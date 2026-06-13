@@ -1,0 +1,1285 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Slug-token index of the IronCache issue tree. The EPIC (#1) is the
+# human-facing index; this file is the machine-readable map slug -> issue number.
+
+epic:
+  number: 1
+  title: '[EPIC] IronCache: vision, tenets, scope, and the research-to-design plan'
+  milestone: M0
+issues:
+- slug: scope-and-tenets
+  number: 2
+  title: '[META]: Scope, ranked tenets, and the five-pillar charter'
+  kind: meta
+  milestone: M0
+  areas:
+  - area:governance
+  labels:
+  - area:governance
+  - meta
+  parent: null
+- slug: glossary-and-invariants
+  number: 3
+  title: '[META]: Glossary and the load-bearing system invariants'
+  kind: meta
+  milestone: M0
+  areas:
+  - area:governance
+  labels:
+  - area:governance
+  - meta
+  parent: scope-and-tenets
+- slug: adr-index
+  number: 4
+  title: '[META]: ADR index, decision register, and record format'
+  kind: meta
+  milestone: M0
+  areas:
+  - area:governance
+  labels:
+  - area:governance
+  - meta
+  parent: scope-and-tenets
+- slug: issue-coherence-audit
+  number: 5
+  title: '[META]: Issue-tree coherence and deduplication audit'
+  kind: meta
+  milestone: M0
+  areas:
+  - area:governance
+  labels:
+  - area:governance
+  - meta
+  parent: scope-and-tenets
+- slug: prior-art-foundations
+  number: 6
+  title: '[RESEARCH]: Prior-art foundations, claim verification, and the pinned competitor landscape'
+  kind: research
+  milestone: M0
+  areas:
+  - area:governance
+  - area:performance
+  labels:
+  - area:governance
+  - area:performance
+  - research
+  parent: scope-and-tenets
+- slug: benchmark-methodology
+  number: 7
+  title: '[DECISION]: Headline metrics are throughput-per-core and memory-at-fixed-hit-ratio'
+  kind: decision
+  milestone: M0
+  areas:
+  - area:performance
+  - area:testing
+  labels:
+  - area:performance
+  - area:testing
+  - decision-needed
+  parent: null
+- slug: benchmark-harness
+  number: 8
+  title: '[DESIGN]: Reproducible benchmark and memory-model harness'
+  kind: design
+  milestone: M1
+  areas:
+  - area:performance
+  - area:testing
+  - area:memory
+  labels:
+  - area:memory
+  - area:performance
+  - area:testing
+  - design
+  parent: benchmark-methodology
+- slug: single-core-benchmark
+  number: 9
+  title: '[RESEARCH]: Single-core throughput bar vs Redis 8 / Valkey / Dragonfly / Garnet'
+  kind: research
+  milestone: M0
+  areas:
+  - area:performance
+  - area:testing
+  labels:
+  - area:performance
+  - area:testing
+  - research
+  parent: benchmark-methodology
+- slug: non-goals-register
+  number: 10
+  title: '[NON-GOAL]: Committed non-goals register (scripting, Memcached protocol, RDMA, managed runtime)'
+  kind: non-goal
+  milestone: M0
+  areas:
+  - area:governance
+  - area:protocol
+  - area:build
+  labels:
+  - area:build
+  - area:governance
+  - area:protocol
+  - non-goal
+  parent: scope-and-tenets
+- slug: ng-fork-cow-snapshot
+  number: 11
+  title: '[NON-GOAL]: fork()+copy-on-write snapshotting, mandatory proxy, and host THP/overcommit tuning'
+  kind: non-goal
+  milestone: M0
+  areas:
+  - area:persistence
+  - area:memory
+  - area:replication
+  labels:
+  - area:memory
+  - area:persistence
+  - area:replication
+  - non-goal
+  parent: null
+- slug: ng-strong-consistency
+  number: 12
+  title: '[NON-GOAL]: Strong consistency / zero write loss in the default async mode'
+  kind: non-goal
+  milestone: M0
+  areas:
+  - area:replication
+  - area:governance
+  labels:
+  - area:governance
+  - area:replication
+  - non-goal
+  parent: null
+- slug: ng-reject-neural-hotpath
+  number: 13
+  title: '[NON-GOAL]: per-request neural/ML inference on the data path'
+  kind: non-goal
+  milestone: M0
+  areas:
+  - area:ai
+  - area:eviction
+  - area:performance
+  labels:
+  - area:ai
+  - area:eviction
+  - area:performance
+  - non-goal
+  parent: null
+- slug: ng-no-claim-without-test
+  number: 14
+  title: '[NON-GOAL]: No consistency or efficiency claim without its test/correction'
+  kind: non-goal
+  milestone: M0
+  areas:
+  - area:testing
+  - area:governance
+  labels:
+  - area:governance
+  - area:testing
+  - non-goal
+  parent: null
+- slug: resp-epic
+  number: 15
+  title: '[DESIGN]: RESP protocol surface, parser, and compatibility tiers'
+  kind: design
+  milestone: M1
+  areas:
+  - area:protocol
+  - area:performance
+  labels:
+  - area:performance
+  - area:protocol
+  - design
+  parent: null
+- slug: compat-tiering
+  number: 16
+  title: '[DECISION]: Define and publish the IronCache compatibility tiering (Tier 0-4)'
+  kind: decision
+  milestone: M0
+  areas:
+  - area:protocol
+  - area:governance
+  labels:
+  - area:governance
+  - area:protocol
+  - decision-needed
+  parent: resp-epic
+- slug: resp3-reply-shaping
+  number: 17
+  title: '[DECISION]: RESP3 reply-shaping policy and error-string fidelity'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:protocol
+  labels:
+  - area:protocol
+  - decision-needed
+  parent: resp-epic
+- slug: error-string-catalog
+  number: 18
+  title: '[DESIGN]: Redis-compatible error-string catalog'
+  kind: design
+  milestone: M1
+  areas:
+  - area:protocol
+  labels:
+  - area:protocol
+  - design
+  parent: resp-epic
+- slug: multi-exec
+  number: 19
+  title: '[DESIGN]: MULTI/EXEC/DISCARD/WATCH with optimistic locking and no rollback'
+  kind: design
+  milestone: M2
+  areas:
+  - area:protocol
+  - area:concurrency
+  labels:
+  - area:concurrency
+  - area:protocol
+  - design
+  parent: resp-epic
+- slug: server-push-channel
+  number: 20
+  title: '[DESIGN]: Unified server-push channel (Pub/Sub, sharded Pub/Sub, keyspace notifications, CSC)'
+  kind: design
+  milestone: M2
+  areas:
+  - area:protocol
+  labels:
+  - area:protocol
+  - design
+  parent: resp-epic
+- slug: client-tracking
+  number: 21
+  title: '[DESIGN]: CLIENT TRACKING (BCAST + RESP3 push default, per-client table, RESP2 REDIRECT)'
+  kind: design
+  milestone: M2
+  areas:
+  - area:protocol
+  - area:memory
+  labels:
+  - area:memory
+  - area:protocol
+  - design
+  parent: resp-epic
+- slug: auth-acl-tls
+  number: 22
+  title: '[DESIGN]: Security surface (AUTH, requirepass, ACL, embedded TLS)'
+  kind: design
+  milestone: M1
+  areas:
+  - area:security
+  - area:protocol
+  labels:
+  - area:protocol
+  - area:security
+  - design
+  parent: resp-epic
+- slug: native-atomic-ops
+  number: 23
+  title: '[RESEARCH]: Native atomic-op set covering common scripting use cases without a Lua VM'
+  kind: research
+  milestone: M2
+  areas:
+  - area:protocol
+  labels:
+  - area:protocol
+  - research
+  parent: resp-epic
+- slug: concurrency-model
+  number: 24
+  title: '[DECISION]: Shared-nothing thread-per-core as the core concurrency model'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:concurrency
+  - area:performance
+  labels:
+  - area:concurrency
+  - area:performance
+  - decision-needed
+  parent: null
+- slug: core-runtime-epic
+  number: 25
+  title: '[DESIGN]: Shared-nothing core runtime and the async/io stack'
+  kind: design
+  milestone: M1
+  areas:
+  - area:concurrency
+  - area:performance
+  labels:
+  - area:concurrency
+  - area:performance
+  - design
+  parent: concurrency-model
+- slug: runtime-bakeoff
+  number: 26
+  title: '[RESEARCH]: Runtime bake-off, monoio vs glommio vs tokio+epoll on GET/SET'
+  kind: research
+  milestone: M0
+  areas:
+  - area:concurrency
+  - area:performance
+  labels:
+  - area:concurrency
+  - area:performance
+  - research
+  parent: core-runtime-epic
+- slug: runtime-abstraction
+  number: 27
+  title: '[DESIGN]: Runtime/IO abstraction layer keeping monoio/glommio/tokio swappable'
+  kind: design
+  milestone: M2
+  areas:
+  - area:concurrency
+  - area:build
+  labels:
+  - area:build
+  - area:concurrency
+  - design
+  parent: core-runtime-epic
+- slug: iouring-fastpath
+  number: 28
+  title: '[DESIGN]: io_uring fast path with registered buffers and multishot ops'
+  kind: design
+  milestone: M2
+  areas:
+  - area:concurrency
+  - area:performance
+  labels:
+  - area:concurrency
+  - area:performance
+  - design
+  parent: core-runtime-epic
+- slug: cross-shard-coordinator
+  number: 29
+  title: '[DESIGN]: Cross-shard coordinator and transaction/scripting surface'
+  kind: design
+  milestone: M2
+  areas:
+  - area:concurrency
+  - area:protocol
+  labels:
+  - area:concurrency
+  - area:protocol
+  - design
+  parent: concurrency-model
+- slug: transaction-surface
+  number: 30
+  title: '[DECISION]: Transaction and scripting surface scope'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:concurrency
+  - area:protocol
+  labels:
+  - area:concurrency
+  - area:protocol
+  - decision-needed
+  parent: concurrency-model
+- slug: runtime-determinism
+  number: 31
+  title: '[DECISION]: Design the runtime for determinism to enable DST'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:concurrency
+  - area:testing
+  labels:
+  - area:concurrency
+  - area:testing
+  - decision-needed
+  parent: concurrency-model
+- slug: hot-shard-mitigation
+  number: 32
+  title: '[RESEARCH]: Hot-shard mitigation and memory-reclamation strategy under shard-per-core'
+  kind: research
+  milestone: M0
+  areas:
+  - area:concurrency
+  - area:memory
+  labels:
+  - area:concurrency
+  - area:memory
+  - research
+  parent: concurrency-model
+- slug: memory-reclamation
+  number: 33
+  title: '[DECISION]: Epoch-based reclamation (crossbeam-epoch) vs custom drain-list framework'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:concurrency
+  - area:storage
+  labels:
+  - area:concurrency
+  - area:storage
+  - decision-needed
+  parent: core-runtime-epic
+- slug: narrow-waist-api
+  number: 34
+  title: '[DESIGN]: Narrow-waist storage API (Read/Upsert/Delete/RMW) under the RESP layer'
+  kind: design
+  milestone: M1
+  areas:
+  - area:storage
+  - area:concurrency
+  labels:
+  - area:concurrency
+  - area:storage
+  - design
+  parent: core-runtime-epic
+- slug: hash-table-design
+  number: 35
+  title: '[DESIGN]: Hash table, data-structure encodings, and per-key object layout'
+  kind: design
+  milestone: M1
+  areas:
+  - area:datastructures
+  - area:memory
+  labels:
+  - area:datastructures
+  - area:memory
+  - design
+  parent: null
+- slug: per-shard-store
+  number: 36
+  title: '[DECISION]: Per-shard single-thread HashMap vs shared concurrent map fallback'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:datastructures
+  - area:concurrency
+  labels:
+  - area:concurrency
+  - area:datastructures
+  - decision-needed
+  parent: hash-table-design
+- slug: encoding-thresholds
+  number: 37
+  title: '[RESEARCH]: Adaptive vs fixed encoding-conversion thresholds'
+  kind: research
+  milestone: M0
+  areas:
+  - area:datastructures
+  labels:
+  - area:datastructures
+  - research
+  parent: hash-table-design
+- slug: segmented-hash-index
+  number: 38
+  title: '[DESIGN]: Segmented extendible-hash index (Dash-style) with SIMD fingerprint probing'
+  kind: design
+  milestone: M2
+  areas:
+  - area:datastructures
+  - area:memory
+  - area:performance
+  labels:
+  - area:datastructures
+  - area:memory
+  - area:performance
+  - design
+  parent: hash-table-design
+- slug: intset-hll
+  number: 39
+  title: '[TASK]: intset and HyperLogLog sparse/dense encodings for wire compatibility'
+  kind: task
+  milestone: M2
+  areas:
+  - area:datastructures
+  labels:
+  - area:datastructures
+  - sub-issue
+  parent: hash-table-design
+- slug: object-encoding-mapping
+  number: 40
+  title: '[DESIGN]: OBJECT ENCODING / DEBUG OBJECT compatibility mapping'
+  kind: design
+  milestone: M2
+  areas:
+  - area:datastructures
+  - area:protocol
+  labels:
+  - area:datastructures
+  - area:protocol
+  - design
+  parent: hash-table-design
+- slug: allocator-selection
+  number: 41
+  title: '[DECISION]: Default global allocator and memory-accounting strategy'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:memory
+  - area:performance
+  labels:
+  - area:memory
+  - area:performance
+  - decision-needed
+  parent: null
+- slug: allocator-benchmark
+  number: 42
+  title: '[RESEARCH]: Benchmark jemalloc/mimalloc/snmalloc under a cache workload'
+  kind: research
+  milestone: M0
+  areas:
+  - area:memory
+  - area:performance
+  - area:testing
+  labels:
+  - area:memory
+  - area:performance
+  - area:testing
+  - research
+  parent: allocator-selection
+- slug: online-defrag
+  number: 43
+  title: '[DESIGN]: Online defragmentation strategy'
+  kind: design
+  milestone: M1
+  areas:
+  - area:memory
+  - area:performance
+  labels:
+  - area:memory
+  - area:performance
+  - design
+  parent: allocator-selection
+- slug: thp-snapshot-stance
+  number: 44
+  title: '[DECISION]: THP and snapshot stance (MADV_NOHUGEPAGE heap, non-fork serialization)'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:memory
+  - area:persistence
+  labels:
+  - area:memory
+  - area:persistence
+  - decision-needed
+  parent: allocator-selection
+- slug: default-memory-posture
+  number: 45
+  title: '[DECISION]: Ship a memory ceiling and eviction ON by default'
+  kind: decision
+  milestone: M0
+  areas:
+  - area:eviction
+  - area:config
+  - area:memory
+  labels:
+  - area:config
+  - area:eviction
+  - area:memory
+  - decision-needed
+  parent: allocator-selection
+- slug: eviction-default
+  number: 46
+  title: '[DECISION]: Default eviction policy (SIEVE vs S3-FIFO vs W-TinyLFU-fronted FIFO)'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:eviction
+  - area:performance
+  labels:
+  - area:eviction
+  - area:performance
+  - decision-needed
+  parent: null
+- slug: eviction-benchmark
+  number: 47
+  title: '[RESEARCH]: Benchmark SIEVE/S3-FIFO/W-TinyLFU/ARC/LIRS on cachemon corpus plus KV traces'
+  kind: research
+  milestone: M0
+  areas:
+  - area:eviction
+  - area:testing
+  labels:
+  - area:eviction
+  - area:testing
+  - research
+  parent: eviction-default
+- slug: eviction-policy-trait
+  number: 48
+  title: '[DESIGN]: Pluggable EvictionPolicy trait and ghost queue'
+  kind: design
+  milestone: M1
+  areas:
+  - area:eviction
+  labels:
+  - area:eviction
+  - design
+  parent: eviction-default
+- slug: admission-filter
+  number: 49
+  title: '[DESIGN]: W-TinyLFU frequency admission filter (CM-sketch + doorkeeper + aging)'
+  kind: design
+  milestone: M1
+  areas:
+  - area:eviction
+  - area:memory
+  labels:
+  - area:eviction
+  - area:memory
+  - design
+  parent: eviction-default
+- slug: redis-policy-mapping
+  number: 50
+  title: '[DESIGN]: Map Redis maxmemory-policy names onto IronCache''s internal engine'
+  kind: design
+  milestone: M1
+  areas:
+  - area:eviction
+  - area:protocol
+  labels:
+  - area:eviction
+  - area:protocol
+  - design
+  parent: eviction-default
+- slug: ttl-expiration
+  number: 51
+  title: '[DESIGN]: TTL expiration via per-shard timing wheel with lazy backstop and background reclamation'
+  kind: design
+  milestone: M2
+  areas:
+  - area:eviction
+  - area:concurrency
+  - area:memory
+  labels:
+  - area:concurrency
+  - area:eviction
+  - area:memory
+  - design
+  parent: eviction-default
+- slug: compression-epic
+  number: 52
+  title: '[DESIGN]: Transparent value compression strategy'
+  kind: design
+  milestone: M1
+  areas:
+  - area:compression
+  - area:memory
+  labels:
+  - area:compression
+  - area:memory
+  - design
+  parent: hash-table-design
+- slug: codec-default
+  number: 53
+  title: '[DECISION]: Default codec = zstd low-level; LZ4 and none as policy options'
+  kind: decision
+  milestone: M0
+  areas:
+  - area:compression
+  labels:
+  - area:compression
+  - decision-needed
+  parent: compression-epic
+- slug: zstd-dependency
+  number: 54
+  title: '[DECISION]: C-bound zstd vs pure-Rust zstd for the static binary'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:compression
+  - area:build
+  labels:
+  - area:build
+  - area:compression
+  - decision-needed
+  parent: compression-epic
+- slug: zdict-dictionaries
+  number: 55
+  title: '[DESIGN]: ZDICT per-prefix dictionary training, versioning, and tagging'
+  kind: design
+  milestone: M1
+  areas:
+  - area:compression
+  - area:memory
+  labels:
+  - area:compression
+  - area:memory
+  - design
+  parent: compression-epic
+- slug: compression-mutation
+  number: 56
+  title: '[DESIGN]: Compression interaction with mutating commands and hot-key cost'
+  kind: design
+  milestone: M2
+  areas:
+  - area:compression
+  - area:performance
+  labels:
+  - area:compression
+  - area:performance
+  - design
+  parent: compression-epic
+- slug: value-size-survey
+  number: 57
+  title: '[RESEARCH]: Cache value-size and compressibility distribution survey'
+  kind: research
+  milestone: M0
+  areas:
+  - area:compression
+  - area:testing
+  labels:
+  - area:compression
+  - area:testing
+  - research
+  parent: compression-epic
+- slug: persistence-epic
+  number: 58
+  title: '[DESIGN]: Persistence, forkless snapshot, and storage-engine architecture'
+  kind: design
+  milestone: M1
+  areas:
+  - area:persistence
+  - area:storage
+  labels:
+  - area:persistence
+  - area:storage
+  - design
+  parent: null
+- slug: durability-stance
+  number: 59
+  title: '[DECISION]: Durability stance (ephemeral default, opt-in snapshot, warm-restart, later tiers)'
+  kind: decision
+  milestone: M0
+  areas:
+  - area:persistence
+  labels:
+  - area:persistence
+  - decision-needed
+  parent: persistence-epic
+- slug: forkless-snapshot
+  number: 60
+  title: '[DESIGN]: Forkless versioned point-in-time snapshot and diskless full-sync'
+  kind: design
+  milestone: M2
+  areas:
+  - area:persistence
+  - area:concurrency
+  labels:
+  - area:concurrency
+  - area:persistence
+  - design
+  parent: persistence-epic
+- slug: snapshot-overhead-bound
+  number: 61
+  title: '[RESEARCH]: Bound and enforce snapshot memory overhead; fast parallel restart'
+  kind: research
+  milestone: M0
+  areas:
+  - area:persistence
+  - area:memory
+  labels:
+  - area:memory
+  - area:persistence
+  - research
+  parent: persistence-epic
+- slug: warm-restart
+  number: 62
+  title: '[DESIGN]: mmap warm-restart (graceful shutdown + state file + pointer fixup)'
+  kind: design
+  milestone: M2
+  areas:
+  - area:persistence
+  - area:cli
+  labels:
+  - area:cli
+  - area:persistence
+  - design
+  parent: persistence-epic
+- slug: segment-manifest-log
+  number: 63
+  title: '[DESIGN]: Segment + atomic manifest durable log with corruption recovery'
+  kind: design
+  milestone: M2
+  areas:
+  - area:persistence
+  - area:storage
+  labels:
+  - area:persistence
+  - area:storage
+  - design
+  parent: persistence-epic
+- slug: hybrid-log-engine
+  number: 64
+  title: '[DESIGN]: HybridLog storage engine with in-place hot-set updates'
+  kind: design
+  milestone: M2
+  areas:
+  - area:storage
+  - area:memory
+  labels:
+  - area:memory
+  - area:storage
+  - design
+  parent: persistence-epic
+- slug: reject-rocksdb
+  number: 65
+  title: '[DECISION]: Reject RocksDB/LSM as the core cold engine; choose hybrid-log vs F2'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:storage
+  - area:build
+  labels:
+  - area:build
+  - area:storage
+  - decision-needed
+  parent: persistence-epic
+- slug: tiered-store
+  number: 66
+  title: '[DESIGN]: Tiered RAM->SSD value store (extstore-inspired)'
+  kind: design
+  milestone: M2
+  areas:
+  - area:storage
+  - area:memory
+  labels:
+  - area:memory
+  - area:storage
+  - design
+  parent: persistence-epic
+- slug: iouring-persistence-path
+  number: 67
+  title: '[DESIGN]: io_uring snapshot/tiering write path with SQPOLL and fallback'
+  kind: design
+  milestone: M2
+  areas:
+  - area:persistence
+  - area:storage
+  labels:
+  - area:persistence
+  - area:storage
+  - design
+  parent: persistence-epic
+- slug: clustering-epic
+  number: 68
+  title: '[DESIGN]: Single-node to multi-node distribution (partitioning, routing, replication, membership)'
+  kind: design
+  milestone: M2
+  areas:
+  - area:replication
+  labels:
+  - area:replication
+  - design
+  parent: null
+- slug: single-node-first
+  number: 69
+  title: '[DECISION]: Single-node-first roadmap with slot-ready storage layout'
+  kind: decision
+  milestone: M0
+  areas:
+  - area:replication
+  - area:storage
+  labels:
+  - area:replication
+  - area:storage
+  - decision-needed
+  parent: clustering-epic
+- slug: cluster-client-contract
+  number: 70
+  title: '[DESIGN]: Redis-Cluster-compatible client contract (16384 slots, CRC16, hash tags, MOVED/ASK)'
+  kind: design
+  milestone: M1
+  areas:
+  - area:replication
+  - area:protocol
+  labels:
+  - area:protocol
+  - area:replication
+  - design
+  parent: clustering-epic
+- slug: internal-shard-map
+  number: 71
+  title: '[DECISION]: Internal shard map and partition count decoupled from the 16384 compatibility slots'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:replication
+  - area:storage
+  - area:concurrency
+  labels:
+  - area:concurrency
+  - area:replication
+  - area:storage
+  - decision-needed
+  parent: clustering-epic
+- slug: cluster-partition-count
+  number: 72
+  title: '[DECISION]: Keyspace partition count as dual-purpose shard/migration unit'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:replication
+  - area:concurrency
+  labels:
+  - area:concurrency
+  - area:replication
+  - decision-needed
+  parent: clustering-epic
+- slug: raft-control-plane
+  number: 73
+  title: '[DESIGN]: Raft-managed authoritative slot map and in-binary HA control plane'
+  kind: design
+  milestone: M1
+  areas:
+  - area:replication
+  labels:
+  - area:replication
+  - design
+  parent: clustering-epic
+- slug: swim-membership
+  number: 74
+  title: '[DESIGN]: SWIM + Lifeguard data-plane membership and failure detection'
+  kind: design
+  milestone: M1
+  areas:
+  - area:replication
+  - area:observability
+  labels:
+  - area:observability
+  - area:replication
+  - design
+  parent: clustering-epic
+- slug: slot-migration
+  number: 75
+  title: '[DESIGN]: Atomic, snapshot-streamed online slot migration without write freeze'
+  kind: design
+  milestone: M2
+  areas:
+  - area:replication
+  - area:storage
+  labels:
+  - area:replication
+  - area:storage
+  - design
+  parent: clustering-epic
+- slug: replication-default
+  number: 76
+  title: '[DECISION]: Default replication and consistency model (async primary/replica + WAIT)'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:replication
+  labels:
+  - area:replication
+  - decision-needed
+  parent: clustering-epic
+- slug: async-replication
+  number: 77
+  title: '[DESIGN]: Offset-based async replication with adaptive, disk-spillable backlog'
+  kind: design
+  milestone: M2
+  areas:
+  - area:replication
+  - area:persistence
+  labels:
+  - area:persistence
+  - area:replication
+  - design
+  parent: clustering-epic
+- slug: per-shard-raft
+  number: 78
+  title: '[RESEARCH]: Per-shard Raft for an opt-in strongly-consistent tier'
+  kind: research
+  milestone: M0
+  areas:
+  - area:replication
+  - area:performance
+  labels:
+  - area:performance
+  - area:replication
+  - research
+  parent: clustering-epic
+- slug: crdt-active-active
+  number: 79
+  title: '[RESEARCH]: Opt-in active-active CRDT mode (reject blanket LWW; principled CRDT/HLC)'
+  kind: research
+  milestone: M2
+  areas:
+  - area:replication
+  - area:memory
+  labels:
+  - area:memory
+  - area:replication
+  - research
+  parent: clustering-epic
+- slug: consistent-hashing-research
+  number: 80
+  title: '[RESEARCH]: Post-ketama consistent hashing for internal placement'
+  kind: research
+  milestone: M0
+  areas:
+  - area:replication
+  labels:
+  - area:replication
+  - research
+  parent: clustering-epic
+- slug: single-binary-epic
+  number: 81
+  title: '[DESIGN]: Single static binary, CLI, and single-binary operations'
+  kind: design
+  milestone: M1
+  areas:
+  - area:cli
+  - area:build
+  labels:
+  - area:build
+  - area:cli
+  - design
+  parent: null
+- slug: cli-subcommands
+  number: 82
+  title: '[DECISION]: clap subcommands vs argv[0] symlink mode-switching and artifact signing'
+  kind: decision
+  milestone: M1
+  areas:
+  - area:cli
+  - area:build
+  - area:security
+  labels:
+  - area:build
+  - area:cli
+  - area:security
+  - decision-needed
+  parent: single-binary-epic
+- slug: ironcache-upgrade
+  number: 83
+  title: '[DESIGN]: ironcache upgrade with verified rollback'
+  kind: design
+  milestone: M2
+  areas:
+  - area:cli
+  - area:build
+  - area:security
+  labels:
+  - area:build
+  - area:cli
+  - area:security
+  - design
+  parent: single-binary-epic
+- slug: packaging-and-install
+  number: 84
+  title: '[TASK]: Packaging, cross-build matrix, reproducible builds, SBOM, and musl penalty research'
+  kind: task
+  milestone: M2
+  areas:
+  - area:build
+  - area:security
+  labels:
+  - area:build
+  - area:security
+  - sub-issue
+  parent: single-binary-epic
+- slug: config-system
+  number: 85
+  title: '[DESIGN]: TOML config with CONFIG GET/SET/REWRITE parity and live reload'
+  kind: design
+  milestone: M2
+  areas:
+  - area:config
+  - area:cli
+  labels:
+  - area:cli
+  - area:config
+  - design
+  parent: single-binary-epic
+- slug: observability-epic
+  number: 86
+  title: '[DESIGN]: Observability (Prometheus /metrics, INFO/SLOWLOG/LATENCY parity)'
+  kind: design
+  milestone: M1
+  areas:
+  - area:observability
+  labels:
+  - area:observability
+  - design
+  parent: single-binary-epic
+- slug: belady-gap-metric
+  number: 87
+  title: '[RESEARCH]: Continuously-reported online Belady-MIN gap metric'
+  kind: research
+  milestone: M2
+  areas:
+  - area:observability
+  - area:eviction
+  labels:
+  - area:eviction
+  - area:observability
+  - research
+  parent: observability-epic
+- slug: ai-advisor-epic
+  number: 88
+  title: '[DESIGN]: AI-driven background advisor (expert selection + bounded knob autotuning)'
+  kind: design
+  milestone: M1
+  areas:
+  - area:ai
+  - area:eviction
+  labels:
+  - area:ai
+  - area:eviction
+  - design
+  parent: null
+- slug: advisor-objective
+  number: 89
+  title: '[RESEARCH]: Define the advisor objective metric (throughput-per-core/memory, not raw hit ratio)'
+  kind: research
+  milestone: M0
+  areas:
+  - area:ai
+  - area:performance
+  labels:
+  - area:ai
+  - area:performance
+  - research
+  parent: ai-advisor-epic
+- slug: advisor-headroom
+  number: 90
+  title: '[RESEARCH]: Quantify advisor headroom over a tuned W-TinyLFU + SIEVE baseline'
+  kind: research
+  milestone: M0
+  areas:
+  - area:ai
+  - area:eviction
+  labels:
+  - area:ai
+  - area:eviction
+  - research
+  parent: ai-advisor-epic
+- slug: advisor-guardrails
+  number: 91
+  title: '[DESIGN]: Advisor safety guardrails and mechanism detail (bounded knobs, hysteresis, rollback,
+    kill-switch)'
+  kind: design
+  milestone: M1
+  areas:
+  - area:ai
+  - area:config
+  labels:
+  - area:ai
+  - area:config
+  - design
+  parent: ai-advisor-epic
+- slug: compression-decision-model
+  number: 92
+  title: '[DESIGN]: Off-path per-value compression decision model'
+  kind: design
+  milestone: M2
+  areas:
+  - area:ai
+  - area:compression
+  labels:
+  - area:ai
+  - area:compression
+  - design
+  parent: ai-advisor-epic
+- slug: belady-oracle-tool
+  number: 93
+  title: '[TASK]: Offline Belady-MIN and learned-Belady oracle in the benchmark harness'
+  kind: task
+  milestone: M2
+  areas:
+  - area:ai
+  - area:testing
+  - area:eviction
+  labels:
+  - area:ai
+  - area:eviction
+  - area:testing
+  - sub-issue
+  parent: ai-advisor-epic
+- slug: ai-dev-pipeline
+  number: 94
+  title: '[DESIGN]: AI-assisted development pipeline with adversarial claim verification'
+  kind: design
+  milestone: M1
+  areas:
+  - area:ai
+  - area:governance
+  labels:
+  - area:ai
+  - area:governance
+  - design
+  parent: ai-advisor-epic
+- slug: conformance-suite
+  number: 95
+  title: '[DESIGN]: Conformance, differential, fuzz, property, and DST testing stack'
+  kind: design
+  milestone: M1
+  areas:
+  - area:testing
+  - area:protocol
+  labels:
+  - area:protocol
+  - area:testing
+  - design
+  parent: null
+- slug: valkey-oracle
+  number: 96
+  title: '[TASK]: Valkey 9.x as RESP differential-test oracle and head-to-head baseline'
+  kind: task
+  milestone: M0
+  areas:
+  - area:testing
+  - area:performance
+  labels:
+  - area:performance
+  - area:testing
+  - sub-issue
+  parent: conformance-suite
+- slug: differential-testing
+  number: 97
+  title: '[DESIGN]: Differential testing against pinned redis-server/valkey-server'
+  kind: design
+  milestone: M2
+  areas:
+  - area:testing
+  - area:protocol
+  labels:
+  - area:protocol
+  - area:testing
+  - design
+  parent: conformance-suite
+- slug: property-model-tests
+  number: 98
+  title: '[DESIGN]: Property-based and model-based tests for every data type'
+  kind: design
+  milestone: M2
+  areas:
+  - area:testing
+  - area:datastructures
+  labels:
+  - area:datastructures
+  - area:testing
+  - design
+  parent: conformance-suite
+- slug: jepsen-elle-plan
+  number: 99
+  title: '[DESIGN]: Jepsen + Elle test plan for clustering/replication'
+  kind: design
+  milestone: M2
+  areas:
+  - area:testing
+  - area:replication
+  labels:
+  - area:replication
+  - area:testing
+  - design
+  parent: conformance-suite
+- slug: fault-injection
+  number: 100
+  title: '[TASK]: Seeded fault-injection and corruption scenarios'
+  kind: task
+  milestone: M2
+  areas:
+  - area:testing
+  - area:persistence
+  labels:
+  - area:persistence
+  - area:testing
+  - sub-issue
+  parent: conformance-suite
