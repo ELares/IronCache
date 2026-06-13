@@ -15,6 +15,9 @@ CLAIMS="$ROOT/docs/prior-art/claims.yaml"
 # Prose files that cite claim ids. Add to this list as the docs grow.
 PROSE_FILES=(
   "$ROOT/docs/PRIOR_ART.md"
+  "$ROOT/docs/CHARTER.md"
+  "$ROOT/docs/GLOSSARY.md"
+  "$ROOT/docs/INVARIANTS.md"
 )
 
 fail=0

@@ -13,6 +13,16 @@ issues are the specification.
   in CI by [`../scripts/ci/check-prior-art-claims.sh`](../scripts/ci/check-prior-art-claims.sh).
 - [research/](research/): the per-dimension research corpus (one document per
   caching dimension) and the machine-readable [`corpus.json`](research/corpus.json).
+- [CHARTER.md](CHARTER.md): the thesis, the five ranked tenets and their
+  conflict order, and the governing-document index.
+- [GLOSSARY.md](GLOSSARY.md) and [INVARIANTS.md](INVARIANTS.md): the canonical
+  vocabulary and the load-bearing invariants every design must respect.
+- [adr/](adr/): the Architecture Decision Records, their registers
+  ([INDEX](adr/INDEX.md), [OPEN](adr/OPEN.md), [QUESTIONS](adr/QUESTIONS.md)),
+  and the ADR format.
+- [ROADMAP.md](ROADMAP.md): the implementation-readiness sequencing (thin
+  vertical slice, waves, gate set). [AUDIT.md](AUDIT.md): the pre-implementation
+  audit record.
 
 The authoritative, evolving design lives in the
 [GitHub issues](https://github.com/ELares/IronCache/issues), indexed from the
