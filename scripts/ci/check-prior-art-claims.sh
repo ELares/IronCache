@@ -18,6 +18,7 @@ PROSE_FILES=(
   "$ROOT/docs/CHARTER.md"
   "$ROOT/docs/GLOSSARY.md"
   "$ROOT/docs/INVARIANTS.md"
+  "$ROOT/docs/NON_GOALS.md"
 )
 
 fail=0
