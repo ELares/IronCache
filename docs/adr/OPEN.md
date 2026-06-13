@@ -11,10 +11,6 @@ stance.
 
 | Decision issue | Area | Blocked on (research) | Milestone | Critical path |
 | --- | --- | --- | --- | --- |
-| #24 shared-nothing thread-per-core | concurrency | #26 runtime bake-off, #32 hot-shard | Impl. Readiness | yes (root) |
-| #31 design for determinism (DST) | concurrency | none | Impl. Readiness | yes |
-| #33 epoch vs custom reclamation | concurrency | #32 | Impl. Readiness | yes |
-| #36 per-shard map vs concurrent | datastructures | #32 | Impl. Readiness | yes |
 | #41 allocator + memory accounting | memory | #42 allocator bench | Impl. Readiness | yes |
 | #45 ceiling + eviction on by default | memory | #47 eviction bench | Impl. Readiness | yes |
 | #46 default eviction policy | eviction | #47 eviction bench | Impl. Readiness | yes |
