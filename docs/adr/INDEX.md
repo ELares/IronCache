@@ -19,6 +19,11 @@ in [OPEN.md](OPEN.md); research questions in [QUESTIONS.md](QUESTIONS.md).
 | [0011](0011-single-node-first-slot-ready.md) | Single-node-first, slot-ready layout | Accepted | #69 |
 | [0012](0012-scale-out-targets.md) | Headline scale-out targets | Accepted | #146 |
 | [0013](0013-advisor-default-posture.md) | Advisor default posture (shadow/off) | Accepted | #155 |
+| [0014](0014-durability-stance.md) | Durability stance (ephemeral default) | Accepted | #59 |
+| [0015](0015-default-value-codec.md) | Default value codec (zstd low) | Accepted | #53 |
+| [0016](0016-headline-efficiency-metrics.md) | Headline metrics (per-core, memory-at-hit-ratio) | Accepted | #7 |
+| [0017](0017-per-tenet-acceptance-gates.md) | Per-tenet acceptance targets and release gates | Accepted | #157 |
+| [0018](0018-encoding-conversion-thresholds.md) | Fixed encoding-conversion thresholds | Accepted | #37 |
 
 As `[DECISION]` issues close, each adds its row here and its `NNNN-*.md` record.
 The numbering is monotonic and never reused, even after supersession.
