@@ -11,15 +11,10 @@ stance.
 
 | Decision issue | Area | Blocked on (research) | Milestone | Critical path |
 | --- | --- | --- | --- | --- |
-| #16 compatibility tiering (Tier 0-4) | protocol | none | Impl. Readiness | yes |
-| #30 transaction + scripting surface | protocol | none | Impl. Readiness | no |
 | #59 durability stance | persistence | #61 snapshot-overhead | Impl. Readiness | yes |
 | #53 default codec | compression | #57 value-size survey | Impl. Readiness | no |
-| #69 single-node-first + slot-ready | replication | none | Impl. Readiness | yes |
 | #7 headline metrics | performance | #9 single-core bar | Impl. Readiness | yes |
 | #157 per-tenet acceptance gates | governance | #7, #16, #24 | Impl. Readiness | no |
-| #155 advisor default posture | ai | none | Impl. Readiness | no |
-| #146 headline scale-out targets | replication | clustering (Wave 3) | M0 | no |
 | #37 adaptive vs fixed encoding thresholds | datastructures | #57 | M0 | no |
 | #33/#36 dependents (allocator cross-shard frees) | memory | #42 | M1 | no |
 
