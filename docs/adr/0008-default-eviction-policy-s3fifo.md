@@ -1,0 +1,59 @@
+# ADR-0008: Default eviction policy is S3-FIFO
+
+Status: Accepted
+Issue: #46
+
+## Context
+
+With a ceiling and eviction on by default (ADR-0007), IronCache needs one default
+online eviction policy, chosen on evidence and reused everywhere. The candidates
+from the literature are SIEVE, S3-FIFO, and a W-TinyLFU-fronted FIFO. The policy
+must be memory-frugal (bytes-per-key includes per-entry policy metadata) and
+lock-light under shared-nothing (ADR-0002), and it must avoid LRU's per-hit
+relink, which makes throughput fall at high hit ratio [hit-ratio-can-hurt-throughput].
+
+## Decision
+
+The default policy is **S3-FIFO**, behind the pluggable `EvictionPolicy` trait
+(#48) so SIEVE and a W-TinyLFU-fronted variant remain selectable. S3-FIFO
+partitions a shard's cache into a small (about 10 percent) probationary FIFO and
+a large main FIFO with a ghost queue [s3fifo-small-main-split], using a 2-bit
+frequency counter capped at 3 [s3fifo-freq-counter-2bit-cap3]. This exploits that
+most objects are one-hit wonders [s3fifo-onehit-wonder-72pct].
+
+## Rejected Alternatives
+
+- **Plain LRU.** Rejected on Efficient: per-hit relinking is a contended
+  bottleneck and throughput drops at high hit ratio [hit-ratio-can-hurt-throughput].
+- **Sampled LRU/LFU (Redis-style).** Rejected: Redis does not implement true
+  LRU/LFU but samples a few keys per eviction [redis-lru-lfu-sampling]
+  [redis-maxmemory-samples-5], paying per-eviction sampling cost and per-object
+  metadata for no hit-ratio win over the FIFO-based policies.
+- **SIEVE as the default.** Strong and the simplest (one FIFO + a visited bit,
+  no ghost) [sieve-simpler-than-lru-nsdi24] [sieve-throughput], and lowest miss
+  ratio on over 45 percent of the web-cache traces in its own study
+  [sieve-miss-ratio-45pct]; kept as a selectable policy. Rejected as the default
+  because it has no ghost queue and degrades on small caches and scan-heavy block
+  workloads [sieve-loc-and-stack-property], while S3-FIFO is best on 10 of 14
+  datasets in its study [s3fifo-miss-ratio-wins] at about 6x the throughput of an
+  optimized LRU at 16 threads [s3fifo-throughput-6x]. Both "wins on N percent of
+  traces" figures are each algorithm's home-corpus result, so #47 re-validates
+  the call on a shared corpus.
+- **W-TinyLFU-fronted FIFO as the default.** Strong hit ratio via its windowed
+  admission [wtinylfu-window-main-split], but its 4-bit Count-Min sketch costs
+  about 8 bytes per entry [wtinylfu-cmsketch-4bit] versus S3-FIFO's 2-bit counter
+  [s3fifo-freq-counter-2bit-cap3], roughly 30x the per-entry policy metadata. We
+  judge that cost not worth the hit-ratio delta for the default (a judgment #47
+  will confirm), and keep W-TinyLFU as a selectable admission filter (#49).
+
+## Consequences
+
+- The default is concurrency-friendly and metadata-frugal, fitting shared-nothing
+  and the bytes-per-key target; it lives behind the `EvictionPolicy` trait (#48)
+  with a ghost queue.
+- The choice is validated empirically on the cachemon corpus plus our own traces
+  as the #47 benchmark follow-up; the default is revisited only if that data
+  contradicts the published results.
+- Redis `maxmemory-policy` names (allkeys-lru, allkeys-lfu, and so on) map onto
+  the engine's policies for compatibility in #50; S3-FIFO is the engine default
+  under cache mode.

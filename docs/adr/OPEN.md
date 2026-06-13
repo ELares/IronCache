@@ -11,9 +11,6 @@ stance.
 
 | Decision issue | Area | Blocked on (research) | Milestone | Critical path |
 | --- | --- | --- | --- | --- |
-| #41 allocator + memory accounting | memory | #42 allocator bench | Impl. Readiness | yes |
-| #45 ceiling + eviction on by default | memory | #47 eviction bench | Impl. Readiness | yes |
-| #46 default eviction policy | eviction | #47 eviction bench | Impl. Readiness | yes |
 | #16 compatibility tiering (Tier 0-4) | protocol | none | Impl. Readiness | yes |
 | #30 transaction + scripting surface | protocol | none | Impl. Readiness | no |
 | #59 durability stance | persistence | #61 snapshot-overhead | Impl. Readiness | yes |
