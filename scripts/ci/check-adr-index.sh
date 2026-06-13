@@ -30,14 +30,17 @@ for f in "$ADR"/[0-9][0-9][0-9][0-9]-*.md; do
   records=$((records+1))
   num="${base%%-*}"
 
-  # 1. required sections + status
+  # 1. required sections (line-anchored headings, not substrings) + status
   for sec in "## Context" "## Decision" "## Rejected Alternatives" "## Consequences"; do
-    grep -qF "$sec" "$f" || { echo "ERROR: $base missing section '$sec'" >&2; fail=1; }
+    grep -qE "^${sec}[[:space:]]*$" "$f" || { echo "ERROR: $base missing section heading '$sec'" >&2; fail=1; }
   done
-  grep -qE '^Status: (Proposed|Accepted|Superseded)$' "$f" \
+  grep -qE '^Status: (Proposed|Accepted|Superseded)[[:space:]]*(#.*)?$' "$f" \
     || { echo "ERROR: $base missing a valid 'Status:' line" >&2; fail=1; }
 
-  # 2. claim-id citations exist (bracketed lowercase-kebab tokens, not md links)
+  # 2. claim-id citations exist (bracketed lowercase-kebab tokens, not md links).
+  # Note: a bracketed kebab token anywhere (including a code fence) is treated as
+  # a citation, matching the sibling check-prior-art-claims.sh convention; ADRs
+  # write illustrative ids without brackets (see the 0000 template).
   while IFS= read -r c; do
     [ -z "$c" ] && continue
     grep -qxF "$c" "$ids_file" || { echo "ERROR: $base cites [$c] not in claims.yaml" >&2; fail=1; }
@@ -49,9 +52,9 @@ for f in "$ADR"/[0-9][0-9][0-9][0-9]-*.md; do
     ls "$ADR/${ref}-"*.md >/dev/null 2>&1 || { echo "ERROR: $base references ADR-$ref with no record file" >&2; fail=1; }
   done < <(grep -oE '(Superseded-by|Supersedes): ADR-[0-9]{4}' "$f" | grep -oE '[0-9]{4}' | sort -u)
 
-  # 4. listed in INDEX.md
-  grep -qE "\(${num}-[a-z0-9-]+\.md\)|\b${num}\b" "$INDEX" \
-    || { echo "ERROR: $base (ADR $num) is not listed in INDEX.md" >&2; fail=1; }
+  # 4. listed in INDEX.md as a real link to the record file (no bare-number match)
+  grep -qE "\(${num}-[a-z0-9-]+\.md\)" "$INDEX" \
+    || { echo "ERROR: $base (ADR $num) is not listed in INDEX.md (expected a (${num}-title.md) link)" >&2; fail=1; }
 done
 
 rm -f "$ids_file"

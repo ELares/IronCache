@@ -61,7 +61,7 @@ runs in CI and is offline and deterministic. It fails when:
 - a `Superseded-by:` or `Supersedes:` link points at an ADR number with no file;
 - an ADR file is not listed in `INDEX.md`.
 
-Binding a *closed* `[DECISION]` issue to the existence of its ADR requires the
-GitHub API and is therefore tracked as a separate (non-blocking) check rather
-than gating every offline docs build; the offline gate above keeps the records
-themselves honest.
+Binding a *closed* `[DECISION]` issue to the existence of its ADR (issue #4
+rule 6) requires the GitHub API and is tracked in #166 as a separate
+(non-blocking) check rather than gating every offline docs build; the offline
+gate above keeps the records themselves honest in the meantime.
