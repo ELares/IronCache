@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# proptest saves a regression seed file on a failing case.
+proptest-regressions/
+
+# Claude Code agent worktrees and session state (never commit).
+.claude/
+
+# local scratch
+*.tmp
+*.bak

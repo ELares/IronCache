@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Vision EPIC (start here)
+    url: https://github.com/ELares/IronCache/issues/1
+    about: The index of the whole project. Read this first to see where a topic fits.
