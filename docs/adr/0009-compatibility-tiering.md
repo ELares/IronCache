@@ -25,8 +25,11 @@ pinned Valkey oracle [valkey-resp-identical]:
   TYPE/SCAN), the 80/20 a cache client actually uses.
 - **Tier 2 (Collections):** lists, sets, hashes, sorted sets.
 - **Tier 3 (Extended):** bitmaps, HyperLogLog, geo, pub/sub
-  [sharded-pubsub-7.0].
-- **Tier 4 (Out of scope for v1):** Lua/Functions and Streams, the committed
+  [sharded-pubsub-7.0], and Streams. Streams is a committed v1 non-goal
+  (NON_GOALS entry 12), but it is an extended data type and so is tiered here,
+  not in Tier 4; the non-goal defers building it, it does not reclassify it as a
+  runtime surface.
+- **Tier 4 (Out of scope for v1):** Lua/Functions, the committed runtime-surface
   non-goals.
 
 A command is supported with Valkey-identical observable behavior or documented

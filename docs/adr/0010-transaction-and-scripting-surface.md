@@ -14,8 +14,9 @@ of the surface v1 commits to, and the mechanism.
 
 ## Decision
 
-Commit to a **scoped transaction surface on VLL** (the lightweight locking from
-ADR-0002's coordinator [dragonfly-vll-citation]):
+Commit to a **scoped transaction surface on VLL** (the Dragonfly lock-manager
+adaptation [dragonfly-vll-citation]), running through the cross-shard coordinator
+(#29) that ADR-0002 calls for:
 
 - MULTI / EXEC / DISCARD / WATCH with exact Redis semantics: commands queue at
   MULTI, EXEC applies them, there is **no rollback** on a runtime error, and a

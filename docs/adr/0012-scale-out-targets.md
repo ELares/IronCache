@@ -49,3 +49,7 @@ Adopt these headline scale-out targets for the multi-node system:
   forces it.
 - The targets are realized in Wave 3 (clustering), consistent with the
   single-node-first sequencing (ADR-0011, roadmap).
+- At the 4096-node floor the slot granularity is coarse (16384 / 4096 = 4 slots
+  per node, so one slot move is about a quarter of a node's data); the migration
+  design (#75) must account for sub-slot or streaming migration if the
+  single-digit-second per-partition rebalance budget is to hold at that scale.
