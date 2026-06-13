@@ -1,0 +1,21 @@
+name: docs
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "docs/**"
+      - "scripts/ci/**"
+      - ".github/workflows/docs.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prior-art-claims:
+    name: prior-art claims agree with claims.yaml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check prior-art claim citations
+        run: bash scripts/ci/check-prior-art-claims.sh
