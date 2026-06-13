@@ -27,9 +27,12 @@ The ceiling is enforced against allocator-attributed bytes (ADR-0006).
   cache and OOMs on write unless the operator intervenes. Safe defaults that
   match the product's identity outrank surprise-minimizing parity, and the
   divergence is in the operationally safer direction.
-- **Eviction on but no ceiling (unbounded until OOM).** Rejected: without a
-  ceiling there is nothing to evict against; the limit is what makes the cache
-  bounded.
+- **Ceiling on but `noeviction` default (bounded store that errors on write).**
+  This was issue #45's Option C. Rejected as the worst of both: it caps memory
+  but then refuses writes when full instead of caching, blurring the
+  cache-versus-datastore line precisely when an operator most expects cache
+  behavior. Datastore semantics are available, but as the explicit opt-in above,
+  not the default.
 
 ## Consequences
 

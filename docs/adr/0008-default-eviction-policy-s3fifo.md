@@ -25,18 +25,26 @@ most objects are one-hit wonders [s3fifo-onehit-wonder-72pct].
 
 - **Plain LRU.** Rejected on Efficient: per-hit relinking is a contended
   bottleneck and throughput drops at high hit ratio [hit-ratio-can-hurt-throughput].
+- **Sampled LRU/LFU (Redis-style).** Rejected: Redis does not implement true
+  LRU/LFU but samples a few keys per eviction [redis-lru-lfu-sampling]
+  [redis-maxmemory-samples-5], paying per-eviction sampling cost and per-object
+  metadata for no hit-ratio win over the FIFO-based policies.
 - **SIEVE as the default.** Strong and the simplest (one FIFO + a visited bit,
-  no ghost) [sieve-simpler-than-lru-nsdi24] [sieve-throughput], kept as a
-  selectable policy. Rejected as the default because it has no ghost queue and
-  degrades on small caches and scan-heavy block workloads
-  [sieve-loc-and-stack-property], whereas S3-FIFO has the best miss ratio on 10
-  of 14 datasets [s3fifo-miss-ratio-wins] and about 6x the throughput of an
-  optimized LRU at 16 threads [s3fifo-throughput-6x].
-- **W-TinyLFU-fronted FIFO as the default.** Best raw hit ratio via its
-  windowed admission [wtinylfu-window-main-split], but it carries a frequency
-  sketch (more per-cache metadata) than S3-FIFO's 2-bit counter for a marginal
-  hit-ratio gain on most traces. Kept as an admission-filter augmentation (#49),
-  not the default.
+  no ghost) [sieve-simpler-than-lru-nsdi24] [sieve-throughput], and lowest miss
+  ratio on over 45 percent of the web-cache traces in its own study
+  [sieve-miss-ratio-45pct]; kept as a selectable policy. Rejected as the default
+  because it has no ghost queue and degrades on small caches and scan-heavy block
+  workloads [sieve-loc-and-stack-property], while S3-FIFO is best on 10 of 14
+  datasets in its study [s3fifo-miss-ratio-wins] at about 6x the throughput of an
+  optimized LRU at 16 threads [s3fifo-throughput-6x]. Both "wins on N percent of
+  traces" figures are each algorithm's home-corpus result, so #47 re-validates
+  the call on a shared corpus.
+- **W-TinyLFU-fronted FIFO as the default.** Strong hit ratio via its windowed
+  admission [wtinylfu-window-main-split], but its 4-bit Count-Min sketch costs
+  about 8 bytes per entry [wtinylfu-cmsketch-4bit] versus S3-FIFO's 2-bit counter
+  [s3fifo-freq-counter-2bit-cap3], roughly 30x the per-entry policy metadata. We
+  judge that cost not worth the hit-ratio delta for the default (a judgment #47
+  will confirm), and keep W-TinyLFU as a selectable admission filter (#49).
 
 ## Consequences
 
