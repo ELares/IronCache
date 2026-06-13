@@ -14,6 +14,11 @@ in [OPEN.md](OPEN.md); research questions in [QUESTIONS.md](QUESTIONS.md).
 | [0006](0006-default-allocator-and-accounting.md) | Default allocator (jemalloc) and memory accounting | Accepted | #41 |
 | [0007](0007-memory-ceiling-and-eviction-on-by-default.md) | Memory ceiling + eviction on by default | Accepted | #45 |
 | [0008](0008-default-eviction-policy-s3fifo.md) | Default eviction policy is S3-FIFO | Accepted | #46 |
+| [0009](0009-compatibility-tiering.md) | Compatibility tiering (Tier 0-4), behavioral equivalence | Accepted | #16 |
+| [0010](0010-transaction-and-scripting-surface.md) | Transaction + scripting surface scope | Accepted | #30 |
+| [0011](0011-single-node-first-slot-ready.md) | Single-node-first, slot-ready layout | Accepted | #69 |
+| [0012](0012-scale-out-targets.md) | Headline scale-out targets | Accepted | #146 |
+| [0013](0013-advisor-default-posture.md) | Advisor default posture (shadow/off) | Accepted | #155 |
 
 As `[DECISION]` issues close, each adds its row here and its `NNNN-*.md` record.
 The numbering is monotonic and never reused, even after supersession.
