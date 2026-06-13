@@ -13,7 +13,7 @@ question open.
 | #9 single-core throughput bar | What is the honest per-core bar vs Redis/Valkey/Dragonfly/Garnet? | #7 |
 | #26 runtime bake-off | monoio vs glommio vs tokio+epoll on GET/SET? | #24, #27 |
 | #32 hot-shard mitigation | How to handle a hot shard and reclaim memory under shard-per-core? | #33, #36 (resolved on paper: ADR-0004/0005, reclamation needs no concurrent machinery on the owned hot path; empirical skew benchmark filed as #170) |
-| #37 encoding thresholds | Adaptive vs fixed listpack/intset conversion thresholds? | #35, #37 |
+| #37 encoding thresholds | Adaptive vs fixed listpack/intset conversion thresholds? | #35 (decided: ADR-0018 fixed Redis-compatible thresholds, adaptive deferred to the advisor) |
 | #42 allocator bench | jemalloc vs mimalloc vs snmalloc under a cache workload? | #41 (decided: ADR-0006 jemalloc on introspection/defrag-hint grounds; #42 re-milestoned to M1 as empirical validation, gated on #8) |
 | #47 eviction bench | SIEVE vs S3-FIFO vs W-TinyLFU vs ARC/LIRS on real traces? | #46 (decided: ADR-0008 S3-FIFO default; #47 re-milestoned to M1 as empirical validation on cachemon + our traces) |
 | #57 value-size survey | Value-size and compressibility distribution? | #52, #53 |

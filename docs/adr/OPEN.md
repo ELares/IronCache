@@ -11,11 +11,6 @@ stance.
 
 | Decision issue | Area | Blocked on (research) | Milestone | Critical path |
 | --- | --- | --- | --- | --- |
-| #59 durability stance | persistence | #61 snapshot-overhead | Impl. Readiness | yes |
-| #53 default codec | compression | #57 value-size survey | Impl. Readiness | no |
-| #7 headline metrics | performance | #9 single-core bar | Impl. Readiness | yes |
-| #157 per-tenet acceptance gates | governance | #7, #16, #24 | Impl. Readiness | no |
-| #37 adaptive vs fixed encoding thresholds | datastructures | #57 | M0 | no |
 | #33/#36 dependents (allocator cross-shard frees) | memory | #42 | M1 | no |
 
 An entry is removed from this register the moment its ADR is accepted and listed
