@@ -22,9 +22,10 @@ methodology:
 - Tail latency measured with an open-loop, coordinated-omission-corrected
   generator [coordinated-omission-closed-loop], not a closed-loop tool reporting
   only averages.
-- Workloads: Zipfian key distributions and the standard YCSB mix
-  [ycsb-core-workloads], with pipelining depth stated explicitly (memtier
-  defaults to none [memtier-default-pipeline-1]).
+- Workloads: Zipfian key distributions and the standard YCSB operation mix
+  [ycsb-core-workloads], driven through the pinned memtier harness (not YCSB's
+  JVM client, which bottlenecks throughput and lacks pipelining), with pipelining
+  depth stated explicitly (memtier defaults to none [memtier-default-pipeline-1]).
 - Comparisons run against a pinned Valkey/Redis/Dragonfly on identical hardware.
 
 ## Rejected Alternatives

@@ -17,7 +17,8 @@ Redis BGSAVE model.
 an opt-in menu:
 
 1. **Forkless versioned point-in-time snapshot** (#60), with constant extra
-   memory and no `fork()` [dragonfly-forkless-versioned-snapshot].
+   memory regardless of dataset size [dragonfly-snapshot-constant-memory] and no
+   `fork()` [dragonfly-forkless-versioned-snapshot].
 2. **mmap warm-restart** (#62): a graceful shutdown writes a state file and a
    restart rebuilds in seconds [memcached-warm-restart-mmap-sigusr1], so a
    planned restart skips the cold-cache penalty.

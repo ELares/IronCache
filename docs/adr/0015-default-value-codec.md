@@ -43,6 +43,10 @@ by value size and entropy (#52/#92), so it never runs where it cannot pay.
   separately (#54); the codec choice here is logical, the linkage is #54.
 - Per-keyspace codec policy (zstd / lz4 / none) is a config surface (#85), with
   zstd-low the default.
+- The read hot path is protected by access asymmetry: a value is compressed once
+  on SET but decompressed on every GET, and zstd decompression speed is near
+  level-independent [zstd-silesia-benchmark-l1], so a high-ratio low level does
+  not tax reads no matter how hard SET compresses.
 - Compression interacts with mutating commands and hot keys (#56) and with the
   off-path compression-decision model (#92); the size/entropy gate keeps it off
   the path where it does not pay.

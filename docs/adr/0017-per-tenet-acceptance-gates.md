@@ -21,9 +21,10 @@ Each tenet has a release gate, in charter rank order:
   Valkey/Dragonfly (per-core throughput strictly above Valkey single-core;
   bytes-per-item below Redis at a fixed hit ratio), enforced by the regression
   gate (#159).
-- **Simple:** a static-binary size ceiling, a kernel-only runtime-dependency
-  count of zero beyond libc/the kernel (musl static build [rust-musl-crt-static-default]),
-  and an install-to-first-GET time bound.
+- **Simple:** a static-binary size ceiling, kernel-only at runtime (a static
+  musl build links libc into the binary; crt-static is the default on
+  x86_64-unknown-linux-musl and is set explicitly on the other musl targets
+  [rust-musl-crt-static-default]), and an install-to-first-GET time bound.
 - **Scalable:** a per-core scaling-efficiency target out to N cores, plus the
   cluster budgets in ADR-0012 (#146).
 - **AI-Driven:** the advisor must never regress below the static baseline
