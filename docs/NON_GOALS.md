@@ -44,9 +44,13 @@ AI-Driven.
 
 8. **No strong consistency in the default mode.** The default replication tier
    is asynchronous leader-follower, so an acknowledged write can be lost on
-   failover, exactly as Redis WAIT is not a durability guarantee
-   [redis-wait-not-strongly-consistent]. Strong durability is an explicit opt-in
-   quorum tier, never the default. (Honest Scalable.)
+   failover, exactly as Redis WAIT is not a strong-consistency guarantee
+   [redis-wait-not-strongly-consistent]. We will not expose a WAIT-style
+   acknowledgement in the default tier that can be read as a consistency
+   guarantee. Strong durability is an explicit opt-in quorum tier, never the
+   default. Promising Redis-async semantics as strong consistency would be a
+   silent behavioral divergence, the worst kind of incompatibility. (Compatible
+   first, then Efficient and Simple.)
 9. **No consistency or efficiency claim without its test.** We will not advertise
    a consistency level for any mode that has not passed a Jepsen suite checked by
    Elle (Redis-Raft itself shipped with 21 such issues [jepsen-redis-raft-21-issues]),
