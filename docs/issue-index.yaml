@@ -1283,3 +1283,419 @@ issues:
   - area:testing
   - sub-issue
   parent: conformance-suite
+
+# Issues added by the 2026-06-13 pre-implementation audit (split sub-issues + coverage gaps).
+post_audit_additions:
+- number: 101
+  title: '[NON-GOAL]: no fork()+copy-on-write point-in-time snapshotting (BGSAVE model)'
+  kind: design
+  milestone: 'M0: Vision and Scope'
+  source: split
+  parent: 11
+- number: 102
+  title: '[NON-GOAL]: do not require host THP disable or vm.overcommit_memory=1 as a precondition'
+  kind: design
+  milestone: 'M0: Vision and Scope'
+  source: split
+  parent: 11
+- number: 103
+  title: '[NON-GOAL]: no mandatory proxy on the hot path for routing'
+  kind: design
+  milestone: 'M0: Vision and Scope'
+  source: split
+  parent: 11
+- number: 104
+  title: '[DESIGN]: AUTH handshake and credential model (HELLO AUTH, AUTH, requirepass, SHA-256 default
+    user)'
+  kind: design
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 22
+- number: 105
+  title: '[DESIGN]: Embedded rustls TLS listener (cert/key config, TLS-only mode, no C TLS lib)'
+  kind: design
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 22
+- number: 106
+  title: '[DESIGN]: Full ACL engine and aclfile persistence (deferred from M1)'
+  kind: design
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 22
+- number: 107
+  title: '[DESIGN]: Cross-shard coordinator: topology, txid ordering, MGET/MSET atomicity, and back-pressure'
+  kind: design
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 29
+- number: 108
+  title: '[DESIGN]: Pub/Sub fan-out topology under shared-nothing shards'
+  kind: design
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 29
+- number: 109
+  title: '[DOC/ADR]: Apply #30''s transaction-and-scripting surface decision to the coordinator'
+  kind: decision-record
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 29
+- number: 110
+  title: '[DESIGN]: Per-shard bucket table geometry and incremental rehash policy'
+  kind: design
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 35
+- number: 111
+  title: '[DESIGN]: One-allocation per-key object layout (embedded key + inline small value + metadata
+    bits)'
+  kind: design
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 35
+- number: 112
+  title: '[DESIGN]: Compact scalar value encodings (SSO, tagged small int/float, variable-width string
+    header)'
+  kind: design
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 35
+- number: 113
+  title: '[DESIGN]: Universal collection container and intset analog (cascade-update designed out)'
+  kind: design
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 35
+- number: 114
+  title: '[TASK]: intset encoding (sorted packed int16/32/64, width upgrade, 512-entry cap, promotion
+    to #35 set path)'
+  kind: task
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 39
+- number: 115
+  title: '[TASK]: HyperLogLog encoding (P=14 dense + sparse ZERO/XZERO/VAL, PFADD/PFCOUNT/PFMERGE)'
+  kind: task
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 39
+- number: 116
+  title: '[TASK]: SIMD register-histogram / merge kernels for PFCOUNT, PFMERGE, BITCOUNT (benchmark-gated)'
+  kind: task
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 39
+- number: 117
+  title: '[DECISION]: Default global allocator (jemalloc vs mimalloc vs snmalloc)'
+  kind: decision
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 41
+- number: 118
+  title: '[DECISION]: Memory accounting and size-class scheme for honest maxmemory'
+  kind: decision
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 41
+- number: 119
+  title: '[DECISION]: CLI mode dispatch - clap subcommands vs argv[0] symlink branching'
+  kind: decision
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 82
+- number: 120
+  title: '[DECISION]: Release-artifact and self-update signing scheme - minisign vs cosign/sigstore'
+  kind: decision
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 82
+- number: 121
+  title: '[TASK]: Reproducible cross-build matrix on cargo-zigbuild (musl x86_64/aarch64 + glibc-pinned
+    gnu fallback)'
+  kind: task
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 84
+- number: 122
+  title: '[TASK]: Release distribution and install paths (curl|sh installer, Homebrew formula, distroless
+    image, hardened systemd unit)'
+  kind: task
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 84
+- number: 123
+  title: '[TASK]: Supply-chain SBOM and artifact attestation (cargo-auditable embedded SBOM + per-release
+    CycloneDX)'
+  kind: task
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 84
+- number: 124
+  title: '[SPIKE]: musl allocator contention benchmark (musl malloc vs static mimalloc vs static jemalloc)
+    on the IronCache cache workload'
+  kind: research
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 84
+- number: 125
+  title: '[NON-GOAL]: Record native Windows server binary as a deferred M2 non-goal (Docker/WSL)'
+  kind: design
+  milestone: 'M2: Prototype-Ready Design'
+  source: split
+  parent: 84
+- number: 126
+  title: '[DESIGN]: AI-driven background advisor - expert selection + bounded knob autotuning (runtime)'
+  kind: design
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 88
+- number: 127
+  title: '[TASK]: Stand up the LLM/agent prior-art mining + adversarial claim-verification pipeline'
+  kind: task
+  milestone: 'M1: Architecture Specification'
+  source: split
+  parent: 88
+- number: 128
+  title: '[DESIGN]: Per-data-type command semantics for strings, lists, hashes, sets, and sorted sets'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 129
+  title: '[DESIGN]: Generic keyspace commands and SCAN cursor-stability contract (SCAN/HSCAN/SSCAN/ZSCAN,
+    KEYS, TYPE, RANDOMKEY, RENAME, COPY, TOUCH, DUMP/RESTORE)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 130
+  title: '[DESIGN]: Blocking command semantics (BLPOP/BRPOP/BLMOVE/BLMPOP/BZPOPMIN/BZMPOP, WAIT, XREAD
+    BLOCK) under the shared-nothing model'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 131
+  title: '[DESIGN]: Bitmap and BITFIELD semantics over the string type (SETBIT/GETBIT/BITCOUNT/BITPOS/BITOP/BITFIELD:
+    addressing, growth, signed/unsigned overflow)'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 132
+  title: '[NON-GOAL]: Redis Streams (XADD/XREAD/XRANGE, consumer groups, rax index) out of scope for M0-M2'
+  kind: non-goal
+  milestone: M0
+  source: gap
+  parent: null
+- number: 133
+  title: '[DECISION]: Geo command family (GEOADD/GEOSEARCH/GEODIST) scope vs non-goal'
+  kind: decision
+  milestone: M1
+  source: gap
+  parent: null
+- number: 134
+  title: '[DESIGN]: Sorted-set (zset) large representation: ordered index plus parallel member->score
+    map'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 135
+  title: '[DESIGN]: List (quicklist-equivalent) representation: linked listpack chunks with O(1) head/tail
+    and node sizing'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 136
+  title: '[RESEARCH]: Large-collection structure bake-off (zset ordered index: skiplist vs B-tree/ART;
+    list deque structure) on throughput-per-core and bytes-per-element'
+  kind: research
+  milestone: M1
+  source: gap
+  parent: null
+- number: 137
+  title: '[DESIGN]: Connection admission, max-clients, output-buffer limits, and the OOM-write/DoS contract
+    under sustained pressure'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 138
+  title: '[DESIGN]: RESP request-size and adversarial-input hardening (proto-max-bulk-len tunable, multibulk
+    count cap, accumulated-frame bound, RESP3 nesting depth, inline-length cap, parser-work budget)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 139
+  title: '[DESIGN]: Graceful shutdown contract (SHUTDOWN [NOSAVE|SAVE], SIGTERM/SIGINT, connection drain,
+    optional save-on-exit, orchestrator exit/grace contract)'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 140
+  title: '[DESIGN]: Idle-connection timeout, TCP keepalive, and dead-peer reaping'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 141
+  title: '[DECISION]: Per-command operational latency budget and slow-operation guard under defrag/eviction/snapshot/expire'
+  kind: decision
+  milestone: M1
+  source: gap
+  parent: null
+- number: 142
+  title: '[DESIGN]: Written threat model (assets, trust boundaries, attacker capabilities, STRIDE per
+    subsystem)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 143
+  title: '[DESIGN]: At-rest encryption of snapshots, warm-restart state, and tiered-store SSD files'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 144
+  title: '[TASK]: Continuous dependency-vulnerability and license auditing as a merge/release gate (cargo-audit/RUSTSEC
+    + cargo-deny)'
+  kind: task
+  milestone: M1
+  source: gap
+  parent: null
+- number: 145
+  title: '[DESIGN]: Secrets handling: log/MONITOR redaction, in-memory zeroization, and core-dump/swap
+    exposure'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 146
+  title: '[DECISION]: Headline scale-out targets (max nodes, slots-per-node working range, rebalance-time
+    and failover-time budgets)'
+  kind: decision
+  milestone: M0
+  source: gap
+  parent: null
+- number: 147
+  title: '[DESIGN]: Replica-read contract (READONLY/READWRITE, replica routing, bounded staleness surfaced
+    to clients)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 148
+  title: '[DESIGN]: Rebalancing policy and orchestration (when/which partitions move, hot-slot trigger,
+    node drain and decommission)'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 149
+  title: '[DESIGN]: Cluster bootstrap and node-lifecycle (seed/MEET join, learner-to-voter-to-slot-owner
+    promotion, add/remove-node surface)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 150
+  title: '[DESIGN]: Admin/introspection command family (CLIENT LIST/INFO/KILL/PAUSE/NO-EVICT/NO-TOUCH,
+    COMMAND DOCS/INFO/COUNT/GETKEYS)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 151
+  title: '[DESIGN]: Troubleshooting introspection commands (MEMORY USAGE/STATS/DOCTOR, LATENCY DOCTOR)'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 152
+  title: '[DESIGN]: Metric/label registry, native INFO field catalog, and per-command cardinality bounds'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 153
+  title: '[DESIGN]: AI advisor observability, explainability, and decision/audit trail (knob from->to,
+    trigger, objective delta, snapshot version, rollback/kill-switch events; surfaced via INFO/metrics
+    and queryable, emitted even in shadow mode)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 154
+  title: '[DESIGN]: Advisor evaluation and promotion gate (offline replay + shadow A/B proving a change
+    beats the static baseline before it acts)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 155
+  title: '[DECISION]: Advisor default posture (ship shadow/off by default; engine fully correct and fast
+    with the advisor disabled)'
+  kind: decision
+  milestone: M0
+  source: gap
+  parent: null
+- number: 156
+  title: '[NON-GOAL]: The advisor adds no runtime network, model-service, or GPU dependency; AI is build-time
+    only except the in-binary O(1) controller'
+  kind: non-goal
+  milestone: M0
+  source: gap
+  parent: null
+- number: 157
+  title: '[DECISION]: Per-tenet acceptance targets and release gates for Compatible/Efficient/Simple/Scalable/AI-Driven'
+  kind: decision
+  milestone: M0
+  source: gap
+  parent: null
+- number: 158
+  title: '[DESIGN]: Real client-driver compatibility matrix (run lettuce/redis-py/go-redis/ioredis/node-redis/jedis/StackExchange.Redis
+    own test suites against IronCache)'
+  kind: design
+  milestone: M2
+  source: gap
+  parent: null
+- number: 159
+  title: '[DESIGN]: Continuous performance-regression CI gate (per-commit throughput-per-core and bytes-per-key
+    ratchet)'
+  kind: design
+  milestone: M1
+  source: gap
+  parent: null
+- number: 160
+  title: '[TASK]: Determinism replay-contract verification as a CI gate (same seed yields byte-identical
+    execution; Env-seam lint against direct nondeterminism)'
+  kind: task
+  milestone: M2
+  source: gap
+  parent: null
+- number: 161
+  title: '[TASK]: Long-horizon soak and memory-stability correctness gate (no leak, bounded fragmentation/RSS
+    drift, no fd/timer/tracked-key growth)'
+  kind: task
+  milestone: M2
+  source: gap
+  parent: null
+- number: 162
+  title: '[RESEARCH]: Pin the second-tier KV/cache landscape (Aerospike, Tarantool, Kvrocks, Hazelcast/Ignite/Coherence,
+    Skytable, Redka)'
+  kind: research
+  milestone: M0
+  source: gap
+  parent: null
+- number: 163
+  title: '[RESEARCH]: Foundational CRDT literature and OR-Set tombstone GC for the full Redis type surface'
+  kind: research
+  milestone: M2
+  source: gap
+  parent: null
