@@ -21,10 +21,11 @@ adopted solely if shard affinity is ever abandoned.
 ## Rejected Alternatives
 
 - **A concurrent map as the primary store (dashmap / scc / papaya).** Rejected
-  on Efficient: these carry per-operation locks or atomics
-  [dashmap-internal-design] [papaya-version-reclamation] that are pure overhead
-  when a single owner already guarantees exclusive access. They solve a sharing
-  problem ADR-0002 designed away.
+  on Efficient: dashmap and scc carry a per-shard `RwLock`
+  [dashmap-internal-design] and papaya carries per-operation atomics plus
+  deferred reclamation [papaya-version-reclamation], all of which are pure
+  overhead when a single owner already guarantees exclusive access. They solve a
+  sharing problem ADR-0002 designed away.
 - **`std::collections::HashMap`.** Not rejected on merit (it is the same
   SwissTable as `hashbrown`); `hashbrown` is chosen directly for its raw-entry
   and allocator-parameter APIs, which the per-shard allocator (#41) and custom

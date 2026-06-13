@@ -12,6 +12,13 @@ other core may hold a reference to it, so the question is narrower than it first
 appears: where, if anywhere, does the engine genuinely share a structure across
 cores, and what reclaims it safely?
 
+This ADR overrides issue #33's stated recommendation (adopt a custom FASTER-style
+global-epoch + drain-list as the backbone, with crossbeam-epoch studied but not
+the integration point). That recommendation assumed an in-place writer racing a
+concurrent reader; under single-owner shared-nothing (ADR-0002) there is no
+concurrent reader on the owned hot path, so the premise does not hold and the
+lighter decision below is the correct one.
+
 ## Decision
 
 - The shard-local hot path uses **no safe-memory-reclamation (SMR) machinery**.
@@ -23,14 +30,16 @@ cores, and what reclaims it safely?
 - Defer adopting a custom FASTER-style global-epoch + thread-local + trigger
   drain-list framework until the HybridLog region-shift work (#64) demonstrates
   that epoch-based reclamation is insufficient for phase-aware region boundary
-  moves.
+  moves. The epoch-vs-custom-framework contest that #33 posed for any future
+  shared or region-shift case is NOT resolved here; it is decided at #64. Only
+  the hot-path question (no SMR) is resolved now.
 
 ## Rejected Alternatives
 
 - **Adopt a custom FASTER-style drain-list framework now.** Rejected as
-  premature: it is phase-aware machinery [faster-hash-bucket-layout] with real
-  maintenance cost, and nothing on the owned hot path needs it yet; building it
-  before #64 proves the need violates Simple.
+  premature: it is phase-aware, epoch-protected machinery [faster-epoch-protection]
+  with real maintenance cost, and nothing on the owned hot path needs it yet;
+  building it before #64 proves the need violates Simple.
 - **Make a hyaline/`seize`-style reclaimer (papaya) the default backbone.**
   Rejected: hyaline is more robust than EBR for heavily-shared lock-free maps
   [seize-vs-epoch] [papaya-version-reclamation], but the per-shard store is not

@@ -25,12 +25,15 @@ state, and cross-shard work is explicit message passing, never shared mutation.
 
 - **Shared dict guarded by a ticket spinlock (KeyDB).** Rejected on Efficient:
   a shared, mutated keyspace under a spinlock has a contention ceiling
-  [keydb-fastlock-ticket-spinlock]; it optimizes the lock instead of removing
-  it.
+  [keydb-fastlock-ticket-spinlock], and the design rests on the bet that
+  hash-table access is short enough to hold a lock [keydb-spinlock-low-contention-claim];
+  it optimizes the lock instead of removing it.
 - **Single command thread with offloaded I/O (Redis, Valkey).** Rejected on
   Efficient: command execution stays on one thread
-  [redis-command-execution-single-threaded], so most cores sit idle; offloading
-  sockets does not lift the keyspace ceiling.
+  [redis-command-execution-single-threaded], and Valkey's I/O threads offload
+  only socket read/parse/write while execution stays single-threaded
+  [valkey-io-threads-offload-scope], so most cores sit idle and the keyspace
+  ceiling is unlifted.
 - **Tokio work-stealing over a shared store.** Rejected: work-stealing forces
   every shared structure to be `Send + Sync` and re-introduces atomics and locks
   on the hot path [tokio-workstealing-readiness-model], the opposite of what the
