@@ -302,8 +302,8 @@ Redis bundles jemalloc 5.3.0 [redis-bundled-jemalloc-version]; upstream jemalloc
 defaults `narenas` to 4x CPUs [jemalloc-narenas-default], disables the background
 purge thread [jemalloc-background-thread-default] (Redis re-enables it), and decays
 dirty pages over 10 seconds [jemalloc-decay-defaults]. Dragonfly chose mimalloc,
-reported about 13 percent faster than jemalloc on one benchmark and over 2.5x on
-another (2021 hardware) [mimalloc-benchmarks], available to Rust as the mimalloc
+reported about 13 percent faster than tcmalloc on one benchmark and over 2.5x
+faster than jemalloc on another (2021 hardware) [mimalloc-benchmarks], available to Rust as the mimalloc
 crate 0.1.52 [mimalloc-rust-version] or jemalloc via tikv-jemallocator 0.7.0
 [tikv-jemallocator-version]. Fragmentation is the operational tax: Redis defines
 `mem_fragmentation_ratio` as RSS over used memory [redis-fragmentation-ratio], and

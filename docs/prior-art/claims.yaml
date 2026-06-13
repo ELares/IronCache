@@ -1,35 +1,29 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
-# IronCache prior-art claims: the version-pinned source of record.
+# IronCache prior-art claim record: the version-pinned source of record.
 #
 # This file is the SINGLE descriptive source of truth for every numeric or
-# version-specific claim that IronCache's prose (docs/PRIOR_ART.md, the README,
-# the research docs, and the design issues) asserts about another system. It is
-# strictly DESCRIPTIVE: it records what an upstream system does at a pinned
-# version, never what IronCache should do. Prescriptive IronCache decisions live
-# in the design issues and (later) the merged design docs, never here.
+# version-specific statement that IronCache's prose (docs/PRIOR_ART.md, the
+# README, the research docs, and the design issues) asserts about another
+# system. It is strictly DESCRIPTIVE: it records what an upstream system does at
+# a pinned version, never what IronCache should do. Prescriptive IronCache
+# decisions live in the design issues, never here.
 #
 # Contract:
 #   * Every load-bearing number in the prose carries an "[id]" tag naming an
 #     entry below. The prose MUST agree with the value pinned here; this file
 #     wins on any disagreement.
-#   * scripts/ci/check-prior-art-claims.sh asserts that every [id] cited in
+#   * scripts/ci/check-prior-art-claims.sh asserts that every "[id]" cited in
 #     docs/PRIOR_ART.md exists below and that every id is unique. It does not
-#     re-fetch sources; upstream drift is caught by the accessed_date going stale.
+#     re-fetch sources; upstream drift is caught by accessed_date going stale.
 #
-# Provenance: these claims were gathered by a fan-out of AI research agents
-# (one per caching dimension), each grounding claims in primary sources. Every
-# load-bearing or non-high-confidence claim was then re-checked by an
-# independent adversarial verifier. The "verification" block on an entry records
-# that verdict (confirmed / corrected / refuted / uncertain / self-verified).
-# Where the verdict was "corrected", the "value" below is the corrected value
-# and the verifier's original is preserved under verification.original_value.
-#
-# Per-entry schema:
-#   id, dimension, system, version, claim, value, source_url, accessed_date,
-#   confidence (high|medium|low) + confidence_reason, load_bearing (bool),
-#   and an optional verification block.
-
+# Provenance: claims were gathered by AI research agents from primary sources,
+# then load-bearing or non-high-confidence claims were re-checked by an
+# independent adversarial verifier. A subset was re-audited again in the
+# pre-implementation issue audit (verification.reaudited = 2026-06-13). The
+# "verification" block records the verdict (confirmed / corrected / refuted /
+# uncertain / self-verified); where the verdict is "corrected" the "value" is
+# the corrected value and the prior reading is kept under original_value.
 claims:
 - id: baleen-flash-admission-fast24
   dimension: ai-ml-caching
@@ -585,9 +579,8 @@ claims:
   version: Valkey 8.x (community benchmarks, accessed 2026-06-13)
   claim: Valkey 8.0 reached ~1.19M RPS on c7g.4xlarge (~230% over 7.2's ~360K RPS); separately SET throughput
     went 239K (no io-threads) to 678K with 6 io-threads, p99 1.68ms to 0.93ms
-  value: ~1.19M RPS (8.0) vs ~360K (7.2) = ~230%, measured on c7g.16xlarge (NOT c7g.4xlarge); 239K->678K
-    SET with 6 io-threads and p99 1.68ms->0.93ms. Both number sets are real but neither appears at the
-    cited URL.
+  value: ~1.19M RPS (Valkey 8.0) vs ~360K (7.2) = ~230% increase, on AWS EC2 c7g.16xlarge (NOT c7g.4xlarge),
+    8 I/O threads, 3M keys, 512B values; avg latency 1.792ms -> 0.542ms (-69.8%)
   source_url: https://valkey.io/blog/performance-optimization-methodology-for-valkey/
   accessed_date: '2026-06-13'
   confidence: medium
@@ -597,12 +590,11 @@ claims:
   verification:
     verdict: corrected
     best_source_url: https://valkey.io/blog/unlock-one-million-rps/
-    note: The cited valkey.io perf-methodology blog contains NEITHER number set. The 1.19M/360K/230% figures
-      are in valkey.io/blog/unlock-one-million-rps/ ('rising from 360K to 1.19M requests per second compared
-      to Valkey 7.2'), and the stated test instance there is c7g.16xlarge, not c7g.4xlarge as the claim
-      says (one secondary source mis-cited it as 4xlarge). The 239K->678K SET / p99 1.68->0.93ms figures
-      are from the Momento 'Valkey Turns One' article (gomomento.com), reflecting a 6-io-threads SET benchm
+    note: 'Re-audited 2026-06-13: instance is c7g.16xlarge and the 230% figure holds. The previously-recorded
+      second dataset (239K->678K SET with 6 io-threads, p99 1.68->0.93ms) has NO primary anchor and was
+      removed as unverified.'
     original_value: ~1.19M RPS (8.0) vs ~360K (7.2); 239K->678K SET
+    reaudited: '2026-06-13'
 - id: valkey-methodology-baremetal-pinning
   dimension: benchmarking-correctness
   system: Valkey
@@ -928,7 +920,8 @@ claims:
   version: 0.13.3
   claim: The zstd Rust crate v0.13.3 binds zstd C library 1.5.7 (via zstd-sys 2.0.16+zstd.1.5.7) and exposes
     features bindgen, pkg-config, zstdmt, experimental, zdict_builder, no_asm, legacy, thin, fat-lto.
-  value: zstd 0.13.3 -> bundles zstd C 1.5.7; zstd-sys 2.0.14+zstd.1.5.7 (NOT 2.0.16)
+  value: zstd 0.13.3 -> zstd-safe 7.1.0 -> zstd-sys 2.0.16+zstd.1.5.7 (bundles zstd C 1.5.7); zstd-safe
+    declares a caret zstd-sys >=2.0.10 so a fresh resolve today picks 2.0.16
   source_url: https://github.com/gyscos/zstd-rs
   accessed_date: '2026-06-13'
   confidence: high
@@ -936,13 +929,12 @@ claims:
   load_bearing: true
   verification:
     verdict: corrected
-    best_source_url: https://github.com/gyscos/zstd-rs/blob/v0.13.3/zstd-safe/zstd-sys/Cargo.toml
-    note: 'Verified dependency chain at tag v0.13.3: zstd 0.13.3 -> zstd-safe 7.2.2 -> zstd-sys version
-      ''2.0.14+zstd.1.5.7'' (links=zstd). The claimed zstd-sys version 2.0.16 is wrong; the actual pinned/bundled
-      version is 2.0.14. Bundled C library 1.5.7 is correct. All listed feature flags (bindgen, pkg-config,
-      zstdmt, experimental, zdict_builder, no_asm, legacy, thin, fat-lto) exist in zstd 0.13.3 Cargo.toml.
-      Only the zstd-sys patch number is corrected.'
+    best_source_url: https://crates.io/crates/zstd-sys
+    note: 'Re-audited 2026-06-13: RE-CORRECTED. The earlier ''2.0.14 not 2.0.16'' was a stale-lockfile
+      artifact; current resolution of zstd 0.13.3 yields zstd-sys 2.0.16+zstd.1.5.7. Original 2.0.16 value
+      restored.'
     original_value: zstd 0.13.3 -> bundles zstd C 1.5.7; zstd-sys 2.0.16+zstd.1.5.7
+    reaudited: '2026-06-13'
 - id: zstd-silesia-benchmark-l1
   dimension: compression-encoding
   system: Zstandard
@@ -3564,8 +3556,8 @@ claims:
   claim: On a 16-core AMD Ryzen 5950x, mimalloc is reported ~13% faster than jemalloc on the Lean benchmark
     and ~2.5x faster on sh6bench, with comparable or better memory usage; it also beats tcmalloc on larsonN
     and xmalloc-testN.
-  value: ~13% faster vs jemalloc on leanN; >2.5x faster on sh6bench -- but these figures are from the
-    2021 benchmark run (16-core AMD 5950x Zen3) against jemalloc tag 5.2.1, NOT a v3.3.2-specific benchmark
+  value: 'On a 16-core AMD Ryzen 5950x (2021 run; jemalloc 5.2.1, tcmalloc 2.8.1, mimalloc v1.7/v2.0-beta):
+    mimalloc ~13% faster than TCMALLOC on leanN, and >2.5x faster than JEMALLOC on sh6bench'
   source_url: https://github.com/microsoft/mimalloc/blob/master/readme.md
   accessed_date: '2026-06-13'
   confidence: medium
@@ -3575,13 +3567,10 @@ claims:
   verification:
     verdict: corrected
     best_source_url: https://github.com/microsoft/mimalloc/blob/master/readme.md
-    note: 'The numbers are present in readme.md: ''there is a 13% speedup over jemalloc'' (leanN) and
-      in sh6bench mimalloc ''does much better ... (more than 2.5x faster than jemalloc)''. However the
-      claim attributes them to ''version=v3.3.2''; the readme''s benchmark section is explicitly titled
-      ''Benchmark Results on a 16-core AMD 5950x (Zen3)'', uses jemalloc tag:5.2.1, and the chart is bench-2021
-      (2021-01-30) -- a fixed historical benchmark, not re-run for v3.3.2. Values right, version attribution
-      corrected. Cla'
+    note: 'Re-audited 2026-06-13: CORRECTED comparator. The ~13% leanN speedup is vs tcmalloc (readme:
+      ''13% speedup over tcmalloc''), NOT jemalloc; the >2.5x sh6bench figure is the one vs jemalloc.'
     original_value: ~13% faster vs jemalloc (Lean); ~2.5x faster on sh6bench
+    reaudited: '2026-06-13'
 - id: mimalloc-design-segments-pages
   dimension: memory-allocators
   system: mimalloc
@@ -3933,9 +3922,9 @@ claims:
   claim: cargo-dist automates cross-built release archives with SHA256 checksums and generates a one-line
     `curl --proto =https --tlsv1.2 -LsSf <url>/installer.sh | sh` installer that manages PATH (APPNAME_NO_MODIFY_PATH)
     and embeds checksums to validate the tarball before unpacking.
-  value: latest is dist v0.32.0 (2026-05-22), not ~0.31.0/2025 (project rebranded cargo-dist -> 'dist');
-    shell installer is `curl --proto =https --tlsv1.2 -LsSf <url> | sh` with embedded SHA256 checksums
-    validated before unpacking and PATH mgmt via *_NO_MODIFY_PATH
+  value: 'dist v0.32.0 (2026-05-22; project rebranded cargo-dist -> dist, repo axodotdev/cargo-dist) generates
+    a one-line installer: curl --proto ''=https'' --tlsv1.2 -LsSf <url> | sh, embedding SHA256 checksums
+    that validate the tarball before unpacking, with PATH control via {APPNAME}_NO_MODIFY_PATH'
   source_url: https://github.com/axodotdev/cargo-dist
   accessed_date: '2026-06-13'
   confidence: medium
@@ -3944,14 +3933,11 @@ claims:
   load_bearing: false
   verification:
     verdict: corrected
-    best_source_url: https://github.com/axodotdev/cargo-dist
-    note: 'Functional claims confirmed: cargo-dist generates a shell (curl|sh) installer with the --proto
-      =https --tlsv1.2 -LsSf flags, embeds checksum info into the installer and validates the tarball
-      before unpacking, and supports PATH management with a NO_MODIFY_PATH env var. Version is off: GitHub
-      releases/latest is v0.32.0 published 2026-05-22 (273 releases, actively maintained, now branded
-      ''dist''), so the claimed ''~v0.30.3-0.31.0 (2025)'' is stale/low. Corrected the version; original
-      ''medium'' confiden'
+    best_source_url: https://github.com/axodotdev/cargo-dist/releases
+    note: 'Re-audited 2026-06-13: version updated to v0.32.0 (was ~0.31.0). Installer flags, checksum
+      embedding, and PATH-env behavior confirmed.'
     original_value: ~v0.31.0; curl|sh installer with embedded checksums + PATH mgmt
+    reaudited: '2026-06-13'
 - id: cargo-zigbuild-version-features
   dimension: ops-build-distribution
   system: cargo-zigbuild
@@ -4249,7 +4235,9 @@ claims:
   version: Homebrew formulae (accessed 2026-06-13)
   claim: Valkey installs as a plain Homebrew formula (`brew install valkey`); Redis now requires `brew
     tap redis/redis` + `brew install --cask redis` and conflicts with valkey (cannot coexist).
-  value: valkey = plain formula; redis = tap+cask, conflicting
+  value: valkey is a plain Homebrew core formula (brew install valkey, 9.1.0, BSD-3-Clause); redis is
+    ALSO a plain core formula again (brew install redis, 8.8.0, AGPL-3.0-only) after re-adding AGPLv3
+    in Redis 8.0; the two formulae conflict_with each other
   source_url: https://formulae.brew.sh/formula/valkey
   accessed_date: '2026-06-13'
   confidence: medium
@@ -4257,12 +4245,15 @@ claims:
     not double-checked on brew page.
   load_bearing: true
   verification:
-    verdict: confirmed
-    best_source_url: https://formulae.brew.sh/formula/valkey
-    note: 'formulae.brew.sh/formula/valkey shows ''brew install valkey'' and ''Conflicts with: redis''.
-      redis.io Homebrew install docs confirm Redis OSS on macOS now uses ''brew tap redis/redis'' then
-      ''brew install --cask redis'' (cask, not formula; not integrated with brew services). Both halves
-      confirmed; original confidence ''medium'' upgraded.'
+    verdict: corrected
+    best_source_url: https://formulae.brew.sh/api/formula/redis.json
+    note: 'Re-audited 2026-06-13: the earlier ''redis needs brew tap + --cask'' is OUTDATED. redis returned
+      to Homebrew core (not deprecated/disabled) after the Redis 8.0 AGPLv3 relicense; both are plain
+      core formulae that mutually conflict.'
+    original_value: valkey is a plain Homebrew core formula (brew install valkey, 9.1.0, BSD-3-Clause);
+      redis is ALSO a plain core formula again (brew install redis, 8.8.0, AGPL-3.0-only) after re-adding
+      AGPLv3 in Redis 8.0; the two formulae conflict_with each other
+    reaudited: '2026-06-13'
 - id: dragonfly-conservative-vs-relaxed
   dimension: persistence-storage-engines
   system: Dragonfly
