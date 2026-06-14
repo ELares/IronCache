@@ -12,7 +12,8 @@
 //! its policy (the swap itself happens at the top of [`crate::dispatch`], not here:
 //! this command only mutates the shared cell). `CONFIG RESETSTAT` zeroes the SERVING
 //! shard's stat counters (serving-shard-scoped, like the single-shard KEYS/SCAN scope;
-//! a cross-shard reset is a coordinator follow-up). `CONFIG REWRITE` is a stub.
+//! a cross-shard reset is a coordinator follow-up). `CONFIG REWRITE` returns the Redis
+//! no-config-file error (the server currently boots without a config-file path).
 
 use crate::cmd_util::ascii_upper;
 use crate::dispatch::ServerContext;
@@ -77,23 +78,27 @@ fn config_get(ctx: &ServerContext, req: &Request) -> Value {
 }
 
 /// `CONFIG SET <param value> [param value ...]` -> `+OK` if every pair applies, else
-/// the FIRST failing pair's canonical error. Redis validates arity (an even number of
-/// param/value tokens after SET) and applies atomically-enough: it validates and sets
-/// each in turn. For PR-4b we apply each in order; the first failure short-circuits
-/// with the canonical error (a later coordinator can make multi-set transactional).
+/// the FIRST failing pair's canonical error. Redis validates arity and applies
+/// atomically-enough: it validates and sets each in turn. For PR-4b we apply each in
+/// order; the first failure short-circuits with the canonical error (a later coordinator
+/// can make multi-set transactional).
+///
+/// Arity, matching Redis 7.4 `configSetCommand` exactly:
+/// - an ODD number of param/value tokens after SET -> `-ERR syntax error`
+///   (`shared.syntaxerr`); the unknown-option message is ONLY for an unrecognized PARAM
+///   NAME, never for malformed arity.
+/// - ZERO param/value tokens (just `CONFIG SET`) -> `+OK` (a no-op set of nothing).
 fn config_set(ctx: &ServerContext, req: &Request) -> Value {
-    // `CONFIG SET name value [name value ...]`: at least one pair, and an EVEN number
-    // of tokens after the subcommand.
+    // `CONFIG SET name value [name value ...]`.
     let rest = &req.args[2..];
-    if rest.is_empty() || rest.len() % 2 != 0 {
-        // Redis emits the unknown-option error for a malformed CONFIG SET arity too
-        // (the "or number of arguments" half of the message). Echo the first token (or
-        // empty) as the offending param, matching Redis's shape.
-        let first = rest
-            .first()
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .unwrap_or_default();
-        return Value::error(ErrorReply::config_set_unknown_param(&first));
+    // An ODD token count is a syntax error (Redis `shared.syntaxerr`), NOT the
+    // unknown-param message (that is reserved for an unrecognized param NAME below).
+    if rest.len() % 2 != 0 {
+        return Value::error(ErrorReply::syntax_error());
+    }
+    // ZERO pairs is a no-op set of nothing: Redis replies +OK (the even-but-empty case).
+    if rest.is_empty() {
+        return Value::ok();
     }
 
     for pair in rest.chunks_exact(2) {
@@ -128,17 +133,19 @@ fn config_resetstat(deltas: &mut CounterDeltas, req: &Request) -> Value {
     Value::ok()
 }
 
-/// `CONFIG REWRITE` -> `+OK` (PR-4b stub). Redis rewrites the on-disk config file; the
-/// IronCache live-reload path (CONFIG.md, the `ironcache config` subcommand) is a later
-/// PR. For now this acks `+OK` rather than erroring, since a runtime `CONFIG SET`
-/// already takes effect immediately (it lives in the highest-precedence overlay) and
-/// the no-config-file error would be misleading on a zero-config boot. Documented as a
-/// stub.
+/// `CONFIG REWRITE` -> `-ERR The server is running without a config file` (PR-4b). Redis
+/// rewrites the on-disk config file; IronCache currently always boots WITHOUT a
+/// config-file path threaded through, so the faithful Redis behavior is the
+/// no-config-file error (src/config.c `configRewriteCommand`), NOT a +OK stub. A runtime
+/// `CONFIG SET` already takes effect immediately (it lives in the highest-precedence
+/// overlay), so nothing is lost by REWRITE not persisting yet. When a config-file path
+/// is threaded later (CONFIG.md, the `ironcache config` subcommand), REWRITE can
+/// actually rewrite the file.
 fn config_rewrite(req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("config|rewrite"));
     }
-    Value::ok()
+    Value::error(ErrorReply::config_rewrite_no_file())
 }
 
 /// `CONFIG HELP` -> the subcommand summary array (like Redis `addReplyHelp`).
@@ -344,11 +351,36 @@ mod tests {
             Value::Error(e) => assert!(e.line().contains("CONFIG SET failed"), "got {}", e.line()),
             other => panic!("expected failed error, got {other:?}"),
         }
-        // Odd arity.
+        // Odd arity -> `-ERR syntax error` (Redis shared.syntaxerr), NOT the
+        // unknown-option message (that is reserved for an unrecognized param NAME).
         match run(&c, &[b"CONFIG", b"SET", b"maxmemory"]).0 {
-            Value::Error(e) => assert!(e.line().contains("Unknown option or number of arguments")),
-            other => panic!("expected arity error, got {other:?}"),
+            Value::Error(e) => assert_eq!(e.line(), "-ERR syntax error"),
+            other => panic!("expected syntax error, got {other:?}"),
         }
+        // A longer odd token count is also a syntax error.
+        match run(
+            &c,
+            &[
+                b"CONFIG",
+                b"SET",
+                b"maxmemory",
+                b"100mb",
+                b"maxmemory-policy",
+            ],
+        )
+        .0
+        {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR syntax error"),
+            other => panic!("expected syntax error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_set_zero_pairs_is_ok_noop() {
+        // CONFIG SET with NO param/value tokens (argc=2, even-but-empty) is a no-op set
+        // of nothing: Redis replies +OK.
+        let c = ctx_with(Config::default());
+        assert_eq!(run(&c, &[b"CONFIG", b"SET"]).0, Value::ok());
     }
 
     #[test]
@@ -404,7 +436,14 @@ mod tests {
     #[test]
     fn config_rewrite_and_help_and_unknown_sub() {
         let c = ctx_with(Config::default());
-        assert_eq!(run(&c, &[b"CONFIG", b"REWRITE"]).0, Value::ok());
+        // REWRITE without a config file is the Redis no-config-file error (the server
+        // currently always boots without a config-file path threaded through).
+        match run(&c, &[b"CONFIG", b"REWRITE"]).0 {
+            Value::Error(e) => {
+                assert_eq!(e.line(), "-ERR The server is running without a config file");
+            }
+            other => panic!("expected no-config-file error, got {other:?}"),
+        }
         assert!(matches!(
             run(&c, &[b"CONFIG", b"HELP"]).0,
             Value::Array(Some(_))
