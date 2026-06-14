@@ -77,3 +77,6 @@ Specs added as the M1 milestone progresses.
 - [PERF_REGRESSION_GATE.md](PERF_REGRESSION_GATE.md): the per-PR performance-
   regression CI gate (micro/macro smoke vs merge-base, stored baselines,
   noise-aware throughput-per-core and bytes-per-key ratchet) (#159).
+- [PERSISTENCE.md](PERSISTENCE.md): the persistence umbrella: three durability
+  tiers with honest loss windows, durable_offset/fsync-lag, fail-closed, shared
+  io_uring write path, hybrid-log + segment/manifest layout (#58).
