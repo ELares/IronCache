@@ -62,6 +62,13 @@ runs in CI and is offline and deterministic. It fails when:
 - an ADR file is not listed in `INDEX.md`.
 
 Binding a *closed* `[DECISION]` issue to the existence of its ADR (issue #4
-rule 6) requires the GitHub API and is tracked in #166 as a separate
-(non-blocking) check rather than gating every offline docs build; the offline
-gate above keeps the records themselves honest in the meantime.
+rule 6) requires the GitHub API, so it lives in a separate, non-blocking job:
+[`../../scripts/ci/check-adr-decision-binding.sh`](../../scripts/ci/check-adr-decision-binding.sh),
+run by the [`adr-governance`](../../.github/workflows/adr-governance.yml)
+workflow on a weekly schedule, on demand, and on PRs that touch the binding
+files. It lists closed issues labeled `decision-needed` and reconciles them
+against ADR `Issue:` headers in both directions: a closed decision with no ADR
+that names it, and an ADR `Issue:` header pointing at a missing, still-open, or
+unlabeled issue. That job is advisory and reports to the run summary; it never
+fails the build. The offline gate above remains the hard gate and keeps the ADR
+records themselves honest.
