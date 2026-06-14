@@ -23,23 +23,27 @@ fallback, and the Env seam for determinism. Out of scope: the concrete store
   is unsynchronized (ADR-0005) and reclamation is trivial (ADR-0004). Locks are
   unnecessary by construction [glommio-locks-never-necessary]
   [seastar-shared-nothing].
-- Work is expressed as async tasks on the per-core executor (stackless Rust
-  async, not stackful fibers, for a smaller footprint than the helio model
-  [dragonfly-coordinator-fiber]). A connection lives its whole life on one core.
+- Work is expressed as async tasks on the per-core executor: stackless Rust async
+  tasks rather than the stackful userspace fibers of the helio model
+  [dragonfly-fibers-model], for a smaller per-connection footprint. A connection
+  lives its whole life on one core.
 
 ### Connection-to-shard routing
 
 - Accept distributes connections across cores. A command's key selects its shard
-  by `k = HASH(KEY) % N` (the glossary shard rule). A single-key command whose
-  key maps to the connection's own core runs inline with no hop; a command whose
-  key belongs to another core, or a multi-key command spanning cores, is a
-  message to the owning core through the cross-shard coordinator (#29). There is
+  by `k = HASH(KEY) % N` (the glossary shard rule). Inline-on-the-receiving-core
+  processing with no hand-off is mandatory for an own-core key
+  [garnet-inline-io-thread-processing]: a single-key command whose key maps to
+  the connection's own core runs inline with no hop; a command whose key belongs
+  to another core, or a multi-key command spanning cores, is a message to the
+  owning core through the cross-shard coordinator (#29). There is
   no shared map and no work stealing.
 
 ### io_uring fast path with portable fallback
 
-- On Linux 5.11+ the network and disk paths use io_uring (registered buffers,
-  multishot accept/recv where available [io-uring-multishot-recv-kernel]),
+- On Linux 5.11+ [tokio-uring-min-kernel] the network and disk paths use io_uring
+  (registered buffers, multishot accept on 5.19+ [io-uring-multishot-accept-kernel]
+  and multishot recv on 6.0+ [io-uring-multishot-recv-kernel] where available),
   matching the helio approach [dragonfly-iouring-helio]; the low-level binding is
   the io-uring crate [io-uring-crate-version] (key opcodes need kernel 5.6+
   [io-uring-read-opcode-kernel]). On older kernels and on macOS dev machines the
@@ -84,9 +88,10 @@ fallback, and the Env seam for determinism. Out of scope: the concrete store
 - ADR-0002, ADR-0003, ADR-0004, ADR-0005; issues #27, #28, #26, #29, #34, #95,
   #160, #32.
 - Claims: [glommio-locks-never-necessary], [seastar-shared-nothing],
-  [dragonfly-coordinator-fiber], [dragonfly-iouring-helio],
+  [dragonfly-fibers-model], [garnet-inline-io-thread-processing],
+  [dragonfly-iouring-helio], [io-uring-multishot-accept-kernel],
   [io-uring-multishot-recv-kernel], [io-uring-crate-version],
-  [io-uring-read-opcode-kernel], [monoio-min-kernel-fallback],
-  [monoio-vs-tokio-scaling], [glommio-version-msrv],
+  [io-uring-read-opcode-kernel], [tokio-uring-min-kernel],
+  [monoio-min-kernel-fallback], [monoio-vs-tokio-scaling], [glommio-version-msrv],
   [tokio-workstealing-readiness-model], [tokio-version-msrv],
   [dst-fdb-tigerbeetle-single-seed].

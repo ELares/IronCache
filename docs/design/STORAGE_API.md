@@ -28,8 +28,33 @@ Garnet's Tsavorite proves a tiny operation set backs a full RESP surface
   mutation. The mutator runs on the owning core with exclusive access, so it is
   atomic by construction with no lock.
 
-Every RESP command is expressed as a sequence of these four against one or more
-keys; the engine exposes only these four.
+Every keyspace read or mutation in the Tier 0/1 surface is expressed as a
+sequence of these four against one or more keys; the engine exposes only these
+four for keyspace access.
+
+### What the waist does NOT cover
+
+Three command classes are not per-key keyspace access and are handled outside the
+four primitives, by design:
+
+- **Iteration (`SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`).** A stable cursor over a shard's
+  table is an iteration primitive, not a per-key op. It is a separate read-only
+  engine entry point (a cursor/iterator over the shard map), not one of the four;
+  this resolves #34's open question (a fifth read-only scan primitive, not
+  `Read` composed) and is specified with the SCAN cursor-stability contract
+  (#129).
+- **Blocking commands (`BLPOP`/`BRPOP`/`BLMOVE`/`WAIT`/`XREAD BLOCK`).** Parking a
+  connection until another client writes is cross-connection coordination with a
+  timeout; a synchronous `RMW` callback cannot block. Blocking is a wait-queue
+  concern above the synchronous store (owned by the blocking-command design), which
+  uses the four primitives when it wakes but is not itself one of them.
+- **Pub/Sub and keyspace notifications.** Channel and subscriber registries are
+  not keyspace state; they are delivered as push frames (#20, PROTOCOL.md), not
+  through the storage waist.
+
+Multi-key and cross-shard atomic commands (`MSET`, `SINTERSTORE`, `MULTI`/`EXEC`
+across shards) ARE expressed in the four primitives, but decomposed by the
+coordinator (#29) into per-shard primitive calls.
 
 ### Composition with shared-nothing
 
@@ -65,7 +90,10 @@ log #64 later) implements the four primitives. This is the seam that lets the
 read-cache index and a future tiered/log backend swap without touching commands,
 exactly as the narrow waist intends [garnet-narrow-waist-api]; it generalizes the
 hot/read-only/disk regioning a hybrid log later adds
-[faster-hybridlog-three-regions].
+[faster-hybridlog-three-regions]. Forward-compatibility constraint (per #34): the
+waist must admit a second store behind the same four primitives, as Garnet runs a
+string store and an object store under one API [garnet-two-stores]; no primitive
+may assume a single backend.
 
 ## Open questions
 
@@ -76,9 +104,11 @@ hot/read-only/disk regioning a hybrid log later adds
 
 ## Acceptance and test hooks
 
-- Every command in the Tier 0/1 set is implementable as a composition of the four
-  primitives with no other store entry point (a layering test: the command crate
-  depends only on the storage-API crate's four functions + hook types).
+- Every keyspace read/mutation in the Tier 0/1 set is implementable as a
+  composition of the four primitives (a layering test: the command crate depends
+  only on the storage-API crate's four functions + hook types for keyspace
+  access); iteration (SCAN), blocking, and pub/sub use their own entry points,
+  not the four.
 - An `RMW` mutator observes and writes atomically with no lock on the owning core.
 - The eviction, expiration, accounting, and snapshot hooks all fire through the
   primitives, verified by the conformance and property suites (#95/#98).
