@@ -228,6 +228,54 @@ fn volatile_re_eligibility_after_expire_attaches_a_ttl() {
 }
 
 #[test]
+fn volatile_main_resident_ttl_victim_is_evicted_not_false_oom() {
+    // The #2 fix (false -OOM under volatile-only): a TTL key promoted into MAIN, with
+    // many non-TTL keys flooding the SMALL queue, must still be found and evicted rather
+    // than the scan tripping a premature -OOM while an evictable volatile key exists.
+    // The old consecutive-skip bound + re-register-into-small kept small over its ~10%
+    // target and STARVED main, so the main-resident TTL victim was never reached; the
+    // distinct-key bound + the lowest-priority re-offer queue reach it.
+    let mut st = store_with(Policy::S3Fifo(ironcache_eviction::S3Fifo::new(true)));
+    assert!(st.policy_volatile_only());
+
+    // One TTL key, read several times so a later eviction PROMOTES it into MAIN (the
+    // S3-FIFO small->main promotion fires when a high-frequency small entry is drawn).
+    set_ttl(&mut st, b"vol", 1_000_000);
+    for _ in 0..5 {
+        assert!(st.read(0, b"vol", UnixMillis(0)).is_some());
+    }
+    // Many non-TTL keys flooding the small queue (well past small's ~10% target).
+    for i in 0u32..30 {
+        set(&mut st, format!("plain{i}").as_bytes());
+    }
+    let live_before = st.len();
+    assert_eq!(live_before, 31, "1 TTL + 30 non-TTL keys");
+
+    // A budget that requires freeing roughly one key: only the single TTL key is
+    // eligible (volatile-only spares the 30 non-TTL keys). The scan must reach and evict
+    // it without spinning or replying -OOM.
+    let budget = st.used_memory() - 50; // forces at least one eviction
+    let evicted = st.evict_to_fit(budget, UnixMillis(0));
+    assert!(
+        evicted >= 1,
+        "the main-resident TTL victim must be evicted (no false -OOM)"
+    );
+    assert!(
+        st.read(0, b"vol", UnixMillis(0)).is_none(),
+        "the TTL key was the eligible victim and is gone"
+    );
+    // The non-TTL keys all survive (volatile-only cannot evict them); termination is
+    // bounded (the test returning at all proves no infinite loop).
+    for i in 0u32..30 {
+        assert!(
+            st.read(0, format!("plain{i}").as_bytes(), UnixMillis(0))
+                .is_some(),
+            "non-TTL key plain{i} must survive volatile-only eviction"
+        );
+    }
+}
+
+#[test]
 fn random_policy_evicts_to_fit() {
     // The Random policy (allkeys-random) also frees memory to fit the budget.
     let mut st = store_with(Policy::Random(ironcache_eviction::Random::new(42, false)));

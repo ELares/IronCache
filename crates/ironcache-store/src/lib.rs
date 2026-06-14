@@ -33,6 +33,7 @@ pub mod kvobj;
 
 use bytes::Bytes;
 use hashbrown::HashMap;
+use hashbrown::HashSet;
 use hashbrown::hash_map::Entry;
 use ironcache_eviction::EvictionPolicy;
 use ironcache_storage::{
@@ -474,18 +475,31 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
     fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
         let volatile_only = self.eviction.volatile_only();
         let mut evicted: u64 = 0;
-        // The bounded-scan guard for the #46 re-eligibility fix. Under a volatile-*
-        // policy a non-TTL victim is RE-REGISTERED (kept as a candidate) rather than
-        // dropped, so the policy can keep offering the same non-TTL keys forever. We
-        // bound the scan by counting CONSECUTIVE skips since the last forward progress
-        // (an eviction or an expired-reap): once that count exceeds the live entry
-        // count, the policy has cycled through its whole offerable set with no eligible
-        // TTL-bearing victim, so we stop and let the caller reply -OOM (matching Redis
-        // volatile-* OOM-when-no-evictable-volatile-key). Any forward progress resets
-        // the counter, so a run that keeps finding eligible TTL keys never trips it.
-        let mut consecutive_skips: usize = 0;
-        // A defensive secondary cap: even if a policy mis-behaves, the loop ends. With
-        // the consecutive-skip bound above this should never be the binding limit.
+        // The bounded-scan guard for the #46 re-eligibility fix, as a DISTINCT-KEY set.
+        // Under a volatile-* policy a non-TTL victim is RE-REGISTERED (kept as a
+        // candidate) rather than dropped, so the policy can keep offering the same
+        // non-TTL keys forever. We bound the scan by recording each DISTINCT (db, key)
+        // we have examined-and-skipped this call: the loop dispatches no-progress (lets
+        // the caller reply -OOM) ONLY once that set covers the WHOLE live keyspace
+        // (`skipped.len() >= self.len()`), i.e. every live key has been offered and none
+        // was an eligible TTL-bearing victim (matching Redis volatile-*
+        // OOM-when-no-evictable-volatile-key).
+        //
+        // Why a DISTINCT set, not the old CONSECUTIVE-skip counter: `re_register` feeds
+        // a skipped key back so `select_victim` can re-offer it, and the policy may
+        // re-offer the SAME non-TTL key several times before it reaches an eligible
+        // TTL victim parked deeper in its queues. A consecutive-skip counter trips on
+        // those repeats and falsely reports OOM while an evictable volatile key still
+        // exists; counting DISTINCT keys does not trip until genuinely every live key
+        // has been offered, so a reachable TTL victim is always found first.
+        //
+        // Any actual eviction (or an expired-reap) shrinks the live keyspace and frees
+        // budget, so we CLEAR the set on that forward progress: the bound is then
+        // re-measured against the new (smaller) keyspace.
+        let mut skipped: HashSet<(u32, Box<[u8]>)> = HashSet::new();
+        // A defensive secondary cap: even if a policy mis-behaves (e.g. re-offers a key
+        // the set already holds without ever offering the rest), the loop ends. With the
+        // distinct-set bound above this should never be the binding limit.
         let max_rounds = self.len().saturating_mul(4).saturating_add(64);
         let mut rounds = 0usize;
         // Strict `>`: free down to `used <= budget`, matching Redis getMaxmemoryState
@@ -515,31 +529,34 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
             // An already-expired victim is reaped by the lazy backstop rather than
             // counted as an eviction (it would have read as absent anyway); this also
             // drops it from the policy queue via expire_if_due's on_remove. This is
-            // forward progress, so reset the consecutive-skip guard.
+            // forward progress, so clear the distinct-skip set.
             if is_expired {
                 self.expire_if_due(db, db_idx, &key, now);
-                consecutive_skips = 0;
+                skipped.clear();
                 continue;
             }
             if volatile_only && lacks_ttl {
                 // Only TTL-bearing keys are eligible. A non-TTL victim is NOT deleted
                 // and NOT dropped from the policy: it is RE-REGISTERED so it remains a
-                // candidate (the #46 re-eligibility fix). Bound the scan: if we have
-                // skipped more keys in a row than the store holds, the policy has
-                // cycled its whole offerable set with no eligible TTL-bearing victim,
-                // so we STOP and let the caller reply -OOM.
-                consecutive_skips += 1;
+                // candidate (the #46 re-eligibility fix). Record it as a DISTINCT skip
+                // and re-register it. Stop ONLY once the distinct-skip set covers the
+                // whole live keyspace (every live key offered, none an eligible TTL
+                // victim), so an eligible main-resident TTL victim is always reached
+                // before the bound trips. The membership check is BEFORE the insert so a
+                // re-offered key does not grow the set.
                 self.eviction.re_register(db, &key);
-                if consecutive_skips > self.len() {
+                skipped.insert((db, key));
+                if skipped.len() >= self.len() {
                     break;
                 }
                 continue;
             }
             if self.remove_object(db, db_idx, &key) {
                 evicted += 1;
-                // Forward progress: reset the skip guard so a subsequent stretch of
-                // non-TTL skips is measured afresh against the (now smaller) keyspace.
-                consecutive_skips = 0;
+                // Forward progress: the keyspace shrank and budget was freed, so clear
+                // the skip set; a subsequent stretch of non-TTL skips is measured afresh
+                // against the (now smaller) keyspace.
+                skipped.clear();
             }
             // If the victim was already gone (a stale queue entry), the loop simply
             // asks for the next victim; it does not count as an eviction.
