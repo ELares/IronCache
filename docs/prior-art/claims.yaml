@@ -6825,3 +6825,81 @@ claims:
       GitHub README names rustls-aws-lc-rs (recommended) and rustls-ring (easier to build). memorysafety.org/blog/rustls-with-aws-crypto-back-end-and-fips
       confirms aws-lc-rs is based on BoringSSL and is the only FIPS-certified Rust crypto provider for
       rustls. Both providers are Rust crates, avoiding a system OpenSSL/C TLS dependency.
+- id: zeroize-crate-on-drop
+  dimension: ops-build-distribution
+  system: zeroize (RustCrypto)
+  version: v1.9.0 (2026-06-12)
+  claim: The zeroize crate provides a Zeroize trait that securely overwrites a value's in-memory bytes
+    (typically with zeros) using core::ptr::write_volatile plus core::sync::atomic memory fences, so the
+    clearing cannot be elided by the optimizer; ZeroizeOnDrop is a marker trait indicating a type zeroizes
+    itself on Drop. It is pure Rust with no FFI or inline assembly and no external dependencies.
+  value: v1.9.0; Zeroize + ZeroizeOnDrop; write_volatile + atomic fence; pure Rust, no FFI
+  source_url: https://docs.rs/zeroize/latest/zeroize/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Version pinned from the crates.io API (newest_version 1.9.0, published 2026-06-12)
+    and docs.rs/latest; mechanism (write_volatile + atomic fence, ZeroizeOnDrop marker, no-FFI/no-deps)
+    quoted from the crate docs. Task brief expected ~1.8.x; the latest 1.8.x is 1.8.2 (2025-09-29) but
+    the current release line advanced to 1.9.0, which is pinned here as the verified current version.
+  load_bearing: true
+  verification:
+    verdict: corrected
+    best_source_url: https://crates.io/api/v1/crates/zeroize
+    note: 'crates.io API: newest/max_stable_version = 1.9.0, published 2026-06-12; latest 1.8.x is 1.8.2
+      (2025-09-29). Corrected the brief''s expected ~1.8.x to the actual current 1.9.0. docs.rs confirms
+      Zeroize trait overwrites memory with placeholder values, uses core::ptr::write_volatile and core::sync::atomic
+      memory fences to prevent the compiler optimizing the zeroing away, ZeroizeOnDrop is a marker trait
+      (Drop must still be implemented), and ''No FFI or inline assembly! WASM friendly'' with no external
+      dependencies.'
+- id: mlock-pages-out-of-swap
+  dimension: ops-build-distribution
+  system: Linux mlock(2)/munlock(2)
+  version: Linux man-pages (man7.org, accessed 2026-06-13)
+  claim: mlock() locks part or all of the calling process's virtual address space into RAM, preventing
+    that memory from being paged to the swap area while the lock is held; munlock() reverses this so the
+    pages may be swapped out again. The man page's NOTES explicitly cite cryptographic keys as a use case,
+    warning that without locking such secrets could be transferred onto persistent swap-store media.
+  value: mlock locks pages into RAM (no paging to swap); munlock reverses; NOTES cite secret-key non-swap
+    use case
+  source_url: https://man7.org/linux/man-pages/man2/mlock.2.html
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Quoted directly from the man7.org mlock(2) man page DESCRIPTION ('preventing that
+    memory from being paged to the swap area') and NOTES (secret-keys/persistent-swap warning).
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://man7.org/linux/man-pages/man2/mlock.2.html
+    note: 'man7.org mlock(2): DESCRIPTION confirms mlock() ''lock[s] part or all of the calling process''s
+      virtual address space into RAM, preventing that memory from being paged to the swap area''; munlock()
+      unlocks so pages ''can be swapped out again if required by the kernel memory manager''. NOTES section
+      confirms the secret-key/persistent-swap-store security rationale. Verified via WebFetch.'
+- id: madv-dontdump-and-rlimit-core-no-coredump
+  dimension: ops-build-distribution
+  system: Linux madvise(2) MADV_DONTDUMP / prctl(2) PR_SET_DUMPABLE / setrlimit(2) RLIMIT_CORE
+  version: Linux man-pages (man7.org, accessed 2026-06-13)
+  claim: Linux offers three complementary mechanisms to keep memory out of core dumps. madvise(MADV_DONTDUMP)
+    (since Linux 3.4) excludes the specified pages from a core dump, and its effect takes precedence over
+    the /proc/[pid]/coredump_filter bit mask (MADV_DODUMP reverses it). prctl(PR_SET_DUMPABLE, 0) clears
+    the per-process 'dumpable' attribute (default 1) so the process produces no core dump on a dump-triggering
+    signal. setrlimit(RLIMIT_CORE, 0) sets the maximum core-file size to 0, so no core dump files are
+    created.
+  value: MADV_DONTDUMP excludes pages (overrides coredump_filter, since 3.4); PR_SET_DUMPABLE=0 disables
+    dumps (default 1); RLIMIT_CORE=0 => no core files
+  source_url: https://man7.org/linux/man-pages/man2/madvise.2.html
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: 'Each fact quoted from its primary man7.org man page: madvise(2) (MADV_DONTDUMP since
+    3.4, precedence over coredump_filter), PR_SET_DUMPABLE(2const) (default 1, 0 disables dumps), setrlimit(2)
+    (RLIMIT_CORE 0 => no core dump files).'
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://man7.org/linux/man-pages/man2/setrlimit.2.html
+    note: 'Three primary man pages confirmed via WebFetch. madvise(2): ''MADV_DONTDUMP (since Linux 3.4)
+      ... Exclude from a core dump those pages in the range specified ... takes precedence over the bit
+      mask that is set via the /proc/[pid]/coredump_filter file''; MADV_DODUMP undoes it. PR_SET_DUMPABLE(2const):
+      controls the ''dumpable'' attribute that ''determines whether core dumps are produced'', normally
+      set to 1; setting 0 (SUID_DUMP_DISABLE) suppresses core dumps on dump-triggering signals. setrlimit(2):
+      RLIMIT_CORE is ''the maximum size of a core file ... in bytes that the process may dump'' and ''When
+      0 no core dump files are created.'''
