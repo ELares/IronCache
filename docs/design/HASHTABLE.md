@@ -94,6 +94,80 @@ metadata [dashtable-populate-memory]. Per-key overhead must be designed in.
   if that budget is threatened.
 - `OBJECT ENCODING` matches the pinned oracle for every type/size (#97/#98).
 
+## Addendum: bucket geometry and rehash policy (#110)
+
+#110 (decomposed from #35) asked to pin the per-shard bucket geometry, an
+"incremental two-table rehash with a per-operation budget," and correct expand
+and shrink thresholds. The geometry is already fixed above and restated here; the
+per-op-budget two-table machinery is **rejected**; expand is taken from the
+bucket layout and shrink is an IronCache addition (stock `hashbrown` does not
+auto-shrink); the only genuine open geometry parameter is the inline hash-tag
+width.
+
+### Bucket geometry (confirmed, not re-decided)
+
+- The per-slot table is the cache-line-bucket open-addressing layout this spec
+  already adopts from Valkey: 7 entries per 64-byte bucket, a presence bitmask
+  plus 7 stored hash bytes, Swiss-table-inspired SIMD probing, soft max fill
+  ~91.43% [valkey-hashtable-bucket-layout], realized by stock `hashbrown`
+  (ADR-0005). The 7-slot bucket, the presence mask, and the stored hash bytes are
+  properties of that layout, not a new structure to build. The specific bucket
+  numbers are pinned at Valkey 8.1.8 [valkey-hashtable-bucket-layout]; the spec's
+  "Valkey 9.x" oracle label is the house version line, while the 7-entry,
+  91.43%-fill geometry is the 8.1.8 source.
+
+### Rejected: incremental two-table rehash with a per-operation budget
+
+- #110's premise (a custom dual-table rehash that migrates a budgeted number of
+  buckets per operation) is **declined**. It directly contradicts the chosen
+  stock-`hashbrown` all-at-once power-of-two resize (ADR-0005, "Growth and
+  rehash" above), and that choice stands.
+- Rationale: the 16384-slot partitioning (ADR-0011) bounds each per-slot table to
+  a small fraction of the shard's keys, so a single all-at-once resize is small
+  and bounded, and its latency is the size of one slot's table, not the shard's.
+  Incremental rehash exists in Redis precisely because its one global dict is
+  large and a stop-the-world rehash would stall; that is why Redis pays for the
+  bespoke two-table scheme with its ~48N peak [redis-dict-two-table-rehash]
+  [redis-dictentry-size]. Valkey's per-slot dictionaries already shrink the unit
+  of rehash to one slot (and saved ~16 bytes/entry doing so)
+  [valkey-per-slot-dict-16b]; IronCache inherits that bound, so the per-op budget
+  buys nothing.
+- Costs avoided: a dual-table read path (every GET probing both old and new
+  tables until migration finishes), a migration cursor and budget accountant on
+  the hot path, and a second live allocation during rehash, all for tables small
+  enough that a single resize already meets the tail-latency budget. The
+  extendible-directory alternative (Dash segment geometry) is likewise studied,
+  not copied [dashtable-segment-geometry], for the same partitioning reason. If a
+  slot's resize ever threatens the budget, the lever is the per-slot table size
+  cap and the hot-shard mitigation (#32/#170), not a two-table machine.
+
+### Expand and shrink thresholds
+
+- Expand is the bucket layout's soft max fill (~91.43%)
+  [valkey-hashtable-bucket-layout], the trigger stock `hashbrown` already applies
+  on the owning core; IronCache does not hand-roll an expand trigger.
+- Shrink is different and must be stated plainly: stock `hashbrown` does **not**
+  automatically shrink a table when entries are removed (it releases capacity
+  only on an explicit `shrink_to_fit`/`shrink_to`). An automatic shrink-on-delete
+  is therefore an IronCache addition, not a property inherited from `hashbrown`.
+  #110 references Redis's 1/32 shrink trigger [redis-dict-resize-ratios] as the
+  prior-art shape; IronCache will provide an equivalent low-watermark shrink, but
+  the exact watermark and how often a per-slot table is allowed to shrink (the
+  churn vs resident-bytes trade) is harness-tuned (#8), not asserted here, and is
+  listed as an open sub-item below. Whatever the policy, `OBJECT ENCODING` and
+  observable behavior are unchanged by any resize [valkey-assert-encoding-vocab]
+  (ADR-0009).
+
+### Remaining open sub-items
+
+- The inline hash-tag width stored beside the kvobj pointer in a bucket (probe
+  speed vs bytes per entry), tuned against the memory harness (#8). This is the
+  same open question listed above and is harness-tied.
+- The automatic shrink-on-delete watermark and shrink cadence for a per-slot
+  table (IronCache adds this on top of `hashbrown`, which does not auto-shrink),
+  also harness-tuned (#8), grounded against Redis's 1/32 trigger
+  [redis-dict-resize-ratios].
+
 ## References
 
 - ADR-0005, ADR-0006, ADR-0008, ADR-0009, ADR-0011, ADR-0018; issues #111, #112,
