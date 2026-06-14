@@ -160,7 +160,7 @@ pub fn cmd_scan<S: Store + Keyspace>(
     // Parse the option tail: MATCH <pattern>, COUNT <n>, TYPE <name>, in any order.
     let mut pattern: Option<bytes::Bytes> = None;
     let mut count: usize = SCAN_DEFAULT_COUNT;
-    let mut type_filter: Option<DataType> = None;
+    let mut type_filter = TypeFilter::Any;
     let mut i = 2;
     while i < req.args.len() {
         let opt = crate::cmd_util::ascii_upper(&req.args[i]);
@@ -188,14 +188,11 @@ pub fn cmd_scan<S: Store + Keyspace>(
                 if i + 1 >= req.args.len() {
                     return Value::error(ErrorReply::syntax_error());
                 }
-                // The TYPE filter is matched against the canonical type name. An
-                // unknown type name simply matches nothing (Redis does not error; it
-                // just yields no keys of that type).
-                type_filter = type_name_to_data_type(&req.args[i + 1]);
-                if type_filter.is_none() {
-                    // Run with a filter that never matches (unknown type -> empty).
-                    type_filter = Some(SENTINEL_NO_TYPE);
-                }
+                // The TYPE filter is matched against the canonical type name. A
+                // recognized name becomes `Is(DataType)` (an exact type comparison); an
+                // unknown name becomes `MatchNothing` so it yields no keys (Redis does
+                // not error; it just yields no keys of that type).
+                type_filter = type_filter_from_name(&req.args[i + 1]);
                 i += 2;
             }
             _ => return Value::error(ErrorReply::syntax_error()),
@@ -204,9 +201,9 @@ pub fn cmd_scan<S: Store + Keyspace>(
 
     let (next, batch) = store.scan_step(db, cursor, count, now, |key, ty| {
         let type_ok = match type_filter {
-            None => true,
-            Some(SENTINEL_NO_TYPE) => false,
-            Some(want) => ty == want,
+            TypeFilter::Any => true,
+            TypeFilter::Is(want) => ty == want,
+            TypeFilter::MatchNothing => false,
         };
         let match_ok = pattern.as_ref().is_none_or(|p| glob_match(p, key));
         type_ok && match_ok
@@ -223,11 +220,32 @@ pub fn cmd_scan<S: Store + Keyspace>(
     ]))
 }
 
-/// A sentinel DataType the SCAN TYPE filter uses to mean "an unknown type name was
-/// requested, so match nothing". Stream is never produced today, so reusing it as the
-/// never-match sentinel is safe and avoids a separate flag. (Documented so a future
-/// Stream type does not silently collide.)
-const SENTINEL_NO_TYPE: DataType = DataType::Stream;
+/// The SCAN `TYPE` filter state. A dedicated enum (rather than overloading a real
+/// [`DataType`] as a never-match sentinel) so a recognized type name routes through a
+/// REAL type comparison: `TYPE stream` is [`TypeFilter::Is`]`(DataType::Stream)` (it
+/// matches nothing TODAY only because no Stream-typed values exist yet, not because of a
+/// sentinel collision), while a truly unknown name is [`TypeFilter::MatchNothing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeFilter {
+    /// No `TYPE` argument: every type passes.
+    Any,
+    /// A recognized type name: keep only keys of exactly this [`DataType`].
+    Is(DataType),
+    /// An unrecognized type name: keep nothing (Redis yields no keys, never an error).
+    MatchNothing,
+}
+
+/// Route a SCAN `TYPE <name>` argument to a [`TypeFilter`]: a recognized type name
+/// (including `stream`) becomes [`TypeFilter::Is`] so it filters via a REAL type
+/// comparison (`stream` matches nothing TODAY only because no Stream-typed values exist,
+/// NOT via a sentinel that would collide once they do); an unrecognized name becomes
+/// [`TypeFilter::MatchNothing`].
+fn type_filter_from_name(name: &[u8]) -> TypeFilter {
+    match type_name_to_data_type(name) {
+        Some(t) => TypeFilter::Is(t),
+        None => TypeFilter::MatchNothing,
+    }
+}
 
 /// Map a Redis type name (`string`/`list`/`set`/`hash`/`zset`/`stream`) to a
 /// [`DataType`], or `None` for an unknown name (SCAN TYPE then matches nothing).
@@ -441,16 +459,21 @@ pub fn cmd_swapdb<S: Store + Keyspace>(store: &mut S, ctx: &ServerContext, req: 
     if req.args.len() != 3 {
         return Value::error(ErrorReply::wrong_arity("swapdb"));
     }
-    let (Some(a), Some(b)) = (parse_i64(&req.args[1]), parse_i64(&req.args[2])) else {
-        // Redis: "invalid first DB index" / "invalid second DB index"; the shared
-        // not-an-integer-ish message is acceptable, but match Redis's DB-index error.
+    // `invalid first DB index` / `invalid second DB index` are ONLY for a non-integer
+    // PARSE failure (Redis getIntFromObjectOrReply with the per-position message).
+    let Some(a) = parse_i64(&req.args[1]) else {
         return Value::error(ErrorReply::err("invalid first DB index"));
     };
+    let Some(b) = parse_i64(&req.args[2]) else {
+        return Value::error(ErrorReply::err("invalid second DB index"));
+    };
+    // An out-of-range (but integer) index returns `DB index is out of range` (Redis
+    // dbSwapDatabases -> C_ERR), NOT the per-position parse message.
     if a < 0 || a >= i64::from(ctx.databases) {
-        return Value::error(ErrorReply::err("invalid first DB index"));
+        return Value::error(ErrorReply::select_out_of_range());
     }
     if b < 0 || b >= i64::from(ctx.databases) {
-        return Value::error(ErrorReply::err("invalid second DB index"));
+        return Value::error(ErrorReply::select_out_of_range());
     }
     store.swap_db(a as u32, b as u32);
     Value::ok()
@@ -486,5 +509,129 @@ fn flush_mode_ok(req: &Request) -> bool {
             matches!(opt.as_slice(), b"ASYNC" | b"SYNC")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::ServerContext;
+    use ironcache_eviction::Policy;
+    use ironcache_observe::ServerInfo;
+    use ironcache_storage::CountingAccounting;
+    use ironcache_store::ShardStore;
+    use ironcache_store::kvobj::KvObj;
+
+    type TestStore = ShardStore<Policy, CountingAccounting>;
+
+    fn test_store(databases: u32) -> TestStore {
+        ShardStore::with_hooks(
+            databases,
+            Policy::cache_default(),
+            CountingAccounting::new(),
+        )
+    }
+
+    /// A minimal context; `cmd_swapdb` reads only `databases`.
+    fn ctx(databases: u32) -> ServerContext {
+        ServerContext {
+            requirepass: None,
+            databases,
+            maxmemory: 0,
+            per_shard_budget: 0,
+            info: ServerInfo {
+                tcp_port: 6379,
+                shards: 1,
+                pid: 1,
+                started_at: ironcache_env::Monotonic::ZERO,
+                maxmemory: 0,
+                maxmemory_policy: "allkeys-lru",
+                mem_allocator: "system",
+            },
+        }
+    }
+
+    fn req(parts: &[&[u8]]) -> Request {
+        Request {
+            args: parts
+                .iter()
+                .map(|p| bytes::Bytes::copy_from_slice(p))
+                .collect(),
+        }
+    }
+
+    /// Drive SCAN to completion and return every key seen (as owned byte vecs).
+    fn scan_all(store: &mut TestStore, parts: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut cursor = b"0".to_vec();
+        loop {
+            let mut full: Vec<&[u8]> = vec![b"SCAN", cursor.as_slice()];
+            full.extend_from_slice(parts);
+            let reply = cmd_scan(store, 0, UnixMillis(0), &req(&full));
+            let Value::Array(Some(items)) = reply else {
+                panic!("SCAN reply is not an array: {reply:?}");
+            };
+            let (Value::BulkString(Some(next)), Value::Array(Some(keys))) = (&items[0], &items[1])
+            else {
+                panic!("unexpected SCAN reply shape: {items:?}");
+            };
+            for k in keys {
+                if let Value::BulkString(Some(b)) = k {
+                    out.push(b.to_vec());
+                }
+            }
+            if next.as_ref() == b"0" {
+                break;
+            }
+            cursor = next.to_vec();
+        }
+        out
+    }
+
+    #[test]
+    fn swapdb_out_of_range_index_is_db_index_out_of_range() {
+        // An out-of-range (but integer) index returns `DB index is out of range`
+        // (dbSwapDatabases C_ERR), NOT the per-position `invalid first/second DB index`
+        // message (which is reserved for a non-integer parse failure).
+        let mut store = test_store(2);
+        let c = ctx(2);
+        match cmd_swapdb(&mut store, &c, &req(&[b"SWAPDB", b"99", b"0"])) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR DB index is out of range"),
+            other => panic!("expected DB-index-out-of-range, got {other:?}"),
+        }
+        // The non-integer parse arm STILL uses the per-position message.
+        match cmd_swapdb(&mut store, &c, &req(&[b"SWAPDB", b"x", b"0"])) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR invalid first DB index"),
+            other => panic!("expected invalid-first-DB-index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_filter_stream_routes_through_is_not_a_sentinel() {
+        // `TYPE stream` must route through a REAL `Is(DataType::Stream)` comparison, not
+        // a never-match sentinel that overloads a real DataType: a recognized name maps
+        // to `Is(..)`, an unknown name to `MatchNothing`.
+        assert_eq!(
+            type_filter_from_name(b"stream"),
+            TypeFilter::Is(DataType::Stream)
+        );
+        assert_eq!(
+            type_filter_from_name(b"string"),
+            TypeFilter::Is(DataType::String)
+        );
+        assert_eq!(type_filter_from_name(b"bogus"), TypeFilter::MatchNothing);
+
+        // End to end: a recognized type filters by exact type (a String key passes
+        // `TYPE string`), `TYPE stream` yields nothing today (no Stream values exist) yet
+        // does so via the real comparison, and an unknown `TYPE bogus` also yields
+        // nothing (never an error).
+        let mut store = test_store(2);
+        store.insert_object(0, KvObj::from_bytes(b"k", b"v", None));
+        assert_eq!(
+            scan_all(&mut store, &[b"TYPE", b"string"]),
+            vec![b"k".to_vec()]
+        );
+        assert!(scan_all(&mut store, &[b"TYPE", b"stream"]).is_empty());
+        assert!(scan_all(&mut store, &[b"TYPE", b"bogus"]).is_empty());
     }
 }
