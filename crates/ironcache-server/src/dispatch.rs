@@ -206,9 +206,12 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 /// borrows (the lifetime-parameterized `rollup` closure in particular). The over-7-args
 /// lint is allowed here with that justification.
 /// The per-command `maxmemory-policy` hot-swap check (CONFIG.md, PR-4b). The hot-path
-/// cost is ONE relaxed atomic load (`generation`) + an integer compare against this
+/// cost is ONE Acquire atomic load (`generation`) + an integer compare against this
 /// shard's last-seen value; when nothing changed (the common case) it returns
-/// immediately with NO lock.
+/// immediately with NO lock. The Acquire load pairs with the writer's Release bump
+/// (`RuntimeConfig::set_policy_name`), so observing a new generation here happens-after
+/// the new policy name was written: the subsequent `policy_name()` read is guaranteed
+/// to see it, with the ordering carried by the atomic itself (not just the strings Mutex).
 ///
 /// On an actual change (a `CONFIG SET maxmemory-policy` happened on SOME shard), this
 /// shard rebuilds its OWN eviction policy from the new name and catches up. Only here
@@ -223,12 +226,16 @@ fn maybe_hot_swap_policy<E: Env, S: PolicySwap>(
     env: &mut E,
     store: &mut S,
     shard_generation: &mut u64,
+    now: UnixMillis,
 ) {
     let current_generation = ctx.runtime.generation();
     if current_generation != *shard_generation {
         let new_name = ctx.runtime.policy_name();
         let seed = env.rng().next_u64();
-        let _ = store.set_policy_by_name(&new_name, seed);
+        // `now` lets the swap skip re-seeding lazily-expired entries into the new policy
+        // (IC-1: the new policy is re-seeded from the live keyspace so eviction works
+        // immediately after the swap).
+        let _ = store.set_policy_by_name(&new_name, seed, now);
         *shard_generation = current_generation;
     }
 }
@@ -252,7 +259,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
 
     // maxmemory-policy HOT-SWAP reach (CONFIG.md, PR-4b): a single relaxed atomic load
     // + compare; the rebuild (rare) is factored into a helper to keep this fn small.
-    maybe_hot_swap_policy(ctx, env, store, shard_generation);
+    maybe_hot_swap_policy(ctx, env, store, shard_generation, now);
 
     // Active TTL reclamation (EXPIRATION.md #51), BEFORE the command body: drain a
     // BOUNDED batch of due keys from the timing wheel and reap the ones whose stored
@@ -558,18 +565,49 @@ enum AuthResult {
 /// overlay, so a `CONFIG SET requirepass` takes effect immediately, PR-4b). The single
 /// `requirepass`/default-user model (full ACL is later). The username must be `default`
 /// (or empty) when a password is set.
+///
+/// The password comparison is CONSTANT-TIME (see [`constant_time_eq`]) so the reply
+/// latency does not leak how many leading bytes of a guess matched the secret (the
+/// timing-leak finding). The password is currently held in plaintext at rest in the
+/// runtime overlay; storing only a SHA-256 digest (verifying against the hash, never the
+/// plaintext) is a tracked AUTH-hardening follow-up (AUTH.md / threat-model #142) and is
+/// deliberately NOT implemented here (it ships in the dedicated AUTH PR), so the
+/// plaintext-at-rest choice is recorded rather than silent.
 fn check_auth(ctx: &ServerContext, user: &[u8], pass: &[u8]) -> AuthResult {
     match ctx.runtime.requirepass() {
         None => AuthResult::NoPasswordSet,
         Some(configured) => {
             let user_ok = user.is_empty() || user.eq_ignore_ascii_case(b"default");
-            if user_ok && pass == configured.as_bytes() {
+            if user_ok && constant_time_eq(pass, configured.as_bytes()) {
                 AuthResult::Ok
             } else {
                 AuthResult::WrongPass
             }
         }
     }
+}
+
+/// Compare two byte slices in CONSTANT TIME with respect to their CONTENTS: the running
+/// time depends only on the slice LENGTHS, never on WHERE the first differing byte is,
+/// so an attacker cannot learn a correct password byte-by-byte from response timing
+/// (the timing-leak finding). No new dependency: a hand-rolled fold.
+///
+/// Mechanism: if the lengths differ, return false immediately (length is not secret in
+/// this model). Otherwise fold every byte pair into an XOR accumulator and check it is
+/// zero at the END, examining ALL bytes regardless of an early mismatch. The accumulator
+/// is read through [`std::hint::black_box`] before the final compare so the optimizer
+/// cannot prove the loop short-circuitable and re-introduce a data-dependent early exit.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    // Defeat any optimization that would let the compiler reintroduce an early-out:
+    // force the accumulator to be materialized before the zero test.
+    std::hint::black_box(acc) == 0
 }
 
 /// `SELECT index` (PROTOCOL.md Tier-0). Validates the range `[0, databases)`.
@@ -999,6 +1037,63 @@ mod tests {
         // AUTH then PING works.
         assert_eq!(run(&c, &mut s, &[b"AUTH", b"pw"]), Value::ok());
         assert_eq!(run(&c, &mut s, &[b"PING"]), Value::simple("PONG"));
+    }
+
+    #[test]
+    fn auth_correct_password_succeeds_wrong_password_is_wrongpass() {
+        // The constant-time compare must still be CORRECT: the exact password
+        // authenticates, and any mismatch (wrong content, or a prefix/suffix of the
+        // secret) is WRONGPASS. We cannot test timing here, only that the constant-time
+        // path returns the right answer.
+        let c = ctx(Some("s3cr3t"));
+        // Correct password authenticates.
+        let mut ok = state(&c);
+        assert_eq!(run(&c, &mut ok, &[b"AUTH", b"s3cr3t"]), Value::ok());
+        // A same-length wrong password is WRONGPASS.
+        let mut bad = state(&c);
+        match run(&c, &mut bad, &[b"AUTH", b"s3cr3T"]) {
+            Value::Error(e) => assert_eq!(
+                e.line(),
+                "-WRONGPASS invalid username-password pair or user is disabled."
+            ),
+            other => panic!("expected WRONGPASS, got {other:?}"),
+        }
+        // A shorter password sharing the secret's prefix is WRONGPASS (length differs).
+        let mut shortp = state(&c);
+        match run(&c, &mut shortp, &[b"AUTH", b"s3cr3"]) {
+            Value::Error(e) => assert!(e.line().starts_with("-WRONGPASS")),
+            other => panic!("expected WRONGPASS, got {other:?}"),
+        }
+        // A longer password with the secret as a prefix is WRONGPASS.
+        let mut longp = state(&c);
+        match run(&c, &mut longp, &[b"AUTH", b"s3cr3t!"]) {
+            Value::Error(e) => assert!(e.line().starts_with("-WRONGPASS")),
+            other => panic!("expected WRONGPASS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_matches_naive_equality() {
+        // The hand-rolled constant-time compare agrees with naive equality on a spread
+        // of length/content cases (correctness of the timing-safe path).
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"", b""),
+            (b"a", b"a"),
+            (b"a", b"b"),
+            (b"", b"x"),
+            (b"abc", b"ab"),
+            (b"abc", b"abc"),
+            (b"abc", b"abd"),
+            (b"secret", b"secret"),
+            (b"secret", b"Secret"),
+        ];
+        for &(a, b) in cases {
+            assert_eq!(
+                constant_time_eq(a, b),
+                a == b,
+                "constant_time_eq disagreed for {a:?} vs {b:?}"
+            );
+        }
     }
 
     #[test]

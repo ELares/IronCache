@@ -21,7 +21,9 @@
 //! [`RuntimeConfig`] is the ONE new piece of cross-shard shared state PR-4b adds. It
 //! is cloned (as an `Arc`) into each shard's `ServerContext` at boot exactly like the
 //! shutdown `AtomicBool` precedent, and the per-command HOT-PATH read is a single
-//! relaxed atomic load + compare (the [`generation`](RuntimeConfig::generation)).
+//! ACQUIRE atomic load + compare (the [`generation`](RuntimeConfig::generation)),
+//! which pairs with the writer's Release bump so the happens-before is carried by the
+//! atomic itself.
 //! The only lock is the [`std::sync::Mutex`] guarding the policy-name + requirepass
 //! strings; it lives HERE in `ironcache-config` (NOT a hot-path crate) and is taken
 //! ONLY on the rare `CONFIG SET` / generation-change, never per command. The
@@ -41,9 +43,11 @@ use std::sync::{Arc, Mutex};
 ///   per-shard budget, so the new ceiling reaches all shards eventually-consistently
 ///   (within one command each). No lock.
 /// - [`generation`](Self::generation): an [`AtomicU64`] bumped on every `CONFIG SET`
-///   that changes a HOT-SWAPPABLE param (currently the eviction policy). Each shard
-///   keeps its own last-seen generation; the per-command hot-path check is a single
-///   relaxed load + compare against that, with NO lock when nothing changed.
+///   that changes a HOT-SWAPPABLE param (currently the eviction policy), with a RELEASE
+///   store. Each shard keeps its own last-seen generation; the per-command hot-path
+///   check is a single ACQUIRE load + compare against that, with NO lock when nothing
+///   changed. The Acquire/Release pair carries the happens-before (new name written
+///   before the bump that publishes it) in the atomic itself.
 /// - The policy NAME string and the `requirepass` string live behind a single
 ///   [`Mutex`]. The lock is taken ONLY on a `CONFIG SET` that touches them, and on a
 ///   generation-change policy swap (to read the new name), never on the common
@@ -103,12 +107,16 @@ impl RuntimeConfig {
         self.maxmemory.load(Ordering::Relaxed)
     }
 
-    /// The current hot-swap generation. A single relaxed atomic load: this is the
+    /// The current hot-swap generation. A single ACQUIRE atomic load: this is the
     /// per-command hot-path check each shard compares against its last-seen value, so
-    /// it must stay lock-free.
+    /// it must stay lock-free. The Acquire pairs with the writer's Release bump in
+    /// [`Self::set_policy_name`], so the happens-before (the new policy name was written
+    /// before the generation bump that publishes it) is carried by the atomic ITSELF,
+    /// robustly, independent of the strings Mutex. An uncontended Acquire load is free
+    /// on the common path (no fence on x86; a plain `ldar` on aarch64).
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        self.generation.load(Ordering::Acquire)
     }
 
     /// The current effective `maxmemory-policy` name (a clone of the locked string).
@@ -161,9 +169,14 @@ impl RuntimeConfig {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             name.clone_into(&mut s.maxmemory_policy);
         }
-        // Bump the generation AFTER writing the name, so a shard that observes the new
-        // generation is guaranteed to read the new name when it then takes the lock.
-        // `fetch_add` returns the PREVIOUS value; the new generation is +1.
+        // Bump the generation AFTER writing the name with a RELEASE store, which pairs
+        // with the per-command ACQUIRE load in `generation()`: a shard that observes the
+        // new generation value is therefore guaranteed to also see the new name written
+        // above. The Release/Acquire pair carries this happens-before in the atomic
+        // itself, so it holds even though the name lives behind a separate Mutex (the
+        // shard still re-reads the name under the lock; the ordering just guarantees the
+        // bump is not reordered ahead of the name write). `fetch_add` returns the
+        // PREVIOUS value; the new generation is +1.
         self.generation.fetch_add(1, Ordering::Release) + 1
     }
 
