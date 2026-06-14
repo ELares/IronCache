@@ -152,3 +152,7 @@ Specs added as the M1 milestone progresses.
   SIGTERM/SIGINT, connection drain, save-on-exit, orchestrator grace/exit-code) (#139).
 - [UPGRADE.md](UPGRADE.md): `ironcache upgrade` with verified rollback (minisign
   verify-before-swap, atomic rename, post-swap readiness probe, auto-rollback) (#83).
+- [PACKAGING.md](PACKAGING.md): packaging and distribution (cross-build matrix +
+  reproducibility, curl|sh installer, Homebrew, distroless image, hardened systemd
+  unit, per-release SHA256 attestation, Windows non-goal); scaffolds in
+  [packaging/](../../packaging/) (#121, #122, #123, #125).

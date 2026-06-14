@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Hardened systemd unit for the IronCache server (#122).
+# SCAFFOLD: templated and inert until the first release. See
+# docs/design/PACKAGING.md and packaging/README.md.
+#
+# Install to /etc/systemd/system/ironcache.service, then:
+#   systemctl daemon-reload && systemctl enable --now ironcache
+# Verify the sandbox with:
+#   systemd-analyze security ironcache.service
+#
+# This is the in-memory default. For a persisted-data deployment, uncomment
+# StateDirectory + ReadWritePaths so the data dir is writable under the
+# otherwise read-only root filesystem.
+
+[Unit]
+Description=IronCache server
+Documentation=https://github.com/OWNER/REPO
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ironcache server
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# --- Identity: transient, allocated-per-start UID/GID, no persistent account.
+DynamicUser=yes
+
+# --- No privilege gain through execve (setuid/setgid + file caps neutralized).
+NoNewPrivileges=yes
+
+# --- Drop every capability; the daemon needs none (binds an unprivileged port).
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- Filesystem: entire tree read-only except explicitly allowed paths.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# --- Memory: forbid writable-and-executable mappings (W^X).
+MemoryDenyWriteExecute=yes
+
+# --- Sockets: allow only the families the server actually uses.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# --- Additional defense-in-depth (consistent with the eight load-bearing
+#     directives above; tightened further as the binary's syscall set settles).
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+# --- Persisted-data deployments only: uncomment to grant a writable state dir
+#     under the strict read-only root.
+# StateDirectory=ironcache
+# ReadWritePaths=/var/lib/ironcache
+
+[Install]
+WantedBy=multi-user.target
