@@ -6179,22 +6179,23 @@ claims:
 - id: hello-noproto-error
   dimension: resp-protocol-compat
   system: Redis (HELLO command)
-  version: redis.io latest docs
+  version: redis 7.x src/networking.c
   claim: HELLO with an unsupported protocol version returns -NOPROTO; on servers without HELLO it returns
     -ERR unknown command, and clients fall back to RESP2.
-  value: -NOPROTO sorry, this protocol version is not supported.
-  source_url: https://redis.io/docs/latest/develop/reference/protocol-spec/
-  accessed_date: '2026-06-13'
+  value: -NOPROTO unsupported protocol version
+  source_url: https://github.com/redis/redis/blob/7.2/src/networking.c
+  accessed_date: '2026-06-14'
   confidence: high
-  confidence_reason: Documented negotiation flow in the protocol spec and HELLO command docs.
+  confidence_reason: The emitting source (helloCommand in src/networking.c) is the ground truth for the
+    on-wire string; the RESP3 spec prose differs from what the server actually sends.
   load_bearing: true
   verification:
     verdict: confirmed
-    best_source_url: https://redis.io/docs/latest/develop/reference/protocol-spec/
-    note: 'Both the protocol spec and RESP3.md confirm -NOPROTO error for unsupported HELLO version; the
-      exact error text ''sorry, this protocol version is not supported.'' matches the spec. (Note: cited
-      URL points to protocol-spec rather than the HELLO command page, but the protocol-spec page carries
-      the exact text, so the claim is well anchored.)'
+    best_source_url: https://github.com/redis/redis/blob/7.2/src/networking.c
+    note: 'The EMITTED string is the one in helloCommand (src/networking.c): addReplyError(c, "-NOPROTO
+      unsupported protocol version"). The RESP3 spec prose ("sorry, this protocol version is not supported.")
+      is documentation wording the server never sends, so the pinned value tracks the server source, not
+      the spec prose.'
 - id: keyspace-notifications-off-by-default
   dimension: resp-protocol-compat
   system: Redis (keyspace notifications)

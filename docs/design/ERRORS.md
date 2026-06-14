@@ -50,12 +50,15 @@ oracle version wins.
 These exact strings are pinned in the catalog (not deferred to the oracle),
 because clients pattern-match them:
 
-- `WRONGTYPE Operations against a key holding the wrong kind of value`
+- `WRONGTYPE Operation against a key holding the wrong kind of value`
 - `ERR unknown command '<name>', with args beginning with: ...`
 - `ERR wrong number of arguments for '<command>' command`
 - `EXECABORT Transaction discarded because of previous errors.`
-- `NOPROTO` uses the pinned Valkey/Redis wording [hello-noproto-error]
-  (for example `NOPROTO sorry, this protocol version is not supported.`).
+- `NOPROTO` uses the EMITTED server string [hello-noproto-error], which is
+  `NOPROTO unsupported protocol version` (from helloCommand in
+  src/networking.c). Note the RESP3 spec prose ("sorry, this protocol version is
+  not supported.") is documentation wording the server never sends; the catalog
+  pins the emitted string.
 - `NOAUTH Authentication required.` and `WRONGPASS invalid username-password
   pair or user is disabled.`
 
