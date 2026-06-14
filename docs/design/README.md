@@ -100,3 +100,9 @@ Specs added as the M1 milestone progresses.
   READWRITE, replica routing, bounded staleness surfaced to clients) (#147).
 - [NODE_LIFECYCLE.md](NODE_LIFECYCLE.md): cluster bootstrap and node lifecycle
   (seed/MEET join, learner to voter to slot-owner promotion, add/remove-node) (#149).
+- [ADVISOR_SAFETY.md](ADVISOR_SAFETY.md): the advisor safety envelope (per-knob
+  bounds, hysteresis/cooldown, regression detect + rollback, kill-switch, RCU
+  snapshot contract) (#91).
+- [ADVISOR.md](ADVISOR.md): the per-shard background advisor (LeCaR/bandit expert
+  weighting, bounded knobs, atomic RCU config swap, EvictionPolicy-trait binding,
+  shadow/off default per ADR-0013) (#126).
