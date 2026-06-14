@@ -177,6 +177,31 @@ ironcache upgrade
 
 ---
 
+## Building
+
+The first engine code has landed (the PR-1 "Boot + wire" slice: a workspace and a
+server that speaks RESP and answers the Tier-0 connection commands). To build and
+run from source you need a stable Rust toolchain (MSRV 1.85, edition 2024):
+
+```sh
+cargo build --workspace
+cargo test --workspace
+
+# boot the server (Tier-0: PING, HELLO, AUTH, SELECT, QUIT, RESET, CLIENT,
+# COMMAND, INFO, ECHO) on the default port and talk to it with any Redis client
+cargo run -p ironcache -- server
+redis-cli -p 6379 PING        # -> PONG
+
+# other modes: print the effective config, or run a config self-check
+cargo run -p ironcache -- config
+cargo run -p ironcache -- check
+```
+
+The storage engine (GET/SET/DEL and the memory ceiling) arrives in the following
+PRs; see [docs/ROADMAP.md](docs/ROADMAP.md) for the thin-vertical-slice order.
+
+---
+
 ## How this repository is organized
 
 - [README.md](README.md): the canonical vision, tenets, and committed non-goals.

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Pinned toolchain for reproducible local and CI builds. The channel is a stable
+# release; the workspace MSRV (Cargo.toml rust-version) is 1.85, the edition-2024
+# floor. CI additionally runs an MSRV job against 1.85 (see .github/workflows/rust.yml).
+[toolchain]
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

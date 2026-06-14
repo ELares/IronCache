@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# cargo-deny policy (supply-chain gate, SUPPLY_CHAIN.md / #144). Licenses are an
+# allowlist matching the dual-licensed posture; advisories warn (they are a
+# release gate, not a per-commit blocker in PR-1); sources restrict to crates.io.
+
+[graph]
+all-features = true
+
+[licenses]
+# Allowlist only. Anything outside this set fails the licenses check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+confidence-threshold = 0.9
+
+[advisories]
+# Warn in PR-1; the release pipeline (release.yml) tightens this to deny
+# (SUPPLY_CHAIN.md: advisories are a release gate, not a per-commit blocker yet).
+version = 2
+yanked = "warn"
+# Only flag `unmaintained` advisories for crates we directly own (workspace),
+# not transitive deps we cannot replace today. The one transitive case is `paste`
+# (RUSTSEC-2024-0436, unmaintained, no safe upgrade), pulled in by
+# tikv-jemalloc-ctl (the ADR-0006 mallctl accounting path); tracked for a
+# `paste` -> `pastey` follow-up. The release pipeline re-evaluates this posture.
+unmaintained = "workspace"
+
+[bans]
+multiple-versions = "warn"
+# Deny wildcard versions on external crates, but allow them on internal workspace
+# path dependencies (the `ironcache-*` crates use `{ path = ... }` with no version,
+# which is normal for an unpublished workspace, not a real wildcard risk).
+wildcards = "deny"
+allow-wildcard-paths = true
+# Determinism backstop (ADR-0003, invariant 2): ban the clock/RNG crates that read
+# real time or OS entropy outside the sanctioned ironcache-env seam. The grep lint
+# in scripts/ci/check-rust-invariants.sh catches direct API use in OUR source; this
+# ban catches a TRANSITIVE pull of one of these crates into the dependency graph
+# (which the grep cannot see). None are present today, so the build stays green; if
+# a future dep pulls one in transitively and it cannot be removed, narrow this list
+# and record the residual here.
+deny = [
+    { name = "chrono" },
+    { name = "time" },
+    { name = "fastrand" },
+    { name = "rand" },
+    { name = "quanta" },
+    { name = "coarsetime" },
+    { name = "minstant" },
+    { name = "web-time" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

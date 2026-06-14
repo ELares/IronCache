@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronCache Cargo virtual workspace. The crate graph mirrors the design seams:
+# ironcache-env (determinism seam, ADR-0003), ironcache-protocol (RESP codec and
+# error catalog, PROTOCOL.md/ERRORS.md), ironcache-runtime (the swappable Runtime
+# trait, RUNTIME_ABSTRACTION.md over the shared-nothing ADR-0002), ironcache-config
+# (layered TOML config, CONFIG.md), ironcache-observe (INFO/metrics scaffold,
+# OBSERVABILITY.md), ironcache-server (dispatch and Tier-0 connection state machine,
+# COMMANDS.md/CONNECTION_LIFECYCLE.md), and the ironcache binary (CLI_BINARY.md,
+# ADR-0020). PR-1 scope: boot plus wire, Tier-0 commands only.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/ironcache-env",
+    "crates/ironcache-protocol",
+    "crates/ironcache-runtime",
+    "crates/ironcache-config",
+    "crates/ironcache-observe",
+    "crates/ironcache-server",
+    "crates/ironcache",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ELares/IronCache"
+authors = ["Zeke <ezequiel.lares@outlook.com>"]
+
+# Pedantic-by-default lints, inherited by every member crate via
+# `[lints] workspace = true`. Specific pedantic lints are relaxed below with a
+# justification; the set is deliberately not a blanket allow.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# The codec and dispatch surfaces are inherently large match arms and conversions;
+# these named relaxations keep the signal high without blanket-allowing pedantic.
+module_name_repetitions = "allow"   # ironcache-* crate names repeat in type names by design.
+missing_errors_doc = "allow"        # Errors are typed enums documented at the type, not per fn.
+missing_panics_doc = "allow"        # PR-1 internal invariants; panics are asserted, not API contract.
+must_use_candidate = "allow"        # Noisy on small value-returning helpers.
+cast_possible_truncation = "allow"  # RESP lengths are bounded by the hardening caps (#138).
+cast_sign_loss = "allow"            # Same: bounded, checked at parse sites.
+cast_precision_loss = "allow"       # Deliberate in RNG f64 derivation and size math; bounded.
+cast_possible_wrap = "allow"        # u64 ids/lengths -> i64 RESP integers are within range here.
+cast_lossless = "allow"             # Prefer explicit `as` in numeric-formatting hot paths.
+doc_markdown = "allow"              # Doc prose cites spec filenames (RUNTIME.md) and proper nouns unquoted.
+
+[workspace.dependencies]
+# Buffers and byte handling for the zero-copy-leaning codec (PROTOCOL.md).
+bytes = "1.11"
+# Async runtime. Used in current-thread mode only; the multi-thread work-stealing
+# scheduler is rejected by ADR-0002 (shared-nothing). See ironcache-runtime.
+tokio = { version = "1.47", default-features = false }
+# CLI dispatch, ADR-0020 clap subcommands. Only `derive` is used (no `env`/`string`
+# features are exercised by the CLI surface); add them back if a future flag needs
+# env-var fallback or runtime-built strings.
+clap = { version = "4.5", features = ["derive"] }
+# Config and serde stack (CONFIG.md).
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+# Typed errors (no stringly-typed errors per ERRORS.md internal-mapping rule).
+thiserror = "2.0"
+anyhow = "1.0"
+# Allocator, ADR-0006. Pinned to the 5.3.x jemalloc series the ADR specifies; the
+# stats (and profiling) features are enabled so the PR-3 mallctl accounting path
+# (epoch + stats.allocated) compiles in.
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "stats", "profiling"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+# SO_REUSEPORT and keepalive socket options (RUNTIME.md per-shard accept).
+socket2 = { version = "0.6", features = ["all"] }
+# Fast CRLF scanning in the RESP line decoder.
+memchr = "2.7"
+# Shortest round-trip f64 digits, post-processed into Redis/fpconv spelling.
+ryu = "1.0"
+# Signal handling in the binary only (graceful shutdown, CLI_BINARY.md).
+libc = "0.2"
+
+# Internal crates.
+ironcache-env = { path = "crates/ironcache-env" }
+ironcache-protocol = { path = "crates/ironcache-protocol" }
+ironcache-runtime = { path = "crates/ironcache-runtime" }
+ironcache-config = { path = "crates/ironcache-config" }
+ironcache-observe = { path = "crates/ironcache-observe" }
+ironcache-server = { path = "crates/ironcache-server" }
+
+[profile.release]
+# Reproducible-build and size posture for the single static binary (CLI_BINARY.md,
+# ADR-0017). LTO and a single codegen unit; panic=abort keeps the musl binary lean.
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

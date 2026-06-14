@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! The IronCache runtime seam (RUNTIME.md, RUNTIME_ABSTRACTION.md) over the
+//! shared-nothing thread-per-core model (ADR-0002) and the determinism Env seam
+//! (ADR-0003).
+//!
+//! ## Two layers
+//!
+//! 1. The [`Runtime`] trait: the minimal `accept` / `recv` / `send` / `timer` /
+//!    `spawn_on_shard` surface the command core compiles against, with associated
+//!    `Listener` / `Stream` / `Buf` types fixed per backend. The core is generic
+//!    over this trait so it monomorphizes with no `dyn` on the hot path
+//!    (RUNTIME_ABSTRACTION.md). PR-1 ships exactly one backend (tokio+epoll/kqueue);
+//!    monoio/glommio are future Cargo features behind the same trait.
+//!
+//! 2. The [`bootstrap`] layer: spins up one OS thread per shard, each pinned to a
+//!    core with its own current-thread tokio runtime and its own `SO_REUSEPORT`
+//!    accept loop, so a connection lives its whole life on one core with no shared
+//!    hot-path state. The multi-thread work-stealing scheduler is deliberately NOT
+//!    used: work-stealing forces `Send + Sync` and re-introduces cross-core
+//!    atomics, the opposite of shared-nothing (ADR-0002, RUNTIME.md).
+//!
+//! ## Freeze point
+//!
+//! The [`Runtime`] trait signature is a freeze point. Downstream crates write
+//! their accept/serve loops against it; changing the method set or the owned-buffer
+//! model is a breaking change to every backend.
+
+#![cfg_attr(not(feature = "tokio"), allow(dead_code))]
+
+use core::future::Future;
+use core::time::Duration;
+use std::net::SocketAddr;
+
+/// An owned, growable byte buffer handed across the I/O seam.
+///
+/// All runtime I/O is owned-buffer, never a borrowed `&mut [u8]`
+/// (RUNTIME_ABSTRACTION.md "owned-buffer model"): io_uring's completion model
+/// requires the buffer to outlive the kernel call, so owned buffers are the only
+/// model every backend (including the future io_uring ones) can satisfy. The
+/// tokio backend pays one copy into this buffer on the readiness path; that copy
+/// is on the portable fallback only.
+pub trait IoBuf: AsRef<[u8]> + AsMut<[u8]> {
+    /// The number of initialized/usable bytes.
+    fn len(&self) -> usize;
+    /// Whether the buffer currently holds no usable bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl IoBuf for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+}
+
+/// The result of one `recv`: the (possibly grown) buffer and the count of bytes
+/// read into it. A read count of `0` signals a clean peer close (EOF).
+pub struct RecvResult<B> {
+    /// The buffer ownership returned to the caller (owned-buffer model).
+    pub buf: B,
+    /// Bytes read; `0` means the peer closed.
+    pub n: usize,
+}
+
+/// The minimal runtime surface the command core compiles against
+/// (RUNTIME_ABSTRACTION.md). Deliberately small: the thread-per-core backends
+/// produce `!Send` futures, so a fat ecosystem trait cannot be satisfied by all
+/// three backends, while this set can. There is no global `spawn`; work pins to
+/// its core through [`Runtime::spawn_on_shard`] (shared-nothing, ADR-0002).
+pub trait Runtime {
+    /// The bound listening socket type.
+    type Listener;
+    /// The connected stream type.
+    type Stream;
+    /// The owned buffer type used by `recv`/`send`.
+    type Buf: IoBuf;
+    /// The error type for I/O operations.
+    type Error;
+
+    /// Accept the next inbound connection on `listener`, returning the stream and
+    /// the peer address.
+    fn accept(
+        &self,
+        listener: &Self::Listener,
+    ) -> impl Future<Output = Result<(Self::Stream, SocketAddr), Self::Error>>;
+
+    /// Read from `stream` into the owned `buf`, appending to its existing
+    /// contents, and return the buffer plus the byte count (0 = peer closed).
+    fn recv(
+        &self,
+        stream: &mut Self::Stream,
+        buf: Self::Buf,
+    ) -> impl Future<Output = Result<RecvResult<Self::Buf>, Self::Error>>;
+
+    /// Write all of the bytes in the owned `buf` to `stream`, then RETURN the
+    /// buffer so the caller (or a buffer pool) can reclaim it.
+    ///
+    /// `send` is owned-buffer and symmetric with `recv`, never a borrowed
+    /// `&[u8]` (RUNTIME_ABSTRACTION.md "all I/O is owned-buffer, never borrowed").
+    /// A future io_uring fixed-buffer backend needs the write buffer to outlive
+    /// the kernel completion, which a borrow cannot honor; returning the owned
+    /// buffer is the only model every backend can satisfy.
+    fn send(
+        &self,
+        stream: &mut Self::Stream,
+        buf: Self::Buf,
+    ) -> impl Future<Output = Result<Self::Buf, Self::Error>>;
+
+    /// Complete after `dur` elapses. The seam's canonical timer; backends arm
+    /// their native timer under it (RUNTIME_ABSTRACTION.md "timer abstraction").
+    fn timer(&self, dur: Duration) -> impl Future<Output = ()>;
+
+    /// Spawn `task` on the current shard's executor. There is no cross-core
+    /// `spawn`: a task pins to the core that spawned it (ADR-0002). The future may
+    /// be `!Send` (thread-per-core property), so this does not require `Send`.
+    fn spawn_on_shard<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + 'static;
+}
+
+#[cfg(feature = "tokio")]
+pub mod tokio_rt;
+#[cfg(feature = "tokio")]
+pub use tokio_rt::TokioRuntime;
+
+pub mod bootstrap;
+pub use bootstrap::{ShardConfig, ShardId, ShardSet, available_shards};
+
+#[cfg(all(test, feature = "tokio"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timer_completes() {
+        let rt = TokioRuntime::new();
+        // A small timer should resolve promptly without panicking.
+        rt.timer(Duration::from_millis(1)).await;
+    }
+
+    #[test]
+    fn accept_recv_send_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A current-thread runtime with a LocalSet, mirroring how a shard runs.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let runtime = TokioRuntime::new();
+            let listener = tokio_rt::bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server = tokio::task::spawn_local(async move {
+                let (mut stream, _peer) = runtime.accept(&listener).await.unwrap();
+                let buf: Vec<u8> = Vec::with_capacity(64);
+                let res = runtime.recv(&mut stream, buf).await.unwrap();
+                assert_eq!(&res.buf[..res.n], b"PING\r\n");
+                let reply = b"+PONG\r\n".to_vec();
+                // send returns the buffer (owned-buffer model); reclaim it.
+                let returned = runtime.send(&mut stream, reply).await.unwrap();
+                assert_eq!(returned, b"+PONG\r\n");
+            });
+
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client.write_all(b"PING\r\n").await.unwrap();
+            let mut reply = [0u8; 7];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"+PONG\r\n");
+            server.await.unwrap();
+        });
+    }
+}
