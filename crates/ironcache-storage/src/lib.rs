@@ -708,6 +708,35 @@ pub trait ActiveExpiry {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime policy-swap surface (CONFIG.md maxmemory-policy hot-swap, #50/#85, PR-4b).
+// A SEPARATE trait from the frozen four primitives (like Admit/ActiveExpiry): it lets
+// the dispatch layer rebuild a shard's eviction policy on a `CONFIG SET
+// maxmemory-policy` WITHOUT naming the concrete policy enum (which lives in
+// ironcache-eviction, a crate the waist does not depend on, to keep the waist
+// policy-agnostic). The waist names only a policy NAME string and an RNG SEED; the
+// concrete store maps the name to a policy through ironcache-eviction. This is
+// ADDITIVE: it adds NO method to the four `Store` primitives and does not change their
+// signatures.
+// ---------------------------------------------------------------------------
+
+/// The runtime eviction-policy swap surface (CONFIG.md `maxmemory-policy` hot-swap).
+/// NOT one of the frozen four primitives; an additive waist trait. A `CONFIG SET
+/// maxmemory-policy` on the dispatch path rebuilds the serving shard's policy through
+/// this, seeded from the Env RNG (ADR-0003 determinism: the seed comes through the
+/// determinism seam, never std rand). The concrete per-shard store implements it; the
+/// eviction history resets on swap (acceptable, Redis itself warns the policy switch
+/// "takes time to adjust").
+pub trait PolicySwap {
+    /// Rebuild this shard's eviction policy from the Redis `maxmemory-policy` `name`,
+    /// seeding any RNG-bearing variant (`*-random`) from `rng_seed` (drawn by the
+    /// caller through the Env RNG seam, ADR-0003). Returns `false` if `name` is not a
+    /// recognized policy name (the dispatch layer validated it already, so this is the
+    /// defensive path). The previous policy's tracking state is DISCARDED on a
+    /// successful swap (the eviction-history reset CONFIG.md/Redis both document).
+    fn set_policy_by_name(&mut self, name: &str, rng_seed: u64) -> bool;
+}
+
+// ---------------------------------------------------------------------------
 // Keyspace iteration surface (KEYSPACE.md #129). A SEPARATE trait from the frozen
 // four primitives (like Admit and ActiveExpiry): it lets the command-dispatch layer
 // run the generic keyspace commands (SCAN/KEYS/DBSIZE/RANDOMKEY/RENAME/COPY/MOVE/

@@ -35,7 +35,7 @@ use bytes::Bytes;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
 use hashbrown::hash_map::Entry;
-use ironcache_eviction::EvictionPolicy;
+use ironcache_eviction::{EvictionPolicy, Policy, map_policy_name};
 use ironcache_storage::{
     AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
     MoveOutcome, NewValue, NullEviction, OccupiedEntry, RmwAction, RmwEntry, RmwStep, ScanCursor,
@@ -688,6 +688,31 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
     }
 }
 
+impl<A: AccountingHook> ironcache_storage::PolicySwap for ShardStore<Policy, A> {
+    /// Rebuild this shard's eviction policy from `name` (CONFIG.md `maxmemory-policy`
+    /// hot-swap), seeded from `rng_seed` (the caller drew it through the Env RNG seam,
+    /// ADR-0003: no std rand in the library). Implemented ONLY for the concrete
+    /// [`Policy`] hook (the swap installs a fresh `Policy`), not for the generic `E`.
+    ///
+    /// The previous policy's tracking state (S3-FIFO queues / W-TinyLFU sketch /
+    /// Random roster) is DISCARDED: the new policy starts with empty eviction history.
+    /// CONFIG.md and Redis both document this ("the policy switch takes time to
+    /// adjust"). The KEYSPACE and the byte accounting are UNTOUCHED, so no resident
+    /// data is lost; only the eviction-ordering metadata resets. The new policy will
+    /// re-observe keys on subsequent accesses/inserts. Returns `false` for an
+    /// unrecognized `name` (leaving the existing policy in place); the dispatch layer
+    /// validates the name first, so that is the defensive path.
+    fn set_policy_by_name(&mut self, name: &str, rng_seed: u64) -> bool {
+        match map_policy_name(name, rng_seed) {
+            Some(policy) => {
+                self.eviction = policy;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 impl<E: EvictionHook, A: AccountingHook> ironcache_storage::ActiveExpiry for ShardStore<E, A> {
     /// Reap `key` ONLY if it is present and its stored deadline has STRICTLY passed at
     /// `now` (the active-drain re-check, EXPIRATION.md). The timing wheel may offer a
@@ -1169,5 +1194,99 @@ mod scan_core_tests {
         let plan = scan_plan(&o, ScanCursor::START, 2);
         assert_eq!(plan.examined.len(), 2);
         assert_eq!(plan.next, ScanCursor(3), "resume at the 3rd key's hash");
+    }
+}
+
+#[cfg(test)]
+mod policy_swap_tests {
+    //! The additive [`PolicySwap`](ironcache_storage::PolicySwap) hot-swap on the
+    //! concrete [`ShardStore`] (CONFIG.md `maxmemory-policy` hot-swap, PR-4b). Proves
+    //! the swap installs a fresh policy, leaves the keyspace intact, resets the
+    //! eviction history, and is deterministic from a fixed seed.
+
+    use super::*;
+    use ironcache_eviction::EvictionPolicy;
+    use ironcache_storage::{Admit, CountingAccounting, NewValue, PolicySwap, Store};
+
+    type TestStore = ShardStore<Policy, CountingAccounting>;
+
+    fn store_with(name: &str) -> TestStore {
+        let policy = map_policy_name(name, 1).expect("known policy name");
+        ShardStore::with_hooks(4, policy, CountingAccounting::new())
+    }
+
+    #[test]
+    fn swap_changes_policy_name_and_keeps_keyspace() {
+        let mut store = store_with("allkeys-lru");
+        // Plant some live data.
+        store.upsert(
+            0,
+            b"k1",
+            NewValue::Bytes(b"v1"),
+            ExpireWrite::Clear,
+            UnixMillis(0),
+        );
+        store.upsert(
+            0,
+            b"k2",
+            NewValue::Bytes(b"v2"),
+            ExpireWrite::Clear,
+            UnixMillis(0),
+        );
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.eviction.policy_name(), "allkeys-lru");
+        // OBJECT-FREQ-style accessor returns None under a non-LFU policy.
+        assert!(store.access_freq(0, b"k1").is_none());
+
+        // Swap to allkeys-lfu (the real W-TinyLFU engine).
+        assert!(store.set_policy_by_name("allkeys-lfu", 7));
+        assert_eq!(store.eviction.policy_name(), "allkeys-lfu");
+        // The keyspace is INTACT across the swap (only eviction metadata reset).
+        assert_eq!(store.len(), 2);
+        // A read under the new LFU policy now tracks frequency (Some), where it was None.
+        let _ = store.read(0, b"k1", UnixMillis(0));
+        assert!(
+            store.access_freq(0, b"k1").is_some(),
+            "LFU policy now tracks access frequency after the swap"
+        );
+    }
+
+    #[test]
+    fn swap_rejects_unknown_name_and_keeps_policy() {
+        let mut store = store_with("allkeys-lru");
+        assert!(!store.set_policy_by_name("allkeys-ttl", 1));
+        // The existing policy is unchanged on a rejected swap.
+        assert_eq!(store.eviction.policy_name(), "allkeys-lru");
+    }
+
+    #[test]
+    fn swap_seed_is_deterministic() {
+        // Two stores swapped to a *-random policy with the SAME seed select the same
+        // victim sequence (ADR-0003: the swap seeds the RNG from the determinism seam).
+        let mut a = store_with("allkeys-lru");
+        let mut b = store_with("allkeys-lru");
+        for s in [&mut a, &mut b] {
+            for i in 0..8u8 {
+                let key = [b'k', i];
+                s.upsert(
+                    0,
+                    &key,
+                    NewValue::Bytes(b"v"),
+                    ExpireWrite::Clear,
+                    UnixMillis(0),
+                );
+            }
+        }
+        assert!(a.set_policy_by_name("allkeys-random", 12345));
+        assert!(b.set_policy_by_name("allkeys-random", 12345));
+        // Re-register the live keys so the Random roster is populated identically.
+        for s in [&mut a, &mut b] {
+            for i in 0..8u8 {
+                let key = [b'k', i];
+                let _ = s.read(0, &key, UnixMillis(0));
+            }
+        }
+        // The same seed yields the same victim choice.
+        assert_eq!(a.eviction.select_victim(), b.eviction.select_victim());
     }
 }

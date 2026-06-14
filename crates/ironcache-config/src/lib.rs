@@ -5,16 +5,26 @@
 //! precedence first (CONFIG.md "sources and precedence"):
 //!
 //! ```text
-//! CLI flags  >  environment variables  >  TOML file  >  built-in defaults
+//! runtime CONFIG SET  >  CLI flags  >  environment variables  >  TOML file  >  built-in defaults
 //! ```
 //!
-//! (The runtime `CONFIG SET` layer that sits above CLI flags is part of the wire
-//! command surface and lands with the `CONFIG` command in a later PR; PR-1
-//! implements the four startup layers.)
-//!
-//! Each layer is an [`ConfigOverlay`] of optional fields; [`Config::resolve`]
-//! folds them defaults-first so a higher layer that sets a key wins. Human sizes
-//! ("512mb") are parsed by [`parse_human_size`].
+//! The lower four startup layers fold into a [`Config`] at boot via
+//! [`Config::resolve`] ([`ConfigOverlay`] of optional fields, defaults-first so a
+//! higher layer that sets a key wins). The HIGHEST layer, the runtime `CONFIG SET`
+//! overlay, is the separate [`RuntimeConfig`] cell (PR-4b): it sits ABOVE the
+//! resolved [`Config`] and is the one a `CONFIG SET` mutates, so a future file
+//! reload (which re-folds only the lower layers) can never clobber a runtime
+//! override. The [`registry`] maps Redis parameter names to the getters/setters
+//! `CONFIG GET`/`CONFIG SET` dispatch over. Human sizes ("512mb") are parsed by
+//! [`parse_human_size`].
+
+pub mod registry;
+pub mod runtime;
+
+pub use registry::{
+    ParamSpec, SetKind, SetOutcome, apply_set, effective_value, lookup, param_specs,
+};
+pub use runtime::RuntimeConfig;
 
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr};
@@ -514,5 +524,59 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_overlay_outranks_the_file_layer() {
+        // The reload-clobber correctness test (CONFIG.md): the runtime overlay is the
+        // HIGHEST-precedence layer, so a CONFIG SET out-ranks the value resolved from
+        // the file/CLI/env/default layers, and a subsequent file reload (re-folding the
+        // lower layers) does NOT clobber the runtime override.
+        use crate::registry::{apply_set, effective_value};
+        use crate::runtime::RuntimeConfig;
+
+        // The boot config as resolved from a TOML file layer (maxmemory 256mb).
+        let file = ConfigOverlay {
+            maxmemory: Some("256mb".to_owned()),
+            maxmemory_policy: Some("allkeys-lru".to_owned()),
+            ..Default::default()
+        };
+        let boot = Config::resolve(&[file]).unwrap();
+        assert_eq!(boot.maxmemory, 256 * 1024 * 1024);
+
+        // The runtime overlay seeds from the boot config, then a CONFIG SET overrides.
+        let runtime = RuntimeConfig::from_config(&boot);
+        assert_eq!(
+            effective_value("maxmemory", &runtime, &boot).as_deref(),
+            Some((256 * 1024 * 1024).to_string().as_str())
+        );
+        apply_set("maxmemory", "512mb", &runtime);
+        apply_set("maxmemory-policy", "allkeys-lfu", &runtime);
+
+        // The runtime override wins over the boot (file) value.
+        assert_eq!(
+            effective_value("maxmemory", &runtime, &boot).as_deref(),
+            Some((512 * 1024 * 1024).to_string().as_str())
+        );
+        assert_eq!(
+            effective_value("maxmemory-policy", &runtime, &boot).as_deref(),
+            Some("allkeys-lfu")
+        );
+
+        // Simulate a file reload: the file layer changes (maxmemory 128mb) and the boot
+        // config is re-folded from the lower layers ONLY. The runtime overlay is NOT
+        // touched by the reload, so the CONFIG SET override survives (no clobber).
+        let reloaded_file = ConfigOverlay {
+            maxmemory: Some("128mb".to_owned()),
+            ..Default::default()
+        };
+        let reloaded_boot = Config::resolve(&[reloaded_file]).unwrap();
+        assert_eq!(reloaded_boot.maxmemory, 128 * 1024 * 1024);
+        // The effective value is STILL the runtime override (512mb), not the reloaded
+        // file value (128mb): the overlay out-ranks the file layer.
+        assert_eq!(
+            effective_value("maxmemory", &runtime, &reloaded_boot).as_deref(),
+            Some((512 * 1024 * 1024).to_string().as_str())
+        );
     }
 }
