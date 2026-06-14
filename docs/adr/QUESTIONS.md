@@ -17,6 +17,7 @@ question open.
 | #42 allocator bench | jemalloc vs mimalloc vs snmalloc under a cache workload? | #41 (decided: ADR-0006 jemalloc on introspection/defrag-hint grounds; #42 re-milestoned to M1 as empirical validation, gated on #8) |
 | #47 eviction bench | SIEVE vs S3-FIFO vs W-TinyLFU vs ARC/LIRS on real traces? | #46 (decided: ADR-0008 S3-FIFO default; #47 re-milestoned to M1 as empirical validation on cachemon + our traces) |
 | #57 value-size survey | Value-size and compressibility distribution? | #52, #53 |
+| #54 pure-Rust zstd parity | Does pure-Rust zstd match C zstd on ratio, throughput, and level/dictionary configurability for our payloads? | #54 (decided on paper: ADR-0021 keeps the C-bound default, pure-Rust behind an off-by-default feature; the parity benchmark is an empirical-validation follow-up to be filed, gating promotion) |
 | #61 snapshot overhead | Bound snapshot memory overhead and fast restart? | #59, #60 |
 | #78 per-shard Raft | Feasibility of an opt-in strongly-consistent tier? | #76, #78 |
 | #80 consistent hashing | Post-ketama placement for internal sharding? | #71, #80 |
