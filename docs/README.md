@@ -18,6 +18,9 @@ issues are the specification.
 - [GLOSSARY.md](GLOSSARY.md) and [INVARIANTS.md](INVARIANTS.md): the canonical
   vocabulary and the load-bearing invariants every design must respect.
 - [design/](design/): the subsystem design specifications that gate implementation.
+- [experiments/](experiments/): experiment-design records for harness-blocked
+  research (the provisional decision plus the exact benchmark to run once the
+  engine and harness exist).
 - [THREAT_MODEL.md](THREAT_MODEL.md): the shared adversary model (assets, trust
   boundaries, attacker capabilities, STRIDE per subsystem, in-scope vs accepted
   risk) that the security specs hang off, paired with the root
