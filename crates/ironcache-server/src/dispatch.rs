@@ -115,23 +115,27 @@ pub fn dispatch<C: Clock, S: Store + Admit>(
     }
 
     // maxmemory admission (ADMISSION.md #128, ADR-0007). For a `denyoom` write, before
-    // the command body: if the ceiling is enabled and this shard is at/over its
+    // the command body: if the ceiling is enabled and this shard is STRICTLY OVER its
     // budget, either evict-to-fit (cache mode) or reply `-OOM` (datastore/noeviction).
-    // Non-denyoom commands (reads, DEL, Tier-0) are ALWAYS served, even over budget,
-    // so a client can read and free under pressure.
+    // The comparison is strict `>` to match Redis's getMaxmemoryState (evict.c):
+    // memory is "under limit" when `used <= maxmemory`, so a write at EXACTLY
+    // used==budget is served, and only used>budget triggers eviction/-OOM (the -OOM
+    // string itself reads "used memory > 'maxmemory'"). Non-denyoom commands (reads,
+    // DEL, Tier-0) are ALWAYS served, even over budget, so a client can read and free
+    // under pressure.
     if ctx.ceiling_enabled() && is_denyoom(cmd.as_slice()) {
         let budget = ctx.per_shard_budget;
-        if store.used_memory() >= budget {
+        if store.used_memory() > budget {
             if store.policy_evicts() {
                 // Cache mode: try to free space, then re-check. If eviction cannot get
-                // us under the budget (write outruns eviction, or only ineligible
-                // keys remain), reject -OOM. The freed count is reported for INFO.
+                // us down to budget (write outruns eviction, or only ineligible keys
+                // remain), reject -OOM. The freed count is reported for INFO.
                 *evicted_out = store.evict_to_fit(budget, now);
-                if store.used_memory() >= budget {
+                if store.used_memory() > budget {
                     return Value::error(ErrorReply::oom());
                 }
             } else {
-                // Strict datastore / noeviction: -OOM is the at-capacity behavior.
+                // Strict datastore / noeviction: -OOM is the over-capacity behavior.
                 return Value::error(ErrorReply::oom());
             }
         }
@@ -1673,6 +1677,89 @@ mod tests {
             run_on(&c, &mut s, &mut st, t, &[b"GET", b"k2"]),
             Value::Null
         );
+    }
+
+    #[test]
+    fn denyoom_write_at_exactly_used_equals_budget_is_served() {
+        // Strict-over semantics (Redis getMaxmemoryState: under-limit at
+        // `used <= maxmemory`). With used == budget EXACTLY, a denyoom write is served
+        // (the gate's `used > budget` is false), NOT OOM'd, even under `noeviction`.
+        let mut probe = store_with(16, Policy::NoEviction);
+        let t = UnixMillis(0);
+        let big = vec![b'v'; 100];
+        // Plant one key with no ceiling, then read the resulting footprint and set the
+        // budget to EXACTLY that, so used == budget on the next gated write.
+        probe.upsert(
+            0,
+            b"k",
+            ironcache_storage::NewValue::Bytes(&big),
+            ironcache_storage::ExpireWrite::Clear,
+            t,
+        );
+        let exact = probe.used_memory();
+        assert!(exact > 0);
+
+        let c = ctx_with_budget(exact);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::NoEviction);
+        // Replay the same plant against the gated store so used == budget exactly.
+        let (r0, ev0) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(r0, Value::ok());
+        assert_eq!(ev0, 0);
+        assert_eq!(
+            st.used_memory(),
+            exact,
+            "used must equal the budget exactly"
+        );
+
+        // A denyoom write that does NOT grow memory (overwrite same key, same size) at
+        // used == budget is SERVED: the gate is strict `>`, so used==budget passes.
+        let (r1, ev1) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(r1, Value::ok(), "at used==budget the write must be served");
+        assert_eq!(ev1, 0);
+
+        // Now push STRICTLY over the budget (a second, larger key with no ceiling
+        // would not be gated; instead grow via the gated path: the first overwrite was
+        // served and left used==budget, so a NEW key now tips strictly over and the
+        // NEXT denyoom write is OOM'd under noeviction).
+        let (r2, _ev2) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k2", &big]);
+        // The k2 write happened at used==budget (served), pushing used strictly over.
+        assert_eq!(r2, Value::ok());
+        assert!(st.used_memory() > exact, "used is now strictly over budget");
+        // The FOLLOWING denyoom write is rejected -OOM (strictly over, noeviction).
+        let (r3, ev3) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k3", &big]);
+        assert_eq!(
+            err_of(r3),
+            "-OOM command not allowed when used memory > 'maxmemory'."
+        );
+        assert_eq!(ev3, 0);
+    }
+
+    #[test]
+    fn cache_mode_at_exactly_budget_serves_without_evicting() {
+        // Cache mode mirror of the strict-over boundary: at used == budget the gate is
+        // not entered, so evict_to_fit does NOT run and nothing is evicted.
+        let mut probe = store_with(16, Policy::cache_default());
+        let t = UnixMillis(0);
+        let big = vec![b'v'; 100];
+        probe.upsert(
+            0,
+            b"k",
+            ironcache_storage::NewValue::Bytes(&big),
+            ironcache_storage::ExpireWrite::Clear,
+            t,
+        );
+        let exact = probe.used_memory();
+
+        let c = ctx_with_budget(exact);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::cache_default());
+        run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(st.used_memory(), exact);
+        // Overwrite at used==budget: served, and the eviction gate did not fire.
+        let (r, ev) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(r, Value::ok());
+        assert_eq!(ev, 0, "at used==budget cache mode must not evict");
     }
 
     #[test]

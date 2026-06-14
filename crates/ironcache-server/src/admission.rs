@@ -34,6 +34,13 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             | b"INCRBY"
             | b"DECRBY"
             | b"INCRBYFLOAT"
+            // SETEX/PSETEX are denyoom writes (they allocate a value), so they are
+            // pre-classified here NOW even though their dispatch arms land in 3b. This
+            // ordering is deliberate: until 3b wires them, an over-budget SETEX/PSETEX
+            // is OOM'd by this gate BEFORE falling through to the unknown-command reply
+            // (OOM-before-unknown), matching Redis (the denyoom check precedes command
+            // lookup); the classification is the single source so the 3b arm cannot
+            // silently bypass the ceiling.
             | b"SETEX"
             | b"PSETEX"
     )
