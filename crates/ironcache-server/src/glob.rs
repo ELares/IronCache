@@ -89,8 +89,12 @@ pub fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
                             matched = true;
                         }
                         idx += 1;
-                    } else if idx + 2 < p.len() && p[idx + 1] == b'-' && p[idx + 2] != b']' {
+                    } else if idx + 2 < p.len() && p[idx + 1] == b'-' {
                         // A range `a-z`. Redis orders the endpoints so `z-a` works too.
+                        // stringmatchlen takes this branch whenever `pattern[1] == '-'`
+                        // with NO guard that pattern[2] != ']', so `]` is consumed as a
+                        // range endpoint too (e.g. `[a-]` is the range ']'..'a' after the
+                        // swap below, since 'a' > ']').
                         let (mut lo, mut hi) = (p[idx], p[idx + 2]);
                         if lo > hi {
                             core::mem::swap(&mut lo, &mut hi);
@@ -221,6 +225,17 @@ mod tests {
         // Redis orders the endpoints, so `[z-a]` behaves like `[a-z]`.
         assert!(glob_match(b"[z-a]", b"m"));
         assert!(!glob_match(b"[z-a]", b"M"));
+    }
+
+    #[test]
+    fn range_consumes_closing_bracket_as_endpoint() {
+        // stringmatchlen takes the range branch whenever `pattern[1] == '-'` with NO
+        // guard that `pattern[2] != ']'`, so `[a-]` is the range ']'..'a' (endpoints
+        // swapped since 'a' > ']'). It matches `]` and `_` (both within ']'..='a') and
+        // does NOT match `-` (0x2D, below ']' 0x5D).
+        assert!(glob_match(b"[a-]", b"]"));
+        assert!(glob_match(b"[a-]", b"_"));
+        assert!(!glob_match(b"[a-]", b"-"));
     }
 
     #[test]
