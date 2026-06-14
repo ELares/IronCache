@@ -150,3 +150,5 @@ Specs added as the M1 milestone progresses.
   (SETBIT/GETBIT zero-fill, BITCOUNT/BITPOS BYTE|BIT, BITOP, BITFIELD overflow) (#131).
 - [SHUTDOWN.md](SHUTDOWN.md): the graceful shutdown contract (SHUTDOWN NOSAVE/SAVE,
   SIGTERM/SIGINT, connection drain, save-on-exit, orchestrator grace/exit-code) (#139).
+- [UPGRADE.md](UPGRADE.md): `ironcache upgrade` with verified rollback (minisign
+  verify-before-swap, atomic rename, post-swap readiness probe, auto-rollback) (#83).
