@@ -6740,3 +6740,42 @@ claims:
       the highest release (no tag beyond it), with 9.0.4 and 8.1.8 the recent per-line tags. As of 2026-06-13
       the release line is past 8.0/8.1. Confirmed. (Some secondary articles cite earlier planned Sept
       2025 GA dates, but the actual GA tag is 2025-10-21.)'
+- id: redis-timeout-default-0
+  dimension: resp-protocol-compat
+  system: Redis
+  version: redis.conf (long-standing default, predates 3.2)
+  claim: The redis.conf `timeout` directive closes a client connection after it has been idle for N seconds;
+    it defaults to 0, which disables idle-client disconnection, so recent Redis does not close idle clients
+    unless a non-zero timeout is configured.
+  value: timeout 0 (idle disconnect disabled by default)
+  source_url: https://redis.io/docs/latest/develop/reference/clients/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Documented redis.conf default; confirmed in the redis.io client-handling reference.
+  load_bearing: true
+  verification:
+    verdict: self-verified
+    best_source_url: https://redis.io/docs/latest/develop/reference/clients/
+    note: 'redis.io client handling: default timeout is 0 to disable client idle disconnection. Confirmed
+      against redis.conf default.'
+- id: redis-tcp-keepalive-default-300
+  dimension: resp-protocol-compat
+  system: Redis
+  version: Redis 3.2.1+ (redis.conf)
+  claim: The redis.conf `tcp-keepalive` directive enables SO_KEEPALIVE and sets the idle time before the
+    first TCP keepalive probe; it defaults to 300 seconds. When non-zero the kernel sends keepalive probes
+    to an otherwise-idle peer (the peer ACKs), which detects a dead peer and keeps middlebox connection
+    state alive. Given Redis's probe-count/interval settings a dead connection is torn down after roughly
+    double the idle time (not an inherent Linux property; default Linux keepalive would take far longer).
+  value: tcp-keepalive 300 (SO_KEEPALIVE on; idle-before-first-probe; ~2x to close given Redis probe config)
+  source_url: https://redis.io/docs/latest/develop/reference/clients/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Default since Redis 3.2.1; documented in redis.conf and the redis.io client-handling
+    reference.
+  load_bearing: true
+  verification:
+    verdict: self-verified
+    best_source_url: https://redis.io/docs/latest/develop/reference/clients/
+    note: 'redis.io and redis.conf: tcp-keepalive defaults to 300s since 3.2.1; SO_KEEPALIVE detects dead
+      peers, ~2x the interval to close on Linux. Confirmed.'

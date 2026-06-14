@@ -58,3 +58,6 @@ Specs added as the M1 milestone progresses.
   (4-bit CM-sketch, halving aging, optional doorkeeper off by default,
   admission/eviction-only decision path, incumbent-wins tie-break) as the non-ML
   admission floor (#49).
+- [CONNECTION_LIFECYCLE.md](CONNECTION_LIFECYCLE.md): idle-connection `timeout`,
+  TCP keepalive for dead-peer detection, and the reaping of dead/wedged/blocked
+  connections with per-core resource reclamation (#140).
