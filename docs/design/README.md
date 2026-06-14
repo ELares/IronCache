@@ -71,3 +71,6 @@ Specs added as the M1 milestone progresses.
   SLOWLOG/MONITOR/INFO/logs, zeroize-on-drop, mlock and no-coredump hardening, and
   the MONITOR/metrics auth decision (#145). The shared adversary model is
   [docs/THREAT_MODEL.md](../THREAT_MODEL.md) (#142).
+- [DEFRAG.md](DEFRAG.md): online active defragmentation (native slab-sparsity
+  query, copy-relocate through the owned per-core index, Redis-compatible throttle
+  and thresholds, default off) (#43).
