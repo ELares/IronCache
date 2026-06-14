@@ -94,21 +94,35 @@ pub fn parse_canonical_i64(bytes: &[u8]) -> Option<i64> {
         // "0" is canonical; "-0" is not.
         return if neg { None } else { Some(0) };
     }
-    let mut acc: i64 = 0;
+    // Accumulate the MAGNITUDE as u64 so the full i64 range, including i64::MIN,
+    // is representable (i64::MIN's magnitude does not fit a positive i64). This
+    // mirrors Redis `string2ll` (src/util.c), which accumulates unsigned and
+    // negates with the LLONG_MIN special-case, so "-9223372036854775808" IS a
+    // canonical int.
+    let mut acc: u64 = 0;
     for &b in digits {
         if !b.is_ascii_digit() {
             return None;
         }
-        acc = acc.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+        acc = acc.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
     }
     if neg {
-        // acc is positive so far; negate. (i64::MIN's magnitude does not fit in a
-        // positive i64, so "-9223372036854775808" would have overflowed the
-        // checked_add above and returned None; that input is therefore classified
-        // as a string, which is acceptable and matches no canonical positive acc.)
-        Some(-acc)
+        // A negative number's magnitude may be up to (i64::MAX as u64) + 1, which
+        // is exactly i64::MIN. Anything larger overflows.
+        const MIN_MAGNITUDE: u64 = (i64::MAX as u64) + 1;
+        if acc > MIN_MAGNITUDE {
+            return None;
+        }
+        if acc == MIN_MAGNITUDE {
+            return Some(i64::MIN);
+        }
+        Some(-(acc as i64))
     } else {
-        Some(acc)
+        // A non-negative number's magnitude may be up to i64::MAX.
+        if acc > i64::MAX as u64 {
+            return None;
+        }
+        Some(acc as i64)
     }
 }
 
@@ -122,6 +136,8 @@ mod tests {
         assert_eq!(classify(b"12345"), Classified::Int(12345));
         assert_eq!(classify(b"-1"), Classified::Int(-1));
         assert_eq!(classify(b"9223372036854775807"), Classified::Int(i64::MAX));
+        // Redis string2ll int-encodes the FULL i64 range, including i64::MIN.
+        assert_eq!(classify(b"-9223372036854775808"), Classified::Int(i64::MIN));
     }
 
     #[test]
@@ -133,8 +149,8 @@ mod tests {
         assert_eq!(classify(b"7 "), Classified::EmbStr);
         assert_eq!(classify(b"-0"), Classified::EmbStr);
         assert_eq!(classify(b"3.14"), Classified::EmbStr);
-        // i64::MIN magnitude does not fit a positive accumulator -> not int.
-        assert_eq!(classify(b"-9223372036854775808"), Classified::EmbStr);
+        // One past i64::MIN's magnitude -> not int (overflows the i64 range).
+        assert_eq!(classify(b"-9223372036854775809"), Classified::EmbStr);
         // Over i64::MAX -> not int (and long enough? no, 19 digits <= 44 -> embstr).
         assert_eq!(classify(b"99999999999999999999"), Classified::EmbStr);
         // Empty string is the empty embstr, never int.
@@ -163,7 +179,7 @@ mod tests {
     fn parse_canonical_round_trips_to_string() {
         // Every classified int must equal its own decimal string (the property
         // that lets an int-encoded value materialize bytes equal to the original).
-        for n in [0i64, 1, -1, 12345, -67890, i64::MAX] {
+        for n in [0i64, 1, -1, 12345, -67890, i64::MAX, i64::MIN] {
             let s = n.to_string();
             assert_eq!(parse_canonical_i64(s.as_bytes()), Some(n), "{s}");
         }

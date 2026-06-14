@@ -252,6 +252,19 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "syntax error")
     }
 
+    /// `ERR invalid expire time in '<cmd>' command` - the reply Redis emits (via
+    /// `addReplyErrorExpireTime`) when an EX/PX/EXAT/PXAT value is `<= 0` or
+    /// overflows the millisecond computation. This is DISTINCT from a syntax error
+    /// (conflicting flags) and from the not-an-integer error (a non-integer expire
+    /// argument, thrown earlier): three separate error classes.
+    #[must_use]
+    pub fn invalid_expire_time(cmd: &str) -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            format!("invalid expire time in '{cmd}' command"),
+        )
+    }
+
     /// `ERR DB index is out of range`.
     #[must_use]
     pub fn select_out_of_range() -> Self {
@@ -416,5 +429,13 @@ mod tests {
     #[test]
     fn syntax_error_is_byte_exact() {
         assert_eq!(ErrorReply::syntax_error().line(), "-ERR syntax error");
+    }
+
+    #[test]
+    fn invalid_expire_time_is_byte_exact() {
+        assert_eq!(
+            ErrorReply::invalid_expire_time("set").line(),
+            "-ERR invalid expire time in 'set' command"
+        );
     }
 }

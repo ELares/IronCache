@@ -66,9 +66,31 @@ enum TtlOption {
     Set(UnixMillis),
 }
 
-/// Parse the SET option tail (args after key and value), or `None` on a syntax
-/// error (conflicting/unknown options or a bad/overflowing TTL value).
-fn parse_set_options(args: &[Bytes], now: UnixMillis) -> Option<SetOptions> {
+/// Why parsing the SET option tail failed. Redis distinguishes THREE error
+/// classes here (do not collapse them):
+///
+/// - [`SetParseError::Syntax`] - conflicting flags (`NX`+`XX`), more than one
+///   expire option, or an unknown token. Emits `-ERR syntax error`.
+/// - [`SetParseError::NotInteger`] - a non-integer EX/PX/EXAT/PXAT argument
+///   (thrown BEFORE the `<= 0` check, matching Redis's `getLongLongFromObjectOrReply`
+///   ordering). Emits `-ERR value is not an integer or out of range`.
+/// - [`SetParseError::InvalidExpire`] - an expire value `<= 0` or one that
+///   overflows the millisecond computation. Emits
+///   `-ERR invalid expire time in 'set' command`.
+#[derive(Debug, PartialEq, Eq)]
+enum SetParseError {
+    /// Conflicting/duplicate/unknown options.
+    Syntax,
+    /// A non-integer (or out-of-i64-range) expire argument.
+    NotInteger,
+    /// An expire value `<= 0` or one that overflows the ms computation.
+    InvalidExpire,
+}
+
+/// Parse the SET option tail (args after key and value) into a [`SetOptions`], or
+/// the specific [`SetParseError`] class so the caller can emit the right Redis
+/// error (Redis maps these to three DISTINCT replies; see [`SetParseError`]).
+fn parse_set_options(args: &[Bytes], now: UnixMillis) -> Result<SetOptions, SetParseError> {
     let mut opts = SetOptions::default();
     let mut ttl_seen = false;
     let mut i = 0;
@@ -77,74 +99,88 @@ fn parse_set_options(args: &[Bytes], now: UnixMillis) -> Option<SetOptions> {
         match up.as_slice() {
             b"NX" => {
                 if opts.nx || opts.xx {
-                    return None;
+                    return Err(SetParseError::Syntax);
                 }
                 opts.nx = true;
                 i += 1;
             }
             b"XX" => {
                 if opts.nx || opts.xx {
-                    return None;
+                    return Err(SetParseError::Syntax);
                 }
                 opts.xx = true;
                 i += 1;
             }
             b"GET" => {
                 if opts.get {
-                    return None;
+                    return Err(SetParseError::Syntax);
                 }
                 opts.get = true;
                 i += 1;
             }
             b"KEEPTTL" => {
                 if ttl_seen {
-                    return None;
+                    return Err(SetParseError::Syntax);
                 }
                 ttl_seen = true;
                 opts.ttl = TtlOption::Keep;
                 i += 1;
             }
             kw @ (b"EX" | b"PX" | b"EXAT" | b"PXAT") => {
+                // A duplicate expire option or a missing argument is a syntax error.
                 if ttl_seen || i + 1 >= args.len() {
-                    return None;
+                    return Err(SetParseError::Syntax);
                 }
                 ttl_seen = true;
-                let n = parse_i64(&args[i + 1])?;
+                // Redis parses the expire arg as an integer FIRST: a non-integer
+                // (or out-of-i64-range) value is the not-an-integer error, thrown
+                // before the <= 0 / overflow checks below.
+                let n = parse_i64(&args[i + 1]).ok_or(SetParseError::NotInteger)?;
+                // A <= 0 value or an overflowing ms computation is invalid expire.
                 opts.ttl = TtlOption::Set(resolve_ttl(kw, n, now)?);
                 i += 2;
             }
-            _ => return None,
+            _ => return Err(SetParseError::Syntax),
         }
     }
-    Some(opts)
+    Ok(opts)
 }
 
-/// Resolve a TTL keyword + numeric argument into an absolute deadline. EX/PX are
-/// relative to `now`; EXAT/PXAT are absolute. A non-positive relative TTL or an
-/// out-of-range value is a syntax/expire error -> `None` (the caller maps it to a
-/// syntax error, matching Redis's "invalid expire time" being rejected before any
-/// write). PR-2a treats any non-positive or overflowing value as rejected.
-fn resolve_ttl(kw: &[u8], n: i64, now: UnixMillis) -> Option<UnixMillis> {
+/// Resolve a TTL keyword + integer argument into an absolute deadline. EX/PX are
+/// relative to `now`; EXAT/PXAT are absolute. A non-positive relative TTL, a
+/// non-positive resolved deadline, or an out-of-range/overflowing value is
+/// [`SetParseError::InvalidExpire`] (Redis's "invalid expire time", rejected
+/// before any write). The argument is already known to be a valid i64.
+fn resolve_ttl(kw: &[u8], n: i64, now: UnixMillis) -> Result<UnixMillis, SetParseError> {
     let abs_millis: i64 = match kw {
-        b"EX" => now_plus(now, n.checked_mul(1_000)?)?,
+        b"EX" => now_plus(now, mul_1000(n)?)?,
         b"PX" => now_plus(now, n)?,
-        b"EXAT" => n.checked_mul(1_000)?,
+        b"EXAT" => mul_1000(n)?,
         b"PXAT" => n,
-        _ => return None,
+        // Unreachable: parse_set_options only calls this for the four keywords.
+        _ => return Err(SetParseError::Syntax),
     };
     if abs_millis <= 0 {
-        return None;
+        return Err(SetParseError::InvalidExpire);
     }
-    Some(UnixMillis(abs_millis as u64))
+    Ok(UnixMillis(abs_millis as u64))
+}
+
+/// `n * 1000`, mapping overflow to an invalid-expire error.
+fn mul_1000(n: i64) -> Result<i64, SetParseError> {
+    n.checked_mul(1_000).ok_or(SetParseError::InvalidExpire)
 }
 
 /// `now + delta_millis` as an i64, rejecting a non-positive delta (Redis rejects a
 /// non-positive EX/PX as an invalid expire time) and overflow.
-fn now_plus(now: UnixMillis, delta_millis: i64) -> Option<i64> {
+fn now_plus(now: UnixMillis, delta_millis: i64) -> Result<i64, SetParseError> {
     if delta_millis <= 0 {
-        return None;
+        return Err(SetParseError::InvalidExpire);
     }
-    i64::try_from(now.0).ok()?.checked_add(delta_millis)
+    i64::try_from(now.0)
+        .ok()
+        .and_then(|t| t.checked_add(delta_millis))
+        .ok_or(SetParseError::InvalidExpire)
 }
 
 /// `SET key value [NX|XX] [GET] [EX s|PX ms|EXAT ts|PXAT tms|KEEPTTL]`.
@@ -156,8 +192,13 @@ pub fn cmd_set<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request)
     if req.args.len() < 3 {
         return Value::error(ErrorReply::wrong_arity("set"));
     }
-    let Some(opts) = parse_set_options(&req.args[3..], now) else {
-        return Value::error(ErrorReply::syntax_error());
+    let opts = match parse_set_options(&req.args[3..], now) {
+        Ok(opts) => opts,
+        Err(SetParseError::Syntax) => return Value::error(ErrorReply::syntax_error()),
+        Err(SetParseError::NotInteger) => return Value::error(ErrorReply::not_an_integer()),
+        Err(SetParseError::InvalidExpire) => {
+            return Value::error(ErrorReply::invalid_expire_time("set"));
+        }
     };
 
     let expire = match opts.ttl {

@@ -221,8 +221,11 @@ fn lazy_expiry_removes_on_read_after_deadline() {
     // Before the deadline: live.
     assert!(s.read(0, b"k", UnixMillis(999)).is_some());
     assert_eq!(s.len(), 1);
-    // At/after the deadline: absent and removed.
-    assert!(s.read(0, b"k", UnixMillis(1_000)).is_none());
+    // AT the deadline: still live (Valkey boundary is `now > deadline`).
+    assert!(s.read(0, b"k", UnixMillis(1_000)).is_some());
+    assert_eq!(s.len(), 1);
+    // One past the deadline: absent and removed.
+    assert!(s.read(0, b"k", UnixMillis(1_001)).is_none());
     assert_eq!(s.len(), 0, "expired key must be removed, not just hidden");
     // A subsequent read with a smaller `now` still sees nothing (it is gone).
     assert!(s.read(0, b"k", UnixMillis(1)).is_none());

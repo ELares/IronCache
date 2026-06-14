@@ -799,12 +799,12 @@ mod tests {
             UnixMillis(1_000),
             &[b"SET", b"k", b"b", b"KEEPTTL"],
         );
-        // Still alive just before the original deadline.
+        // Alive AT the original deadline (Valkey boundary is `now > deadline`).
         assert_eq!(
-            run_on(&c, &mut s, &mut st, UnixMillis(99_999), &[b"GET", b"k"]),
+            run_on(&c, &mut s, &mut st, UnixMillis(100_000), &[b"GET", b"k"]),
             bulk(b"b")
         );
-        // Expired after the original deadline (KEEPTTL kept it, did not extend).
+        // Expired one ms past the original deadline (KEEPTTL kept it, did not extend).
         assert_eq!(
             run_on(&c, &mut s, &mut st, UnixMillis(100_001), &[b"GET", b"k"]),
             Value::Null
@@ -828,8 +828,14 @@ mod tests {
             run_on(&c, &mut s, &mut st, UnixMillis(9_999), &[b"GET", b"k"]),
             bulk(b"v")
         );
+        // Alive AT the deadline (Valkey boundary is `now > deadline`).
         assert_eq!(
             run_on(&c, &mut s, &mut st, UnixMillis(10_000), &[b"GET", b"k"]),
+            bulk(b"v")
+        );
+        // Expired one ms past the deadline.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, UnixMillis(10_001), &[b"GET", b"k"]),
             Value::Null
         );
     }
@@ -849,6 +855,62 @@ mod tests {
             match run_on(&c, &mut s, &mut st, t, &opts) {
                 Value::Error(e) => assert_eq!(e.line(), "-ERR syntax error", "{opts:?}"),
                 other => panic!("expected syntax error for {opts:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_non_positive_or_overflowing_expire_is_invalid_expire_time() {
+        // Redis emits `-ERR invalid expire time in 'set' command` (a class DISTINCT
+        // from syntax error) for an EX/PX/EXAT/PXAT value <= 0 or one that overflows
+        // the millisecond computation. Nothing is written.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        for opts in [
+            vec![b"SET".as_slice(), b"k", b"v", b"EX", b"0"],
+            vec![b"SET", b"k", b"v", b"EX", b"-1"],
+            vec![b"SET", b"k", b"v", b"PX", b"0"],
+            vec![b"SET", b"k", b"v", b"EXAT", b"0"],
+            vec![b"SET", b"k", b"v", b"PXAT", b"0"],
+            // EX * 1000 overflows i64 -> invalid expire (an integer, but out of ms range).
+            vec![b"SET", b"k", b"v", b"EX", b"9223372036854775807"],
+        ] {
+            match run_on(&c, &mut s, &mut st, t, &opts) {
+                Value::Error(e) => assert_eq!(
+                    e.line(),
+                    "-ERR invalid expire time in 'set' command",
+                    "{opts:?}"
+                ),
+                other => panic!("expected invalid expire time for {opts:?}, got {other:?}"),
+            }
+        }
+        // No key was ever written.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), Value::Null);
+    }
+
+    #[test]
+    fn set_non_integer_expire_is_not_an_integer_error() {
+        // A NON-integer expire argument is the shared not-an-integer error, thrown
+        // BEFORE the <= 0 check (a distinct class from invalid expire time). A
+        // leading '+' is also rejected (Redis string2ll rejects '+').
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        for opts in [
+            vec![b"SET".as_slice(), b"k", b"v", b"EX", b"abc"],
+            vec![b"SET", b"k", b"v", b"PX", b"1.5"],
+            vec![b"SET", b"k", b"v", b"EX", b"+5"],
+        ] {
+            match run_on(&c, &mut s, &mut st, t, &opts) {
+                Value::Error(e) => assert_eq!(
+                    e.line(),
+                    "-ERR value is not an integer or out of range",
+                    "{opts:?}"
+                ),
+                other => panic!("expected not-an-integer for {opts:?}, got {other:?}"),
             }
         }
     }

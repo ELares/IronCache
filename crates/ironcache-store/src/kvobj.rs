@@ -295,10 +295,15 @@ impl KvObj {
 
     /// Whether this entry's TTL deadline has passed at `now` (the lazy-backstop
     /// predicate). An entry with no deadline never expires.
+    ///
+    /// The comparison is STRICTLY greater (`now > deadline`), matching Valkey's
+    /// `timestampIsExpired`/`keyIsExpired` (`return now > when;`, src/db.c): a key
+    /// is ALIVE at `now == deadline` and expired only once `now` strictly exceeds
+    /// the deadline.
     #[must_use]
     pub fn is_expired(&self, now: UnixMillis) -> bool {
         match self.expire_at {
-            Some(deadline) => deadline <= now,
+            Some(deadline) => now > deadline,
             None => false,
         }
     }
@@ -361,12 +366,23 @@ mod tests {
     fn ttl_present_flag_tracks_expire_at() {
         let with = KvObj::from_bytes(b"k", b"v", Some(UnixMillis(10)));
         assert!(with.header.ttl_present);
-        assert!(with.is_expired(UnixMillis(10)));
+        // Canonical Valkey boundary (`now > when`): ALIVE at now == deadline.
+        assert!(!with.is_expired(UnixMillis(10)));
         assert!(with.is_expired(UnixMillis(11)));
         assert!(!with.is_expired(UnixMillis(9)));
         let without = KvObj::from_bytes(b"k", b"v", None);
         assert!(!without.header.ttl_present);
         assert!(!without.is_expired(UnixMillis(u64::MAX)));
+    }
+
+    #[test]
+    fn is_expired_boundary_is_strictly_greater_than_deadline() {
+        // The Valkey contract (src/db.c `return now > when;`): a key with deadline
+        // D is LIVE at now == D and DEAD only at now == D + 1.
+        let o = KvObj::from_bytes(b"k", b"v", Some(UnixMillis(100)));
+        assert!(!o.is_expired(UnixMillis(99)), "before deadline: live");
+        assert!(!o.is_expired(UnixMillis(100)), "at deadline: live");
+        assert!(o.is_expired(UnixMillis(101)), "one past deadline: dead");
     }
 
     #[test]
