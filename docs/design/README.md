@@ -38,7 +38,10 @@ Claim citations in these docs are validated in CI by
   parity, and the metric/INFO registry (#86, #152).
 - [ADMISSION.md](ADMISSION.md): connection admission, maxclients, output-buffer
   limits, and the OOM-write contract (#137).
+- [TESTING.md](TESTING.md): the correctness stack (conformance oracle, command
+  spec, differential testing, parser fuzzing, property tests, and DST) (#95, #96).
+- [BENCHMARK.md](BENCHMARK.md): the reproducible benchmark harness, per-key memory
+  model, and the Valkey head-to-head baseline (#8, #96).
 
-More design specs land here as the Implementation Readiness milestone progresses
-(runtime, storage API, hash table, eviction, expiration, commands, CLI, config,
-observability, testing, benchmarking).
+This completes the Implementation Readiness design specs. Further specs land here
+as the M1 Architecture Specification milestone progresses.
