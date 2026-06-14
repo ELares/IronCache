@@ -105,9 +105,32 @@ pub struct ServerInfo {
     pub mem_allocator: &'static str,
 }
 
+/// A memory snapshot for the INFO `memory` section (ADR-0006, OBSERVABILITY.md).
+///
+/// These are the PROCESS-GLOBAL allocator figures (jemalloc `stats.allocated` /
+/// `stats.resident`), read ONCE by the caller on the shard serving INFO. They are
+/// distinct from the per-shard logical-byte counter (`Store::used_memory`, the fast
+/// number PR-3's eviction budget checks): a process-global figure must NOT be
+/// summed across shards or it would N-times over-count, so the caller passes one
+/// already-read value here rather than a per-shard sum.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryInfo {
+    /// `used_memory`: the allocator-attributed live allocated total in bytes
+    /// (the analog of Redis `used_memory`, ADR-0006).
+    pub used_memory: u64,
+    /// `used_memory_rss`: the resident set size in bytes (jemalloc
+    /// `stats.resident`). May exceed `used_memory` under fragmentation.
+    pub used_memory_rss: u64,
+}
+
 /// Build the `INFO` reply body (OBSERVABILITY.md). `section` is the optional
 /// lowercased section filter (e.g. `server`); `None` or `"default"`/`"all"`
 /// renders all sections.
+///
+/// `memory` carries the process-global allocator figures (ADR-0006), read once by
+/// the caller; the `memory` section reports them for `used_memory`/`used_memory_rss`
+/// and derives `used_memory_human` and `mem_fragmentation_ratio` (RSS/used) from
+/// them.
 ///
 /// The returned `String` is the raw INFO body; the caller wraps it as a bulk
 /// string. Lines use `\r\n` and `field:value` exactly as Redis does so existing
@@ -117,6 +140,7 @@ pub fn build_info<C: Clock>(
     clock: &C,
     server: &ServerInfo,
     rolled: CounterSnapshot,
+    memory: MemoryInfo,
     section: Option<&str>,
 ) -> String {
     // `write!` into a String never fails; the `let _ =` discards the Result.
@@ -160,15 +184,28 @@ pub fn build_info<C: Clock>(
     }
     if want("memory") {
         out.push_str("# Memory\r\n");
-        // PR-1 has no allocator accounting yet (ADR-0006 lands with the store);
-        // used_memory* stay zero with the correct field names so exporters parse
-        // cleanly. maxmemory and mem_allocator ARE real: threaded from config.
-        out.push_str("used_memory:0\r\n");
-        out.push_str("used_memory_human:0B\r\n");
-        out.push_str("used_memory_rss:0\r\n");
+        // PR-2b: used_memory* are the PROCESS-GLOBAL jemalloc figures (ADR-0006),
+        // read once by the caller and passed in. maxmemory and mem_allocator are
+        // threaded from config. The per-shard logical-byte counter is a separate,
+        // shard-local number (PR-3 eviction budget) and is NOT what used_memory
+        // reports.
+        let _ = write!(out, "used_memory:{}\r\n", memory.used_memory);
+        let _ = write!(
+            out,
+            "used_memory_human:{}\r\n",
+            human_bytes(memory.used_memory)
+        );
+        let _ = write!(out, "used_memory_rss:{}\r\n", memory.used_memory_rss);
         let _ = write!(out, "maxmemory:{}\r\n", server.maxmemory);
         out.push_str("maxmemory_policy:noeviction\r\n");
-        out.push_str("mem_fragmentation_ratio:0.00\r\n");
+        // mem_fragmentation_ratio = RSS / used (OBSERVABILITY.md); 0.00 when used is
+        // 0 (avoid a divide-by-zero), matching the no-data startup case.
+        let frag = if memory.used_memory > 0 {
+            memory.used_memory_rss as f64 / memory.used_memory as f64
+        } else {
+            0.0
+        };
+        let _ = write!(out, "mem_fragmentation_ratio:{frag:.2}\r\n");
         let _ = write!(out, "mem_allocator:{}\r\n", server.mem_allocator);
         out.push_str("\r\n");
     }
@@ -200,6 +237,27 @@ fn run_id_placeholder() -> &'static str {
     "0000000000000000000000000000000000000000"
 }
 
+/// Render a byte count the way Redis's `bytesToHuman` does for `used_memory_human`:
+/// `B`/`K`/`M`/`G` with two decimals above the byte scale (e.g. `1.00K`, `1.50M`),
+/// and a plain integer with a `B` suffix below 1024 (e.g. `512B`). 1K = 1024 bytes
+/// (binary), matching Redis. Deterministic and allocation-light (no float for the
+/// byte case).
+fn human_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    const M: f64 = 1024.0 * 1024.0;
+    const G: f64 = 1024.0 * 1024.0 * 1024.0;
+    let f = n as f64;
+    if f < K {
+        format!("{n}B")
+    } else if f < M {
+        format!("{:.2}K", f / K)
+    } else if f < G {
+        format!("{:.2}M", f / M)
+    } else {
+        format!("{:.2}G", f / G)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,7 +278,13 @@ mod tests {
     #[test]
     fn info_has_standard_sections_and_fields() {
         let env = TestEnv::new(1);
-        let body = build_info(&env, &server(), CounterSnapshot::default(), None);
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            None,
+        );
         assert!(body.contains("# Server\r\n"));
         assert!(body.contains("# Clients\r\n"));
         assert!(body.contains("# Memory\r\n"));
@@ -237,7 +301,13 @@ mod tests {
         let mut s = server();
         s.maxmemory = 256 * 1024 * 1024;
         s.mem_allocator = "system";
-        let body = build_info(&env, &s, CounterSnapshot::default(), Some("memory"));
+        let body = build_info(
+            &env,
+            &s,
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            Some("memory"),
+        );
         assert!(
             body.contains(&format!("maxmemory:{}\r\n", 256 * 1024 * 1024)),
             "{body}"
@@ -246,9 +316,69 @@ mod tests {
     }
 
     #[test]
+    fn info_memory_reports_used_memory_and_frag_ratio() {
+        // The process-global figures are reported verbatim, human-rendered, and the
+        // fragmentation ratio is RSS/used.
+        let env = TestEnv::new(1);
+        let mem = MemoryInfo {
+            used_memory: 2 * 1024 * 1024,     // 2 MiB
+            used_memory_rss: 3 * 1024 * 1024, // 3 MiB
+        };
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            mem,
+            Some("memory"),
+        );
+        assert!(
+            body.contains(&format!("used_memory:{}\r\n", 2 * 1024 * 1024)),
+            "{body}"
+        );
+        assert!(body.contains("used_memory_human:2.00M\r\n"), "{body}");
+        assert!(
+            body.contains(&format!("used_memory_rss:{}\r\n", 3 * 1024 * 1024)),
+            "{body}"
+        );
+        // 3 MiB / 2 MiB = 1.50.
+        assert!(body.contains("mem_fragmentation_ratio:1.50\r\n"), "{body}");
+    }
+
+    #[test]
+    fn info_memory_zero_used_has_no_divide_by_zero() {
+        let env = TestEnv::new(1);
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            Some("memory"),
+        );
+        assert!(body.contains("used_memory:0\r\n"), "{body}");
+        assert!(body.contains("used_memory_human:0B\r\n"), "{body}");
+        assert!(body.contains("mem_fragmentation_ratio:0.00\r\n"), "{body}");
+    }
+
+    #[test]
+    fn human_bytes_renders_like_redis() {
+        assert_eq!(human_bytes(0), "0B");
+        assert_eq!(human_bytes(512), "512B");
+        assert_eq!(human_bytes(1024), "1.00K");
+        assert_eq!(human_bytes(1536), "1.50K");
+        assert_eq!(human_bytes(1024 * 1024), "1.00M");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00G");
+    }
+
+    #[test]
     fn info_section_filter() {
         let env = TestEnv::new(1);
-        let only_server = build_info(&env, &server(), CounterSnapshot::default(), Some("server"));
+        let only_server = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            Some("server"),
+        );
         assert!(only_server.contains("# Server\r\n"));
         assert!(!only_server.contains("# Memory\r\n"));
     }
@@ -257,7 +387,13 @@ mod tests {
     fn info_uptime_uses_clock() {
         let mut env = TestEnv::new(1);
         env.advance(Duration::from_secs(90));
-        let body = build_info(&env, &server(), CounterSnapshot::default(), Some("server"));
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            Some("server"),
+        );
         assert!(body.contains("uptime_in_seconds:90\r\n"), "{body}");
     }
 

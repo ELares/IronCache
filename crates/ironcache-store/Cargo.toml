@@ -22,3 +22,19 @@ bytes = { workspace = true }
 # one core). Its default hasher is fine for PR-2a; the inline-tag/seeded-hash
 # tuning is a #8 follow-up.
 hashbrown = { workspace = true }
+
+# jemalloc mallctl introspection for the PROCESS-GLOBAL used_memory figure
+# (ADR-0006: epoch + stats.allocated/stats.resident). The `stats` API is SAFE (no
+# unsafe needed, so this crate keeps `#![forbid(unsafe_code)]`). Gated to the
+# targets where jemalloc is the global allocator (every target except MSVC, which
+# falls back to the system allocator per the binary's `#[global_allocator]` cfg);
+# on MSVC the process_*_bytes readers return 0 (no jemalloc to query).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemalloc-ctl = { workspace = true }
+
+# The accounting smoke test installs jemalloc as ITS OWN `#[global_allocator]` (the
+# library and the workspace test harness do not set one), so the process-global
+# mallctl figures reflect real allocations. Dev-only, non-MSVC (where jemalloc is
+# unavailable and process_*_bytes returns 0).
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }

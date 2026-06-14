@@ -258,6 +258,7 @@ dependencies = [
  "ironcache-runtime",
  "ironcache-storage",
  "ironcache-store",
+ "tikv-jemallocator",
  "tokio",
  "toml",
 ]
@@ -276,6 +277,8 @@ dependencies = [
  "bytes",
  "hashbrown 0.16.1",
  "ironcache-storage",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
 ]
 
 [[package]]
