@@ -259,6 +259,7 @@ dependencies = [
  "ironcache-storage",
  "ironcache-store",
  "tokio",
+ "toml",
 ]
 
 [[package]]

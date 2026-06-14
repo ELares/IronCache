@@ -13,15 +13,42 @@
 //! - [`Store::read`] - borrow the value (or absence) for a read-only command.
 //! - [`Store::upsert`] - blind set, replacing any existing value.
 //! - [`Store::delete`] - remove a key, returning whether it existed-and-was-live.
-//! - [`Store::rmw`] - the atomic read-modify-write: the single primitive behind
-//!   INCR/APPEND/SETBIT/LPUSH/HSET, conditional SET (NX/XX/GET), and expiry-on
-//!   -write. The closure runs on the owning core with exclusive access, so it is
-//!   atomic by construction with no lock (ADR-0002/0005).
+//! - [`Store::rmw`] - the atomic read-modify-write: the single atomic write funnel
+//!   behind conditional SET (NX/XX/GET), SETNX, GETSET, INCR, and expiry-on-write.
+//!   The closure observes the entry and returns the write decision; it runs on the
+//!   owning core with exclusive access, so observe-and-write is atomic by
+//!   construction with no lock (ADR-0002/0005).
+//!
+//! ## What `rmw` supports today, and the additive collection extension
+//!
+//! In PR-2a the [`RmwAction`] surface is `Insert`/`Replace`/`Keep`/`Delete`: the
+//! closure decides on a WHOLE owned value (`Replace(NewValueOwned)`), so an in
+//! -place value mutation is expressed as rebuild-and-`Replace`. This is the right
+//! and complete surface for strings. It is NOT yet a value-internal in-place edit:
+//! the closure cannot reach into a stored collection and push one list element
+//! without handing back a whole rebuilt value.
+//!
+//! VALUE-INTERNAL in-place mutation (LPUSH appending to a list, HSET setting one
+//! field, and the APPEND/SETRANGE efficiency path in PR-2b) is an ADDITIVE
+//! extension to [`OccupiedEntry`]/[`RmwAction`] (a new mutable accessor / a new
+//! action variant) to be co-designed WITH the Tier-2 value types. That extension
+//! adds capability without churning existing string callers or PR-3's eviction/
+//! accounting callers, so it does not reopen the waist. It is deliberately NOT
+//! pre-designed here (no half-baked `Mutate` variant); this note records the plan.
 //!
 //! [`Store::contains`] and [`Store::type_of`] are cheap convenience entry points
 //! for EXISTS/TYPE (each is `read().is_some()` / the read's data type), provided so
 //! those commands do not pay to materialize a [`ValueRef`]; they are NOT a fifth
 //! primitive.
+//!
+//! ## Freeze scope
+//!
+//! The FROZEN surface is: the key-level primitives (read/upsert/delete/rmw), the
+//! TTL effect ([`ExpireWrite`] and the per-entry `expire_at` deadline), the
+//! accounting hook, and the eviction victim-KEY selection ([`EvictionHook`]). The
+//! value-internal in-place mutation described above, and the store-internal
+//! snapshot pre-image hook (see [`Store`]), are ADDITIVE extensions that land with
+//! their features without reopening this waist.
 //!
 //! ## Determinism and shared-nothing (ADR-0002/0003/0005)
 //!
@@ -35,10 +62,25 @@
 //!
 //! TTL is NOT a separate hook: it is an `Option<UnixMillis>` deadline carried on
 //! the entry. The lazy expiry-on-read backstop lives inside `read`/`rmw`/
-//! `contains`/`type_of`: an entry whose `expire_at <= now` reads as absent and is
-//! removed. The active per-shard timing wheel and the EXPIRE/TTL/PERSIST commands
+//! `contains`/`type_of`: an entry whose deadline has strictly passed (`now >
+//! expire_at`, the Valkey boundary) reads as absent and is removed; a key is alive
+//! at `now == expire_at`. The active per-shard timing wheel and the EXPIRE/TTL/PERSIST commands
 //! are PR-3 and attach as a side structure keyed off this same field, with NO
 //! signature change here.
+//!
+//! ## maxmemory admission / OOM (architecture decision)
+//!
+//! The write primitives are WRITE-ALWAYS-SUCCEEDS: they do NOT enforce a memory
+//! ceiling. maxmemory admission and the out-of-memory reply are enforced ABOVE the
+//! waist at the command-dispatch layer, matching Redis (`processCommand` checks the
+//! command's `denyoom` flag and runs `freeMemoryIfNeeded`/`performEvictions` BEFORE
+//! the command body, not inside the storage layer). This keeps the primitives
+//! frozen and lets the dispatch layer own the policy: the store exposes
+//! [`Store::used_memory`] (a read) today, and PR-3 adds an evict-to-fit path the
+//! dispatch layer drives by calling [`EvictionHook::select_victim`] (fix: the
+//! victim KEY) and then [`Store::delete`] in a loop until under budget, or replying
+//! `-OOM` for a `denyoom` write when nothing more can be freed. This is a recorded
+//! decision, not a primitive-signature change.
 
 #![forbid(unsafe_code)]
 
@@ -54,7 +96,8 @@ use bytes::Bytes;
 /// value in this newtype before calling the store). Frozen so the absolute-TTL
 /// commands (EXAT/PXAT/EXPIREAT, PR-3) all share one basis.
 ///
-/// It is `Ord` so a deadline comparison (`deadline <= now`) is a plain `<=`.
+/// It is `Ord` so the deadline comparison (`now > deadline`, the Valkey
+/// strictly-greater expiry boundary) is a plain comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnixMillis(pub u64);
 
@@ -300,7 +343,9 @@ pub enum ExpireWrite {
 }
 
 // ---------------------------------------------------------------------------
-// RMW (STORAGE_API.md "the single primitive behind ... every in-place mutation").
+// RMW: the atomic write funnel (STORAGE_API.md). In PR-2a the closure decides on a
+// whole owned value (Insert/Replace/Keep/Delete); value-internal in-place mutation
+// for collections is the additive extension noted in the module docs.
 // ---------------------------------------------------------------------------
 
 /// The entry handed to an [`Store::rmw`] closure: either the key is absent
@@ -321,6 +366,11 @@ pub enum RmwEntry<'a> {
 /// the owning core (no lock). The same int-materialization rule as [`ValueRef`]
 /// applies to [`OccupiedEntry::as_bytes`]: the closure sees decimal bytes for an
 /// int-encoded value.
+///
+/// PR-2a observation is READ-ONLY (the write is expressed as the whole owned value
+/// in [`RmwAction`]). A mutable, value-internal accessor for collection in-place
+/// edits (LPUSH/HSET) and the PR-2b APPEND/SETRANGE efficiency path is the additive
+/// extension noted in the module docs; it is not present yet.
 #[derive(Debug)]
 pub struct OccupiedEntry<'a> {
     data_type: DataType,
@@ -403,7 +453,11 @@ pub struct RmwStep<R> {
     pub reply: R,
 }
 
-/// The value mutation an [`RmwStep`] requests.
+/// The value mutation an [`RmwStep`] requests. PR-2a operates on the WHOLE owned
+/// value: an in-place value edit is expressed as rebuild-and-[`RmwAction::Replace`].
+/// A value-internal in-place variant for collections (and the APPEND/SETRANGE
+/// efficiency path) is the additive extension noted in the module docs; it is not
+/// present yet, to avoid freezing a half-designed mutation surface.
 #[derive(Debug)]
 pub enum RmwAction {
     /// Leave the value untouched (the TTL may still change via `expire`).
@@ -428,8 +482,10 @@ pub enum RmwAction {
 /// an insert, `on_remove` on a delete/replace. PR-2a ships [`NullEviction`] (all
 /// no-ops); the real S3-FIFO policy and `select_victim` driving are PR-3.
 ///
-/// `key_hash` is the full 64-bit key hash (the same value SCAN orders on, #129),
-/// so the policy never needs the key bytes.
+/// `db` is the validated logical DB id (the same id SELECT validates, KEYSPACE.md),
+/// and `key_hash` is the full 64-bit key hash (the same value SCAN orders on,
+/// #129). The on_access/on_insert/on_remove callbacks take the hash because that is
+/// all the policy's queues need to rank an entry.
 pub trait EvictionHook {
     /// A live key was read or observed in an rmw.
     fn on_access(&mut self, db: u32, key_hash: u64);
@@ -437,8 +493,13 @@ pub trait EvictionHook {
     fn on_insert(&mut self, db: u32, key_hash: u64, bytes: usize);
     /// A value was removed (delete, replace, or expiry), freeing `bytes`.
     fn on_remove(&mut self, db: u32, key_hash: u64, bytes: usize);
-    /// Pick a victim key hash to evict when over budget, or `None` if none.
-    fn select_victim(&mut self) -> Option<u64>;
+    /// Pick a victim KEY to evict when over budget, or `None` if none. The KEY
+    /// bytes (not the hash) are returned because the store's table is keyed by the
+    /// owned key bytes (`Box<[u8]>`, ADR-0008): a u64 hash cannot drive a delete
+    /// from a byte-keyed map, so the policy must surface the key it chose
+    /// (EVICTION.md `evict_victim() -> key`). PR-3's S3-FIFO evicts through this
+    /// frozen surface.
+    fn select_victim(&mut self) -> Option<Box<[u8]>>;
 }
 
 /// A no-op eviction hook (PR-2a default). Eviction-on-by-default (ADR-0007) and
@@ -454,7 +515,7 @@ impl EvictionHook for NullEviction {
     #[inline]
     fn on_remove(&mut self, _db: u32, _key_hash: u64, _bytes: usize) {}
     #[inline]
-    fn select_victim(&mut self) -> Option<u64> {
+    fn select_victim(&mut self) -> Option<Box<[u8]>> {
         None
     }
 }
@@ -518,8 +579,9 @@ impl AccountingHook for CountingAccounting {
 /// a clock). `db` selects the logical database (KEYSPACE.md per-DB keyspace).
 pub trait Store {
     /// Borrow the live value for `key`, or `None` if absent OR lazily expired. An
-    /// entry whose deadline has passed (`expire_at <= now`) is removed and reported
-    /// as `None` (the lazy backstop, EXPIRATION.md).
+    /// entry whose deadline has strictly passed (`now > expire_at`, the Valkey
+    /// boundary; alive at `now == expire_at`) is removed and reported as `None`
+    /// (the lazy backstop, EXPIRATION.md).
     fn read(&mut self, db: u32, key: &[u8], now: UnixMillis) -> Option<ValueRef<'_>>;
 
     /// Blind set: store `value` for `key` with the `expire` TTL effect, replacing

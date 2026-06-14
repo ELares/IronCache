@@ -31,3 +31,7 @@ bytes = { workspace = true }
 ironcache-store = { workspace = true }
 ironcache-runtime = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
+# Parse this crate's own Cargo.toml in the layering contract test (a form
+# -independent dependency-table walk, so a dotted-table
+# `[dependencies.ironcache-store]` cannot slip past the guard).
+toml = { workspace = true }

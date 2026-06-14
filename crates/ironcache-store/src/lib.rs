@@ -23,7 +23,8 @@
 //!
 //! The store reads no clock: `now: UnixMillis` is passed in by the caller. The
 //! lazy expiry-on-read backstop (EXPIRATION.md) lives in every read path here: an
-//! entry with `expire_at <= now` is removed and reported as absent.
+//! entry whose deadline has strictly passed (`now > expire_at`, the Valkey
+//! boundary; alive at `now == expire_at`) is removed and reported as absent.
 
 #![forbid(unsafe_code)]
 
@@ -131,10 +132,19 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         self.hash_builder.hash_one(key)
     }
 
-    /// The map for `db`, clamped to a valid index. The command layer validates the
-    /// DB range at SELECT time (KEYSPACE.md); this clamp is a defensive backstop so
-    /// an out-of-range db never panics the shard.
+    /// The map index for the validated logical `db`. The command layer validates the
+    /// DB range at SELECT time (KEYSPACE.md), so a well-behaved caller always passes
+    /// an in-range `db`. A `debug_assert` fires loudly in tests and DST if a future
+    /// un-validated caller (SWAPDB/MOVE/COPY, a cluster coordinator) routes an
+    /// out-of-range db; the RELEASE build clamps to the last DB as a defensive
+    /// backstop so an out-of-range db never panics the shard in production.
     fn db_index(&self, db: u32) -> usize {
+        debug_assert!(
+            (db as usize) < self.dbs.len(),
+            "db index {db} out of range (have {} dbs); the command layer must \
+             validate the DB range before calling the store",
+            self.dbs.len()
+        );
         (db as usize).min(self.dbs.len().saturating_sub(1))
     }
 
@@ -142,7 +152,16 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// present but its deadline has passed at `now`, remove it (firing the
     /// eviction/accounting remove hooks) and report it gone. Returns whether a
     /// LIVE entry remains for the key afterwards.
-    fn expire_if_due(&mut self, db_idx: usize, key: &[u8], now: UnixMillis) -> bool {
+    ///
+    /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
+    /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
+    ///
+    /// FOLLOW-UP (#8/PR-2b efficiency): this does a `get` (the expiry probe) plus a
+    /// `contains_key`, and the read/type_of callers then do ANOTHER `get` for the
+    /// live entry, so a hot read hashes the key up to three times. Collapse to a
+    /// single hash probe with the Entry API (or a get-once handle threaded to the
+    /// caller) once the read path is restructured around it. No change now.
+    fn expire_if_due(&mut self, db: u32, db_idx: usize, key: &[u8], now: UnixMillis) -> bool {
         let due = self
             .dbs
             .get(db_idx)
@@ -153,7 +172,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             if let Some(obj) = self.dbs[db_idx].remove(key) {
                 let bytes = obj.accounted_bytes();
                 self.account_sub(bytes);
-                self.eviction.on_remove(db_idx as u32, key_hash, bytes);
+                self.eviction.on_remove(db, key_hash, bytes);
             }
             return false;
         }
@@ -164,7 +183,16 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// Insert or replace `key`'s object, adjusting the accounting/eviction hooks for
     /// the byte delta. Returns whether a live entry existed before (overwrite vs
     /// create). Caller guarantees any due expiry already ran.
-    fn put_object(&mut self, db_idx: usize, key: &[u8], obj: KvObj) -> bool {
+    ///
+    /// This (with [`Self::remove_object`] and the [`Store::rmw`] body) is the
+    /// store-internal WRITE FUNNEL. The Wave-3 forkless-snapshot OnWrite pre-image
+    /// hook (#60) attaches HERE, capturing the old object before it is overwritten;
+    /// because this funnel is store-internal and not part of the frozen `Store`
+    /// trait, adding it does NOT reopen the storage waist (STORAGE_API.md).
+    ///
+    /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
+    /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
+    fn put_object(&mut self, db: u32, db_idx: usize, key: &[u8], obj: KvObj) -> bool {
         let key_hash = self.key_hash(key);
         let new_bytes = obj.accounted_bytes();
         let boxed: Box<[u8]> = key.to_vec().into_boxed_slice();
@@ -183,21 +211,24 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         };
         if let Some(old) = old_bytes {
             self.account_sub(old);
-            self.eviction.on_remove(db_idx as u32, key_hash, old);
+            self.eviction.on_remove(db, key_hash, old);
         }
         self.account_add(new_bytes);
-        self.eviction.on_insert(db_idx as u32, key_hash, new_bytes);
+        self.eviction.on_insert(db, key_hash, new_bytes);
         old_bytes.is_some()
     }
 
     /// Remove `key`'s object, crediting the hooks. Returns whether it existed
     /// (caller guarantees any due expiry already ran, so an existing entry is live).
-    fn remove_object(&mut self, db_idx: usize, key: &[u8]) -> bool {
+    ///
+    /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
+    /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
+    fn remove_object(&mut self, db: u32, db_idx: usize, key: &[u8]) -> bool {
         let key_hash = self.key_hash(key);
         if let Some(obj) = self.dbs[db_idx].remove(key) {
             let bytes = obj.accounted_bytes();
             self.account_sub(bytes);
-            self.eviction.on_remove(db_idx as u32, key_hash, bytes);
+            self.eviction.on_remove(db, key_hash, bytes);
             true
         } else {
             false
@@ -206,6 +237,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
 
     /// Build the read-borrow view for an object. An int materializes its decimal
     /// bytes (owned); a string borrows the stored buffer.
+    ///
+    /// FOLLOW-UP (#8/Efficient): the int branch allocates a fresh `Bytes` per read
+    /// via `int_decimal_bytes`. When the FAM object-layout work lands, format the
+    /// decimal digits into an inline/borrowable buffer carried by the view (or by
+    /// the object) so an int read does no per-read heap allocation. No change now.
     fn view_of(obj: &KvObj) -> ValueRef<'_> {
         match &obj.value {
             kvobj::ValueRepr::Int(n) => {
@@ -249,11 +285,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
 impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
     fn read(&mut self, db: u32, key: &[u8], now: UnixMillis) -> Option<ValueRef<'_>> {
         let db_idx = self.db_index(db);
-        if !self.expire_if_due(db_idx, key, now) {
+        if !self.expire_if_due(db, db_idx, key, now) {
             return None;
         }
         let key_hash = self.key_hash(key);
-        self.eviction.on_access(db_idx as u32, key_hash);
+        self.eviction.on_access(db, key_hash);
         // The entry is present and live (expire_if_due returned true).
         self.dbs[db_idx].get(key).map(Self::view_of)
     }
@@ -269,7 +305,7 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         let db_idx = self.db_index(db);
         // Whether a live key existed before this blind set (the return value), and
         // its old deadline (for ExpireWrite::Keep).
-        let existed = self.expire_if_due(db_idx, key, now);
+        let existed = self.expire_if_due(db, db_idx, key, now);
         let old_deadline = if existed {
             self.dbs[db_idx].get(key).and_then(|o| o.expire_at)
         } else {
@@ -280,17 +316,17 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             NewValue::Bytes(b) => KvObj::from_bytes(key, b, new_deadline),
             NewValue::Int(n) => KvObj::from_int(key, n, new_deadline),
         };
-        self.put_object(db_idx, key, obj);
+        self.put_object(db, db_idx, key, obj);
         existed
     }
 
     fn delete(&mut self, db: u32, key: &[u8], now: UnixMillis) -> bool {
         let db_idx = self.db_index(db);
         // A lazily-expired key counts as not-existing: run the backstop first.
-        if !self.expire_if_due(db_idx, key, now) {
+        if !self.expire_if_due(db, db_idx, key, now) {
             return false;
         }
-        self.remove_object(db_idx, key)
+        self.remove_object(db, db_idx, key)
     }
 
     fn rmw<R>(
@@ -301,12 +337,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         f: impl FnOnce(RmwEntry<'_>) -> RmwStep<R>,
     ) -> R {
         let db_idx = self.db_index(db);
-        let live = self.expire_if_due(db_idx, key, now);
+        let live = self.expire_if_due(db, db_idx, key, now);
         let key_hash = self.key_hash(key);
 
         // Observe (atomically with the write that follows, on the owning core).
         let step = if live {
-            self.eviction.on_access(db_idx as u32, key_hash);
+            self.eviction.on_access(db, key_hash);
             let obj = self.dbs[db_idx].get(key).expect("live entry present");
             let entry = RmwEntry::Occupied(Self::occupied_of(obj));
             f(entry)
@@ -343,11 +379,11 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                     other => resolve_expire(other, old_deadline),
                 };
                 let obj = KvObj::from_new_owned(key, v, new_deadline);
-                self.put_object(db_idx, key, obj);
+                self.put_object(db, db_idx, key, obj);
             }
             RmwAction::Delete => {
                 if live {
-                    self.remove_object(db_idx, key);
+                    self.remove_object(db, db_idx, key);
                 }
             }
         }
@@ -356,12 +392,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
 
     fn contains(&mut self, db: u32, key: &[u8], now: UnixMillis) -> bool {
         let db_idx = self.db_index(db);
-        self.expire_if_due(db_idx, key, now)
+        self.expire_if_due(db, db_idx, key, now)
     }
 
     fn type_of(&mut self, db: u32, key: &[u8], now: UnixMillis) -> Option<DataType> {
         let db_idx = self.db_index(db);
-        if !self.expire_if_due(db_idx, key, now) {
+        if !self.expire_if_due(db, db_idx, key, now) {
             return None;
         }
         self.dbs[db_idx].get(key).map(|o| o.header.data_type)
@@ -391,7 +427,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     pub fn insert_object(&mut self, db: u32, obj: KvObj) {
         let db_idx = self.db_index(db);
         let key = obj.key.clone();
-        self.put_object(db_idx, &key, obj);
+        self.put_object(db, db_idx, &key, obj);
     }
 }
 

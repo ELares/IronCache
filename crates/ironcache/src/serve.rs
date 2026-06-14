@@ -256,8 +256,10 @@ fn handle_request(
     let snapshot_fn = || state_rc.borrow().counters.snapshot();
     let rollup: &dyn Fn() -> CounterSnapshot = &snapshot_fn;
     // Compute `now` once per command from the shard's wall clock, then run dispatch
-    // against the per-shard store. The env borrow ends before the store borrow so
-    // the two RefCell borrows never overlap.
+    // against the per-shard store. `env` and `store` are SEPARATE RefCells, so the
+    // env clock read at the dispatch call site can overlap the held store
+    // borrow_mut with no conflict: overlapping borrows of distinct RefCells never
+    // alias the same cell.
     let now = UnixMillis(env.borrow().now_unix_millis());
     let mut store = store_rc.borrow_mut();
     let reply = dispatch(ctx, conn, &*env.borrow(), &mut *store, now, rollup, request);
