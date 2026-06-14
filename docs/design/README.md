@@ -54,3 +54,7 @@ Specs added as the M1 milestone progresses.
   list/hash/set/zset, plus the intset-style sorted-array analog (#113). The
   per-shard bucket geometry and rehash policy are an addendum in HASHTABLE.md
   (#110).
+- [WTINYLFU.md](WTINYLFU.md): the selectable W-TinyLFU frequency-admission filter
+  (4-bit CM-sketch, halving aging, optional doorkeeper off by default,
+  admission/eviction-only decision path, incumbent-wins tie-break) as the non-ML
+  admission floor (#49).

@@ -25,20 +25,21 @@ monomorphization strategy, runtime selection, and the Redis alias layer.
   hooks. The FIFO-class policies fold their state into the kvobj (OBJECT_LAYOUT
   #111), the S3-FIFO 2-bit counter [s3fifo-freq-counter-2bit-cap3] or a SIEVE
   visited bit [sieve-algorithm], so they need no parallel per-key structure. The
-  W-TinyLFU-fronted variant is the exception: its frequency lives in a shared
-  per-shard 4-bit Count-Min sketch [wtinylfu-cmsketch-4bit] (about 8 bytes per
-  entry, out of the object, not the 2-bit field) plus a small LRU admission
-  window [wtinylfu-window-main-split].
-- Hot-path contract: for the FIFO-class policies (S3-FIFO, SIEVE) `on_access` is a
-  single in-place metadata write on the owning core (a flag/counter bump), never a
-  list relink, so it adds no lock and no allocation, which is exactly why
-  FIFO-class policies beat LRU here [hit-ratio-can-hurt-throughput] and why locks
-  are unnecessary [glommio-locks-never-necessary] (ADR-0005). The W-TinyLFU
-  variant is a deliberate exception: an access does a multi-cell minimum-increment
-  on the shard's sketch [wtinylfu-cmsketch-4bit] and may relink the admission
-  window, still lock-free on the owning core but not a single write. Eviction
-  selection runs only when the shard hits its budget (ADR-0007), off the read
-  path.
+  W-TinyLFU-fronted variant is the exception: its frequency lives in a per-shard
+  4-bit Count-Min sketch [wtinylfu-cmsketch-4bit] (about 8 bytes per entry, out of
+  the object, not the 2-bit field). It carries NO SLRU window; Caffeine's
+  window/main split [wtinylfu-window-main-split] is deliberately not adopted, and
+  the full filter design (sketch, aging, doorkeeper, decision-path contract) is
+  WTINYLFU.md (#49).
+- Hot-path contract: `on_access` is a single in-place metadata write on the owning
+  core (a flag/counter bump), never a list relink, so it adds no lock and no
+  allocation, which is exactly why FIFO-class policies beat LRU here
+  [hit-ratio-can-hurt-throughput] and why locks are unnecessary
+  [glommio-locks-never-necessary] (ADR-0005). The W-TinyLFU-fronted variant keeps
+  this same single-write read path: its CM-sketch is consulted and updated only at
+  the admission/eviction decision, not per read (WTINYLFU.md, #49), and it has no
+  window to relink. Eviction selection runs only when the shard hits its budget
+  (ADR-0007), off the read path.
 
 ### Ghost queue
 
@@ -92,10 +93,10 @@ monomorphization strategy, runtime selection, and the Redis alias layer.
 
 ## Acceptance and test hooks
 
-- `on_access` for the FIFO-class policies (S3-FIFO, SIEVE) is a single in-place
-  metadata write, no lock, no alloc; the W-TinyLFU variant's access is a
-  lock-free sketch minimum-increment plus an optional window relink (a hot-path
-  lint/test scoped per policy).
+- `on_access` is a single in-place metadata write, no lock, no alloc, for the
+  FIFO-class policies AND the W-TinyLFU-fronted variant; the variant's sketch is
+  touched only at the admission/eviction decision, never per read, with no window
+  relink (a hot-path lint asserts no per-read sketch mutation, WTINYLFU.md #49).
 - All ten Redis policy names are accepted, `CONFIG GET maxmemory-policy` echoes a
   Redis-recognized value, and the eviction effect matches the named family
   (conformance #95/#97).
