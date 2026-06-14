@@ -107,14 +107,15 @@ fi
 # 3. Shared-nothing: no std::sync lock types in hot-path crates (invariant 1).
 # ---------------------------------------------------------------------------
 section "no std::sync locks in hot-path crates"
-# The hot-path crates: those that own per-shard state. As of PR-2 these are the
-# storage waist (ironcache-storage) and the concrete per-shard store
-# (ironcache-store), plus ironcache-server (connection state) and ironcache-observe
-# (per-shard counters). ironcache-runtime is the I/O seam and is allowed
-# Arc<AtomicBool> for the cross-thread shutdown FLAG only (not hot-path data), so we
-# lint for Mutex/RwLock specifically, not all of std::sync. The store crates are
-# shared-nothing (ADR-0005): the per-shard map is unsynchronized, with no lock.
-HOTPATH_CRATES="ironcache-storage ironcache-store ironcache-server ironcache-observe"
+# The hot-path crates: those that own per-shard state. As of PR-3a these are the
+# storage waist (ironcache-storage), the concrete per-shard store (ironcache-store),
+# the per-shard eviction policy (ironcache-eviction: S3-FIFO queues / Random roster,
+# unsynchronized per ADR-0005), plus ironcache-server (connection state) and
+# ironcache-observe (per-shard counters). ironcache-runtime is the I/O seam and is
+# allowed Arc<AtomicBool> for the cross-thread shutdown FLAG only (not hot-path data),
+# so we lint for Mutex/RwLock specifically, not all of std::sync. The store/eviction
+# crates are shared-nothing (ADR-0005): the per-shard state is unsynchronized, no lock.
+HOTPATH_CRATES="ironcache-storage ironcache-store ironcache-eviction ironcache-server ironcache-observe"
 lock_hits=""
 for c in $HOTPATH_CRATES; do
     dir="$CRATES/$c"

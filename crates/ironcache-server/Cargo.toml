@@ -29,6 +29,10 @@ bytes = { workspace = true }
 # end-to-end harness need a real Store to drive the generic dispatch, but the
 # library code depends only on the waist (above).
 ironcache-store = { workspace = true }
+# The concrete eviction policy is TEST-ONLY here too: the dispatch admission tests
+# wire a real `Policy` (cache mode / noeviction) into the store to exercise the
+# evict-to-fit / -OOM gate. The library names only the `Admit` waist trait (above).
+ironcache-eviction = { workspace = true }
 ironcache-runtime = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 # Parse this crate's own Cargo.toml in the layering contract test (a form

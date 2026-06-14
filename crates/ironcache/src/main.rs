@@ -192,6 +192,7 @@ fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
             ""
         }
     );
+    println!("  policy      = {}", cfg.maxmemory_policy);
     println!(
         "  requirepass = {}",
         if cfg.requirepass.is_some() {
@@ -238,6 +239,7 @@ fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
     println!("shards = {}", cfg.shards);
     println!("databases = {}", cfg.databases);
     println!("maxmemory = {}", cfg.maxmemory);
+    println!("maxmemory-policy = \"{}\"", cfg.maxmemory_policy);
     println!("timeout = {}", cfg.timeout_secs);
     println!(
         "requirepass = {}",
