@@ -67,6 +67,17 @@ pub const WHEEL_SIZE: usize = 64;
 /// The number of hierarchical levels.
 pub const LEVELS: usize = 4;
 
+/// The maximum number of elapsed ticks a single [`TimingWheel::advance`] processes
+/// (the tick-walk bound). [`crate::TimingWheel::advance`]'s `max` caps the POPPED keys,
+/// but without this an idle gap would still cost O(gap) ticks of cascade/drain work on
+/// the first command after the gap. With this cap the per-call work is bounded; the
+/// wheel carries `current_tick` forward so subsequent commands (and the 3c background
+/// timer) converge to `now`. An EMPTY wheel skips the walk entirely (O(1)
+/// fast-forward), so this cap only ever binds a non-empty, sparsely-populated wheel
+/// crossed by a large gap; the lazy-read backstop remains the correctness guarantee,
+/// so a deferred tick only delays idle-memory reclamation, never observation.
+pub const MAX_TICKS_PER_CALL: u64 = 4 * WHEEL_SIZE as u64;
+
 /// A registered expiry: the `(db, key)` the active drain will offer for reclamation
 /// once its tick is reached. The deadline is carried so cascading can re-bucket it
 /// at a finer level without re-deriving it.
@@ -152,6 +163,14 @@ impl TimingWheel {
     /// offers it immediately.
     fn position(base: u64, tick: u64) -> (usize, usize) {
         let delay = tick.saturating_sub(base);
+        // A deadline already at or behind `base` (delay == 0) must land in level 0's
+        // CURRENT slot (`base % WHEEL_SIZE`), NOT `tick % WHEEL_SIZE`: a past `tick`
+        // hashes to a slot the forward sweep already passed, so it would wait a full
+        // WHEEL_SIZE-tick revolution before being drained. Bucketing it at the current
+        // slot lets the very next advance (which drains `base`'s slot) retire it.
+        if delay == 0 {
+            return (0, (base % WHEEL_SIZE as u64) as usize);
+        }
         // Find the finest level whose total span (WHEEL_SIZE slots) covers `delay`.
         for level in 0..LEVELS {
             let span = Self::level_span(level);
@@ -205,6 +224,14 @@ impl TimingWheel {
     /// The first advance only establishes the time origin (it sets `current_tick`
     /// and returns nothing), so a deadline registered before any advance is measured
     /// against real elapsed ticks rather than firing spuriously at startup.
+    ///
+    /// ## Bounded per-call work across an idle gap (#4)
+    ///
+    /// The `max` cap bounds the POPPED keys, but the tick WALK is bounded too: an EMPTY
+    /// wheel fast-forwards `current_tick` to `now_tick` in O(1) (the common idle case),
+    /// and a non-empty wheel processes at most [`MAX_TICKS_PER_CALL`] elapsed ticks per
+    /// call, carrying `current_tick` forward so later commands converge. So the first
+    /// command after a long idle gap does NOT pay O(gap).
     pub fn advance(&mut self, now: UnixMillis, max: usize) -> Vec<(u32, Box<[u8]>)> {
         let now_tick = now.0 / TICK_MS;
         let Some(mut cur) = self.current_tick else {
@@ -217,13 +244,29 @@ impl TimingWheel {
             return Vec::new();
         }
 
+        // O(1) empty-wheel fast-forward (the #4 advance bound): with no registered
+        // entries there is nothing to cascade or drain across the elapsed ticks, so jump
+        // straight to `now_tick` instead of walking each tick. This is the common case
+        // for the first command after an idle gap, which otherwise paid O(gap).
+        if self.len == 0 {
+            self.current_tick = Some(now_tick);
+            return Vec::new();
+        }
+
         let mut due: Vec<(u32, Box<[u8]>)> = Vec::new();
+
+        // Bound the tick walk to MAX_TICKS_PER_CALL elapsed ticks (the #4 advance
+        // bound): even a non-empty, sparsely-populated wheel crossed by a large gap pays
+        // only O(cap) per call, and `current_tick` carries forward so subsequent
+        // commands converge to `now`. The reclamation stays bounded; the lazy backstop
+        // is the correctness guarantee.
+        let walk_limit = now_tick.min(cur.saturating_add(MAX_TICKS_PER_CALL));
 
         // Walk tick by tick from the current position up to (but NOT including)
         // now_tick: a key with deadline tick T is due only once we have advanced PAST
         // T (now_tick > T), matching `now > deadline`. At each elapsed tick we cascade
         // higher levels down, then drain level 0's slot for that tick.
-        while cur < now_tick {
+        while cur < walk_limit {
             // The tick we are about to retire is `cur` (entries due strictly before
             // now_tick). Cascade higher levels at level boundaries so their entries
             // reach finer slots before we drain.
@@ -291,15 +334,24 @@ mod tests {
         UnixMillis(t)
     }
 
+    /// Drain every due entry at `now`, advancing repeatedly until the wheel has both
+    /// fully caught up to `now_tick` AND popped everything due. A single `advance` is
+    /// bounded (the #4 per-call tick cap + the `max` pop cap), so "an empty batch" no
+    /// longer means "fully drained": we keep going until `current_tick == now_tick` and
+    /// a final advance yields nothing.
     fn drain_all(w: &mut TimingWheel, now: UnixMillis, max: usize) -> Vec<Vec<u8>> {
+        let now_tick = now.0 / TICK_MS;
         let mut out = Vec::new();
         loop {
             let batch = w.advance(now, max);
-            if batch.is_empty() {
-                break;
-            }
+            let empty = batch.is_empty();
             for (_, k) in batch {
                 out.push(k.into_vec());
+            }
+            // Stop once the wheel has caught up to `now` AND the last advance popped
+            // nothing (no more due entries this tick).
+            if empty && w.current_tick == Some(now_tick) {
+                break;
             }
         }
         out
@@ -462,6 +514,92 @@ mod tests {
         let b = run();
         assert_eq!(a, b, "identical now sequence => identical due sequence");
         assert_eq!(a.len(), 50, "every registered key eventually fired");
+    }
+
+    #[test]
+    fn past_deadline_fires_on_the_immediately_following_advance() {
+        // The #3 fix: a deadline already at or behind the wheel base must be bucketed
+        // into level 0's CURRENT slot, so the very next advance (one tick past the base)
+        // retires it, instead of waiting up to a full WHEEL_SIZE-tick revolution.
+        let mut w = TimingWheel::new();
+        // Establish the origin well into the wheel (base tick 1000 -> slot 1000 % 64).
+        assert!(w.advance(ms(1000 * TICK_MS), 100).is_empty());
+        // Register a deadline FAR in the past (tick 3, base tick 1000).
+        w.register(0, b"stale", ms(3 * TICK_MS));
+        assert_eq!(w.len(), 1);
+        // The immediately-following advance (one tick past the base) fires it; the old
+        // tick%WHEEL_SIZE bucketing would have parked it ~a revolution away.
+        let fired = w.advance(ms(1001 * TICK_MS), 100);
+        assert_eq!(fired.len(), 1, "past deadline fires on the next advance");
+        assert_eq!(fired[0].1.as_ref(), b"stale");
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn empty_wheel_fast_forwards_over_a_huge_gap_in_o1() {
+        // The #4 fix (a): an EMPTY wheel advanced across an enormous idle gap does NOT
+        // walk every tick; it fast-forwards current_tick to now_tick in O(1) and returns
+        // immediately. A 30-day gap is ~25.9M ticks (TICK_MS=100); walking it would be
+        // O(gap), here it is a single jump.
+        let mut w = TimingWheel::new();
+        assert!(w.advance(ms(0), 100).is_empty()); // origin at tick 0
+        let huge = 30u64 * 24 * 60 * 60 * 1000; // 30 days in ms
+        let fired = w.advance(ms(huge), 100);
+        assert!(fired.is_empty(), "empty wheel fires nothing across the gap");
+        // current_tick jumped straight to now_tick (no per-tick walk).
+        assert_eq!(w.current_tick, Some(huge / TICK_MS));
+        // A subsequent registration + advance still works against the fast-forwarded
+        // base (no spurious early fire, normal operation resumes).
+        w.register(0, b"k", ms(huge + 100));
+        assert!(
+            w.advance(ms(huge + 100), 100).is_empty(),
+            "alive at deadline"
+        );
+        let fired2 = w.advance(ms(huge + 200), 100);
+        assert_eq!(fired2.len(), 1);
+        assert_eq!(fired2[0].1.as_ref(), b"k");
+    }
+
+    #[test]
+    fn nonempty_wheel_advance_is_bounded_per_call_across_a_gap() {
+        // The #4 fix (b): a non-empty, SPARSE wheel crossed by a large gap processes at
+        // most MAX_TICKS_PER_CALL elapsed ticks per call (bounded work), carrying
+        // current_tick forward so subsequent calls converge. The entry far in the future
+        // is NOT reached in the first bounded call, but current_tick still advanced by
+        // exactly the cap.
+        let mut w = TimingWheel::new();
+        assert!(w.advance(ms(0), 100).is_empty()); // origin at tick 0
+        // One entry whose deadline is well beyond a single capped walk.
+        let far_tick = MAX_TICKS_PER_CALL * 10; // 2560 ticks out
+        w.register(0, b"far", ms(far_tick * TICK_MS));
+        // Advance across the whole gap in ONE call: the walk is capped, so current_tick
+        // advances by exactly MAX_TICKS_PER_CALL (not the full gap) and "far" is not yet
+        // due.
+        let now_tick = far_tick + 1;
+        let fired = w.advance(ms(now_tick * TICK_MS), 100);
+        assert!(
+            fired.is_empty(),
+            "the far entry is not reached in one capped call"
+        );
+        assert_eq!(
+            w.current_tick,
+            Some(MAX_TICKS_PER_CALL),
+            "current_tick advanced by exactly the per-call cap, not the full gap"
+        );
+        // Subsequent calls converge: each advances the (now still non-empty) wheel by up
+        // to the cap until the entry's tick is retired. A bounded number of calls drains
+        // it (here it is reached once current_tick passes far_tick).
+        let mut calls = 0;
+        loop {
+            let batch = w.advance(ms(now_tick * TICK_MS), 100);
+            calls += 1;
+            if !batch.is_empty() {
+                assert_eq!(batch[0].1.as_ref(), b"far");
+                break;
+            }
+            assert!(calls < 100, "must converge in a bounded number of calls");
+        }
+        assert!(w.is_empty());
     }
 
     #[test]
