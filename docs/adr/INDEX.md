@@ -30,6 +30,7 @@ in [OPEN.md](OPEN.md); research questions in [QUESTIONS.md](QUESTIONS.md).
 | [0022](0022-thp-snapshot-stance.md) | THP and snapshot stance (forkless serialization, no huge pages, no overcommit tuning) | Accepted | #44 |
 | [0023](0023-cold-tier-engine.md) | Cold-tier engine (reject RocksDB/LSM, adopt hybrid log) | Accepted | #65 |
 | [0024](0024-geo-command-scope.md) | Geo command family scope (non-goal for v1) | Accepted | #133 |
+| [0025](0025-cluster-partition-count.md) | Cluster keyspace partition count (16384 dual-purpose unit) | Accepted | #72 |
 
 As `[DECISION]` issues close, each adds its row here and its `NNNN-*.md` record.
 The numbering is monotonic and never reused, even after supersession.
