@@ -96,3 +96,7 @@ Specs added as the M1 milestone progresses.
   authoritative slot map, config epoch, membership, and replica promotion (#73).
 - [MEMBERSHIP.md](MEMBERSHIP.md): SWIM + non-optional Lifeguard data-plane
   membership and failure detection, joined with the Raft-committed map (#74).
+- [REPLICA_READ.md](REPLICA_READ.md): the replica-read contract (READONLY/
+  READWRITE, replica routing, bounded staleness surfaced to clients) (#147).
+- [NODE_LIFECYCLE.md](NODE_LIFECYCLE.md): cluster bootstrap and node lifecycle
+  (seed/MEET join, learner to voter to slot-owner promotion, add/remove-node) (#149).
