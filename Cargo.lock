@@ -196,6 +196,7 @@ dependencies = [
  "clap",
  "ironcache-config",
  "ironcache-env",
+ "ironcache-eviction",
  "ironcache-observe",
  "ironcache-protocol",
  "ironcache-runtime",
@@ -220,6 +221,14 @@ dependencies = [
 [[package]]
 name = "ironcache-env"
 version = "0.0.0"
+
+[[package]]
+name = "ironcache-eviction"
+version = "0.0.0"
+dependencies = [
+ "ironcache-env",
+ "ironcache-storage",
+]
 
 [[package]]
 name = "ironcache-observe"
@@ -253,6 +262,7 @@ dependencies = [
  "bytes",
  "ironcache-config",
  "ironcache-env",
+ "ironcache-eviction",
  "ironcache-observe",
  "ironcache-protocol",
  "ironcache-runtime",
@@ -276,6 +286,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "hashbrown 0.16.1",
+ "ironcache-eviction",
  "ironcache-storage",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",

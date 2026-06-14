@@ -13,12 +13,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod cmd_keyspace;
 pub mod cmd_string;
 pub mod cmd_util;
 pub mod conn;
 pub mod dispatch;
 
+pub use admission::is_denyoom;
 pub use conn::ConnState;
 pub use dispatch::{RollupFn, ServerContext, dispatch};
 
@@ -32,5 +34,6 @@ pub use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, Request, Value
 
 // Re-export the storage WAIST types the binary needs to construct/pass a store and
 // the `now` basis. The binary depends on ironcache-storage transitively through
-// here for the trait, and on ironcache-store directly for the concrete impl.
-pub use ironcache_storage::{Store, UnixMillis};
+// here for the trait, and on ironcache-store directly for the concrete impl. `Admit`
+// is the PR-3a admission surface dispatch bounds on (evict-to-fit + policy queries).
+pub use ironcache_storage::{Admit, Store, UnixMillis};

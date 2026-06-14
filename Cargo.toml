@@ -7,7 +7,9 @@
 # (layered TOML config, CONFIG.md), ironcache-observe (INFO/metrics scaffold,
 # OBSERVABILITY.md), ironcache-server (dispatch and Tier-0 connection state machine,
 # COMMANDS.md/CONNECTION_LIFECYCLE.md), and the ironcache binary (CLI_BINARY.md,
-# ADR-0020). PR-1 scope: boot plus wire, Tier-0 commands only.
+# ADR-0020). PR-1 scope: boot plus wire, Tier-0 commands only. PR-3a adds
+# ironcache-eviction (the pluggable EvictionPolicy: S3-FIFO/Random/NoEviction,
+# EVICTION.md/ADR-0008) plus the memory ceiling and denyoom admission.
 
 [workspace]
 resolver = "2"
@@ -18,6 +20,7 @@ members = [
     "crates/ironcache-config",
     "crates/ironcache-observe",
     "crates/ironcache-storage",
+    "crates/ironcache-eviction",
     "crates/ironcache-store",
     "crates/ironcache-server",
     "crates/ironcache",
@@ -88,6 +91,7 @@ ironcache-runtime = { path = "crates/ironcache-runtime" }
 ironcache-config = { path = "crates/ironcache-config" }
 ironcache-observe = { path = "crates/ironcache-observe" }
 ironcache-storage = { path = "crates/ironcache-storage" }
+ironcache-eviction = { path = "crates/ironcache-eviction" }
 ironcache-store = { path = "crates/ironcache-store" }
 ironcache-server = { path = "crates/ironcache-server" }
 

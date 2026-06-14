@@ -25,6 +25,7 @@ pub struct ShardCounters {
     connections_received: u64,
     commands_processed: u64,
     connected_clients: u64,
+    evicted_keys: u64,
 }
 
 impl ShardCounters {
@@ -50,6 +51,12 @@ impl ShardCounters {
         self.commands_processed += 1;
     }
 
+    /// Record `n` keys evicted to honor the memory ceiling (PR-3a; INFO
+    /// `evicted_keys`). Called by the dispatch admission path after `evict_to_fit`.
+    pub fn on_evicted(&mut self, n: u64) {
+        self.evicted_keys += n;
+    }
+
     /// Take an immutable snapshot for rollup.
     #[must_use]
     pub fn snapshot(&self) -> CounterSnapshot {
@@ -57,6 +64,7 @@ impl ShardCounters {
             connections_received: self.connections_received,
             commands_processed: self.commands_processed,
             connected_clients: self.connected_clients,
+            evicted_keys: self.evicted_keys,
         }
     }
 }
@@ -70,6 +78,9 @@ pub struct CounterSnapshot {
     pub commands_processed: u64,
     /// Currently-open connections on this shard.
     pub connected_clients: u64,
+    /// Total keys evicted by this shard to honor the memory ceiling (INFO
+    /// `evicted_keys`, PR-3a).
+    pub evicted_keys: u64,
 }
 
 impl CounterSnapshot {
@@ -80,6 +91,7 @@ impl CounterSnapshot {
             connections_received: self.connections_received + other.connections_received,
             commands_processed: self.commands_processed + other.commands_processed,
             connected_clients: self.connected_clients + other.connected_clients,
+            evicted_keys: self.evicted_keys + other.evicted_keys,
         }
     }
 }
@@ -98,6 +110,11 @@ pub struct ServerInfo {
     /// The resolved memory ceiling in bytes, reported in the INFO `memory`
     /// section's `maxmemory` field. `0` means unlimited.
     pub maxmemory: u64,
+    /// The configured eviction policy name (one of the eight Redis
+    /// `maxmemory-policy` names), reported in the INFO `memory` section's
+    /// `maxmemory_policy` field. Static after boot in PR-3a (the CONFIG SET runtime
+    /// switch is deferred to 3c).
+    pub maxmemory_policy: &'static str,
     /// The name of the global allocator actually selected at build time
     /// (`jemalloc` or `system`), reported as INFO `mem_allocator`. Derived from
     /// the same cfg that picks the `#[global_allocator]`, so INFO never claims
@@ -197,7 +214,9 @@ pub fn build_info<C: Clock>(
         );
         let _ = write!(out, "used_memory_rss:{}\r\n", memory.used_memory_rss);
         let _ = write!(out, "maxmemory:{}\r\n", server.maxmemory);
-        out.push_str("maxmemory_policy:noeviction\r\n");
+        // PR-3a: the CONFIGURED eviction policy name (ADR-0007 cache mode default is
+        // allkeys-lru, NOT noeviction). Static after boot in 3a.
+        let _ = write!(out, "maxmemory_policy:{}\r\n", server.maxmemory_policy);
         // mem_fragmentation_ratio = RSS / used (OBSERVABILITY.md); 0.00 when used is
         // 0 (avoid a divide-by-zero), matching the no-data startup case.
         let frag = if memory.used_memory > 0 {
@@ -222,7 +241,9 @@ pub fn build_info<C: Clock>(
             rolled.commands_processed
         );
         out.push_str("expired_keys:0\r\n");
-        out.push_str("evicted_keys:0\r\n");
+        // PR-3a: the rolled-up evicted-keys total (bumped by the dispatch admission
+        // path after evict_to_fit). expired_keys / keyspace_hits / misses are 3b.
+        let _ = write!(out, "evicted_keys:{}\r\n", rolled.evicted_keys);
         out.push_str("keyspace_hits:0\r\n");
         out.push_str("keyspace_misses:0\r\n");
         out.push_str("\r\n");
@@ -271,6 +292,7 @@ mod tests {
             pid: 1234,
             started_at: Monotonic::ZERO,
             maxmemory: 0,
+            maxmemory_policy: "allkeys-lru",
             mem_allocator: "jemalloc",
         }
     }
@@ -313,6 +335,23 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("mem_allocator:system\r\n"), "{body}");
+    }
+
+    #[test]
+    fn info_reports_configured_policy_and_evicted_keys() {
+        // PR-3a: maxmemory_policy is the CONFIGURED name (not the old hardcoded
+        // noeviction), and evicted_keys is the rolled-up counter.
+        let env = TestEnv::new(1);
+        let mut s = server();
+        s.maxmemory_policy = "volatile-ttl";
+        let rolled = CounterSnapshot {
+            evicted_keys: 7,
+            ..Default::default()
+        };
+        let body = build_info(&env, &s, rolled, MemoryInfo::default(), None);
+        assert!(body.contains("maxmemory_policy:volatile-ttl\r\n"), "{body}");
+        assert!(!body.contains("maxmemory_policy:noeviction\r\n"), "{body}");
+        assert!(body.contains("evicted_keys:7\r\n"), "{body}");
     }
 
     #[test]

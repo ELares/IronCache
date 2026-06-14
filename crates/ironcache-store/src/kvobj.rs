@@ -48,9 +48,13 @@ pub struct Header {
     pub data_type: DataType,
     /// The value encoding (4-bit field in the packed layout).
     pub encoding: Encoding,
-    /// The S3-FIFO eviction rank: a 2-bit frequency counter capped at 3
-    /// (ADR-0008). Reserved in PR-2a (the eviction hook is a no-op); PR-3 drives
-    /// it. Stored as a `u8` here, masked to two bits.
+    /// The S3-FIFO eviction rank: a 2-bit frequency counter capped at 3 (ADR-0008).
+    /// RESERVED: in PR-3a the S3-FIFO 2-bit frequency is owned by the POLICY (a
+    /// per-key counter on the queued entry), because `select_victim` is policy-only
+    /// and cannot borrow this header. This field is carried for the eventual
+    /// single-source-of-truth migration (when the decision path can read the rank
+    /// across the storage boundary, a later PR), but the access path does NOT write it
+    /// today, since nothing reads it. Stored as a `u8` here, masked to two bits.
     pub eviction_rank: u8,
     /// Whether a TTL deadline is present (the TTL-present flag bit). Mirrors
     /// `expire_at.is_some()`; kept explicit to match the packed-header shape.

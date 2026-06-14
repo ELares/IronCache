@@ -70,8 +70,14 @@ pub struct Config {
     /// per PROTOCOL.md; exposed for completeness/testing).
     pub default_resp3: bool,
     /// Memory ceiling in bytes. `0` means unlimited (PR-1 does not enforce it;
-    /// the value is parsed and surfaced for `config`/INFO).
+    /// PR-3a enforces it at the dispatch layer via the per-shard budget). The value
+    /// is parsed and surfaced for `config`/INFO.
     pub maxmemory: u64,
+    /// The eviction policy: one of the eight Redis `maxmemory-policy` names
+    /// (EVICTION.md #50). Defaults to an eviction-ON name (`allkeys-lru`) per
+    /// ADR-0007 (cache mode), NOT Redis's `noeviction` default. Validated against the
+    /// recognized names in [`Config::validate`].
+    pub maxmemory_policy: String,
     /// Optional `requirepass` password. `None` means auth is not required.
     pub requirepass: Option<String>,
     /// Idle timeout in seconds; `0` disables idle disconnection (Redis default 0,
@@ -95,11 +101,31 @@ impl Default for Config {
             databases: 16,
             default_resp3: false,
             maxmemory: 0,
+            // ADR-0007: cache mode default is eviction-ON with a Redis-recognized
+            // name, NOT noeviction. allkeys-lru is the typical cache default; the
+            // FIFO-class engine (ADR-0008) serves it.
+            maxmemory_policy: "allkeys-lru".to_owned(),
             requirepass: None,
             timeout_secs: 0,
         }
     }
 }
+
+/// The eight Redis `maxmemory-policy` names IronCache accepts (EVICTION.md #50).
+/// Inlined here (rather than depending on `ironcache-eviction`) to keep the config
+/// crate dependency-light; this list is a stable Redis fact and is mirrored by
+/// `ironcache_eviction::REDIS_POLICY_NAMES` (kept in lockstep). Validation is
+/// case-insensitive.
+pub const MAXMEMORY_POLICY_NAMES: [&str; 8] = [
+    "noeviction",
+    "allkeys-lru",
+    "allkeys-lfu",
+    "allkeys-random",
+    "volatile-lru",
+    "volatile-lfu",
+    "volatile-random",
+    "volatile-ttl",
+];
 
 impl Config {
     /// Resolve the effective config by folding `overlays` over the defaults,
@@ -134,6 +160,20 @@ impl Config {
                 reason: "must be at least 1".to_owned(),
             });
         }
+        // maxmemory-policy must be one of the eight Redis names (case-insensitive),
+        // EVICTION.md #50. An unknown name hard-fails boot rather than silently
+        // falling back to a default (an operator typo must be visible).
+        let policy_lower = self.maxmemory_policy.to_ascii_lowercase();
+        if !MAXMEMORY_POLICY_NAMES.contains(&policy_lower.as_str()) {
+            return Err(ConfigError::Invalid {
+                field: "maxmemory-policy",
+                reason: format!(
+                    "'{}' is not a recognized policy (expected one of: {})",
+                    self.maxmemory_policy,
+                    MAXMEMORY_POLICY_NAMES.join(", ")
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -156,6 +196,8 @@ pub struct ConfigOverlay {
     pub default_resp3: Option<bool>,
     /// Memory ceiling as a human size string ("512mb", "1gb", "0").
     pub maxmemory: Option<String>,
+    /// Eviction policy name (one of the eight Redis `maxmemory-policy` names).
+    pub maxmemory_policy: Option<String>,
     /// `requirepass` password.
     pub requirepass: Option<String>,
     /// Idle timeout in seconds.
@@ -203,6 +245,9 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_MAXMEMORY") {
             o.maxmemory = Some(v);
         }
+        if let Ok(v) = std::env::var("IRONCACHE_MAXMEMORY_POLICY") {
+            o.maxmemory_policy = Some(v);
+        }
         if let Ok(v) = std::env::var("IRONCACHE_REQUIREPASS") {
             o.requirepass = Some(v);
         }
@@ -237,6 +282,11 @@ impl ConfigOverlay {
             // overflowing maxmemory must hard-fail boot, not silently become 0
             // (unlimited). Integer math, overflow-checked (see parse_human_size).
             cfg.maxmemory = parse_human_size(v)?;
+        }
+        if let Some(ref v) = self.maxmemory_policy {
+            // Name validity is checked in Config::validate (after all overlays fold),
+            // so an env/CLI override is validated once on the resolved value.
+            cfg.maxmemory_policy.clone_from(v);
         }
         if let Some(ref v) = self.requirepass {
             cfg.requirepass = Some(v.clone());
@@ -318,8 +368,44 @@ mod tests {
         assert!(c.shards >= 1);
         assert_eq!(c.databases, 16);
         assert_eq!(c.maxmemory, 0);
+        // ADR-0007: the cache-mode default is eviction-ON, not noeviction.
+        assert_eq!(c.maxmemory_policy, "allkeys-lru");
+        assert_ne!(c.maxmemory_policy, "noeviction");
         assert!(c.requirepass.is_none());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn maxmemory_policy_overlay_and_validation() {
+        // A valid Redis name resolves and validates (case-insensitive).
+        for good in [
+            "noeviction",
+            "allkeys-lfu",
+            "VOLATILE-TTL",
+            "volatile-random",
+        ] {
+            let o = ConfigOverlay {
+                maxmemory_policy: Some(good.to_owned()),
+                ..Default::default()
+            };
+            let cfg = Config::resolve(&[o]).unwrap();
+            assert_eq!(cfg.maxmemory_policy, good);
+            cfg.validate()
+                .expect("valid policy name should pass validate");
+        }
+        // An unknown name resolves (the layer just sets a string) but FAILS validate.
+        let o = ConfigOverlay {
+            maxmemory_policy: Some("allkeys-ttl".to_owned()),
+            ..Default::default()
+        };
+        let cfg = Config::resolve(&[o]).unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Invalid {
+                field: "maxmemory-policy",
+                ..
+            })
+        ));
     }
 
     #[test]

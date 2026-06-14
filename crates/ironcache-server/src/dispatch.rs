@@ -9,12 +9,13 @@
 //! handshake/connection tier; data commands (GET/SET/...) arrive with the store
 //! in PR-2.
 
+use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{cmd_keyspace, cmd_string};
 use ironcache_env::Clock;
 use ironcache_observe::{CounterSnapshot, MemoryInfo, ServerInfo, build_info};
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
-use ironcache_storage::{Store, UnixMillis};
+use ironcache_storage::{Admit, Store, UnixMillis};
 
 /// Immutable, server-wide context a handler may read. It is cloned cheaply onto
 /// each shard; the dynamic per-rollup counters are passed in separately.
@@ -24,6 +25,17 @@ pub struct ServerContext {
     pub requirepass: Option<String>,
     /// Number of logical databases (`SELECT` range is `[0, databases)`).
     pub databases: u32,
+    /// The resolved memory ceiling in bytes (`maxmemory`). `0` means unlimited: the
+    /// admission gate is OFF and every write is served (ADR-0007 unlimited posture).
+    pub maxmemory: u64,
+    /// The PER-SHARD byte budget the admission gate enforces against this shard's
+    /// `used_memory()`: `maxmemory / shards`, computed ONCE at boot. The maxmemory
+    /// ceiling is split evenly across shards (shared-nothing, ADR-0002): each shard
+    /// owns a slice of the budget and evicts/`-OOM`s against its own slice, with no
+    /// cross-shard counter on the hot path. Exact per-arena attribution (ADR-0006) is
+    /// a later follow-up; the even split is the honest per-shard approximation for
+    /// 3a. `0` when `maxmemory == 0` (unlimited).
+    pub per_shard_budget: u64,
     /// Static server facts for INFO/HELLO.
     pub info: ServerInfo,
 }
@@ -33,6 +45,13 @@ impl ServerContext {
     #[must_use]
     pub fn requires_auth(&self) -> bool {
         self.requirepass.is_some()
+    }
+
+    /// Whether the memory ceiling is enabled (a non-zero `maxmemory`). When `false`,
+    /// admission is a no-op and every write is served.
+    #[must_use]
+    pub fn ceiling_enabled(&self) -> bool {
+        self.maxmemory > 0 && self.per_shard_budget > 0
     }
 }
 
@@ -54,16 +73,24 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 /// supplied in).
 ///
 /// Tier-0 (connection) commands ignore `store`/`now`; the data commands use them.
-/// The function is generic over `S: Store` for monomorphization, consistent with
-/// the existing `C: Clock` generic.
+/// The function is generic over `S: Store + Admit` for monomorphization, consistent
+/// with the existing `C: Clock` generic. The [`Admit`] bound lets the dispatcher
+/// enforce the maxmemory ceiling (evict-to-fit / `-OOM`) without naming the concrete
+/// store or policy.
 ///
-/// The 8 arguments are each a distinct, orthogonal seam (ctx/state/clock/store/now/
-/// rollup/mem/req) the dispatcher fans out to handlers; bundling them into a struct
-/// would just move the same fields behind one name and obscure the per-command
-/// borrows (the lifetime-parameterized `rollup` closure in particular). The
-/// over-7-args lint is allowed here with that justification.
+/// `evicted_out` is an out-parameter the admission gate writes the number of keys it
+/// evicted into (0 on every non-evicting command); the caller adds it to the shard's
+/// `evicted_keys` counter (INFO). It is a `&mut u64` rather than a counter handle so
+/// dispatch does not alias the `rollup` closure's borrow of the same per-shard
+/// counters (the serve loop applies the bump after dispatch returns).
+///
+/// The arguments are each a distinct, orthogonal seam (ctx/state/clock/store/now/
+/// rollup/mem/evicted_out/req) the dispatcher fans out to handlers; bundling them into
+/// a struct would just move the same fields behind one name and obscure the
+/// per-command borrows (the lifetime-parameterized `rollup` closure in particular).
+/// The over-7-args lint is allowed here with that justification.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch<C: Clock, S: Store>(
+pub fn dispatch<C: Clock, S: Store + Admit>(
     ctx: &ServerContext,
     state: &mut ConnState,
     clock: &C,
@@ -71,8 +98,10 @@ pub fn dispatch<C: Clock, S: Store>(
     now: UnixMillis,
     rollup: RollupFn<'_>,
     mem: MemoryInfo,
+    evicted_out: &mut u64,
     req: &Request,
 ) -> Value {
+    *evicted_out = 0;
     let cmd = ascii_upper(req.command());
 
     // Auth gate: before authenticating, only a small set of commands is allowed
@@ -83,6 +112,33 @@ pub fn dispatch<C: Clock, S: Store>(
         && !matches!(cmd.as_slice(), b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
     {
         return Value::error(ErrorReply::noauth());
+    }
+
+    // maxmemory admission (ADMISSION.md #128, ADR-0007). For a `denyoom` write, before
+    // the command body: if the ceiling is enabled and this shard is STRICTLY OVER its
+    // budget, either evict-to-fit (cache mode) or reply `-OOM` (datastore/noeviction).
+    // The comparison is strict `>` to match Redis's getMaxmemoryState (evict.c):
+    // memory is "under limit" when `used <= maxmemory`, so a write at EXACTLY
+    // used==budget is served, and only used>budget triggers eviction/-OOM (the -OOM
+    // string itself reads "used memory > 'maxmemory'"). Non-denyoom commands (reads,
+    // DEL, Tier-0) are ALWAYS served, even over budget, so a client can read and free
+    // under pressure.
+    if ctx.ceiling_enabled() && is_denyoom(cmd.as_slice()) {
+        let budget = ctx.per_shard_budget;
+        if store.used_memory() > budget {
+            if store.policy_evicts() {
+                // Cache mode: try to free space, then re-check. If eviction cannot get
+                // us down to budget (write outruns eviction, or only ineligible keys
+                // remain), reject -OOM. The freed count is reported for INFO.
+                *evicted_out = store.evict_to_fit(budget, now);
+                if store.used_memory() > budget {
+                    return Value::error(ErrorReply::oom());
+                }
+            } else {
+                // Strict datastore / noeviction: -OOM is the over-capacity behavior.
+                return Value::error(ErrorReply::oom());
+            }
+        }
     }
 
     let db = state.db;
@@ -439,18 +495,38 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use ironcache_env::{Monotonic, TestEnv};
+    use ironcache_eviction::Policy;
+    use ironcache_storage::CountingAccounting;
     use ironcache_store::ShardStore;
+
+    /// The store type the dispatch tests drive: the concrete per-shard store wired
+    /// with a real eviction policy (so it satisfies the `Admit` bound dispatch now
+    /// requires). Defaults to the cache-mode S3-FIFO policy.
+    type TestStore = ShardStore<Policy, CountingAccounting>;
+
+    /// A test store with `databases` DBs and the given policy.
+    fn store_with(databases: u32, policy: Policy) -> TestStore {
+        ShardStore::with_hooks(databases, policy, CountingAccounting::new())
+    }
+
+    /// The default test store (cache-mode S3-FIFO, ceiling off).
+    fn test_store(databases: u32) -> TestStore {
+        store_with(databases, Policy::cache_default())
+    }
 
     fn ctx(pass: Option<&str>) -> ServerContext {
         ServerContext {
             requirepass: pass.map(str::to_owned),
             databases: 16,
+            maxmemory: 0,
+            per_shard_budget: 0,
             info: ServerInfo {
                 tcp_port: 6379,
                 shards: 1,
                 pid: 1,
                 started_at: Monotonic::ZERO,
                 maxmemory: 0,
+                maxmemory_policy: "allkeys-lru",
                 mem_allocator: "jemalloc",
             },
         }
@@ -474,8 +550,9 @@ mod tests {
 
     fn run(ctx: &ServerContext, st: &mut ConnState, parts: &[&[u8]]) -> Value {
         let env = TestEnv::new(1);
-        let mut store = ShardStore::new(ctx.databases);
+        let mut store = test_store(ctx.databases);
         let zero = || CounterSnapshot::default();
+        let mut evicted = 0;
         dispatch(
             ctx,
             st,
@@ -484,6 +561,7 @@ mod tests {
             UnixMillis(0),
             &zero,
             MemoryInfo::default(),
+            &mut evicted,
             &req(parts),
         )
     }
@@ -494,12 +572,13 @@ mod tests {
     fn run_on(
         ctx: &ServerContext,
         st: &mut ConnState,
-        store: &mut ShardStore,
+        store: &mut TestStore,
         now: UnixMillis,
         parts: &[&[u8]],
     ) -> Value {
         let env = TestEnv::new(1);
         let zero = || CounterSnapshot::default();
+        let mut evicted = 0;
         dispatch(
             ctx,
             st,
@@ -508,6 +587,7 @@ mod tests {
             now,
             &zero,
             MemoryInfo::default(),
+            &mut evicted,
             &req(parts),
         )
     }
@@ -730,7 +810,7 @@ mod tests {
     fn set_then_get_round_trips() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"SET", b"foo", b"bar"]),
@@ -751,7 +831,7 @@ mod tests {
     fn set_nx_only_when_absent() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v1", b"NX"]),
@@ -769,7 +849,7 @@ mod tests {
     fn set_xx_only_when_present() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // XX on absent key -> nil, nothing written.
         assert_eq!(
@@ -790,7 +870,7 @@ mod tests {
     fn set_get_returns_old_value() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"old"]);
         // SET k new XX GET -> returns old, writes new.
@@ -823,7 +903,7 @@ mod tests {
     fn set_keepttl_preserves_deadline() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         // Set with a 100-second TTL at t=0 (deadline 100000ms).
         run_on(
             &c,
@@ -856,7 +936,7 @@ mod tests {
     fn set_ex_stores_deadline_and_lazy_expires() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         // EX 10 at t=0 -> deadline 10000ms.
         run_on(
             &c,
@@ -885,7 +965,7 @@ mod tests {
     fn set_conflicting_options_is_syntax_error() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         for opts in [
             vec![b"SET".as_slice(), b"k", b"v", b"NX", b"XX"],
@@ -907,7 +987,7 @@ mod tests {
         // the millisecond computation. Nothing is written.
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         for opts in [
             vec![b"SET".as_slice(), b"k", b"v", b"EX", b"0"],
@@ -938,7 +1018,7 @@ mod tests {
         // leading '+' is also rejected (Redis string2ll rejects '+').
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         for opts in [
             vec![b"SET".as_slice(), b"k", b"v", b"EX", b"abc"],
@@ -960,7 +1040,7 @@ mod tests {
     fn setnx_and_getset() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"SETNX", b"k", b"v1"]),
@@ -987,7 +1067,7 @@ mod tests {
     fn del_and_exists_variadic_counts() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         run_on(&c, &mut s, &mut st, t, &[b"SET", b"a", b"1"]);
         run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"2"]);
@@ -1017,7 +1097,7 @@ mod tests {
     fn type_and_strlen() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"TYPE", b"k"]),
@@ -1052,7 +1132,7 @@ mod tests {
 
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
 
         // Plant a non-String value directly (PR-2a commands only ever produce
@@ -1096,7 +1176,7 @@ mod tests {
     fn arity_errors_on_data_commands() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         for cmd in [
             vec![b"GET".as_slice()],
@@ -1127,7 +1207,7 @@ mod tests {
     /// The store-level encoding of `key` in db 0 (for int-encoding assertions). The
     /// command layer only ever sees bytes; the test reaches the store directly to
     /// confirm the result is stored int-encoded, which is the ENCODINGS.md contract.
-    fn encoding_of(st: &mut ShardStore, key: &[u8]) -> Option<ironcache_storage::Encoding> {
+    fn encoding_of(st: &mut TestStore, key: &[u8]) -> Option<ironcache_storage::Encoding> {
         st.read(0, key, UnixMillis(0)).map(|v| v.encoding())
     }
 
@@ -1142,7 +1222,7 @@ mod tests {
     fn incr_decr_from_absent_and_existing() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // Absent key starts at 0: INCR -> 1.
         assert_eq!(
@@ -1189,7 +1269,7 @@ mod tests {
         // SET n 10 (stored int-encoded), then INCR/INCRBY/DECR through dispatch.
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         run_on(&c, &mut s, &mut st, t, &[b"SET", b"n", b"10"]);
         assert_eq!(
@@ -1210,7 +1290,7 @@ mod tests {
     fn incr_non_integer_value_and_arg_are_not_an_integer() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // Non-integer EXISTING value (an embstr) -> not-an-integer.
         run_on(&c, &mut s, &mut st, t, &[b"SET", b"s", b"hello"]);
@@ -1239,7 +1319,7 @@ mod tests {
     fn incr_overflow_and_decr_underflow_and_decrby_min_edge() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // INCR of i64::MAX overflows.
         run_on(
@@ -1287,7 +1367,7 @@ mod tests {
         use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         let mut obj = KvObj::from_bytes(b"lst", b"x", None);
         obj.header = Header {
@@ -1330,7 +1410,7 @@ mod tests {
         use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         let mut obj = KvObj::from_bytes(b"lst", b"x", None);
         obj.header = Header {
@@ -1358,7 +1438,7 @@ mod tests {
     fn incrbyfloat_absent_format_and_storage() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // Absent -> 0 + 10.5 = "10.5" (bulk string).
         assert_eq!(
@@ -1381,7 +1461,7 @@ mod tests {
     fn incrbyfloat_integer_valued_result_round_trips_to_incr() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // 5.0e3 -> "5000" (integer-valued result, no dot), stored as a string that
         // is int-encoded (since "5000" is a canonical integer), so a later INCR
@@ -1404,7 +1484,7 @@ mod tests {
     fn incrbyfloat_invalid_float_and_nan_inf() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // Non-float existing value -> not-a-valid-float.
         run_on(&c, &mut s, &mut st, t, &[b"SET", b"s", b"hello"]);
@@ -1448,7 +1528,7 @@ mod tests {
     fn append_absent_existing_and_binary_safe() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // Absent: APPEND creates and returns len(value).
         assert_eq!(
@@ -1499,7 +1579,7 @@ mod tests {
     fn append_promotes_int_off_the_int_encoding() {
         let c = ctx(None);
         let mut s = state(&c);
-        let mut st = ShardStore::new(c.databases);
+        let mut st = test_store(c.databases);
         let t = UnixMillis(0);
         // SET n 10 is int-encoded; APPEND promotes the concatenation OFF int (to a
         // string encoding). The exact string encoding is length-based in the frozen
@@ -1524,5 +1604,239 @@ mod tests {
             Some(ironcache_storage::Encoding::Int),
             "APPEND must promote off the int encoding"
         );
+    }
+
+    // -- maxmemory admission (PR-3a, ADMISSION.md #128, ADR-0007). --
+
+    /// Run a command against a caller-owned store with the ceiling ON, returning the
+    /// reply and the number of keys the admission gate evicted.
+    fn run_admit(
+        ctx: &ServerContext,
+        st: &mut ConnState,
+        store: &mut TestStore,
+        now: UnixMillis,
+        parts: &[&[u8]],
+    ) -> (Value, u64) {
+        let env = TestEnv::new(1);
+        let zero = || CounterSnapshot::default();
+        let mut evicted = 0u64;
+        let reply = dispatch(
+            ctx,
+            st,
+            &env,
+            store,
+            now,
+            &zero,
+            MemoryInfo::default(),
+            &mut evicted,
+            &req(parts),
+        );
+        (reply, evicted)
+    }
+
+    /// A context with the ceiling enabled at `per_shard_budget` bytes (single-shard
+    /// tests, so maxmemory == per_shard_budget).
+    fn ctx_with_budget(per_shard_budget: u64) -> ServerContext {
+        let mut c = ctx(None);
+        c.maxmemory = per_shard_budget;
+        c.per_shard_budget = per_shard_budget;
+        c
+    }
+
+    fn err_of(v: Value) -> String {
+        match v {
+            Value::Error(e) => e.line(),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn noeviction_over_budget_rejects_denyoom_write_with_byte_exact_oom() {
+        // Strict datastore mode: a denyoom write at/over the budget gets the exact
+        // -OOM string, and nothing is written.
+        let c = ctx_with_budget(50);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::NoEviction);
+        let t = UnixMillis(0);
+        let big = vec![b'v'; 100];
+        // The first SET: used_memory starts at 0 (< 50), so the gate lets it through;
+        // the store is now over budget.
+        let (r, ev) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(r, Value::ok());
+        assert_eq!(ev, 0);
+        assert!(st.used_memory() >= 50);
+        // A SECOND denyoom write is rejected -OOM (byte-exact), nothing evicted.
+        let (r2, ev2) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k2", &big]);
+        assert_eq!(
+            err_of(r2),
+            "-OOM command not allowed when used memory > 'maxmemory'."
+        );
+        assert_eq!(ev2, 0, "noeviction evicts nothing");
+        // k2 was not written.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"k2"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn denyoom_write_at_exactly_used_equals_budget_is_served() {
+        // Strict-over semantics (Redis getMaxmemoryState: under-limit at
+        // `used <= maxmemory`). With used == budget EXACTLY, a denyoom write is served
+        // (the gate's `used > budget` is false), NOT OOM'd, even under `noeviction`.
+        let mut probe = store_with(16, Policy::NoEviction);
+        let t = UnixMillis(0);
+        let big = vec![b'v'; 100];
+        // Plant one key with no ceiling, then read the resulting footprint and set the
+        // budget to EXACTLY that, so used == budget on the next gated write.
+        probe.upsert(
+            0,
+            b"k",
+            ironcache_storage::NewValue::Bytes(&big),
+            ironcache_storage::ExpireWrite::Clear,
+            t,
+        );
+        let exact = probe.used_memory();
+        assert!(exact > 0);
+
+        let c = ctx_with_budget(exact);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::NoEviction);
+        // Replay the same plant against the gated store so used == budget exactly.
+        let (r0, ev0) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(r0, Value::ok());
+        assert_eq!(ev0, 0);
+        assert_eq!(
+            st.used_memory(),
+            exact,
+            "used must equal the budget exactly"
+        );
+
+        // A denyoom write that does NOT grow memory (overwrite same key, same size) at
+        // used == budget is SERVED: the gate is strict `>`, so used==budget passes.
+        let (r1, ev1) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(r1, Value::ok(), "at used==budget the write must be served");
+        assert_eq!(ev1, 0);
+
+        // Now push STRICTLY over the budget (a second, larger key with no ceiling
+        // would not be gated; instead grow via the gated path: the first overwrite was
+        // served and left used==budget, so a NEW key now tips strictly over and the
+        // NEXT denyoom write is OOM'd under noeviction).
+        let (r2, _ev2) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k2", &big]);
+        // The k2 write happened at used==budget (served), pushing used strictly over.
+        assert_eq!(r2, Value::ok());
+        assert!(st.used_memory() > exact, "used is now strictly over budget");
+        // The FOLLOWING denyoom write is rejected -OOM (strictly over, noeviction).
+        let (r3, ev3) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k3", &big]);
+        assert_eq!(
+            err_of(r3),
+            "-OOM command not allowed when used memory > 'maxmemory'."
+        );
+        assert_eq!(ev3, 0);
+    }
+
+    #[test]
+    fn cache_mode_at_exactly_budget_serves_without_evicting() {
+        // Cache mode mirror of the strict-over boundary: at used == budget the gate is
+        // not entered, so evict_to_fit does NOT run and nothing is evicted.
+        let mut probe = store_with(16, Policy::cache_default());
+        let t = UnixMillis(0);
+        let big = vec![b'v'; 100];
+        probe.upsert(
+            0,
+            b"k",
+            ironcache_storage::NewValue::Bytes(&big),
+            ironcache_storage::ExpireWrite::Clear,
+            t,
+        );
+        let exact = probe.used_memory();
+
+        let c = ctx_with_budget(exact);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::cache_default());
+        run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(st.used_memory(), exact);
+        // Overwrite at used==budget: served, and the eviction gate did not fire.
+        let (r, ev) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert_eq!(r, Value::ok());
+        assert_eq!(ev, 0, "at used==budget cache mode must not evict");
+    }
+
+    #[test]
+    fn reads_and_del_are_served_over_budget() {
+        // Non-denyoom commands are ALWAYS served even over budget (a client must be
+        // able to read and free under memory pressure).
+        let c = ctx_with_budget(50);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::NoEviction);
+        let t = UnixMillis(0);
+        let big = vec![b'v'; 100];
+        run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", &big]);
+        assert!(st.used_memory() >= 50);
+        // GET still works over budget.
+        let (got_get, _) = run_admit(&c, &mut s, &mut st, t, &[b"GET", b"k"]);
+        assert_eq!(
+            got_get,
+            Value::BulkString(Some(Bytes::copy_from_slice(&big)))
+        );
+        // DEL (memory-releasing) still works over budget and frees space.
+        let (got_del, _) = run_admit(&c, &mut s, &mut st, t, &[b"DEL", b"k"]);
+        assert_eq!(got_del, Value::Integer(1));
+        assert!(st.used_memory() < 50, "DEL freed space");
+    }
+
+    #[test]
+    fn cache_mode_over_budget_evicts_then_the_write_succeeds() {
+        // Cache mode: a denyoom write at the budget triggers evict-to-fit; once there
+        // is room the write proceeds and the evicted count is reported.
+        let c = ctx_with_budget(300);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::cache_default());
+        let t = UnixMillis(0);
+        let val = vec![b'v'; 100];
+        // Write several keys to get over the 300-byte budget.
+        for i in 0u32..5 {
+            run_admit(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("k{i}").as_bytes(), &val],
+            );
+        }
+        assert!(
+            st.used_memory() >= 300,
+            "should be over budget after the fills"
+        );
+        // The next denyoom write evicts to fit, then succeeds.
+        let (r, ev) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"new", &val]);
+        assert_eq!(r, Value::ok(), "the write should succeed after eviction");
+        assert!(ev > 0, "cache mode should have evicted at least one key");
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"new"]),
+            Value::BulkString(Some(Bytes::copy_from_slice(&val)))
+        );
+    }
+
+    #[test]
+    fn ceiling_off_serves_every_write() {
+        // maxmemory == 0 (unlimited): the gate is off; writes always succeed.
+        let c = ctx(None);
+        assert!(!c.ceiling_enabled());
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let big = vec![b'v'; 10_000];
+        for i in 0u32..5 {
+            let (r, ev) = run_admit(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("k{i}").as_bytes(), &big],
+            );
+            assert_eq!(r, Value::ok());
+            assert_eq!(ev, 0);
+        }
     }
 }

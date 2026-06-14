@@ -34,13 +34,12 @@ pub mod kvobj;
 use bytes::Bytes;
 use hashbrown::HashMap;
 use hashbrown::hash_map::Entry;
+use ironcache_eviction::EvictionPolicy;
 use ironcache_storage::{
     AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, NewValue,
     NullEviction, OccupiedEntry, RmwAction, RmwEntry, RmwStep, Store, UnixMillis, ValueRef,
 };
 use kvobj::{KvObj, int_decimal_bytes};
-
-use std::hash::BuildHasher;
 
 /// The per-shard store: one `hashbrown::HashMap` per logical database, plus the
 /// eviction and accounting hooks fired from inside the primitives.
@@ -64,10 +63,6 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// in lockstep with the accounting hook's add/sub deltas so the read is O(1).
     /// PR-2b swaps `used_memory()` to the jemalloc `stats.allocated` mallctl.
     used: u64,
-    /// The hasher used to derive the full 64-bit key hash handed to the eviction
-    /// hook (the same hash basis SCAN orders on, #129). It is `hashbrown`'s default
-    /// `DefaultHashBuilder`; seeded-hash tuning is a #8 follow-up.
-    hash_builder: hashbrown::DefaultHashBuilder,
 }
 
 impl ShardStore<NullEviction, CountingAccounting> {
@@ -92,7 +87,6 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             eviction,
             accounting,
             used: 0,
-            hash_builder: hashbrown::DefaultHashBuilder::default(),
         }
     }
 
@@ -125,11 +119,6 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.dbs.iter().all(HashMap::is_empty)
-    }
-
-    /// The full 64-bit key hash for the eviction hook (and the SCAN-order basis).
-    fn key_hash(&self, key: &[u8]) -> u64 {
-        self.hash_builder.hash_one(key)
     }
 
     /// The map index for the validated logical `db`. The command layer validates the
@@ -168,11 +157,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             .and_then(|m| m.get(key))
             .is_some_and(|o| o.is_expired(now));
         if due {
-            let key_hash = self.key_hash(key);
             if let Some(obj) = self.dbs[db_idx].remove(key) {
                 let bytes = obj.accounted_bytes();
                 self.account_sub(bytes);
-                self.eviction.on_remove(db, key_hash, bytes);
+                self.eviction.on_remove(db, key, bytes);
             }
             return false;
         }
@@ -193,7 +181,6 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
     /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
     fn put_object(&mut self, db: u32, db_idx: usize, key: &[u8], obj: KvObj) -> bool {
-        let key_hash = self.key_hash(key);
         let new_bytes = obj.accounted_bytes();
         let boxed: Box<[u8]> = key.to_vec().into_boxed_slice();
         // Replace inside the entry scope, capturing any old weight, then update the
@@ -211,10 +198,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         };
         if let Some(old) = old_bytes {
             self.account_sub(old);
-            self.eviction.on_remove(db, key_hash, old);
+            self.eviction.on_remove(db, key, old);
         }
         self.account_add(new_bytes);
-        self.eviction.on_insert(db, key_hash, new_bytes);
+        self.eviction.on_insert(db, key, new_bytes);
         old_bytes.is_some()
     }
 
@@ -224,11 +211,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
     /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
     fn remove_object(&mut self, db: u32, db_idx: usize, key: &[u8]) -> bool {
-        let key_hash = self.key_hash(key);
         if let Some(obj) = self.dbs[db_idx].remove(key) {
             let bytes = obj.accounted_bytes();
             self.account_sub(bytes);
-            self.eviction.on_remove(db, key_hash, bytes);
+            self.eviction.on_remove(db, key, bytes);
             true
         } else {
             false
@@ -288,9 +274,11 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         if !self.expire_if_due(db, db_idx, key, now) {
             return None;
         }
-        let key_hash = self.key_hash(key);
-        self.eviction.on_access(db, key_hash);
-        // The entry is present and live (expire_if_due returned true).
+        // The S3-FIFO 2-bit frequency is owned by the POLICY (per-key counter bumped
+        // in `on_access`); the kvobj `eviction_rank` header field is RESERVED for the
+        // eventual single-source migration (see the eviction crate docs) and is not
+        // written on the access path, since nothing reads it today.
+        self.eviction.on_access(db, key);
         self.dbs[db_idx].get(key).map(Self::view_of)
     }
 
@@ -338,11 +326,13 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
     ) -> R {
         let db_idx = self.db_index(db);
         let live = self.expire_if_due(db, db_idx, key, now);
-        let key_hash = self.key_hash(key);
 
         // Observe (atomically with the write that follows, on the owning core).
         let step = if live {
-            self.eviction.on_access(db, key_hash);
+            // The S3-FIFO 2-bit frequency is owned by the POLICY (bumped in
+            // `on_access`); the kvobj `eviction_rank` header field is RESERVED, not
+            // written here (nothing reads it). See the eviction crate docs.
+            self.eviction.on_access(db, key);
             let obj = self.dbs[db_idx].get(key).expect("live entry present");
             let entry = RmwEntry::Occupied(Self::occupied_of(obj));
             f(entry)
@@ -408,6 +398,127 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // accounting hook. PR-2b swaps this for the jemalloc stats.allocated mallctl
         // behind this same method.
         self.used
+    }
+}
+
+impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardStore<E, A> {
+    /// Whether the configured policy evicts at the ceiling (cache mode) vs rejects
+    /// the write (strict datastore mode / `noeviction`). Dispatch reads this to
+    /// choose evict-to-fit vs an immediate `-OOM` (ADMISSION.md).
+    fn policy_evicts(&self) -> bool {
+        self.eviction.evicts()
+    }
+
+    /// Whether the configured policy restricts victims to TTL-bearing keys (the
+    /// `volatile-*` family). Exposed for INFO/introspection; [`Self::evict_to_fit`]
+    /// already enforces it internally.
+    fn policy_volatile_only(&self) -> bool {
+        self.eviction.volatile_only()
+    }
+
+    /// The CONFIGURED `maxmemory-policy` name the policy echoes VERBATIM (for INFO
+    /// `maxmemory_policy` and CONFIG GET); the exact configured spelling, not an
+    /// engine-family substitution (ADR-0009).
+    fn policy_name(&self) -> String {
+        self.eviction.policy_name()
+    }
+
+    /// Evict entries until `used_memory()` is at or below `budget_bytes` (`used <=
+    /// budget`), or until the policy can free no more (or a per-call iteration cap is
+    /// hit). Returns the number of entries evicted (ADMISSION.md evict-to-fit;
+    /// ADR-0007 cache mode).
+    ///
+    /// The loop condition is strict `>` to match Redis's getMaxmemoryState (evict.c):
+    /// memory is "under limit" at `used <= maxmemory`, so eviction frees down to
+    /// `used <= budget` (NOT strictly below it) and stops the instant the budget is
+    /// met exactly.
+    ///
+    /// The store drives the policy through the [`EvictionHook`] surface: each round
+    /// asks [`EvictionHook::select_victim`] for a `(db, key)` and deletes it (which
+    /// fires `on_remove` and frees its bytes through the accounting hook), stopping as
+    /// soon as the budget is met. If `select_victim` returns `None` the policy cannot
+    /// free anything (an empty keyspace, or the `noeviction` policy), so we stop and
+    /// return what we evicted so far; the caller then decides whether to reply `-OOM`.
+    ///
+    /// ## Volatile-only enforcement
+    ///
+    /// For a `volatile_only` policy (the `volatile-*` family) only TTL-bearing keys
+    /// are eligible. The frozen hooks do not pass TTL to the policy, so the FILTER
+    /// lives here, where the store can read `expire_at`: a victim with NO TTL is
+    /// removed from the policy's queue (so the policy stops offering it) but the kvobj
+    /// is NOT deleted, and the loop asks for the next victim. If no eligible
+    /// TTL-bearing key remains, the policy eventually returns `None` (its queues
+    /// drain of offerable victims) and the loop stops, leaving the over-budget write
+    /// to be rejected `-OOM` (matching Redis volatile-* with no expirable keys).
+    ///
+    /// `now` is consulted only to skip an ALREADY-expired victim (it will be reaped
+    /// lazily anyway). The iteration cap keeps the loop bounded by construction.
+    fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
+        let volatile_only = self.eviction.volatile_only();
+        let mut evicted: u64 = 0;
+        // A generous bound: at most a couple of touches per current entry, plus a
+        // margin, so a volatile skip-scan over an all-non-TTL keyspace still ends.
+        let max_rounds = self.len().saturating_mul(2).saturating_add(16);
+        let mut rounds = 0usize;
+        // Strict `>`: free down to `used <= budget`, matching Redis getMaxmemoryState
+        // (under-limit at `used <= maxmemory`). At used==budget the loop does not run.
+        while self.used_memory() > budget_bytes {
+            if rounds >= max_rounds {
+                break;
+            }
+            rounds += 1;
+            let Some((db, key)) = self.eviction.select_victim() else {
+                break;
+            };
+            let db_idx = self.db_index(db);
+            // Inspect the candidate (immutable borrow), extract the state, then drop
+            // the borrow before any mutating call (the hooks borrow self mut).
+            let (present, is_expired, lacks_ttl) = match self.dbs[db_idx].get(&*key) {
+                Some(obj) => (true, obj.is_expired(now), obj.expire_at.is_none()),
+                None => (false, false, true),
+            };
+            // A STALE victim (the policy offered a key the store no longer holds, e.g.
+            // a Random roster entry the store did not actually delete on a prior skip):
+            // prune it from the policy so it is not re-offered, then ask for the next.
+            if !present {
+                self.eviction.on_remove(db, &key, 0);
+                continue;
+            }
+            // An already-expired victim is reaped by the lazy backstop rather than
+            // counted as an eviction (it would have read as absent anyway); this also
+            // drops it from the policy queue via expire_if_due's on_remove.
+            if is_expired {
+                self.expire_if_due(db, db_idx, &key, now);
+                continue;
+            }
+            if volatile_only && lacks_ttl {
+                // Only TTL-bearing keys are eligible. A non-TTL victim is dropped from
+                // the policy queue (so it is not re-offered) but NOT deleted.
+                //
+                // INVARIANT (volatile-* re-eligibility; a PR-3b PREREQUISITE).
+                // `select_victim` already pop_front'd this key from the policy's queue,
+                // and this on_remove makes that drop permanent: under a volatile-*
+                // policy the policy stops TRACKING a non-TTL key here, and ONLY a write
+                // (`on_insert`) re-tracks it. This is correct for PR-3a because EVERY
+                // 3a TTL is set at WRITE time (the upsert/rmw funnel re-inserts and so
+                // re-tracks the key with its new TTL). But PR-3b's EXPIRE attaches a
+                // TTL to an EXISTING key WITHOUT rewriting it, so EXPIRE MUST call back
+                // into the policy to re-register the key; otherwise a key dropped here
+                // while non-TTL would never become an eviction candidate again even
+                // after it gains a TTL, and a volatile-* policy would UNDER-EVICT
+                // (silently retain expirable keys it should be able to free). Tracked
+                // as a 3b prerequisite (see s3fifo::select_victim and the 3b EXPIRE
+                // task). NO behavior change in 3a.
+                self.eviction.on_remove(db, &key, 0);
+                continue;
+            }
+            if self.remove_object(db, db_idx, &key) {
+                evicted += 1;
+            }
+            // If the victim was already gone (a stale queue entry), the loop simply
+            // asks for the next victim; it does not count as an eviction.
+        }
+        evicted
     }
 }
 

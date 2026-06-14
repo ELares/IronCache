@@ -343,6 +343,23 @@ impl ErrorReply {
     pub fn command_no_key_args() -> Self {
         ErrorReply::new(ErrorCode::Err, "The command has no key arguments")
     }
+
+    /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
+    /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
+    /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free
+    /// enough, and always in strict datastore mode (`noeviction`) at capacity.
+    ///
+    /// Verified against redis/redis `src/server.c` `OOM_COMMAND_NOT_ALLOWED`:
+    /// `"-OOM command not allowed when used memory > 'maxmemory'.\r\n"` (leading OOM
+    /// token, single-quoted `maxmemory`, trailing period). Clients pattern-match the
+    /// OOM token, so the spelling is part of the contract.
+    #[must_use]
+    pub fn oom() -> Self {
+        ErrorReply::new(
+            ErrorCode::Oom,
+            "command not allowed when used memory > 'maxmemory'.",
+        )
+    }
 }
 
 /// Truncate a `&str` to at most `max` bytes without splitting a UTF-8 char (so
@@ -453,6 +470,18 @@ mod tests {
             ErrorReply::protocol("invalid multibulk length").line(),
             "-ERR Protocol error: invalid multibulk length"
         );
+    }
+
+    #[test]
+    fn oom_is_byte_exact() {
+        // Byte-exact to redis/redis src/server.c OOM_COMMAND_NOT_ALLOWED. The encoder
+        // appends the trailing CRLF, so `line()` is the reply without it.
+        assert_eq!(
+            ErrorReply::oom().line(),
+            "-OOM command not allowed when used memory > 'maxmemory'."
+        );
+        assert_eq!(ErrorReply::oom().code(), ErrorCode::Oom);
+        assert_eq!(ErrorCode::Oom.token(), "OOM");
     }
 
     #[test]

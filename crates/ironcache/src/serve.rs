@@ -10,7 +10,8 @@
 //! and writes the encoded reply.
 
 use ironcache_config::Config;
-use ironcache_env::{Clock, SystemEnv};
+use ironcache_env::{Clock, Env, Rng, SystemEnv};
+use ironcache_eviction::{Policy, map_policy_name};
 use ironcache_observe::{CounterSnapshot, MemoryInfo, ServerInfo, ShardCounters};
 use ironcache_runtime::bootstrap::{ShardConfig, ShardId, ShardSet};
 use ironcache_runtime::{Runtime, TokioRuntime};
@@ -18,6 +19,7 @@ use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
     ConnState, DecodeOutcome, Limits, ProtoVersion, Request, UnixMillis, decode, dispatch,
 };
+use ironcache_storage::CountingAccounting;
 use ironcache_store::{ShardStore, process_memory};
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -34,6 +36,11 @@ use std::sync::atomic::Ordering;
 pub const GLOBAL_ALLOCATOR_NAME: &str = "jemalloc";
 #[cfg(target_env = "msvc")]
 pub const GLOBAL_ALLOCATOR_NAME: &str = "libc";
+
+/// The concrete per-shard store the binary wires: the `ShardStore` over the
+/// configured eviction [`Policy`] and the logical-byte accounting hook. The generic
+/// dispatch runs against this through the `Store` + `Admit` waist traits.
+type ShardStoreImpl = ShardStore<Policy, CountingAccounting>;
 
 /// Per-shard, core-local mutable state. Single-threaded access on the shard's
 /// thread (no `Send`/`Sync` needed, no locks; shared-nothing ADR-0002).
@@ -52,12 +59,28 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
         bind,
     };
 
+    // The eviction policy NAME is leaked to a 'static str so INFO/ServerInfo can hold
+    // it cheaply for the process lifetime (it never changes in 3a; the CONFIG SET
+    // runtime switch is 3c). One small leak at boot, not per request.
+    let policy_name: &'static str = Box::leak(config.maxmemory_policy.clone().into_boxed_str());
+
+    // The PER-SHARD byte budget: the maxmemory ceiling split evenly across shards
+    // (shared-nothing, ADR-0002). 0 when maxmemory is 0 (unlimited). Computed ONCE
+    // here, carried in the context.
+    let per_shard_budget = if config.maxmemory == 0 {
+        0
+    } else {
+        (config.maxmemory / config.shards.max(1) as u64).max(1)
+    };
+
     // Static, cheaply-cloned server context shared by value onto each shard. It is
     // immutable, so cloning it per shard does not violate shared-nothing (no
     // mutable cross-core state).
     let ctx_template = ServerContext {
         requirepass: config.requirepass.clone(),
         databases: config.databases,
+        maxmemory: config.maxmemory,
+        per_shard_budget,
         info: ServerInfo {
             tcp_port: config.port,
             shards: config.shards,
@@ -66,6 +89,7 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
             // uptime is measured from when the shard's Env started.
             started_at: ironcache_env::Monotonic::ZERO,
             maxmemory: config.maxmemory,
+            maxmemory_policy: policy_name,
             mem_allocator: GLOBAL_ALLOCATOR_NAME,
         },
     };
@@ -90,11 +114,12 @@ thread_local! {
     // The shard's core-local state. Created lazily on first use on each shard
     // thread; never shared across threads.
     static SHARD: RefCell<Option<Rc<RefCell<ShardState>>>> = const { RefCell::new(None) };
-    // The shard's per-shard store: the per-DB hashbrown kvobj map (ADR-0005). Held
-    // as Rc<RefCell<..>> exactly like ENV, so it is core-local and unsynchronized;
-    // created lazily per shard thread. The concrete ShardStore implements the
-    // ironcache-storage::Store waist the generic dispatch runs against.
-    static STORE: RefCell<Option<Rc<RefCell<ShardStore>>>> = const { RefCell::new(None) };
+    // The shard's per-shard store: the per-DB hashbrown kvobj map (ADR-0005) wired
+    // with the configured eviction policy. Held as Rc<RefCell<..>> exactly like ENV,
+    // so it is core-local and unsynchronized; created lazily per shard thread. The
+    // concrete ShardStore implements the Store + Admit waist traits the generic
+    // dispatch runs against.
+    static STORE: RefCell<Option<Rc<RefCell<ShardStoreImpl>>>> = const { RefCell::new(None) };
     // One SystemEnv per shard thread (the sanctioned real-time boundary). It is
     // wrapped in a RefCell so the determinism seam's RNG half is REACHABLE: the
     // shard is single-threaded (current-thread runtime, !Send tasks), so clock
@@ -119,11 +144,19 @@ fn shard_state() -> Rc<RefCell<ShardState>> {
     })
 }
 
-fn shard_store(databases: u32) -> Rc<RefCell<ShardStore>> {
+fn shard_store(databases: u32, policy_name: &str) -> Rc<RefCell<ShardStoreImpl>> {
     STORE.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.is_none() {
-            *b = Some(Rc::new(RefCell::new(ShardStore::new(databases))));
+            // Build the shard's eviction policy from the configured name, seeding the
+            // Random variant from THIS shard's Env RNG (ADR-0003: no std rand; the
+            // seed comes through the determinism seam). The name was validated at
+            // config time, so map_policy_name cannot return None here; fall back to
+            // the cache default defensively if a future un-validated path slips in.
+            let seed = shard_env().borrow_mut().rng().next_u64();
+            let policy = map_policy_name(policy_name, seed).unwrap_or_else(Policy::cache_default);
+            let store = ShardStore::with_hooks(databases, policy, CountingAccounting::new());
+            *b = Some(Rc::new(RefCell::new(store)));
         }
         Rc::clone(b.as_ref().unwrap())
     })
@@ -158,7 +191,7 @@ async fn serve_connection(
 ) {
     let env = shard_env();
     let state_rc = shard_state();
-    let store_rc = shard_store(ctx.databases);
+    let store_rc = shard_store(ctx.databases, ctx.info.maxmemory_policy);
     // Correct the context's started_at to this shard's boot instant.
     ctx.info.started_at = shard_started_at();
 
@@ -247,7 +280,7 @@ fn handle_request(
     ctx: &ServerContext,
     conn: &mut ConnState,
     env: &Rc<RefCell<SystemEnv>>,
-    store_rc: &Rc<RefCell<ShardStore>>,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
     state_rc: &Rc<RefCell<ShardState>>,
     request: &Request,
     out: &mut Vec<u8>,
@@ -276,17 +309,30 @@ fn handle_request(
     } else {
         MemoryInfo::default()
     };
-    let mut store = store_rc.borrow_mut();
-    let reply = dispatch(
-        ctx,
-        conn,
-        &*env.borrow(),
-        &mut *store,
-        now,
-        rollup,
-        mem,
-        request,
-    );
+    let mut evicted = 0u64;
+    let reply = {
+        let mut store = store_rc.borrow_mut();
+        dispatch(
+            ctx,
+            conn,
+            &*env.borrow(),
+            &mut *store,
+            now,
+            rollup,
+            mem,
+            &mut evicted,
+            request,
+        )
+        // The store borrow ends here, BEFORE the counter bump below borrows
+        // `state_rc` mutably (the rollup closure captured `state_rc` too, so the two
+        // borrows must not overlap; they do not, the dispatch call has returned).
+    };
+    // Roll the maxmemory eviction count (if any) into the shard's evicted_keys counter
+    // for INFO (PR-3a). Zero on every non-evicting command, so this is a cheap no-op
+    // on the hot path.
+    if evicted > 0 {
+        state_rc.borrow_mut().counters.on_evicted(evicted);
+    }
     encode_into(out, &reply, conn.proto);
     conn.should_close
 }

@@ -28,6 +28,10 @@ ironcache-observe = { workspace = true }
 # depends only on the waist; the binary is where the concrete impl is wired in.
 ironcache-storage = { workspace = true }
 ironcache-store = { workspace = true }
+# The concrete eviction policy: the binary constructs the configured `Policy`
+# (S3-FIFO/Random/NoEviction via map_policy_name) and wires it into the per-shard
+# store as the E hook. The library names only the EvictionPolicy/Admit traits.
+ironcache-eviction = { workspace = true }
 ironcache-server = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

@@ -7,11 +7,13 @@
 //! socket, which is the integration coverage the PR-1 gate asks for.
 
 use ironcache_env::{Clock, SystemEnv};
+use ironcache_eviction::Policy;
 use ironcache_observe::{CounterSnapshot, MemoryInfo, ServerInfo};
 use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, decode, encode_to_vec};
 use ironcache_runtime::tokio_rt::bind_reuseport;
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{ConnState, UnixMillis, dispatch};
+use ironcache_storage::CountingAccounting;
 use ironcache_store::{ShardStore, process_memory};
 use std::cell::RefCell;
 
@@ -25,12 +27,15 @@ fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
     ServerContext {
         requirepass: pass.map(str::to_owned),
         databases: 16,
+        maxmemory: 0,
+        per_shard_budget: 0,
         info: ServerInfo {
             tcp_port: port,
             shards: 1,
             pid: std::process::id(),
             started_at: ironcache_env::Monotonic::ZERO,
             maxmemory: 0,
+            maxmemory_policy: "allkeys-lru",
             mem_allocator: "jemalloc",
         },
     }
@@ -42,8 +47,13 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let env = SystemEnv::new();
     // A real per-connection store for the test server, constructed exactly as the
-    // binary's per-shard store is (the concrete ShardStore over the waist).
-    let mut store = ShardStore::new(ctx.databases);
+    // binary's per-shard store is (the concrete ShardStore over the waist, wired with
+    // the cache-mode eviction policy so it satisfies the Admit bound dispatch needs).
+    let mut store = ShardStore::with_hooks(
+        ctx.databases,
+        Policy::cache_default(),
+        CountingAccounting::new(),
+    );
     let counters = RefCell::new(CounterSnapshot::default());
     let mut conn = ConnState::new(
         1,
@@ -73,8 +83,17 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
                     } else {
                         MemoryInfo::default()
                     };
+                    let mut evicted = 0u64;
                     let reply = dispatch(
-                        &ctx, &mut conn, &env, &mut store, now, &rollup, mem, &request,
+                        &ctx,
+                        &mut conn,
+                        &env,
+                        &mut store,
+                        now,
+                        &rollup,
+                        mem,
+                        &mut evicted,
+                        &request,
                     );
                     let bytes = encode_to_vec(&reply, conn.proto);
                     if stream.write_all(&bytes).await.is_err() {
