@@ -7760,3 +7760,174 @@ claims:
       releases page pins latest stable as 0.12 released 15 Jan 2025; the WebFetch model misparsed the
       ''21:48'' timestamp as year 2021, but the releases listing shows ''15 Jan'' and Fedora 40 shipped
       minisign-0.12 in 2025, confirming 2025-01-15. Tool and version pinned: minisign 0.12 from github.com/jedisct1/minisign.'
+- id: systemd-nonewprivileges-blocks-execve-priv-gain
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd.exec(5), latest (man7.org/Arch mirror, 2026)
+  claim: systemd's NoNewPrivileges= directive, when set to true, ensures the service process and all its
+    children can never gain new privileges through execve() (e.g. via setuid/setgid bits or filesystem
+    capabilities); its default is false.
+  value: NoNewPrivileges=true blocks privilege gain via execve(); default false
+  source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Quoted directly from the upstream systemd.exec(5) man page text via man7.org and
+    Arch mirrors; this is the canonical normative spec.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+    note: 'Man page: ''If true, ensures that the service process and all its children can never gain new
+      privileges through execve()''. Default false. Confirmed via man7.org systemd.exec(5).'
+- id: systemd-protectsystem-strict-readonly-fs
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd.exec(5), latest (man7.org/Debian/Arch mirror, 2026)
+  claim: systemd's ProtectSystem= directive takes a boolean or the special values 'full' or 'strict';
+    with 'strict' the entire file system hierarchy is mounted read-only for the unit except the API file
+    system subtrees /dev/, /proc/ and /sys/. The default is off, and the setting is implied when DynamicUser=
+    is enabled.
+  value: ProtectSystem=strict mounts whole FS read-only except /dev,/proc,/sys; default off (implied by
+    DynamicUser)
+  source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Quoted from upstream systemd.exec(5) man page; the 'strict' semantics and the DynamicUser
+    implication are stated verbatim in the canonical spec.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+    note: 'Man page: with ''strict'' the ''entire file system hierarchy is mounted read-only, except for
+      the API file system subtrees /dev/, /proc/ and /sys/''. Default off; implied when DynamicUser is
+      enabled.'
+- id: systemd-protecthome-inaccessible-home-root-runuser
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd.exec(5), latest (man7.org mirror, 2026)
+  claim: systemd's ProtectHome= directive takes a boolean or the special values 'read-only' or 'tmpfs';
+    when true it makes the directories /home/, /root and /run/user inaccessible and empty to the unit.
+    The default is off (and it is implied when DynamicUser= is set).
+  value: ProtectHome=true makes /home,/root,/run/user inaccessible+empty; default off
+  source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Quoted from upstream systemd.exec(5) man page; the directory list and the read-only/tmpfs
+    variants are stated in the canonical spec.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+    note: 'Man page: ''If true, the directories /home/, /root, and /run/user are made inaccessible and
+      empty''; special values ''read-only'' and ''tmpfs''. Default off; implied if DynamicUser is set.'
+- id: systemd-privatetmp-namespaced-tmp
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd.exec(5), latest (Arch mirror, 2026)
+  claim: systemd's PrivateTmp= directive (boolean, or 'disconnected') sets up a new file system namespace
+    for the executed processes so that /tmp/ and /var/tmp/ are not shared with processes outside the namespace,
+    and all temporary files the service creates in these directories are removed after the service is
+    stopped; it defaults to false (with 'disconnected' implied when DynamicUser= is enabled).
+  value: PrivateTmp=true namespaces /tmp and /var/tmp, cleaned up on stop; default false
+  source_url: https://man.archlinux.org/man/systemd.exec.5.en
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Quoted from the upstream systemd.exec(5) man page (Arch mirror, which tracks current
+    systemd); description and default stated verbatim.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://man.archlinux.org/man/systemd.exec.5.en
+    note: 'Man page: ''a new file system namespace will be set up ... /tmp/ and /var/tmp/ directories
+      inside it are not shared with processes outside ... all temporary files created by a service in
+      these directories will be removed after the service is stopped.'' Defaults to false; ''disconnected''
+      implied under DynamicUser.'
+- id: systemd-dynamicuser-transient-uid-gid
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd.exec(5), latest (man7.org mirror, 2026)
+  claim: systemd's DynamicUser= directive, when set, allocates a UNIX user and group pair dynamically
+    when the unit is started and releases it as soon as the unit is stopped; it defaults to off and implies
+    several other hardening settings including NoNewPrivileges, RestrictSUIDSGID, RemoveIPC, and ProtectSystem=strict.
+  value: DynamicUser=yes allocates transient uid/gid at start, frees at stop; default off; implies NoNewPrivileges/ProtectSystem=strict
+  source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Quoted from upstream systemd.exec(5) man page; the transient allocation behavior
+    and the implied-settings list are stated in the canonical spec.
+  load_bearing: false
+  verification:
+    verdict: confirmed
+    best_source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+    note: 'Man page: ''If set, a UNIX user and group pair is allocated dynamically when the unit is started,
+      and released as soon as it is stopped.'' Default off; implies RemoveIPC, RestrictSUIDSGID, NoNewPrivileges,
+      ProtectSystem=strict.'
+- id: systemd-restrictaddressfamilies-limits-sockets
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd.exec(5), latest (Debian bookworm mirror, 2026)
+  claim: systemd's RestrictAddressFamilies= directive restricts the set of socket address families (e.g.
+    AF_INET, AF_INET6, AF_UNIX) accessible to the processes of the unit; by default no restrictions apply
+    and all address families are accessible, and assigning the empty string undoes any previous address-family
+    restriction changes.
+  value: 'RestrictAddressFamilies= limits accessible socket families; default: all accessible; empty string
+    resets restrictions'
+  source_url: https://manpages.debian.org/bookworm/systemd/systemd.exec.5.en.html
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Quoted verbatim from the upstream systemd.exec(5) man page (Debian bookworm mirror);
+    description, default, and empty-string semantics stated in the canonical spec.
+  load_bearing: false
+  verification:
+    verdict: confirmed
+    best_source_url: https://manpages.debian.org/bookworm/systemd/systemd.exec.5.en.html
+    note: 'Man page: ''Restricts the set of socket address families accessible to the processes of this
+      unit.'' ''By default, no restrictions apply, all address families are accessible to processes.''
+      Empty string undoes previous restriction changes.'
+- id: systemd-memorydenywriteexecute-blocks-w-x-mappings
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd.exec(5), latest (upstream/Linux Audit reference, 2026)
+  claim: 'systemd''s MemoryDenyWriteExecute= directive, when set, installs a system call filter that prevents
+    creating memory mappings that are simultaneously writable and executable, changing existing mappings
+    to executable, or mapping shared memory executable; specifically it rejects mmap with both PROT_EXEC
+    and PROT_WRITE, mprotect/pkey_mprotect with PROT_EXEC, and shmat with SHM_EXEC (note: memfd_create()+mmap()
+    can still circumvent it unless additionally blocked).'
+  value: MemoryDenyWriteExecute=yes blocks W+X mmap, PROT_EXEC mprotect, SHM_EXEC shmat via seccomp; default
+    off
+  source_url: https://linux-audit.com/systemd/settings/units/memorydenywriteexecute/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: 'Behavior (mmap PROT_EXEC|PROT_WRITE, mprotect/pkey_mprotect PROT_EXEC, shmat SHM_EXEC)
+    matches the upstream systemd.exec(5) wording; the memfd_create gap is documented upstream (systemd
+    issue #11473). freedesktop.org returned HTTP 403 so the man7/Linux-Audit reflections of the upstream
+    text were used.'
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://linux-audit.com/systemd/settings/units/memorydenywriteexecute/
+    note: 'Upstream-derived: filter rejects mmap with PROT_EXEC|PROT_WRITE, mprotect/pkey_mprotect with
+      PROT_EXEC, shmat with SHM_EXEC. Known gap: memfd_create()+mmap() can circumvent (systemd GitHub
+      issue #11473). Default off.'
+- id: systemd-capabilityboundingset-limits-caps
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd.exec(5), latest (man7.org mirror, 2026)
+  claim: systemd's CapabilityBoundingSet= directive controls which Linux capabilities are included in
+    the capability bounding set for the executed process (taking whitespace-separated capability names,
+    with a leading '~' inverting the selection); by default no capability bounding restrictions are applied
+    on process execution.
+  value: 'CapabilityBoundingSet= restricts the process capability bounding set; ''~'' inverts; default:
+    no limits'
+  source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Quoted from upstream systemd.exec(5) man page; the bounding-set semantics and '~'
+    inversion are stated in the canonical spec.
+  load_bearing: false
+  verification:
+    verdict: confirmed
+    best_source_url: https://man7.org/linux/man-pages/man5/systemd.exec.5.html
+    note: 'Man page: ''Controls which capabilities to include in the capability bounding set for the executed
+      process.'' Whitespace-separated names; ''~'' inverts selection; by default not modified on execution
+      (no limits).'
