@@ -16,3 +16,6 @@ workspace = true
 [dependencies]
 bytes = { workspace = true }
 memchr = { workspace = true }
+# Shortest round-trip f64 digit extraction. We post-process ryu's output into
+# Redis/fpconv's exact spelling (no-decimal integrals, `e+NN`/`e-N` exponents).
+ryu = { workspace = true }

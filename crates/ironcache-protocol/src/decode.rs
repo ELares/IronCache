@@ -74,6 +74,21 @@ pub enum DecodeOutcome {
     Error(ErrorReply),
 }
 
+/// What a single frame parse produced relative to a local cursor: either a real
+/// request (with the bytes it consumed), a no-op frame that was skipped (consume
+/// and continue), not enough bytes yet, or a protocol error.
+enum FrameStep {
+    /// A dispatchable request consuming `consumed` bytes from the cursor.
+    Request { request: Request, consumed: usize },
+    /// A no-op frame (empty/null multibulk, blank inline line, attribute) that
+    /// consumed `consumed` bytes and carries nothing to dispatch.
+    Skip { consumed: usize },
+    /// Not enough bytes for this frame yet.
+    Incomplete,
+    /// A protocol error.
+    Error(ErrorReply),
+}
+
 /// Decode at most one request from `input` using `limits`.
 ///
 /// `input` is the connection's read buffer (a borrow; nothing is mutated). On
@@ -81,33 +96,44 @@ pub enum DecodeOutcome {
 /// are copied into owned [`Bytes`]; PR-1 favors simplicity over the eventual
 /// zero-copy borrow (PROTOCOL.md notes zero-copy is an optimization behind this
 /// same interface).
+///
+/// No-op frames (empty/null multibulk `*0`/`*-1`, blank inline lines, and
+/// tolerated RESP3 attribute frames `|n...`) are skipped ITERATIVELY by advancing
+/// a local cursor, not by recursing. This keeps stack usage O(1) regardless of how
+/// many leading no-op frames a peer sends, so a flood of `*0\r\n` cannot overflow
+/// the stack and abort the shard (hardening, #138).
 #[must_use]
 pub fn decode(input: &[u8], limits: &Limits) -> DecodeOutcome {
-    if input.is_empty() {
-        return DecodeOutcome::Incomplete;
-    }
-    match input[0] {
-        b'*' => decode_multibulk(input, limits),
-        // RESP3 attribute frames on input are tolerated: parse and skip, then
-        // decode whatever follows (PROTOCOL.md).
-        b'|' => decode_and_skip_attribute(input, limits),
-        // Anything else is an inline command line.
-        _ => decode_inline(input, limits),
-    }
-}
-
-/// Add `prefix` consumed bytes to a sub-decode outcome. Used where a leading
-/// no-op frame (empty multibulk, blank inline line, attribute) was skipped and we
-/// recursed to decode what follows: the outer consumed count must include the
-/// skipped prefix.
-fn with_consumed_prefix(prefix: usize, outcome: DecodeOutcome) -> DecodeOutcome {
-    match outcome {
-        DecodeOutcome::Complete { request, consumed } => DecodeOutcome::Complete {
-            request,
-            consumed: prefix + consumed,
-        },
-        DecodeOutcome::Incomplete => DecodeOutcome::Incomplete,
-        DecodeOutcome::Error(e) => DecodeOutcome::Error(e),
+    let mut cursor = 0usize;
+    loop {
+        let rest = &input[cursor..];
+        if rest.is_empty() {
+            return DecodeOutcome::Incomplete;
+        }
+        let step = match rest[0] {
+            b'*' => decode_multibulk(rest, limits),
+            // RESP3 attribute frames on input are tolerated: parse and skip.
+            b'|' => decode_and_skip_attribute(rest, limits),
+            // Anything else is an inline command line.
+            _ => decode_inline(rest, limits),
+        };
+        match step {
+            FrameStep::Request { request, consumed } => {
+                return DecodeOutcome::Complete {
+                    request,
+                    consumed: cursor + consumed,
+                };
+            }
+            FrameStep::Skip { consumed } => {
+                // Advance past the no-op frame and parse the next one. The cursor
+                // strictly advances (skipped frames consume at least their CRLF),
+                // so this loop terminates.
+                debug_assert!(consumed > 0, "a skipped frame must consume bytes");
+                cursor += consumed;
+            }
+            FrameStep::Incomplete => return DecodeOutcome::Incomplete,
+            FrameStep::Error(e) => return DecodeOutcome::Error(e),
+        }
     }
 }
 
@@ -154,94 +180,93 @@ fn parse_i64(bytes: &[u8]) -> Option<i64> {
     Some(if neg { -acc } else { acc })
 }
 
-fn decode_multibulk(input: &[u8], limits: &Limits) -> DecodeOutcome {
+fn decode_multibulk(input: &[u8], limits: &Limits) -> FrameStep {
     // Header: *<count>\r\n
     let Some(crlf) = find_crlf(input, 1) else {
-        return DecodeOutcome::Incomplete;
+        return FrameStep::Incomplete;
     };
     let Some(count) = parse_i64(&input[1..crlf]) else {
-        return DecodeOutcome::Error(ErrorReply::protocol("invalid multibulk length"));
+        return FrameStep::Error(ErrorReply::protocol("invalid multibulk length"));
     };
     if count > limits.max_multibulk {
-        return DecodeOutcome::Error(ErrorReply::protocol("invalid multibulk length"));
+        return FrameStep::Error(ErrorReply::protocol("invalid multibulk length"));
     }
     // *0 or *-1: an empty/null multibulk. Redis treats these as a no-op request
-    // (it reads them and waits for the next). We surface an empty request so the
-    // caller can skip; but an empty arg list is invalid for dispatch, so we model
-    // it as "consume and continue" by returning a Complete with a single empty
-    // sentinel would be wrong. Instead we recurse past it.
+    // (it reads them and waits for the next). An empty arg list is invalid for
+    // dispatch, so we report a Skip and the caller advances the cursor past it and
+    // parses the next frame (iteratively, never recursing).
     if count <= 0 {
-        let consumed = crlf + 2;
-        // Nothing meaningful to dispatch; skip and try to parse the next frame.
-        return with_consumed_prefix(consumed, decode(&input[consumed..], limits));
+        return FrameStep::Skip { consumed: crlf + 2 };
     }
 
     let mut pos = crlf + 2;
     let mut args: Vec<Bytes> = Vec::with_capacity(count.min(64) as usize);
     for _ in 0..count {
         if pos >= input.len() {
-            return DecodeOutcome::Incomplete;
+            return FrameStep::Incomplete;
         }
         if input[pos] != b'$' {
-            return DecodeOutcome::Error(ErrorReply::protocol(&format!(
+            return FrameStep::Error(ErrorReply::protocol(&format!(
                 "expected '$', got '{}'",
                 input[pos] as char
             )));
         }
         let Some(len_crlf) = find_crlf(input, pos + 1) else {
-            return DecodeOutcome::Incomplete;
+            return FrameStep::Incomplete;
         };
         let Some(blen) = parse_i64(&input[pos + 1..len_crlf]) else {
-            return DecodeOutcome::Error(ErrorReply::protocol("invalid bulk length"));
+            return FrameStep::Error(ErrorReply::protocol("invalid bulk length"));
         };
         if blen < 0 || blen > limits.max_bulk_len {
-            return DecodeOutcome::Error(ErrorReply::protocol("invalid bulk length"));
+            return FrameStep::Error(ErrorReply::protocol("invalid bulk length"));
         }
         let data_start = len_crlf + 2;
         let blen_usize = blen as usize;
         let data_end = data_start + blen_usize;
         // Need the payload plus its trailing CRLF.
         if data_end + 2 > input.len() {
-            return DecodeOutcome::Incomplete;
+            return FrameStep::Incomplete;
         }
         if input[data_end] != b'\r' || input[data_end + 1] != b'\n' {
-            return DecodeOutcome::Error(ErrorReply::protocol("expected CRLF after bulk payload"));
+            return FrameStep::Error(ErrorReply::protocol("expected CRLF after bulk payload"));
         }
         args.push(Bytes::copy_from_slice(&input[data_start..data_end]));
         pos = data_end + 2;
     }
-    DecodeOutcome::Complete {
+    FrameStep::Request {
         request: Request { args },
         consumed: pos,
     }
 }
 
-fn decode_inline(input: &[u8], limits: &Limits) -> DecodeOutcome {
+fn decode_inline(input: &[u8], limits: &Limits) -> FrameStep {
     let Some(crlf) = find_crlf_or_lf(input) else {
         // No line terminator yet. Guard the inline-length cap so a peer cannot
         // make us buffer unboundedly waiting for a newline.
         if input.len() > limits.max_inline_len {
-            return DecodeOutcome::Error(ErrorReply::protocol("too big inline request"));
+            return FrameStep::Error(ErrorReply::protocol("too big inline request"));
         }
-        return DecodeOutcome::Incomplete;
+        return FrameStep::Incomplete;
     };
     let (line_end, consumed) = crlf;
     if line_end > limits.max_inline_len {
-        return DecodeOutcome::Error(ErrorReply::protocol("too big inline request"));
+        return FrameStep::Error(ErrorReply::protocol("too big inline request"));
     }
     let line = &input[..line_end];
     match split_inline(line) {
         Ok(args) => {
             if args.is_empty() {
-                // A blank line: skip it and parse the next frame.
-                return with_consumed_prefix(consumed, decode(&input[consumed..], limits));
-            }
-            DecodeOutcome::Complete {
-                request: Request { args },
-                consumed,
+                // A blank line: skip it (the caller advances and parses the next
+                // frame). `consumed` includes the terminator, so it is > 0.
+                FrameStep::Skip { consumed }
+            } else {
+                FrameStep::Request {
+                    request: Request { args },
+                    consumed,
+                }
             }
         }
-        Err(e) => DecodeOutcome::Error(e),
+        Err(e) => FrameStep::Error(e),
     }
 }
 
@@ -258,8 +283,10 @@ fn find_crlf_or_lf(input: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// Split an inline command line into arguments, honoring single and double
-/// quotes the way redis-cli's `sdssplitargs` does (enough for handshake and
-/// netcat use). Unbalanced quotes are a protocol error.
+/// quotes. This covers enough of `sdssplitargs` for handshake and netcat probing;
+/// full `sdssplitargs` escape semantics (`\xHH` hex, octal, the `\n\r\t\b\a`
+/// escapes, single-quote `\'`) are out of PR-1 scope. Unbalanced quotes are a
+/// protocol error.
 fn split_inline(line: &[u8]) -> Result<Vec<Bytes>, ErrorReply> {
     let mut args: Vec<Bytes> = Vec::new();
     let mut i = 0;
@@ -347,44 +374,47 @@ fn split_inline(line: &[u8]) -> Result<Vec<Bytes>, ErrorReply> {
 }
 
 /// Parse and skip a single RESP3 attribute frame (`|<n>\r\n` followed by `n`
-/// key/value pairs), then decode whatever follows. IronCache tolerates but does
-/// not act on attributes in v1 (PROTOCOL.md).
-fn decode_and_skip_attribute(input: &[u8], limits: &Limits) -> DecodeOutcome {
+/// key/value pairs). IronCache tolerates but does not act on attributes in v1
+/// (PROTOCOL.md): the frame is reported as a [`FrameStep::Skip`] so the iterative
+/// `decode` loop advances past it and parses whatever follows, without recursion.
+fn decode_and_skip_attribute(input: &[u8], limits: &Limits) -> FrameStep {
     let Some(crlf) = find_crlf(input, 1) else {
-        return DecodeOutcome::Incomplete;
+        return FrameStep::Incomplete;
     };
     let Some(pairs) = parse_i64(&input[1..crlf]) else {
-        return DecodeOutcome::Error(ErrorReply::protocol("invalid attribute length"));
+        return FrameStep::Error(ErrorReply::protocol("invalid attribute length"));
     };
     if pairs < 0 {
-        return DecodeOutcome::Error(ErrorReply::protocol("invalid attribute length"));
+        return FrameStep::Error(ErrorReply::protocol("invalid attribute length"));
     }
     // Skip 2*pairs bulk strings. Attributes are client->server rare; we only need
     // to consume them. Each element here is expected to be a bulk string.
     let mut pos = crlf + 2;
     for _ in 0..(pairs * 2) {
         if pos >= input.len() {
-            return DecodeOutcome::Incomplete;
+            return FrameStep::Incomplete;
         }
         if input[pos] != b'$' {
-            return DecodeOutcome::Error(ErrorReply::protocol("invalid attribute element"));
+            return FrameStep::Error(ErrorReply::protocol("invalid attribute element"));
         }
         let Some(len_crlf) = find_crlf(input, pos + 1) else {
-            return DecodeOutcome::Incomplete;
+            return FrameStep::Incomplete;
         };
         let Some(blen) = parse_i64(&input[pos + 1..len_crlf]) else {
-            return DecodeOutcome::Error(ErrorReply::protocol("invalid bulk length"));
+            return FrameStep::Error(ErrorReply::protocol("invalid bulk length"));
         };
         if blen < 0 || blen > limits.max_bulk_len {
-            return DecodeOutcome::Error(ErrorReply::protocol("invalid bulk length"));
+            return FrameStep::Error(ErrorReply::protocol("invalid bulk length"));
         }
         let data_end = len_crlf + 2 + blen as usize;
         if data_end + 2 > input.len() {
-            return DecodeOutcome::Incomplete;
+            return FrameStep::Incomplete;
         }
         pos = data_end + 2;
     }
-    with_consumed_prefix(pos, decode(&input[pos..], limits))
+    // The header `|n\r\n` is at least 4 bytes, so `pos > 0` and the cursor in
+    // `decode` strictly advances.
+    FrameStep::Skip { consumed: pos }
 }
 
 #[cfg(test)]
@@ -551,5 +581,82 @@ mod tests {
         let buf = b"|1\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*1\r\n$4\r\nPING\r\n";
         let (args, _) = complete(buf);
         assert_eq!(args, vec![b"PING".to_vec()]);
+    }
+
+    // -- Regression: no-op-frame skipping is iterative (O(1) stack), not
+    // recursive. A flood of leading no-op frames must NOT overflow the stack and
+    // abort the process (uncatchable SIGABRT), which would kill the whole shard.
+    // Pre-fix, `decode` recursed once per skipped frame.
+
+    #[test]
+    fn many_empty_multibulk_frames_do_not_overflow_stack() {
+        // ~50k leading `*0\r\n` frames (each a 4-byte no-op), then a real PING.
+        const N: usize = 50_000;
+        let mut buf = Vec::with_capacity(N * 4 + 16);
+        for _ in 0..N {
+            buf.extend_from_slice(b"*0\r\n");
+        }
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        buf.extend_from_slice(ping);
+        let (args, consumed) = complete(&buf);
+        assert_eq!(args, vec![b"PING".to_vec()]);
+        assert_eq!(consumed, N * 4 + ping.len());
+    }
+
+    #[test]
+    fn many_null_multibulk_frames_do_not_overflow_stack() {
+        // `*-1\r\n` is also a no-op multibulk (5 bytes each).
+        const N: usize = 50_000;
+        let mut buf = Vec::with_capacity(N * 5 + 16);
+        for _ in 0..N {
+            buf.extend_from_slice(b"*-1\r\n");
+        }
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        buf.extend_from_slice(ping);
+        let (args, consumed) = complete(&buf);
+        assert_eq!(args, vec![b"PING".to_vec()]);
+        assert_eq!(consumed, N * 5 + ping.len());
+    }
+
+    #[test]
+    fn many_blank_inline_lines_do_not_overflow_stack() {
+        // ~50k blank `\r\n` lines (2 bytes each), then an inline PING.
+        const N: usize = 50_000;
+        let mut buf = Vec::with_capacity(N * 2 + 8);
+        for _ in 0..N {
+            buf.extend_from_slice(b"\r\n");
+        }
+        let ping = b"PING\r\n";
+        buf.extend_from_slice(ping);
+        let (args, consumed) = complete(&buf);
+        assert_eq!(args, vec![b"PING".to_vec()]);
+        assert_eq!(consumed, N * 2 + ping.len());
+    }
+
+    #[test]
+    fn many_attribute_frames_do_not_overflow_stack() {
+        // ~50k attribute frames `|1\r\n$1\r\na\r\n$1\r\nb\r\n` then a PING.
+        const N: usize = 50_000;
+        let attr = b"|1\r\n$1\r\na\r\n$1\r\nb\r\n";
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        let mut buf = Vec::with_capacity(N * attr.len() + ping.len());
+        for _ in 0..N {
+            buf.extend_from_slice(attr);
+        }
+        buf.extend_from_slice(ping);
+        let (args, consumed) = complete(&buf);
+        assert_eq!(args, vec![b"PING".to_vec()]);
+        assert_eq!(consumed, N * attr.len() + ping.len());
+    }
+
+    #[test]
+    fn all_noop_frames_with_no_real_frame_is_incomplete() {
+        // A buffer of only no-op frames yields Incomplete (waiting for a real one),
+        // and still must not recurse/overflow.
+        let mut buf = Vec::new();
+        for _ in 0..10_000 {
+            buf.extend_from_slice(b"*0\r\n");
+        }
+        assert_eq!(decode(&buf, &Limits::default()), DecodeOutcome::Incomplete);
     }
 }

@@ -7,7 +7,9 @@
 //! boolean `#`, big number `(`, verbatim `=`, push `>`, null `_`); under
 //! [`ProtoVersion::Resp2`] each degrades to its RESP2 equivalent:
 //!
-//! - `Null` -> `$-1` (or `*-1` is never produced by us; we use the bulk null).
+//! - Null shaping by source type: a scalar `Value::Null` degrades to `$-1`
+//!   (RESP2) and a `Value::Array(None)` degrades to `*-1` (RESP2); under RESP3
+//!   both render as the single null marker `_`.
 //! - `Double` -> bulk string of the formatted number.
 //! - `Boolean` -> `:1` / `:0`.
 //! - `BigNumber` -> bulk string.
@@ -229,21 +231,153 @@ fn put_double(out: &mut BytesMut, d: f64) {
     out.put_slice(format_double(d).as_bytes());
 }
 
-/// Format a double the way Redis does: `inf`/`-inf`/`nan` specials, otherwise the
-/// shortest round-trip representation.
+/// Format a double the way Redis does (`util.c` `d2string` -> `fpconv_dtoa`):
+/// `inf`/`-inf`/`nan` specials, integral values with NO decimal point (`3`,
+/// `100`), very large/small magnitudes in `e+NN`/`e-N` exponent form (`1e+100`,
+/// `1e-7`), and everything else as the shortest round-trip decimal (`3.5`, `0.1`,
+/// `3.141592653589793`).
+///
+/// We obtain the shortest significant digits from `ryu` and then re-emit them with
+/// fpconv's exact `emit_digits` format-selection rule (the same thresholds Redis
+/// vendors), so the listed handshake/score cases are byte-identical to Redis.
+///
+/// Note on `nan`: Redis rejects NaN scores before reaching the double encoder
+/// (`ZADD`/`INCRBYFLOAT` validate first), so no command path actually emits
+/// `,nan`. The arm exists for spec-completeness only; PR-2/PR-3 command authors
+/// must NOT assume a NaN score round-trips through this encoder.
 fn format_double(d: f64) -> String {
     if d.is_nan() {
-        "nan".to_owned()
-    } else if d.is_infinite() {
-        if d > 0.0 {
+        return "nan".to_owned();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 {
             "inf".to_owned()
         } else {
             "-inf".to_owned()
-        }
-    } else {
-        // Rust's default float formatting is shortest-round-trip.
-        format!("{d}")
+        };
     }
+    if d == 0.0 {
+        // fpconv emits integral zero with no decimal point, sign preserved.
+        return if d.is_sign_negative() {
+            "-0".to_owned()
+        } else {
+            "0".to_owned()
+        };
+    }
+
+    let mut buf = ryu::Buffer::new();
+    let (neg, digits, k) = decompose_ryu(buf.format(d));
+    let body = emit_digits(&digits, k, neg);
+    if neg { format!("-{body}") } else { body }
+}
+
+/// Decompose a finite, non-zero `ryu`-formatted f64 string into `(neg, digits, k)`
+/// where `value == (digits parsed as an integer) * 10^k`, `digits` carries no
+/// leading or trailing zeros. This is exactly fpconv's `(digits, ndigits, K)`
+/// contract, derived from ryu's shortest output.
+fn decompose_ryu(s: &str) -> (bool, String, i32) {
+    let neg = s.starts_with('-');
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let (mantissa, exp): (&str, i32) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse().unwrap_or(0)),
+        None => (s, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    let mut k = exp - i32::try_from(frac_part.len()).unwrap_or(0);
+    // Strip leading zeros (keep at least one digit).
+    let lead_trimmed = digits.trim_start_matches('0');
+    digits = if lead_trimmed.is_empty() {
+        "0".to_owned()
+    } else {
+        lead_trimmed.to_owned()
+    };
+    // Strip trailing zeros, moving the count into K.
+    if digits != "0" {
+        let before = digits.len();
+        let t = digits.trim_end_matches('0');
+        let removed = before - t.len();
+        k += i32::try_from(removed).unwrap_or(0);
+        digits = t.to_owned();
+    }
+    (neg, digits, k)
+}
+
+/// fpconv's `emit_digits`: render the significand `digits` (with base-10 exponent
+/// `k`) into Redis's exact spelling. Ported byte-for-byte from the fpconv copy
+/// Redis vendors (`fpconv_dtoa.c`), including the `max_trailing_zeros` and the
+/// `K < 0 && (K > -7 || exp < 4)` decimal thresholds and the unpadded `e+N`/`e-N`
+/// exponent form. The leading sign is applied by the caller.
+fn emit_digits(digits: &str, k: i32, neg: bool) -> String {
+    let db = digits.as_bytes();
+    let ndigits = i32::try_from(db.len()).unwrap_or(0);
+    let mut exp = (k + ndigits - 1).abs();
+    let max_trailing_zeros = if neg { 6 } else { 7 };
+
+    let mut out = String::new();
+
+    // Plain integer (no decimal point): e.g. 3, 100, 1234567.
+    if k >= 0 && exp < (ndigits + max_trailing_zeros) {
+        out.push_str(digits);
+        for _ in 0..k {
+            out.push('0');
+        }
+        return out;
+    }
+
+    // Decimal without scientific notation: e.g. 3.5, 0.1, 0.0001.
+    if k < 0 && (k > -7 || exp < 4) {
+        let offset = ndigits - k.abs();
+        if offset <= 0 {
+            // value < 1.0 -> 0.00...digits
+            let zeros = (-offset) as usize;
+            out.push('0');
+            out.push('.');
+            for _ in 0..zeros {
+                out.push('0');
+            }
+            out.push_str(digits);
+        } else {
+            // value > 1.0 with a fractional part.
+            let o = offset as usize;
+            out.push_str(&digits[..o]);
+            out.push('.');
+            out.push_str(&digits[o..]);
+        }
+        return out;
+    }
+
+    // Scientific notation: d[.ddd]e±NN, exponent unpadded (1e+100, 1e-7).
+    let nd = (ndigits as usize).min(18 - usize::from(neg));
+    out.push(db[0] as char);
+    if nd > 1 {
+        out.push('.');
+        for &c in &db[1..nd] {
+            out.push(c as char);
+        }
+    }
+    out.push('e');
+    out.push(if k + ndigits - 1 < 0 { '-' } else { '+' });
+    let mut cent = 0;
+    if exp > 99 {
+        cent = exp / 100;
+        out.push((b'0' + u8::try_from(cent).unwrap_or(0)) as char);
+        exp -= cent * 100;
+    }
+    if exp > 9 {
+        let dec = exp / 10;
+        out.push((b'0' + u8::try_from(dec).unwrap_or(0)) as char);
+        exp -= dec * 10;
+    } else if cent != 0 {
+        out.push('0');
+    }
+    out.push((b'0' + u8::try_from(exp % 10).unwrap_or(0)) as char);
+    out
 }
 
 // Minimal integer formatting without pulling the itoa crate (keeps the dep set
@@ -356,6 +490,95 @@ mod tests {
             enc(&Value::Double(3.5), ProtoVersion::Resp2),
             b"$3\r\n3.5\r\n"
         );
+    }
+
+    #[test]
+    fn format_double_matches_fpconv() {
+        // The fpconv/Redis spelling, verified against the vendored fpconv_dtoa:
+        // integral doubles have no decimal point; large/small magnitudes use the
+        // unpadded e+NN / e-N exponent form; otherwise shortest decimal.
+        let cases: &[(f64, &str)] = &[
+            (1e100, "1e+100"),
+            (1e-7, "1e-7"),
+            (3.0, "3"),
+            (100.0, "100"),
+            (3.5, "3.5"),
+            (0.1, "0.1"),
+            (core::f64::consts::PI, "3.141592653589793"),
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (-3.5, "-3.5"),
+            (1e16, "1e+16"),
+            (1e7, "10000000"),
+            (1e8, "1e+8"),
+            (0.000_01, "0.00001"),
+            (0.000_001, "0.000001"),
+            (-1e100, "-1e+100"),
+        ];
+        for &(d, want) in cases {
+            assert_eq!(format_double(d), want, "format_double({d})");
+        }
+    }
+
+    #[test]
+    fn double_differential_resp2_and_resp3_shapes() {
+        // The same fpconv string must appear as a RESP3 `,double` and as the body
+        // of a RESP2 bulk string.
+        let cases: &[(f64, &str)] = &[
+            (1e100, "1e+100"),
+            (1e-7, "1e-7"),
+            (3.0, "3"),
+            (100.0, "100"),
+            (3.5, "3.5"),
+            (0.1, "0.1"),
+            (core::f64::consts::PI, "3.141592653589793"),
+        ];
+        for &(d, s) in cases {
+            // RESP3: ,<s>\r\n
+            let mut want3 = Vec::new();
+            want3.push(b',');
+            want3.extend_from_slice(s.as_bytes());
+            want3.extend_from_slice(b"\r\n");
+            assert_eq!(
+                enc(&Value::Double(d), ProtoVersion::Resp3),
+                want3,
+                "RESP3 {d}"
+            );
+            // RESP2: $<len>\r\n<s>\r\n
+            let want2 = format!("${}\r\n{}\r\n", s.len(), s).into_bytes();
+            assert_eq!(
+                enc(&Value::Double(d), ProtoVersion::Resp2),
+                want2,
+                "RESP2 {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn double_round_trips_through_parse() {
+        // Every formatted double must parse back to the original f64 (shortest
+        // round-trip property), across a spread of magnitudes and signs.
+        let samples: &[f64] = &[
+            0.1,
+            3.5,
+            core::f64::consts::PI,
+            2.5e-8,
+            9.9e22,
+            -1.234_567_89e-15,
+            123_456_789.012_345,
+            f64::MIN_POSITIVE,
+            -f64::MAX,
+            1.0 / 3.0,
+        ];
+        for &d in samples {
+            let s = format_double(d);
+            let back: f64 = s.parse().unwrap();
+            assert_eq!(
+                back.to_bits(),
+                d.to_bits(),
+                "round-trip failed for {d} -> {s}"
+            );
+        }
     }
 
     #[test]

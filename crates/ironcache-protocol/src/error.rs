@@ -40,9 +40,16 @@ pub enum ErrorCode {
     Oom,
     /// Key already exists (e.g. `RESTORE` without `REPLACE`).
     BusyKey,
-    /// Index/offset out of range.
+    /// Reserved/unused: there is NO canonical `-OUTOFRANGE` leading token in
+    /// Redis. Index/offset out-of-range and `SELECT` use the plain `ERR` token
+    /// (`ERR value is not an integer or out of range`, `ERR index out of range`,
+    /// `ERR DB index is out of range`), so this variant has no live constructor.
+    /// It is kept only to avoid churning the freeze-point enum discriminants; do
+    /// not introduce a constructor that emits `-OUTOFRANGE`.
     OutOfRange,
-    /// `UNWATCH`/`DISCARD`-class "no transaction in progress".
+    /// `SCRIPT KILL` / `FUNCTION KILL` with nothing currently running
+    /// (`-NOTBUSY No scripts in execution right now.`). NOT `UNWATCH`/`DISCARD`:
+    /// those reply with the plain `ERR` token, not `NOTBUSY`.
     NotBusy,
 }
 
@@ -111,27 +118,39 @@ impl ErrorReply {
 
     // -- Pinned, handshake-critical and control-flow strings (byte-exact). --
 
-    /// `ERR unknown command '<name>', with args beginning with: <args>`.
+    /// `ERR unknown command '<name>', with args beginning with: '<a>' '<b>' `.
     ///
-    /// Matches Valkey: the command name is single-quoted, then each argument is
-    /// rendered single-quoted and comma-separated with a trailing comma. Clients
-    /// pattern-match the `unknown command` phrase during handshake fallback.
+    /// Byte-exact to Redis `server.c` `unknownCommand`: the command name is
+    /// single-quoted (truncated to 128 bytes), then each argument is rendered
+    /// `'<value>' ` (single quote, value, single quote, trailing SPACE) with NO
+    /// comma separators. Redis accumulates args only while the running
+    /// accumulated-args length stays below a 128-byte budget over the WHOLE args
+    /// string (`while sdslen(args) < 128`), and each appended arg's value is
+    /// itself truncated to the remaining budget; there is no fixed arg-count cap.
+    /// Clients pattern-match the `unknown command` phrase during handshake
+    /// fallback.
     #[must_use]
     pub fn unknown_command(name: &str, args: &[&[u8]]) -> Self {
-        let mut s = String::new();
-        // Redis truncates each arg display to 128 bytes and shows at most 20 args;
-        // we mirror that bound so adversarial input cannot blow up the reply.
+        // Command name truncated to 128 bytes (on a char boundary so the lossy
+        // string stays valid UTF-8).
+        let name_trunc = truncate_str(name, 128);
+
+        // 128-byte budget over the whole accumulated args string, matching Redis's
+        // `while (sdslen(args) < 128)` loop. Each arg is appended as `'<value>' `;
+        // the value is truncated to the budget remaining before this arg.
         let mut shown = String::new();
-        for (i, a) in args.iter().take(20).enumerate() {
-            if i > 0 {
-                shown.push_str(", ");
+        for a in args {
+            if shown.len() >= 128 {
+                break;
             }
-            let text = String::from_utf8_lossy(&a[..a.len().min(128)]);
-            let _ = write!(shown, "'{text}'");
+            let remaining = 128 - shown.len();
+            let text = String::from_utf8_lossy(&a[..a.len().min(remaining)]);
+            let _ = write!(shown, "'{text}' ");
         }
+        let mut s = String::new();
         let _ = write!(
             s,
-            "unknown command '{name}', with args beginning with: {shown}"
+            "unknown command '{name_trunc}', with args beginning with: {shown}"
         );
         ErrorReply::new(ErrorCode::Err, s)
     }
@@ -189,14 +208,15 @@ impl ErrorReply {
         )
     }
 
-    /// `ERR Client sent AUTH, but no password is set. Did you mean AUTH
-    /// <username> <password>?` - the verbatim Redis string for `AUTH` with no
-    /// password configured. Clients fall back on this exact text.
+    /// `ERR AUTH <password> called without any password configured for the
+    /// default user. Are you sure your configuration is correct?` - the current
+    /// canonical Redis string for `AUTH` when no `requirepass`/ACL password is
+    /// configured. Clients fall back on this text.
     #[must_use]
     pub fn auth_no_password_set() -> Self {
         ErrorReply::new(
             ErrorCode::Err,
-            "Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?",
+            "AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?",
         )
     }
 
@@ -230,18 +250,63 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "DB index is out of range")
     }
 
-    /// `ERR <command>|<sub> ... ` style "unknown subcommand" message, the wording
-    /// clients see for an unrecognized `CLIENT`/`COMMAND`/`CONFIG` subcommand.
+    /// `ERR unknown subcommand or wrong number of arguments for '<sub>'. Try
+    /// <PARENT> HELP.` the wording clients see for an unrecognized
+    /// `CLIENT`/`COMMAND`/`CONFIG` subcommand.
+    ///
+    /// Byte-exact to Redis `addReplySubcommandSyntaxError`: the leading word is
+    /// LOWERCASE `unknown`, the subcommand is truncated to 128 bytes (`%.128s`),
+    /// and the parent command name is uppercased.
     #[must_use]
     pub fn unknown_subcommand(parent: &str, sub: &str) -> Self {
+        let sub_trunc = truncate_str(sub, 128);
         ErrorReply::new(
             ErrorCode::Err,
             format!(
-                "Unknown subcommand or wrong number of arguments for '{sub}'. Try {} HELP.",
+                "unknown subcommand or wrong number of arguments for '{sub_trunc}'. Try {} HELP.",
                 parent.to_uppercase()
             ),
         )
     }
+
+    /// `ERR Unknown HELLO option '<opt>'` the syntax error for an unrecognized
+    /// `HELLO` option keyword. Pinned here so the dispatch call site does not
+    /// hand-write the string (ERRORS.md "no call site hand-writes an error").
+    #[must_use]
+    pub fn hello_syntax_error(opt: &str) -> Self {
+        ErrorReply::new(ErrorCode::Err, format!("Unknown HELLO option '{opt}'"))
+    }
+
+    /// `ERR Client names cannot contain spaces, newlines or special characters.`
+    /// for `CLIENT SETNAME` (and `HELLO SETNAME`) with an invalid name.
+    #[must_use]
+    pub fn client_name_invalid_chars() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "Client names cannot contain spaces, newlines or special characters.",
+        )
+    }
+
+    /// `ERR The command has no key arguments` for `COMMAND GETKEYS` against a
+    /// command that takes no keys.
+    #[must_use]
+    pub fn command_no_key_args() -> Self {
+        ErrorReply::new(ErrorCode::Err, "The command has no key arguments")
+    }
+}
+
+/// Truncate a `&str` to at most `max` bytes without splitting a UTF-8 char (so
+/// the result stays valid UTF-8). Used to mirror Redis's `%.128s` byte caps on
+/// command/subcommand display names.
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]
@@ -272,18 +337,21 @@ mod tests {
         );
         assert_eq!(
             ErrorReply::auth_no_password_set().line(),
-            "-ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?"
+            "-ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"
         );
     }
 
     #[test]
     fn unknown_command_renders_name_and_args() {
-        let e = ErrorReply::unknown_command("FOO", &[b"a", b"b"]);
+        // Canonical Redis shape: space-separated single-quoted args, trailing
+        // space, no commas. For `foo` with args `a b`:
+        //   ERR unknown command 'foo', with args beginning with: 'a' 'b'
+        let e = ErrorReply::unknown_command("foo", &[b"a", b"b"]);
         assert_eq!(
             e.line(),
-            "-ERR unknown command 'FOO', with args beginning with: 'a', 'b'"
+            "-ERR unknown command 'foo', with args beginning with: 'a' 'b' "
         );
-        // No-arg form.
+        // No-arg form: the phrase is present with no args after it.
         let e0 = ErrorReply::unknown_command("BAR", &[]);
         assert_eq!(
             e0.line(),
@@ -292,11 +360,31 @@ mod tests {
     }
 
     #[test]
-    fn unknown_command_caps_arg_count() {
-        let many: Vec<&[u8]> = (0..40).map(|_| b"x".as_slice()).collect();
+    fn unknown_command_args_respect_128_byte_budget() {
+        // Many small args: accumulation stops once the args string reaches the
+        // 128-byte budget, with no fixed 20-arg cap. Each arg renders `'x' ` (4
+        // bytes), so we expect floor(128/4) = 32 args shown.
+        let many: Vec<&[u8]> = (0..200).map(|_| b"x".as_slice()).collect();
         let e = ErrorReply::unknown_command("Z", &many);
-        // 20 shown args -> 19 separators -> 20 quoted 'x'.
-        assert_eq!(e.message().matches("'x'").count(), 20);
+        assert_eq!(e.message().matches("'x'").count(), 32);
+    }
+
+    #[test]
+    fn unknown_command_truncates_long_arg_to_remaining_budget() {
+        // A single huge arg is truncated to the 128-byte budget.
+        let big = vec![b'y'; 1000];
+        let e = ErrorReply::unknown_command("Z", &[big.as_slice()]);
+        // The accumulated args string holds at most the budget plus the quoting.
+        assert_eq!(e.message().matches('y').count(), 128);
+    }
+
+    #[test]
+    fn unknown_subcommand_is_lowercase_and_uppercases_parent() {
+        let e = ErrorReply::unknown_subcommand("client", "BOGUS");
+        assert_eq!(
+            e.line(),
+            "-ERR unknown subcommand or wrong number of arguments for 'BOGUS'. Try CLIENT HELP."
+        );
     }
 
     #[test]
