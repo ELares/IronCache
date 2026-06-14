@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-protocol"
+description = "RESP2/RESP3 codec and the canonical Redis-compatible error catalog (PROTOCOL.md, ERRORS.md, ADR-0019)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+memchr = { workspace = true }

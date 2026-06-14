@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-server"
+description = "Per-connection state machine and Tier-0 command dispatch (COMMANDS.md, CONNECTION_LIFECYCLE.md, PROTOCOL.md)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ironcache-env = { workspace = true }
+ironcache-protocol = { workspace = true }
+ironcache-observe = { workspace = true }
+ironcache-config = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+ironcache-runtime = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }

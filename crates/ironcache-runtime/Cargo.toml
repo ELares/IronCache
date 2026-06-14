@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-runtime"
+description = "Swappable Runtime trait seam (RUNTIME_ABSTRACTION.md) and a shared-nothing tokio current-thread, per-core-pinned bootstrap (ADR-0002)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Exactly one backend is active per build (RUNTIME_ABSTRACTION.md). tokio+epoll
+# is the default and the only backend PR-1 ships; monoio/glommio are future
+# feature gates the seam is shaped for.
+default = ["tokio"]
+tokio = ["dep:tokio", "dep:socket2"]
+
+[dependencies]
+ironcache-env = { workspace = true }
+tokio = { workspace = true, optional = true, features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "sync",
+] }
+socket2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }

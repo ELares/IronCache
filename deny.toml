@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# cargo-deny policy (supply-chain gate, SUPPLY_CHAIN.md / #144). Licenses are an
+# allowlist matching the dual-licensed posture; advisories warn (they are a
+# release gate, not a per-commit blocker in PR-1); sources restrict to crates.io.
+
+[graph]
+all-features = true
+
+[licenses]
+# Allowlist only. Anything outside this set fails the licenses check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+confidence-threshold = 0.9
+
+[advisories]
+# Warn in PR-1; the release pipeline (release.yml) tightens this to deny.
+version = 2
+yanked = "warn"
+
+[bans]
+multiple-versions = "warn"
+# Deny wildcard versions on external crates, but allow them on internal workspace
+# path dependencies (the `ironcache-*` crates use `{ path = ... }` with no version,
+# which is normal for an unpublished workspace, not a real wildcard risk).
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

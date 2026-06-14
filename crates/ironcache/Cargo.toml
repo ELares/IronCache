@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache"
+description = "IronCache: the most efficient Redis-compatible cache, in one static Rust binary. (server | cli | bench | check | config | upgrade)"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "ironcache"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ironcache-env = { workspace = true }
+ironcache-protocol = { workspace = true }
+ironcache-runtime = { workspace = true }
+ironcache-config = { workspace = true }
+ironcache-observe = { workspace = true }
+ironcache-server = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync", "signal"] }
+libc = { workspace = true }
+
+# jemalloc is the default allocator (ADR-0006). Not available on MSVC Windows;
+# gate it so the workspace still builds there (the static release targets are
+# musl/macos, where it is available).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
