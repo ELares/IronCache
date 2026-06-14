@@ -27,24 +27,29 @@ AUTH credential model (#104, runs inside the TLS session) and the full ACL engin
   so TLS adds no C dependency, no sidecar, and no extra process. rustls is
   safe-by-default: it excludes SSLv3/TLS1.0/TLS1.1 by construction
   [rustls-pure-rust-tls12-tls13], so the version floor is TLS 1.2 and the cipher
-  suites are rustls's vetted defaults rather than an operator-tuned list.
+  suites are rustls's vetted defaults rather than an operator-tuned list. TLS wraps
+  the transport only: the RESP observable contract is unchanged (ADR-0009
+  behavioral equivalence), so a client sees identical replies over TLS or plaintext.
 
 ### Cryptographic backend and the static-binary trade
 
 - rustls selects its crypto provider by crate feature: aws-lc-rs (default,
-  AWS-LC/BoringSSL-based, FIPS-certifiable, but pulls a cmake build dependency) or
-  ring (easier cross-builds); both are Rust crates, so neither links system
-  OpenSSL [rustls-aws-lc-rs-default-ring-alternative]. IronCache pins one provider
-  for the reproducible static build; the choice (aws-lc-rs for FIPS-eligibility vs
-  ring for build simplicity under cargo-zigbuild) is a build-config decision tied
+  AWS-LC/BoringSSL-based, available as a FIPS-certified provider, but pulls a cmake
+  build dependency) or ring (easier cross-builds); both are Rust crates, so neither
+  links system OpenSSL [rustls-aws-lc-rs-default-ring-alternative]. IronCache pins
+  one provider for the reproducible static build; the choice (aws-lc-rs for a
+  FIPS-certified backend vs ring for build simplicity under cargo-zigbuild) is a
+  build-config decision tied
   to #81/#84, defaulting to the provider that keeps the musl cross-build
   reproducible, with `default-features = false` used to keep the dependency
   explicit [rustls-aws-lc-rs-default-ring-alternative].
 
 ### Cert/key config and the TLS-only posture
 
-- The listener takes a cert chain and private key from configured paths
-  (CONFIG.md #85), reloadable so a cert rotation needs no restart. TLS is exposed
+- The listener takes a cert chain and private key from configured paths (#85);
+  cert/key reload (so a cert rotation needs no restart) is a hot-swappable
+  parameter this spec adds to the CONFIG.md #85 partition, distinct from the
+  restart-required bind/port. TLS is exposed
   on a dedicated `tls-port` (a separate listener) rather than by sniffing TLS vs
   plaintext on one port: this resolves the #22 open decision toward separate-port,
   which is unambiguous and avoids a per-connection protocol-detection heuristic. A
