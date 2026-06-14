@@ -16,6 +16,12 @@ workspace = true
 [dependencies]
 # The frozen waist this crate implements.
 ironcache-storage = { workspace = true }
+# The pluggable eviction policies (EVICTION.md #48, ADR-0008). The store's
+# `evict_to_fit` + the policy-query accessors (policy_name/evicts/volatile_only)
+# name the EvictionPolicy trait; the binary wires a concrete `Policy` as the store's
+# E hook. The store still implements the waist generically over `E: EvictionHook`, so
+# this edge is the concrete-policy wiring, not a change to the frozen waist.
+ironcache-eviction = { workspace = true }
 # Bytes for value buffers (matches the waist's borrow/write byte type).
 bytes = { workspace = true }
 # The per-shard SwissTable (ADR-0005: stock hashbrown, unsynchronized, owned by
@@ -38,3 +44,10 @@ tikv-jemalloc-ctl = { workspace = true }
 # unavailable and process_*_bytes returns 0).
 [target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
 tikv-jemallocator = { workspace = true }
+
+# The eviction integration test (tests/eviction.rs) drives the store with the real
+# concrete `Policy` (S3-FIFO/Random/NoEviction). The library already depends on
+# ironcache-eviction for the EvictionPolicy trait; this restates it for the test
+# target so the test can name the concrete policy types.
+[dev-dependencies]
+ironcache-eviction = { workspace = true }
