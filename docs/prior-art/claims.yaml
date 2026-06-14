@@ -8089,3 +8089,109 @@ claims:
     note: 'go-redis CONTRIBUTING ''make test'' spins Redis via docker-compose and runs Ginkgo integration
       tests (issue #3490 discusses these integration tests). Jedis/Lettuce JUnit suites run against a
       live server via Maven per their repos; treat the cross-driver generalization as medium confidence.'
+- id: crdt-state-vs-op-based-cvrdt-cmrdt
+  dimension: replication
+  system: Conflict-free Replicated Data Types (Shapiro/Preguica/Baquero/Zawirski taxonomy)
+  version: INRIA Research Report RR-7506 (2011)
+  claim: 'Shapiro et al.''s CRDT taxonomy distinguishes two families of conflict-free replicated data
+    types: state-based Convergent Replicated Data Types (CvRDT), in which a replica''s full state is propagated
+    and replicas merge by applying a join (least-upper-bound) operation over a join-semilattice so merges
+    are commutative, associative, and idempotent; and operation-based Commutative Replicated Data Types
+    (CmRDT), in which update operations are propagated and concurrent operations are required to commute.'
+  value: CvRDT (state-based, propagate full state, merge via join-semilattice least-upper-bound) vs CmRDT
+    (operation-based, propagate commutative operations)
+  source_url: https://inria.hal.science/inria-00555588v1/document
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Primary source (the canonical 2011 INRIA RR-7506 technical report) fetched and confirmed;
+    authors, report number, year, and the two-class CvRDT/CmRDT terminology and join-semilattice merge
+    semantics all verified against the PDF.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://inria.hal.science/inria-00555588v1/document
+    note: Fetched the RR-7506 PDF (berkeley mirror) confirming authors Shapiro, Preguica, Baquero, Zawirski,
+      year 2011, and the state-based convergent (CvRDT) vs operation-based commutative (CmRDT) distinction
+      with join-semilattice merge. Also corroborated by Wikipedia CRDT article.
+- id: delta-state-crdt-delta-mutators-reduce-shipped-state
+  dimension: replication
+  system: Delta-state CRDTs / delta-mutators (Almeida, Shoker, Baquero)
+  version: JPDC 2018 (preprint arXiv:1410.2803, 2014/2016)
+  claim: Delta-state CRDTs (delta-CRDTs) define delta-mutators that return a delta-state, a value in the
+    same join-semilattice as the full state that encodes only the recent updates induced by an operation;
+    this delta-state is typically much smaller than the full state and is shipped (individually or joined
+    in batches) instead of the entire object, then incorporated at remote replicas by the same join operation,
+    reducing the amount of state transmitted while preserving the idempotent/associative/commutative merge
+    of classic state-based CRDTs.
+  value: delta-mutators return small delta-states (same join-semilattice) shipped instead of full state,
+    reducing communication while keeping join-based merge
+  source_url: https://arxiv.org/pdf/1410.2803
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Primary source (Almeida/Shoker/Baquero 'Efficient State-based CRDTs by Delta-Mutation')
+    fetched and confirmed; the quoted mechanism (delta-mutators returning a delta-state in the same join-semilattice,
+    typically much smaller than full state) matches the paper text.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://arxiv.org/pdf/1410.2803
+    note: Fetched the arXiv PDF; confirmed authors Almeida, Shoker, Baquero, title 'Efficient State-based
+      CRDTs by Delta-Mutation', and the core delta-mutator/delta-state mechanism reducing shipped state.
+      Corroborated by the companion 'Delta State Replicated Data Types' paper (arXiv:1603.01529).
+- id: optimized-or-set-tombstone-free-version-vectors
+  dimension: replication
+  system: Optimized Observed-Remove Set (OR-Set) (Bieniusa, Zawirski, Preguica, Shapiro, Baquero, Balegas,
+    Duarte)
+  version: INRIA Research Report RR-8083 / arXiv:1210.3368 (2012)
+  claim: The Observed-Remove Set (OR-Set) gives each added element a unique tag so that an element is
+    present when it has at least one observed add-tag not yet removed (add-wins on concurrent add/remove).
+    Bieniusa et al.'s optimized OR-Set introduces an optimization that avoids storing per-element tombstones
+    for removed elements by instead maintaining a vector of timestamps (version vector / causal context)
+    per replica to summarize which unique tags have been observed, thereby decreasing the size of the
+    set's metadata and avoiding unbounded tombstone growth.
+  value: optimized OR-Set replaces per-element tombstones with a per-replica version vector / causal context
+    summarizing observed unique tags, decreasing metadata size
+  source_url: https://arxiv.org/abs/1210.3368
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Primary-source abstract directly confirms 'a new optimization to avoid tombstones'
+    to decrease metadata size; the version-vector/causal-context mechanism is corroborated by Wikipedia's
+    CRDT article citing Bieniusa et al. 2012 ('maintaining a vector of timestamps for each replica').
+    Full-text PDF extraction of the exact internal mechanism sentence did not render cleanly, but two
+    sources agree.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://arxiv.org/abs/1210.3368
+    note: Abstract on arXiv/INRIA HAL confirms the tombstone-avoidance optimization and goal of decreasing
+      metadata size; Wikipedia CRDT article (citing Bieniusa et al. 2012) confirms the tombstone elimination
+      is achieved by maintaining a vector of timestamps per replica (version vector / causal context).
+      Full PDF text extraction was garbled so the exact mechanism quote relies on the secondary corroboration.
+- id: hybrid-logical-clocks-bounded-skew-epsilon
+  dimension: distributed-clustering
+  system: Hybrid Logical Clocks (HLC) (Kulkarni, Demirbas, Madappa, Avva, Leone)
+  version: SUNY Buffalo Tech Report 2014-04 / 'Logical Physical Clocks', May 2014
+  claim: 'Hybrid Logical Clocks (HLC) combine logical clocks and physical clocks: each event''s HLC timestamp
+    captures the happens-before/causality relation like a logical clock, while the logical component l.e
+    is kept close to the node''s physical time pt.e such that the difference l.e - pt.e is bounded (trivially
+    bounded by the clock-synchronization uncertainty epsilon). This lets a single timestamp serve both
+    causality tracking and an approximation of physical time, and HLC can substitute for physical-time
+    clocks in protocols expecting NTP-style time.'
+  value: HLC keeps logical timestamp within a bounded epsilon of physical time (l.e - pt.e bounded by
+    epsilon) while still capturing causality
+  source_url: https://cse.buffalo.edu/tech-reports/2014-04.pdf
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Core bound (l.e - pt.e is bounded, trivially bounded by epsilon) confirmed by co-author
+    Murat Demirbas's own blog post; authors, title, and tech-report number confirmed via search-result
+    metadata and Springer/Semantic Scholar listings. The tech-report PDF itself did not extract to readable
+    text, but the author's blog states the bound verbatim.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: http://muratbuffalo.blogspot.com/2014/07/hybrid-logical-clocks.html
+    note: Co-author Demirbas's blog confirms 'l.e is close to pt.e, that is, l.e - pt.e is bounded' and
+      'l-pt is trivially bounded by epsilon', plus HLC captures causality and can substitute for PT clocks.
+      Authors/title/report-number (Kulkarni, Demirbas, Madappa, Avva, Leone; 'Logical Physical Clocks...';
+      SUNY Buffalo TR 2014-04) confirmed via Springer and Semantic Scholar listings; primary PDF extraction
+      was garbled so the verbatim bound is sourced from the author blog.
