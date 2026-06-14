@@ -23,6 +23,6 @@ pub mod error;
 pub mod value;
 
 pub use decode::{DecodeOutcome, Limits, Request, decode};
-pub use encode::{encode, encode_to_vec};
+pub use encode::{encode, encode_to_vec, format_human_double};
 pub use error::{ErrorCode, ErrorReply};
 pub use value::{ProtoVersion, Value};

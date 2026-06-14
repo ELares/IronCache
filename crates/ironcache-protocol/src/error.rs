@@ -271,6 +271,35 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "DB index is out of range")
     }
 
+    /// `ERR increment or decrement would overflow` - the reply Redis emits (via
+    /// `addReplyError(c,"increment or decrement would overflow")`, src/t_string.c
+    /// `incrDecrCommand`) when an INCR/DECR/INCRBY/DECRBY would carry the i64 result
+    /// past the i64 range. DISTINCT from the not-an-integer error: this is a result
+    /// overflow, not a parse failure. Also the reply for the `DECRBY key i64::MIN`
+    /// edge (the increment cannot be negated within i64).
+    #[must_use]
+    pub fn increment_overflow() -> Self {
+        ErrorReply::new(ErrorCode::Err, "increment or decrement would overflow")
+    }
+
+    /// `ERR value is not a valid float` - the default reply Redis emits when the
+    /// stored value or the increment argument of INCRBYFLOAT cannot be parsed as a
+    /// float (`getLongDoubleFromObjectOrReply` with a NULL message, src/object.c,
+    /// which defaults to `addReplyError(c,"value is not a valid float")`). The
+    /// float analog of [`ErrorReply::not_an_integer`].
+    #[must_use]
+    pub fn not_a_valid_float() -> Self {
+        ErrorReply::new(ErrorCode::Err, "value is not a valid float")
+    }
+
+    /// `ERR increment would produce NaN or Infinity` - the reply Redis emits (via
+    /// `addReplyError(c,"increment would produce NaN or Infinity")`, src/t_string.c
+    /// `incrbyfloatCommand`) when the INCRBYFLOAT result is NaN or +/-Infinity.
+    #[must_use]
+    pub fn increment_nan_or_inf() -> Self {
+        ErrorReply::new(ErrorCode::Err, "increment would produce NaN or Infinity")
+    }
+
     /// `ERR unknown subcommand or wrong number of arguments for '<sub>'. Try
     /// <PARENT> HELP.` the wording clients see for an unrecognized
     /// `CLIENT`/`COMMAND`/`CONFIG` subcommand.
@@ -436,6 +465,29 @@ mod tests {
         assert_eq!(
             ErrorReply::invalid_expire_time("set").line(),
             "-ERR invalid expire time in 'set' command"
+        );
+    }
+
+    #[test]
+    fn numeric_rmw_errors_are_byte_exact() {
+        // Verified against redis/redis: src/t_string.c (incrDecrCommand,
+        // incrbyfloatCommand) and src/object.c (getLongDoubleFromObjectOrReply
+        // NULL-message default).
+        assert_eq!(
+            ErrorReply::not_an_integer().line(),
+            "-ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            ErrorReply::increment_overflow().line(),
+            "-ERR increment or decrement would overflow"
+        );
+        assert_eq!(
+            ErrorReply::not_a_valid_float().line(),
+            "-ERR value is not a valid float"
+        );
+        assert_eq!(
+            ErrorReply::increment_nan_or_inf().line(),
+            "-ERR increment would produce NaN or Infinity"
         );
     }
 }

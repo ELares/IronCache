@@ -380,6 +380,52 @@ fn emit_digits(digits: &str, k: i32, neg: bool) -> String {
     out
 }
 
+/// Format an f64 the way Redis's `ld2string(..., LD_STR_HUMAN)` (src/util.c) shapes
+/// the INCRBYFLOAT reply: a plain decimal with NO trailing zeros, NO trailing
+/// decimal point, NO scientific notation, and `-0` normalized to `0`.
+///
+/// This is DELIBERATELY NOT [`format_double`] (the RESP3 `,double` / fpconv
+/// encoder). Redis's INCRBYFLOAT human format and its RESP3 double format are
+/// different spellings: fpconv emits scientific notation for large/small magnitudes
+/// (`1e+100`, `1e-7`) and is the shortest-round-trip score format, whereas
+/// `ld2string` HUMAN uses `%.17Lf` (fixed-point) then strips trailing zeros and a
+/// trailing dot, so it never goes scientific. INCRBYFLOAT must use THIS spelling.
+///
+/// IronCache stores the value as f64, a documented precision divergence from
+/// Redis's 80-bit long double (ENCODINGS.md "the integer/float fast path";
+/// INCRBYFLOAT result is stored as a STRING, not the int encoding). We obtain the
+/// HUMAN spelling from Rust's `Display`, which is the shortest round-trip decimal
+/// and (unlike `%g`) NEVER emits an exponent: it prints the full decimal expansion,
+/// which is exactly the no-scientific-notation property `ld2string` HUMAN has. For
+/// an integer-valued f64 it prints no decimal point (`5.0 -> "5"`), and it carries
+/// no trailing zeros, matching the post-strip Redis output as closely as f64
+/// precision allows. The only normalization we add is the `-0 -> 0` special case
+/// Redis applies explicitly.
+///
+/// NaN/Infinity never reach this function: the INCRBYFLOAT command path rejects a
+/// NaN/Infinity result with `-ERR increment would produce NaN or Infinity` before
+/// formatting (matching Redis), so a non-finite input is not a valid caller state.
+/// For robustness it still returns Redis's `nan`/`inf`/`-inf` spelling rather than
+/// Rust's `NaN`/`inf` if somehow called with one.
+#[must_use]
+pub fn format_human_double(d: f64) -> String {
+    if d.is_nan() {
+        return "nan".to_owned();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 {
+            "inf".to_owned()
+        } else {
+            "-inf".to_owned()
+        };
+    }
+    // Rust's Display is the shortest round-trip decimal with no exponent form; it
+    // already strips trailing zeros and omits the dot for integer-valued floats.
+    let s = format!("{d}");
+    // Redis's ld2string HUMAN normalizes a formatted "-0" back to "0".
+    if s == "-0" { "0".to_owned() } else { s }
+}
+
 // Minimal integer formatting without pulling the itoa crate (keeps the dep set
 // small for a freeze-point crate). 20 bytes holds any i64 plus sign.
 fn itoa_buf() -> [u8; 20] {
@@ -518,6 +564,39 @@ mod tests {
         for &(d, want) in cases {
             assert_eq!(format_double(d), want, "format_double({d})");
         }
+    }
+
+    #[test]
+    fn format_human_double_matches_ld2string_human() {
+        // INCRBYFLOAT reply spelling (ld2string LD_STR_HUMAN): plain decimal, no
+        // trailing zeros, no trailing dot, no scientific notation, -0 -> 0.
+        let cases: &[(f64, &str)] = &[
+            (10.5, "10.5"),    // INCRBYFLOAT k 10.5 on absent -> "10.5"
+            (5.0, "5"),        // integer-valued result -> no dot
+            (0.0, "0"),        // zero -> "0"
+            (-0.0, "0"),       // negative zero normalized to "0"
+            (3.25, "3.25"),    // shortest round-trip, not 3.25000000000000017
+            (-2.5, "-2.5"),    // sign preserved
+            (100.0, "100"),    // integer-valued, no dot
+            (0.1, "0.1"),      // shortest, not 0.10000000000000001
+            (-3.0, "-3"),      // negative integer-valued -> no dot
+            (5_000.0, "5000"), // larger integer-valued
+            // No scientific notation even at extreme magnitudes (the ld2string
+            // HUMAN property; differs from the RESP3 fpconv ,double encoder).
+            (1e-7, "0.0000001"),
+        ];
+        for &(d, want) in cases {
+            assert_eq!(format_human_double(d), want, "format_human_double({d})");
+        }
+    }
+
+    #[test]
+    fn format_human_double_is_not_the_fpconv_double() {
+        // Pin the deliberate divergence: at magnitudes where fpconv goes
+        // scientific, the INCRBYFLOAT human format stays plain decimal. If these
+        // ever converge, the INCRBYFLOAT reply spelling has regressed.
+        assert_eq!(format_double(1e-7), "1e-7");
+        assert_eq!(format_human_double(1e-7), "0.0000001");
     }
 
     #[test]
