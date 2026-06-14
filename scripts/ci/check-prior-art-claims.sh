@@ -21,9 +21,11 @@ PROSE_FILES=(
   "$ROOT/docs/NON_GOALS.md"
   "$ROOT/docs/THREAT_MODEL.md"
 )
-# Plus every design spec under docs/design/ (claim citations there are checked too).
+# Plus every design spec under docs/design/ and every experiment-design doc under
+# docs/experiments/ (claim citations there are checked too).
 shopt -s nullglob
 PROSE_FILES+=("$ROOT"/docs/design/*.md)
+PROSE_FILES+=("$ROOT"/docs/experiments/*.md)
 shopt -u nullglob
 
 fail=0

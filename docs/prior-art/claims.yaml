@@ -7013,3 +7013,84 @@ claims:
       (redis.io/docs/latest/commands/readwrite) was surfaced in the same search and resets the readonly
       flag; redis-py-cluster docs independently note replicas may not return latest data due to asynchronous
       replication, consistent with the bounded-staleness framing.'
+- id: art-adaptive-radix-tree-icde13
+  dimension: datastructures
+  system: Adaptive Radix Tree (ART)
+  version: "Leis, Kemper, Neumann \u2014 ICDE 2013, pp. 38-49, DOI 10.1109/ICDE.2013.6544812"
+  claim: ART is a space-adaptive radix tree (trie) for main-memory indexing whose four node types (Node4,
+    Node16, Node48, Node256) grow/shrink with fanout to keep nodes dense and cache-line-friendly; the
+    paper proves a bounded per-key space consumption and reports it is often as low as ~8.1 bytes per
+    key in practice, while keeping keys in sorted order (unlike hash tables) and exceeding the lookup
+    performance of highly tuned read-only search trees.
+  value: 4 adaptive node types (4/16/48/256); ~8.1 bytes/key in practice; ordered (range-capable); cache-line-optimized
+    vs read-only search trees and hash tables
+  source_url: https://www.db.in.tum.de/~leis/papers/ART.pdf
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: 'Extracted directly from the authors'' canonical PDF (db.in.tum.de): the four node
+    types, the ''often as low as 8.1 bytes per key'' figure, and the cache-line/sorted-order claims are
+    verbatim; citation (authors, ICDE 2013, pp.38-49, DOI) cross-confirmed via dblp.'
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://www.db.in.tum.de/~leis/papers/ART.pdf
+    note: Text extracted from the authors' PDF confirms Node4/Node16/Node48/Node256 and 'space consumption
+      ... often as low as 8.1 bytes per key', plus 'lookup performance surpasses highly tuned, read-only
+      search trees' and avoidance of cache misses by optimally utilizing cache lines. dblp record confirms
+      Leis/Kemper/Neumann, ICDE 2013, pages 38-49, DOI 10.1109/ICDE.2013.6544812.
+- id: skiplist-vs-btree-cache
+  dimension: memory
+  system: Skip list vs B-tree (ordered in-memory index cache behavior)
+  version: 'Bridging Cache-Friendliness and Concurrency: A Locality-Optimized In-Memory B-Skiplist (arXiv:2507.21492,
+    ICPP ''25, 2025)'
+  claim: "Classic skip lists store one element per tower node with scattered forward pointers, giving\
+    \ poor spatial locality, whereas B-trees pack many keys per node (one cache line holding many candidates),\
+    \ reducing height and memory fetches per traversal; consequently node-blocked designs are markedly\
+    \ more cache-efficient \u2014 the locality-optimized B-skiplist reports 2x-9x higher throughput than\
+    \ state-of-the-art concurrent skiplists (e.g., Folly, Java ConcurrentSkipListMap) at 128 threads."
+  value: skiplist = 1 element/node (poor locality); B-tree = many keys/node (cache-line dense, lower height);
+    B-skiplist 2x-9x throughput vs concurrent skiplists @128 threads
+  source_url: https://arxiv.org/abs/2507.21492
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: The structural explanation (one-element-per-node skiplist vs multi-key B-tree node)
+    is well established and corroborated across multiple sources; the 2x-9x throughput figure is the exact
+    number stated in the paper's abstract.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://arxiv.org/abs/2507.21492
+    note: "arXiv abstract states the B-skiplist achieves 2x-9x higher throughput vs state-of-the-art concurrent\
+      \ skiplists (Folly, Java ConcurrentSkipListMap) at 128 threads. The one-element-per-node vs many-keys-per-node\
+      \ locality contrast is corroborated by the SIGMOD CSB+-tree line of work and multiple secondary\
+      \ sources; note a separately surfaced '2.4-4.8x more cache misses / 2-8x throughput' figure was\
+      \ NOT used as the load-bearing number since it could not be re-confirmed against the abstract \u2014\
+      \ the abstract's 2x-9x throughput is used instead."
+- id: redis-zset-skiplist-plus-ht
+  dimension: datastructures
+  system: Redis sorted set (ZSET) representation
+  version: Redis 7.x (skiplist encoding; listpack for small sets in 7.0+, ziplist in <=6.2)
+  claim: 'A large Redis sorted set under ''skiplist'' encoding is a dual structure: a hash table (dict)
+    mapping member->score for O(1) ZSCORE point lookups, plus a skip list mapping score->member for O(log
+    n) ordered range queries; the same SDS member string is shared between both views to save memory,
+    so each member is effectively referenced in both structures. Small sorted sets use the compact listpack
+    encoding (Redis 7.0+) or ziplist (<=6.2), governed by zset-max-listpack-entries (default 128) and
+    zset-max-listpack-value (default 64 bytes), and are auto-promoted to skiplist+dict once a threshold
+    is exceeded.'
+  value: skiplist encoding = dict(member->score, O(1)) + skiplist(score->member, O(log n)), shared SDS;
+    small sets = listpack(7.0+)/ziplist(<=6.2); thresholds 128 entries / 64 bytes
+  source_url: https://github.com/redis/redis/blob/unstable/src/t_zset.c
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: The dual hash-table-plus-skiplist design and shared-SDS memory optimization are stated
+    in Redis's own t_zset.c source comment and the official object-encoding docs; encoding names and default
+    thresholds confirmed from redis.io docs.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/object-encoding/
+    note: "Redis t_zset.c design comment: ZSETs use two data structures \u2014 a hash table mapping objects\
+      \ to scores and a skip list mapping scores to objects \u2014 with the same SDS string shared to\
+      \ save memory. redis.io OBJECT ENCODING docs confirm encodings 'skiplist' (normal), 'listpack' (>=7.0,\
+      \ small), 'ziplist' (<=6.2, small); defaults zset-max-listpack-entries=128 and zset-max-listpack-value=64\
+      \ bytes confirmed from Redis docs/config."
