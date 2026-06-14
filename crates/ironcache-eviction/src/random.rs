@@ -118,6 +118,12 @@ impl EvictionPolicy for Random {
         self.volatile_only
     }
 
+    fn access_freq(&self, _db: u32, _key: &[u8]) -> Option<u8> {
+        // Random keeps no frequency estimate; OBJECT FREQ requires an LFU policy, so it
+        // reports None (dispatch emits the LFU-gating error).
+        None
+    }
+
     fn re_register(&mut self, db: u32, key: &[u8]) {
         // The volatile-* re-eligibility fix (#46). For Random, `select_victim` returns
         // a CLONE and leaves the roster entry in place (see `select_victim`), so a

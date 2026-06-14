@@ -481,6 +481,14 @@ impl EvictionPolicy for WTinyLfu {
         self.volatile_only
     }
 
+    fn access_freq(&self, db: u32, key: &[u8]) -> Option<u8> {
+        // The LFU engine: OBJECT FREQ reports the 4-bit count-min sketch estimate
+        // (0..=15), the logarithmic access-frequency counter Redis's LFU exposes. This
+        // is the only policy that returns Some, so OBJECT FREQ succeeds exactly under an
+        // *-lfu maxmemory policy and errors otherwise (the LFU gate).
+        Some(self.sketch.estimate(db, key))
+    }
+
     fn re_register(&mut self, db: u32, key: &[u8]) {
         // The volatile-* re-eligibility fix (#46), SAME contract as S3-FIFO: a victim
         // the store declined to delete (a non-TTL key under volatile-*) is put BACK so

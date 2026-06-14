@@ -674,6 +674,13 @@ pub trait Admit {
     /// policy can free no more. Returns the number of entries evicted (the caller
     /// bumps the `evicted_keys` counter and, if still over budget, replies `-OOM`).
     fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64;
+
+    /// The access-frequency estimate for `(db, key)` for OBJECT FREQ, or `None` if the
+    /// configured policy keeps no frequency estimate (every non-LFU policy). The
+    /// dispatch layer maps `None` to the canonical OBJECT FREQ LFU-gating error and a
+    /// `Some(v)` to the integer reply. Additive (read-only introspection over the
+    /// configured policy), NOT one of the frozen four primitives.
+    fn access_freq(&self, db: u32, key: &[u8]) -> Option<u8>;
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +705,189 @@ pub trait ActiveExpiry {
     /// key is left untouched and reported `false`. This is why a wheel registration
     /// need not be kept consistent with the store (the drain self-corrects).
     fn reap_if_expired(&mut self, db: u32, key: &[u8], now: UnixMillis) -> bool;
+}
+
+// ---------------------------------------------------------------------------
+// Keyspace iteration surface (KEYSPACE.md #129). A SEPARATE trait from the frozen
+// four primitives (like Admit and ActiveExpiry): it lets the command-dispatch layer
+// run the generic keyspace commands (SCAN/KEYS/DBSIZE/RANDOMKEY/RENAME/COPY/MOVE/
+// SWAPDB/FLUSHDB/FLUSHALL) WITHOUT naming the concrete map or kvobj type. The new
+// iteration capability the SCAN cursor needs is additive, so it does NOT reopen the
+// frozen waist; dispatch bounds on `S: Store + Admit + ActiveExpiry + Keyspace`.
+// ---------------------------------------------------------------------------
+
+/// A SCAN cursor (KEYSPACE.md "SCAN cursor-stability contract"). The wire form is a
+/// decimal string ([`Self::to_token`]/[`Self::from_token`]); `0` is the start and a
+/// returned `0` means the iteration is complete.
+///
+/// ## What the cursor encodes (the freeze-sensitive headline)
+///
+/// The value is the resume point in ASCENDING FULL 64-bit key-hash order, where the
+/// hash is a FIXED-SEED stable hash recomputable from the key bytes (NOT hashbrown's
+/// per-table RandomState tag, NOT std `rand`): the last full key-hash already emitted.
+/// Resumption (KEYSPACE.md) returns keys whose hash is STRICTLY GREATER than the
+/// cursor hash, plus any not-yet-emitted keys whose hash EQUALS the cursor hash
+/// (discriminated by raw key bytes), so two distinct keys that collide on the same
+/// 64-bit hash are never skipped. Because a key's full hash is invariant across a
+/// `hashbrown` all-at-once resize, iteration is TOTAL across a resize (the
+/// rehash-tolerance guarantee KEYSPACE.md mandates); reverse-binary iteration over the
+/// SwissTable bucket index is explicitly rejected there (it is tied to Redis's
+/// incremental two-table rehash, which does not transfer).
+///
+/// ## Reserved high bits (do NOT populate in PR-4a)
+///
+/// KEYSPACE.md reserves the cursor's HIGH bits for a future SLOT id so a cluster
+/// coordinator can fan SCAN out across slots/nodes and report a migrated slot with a
+/// MOVED-style redirection. PR-4a is single-node single-slot, so the slot field is
+/// always zero and the whole 64-bit value carries the intra-slot hash position. The
+/// equal-hash discriminator KEYSPACE.md also mentions is NOT carried in the cursor
+/// integer here: the store derives it from the raw key bytes at resume time (it
+/// re-emits same-hash keys whose bytes sort after the largest already-emitted at that
+/// hash), which needs no extra cursor field and keeps the wire token a plain decimal
+/// hash. This is the documented narrowing of KEYSPACE.md's open "bit-split" question
+/// for the single-slot case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScanCursor(pub u64);
+
+impl ScanCursor {
+    /// The start-of-iteration cursor (`0`).
+    pub const START: ScanCursor = ScanCursor(0);
+
+    /// Whether this is the start/complete sentinel (`0`).
+    #[must_use]
+    pub fn is_start(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The wire token: the decimal-string form a client sends and receives (Redis
+    /// SCAN cursors are decimal bulk strings).
+    #[must_use]
+    pub fn to_token(self) -> String {
+        self.0.to_string()
+    }
+
+    /// Parse a wire token (a decimal string) back into a cursor. Returns `None` on a
+    /// non-decimal / out-of-u64-range token (the caller maps that to the canonical
+    /// `invalid cursor` error).
+    #[must_use]
+    pub fn from_token(token: &[u8]) -> Option<ScanCursor> {
+        if token.is_empty() {
+            return None;
+        }
+        let mut acc: u64 = 0;
+        for &b in token {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            acc = acc.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+        }
+        Some(ScanCursor(acc))
+    }
+}
+
+/// How [`Keyspace::move_object`] relocates the source value (RENAME/RENAMENX/MOVE
+/// consume the source; COPY leaves it in place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveMode {
+    /// Move the value object to the destination, REMOVING the source (RENAME /
+    /// RENAMENX / MOVE).
+    Rename,
+    /// Copy the value object to the destination, LEAVING the source intact (COPY).
+    Copy,
+}
+
+/// The outcome of a [`Keyspace::move_object`] call (RENAME/RENAMENX/COPY/MOVE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveOutcome {
+    /// The source was moved to the destination (RENAME / MOVE success).
+    Moved,
+    /// The source was copied to the destination (COPY success).
+    Copied,
+    /// The source key did not exist (or was lazily expired): nothing was done.
+    NoSource,
+    /// The destination already held a live key and `replace` was false: nothing was
+    /// done (RENAMENX-returns-0 / COPY-without-REPLACE / MOVE-dest-occupied).
+    DestExists,
+}
+
+/// The keyspace iteration + bulk-management surface the dispatch layer drives for the
+/// generic keyspace commands (KEYSPACE.md). NOT one of the frozen four primitives; an
+/// additive waist trait alongside [`Admit`]/[`ActiveExpiry`]. The concrete per-shard
+/// store implements it; dispatch bounds on `S: Store + Admit + ActiveExpiry + Keyspace`.
+///
+/// ## Cross-shard scope (single-shard-per-connection for now)
+///
+/// Every method operates on ONE shard's DB(s). Since no cross-shard key routing exists
+/// yet (the store IS the connection's whole keyspace, ADR-0011 single-node-first), SCAN
+/// / KEYS / DBSIZE / RANDOMKEY / FLUSHDB cover the connection's entire keyspace. A true
+/// cross-shard fan-out (SCAN every node and merge, with the cursor's reserved slot bits
+/// driving MOVED-style redirection) is DEFERRED to the coordinator/clustering work
+/// (#29/#75); the iteration seam is SHAPED for it ([`ScanCursor`]'s reserved high bits)
+/// but PR-4a builds no fan-out. `move_object` is same-shard only for the same reason
+/// (a cross-shard RENAME/COPY routes through the coordinator later, KEYSPACE.md).
+pub trait Keyspace {
+    /// Run ONE bounded SCAN batch over `db` in ascending full-key-hash order, starting
+    /// after `cursor` (KEYSPACE.md cursor-stability contract). `count` bounds the keys
+    /// EXAMINED this call (a hint, like Redis: an empty batch with a non-zero returned
+    /// cursor is legal). `keep(key, type)` is the MATCH/TYPE filter applied BEFORE a
+    /// key is cloned into the result, so a filtered-out key costs no allocation. Lazily
+    /// -expired keys (deadline strictly past `now`) are skipped (NOT returned, NOT
+    /// reaped here; the lazy backstop / active drain reclaim them). Returns the next
+    /// cursor (`ScanCursor(0)` = iteration complete) and the kept keys for this batch.
+    fn scan_step(
+        &mut self,
+        db: u32,
+        cursor: ScanCursor,
+        count: usize,
+        now: UnixMillis,
+        keep: impl FnMut(&[u8], DataType) -> bool,
+    ) -> (ScanCursor, Vec<Box<[u8]>>);
+
+    /// The number of keys in `db` (DBSIZE). A RAW live-ish count: Redis does NOT
+    /// actively expire on DBSIZE (it returns the dict size, including not-yet-reaped
+    /// expired keys), so this returns the table length WITHOUT running the lazy
+    /// backstop, matching the oracle.
+    fn db_len(&self, db: u32) -> usize;
+
+    /// A pseudo-random live key from `db` (RANDOMKEY), or `None` if `db` is empty (of
+    /// live keys). `pick` is a random index the CALLER drew from the Env RNG (ADR-0003:
+    /// the store reads no RNG; randomness enters through the determinism seam). An
+    /// expired key at the picked position is skipped (the implementation probes onward
+    /// deterministically from `pick`).
+    fn random_key(&mut self, db: u32, pick: u64, now: UnixMillis) -> Option<Box<[u8]>>;
+
+    /// Remove every key in `db` (FLUSHDB), firing the remove hooks / accounting for
+    /// each. Returns the number of entries removed.
+    fn flush_db(&mut self, db: u32) -> u64;
+
+    /// Remove every key in EVERY db (FLUSHALL), firing the remove hooks / accounting.
+    /// Returns the total number of entries removed.
+    fn flush_all(&mut self) -> u64;
+
+    /// Move or copy the value object at `(src_db, src)` to `(dst_db, dst)`,
+    /// PRESERVING the value object intact (encoding + remaining TTL), for
+    /// RENAME/RENAMENX/COPY/MOVE (KEYSPACE.md "moves the value object INTACT"). `mode`
+    /// selects move-vs-copy; `replace` permits overwriting a live destination. Returns
+    /// the [`MoveOutcome`]. A lazily-expired source reads as [`MoveOutcome::NoSource`].
+    /// SAME-SHARD only (no cross-shard routing exists; a cross-shard form goes through
+    /// the coordinator later, KEYSPACE.md).
+    #[allow(clippy::too_many_arguments)]
+    fn move_object(
+        &mut self,
+        src_db: u32,
+        src: &[u8],
+        dst_db: u32,
+        dst: &[u8],
+        mode: MoveMode,
+        replace: bool,
+        now: UnixMillis,
+    ) -> MoveOutcome;
+
+    /// Swap the entire contents of two logical databases (SWAPDB), an O(1) operation
+    /// (the per-DB maps are Vec elements; the swap exchanges them without touching any
+    /// entry). No hooks fire (no entry is created or destroyed; the keys simply belong
+    /// to a different db id afterward).
+    fn swap_db(&mut self, a: u32, b: u32);
 }
 
 #[cfg(test)]
@@ -769,5 +959,29 @@ mod tests {
     fn unix_millis_is_ordered() {
         assert!(UnixMillis(10) < UnixMillis(20));
         assert!(UnixMillis(20) <= UnixMillis(20));
+    }
+
+    #[test]
+    fn scan_cursor_token_round_trips() {
+        // The wire form is a decimal string; 0 is the start/complete sentinel.
+        assert_eq!(ScanCursor::START.to_token(), "0");
+        assert!(ScanCursor::START.is_start());
+        for raw in [0u64, 1, 42, 12345, u64::MAX] {
+            let c = ScanCursor(raw);
+            let token = c.to_token();
+            assert_eq!(ScanCursor::from_token(token.as_bytes()), Some(c), "{raw}");
+        }
+        // A returned cursor of 0 means complete; a non-zero cursor does not.
+        assert!(!ScanCursor(7).is_start());
+    }
+
+    #[test]
+    fn scan_cursor_rejects_malformed_tokens() {
+        assert_eq!(ScanCursor::from_token(b""), None);
+        assert_eq!(ScanCursor::from_token(b"-1"), None);
+        assert_eq!(ScanCursor::from_token(b"abc"), None);
+        assert_eq!(ScanCursor::from_token(b"12x"), None);
+        // Overflow past u64.
+        assert_eq!(ScanCursor::from_token(b"18446744073709551616"), None);
     }
 }

@@ -394,6 +394,15 @@ impl EvictionPolicy for S3Fifo {
         self.volatile_only
     }
 
+    fn access_freq(&self, _db: u32, _key: &[u8]) -> Option<u8> {
+        // S3-FIFO is NOT an LFU engine: it keeps a 2-bit promote-frequency for its OWN
+        // queue decisions, not a Redis OBJECT FREQ estimate. OBJECT FREQ requires an
+        // LFU maxmemory policy, so the FIFO-class engine reports None and the dispatch
+        // layer emits the LFU-gating error (matching Redis, which errors OBJECT FREQ
+        // unless maxmemory-policy is *-lfu).
+        None
+    }
+
     fn re_register(&mut self, db: u32, key: &[u8]) {
         // The volatile-* re-eligibility fix (#46): `select_victim` pop_front'd this
         // key, and the store declined to delete it (a non-TTL key under a volatile-*
