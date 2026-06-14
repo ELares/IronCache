@@ -133,3 +133,11 @@ Specs added as the M1 milestone progresses.
   tests with threshold-straddling generators and post-mutation encoding asserts (#98).
 - [JEPSEN_PLAN.md](JEPSEN_PLAN.md): Jepsen + Elle consistency test plan (fault
   catalog, async-vs-quorum suites, partition-mid-migration) (#99).
+- [COORDINATOR.md](COORDINATOR.md): the per-connection home-thread cross-shard
+  coordinator (bounded MPSC fan-out, global txid order, per-shard atomic
+  MGET/MSET, back-pressure) (#107).
+- [TRANSACTIONS.md](TRANSACTIONS.md): MULTI/EXEC/DISCARD/WATCH with optimistic
+  locking, queue-then-apply, dirty-CAS, and no rollback (#19).
+- [BLOCKING_COMMANDS.md](BLOCKING_COMMANDS.md): blocking commands (BLPOP family,
+  WAIT, XREAD BLOCK) under shared-nothing: per-shard FIFO wait queues, cross-shard
+  wakeup, no-block-in-EXEC (#130).

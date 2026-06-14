@@ -7395,3 +7395,125 @@ claims:
       or as a standalone server speaking the RESP wire protocol, with strings/lists/sets/hashes/sorted-sets,
       key management and transactions. Latest release v1.0.1 dated 2025-02-04 marks it stable for non-critical
       production use and now in maintenance mode (no planned new features).
+- id: redis-blocking-commands-exist-and-block
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.x (docs/latest, accessed 2026-06-14)
+  claim: Redis provides a family of blocking commands (BLPOP, BRPOP, BLMOVE, BLMPOP, BZPOPMIN, BZMPOP,
+    XREAD BLOCK) that block the client connection until data is available or a timeout elapses.
+  value: BLPOP/BRPOP 'Removes and returns the first/last element in a list. Blocks until an element is
+    available otherwise.' BLMOVE 'When source is empty, Redis will block the connection until another
+    client pushes to it or until timeout is reached.' BLMPOP 'Pops the first element from one of multiple
+    lists. Blocks until an element is available otherwise.' BZPOPMIN is 'the blocking variant of the sorted
+    set ZPOPMIN primitive ... it blocks the connection when there are no members to pop from any of the
+    given sorted sets.' XREAD BLOCK 'is able to block if it could not return any data ... and automatically
+    unblock once one of the requested keys accept data.'
+  source_url: https://redis.io/docs/latest/commands/blpop/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Each command's blocking behavior is stated verbatim on its own official redis.io
+    command reference page; multiple pages cross-confirm the family.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/blpop/
+    note: Confirmed across redis.io pages for BLPOP, BLMOVE, BLMPOP, BZPOPMIN, and XREAD; each documents
+      that the command blocks the connection until data is available or timeout. WAIT is a distinct blocking
+      command (blocks until replica acknowledgements) covered separately.
+- id: redis-blocking-fifo-wakeup-fairness
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.x (docs/latest, accessed 2026-06-14)
+  claim: 'When multiple clients are blocked on the same key, Redis serves them in FIFO order: the client
+    that has been waiting the longest (first to block on that key) is served first when the key becomes
+    available; an unblocked client retains no priority and re-enters the queue at its new position on
+    a subsequent block.'
+  value: 'BLPOP docs: ''If multiple clients are blocked for the same key, the first client to be served
+    is the one that has been waiting the longest (the first that blocked for the key). Once a client is
+    unblocked it does not retain any priority; when it blocks again with another BLPOP call, it will be
+    served according to its new position in the queue.'' BZPOPMIN refers to BLPOP for the exact semantics
+    (''BZPOPMIN is identical to BLPOP with the only difference being the data structure being popped from'').'
+  source_url: https://redis.io/docs/latest/commands/blpop/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: FIFO fairness wording is quoted verbatim from the official BLPOP reference; BZPOPMIN
+    page explicitly defers to BLPOP for identical semantics.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/blpop/
+    note: Quoted directly from redis.io BLPOP 'Behavior of BLPOP when multiple clients are blocked' section;
+      BZPOPMIN page cross-confirms identical semantics for the sorted-set variants.
+- id: redis-blocking-noop-inside-multi-exec
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.x (docs/latest, accessed 2026-06-14)
+  claim: Blocking commands do not block when executed inside a MULTI/EXEC transaction (or a Lua script);
+    if no data is available they return immediately with the same nil/empty reply that a timed-out call
+    would produce, behaving like their non-blocking counterparts.
+  value: 'BLPOP docs: ''BLPOP inside a MULTI / EXEC block does not make a lot of sense as it would require
+    blocking the entire server ... the behavior of BLPOP inside MULTI / EXEC when the list is empty is
+    to return a nil multi-bulk reply, which is the same thing that happens when the timeout is reached.''
+    BLMOVE docs: ''When used inside a MULTI/EXEC block or a Lua script, this command behaves exactly like
+    LMOVE.'''
+  source_url: https://redis.io/docs/latest/commands/blpop/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Stated verbatim on the BLPOP page (nil reply, no blocking inside MULTI/EXEC) and
+    corroborated by the BLMOVE page for the non-blocking-in-transaction behavior.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/blpop/
+    note: Confirmed on redis.io BLPOP ('BLPOP inside a MULTI/EXEC transaction' section) returning nil
+      immediately, and BLMOVE which states it behaves exactly like the non-blocking LMOVE inside MULTI/EXEC
+      or a Lua script.
+- id: redis-blpop-timeout-double-zero-forever
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.x (docs/latest); timeout became a double in Redis 6.0.0
+  claim: The BLPOP-family timeout argument is interpreted as a double specifying the maximum number of
+    seconds to block (fractional seconds allowed), and a timeout of zero blocks indefinitely.
+  value: 'BLPOP docs: ''The timeout argument is interpreted as a double value specifying the maximum number
+    of seconds to block. A timeout of zero can be used to block indefinitely.'' BLMPOP/BZPOPMIN use identical
+    wording (''a double value specifying the maximum number of seconds to block ... A timeout of zero
+    can be used to block indefinitely''). BZPOPMIN history notes: as of Redis 6.0.0 the timeout is interpreted
+    as a double instead of an integer.'
+  source_url: https://redis.io/docs/latest/commands/blpop/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Timeout-as-double and zero-means-forever wording is quoted verbatim from BLPOP, BLMPOP,
+    and BZPOPMIN reference pages.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/blpop/
+    note: 'Confirmed verbatim on redis.io for BLPOP, BLMPOP, and BZPOPMIN. Note the deliberate exception:
+      XREAD''s BLOCK argument is in milliseconds, not seconds (covered in a separate claim).'
+- id: redis-xread-block-semantics-dollar-id
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.x (docs/latest, accessed 2026-06-14); XREAD added in Redis 5.0.0
+  claim: XREAD BLOCK blocks for new stream entries with IDs greater than the supplied IDs; the special
+    ID '$' means 'only entries added after this blocking call begins' (use $ only on the first call, then
+    pass the last received ID), and BLOCK takes a millisecond timeout where 0 means block indefinitely.
+  value: 'XREAD docs: BLOCK ''is able to block if it could not return any data, according to the specified
+    streams and IDs, and automatically unblock once one of the requested keys accept data.'' On $: ''When
+    blocking sometimes we want to receive just entries that are added to the stream via XADD starting
+    from the moment we block ... It is very important to understand that you should use the $ ID only
+    for the first call to XREAD. Later the ID should be the one of the last reported item in the stream,
+    otherwise you could miss all the entries that are added in between.'' Timeout is in milliseconds (e.g.
+    XREAD BLOCK 5000 ... $); BLOCK 0 blocks forever (a timeout of 0 milliseconds never times out).'
+  source_url: https://redis.io/docs/latest/commands/xread/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: BLOCK behavior and the $ semantics are quoted verbatim from the official XREAD reference;
+    BLOCK 0 = block-forever and milliseconds units are corroborated by Redis docs and multiple client-library
+    issue threads.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/xread/
+    note: BLOCK and $ wording quoted directly from redis.io XREAD. BLOCK 0 = block indefinitely and millisecond
+      units corroborated by web search (redis client issue trackers redis/jedis#2277, redis/redis-rb#836
+      explicitly treat BLOCK 0 as 'should not time out').
