@@ -111,3 +111,6 @@ Specs added as the M1 milestone progresses.
   rollback/kill events), surfaced via INFO/metrics, emitted even in shadow (#153).
 - [ADVISOR_PROMOTION.md](ADVISOR_PROMOTION.md): the offline-replay + shadow-A/B
   promotion gate proving a change beats the static baseline before it acts (#154).
+- [ADMIN_COMMANDS.md](ADMIN_COMMANDS.md): the admin/introspection command family
+  (CLIENT LIST/INFO/KILL/PAUSE/NO-EVICT/NO-TOUCH with byte-faithful-vs-synthesized
+  fields, COMMAND DOCS/INFO/COUNT/GETKEYS, RESET semantics) (#150).
