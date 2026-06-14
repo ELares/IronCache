@@ -18,6 +18,10 @@ issues are the specification.
 - [GLOSSARY.md](GLOSSARY.md) and [INVARIANTS.md](INVARIANTS.md): the canonical
   vocabulary and the load-bearing invariants every design must respect.
 - [design/](design/): the subsystem design specifications that gate implementation.
+- [THREAT_MODEL.md](THREAT_MODEL.md): the shared adversary model (assets, trust
+  boundaries, attacker capabilities, STRIDE per subsystem, in-scope vs accepted
+  risk) that the security specs hang off, paired with the root
+  [SECURITY.md](../SECURITY.md) policy.
 - [adr/](adr/): the Architecture Decision Records, their registers
   ([INDEX](adr/INDEX.md), [OPEN](adr/OPEN.md), [QUESTIONS](adr/QUESTIONS.md)),
   and the ADR format.

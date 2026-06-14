@@ -67,3 +67,7 @@ Specs added as the M1 milestone progresses.
 - [TLS.md](TLS.md): the embedded rustls TLS listener (no C TLS library, cert/key
   config, dedicated tls-port and TLS-only mode, optional mTLS, TLS 1.2/1.3 floor,
   measured plaintext-vs-TLS overhead) (#105).
+- [SECRETS.md](SECRETS.md): secrets handling: redaction of secret args from
+  SLOWLOG/MONITOR/INFO/logs, zeroize-on-drop, mlock and no-coredump hardening, and
+  the MONITOR/metrics auth decision (#145). The shared adversary model is
+  [docs/THREAT_MODEL.md](../THREAT_MODEL.md) (#142).

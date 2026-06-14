@@ -19,6 +19,7 @@ PROSE_FILES=(
   "$ROOT/docs/GLOSSARY.md"
   "$ROOT/docs/INVARIANTS.md"
   "$ROOT/docs/NON_GOALS.md"
+  "$ROOT/docs/THREAT_MODEL.md"
 )
 # Plus every design spec under docs/design/ (claim citations there are checked too).
 shopt -s nullglob
