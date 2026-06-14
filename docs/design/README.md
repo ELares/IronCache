@@ -106,3 +106,8 @@ Specs added as the M1 milestone progresses.
 - [ADVISOR.md](ADVISOR.md): the per-shard background advisor (LeCaR/bandit expert
   weighting, bounded knobs, atomic RCU config swap, EvictionPolicy-trait binding,
   shadow/off default per ADR-0013) (#126).
+- [ADVISOR_AUDIT.md](ADVISOR_AUDIT.md): the durable tamper-evident advisor
+  decision/audit log (knob deltas, trigger, snapshot version, replay evidence,
+  rollback/kill events), surfaced via INFO/metrics, emitted even in shadow (#153).
+- [ADVISOR_PROMOTION.md](ADVISOR_PROMOTION.md): the offline-replay + shadow-A/B
+  promotion gate proving a change beats the static baseline before it acts (#154).
