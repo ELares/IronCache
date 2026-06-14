@@ -7094,3 +7094,129 @@ claims:
       \ save memory. redis.io OBJECT ENCODING docs confirm encodings 'skiplist' (normal), 'listpack' (>=7.0,\
       \ small), 'ziplist' (<=6.2, small); defaults zset-max-listpack-entries=128 and zset-max-listpack-value=64\
       \ bytes confirmed from Redis docs/config."
+- id: redis-client-list-fields
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 8.0 (docs/latest, fields tagged by introducing version)
+  claim: Redis CLIENT LIST and CLIENT INFO return a per-connection bulk string of space-separated key=value
+    fields plus a single-character flags set.
+  value: 'CLIENT LIST (since 2.4.0) and CLIENT INFO (since 6.2.0) return human-readable lines (bulk string
+    in both RESP2 and RESP3) of field=value pairs. Core fields: id, addr, laddr (6.2.0), fd, name, age,
+    idle, flags, db, sub, psub, ssub (7.0.3), multi, watch (7.4.0), qbuf, qbuf-free, argv-mem (6.2.0),
+    multi-mem (7.0.0), tot-net-in/tot-net-out/tot-cmds, obl, oll, omem, tot-mem (6.2.0), events, cmd,
+    user (6.0.0), redir (6.2.0), resp (7.0.0), rbs/rbp (7.0.0), lib-name/lib-ver (7.2.0), io-thread (8.0.0).
+    The flags field uses single chars: A (close ASAP), b (blocked), c (close after reply), d (dirty CAS/WATCH),
+    e (no-evict/excluded from eviction), M (master), N (none), O (MONITOR), P (Pub/Sub), r (cluster readonly),
+    S (replica), u (unblocked), U (unix socket), x (MULTI/EXEC), t/T/R/B (client tracking states). Clients
+    are expected to tolerate new/unknown fields.'
+  source_url: https://redis.io/docs/latest/commands/client-list/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Field list, per-field introducing versions, and full flag legend taken directly from
+    the official redis.io CLIENT LIST reference page.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/client-list/
+    note: Confirmed via WebFetch of the official CLIENT LIST page, including version tags (laddr 6.2.0,
+      ssub 7.0.3, watch 7.4.0, resp 7.0.0, lib-name/lib-ver 7.2.0, io-thread 8.0.0) and the single-character
+      flag legend. CLIENT INFO returns the same field set for the calling connection.
+- id: redis-client-kill-filters
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.4+ (docs/latest; MAXAGE since 7.4.0)
+  claim: Redis CLIENT KILL supports a legacy addr-only form returning OK and a filter form (ID/ADDR/LADDR/TYPE/USER/SKIPME/MAXAGE)
+    returning an integer count of killed connections.
+  value: 'Two forms: (1) legacy ''CLIENT KILL ip:port'' returns Simple string OK (or error if no match).
+    (2) Filter form ''CLIENT KILL [ID id] [ADDR ip:port] [LADDR ip:port] [TYPE NORMAL|MASTER|REPLICA|PUBSUB]
+    [USER username] [SKIPME yes|no] [MAXAGE n]'' returns an Integer count of clients killed (may be 0).
+    Filters combine with AND logic. ID/ADDR/TYPE/USER/SKIPME available since 2.8.12; LADDR since 6.2.0;
+    MAXAGE (kills connections older than n seconds) since 7.4.0. SKIPME defaults to yes (the calling client
+    is spared unless SKIPME no). TYPE accepts NORMAL, MASTER, REPLICA (alias SLAVE), PUBSUB.'
+  source_url: https://redis.io/docs/latest/commands/client-kill/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Both forms, all filter keywords, the two distinct reply types, and version tags (incl.
+    MAXAGE 7.4.0, LADDR 6.2.0) taken directly from the official CLIENT KILL reference.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/client-kill/
+    note: 'Confirmed via WebFetch of the official CLIENT KILL page: legacy ip:port form -> Simple string
+      OK; filter form -> Integer count; MAXAGE introduced in Redis 7.4.0; SKIPME default yes; TYPE values
+      NORMAL/MASTER/REPLICA(SLAVE)/PUBSUB; LADDR added 6.2.0.'
+- id: redis-client-pause-modes
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 6.2+ (docs/latest; WRITE|ALL mode arg since 6.2.0)
+  claim: Redis CLIENT PAUSE takes a millisecond timeout with an optional WRITE|ALL mode (default ALL),
+    and CLIENT UNPAUSE cancels an active pause; both reply OK.
+  value: '''CLIENT PAUSE timeout [WRITE | ALL]'' suspends client command processing for ''timeout'' milliseconds
+    and replies Simple string OK (error on invalid timeout). Mode ALL (the default) pauses all commands;
+    WRITE pauses only write commands while allowing reads. CLIENT PAUSE exists since 3.0.0; the optional
+    WRITE|ALL mode argument was added in 6.2.0. ''CLIENT UNPAUSE'' (added 6.2.0, replies OK) resumes/cancels
+    any active pause before its timeout expires.'
+  source_url: https://redis.io/docs/latest/commands/client-pause/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Syntax, default mode, WRITE-vs-ALL semantics, version history (3.0.0 base, 6.2.0
+    mode arg), and OK reply taken directly from the official CLIENT PAUSE and CLIENT UNPAUSE pages.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/client-pause/
+    note: 'Confirmed via WebFetch: CLIENT PAUSE since 3.0.0, WRITE|ALL mode arg since 6.2.0, default mode
+      ALL, Simple string OK reply; CLIENT UNPAUSE since 6.2.0 also returns OK.'
+- id: redis-client-no-evict-no-touch
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.2+ (docs/latest; NO-EVICT 7.0.0, NO-TOUCH 7.2.0)
+  claim: Redis CLIENT NO-EVICT ON|OFF exempts a connection from client-eviction, and CLIENT NO-TOUCH ON|OFF
+    stops the connection from updating key LRU/LFU on access; both reply OK.
+  value: '''CLIENT NO-EVICT ON|OFF'' (since 7.0.0) toggles whether the current connection is excluded
+    from the client output-buffer/eviction mechanism; ON protects it, OFF re-includes it. ''CLIENT NO-TOUCH
+    ON|OFF'' (since 7.2.0) toggles whether commands from the current connection update accessed keys''
+    LRU/LFU statistics; with ON the access time is not modified except when the explicit TOUCH command
+    is used. Both reply Simple string OK (Simple error on invalid argument). The NO-EVICT state is surfaced
+    as the ''e'' flag in CLIENT LIST.'
+  source_url: https://redis.io/docs/latest/commands/client-no-touch/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Syntax, semantics, OK reply, and version tags taken from both dedicated pages; NO-TOUCH
+    7.2.0 confirmed from its own authoritative page (the NO-EVICT page's passing note saying 7.0.0 was
+    overridden by the dedicated NO-TOUCH page).
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/client-no-touch/
+    note: 'Confirmed via WebFetch of both pages: CLIENT NO-EVICT available since 7.0.0; CLIENT NO-TOUCH
+      available since 7.2.0 (per its dedicated page, authoritative over the NO-EVICT page''s incidental
+      7.0.0 note); both ON|OFF, both reply OK; TOUCH still updates access time under NO-TOUCH ON.'
+- id: redis-command-introspection
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.0+ (docs/latest; COUNT/GETKEYS since 2.8.13, DOCS + INFO elems 7-10 since 7.0.0)
+  claim: Redis COMMAND INFO returns a 10-element-per-command array (nil for unknown commands), COMMAND
+    DOCS returns a name->doc map, COMMAND COUNT an integer, and COMMAND GETKEYS an array of key names.
+  value: 'COMMAND INFO returns an array; each known command is a nested array of 10 elements: name, arity,
+    flags[], first-key, last-key, key-step, acl-categories[], tips[], key-specifications[], subcommands[]
+    (elements 7-10 added in 7.0.0). Unknown command names yield a nil/null entry at their position. COMMAND
+    DOCS [name ...] (since 7.0.0) returns a map (RESP3) / flattened array (RESP2) keyed by command name,
+    each value carrying summary, since, group, complexity, arguments, doc_flags, history, etc. COMMAND
+    COUNT (since 2.8.13) returns an Integer of total commands, O(1). COMMAND GETKEYS command [arg ...]
+    (since 2.8.13) returns an array of the key names the given command would access (errors when the command
+    is invalid or has no keys); the related COMMAND GETKEYSANDFLAGS (7.0.0) returns each key paired with
+    its access flags.'
+  source_url: https://redis.io/docs/latest/commands/command-info/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Reply shapes, the 10-element COMMAND INFO layout with 7-10 added in 7.0.0, nil-for-unknown
+    behavior, and version tags for DOCS/COUNT/GETKEYS taken directly from the four official COMMAND subcommand
+    pages.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/command-docs/
+    note: Confirmed via WebFetch of COMMAND INFO (10 nested elements, elems 7-10 since 7.0.0, nil for
+      unknown), COMMAND DOCS (since 7.0.0, map/array reply), COMMAND COUNT (since 2.8.13, integer reply),
+      and COMMAND GETKEYS (since 2.8.13, array reply; GETKEYSANDFLAGS since 7.0.0).
