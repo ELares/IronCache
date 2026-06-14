@@ -375,6 +375,46 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "The command has no key arguments")
     }
 
+    /// `ERR no such key` - the reply Redis emits (via `shared.nokeyerr`) when
+    /// RENAME/RENAMENX's source key does not exist (src/db.c `renameGenericCommand`
+    /// -> `lookupKeyWriteOrReply(c, c->argv[1], shared.nokeyerr)`). Byte-exact.
+    #[must_use]
+    pub fn no_such_key() -> Self {
+        ErrorReply::new(ErrorCode::Err, "no such key")
+    }
+
+    /// `ERR invalid cursor` - the reply Redis emits (src/db.c
+    /// `parseScanCursorOrReply` -> `addReplyError(c, "invalid cursor")`) when a SCAN
+    /// family cursor is not a valid unsigned-decimal token. Byte-exact.
+    #[must_use]
+    pub fn invalid_cursor() -> Self {
+        ErrorReply::new(ErrorCode::Err, "invalid cursor")
+    }
+
+    /// `ERR An LFU maxmemory policy is not selected, access frequency not tracked...`,
+    /// the reply Redis emits (src/object.c `objectCommandGetKey` FREQ branch) when
+    /// OBJECT FREQ runs WITHOUT an LFU `maxmemory-policy`. Byte-exact (the full
+    /// sentence including the runtime-switch note clients may surface).
+    #[must_use]
+    pub fn object_freq_requires_lfu() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+        )
+    }
+
+    /// `ERR An LFU maxmemory policy is selected, idle time not tracked...`, the reply
+    /// Redis emits (src/object.c OBJECT IDLETIME branch) when OBJECT IDLETIME runs
+    /// UNDER an LFU `maxmemory-policy` (idle time is not meaningful under LFU).
+    /// Byte-exact.
+    #[must_use]
+    pub fn object_idletime_under_lfu() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+        )
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free
@@ -518,6 +558,26 @@ mod tests {
     #[test]
     fn syntax_error_is_byte_exact() {
         assert_eq!(ErrorReply::syntax_error().line(), "-ERR syntax error");
+    }
+
+    #[test]
+    fn keyspace_introspection_errors_are_byte_exact() {
+        // Verified against redis/redis: src/db.c (shared.nokeyerr, parseScanCursorOrReply)
+        // and src/object.c (OBJECT FREQ / IDLETIME LFU gating).
+        assert_eq!(ErrorReply::no_such_key().line(), "-ERR no such key");
+        assert_eq!(ErrorReply::invalid_cursor().line(), "-ERR invalid cursor");
+        assert_eq!(
+            ErrorReply::object_freq_requires_lfu().line(),
+            "-ERR An LFU maxmemory policy is not selected, access frequency not tracked. \
+             Please note that when switching between policies at runtime LRU and LFU data \
+             will take some time to adjust."
+        );
+        assert_eq!(
+            ErrorReply::object_idletime_under_lfu().line(),
+            "-ERR An LFU maxmemory policy is selected, idle time not tracked. \
+             Please note that when switching between policies at runtime LRU and LFU data \
+             will take some time to adjust."
+        );
     }
 
     #[test]
