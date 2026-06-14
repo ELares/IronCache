@@ -10,8 +10,21 @@
 //! Per WTINYLFU.md the variant keeps ONLY the frequency comparison: there is NO SLRU
 //! window and NO per-hit list relink (both deferred / dropped, see the spec's
 //! "Reconciliation with EVICTION.md"), and NO doorkeeper (OFF by default, also
-//! deferred here). The read path stays a single in-place sketch bump.
+//! deferred here).
 //!
+//! ## Per-read sketch bump: a deliberate DIVERGENCE from WTINYLFU.md (not yet the
+//! spec target)
+//!
+//! WTINYLFU.md specifies a decision-path-only sketch (bumped for admission
+//! candidates and victims, NOT per GET) plus an acceptance lint asserting "no
+//! per-read sketch mutation". This first-cut implementation instead does an inline
+//! min-increment per access ([`WTinyLfu::on_access`], O(depth), bounded, no alloc),
+//! sampling the FULL read stream the way Caffeine's W-TinyLFU does. That is a
+//! conscious divergence: a fuller frequency signal at the cost of an O(depth) bump
+//! on the GET path, versus the spec's leaner decision-path sampling. Which wins on
+//! the hit-ratio/throughput tradeoff is a harness question (#47/#8); the
+//! decision-path-only model, a read buffer drained off the GET critical path, and
+//! the no-per-read-mutation lint are DEFERRED follow-ups, NOT satisfied here.
 //! ## What lives here
 //!
 //! - [`CmSketch`]: a 4-bit count-min frequency estimator with MIN-INCREMENT and
@@ -405,10 +418,12 @@ impl WTinyLfu {
 
 impl EvictionHook for WTinyLfu {
     fn on_access(&mut self, db: u32, key: &[u8]) {
-        // The ONLY per-access cost: a min-increment of the sketch (O(depth)). No list
-        // relink, no per-read scan (WTINYLFU.md hot-path contract). The sketch tracks
-        // the read stream so a frequently-accessed key accrues frequency and survives
-        // eviction.
+        // Inline min-increment of the sketch (O(depth), no alloc, no list relink) so
+        // the sketch tracks the full read stream and a frequently-accessed key accrues
+        // frequency and survives eviction. NOTE: this is a deliberate DIVERGENCE from
+        // WTINYLFU.md's decision-path-only model and its "no per-read sketch mutation"
+        // acceptance lint, which are DEFERRED (see the module header). It does NOT yet
+        // satisfy that hot-path contract; the cost is bounded to O(depth) per GET.
         self.sketch.increment(db, key);
     }
 

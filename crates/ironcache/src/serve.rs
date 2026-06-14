@@ -303,6 +303,12 @@ async fn serve_connection(
     // even when no command arrives (EXPIRATION.md). It is spawned here (not at thread
     // boot) because spawn_on_shard needs the shard's running LocalSet, which exists by
     // the time the first connection is being served on this thread.
+    //
+    // FORWARD-LOOKING: spawning on the first connection means a shard that never
+    // receives a connection never starts its drain. Harmless today (no cross-shard key
+    // routing exists, so a connectionless shard owns no keys), but when cluster routing
+    // lands a data-bearing connectionless shard could accumulate expired memory; at that
+    // point spawn this at shard-thread boot or on first key insert instead.
     spawn_expire_task(
         rt,
         Rc::clone(&env),
