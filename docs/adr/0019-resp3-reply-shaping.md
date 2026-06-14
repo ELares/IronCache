@@ -14,10 +14,11 @@ emits once a connection is upgraded.
 
 ## Decision
 
-Match Redis per command. When `proto=3`, emit the native RESP3 aggregate types
-(map `%`, set `~`, double `,`, big number `(`, verbatim `=`, push `>`) for
-exactly the commands where Redis/Valkey emit them, and RESP2 shapes everywhere
-else; under `proto=2` emit the RESP2 shapes [resp-type-prefixes]. Null is the
+Match Redis per command. When `proto=3`, emit the RESP3-specific types where
+Redis/Valkey emit them (map `%`, set `~`, double `,`, boolean `#`, big number
+`(`, verbatim `=`, push `>`; the list is illustrative, the per-command match rule
+is authoritative), and RESP2 shapes everywhere else; under `proto=2` emit the
+RESP2 shapes [resp-type-prefixes]. Null is the
 RESP3 null `_` under proto=3 and the null bulk/array (`$-1` / `*-1`) under proto=2
 [resp2-null-encodings]. Error replies are byte-identical to Valkey on the leading
 token and use the exact catalog text (#18); the contract is behavioral

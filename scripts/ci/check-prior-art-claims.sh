@@ -47,10 +47,12 @@ echo "claims.yaml: $id_count unique ids"
 missing_total=0
 for f in "${PROSE_FILES[@]}"; do
   [ -f "$f" ] || { echo "WARN: prose file not found: $f" >&2; continue; }
-  # Citations are bracketed kebab tokens with a hyphen, e.g. [redis-io-threads-default].
-  # Every claim id is kebab-case (contains a hyphen), so the hyphen filter excludes
-  # single-word markdown link texts like [charter] while keeping real citations.
-  cites="$(grep -oE '\[[a-z0-9][a-z0-9-]*\]' "$f" | sed -E 's/^\[//; s/\]$//' | grep -- '-' | sort -u || true)"
+  # Citations are bracketed claim ids, e.g. [redis-io-threads-default] or
+  # [sharded-pubsub-7.0] (ids may contain dots/uppercase). We match the token plus
+  # an optional trailing "(" and drop the link form "[text](" so markdown links are
+  # excluded; the hyphen filter then drops single-word link texts like [charter]
+  # (every claim id is kebab-case with a hyphen).
+  cites="$(grep -oE '\[[a-z0-9][a-zA-Z0-9._-]*\]\(?' "$f" | grep -v '($' | sed -E 's/^\[//; s/\]$//' | grep -- '-' | sort -u || true)"
   n_missing=0
   while IFS= read -r c; do
     [ -z "$c" ] && continue

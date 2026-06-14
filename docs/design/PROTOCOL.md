@@ -33,6 +33,8 @@ resolve to Compatible first.
   length, accumulated incomplete-frame bytes, parser-work budget) are enforced
   here per the hardening design (#138); the 512 MB bulk cap is the default of the
   tunable `proto-max-bulk-len` [bulk-string-max-512mb], not a hard constant.
+- On input, the RESP3 attribute marker (`|`) and streamed-aggregate markers are
+  tolerated (parsed and skipped); IronCache does not emit them in v1, per #15.
 
 ### Serializer and reply shaping
 
@@ -48,8 +50,9 @@ resolve to Compatible first.
 ### Per-connection state machine (HELLO-driven)
 
 - A connection starts in RESP2 [resp3-opt-in-via-hello]. `HELLO` with no version
-  reports server info and keeps the current proto; `HELLO 2` / `HELLO 3` switch
-  proto; an unsupported version returns `-NOPROTO` [hello-noproto-error].
+  reports the server-info map (the fields `server`, `version`, `proto`, `id`,
+  `mode`, `role`, `modules`) and keeps the current proto; `HELLO 2` / `HELLO 3`
+  switch proto; an unsupported version returns `-NOPROTO` [hello-noproto-error].
 - Per-connection state: protocol version, authenticated user (default user per
   [acl-default-user]), selected DB, name, RESP3 push/tracking flags, and the
   MULTI queue (the transaction surface is ADR-0010). State is shard-core-local;
@@ -59,10 +62,14 @@ resolve to Compatible first.
 
 `PING`, `HELLO`, `AUTH`, `SELECT`, `QUIT`, `RESET`, and the `CLIENT`
 subcommands needed so handshakes succeed (`CLIENT SETNAME/GETNAME/SETINFO/ID`),
-plus `COMMAND DOCS`/`COMMAND COUNT` stubs sufficient for client startup. The full
-admin `CLIENT`/`COMMAND` surface is a later design; Tier 0 only needs the
-handshake to complete for every mainstream client against the ~240-command
-expectation [redis-core-command-count].
+plus `COMMAND DOCS`/`COMMAND COUNT` stubs sufficient for client startup. The
+admin `CLIENT` subcommands that #15 also listed (`LIST`, `KILL`, `INFO`,
+`NO-EVICT`, `NO-TOUCH`) and the full `COMMAND` introspection family are
+deliberately deferred to the admin-command design (audit-filed): they are not
+handshake-critical, so Tier 0 is scoped to handshake-only here, a deliberate
+narrowing of #15's listed set. Tier 0 only needs the handshake to complete for
+every mainstream client against the ~240-command expectation
+[redis-core-command-count].
 
 ### Interaction model
 

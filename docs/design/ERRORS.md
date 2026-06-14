@@ -45,6 +45,23 @@ behaviorally equivalent (ADR-0009). The differential oracle (#97) enforces the
 chosen bar per message; where Valkey wording drifts across versions, the pinned
 oracle version wins.
 
+### Pinned verbatim strings (handshake-critical and control-flow)
+
+These exact strings are pinned in the catalog (not deferred to the oracle),
+because clients pattern-match them:
+
+- `WRONGTYPE Operations against a key holding the wrong kind of value`
+- `ERR unknown command '<name>', with args beginning with: ...`
+- `ERR wrong number of arguments for '<command>' command`
+- `EXECABORT Transaction discarded because of previous errors.`
+- `NOPROTO` uses the pinned Valkey/Redis wording [hello-noproto-error]
+  (for example `NOPROTO sorry, this protocol version is not supported.`).
+- `NOAUTH Authentication required.` and `WRONGPASS invalid username-password
+  pair or user is disabled.`
+
+The pinned text tracks the oracle version (#96); a drift in upstream wording is a
+deliberate catalog update, not silent.
+
 ### Internal mapping
 
 Every internal error type (a typed Rust enum, never a stringly-typed error)
