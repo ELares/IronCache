@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -143,6 +149,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,7 +184,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -177,6 +200,8 @@ dependencies = [
  "ironcache-protocol",
  "ironcache-runtime",
  "ironcache-server",
+ "ironcache-storage",
+ "ironcache-store",
  "libc",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -231,7 +256,25 @@ dependencies = [
  "ironcache-observe",
  "ironcache-protocol",
  "ironcache-runtime",
+ "ironcache-storage",
+ "ironcache-store",
  "tokio",
+]
+
+[[package]]
+name = "ironcache-storage"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
+name = "ironcache-store"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "hashbrown 0.16.1",
+ "ironcache-storage",
 ]
 
 [[package]]
