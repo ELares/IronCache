@@ -7636,3 +7636,98 @@ claims:
       'TYPE returns string' phrasing is the documented corollary of bitmaps being the String type (the
       SETBIT page stores into a key and GETs it back as a string), not a verbatim quote, hence self-verified
       rather than confirmed.
+- id: redis-shutdown-save-nosave-default
+  dimension: resp-protocol-compat
+  system: Redis
+  version: Redis 7.x / latest (redis.io docs)
+  claim: 'The Redis SHUTDOWN command''s default save behavior is conditional on configured save points:
+    with no modifier it performs a blocking SAVE only if at least one save point is configured; the SAVE
+    modifier forces a DB save even if no save points are configured; the NOSAVE modifier prevents a DB
+    save even if one or more save points are configured.'
+  value: default = save iff >=1 save point configured; SAVE = always save; NOSAVE = never save
+  source_url: https://redis.io/docs/latest/commands/shutdown/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Primary official Redis command documentation; exact wording quoted ('SAVE will force
+    a DB saving operation even if no save points are configured', 'NOSAVE will prevent a DB saving operation
+    even if one or more save points are configured', and default step 'Perform a blocking SAVE if at least
+    one save point is configured').
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/shutdown/
+    note: 'Confirmed verbatim from the official redis.io SHUTDOWN page: default behavior performs a blocking
+      SAVE only if at least one save point is configured; SAVE forces save even with no save points; NOSAVE
+      prevents save even when save points are configured. Cross-confirmed by mirror redis-doc and Dragonfly''s
+      Redis-compatible command reference.'
+- id: redis-sigterm-sigint-graceful-shutdown
+  dimension: resp-protocol-compat
+  system: Redis
+  version: Redis 7.x / latest (redis.io docs)
+  claim: 'Redis handles SIGTERM and SIGINT by performing a graceful shutdown: the server does not immediately
+    exit but schedules a shutdown similar to the one performed by the SHUTDOWN command, starting as soon
+    as the currently executing command terminates (with a possible additional delay of 0.1 seconds or
+    less); if the RDB file can''t be saved the shutdown fails and the server keeps running to avoid data
+    loss.'
+  value: SIGTERM and SIGINT => scheduled graceful shutdown (like SHUTDOWN), not immediate exit
+  source_url: https://redis.io/docs/latest/operate/oss_and_stack/reference/signals/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Primary official Redis signal-handling reference; quoted text 'The SIGTERM and SIGINT
+    signals tell Redis to shut down gracefully... it does not immediately exit. Instead, it schedules
+    a shutdown similar to the one performed by the SHUTDOWN command.'
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/operate/oss_and_stack/reference/signals/
+    note: Confirmed verbatim from official Redis signal-handling docs that both SIGTERM and SIGINT trigger
+      a graceful, scheduled shutdown equivalent to the SHUTDOWN command (not an immediate exit), waiting
+      for the current command to finish plus <=0.1s, and aborting shutdown if RDB cannot be saved.
+- id: k8s-termination-grace-period-default-30s-sigterm-sigkill
+  dimension: ops-build-distribution
+  system: Kubernetes
+  version: Kubernetes (current docs, kubernetes.io Pod Lifecycle)
+  claim: On pod termination Kubernetes runs the container's preStop hook (if defined), sends SIGTERM to
+    the container's main process, then after a grace period sends SIGKILL if the process has not exited;
+    the grace period is governed by terminationGracePeriodSeconds, which defaults to 30 seconds and is
+    a shared budget covering both the preStop hook and the application's own shutdown.
+  value: terminationGracePeriodSeconds default = 30s; sequence preStop -> SIGTERM -> (grace) -> SIGKILL
+  source_url: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Primary official Kubernetes Pod Lifecycle docs state 'A Pod is granted a term to
+    terminate gracefully, which defaults to 30 seconds'; preStop->SIGTERM->grace->SIGKILL sequence corroborated
+    across the docs and CNCF guide.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/
+    note: 'Confirmed from official Kubernetes Pod Lifecycle docs: default grace period 30s, kubelet runs
+      preStop hook (when defined and grace period != 0) then sends SIGTERM and, after the grace period,
+      SIGKILL. The grace period is the combined budget for preStop plus container stop; if preStop is
+      still running at expiry the kubelet adds a one-off 2s extension. Cross-confirmed by the CNCF Dec
+      2024 pod-termination-lifecycle guide.'
+- id: systemd-timeoutstopsec-default-90s-sigterm-sigkill
+  dimension: ops-build-distribution
+  system: systemd
+  version: systemd (man7.org / freedesktop systemd.service(5), systemd-system.conf(5))
+  claim: systemd stops a service by sending SIGTERM and, if the service has not stopped after TimeoutStopSec,
+    forcibly terminating it with SIGKILL (unless disabled via SendSIGKILL=); TimeoutStopSec defaults to
+    DefaultTimeoutStopSec from the manager configuration, which defaults to 90 seconds in both the system
+    and user manager.
+  value: TimeoutStopSec = DefaultTimeoutStopSec (default 90s) then SIGKILL after SIGTERM
+  source_url: https://man7.org/linux/man-pages/man5/systemd-system.conf.5.html
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: 'Primary systemd man pages: systemd.service(5) states TimeoutStopSec ''Defaults to
+    DefaultTimeoutStopSec= from the manager configuration file'' and that after the timeout the service
+    ''will be forcibly terminated by SIGKILL''; systemd-system.conf(5) states ''DefaultTimeoutStartSec
+    and DefaultTimeoutStopSec default to 90 s in the system manager and 90 s in the user manager''.'
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://man7.org/linux/man-pages/man5/systemd-system.conf.5.html
+    note: 'Confirmed from systemd man pages: TimeoutStopSec defaults to DefaultTimeoutStopSec (90s system
+      and user manager). Termination sequence is SIGTERM first (or KillSignal=), then SIGKILL after the
+      timeout unless SendSIGKILL= disables it. The freedesktop.org mirror returned HTTP 403 to WebFetch,
+      so the man7.org mirror is cited as best source; content matches the official systemd documentation.'
