@@ -694,22 +694,64 @@ impl<A: AccountingHook> ironcache_storage::PolicySwap for ShardStore<Policy, A> 
     /// ADR-0003: no std rand in the library). Implemented ONLY for the concrete
     /// [`Policy`] hook (the swap installs a fresh `Policy`), not for the generic `E`.
     ///
-    /// The previous policy's tracking state (S3-FIFO queues / W-TinyLFU sketch /
-    /// Random roster) is DISCARDED: the new policy starts with empty eviction history.
-    /// CONFIG.md and Redis both document this ("the policy switch takes time to
-    /// adjust"). The KEYSPACE and the byte accounting are UNTOUCHED, so no resident
-    /// data is lost; only the eviction-ordering metadata resets. The new policy will
-    /// re-observe keys on subsequent accesses/inserts. Returns `false` for an
-    /// unrecognized `name` (leaving the existing policy in place); the dispatch layer
-    /// validates the name first, so that is the defensive path.
-    fn set_policy_by_name(&mut self, name: &str, rng_seed: u64) -> bool {
-        match map_policy_name(name, rng_seed) {
-            Some(policy) => {
-                self.eviction = policy;
-                true
-            }
-            None => false,
+    /// The previous policy's RANKING HISTORY (S3-FIFO queue positions / W-TinyLFU sketch
+    /// counts / LRU recency) is DISCARDED: the new policy starts with empty eviction
+    /// ordering. CONFIG.md and Redis both document this ("the policy switch takes time to
+    /// adjust"). The KEYSPACE and the byte accounting are UNTOUCHED, so no resident data
+    /// is lost.
+    ///
+    /// IC-1 fix: the new policy is RE-SEEDED from the live keyspace BEFORE returning, so
+    /// it has eviction candidates immediately. Without this, the fresh policy has an
+    /// EMPTY roster while the keyspace is populated, so [`EvictionHook::select_victim`]
+    /// returns `None` and a populated, over-budget shard would reply a spurious `-OOM`
+    /// (eviction cannot find a victim) until every key happens to be re-observed by a
+    /// later access/insert. We iterate every live entry in every db and call
+    /// [`EvictionHook::on_insert`] with the SAME logical-byte accounting the normal
+    /// insert path uses ([`KvObj::accounted_bytes`]), skipping any entry already past its
+    /// deadline at `now` (a lazily-expired key must not be re-seeded as a candidate; the
+    /// lazy/active backstops will reap it). This is O(live keys), once per (rare) swap,
+    /// off the hot path. Returns `false` for an unrecognized `name` (leaving the existing
+    /// policy in place); the dispatch layer validates the name first, so that is the
+    /// defensive path.
+    fn set_policy_by_name(&mut self, name: &str, rng_seed: u64, now: UnixMillis) -> bool {
+        let Some(policy) = map_policy_name(name, rng_seed) else {
+            return false;
+        };
+        self.eviction = policy;
+        // Re-seed the fresh policy's candidate roster from the live keyspace so
+        // select_victim works immediately (IC-1). Collect (db, key, bytes) first so the
+        // immutable db borrow ends before the mutable eviction-hook calls; skip entries
+        // whose deadline has strictly passed at `now` (lazily-expired, must not seed).
+        let mut seed_set: Vec<(u32, Box<[u8]>, usize)> = self
+            .dbs
+            .iter()
+            .enumerate()
+            .flat_map(|(db_idx, map)| {
+                let db = db_idx as u32;
+                map.iter().filter_map(move |(key, obj)| {
+                    if obj.is_expired(now) {
+                        None
+                    } else {
+                        Some((db, key.clone(), obj.accounted_bytes()))
+                    }
+                })
+            })
+            .collect();
+        // Re-seed in a DETERMINISTIC order (ADR-0003): the `hashbrown` map iteration
+        // order varies per instance (a per-table RandomState), so feeding `on_insert` in
+        // raw iteration order would make a *-random policy's re-seeded roster (and thus
+        // its seeded victim choice) differ run-to-run. Sort by (db, scan_hash, key bytes)
+        // -- the same stable, resize-invariant order SCAN/RANDOMKEY use -- so two shards
+        // with identical keyspaces and the same RNG seed re-seed identically.
+        seed_set.sort_unstable_by(|(da, ka, _), (db, kb, _)| {
+            da.cmp(db)
+                .then_with(|| scan_hash(ka).cmp(&scan_hash(kb)))
+                .then_with(|| ka.cmp(kb))
+        });
+        for (db, key, bytes) in seed_set {
+            self.eviction.on_insert(db, &key, bytes);
         }
+        true
     }
 }
 
@@ -1239,7 +1281,7 @@ mod policy_swap_tests {
         assert!(store.access_freq(0, b"k1").is_none());
 
         // Swap to allkeys-lfu (the real W-TinyLFU engine).
-        assert!(store.set_policy_by_name("allkeys-lfu", 7));
+        assert!(store.set_policy_by_name("allkeys-lfu", 7, UnixMillis(0)));
         assert_eq!(store.eviction.policy_name(), "allkeys-lfu");
         // The keyspace is INTACT across the swap (only eviction metadata reset).
         assert_eq!(store.len(), 2);
@@ -1254,9 +1296,111 @@ mod policy_swap_tests {
     #[test]
     fn swap_rejects_unknown_name_and_keeps_policy() {
         let mut store = store_with("allkeys-lru");
-        assert!(!store.set_policy_by_name("allkeys-ttl", 1));
+        assert!(!store.set_policy_by_name("allkeys-ttl", 1, UnixMillis(0)));
         // The existing policy is unchanged on a rejected swap.
         assert_eq!(store.eviction.policy_name(), "allkeys-lru");
+    }
+
+    #[test]
+    fn swap_reseeds_policy_so_eviction_works_immediately_no_spurious_oom() {
+        // IC-1: a populated, over-budget shard must still EVICT right after a policy
+        // swap. Before the fix the fresh policy had an EMPTY roster, so select_victim
+        // returned None and evict_to_fit freed nothing (the caller would then reply a
+        // spurious -OOM). After the fix the swap re-seeds the new policy from the live
+        // keyspace, so eviction finds a victim on the very next call.
+        let mut store = store_with("allkeys-lru");
+        // Plant several live keys with NO read/insert touching the NEW policy yet.
+        for i in 0..8u8 {
+            let key = [b'k', i];
+            store.upsert(
+                0,
+                &key,
+                NewValue::Bytes(b"value-bytes"),
+                ExpireWrite::Clear,
+                UnixMillis(0),
+            );
+        }
+        let before = store.len();
+        assert_eq!(before, 8);
+        let used = store.used_memory();
+        assert!(used > 0);
+
+        // Swap to allkeys-lfu (a DIFFERENT engine: a fresh, empty W-TinyLFU policy).
+        assert!(store.set_policy_by_name("allkeys-lfu", 7, UnixMillis(0)));
+        assert_eq!(store.eviction.policy_name(), "allkeys-lfu");
+
+        // A denyoom write over a TINY budget must EVICT (no spurious -OOM): evict_to_fit
+        // frees down to the budget. With the re-seed it can select victims immediately;
+        // without it (the bug) it would free ZERO and the caller would -OOM.
+        let tiny_budget = used / 4;
+        let evicted = store.evict_to_fit(tiny_budget, UnixMillis(0));
+        assert!(
+            evicted > 0,
+            "post-swap eviction freed nothing (spurious -OOM): the new policy was not \
+             re-seeded from the live keyspace"
+        );
+        assert!(
+            store.used_memory() <= tiny_budget,
+            "eviction did not bring usage under the budget"
+        );
+        assert!(store.len() < before, "no keys were actually evicted");
+
+        // OBJECT FREQ works under the new LFU policy for a surviving key (access_freq is
+        // Some), proving the swap installed a functioning LFU engine.
+        let survivor = (0..8u8)
+            .map(|i| [b'k', i])
+            .find(|k| store.contains(0, k, UnixMillis(0)))
+            .expect("at least one key survives the partial eviction");
+        assert!(
+            store.access_freq(0, &survivor).is_some(),
+            "OBJECT FREQ must work after the swap to an LFU policy"
+        );
+    }
+
+    #[test]
+    fn swap_does_not_reseed_lazily_expired_entries() {
+        // A key already past its deadline at the swap `now` must NOT be re-seeded as an
+        // eviction candidate (it is lazily-expired; the backstop reaps it on the next
+        // observe). With one expired and one live key, the swap re-seeds ONLY the live
+        // key into the new policy, so evict_to_fit over a zero budget evicts the live key
+        // (a real eviction) and never offers the expired key as a victim.
+        let mut store = store_with("allkeys-lru");
+        // A live key (no TTL) and a key whose deadline is in the past at now=100.
+        store.upsert(
+            0,
+            b"live",
+            NewValue::Bytes(b"v"),
+            ExpireWrite::Clear,
+            UnixMillis(0),
+        );
+        store.upsert(
+            0,
+            b"dead",
+            NewValue::Bytes(b"v"),
+            ExpireWrite::Set(UnixMillis(10)),
+            UnixMillis(0),
+        );
+        assert_eq!(store.len(), 2);
+
+        // Swap at now=100, after `dead`'s deadline (10) but the keyspace still holds it
+        // (not yet reaped). The re-seed must skip `dead`.
+        assert!(store.set_policy_by_name("allkeys-lfu", 1, UnixMillis(100)));
+
+        // Evicting to zero budget at now=100: `live` is the only re-seeded candidate and
+        // is evicted (a real eviction). `dead` was never re-seeded, so the policy never
+        // offers it; it stays resident-but-stale until a read/active-drain reaps it.
+        let evicted = store.evict_to_fit(0, UnixMillis(100));
+        assert_eq!(evicted, 1, "exactly the live key is evicted post-swap");
+        // `live` is gone.
+        assert!(!store.contains(0, b"live", UnixMillis(100)));
+        // `dead` was not re-seeded as a candidate; observing it now lazily reaps it
+        // (the backstop), confirming it was treated as expired, not as an eviction
+        // candidate.
+        assert!(
+            !store.contains(0, b"dead", UnixMillis(100)),
+            "the expired key reads as absent (lazy backstop), never an eviction victim"
+        );
+        assert_eq!(store.len(), 0, "live evicted, dead reaped on observe");
     }
 
     #[test]
@@ -1277,16 +1421,11 @@ mod policy_swap_tests {
                 );
             }
         }
-        assert!(a.set_policy_by_name("allkeys-random", 12345));
-        assert!(b.set_policy_by_name("allkeys-random", 12345));
-        // Re-register the live keys so the Random roster is populated identically.
-        for s in [&mut a, &mut b] {
-            for i in 0..8u8 {
-                let key = [b'k', i];
-                let _ = s.read(0, &key, UnixMillis(0));
-            }
-        }
-        // The same seed yields the same victim choice.
+        // The swap RE-SEEDS the Random roster from the live keyspace (IC-1), so both
+        // stores have an identical, populated roster immediately after the swap.
+        assert!(a.set_policy_by_name("allkeys-random", 12345, UnixMillis(0)));
+        assert!(b.set_policy_by_name("allkeys-random", 12345, UnixMillis(0)));
+        // The same seed over the same re-seeded roster yields the same victim choice.
         assert_eq!(a.eviction.select_victim(), b.eviction.select_victim());
     }
 }

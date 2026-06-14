@@ -723,17 +723,29 @@ pub trait ActiveExpiry {
 /// NOT one of the frozen four primitives; an additive waist trait. A `CONFIG SET
 /// maxmemory-policy` on the dispatch path rebuilds the serving shard's policy through
 /// this, seeded from the Env RNG (ADR-0003 determinism: the seed comes through the
-/// determinism seam, never std rand). The concrete per-shard store implements it; the
-/// eviction history resets on swap (acceptable, Redis itself warns the policy switch
-/// "takes time to adjust").
+/// determinism seam, never std rand). The concrete per-shard store implements it.
+///
+/// The previous policy's eviction RANKING HISTORY (S3-FIFO queue positions / W-TinyLFU
+/// sketch counts / LRU recency) is reset on swap, which is acceptable (Redis itself
+/// warns the policy switch "takes time to adjust"). But the new policy IS RE-SEEDED from
+/// the live keyspace (its roster is repopulated from every resident key), so eviction
+/// works IMMEDIATELY after a swap: a populated over-budget shard can still select a
+/// victim on the very next write rather than spuriously replying `-OOM` until keys are
+/// re-observed. Only the ranking metadata resets; the candidate set does not.
 pub trait PolicySwap {
     /// Rebuild this shard's eviction policy from the Redis `maxmemory-policy` `name`,
     /// seeding any RNG-bearing variant (`*-random`) from `rng_seed` (drawn by the
     /// caller through the Env RNG seam, ADR-0003). Returns `false` if `name` is not a
     /// recognized policy name (the dispatch layer validated it already, so this is the
-    /// defensive path). The previous policy's tracking state is DISCARDED on a
-    /// successful swap (the eviction-history reset CONFIG.md/Redis both document).
-    fn set_policy_by_name(&mut self, name: &str, rng_seed: u64) -> bool;
+    /// defensive path).
+    ///
+    /// On a successful swap the new policy's RANKING HISTORY starts empty (the
+    /// eviction-ordering reset CONFIG.md/Redis both document), but its CANDIDATE ROSTER
+    /// is RE-SEEDED from the live keyspace: every resident, not-yet-lazily-expired entry
+    /// (its deadline has not strictly passed at `now`) is re-observed into the new policy
+    /// so `select_victim` has candidates immediately and eviction does not falsely OOM.
+    /// `now` is the lazy-expiry boundary used to skip entries past their deadline.
+    fn set_policy_by_name(&mut self, name: &str, rng_seed: u64, now: UnixMillis) -> bool;
 }
 
 // ---------------------------------------------------------------------------
