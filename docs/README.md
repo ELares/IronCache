@@ -17,6 +17,7 @@ issues are the specification.
   conflict order, and the governing-document index.
 - [GLOSSARY.md](GLOSSARY.md) and [INVARIANTS.md](INVARIANTS.md): the canonical
   vocabulary and the load-bearing invariants every design must respect.
+- [design/](design/): the subsystem design specifications that gate implementation.
 - [adr/](adr/): the Architecture Decision Records, their registers
   ([INDEX](adr/INDEX.md), [OPEN](adr/OPEN.md), [QUESTIONS](adr/QUESTIONS.md)),
   and the ADR format.
