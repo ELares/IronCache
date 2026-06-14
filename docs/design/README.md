@@ -22,6 +22,10 @@ Claim citations in these docs are validated in CI by
   inline small value, folded metadata bits) (#111).
 - [ENCODINGS.md](ENCODINGS.md): compact scalar value encodings (SSO, tagged
   int/float, variable-width header) (#112).
+- [EVICTION.md](EVICTION.md): the pluggable EvictionPolicy trait, ghost queue,
+  and Redis maxmemory-policy-name mapping (#48, #50).
+- [EXPIRATION.md](EXPIRATION.md): per-shard timing-wheel TTL with lazy backstop
+  and background reclamation (#51).
 
 More design specs land here as the Implementation Readiness milestone progresses
 (runtime, storage API, hash table, eviction, expiration, commands, CLI, config,
