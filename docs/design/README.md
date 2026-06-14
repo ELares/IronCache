@@ -188,3 +188,6 @@ Specs added as the M1 milestone progresses.
   disk-spillable backlog and partial resync (#77).
 - [REBALANCING.md](REBALANCING.md): rebalancing policy and orchestration (trigger,
   hot-partition detection, throttle, drain/decommission) (#148).
+- [TROUBLESHOOTING_COMMANDS.md](TROUBLESHOOTING_COMMANDS.md): diagnostic commands
+  (MEMORY USAGE/STATS/DOCTOR, LATENCY DOCTOR) with synthesized fields/advice over
+  the divergent internals (#151).
