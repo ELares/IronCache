@@ -7931,3 +7931,90 @@ claims:
     note: 'Man page: ''Controls which capabilities to include in the capability bounding set for the executed
       process.'' Whitespace-separated names; ''~'' inverts selection; by default not modified on execution
       (no limits).'
+- id: aead-aes-gcm-vs-xchacha20-nonce-tradeoff
+  dimension: ops-build-distribution
+  system: AEAD cipher selection (AES-256-GCM vs XChaCha20-Poly1305)
+  version: 'AES-GCM: NIST SP 800-38D 96-bit nonce; XChaCha20-Poly1305: 192-bit (24-byte) nonce'
+  claim: AES-256-GCM uses a 96-bit nonce; because that nonce space is too small to safely pick at random
+    across many messages, a birthday-bound collision (nonce reuse) becomes likely after roughly a few
+    billion messages under one key, and nonce reuse with GCM is catastrophic (it leaks the authentication
+    key / breaks confidentiality and integrity), so guidance is to use a counter or rekey (e.g. before
+    ~350 GB / ~2^32 messages under one key). XChaCha20-Poly1305 extends the nonce to 192 bits (24 bytes),
+    which is large enough to choose nonces at random with no practical collision risk under the same key,
+    making it the misuse-resistant choice when random nonces are desired.
+  value: 'AES-256-GCM: 96-bit nonce, nonce reuse catastrophic, rekey before ~2^32 messages / ~350 GB;
+    XChaCha20-Poly1305: 192-bit random nonce, no practical nonce-collision limit'
+  source_url: https://libsodium.gitbook.io/doc/secret-key_cryptography/aead/aes-256-gcm
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Corroborated by libsodium docs (authoritative crypto library guidance), the ChaCha20-Poly1305
+    Wikipedia article, and Filippo Valsorda's XAES-256-GCM writeup; all agree on 96-bit GCM nonce, catastrophic
+    reuse, and 192-bit XChaCha nonce.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://libsodium.gitbook.io/doc/secret-key_cryptography/aead/aes-256-gcm
+    note: libsodium AES-256-GCM doc states the 96-bit nonce is too small to pick at random, birthday-bound
+      collision becomes uncomfortable after a few billion messages with catastrophic consequences, and
+      recommends switching keys before ~350 GB or using (X)ChaCha20-Poly1305 instead. The 192-bit XChaCha20
+      nonce permitting random nonces with no limitation is confirmed by the ChaCha20-Poly1305 Wikipedia
+      article and multiple comparison sources.
+- id: envelope-encryption-dek-wrapped-by-kek-kms
+  dimension: ops-build-distribution
+  system: Envelope encryption pattern (cloud KMS)
+  version: AWS KMS Developer Guide concepts; Google Cloud KMS envelope-encryption docs (accessed 2026-06-14)
+  claim: 'The standard envelope-encryption pattern is: encrypt the data with a locally-generated data
+    encryption key (DEK), then encrypt (''wrap'') the DEK with a separate key-encryption key (KEK) held
+    in a KMS, and store the wrapped DEK alongside the ciphertext. The plaintext KEK never leaves the KMS/HSM;
+    to read the data you call KMS to unwrap the DEK, then use the DEK to decrypt. This limits blast radius
+    (a leaked DEK only exposes data it encrypted) and avoids sending bulk data to KMS. Google Cloud KMS
+    recommends DEKs be 256-bit AES-GCM. AWS KMS implements the same hierarchy: a KMS key (top-level, HSM-backed,
+    never exported in plaintext) protects generated data keys returned to the application in both plaintext
+    and ciphertext form.'
+  value: DEK encrypts data; KEK (in KMS, never exported plaintext) wraps the DEK; wrapped DEK stored with
+    ciphertext; Google recommends 256-bit AES-GCM DEKs
+  source_url: https://docs.cloud.google.com/kms/docs/envelope-encryption
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: 'Directly quoted from both Google Cloud KMS envelope-encryption docs (''The DEK is
+    encrypted (also known as wrapped) by a key encryption key (KEK)'') and the AWS KMS Developer Guide
+    concepts page (key hierarchy: KMS key / HBK never exported plaintext, data keys returned as plaintext
+    + ciphertext).'
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://docs.cloud.google.com/kms/docs/envelope-encryption
+    note: Google Cloud KMS docs define envelope encryption as encrypting a key with another key, define
+      the DEK as the key that encrypts data (recommend 256-bit AES-GCM), and state the DEK is encrypted
+      (wrapped) by a KEK stored in Cloud KMS that never leaves Cloud KMS. AWS KMS concepts page confirms
+      the equivalent hierarchy where the KMS key / HSM backing key never leaves the HSM in plaintext and
+      customer data keys are returned encrypted and/or in plaintext over TLS.
+- id: rustcrypto-aeads-crate-versions-pinned
+  dimension: ops-build-distribution
+  system: RustCrypto AEADs crates (aes-gcm, chacha20poly1305)
+  version: aes-gcm 0.10.3 (latest stable; 0.11.0-rc.4 prerelease); chacha20poly1305 0.10.1 (latest stable;
+    0.11.0-rc.3 prerelease)
+  claim: The RustCrypto AEADs project provides maintained pure-Rust AEAD crates suitable for at-rest encryption.
+    The aes-gcm crate (pure-Rust AES-GCM with optional architecture-specific hardware acceleration) latest
+    stable is 0.10.3, with 0.11.0-rc.4 published 2026-05-25 (requires Rust 1.85, dual Apache-2.0/MIT).
+    The chacha20poly1305 crate (pure-Rust ChaCha20Poly1305 per RFC 8439, and also includes the XChaCha20Poly1305
+    extended-nonce variant plus ChaCha8/ChaCha12Poly1305) latest stable is 0.10.1, with 0.11.0-rc.3 published
+    2026-02-02 (requires Rust 1.85). Both are dual Apache-2.0/MIT licensed. (The 'ring' crate is an alternative
+    AEAD provider for AES-256-GCM and ChaCha20-Poly1305.)
+  value: aes-gcm = 0.10.3 (stable), 0.11.0-rc.4 (pre); chacha20poly1305 = 0.10.1 (stable), 0.11.0-rc.3
+    (pre); chacha20poly1305 also provides XChaCha20Poly1305
+  source_url: https://crates.io/crates/aes-gcm
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Versions read directly from the crates.io JSON API (max_stable_version / max_version)
+    for both crates; descriptions and XChaCha20Poly1305 inclusion confirmed by the RustCrypto/AEADs GitHub
+    README and crate descriptions.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://crates.io/api/v1/crates/chacha20poly1305
+    note: 'crates.io API: aes-gcm max_stable_version 0.10.3, max_version 0.11.0-rc.4 (published 2026-05-25,
+      MSRV Rust 1.85, Apache-2.0/MIT). chacha20poly1305 max_stable_version 0.10.1, max_version 0.11.0-rc.3
+      (published 2026-02-02, MSRV Rust 1.85); crate description confirms it implements RFC 8439 ChaCha20Poly1305
+      plus the XChaCha20Poly1305 extended-nonce variant and ChaCha8/ChaCha12Poly1305. Both crates are
+      part of RustCrypto/AEADs.'
