@@ -1320,6 +1320,41 @@ mod tests {
     }
 
     #[test]
+    fn incrbyfloat_wrongtype_beats_invalid_increment() {
+        // Redis `incrbyfloatCommand` checks the TYPE before parsing the increment
+        // argument, so `INCRBYFLOAT <list-key> abc` is WRONGTYPE, NOT
+        // "value is not a valid float" (the malformed increment is irrelevant once
+        // the key is the wrong type). Plant a non-string via the store seam as the
+        // other WRONGTYPE tests do.
+        use ironcache_storage::{DataType, Encoding};
+        use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        let mut obj = KvObj::from_bytes(b"lst", b"x", None);
+        obj.header = Header {
+            data_type: DataType::List,
+            encoding: Encoding::ListPack,
+            eviction_rank: 0,
+            ttl_present: false,
+            snapshot_version: 0,
+        };
+        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        st.insert_object(0, obj);
+        assert_eq!(
+            err_line(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"INCRBYFLOAT", b"lst", b"abc"]
+            )),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+    }
+
+    #[test]
     fn incrbyfloat_absent_format_and_storage() {
         let c = ctx(None);
         let mut s = state(&c);

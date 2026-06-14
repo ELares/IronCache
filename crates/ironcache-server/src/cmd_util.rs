@@ -153,6 +153,9 @@ pub fn parse_f64(arg: &[u8]) -> Option<f64> {
         return None;
     }
     let s = core::str::from_utf8(arg).ok()?;
+    // DIVERGENCE (acknowledged extreme edge): Rust `f64::from_str` rejects C99
+    // hex-float literals like "0x1p4" that Redis's strtold/string2ld accept; this is
+    // practically irrelevant for a counter command and unchanged here by design.
     let v: f64 = s.parse().ok()?;
     // Redis rejects a NaN at parse time (it is not-a-valid-float, distinct from the
     // result NaN/Inf error). Infinity is allowed through (handled by the result

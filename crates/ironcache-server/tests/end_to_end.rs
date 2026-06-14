@@ -12,7 +12,7 @@ use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, decode, encode_to_
 use ironcache_runtime::tokio_rt::bind_reuseport;
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{ConnState, UnixMillis, dispatch};
-use ironcache_store::{ShardStore, process_allocated_bytes, process_resident_bytes};
+use ironcache_store::{ShardStore, process_memory};
 use std::cell::RefCell;
 
 // jemalloc as this test binary's global allocator so the INFO used_memory figure
@@ -62,11 +62,13 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
                     let rollup = || *counters.borrow();
                     let now = UnixMillis(env.now_unix_millis());
                     // Read the process-global allocator figures for INFO (ADR-0006),
-                    // mirroring the server binary's once-per-INFO read.
+                    // mirroring the server binary's once-per-INFO single-snapshot read
+                    // (one epoch advance -> allocated + resident from the same snapshot).
                     let mem = if request.command().eq_ignore_ascii_case(b"INFO") {
+                        let (used_memory, used_memory_rss) = process_memory();
                         MemoryInfo {
-                            used_memory: process_allocated_bytes(),
-                            used_memory_rss: process_resident_bytes(),
+                            used_memory,
+                            used_memory_rss,
                         }
                     } else {
                         MemoryInfo::default()
@@ -357,6 +359,24 @@ fn numeric_append_and_info_over_real_socket() {
             val > 0,
             "INFO used_memory should be > 0, got {val} ({body})"
         );
+
+        // RESP3 leg: switch the connection to RESP3 (HELLO 3 -> a map, '%'), then
+        // INCRBYFLOAT must STILL reply with a bulk string ($<len>\r\n<digits>\r\n),
+        // NOT a RESP3 `,double` (ADR-0019: INCRBYFLOAT is bulk in both protocols).
+        client
+            .write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+            .await
+            .unwrap();
+        let mut hbuf = [0u8; 256];
+        let hn = client.read(&mut hbuf).await.unwrap();
+        assert_eq!(hbuf[0], b'%', "expected RESP3 map, got {:?}", &hbuf[..hn]);
+        // INCRBYFLOAT g 3.25 on an absent key -> "3.25" (non-integer, so it keeps a
+        // dot and is unambiguously a bulk string, not a `,double`).
+        client
+            .write_all(b"*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\ng\r\n$4\r\n3.25\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$4\r\n3.25\r\n").await;
 
         drop(client);
         acceptor.await.unwrap();

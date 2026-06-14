@@ -421,7 +421,9 @@ pub fn cmd_decrby<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
 ///
 /// Operates on the value parsed as an f64 (absent -> 0). A non-float existing value
 /// or increment argument is `-ERR value is not a valid float`; a NaN/Infinity
-/// result is `-ERR increment would produce NaN or Infinity`. The result is stored
+/// result is `-ERR increment would produce NaN or Infinity`. The checks run in
+/// Redis order (type -> existing value -> increment argument), so a non-string key
+/// is WRONGTYPE even when the increment argument is itself malformed. The result is stored
 /// as a STRING (its human-formatted decimal, classified embstr/raw by length, so a
 /// later INCR on an integer-valued result still works), NOT int-encoded
 /// (ENCODINGS.md: the INCRBYFLOAT result is a string). The TTL is left unchanged.
@@ -433,11 +435,15 @@ pub fn cmd_incrbyfloat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &
     if req.args.len() != 3 {
         return Value::error(ErrorReply::wrong_arity("incrbyfloat"));
     }
-    // The increment argument is validated up front (Redis parses argv[2] too).
-    let Some(incr) = parse_f64(&req.args[2]) else {
-        return Value::error(ErrorReply::not_a_valid_float());
-    };
+    // Redis `incrbyfloatCommand` checks the TYPE first (checkType OBJ_STRING),
+    // THEN parses the existing value, THEN parses the increment argument. So the
+    // raw increment Bytes is carried INTO the rmw closure and parsed only after the
+    // type and existing-value checks pass, matching Redis's order: a non-string key
+    // is WRONGTYPE even with a malformed increment (e.g. `INCRBYFLOAT <list> abc`).
+    // (This differs from INCR/INCRBY/DECRBY, where Redis parses the integer increment
+    // argument BEFORE checkType, so those keep their parse-first order.)
     let key = req.args[1].clone();
+    let incr_arg = req.args[2].clone();
     store.rmw(db, &key, now, move |entry| {
         let current: f64 = match &entry {
             RmwEntry::Vacant => 0.0,
@@ -448,6 +454,11 @@ pub fn cmd_incrbyfloat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &
                 Some(n) => n,
                 None => return keep_err(ErrorReply::not_a_valid_float()),
             },
+        };
+        // The increment argument is parsed AFTER the type + existing-value checks
+        // (Redis parses argv[2] last in incrbyfloatCommand).
+        let Some(incr) = parse_f64(&incr_arg) else {
+            return keep_err(ErrorReply::not_a_valid_float());
         };
         let result = current + incr;
         // A NaN/Infinity result is rejected before any write (matching Redis).
