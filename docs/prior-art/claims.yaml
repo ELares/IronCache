@@ -6903,3 +6903,82 @@ claims:
       set to 1; setting 0 (SUID_DUMP_DISABLE) suppresses core dumps on dump-triggering signals. setrlimit(2):
       RLIMIT_CORE is ''the maximum size of a core file ... in bytes that the process may dump'' and ''When
       0 no core dump files are created.'''
+- id: cargo-deny-four-checks
+  dimension: ops-build-distribution
+  system: cargo-deny (EmbarkStudios)
+  version: 0.19.8 (released 2026-05-28)
+  claim: 'cargo-deny is a Cargo plugin that lints a project''s full dependency graph via four checks run
+    by `cargo deny check`: advisories (flags crates with security vulnerabilities, or marked Unmaintained/Unsound,
+    or yanked from the source registry, by consulting an advisory database), licenses (verifies every
+    crate''s SPDX license terms are acceptable), bans (denies/allows specific crates and detects duplicate/multiple
+    versions of the same crate), and sources (verifies each crate originates only from trusted source
+    locations). Since 0.16.0 the advisories check denies all advisories by default; the deprecated per-type
+    severity fields (vulnerability/unmaintained/unsound/notice/severity-threshold) were removed and an
+    advisory must be explicitly listed under `ignore` to be allowed.'
+  value: '4 checks: advisories, licenses, bans (incl. duplicate detection), sources; advisories deny-by-default
+    since 0.16.0'
+  source_url: https://embarkstudios.github.io/cargo-deny/checks/index.html
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Four checks and their descriptions taken verbatim from the official cargo-deny docs
+    checks index; deny-by-default-since-0.16.0 behavior confirmed from the upstream CHANGELOG; version
+    0.19.8/2026-05-28 confirmed from the crates.io API. Prompt's '~0.16.x' guess was stale; pinned to
+    the actual current release.
+  load_bearing: true
+  verification:
+    verdict: corrected
+    best_source_url: https://crates.io/api/v1/crates/cargo-deny
+    note: crates.io API max_stable_version is 0.19.8 (created 2026-05-28), not the ~0.16.x suggested in
+      the task; 0.16.x is when advisories became deny-by-default, which the CHANGELOG confirms. Four-check
+      list cross-checked against embarkstudios.github.io/cargo-deny/checks/index.html and the WebSearch
+      summary of the per-check sub-pages (advisories/licenses/bans/sources).
+- id: cargo-audit-rustsec-lockfile-scan
+  dimension: ops-build-distribution
+  system: cargo-audit + RustSec rustsec crate (rustsec/rustsec)
+  version: cargo-audit 0.22.2 (released 2026-06-05; MSRV Rust 1.88.0)
+  claim: cargo-audit reads a project's Cargo.lock and reports any dependency (including transitive ones)
+    that matches an advisory in the RustSec Advisory Database, emitting a table of crate name, version,
+    advisory ID, severity, and a link. It is built on the `rustsec` crate, can warn on yanked crates,
+    and ships an experimental `cargo audit fix` that rewrites Cargo.toml to non-vulnerable version requirements.
+    It requires a lockfile (it does not resolve the graph itself), making it well suited to a CI merge/release
+    gate.
+  value: Scans Cargo.lock against RustSec advisory-db; outputs name/version/advisory-id/severity per finding;
+    `cargo audit fix` is experimental
+  source_url: https://github.com/rustsec/rustsec/blob/main/cargo-audit/README.md
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Behavior (Cargo.lock scan, output columns, fix subcommand) confirmed from the upstream
+    cargo-audit README; version 0.22.2 / release date 2026-06-05 / MSRV 1.88.0 confirmed from the crates.io
+    API and docs.rs.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://crates.io/api/v1/crates/cargo-audit
+    note: crates.io API reports max_stable_version 0.22.2 created 2026-06-05; docs.rs/crate/cargo-audit/latest
+      shows 0.22.2 with MSRV 1.88.0. README at rustsec/rustsec confirms Cargo.lock-based scanning against
+      the RustSec Advisory Database and the experimental `cargo audit fix`.
+- id: rustsec-advisory-db-wg-secure-code
+  dimension: ops-build-distribution
+  system: RustSec Advisory Database (rustsec/advisory-db)
+  version: git-based, continuously updated; advisory IDs RUSTSEC-YYYY-NNNN (accessed 2026-06-13)
+  claim: The RustSec Advisory Database is a community Git repository (rustsec/advisory-db) of security
+    advisories filed against Rust crates published via crates.io, maintained by the Rust Secure Code Working
+    Group. Each advisory receives an ID of the form RUSTSEC-YYYY-NNNN, advisories are submitted/reviewed
+    as pull requests, and the data is exported in real time to the OSV (Open Source Vulnerabilities) format
+    and consumed by the GitHub Advisory Database / Dependabot. It is the database that both cargo-audit
+    and cargo-deny's advisories check consult.
+  value: Maintained by Rust Secure Code WG; advisory IDs are RUSTSEC-YYYY-NNNN; PR-submitted; exported
+    to OSV
+  source_url: https://rustsec.org/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Maintainer (Rust Secure Code Working Group), the RUSTSEC-YYYY-NNNN ID format, PR
+    submission flow, and OSV export all confirmed verbatim from rustsec.org and the rustsec/advisory-db
+    README.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://rustsec.org/
+    note: rustsec.org states the database is maintained by the Rust Secure Code Working Group, covers
+      crates published via crates.io, uses RUSTSEC-YYYY-NNNN IDs (example RUSTSEC-2022-0051), and exports
+      to OSV in real time for the GitHub Advisory Database/Dependabot. Cross-checked against github.com/rustsec/advisory-db.
