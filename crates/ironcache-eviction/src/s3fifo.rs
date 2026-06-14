@@ -258,11 +258,11 @@ impl EvictionHook for S3Fifo {
     fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
         // A returned victim has been pop_front'd OUT of its queue: the policy no longer
         // tracks it. The store may then SKIP deleting it (a volatile-* policy skips a
-        // non-TTL victim, see `ShardStore::evict_to_fit`); in that case only a later
-        // write (`on_insert`) re-tracks the key. PR-3b's EXPIRE attaches a TTL without
-        // a write, so it MUST call back into the policy to re-register the key, or a
-        // volatile-* policy would under-evict. See the full invariant note in
-        // `ShardStore::evict_to_fit`'s volatile-only skip path (a 3b prerequisite).
+        // non-TTL victim, see `ShardStore::evict_to_fit`); in that case the store calls
+        // [`EvictionPolicy::re_register`] to put the key BACK as a candidate (the #46
+        // re-eligibility fix), so a later EXPIRE that attaches a TTL makes it eligible
+        // without a rewrite. (PR-3a instead DROPPED such a key, which under-evicted a
+        // volatile-* policy; #46 is now fixed.)
         //
         // Guaranteed progress: cap the total promotion/second-chance rounds so an
         // all-hot keyspace still yields a victim instead of spinning. The bound is
@@ -347,6 +347,33 @@ impl EvictionPolicy for S3Fifo {
 
     fn volatile_only(&self) -> bool {
         self.volatile_only
+    }
+
+    fn re_register(&mut self, db: u32, key: &[u8]) {
+        // The volatile-* re-eligibility fix (#46): `select_victim` pop_front'd this
+        // key, and the store declined to delete it (a non-TTL key under a volatile-*
+        // policy). Put it BACK so it stays an eviction candidate; a later EXPIRE that
+        // attaches a TTL then makes it eligible.
+        //
+        // We re-queue to the SMALL BACK with a reset frequency. This is the queue that
+        // keeps it REACHABLE by the next `select_victim`: the draw prefers the small
+        // queue while it is over its ~10% target (and falls back to it when main is
+        // empty), so a re-registered cold candidate stays in front of the scan rather
+        // than being parked behind main where the draw might not revisit it. These are
+        // keys the policy already judged cold (it offered them as victims), so the
+        // probationary small queue is the right home; the store's bounded
+        // consecutive-skip guard stops the scan once the whole offerable set has cycled
+        // with no eligible TTL key. Idempotent: do not duplicate an already-tracked key.
+        if self.small.iter().any(|e| e.matches(db, key))
+            || self.main.iter().any(|e| e.matches(db, key))
+        {
+            return;
+        }
+        self.small.push_back(Entry {
+            db,
+            key: key.to_vec().into_boxed_slice(),
+            freq: 0,
+        });
     }
 }
 
@@ -481,6 +508,52 @@ mod tests {
         let ttl = S3Fifo::with_name(true, "volatile-ttl");
         assert_eq!(ttl.policy_name(), "volatile-ttl");
         assert_eq!(ttl.engine_family(), "volatile-lru");
+    }
+
+    #[test]
+    fn re_register_keeps_a_skipped_victim_trackable() {
+        // The #46 re-eligibility fix: a victim the store declines to delete (a non-TTL
+        // key under volatile-*) is RE-REGISTERED, so the policy keeps offering it. The
+        // PR-3a path dropped it (on_remove), so it could never be a victim again.
+        let mut p = S3Fifo::new(true);
+        ins(&mut p, b"x");
+        // The store pulls x as a victim, then (non-TTL under volatile-*) re-registers
+        // it instead of deleting.
+        let v = p.select_victim().expect("x is offered as a victim");
+        assert_eq!(v.1.as_ref(), b"x");
+        // After select_victim, x is no longer queued (it was pop_front'd).
+        assert!(
+            !p.small
+                .iter()
+                .chain(p.main.iter())
+                .any(|e| e.matches(0, b"x")),
+            "select_victim pops the candidate out"
+        );
+        // Re-register puts it back so it stays a candidate.
+        p.re_register(0, b"x");
+        assert!(
+            p.small
+                .iter()
+                .chain(p.main.iter())
+                .any(|e| e.matches(0, b"x")),
+            "re_register keeps the key trackable (#46)"
+        );
+        // It is offered again on the next pass (now eligible if it has since gained a
+        // TTL at the store; the policy does not know about TTL, the store filters).
+        assert_eq!(
+            p.select_victim().map(|(_, k)| k.into_vec()),
+            Some(b"x".to_vec())
+        );
+        // re_register is idempotent: re-registering a still-tracked key does not dup.
+        p.re_register(0, b"x"); // x was just popped, so this re-adds once
+        p.re_register(0, b"x"); // already present now -> no-op
+        let count = p
+            .small
+            .iter()
+            .chain(p.main.iter())
+            .filter(|e| e.matches(0, b"x"))
+            .count();
+        assert_eq!(count, 1, "re_register must not duplicate a tracked key");
     }
 
     #[test]

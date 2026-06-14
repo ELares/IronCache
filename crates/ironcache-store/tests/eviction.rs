@@ -8,7 +8,9 @@
 //! `with_hooks` (the binary's wiring path).
 
 use ironcache_eviction::Policy;
-use ironcache_storage::{Admit, ExpireWrite, NewValue, Store, UnixMillis};
+use ironcache_storage::{
+    Admit, ExpireWrite, NewValue, RmwAction, RmwEntry, RmwStep, Store, UnixMillis,
+};
 use ironcache_store::ShardStore;
 
 type PolicyStore = ShardStore<Policy, ironcache_storage::CountingAccounting>;
@@ -147,6 +149,82 @@ fn volatile_only_with_no_ttl_keys_frees_nothing() {
     let evicted = st.evict_to_fit(0, UnixMillis(0));
     assert_eq!(evicted, 0);
     assert_eq!(st.used_memory(), before);
+}
+
+/// Attach a TTL to an EXISTING key the way the 3b EXPIRE command does: an `rmw`
+/// with `RmwAction::Keep` (value untouched) + `ExpireWrite::Set` (the new deadline).
+/// This is NOT a rewrite (`upsert` would re-insert and so re-track the key through
+/// the eviction `on_insert` funnel, masking the re-eligibility path); it sets only
+/// the deadline, which is exactly the case #46 must handle.
+fn expire_existing(st: &mut PolicyStore, key: &[u8], deadline: u64) {
+    st.rmw(0, key, UnixMillis(0), |entry| {
+        assert!(
+            matches!(entry, RmwEntry::Occupied(_)),
+            "expire_existing requires a live key"
+        );
+        RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Set(UnixMillis(deadline)),
+            reply: (),
+        }
+    });
+}
+
+#[test]
+fn volatile_re_eligibility_after_expire_attaches_a_ttl() {
+    // The #46 fix: a non-TTL key the volatile-* policy could not evict (because it
+    // lacks a TTL) must REMAIN an eviction candidate, so a later EXPIRE that attaches
+    // a TTL makes it eligible. The PR-3a bug dropped such a key from the policy on the
+    // first skip, so it could never be evicted again even after gaining a TTL.
+    let mut st = store_with(Policy::S3Fifo(ironcache_eviction::S3Fifo::new(true)));
+    assert!(st.policy_volatile_only());
+
+    // All keys start WITHOUT a TTL. (No `read` between the phases: a read fires
+    // `on_access`, which bumps the S3-FIFO frequency and would confound the proof with
+    // frequency-promotion; the entry count is asserted instead to confirm survival.)
+    set(&mut st, b"a");
+    set(&mut st, b"b");
+    set(&mut st, b"c");
+    let before = st.used_memory();
+    assert_eq!(st.len(), 3);
+    assert!(before > 0);
+
+    // Phase 1: with no TTL-bearing keys, a volatile-* policy frees NOTHING (it tries
+    // each key, finds no TTL, RE-REGISTERS it, and the bounded scan stops). This both
+    // proves the OOM-when-no-evictable-volatile-key behavior AND exercises the skip +
+    // re-register path that #46 must make non-destructive. The PR-3a bug dropped each
+    // skipped key from the policy here, so phase 2 could never evict it.
+    let freed = st.evict_to_fit(0, UnixMillis(0));
+    assert_eq!(freed, 0, "no TTL keys: volatile-only frees nothing");
+    assert_eq!(st.used_memory(), before, "nothing was evicted");
+    assert_eq!(st.len(), 3, "all keys survive (re-registered, NOT dropped)");
+
+    // Phase 2: EXPIRE attaches a TTL to ONE previously-skipped key (the 3b EXPIRE
+    // path: set the deadline without rewriting the value, so the eviction `on_insert`
+    // funnel does NOT run). The #46 fix means this key is still tracked by the policy
+    // from phase 1, so it is now an eligible victim. (b starts at frequency 0, so this
+    // single access leaves it at 1, which is still evict-eligible.)
+    expire_existing(&mut st, b"b", 1_000_000);
+
+    // Now evict_to_fit CAN free that key (and only that key: a and c still lack a TTL).
+    let freed2 = st.evict_to_fit(0, UnixMillis(0));
+    assert!(
+        freed2 >= 1,
+        "after EXPIRE attaches a TTL, the key becomes evictable (the #46 fix)"
+    );
+    assert!(
+        st.read(0, b"b", UnixMillis(0)).is_none(),
+        "the EXPIRE'd key b must now be evictable"
+    );
+    // The still-non-TTL keys are spared.
+    assert!(
+        st.read(0, b"a", UnixMillis(0)).is_some(),
+        "a (no TTL) must survive"
+    );
+    assert!(
+        st.read(0, b"c", UnixMillis(0)).is_some(),
+        "c (no TTL) must survive"
+    );
 }
 
 #[test]

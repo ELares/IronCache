@@ -39,8 +39,11 @@
 //! cannot filter on its own. Instead [`EvictionPolicy::volatile_only`] is a posture
 //! FLAG the store reads in `evict_to_fit`: a `volatile_only` policy's victims are
 //! filtered there against `expire_at` (the store has the kvobj), and a victim with
-//! no TTL is skipped rather than deleted. This keeps TTL knowledge where it lives
-//! (the store) without threading TTL through the frozen hooks. `volatile-ttl`
+//! no TTL is skipped rather than deleted. The skipped key is RE-REGISTERED into the
+//! policy ([`EvictionPolicy::re_register`], the #46 fix) instead of dropped, so it
+//! stays an eviction candidate and a later EXPIRE that attaches a TTL makes it
+//! eligible. This keeps TTL knowledge where it lives (the store) without threading
+//! TTL through the frozen hooks. `volatile-ttl`
 //! nearest-expiry-first ordering lands with the timing wheel in 3b; for 3a it maps
 //! to S3-FIFO over the volatile set (a documented divergence, ADR-0009).
 //!
@@ -84,6 +87,19 @@ pub trait EvictionPolicy: EvictionHook {
     fn evicts(&self) -> bool;
     /// Whether victims are restricted to keys carrying a TTL (the volatile-* family).
     fn volatile_only(&self) -> bool;
+
+    /// Re-register a `(db, key)` the store could NOT evict back into the policy's
+    /// tracking, NON-DESTRUCTIVELY (the volatile-* re-eligibility fix, #46).
+    ///
+    /// `select_victim` pop_front's a candidate OUT of its queue. When `evict_to_fit`
+    /// cannot use that candidate because it carries no TTL under a `volatile_only`
+    /// policy, it must NOT drop it (the PR-3a bug: a dropped non-TTL key could never
+    /// be evicted again even after a later EXPIRE gave it a TTL). Instead the store
+    /// calls this to put the key BACK into the policy so it remains an eviction
+    /// candidate; a later EXPIRE that attaches a TTL then makes it eligible. Distinct
+    /// from `on_insert` (no byte accounting, no ghost/recency churn): it is a pure
+    /// re-track of an already-tracked key the store declined to delete.
+    fn re_register(&mut self, db: u32, key: &[u8]);
 }
 
 /// The bundled eviction policy, enum-dispatched (EVICTION.md "enum dispatch" option).
@@ -175,6 +191,15 @@ impl EvictionPolicy for Policy {
             Policy::NoEviction => false,
             Policy::S3Fifo(p) => p.volatile_only(),
             Policy::Random(p) => p.volatile_only(),
+        }
+    }
+
+    fn re_register(&mut self, db: u32, key: &[u8]) {
+        match self {
+            // NoEviction never offers a victim, so it is never asked to re-register.
+            Policy::NoEviction => {}
+            Policy::S3Fifo(p) => p.re_register(db, key),
+            Policy::Random(p) => p.re_register(db, key),
         }
     }
 }

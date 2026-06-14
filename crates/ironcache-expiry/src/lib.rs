@@ -433,7 +433,11 @@ mod tests {
             let mut w = TimingWheel::new();
             w.advance(ms(0), 100);
             for i in 0..50u32 {
-                w.register(i % 3, format!("key{i}").as_bytes(), ms(100 + u64::from(i) * 37));
+                w.register(
+                    i % 3,
+                    format!("key{i}").as_bytes(),
+                    ms(100 + u64::from(i) * 37),
+                );
             }
             let mut out = Vec::new();
             // A fixed sequence of advances.

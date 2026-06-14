@@ -117,6 +117,18 @@ impl EvictionPolicy for Random {
     fn volatile_only(&self) -> bool {
         self.volatile_only
     }
+
+    fn re_register(&mut self, db: u32, key: &[u8]) {
+        // The volatile-* re-eligibility fix (#46). For Random, `select_victim` returns
+        // a CLONE and leaves the roster entry in place (see `select_victim`), so a
+        // skipped non-TTL victim is normally still tracked. This re-add is therefore
+        // a no-op in the common case, but it is kept idempotent and correct so the
+        // store can call it uniformly across policies: it re-inserts only if the key
+        // is somehow no longer in the roster.
+        if self.position(db, key).is_none() {
+            self.keys.push((db, key.to_vec().into_boxed_slice()));
+        }
+    }
 }
 
 #[cfg(test)]

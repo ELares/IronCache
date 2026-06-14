@@ -440,25 +440,39 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
     /// free anything (an empty keyspace, or the `noeviction` policy), so we stop and
     /// return what we evicted so far; the caller then decides whether to reply `-OOM`.
     ///
-    /// ## Volatile-only enforcement
+    /// ## Volatile-only enforcement (the #46 re-eligibility fix, completed in 3b)
     ///
     /// For a `volatile_only` policy (the `volatile-*` family) only TTL-bearing keys
     /// are eligible. The frozen hooks do not pass TTL to the policy, so the FILTER
     /// lives here, where the store can read `expire_at`: a victim with NO TTL is
-    /// removed from the policy's queue (so the policy stops offering it) but the kvobj
-    /// is NOT deleted, and the loop asks for the next victim. If no eligible
-    /// TTL-bearing key remains, the policy eventually returns `None` (its queues
-    /// drain of offerable victims) and the loop stops, leaving the over-budget write
-    /// to be rejected `-OOM` (matching Redis volatile-* with no expirable keys).
+    /// RE-REGISTERED into the policy (NON-DESTRUCTIVELY, via
+    /// [`EvictionPolicy::re_register`]) rather than dropped, and the loop asks for the
+    /// next victim. Re-registering (instead of the PR-3a `on_remove` drop) is the #46
+    /// fix: a non-TTL key the store declines to evict STAYS an eviction candidate, so
+    /// once a later EXPIRE attaches a TTL it becomes eligible. The scan is bounded by
+    /// tracking the distinct keys examined-and-skipped this call: once that set covers
+    /// the whole live keyspace with no eligible TTL-bearing victim found, the loop
+    /// returns what it freed so far (zero, here), leaving the over-budget write to be
+    /// rejected `-OOM` (matching Redis volatile-* with no expirable keys).
     ///
     /// `now` is consulted only to skip an ALREADY-expired victim (it will be reaped
-    /// lazily anyway). The iteration cap keeps the loop bounded by construction.
+    /// lazily anyway). The iteration cap is a defensive secondary bound.
     fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
         let volatile_only = self.eviction.volatile_only();
         let mut evicted: u64 = 0;
-        // A generous bound: at most a couple of touches per current entry, plus a
-        // margin, so a volatile skip-scan over an all-non-TTL keyspace still ends.
-        let max_rounds = self.len().saturating_mul(2).saturating_add(16);
+        // The bounded-scan guard for the #46 re-eligibility fix. Under a volatile-*
+        // policy a non-TTL victim is RE-REGISTERED (kept as a candidate) rather than
+        // dropped, so the policy can keep offering the same non-TTL keys forever. We
+        // bound the scan by counting CONSECUTIVE skips since the last forward progress
+        // (an eviction or an expired-reap): once that count exceeds the live entry
+        // count, the policy has cycled through its whole offerable set with no eligible
+        // TTL-bearing victim, so we stop and let the caller reply -OOM (matching Redis
+        // volatile-* OOM-when-no-evictable-volatile-key). Any forward progress resets
+        // the counter, so a run that keeps finding eligible TTL keys never trips it.
+        let mut consecutive_skips: usize = 0;
+        // A defensive secondary cap: even if a policy mis-behaves, the loop ends. With
+        // the consecutive-skip bound above this should never be the binding limit.
+        let max_rounds = self.len().saturating_mul(4).saturating_add(64);
         let mut rounds = 0usize;
         // Strict `>`: free down to `used <= budget`, matching Redis getMaxmemoryState
         // (under-limit at `used <= maxmemory`). At used==budget the loop does not run.
@@ -486,34 +500,32 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
             }
             // An already-expired victim is reaped by the lazy backstop rather than
             // counted as an eviction (it would have read as absent anyway); this also
-            // drops it from the policy queue via expire_if_due's on_remove.
+            // drops it from the policy queue via expire_if_due's on_remove. This is
+            // forward progress, so reset the consecutive-skip guard.
             if is_expired {
                 self.expire_if_due(db, db_idx, &key, now);
+                consecutive_skips = 0;
                 continue;
             }
             if volatile_only && lacks_ttl {
-                // Only TTL-bearing keys are eligible. A non-TTL victim is dropped from
-                // the policy queue (so it is not re-offered) but NOT deleted.
-                //
-                // INVARIANT (volatile-* re-eligibility; a PR-3b PREREQUISITE).
-                // `select_victim` already pop_front'd this key from the policy's queue,
-                // and this on_remove makes that drop permanent: under a volatile-*
-                // policy the policy stops TRACKING a non-TTL key here, and ONLY a write
-                // (`on_insert`) re-tracks it. This is correct for PR-3a because EVERY
-                // 3a TTL is set at WRITE time (the upsert/rmw funnel re-inserts and so
-                // re-tracks the key with its new TTL). But PR-3b's EXPIRE attaches a
-                // TTL to an EXISTING key WITHOUT rewriting it, so EXPIRE MUST call back
-                // into the policy to re-register the key; otherwise a key dropped here
-                // while non-TTL would never become an eviction candidate again even
-                // after it gains a TTL, and a volatile-* policy would UNDER-EVICT
-                // (silently retain expirable keys it should be able to free). Tracked
-                // as a 3b prerequisite (see s3fifo::select_victim and the 3b EXPIRE
-                // task). NO behavior change in 3a.
-                self.eviction.on_remove(db, &key, 0);
+                // Only TTL-bearing keys are eligible. A non-TTL victim is NOT deleted
+                // and NOT dropped from the policy: it is RE-REGISTERED so it remains a
+                // candidate (the #46 re-eligibility fix). Bound the scan: if we have
+                // skipped more keys in a row than the store holds, the policy has
+                // cycled its whole offerable set with no eligible TTL-bearing victim,
+                // so we STOP and let the caller reply -OOM.
+                consecutive_skips += 1;
+                self.eviction.re_register(db, &key);
+                if consecutive_skips > self.len() {
+                    break;
+                }
                 continue;
             }
             if self.remove_object(db, db_idx, &key) {
                 evicted += 1;
+                // Forward progress: reset the skip guard so a subsequent stretch of
+                // non-TTL skips is measured afresh against the (now smaller) keyspace.
+                consecutive_skips = 0;
             }
             // If the victim was already gone (a stale queue entry), the loop simply
             // asks for the next victim; it does not count as an eviction.
