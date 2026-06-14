@@ -9,7 +9,7 @@
 //! synchronization. The connection loop decodes RESP, dispatches Tier-0 commands,
 //! and writes the encoded reply.
 
-use ironcache_config::Config;
+use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng, SystemEnv};
 use ironcache_eviction::{Policy, map_policy_name};
 use ironcache_observe::{CounterSnapshot, MemoryInfo, ServerInfo, ShardCounters};
@@ -48,6 +48,13 @@ type ShardStoreImpl = ShardStore<Policy, CountingAccounting>;
 struct ShardState {
     next_client_id: u64,
     counters: ShardCounters,
+    /// The last runtime-config GENERATION this shard observed (PR-4b). Dispatch compares
+    /// the shared `RuntimeConfig::generation()` against this once per command (a relaxed
+    /// atomic load + integer compare, NO lock when unchanged) and, on a change, rebuilds
+    /// this shard's eviction policy from the new `maxmemory-policy` name. Core-local
+    /// (per shard, shared-nothing ADR-0002): each shard catches up to a `CONFIG SET
+    /// maxmemory-policy` on its next command.
+    last_policy_generation: u64,
 }
 
 /// Boot the server: derive the shard config from `config`, start the shard set,
@@ -60,28 +67,27 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
         bind,
     };
 
-    // The eviction policy NAME is leaked to a 'static str so INFO/ServerInfo can hold
-    // it cheaply for the process lifetime (it never changes in 3a; the CONFIG SET
-    // runtime switch is 3c). One small leak at boot, not per request.
+    // The BOOT eviction policy NAME is leaked to a 'static str so INFO/ServerInfo can
+    // hold it cheaply for the process lifetime as the STATIC boot fact. The CURRENT
+    // effective policy (which a `CONFIG SET maxmemory-policy` changes) lives in the
+    // RuntimeConfig cell; INFO reads it from there (PR-4b). One small leak at boot.
     let policy_name: &'static str = Box::leak(config.maxmemory_policy.clone().into_boxed_str());
 
-    // The PER-SHARD byte budget: the maxmemory ceiling split evenly across shards
-    // (shared-nothing, ADR-0002). 0 when maxmemory is 0 (unlimited). Computed ONCE
-    // here, carried in the context.
-    let per_shard_budget = if config.maxmemory == 0 {
-        0
-    } else {
-        (config.maxmemory / config.shards.max(1) as u64).max(1)
-    };
+    // The process-wide runtime-config overlay (PR-4b, the highest-precedence layer):
+    // ONE Arc shared (cloned) into every shard's context, exactly like the shutdown
+    // AtomicBool precedent. A `CONFIG SET` mutates it; the per-command reads are cheap
+    // atomic loads (maxmemory/generation) with the string params behind a lock taken
+    // only on CONFIG SET. Seeded from the boot-resolved config.
+    let runtime = RuntimeConfig::from_config(config);
 
-    // Static, cheaply-cloned server context shared by value onto each shard. It is
-    // immutable, so cloning it per shard does not violate shared-nothing (no
-    // mutable cross-core state).
+    // Static, cheaply-cloned server context shared by value onto each shard. The
+    // mutable cross-shard state is ONLY the runtime cell (an Arc); the rest is
+    // immutable, so cloning per shard does not violate shared-nothing.
     let ctx_template = ServerContext {
-        requirepass: config.requirepass.clone(),
+        runtime,
+        boot: config.clone(),
         databases: config.databases,
-        maxmemory: config.maxmemory,
-        per_shard_budget,
+        shards: config.shards,
         info: ServerInfo {
             tcp_port: config.port,
             shards: config.shards,
@@ -233,6 +239,10 @@ fn shard_state() -> Rc<RefCell<ShardState>> {
             *b = Some(Rc::new(RefCell::new(ShardState {
                 next_client_id: 1,
                 counters: ShardCounters::new(),
+                // Start at 0 (the RuntimeConfig generation also starts at 0): the first
+                // CONFIG SET maxmemory-policy bumps it, and this shard notices on its
+                // next command.
+                last_policy_generation: 0,
             })));
         }
         Rc::clone(b.as_ref().unwrap())
@@ -436,6 +446,12 @@ fn handle_request(
         MemoryInfo::default()
     };
     let mut deltas = CounterDeltas::default();
+    // The shard's last-seen runtime-config generation (PR-4b), copied OUT of state_rc
+    // into a plain local so dispatch can take `&mut` it WITHOUT borrowing state_rc
+    // (the rollup closure already captured state_rc immutably for INFO; a held mutable
+    // borrow of the same cell would conflict). Dispatch updates the local on a
+    // generation-change policy swap; we write it back after dispatch returns.
+    let mut shard_generation = state_rc.borrow().last_policy_generation;
     // The lazy-backstop expiry count this command produced (a separate signal from the
     // dispatch deltas): the store accumulates it inside the four primitives, and we
     // drain it after dispatch returns and fold it into `expired_keys` alongside the
@@ -457,6 +473,7 @@ fn handle_request(
             &mut *store,
             &mut wheel,
             now,
+            &mut shard_generation,
             rollup,
             mem,
             &mut deltas,
@@ -469,15 +486,16 @@ fn handle_request(
         // `state_rc` mutably (the rollup closure captured `state_rc` too, so the two
         // borrows must not overlap; they do not, the dispatch call has returned).
     };
-    // Fold this command's dynamic counters into the shard's totals for INFO: the
-    // dispatch deltas (eviction / active-drain expiry / keyspace hit-miss) plus the
-    // lazy-backstop expiry count. Each is zero on a command that did not trigger it,
-    // so this is a cheap no-op on the common hot path.
+    // Fold this command's dynamic counters into the shard's totals for INFO and write
+    // back the (possibly advanced) policy generation. Each is a cheap no-op on the
+    // common hot path (no deltas, no generation change).
     {
         deltas.expired += lazy_expired;
+        let mut st = state_rc.borrow_mut();
         if deltas != CounterDeltas::default() {
-            state_rc.borrow_mut().counters.apply(deltas);
+            st.counters.apply(deltas);
         }
+        st.last_policy_generation = shard_generation;
     }
     encode_into(out, &reply, conn.proto);
     conn.should_close
@@ -563,6 +581,7 @@ mod tests {
         let state = Rc::new(RefCell::new(ShardState {
             next_client_id: 1,
             counters: ShardCounters::new(),
+            last_policy_generation: 0,
         }));
         (env, store, wheel, state)
     }

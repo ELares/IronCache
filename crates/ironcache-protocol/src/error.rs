@@ -415,6 +415,57 @@ impl ErrorReply {
         )
     }
 
+    /// `ERR Unknown option or number of arguments for CONFIG SET - '<param>'` - the
+    /// byte-exact Redis reply (src/config.c `configSetCommand`,
+    /// `addReplyErrorFormat(c, "Unknown option or number of arguments for CONFIG SET - '%s'", ...)`)
+    /// for a `CONFIG SET` of an unrecognized parameter (or a missing value). The param
+    /// name is echoed verbatim. Clients pattern-match on the `Unknown option` phrase.
+    #[must_use]
+    pub fn config_set_unknown_param(param: &str) -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            format!("Unknown option or number of arguments for CONFIG SET - '{param}'"),
+        )
+    }
+
+    /// `ERR CONFIG SET failed (possibly related to argument '<param>') - <reason>` -
+    /// the byte-exact Redis reply (src/config.c `configSetCommand`,
+    /// `addReplyErrorFormat(c, "CONFIG SET failed (possibly related to argument '%s') - %s", ...)`)
+    /// for a recognized parameter whose VALUE was rejected (e.g. a malformed
+    /// `maxmemory` size, or an unrecognized `maxmemory-policy` name). The `reason` is
+    /// the human-readable cause.
+    #[must_use]
+    pub fn config_set_failed(param: &str, reason: &str) -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            format!("CONFIG SET failed (possibly related to argument '{param}') - {reason}"),
+        )
+    }
+
+    /// `ERR CONFIG SET failed (possibly related to argument '<param>') - can't set
+    /// immutable config` - the byte-exact Redis reply for a `CONFIG SET` of an
+    /// IMMUTABLE (restart-required) parameter (`bind`/`port`/`databases`/...). Redis
+    /// marks these `IMMUTABLE_CONFIG` and rejects a runtime set with this reason rather
+    /// than silently ignoring it (CONFIG.md "reported as requiring a restart").
+    #[must_use]
+    pub fn config_set_immutable(param: &str) -> Self {
+        ErrorReply::config_set_failed(param, "can't set immutable config")
+    }
+
+    /// `ERR The server is running without a config file` - the byte-exact Redis reply
+    /// (src/config.c `configRewriteCommand`, `addReplyError(c, "The server is running
+    /// without a config file")`) for `CONFIG REWRITE` when no config file was given at
+    /// boot. IronCache currently always boots without a config-file path threaded
+    /// through, so REWRITE returns this faithfully (rather than a misleading +OK stub)
+    /// until the config-file path is wired (CONFIG.md).
+    #[must_use]
+    pub fn config_rewrite_no_file() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "The server is running without a config file",
+        )
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free
@@ -558,6 +609,35 @@ mod tests {
     #[test]
     fn syntax_error_is_byte_exact() {
         assert_eq!(ErrorReply::syntax_error().line(), "-ERR syntax error");
+    }
+
+    #[test]
+    fn config_set_errors_are_byte_exact() {
+        // Verified against redis/redis src/config.c configSetCommand: the unknown-option
+        // error, the value-rejection "CONFIG SET failed" error, and the immutable
+        // (restart-required) variant. The param name is echoed verbatim.
+        assert_eq!(
+            ErrorReply::config_set_unknown_param("bogus").line(),
+            "-ERR Unknown option or number of arguments for CONFIG SET - 'bogus'"
+        );
+        assert_eq!(
+            ErrorReply::config_set_failed("maxmemory", "bad size").line(),
+            "-ERR CONFIG SET failed (possibly related to argument 'maxmemory') - bad size"
+        );
+        assert_eq!(
+            ErrorReply::config_set_immutable("databases").line(),
+            "-ERR CONFIG SET failed (possibly related to argument 'databases') - can't set immutable config"
+        );
+    }
+
+    #[test]
+    fn config_rewrite_no_file_is_byte_exact() {
+        // Verified against redis/redis src/config.c configRewriteCommand: the
+        // no-config-file reply (CONFIG REWRITE without a config file).
+        assert_eq!(
+            ErrorReply::config_rewrite_no_file().line(),
+            "-ERR The server is running without a config file"
+        );
     }
 
     #[test]

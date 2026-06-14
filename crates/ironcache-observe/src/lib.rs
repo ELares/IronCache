@@ -85,7 +85,22 @@ impl ShardCounters {
     /// keyspace-hit-miss outputs dispatch accumulates for one command) into this
     /// shard's counters. Called once per command after dispatch returns, so the
     /// dynamic counters do not alias the INFO rollup's borrow during dispatch.
+    ///
+    /// `d.reset_stats` (PR-4b `CONFIG RESETSTAT`) zeroes the resettable STAT counters
+    /// FIRST (the additive deltas are then applied on top, though a RESETSTAT command
+    /// produces no other deltas). It zeroes the same stats Redis `resetServerStats`
+    /// does: the eviction / expiry / keyspace hit-miss totals and the command /
+    /// connection counters. It does NOT touch `connected_clients` (a live gauge, not a
+    /// since-reset stat), matching Redis (RESETSTAT leaves connected_clients alone).
     pub fn apply(&mut self, d: CounterDeltas) {
+        if d.reset_stats {
+            self.evicted_keys = 0;
+            self.expired_keys = 0;
+            self.keyspace_hits = 0;
+            self.keyspace_misses = 0;
+            self.commands_processed = 0;
+            self.connections_received = 0;
+        }
         self.evicted_keys += d.evicted;
         self.expired_keys += d.expired;
         self.keyspace_hits += d.keyspace_hits;
@@ -122,6 +137,12 @@ pub struct CounterDeltas {
     pub keyspace_hits: u64,
     /// Keyspace misses from read commands this command.
     pub keyspace_misses: u64,
+    /// `CONFIG RESETSTAT` (PR-4b): when true, [`ShardCounters::apply`] zeroes the
+    /// resettable STAT counters on the serving shard FIRST (serving-shard-scoped, like
+    /// the single-shard KEYS/SCAN scope; the cross-shard reset is a coordinator
+    /// follow-up). The dispatch layer sets this for a `CONFIG RESETSTAT` and the serve
+    /// loop honors it in `apply`.
+    pub reset_stats: bool,
 }
 
 /// An immutable, summable snapshot of one shard's counters.
@@ -205,6 +226,19 @@ pub struct MemoryInfo {
     pub used_memory_rss: u64,
 }
 
+/// The CURRENT effective `maxmemory`/`maxmemory_policy` INFO reports (CONFIG.md, the
+/// `CONFIG SET` hot-swap, PR-4b). The boot values live in [`ServerInfo`] as static
+/// facts, but a runtime `CONFIG SET` changes the effective ceiling/policy, so the
+/// caller reads the CURRENT values from the runtime-config cell and passes them here.
+/// INFO then reflects a `CONFIG SET maxmemory`/`maxmemory-policy` immediately.
+#[derive(Debug, Clone, Copy)]
+pub struct EffectiveMemoryConfig<'a> {
+    /// The current effective `maxmemory` ceiling in bytes (0 = unlimited).
+    pub maxmemory: u64,
+    /// The current effective `maxmemory-policy` name (verbatim).
+    pub maxmemory_policy: &'a str,
+}
+
 /// Build the `INFO` reply body (OBSERVABILITY.md). `section` is the optional
 /// lowercased section filter (e.g. `server`); `None` or `"default"`/`"all"`
 /// renders all sections.
@@ -212,7 +246,9 @@ pub struct MemoryInfo {
 /// `memory` carries the process-global allocator figures (ADR-0006), read once by
 /// the caller; the `memory` section reports them for `used_memory`/`used_memory_rss`
 /// and derives `used_memory_human` and `mem_fragmentation_ratio` (RSS/used) from
-/// them.
+/// them. `effective` carries the CURRENT `maxmemory`/`maxmemory_policy` (PR-4b): the
+/// caller reads them from the runtime-config cell so a `CONFIG SET` is reflected in
+/// INFO, rather than the static boot values held in [`ServerInfo`].
 ///
 /// The returned `String` is the raw INFO body; the caller wraps it as a bulk
 /// string. Lines use `\r\n` and `field:value` exactly as Redis does so existing
@@ -223,6 +259,7 @@ pub fn build_info<C: Clock>(
     server: &ServerInfo,
     rolled: CounterSnapshot,
     memory: MemoryInfo,
+    effective: EffectiveMemoryConfig<'_>,
     section: Option<&str>,
 ) -> String {
     // `write!` into a String never fails; the `let _ =` discards the Result.
@@ -278,10 +315,12 @@ pub fn build_info<C: Clock>(
             human_bytes(memory.used_memory)
         );
         let _ = write!(out, "used_memory_rss:{}\r\n", memory.used_memory_rss);
-        let _ = write!(out, "maxmemory:{}\r\n", server.maxmemory);
-        // PR-3a: the CONFIGURED eviction policy name (ADR-0007 cache mode default is
-        // allkeys-lru, NOT noeviction). Static after boot in 3a.
-        let _ = write!(out, "maxmemory_policy:{}\r\n", server.maxmemory_policy);
+        // PR-4b: report the CURRENT effective maxmemory/maxmemory_policy (read from the
+        // runtime-config cell), so a `CONFIG SET maxmemory`/`maxmemory-policy` is
+        // reflected here immediately. The boot values in `server` are the static facts;
+        // `effective` is the live overlay.
+        let _ = write!(out, "maxmemory:{}\r\n", effective.maxmemory);
+        let _ = write!(out, "maxmemory_policy:{}\r\n", effective.maxmemory_policy);
         // mem_fragmentation_ratio = RSS / used (OBSERVABILITY.md); 0.00 when used is
         // 0 (avoid a divide-by-zero), matching the no-data startup case.
         let frag = if memory.used_memory > 0 {
@@ -363,6 +402,14 @@ mod tests {
         }
     }
 
+    /// The default effective memory config for the tests (mirrors the boot values).
+    fn eff() -> EffectiveMemoryConfig<'static> {
+        EffectiveMemoryConfig {
+            maxmemory: 0,
+            maxmemory_policy: "allkeys-lru",
+        }
+    }
+
     #[test]
     fn info_has_standard_sections_and_fields() {
         let env = TestEnv::new(1);
@@ -371,6 +418,7 @@ mod tests {
             &server(),
             CounterSnapshot::default(),
             MemoryInfo::default(),
+            eff(),
             None,
         );
         assert!(body.contains("# Server\r\n"));
@@ -387,13 +435,19 @@ mod tests {
     fn info_memory_threads_maxmemory_and_allocator() {
         let env = TestEnv::new(1);
         let mut s = server();
-        s.maxmemory = 256 * 1024 * 1024;
         s.mem_allocator = "system";
+        // PR-4b: maxmemory is read from the EFFECTIVE config (the runtime overlay), not
+        // the static ServerInfo, so INFO reflects a CONFIG SET.
+        let effective = EffectiveMemoryConfig {
+            maxmemory: 256 * 1024 * 1024,
+            maxmemory_policy: "allkeys-lru",
+        };
         let body = build_info(
             &env,
             &s,
             CounterSnapshot::default(),
             MemoryInfo::default(),
+            effective,
             Some("memory"),
         );
         assert!(
@@ -405,16 +459,25 @@ mod tests {
 
     #[test]
     fn info_reports_configured_policy_and_evicted_keys() {
-        // PR-3a: maxmemory_policy is the CONFIGURED name (not the old hardcoded
-        // noeviction), and evicted_keys is the rolled-up counter.
+        // PR-4b: maxmemory_policy is the CURRENT effective name (read from the runtime
+        // overlay), and evicted_keys is the rolled-up counter.
         let env = TestEnv::new(1);
-        let mut s = server();
-        s.maxmemory_policy = "volatile-ttl";
+        let effective = EffectiveMemoryConfig {
+            maxmemory: 0,
+            maxmemory_policy: "volatile-ttl",
+        };
         let rolled = CounterSnapshot {
             evicted_keys: 7,
             ..Default::default()
         };
-        let body = build_info(&env, &s, rolled, MemoryInfo::default(), None);
+        let body = build_info(
+            &env,
+            &server(),
+            rolled,
+            MemoryInfo::default(),
+            effective,
+            None,
+        );
         assert!(body.contains("maxmemory_policy:volatile-ttl\r\n"), "{body}");
         assert!(!body.contains("maxmemory_policy:noeviction\r\n"), "{body}");
         assert!(body.contains("evicted_keys:7\r\n"), "{body}");
@@ -434,6 +497,7 @@ mod tests {
             &server(),
             CounterSnapshot::default(),
             mem,
+            eff(),
             Some("memory"),
         );
         assert!(
@@ -457,6 +521,7 @@ mod tests {
             &server(),
             CounterSnapshot::default(),
             MemoryInfo::default(),
+            eff(),
             Some("memory"),
         );
         assert!(body.contains("used_memory:0\r\n"), "{body}");
@@ -482,6 +547,7 @@ mod tests {
             &server(),
             CounterSnapshot::default(),
             MemoryInfo::default(),
+            eff(),
             Some("server"),
         );
         assert!(only_server.contains("# Server\r\n"));
@@ -497,6 +563,7 @@ mod tests {
             &server(),
             CounterSnapshot::default(),
             MemoryInfo::default(),
+            eff(),
             Some("server"),
         );
         assert!(body.contains("uptime_in_seconds:90\r\n"), "{body}");

@@ -534,11 +534,16 @@ mod tests {
 
     /// A minimal context; `cmd_swapdb` reads only `databases`.
     fn ctx(databases: u32) -> ServerContext {
-        ServerContext {
-            requirepass: None,
+        let boot = ironcache_config::Config {
             databases,
-            maxmemory: 0,
-            per_shard_budget: 0,
+            shards: 1,
+            ..ironcache_config::Config::default()
+        };
+        let runtime = ironcache_config::RuntimeConfig::from_config(&boot);
+        ServerContext {
+            runtime,
+            databases,
+            shards: 1,
             info: ServerInfo {
                 tcp_port: 6379,
                 shards: 1,
@@ -548,6 +553,7 @@ mod tests {
                 maxmemory_policy: "allkeys-lru",
                 mem_allocator: "system",
             },
+            boot,
         }
     }
 

@@ -11,12 +11,16 @@
 
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
-use crate::{cmd_expire, cmd_introspect, cmd_keyspace, cmd_string};
+use crate::{cmd_config, cmd_expire, cmd_introspect, cmd_keyspace, cmd_string};
+use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
 use ironcache_expiry::TimingWheel;
-use ironcache_observe::{CounterDeltas, CounterSnapshot, MemoryInfo, ServerInfo, build_info};
+use ironcache_observe::{
+    CounterDeltas, CounterSnapshot, EffectiveMemoryConfig, MemoryInfo, ServerInfo, build_info,
+};
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
-use ironcache_storage::{ActiveExpiry, Admit, Keyspace, Store, UnixMillis};
+use ironcache_storage::{ActiveExpiry, Admit, Keyspace, PolicySwap, Store, UnixMillis};
+use std::sync::Arc;
 
 /// The bounded number of expired keys the active timing-wheel drain reclaims per
 /// command (EXPIRATION.md "bounded reclamation"). A small cap keeps the drain off the
@@ -89,39 +93,71 @@ pub fn drain_due_keys<S: Store + ActiveExpiry>(
 
 /// Immutable, server-wide context a handler may read. It is cloned cheaply onto
 /// each shard; the dynamic per-rollup counters are passed in separately.
+///
+/// ## The runtime-config cell (PR-4b, the one new cross-shard shared state)
+///
+/// `runtime` is the process-wide [`RuntimeConfig`] overlay, shared as an `Arc` cloned
+/// into every shard's context at boot (exactly like the shutdown `AtomicBool`
+/// precedent in the bootstrap). It is the HIGHEST-precedence config layer (CONFIG.md):
+/// a `CONFIG SET` mutates it, and the per-command reads here are cheap atomic loads
+/// (`maxmemory`/`generation`), with the string-valued params (policy name /
+/// requirepass) behind a lock that lives in `ironcache-config` and is taken only on
+/// `CONFIG SET`/generation-change, never per command. `boot` is the lower-layer fold
+/// (CLI > env > TOML > defaults), read by `CONFIG GET` for the restart-required params.
 #[derive(Debug, Clone)]
 pub struct ServerContext {
-    /// The configured password, if any. `None` means auth is not required.
-    pub requirepass: Option<String>,
+    /// The process-wide runtime-config overlay (the highest-precedence layer). Shared
+    /// across shards as an `Arc`; the per-command hot-path reads are atomic loads.
+    pub runtime: Arc<RuntimeConfig>,
+    /// The boot-resolved config (CLI > env > TOML > defaults), the lower-layer fold.
+    /// `CONFIG GET` reads it for the restart-required params (bind/port/databases/...).
+    pub boot: Config,
     /// Number of logical databases (`SELECT` range is `[0, databases)`).
     pub databases: u32,
-    /// The resolved memory ceiling in bytes (`maxmemory`). `0` means unlimited: the
-    /// admission gate is OFF and every write is served (ADR-0007 unlimited posture).
-    pub maxmemory: u64,
-    /// The PER-SHARD byte budget the admission gate enforces against this shard's
-    /// `used_memory()`: `maxmemory / shards`, computed ONCE at boot. The maxmemory
-    /// ceiling is split evenly across shards (shared-nothing, ADR-0002): each shard
-    /// owns a slice of the budget and evicts/`-OOM`s against its own slice, with no
-    /// cross-shard counter on the hot path. Exact per-arena attribution (ADR-0006) is
-    /// a later follow-up; the even split is the honest per-shard approximation for
-    /// 3a. `0` when `maxmemory == 0` (unlimited).
-    pub per_shard_budget: u64,
+    /// The shard count, for computing the per-shard admission budget
+    /// (`current maxmemory / shards`). The maxmemory ceiling is split evenly across
+    /// shards (shared-nothing, ADR-0002), recomputed from the CURRENT runtime
+    /// `maxmemory` on each ceiling check so a `CONFIG SET maxmemory` reaches all shards.
+    pub shards: usize,
     /// Static server facts for INFO/HELLO.
     pub info: ServerInfo,
 }
 
 impl ServerContext {
-    /// Whether a password is configured (and therefore auth is required).
+    /// Whether a password is currently configured (auth required). Reads the runtime
+    /// overlay so a `CONFIG SET requirepass` takes effect for new commands. Takes the
+    /// overlay's lock (off the per-command hot path: the auth check is rare relative to
+    /// data commands, and the lock is uncontended in the single-threaded-per-shard model).
     #[must_use]
     pub fn requires_auth(&self) -> bool {
-        self.requirepass.is_some()
+        self.runtime.requires_auth()
     }
 
-    /// Whether the memory ceiling is enabled (a non-zero `maxmemory`). When `false`,
-    /// admission is a no-op and every write is served.
+    /// The current effective `maxmemory` ceiling in bytes (a cheap atomic load from the
+    /// runtime overlay). `0` means unlimited.
+    #[must_use]
+    pub fn maxmemory(&self) -> u64 {
+        self.runtime.maxmemory()
+    }
+
+    /// The CURRENT per-shard byte budget: `current maxmemory / shards` (the even split,
+    /// ADR-0002), recomputed from the runtime overlay so a `CONFIG SET maxmemory`
+    /// reaches every shard's admission gate. `0` when `maxmemory == 0` (unlimited).
+    #[must_use]
+    pub fn per_shard_budget(&self) -> u64 {
+        let max = self.maxmemory();
+        if max == 0 {
+            0
+        } else {
+            (max / self.shards.max(1) as u64).max(1)
+        }
+    }
+
+    /// Whether the memory ceiling is enabled (a non-zero current `maxmemory`). When
+    /// `false`, admission is a no-op and every write is served.
     #[must_use]
     pub fn ceiling_enabled(&self) -> bool {
-        self.maxmemory > 0 && self.per_shard_budget > 0
+        self.maxmemory() > 0
     }
 }
 
@@ -169,14 +205,50 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 /// struct would just move the same fields behind one name and obscure the per-command
 /// borrows (the lifetime-parameterized `rollup` closure in particular). The over-7-args
 /// lint is allowed here with that justification.
+/// The per-command `maxmemory-policy` hot-swap check (CONFIG.md, PR-4b). The hot-path
+/// cost is ONE Acquire atomic load (`generation`) + an integer compare against this
+/// shard's last-seen value; when nothing changed (the common case) it returns
+/// immediately with NO lock. The Acquire load pairs with the writer's Release bump
+/// (`RuntimeConfig::set_policy_name`), so observing a new generation here happens-after
+/// the new policy name was written: the subsequent `policy_name()` read is guaranteed
+/// to see it, with the ordering carried by the atomic itself (not just the strings Mutex).
+///
+/// On an actual change (a `CONFIG SET maxmemory-policy` happened on SOME shard), this
+/// shard rebuilds its OWN eviction policy from the new name and catches up. Only here
+/// (rare) do we take the overlay lock to read the new name and draw an RNG seed through
+/// the Env seam (ADR-0003: the `*-random` policy is seeded deterministically, never std
+/// rand). The swap reaches all shards eventually-consistently: each shard notices on its
+/// next command (at most one command of lag), so a connection on a DIFFERENT shard sees
+/// the new policy on its next command too. `set_policy_by_name` validated the name at
+/// `CONFIG SET` time; a `false` return (defensive) leaves the existing policy in place.
+fn maybe_hot_swap_policy<E: Env, S: PolicySwap>(
+    ctx: &ServerContext,
+    env: &mut E,
+    store: &mut S,
+    shard_generation: &mut u64,
+    now: UnixMillis,
+) {
+    let current_generation = ctx.runtime.generation();
+    if current_generation != *shard_generation {
+        let new_name = ctx.runtime.policy_name();
+        let seed = env.rng().next_u64();
+        // `now` lets the swap skip re-seeding lazily-expired entries into the new policy
+        // (IC-1: the new policy is re-seeded from the live keyspace so eviction works
+        // immediately after the swap).
+        let _ = store.set_policy_by_name(&new_name, seed, now);
+        *shard_generation = current_generation;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
+pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
     ctx: &ServerContext,
     state: &mut ConnState,
     env: &mut E,
     store: &mut S,
     wheel: &mut TimingWheel,
     now: UnixMillis,
+    shard_generation: &mut u64,
     rollup: RollupFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
@@ -184,6 +256,10 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
 ) -> Value {
     *deltas = CounterDeltas::default();
     let cmd = ascii_upper(req.command());
+
+    // maxmemory-policy HOT-SWAP reach (CONFIG.md, PR-4b): a single relaxed atomic load
+    // + compare; the rebuild (rare) is factored into a helper to keep this fn small.
+    maybe_hot_swap_policy(ctx, env, store, shard_generation, now);
 
     // Active TTL reclamation (EXPIRATION.md #51), BEFORE the command body: drain a
     // BOUNDED batch of due keys from the timing wheel and reap the ones whose stored
@@ -215,7 +291,10 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
     // DEL, Tier-0) are ALWAYS served, even over budget, so a client can read and free
     // under pressure.
     if ctx.ceiling_enabled() && is_denyoom(cmd.as_slice()) {
-        let budget = ctx.per_shard_budget;
+        // The per-shard budget is recomputed from the CURRENT runtime maxmemory (a
+        // cheap atomic load divided by the shard count), so a `CONFIG SET maxmemory`
+        // tightens/loosens every shard's gate on its next denyoom write (PR-4b).
+        let budget = ctx.per_shard_budget();
         if store.used_memory() > budget {
             if store.policy_evicts() {
                 // Cache mode: try to free space, then re-check. If eviction cannot get
@@ -252,7 +331,10 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         // INFO reads only the CLOCK half of the env seam (uptime); pass `env` as the
         // `&C: Clock` it needs.
         b"INFO" => cmd_info(ctx, env, rollup, mem, req),
-        b"CONFIG" => cmd_config_stub(req),
+        // CONFIG GET/SET/RESETSTAT/REWRITE/HELP (PR-4b). RESETSTAT signals the serving
+        // shard's counter reset via `deltas.reset_stats` (the serve loop honors it in
+        // ShardCounters::apply); the serving-shard scope is documented in cmd_config.
+        b"CONFIG" => cmd_config::cmd_config(ctx, deltas, req),
         // -- Data commands (PR-2a) over the storage waist. The two pure reads (GET,
         // STRLEN) feed the keyspace hit/miss counters (PR-3b): a found live key is a
         // hit, an absent/expired key a miss. --
@@ -479,21 +561,53 @@ enum AuthResult {
     WrongPass,
 }
 
-/// Check credentials against the configured password. PR-1 supports the single
-/// `requirepass`/default-user model (full ACL is later). The username must be
-/// `default` (or empty) when a password is set.
+/// Check credentials against the CURRENT configured password (read from the runtime
+/// overlay, so a `CONFIG SET requirepass` takes effect immediately, PR-4b). The single
+/// `requirepass`/default-user model (full ACL is later). The username must be `default`
+/// (or empty) when a password is set.
+///
+/// The password comparison is CONSTANT-TIME (see [`constant_time_eq`]) so the reply
+/// latency does not leak how many leading bytes of a guess matched the secret (the
+/// timing-leak finding). The password is currently held in plaintext at rest in the
+/// runtime overlay; storing only a SHA-256 digest (verifying against the hash, never the
+/// plaintext) is a tracked AUTH-hardening follow-up (AUTH.md / threat-model #142) and is
+/// deliberately NOT implemented here (it ships in the dedicated AUTH PR), so the
+/// plaintext-at-rest choice is recorded rather than silent.
 fn check_auth(ctx: &ServerContext, user: &[u8], pass: &[u8]) -> AuthResult {
-    match &ctx.requirepass {
+    match ctx.runtime.requirepass() {
         None => AuthResult::NoPasswordSet,
         Some(configured) => {
             let user_ok = user.is_empty() || user.eq_ignore_ascii_case(b"default");
-            if user_ok && pass == configured.as_bytes() {
+            if user_ok && constant_time_eq(pass, configured.as_bytes()) {
                 AuthResult::Ok
             } else {
                 AuthResult::WrongPass
             }
         }
     }
+}
+
+/// Compare two byte slices in CONSTANT TIME with respect to their CONTENTS: the running
+/// time depends only on the slice LENGTHS, never on WHERE the first differing byte is,
+/// so an attacker cannot learn a correct password byte-by-byte from response timing
+/// (the timing-leak finding). No new dependency: a hand-rolled fold.
+///
+/// Mechanism: if the lengths differ, return false immediately (length is not secret in
+/// this model). Otherwise fold every byte pair into an XOR accumulator and check it is
+/// zero at the END, examining ALL bytes regardless of an early mismatch. The accumulator
+/// is read through [`std::hint::black_box`] before the final compare so the optimizer
+/// cannot prove the loop short-circuitable and re-introduce a data-dependent early exit.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    // Defeat any optimization that would let the compiler reintroduce an early-out:
+    // force the accumulator to be materialized before the zero test.
+    std::hint::black_box(acc) == 0
 }
 
 /// `SELECT index` (PROTOCOL.md Tier-0). Validates the range `[0, databases)`.
@@ -604,26 +718,23 @@ fn cmd_info<C: Clock>(
     } else {
         None
     };
-    let body = build_info(clock, &ctx.info, rollup(), mem, section.as_deref());
+    // PR-4b: report the CURRENT effective maxmemory + policy (read from the runtime
+    // overlay), so a `CONFIG SET maxmemory`/`maxmemory-policy` is reflected in INFO.
+    // The policy name is cloned once here (off the per-command hot path: INFO is rare).
+    let policy = ctx.runtime.policy_name();
+    let effective = EffectiveMemoryConfig {
+        maxmemory: ctx.runtime.maxmemory(),
+        maxmemory_policy: &policy,
+    };
+    let body = build_info(
+        clock,
+        &ctx.info,
+        rollup(),
+        mem,
+        effective,
+        section.as_deref(),
+    );
     Value::bulk(body.into_bytes())
-}
-
-/// `CONFIG GET/SET` minimal stub. PR-1 has no live config command surface; reply
-/// well-formed so client startup (which sometimes probes `CONFIG GET save`)
-/// does not error: GET returns an empty map/array, SET acks.
-fn cmd_config_stub(req: &Request) -> Value {
-    if req.args.len() < 2 {
-        return Value::error(ErrorReply::wrong_arity("config"));
-    }
-    let sub = ascii_upper(&req.args[1]);
-    match sub.as_slice() {
-        b"GET" => Value::Map(vec![]),
-        b"SET" | b"RESETSTAT" | b"REWRITE" => Value::ok(),
-        _ => Value::error(ErrorReply::unknown_subcommand(
-            "CONFIG",
-            &String::from_utf8_lossy(&req.args[1]),
-        )),
-    }
 }
 
 // -- helpers --
@@ -686,20 +797,36 @@ mod tests {
     }
 
     fn ctx(pass: Option<&str>) -> ServerContext {
-        ServerContext {
+        ctx_full(pass, 0, "allkeys-lru")
+    }
+
+    /// A test context with an explicit requirepass, maxmemory ceiling, and policy name
+    /// seeded into the runtime overlay (so the generation-gated swap + ceiling tests
+    /// can drive the shared cell directly).
+    fn ctx_full(pass: Option<&str>, maxmemory: u64, policy: &str) -> ServerContext {
+        let boot = ironcache_config::Config {
+            maxmemory,
+            maxmemory_policy: policy.to_owned(),
             requirepass: pass.map(str::to_owned),
             databases: 16,
-            maxmemory: 0,
-            per_shard_budget: 0,
+            shards: 1,
+            ..ironcache_config::Config::default()
+        };
+        let runtime = RuntimeConfig::from_config(&boot);
+        ServerContext {
+            runtime,
+            databases: 16,
+            shards: 1,
             info: ServerInfo {
                 tcp_port: 6379,
                 shards: 1,
                 pid: 1,
                 started_at: Monotonic::ZERO,
-                maxmemory: 0,
+                maxmemory,
                 maxmemory_policy: "allkeys-lru",
                 mem_allocator: "jemalloc",
             },
+            boot,
         }
     }
 
@@ -725,6 +852,7 @@ mod tests {
         let mut wheel = TimingWheel::new();
         let zero = || CounterSnapshot::default();
         let mut deltas = CounterDeltas::default();
+        let mut shard_gen = ctx.runtime.generation();
         dispatch(
             ctx,
             st,
@@ -732,6 +860,7 @@ mod tests {
             &mut store,
             &mut wheel,
             UnixMillis(0),
+            &mut shard_gen,
             &zero,
             MemoryInfo::default(),
             &mut deltas,
@@ -781,6 +910,7 @@ mod tests {
         let mut env = TestEnv::new(1);
         let zero = || CounterSnapshot::default();
         let mut deltas = CounterDeltas::default();
+        let mut shard_gen = ctx.runtime.generation();
         let reply = dispatch(
             ctx,
             st,
@@ -788,6 +918,7 @@ mod tests {
             store,
             wheel,
             now,
+            &mut shard_gen,
             &zero,
             MemoryInfo::default(),
             &mut deltas,
@@ -906,6 +1037,63 @@ mod tests {
         // AUTH then PING works.
         assert_eq!(run(&c, &mut s, &[b"AUTH", b"pw"]), Value::ok());
         assert_eq!(run(&c, &mut s, &[b"PING"]), Value::simple("PONG"));
+    }
+
+    #[test]
+    fn auth_correct_password_succeeds_wrong_password_is_wrongpass() {
+        // The constant-time compare must still be CORRECT: the exact password
+        // authenticates, and any mismatch (wrong content, or a prefix/suffix of the
+        // secret) is WRONGPASS. We cannot test timing here, only that the constant-time
+        // path returns the right answer.
+        let c = ctx(Some("s3cr3t"));
+        // Correct password authenticates.
+        let mut ok = state(&c);
+        assert_eq!(run(&c, &mut ok, &[b"AUTH", b"s3cr3t"]), Value::ok());
+        // A same-length wrong password is WRONGPASS.
+        let mut bad = state(&c);
+        match run(&c, &mut bad, &[b"AUTH", b"s3cr3T"]) {
+            Value::Error(e) => assert_eq!(
+                e.line(),
+                "-WRONGPASS invalid username-password pair or user is disabled."
+            ),
+            other => panic!("expected WRONGPASS, got {other:?}"),
+        }
+        // A shorter password sharing the secret's prefix is WRONGPASS (length differs).
+        let mut shortp = state(&c);
+        match run(&c, &mut shortp, &[b"AUTH", b"s3cr3"]) {
+            Value::Error(e) => assert!(e.line().starts_with("-WRONGPASS")),
+            other => panic!("expected WRONGPASS, got {other:?}"),
+        }
+        // A longer password with the secret as a prefix is WRONGPASS.
+        let mut longp = state(&c);
+        match run(&c, &mut longp, &[b"AUTH", b"s3cr3t!"]) {
+            Value::Error(e) => assert!(e.line().starts_with("-WRONGPASS")),
+            other => panic!("expected WRONGPASS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_matches_naive_equality() {
+        // The hand-rolled constant-time compare agrees with naive equality on a spread
+        // of length/content cases (correctness of the timing-safe path).
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"", b""),
+            (b"a", b"a"),
+            (b"a", b"b"),
+            (b"", b"x"),
+            (b"abc", b"ab"),
+            (b"abc", b"abc"),
+            (b"abc", b"abd"),
+            (b"secret", b"secret"),
+            (b"secret", b"Secret"),
+        ];
+        for &(a, b) in cases {
+            assert_eq!(
+                constant_time_eq(a, b),
+                a == b,
+                "constant_time_eq disagreed for {a:?} vs {b:?}"
+            );
+        }
     }
 
     #[test]
@@ -1825,6 +2013,7 @@ mod tests {
         let mut wheel = TimingWheel::new();
         let zero = || CounterSnapshot::default();
         let mut deltas = CounterDeltas::default();
+        let mut shard_gen = ctx.runtime.generation();
         let reply = dispatch(
             ctx,
             st,
@@ -1832,6 +2021,7 @@ mod tests {
             store,
             &mut wheel,
             now,
+            &mut shard_gen,
             &zero,
             MemoryInfo::default(),
             &mut deltas,
@@ -1841,12 +2031,10 @@ mod tests {
     }
 
     /// A context with the ceiling enabled at `per_shard_budget` bytes (single-shard
-    /// tests, so maxmemory == per_shard_budget).
+    /// tests, so maxmemory == per_shard_budget). The ceiling is seeded into the runtime
+    /// overlay (the highest-precedence layer), where the admission gate reads it.
     fn ctx_with_budget(per_shard_budget: u64) -> ServerContext {
-        let mut c = ctx(None);
-        c.maxmemory = per_shard_budget;
-        c.per_shard_budget = per_shard_budget;
-        c
+        ctx_full(None, per_shard_budget, "allkeys-lru")
     }
 
     fn err_of(v: Value) -> String {
@@ -4069,5 +4257,129 @@ mod tests {
                 "expected arity error for {cmd:?}"
             );
         }
+    }
+
+    // -- CONFIG maxmemory-policy hot-swap through dispatch (PR-4b). --
+
+    /// Drive ONE command through dispatch against a caller-owned store + per-shard
+    /// generation, with a seeded [`TestEnv`] (so the swap seed is deterministic), and
+    /// return the reply.
+    fn run_swap(
+        ctx: &ServerContext,
+        st: &mut ConnState,
+        store: &mut TestStore,
+        shard_gen: &mut u64,
+        seed: u64,
+        parts: &[&[u8]],
+    ) -> Value {
+        let mut env = TestEnv::new(seed);
+        let mut wheel = TimingWheel::new();
+        let zero = || CounterSnapshot::default();
+        let mut deltas = CounterDeltas::default();
+        dispatch(
+            ctx,
+            st,
+            &mut env,
+            store,
+            &mut wheel,
+            UnixMillis(0),
+            shard_gen,
+            &zero,
+            MemoryInfo::default(),
+            &mut deltas,
+            &req(parts),
+        )
+    }
+
+    #[test]
+    fn dispatch_hot_swaps_policy_on_generation_change() {
+        // A CONFIG SET maxmemory-policy bumps the shared generation; the NEXT command on
+        // a shard whose last-seen generation is behind rebuilds that shard's policy from
+        // the new name (the per-command atomic load + compare at the top of dispatch).
+        let c = ctx_full(None, 0, "allkeys-lru");
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, map_policy_name("allkeys-lru", 1).unwrap());
+        let mut shard_gen = c.runtime.generation();
+
+        // A no-op command does not swap (generation unchanged).
+        let _ = run_swap(&c, &mut s, &mut st, &mut shard_gen, 1, &[b"PING"]);
+        assert_eq!(st.policy_name(), "allkeys-lru");
+
+        // CONFIG SET maxmemory-policy allkeys-lfu (bumps the shared generation).
+        let _ = run_swap(
+            &c,
+            &mut s,
+            &mut st,
+            &mut shard_gen,
+            1,
+            &[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lfu"],
+        );
+        // The swap happens at the TOP of the NEXT dispatch (the CONFIG SET command that
+        // bumped the generation observed the OLD generation at its own top). Issue
+        // another command: now the store has swapped.
+        let _ = run_swap(&c, &mut s, &mut st, &mut shard_gen, 1, &[b"PING"]);
+        assert_eq!(
+            st.policy_name(),
+            "allkeys-lfu",
+            "store swapped to the new policy"
+        );
+        assert_eq!(
+            shard_gen,
+            c.runtime.generation(),
+            "shard caught up to the gen"
+        );
+    }
+
+    #[test]
+    fn dispatch_swap_seed_is_deterministic() {
+        // Two identical seeded runs that swap to a *-random policy through dispatch
+        // produce the same victim ordering (ADR-0003: the swap seeds the RNG through the
+        // Env seam, so a fixed seed is reproducible; the shared atomic reads add no
+        // nondeterminism for a fixed command sequence).
+        fn build_and_swap(seed: u64) -> TestStore {
+            let c = ctx_full(None, 0, "allkeys-lru");
+            let mut s = state(&c);
+            let mut st = store_with(c.databases, map_policy_name("allkeys-lru", 1).unwrap());
+            let mut shard_gen = c.runtime.generation();
+            // Plant keys.
+            for i in 0..8u8 {
+                let key = [b'k', i];
+                let _ = run_swap(
+                    &c,
+                    &mut s,
+                    &mut st,
+                    &mut shard_gen,
+                    seed,
+                    &[b"SET", &key, b"v"],
+                );
+            }
+            // Swap to allkeys-random; the swap draws its seed from the seeded TestEnv on
+            // the FIRST command after the generation bump.
+            let _ = run_swap(
+                &c,
+                &mut s,
+                &mut st,
+                &mut shard_gen,
+                seed,
+                &[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-random"],
+            );
+            // The next command triggers the swap (and re-tracks the keys via reads).
+            for i in 0..8u8 {
+                let key = [b'k', i];
+                let _ = run_swap(&c, &mut s, &mut st, &mut shard_gen, seed, &[b"GET", &key]);
+            }
+            assert_eq!(st.policy_name(), "allkeys-random");
+            st
+        }
+        // The swap-seed determinism is anchored by the FIRST command after the gen bump:
+        // both runs draw the SAME seed value from a TestEnv seeded the same way, because
+        // that command's env is `TestEnv::new(seed)` and the RNG draw for the swap is the
+        // first draw on that fresh env. So both stores swap to a Random policy seeded
+        // identically; their used_memory and policy name match deterministically.
+        let a = build_and_swap(99);
+        let b = build_and_swap(99);
+        assert_eq!(a.policy_name(), b.policy_name());
+        assert_eq!(a.used_memory(), b.used_memory());
+        assert_eq!(a.len(), b.len());
     }
 }

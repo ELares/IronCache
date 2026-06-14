@@ -708,6 +708,47 @@ pub trait ActiveExpiry {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime policy-swap surface (CONFIG.md maxmemory-policy hot-swap, #50/#85, PR-4b).
+// A SEPARATE trait from the frozen four primitives (like Admit/ActiveExpiry): it lets
+// the dispatch layer rebuild a shard's eviction policy on a `CONFIG SET
+// maxmemory-policy` WITHOUT naming the concrete policy enum (which lives in
+// ironcache-eviction, a crate the waist does not depend on, to keep the waist
+// policy-agnostic). The waist names only a policy NAME string and an RNG SEED; the
+// concrete store maps the name to a policy through ironcache-eviction. This is
+// ADDITIVE: it adds NO method to the four `Store` primitives and does not change their
+// signatures.
+// ---------------------------------------------------------------------------
+
+/// The runtime eviction-policy swap surface (CONFIG.md `maxmemory-policy` hot-swap).
+/// NOT one of the frozen four primitives; an additive waist trait. A `CONFIG SET
+/// maxmemory-policy` on the dispatch path rebuilds the serving shard's policy through
+/// this, seeded from the Env RNG (ADR-0003 determinism: the seed comes through the
+/// determinism seam, never std rand). The concrete per-shard store implements it.
+///
+/// The previous policy's eviction RANKING HISTORY (S3-FIFO queue positions / W-TinyLFU
+/// sketch counts / LRU recency) is reset on swap, which is acceptable (Redis itself
+/// warns the policy switch "takes time to adjust"). But the new policy IS RE-SEEDED from
+/// the live keyspace (its roster is repopulated from every resident key), so eviction
+/// works IMMEDIATELY after a swap: a populated over-budget shard can still select a
+/// victim on the very next write rather than spuriously replying `-OOM` until keys are
+/// re-observed. Only the ranking metadata resets; the candidate set does not.
+pub trait PolicySwap {
+    /// Rebuild this shard's eviction policy from the Redis `maxmemory-policy` `name`,
+    /// seeding any RNG-bearing variant (`*-random`) from `rng_seed` (drawn by the
+    /// caller through the Env RNG seam, ADR-0003). Returns `false` if `name` is not a
+    /// recognized policy name (the dispatch layer validated it already, so this is the
+    /// defensive path).
+    ///
+    /// On a successful swap the new policy's RANKING HISTORY starts empty (the
+    /// eviction-ordering reset CONFIG.md/Redis both document), but its CANDIDATE ROSTER
+    /// is RE-SEEDED from the live keyspace: every resident, not-yet-lazily-expired entry
+    /// (its deadline has not strictly passed at `now`) is re-observed into the new policy
+    /// so `select_victim` has candidates immediately and eviction does not falsely OOM.
+    /// `now` is the lazy-expiry boundary used to skip entries past their deadline.
+    fn set_policy_by_name(&mut self, name: &str, rng_seed: u64, now: UnixMillis) -> bool;
+}
+
+// ---------------------------------------------------------------------------
 // Keyspace iteration surface (KEYSPACE.md #129). A SEPARATE trait from the frozen
 // four primitives (like Admit and ActiveExpiry): it lets the command-dispatch layer
 // run the generic keyspace commands (SCAN/KEYS/DBSIZE/RANDOMKEY/RENAME/COPY/MOVE/

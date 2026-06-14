@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod cmd_config;
 pub mod cmd_expire;
 pub mod cmd_introspect;
 pub mod cmd_keyspace;
