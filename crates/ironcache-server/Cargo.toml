@@ -35,3 +35,9 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"
 # -independent dependency-table walk, so a dotted-table
 # `[dependencies.ironcache-store]` cannot slip past the guard).
 toml = { workspace = true }
+
+# The end-to-end test installs jemalloc as its own `#[global_allocator]` so the INFO
+# `used_memory` figure (process-global stats.allocated) is live over a real socket,
+# mirroring the server binary. Dev-only, non-MSVC (where jemalloc is unavailable).
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }

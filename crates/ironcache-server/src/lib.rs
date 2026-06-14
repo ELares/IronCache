@@ -22,6 +22,10 @@ pub mod dispatch;
 pub use conn::ConnState;
 pub use dispatch::{RollupFn, ServerContext, dispatch};
 
+// Re-export the observe types the binary supplies to dispatch (the INFO memory
+// snapshot it reads once at the binary edge).
+pub use ironcache_observe::MemoryInfo;
+
 // Re-export the protocol types callers need so the binary depends on one crate
 // for the server surface.
 pub use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, Request, Value, decode, encode};
