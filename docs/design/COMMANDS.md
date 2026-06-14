@@ -10,7 +10,7 @@ ENCODING), #95/#98 (conformance/property), #130 (blocking).
 The five core collection groups (strings, lists, hashes, sets, sorted sets) are
 the bulk of the Tier 1 surface, and the top-ranked Compatible tenet had no owner
 for their command-level contract. This specifies that contract and the method by
-which it is made testable, rather than re-printing all ~150 commands
+which it is made testable, rather than re-printing all ~240 commands
 [redis-core-command-count]. In scope: arity/variadic rules, the `*STORE` family,
 counted/`LIMIT` forms, reply shapes, the option flags, and the error edges. Out
 of scope: the in-memory representations (#35/#112/#113/#134/#135), blocking
@@ -31,7 +31,9 @@ cross-cutting rules below.
 
 ### Mapping to storage primitives
 
-Every command is a composition of the four storage primitives (#34): reads use
+Every per-type collection command in this document is a composition of the four
+storage primitives (#34) (iteration/SCAN, blocking, and pub/sub use their own
+entry points, per STORAGE_API.md): reads use
 `Read`, blind writes `Upsert`, removals `Delete`, and all in-place mutation
 (`INCR`, `APPEND`, `SETRANGE`, `LPUSH`/`RPUSH`, `HSET`, `SADD`, `ZADD`, and the
 counted/flagged forms) is one `RMW` whose mutator runs atomically on the owning
@@ -87,4 +89,4 @@ Specified once, applied per command:
 - Claims: [redis-core-command-count], [valkey-resp-identical],
   [valkey-assert-encoding-vocab], [redis-hash-max-listpack-entries-512],
   [redis-set-encodings-thresholds], [redis-zset-max-listpack-entries-128],
-  [redis-list-max-listpack-size-neg2], [multi-exec-no-rollback].
+  [redis-list-max-listpack-size-neg2].

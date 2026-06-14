@@ -37,14 +37,18 @@ SwissTable (ADR-0005, #35) that resizes all-at-once, so the Redis bucket trick
 does not transfer. Instead the cursor is defined over the key hash, which a
 resize does not change:
 
-- A SCAN cursor encodes the slot id (high bits) plus an intra-slot position that
-  is the last key-hash returned. Iteration within a slot proceeds in ascending
-  key-hash order, using the hash IronCache already computes for placement (the
-  hash tag in the bucket, full hash recomputable from the embedded key). Because a
-  key's hash is invariant across a `hashbrown` resize, resuming at "next key whose
-  hash exceeds the cursor" returns every key present throughout at least once,
-  regardless of any resize between calls. Keys inserted mid-scan may or may not
-  appear; that is within contract.
+- A SCAN cursor encodes the slot id (high bits) plus an intra-slot position: the
+  last FULL 64-bit key-hash returned, plus a small discriminator counting how many
+  keys sharing that exact hash were already emitted. Iteration within a slot
+  proceeds in ascending full-key-hash order, using the full hash recomputed from
+  the embedded key, never the truncated in-bucket tag. Resumption returns keys
+  whose hash is strictly greater than the cursor hash, plus any not-yet-emitted
+  keys whose hash equals the cursor hash (selected via the discriminator), so two
+  distinct keys that collide on the same 64-bit hash are never skipped. Because a
+  key's full hash is invariant across a `hashbrown` resize, this returns every key
+  present throughout the scan at least once regardless of any resize between calls,
+  including equal-hash keys. Keys inserted mid-scan may or may not appear; that is
+  within contract.
 - Because the shard is single-owner (ADR-0005), no locking is needed; SCAN runs as
   bounded batches on the owning core (`COUNT` is a hint to batch size) and yields
   between batches so it never stalls the core.
@@ -59,8 +63,9 @@ When a slot is being migrated out (#75), its keys move to another node; the
 cluster SCAN contract is that clients SCAN every node, so a node only owes the
 guarantee for slots it owns at the time. A slot migrating mid-scan is handled by
 the migration design (#75): the cursor's slot id lets the node report the slot as
-moved (the client re-SCANs the new owner), so no key is silently dropped. This is
-why the cursor encodes the slot explicitly.
+moved with a MOVED-style redirection [redis-cluster-moved-ask] (the client
+re-SCANs the new owner), so no key is silently dropped. This is why the cursor
+encodes the slot explicitly.
 
 ### DUMP / RESTORE
 
@@ -73,11 +78,19 @@ ENCODING) have one blob format to target, validated against the oracle
 
 ## Open questions
 
-- The exact cursor encoding bit-split (slot id vs intra-slot hash position) given
-  16384 slots and a 64-bit cursor, and whether very large slots need a secondary
-  cursor field.
-- Whether hash-ordered iteration costs enough over natural table order to warrant
-  a per-slot secondary index, measured on the harness (#8).
+- The exact cursor encoding bit-split (slot id, full-hash, and the equal-hash
+  discriminator) given 16384 slots [redis-cluster-hash-slots-16384] and a 64-bit
+  cursor, and whether very large slots need a secondary cursor field (a 64-bit
+  cursor may be too narrow to carry slot id + full hash + discriminator, so the
+  cursor encoding itself is an open question, possibly an opaque token rather than
+  a literal hash).
+- Hash-ordered iteration is REQUIRED for the guarantee, not optional: a
+  natural-table-order cursor position is meaningless after an all-at-once resize
+  (entries rehash to new buckets), so table order would break stability. The open
+  question is only the mechanism and its cost: a per-slot secondary index kept
+  sorted by hash, versus sorting each batch on the fly (O(n log n) per batch,
+  which is in tension with the bounded-batch yield property above), measured on
+  the harness (#8).
 
 ## Acceptance and test hooks
 
