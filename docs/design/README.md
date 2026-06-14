@@ -168,3 +168,6 @@ Specs added as the M1 milestone progresses.
   diskless full-sync (epoch cut, RDB-compatible base) (#60).
 - [TIERED_STORE.md](TIERED_STORE.md): the tiered RAM->SSD value store
   (RAM index + ~12B pointer, eviction-driven spill, append-only flash) (#66).
+- [AT_REST_ENCRYPTION.md](AT_REST_ENCRYPTION.md): opt-in envelope encryption (AEAD
+  over segment/page/.meta records, DEK-wrapped-by-KEK/KMS, key rotation,
+  off-hot-path, fail-closed) (#143).
