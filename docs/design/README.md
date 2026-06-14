@@ -141,3 +141,8 @@ Specs added as the M1 milestone progresses.
 - [BLOCKING_COMMANDS.md](BLOCKING_COMMANDS.md): blocking commands (BLPOP family,
   WAIT, XREAD BLOCK) under shared-nothing: per-shard FIFO wait queues, cross-shard
   wakeup, no-block-in-EXEC (#130).
+- [SERVER_PUSH.md](SERVER_PUSH.md): the unified server-push channel (Pub/Sub,
+  sharded Pub/Sub, keyspace notifications, client-side-caching) and its fan-out
+  topology under shared-nothing (#20, #108).
+- [CLIENT_TRACKING.md](CLIENT_TRACKING.md): CLIENT TRACKING (BCAST + RESP3 push
+  default, bounded global table, RESP2 REDIRECT) (#21).
