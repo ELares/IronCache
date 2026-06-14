@@ -22,16 +22,23 @@ monomorphization strategy, runtime selection, and the Redis alias layer.
 
 - One trait with a small surface: `on_access(entry)`, `on_insert(entry)`,
   `evict_victim() -> key` (called only at the memory budget), and ghost-queue
-  hooks. It operates over the per-entry metadata folded into the kvobj
-  (OBJECT_LAYOUT #111): the S3-FIFO 2-bit counter [s3fifo-freq-counter-2bit-cap3],
-  or a SIEVE visited bit [sieve-algorithm], or a W-TinyLFU sketch reference
-  [wtinylfu-window-main-split], so no policy needs a parallel per-key structure.
-- Hot-path contract: `on_access` is a single in-place metadata write on the
-  owning core (a flag/counter bump), never a list relink, so it adds no lock and
-  no allocation, which is exactly why FIFO-class policies beat LRU here
-  [hit-ratio-can-hurt-throughput] and why locks are unnecessary
-  [glommio-locks-never-necessary] (ADR-0005). Eviction selection runs only when
-  the shard hits its budget (ADR-0007), off the read path.
+  hooks. The FIFO-class policies fold their state into the kvobj (OBJECT_LAYOUT
+  #111), the S3-FIFO 2-bit counter [s3fifo-freq-counter-2bit-cap3] or a SIEVE
+  visited bit [sieve-algorithm], so they need no parallel per-key structure. The
+  W-TinyLFU-fronted variant is the exception: its frequency lives in a shared
+  per-shard 4-bit Count-Min sketch [wtinylfu-cmsketch-4bit] (about 8 bytes per
+  entry, out of the object, not the 2-bit field) plus a small LRU admission
+  window [wtinylfu-window-main-split].
+- Hot-path contract: for the FIFO-class policies (S3-FIFO, SIEVE) `on_access` is a
+  single in-place metadata write on the owning core (a flag/counter bump), never a
+  list relink, so it adds no lock and no allocation, which is exactly why
+  FIFO-class policies beat LRU here [hit-ratio-can-hurt-throughput] and why locks
+  are unnecessary [glommio-locks-never-necessary] (ADR-0005). The W-TinyLFU
+  variant is a deliberate exception: an access does a multi-cell minimum-increment
+  on the shard's sketch [wtinylfu-cmsketch-4bit] and may relink the admission
+  window, still lock-free on the owning core but not a single write. Eviction
+  selection runs only when the shard hits its budget (ADR-0007), off the read
+  path.
 
 ### Ghost queue
 
@@ -47,8 +54,12 @@ monomorphization strategy, runtime selection, and the Redis alias layer.
   `EvictionPolicy` trait, or an enum dispatch) so there is no vtable indirection
   on the hot path for the default. Runtime selection (the advisor #88 or
   `CONFIG SET maxmemory-policy`) switches policy per shard via the alias layer
-  below; switching rebinds the policy and reinterprets the per-entry metadata
-  bits, it does not move data.
+  below; switching rebinds the policy without moving the values. Because the
+  per-entry 2-bit field means different things per policy (an S3-FIFO freq counter
+  [s3fifo-freq-counter-2bit-cap3] vs a SIEVE visited bit [sieve-algorithm]), the
+  post-switch metadata is approximate until warmed, or the switch runs the
+  quiescent reindex step #48 proposes; switching to or from W-TinyLFU
+  additionally builds or drops its sketch.
 
 ### Redis policy-name mapping (#50)
 
@@ -62,13 +73,15 @@ monomorphization strategy, runtime selection, and the Redis alias layer.
   (S3-FIFO by default) over all keys; the `volatile-*` family restricts the
   victim set to keys with a TTL (#51). `*-lru`/`*-lfu` are served by the
   FIFO-class engine rather than Redis's sampled approximation
-  [redis-lru-lfu-sampling] [redis-maxmemory-samples-5] (a default-internal
-  difference, not an observable one: the wire contract is the accepted name and
-  the eviction effect, not the sampling algorithm). `*-random` maps to a random
-  victim; `*-ttl` and the newer `*-lrm` (least-recently-modified)
-  [redis-lrm-policy-new] map to their respective orderings over the eligible set.
-  `maxmemory-samples` is accepted and ignored (or used only to gate a SIEVE/LRU
-  fallback), documented as a no-op under the FIFO engine.
+  [redis-lru-lfu-sampling] [redis-maxmemory-samples-5] (a documented
+  default-behavior divergence per ADR-0009: the named family is honored as the
+  eviction posture, but the exact victim ordering differs from Redis's sampling;
+  the name is accepted and `CONFIG GET` echoes it). `*-random` maps to a random
+  victim; `volatile-ttl` evicts nearest-expiry-first using the #51 timing wheel
+  (there is no `allkeys-ttl`); the newer `*-lrm` (least-recently-modified)
+  [redis-lrm-policy-new] evicts by last-modification time over the eligible set.
+  `maxmemory-samples` is accepted and is a documented no-op under the FIFO-class
+  engine (it tunes Redis sampling, which IronCache does not use).
 
 ## Open questions
 
@@ -79,8 +92,10 @@ monomorphization strategy, runtime selection, and the Redis alias layer.
 
 ## Acceptance and test hooks
 
-- `on_access` for every policy is a single in-place metadata write, no lock, no
-  alloc (a hot-path lint/test).
+- `on_access` for the FIFO-class policies (S3-FIFO, SIEVE) is a single in-place
+  metadata write, no lock, no alloc; the W-TinyLFU variant's access is a
+  lock-free sketch minimum-increment plus an optional window relink (a hot-path
+  lint/test scoped per policy).
 - All ten Redis policy names are accepted, `CONFIG GET maxmemory-policy` echoes a
   Redis-recognized value, and the eviction effect matches the named family
   (conformance #95/#97).
@@ -92,7 +107,8 @@ monomorphization strategy, runtime selection, and the Redis alias layer.
 - ADR-0005, ADR-0007, ADR-0008; issues #46, #49, #51, #34, #88, #8, #47, #95,
   #97, #111.
 - Claims: [s3fifo-freq-counter-2bit-cap3], [s3fifo-small-main-split],
-  [sieve-algorithm], [wtinylfu-window-main-split], [hit-ratio-can-hurt-throughput],
+  [sieve-algorithm], [wtinylfu-window-main-split], [wtinylfu-cmsketch-4bit],
+  [hit-ratio-can-hurt-throughput],
   [glommio-locks-never-necessary], [redis-maxmemory-policies-list],
   [redis-maxmemory-policy-default-rc], [redis-lru-lfu-sampling],
   [redis-maxmemory-samples-5], [redis-lrm-policy-new].

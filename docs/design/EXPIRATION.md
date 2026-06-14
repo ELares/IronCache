@@ -64,9 +64,10 @@ expiries exactly per shard instead.
 
 - The wheel registers a (key, optional element) deadline, so per-element TTLs
   (hash-field expiry and similar) reuse the same mechanism rather than a bespoke
-  side structure; this is the durable form of the per-element expiry KeyDB
-  prototyped and reverted [keydb-subkey-expire]. Whether per-element TTL ships in
-  v1 is gated by the command-surface tiering (#128); the wheel supports it.
+  side structure; it reuses the wheel for the per-element expiry KeyDB ships via
+  EXPIREMEMBER/EXPIREMEMBERAT [keydb-subkey-expire], providing the same capability
+  natively. Whether per-element TTL ships in v1 is gated by the command-surface
+  tiering (#128); the wheel supports it.
 
 ## Open questions
 
