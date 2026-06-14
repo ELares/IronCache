@@ -6982,34 +6982,6 @@ claims:
     note: rustsec.org states the database is maintained by the Rust Secure Code Working Group, covers
       crates published via crates.io, uses RUSTSEC-YYYY-NNNN IDs (example RUSTSEC-2022-0051), and exports
       to OSV in real time for the GitHub Advisory Database/Dependabot. Cross-checked against github.com/rustsec/advisory-db.
-- id: envoy-redis-readpolicy
-  dimension: resp-protocol-compat
-  system: Envoy Redis proxy (network filter)
-  version: latest (1.39.0-dev-ec0eb7 docs build)
-  claim: 'Envoy''s Redis proxy exposes a ReadPolicy enum on the connection-pool settings that surfaces
-    replica reads with bounded staleness as an explicit, named contract. The enum has five values: MASTER
-    (default, read from the current primary), PREFER_MASTER (read from primary, fall back to replicas
-    if unavailable), REPLICA (read from replica nodes; a random node is chosen among multiple replicas
-    in a shard, healthy nodes preferred), PREFER_REPLICA (read from replicas, fall back to primary if
-    all replicas are unavailable/unhealthy), and ANY (read from any node, primary or replica, healthy
-    nodes preferred). The documentation explicitly warns that all ReadPolicy settings except MASTER may
-    return stale data because replication is asynchronous, so the caller must tolerate staleness.'
-  value: ReadPolicy enum = {MASTER (default), PREFER_MASTER, REPLICA, PREFER_REPLICA, ANY}; non-MASTER
-    policies documented as possibly returning stale data due to asynchronous replication
-  source_url: https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/redis_proxy/v3/redis_proxy.proto
-  accessed_date: '2026-06-13'
-  confidence: high
-  confidence_reason: Read directly from the official Envoy v3 API proto documentation; all five enum values
-    and the asynchronous-replication staleness warning are quoted verbatim from the upstream page.
-  load_bearing: true
-  verification:
-    verdict: confirmed
-    best_source_url: https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/network/redis_proxy/v3/redis_proxy.proto
-    note: WebFetch of the latest Envoy v3 redis_proxy.proto docs (build 1.39.0-dev-ec0eb7) returned all
-      five ReadPolicy values with MASTER as DEFAULT and the explicit note that all settings except MASTER
-      may return stale data because replication is asynchronous. Cross-checked against WebSearch summaries
-      of older tagged versions (v1.12.0/v1.14.x) which describe the same enum semantics, confirming this
-      is a long-standing, canonical Envoy feature rather than a recent addition.
 - id: redis-cluster-readonly-replica
   dimension: resp-protocol-compat
   system: Redis Cluster (READONLY / READWRITE connection commands)
