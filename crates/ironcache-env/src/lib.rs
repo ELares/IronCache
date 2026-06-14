@@ -92,16 +92,21 @@ pub trait Rng {
     /// The next 64 bits of the stream.
     fn next_u64(&mut self) -> u64;
 
-    /// A uniform `u64` in `[0, bound)`. Returns `0` when `bound == 0`. Uses
-    /// Lemire's multiply-shift (no modulo bias) so the mapping is stable across
-    /// implementations that share `next_u64`.
+    /// A `u64` in `[0, bound)`. Returns `0` when `bound == 0`. Uses Lemire's
+    /// multiply-shift reduction WITHOUT the rejection step, so it carries a small,
+    /// bounded, deterministic bias (it is not exactly uniform). That is the right
+    /// trade for jitter and sampling, where reproducibility matters and a tiny
+    /// bias is harmless; it is NOT suitable where exact uniformity or crypto
+    /// guarantees are required. The mapping is stable across implementations that
+    /// share `next_u64`.
     #[inline]
     fn gen_below(&mut self, bound: u64) -> u64 {
         if bound == 0 {
             return 0;
         }
-        // Widening-multiply rejection-free reduction; bias is bounded and
-        // deterministic, which is what DST needs (not cryptographic uniformity).
+        // Widening-multiply reduction with NO rejection step; the bias is bounded
+        // and deterministic, which is what DST needs (not cryptographic
+        // uniformity, and not exact uniformity).
         let m = u128::from(self.next_u64()) * u128::from(bound);
         (m >> 64) as u64
     }

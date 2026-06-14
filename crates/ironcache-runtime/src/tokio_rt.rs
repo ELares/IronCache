@@ -63,8 +63,16 @@ impl Runtime for TokioRuntime {
         Ok(RecvResult { buf, n })
     }
 
-    async fn send(&self, stream: &mut Self::Stream, data: &[u8]) -> Result<(), Self::Error> {
-        stream.write_all(data).await
+    async fn send(
+        &self,
+        stream: &mut Self::Stream,
+        buf: Self::Buf,
+    ) -> Result<Self::Buf, Self::Error> {
+        // Owned-buffer model: write the buffer's bytes, then hand the buffer back
+        // to the caller so it (or a pool) can reclaim/reuse the allocation. A
+        // future io_uring fixed-buffer backend relies on this ownership return.
+        stream.write_all(buf.as_ref()).await?;
+        Ok(buf)
     }
 
     async fn timer(&self, dur: Duration) -> () {

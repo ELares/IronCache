@@ -23,6 +23,8 @@ fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
             shards: 1,
             pid: std::process::id(),
             started_at: ironcache_env::Monotonic::ZERO,
+            maxmemory: 0,
+            mem_allocator: "jemalloc",
         },
     }
 }

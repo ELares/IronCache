@@ -93,12 +93,19 @@ pub trait Runtime {
         buf: Self::Buf,
     ) -> impl Future<Output = Result<RecvResult<Self::Buf>, Self::Error>>;
 
-    /// Write all of `data` to `stream`.
+    /// Write all of the bytes in the owned `buf` to `stream`, then RETURN the
+    /// buffer so the caller (or a buffer pool) can reclaim it.
+    ///
+    /// `send` is owned-buffer and symmetric with `recv`, never a borrowed
+    /// `&[u8]` (RUNTIME_ABSTRACTION.md "all I/O is owned-buffer, never borrowed").
+    /// A future io_uring fixed-buffer backend needs the write buffer to outlive
+    /// the kernel completion, which a borrow cannot honor; returning the owned
+    /// buffer is the only model every backend can satisfy.
     fn send(
         &self,
         stream: &mut Self::Stream,
-        data: &[u8],
-    ) -> impl Future<Output = Result<(), Self::Error>>;
+        buf: Self::Buf,
+    ) -> impl Future<Output = Result<Self::Buf, Self::Error>>;
 
     /// Complete after `dur` elapses. The seam's canonical timer; backends arm
     /// their native timer under it (RUNTIME_ABSTRACTION.md "timer abstraction").
@@ -151,7 +158,10 @@ mod tests {
                 let buf: Vec<u8> = Vec::with_capacity(64);
                 let res = runtime.recv(&mut stream, buf).await.unwrap();
                 assert_eq!(&res.buf[..res.n], b"PING\r\n");
-                runtime.send(&mut stream, b"+PONG\r\n").await.unwrap();
+                let reply = b"+PONG\r\n".to_vec();
+                // send returns the buffer (owned-buffer model); reclaim it.
+                let returned = runtime.send(&mut stream, reply).await.unwrap();
+                assert_eq!(returned, b"+PONG\r\n");
             });
 
             let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();

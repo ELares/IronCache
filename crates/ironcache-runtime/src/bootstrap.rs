@@ -43,13 +43,35 @@ pub struct ShardSet {
     handles: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// The grace window a shard waits for its in-flight connection tasks to finish
+/// after it stops accepting, before it returns regardless (SHUTDOWN.md bounded
+/// drain). Kept here so the bound is one constant; the binary may make it a knob.
+pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
 impl ShardSet {
     /// Signal all shards to stop accepting and drain, then wait for their threads.
-    pub fn shutdown_and_join(self) {
+    ///
+    /// Each shard performs a BOUNDED drain (see [`DRAIN_GRACE`]): it stops
+    /// accepting, then awaits its live connection tasks until they finish or the
+    /// grace window elapses, and only then its accept loop returns. This call
+    /// joins every shard thread and surfaces the FIRST join error (a shard thread
+    /// that panicked) rather than silently discarding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first thread-join error if any shard thread panicked.
+    pub fn shutdown_and_join(self) -> std::thread::Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        let mut first_err: std::thread::Result<()> = Ok(());
         for h in self.handles {
-            let _ = h.join();
+            if let Err(e) = h.join() {
+                // Keep joining the rest, but remember the first panic to surface.
+                if first_err.is_ok() {
+                    first_err = Err(e);
+                }
+            }
         }
+        first_err
     }
 
     /// The shared shutdown flag, so a signal handler can flip it without holding
@@ -69,10 +91,27 @@ pub fn available_shards() -> usize {
 
 #[cfg(feature = "tokio")]
 mod tokio_bootstrap {
-    use super::{Arc, AtomicBool, Duration, Ordering, ShardConfig, ShardId, ShardSet};
+    use super::{Arc, AtomicBool, DRAIN_GRACE, Duration, Ordering, ShardConfig, ShardId, ShardSet};
     use crate::TokioRuntime;
     use crate::tokio_rt::{bind_reuseport, bind_reuseport_std};
+    use std::cell::Cell;
     use std::future::Future;
+    use std::rc::Rc;
+
+    /// A core-local count of in-flight connection tasks on one shard. Incremented
+    /// when a connection task starts and decremented when it completes (even on
+    /// panic, via the drop guard). Single-threaded per shard, so a plain
+    /// `Rc<Cell<_>>` suffices (no atomics; shared-nothing ADR-0002).
+    type LiveTasks = Rc<Cell<usize>>;
+
+    /// RAII guard that decrements the shard's live-task count when a connection
+    /// task ends, including on panic (so the drain count stays accurate).
+    struct LiveGuard(LiveTasks);
+    impl Drop for LiveGuard {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().saturating_sub(1));
+        }
+    }
 
     /// Run the shard set. For each shard this spawns an OS thread that:
     ///   1. builds a current-thread tokio runtime (NOT multi-thread; ADR-0002),
@@ -123,17 +162,35 @@ mod tokio_bootstrap {
                         }
                     };
                     let local = tokio::task::LocalSet::new();
-                    local.block_on(&rt, async move {
-                        let listener = match bind_reuseport(bind) {
-                            Ok(l) => l,
-                            Err(e) => {
-                                eprintln!("shard {index}: bind {bind} failed: {e}");
-                                return;
-                            }
-                        };
-                        let runtime = TokioRuntime::new();
-                        accept_loop(&listener, &runtime, &serve, shard, &shutdown).await;
-                    });
+                    // Catch a panic escaping the accept loop so the thread logs it
+                    // (and bumps a per-shard shard_died counter for future
+                    // OBSERVABILITY wiring) before it exits, instead of unwinding
+                    // silently. The panic is then resumed so `join()` still surfaces
+                    // it to `shutdown_and_join` (which no longer discards it).
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        local.block_on(&rt, async move {
+                            let listener = match bind_reuseport(bind) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    eprintln!("shard {index}: bind {bind} failed: {e}");
+                                    return;
+                                }
+                            };
+                            let runtime = TokioRuntime::new();
+                            accept_loop(&listener, &runtime, &serve, shard, &shutdown).await;
+                        });
+                    }));
+                    if let Err(panic) = result {
+                        // shard_died counter: PR-1 has no metrics registry yet, so
+                        // this is a local tally logged on the way out; the registry
+                        // wiring (OBSERVABILITY.md #152) reads it later.
+                        let shard_died: u64 = 1;
+                        eprintln!(
+                            "shard {index}: accept loop panicked (shard_died={shard_died}); \
+                             shard thread exiting"
+                        );
+                        std::panic::resume_unwind(panic);
+                    }
                 })?;
             handles.push(handle);
         }
@@ -152,6 +209,9 @@ mod tokio_bootstrap {
         Fut: Future<Output = ()> + 'static,
     {
         let _ = runtime;
+        // Core-local count of in-flight connection tasks, for the bounded drain.
+        let live: LiveTasks = Rc::new(Cell::new(0));
+
         while !shutdown.load(Ordering::Relaxed) {
             // Race the accept against a short timer so a shutdown is observed even
             // when no new connection arrives (no blocking accept that ignores the
@@ -162,9 +222,17 @@ mod tokio_bootstrap {
                         Ok((stream, _peer)) => {
                             let _ = stream.set_nodelay(true);
                             let fut = serve(TokioRuntime::new(), stream, shard);
+                            // Track this connection for the drain: bump the live
+                            // count, and decrement via a drop guard when the task
+                            // ends (including on panic).
+                            live.set(live.get() + 1);
+                            let guard = LiveGuard(Rc::clone(&live));
                             // Pin to this shard's LocalSet: the connection lives
                             // its whole life on this core (ADR-0002).
-                            tokio::task::spawn_local(fut);
+                            tokio::task::spawn_local(async move {
+                                let _guard = guard;
+                                fut.await;
+                            });
                         }
                         Err(e) => {
                             // Transient accept errors (e.g. EMFILE) should not kill
@@ -176,6 +244,37 @@ mod tokio_bootstrap {
                 }
                 () = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
+        }
+
+        // Shutdown observed: stop accepting (loop exited) and drain in-flight
+        // connection tasks up to the grace deadline. We poll the live count on a
+        // short tick rather than collecting JoinHandles, which keeps this O(1) in
+        // bookkeeping and works with the fire-and-forget spawn_local model.
+        drain_live_tasks(&live, shard).await;
+    }
+
+    /// Await the shard's in-flight connection tasks until the live count reaches
+    /// zero or the [`DRAIN_GRACE`] window elapses, then return. Bounded by design
+    /// (SHUTDOWN.md): a slow/stuck client cannot block shutdown forever.
+    async fn drain_live_tasks(live: &LiveTasks, shard: ShardId) {
+        if live.get() == 0 {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
+        let tick = Duration::from_millis(20);
+        while live.get() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!(
+                    "shard {}: drain grace elapsed with {} connection task(s) still live; \
+                     proceeding with shutdown",
+                    shard.index,
+                    live.get()
+                );
+                break;
+            }
+            // Yield to the LocalSet so the in-flight connection tasks make progress
+            // and their drop guards decrement the live count.
+            tokio::time::sleep(tick).await;
         }
     }
 }

@@ -151,9 +151,8 @@ fn cmd_hello(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value
                 idx += 2;
             }
             _ => {
-                return Value::error(ErrorReply::err(format!(
-                    "Syntax error in HELLO option '{}'",
-                    String::from_utf8_lossy(&req.args[idx])
+                return Value::error(ErrorReply::hello_syntax_error(&String::from_utf8_lossy(
+                    &req.args[idx],
                 )));
             }
         }
@@ -283,9 +282,7 @@ fn cmd_client(state: &mut ConnState, req: &Request) -> Value {
                 .iter()
                 .any(|&b| b == b' ' || b == b'\n' || b == b'\r')
             {
-                return Value::error(ErrorReply::err(
-                    "Client names cannot contain spaces, newlines or special characters.",
-                ));
+                return Value::error(ErrorReply::client_name_invalid_chars());
             }
             state.name = String::from_utf8_lossy(&req.args[2]).into_owned();
             Value::ok()
@@ -333,9 +330,13 @@ fn cmd_command(req: &Request) -> Value {
         b"COUNT" => Value::Integer(0),
         // DOCS: an empty map is well-formed and accepted by clients at startup.
         b"DOCS" => Value::Map(vec![]),
-        b"GETKEYS" => Value::error(ErrorReply::err("The command has no key arguments")),
-        // INFO and any other subcommand: an empty, well-formed array (PR-1 has no
-        // command table yet; clients tolerate an empty introspection result).
+        b"GETKEYS" => Value::error(ErrorReply::command_no_key_args()),
+        // INFO and any other subcommand: an empty, well-formed array. DELIBERATE
+        // divergence from the sibling stubs (CLIENT/CONFIG return an
+        // unknown_subcommand error for an unknown sub): COMMAND is probed at client
+        // startup with assorted subcommands, and an empty array is more tolerant
+        // than an error. Do not "fix" this to unknown_subcommand without checking
+        // client startup probes (PR-1 has no command table yet).
         _ => Value::Array(Some(vec![])),
     }
 }
@@ -403,6 +404,8 @@ mod tests {
                 shards: 1,
                 pid: 1,
                 started_at: Monotonic::ZERO,
+                maxmemory: 0,
+                mem_allocator: "jemalloc",
             },
         }
     }
@@ -449,7 +452,7 @@ mod tests {
         match v {
             Value::Error(e) => assert_eq!(
                 e.line(),
-                "-ERR unknown command 'FROBNICATE', with args beginning with: 'a', 'b'"
+                "-ERR unknown command 'FROBNICATE', with args beginning with: 'a' 'b' "
             ),
             other => panic!("expected error, got {other:?}"),
         }
@@ -519,10 +522,9 @@ mod tests {
         let mut s = state(&c);
         let v = run(&c, &mut s, &[b"AUTH", b"whatever"]);
         match v {
-            Value::Error(e) => assert!(
-                e.line()
-                    .starts_with("-ERR Client sent AUTH, but no password is set")
-            ),
+            Value::Error(e) => assert!(e.line().starts_with(
+                "-ERR AUTH <password> called without any password configured for the default user"
+            )),
             other => panic!("expected error, got {other:?}"),
         }
     }
