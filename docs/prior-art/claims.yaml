@@ -7731,3 +7731,32 @@ claims:
       and user manager). Termination sequence is SIGTERM first (or KillSignal=), then SIGKILL after the
       timeout unless SendSIGKILL= disables it. The freedesktop.org mirror returned HTTP 403 to WebFetch,
       so the man7.org mirror is cited as best source; content matches the official systemd documentation.'
+- id: minisign-offline-ed25519-detached-verify
+  dimension: ops-build-distribution
+  system: minisign (jedisct1)
+  version: '0.12'
+  claim: minisign verifies a detached signature entirely offline against a single small Ed25519 public
+    key, with no PKI, certificate chain, or network access required.
+  value: 'minisign uses the Ed25519 public-key signature system. Verification requires only the original
+    file, the detached .minisig signature file, and a single public key (a short base64 string, ~56 chars,
+    prefixed RW) provided either as a file (-p minisign.pub) or inline on the command line (-P RW...).
+    The command form is `minisign -Vm <file> -p minisign.pub` (or `-P <pubkey>`). No internet connection,
+    no PKI, and no certificate chain are needed; the per-file signature plus an Ed25519-signed trusted-comment
+    line are checked locally against that one key. Latest stable release 0.12, dated 2025-01-15 (also
+    packaged as minisign-0.12 in Fedora 40, 2025); source: github.com/jedisct1/minisign.'
+  source_url: https://github.com/jedisct1/minisign/blob/master/README.md
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Confirmed directly from the official jedisct1/minisign README (Ed25519, single public
+    key, no network/PKI, -Vm/-p/-P verify syntax) and the official GitHub releases page (latest stable
+    0.12, 2025-01-15), corroborated by the project homepage and Arch/Ubuntu man pages and Fedora 40 packaging
+    of 0.12 in 2025.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://github.com/jedisct1/minisign/releases/tag/0.12
+    note: 'README confirms Ed25519, offline verification with only a single public key (no network/PKI/cert
+      chain), and the `minisign -Vm file -p minisign.pub` / `-P <pubkey>` detached-verify syntax. GitHub
+      releases page pins latest stable as 0.12 released 15 Jan 2025; the WebFetch model misparsed the
+      ''21:48'' timestamp as year 2021, but the releases listing shows ''15 Jan'' and Fedora 40 shipped
+      minisign-0.12 in 2025, confirming 2025-01-15. Tool and version pinned: minisign 0.12 from github.com/jedisct1/minisign.'
