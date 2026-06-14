@@ -42,6 +42,20 @@ surfaced by `CONFIG GET`.
   for example `maxmemory-samples`, #50) are accepted and echoed for compatibility,
   documented as no-ops.
 
+#### Deliberate divergence: `bind` and `port` are restart-required
+
+`databases` and `io-threads` are `IMMUTABLE_CONFIG` in Redis and cannot change at
+runtime in IronCache either, so reporting them restart-required matches Redis. By
+contrast `bind` and `port` are `MODIFIABLE_CONFIG` in Redis (accepted at runtime,
+where Redis re-binds the listening socket), but IronCache reports them
+restart-required as a **deliberate divergence**: under the thread-per-core boot
+model the listening sockets are bound once at startup and cannot be re-bound or
+re-ported live, so a runtime `CONFIG SET bind`/`port` is rejected with the
+restart-required error rather than silently accepted as a no-op (the
+set-then-persist model Redis documents assumes the value actually takes effect
+[redis-config-set-rewrite-no-sighup]). Re-bind-at-runtime is a possible future
+capability; until then the restart-required reject is the faithful behavior.
+
 ### Live reload (beyond Redis)
 
 Unlike Redis, IronCache supports reloading the config file without a restart: a

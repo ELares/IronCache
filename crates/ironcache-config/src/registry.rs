@@ -52,10 +52,22 @@ pub enum SetKind {
     /// getter returns a fixed Redis-recognized default), matching how Redis surfaces
     /// these under a non-persistence cache build.
     AcceptedNoOp,
-    /// Restart-required: read-only at runtime (bind/port/databases/shards). `CONFIG
-    /// SET` returns the Redis-style can't-set-at-runtime error rather than silently
-    /// ignoring it (CONFIG.md "reported as requiring a restart rather than silently
-    /// ignored").
+    /// Restart-required: read-only at runtime (bind/port/databases/io-threads/shards).
+    /// `CONFIG SET` returns the Redis-style can't-set-at-runtime error rather than
+    /// silently ignoring it (CONFIG.md "reported as requiring a restart rather than
+    /// silently ignored").
+    ///
+    /// Two DISTINCT reasons land here, and they do NOT all mirror Redis:
+    /// - `databases` and `io-threads` are genuinely IMMUTABLE in BOTH IronCache and
+    ///   Redis (Redis marks them `IMMUTABLE_CONFIG`): they cannot change at runtime in
+    ///   either system, so reporting restart-required matches Redis.
+    /// - `bind` and `port` are MODIFIABLE_CONFIG in Redis (accepted at runtime; Redis
+    ///   re-binds the listening socket). IronCache reports them restart-required as a
+    ///   DELIBERATE DIVERGENCE: under the thread-per-core boot model the listening
+    ///   sockets are bound once at startup and cannot be re-bound / re-ported live, so a
+    ///   runtime set would be a silent lie. We reject with the restart-required error
+    ///   rather than pretend it took effect. (Re-bind-at-runtime is a possible future
+    ///   capability; until then this is the faithful behavior.)
     RestartRequired,
 }
 
@@ -103,6 +115,12 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "appendonly",
             kind: SetKind::AcceptedNoOp,
         },
+        // bind/port are MODIFIABLE_CONFIG in Redis (accepted at runtime), but IronCache
+        // reports them restart-required as a DELIBERATE DIVERGENCE: the thread-per-core
+        // boot binds the listening sockets once at startup and cannot re-bind / re-port
+        // live, so a runtime set is rejected rather than silently lying. See the
+        // `SetKind::RestartRequired` doc and docs/design/CONFIG.md. (databases/io-threads
+        // below are genuinely IMMUTABLE in both Redis and IronCache.)
         ParamSpec {
             name: "bind",
             kind: SetKind::RestartRequired,
