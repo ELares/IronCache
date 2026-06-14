@@ -13,7 +13,7 @@ selectors, and `aclfile` persistence. The build is deferred past M1 (the M1 slic
 ships only the degenerate single default-user); the shape is fixed now so the later
 implementation is additive, not a rewrite of the auth path. Scope: the ACL command
 surface, the permission model, and aclfile load/save. The handshake and credential
-storage are AUTH.md (#104); the transport is TLS (#105).
+storage are AUTH.md (#104); the transport is TLS (#105, separate spec).
 
 ## Design
 
@@ -26,19 +26,23 @@ storage are AUTH.md (#104); the transport is TLS (#105).
   users and narrows rules without changing the default user's behavior.
 - Command rules: `+cmd`/`-cmd` for individual commands and `+@category`/
   `-@category` for the command categories (read, write, admin, dangerous, and the
-  rest of the ~20 Redis categories) [acl-default-user]. Key rules: `~pattern`,
-  with the read/write-scoped `%R~`/`%W~` forms (Redis 7.0+) [acl-default-user].
-  Channel rules: `&pattern` for pub/sub channel access [acl-default-user].
-- Selectors (Redis 7.0+): a user may carry multiple permission selectors
-  `(+cmd ~key)` so a single identity can hold distinct command/key bundles, the
-  superset form the default user degenerates out of [acl-default-user].
+  rest) [acl-default-user]. Key rules: `~pattern`, with the read/write-scoped
+  `%R~`/`%W~` forms (Redis 7.0+) [acl-default-user]. Channel rules: `&pattern` for
+  pub/sub channel access [acl-default-user].
+- Selectors: a user may carry multiple permission selectors `(+cmd ~key)` so a
+  single identity can hold distinct command/key bundles (the Redis selector form).
+  This is an IronCache ACL-parity design target, not asserted from a pinned claim;
+  it is the superset form the M1 default user degenerates out of.
 
 ### Command surface
 
 - `ACL SETUSER`, `GETUSER`, `DELUSER`, `LIST`, `CAT`, `GENPASS`, `WHOAMI`, and
-  `USERS` [acl-default-user]. `GETUSER` reports the user in the Redis-recognized
-  field shape so existing tooling parses it (verified differentially, not asserted
-  here); `CAT` lists the command categories; `GENPASS` returns a CSPRNG hex secret.
+  `USERS` (the Redis ACL subcommand surface; `SETUSER` token syntax is the part
+  pinned by [acl-default-user]). `GETUSER` reports the user in the Redis-recognized
+  field shape so existing tooling parses it (verified differentially against the
+  oracle, not asserted here); `CAT` lists the command categories; `GENPASS` returns
+  a cryptographically-random secret (an IronCache design requirement, not a pinned
+  claim).
 - Enforcement is a per-connection check (ADR-0002): the connection resolves to a
   user at auth time (AUTH.md), and each command is gated against that user's
   resolved command/key/channel rules on the owning core, with no shared lookup on
@@ -46,11 +50,13 @@ storage are AUTH.md (#104); the transport is TLS (#105).
 
 ### aclfile persistence
 
-- Users persist to an `aclfile` (one `user ...` line per user) that is loaded at
-  startup and rewritten by `ACL SAVE`, mirroring Redis's `aclfile` model; the file
-  path is a config knob (CONFIG.md #85) and reloadable. `ACL LOAD` re-reads it.
-  When no aclfile is configured, only the default user exists (the M1 posture), so
-  aclfile is purely additive.
+- Users persist to an `aclfile` (one `user ...` line per user) loaded at startup
+  and rewritten by `ACL SAVE`, an IronCache-provided Redis-compatible aclfile.
+  `ACL LOAD` re-reads it. The aclfile path is a configuration parameter owned by
+  the config system (#85); whether it sits in the hot-reload partition or is
+  reload-only via `ACL LOAD` is an open question below. When no aclfile is
+  configured, only the default user exists (the M1 posture), so aclfile is purely
+  additive.
 
 ### Compatibility tier and deferral
 
@@ -66,7 +72,8 @@ storage are AUTH.md (#104); the transport is TLS (#105).
   follows the coarse `~pattern` form (Redis added `%R%W` in 7.0; both are in the
   pinned shape).
 - The aclfile-vs-CONFIG precedence when both define users (Redis forbids mixing;
-  match that), settled with the CONFIG layering (#85).
+  match that), and whether the aclfile path is a hot-reloadable parameter or
+  reload-only via `ACL LOAD`, both settled with the CONFIG layering (#85).
 - ACL attempt/error rate limiting, shared with the AUTH open question (#104) and
   informed by the threat model (#142).
 
