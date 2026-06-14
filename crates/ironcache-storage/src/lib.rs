@@ -77,10 +77,10 @@
 //! the command body, not inside the storage layer). This keeps the primitives
 //! frozen and lets the dispatch layer own the policy: the store exposes
 //! [`Store::used_memory`] (a read) today, and PR-3 adds an evict-to-fit path the
-//! dispatch layer drives by calling [`EvictionHook::select_victim`] (fix: the
-//! victim KEY) and then [`Store::delete`] in a loop until under budget, or replying
-//! `-OOM` for a `denyoom` write when nothing more can be freed. This is a recorded
-//! decision, not a primitive-signature change.
+//! dispatch layer drives by calling [`EvictionHook::select_victim`] (which returns
+//! the victim `(db, key)`) and then deleting it in a loop until under budget, or
+//! replying `-OOM` for a `denyoom` write when nothing more can be freed. This is a
+//! recorded decision, not a change to the FROZEN four primitives.
 
 #![forbid(unsafe_code)]
 
@@ -479,27 +479,38 @@ pub enum RmwAction {
 
 /// The eviction policy hook (#48, ADR-0008 S3-FIFO). The store fires these from
 /// INSIDE the primitives: `on_access` on a read/rmw of a live key, `on_insert` on
-/// an insert, `on_remove` on a delete/replace. PR-2a ships [`NullEviction`] (all
-/// no-ops); the real S3-FIFO policy and `select_victim` driving are PR-3.
+/// an insert, `on_remove` on a delete/replace/expiry. PR-2a ships
+/// [`NullEviction`] (all no-ops); the real S3-FIFO policy and `select_victim`
+/// driving land in PR-3 (`ironcache-eviction`).
 ///
-/// `db` is the validated logical DB id (the same id SELECT validates, KEYSPACE.md),
-/// and `key_hash` is the full 64-bit key hash (the same value SCAN orders on,
-/// #129). The on_access/on_insert/on_remove callbacks take the hash because that is
-/// all the policy's queues need to rank an entry.
+/// `db` is the validated logical DB id (the same id SELECT validates, KEYSPACE.md);
+/// `key` is the entry's key BYTES.
+///
+/// ## Why this RESERVED hook is byte-keyed (a PR-3 refinement)
+///
+/// This trait was reserved in PR-2a with a `key_hash: u64` argument as a placeholder.
+/// PR-3 refines it to take `key: &[u8]` directly, because the only thing
+/// [`Self::select_victim`] can return that the store can act on is the OWNED key
+/// bytes (`Box<[u8]>`, the store's table key): a u64 hash cannot drive a delete from
+/// a byte-keyed map (EVICTION.md `evict_victim() -> key`). Keeping the policy's
+/// queues keyed by the same bytes it must return makes the policy coherent in ONE
+/// place rather than carrying a parallel hash->key side map. The store already has
+/// `key: &[u8]` at every call site, so this refinement is mechanical there. This is
+/// a reserved-hook refinement, NOT a change to the FROZEN four primitives.
 pub trait EvictionHook {
     /// A live key was read or observed in an rmw.
-    fn on_access(&mut self, db: u32, key_hash: u64);
+    fn on_access(&mut self, db: u32, key: &[u8]);
     /// A new value was inserted, costing `bytes` logical bytes.
-    fn on_insert(&mut self, db: u32, key_hash: u64, bytes: usize);
+    fn on_insert(&mut self, db: u32, key: &[u8], bytes: usize);
     /// A value was removed (delete, replace, or expiry), freeing `bytes`.
-    fn on_remove(&mut self, db: u32, key_hash: u64, bytes: usize);
-    /// Pick a victim KEY to evict when over budget, or `None` if none. The KEY
-    /// bytes (not the hash) are returned because the store's table is keyed by the
-    /// owned key bytes (`Box<[u8]>`, ADR-0008): a u64 hash cannot drive a delete
-    /// from a byte-keyed map, so the policy must surface the key it chose
-    /// (EVICTION.md `evict_victim() -> key`). PR-3's S3-FIFO evicts through this
-    /// frozen surface.
-    fn select_victim(&mut self) -> Option<Box<[u8]>>;
+    fn on_remove(&mut self, db: u32, key: &[u8], bytes: usize);
+    /// Pick a victim to evict when over budget, or `None` if none. Returns the
+    /// `(db, key)` pair so the caller (`ShardStore::evict_to_fit`) can delete it
+    /// from the correct per-DB map: the KEY bytes (not a hash) are returned because
+    /// the store's table is keyed by the owned key bytes (`Box<[u8]>`, ADR-0008), so
+    /// a hash cannot drive the delete (EVICTION.md `evict_victim() -> key`). PR-3's
+    /// S3-FIFO evicts through this surface.
+    fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)>;
 }
 
 /// A no-op eviction hook (PR-2a default). Eviction-on-by-default (ADR-0007) and
@@ -509,13 +520,13 @@ pub struct NullEviction;
 
 impl EvictionHook for NullEviction {
     #[inline]
-    fn on_access(&mut self, _db: u32, _key_hash: u64) {}
+    fn on_access(&mut self, _db: u32, _key: &[u8]) {}
     #[inline]
-    fn on_insert(&mut self, _db: u32, _key_hash: u64, _bytes: usize) {}
+    fn on_insert(&mut self, _db: u32, _key: &[u8], _bytes: usize) {}
     #[inline]
-    fn on_remove(&mut self, _db: u32, _key_hash: u64, _bytes: usize) {}
+    fn on_remove(&mut self, _db: u32, _key: &[u8], _bytes: usize) {}
     #[inline]
-    fn select_victim(&mut self) -> Option<Box<[u8]>> {
+    fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
         None
     }
 }
@@ -630,6 +641,38 @@ pub trait Store {
     fn used_memory(&self) -> u64;
 }
 
+// ---------------------------------------------------------------------------
+// Admission surface (ADMISSION.md #128, ADR-0007). A SEPARATE trait from the frozen
+// four primitives: it lets the command-dispatch layer enforce the maxmemory ceiling
+// (evict-to-fit in cache mode, reply -OOM in datastore/noeviction) WITHOUT naming the
+// concrete store or the concrete policy. The store implements it over its configured
+// policy; dispatch bounds on `S: Store + Admit`.
+// ---------------------------------------------------------------------------
+
+/// The maxmemory admission surface the dispatch layer drives (ADMISSION.md). This is
+/// NOT one of the frozen four primitives; it is an additive waist trait (the eviction
+/// victim-KEY selection it builds on, [`EvictionHook`], was always reserved). The
+/// concrete per-shard store implements it over its configured eviction policy, so
+/// dispatch enforces the ceiling generically.
+pub trait Admit {
+    /// Whether the configured policy evicts at the ceiling (cache mode) rather than
+    /// rejecting the write (strict datastore / `noeviction`). Dispatch reads this to
+    /// choose evict-to-fit vs an immediate `-OOM`.
+    fn policy_evicts(&self) -> bool;
+
+    /// Whether the configured policy restricts victims to TTL-bearing keys (the
+    /// `volatile-*` family). For INFO / introspection.
+    fn policy_volatile_only(&self) -> bool;
+
+    /// The Redis-recognized `maxmemory-policy` name the policy echoes (INFO / CONFIG).
+    fn policy_name(&self) -> &'static str;
+
+    /// Evict entries until `used_memory()` is below `budget_bytes`, or until the
+    /// policy can free no more. Returns the number of entries evicted (the caller
+    /// bumps the `evicted_keys` counter and, if still over budget, replies `-OOM`).
+    fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,9 +732,9 @@ mod tests {
     #[test]
     fn null_eviction_selects_nothing_and_is_inert() {
         let mut e = NullEviction;
-        e.on_access(0, 1);
-        e.on_insert(0, 1, 10);
-        e.on_remove(0, 1, 10);
+        e.on_access(0, b"k");
+        e.on_insert(0, b"k", 10);
+        e.on_remove(0, b"k", 10);
         assert_eq!(e.select_victim(), None);
     }
 
