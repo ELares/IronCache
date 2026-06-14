@@ -7220,3 +7220,178 @@ claims:
     note: Confirmed via WebFetch of COMMAND INFO (10 nested elements, elems 7-10 since 7.0.0, nil for
       unknown), COMMAND DOCS (since 7.0.0, map/array reply), COMMAND COUNT (since 2.8.13, integer reply),
       and COMMAND GETKEYS (since 2.8.13, array reply; GETKEYSANDFLAGS since 7.0.0).
+- id: aerospike-hybrid-memory-index
+  dimension: memory
+  system: Aerospike Database
+  version: 8.1.2 (Enterprise/Community; released 2026-04-16; HMA architecture)
+  claim: Aerospike's default Hybrid Memory Architecture (HMA) keeps the primary index (and optional secondary
+    indexes) in DRAM for low-latency lookups while storing record data on SSD/NVMe flash; the primary
+    index can alternatively be placed in Intel Optane Persistent Memory (PMem) or, in the Enterprise-only
+    'All Flash' mode, on a flash device alongside the data (index-on-flash requires data on SSD). Its
+    clustering layer adds asynchronous Cross-Datacenter Replication (XDR) that ships changes over WAN
+    links between geographically distributed clusters in unidirectional or bidirectional topologies, configurable
+    per namespace/set/bin.
+  value: 'HMA: index in DRAM (or PMem); data on SSD/flash. All Flash (EE only): index+data on flash. XDR:
+    asynchronous cross-datacenter replication, uni/bidirectional, per-namespace/set/bin policy.'
+  source_url: https://aerospike.com/products/features/hybrid-memory-architecture/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: HMA index/data placement, PMem option, and All-Flash EE-only constraint confirmed
+    directly from Aerospike's HMA feature page and storage architecture docs; XDR async/topology details
+    confirmed from the official XDR architecture page; version 8.1.2 confirmed from Aerospike release-notes
+    index.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://aerospike.com/docs/database/learn/architecture/xdr/
+    note: HMA page and storage docs state primary index in memory and data on SSD by default; All Flash
+      (index+data on flash) is Enterprise-only and requires data on SSD; PMem is a supported index/data
+      medium. XDR docs confirm asynchronous replication over WAN between geo-distributed clusters with
+      unidirectional and bidirectional topologies and per-namespace/set/bin policies. Version 8.1.2 released
+      2026-04-16 per Aerospike release notes (8.1.0 on 2025-08-05, 8.0.0 on 2025-01-22).
+- id: tarantool-vinyl-lsm
+  dimension: storage
+  system: Tarantool
+  version: 3.7.0 (released 2026-04-22; storage engines memtx + vinyl)
+  claim: 'Tarantool offers two row storage engines: ''memtx'', the default in-memory engine that holds
+    the entire dataset in RAM while ensuring durability via a write-ahead log (WAL) plus periodic snapshots,
+    and ''vinyl'', a disk-based engine built on a log-structured merge-tree (LSM) for datasets larger
+    than RAM, where the in-RAM level (L0) is bounded by the vinyl_memory setting before data is flushed
+    to on-disk runs. Concurrency uses cooperative lightweight fibers that yield on I/O, with transactions
+    executed on a single transaction thread (separate network and WAL-writer threads), so a fiber yields
+    and the change is written to the WAL on commit.'
+  value: 'memtx: all-in-RAM, durable via WAL + snapshots. vinyl: on-disk LSM tree, RAM level L0 bounded
+    by vinyl_memory. Concurrency: cooperative fibers on a single transaction thread; separate WAL/network
+    threads.'
+  source_url: https://www.tarantool.io/en/doc/latest/platform/engines/vinyl/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: memtx-vs-vinyl split, vinyl's LSM structure with RAM L0 bounded by vinyl_memory,
+    and WAL-based durability for memtx confirmed from Tarantool's official engines/vinyl docs; fiber +
+    single-transaction-thread model confirmed from official fiber docs and dbdb.io entry; version 3.7.0
+    (2026-04-22) confirmed from Tarantool GitHub releases.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://github.com/tarantool/tarantool/releases/tag/3.6.1
+    note: Official docs confirm memtx (default, in-memory, WAL + snapshot durability) and vinyl (disk
+      LSM tree, L0 RAM level controlled by vinyl_memory). Fiber docs and dbdb.io confirm cooperative fibers
+      and a transaction model where commit yields and writes to the WAL via a dedicated WAL thread plus
+      a network thread. Latest stable release 3.7.0 dated 2026-04-22 (3.6.1 on 2026-01-27) per GitHub
+      releases; 3.x is the recommended series.
+- id: kvrocks-rocksdb-resp
+  dimension: storage
+  system: Apache Kvrocks
+  version: 2.15.0 (released 2026-02-27; bundles RocksDB v10.10.1)
+  claim: Apache Kvrocks is a distributed key-value NoSQL server that uses RocksDB (an LSM-tree store)
+    as its on-disk storage engine while speaking the Redis (RESP) wire protocol so existing Redis clients
+    connect unchanged; it persists data to disk rather than holding it all in RAM, trading some latency
+    for larger-than-memory capacity. Release 2.15.0 upgrades the bundled RocksDB to v10.10.1, moves the
+    codebase to C++20, and adds Redis-style logical-database SELECT support plus additional TimeSeries
+    and TDigest commands.
+  value: RocksDB-backed (v10.10.1 in 2.15.0), Redis/RESP wire-protocol compatible, on-disk LSM storage;
+    2.15.0 adds SELECT multi-DB, C++20, TimeSeries/TDigest commands.
+  source_url: https://kvrocks.apache.org/blog/release-2-15-0/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: RocksDB-as-storage-engine and Redis-protocol compatibility confirmed from the project's
+    GitHub description; version 2.15.0 (2026-02-27), the bundled RocksDB v10.10.1, the C++20 move, and
+    the SELECT/TimeSeries/TDigest additions confirmed directly from the official 2.15.0 release blog post.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://github.com/apache/kvrocks/releases/tag/v2.11.0
+    note: Apache Kvrocks GitHub repo describes it as 'a distributed key value NoSQL database that uses
+      RocksDB as storage engine and is compatible with Redis protocol.' Official 2.15.0 release blog (dated
+      2026-02-27) confirms RocksDB upgraded to v10.10.1, C++ standard raised to C++20, and new SELECT
+      (redis-databases), TimeSeries (TS.MREVRANGE/TS.QUERYINDEX/TS.ALTER), and TDigest commands. Earlier
+      releases corroborate the RocksDB-version-bump pattern (2.11.0 -> v9.10.0, 2.10.0 -> v9.6.1).
+- id: ignite-data-grid-near-cache
+  dimension: memory
+  system: Apache Ignite
+  version: 2.17.0 (stable, released 2025-02-13; Ignite 3.0.0 preview 2025-02-05)
+  claim: Apache Ignite is a distributed, partitioned in-memory data grid that spreads key-value caches
+    across cluster nodes as a distributed hash table (each node owns a partition of the data) with RAM
+    as the primary tier and optional disk persistence. It supports near-cache (a local read cache of frequently
+    accessed entries on the client/compute side), read-through (a cache miss transparently loads the entry
+    from an external store), and write-through/write-behind (updates are propagated to the backing database
+    synchronously, or asynchronously in batches) for integrating an external system of record.
+  value: Partitioned in-memory data grid (distributed hash table, RAM-primary + optional disk); supports
+    near-cache, read-through, and write-through/write-behind to external stores. Stable 2.17.0; 3.0.0
+    preview.
+  source_url: https://ignite.apache.org/use-cases/in-memory-cache.html
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Partitioned distributed-hash-table model and read-through/write-through/write-behind
+    support confirmed from Ignite's official in-memory-cache use-case page and CacheConfiguration javadoc;
+    near-cache is a documented Ignite feature; stable version 2.17.0 (2025-02-13) and 3.0.0 preview (2025-02-05)
+    confirmed from the Apache Ignite Wikipedia entry citing official releases.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://ignite.apache.org/releases/latest/javadoc/org/apache/ignite/configuration/CacheConfiguration.html
+    note: Ignite docs describe a distributed in-memory hash table partitioned across the cluster with
+      each node owning a portion of data, RAM-primary with optional disk tier. Read-through (miss loads
+      from external DB) and write-through/write-behind (sync vs async-batched propagation to the persistence
+      store) are explicitly documented; near-cache is a standard Ignite feature. CacheConfiguration javadoc
+      is under the 2.17.0 'latest' release; Wikipedia confirms stable 2.17.0 on 2025-02-13 and 3.0.0 preview
+      on 2025-02-05.
+- id: skytable-mtchm-index
+  dimension: memory
+  system: Skytable
+  version: 0.8.4 (released 2024-08-07; engine on Skyhash 2 / BlueQL)
+  claim: Skytable is a Rust key-value/NoSQL database that is primarily in-memory and serves queries through
+    its BlueQL language over the Skyhash protocol; its core in-memory index is NOT a B-tree but a multi-threaded
+    lock-friendly concurrent hashmap ('mtchm', exposed as IndexMTRaw), with an additional single-threaded
+    ordered sequence index (IndexSTSeqDll, a doubly-linked-list-backed map) for ordered iteration. Durability
+    is provided by a custom append-only-file (AOF) based storage engine with delayed-durability transactions
+    rather than by an LSM or B-tree on-disk structure.
+  value: 'In-memory primary index = concurrent hashmap (mtchm / IndexMTRaw), plus a single-threaded ordered
+    seq index (IndexSTSeqDll); NOT a B-tree. Storage: custom AOF engine with delayed-durability transactions.
+    Latest stable 0.8.4.'
+  source_url: https://github.com/skytable/skytable
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: 'Index implementations (mtchm/IndexMTRaw concurrent hashmap; IndexSTSeqDll ordered
+    DLL; std HashMap-based IndexST) confirmed by reading the engine/idx source at the v0.8.4 tag; in-memory/AOF/delayed-durability
+    and BlueQL/Skyhash confirmed from the GitHub README and docs; version 0.8.4 (2024-08-07) confirmed
+    from GitHub releases. Note: the suggested id ''skytable-btree'' is inaccurate (Skytable''s index is
+    a concurrent hashmap, not a B-tree), so the claim is pinned to the real structure.'
+  load_bearing: true
+  verification:
+    verdict: corrected
+    best_source_url: https://raw.githubusercontent.com/skytable/skytable/v0.8.4/server/src/engine/idx/mod.rs
+    note: 'Reading server/src/engine/idx/mod.rs at tag v0.8.4 shows the index abstractions MTIndex/STIndex/STIndexSeq
+      with concrete types: IndexMTRaw = mtchm::imp::Raw (multi-threaded concurrent hashmap), IndexSTSeqDll
+      (single-threaded ordered, doubly-linked-list backed; Conservative/Liberal configs), and IndexST
+      = std HashMap. No B-tree is used. The example id ''skytable-btree'' is therefore corrected to ''skytable-mtchm-index''
+      to match the actual concurrent-hashmap implementation. README/docs confirm primary in-memory design,
+      custom AOF storage with delayed-durability transactions, BlueQL over Skyhash 2; latest stable release
+      0.8.4 dated 2024-08-07 (0.9.0 in development).'
+- id: redka-redis-sqlite
+  dimension: storage
+  system: Redka
+  version: 1.0.1 (released 2025-02-04; SQLite/PostgreSQL backend)
+  claim: Redka (by nalgeon) re-implements the core of Redis on top of a relational database, using SQLite
+    (default) or PostgreSQL as its storage backend so data is persisted in ordinary SQL tables rather
+    than an in-memory dataset. It is usable both as an in-process Go library and as a standalone server
+    that speaks the Redis RESP wire protocol, implementing the main Redis data types (strings, lists,
+    sets, hashes, sorted sets) plus key management and transactions; v1.0.1 marks the project stable and
+    feature-complete (maintenance mode, no planned new features).
+  value: Redis core re-implemented on SQLite (default) or PostgreSQL; data in SQL tables. Embeddable Go
+    API + standalone RESP server; strings/lists/sets/hashes/sorted-sets. v1.0.1 stable, maintenance mode.
+  source_url: https://github.com/nalgeon/redka/releases/tag/v0.3.0
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: SQLite/PostgreSQL backend, dual in-process Go API + standalone RESP server, and the
+    supported data-type set confirmed from the Redka releases page and README; version 1.0.1 (2025-02-04)
+    and the 'stable / maintenance mode' status confirmed from the GitHub releases listing.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://github.com/nalgeon/redka/releases
+    note: Redka GitHub releases/README confirm it 'reimplements the core parts of Redis with SQL, while
+      remaining compatible with Redis API,' backed by SQLite or PostgreSQL, runnable in-process (Go API)
+      or as a standalone server speaking the RESP wire protocol, with strings/lists/sets/hashes/sorted-sets,
+      key management and transactions. Latest release v1.0.1 dated 2025-02-04 marks it stable for non-critical
+      production use and now in maintenance mode (no planned new features).
