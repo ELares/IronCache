@@ -83,6 +83,9 @@ Specs added as the M1 milestone progresses.
 - [DICTIONARIES.md](DICTIONARIES.md): off-hot-path ZDICT per-prefix dictionary
   training, monotonic fail-closed dict-version-id, atomic install + lazy
   re-encode (#55).
+- [SUPPLY_CHAIN.md](SUPPLY_CHAIN.md): the dependency-vulnerability + license
+  merge/release gate (cargo-deny four checks, cargo-audit/RUSTSEC, license
+  allow-list, time-boxed exceptions) (#144).
 - [PERSISTENCE.md](PERSISTENCE.md): the persistence umbrella: three durability
   tiers with honest loss windows, durable_offset/fsync-lag, fail-closed, shared
   io_uring write path, hybrid-log + segment/manifest layout (#58).
