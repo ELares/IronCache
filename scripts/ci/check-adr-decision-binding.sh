@@ -23,6 +23,10 @@
 # Requirements: POSIX sh, gh (authenticated via GH_TOKEN/GITHUB_TOKEN), and the
 # repo checked out. No network beyond gh against this repository's own API.
 set -eu
+# Stable byte collation so `sort` and `comm` agree: GNU comm (CI) aborts with
+# "not in sorted order" if fed numerically-sorted input, while BSD comm (macOS)
+# tolerates it. Sort lexically under LC_ALL=C and comm is happy on every runner.
+export LC_ALL=C
 
 LABEL="decision-needed"
 
@@ -63,7 +67,7 @@ if ! gh issue list $REPO_ARG --state closed --label "$LABEL" --limit 1000 \
   cat "$WORK/err1" >&2
   exit 2
 fi
-sort -n -u "$closed" -o "$closed"
+sort -u "$closed" -o "$closed"
 
 # --- 2. issue numbers named by ADR 'Issue:' headers -----------------------
 # Header forms seen in the tree: "Issue: #41" and "Issue: #82, #119". Skip the
@@ -84,7 +88,7 @@ for f in "$ADR_DIR"/[0-9][0-9][0-9][0-9]-*.md; do
     printf '%s %s\n' "$n" "$base" >>"$adr_map"
   done
 done
-sort -n -u "$adr_issues" -o "$adr_issues"
+sort -u "$adr_issues" -o "$adr_issues"
 
 # --- 3. direction A: closed decision with no ADR -------------------------
 # In $closed but not in $adr_issues.
