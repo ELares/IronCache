@@ -24,6 +24,15 @@ use thiserror::Error;
 /// compatibility (CLI_BINARY.md leaves the exact port open but defaults to parity).
 pub const DEFAULT_PORT: u16 = 6379;
 
+/// The default shard count: the host's available parallelism via
+/// [`std::thread::available_parallelism`] (CONFIG.md), which honors cgroup CPU
+/// quotas (unlike the `num_cpus` crate). Never zero (a degenerate host reports at
+/// least one).
+#[must_use]
+pub fn default_shards() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
 /// Errors from loading or resolving configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -78,7 +87,11 @@ impl Default for Config {
         Config {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: DEFAULT_PORT,
-            shards: num_cpus::get().max(1),
+            // Default to available parallelism via std (which honors cgroup CPU
+            // quotas, unlike num_cpus). Never zero. Mirrors
+            // `ironcache_runtime::available_shards` without taking a dep on the
+            // runtime crate (and thus tokio) here.
+            shards: default_shards(),
             databases: 16,
             default_resp3: false,
             maxmemory: 0,
@@ -92,13 +105,19 @@ impl Config {
     /// Resolve the effective config by folding `overlays` over the defaults,
     /// lowest-precedence first. The caller passes overlays in precedence order:
     /// `[toml, env, cli]` (later overrides earlier).
-    #[must_use]
-    pub fn resolve(overlays: &[ConfigOverlay]) -> Config {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Size`] if any overlay carries a malformed or
+    /// out-of-range `maxmemory` (e.g. `garbage`, `99999999999gb`, `1.5gb`). A bad
+    /// ceiling HARD-FAILS here rather than silently resolving to 0 = unlimited,
+    /// which would violate the honest-ceiling invariant (#3).
+    pub fn resolve(overlays: &[ConfigOverlay]) -> Result<Config, ConfigError> {
         let mut cfg = Config::default();
         for o in overlays {
-            o.apply_to(&mut cfg);
+            o.apply_to(&mut cfg)?;
         }
-        cfg
+        Ok(cfg)
     }
 
     /// Validate cross-field invariants after resolution.
@@ -191,7 +210,13 @@ impl ConfigOverlay {
     }
 
     /// Apply this overlay's set fields onto `cfg`.
-    fn apply_to(&self, cfg: &mut Config) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Size`] if this overlay's `maxmemory` is malformed or
+    /// out of range. A bad ceiling propagates so the binary hard-fails at boot
+    /// rather than silently going unlimited (honest-ceiling invariant #3).
+    fn apply_to(&self, cfg: &mut Config) -> Result<(), ConfigError> {
         if let Some(v) = self.bind {
             cfg.bind = v;
         }
@@ -208,12 +233,10 @@ impl ConfigOverlay {
             cfg.default_resp3 = v;
         }
         if let Some(ref v) = self.maxmemory {
-            // A malformed size in an overlay falls back to leaving the prior value
-            // (the binary validates explicitly via parse_human_size before boot to
-            // surface the error); here we apply only when it parses.
-            if let Ok(bytes) = parse_human_size(v) {
-                cfg.maxmemory = bytes;
-            }
+            // Parse the human size here and PROPAGATE any error: a malformed or
+            // overflowing maxmemory must hard-fail boot, not silently become 0
+            // (unlimited). Integer math, overflow-checked (see parse_human_size).
+            cfg.maxmemory = parse_human_size(v)?;
         }
         if let Some(ref v) = self.requirepass {
             cfg.requirepass = Some(v.clone());
@@ -221,6 +244,7 @@ impl ConfigOverlay {
         if let Some(v) = self.timeout {
             cfg.timeout_secs = v;
         }
+        Ok(())
     }
 }
 
@@ -228,16 +252,28 @@ impl ConfigOverlay {
 /// `b`, `k`/`kb`, `m`/`mb`, `g`/`gb` (and uppercase). Bare numbers are bytes.
 /// `k`/`m`/`g` are 1000-based and `kb`/`mb`/`gb` are 1024-based, matching Redis's
 /// `memtoull` convention. `0` parses to `0` (unlimited).
+///
+/// The numeric prefix is parsed as a `u64` and multiplied by the unit with
+/// `checked_mul`, so all arithmetic is integer and overflow is a hard error
+/// (never a silent wrap). FRACTIONAL inputs are REJECTED: `1.5gb` returns a
+/// [`ConfigError::Size`] rather than truncating, because a cache ceiling must be
+/// an exact byte count and silent truncation hides operator intent. A leading `+`
+/// is rejected too (Redis sizes are plain non-negative integers).
 pub fn parse_human_size(s: &str) -> Result<u64, ConfigError> {
     let t = s.trim();
     if t.is_empty() {
         return Err(ConfigError::Size(s.to_owned(), "empty".to_owned()));
     }
-    // Split numeric prefix from unit suffix.
-    let split = t
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '+' && c != '-')
-        .unwrap_or(t.len());
+    // Numeric prefix is ASCII digits only (no '.', '+', '-'): any of those makes
+    // the input either fractional, signed, or malformed, all of which we reject.
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
     let (num_part, unit_part) = t.split_at(split);
+    if num_part.is_empty() {
+        return Err(ConfigError::Size(
+            s.to_owned(),
+            "missing numeric value".to_owned(),
+        ));
+    }
     let unit = unit_part.trim().to_ascii_lowercase();
     let mult: u64 = match unit.as_str() {
         "" | "b" => 1,
@@ -254,18 +290,21 @@ pub fn parse_human_size(s: &str) -> Result<u64, ConfigError> {
             ));
         }
     };
-    // Accept integers; reject fractional bytes-after-multiply only if not whole.
-    let value: f64 = num_part
+    // Integer parse of the numeric prefix. A '.', '+', or '-' would have ended the
+    // digit run above and shown up in `unit`, producing an "unknown unit" error;
+    // an explicit check keeps the message precise for the common fractional case.
+    if num_part.len() != t.len() && unit_part.starts_with('.') {
+        return Err(ConfigError::Size(
+            s.to_owned(),
+            "fractional sizes are not allowed".to_owned(),
+        ));
+    }
+    let value: u64 = num_part
         .parse()
-        .map_err(|_| ConfigError::Size(s.to_owned(), "not a number".to_owned()))?;
-    if value < 0.0 {
-        return Err(ConfigError::Size(s.to_owned(), "negative".to_owned()));
-    }
-    let bytes = value * (mult as f64);
-    if bytes > (u64::MAX as f64) {
-        return Err(ConfigError::Size(s.to_owned(), "too large".to_owned()));
-    }
-    Ok(bytes as u64)
+        .map_err(|_| ConfigError::Size(s.to_owned(), "not an integer".to_owned()))?;
+    value.checked_mul(mult).ok_or_else(|| {
+        ConfigError::Size(s.to_owned(), "too large (overflows u64 bytes)".to_owned())
+    })
 }
 
 #[cfg(test)]
@@ -298,7 +337,7 @@ mod tests {
             port: Some(3333),
             ..Default::default()
         };
-        let cfg = Config::resolve(&[file, env, cli]);
+        let cfg = Config::resolve(&[file, env, cli]).unwrap();
         // CLI wins on port.
         assert_eq!(cfg.port, 3333);
         // shards only set by file -> shows through.
@@ -314,11 +353,38 @@ mod tests {
             requirepass = "secret"
         "#;
         let o = ConfigOverlay::from_toml_str(toml_src).unwrap();
-        let cfg = Config::resolve(&[o]);
+        let cfg = Config::resolve(&[o]).unwrap();
         assert_eq!(cfg.port, 7000);
         assert_eq!(cfg.shards, 4);
         assert_eq!(cfg.maxmemory, 256 * 1024 * 1024);
         assert_eq!(cfg.requirepass.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn maxmemory_bad_value_hard_fails_resolution() {
+        // A malformed/overflowing/fractional maxmemory must error out of resolve,
+        // NOT silently resolve to 0 (unlimited).
+        for bad in ["garbage", "99999999999gb", "1.7b", "1.5gb", "12xb", "-5mb"] {
+            let o = ConfigOverlay {
+                maxmemory: Some(bad.to_owned()),
+                ..Default::default()
+            };
+            let res = Config::resolve(&[o]);
+            assert!(
+                matches!(res, Err(ConfigError::Size(_, _))),
+                "expected Size error for maxmemory {bad:?}, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn maxmemory_good_value_resolves() {
+        let o = ConfigOverlay {
+            maxmemory: Some("512mb".to_owned()),
+            ..Default::default()
+        };
+        let cfg = Config::resolve(&[o]).unwrap();
+        assert_eq!(cfg.maxmemory, 512 * 1024 * 1024);
     }
 
     #[test]
@@ -347,6 +413,12 @@ mod tests {
         assert!(parse_human_size("abc").is_err());
         assert!(parse_human_size("12xb").is_err());
         assert!(parse_human_size("-5mb").is_err());
+        // Fractional inputs are rejected (no silent truncation).
+        assert!(parse_human_size("1.5gb").is_err());
+        assert!(parse_human_size("1.7b").is_err());
+        // Overflow is a hard error, not a silent wrap.
+        assert!(parse_human_size("99999999999gb").is_err());
+        assert!(parse_human_size("18446744073709551616").is_err()); // u64::MAX + 1
     }
 
     #[test]

@@ -22,9 +22,16 @@ allow = [
 confidence-threshold = 0.9
 
 [advisories]
-# Warn in PR-1; the release pipeline (release.yml) tightens this to deny.
+# Warn in PR-1; the release pipeline (release.yml) tightens this to deny
+# (SUPPLY_CHAIN.md: advisories are a release gate, not a per-commit blocker yet).
 version = 2
 yanked = "warn"
+# Only flag `unmaintained` advisories for crates we directly own (workspace),
+# not transitive deps we cannot replace today. The one transitive case is `paste`
+# (RUSTSEC-2024-0436, unmaintained, no safe upgrade), pulled in by
+# tikv-jemalloc-ctl (the ADR-0006 mallctl accounting path); tracked for a
+# `paste` -> `pastey` follow-up. The release pipeline re-evaluates this posture.
+unmaintained = "workspace"
 
 [bans]
 multiple-versions = "warn"
@@ -33,6 +40,23 @@ multiple-versions = "warn"
 # which is normal for an unpublished workspace, not a real wildcard risk).
 wildcards = "deny"
 allow-wildcard-paths = true
+# Determinism backstop (ADR-0003, invariant 2): ban the clock/RNG crates that read
+# real time or OS entropy outside the sanctioned ironcache-env seam. The grep lint
+# in scripts/ci/check-rust-invariants.sh catches direct API use in OUR source; this
+# ban catches a TRANSITIVE pull of one of these crates into the dependency graph
+# (which the grep cannot see). None are present today, so the build stays green; if
+# a future dep pulls one in transitively and it cannot be removed, narrow this list
+# and record the residual here.
+deny = [
+    { name = "chrono" },
+    { name = "time" },
+    { name = "fastrand" },
+    { name = "rand" },
+    { name = "quanta" },
+    { name = "coarsetime" },
+    { name = "minstant" },
+    { name = "web-time" },
+]
 
 [sources]
 unknown-registry = "deny"

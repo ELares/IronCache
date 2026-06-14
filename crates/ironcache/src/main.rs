@@ -22,6 +22,29 @@ use std::path::Path;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Build-time jemalloc tuning (ADR-0006). Exporting the `malloc_conf` C string is
+// the tikv-jemallocator-sanctioned way to set boot options without env vars. We
+// enable the background purge thread by default (flipping jemalloc's upstream-off
+// default, the way Redis does) and lower `dirty_decay_ms` below the stock 10 s so
+// dirty pages return to the OS faster under eviction churn. The exact decay value
+// is a config knob (#85); 5 s is a sensible sub-10 s default until that lands.
+//
+// tikv-jemalloc-sys builds jemalloc with the `_rjem_` prefix on our targets
+// (musl/macos; macOS forces prefixing), so the symbol downstream is
+// `_rjem_malloc_conf`. Same cfg-gate as the allocator so MSVC (which has no
+// jemalloc here) is unaffected.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static libc::c_char> = Some(unsafe {
+    // background_thread:true enables the async purge thread; dirty_decay_ms:5000
+    // returns dirty pages after 5 s (sub-10 s per ADR-0006). `c"..."` is a
+    // NUL-terminated C string literal; jemalloc reads this pointer at init.
+    &*c"background_thread:true,dirty_decay_ms:5000"
+        .as_ptr()
+        .cast::<libc::c_char>()
+});
+
 fn main() -> anyhow::Result<()> {
     // redis-cli argv[0] alias: forward to `cli` (ADR-0020). If invoked as
     // `redis-cli`, we synthesize a `cli` invocation from the remaining args.
@@ -70,7 +93,10 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
         ..Default::default()
     };
 
-    let cfg = Config::resolve(&[file_overlay, env_overlay, cli_overlay]);
+    // resolve() hard-fails on a malformed/overflowing maxmemory (it no longer
+    // silently degrades to 0 = unlimited), so a bad ceiling stops boot here.
+    let cfg = Config::resolve(&[file_overlay, env_overlay, cli_overlay])
+        .context("resolving effective config")?;
     cfg.validate().context("validating effective config")?;
     Ok(cfg)
 }
@@ -89,7 +115,11 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     eprintln!("ironcache: ready (PING -> +PONG). Ctrl-C to stop.");
     serve::wait_for_signal(&flag);
     eprintln!("ironcache: shutting down");
-    set.shutdown_and_join();
+    if set.shutdown_and_join().is_err() {
+        // A shard thread panicked; surface it as a non-zero exit rather than
+        // pretending shutdown was clean.
+        anyhow::bail!("one or more shard threads panicked during shutdown");
+    }
     Ok(())
 }
 
@@ -128,7 +158,10 @@ fn run_cli_alias() -> anyhow::Result<()> {
                 i += 2;
             }
             "-p" | "--port" if i + 1 < args.len() => {
-                port = args[i + 1].parse().unwrap_or(port);
+                // Surface a parse error instead of silently falling back to 6379.
+                port = args[i + 1]
+                    .parse()
+                    .with_context(|| format!("invalid -p/--port value '{}'", args[i + 1]))?;
                 i += 2;
             }
             _ => i += 1,
@@ -167,7 +200,30 @@ fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
             "unset"
         }
     );
+    print_allocator_check();
     Ok(())
+}
+
+/// Report the live allocator configuration so `check` confirms the ADR-0006
+/// jemalloc tuning (background purge thread on, sub-10s dirty decay) actually
+/// landed. This also exercises the `tikv-jemalloc-ctl` `opt.*` mallctl path that
+/// PR-3's `epoch` + `stats.allocated` accounting will build on.
+#[cfg(not(target_env = "msvc"))]
+fn print_allocator_check() {
+    use tikv_jemalloc_ctl::{opt, raw};
+    let bg = opt::background_thread::read()
+        .map_or_else(|e| format!("unavailable ({e})"), |v| v.to_string());
+    // dirty_decay_ms has no typed key in tikv-jemalloc-ctl; read it via the raw
+    // mallctl path (it is an ssize_t). This is the same mallctl seam PR-3's
+    // epoch + stats.allocated accounting uses.
+    let decay = unsafe { raw::read::<libc::ssize_t>(b"opt.dirty_decay_ms\0") }
+        .map_or_else(|e| format!("unavailable ({e})"), |v| format!("{v} ms"));
+    println!("  allocator   = jemalloc (background_thread={bg}, dirty_decay_ms={decay})");
+}
+
+#[cfg(target_env = "msvc")]
+fn print_allocator_check() {
+    println!("  allocator   = system (jemalloc not built on this target)");
 }
 
 fn cmd_config(cli: &Cli) -> anyhow::Result<()> {

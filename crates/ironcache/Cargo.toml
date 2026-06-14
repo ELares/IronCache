@@ -30,11 +30,14 @@ bytes = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync", "signal"] }
 libc = { workspace = true }
 
-# jemalloc is the default allocator (ADR-0006). Not available on MSVC Windows;
-# gate it so the workspace still builds there (the static release targets are
-# musl/macos, where it is available).
+# jemalloc is the default allocator (ADR-0006, jemalloc 5.3.x). Not available on
+# MSVC Windows; gate it so the workspace still builds there (the static release
+# targets are musl/macos, where it is available). The background-purge thread,
+# stats, and profiling features are enabled per ADR-0006; tikv-jemalloc-ctl gives
+# the PR-3 epoch + stats.allocated accounting path a place to compile against.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }

@@ -22,6 +22,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+/// The name of the global allocator selected at build time, for INFO
+/// `mem_allocator`. This MUST track the `#[global_allocator]` cfg in `main.rs`
+/// (jemalloc on every target except MSVC, where it falls back to the system
+/// allocator), so INFO never claims jemalloc on a build that linked the system
+/// allocator.
+#[cfg(not(target_env = "msvc"))]
+pub const GLOBAL_ALLOCATOR_NAME: &str = "jemalloc";
+#[cfg(target_env = "msvc")]
+pub const GLOBAL_ALLOCATOR_NAME: &str = "libc";
+
 /// Per-shard, core-local mutable state. Single-threaded access on the shard's
 /// thread (no `Send`/`Sync` needed, no locks; shared-nothing ADR-0002).
 struct ShardState {
@@ -52,6 +62,8 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
             // started_at is filled in per shard at boot via the shard's clock so
             // uptime is measured from when the shard's Env started.
             started_at: ironcache_env::Monotonic::ZERO,
+            maxmemory: config.maxmemory,
+            mem_allocator: GLOBAL_ALLOCATOR_NAME,
         },
     };
     let default_proto = if config.default_resp3 {
@@ -75,8 +87,14 @@ thread_local! {
     // The shard's core-local state. Created lazily on first use on each shard
     // thread; never shared across threads.
     static SHARD: RefCell<Option<Rc<RefCell<ShardState>>>> = const { RefCell::new(None) };
-    // One SystemEnv per shard thread (the sanctioned real-time boundary).
-    static ENV: RefCell<Option<Rc<SystemEnv>>> = const { RefCell::new(None) };
+    // One SystemEnv per shard thread (the sanctioned real-time boundary). It is
+    // wrapped in a RefCell so the determinism seam's RNG half is REACHABLE: the
+    // shard is single-threaded (current-thread runtime, !Send tasks), so clock
+    // reads go through `.borrow()` and `Env::rng` through `.borrow_mut()` with no
+    // cross-core synchronization. A bare `Rc<SystemEnv>` would make `.rng()`
+    // (which needs `&mut self`) structurally uncallable; PR-2/PR-3 need RNG on the
+    // hot path (S3-FIFO sampling, TTL jitter).
+    static ENV: RefCell<Option<Rc<RefCell<SystemEnv>>>> = const { RefCell::new(None) };
     static STARTED_AT: RefCell<Option<ironcache_env::Monotonic>> = const { RefCell::new(None) };
 }
 
@@ -93,17 +111,17 @@ fn shard_state() -> Rc<RefCell<ShardState>> {
     })
 }
 
-fn shard_env() -> Rc<SystemEnv> {
+fn shard_env() -> Rc<RefCell<SystemEnv>> {
     ENV.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.is_none() {
-            let env = Rc::new(SystemEnv::new());
+            let env = SystemEnv::new();
             // Record the shard's boot instant for uptime.
             STARTED_AT.with(|s| {
                 use ironcache_env::Clock;
                 *s.borrow_mut() = Some(env.now());
             });
-            *b = Some(env);
+            *b = Some(Rc::new(RefCell::new(env)));
         }
         Rc::clone(b.as_ref().unwrap())
     })
@@ -159,8 +177,10 @@ async fn serve_connection(
                         handle_request(&ctx, &mut conn, &env, &state_rc, &request, &mut out);
                     read_buf.drain(..consumed);
                     if close {
-                        // Flush the QUIT reply then close.
-                        let _ = rt.send(&mut stream, &out).await;
+                        // Flush the QUIT reply then close. send returns the owned
+                        // buffer (owned-buffer model); we are closing, so the
+                        // returned buffer is dropped rather than reclaimed.
+                        let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
                         break 'conn;
                     }
                 }
@@ -168,14 +188,18 @@ async fn serve_connection(
                 DecodeOutcome::Error(e) => {
                     // Protocol error: write it and close the connection (hardening).
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
-                    let _ = rt.send(&mut stream, &out).await;
+                    let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
                     break 'conn;
                 }
             }
         }
 
-        if !out.is_empty() && rt.send(&mut stream, &out).await.is_err() {
-            break;
+        if !out.is_empty() {
+            // Owned-buffer send: hand `out` over and take the returned buffer back.
+            match rt.send(&mut stream, std::mem::take(&mut out)).await {
+                Ok(returned) => out = returned,
+                Err(_) => break,
+            }
         }
 
         // Need more bytes: read.
@@ -193,10 +217,14 @@ async fn serve_connection(
 
 /// Dispatch one request and append its encoded reply to `out`. Returns whether
 /// the connection should close after flushing (QUIT).
+///
+/// `env` is the shard's owned-mutable env handle. Clock reads (the only Env need
+/// in PR-1) go through `.borrow()`; the RNG half (`env.borrow_mut().rng()`) is
+/// reachable through this same handle for PR-2/PR-3 hot paths.
 fn handle_request(
     ctx: &ServerContext,
     conn: &mut ConnState,
-    env: &SystemEnv,
+    env: &Rc<RefCell<SystemEnv>>,
     state_rc: &Rc<RefCell<ShardState>>,
     request: &Request,
     out: &mut Vec<u8>,
@@ -204,7 +232,7 @@ fn handle_request(
     state_rc.borrow_mut().counters.on_command();
     let snapshot_fn = || state_rc.borrow().counters.snapshot();
     let rollup: &dyn Fn() -> CounterSnapshot = &snapshot_fn;
-    let reply = dispatch(ctx, conn, env, rollup, request);
+    let reply = dispatch(ctx, conn, &*env.borrow(), rollup, request);
     encode_into(out, &reply, conn.proto);
     conn.should_close
 }
@@ -259,4 +287,28 @@ pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) {
         }
     });
     flag.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironcache_env::{Clock, Env, Rng};
+
+    #[test]
+    fn shard_env_rng_is_reachable_as_wired() {
+        // Regression for the determinism seam: the shard hands out an
+        // owned-mutable env handle (Rc<RefCell<SystemEnv>>), so BOTH halves of the
+        // seam are reachable. A bare Rc<SystemEnv> would make `.rng()` (which needs
+        // `&mut self`) structurally uncallable. Prove the RNG path works through
+        // the borrow, as the per-connection code is wired.
+        let env = shard_env();
+        // Clock half: reachable via shared borrow.
+        let _ = env.borrow().now();
+        // RNG half: reachable via mutable borrow. Two draws differ (the stream
+        // advances), confirming we hold a live, mutable RNG and not a no-op.
+        let mut handle = env.borrow_mut();
+        let a = handle.rng().next_u64();
+        let b = handle.rng().next_u64();
+        assert_ne!(a, b, "RNG stream did not advance through the env handle");
+    }
 }

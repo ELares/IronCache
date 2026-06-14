@@ -95,6 +95,14 @@ pub struct ServerInfo {
     pub pid: u32,
     /// The monotonic instant captured at boot, for uptime.
     pub started_at: ironcache_env::Monotonic,
+    /// The resolved memory ceiling in bytes, reported in the INFO `memory`
+    /// section's `maxmemory` field. `0` means unlimited.
+    pub maxmemory: u64,
+    /// The name of the global allocator actually selected at build time
+    /// (`jemalloc` or `system`), reported as INFO `mem_allocator`. Derived from
+    /// the same cfg that picks the `#[global_allocator]`, so INFO never claims
+    /// jemalloc on a build that linked the system allocator.
+    pub mem_allocator: &'static str,
 }
 
 /// Build the `INFO` reply body (OBSERVABILITY.md). `section` is the optional
@@ -153,14 +161,15 @@ pub fn build_info<C: Clock>(
     if want("memory") {
         out.push_str("# Memory\r\n");
         // PR-1 has no allocator accounting yet (ADR-0006 lands with the store);
-        // report zeros with the correct field names so exporters parse cleanly.
+        // used_memory* stay zero with the correct field names so exporters parse
+        // cleanly. maxmemory and mem_allocator ARE real: threaded from config.
         out.push_str("used_memory:0\r\n");
         out.push_str("used_memory_human:0B\r\n");
         out.push_str("used_memory_rss:0\r\n");
-        out.push_str("maxmemory:0\r\n");
+        let _ = write!(out, "maxmemory:{}\r\n", server.maxmemory);
         out.push_str("maxmemory_policy:noeviction\r\n");
         out.push_str("mem_fragmentation_ratio:0.00\r\n");
-        out.push_str("mem_allocator:jemalloc\r\n");
+        let _ = write!(out, "mem_allocator:{}\r\n", server.mem_allocator);
         out.push_str("\r\n");
     }
     if want("stats") {
@@ -203,6 +212,8 @@ mod tests {
             shards: 4,
             pid: 1234,
             started_at: Monotonic::ZERO,
+            maxmemory: 0,
+            mem_allocator: "jemalloc",
         }
     }
 
@@ -218,6 +229,20 @@ mod tests {
         assert!(body.contains("connected_clients:0\r\n"));
         assert!(body.contains("mem_allocator:jemalloc\r\n"));
         assert!(body.contains(&format!("ironcache_version:{SERVER_VERSION}\r\n")));
+    }
+
+    #[test]
+    fn info_memory_threads_maxmemory_and_allocator() {
+        let env = TestEnv::new(1);
+        let mut s = server();
+        s.maxmemory = 256 * 1024 * 1024;
+        s.mem_allocator = "system";
+        let body = build_info(&env, &s, CounterSnapshot::default(), Some("memory"));
+        assert!(
+            body.contains(&format!("maxmemory:{}\r\n", 256 * 1024 * 1024)),
+            "{body}"
+        );
+        assert!(body.contains("mem_allocator:system\r\n"), "{body}");
     }
 
     #[test]

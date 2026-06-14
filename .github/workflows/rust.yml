@@ -121,4 +121,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sh scripts/ci/check-rust-invariants.sh
+      - run: bash scripts/ci/check-rust-invariants.sh
+
+  deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Per-PR merge-blocking supply-chain gate (SUPPLY_CHAIN.md). Runs all four
+      # cargo-deny checks against the committed deny.toml + Cargo.lock. The action
+      # is pinned by commit SHA (v2.0.20) so the policy result is reproducible.
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check advisories licenses bans sources
