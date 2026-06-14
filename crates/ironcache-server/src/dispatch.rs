@@ -11,12 +11,12 @@
 
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
-use crate::{cmd_expire, cmd_keyspace, cmd_string};
-use ironcache_env::Clock;
+use crate::{cmd_expire, cmd_introspect, cmd_keyspace, cmd_string};
+use ironcache_env::{Clock, Env, Rng};
 use ironcache_expiry::TimingWheel;
 use ironcache_observe::{CounterDeltas, CounterSnapshot, MemoryInfo, ServerInfo, build_info};
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
-use ironcache_storage::{ActiveExpiry, Admit, Store, UnixMillis};
+use ironcache_storage::{ActiveExpiry, Admit, Keyspace, Store, UnixMillis};
 
 /// The bounded number of expired keys the active timing-wheel drain reclaims per
 /// command (EXPIRATION.md "bounded reclamation"). A small cap keeps the drain off the
@@ -132,8 +132,13 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 
 /// Dispatch one request to its handler, returning the reply [`Value`].
 ///
-/// `clock` provides INFO uptime through the Env seam (no direct time). `store` is
-/// the per-shard storage waist (#34) the data commands run against; `now` is the
+/// `env` is the per-shard determinism seam (ADR-0003): its CLOCK half provides INFO
+/// uptime (no direct time) and its RNG half is the source RANDOMKEY draws a random
+/// index from (the CALLER draws through the seam; the store reads no RNG, KEYSPACE.md).
+/// It is `&mut E` because the RNG needs `&mut self`; dispatch is the single owner of
+/// the env borrow for the command, so the clock read and the RNG draw do not alias.
+/// `store` is the per-shard storage waist (#34) the data commands run against; `now`
+/// is the
 /// absolute wall-clock deadline basis for this command, computed once per command
 /// by the caller from the Env clock (ADR-0003: the store reads no clock). `state`
 /// is the mutable per-connection state. `rollup` yields the counters for INFO;
@@ -143,10 +148,11 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 /// supplied in).
 ///
 /// Tier-0 (connection) commands ignore `store`/`now`; the data commands use them.
-/// The function is generic over `S: Store + Admit` for monomorphization, consistent
-/// with the existing `C: Clock` generic. The [`Admit`] bound lets the dispatcher
-/// enforce the maxmemory ceiling (evict-to-fit / `-OOM`) without naming the concrete
-/// store or policy.
+/// The function is generic over `S: Store + Admit + ActiveExpiry + Keyspace` for
+/// monomorphization, and over `E: Env` (clock + RNG). The [`Admit`] bound lets the
+/// dispatcher enforce the maxmemory ceiling (evict-to-fit / `-OOM`); the [`Keyspace`]
+/// bound adds the iteration + bulk-management surface (SCAN/KEYS/DBSIZE/RANDOMKEY/
+/// RENAME/COPY/MOVE/SWAPDB/FLUSH) without naming the concrete store.
 ///
 /// `deltas` is an out-parameter dispatch accumulates this command's dynamic counter
 /// changes into (eviction count, active-expiry reclamation count, keyspace hits/misses);
@@ -164,10 +170,10 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 /// borrows (the lifetime-parameterized `rollup` closure in particular). The over-7-args
 /// lint is allowed here with that justification.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch<C: Clock, S: Store + Admit + ActiveExpiry>(
+pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
     ctx: &ServerContext,
     state: &mut ConnState,
-    clock: &C,
+    env: &mut E,
     store: &mut S,
     wheel: &mut TimingWheel,
     now: UnixMillis,
@@ -243,7 +249,9 @@ pub fn dispatch<C: Clock, S: Store + Admit + ActiveExpiry>(
         }
         b"CLIENT" => cmd_client(state, req),
         b"COMMAND" => cmd_command(req),
-        b"INFO" => cmd_info(ctx, clock, rollup, mem, req),
+        // INFO reads only the CLOCK half of the env seam (uptime); pass `env` as the
+        // `&C: Clock` it needs.
+        b"INFO" => cmd_info(ctx, env, rollup, mem, req),
         b"CONFIG" => cmd_config_stub(req),
         // -- Data commands (PR-2a) over the storage waist. The two pure reads (GET,
         // STRLEN) feed the keyspace hit/miss counters (PR-3b): a found live key is a
@@ -284,6 +292,40 @@ pub fn dispatch<C: Clock, S: Store + Admit + ActiveExpiry>(
         b"GETEX" => keyspace_counted(deltas, cmd_expire::cmd_getex(store, wheel, db, now, req)),
         b"SETEX" => cmd_expire::cmd_setex(store, wheel, db, now, req),
         b"PSETEX" => cmd_expire::cmd_psetex(store, wheel, db, now, req),
+        // -- Generic keyspace commands (PR-4a) over the additive Keyspace seam. These
+        // are SINGLE-SHARD-PER-CONNECTION (the store IS this connection's whole
+        // keyspace; no cross-shard routing exists yet, so SCAN/KEYS/DBSIZE/RANDOMKEY/
+        // FLUSHDB cover the connection's entire keyspace). True cross-shard fan-out is
+        // deferred to the coordinator (KEYSPACE.md); the cursor's reserved slot bits
+        // are shaped for it. --
+        b"KEYS" => cmd_keyspace::cmd_keys(store, db, now, req),
+        b"SCAN" => cmd_keyspace::cmd_scan(store, db, now, req),
+        b"DBSIZE" => cmd_keyspace::cmd_dbsize(store, db, req),
+        b"RANDOMKEY" => {
+            // RANDOMKEY's randomness enters through the Env RNG seam (ADR-0003,
+            // KEYSPACE.md): the CALLER draws the index here and passes it in; the store
+            // reads no RNG. Draw ONLY for RANDOMKEY so the per-command RNG stream is not
+            // perturbed by other commands.
+            let pick = if req.args.len() == 1 {
+                env.rng().next_u64()
+            } else {
+                0
+            };
+            cmd_keyspace::cmd_randomkey(store, db, pick, now, req)
+        }
+        b"RENAME" => cmd_keyspace::cmd_rename(store, db, now, req),
+        b"RENAMENX" => cmd_keyspace::cmd_renamenx(store, db, now, req),
+        b"COPY" => cmd_keyspace::cmd_copy(store, ctx, db, now, req),
+        b"MOVE" => cmd_keyspace::cmd_move(store, ctx, db, now, req),
+        b"SWAPDB" => cmd_keyspace::cmd_swapdb(store, ctx, req),
+        b"TOUCH" => cmd_keyspace::cmd_touch(store, db, now, req),
+        // UNLINK is DEL today: there is no async background free yet (#51), so it
+        // removes synchronously and counts the same keys. Documented in the handler.
+        b"UNLINK" => cmd_keyspace::cmd_unlink(store, db, now, req),
+        b"FLUSHDB" => cmd_keyspace::cmd_flushdb(store, db, req),
+        b"FLUSHALL" => cmd_keyspace::cmd_flushall(store, req),
+        // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
+        b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
         _ => {
             let name = String::from_utf8_lossy(req.command()).into_owned();
             let rest: Vec<&[u8]> = req.args[1..].iter().map(bytes::Bytes::as_ref).collect();
@@ -678,7 +720,7 @@ mod tests {
     }
 
     fn run(ctx: &ServerContext, st: &mut ConnState, parts: &[&[u8]]) -> Value {
-        let env = TestEnv::new(1);
+        let mut env = TestEnv::new(1);
         let mut store = test_store(ctx.databases);
         let mut wheel = TimingWheel::new();
         let zero = || CounterSnapshot::default();
@@ -686,7 +728,7 @@ mod tests {
         dispatch(
             ctx,
             st,
-            &env,
+            &mut env,
             &mut store,
             &mut wheel,
             UnixMillis(0),
@@ -736,13 +778,13 @@ mod tests {
         now: UnixMillis,
         parts: &[&[u8]],
     ) -> (Value, CounterDeltas) {
-        let env = TestEnv::new(1);
+        let mut env = TestEnv::new(1);
         let zero = || CounterSnapshot::default();
         let mut deltas = CounterDeltas::default();
         let reply = dispatch(
             ctx,
             st,
-            &env,
+            &mut env,
             store,
             wheel,
             now,
@@ -1779,14 +1821,14 @@ mod tests {
         now: UnixMillis,
         parts: &[&[u8]],
     ) -> (Value, u64) {
-        let env = TestEnv::new(1);
+        let mut env = TestEnv::new(1);
         let mut wheel = TimingWheel::new();
         let zero = || CounterSnapshot::default();
         let mut deltas = CounterDeltas::default();
         let reply = dispatch(
             ctx,
             st,
-            &env,
+            &mut env,
             store,
             &mut wheel,
             now,
@@ -3459,5 +3501,573 @@ mod tests {
         // All ten keys expired (deadline 500ms, drained by step 600+).
         assert_eq!(a.0, 0);
         assert_eq!(a.1, 10);
+    }
+
+    // -- Generic keyspace + introspection commands (PR-4a) through dispatch. --
+
+    /// A test store wired with an LFU policy (for OBJECT FREQ/IDLETIME gating tests).
+    fn lfu_store(databases: u32) -> TestStore {
+        let policy = map_policy_name("allkeys-lfu", 1).expect("allkeys-lfu maps");
+        ShardStore::with_hooks(databases, policy, CountingAccounting::new())
+    }
+
+    /// Extract a Bulk string's bytes (panics on any other reply shape).
+    fn bulk_bytes(v: &Value) -> Vec<u8> {
+        match v {
+            Value::BulkString(Some(b)) => b.to_vec(),
+            other => panic!("expected bulk string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keys_matches_glob_and_equals_full_scan() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        for k in [b"user:1".as_slice(), b"user:2", b"post:1", b"misc"] {
+            run_on(&c, &mut s, &mut st, t, &[b"SET", k, b"v"]);
+        }
+        // KEYS user:* -> the two user keys (order-independent compare).
+        let v = run_on(&c, &mut s, &mut st, t, &[b"KEYS", b"user:*"]);
+        let mut got: Vec<Vec<u8>> = match v {
+            Value::Array(Some(items)) => items.iter().map(bulk_bytes).collect(),
+            other => panic!("expected array, got {other:?}"),
+        };
+        got.sort();
+        assert_eq!(got, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
+        // KEYS * -> all four.
+        let all = run_on(&c, &mut s, &mut st, t, &[b"KEYS", b"*"]);
+        match all {
+            Value::Array(Some(items)) => assert_eq!(items.len(), 4),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_to_completion_collects_all_keys() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        for i in 0..40 {
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("k{i}").as_bytes(), b"v"],
+            );
+        }
+        // Loop SCAN with a small COUNT to completion, collecting every key.
+        let mut collected: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut cursor = b"0".to_vec();
+        loop {
+            let v = run_on(&c, &mut s, &mut st, t, &[b"SCAN", &cursor, b"COUNT", b"3"]);
+            let items = match v {
+                Value::Array(Some(items)) => items,
+                other => panic!("SCAN reply must be a 2-array, got {other:?}"),
+            };
+            assert_eq!(items.len(), 2, "[next_cursor, [keys]]");
+            let next = bulk_bytes(&items[0]);
+            if let Value::Array(Some(keys)) = &items[1] {
+                for k in keys {
+                    collected.insert(bulk_bytes(k));
+                }
+            } else {
+                panic!("SCAN keys element must be an array");
+            }
+            if next == b"0" {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(
+            collected.len(),
+            40,
+            "SCAN to completion collected every key"
+        );
+    }
+
+    #[test]
+    fn scan_match_and_type_filters() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        for i in 0..10 {
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("s{i}").as_bytes(), b"v"],
+            );
+        }
+        // SCAN 0 MATCH s1* -> just s1 (s1 only; s10..s19 do not exist).
+        let v = run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"SCAN", b"0", b"MATCH", b"s1", b"COUNT", b"100"],
+        );
+        if let Value::Array(Some(items)) = v {
+            if let Value::Array(Some(keys)) = &items[1] {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(bulk_bytes(&keys[0]), b"s1");
+            }
+        }
+        // SCAN 0 TYPE list -> nothing (all are strings).
+        let v = run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"SCAN", b"0", b"TYPE", b"list", b"COUNT", b"100"],
+        );
+        if let Value::Array(Some(items)) = v {
+            if let Value::Array(Some(keys)) = &items[1] {
+                assert!(keys.is_empty(), "no list-typed keys");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_invalid_cursor_errors() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        match run_on(
+            &c,
+            &mut s,
+            &mut st,
+            UnixMillis(0),
+            &[b"SCAN", b"notanumber"],
+        ) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR invalid cursor"),
+            other => panic!("expected invalid cursor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dbsize_counts_keys() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"DBSIZE"]),
+            Value::Integer(0)
+        );
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"a", b"1"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"2"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"DBSIZE"]),
+            Value::Integer(2)
+        );
+    }
+
+    // The short test-fixture names (c/s/st/t plus the a/b reply bindings) are the
+    // established convention across this test module; the lint trips only because this
+    // case names a couple of reply temporaries too.
+    #[allow(clippy::many_single_char_names)]
+    #[test]
+    fn randomkey_member_nil_and_deterministic_under_seeded_env() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // Empty DB -> nil.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"RANDOMKEY"]), Value::Null);
+        for i in 0..10 {
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("k{i}").as_bytes(), b"v"],
+            );
+        }
+        // The reply is a live member.
+        let v = run_on(&c, &mut s, &mut st, t, &[b"RANDOMKEY"]);
+        let key = bulk_bytes(&v);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", &key]),
+            Value::Integer(1),
+            "RANDOMKEY returned a live member"
+        );
+        // Deterministic under the seeded TestEnv: `run_on` builds a fresh TestEnv(seed=1)
+        // each call, so the first RNG draw (the pick) is identical, yielding the same key.
+        let a = run_on(&c, &mut s, &mut st, t, &[b"RANDOMKEY"]);
+        let b = run_on(&c, &mut s, &mut st, t, &[b"RANDOMKEY"]);
+        assert_eq!(a, b, "RANDOMKEY deterministic under a seeded env");
+    }
+
+    #[test]
+    fn rename_preserves_value_and_renamenx_copy_semantics() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"src", b"hello"]);
+        // RENAME -> +OK, src gone, dst holds the value.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RENAME", b"src", b"dst"]),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"dst"]),
+            bulk(b"hello")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"src"]),
+            Value::Null
+        );
+        // RENAME of a missing key -> no such key.
+        match run_on(&c, &mut s, &mut st, t, &[b"RENAME", b"gone", b"x"]) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR no such key"),
+            other => panic!("expected no such key, got {other:?}"),
+        }
+        // RENAMENX: dst exists -> 0; dst free -> 1.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"a", b"1"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"2"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RENAMENX", b"a", b"b"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RENAMENX", b"a", b"c"]),
+            Value::Integer(1)
+        );
+        // COPY with REPLACE overwrites; without REPLACE onto an existing dst -> 0.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"from", b"X"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"to", b"Y"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"COPY", b"from", b"to"]),
+            Value::Integer(0),
+            "COPY declines without REPLACE when dst exists"
+        );
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"COPY", b"from", b"to", b"REPLACE"]
+            ),
+            Value::Integer(1)
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"to"]), bulk(b"X"));
+    }
+
+    #[test]
+    fn move_across_dbs_and_noop_when_dest_occupied() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // The connection is on db 0 (default).
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v"]);
+        // MOVE k 1 -> 1; gone from db 0.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"MOVE", b"k", b"1"]),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"k"]),
+            Value::Integer(0)
+        );
+        // A fresh k in db 0; MOVE to db 1 where k already exists -> 0 (no-op).
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v2"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"MOVE", b"k", b"1"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"k"]),
+            Value::Integer(1)
+        );
+        // MOVE to the same db is an error.
+        assert!(matches!(
+            run_on(&c, &mut s, &mut st, t, &[b"MOVE", b"k", b"0"]),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn swapdb_swaps_contents() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // Put a in db 0, b in db 1 (via MOVE), then SWAPDB 0 1.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"a", b"in0"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"in0too"]);
+        run_on(&c, &mut s, &mut st, t, &[b"MOVE", b"b", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SWAPDB", b"0", b"1"]),
+            Value::ok()
+        );
+        // After swap, db 0 holds what was db 1 (b), and a is now in db 1.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"a"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"b"]),
+            Value::Integer(1)
+        );
+    }
+
+    #[test]
+    fn touch_and_unlink_counts() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"a", b"1"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"2"]);
+        // TOUCH counts live keys (repeats counted, like EXISTS).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"TOUCH", b"a", b"a", b"b", b"missing"]
+            ),
+            Value::Integer(3)
+        );
+        // UNLINK removes live keys, returns the count (== DEL today).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"UNLINK", b"a", b"b", b"missing"]),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"a", b"b"]),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn flushdb_and_flushall_empty_scope() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"a", b"1"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"2"]);
+        run_on(&c, &mut s, &mut st, t, &[b"MOVE", b"b", b"1"]);
+        // FLUSHDB (with the SYNC option accepted) empties only db 0.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"FLUSHDB", b"SYNC"]),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"DBSIZE"]),
+            Value::Integer(0)
+        );
+        // FLUSHALL ASYNC empties everything.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"FLUSHALL", b"ASYNC"]),
+            Value::ok()
+        );
+        // An unknown flush option is a syntax error.
+        assert!(matches!(
+            run_on(&c, &mut s, &mut st, t, &[b"FLUSHDB", b"BOGUS"]),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn object_encoding_int_embstr_raw() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // int
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"n", b"12345"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"n"]),
+            bulk(b"int")
+        );
+        // embstr (short string)
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"e", b"hello"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"e"]),
+            bulk(b"embstr")
+        );
+        // raw (long string > 44 bytes)
+        let big = vec![b'z'; 100];
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"r", &big]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"r"]),
+            bulk(b"raw")
+        );
+        // Missing key -> null (Redis replies the null bulk, not an error).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"nope"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn object_encoding_append_stays_short_is_a_known_divergence() {
+        // KNOWN DIVERGENCE (ADR-0009, recorded for the conformance suite): an APPEND
+        // whose result stays SHORT reports `embstr`/`int` here where REDIS reports
+        // `raw` (Redis converts any APPENDed string to raw unconditionally). IronCache's
+        // APPEND rebuilds-and-reclassifies through the rmw waist, so a short result
+        // reclassifies. The fix needs the deferred in-place-mutation waist extension; it
+        // is NOT fixed here. This test asserts the CURRENT (divergent) behavior so the
+        // conformance suite tracks it.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // APPEND to a fresh key with a short value -> Redis would report `raw`; we report
+        // `embstr` (the documented divergence).
+        run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"a", b"abc"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"a"]),
+            bulk(b"embstr"),
+            "KNOWN DIVERGENCE: APPEND-stays-short reports embstr here, raw in Redis"
+        );
+        // An APPEND producing a pure-integer string reports `int` here (Redis: raw).
+        run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"b", b"42"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"b"]),
+            bulk(b"int"),
+            "KNOWN DIVERGENCE: APPEND of digits reports int here, raw in Redis"
+        );
+    }
+
+    #[test]
+    fn object_refcount_shared_int_vs_one() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // A shared small int (0..=9999) reports OBJ_SHARED_REFCOUNT = 2147483647.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"small", b"100"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"REFCOUNT", b"small"]),
+            Value::Integer(2_147_483_647)
+        );
+        // A large int (>= 10000) is not shared -> 1.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"big", b"100000"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"REFCOUNT", b"big"]),
+            Value::Integer(1)
+        );
+        // A non-int string -> 1.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"str", b"hello"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"REFCOUNT", b"str"]),
+            Value::Integer(1)
+        );
+    }
+
+    #[test]
+    fn object_idletime_zero_under_non_lfu_and_errors_under_lfu() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        // Non-LFU (default cache policy): IDLETIME is 0.
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"IDLETIME", b"k"]),
+            Value::Integer(0)
+        );
+        // LFU policy: IDLETIME errors (idle time not tracked under LFU).
+        let mut lfu = lfu_store(c.databases);
+        run_on(&c, &mut s, &mut lfu, t, &[b"SET", b"k", b"v"]);
+        match run_on(&c, &mut s, &mut lfu, t, &[b"OBJECT", b"IDLETIME", b"k"]) {
+            Value::Error(e) => assert_eq!(
+                e.line(),
+                "-ERR An LFU maxmemory policy is selected, idle time not tracked. \
+                 Please note that when switching between policies at runtime LRU and \
+                 LFU data will take some time to adjust."
+            ),
+            other => panic!("expected LFU idletime error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_freq_under_lfu_and_errors_under_non_lfu() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let t = UnixMillis(0);
+        // Non-LFU: FREQ errors (requires an LFU policy).
+        let mut st = test_store(c.databases);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v"]);
+        match run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"FREQ", b"k"]) {
+            Value::Error(e) => assert_eq!(
+                e.line(),
+                "-ERR An LFU maxmemory policy is not selected, access frequency not \
+                 tracked. Please note that when switching between policies at runtime \
+                 LRU and LFU data will take some time to adjust."
+            ),
+            other => panic!("expected LFU freq error, got {other:?}"),
+        }
+        // LFU: FREQ returns an integer estimate (>= 0).
+        let mut lfu = lfu_store(c.databases);
+        run_on(&c, &mut s, &mut lfu, t, &[b"SET", b"k", b"v"]);
+        // Access it a few times so the sketch estimate is non-trivial.
+        for _ in 0..5 {
+            run_on(&c, &mut s, &mut lfu, t, &[b"GET", b"k"]);
+        }
+        match run_on(&c, &mut s, &mut lfu, t, &[b"OBJECT", b"FREQ", b"k"]) {
+            Value::Integer(n) => assert!((0..=15).contains(&n), "FREQ estimate in 0..=15, got {n}"),
+            other => panic!("expected integer freq, got {other:?}"),
+        }
+        // FREQ of a missing key (under LFU) -> null.
+        assert_eq!(
+            run_on(&c, &mut s, &mut lfu, t, &[b"OBJECT", b"FREQ", b"absent"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn object_help_and_unknown_subcommand() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // HELP -> a non-empty array of bulk strings.
+        match run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"HELP"]) {
+            Value::Array(Some(items)) => assert!(!items.is_empty()),
+            other => panic!("expected help array, got {other:?}"),
+        }
+        // An unknown subcommand errors.
+        assert!(matches!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"BOGUS", b"k"]),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn keyspace_command_arity_errors() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        for cmd in [
+            vec![b"KEYS".as_slice()],
+            vec![b"SCAN"],
+            vec![b"RENAME", b"a"],
+            vec![b"RENAMENX", b"a"],
+            vec![b"MOVE", b"a"],
+            vec![b"SWAPDB", b"0"],
+            vec![b"TOUCH"],
+            vec![b"UNLINK"],
+            vec![b"OBJECT"],
+        ] {
+            assert!(
+                matches!(run_on(&c, &mut s, &mut st, t, &cmd), Value::Error(_)),
+                "expected arity error for {cmd:?}"
+            );
+        }
     }
 }

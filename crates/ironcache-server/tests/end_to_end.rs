@@ -45,7 +45,7 @@ fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
 /// the peer closes or QUIT.
 async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let env = SystemEnv::new();
+    let mut env = SystemEnv::new();
     // A real per-connection store for the test server, constructed exactly as the
     // binary's per-shard store is (the concrete ShardStore over the waist, wired with
     // the cache-mode eviction policy so it satisfies the Admit bound dispatch needs).
@@ -89,7 +89,7 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
                     let reply = dispatch(
                         &ctx,
                         &mut conn,
-                        &env,
+                        &mut env,
                         &mut store,
                         &mut wheel,
                         now,
@@ -403,6 +403,131 @@ fn numeric_append_and_info_over_real_socket() {
         drop(client);
         acceptor.await.unwrap();
     });
+}
+
+#[test]
+fn keyspace_commands_over_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // SET three keys.
+        for (k, klen) in [("k1", 2usize), ("k2", 2), ("k3", 2)] {
+            let cmd = format!("*3\r\n$3\r\nSET\r\n${klen}\r\n{k}\r\n$1\r\nv\r\n");
+            client.write_all(cmd.as_bytes()).await.unwrap();
+            expect_reply(&mut client, b"+OK\r\n").await;
+        }
+
+        // DBSIZE -> :3
+        client.write_all(b"*1\r\n$6\r\nDBSIZE\r\n").await.unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+
+        // SCAN 0 COUNT 100 -> a 2-element array; collect every key to completion.
+        let mut collected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cursor = String::from("0");
+        loop {
+            let curlen = cursor.len();
+            let cmd =
+                format!("*4\r\n$4\r\nSCAN\r\n${curlen}\r\n{cursor}\r\n$5\r\nCOUNT\r\n$2\r\n10\r\n");
+            client.write_all(cmd.as_bytes()).await.unwrap();
+            // Read a chunk and parse the 2-array reply (small, fits one read here).
+            let mut buf = [0u8; 1024];
+            let n = client.read(&mut buf).await.unwrap();
+            let (next, keys) = parse_scan_reply(&buf[..n]);
+            for k in keys {
+                collected.insert(k);
+            }
+            if next == "0" {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(collected.len(), 3, "SCAN to completion collected all keys");
+        assert!(collected.contains("k1") && collected.contains("k2") && collected.contains("k3"));
+
+        // KEYS k* -> array containing all three (just assert the array header count).
+        client
+            .write_all(b"*2\r\n$4\r\nKEYS\r\n$2\r\nk*\r\n")
+            .await
+            .unwrap();
+        let mut kbuf = [0u8; 256];
+        let kn = client.read(&mut kbuf).await.unwrap();
+        assert_eq!(kbuf[0], b'*', "KEYS reply is an array");
+        assert!(
+            String::from_utf8_lossy(&kbuf[..kn]).starts_with("*3\r\n"),
+            "KEYS k* -> 3 keys"
+        );
+
+        // OBJECT ENCODING k1 -> embstr ($6\r\nembstr\r\n).
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$2\r\nk1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$6\r\nembstr\r\n").await;
+
+        // RENAME k1 k1b -> +OK ; GET k1b -> v ; GET k1 -> null.
+        client
+            .write_all(b"*3\r\n$6\r\nRENAME\r\n$2\r\nk1\r\n$3\r\nk1b\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$3\r\nk1b\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$1\r\nv\r\n").await;
+
+        // FLUSHDB -> +OK ; DBSIZE -> :0.
+        client.write_all(b"*1\r\n$7\r\nFLUSHDB\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client.write_all(b"*1\r\n$6\r\nDBSIZE\r\n").await.unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
+/// Minimal RESP2 parser for a SCAN reply `*2\r\n$<n>\r\n<cursor>\r\n*<m>\r\n($<l>\r\n<key>\r\n)*`,
+/// returning the next cursor string and the key strings. Sufficient for the small
+/// keyspaces the e2e test uses (one read per SCAN call).
+fn parse_scan_reply(buf: &[u8]) -> (String, Vec<String>) {
+    let s = String::from_utf8_lossy(buf);
+    let mut lines = s.split("\r\n");
+    assert_eq!(lines.next(), Some("*2"), "SCAN reply is a 2-array");
+    // The cursor: a bulk string ($len then the bytes).
+    let cur_hdr = lines.next().unwrap_or("");
+    assert!(
+        cur_hdr.starts_with('$'),
+        "cursor bulk header, got {cur_hdr}"
+    );
+    let cursor = lines.next().unwrap_or("").to_string();
+    // The keys array header `*m`.
+    let arr_hdr = lines.next().unwrap_or("");
+    assert!(arr_hdr.starts_with('*'), "keys array header, got {arr_hdr}");
+    let m: usize = arr_hdr[1..].parse().unwrap_or(0);
+    let mut keys = Vec::new();
+    for _ in 0..m {
+        let _len = lines.next(); // $len
+        if let Some(k) = lines.next() {
+            keys.push(k.to_string());
+        }
+    }
+    (cursor, keys)
 }
 
 #[test]

@@ -10,6 +10,13 @@ pub fn ascii_upper(b: &[u8]) -> Vec<u8> {
     b.iter().map(u8::to_ascii_uppercase).collect()
 }
 
+/// ASCII-lowercase a byte slice into an owned `Vec<u8>` for case-insensitive matching
+/// (e.g. the SCAN `TYPE` name, which Redis lowercases against the type vocabulary).
+#[must_use]
+pub fn ascii_lower(b: &[u8]) -> Vec<u8> {
+    b.iter().map(u8::to_ascii_lowercase).collect()
+}
+
 /// Parse a base-10 i64 from an argument the way Redis `string2ll` (src/util.c)
 /// does: an optional single leading `-` then one or more ASCII digits, with NO
 /// leading `+`, no whitespace, and no other characters. The FULL i64 range

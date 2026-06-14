@@ -37,10 +37,126 @@ use hashbrown::HashSet;
 use hashbrown::hash_map::Entry;
 use ironcache_eviction::EvictionPolicy;
 use ironcache_storage::{
-    AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, NewValue,
-    NullEviction, OccupiedEntry, RmwAction, RmwEntry, RmwStep, Store, UnixMillis, ValueRef,
+    AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
+    MoveOutcome, NewValue, NullEviction, OccupiedEntry, RmwAction, RmwEntry, RmwStep, ScanCursor,
+    Store, UnixMillis, ValueRef,
 };
 use kvobj::{KvObj, int_decimal_bytes};
+
+/// The FIXED-SEED stable key hash that the SCAN cursor iterates in ascending order
+/// (KEYSPACE.md "the full hash recomputed from the embedded key"). It is a small
+/// dedicated wyhash-style mix over the raw key bytes (ADR-0003 determinism):
+///
+/// - It is RECOMPUTABLE from the key bytes alone (the cursor encodes a position in
+///   this hash's order, and a resume re-derives every key's hash), so the iteration
+///   order is stable across calls and processes.
+/// - It is NOT `hashbrown`'s per-table hasher (a `RandomState` / per-table tag, which
+///   differs run-to-run and would break a multi-call SCAN), and NOT `std` `rand`.
+/// - Because the value depends ONLY on the key bytes, it is INVARIANT across a
+///   `hashbrown` all-at-once resize: a resize moves entries to new buckets but does
+///   not change any key's `scan_hash`, so a SCAN that spans a resize still visits
+///   every key present throughout in the same total order (the rehash-tolerance
+///   guarantee KEYSPACE.md mandates; reverse-binary bucket iteration is rejected
+///   there precisely because it is NOT resize-invariant for an all-at-once table).
+///
+/// The mix is the wyhash final-mix (a fixed 64-bit secret, deterministic, public
+/// domain), folded byte-by-byte so it is collision-resistant enough to spread keys
+/// across the 64-bit order while staying allocation-free and branch-light.
+#[must_use]
+pub fn scan_hash(key: &[u8]) -> u64 {
+    // wyhash-style: a fixed seed, then a per-byte fold through a 64-bit multiply-xor
+    // mix. Fully determined by the key bytes (no table state, no OS entropy).
+    const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+    const SECRET: u64 = 0xA076_1D64_78BD_642F;
+    let mut h: u64 = SEED ^ SECRET;
+    for &b in key {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3); // FNV-1a prime spread
+        h ^= h >> 33;
+    }
+    // Final avalanche (splitmix64 finalizer) so close keys land far apart in the order.
+    h = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^ (h >> 31)
+}
+
+/// The result of the pure SCAN cursor-stepping core ([`scan_plan`]): which sorted
+/// keys to EXAMINE this batch (the borrow lives as long as the input `order`) and the
+/// next [`ScanCursor`] to return.
+struct ScanPlan<'a> {
+    /// The keys to examine this batch, in ascending (hash, bytes) order.
+    examined: Vec<&'a [u8]>,
+    /// The next cursor: `ScanCursor(0)` means the iteration is complete; otherwise the
+    /// `scan_hash` of the FIRST not-yet-examined key (the resume threshold).
+    next: ScanCursor,
+}
+
+/// The PURE SCAN cursor-stepping core over a pre-sorted `(scan_hash, key_bytes)`
+/// slice (KEYSPACE.md cursor-stability contract). Separated from the store so it can
+/// be unit-tested with HAND-CRAFTED hashes, including a FORCED equal-hash collision
+/// (two distinct keys sharing a 64-bit hash), without inverting [`scan_hash`].
+///
+/// ## The cursor invariant (and why a non-terminal cursor is never 0)
+///
+/// The cursor is the `scan_hash` of the NEXT not-yet-examined key (the resume
+/// THRESHOLD), with `>=` resume semantics; `ScanCursor(0)` is reserved for "complete".
+/// An equal-hash GROUP (all keys sharing one hash) is NEVER split across two calls:
+/// once a batch reaches its `count` budget, it keeps examining until the hash CHANGES,
+/// then stops at the group boundary. So the next cursor is always the hash at the
+/// START of a fresh, fully-un-examined group, and resuming at `hash >= cursor` returns
+/// every key of that group (the equal-hash discriminator is re-derived from the group
+/// boundary, needing no extra cursor field).
+///
+/// A non-terminal cursor is NEVER `0`: a key whose `scan_hash` is 0 sorts FIRST, so it
+/// is examined on the start batch (cursor 0 == start) and the next un-examined key
+/// then has a strictly greater hash. Thus a returned `ScanCursor(0)` unambiguously
+/// means complete, never "resume from the 0-hash key".
+///
+/// `count` bounds the keys EXAMINED (a hint, like Redis); `count == 0` is treated as
+/// 1 so progress is always made.
+fn scan_plan<'a>(order: &[(u64, &'a [u8])], cursor: ScanCursor, count: usize) -> ScanPlan<'a> {
+    let total = order.len();
+    // The resume position: the first key whose hash is >= the cursor. For the start
+    // cursor (0) that is index 0. Because a group is never split, `start` always lands
+    // on a group boundary, so `>=` returns the whole resumed group.
+    let start = if cursor.is_start() {
+        0
+    } else {
+        order.partition_point(|&(h, _)| h < cursor.0)
+    };
+    if start >= total {
+        return ScanPlan {
+            examined: Vec::new(),
+            next: ScanCursor::START,
+        };
+    }
+
+    let count = count.max(1);
+    let mut examined: Vec<&'a [u8]> = Vec::new();
+    let mut i = start;
+    let mut n = 0usize;
+    while i < total {
+        let (h, key) = order[i];
+        // Stop once the per-call budget is spent AND we are at a group boundary (the
+        // hash differs from the last examined key), so a group is never split.
+        if n >= count && i > start && h != order[i - 1].0 {
+            break;
+        }
+        examined.push(key);
+        n += 1;
+        i += 1;
+    }
+
+    // The next cursor: 0 (complete) if we consumed the whole order; otherwise the hash
+    // of the first un-examined key (always a strictly-greater group start, never 0).
+    let next = if i >= total {
+        ScanCursor::START
+    } else {
+        ScanCursor(order[i].0)
+    };
+    ScanPlan { examined, next }
+}
 
 /// The per-shard store: one `hashbrown::HashMap` per logical database, plus the
 /// eviction and accounting hooks fired from inside the primitives.
@@ -563,6 +679,13 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
         }
         evicted
     }
+
+    /// The access-frequency estimate for OBJECT FREQ, delegated to the configured
+    /// policy (only the W-TinyLFU LFU engine returns `Some`; non-LFU policies return
+    /// `None`, which dispatch maps to the OBJECT FREQ LFU-gating error). Read-only.
+    fn access_freq(&self, db: u32, key: &[u8]) -> Option<u8> {
+        self.eviction.access_freq(db, key)
+    }
 }
 
 impl<E: EvictionHook, A: AccountingHook> ironcache_storage::ActiveExpiry for ShardStore<E, A> {
@@ -586,6 +709,196 @@ impl<E: EvictionHook, A: AccountingHook> ironcache_storage::ActiveExpiry for Sha
         }
         // remove_object fires on_remove + frees the bytes through the accounting hook.
         self.remove_object(db, db_idx, key)
+    }
+}
+
+impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
+    /// One bounded SCAN batch in ascending [`scan_hash`] order (KEYSPACE.md). See the
+    /// trait method docs for the contract; the resume predicate matches KEYSPACE.md
+    /// exactly: a key is emitted iff `scan_hash(k) > cursor_hash` OR
+    /// (`scan_hash(k) == cursor_hash` AND `k_bytes > last_emitted_bytes_at_that_hash`),
+    /// so two distinct keys colliding on the same 64-bit hash are BOTH returned.
+    ///
+    /// The cursor's integer IS the last-emitted `scan_hash` (PR-4a single-slot: the
+    /// reserved slot high-bits are zero). The equal-hash discriminator is NOT carried
+    /// in the integer; instead, on resume, same-hash keys whose bytes sort at or before
+    /// the largest already-emitted-at-that-hash are skipped, which re-derives the
+    /// discriminator from the key bytes without widening the wire token.
+    ///
+    /// Implementation: build the sorted `(scan_hash, key)` view of the live db ONCE per
+    /// call (O(n log n), the "sort each batch on the fly" mechanism KEYSPACE.md names),
+    /// binary-search to the resume point, then examine up to `count` keys applying the
+    /// `keep` filter, skipping lazily-expired ones. Because `scan_hash` is
+    /// resize-invariant, the sorted order is identical before and after a `hashbrown`
+    /// resize, so iteration is total across a resize.
+    fn scan_step(
+        &mut self,
+        db: u32,
+        cursor: ScanCursor,
+        count: usize,
+        now: UnixMillis,
+        mut keep: impl FnMut(&[u8], DataType) -> bool,
+    ) -> (ScanCursor, Vec<Box<[u8]>>) {
+        let db_idx = self.db_index(db);
+        let Some(map) = self.dbs.get(db_idx) else {
+            return (ScanCursor::START, Vec::new());
+        };
+        if map.is_empty() {
+            // Empty db -> complete immediately (cursor 0).
+            return (ScanCursor::START, Vec::new());
+        }
+
+        // The sorted (scan_hash, key_bytes) view. `scan_hash` is recomputed from the
+        // key bytes here, NOT read from the table's internal hasher, so the order is
+        // stable across calls and across a resize (KEYSPACE.md). Sorting by (hash,
+        // bytes) gives a total order even for equal-hash keys.
+        let mut order: Vec<(u64, &[u8])> = map.keys().map(|k| (scan_hash(k), k.as_ref())).collect();
+        order.sort_unstable();
+
+        // Walk the sorted order, choosing which keys to EXAMINE this batch and what the
+        // next cursor is (the pure cursor-stepping core, unit-tested in isolation).
+        let plan = scan_plan(&order, cursor, count);
+
+        // Realize the plan: for each examined key, skip a lazily-expired one (the lazy
+        // backstop / active drain reclaim it; SCAN never returns it) and apply the
+        // MATCH/TYPE `keep` filter BEFORE cloning the key into the result.
+        let mut kept: Vec<Box<[u8]>> = Vec::with_capacity(plan.examined.len());
+        for &key in &plan.examined {
+            if let Some(obj) = map.get(key) {
+                if obj.is_expired(now) {
+                    continue;
+                }
+                if keep(key, obj.header.data_type) {
+                    kept.push(key.to_vec().into_boxed_slice());
+                }
+            }
+        }
+        (plan.next, kept)
+    }
+
+    fn db_len(&self, db: u32) -> usize {
+        let db_idx = self.db_index(db);
+        // RAW table length (Redis does not active-expire on DBSIZE): the dict size,
+        // including not-yet-reaped expired keys. No lazy backstop here.
+        self.dbs.get(db_idx).map_or(0, HashMap::len)
+    }
+
+    fn random_key(&mut self, db: u32, pick: u64, now: UnixMillis) -> Option<Box<[u8]>> {
+        let db_idx = self.db_index(db);
+        let map = self.dbs.get(db_idx)?;
+        let n = map.len();
+        if n == 0 {
+            return None;
+        }
+        // The caller drew `pick` from the Env RNG (ADR-0003: the store reads no RNG).
+        // Map it to a starting index, then probe forward DETERMINISTICALLY in the
+        // sorted scan order, skipping expired keys, so an expired key at the picked
+        // position does not yield `None` while live keys remain.
+        let mut order: Vec<&[u8]> = map.keys().map(std::convert::AsRef::as_ref).collect();
+        order.sort_unstable_by(|a, b| scan_hash(a).cmp(&scan_hash(b)).then(a.cmp(b)));
+        let start = (pick % n as u64) as usize;
+        for off in 0..n {
+            let idx = (start + off) % n;
+            let key = order[idx];
+            if let Some(obj) = map.get(key) {
+                if !obj.is_expired(now) {
+                    return Some(key.to_vec().into_boxed_slice());
+                }
+            }
+        }
+        None
+    }
+
+    fn flush_db(&mut self, db: u32) -> u64 {
+        let db_idx = self.db_index(db);
+        let keys: Vec<Box<[u8]>> = match self.dbs.get(db_idx) {
+            Some(map) => map.keys().cloned().collect(),
+            None => return 0,
+        };
+        let mut removed = 0u64;
+        for key in &keys {
+            // remove_object fires the eviction/accounting remove hooks and frees bytes.
+            if self.remove_object(db, db_idx, key) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    fn flush_all(&mut self) -> u64 {
+        let mut removed = 0u64;
+        for db in 0..self.dbs.len() as u32 {
+            removed += self.flush_db(db);
+        }
+        removed
+    }
+
+    fn move_object(
+        &mut self,
+        src_db: u32,
+        src: &[u8],
+        dst_db: u32,
+        dst: &[u8],
+        mode: MoveMode,
+        replace: bool,
+        now: UnixMillis,
+    ) -> MoveOutcome {
+        let src_idx = self.db_index(src_db);
+        let dst_idx = self.db_index(dst_db);
+
+        // A lazily-expired source reads as absent (run the backstop first).
+        if !self.expire_if_due(src_db, src_idx, src, now) {
+            return MoveOutcome::NoSource;
+        }
+        // A RENAME/COPY/MOVE onto its own identical (db,key) is a special case: RENAME
+        // of a key to itself is a no-op success in Redis; treat src==dst as a move that
+        // leaves the value where it is.
+        let same_slot = src_idx == dst_idx && src == dst;
+        if same_slot {
+            return match mode {
+                MoveMode::Rename => MoveOutcome::Moved,
+                MoveMode::Copy => MoveOutcome::Copied,
+            };
+        }
+
+        // Destination occupancy gate (RENAMENX-0 / COPY-without-REPLACE / MOVE-occupied).
+        // A lazily-expired destination counts as absent.
+        let dst_live = self.expire_if_due(dst_db, dst_idx, dst, now);
+        if dst_live && !replace {
+            return MoveOutcome::DestExists;
+        }
+
+        // Take the source object INTACT (preserving encoding + remaining TTL). Re-key it
+        // to the destination key bytes; the value representation and `expire_at` are
+        // carried unchanged (KEYSPACE.md "moves the value object INTACT").
+        let Some(mut obj) = self.dbs[src_idx].get(src).cloned() else {
+            return MoveOutcome::NoSource;
+        };
+        obj.key = dst.to_vec().into_boxed_slice();
+
+        // Write the destination through the funnel (fires insert hooks, accounts bytes;
+        // a replaced live destination is credited inside put_object).
+        self.put_object(dst_db, dst_idx, dst, obj);
+
+        match mode {
+            MoveMode::Rename => {
+                // Remove the source (fires remove hooks, credits its bytes).
+                self.remove_object(src_db, src_idx, src);
+                MoveOutcome::Moved
+            }
+            MoveMode::Copy => MoveOutcome::Copied,
+        }
+    }
+
+    fn swap_db(&mut self, a: u32, b: u32) {
+        let ai = self.db_index(a);
+        let bi = self.db_index(b);
+        if ai != bi {
+            // O(1) Vec element swap: the per-DB maps trade places; no entry is created
+            // or destroyed, so no hook fires and the accounting total is unchanged
+            // (the same entries are still resident, just under different db ids).
+            self.dbs.swap(ai, bi);
+        }
     }
 }
 
@@ -731,4 +1044,130 @@ pub fn process_resident_bytes() -> u64 {
 #[must_use]
 pub fn process_memory() -> (u64, u64) {
     (0, 0)
+}
+
+#[cfg(test)]
+mod scan_core_tests {
+    //! White-box unit tests for the SCAN cursor primitives ([`scan_hash`],
+    //! [`scan_plan`]) that need HAND-CRAFTED hashes (a forced equal-hash collision),
+    //! which the black-box `tests/keyspace.rs` integration tests cannot construct
+    //! without inverting `scan_hash`.
+
+    use super::{ScanCursor, scan_hash, scan_plan};
+
+    /// Build a sorted `(hash, key)` order from explicit `(hash, key)` pairs (the input
+    /// shape `scan_plan` consumes). Sorts by (hash, bytes) like the store does.
+    fn order(pairs: &[(u64, &'static [u8])]) -> Vec<(u64, &'static [u8])> {
+        let mut v = pairs.to_vec();
+        v.sort_unstable();
+        v
+    }
+
+    /// Drive `scan_plan` to completion and collect every examined key, asserting the
+    /// cursor terminates at 0. Returns the examined keys in emission order.
+    fn drive(order: &[(u64, &'static [u8])], count: usize) -> Vec<&'static [u8]> {
+        let mut out = Vec::new();
+        let mut cursor = ScanCursor::START;
+        // A generous loop bound so a cursor bug fails the test rather than hangs.
+        for _ in 0..(order.len() + 4) {
+            let plan = scan_plan(order, cursor, count);
+            out.extend(plan.examined.iter().copied());
+            if plan.next.is_start() {
+                return out;
+            }
+            cursor = plan.next;
+        }
+        panic!("scan_plan did not terminate (cursor never returned 0)");
+    }
+
+    #[test]
+    fn scan_hash_is_deterministic_and_pure() {
+        // Recomputable from the key bytes alone: the same bytes always hash the same,
+        // across calls (and, by construction, processes). Different bytes differ.
+        assert_eq!(scan_hash(b"alpha"), scan_hash(b"alpha"));
+        assert_ne!(scan_hash(b"alpha"), scan_hash(b"beta"));
+        assert_ne!(scan_hash(b""), scan_hash(b"\0"));
+    }
+
+    #[test]
+    fn empty_order_completes_immediately() {
+        let plan = scan_plan(&[], ScanCursor::START, 10);
+        assert!(plan.examined.is_empty());
+        assert!(plan.next.is_start(), "empty -> cursor 0 (complete)");
+    }
+
+    #[test]
+    fn full_iteration_visits_every_key_once_small_count() {
+        // Distinct hashes; COUNT 1 still completes and visits each key exactly once.
+        let o = order(&[(30, b"c"), (10, b"a"), (20, b"b"), (40, b"d")]);
+        let visited = drive(&o, 1);
+        assert_eq!(visited, vec![&b"a"[..], b"b", b"c", b"d"]);
+    }
+
+    #[test]
+    fn forced_equal_hash_collision_returns_both_keys() {
+        // THE forced-collision test: two DISTINCT keys sharing the same 64-bit hash
+        // (impossible to find by inverting scan_hash, so constructed here). The
+        // equal-hash group must NEVER be split and BOTH keys must be returned, even
+        // with COUNT 1 (the group is emitted whole once reached).
+        let o = order(&[(7, b"k1"), (7, b"k2"), (9, b"z")]);
+        let visited = drive(&o, 1);
+        assert!(visited.contains(&&b"k1"[..]), "k1 (collision) returned");
+        assert!(visited.contains(&&b"k2"[..]), "k2 (collision) returned");
+        assert!(visited.contains(&&b"z"[..]));
+        assert_eq!(visited.len(), 3, "every key returned exactly once");
+    }
+
+    #[test]
+    fn equal_hash_group_is_never_split_across_calls() {
+        // A group of 3 keys at hash 5, then one at hash 8. With COUNT 1 the first call
+        // must emit the WHOLE hash-5 group (never split), then a second call the hash-8
+        // key. The returned cursor after the first call is the hash-8 group start (8),
+        // never a value inside the hash-5 group.
+        let o = order(&[(5, b"a"), (5, b"b"), (5, b"c"), (8, b"d")]);
+        let plan1 = scan_plan(&o, ScanCursor::START, 1);
+        assert_eq!(
+            plan1.examined.len(),
+            3,
+            "whole equal-hash group in one batch"
+        );
+        assert_eq!(
+            plan1.next,
+            ScanCursor(8),
+            "cursor resumes at the next group"
+        );
+        let plan2 = scan_plan(&o, plan1.next, 1);
+        assert_eq!(plan2.examined, vec![&b"d"[..]]);
+        assert!(plan2.next.is_start(), "complete after the last group");
+    }
+
+    #[test]
+    fn non_terminal_cursor_is_never_zero_even_with_a_zero_hash_key() {
+        // A key whose scan_hash is 0 sorts FIRST and is examined on the start batch, so
+        // the next cursor is strictly greater than 0. A returned 0 thus unambiguously
+        // means complete, never "resume from the 0-hash key".
+        let o = order(&[(0, b"zero"), (1, b"one"), (2, b"two")]);
+        let plan = scan_plan(&o, ScanCursor::START, 1);
+        assert!(
+            plan.examined.contains(&&b"zero"[..]),
+            "0-hash key examined first"
+        );
+        assert!(
+            !plan.next.is_start(),
+            "next cursor is non-zero (more remain)"
+        );
+        assert_ne!(plan.next, ScanCursor(0));
+        // Driving to completion still visits all three exactly once.
+        let visited = drive(&o, 1);
+        assert_eq!(visited.len(), 3);
+    }
+
+    #[test]
+    fn count_is_a_hint_examined_count_bounds_the_batch() {
+        // With distinct hashes and COUNT 2, the first batch examines exactly 2 keys.
+        let o = order(&[(1, b"a"), (2, b"b"), (3, b"c"), (4, b"d"), (5, b"e")]);
+        let plan = scan_plan(&o, ScanCursor::START, 2);
+        assert_eq!(plan.examined.len(), 2);
+        assert_eq!(plan.next, ScanCursor(3), "resume at the 3rd key's hash");
+    }
 }

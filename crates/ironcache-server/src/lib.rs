@@ -15,11 +15,13 @@
 
 pub mod admission;
 pub mod cmd_expire;
+pub mod cmd_introspect;
 pub mod cmd_keyspace;
 pub mod cmd_string;
 pub mod cmd_util;
 pub mod conn;
 pub mod dispatch;
+pub mod glob;
 
 pub use admission::is_denyoom;
 pub use conn::ConnState;

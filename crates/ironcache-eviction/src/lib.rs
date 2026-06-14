@@ -97,6 +97,16 @@ pub trait EvictionPolicy: EvictionHook {
     /// Whether victims are restricted to keys carrying a TTL (the volatile-* family).
     fn volatile_only(&self) -> bool;
 
+    /// The access-frequency estimate for `(db, key)` for OBJECT FREQ, or `None` if
+    /// this policy keeps no frequency estimate (every NON-LFU policy). Only the
+    /// W-TinyLFU LFU-family engine ([`Policy::WTinyLfu`]) returns `Some` (the 4-bit
+    /// count-min sketch estimate, 0..=15); `noeviction`/`*-lru`/`*-random`/`*-ttl`
+    /// return `None`. The dispatch layer maps `None` to the canonical OBJECT FREQ
+    /// LFU-gating error (FREQ requires an LFU maxmemory policy). Additive: it is a
+    /// read-only introspection accessor, NOT part of the frozen four `Store`
+    /// primitives and NOT a hook the store fires on the hot path.
+    fn access_freq(&self, db: u32, key: &[u8]) -> Option<u8>;
+
     /// Re-register a `(db, key)` the store could NOT evict back into the policy's
     /// tracking, NON-DESTRUCTIVELY (the volatile-* re-eligibility fix, #46).
     ///
@@ -208,6 +218,18 @@ impl EvictionPolicy for Policy {
             Policy::S3Fifo(p) => p.volatile_only(),
             Policy::Random(p) => p.volatile_only(),
             Policy::WTinyLfu(p) => p.volatile_only(),
+        }
+    }
+
+    fn access_freq(&self, db: u32, key: &[u8]) -> Option<u8> {
+        match self {
+            // Only the W-TinyLFU LFU engine keeps a frequency estimate (OBJECT FREQ);
+            // every non-LFU policy returns None (the dispatch layer then emits the
+            // OBJECT FREQ LFU-gating error).
+            Policy::NoEviction => None,
+            Policy::S3Fifo(p) => p.access_freq(db, key),
+            Policy::Random(p) => p.access_freq(db, key),
+            Policy::WTinyLfu(p) => p.access_freq(db, key),
         }
     }
 

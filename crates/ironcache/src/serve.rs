@@ -444,10 +444,16 @@ fn handle_request(
     let reply = {
         let mut store = store_rc.borrow_mut();
         let mut wheel = wheel_rc.borrow_mut();
+        // dispatch now takes `env: &mut E` (clock + RNG, ADR-0003): RANDOMKEY draws a
+        // random index through the RNG half, so the env handle must be MUTABLE. `env`
+        // is a SEPARATE RefCell from store/wheel, so `env.borrow_mut()` here does not
+        // alias the held store/wheel borrows. `now` was already read above from a
+        // distinct, now-dropped `env.borrow()`.
+        let mut env_ref = env.borrow_mut();
         let r = dispatch(
             ctx,
             conn,
-            &*env.borrow(),
+            &mut *env_ref,
             &mut *store,
             &mut wheel,
             now,
@@ -456,6 +462,7 @@ fn handle_request(
             &mut deltas,
             request,
         );
+        drop(env_ref);
         lazy_expired = store.take_lazy_expired();
         r
         // The store/wheel borrows end here, BEFORE the counter apply below borrows
