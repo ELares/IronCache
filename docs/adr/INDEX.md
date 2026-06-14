@@ -24,6 +24,7 @@ in [OPEN.md](OPEN.md); research questions in [QUESTIONS.md](QUESTIONS.md).
 | [0016](0016-headline-efficiency-metrics.md) | Headline metrics (per-core, memory-at-hit-ratio) | Accepted | #7 |
 | [0017](0017-per-tenet-acceptance-gates.md) | Per-tenet acceptance targets and release gates | Accepted | #157 |
 | [0018](0018-encoding-conversion-thresholds.md) | Fixed encoding-conversion thresholds | Accepted | #37 |
+| [0019](0019-resp3-reply-shaping.md) | RESP3 reply-shaping policy and error fidelity | Accepted | #17 |
 
 As `[DECISION]` issues close, each adds its row here and its `NNNN-*.md` record.
 The numbering is monotonic and never reused, even after supersession.
