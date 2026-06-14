@@ -215,12 +215,14 @@ pub fn dispatch<C: Clock, S: Store + Admit + ActiveExpiry>(
         b"PEXPIRE" => cmd_expire::cmd_pexpire(store, wheel, db, now, req),
         b"EXPIREAT" => cmd_expire::cmd_expireat(store, wheel, db, now, req),
         b"PEXPIREAT" => cmd_expire::cmd_pexpireat(store, wheel, db, now, req),
-        b"TTL" => keyspace_counted(deltas, cmd_expire::cmd_ttl(store, db, now, req)),
-        b"PTTL" => keyspace_counted(deltas, cmd_expire::cmd_pttl(store, db, now, req)),
-        b"EXPIRETIME" => keyspace_counted(deltas, cmd_expire::cmd_expiretime(store, db, now, req)),
-        b"PEXPIRETIME" => {
-            keyspace_counted(deltas, cmd_expire::cmd_pexpiretime(store, db, now, req))
-        }
+        // TTL / PTTL / EXPIRETIME / PEXPIRETIME are TTL-family INTROSPECTION and use
+        // LOOKUP_NOTOUCH in Redis: they do NOT update keyspace_hits/keyspace_misses
+        // (src/expire.c ttlGenericCommand / expiretimeGenericCommand). Only GET/GETEX
+        // count (the #8 fix).
+        b"TTL" => cmd_expire::cmd_ttl(store, db, now, req),
+        b"PTTL" => cmd_expire::cmd_pttl(store, db, now, req),
+        b"EXPIRETIME" => cmd_expire::cmd_expiretime(store, db, now, req),
+        b"PEXPIRETIME" => cmd_expire::cmd_pexpiretime(store, db, now, req),
         b"PERSIST" => cmd_expire::cmd_persist(store, db, now, req),
         b"GETEX" => keyspace_counted(deltas, cmd_expire::cmd_getex(store, wheel, db, now, req)),
         b"SETEX" => cmd_expire::cmd_setex(store, wheel, db, now, req),
@@ -542,19 +544,19 @@ fn parse_int_arg(arg: &[u8]) -> Option<i64> {
 /// Fold a read command's hit/miss into the keyspace counters (PR-3b, INFO
 /// `keyspace_hits`/`keyspace_misses`), then return the reply unchanged.
 ///
-/// A MISS is the "key not found" reply shape: a `Null` bulk (GET/GETEX absent) or the
-/// `Integer(-2)` TTL-family not-found convention. An `Error` reply (e.g. WRONGTYPE) is
-/// NEITHER a hit nor a miss (it is not a successful lookup result). Everything else is
-/// a HIT (the key was found live). This is applied only to commands whose reply shape
-/// is an UNAMBIGUOUS found/not-found signal (GET, GETEX, TTL/PTTL/EXPIRETIME/
-/// PEXPIRETIME); commands whose reply collides with a real value (e.g. STRLEN's 0) are
-/// not counted, to avoid misclassification.
+/// A MISS is the "key not found" reply shape: a `Null` bulk (GET/GETEX absent). An
+/// `Error` reply (e.g. WRONGTYPE) is NEITHER a hit nor a miss (it is not a successful
+/// lookup result). Everything else is a HIT (the key was found live). This is applied
+/// only to GET / GETEX, whose reply shape is an UNAMBIGUOUS found/not-found signal and
+/// which Redis counts (a real keyspace LOOKUP). The TTL-family introspection commands
+/// (TTL/PTTL/EXPIRETIME/PEXPIRETIME) use LOOKUP_NOTOUCH and are NOT counted (the #8
+/// fix); STRLEN's reply collides with a real value (0) so it is also not counted.
 fn keyspace_counted(deltas: &mut CounterDeltas, reply: Value) -> Value {
     match &reply {
         Value::Error(_) => {}
-        // A `Null` bulk (GET/GETEX absent) or the `Integer(-2)` TTL-family not-found
-        // convention is a miss; anything else (a found value / a real TTL) is a hit.
-        Value::Null | Value::Integer(-2) => deltas.keyspace_misses += 1,
+        // A `Null` bulk (GET/GETEX absent) is a miss; anything else (a found value) is
+        // a hit.
+        Value::Null => deltas.keyspace_misses += 1,
         _ => deltas.keyspace_hits += 1,
     }
     reply
@@ -2303,23 +2305,43 @@ mod tests {
     }
 
     #[test]
-    fn expire_conflicting_options_are_syntax_errors() {
+    fn expire_conflicting_options_are_specific_errors() {
+        // The three EXPIRE-option conflicts / the unknown token each map to their
+        // SPECIFIC Redis message (src/expire.c parseExtendedExpireArgumentsOrReply),
+        // NOT the generic syntax error (the #7 fix).
         let c = ctx(None);
         let mut s = state(&c);
         let mut st = test_store(c.databases);
         let mut wheel = TimingWheel::new();
         let t = UnixMillis(0);
         run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
-        for opts in [
-            vec![b"EXPIRE".as_slice(), b"k", b"10", b"NX", b"XX"],
-            vec![b"EXPIRE", b"k", b"10", b"NX", b"GT"],
-            vec![b"EXPIRE", b"k", b"10", b"NX", b"LT"],
-            vec![b"EXPIRE", b"k", b"10", b"GT", b"LT"],
-            vec![b"EXPIRE", b"k", b"10", b"BOGUS"],
-        ] {
-            match run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &opts) {
-                Value::Error(e) => assert_eq!(e.line(), "-ERR syntax error", "{opts:?}"),
-                other => panic!("expected syntax error for {opts:?}, got {other:?}"),
+        let cases: &[(&[&[u8]], &str)] = &[
+            (
+                &[b"EXPIRE", b"k", b"10", b"NX", b"XX"],
+                "-ERR NX and XX, GT or LT options at the same time are not compatible",
+            ),
+            (
+                &[b"EXPIRE", b"k", b"10", b"NX", b"GT"],
+                "-ERR NX and XX, GT or LT options at the same time are not compatible",
+            ),
+            (
+                &[b"EXPIRE", b"k", b"10", b"NX", b"LT"],
+                "-ERR NX and XX, GT or LT options at the same time are not compatible",
+            ),
+            (
+                &[b"EXPIRE", b"k", b"10", b"GT", b"LT"],
+                "-ERR GT and LT options at the same time are not compatible",
+            ),
+            // The unknown-option token is echoed verbatim.
+            (
+                &[b"EXPIRE", b"k", b"10", b"BOGUS"],
+                "-ERR Unsupported option BOGUS",
+            ),
+        ];
+        for (opts, want) in cases {
+            match run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, opts) {
+                Value::Error(e) => assert_eq!(&e.line(), want, "{opts:?}"),
+                other => panic!("expected {want} for {opts:?}, got {other:?}"),
             }
         }
         // GT+XX and LT+XX are LEGAL (no error). With a TTL present XX is satisfied.
@@ -2341,6 +2363,80 @@ mod tests {
                 &[b"EXPIRE", b"k", b"20", b"GT", b"XX"]
             )),
             1
+        );
+    }
+
+    #[test]
+    fn expire_lt_xx_independent_gates_drop_xx_on_no_ttl() {
+        // The #1 fix: EXPIRE evaluates the existence gate (NX/XX) and the ordering gate
+        // (GT/LT) INDEPENDENTLY, and BOTH must pass. `LT XX` on a key with NO current
+        // TTL: XX fails (no TTL), so the timeout is NOT set and the reply is 0 even
+        // though LT alone (no-TTL = +infinity) would have applied. The old collapsed
+        // enum dropped the XX gate and (wrongly) set the TTL.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        // LT XX on a no-TTL key -> reply 0, nothing set.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"10", b"LT", b"XX"]
+            )),
+            0,
+            "LT XX must fail the XX gate on a key with no TTL"
+        );
+        // TTL is still -1 (no TTL was set).
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"k"]
+            )),
+            -1,
+            "no TTL was set"
+        );
+        // Now give it a TTL, then LT XX with a SMALLER deadline applies (both gates
+        // pass: XX has a TTL, LT is strictly less).
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"EXPIRE", b"k", b"100"],
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"50", b"LT", b"XX"]
+            )),
+            1,
+            "LT XX applies when a TTL exists and the new deadline is smaller"
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"k"]
+            )),
+            50
         );
     }
 
@@ -2460,7 +2556,135 @@ mod tests {
                 t,
                 &[b"EXPIRETIME", b"k"]
             )),
-            123 // 123456 / 1000
+            123 // (123456 + 500) / 1000 = 123 (ms component < 500 rounds down)
+        );
+    }
+
+    #[test]
+    fn expiretime_rounds_to_nearest_second() {
+        // EXPIRETIME rounds the absolute ms deadline to the NEAREST second
+        // (`(ms + 500) / 1000`, Redis ttlGenericCommand output_abs), so an ms component
+        // >= 500 rounds UP. PEXPIRETIME stays exact ms (the #5 fix).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        // 123556ms: ms component 556 >= 500 -> EXPIRETIME rounds up to 124.
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"PEXPIREAT", b"k", b"123556"],
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRETIME", b"k"]
+            )),
+            124,
+            "(123556 + 500) / 1000 = 124"
+        );
+        // PEXPIRETIME is the exact ms, unrounded.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PEXPIRETIME", b"k"]
+            )),
+            123_556
+        );
+    }
+
+    #[test]
+    fn expire_deadline_equal_to_now_deletes_immediately() {
+        // The #6 command-time boundary: a resolved deadline EQUAL to now is treated as
+        // already past (Redis checkAlreadyExpired, `when <= now`), so PEXPIREAT k <now>
+        // replies 1 and the key is gone the same tick. This is DISTINCT from the store's
+        // lazy-read backstop (`now > deadline`, alive at now==deadline), which governs a
+        // SET deadline reached later.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let now = UnixMillis(100_000);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, now, &[b"SET", b"k", b"v"]);
+        // PEXPIREAT to exactly `now` -> reply 1, key deleted immediately.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                now,
+                &[b"PEXPIREAT", b"k", b"100000"]
+            )),
+            1,
+            "deadline == now deletes and replies 1 (checkAlreadyExpired <= now)"
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                now,
+                &[b"EXISTS", b"k"]
+            )),
+            0,
+            "key is gone same-tick"
+        );
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, now, &[b"GET", b"k"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn getex_exat_in_the_past_returns_value_then_deletes() {
+        // The #6 boundary for GETEX: an ABSOLUTE EXAT/PXAT deadline at or before now
+        // returns the value AND deletes the key (Redis checkAlreadyExpired). A past
+        // RELATIVE EX/PX is still the invalid-expire error, not this path.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let now = UnixMillis(100_000);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, now, &[b"SET", b"k", b"v"]);
+        // PXAT exactly at now (100000ms): value returned, key deleted.
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                now,
+                &[b"GETEX", b"k", b"PXAT", b"100000"]
+            ),
+            bulk(b"v"),
+            "GETEX returns the value even when the absolute deadline is past"
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                now,
+                &[b"EXISTS", b"k"]
+            )),
+            0,
+            "the key is deleted after the read (past absolute deadline)"
         );
     }
 
@@ -2941,12 +3165,41 @@ mod tests {
         // GET miss.
         let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"GET", b"absent"]);
         assert_eq!((d.keyspace_hits, d.keyspace_misses), (0, 1));
-        // TTL miss (-2) on absent.
-        let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"TTL", b"absent"]);
-        assert_eq!((d.keyspace_hits, d.keyspace_misses), (0, 1));
-        // TTL hit (-1, present-no-ttl is still a found key).
-        let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"TTL", b"k"]);
+        // GETEX is also counted (a real keyspace lookup): a hit on a present key.
+        let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"GETEX", b"k"]);
         assert_eq!((d.keyspace_hits, d.keyspace_misses), (1, 0));
+        let (_r, d) =
+            run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"GETEX", b"absent"]);
+        assert_eq!((d.keyspace_hits, d.keyspace_misses), (0, 1));
+    }
+
+    #[test]
+    fn ttl_family_does_not_count_keyspace_hits_or_misses() {
+        // TTL-family introspection (TTL/PTTL/EXPIRETIME/PEXPIRETIME) uses LOOKUP_NOTOUCH
+        // and must NOT bump keyspace_hits/keyspace_misses (the #8 fix), unlike GET/GETEX.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        for cmd in [
+            vec![b"TTL".as_slice(), b"k"],
+            vec![b"TTL", b"absent"],
+            vec![b"PTTL", b"k"],
+            vec![b"PTTL", b"absent"],
+            vec![b"EXPIRETIME", b"k"],
+            vec![b"EXPIRETIME", b"absent"],
+            vec![b"PEXPIRETIME", b"k"],
+            vec![b"PEXPIRETIME", b"absent"],
+        ] {
+            let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &cmd);
+            assert_eq!(
+                (d.keyspace_hits, d.keyspace_misses),
+                (0, 0),
+                "{cmd:?} must not count keyspace hits/misses (LOOKUP_NOTOUCH)"
+            );
+        }
     }
 
     #[test]

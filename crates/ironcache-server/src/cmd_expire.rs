@@ -46,55 +46,77 @@ enum ExpireKind {
     MillisAt,
 }
 
-/// The Redis 7 conditional flag on an EXPIRE-family command (mutually constrained:
-/// NX conflicts with any of XX/GT/LT; GT conflicts with LT).
+/// The Redis 7 conditional flags on an EXPIRE-family command, parsed as the RAW set
+/// of flags rather than collapsed into one mutually-exclusive choice.
+///
+/// Redis evaluates the existence gate (`NX`/`XX`) and the ordering gate (`GT`/`LT`)
+/// INDEPENDENTLY (src/expire.c): both gates must pass for the timeout to be set. The
+/// legal combinations `GT XX` and `LT XX` therefore carry BOTH an ordering and an
+/// existence condition, and BOTH must hold. Collapsing the four flags into a single
+/// enum would silently drop the `XX` gate on an `LT XX` (the only observably divergent
+/// pairing, since `GT` already rejects a no-TTL key the way `XX` would), so the flags
+/// are kept separate here. Conflicts (`NX` with any of `XX`/`GT`/`LT`; `GT` with `LT`)
+/// are still rejected at parse time.
+///
+/// The four bools mirror the four INDEPENDENT Redis option bits exactly (each present
+/// or absent on its own); collapsing them into two-variant enums or a state machine
+/// (the `struct_excessive_bools` lint's suggestion) would re-introduce the very
+/// coupling the #1 fix removes, so the lint is allowed here with that rationale.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum ExpireCond {
-    /// No condition: always set.
-    #[default]
-    None,
-    /// NX: set only if the key has NO current TTL.
-    Nx,
-    /// XX: set only if the key HAS a current TTL.
-    Xx,
-    /// GT: set only if the new expiry is GREATER than the current (no-TTL = infinite,
-    /// so GT against a no-TTL key NEVER applies).
-    Gt,
-    /// LT: set only if the new expiry is LESS than the current (no-TTL = infinite, so
-    /// LT against a no-TTL key ALWAYS applies).
-    Lt,
+struct ExpireCond {
+    /// `NX`: set only if the key has NO current TTL.
+    nx: bool,
+    /// `XX`: set only if the key HAS a current TTL.
+    xx: bool,
+    /// `GT`: set only if the new expiry is GREATER than the current (no-TTL =
+    /// +infinity, so `GT` against a no-TTL key NEVER applies).
+    gt: bool,
+    /// `LT`: set only if the new expiry is LESS than the current (no-TTL = +infinity,
+    /// so `LT` against a no-TTL key ALWAYS applies).
+    lt: bool,
 }
 
-/// Parse the optional trailing condition flag of an EXPIRE-family command. Returns
-/// `None` on a conflict / unknown token (the caller maps it to a syntax error).
-fn parse_expire_cond(args: &[Bytes]) -> Option<ExpireCond> {
-    let mut nx = false;
-    let mut xx = false;
-    let mut gt = false;
-    let mut lt = false;
+/// Why parsing the EXPIRE-family option tail failed: a flag conflict (one of the two
+/// Redis incompatibility messages) or an unknown option token. Each maps to a specific
+/// Redis error string (src/expire.c `parseExtendedExpireArgumentsOrReply`).
+enum ExpireCondError {
+    /// `NX` combined with any of `XX`/`GT`/`LT`.
+    NxWithOther,
+    /// `GT` combined with `LT`.
+    GtWithLt,
+    /// An unrecognized option token (echoed verbatim).
+    Unsupported(String),
+}
+
+/// Parse the optional trailing condition flags of an EXPIRE-family command into the
+/// RAW [`ExpireCond`] flag set. Rejects the Redis conflicts (NX with any of XX/GT/LT;
+/// GT with LT) and unknown tokens, mapping each to a specific [`ExpireCondError`].
+fn parse_expire_cond(args: &[Bytes]) -> Result<ExpireCond, ExpireCondError> {
+    let mut cond = ExpireCond::default();
     for a in args {
         match ascii_upper(a).as_slice() {
-            b"NX" => nx = true,
-            b"XX" => xx = true,
-            b"GT" => gt = true,
-            b"LT" => lt = true,
-            _ => return None,
+            b"NX" => cond.nx = true,
+            b"XX" => cond.xx = true,
+            b"GT" => cond.gt = true,
+            b"LT" => cond.lt = true,
+            _ => {
+                // Echo the token verbatim (Redis prints the raw argument).
+                return Err(ExpireCondError::Unsupported(
+                    String::from_utf8_lossy(a).into_owned(),
+                ));
+            }
         }
     }
-    // Conflicts (Redis: NX with any of XX/GT/LT is an error; GT+LT is an error).
-    if nx && (xx || gt || lt) {
-        return None;
+    // Conflicts (Redis: NX with any of XX/GT/LT is an error; GT+LT is an error). The
+    // NX conflict is checked first to match Redis's argument-parse order.
+    if cond.nx && (cond.xx || cond.gt || cond.lt) {
+        return Err(ExpireCondError::NxWithOther);
     }
-    if gt && lt {
-        return None;
+    if cond.gt && cond.lt {
+        return Err(ExpireCondError::GtWithLt);
     }
-    Some(match (nx, xx, gt, lt) {
-        (true, _, _, _) => ExpireCond::Nx,
-        (_, _, true, _) => ExpireCond::Gt,
-        (_, _, _, true) => ExpireCond::Lt,
-        (_, true, _, _) => ExpireCond::Xx,
-        _ => ExpireCond::None,
-    })
+    Ok(cond)
 }
 
 /// Resolve an EXPIRE-family argument into an absolute deadline in milliseconds, as a
@@ -139,8 +161,15 @@ fn expire_generic<S: Store>(
     let Some(n) = parse_i64(&req.args[2]) else {
         return Value::error(ErrorReply::not_an_integer());
     };
-    let Some(cond) = parse_expire_cond(&req.args[3..]) else {
-        return Value::error(ErrorReply::syntax_error());
+    let cond = match parse_expire_cond(&req.args[3..]) {
+        Ok(c) => c,
+        Err(ExpireCondError::NxWithOther) => {
+            return Value::error(ErrorReply::expire_nx_and_xx_gt_lt());
+        }
+        Err(ExpireCondError::GtWithLt) => return Value::error(ErrorReply::expire_gt_and_lt()),
+        Err(ExpireCondError::Unsupported(opt)) => {
+            return Value::error(ErrorReply::expire_unsupported_option(&opt));
+        }
     };
     let Ok(deadline_ms) = resolve_expire_at(kind, n, now) else {
         return Value::error(ErrorReply::invalid_expire_time(cmd_name));
@@ -159,35 +188,32 @@ fn expire_generic<S: Store>(
             RmwEntry::Occupied(o) => o.expire_at(),
         };
 
-        // Apply the NX/XX/GT/LT condition. `current` is None for a key with no TTL,
-        // which GT/LT treat as +infinity.
-        let allowed = match cond {
-            ExpireCond::None => true,
-            ExpireCond::Nx => current.is_none(),
-            ExpireCond::Xx => current.is_some(),
-            // GT: set only if the new expiry is greater than the current. A no-TTL key
-            // is infinite, so GT never applies to it.
-            ExpireCond::Gt => match current {
-                None => false,
-                Some(cur) => deadline_ms > cur.0 as i64,
-            },
-            // LT: set only if the new expiry is less than the current. A no-TTL key is
-            // infinite, so LT always applies to it.
-            ExpireCond::Lt => match current {
-                None => true,
-                Some(cur) => deadline_ms < cur.0 as i64,
-            },
+        // Apply the NX/XX/GT/LT condition. Redis (src/expire.c) evaluates the
+        // existence gate (NX/XX) and the ordering gate (GT/LT) INDEPENDENTLY: BOTH must
+        // pass. `current` is None for a key with no TTL, which GT/LT treat as +infinity.
+        // `LT XX` is the observably divergent legal pairing the old collapsed enum
+        // dropped the XX gate on; both gates are now required.
+        let existence_ok = (!cond.nx || current.is_none()) && (!cond.xx || current.is_some());
+        let ordering_ok = match current {
+            // No current TTL is +infinity: GT never applies, LT always does.
+            None => !cond.gt,
+            Some(cur) => {
+                // GT: new must be strictly greater; LT: strictly less. With neither
+                // flag the gate is open.
+                (!cond.gt || deadline_ms > cur.0 as i64) && (!cond.lt || deadline_ms < cur.0 as i64)
+            }
         };
-        if !allowed {
+        if !(existence_ok && ordering_ok) {
             return keep_int(0);
         }
 
         // A resolved deadline at or before `now` deletes the key and replies 1 (Redis
-        // deletes a key whose new expiry is already past). The Valkey boundary is
-        // `now > deadline`, so a deadline strictly LESS than now is past; a deadline
-        // EQUAL to now is still alive (it would expire one ms later), so it is SET, not
-        // deleted, to match the lazy-backstop boundary the store enforces.
-        if deadline_ms < now.0 as i64 {
+        // src/expire.c `checkAlreadyExpired`: `when <= now`). This COMMAND-TIME boundary
+        // is `<=`, distinct from the store's lazy-read backstop (`now > deadline`, alive
+        // at now==deadline): a deadline EQUAL to now is treated as already past HERE and
+        // the key is deleted immediately. Only a strictly-FUTURE deadline is set (and
+        // registered in the wheel below).
+        if deadline_ms <= now.0 as i64 {
             return RmwStep {
                 action: RmwAction::Delete,
                 expire: ExpireWrite::Unchanged,
@@ -204,8 +230,10 @@ fn expire_generic<S: Store>(
     });
 
     // Register the deadline in the wheel only when a SET (not a delete / no-op) fired.
-    // We know a SET fired iff the reply is 1 AND the deadline is not in the past.
-    if matches!(reply, Value::Integer(1)) && deadline_ms >= now.0 as i64 {
+    // A SET fired iff the reply is 1 AND the deadline is strictly in the FUTURE
+    // (`deadline_ms > now`): a deadline at or before now took the past-deadline delete
+    // branch above, so only a strictly-future deadline is a live registration.
+    if matches!(reply, Value::Integer(1)) && deadline_ms > now.0 as i64 {
         to_register = Some(UnixMillis(deadline_ms as u64));
     }
     if let Some(at) = to_register {
@@ -318,9 +346,13 @@ pub fn cmd_pttl<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
 }
 
 /// `EXPIRETIME key` -> the ABSOLUTE unix expiry in SECONDS, -2/-1 (Redis 7).
+///
+/// Redis rounds the absolute ms deadline to the NEAREST second (`(expire_ms + 500) /
+/// 1000`, src/expire.c `ttlGenericCommand` output_abs), so a deadline with an ms
+/// component >= 500 rounds UP. PEXPIRETIME stays exact ms.
 pub fn cmd_expiretime<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
     ttl_read(store, db, now, req, "expiretime", |at| {
-        (at.0 / 1_000) as i64
+        ((at.0 + 500) / 1_000) as i64
     })
 }
 
@@ -359,8 +391,14 @@ pub fn cmd_persist<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
 enum GetexTtl {
     /// No option: do NOT change the TTL (bare GETEX is a pure read, unlike SET).
     Unchanged,
-    /// EX/PX/EXAT/PXAT resolved to an absolute deadline.
+    /// EX/PX/EXAT/PXAT resolved to a STRICTLY-FUTURE absolute deadline.
     Set(UnixMillis),
+    /// EXAT/PXAT resolved to an absolute deadline already at or before `now`
+    /// (`deadline <= now`, the Redis `checkAlreadyExpired` command-time boundary): the
+    /// key is read (the value is returned) and then DELETED, like an EXPIREAT in the
+    /// past. Only the absolute forms reach this; a non-positive relative EX/PX is the
+    /// `invalid expire time` error instead.
+    SetPast,
     /// PERSIST: clear any TTL.
     Persist,
 }
@@ -399,13 +437,17 @@ pub fn cmd_getex<S: Store>(
         }
         RmwEntry::Occupied(o) => {
             let value = Value::BulkString(Some(Bytes::copy_from_slice(o.as_bytes())));
-            let expire = match ttl {
-                GetexTtl::Unchanged => ExpireWrite::Unchanged,
-                GetexTtl::Set(at) => ExpireWrite::Set(at),
-                GetexTtl::Persist => ExpireWrite::Clear,
+            // A past absolute deadline (EXAT/PXAT with `deadline <= now`) returns the
+            // value and DELETES the key (Redis checkAlreadyExpired command-time
+            // boundary); every other case keeps the key and adjusts the TTL.
+            let (action, expire) = match ttl {
+                GetexTtl::Unchanged => (RmwAction::Keep, ExpireWrite::Unchanged),
+                GetexTtl::Set(at) => (RmwAction::Keep, ExpireWrite::Set(at)),
+                GetexTtl::Persist => (RmwAction::Keep, ExpireWrite::Clear),
+                GetexTtl::SetPast => (RmwAction::Delete, ExpireWrite::Unchanged),
             };
             RmwStep {
-                action: RmwAction::Keep,
+                action,
                 expire,
                 reply: value,
             }
@@ -454,18 +496,28 @@ fn parse_getex_ttl(args: &[Bytes], now: UnixMillis) -> Result<GetexTtl, GetexPar
                 return Err(GetexParseError::Syntax);
             }
             let n = parse_i64(&args[1]).ok_or(GetexParseError::NotInteger)?;
-            let kind = match kw {
-                b"EX" => ExpireKind::Seconds,
-                b"PX" => ExpireKind::Millis,
-                b"EXAT" => ExpireKind::SecondsAt,
-                _ => ExpireKind::MillisAt,
+            let (kind, absolute) = match kw {
+                b"EX" => (ExpireKind::Seconds, false),
+                b"PX" => (ExpireKind::Millis, false),
+                b"EXAT" => (ExpireKind::SecondsAt, true),
+                _ => (ExpireKind::MillisAt, true),
             };
-            // GETEX rejects a non-positive / overflowing expire as invalid (it does
-            // NOT delete the key the way EXPIRE does; the option is rejected outright).
+            // A non-positive / overflowing RELATIVE expire (EX/PX) is invalid and the
+            // option is rejected outright (Redis does NOT delete the key for it). The
+            // ABSOLUTE forms (EXAT/PXAT) only reject a non-positive timestamp; an
+            // in-the-past-but-positive absolute deadline DELETES the key (handled below
+            // via SetPast, the checkAlreadyExpired command-time boundary).
             let abs =
                 resolve_expire_at(kind, n, now).map_err(|()| GetexParseError::InvalidExpire)?;
             if abs <= 0 {
                 return Err(GetexParseError::InvalidExpire);
+            }
+            // checkAlreadyExpired command-time boundary (`deadline <= now`): a resolved
+            // ABSOLUTE deadline at or before now expires the key on this command. EX/PX
+            // resolve against `now`, so a positive relative value is always strictly
+            // future and never hits this; only EXAT/PXAT can.
+            if absolute && abs <= now.0 as i64 {
+                return Ok(GetexTtl::SetPast);
             }
             Ok(GetexTtl::Set(UnixMillis(abs as u64)))
         }

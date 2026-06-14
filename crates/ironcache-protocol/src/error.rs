@@ -271,6 +271,37 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "DB index is out of range")
     }
 
+    /// `ERR NX and XX, GT or LT options at the same time are not compatible` - the
+    /// reply Redis emits (src/expire.c `parseExtendedExpireArgumentsOrReply`) when the
+    /// EXPIRE-family `NX` option is combined with any of `XX`/`GT`/`LT`. DISTINCT from
+    /// the generic syntax error so a client can tell apart the specific incompatibility.
+    #[must_use]
+    pub fn expire_nx_and_xx_gt_lt() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "NX and XX, GT or LT options at the same time are not compatible",
+        )
+    }
+
+    /// `ERR GT and LT options at the same time are not compatible` - the reply Redis
+    /// emits (src/expire.c `parseExtendedExpireArgumentsOrReply`) when the EXPIRE-family
+    /// `GT` and `LT` options are combined.
+    #[must_use]
+    pub fn expire_gt_and_lt() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "GT and LT options at the same time are not compatible",
+        )
+    }
+
+    /// `ERR Unsupported option <opt>` - the reply Redis emits (src/expire.c
+    /// `parseExtendedExpireArgumentsOrReply`) for an unrecognized EXPIRE-family option
+    /// token. The token is echoed verbatim (Redis prints the raw argument).
+    #[must_use]
+    pub fn expire_unsupported_option(opt: &str) -> Self {
+        ErrorReply::new(ErrorCode::Err, format!("Unsupported option {opt}"))
+    }
+
     /// `ERR increment or decrement would overflow` - the reply Redis emits (via
     /// `addReplyError(c,"increment or decrement would overflow")`, src/t_string.c
     /// `incrDecrCommand`) when an INCR/DECR/INCRBY/DECRBY would carry the i64 result
@@ -513,6 +544,26 @@ mod tests {
         assert_eq!(
             ErrorReply::invalid_expire_time("psetex").line(),
             "-ERR invalid expire time in 'psetex' command"
+        );
+    }
+
+    #[test]
+    fn expire_option_errors_are_byte_exact() {
+        // Verified against redis/redis: src/expire.c
+        // parseExtendedExpireArgumentsOrReply. The three EXPIRE-family option errors
+        // are distinct from the generic syntax error.
+        assert_eq!(
+            ErrorReply::expire_nx_and_xx_gt_lt().line(),
+            "-ERR NX and XX, GT or LT options at the same time are not compatible"
+        );
+        assert_eq!(
+            ErrorReply::expire_gt_and_lt().line(),
+            "-ERR GT and LT options at the same time are not compatible"
+        );
+        // The unknown-option token is echoed verbatim.
+        assert_eq!(
+            ErrorReply::expire_unsupported_option("BOGUS").line(),
+            "-ERR Unsupported option BOGUS"
         );
     }
 
