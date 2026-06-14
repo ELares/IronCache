@@ -171,3 +171,6 @@ Specs added as the M1 milestone progresses.
 - [AT_REST_ENCRYPTION.md](AT_REST_ENCRYPTION.md): opt-in envelope encryption (AEAD
   over segment/page/.meta records, DEK-wrapped-by-KEK/KMS, key rotation,
   off-hot-path, fail-closed) (#143).
+- [CLIENT_DRIVER_MATRIX.md](CLIENT_DRIVER_MATRIX.md): the real client-driver
+  compatibility matrix (run lettuce/jedis/redis-py/go-redis/ioredis/node-redis/
+  StackExchange.Redis own suites against IronCache, pinned versions) (#158).
