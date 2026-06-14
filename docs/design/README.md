@@ -74,3 +74,6 @@ Specs added as the M1 milestone progresses.
 - [DEFRAG.md](DEFRAG.md): online active defragmentation (native slab-sparsity
   query, copy-relocate through the owned per-core index, Redis-compatible throttle
   and thresholds, default off) (#43).
+- [PERF_REGRESSION_GATE.md](PERF_REGRESSION_GATE.md): the per-PR performance-
+  regression CI gate (micro/macro smoke vs merge-base, stored baselines,
+  noise-aware throughput-per-core and bytes-per-key ratchet) (#159).
