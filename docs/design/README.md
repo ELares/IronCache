@@ -127,3 +127,9 @@ Specs added as the M1 milestone progresses.
   OBJECT ENCODING name map and DEBUG OBJECT field synthesis (#40).
 - [HYPERLOGLOG.md](HYPERLOGLOG.md): the wire-compatible HyperLogLog (dense P=14 +
   sparse ZERO/XZERO/VAL, PFADD/PFCOUNT/PFMERGE, byte-exact DUMP/RESTORE) (#115).
+- [DIFFERENTIAL_TESTING.md](DIFFERENTIAL_TESTING.md): byte-exact RESP differential
+  replay vs pinned Valkey/Redis with leading-token error tiering (#97).
+- [PROPERTY_TESTING.md](PROPERTY_TESTING.md): proptest+bolero per-type property
+  tests with threshold-straddling generators and post-mutation encoding asserts (#98).
+- [JEPSEN_PLAN.md](JEPSEN_PLAN.md): Jepsen + Elle consistency test plan (fault
+  catalog, async-vs-quorum suites, partition-mid-migration) (#99).
