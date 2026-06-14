@@ -22,7 +22,7 @@ concrete metric/label/INFO-field registry with cardinality bounds.
   field names, so `redis_exporter` and existing parsers work unchanged (ADR-0009).
 - `SLOWLOG` keeps Redis's defaults (threshold 10000 us, 128 entries
   [redis-slowlog-defaults]) and reply shape. `LATENCY` monitoring is ON by default
-  in IronCache (#86) — a deliberate divergence from Redis, where the latency
+  in IronCache (#86), a deliberate divergence from Redis, where the latency
   monitor ships off [redis-latency-monitor-default-off]: better day-one
   observability is worth the small always-on cost, and the threshold stays
   configurable. The command surface and reply shapes still match Redis so existing
@@ -34,10 +34,10 @@ concrete metric/label/INFO-field registry with cardinality bounds.
   `redis_exporter` process [redis-no-builtin-prometheus], IronCache serves
   `/metrics` in-process. That native in-process metrics are viable in a cache is
   shown by Dragonfly, which exposes Prometheus metrics from the server process
-  itself [dragonfly-native-prometheus-6379-metrics] rather than via a sidecar — a
-  data point, not a layout IronCache copies. No exporter sidecar, no extra hop, no
-  lag; the single-binary thesis (#81) requires this. The exact transport — a
-  dedicated HTTP `--metrics-addr` vs serving `/metrics` on the existing RESP port —
+  itself [dragonfly-native-prometheus-6379-metrics] rather than via a sidecar (a
+  data point, not a layout IronCache copies). No exporter sidecar, no extra hop, no
+  lag; the single-binary thesis (#81) requires this. The exact transport (a
+  dedicated HTTP `--metrics-addr` vs serving `/metrics` on the existing RESP port)
   is an open #86 decision (see Open questions).
 
 ### Metric/label registry (#152)

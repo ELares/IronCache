@@ -1,9 +1,10 @@
 # Design: Reproducible benchmark and memory-model harness
 
 Issue: #8. Sub-task: #96 (Valkey baseline, head-to-head half). Decisions: ADR-0006
-(jemalloc accounting), ADR-0003 (determinism / seeded runs), ADR-0009 (compat, so
-the baseline runs matched configs). Related: #95 (the correctness counterpart),
-#41 (memory targets), #1 (vision claims).
+(jemalloc accounting), ADR-0016 (headline efficiency metrics: per-core throughput,
+memory-at-fixed-hit-ratio). Related: ADR-0003 (runtime determinism, reused here for
+seeded inputs), #95 (the correctness counterpart), #41 (memory targets), #1
+(vision claims).
 
 ## Goal and scope
 
@@ -40,10 +41,10 @@ of scope; correctness is #95.
 
 ### Memory model
 
-- Memory is accounted from allocator introspection — jemalloc `stats.allocated`
-  plus `malloc_usable_size` (ADR-0006) — not from a naive sum of logical value
-  sizes, because `maxmemory` accounting must capture allocator rounding
-  [redis-maxmemory-accounting]. The model decomposes each entry as header +
+- Memory is accounted from allocator introspection: jemalloc `stats.allocated`
+  (ADR-0006) plus `malloc_usable_size` for per-object rounding, not from a naive
+  sum of logical value sizes, because `maxmemory` accounting must capture allocator
+  rounding [redis-maxmemory-accounting]. The model decomposes each entry as header +
   container + allocator rounding and reports per-key, per-encoding bytes with
   competitor columns: Redis 8.x's redesigned kvobj header
   [redis-kvobj-header-redesign-8x], Valkey's up-to-8-byte embedded key
@@ -53,10 +54,11 @@ of scope; correctness is #95.
 ### Valkey head-to-head baseline (#96)
 
 - The same CI runner measures IronCache and a pinned Valkey side by side on
-  identical hardware under matched configs (ADR-0009), emitting QPS-per-core and
-  bytes-per-key in one machine-readable report. Valkey is the canonical baseline
-  because it is wire-identical to Redis 7.2 [valkey-resp-identical] and BSD-3
-  licensed [valkey-license-bsd3] (no SSPL/RSAL artifact is used). The same pinned
+  identical hardware under matched configs, emitting the headline metrics (ADR-0016)
+  QPS-per-core and bytes-per-key in one machine-readable report. Valkey is the
+  canonical baseline because the fork stays RESP-wire-compatible with Redis 7.2
+  [valkey-resp-identical] and is BSD-3 licensed [valkey-license-bsd3] (no SSPL/RSAL
+  artifact is used). The same pinned
   binary that is the differential oracle (#95) is the benchmark bar to beat, so
   "correct" and "the bar" are defined by one reference.
 
@@ -70,9 +72,9 @@ of scope; correctness is #95.
 
 ### Determinism
 
-- Workload generation (key stream, zipf draws, operation mix) is seeded through the
-  same controllable path as the runtime (ADR-0003), so a published run's input is
-  reproducible from its recorded seed, not just its flags.
+- Workload generation (key stream, zipf draws, operation mix) reuses the same
+  seeded-input discipline as the runtime (cf. ADR-0003), so a published run's input
+  is reproducible from its recorded seed, not just its flags.
 
 ## Open decisions
 
@@ -102,7 +104,7 @@ of scope; correctness is #95.
 
 ## References
 
-- ADR-0003, ADR-0006, ADR-0009; issues #96, #95, #41, #1; spec TESTING.md.
+- ADR-0003, ADR-0006, ADR-0016; issues #96, #95, #41, #1; spec TESTING.md.
 - Claims: [valkey-methodology-baremetal-pinning],
   [memtier-default-clients-threads-requests], [coordinated-omission-closed-loop],
   [redis-kvobj-header-redesign-8x], [valkey-embedded-key-8b],

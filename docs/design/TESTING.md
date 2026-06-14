@@ -31,11 +31,14 @@ in #99/#100).
 ### Conformance oracle: pinned Valkey
 
 - A pinned Valkey tag (the 9.x line [valkey-version-landscape-2026]) is the
-  conformance and differential oracle, run in CI. Valkey is BSD-3-Clause
-  [valkey-license-bsd3] and wire-identical to Redis 7.2 RESP2/RESP3
-  [valkey-resp-identical], so it is the license-safe reference we can run side by
-  side; relicensed Redis (SSPL/RSAL) is rejected as the oracle to keep the corpus
-  and any vendored fixtures free of non-OSI artifacts. The per-command suite
+  conformance and differential oracle, run in CI. The Valkey fork stays
+  RESP-wire-compatible with Redis 7.2 RESP2/RESP3 [valkey-resp-identical] and is
+  BSD-3-Clause [valkey-license-bsd3], so it is the license-safe reference we can run
+  side by side; relicensed Redis (SSPL/RSAL) is rejected as the oracle to keep the
+  corpus and any vendored fixtures free of non-OSI artifacts. Wire identity for the
+  specific pinned tag is not trusted blind: the differential suite itself re-verifies
+  it, so the pin can advance up the 9.x line without assuming forward identity. The
+  per-command suite
   adapts the Valkey TCL `assert_*` vocabulary; `assert_encoding` (which resolves to
   an `OBJECT ENCODING` match [valkey-assert-encoding-vocab]) maps to IronCache's
   own `OBJECT ENCODING` reporting, since internal encodings differ.
@@ -46,7 +49,8 @@ in #99/#100).
   dispatch table and the arity/reply-type validation so the parser, validator, and
   conformance suite cannot drift. The surface is ~240-246 core commands
   [redis-core-command-count]; the RESP type space is 15 markers
-  [resp-type-prefixes] with bulk strings capped at 512 MB [bulk-string-max-512mb].
+  [resp-type-prefixes] with bulk strings bounded by the tunable `proto-max-bulk-len`
+  (512 MB default) [bulk-string-max-512mb].
   Acceptance is that unmodified Redis clients (redis-cli, redis-py, ioredis) run
   green.
 
@@ -73,8 +77,9 @@ in #99/#100).
 
 ### Property tests and deterministic simulation (DST)
 
-- Property tests assert invariants that cross commands (round-trip encode/decode,
-  TTL monotonicity, type-transition legality) rather than single examples.
+- Property tests (#98) assert invariants that cross commands (round-trip
+  encode/decode, TTL monotonicity, type-transition legality) rather than single
+  examples.
 - DST is **built**, not bought: a Flow/VOPR-style simulator on the deterministic
   runtime, driving all time/network/disk/RNG through the Env seam (ADR-0003,
   RUNTIME.md) so any failure replays byte-identically from a single seed
@@ -113,8 +118,8 @@ in #99/#100).
 
 ## References
 
-- ADR-0003, ADR-0009; issues #96, #97, #15, #138, #8; specs PROTOCOL.md,
-  ERRORS.md, RUNTIME.md.
+- ADR-0003, ADR-0009; issues #96, #97, #98, #99, #100, #15, #138, #8, #1
+  (vision); specs PROTOCOL.md, ERRORS.md, RUNTIME.md.
 - Claims: [valkey-assert-encoding-vocab], [redis-core-command-count],
   [valkey-resp-identical], [valkey-version-landscape-2026], [resp-type-prefixes],
   [bulk-string-max-512mb], [dst-fdb-tigerbeetle-single-seed], [valkey-license-bsd3],
