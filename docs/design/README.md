@@ -77,6 +77,12 @@ Specs added as the M1 milestone progresses.
 - [PERF_REGRESSION_GATE.md](PERF_REGRESSION_GATE.md): the per-PR performance-
   regression CI gate (micro/macro smoke vs merge-base, stored baselines,
   noise-aware throughput-per-core and bytes-per-key ratchet) (#159).
+- [COMPRESSION.md](COMPRESSION.md): transparent value-compression framing
+  (codec/dict id, uncompressed length, incompressible flag), single-branch GET
+  decode, compressed-bytes maxmemory accounting, per-keyspace opt-in (#52).
+- [DICTIONARIES.md](DICTIONARIES.md): off-hot-path ZDICT per-prefix dictionary
+  training, monotonic fail-closed dict-version-id, atomic install + lazy
+  re-encode (#55).
 - [PERSISTENCE.md](PERSISTENCE.md): the persistence umbrella: three durability
   tiers with honest loss windows, durable_offset/fsync-lag, fail-closed, shared
   io_uring write path, hybrid-log + segment/manifest layout (#58).
