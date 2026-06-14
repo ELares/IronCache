@@ -26,17 +26,37 @@ pub struct Random {
     rng: SplitMix64,
     /// Whether victims are restricted to TTL-bearing keys (enforced by the store).
     volatile_only: bool,
+    /// The CONFIGURED `maxmemory-policy` name this policy echoes VERBATIM from
+    /// `policy_name()` (CONFIG GET / INFO). `new` defaults it to the family name
+    /// (`allkeys-random`/`volatile-random`, the only two names that map to Random);
+    /// `with_name` carries an explicit configured spelling.
+    name: String,
 }
 
 impl Random {
     /// A random policy seeded with `seed` (the binary derives it from its Env clock /
-    /// RNG, ADR-0003). `volatile_only` selects the `volatile-random` variant.
+    /// RNG, ADR-0003). `volatile_only` selects the `volatile-random` variant; the
+    /// configured policy name defaults to the family name.
     #[must_use]
     pub fn new(seed: u64, volatile_only: bool) -> Self {
+        let name = if volatile_only {
+            "volatile-random"
+        } else {
+            "allkeys-random"
+        };
+        Random::with_name(seed, volatile_only, name)
+    }
+
+    /// A random policy carrying the exact CONFIGURED policy name, returned verbatim by
+    /// [`EvictionPolicy::policy_name`] (CONFIG GET / INFO round-trip the configured
+    /// enum string).
+    #[must_use]
+    pub fn with_name(seed: u64, volatile_only: bool, name: &str) -> Self {
         Random {
             keys: Vec::new(),
             rng: SplitMix64::new(seed),
             volatile_only,
+            name: name.to_owned(),
         }
     }
 
@@ -83,12 +103,11 @@ impl EvictionHook for Random {
 }
 
 impl EvictionPolicy for Random {
-    fn policy_name(&self) -> &'static str {
-        if self.volatile_only {
-            "volatile-random"
-        } else {
-            "allkeys-random"
-        }
+    fn policy_name(&self) -> String {
+        // The CONFIGURED name, returned VERBATIM. Only `allkeys-random` /
+        // `volatile-random` map to this policy, so there is no engine divergence here;
+        // the name still round-trips unchanged for CONFIG GET / INFO.
+        self.name.clone()
     }
 
     fn evicts(&self) -> bool {

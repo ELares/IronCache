@@ -52,14 +52,15 @@ fn cache_mode_evicts_to_fit_under_budget() {
     let before = st.used_memory();
     assert!(before > 1_000, "expected the writes to exceed the budget");
 
-    // Evict to a 1000-byte budget: used_memory must drop strictly below it, and at
-    // least one entry must have been evicted.
+    // Evict to a 1000-byte budget: used_memory must drop to at or below it (strict
+    // `>` over-limit semantics: eviction frees down to `used <= budget`), and at least
+    // one entry must have been evicted.
     let budget = 1_000u64;
     let evicted = st.evict_to_fit(budget, UnixMillis(0));
     assert!(evicted > 0, "cache mode must evict to fit the budget");
     assert!(
-        st.used_memory() < budget,
-        "used_memory {} not below budget {budget}",
+        st.used_memory() <= budget,
+        "used_memory {} not within budget {budget}",
         st.used_memory()
     );
 }
@@ -158,7 +159,7 @@ fn random_policy_evicts_to_fit() {
     let budget = 500u64;
     let evicted = st.evict_to_fit(budget, UnixMillis(0));
     assert!(evicted > 0);
-    assert!(st.used_memory() < budget);
+    assert!(st.used_memory() <= budget);
 }
 
 #[test]
@@ -190,13 +191,34 @@ fn evict_to_fit_is_deterministic_on_replay() {
 
 #[test]
 fn policy_name_and_accessors_reflect_the_configured_policy() {
+    use ironcache_eviction::map_policy_name;
+
     assert_eq!(store_with(Policy::NoEviction).policy_name(), "noeviction");
+
+    // The CONFIGURED name round-trips VERBATIM through the store's Admit::policy_name,
+    // NOT the engine-family name: a server configured `allkeys-lfu` reports exactly
+    // `allkeys-lfu` (safe for INFO / CONFIG GET), even though the engine that serves
+    // it is FIFO-class (ADR-0009).
+    assert_eq!(
+        store_with(map_policy_name("allkeys-lfu", 1).unwrap()).policy_name(),
+        "allkeys-lfu"
+    );
+    assert_eq!(
+        store_with(map_policy_name("volatile-ttl", 1).unwrap()).policy_name(),
+        "volatile-ttl"
+    );
+    // The family default still round-trips its own spelling.
     assert_eq!(
         store_with(Policy::cache_default()).policy_name(),
         "allkeys-lru"
     );
-    let rnd = store_with(Policy::Random(ironcache_eviction::Random::new(1, false)));
+
+    let rnd = store_with(map_policy_name("allkeys-random", 1).unwrap());
     assert_eq!(rnd.policy_name(), "allkeys-random");
     assert!(rnd.policy_evicts());
     assert!(!rnd.policy_volatile_only());
+
+    // A volatile policy reports its configured name and the volatile posture.
+    let vol = store_with(map_policy_name("volatile-ttl", 1).unwrap());
+    assert!(vol.policy_volatile_only());
 }

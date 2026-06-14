@@ -14,11 +14,13 @@
 //! ## 2-bit frequency: policy-side counter (PR-3a)
 //!
 //! The frequency lives ON each queued entry ([`Entry::freq`]), bumped in
-//! [`EvictionHook::on_access`]. The crate docs explain why this is the
-//! policy-side counter rather than the kvobj `eviction_rank`: `select_victim` is
-//! policy-only and cannot borrow the kvobj header. The counter is bounded (one per
-//! queued key, dropped when the key leaves both queues) and capped at 3, so it is the
-//! 2-bit field S3-FIFO needs.
+//! [`EvictionHook::on_access`], and this is the SINGLE source of truth. The crate docs
+//! explain why it is the policy-side counter rather than the kvobj `eviction_rank`:
+//! `select_victim` is policy-only and cannot borrow the kvobj header. The kvobj
+//! `eviction_rank` field is RESERVED for a later single-source migration and is NOT
+//! written on the store's access path today. The counter is bounded (one per queued
+//! key, dropped when the key leaves both queues) and capped at 3, so it is the 2-bit
+//! field S3-FIFO needs.
 //!
 //! ## Byte-budget-driven, not count-driven
 //!
@@ -77,17 +79,53 @@ pub struct S3Fifo {
     /// Whether victims are restricted to TTL-bearing keys (the volatile-* family),
     /// enforced by the store in `evict_to_fit`.
     volatile_only: bool,
+    /// The CONFIGURED `maxmemory-policy` name this policy echoes VERBATIM from
+    /// `policy_name()` (CONFIG GET / INFO). `map_policy_name` plants the exact
+    /// configured spelling here (e.g. `allkeys-lfu`, `volatile-ttl`); `new` defaults
+    /// it to the family name. The ENGINE is always S3-FIFO ([`Self::engine_family`]);
+    /// the NAME round-trips unchanged (ADR-0009).
+    name: String,
 }
 
 impl S3Fifo {
-    /// A fresh S3-FIFO policy. `volatile_only` selects the `volatile-*` restriction.
+    /// A fresh S3-FIFO policy. `volatile_only` selects the `volatile-*` restriction;
+    /// the configured policy name defaults to the family name
+    /// (`allkeys-lru`/`volatile-lru`). Use [`Self::with_name`] (via `map_policy_name`)
+    /// to carry a specific configured spelling (e.g. `allkeys-lfu`, `volatile-ttl`).
     #[must_use]
     pub fn new(volatile_only: bool) -> Self {
+        let name = if volatile_only {
+            "volatile-lru"
+        } else {
+            "allkeys-lru"
+        };
+        S3Fifo::with_name(volatile_only, name)
+    }
+
+    /// A fresh S3-FIFO policy carrying the exact CONFIGURED policy name, returned
+    /// verbatim by [`EvictionPolicy::policy_name`]. `map_policy_name` uses this so
+    /// CONFIG GET / INFO round-trip the configured enum string (ADR-0009).
+    #[must_use]
+    pub fn with_name(volatile_only: bool, name: &str) -> Self {
         S3Fifo {
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
             volatile_only,
+            name: name.to_owned(),
+        }
+    }
+
+    /// The internal eviction ENGINE family label (always S3-FIFO here). This is the
+    /// engine identity, SEPARATE from the configured Redis name [`Self::policy_name`]
+    /// returns verbatim: the engine serves the configured name with a documented
+    /// victim-ordering divergence for the `*-lfu`/`volatile-ttl` spellings (ADR-0009).
+    #[must_use]
+    pub fn engine_family(&self) -> &'static str {
+        if self.volatile_only {
+            "volatile-lru"
+        } else {
+            "allkeys-lru"
         }
     }
 
@@ -218,6 +256,14 @@ impl EvictionHook for S3Fifo {
     }
 
     fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
+        // A returned victim has been pop_front'd OUT of its queue: the policy no longer
+        // tracks it. The store may then SKIP deleting it (a volatile-* policy skips a
+        // non-TTL victim, see `ShardStore::evict_to_fit`); in that case only a later
+        // write (`on_insert`) re-tracks the key. PR-3b's EXPIRE attaches a TTL without
+        // a write, so it MUST call back into the policy to re-register the key, or a
+        // volatile-* policy would under-evict. See the full invariant note in
+        // `ShardStore::evict_to_fit`'s volatile-only skip path (a 3b prerequisite).
+        //
         // Guaranteed progress: cap the total promotion/second-chance rounds so an
         // all-hot keyspace still yields a victim instead of spinning. The bound is
         // the current entry count plus a margin: after that many promotions every
@@ -287,16 +333,12 @@ impl EvictionHook for S3Fifo {
 }
 
 impl EvictionPolicy for S3Fifo {
-    fn policy_name(&self) -> &'static str {
-        // The volatile-* family echoes a recognized volatile name; the allkeys-*
-        // family echoes allkeys-lru (the typical cache default). The lfu/ttl callers
-        // accept this echo as a documented divergence (ADR-0009): the engine is
-        // FIFO-class, the NAME is honored.
-        if self.volatile_only {
-            "volatile-lru"
-        } else {
-            "allkeys-lru"
-        }
+    fn policy_name(&self) -> String {
+        // The CONFIGURED name, returned VERBATIM (e.g. allkeys-lfu, volatile-ttl).
+        // Redis round-trips the configured enum string unchanged for CONFIG GET/INFO;
+        // the engine that serves it is FIFO-class ([`Self::engine_family`]), a
+        // documented victim-ordering divergence (ADR-0009), but the NAME is honored.
+        self.name.clone()
     }
 
     fn evicts(&self) -> bool {
@@ -417,13 +459,28 @@ mod tests {
 
     #[test]
     fn volatile_flag_drives_name_and_posture() {
+        // `new` defaults the configured name to the family name.
         let all = S3Fifo::new(false);
         assert_eq!(all.policy_name(), "allkeys-lru");
+        assert_eq!(all.engine_family(), "allkeys-lru");
         assert!(!all.volatile_only());
         let vol = S3Fifo::new(true);
         assert_eq!(vol.policy_name(), "volatile-lru");
+        assert_eq!(vol.engine_family(), "volatile-lru");
         assert!(vol.volatile_only());
         assert!(vol.evicts());
+    }
+
+    #[test]
+    fn configured_name_round_trips_verbatim_over_the_engine_family() {
+        // The configured spelling is returned VERBATIM even when the engine family
+        // diverges (ADR-0009): the NAME is honored, the ENGINE is S3-FIFO.
+        let lfu = S3Fifo::with_name(false, "allkeys-lfu");
+        assert_eq!(lfu.policy_name(), "allkeys-lfu");
+        assert_eq!(lfu.engine_family(), "allkeys-lru");
+        let ttl = S3Fifo::with_name(true, "volatile-ttl");
+        assert_eq!(ttl.policy_name(), "volatile-ttl");
+        assert_eq!(ttl.engine_family(), "volatile-lru");
     }
 
     #[test]

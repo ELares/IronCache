@@ -245,24 +245,6 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         }
     }
 
-    /// Bump the S3-FIFO 2-bit frequency rank on an accessed object, saturating at
-    /// [`Header::MAX_EVICTION_RANK`] (3, ADR-0008 `s3fifo-freq-counter-2bit-cap3`).
-    ///
-    /// The 2-bit frequency LIVES on the kvobj header (the reserved `eviction_rank`
-    /// field): the store drives it on every read/rmw access, and the eviction policy
-    /// consults it through the store during evict-to-fit (see
-    /// [`Self::evict_to_fit`]). This keeps the single in-place metadata write on the
-    /// access path (EVICTION.md "on_access is a single in-place metadata write") and
-    /// avoids a parallel per-key frequency map in the policy. A no-op if the object
-    /// is absent (the caller guarantees liveness on the access path, so this is just
-    /// defensive).
-    fn bump_access_rank(obj: Option<&mut KvObj>) {
-        if let Some(obj) = obj {
-            obj.header.eviction_rank =
-                (obj.header.eviction_rank + 1).min(kvobj::Header::MAX_EVICTION_RANK);
-        }
-    }
-
     /// Build the rmw observation handle for an object (same int-materialization as
     /// [`Self::view_of`]). Returns the handle plus the int decimal `Bytes` keeper so
     /// the borrow stays valid for the closure.
@@ -292,11 +274,11 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         if !self.expire_if_due(db, db_idx, key, now) {
             return None;
         }
+        // The S3-FIFO 2-bit frequency is owned by the POLICY (per-key counter bumped
+        // in `on_access`); the kvobj `eviction_rank` header field is RESERVED for the
+        // eventual single-source migration (see the eviction crate docs) and is not
+        // written on the access path, since nothing reads it today.
         self.eviction.on_access(db, key);
-        // The entry is present and live (expire_if_due returned true). Bump the
-        // S3-FIFO 2-bit frequency rank on the object (ADR-0008): the policy reads
-        // this rank during evict-to-fit. See `bump_access_rank`.
-        Self::bump_access_rank(self.dbs[db_idx].get_mut(key));
         self.dbs[db_idx].get(key).map(Self::view_of)
     }
 
@@ -347,10 +329,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
 
         // Observe (atomically with the write that follows, on the owning core).
         let step = if live {
+            // The S3-FIFO 2-bit frequency is owned by the POLICY (bumped in
+            // `on_access`); the kvobj `eviction_rank` header field is RESERVED, not
+            // written here (nothing reads it). See the eviction crate docs.
             self.eviction.on_access(db, key);
-            // Bump the S3-FIFO 2-bit frequency rank on the observed object
-            // (ADR-0008), the same access-path bump as `read`.
-            Self::bump_access_rank(self.dbs[db_idx].get_mut(key));
             let obj = self.dbs[db_idx].get(key).expect("live entry present");
             let entry = RmwEntry::Occupied(Self::occupied_of(obj));
             f(entry)
@@ -434,15 +416,22 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
         self.eviction.volatile_only()
     }
 
-    /// The Redis-recognized `maxmemory-policy` name the configured policy echoes (for
-    /// INFO `maxmemory_policy` and CONFIG GET).
-    fn policy_name(&self) -> &'static str {
+    /// The CONFIGURED `maxmemory-policy` name the policy echoes VERBATIM (for INFO
+    /// `maxmemory_policy` and CONFIG GET); the exact configured spelling, not an
+    /// engine-family substitution (ADR-0009).
+    fn policy_name(&self) -> String {
         self.eviction.policy_name()
     }
 
-    /// Evict entries until `used_memory()` is strictly below `budget_bytes`, or until
-    /// the policy can free no more (or a per-call iteration cap is hit). Returns the
-    /// number of entries evicted (ADMISSION.md evict-to-fit; ADR-0007 cache mode).
+    /// Evict entries until `used_memory()` is at or below `budget_bytes` (`used <=
+    /// budget`), or until the policy can free no more (or a per-call iteration cap is
+    /// hit). Returns the number of entries evicted (ADMISSION.md evict-to-fit;
+    /// ADR-0007 cache mode).
+    ///
+    /// The loop condition is strict `>` to match Redis's getMaxmemoryState (evict.c):
+    /// memory is "under limit" at `used <= maxmemory`, so eviction frees down to
+    /// `used <= budget` (NOT strictly below it) and stops the instant the budget is
+    /// met exactly.
     ///
     /// The store drives the policy through the [`EvictionHook`] surface: each round
     /// asks [`EvictionHook::select_victim`] for a `(db, key)` and deletes it (which
@@ -471,7 +460,9 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
         // margin, so a volatile skip-scan over an all-non-TTL keyspace still ends.
         let max_rounds = self.len().saturating_mul(2).saturating_add(16);
         let mut rounds = 0usize;
-        while self.used_memory() >= budget_bytes {
+        // Strict `>`: free down to `used <= budget`, matching Redis getMaxmemoryState
+        // (under-limit at `used <= maxmemory`). At used==budget the loop does not run.
+        while self.used_memory() > budget_bytes {
             if rounds >= max_rounds {
                 break;
             }
@@ -503,6 +494,21 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
             if volatile_only && lacks_ttl {
                 // Only TTL-bearing keys are eligible. A non-TTL victim is dropped from
                 // the policy queue (so it is not re-offered) but NOT deleted.
+                //
+                // INVARIANT (volatile-* re-eligibility; a PR-3b PREREQUISITE).
+                // `select_victim` already pop_front'd this key from the policy's queue,
+                // and this on_remove makes that drop permanent: under a volatile-*
+                // policy the policy stops TRACKING a non-TTL key here, and ONLY a write
+                // (`on_insert`) re-tracks it. This is correct for PR-3a because EVERY
+                // 3a TTL is set at WRITE time (the upsert/rmw funnel re-inserts and so
+                // re-tracks the key with its new TTL). But PR-3b's EXPIRE attaches a
+                // TTL to an EXISTING key WITHOUT rewriting it, so EXPIRE MUST call back
+                // into the policy to re-register the key; otherwise a key dropped here
+                // while non-TTL would never become an eviction candidate again even
+                // after it gains a TTL, and a volatile-* policy would UNDER-EVICT
+                // (silently retain expirable keys it should be able to free). Tracked
+                // as a 3b prerequisite (see s3fifo::select_victim and the 3b EXPIRE
+                // task). NO behavior change in 3a.
                 self.eviction.on_remove(db, &key, 0);
                 continue;
             }

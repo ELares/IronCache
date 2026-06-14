@@ -15,19 +15,22 @@
 //!
 //! ## Where the 2-bit frequency lives (a documented PR-3a choice)
 //!
-//! EVICTION.md folds the S3-FIFO 2-bit frequency into the kvobj header
-//! (`eviction_rank`), and the store DOES bump that field on every read/rmw access.
-//! The eviction DECISION, however, runs entirely inside [`S3Fifo::select_victim`],
-//! which is a policy-only method (the store cannot reach into the policy's queues to
-//! make the promote-or-evict call). So for PR-3a the S3-FIFO policy keeps its OWN
-//! bounded 2-bit frequency counter, keyed by the queued key, bumped in
-//! [`EvictionHook::on_access`]. This is the "policy-side 2-bit counter map" the PR-3
-//! brief explicitly permits, chosen because `select_victim` has no borrow of the
-//! kvobj header. It is bounded: an entry exists only while the key is queued (small
-//! or main), and it is dropped when the key leaves both queues. The store-side
-//! `eviction_rank` bump is kept (it is the eventual single-source-of-truth once the
-//! decision path can read it across the boundary, a #8/3c follow-up) and is harmless
-//! today. The two never disagree on direction (both count accesses up to 3).
+//! The POLICY owns the S3-FIFO 2-bit frequency for now: it keeps its OWN bounded
+//! 2-bit counter, keyed by the queued key and bumped in [`EvictionHook::on_access`]
+//! ([`S3Fifo::select_victim`] reads THAT counter to make the promote-or-evict call).
+//! This is the SINGLE source of truth. The reason it is policy-side and not the kvobj
+//! header is that `select_victim` is a policy-only method and cannot reach into the
+//! store to borrow the kvobj header, so the decision path has no view of a
+//! store-side rank. The policy counter is bounded: an entry exists only while the key
+//! is queued (small or main), and it is dropped when the key leaves both queues.
+//!
+//! EVICTION.md ultimately folds this frequency into the kvobj header
+//! (`eviction_rank`, a 2-bit field). That header field is RESERVED for the eventual
+//! single-source migration (when `select_victim` can read the rank ACROSS the storage
+//! boundary, a later PR), but PR-3a does NOT write it on the access path: a parallel
+//! store-side bump that nothing reads is dead weight on the hot path, so there is
+//! ONE counter (the policy's) until the cross-boundary read lands. See the
+//! `Header::eviction_rank` field doc in `ironcache-store`.
 //!
 //! ## Volatile-only victim restriction
 //!
@@ -62,15 +65,21 @@ use ironcache_storage::EvictionHook;
 /// storage hook [`EvictionHook`] (the per-access/insert/remove callbacks and victim
 /// selection) with the policy's IDENTITY and POSTURE:
 ///
-/// - [`Self::policy_name`] - the Redis-recognized `maxmemory-policy` name this policy
-///   echoes from `CONFIG GET`/INFO (one of the eight Redis names).
+/// - [`Self::policy_name`] - the CONFIGURED `maxmemory-policy` name this policy echoes
+///   VERBATIM from `CONFIG GET`/INFO (the exact configured enum string, ADR-0009).
 /// - [`Self::evicts`] - whether this policy ever frees memory (false only for
 ///   `NoEviction`); the dispatch layer uses it to choose evict-to-fit vs reply `-OOM`.
 /// - [`Self::volatile_only`] - whether victims are restricted to TTL-bearing keys
 ///   (the `volatile-*` family); the store enforces it in `evict_to_fit`.
 pub trait EvictionPolicy: EvictionHook {
-    /// The Redis-recognized `maxmemory-policy` name (echoed by CONFIG GET/INFO).
-    fn policy_name(&self) -> &'static str;
+    /// The CONFIGURED `maxmemory-policy` name, returned VERBATIM (echoed by CONFIG
+    /// GET / INFO). Redis round-trips the configured enum string unchanged (e.g. a
+    /// server configured `allkeys-lfu` or `volatile-ttl` echoes exactly that, NOT a
+    /// substituted engine-family name), so this returns the exact name the policy was
+    /// built from. The engine that SERVES the name may diverge from Redis's (the
+    /// FIFO-class engine serves `*-lfu`/`volatile-ttl`, ADR-0009); the NAME is still
+    /// honored verbatim, which keeps INFO `maxmemory_policy` and CONFIG GET safe.
+    fn policy_name(&self) -> String;
     /// Whether this policy frees memory at the ceiling (false only for NoEviction).
     fn evicts(&self) -> bool;
     /// Whether victims are restricted to keys carrying a TTL (the volatile-* family).
@@ -147,9 +156,11 @@ impl EvictionHook for Policy {
 }
 
 impl EvictionPolicy for Policy {
-    fn policy_name(&self) -> &'static str {
+    fn policy_name(&self) -> String {
         match self {
-            Policy::NoEviction => "noeviction",
+            // `noeviction` has exactly one configured spelling, so the unit variant
+            // carries no string; the other two echo their configured name verbatim.
+            Policy::NoEviction => "noeviction".to_owned(),
             Policy::S3Fifo(p) => p.policy_name(),
             Policy::Random(p) => p.policy_name(),
         }
@@ -198,27 +209,35 @@ pub fn is_valid_policy_name(name: &str) -> bool {
 /// `Random` policy seeded from `rng_seed` (the binary derives this from its `Env`,
 /// ADR-0003). Returns `None` for an unrecognized name (config validation rejects it).
 ///
+/// The constructed policy carries the configured name VERBATIM (the lowercased
+/// spelling): [`EvictionPolicy::policy_name`] returns it unchanged for CONFIG GET /
+/// INFO, so `allkeys-lfu` and `volatile-ttl` round-trip exactly even though the
+/// engine that SERVES them is FIFO-class (a documented victim-ordering divergence,
+/// ADR-0009; see [`S3Fifo::engine_family`] for the engine label).
+///
 /// Mapping (EVICTION.md / ADR-0009):
 /// - `noeviction` -> [`Policy::NoEviction`] (strict datastore mode).
 /// - `allkeys-lru` / `allkeys-lfu` -> S3-FIFO over all keys. The `*-lfu` name is
-///   SERVED by the FIFO-class engine: the name is accepted and echoed, but the
-///   victim ordering is S3-FIFO's, not Redis's sampled LFU (a documented
+///   SERVED by the FIFO-class engine: the name is accepted and ECHOED VERBATIM, but
+///   the victim ordering is S3-FIFO's, not Redis's sampled LFU (a documented
 ///   default-behavior divergence, ADR-0009).
 /// - `allkeys-random` -> [`Policy::Random`] over all keys.
 /// - `volatile-lru` / `volatile-lfu` / `volatile-ttl` -> S3-FIFO restricted to
-///   TTL-bearing keys. `volatile-ttl` nearest-expiry-first ordering lands with the
-///   timing wheel in 3b; for 3a it maps to S3-FIFO `volatile_only` with that
-///   documented note (ADR-0009).
+///   TTL-bearing keys, each echoing its own configured name verbatim. `volatile-ttl`
+///   nearest-expiry-first ordering lands with the timing wheel in 3b; for 3a it maps
+///   to S3-FIFO `volatile_only` with that documented note (ADR-0009).
 /// - `volatile-random` -> [`Policy::Random`] restricted to TTL-bearing keys.
 #[must_use]
 pub fn map_policy_name(name: &str, rng_seed: u64) -> Option<Policy> {
     let lower = name.to_ascii_lowercase();
     let policy = match lower.as_str() {
         "noeviction" => Policy::NoEviction,
-        "allkeys-lru" | "allkeys-lfu" => Policy::S3Fifo(S3Fifo::new(false)),
-        "allkeys-random" => Policy::Random(Random::new(rng_seed, false)),
-        "volatile-lru" | "volatile-lfu" | "volatile-ttl" => Policy::S3Fifo(S3Fifo::new(true)),
-        "volatile-random" => Policy::Random(Random::new(rng_seed, true)),
+        "allkeys-lru" | "allkeys-lfu" => Policy::S3Fifo(S3Fifo::with_name(false, &lower)),
+        "allkeys-random" => Policy::Random(Random::with_name(rng_seed, false, &lower)),
+        "volatile-lru" | "volatile-lfu" | "volatile-ttl" => {
+            Policy::S3Fifo(S3Fifo::with_name(true, &lower))
+        }
+        "volatile-random" => Policy::Random(Random::with_name(rng_seed, true, &lower)),
         _ => return None,
     };
     Some(policy)
@@ -250,21 +269,33 @@ mod tests {
     #[test]
     fn mapping_covers_all_eight_with_correct_posture() {
         let cases: &[(&str, &str, bool, bool)] = &[
-            // name, policy_name echoed, evicts, volatile_only
+            // name, policy_name echoed VERBATIM, evicts, volatile_only
             ("noeviction", "noeviction", false, false),
             ("allkeys-lru", "allkeys-lru", true, false),
-            ("allkeys-lfu", "allkeys-lru", true, false),
+            ("allkeys-lfu", "allkeys-lfu", true, false),
             ("allkeys-random", "allkeys-random", true, false),
             ("volatile-lru", "volatile-lru", true, true),
-            ("volatile-lfu", "volatile-lru", true, true),
+            ("volatile-lfu", "volatile-lfu", true, true),
             ("volatile-random", "volatile-random", true, true),
-            ("volatile-ttl", "volatile-lru", true, true),
+            ("volatile-ttl", "volatile-ttl", true, true),
         ];
-        for (name, _echo, evicts, vol) in cases {
+        for (name, echo, evicts, vol) in cases {
             let p = map_policy_name(name, 1).unwrap_or_else(|| panic!("{name} should map"));
+            // The configured name round-trips VERBATIM (no engine-family substitution).
+            assert_eq!(
+                p.policy_name(),
+                *echo,
+                "{name} policy_name() must be verbatim"
+            );
             assert_eq!(p.evicts(), *evicts, "{name} evicts()");
             assert_eq!(p.volatile_only(), *vol, "{name} volatile_only()");
         }
+        // A configured name is echoed in its lowercased canonical spelling regardless
+        // of input case (Redis accepts any case; CONFIG GET reports the enum string).
+        assert_eq!(
+            map_policy_name("AllKeys-LFU", 1).unwrap().policy_name(),
+            "allkeys-lfu"
+        );
         // An unknown name maps to None.
         assert!(map_policy_name("bogus", 1).is_none());
     }
@@ -275,11 +306,13 @@ mod tests {
         // round-trips a recognized value), even where the engine diverges (lfu/ttl).
         for name in REDIS_POLICY_NAMES {
             let p = map_policy_name(name, 7).unwrap();
+            let echoed = p.policy_name();
             assert!(
-                is_valid_policy_name(p.policy_name()),
-                "{name} echoed non-Redis name {}",
-                p.policy_name()
+                is_valid_policy_name(&echoed),
+                "{name} echoed non-Redis name {echoed}"
             );
+            // And it is the configured name verbatim (round-trip).
+            assert_eq!(echoed, name, "{name} must echo verbatim");
         }
     }
 
@@ -290,7 +323,7 @@ mod tests {
         let p = Policy::cache_default();
         assert!(p.evicts());
         assert!(!p.volatile_only());
-        assert!(is_valid_policy_name(p.policy_name()));
+        assert!(is_valid_policy_name(&p.policy_name()));
         assert_ne!(p.policy_name(), "noeviction");
     }
 }

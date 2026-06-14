@@ -664,8 +664,11 @@ pub trait Admit {
     /// `volatile-*` family). For INFO / introspection.
     fn policy_volatile_only(&self) -> bool;
 
-    /// The Redis-recognized `maxmemory-policy` name the policy echoes (INFO / CONFIG).
-    fn policy_name(&self) -> &'static str;
+    /// The CONFIGURED `maxmemory-policy` name the policy echoes VERBATIM (INFO /
+    /// CONFIG GET). Redis round-trips the configured enum string unchanged (e.g.
+    /// `allkeys-lfu`, `volatile-ttl`), NOT a substituted engine-family name, so this
+    /// returns the exact configured spelling and is safe for INFO and CONFIG GET.
+    fn policy_name(&self) -> String;
 
     /// Evict entries until `used_memory()` is below `budget_bytes`, or until the
     /// policy can free no more. Returns the number of entries evicted (the caller
