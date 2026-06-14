@@ -23,28 +23,31 @@ selector ACL engine and `aclfile` (#106), and the TLS transport (#105).
 
 - The default user ships in the Redis-compatible shape `user default on nopass
   ~* &* +@all` [acl-default-user], so an unconfigured IronCache accepts commands
-  with no auth (the cache-mode posture, ADR-0007) and `ACL GETUSER default`
-  reports the expected fields. Passwords are stored and reported as SHA-256
-  [acl-default-user], not a stronger KDF: SHA-256 is the contract `ACL GETUSER`
-  output and existing tooling expect, and diverging would break compatible output
-  (Compatible outranks any marginal hardening here; the threat model #142 records
-  the accepted risk).
+  with no auth, matching Redis's documented default-user (behavioral equivalence,
+  ADR-0009). `ACL GETUSER default` must report the field set a Redis client
+  expects; that field-by-field output is a design requirement verified
+  differentially against the oracle, not asserted here. Passwords are stored as
+  SHA-256 [acl-default-user]; IronCache keeps SHA-256 rather than a stronger KDF
+  as a deliberate behavioral-equivalence choice (ADR-0009) so the stored form
+  matches Redis, with the accepted risk recorded in the threat model (#142).
 
 ### requirepass maps onto the default user
 
-- Legacy `requirepass <pass>` sets the default user's password and flips it from
-  `nopass` to password-required [acl-default-user]; it is not a separate parallel
-  code path. This resolves the #22 open decision: `requirepass`, `AUTH default
-  <pass>`, and `ACL SETUSER default >pass` all converge on the same default-user
-  credential, so the three configuration routes cannot disagree about the
-  effective password.
+- Legacy `requirepass <pass>` sets the default user's password [acl-default-user],
+  flipping it from `nopass` to password-required, rather than living as a separate
+  parallel code path. The #22 open decision is resolved by this design:
+  `requirepass`, `AUTH default <pass>`, and `ACL SETUSER default >pass` all
+  converge on the same default-user credential, so the three configuration routes
+  cannot disagree about the effective password.
 
 ### Handshake surface: HELLO AUTH and AUTH
 
 - `AUTH <pass>` (one-arg, legacy) authenticates as the default user; `AUTH <user>
   <pass>` authenticates as a named user; `HELLO <ver> AUTH <user> <pass>` does the
-  same inline during protocol negotiation, which is how RESP3-default clients
-  (redis-py 8, node-redis 6 [client-default-resp3-redis8]) carry credentials.
+  same inline during protocol negotiation. Modern clients default to RESP3 and so
+  open with `HELLO 3` (redis-py 8, node-redis 6 [client-default-resp3-redis8]);
+  carrying credentials inline on that `HELLO` is the general handshake behavior
+  IronCache must accept.
   AUTH and the AUTH arguments to HELLO run inside the Tier 0 handshake
   (PROTOCOL.md) and gate the connection before any data command is dispatched.
 - Authentication state is a per-connection flag resolved at handshake time and
@@ -79,16 +82,17 @@ selector ACL engine and `aclfile` (#106), and the TLS transport (#105).
 - `HELLO 3 AUTH default <pass>`, `AUTH <pass>`, `AUTH <user> <pass>`, and
   `requirepass` all authenticate unmodified redis-cli/redis-py/ioredis clients.
 - Bad credentials return `-NOAUTH`/`-WRONGPASS` and an unsupported HELLO version
-  returns `-NOPROTO`, byte-matching the pinned oracle [hello-noproto-error].
-- Passwords are stored and reported as SHA-256; `requirepass`, `AUTH default`, and
-  `ACL SETUSER default >pass` converge on the same effective credential
-  [acl-default-user].
+  returns `-NOPROTO`; these prefixes are in ERRORS.md's full-text-pinned set, so
+  the wording matches verbatim [hello-noproto-error], not just the leading token.
+- Passwords are stored as SHA-256 [acl-default-user]; `ACL GETUSER default` output
+  matches the oracle differentially; `requirepass`, `AUTH default`, and `ACL
+  SETUSER default >pass` converge on the same effective credential.
 - A single-key GET/SET on an authenticated connection takes one branch for the
   auth check and no shared lookup (the hot-path lint, ADR-0002).
 
 ## References
 
-- ADR-0002, ADR-0007, ADR-0009; issues #22, #15, #18, #105, #106, #142, #97, #1;
+- ADR-0002, ADR-0009; issues #22, #15, #18, #105, #106, #142, #97, #1;
   specs PROTOCOL.md, ERRORS.md, TESTING.md.
 - Claims: [acl-default-user], [hello-noproto-error], [client-default-resp3-redis8],
   [valkey-license-bsd3], [valkey-resp-identical].

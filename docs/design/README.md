@@ -48,4 +48,4 @@ Claim citations in these docs are validated in CI by
 Specs added as the M1 milestone progresses.
 
 - [AUTH.md](AUTH.md): the AUTH handshake and credential model (HELLO AUTH, AUTH,
-  requirepass, SHA-256 default user) (#104).
+  requirepass, SHA-256 password storage, default user) (#104).
