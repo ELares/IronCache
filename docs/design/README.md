@@ -156,3 +156,7 @@ Specs added as the M1 milestone progresses.
   reproducibility, curl|sh installer, Homebrew, distroless image, hardened systemd
   unit, per-release SHA256 attestation, Windows non-goal); scaffolds in
   [packaging/](../../packaging/) (#121, #122, #123, #125).
+- [WARM_RESTART.md](WARM_RESTART.md): mmap warm restart (SIGUSR1 drain, .meta
+  sidecar, relative-offset pointer fixup, O(n) index regen, tmpfs/DAX) (#62).
+- [DISK_IO.md](DISK_IO.md): the io_uring snapshot/tiering disk write path (disk_io
+  trait, SQPOLL off-by-default, shared registered buffers, bounded I/O cores) (#67).
