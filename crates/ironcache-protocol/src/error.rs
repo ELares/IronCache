@@ -244,6 +244,14 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "value is not an integer or out of range")
     }
 
+    /// `ERR syntax error` - the canonical reply for malformed/conflicting command
+    /// options (e.g. `SET k v NX XX`, `SET k v EX 1 PX 1`, an unknown SET flag).
+    /// Byte-exact to Redis `addReplyError(c, "syntax error")`.
+    #[must_use]
+    pub fn syntax_error() -> Self {
+        ErrorReply::new(ErrorCode::Err, "syntax error")
+    }
+
     /// `ERR DB index is out of range`.
     #[must_use]
     pub fn select_out_of_range() -> Self {
@@ -403,5 +411,10 @@ mod tests {
             ErrorReply::protocol("invalid multibulk length").line(),
             "-ERR Protocol error: invalid multibulk length"
         );
+    }
+
+    #[test]
+    fn syntax_error_is_byte_exact() {
+        assert_eq!(ErrorReply::syntax_error().line(), "-ERR syntax error");
     }
 }

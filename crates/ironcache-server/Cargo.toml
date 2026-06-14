@@ -18,8 +18,16 @@ ironcache-env = { workspace = true }
 ironcache-protocol = { workspace = true }
 ironcache-observe = { workspace = true }
 ironcache-config = { workspace = true }
+# The storage WAIST only (not ironcache-store): the command layer names the four
+# primitives + the hook types, never the concrete map. This dependency edge is the
+# compile-time proof of the layering contract (STORAGE_API.md).
+ironcache-storage = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
+# The concrete store is a TEST-ONLY dependency here: the dispatch tests and the
+# end-to-end harness need a real Store to drive the generic dispatch, but the
+# library code depends only on the waist (above).
+ironcache-store = { workspace = true }
 ironcache-runtime = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }

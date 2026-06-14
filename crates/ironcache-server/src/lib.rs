@@ -13,6 +13,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cmd_keyspace;
+pub mod cmd_string;
+pub mod cmd_util;
 pub mod conn;
 pub mod dispatch;
 
@@ -22,3 +25,8 @@ pub use dispatch::{RollupFn, ServerContext, dispatch};
 // Re-export the protocol types callers need so the binary depends on one crate
 // for the server surface.
 pub use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, Request, Value, decode, encode};
+
+// Re-export the storage WAIST types the binary needs to construct/pass a store and
+// the `now` basis. The binary depends on ironcache-storage transitively through
+// here for the trait, and on ironcache-store directly for the concrete impl.
+pub use ironcache_storage::{Store, UnixMillis};

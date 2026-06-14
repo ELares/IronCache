@@ -10,12 +10,15 @@
 //! and writes the encoded reply.
 
 use ironcache_config::Config;
-use ironcache_env::SystemEnv;
+use ironcache_env::{Clock, SystemEnv};
 use ironcache_observe::{CounterSnapshot, ServerInfo, ShardCounters};
 use ironcache_runtime::bootstrap::{ShardConfig, ShardId, ShardSet};
 use ironcache_runtime::{Runtime, TokioRuntime};
 use ironcache_server::dispatch::ServerContext;
-use ironcache_server::{ConnState, DecodeOutcome, Limits, ProtoVersion, Request, decode, dispatch};
+use ironcache_server::{
+    ConnState, DecodeOutcome, Limits, ProtoVersion, Request, UnixMillis, decode, dispatch,
+};
+use ironcache_store::ShardStore;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -87,6 +90,11 @@ thread_local! {
     // The shard's core-local state. Created lazily on first use on each shard
     // thread; never shared across threads.
     static SHARD: RefCell<Option<Rc<RefCell<ShardState>>>> = const { RefCell::new(None) };
+    // The shard's per-shard store: the per-DB hashbrown kvobj map (ADR-0005). Held
+    // as Rc<RefCell<..>> exactly like ENV, so it is core-local and unsynchronized;
+    // created lazily per shard thread. The concrete ShardStore implements the
+    // ironcache-storage::Store waist the generic dispatch runs against.
+    static STORE: RefCell<Option<Rc<RefCell<ShardStore>>>> = const { RefCell::new(None) };
     // One SystemEnv per shard thread (the sanctioned real-time boundary). It is
     // wrapped in a RefCell so the determinism seam's RNG half is REACHABLE: the
     // shard is single-threaded (current-thread runtime, !Send tasks), so clock
@@ -106,6 +114,16 @@ fn shard_state() -> Rc<RefCell<ShardState>> {
                 next_client_id: 1,
                 counters: ShardCounters::new(),
             })));
+        }
+        Rc::clone(b.as_ref().unwrap())
+    })
+}
+
+fn shard_store(databases: u32) -> Rc<RefCell<ShardStore>> {
+    STORE.with(|cell| {
+        let mut b = cell.borrow_mut();
+        if b.is_none() {
+            *b = Some(Rc::new(RefCell::new(ShardStore::new(databases))));
         }
         Rc::clone(b.as_ref().unwrap())
     })
@@ -140,6 +158,7 @@ async fn serve_connection(
 ) {
     let env = shard_env();
     let state_rc = shard_state();
+    let store_rc = shard_store(ctx.databases);
     // Correct the context's started_at to this shard's boot instant.
     ctx.info.started_at = shard_started_at();
 
@@ -173,8 +192,9 @@ async fn serve_connection(
         loop {
             match decode(&read_buf, &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
-                    let close =
-                        handle_request(&ctx, &mut conn, &env, &state_rc, &request, &mut out);
+                    let close = handle_request(
+                        &ctx, &mut conn, &env, &store_rc, &state_rc, &request, &mut out,
+                    );
                     read_buf.drain(..consumed);
                     if close {
                         // Flush the QUIT reply then close. send returns the owned
@@ -218,13 +238,16 @@ async fn serve_connection(
 /// Dispatch one request and append its encoded reply to `out`. Returns whether
 /// the connection should close after flushing (QUIT).
 ///
-/// `env` is the shard's owned-mutable env handle. Clock reads (the only Env need
-/// in PR-1) go through `.borrow()`; the RNG half (`env.borrow_mut().rng()`) is
-/// reachable through this same handle for PR-2/PR-3 hot paths.
+/// `env` is the shard's owned-mutable env handle; `store_rc` is the shard's store.
+/// The absolute `now` deadline basis is computed ONCE here from the Env wall clock
+/// (ADR-0003: the store reads no clock) and passed into dispatch wrapped in
+/// [`UnixMillis`]; the data commands convert relative EX/PX against it. Clock reads
+/// go through `env.borrow()`; the store is mutated through `store_rc.borrow_mut()`.
 fn handle_request(
     ctx: &ServerContext,
     conn: &mut ConnState,
     env: &Rc<RefCell<SystemEnv>>,
+    store_rc: &Rc<RefCell<ShardStore>>,
     state_rc: &Rc<RefCell<ShardState>>,
     request: &Request,
     out: &mut Vec<u8>,
@@ -232,7 +255,12 @@ fn handle_request(
     state_rc.borrow_mut().counters.on_command();
     let snapshot_fn = || state_rc.borrow().counters.snapshot();
     let rollup: &dyn Fn() -> CounterSnapshot = &snapshot_fn;
-    let reply = dispatch(ctx, conn, &*env.borrow(), rollup, request);
+    // Compute `now` once per command from the shard's wall clock, then run dispatch
+    // against the per-shard store. The env borrow ends before the store borrow so
+    // the two RefCell borrows never overlap.
+    let now = UnixMillis(env.borrow().now_unix_millis());
+    let mut store = store_rc.borrow_mut();
+    let reply = dispatch(ctx, conn, &*env.borrow(), &mut *store, now, rollup, request);
     encode_into(out, &reply, conn.proto);
     conn.should_close
 }
