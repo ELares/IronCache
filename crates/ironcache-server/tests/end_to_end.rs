@@ -7,13 +7,19 @@
 //! socket, which is the integration coverage the PR-1 gate asks for.
 
 use ironcache_env::{Clock, SystemEnv};
-use ironcache_observe::{CounterSnapshot, ServerInfo};
+use ironcache_observe::{CounterSnapshot, MemoryInfo, ServerInfo};
 use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, decode, encode_to_vec};
 use ironcache_runtime::tokio_rt::bind_reuseport;
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{ConnState, UnixMillis, dispatch};
-use ironcache_store::ShardStore;
+use ironcache_store::{ShardStore, process_memory};
 use std::cell::RefCell;
+
+// jemalloc as this test binary's global allocator so the INFO used_memory figure
+// (process-global stats.allocated) is live, mirroring the server binary.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
     ServerContext {
@@ -55,7 +61,21 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
                 DecodeOutcome::Complete { request, consumed } => {
                     let rollup = || *counters.borrow();
                     let now = UnixMillis(env.now_unix_millis());
-                    let reply = dispatch(&ctx, &mut conn, &env, &mut store, now, &rollup, &request);
+                    // Read the process-global allocator figures for INFO (ADR-0006),
+                    // mirroring the server binary's once-per-INFO single-snapshot read
+                    // (one epoch advance -> allocated + resident from the same snapshot).
+                    let mem = if request.command().eq_ignore_ascii_case(b"INFO") {
+                        let (used_memory, used_memory_rss) = process_memory();
+                        MemoryInfo {
+                            used_memory,
+                            used_memory_rss,
+                        }
+                    } else {
+                        MemoryInfo::default()
+                    };
+                    let reply = dispatch(
+                        &ctx, &mut conn, &env, &mut store, now, &rollup, mem, &request,
+                    );
                     let bytes = encode_to_vec(&reply, conn.proto);
                     if stream.write_all(&bytes).await.is_err() {
                         return;
@@ -246,6 +266,117 @@ fn data_commands_over_real_socket() {
             .await
             .unwrap();
         expect_reply(&mut client, b":1\r\n").await;
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
+#[test]
+fn numeric_append_and_info_over_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // SET n 10 ; INCR n -> :11 ; INCRBY n 5 -> :16 ; DECR n -> :15.
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nn\r\n$2\r\n10\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":11\r\n").await;
+        client
+            .write_all(b"*3\r\n$6\r\nINCRBY\r\n$1\r\nn\r\n$1\r\n5\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":16\r\n").await;
+        client
+            .write_all(b"*2\r\n$4\r\nDECR\r\n$1\r\nn\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":15\r\n").await;
+
+        // APPEND s abc -> :3 ; APPEND s de -> :5 ; GET s -> $5 abcde.
+        client
+            .write_all(b"*3\r\n$6\r\nAPPEND\r\n$1\r\ns\r\n$3\r\nabc\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+        client
+            .write_all(b"*3\r\n$6\r\nAPPEND\r\n$1\r\ns\r\n$2\r\nde\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":5\r\n").await;
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$5\r\nabcde\r\n").await;
+
+        // INCRBYFLOAT f 10.5 -> $4 10.5 (a bulk string in both RESP2 and RESP3).
+        client
+            .write_all(b"*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\nf\r\n$4\r\n10.5\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$4\r\n10.5\r\n").await;
+
+        // INFO memory: used_memory must be > 0 (the process-global jemalloc figure).
+        client
+            .write_all(b"*2\r\n$4\r\nINFO\r\n$6\r\nmemory\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let n = client.read(&mut buf).await.unwrap();
+        let body = String::from_utf8_lossy(&buf[..n]);
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("used_memory:"))
+            .expect("INFO memory has a used_memory line");
+        let val: u64 = line
+            .trim_start_matches("used_memory:")
+            .trim()
+            .parse()
+            .expect("used_memory is an integer");
+        assert!(
+            val > 0,
+            "INFO used_memory should be > 0, got {val} ({body})"
+        );
+
+        // RESP3 leg: switch the connection to RESP3 (HELLO 3 -> a map, '%'), then
+        // INCRBYFLOAT must STILL reply with a bulk string ($<len>\r\n<digits>\r\n),
+        // NOT a RESP3 `,double` (ADR-0019: INCRBYFLOAT is bulk in both protocols).
+        client
+            .write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+            .await
+            .unwrap();
+        let mut hbuf = [0u8; 256];
+        let hn = client.read(&mut hbuf).await.unwrap();
+        assert_eq!(hbuf[0], b'%', "expected RESP3 map, got {:?}", &hbuf[..hn]);
+        // INCRBYFLOAT g 3.25 on an absent key -> "3.25" (non-integer, so it keeps a
+        // dot and is unambiguously a bulk string, not a `,double`).
+        client
+            .write_all(b"*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\ng\r\n$4\r\n3.25\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$4\r\n3.25\r\n").await;
 
         drop(client);
         acceptor.await.unwrap();

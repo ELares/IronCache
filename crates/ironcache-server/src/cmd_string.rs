@@ -10,9 +10,9 @@
 //! enters only as the `now` deadline basis (ADR-0003); the command layer converts
 //! relative EX/PX against `now` into the absolute [`UnixMillis`] the waist stores.
 
-use crate::cmd_util::{ascii_upper, parse_i64};
+use crate::cmd_util::{ascii_upper, parse_f64, parse_i64, parse_i64_strict};
 use bytes::Bytes;
-use ironcache_protocol::{ErrorReply, Request, Value};
+use ironcache_protocol::{ErrorReply, Request, Value, format_human_double};
 use ironcache_storage::{
     DataType, ExpireWrite, NewValue, NewValueOwned, RmwAction, RmwEntry, RmwStep, Store, UnixMillis,
 };
@@ -310,5 +310,234 @@ pub fn cmd_getset<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
             expire: ExpireWrite::Clear,
             reply: Value::Null,
         },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Numeric read-modify-write commands (COMMANDS.md strings, ENCODINGS.md int fast
+// path). INCR/DECR/INCRBY/DECRBY operate on the value parsed as a canonical i64 and
+// store the result INT-encoded; INCRBYFLOAT operates on the value as an f64 and
+// stores the result as a STRING (ADR-0019: integer reply for INCR*, bulk-string
+// reply for INCRBYFLOAT). Each is one atomic `rmw` over the frozen waist: the
+// closure observes the old bytes, validates, computes, and returns the write.
+// ---------------------------------------------------------------------------
+
+/// The shared body of INCR/DECR/INCRBY/DECRBY: add `incr` to the value at `key`
+/// (absent -> 0), int-encode the result, reply with the new value as a RESP
+/// integer. A non-canonical-integer existing value, or an i64 overflow, is the
+/// matching Redis error (no write). `incr` is already parsed (the caller validated
+/// the argument form, including the DECRBY `i64::MIN` negation edge).
+fn incr_by<S: Store>(store: &mut S, db: u32, now: UnixMillis, key: &[u8], incr: i64) -> Value {
+    let key = Bytes::copy_from_slice(key);
+    store.rmw(db, &key, now, move |entry| {
+        // The current value as i64 (absent -> 0). A non-string is WRONGTYPE; a
+        // non-canonical-integer string is the not-an-integer error.
+        let current: i64 = match &entry {
+            RmwEntry::Vacant => 0,
+            RmwEntry::Occupied(o) if o.data_type() != DataType::String => {
+                return keep_err(ErrorReply::wrong_type());
+            }
+            RmwEntry::Occupied(o) => match parse_i64_strict(o.as_bytes()) {
+                Some(n) => n,
+                None => return keep_err(ErrorReply::not_an_integer()),
+            },
+        };
+        // Checked add: an i64 overflow is the overflow error (no write).
+        let Some(next) = current.checked_add(incr) else {
+            return keep_err(ErrorReply::increment_overflow());
+        };
+        // Store the result int-encoded (NewValueOwned::Int, no value allocation).
+        // INCR does NOT touch the TTL (Redis keeps the existing expire).
+        RmwStep {
+            action: RmwAction::Replace(NewValueOwned::Int(next)),
+            expire: ExpireWrite::Unchanged,
+            reply: Value::Integer(next),
+        }
+    })
+}
+
+/// A no-write rmw step that just returns an error reply (value untouched, TTL
+/// untouched). The shared abort path for the numeric/append validators.
+fn keep_err(e: ErrorReply) -> RmwStep<Value> {
+    RmwStep {
+        action: RmwAction::Keep,
+        expire: ExpireWrite::Unchanged,
+        reply: Value::error(e),
+    }
+}
+
+/// `INCR key` -> the new value (old + 1) as a RESP integer.
+pub fn cmd_incr<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 2 {
+        return Value::error(ErrorReply::wrong_arity("incr"));
+    }
+    incr_by(store, db, now, &req.args[1], 1)
+}
+
+/// `DECR key` -> the new value (old - 1) as a RESP integer.
+pub fn cmd_decr<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 2 {
+        return Value::error(ErrorReply::wrong_arity("decr"));
+    }
+    incr_by(store, db, now, &req.args[1], -1)
+}
+
+/// `INCRBY key increment` -> the new value (old + increment) as a RESP integer. A
+/// non-integer increment argument is the not-an-integer error (no write).
+pub fn cmd_incrby<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("incrby"));
+    }
+    let Some(incr) = parse_i64_strict(&req.args[2]) else {
+        return Value::error(ErrorReply::not_an_integer());
+    };
+    incr_by(store, db, now, &req.args[1], incr)
+}
+
+/// `DECRBY key decrement` -> the new value (old - decrement) as a RESP integer.
+///
+/// The decrement is negated before adding. `i64::MIN` cannot be negated within
+/// i64, so `DECRBY key -9223372036854775808` is the overflow error (matching
+/// Redis, which detects `incr == LLONG_MIN` and replies with the overflow text
+/// rather than wrapping). A non-integer decrement argument is the not-an-integer
+/// error (checked first, like Redis).
+pub fn cmd_decrby<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("decrby"));
+    }
+    let Some(decr) = parse_i64_strict(&req.args[2]) else {
+        return Value::error(ErrorReply::not_an_integer());
+    };
+    // Negate the decrement; i64::MIN has no positive i64, so its negation overflows
+    // and is the overflow error (the DECRBY i64::MIN edge).
+    let Some(incr) = decr.checked_neg() else {
+        return Value::error(ErrorReply::increment_overflow());
+    };
+    incr_by(store, db, now, &req.args[1], incr)
+}
+
+/// `INCRBYFLOAT key increment` -> the new value as a bulk string (ADR-0019: bulk in
+/// both RESP2 and RESP3).
+///
+/// Operates on the value parsed as an f64 (absent -> 0). A non-float existing value
+/// or increment argument is `-ERR value is not a valid float`; a NaN/Infinity
+/// result is `-ERR increment would produce NaN or Infinity`. The checks run in
+/// Redis order (type -> existing value -> increment argument), so a non-string key
+/// is WRONGTYPE even when the increment argument is itself malformed. The result is stored
+/// as a STRING (its human-formatted decimal, classified embstr/raw by length, so a
+/// later INCR on an integer-valued result still works), NOT int-encoded
+/// (ENCODINGS.md: the INCRBYFLOAT result is a string). The TTL is left unchanged.
+///
+/// IronCache uses f64, a documented precision divergence from Redis's 80-bit long
+/// double; the result is formatted with [`format_human_double`] (the ld2string
+/// HUMAN spelling), NOT the RESP3 fpconv double encoder.
+pub fn cmd_incrbyfloat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("incrbyfloat"));
+    }
+    // Redis `incrbyfloatCommand` checks the TYPE first (checkType OBJ_STRING),
+    // THEN parses the existing value, THEN parses the increment argument. So the
+    // raw increment Bytes is carried INTO the rmw closure and parsed only after the
+    // type and existing-value checks pass, matching Redis's order: a non-string key
+    // is WRONGTYPE even with a malformed increment (e.g. `INCRBYFLOAT <list> abc`).
+    // (This differs from INCR/INCRBY/DECRBY, where Redis parses the integer increment
+    // argument BEFORE checkType, so those keep their parse-first order.)
+    let key = req.args[1].clone();
+    let incr_arg = req.args[2].clone();
+    store.rmw(db, &key, now, move |entry| {
+        let current: f64 = match &entry {
+            RmwEntry::Vacant => 0.0,
+            RmwEntry::Occupied(o) if o.data_type() != DataType::String => {
+                return keep_err(ErrorReply::wrong_type());
+            }
+            RmwEntry::Occupied(o) => match parse_f64(o.as_bytes()) {
+                Some(n) => n,
+                None => return keep_err(ErrorReply::not_a_valid_float()),
+            },
+        };
+        // The increment argument is parsed AFTER the type + existing-value checks
+        // (Redis parses argv[2] last in incrbyfloatCommand).
+        let Some(incr) = parse_f64(&incr_arg) else {
+            return keep_err(ErrorReply::not_a_valid_float());
+        };
+        let result = current + incr;
+        // A NaN/Infinity result is rejected before any write (matching Redis).
+        if result.is_nan() || result.is_infinite() {
+            return keep_err(ErrorReply::increment_nan_or_inf());
+        }
+        // Store the result as a STRING (the human-formatted decimal). It is
+        // classified int/embstr/raw by the store, so an integer-valued result like
+        // "5" is int-encoded and a later INCR on it still works (matching Redis,
+        // where INCRBYFLOAT then INCR round-trips for integer-valued results).
+        let formatted = format_human_double(result);
+        let bytes = Bytes::from(formatted.into_bytes());
+        RmwStep {
+            action: RmwAction::Replace(NewValueOwned::Bytes(bytes.clone())),
+            expire: ExpireWrite::Unchanged,
+            reply: Value::BulkString(Some(bytes)),
+        }
+    })
+}
+
+/// `APPEND key value` -> the new string length as a RESP integer.
+///
+/// If `key` is absent, APPEND behaves like SET (creates `key = value`) and returns
+/// `len(value)`. If `key` holds a string, `value` is appended and the new length is
+/// returned; an int-encoded value is promoted OFF the int encoding (the
+/// concatenation of decimal digits + suffix is no longer a canonical integer).
+/// WRONGTYPE if the existing value is not a string. The TTL is left unchanged
+/// (Redis APPEND preserves it).
+///
+/// ENCODING DIVERGENCE (documented): Redis always reports `raw` after APPEND
+/// (an appended SDS is never re-`embstr`'d). IronCache writes the rebuilt value
+/// back through the frozen waist's `NewValueOwned::Bytes`, which the store
+/// classifies by LENGTH (ENCODINGS.md): a short append result is therefore `embstr`
+/// and only a result over the embstr threshold is `raw`. Forcing an always-`raw`
+/// result would require a new write-value variant on the waist (a waist change,
+/// out of scope and explicitly forbidden for PR-2b); the in-place spare-capacity
+/// append that would also fix this is the #8/Efficiency follow-up below. OBJECT
+/// ENCODING is a later PR, so this internal-representation difference is not yet
+/// observable through a command.
+///
+/// FOLLOW-UP (#8/Efficiency): PR-2b implements APPEND as read-old + concat +
+/// Replace (one owned rebuilt value through the frozen waist). The in-place spare
+/// -capacity append (growing the existing buffer without a full rebuild) is the
+/// documented value-internal-mutation extension to the waist (STORAGE_API.md notes
+/// the "APPEND/SETRANGE efficiency path" as the additive `RmwAction` follow-up); it
+/// is intentionally NOT done here.
+pub fn cmd_append<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("append"));
+    }
+    let suffix = req.args[2].clone();
+    store.rmw(db, &req.args[1], now, move |entry| match entry {
+        // Absent: APPEND behaves like SET, returns len(value), clears TTL (SET
+        // semantics on create).
+        RmwEntry::Vacant => {
+            let len = suffix.len() as i64;
+            RmwStep {
+                action: RmwAction::Insert(NewValueOwned::Bytes(suffix)),
+                expire: ExpireWrite::Clear,
+                reply: Value::Integer(len),
+            }
+        }
+        // Non-string: WRONGTYPE, no write.
+        RmwEntry::Occupied(o) if o.data_type() != DataType::String => {
+            keep_err(ErrorReply::wrong_type())
+        }
+        // String: concatenate old + value (binary-safe), return the new length.
+        // The TTL is preserved (Redis APPEND does not touch the expire).
+        RmwEntry::Occupied(o) => {
+            let old = o.as_bytes();
+            let mut combined = Vec::with_capacity(old.len() + suffix.len());
+            combined.extend_from_slice(old);
+            combined.extend_from_slice(&suffix);
+            let len = combined.len() as i64;
+            RmwStep {
+                action: RmwAction::Replace(NewValueOwned::Bytes(Bytes::from(combined))),
+                expire: ExpireWrite::Unchanged,
+                reply: Value::Integer(len),
+            }
+        }
     })
 }

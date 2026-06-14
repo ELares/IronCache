@@ -448,3 +448,99 @@ fn resolve_expire(expire: ExpireWrite, old: Option<UnixMillis>) -> Option<UnixMi
 pub fn format_int(n: i64) -> Bytes {
     int_decimal_bytes(n)
 }
+
+// ---------------------------------------------------------------------------
+// Process-global allocator accounting (ADR-0006, OBSERVABILITY.md). This is the
+// HONEST process-wide figure INFO's `used_memory` reports, SEPARATE from the
+// per-shard logical-byte counter [`Store::used_memory`] (which stays the fast
+// per-shard number PR-3's eviction budget checks; it is NOT replaced by these).
+//
+// jemalloc caches its statistics and only refreshes them when the `epoch` is
+// advanced, so each read advances the epoch first, then reads `stats.allocated`
+// (the live allocated total, the analog of Redis `used_memory`) or
+// `stats.resident` (RSS). The tikv-jemalloc-ctl `stats` API is SAFE, so this crate
+// keeps `#![forbid(unsafe_code)]`.
+//
+// PR-3 FOLLOW-UP: per-shard-arena attribution (ADR-0006 "Per-shard arenas keep
+// accounting and fragmentation shard-local") so eviction can budget per shard
+// precisely. PR-2b reports the honest PROCESS-GLOBAL total for INFO; the read is
+// done ONCE on the shard serving INFO (the caller must not sum it across shards,
+// which would N-times over-count a process-global figure).
+// ---------------------------------------------------------------------------
+
+/// The process-wide jemalloc `stats.allocated` total in bytes (the live allocated
+/// total, the analog of Redis `used_memory`), advancing the epoch first so the
+/// figure is fresh. Returns 0 if the stat cannot be read.
+///
+/// This is the PROCESS-GLOBAL figure for INFO `used_memory`; it is NOT the
+/// per-shard logical-byte counter ([`Store::used_memory`]). Read it ONCE per INFO
+/// (on the serving shard); do NOT sum it across shards.
+#[cfg(not(target_env = "msvc"))]
+#[must_use]
+pub fn process_allocated_bytes() -> u64 {
+    // Advance the epoch so the cached stats refresh, then read allocated. Any
+    // mallctl error (e.g. jemalloc not the active allocator) degrades to 0 rather
+    // than panicking the INFO path.
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    tikv_jemalloc_ctl::stats::allocated::read()
+        .map(|b| b as u64)
+        .unwrap_or(0)
+}
+
+/// The process-wide jemalloc `stats.resident` total in bytes (RSS), advancing the
+/// epoch first. Returns 0 if the stat cannot be read. Process-global; read once for
+/// INFO `used_memory_rss`.
+#[cfg(not(target_env = "msvc"))]
+#[must_use]
+pub fn process_resident_bytes() -> u64 {
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    tikv_jemalloc_ctl::stats::resident::read()
+        .map(|b| b as u64)
+        .unwrap_or(0)
+}
+
+/// The process-wide jemalloc `(allocated, resident)` pair in bytes, read from a
+/// SINGLE epoch snapshot: the epoch is advanced ONCE and both `stats.allocated`
+/// (the `used_memory` analog) and `stats.resident` (RSS) are then read from that
+/// same refreshed snapshot. INFO uses this so its two memory figures are mutually
+/// consistent (no skew from two independent epoch advances). Either stat degrades
+/// to 0 if it cannot be read. Process-global; call ONCE per INFO on the serving
+/// shard, NOT summed across shards.
+#[cfg(not(target_env = "msvc"))]
+#[must_use]
+pub fn process_memory() -> (u64, u64) {
+    // One epoch advance refreshes the cached stats; both reads then come from the
+    // same snapshot.
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    let allocated = tikv_jemalloc_ctl::stats::allocated::read()
+        .map(|b| b as u64)
+        .unwrap_or(0);
+    let resident = tikv_jemalloc_ctl::stats::resident::read()
+        .map(|b| b as u64)
+        .unwrap_or(0);
+    (allocated, resident)
+}
+
+/// MSVC fallback: the system allocator is selected there (no jemalloc to query),
+/// so the process-global allocator figure is unavailable and reported as 0. INFO
+/// still emits the field with a parse-clean value.
+#[cfg(target_env = "msvc")]
+#[must_use]
+pub fn process_allocated_bytes() -> u64 {
+    0
+}
+
+/// MSVC fallback for RSS (see [`process_allocated_bytes`]).
+#[cfg(target_env = "msvc")]
+#[must_use]
+pub fn process_resident_bytes() -> u64 {
+    0
+}
+
+/// MSVC fallback for the single-snapshot pair (see [`process_allocated_bytes`]):
+/// no jemalloc to query, so both figures are 0.
+#[cfg(target_env = "msvc")]
+#[must_use]
+pub fn process_memory() -> (u64, u64) {
+    (0, 0)
+}

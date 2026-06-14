@@ -12,7 +12,7 @@
 use crate::conn::ConnState;
 use crate::{cmd_keyspace, cmd_string};
 use ironcache_env::Clock;
-use ironcache_observe::{CounterSnapshot, ServerInfo, build_info};
+use ironcache_observe::{CounterSnapshot, MemoryInfo, ServerInfo, build_info};
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
 use ironcache_storage::{Store, UnixMillis};
 
@@ -47,11 +47,22 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 /// the per-shard storage waist (#34) the data commands run against; `now` is the
 /// absolute wall-clock deadline basis for this command, computed once per command
 /// by the caller from the Env clock (ADR-0003: the store reads no clock). `state`
-/// is the mutable per-connection state. `rollup` yields the counters for INFO.
+/// is the mutable per-connection state. `rollup` yields the counters for INFO;
+/// `mem` is the process-global allocator snapshot (ADR-0006) the caller read ONCE at
+/// the binary edge for INFO `used_memory`/`used_memory_rss` (the server crate cannot
+/// read the concrete store's mallctl by the layering contract, so the figure is
+/// supplied in).
 ///
 /// Tier-0 (connection) commands ignore `store`/`now`; the data commands use them.
 /// The function is generic over `S: Store` for monomorphization, consistent with
 /// the existing `C: Clock` generic.
+///
+/// The 8 arguments are each a distinct, orthogonal seam (ctx/state/clock/store/now/
+/// rollup/mem/req) the dispatcher fans out to handlers; bundling them into a struct
+/// would just move the same fields behind one name and obscure the per-command
+/// borrows (the lifetime-parameterized `rollup` closure in particular). The
+/// over-7-args lint is allowed here with that justification.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch<C: Clock, S: Store>(
     ctx: &ServerContext,
     state: &mut ConnState,
@@ -59,6 +70,7 @@ pub fn dispatch<C: Clock, S: Store>(
     store: &mut S,
     now: UnixMillis,
     rollup: RollupFn<'_>,
+    mem: MemoryInfo,
     req: &Request,
 ) -> Value {
     let cmd = ascii_upper(req.command());
@@ -90,7 +102,7 @@ pub fn dispatch<C: Clock, S: Store>(
         }
         b"CLIENT" => cmd_client(state, req),
         b"COMMAND" => cmd_command(req),
-        b"INFO" => cmd_info(ctx, clock, rollup, req),
+        b"INFO" => cmd_info(ctx, clock, rollup, mem, req),
         b"CONFIG" => cmd_config_stub(req),
         // -- Data commands (PR-2a) over the storage waist. --
         b"GET" => cmd_string::cmd_get(store, db, now, req),
@@ -98,6 +110,13 @@ pub fn dispatch<C: Clock, S: Store>(
         b"SETNX" => cmd_string::cmd_setnx(store, db, now, req),
         b"GETSET" => cmd_string::cmd_getset(store, db, now, req),
         b"STRLEN" => cmd_string::cmd_strlen(store, db, now, req),
+        // -- Numeric RMW + APPEND (PR-2b) over the storage waist. --
+        b"INCR" => cmd_string::cmd_incr(store, db, now, req),
+        b"DECR" => cmd_string::cmd_decr(store, db, now, req),
+        b"INCRBY" => cmd_string::cmd_incrby(store, db, now, req),
+        b"DECRBY" => cmd_string::cmd_decrby(store, db, now, req),
+        b"INCRBYFLOAT" => cmd_string::cmd_incrbyfloat(store, db, now, req),
+        b"APPEND" => cmd_string::cmd_append(store, db, now, req),
         b"DEL" => cmd_keyspace::cmd_del(store, db, now, req),
         b"EXISTS" => cmd_keyspace::cmd_exists(store, db, now, req),
         b"TYPE" => cmd_keyspace::cmd_type(store, db, now, req),
@@ -363,11 +382,15 @@ fn cmd_command(req: &Request) -> Value {
     }
 }
 
-/// `INFO [section]` -> delegates to ironcache-observe.
+/// `INFO [section]` -> delegates to ironcache-observe. `mem` is the process-global
+/// allocator snapshot (ADR-0006) the caller read once at the binary edge (the
+/// server crate has no access to the concrete store's mallctl readers, by the
+/// layering contract; the binary supplies the figure).
 fn cmd_info<C: Clock>(
     ctx: &ServerContext,
     clock: &C,
     rollup: RollupFn<'_>,
+    mem: MemoryInfo,
     req: &Request,
 ) -> Value {
     let section = if req.args.len() >= 2 {
@@ -375,7 +398,7 @@ fn cmd_info<C: Clock>(
     } else {
         None
     };
-    let body = build_info(clock, &ctx.info, rollup(), section.as_deref());
+    let body = build_info(clock, &ctx.info, rollup(), mem, section.as_deref());
     Value::bulk(body.into_bytes())
 }
 
@@ -453,7 +476,16 @@ mod tests {
         let env = TestEnv::new(1);
         let mut store = ShardStore::new(ctx.databases);
         let zero = || CounterSnapshot::default();
-        dispatch(ctx, st, &env, &mut store, UnixMillis(0), &zero, &req(parts))
+        dispatch(
+            ctx,
+            st,
+            &env,
+            &mut store,
+            UnixMillis(0),
+            &zero,
+            MemoryInfo::default(),
+            &req(parts),
+        )
     }
 
     /// Like [`run`] but threads a caller-owned store and `now`, for the data-command
@@ -468,7 +500,16 @@ mod tests {
     ) -> Value {
         let env = TestEnv::new(1);
         let zero = || CounterSnapshot::default();
-        dispatch(ctx, st, &env, store, now, &zero, &req(parts))
+        dispatch(
+            ctx,
+            st,
+            &env,
+            store,
+            now,
+            &zero,
+            MemoryInfo::default(),
+            &req(parts),
+        )
     }
 
     #[test]
@@ -1066,11 +1107,422 @@ mod tests {
             vec![b"STRLEN"],
             vec![b"SETNX", b"k"],
             vec![b"GETSET", b"k"],
+            // PR-2b numeric/append arity.
+            vec![b"INCR"],
+            vec![b"DECR", b"a", b"b"],
+            vec![b"INCRBY", b"k"],
+            vec![b"DECRBY", b"k"],
+            vec![b"INCRBYFLOAT", b"k"],
+            vec![b"APPEND", b"k"],
         ] {
             assert!(
                 matches!(run_on(&c, &mut s, &mut st, t, &cmd), Value::Error(_)),
                 "expected arity error for {cmd:?}"
             );
         }
+    }
+
+    // -- Numeric RMW + APPEND (PR-2b). --
+
+    /// The store-level encoding of `key` in db 0 (for int-encoding assertions). The
+    /// command layer only ever sees bytes; the test reaches the store directly to
+    /// confirm the result is stored int-encoded, which is the ENCODINGS.md contract.
+    fn encoding_of(st: &mut ShardStore, key: &[u8]) -> Option<ironcache_storage::Encoding> {
+        st.read(0, key, UnixMillis(0)).map(|v| v.encoding())
+    }
+
+    fn err_line(v: Value) -> String {
+        match v {
+            Value::Error(e) => e.line(),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incr_decr_from_absent_and_existing() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // Absent key starts at 0: INCR -> 1.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCR", b"n"]),
+            Value::Integer(1)
+        );
+        // The result is int-encoded.
+        assert_eq!(
+            encoding_of(&mut st, b"n"),
+            Some(ironcache_storage::Encoding::Int)
+        );
+        // STRLEN reflects the decimal length of the result.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"STRLEN", b"n"]),
+            Value::Integer(1)
+        );
+        // INCRBY and DECR/DECRBY.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCRBY", b"n", b"5"]),
+            Value::Integer(6)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"DECR", b"n"]),
+            Value::Integer(5)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"DECRBY", b"n", b"10"]),
+            Value::Integer(-5)
+        );
+        // After several ops the decimal length is 2 ("-5").
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"STRLEN", b"n"]),
+            Value::Integer(2)
+        );
+        // A negative increment via INCRBY works.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCRBY", b"n", b"-5"]),
+            Value::Integer(-10)
+        );
+    }
+
+    #[test]
+    fn incr_on_existing_string_set_value() {
+        // SET n 10 (stored int-encoded), then INCR/INCRBY/DECR through dispatch.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"n", b"10"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCR", b"n"]),
+            Value::Integer(11)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCRBY", b"n", b"5"]),
+            Value::Integer(16)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"DECR", b"n"]),
+            Value::Integer(15)
+        );
+    }
+
+    #[test]
+    fn incr_non_integer_value_and_arg_are_not_an_integer() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // Non-integer EXISTING value (an embstr) -> not-an-integer.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"s", b"hello"]);
+        assert_eq!(
+            err_line(run_on(&c, &mut s, &mut st, t, &[b"INCR", b"s"])),
+            "-ERR value is not an integer or out of range"
+        );
+        // A leading-zero / non-canonical existing string is also rejected (string2ll).
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"z", b"007"]);
+        assert_eq!(
+            err_line(run_on(&c, &mut s, &mut st, t, &[b"INCR", b"z"])),
+            "-ERR value is not an integer or out of range"
+        );
+        // Non-integer INCREMENT argument -> not-an-integer.
+        assert_eq!(
+            err_line(run_on(&c, &mut s, &mut st, t, &[b"INCRBY", b"n", b"1.5"])),
+            "-ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            err_line(run_on(&c, &mut s, &mut st, t, &[b"INCRBY", b"n", b"abc"])),
+            "-ERR value is not an integer or out of range"
+        );
+    }
+
+    #[test]
+    fn incr_overflow_and_decr_underflow_and_decrby_min_edge() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // INCR of i64::MAX overflows.
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"SET", b"max", b"9223372036854775807"],
+        );
+        assert_eq!(
+            err_line(run_on(&c, &mut s, &mut st, t, &[b"INCR", b"max"])),
+            "-ERR increment or decrement would overflow"
+        );
+        // DECR of i64::MIN underflows.
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"SET", b"min", b"-9223372036854775808"],
+        );
+        assert_eq!(
+            err_line(run_on(&c, &mut s, &mut st, t, &[b"DECR", b"min"])),
+            "-ERR increment or decrement would overflow"
+        );
+        // DECRBY key i64::MIN: the decrement cannot be negated -> overflow error.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"x", b"0"]);
+        assert_eq!(
+            err_line(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"DECRBY", b"x", b"-9223372036854775808"]
+            )),
+            "-ERR increment or decrement would overflow"
+        );
+        // The value was not modified by any of the failed ops.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"x"]), bulk(b"0"));
+    }
+
+    #[test]
+    fn incr_wrongtype_against_non_string() {
+        use ironcache_storage::{DataType, Encoding};
+        use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        let mut obj = KvObj::from_bytes(b"lst", b"x", None);
+        obj.header = Header {
+            data_type: DataType::List,
+            encoding: Encoding::ListPack,
+            eviction_rank: 0,
+            ttl_present: false,
+            snapshot_version: 0,
+        };
+        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        st.insert_object(0, obj);
+        assert_eq!(
+            err_line(run_on(&c, &mut s, &mut st, t, &[b"INCR", b"lst"])),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+        assert_eq!(
+            err_line(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"INCRBYFLOAT", b"lst", b"1"]
+            )),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+        assert_eq!(
+            err_line(run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"lst", b"x"])),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+    }
+
+    #[test]
+    fn incrbyfloat_wrongtype_beats_invalid_increment() {
+        // Redis `incrbyfloatCommand` checks the TYPE before parsing the increment
+        // argument, so `INCRBYFLOAT <list-key> abc` is WRONGTYPE, NOT
+        // "value is not a valid float" (the malformed increment is irrelevant once
+        // the key is the wrong type). Plant a non-string via the store seam as the
+        // other WRONGTYPE tests do.
+        use ironcache_storage::{DataType, Encoding};
+        use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        let mut obj = KvObj::from_bytes(b"lst", b"x", None);
+        obj.header = Header {
+            data_type: DataType::List,
+            encoding: Encoding::ListPack,
+            eviction_rank: 0,
+            ttl_present: false,
+            snapshot_version: 0,
+        };
+        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        st.insert_object(0, obj);
+        assert_eq!(
+            err_line(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"INCRBYFLOAT", b"lst", b"abc"]
+            )),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+    }
+
+    #[test]
+    fn incrbyfloat_absent_format_and_storage() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // Absent -> 0 + 10.5 = "10.5" (bulk string).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCRBYFLOAT", b"f", b"10.5"]),
+            bulk(b"10.5")
+        );
+        // Stored as a STRING (its decimal); GET returns the same bytes.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"f"]),
+            bulk(b"10.5")
+        );
+        // Add 0.1 -> "10.6" (shortest round-trip, no trailing zeros).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCRBYFLOAT", b"f", b"0.1"]),
+            bulk(b"10.6")
+        );
+    }
+
+    #[test]
+    fn incrbyfloat_integer_valued_result_round_trips_to_incr() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // 5.0e3 -> "5000" (integer-valued result, no dot), stored as a string that
+        // is int-encoded (since "5000" is a canonical integer), so a later INCR
+        // works (matching Redis INCRBYFLOAT -> INCR round-trip for integer results).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCRBYFLOAT", b"v", b"5.0e3"]),
+            bulk(b"5000")
+        );
+        assert_eq!(
+            encoding_of(&mut st, b"v"),
+            Some(ironcache_storage::Encoding::Int)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCR", b"v"]),
+            Value::Integer(5001)
+        );
+    }
+
+    #[test]
+    fn incrbyfloat_invalid_float_and_nan_inf() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // Non-float existing value -> not-a-valid-float.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"s", b"hello"]);
+        assert_eq!(
+            err_line(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"INCRBYFLOAT", b"s", b"1.0"]
+            )),
+            "-ERR value is not a valid float"
+        );
+        // Non-float increment argument -> not-a-valid-float.
+        assert_eq!(
+            err_line(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"INCRBYFLOAT", b"f", b"abc"]
+            )),
+            "-ERR value is not a valid float"
+        );
+        // An infinite increment produces an infinite result -> NaN/Inf error.
+        assert_eq!(
+            err_line(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"INCRBYFLOAT", b"f", b"inf"]
+            )),
+            "-ERR increment would produce NaN or Infinity"
+        );
+        // None of the failed ops created the key.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"f"]), Value::Null);
+    }
+
+    #[test]
+    fn append_absent_existing_and_binary_safe() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // Absent: APPEND creates and returns len(value).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"s", b"abc"]),
+            Value::Integer(3)
+        );
+        // Existing string: appends, returns new len.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"s", b"de"]),
+            Value::Integer(5)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"s"]),
+            bulk(b"abcde")
+        );
+        // DIVERGENCE (documented in cmd_append): the frozen waist classifies the
+        // rebuilt value by LENGTH, so a SHORT append result is embstr where Redis
+        // (which never re-embstrs an appended SDS) would report raw. A result over
+        // the embstr threshold is raw, which is the promotion the brief pins; assert
+        // that explicitly below.
+        assert_eq!(
+            encoding_of(&mut st, b"s"),
+            Some(ironcache_storage::Encoding::EmbStr)
+        );
+        // Appending past the embstr threshold promotes the result to raw.
+        let big = vec![b'q'; 60];
+        run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"s", &big]);
+        assert_eq!(
+            encoding_of(&mut st, b"s"),
+            Some(ironcache_storage::Encoding::Raw)
+        );
+        // Binary-safe append (NUL bytes preserved).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"b", b"\x00\x01"]),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"b", b"\x02"]),
+            Value::Integer(3)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"b"]),
+            bulk(b"\x00\x01\x02")
+        );
+    }
+
+    #[test]
+    fn append_promotes_int_off_the_int_encoding() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // SET n 10 is int-encoded; APPEND promotes the concatenation OFF int (to a
+        // string encoding). The exact string encoding is length-based in the frozen
+        // waist (embstr here for the short "10x"; raw past the threshold).
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"n", b"10"]);
+        assert_eq!(
+            encoding_of(&mut st, b"n"),
+            Some(ironcache_storage::Encoding::Int)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"APPEND", b"n", b"x"]),
+            Value::Integer(3)
+        );
+        // "10x" is not an integer -> a string encoding (no longer int), and GET sees
+        // the decimal+suffix.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"n"]),
+            bulk(b"10x")
+        );
+        assert_ne!(
+            encoding_of(&mut st, b"n"),
+            Some(ironcache_storage::Encoding::Int),
+            "APPEND must promote off the int encoding"
+        );
     }
 }
