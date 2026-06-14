@@ -11,11 +11,21 @@
 
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
-use crate::{cmd_keyspace, cmd_string};
+use crate::{cmd_expire, cmd_keyspace, cmd_string};
 use ironcache_env::Clock;
-use ironcache_observe::{CounterSnapshot, MemoryInfo, ServerInfo, build_info};
+use ironcache_expiry::TimingWheel;
+use ironcache_observe::{CounterDeltas, CounterSnapshot, MemoryInfo, ServerInfo, build_info};
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
-use ironcache_storage::{Admit, Store, UnixMillis};
+use ironcache_storage::{ActiveExpiry, Admit, Store, UnixMillis};
+
+/// The bounded number of expired keys the active timing-wheel drain reclaims per
+/// command (EXPIRATION.md "bounded reclamation"). A small cap keeps the drain off the
+/// command path's critical section: a flood of co-expiring keys is reclaimed across
+/// several commands rather than stalling one. The lazy backstop still prevents
+/// OBSERVING an expired key, so this bound only governs how fast resident memory for
+/// expired keys returns, never correctness. The background timer-task drain for IDLE
+/// shards (an empty-traffic shard never calls this) is deferred to PR-3c.
+pub const MAX_RECLAIM_PER_CALL: usize = 20;
 
 /// Immutable, server-wide context a handler may read. It is cloned cheaply onto
 /// each shard; the dynamic per-rollup counters are passed in separately.
@@ -78,31 +88,49 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 /// enforce the maxmemory ceiling (evict-to-fit / `-OOM`) without naming the concrete
 /// store or policy.
 ///
-/// `evicted_out` is an out-parameter the admission gate writes the number of keys it
-/// evicted into (0 on every non-evicting command); the caller adds it to the shard's
-/// `evicted_keys` counter (INFO). It is a `&mut u64` rather than a counter handle so
-/// dispatch does not alias the `rollup` closure's borrow of the same per-shard
-/// counters (the serve loop applies the bump after dispatch returns).
+/// `deltas` is an out-parameter dispatch accumulates this command's dynamic counter
+/// changes into (eviction count, active-expiry reclamation count, keyspace hits/misses);
+/// it starts zeroed and the serve loop folds it into the shard's [`ShardCounters`]
+/// AFTER dispatch returns. It is a `&mut` out-parameter rather than a counter handle so
+/// dispatch does not alias the `rollup` closure's borrow of the same per-shard counters.
 ///
-/// The arguments are each a distinct, orthogonal seam (ctx/state/clock/store/now/
-/// rollup/mem/evicted_out/req) the dispatcher fans out to handlers; bundling them into
-/// a struct would just move the same fields behind one name and obscure the
-/// per-command borrows (the lifetime-parameterized `rollup` closure in particular).
-/// The over-7-args lint is allowed here with that justification.
+/// `wheel` is the per-shard timing wheel (#51): dispatch drains a BOUNDED batch of due
+/// keys from it BEFORE the command body (the active reclamation), and the TTL-setting
+/// commands register their new deadline into it.
+///
+/// The arguments are each a distinct, orthogonal seam (ctx/state/clock/store/wheel/now/
+/// rollup/mem/deltas/req) the dispatcher fans out to handlers; bundling them into a
+/// struct would just move the same fields behind one name and obscure the per-command
+/// borrows (the lifetime-parameterized `rollup` closure in particular). The over-7-args
+/// lint is allowed here with that justification.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch<C: Clock, S: Store + Admit>(
+pub fn dispatch<C: Clock, S: Store + Admit + ActiveExpiry>(
     ctx: &ServerContext,
     state: &mut ConnState,
     clock: &C,
     store: &mut S,
+    wheel: &mut TimingWheel,
     now: UnixMillis,
     rollup: RollupFn<'_>,
     mem: MemoryInfo,
-    evicted_out: &mut u64,
+    deltas: &mut CounterDeltas,
     req: &Request,
 ) -> Value {
-    *evicted_out = 0;
+    *deltas = CounterDeltas::default();
     let cmd = ascii_upper(req.command());
+
+    // Active TTL reclamation (EXPIRATION.md #51), BEFORE the command body: drain a
+    // BOUNDED batch of due keys from the timing wheel and reap the ones whose stored
+    // deadline has actually passed (the wheel may offer a stale entry; the store
+    // re-checks). This bounds resident memory for expired keys under traffic; the lazy
+    // backstop in the store still prevents OBSERVING an expired key, so this is purely
+    // a memory optimization. MAX_RECLAIM_PER_CALL caps the work per command so the
+    // drain never stalls the command path.
+    for (db, key) in wheel.advance(now, MAX_RECLAIM_PER_CALL) {
+        if store.reap_if_expired(db, &key, now) {
+            deltas.expired += 1;
+        }
+    }
 
     // Auth gate: before authenticating, only a small set of commands is allowed
     // (Redis: HELLO, AUTH, QUIT, RESET). Everything else (including the data
@@ -130,7 +158,7 @@ pub fn dispatch<C: Clock, S: Store + Admit>(
                 // Cache mode: try to free space, then re-check. If eviction cannot get
                 // us down to budget (write outruns eviction, or only ineligible keys
                 // remain), reject -OOM. The freed count is reported for INFO.
-                *evicted_out = store.evict_to_fit(budget, now);
+                deltas.evicted = store.evict_to_fit(budget, now);
                 if store.used_memory() > budget {
                     return Value::error(ErrorReply::oom());
                 }
@@ -160,11 +188,16 @@ pub fn dispatch<C: Clock, S: Store + Admit>(
         b"COMMAND" => cmd_command(req),
         b"INFO" => cmd_info(ctx, clock, rollup, mem, req),
         b"CONFIG" => cmd_config_stub(req),
-        // -- Data commands (PR-2a) over the storage waist. --
-        b"GET" => cmd_string::cmd_get(store, db, now, req),
-        b"SET" => cmd_string::cmd_set(store, db, now, req),
+        // -- Data commands (PR-2a) over the storage waist. The two pure reads (GET,
+        // STRLEN) feed the keyspace hit/miss counters (PR-3b): a found live key is a
+        // hit, an absent/expired key a miss. --
+        b"GET" => keyspace_counted(deltas, cmd_string::cmd_get(store, db, now, req)),
+        b"SET" => cmd_string::cmd_set(store, wheel, db, now, req),
         b"SETNX" => cmd_string::cmd_setnx(store, db, now, req),
         b"GETSET" => cmd_string::cmd_getset(store, db, now, req),
+        // STRLEN is intentionally NOT keyspace-counted: its absent reply Integer(0) is
+        // indistinguishable from STRLEN of an empty string, so a reply-shape signal
+        // would misclassify; the lookup-side hit/miss is left as a later refinement.
         b"STRLEN" => cmd_string::cmd_strlen(store, db, now, req),
         // -- Numeric RMW + APPEND (PR-2b) over the storage waist. --
         b"INCR" => cmd_string::cmd_incr(store, db, now, req),
@@ -176,6 +209,22 @@ pub fn dispatch<C: Clock, S: Store + Admit>(
         b"DEL" => cmd_keyspace::cmd_del(store, db, now, req),
         b"EXISTS" => cmd_keyspace::cmd_exists(store, db, now, req),
         b"TYPE" => cmd_keyspace::cmd_type(store, db, now, req),
+        // -- TTL / EXPIRE family (PR-3b) over the frozen waist. TTL-setting commands
+        // also register their new deadline in the per-shard timing wheel. --
+        b"EXPIRE" => cmd_expire::cmd_expire(store, wheel, db, now, req),
+        b"PEXPIRE" => cmd_expire::cmd_pexpire(store, wheel, db, now, req),
+        b"EXPIREAT" => cmd_expire::cmd_expireat(store, wheel, db, now, req),
+        b"PEXPIREAT" => cmd_expire::cmd_pexpireat(store, wheel, db, now, req),
+        b"TTL" => keyspace_counted(deltas, cmd_expire::cmd_ttl(store, db, now, req)),
+        b"PTTL" => keyspace_counted(deltas, cmd_expire::cmd_pttl(store, db, now, req)),
+        b"EXPIRETIME" => keyspace_counted(deltas, cmd_expire::cmd_expiretime(store, db, now, req)),
+        b"PEXPIRETIME" => {
+            keyspace_counted(deltas, cmd_expire::cmd_pexpiretime(store, db, now, req))
+        }
+        b"PERSIST" => cmd_expire::cmd_persist(store, db, now, req),
+        b"GETEX" => keyspace_counted(deltas, cmd_expire::cmd_getex(store, wheel, db, now, req)),
+        b"SETEX" => cmd_expire::cmd_setex(store, wheel, db, now, req),
+        b"PSETEX" => cmd_expire::cmd_psetex(store, wheel, db, now, req),
         _ => {
             let name = String::from_utf8_lossy(req.command()).into_owned();
             let rest: Vec<&[u8]> = req.args[1..].iter().map(bytes::Bytes::as_ref).collect();
@@ -490,6 +539,27 @@ fn parse_int_arg(arg: &[u8]) -> Option<i64> {
     s.parse::<i64>().ok()
 }
 
+/// Fold a read command's hit/miss into the keyspace counters (PR-3b, INFO
+/// `keyspace_hits`/`keyspace_misses`), then return the reply unchanged.
+///
+/// A MISS is the "key not found" reply shape: a `Null` bulk (GET/GETEX absent) or the
+/// `Integer(-2)` TTL-family not-found convention. An `Error` reply (e.g. WRONGTYPE) is
+/// NEITHER a hit nor a miss (it is not a successful lookup result). Everything else is
+/// a HIT (the key was found live). This is applied only to commands whose reply shape
+/// is an UNAMBIGUOUS found/not-found signal (GET, GETEX, TTL/PTTL/EXPIRETIME/
+/// PEXPIRETIME); commands whose reply collides with a real value (e.g. STRLEN's 0) are
+/// not counted, to avoid misclassification.
+fn keyspace_counted(deltas: &mut CounterDeltas, reply: Value) -> Value {
+    match &reply {
+        Value::Error(_) => {}
+        // A `Null` bulk (GET/GETEX absent) or the `Integer(-2)` TTL-family not-found
+        // convention is a miss; anything else (a found value / a real TTL) is a hit.
+        Value::Null | Value::Integer(-2) => deltas.keyspace_misses += 1,
+        _ => deltas.keyspace_hits += 1,
+    }
+    reply
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,17 +621,19 @@ mod tests {
     fn run(ctx: &ServerContext, st: &mut ConnState, parts: &[&[u8]]) -> Value {
         let env = TestEnv::new(1);
         let mut store = test_store(ctx.databases);
+        let mut wheel = TimingWheel::new();
         let zero = || CounterSnapshot::default();
-        let mut evicted = 0;
+        let mut deltas = CounterDeltas::default();
         dispatch(
             ctx,
             st,
             &env,
             &mut store,
+            &mut wheel,
             UnixMillis(0),
             &zero,
             MemoryInfo::default(),
-            &mut evicted,
+            &mut deltas,
             &req(parts),
         )
     }
@@ -576,20 +648,51 @@ mod tests {
         now: UnixMillis,
         parts: &[&[u8]],
     ) -> Value {
+        let mut wheel = TimingWheel::new();
+        run_on_wheel(ctx, st, store, &mut wheel, now, parts)
+    }
+
+    /// Like [`run_on`] but threads a caller-owned [`TimingWheel`] (and surfaces the
+    /// counter deltas), for the EXPIRE / active-drain tests that need the wheel to
+    /// persist across calls (register on one command, drain on a later one).
+    fn run_on_wheel(
+        ctx: &ServerContext,
+        st: &mut ConnState,
+        store: &mut TestStore,
+        wheel: &mut TimingWheel,
+        now: UnixMillis,
+        parts: &[&[u8]],
+    ) -> Value {
+        let (reply, _deltas) = run_on_wheel_deltas(ctx, st, store, wheel, now, parts);
+        reply
+    }
+
+    /// Like [`run_on_wheel`] but also returns the [`CounterDeltas`] dispatch produced
+    /// (the active-drain expiry count and keyspace hit/miss), for the counter tests.
+    fn run_on_wheel_deltas(
+        ctx: &ServerContext,
+        st: &mut ConnState,
+        store: &mut TestStore,
+        wheel: &mut TimingWheel,
+        now: UnixMillis,
+        parts: &[&[u8]],
+    ) -> (Value, CounterDeltas) {
         let env = TestEnv::new(1);
         let zero = || CounterSnapshot::default();
-        let mut evicted = 0;
-        dispatch(
+        let mut deltas = CounterDeltas::default();
+        let reply = dispatch(
             ctx,
             st,
             &env,
             store,
+            wheel,
             now,
             &zero,
             MemoryInfo::default(),
-            &mut evicted,
+            &mut deltas,
             &req(parts),
-        )
+        );
+        (reply, deltas)
     }
 
     #[test]
@@ -1618,20 +1721,22 @@ mod tests {
         parts: &[&[u8]],
     ) -> (Value, u64) {
         let env = TestEnv::new(1);
+        let mut wheel = TimingWheel::new();
         let zero = || CounterSnapshot::default();
-        let mut evicted = 0u64;
+        let mut deltas = CounterDeltas::default();
         let reply = dispatch(
             ctx,
             st,
             &env,
             store,
+            &mut wheel,
             now,
             &zero,
             MemoryInfo::default(),
-            &mut evicted,
+            &mut deltas,
             &req(parts),
         );
-        (reply, evicted)
+        (reply, deltas.evicted)
     }
 
     /// A context with the ceiling enabled at `per_shard_budget` bytes (single-shard
@@ -1838,5 +1943,1051 @@ mod tests {
             assert_eq!(r, Value::ok());
             assert_eq!(ev, 0);
         }
+    }
+
+    // -- TTL / EXPIRE family (PR-3b). --
+
+    fn int(v: Value) -> i64 {
+        match v {
+            Value::Integer(n) => n,
+            other => panic!("expected integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expire_sets_ttl_and_ttl_pttl_reflect_it_then_lazy_expires() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        // SET then EXPIRE 10 at t=0 -> deadline 10000ms.
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            UnixMillis(0),
+            &[b"SET", b"k", b"v"],
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(0),
+                &[b"EXPIRE", b"k", b"10"]
+            )),
+            1
+        );
+        // TTL ~10s, PTTL ~10000ms.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(0),
+                &[b"TTL", b"k"]
+            )),
+            10
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(0),
+                &[b"PTTL", b"k"]
+            )),
+            10_000
+        );
+        // Alive AT the deadline (Valkey boundary now > deadline).
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(10_000),
+                &[b"GET", b"k"]
+            ),
+            bulk(b"v")
+        );
+        // Expired one ms past the deadline.
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(10_001),
+                &[b"GET", b"k"]
+            ),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn pexpire_expireat_pexpireat_set_ttl() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"a", b"v"]);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"b", b"v"]);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"d", b"v"]);
+        // PEXPIRE a 5000 -> 5000ms.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PEXPIRE", b"a", b"5000"]
+            )),
+            1
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PTTL", b"a"]
+            )),
+            5_000
+        );
+        // EXPIREAT b 100 (absolute seconds) -> 100000ms.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIREAT", b"b", b"100"]
+            )),
+            1
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PEXPIRETIME", b"b"]
+            )),
+            100_000
+        );
+        // PEXPIREAT d 250000 (absolute ms).
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PEXPIREAT", b"d", b"250000"]
+            )),
+            1
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PEXPIRETIME", b"d"]
+            )),
+            250_000
+        );
+    }
+
+    #[test]
+    fn expire_on_missing_key_replies_zero() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"nope", b"10"]
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn expire_past_deadline_deletes_the_key_and_replies_one() {
+        // A resolved deadline strictly in the PAST deletes the key and replies 1.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        // now = 100000ms.
+        let t = UnixMillis(100_000);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        // EXPIREAT in the past (unix second 1 -> 1000ms, well before now): reply 1,
+        // key deleted.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIREAT", b"k", b"1"]
+            )),
+            1
+        );
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"GET", b"k"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn expire_nx_xx_gt_lt_accept_and_reject() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+
+        // NX on a key with NO TTL: applies (reply 1). Sets deadline 10000.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"10", b"NX"]
+            )),
+            1
+        );
+        // NX again now that a TTL exists: rejected (reply 0).
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"20", b"NX"]
+            )),
+            0
+        );
+        // XX with a TTL present: applies (reply 1). Set to 20000.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"20", b"XX"]
+            )),
+            1
+        );
+        // GT with a GREATER new expiry (30 > 20): applies.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"30", b"GT"]
+            )),
+            1
+        );
+        // GT with a LESSER new expiry (5 < 30): rejected.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"5", b"GT"]
+            )),
+            0
+        );
+        // LT with a LESSER new expiry (5 < 30): applies.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"5", b"LT"]
+            )),
+            1
+        );
+        // LT with a GREATER new expiry (100 > 5): rejected.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"100", b"LT"]
+            )),
+            0
+        );
+    }
+
+    #[test]
+    fn expire_gt_lt_treat_no_ttl_as_infinite() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        // A key with NO TTL is treated as +infinity.
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"g", b"v"]);
+        // GT against a no-TTL key NEVER applies (nothing is greater than infinity).
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"g", b"10", b"GT"]
+            )),
+            0
+        );
+        // Still no TTL.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"g"]
+            )),
+            -1
+        );
+        // LT against a no-TTL key ALWAYS applies (anything is less than infinity).
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"l", b"v"]);
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"l", b"10", b"LT"]
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn expire_conflicting_options_are_syntax_errors() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        for opts in [
+            vec![b"EXPIRE".as_slice(), b"k", b"10", b"NX", b"XX"],
+            vec![b"EXPIRE", b"k", b"10", b"NX", b"GT"],
+            vec![b"EXPIRE", b"k", b"10", b"NX", b"LT"],
+            vec![b"EXPIRE", b"k", b"10", b"GT", b"LT"],
+            vec![b"EXPIRE", b"k", b"10", b"BOGUS"],
+        ] {
+            match run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &opts) {
+                Value::Error(e) => assert_eq!(e.line(), "-ERR syntax error", "{opts:?}"),
+                other => panic!("expected syntax error for {opts:?}, got {other:?}"),
+            }
+        }
+        // GT+XX and LT+XX are LEGAL (no error). With a TTL present XX is satisfied.
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"EXPIRE", b"k", b"10"],
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRE", b"k", b"20", b"GT", b"XX"]
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn ttl_pttl_minus_two_minus_one_conventions() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        // Missing key -> -2.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"missing"]
+            )),
+            -2
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PTTL", b"missing"]
+            )),
+            -2
+        );
+        // Present, no TTL -> -1.
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"k"]
+            )),
+            -1
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PTTL", b"k"]
+            )),
+            -1
+        );
+        // EXPIRETIME/PEXPIRETIME conventions too.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRETIME", b"missing"]
+            )),
+            -2
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRETIME", b"k"]
+            )),
+            -1
+        );
+    }
+
+    #[test]
+    fn expiretime_pexpiretime_are_absolute() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        // PEXPIREAT to an absolute ms; EXPIRETIME is that / 1000, PEXPIRETIME is it.
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"PEXPIREAT", b"k", b"123456"],
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PEXPIRETIME", b"k"]
+            )),
+            123_456
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"EXPIRETIME", b"k"]
+            )),
+            123 // 123456 / 1000
+        );
+    }
+
+    #[test]
+    fn persist_removes_ttl_and_stops_expiring() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"SET", b"k", b"v", b"EX", b"10"],
+        );
+        // PERSIST removes the TTL -> reply 1.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PERSIST", b"k"]
+            )),
+            1
+        );
+        // TTL now -1 (no TTL).
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"k"]
+            )),
+            -1
+        );
+        // PERSIST again (no TTL) -> reply 0.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PERSIST", b"k"]
+            )),
+            0
+        );
+        // PERSIST on a missing key -> 0.
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PERSIST", b"gone"]
+            )),
+            0
+        );
+        // The key no longer expires at the old deadline.
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(20_000),
+                &[b"GET", b"k"]
+            ),
+            bulk(b"v")
+        );
+    }
+
+    #[test]
+    fn getex_matrix() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"SET", b"k", b"v", b"EX", b"100"],
+        );
+        // Bare GETEX returns the value and does NOT change the TTL.
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"GETEX", b"k"]),
+            bulk(b"v")
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"k"]
+            )),
+            100
+        );
+        // GETEX EX 5 sets a new TTL.
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"GETEX", b"k", b"EX", b"5"]
+            ),
+            bulk(b"v")
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"k"]
+            )),
+            5
+        );
+        // GETEX PERSIST clears the TTL.
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"GETEX", b"k", b"PERSIST"]
+            ),
+            bulk(b"v")
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"k"]
+            )),
+            -1
+        );
+        // GETEX on an absent key -> nil.
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"GETEX", b"absent"]),
+            Value::Null
+        );
+        // GETEX PXAT (absolute ms).
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"GETEX", b"k", b"PXAT", b"50000"],
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PEXPIRETIME", b"k"]
+            )),
+            50_000
+        );
+    }
+
+    #[test]
+    fn getex_wrongtype_and_invalid_expire() {
+        use ironcache_storage::{DataType, Encoding};
+        use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        // GETEX against a non-string -> WRONGTYPE.
+        let mut obj = KvObj::from_bytes(b"lst", b"x", None);
+        obj.header = Header {
+            data_type: DataType::List,
+            encoding: Encoding::ListPack,
+            eviction_rank: 0,
+            ttl_present: false,
+            snapshot_version: 0,
+        };
+        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        st.insert_object(0, obj);
+        match run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"GETEX", b"lst"]) {
+            Value::Error(e) => assert_eq!(
+                e.line(),
+                "-WRONGTYPE Operation against a key holding the wrong kind of value"
+            ),
+            other => panic!("expected WRONGTYPE, got {other:?}"),
+        }
+        // GETEX with an invalid (<= 0) expire -> invalid expire time in 'getex'.
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        match run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"GETEX", b"k", b"EX", b"0"],
+        ) {
+            Value::Error(e) => {
+                assert_eq!(e.line(), "-ERR invalid expire time in 'getex' command");
+            }
+            other => panic!("expected invalid expire time, got {other:?}"),
+        }
+        // GETEX with conflicting options -> syntax error.
+        match run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"GETEX", b"k", b"EX", b"5", b"PERSIST"],
+        ) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR syntax error"),
+            other => panic!("expected syntax error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setex_psetex_set_value_and_ttl() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        // SETEX k 10 v -> +OK, value set, TTL 10s.
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"SETEX", b"k", b"10", b"v"]
+            ),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"GET", b"k"]),
+            bulk(b"v")
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"TTL", b"k"]
+            )),
+            10
+        );
+        // PSETEX p 5000 v -> TTL 5000ms.
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PSETEX", b"p", b"5000", b"v"]
+            ),
+            Value::ok()
+        );
+        assert_eq!(
+            int(run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                t,
+                &[b"PTTL", b"p"]
+            )),
+            5_000
+        );
+    }
+
+    #[test]
+    fn setex_psetex_non_positive_is_invalid_expire_and_writes_nothing() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        match run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"SETEX", b"k", b"0", b"v"],
+        ) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR invalid expire time in 'setex' command"),
+            other => panic!("expected invalid expire time, got {other:?}"),
+        }
+        match run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t,
+            &[b"PSETEX", b"k", b"-1", b"v"],
+        ) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR invalid expire time in 'psetex' command"),
+            other => panic!("expected invalid expire time, got {other:?}"),
+        }
+        // Nothing was written.
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"GET", b"k"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn expire_family_arity_errors() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        for cmd in [
+            vec![b"EXPIRE".as_slice(), b"k"],
+            vec![b"PEXPIRE", b"k"],
+            vec![b"TTL"],
+            vec![b"PTTL", b"a", b"b"],
+            vec![b"PERSIST"],
+            vec![b"EXPIRETIME"],
+            vec![b"GETEX"],
+            vec![b"SETEX", b"k", b"10"],
+            vec![b"PSETEX", b"k", b"10"],
+        ] {
+            assert!(
+                matches!(
+                    run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &cmd),
+                    Value::Error(_)
+                ),
+                "expected arity error for {cmd:?}"
+            );
+        }
+    }
+
+    // -- Active drain + counters (PR-3b). --
+
+    #[test]
+    fn active_drain_reclaims_expired_keys_and_bumps_expired_counter() {
+        // Set short TTLs, advance now via the dispatch `now`, then issue a command:
+        // the active drain pops the due keys from the wheel and reaps them, bumping the
+        // expired delta.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        // Establish the wheel origin at t=0 (the first advance only sets the base).
+        let _ = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, UnixMillis(0), &[b"PING"]);
+        // Three keys each with a 1s TTL (deadline 1000ms), registered in the wheel.
+        for k in [b"a".as_slice(), b"b", b"c"] {
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(0),
+                &[b"SET", k, b"v", b"EX", b"1"],
+            );
+        }
+        assert_eq!(st.len(), 3);
+        // Advance well past the deadline and issue a command: the active drain reaps
+        // all three before the command body. The drain count is in the expired delta.
+        let (_r, deltas) = run_on_wheel_deltas(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            UnixMillis(5_000),
+            &[b"PING"],
+        );
+        assert_eq!(
+            deltas.expired, 3,
+            "active drain reaped the three expired keys"
+        );
+        // The store no longer holds them (the drain deleted them, not just the lazy
+        // backstop on a read).
+        assert_eq!(
+            st.len(),
+            0,
+            "expired keys are resident-evicted by the drain"
+        );
+    }
+
+    #[test]
+    fn active_drain_skips_re_ttld_key_via_store_recheck() {
+        // A stale wheel entry (a key whose TTL was extended) must NOT be reaped early:
+        // the store re-checks the real expire_at, so the drain skips it.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let _ = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, UnixMillis(0), &[b"PING"]);
+        // SET with a 1s TTL (deadline 1000), then EXTEND to 100s (deadline 100000).
+        // The wheel still holds the OLD 1000ms registration (a stale entry).
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            UnixMillis(0),
+            &[b"SET", b"k", b"v", b"EX", b"1"],
+        );
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            UnixMillis(0),
+            &[b"EXPIRE", b"k", b"100"],
+        );
+        // Advance past the OLD deadline (2000ms) but not the new one: the drain offers
+        // the stale entry, but the store re-check finds the key NOT expired and skips.
+        let (_r, deltas) = run_on_wheel_deltas(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            UnixMillis(2_000),
+            &[b"PING"],
+        );
+        assert_eq!(
+            deltas.expired, 0,
+            "stale wheel entry must not reap a re-TTL'd key"
+        );
+        assert_eq!(
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(2_000),
+                &[b"GET", b"k"]
+            ),
+            bulk(b"v"),
+            "the re-TTL'd key is still alive"
+        );
+    }
+
+    #[test]
+    fn keyspace_hits_and_misses_are_counted_for_reads() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t = UnixMillis(0);
+        run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"SET", b"k", b"v"]);
+        // GET hit.
+        let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"GET", b"k"]);
+        assert_eq!((d.keyspace_hits, d.keyspace_misses), (1, 0));
+        // GET miss.
+        let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"GET", b"absent"]);
+        assert_eq!((d.keyspace_hits, d.keyspace_misses), (0, 1));
+        // TTL miss (-2) on absent.
+        let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"TTL", b"absent"]);
+        assert_eq!((d.keyspace_hits, d.keyspace_misses), (0, 1));
+        // TTL hit (-1, present-no-ttl is still a found key).
+        let (_r, d) = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, t, &[b"TTL", b"k"]);
+        assert_eq!((d.keyspace_hits, d.keyspace_misses), (1, 0));
+    }
+
+    #[test]
+    fn determinism_replay_drives_identical_expiry_sets() {
+        // The same command + now sequence replays the identical expiry outcome (the
+        // determinism contract, ADR-0003: the wheel + store read time only via `now`).
+        let run = || -> (usize, u64) {
+            let c = ctx(None);
+            let mut s = state(&c);
+            let mut st = test_store(c.databases);
+            let mut wheel = TimingWheel::new();
+            let _ = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, UnixMillis(0), &[b"PING"]);
+            for i in 0..10u32 {
+                run_on_wheel(
+                    &c,
+                    &mut s,
+                    &mut st,
+                    &mut wheel,
+                    UnixMillis(0),
+                    &[b"SET", format!("k{i}").as_bytes(), b"v", b"PX", b"500"],
+                );
+            }
+            let mut total_expired = 0u64;
+            for step in [200u64, 600, 1_000, 5_000] {
+                let (_r, d) = run_on_wheel_deltas(
+                    &c,
+                    &mut s,
+                    &mut st,
+                    &mut wheel,
+                    UnixMillis(step),
+                    &[b"PING"],
+                );
+                total_expired += d.expired;
+            }
+            (st.len(), total_expired)
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "identical now sequence => identical expiry outcome");
+        // All ten keys expired (deadline 500ms, drained by step 600+).
+        assert_eq!(a.0, 0);
+        assert_eq!(a.1, 10);
     }
 }

@@ -676,6 +676,30 @@ pub trait Admit {
     fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64;
 }
 
+// ---------------------------------------------------------------------------
+// Active-expiry surface (EXPIRATION.md #51). A SEPARATE trait from the frozen four
+// primitives (like Admit): it lets the dispatch layer drive the per-shard timing
+// wheel's active drain WITHOUT naming the concrete store. The lazy expiry-on-read
+// backstop inside the four primitives remains the correctness guarantee; this surface
+// is the BOUNDED active reclamation that keeps resident memory for expired keys low.
+// ---------------------------------------------------------------------------
+
+/// The active-expiry reaping surface the dispatch layer drives from the timing wheel
+/// (EXPIRATION.md). NOT one of the frozen four primitives; an additive waist trait
+/// (the per-entry `expire_at` deadline it acts on was always part of the waist). The
+/// concrete per-shard store implements it; dispatch bounds on `S: Store + ActiveExpiry`
+/// so the bounded active drain runs generically over the same `now` basis.
+pub trait ActiveExpiry {
+    /// Reap `key` ONLY if it is present and its stored deadline has STRICTLY passed at
+    /// `now` (`now > expire_at`, the Valkey boundary). Returns whether a key was
+    /// actually reaped (firing the remove hooks). The timing wheel may offer a STALE
+    /// entry (a re-TTL'd / PERSISTed / overwritten key), so the implementation
+    /// RE-CHECKS the real `expire_at` and reaps only a genuinely-expired key; a live
+    /// key is left untouched and reported `false`. This is why a wheel registration
+    /// need not be kept consistent with the store (the drain self-corrects).
+    fn reap_if_expired(&mut self, db: u32, key: &[u8], now: UnixMillis) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod cmd_expire;
 pub mod cmd_keyspace;
 pub mod cmd_string;
 pub mod cmd_util;
@@ -22,11 +23,16 @@ pub mod dispatch;
 
 pub use admission::is_denyoom;
 pub use conn::ConnState;
-pub use dispatch::{RollupFn, ServerContext, dispatch};
+pub use dispatch::{MAX_RECLAIM_PER_CALL, RollupFn, ServerContext, dispatch};
 
 // Re-export the observe types the binary supplies to dispatch (the INFO memory
-// snapshot it reads once at the binary edge).
-pub use ironcache_observe::MemoryInfo;
+// snapshot it reads once at the binary edge, and the per-command counter deltas the
+// serve loop folds into the shard counters after dispatch returns).
+pub use ironcache_observe::{CounterDeltas, MemoryInfo};
+
+// Re-export the per-shard timing wheel the binary owns (Rc<RefCell<>>) and passes to
+// dispatch for the active TTL drain + deadline registration (#51).
+pub use ironcache_expiry::TimingWheel;
 
 // Re-export the protocol types callers need so the binary depends on one crate
 // for the server surface.
@@ -35,5 +41,6 @@ pub use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, Request, Value
 // Re-export the storage WAIST types the binary needs to construct/pass a store and
 // the `now` basis. The binary depends on ironcache-storage transitively through
 // here for the trait, and on ironcache-store directly for the concrete impl. `Admit`
-// is the PR-3a admission surface dispatch bounds on (evict-to-fit + policy queries).
-pub use ironcache_storage::{Admit, Store, UnixMillis};
+// is the PR-3a admission surface dispatch bounds on (evict-to-fit + policy queries);
+// `ActiveExpiry` is the PR-3b active-drain surface (reap_if_expired).
+pub use ironcache_storage::{ActiveExpiry, Admit, Store, UnixMillis};

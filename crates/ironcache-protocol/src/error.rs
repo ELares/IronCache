@@ -495,6 +495,25 @@ mod tests {
             ErrorReply::invalid_expire_time("set").line(),
             "-ERR invalid expire time in 'set' command"
         );
+        // The PR-3b TTL-setting commands reuse the same constructor with their own
+        // command name; pin the exact strings the EXPIRE family / GETEX / SETEX /
+        // PSETEX emit (byte-exact to Redis addReplyErrorExpireTime).
+        assert_eq!(
+            ErrorReply::invalid_expire_time("expire").line(),
+            "-ERR invalid expire time in 'expire' command"
+        );
+        assert_eq!(
+            ErrorReply::invalid_expire_time("getex").line(),
+            "-ERR invalid expire time in 'getex' command"
+        );
+        assert_eq!(
+            ErrorReply::invalid_expire_time("setex").line(),
+            "-ERR invalid expire time in 'setex' command"
+        );
+        assert_eq!(
+            ErrorReply::invalid_expire_time("psetex").line(),
+            "-ERR invalid expire time in 'psetex' command"
+        );
     }
 
     #[test]

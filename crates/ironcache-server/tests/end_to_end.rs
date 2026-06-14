@@ -12,7 +12,7 @@ use ironcache_observe::{CounterSnapshot, MemoryInfo, ServerInfo};
 use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, decode, encode_to_vec};
 use ironcache_runtime::tokio_rt::bind_reuseport;
 use ironcache_server::dispatch::ServerContext;
-use ironcache_server::{ConnState, UnixMillis, dispatch};
+use ironcache_server::{ConnState, CounterDeltas, TimingWheel, UnixMillis, dispatch};
 use ironcache_storage::CountingAccounting;
 use ironcache_store::{ShardStore, process_memory};
 use std::cell::RefCell;
@@ -54,6 +54,8 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
         Policy::cache_default(),
         CountingAccounting::new(),
     );
+    // The per-shard timing wheel (#51), owned alongside the store as the binary does.
+    let mut wheel = TimingWheel::new();
     let counters = RefCell::new(CounterSnapshot::default());
     let mut conn = ConnState::new(
         1,
@@ -83,16 +85,17 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
                     } else {
                         MemoryInfo::default()
                     };
-                    let mut evicted = 0u64;
+                    let mut deltas = CounterDeltas::default();
                     let reply = dispatch(
                         &ctx,
                         &mut conn,
                         &env,
                         &mut store,
+                        &mut wheel,
                         now,
                         &rollup,
                         mem,
-                        &mut evicted,
+                        &mut deltas,
                         &request,
                     );
                     let bytes = encode_to_vec(&reply, conn.proto);

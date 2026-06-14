@@ -22,6 +22,11 @@ ironcache-config = { workspace = true }
 # primitives + the hook types, never the concrete map. This dependency edge is the
 # compile-time proof of the layering contract (STORAGE_API.md).
 ironcache-storage = { workspace = true }
+# The per-shard TTL timing wheel (#51). It names only the storage waist's UnixMillis
+# basis (no concrete store type), so the command layer can register deadlines after a
+# TTL-setting command without reaching past the waist. The lazy backstop in the store
+# remains the correctness guarantee; the wheel is the active-reclamation optimization.
+ironcache-expiry = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]

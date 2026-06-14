@@ -17,7 +17,8 @@ use ironcache_runtime::bootstrap::{ShardConfig, ShardId, ShardSet};
 use ironcache_runtime::{Runtime, TokioRuntime};
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
-    ConnState, DecodeOutcome, Limits, ProtoVersion, Request, UnixMillis, decode, dispatch,
+    ConnState, CounterDeltas, DecodeOutcome, Limits, ProtoVersion, Request, TimingWheel,
+    UnixMillis, decode, dispatch,
 };
 use ironcache_storage::CountingAccounting;
 use ironcache_store::{ShardStore, process_memory};
@@ -120,6 +121,11 @@ thread_local! {
     // concrete ShardStore implements the Store + Admit waist traits the generic
     // dispatch runs against.
     static STORE: RefCell<Option<Rc<RefCell<ShardStoreImpl>>>> = const { RefCell::new(None) };
+    // The shard's per-shard TTL timing wheel (#51), held as Rc<RefCell<..>> exactly
+    // like STORE/ENV so it is core-local and unsynchronized (ADR-0002/0005). The
+    // active drain pops due keys from it before each command; TTL-setting commands
+    // register deadlines into it. Created lazily per shard thread.
+    static WHEEL: RefCell<Option<Rc<RefCell<TimingWheel>>>> = const { RefCell::new(None) };
     // One SystemEnv per shard thread (the sanctioned real-time boundary). It is
     // wrapped in a RefCell so the determinism seam's RNG half is REACHABLE: the
     // shard is single-threaded (current-thread runtime, !Send tasks), so clock
@@ -162,6 +168,16 @@ fn shard_store(databases: u32, policy_name: &str) -> Rc<RefCell<ShardStoreImpl>>
     })
 }
 
+fn shard_wheel() -> Rc<RefCell<TimingWheel>> {
+    WHEEL.with(|cell| {
+        let mut b = cell.borrow_mut();
+        if b.is_none() {
+            *b = Some(Rc::new(RefCell::new(TimingWheel::new())));
+        }
+        Rc::clone(b.as_ref().unwrap())
+    })
+}
+
 fn shard_env() -> Rc<RefCell<SystemEnv>> {
     ENV.with(|cell| {
         let mut b = cell.borrow_mut();
@@ -192,6 +208,7 @@ async fn serve_connection(
     let env = shard_env();
     let state_rc = shard_state();
     let store_rc = shard_store(ctx.databases, ctx.info.maxmemory_policy);
+    let wheel_rc = shard_wheel();
     // Correct the context's started_at to this shard's boot instant.
     ctx.info.started_at = shard_started_at();
 
@@ -226,7 +243,7 @@ async fn serve_connection(
             match decode(&read_buf, &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
                     let close = handle_request(
-                        &ctx, &mut conn, &env, &store_rc, &state_rc, &request, &mut out,
+                        &ctx, &mut conn, &env, &store_rc, &wheel_rc, &state_rc, &request, &mut out,
                     );
                     read_buf.drain(..consumed);
                     if close {
@@ -276,11 +293,13 @@ async fn serve_connection(
 /// (ADR-0003: the store reads no clock) and passed into dispatch wrapped in
 /// [`UnixMillis`]; the data commands convert relative EX/PX against it. Clock reads
 /// go through `env.borrow()`; the store is mutated through `store_rc.borrow_mut()`.
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     ctx: &ServerContext,
     conn: &mut ConnState,
     env: &Rc<RefCell<SystemEnv>>,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    wheel_rc: &Rc<RefCell<TimingWheel>>,
     state_rc: &Rc<RefCell<ShardState>>,
     request: &Request,
     out: &mut Vec<u8>,
@@ -309,29 +328,42 @@ fn handle_request(
     } else {
         MemoryInfo::default()
     };
-    let mut evicted = 0u64;
+    let mut deltas = CounterDeltas::default();
+    // The lazy-backstop expiry count this command produced (a separate signal from the
+    // dispatch deltas): the store accumulates it inside the four primitives, and we
+    // drain it after dispatch returns and fold it into `expired_keys` alongside the
+    // active-drain count, so both expiry paths feed the INFO counter.
+    let lazy_expired;
     let reply = {
         let mut store = store_rc.borrow_mut();
-        dispatch(
+        let mut wheel = wheel_rc.borrow_mut();
+        let r = dispatch(
             ctx,
             conn,
             &*env.borrow(),
             &mut *store,
+            &mut wheel,
             now,
             rollup,
             mem,
-            &mut evicted,
+            &mut deltas,
             request,
-        )
-        // The store borrow ends here, BEFORE the counter bump below borrows
+        );
+        lazy_expired = store.take_lazy_expired();
+        r
+        // The store/wheel borrows end here, BEFORE the counter apply below borrows
         // `state_rc` mutably (the rollup closure captured `state_rc` too, so the two
         // borrows must not overlap; they do not, the dispatch call has returned).
     };
-    // Roll the maxmemory eviction count (if any) into the shard's evicted_keys counter
-    // for INFO (PR-3a). Zero on every non-evicting command, so this is a cheap no-op
-    // on the hot path.
-    if evicted > 0 {
-        state_rc.borrow_mut().counters.on_evicted(evicted);
+    // Fold this command's dynamic counters into the shard's totals for INFO: the
+    // dispatch deltas (eviction / active-drain expiry / keyspace hit-miss) plus the
+    // lazy-backstop expiry count. Each is zero on a command that did not trigger it,
+    // so this is a cheap no-op on the common hot path.
+    {
+        deltas.expired += lazy_expired;
+        if deltas != CounterDeltas::default() {
+            state_rc.borrow_mut().counters.apply(deltas);
+        }
     }
     encode_into(out, &reply, conn.proto);
     conn.should_close

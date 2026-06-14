@@ -270,6 +270,7 @@ dependencies = [
  "ironcache-config",
  "ironcache-env",
  "ironcache-eviction",
+ "ironcache-expiry",
  "ironcache-observe",
  "ironcache-protocol",
  "ironcache-runtime",

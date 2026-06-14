@@ -63,6 +63,14 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// in lockstep with the accounting hook's add/sub deltas so the read is O(1).
     /// PR-2b swaps `used_memory()` to the jemalloc `stats.allocated` mallctl.
     used: u64,
+    /// The count of keys reaped by the LAZY expiry-on-read backstop since the last
+    /// drain (PR-3b INFO `expired_keys`, the lazy-path signal). The serve loop drains
+    /// it with [`Self::take_lazy_expired`] after each command and folds it into the
+    /// shard's `expired_keys` counter, so the lazy path contributes to `expired_keys`
+    /// alongside the active timing-wheel drain. Not a waist concept (it is an
+    /// introspection accumulator on the concrete store), so it adds no primitive
+    /// signature.
+    lazy_expired: u64,
 }
 
 impl ShardStore<NullEviction, CountingAccounting> {
@@ -87,6 +95,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             eviction,
             accounting,
             used: 0,
+            lazy_expired: 0,
         }
     }
 
@@ -161,6 +170,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 let bytes = obj.accounted_bytes();
                 self.account_sub(bytes);
                 self.eviction.on_remove(db, key, bytes);
+                // Count the lazy-backstop reclamation for INFO `expired_keys` (PR-3b).
+                // The serve loop drains this with `take_lazy_expired` after each
+                // command. This is the lazy-path signal that complements the active
+                // timing-wheel drain's count.
+                self.lazy_expired = self.lazy_expired.saturating_add(1);
             }
             return false;
         }
@@ -534,11 +548,45 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
     }
 }
 
+impl<E: EvictionHook, A: AccountingHook> ironcache_storage::ActiveExpiry for ShardStore<E, A> {
+    /// Reap `key` ONLY if it is present and its stored deadline has STRICTLY passed at
+    /// `now` (the active-drain re-check, EXPIRATION.md). The timing wheel may offer a
+    /// STALE entry (a re-TTL'd / PERSISTed / overwritten key), so this re-checks the
+    /// real `expire_at` and reaps only a genuinely-expired key (firing the
+    /// eviction/accounting remove hooks). A live key is left untouched and reported
+    /// `false`. The lazy-expired accumulator is NOT bumped here (the serve loop counts
+    /// active-drain reclamations separately into `expired_keys`), avoiding a double
+    /// count.
+    fn reap_if_expired(&mut self, db: u32, key: &[u8], now: UnixMillis) -> bool {
+        let db_idx = self.db_index(db);
+        let expired = self
+            .dbs
+            .get(db_idx)
+            .and_then(|m| m.get(key))
+            .is_some_and(|o| o.is_expired(now));
+        if !expired {
+            return false;
+        }
+        // remove_object fires on_remove + frees the bytes through the accounting hook.
+        self.remove_object(db, db_idx, key)
+    }
+}
+
 impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// Borrow the accounting hook (test/introspection helper).
     #[must_use]
     pub fn accounting(&self) -> &A {
         &self.accounting
+    }
+
+    /// Take (and reset) the count of keys reaped by the LAZY expiry-on-read backstop
+    /// since the last call (PR-3b INFO `expired_keys`, the lazy-path signal). The
+    /// serve loop calls this after each command and folds the result into the shard's
+    /// `expired_keys` counter, so both the lazy backstop and the active timing-wheel
+    /// drain contribute to `expired_keys`. Not a waist method; an introspection
+    /// accumulator on the concrete store.
+    pub fn take_lazy_expired(&mut self) -> u64 {
+        std::mem::take(&mut self.lazy_expired)
     }
 
     /// Insert a fully-formed [`KvObj`] under `db`, bypassing the string-only
