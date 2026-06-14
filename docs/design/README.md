@@ -64,3 +64,6 @@ Specs added as the M1 milestone progresses.
 - [ACL.md](ACL.md): the full ACL engine (SETUSER/GETUSER/categories/key+channel
   patterns/selectors) and aclfile persistence, as an additive superset of the M1
   default user (build deferred, shape specified) (#106).
+- [TLS.md](TLS.md): the embedded rustls TLS listener (no C TLS library, cert/key
+  config, dedicated tls-port and TLS-only mode, optional mTLS, TLS 1.2/1.3 floor,
+  measured plaintext-vs-TLS overhead) (#105).

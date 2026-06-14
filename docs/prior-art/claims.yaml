@@ -6779,3 +6779,49 @@ claims:
     best_source_url: https://redis.io/docs/latest/develop/reference/clients/
     note: 'redis.io and redis.conf: tcp-keepalive defaults to 300s since 3.2.1; SO_KEEPALIVE detects dead
       peers, ~2x the interval to close on Linux. Confirmed.'
+- id: rustls-pure-rust-tls12-tls13
+  dimension: resp-protocol-compat
+  system: rustls
+  version: 0.23.40 (released 2026-04-28)
+  claim: rustls is a modern pure-Rust TLS library that implements both TLS 1.2 and TLS 1.3 for clients
+    and servers, with no dependency on OpenSSL or any other C TLS library; it is designed to be safe-by-default,
+    deliberately excluding obsolete/insecure protocol versions (SSLv3, TLS 1.0, TLS 1.1) and requiring
+    no configuration to achieve a good level of cryptographic security.
+  value: TLS 1.2 + TLS 1.3 only; SSLv3/TLS1.0/TLS1.1 not supported; no C TLS library linked
+  source_url: https://github.com/rustls/rustls
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Pure-Rust status, TLS 1.2/1.3 support, exclusion of older protocols, and safe-defaults
+    philosophy confirmed directly from the rustls GitHub README via WebFetch.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://github.com/rustls/rustls
+    note: WebFetch of github.com/rustls/rustls confirms it is a pure-Rust TLS library (no OpenSSL/C TLS
+      lib), implements TLS 1.2 and TLS 1.3 for clients and servers, excludes SSLv3/TLS1.0/TLS1.1 by design,
+      and states it 'provides no unsafe features or obsolete cryptography by default.'
+- id: rustls-aws-lc-rs-default-ring-alternative
+  dimension: ops-build-distribution
+  system: rustls
+  version: 0.23.40 (released 2026-04-28)
+  claim: 'rustls ships two built-in first-party cryptographic backends selected by crate features: aws-lc-rs
+    (the aws_lc_rs feature, enabled by default; based on AWS-LC / BoringSSL, FIPS-certifiable, full feature
+    set incl. post-quantum, but adds build-time deps such as cmake) and ring (the ring feature, easier
+    to build across platforms). Both are Rust-crate providers, so neither requires linking system OpenSSL;
+    the active provider can be selected via with_crypto_provider on ClientConfig/ServerConfig, and default-features=false
+    removes the implicit aws-lc-rs dependency.'
+  value: default backend = aws-lc-rs; alternative = ring; no system OpenSSL link
+  source_url: https://docs.rs/rustls/
+  accessed_date: '2026-06-13'
+  confidence: high
+  confidence_reason: Default aws-lc-rs vs ring alternative, feature flags, with_crypto_provider, and default-features=false
+    opt-out all confirmed from docs.rs/rustls and the rustls GitHub README; FIPS/AWS-LC background corroborated
+    by the Prossimo (memorysafety.org) writeup.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://docs.rs/rustls/
+    note: docs.rs/rustls states aws-lc-rs is enabled by default and ring is available via crate feature;
+      GitHub README names rustls-aws-lc-rs (recommended) and rustls-ring (easier to build). memorysafety.org/blog/rustls-with-aws-crypto-back-end-and-fips
+      confirms aws-lc-rs is based on BoringSSL and is the only FIPS-certified Rust crypto provider for
+      rustls. Both providers are Rust crates, avoiding a system OpenSSL/C TLS dependency.
