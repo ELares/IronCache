@@ -12,6 +12,10 @@ Claim citations in these docs are validated in CI by
   (#18).
 - [HARDENING.md](HARDENING.md): RESP request-size and adversarial-input limits
   (#138).
+- [RUNTIME.md](RUNTIME.md): shared-nothing thread-per-core runtime, io_uring
+  fast path with portable fallback, and the Env seam (#25).
+- [STORAGE_API.md](STORAGE_API.md): the four-primitive narrow-waist storage
+  contract (Read/Upsert/Delete/RMW) with hooks (#34).
 
 More design specs land here as the Implementation Readiness milestone progresses
 (runtime, storage API, hash table, eviction, expiration, commands, CLI, config,
