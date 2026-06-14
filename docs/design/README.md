@@ -43,5 +43,9 @@ Claim citations in these docs are validated in CI by
 - [BENCHMARK.md](BENCHMARK.md): the reproducible benchmark harness, per-key memory
   model, and the Valkey head-to-head baseline (#8, #96).
 
-This completes the Implementation Readiness design specs. Further specs land here
-as the M1 Architecture Specification milestone progresses.
+## M1: Architecture Specification
+
+Specs added as the M1 milestone progresses.
+
+- [AUTH.md](AUTH.md): the AUTH handshake and credential model (HELLO AUTH, AUTH,
+  requirepass, SHA-256 password storage, default user) (#104).
