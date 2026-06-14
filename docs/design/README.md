@@ -30,6 +30,14 @@ Claim citations in these docs are validated in CI by
   lists, hashes, sets, sorted sets (arity, flags, *STORE, error edges) (#128).
 - [KEYSPACE.md](KEYSPACE.md): generic keyspace commands and the SCAN
   cursor-stability contract, plus DUMP/RESTORE (#129).
+- [CLI_BINARY.md](CLI_BINARY.md): the single static binary, its clap
+  subcommands, zero-config boot, and self-update (#81).
+- [CONFIG.md](CONFIG.md): TOML config, CONFIG GET/SET/REWRITE parity, and live
+  reload (#85).
+- [OBSERVABILITY.md](OBSERVABILITY.md): native Prometheus, INFO/SLOWLOG/LATENCY
+  parity, and the metric/INFO registry (#86, #152).
+- [ADMISSION.md](ADMISSION.md): connection admission, maxclients, output-buffer
+  limits, and the OOM-write contract (#137).
 
 More design specs land here as the Implementation Readiness milestone progresses
 (runtime, storage API, hash table, eviction, expiration, commands, CLI, config,
