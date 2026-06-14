@@ -18,6 +18,14 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    # Zlib: pulled transitively by `foldhash`, hashbrown 0.16's default hasher
+    # (ADR-0005, the per-shard SwissTable in ironcache-store). The Zlib license is
+    # OSI-approved and FSF Free/Libre, and permissive (BSD/MIT-class: use freely,
+    # no copyleft, only a misrepresentation-of-origin clause). foldhash is also the
+    # DETERMINISTIC default hasher (fixed seed, no OS entropy), which suits the
+    # determinism invariant (ADR-0003) better than std's RandomState would. Allowed
+    # here so the store crate's hashbrown dependency passes the licenses gate.
+    "Zlib",
 ]
 confidence-threshold = 0.9
 
