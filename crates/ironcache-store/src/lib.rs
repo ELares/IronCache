@@ -499,6 +499,28 @@ pub fn process_resident_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// The process-wide jemalloc `(allocated, resident)` pair in bytes, read from a
+/// SINGLE epoch snapshot: the epoch is advanced ONCE and both `stats.allocated`
+/// (the `used_memory` analog) and `stats.resident` (RSS) are then read from that
+/// same refreshed snapshot. INFO uses this so its two memory figures are mutually
+/// consistent (no skew from two independent epoch advances). Either stat degrades
+/// to 0 if it cannot be read. Process-global; call ONCE per INFO on the serving
+/// shard, NOT summed across shards.
+#[cfg(not(target_env = "msvc"))]
+#[must_use]
+pub fn process_memory() -> (u64, u64) {
+    // One epoch advance refreshes the cached stats; both reads then come from the
+    // same snapshot.
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    let allocated = tikv_jemalloc_ctl::stats::allocated::read()
+        .map(|b| b as u64)
+        .unwrap_or(0);
+    let resident = tikv_jemalloc_ctl::stats::resident::read()
+        .map(|b| b as u64)
+        .unwrap_or(0);
+    (allocated, resident)
+}
+
 /// MSVC fallback: the system allocator is selected there (no jemalloc to query),
 /// so the process-global allocator figure is unavailable and reported as 0. INFO
 /// still emits the field with a parse-clean value.
@@ -513,4 +535,12 @@ pub fn process_allocated_bytes() -> u64 {
 #[must_use]
 pub fn process_resident_bytes() -> u64 {
     0
+}
+
+/// MSVC fallback for the single-snapshot pair (see [`process_allocated_bytes`]):
+/// no jemalloc to query, so both figures are 0.
+#[cfg(target_env = "msvc")]
+#[must_use]
+pub fn process_memory() -> (u64, u64) {
+    (0, 0)
 }

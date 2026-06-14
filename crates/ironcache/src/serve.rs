@@ -18,7 +18,7 @@ use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
     ConnState, DecodeOutcome, Limits, ProtoVersion, Request, UnixMillis, decode, dispatch,
 };
-use ironcache_store::{ShardStore, process_allocated_bytes, process_resident_bytes};
+use ironcache_store::{ShardStore, process_memory};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -261,15 +261,17 @@ fn handle_request(
     // borrow_mut with no conflict: overlapping borrows of distinct RefCells never
     // alias the same cell.
     let now = UnixMillis(env.borrow().now_unix_millis());
-    // The process-global allocator figures for INFO (ADR-0006). They advance the
-    // jemalloc epoch (a mallctl call), so read them ONLY for INFO (read once, on the
-    // shard serving the command) and keep them off every other command's hot path.
-    // A process-global figure must NOT be summed across shards; one read on the
-    // serving shard is the honest total.
+    // The process-global allocator figures for INFO (ADR-0006). One call advances
+    // the jemalloc epoch (a mallctl) ONCE and reads allocated + resident from the
+    // SAME snapshot, so the two INFO figures are mutually consistent. Read it ONLY
+    // for INFO (once, on the shard serving the command) and keep it off every other
+    // command's hot path. A process-global figure must NOT be summed across shards;
+    // one read on the serving shard is the honest total.
     let mem = if request.command().eq_ignore_ascii_case(b"INFO") {
+        let (used_memory, used_memory_rss) = process_memory();
         MemoryInfo {
-            used_memory: process_allocated_bytes(),
-            used_memory_rss: process_resident_bytes(),
+            used_memory,
+            used_memory_rss,
         }
     } else {
         MemoryInfo::default()

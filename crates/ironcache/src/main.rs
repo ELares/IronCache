@@ -223,7 +223,10 @@ fn print_allocator_check() {
 
 #[cfg(target_env = "msvc")]
 fn print_allocator_check() {
-    println!("  allocator   = system (jemalloc not built on this target)");
+    // Report "libc" (Redis's name for a system-malloc build), matching INFO's
+    // `mem_allocator` (serve.rs GLOBAL_ALLOCATOR_NAME) so the same allocator has one
+    // name across `check` and INFO.
+    println!("  allocator   = libc (jemalloc not built on this target)");
 }
 
 fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
