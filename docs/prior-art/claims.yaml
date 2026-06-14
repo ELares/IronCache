@@ -8018,3 +8018,74 @@ claims:
       (published 2026-02-02, MSRV Rust 1.85); crate description confirms it implements RFC 8439 ChaCha20Poly1305
       plus the XChaCha20Poly1305 extended-nonce variant and ChaCha8/ChaCha12Poly1305. Both crates are
       part of RustCrypto/AEADs.'
+- id: go-redis-jedis-lettuce-default-resp3
+  dimension: resp-protocol-compat
+  system: go-redis (Go), Jedis (Java), Lettuce (Java) Redis client drivers
+  version: go-redis v9.20.1 (2026-06-11); Jedis 5.2.0 (2024-09-27); Lettuce 6.7.1.RELEASE
+  claim: 'Beyond redis-py 8 / node-redis 6, three more major drivers default to (or auto-negotiate) RESP3:
+    go-redis v9 uses RESP3 by default when the Options.Protocol field is left unset (settable to 2 or
+    3); Lettuce 6.x defaults to ProtocolVersion.newestSupported(), performing a HELLO handshake that selects
+    RESP3 when the server supports it (Redis docs: ''Lettuce uses [RESP3] by default''); Jedis 5.x UnifiedJedis-based
+    clients perform RESP3 auto-negotiation by default with graceful fallback to RESP2, and protocol can
+    be pinned via RedisProtocol.RESP3.'
+  value: go-redis v9 default = RESP3 (Protocol unset); Lettuce 6.x default = newestSupported() -> RESP3
+    via HELLO; Jedis 5.x default = RESP3 auto-negotiate with RESP2 fallback
+  source_url: https://github.com/redis/go-redis
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: go-redis README/Uptrace and Redis Lettuce/Jedis connect docs each confirm RESP3-default/auto-negotiation;
+    Lettuce mechanism (newestSupported HELLO discovery) cross-confirmed via ClientOptions source and Client
+    Options wiki.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/develop/clients/lettuce/connect/
+    note: Redis Lettuce connect doc states Lettuce uses RESP3 by default (newestSupported discovery via
+      HELLO); Jedis connect doc and 5.2.0 release confirm RESP3 with RESP2 fallback; go-redis docs show
+      Protocol:3 as default with explicit 2/3 override.
+- id: stackexchange-redis-default-resp2-optin
+  dimension: resp-protocol-compat
+  system: StackExchange.Redis (.NET) Redis client driver
+  version: StackExchange.Redis 2.x (>= 2.13, < 3.0), non-AMR endpoints
+  claim: StackExchange.Redis 2.x (current stable line, >= 2.13 and < 3.0) defaults to RESP2 for non-Azure-Managed-Redis
+    endpoints; RESP3 is opt-in via configurationOptions.Protocol = RedisProtocol.Resp3 or the 'protocol=resp3'
+    connection-string option, with automatic RESP2 fallback if the server does not support RESP3. RESP3
+    is planned to become the default in version 3.0. This contrasts with the RESP3-by-default Java/Go/Python/Node
+    drivers.
+  value: StackExchange.Redis 2.x default = RESP2 (RESP3 opt-in); RESP3 becomes default in 3.0
+  source_url: https://stackexchange.github.io/StackExchange.Redis/Resp3.html
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Official StackExchange.Redis Resp3.html doc explicitly states default for >= 2.13
+    and < 3.0 (non-AMR) is RESP2 and that 3.0 will make RESP3 default; corroborated by Configuration docs
+    and release notes.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://stackexchange.github.io/StackExchange.Redis/Resp3.html
+    note: 'Exact wording: ''Library version >= 2.13 and < 3.0 (non-AMR) RESP2''; RESP3 enabled via options.Protocol
+      = RedisProtocol.Resp3 or protocol=resp3; 3.0 planned to default RESP3.'
+- id: redis-drivers-ship-server-integration-test-suites
+  dimension: resp-protocol-compat
+  system: Major Redis client drivers (go-redis, Jedis, Lettuce, redis-py, node-redis, ioredis, StackExchange.Redis)
+  version: go-redis v9.20.1; Jedis 5.2.0; Lettuce 6.7.1.RELEASE (representative current pins)
+  claim: 'Each major Redis driver ships its own integration test suite designed to run against a live
+    Redis server rather than only mocks: e.g. go-redis exposes ''make test'' which uses docker-compose
+    to spin up real Redis containers and runs Ginkgo-based integration specs against them; Jedis/Lettuce
+    run their JUnit suites against a server via Maven (mvn test) plus repo Makefile/test harness. A new
+    RESP-compatible server can therefore be validated by pointing these upstream driver suites at it.'
+  value: Drivers provide server-runnable integration suites (e.g. go-redis 'make test' -> docker-compose
+    + Ginkgo; Jedis/Lettuce 'mvn test' against a server)
+  source_url: https://github.com/redis/go-redis/blob/master/CONTRIBUTING.md
+  accessed_date: '2026-06-14'
+  confidence: medium
+  confidence_reason: 'go-redis ''make test'' via docker-compose + Ginkgo confirmed via CONTRIBUTING/issue
+    #3490 and search; Jedis/Lettuce maven-against-server suites are well established but the exact harness
+    wording was not directly quoted from a single canonical page in this session.'
+  load_bearing: false
+  verification:
+    verdict: self-verified
+    best_source_url: https://github.com/redis/go-redis/issues/3490
+    note: 'go-redis CONTRIBUTING ''make test'' spins Redis via docker-compose and runs Ginkgo integration
+      tests (issue #3490 discusses these integration tests). Jedis/Lettuce JUnit suites run against a
+      live server via Maven per their repos; treat the cross-driver generalization as medium confidence.'
