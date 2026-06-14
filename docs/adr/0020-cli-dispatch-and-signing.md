@@ -1,7 +1,7 @@
 # ADR-0020: CLI mode dispatch and artifact signing
 
 Status: Accepted
-Issue: #82
+Issue: #82, #119
 
 ## Context
 

@@ -20,18 +20,25 @@ concrete metric/label/INFO-field registry with cardinality bounds.
 
 - `INFO` returns the standard sections [redis-info-sections] with Redis-recognized
   field names, so `redis_exporter` and existing parsers work unchanged (ADR-0009).
-- `SLOWLOG` (default threshold 10000 us, 128 entries [redis-slowlog-defaults]) and
-  `LATENCY` (monitor off by default [redis-latency-monitor-default-off]) match
-  Redis behavior and defaults.
+- `SLOWLOG` keeps Redis's defaults (threshold 10000 us, 128 entries
+  [redis-slowlog-defaults]) and reply shape. `LATENCY` monitoring is ON by default
+  in IronCache (#86) — a deliberate divergence from Redis, where the latency
+  monitor ships off [redis-latency-monitor-default-off]: better day-one
+  observability is worth the small always-on cost, and the threshold stays
+  configurable. The command surface and reply shapes still match Redis so existing
+  tooling parses them unchanged.
 
 ### Native Prometheus endpoint (no sidecar)
 
 - Unlike Redis, which has no native Prometheus endpoint and relies on a separate
   `redis_exporter` process [redis-no-builtin-prometheus], IronCache serves
-  `/metrics` in-process (an HTTP endpoint on a configurable `--metrics-addr`),
-  the way Dragonfly serves metrics on its own port
-  [dragonfly-native-prometheus-6379-metrics]. No exporter sidecar, no extra hop,
-  no lag. The single-binary thesis (#81) requires this.
+  `/metrics` in-process. That native in-process metrics are viable in a cache is
+  shown by Dragonfly, which exposes Prometheus metrics from the server process
+  itself [dragonfly-native-prometheus-6379-metrics] rather than via a sidecar — a
+  data point, not a layout IronCache copies. No exporter sidecar, no extra hop, no
+  lag; the single-binary thesis (#81) requires this. The exact transport — a
+  dedicated HTTP `--metrics-addr` vs serving `/metrics` on the existing RESP port —
+  is an open #86 decision (see Open questions).
 
 ### Metric/label registry (#152)
 
@@ -67,6 +74,8 @@ concrete metric/label/INFO-field registry with cardinality bounds.
   summaries.
 - Whether the native INFO section is on by default or behind a flag (cardinality
   vs visibility).
+- The metrics transport and port: a dedicated HTTP endpoint (`--metrics-addr`) vs
+  serving `/metrics` on the existing RESP port, decided in #86.
 
 ## Acceptance and test hooks
 
@@ -75,8 +84,9 @@ concrete metric/label/INFO-field registry with cardinality bounds.
 - `/metrics` serves in-process with no sidecar; metric names/labels match the
   versioned registry; per-command series cannot exceed the cardinality bound (a
   cardinality test feeding a high-arity workload).
-- `SLOWLOG`/`LATENCY`/`INFO` defaults and reply shapes match the pinned oracle
-  (#97).
+- `SLOWLOG`/`INFO` defaults and `SLOWLOG`/`LATENCY`/`INFO` reply shapes match the
+  pinned oracle (#97); `LATENCY` monitoring is asserted ON by default (the
+  documented #86 divergence), not off.
 
 ## References
 
