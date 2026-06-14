@@ -148,3 +148,5 @@ Specs added as the M1 milestone progresses.
   default, bounded global table, RESP2 REDIRECT) (#21).
 - [BITMAPS.md](BITMAPS.md): bitmap and BITFIELD semantics over the string type
   (SETBIT/GETBIT zero-fill, BITCOUNT/BITPOS BYTE|BIT, BITOP, BITFIELD overflow) (#131).
+- [SHUTDOWN.md](SHUTDOWN.md): the graceful shutdown contract (SHUTDOWN NOSAVE/SAVE,
+  SIGTERM/SIGINT, connection drain, save-on-exit, orchestrator grace/exit-code) (#139).
