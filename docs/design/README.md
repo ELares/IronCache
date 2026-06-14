@@ -114,3 +114,8 @@ Specs added as the M1 milestone progresses.
 - [ADMIN_COMMANDS.md](ADMIN_COMMANDS.md): the admin/introspection command family
   (CLIENT LIST/INFO/KILL/PAUSE/NO-EVICT/NO-TOUCH with byte-faithful-vs-synthesized
   fields, COMMAND DOCS/INFO/COUNT/GETKEYS, RESET semantics) (#150).
+- [RUNTIME_ABSTRACTION.md](RUNTIME_ABSTRACTION.md): the Runtime/IO trait seam
+  (owned buffers, monomorphization, Cargo-feature backend select) keeping
+  monoio/glommio/tokio swappable (#27).
+- [IOURING_DATAPATH.md](IOURING_DATAPATH.md): the Linux io_uring net fast path
+  (per-shard ring, registered fixed buffers, multishot + one-shot fallback) (#28).
