@@ -125,3 +125,5 @@ Specs added as the M1 milestone progresses.
   listpack deque, O(1) head/tail, ~8KB node sizing) (#135).
 - [OBJECT_ENCODING_MAPPING.md](OBJECT_ENCODING_MAPPING.md): the internal-repr to
   OBJECT ENCODING name map and DEBUG OBJECT field synthesis (#40).
+- [HYPERLOGLOG.md](HYPERLOGLOG.md): the wire-compatible HyperLogLog (dense P=14 +
+  sparse ZERO/XZERO/VAL, PFADD/PFCOUNT/PFMERGE, byte-exact DUMP/RESTORE) (#115).
