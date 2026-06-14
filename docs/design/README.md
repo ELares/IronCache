@@ -61,3 +61,6 @@ Specs added as the M1 milestone progresses.
 - [CONNECTION_LIFECYCLE.md](CONNECTION_LIFECYCLE.md): idle-connection `timeout`,
   TCP keepalive for dead-peer detection, and the reaping of dead/wedged/blocked
   connections with per-core resource reclamation (#140).
+- [ACL.md](ACL.md): the full ACL engine (SETUSER/GETUSER/categories/key+channel
+  patterns/selectors) and aclfile persistence, as an additive superset of the M1
+  default user (build deferred, shape specified) (#106).
