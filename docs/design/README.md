@@ -92,3 +92,7 @@ Specs added as the M1 milestone progresses.
 - [CLUSTER_CONTRACT.md](CLUSTER_CONTRACT.md): the Redis-Cluster-compatible client
   wire contract (CRC16/16384 slots, hash tags, CROSSSLOT, MOVED/ASK, CLUSTER
   SLOTS/SHARDS, sharded Pub/Sub) (#70).
+- [CONTROL_PLANE.md](CONTROL_PLANE.md): the in-binary Raft control plane owning the
+  authoritative slot map, config epoch, membership, and replica promotion (#73).
+- [MEMBERSHIP.md](MEMBERSHIP.md): SWIM + non-optional Lifeguard data-plane
+  membership and failure detection, joined with the Raft-committed map (#74).
