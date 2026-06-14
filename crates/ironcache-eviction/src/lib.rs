@@ -2,7 +2,7 @@
 //! Pluggable eviction policies for IronCache (EVICTION.md #48/#50, ADR-0007/0008).
 //!
 //! This crate extends the reserved [`ironcache_storage::EvictionHook`] with the
-//! [`EvictionPolicy`] trait (policy identity + posture) and bundles the three PR-3a
+//! [`EvictionPolicy`] trait (policy identity + posture) and bundles the eviction
 //! policies behind one enum-dispatched [`Policy`]:
 //!
 //! - [`Policy::NoEviction`] - strict datastore mode: never selects a victim, so a
@@ -12,6 +12,13 @@
 //!   key fingerprints, with a 2-bit frequency counter (`s3fifo-freq-counter-2bit-cap3`).
 //! - [`Policy::Random`] - a uniformly-random victim drawn through the determinism
 //!   seam's RNG (ADR-0003), the `allkeys-random`/`volatile-random` mapping.
+//! - [`Policy::WTinyLfu`] - the selectable W-TinyLFU-fronted variant (#49,
+//!   WTINYLFU.md): a 4-bit count-min frequency sketch (min-increment + periodic
+//!   halving aging) over a recency victim FIFO, serving the `allkeys-lfu`/`volatile-lfu`
+//!   names. PR-3c makes these names REAL W-TinyLFU (they mapped to S3-FIFO under a
+//!   documented 3a divergence). The admission decision is wired as a frequency-ordered
+//!   victim choice (evict the lowest-estimated-frequency resident), a documented
+//!   divergence from full TinyLFU candidate-vs-victim admission (see [`WTinyLfu`]).
 //!
 //! ## Where the 2-bit frequency lives (a documented PR-3a choice)
 //!
@@ -58,9 +65,11 @@
 
 mod random;
 mod s3fifo;
+mod wtinylfu;
 
 pub use random::Random;
 pub use s3fifo::S3Fifo;
+pub use wtinylfu::{CmSketch, WTinyLfu};
 
 use ironcache_storage::EvictionHook;
 
@@ -118,8 +127,10 @@ pub enum Policy {
     /// A uniformly-random victim through the determinism seam (ADR-0003). Maps to
     /// `allkeys-random`/`volatile-random`.
     Random(Random),
-    // 3c: WTinyLfu - the W-TinyLFU-fronted admission filter (#49) is DEFERRED to a
-    // later PR; it adds a per-shard 4-bit Count-Min sketch, out of scope for 3a.
+    /// The selectable W-TinyLFU-fronted variant (#49, WTINYLFU.md): a 4-bit count-min
+    /// frequency sketch over a recency victim FIFO. `volatile_only` restricts it to
+    /// TTL-bearing keys (the `volatile-*` family). Serves `allkeys-lfu`/`volatile-lfu`.
+    WTinyLfu(WTinyLfu),
 }
 
 impl Policy {
@@ -140,6 +151,7 @@ impl EvictionHook for Policy {
             Policy::NoEviction => {}
             Policy::S3Fifo(p) => p.on_access(db, key),
             Policy::Random(p) => p.on_access(db, key),
+            Policy::WTinyLfu(p) => p.on_access(db, key),
         }
     }
 
@@ -149,6 +161,7 @@ impl EvictionHook for Policy {
             Policy::NoEviction => {}
             Policy::S3Fifo(p) => p.on_insert(db, key, bytes),
             Policy::Random(p) => p.on_insert(db, key, bytes),
+            Policy::WTinyLfu(p) => p.on_insert(db, key, bytes),
         }
     }
 
@@ -158,6 +171,7 @@ impl EvictionHook for Policy {
             Policy::NoEviction => {}
             Policy::S3Fifo(p) => p.on_remove(db, key, bytes),
             Policy::Random(p) => p.on_remove(db, key, bytes),
+            Policy::WTinyLfu(p) => p.on_remove(db, key, bytes),
         }
     }
 
@@ -167,6 +181,7 @@ impl EvictionHook for Policy {
             Policy::NoEviction => None,
             Policy::S3Fifo(p) => p.select_victim(),
             Policy::Random(p) => p.select_victim(),
+            Policy::WTinyLfu(p) => p.select_victim(),
         }
     }
 }
@@ -179,6 +194,7 @@ impl EvictionPolicy for Policy {
             Policy::NoEviction => "noeviction".to_owned(),
             Policy::S3Fifo(p) => p.policy_name(),
             Policy::Random(p) => p.policy_name(),
+            Policy::WTinyLfu(p) => p.policy_name(),
         }
     }
 
@@ -191,6 +207,7 @@ impl EvictionPolicy for Policy {
             Policy::NoEviction => false,
             Policy::S3Fifo(p) => p.volatile_only(),
             Policy::Random(p) => p.volatile_only(),
+            Policy::WTinyLfu(p) => p.volatile_only(),
         }
     }
 
@@ -200,6 +217,7 @@ impl EvictionPolicy for Policy {
             Policy::NoEviction => {}
             Policy::S3Fifo(p) => p.re_register(db, key),
             Policy::Random(p) => p.re_register(db, key),
+            Policy::WTinyLfu(p) => p.re_register(db, key),
         }
     }
 }
@@ -240,28 +258,32 @@ pub fn is_valid_policy_name(name: &str) -> bool {
 /// engine that SERVES them is FIFO-class (a documented victim-ordering divergence,
 /// ADR-0009; see [`S3Fifo::engine_family`] for the engine label).
 ///
-/// Mapping (EVICTION.md / ADR-0009):
+/// Mapping (EVICTION.md / ADR-0009; the `*-lfu` rows are now REAL W-TinyLFU, PR-3c):
 /// - `noeviction` -> [`Policy::NoEviction`] (strict datastore mode).
-/// - `allkeys-lru` / `allkeys-lfu` -> S3-FIFO over all keys. The `*-lfu` name is
-///   SERVED by the FIFO-class engine: the name is accepted and ECHOED VERBATIM, but
-///   the victim ordering is S3-FIFO's, not Redis's sampled LFU (a documented
-///   default-behavior divergence, ADR-0009).
+/// - `allkeys-lru` -> S3-FIFO over all keys. The `*-lru` name is served by the
+///   FIFO-class engine, a documented victim-ordering divergence (ADR-0009).
+/// - `allkeys-lfu` -> [`Policy::WTinyLfu`] over all keys: the real W-TinyLFU-fronted
+///   variant (#49). PR-3a mapped `*-lfu` to S3-FIFO as a documented stand-in; PR-3c
+///   makes it the actual frequency-admission engine. The name still echoes verbatim.
 /// - `allkeys-random` -> [`Policy::Random`] over all keys.
-/// - `volatile-lru` / `volatile-lfu` / `volatile-ttl` -> S3-FIFO restricted to
-///   TTL-bearing keys, each echoing its own configured name verbatim. `volatile-ttl`
-///   nearest-expiry-first ordering lands with the timing wheel in 3b; for 3a it maps
-///   to S3-FIFO `volatile_only` with that documented note (ADR-0009).
+/// - `volatile-lru` / `volatile-ttl` -> S3-FIFO restricted to TTL-bearing keys, each
+///   echoing its own configured name verbatim. `volatile-ttl` nearest-expiry-first
+///   ordering is a documented divergence (it maps to S3-FIFO `volatile_only`, ADR-0009).
+/// - `volatile-lfu` -> [`Policy::WTinyLfu`] restricted to TTL-bearing keys: the real
+///   W-TinyLFU variant over the volatile set (`volatile_only=true`).
 /// - `volatile-random` -> [`Policy::Random`] restricted to TTL-bearing keys.
 #[must_use]
 pub fn map_policy_name(name: &str, rng_seed: u64) -> Option<Policy> {
     let lower = name.to_ascii_lowercase();
     let policy = match lower.as_str() {
         "noeviction" => Policy::NoEviction,
-        "allkeys-lru" | "allkeys-lfu" => Policy::S3Fifo(S3Fifo::with_name(false, &lower)),
+        "allkeys-lru" => Policy::S3Fifo(S3Fifo::with_name(false, &lower)),
+        // `*-lfu` is now REAL W-TinyLFU (PR-3c): the 4-bit count-min frequency engine,
+        // no longer the S3-FIFO 3a stand-in. The configured name still round-trips.
+        "allkeys-lfu" => Policy::WTinyLfu(WTinyLfu::with_name(false, &lower)),
         "allkeys-random" => Policy::Random(Random::with_name(rng_seed, false, &lower)),
-        "volatile-lru" | "volatile-lfu" | "volatile-ttl" => {
-            Policy::S3Fifo(S3Fifo::with_name(true, &lower))
-        }
+        "volatile-lru" | "volatile-ttl" => Policy::S3Fifo(S3Fifo::with_name(true, &lower)),
+        "volatile-lfu" => Policy::WTinyLfu(WTinyLfu::with_name(true, &lower)),
         "volatile-random" => Policy::Random(Random::with_name(rng_seed, true, &lower)),
         _ => return None,
     };
@@ -339,6 +361,47 @@ mod tests {
             // And it is the configured name verbatim (round-trip).
             assert_eq!(echoed, name, "{name} must echo verbatim");
         }
+    }
+
+    #[test]
+    fn lfu_names_map_to_real_wtinylfu_with_verbatim_name() {
+        // PR-3c: `*-lfu` now maps to the REAL W-TinyLFU variant (not the 3a S3-FIFO
+        // stand-in), echoing the configured name verbatim and carrying the right posture.
+        let all = map_policy_name("allkeys-lfu", 1).expect("allkeys-lfu maps");
+        assert!(
+            matches!(all, Policy::WTinyLfu(_)),
+            "allkeys-lfu must map to the W-TinyLFU variant"
+        );
+        assert_eq!(all.policy_name(), "allkeys-lfu");
+        assert!(all.evicts());
+        assert!(!all.volatile_only());
+
+        let vol = map_policy_name("volatile-lfu", 1).expect("volatile-lfu maps");
+        assert!(
+            matches!(vol, Policy::WTinyLfu(_)),
+            "volatile-lfu must map to the W-TinyLFU variant"
+        );
+        assert_eq!(vol.policy_name(), "volatile-lfu");
+        assert!(vol.volatile_only());
+
+        // Case-insensitive input still echoes the lowercased configured spelling.
+        let ci = map_policy_name("AllKeys-LFU", 1).unwrap();
+        assert!(matches!(ci, Policy::WTinyLfu(_)));
+        assert_eq!(ci.policy_name(), "allkeys-lfu");
+
+        // The non-lfu names keep their existing engines (regression guard).
+        assert!(matches!(
+            map_policy_name("allkeys-lru", 1).unwrap(),
+            Policy::S3Fifo(_)
+        ));
+        assert!(matches!(
+            map_policy_name("volatile-ttl", 1).unwrap(),
+            Policy::S3Fifo(_)
+        ));
+        assert!(matches!(
+            map_policy_name("allkeys-random", 1).unwrap(),
+            Policy::Random(_)
+        ));
     }
 
     #[test]

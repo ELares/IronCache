@@ -624,7 +624,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use ironcache_env::{Monotonic, TestEnv};
-    use ironcache_eviction::Policy;
+    use ironcache_eviction::{Policy, map_policy_name};
     use ironcache_storage::CountingAccounting;
     use ironcache_store::ShardStore;
 
@@ -1979,6 +1979,63 @@ mod tests {
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"GET", b"new"]),
             Value::BulkString(Some(Bytes::copy_from_slice(&val)))
+        );
+    }
+
+    #[test]
+    fn wtinylfu_eviction_preserves_a_hot_key_under_the_ceiling() {
+        // End-to-end W-TinyLFU through the real evict_to_fit flow (PR-3c): a frequently
+        // GET'd key survives eviction under memory pressure while cold keys are evicted
+        // (scan resistance). Configure the `allkeys-lfu` policy (now real W-TinyLFU).
+        let c = ctx_with_budget(400);
+        let mut s = state(&c);
+        let mut st = store_with(
+            c.databases,
+            map_policy_name("allkeys-lfu", 1).expect("allkeys-lfu maps"),
+        );
+        // Sanity: it is genuinely the W-TinyLFU engine, not a stand-in.
+        assert_eq!(st.policy_name(), "allkeys-lfu");
+        let t = UnixMillis(0);
+        let val = vec![b'v'; 100];
+
+        // Plant the hot key and access it many times so the sketch records high frequency.
+        run_admit(&c, &mut s, &mut st, t, &[b"SET", b"hot", &val]);
+        for _ in 0..20 {
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"hot"]);
+        }
+        // Now stream many cold keys, each written once. Eviction must target the cold
+        // keys (lowest estimated frequency), never the hot key. Tally the evictions so we
+        // can assert eviction actually happened.
+        let mut total_evicted = 0u64;
+        for i in 0u32..15 {
+            let (_r, ev) = run_admit(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("cold{i}").as_bytes(), &val],
+            );
+            total_evicted += ev;
+        }
+        // The hot key must still be present (it survived the cold-key flood): scan
+        // resistance, the headline W-TinyLFU property.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"hot"]),
+            Value::BulkString(Some(Bytes::copy_from_slice(&val))),
+            "the frequently-accessed key must survive W-TinyLFU eviction"
+        );
+        // Eviction actually happened (the budget is small, so the cold flood forced
+        // several evictions). Each was a COLD key, never the hot one (asserted above).
+        assert!(
+            total_evicted > 0,
+            "the cold-key flood must have triggered W-TinyLFU eviction"
+        );
+        // The keyspace stayed small (bounded by the budget): far fewer than the 16 keys
+        // written, since cold keys were continually evicted to make room.
+        assert!(
+            st.len() < 8,
+            "W-TinyLFU kept the resident set bounded under the ceiling ({} keys)",
+            st.len()
         );
     }
 
