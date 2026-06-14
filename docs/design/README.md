@@ -180,3 +180,11 @@ Specs added as the M1 milestone progresses.
   oracle in the benchmark harness (benchmark-only-crate isolation) (#93).
 - [COMPRESSION_ADVISOR.md](COMPRESSION_ADVISOR.md): the off-path per-value
   compression decision model (offline table, zero per-request model calls) (#92).
+- [DISTRIBUTION.md](DISTRIBUTION.md): the single-node to multi-node distribution
+  staircase umbrella binding ADR-0011/0012/0025/0026 (#68).
+- [MIGRATION.md](MIGRATION.md): atomic, snapshot-streamed online slot migration
+  without write freeze (single Raft SETSLOT flip, fence cutover) (#75).
+- [REPLICATION.md](REPLICATION.md): offset-based async replication with adaptive
+  disk-spillable backlog and partial resync (#77).
+- [REBALANCING.md](REBALANCING.md): rebalancing policy and orchestration (trigger,
+  hot-partition detection, throttle, drain/decommission) (#148).
