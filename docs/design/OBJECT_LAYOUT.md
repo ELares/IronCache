@@ -41,6 +41,17 @@ Folding these into the header (rather than side maps) is what keeps per-key
 overhead low and is the reason the index needs no parallel metadata structures
 (#35).
 
+Budget: the fixed header (type+encoding, the 2-bit eviction rank, the
+TTL-present bit, the version stamp, the key length, the inline-value length)
+targets at most 8 bytes excluding the variable key/value length encodings. The
+TTL expiry handle (a timing-wheel slot index, #51) and a snapshot version wide
+enough not to wrap during a cut (#60) are each up to about 4 bytes; if both plus
+the rest exceed the budget, the TTL handle becomes an out-of-header index into
+the shard's timing wheel rather than bloating every object. So type/encoding,
+eviction rank, TTL-present, and version are always in-header with no side lookup;
+only the (optional) TTL expiry handle may be an indexed lookup. Exact widths are
+tuned in #8/#51/#60.
+
 ### Inline-key / SSO threshold
 
 Keys up to an inline threshold are stored in the kvobj allocation; longer keys
@@ -56,9 +67,13 @@ Efficient gate ADR-0016/0017).
 Growing an inline value past the inline capacity reallocates the kvobj (or
 promotes the value to an out-of-line allocation). Because the shard is
 single-owner (ADR-0005), the reallocation is a plain move with the index pointer
-updated in place; no reader can hold a stale pointer (ADR-0004). The trade-off
-(reallocate-on-grow vs reserve slack) is tuned against write-heavy workloads on
-the harness.
+updated in place; no reader can hold a stale pointer (ADR-0004). A reallocation
+may only occur when no outstanding `Read` borrow into that kvobj is live; because
+the command and any `Read` view it holds run on the same owning core, Rust's
+borrow checker enforces this statically, so a grow inside an `RMW`-style command
+cannot invalidate a concurrently-held `Read` view (this is the borrow-lifetime
+contract STORAGE_API specifies). The trade-off (reallocate-on-grow vs reserve
+slack) is tuned against write-heavy workloads on the harness.
 
 ## Open questions
 

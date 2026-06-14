@@ -38,10 +38,16 @@ header, not a fixed 16-byte one.
 ### Rejected: the shared-integer pool
 
 Redis pre-allocates a pool of 10000 shared small-integer objects to dedupe common
-integers [redis-shared-integers-10000]. IronCache **rejects** this: with
-pointer-tagged inline integers (above) an integer value occupies no separate
-allocation at all, so there is nothing to share and the pool would be pure
-complexity and a refcount surface for no memory win. This is a deliberate
+integers [redis-shared-integers-10000]. IronCache **rejects** this for two
+reasons. First, with pointer-tagged inline integers (above) an integer value
+occupies no separate allocation at all, so there is nothing to share. Second, and
+decisively, a shared/refcounted object cannot carry per-key eviction metadata,
+which is why Redis itself disables the shared-integer pool under an LRU/LFU
+`maxmemory` policy [redis-shared-integers-10000]; IronCache is cache-mode with
+eviction on by default and a per-key S3-FIFO rank folded into every kvobj
+(ADR-0007/0008, OBJECT_LAYOUT), so the pool is incompatible with the default
+posture regardless of inlining. The pool would be pure complexity and a refcount
+surface for no memory win. This is a deliberate
 divergence (a default-internal-representation difference, not an observable one:
 `OBJECT ENCODING` still reports `int`).
 
