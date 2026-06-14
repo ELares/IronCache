@@ -134,6 +134,11 @@ ADR-0013's posture. None is a measured IronCache result.
   optional doorkeeper OFF by default [wtinylfu-cmsketch-4bit] [wtinylfu-caffeine-sketch].
 - The filter is invoked only at admission/eviction, never per GET; a hot-path
   lint/test asserts no per-read sketch mutation [hit-ratio-can-hurt-throughput].
+  (DEFERRED: the PR-3c first-cut implementation samples the full read stream with
+  an inline O(depth) min-increment in `on_access` instead, a conscious divergence
+  for a fuller frequency signal; the decision-path-only model, a read buffer drained
+  off the GET critical path, and this no-per-read-mutation lint are tracked
+  follow-ups for the harness bake-off (#47/#8) and are NOT yet met.)
 - The sketch decision path is a small bounded (depth-many) lock-free set of reads
   on the owning core [glommio-locks-never-necessary]; the SLRU window is absent (no
   per-hit relink), refining EVICTION.md per the reconciliation note above.

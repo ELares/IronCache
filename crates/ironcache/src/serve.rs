@@ -17,8 +17,8 @@ use ironcache_runtime::bootstrap::{ShardConfig, ShardId, ShardSet};
 use ironcache_runtime::{Runtime, TokioRuntime};
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
-    ConnState, CounterDeltas, DecodeOutcome, Limits, ProtoVersion, Request, TimingWheel,
-    UnixMillis, decode, dispatch,
+    ConnState, CounterDeltas, DecodeOutcome, EXPIRE_CYCLE_INTERVAL, Limits, MAX_RECLAIM_PER_CYCLE,
+    ProtoVersion, Request, TimingWheel, UnixMillis, decode, dispatch, drain_due_keys,
 };
 use ironcache_storage::CountingAccounting;
 use ironcache_store::{ShardStore, process_memory};
@@ -135,6 +135,95 @@ thread_local! {
     // hot path (S3-FIFO sampling, TTL jitter).
     static ENV: RefCell<Option<Rc<RefCell<SystemEnv>>>> = const { RefCell::new(None) };
     static STARTED_AT: RefCell<Option<ironcache_env::Monotonic>> = const { RefCell::new(None) };
+    // Whether THIS shard thread has already spawned its background active-expiry timer
+    // task (PR-3c). Spawned exactly ONCE per shard, lazily on the first connection (the
+    // shard's tokio LocalSet must exist, which it does once a connection is being
+    // served), so an idle shard that has had at least one connection still reclaims
+    // expired memory with no further commands. A plain Cell suffices (single-threaded
+    // per shard; shared-nothing ADR-0002).
+    static EXPIRE_TASK_SPAWNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Spawn the per-shard BACKGROUND active-expiry timer task ONCE on this shard's
+/// executor (EXPIRATION.md idle-shard memory boundedness, PR-3c). Idempotent per shard:
+/// guarded by [`EXPIRE_TASK_SPAWNED`] so repeated connections do not spawn duplicates.
+///
+/// The task loops: `rt.timer(EXPIRE_CYCLE_INTERVAL).await` (the Runtime timer SEAM, NOT
+/// `tokio::time` directly, ADR-0003), then reads `now` from the shard's Env clock (NOT
+/// std time) and drains a BOUNDED batch from the wheel via the SAME [`drain_due_keys`]
+/// helper the opportunistic per-command path uses. The reclaimed count folds into the
+/// shard's `expired_keys` counter so idle reclamation shows up in INFO alongside the
+/// command-path drain.
+///
+/// ## Borrow discipline (critical, ADR-0002/0005)
+///
+/// Each tick borrows the per-shard ENV / STORE / WHEEL / STATE RefCells ONLY briefly
+/// and DROPS every borrow BEFORE the next `.await`. A RefCell borrow held across an
+/// await would double-borrow-panic when a concurrently-scheduled command handler runs
+/// on the same single thread between the timer firing and resuming. The tick body is a
+/// single non-async block (`expire_cycle_tick`) that takes and releases all borrows and
+/// returns a plain `u64`, so no `Ref`/`RefMut` is alive when the loop awaits the timer.
+fn spawn_expire_task(
+    rt: TokioRuntime,
+    env: Rc<RefCell<SystemEnv>>,
+    store_rc: Rc<RefCell<ShardStoreImpl>>,
+    wheel_rc: Rc<RefCell<TimingWheel>>,
+    state_rc: Rc<RefCell<ShardState>>,
+) {
+    if EXPIRE_TASK_SPAWNED.with(std::cell::Cell::get) {
+        return;
+    }
+    EXPIRE_TASK_SPAWNED.with(|c| c.set(true));
+    rt.spawn_on_shard(async move {
+        loop {
+            // Await the cycle interval through the Runtime timer seam (NOT tokio::time
+            // directly). No RefCell borrow is held across this await.
+            rt.timer(EXPIRE_CYCLE_INTERVAL).await;
+            // One tick: take + release all borrows inside this call, returning a u64.
+            // Nothing borrowed survives to the next await iteration.
+            expire_cycle_tick(&env, &store_rc, &wheel_rc, &state_rc);
+        }
+    });
+}
+
+/// Run ONE background active-expiry cycle: read `now` from the Env clock, drain a
+/// bounded batch from the wheel (reusing [`drain_due_keys`]), and fold the reclaimed
+/// count into the shard's `expired_keys` counter. Returns the number of keys reaped
+/// (for the wiring smoke test).
+///
+/// This is a SYNCHRONOUS function: it acquires every RefCell borrow and releases it
+/// before returning, so the async caller never holds a borrow across an `.await` (the
+/// borrow-discipline contract above). The clock read (`env.borrow()`) and the
+/// store/wheel mutation (separate RefCells) do not alias.
+fn expire_cycle_tick(
+    env: &Rc<RefCell<SystemEnv>>,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    wheel_rc: &Rc<RefCell<TimingWheel>>,
+    state_rc: &Rc<RefCell<ShardState>>,
+) -> u64 {
+    // The WORK (which keys are due) is decided by the Env clock (ADR-0003), so a DST
+    // replay reaps the identical keys; only the FIRING schedule is wall-clock.
+    let now = UnixMillis(env.borrow().now_unix_millis());
+    let reaped = {
+        let mut store = store_rc.borrow_mut();
+        let mut wheel = wheel_rc.borrow_mut();
+        // The `&mut *` derefs THROUGH the RefMut to the concrete ShardStore/TimingWheel
+        // the generic `drain_due_keys` bound needs (a bare `&mut wheel` would be
+        // `&mut RefMut<..>`, which does not satisfy `S: Store + ActiveExpiry`). The
+        // deref is load-bearing, so the auto-deref lint is silenced here.
+        #[allow(clippy::explicit_auto_deref)]
+        drain_due_keys(&mut *wheel, &mut *store, now, MAX_RECLAIM_PER_CYCLE)
+        // store + wheel borrows DROP here, before the state borrow below and before
+        // the caller's next await.
+    };
+    if reaped > 0 {
+        let deltas = CounterDeltas {
+            expired: reaped,
+            ..CounterDeltas::default()
+        };
+        state_rc.borrow_mut().counters.apply(deltas);
+    }
+    reaped
 }
 
 fn shard_state() -> Rc<RefCell<ShardState>> {
@@ -209,6 +298,24 @@ async fn serve_connection(
     let state_rc = shard_state();
     let store_rc = shard_store(ctx.databases, ctx.info.maxmemory_policy);
     let wheel_rc = shard_wheel();
+    // Spawn this shard's BACKGROUND active-expiry timer task ONCE (PR-3c, idempotent):
+    // it keeps an idle shard's resident memory bounded by draining the wheel on a timer
+    // even when no command arrives (EXPIRATION.md). It is spawned here (not at thread
+    // boot) because spawn_on_shard needs the shard's running LocalSet, which exists by
+    // the time the first connection is being served on this thread.
+    //
+    // FORWARD-LOOKING: spawning on the first connection means a shard that never
+    // receives a connection never starts its drain. Harmless today (no cross-shard key
+    // routing exists, so a connectionless shard owns no keys), but when cluster routing
+    // lands a data-bearing connectionless shard could accumulate expired memory; at that
+    // point spawn this at shard-thread boot or on first key insert instead.
+    spawn_expire_task(
+        rt,
+        Rc::clone(&env),
+        Rc::clone(&store_rc),
+        Rc::clone(&wheel_rc),
+        Rc::clone(&state_rc),
+    );
     // Correct the context's started_at to this shard's boot instant.
     ctx.info.started_at = shard_started_at();
 
@@ -425,6 +532,142 @@ pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) {
 mod tests {
     use super::*;
     use ironcache_env::{Clock, Env, Rng};
+    use ironcache_storage::{ExpireWrite, NewValue, Store};
+
+    /// The per-shard handles the timer-task tests drive (the same Rc<RefCell<..>> set
+    /// `spawn_expire_task` / `expire_cycle_tick` consume).
+    type TimerFixtures = (
+        Rc<RefCell<SystemEnv>>,
+        Rc<RefCell<ShardStoreImpl>>,
+        Rc<RefCell<TimingWheel>>,
+        Rc<RefCell<ShardState>>,
+    );
+
+    /// Build a fresh per-shard store + wheel + env + state for the timer-task tests, but
+    /// independent of the shard thread-locals so a test can plant entries directly.
+    fn timer_fixtures() -> TimerFixtures {
+        let env = Rc::new(RefCell::new(SystemEnv::new()));
+        let store = Rc::new(RefCell::new(ShardStore::with_hooks(
+            16,
+            Policy::cache_default(),
+            CountingAccounting::new(),
+        )));
+        let wheel = Rc::new(RefCell::new(TimingWheel::new()));
+        let state = Rc::new(RefCell::new(ShardState {
+            next_client_id: 1,
+            counters: ShardCounters::new(),
+        }));
+        (env, store, wheel, state)
+    }
+
+    /// Plant a key with a deadline already in the PAST relative to the real wall clock
+    /// (deadline 1ms after the Unix epoch), and register it in the wheel, so the next
+    /// active-expiry cycle finds it due regardless of the precise SystemEnv `now`.
+    fn plant_expired(
+        store: &Rc<RefCell<ShardStoreImpl>>,
+        wheel: &Rc<RefCell<TimingWheel>>,
+        key: &[u8],
+    ) {
+        let deadline = UnixMillis(1);
+        // now=0 so the upsert itself does not lazily reap it before the cycle runs.
+        store.borrow_mut().upsert(
+            0,
+            key,
+            NewValue::Bytes(b"v"),
+            ExpireWrite::Set(deadline),
+            UnixMillis(0),
+        );
+        wheel.borrow_mut().register(0, key, deadline);
+    }
+
+    #[test]
+    fn expire_cycle_tick_reaps_expired_and_bumps_counter() {
+        // The background cycle FUNCTION (driven directly, deterministically): a key whose
+        // deadline is in the past is reaped and folded into the shard's expired_keys
+        // counter, with NO command issued (the idle-shard boundedness guarantee).
+        let (env, store, wheel, state) = timer_fixtures();
+        // Establish the wheel origin in the past so the elapsed-to-now walk retires the
+        // entry (the first advance only sets the base).
+        wheel.borrow_mut().advance(UnixMillis(0), 0);
+        plant_expired(&store, &wheel, b"k1");
+        plant_expired(&store, &wheel, b"k2");
+        assert_eq!(store.borrow().len(), 2);
+
+        let reaped = expire_cycle_tick(&env, &store, &wheel, &state);
+        assert_eq!(
+            reaped, 2,
+            "the cycle reaped both expired keys with no command"
+        );
+        assert_eq!(store.borrow().len(), 0, "resident memory bounded when idle");
+        assert_eq!(
+            state.borrow().counters.snapshot().expired_keys,
+            2,
+            "the cycle folds reclamation into the shard expired_keys counter"
+        );
+    }
+
+    #[test]
+    fn expire_cycle_tick_is_a_noop_when_nothing_due() {
+        // A cycle with nothing due reaps nothing and leaves the counter untouched (the
+        // common idle case: an empty wheel fast-forwards in O(1)).
+        let (env, store, wheel, state) = timer_fixtures();
+        wheel.borrow_mut().advance(UnixMillis(0), 0);
+        let reaped = expire_cycle_tick(&env, &store, &wheel, &state);
+        assert_eq!(reaped, 0);
+        assert_eq!(state.borrow().counters.snapshot().expired_keys, 0);
+    }
+
+    #[test]
+    fn spawn_expire_task_drains_an_idle_shard_via_the_timer_seam() {
+        // Wiring smoke for the SPAWNED async task: run it on a current-thread LocalSet
+        // (as a shard does), plant an expired key, and assert the timer task reclaims it
+        // with NO command ever issued. This exercises spawn_on_shard + Runtime::timer +
+        // the borrow discipline (a held RefCell borrow across the await would panic here
+        // because the test thread reborrows the same cells between ticks).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (env, store, wheel, state) = timer_fixtures();
+            wheel.borrow_mut().advance(UnixMillis(0), 0);
+            plant_expired(&store, &wheel, b"idle");
+            assert_eq!(store.borrow().len(), 1);
+
+            let runtime = TokioRuntime::new();
+            // EXPIRE_TASK_SPAWNED is thread-local; this test thread spawns exactly once.
+            spawn_expire_task(
+                runtime,
+                Rc::clone(&env),
+                Rc::clone(&store),
+                Rc::clone(&wheel),
+                Rc::clone(&state),
+            );
+
+            // Drive the LocalSet: the timer task awaits EXPIRE_CYCLE_INTERVAL (100ms) then
+            // drains. Yield-sleep past a BOUNDED number of cycles (no wall-clock deadline,
+            // so this stays off std::time per the determinism lint). While we sleep we ALSO
+            // reborrow the shared cells (as a command handler would), proving the task does
+            // not hold a borrow across its await.
+            for _ in 0..40 {
+                tokio::time::sleep(EXPIRE_CYCLE_INTERVAL).await;
+                // Reborrow the cells between the task's awaits: would panic if the task
+                // held a borrow across .await.
+                if store.borrow().is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                store.borrow().is_empty(),
+                "the background timer task reclaimed the idle shard's expired key"
+            );
+            assert!(
+                state.borrow().counters.snapshot().expired_keys >= 1,
+                "idle reclamation folded into expired_keys"
+            );
+        });
+    }
 
     #[test]
     fn shard_env_rng_is_reachable_as_wired() {

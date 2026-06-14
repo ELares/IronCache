@@ -97,6 +97,9 @@ monomorphization strategy, runtime selection, and the Redis alias layer.
   FIFO-class policies AND the W-TinyLFU-fronted variant; the variant's sketch is
   touched only at the admission/eviction decision, never per read, with no window
   relink (a hot-path lint asserts no per-read sketch mutation, WTINYLFU.md #49).
+  (DEFERRED: the PR-3c W-TinyLFU first cut bumps the sketch per read with a bounded
+  O(depth) min-increment; the decision-path-only sampling and the lint are tracked
+  follow-ups, see WTINYLFU.md.)
 - All ten Redis policy names are accepted, `CONFIG GET maxmemory-policy` echoes a
   Redis-recognized value, and the eviction effect matches the named family
   (conformance #95/#97).

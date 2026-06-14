@@ -23,7 +23,10 @@ pub mod dispatch;
 
 pub use admission::is_denyoom;
 pub use conn::ConnState;
-pub use dispatch::{MAX_RECLAIM_PER_CALL, RollupFn, ServerContext, dispatch};
+pub use dispatch::{
+    EXPIRE_CYCLE_INTERVAL, MAX_RECLAIM_PER_CALL, MAX_RECLAIM_PER_CYCLE, RollupFn, ServerContext,
+    dispatch, drain_due_keys,
+};
 
 // Re-export the observe types the binary supplies to dispatch (the INFO memory
 // snapshot it reads once at the binary edge, and the per-command counter deltas the

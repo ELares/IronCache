@@ -23,9 +23,69 @@ use ironcache_storage::{ActiveExpiry, Admit, Store, UnixMillis};
 /// command path's critical section: a flood of co-expiring keys is reclaimed across
 /// several commands rather than stalling one. The lazy backstop still prevents
 /// OBSERVING an expired key, so this bound only governs how fast resident memory for
-/// expired keys returns, never correctness. The background timer-task drain for IDLE
-/// shards (an empty-traffic shard never calls this) is deferred to PR-3c.
+/// expired keys returns, never correctness.
+///
+/// This is the cap for the OPPORTUNISTIC (per-command) drain. The PR-3c background
+/// timer task for IDLE shards calls the SAME [`drain_due_keys`] helper with its own
+/// per-cycle cap ([`crate::MAX_RECLAIM_PER_CYCLE`]); both paths share the one bounded
+/// drain so there is no duplicate reclamation logic (EXPIRATION.md idle-shard memory
+/// boundedness).
 pub const MAX_RECLAIM_PER_CALL: usize = 20;
+
+/// The bounded number of expired keys the PR-3c per-shard BACKGROUND timer task
+/// reclaims per cycle (EXPIRATION.md idle-shard memory boundedness). The timer task is
+/// what keeps an IDLE shard's resident memory bounded: an opportunistic
+/// (per-command) drain only fires when a command arrives, so a shard with no traffic
+/// would otherwise accumulate expired-but-not-reclaimed values until the next command.
+/// The per-cycle cap is larger than [`MAX_RECLAIM_PER_CALL`] (the background task is
+/// off the command critical section, so it may reclaim more aggressively per cycle),
+/// but still bounded so one cycle never monopolizes the shard's single thread. It is a
+/// #8-tunable internal default, not a wire-exposed knob.
+pub const MAX_RECLAIM_PER_CYCLE: usize = 100;
+
+/// The interval between background active-expiry cycles on each shard (the Redis `hz`
+/// analog, EXPIRATION.md). The PR-3c timer task awaits `Runtime::timer(EXPIRE_CYCLE_INTERVAL)`
+/// then drains a bounded batch, so an idle shard reclaims expired memory roughly every
+/// interval even with no traffic. 100ms matches the timing-wheel bottom-level
+/// resolution ([`ironcache_expiry::TICK_MS`]), so the active drain keeps pace with the
+/// finest deadline bucket. A #8-tunable internal default, not a wire knob; the timer
+/// FIRING schedule is wall-clock and does NOT affect observable behavior (the lazy
+/// backstop guarantees no expired key is ever observed regardless of when cleanup runs).
+pub const EXPIRE_CYCLE_INTERVAL: core::time::Duration = core::time::Duration::from_millis(100);
+
+/// Drain a BOUNDED batch of due keys from the timing `wheel` at `now` and reap the
+/// ones whose stored deadline has actually passed (EXPIRATION.md active reclamation).
+/// Returns the number of keys ACTUALLY reaped (the `expired_keys` contribution).
+///
+/// This is the SINGLE bounded-drain helper SHARED by both active-reclamation paths
+/// (EXPIRATION.md "runs on the owning core"):
+/// - the OPPORTUNISTIC per-command drain in [`dispatch`] (cap [`MAX_RECLAIM_PER_CALL`]),
+/// - the PR-3c per-shard BACKGROUND timer task for idle shards (its own per-cycle cap),
+///
+/// so the advance-and-reap logic lives in one place. The wheel may offer a STALE entry
+/// (a re-TTL'd / PERSISTed / overwritten key); [`ActiveExpiry::reap_if_expired`]
+/// re-checks the store's real `expire_at`, so only a genuinely-expired key is reaped
+/// and counted. `max` caps the work so neither path stalls. The lazy backstop in the
+/// store remains the correctness guarantee; this is purely the memory optimization.
+///
+/// Determinism (ADR-0003): the WORK (which keys are due) is decided entirely by the
+/// `now` the caller reads from the Env clock; the helper itself reads no clock. So a
+/// background timer firing on wall-clock time does not change observable behavior, but
+/// the keys it reaps for a given `now` are byte-identical on a seeded replay.
+pub fn drain_due_keys<S: Store + ActiveExpiry>(
+    wheel: &mut TimingWheel,
+    store: &mut S,
+    now: UnixMillis,
+    max: usize,
+) -> u64 {
+    let mut reaped = 0u64;
+    for (db, key) in wheel.advance(now, max) {
+        if store.reap_if_expired(db, &key, now) {
+            reaped += 1;
+        }
+    }
+    reaped
+}
 
 /// Immutable, server-wide context a handler may read. It is cloned cheaply onto
 /// each shard; the dynamic per-rollup counters are passed in separately.
@@ -125,12 +185,9 @@ pub fn dispatch<C: Clock, S: Store + Admit + ActiveExpiry>(
     // re-checks). This bounds resident memory for expired keys under traffic; the lazy
     // backstop in the store still prevents OBSERVING an expired key, so this is purely
     // a memory optimization. MAX_RECLAIM_PER_CALL caps the work per command so the
-    // drain never stalls the command path.
-    for (db, key) in wheel.advance(now, MAX_RECLAIM_PER_CALL) {
-        if store.reap_if_expired(db, &key, now) {
-            deltas.expired += 1;
-        }
-    }
+    // drain never stalls the command path. The SAME [`drain_due_keys`] helper backs the
+    // PR-3c background timer task for idle shards (no duplicate drain logic).
+    deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
 
     // Auth gate: before authenticating, only a small set of commands is allowed
     // (Redis: HELLO, AUTH, QUIT, RESET). Everything else (including the data
@@ -567,7 +624,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use ironcache_env::{Monotonic, TestEnv};
-    use ironcache_eviction::Policy;
+    use ironcache_eviction::{Policy, map_policy_name};
     use ironcache_storage::CountingAccounting;
     use ironcache_store::ShardStore;
 
@@ -1926,6 +1983,63 @@ mod tests {
     }
 
     #[test]
+    fn wtinylfu_eviction_preserves_a_hot_key_under_the_ceiling() {
+        // End-to-end W-TinyLFU through the real evict_to_fit flow (PR-3c): a frequently
+        // GET'd key survives eviction under memory pressure while cold keys are evicted
+        // (scan resistance). Configure the `allkeys-lfu` policy (now real W-TinyLFU).
+        let c = ctx_with_budget(400);
+        let mut s = state(&c);
+        let mut st = store_with(
+            c.databases,
+            map_policy_name("allkeys-lfu", 1).expect("allkeys-lfu maps"),
+        );
+        // Sanity: it is genuinely the W-TinyLFU engine, not a stand-in.
+        assert_eq!(st.policy_name(), "allkeys-lfu");
+        let t = UnixMillis(0);
+        let val = vec![b'v'; 100];
+
+        // Plant the hot key and access it many times so the sketch records high frequency.
+        run_admit(&c, &mut s, &mut st, t, &[b"SET", b"hot", &val]);
+        for _ in 0..20 {
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"hot"]);
+        }
+        // Now stream many cold keys, each written once. Eviction must target the cold
+        // keys (lowest estimated frequency), never the hot key. Tally the evictions so we
+        // can assert eviction actually happened.
+        let mut total_evicted = 0u64;
+        for i in 0u32..15 {
+            let (_r, ev) = run_admit(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("cold{i}").as_bytes(), &val],
+            );
+            total_evicted += ev;
+        }
+        // The hot key must still be present (it survived the cold-key flood): scan
+        // resistance, the headline W-TinyLFU property.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"hot"]),
+            Value::BulkString(Some(Bytes::copy_from_slice(&val))),
+            "the frequently-accessed key must survive W-TinyLFU eviction"
+        );
+        // Eviction actually happened (the budget is small, so the cold flood forced
+        // several evictions). Each was a COLD key, never the hot one (asserted above).
+        assert!(
+            total_evicted > 0,
+            "the cold-key flood must have triggered W-TinyLFU eviction"
+        );
+        // The keyspace stayed small (bounded by the budget): far fewer than the 16 keys
+        // written, since cold keys were continually evicted to make room.
+        assert!(
+            st.len() < 8,
+            "W-TinyLFU kept the resident set bounded under the ceiling ({} keys)",
+            st.len()
+        );
+    }
+
+    #[test]
     fn ceiling_off_serves_every_write() {
         // maxmemory == 0 (unlimited): the gate is off; writes always succeed.
         let c = ctx(None);
@@ -3149,6 +3263,109 @@ mod tests {
             bulk(b"v"),
             "the re-TTL'd key is still alive"
         );
+    }
+
+    #[test]
+    fn drain_due_keys_helper_reaps_bounded_batch_deterministically() {
+        // The SHARED bounded-drain helper (PR-3c) both the opportunistic per-command
+        // path and the background timer task call. Drive it directly: register keys with
+        // deadlines, advance the TestEnv-equivalent `now` past them, and assert it reaps
+        // exactly the due keys, bumps the count, and respects the `max` bound.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        // Establish the wheel origin at t=0.
+        let _ = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, UnixMillis(0), &[b"PING"]);
+        // 5 keys each with a 1s TTL (deadline 1000ms), registered in the wheel via SET EX.
+        for k in [b"a".as_slice(), b"b", b"c", b"d", b"e"] {
+            run_on_wheel(
+                &c,
+                &mut s,
+                &mut st,
+                &mut wheel,
+                UnixMillis(0),
+                &[b"SET", k, b"v", b"EX", b"1"],
+            );
+        }
+        assert_eq!(st.len(), 5);
+        // Drain with a small bound (max=2): the helper reaps at most 2 per call.
+        let now = UnixMillis(5_000);
+        let first = drain_due_keys(&mut wheel, &mut st, now, 2);
+        assert!(first <= 2, "the helper respects the max bound");
+        // Keep draining until nothing more is due; total reaped is exactly the 5 keys.
+        let mut total = first;
+        loop {
+            let n = drain_due_keys(&mut wheel, &mut st, now, 2);
+            if n == 0 {
+                break;
+            }
+            assert!(n <= 2, "every call respects the max bound");
+            total += n;
+        }
+        assert_eq!(total, 5, "the helper reaps exactly the due keys");
+        assert_eq!(st.len(), 0, "all expired keys are resident-evicted");
+
+        // Determinism (ADR-0003): a fresh replay against the same registrations + the
+        // same `now` reaps the identical count (the helper reads time only via `now`).
+        let mut st2 = test_store(c.databases);
+        let mut wheel2 = TimingWheel::new();
+        let mut s2 = state(&c);
+        let _ = run_on_wheel_deltas(
+            &c,
+            &mut s2,
+            &mut st2,
+            &mut wheel2,
+            UnixMillis(0),
+            &[b"PING"],
+        );
+        for k in [b"a".as_slice(), b"b", b"c", b"d", b"e"] {
+            run_on_wheel(
+                &c,
+                &mut s2,
+                &mut st2,
+                &mut wheel2,
+                UnixMillis(0),
+                &[b"SET", k, b"v", b"EX", b"1"],
+            );
+        }
+        let replay = drain_due_keys(&mut wheel2, &mut st2, now, 100);
+        assert_eq!(
+            replay, 5,
+            "same now + same registrations => same reclamation"
+        );
+    }
+
+    #[test]
+    fn drain_due_keys_helper_skips_stale_re_ttld_entry() {
+        // The helper reaps ONLY genuinely-expired keys: a re-TTL'd key whose stale wheel
+        // entry is offered is re-checked by the store and skipped (no false reap).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let _ = run_on_wheel_deltas(&c, &mut s, &mut st, &mut wheel, UnixMillis(0), &[b"PING"]);
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            UnixMillis(0),
+            &[b"SET", b"k", b"v", b"EX", b"1"],
+        );
+        run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            UnixMillis(0),
+            &[b"EXPIRE", b"k", b"100"],
+        );
+        // Past the OLD deadline (2000ms) but not the new one: the stale entry is offered,
+        // the store re-check finds it live, the helper reaps nothing.
+        let reaped = drain_due_keys(&mut wheel, &mut st, UnixMillis(2_000), 100);
+        assert_eq!(reaped, 0, "stale wheel entry must not reap a re-TTL'd key");
+        assert_eq!(st.len(), 1, "the re-TTL'd key survives");
     }
 
     #[test]
