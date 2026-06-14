@@ -160,3 +160,11 @@ Specs added as the M1 milestone progresses.
   sidecar, relative-offset pointer fixup, O(n) index regen, tmpfs/DAX) (#62).
 - [DISK_IO.md](DISK_IO.md): the io_uring snapshot/tiering disk write path (disk_io
   trait, SQPOLL off-by-default, shared registered buffers, bounded I/O cores) (#67).
+- [HYBRIDLOG_ENGINE.md](HYBRIDLOG_ENGINE.md): the FASTER-style HybridLog cold
+  engine (tri-region, in-place hot-set update vs RCU, swappable index) (#64).
+- [DURABLE_LOG.md](DURABLE_LOG.md): the segment + atomic-manifest durable log with
+  CRC granularity and corruption recovery (#63).
+- [SNAPSHOT.md](SNAPSHOT.md): the forkless versioned point-in-time snapshot and
+  diskless full-sync (epoch cut, RDB-compatible base) (#60).
+- [TIERED_STORE.md](TIERED_STORE.md): the tiered RAM->SSD value store
+  (RAM index + ~12B pointer, eviction-driven spill, append-only flash) (#66).
