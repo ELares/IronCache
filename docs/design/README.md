@@ -26,6 +26,10 @@ Claim citations in these docs are validated in CI by
   and Redis maxmemory-policy-name mapping (#48, #50).
 - [EXPIRATION.md](EXPIRATION.md): per-shard timing-wheel TTL with lazy backstop
   and background reclamation (#51).
+- [COMMANDS.md](COMMANDS.md): per-data-type command semantics for strings,
+  lists, hashes, sets, sorted sets (arity, flags, *STORE, error edges) (#128).
+- [KEYSPACE.md](KEYSPACE.md): generic keyspace commands and the SCAN
+  cursor-stability contract, plus DUMP/RESTORE (#129).
 
 More design specs land here as the Implementation Readiness milestone progresses
 (runtime, storage API, hash table, eviction, expiration, commands, CLI, config,
