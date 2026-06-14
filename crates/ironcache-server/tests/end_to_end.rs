@@ -24,11 +24,18 @@ use std::cell::RefCell;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
-    ServerContext {
-        requirepass: pass.map(str::to_owned),
+    let boot = ironcache_config::Config {
+        port,
         databases: 16,
-        maxmemory: 0,
-        per_shard_budget: 0,
+        shards: 1,
+        requirepass: pass.map(str::to_owned),
+        ..ironcache_config::Config::default()
+    };
+    let runtime = ironcache_config::RuntimeConfig::from_config(&boot);
+    ServerContext {
+        runtime,
+        databases: 16,
+        shards: 1,
         info: ServerInfo {
             tcp_port: port,
             shards: 1,
@@ -38,6 +45,7 @@ fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
             maxmemory_policy: "allkeys-lru",
             mem_allocator: "jemalloc",
         },
+        boot,
     }
 }
 
@@ -66,6 +74,9 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
     );
     let limits = Limits::default();
     let mut buf: Vec<u8> = Vec::new();
+    // This connection's last-seen runtime-config generation (PR-4b): dispatch advances
+    // it on a CONFIG SET maxmemory-policy and swaps this store's policy.
+    let mut shard_gen = ctx.runtime.generation();
     loop {
         // Drain complete frames.
         loop {
@@ -93,6 +104,7 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
                         &mut store,
                         &mut wheel,
                         now,
+                        &mut shard_gen,
                         &rollup,
                         mem,
                         &mut deltas,
