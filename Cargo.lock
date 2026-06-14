@@ -231,6 +231,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironcache-expiry"
+version = "0.0.0"
+dependencies = [
+ "ironcache-storage",
+]
+
+[[package]]
 name = "ironcache-observe"
 version = "0.0.0"
 dependencies = [
@@ -263,6 +270,7 @@ dependencies = [
  "ironcache-config",
  "ironcache-env",
  "ironcache-eviction",
+ "ironcache-expiry",
  "ironcache-observe",
  "ironcache-protocol",
  "ironcache-runtime",

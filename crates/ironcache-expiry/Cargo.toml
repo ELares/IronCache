@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-expiry"
+description = "The per-shard hierarchical timing wheel for active TTL reclamation (EXPIRATION.md #51, ADR-0002/0003/0005). The lazy backstop in ironcache-store remains the correctness guarantee; this wheel bounds resident memory under traffic."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The frozen storage waist supplies the UnixMillis deadline basis (ADR-0003): the
+# wheel reads time ONLY through the `now` argument the caller passes, never a clock.
+# No hashbrown, no concrete store type, no std::sync/time/rand cross this edge.
+ironcache-storage = { workspace = true }

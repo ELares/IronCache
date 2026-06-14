@@ -26,6 +26,14 @@ pub struct ShardCounters {
     commands_processed: u64,
     connected_clients: u64,
     evicted_keys: u64,
+    /// Keys reclaimed because their TTL passed (INFO `expired_keys`, PR-3b). Bumped by
+    /// the active timing-wheel drain AND the lazy expiry-on-read backstop.
+    expired_keys: u64,
+    /// Read commands that found a live key (INFO `keyspace_hits`, PR-3b).
+    keyspace_hits: u64,
+    /// Read commands that found no live key, including a lazily-expired one (INFO
+    /// `keyspace_misses`, PR-3b).
+    keyspace_misses: u64,
 }
 
 impl ShardCounters {
@@ -57,6 +65,33 @@ impl ShardCounters {
         self.evicted_keys += n;
     }
 
+    /// Record `n` keys reclaimed due to TTL expiry (PR-3b; INFO `expired_keys`).
+    /// Called by the serve loop after the active timing-wheel drain.
+    pub fn on_expired(&mut self, n: u64) {
+        self.expired_keys += n;
+    }
+
+    /// Record `n` keyspace hits (a read found a live key, INFO `keyspace_hits`).
+    pub fn on_keyspace_hits(&mut self, n: u64) {
+        self.keyspace_hits += n;
+    }
+
+    /// Record `n` keyspace misses (a read found no live key, INFO `keyspace_misses`).
+    pub fn on_keyspace_misses(&mut self, n: u64) {
+        self.keyspace_misses += n;
+    }
+
+    /// Fold a batch of per-command counter deltas (PR-3b: the eviction / expiry /
+    /// keyspace-hit-miss outputs dispatch accumulates for one command) into this
+    /// shard's counters. Called once per command after dispatch returns, so the
+    /// dynamic counters do not alias the INFO rollup's borrow during dispatch.
+    pub fn apply(&mut self, d: CounterDeltas) {
+        self.evicted_keys += d.evicted;
+        self.expired_keys += d.expired;
+        self.keyspace_hits += d.keyspace_hits;
+        self.keyspace_misses += d.keyspace_misses;
+    }
+
     /// Take an immutable snapshot for rollup.
     #[must_use]
     pub fn snapshot(&self) -> CounterSnapshot {
@@ -65,8 +100,28 @@ impl ShardCounters {
             commands_processed: self.commands_processed,
             connected_clients: self.connected_clients,
             evicted_keys: self.evicted_keys,
+            expired_keys: self.expired_keys,
+            keyspace_hits: self.keyspace_hits,
+            keyspace_misses: self.keyspace_misses,
         }
     }
+}
+
+/// The per-command counter deltas dispatch (and the active drain) accumulate for ONE
+/// command, applied to the shard's [`ShardCounters`] after dispatch returns. Passed
+/// as a single `&mut` out-parameter so the dynamic counters do not alias the INFO
+/// rollup closure's borrow of the same shard counters during dispatch (the serve loop
+/// applies the deltas once dispatch has returned).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CounterDeltas {
+    /// Keys evicted by the admission gate (`evict_to_fit`) this command.
+    pub evicted: u64,
+    /// Keys reclaimed by the active TTL drain (and the lazy backstop) this command.
+    pub expired: u64,
+    /// Keyspace hits from read commands this command.
+    pub keyspace_hits: u64,
+    /// Keyspace misses from read commands this command.
+    pub keyspace_misses: u64,
 }
 
 /// An immutable, summable snapshot of one shard's counters.
@@ -81,6 +136,13 @@ pub struct CounterSnapshot {
     /// Total keys evicted by this shard to honor the memory ceiling (INFO
     /// `evicted_keys`, PR-3a).
     pub evicted_keys: u64,
+    /// Total keys reclaimed by this shard due to TTL expiry (INFO `expired_keys`,
+    /// PR-3b: the active wheel drain plus the lazy backstop).
+    pub expired_keys: u64,
+    /// Total read hits on a live key (INFO `keyspace_hits`, PR-3b).
+    pub keyspace_hits: u64,
+    /// Total read misses (absent/expired key) (INFO `keyspace_misses`, PR-3b).
+    pub keyspace_misses: u64,
 }
 
 impl CounterSnapshot {
@@ -92,6 +154,9 @@ impl CounterSnapshot {
             commands_processed: self.commands_processed + other.commands_processed,
             connected_clients: self.connected_clients + other.connected_clients,
             evicted_keys: self.evicted_keys + other.evicted_keys,
+            expired_keys: self.expired_keys + other.expired_keys,
+            keyspace_hits: self.keyspace_hits + other.keyspace_hits,
+            keyspace_misses: self.keyspace_misses + other.keyspace_misses,
         }
     }
 }
@@ -240,12 +305,13 @@ pub fn build_info<C: Clock>(
             "total_commands_processed:{}\r\n",
             rolled.commands_processed
         );
-        out.push_str("expired_keys:0\r\n");
-        // PR-3a: the rolled-up evicted-keys total (bumped by the dispatch admission
-        // path after evict_to_fit). expired_keys / keyspace_hits / misses are 3b.
+        // PR-3b: expired_keys is the rolled-up TTL-reclamation total (active wheel
+        // drain + lazy backstop). PR-3a: evicted_keys is the maxmemory-eviction total.
+        let _ = write!(out, "expired_keys:{}\r\n", rolled.expired_keys);
         let _ = write!(out, "evicted_keys:{}\r\n", rolled.evicted_keys);
-        out.push_str("keyspace_hits:0\r\n");
-        out.push_str("keyspace_misses:0\r\n");
+        // PR-3b: keyspace hit/miss totals from read commands.
+        let _ = write!(out, "keyspace_hits:{}\r\n", rolled.keyspace_hits);
+        let _ = write!(out, "keyspace_misses:{}\r\n", rolled.keyspace_misses);
         out.push_str("\r\n");
     }
     out

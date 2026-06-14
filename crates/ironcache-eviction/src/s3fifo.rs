@@ -74,6 +74,18 @@ pub struct S3Fifo {
     small: VecDeque<Entry>,
     /// The large main FIFO (promoted / ghost-readmitted keys).
     main: VecDeque<Entry>,
+    /// The LOWEST-priority re-offer FIFO for the volatile-* re-eligibility fix (#46):
+    /// a non-TTL victim the store declines to delete is re-registered HERE rather than
+    /// back into small/main. `select_victim` drains this queue ONLY after small and main
+    /// are exhausted, so every fresh small/main candidate (including an eligible TTL
+    /// victim parked anywhere) is offered BEFORE a re-registered key cycles again. This
+    /// is what stops the #46 false `-OOM`: feeding skipped keys back into small (the old
+    /// behavior) kept small over its ~10% target and STARVED main, so a main-resident
+    /// TTL victim was never reached; the dedicated lowest-priority queue removes that
+    /// starvation in either direction. The store's distinct-key skip set then terminates
+    /// the scan once every live key (now all sitting here) has been offered with no
+    /// eligible TTL victim.
+    reoffer: VecDeque<Entry>,
     /// The ghost ring of recently-evicted key fingerprints (FIFO, bounded).
     ghost: VecDeque<u64>,
     /// Whether victims are restricted to TTL-bearing keys (the volatile-* family),
@@ -110,6 +122,7 @@ impl S3Fifo {
         S3Fifo {
             small: VecDeque::new(),
             main: VecDeque::new(),
+            reoffer: VecDeque::new(),
             ghost: VecDeque::new(),
             volatile_only,
             name: name.to_owned(),
@@ -148,9 +161,18 @@ impl S3Fifo {
         h
     }
 
-    /// The running total of queued entries (small + main).
+    /// The running total of queued entries (small + main + the re-offer queue). All
+    /// three hold LIVE keys the store still tracks, so they all count toward the cap
+    /// sizing and the guaranteed-progress round bound.
     fn entry_count(&self) -> usize {
-        self.small.len() + self.main.len()
+        self.small.len() + self.main.len() + self.reoffer.len()
+    }
+
+    /// Whether `(db, key)` is tracked in ANY of the three queues (small/main/reoffer).
+    fn tracks(&self, db: u32, key: &[u8]) -> bool {
+        self.small.iter().any(|e| e.matches(db, key))
+            || self.main.iter().any(|e| e.matches(db, key))
+            || self.reoffer.iter().any(|e| e.matches(db, key))
     }
 
     /// The current small-queue target capacity (~10% of the running entry count, at
@@ -189,13 +211,18 @@ impl S3Fifo {
         }
     }
 
-    /// Bump the 2-bit frequency of a queued entry matching `(db, key)`, if present.
+    /// Bump the 2-bit frequency of a queued entry matching `(db, key)`, if present in
+    /// any of the three queues.
     fn bump_freq(&mut self, db: u32, key: &[u8]) {
         if let Some(e) = self.small.iter_mut().find(|e| e.matches(db, key)) {
             e.freq = (e.freq + 1).min(MAX_FREQ);
             return;
         }
         if let Some(e) = self.main.iter_mut().find(|e| e.matches(db, key)) {
+            e.freq = (e.freq + 1).min(MAX_FREQ);
+            return;
+        }
+        if let Some(e) = self.reoffer.iter_mut().find(|e| e.matches(db, key)) {
             e.freq = (e.freq + 1).min(MAX_FREQ);
         }
     }
@@ -209,6 +236,10 @@ impl S3Fifo {
         }
         if let Some(i) = self.main.iter().position(|e| e.matches(db, key)) {
             self.main.remove(i);
+            return true;
+        }
+        if let Some(i) = self.reoffer.iter().position(|e| e.matches(db, key)) {
+            self.reoffer.remove(i);
             return true;
         }
         false
@@ -226,9 +257,7 @@ impl EvictionHook for S3Fifo {
     fn on_insert(&mut self, db: u32, key: &[u8], _bytes: usize) {
         // A replace of an already-queued key: it is already tracked, so just treat it
         // as a fresh access (bump) rather than duplicating it.
-        if self.small.iter().any(|e| e.matches(db, key))
-            || self.main.iter().any(|e| e.matches(db, key))
-        {
+        if self.tracks(db, key) {
             self.bump_freq(db, key);
             return;
         }
@@ -258,11 +287,11 @@ impl EvictionHook for S3Fifo {
     fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
         // A returned victim has been pop_front'd OUT of its queue: the policy no longer
         // tracks it. The store may then SKIP deleting it (a volatile-* policy skips a
-        // non-TTL victim, see `ShardStore::evict_to_fit`); in that case only a later
-        // write (`on_insert`) re-tracks the key. PR-3b's EXPIRE attaches a TTL without
-        // a write, so it MUST call back into the policy to re-register the key, or a
-        // volatile-* policy would under-evict. See the full invariant note in
-        // `ShardStore::evict_to_fit`'s volatile-only skip path (a 3b prerequisite).
+        // non-TTL victim, see `ShardStore::evict_to_fit`); in that case the store calls
+        // [`EvictionPolicy::re_register`] to put the key BACK as a candidate (the #46
+        // re-eligibility fix), so a later EXPIRE that attaches a TTL makes it eligible
+        // without a rewrite. (PR-3a instead DROPPED such a key, which under-evicted a
+        // volatile-* policy; #46 is now fixed.)
         //
         // Guaranteed progress: cap the total promotion/second-chance rounds so an
         // all-hot keyspace still yields a victim instead of spinning. The bound is
@@ -274,14 +303,18 @@ impl EvictionHook for S3Fifo {
         loop {
             if rounds == 0 {
                 // Promotion cap hit (all-hot keyspace). Force-evict the small front,
-                // or the main front, whichever exists, so the store always makes
-                // progress (it must be able to free SOMETHING to honor the budget).
+                // then main, then the re-offer queue, whichever exists, so the store
+                // always makes progress (it must be able to free SOMETHING to honor the
+                // budget).
                 if let Some(e) = self.small.pop_front() {
                     let fp = Self::fingerprint(e.db, &e.key);
                     self.ghost_record(fp);
                     return Some((e.db, e.key));
                 }
                 if let Some(e) = self.main.pop_front() {
+                    return Some((e.db, e.key));
+                }
+                if let Some(e) = self.reoffer.pop_front() {
                     return Some((e.db, e.key));
                 }
                 return None;
@@ -292,7 +325,9 @@ impl EvictionHook for S3Fifo {
             // OVER its ~10% target (its overflow is the probationary churn S3-FIFO
             // evicts first); otherwise drain main with a second chance. When small is
             // within target but main is empty, fall back to small so a tiny keyspace
-            // (all in small) still yields a victim.
+            // (all in small) still yields a victim. The re-offer queue (skipped
+            // non-TTL volatile candidates, #46) is drained LAST, only once small and
+            // main are exhausted, so every fresh small/main candidate is offered first.
             let draw_small = (self.small.len() > self.small_cap() || self.main.is_empty())
                 && !self.small.is_empty();
 
@@ -326,7 +361,17 @@ impl EvictionHook for S3Fifo {
                 return Some((e.db, e.key));
             }
 
-            // Both queues empty: nothing to evict.
+            // Small and main exhausted: drain the lowest-priority re-offer queue (#46).
+            // These are keys the store skipped (non-TTL under volatile-*) and asked to
+            // keep as candidates; offering them only now guarantees a fresh small/main
+            // candidate (an eligible TTL victim included) is always reached first. The
+            // store re-checks TTL and either evicts (if a TTL has since been attached)
+            // or re-registers again; its distinct-key skip set bounds the cycle.
+            if let Some(e) = self.reoffer.pop_front() {
+                return Some((e.db, e.key));
+            }
+
+            // All three queues empty: nothing to evict.
             return None;
         }
     }
@@ -347,6 +392,33 @@ impl EvictionPolicy for S3Fifo {
 
     fn volatile_only(&self) -> bool {
         self.volatile_only
+    }
+
+    fn re_register(&mut self, db: u32, key: &[u8]) {
+        // The volatile-* re-eligibility fix (#46): `select_victim` pop_front'd this
+        // key, and the store declined to delete it (a non-TTL key under a volatile-*
+        // policy). Put it BACK so it stays an eviction candidate; a later EXPIRE that
+        // attaches a TTL then makes it eligible.
+        //
+        // We re-queue to the dedicated LOWEST-PRIORITY re-offer queue, NOT small or main.
+        // Feeding skipped keys back into small kept it permanently OVER its ~10% target
+        // and STARVED main, so a main-resident eligible TTL victim was never offered,
+        // producing a false `-OOM` while an evictable volatile key existed (the #46 bug);
+        // feeding them into main would symmetrically risk starving small. The separate
+        // re-offer queue (drained by `select_victim` only after small and main) removes
+        // the starvation in BOTH directions: every fresh small/main candidate (an
+        // eligible TTL victim included) is offered before any re-registered key cycles
+        // again. The store's distinct-key skip set (see `ShardStore::evict_to_fit`) then
+        // terminates the scan once every live key has been offered with no eligible TTL
+        // victim. Idempotent: do not duplicate an already-tracked key.
+        if self.tracks(db, key) {
+            return;
+        }
+        self.reoffer.push_back(Entry {
+            db,
+            key: key.to_vec().into_boxed_slice(),
+            freq: 0,
+        });
     }
 }
 
@@ -481,6 +553,45 @@ mod tests {
         let ttl = S3Fifo::with_name(true, "volatile-ttl");
         assert_eq!(ttl.policy_name(), "volatile-ttl");
         assert_eq!(ttl.engine_family(), "volatile-lru");
+    }
+
+    #[test]
+    fn re_register_keeps_a_skipped_victim_trackable() {
+        // The #46 re-eligibility fix: a victim the store declines to delete (a non-TTL
+        // key under volatile-*) is RE-REGISTERED, so the policy keeps offering it. The
+        // PR-3a path dropped it (on_remove), so it could never be a victim again.
+        let mut p = S3Fifo::new(true);
+        ins(&mut p, b"x");
+        // The store pulls x as a victim, then (non-TTL under volatile-*) re-registers
+        // it instead of deleting.
+        let v = p.select_victim().expect("x is offered as a victim");
+        assert_eq!(v.1.as_ref(), b"x");
+        // After select_victim, x is no longer queued (it was pop_front'd).
+        assert!(!p.tracks(0, b"x"), "select_victim pops the candidate out");
+        // Re-register puts it back (into the lowest-priority re-offer queue) so it stays
+        // a candidate.
+        p.re_register(0, b"x");
+        assert!(
+            p.tracks(0, b"x"),
+            "re_register keeps the key trackable (#46)"
+        );
+        // It is offered again on the next pass (now eligible if it has since gained a
+        // TTL at the store; the policy does not know about TTL, the store filters).
+        assert_eq!(
+            p.select_victim().map(|(_, k)| k.into_vec()),
+            Some(b"x".to_vec())
+        );
+        // re_register is idempotent: re-registering a still-tracked key does not dup.
+        p.re_register(0, b"x"); // x was just popped, so this re-adds once
+        p.re_register(0, b"x"); // already present now -> no-op
+        let count = p
+            .small
+            .iter()
+            .chain(p.main.iter())
+            .chain(p.reoffer.iter())
+            .filter(|e| e.matches(0, b"x"))
+            .count();
+        assert_eq!(count, 1, "re_register must not duplicate a tracked key");
     }
 
     #[test]

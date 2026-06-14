@@ -33,6 +33,7 @@ pub mod kvobj;
 
 use bytes::Bytes;
 use hashbrown::HashMap;
+use hashbrown::HashSet;
 use hashbrown::hash_map::Entry;
 use ironcache_eviction::EvictionPolicy;
 use ironcache_storage::{
@@ -63,6 +64,14 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// in lockstep with the accounting hook's add/sub deltas so the read is O(1).
     /// PR-2b swaps `used_memory()` to the jemalloc `stats.allocated` mallctl.
     used: u64,
+    /// The count of keys reaped by the LAZY expiry-on-read backstop since the last
+    /// drain (PR-3b INFO `expired_keys`, the lazy-path signal). The serve loop drains
+    /// it with [`Self::take_lazy_expired`] after each command and folds it into the
+    /// shard's `expired_keys` counter, so the lazy path contributes to `expired_keys`
+    /// alongside the active timing-wheel drain. Not a waist concept (it is an
+    /// introspection accumulator on the concrete store), so it adds no primitive
+    /// signature.
+    lazy_expired: u64,
 }
 
 impl ShardStore<NullEviction, CountingAccounting> {
@@ -87,6 +96,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             eviction,
             accounting,
             used: 0,
+            lazy_expired: 0,
         }
     }
 
@@ -161,6 +171,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 let bytes = obj.accounted_bytes();
                 self.account_sub(bytes);
                 self.eviction.on_remove(db, key, bytes);
+                // Count the lazy-backstop reclamation for INFO `expired_keys` (PR-3b).
+                // The serve loop drains this with `take_lazy_expired` after each
+                // command. This is the lazy-path signal that complements the active
+                // timing-wheel drain's count.
+                self.lazy_expired = self.lazy_expired.saturating_add(1);
             }
             return false;
         }
@@ -440,25 +455,52 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
     /// free anything (an empty keyspace, or the `noeviction` policy), so we stop and
     /// return what we evicted so far; the caller then decides whether to reply `-OOM`.
     ///
-    /// ## Volatile-only enforcement
+    /// ## Volatile-only enforcement (the #46 re-eligibility fix, completed in 3b)
     ///
     /// For a `volatile_only` policy (the `volatile-*` family) only TTL-bearing keys
     /// are eligible. The frozen hooks do not pass TTL to the policy, so the FILTER
     /// lives here, where the store can read `expire_at`: a victim with NO TTL is
-    /// removed from the policy's queue (so the policy stops offering it) but the kvobj
-    /// is NOT deleted, and the loop asks for the next victim. If no eligible
-    /// TTL-bearing key remains, the policy eventually returns `None` (its queues
-    /// drain of offerable victims) and the loop stops, leaving the over-budget write
-    /// to be rejected `-OOM` (matching Redis volatile-* with no expirable keys).
+    /// RE-REGISTERED into the policy (NON-DESTRUCTIVELY, via
+    /// [`EvictionPolicy::re_register`]) rather than dropped, and the loop asks for the
+    /// next victim. Re-registering (instead of the PR-3a `on_remove` drop) is the #46
+    /// fix: a non-TTL key the store declines to evict STAYS an eviction candidate, so
+    /// once a later EXPIRE attaches a TTL it becomes eligible. The scan is bounded by
+    /// tracking the distinct keys examined-and-skipped this call: once that set covers
+    /// the whole live keyspace with no eligible TTL-bearing victim found, the loop
+    /// returns what it freed so far (zero, here), leaving the over-budget write to be
+    /// rejected `-OOM` (matching Redis volatile-* with no expirable keys).
     ///
     /// `now` is consulted only to skip an ALREADY-expired victim (it will be reaped
-    /// lazily anyway). The iteration cap keeps the loop bounded by construction.
+    /// lazily anyway). The iteration cap is a defensive secondary bound.
     fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
         let volatile_only = self.eviction.volatile_only();
         let mut evicted: u64 = 0;
-        // A generous bound: at most a couple of touches per current entry, plus a
-        // margin, so a volatile skip-scan over an all-non-TTL keyspace still ends.
-        let max_rounds = self.len().saturating_mul(2).saturating_add(16);
+        // The bounded-scan guard for the #46 re-eligibility fix, as a DISTINCT-KEY set.
+        // Under a volatile-* policy a non-TTL victim is RE-REGISTERED (kept as a
+        // candidate) rather than dropped, so the policy can keep offering the same
+        // non-TTL keys forever. We bound the scan by recording each DISTINCT (db, key)
+        // we have examined-and-skipped this call: the loop dispatches no-progress (lets
+        // the caller reply -OOM) ONLY once that set covers the WHOLE live keyspace
+        // (`skipped.len() >= self.len()`), i.e. every live key has been offered and none
+        // was an eligible TTL-bearing victim (matching Redis volatile-*
+        // OOM-when-no-evictable-volatile-key).
+        //
+        // Why a DISTINCT set, not the old CONSECUTIVE-skip counter: `re_register` feeds
+        // a skipped key back so `select_victim` can re-offer it, and the policy may
+        // re-offer the SAME non-TTL key several times before it reaches an eligible
+        // TTL victim parked deeper in its queues. A consecutive-skip counter trips on
+        // those repeats and falsely reports OOM while an evictable volatile key still
+        // exists; counting DISTINCT keys does not trip until genuinely every live key
+        // has been offered, so a reachable TTL victim is always found first.
+        //
+        // Any actual eviction (or an expired-reap) shrinks the live keyspace and frees
+        // budget, so we CLEAR the set on that forward progress: the bound is then
+        // re-measured against the new (smaller) keyspace.
+        let mut skipped: HashSet<(u32, Box<[u8]>)> = HashSet::new();
+        // A defensive secondary cap: even if a policy mis-behaves (e.g. re-offers a key
+        // the set already holds without ever offering the rest), the loop ends. With the
+        // distinct-set bound above this should never be the binding limit.
+        let max_rounds = self.len().saturating_mul(4).saturating_add(64);
         let mut rounds = 0usize;
         // Strict `>`: free down to `used <= budget`, matching Redis getMaxmemoryState
         // (under-limit at `used <= maxmemory`). At used==budget the loop does not run.
@@ -486,34 +528,35 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
             }
             // An already-expired victim is reaped by the lazy backstop rather than
             // counted as an eviction (it would have read as absent anyway); this also
-            // drops it from the policy queue via expire_if_due's on_remove.
+            // drops it from the policy queue via expire_if_due's on_remove. This is
+            // forward progress, so clear the distinct-skip set.
             if is_expired {
                 self.expire_if_due(db, db_idx, &key, now);
+                skipped.clear();
                 continue;
             }
             if volatile_only && lacks_ttl {
-                // Only TTL-bearing keys are eligible. A non-TTL victim is dropped from
-                // the policy queue (so it is not re-offered) but NOT deleted.
-                //
-                // INVARIANT (volatile-* re-eligibility; a PR-3b PREREQUISITE).
-                // `select_victim` already pop_front'd this key from the policy's queue,
-                // and this on_remove makes that drop permanent: under a volatile-*
-                // policy the policy stops TRACKING a non-TTL key here, and ONLY a write
-                // (`on_insert`) re-tracks it. This is correct for PR-3a because EVERY
-                // 3a TTL is set at WRITE time (the upsert/rmw funnel re-inserts and so
-                // re-tracks the key with its new TTL). But PR-3b's EXPIRE attaches a
-                // TTL to an EXISTING key WITHOUT rewriting it, so EXPIRE MUST call back
-                // into the policy to re-register the key; otherwise a key dropped here
-                // while non-TTL would never become an eviction candidate again even
-                // after it gains a TTL, and a volatile-* policy would UNDER-EVICT
-                // (silently retain expirable keys it should be able to free). Tracked
-                // as a 3b prerequisite (see s3fifo::select_victim and the 3b EXPIRE
-                // task). NO behavior change in 3a.
-                self.eviction.on_remove(db, &key, 0);
+                // Only TTL-bearing keys are eligible. A non-TTL victim is NOT deleted
+                // and NOT dropped from the policy: it is RE-REGISTERED so it remains a
+                // candidate (the #46 re-eligibility fix). Record it as a DISTINCT skip
+                // and re-register it. Stop ONLY once the distinct-skip set covers the
+                // whole live keyspace (every live key offered, none an eligible TTL
+                // victim), so an eligible main-resident TTL victim is always reached
+                // before the bound trips. The membership check is BEFORE the insert so a
+                // re-offered key does not grow the set.
+                self.eviction.re_register(db, &key);
+                skipped.insert((db, key));
+                if skipped.len() >= self.len() {
+                    break;
+                }
                 continue;
             }
             if self.remove_object(db, db_idx, &key) {
                 evicted += 1;
+                // Forward progress: the keyspace shrank and budget was freed, so clear
+                // the skip set; a subsequent stretch of non-TTL skips is measured afresh
+                // against the (now smaller) keyspace.
+                skipped.clear();
             }
             // If the victim was already gone (a stale queue entry), the loop simply
             // asks for the next victim; it does not count as an eviction.
@@ -522,11 +565,45 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
     }
 }
 
+impl<E: EvictionHook, A: AccountingHook> ironcache_storage::ActiveExpiry for ShardStore<E, A> {
+    /// Reap `key` ONLY if it is present and its stored deadline has STRICTLY passed at
+    /// `now` (the active-drain re-check, EXPIRATION.md). The timing wheel may offer a
+    /// STALE entry (a re-TTL'd / PERSISTed / overwritten key), so this re-checks the
+    /// real `expire_at` and reaps only a genuinely-expired key (firing the
+    /// eviction/accounting remove hooks). A live key is left untouched and reported
+    /// `false`. The lazy-expired accumulator is NOT bumped here (the serve loop counts
+    /// active-drain reclamations separately into `expired_keys`), avoiding a double
+    /// count.
+    fn reap_if_expired(&mut self, db: u32, key: &[u8], now: UnixMillis) -> bool {
+        let db_idx = self.db_index(db);
+        let expired = self
+            .dbs
+            .get(db_idx)
+            .and_then(|m| m.get(key))
+            .is_some_and(|o| o.is_expired(now));
+        if !expired {
+            return false;
+        }
+        // remove_object fires on_remove + frees the bytes through the accounting hook.
+        self.remove_object(db, db_idx, key)
+    }
+}
+
 impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// Borrow the accounting hook (test/introspection helper).
     #[must_use]
     pub fn accounting(&self) -> &A {
         &self.accounting
+    }
+
+    /// Take (and reset) the count of keys reaped by the LAZY expiry-on-read backstop
+    /// since the last call (PR-3b INFO `expired_keys`, the lazy-path signal). The
+    /// serve loop calls this after each command and folds the result into the shard's
+    /// `expired_keys` counter, so both the lazy backstop and the active timing-wheel
+    /// drain contribute to `expired_keys`. Not a waist method; an introspection
+    /// accumulator on the concrete store.
+    pub fn take_lazy_expired(&mut self) -> u64 {
+        std::mem::take(&mut self.lazy_expired)
     }
 
     /// Insert a fully-formed [`KvObj`] under `db`, bypassing the string-only

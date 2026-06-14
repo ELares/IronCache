@@ -12,6 +12,7 @@
 
 use crate::cmd_util::{ascii_upper, parse_f64, parse_i64, parse_i64_strict};
 use bytes::Bytes;
+use ironcache_expiry::TimingWheel;
 use ironcache_protocol::{ErrorReply, Request, Value, format_human_double};
 use ironcache_storage::{
     DataType, ExpireWrite, NewValue, NewValueOwned, RmwAction, RmwEntry, RmwStep, Store, UnixMillis,
@@ -188,7 +189,17 @@ fn now_plus(now: UnixMillis, delta_millis: i64) -> Result<i64, SetParseError> {
 /// Plain SET is a blind `upsert`. Any conditional (NX/XX) or observing (GET) form,
 /// or KEEPTTL, goes through `rmw` so the observe-then-write is atomic. Reply is
 /// `+OK`/null per Redis, or (with GET) the old value / WRONGTYPE.
-pub fn cmd_set<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+///
+/// `wheel` registers the resolved deadline after a SET that actually wrote a TTL
+/// (EX/PX/EXAT/PXAT), so the active drain can reclaim it; the lazy backstop in the
+/// store remains the correctness guarantee, so this registration is best-effort.
+pub fn cmd_set<S: Store>(
+    store: &mut S,
+    wheel: &mut TimingWheel,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+) -> Value {
     if req.args.len() < 3 {
         return Value::error(ErrorReply::wrong_arity("set"));
     }
@@ -206,10 +217,19 @@ pub fn cmd_set<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request)
         TtlOption::Keep => ExpireWrite::Keep,
         TtlOption::Set(at) => ExpireWrite::Set(at),
     };
+    // The absolute deadline an EX/PX/EXAT/PXAT SET sets (for the wheel registration).
+    let set_deadline = if let TtlOption::Set(at) = opts.ttl {
+        Some(at)
+    } else {
+        None
+    };
 
     // The fast path: plain SET with no NX/XX/GET is a blind upsert.
     if !opts.nx && !opts.xx && !opts.get {
         store.upsert(db, &req.args[1], NewValue::Bytes(&req.args[2]), expire, now);
+        if let Some(at) = set_deadline {
+            wheel.register(db, &req.args[1], at);
+        }
         return Value::ok();
     }
 
@@ -217,7 +237,10 @@ pub fn cmd_set<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request)
     // applies NX/XX, captures GET's old value, and writes.
     let key = req.args[1].clone();
     let new_val = req.args[2].clone();
-    store.rmw(db, &key, now, move |entry| {
+    // Tracks whether the rmw actually performed the write (so the deadline is
+    // registered only when a TTL was really set, not on an NX/XX no-op or WRONGTYPE).
+    let mut wrote = false;
+    let reply = store.rmw(db, &key, now, |entry| {
         let occupied = matches!(entry, RmwEntry::Occupied(_));
 
         // GET (and the WRONGTYPE check it forces) observes the old value first.
@@ -254,13 +277,21 @@ pub fn cmd_set<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request)
         }
 
         // Write the new value with the resolved TTL effect.
+        wrote = true;
         let reply = get_reply.unwrap_or_else(Value::ok);
         RmwStep {
             action: RmwAction::Replace(NewValueOwned::Bytes(new_val)),
             expire,
             reply,
         }
-    })
+    });
+
+    if wrote {
+        if let Some(at) = set_deadline {
+            wheel.register(db, &key, at);
+        }
+    }
+    reply
 }
 
 /// `SETNX key value` -> 1 if set (key was absent), 0 otherwise. An rmw insert-if
