@@ -146,3 +146,5 @@ Specs added as the M1 milestone progresses.
   topology under shared-nothing (#20, #108).
 - [CLIENT_TRACKING.md](CLIENT_TRACKING.md): CLIENT TRACKING (BCAST + RESP3 push
   default, bounded global table, RESP2 REDIRECT) (#21).
+- [BITMAPS.md](BITMAPS.md): bitmap and BITFIELD semantics over the string type
+  (SETBIT/GETBIT zero-fill, BITCOUNT/BITPOS BYTE|BIT, BITOP, BITFIELD overflow) (#131).

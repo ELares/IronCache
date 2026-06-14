@@ -7517,3 +7517,122 @@ claims:
     note: BLOCK and $ wording quoted directly from redis.io XREAD. BLOCK 0 = block indefinitely and millisecond
       units corroborated by web search (redis client issue trackers redis/jedis#2277, redis/redis-rb#836
       explicitly treat BLOCK 0 as 'should not time out').
+- id: redis-setbit-zerofill-growth-bigendian
+  dimension: datastructures
+  system: Redis
+  version: 7.x (docs latest, 2026-06-14)
+  claim: Redis SETBIT grows the underlying string as needed to hold the addressed bit, and any newly added
+    bytes/bits introduced by growth are set to 0; bits are big-endian within each byte (the first byte
+    covers bit offsets 0..7, the second byte 8..15, etc., with offset 0 being the most significant bit
+    of byte 0).
+  value: SETBIT zero-fills on growth; big-endian bit ordering within bytes (offset 0 = MSB of first byte;
+    first byte = offsets 0..7)
+  source_url: https://redis.io/docs/latest/commands/setbit/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Official Redis SETBIT command page states verbatim 'When the string at key is grown,
+    added bits are set to 0' and 'The first byte of the string corresponds to offsets 0..7 of the bitmap,
+    the second byte to the 8..15 range, and so forth'; SETBIT/GETBIT example ('42') confirms big-endian
+    ordering.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/setbit/
+    note: WebFetch of the official SETBIT page returned the verbatim growth/zero-fill text and the byte/offset
+      mapping, plus the worked '42' example demonstrating big-endian bit order. GETBIT page corroborates
+      that out-of-range offsets read as 0 ('contiguous space with 0 bits').
+- id: redis-bitcount-bitpos-byte-bit-range-7-0
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.0.0 (BIT option added); docs latest, 2026-06-14
+  claim: 'Redis BITCOUNT (syntax: BITCOUNT key [start end [BYTE | BIT]]) and BITPOS (syntax: BITPOS key
+    bit [start [end [BYTE | BIT]]]) support range indexing in either BYTE units (the default) or BIT units;
+    the BYTE|BIT modifier was added in Redis 7.0.0. Negative indices count from the end (-1 = last byte/bit).'
+  value: BITCOUNT/BITPOS accept BYTE (default) or BIT range units; BIT|BYTE option added in 7.0.0
+  source_url: https://redis.io/docs/latest/commands/bitcount/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: 'Official BITCOUNT and BITPOS command pages both show the [BYTE | BIT] modifier in
+    the syntax and both History sections state ''Starting with Redis version 7.0.0: Added the BYTE|BIT
+    option.'''
+  load_bearing: false
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/bitpos/
+    note: WebFetch of both the BITCOUNT and BITPOS official pages independently confirmed the BYTE|BIT
+      modifier in the syntax and the 7.0.0 'Added the BYTE|BIT option' history entry, plus worked examples
+      (e.g. BITCOUNT mykey 5 30 BIT; BITPOS mykey 1 7 15 BIT).
+- id: redis-bitop-result-length-longest-zeropad
+  dimension: datastructures
+  system: Redis
+  version: 7.x (docs latest, 2026-06-14)
+  claim: Redis BITOP performs bitwise AND/OR/XOR/NOT (NOT is unary) across one or more source strings
+    into a destination key; when operands differ in length, every shorter operand (and any non-existent
+    key) is treated as zero-padded up to the length of the longest operand, and the resulting destination
+    string length equals the size of the longest input string.
+  value: BITOP AND/OR/XOR/NOT; result length = longest input; shorter operands and missing keys zero-padded
+    to longest
+  source_url: https://redis.io/docs/latest/commands/bitop/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Official BITOP page states 'all the strings shorter than the longest string ... are
+    treated as if they were zero-padded up to the length of the longest string', non-existent keys 'considered
+    as a stream of zero bytes', and the integer reply 'is equal to the size of the longest input string'.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/bitop/
+    note: 'WebFetch of the official BITOP page returned the verbatim zero-padding and result-length-equals-longest-input
+      text. Note: the documented current Redis BITOP also supports additional operators (DIFF, DIFF1,
+      ANDOR, ONE) beyond the classic AND/OR/XOR/NOT; the AND/OR/XOR/NOT subset and the length/zero-pad
+      semantics asserted here are fully confirmed.'
+- id: redis-bitfield-widths-overflow-modes
+  dimension: datastructures
+  system: Redis
+  version: 7.x (docs latest, 2026-06-14)
+  claim: Redis BITFIELD addresses fixed-width integer fields within a string using type specifiers u<N>
+    (unsigned, up to 63 bits) and i<N> (signed, up to 64 bits); the unsigned 63-bit cap exists because
+    the RESP protocol cannot return 64-bit unsigned integers. INCRBY/SET overflow behavior is selectable
+    per OVERFLOW directive as WRAP (modular wraparound, the default), SAT (saturating arithmetic clamping
+    to min/max), or FAIL (no-op on overflow, returning NULL for that subcommand).
+  value: BITFIELD u<N> up to u63, i<N> up to i64; OVERFLOW WRAP (default) | SAT | FAIL
+  source_url: https://redis.io/docs/latest/commands/bitfield/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Official BITFIELD page states 'up to 64 bits for signed integers, and up to 63 bits
+    for unsigned integers' (the latter due to RESP being 'unable to return 64 bit unsigned integers as
+    replies') and documents the three OVERFLOW behaviors WRAP/SAT/FAIL with WRAP as default.
+  load_bearing: true
+  verification:
+    verdict: confirmed
+    best_source_url: https://redis.io/docs/latest/commands/bitfield/
+    note: WebFetch of the official BITFIELD page returned the verbatim width limits (i up to 64, u up
+      to 63) with the RESP-protocol rationale, and the verbatim WRAP/SAT/FAIL OVERFLOW definitions including
+      WRAP-as-default and FAIL returning NULL.
+- id: redis-bitmap-is-string-type
+  dimension: resp-protocol-compat
+  system: Redis
+  version: 7.x (docs latest, 2026-06-14)
+  claim: In Redis, bitmaps are not a dedicated/distinct data type; they are a set of bit-oriented operations
+    defined on the String type, which is treated as a bit vector. A key written to via SETBIT/BITFIELD
+    holds an ordinary string (interoperable with SET/GET), and therefore TYPE returns 'string' for such
+    a key.
+  value: Bitmaps are the String type (not a separate type); TYPE returns 'string'
+  source_url: https://redis.io/docs/latest/develop/data-types/bitmaps/
+  accessed_date: '2026-06-14'
+  confidence: high
+  confidence_reason: Official Redis Bitmaps data-type doc states verbatim 'Redis bitmaps are not an actual
+    data type, but a set of bit-oriented operations defined on the String type which is treated like a
+    bit vector' and notes bitmaps can be used with string commands SET/GET; the SETBIT command page reinforces
+    this with its 'bitmapsarestrings' GET example.
+  load_bearing: true
+  verification:
+    verdict: self-verified
+    best_source_url: https://redis.io/docs/latest/develop/data-types/bitmaps/
+    note: The 'not an actual data type, but a set of bit-oriented operations defined on the String type'
+      wording was retrieved verbatim via WebSearch of the official redis.io bitmaps doc (and matches the
+      mirrored valkey.io/redis-stack copies). The direct WebFetch of the canonical page returned no body
+      on two attempts (and the .md variant 404'd), so the page text was confirmed indirectly; the specific
+      'TYPE returns string' phrasing is the documented corollary of bitmaps being the String type (the
+      SETBIT page stores into a key and GETs it back as a string), not a verbatim quote, hence self-verified
+      rather than confirmed.
