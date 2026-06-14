@@ -119,3 +119,9 @@ Specs added as the M1 milestone progresses.
   monoio/glommio/tokio swappable (#27).
 - [IOURING_DATAPATH.md](IOURING_DATAPATH.md): the Linux io_uring net fast path
   (per-shard ring, registered fixed buffers, multishot + one-shot fallback) (#28).
+- [ZSET_LARGE.md](ZSET_LARGE.md): the large sorted-set representation (ordered
+  index plus parallel member->score map; final structure deferred to #136) (#134).
+- [LIST_LARGE.md](LIST_LARGE.md): the large list (quicklist-equivalent chunked
+  listpack deque, O(1) head/tail, ~8KB node sizing) (#135).
+- [OBJECT_ENCODING_MAPPING.md](OBJECT_ENCODING_MAPPING.md): the internal-repr to
+  OBJECT ENCODING name map and DEBUG OBJECT field synthesis (#40).
