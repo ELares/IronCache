@@ -174,3 +174,9 @@ Specs added as the M1 milestone progresses.
 - [CLIENT_DRIVER_MATRIX.md](CLIENT_DRIVER_MATRIX.md): the real client-driver
   compatibility matrix (run lettuce/jedis/redis-py/go-redis/ioredis/node-redis/
   StackExchange.Redis own suites against IronCache, pinned versions) (#158).
+- [COMPRESSION_MUTATION.md](COMPRESSION_MUTATION.md): compression interaction with
+  mutating commands (per-command table, disable-on-first-grow, hot-key cost) (#56).
+- [EVICTION_ORACLE.md](EVICTION_ORACLE.md): the offline Belady-MIN / learned-Belady
+  oracle in the benchmark harness (benchmark-only-crate isolation) (#93).
+- [COMPRESSION_ADVISOR.md](COMPRESSION_ADVISOR.md): the off-path per-value
+  compression decision model (offline table, zero per-request model calls) (#92).
