@@ -43,6 +43,15 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             // silently bypass the ceiling.
             | b"SETEX"
             | b"PSETEX"
+            // RENAME/RENAMENX/COPY are `denyoom` writes in Redis (they materialize a
+            // value at the destination). MOVE is NOT denyoom (Redis flags it `write
+            // fast` without denyoom, since it relocates rather than duplicates), so it
+            // is intentionally absent. SWAPDB/FLUSHDB/FLUSHALL/TOUCH/UNLINK/SCAN/KEYS/
+            // DBSIZE/RANDOMKEY/OBJECT do not allocate value bytes, so they are not
+            // gated either (FLUSH* and UNLINK/DEL are memory-RELEASING).
+            | b"RENAME"
+            | b"RENAMENX"
+            | b"COPY"
     )
 }
 
@@ -64,6 +73,9 @@ mod tests {
             b"INCRBYFLOAT",
             b"SETEX",
             b"PSETEX",
+            b"RENAME",
+            b"RENAMENX",
+            b"COPY",
         ] {
             assert!(is_denyoom(w), "{w:?} should be denyoom");
         }
@@ -79,6 +91,19 @@ mod tests {
             b"TYPE",
             // memory-releasing
             b"DEL",
+            b"UNLINK",
+            b"FLUSHDB",
+            b"FLUSHALL",
+            // generic keyspace reads / non-allocating (PR-4a)
+            b"KEYS",
+            b"SCAN",
+            b"DBSIZE",
+            b"RANDOMKEY",
+            b"TOUCH",
+            b"OBJECT",
+            // MOVE relocates rather than duplicates (write fast, not denyoom in Redis)
+            b"MOVE",
+            b"SWAPDB",
             // Tier-0 / connection
             b"INFO",
             b"PING",
