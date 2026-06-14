@@ -27,6 +27,7 @@ in [OPEN.md](OPEN.md); research questions in [QUESTIONS.md](QUESTIONS.md).
 | [0019](0019-resp3-reply-shaping.md) | RESP3 reply-shaping policy and error fidelity | Accepted | #17 |
 | [0020](0020-cli-dispatch-and-signing.md) | CLI mode dispatch (clap) and artifact signing (minisign) | Accepted | #82 |
 | [0021](0021-c-bound-zstd-vs-pure-rust.md) | C-bound zstd default, pure-Rust behind a feature | Accepted | #54 |
+| [0023](0023-cold-tier-engine.md) | Cold-tier engine (reject RocksDB/LSM, adopt hybrid log) | Accepted | #65 |
 | [0024](0024-geo-command-scope.md) | Geo command family scope (non-goal for v1) | Accepted | #133 |
 
 As `[DECISION]` issues close, each adds its row here and its `NNNN-*.md` record.
