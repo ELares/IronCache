@@ -17,6 +17,8 @@ members = [
     "crates/ironcache-runtime",
     "crates/ironcache-config",
     "crates/ironcache-observe",
+    "crates/ironcache-storage",
+    "crates/ironcache-store",
     "crates/ironcache-server",
     "crates/ironcache",
 ]
@@ -69,6 +71,9 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads", "stats"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # SO_REUSEPORT and keepalive socket options (RUNTIME.md per-shard accept).
 socket2 = { version = "0.6", features = ["all"] }
+# The per-shard SwissTable for the store index (ADR-0005, HASHTABLE.md #35). Stock
+# hashbrown, unsynchronized, owned by one core; MIT OR Apache-2.0 (cargo-deny clean).
+hashbrown = "0.16"
 # Fast CRLF scanning in the RESP line decoder.
 memchr = "2.7"
 # Shortest round-trip f64 digits, post-processed into Redis/fpconv spelling.
@@ -82,6 +87,8 @@ ironcache-protocol = { path = "crates/ironcache-protocol" }
 ironcache-runtime = { path = "crates/ironcache-runtime" }
 ironcache-config = { path = "crates/ironcache-config" }
 ironcache-observe = { path = "crates/ironcache-observe" }
+ironcache-storage = { path = "crates/ironcache-storage" }
+ironcache-store = { path = "crates/ironcache-store" }
 ironcache-server = { path = "crates/ironcache-server" }
 
 [profile.release]

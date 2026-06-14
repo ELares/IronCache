@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-store"
+description = "The concrete per-shard store: per-DB hashbrown SwissTable of kvobj entries, implementing the ironcache-storage narrow waist (HASHTABLE.md #35, OBJECT_LAYOUT.md #111, ADR-0005)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The frozen waist this crate implements.
+ironcache-storage = { workspace = true }
+# Bytes for value buffers (matches the waist's borrow/write byte type).
+bytes = { workspace = true }
+# The per-shard SwissTable (ADR-0005: stock hashbrown, unsynchronized, owned by
+# one core). Its default hasher is fine for PR-2a; the inline-tag/seeded-hash
+# tuning is a #8 follow-up.
+hashbrown = { workspace = true }

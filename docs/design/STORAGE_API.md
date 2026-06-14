@@ -80,7 +80,12 @@ knowing the engine internals:
 - **accounting hook** (#41/ADR-0006): every insert/delete updates the shard's
   allocator-attributed byte count for honest maxmemory (invariant 3).
 - **snapshot hook** (#60): the forkless versioned snapshot observes writes via the
-  same path (the OnWrite hook).
+  store-internal write funnel (the OnWrite pre-image hook). This hook attaches at
+  the store's internal `put_object`/`remove_object`/`rmw` funnel, which is NOT part
+  of the frozen `Store` trait, so it lands WITH the Wave-3 snapshot feature without
+  reopening the waist. The PR-2a store carries only the eviction and accounting
+  hooks on the trait surface; expiration is folded into the per-entry deadline
+  (not a separate hook), and the snapshot OnWrite hook is deferred to its feature.
 
 ### Layering contract
 
@@ -110,8 +115,14 @@ may assume a single backend.
   access); iteration (SCAN), blocking, and pub/sub use their own entry points,
   not the four.
 - An `RMW` mutator observes and writes atomically with no lock on the owning core.
-- The eviction, expiration, accounting, and snapshot hooks all fire through the
-  primitives, verified by the conformance and property suites (#95/#98).
+- The eviction and accounting hooks fire through the four primitives, and
+  expiration is enforced through the per-entry deadline on every read path (lazy
+  backstop now, active timing wheel in PR-3); these are verified by the conformance
+  and property suites (#95/#98). The snapshot OnWrite pre-image hook attaches at the
+  store-internal write funnel (`put_object`/`remove_object`/`rmw`), NOT the frozen
+  `Store` trait, and lands with the Wave-3 snapshot feature (#60) without reopening
+  the waist, so spec and code agree: the PR-2a trait surface carries eviction +
+  accounting only.
 
 ## References
 

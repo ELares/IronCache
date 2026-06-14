@@ -10,9 +10,11 @@
 //! in PR-2.
 
 use crate::conn::ConnState;
+use crate::{cmd_keyspace, cmd_string};
 use ironcache_env::Clock;
 use ironcache_observe::{CounterSnapshot, ServerInfo, build_info};
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
+use ironcache_storage::{Store, UnixMillis};
 
 /// Immutable, server-wide context a handler may read. It is cloned cheaply onto
 /// each shard; the dynamic per-rollup counters are passed in separately.
@@ -41,19 +43,29 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 
 /// Dispatch one request to its handler, returning the reply [`Value`].
 ///
-/// `clock` provides INFO uptime through the Env seam (no direct time). `state` is
-/// the mutable per-connection state. `rollup` yields the counters for INFO.
-pub fn dispatch<C: Clock>(
+/// `clock` provides INFO uptime through the Env seam (no direct time). `store` is
+/// the per-shard storage waist (#34) the data commands run against; `now` is the
+/// absolute wall-clock deadline basis for this command, computed once per command
+/// by the caller from the Env clock (ADR-0003: the store reads no clock). `state`
+/// is the mutable per-connection state. `rollup` yields the counters for INFO.
+///
+/// Tier-0 (connection) commands ignore `store`/`now`; the data commands use them.
+/// The function is generic over `S: Store` for monomorphization, consistent with
+/// the existing `C: Clock` generic.
+pub fn dispatch<C: Clock, S: Store>(
     ctx: &ServerContext,
     state: &mut ConnState,
     clock: &C,
+    store: &mut S,
+    now: UnixMillis,
     rollup: RollupFn<'_>,
     req: &Request,
 ) -> Value {
     let cmd = ascii_upper(req.command());
 
     // Auth gate: before authenticating, only a small set of commands is allowed
-    // (Redis: HELLO, AUTH, QUIT, RESET). Everything else is NOAUTH.
+    // (Redis: HELLO, AUTH, QUIT, RESET). Everything else (including the data
+    // commands) is NOAUTH.
     if ctx.requires_auth()
         && !state.authenticated
         && !matches!(cmd.as_slice(), b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
@@ -61,6 +73,7 @@ pub fn dispatch<C: Clock>(
         return Value::error(ErrorReply::noauth());
     }
 
+    let db = state.db;
     match cmd.as_slice() {
         b"PING" => cmd_ping(req),
         b"ECHO" => cmd_echo(req),
@@ -79,6 +92,15 @@ pub fn dispatch<C: Clock>(
         b"COMMAND" => cmd_command(req),
         b"INFO" => cmd_info(ctx, clock, rollup, req),
         b"CONFIG" => cmd_config_stub(req),
+        // -- Data commands (PR-2a) over the storage waist. --
+        b"GET" => cmd_string::cmd_get(store, db, now, req),
+        b"SET" => cmd_string::cmd_set(store, db, now, req),
+        b"SETNX" => cmd_string::cmd_setnx(store, db, now, req),
+        b"GETSET" => cmd_string::cmd_getset(store, db, now, req),
+        b"STRLEN" => cmd_string::cmd_strlen(store, db, now, req),
+        b"DEL" => cmd_keyspace::cmd_del(store, db, now, req),
+        b"EXISTS" => cmd_keyspace::cmd_exists(store, db, now, req),
+        b"TYPE" => cmd_keyspace::cmd_type(store, db, now, req),
         _ => {
             let name = String::from_utf8_lossy(req.command()).into_owned();
             let rest: Vec<&[u8]> = req.args[1..].iter().map(bytes::Bytes::as_ref).collect();
@@ -394,6 +416,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use ironcache_env::{Monotonic, TestEnv};
+    use ironcache_store::ShardStore;
 
     fn ctx(pass: Option<&str>) -> ServerContext {
         ServerContext {
@@ -428,8 +451,24 @@ mod tests {
 
     fn run(ctx: &ServerContext, st: &mut ConnState, parts: &[&[u8]]) -> Value {
         let env = TestEnv::new(1);
+        let mut store = ShardStore::new(ctx.databases);
         let zero = || CounterSnapshot::default();
-        dispatch(ctx, st, &env, &zero, &req(parts))
+        dispatch(ctx, st, &env, &mut store, UnixMillis(0), &zero, &req(parts))
+    }
+
+    /// Like [`run`] but threads a caller-owned store and `now`, for the data-command
+    /// tests that need state to persist across calls (SET then GET) and a clock to
+    /// advance (EX/lazy expiry).
+    fn run_on(
+        ctx: &ServerContext,
+        st: &mut ConnState,
+        store: &mut ShardStore,
+        now: UnixMillis,
+        parts: &[&[u8]],
+    ) -> Value {
+        let env = TestEnv::new(1);
+        let zero = || CounterSnapshot::default();
+        dispatch(ctx, st, &env, store, now, &zero, &req(parts))
     }
 
     #[test]
@@ -637,6 +676,401 @@ mod tests {
                 assert!(String::from_utf8_lossy(&b).contains("tcp_port:6379"));
             }
             other => panic!("expected bulk, got {other:?}"),
+        }
+    }
+
+    // -- Data commands (PR-2a) through dispatch over a real ShardStore. --
+
+    fn bulk(b: &[u8]) -> Value {
+        Value::BulkString(Some(Bytes::copy_from_slice(b)))
+    }
+
+    #[test]
+    fn set_then_get_round_trips() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"foo", b"bar"]),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"foo"]),
+            bulk(b"bar")
+        );
+        // Missing key -> null.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"nope"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn set_nx_only_when_absent() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v1", b"NX"]),
+            Value::ok()
+        );
+        // Second NX on a present key -> nil, value unchanged.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v2", b"NX"]),
+            Value::Null
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), bulk(b"v1"));
+    }
+
+    #[test]
+    fn set_xx_only_when_present() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        // XX on absent key -> nil, nothing written.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v", b"XX"]),
+            Value::Null
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), Value::Null);
+        // Create, then XX overwrite works.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v2", b"XX"]),
+            Value::ok()
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), bulk(b"v2"));
+    }
+
+    #[test]
+    fn set_get_returns_old_value() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"old"]);
+        // SET k new XX GET -> returns old, writes new.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", b"k", b"new", b"XX", b"GET"]
+            ),
+            bulk(b"old")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]),
+            bulk(b"new")
+        );
+        // SET GET on an absent key returns null and writes the new value.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"fresh", b"v", b"GET"]),
+            Value::Null
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"fresh"]),
+            bulk(b"v")
+        );
+    }
+
+    #[test]
+    fn set_keepttl_preserves_deadline() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        // Set with a 100-second TTL at t=0 (deadline 100000ms).
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            UnixMillis(0),
+            &[b"SET", b"k", b"a", b"EX", b"100"],
+        );
+        // KEEPTTL overwrite at t=1000: value changes, deadline preserved.
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            UnixMillis(1_000),
+            &[b"SET", b"k", b"b", b"KEEPTTL"],
+        );
+        // Alive AT the original deadline (Valkey boundary is `now > deadline`).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, UnixMillis(100_000), &[b"GET", b"k"]),
+            bulk(b"b")
+        );
+        // Expired one ms past the original deadline (KEEPTTL kept it, did not extend).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, UnixMillis(100_001), &[b"GET", b"k"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn set_ex_stores_deadline_and_lazy_expires() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        // EX 10 at t=0 -> deadline 10000ms.
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            UnixMillis(0),
+            &[b"SET", b"k", b"v", b"EX", b"10"],
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, UnixMillis(9_999), &[b"GET", b"k"]),
+            bulk(b"v")
+        );
+        // Alive AT the deadline (Valkey boundary is `now > deadline`).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, UnixMillis(10_000), &[b"GET", b"k"]),
+            bulk(b"v")
+        );
+        // Expired one ms past the deadline.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, UnixMillis(10_001), &[b"GET", b"k"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn set_conflicting_options_is_syntax_error() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        for opts in [
+            vec![b"SET".as_slice(), b"k", b"v", b"NX", b"XX"],
+            vec![b"SET", b"k", b"v", b"EX", b"1", b"PX", b"1"],
+            vec![b"SET", b"k", b"v", b"EX", b"1", b"KEEPTTL"],
+            vec![b"SET", b"k", b"v", b"BOGUS"],
+        ] {
+            match run_on(&c, &mut s, &mut st, t, &opts) {
+                Value::Error(e) => assert_eq!(e.line(), "-ERR syntax error", "{opts:?}"),
+                other => panic!("expected syntax error for {opts:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_non_positive_or_overflowing_expire_is_invalid_expire_time() {
+        // Redis emits `-ERR invalid expire time in 'set' command` (a class DISTINCT
+        // from syntax error) for an EX/PX/EXAT/PXAT value <= 0 or one that overflows
+        // the millisecond computation. Nothing is written.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        for opts in [
+            vec![b"SET".as_slice(), b"k", b"v", b"EX", b"0"],
+            vec![b"SET", b"k", b"v", b"EX", b"-1"],
+            vec![b"SET", b"k", b"v", b"PX", b"0"],
+            vec![b"SET", b"k", b"v", b"EXAT", b"0"],
+            vec![b"SET", b"k", b"v", b"PXAT", b"0"],
+            // EX * 1000 overflows i64 -> invalid expire (an integer, but out of ms range).
+            vec![b"SET", b"k", b"v", b"EX", b"9223372036854775807"],
+        ] {
+            match run_on(&c, &mut s, &mut st, t, &opts) {
+                Value::Error(e) => assert_eq!(
+                    e.line(),
+                    "-ERR invalid expire time in 'set' command",
+                    "{opts:?}"
+                ),
+                other => panic!("expected invalid expire time for {opts:?}, got {other:?}"),
+            }
+        }
+        // No key was ever written.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), Value::Null);
+    }
+
+    #[test]
+    fn set_non_integer_expire_is_not_an_integer_error() {
+        // A NON-integer expire argument is the shared not-an-integer error, thrown
+        // BEFORE the <= 0 check (a distinct class from invalid expire time). A
+        // leading '+' is also rejected (Redis string2ll rejects '+').
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        for opts in [
+            vec![b"SET".as_slice(), b"k", b"v", b"EX", b"abc"],
+            vec![b"SET", b"k", b"v", b"PX", b"1.5"],
+            vec![b"SET", b"k", b"v", b"EX", b"+5"],
+        ] {
+            match run_on(&c, &mut s, &mut st, t, &opts) {
+                Value::Error(e) => assert_eq!(
+                    e.line(),
+                    "-ERR value is not an integer or out of range",
+                    "{opts:?}"
+                ),
+                other => panic!("expected not-an-integer for {opts:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn setnx_and_getset() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SETNX", b"k", b"v1"]),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SETNX", b"k", b"v2"]),
+            Value::Integer(0)
+        );
+        // GETSET returns old and writes new.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETSET", b"k", b"v3"]),
+            bulk(b"v1")
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), bulk(b"v3"));
+        // GETSET on absent key returns null.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETSET", b"new", b"x"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn del_and_exists_variadic_counts() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"a", b"1"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"2"]);
+        // EXISTS counts repeats (Redis semantics).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"EXISTS", b"a", b"a", b"b", b"missing"]
+            ),
+            Value::Integer(3)
+        );
+        // DEL removes live keys, returns count removed.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"DEL", b"a", b"b", b"missing"]),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"a", b"b"]),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn type_and_strlen() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"TYPE", b"k"]),
+            Value::simple("none")
+        );
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"hello"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"TYPE", b"k"]),
+            Value::simple("string")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"STRLEN", b"k"]),
+            Value::Integer(5)
+        );
+        // STRLEN of an int value is the decimal length.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"n", b"-12345"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"STRLEN", b"n"]),
+            Value::Integer(6)
+        );
+        // STRLEN of an absent key is 0.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"STRLEN", b"gone"]),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn wrongtype_on_get_against_non_string() {
+        use ironcache_storage::{DataType, Encoding};
+        use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
+
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+
+        // Plant a non-String value directly (PR-2a commands only ever produce
+        // Strings, so this is the only way to reach the WRONGTYPE branch before
+        // collections land). A List-typed kvobj under key "lst".
+        let mut obj = KvObj::from_bytes(b"lst", b"x", None);
+        obj.header = Header {
+            data_type: DataType::List,
+            encoding: Encoding::ListPack,
+            eviction_rank: 0,
+            ttl_present: false,
+            snapshot_version: 0,
+        };
+        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        st.insert_object(0, obj);
+
+        // GET / STRLEN / GETSET against the non-string -> WRONGTYPE.
+        match run_on(&c, &mut s, &mut st, t, &[b"GET", b"lst"]) {
+            Value::Error(e) => assert_eq!(
+                e.line(),
+                "-WRONGTYPE Operation against a key holding the wrong kind of value"
+            ),
+            other => panic!("expected WRONGTYPE, got {other:?}"),
+        }
+        assert!(matches!(
+            run_on(&c, &mut s, &mut st, t, &[b"STRLEN", b"lst"]),
+            Value::Error(_)
+        ));
+        assert!(matches!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETSET", b"lst", b"v"]),
+            Value::Error(_)
+        ));
+        // TYPE never returns WRONGTYPE; it reports the type name.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"TYPE", b"lst"]),
+            Value::simple("list")
+        );
+    }
+
+    #[test]
+    fn arity_errors_on_data_commands() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = ShardStore::new(c.databases);
+        let t = UnixMillis(0);
+        for cmd in [
+            vec![b"GET".as_slice()],
+            vec![b"SET", b"k"],
+            vec![b"DEL"],
+            vec![b"EXISTS"],
+            vec![b"TYPE"],
+            vec![b"STRLEN"],
+            vec![b"SETNX", b"k"],
+            vec![b"GETSET", b"k"],
+        ] {
+            assert!(
+                matches!(run_on(&c, &mut s, &mut st, t, &cmd), Value::Error(_)),
+                "expected arity error for {cmd:?}"
+            );
         }
     }
 }

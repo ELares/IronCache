@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-storage"
+description = "The narrow-waist storage API (Read/Upsert/Delete/RMW + hooks). THE freeze point between the command layer and the per-shard store (STORAGE_API.md, #34)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Bytes for the read-borrow / write-value byte handling (PROTOCOL.md leans on the
+# same buffer type). The waist names ONLY this and the env Clock newtype basis; no
+# hashbrown and no concrete map type, so the command layer can depend on the waist
+# without pulling in the store (the layering contract, STORAGE_API.md).
+bytes = { workspace = true }

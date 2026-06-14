@@ -6,12 +6,13 @@
 //! This exercises the actual decode -> dispatch -> encode path against a live
 //! socket, which is the integration coverage the PR-1 gate asks for.
 
-use ironcache_env::SystemEnv;
+use ironcache_env::{Clock, SystemEnv};
 use ironcache_observe::{CounterSnapshot, ServerInfo};
 use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, decode, encode_to_vec};
 use ironcache_runtime::tokio_rt::bind_reuseport;
 use ironcache_server::dispatch::ServerContext;
-use ironcache_server::{ConnState, dispatch};
+use ironcache_server::{ConnState, UnixMillis, dispatch};
+use ironcache_store::ShardStore;
 use std::cell::RefCell;
 
 fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
@@ -34,6 +35,9 @@ fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
 async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let env = SystemEnv::new();
+    // A real per-connection store for the test server, constructed exactly as the
+    // binary's per-shard store is (the concrete ShardStore over the waist).
+    let mut store = ShardStore::new(ctx.databases);
     let counters = RefCell::new(CounterSnapshot::default());
     let mut conn = ConnState::new(
         1,
@@ -50,7 +54,8 @@ async fn serve_one(mut stream: tokio::net::TcpStream, ctx: ServerContext) {
             match decode(&buf, &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
                     let rollup = || *counters.borrow();
-                    let reply = dispatch(&ctx, &mut conn, &env, &rollup, &request);
+                    let now = UnixMillis(env.now_unix_millis());
+                    let reply = dispatch(&ctx, &mut conn, &env, &mut store, now, &rollup, &request);
                     let bytes = encode_to_vec(&reply, conn.proto);
                     if stream.write_all(&bytes).await.is_err() {
                         return;
@@ -139,6 +144,110 @@ fn ping_hello_select_over_real_socket() {
         let n = client.read(&mut tail).await.unwrap_or(0);
         assert_eq!(n, 0, "server did not close after QUIT");
 
+        acceptor.await.unwrap();
+    });
+}
+
+/// Read exactly `expect.len()` bytes from `client` and assert they match `expect`.
+async fn expect_reply(client: &mut tokio::net::TcpStream, expect: &[u8]) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; expect.len()];
+    client.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, expect, "got {:?}", String::from_utf8_lossy(&buf));
+}
+
+#[test]
+fn data_commands_over_real_socket() {
+    use tokio::io::AsyncWriteExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // SET foo bar -> +OK
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+
+        // GET foo -> $3\r\nbar\r\n
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$3\r\nbar\r\n").await;
+
+        // SET k v NX -> +OK ; SET k v2 NX -> $-1 (RESP2 null bulk)
+        client
+            .write_all(b"*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nNX\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nv2\r\n$2\r\nNX\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$-1\r\n").await;
+
+        // SET k v2 XX GET -> old value "v"
+        client
+            .write_all(b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nv2\r\n$2\r\nXX\r\n$3\r\nGET\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$1\r\nv\r\n").await;
+
+        // DEL foo k -> :2
+        client
+            .write_all(b"*3\r\n$3\r\nDEL\r\n$3\r\nfoo\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":2\r\n").await;
+
+        // EXISTS foo -> :0
+        client
+            .write_all(b"*2\r\n$6\r\nEXISTS\r\n$3\r\nfoo\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+
+        // TYPE on a missing key -> +none
+        client
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$3\r\nfoo\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+none\r\n").await;
+
+        // SET typed v, TYPE -> +string, STRLEN -> :1
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$5\r\ntyped\r\n$1\r\nv\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$5\r\ntyped\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+string\r\n").await;
+        client
+            .write_all(b"*2\r\n$6\r\nSTRLEN\r\n$5\r\ntyped\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":1\r\n").await;
+
+        drop(client);
         acceptor.await.unwrap();
     });
 }

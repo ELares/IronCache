@@ -23,6 +23,11 @@ ironcache-protocol = { workspace = true }
 ironcache-runtime = { workspace = true }
 ironcache-config = { workspace = true }
 ironcache-observe = { workspace = true }
+# The binary depends on BOTH the waist (the trait/types) and the concrete store
+# (to construct the per-shard ShardStore it hands to dispatch). The server library
+# depends only on the waist; the binary is where the concrete impl is wired in.
+ironcache-storage = { workspace = true }
+ironcache-store = { workspace = true }
 ironcache-server = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
