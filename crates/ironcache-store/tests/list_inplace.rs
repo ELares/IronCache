@@ -15,7 +15,7 @@
 //! Determinism (ADR-0003): the "random" sequence is a SEEDED in-test LCG (no
 //! std::time / no rand crate), so the run is byte-identical on replay.
 
-use ironcache_config::{DEFAULT_LIST_MAX_LISTPACK_ENTRIES, DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES};
+use ironcache_config::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES;
 use ironcache_storage::{
     ExpireWrite, NewValue, NewValueOwned, RmwAction, RmwEntry, RmwStep, Store, UnixMillis,
 };
@@ -294,15 +294,30 @@ fn encoding_flips_to_quicklist_at_the_threshold_and_back() {
     lpop(&mut store, key); // pops the big element; only ... wait, list is now empty -> deleted
     assert_eq!(encoding_of(&mut store, key), "none");
 
-    // Element-count side of the transition: many tiny elements cross the entry cap.
+    // No element-count cap for lists (Redis -2 negative fill: count unlimited). MANY
+    // small elements that stay UNDER the byte budget remain `listpack`, well past the
+    // 128-entry hash/zset cap: 200 single-byte elements = 200 bytes, far under 8 KB.
     let key2 = b"e2";
-    for i in 0..=DEFAULT_LIST_MAX_LISTPACK_ENTRIES {
-        rpush(&mut store, key2, format!("{i}").as_bytes());
+    for _ in 0..200 {
+        rpush(&mut store, key2, b"z");
     }
     assert_eq!(
         encoding_of(&mut store, key2),
+        "listpack",
+        "many small elements stay listpack: byte-driven transition only, no entry cap"
+    );
+
+    // Crossing the 8 KB byte budget with many small elements flips to quicklist.
+    let key3 = b"e3";
+    let chunk = vec![b'y'; 100];
+    let pushes = (DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES / chunk.len()) + 2;
+    for _ in 0..pushes {
+        rpush(&mut store, key3, &chunk);
+    }
+    assert_eq!(
+        encoding_of(&mut store, key3),
         "quicklist",
-        "over the entry cap -> quicklist"
+        "crossing the 8 KB byte budget flips to quicklist"
     );
 }
 
@@ -456,23 +471,30 @@ fn seeded_list_workload_replays_identically() {
 
 #[test]
 fn quicklist_to_listpack_transition_is_a_pure_function_of_the_repr() {
-    // Build a list that is quicklist (over the entry cap), then trim it back below the
-    // cap and confirm it reports listpack again -- the NAME is a pure function of the
-    // active repr (#40), not a sticky flag.
+    // Build a list that is quicklist (over the BYTE budget), then shrink it back below
+    // the budget and confirm it reports listpack again -- the NAME is a pure function of
+    // the active repr (#40), not a sticky flag. The transition is byte-driven only (no
+    // element-count cap for lists).
     let key = b"t";
     let mut store = ShardStore::new(1);
-    for i in 0..(DEFAULT_LIST_MAX_LISTPACK_ENTRIES + 10) {
-        rpush(&mut store, key, format!("{i}").as_bytes());
+    let chunk = vec![b'y'; 100];
+    // Enough 100-byte chunks to cross 8 KB (with a margin).
+    let budget_chunks = DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES / chunk.len();
+    let pushes = budget_chunks + 5;
+    for _ in 0..pushes {
+        rpush(&mut store, key, &chunk);
     }
     assert_eq!(encoding_of(&mut store, key), "quicklist");
 
-    // LTRIM down to a handful of elements via repeated LPOP.
-    for _ in 0..(DEFAULT_LIST_MAX_LISTPACK_ENTRIES + 5) {
+    // Pop chunks until well under the byte budget (~half the budget worth remaining):
+    // pop (pushes - budget_chunks/2) chunks. The remaining bytes are then below 8 KB.
+    let pops = pushes - budget_chunks / 2;
+    for _ in 0..pops {
         lpop(&mut store, key);
     }
     assert_eq!(
         encoding_of(&mut store, key),
         "listpack",
-        "shrinking below the cap reports listpack again (pure function of repr)"
+        "shrinking below the byte budget reports listpack again (pure function of repr)"
     );
 }

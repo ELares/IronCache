@@ -37,9 +37,9 @@ use hashbrown::HashSet;
 use hashbrown::hash_map::Entry;
 use ironcache_eviction::{EvictionPolicy, Policy, map_policy_name};
 use ironcache_storage::{
-    AccountingHook, CountingAccounting, DataType, Encoding, EvictionHook, ExpireWrite, Keyspace,
-    MoveMode, MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction,
-    RmwEntry, RmwStep, ScanCursor, Store, UnixMillis, ValueRef,
+    AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
+    MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
+    RmwStep, ScanCursor, Store, UnixMillis, ValueRef,
 };
 use kvobj::{KvObj, int_decimal_bytes};
 
@@ -593,17 +593,28 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
 
         let step = if live {
             let obj = self.dbs[db_idx].get_mut(key).expect("live entry present");
+            // Read the REAL pre-edit metadata off the header BEFORE taking the typed
+            // mutable borrow (these are Copy scalars; `as_list_mut` then borrows the
+            // value mutably). The mutable handle carries the same type/encoding/TTL the
+            // read-only `occupied_of()` path exposes, so PR-6/7/8 can read accurate
+            // metadata off the mutable arm. The store still recomputes the POST-edit
+            // encoding after a `Mutated` return; this is the PRE-edit snapshot.
+            let data_type = obj.header.data_type;
+            let encoding = obj.header.encoding;
+            let expire_at = obj.expire_at;
             // Build the typed mutable view: a list yields the list arm, anything else
             // the non-collection arm (the handler's as_list_mut returns None ->
             // WRONGTYPE). The borrow of `obj` lives only for the closure call.
+            //
+            // PR-6/7/8 NOTE: this type-dispatch handles only the list arm today. When
+            // the hash/set/zset reprs land, add their `as_*_mut` arms HERE and to
+            // `KvObj::is_empty_collection` (kvobj.rs) IN LOCKSTEP.
             let entry = match obj.as_list_mut() {
                 Some(list) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(Encoding::ListPack, None, list))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, list))
                 }
                 None => RmwEntry::OccupiedMut(OccupiedEntryMut::non_collection(
-                    DataType::String,
-                    Encoding::Raw,
-                    None,
+                    data_type, encoding, expire_at,
                 )),
             };
             f(entry)

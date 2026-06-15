@@ -26,7 +26,7 @@
 
 use crate::encoding::{Classified, EMBSTR_THRESHOLD, classify};
 use bytes::Bytes;
-use ironcache_config::{DEFAULT_LIST_MAX_LISTPACK_ENTRIES, DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES};
+use ironcache_config::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES;
 use ironcache_storage::{DataType, Encoding, ListValue, NewValueOwned, UnixMillis};
 use std::collections::VecDeque;
 
@@ -188,16 +188,19 @@ impl ValueRepr {
 // ## The listpack -> quicklist transition (#40)
 //
 // The reported encoding is a PURE FUNCTION of the active state: a list is `listpack`
-// while BOTH its total element bytes are at or below the `list-max-listpack-size`
-// byte budget AND its element count is at or below the per-node element cap; once it
-// exceeds EITHER bound it reports `quicklist`. Reconfiguring a threshold changes WHEN
-// a value converts, never the name reported for a value that has not converted.
+// while its total element bytes are at or below the `list-max-listpack-size` byte
+// budget, and reports `quicklist` once it exceeds that budget. There is NO
+// element-count cap for lists (Redis's default `-2` negative fill sizes by BYTES with
+// the count left unlimited, so e.g. a 129-element list of small values stays
+// `listpack`). Reconfiguring the budget changes WHEN a value converts, never the name
+// reported for a value that has not converted.
 // ---------------------------------------------------------------------------
 
 /// A LIST value (PR-5). Elements are stored in head-to-tail order in a `VecDeque`,
 /// with a running element-byte total for O(1) accounting and an O(1) encoding
-/// transition check. The thresholds are the config defaults (the byte budget +
-/// element cap); a runtime-settable form is a follow-up.
+/// transition check. The transition threshold is the config default byte budget
+/// (`list-max-listpack-size`, default 8 KB); there is NO element-count cap for lists.
+/// A runtime-settable budget is a follow-up.
 #[derive(Debug, Clone, Default)]
 pub struct ListVal {
     /// The elements in head (front) to tail (back) order.
@@ -226,13 +229,15 @@ impl ListVal {
     }
 
     /// The encoding this list reports, a PURE FUNCTION of the active repr (#40):
-    /// `listpack` while small, `quicklist` once over EITHER the byte budget or the
-    /// element-count cap. See the type docs.
+    /// `listpack` while the total element bytes stay at or below the byte budget,
+    /// `quicklist` once over it. There is NO element-count cap for lists: Redis's
+    /// default `list-max-listpack-size -2` is a negative fill, which sizes the listpack
+    /// node by BYTES (8 KB) with the element count left unlimited (quicklist.c
+    /// `quicklistNodeLimit` sets `count = UINT_MAX` for a negative fill). The 128-entry
+    /// cap is the HASH/ZSET default, NOT the list default. See the type docs.
     #[must_use]
     pub fn encoding(&self) -> Encoding {
-        if self.total_bytes > DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES
-            || self.elems.len() > DEFAULT_LIST_MAX_LISTPACK_ENTRIES
-        {
+        if self.total_bytes > DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES {
             Encoding::QuickList
         } else {
             Encoding::ListPack
@@ -623,6 +628,11 @@ impl KvObj {
     /// the empty-collection-deletes-key check, by element COUNT, not byte count -- a
     /// list of empty-string elements has zero value bytes but is NOT empty). Returns
     /// `false` for a non-collection value (a string is never "empty" in this sense).
+    ///
+    /// PR-6/7/8 NOTE: this match handles only `ValueRepr::List` today. When the hash/
+    /// set/zset reprs land, add their arms HERE and to the `rmw_mut` type-dispatch in
+    /// `lib.rs` (the `as_*_mut` selection) IN LOCKSTEP, so every collection honors the
+    /// empty-collection-deletes-key contract.
     #[must_use]
     pub fn is_empty_collection(&self) -> bool {
         match &self.value {
@@ -847,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn listval_encoding_transition_is_pure_function_of_repr() {
+    fn listval_encoding_transition_is_byte_driven_only() {
         let mut l = ListVal::new();
         l.push_back(b"a");
         assert_eq!(l.encoding(), Encoding::ListPack);
@@ -858,12 +868,36 @@ mod tests {
         // Pop it back off -> listpack again (a pure function of the active repr).
         assert_eq!(l.pop_back(), Some(big));
         assert_eq!(l.encoding(), Encoding::ListPack);
-        // Element-count side of the transition.
+
+        // There is NO element-count cap for lists (Redis -2 negative fill: count
+        // unlimited). MANY small elements that stay UNDER the byte budget remain
+        // `listpack`, even well past the 128-entry hash/zset cap. Use 200 single-byte
+        // elements (200 bytes, far under the 8 KB budget).
         let mut l2 = ListVal::new();
-        for i in 0..=super::DEFAULT_LIST_MAX_LISTPACK_ENTRIES {
-            l2.push_back(format!("{i}").as_bytes());
+        for _ in 0..200 {
+            l2.push_back(b"z");
         }
-        assert_eq!(l2.encoding(), Encoding::QuickList);
+        assert_eq!(l2.elems.len(), 200);
+        assert_eq!(
+            l2.encoding(),
+            Encoding::ListPack,
+            "many small elements stay listpack: byte-driven transition only, no entry cap"
+        );
+
+        // Crossing the 8 KB byte budget with many small elements flips to quicklist.
+        // Each push of 100 bytes; after enough pushes the total exceeds 8 KB.
+        let chunk = vec![b'y'; 100];
+        let pushes = (super::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES / chunk.len()) + 2;
+        let mut l3 = ListVal::new();
+        for _ in 0..pushes {
+            l3.push_back(&chunk);
+        }
+        assert!(l3.element_bytes() > super::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES);
+        assert_eq!(
+            l3.encoding(),
+            Encoding::QuickList,
+            "crossing the 8 KB byte budget flips to quicklist"
+        );
     }
 
     #[test]
