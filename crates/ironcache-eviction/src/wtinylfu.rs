@@ -12,55 +12,72 @@
 //! "Reconciliation with EVICTION.md"), and NO doorkeeper (OFF by default, also
 //! deferred here).
 //!
-//! ## Per-read sketch bump: a deliberate DIVERGENCE from WTINYLFU.md (not yet the
-//! spec target)
+//! ## Decision-path-only sketch (no per-read mutation, #57, WTINYLFU.md:135-136)
 //!
-//! WTINYLFU.md specifies a decision-path-only sketch (bumped for admission
-//! candidates and victims, NOT per GET) plus an acceptance lint asserting "no
-//! per-read sketch mutation". This first-cut implementation instead does an inline
-//! min-increment per access ([`WTinyLfu::on_access`], O(depth), bounded, no alloc),
-//! sampling the FULL read stream the way Caffeine's W-TinyLFU does. That is a
-//! conscious divergence: a fuller frequency signal at the cost of an O(depth) bump
-//! on the GET path, versus the spec's leaner decision-path sampling. Which wins on
-//! the hit-ratio/throughput tradeoff is a harness question (#47/#8); the
-//! decision-path-only model, a read buffer drained off the GET critical path, and
-//! the no-per-read-mutation lint are DEFERRED follow-ups, NOT satisfied here.
+//! WTINYLFU.md's "Decision-path contract" specifies a sketch that is consulted and
+//! min-incremented ONLY on the admission/eviction decision path, never on the GET hot
+//! path, plus an acceptance lint asserting "no per-read sketch mutation". This module
+//! implements exactly that: [`WTinyLfu::on_access`] is a NO-OP (the GET read path does
+//! NOT touch the sketch, so the read path stays the FIFO-class core's in-place
+//! metadata write with no list relink). The sketch is min-incremented at exactly two
+//! points, both on the decision path:
+//!
+//! - the CANDIDATE, in [`EvictionHook::on_insert`] ("seen at the door"): one
+//!   min-increment for the just-inserted key, which is also recorded as the pending
+//!   admission candidate;
+//! - the VICTIM, inside the admission door ([`WTinyLfu::admit_or_reject`]): one
+//!   min-increment of the chosen would-be victim when it is evaluated.
+//!
+//! This is the headline #57 contract: frequency tracks the stream of admission
+//! candidates and victims, not every read.
+//!
 //! ## What lives here
 //!
 //! - [`CmSketch`]: a 4-bit count-min frequency estimator with MIN-INCREMENT and
 //!   PERIODIC HALVING aging (`wtinylfu-cmsketch-4bit`). Deterministic seeded hashing
-//!   (ADR-0003: no `RandomState`, no std rand).
+//!   (ADR-0003: no `RandomState`, no std rand). UNCHANGED except for WHERE
+//!   [`CmSketch::increment`] is now called (the decision path, not per read).
 //! - [`WTinyLfu`]: the policy. A recency victim FIFO of resident keys (like
 //!   S3-FIFO's main) so [`EvictionHook::select_victim`] can return a `(db, key)`;
-//!   `on_access` bumps the sketch (the only per-access cost, O(depth)); `on_insert`
-//!   tracks the key; `on_remove` untracks; a lowest-priority re-offer FIFO carries
-//!   the #46 volatile-only re-eligibility contract (same distinct-set bound as
-//!   S3-FIFO).
+//!   `on_access` is a NO-OP (decision-path contract); `on_insert` tracks the key,
+//!   bumps the sketch, and records the pending admission candidate; `on_remove`
+//!   untracks (and clears a stale pending candidate); a lowest-priority re-offer FIFO
+//!   carries the #46 volatile-only re-eligibility contract (same distinct-set bound
+//!   as S3-FIFO).
 //!
-//! ## Admission wiring (a documented divergence from full TinyLFU)
+//! ## The candidate-admission DOOR (wired through the FROZEN EvictionHook)
 //!
 //! Full TinyLFU admits an incoming candidate over the chosen victim only if
-//! `sketch.estimate(candidate) > sketch.estimate(victim)` (incumbent wins ties,
-//! WTINYLFU.md "Tie-break"). That decision needs the CANDIDATE key at the eviction
-//! boundary. The store's `evict_to_fit` flow drives eviction purely through
+//! `sketch.estimate(candidate) > sketch.estimate(victim)` (a STRICT win; incumbent
+//! wins ties, WTINYLFU.md "Tie-break"). That decision needs the CANDIDATE key at the
+//! eviction boundary, but the store's `evict_to_fit` drives eviction purely through
 //! [`EvictionHook::select_victim`] (a `&mut self -> Option<(db, key)>` with NO
-//! candidate argument) and the byte budget; threading the candidate key would change
-//! the `Admit::evict_to_fit` signature and require per-command candidate extraction at
-//! the dispatch layer.
+//! candidate argument). Rather than change that FROZEN trait, this policy captures the
+//! candidate out-of-band: `on_insert` records the most-recently-inserted `(db, key)`
+//! as `self.candidate`, and [`WTinyLfu::select_victim`] consumes it ONE-SHOT on the
+//! first call of an `evict_to_fit` run via [`WTinyLfu::admit_or_reject`].
 //!
-//! IronCache therefore takes option (b) from the design: a FREQUENCY-ORDERED VICTIM
-//! CHOICE. `select_victim` returns the resident key with the LOWEST estimated
-//! frequency (ties broken by FIFO/recency order, the older key first). This is the
-//! deterministic dual of the strict-win admission rule: instead of rejecting a
-//! low-frequency CANDIDATE at the door, it evicts the low-frequency RESIDENT, which
-//! delivers the same headline property (a frequently-accessed key survives while a
-//! one-hit key is evicted, i.e. scan resistance). The DIVERGENCE from full TinyLFU:
-//! the candidate's own frequency is not compared at admission, so a brand-new key is
-//! always admitted (displacing the coldest resident) rather than being rejected when
-//! the coldest resident is hotter than the candidate. Closing that gap (the strict
-//! candidate-vs-victim comparison) is a follow-up gated on threading the candidate
-//! through `evict_to_fit` (#47/#8); the [`CmSketch::estimate`] primitive that decision
-//! needs is already here and tested.
+//! The door compares the candidate against the COLDEST resident (the would-be
+//! victim):
+//!
+//! - candidate IS the coldest resident -> trivially self-evict (one key);
+//! - candidate estimate STRICTLY greater than the victim estimate -> ADMIT the
+//!   candidate by evicting the VICTIM;
+//! - tie or candidate colder -> REJECT: the just-inserted candidate is itself the
+//!   victim returned (stored-then-evicted), the incumbent wins the tie.
+//!
+//! After the candidate is consumed, `select_victim` falls through to the existing
+//! plain frequency-ordered choice (coldest resident, then the re-offer FIFO).
+//!
+//! ## Redis scan-resistance semantics (this is the SELECTABLE policy, NOT the default)
+//!
+//! "A rejected cold candidate is stored-then-evicted": the write SUCCEEDS into the
+//! keyspace and is immediately reclaimed by the door when it loses to a hotter
+//! incumbent, so a scan flood of cold one-hit candidates churns through their own
+//! slots while the established hot residents survive. This is the scan-resistance
+//! W-TinyLFU exists for. Note this is the SELECTABLE W-TinyLFU-fronted variant
+//! (`allkeys-lfu` / `volatile-lfu`); the DEFAULT eviction core is S3-FIFO (ADR-0008)
+//! and is untouched by this module.
 //!
 //! ## Determinism and shared-nothing (ADR-0002/0003/0005)
 //!
@@ -297,9 +314,9 @@ impl Entry {
 /// The W-TinyLFU-fronted eviction policy (per shard, unsynchronized; ADR-0005).
 ///
 /// Holds the frequency [`CmSketch`] plus a recency FIFO of resident keys so
-/// `select_victim` can return a `(db, key)`. See the module docs for the admission
-/// wiring (frequency-ordered victim choice) and its documented divergence from full
-/// TinyLFU candidate-vs-victim admission.
+/// `select_victim` can return a `(db, key)`. See the module docs for the
+/// candidate-admission door (the strict-win / incumbent-wins-ties rule) and the
+/// decision-path-only sketch contract (no per-read mutation, #57).
 #[derive(Debug, Clone)]
 pub struct WTinyLfu {
     /// The 4-bit count-min frequency estimator.
@@ -307,6 +324,12 @@ pub struct WTinyLfu {
     /// The recency FIFO of resident keys (insertion order; the victim search scans this
     /// for the lowest-frequency resident, FIFO order breaking frequency ties).
     resident: VecDeque<Entry>,
+    /// The PENDING admission candidate: the most-recently-inserted `(db, key)`, recorded
+    /// by `on_insert` ("seen at the door"). `select_victim` consumes it ONE-SHOT (a
+    /// `take`) on the first call of an `evict_to_fit` run and runs it through the
+    /// candidate-admission door ([`WTinyLfu::admit_or_reject`]). Cleared by `on_remove`
+    /// if the candidate is deleted before the door runs (no stale candidate).
+    candidate: Option<Entry>,
     /// The LOWEST-priority re-offer FIFO for the #46 volatile-only re-eligibility fix:
     /// a non-TTL victim the store declines to delete is re-registered HERE rather than
     /// back into `resident`. `select_victim` consults it ONLY after `resident` is
@@ -345,6 +368,7 @@ impl WTinyLfu {
             sketch: CmSketch::new(),
             resident: VecDeque::new(),
             reoffer: VecDeque::new(),
+            candidate: None,
             volatile_only,
             name: name.to_owned(),
         }
@@ -388,18 +412,18 @@ impl WTinyLfu {
         false
     }
 
-    /// Pop the resident key with the LOWEST estimated frequency (FIFO order breaks
-    /// ties: the EARLIEST-inserted lowest-frequency key wins, which is the recency
-    /// fallback). This is the frequency-ordered victim choice (see the module docs):
-    /// the deterministic dual of full TinyLFU admission. Returns `None` if `resident`
-    /// is empty.
-    fn pop_lowest_frequency_resident(&mut self) -> Option<Entry> {
+    /// The index of the resident key with the LOWEST estimated frequency (FIFO order
+    /// breaks ties: the EARLIEST-inserted lowest-frequency key wins, the recency
+    /// fallback). `None` if `resident` is empty. This is the coldest-resident search
+    /// shared by [`Self::pop_lowest_frequency_resident`] (which removes it) and the
+    /// door [`Self::admit_or_reject`] (which compares the candidate against it).
+    ///
+    /// O(resident) linear scan, matching S3-FIFO's PR-3a scan; the eventual
+    /// intrusive-frequency layout removes it (a #8 follow-up).
+    fn lowest_frequency_resident_index(&self) -> Option<usize> {
         if self.resident.is_empty() {
             return None;
         }
-        // Linear scan for the minimum estimate; ties keep the earliest index (FIFO).
-        // This is O(resident) per victim, matching S3-FIFO's PR-3a linear scan; the
-        // eventual intrusive-frequency layout removes it (a #8 follow-up).
         let mut best_idx = 0usize;
         let mut best_est = COUNTER_MAX;
         for (i, e) in self.resident.iter().enumerate() {
@@ -412,33 +436,115 @@ impl WTinyLfu {
                 }
             }
         }
-        self.resident.remove(best_idx)
+        Some(best_idx)
+    }
+
+    /// Pop the resident key with the LOWEST estimated frequency (FIFO order breaks
+    /// ties: the EARLIEST-inserted lowest-frequency key wins, which is the recency
+    /// fallback). The post-door frequency-ordered fallback choice. Returns `None` if
+    /// `resident` is empty.
+    fn pop_lowest_frequency_resident(&mut self) -> Option<Entry> {
+        let idx = self.lowest_frequency_resident_index()?;
+        self.resident.remove(idx)
+    }
+
+    /// The candidate-admission DOOR (WTINYLFU.md "Decision-path contract" + "Tie-break").
+    ///
+    /// Compares the just-inserted `cand` against the COLDEST resident (the would-be
+    /// victim) and returns the key to evict. The strict-win / incumbent-wins-ties rule:
+    ///
+    /// - candidate IS the coldest resident (same index) -> self-evict it (one key,
+    ///   trivially the coldest; no comparison needed).
+    /// - otherwise: min-increment the VICTIM (the decision-path bump for the resident
+    ///   being evaluated), then admit the candidate ONLY on a STRICT win
+    ///   (`estimate(cand) > estimate(victim)`), in which case evict the VICTIM. On a tie
+    ///   or a colder candidate, REJECT the candidate: it is itself returned as the
+    ///   victim (stored-then-evicted), so the incumbent keeps its slot.
+    ///
+    /// Edge cases preserve `evict_to_fit`'s guaranteed progress (every path returns a
+    /// LIVE key, or `None` only when nothing at all is evictable):
+    ///
+    /// - the candidate was removed between insert and here (not tracked) -> evict the
+    ///   would-be victim instead;
+    /// - no resident victim at all -> evict the candidate if it is still resident, else
+    ///   pop the lowest-priority re-offer FIFO.
+    fn admit_or_reject(&mut self, cand: &Entry) -> Option<(u32, Box<[u8]>)> {
+        let cand_idx = self
+            .resident
+            .iter()
+            .position(|e| e.matches(cand.db, &cand.key));
+        match self.lowest_frequency_resident_index() {
+            None => {
+                // No resident victim. Evict the candidate itself if still tracked,
+                // otherwise fall back to the re-offer FIFO so the loop still progresses.
+                if let Some(i) = cand_idx {
+                    let e = self.resident.remove(i)?;
+                    return Some((e.db, e.key));
+                }
+                self.reoffer.pop_front().map(|e| (e.db, e.key))
+            }
+            Some(victim_idx) => {
+                // The candidate is the coldest resident: trivially self-evict it.
+                if cand_idx == Some(victim_idx) {
+                    let e = self.resident.remove(victim_idx)?;
+                    return Some((e.db, e.key));
+                }
+                // Decision-path bump of the VICTIM (the resident being evaluated), then
+                // read both estimates for the strict-win comparison.
+                let victim = &self.resident[victim_idx];
+                let (vdb, vkey) = (victim.db, victim.key.clone());
+                self.sketch.increment(vdb, &vkey);
+                let victim_est = self.sketch.estimate(vdb, &vkey);
+                let cand_est = self.sketch.estimate(cand.db, &cand.key);
+                if cand_idx.is_none() {
+                    // The candidate vanished (deleted) before the door ran: there is no
+                    // candidate to admit or self-evict, so evict the would-be victim.
+                    let e = self.resident.remove(victim_idx)?;
+                    return Some((e.db, e.key));
+                }
+                if cand_est > victim_est {
+                    // STRICT win: admit the candidate by evicting the victim.
+                    let e = self.resident.remove(victim_idx)?;
+                    Some((e.db, e.key))
+                } else {
+                    // Tie or candidate colder: REJECT. The just-inserted candidate is
+                    // itself the victim (stored-then-evicted); the incumbent wins.
+                    let i = cand_idx?;
+                    let e = self.resident.remove(i)?;
+                    Some((e.db, e.key))
+                }
+            }
+        }
     }
 }
 
 impl EvictionHook for WTinyLfu {
-    fn on_access(&mut self, db: u32, key: &[u8]) {
-        // Inline min-increment of the sketch (O(depth), no alloc, no list relink) so
-        // the sketch tracks the full read stream and a frequently-accessed key accrues
-        // frequency and survives eviction. NOTE: this is a deliberate DIVERGENCE from
-        // WTINYLFU.md's decision-path-only model and its "no per-read sketch mutation"
-        // acceptance lint, which are DEFERRED (see the module header). It does NOT yet
-        // satisfy that hot-path contract; the cost is bounded to O(depth) per GET.
-        self.sketch.increment(db, key);
+    fn on_access(&mut self, _db: u32, _key: &[u8]) {
+        // DECISION-PATH CONTRACT (WTINYLFU.md:135-136, #57): the GET read path is a
+        // NO-OP. The sketch is min-incremented ONLY on the decision path (the candidate
+        // in `on_insert`, the victim in `admit_or_reject`), NEVER per read. This is the
+        // headline "no per-read sketch mutation" lint: the read path stays the
+        // FIFO-class core's in-place metadata write with no list relink. Deliberately
+        // empty, not a TODO.
     }
 
     fn on_insert(&mut self, db: u32, key: &[u8], _bytes: usize) {
-        // Track the resident key. A replace of an already-tracked key is a no-op for
-        // tracking (it stays resident) but still bumps its frequency, treating the
-        // write as an access.
-        if self.tracks(db, key) {
-            self.sketch.increment(db, key);
-            return;
-        }
-        self.resident.push_back(Entry {
+        // Decision-path bump: the candidate is "seen at the door". One min-increment of
+        // the just-inserted key, and record it as the pending admission candidate that
+        // `select_victim` runs through the door ONE-SHOT.
+        self.sketch.increment(db, key);
+        self.candidate = Some(Entry {
             db,
             key: key.to_vec().into_boxed_slice(),
         });
+        // Track residency. A replace of an already-tracked key stays resident (no
+        // duplicate); a fresh key is pushed to the recency FIFO.
+        if !self.tracks(db, key) {
+            self.resident.push_back(Entry {
+                db,
+                key: key.to_vec().into_boxed_slice(),
+            });
+        }
     }
 
     fn on_remove(&mut self, db: u32, key: &[u8], _bytes: usize) {
@@ -447,16 +553,31 @@ impl EvictionHook for WTinyLfu {
         // returning key keeps its earned frequency until aging decays it, the
         // ghost-like memory that gives scan resistance across a delete+reinsert.)
         self.remove_entry(db, key);
+        // If the pending candidate was just removed, clear it so the door never runs on
+        // a stale candidate.
+        if let Some(c) = &self.candidate {
+            if c.matches(db, key) {
+                self.candidate = None;
+            }
+        }
     }
 
     fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
-        // Frequency-ordered victim choice (the module-doc admission wiring): evict the
-        // lowest-estimated-frequency resident key. A returned victim is popped OUT of
-        // the resident FIFO; the store may SKIP deleting it (a volatile-* policy skips a
-        // non-TTL victim) and then call `re_register` to put it back as a candidate
-        // (#46). When `resident` is exhausted, drain the lowest-priority re-offer FIFO
-        // so a fresh resident candidate is always offered before a re-registered key
-        // cycles again.
+        // ONE-SHOT candidate-admission door: on the FIRST select_victim of an
+        // evict_to_fit run, consume the pending candidate (the just-inserted key) and
+        // run it through the door (admit on a strict win by evicting the victim, else
+        // reject by self-evicting the candidate; see `admit_or_reject`). The candidate
+        // is `take`n, so subsequent select_victim calls in the same loop fall through to
+        // the plain frequency-ordered choice below.
+        if let Some(cand) = self.candidate.take() {
+            return self.admit_or_reject(&cand);
+        }
+        // Fall-through frequency-ordered victim choice: evict the lowest-estimated-
+        // frequency resident key. A returned victim is popped OUT of the resident FIFO;
+        // the store may SKIP deleting it (a volatile-* policy skips a non-TTL victim)
+        // and then call `re_register` to put it back as a candidate (#46). When
+        // `resident` is exhausted, drain the lowest-priority re-offer FIFO so a fresh
+        // resident candidate is always offered before a re-registered key cycles again.
         if let Some(e) = self.pop_lowest_frequency_resident() {
             return Some((e.db, e.key));
         }
@@ -519,6 +640,15 @@ mod tests {
     }
     fn victim_key(p: &mut WTinyLfu) -> Option<Vec<u8>> {
         p.select_victim().map(|(_, k)| k.into_vec())
+    }
+    /// Raise a key's sketch estimate by `n` DECISION-PATH increments, the genuine
+    /// frequency dimension under #57 (on_access is a no-op, so a GET loop cannot do
+    /// this). Drives the sketch directly the way the candidate/victim decision path
+    /// does, leaving the residency FIFO untouched.
+    fn bump(p: &mut WTinyLfu, key: &[u8], n: usize) {
+        for _ in 0..n {
+            p.sketch.increment(0, key);
+        }
     }
 
     #[test]
@@ -608,48 +738,228 @@ mod tests {
     }
 
     #[test]
-    fn frequently_accessed_key_survives_one_hit_key_is_evicted() {
-        // The HEADLINE property (scan resistance): a hot key survives while a one-hit
-        // scan key is evicted. Insert both, hammer the hot key, then the first victim is
-        // the cold one-hit key, and the hot key remains tracked.
+    fn on_access_does_not_mutate_the_sketch() {
+        // THE headline #57 acceptance lint (WTINYLFU.md:135-136): the GET read path is a
+        // NO-OP. Call on_access many times on a tracked key and assert its sketch
+        // estimate is UNCHANGED (zero, since on_insert is not called here). Frequency is
+        // built ONLY on the decision path, never per read.
+        let mut p = WTinyLfu::new(false);
+        ins(&mut p, b"k");
+        // on_insert bumped the candidate once; read it, then prove on_access never moves
+        // the estimate.
+        let before = p.estimate(0, b"k");
+        for _ in 0..1000 {
+            acc(&mut p, b"k");
+        }
+        assert_eq!(
+            p.estimate(0, b"k"),
+            before,
+            "on_access is a no-op: the read path must not mutate the sketch (#57)"
+        );
+
+        // And on a never-inserted key, on_access leaves it at the unseen-zero estimate.
+        let mut q = WTinyLfu::new(false);
+        for _ in 0..1000 {
+            q.on_access(0, b"never");
+        }
+        assert_eq!(
+            q.estimate(0, b"never"),
+            0,
+            "on_access must not create frequency for a read-only key"
+        );
+    }
+
+    #[test]
+    fn candidate_admission_door_strict_win_admits_candidate_evicts_victim() {
+        // The door admits the candidate on a STRICT frequency win: it evicts the COLDER
+        // incumbent victim, not the candidate. Make "hot" genuinely hotter than the
+        // about-to-be-inserted candidate via decision-path bumps.
         let mut p = WTinyLfu::new(false);
         ins(&mut p, b"hot");
-        ins(&mut p, b"scan");
-        for _ in 0..10 {
-            acc(&mut p, b"hot");
+        bump(&mut p, b"hot", 5); // hot estimate ~6 (1 from on_insert + 5)
+        // Insert the candidate "cand"; on_insert bumps it to ~1 and records it as the
+        // pending candidate, then raise it ABOVE the incumbent so it strictly wins.
+        ins(&mut p, b"cand");
+        bump(&mut p, b"cand", 10); // cand now ~11, strictly hotter than hot
+        // First select_victim consumes the candidate through the door: cand (~11) wins
+        // strictly over the coldest resident "hot" (~6), so the VICTIM (hot) is evicted.
+        assert_eq!(
+            victim_key(&mut p),
+            Some(b"hot".to_vec()),
+            "a strict-win candidate is admitted: the colder incumbent is evicted"
+        );
+        assert!(
+            p.tracks(0, b"cand"),
+            "the admitted candidate stays resident"
+        );
+        assert!(!p.tracks(0, b"hot"), "the colder incumbent was evicted");
+    }
+
+    #[test]
+    fn candidate_admission_door_rejects_a_colder_candidate_self_evicting_it() {
+        // The door REJECTS a candidate colder than the coldest incumbent: the
+        // just-inserted candidate is itself evicted (stored-then-evicted), the incumbent
+        // keeps its slot. This is the scan-resistance semantics.
+        let mut p = WTinyLfu::new(false);
+        ins(&mut p, b"warm");
+        bump(&mut p, b"warm", 8); // warm estimate ~9
+        // Insert the cold candidate (estimate ~1 from on_insert only).
+        ins(&mut p, b"cold");
+        // The door: cold (~1) vs coldest resident "warm" (~9). cold does NOT strictly
+        // win, so it is REJECTED and self-evicted.
+        assert_eq!(
+            victim_key(&mut p),
+            Some(b"cold".to_vec()),
+            "a colder candidate is rejected: it self-evicts"
+        );
+        assert!(p.tracks(0, b"warm"), "the warmer incumbent survives");
+        assert!(!p.tracks(0, b"cold"), "the rejected candidate was evicted");
+    }
+
+    #[test]
+    fn candidate_admission_door_tie_break_incumbent_wins() {
+        // On a frequency TIE the incumbent wins (admit only on a STRICT win,
+        // WTINYLFU.md "Tie-break"): the candidate is rejected and self-evicts.
+        let mut p = WTinyLfu::new(false);
+        ins(&mut p, b"inc");
+        bump(&mut p, b"inc", 4); // inc estimate ~5
+        // Insert a candidate and bump it to EXACTLY the incumbent's estimate (a tie). The
+        // door min-increments the victim once when it evaluates it, so match THAT: after
+        // the victim bump "inc" reads ~6, so bring the candidate to ~6 too for the tie.
+        ins(&mut p, b"tie"); // ~1 from on_insert
+        bump(&mut p, b"tie", 5); // tie now ~6, equal to inc after its decision-path bump
+        assert_eq!(
+            victim_key(&mut p),
+            Some(b"tie".to_vec()),
+            "a tie rejects the candidate (incumbent wins ties)"
+        );
+        assert!(p.tracks(0, b"inc"), "the incumbent wins the tie");
+        assert!(!p.tracks(0, b"tie"), "the tied candidate self-evicts");
+    }
+
+    #[test]
+    fn scan_flood_does_not_evict_the_hot_key_via_the_door() {
+        // A flood of distinct COLD one-hit candidates must not displace an established
+        // hot resident: each cold candidate loses the admission door (estimate ~1 vs the
+        // hot incumbent's high estimate) and self-evicts, so the hot key survives. This
+        // is the cache-pollution resistance W-TinyLFU exists for, via the door.
+        let mut p = WTinyLfu::new(false);
+        ins(&mut p, b"hot");
+        bump(&mut p, b"hot", 14); // hot saturates near the cap
+        // Each cold candidate is inserted (becoming the pending candidate), then the door
+        // runs: cold (~1) loses to the hot incumbent, so the COLD candidate self-evicts.
+        for i in 0..50u32 {
+            ins(&mut p, format!("scan{i}").as_bytes());
+            let v = victim_key(&mut p).expect("a cold candidate self-evicts at the door");
+            assert_eq!(
+                v,
+                format!("scan{i}").into_bytes(),
+                "the cold candidate loses the door and self-evicts, sparing the hot key"
+            );
+            assert_ne!(v, b"hot".to_vec(), "the hot key is never chosen");
         }
-        // The lowest-frequency resident is "scan" (estimate ~0 vs "hot" ~10).
-        assert_eq!(victim_key(&mut p), Some(b"scan".to_vec()));
         assert!(
             p.tracks(0, b"hot"),
-            "the frequently-accessed key survives eviction"
+            "the hot key survives the whole cold-candidate flood"
         );
+    }
+
+    #[test]
+    fn frequently_evaluated_key_survives_one_hit_key_is_evicted() {
+        // The HEADLINE scan-resistance property restated for the decision-path model: a
+        // key that has accrued frequency on the decision path survives while a one-hit
+        // key is evicted. Insert both, raise "hot" via decision-path bumps, then evicting
+        // (after the candidate is consumed) targets the cold one-hit key.
+        let mut p = WTinyLfu::new(false);
+        ins(&mut p, b"hot");
+        ins(&mut p, b"scan"); // scan is the LAST insert => the pending candidate
+        bump(&mut p, b"hot", 10); // hot ~11
+        // First select_victim consumes the candidate "scan" (~1) vs coldest resident.
+        // The coldest resident IS "scan" itself, so it self-evicts (trivial coldest).
+        assert_eq!(victim_key(&mut p), Some(b"scan".to_vec()));
+        assert!(p.tracks(0, b"hot"), "the high-frequency key survives");
         assert!(!p.tracks(0, b"scan"), "the one-hit key is evicted");
     }
 
     #[test]
-    fn scan_flood_does_not_evict_the_hot_key() {
-        // A flood of distinct one-hit scan keys must not displace an established hot key:
-        // each scan key has estimate ~0, so the victim search always picks a scan key
-        // over the hot one. This is the cache-pollution resistance W-TinyLFU exists for.
+    fn candidate_is_consumed_after_the_first_decision() {
+        // The candidate is ONE-SHOT: it drives only the FIRST select_victim of an
+        // evict_to_fit run; later calls fall through to the plain frequency-ordered
+        // choice. Insert several keys, then two select_victim calls: the first runs the
+        // door on the last-inserted candidate, the second is a plain coldest-resident
+        // choice (no candidate left).
+        let mut p = WTinyLfu::new(false);
+        ins(&mut p, b"a");
+        ins(&mut p, b"b");
+        ins(&mut p, b"c"); // c is the pending candidate (last insert)
+        bump(&mut p, b"a", 5); // a is warm; b and c are cold (~1)
+        // First decision: candidate "c" vs coldest resident. b and c are both ~1; the
+        // coldest-resident index is "b" (earlier FIFO). c does not strictly beat b, so c
+        // self-evicts (rejected).
+        let first = victim_key(&mut p).expect("first victim via the door");
+        assert_eq!(first, b"c".to_vec(), "the candidate is consumed first");
+        // Candidate now cleared: the second call is a plain coldest-resident choice.
+        let second = victim_key(&mut p).expect("second victim, no candidate");
+        assert_eq!(
+            second,
+            b"b".to_vec(),
+            "plain coldest resident after the door"
+        );
+        assert!(p.tracks(0, b"a"), "the warm key survives both decisions");
+    }
+
+    #[test]
+    fn candidate_that_is_the_coldest_resident_self_evicts() {
+        // When the just-inserted candidate IS the coldest resident, the door trivially
+        // self-evicts it (one key, no comparison): a brand-new cold key inserted into a
+        // set of warmer residents loses immediately.
+        let mut p = WTinyLfu::new(false);
+        ins(&mut p, b"warm1");
+        ins(&mut p, b"warm2");
+        bump(&mut p, b"warm1", 6);
+        bump(&mut p, b"warm2", 6);
+        ins(&mut p, b"newcold"); // the candidate, estimate ~1, the coldest resident
+        assert_eq!(
+            victim_key(&mut p),
+            Some(b"newcold".to_vec()),
+            "the candidate is the coldest resident, so it self-evicts"
+        );
+        assert!(p.tracks(0, b"warm1"));
+        assert!(p.tracks(0, b"warm2"));
+    }
+
+    #[test]
+    fn candidate_alone_self_evicts_when_no_other_resident() {
+        // Edge case: the candidate is the ONLY resident. The door self-evicts it (there
+        // is no other victim), preserving evict_to_fit's progress guarantee.
+        let mut p = WTinyLfu::new(false);
+        ins(&mut p, b"solo");
+        assert_eq!(
+            victim_key(&mut p),
+            Some(b"solo".to_vec()),
+            "the sole resident candidate self-evicts"
+        );
+        assert!(!p.tracks(0, b"solo"));
+        assert_eq!(p.select_victim(), None, "nothing left to evict");
+    }
+
+    #[test]
+    fn candidate_removed_before_the_door_evicts_the_would_be_victim() {
+        // Edge case: the candidate is deleted (on_remove) between insert and the door.
+        // on_remove clears the stale candidate, so select_victim falls through to the
+        // plain coldest-resident choice (no door run).
         let mut p = WTinyLfu::new(false);
         ins(&mut p, b"hot");
-        for _ in 0..20 {
-            acc(&mut p, b"hot");
-        }
-        for i in 0..50u32 {
-            ins(&mut p, format!("scan{i}").as_bytes());
-        }
-        // Evict 50 victims (one per scan key): the hot key must never be chosen.
-        for _ in 0..50 {
-            let v = victim_key(&mut p).expect("a scan victim");
-            assert_ne!(
-                v,
-                b"hot".to_vec(),
-                "the hot key must survive the scan flood"
-            );
-        }
-        assert!(p.tracks(0, b"hot"), "the hot key survives the whole scan");
+        bump(&mut p, b"hot", 8);
+        ins(&mut p, b"cand"); // pending candidate
+        p.on_remove(0, b"cand", 1); // candidate deleted before the door
+        // The candidate was cleared, so select_victim is a plain coldest-resident choice;
+        // "hot" is the only resident left.
+        assert_eq!(
+            victim_key(&mut p),
+            Some(b"hot".to_vec()),
+            "a removed candidate clears; the door does not run on a stale key"
+        );
     }
 
     #[test]
@@ -739,19 +1049,27 @@ mod tests {
 
     #[test]
     fn determinism_identical_victim_choices_on_replay() {
-        // ADR-0003: the same insert/access sequence yields the IDENTICAL victim sequence
-        // on a fresh replay (fixed-seed sketch hashing, deterministic FIFO tie-break).
+        // ADR-0003: the same insert/decision sequence yields the IDENTICAL victim
+        // sequence on a fresh replay (fixed-seed sketch hashing, deterministic FIFO
+        // tie-break, deterministic door). Review fix (A): the old version used an
+        // on_access/acc() loop to "make a subset hot", which is DEAD CODE under #57
+        // (on_access is a no-op). This builds a GENUINE frequency dimension via bump()
+        // (decision-path increments) so a deterministic subset really gets a higher
+        // estimate, and asserts the hot subset is evicted LATER than the cold one.
         let run = || -> Vec<Vec<u8>> {
             let mut p = WTinyLfu::new(false);
             for i in 0..40u32 {
                 ins(&mut p, format!("k{i}").as_bytes());
             }
-            // Make a deterministic subset hot.
+            // Genuine frequency: every 3rd key is made hot with a deterministic, increasing
+            // number of decision-path increments. This is a REAL estimate difference, not
+            // an inert read loop.
             for i in (0..40u32).step_by(3) {
-                for _ in 0..=(i % 7) {
-                    acc(&mut p, format!("k{i}").as_bytes());
-                }
+                bump(&mut p, format!("k{i}").as_bytes(), 5 + (i as usize % 7));
             }
+            // Drain every key. The first select_victim consumes the pending candidate (the
+            // last inserted "k39", a cold key), then the rest are plain coldest-first
+            // choices, so the cold keys go before the hot subset.
             let mut out = Vec::new();
             while let Some((db, k)) = p.select_victim() {
                 p.on_remove(db, &k, 0);
@@ -763,5 +1081,29 @@ mod tests {
         let b = run();
         assert_eq!(a, b, "identical sequence => identical victim order");
         assert_eq!(a.len(), 40, "every key is eventually evicted");
+
+        // The frequency dimension is REAL and ordered: the hot subset (every 3rd key)
+        // must be evicted LATER than the cold majority. Compute the average eviction
+        // position of hot vs cold and assert hot evicts strictly later. This is what makes
+        // the test exercise frequency-differentiated ordering, not just FIFO.
+        let pos = |key: &str| a.iter().position(|k| k == key.as_bytes()).unwrap();
+        let mut hot_positions = Vec::new();
+        let mut cold_positions = Vec::new();
+        for i in 0..40u32 {
+            let p = pos(&format!("k{i}"));
+            if i % 3 == 0 {
+                hot_positions.push(p);
+            } else {
+                cold_positions.push(p);
+            }
+        }
+        let avg = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len() as f64;
+        assert!(
+            avg(&hot_positions) > avg(&cold_positions),
+            "the higher-frequency subset is evicted later (frequency-ordered, not FIFO): \
+             hot avg {} vs cold avg {}",
+            avg(&hot_positions),
+            avg(&cold_positions),
+        );
     }
 }
