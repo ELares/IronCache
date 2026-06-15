@@ -530,6 +530,59 @@ async fn route_and_dispatch(
     let cmd_upper = ascii_upper(request.command());
     let route = route::classify(&cmd_upper);
 
+    // -- TRANSACTION CORRECTNESS UNDER PARTITIONING (COORDINATOR.md #107, the critical fix).
+    //
+    // The coordinator routes each command to its key's OWNER shard. But a command issued
+    // INSIDE a `MULTI` must be QUEUED (reply `+QUEUED`), not executed: routing it remotely
+    // (the dispatch_via / multikey / whole-keyspace branches below) would EXECUTE it eagerly
+    // and out of transaction order. The queue gate lives in `dispatch` (the server crate) on
+    // the HOME path only, so the remote/fan-out branches bypass it entirely. We close that
+    // hole here, BEFORE the routing decision.
+    //
+    // The KEY INVARIANT we establish: a transaction reaches real (home-only) EXEC ONLY when
+    // ALL its watched keys AND all its queued commands' keys are HOME-OWNED, so home
+    // execution is always correct. Otherwise we reject it LOUDLY (a transaction is correct,
+    // or explicitly aborted -- never silently wrong). True cross-shard transactions (txid +
+    // ordered apply) are Stage 3, out of scope here.
+    //
+    // With `shards == 1` every key is home-owned, so the guards below NEVER fire and the
+    // `in_multi -> home path` branch is exactly the pre-coordinator behavior (home dispatch
+    // was always the path): byte-identical, and every existing transaction test stays green.
+
+    // (1) QUEUE GATE + (2) CROSS-SHARD-IN-MULTI / WHOLE-KEYSPACE GUARDS. Inside a transaction
+    // a command must be QUEUED (or a control verb handled), NEVER routed/executed remotely, and
+    // a transaction may reach real (home-only) EXEC ONLY when all its keys are home-owned. That
+    // transaction-correctness logic lives in `route_in_multi` (kept out of this router so it
+    // stays small); it returns the close flag when it handled the in-MULTI case.
+    if conn.in_multi {
+        return route_in_multi(
+            ctx, conn, home, env, store_rc, wheel_rc, state_rc, &cmd_upper, route, request, out,
+        );
+    }
+
+    // (3) CROSS-SHARD WATCH GUARD (only when NOT in_multi; WATCH inside MULTI already errors
+    // via dispatch's watch_inside_multi path). A `WATCH` of a key owned by a remote shard
+    // would snapshot the WRONG (home) store, making the dirty-CAS meaningless. `route::classify`
+    // treats WATCH as AlwaysHome and `command_keys` does not extract its keys, so we read
+    // WATCH's keys (args[1..]) DIRECTLY here. If any is not home-owned, reply the cross-shard
+    // WATCH error and do NOT run WATCH (no snapshot, no conn.watch mutation); the connection is
+    // left un-watched so a following MULTI/EXEC works. A WATCH of only home-owned keys (or a
+    // malformed/arity-wrong WATCH) falls through to the home dispatch -> cmd_watch unchanged.
+    if cmd_upper == b"WATCH"
+        && request.args.len() >= 2
+        && request.args[1..]
+            .iter()
+            .any(|k| route::owner_shard(k.as_ref(), home.total) != home.index)
+    {
+        state_rc.borrow_mut().counters.on_command();
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::watch_cross_shard()),
+            conn.proto,
+        );
+        return false;
+    }
+
     // A SHARD-SPANNING KeyedMulti command (its keys land on >1 shard, so `owner_shard_set`
     // is None) that is one of the SIX fan-out-supported commands routes to the multi-key
     // SCATTER-GATHER (COORDINATOR.md #107, Stage 2a). Co-located KeyedMulti (Some(shard))
@@ -623,6 +676,81 @@ async fn route_and_dispatch(
             ctx, conn, env, store_rc, wheel_rc, state_rc, request, &cmd_upper, out,
         )
     }
+}
+
+/// The in-MULTI transaction-correctness guards (COORDINATOR.md #107, the critical fix), split
+/// out of [`route_and_dispatch`] so the router stays small. Returns the connection-close flag
+/// (always `false` here; in-MULTI commands never close).
+///
+/// A command issued inside a transaction must be QUEUED (reply `+QUEUED`), not executed:
+/// routing it remotely (the dispatch_via / multikey / whole-keyspace branches) would EXECUTE it
+/// eagerly and out of transaction order, since the queue gate lives in `dispatch` on the HOME
+/// path only. So EVERY in-MULTI command goes to the HOME path EXCEPT the two reject-loudly
+/// cases below. The KEY INVARIANT: a transaction reaches real (home-only) EXEC ONLY when ALL its
+/// watched keys AND all queued commands' keys are HOME-OWNED, so home execution is always
+/// correct; otherwise it is rejected LOUDLY (correct, or explicitly aborted -- never silently
+/// wrong). True cross-shard transactions (txid + ordered apply) are Stage 3. With `shards == 1`
+/// every key is home-owned, so the guards never fire and this is the pre-coordinator behavior.
+#[allow(clippy::too_many_arguments)]
+fn route_in_multi(
+    ctx: &ServerContext,
+    conn: &mut ConnState,
+    home: ShardId,
+    env: &Rc<RefCell<SystemEnv>>,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    wheel_rc: &Rc<RefCell<TimingWheel>>,
+    state_rc: &Rc<RefCell<ShardState>>,
+    cmd_upper: &[u8],
+    route: route::CommandClass,
+    request: &Request,
+    out: &mut Vec<u8>,
+) -> bool {
+    let keyed = matches!(
+        route,
+        route::CommandClass::KeyedSingle | route::CommandClass::KeyedMulti
+    );
+    // A KEYED DATA command whose keys are not ALL home-owned is rejected at queue time (Redis's
+    // queue-time-error behavior): reply the cross-shard error NOW and dirty the transaction, so
+    // EXEC returns -EXECABORT and applies nothing. Bump commands_processed like the other paths.
+    if keyed && !all_keys_home_owned(cmd_upper, request, home) {
+        state_rc.borrow_mut().counters.on_command();
+        conn.dirty_exec = true;
+        encode_into(
+            out,
+            &ironcache_server::Value::error(
+                ironcache_protocol::ErrorReply::txn_cross_shard_command(),
+            ),
+            conn.proto,
+        );
+        return false;
+    }
+    // A WHOLE-KEYSPACE command (KEYS/SCAN/DBSIZE/FLUSHALL/FLUSHDB/RANDOMKEY) cannot run correctly
+    // home-only at EXEC when the keyspace is partitioned: EXEC replays synchronously on the HOME
+    // store, so it would cover only the home shard's ~1/N (a `MULTI; FLUSHALL; EXEC` would
+    // partially flush -- silent data RETENTION). There is no single owner to hop to and EXEC
+    // cannot fan out (it is synchronous), so reject at queue time (dirty -> -EXECABORT), the same
+    // "correct or explicitly aborted, never silently wrong" contract as the cross-shard keyed
+    // case. Gate on `home.total > 1`: with one shard the home shard IS the whole keyspace, so
+    // they run correctly home-only and must keep working (shards == 1 byte-identical parity).
+    if matches!(route, route::CommandClass::WholeKeyspace) && home.total > 1 {
+        state_rc.borrow_mut().counters.on_command();
+        conn.dirty_exec = true;
+        encode_into(
+            out,
+            &ironcache_server::Value::error(
+                ironcache_protocol::ErrorReply::txn_whole_keyspace_unsupported(),
+            ),
+            conn.proto,
+        );
+        return false;
+    }
+    // All-home keyed command OR a control verb: HOME path. `dispatch`'s queue gate queues the
+    // keyed command (`+QUEUED`) and runs EXEC/DISCARD/etc. specially. This is the ONLY routing
+    // branch taken while in_multi (no remote hop, no fan-out), so a transaction that reaches real
+    // EXEC has ALL queued keys home-owned -> home-only EXEC is correct.
+    handle_request(
+        ctx, conn, env, store_rc, wheel_rc, state_rc, request, cmd_upper, out,
+    )
 }
 
 /// Dispatch one request and append its encoded reply to `out`. Returns whether
@@ -735,6 +863,35 @@ fn encode_into(out: &mut Vec<u8>, value: &ironcache_server::Value, proto: ProtoV
     let mut bm = bytes::BytesMut::with_capacity(64);
     ironcache_protocol::encode(&mut bm, value, proto);
     out.extend_from_slice(&bm);
+}
+
+/// Whether EVERY routing key of a KEYED data command (`KeyedSingle`/`KeyedMulti`) is owned
+/// by the HOME shard (COORDINATOR.md #107, the in-MULTI cross-shard guard). Used inside a
+/// transaction to decide whether a queued command is safe to run home-only at EXEC: only a
+/// command whose keys are ALL home-owned may queue (and later EXEC correctly home-only); any
+/// key on a remote shard means home-only EXEC would silently lose the write, so the caller
+/// rejects + dirties the transaction instead.
+///
+/// It reuses the SAME key-extraction the router uses ([`route::single_key`] for the single-key
+/// fast path, [`route::command_keys`] for multi-key), so "which bytes are keys" cannot drift
+/// from the routing decision. A command with NO extractable key (a malformed / short request,
+/// `KeySpec::None`) has no remote key, so it is treated as home-owned: it queues and the home
+/// handler emits the proper runtime error as the EXEC array element (matching Redis, where a
+/// queued command's argument error surfaces at run time, not queue time).
+fn all_keys_home_owned(cmd_upper: &[u8], request: &Request, home: ShardId) -> bool {
+    let is_home = |key: &[u8]| route::owner_shard(key, home.total) == home.index;
+    match route::classify(cmd_upper) {
+        route::CommandClass::KeyedSingle => route::single_key(request).is_none_or(is_home),
+        route::CommandClass::KeyedMulti => match route::command_keys(cmd_upper, request) {
+            route::KeySpec::None => true,
+            route::KeySpec::One(k) => is_home(k),
+            route::KeySpec::Many(keys) => keys.iter().all(|k| is_home(k)),
+        },
+        // Only keyed commands reach this helper (the caller gates on `keyed`); a control /
+        // whole-keyspace command has no owned key, so treat it as home (it never routes
+        // remotely from inside MULTI anyway).
+        route::CommandClass::AlwaysHome | route::CommandClass::WholeKeyspace => true,
+    }
 }
 
 /// Whether `cmd_upper` is one of the SIX multi-key DATA commands the coordinator fans out
