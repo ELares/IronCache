@@ -256,6 +256,29 @@ impl Config {
                 reason: "must be at least 1".to_owned(),
             });
         }
+        // HARD CEILING on the shard count (COORDINATOR.md #107, FIX 2): the cross-shard
+        // SCAN wire cursor is COMPOSITE -- its high
+        // [`ironcache_storage::ScanCursor::SHARD_BITS`] bits carry the shard index, so it
+        // can address at most [`ironcache_storage::ScanCursor::MAX_SHARDS`] (256) shards.
+        // Beyond that the shard index overflows its field and silently CORRUPTS the cursor
+        // (shard 256 packs to the all-zero "done" sentinel; shard 257 aliases shard 1).
+        // This is reachable in release (`default_shards()` on a >256-core host, or an
+        // explicit `--shards 512`), so it is a LOUD boot error, NOT a debug_assert. The
+        // limit lives in the storage waist so the cursor math and this guard share ONE
+        // source of truth.
+        let max_shards = ironcache_storage::ScanCursor::MAX_SHARDS;
+        if self.shards > max_shards {
+            return Err(ConfigError::Invalid {
+                field: "shards",
+                reason: format!(
+                    "{} exceeds the maximum of {max_shards} (the cross-shard SCAN cursor \
+                     reserves {} high bits for the shard index; more shards would corrupt \
+                     the composite cursor)",
+                    self.shards,
+                    ironcache_storage::ScanCursor::SHARD_BITS,
+                ),
+            });
+        }
         if self.databases == 0 {
             return Err(ConfigError::Invalid {
                 field: "databases",
@@ -616,6 +639,32 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_too_many_shards() {
+        // FIX 2: a shard count above the composite-cursor ceiling (MAX_SHARDS == 256) is
+        // a LOUD boot error (reachable via `--shards 512` or `default_shards()` on a
+        // >256-core host), not a silent SCAN cursor corruption. Exactly MAX_SHARDS is OK;
+        // one beyond is rejected with the `shards` field error.
+        let max = ironcache_storage::ScanCursor::MAX_SHARDS;
+        let ok = Config {
+            shards: max,
+            ..Config::default()
+        };
+        ok.validate().expect("exactly MAX_SHARDS shards is allowed");
+
+        let too_many = Config {
+            shards: max + 1,
+            ..Config::default()
+        };
+        assert!(matches!(
+            too_many.validate(),
+            Err(ConfigError::Invalid {
+                field: "shards",
+                ..
+            })
+        ));
     }
 
     #[test]

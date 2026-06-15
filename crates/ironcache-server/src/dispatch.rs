@@ -281,8 +281,53 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap 
     deltas: &mut CounterDeltas,
     req: &Request,
 ) -> Value {
-    *deltas = CounterDeltas::default();
+    // Uppercase the command ONCE here, then delegate. This is the entry every test /
+    // EXEC re-dispatch path uses; the cross-shard serve loop instead calls
+    // [`dispatch_with_cmd`] DIRECTLY with the command it already uppercased for routing,
+    // so the home hot path uppercases exactly once (FIX 5).
     let cmd = ascii_upper(req.command());
+    dispatch_with_cmd(
+        ctx,
+        state,
+        env,
+        store,
+        wheel,
+        now,
+        shard_generation,
+        rollup,
+        mem,
+        deltas,
+        req,
+        &cmd,
+    )
+}
+
+/// [`dispatch`] with the uppercased command token supplied by the caller (FIX 5). The
+/// cross-shard serve loop computes `cmd_upper` once for routing
+/// ([`crate::route::classify`]) and passes the SAME slice here, so the hottest path (a
+/// home-owned single-key command) does NOT re-uppercase + re-allocate the command per
+/// command. The body is byte-for-byte identical to the prior `dispatch`; only the source
+/// of `cmd` changed (param instead of a local `ascii_upper`). `cmd` MUST equal
+/// `ascii_upper(req.command())` (the contract the two callers uphold).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_with_cmd<
+    E: Env,
+    S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap + Watch,
+>(
+    ctx: &ServerContext,
+    state: &mut ConnState,
+    env: &mut E,
+    store: &mut S,
+    wheel: &mut TimingWheel,
+    now: UnixMillis,
+    shard_generation: &mut u64,
+    rollup: RollupFn<'_>,
+    mem: MemoryInfo,
+    deltas: &mut CounterDeltas,
+    req: &Request,
+    cmd: &[u8],
+) -> Value {
+    *deltas = CounterDeltas::default();
 
     // maxmemory-policy HOT-SWAP reach (CONFIG.md, PR-4b): a single relaxed atomic load
     // + compare; the rebuild (rare) is factored into a helper to keep this fn small.
@@ -305,7 +350,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap 
     // are already past auth (you cannot MULTI before authenticating).
     if ctx.requires_auth()
         && !state.authenticated
-        && !matches!(cmd.as_slice(), b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
+        && !matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
     {
         return Value::error(ErrorReply::noauth());
     }
@@ -328,11 +373,11 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap 
     // there, since the dirty-CAS already ran + cleared the watches at EXEC entry).
     if state.in_multi
         && !matches!(
-            cmd.as_slice(),
+            cmd,
             b"MULTI" | b"EXEC" | b"DISCARD" | b"RESET" | b"QUIT" | b"WATCH"
         )
     {
-        return match cmd_txn::queue_validate(&cmd, &req.args) {
+        return match cmd_txn::queue_validate(cmd, &req.args) {
             Ok(()) => {
                 state.queued.push(req.clone());
                 Value::simple("QUEUED")
@@ -345,7 +390,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap 
     }
 
     dispatch_inner(
-        ctx, state, env, store, wheel, now, rollup, mem, deltas, req, &cmd,
+        ctx, state, env, store, wheel, now, rollup, mem, deltas, req, cmd,
     )
 }
 
@@ -372,41 +417,6 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
     req: &Request,
     cmd: &[u8],
 ) -> Value {
-    // maxmemory admission (ADMISSION.md #128, ADR-0007). For a `denyoom` write, before
-    // the command body: if the ceiling is enabled and this shard is STRICTLY OVER its
-    // budget, either evict-to-fit (cache mode) or reply `-OOM` (datastore/noeviction).
-    // The comparison is strict `>` to match Redis's getMaxmemoryState (evict.c):
-    // memory is "under limit" when `used <= maxmemory`, so a write at EXACTLY
-    // used==budget is served, and only used>budget triggers eviction/-OOM (the -OOM
-    // string itself reads "used memory > 'maxmemory'"). Non-denyoom commands (reads,
-    // DEL, Tier-0) are ALWAYS served, even over budget, so a client can read and free
-    // under pressure.
-    //
-    // This gate is INSIDE `dispatch_inner` (not the once-per-command `dispatch`) so it
-    // runs PER QUEUED COMMAND in the EXEC loop, matching Redis (denyoom is evaluated per
-    // command at EXEC). A queued denyoom write that is over budget becomes an `-OOM`
-    // error ELEMENT in the EXEC array; the batch continues (no rollback).
-    if ctx.ceiling_enabled() && is_denyoom(cmd) {
-        // The per-shard budget is recomputed from the CURRENT runtime maxmemory (a
-        // cheap atomic load divided by the shard count), so a `CONFIG SET maxmemory`
-        // tightens/loosens every shard's gate on its next denyoom write (PR-4b).
-        let budget = ctx.per_shard_budget();
-        if store.used_memory() > budget {
-            if store.policy_evicts() {
-                // Cache mode: try to free space, then re-check. If eviction cannot get
-                // us down to budget (write outruns eviction, or only ineligible keys
-                // remain), reject -OOM. The freed count is reported for INFO.
-                deltas.evicted += store.evict_to_fit(budget, now);
-                if store.used_memory() > budget {
-                    return Value::error(ErrorReply::oom());
-                }
-            } else {
-                // Strict datastore / noeviction: -OOM is the over-capacity behavior.
-                return Value::error(ErrorReply::oom());
-            }
-        }
-    }
-
     let db = state.db;
     // The arms below are HAND-SYNCED with the queue-time arity table in
     // [`cmd_txn::arity_of`] (every dispatch arm has a table entry, and vice versa). The
@@ -493,6 +503,82 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // shard's counter reset via `deltas.reset_stats` (the serve loop honors it in
         // ShardCounters::apply); the serving-shard scope is documented in cmd_config.
         b"CONFIG" => cmd_config::cmd_config(ctx, deltas, req),
+        // Every OTHER command is a KEYED-DATA command (or an unknown token): it touches
+        // only store/wheel/db/now (+ env for the RNG-drawing members), NO ConnState. The
+        // bodies live in [`dispatch_keyed_data`], the SINGLE keyed-arm definition that
+        // BOTH this home path and the cross-shard [`dispatch_remote_keyed`] path call, so
+        // the two cannot diverge (COORDINATOR.md #107). The maxmemory admission gate runs
+        // INSIDE that helper (it is per-command, owned by the shard holding the key).
+        _ => dispatch_keyed_data(ctx, env, store, wheel, db, now, deltas, req, cmd),
+    }
+}
+
+/// The KEYED-DATA command bodies + the per-command `maxmemory` admission gate: the
+/// SINGLE definition shared by the home path ([`dispatch_inner`]'s default arm) and the
+/// cross-shard remote path ([`dispatch_remote_keyed`]), so a keyed command's behavior is
+/// byte-identical whether it runs on its home shard or after a cross-thread hop
+/// (COORDINATOR.md #107). FACTORED (not copy-pasted) precisely so the two paths cannot
+/// drift.
+///
+/// It takes NO [`ConnState`]: every arm here keys on `args[1]` (or is an unknown token)
+/// and touches only `store`/`wheel`/`db`/`now`/`deltas`, plus `env` for the RNG-drawing
+/// members (RANDOMKEY is whole-keyspace and stays in `dispatch_inner`'s control set, but
+/// SPOP/SRANDMEMBER/HRANDFIELD/ZRANDMEMBER draw a per-command seed through the Env RNG
+/// seam, ADR-0003). `db` is supplied by the caller (`state.db` on the home path, the
+/// `ShardWork.db` on the remote path).
+///
+/// The big-match shape is the intended structure (the command table), so the
+/// line-count and arg-count lints are allowed here as on the parent.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
+    ctx: &ServerContext,
+    env: &mut E,
+    store: &mut S,
+    wheel: &mut TimingWheel,
+    db: u32,
+    now: UnixMillis,
+    deltas: &mut CounterDeltas,
+    req: &Request,
+    cmd: &[u8],
+) -> Value {
+    // maxmemory admission (ADMISSION.md #128, ADR-0007). For a `denyoom` write, before
+    // the command body: if the ceiling is enabled and this shard is STRICTLY OVER its
+    // budget, either evict-to-fit (cache mode) or reply `-OOM` (datastore/noeviction).
+    // The comparison is strict `>` to match Redis's getMaxmemoryState (evict.c):
+    // memory is "under limit" when `used <= maxmemory`, so a write at EXACTLY
+    // used==budget is served, and only used>budget triggers eviction/-OOM (the -OOM
+    // string itself reads "used memory > 'maxmemory'"). Non-denyoom commands (reads,
+    // DEL, Tier-0) are ALWAYS served, even over budget, so a client can read and free
+    // under pressure.
+    //
+    // It runs PER QUEUED COMMAND in the EXEC loop (this helper is the dispatch_inner
+    // default arm, which EXEC re-enters per queued command), matching Redis (denyoom is
+    // evaluated per command at EXEC). A queued denyoom write that is over budget becomes
+    // an `-OOM` error ELEMENT in the EXEC array; the batch continues (no rollback). On the
+    // cross-shard remote path the gate runs against the OWNING shard's budget (the shard
+    // holding the key owns its share of the maxmemory ceiling).
+    if ctx.ceiling_enabled() && is_denyoom(cmd) {
+        // The per-shard budget is recomputed from the CURRENT runtime maxmemory (a
+        // cheap atomic load divided by the shard count), so a `CONFIG SET maxmemory`
+        // tightens/loosens every shard's gate on its next denyoom write (PR-4b).
+        let budget = ctx.per_shard_budget();
+        if store.used_memory() > budget {
+            if store.policy_evicts() {
+                // Cache mode: try to free space, then re-check. If eviction cannot get
+                // us down to budget (write outruns eviction, or only ineligible keys
+                // remain), reject -OOM. The freed count is reported for INFO.
+                deltas.evicted += store.evict_to_fit(budget, now);
+                if store.used_memory() > budget {
+                    return Value::error(ErrorReply::oom());
+                }
+            } else {
+                // Strict datastore / noeviction: -OOM is the over-capacity behavior.
+                return Value::error(ErrorReply::oom());
+            }
+        }
+    }
+
+    match cmd {
         // -- Data commands (PR-2a) over the storage waist. The two pure reads (GET,
         // STRLEN) feed the keyspace hit/miss counters (PR-3b): a found live key is a
         // hit, an absent/expired key a miss. --
@@ -722,6 +808,153 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
             let rest: Vec<&[u8]> = req.args[1..].iter().map(bytes::Bytes::as_ref).collect();
             Value::error(ErrorReply::unknown_command(&name, &rest))
         }
+    }
+}
+
+/// Run ONE keyed data command (a [`route::CommandClass::KeyedSingle`](crate::route) OR a
+/// [`route::CommandClass::KeyedMulti`](crate::route) whose keys all co-locate on one shard)
+/// on the shard that OWNS its key(s), after a cross-thread hop (COORDINATOR.md #107, Stage
+/// 1). This is the REMOTE counterpart of the home [`dispatch`] fast path: the coordinator's
+/// per-shard drain loop calls it on the OWNING shard with that shard's OWN store/wheel/env,
+/// so a `SET k v` issued on a connection homed on shard 0 lands in shard `owner_shard(k)`'s
+/// partition and a later `GET k` (or `DEL k`) on any connection finds it.
+///
+/// It runs the SAME keyed-arm bodies the home path does (via the shared
+/// [`dispatch_keyed_data`], so the two cannot diverge), preceded by the two per-command
+/// shard-owned steps the home `dispatch` also runs and the owning shard still owns:
+///   1. the `maxmemory-policy` hot-swap generation check (CONFIG.md, PR-4b) against THIS
+///      shard's `shard_generation` (so a `CONFIG SET maxmemory-policy` reaches the owning
+///      shard on its next remote command too);
+///   2. the active-expiry wheel drain (EXPIRATION.md #51) on THIS shard's wheel/store.
+///
+/// The maxmemory admission gate runs INSIDE `dispatch_keyed_data` against THIS shard's
+/// budget (the owning shard owns its share of the ceiling).
+///
+/// It has NO [`ConnState`]: it is only ever called for a keyed data command (the serve loop
+/// classifies + extracts keys before hopping), which by construction touches no connection
+/// state. `now` is read by the CALLER from the OWNING shard's Env clock (the determinism
+/// seam, ADR-0003), NOT supplied by the home shard, so a seeded replay reaps/expires
+/// identically on the owning core. `deltas` accumulates this command's counter changes; the
+/// caller folds them into the OWNING shard's counters (where the data lives) and ships a
+/// copy back so the home core does not double-count.
+///
+/// If somehow handed a non-keyed command (a classification bug; never happens given the
+/// serve loop's `route::classify` + `command_keys` gate), it returns an internal error
+/// rather than silently running a control command without its `ConnState`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_remote_keyed<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
+    ctx: &ServerContext,
+    env: &mut E,
+    store: &mut S,
+    wheel: &mut TimingWheel,
+    db: u32,
+    now: UnixMillis,
+    shard_generation: &mut u64,
+    deltas: &mut CounterDeltas,
+    req: &Request,
+) -> Value {
+    *deltas = CounterDeltas::default();
+    let cmd = ascii_upper(req.command());
+
+    // Defense in depth: only KEYED data commands are ever routed here (COORDINATOR.md #107,
+    // Stage 1). KeyedSingle (args[1] key) AND KeyedMulti (DEL/EXISTS/RENAME/SINTER/BITOP/
+    // PFCOUNT/.../OBJECT) are BOTH routable: the serve loop routes a keyed command whose
+    // keys ALL resolve to one shard, and every such handler is ConnState-free (it runs via
+    // the shared `dispatch_keyed_data` arms below), so it executes correctly after the hop.
+    // A control/conn/txn (AlwaysHome) or whole-keyspace command reaching this path is a
+    // classification bug; refuse it rather than run it without the ConnState / fan-out it
+    // needs. (A key-SPANNING multi-key command is kept HOME by the serve loop and never
+    // reaches here -- the Stage 2 fan-out gap.)
+    if !matches!(
+        crate::route::classify(&cmd),
+        crate::route::CommandClass::KeyedSingle | crate::route::CommandClass::KeyedMulti
+    ) {
+        return Value::error(ErrorReply::err(
+            "command routed cross-shard is not key-routable",
+        ));
+    }
+
+    // (1) maxmemory-policy HOT-SWAP reach on the owning shard (CONFIG.md, PR-4b): one
+    // relaxed atomic load + compare; the rebuild (rare) is the shared helper.
+    maybe_hot_swap_policy(ctx, env, store, shard_generation, now);
+
+    // (2) Active TTL reclamation on the owning shard (EXPIRATION.md #51), BEFORE the
+    // command body, exactly like the home `dispatch`: drain a BOUNDED batch of due keys
+    // from THIS shard's wheel and reap the genuinely-expired ones (the SAME
+    // `drain_due_keys` helper). Bounds resident memory for expired keys under traffic.
+    deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
+
+    // (3) The keyed command body + the per-command admission gate, via the SINGLE shared
+    // keyed-arm definition (so home and remote cannot diverge).
+    dispatch_keyed_data(ctx, env, store, wheel, db, now, deltas, req, &cmd)
+}
+
+/// Run ONE shard's PARTIAL of a [`route::CommandClass::WholeKeyspace`](crate::route)
+/// command against THIS shard's partition, for the cross-shard scatter-gather fan-out
+/// (COORDINATOR.md #107, the whole-keyspace pass). The coordinator's home core sends the
+/// SAME request to every other shard (and runs it locally on the home shard); each shard
+/// returns its slice's result, which the home core MERGES:
+///   - DBSIZE: this shard's key count (the home core sums the per-shard integers).
+///   - KEYS pattern: this shard's matching keys (the home core concatenates the arrays).
+///   - SCAN cursor ...: this shard's scan_step batch over the per-shard INNER cursor the
+///     home core rewrote into `args[1]` before sending (the home core decodes/encodes the
+///     COMPOSITE cursor; each shard runs the plain single-shard SCAN against its partition).
+///   - FLUSHDB / FLUSHALL: clear this shard's selected db / all dbs, returning `+OK`.
+///   - RANDOMKEY: a random live key from this shard's selected db, or nil if it has none.
+///
+/// Unlike a KEYED hop the whole-keyspace partials touch NO single owned key: they run the
+/// SAME `cmd_keyspace::*` handlers the home `dispatch_keyed_data` arms call (so the per
+/// -shard behavior is byte-identical to the single-shard path), needing only `db` (+ the
+/// Env RNG seam for RANDOMKEY's index, ADR-0003) and NO [`ConnState`]. They do NOT run the
+/// active-expiry drain or the maxmemory admission gate (a read-only count/iterate or a
+/// flush is not a `denyoom` write; FLUSH frees memory), so this path is lean.
+///
+/// `db` is the issuing connection's selected DB (the `ShardWork.db`). It returns an
+/// internal error if handed a non-whole-keyspace command (a coordinator classification
+/// bug; the serve loop only fans out WholeKeyspace commands here).
+pub fn dispatch_remote_whole_keyspace<E: Env, S: Store + Keyspace>(
+    env: &mut E,
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+) -> Value {
+    let cmd = ascii_upper(req.command());
+
+    // Defense in depth: only WholeKeyspace commands are fanned out here. Anything else is
+    // a coordinator classification bug; refuse it rather than run it on a wrong path.
+    if !matches!(
+        crate::route::classify(&cmd),
+        crate::route::CommandClass::WholeKeyspace
+    ) {
+        return Value::error(ErrorReply::err(
+            "command fanned out cross-shard is not whole-keyspace",
+        ));
+    }
+
+    match cmd.as_slice() {
+        // Per-shard partials over the Keyspace seam (no ConnState, no admission/expiry).
+        b"DBSIZE" => cmd_keyspace::cmd_dbsize(store, db, req),
+        b"KEYS" => cmd_keyspace::cmd_keys(store, db, now, req),
+        b"SCAN" => cmd_keyspace::cmd_scan(store, db, now, req),
+        b"FLUSHDB" => cmd_keyspace::cmd_flushdb(store, db, req),
+        b"FLUSHALL" => cmd_keyspace::cmd_flushall(store, req),
+        b"RANDOMKEY" => {
+            // RANDOMKEY's index enters through the Env RNG seam (ADR-0003) on THIS shard,
+            // mirroring the home `dispatch_keyed_data` arm: the caller draws it here; the
+            // store reads no RNG. Each shard returns its own random key (or nil); the home
+            // core then picks ONE among the non-nil shard replies (also via the Env seam).
+            let pick = if req.args.len() == 1 {
+                env.rng().next_u64()
+            } else {
+                0
+            };
+            cmd_keyspace::cmd_randomkey(store, db, pick, now, req)
+        }
+        // The classify gate above already excludes everything else.
+        _ => Value::error(ErrorReply::err(
+            "command fanned out cross-shard is not whole-keyspace",
+        )),
     }
 }
 

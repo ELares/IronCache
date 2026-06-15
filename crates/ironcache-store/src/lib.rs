@@ -115,11 +115,33 @@ struct ScanPlan<'a> {
 ///
 /// `count` bounds the keys EXAMINED (a hint, like Redis); `count == 0` is treated as
 /// 1 so progress is always made.
-fn scan_plan<'a>(order: &[(u64, &'a [u8])], cursor: ScanCursor, count: usize) -> ScanPlan<'a> {
+///
+/// ## `band_bits`: BAND-ALIGNING the next cursor for the cross-shard composite cursor
+///
+/// `band_bits` is the number of LOW hash bits the cross-shard composite SCAN cursor
+/// CANNOT carry (it reserves them for the high shard-index field; see
+/// [`ScanCursor::SHARD_BITS`]). It is `0` on a single-shard server (the inner cursor
+/// passes through verbatim) and [`ScanCursor::SHARD_BITS`] when more than one shard is
+/// configured. When `band_bits > 0` the next cursor is rounded DOWN to its `2^band_bits`
+/// BAND FLOOR and a band is NEVER split across calls, so the composite cursor's truncating
+/// `inner >> band_bits` encode is LOSSLESS (the cleared low bits are already 0) and the
+/// cross-shard wire cursor strictly advances by at least one band -> termination. The
+/// inclusive `scan_hash >= cursor` resume re-includes the whole band start, so a band
+/// floor never skips an un-examined key.
+///
+/// With `band_bits == 0` (single shard) this is BYTE-IDENTICAL to the prior group-only
+/// logic: the stop rule degenerates to "hash changed" and the next cursor is the exact
+/// first un-examined hash, so single-shard SCAN tokens are unchanged.
+fn scan_plan<'a>(
+    order: &[(u64, &'a [u8])],
+    cursor: ScanCursor,
+    count: usize,
+    band_bits: u32,
+) -> ScanPlan<'a> {
     let total = order.len();
     // The resume position: the first key whose hash is >= the cursor. For the start
-    // cursor (0) that is index 0. Because a group is never split, `start` always lands
-    // on a group boundary, so `>=` returns the whole resumed group.
+    // cursor (0) that is index 0. Because a group/band is never split, `start` always
+    // lands on a group/band boundary, so `>=` returns the whole resumed group/band.
     let start = if cursor.is_start() {
         0
     } else {
@@ -132,15 +154,22 @@ fn scan_plan<'a>(order: &[(u64, &'a [u8])], cursor: ScanCursor, count: usize) ->
         };
     }
 
+    // The BAND of a hash: with band_bits==0 a band IS the exact hash (today's group
+    // boundary); with band_bits>0 it is the hash with its low band_bits bits cleared, so
+    // all hashes in one 2^band_bits window share a band. `>> band_bits` is the band id
+    // (a u32 shift of 0 is the identity, so band_bits==0 yields the raw hash).
+    let band = |h: u64| h >> band_bits;
+
     let count = count.max(1);
     let mut examined: Vec<&'a [u8]> = Vec::new();
     let mut i = start;
     let mut n = 0usize;
     while i < total {
         let (h, key) = order[i];
-        // Stop once the per-call budget is spent AND we are at a group boundary (the
-        // hash differs from the last examined key), so a group is never split.
-        if n >= count && i > start && h != order[i - 1].0 {
+        // Stop once the per-call budget is spent AND we are at a BAND boundary (the band
+        // differs from the last examined key), so a band (and, with band_bits==0, an
+        // equal-hash group) is never split across two calls.
+        if n >= count && i > start && band(h) != band(order[i - 1].0) {
             break;
         }
         examined.push(key);
@@ -148,12 +177,16 @@ fn scan_plan<'a>(order: &[(u64, &'a [u8])], cursor: ScanCursor, count: usize) ->
         i += 1;
     }
 
-    // The next cursor: 0 (complete) if we consumed the whole order; otherwise the hash
-    // of the first un-examined key (always a strictly-greater group start, never 0).
+    // The next cursor: 0 (complete) if we consumed the whole order; otherwise the BAND
+    // FLOOR of the first un-examined key. The floor is `(hash >> band_bits) << band_bits`
+    // (with band_bits==0 it is the exact hash, today's behavior). The floor is always a
+    // strictly-greater band start than the prior batch's last band, never inside it. A
+    // non-terminal band floor for a non-start position is never 0 because a 0-band key
+    // sorts FIRST and is examined on the start batch (see the cursor invariant doc).
     let next = if i >= total {
         ScanCursor::START
     } else {
-        ScanCursor(order[i].0)
+        ScanCursor(band(order[i].0) << band_bits)
     };
     ScanPlan { examined, next }
 }
@@ -205,6 +238,14 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// case, no WATCH active) the funnel notify does a single integer check and returns;
     /// the non-watching hot path pays ~one branch.
     watched_count: usize,
+    /// The number of LOW `scan_hash` bits the cross-shard composite SCAN cursor reserves
+    /// for the shard index, so [`Self::scan_step`] returns BAND-ALIGNED next cursors that
+    /// the coordinator's `compose`/`decompose` round-trips LOSSLESSLY (COORDINATOR.md
+    /// #107). It is `0` on a single-shard server (`scan_step` is then byte-identical to
+    /// the pre-coordinator behavior: the exact next-key hash, no band rounding) and
+    /// [`ScanCursor::SHARD_BITS`] when more than one shard is configured. Set ONCE at
+    /// construction from the boot shard count; the store reads no shard topology otherwise.
+    scan_band_bits: u32,
 }
 
 /// One WATCH per-key version slot (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Held in
@@ -245,7 +286,30 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             watch_versions: HashMap::new(),
             version_clock: 0,
             watched_count: 0,
+            // Default 0: a single-shard server (and every test fixture) gets the
+            // pre-coordinator byte-identical SCAN behavior. The boot path sets the real
+            // reserved-band width via [`Self::with_scan_band_bits`] when shards > 1.
+            scan_band_bits: 0,
         }
+    }
+
+    /// Set the cross-shard SCAN reserved-band width (a CONSUMING builder, COORDINATOR.md
+    /// #107). The boot path calls this with [`ScanCursor::SHARD_BITS`] when the server
+    /// runs more than one shard, so [`Self::scan_step`] returns BAND-ALIGNED next cursors
+    /// the coordinator's composite cursor round-trips losslessly; it stays `0` for a
+    /// single-shard server (SCAN is then byte-identical to the pre-coordinator behavior).
+    ///
+    /// `bits` MUST be `< 64` (it is a hash right-shift amount); the only callers pass `0`
+    /// or `ScanCursor::SHARD_BITS` (8). Builder form so the common constructors keep their
+    /// signatures and every existing test fixture is unaffected (defaults to `0`).
+    #[must_use]
+    pub fn with_scan_band_bits(mut self, bits: u32) -> Self {
+        debug_assert!(
+            bits < 64,
+            "scan_band_bits is a hash shift amount, must be < 64"
+        );
+        self.scan_band_bits = bits;
+        self
     }
 
     /// The WATCH write-funnel NOTIFY (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Called
@@ -1180,8 +1244,10 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         order.sort_unstable();
 
         // Walk the sorted order, choosing which keys to EXAMINE this batch and what the
-        // next cursor is (the pure cursor-stepping core, unit-tested in isolation).
-        let plan = scan_plan(&order, cursor, count);
+        // next cursor is (the pure cursor-stepping core, unit-tested in isolation). The
+        // shard's `scan_band_bits` makes the next cursor BAND-ALIGNED for the cross-shard
+        // composite cursor (0 on a single-shard server -> byte-identical to before).
+        let plan = scan_plan(&order, cursor, count, self.scan_band_bits);
 
         // Realize the plan: for each examined key, skip a lazily-expired one (the lazy
         // backstop / active drain reclaim it; SCAN never returns it) and apply the
@@ -1620,15 +1686,39 @@ mod scan_core_tests {
     /// Drive `scan_plan` to completion and collect every examined key, asserting the
     /// cursor terminates at 0. Returns the examined keys in emission order.
     fn drive(order: &[(u64, &'static [u8])], count: usize) -> Vec<&'static [u8]> {
+        drive_bands(order, count, 0)
+    }
+
+    /// Drive `scan_plan` to completion with an explicit `band_bits` reserved-band width
+    /// (the cross-shard composite-cursor case). Asserts the cursor terminates at 0; the
+    /// loop bound is GENEROUS (each step advances at least one band, but a band may take
+    /// several COUNT-bounded calls when keys share a band, so allow extra iterations).
+    fn drive_bands(
+        order: &[(u64, &'static [u8])],
+        count: usize,
+        band_bits: u32,
+    ) -> Vec<&'static [u8]> {
         let mut out = Vec::new();
         let mut cursor = ScanCursor::START;
         // A generous loop bound so a cursor bug fails the test rather than hangs.
-        for _ in 0..(order.len() + 4) {
-            let plan = scan_plan(order, cursor, count);
+        for _ in 0..(order.len() * 2 + 4) {
+            let plan = scan_plan(order, cursor, count, band_bits);
             out.extend(plan.examined.iter().copied());
             if plan.next.is_start() {
                 return out;
             }
+            // Band-alignment invariant: a non-terminal next cursor has its low band_bits
+            // bits cleared, so the composite cursor's `>> band_bits` encode is lossless.
+            if band_bits > 0 {
+                let low_mask = (1u64 << band_bits) - 1;
+                assert_eq!(
+                    plan.next.0 & low_mask,
+                    0,
+                    "next cursor must be band-aligned (low band_bits clear)"
+                );
+            }
+            // Strict forward progress: the cursor must advance.
+            assert!(plan.next.0 > cursor.0, "cursor must strictly advance");
             cursor = plan.next;
         }
         panic!("scan_plan did not terminate (cursor never returned 0)");
@@ -1645,7 +1735,7 @@ mod scan_core_tests {
 
     #[test]
     fn empty_order_completes_immediately() {
-        let plan = scan_plan(&[], ScanCursor::START, 10);
+        let plan = scan_plan(&[], ScanCursor::START, 10, 0);
         assert!(plan.examined.is_empty());
         assert!(plan.next.is_start(), "empty -> cursor 0 (complete)");
     }
@@ -1679,7 +1769,7 @@ mod scan_core_tests {
         // key. The returned cursor after the first call is the hash-8 group start (8),
         // never a value inside the hash-5 group.
         let o = order(&[(5, b"a"), (5, b"b"), (5, b"c"), (8, b"d")]);
-        let plan1 = scan_plan(&o, ScanCursor::START, 1);
+        let plan1 = scan_plan(&o, ScanCursor::START, 1, 0);
         assert_eq!(
             plan1.examined.len(),
             3,
@@ -1690,7 +1780,7 @@ mod scan_core_tests {
             ScanCursor(8),
             "cursor resumes at the next group"
         );
-        let plan2 = scan_plan(&o, plan1.next, 1);
+        let plan2 = scan_plan(&o, plan1.next, 1, 0);
         assert_eq!(plan2.examined, vec![&b"d"[..]]);
         assert!(plan2.next.is_start(), "complete after the last group");
     }
@@ -1701,7 +1791,7 @@ mod scan_core_tests {
         // the next cursor is strictly greater than 0. A returned 0 thus unambiguously
         // means complete, never "resume from the 0-hash key".
         let o = order(&[(0, b"zero"), (1, b"one"), (2, b"two")]);
-        let plan = scan_plan(&o, ScanCursor::START, 1);
+        let plan = scan_plan(&o, ScanCursor::START, 1, 0);
         assert!(
             plan.examined.contains(&&b"zero"[..]),
             "0-hash key examined first"
@@ -1720,9 +1810,60 @@ mod scan_core_tests {
     fn count_is_a_hint_examined_count_bounds_the_batch() {
         // With distinct hashes and COUNT 2, the first batch examines exactly 2 keys.
         let o = order(&[(1, b"a"), (2, b"b"), (3, b"c"), (4, b"d"), (5, b"e")]);
-        let plan = scan_plan(&o, ScanCursor::START, 2);
+        let plan = scan_plan(&o, ScanCursor::START, 2, 0);
         assert_eq!(plan.examined.len(), 2);
         assert_eq!(plan.next, ScanCursor(3), "resume at the 3rd key's hash");
+    }
+
+    #[test]
+    fn band_aligned_next_cursor_clears_low_bits() {
+        // FIX 1: with band_bits=8 the next cursor is the BAND FLOOR of the first
+        // un-examined key (low 8 bits cleared), so the composite cursor's `>> 8` encode
+        // is LOSSLESS. Two keys share the band [0x100, 0x1FF]; the next un-examined key
+        // 0x205 floors to 0x200.
+        let o = order(&[(0x105, b"a"), (0x1A0, b"b"), (0x205, b"c")]);
+        let plan = scan_plan(&o, ScanCursor::START, 1, 8);
+        // The whole [0x100, 0x1FF] band must be emitted in the first batch (a band is
+        // never split), and the next cursor is the floor of 0x205 -> 0x200.
+        assert_eq!(plan.examined.len(), 2, "whole band emitted, never split");
+        assert_eq!(
+            plan.next,
+            ScanCursor(0x200),
+            "next cursor is the band floor"
+        );
+        assert_eq!(plan.next.0 & 0xFF, 0, "low 8 bits cleared (band-aligned)");
+    }
+
+    #[test]
+    fn dense_band_terminates_and_visits_every_key_with_band_bits() {
+        // FIX 1 (the regression guard at the cursor-core level): a DENSE 256-band -- many
+        // keys whose hashes share the top 56 bits (all in band 0x300 = [0x300, 0x3FF]) --
+        // plus keys outside it. With band_bits=8 and COUNT 1 the loop MUST terminate (the
+        // band-aligned cursor strictly advances by >= one band, never re-floors into the
+        // same band forever) and visit every key. Before the band-alignment fix, the
+        // non-aligned next cursor inside a dense band would not advance the composite
+        // cursor and the SCAN loop would never terminate.
+        let dense: Vec<(u64, &'static [u8])> = vec![
+            (0x300, b"d0"),
+            (0x305, b"d1"),
+            (0x310, b"d2"),
+            (0x3AB, b"d3"),
+            (0x3FF, b"d4"),
+            (0x100, b"before"),
+            (0x900, b"after0"),
+            (0x9FF, b"after1"),
+        ];
+        let o = order(&dense);
+        // COUNT 1 (the worst case) and COUNT 3, both must terminate + cover.
+        for count in [1usize, 3] {
+            let visited = drive_bands(&o, count, 8);
+            let mut got: Vec<&[u8]> = visited.clone();
+            got.sort_unstable();
+            got.dedup();
+            let mut expect: Vec<&[u8]> = dense.iter().map(|&(_, k)| k).collect();
+            expect.sort_unstable();
+            assert_eq!(got, expect, "every key visited (count={count})");
+        }
     }
 }
 

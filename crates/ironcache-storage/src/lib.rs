@@ -1796,6 +1796,94 @@ impl ScanCursor {
         }
         Some(ScanCursor(acc))
     }
+
+    /// The number of HIGH bits of a COMPOSITE cross-shard SCAN cursor reserved for the
+    /// shard index (COORDINATOR.md #107, the whole-keyspace fan-out). 8 bits supports up
+    /// to 256 shards in the fan-out; the remaining `64 - 8 = 56` low bits carry the
+    /// owning shard's inner [`ScanCursor`] (`scan_hash`) position. See [`Self::compose`]
+    /// for the bit math and the round-DOWN safety argument.
+    pub const SHARD_BITS: u32 = 8;
+
+    /// The maximum number of shards a composite cursor can address (`2^SHARD_BITS`):
+    /// the shard index must fit the reserved high field. [`Config::validate`] HARD-FAILS
+    /// boot when `shards > MAX_SHARDS` (the single enforcement site:
+    /// `ironcache-config`'s `Config::validate`, referencing THIS const), so an over-count
+    /// is a loud, deterministic config error at startup, never a silent data-dependent
+    /// cursor corruption. [`Self::compose`] also `assert!`s it as a belt-and-suspenders
+    /// invariant on the (cold) SCAN-coordination path.
+    ///
+    /// [`Config::validate`]: https://docs.rs/ironcache-config
+    pub const MAX_SHARDS: usize = 1usize << Self::SHARD_BITS;
+
+    /// Build the COMPOSITE cross-shard SCAN wire cursor for `(shard_idx, inner)` over
+    /// `n_shards` (COORDINATOR.md #107). The composite walks shards one at a time: the
+    /// HIGH [`Self::SHARD_BITS`] bits carry `shard_idx`, the LOW `64 - SHARD_BITS` bits
+    /// carry the owning shard's inner `scan_hash` resume position.
+    ///
+    /// ## n_shards == 1 is BYTE-IDENTICAL to the single-shard cursor
+    ///
+    /// With one shard there is no shard field to multiplex, so the inner cursor passes
+    /// through VERBATIM (`compose(0, inner, 1) == inner`): the full 64 bits are the
+    /// intra-shard hash exactly as today, so the wire token and every existing SCAN test
+    /// are unchanged. The packed encoding engages only when `n_shards > 1`.
+    ///
+    /// ## The round-DOWN safety argument (why a truncating shift is correct)
+    ///
+    /// For `n_shards > 1` the inner hash is RIGHT-shifted by `SHARD_BITS` to free the high
+    /// field: `composite = (shard_idx << LOW) | (inner >> SHARD_BITS)`. On decode the
+    /// inner threshold is reconstructed with its low `SHARD_BITS` bits CLEARED (rounded
+    /// DOWN to a multiple of `2^SHARD_BITS`). Because the store resumes a scan at
+    /// `scan_hash >= cursor` (INCLUSIVE), a threshold rounded DOWN can only RE-VISIT
+    /// already-emitted keys in a bounded `< 2^SHARD_BITS`-wide hash band, NEVER skip an
+    /// un-examined key (SCAN explicitly permits duplicate emissions). Rounding UP would
+    /// skip the `[true_hash, rounded_up)` band, so the truncating shift (round toward 0)
+    /// is the load-bearing safe direction. The inner hash is full-range u64; we do NOT
+    /// assume it fits in `LOW` bits, we only lower the resume RESOLUTION, which the
+    /// inclusive resume makes safe.
+    ///
+    /// # Panics
+    ///
+    /// Panics (in RELEASE too) if `shard_idx >= n_shards` or `n_shards > MAX_SHARDS`. Both
+    /// are coordinator wiring bugs never reachable from key DATA, and `n_shards >
+    /// MAX_SHARDS` is already rejected at boot by `Config::validate`; the `assert!`s here
+    /// are a loud belt-and-suspenders guard on the COLD SCAN-coordination path (not a
+    /// per-key hot path), so a future un-validated caller corrupts loudly, not silently.
+    #[must_use]
+    pub fn compose(shard_idx: usize, inner: ScanCursor, n_shards: usize) -> ScanCursor {
+        if n_shards <= 1 {
+            // Single (or degenerate zero) shard: pass the inner cursor through unchanged
+            // (byte-identical token). Checked BEFORE the multi-shard asserts so the
+            // single-shard / `max(1)` degenerate path is always a clean identity.
+            return inner;
+        }
+        assert!(shard_idx < n_shards, "compose: shard_idx out of range");
+        assert!(n_shards <= Self::MAX_SHARDS, "compose: too many shards");
+        let low = 64 - Self::SHARD_BITS;
+        let shard_field = (shard_idx as u64) << low;
+        // Truncating right-shift frees the high field AND rounds the threshold DOWN.
+        let inner_field = inner.0 >> Self::SHARD_BITS;
+        ScanCursor(shard_field | inner_field)
+    }
+
+    /// Decode a COMPOSITE cross-shard SCAN cursor (the inverse of [`Self::compose`]) into
+    /// `(shard_idx, inner_resume)` over `n_shards` (COORDINATOR.md #107).
+    ///
+    /// `inner_resume` is the inner [`ScanCursor`] threshold to pass to that shard's
+    /// `scan_step`, with its low [`Self::SHARD_BITS`] bits CLEARED (rounded DOWN; see
+    /// [`Self::compose`] for why that is safe). With `n_shards <= 1` the cursor IS the
+    /// inner cursor and decodes to `(0, self)` (byte-identical passthrough).
+    #[must_use]
+    pub fn decompose(self, n_shards: usize) -> (usize, ScanCursor) {
+        if n_shards <= 1 {
+            return (0, self);
+        }
+        let low = 64 - Self::SHARD_BITS;
+        let shard_idx = (self.0 >> low) as usize;
+        let low_mask = (1u64 << low) - 1;
+        // Restore the inner threshold with its low SHARD_BITS bits cleared (round DOWN).
+        let inner_resume = (self.0 & low_mask) << Self::SHARD_BITS;
+        (shard_idx, ScanCursor(inner_resume))
+    }
 }
 
 /// How [`Keyspace::move_object`] relocates the source value (RENAME/RENAMENX/MOVE
@@ -1999,5 +2087,85 @@ mod tests {
         assert_eq!(ScanCursor::from_token(b"12x"), None);
         // Overflow past u64.
         assert_eq!(ScanCursor::from_token(b"18446744073709551616"), None);
+    }
+
+    #[test]
+    fn composite_cursor_n1_is_byte_identical_passthrough() {
+        // The freeze-sensitive guarantee: with n_shards == 1 the composite cursor IS the
+        // inner cursor, bit-for-bit, so the existing single-shard SCAN wire tokens never
+        // change. compose(0, inner, 1) == inner and decompose(.., 1) == (0, inner) for
+        // EVERY inner value, including the full-range edges.
+        for raw in [0u64, 1, 42, 255, 256, 0x00FF_FFFF_FFFF_FFFF, u64::MAX] {
+            let inner = ScanCursor(raw);
+            assert_eq!(
+                ScanCursor::compose(0, inner, 1),
+                inner,
+                "n=1 compose must be identity for {raw}"
+            );
+            assert_eq!(
+                inner.decompose(1),
+                (0, inner),
+                "n=1 decompose must be identity for {raw}"
+            );
+            // n_shards == 0 (degenerate; the coordinator passes max(1)) also passes through.
+            assert_eq!(ScanCursor::compose(0, inner, 0), inner);
+        }
+    }
+
+    #[test]
+    fn composite_cursor_packs_shard_index_in_high_bits() {
+        // For n_shards > 1 the shard index lands in the high SHARD_BITS bits and the
+        // inner hash in the low bits. decompose recovers the shard index EXACTLY (it is a
+        // small integer that never overflows the field) and the inner threshold rounded
+        // DOWN to a multiple of 2^SHARD_BITS.
+        let n = 8usize;
+        for shard_idx in 0..n {
+            for raw in [0u64, 1, 0x1234_5678_9ABC_DEF0, u64::MAX, 0xFF, 0x100] {
+                let composite = ScanCursor::compose(shard_idx, ScanCursor(raw), n);
+                let (got_shard, inner_resume) = composite.decompose(n);
+                assert_eq!(got_shard, shard_idx, "shard index must round-trip exactly");
+                // The inner threshold is the input rounded DOWN to a 2^SHARD_BITS multiple.
+                let expected = raw & !((1u64 << ScanCursor::SHARD_BITS) - 1);
+                assert_eq!(
+                    inner_resume.0, expected,
+                    "inner threshold must be raw rounded DOWN (raw={raw:#x})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composite_inner_threshold_only_rounds_down_never_up() {
+        // The load-bearing safety property: the reconstructed inner threshold is ALWAYS
+        // <= the original (round toward 0), with error strictly < 2^SHARD_BITS. A threshold
+        // rounded UP would skip keys under the inclusive `>=` resume; rounding DOWN only
+        // ever re-visits. Hammer many hashes to prove the direction + the bound.
+        let n = 16usize;
+        let step = (1u64 << 56) - 7; // a coprime-ish stride to sweep the space
+        let mut h = 1u64;
+        for _ in 0..10_000 {
+            let composite = ScanCursor::compose(3, ScanCursor(h), n);
+            let (_shard, inner_resume) = composite.decompose(n);
+            assert!(
+                inner_resume.0 <= h,
+                "threshold must round DOWN, never up (h={h:#x})"
+            );
+            assert!(
+                h - inner_resume.0 < (1u64 << ScanCursor::SHARD_BITS),
+                "round-down error must be < 2^SHARD_BITS (h={h:#x})"
+            );
+            h = h.wrapping_add(step);
+        }
+    }
+
+    #[test]
+    fn composite_max_shards_field_holds_the_top_index() {
+        // The largest addressable shard index (MAX_SHARDS - 1) still fits the high field
+        // and round-trips, confirming the documented shard-count ceiling.
+        let n = ScanCursor::MAX_SHARDS;
+        let top = n - 1;
+        let composite = ScanCursor::compose(top, ScanCursor(0xABCD), n);
+        let (got, _inner) = composite.decompose(n);
+        assert_eq!(got, top, "the top shard index must fit SHARD_BITS");
     }
 }
