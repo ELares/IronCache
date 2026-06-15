@@ -76,6 +76,37 @@ pub const DEFAULT_ZSET_MAX_LISTPACK_ENTRIES: usize = 128;
 /// PR-6/7 share the pinned default.
 pub const DEFAULT_HASH_MAX_LISTPACK_VALUE: usize = 64;
 
+/// The default ALL-INTEGER set element-count cap for the `intset` encoding
+/// (`set-max-intset-entries`, default 512; verified against Redis 7.4 `config.c` /
+/// `t_set.c` and the pinned claims [redis-set-encoding-defaults] /
+/// [redis-set-encodings-thresholds]). An all-integer set stays `intset` (a sorted
+/// integer array, binary-search membership) while its member count is at or below this;
+/// growth PAST it converts away from `intset`. Because 512 > the 128 listpack-entries
+/// cap below, an integer set that exceeds 512 members goes STRAIGHT to `hashtable` (it
+/// cannot fit the 128-member listpack). This is the SET-specific intset cap, DISTINCT
+/// from the hash 512 entry cap ([`DEFAULT_HASH_MAX_LISTPACK_ENTRIES`], a different param
+/// that happens to share the 512 value) and from the set listpack-entries cap below.
+/// Wired into the set encoding logic in PR-7.
+pub const DEFAULT_SET_MAX_INTSET_ENTRIES: usize = 512;
+
+/// The default per-collection element-count cap for a SET `listpack`
+/// (`set-max-listpack-entries`, default 128; [redis-set-encodings-thresholds]). Once an
+/// all-integer set takes a NON-integer member (leaving `intset`) it becomes `listpack`
+/// IFF the resulting member count is at or below this AND every member byte length is at
+/// or below [`DEFAULT_SET_MAX_LISTPACK_VALUE`]; otherwise it becomes `hashtable`. A
+/// listpack set that grows past this (or past the per-member byte cap) converts to
+/// `hashtable`. This SHARES the 128 value with the ZSET listpack cap
+/// ([`DEFAULT_ZSET_MAX_LISTPACK_ENTRIES`]) but is a SEPARATE Redis parameter.
+pub const DEFAULT_SET_MAX_LISTPACK_ENTRIES: usize = 128;
+
+/// The default per-member BYTE cap for a SET `listpack` (`set-max-listpack-value`,
+/// default 64; [redis-set-encodings-thresholds]). A listpack set whose ANY member byte
+/// length exceeds this converts to `hashtable`, EVEN when it has few members (the byte
+/// cap is per-member, not a total). The SET companion to
+/// [`DEFAULT_SET_MAX_LISTPACK_ENTRIES`] (the entry cap). Wired into the set encoding
+/// logic in PR-7.
+pub const DEFAULT_SET_MAX_LISTPACK_VALUE: usize = 64;
+
 /// The Redis `list-max-listpack-size` default SPELLING (`-2` = "8 KB per node"). This
 /// is what `CONFIG GET list-max-listpack-size` echoes (the configured Redis form),
 /// while the store works in the resolved byte budget
