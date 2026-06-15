@@ -111,6 +111,13 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             | b"SETBIT"
             | b"BITOP"
             | b"BITFIELD"
+            // HyperLogLog writes that allocate value bytes (PR-11). PFADD creates/updates
+            // the dense (12304-byte) backing string; PFMERGE materializes the union at
+            // the destination. Both are `denyoom` in Redis. PFCOUNT is read-only (it
+            // always recomputes the cardinality, never writing back a cache), so it is
+            // NOT gated.
+            | b"PFADD"
+            | b"PFMERGE"
     )
 }
 
@@ -166,6 +173,9 @@ mod tests {
             b"SETBIT",
             b"BITOP",
             b"BITFIELD",
+            // HyperLogLog writes (PR-11).
+            b"PFADD",
+            b"PFMERGE",
         ] {
             assert!(is_denyoom(w), "{w:?} should be denyoom");
         }
@@ -273,6 +283,8 @@ mod tests {
             b"BITCOUNT",
             b"BITPOS",
             b"BITFIELD_RO",
+            // HyperLogLog read (PR-11): PFCOUNT always recomputes, never writes.
+            b"PFCOUNT",
         ] {
             assert!(!is_denyoom(r), "{r:?} must not be denyoom");
         }
