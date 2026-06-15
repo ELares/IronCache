@@ -770,6 +770,161 @@ fn hash_commands_over_real_socket() {
 }
 
 #[test]
+fn set_commands_over_real_socket() {
+    use tokio::io::AsyncWriteExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // SADD s 1 2 3 -> :3 (three new integer members; stays intset).
+        client
+            .write_all(b"*5\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+
+        // TYPE s -> +set.
+        client
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$1\r\ns\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+set\r\n").await;
+
+        // SCARD s -> :3.
+        client
+            .write_all(b"*2\r\n$5\r\nSCARD\r\n$1\r\ns\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+
+        // OBJECT ENCODING s -> intset (all-integer, small).
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\ns\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$6\r\nintset\r\n").await;
+
+        // SMEMBERS s -> a 3-element array (intset is ascending: 1,2,3).
+        client
+            .write_all(b"*2\r\n$8\r\nSMEMBERS\r\n$1\r\ns\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n").await;
+
+        // A member over the 64-byte cap (after a non-integer forces listpack, then the big
+        // member forces hashtable): OBJECT ENCODING s -> hashtable.
+        client
+            .write_all(b"*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$2\r\nxy\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":1\r\n").await;
+        let big = vec![b'q'; 100];
+        let mut frame = format!("*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n${}\r\n", big.len()).into_bytes();
+        frame.extend_from_slice(&big);
+        frame.extend_from_slice(b"\r\n");
+        client.write_all(&frame).await.unwrap();
+        expect_reply(&mut client, b":1\r\n").await;
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\ns\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$9\r\nhashtable\r\n").await;
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
+#[test]
+fn set_store_and_wrongtype_over_real_socket() {
+    use tokio::io::AsyncWriteExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // SINTERSTORE over a socket: a={1,2,3}, b={2,3,4} -> dest={2,3} (cardinality 2).
+        client
+            .write_all(b"*5\r\n$4\r\nSADD\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+        client
+            .write_all(b"*5\r\n$4\r\nSADD\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\n3\r\n$1\r\n4\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+        client
+            .write_all(b"*4\r\n$11\r\nSINTERSTORE\r\n$4\r\ndest\r\n$1\r\na\r\n$1\r\nb\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":2\r\n").await;
+        // SMEMBERS dest -> {2,3} (intset ascending).
+        client
+            .write_all(b"*2\r\n$8\r\nSMEMBERS\r\n$4\r\ndest\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"*2\r\n$1\r\n2\r\n$1\r\n3\r\n").await;
+
+        // SREM dest 2 3 empties dest -> the key is gone (EXISTS dest -> :0).
+        client
+            .write_all(b"*4\r\n$4\r\nSREM\r\n$4\r\ndest\r\n$1\r\n2\r\n$1\r\n3\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":2\r\n").await;
+        client
+            .write_all(b"*2\r\n$6\r\nEXISTS\r\n$4\r\ndest\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+
+        // WRONGTYPE: a set command on a string key.
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nstr\r\n$1\r\nv\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*3\r\n$4\r\nSADD\r\n$3\r\nstr\r\n$1\r\na\r\n")
+            .await
+            .unwrap();
+        expect_reply(
+            &mut client,
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+        )
+        .await;
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
+#[test]
 fn unknown_command_error_over_socket() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rt = tokio::runtime::Builder::new_current_thread()

@@ -536,6 +536,35 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "MAXLEN can't be negative")
     }
 
+    /// `ERR numkeys should be greater than 0` - the reply Redis emits (src/t_set.c
+    /// `sintercardCommand` -> `addReplyError(c, "numkeys should be greater than 0")`) when
+    /// SINTERCARD's `numkeys` argument is <= 0. Byte-exact. A NON-integer numkeys is the
+    /// separate not-an-integer error; this is specifically the non-positive case.
+    #[must_use]
+    pub fn numkeys_should_be_positive() -> Self {
+        ErrorReply::new(ErrorCode::Err, "numkeys should be greater than 0")
+    }
+
+    /// `ERR Number of keys can't be greater than number of args` - the reply Redis emits
+    /// (src/t_set.c `sintercardCommand`) when SINTERCARD's `numkeys` exceeds the number of
+    /// key arguments actually supplied. Byte-exact.
+    #[must_use]
+    pub fn numkeys_greater_than_args() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "Number of keys can't be greater than number of args",
+        )
+    }
+
+    /// `ERR LIMIT can't be negative` - the reply Redis emits (src/t_set.c
+    /// `sintercardCommand`) when SINTERCARD's optional `LIMIT` argument is negative.
+    /// Byte-exact. A NON-integer LIMIT is the separate not-an-integer error; this is
+    /// specifically the negative case.
+    #[must_use]
+    pub fn limit_cant_be_negative() -> Self {
+        ErrorReply::new(ErrorCode::Err, "LIMIT can't be negative")
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free
@@ -829,6 +858,25 @@ mod tests {
         assert_eq!(
             ErrorReply::increment_nan_or_inf().line(),
             "-ERR increment would produce NaN or Infinity"
+        );
+    }
+
+    #[test]
+    fn set_errors_are_byte_exact() {
+        // Verified against redis/redis src/t_set.c sintercardCommand: the numkeys and LIMIT
+        // option errors. All use the plain `ERR` token and are DISTINCT from the generic
+        // not-an-integer error (a non-integer numkeys/LIMIT is thrown by the parse).
+        assert_eq!(
+            ErrorReply::numkeys_should_be_positive().line(),
+            "-ERR numkeys should be greater than 0"
+        );
+        assert_eq!(
+            ErrorReply::numkeys_greater_than_args().line(),
+            "-ERR Number of keys can't be greater than number of args"
+        );
+        assert_eq!(
+            ErrorReply::limit_cant_be_negative().line(),
+            "-ERR LIMIT can't be negative"
         );
     }
 

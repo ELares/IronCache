@@ -11,7 +11,9 @@
 
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
-use crate::{cmd_config, cmd_expire, cmd_hash, cmd_introspect, cmd_keyspace, cmd_list, cmd_string};
+use crate::{
+    cmd_config, cmd_expire, cmd_hash, cmd_introspect, cmd_keyspace, cmd_list, cmd_set, cmd_string,
+};
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
 use ironcache_expiry::TimingWheel;
@@ -459,6 +461,42 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
             cmd_hash::cmd_hrandfield(store, db, seed, now, req)
         }
         b"HSCAN" => cmd_hash::cmd_hscan(store, db, now, req),
+        // -- Set commands (PR-7) over the in-place-mutation RMW extension. Mutating
+        // commands route through `rmw_mut` (OccupiedMut/Mutated) or Insert (create) /
+        // Delete (emptied); reads through `rmw_mut` with Keep. WRONGTYPE on a non-set; a
+        // MISSING source key is treated as an EMPTY set for the read/algebra commands.
+        // SPOP/SRANDMEMBER randomness enters through the Env RNG seam (the caller draws the
+        // seed here, like HRANDFIELD/RANDOMKEY). SSCAN reuses the SCAN hash-ordered cursor
+        // over the set's own member table. The multi-key reads (SINTER/...) and the *STORE
+        // writes operate on this connection's accept shard (single-shard-per-connection,
+        // like the keyspace commands); no cross-shard fan-out. --
+        b"SADD" => cmd_set::cmd_sadd(store, db, now, req),
+        b"SREM" => cmd_set::cmd_srem(store, db, now, req),
+        b"SMEMBERS" => cmd_set::cmd_smembers(store, db, now, req),
+        b"SISMEMBER" => cmd_set::cmd_sismember(store, db, now, req),
+        b"SMISMEMBER" => cmd_set::cmd_smismember(store, db, now, req),
+        b"SCARD" => cmd_set::cmd_scard(store, db, now, req),
+        b"SPOP" => {
+            // SPOP's randomness enters through the Env RNG seam (ADR-0003): the CALLER
+            // draws the seed here and passes it in; the store + handler read no RNG. Draw
+            // ONLY for SPOP so the per-command RNG stream is not perturbed by other
+            // commands (mirrors the HRANDFIELD/RANDOMKEY draw blocks).
+            let seed = env.rng().next_u64();
+            cmd_set::cmd_spop(store, db, seed, now, req)
+        }
+        b"SRANDMEMBER" => {
+            let seed = env.rng().next_u64();
+            cmd_set::cmd_srandmember(store, db, seed, now, req)
+        }
+        b"SMOVE" => cmd_set::cmd_smove(store, db, now, req),
+        b"SINTER" => cmd_set::cmd_sinter(store, db, now, req),
+        b"SUNION" => cmd_set::cmd_sunion(store, db, now, req),
+        b"SDIFF" => cmd_set::cmd_sdiff(store, db, now, req),
+        b"SINTERCARD" => cmd_set::cmd_sintercard(store, db, now, req),
+        b"SINTERSTORE" => cmd_set::cmd_sinterstore(store, db, now, req),
+        b"SUNIONSTORE" => cmd_set::cmd_sunionstore(store, db, now, req),
+        b"SDIFFSTORE" => cmd_set::cmd_sdiffstore(store, db, now, req),
+        b"SSCAN" => cmd_set::cmd_sscan(store, db, now, req),
         // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
         b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
         _ => {
@@ -3943,6 +3981,54 @@ mod tests {
         let a = run_on(&c, &mut s, &mut st, t, &[b"RANDOMKEY"]);
         let b = run_on(&c, &mut s, &mut st, t, &[b"RANDOMKEY"]);
         assert_eq!(a, b, "RANDOMKEY deterministic under a seeded env");
+    }
+
+    #[test]
+    fn set_spop_srandmember_sscan_are_deterministic_through_the_env_seam() {
+        // ADR-0003: SPOP/SRANDMEMBER draw their seed from the Env RNG via dispatch (the
+        // caller-draws seam); SSCAN reads no RNG. `run_on` builds a fresh TestEnv(seed=1)
+        // each call, so the first RNG draw (the SPOP/SRANDMEMBER seed) is identical across
+        // calls, yielding the same selection. This pins that the randomness enters through
+        // the seam (the store/handler read no RNG) and is deterministic for a fixed seed.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"SADD", b"k", b"a", b"b", b"c", b"d", b"e"],
+        );
+        // SRANDMEMBER (no removal): two calls with the same fresh-seed env match.
+        let rand_a = run_on(&c, &mut s, &mut st, t, &[b"SRANDMEMBER", b"k", b"3"]);
+        let rand_b = run_on(&c, &mut s, &mut st, t, &[b"SRANDMEMBER", b"k", b"3"]);
+        assert_eq!(
+            rand_a, rand_b,
+            "SRANDMEMBER deterministic under the seeded env"
+        );
+
+        // SSCAN reads no RNG: identical across calls (cursor 0, small set -> all at once).
+        let scan_a = run_on(&c, &mut s, &mut st, t, &[b"SSCAN", b"k", b"0"]);
+        let scan_b = run_on(&c, &mut s, &mut st, t, &[b"SSCAN", b"k", b"0"]);
+        assert_eq!(scan_a, scan_b, "SSCAN deterministic (reads no RNG)");
+
+        // SPOP on two FRESH identical stores with the same seeded env pops the SAME member.
+        let mut st1 = test_store(c.databases);
+        let mut st2 = test_store(c.databases);
+        for store in [&mut st1, &mut st2] {
+            run_on(
+                &c,
+                &mut s,
+                store,
+                t,
+                &[b"SADD", b"k", b"a", b"b", b"c", b"d"],
+            );
+        }
+        let p1 = run_on(&c, &mut s, &mut st1, t, &[b"SPOP", b"k"]);
+        let p2 = run_on(&c, &mut s, &mut st2, t, &[b"SPOP", b"k"]);
+        assert_eq!(p1, p2, "SPOP deterministic under the seeded env");
     }
 
     #[test]
