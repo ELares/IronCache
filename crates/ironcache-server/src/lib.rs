@@ -45,6 +45,21 @@ pub use cmd_set::{ICSTORESET, SetOp, set_combine};
 // (client-unreachable; only the coordinator issues it to write a spanning zset *STORE /
 // ZRANGESTORE result to the dest owner).
 pub use cmd_zset::{AggOp, Aggregate, ICSTOREZSET, ScoredMember, WeightedSource, zset_combine};
+// The PURE BITOP combiner (the single source of truth shared by the single-shard BITOP
+// handler and the cross-shard coordinator's gather-combine, COORDINATOR.md #107, Stage
+// 2b-3). The cross-shard BITOP reuses a plain routed `SET dest <bytes>` for its dest write
+// (SET clears the dest TTL by default, matching BITOP's blind-overwrite-clear-TTL), so
+// there is NO internal BITOP write verb.
+pub use cmd_bitmap::bitop_compute;
+// The PURE HyperLogLog union + estimator primitives (the single source of truth shared by
+// the single-shard PFCOUNT/PFMERGE handlers and the cross-shard coordinator's
+// gather-union-estimate, COORDINATOR.md #107, Stage 2b-3), plus the INTERNAL `__ICSTOREHLL`
+// dest-write verb token (client-unreachable; only the coordinator issues it to write a
+// merged HLL to the PFMERGE dest owner with the dest TTL PRESERVED).
+pub use cmd_hll::{
+    HLL_REGISTERS, ICSTOREHLL, dense_from_regs, estimate_reply, is_valid_dense, merge_into,
+    regs_reghisto,
+};
 // The #89 single-source-of-truth command registry. `CommandClass` is also re-exported via
 // `route` (its legacy path) below; `Arity` is re-exported via `cmd_txn` (its legacy path).
 pub use command_spec::{Arity, CommandSpec, KeySpecKind, spec_of};

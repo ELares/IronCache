@@ -46,8 +46,10 @@ use ironcache_storage::{
 
 /// The HLL precision: 2^14 = 16384 registers (Redis `HLL_P`).
 const HLL_P: u32 = 14;
-/// The number of registers, 2^P (Redis `HLL_REGISTERS`).
-const HLL_REGISTERS: usize = 1 << HLL_P; // 16384
+/// The number of registers, 2^P (Redis `HLL_REGISTERS`). `pub` so the cross-shard
+/// coordinator can size its working union register array to the EXACT same width as the
+/// single-shard estimator (COORDINATOR.md #107, Stage 2b-3).
+pub const HLL_REGISTERS: usize = 1 << HLL_P; // 16384
 /// Bits per dense register (Redis `HLL_BITS`).
 const HLL_BITS: usize = 6;
 /// The maximum value a 6-bit register can hold (Redis `HLL_REGISTER_MAX`).
@@ -205,8 +207,11 @@ fn mark_cache_invalid(buf: &mut [u8]) {
 /// Whether `bytes` is a valid DENSE HLL object: the exact dense length, the `HYLL`
 /// magic, and the dense encoding tag. A string that is not a valid (dense) HLL is the
 /// [`ErrorReply::hll_invalid_value`] error; a non-string is WRONGTYPE (checked by the
-/// caller before this).
-fn is_valid_dense(bytes: &[u8]) -> bool {
+/// caller before this). `pub` so the cross-shard coordinator validates a GET-gathered HLL
+/// string on the home core with the EXACT same check as the single-shard handler
+/// (COORDINATOR.md #107, Stage 2b-3).
+#[must_use]
+pub fn is_valid_dense(bytes: &[u8]) -> bool {
     bytes.len() == HLL_DENSE_SIZE && &bytes[0..4] == b"HYLL" && bytes[4] == HLL_DENSE
 }
 
@@ -237,8 +242,12 @@ fn dense_add(obj: &mut [u8], element: &[u8]) -> bool {
 
 /// Merge the source dense object's registers into `max_regs` (per-register max), where
 /// `max_regs` is a working array of 16384 register values. Used by PFCOUNT (multi-key
-/// union) and PFMERGE.
-fn merge_into(max_regs: &mut [u8; HLL_REGISTERS], src_obj: &[u8]) {
+/// union) and PFMERGE. `pub` so the cross-shard coordinator unions the GET-gathered HLL
+/// objects with the EXACT same per-register max as the single-shard PFCOUNT/PFMERGE
+/// (COORDINATOR.md #107, Stage 2b-3); `src_obj` MUST be a validated dense object (the
+/// coordinator runs [`is_valid_dense`] on the home core first, as the single-shard handler
+/// does before this).
+pub fn merge_into(max_regs: &mut [u8; HLL_REGISTERS], src_obj: &[u8]) {
     let p = reg_block(src_obj);
     for (i, slot) in max_regs.iter_mut().enumerate() {
         let v = dense_get_register(p, i);
@@ -248,8 +257,12 @@ fn merge_into(max_regs: &mut [u8; HLL_REGISTERS], src_obj: &[u8]) {
     }
 }
 
-/// Pack a working register array back into a fresh dense object (cache-invalid).
-fn dense_from_regs(regs: &[u8; HLL_REGISTERS]) -> Vec<u8> {
+/// Pack a working register array back into a fresh dense object (cache-invalid). `pub` so
+/// the cross-shard coordinator builds the merged dense object it writes to the PFMERGE dest
+/// owner with the EXACT same byte layout as the single-shard PFMERGE (COORDINATOR.md #107,
+/// Stage 2b-3).
+#[must_use]
+pub fn dense_from_regs(regs: &[u8; HLL_REGISTERS]) -> Vec<u8> {
     let mut obj = new_dense();
     let p = reg_block_mut(&mut obj);
     for (i, &v) in regs.iter().enumerate() {
@@ -343,8 +356,11 @@ fn hll_estimate(reghisto: &[i32; 64]) -> u64 {
 /// `as i64` cast would wrap that to -1 (a negative cardinality). Redis computes
 /// `(uint64_t) llroundl(+inf)` = `LLONG_MAX` and replies that large POSITIVE value, so
 /// saturating an out-of-`i64`-range estimate to `i64::MAX` matches Redis exactly while
-/// guaranteeing PFCOUNT is never negative.
-fn estimate_reply(reghisto: &[i32; 64]) -> i64 {
+/// guaranteeing PFCOUNT is never negative. `pub` so the cross-shard coordinator's spanning
+/// PFCOUNT estimates the union with the EXACT same estimator as the single-shard PFCOUNT
+/// (COORDINATOR.md #107, Stage 2b-3), so the cross-shard count CAN NOT drift.
+#[must_use]
+pub fn estimate_reply(reghisto: &[i32; 64]) -> i64 {
     i64::try_from(hll_estimate(reghisto)).unwrap_or(i64::MAX)
 }
 
@@ -360,7 +376,11 @@ fn dense_reghisto(obj: &[u8]) -> [i32; 64] {
 }
 
 /// Build the register-value histogram from a working register array (the union path).
-fn regs_reghisto(regs: &[u8; HLL_REGISTERS]) -> [i32; 64] {
+/// `pub` so the cross-shard coordinator histograms its unioned register array with the
+/// EXACT same path as the single-shard multi-key PFCOUNT (COORDINATOR.md #107, Stage
+/// 2b-3) before calling [`estimate_reply`].
+#[must_use]
+pub fn regs_reghisto(regs: &[u8; HLL_REGISTERS]) -> [i32; 64] {
     let mut reghisto = [0i32; 64];
     for &v in regs {
         reghisto[v as usize] += 1;
@@ -523,6 +543,59 @@ pub fn cmd_pfmerge<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
     let dest = req.args[1].clone();
     store.rmw(db, &dest, now, move |_entry| RmwStep {
         action: RmwAction::Replace(NewValueOwned::Bytes(Bytes::from(merged))),
+        expire: ExpireWrite::Unchanged,
+        reply: Value::ok(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// INTERNAL cross-shard PFMERGE dest-write verb (COORDINATOR.md #107, Stage 2b-3).
+// ---------------------------------------------------------------------------
+
+/// The internal token the cross-shard coordinator uses to write a merged HLL to the
+/// PFMERGE dest owner shard (COORDINATOR.md #107, Stage 2b-3). NOT a client command: the
+/// router gates it so a client sending it gets `unknown command`; only the coordinator
+/// issues it (via `dispatch_one_value` / `run_local_keyed`) after it has GATHERED the dest
+/// plus sources cross-shard and UNIONED their registers with the shared [`merge_into`]. See
+/// [`cmd_icstorehll`].
+///
+/// Unlike the set/zset `*STORE` (a blind overwrite CLEARING the dest TTL), a single-shard
+/// PFMERGE PRESERVES the dest's existing TTL and NEVER deletes the dest (an empty merge
+/// still ensures an empty dense HLL at the dest). A plain routed `SET dest <bytes>` would
+/// CLEAR the TTL, so PFMERGE needs this dedicated TTL-preserving verb rather than reusing
+/// SET (which is what the cross-shard BITOP dest write does, since BITOP DOES clear TTL).
+pub const ICSTOREHLL: &[u8] = b"__ICSTOREHLL";
+
+/// INTERNAL: `__ICSTOREHLL dest <dense-hll-bytes>` -> `+OK`. The dest-write half of the
+/// cross-shard PFMERGE (COORDINATOR.md #107, Stage 2b-3): write the supplied dense HLL
+/// object to `dest` on its OWNER shard with the EXACT TTL-PRESERVING semantics the
+/// single-shard [`cmd_pfmerge`] uses (`RmwAction::Replace` + `ExpireWrite::Unchanged`), so
+/// a spanning PFMERGE is byte-identical to the single-shard write AND keeps any existing
+/// dest deadline (a vacant dest simply gets no TTL). The coordinator gathers + unions the
+/// dest + sources itself (the shared [`merge_into`] + [`dense_from_regs`]) and passes the
+/// already-built dense object as `args[2]`, so this verb does NO HLL math; it is purely the
+/// owner-shard write. It is a single-key write keyed on `dest` (`args[1]`), so it routes +
+/// admits like any keyed write through the existing substrate. `denyoom` (a 12304-byte
+/// value).
+///
+/// CLIENT-UNREACHABLE: this is gated out of the client command path (the serve-loop router
+/// rejects [`ICSTOREHLL`] before routing), so a client sending `__ICSTOREHLL` gets the
+/// standard unknown-command error; only the coordinator reaches this arm, via the internal
+/// `dispatch_remote_keyed` / `run_local_keyed` path.
+pub fn cmd_icstorehll<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    // `__ICSTOREHLL dest <bytes>`: exactly the dest key + the dense object.
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("__icstorehll"));
+    }
+    let dest = req.args[1].clone();
+    let obj = req.args[2].clone();
+    // TTL-PRESERVING blind write of the merged dense HLL -- the EXACT single-shard PFMERGE
+    // write (`RmwAction::Replace` + `ExpireWrite::Unchanged`): Replace on a vacant entry
+    // behaves like Insert (a fresh dest gets no TTL), and Unchanged keeps an existing dest's
+    // deadline. The coordinator already validated + unioned + packed the object, so we write
+    // it verbatim.
+    store.rmw(db, &dest, now, move |_entry| RmwStep {
+        action: RmwAction::Replace(NewValueOwned::Bytes(obj.clone())),
         expire: ExpireWrite::Unchanged,
         reply: Value::ok(),
     })

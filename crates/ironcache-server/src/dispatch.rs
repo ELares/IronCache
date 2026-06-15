@@ -829,6 +829,14 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         // CLIENT sending `__ICSTOREZSET` is rejected before routing (the serve-loop router +
         // queue-time validator gate it), so it gets unknown-command and never reaches here. --
         b"__ICSTOREZSET" => cmd_zset::cmd_icstorezset(store, db, now, req),
+        // -- INTERNAL cross-shard PFMERGE dest-write verb (COORDINATOR.md #107, Stage 2b-3).
+        // `__ICSTOREHLL dest <dense-hll-bytes>` writes a spanning-PFMERGE merged HLL to the
+        // dest owner with the EXACT TTL-PRESERVING semantics the single-shard PFMERGE uses
+        // (so an existing dest TTL survives). Reached ONLY via the coordinator's internal
+        // dispatch (`dispatch_remote_keyed` / `run_local_keyed`); a CLIENT sending
+        // `__ICSTOREHLL` is rejected before routing (the serve-loop router gates it), so it
+        // gets unknown-command and never reaches here. --
+        b"__ICSTOREHLL" => cmd_hll::cmd_icstorehll(store, db, now, req),
         _ => {
             let name = String::from_utf8_lossy(req.command()).into_owned();
             let rest: Vec<&[u8]> = req.args[1..].iter().map(bytes::Bytes::as_ref).collect();

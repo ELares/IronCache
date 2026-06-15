@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Cross-shard coordinator Stage 2b-1 (spanning SET algebra + STORE) acceptance tests
-//! (COORDINATOR.md #107).
+//! Cross-shard coordinator Stage 2b (spanning SET algebra + STORE, ZSET algebra + STORE +
+//! ZRANGESTORE, BITOP, and HyperLogLog PFCOUNT/PFMERGE) acceptance tests (COORDINATOR.md
+//! #107, Stage 2b-1 + 2b-2 + 2b-3).
 //!
 //! These boot the REAL multi-shard `run_server` on an ephemeral port (the actual
 //! SO_REUSEPORT thread-per-core topology) and drive it over real sockets, so they exercise
@@ -1308,6 +1309,592 @@ fn internal_icstorezset_verb_is_not_client_reachable() {
             assert!(
                 matches!(&r, Resp::Error(l) if String::from_utf8_lossy(l).starts_with("ERR unknown command")),
                 "lowercase __icstorezset must be unknown-command too, got {r:?}"
+            );
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+    });
+}
+
+// ===========================================================================
+// BITOP + HyperLogLog (PFCOUNT / PFMERGE) cross-shard acceptance (Stage 2b-3).
+//
+// The same headline guards as the set/zset sections: cross-shard == single-shard PARITY,
+// the write-form dest write (BITOP clears the dest TTL via a routed SET; PFMERGE PRESERVES
+// it via the internal __ICSTOREHLL verb), the BITOP empty-result dest-delete, the
+// WRONGTYPE-source ABORT leaving dest untouched, and that __ICSTOREHLL is NOT client
+// -reachable. The keys are chosen so they SPAN shards with N>1 and co-locate with N==1.
+// ===========================================================================
+
+/// `SET key value` (a raw string), asserting `+OK`.
+async fn set_str(client: &mut TcpStream, buf: &mut Vec<u8>, key: &str, value: &[u8]) {
+    let r = roundtrip(client, buf, &[b"SET", key.as_bytes(), value]).await;
+    assert!(
+        matches!(r, Resp::Simple(ref s) if s == b"OK"),
+        "SET {key} -> {r:?}"
+    );
+}
+
+/// `GET key` -> the bulk body (or `None` if the key is missing).
+async fn get_bulk(client: &mut TcpStream, buf: &mut Vec<u8>, key: &str) -> Option<Vec<u8>> {
+    match roundtrip(client, buf, &[b"GET", key.as_bytes()]).await {
+        Resp::Bulk(b) => b,
+        Resp::Null => None,
+        other => panic!("GET {key} unexpected reply {other:?}"),
+    }
+}
+
+/// `PFADD key elem...` -> the integer reply.
+async fn pfadd(client: &mut TcpStream, buf: &mut Vec<u8>, key: &str, elems: &[&str]) {
+    let mut parts: Vec<&[u8]> = vec![b"PFADD", key.as_bytes()];
+    for e in elems {
+        parts.push(e.as_bytes());
+    }
+    let r = roundtrip(client, buf, &parts).await;
+    assert!(matches!(r, Resp::Integer(_)), "PFADD {key} -> {r:?}");
+}
+
+#[test]
+fn spanning_bitop_and_or_xor_matches_single_shard_with_zero_extend() {
+    // BITOP AND/OR/XOR over UNEQUAL-length sources that SPAN shards must zero-extend to the
+    // longest and produce the byte-identical result the single-shard handler does. The dest
+    // read-back (GET) and the reply (result byte length) match across topologies.
+    //
+    // One BITOP op's reply (the result byte length) + the dest read-back, for parity compare.
+    #[derive(Debug, PartialEq, Eq)]
+    struct BitopRun {
+        op: String,
+        reply: Resp,
+        dest_bytes: Option<Vec<u8>>,
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        // src a = 0xFF 0x0F 0xAA (3 bytes); src b = 0xF0 0xFF (2 bytes, SHORTER -> zero-pad).
+        let a: &[u8] = &[0xFF, 0x0F, 0xAA];
+        let b: &[u8] = &[0xF0, 0xFF];
+        let mut results: Vec<Vec<BitopRun>> = Vec::new();
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+            set_str(&mut c, &mut buf, "bo:a", a).await;
+            set_str(&mut c, &mut buf, "bo:b", b).await;
+
+            let mut got = Vec::new();
+            for (op, dest) in [("AND", "bo:and"), ("OR", "bo:or"), ("XOR", "bo:xor")] {
+                let reply = roundtrip(
+                    &mut c,
+                    &mut buf,
+                    &[b"BITOP", op.as_bytes(), dest.as_bytes(), b"bo:a", b"bo:b"],
+                )
+                .await;
+                let dest_bytes = get_bulk(&mut c, &mut buf, dest).await;
+                got.push(BitopRun {
+                    op: op.to_string(),
+                    reply,
+                    dest_bytes,
+                });
+            }
+            results.push(got);
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+        // Parity: the 5-shard and 1-shard results are identical, AND equal the hand-computed
+        // zero-extended algebra over (a,b).
+        let n5 = &results[0];
+        let n1 = &results[1];
+        assert_eq!(n5, n1, "BITOP AND/OR/XOR parity (5 vs 1 shard)");
+        // Expected: AND = [0xF0,0x0F,0x00], OR = [0xFF,0xFF,0xAA], XOR = [0x0F,0xF0,0xAA].
+        let expect = [
+            ("AND", vec![0xF0u8, 0x0F, 0x00]),
+            ("OR", vec![0xFF, 0xFF, 0xAA]),
+            ("XOR", vec![0x0F, 0xF0, 0xAA]),
+        ];
+        for (run, (eop, ebytes)) in n5.iter().zip(expect.iter()) {
+            assert_eq!(&run.op, eop);
+            assert_eq!(
+                run.reply,
+                Resp::Integer(3),
+                "{eop} byte length is max(3,2)=3"
+            );
+            assert_eq!(
+                run.dest_bytes.as_deref(),
+                Some(ebytes.as_slice()),
+                "{eop} dest bytes"
+            );
+        }
+    });
+}
+
+#[test]
+fn spanning_bitop_not_single_source_and_arity() {
+    // BITOP NOT takes EXACTLY one source. The spanning NOT inverts the single (spanning) src
+    // byte-for-byte; NOT with >1 source is the arity error (on the home core, before gather).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+            set_str(&mut c, &mut buf, "bn:src", &[0x00, 0x0F, 0xFF]).await;
+
+            // BITOP NOT bn:dst bn:src -> 3 bytes, dst = [0xFF,0xF0,0x00].
+            let reply =
+                roundtrip(&mut c, &mut buf, &[b"BITOP", b"NOT", b"bn:dst", b"bn:src"]).await;
+            assert_eq!(reply, Resp::Integer(3), "NOT length (shards={shards})");
+            assert_eq!(
+                get_bulk(&mut c, &mut buf, "bn:dst").await.as_deref(),
+                Some([0xFFu8, 0xF0, 0x00].as_slice()),
+                "NOT dest bytes (shards={shards})"
+            );
+
+            // BITOP NOT with TWO sources -> the arity error, no write.
+            let r = roundtrip(
+                &mut c,
+                &mut buf,
+                &[b"BITOP", b"NOT", b"bn:dst2", b"bn:src", b"bn:src"],
+            )
+            .await;
+            assert!(
+                matches!(&r, Resp::Error(_)),
+                "BITOP NOT with >1 source must error, got {r:?} (shards={shards})"
+            );
+            assert_eq!(
+                roundtrip(&mut c, &mut buf, &[b"EXISTS", b"bn:dst2"]).await,
+                Resp::Integer(0),
+                "the errored BITOP NOT must not write dest (shards={shards})"
+            );
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn spanning_bitop_empty_result_deletes_dest_and_clears_ttl() {
+    // An empty BITOP result (all sources missing -> max length 0) DELETES the dest and replies
+    // 0. A non-empty BITOP write CLEARS any pre-existing dest TTL (blind overwrite via SET).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            // Pre-create dest as a STRING WITH a TTL.
+            set_str(&mut c, &mut buf, "be:dst", b"preexisting").await;
+            let r = roundtrip(&mut c, &mut buf, &[b"EXPIRE", b"be:dst", b"1000"]).await;
+            assert_eq!(r, Resp::Integer(1), "EXPIRE set (shards={shards})");
+
+            // BITOP AND over two MISSING sources -> empty result -> DEL dest, reply 0.
+            let reply = roundtrip(
+                &mut c,
+                &mut buf,
+                &[b"BITOP", b"AND", b"be:dst", b"be:miss1", b"be:miss2"],
+            )
+            .await;
+            assert_eq!(
+                reply,
+                Resp::Integer(0),
+                "empty BITOP replies 0 (shards={shards})"
+            );
+            assert_eq!(
+                roundtrip(&mut c, &mut buf, &[b"EXISTS", b"be:dst"]).await,
+                Resp::Integer(0),
+                "empty BITOP deletes dest (shards={shards})"
+            );
+
+            // Now a NON-empty BITOP write over a dest that has a TTL must CLEAR the TTL.
+            set_str(&mut c, &mut buf, "be:src", &[0xFF, 0xFF]).await;
+            set_str(&mut c, &mut buf, "be:dst2", b"old").await;
+            let r = roundtrip(&mut c, &mut buf, &[b"EXPIRE", b"be:dst2", b"1000"]).await;
+            assert_eq!(r, Resp::Integer(1), "EXPIRE dst2 (shards={shards})");
+            let reply =
+                roundtrip(&mut c, &mut buf, &[b"BITOP", b"OR", b"be:dst2", b"be:src"]).await;
+            assert_eq!(reply, Resp::Integer(2), "OR length (shards={shards})");
+            assert_eq!(
+                roundtrip(&mut c, &mut buf, &[b"TTL", b"be:dst2"]).await,
+                Resp::Integer(-1),
+                "BITOP clears dest TTL (shards={shards})"
+            );
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn spanning_bitop_wrongtype_source_aborts_before_any_write() {
+    // A non-string BITOP source -> WRONGTYPE, and the dest is left UNTOUCHED (validate all
+    // sources before the dest write).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            set_str(&mut c, &mut buf, "bw:a", &[0xFF]).await;
+            // bw:b is a SET (a non-string) -> a WRONGTYPE source.
+            sadd(&mut c, &mut buf, "bw:b", &["x"]).await;
+            // Pre-create dest so we can prove it stays untouched.
+            set_str(&mut c, &mut buf, "bw:dst", b"keepme").await;
+
+            let r = roundtrip(
+                &mut c,
+                &mut buf,
+                &[b"BITOP", b"AND", b"bw:dst", b"bw:a", b"bw:b"],
+            )
+            .await;
+            let Resp::Error(line) = r else {
+                panic!("BITOP wrong-type source must error, got {r:?} (shards={shards})");
+            };
+            assert!(
+                String::from_utf8_lossy(&line).starts_with("WRONGTYPE"),
+                "must be WRONGTYPE, got {:?} (shards={shards})",
+                String::from_utf8_lossy(&line)
+            );
+            // dest still holds its original string (no partial write).
+            assert_eq!(
+                get_bulk(&mut c, &mut buf, "bw:dst").await.as_deref(),
+                Some(b"keepme".as_slice()),
+                "dest untouched on WRONGTYPE abort (shards={shards})"
+            );
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn spanning_pfcount_union_matches_single_shard() {
+    // PFCOUNT over multiple keys that SPAN shards estimates the UNION cardinality, and the
+    // estimate equals the single-shard PFCOUNT on the same logical element sets (the SAME pure
+    // estimator). A missing key contributes nothing.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let mut counts: Vec<i64> = Vec::new();
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            // Three HLLs with OVERLAPPING element sets across keys that span shards. The union
+            // has the DISTINCT elements e0..e149 (150 distinct).
+            let g1: Vec<String> = (0..100).map(|i| format!("e{i}")).collect();
+            let g2: Vec<String> = (50..120).map(|i| format!("e{i}")).collect();
+            let g3: Vec<String> = (100..150).map(|i| format!("e{i}")).collect();
+            pfadd(
+                &mut c,
+                &mut buf,
+                "pc:a",
+                &g1.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .await;
+            pfadd(
+                &mut c,
+                &mut buf,
+                "pc:b",
+                &g2.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .await;
+            pfadd(
+                &mut c,
+                &mut buf,
+                "pc:c",
+                &g3.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .await;
+
+            // PFCOUNT over the three + a MISSING key (contributes nothing).
+            let r = roundtrip(
+                &mut c,
+                &mut buf,
+                &[b"PFCOUNT", b"pc:a", b"pc:b", b"pc:c", b"pc:missing"],
+            )
+            .await;
+            let Resp::Integer(n) = r else {
+                panic!("PFCOUNT must reply integer, got {r:?} (shards={shards})");
+            };
+            counts.push(n);
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+        // Cross-shard union estimate == single-shard estimate (byte-identical via the same
+        // estimator), and within HLL error of the true 150 distinct elements.
+        assert_eq!(counts[0], counts[1], "PFCOUNT union parity (5 vs 1 shard)");
+        let n = counts[0];
+        assert!(
+            (140..=160).contains(&n),
+            "PFCOUNT union estimate {n} should be near the 150 distinct elements"
+        );
+    });
+}
+
+#[test]
+fn spanning_pfcount_wrongtype_source_errors() {
+    // A non-string PFCOUNT source -> WRONGTYPE (PFCOUNT validates all keys first); a missing
+    // single key -> 0.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            pfadd(&mut c, &mut buf, "pw:a", &["x", "y", "z"]).await;
+            // pw:b is a SET (a non-string) -> WRONGTYPE.
+            sadd(&mut c, &mut buf, "pw:b", &["m"]).await;
+
+            let r = roundtrip(&mut c, &mut buf, &[b"PFCOUNT", b"pw:a", b"pw:b"]).await;
+            assert!(
+                matches!(&r, Resp::Error(l) if String::from_utf8_lossy(l).starts_with("WRONGTYPE")),
+                "PFCOUNT non-HLL source must be WRONGTYPE, got {r:?} (shards={shards})"
+            );
+
+            // PFCOUNT over a SINGLE missing key -> 0.
+            let r = roundtrip(&mut c, &mut buf, &[b"PFCOUNT", b"pw:missing"]).await;
+            assert_eq!(
+                r,
+                Resp::Integer(0),
+                "PFCOUNT missing key = 0 (shards={shards})"
+            );
+
+            // PFCOUNT over a missing key spanning with another missing key -> 0 (both skipped).
+            let r = roundtrip(&mut c, &mut buf, &[b"PFCOUNT", b"pw:miss1", b"pw:miss2"]).await;
+            assert_eq!(
+                r,
+                Resp::Integer(0),
+                "PFCOUNT all-missing = 0 (shards={shards})"
+            );
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn spanning_pfmerge_matches_single_shard_and_preserves_dest_ttl() {
+    // PFMERGE over sources that SPAN shards: the merged dest, read back via PFCOUNT, equals the
+    // single-shard merge. CRITICAL: PFMERGE PRESERVES an existing dest TTL (unlike *STORE which
+    // clears it), so an EXPIRE set on the dest before the merge survives.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let mut merged_counts: Vec<i64> = Vec::new();
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            let g1: Vec<String> = (0..80).map(|i| format!("m{i}")).collect();
+            let g2: Vec<String> = (40..130).map(|i| format!("m{i}")).collect();
+            pfadd(
+                &mut c,
+                &mut buf,
+                "pm:a",
+                &g1.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .await;
+            pfadd(
+                &mut c,
+                &mut buf,
+                "pm:b",
+                &g2.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .await;
+
+            // Pre-create the dest as an HLL WITH a TTL (PFADD then EXPIRE), so we can assert the
+            // TTL is PRESERVED across the merge.
+            pfadd(&mut c, &mut buf, "pm:dst", &["seed"]).await;
+            let r = roundtrip(&mut c, &mut buf, &[b"EXPIRE", b"pm:dst", b"1000"]).await;
+            assert_eq!(r, Resp::Integer(1), "EXPIRE dst (shards={shards})");
+
+            // PFMERGE pm:dst pm:a pm:b -> +OK.
+            let r = roundtrip(&mut c, &mut buf, &[b"PFMERGE", b"pm:dst", b"pm:a", b"pm:b"]).await;
+            assert!(
+                matches!(&r, Resp::Simple(s) if s == b"OK"),
+                "PFMERGE must reply +OK, got {r:?} (shards={shards})"
+            );
+
+            // The dest TTL is STILL positive (preserved, not cleared).
+            let r = roundtrip(&mut c, &mut buf, &[b"TTL", b"pm:dst"]).await;
+            match r {
+                Resp::Integer(t) => assert!(
+                    t > 0,
+                    "PFMERGE must PRESERVE the dest TTL, got TTL={t} (shards={shards})"
+                ),
+                other => panic!("TTL reply {other:?} (shards={shards})"),
+            }
+
+            // The merged cardinality (dest seed + a's 80 + b's 90, union of m0..m129 plus seed).
+            let r = roundtrip(&mut c, &mut buf, &[b"PFCOUNT", b"pm:dst"]).await;
+            let Resp::Integer(n) = r else {
+                panic!("PFCOUNT dst reply {r:?} (shards={shards})");
+            };
+            merged_counts.push(n);
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+        // The merged dest cardinality is identical cross-shard vs single-shard, and within HLL
+        // error of the 131 distinct (m0..m129 + "seed").
+        assert_eq!(
+            merged_counts[0], merged_counts[1],
+            "PFMERGE merged cardinality parity (5 vs 1 shard)"
+        );
+        let n = merged_counts[0];
+        assert!(
+            (121..=141).contains(&n),
+            "merged cardinality {n} should be near the 131 distinct elements"
+        );
+    });
+}
+
+#[test]
+fn spanning_pfmerge_empty_creates_dest() {
+    // PFMERGE with only missing sources still ENSURES the dest exists as a (possibly empty)
+    // dense HLL -- it never deletes. PFCOUNT of the freshly-created dest is 0.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            // PFMERGE pe:dst pe:missing (the only source is missing) -> +OK, dest ensured.
+            let r = roundtrip(&mut c, &mut buf, &[b"PFMERGE", b"pe:dst", b"pe:missing"]).await;
+            assert!(
+                matches!(&r, Resp::Simple(s) if s == b"OK"),
+                "empty PFMERGE -> +OK, got {r:?} (shards={shards})"
+            );
+            assert_eq!(
+                roundtrip(&mut c, &mut buf, &[b"EXISTS", b"pe:dst"]).await,
+                Resp::Integer(1),
+                "empty PFMERGE still creates dest (shards={shards})"
+            );
+            assert_eq!(
+                roundtrip(&mut c, &mut buf, &[b"PFCOUNT", b"pe:dst"]).await,
+                Resp::Integer(0),
+                "freshly-created empty dest has cardinality 0 (shards={shards})"
+            );
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn spanning_pfmerge_wrongtype_source_aborts_before_any_write() {
+    // A non-string PFMERGE source -> WRONGTYPE, and the dest is left UNTOUCHED (validate all
+    // inputs before the dest write -- no partial merge).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            pfadd(&mut c, &mut buf, "pa:a", &["x", "y"]).await;
+            // pa:b is a SET (a non-string) -> WRONGTYPE.
+            sadd(&mut c, &mut buf, "pa:b", &["m"]).await;
+
+            let r = roundtrip(&mut c, &mut buf, &[b"PFMERGE", b"pa:dst", b"pa:a", b"pa:b"]).await;
+            assert!(
+                matches!(&r, Resp::Error(l) if String::from_utf8_lossy(l).starts_with("WRONGTYPE")),
+                "PFMERGE non-HLL source must be WRONGTYPE, got {r:?} (shards={shards})"
+            );
+            // dest was never created (the abort happened before the write).
+            assert_eq!(
+                roundtrip(&mut c, &mut buf, &[b"EXISTS", b"pa:dst"]).await,
+                Resp::Integer(0),
+                "PFMERGE dest untouched on WRONGTYPE abort (shards={shards})"
+            );
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn internal_icstorehll_verb_is_not_client_reachable() {
+    // The internal __ICSTOREHLL verb (the coordinator's PFMERGE dest-write) MUST be
+    // unreachable from a client: a client sending it gets the standard unknown-command error,
+    // NOT a successful store. Both topologies.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            let r = roundtrip(&mut c, &mut buf, &[b"__ICSTOREHLL", b"hk", b"obj"]).await;
+            let Resp::Error(line) = r else {
+                panic!("__ICSTOREHLL must be rejected, got {r:?} (shards={shards})");
+            };
+            assert!(
+                String::from_utf8_lossy(&line).starts_with("ERR unknown command"),
+                "client __ICSTOREHLL must be unknown-command, got {:?} (shards={shards})",
+                String::from_utf8_lossy(&line)
+            );
+            assert_eq!(
+                roundtrip(&mut c, &mut buf, &[b"EXISTS", b"hk"]).await,
+                Resp::Integer(0),
+                "rejected __ICSTOREHLL must not have written the key (shards={shards})"
+            );
+
+            // Lowercase form too (case-insensitive).
+            let r = roundtrip(&mut c, &mut buf, &[b"__icstorehll", b"hk2", b"obj"]).await;
+            assert!(
+                matches!(&r, Resp::Error(l) if String::from_utf8_lossy(l).starts_with("ERR unknown command")),
+                "lowercase __icstorehll must be unknown-command too, got {r:?}"
             );
 
             drop(c);

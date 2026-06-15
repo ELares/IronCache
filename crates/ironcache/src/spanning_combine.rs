@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Home-core GATHER + (shared) COMBINE + STORE for the SHARD-SPANNING set-algebra AND
-//! sorted-set-algebra commands (COORDINATOR.md #107, coordinator Stage 2b-1 + 2b-2).
+//! Home-core GATHER + (shared) COMBINE + STORE for the SHARD-SPANNING set-algebra,
+//! sorted-set-algebra, BITOP, and HyperLogLog (PFCOUNT/PFMERGE) commands (COORDINATOR.md
+//! #107, coordinator Stage 2b-1 + 2b-2 + 2b-3).
 //!
 //! IronCache presents as a SINGLE NODE, so a spanning multi-key command is TRANSPARENT
 //! (gather-combine, NOT `-CROSSSLOT`): the coordinator GATHERS each source value from its
@@ -50,8 +51,9 @@ use ironcache_protocol::ErrorCode;
 use ironcache_runtime::bootstrap::ShardId;
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
-    AggOp, Aggregate, ProtoVersion, Request, ScoredMember, SetOp, Value, WeightedSource,
-    owner_shard, set_combine, zset_combine,
+    AggOp, Aggregate, HLL_REGISTERS, ProtoVersion, Request, ScoredMember, SetOp, Value,
+    WeightedSource, bitop_compute, dense_from_regs, estimate_reply, is_valid_dense, merge_into,
+    owner_shard, regs_reghisto, set_combine, zset_combine,
 };
 
 /// GATHER one source key's set members from its OWNER shard (COORDINATOR.md #107, Stage 2b):
@@ -961,6 +963,318 @@ fn parse_f64_arg(b: &[u8]) -> Option<f64> {
     }
     let v: f64 = std::str::from_utf8(b).ok()?.parse().ok()?;
     if v.is_nan() { None } else { Some(v) }
+}
+
+// ===========================================================================
+// BITOP + HyperLogLog (COORDINATOR.md #107, coordinator Stage 2b-3).
+//
+// BITOP op dest src... (write), PFCOUNT key... (read), PFMERGE dest src... (write) when
+// their keys SPAN shards. Same design as the set/zset algebra above: GATHER each source's
+// RAW STRING bytes from its owner shard (route `GET key`), COMBINE with a PURE function
+// SHARED with the single-shard handler (the one source of truth so cross-shard and
+// single-shard results CANNOT drift) -- [`bitop_compute`] for BITOP, the
+// [`merge_into`]/[`dense_from_regs`]/[`regs_reghisto`]/[`estimate_reply`] register-array ops
+// for the HLLs -- and for the WRITE forms WRITE the result to the dest owner. BITOP's dest
+// write reuses a plain routed `SET dest <bytes>` (SET clears the dest TTL by default, which
+// is exactly BITOP's blind-overwrite-clear-TTL); PFMERGE's dest write uses the internal
+// [`ironcache_server::ICSTOREHLL`] verb (TTL-PRESERVING, the one semantic that differs from
+// a plain SET and from the set/zset *STORE verbs).
+//
+// GATHER fidelity: a present STRING -> its bytes; a missing key -> None (BITOP treats a
+// missing source as an empty string the zero-pad covers; PFCOUNT/PFMERGE skip it); a
+// NON-STRING -> WRONGTYPE (a `GET` on a non-string replies WRONGTYPE) -> ABORT the whole
+// command BEFORE any write. For the HLLs a PRESENT string is additionally validated as a
+// dense HLL on the HOME core ([`is_valid_dense`]); an invalid one -> hll_invalid_value ->
+// abort. All sources are validated FIRST, so a write command never partially mutates.
+// ===========================================================================
+
+/// GATHER one key's RAW STRING bytes from its OWNER shard by routing `GET key` (the home
+/// subset runs LOCALLY + synchronously, remote keys hop), returning:
+/// - `Ok(Some(bytes))` for a present STRING;
+/// - `Ok(None)` for a MISSING key (`GET` replies a null) -- the caller treats it as an
+///   empty BITOP source / a skipped HLL;
+/// - `Err(error)` for an `Error` reply (a WRONGTYPE on a non-string, OR a shard-unavailable
+///   degradation): the caller ABORTS the whole command with that error before any write.
+///
+/// `run_local_keyed` returns before any `.await` and `dispatch_one_value` holds no home-core
+/// borrow across its hop, so this respects the no-borrow-across-await contract.
+async fn gather_string_bytes(
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    home: ShardId,
+    db: u32,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, Value> {
+    let get = Request {
+        args: vec![
+            bytes::Bytes::from_static(b"GET"),
+            bytes::Bytes::copy_from_slice(key),
+        ],
+    };
+    let value = route_to_owner(inbox, ctx, home, db, key, &get).await;
+    match value {
+        // A present string -> its raw bytes (an HLL object is a string).
+        Value::BulkString(Some(b)) => Ok(Some(b.to_vec())),
+        // A WRONGTYPE (the key is a non-string) or a shard-unavailable degradation -> abort.
+        e @ Value::Error(_) => Err(e),
+        // A missing key (Null) -- and defensively any other shape -> no contribution.
+        _ => Ok(None),
+    }
+}
+
+/// The home-core ARITY/OP check + GATHER + (shared) COMBINE + STORE for a SHARD-SPANNING
+/// `BITOP op dest src [src ...]` (COORDINATOR.md #107, Stage 2b-3), encoding the reply into
+/// `out`. The serve loop calls this when BITOP's keys (dest + sources) span shards; the
+/// co-located case routes via Stage 1.
+///
+/// MIRRORS the single-shard `cmd_bitop` EXACTLY: AND/OR/XOR take >= 1 source, NOT takes
+/// EXACTLY one (else the bitop-not-single-source error); a bad op is a syntax error; every
+/// source is read + type-validated FIRST (a non-string aborts with WRONGTYPE, dest
+/// untouched); the result is [`bitop_compute`] (the SHARED combiner, zero-extending to the
+/// longest source); an EMPTY result routes `DEL dest` and replies 0 (BITOP deletes dest on
+/// empty); a non-empty result routes `SET dest <bytes>` (a blind overwrite CLEARING the dest
+/// TTL, exactly BITOP's dest write) and replies the result length in BYTES.
+#[allow(clippy::too_many_arguments)]
+pub async fn fan_out_bitop(
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    request: &Request,
+    db: u32,
+    home: ShardId,
+    out: &mut Vec<u8>,
+    proto: ProtoVersion,
+) {
+    use ironcache_protocol::ErrorReply;
+    let reply = 'reply: {
+        // BITOP op dest src [src ...]: at least op + dest + one source (Min(4)).
+        if request.args.len() < 4 {
+            break 'reply Value::error(ErrorReply::wrong_arity("bitop"));
+        }
+        let op = request.args[1].to_ascii_uppercase();
+        if !matches!(op.as_slice(), b"AND" | b"OR" | b"XOR" | b"NOT") {
+            break 'reply Value::error(ErrorReply::syntax_error());
+        }
+        // NOT takes EXACTLY one source key (BITOP NOT dest src). The arity check runs on the
+        // home core BEFORE any gather, matching cmd_bitop.
+        if op.as_slice() == b"NOT" && request.args.len() != 4 {
+            break 'reply Value::error(ErrorReply::bitop_not_single_source());
+        }
+        let dest = request.args[2].clone();
+        let src_keys: Vec<bytes::Bytes> = request.args[3..].to_vec();
+
+        // GATHER every source's bytes, validating ALL first: a missing source is an empty
+        // string (the zero-pad in bitop_compute covers it), a non-string aborts WRONGTYPE
+        // BEFORE any dest write (dest untouched).
+        let mut sources: Vec<Vec<u8>> = Vec::with_capacity(src_keys.len());
+        for k in &src_keys {
+            match gather_string_bytes(inbox, ctx, home, db, k).await {
+                Ok(Some(b)) => sources.push(b),
+                Ok(None) => sources.push(Vec::new()),
+                Err(e) => break 'reply e,
+            }
+        }
+
+        // COMBINE via the SHARED pure combiner, then STORE to the dest owner.
+        let result = bitop_compute(op.as_slice(), &sources);
+        store_bitop_result(inbox, ctx, home, db, &dest, result).await
+    };
+    encode_into(out, &reply, proto);
+}
+
+/// Write the spanning BITOP result to `dest`'s OWNER shard with the EXACT single-shard
+/// blind-overwrite-CLEARING-TTL semantics (COORDINATOR.md #107, Stage 2b-3), returning the
+/// integer reply [`Value`]:
+/// - EMPTY result -> route `DEL dest` (BITOP deletes dest on an empty result) and reply
+///   `Integer(0)`.
+/// - non-empty result -> route `SET dest <bytes>` (a plain SET clears the dest TTL by
+///   default, exactly BITOP's dest write -- so NO internal verb is needed) and reply the
+///   result LENGTH in bytes.
+///
+/// A shard-unavailable degradation on the dest write is surfaced (the result was NOT stored).
+async fn store_bitop_result(
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    home: ShardId,
+    db: u32,
+    dest: &[u8],
+    result: Vec<u8>,
+) -> Value {
+    let len = result.len() as i64;
+    let subreq = if result.is_empty() {
+        // BITOP deletes the destination on an empty result. DEL routes to the dest owner like
+        // any keyed command; its 0/1 reply is discarded -- BITOP replies the byte length (0).
+        Request {
+            args: vec![
+                bytes::Bytes::from_static(b"DEL"),
+                bytes::Bytes::copy_from_slice(dest),
+            ],
+        }
+    } else {
+        // Blind overwrite via a plain SET (TTL CLEARED by default -- the EXACT BITOP dest
+        // write). SET dest <result-bytes>.
+        Request {
+            args: vec![
+                bytes::Bytes::from_static(b"SET"),
+                bytes::Bytes::copy_from_slice(dest),
+                bytes::Bytes::from(result),
+            ],
+        }
+    };
+    let write_reply = route_to_owner(inbox, ctx, home, db, dest, &subreq).await;
+    match write_reply {
+        Value::Error(e) => Value::Error(e),
+        _ if len == 0 => Value::Integer(0),
+        _ => Value::Integer(len),
+    }
+}
+
+/// GATHER one HLL key's registers from its OWNER shard into `max_regs` (per-register max),
+/// validating on the HOME core (COORDINATOR.md #107, Stage 2b-3). Route `GET key`: a present
+/// STRING is validated as a dense HLL via [`is_valid_dense`] (an invalid one ->
+/// hll_invalid_value abort) then unioned with the SHARED [`merge_into`]; a missing key
+/// contributes nothing; a non-string -> WRONGTYPE abort. Returns `Ok(())` on a clean gather,
+/// or `Err(error)` to abort the whole command BEFORE any write.
+async fn gather_hll_into(
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    home: ShardId,
+    db: u32,
+    key: &[u8],
+    max_regs: &mut [u8; HLL_REGISTERS],
+) -> Result<(), Value> {
+    use ironcache_protocol::ErrorReply;
+    match gather_string_bytes(inbox, ctx, home, db, key).await? {
+        Some(bytes) => {
+            // Validate on the home core with the EXACT single-shard check; an invalid dense
+            // HLL aborts before any union/write (matching cmd_pfcount/cmd_pfmerge).
+            if !is_valid_dense(&bytes) {
+                return Err(Value::error(ErrorReply::hll_invalid_value()));
+            }
+            merge_into(max_regs, &bytes);
+            Ok(())
+        }
+        // A missing key contributes nothing to the union.
+        None => Ok(()),
+    }
+}
+
+/// The home-core GATHER + (shared) UNION + ESTIMATE for a SHARD-SPANNING `PFCOUNT key
+/// [key ...]` (COORDINATOR.md #107, Stage 2b-3), encoding the integer reply into `out`. The
+/// serve loop calls this when PFCOUNT's keys span shards; the co-located case routes via
+/// Stage 1.
+///
+/// READ-ONLY (it NEVER writes -- no cross-shard cache-header update, matching the single
+/// -shard PFCOUNT). UNION the registers across every present valid HLL (a missing key
+/// contributes nothing; a non-string -> WRONGTYPE; a present-but-invalid string ->
+/// hll_invalid_value -- all validated FIRST), then estimate via the SHARED
+/// [`regs_reghisto`] + [`estimate_reply`], so the cross-shard count is the SAME as the
+/// single-shard one.
+pub async fn fan_out_pfcount(
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    request: &Request,
+    db: u32,
+    home: ShardId,
+    out: &mut Vec<u8>,
+    proto: ProtoVersion,
+) {
+    use ironcache_protocol::ErrorReply;
+    let reply = 'reply: {
+        // PFCOUNT key [key ...]: at least one key (Min(2)).
+        if request.args.len() < 2 {
+            break 'reply Value::error(ErrorReply::wrong_arity("pfcount"));
+        }
+        // HEAP-allocate the 16384-byte working register array so it does NOT inflate this
+        // (awaited) future's stack frame (the single-shard handler keeps it on the stack, but
+        // it never awaits; here a 16 KiB array in the future trips clippy::large_futures and
+        // bloats every enclosing future). The union + estimate are otherwise identical.
+        let mut max_regs = Box::new([0u8; HLL_REGISTERS]);
+        for key in &request.args[1..] {
+            if let Err(e) = gather_hll_into(inbox, ctx, home, db, key, &mut max_regs).await {
+                break 'reply e;
+            }
+        }
+        let reghisto = regs_reghisto(&max_regs);
+        Value::Integer(estimate_reply(&reghisto))
+    };
+    encode_into(out, &reply, proto);
+}
+
+/// The home-core GATHER + (shared) UNION + (TTL-preserving) STORE for a SHARD-SPANNING
+/// `PFMERGE dest src [src ...]` (COORDINATOR.md #107, Stage 2b-3), encoding the `+OK` reply
+/// into `out`. The serve loop calls this when PFMERGE's keys span shards; the co-located
+/// case routes via Stage 1.
+///
+/// MIRRORS the single-shard `cmd_pfmerge` EXACTLY: the dest counts as BOTH a source (its
+/// current registers join the union) and the write target, so gather the dest + every source
+/// FIRST (a non-string -> WRONGTYPE, a present-but-invalid -> hll_invalid_value -- validated
+/// before any write); UNION via the SHARED [`merge_into`]; build the merged dense object via
+/// [`dense_from_regs`]; write it to the dest owner via the internal
+/// [`ironcache_server::ICSTOREHLL`] verb, which PRESERVES the dest's existing TTL (the one
+/// semantic that differs from a plain SET) and NEVER deletes (an empty merge still ensures an
+/// empty dense HLL at the dest). Reply `+OK`.
+pub async fn fan_out_pfmerge(
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    request: &Request,
+    db: u32,
+    home: ShardId,
+    out: &mut Vec<u8>,
+    proto: ProtoVersion,
+) {
+    use ironcache_protocol::ErrorReply;
+    let reply = 'reply: {
+        // PFMERGE dest [src ...]: at least the dest (Min(2)). The dest is args[1] and joins
+        // the union as both a source and the target.
+        if request.args.len() < 2 {
+            break 'reply Value::error(ErrorReply::wrong_arity("pfmerge"));
+        }
+        let dest = request.args[1].clone();
+        // GATHER dest + every source into the union, validating ALL first (so a WRONGTYPE /
+        // invalid-HLL on ANY input aborts before the dest write -- no partial merge). The
+        // 16384-byte register array is HEAP-allocated to keep this awaited future small
+        // (see fan_out_pfcount).
+        let mut max_regs = Box::new([0u8; HLL_REGISTERS]);
+        for key in &request.args[1..] {
+            if let Err(e) = gather_hll_into(inbox, ctx, home, db, key, &mut max_regs).await {
+                break 'reply e;
+            }
+        }
+        // Build the merged dense object and write it TTL-PRESERVINGLY to the dest owner via
+        // the internal verb. PFMERGE never deletes on empty: an empty union still writes an
+        // (empty) dense HLL, matching the single-shard handler.
+        let merged = dense_from_regs(&max_regs);
+        store_hll_result(inbox, ctx, home, db, &dest, merged).await
+    };
+    encode_into(out, &reply, proto);
+}
+
+/// Write the spanning PFMERGE merged dense HLL `obj` to `dest`'s OWNER shard via the internal
+/// `__ICSTOREHLL dest <obj>` verb (COORDINATOR.md #107, Stage 2b-3), which uses
+/// `RmwAction::Replace` + `ExpireWrite::Unchanged` -- the EXACT single-shard PFMERGE write,
+/// PRESERVING any existing dest TTL and creating a fresh (TTL-less) dest when vacant. The
+/// verb replies `+OK`; a shard-unavailable degradation is surfaced (the merge was NOT
+/// stored).
+async fn store_hll_result(
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    home: ShardId,
+    db: u32,
+    dest: &[u8],
+    obj: Vec<u8>,
+) -> Value {
+    let subreq = Request {
+        args: vec![
+            bytes::Bytes::copy_from_slice(ironcache_server::ICSTOREHLL),
+            bytes::Bytes::copy_from_slice(dest),
+            bytes::Bytes::from(obj),
+        ],
+    };
+    match route_to_owner(inbox, ctx, home, db, dest, &subreq).await {
+        // Surface a shard-unavailable degradation; otherwise echo the verb's +OK.
+        e @ Value::Error(_) => e,
+        other => other,
+    }
 }
 
 #[cfg(test)]
