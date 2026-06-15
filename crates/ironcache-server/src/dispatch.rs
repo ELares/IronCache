@@ -12,8 +12,8 @@
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{
-    cmd_config, cmd_expire, cmd_hash, cmd_introspect, cmd_keyspace, cmd_list, cmd_set, cmd_string,
-    cmd_zset,
+    cmd_bitmap, cmd_config, cmd_expire, cmd_hash, cmd_introspect, cmd_keyspace, cmd_list, cmd_set,
+    cmd_string, cmd_zset,
 };
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
@@ -537,6 +537,21 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
         b"ZINTERSTORE" => cmd_zset::cmd_zinterstore(store, db, now, req),
         b"ZDIFFSTORE" => cmd_zset::cmd_zdiffstore(store, db, now, req),
         b"ZINTERCARD" => cmd_zset::cmd_zintercard(store, db, now, req),
+        // -- Bitmap commands (PR-9, BITMAPS.md) over the STRING type. A bitmap is the
+        // string value addressed at bit granularity (TYPE=string, OBJECT ENCODING a
+        // string encoding); these need no new type. Mutations (SETBIT, BITOP-dest,
+        // BITFIELD with SET/INCRBY) route through the string `rmw` rebuild-Replace path;
+        // reads (GETBIT/BITCOUNT/BITPOS/BITFIELD-all-GET/BITFIELD_RO) through `read`.
+        // WRONGTYPE on a non-string. BITOP is multi-key (reads sources + writes dest on
+        // this connection's accept shard, single-shard-per-connection like the other
+        // multi-key commands; an empty result deletes dest). --
+        b"SETBIT" => cmd_bitmap::cmd_setbit(store, db, now, req),
+        b"GETBIT" => cmd_bitmap::cmd_getbit(store, db, now, req),
+        b"BITCOUNT" => cmd_bitmap::cmd_bitcount(store, db, now, req),
+        b"BITPOS" => cmd_bitmap::cmd_bitpos(store, db, now, req),
+        b"BITOP" => cmd_bitmap::cmd_bitop(store, db, now, req),
+        b"BITFIELD" => cmd_bitmap::cmd_bitfield(store, db, now, req),
+        b"BITFIELD_RO" => cmd_bitmap::cmd_bitfield_ro(store, db, now, req),
         // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
         b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
         _ => {

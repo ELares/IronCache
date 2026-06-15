@@ -1089,3 +1089,97 @@ fn zset_commands_over_real_socket() {
         acceptor.await.unwrap();
     });
 }
+
+#[test]
+fn bitmap_commands_over_real_socket() {
+    use tokio::io::AsyncWriteExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // SETBIT bk 7 1 -> :0 (old bit), creates the key.
+        client
+            .write_all(b"*4\r\n$6\r\nSETBIT\r\n$2\r\nbk\r\n$1\r\n7\r\n$1\r\n1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+
+        // GETBIT bk 7 -> :1 ; GETBIT bk 6 -> :0.
+        client
+            .write_all(b"*3\r\n$6\r\nGETBIT\r\n$2\r\nbk\r\n$1\r\n7\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":1\r\n").await;
+        client
+            .write_all(b"*3\r\n$6\r\nGETBIT\r\n$2\r\nbk\r\n$1\r\n6\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+
+        // BITCOUNT bk -> :1 (one set bit).
+        client
+            .write_all(b"*2\r\n$8\r\nBITCOUNT\r\n$2\r\nbk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":1\r\n").await;
+
+        // GET bk -> the single byte 0x01 (a bitmap is the string type).
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$2\r\nbk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$1\r\n\x01\r\n").await;
+
+        // TYPE bk -> +string.
+        client
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$2\r\nbk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+string\r\n").await;
+
+        // Two source bitmaps: SETBIT s1 0 1 (byte0 0x80) ; SETBIT s2 1 1 (byte0 0x40).
+        client
+            .write_all(b"*4\r\n$6\r\nSETBIT\r\n$2\r\ns1\r\n$1\r\n0\r\n$1\r\n1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+        client
+            .write_all(b"*4\r\n$6\r\nSETBIT\r\n$2\r\ns2\r\n$1\r\n1\r\n$1\r\n1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+        // BITOP OR dst s1 s2 -> :1 (1-byte result, byte0 = 0xC0).
+        client
+            .write_all(b"*5\r\n$5\r\nBITOP\r\n$2\r\nOR\r\n$3\r\ndst\r\n$2\r\ns1\r\n$2\r\ns2\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":1\r\n").await;
+        // GET dst -> 0xC0 ; BITCOUNT dst -> :2.
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$3\r\ndst\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$1\r\n\xc0\r\n").await;
+        client
+            .write_all(b"*2\r\n$8\r\nBITCOUNT\r\n$3\r\ndst\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":2\r\n").await;
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
