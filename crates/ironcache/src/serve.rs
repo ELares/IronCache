@@ -718,6 +718,10 @@ async fn route_and_dispatch(
         // the coordinator issues it (via the inbox). Reject a CLIENT `__ICPUBLISH` here with the
         // same unknown-command reply as the *STORE verbs.
         || cmd_upper == ironcache_server::ICPUBLISH
+        // `__ICPUBSUB` is the INTERNAL cross-shard PUBSUB-introspection gather verb (SERVER_PUSH.md
+        // #20, PR 91b): the same gate -- registry-present (cross-check exact) but client-
+        // unreachable; only the coordinator issues it (via the inbox per shard).
+        || cmd_upper == ironcache_server::ICPUBSUB
     {
         reject_internal_verb(conn, state_rc, request, out);
         return false;
@@ -1242,16 +1246,18 @@ fn reject_internal_verb(
 // (`shard_pubsub()`, a serve thread-local). SUBSCRIBE/UNSUBSCRIBE are HOME-LOCAL (the
 // connection's subscriptions live on its home shard); PUBLISH fans out via the coordinator.
 
-/// Intercept and handle the SERVE-LAYER pub/sub commands (SERVER_PUSH.md #20, PR 91a), returning
-/// `Some(close)` when `cmd_upper` is one of them (always `false`: a pub/sub command never closes
-/// the connection) and `None` when it is NOT a pub/sub command (the caller falls through to the
-/// normal routing + dispatch). Split out of [`route_and_dispatch`] so the router stays small.
+/// Intercept and handle the SERVE-LAYER pub/sub commands (SERVER_PUSH.md #20, PR 91a/91b),
+/// returning `Some(close)` when `cmd_upper` is one of them (always `false`: a pub/sub command
+/// never closes the connection) and `None` when it is NOT a pub/sub command (the caller falls
+/// through to the normal routing + dispatch). Split out of [`route_and_dispatch`] so the router
+/// stays small.
 ///
 /// `commands_processed` is bumped here for every handled command (matching every other reply
-/// path's single count). SUBSCRIBE / PUBLISH validate arity inline (the registry arity, mirroring
-/// the dispatch arity path); UNSUBSCRIBE accepts zero channel args (unsubscribe-all). PING is
-/// intercepted ONLY when the connection is a RESP2 subscriber (the `["pong", ...]` array shape);
-/// a non-subscriber / RESP3 PING returns `None` so the normal `cmd_ping` arm handles it unchanged.
+/// path's single count). SUBSCRIBE / PSUBSCRIBE / PUBLISH validate arity inline (the registry
+/// arity, mirroring the dispatch arity path); UNSUBSCRIBE / PUNSUBSCRIBE accept zero args
+/// (unsubscribe-all); PUBSUB validates its subcommand inline. PING is intercepted ONLY when the
+/// connection is a RESP2 subscriber (the `["pong", ...]` array shape); a non-subscriber / RESP3
+/// PING returns `None` so the normal `cmd_ping` arm handles it unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn try_handle_pubsub(
     conn: &mut ConnState,
@@ -1284,6 +1290,36 @@ async fn try_handle_pubsub(
         b"UNSUBSCRIBE" => {
             state_rc.borrow_mut().counters.on_command();
             handle_unsubscribe(conn, request, out);
+            Some(false)
+        }
+        b"PSUBSCRIBE" => {
+            state_rc.borrow_mut().counters.on_command();
+            // Arity (>= 2) is the registry's; a bare PSUBSCRIBE with no pattern is a
+            // wrong-arity error, mirroring SUBSCRIBE's inline arity path.
+            if request.args.len() >= 2 {
+                handle_psubscribe(conn, push_tx, request, out);
+            } else {
+                encode_into(
+                    out,
+                    &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_arity(
+                        "psubscribe",
+                    )),
+                    conn.proto,
+                );
+            }
+            Some(false)
+        }
+        b"PUNSUBSCRIBE" => {
+            state_rc.borrow_mut().counters.on_command();
+            handle_punsubscribe(conn, request, out);
+            Some(false)
+        }
+        b"PUBSUB" => {
+            state_rc.borrow_mut().counters.on_command();
+            // PUBSUB <subcommand> [args]: a cross-shard introspection GATHER (CHANNELS /
+            // NUMSUB / NUMPAT). Like PUBLISH it lives in the serve layer (it reads the
+            // per-shard subscription tables) and fans out via the coordinator's inbox.
+            handle_pubsub(conn, inbox, home, request, out).await;
             Some(false)
         }
         b"PUBLISH" => {
@@ -1402,6 +1438,120 @@ fn handle_unsubscribe(conn: &mut ConnState, request: &Request, out: &mut Vec<u8>
     }
 }
 
+/// `PSUBSCRIBE pattern [pattern ...]` (SERVER_PUSH.md #20, PR 91b). For EACH pattern: insert it
+/// into `conn.sub_patterns` and register `(pattern, conn.id, push_tx.clone())` into THIS shard's
+/// subscription `patterns` table, then append a `["psubscribe", pattern, running_count]`
+/// confirmation. The running count is `sub_channels.len() + sub_patterns.len()` AFTER the insert
+/// (the TOTAL of channels + patterns, exactly as SUBSCRIBE); a re-subscribe to an already-held
+/// pattern does NOT bump the count (the `HashSet` / table inserts are idempotent), matching
+/// Redis. One confirmation message per pattern argument, in order.
+fn handle_psubscribe(
+    conn: &mut ConnState,
+    push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    let pubsub = shard_pubsub();
+    for pattern in &request.args[1..] {
+        conn.sub_patterns.insert(pattern.clone());
+        pubsub
+            .borrow_mut()
+            .subscribe_pattern(pattern.clone(), conn.id, push_tx.clone());
+        let count = running_count(conn);
+        encode_into(
+            out,
+            &push_confirm("psubscribe", pattern.as_ref(), count),
+            conn.proto,
+        );
+    }
+}
+
+/// `PUNSUBSCRIBE [pattern ...]` (SERVER_PUSH.md #20, PR 91b). With pattern args, unsubscribe each
+/// named pattern; with NO args, unsubscribe ALL currently-subscribed patterns. Reply one
+/// `["punsubscribe", pattern, running_count]` per AFFECTED pattern; the no-args-and-none-subscribed
+/// edge replies a single `["punsubscribe", nil, 0]` (matching Redis). Deregister each from THIS
+/// shard's subscription `patterns` table (the connection's subscriptions are home-shard-local).
+fn handle_punsubscribe(conn: &mut ConnState, request: &Request, out: &mut Vec<u8>) {
+    let pubsub = shard_pubsub();
+    // The patterns to drop: the named args, or ALL currently-subscribed when none are named.
+    let targets: Vec<bytes::Bytes> = if request.args.len() > 1 {
+        request.args[1..].to_vec()
+    } else {
+        conn.sub_patterns.iter().cloned().collect()
+    };
+
+    if targets.is_empty() {
+        // No args AND nothing subscribed: Redis replies a single nil-pattern confirmation.
+        encode_into(
+            out,
+            &ironcache_server::Value::Push(vec![
+                ironcache_server::Value::bulk_str("punsubscribe"),
+                ironcache_server::Value::Null,
+                ironcache_server::Value::Integer(0),
+            ]),
+            conn.proto,
+        );
+        return;
+    }
+
+    for pattern in targets {
+        conn.sub_patterns.remove(&pattern);
+        pubsub
+            .borrow_mut()
+            .unsubscribe_pattern(pattern.as_ref(), conn.id);
+        let count = running_count(conn);
+        encode_into(
+            out,
+            &push_confirm("punsubscribe", pattern.as_ref(), count),
+            conn.proto,
+        );
+    }
+}
+
+/// `PUBSUB CHANNELS [pattern] | NUMSUB [ch ...] | NUMPAT` (SERVER_PUSH.md #20, PR 91b) -- the
+/// cross-shard introspection GATHER. Subscription state is PER-SHARD (a channel may have
+/// subscribers on several shards), so each subcommand fans the SAME internal `__ICPUBSUB <sub>
+/// [args]` request out to EVERY shard via [`coordinator::fan_out_pubsub`] (the home shard runs
+/// it locally, peers via their drain loops) and MERGES the per-shard partials per subcommand:
+/// CHANNELS unions+dedups the channel names, NUMSUB sums the per-channel counts, NUMPAT unions
+/// the pattern names and counts the DISTINCT total. An unknown subcommand is the Redis
+/// unknown-subcommand error (no fan-out). `commands_processed` was already bumped by the caller.
+async fn handle_pubsub(
+    conn: &ConnState,
+    inbox: &coordinator::Inbox,
+    home: ShardId,
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    // PUBSUB requires a subcommand (arity >= 2 in the registry; the serve loop does not arity-gate
+    // it, so validate here). A bare `PUBSUB` is the unknown-subcommand error (matching Redis,
+    // which rejects a missing subcommand the same way as an unknown one).
+    let Some(sub_raw) = request.args.get(1) else {
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::unknown_subcommand(
+                "pubsub", "",
+            )),
+            conn.proto,
+        );
+        return;
+    };
+    let sub_upper = ascii_upper(sub_raw.as_ref());
+    if !matches!(sub_upper.as_slice(), b"CHANNELS" | b"NUMSUB" | b"NUMPAT") {
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::unknown_subcommand(
+                "pubsub",
+                &String::from_utf8_lossy(sub_raw.as_ref()),
+            )),
+            conn.proto,
+        );
+        return;
+    }
+    let merged = coordinator::fan_out_pubsub(inbox, request, home.index).await;
+    encode_into(out, &merged, conn.proto);
+}
+
 /// `PUBLISH channel payload` (SERVER_PUSH.md #20, PR 91a) -> the total number of receivers across
 /// ALL shards. Classic Pub/Sub channels are not slotted, so delivery FANS OUT to every shard's
 /// local subscriber table via [`coordinator::fan_out_publish`] (the home shard delivers locally,
@@ -1457,8 +1607,8 @@ fn deregister_all_subscriptions(conn: &ConnState) {
         table.unsubscribe(channel.as_ref(), conn.id);
     }
     for pattern in &conn.sub_patterns {
-        // patterns is empty this pass (PR 91b wires PSUBSCRIBE); the loop is here so the
-        // cleanup already covers patterns when they land.
+        // PSUBSCRIBE pattern subscriptions (PR 91b): deregister each from this shard's
+        // `patterns` table so a QUIT / error close / peer close leaves no pattern leak.
         table.unsubscribe_pattern(pattern.as_ref(), conn.id);
     }
 }

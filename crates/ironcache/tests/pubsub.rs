@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Classic exact-channel Pub/Sub acceptance tests (SERVER_PUSH.md #20, PR 91a).
+//! Pub/Sub acceptance tests (SERVER_PUSH.md #20, PR 91a exact channels + PR 91b glob patterns).
 //!
 //! These boot the REAL multi-shard `run_server` on an ephemeral port (the actual
 //! SO_REUSEPORT thread-per-core topology + cross-shard coordinator) and drive it over real
-//! sockets, so they exercise the whole path: the serve-layer SUBSCRIBE/UNSUBSCRIBE/PUBLISH
-//! interception, the per-shard subscription table, the cross-shard `__ICPUBLISH` fan-out, the
-//! per-connection push channel + the `select!` idle wait, the RESP3 `>` / RESP2 `*` framing,
+//! sockets, so they exercise the whole path: the serve-layer pub/sub interception (SUBSCRIBE,
+//! PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, PUBLISH, PUBSUB), the per-shard subscription tables,
+//! the cross-shard `__ICPUBLISH` fan-out plus the `__ICPUBSUB` introspection gather, the
+//! per-connection push channel plus the `select!` idle wait, the RESP3 `>` and RESP2 `*` framing,
 //! the subscribe-mode gate, PING-while-subscribed, back-pressure shedding, and disconnect
-//! cleanup. With shards=4 a publisher and a subscriber land on (likely) different cores, so
-//! the cross-shard fan-out is genuinely exercised.
+//! cleanup. With shards=4 a publisher and a subscriber land on (likely) different cores, so the
+//! cross-shard fan-out and the per-shard-gather introspection are genuinely exercised.
 
 use ironcache::test_support::run_server_for_test;
 use std::time::Duration;
@@ -176,6 +177,42 @@ fn assert_message(reply: &Resp, channel: &[u8], payload: &[u8]) -> bool {
     assert_eq!(items[1], Resp::Bulk(Some(channel.to_vec())));
     assert_eq!(items[2], Resp::Bulk(Some(payload.to_vec())));
     *is_push
+}
+
+/// Assert a delivered pattern-message frame is `["pmessage", pattern, channel, payload]` and
+/// return whether it was a RESP3 push (`>`) vs a RESP2 array (`*`).
+fn assert_pmessage(reply: &Resp, pattern: &[u8], channel: &[u8], payload: &[u8]) -> bool {
+    let Resp::Agg { is_push, items } = reply else {
+        panic!("pattern delivery must be an aggregate, got {reply:?}");
+    };
+    assert_eq!(items.len(), 4, "pmessage has 4 elements");
+    assert_eq!(items[0], Resp::Bulk(Some(b"pmessage".to_vec())));
+    assert_eq!(items[1], Resp::Bulk(Some(pattern.to_vec())));
+    assert_eq!(items[2], Resp::Bulk(Some(channel.to_vec())));
+    assert_eq!(items[3], Resp::Bulk(Some(payload.to_vec())));
+    *is_push
+}
+
+/// Extract the elements of an aggregate (array/push), panicking on any other reply shape.
+fn agg_items(reply: &Resp) -> &[Resp] {
+    let Resp::Agg { items, .. } = reply else {
+        panic!("expected an aggregate reply, got {reply:?}");
+    };
+    items
+}
+
+/// Collect the bulk-string channel names from a PUBSUB CHANNELS reply (an array of bulks),
+/// sorted so order-independent unions are comparable.
+fn sorted_channel_names(reply: &Resp) -> Vec<Vec<u8>> {
+    let mut names: Vec<Vec<u8>> = agg_items(reply)
+        .iter()
+        .map(|item| match item {
+            Resp::Bulk(Some(b)) => b.clone(),
+            other => panic!("PUBSUB CHANNELS element must be a bulk string, got {other:?}"),
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn rt() -> tokio::runtime::Runtime {
@@ -567,6 +604,326 @@ fn non_subscriber_hot_path_get_set_unchanged() {
         // A PING on a non-subscriber is the normal +PONG simple string (NOT the pong array).
         let pong = send_and_read(&mut c, &mut cb, &[b"PING"]).await;
         assert_eq!(pong, Resp::Simple(b"PONG".to_vec()));
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PR 91b: PSUBSCRIBE / PUNSUBSCRIBE (glob pattern subscriptions) + PUBSUB
+// CHANNELS / NUMSUB / NUMPAT introspection.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pattern_delivery_cross_shard() {
+    // Conn A PSUBSCRIBE news.* ; conn B PUBLISH news.tech x (shards=4, likely different cores).
+    // A receives ["pmessage", news.*, news.tech, x]; B's PUBLISH reports 1 receiver.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut a = connect_retry(port).await;
+        let mut b = connect_retry(port).await;
+        let mut abuf = Vec::new();
+        let mut bbuf = Vec::new();
+
+        // PSUBSCRIBE confirmation is ["psubscribe", news.*, 1].
+        let sub = send_and_read(&mut a, &mut abuf, &[b"PSUBSCRIBE", b"news.*"]).await;
+        let items = agg_items(&sub);
+        assert_eq!(items[0], Resp::Bulk(Some(b"psubscribe".to_vec())));
+        assert_eq!(items[1], Resp::Bulk(Some(b"news.*".to_vec())));
+        assert_eq!(items[2], Resp::Integer(1));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let pubr = send_and_read(&mut b, &mut bbuf, &[b"PUBLISH", b"news.tech", b"x"]).await;
+        assert_eq!(
+            pubr,
+            Resp::Integer(1),
+            "PUBLISH to a channel matched by one pattern reports 1"
+        );
+
+        let msg = read_with_timeout(&mut a, &mut abuf, 1000)
+            .await
+            .expect("pattern subscriber must receive the pmessage");
+        assert_pmessage(&msg, b"news.*", b"news.tech", b"x");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn exact_and_pattern_double_delivery_and_double_count() {
+    // A connection subscribed to BOTH exact "news.tech" AND pattern "news.*" receives BOTH a
+    // "message" AND a "pmessage" for ONE PUBLISH, and the PUBLISH count includes BOTH (= 2).
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut a = connect_retry(port).await;
+        let mut abuf = Vec::new();
+
+        // Both subscriptions on the SAME connection (so they share a home shard + push channel).
+        let _ = send_and_read(&mut a, &mut abuf, &[b"SUBSCRIBE", b"news.tech"]).await;
+        let _ = send_and_read(&mut a, &mut abuf, &[b"PSUBSCRIBE", b"news.*"]).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let mut b = connect_retry(port).await;
+        let mut bbuf = Vec::new();
+        let pubr = send_and_read(&mut b, &mut bbuf, &[b"PUBLISH", b"news.tech", b"v"]).await;
+        assert_eq!(
+            pubr,
+            Resp::Integer(2),
+            "exact + pattern on one conn counts as 2 receivers"
+        );
+
+        // The connection receives TWO frames: one "message" and one "pmessage" (order between
+        // them is not guaranteed across the exact-vs-pattern fan-out, so accept either order).
+        let f1 = read_with_timeout(&mut a, &mut abuf, 1000)
+            .await
+            .expect("first frame must arrive");
+        let f2 = read_with_timeout(&mut a, &mut abuf, 1000)
+            .await
+            .expect("second frame must arrive");
+        let kind = |r: &Resp| match agg_items(r)[0].clone() {
+            Resp::Bulk(Some(b)) => b,
+            other => panic!("frame tag must be a bulk string, got {other:?}"),
+        };
+        let mut kinds = [kind(&f1), kind(&f2)];
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [b"message".to_vec(), b"pmessage".to_vec()],
+            "one message + one pmessage delivered for a single PUBLISH"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn punsubscribe_no_args_unsubscribes_all_patterns() {
+    // PSUBSCRIBE two patterns, then PUNSUBSCRIBE with NO args: one confirm per pattern, the
+    // running count counts DOWN to 0; a later PUBLISH to a matched channel reports 0.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+
+        send_cmd(&mut c, &[b"PSUBSCRIBE", b"a.*", b"b.*"]).await;
+        for (i, pat) in [&b"a.*"[..], b"b.*"].iter().enumerate() {
+            let r = read_reply(&mut c, &mut cb).await;
+            let items = agg_items(&r);
+            assert_eq!(items[0], Resp::Bulk(Some(b"psubscribe".to_vec())));
+            assert_eq!(items[1], Resp::Bulk(Some(pat.to_vec())));
+            assert_eq!(items[2], Resp::Integer(i as i64 + 1));
+        }
+
+        // PUNSUBSCRIBE with no args: one confirm per pattern, count walking down to 0.
+        send_cmd(&mut c, &[b"PUNSUBSCRIBE"]).await;
+        let mut last_count = i64::MAX;
+        for _ in 0..2 {
+            let r = read_reply(&mut c, &mut cb).await;
+            let items = agg_items(&r);
+            assert_eq!(items[0], Resp::Bulk(Some(b"punsubscribe".to_vec())));
+            let Resp::Integer(count) = items[2] else {
+                panic!("punsubscribe count must be an integer");
+            };
+            last_count = count;
+        }
+        assert_eq!(last_count, 0, "PUNSUBSCRIBE-all ends at running count 0");
+
+        // The connection left subscribe mode: a PUBLISH to a previously-matched channel is 0.
+        let mut p = connect_retry(port).await;
+        let mut pb = Vec::new();
+        let n = send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"a.x", b"v"]).await;
+        assert_eq!(
+            n,
+            Resp::Integer(0),
+            "no pattern subscribers after PUNSUBSCRIBE"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// Boot, spread several subscribers across shards, and exercise PUBSUB CHANNELS / NUMSUB /
+/// NUMPAT. `shards` is parametrized so the same assertions run at shards=4 (cross-shard gather)
+/// and shards=1 (single-shard parity).
+fn run_pubsub_introspection(shards: usize) {
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(shards);
+
+        // Several subscribers on a mix of channels + a pattern, spread across shards via
+        // SO_REUSEPORT. Keep the sockets alive for the lifetime of the introspection.
+        let mut held = Vec::new();
+        // news.tech: two subscribers; news.sports: one; pattern news.* : two (distinct conns).
+        for spec in [
+            &[b"SUBSCRIBE".as_slice(), b"news.tech"][..],
+            &[b"SUBSCRIBE", b"news.tech"],
+            &[b"SUBSCRIBE", b"news.sports"],
+            &[b"PSUBSCRIBE", b"news.*"],
+            &[b"PSUBSCRIBE", b"news.*"],
+        ] {
+            let mut s = connect_retry(port).await;
+            let mut sb = Vec::new();
+            let _ = send_and_read(&mut s, &mut sb, spec).await;
+            held.push((s, sb));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut q = connect_retry(port).await;
+        let mut qb = Vec::new();
+
+        // PUBSUB CHANNELS: union across shards, deduped -> {news.tech, news.sports}. Patterns
+        // are NOT channels, so news.* must NOT appear.
+        let chans = send_and_read(&mut q, &mut qb, &[b"PUBSUB", b"CHANNELS"]).await;
+        assert_eq!(
+            sorted_channel_names(&chans),
+            vec![b"news.sports".to_vec(), b"news.tech".to_vec()],
+            "PUBSUB CHANNELS unions + dedups channel names across shards"
+        );
+
+        // PUBSUB CHANNELS news.spo* : glob filter -> only news.sports.
+        let filtered =
+            send_and_read(&mut q, &mut qb, &[b"PUBSUB", b"CHANNELS", b"news.spo*"]).await;
+        assert_eq!(
+            sorted_channel_names(&filtered),
+            vec![b"news.sports".to_vec()],
+            "PUBSUB CHANNELS applies the glob filter"
+        );
+
+        // PUBSUB NUMSUB news.tech news.sports absent : flat [ch, n, ...] in requested order;
+        // counts summed across shards; a channel with no subs -> 0.
+        let numsub = send_and_read(
+            &mut q,
+            &mut qb,
+            &[
+                b"PUBSUB",
+                b"NUMSUB",
+                b"news.tech",
+                b"news.sports",
+                b"absent",
+            ],
+        )
+        .await;
+        let items = agg_items(&numsub);
+        assert_eq!(
+            items.len(),
+            6,
+            "NUMSUB returns a flat [ch, n] pair per channel"
+        );
+        assert_eq!(items[0], Resp::Bulk(Some(b"news.tech".to_vec())));
+        assert_eq!(items[1], Resp::Integer(2), "news.tech has 2 subscribers");
+        assert_eq!(items[2], Resp::Bulk(Some(b"news.sports".to_vec())));
+        assert_eq!(items[3], Resp::Integer(1), "news.sports has 1 subscriber");
+        assert_eq!(items[4], Resp::Bulk(Some(b"absent".to_vec())));
+        assert_eq!(items[5], Resp::Integer(0), "an unsubscribed channel is 0");
+
+        // PUBSUB NUMPAT : distinct patterns globally. Two conns subscribed to the SAME pattern
+        // news.* -> ONE distinct pattern, not two.
+        let numpat = send_and_read(&mut q, &mut qb, &[b"PUBSUB", b"NUMPAT"]).await;
+        assert_eq!(
+            numpat,
+            Resp::Integer(1),
+            "PUBSUB NUMPAT counts DISTINCT patterns globally (the same pattern on 2 conns is 1)"
+        );
+
+        server.shutdown_and_join().unwrap();
+        drop(held);
+    });
+}
+
+#[test]
+fn pubsub_introspection_cross_shard() {
+    run_pubsub_introspection(4);
+}
+
+#[test]
+fn pubsub_introspection_single_shard_parity() {
+    run_pubsub_introspection(1);
+}
+
+#[test]
+fn pubsub_unknown_subcommand_errors() {
+    // PUBSUB with an unknown subcommand -> the Redis unknown-subcommand error.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+        let err = send_and_read(&mut c, &mut cb, &[b"PUBSUB", b"BOGUS"]).await;
+        let Resp::Error(line) = err else {
+            panic!("PUBSUB BOGUS must be an error, got {err:?}");
+        };
+        assert_eq!(
+            line,
+            b"ERR unknown subcommand or wrong number of arguments for 'BOGUS'. Try PUBSUB HELP."
+        );
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn pattern_delivery_resp3_push_frame() {
+    // A pattern delivery renders as a RESP3 push (`>` first byte) on a RESP3 subscriber.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut r3 = connect_retry(port).await;
+        let mut r3b = Vec::new();
+        hello3(&mut r3).await;
+        let _ = send_and_read(&mut r3, &mut r3b, &[b"PSUBSCRIBE", b"news.*"]).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let mut p = connect_retry(port).await;
+        let mut pb = Vec::new();
+        let n = send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"news.tech", b"v"]).await;
+        assert_eq!(n, Resp::Integer(1));
+
+        let m3 = read_with_timeout(&mut r3, &mut r3b, 1000)
+            .await
+            .expect("RESP3 pattern subscriber must receive");
+        assert!(
+            assert_pmessage(&m3, b"news.*", b"news.tech", b"v"),
+            "RESP3 pattern delivery is a `>` push frame"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn single_shard_pattern_delivery_parity() {
+    // shards == 1: PSUBSCRIBE/PUBLISH pattern delivery works (home delivery runs locally).
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(1);
+        let mut a = connect_retry(port).await;
+        let mut ab = Vec::new();
+        let _ = send_and_read(&mut a, &mut ab, &[b"PSUBSCRIBE", b"ev.*"]).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let mut b = connect_retry(port).await;
+        let mut bb = Vec::new();
+        let n = send_and_read(&mut b, &mut bb, &[b"PUBLISH", b"ev.login", b"v"]).await;
+        assert_eq!(
+            n,
+            Resp::Integer(1),
+            "single-shard pattern PUBLISH counts the subscriber"
+        );
+
+        let msg = read_with_timeout(&mut a, &mut ab, 1000)
+            .await
+            .expect("single-shard pattern subscriber must receive");
+        assert_pmessage(&msg, b"ev.*", b"ev.login", b"v");
 
         server.shutdown_and_join().unwrap();
     });

@@ -423,21 +423,26 @@ pub(crate) mod tests {
             "the command_spec registry size does not equal the dispatch arm count (out of sync)"
         );
 
-        // SERVE-LAYER-ROUTED commands (SERVER_PUSH.md #20, PR 91a): SUBSCRIBE / UNSUBSCRIBE /
-        // PUBLISH and the internal `__ICPUBLISH` are in the `spec_of` registry (so their arity
-        // validates and `classify` returns AlwaysHome) but are intercepted in the SERVE layer
-        // (`route_and_dispatch`) BEFORE dispatch -- registration needs the per-connection push
-        // sender + the per-shard subscription table, which live in the serve loop -- so they
-        // have NO `dispatch_inner` arm and are deliberately ABSENT from `dispatch_arm_names`.
-        // The set-equality above therefore does NOT cover them; assert that contract directly
-        // (registry-present, dispatch-arm-absent) so a future edit cannot silently regress it
-        // (e.g. accidentally adding a real dispatch arm for one of them, or dropping it from
-        // the registry so its arity stops validating).
+        // SERVE-LAYER-ROUTED commands (SERVER_PUSH.md #20, PR 91a/91b): SUBSCRIBE / UNSUBSCRIBE /
+        // PSUBSCRIBE / PUNSUBSCRIBE / PUBLISH / PUBSUB and the internal `__ICPUBLISH` /
+        // `__ICPUBSUB` are in the `spec_of` registry (so their arity validates and `classify`
+        // returns AlwaysHome) but are intercepted in the SERVE layer (`route_and_dispatch`) BEFORE
+        // dispatch -- registration needs the per-connection push sender + the per-shard
+        // subscription table, which live in the serve loop -- so they have NO `dispatch_inner` arm
+        // and are deliberately ABSENT from `dispatch_arm_names`. The set-equality above therefore
+        // does NOT cover them; assert that contract directly (registry-present, dispatch-arm-
+        // absent) so a future edit cannot silently regress it (e.g. accidentally adding a real
+        // dispatch arm for one of them, or dropping it from the registry so its arity stops
+        // validating).
         for cmd in [
             b"SUBSCRIBE".as_slice(),
             b"UNSUBSCRIBE",
+            b"PSUBSCRIBE",
+            b"PUNSUBSCRIBE",
             b"PUBLISH",
+            b"PUBSUB",
             b"__ICPUBLISH",
+            b"__ICPUBSUB",
         ] {
             assert!(
                 crate::command_spec::spec_of(cmd).is_some(),

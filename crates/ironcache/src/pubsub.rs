@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Classic exact-channel Pub/Sub: the server-push substrate (SERVER_PUSH.md #20/#108,
-//! PASS 1 = PR 91a).
+//! Pub/Sub: the server-push substrate (SERVER_PUSH.md #20/#108, PR 91a exact channels +
+//! PR 91b glob patterns).
 //!
 //! Four Redis features deliver data OUTSIDE the request/reply flow (classic Pub/Sub,
 //! sharded Pub/Sub, keyspace notifications, CSC invalidations); on the wire they are ONE
 //! shape, a RESP3 push frame (`>`) on RESP3 and a multi-bulk array (`*`) on RESP2
-//! (SERVER_PUSH.md). This module implements the FIRST of those (classic SUBSCRIBE /
-//! UNSUBSCRIBE / PUBLISH) and lays the substrate the other three slot into:
+//! (SERVER_PUSH.md). This module implements the FIRST of those (classic + pattern SUBSCRIBE /
+//! PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE / PUBLISH) and lays the substrate the other three
+//! slot into:
 //!
 //! - [`ServerPush`] + [`render`]: the one internal push value and its per-connection
 //!   renderer. Framing is written ONCE (via [`ironcache_protocol::Value::Push`], which the
 //!   encoder maps to `>` under RESP3 / `*` under RESP2), so the four features cannot drift.
-//!   [`ServerPush::PMessage`] is reserved for PSUBSCRIBE (PR 91b) and unused this pass.
-//! - [`ShardPubSub`]: the PER-SHARD subscription table (channel -> {conn id -> push sender}).
-//!   Subscription state is per-shard, NOT a global registry: under shared-nothing
+//!   [`ServerPush::PMessage`] carries a PSUBSCRIBE pattern delivery (PR 91b).
+//! - [`ShardPubSub`]: the PER-SHARD subscription table (channel/pattern -> {conn id -> push
+//!   sender}). Subscription state is per-shard, NOT a global registry: under shared-nothing
 //!   thread-per-core (ADR-0002) a global subscriber table would be a cross-core hot
 //!   structure on every PUBLISH. It is a core-local thread-local with NO lock; the only
 //!   cross-core handle it stores is the `Send` [`mpsc::Sender<ServerPush>`] of each
 //!   subscriber connection (the connection lives on its home shard, but a PUBLISH that
 //!   fans out reaches this table on every shard, so the senders must cross cores). The
-//!   `patterns` map is reserved for PSUBSCRIBE (PR 91b) and stays empty this pass.
+//!   `patterns` map holds PSUBSCRIBE glob-pattern subscriptions (PR 91b); a PUBLISH delivers
+//!   to BOTH the exact `channels` map ([`ShardPubSub::deliver`]) AND every matching pattern
+//!   ([`ShardPubSub::deliver_patterns`]).
 //!
 //! ## Back-pressure (SERVER_PUSH.md)
 //!
@@ -45,8 +48,8 @@ use tokio::sync::mpsc;
 pub const PUSH_CHANNEL_BOUND: usize = 1024;
 
 /// One internal server-push value (SERVER_PUSH.md). It carries every out-of-band frame so
-/// framing is written ONCE by [`render`]; this pass uses only [`ServerPush::Message`]
-/// (classic Pub/Sub), with [`ServerPush::PMessage`] reserved for PSUBSCRIBE (PR 91b).
+/// framing is written ONCE by [`render`]: [`ServerPush::Message`] (classic Pub/Sub) and
+/// [`ServerPush::PMessage`] (PSUBSCRIBE pattern Pub/Sub, PR 91b).
 ///
 /// All fields are [`Bytes`] (refcounted, `Send`), so a `ServerPush` crosses the
 /// thread boundary from the publishing shard to a subscriber on another core.
@@ -60,8 +63,7 @@ pub enum ServerPush {
         payload: Bytes,
     },
     /// A pattern Pub/Sub message: `pattern` (the matched PSUBSCRIBE pattern) + `channel`
-    /// (the concrete channel) + `payload`. RESERVED for PSUBSCRIBE (PR 91b); never
-    /// constructed this pass.
+    /// (the concrete channel) + `payload` (PSUBSCRIBE delivery, PR 91b).
     PMessage {
         /// The PSUBSCRIBE pattern that matched.
         pattern: Bytes,
@@ -105,22 +107,24 @@ impl ServerPush {
     }
 }
 
-/// The PER-SHARD subscription table (SERVER_PUSH.md routing tables). Maps a channel (and,
-/// from PR 91b, a pattern) to the set of LOCAL subscriber connections by connection id,
-/// each carrying that connection's `Send` push sender.
+/// The PER-SHARD subscription table (SERVER_PUSH.md routing tables). Maps a channel (and a
+/// PSUBSCRIBE glob pattern, PR 91b) to the set of LOCAL subscriber connections by connection
+/// id, each carrying that connection's `Send` push sender.
 ///
 /// Core-local (a thread-local in [`crate::serve`]); NO lock (ADR-0002 shared-nothing). The
 /// only cross-core handle stored is the `Send` [`mpsc::Sender<ServerPush>`]: a PUBLISH that
 /// fans out to every shard reaches each shard's own `ShardPubSub` (via the cross-shard
 /// coordinator), so each shard renders to ITS connections from ITS table with no shared
-/// lock. The `patterns` map is reserved for PSUBSCRIBE (PR 91b) and stays empty this pass.
+/// lock. The `patterns` map holds PSUBSCRIBE subscriptions; one PUBLISH delivers to BOTH the
+/// exact `channels` entry AND every matching pattern (no dedup, Redis semantics).
 #[derive(Debug, Default)]
 pub struct ShardPubSub {
     /// channel -> {conn id -> push sender}. A channel with no subscribers is absent (the
     /// last UNSUBSCRIBE / disconnect removes the empty inner map).
     pub channels: HashMap<Bytes, HashMap<u64, mpsc::Sender<ServerPush>>>,
-    /// pattern -> {conn id -> push sender}. RESERVED for PSUBSCRIBE (PR 91b); empty this
-    /// pass. Designed in now so the pattern fan-out slots in without reshaping this table.
+    /// pattern -> {conn id -> push sender} (PSUBSCRIBE, PR 91b). A pattern with no subscribers
+    /// is absent (the last PUNSUBSCRIBE / disconnect removes the empty inner map). A PUBLISH
+    /// iterates these and `glob_match`es each pattern against the published channel.
     pub patterns: HashMap<Bytes, HashMap<u64, mpsc::Sender<ServerPush>>>,
 }
 
@@ -147,10 +151,27 @@ impl ShardPubSub {
         }
     }
 
+    /// Register `conn_id`'s push `sender` as a subscriber of `pattern` on THIS shard (the
+    /// PSUBSCRIBE analog of [`Self::subscribe`], PR 91b). A re-subscribe (same conn id, same
+    /// pattern) overwrites the stale sender with the current one (idempotent on the table; the
+    /// caller decides whether the running count bumps, matching Redis's "already subscribed does
+    /// not bump" rule).
+    pub fn subscribe_pattern(
+        &mut self,
+        pattern: Bytes,
+        conn_id: u64,
+        sender: mpsc::Sender<ServerPush>,
+    ) {
+        self.patterns
+            .entry(pattern)
+            .or_default()
+            .insert(conn_id, sender);
+    }
+
     /// Deregister `conn_id` from `pattern` on THIS shard (the PSUBSCRIBE analog of
-    /// [`Self::unsubscribe`]), pruning the empty pattern entry. RESERVED for PR 91b; the
-    /// disconnect cleanup already drives it so pattern cleanup needs no reshaping when
-    /// PSUBSCRIBE lands. A no-op this pass (the `patterns` map is always empty).
+    /// [`Self::unsubscribe`]), pruning the empty pattern entry. The disconnect cleanup
+    /// (`deregister_all_subscriptions`) drives it off the connection's `sub_patterns` set, and
+    /// PUNSUBSCRIBE deregisters each named (or all) pattern through it.
     pub fn unsubscribe_pattern(&mut self, pattern: &[u8], conn_id: u64) {
         if let Some(subs) = self.patterns.get_mut(pattern) {
             subs.remove(&conn_id);
@@ -158,6 +179,97 @@ impl ShardPubSub {
                 self.patterns.remove(pattern);
             }
         }
+    }
+
+    /// Deliver `channel` + `payload` to every LOCAL subscriber whose PATTERN matches `channel`
+    /// under Redis glob rules (PSUBSCRIBE fan-out, SERVER_PUSH.md, PR 91b), returning the number
+    /// actually delivered. A connection is delivered ONCE PER MATCHING PATTERN it holds (Redis
+    /// semantics: a connection subscribed to two patterns that both match one channel gets one
+    /// `pmessage` per pattern), and the pattern delivery is INDEPENDENT of (and in addition to)
+    /// the exact-channel [`Self::deliver`] fan-out -- a connection subscribed to both an exact
+    /// channel AND a matching pattern receives BOTH a `message` AND a `pmessage` for one PUBLISH.
+    ///
+    /// Each matched subscriber is rendered a [`ServerPush::PMessage`] carrying the matched
+    /// `pattern` so the client can tell which PSUBSCRIBE produced the delivery. Delivery is the
+    /// SAME non-blocking [`mpsc::Sender::try_send`] + slow-consumer SHED as [`Self::deliver`] (a
+    /// push must never block the publishing shard); a shed subscriber is NOT counted as a
+    /// receiver. `glob` is the binary-safe Redis `stringmatchlen` matcher passed in by the caller
+    /// (the `ironcache-server` crate owns it; this crate stays glob-engine-agnostic).
+    pub fn deliver_patterns(
+        &mut self,
+        channel: &[u8],
+        payload: &Bytes,
+        glob: impl Fn(&[u8], &[u8]) -> bool,
+    ) -> i64 {
+        let mut delivered: i64 = 0;
+        // Patterns whose inner map went empty after shedding (pruned after the walk; we cannot
+        // mutate `self.patterns` while iterating it).
+        let mut prune: Vec<Bytes> = Vec::new();
+        for (pattern, subs) in &mut self.patterns {
+            if !glob(pattern.as_ref(), channel) {
+                continue;
+            }
+            let push = ServerPush::PMessage {
+                pattern: pattern.clone(),
+                channel: Bytes::copy_from_slice(channel),
+                payload: payload.clone(),
+            };
+            let mut shed: Vec<u64> = Vec::new();
+            for (&conn_id, sender) in subs.iter() {
+                match sender.try_send(push.clone()) {
+                    Ok(()) => delivered += 1,
+                    Err(
+                        mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_),
+                    ) => shed.push(conn_id),
+                }
+            }
+            for conn_id in shed {
+                subs.remove(&conn_id);
+            }
+            if subs.is_empty() {
+                prune.push(pattern.clone());
+            }
+        }
+        for pattern in prune {
+            self.patterns.remove(&pattern);
+        }
+        delivered
+    }
+
+    /// The LOCAL channel names that have at least one subscriber on THIS shard (PUBSUB CHANNELS,
+    /// PR 91b), optionally filtered to those matching `pat` under Redis glob rules. The home
+    /// core UNIONS + dedups these across shards (a channel may have subscribers on more than one
+    /// shard). `glob` is the binary-safe matcher passed in by the caller; `pat == None` returns
+    /// every locally-subscribed channel.
+    #[must_use]
+    pub fn local_channels(
+        &self,
+        pat: Option<&[u8]>,
+        glob: impl Fn(&[u8], &[u8]) -> bool,
+    ) -> Vec<Bytes> {
+        self.channels
+            .keys()
+            .filter(|ch| pat.is_none_or(|p| glob(p, ch.as_ref())))
+            .cloned()
+            .collect()
+    }
+
+    /// The LOCAL subscriber count of `channel` on THIS shard (PUBSUB NUMSUB, PR 91b): the size
+    /// of the channel's local subscriber map, or 0 when the channel has no local subscriber. The
+    /// home core SUMS these per channel across shards.
+    #[must_use]
+    pub fn local_numsub(&self, channel: &[u8]) -> i64 {
+        self.channels
+            .get(channel)
+            .map_or(0, |subs| i64::try_from(subs.len()).unwrap_or(i64::MAX))
+    }
+
+    /// The LOCAL pattern names that have at least one subscriber on THIS shard (PUBSUB NUMPAT,
+    /// PR 91b). The home core UNIONS these across shards and COUNTS the DISTINCT patterns (the
+    /// same pattern subscribed on two shards is ONE pattern, NOT two).
+    #[must_use]
+    pub fn local_patterns(&self) -> Vec<Bytes> {
+        self.patterns.keys().cloned().collect()
     }
 
     /// Deliver `push` to every LOCAL subscriber of `channel` on THIS shard, returning the
@@ -262,5 +374,98 @@ mod tests {
     fn deliver_to_no_subscribers_is_zero() {
         let mut t = ShardPubSub::default();
         assert_eq!(t.deliver(b"absent", &msg(b"absent", b"x")), 0);
+    }
+
+    // A tiny test-only glob (prefix `news.` matches `news.*`) so the pattern tests do not pull
+    // the real `ironcache_server::glob` into this crate's unit tests; the integration tests
+    // exercise the real matcher end to end.
+    fn star_suffix(pattern: &[u8], string: &[u8]) -> bool {
+        pattern.last() == Some(&b'*') && string.starts_with(&pattern[..pattern.len() - 1])
+    }
+
+    #[test]
+    fn deliver_patterns_matches_and_renders_pmessage() {
+        let mut t = ShardPubSub::default();
+        let (tx, mut rx) = mpsc::channel::<ServerPush>(4);
+        t.subscribe_pattern(Bytes::from_static(b"news.*"), 3, tx);
+        let payload = Bytes::from_static(b"hello");
+        // A matching channel delivers exactly one pmessage; a non-matching one delivers zero.
+        assert_eq!(t.deliver_patterns(b"news.tech", &payload, star_suffix), 1);
+        assert_eq!(t.deliver_patterns(b"weather", &payload, star_suffix), 0);
+        let got = rx.try_recv().unwrap();
+        assert_eq!(
+            got,
+            ServerPush::PMessage {
+                pattern: Bytes::from_static(b"news.*"),
+                channel: Bytes::from_static(b"news.tech"),
+                payload: Bytes::from_static(b"hello"),
+            }
+        );
+    }
+
+    #[test]
+    fn deliver_patterns_one_per_matching_pattern() {
+        // A connection subscribed to TWO patterns that both match one channel gets a pmessage
+        // PER pattern (Redis: no dedup across patterns).
+        let mut t = ShardPubSub::default();
+        let (tx, mut rx) = mpsc::channel::<ServerPush>(8);
+        t.subscribe_pattern(Bytes::from_static(b"news.*"), 3, tx.clone());
+        t.subscribe_pattern(Bytes::from_static(b"n*"), 3, tx);
+        let payload = Bytes::from_static(b"x");
+        assert_eq!(t.deliver_patterns(b"news.tech", &payload, star_suffix), 2);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn deliver_patterns_sheds_full_consumer_and_prunes() {
+        let mut t = ShardPubSub::default();
+        let (tx, _rx) = mpsc::channel::<ServerPush>(1);
+        t.subscribe_pattern(Bytes::from_static(b"p*"), 9, tx);
+        let payload = Bytes::from_static(b"a");
+        // First delivery fits the bound.
+        assert_eq!(t.deliver_patterns(b"px", &payload, star_suffix), 1);
+        // Channel is full now -> the next delivery sheds conn 9 and prunes the empty pattern.
+        assert_eq!(t.deliver_patterns(b"px", &payload, star_suffix), 0);
+        assert!(!t.patterns.contains_key(b"p*".as_slice()));
+    }
+
+    #[test]
+    fn unsubscribe_pattern_prunes_empty_patterns() {
+        let mut t = ShardPubSub::default();
+        let (tx, _rx) = mpsc::channel::<ServerPush>(4);
+        t.subscribe_pattern(Bytes::from_static(b"p*"), 1, tx);
+        assert!(t.patterns.contains_key(b"p*".as_slice()));
+        t.unsubscribe_pattern(b"p*", 1);
+        assert!(!t.patterns.contains_key(b"p*".as_slice()));
+    }
+
+    #[test]
+    fn local_introspection_channels_numsub_patterns() {
+        let mut t = ShardPubSub::default();
+        let (tx, _rx) = mpsc::channel::<ServerPush>(4);
+        t.subscribe(Bytes::from_static(b"news.tech"), 1, tx.clone());
+        t.subscribe(Bytes::from_static(b"news.tech"), 2, tx.clone());
+        t.subscribe(Bytes::from_static(b"weather"), 1, tx.clone());
+        t.subscribe_pattern(Bytes::from_static(b"news.*"), 1, tx);
+
+        // CHANNELS unfiltered: both channels (order-independent).
+        let mut chans = t.local_channels(None, star_suffix);
+        chans.sort();
+        assert_eq!(
+            chans,
+            vec![
+                Bytes::from_static(b"news.tech"),
+                Bytes::from_static(b"weather"),
+            ]
+        );
+        // CHANNELS filtered by `news.*`: only the matching channel.
+        let filtered = t.local_channels(Some(b"news.*"), star_suffix);
+        assert_eq!(filtered, vec![Bytes::from_static(b"news.tech")]);
+        // NUMSUB: 2 for news.tech, 0 for an unsubscribed channel.
+        assert_eq!(t.local_numsub(b"news.tech"), 2);
+        assert_eq!(t.local_numsub(b"absent"), 0);
+        // PATTERNS: the single pattern with a subscriber.
+        assert_eq!(t.local_patterns(), vec![Bytes::from_static(b"news.*")]);
     }
 }
