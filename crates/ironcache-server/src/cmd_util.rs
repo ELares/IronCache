@@ -173,6 +173,53 @@ pub fn parse_f64(arg: &[u8]) -> Option<f64> {
     Some(v)
 }
 
+/// Parse a ZSET SCORE the way Redis `zslParseRange` parses a range bound's float:
+/// `+inf`/`inf`/`+infinity` -> `+f64::INFINITY`, `-inf`/`-infinity` ->
+/// `-f64::INFINITY`, otherwise [`parse_f64`]. Used for score-range bounds (after the
+/// `(` exclusive prefix is stripped). Returns `None` on a non-float (the caller maps it
+/// to the byte-exact `min or max is not a float`). Distinct from [`parse_f64`] only in
+/// the explicit `inf` token spellings Redis's range parser accepts.
+#[must_use]
+pub fn parse_score(arg: &[u8]) -> Option<f64> {
+    let lower = ascii_lower(arg);
+    match lower.as_slice() {
+        b"+inf" | b"inf" | b"+infinity" | b"infinity" => Some(f64::INFINITY),
+        b"-inf" | b"-infinity" => Some(f64::NEG_INFINITY),
+        _ => parse_f64(arg),
+    }
+}
+
+/// Parse one end of a ZSET SCORE range (ZRANGEBYSCORE / ZCOUNT / ZRANGE BYSCORE):
+/// a leading `(` marks an EXCLUSIVE bound, otherwise the bound is INCLUSIVE; the rest is
+/// a score parsed via [`parse_score`] (so `+inf`/`-inf`/`5`/`(5` all parse). Returns
+/// `None` on a malformed bound (the caller maps it to `min or max is not a float`).
+#[must_use]
+pub fn parse_score_bound(arg: &[u8]) -> Option<ironcache_storage::ScoreBound> {
+    use ironcache_storage::ScoreBound;
+    if let Some(rest) = arg.strip_prefix(b"(") {
+        parse_score(rest).map(ScoreBound::exclusive)
+    } else {
+        parse_score(arg).map(ScoreBound::inclusive)
+    }
+}
+
+/// Parse one end of a ZSET LEX range (ZRANGEBYLEX / ZLEXCOUNT / ZRANGE BYLEX): `-` is the
+/// minimum (before all members), `+` is the maximum (after all members), `[m` is an
+/// inclusive bound at the member bytes `m`, `(m` an exclusive bound. Any other form
+/// (including a bare member with no `[`/`(`) is invalid. Returns `None` on a malformed
+/// bound (the caller maps it to `min or max not valid string range item`).
+#[must_use]
+pub fn parse_lex_bound(arg: &[u8]) -> Option<ironcache_storage::LexBound> {
+    use ironcache_storage::LexBound;
+    match arg.first()? {
+        b'-' if arg.len() == 1 => Some(LexBound::NegInf),
+        b'+' if arg.len() == 1 => Some(LexBound::PosInf),
+        b'[' => Some(LexBound::Inclusive(arg[1..].to_vec())),
+        b'(' => Some(LexBound::Exclusive(arg[1..].to_vec())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

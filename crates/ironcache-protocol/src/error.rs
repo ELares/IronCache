@@ -565,6 +565,66 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "LIMIT can't be negative")
     }
 
+    /// `ERR GT, LT, and/or NX options at the same time are not compatible` - the reply
+    /// Redis emits (src/t_zset.c `zaddGenericCommand`) when ZADD is given an incompatible
+    /// combination of the GT/LT/NX flags (NX+GT, NX+LT, GT+LT). Byte-exact. NX+XX is a
+    /// separate generic syntax error (Redis checks NX+XX before this), handled by the
+    /// caller with [`Self::syntax_error`].
+    #[must_use]
+    pub fn zadd_gt_lt_nx_incompatible() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "GT, LT, and/or NX options at the same time are not compatible",
+        )
+    }
+
+    /// `ERR INCR option supports a single increment-element pair` - the reply Redis emits
+    /// (src/t_zset.c `zaddGenericCommand`) when ZADD INCR is given more than one
+    /// score-member pair. Byte-exact.
+    #[must_use]
+    pub fn zadd_incr_single_pair() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "INCR option supports a single increment-element pair",
+        )
+    }
+
+    /// `ERR min or max is not a float` - the reply Redis emits (src/t_zset.c
+    /// `zslParseRange`) when a ZRANGEBYSCORE / ZCOUNT / ZREMRANGEBYSCORE / ZRANGE BYSCORE
+    /// score-range bound (`min`/`max`) does not parse as a float (after stripping an
+    /// optional `(` exclusive prefix and accepting `+inf`/`-inf`). Byte-exact.
+    #[must_use]
+    pub fn min_or_max_not_a_float() -> Self {
+        ErrorReply::new(ErrorCode::Err, "min or max is not a float")
+    }
+
+    /// `ERR min or max not valid string range item` - the reply Redis emits (src/t_zset.c
+    /// `zslParseLexRange`) when a ZRANGEBYLEX / ZLEXCOUNT / ZREMRANGEBYLEX / ZRANGE BYLEX
+    /// lex-range bound is not a valid lex item (it must be `-`, `+`, or start with `[` or
+    /// `(`). Byte-exact.
+    #[must_use]
+    pub fn min_or_max_not_valid_string_range() -> Self {
+        ErrorReply::new(ErrorCode::Err, "min or max not valid string range item")
+    }
+
+    /// `ERR weight value is not a float` - the reply Redis emits (src/t_zset.c
+    /// `zunionInterDiffGenericCommand`) when a ZUNIONSTORE / ZINTERSTORE / ZUNION / ZINTER
+    /// `WEIGHTS` value does not parse as a float. Byte-exact.
+    #[must_use]
+    pub fn weight_not_a_float() -> Self {
+        ErrorReply::new(ErrorCode::Err, "weight value is not a float")
+    }
+
+    /// `ERR syntax error` reused for the ZADD `INCR` no-op nil and conflicting-options
+    /// cases is NOT this; this is the dedicated ZADD `nan` score path which Redis reports
+    /// as the generic not-a-valid-float. (Kept as a named helper so the zset command code
+    /// reads clearly; it delegates to the existing [`Self::not_a_valid_float`] message,
+    /// which is byte-identical to Redis's ZADD bad-score reply.)
+    #[must_use]
+    pub fn zadd_score_not_a_float() -> Self {
+        ErrorReply::not_a_valid_float()
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free

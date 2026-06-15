@@ -23,6 +23,7 @@ pub mod cmd_list;
 pub mod cmd_set;
 pub mod cmd_string;
 pub mod cmd_util;
+pub mod cmd_zset;
 pub mod conn;
 pub mod dispatch;
 pub mod glob;

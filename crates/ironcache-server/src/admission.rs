@@ -87,6 +87,19 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             | b"SINTERSTORE"
             | b"SUNIONSTORE"
             | b"SDIFFSTORE"
+            // Sorted-set writes that allocate value bytes (PR-8). ZADD/ZINCRBY grow the
+            // zset (or create-on-missing); ZRANGESTORE and ZUNIONSTORE/ZINTERSTORE/
+            // ZDIFFSTORE materialize a result zset at the destination. All are `denyoom`
+            // in Redis. ZREM/ZPOPMIN/ZPOPMAX/ZREMRANGE* are memory-RELEASING and the zset
+            // reads (ZSCORE/ZMSCORE/ZCARD/ZRANK/ZREVRANK/ZCOUNT/ZLEXCOUNT/ZRANGE*/
+            // ZRANDMEMBER/ZSCAN/ZUNION/ZINTER/ZDIFF/ZINTERCARD) are read-only, so they are
+            // NOT gated.
+            | b"ZADD"
+            | b"ZINCRBY"
+            | b"ZRANGESTORE"
+            | b"ZUNIONSTORE"
+            | b"ZINTERSTORE"
+            | b"ZDIFFSTORE"
     )
 }
 
@@ -131,6 +144,13 @@ mod tests {
             b"SINTERSTORE",
             b"SUNIONSTORE",
             b"SDIFFSTORE",
+            // Sorted-set writes (PR-8).
+            b"ZADD",
+            b"ZINCRBY",
+            b"ZRANGESTORE",
+            b"ZUNIONSTORE",
+            b"ZINTERSTORE",
+            b"ZDIFFSTORE",
         ] {
             assert!(is_denyoom(w), "{w:?} should be denyoom");
         }
@@ -207,6 +227,32 @@ mod tests {
             b"SDIFF",
             b"SINTERCARD",
             b"SSCAN",
+            // Sorted-set reads + memory-releasing zset writes (PR-8): not denyoom.
+            b"ZREM",
+            b"ZPOPMIN",
+            b"ZPOPMAX",
+            b"ZREMRANGEBYRANK",
+            b"ZREMRANGEBYSCORE",
+            b"ZREMRANGEBYLEX",
+            b"ZSCORE",
+            b"ZMSCORE",
+            b"ZCARD",
+            b"ZRANK",
+            b"ZREVRANK",
+            b"ZCOUNT",
+            b"ZLEXCOUNT",
+            b"ZRANGE",
+            b"ZREVRANGE",
+            b"ZRANGEBYSCORE",
+            b"ZREVRANGEBYSCORE",
+            b"ZRANGEBYLEX",
+            b"ZREVRANGEBYLEX",
+            b"ZRANDMEMBER",
+            b"ZSCAN",
+            b"ZUNION",
+            b"ZINTER",
+            b"ZDIFF",
+            b"ZINTERCARD",
         ] {
             assert!(!is_denyoom(r), "{r:?} must not be denyoom");
         }
