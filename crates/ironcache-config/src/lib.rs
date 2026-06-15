@@ -66,6 +66,17 @@ pub const DEFAULT_HASH_MAX_LISTPACK_ENTRIES: usize = 512;
 /// the ZSET constant only.
 pub const DEFAULT_ZSET_MAX_LISTPACK_ENTRIES: usize = 128;
 
+/// The default per-member BYTE cap for a ZSET `listpack` (`zset-max-listpack-value`,
+/// default 64; [redis-zset-max-listpack-entries-128]). A zset whose ANY member byte
+/// length exceeds this transitions away from `listpack` to `skiplist`, EVEN when it has
+/// few entries (the byte cap is per-member, not a total). This is the ZSET companion to
+/// [`DEFAULT_ZSET_MAX_LISTPACK_ENTRIES`] (the entry cap): a zset stays `listpack` while
+/// `entries <= zset-max-listpack-entries` AND every member byte length `<=
+/// zset-max-listpack-value`. SHARES the 64 value with the HASH/SET per-element byte caps
+/// ([`DEFAULT_HASH_MAX_LISTPACK_VALUE`] / [`DEFAULT_SET_MAX_LISTPACK_VALUE`]) but is a
+/// SEPARATE Redis parameter. Wired into the zset encoding logic in PR-8.
+pub const DEFAULT_ZSET_MAX_LISTPACK_VALUE: usize = 64;
+
 /// The default per-field/value BYTE cap for a HASH listpack (`hash-max-listpack-value`,
 /// default 64). A hash whose ANY field-or-value byte length exceeds this transitions
 /// away from `listpack` to `hashtable`, EVEN when it has few entries (the byte cap is

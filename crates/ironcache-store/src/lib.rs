@@ -401,14 +401,15 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // ENCODING reads the encoding, e.g. listpack/quicklist/hashtable/intset). The
             // bytes are empty so a misrouted as_bytes() yields nothing rather than leaking
             // a representation.
-            kvobj::ValueRepr::List(_) | kvobj::ValueRepr::Hash(_) | kvobj::ValueRepr::Set(_) => {
-                ValueRef::borrowed(
-                    obj.header.data_type,
-                    obj.header.encoding,
-                    obj.expire_at,
-                    &[],
-                )
-            }
+            kvobj::ValueRepr::List(_)
+            | kvobj::ValueRepr::Hash(_)
+            | kvobj::ValueRepr::Set(_)
+            | kvobj::ValueRepr::ZSet(_) => ValueRef::borrowed(
+                obj.header.data_type,
+                obj.header.encoding,
+                obj.expire_at,
+                &[],
+            ),
         }
     }
 
@@ -435,14 +436,15 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // that hits a collection key) exposes empty bytes; the closure sees the
             // collection data_type and returns WRONGTYPE. In-place collection edits use the
             // MUTABLE arm (`rmw_mut` -> OccupiedEntryMut), not this read-only handle.
-            kvobj::ValueRepr::List(_) | kvobj::ValueRepr::Hash(_) | kvobj::ValueRepr::Set(_) => {
-                OccupiedEntry::borrowed(
-                    obj.header.data_type,
-                    obj.header.encoding,
-                    obj.expire_at,
-                    &[],
-                )
-            }
+            kvobj::ValueRepr::List(_)
+            | kvobj::ValueRepr::Hash(_)
+            | kvobj::ValueRepr::Set(_)
+            | kvobj::ValueRepr::ZSet(_) => OccupiedEntry::borrowed(
+                obj.header.data_type,
+                obj.header.encoding,
+                obj.expire_at,
+                &[],
+            ),
         }
     }
 }
@@ -628,6 +630,9 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                 }
                 kvobj::ValueRepr::Set(s) => {
                     RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, s))
+                }
+                kvobj::ValueRepr::ZSet(z) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, z))
                 }
                 kvobj::ValueRepr::Int(_)
                 | kvobj::ValueRepr::Inline(_)

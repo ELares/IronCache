@@ -33,11 +33,13 @@ use ironcache_config::{
     DEFAULT_HASH_MAX_LISTPACK_ENTRIES, DEFAULT_HASH_MAX_LISTPACK_VALUE,
     DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES, DEFAULT_SET_MAX_INTSET_ENTRIES,
     DEFAULT_SET_MAX_LISTPACK_ENTRIES, DEFAULT_SET_MAX_LISTPACK_VALUE,
+    DEFAULT_ZSET_MAX_LISTPACK_ENTRIES, DEFAULT_ZSET_MAX_LISTPACK_VALUE,
 };
 use ironcache_storage::{
-    DataType, Encoding, HashValue, ListValue, NewValueOwned, SetValue, UnixMillis,
+    DataType, Encoding, HashValue, IncrOutcome, LexBound, ListValue, NewValueOwned, ScoreBound,
+    SetValue, UnixMillis, ZAddFlags, ZAddOutcome, ZSetValue,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 /// The inline-value buffer capacity (embstr). Matches [`EMBSTR_THRESHOLD`]; a
 /// value classified as embstr fits here without a separate allocation in the
@@ -155,6 +157,10 @@ pub enum ValueRepr {
     /// over the entry-count OR per-member-byte threshold (a pure function of the active
     /// repr, #40). The conversion is ONE-WAY (never demotes).
     Set(SetVal),
+    /// A ZSET (sorted set) value (PR-8). `OBJECT ENCODING` -> `listpack` while small,
+    /// `skiplist` once over the entry-count OR per-member-byte threshold (a pure function
+    /// of the active repr, #40). The conversion is ONE-WAY (never demotes).
+    ZSet(ZSetVal),
 }
 
 impl ValueRepr {
@@ -169,6 +175,7 @@ impl ValueRepr {
             ValueRepr::List(l) => l.encoding(),
             ValueRepr::Hash(h) => h.encoding(),
             ValueRepr::Set(s) => s.encoding(),
+            ValueRepr::ZSet(z) => z.encoding(),
         }
     }
 
@@ -185,6 +192,7 @@ impl ValueRepr {
             ValueRepr::List(l) => l.element_bytes(),
             ValueRepr::Hash(h) => h.element_bytes(),
             ValueRepr::Set(s) => s.element_bytes(),
+            ValueRepr::ZSet(z) => z.element_bytes(),
         }
     }
 }
@@ -1035,6 +1043,559 @@ impl SetValue for SetVal {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ZSetVal: the PR-8 sorted-set (zset) value (COLLECTIONS.md, ZSET_LARGE.md,
+// OBJECT_ENCODING_MAPPING.md #40, ADR-0018). The ZSET analog of `ListVal`/`HashVal`/
+// `SetVal`, with the two-rung Redis zset encoding ladder:
+//
+//   1. `listpack`  -- a small zset, stored as a `Vec<(member, score)>` kept SORTED by
+//                     (score ASC, member-bytes ASC), linear-scan membership. Reports
+//                     `Encoding::ListPack`.
+//   2. `skiplist`  -- a large zset, stored as a DUAL structure mirroring Redis
+//                     [redis-zset-skiplist-plus-ht]: an ordered index keyed by
+//                     (OrderedScore, member) for range/rank, plus a parallel
+//                     `HashMap<member, score>` for O(1) ZSCORE and ZADD score-update.
+//                     Reports `Encoding::SkipList`.
+//
+// ## The provisional large form (ZSET_LARGE.md #134/#136)
+//
+// The ordered index is a `BTreeSet<(OrderedScore, Box<[u8]>)>` rather than a true
+// skiplist. ZSET_LARGE.md calls the skiplist "provisional" and commits this code to the
+// TRAIT (ZSetValue) the index sits behind, not the concrete structure; the #136 bake-off
+// (skiplist vs cache-conscious B-tree vs ART) picks the perf winner later. A BTreeMap
+// gives the same ordered-range / rank semantics with correct ordering, so it satisfies
+// the v1 correctness + Compatible bar; the real skiplist (or the bake-off winner) is the
+// documented #134/#136 follow-up [skiplist-vs-btree-cache]. The member bytes ARE
+// duplicated between the index key and the map key here (a v1 simplification; the
+// shared-SDS single-allocation packing is the same #8 follow-up the other collections
+// note), which the store's measured-delta accounting handles correctly regardless.
+//
+// ## The listpack -> skiplist transition (#40) and its one-way ratchet
+//
+// A `ZSetVal` is a listpack while `entries <= zset-max-listpack-entries` (128) AND every
+// member byte length is `<= zset-max-listpack-value` (64); once either bound is crossed it
+// converts to the skiplist form. Like Redis (and like HashVal/SetVal), the conversion is
+// ONE-WAY: a zset that grew to skiplist STAYS skiplist even if later shrunk, so OBJECT
+// ENCODING is a pure function of the ACTIVE repr and only ratchets up.
+//
+// ## Ordering (the (score, member) total order)
+//
+// Members order by (score ASC, then member-bytes ASC for equal scores), the Redis
+// skiplist order [redis-zset-skiplist-plus-ht]. Scores compare with `f64::total_cmp` via
+// the `OrderedScore` newtype, which gives a total order over all finite + infinite f64
+// (+inf is the maximum, -inf the minimum). A NaN INPUT score is rejected at parse time
+// before it reaches `add`/`incr`; a NaN ARITHMETIC RESULT (an existing +inf incremented by
+// -inf via ZINCRBY/ZADD INCR) is caught inside `incr`, which returns `IncrOutcome::Nan`
+// WITHOUT mutating, so a NaN never enters the order. `total_cmp` orders -0.0
+// before +0.0, but the command layer never produces a distinct -0.0 score (parse_f64
+// yields +0.0 for "0"/"-0"), so the -0.0/+0.0 distinction is not observable.
+//
+// ## Determinism (ZSCAN/ZRANDMEMBER, ADR-0003)
+//
+// Both forms expose members in the deterministic (score, member) order, so ZSCAN and the
+// ZRANDMEMBER index draws (the caller draws the seed through the Env RNG seam) are
+// deterministic and resize-invariant: the order does not depend on `hashbrown`'s
+// per-table RandomState (the map is used ONLY for O(1) score lookup, never iterated for an
+// ordered result).
+// ---------------------------------------------------------------------------
+
+/// A total-order newtype over an `f64` zset SCORE (ZSET_LARGE.md ordering). Orders by
+/// `f64::total_cmp`, which is a total order over all finite and infinite f64 (NaN is
+/// rejected by the command layer before a score reaches the zset, so it never appears
+/// here). `+inf` is the maximum and `-inf` the minimum, matching Redis's score order.
+#[derive(Debug, Clone, Copy)]
+struct OrderedScore(f64);
+
+impl PartialEq for OrderedScore {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for OrderedScore {}
+impl PartialOrd for OrderedScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// One stored zset entry in the listpack form: an owned `(member, score)` pair. A type
+/// alias so the listpack form and its helpers do not repeat the boxed-slice tuple.
+type ZSetEntry = (Box<[u8]>, f64);
+
+/// The private representation behind a [`ZSetVal`]: the two Redis zset encodings. Kept
+/// private so the public [`ZSetVal`] exposes no internal type (the `OrderedScore`
+/// newtype, the index/map shapes) -- the encoding is the only thing the public API
+/// surfaces, via [`ZSetVal::encoding`].
+#[derive(Debug, Clone)]
+enum ZSetRepr {
+    /// The small `listpack` form: `(member, score)` pairs kept SORTED by (score, member),
+    /// linear-scanned for membership. Reports [`Encoding::ListPack`].
+    ListPack(Vec<ZSetEntry>),
+    /// The large `skiplist` form: a dual structure -- an ordered index
+    /// `BTreeSet<(OrderedScore, member)>` for range/rank, plus a parallel
+    /// `HashMap<member, score>` for O(1) score lookup [redis-zset-skiplist-plus-ht].
+    /// Reports [`Encoding::SkipList`]. One-way: never converts back to listpack.
+    SkipList {
+        /// The ordered index keyed by (score, member) for range and rank queries.
+        index: BTreeSet<(OrderedScore, Box<[u8]>)>,
+        /// The member -> score map for O(1) ZSCORE and ZADD score-update.
+        scores: HashMap<Box<[u8]>, f64>,
+    },
+}
+
+/// A ZSET (sorted set) value (PR-8). The two Redis zset encodings with a one-way
+/// listpack -> skiplist ladder (see the module comment), held behind a private
+/// [`ZSetRepr`] so the public type exposes no internals. The reported encoding is a pure
+/// function of the active form.
+#[derive(Debug, Clone)]
+pub struct ZSetVal(ZSetRepr);
+
+impl Default for ZSetVal {
+    fn default() -> Self {
+        ZSetVal::new()
+    }
+}
+
+impl ZSetVal {
+    /// An empty zset (the create-on-missing seed before the first member), in the small
+    /// listpack form.
+    #[must_use]
+    pub fn new() -> Self {
+        ZSetVal(ZSetRepr::ListPack(Vec::new()))
+    }
+
+    /// The sum of member byte lengths PLUS a fixed 8-byte score charge per member (the
+    /// value-bytes side of accounting and the `logical_len` for a zset). The 8-byte score
+    /// charge is the f64 score weight (matching the task's "member bytes + a fixed 8-byte
+    /// score charge" accounting basis). Does NOT include the key bytes (the kvobj adds
+    /// those).
+    #[must_use]
+    pub fn element_bytes(&self) -> usize {
+        match &self.0 {
+            ZSetRepr::ListPack(v) => v.iter().map(|(m, _)| m.len() + 8).sum(),
+            ZSetRepr::SkipList { scores, .. } => scores.keys().map(|m| m.len() + 8).sum(),
+        }
+    }
+
+    /// The encoding this zset reports, a PURE FUNCTION of the active form (#40):
+    /// `listpack` for the small form, `skiplist` for the large form.
+    #[must_use]
+    pub fn encoding(&self) -> Encoding {
+        match &self.0 {
+            ZSetRepr::ListPack(_) => Encoding::ListPack,
+            ZSetRepr::SkipList { .. } => Encoding::SkipList,
+        }
+    }
+
+    /// Whether the zset is in the small `listpack` form (drives ZSCAN's small-collection
+    /// one-shot behavior).
+    #[must_use]
+    pub fn is_small(&self) -> bool {
+        matches!(self.0, ZSetRepr::ListPack(_))
+    }
+
+    /// Whether a listpack zset of `entries` members where a new/updated member byte length
+    /// is `member_len` must convert to `skiplist` (the #40 listpack thresholds): convert
+    /// once `entries > zset-max-listpack-entries` (128) OR any member byte length exceeds
+    /// `zset-max-listpack-value` (64).
+    fn listpack_overflows(entries: usize, member_len: usize) -> bool {
+        entries > DEFAULT_ZSET_MAX_LISTPACK_ENTRIES || member_len > DEFAULT_ZSET_MAX_LISTPACK_VALUE
+    }
+
+    /// Promote the small listpack form to the large skiplist form (one-way). A no-op if
+    /// already a skiplist.
+    fn convert_to_skiplist(&mut self) {
+        if let ZSetRepr::ListPack(v) = &mut self.0 {
+            let mut index: BTreeSet<(OrderedScore, Box<[u8]>)> = BTreeSet::new();
+            let mut scores: HashMap<Box<[u8]>, f64> = HashMap::with_capacity(v.len());
+            for (m, s) in v.drain(..) {
+                index.insert((OrderedScore(s), m.clone()));
+                scores.insert(m, s);
+            }
+            self.0 = ZSetRepr::SkipList { index, scores };
+        }
+    }
+
+    /// Find the index of `member` in the sorted listpack form (linear scan), or `None`.
+    fn listpack_pos(v: &[ZSetEntry], member: &[u8]) -> Option<usize> {
+        v.iter().position(|(m, _)| m.as_ref() == member)
+    }
+
+    /// Insert `member` at `score` into the sorted listpack vec, keeping the (score,
+    /// member) order. The caller guarantees `member` is NOT already present.
+    fn listpack_insert_sorted(v: &mut Vec<ZSetEntry>, member: &[u8], score: f64) {
+        let pos = v
+            .binary_search_by(|(m, s)| s.total_cmp(&score).then_with(|| m.as_ref().cmp(member)))
+            .unwrap_or_else(|e| e);
+        v.insert(pos, (member.to_vec().into_boxed_slice(), score));
+    }
+
+    /// Set `member` to `score` UNCONDITIONALLY (used by `add`/`incr` after the flag
+    /// decision is made). Adds if absent, rewrites the score if present (re-sorting in the
+    /// listpack form, remove-then-reinsert in the skiplist index), and re-checks the
+    /// listpack->skiplist transition. Returns whether the member was NEW.
+    fn put(&mut self, member: &[u8], score: f64) -> bool {
+        match &mut self.0 {
+            ZSetRepr::ListPack(v) => {
+                let was_new = if let Some(i) = ZSetVal::listpack_pos(v, member) {
+                    // Score rewrite: remove the old entry then re-insert in order.
+                    v.remove(i);
+                    ZSetVal::listpack_insert_sorted(v, member, score);
+                    false
+                } else {
+                    ZSetVal::listpack_insert_sorted(v, member, score);
+                    true
+                };
+                if ZSetVal::listpack_overflows(v.len(), member.len()) {
+                    self.convert_to_skiplist();
+                }
+                was_new
+            }
+            ZSetRepr::SkipList { index, scores } => {
+                if let Some(old) = scores.get(member).copied() {
+                    // Score update: remove-then-reinsert in the ordered index plus an
+                    // in-place score rewrite in the map (the ZSET_LARGE.md sync invariant).
+                    index.remove(&(OrderedScore(old), member.to_vec().into_boxed_slice()));
+                    index.insert((OrderedScore(score), member.to_vec().into_boxed_slice()));
+                    scores.insert(member.to_vec().into_boxed_slice(), score);
+                    false
+                } else {
+                    index.insert((OrderedScore(score), member.to_vec().into_boxed_slice()));
+                    scores.insert(member.to_vec().into_boxed_slice(), score);
+                    true
+                }
+            }
+        }
+    }
+
+    /// All `(member, score)` pairs in (score, member) order. The single ordered-snapshot
+    /// helper the range/rank/scan methods build on.
+    fn ordered(&self) -> Vec<(Vec<u8>, f64)> {
+        match &self.0 {
+            ZSetRepr::ListPack(v) => v.iter().map(|(m, s)| (m.to_vec(), *s)).collect(),
+            ZSetRepr::SkipList { index, .. } => {
+                index.iter().map(|(s, m)| (m.to_vec(), s.0)).collect()
+            }
+        }
+    }
+
+    /// Construct a zset from `(member, score)` pairs in arbitrary order (the
+    /// create-on-missing / *STORE path), deduplicating by member (the LAST score wins, as
+    /// the caller already resolved aggregation) and applying the encoding ladder.
+    fn from_pairs(pairs: &[(Vec<u8>, f64)]) -> Self {
+        let mut z = ZSetVal::new();
+        for (m, s) in pairs {
+            z.put(m, *s);
+        }
+        z
+    }
+
+    /// Normalize a signed inclusive Redis RANK range `[start, stop]` against `len` into a
+    /// half-open `usize` range, clamped to bounds; an empty/inverted range yields `a..a`.
+    /// The same normalization LRANGE/ZRANGE-by-index use.
+    fn resolve_rank_range(len: usize, start: i64, stop: i64) -> std::ops::Range<usize> {
+        let len_i = len as i64;
+        if len_i == 0 {
+            return 0..0;
+        }
+        let mut s = if start < 0 { start + len_i } else { start };
+        let mut e = if stop < 0 { stop + len_i } else { stop };
+        if s < 0 {
+            s = 0;
+        }
+        if e >= len_i {
+            e = len_i - 1;
+        }
+        if s > e || s >= len_i {
+            return 0..0;
+        }
+        (s as usize)..((e + 1) as usize)
+    }
+
+    /// Apply an optional `(offset, count)` LIMIT to an already-ordered list: skip
+    /// `offset` (a negative offset yields nothing, matching Redis), then take `count`
+    /// (a negative count means "to the end").
+    fn apply_limit<T>(mut items: Vec<T>, limit: Option<(i64, i64)>) -> Vec<T> {
+        let Some((offset, count)) = limit else {
+            return items;
+        };
+        if offset < 0 {
+            return Vec::new();
+        }
+        let offset = offset as usize;
+        if offset >= items.len() {
+            return Vec::new();
+        }
+        items.drain(..offset);
+        if count >= 0 {
+            items.truncate(count as usize);
+        }
+        items
+    }
+}
+
+/// Whether a score UPDATE from `cur` to `new` passes the GT/LT gate (used by both `add`
+/// and `incr`). GT permits the update only when `new` is strictly greater than `cur`; LT
+/// only when strictly less; with neither set the update always passes. Written with
+/// positive comparisons (no negated partial-ord operator) so a non-finite score compares
+/// the IEEE way Redis relies on (GT vs `+inf` never updates, etc.).
+fn gate_passes(cur: f64, new: f64, flags: ZAddFlags) -> bool {
+    if flags.gt {
+        new > cur
+    } else if flags.lt {
+        new < cur
+    } else {
+        true
+    }
+}
+
+impl ZSetValue for ZSetVal {
+    #[allow(clippy::float_cmp)] // `score != cur` is the exact Redis CH "changed" check.
+    fn add(&mut self, member: &[u8], score: f64, flags: ZAddFlags) -> ZAddOutcome {
+        let Some(cur) = self.score(member) else {
+            // The member is absent: XX suppresses adding it; GT/LT alone DO add new members
+            // (per Redis they only gate UPDATES), so they fall through to the add.
+            if flags.xx {
+                return ZAddOutcome {
+                    added: false,
+                    changed: false,
+                    new_score: None,
+                };
+            }
+            self.put(member, score);
+            return ZAddOutcome {
+                added: true,
+                changed: true,
+                new_score: Some(score),
+            };
+        };
+        // The member exists: NX suppresses any update; GT/LT gate on the new score.
+        if flags.nx || !gate_passes(cur, score, flags) {
+            return ZAddOutcome {
+                added: false,
+                changed: false,
+                new_score: Some(cur),
+            };
+        }
+        // Apply the score (an equal score still counts as unchanged, matching Redis: CH
+        // counts a member as changed only if the score actually differs).
+        let changed = score != cur;
+        if changed {
+            self.put(member, score);
+        }
+        ZAddOutcome {
+            added: false,
+            changed,
+            new_score: Some(score),
+        }
+    }
+
+    fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> IncrOutcome {
+        let Some(cur) = self.score(member) else {
+            if flags.xx {
+                return IncrOutcome::Suppressed; // XX on a missing member: INCR -> nil.
+            }
+            // Create at `delta` (ZINCRBY/ZADD INCR on a missing member starts from 0). A
+            // NaN delta itself was rejected at parse time, so the create score is never NaN;
+            // guard defensively anyway so the store never stores a NaN.
+            if delta.is_nan() {
+                return IncrOutcome::Nan;
+            }
+            self.put(member, delta);
+            return IncrOutcome::Updated(delta);
+        };
+        if flags.nx {
+            return IncrOutcome::Suppressed; // NX on an existing member: INCR -> nil.
+        }
+        let new = cur + delta;
+        // A NaN RESULT (e.g. an existing +inf incremented by -inf) is rejected WITHOUT
+        // mutating: the store never holds a NaN score, and the command layer returns
+        // `-ERR resulting score is not a number (NaN)`. Checked BEFORE the gate so the
+        // NaN error takes precedence over a GT/LT suppression.
+        if new.is_nan() {
+            return IncrOutcome::Nan;
+        }
+        if !gate_passes(cur, new, flags) {
+            return IncrOutcome::Suppressed; // GT/LT gate failed: INCR -> nil.
+        }
+        self.put(member, new);
+        IncrOutcome::Updated(new)
+    }
+
+    fn score(&self, member: &[u8]) -> Option<f64> {
+        match &self.0 {
+            ZSetRepr::ListPack(v) => ZSetVal::listpack_pos(v, member).map(|i| v[i].1),
+            ZSetRepr::SkipList { scores, .. } => scores.get(member).copied(),
+        }
+    }
+
+    fn remove(&mut self, member: &[u8]) -> bool {
+        match &mut self.0 {
+            ZSetRepr::ListPack(v) => {
+                if let Some(i) = ZSetVal::listpack_pos(v, member) {
+                    v.remove(i);
+                    true
+                } else {
+                    false
+                }
+            }
+            // One-way ratchet: a skiplist zset stays a skiplist as it shrinks (Redis
+            // parity), so we do NOT demote back to listpack on removal.
+            ZSetRepr::SkipList { index, scores } => {
+                if let Some(old) = scores.remove(member) {
+                    index.remove(&(OrderedScore(old), member.to_vec().into_boxed_slice()));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match &self.0 {
+            ZSetRepr::ListPack(v) => v.len(),
+            ZSetRepr::SkipList { scores, .. } => scores.len(),
+        }
+    }
+
+    fn rank(&self, member: &[u8], rev: bool) -> Option<usize> {
+        let ordered = self.ordered();
+        let pos = ordered.iter().position(|(m, _)| m.as_slice() == member)?;
+        Some(if rev { ordered.len() - 1 - pos } else { pos })
+    }
+
+    fn range_by_rank(&self, start: i64, stop: i64, rev: bool) -> Vec<(Vec<u8>, f64)> {
+        let mut ordered = self.ordered();
+        if rev {
+            ordered.reverse();
+        }
+        let r = ZSetVal::resolve_rank_range(ordered.len(), start, stop);
+        ordered[r].to_vec()
+    }
+
+    fn range_by_score(
+        &self,
+        min: ScoreBound,
+        max: ScoreBound,
+        rev: bool,
+        limit: Option<(i64, i64)>,
+    ) -> Vec<(Vec<u8>, f64)> {
+        // Filter in ascending order, then reverse for rev (so the LIMIT offset/count apply
+        // to the result order, matching Redis ZREVRANGEBYSCORE).
+        let mut out: Vec<(Vec<u8>, f64)> = self
+            .ordered()
+            .into_iter()
+            .filter(|(_, s)| min.allows_min(*s) && max.allows_max(*s))
+            .collect();
+        if rev {
+            out.reverse();
+        }
+        ZSetVal::apply_limit(out, limit)
+    }
+
+    fn range_by_lex(
+        &self,
+        min: &LexBound,
+        max: &LexBound,
+        rev: bool,
+        limit: Option<(i64, i64)>,
+    ) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = self
+            .ordered()
+            .into_iter()
+            .filter(|(m, _)| min.allows_min(m) && max.allows_max(m))
+            .map(|(m, _)| m)
+            .collect();
+        if rev {
+            out.reverse();
+        }
+        ZSetVal::apply_limit(out, limit)
+    }
+
+    fn count_by_score(&self, min: ScoreBound, max: ScoreBound) -> usize {
+        self.ordered()
+            .iter()
+            .filter(|(_, s)| min.allows_min(*s) && max.allows_max(*s))
+            .count()
+    }
+
+    fn count_by_lex(&self, min: &LexBound, max: &LexBound) -> usize {
+        self.ordered()
+            .iter()
+            .filter(|(m, _)| min.allows_min(m) && max.allows_max(m))
+            .count()
+    }
+
+    fn pop_min(&mut self, count: usize) -> Vec<(Vec<u8>, f64)> {
+        let mut ordered = self.ordered();
+        ordered.truncate(count);
+        for (m, _) in &ordered {
+            self.remove(m);
+        }
+        ordered
+    }
+
+    fn pop_max(&mut self, count: usize) -> Vec<(Vec<u8>, f64)> {
+        let mut ordered = self.ordered();
+        ordered.reverse();
+        ordered.truncate(count);
+        for (m, _) in &ordered {
+            self.remove(m);
+        }
+        ordered
+    }
+
+    fn remove_range_by_rank(&mut self, start: i64, stop: i64) -> usize {
+        let ordered = self.ordered();
+        let r = ZSetVal::resolve_rank_range(ordered.len(), start, stop);
+        let victims: Vec<Vec<u8>> = ordered[r].iter().map(|(m, _)| m.clone()).collect();
+        for m in &victims {
+            self.remove(m);
+        }
+        victims.len()
+    }
+
+    fn remove_range_by_score(&mut self, min: ScoreBound, max: ScoreBound) -> usize {
+        let victims: Vec<Vec<u8>> = self
+            .ordered()
+            .into_iter()
+            .filter(|(_, s)| min.allows_min(*s) && max.allows_max(*s))
+            .map(|(m, _)| m)
+            .collect();
+        for m in &victims {
+            self.remove(m);
+        }
+        victims.len()
+    }
+
+    fn remove_range_by_lex(&mut self, min: &LexBound, max: &LexBound) -> usize {
+        let victims: Vec<Vec<u8>> = self
+            .ordered()
+            .into_iter()
+            .filter(|(m, _)| min.allows_min(m) && max.allows_max(m))
+            .map(|(m, _)| m)
+            .collect();
+        for m in &victims {
+            self.remove(m);
+        }
+        victims.len()
+    }
+
+    fn members_with_scores(&self) -> Vec<(Vec<u8>, f64)> {
+        self.ordered()
+    }
+
+    fn is_listpack(&self) -> bool {
+        self.is_small()
+    }
+}
+
 /// Parse a member as an i64 the way Redis `string2ll` (src/util.c) does for intset
 /// membership: an optional single leading `-` then ASCII digits, full i64 range,
 /// rejecting leading `+`, whitespace, and overflow. Leading-zero canonicality is checked
@@ -1219,6 +1780,14 @@ impl KvObj {
                 let set = SetVal::from_members(&members);
                 KvObj::from_set(key, set, expire_at)
             }
+            // The PR-8 create-on-missing ZSET path: build the zset value from the
+            // (member, score) pairs (deduped -- last score wins -- + ladder/ordering
+            // applied by `ZSetVal::from_pairs`). Subsequent edits go through the in-place
+            // RmwAction::Mutated path, not this rebuild.
+            NewValueOwned::ZSet(pairs) => {
+                let zset = ZSetVal::from_pairs(&pairs);
+                KvObj::from_zset(key, zset, expire_at)
+            }
         }
     }
 
@@ -1264,6 +1833,20 @@ impl KvObj {
         }
     }
 
+    /// Build a `KvObj` holding a ZSET value (PR-8). The data type is [`DataType::ZSet`]
+    /// and the encoding is read off the zset's active form ([`ZSetVal::encoding`]); the
+    /// store recomputes it after each in-place edit.
+    #[must_use]
+    pub fn from_zset(key: &[u8], zset: ZSetVal, expire_at: Option<UnixMillis>) -> Self {
+        let encoding = zset.encoding();
+        KvObj {
+            header: Header::with_type(DataType::ZSet, encoding, expire_at.is_some()),
+            key: key.to_vec().into_boxed_slice(),
+            value: ValueRepr::ZSet(zset),
+            expire_at,
+        }
+    }
+
     /// Recompute and store `header.encoding` from the CURRENT value representation
     /// (PR-5: called by the store after an in-place collection edit, so a list that
     /// crossed the listpack->quicklist threshold, or a hash that crossed listpack->
@@ -1303,6 +1886,17 @@ impl KvObj {
         }
     }
 
+    /// A mutable borrow of the stored ZSET value, or `None` if this entry is not a sorted
+    /// set (PR-8: the store hands this to the in-place-mutation arm; a non-zset yields
+    /// `None` -> WRONGTYPE). The ZSET analog of [`Self::as_list_mut`]/[`Self::as_hash_mut`]/
+    /// [`Self::as_set_mut`].
+    pub fn as_zset_mut(&mut self) -> Option<&mut ZSetVal> {
+        match &mut self.value {
+            ValueRepr::ZSet(z) => Some(z),
+            _ => None,
+        }
+    }
+
     /// Whether this entry holds a LIST value (PR-5).
     #[must_use]
     pub fn is_list(&self) -> bool {
@@ -1321,6 +1915,12 @@ impl KvObj {
         matches!(self.value, ValueRepr::Set(_))
     }
 
+    /// Whether this entry holds a ZSET value (PR-8).
+    #[must_use]
+    pub fn is_zset(&self) -> bool {
+        matches!(self.value, ValueRepr::ZSet(_))
+    }
+
     /// Whether this entry is a COLLECTION at all (list/hash/set/...; PR-5 list, PR-6 hash,
     /// PR-7 set). The SINGLE source of "what reprs are collections", so the store's
     /// `rmw_mut` type-dispatch and the empty-collection check stay in sync (the PR-5
@@ -1335,7 +1935,7 @@ impl KvObj {
     pub fn is_collection(&self) -> bool {
         matches!(
             self.value,
-            ValueRepr::List(_) | ValueRepr::Hash(_) | ValueRepr::Set(_)
+            ValueRepr::List(_) | ValueRepr::Hash(_) | ValueRepr::Set(_) | ValueRepr::ZSet(_)
         )
     }
 
@@ -1350,6 +1950,7 @@ impl KvObj {
             ValueRepr::List(l) => Some(l.len()),
             ValueRepr::Hash(h) => Some(h.len()),
             ValueRepr::Set(s) => Some(s.len()),
+            ValueRepr::ZSet(z) => Some(z.len()),
             _ => None,
         }
     }
@@ -1886,5 +2487,323 @@ mod tests {
         assert!(!o.is_empty_collection());
         // accounted_bytes = key + element bytes.
         assert_eq!(o.accounted_bytes(), 1 + 1);
+    }
+
+    // -- ZSetVal unit tests (PR-8): the (score, member) total order + the
+    // listpack->skiplist transition + score-update + NaN/inf handling + accounting. --
+
+    fn no_flags() -> ZAddFlags {
+        ZAddFlags::default()
+    }
+
+    #[test]
+    fn zsetval_orders_by_score_then_member_lex() {
+        let mut z = ZSetVal::new();
+        // Insert out of order; the (score, member) order must come out sorted.
+        z.add(b"b", 2.0, no_flags());
+        z.add(b"a", 1.0, no_flags());
+        z.add(b"c", 2.0, no_flags()); // equal score to b -> member lex tiebreak (b before c)
+        z.add(b"d", 1.0, no_flags()); // equal score to a -> a before d
+        let order: Vec<Vec<u8>> = z
+            .members_with_scores()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        assert_eq!(
+            order,
+            vec![b"a".to_vec(), b"d".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "score ASC, then member-bytes ASC for equal scores"
+        );
+    }
+
+    #[test]
+    fn zsetval_inf_scores_order_at_the_extremes() {
+        let mut z = ZSetVal::new();
+        z.add(b"mid", 0.0, no_flags());
+        z.add(b"hi", f64::INFINITY, no_flags());
+        z.add(b"lo", f64::NEG_INFINITY, no_flags());
+        let order: Vec<Vec<u8>> = z
+            .members_with_scores()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        assert_eq!(order, vec![b"lo".to_vec(), b"mid".to_vec(), b"hi".to_vec()]);
+        assert_eq!(z.score(b"hi"), Some(f64::INFINITY));
+        assert_eq!(z.score(b"lo"), Some(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn zsetval_score_update_reorders_and_does_not_grow() {
+        let mut z = ZSetVal::new();
+        assert!(z.add(b"a", 1.0, no_flags()).added);
+        assert!(z.add(b"b", 2.0, no_flags()).added);
+        // Update a's score above b: it must reorder and NOT be a new member.
+        let out = z.add(b"a", 9.0, no_flags());
+        assert!(!out.added);
+        assert!(out.changed);
+        assert_eq!(out.new_score, Some(9.0));
+        assert_eq!(z.len(), 2);
+        let order: Vec<Vec<u8>> = z
+            .members_with_scores()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        assert_eq!(order, vec![b"b".to_vec(), b"a".to_vec()]);
+    }
+
+    #[test]
+    fn zsetval_transition_at_entry_and_byte_thresholds_is_one_way() {
+        // Entry-count threshold: 128 entries stays listpack; 129 flips to skiplist.
+        let mut z = ZSetVal::new();
+        for i in 0..DEFAULT_ZSET_MAX_LISTPACK_ENTRIES {
+            z.add(format!("m{i:04}").as_bytes(), i as f64, no_flags());
+        }
+        assert_eq!(z.len(), DEFAULT_ZSET_MAX_LISTPACK_ENTRIES);
+        assert_eq!(
+            z.encoding(),
+            Encoding::ListPack,
+            "exactly 128 stays listpack"
+        );
+        z.add(b"overflow", 999.0, no_flags());
+        assert_eq!(
+            z.encoding(),
+            Encoding::SkipList,
+            "129 entries flips to skiplist"
+        );
+        // One-way ratchet: removing back below 128 keeps it skiplist.
+        for i in 0..DEFAULT_ZSET_MAX_LISTPACK_ENTRIES {
+            z.remove(format!("m{i:04}").as_bytes());
+        }
+        assert!(z.len() < DEFAULT_ZSET_MAX_LISTPACK_ENTRIES);
+        assert_eq!(
+            z.encoding(),
+            Encoding::SkipList,
+            "a skiplist zset never demotes back to listpack"
+        );
+
+        // Per-member byte threshold: a 64-byte member stays listpack; 65 flips.
+        let mut z2 = ZSetVal::new();
+        z2.add(b"x", 1.0, no_flags());
+        let at_cap = vec![b'q'; DEFAULT_ZSET_MAX_LISTPACK_VALUE];
+        z2.add(&at_cap, 2.0, no_flags());
+        assert_eq!(
+            z2.encoding(),
+            Encoding::ListPack,
+            "64-byte member at the cap"
+        );
+        let over_cap = vec![b'q'; DEFAULT_ZSET_MAX_LISTPACK_VALUE + 1];
+        z2.add(&over_cap, 3.0, no_flags());
+        assert_eq!(
+            z2.encoding(),
+            Encoding::SkipList,
+            "a 65-byte member flips to skiplist"
+        );
+    }
+
+    #[test]
+    fn zsetval_add_matrix_nx_xx_gt_lt() {
+        let mut z = ZSetVal::new();
+        z.add(b"a", 5.0, no_flags());
+        // NX on an existing member: suppressed (no change), new_score reflects current.
+        let nx = z.add(
+            b"a",
+            1.0,
+            ZAddFlags {
+                nx: true,
+                ..no_flags()
+            },
+        );
+        assert!(!nx.added && !nx.changed && nx.new_score == Some(5.0));
+        // XX on a missing member: suppressed, new_score None.
+        let xx = z.add(
+            b"new",
+            1.0,
+            ZAddFlags {
+                xx: true,
+                ..no_flags()
+            },
+        );
+        assert!(!xx.added && !xx.changed && xx.new_score.is_none());
+        // GT updates only if greater: 3 < 5 -> suppressed.
+        let gt_lo = z.add(
+            b"a",
+            3.0,
+            ZAddFlags {
+                gt: true,
+                ..no_flags()
+            },
+        );
+        assert!(!gt_lo.changed && z.score(b"a") == Some(5.0));
+        // GT updates if greater: 9 > 5 -> applied.
+        let gt_hi = z.add(
+            b"a",
+            9.0,
+            ZAddFlags {
+                gt: true,
+                ..no_flags()
+            },
+        );
+        assert!(gt_hi.changed && z.score(b"a") == Some(9.0));
+        // GT/LT alone still ADD a new member (Redis: GT/LT do not prevent adds).
+        let added = z.add(
+            b"fresh",
+            7.0,
+            ZAddFlags {
+                gt: true,
+                ..no_flags()
+            },
+        );
+        assert!(added.added && z.score(b"fresh") == Some(7.0));
+    }
+
+    #[test]
+    fn zsetval_incr_and_suppression() {
+        let mut z = ZSetVal::new();
+        // INCR on a missing member starts from delta.
+        assert_eq!(z.incr(b"a", 2.5, no_flags()), IncrOutcome::Updated(2.5));
+        assert_eq!(z.incr(b"a", 2.5, no_flags()), IncrOutcome::Updated(5.0));
+        // NX INCR on an existing member: suppressed (nil).
+        assert_eq!(
+            z.incr(
+                b"a",
+                1.0,
+                ZAddFlags {
+                    nx: true,
+                    ..no_flags()
+                }
+            ),
+            IncrOutcome::Suppressed
+        );
+        // XX INCR on a missing member: suppressed (nil).
+        assert_eq!(
+            z.incr(
+                b"missing",
+                1.0,
+                ZAddFlags {
+                    xx: true,
+                    ..no_flags()
+                }
+            ),
+            IncrOutcome::Suppressed
+        );
+    }
+
+    #[test]
+    fn zsetval_incr_nan_result_is_signalled_and_does_not_mutate() {
+        // An existing +inf incremented by -inf yields NaN: the store must NOT store it.
+        let mut z = ZSetVal::new();
+        assert_eq!(
+            z.incr(b"m", f64::INFINITY, no_flags()),
+            IncrOutcome::Updated(f64::INFINITY)
+        );
+        assert_eq!(
+            z.incr(b"m", f64::NEG_INFINITY, no_flags()),
+            IncrOutcome::Nan
+        );
+        // The member is UNCHANGED at +inf (no NaN stored, the order is untouched).
+        assert_eq!(z.score(b"m"), Some(f64::INFINITY));
+
+        // The symmetric case: an existing -inf incremented by +inf.
+        let mut z2 = ZSetVal::new();
+        assert_eq!(
+            z2.incr(b"m", f64::NEG_INFINITY, no_flags()),
+            IncrOutcome::Updated(f64::NEG_INFINITY)
+        );
+        assert_eq!(z2.incr(b"m", f64::INFINITY, no_flags()), IncrOutcome::Nan);
+        assert_eq!(z2.score(b"m"), Some(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn zsetval_range_by_score_rank_lex_and_pops() {
+        let mut z = ZSetVal::new();
+        for (m, s) in [(b"a", 1.0), (b"b", 2.0), (b"c", 3.0), (b"d", 4.0)] {
+            z.add(m, s, no_flags());
+        }
+        // range_by_score inclusive [2,3].
+        let by_score = z.range_by_score(
+            ScoreBound::inclusive(2.0),
+            ScoreBound::inclusive(3.0),
+            false,
+            None,
+        );
+        assert_eq!(by_score, vec![(b"b".to_vec(), 2.0), (b"c".to_vec(), 3.0)]);
+        // exclusive lower (2 -> excludes b.
+        let excl = z.range_by_score(
+            ScoreBound::exclusive(2.0),
+            ScoreBound::inclusive(4.0),
+            false,
+            None,
+        );
+        assert_eq!(excl.len(), 2);
+        assert_eq!(excl[0].0, b"c".to_vec());
+        // rank.
+        assert_eq!(z.rank(b"a", false), Some(0));
+        assert_eq!(z.rank(b"a", true), Some(3));
+        assert_eq!(z.rank(b"zzz", false), None);
+        // range_by_rank [0, 1].
+        let r = z.range_by_rank(0, 1, false);
+        assert_eq!(r, vec![(b"a".to_vec(), 1.0), (b"b".to_vec(), 2.0)]);
+        // count_by_score.
+        assert_eq!(
+            z.count_by_score(ScoreBound::inclusive(2.0), ScoreBound::inclusive(3.0)),
+            2
+        );
+        // pop_min/pop_max.
+        assert_eq!(z.pop_min(1), vec![(b"a".to_vec(), 1.0)]);
+        assert_eq!(z.pop_max(1), vec![(b"d".to_vec(), 4.0)]);
+        assert_eq!(z.len(), 2);
+    }
+
+    #[test]
+    fn zsetval_lex_range_equal_scores() {
+        let mut z = ZSetVal::new();
+        for m in [b"a".as_slice(), b"b", b"c", b"d"] {
+            z.add(m, 0.0, no_flags());
+        }
+        // [b, (d -> b, c.
+        let lex = z.range_by_lex(
+            &LexBound::Inclusive(b"b".to_vec()),
+            &LexBound::Exclusive(b"d".to_vec()),
+            false,
+            None,
+        );
+        assert_eq!(lex, vec![b"b".to_vec(), b"c".to_vec()]);
+        // - to + -> all.
+        let all = z.range_by_lex(&LexBound::NegInf, &LexBound::PosInf, false, None);
+        assert_eq!(all.len(), 4);
+        assert_eq!(z.count_by_lex(&LexBound::NegInf, &LexBound::PosInf), 4);
+    }
+
+    #[test]
+    fn kvobj_from_zset_reports_zset_type_and_encoding_and_accounting() {
+        let mut z = ZSetVal::new();
+        z.add(b"m", 1.0, no_flags());
+        let o = KvObj::from_zset(b"k", z, None);
+        assert_eq!(o.header.data_type, DataType::ZSet);
+        assert_eq!(o.header.encoding, Encoding::ListPack);
+        assert!(o.is_zset());
+        assert!(o.is_collection());
+        assert!(!o.is_empty_collection());
+        // accounted_bytes = key(1) + member bytes(1) + 8-byte score charge.
+        assert_eq!(o.accounted_bytes(), 1 + 1 + 8);
+    }
+
+    #[test]
+    fn kvobj_from_zset_via_new_owned_dedupes_last_score_wins() {
+        let o = KvObj::from_new_owned(
+            b"k",
+            NewValueOwned::zset(vec![
+                (b"a".to_vec(), 1.0),
+                (b"b".to_vec(), 2.0),
+                (b"a".to_vec(), 9.0),
+            ]),
+            None,
+        );
+        assert_eq!(o.collection_len(), Some(2), "duplicate member deduped");
+        if let ValueRepr::ZSet(z) = &o.value {
+            assert_eq!(z.score(b"a"), Some(9.0), "last score wins");
+        } else {
+            panic!("expected a zset value");
+        }
     }
 }

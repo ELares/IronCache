@@ -13,6 +13,7 @@ use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{
     cmd_config, cmd_expire, cmd_hash, cmd_introspect, cmd_keyspace, cmd_list, cmd_set, cmd_string,
+    cmd_zset,
 };
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
@@ -497,6 +498,45 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
         b"SUNIONSTORE" => cmd_set::cmd_sunionstore(store, db, now, req),
         b"SDIFFSTORE" => cmd_set::cmd_sdiffstore(store, db, now, req),
         b"SSCAN" => cmd_set::cmd_sscan(store, db, now, req),
+        // -- Sorted-set (zset) commands (PR-8, COMMANDS.md zset semantics). --
+        b"ZADD" => cmd_zset::cmd_zadd(store, db, now, req),
+        b"ZINCRBY" => cmd_zset::cmd_zincrby(store, db, now, req),
+        b"ZREM" => cmd_zset::cmd_zrem(store, db, now, req),
+        b"ZSCORE" => cmd_zset::cmd_zscore(store, db, now, req),
+        b"ZMSCORE" => cmd_zset::cmd_zmscore(store, db, now, req),
+        b"ZCARD" => cmd_zset::cmd_zcard(store, db, now, req),
+        b"ZRANK" => cmd_zset::cmd_zrank(store, db, now, req),
+        b"ZREVRANK" => cmd_zset::cmd_zrevrank(store, db, now, req),
+        b"ZCOUNT" => cmd_zset::cmd_zcount(store, db, now, req),
+        b"ZLEXCOUNT" => cmd_zset::cmd_zlexcount(store, db, now, req),
+        b"ZRANGE" => cmd_zset::cmd_zrange(store, db, now, req),
+        b"ZREVRANGE" => cmd_zset::cmd_zrevrange(store, db, now, req),
+        b"ZRANGEBYSCORE" => cmd_zset::cmd_zrangebyscore(store, db, now, req),
+        b"ZREVRANGEBYSCORE" => cmd_zset::cmd_zrevrangebyscore(store, db, now, req),
+        b"ZRANGEBYLEX" => cmd_zset::cmd_zrangebylex(store, db, now, req),
+        b"ZREVRANGEBYLEX" => cmd_zset::cmd_zrevrangebylex(store, db, now, req),
+        b"ZREMRANGEBYRANK" => cmd_zset::cmd_zremrangebyrank(store, db, now, req),
+        b"ZREMRANGEBYSCORE" => cmd_zset::cmd_zremrangebyscore(store, db, now, req),
+        b"ZREMRANGEBYLEX" => cmd_zset::cmd_zremrangebylex(store, db, now, req),
+        b"ZPOPMIN" => cmd_zset::cmd_zpopmin(store, db, now, req),
+        b"ZPOPMAX" => cmd_zset::cmd_zpopmax(store, db, now, req),
+        b"ZRANDMEMBER" => {
+            // ZRANDMEMBER's randomness enters through the Env RNG seam (ADR-0003): the
+            // CALLER draws the seed here and passes it in; the store + handler read no
+            // RNG. Draw ONLY for ZRANDMEMBER so the per-command RNG stream is not perturbed
+            // (mirrors the SRANDMEMBER/HRANDFIELD/RANDOMKEY draw blocks).
+            let seed = env.rng().next_u64();
+            cmd_zset::cmd_zrandmember(store, db, seed, now, req)
+        }
+        b"ZSCAN" => cmd_zset::cmd_zscan(store, db, now, req),
+        b"ZRANGESTORE" => cmd_zset::cmd_zrangestore(store, db, now, req),
+        b"ZUNION" => cmd_zset::cmd_zunion(store, db, now, req),
+        b"ZINTER" => cmd_zset::cmd_zinter(store, db, now, req),
+        b"ZDIFF" => cmd_zset::cmd_zdiff(store, db, now, req),
+        b"ZUNIONSTORE" => cmd_zset::cmd_zunionstore(store, db, now, req),
+        b"ZINTERSTORE" => cmd_zset::cmd_zinterstore(store, db, now, req),
+        b"ZDIFFSTORE" => cmd_zset::cmd_zdiffstore(store, db, now, req),
+        b"ZINTERCARD" => cmd_zset::cmd_zintercard(store, db, now, req),
         // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
         b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
         _ => {
