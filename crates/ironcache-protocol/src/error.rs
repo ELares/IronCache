@@ -675,12 +675,25 @@ impl ErrorReply {
     }
 
     /// `ERR bit is not an integer or out of range` - the reply Redis emits (src/bitops.c
-    /// `setbitCommand` / `bitposCommand`) when a SETBIT value (or BITPOS target bit) is
-    /// not exactly 0 or 1. Byte-exact. DISTINCT from [`Self::bit_offset_out_of_range`]
-    /// (the OFFSET) and the generic not-an-integer error.
+    /// `setbitCommand`) when a SETBIT value is not exactly 0 or 1. Byte-exact. DISTINCT
+    /// from [`Self::bit_offset_out_of_range`] (the OFFSET) and the generic
+    /// not-an-integer error. NOTE: BITPOS does NOT reuse this string; a BITPOS bit
+    /// argument that is non-integer is the generic [`Self::not_an_integer`], and a
+    /// parsed-but-not-0/1 value is [`Self::bitpos_bit_arg`] ("The bit argument must be
+    /// 1 or 0.").
     #[must_use]
     pub fn bit_not_integer_or_range() -> Self {
         ErrorReply::new(ErrorCode::Err, "bit is not an integer or out of range")
+    }
+
+    /// `ERR The bit argument must be 1 or 0.` - the reply Redis emits (src/bitops.c
+    /// `bitposCommand`) when the BITPOS `bit` argument PARSES as an integer but is not
+    /// exactly 0 or 1 (e.g. `2`, `-1`). Byte-exact (note the trailing period). A
+    /// non-integer / leading-zero bit argument is the earlier generic
+    /// [`Self::not_an_integer`] (the integer parse fails first).
+    #[must_use]
+    pub fn bitpos_bit_arg() -> Self {
+        ErrorReply::new(ErrorCode::Err, "The bit argument must be 1 or 0.")
     }
 
     /// `ERR BITOP NOT must be called with a single source key.` - the reply Redis emits
@@ -1106,6 +1119,12 @@ mod tests {
         assert_eq!(
             ErrorReply::bit_not_integer_or_range().line(),
             "-ERR bit is not an integer or out of range"
+        );
+        // BITPOS's parsed-but-not-0/1 bit-argument error (note the trailing period).
+        // DISTINCT from SETBIT's bit-not-integer string above.
+        assert_eq!(
+            ErrorReply::bitpos_bit_arg().line(),
+            "-ERR The bit argument must be 1 or 0."
         );
         assert_eq!(
             ErrorReply::bitop_not_single_source().line(),
