@@ -248,6 +248,66 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "WATCH inside MULTI is not allowed")
     }
 
+    /// `ERR a queued command references a key on another shard; cross-shard
+    /// transactions are not supported yet` - a TEMPORARY limitation of the
+    /// cross-shard coordinator (COORDINATOR.md #107).
+    ///
+    /// Emitted at QUEUE time (inside a `MULTI`) when a keyed command's key(s) are
+    /// not all owned by the connection's home shard. A correct transaction must
+    /// reach EXEC with EVERY watched key and EVERY queued command's key home-owned,
+    /// so home-only EXEC is always correct; a command that would violate that is
+    /// rejected NOW and the transaction is dirtied (a later EXEC returns -EXECABORT
+    /// and applies nothing), rather than silently executing eagerly + out of order.
+    ///
+    /// IronCache presents as a SINGLE NODE (not a cluster), so this is deliberately
+    /// NOT Redis's `-CROSSSLOT` (which is a cluster-slot contract a client can
+    /// observe); it is a plain `ERR` describing the temporary limitation. The guard
+    /// is removed once Stage 3 (txid + ordered cross-shard apply) lands; with
+    /// `shards == 1` every key is home-owned, so it never fires.
+    #[must_use]
+    pub fn txn_cross_shard_command() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "a queued command references a key on another shard; cross-shard transactions are not supported yet",
+        )
+    }
+
+    /// `ERR WATCH of a key on another shard is not supported yet` - the companion
+    /// TEMPORARY limitation for `WATCH` of a key owned by a remote shard
+    /// (COORDINATOR.md #107). A cross-shard WATCH would snapshot the WRONG (home)
+    /// store, so the dirty-CAS at EXEC would be meaningless; we reject the WATCH
+    /// loudly instead and leave the connection un-watched (a following MULTI/EXEC
+    /// still works). Like [`Self::txn_cross_shard_command`] this is a plain `ERR`
+    /// (not `-CROSSSLOT`): IronCache is single-node, and the guard is removed by the
+    /// Stage 3 cross-shard transaction work. With `shards == 1` every key is
+    /// home-owned, so it never fires.
+    #[must_use]
+    pub fn watch_cross_shard() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "WATCH of a key on another shard is not supported yet",
+        )
+    }
+
+    /// `ERR a whole-keyspace command in a transaction is not supported across shards
+    /// yet` - the companion TEMPORARY limitation for a WHOLE-KEYSPACE command
+    /// (KEYS/SCAN/DBSIZE/FLUSHALL/FLUSHDB/RANDOMKEY) queued inside `MULTI`
+    /// (COORDINATOR.md #107). Outside a transaction these SCATTER-GATHER across all
+    /// shards; inside `MULTI`, `EXEC` replays synchronously on the HOME store only, so
+    /// they would return a PARTIAL (~1/N) result (a `MULTI; FLUSHALL; EXEC` would flush
+    /// only the home partition -- a silent partial flush). We reject them loudly at
+    /// queue time (dirtying the transaction, so `EXEC` returns `-EXECABORT`) rather than
+    /// return a partial result. A plain `ERR` (not `-CROSSSLOT`): IronCache is
+    /// single-node, and the guard is removed by the Stage 3 cross-shard transaction
+    /// work. With `shards == 1` the home shard IS the whole keyspace, so it never fires.
+    #[must_use]
+    pub fn txn_whole_keyspace_unsupported() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "a whole-keyspace command in a transaction is not supported across shards yet",
+        )
+    }
+
     /// `ERR AUTH <password> called without any password configured for the
     /// default user. Are you sure your configuration is correct?` - the current
     /// canonical Redis string for `AUTH` when no `requirepass`/ACL password is
@@ -888,6 +948,35 @@ mod tests {
         assert_eq!(ErrorReply::discard_without_multi().code(), ErrorCode::Err);
         assert_eq!(ErrorReply::multi_nested().code(), ErrorCode::Err);
         assert_eq!(ErrorReply::watch_inside_multi().code(), ErrorCode::Err);
+    }
+
+    #[test]
+    fn cross_shard_transaction_strings_are_byte_exact() {
+        // The two TEMPORARY cross-shard transaction limitation errors (COORDINATOR.md
+        // #107): an in-MULTI command whose key is owned by a remote shard, and a WATCH of
+        // a remote-owned key before MULTI. Both use the plain `ERR` token (IronCache is
+        // single-node, NOT a cluster, so deliberately NOT `-CROSSSLOT`); the leading code
+        // is prepended by `line`, so the message carries no double prefix. These are
+        // removed by the Stage 3 cross-shard transaction work; with shards == 1 they never
+        // fire (every key is home-owned).
+        assert_eq!(
+            ErrorReply::txn_cross_shard_command().line(),
+            "-ERR a queued command references a key on another shard; cross-shard transactions are not supported yet"
+        );
+        assert_eq!(
+            ErrorReply::watch_cross_shard().line(),
+            "-ERR WATCH of a key on another shard is not supported yet"
+        );
+        assert_eq!(
+            ErrorReply::txn_whole_keyspace_unsupported().line(),
+            "-ERR a whole-keyspace command in a transaction is not supported across shards yet"
+        );
+        assert_eq!(ErrorReply::txn_cross_shard_command().code(), ErrorCode::Err);
+        assert_eq!(ErrorReply::watch_cross_shard().code(), ErrorCode::Err);
+        assert_eq!(
+            ErrorReply::txn_whole_keyspace_unsupported().code(),
+            ErrorCode::Err
+        );
     }
 
     #[test]
