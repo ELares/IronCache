@@ -272,6 +272,10 @@ fn arity_of(cmd: &[u8]) -> Option<Arity> {
         b"BITOP" => Min(4),
         b"BITFIELD" => Min(2),
         b"BITFIELD_RO" => Min(2),
+        // -- HyperLogLog (cmd_hll). All three are Redis arity -2 (Min(2)). --
+        b"PFADD" => Min(2),
+        b"PFCOUNT" => Min(2),
+        b"PFMERGE" => Min(2),
         // -- Introspection (cmd_introspect). --
         b"OBJECT" => Min(2),
         _ => return None,
@@ -508,6 +512,10 @@ mod tests {
             b"BITOP",
             b"BITFIELD",
             b"BITFIELD_RO",
+            // HyperLogLog
+            b"PFADD",
+            b"PFCOUNT",
+            b"PFMERGE",
             // Introspection
             b"OBJECT",
         ];
@@ -668,6 +676,10 @@ mod tests {
             b"BITOP",
             b"BITFIELD",
             b"BITFIELD_RO",
+            // HyperLogLog
+            b"PFADD",
+            b"PFCOUNT",
+            b"PFMERGE",
             // Introspection
             b"OBJECT",
         ];

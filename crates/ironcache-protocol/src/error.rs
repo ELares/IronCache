@@ -779,6 +779,22 @@ impl ErrorReply {
         )
     }
 
+    /// `WRONGTYPE Key is not a valid HyperLogLog string value.` - the reply Redis emits
+    /// (src/hyperloglog.c `isHLLObjectOrReply`) when a PFADD / PFCOUNT / PFMERGE key
+    /// holds a STRING that is not a valid HyperLogLog object (bad magic / encoding /
+    /// length). The leading token is `WRONGTYPE` (the same code as the wrong-type error),
+    /// so [`ErrorReply::line`] renders `-WRONGTYPE Key is not a valid HyperLogLog string
+    /// value.`; the message passed here carries NO `WRONGTYPE` prefix (the code token is
+    /// prepended by `line`, exactly as [`Self::wrong_type`] relies on). The trailing
+    /// period is part of the canonical Redis string. Byte-exact.
+    #[must_use]
+    pub fn hll_invalid_value() -> Self {
+        ErrorReply::new(
+            ErrorCode::WrongType,
+            "Key is not a valid HyperLogLog string value.",
+        )
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free
@@ -1213,5 +1229,17 @@ mod tests {
             ErrorReply::bitfield_ro_no_writes().line(),
             "-ERR BITFIELD_RO only supports the GET subcommand"
         );
+    }
+
+    #[test]
+    fn hll_invalid_value_error_is_byte_exact() {
+        // Verified against redis/redis src/hyperloglog.c `isHLLObjectOrReply`. The token
+        // is WRONGTYPE (the same code as wrong_type), prepended by `line`, so the message
+        // carries no WRONGTYPE prefix and the wire line has exactly one WRONGTYPE token.
+        assert_eq!(
+            ErrorReply::hll_invalid_value().line(),
+            "-WRONGTYPE Key is not a valid HyperLogLog string value."
+        );
+        assert_eq!(ErrorReply::hll_invalid_value().code(), ErrorCode::WrongType);
     }
 }

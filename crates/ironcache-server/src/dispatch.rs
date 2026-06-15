@@ -12,8 +12,8 @@
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{
-    cmd_bitmap, cmd_config, cmd_expire, cmd_hash, cmd_introspect, cmd_keyspace, cmd_list, cmd_set,
-    cmd_string, cmd_txn, cmd_zset,
+    cmd_bitmap, cmd_config, cmd_expire, cmd_hash, cmd_hll, cmd_introspect, cmd_keyspace, cmd_list,
+    cmd_set, cmd_string, cmd_txn, cmd_zset,
 };
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
@@ -703,6 +703,18 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         b"BITOP" => cmd_bitmap::cmd_bitop(store, db, now, req),
         b"BITFIELD" => cmd_bitmap::cmd_bitfield(store, db, now, req),
         b"BITFIELD_RO" => cmd_bitmap::cmd_bitfield_ro(store, db, now, req),
+        // -- HyperLogLog commands (PR-11, COMMANDS.md HLL) over the STRING type. An HLL
+        // is the dense (12304-byte) string object addressed opaquely (TYPE=string); these
+        // need no new type. PFADD writes through the string `rmw` path (Insert on a new
+        // key, Replace only when a register actually changed, Keep otherwise so a no-op
+        // PFADD does not dirty a watched key); PFCOUNT is read-only (always recomputes the
+        // cardinality, never writes back a cache); PFMERGE reads all sources + writes the
+        // union to dest. WRONGTYPE on a non-string, or the HLL-invalid error on a string
+        // that is not a valid dense HLL. The multi-key PFCOUNT/PFMERGE operate on this
+        // connection's accept shard (single-shard-per-connection, like BITOP). --
+        b"PFADD" => cmd_hll::cmd_pfadd(store, db, now, req),
+        b"PFCOUNT" => cmd_hll::cmd_pfcount(store, db, now, req),
+        b"PFMERGE" => cmd_hll::cmd_pfmerge(store, db, now, req),
         // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
         b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
         _ => {
