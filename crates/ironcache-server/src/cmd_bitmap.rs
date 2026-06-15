@@ -30,9 +30,13 @@
 //!
 //! A bitmap is bounded by the string ceiling: 512 MB per value via
 //! proto-max-bulk-len, so the maximum addressable bit offset is `4*1024*1024*1024-1`
-//! (2^32 bits). SETBIT / BITFIELD at an offset that would grow the value past the
-//! ceiling is REJECTED with the Redis-recognized "bit offset is not an integer or
-//! out of range" error rather than allocating unboundedly (BITMAPS.md size ceiling).
+//! (2^32 bits). SETBIT (and a BITFIELD START offset) past the ceiling is REJECTED with
+//! the Redis-recognized "bit offset is not an integer or out of range" error rather
+//! than allocating unboundedly (BITMAPS.md size ceiling). Matching Redis
+//! `getBitOffsetFromArgument`, BITFIELD checks the START offset ONLY: a field whose
+//! width extends past the ceiling is allowed (a GET reads the missing bits as 0; a
+//! SET/INCRBY grows the value a bounded few bytes past 512 MB), since the start is in
+//! range.
 //!
 //! ## ENCODING DIVERGENCE (documented, identical to APPEND)
 //!
@@ -168,12 +172,16 @@ fn bitpos_in_range(data: &[u8], target: u8, start_bit: u64, end_bit: u64) -> Opt
 // Shared argument parsing.
 // ---------------------------------------------------------------------------
 
-/// Parse a base-10 i64 bit/field offset or value argument the way Redis's
-/// `getLongLongFromObjectOrReply` does for the bit commands: a plain `[-]?digits`
-/// (the looser form, NOT the strict no-leading-zeros rule the numeric RMW uses).
-/// Returns `None` on any non-integer form (the caller maps `None` to the right error).
+/// Parse a base-10 i64 bit/field offset or value argument the way Redis parses the
+/// bit-command integer arguments: via `string2ll` (src/util.c), the STRICT canonical
+/// rule that REJECTS leading zeros (`"007"`) and a lone leading `+`. The bit commands
+/// (SETBIT/GETBIT offset, BITCOUNT/BITPOS start/end, BITFIELD `#`/plain offset and
+/// SET/INCRBY value) all route their integer arguments through `string2ll`, so they
+/// use the same strict parser the numeric RMW commands do, NOT the looser SET-expire
+/// form. Returns `None` on any non-integer form (the caller maps `None` to the right
+/// error).
 fn parse_i64(arg: &[u8]) -> Option<i64> {
-    crate::cmd_util::parse_i64(arg)
+    crate::cmd_util::parse_i64_strict(arg)
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +283,13 @@ fn parse_bit_offset(arg: &[u8]) -> Option<u64> {
 /// (Redis 7), negative-from-end and INCLUSIVE. A missing key is 0. WRONGTYPE on a
 /// non-string. Read-only (via `read`).
 pub fn cmd_bitcount<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
-    // BITCOUNT key | BITCOUNT key start end | BITCOUNT key start end BYTE|BIT.
+    // BITCOUNT key | BITCOUNT key start end | BITCOUNT key start end BYTE|BIT. Below the
+    // minimum arity (no key) is the generic wrong-arity error, NOT a syntax error (Redis
+    // arity -2); the malformed-but-arity-ok forms (e.g. one range bound) fall through to
+    // syntax_error.
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("bitcount"));
+    }
     if req.args.len() != 2 && req.args.len() != 4 && req.args.len() != 5 {
         return Value::error(ErrorReply::syntax_error());
     }
@@ -387,14 +401,23 @@ fn resolve_range(start: i64, end: i64, len: u64) -> Option<(u64, u64)> {
 /// search to the stored bits. A missing key: bit 0 -> 0, bit 1 -> -1. WRONGTYPE on a
 /// non-string. Read-only (via `read`).
 pub fn cmd_bitpos<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
-    // BITPOS key bit | + start | + start end | + start end BYTE|BIT.
-    if !(3..=6).contains(&req.args.len()) {
+    // BITPOS key bit | + start | + start end | + start end BYTE|BIT. Below the minimum
+    // arity (no bit argument) is the generic wrong-arity error, NOT a syntax error
+    // (Redis arity -3); the malformed-but-arity-ok forms fall through to syntax_error.
+    if req.args.len() < 3 {
+        return Value::error(ErrorReply::wrong_arity("bitpos"));
+    }
+    if req.args.len() > 6 {
         return Value::error(ErrorReply::syntax_error());
     }
-    let target: u8 = match req.args[2].as_ref() {
-        b"0" => 0,
-        b"1" => 1,
-        _ => return Value::error(ErrorReply::bit_not_integer_or_range()),
+    // The bit argument is parsed as an integer first (a non-integer / leading-zero form
+    // is the generic not-an-integer error); a parsed-but-not-0/1 value (e.g. 2, -1) is
+    // the dedicated "The bit argument must be 1 or 0." error (note the trailing period).
+    let target: u8 = match parse_i64(&req.args[2]) {
+        Some(0) => 0,
+        Some(1) => 1,
+        Some(_) => return Value::error(ErrorReply::bitpos_bit_arg()),
+        None => return Value::error(ErrorReply::not_an_integer()),
     };
     // Parse the optional [start [end [BYTE|BIT]]] tail before the lookup.
     let start_arg = if req.args.len() >= 4 {
@@ -754,11 +777,19 @@ fn bitfield_generic<S: Store>(
 }
 
 /// Parse the BITFIELD sub-op tail into a vector of [`BitfieldOp`]. OVERFLOW sets the
-/// mode for the following SET/INCRBY ops (default WRAP). `read_only` rejects SET/INCRBY
-/// (and OVERFLOW, which is meaningless without a write) with the BITFIELD_RO error.
+/// mode for the following SET/INCRBY ops (default WRAP).
+///
+/// For `read_only` (BITFIELD_RO) the parse follows Redis precedence (src/bitops.c
+/// `bitfieldGeneric`): EVERY op is parsed and validated (type / offset / value) first
+/// regardless of read-only, OVERFLOW is accepted (a harmless no-op since there are no
+/// writes), and only AFTER the full parse loop, if any WRITE op (SET/INCRBY) was
+/// present, is the BITFIELD_RO error returned. So a bad type under a RO write op
+/// returns the TYPE error (validated first), not the RO error.
 fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>, ErrorReply> {
     let mut ops = Vec::new();
     let mut overflow = Overflow::Wrap;
+    // Whether any SET/INCRBY (write) op appeared; gates the post-loop BITFIELD_RO error.
+    let mut saw_write = false;
     let mut i = 0;
     while i < args.len() {
         let kw = ascii_upper(&args[i]);
@@ -774,9 +805,7 @@ fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>
                 i += 3;
             }
             b"SET" => {
-                if read_only {
-                    return Err(ErrorReply::bitfield_ro_no_writes());
-                }
+                saw_write = true;
                 if i + 3 >= args.len() {
                     return Err(ErrorReply::syntax_error());
                 }
@@ -794,9 +823,7 @@ fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>
                 i += 4;
             }
             b"INCRBY" => {
-                if read_only {
-                    return Err(ErrorReply::bitfield_ro_no_writes());
-                }
+                saw_write = true;
                 if i + 3 >= args.len() {
                     return Err(ErrorReply::syntax_error());
                 }
@@ -814,9 +841,8 @@ fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>
                 i += 4;
             }
             b"OVERFLOW" => {
-                if read_only {
-                    return Err(ErrorReply::bitfield_ro_no_writes());
-                }
+                // OVERFLOW is accepted under BITFIELD_RO too (a harmless no-op when there
+                // are no writes): it is parsed and validated, and sets the unused mode.
                 if i + 1 >= args.len() {
                     return Err(ErrorReply::syntax_error());
                 }
@@ -831,12 +857,23 @@ fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>
             _ => return Err(ErrorReply::syntax_error()),
         }
     }
+    // Redis precedence: only AFTER the full parse loop, a read-only command with any
+    // write op present is the BITFIELD_RO error (a bad type under a RO write op already
+    // returned the type error above).
+    if read_only && saw_write {
+        return Err(ErrorReply::bitfield_ro_no_writes());
+    }
     Ok(ops)
 }
 
 /// Parse a BITFIELD offset: a plain bit offset, or `#<n>` for `n * type-width` bits.
-/// Bounded by the proto-max-bit-offset ceiling (the field's HIGHEST bit must fit), so a
-/// huge offset is the bit-offset-out-of-range error rather than a huge allocation.
+/// Bounded by the proto-max-bit-offset ceiling on the START offset ONLY, matching Redis
+/// `getBitOffsetFromArgument` (src/bitops.c), which checks `(bits >> 3) >= 512MB`, i.e.
+/// `bits > PROTO_MAX_BIT_OFFSET (2^32 - 1)`; it does NOT add the field width. So a GET
+/// whose field EXTENDS past the end is not an error: the missing high bits read as 0 and
+/// the value is returned. A SET/INCRBY may grow the backing string a few bytes past
+/// 512 MB to `ceil((offset + width) / 8)` bytes (bounded, matching Redis), so a huge
+/// start offset is the bit-offset-out-of-range error rather than a huge allocation.
 fn parse_field_offset(arg: &[u8], ty: FieldType) -> Result<u64, ErrorReply> {
     let bits = if let Some(rest) = arg.strip_prefix(b"#") {
         // `#n` means n * type-width bits.
@@ -853,12 +890,11 @@ fn parse_field_offset(arg: &[u8], ty: FieldType) -> Result<u64, ErrorReply> {
         Some(n as u64)
     };
     let bits = bits.ok_or_else(ErrorReply::bit_offset_out_of_range)?;
-    // The field's HIGHEST bit is offset + width - 1; it must fit the ceiling so the
-    // backing string never grows past 512 MB.
-    let highest = bits
-        .checked_add(u64::from(ty.bits) - 1)
-        .ok_or_else(ErrorReply::bit_offset_out_of_range)?;
-    if highest > PROTO_MAX_BIT_OFFSET {
+    // The START offset must fit the ceiling (Redis checks the start only, NOT the
+    // field's highest bit). A field that extends past the end is allowed: a GET reads
+    // the missing bits as 0; a SET/INCRBY grows the string a bounded few bytes past the
+    // ceiling.
+    if bits > PROTO_MAX_BIT_OFFSET {
         return Err(ErrorReply::bit_offset_out_of_range());
     }
     Ok(bits)
@@ -1746,17 +1782,72 @@ mod tests {
             Value::Array(Some(items)) => assert_eq!(int(&items[0]), 255),
             other => panic!("expected an array, got {other:?}"),
         }
-        // SET / INCRBY / OVERFLOW are rejected.
+        // SET / INCRBY are rejected with the BITFIELD_RO write error.
         for op in [
             req(&[b"BITFIELD_RO", b"k", b"SET", b"u8", b"#0", b"1"]),
             req(&[b"BITFIELD_RO", b"k", b"INCRBY", b"u8", b"#0", b"1"]),
-            req(&[b"BITFIELD_RO", b"k", b"OVERFLOW", b"SAT"]),
         ] {
             assert_eq!(
                 err_line(&cmd_bitfield_ro(&mut s, 0, NOW, &op)),
                 "-ERR BITFIELD_RO only supports the GET subcommand"
             );
         }
+    }
+
+    #[test]
+    fn bitfield_ro_overflow_is_accepted_no_op() {
+        let mut s = test_store();
+        store_string(&mut s, b"k", &[0xFF]);
+        // BITFIELD_RO with a lone OVERFLOW is accepted (a harmless no-op, no writes) and
+        // returns an empty array, NOT an error.
+        let v = cmd_bitfield_ro(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"BITFIELD_RO", b"k", b"OVERFLOW", b"SAT"]),
+        );
+        match v {
+            Value::Array(Some(items)) => assert!(items.is_empty()),
+            other => panic!("expected an empty array, got {other:?}"),
+        }
+        // OVERFLOW followed by a GET works (OVERFLOW is a no-op for the read).
+        let v = cmd_bitfield_ro(
+            &mut s,
+            0,
+            NOW,
+            &req(&[
+                b"BITFIELD_RO",
+                b"k",
+                b"OVERFLOW",
+                b"SAT",
+                b"GET",
+                b"u8",
+                b"0",
+            ]),
+        );
+        match v {
+            Value::Array(Some(items)) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(int(&items[0]), 255);
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bitfield_ro_precedence_type_error_before_ro_error() {
+        let mut s = test_store();
+        // A bad type under a RO WRITE op returns the TYPE error (every op is parsed and
+        // validated first; the BITFIELD_RO error is only emitted AFTER the full parse).
+        assert_eq!(
+            err_line(&cmd_bitfield_ro(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITFIELD_RO", b"k", b"SET", b"BADTYPE", b"0", b"5"])
+            )),
+            "-ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is."
+        );
     }
 
     #[test]
@@ -1874,6 +1965,154 @@ mod tests {
             Value::BulkString(Some(b)) => assert_eq!(b.as_ref(), b"raw"),
             other => panic!("expected a bulk encoding name, got {other:?}"),
         }
+    }
+
+    // ---- Strict integer parse: leading zeros rejected (string2ll rule). ----
+
+    #[test]
+    fn bit_command_integer_args_reject_leading_zeros() {
+        let mut s = test_store();
+        // SETBIT offset "007" -> bit-offset-out-of-range (the strict parser rejects the
+        // leading zero, mapped to the offset error).
+        assert_eq!(
+            err_line(&cmd_setbit(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"SETBIT", b"k", b"007", b"1"])
+            )),
+            "-ERR bit offset is not an integer or out of range"
+        );
+        // GETBIT offset "007" -> the same offset error.
+        assert_eq!(
+            err_line(&cmd_getbit(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"GETBIT", b"k", b"007"])
+            )),
+            "-ERR bit offset is not an integer or out of range"
+        );
+        // BITCOUNT start/end "00" "01" -> the generic not-an-integer error.
+        assert_eq!(
+            err_line(&cmd_bitcount(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITCOUNT", b"k", b"00", b"01"])
+            )),
+            "-ERR value is not an integer or out of range"
+        );
+        // BITFIELD GET offset "007" -> the offset error.
+        assert_eq!(
+            err_line(&cmd_bitfield(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITFIELD", b"k", b"GET", b"u8", b"007"])
+            )),
+            "-ERR bit offset is not an integer or out of range"
+        );
+        // BITFIELD SET value "007" -> the generic not-an-integer error (the VALUE arg).
+        assert_eq!(
+            err_line(&cmd_bitfield(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITFIELD", b"k", b"SET", b"u8", b"0", b"007"])
+            )),
+            "-ERR value is not an integer or out of range"
+        );
+    }
+
+    // ---- BITFIELD offset ceiling is START-only (a GET past the end reads 0). ----
+
+    #[test]
+    fn bitfield_offset_ceiling_is_start_only() {
+        let mut s = test_store();
+        // GET u16 at start offset 2^32 - 8: the start is in range; the field's highest
+        // bit (2^32 + 7) extends past the ceiling, but Redis checks the START only, so
+        // this reads the missing bits as 0 and returns 0 (NOT an error, NOT a huge alloc).
+        let start = (4u64 * 1024 * 1024 * 1024 - 8).to_string();
+        let v = cmd_bitfield(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"BITFIELD", b"bf", b"GET", b"u16", start.as_bytes()]),
+        );
+        match v {
+            Value::Array(Some(items)) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(int(&items[0]), 0);
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+        // The key was never created (a GET does not write).
+        assert_eq!(get_bytes(&mut s, b"bf"), None);
+        // A START offset at 2^32 (past PROTO_MAX_BIT_OFFSET = 2^32 - 1) IS the error.
+        let past = (4u64 * 1024 * 1024 * 1024).to_string();
+        assert_eq!(
+            err_line(&cmd_bitfield(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITFIELD", b"bf", b"GET", b"u8", past.as_bytes()])
+            )),
+            "-ERR bit offset is not an integer or out of range"
+        );
+    }
+
+    // ---- BITPOS bad-bit-arg + below-min arity. ----
+
+    #[test]
+    fn bitpos_bad_bit_argument_errors() {
+        let mut s = test_store();
+        store_string(&mut s, b"k", &[0xFF]);
+        // A parsed-but-not-0/1 bit argument -> "The bit argument must be 1 or 0." (note
+        // the trailing period).
+        assert_eq!(
+            err_line(&cmd_bitpos(&mut s, 0, NOW, &req(&[b"BITPOS", b"k", b"2"]))),
+            "-ERR The bit argument must be 1 or 0."
+        );
+        assert_eq!(
+            err_line(&cmd_bitpos(&mut s, 0, NOW, &req(&[b"BITPOS", b"k", b"-1"]))),
+            "-ERR The bit argument must be 1 or 0."
+        );
+        // A non-integer / leading-zero bit argument -> the generic not-an-integer error.
+        assert_eq!(
+            err_line(&cmd_bitpos(&mut s, 0, NOW, &req(&[b"BITPOS", b"k", b"x"]))),
+            "-ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            err_line(&cmd_bitpos(&mut s, 0, NOW, &req(&[b"BITPOS", b"k", b"01"]))),
+            "-ERR value is not an integer or out of range"
+        );
+    }
+
+    #[test]
+    fn bitcount_and_bitpos_below_min_arity_is_wrong_arity() {
+        let mut s = test_store();
+        // BITCOUNT with no key (arity -2) -> the generic wrong-arity error.
+        assert_eq!(
+            err_line(&cmd_bitcount(&mut s, 0, NOW, &req(&[b"BITCOUNT"]))),
+            "-ERR wrong number of arguments for 'bitcount' command"
+        );
+        // BITPOS with no bit argument (arity -3) -> the generic wrong-arity error.
+        assert_eq!(
+            err_line(&cmd_bitpos(&mut s, 0, NOW, &req(&[b"BITPOS", b"k"]))),
+            "-ERR wrong number of arguments for 'bitpos' command"
+        );
+        // The malformed-but-arity-ok BITCOUNT form (one range bound) stays a syntax
+        // error (NOT wrong-arity).
+        assert_eq!(
+            err_line(&cmd_bitcount(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITCOUNT", b"k", b"0"])
+            )),
+            "-ERR syntax error"
+        );
     }
 
     /// Store a raw string value at `key` via the store's blind upsert (a test helper so
