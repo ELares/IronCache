@@ -261,6 +261,9 @@ pub fn cmd_set<S: Store>(
                     };
                 }
                 RmwEntry::Vacant => get_reply = Some(Value::Null),
+                // The read-only `rmw` primitive never yields the in-place-mutation
+                // arm (that comes only from `rmw_mut`); this is unreachable here.
+                RmwEntry::OccupiedMut(_) => unreachable!("cmd_set uses rmw, not rmw_mut"),
             }
         }
 
@@ -312,6 +315,8 @@ pub fn cmd_setnx<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
             expire: ExpireWrite::Unchanged,
             reply: Value::Integer(0),
         },
+        // Unreachable: SETNX uses the read-only `rmw`, never `rmw_mut`.
+        RmwEntry::OccupiedMut(_) => unreachable!("cmd_setnx uses rmw, not rmw_mut"),
     })
 }
 
@@ -341,6 +346,8 @@ pub fn cmd_getset<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
             expire: ExpireWrite::Clear,
             reply: Value::Null,
         },
+        // Unreachable: GETSET uses the read-only `rmw`, never `rmw_mut`.
+        RmwEntry::OccupiedMut(_) => unreachable!("cmd_getset uses rmw, not rmw_mut"),
     })
 }
 
@@ -372,6 +379,8 @@ fn incr_by<S: Store>(store: &mut S, db: u32, now: UnixMillis, key: &[u8], incr: 
                 Some(n) => n,
                 None => return keep_err(ErrorReply::not_an_integer()),
             },
+            // Unreachable: the numeric RMW uses the read-only `rmw`, never `rmw_mut`.
+            RmwEntry::OccupiedMut(_) => unreachable!("incr_by uses rmw, not rmw_mut"),
         };
         // Checked add: an i64 overflow is the overflow error (no write).
         let Some(next) = current.checked_add(incr) else {
@@ -485,6 +494,8 @@ pub fn cmd_incrbyfloat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &
                 Some(n) => n,
                 None => return keep_err(ErrorReply::not_a_valid_float()),
             },
+            // Unreachable: INCRBYFLOAT uses the read-only `rmw`, never `rmw_mut`.
+            RmwEntry::OccupiedMut(_) => unreachable!("cmd_incrbyfloat uses rmw, not rmw_mut"),
         };
         // The increment argument is parsed AFTER the type + existing-value checks
         // (Redis parses argv[2] last in incrbyfloatCommand).
@@ -570,5 +581,7 @@ pub fn cmd_append<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
                 reply: Value::Integer(len),
             }
         }
+        // Unreachable: APPEND uses the read-only `rmw`, never `rmw_mut`.
+        RmwEntry::OccupiedMut(_) => unreachable!("cmd_append uses rmw, not rmw_mut"),
     })
 }

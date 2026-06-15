@@ -115,6 +115,13 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "appendonly",
             kind: SetKind::AcceptedNoOp,
         },
+        // The list listpack->quicklist threshold (PR-5, #40). Recognized + echoed for
+        // compatibility; the store reads its own resolved byte-budget default, and a
+        // runtime change is a follow-up (CONFIG.md "accepted and echoed").
+        ParamSpec {
+            name: "list-max-listpack-size",
+            kind: SetKind::AcceptedNoOp,
+        },
         // bind/port are MODIFIABLE_CONFIG in Redis (accepted at runtime), but IronCache
         // reports them restart-required as a DELIBERATE DIVERGENCE: the thread-per-core
         // boot binds the listening sockets once at startup and cannot re-bind / re-port
@@ -176,6 +183,9 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         "maxmemory-samples" => "5".to_owned(),
         "save" => String::new(),
         "appendonly" => "no".to_owned(),
+        // The list listpack->quicklist threshold: echo the Redis `-2` default
+        // spelling ("8 KB per node"); the store works in the resolved byte budget.
+        "list-max-listpack-size" => crate::LIST_MAX_LISTPACK_SIZE_REDIS_DEFAULT.to_owned(),
         // Restart-required: read the boot config (these never change at runtime).
         "bind" => boot.bind.to_string(),
         "port" => boot.port.to_string(),

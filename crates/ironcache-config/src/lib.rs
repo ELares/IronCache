@@ -34,6 +34,30 @@ use thiserror::Error;
 /// compatibility (CLI_BINARY.md leaves the exact port open but defaults to parity).
 pub const DEFAULT_PORT: u16 = 6379;
 
+/// The default list listpack byte budget (`list-max-listpack-size`), expressed as a
+/// BYTE budget (PR-5, ENCODINGS.md / OBJECT_ENCODING_MAPPING.md #40, LIST_LARGE.md
+/// "Node sizing ~8 KB"). Redis's default `-2` means "8 KB per listpack node"; we
+/// store the resolved byte budget directly. A small LIST whose total element bytes
+/// stay at or below this (and whose element count stays under
+/// [`DEFAULT_LIST_MAX_LISTPACK_ENTRIES`]) is `OBJECT ENCODING` -> `listpack`; once it
+/// exceeds either bound it transitions to `quicklist`. The store reads this default;
+/// `CONFIG GET list-max-listpack-size` reports the Redis `-2` spelling.
+pub const DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES: usize = 8 * 1024;
+
+/// The default per-node element-count cap for a list listpack (PR-5, the sane node
+/// cap LIST_LARGE.md / the task spec name, 128). A list whose element count exceeds
+/// this transitions to `quicklist` even if it is under the byte budget, matching the
+/// element-count side of Redis's listpack/quicklist boundary.
+pub const DEFAULT_LIST_MAX_LISTPACK_ENTRIES: usize = 128;
+
+/// The Redis `list-max-listpack-size` default SPELLING (`-2` = "8 KB per node"). This
+/// is what `CONFIG GET list-max-listpack-size` echoes (the configured Redis form),
+/// while the store works in the resolved byte budget
+/// ([`DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES`]). Reported as an accepted, recognized
+/// parameter (CONFIG.md "accepted and echoed for compatibility"); changing it at
+/// runtime is a follow-up.
+pub const LIST_MAX_LISTPACK_SIZE_REDIS_DEFAULT: &str = "-2";
+
 /// The default shard count: the host's available parallelism via
 /// [`std::thread::available_parallelism`] (CONFIG.md), which honors cgroup CPU
 /// quotas (unlike the `num_cpus` crate). Never zero (a degenerate host reports at
