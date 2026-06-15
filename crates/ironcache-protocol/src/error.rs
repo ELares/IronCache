@@ -483,6 +483,35 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "value is out of range, must be positive")
     }
 
+    /// `ERR RANK can't be zero: ...` - the reply Redis emits (src/t_list.c
+    /// `lposCommand` -> `addReplyError`) when LPOS is given `RANK 0`. RANK selects
+    /// which match to start from (1 = first match, negative = from the tail); zero is
+    /// meaningless. Byte-exact to Redis. DISTINCT from the not-an-integer error (a
+    /// non-integer RANK is thrown earlier by the integer parse).
+    #[must_use]
+    pub fn lpos_rank_zero() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list",
+        )
+    }
+
+    /// `ERR COUNT can't be negative` - the reply Redis emits (src/t_list.c
+    /// `lposCommand`) when LPOS is given a negative `COUNT`. Byte-exact. A non-integer
+    /// COUNT is the separate not-an-integer error; this is specifically the negative case.
+    #[must_use]
+    pub fn lpos_count_negative() -> Self {
+        ErrorReply::new(ErrorCode::Err, "COUNT can't be negative")
+    }
+
+    /// `ERR MAXLEN can't be negative` - the reply Redis emits (src/t_list.c
+    /// `lposCommand`) when LPOS is given a negative `MAXLEN`. Byte-exact. A non-integer
+    /// MAXLEN is the separate not-an-integer error; this is specifically the negative case.
+    #[must_use]
+    pub fn lpos_maxlen_negative() -> Self {
+        ErrorReply::new(ErrorCode::Err, "MAXLEN can't be negative")
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free
@@ -735,6 +764,24 @@ mod tests {
         assert_eq!(
             ErrorReply::value_out_of_range_must_be_positive().line(),
             "-ERR value is out of range, must be positive"
+        );
+    }
+
+    #[test]
+    fn lpos_option_errors_are_byte_exact() {
+        // Verified against redis/redis src/t_list.c lposCommand: the specific RANK-zero,
+        // negative-COUNT, and negative-MAXLEN replies (DISTINCT from not-an-integer).
+        assert_eq!(
+            ErrorReply::lpos_rank_zero().line(),
+            "-ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list"
+        );
+        assert_eq!(
+            ErrorReply::lpos_count_negative().line(),
+            "-ERR COUNT can't be negative"
+        );
+        assert_eq!(
+            ErrorReply::lpos_maxlen_negative().line(),
+            "-ERR MAXLEN can't be negative"
         );
     }
 
