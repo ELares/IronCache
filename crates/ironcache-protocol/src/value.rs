@@ -66,6 +66,15 @@ pub enum Value {
     VerbatimString { format: [u8; 3], data: Bytes },
     /// RESP3 map (`%`); degrades to a flat array under RESP2.
     Map(Vec<(Value, Value)>),
+    /// An ORDERED array-of-pairs (NOT a map): under RESP3 it renders as an array of
+    /// 2-element arrays (`*<n>` then n x `*2` + the two elements); under RESP2 it
+    /// FLATTENS to a single `*<2n>` array of the 2n elements in order. Unlike
+    /// [`Value::Map`] this preserves insertion ORDER and allows DUPLICATE first-elements
+    /// (it is not keyed), and unlike `Map` its RESP3 shape is a NESTED array, not a `%`
+    /// map. This is the shape Redis uses for the WITHVALUES/WITHSCORES replies whose
+    /// RESP3 form nests each (member, value) pair: HRANDFIELD WITHVALUES (PR-6) and, later,
+    /// ZRANDMEMBER WITHSCORES / ZRANGE WITHSCORES (PR-8).
+    Pairs(Vec<(Value, Value)>),
     /// RESP3 set (`~`); degrades to an array under RESP2.
     Set(Vec<Value>),
     /// RESP3 push (`>`); degrades to an array under RESP2.

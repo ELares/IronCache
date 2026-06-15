@@ -15,6 +15,9 @@
 //! - `BigNumber` -> bulk string.
 //! - `VerbatimString` -> bulk string of the data (format prefix dropped).
 //! - `Map` -> flat array of `[k0, v0, k1, v1, ...]`.
+//! - `Pairs` -> RESP3 array of 2-element arrays (`*2` per pair, NESTED); RESP2 flat
+//!   array of `2n` elements. An ORDERED array-of-pairs (not a `%` map): the RESP3
+//!   WITHVALUES/WITHSCORES nesting (HRANDFIELD WITHVALUES, ZRANDMEMBER WITHSCORES).
 //! - `Set` -> array.
 //! - `Push` -> array.
 //! - `BulkError` -> simple error line.
@@ -147,6 +150,30 @@ pub fn encode(out: &mut BytesMut, value: &Value, proto: ProtoVersion) {
                 for (k, v) in pairs {
                     encode(out, k, proto);
                     encode(out, v, proto);
+                }
+            }
+        },
+        Value::Pairs(pairs) => match proto {
+            ProtoVersion::Resp3 => {
+                // NESTED: an array of n 2-element arrays (one [first, second] sub-array
+                // per pair). This is the RESP3 WITHVALUES/WITHSCORES nesting.
+                out.put_u8(b'*');
+                put_i64(out, pairs.len() as i64);
+                crlf(out);
+                for (a, b) in pairs {
+                    out.put_slice(b"*2\r\n");
+                    encode(out, a, proto);
+                    encode(out, b, proto);
+                }
+            }
+            ProtoVersion::Resp2 => {
+                // FLAT: a single array of the 2n elements in order (first, second, ...).
+                out.put_u8(b'*');
+                put_i64(out, (pairs.len() * 2) as i64);
+                crlf(out);
+                for (a, b) in pairs {
+                    encode(out, a, proto);
+                    encode(out, b, proto);
                 }
             }
         },
@@ -666,6 +693,52 @@ mod tests {
         assert_eq!(enc(&m, ProtoVersion::Resp3), b"%1\r\n$1\r\nk\r\n:1\r\n");
         // RESP2: flat array of length 2.
         assert_eq!(enc(&m, ProtoVersion::Resp2), b"*2\r\n$1\r\nk\r\n:1\r\n");
+    }
+
+    #[test]
+    fn pairs_shaping_nested_resp3_flat_resp2() {
+        // Two (field, value) pairs, in order.
+        let p = Value::Pairs(vec![
+            (Value::bulk_str("a"), Value::bulk_str("1")),
+            (Value::bulk_str("b"), Value::bulk_str("2")),
+        ]);
+        // RESP3: NESTED -> outer *2, each pair a *2 sub-array.
+        assert_eq!(
+            enc(&p, ProtoVersion::Resp3),
+            b"*2\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        // RESP2: FLAT -> a single *4 array of the 2n elements in order.
+        assert_eq!(
+            enc(&p, ProtoVersion::Resp2),
+            b"*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+    }
+
+    #[test]
+    fn pairs_preserves_order_and_allows_duplicate_first_elements() {
+        // Unlike a Map, Pairs is NOT keyed: a repeated first element is preserved (it must
+        // render as an array-of-pairs, not a deduplicated map). Order is preserved too.
+        let p = Value::Pairs(vec![
+            (Value::bulk_str("x"), Value::Integer(1)),
+            (Value::bulk_str("x"), Value::Integer(2)),
+        ]);
+        // RESP3 nested: both x pairs present, in order.
+        assert_eq!(
+            enc(&p, ProtoVersion::Resp3),
+            b"*2\r\n*2\r\n$1\r\nx\r\n:1\r\n*2\r\n$1\r\nx\r\n:2\r\n"
+        );
+        // RESP2 flat: x 1 x 2.
+        assert_eq!(
+            enc(&p, ProtoVersion::Resp2),
+            b"*4\r\n$1\r\nx\r\n:1\r\n$1\r\nx\r\n:2\r\n"
+        );
+    }
+
+    #[test]
+    fn pairs_empty_is_an_empty_array_in_both_protos() {
+        let p = Value::Pairs(Vec::new());
+        assert_eq!(enc(&p, ProtoVersion::Resp3), b"*0\r\n");
+        assert_eq!(enc(&p, ProtoVersion::Resp2), b"*0\r\n");
     }
 
     #[test]
