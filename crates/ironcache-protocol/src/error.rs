@@ -331,6 +331,30 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "increment would produce NaN or Infinity")
     }
 
+    /// `ERR hash value is not an integer` - the reply Redis emits (src/t_hash.c
+    /// `hincrbyCommand` -> `addReplyError(c,"hash value is not an integer")`) when
+    /// HINCRBY's stored field value is not a canonical integer. The HASH analog of
+    /// [`ErrorReply::not_an_integer`] (the field value, not a command argument). A
+    /// non-integer INCREMENT argument is the generic [`ErrorReply::not_an_integer`]
+    /// (thrown by the argument parse, like Redis); this is specifically the stored-value
+    /// class.
+    #[must_use]
+    pub fn hash_value_not_an_integer() -> Self {
+        ErrorReply::new(ErrorCode::Err, "hash value is not an integer")
+    }
+
+    /// `ERR hash value is not a float` - the reply Redis emits (src/t_hash.c
+    /// `hincrbyfloatCommand` -> `addReplyError(c,"hash value is not a float")`) when
+    /// HINCRBYFLOAT's stored field value cannot be parsed as a float. The HASH analog of
+    /// [`ErrorReply::not_a_valid_float`] for the stored field value. A non-float
+    /// INCREMENT argument is still [`ErrorReply::not_a_valid_float`] (Redis parses the
+    /// argument with `getLongDoubleFromObjectOrReply`, the generic float error); this is
+    /// the stored-value class.
+    #[must_use]
+    pub fn hash_value_not_a_float() -> Self {
+        ErrorReply::new(ErrorCode::Err, "hash value is not a float")
+    }
+
     /// `ERR unknown subcommand or wrong number of arguments for '<sub>'. Try
     /// <PARENT> HELP.` the wording clients see for an unrecognized
     /// `CLIENT`/`COMMAND`/`CONFIG` subcommand.
@@ -805,6 +829,22 @@ mod tests {
         assert_eq!(
             ErrorReply::increment_nan_or_inf().line(),
             "-ERR increment would produce NaN or Infinity"
+        );
+    }
+
+    #[test]
+    fn hash_value_errors_are_byte_exact() {
+        // Verified against redis/redis src/t_hash.c: HINCRBY's stored-value-not-integer
+        // and HINCRBYFLOAT's stored-value-not-float replies. Both use the plain `ERR`
+        // token and are DISTINCT from the string-family not-an-integer / not-a-valid
+        // -float replies (those are for command arguments).
+        assert_eq!(
+            ErrorReply::hash_value_not_an_integer().line(),
+            "-ERR hash value is not an integer"
+        );
+        assert_eq!(
+            ErrorReply::hash_value_not_a_float().line(),
+            "-ERR hash value is not a float"
         );
     }
 }

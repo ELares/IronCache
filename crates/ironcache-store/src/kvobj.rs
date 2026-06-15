@@ -25,9 +25,14 @@
 //! version will pack it, so that follow-up is a representation change only.
 
 use crate::encoding::{Classified, EMBSTR_THRESHOLD, classify};
+use crate::scan_hash;
 use bytes::Bytes;
-use ironcache_config::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES;
-use ironcache_storage::{DataType, Encoding, ListValue, NewValueOwned, UnixMillis};
+use hashbrown::HashMap;
+use ironcache_config::{
+    DEFAULT_HASH_MAX_LISTPACK_ENTRIES, DEFAULT_HASH_MAX_LISTPACK_VALUE,
+    DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES,
+};
+use ironcache_storage::{DataType, Encoding, HashValue, ListValue, NewValueOwned, UnixMillis};
 use std::collections::VecDeque;
 
 /// The inline-value buffer capacity (embstr). Matches [`EMBSTR_THRESHOLD`]; a
@@ -137,6 +142,10 @@ pub enum ValueRepr {
     /// A LIST value (PR-5). `OBJECT ENCODING` -> `listpack` while small, `quicklist`
     /// once over the threshold (a pure function of the active repr, #40).
     List(ListVal),
+    /// A HASH value (PR-6). `OBJECT ENCODING` -> `listpack` while small, `hashtable`
+    /// once over the entry-count OR per-element-byte threshold (a pure function of the
+    /// active repr, #40).
+    Hash(HashVal),
 }
 
 impl ValueRepr {
@@ -149,6 +158,7 @@ impl ValueRepr {
             ValueRepr::Inline(_) => Encoding::EmbStr,
             ValueRepr::Raw(_) => Encoding::Raw,
             ValueRepr::List(l) => l.encoding(),
+            ValueRepr::Hash(h) => h.encoding(),
         }
     }
 
@@ -163,6 +173,7 @@ impl ValueRepr {
             ValueRepr::Inline(b) => b.as_bytes().len(),
             ValueRepr::Raw(b) => b.len(),
             ValueRepr::List(l) => l.element_bytes(),
+            ValueRepr::Hash(h) => h.element_bytes(),
         }
     }
 }
@@ -458,6 +469,244 @@ impl ListValue for ListVal {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HashVal: the PR-6 hash value (COLLECTIONS.md, ENCODINGS.md, OBJECT_ENCODING_
+// MAPPING.md #40, HASHTABLE.md addendum). The HASH analog of `ListVal`: a small
+// listpack-like form (a `Vec<(field, value)>` with linear scan, reporting `listpack`)
+// that PROMOTES to a `hashbrown::HashMap` (reporting `hashtable`) once it grows past
+// the HASH entry-count cap (512, NOT the 128 ZSET/SET cap) OR any field-or-value byte
+// length exceeds the per-element byte cap (64).
+//
+// ## The listpack -> hashtable transition (#40), and its one-way ratchet
+//
+// The TRANSITION (small -> large) is checked on every mutating edit: a `HashVal` is a
+// listpack while `entries <= hash-max-listpack-entries` AND every field-and-value byte
+// length `<= hash-max-listpack-value`; once either bound is crossed it converts to the
+// hashtable form. Like Redis, the conversion is ONE-WAY (a hash that grew to hashtable
+// stays hashtable even if later shrunk): Redis never converts a hashtable hash back to
+// listpack, so OBJECT ENCODING is a pure function of the ACTIVE repr (which form is
+// resident), and the active form only ratchets up. This differs from the LIST
+// listpack<->quicklist transition (which is reversible because the list reports the name
+// purely from its current byte total); the hash matches Redis's one-way encoding ratchet
+// for hashes (`hashTypeTryConversion` only ever promotes).
+//
+// ## Iteration order (HSCAN/HRANDFIELD/HGETALL determinism, ADR-0003)
+//
+// The listpack form preserves INSERTION order (a `Vec`); the hashtable form's
+// `hashbrown::HashMap` has a per-table RandomState iteration order that varies
+// run-to-run, which would break deterministic HSCAN/HRANDFIELD/HGETALL. So `iter()` /
+// `fields()` SORT the hashtable form by the fixed-seed stable field hash (`scan_hash`,
+// the same resize-invariant order the keyspace SCAN uses), giving a deterministic,
+// resize-invariant order. The listpack form is already deterministic (insertion order),
+// so it is returned as-is.
+// ---------------------------------------------------------------------------
+
+/// One stored hash entry: an owned `(field, value)` byte pair. A type alias so the
+/// listpack form and its helpers do not repeat the (clippy-flagged) nested boxed-slice
+/// tuple.
+type HashEntry = (Box<[u8]>, Box<[u8]>);
+
+/// A HASH value (PR-6). Stored as a small listpack-like `Vec<(field, value)>` while it
+/// fits the listpack thresholds, promoting to a `hashbrown::HashMap` once it exceeds the
+/// HASH entry-count cap (512; the 128 default is the ZSET/SET cap, not the hash one) OR
+/// any field-or-value byte length exceeds the per-element byte cap (64). A running
+/// field+value byte total is kept for O(1) accounting. The reported
+/// encoding is a pure function of the active form (`listpack` vs `hashtable`).
+#[derive(Debug, Clone)]
+pub enum HashVal {
+    /// The small listpack-equivalent form: `(field, value)` pairs in insertion order,
+    /// linear-scanned. Reports [`Encoding::ListPack`].
+    ListPack(Vec<HashEntry>),
+    /// The large hashtable form: a `hashbrown::HashMap`. Reports [`Encoding::HashTable`].
+    /// One-way: a hash never converts back to the listpack form (Redis parity).
+    HashTable(HashMap<Box<[u8]>, Box<[u8]>>),
+}
+
+impl Default for HashVal {
+    fn default() -> Self {
+        HashVal::new()
+    }
+}
+
+impl HashVal {
+    /// An empty hash (the create-on-missing seed before the first field is set), in the
+    /// small listpack form.
+    #[must_use]
+    pub fn new() -> Self {
+        HashVal::ListPack(Vec::new())
+    }
+
+    /// The sum of field+value byte lengths (the value-bytes side of accounting and the
+    /// `logical_len` for a hash). Does NOT include the key bytes (the kvobj adds those)
+    /// or per-entry bookkeeping (the FAM/packing is a #8 follow-up).
+    #[must_use]
+    pub fn element_bytes(&self) -> usize {
+        match self {
+            HashVal::ListPack(v) => v.iter().map(|(f, val)| f.len() + val.len()).sum(),
+            HashVal::HashTable(m) => m.iter().map(|(f, val)| f.len() + val.len()).sum(),
+        }
+    }
+
+    /// The encoding this hash reports, a PURE FUNCTION of the active form (#40):
+    /// `listpack` for the small form, `hashtable` for the large form.
+    #[must_use]
+    pub fn encoding(&self) -> Encoding {
+        match self {
+            HashVal::ListPack(_) => Encoding::ListPack,
+            HashVal::HashTable(_) => Encoding::HashTable,
+        }
+    }
+
+    /// Whether the small listpack form should convert to the hashtable form after an
+    /// edit that left `entries` entries with a new `field`/`value` (the #40 transition):
+    /// convert once `entries > hash-max-listpack-entries` (the HASH cap, 512, NOT the 128
+    /// ZSET/SET cap) OR either the new field or value byte length exceeds
+    /// `hash-max-listpack-value` (64). Reads the HASH entry constant
+    /// ([`DEFAULT_HASH_MAX_LISTPACK_ENTRIES`]).
+    fn should_convert(entries: usize, field_len: usize, value_len: usize) -> bool {
+        entries > DEFAULT_HASH_MAX_LISTPACK_ENTRIES
+            || field_len > DEFAULT_HASH_MAX_LISTPACK_VALUE
+            || value_len > DEFAULT_HASH_MAX_LISTPACK_VALUE
+    }
+
+    /// Promote the small listpack form to the large hashtable form (one-way). A no-op if
+    /// already a hashtable.
+    fn convert_to_hashtable(&mut self) {
+        if let HashVal::ListPack(v) = self {
+            let mut m: HashMap<Box<[u8]>, Box<[u8]>> = HashMap::with_capacity(v.len());
+            for (f, val) in v.drain(..) {
+                m.insert(f, val);
+            }
+            *self = HashVal::HashTable(m);
+        }
+    }
+
+    /// Find the index of `field` in the small listpack form (linear scan), or `None`.
+    fn listpack_pos(v: &[HashEntry], field: &[u8]) -> Option<usize> {
+        v.iter().position(|(f, _)| f.as_ref() == field)
+    }
+}
+
+impl HashValue for HashVal {
+    fn set(&mut self, field: &[u8], value: &[u8]) -> bool {
+        // Overwrite-in-place if present (no growth); else insert (growth). After an
+        // insert into the small form, re-check the listpack -> hashtable transition.
+        match self {
+            HashVal::ListPack(v) => {
+                if let Some(i) = HashVal::listpack_pos(v, field) {
+                    v[i].1 = value.to_vec().into_boxed_slice();
+                    // An overwrite can still cross the per-element value-byte cap.
+                    if HashVal::should_convert(v.len(), field.len(), value.len()) {
+                        self.convert_to_hashtable();
+                    }
+                    false
+                } else {
+                    v.push((
+                        field.to_vec().into_boxed_slice(),
+                        value.to_vec().into_boxed_slice(),
+                    ));
+                    if HashVal::should_convert(v.len(), field.len(), value.len()) {
+                        self.convert_to_hashtable();
+                    }
+                    true
+                }
+            }
+            HashVal::HashTable(m) => m
+                .insert(
+                    field.to_vec().into_boxed_slice(),
+                    value.to_vec().into_boxed_slice(),
+                )
+                .is_none(),
+        }
+    }
+
+    fn set_nx(&mut self, field: &[u8], value: &[u8]) -> bool {
+        // DEFERRED #8 follow-up (efficiency papercut, correctness-neutral): this does a
+        // double linear scan on the listpack form (contains then set both scan); a single
+        // entry-API pass would avoid the second scan.
+        if self.contains(field) {
+            return false;
+        }
+        self.set(field, value);
+        true
+    }
+
+    fn get(&self, field: &[u8]) -> Option<&[u8]> {
+        match self {
+            HashVal::ListPack(v) => HashVal::listpack_pos(v, field).map(|i| v[i].1.as_ref()),
+            HashVal::HashTable(m) => m.get(field).map(std::convert::AsRef::as_ref),
+        }
+    }
+
+    fn del(&mut self, field: &[u8]) -> bool {
+        match self {
+            HashVal::ListPack(v) => {
+                if let Some(i) = HashVal::listpack_pos(v, field) {
+                    v.remove(i);
+                    true
+                } else {
+                    false
+                }
+            }
+            // One-way ratchet: a hashtable hash stays a hashtable even as it shrinks
+            // (Redis parity), so we do NOT demote back to listpack on removal.
+            HashVal::HashTable(m) => m.remove(field).is_some(),
+        }
+    }
+
+    fn contains(&self, field: &[u8]) -> bool {
+        match self {
+            HashVal::ListPack(v) => HashVal::listpack_pos(v, field).is_some(),
+            HashVal::HashTable(m) => m.contains_key(field),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            HashVal::ListPack(v) => v.len(),
+            HashVal::HashTable(m) => m.len(),
+        }
+    }
+
+    // DEFERRED #8 follow-up (efficiency papercut, correctness-neutral): fields()/values()
+    // each materialize the FULL pairs() snapshot (cloning both halves) only to drop one;
+    // a half-clone path would avoid the wasted allocation.
+    fn fields(&self) -> Vec<Vec<u8>> {
+        self.pairs().into_iter().map(|(f, _)| f).collect()
+    }
+
+    fn values(&self) -> Vec<Vec<u8>> {
+        self.pairs().into_iter().map(|(_, v)| v).collect()
+    }
+
+    fn is_listpack(&self) -> bool {
+        matches!(self, HashVal::ListPack(_))
+    }
+
+    fn pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            // The listpack form is already in deterministic INSERTION order.
+            HashVal::ListPack(v) => v
+                .iter()
+                .map(|(f, val)| (f.to_vec(), val.to_vec()))
+                .collect(),
+            // The hashtable form's `hashbrown` iteration order varies run-to-run, so
+            // SORT by the fixed-seed stable field hash (then raw bytes) for a
+            // deterministic, resize-invariant order (the same order SCAN uses, ADR-0003).
+            HashVal::HashTable(m) => {
+                let mut out: Vec<(Vec<u8>, Vec<u8>)> = m
+                    .iter()
+                    .map(|(f, val)| (f.to_vec(), val.to_vec()))
+                    .collect();
+                out.sort_unstable_by(|(fa, _), (fb, _)| {
+                    scan_hash(fa).cmp(&scan_hash(fb)).then_with(|| fa.cmp(fb))
+                });
+                out
+            }
+        }
+    }
+}
+
 /// Decimal byte length of an i64 (digit count plus a sign for negatives), without
 /// allocating. Used by STRLEN and accounting for int-encoded values.
 #[must_use]
@@ -583,6 +832,16 @@ impl KvObj {
                 }
                 KvObj::from_list(key, list, expire_at)
             }
+            // The PR-6 create-on-missing HASH path: build the hash value from the
+            // insertion-ordered (field, value) pairs. Subsequent edits go through the
+            // in-place RmwAction::Mutated path, not this rebuild.
+            NewValueOwned::Hash(pairs) => {
+                let mut hash = HashVal::new();
+                for (f, v) in &pairs {
+                    hash.set(f, v);
+                }
+                KvObj::from_hash(key, hash, expire_at)
+            }
         }
     }
 
@@ -600,10 +859,25 @@ impl KvObj {
         }
     }
 
+    /// Build a `KvObj` holding a HASH value (PR-6). The data type is
+    /// [`DataType::Hash`] and the encoding is read off the hash's active form
+    /// ([`HashVal::encoding`]); the store recomputes it after each in-place edit.
+    #[must_use]
+    pub fn from_hash(key: &[u8], hash: HashVal, expire_at: Option<UnixMillis>) -> Self {
+        let encoding = hash.encoding();
+        KvObj {
+            header: Header::with_type(DataType::Hash, encoding, expire_at.is_some()),
+            key: key.to_vec().into_boxed_slice(),
+            value: ValueRepr::Hash(hash),
+            expire_at,
+        }
+    }
+
     /// Recompute and store `header.encoding` from the CURRENT value representation
     /// (PR-5: called by the store after an in-place collection edit, so a list that
-    /// crossed the listpack->quicklist threshold reports the new name). A no-op for a
-    /// string value whose encoding is already in lockstep with its repr.
+    /// crossed the listpack->quicklist threshold, or a hash that crossed listpack->
+    /// hashtable, reports the new name). A no-op for a string value whose encoding is
+    /// already in lockstep with its repr.
     pub fn recompute_encoding(&mut self) {
         self.header.encoding = self.value.encoding();
     }
@@ -618,27 +892,66 @@ impl KvObj {
         }
     }
 
+    /// A mutable borrow of the stored HASH value, or `None` if this entry is not a hash
+    /// (PR-6: the store hands this to the in-place-mutation arm; a non-hash yields
+    /// `None` -> WRONGTYPE). The HASH analog of [`Self::as_list_mut`].
+    pub fn as_hash_mut(&mut self) -> Option<&mut HashVal> {
+        match &mut self.value {
+            ValueRepr::Hash(h) => Some(h),
+            _ => None,
+        }
+    }
+
     /// Whether this entry holds a LIST value (PR-5).
     #[must_use]
     pub fn is_list(&self) -> bool {
         matches!(self.value, ValueRepr::List(_))
     }
 
-    /// Whether this entry is a COLLECTION that currently holds zero ELEMENTS (PR-5:
-    /// the empty-collection-deletes-key check, by element COUNT, not byte count -- a
-    /// list of empty-string elements has zero value bytes but is NOT empty). Returns
-    /// `false` for a non-collection value (a string is never "empty" in this sense).
+    /// Whether this entry holds a HASH value (PR-6).
+    #[must_use]
+    pub fn is_hash(&self) -> bool {
+        matches!(self.value, ValueRepr::Hash(_))
+    }
+
+    /// Whether this entry is a COLLECTION at all (list/hash/...; PR-5 list, PR-6 hash).
+    /// The SINGLE source of "what reprs are collections", so the store's `rmw_mut`
+    /// type-dispatch and the empty-collection check stay in sync (the PR-5 review's
+    /// consolidation ask). A non-collection (string family) is `false`.
     ///
-    /// PR-6/7/8 NOTE: this match handles only `ValueRepr::List` today. When the hash/
-    /// set/zset reprs land, add their arms HERE and to the `rmw_mut` type-dispatch in
-    /// `lib.rs` (the `as_*_mut` selection) IN LOCKSTEP, so every collection honors the
-    /// empty-collection-deletes-key contract.
+    /// PR-7/8 NOTE: when the set/zset reprs land, add their arms to the THREE collection
+    /// sites that share this enum -- [`Self::collection_len`] (which backs
+    /// [`Self::is_empty_collection`]), the `rmw_mut` type-dispatch in `lib.rs`
+    /// ([`crate::ShardStore`] selecting `as_*_mut`), and (if a read view is needed) the
+    /// store's `view_of`/`occupied_of` collection arms -- IN LOCKSTEP.
+    #[must_use]
+    pub fn is_collection(&self) -> bool {
+        matches!(self.value, ValueRepr::List(_) | ValueRepr::Hash(_))
+    }
+
+    /// The element COUNT of this entry IF it is a collection, else `None` (a
+    /// non-collection has no element count). This is the SINGLE place that maps each
+    /// collection repr to its element count, so [`Self::is_empty_collection`] and any
+    /// future len-based check cannot drift from the `rmw_mut` type-dispatch. Add new
+    /// collection arms HERE when the set/zset reprs land.
+    #[must_use]
+    pub fn collection_len(&self) -> Option<usize> {
+        match &self.value {
+            ValueRepr::List(l) => Some(l.len()),
+            ValueRepr::Hash(h) => Some(h.len()),
+            _ => None,
+        }
+    }
+
+    /// Whether this entry is a COLLECTION that currently holds zero ELEMENTS (PR-5/6:
+    /// the empty-collection-deletes-key check, by element COUNT, not byte count -- a
+    /// hash of empty-string values has zero value bytes but is NOT empty). Returns
+    /// `false` for a non-collection value (a string is never "empty" in this sense).
+    /// Defined in terms of [`Self::collection_len`] so it cannot drift from the
+    /// type-dispatch.
     #[must_use]
     pub fn is_empty_collection(&self) -> bool {
-        match &self.value {
-            ValueRepr::List(l) => l.len() == 0,
-            _ => false,
-        }
+        self.collection_len() == Some(0)
     }
 
     /// Replace this object's VALUE in place (and reclassify its encoding) while
@@ -871,8 +1184,9 @@ mod tests {
 
         // There is NO element-count cap for lists (Redis -2 negative fill: count
         // unlimited). MANY small elements that stay UNDER the byte budget remain
-        // `listpack`, even well past the 128-entry hash/zset cap. Use 200 single-byte
-        // elements (200 bytes, far under the 8 KB budget).
+        // `listpack`, even well past any collection entry cap (the 512 hash / 128
+        // zset-set caps). Use 200 single-byte elements (200 bytes, far under the 8 KB
+        // budget).
         let mut l2 = ListVal::new();
         for _ in 0..200 {
             l2.push_back(b"z");
@@ -913,6 +1227,44 @@ mod tests {
         l.remove_matching(0, b"DEFG"); // -4
         assert_eq!(l.element_bytes(), 0);
         assert!(l.is_empty());
+    }
+
+    // -- HashVal::should_convert boundary (PR-6 review): the Redis-correct 512/513 HASH
+    // entry boundary + the 64-byte per-element cap, tested DIRECTLY (no need to insert 513
+    // real elements; this pins the threshold constant + the comparison). --
+
+    #[test]
+    fn hashval_should_convert_pins_the_512_entry_and_64_byte_boundaries() {
+        // The HASH entry cap is 512 (NOT the 128 zset/set cap). Verified vs Redis 7.4
+        // config.c / t_hash.c and the pinned claim redis-hash-max-listpack-entries-512.
+        assert_eq!(DEFAULT_HASH_MAX_LISTPACK_ENTRIES, 512);
+        assert_eq!(DEFAULT_HASH_MAX_LISTPACK_VALUE, 64);
+
+        // Entry-count boundary: 512 small entries stay listpack; 513 flips to hashtable.
+        // `should_convert(entries, ..)` is called AFTER the edit, with the post-edit count.
+        assert!(
+            !HashVal::should_convert(512, 1, 1),
+            "exactly 512 entries (small field/value) stays listpack"
+        );
+        assert!(
+            HashVal::should_convert(513, 1, 1),
+            "513 entries flips to hashtable (over the 512 HASH cap)"
+        );
+
+        // Per-element byte boundary (independent of entry count): a field or value of 64
+        // bytes stays listpack; 65 bytes flips. Few entries, so only the byte cap fires.
+        assert!(
+            !HashVal::should_convert(2, 64, 64),
+            "a 64-byte field AND a 64-byte value (at the cap) stays listpack"
+        );
+        assert!(
+            HashVal::should_convert(2, 65, 1),
+            "a 65-byte field (over the 64 cap) flips to hashtable"
+        );
+        assert!(
+            HashVal::should_convert(2, 1, 65),
+            "a 65-byte value (over the 64 cap) flips to hashtable"
+        );
     }
 
     #[test]

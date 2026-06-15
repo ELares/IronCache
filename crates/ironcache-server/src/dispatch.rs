@@ -11,7 +11,7 @@
 
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
-use crate::{cmd_config, cmd_expire, cmd_introspect, cmd_keyspace, cmd_list, cmd_string};
+use crate::{cmd_config, cmd_expire, cmd_hash, cmd_introspect, cmd_keyspace, cmd_list, cmd_string};
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
 use ironcache_expiry::TimingWheel;
@@ -430,6 +430,35 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
         b"LMOVE" => cmd_list::cmd_lmove(store, db, now, req),
         b"RPOPLPUSH" => cmd_list::cmd_rpoplpush(store, db, now, req),
         b"LPOS" => cmd_list::cmd_lpos(store, db, now, req),
+        // -- Hash commands (PR-6) over the in-place-mutation RMW extension. Mutating
+        // commands route through `rmw_mut` (OccupiedMut/Mutated) or Insert (create) /
+        // Delete (emptied); reads through `rmw_mut` with Keep. WRONGTYPE on a non-hash.
+        // HRANDFIELD's randomness enters through the Env RNG seam (the caller draws the
+        // seed here, like RANDOMKEY). HSCAN reuses the SCAN hash-ordered cursor over the
+        // hash's own field table. --
+        b"HSET" => cmd_hash::cmd_hset(store, db, now, req),
+        b"HMSET" => cmd_hash::cmd_hmset(store, db, now, req),
+        b"HSETNX" => cmd_hash::cmd_hsetnx(store, db, now, req),
+        b"HGET" => cmd_hash::cmd_hget(store, db, now, req),
+        b"HMGET" => cmd_hash::cmd_hmget(store, db, now, req),
+        b"HDEL" => cmd_hash::cmd_hdel(store, db, now, req),
+        b"HGETALL" => cmd_hash::cmd_hgetall(store, db, now, req),
+        b"HKEYS" => cmd_hash::cmd_hkeys(store, db, now, req),
+        b"HVALS" => cmd_hash::cmd_hvals(store, db, now, req),
+        b"HLEN" => cmd_hash::cmd_hlen(store, db, now, req),
+        b"HEXISTS" => cmd_hash::cmd_hexists(store, db, now, req),
+        b"HSTRLEN" => cmd_hash::cmd_hstrlen(store, db, now, req),
+        b"HINCRBY" => cmd_hash::cmd_hincrby(store, db, now, req),
+        b"HINCRBYFLOAT" => cmd_hash::cmd_hincrbyfloat(store, db, now, req),
+        b"HRANDFIELD" => {
+            // HRANDFIELD's randomness enters through the Env RNG seam (ADR-0003,
+            // KEYSPACE.md): the CALLER draws the seed here and passes it in; the store +
+            // handler read no RNG. Draw ONLY for HRANDFIELD so the per-command RNG stream
+            // is not perturbed by other commands (mirrors the RANDOMKEY draw block).
+            let seed = env.rng().next_u64();
+            cmd_hash::cmd_hrandfield(store, db, seed, now, req)
+        }
+        b"HSCAN" => cmd_hash::cmd_hscan(store, db, now, req),
         // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
         b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
         _ => {
@@ -4980,5 +5009,53 @@ mod tests {
                 other => panic!("expected arity error for {bad:?}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn hash_commands_through_dispatch() {
+        // Drive the HASH commands through the full dispatcher (so the HRANDFIELD RNG draw
+        // off the Env seam, the denyoom gate, and the command-table wiring are exercised).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // HSET two new fields -> :2.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"HSET", b"h", b"a", b"1", b"b", b"2"]
+            ),
+            Value::Integer(2)
+        );
+        // HGET -> bulk.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"HGET", b"h", b"a"]),
+            bulk(b"1")
+        );
+        // HRANDFIELD with no count -> one of the fields (the RNG seed comes off the Env
+        // seam inside dispatch; we just assert it is a member).
+        match run_on(&c, &mut s, &mut st, t, &[b"HRANDFIELD", b"h"]) {
+            Value::BulkString(Some(f)) => {
+                assert!(f.as_ref() == b"a" || f.as_ref() == b"b", "got {f:?}");
+            }
+            other => panic!("HRANDFIELD -> {other:?}"),
+        }
+        // HGETALL -> a map value (the encoder degrades it per proto).
+        match run_on(&c, &mut s, &mut st, t, &[b"HGETALL", b"h"]) {
+            Value::Map(pairs) => assert_eq!(pairs.len(), 2),
+            other => panic!("HGETALL -> {other:?}"),
+        }
+        // HDEL both fields -> :2, then the key is gone (empty-deletes-key).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"HDEL", b"h", b"a", b"b"]),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"h"]),
+            Value::Integer(0)
+        );
     }
 }

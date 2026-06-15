@@ -65,6 +65,16 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             | b"LINSERT"
             | b"LMOVE"
             | b"RPOPLPUSH"
+            // Hash writes that allocate value bytes (PR-6). HSET/HMSET/HSETNX add or
+            // replace fields; HINCRBY/HINCRBYFLOAT create-on-missing and grow a field's
+            // value. All are `denyoom` in Redis. HDEL is memory-RELEASING and the hash
+            // reads (HGET/HMGET/HGETALL/HKEYS/HVALS/HLEN/HEXISTS/HSTRLEN/HRANDFIELD/HSCAN)
+            // are read-only, so they are NOT gated.
+            | b"HSET"
+            | b"HMSET"
+            | b"HSETNX"
+            | b"HINCRBY"
+            | b"HINCRBYFLOAT"
     )
 }
 
@@ -98,6 +108,12 @@ mod tests {
             b"LINSERT",
             b"LMOVE",
             b"RPOPLPUSH",
+            // Hash writes (PR-6).
+            b"HSET",
+            b"HMSET",
+            b"HSETNX",
+            b"HINCRBY",
+            b"HINCRBYFLOAT",
         ] {
             assert!(is_denyoom(w), "{w:?} should be denyoom");
         }
@@ -147,6 +163,18 @@ mod tests {
             b"LRANGE",
             b"LINDEX",
             b"LPOS",
+            // Hash reads + memory-releasing HDEL (PR-6): not denyoom.
+            b"HGET",
+            b"HMGET",
+            b"HGETALL",
+            b"HKEYS",
+            b"HVALS",
+            b"HLEN",
+            b"HEXISTS",
+            b"HSTRLEN",
+            b"HRANDFIELD",
+            b"HSCAN",
+            b"HDEL",
         ] {
             assert!(!is_denyoom(r), "{r:?} must not be denyoom");
         }

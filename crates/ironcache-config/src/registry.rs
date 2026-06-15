@@ -122,6 +122,18 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "list-max-listpack-size",
             kind: SetKind::AcceptedNoOp,
         },
+        // The hash listpack->hashtable thresholds (PR-6, #40): entry-count cap (512)
+        // and per-element byte cap (64). Recognized + echoed for compatibility; the
+        // store reads its own resolved defaults, and a runtime change is a follow-up
+        // (CONFIG.md "accepted and echoed").
+        ParamSpec {
+            name: "hash-max-listpack-entries",
+            kind: SetKind::AcceptedNoOp,
+        },
+        ParamSpec {
+            name: "hash-max-listpack-value",
+            kind: SetKind::AcceptedNoOp,
+        },
         // bind/port are MODIFIABLE_CONFIG in Redis (accepted at runtime), but IronCache
         // reports them restart-required as a DELIBERATE DIVERGENCE: the thread-per-core
         // boot binds the listening sockets once at startup and cannot re-bind / re-port
@@ -186,6 +198,10 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // The list listpack->quicklist threshold: echo the Redis `-2` default
         // spelling ("8 KB per node"); the store works in the resolved byte budget.
         "list-max-listpack-size" => crate::LIST_MAX_LISTPACK_SIZE_REDIS_DEFAULT.to_owned(),
+        // The hash listpack->hashtable thresholds: echo the pinned defaults (512
+        // entries, 64 bytes per element); the store reads these resolved defaults.
+        "hash-max-listpack-entries" => crate::DEFAULT_HASH_MAX_LISTPACK_ENTRIES.to_string(),
+        "hash-max-listpack-value" => crate::DEFAULT_HASH_MAX_LISTPACK_VALUE.to_string(),
         // Restart-required: read the boot config (these never change at runtime).
         "bind" => boot.bind.to_string(),
         "port" => boot.port.to_string(),
@@ -321,6 +337,23 @@ mod tests {
             effective_value("appendonly", &rc, &cfg).as_deref(),
             Some("no")
         );
+        // The list/hash collection thresholds echo their pinned defaults (PR-5/6).
+        assert_eq!(
+            effective_value("list-max-listpack-size", &rc, &cfg).as_deref(),
+            Some("-2")
+        );
+        // hash-max-listpack-entries echoes the Redis-correct 512 (NOT 128, which is the
+        // ZSET/SET default); verified vs the pinned claim redis-hash-max-listpack-entries-512.
+        assert_eq!(
+            effective_value("hash-max-listpack-entries", &rc, &cfg).as_deref(),
+            Some("512")
+        );
+        assert_eq!(
+            effective_value("hash-max-listpack-value", &rc, &cfg).as_deref(),
+            Some("64")
+        );
+        assert!(lookup("hash-max-listpack-entries").is_some());
+        assert!(lookup("hash-max-listpack-value").is_some());
         // Unknown param -> None (CONFIG GET omits it).
         assert!(effective_value("bogus", &rc, &cfg).is_none());
     }

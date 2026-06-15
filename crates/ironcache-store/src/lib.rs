@@ -396,11 +396,12 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             kvobj::ValueRepr::Raw(b) => {
                 ValueRef::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
-            // A LIST is not byte-readable as a string: the command layer only reads
+            // A LIST/HASH is not byte-readable as a string: the command layer only reads
             // its data_type / encoding from the view (GET checks String; OBJECT
-            // ENCODING reads the encoding). The bytes are empty so a misrouted
-            // as_bytes() yields nothing rather than leaking a representation.
-            kvobj::ValueRepr::List(_) => ValueRef::borrowed(
+            // ENCODING reads the encoding, e.g. listpack/quicklist/hashtable). The bytes
+            // are empty so a misrouted as_bytes() yields nothing rather than leaking a
+            // representation.
+            kvobj::ValueRepr::List(_) | kvobj::ValueRepr::Hash(_) => ValueRef::borrowed(
                 obj.header.data_type,
                 obj.header.encoding,
                 obj.expire_at,
@@ -428,11 +429,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             kvobj::ValueRepr::Raw(b) => {
                 OccupiedEntry::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
-            // A LIST observed through the READ-ONLY rmw arm (e.g. a numeric RMW that
-            // hits a list key) exposes empty bytes; the closure sees data_type=List
-            // and returns WRONGTYPE. In-place list edits use the MUTABLE arm
-            // (`rmw_mut` -> OccupiedEntryMut), not this read-only handle.
-            kvobj::ValueRepr::List(_) => OccupiedEntry::borrowed(
+            // A LIST/HASH observed through the READ-ONLY rmw arm (e.g. a numeric RMW that
+            // hits a collection key) exposes empty bytes; the closure sees the collection
+            // data_type and returns WRONGTYPE. In-place collection edits use the MUTABLE
+            // arm (`rmw_mut` -> OccupiedEntryMut), not this read-only handle.
+            kvobj::ValueRepr::List(_) | kvobj::ValueRepr::Hash(_) => OccupiedEntry::borrowed(
                 obj.header.data_type,
                 obj.header.encoding,
                 obj.expire_at,
@@ -602,20 +603,30 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             let data_type = obj.header.data_type;
             let encoding = obj.header.encoding;
             let expire_at = obj.expire_at;
-            // Build the typed mutable view: a list yields the list arm, anything else
-            // the non-collection arm (the handler's as_list_mut returns None ->
-            // WRONGTYPE). The borrow of `obj` lives only for the closure call.
+            // Build the typed mutable view: a list yields the list arm, a hash the hash
+            // arm, anything else the non-collection arm (the handler's `as_*_mut` then
+            // returns None -> WRONGTYPE). The borrow of `obj` lives only for the closure
+            // call. The collection arms are selected per repr; the empty-collection check
+            // after a Mutated return uses `KvObj::is_empty_collection`, which is defined
+            // over the SAME `collection_len` mapping (kvobj.rs), so the two sites cannot
+            // drift (the PR-5 review's consolidation; new collection types add an arm
+            // here AND a `collection_len` arm there in lockstep).
             //
-            // PR-6/7/8 NOTE: this type-dispatch handles only the list arm today. When
-            // the hash/set/zset reprs land, add their `as_*_mut` arms HERE and to
-            // `KvObj::is_empty_collection` (kvobj.rs) IN LOCKSTEP.
-            let entry = match obj.as_list_mut() {
-                Some(list) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, list))
+            // The repr is matched ONCE (not via sequential `as_*_mut` borrows, which
+            // would each take and drop a fresh `&mut` and obscure the dispatch) so each
+            // collection type maps to exactly one arm.
+            let entry = match &mut obj.value {
+                kvobj::ValueRepr::List(l) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, l))
                 }
-                None => RmwEntry::OccupiedMut(OccupiedEntryMut::non_collection(
-                    data_type, encoding, expire_at,
-                )),
+                kvobj::ValueRepr::Hash(h) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, h))
+                }
+                kvobj::ValueRepr::Int(_)
+                | kvobj::ValueRepr::Inline(_)
+                | kvobj::ValueRepr::Raw(_) => RmwEntry::OccupiedMut(
+                    OccupiedEntryMut::non_collection(data_type, encoding, expire_at),
+                ),
             };
             f(entry)
         } else {
