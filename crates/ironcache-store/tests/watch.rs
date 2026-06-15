@@ -58,6 +58,172 @@ fn sadd(store: &mut ShardStore, key: &[u8], member: &[u8]) -> bool {
     })
 }
 
+/// EXPIRE-style TTL write through the read-only `rmw` Keep arm: set a new deadline on a
+/// live key WITHOUT touching the value (mirrors the cmd_expire handler's
+/// `RmwAction::Keep` + `ExpireWrite::Set`). Returns whether the key was live.
+fn expire(store: &mut ShardStore, key: &[u8], deadline: UnixMillis) -> bool {
+    store.rmw(0, key, NOW, move |entry| match entry {
+        RmwEntry::Occupied(_) => RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Set(deadline),
+            reply: true,
+        },
+        RmwEntry::Vacant => RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Unchanged,
+            reply: false,
+        },
+        RmwEntry::OccupiedMut(_) => unreachable!(),
+    })
+}
+
+/// PERSIST-style TTL write through the read-only `rmw` Keep arm: clear the deadline on a
+/// live key WITHOUT touching the value (mirrors cmd_persist's `RmwAction::Keep` +
+/// `ExpireWrite::Clear`). Returns whether the key was live.
+fn persist(store: &mut ShardStore, key: &[u8]) -> bool {
+    store.rmw(0, key, NOW, |entry| match entry {
+        RmwEntry::Occupied(_) => RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Clear,
+            reply: true,
+        },
+        RmwEntry::Vacant => RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Unchanged,
+            reply: false,
+        },
+        RmwEntry::OccupiedMut(_) => unreachable!(),
+    })
+}
+
+/// Bare GETEX (no TTL option) through the read-only `rmw` Keep arm: a pure read that
+/// leaves the deadline UNCHANGED (mirrors the GetexTtl::Unchanged path,
+/// `RmwAction::Keep` + `ExpireWrite::Unchanged`). This must NOT dirty a watched key.
+fn getex_noop(store: &mut ShardStore, key: &[u8]) -> bool {
+    store.rmw(0, key, NOW, |entry| match entry {
+        RmwEntry::Occupied(_) => RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Unchanged,
+            reply: true,
+        },
+        RmwEntry::Vacant => RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Unchanged,
+            reply: false,
+        },
+        RmwEntry::OccupiedMut(_) => unreachable!(),
+    })
+}
+
+#[test]
+fn expire_of_a_watched_key_is_dirty() {
+    // SET k v (no TTL); WATCH k; EXPIRE k 100 (sets a deadline) -> dirty. This is the
+    // TTL-only-command-dirties-a-watched-key fix: the `rmw` Keep arm bumps the version on
+    // a real TTL change, so a following EXEC would abort with the null array.
+    let mut s = store();
+    s.upsert(0, b"k", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+    let e = s.watch_snapshot(0, b"k", NOW);
+    assert!(e.present_at_watch);
+    assert!(!s.watch_is_dirty(&e, NOW), "no write yet -> clean");
+    assert!(expire(&mut s, b"k", UnixMillis(100_000)), "key was live");
+    assert!(
+        s.watch_is_dirty(&e, NOW),
+        "EXPIRE (a TTL change) dirties the watched key"
+    );
+}
+
+#[test]
+fn persist_of_a_watched_key_with_ttl_is_dirty() {
+    // SET k v with a TTL; WATCH k; PERSIST k (clears the deadline) -> dirty.
+    let mut s = store();
+    s.upsert(
+        0,
+        b"k",
+        NewValue::Bytes(b"v"),
+        ExpireWrite::Set(UnixMillis(100_000)),
+        NOW,
+    );
+    let e = s.watch_snapshot(0, b"k", NOW);
+    assert!(e.present_at_watch);
+    assert!(!s.watch_is_dirty(&e, NOW), "no write yet -> clean");
+    assert!(persist(&mut s, b"k"), "key was live");
+    assert!(
+        s.watch_is_dirty(&e, NOW),
+        "PERSIST (clearing a deadline) dirties the watched key"
+    );
+}
+
+#[test]
+fn bare_getex_no_ttl_option_does_not_dirty() {
+    // SET k v; WATCH k; bare GETEX k (no TTL option -> ExpireWrite::Unchanged) -> CLEAN.
+    // The fix scopes the notify to the real-change branch, so a no-op TTL write keeps the
+    // key clean (matches Redis: a bare GETEX does not signalModifiedKey).
+    let mut s = store();
+    s.upsert(0, b"k", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+    let e = s.watch_snapshot(0, b"k", NOW);
+    assert!(getex_noop(&mut s, b"k"), "key was live");
+    assert!(
+        !s.watch_is_dirty(&e, NOW),
+        "a bare GETEX (no TTL option) is a pure read and does NOT dirty the watched key"
+    );
+}
+
+#[test]
+fn no_op_expire_same_deadline_does_not_dirty() {
+    // A watched key with a TTL; EXPIRE to the SAME deadline -> no change -> CLEAN. The
+    // real-change scoping means an EXPIRE that does not move the deadline stays clean.
+    let mut s = store();
+    let deadline = UnixMillis(100_000);
+    s.upsert(
+        0,
+        b"k",
+        NewValue::Bytes(b"v"),
+        ExpireWrite::Set(deadline),
+        NOW,
+    );
+    let e = s.watch_snapshot(0, b"k", NOW);
+    assert!(expire(&mut s, b"k", deadline), "key was live");
+    assert!(
+        !s.watch_is_dirty(&e, NOW),
+        "an EXPIRE that does not move the deadline is a no-op and does NOT dirty"
+    );
+}
+
+#[test]
+fn lazily_expired_watched_key_dirties_via_version_bump() {
+    // A watched LIVE key that lazily expires between WATCH and EXEC reads dirty, and the
+    // dirty signal is carried by the VERSION bump (not only the present/absent flip): the
+    // expire_if_due removal now funnels through remove_object, which fires touch_watch.
+    // Prove it via the version: after the reap the slot version has advanced past the
+    // snapshot, so even if the present/absent comparison agreed, the version alone catches
+    // it. We assert the version moved by reading the live slot version through a SECOND
+    // watcher planted at the same key after the reap is irrelevant; instead we check the
+    // store's version_clock advanced across the reap and that the entry reads dirty.
+    let mut s = store();
+    let deadline = UnixMillis(2_000);
+    s.upsert(
+        0,
+        b"k",
+        NewValue::Bytes(b"v"),
+        ExpireWrite::Set(deadline),
+        NOW,
+    );
+    let e = s.watch_snapshot(0, b"k", NOW);
+    assert!(e.present_at_watch, "live at watch time");
+    let clock_before = s.version_clock();
+    // Past the deadline: the dirty check runs the lazy backstop. The removal funnels
+    // through remove_object -> touch_watch, so the version clock advances (the version-bump
+    // dirty signal), independent of the present/absent fallback.
+    assert!(
+        s.watch_is_dirty(&e, UnixMillis(2_001)),
+        "a lazily-expired watched key is dirty"
+    );
+    assert!(
+        s.version_clock() > clock_before,
+        "the lazy expiry funneled through remove_object and bumped the version clock (not only present/absent)"
+    );
+}
+
 #[test]
 fn overwrite_of_a_watched_key_is_dirty() {
     let mut s = store();

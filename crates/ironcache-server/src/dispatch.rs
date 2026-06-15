@@ -718,12 +718,15 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
 /// the key's current version + present/absent status into a [`WatchEntry`] pushed onto
 /// `state.watch`. Replies `+OK`.
 ///
-/// WATCH inside MULTI is rejected with `-ERR WATCH inside MULTI is not allowed` WITHOUT
-/// dirtying the transaction (the txn stays open + clean, so a following EXEC still runs):
-/// the queue gate excludes WATCH from queueing, and this arm returns the error when
-/// `in_multi`. WATCH is arity -2 (the command token + at least one key); the queue-gate
-/// arity table holds the same value, but WATCH outside MULTI is validated here too (the
-/// gate only runs inside MULTI), so check it explicitly.
+/// A WELL-FORMED WATCH inside MULTI is rejected with `-ERR WATCH inside MULTI is not
+/// allowed` WITHOUT dirtying the transaction (the txn stays open + clean, so a following
+/// EXEC still runs): the queue gate excludes WATCH from queueing, and this arm returns the
+/// error when `in_multi`. WATCH is arity -2 (the command token + at least one key); the
+/// queue-gate arity table holds the same value, but WATCH outside MULTI is validated here
+/// too (the gate only runs inside MULTI), so check it explicitly. The arity check runs
+/// BEFORE the in-MULTI rejection (matching the MULTI/DISCARD/EXEC arms and Redis's
+/// pre-queue commandCheckArity -> flagTransaction), so a MALFORMED WATCH (no keys) inside
+/// MULTI DIRTIES the transaction (`dirty_exec`), and a later clean EXEC returns EXECABORT.
 ///
 /// SINGLE-SHARD-PER-CONNECTION (PR-10b scope): every watched key is registered on this
 /// connection's accept shard `store`; a watched key on a different shard is out of scope
@@ -734,14 +737,21 @@ fn cmd_watch<S: Store + Watch>(
     now: UnixMillis,
     req: &Request,
 ) -> Value {
-    // WATCH inside MULTI: error, txn left OPEN + CLEAN (no dirty_exec). Checked before
-    // arity so it matches Redis's order (watchCommand rejects in-MULTI first).
+    // Arity -2: command token + >= 1 key. Checked FIRST (matching the MULTI/DISCARD/EXEC
+    // arms): Redis runs commandCheckArity -> flagTransaction at the pre-queue arity check,
+    // so a malformed WATCH issued INSIDE a transaction DIRTIES it (a later clean EXEC then
+    // returns EXECABORT). Only AFTER arity passes does the WATCH-inside-MULTI rejection
+    // apply (a well-formed WATCH inside MULTI is the legal-but-disallowed case that leaves
+    // the txn OPEN + CLEAN).
+    if req.args.len() < 2 {
+        if state.in_multi {
+            state.dirty_exec = true;
+        }
+        return Value::error(ErrorReply::wrong_arity("watch"));
+    }
+    // WATCH inside MULTI: error, txn left OPEN + CLEAN (no dirty_exec).
     if state.in_multi {
         return Value::error(ErrorReply::watch_inside_multi());
-    }
-    // Arity -2: command token + >= 1 key.
-    if req.args.len() < 2 {
-        return Value::error(ErrorReply::wrong_arity("watch"));
     }
     let db = state.db;
     for key in &req.args[1..] {

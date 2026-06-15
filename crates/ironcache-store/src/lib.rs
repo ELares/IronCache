@@ -369,10 +369,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             .and_then(|m| m.get(key))
             .is_some_and(|o| o.is_expired(now));
         if due {
-            if let Some(obj) = self.dbs[db_idx].remove(key) {
-                let bytes = obj.accounted_bytes();
-                self.account_sub(bytes);
-                self.eviction.on_remove(db, key, bytes);
+            // Route the removal through the WRITE FUNNEL (`remove_object`): it fires
+            // on_remove + account_sub AND `touch_watch`, so a watched key that lazily
+            // expires between WATCH and EXEC is dirtied (the lazy-expiry dirty signal).
+            // Inlining the remove here would skip that notify and rest the dirty signal
+            // ONLY on the present/absent fallback. The lazy-backstop counter is bumped
+            // AFTER, gated on the funnel actually having removed a resident entry.
+            if self.remove_object(db, db_idx, key) {
                 // Count the lazy-backstop reclamation for INFO `expired_keys` (PR-3b).
                 // The serve loop drains this with `take_lazy_expired` after each
                 // command. This is the lazy-path signal that complements the active
@@ -428,19 +431,22 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         old_bytes.is_some()
     }
 
-    /// Remove `key`'s object, crediting the hooks. Returns whether it existed
-    /// (caller guarantees any due expiry already ran, so an existing entry is live).
+    /// Remove `key`'s object, crediting the hooks (the store-internal REMOVE FUNNEL).
+    /// Returns whether it existed. Used both for an explicit delete (the `rmw` Delete
+    /// arm, where the caller guarantees any due expiry already ran, so an existing entry
+    /// is live) AND for an expiry removal: BOTH the lazy backstop ([`Self::expire_if_due`])
+    /// and the active reaper ([`Self::reap_if_expired`]) route the actual removal through
+    /// here, so on_remove + account_sub + the WATCH notify fire on every removal path.
     ///
     /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
     /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
     fn remove_object(&mut self, db: u32, db_idx: usize, key: &[u8]) -> bool {
         // WATCH notify (PR-10b): a delete or expiry of a watched key bumps its version.
-        // The lazy/active expiry paths reach here through `remove_object` (expire_if_due /
-        // reap_if_expired both call it), so a watched key that expires is dirtied too,
-        // and FLUSHDB/FLUSHALL (which loop remove_object) dirty every watched key they
-        // remove. A watched-but-ABSENT key flush is handled in flush_db (it iterates the
-        // watch slots), since remove_object only fires for a key that was actually
-        // resident.
+        // Because the lazy/active expiry paths reach here (expire_if_due / reap_if_expired
+        // both call remove_object), a watched key that expires is dirtied too, and
+        // FLUSHDB/FLUSHALL (which loop remove_object) dirty every watched key they remove.
+        // A watched-but-ABSENT key flush is handled in flush_db (it iterates the watch
+        // slots), since remove_object only fires for a key that was actually resident.
         self.touch_watch(db, key);
         if let Some(obj) = self.dbs[db_idx].remove(key) {
             let bytes = obj.accounted_bytes();
@@ -641,6 +647,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         other => resolve_expire(other, old_deadline),
                     };
                     if new_deadline != old_deadline {
+                        // WATCH notify (PR-10b): a TTL change on a watched key IS a write
+                        // (EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT/PERSIST/GETEX-with-TTL all
+                        // signal in Redis -> keyModified -> touchWatchedKey). Scoped to the
+                        // real-change branch: a no-op TTL write (bare GETEX, an EXPIRE that
+                        // does not move the deadline) keeps the key CLEAN, matching Redis.
+                        self.touch_watch(db, key);
                         if let Some(obj) = self.dbs[db_idx].get_mut(key) {
                             obj.expire_at = new_deadline;
                             obj.header.ttl_present = new_deadline.is_some();
@@ -769,6 +781,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         other => resolve_expire(other, old_deadline),
                     };
                     if new_deadline != old_deadline {
+                        // WATCH notify (PR-10b): same as the read-only `rmw` Keep arm -- a
+                        // TTL change on a watched key is a write, scoped to the real-change
+                        // branch so a no-op TTL write stays clean (matches Redis).
+                        self.touch_watch(db, key);
                         if let Some(obj) = self.dbs[db_idx].get_mut(key) {
                             obj.expire_at = new_deadline;
                             obj.header.ttl_present = new_deadline.is_some();
@@ -803,25 +819,26 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // from the post-edit repr, and applies any TTL effect.
             RmwAction::Mutated => {
                 if live {
-                    // WATCH notify (PR-10b): an in-place collection edit IS a write to the
-                    // key, so it must bump a watched key's version EVEN when the edit is a
-                    // no-op on the value (SADD of an existing member, HSET of the same
-                    // value) -- Redis treats any write command touching the key as a
-                    // modification. The funnel functions (put_object/remove_object) are
-                    // NOT called on the non-emptying same-size in-place path, so the
-                    // notify must fire here. The emptied branch below routes through
-                    // remove_object_crediting (which also notifies), so this is a no-op
-                    // double-touch in that case (it only bumps the version again, which is
-                    // harmless: the key is still dirty either way).
-                    self.touch_watch(db, key);
                     let emptied = self.dbs[db_idx]
                         .get(key)
                         .is_some_and(KvObj::is_empty_collection);
                     if emptied {
                         // Same pre-edit-weight credit as the Delete arm: the edit
                         // already shrank the in-memory object, so credit `old_bytes`.
+                        // The WATCH notify fires inside remove_object_crediting (an
+                        // emptied collection is a delete), so it is NOT fired again here
+                        // -- each logical write bumps the version exactly once.
                         self.remove_object_crediting(db, db_idx, key, old_bytes);
                     } else {
+                        // WATCH notify (PR-10b): a non-emptying in-place collection edit IS
+                        // a write to the key, so it must bump a watched key's version EVEN
+                        // when the edit is a no-op on the value (SADD of an existing member,
+                        // HSET of the same value) -- Redis treats any write command touching
+                        // the key as a modification. The funnel functions
+                        // (put_object/remove_object) are NOT called on this non-emptying
+                        // same-size in-place path, so the notify must fire here. (The emptied
+                        // branch above already notifies via remove_object_crediting.)
+                        self.touch_watch(db, key);
                         let new_bytes = self.dbs[db_idx].get(key).map_or(0, KvObj::accounted_bytes);
                         // Re-account the signed delta and re-fire the eviction sizing
                         // so the policy's per-key byte estimate tracks the edit.

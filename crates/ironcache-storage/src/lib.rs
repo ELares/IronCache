@@ -1705,7 +1705,12 @@ pub trait Watch {
     /// `entry.version` (any create/overwrite/delete/expiry/flush of the key bumped it,
     /// including a no-op write that did not change the value), OR its current present
     /// /absent status (`read(db,key,now).is_some()`) differs from `entry.present_at_watch`
-    /// (a watched-live key that expired, or a watched-absent key now present). Read-only.
+    /// (a watched-live key that expired, or a watched-absent key now present).
+    ///
+    /// Logically a read, but NOT side-effect-free: the present/absent probe runs the lazy
+    /// expiry backstop, so it may reap an already-expired watched key as a side effect
+    /// (that reap IS the expiry dirty signal -- it both flips present/absent and bumps the
+    /// version). It mutates no value and is idempotent across repeated calls.
     fn watch_is_dirty(&mut self, entry: &WatchEntry, now: UnixMillis) -> bool;
 
     /// Deregister the watches in `entries` (the connection's whole snapshot list): per
