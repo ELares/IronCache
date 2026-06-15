@@ -13,7 +13,7 @@ use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{
     cmd_bitmap, cmd_config, cmd_expire, cmd_hash, cmd_introspect, cmd_keyspace, cmd_list, cmd_set,
-    cmd_string, cmd_zset,
+    cmd_string, cmd_txn, cmd_zset,
 };
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
@@ -243,11 +243,31 @@ fn maybe_hot_swap_policy<E: Env, S: PolicySwap>(
     }
 }
 
-// The dispatcher is one large command-routing match (the command table); its arms
-// grow as commands land (PR-5 adds the 16 list commands). The big-match shape is the
-// intended structure, so the line-count lint is allowed here alongside the
-// arg-count one (the workspace lint note records the dispatch-surface exception).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Dispatch one CLIENT command: the top-of-command work that must run ONCE per
+/// command from the wire, then either QUEUE it (inside a transaction) or run it.
+///
+/// ## Why this is split from [`dispatch_inner`] (PR-10a re-entrancy)
+///
+/// `EXEC` must re-run each queued command WITHOUT re-borrowing the store/wheel/env
+/// RefCells (the serve loop already holds them borrowed across the whole `dispatch`
+/// call). So the command body lives in [`dispatch_inner`], which takes the
+/// already-borrowed `&mut store` / `&mut wheel` / `&mut env`: `EXEC`'s loop calls
+/// `dispatch_inner` per queued command, reusing the SAME refs, with NO re-borrow of
+/// the thread-locals and NO double-borrow panic.
+///
+/// This outer `dispatch` does the work that must happen exactly ONCE per command
+/// arriving from the client and NOT per queued command at EXEC time:
+/// 1. reset `deltas` (a fresh per-command accumulator);
+/// 2. the `maxmemory-policy` hot-swap generation check (CONFIG.md, PR-4b);
+/// 3. the active-expiry wheel drain (EXPIRATION.md #51);
+/// 4. the auth gate (NOAUTH before authenticating);
+/// 5. THE QUEUE GATE (PR-10a): when inside `MULTI`, validate + stage the command and
+///    reply `+QUEUED`, OR reply a queue-time error now and dirty the transaction.
+///
+/// The per-command `maxmemory` admission gate is INSIDE `dispatch_inner` instead,
+/// because Redis evaluates `denyoom` per command at EXEC time (a queued over-budget
+/// write becomes an `-OOM` element in the array, no rollback).
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
     ctx: &ServerContext,
     state: &mut ConnState,
@@ -275,12 +295,14 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
     // backstop in the store still prevents OBSERVING an expired key, so this is purely
     // a memory optimization. MAX_RECLAIM_PER_CALL caps the work per command so the
     // drain never stalls the command path. The SAME [`drain_due_keys`] helper backs the
-    // PR-3c background timer task for idle shards (no duplicate drain logic).
+    // PR-3c background timer task for idle shards (no duplicate drain logic). It runs
+    // ONCE per client command (here), not per queued command at EXEC time.
     deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
 
     // Auth gate: before authenticating, only a small set of commands is allowed
     // (Redis: HELLO, AUTH, QUIT, RESET). Everything else (including the data
-    // commands) is NOAUTH.
+    // commands) is NOAUTH. Runs once per client command; queued commands at EXEC time
+    // are already past auth (you cannot MULTI before authenticating).
     if ctx.requires_auth()
         && !state.authenticated
         && !matches!(cmd.as_slice(), b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
@@ -288,6 +310,62 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
         return Value::error(ErrorReply::noauth());
     }
 
+    // THE QUEUE GATE (TRANSACTIONS.md "queue then apply", PR-10a). While inside a
+    // transaction, every command EXCEPT the control commands MULTI/EXEC/DISCARD (and
+    // RESET/QUIT, which act on the connection itself) is QUEUED rather than executed:
+    //   - validate it against the command table (known command + table arity). On a
+    //     queue-time error (unknown command / wrong arity), reply the error NOW and
+    //     mark the transaction dirty, so EXEC returns -EXECABORT and applies nothing.
+    //   - otherwise stage a CLONE of the request and reply +QUEUED.
+    // The control commands fall through to their arms in `dispatch_inner`. WATCH/UNWATCH
+    // arrive in PR-10b; until then they are not in the pass-through set, so inside MULTI
+    // they queue-validate as unknown commands (faithful: they are not implemented yet).
+    if state.in_multi
+        && !matches!(
+            cmd.as_slice(),
+            b"MULTI" | b"EXEC" | b"DISCARD" | b"RESET" | b"QUIT"
+        )
+    {
+        return match cmd_txn::queue_validate(&cmd, &req.args) {
+            Ok(()) => {
+                state.queued.push(req.clone());
+                Value::simple("QUEUED")
+            }
+            Err(e) => {
+                state.dirty_exec = true;
+                Value::error(e)
+            }
+        };
+    }
+
+    dispatch_inner(
+        ctx, state, env, store, wheel, now, rollup, mem, deltas, req, &cmd,
+    )
+}
+
+/// The command body: the per-command `maxmemory` admission gate followed by the big
+/// command-routing match. Split out from [`dispatch`] so `EXEC` can re-run each queued
+/// command here against the ALREADY-BORROWED store/wheel/env (PR-10a re-entrancy, see
+/// `dispatch`'s doc). The caller passes the uppercased command token `cmd` so this
+/// fn does not re-uppercase per queued command.
+///
+/// The dispatcher is one large command-routing match (the command table); its arms grow
+/// as commands land. The big-match shape is the intended structure, so the line-count
+/// lint is allowed here alongside the arg-count one.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
+    ctx: &ServerContext,
+    state: &mut ConnState,
+    env: &mut E,
+    store: &mut S,
+    wheel: &mut TimingWheel,
+    now: UnixMillis,
+    rollup: RollupFn<'_>,
+    mem: MemoryInfo,
+    deltas: &mut CounterDeltas,
+    req: &Request,
+    cmd: &[u8],
+) -> Value {
     // maxmemory admission (ADMISSION.md #128, ADR-0007). For a `denyoom` write, before
     // the command body: if the ceiling is enabled and this shard is STRICTLY OVER its
     // budget, either evict-to-fit (cache mode) or reply `-OOM` (datastore/noeviction).
@@ -297,7 +375,12 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
     // string itself reads "used memory > 'maxmemory'"). Non-denyoom commands (reads,
     // DEL, Tier-0) are ALWAYS served, even over budget, so a client can read and free
     // under pressure.
-    if ctx.ceiling_enabled() && is_denyoom(cmd.as_slice()) {
+    //
+    // This gate is INSIDE `dispatch_inner` (not the once-per-command `dispatch`) so it
+    // runs PER QUEUED COMMAND in the EXEC loop, matching Redis (denyoom is evaluated per
+    // command at EXEC). A queued denyoom write that is over budget becomes an `-OOM`
+    // error ELEMENT in the EXEC array; the batch continues (no rollback).
+    if ctx.ceiling_enabled() && is_denyoom(cmd) {
         // The per-shard budget is recomputed from the CURRENT runtime maxmemory (a
         // cheap atomic load divided by the shard count), so a `CONFIG SET maxmemory`
         // tightens/loosens every shard's gate on its next denyoom write (PR-4b).
@@ -307,7 +390,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
                 // Cache mode: try to free space, then re-check. If eviction cannot get
                 // us down to budget (write outruns eviction, or only ineligible keys
                 // remain), reject -OOM. The freed count is reported for INFO.
-                deltas.evicted = store.evict_to_fit(budget, now);
+                deltas.evicted += store.evict_to_fit(budget, now);
                 if store.used_memory() > budget {
                     return Value::error(ErrorReply::oom());
                 }
@@ -319,7 +402,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
     }
 
     let db = state.db;
-    match cmd.as_slice() {
+    match cmd {
         b"PING" => cmd_ping(req),
         b"ECHO" => cmd_echo(req),
         b"HELLO" => cmd_hello(ctx, state, req),
@@ -333,6 +416,33 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
             state.reset(ctx.requires_auth());
             Value::SimpleString("RESET".to_owned())
         }
+        // -- Transaction control: MULTI/EXEC/DISCARD (TRANSACTIONS.md, PR-10a). These
+        // reach `dispatch_inner` only as direct client commands (the queue gate in
+        // `dispatch` excludes them from queueing). WATCH/UNWATCH are PR-10b. --
+        b"MULTI" => {
+            // MULTI takes exactly the command token. A nested MULTI is an error and
+            // leaves the queue + transaction state UNCHANGED (still in MULTI).
+            if req.args.len() != 1 {
+                return Value::error(ErrorReply::wrong_arity("multi"));
+            }
+            if state.in_multi {
+                return Value::error(ErrorReply::multi_nested());
+            }
+            state.enter_multi();
+            Value::ok()
+        }
+        b"DISCARD" => {
+            if req.args.len() != 1 {
+                return Value::error(ErrorReply::wrong_arity("discard"));
+            }
+            if !state.in_multi {
+                return Value::error(ErrorReply::discard_without_multi());
+            }
+            // Drop the queue + leave transaction state, applying nothing.
+            state.clear_txn();
+            Value::ok()
+        }
+        b"EXEC" => exec_transaction(ctx, state, env, store, wheel, now, rollup, mem, deltas, req),
         b"CLIENT" => cmd_client(state, req),
         b"COMMAND" => cmd_command(req),
         // INFO reads only the CLOCK half of the env seam (uptime); pass `env` as the
@@ -560,6 +670,67 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
             Value::error(ErrorReply::unknown_command(&name, &rest))
         }
     }
+}
+
+/// Run `EXEC` (TRANSACTIONS.md "queue then apply", PR-10a). Decides the three Redis
+/// outcomes and, on the apply path, REPLAYS each queued command against the SAME
+/// already-borrowed store/wheel/env by calling [`dispatch_inner`] per command (the
+/// re-entrancy the dispatch split exists for):
+/// - NOT in a transaction -> `-ERR EXEC without MULTI`;
+/// - in a transaction but DIRTIED (a queue-time error) -> `-EXECABORT ...`, drop the
+///   queue, exit MULTI, apply nothing;
+/// - otherwise -> run every queued command in order, collect each reply into an array
+///   element, and return the array (an empty MULTI;EXEC is an empty array `*0`). There
+///   is NO rollback: a per-command runtime error (WRONGTYPE, not-an-integer, `-OOM`
+///   over budget) is an Error element and the batch continues.
+///
+/// Determinism (ADR-0003): the whole batch reuses the SINGLE `now` the serve loop read
+/// once for this EXEC command, so a replay reaps/expires identically; no per-queued-
+/// command clock read. Exiting the transaction clears the queue in all three branches.
+#[allow(clippy::too_many_arguments)]
+fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
+    ctx: &ServerContext,
+    state: &mut ConnState,
+    env: &mut E,
+    store: &mut S,
+    wheel: &mut TimingWheel,
+    now: UnixMillis,
+    rollup: RollupFn<'_>,
+    mem: MemoryInfo,
+    deltas: &mut CounterDeltas,
+    req: &Request,
+) -> Value {
+    if req.args.len() != 1 {
+        return Value::error(ErrorReply::wrong_arity("exec"));
+    }
+    if !state.in_multi {
+        return Value::error(ErrorReply::exec_without_multi());
+    }
+    if state.dirty_exec {
+        // A queue-time error dirtied the batch: refuse the whole thing and apply
+        // nothing (clear_txn drops the queue + exits MULTI).
+        state.clear_txn();
+        return Value::error(ErrorReply::exec_abort());
+    }
+    // Take the queue OUT of `state` so we can pass `&mut state` to `dispatch_inner` per
+    // command without aliasing `state.queued`. Exit the transaction NOW (before running)
+    // so a queued RESET/MULTI/etc. sees a clean post-EXEC connection state, matching
+    // Redis (EXEC ends the transaction, then runs the batch).
+    let queued = std::mem::take(&mut state.queued);
+    state.clear_txn();
+    let mut replies = Vec::with_capacity(queued.len());
+    for q in &queued {
+        // Re-derive the uppercased token per queued command (cheap; the request was
+        // validated at queue time). Reuse the SAME borrowed store/wheel/env + `now`:
+        // no re-borrow of the thread-locals, no double-borrow. Counter deltas
+        // ACCUMULATE across the batch (eviction / keyspace hits-misses use `+=`).
+        let qcmd = ascii_upper(q.command());
+        let reply = dispatch_inner(
+            ctx, state, env, store, wheel, now, rollup, mem, deltas, q, &qcmd,
+        );
+        replies.push(reply);
+    }
+    Value::Array(Some(replies))
 }
 
 /// `PING` -> `+PONG`; `PING msg` -> bulk `msg`.
@@ -5198,5 +5369,300 @@ mod tests {
             run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"h"]),
             Value::Integer(0)
         );
+    }
+
+    // -- Transactions: MULTI/EXEC/DISCARD queueing (TRANSACTIONS.md, PR-10a). These use
+    // the persistent-store `run_on` helper so the per-connection MULTI state (in_multi /
+    // queued / dirty_exec on `s`) and the store both persist across calls. --
+
+    #[test]
+    fn multi_opens_a_transaction_and_queues_commands() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // MULTI -> +OK and the connection is in a transaction.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert!(s.in_multi);
+        // Each subsequent command is QUEUED (a SimpleString "QUEUED"), NOT executed.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]),
+            Value::simple("QUEUED")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCR", b"k"]),
+            Value::simple("QUEUED")
+        );
+        // The queue grew; nothing applied yet (k still absent in the store).
+        assert_eq!(s.queued.len(), 2);
+        // Even a read like GET is QUEUED inside MULTI (it does not execute now), so it
+        // replies +QUEUED rather than the value, and the queue grows to 3.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]),
+            Value::simple("QUEUED")
+        );
+        assert_eq!(s.queued.len(), 3);
+    }
+
+    #[test]
+    fn exec_runs_queued_commands_in_order_returning_an_array() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"k"]);
+        // EXEC -> Array([+OK, :2]) in order.
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], Value::ok());
+                assert_eq!(items[1], Value::Integer(2));
+            }
+            other => panic!("EXEC -> {other:?}"),
+        }
+        // The transaction is over and the batch applied: k == 2.
+        assert!(!s.in_multi);
+        assert!(s.queued.is_empty());
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), bulk(b"2"));
+    }
+
+    #[test]
+    fn empty_multi_exec_is_an_empty_array() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXEC"]),
+            Value::Array(Some(vec![]))
+        );
+        assert!(!s.in_multi);
+    }
+
+    #[test]
+    fn discard_drops_the_queue_and_exits_multi() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]),
+            Value::simple("QUEUED")
+        );
+        // DISCARD -> +OK, queue dropped, not in MULTI, nothing applied.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"DISCARD"]), Value::ok());
+        assert!(!s.in_multi);
+        assert!(s.queued.is_empty());
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), Value::Null);
+    }
+
+    #[test]
+    fn exec_and_discard_without_multi_are_errors() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC"])),
+            "-ERR EXEC without MULTI"
+        );
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"DISCARD"])),
+            "-ERR DISCARD without MULTI"
+        );
+    }
+
+    #[test]
+    fn nested_multi_is_an_error_and_leaves_the_queue_intact() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(s.queued.len(), 1);
+        // A nested MULTI errors and does NOT touch the queue or the transaction state.
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"MULTI"])),
+            "-ERR MULTI calls can not be nested"
+        );
+        assert!(s.in_multi);
+        assert_eq!(
+            s.queued.len(),
+            1,
+            "the queue is intact after a nested MULTI"
+        );
+    }
+
+    #[test]
+    fn queue_time_arity_error_dirties_and_exec_aborts() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        // A valid queued write first.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]),
+            Value::simple("QUEUED")
+        );
+        // GET with no key: a queue-time ARITY error reported NOW, and the txn dirtied.
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"GET"])),
+            "-ERR wrong number of arguments for 'get' command"
+        );
+        assert!(s.dirty_exec);
+        // EXEC -> EXECABORT, nothing applied (k absent), transaction cleared.
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC"])),
+            "-EXECABORT Transaction discarded because of previous errors."
+        );
+        assert!(!s.in_multi);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), Value::Null);
+    }
+
+    #[test]
+    fn queue_time_unknown_command_dirties_and_exec_aborts() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        // An unknown command inside MULTI: the unknown-command error NOW + dirty.
+        match run_on(&c, &mut s, &mut st, t, &[b"FROBNICATE", b"a"]) {
+            Value::Error(e) => assert!(
+                e.line().starts_with("-ERR unknown command 'FROBNICATE'"),
+                "{}",
+                e.line()
+            ),
+            other => panic!("expected unknown-command error, got {other:?}"),
+        }
+        assert!(s.dirty_exec);
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC"])),
+            "-EXECABORT Transaction discarded because of previous errors."
+        );
+        assert!(!s.in_multi);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), Value::Null);
+    }
+
+    #[test]
+    fn exec_does_not_roll_back_on_a_runtime_error() {
+        // No rollback (TRANSACTIONS.md): a per-command runtime error at EXEC time becomes
+        // an Error ELEMENT in the array; the batch continues and later writes apply.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // A string value that INCR cannot parse.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"sv", b"hello"]),
+            Value::ok()
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"sv"]); // will fail at run time
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"s2", b"ok"]); // must still apply
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => {
+                assert_eq!(items.len(), 2);
+                match &items[0] {
+                    Value::Error(e) => {
+                        assert_eq!(e.line(), "-ERR value is not an integer or out of range");
+                    }
+                    other => panic!("element 0 should be the INCR error, got {other:?}"),
+                }
+                assert_eq!(items[1], Value::ok());
+            }
+            other => panic!("EXEC -> {other:?}"),
+        }
+        // No rollback: s2 was set despite the earlier error element.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"s2"]),
+            bulk(b"ok")
+        );
+    }
+
+    #[test]
+    fn reset_mid_multi_clears_the_transaction() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        // RESET inside MULTI clears the transaction (it is in the queue-gate exclusion
+        // set, so it runs immediately and resets the connection).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RESET"]),
+            Value::SimpleString("RESET".to_owned())
+        );
+        assert!(!s.in_multi);
+        assert!(s.queued.is_empty());
+        // A subsequent EXEC is now "without MULTI".
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC"])),
+            "-ERR EXEC without MULTI"
+        );
+    }
+
+    #[test]
+    fn per_command_admission_runs_inside_exec() {
+        // The maxmemory denyoom gate is evaluated PER QUEUED COMMAND at EXEC time (it
+        // lives in dispatch_inner). With a tiny budget + noeviction, a queued write that
+        // tips strictly over budget becomes an -OOM error ELEMENT in the array; the batch
+        // does not roll back the writes that already applied.
+        let c = ctx_with_budget(50);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::NoEviction);
+        let t = UnixMillis(0);
+        let big = vec![b'v'; 100];
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        // First queued SET: at EXEC time used starts at 0 (< 50), so it is served and
+        // pushes the store over budget.
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k1", &big]);
+        // Second queued SET: at EXEC time used is now strictly over budget -> -OOM.
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k2", &big]);
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], Value::ok(), "first write served");
+                match &items[1] {
+                    Value::Error(e) => assert_eq!(
+                        e.line(),
+                        "-OOM command not allowed when used memory > 'maxmemory'."
+                    ),
+                    other => panic!("element 1 should be -OOM, got {other:?}"),
+                }
+            }
+            other => panic!("EXEC -> {other:?}"),
+        }
+        // No rollback: k1 is present, k2 was rejected.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k1"]), bulk(&big));
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"k2"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn control_commands_are_not_queued_inside_multi() {
+        // MULTI/EXEC/DISCARD/RESET/QUIT are NOT staged: they act on the connection even
+        // while in a transaction. Here QUIT inside MULTI closes (and is not queued).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(s.queued.len(), 1);
+        // QUIT runs immediately (sets should_close), not queued.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"QUIT"]), Value::ok());
+        assert!(s.should_close);
+        assert_eq!(s.queued.len(), 1, "QUIT was not queued");
     }
 }

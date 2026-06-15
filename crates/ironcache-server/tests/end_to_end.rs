@@ -1091,6 +1091,77 @@ fn zset_commands_over_real_socket() {
 }
 
 #[test]
+fn transactions_over_real_socket() {
+    use tokio::io::AsyncWriteExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // MULTI -> +OK.
+        client.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        // SET k 1 -> +QUEUED (a simple string).
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+QUEUED\r\n").await;
+        // INCR k -> +QUEUED.
+        client
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+QUEUED\r\n").await;
+        // EXEC -> the per-command reply array: *2 then +OK then :2.
+        client.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(&mut client, b"*2\r\n+OK\r\n:2\r\n").await;
+        // The batch applied: GET k -> "2".
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$1\r\n2\r\n").await;
+
+        // DISCARD path: MULTI, queue a write, DISCARD, confirm it did not apply.
+        client.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nd\r\n$1\r\n9\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+QUEUED\r\n").await;
+        client.write_all(b"*1\r\n$7\r\nDISCARD\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        // GET d -> null bulk (the discarded SET never applied).
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nd\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$-1\r\n").await;
+
+        // EXEC without MULTI -> the control error.
+        client.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(&mut client, b"-ERR EXEC without MULTI\r\n").await;
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
+#[test]
 fn bitmap_commands_over_real_socket() {
     use tokio::io::AsyncWriteExt;
 
