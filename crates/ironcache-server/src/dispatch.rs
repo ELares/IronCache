@@ -402,6 +402,13 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
     }
 
     let db = state.db;
+    // The arms below are HAND-SYNCED with the queue-time arity table in
+    // [`cmd_txn::arity_of`] (every dispatch arm has a table entry, and vice versa). The
+    // sync is guarded by the bidirectional + count cross-check
+    // `cmd_txn::tests::table_covers_every_dispatch_arm`; if you add or remove a command
+    // arm here, update that table (and its hand-listed `dispatch_arms`) too. A true
+    // single-source-of-truth table that removes the hand-sync is the tracked follow-up
+    // (#89).
     match cmd {
         b"PING" => cmd_ping(req),
         b"ECHO" => cmd_echo(req),
@@ -420,9 +427,16 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // reach `dispatch_inner` only as direct client commands (the queue gate in
         // `dispatch` excludes them from queueing). WATCH/UNWATCH are PR-10b. --
         b"MULTI" => {
-            // MULTI takes exactly the command token. A nested MULTI is an error and
-            // leaves the queue + transaction state UNCHANGED (still in MULTI).
+            // MULTI takes exactly the command token. A wrong-arity MULTI issued INSIDE a
+            // transaction DIRTIES it (Redis runs commandCheckArity BEFORE the MULTI queue
+            // block, so an arity failure on ANY verb, control verbs included, calls
+            // flagTransaction -> CLIENT_DIRTY_EXEC). The txn stays OPEN + dirty, so a later
+            // clean EXEC returns EXECABORT. When NOT in_multi this is just a plain
+            // wrong-arity error.
             if req.args.len() != 1 {
+                if state.in_multi {
+                    state.dirty_exec = true;
+                }
                 return Value::error(ErrorReply::wrong_arity("multi"));
             }
             if state.in_multi {
@@ -432,7 +446,14 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
             Value::ok()
         }
         b"DISCARD" => {
+            // A wrong-arity DISCARD issued INSIDE a transaction DIRTIES it (arity is
+            // checked before the queue block; see the MULTI arm), leaving the txn open so a
+            // later clean EXEC returns EXECABORT. NOT exiting MULTI on this path matches
+            // Redis (the dirty bit is set, the queue is untouched).
             if req.args.len() != 1 {
+                if state.in_multi {
+                    state.dirty_exec = true;
+                }
                 return Value::error(ErrorReply::wrong_arity("discard"));
             }
             if !state.in_multi {
@@ -701,6 +722,14 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
     req: &Request,
 ) -> Value {
     if req.args.len() != 1 {
+        // A wrong-arity EXEC issued INSIDE a transaction DIRTIES it (Redis runs
+        // commandCheckArity before the MULTI queue block, so an arity failure on the EXEC
+        // verb itself calls flagTransaction -> CLIENT_DIRTY_EXEC). The txn stays OPEN +
+        // dirty, so a later clean EXEC returns EXECABORT. When NOT in_multi this is just a
+        // plain wrong-arity error (and a clean EXEC then returns EXEC-without-MULTI).
+        if state.in_multi {
+            state.dirty_exec = true;
+        }
         return Value::error(ErrorReply::wrong_arity("exec"));
     }
     if !state.in_multi {
@@ -5549,6 +5578,105 @@ mod tests {
         );
         assert!(!s.in_multi);
         assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), Value::Null);
+    }
+
+    #[test]
+    fn wrong_arity_exec_inside_multi_dirties_and_next_exec_aborts() {
+        // commandCheckArity runs BEFORE the MULTI queue block in Redis, so a wrong-arity
+        // control verb (here EXEC) issued inside a transaction DIRTIES it: the bad EXEC
+        // replies its arity error, the txn stays OPEN + dirty, and a SUBSEQUENT clean EXEC
+        // returns EXECABORT. (MULTI; EXEC x; EXEC -> +OK, arity error, EXECABORT.)
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        // EXEC with an extra arg: wrong arity reported NOW, txn dirtied but still open.
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC", b"x"])),
+            "-ERR wrong number of arguments for 'exec' command"
+        );
+        assert!(s.in_multi, "the wrong-arity EXEC does NOT exit the txn");
+        assert!(s.dirty_exec, "the wrong-arity EXEC dirties the txn");
+        // A subsequent clean EXEC aborts because the txn is dirty.
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC"])),
+            "-EXECABORT Transaction discarded because of previous errors."
+        );
+        assert!(!s.in_multi);
+    }
+
+    #[test]
+    fn wrong_arity_multi_inside_multi_dirties_and_next_exec_aborts() {
+        // Same as the EXEC case but with a wrong-arity MULTI: it dirties the open txn (a
+        // bad-arity control verb is rejected before the nested-MULTI check), so the later
+        // clean EXEC aborts. (MULTI; MULTI x; EXEC -> +OK, arity error, EXECABORT.)
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"MULTI", b"x"])),
+            "-ERR wrong number of arguments for 'multi' command"
+        );
+        assert!(s.in_multi, "the wrong-arity MULTI does NOT exit the txn");
+        assert!(s.dirty_exec, "the wrong-arity MULTI dirties the txn");
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC"])),
+            "-EXECABORT Transaction discarded because of previous errors."
+        );
+        assert!(!s.in_multi);
+    }
+
+    #[test]
+    fn wrong_arity_discard_inside_multi_dirties_and_next_exec_aborts() {
+        // Same with a wrong-arity DISCARD: it dirties the open txn (the arity failure is
+        // before the queue block) and does NOT discard it; the later clean EXEC aborts.
+        // (MULTI; DISCARD x; EXEC -> +OK, arity error, EXECABORT.)
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"DISCARD", b"x"])),
+            "-ERR wrong number of arguments for 'discard' command"
+        );
+        assert!(s.in_multi, "the wrong-arity DISCARD does NOT exit the txn");
+        assert!(s.dirty_exec, "the wrong-arity DISCARD dirties the txn");
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC"])),
+            "-EXECABORT Transaction discarded because of previous errors."
+        );
+        assert!(!s.in_multi);
+    }
+
+    #[test]
+    fn wrong_arity_control_verb_outside_multi_is_a_plain_error() {
+        // When NOT in a transaction, a wrong-arity control verb is just its arity error
+        // (nothing to dirty): EXEC x -> arity error; a later clean EXEC is EXEC-without-
+        // MULTI (NOT EXECABORT), confirming nothing was left dirty.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC", b"x"])),
+            "-ERR wrong number of arguments for 'exec' command"
+        );
+        assert!(!s.in_multi);
+        assert!(!s.dirty_exec);
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"DISCARD", b"x"])),
+            "-ERR wrong number of arguments for 'discard' command"
+        );
+        assert!(!s.dirty_exec);
+        // A clean EXEC now: EXEC-without-MULTI, not EXECABORT.
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"EXEC"])),
+            "-ERR EXEC without MULTI"
+        );
     }
 
     #[test]
