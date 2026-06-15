@@ -124,16 +124,40 @@ mod tokio_bootstrap {
     /// [`TokioRuntime`], the accepted [`tokio::net::TcpStream`], and the
     /// [`ShardId`]. It returns a `'static` future (the connection task).
     ///
+    /// `inboxes` hands each shard ITS OWN cross-shard inbound item by index (the
+    /// coordinator's per-shard MPSC receiver, COORDINATOR.md #107): shard `index`
+    /// takes `inboxes[index]` and the `drain` closure turns it into a background
+    /// drain-loop future spawned on the shard's LocalSet ALONGSIDE the accept loop, so
+    /// a shard processes both newly-accepted connections AND cross-shard work routed to
+    /// the keys it owns. The seam is GENERIC over the item type `I` and the drain
+    /// closure so this runtime layer stays free of the coordinator's concrete types
+    /// (no `ShardWork`/`Receiver` naming leaks here); the binary supplies both. A
+    /// length mismatch (`inboxes.len() != total`) is a wiring bug and panics.
+    ///
     /// Returns a [`ShardSet`] for shutdown/join. If a shard thread fails to bind
     /// it logs to stderr and exits that thread; at least one bound shard is
     /// required for a useful server (the binary checks this separately).
-    pub fn run_shards<S, Fut>(cfg: &ShardConfig, serve: S) -> std::io::Result<ShardSet>
+    pub fn run_shards<S, Fut, I, D, DFut>(
+        cfg: &ShardConfig,
+        serve: S,
+        inboxes: Vec<I>,
+        drain: D,
+    ) -> std::io::Result<ShardSet>
     where
         S: Fn(TokioRuntime, tokio::net::TcpStream, ShardId) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = ()> + 'static,
+        I: Send + 'static,
+        D: Fn(I) -> DFut + Clone + Send + 'static,
+        DFut: Future<Output = ()> + 'static,
     {
         let shutdown = Arc::new(AtomicBool::new(false));
         let total = cfg.shards.max(1);
+        assert_eq!(
+            inboxes.len(),
+            total,
+            "run_shards: one inbox per shard required (got {}, need {total})",
+            inboxes.len()
+        );
 
         // Pre-flight bind probe so a bind failure (e.g. port in use) surfaces as
         // an error from this synchronous call rather than silently inside a shard
@@ -143,9 +167,12 @@ mod tokio_bootstrap {
         drop(probe);
 
         let mut handles = Vec::with_capacity(total);
-        for index in 0..total {
+        // Hand each shard its own inbox by moving items OUT of the vec by index. The
+        // vec is consumed (into_iter) so each `I` is owned by exactly one shard thread.
+        for (index, inbox) in inboxes.into_iter().enumerate() {
             let shutdown = Arc::clone(&shutdown);
             let serve = serve.clone();
+            let drain = drain.clone();
             let bind = cfg.bind;
             let shard = ShardId { index, total };
             let handle = std::thread::Builder::new()
@@ -176,6 +203,14 @@ mod tokio_bootstrap {
                                     return;
                                 }
                             };
+                            // Spawn the cross-shard DRAIN LOOP on this shard's LocalSet
+                            // BEFORE the accept loop (COORDINATOR.md #107): a shard can
+                            // own keys and must service remote work even if it never
+                            // accepts a connection. The accept loop below then runs for
+                            // the shard's lifetime; the drain loop runs concurrently on
+                            // the same single-threaded LocalSet (interleaved, never
+                            // parallel, so the shard-local RefCells stay single-threaded).
+                            tokio::task::spawn_local(drain(inbox));
                             let runtime = TokioRuntime::new();
                             accept_loop(&listener, &runtime, &serve, shard, &shutdown).await;
                         });

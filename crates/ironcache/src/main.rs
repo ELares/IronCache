@@ -8,11 +8,13 @@
 //! boundary (ADR-0003) holds.
 
 mod cli;
-mod serve;
 
 use anyhow::Context as _;
 use clap::Parser;
 use cli::{Cli, Command};
+// The server wiring lives in the crate's library half (`src/lib.rs`) so integration
+// tests can boot the real `run_server`; the binary consumes the same modules here.
+use ironcache::serve;
 use ironcache_config::{Config, ConfigOverlay};
 use std::path::Path;
 

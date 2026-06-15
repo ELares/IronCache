@@ -17,3 +17,9 @@ workspace = true
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+# The storage waist owns ScanCursor::MAX_SHARDS (the composite cross-shard SCAN cursor's
+# shard-index field width), so the shard-count ceiling lives in ONE place and Config
+# validation rejects an over-count at boot rather than silently corrupting the cursor
+# (COORDINATOR.md #107, FIX 2). storage is the leaf waist (only `bytes`), so this is not
+# a dependency cycle and pulls in no extra third-party crates.
+ironcache-storage = { workspace = true }

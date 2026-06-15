@@ -30,12 +30,17 @@ pub mod cmd_zset;
 pub mod conn;
 pub mod dispatch;
 pub mod glob;
+pub mod route;
 
 pub use admission::is_denyoom;
 pub use conn::ConnState;
 pub use dispatch::{
     EXPIRE_CYCLE_INTERVAL, MAX_RECLAIM_PER_CALL, MAX_RECLAIM_PER_CYCLE, RollupFn, ServerContext,
-    dispatch, drain_due_keys,
+    dispatch, dispatch_remote_keyed, dispatch_remote_whole_keyspace, dispatch_with_cmd,
+    drain_due_keys,
+};
+pub use route::{
+    CommandClass, KeySpec, classify, command_keys, owner_shard, owner_shard_set, single_key,
 };
 
 // Re-export the observe types the binary supplies to dispatch (the INFO memory
@@ -58,4 +63,6 @@ pub use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, Request, Value
 // `ActiveExpiry` is the PR-3b active-drain surface (reap_if_expired). `Watch` is the
 // PR-10b WATCH optimistic-lock surface (watch_snapshot/watch_is_dirty/unwatch) dispatch
 // bounds on; `WatchEntry` is the per-key snapshot the connection holds.
-pub use ironcache_storage::{ActiveExpiry, Admit, Store, UnixMillis, Watch, WatchEntry};
+pub use ironcache_storage::{
+    ActiveExpiry, Admit, Keyspace, ScanCursor, Store, UnixMillis, Watch, WatchEntry,
+};

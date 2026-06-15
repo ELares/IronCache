@@ -9,6 +9,7 @@
 //! synchronization. The connection loop decodes RESP, dispatches Tier-0 commands,
 //! and writes the encoded reply.
 
+use crate::coordinator;
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng, SystemEnv};
 use ironcache_eviction::{Policy, map_policy_name};
@@ -18,7 +19,8 @@ use ironcache_runtime::{Runtime, TokioRuntime};
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
     ConnState, CounterDeltas, DecodeOutcome, EXPIRE_CYCLE_INTERVAL, Limits, MAX_RECLAIM_PER_CYCLE,
-    ProtoVersion, Request, TimingWheel, UnixMillis, decode, dispatch, drain_due_keys,
+    ProtoVersion, Request, ScanCursor, TimingWheel, UnixMillis, decode, dispatch_with_cmd,
+    drain_due_keys, route,
 };
 use ironcache_storage::CountingAccounting;
 use ironcache_store::{ShardStore, process_memory};
@@ -41,20 +43,26 @@ pub const GLOBAL_ALLOCATOR_NAME: &str = "libc";
 /// The concrete per-shard store the binary wires: the `ShardStore` over the
 /// configured eviction [`Policy`] and the logical-byte accounting hook. The generic
 /// dispatch runs against this through the `Store` + `Admit` waist traits.
-type ShardStoreImpl = ShardStore<Policy, CountingAccounting>;
+///
+/// `pub(crate)` so the [`crate::coordinator`] drain loop names the same concrete store
+/// type the per-shard thread-locals hold (it runs remote keyed work against it).
+pub(crate) type ShardStoreImpl = ShardStore<Policy, CountingAccounting>;
 
 /// Per-shard, core-local mutable state. Single-threaded access on the shard's
 /// thread (no `Send`/`Sync` needed, no locks; shared-nothing ADR-0002).
-struct ShardState {
-    next_client_id: u64,
-    counters: ShardCounters,
+///
+/// `pub(crate)` so the [`crate::coordinator`] drain loop can fold a remote command's
+/// counter deltas into the OWNING shard's counters (the data lives there).
+pub(crate) struct ShardState {
+    pub(crate) next_client_id: u64,
+    pub(crate) counters: ShardCounters,
     /// The last runtime-config GENERATION this shard observed (PR-4b). Dispatch compares
     /// the shared `RuntimeConfig::generation()` against this once per command (a relaxed
     /// atomic load + integer compare, NO lock when unchanged) and, on a change, rebuilds
     /// this shard's eviction policy from the new `maxmemory-policy` name. Core-local
     /// (per shard, shared-nothing ADR-0002): each shard catches up to a `CONFIG SET
     /// maxmemory-policy` on its next command.
-    last_policy_generation: u64,
+    pub(crate) last_policy_generation: u64,
 }
 
 /// Boot the server: derive the shard config from `config`, start the shard set,
@@ -106,14 +114,42 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
         ProtoVersion::Resp2
     };
 
-    let serve = move |rt: TokioRuntime, stream: tokio::net::TcpStream, shard: ShardId| {
-        let ctx = ctx_template.clone();
-        async move {
-            serve_connection(rt, stream, shard, ctx, default_proto).await;
+    // The cross-shard coordinator substrate (COORDINATOR.md #107): one bounded inbound
+    // queue PER shard. `inbox` (the shared senders) is captured into the per-connection
+    // serve closure so any home core can route a single-key command to the shard that
+    // OWNS the key; `rxs` (the matching receivers, one per shard, in shard-index order)
+    // are handed to `run_shards`, which moves each into its shard's drain loop. With
+    // shards == 1 every key is home-owned, so the queues carry no traffic and the path is
+    // byte-identical to before this layer (verified by the coordinator_stage1 parity test).
+    let total = config.shards.max(1);
+    let (inbox, rxs) = coordinator::build_inboxes(total);
+
+    // Clone the (immutable-after-boot) context for the drain closure BEFORE the serve
+    // closure moves `ctx_template` in. Each shard's drain loop gets this clone so it has
+    // the admission budget / policy generation / databases it needs to run remote keyed
+    // work; the per-connection serve closure clones the original per connection.
+    let drain_ctx = ctx_template.clone();
+
+    let serve = {
+        let inbox = inbox.clone();
+        move |rt: TokioRuntime, stream: tokio::net::TcpStream, shard: ShardId| {
+            let ctx = ctx_template.clone();
+            let inbox = inbox.clone();
+            async move {
+                serve_connection(rt, stream, shard, ctx, default_proto, inbox).await;
+            }
         }
     };
 
-    let set = ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve)?;
+    // The per-shard drain closure: turn a shard's receiver into its drain-loop future.
+    // run_shards spawns it on each shard's LocalSet alongside the accept loop, BEFORE
+    // accepting (a shard can own keys without ever accepting a connection).
+    let drain = move |rx: tokio::sync::mpsc::Receiver<coordinator::ShardWork>| {
+        let ctx = drain_ctx.clone();
+        coordinator::run_drain_loop(rx, ctx)
+    };
+
+    let set = ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?;
     Ok(set)
 }
 
@@ -169,6 +205,27 @@ thread_local! {
 /// on the same single thread between the timer firing and resuming. The tick body is a
 /// single non-async block (`expire_cycle_tick`) that takes and releases all borrows and
 /// returns a plain `u64`, so no `Ref`/`RefMut` is alive when the loop awaits the timer.
+/// Bring up THIS shard's background tasks at shard boot: lazily init the per-shard
+/// store/wheel/env/state handles and spawn the active-expiry timer task ONCE.
+///
+/// Called from the coordinator's per-shard drain-loop setup at SHARD BOOT (not on the
+/// first connection), because a shard can now OWN keys (and so need active expiry) even
+/// if it never accepts a connection (COORDINATOR.md #107 partitions the keyspace across
+/// shards). It is idempotent (the spawn is guarded by [`EXPIRE_TASK_SPAWNED`]) and runs
+/// on the shard's LocalSet (the drain loop is spawned there), which is exactly what
+/// `spawn_on_shard` needs. `databases`/`policy_name` are the boot facts the store
+/// lazy-init needs (the same values `serve_connection` passes).
+///
+/// The [`TokioRuntime`] backend is zero-sized (it carries no state; the shard's tasks
+/// live on the LocalSet), so it is constructed here rather than threaded in.
+pub(crate) fn ensure_shard_started(databases: u32, policy_name: &str, reserved_bits: u32) {
+    let env = shard_env();
+    let store_rc = shard_store(databases, policy_name, reserved_bits);
+    let wheel_rc = shard_wheel();
+    let state_rc = shard_state();
+    spawn_expire_task(TokioRuntime::new(), env, store_rc, wheel_rc, state_rc);
+}
+
 fn spawn_expire_task(
     rt: TokioRuntime,
     env: Rc<RefCell<SystemEnv>>,
@@ -232,7 +289,7 @@ fn expire_cycle_tick(
     reaped
 }
 
-fn shard_state() -> Rc<RefCell<ShardState>> {
+pub(crate) fn shard_state() -> Rc<RefCell<ShardState>> {
     SHARD.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.is_none() {
@@ -249,7 +306,25 @@ fn shard_state() -> Rc<RefCell<ShardState>> {
     })
 }
 
-fn shard_store(databases: u32, policy_name: &str) -> Rc<RefCell<ShardStoreImpl>> {
+/// The number of LOW `scan_hash` bits the cross-shard composite SCAN cursor must reserve
+/// for the shard index, given the total shard count (COORDINATOR.md #107, FIX 1). `0` for
+/// a single (or degenerate zero) shard server -- SCAN is then byte-identical to the
+/// pre-coordinator behavior (the inner cursor passes through verbatim) -- and
+/// [`ScanCursor::SHARD_BITS`] when more than one shard is configured, so `scan_step`
+/// returns BAND-ALIGNED next cursors the composite cursor round-trips losslessly.
+pub(crate) fn scan_reserved_bits(total_shards: usize) -> u32 {
+    if total_shards > 1 {
+        ScanCursor::SHARD_BITS
+    } else {
+        0
+    }
+}
+
+pub(crate) fn shard_store(
+    databases: u32,
+    policy_name: &str,
+    reserved_bits: u32,
+) -> Rc<RefCell<ShardStoreImpl>> {
     STORE.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.is_none() {
@@ -260,14 +335,18 @@ fn shard_store(databases: u32, policy_name: &str) -> Rc<RefCell<ShardStoreImpl>>
             // the cache default defensively if a future un-validated path slips in.
             let seed = shard_env().borrow_mut().rng().next_u64();
             let policy = map_policy_name(policy_name, seed).unwrap_or_else(Policy::cache_default);
-            let store = ShardStore::with_hooks(databases, policy, CountingAccounting::new());
+            // The reserved-band width makes `scan_step` return band-aligned next cursors
+            // for the cross-shard composite cursor (0 on a single-shard server, so SCAN
+            // stays byte-identical to before the coordinator layer; FIX 1).
+            let store = ShardStore::with_hooks(databases, policy, CountingAccounting::new())
+                .with_scan_band_bits(reserved_bits);
             *b = Some(Rc::new(RefCell::new(store)));
         }
         Rc::clone(b.as_ref().unwrap())
     })
 }
 
-fn shard_wheel() -> Rc<RefCell<TimingWheel>> {
+pub(crate) fn shard_wheel() -> Rc<RefCell<TimingWheel>> {
     WHEEL.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.is_none() {
@@ -277,7 +356,7 @@ fn shard_wheel() -> Rc<RefCell<TimingWheel>> {
     })
 }
 
-fn shard_env() -> Rc<RefCell<SystemEnv>> {
+pub(crate) fn shard_env() -> Rc<RefCell<SystemEnv>> {
     ENV.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.is_none() {
@@ -300,32 +379,26 @@ fn shard_started_at() -> ironcache_env::Monotonic {
 async fn serve_connection(
     rt: TokioRuntime,
     mut stream: tokio::net::TcpStream,
-    _shard: ShardId,
+    home: ShardId,
     mut ctx: ServerContext,
     default_proto: ProtoVersion,
+    inbox: coordinator::Inbox,
 ) {
     let env = shard_env();
     let state_rc = shard_state();
-    let store_rc = shard_store(ctx.databases, ctx.info.maxmemory_policy);
+    // The reserved-band width is derived from the configured TOTAL shard count so SCAN's
+    // composite cursor is band-aligned when shards > 1 (FIX 1); 0 keeps single-shard SCAN
+    // byte-identical.
+    let reserved_bits = scan_reserved_bits(ctx.shards);
+    let store_rc = shard_store(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
     let wheel_rc = shard_wheel();
-    // Spawn this shard's BACKGROUND active-expiry timer task ONCE (PR-3c, idempotent):
-    // it keeps an idle shard's resident memory bounded by draining the wheel on a timer
-    // even when no command arrives (EXPIRATION.md). It is spawned here (not at thread
-    // boot) because spawn_on_shard needs the shard's running LocalSet, which exists by
-    // the time the first connection is being served on this thread.
-    //
-    // FORWARD-LOOKING: spawning on the first connection means a shard that never
-    // receives a connection never starts its drain. Harmless today (no cross-shard key
-    // routing exists, so a connectionless shard owns no keys), but when cluster routing
-    // lands a data-bearing connectionless shard could accumulate expired memory; at that
-    // point spawn this at shard-thread boot or on first key insert instead.
-    spawn_expire_task(
-        rt,
-        Rc::clone(&env),
-        Rc::clone(&store_rc),
-        Rc::clone(&wheel_rc),
-        Rc::clone(&state_rc),
-    );
+    // Ensure this shard's background active-expiry timer is up (PR-3c, idempotent). The
+    // canonical spawn point is now SHARD BOOT (the coordinator drain loop calls
+    // `ensure_shard_started` before its recv loop, COORDINATOR.md #107: a key-owning shard
+    // must reclaim even with no connection). This call is the same idempotent helper, so a
+    // connection arriving before the drain loop's first poll still gets the timer started;
+    // the EXPIRE_TASK_SPAWNED guard makes the duplicate call a no-op.
+    ensure_shard_started(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
     // Correct the context's started_at to this shard's boot instant.
     ctx.info.started_at = shard_started_at();
 
@@ -359,9 +432,14 @@ async fn serve_connection(
         loop {
             match decode(&read_buf, &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
-                    let close = handle_request(
-                        &ctx, &mut conn, &env, &store_rc, &wheel_rc, &state_rc, &request, &mut out,
-                    );
+                    // Route + dispatch one decoded request (COORDINATOR.md #107, Stage 1),
+                    // appending its encoded reply to `out`; returns whether to close (QUIT).
+                    // Factored out of the serve loop so the connection loop stays small.
+                    let close = route_and_dispatch(
+                        &ctx, &mut conn, home, &inbox, &env, &store_rc, &wheel_rc, &state_rc,
+                        &request, &mut out,
+                    )
+                    .await;
                     read_buf.drain(..consumed);
                     if close {
                         // Flush the QUIT reply then close. send returns the owned
@@ -416,6 +494,105 @@ async fn serve_connection(
     state_rc.borrow_mut().counters.on_connection_close();
 }
 
+/// ROUTE + DISPATCH one decoded request (COORDINATOR.md #107, Stage 1), appending its
+/// encoded reply to `out` and returning whether the connection should close (QUIT). Split
+/// out of the serve loop so the connection loop stays small; the routing decision is:
+///
+/// - KEYED (single/multi) command whose key(s) ALL resolve to ONE shard -> that shard:
+///   the LOCAL fast path (sync `handle_request`) when it is home, else a single remote HOP
+///   ([`coordinator::dispatch_via`]). A key-SPANNING multi-key command stays HOME (the
+///   documented Stage 2 fan-out gap).
+/// - WHOLE-KEYSPACE (KEYS/SCAN/DBSIZE/FLUSHALL/FLUSHDB/RANDOMKEY) -> SCATTER-GATHER across
+///   ALL shards so it covers the WHOLE keyspace (not just the home shard's ~1/N): SCAN is a
+///   single-shard-per-call COMPOSITE-cursor walk ([`crate::whole_keyspace::scan_cross_shard`]),
+///   the rest broadcast + merge ([`crate::whole_keyspace::fan_out_and_merge`]).
+/// - AlwaysHome (control/conn/txn, SWAPDB, unknown) -> HOME (sync `handle_request`).
+///
+/// With shards == 1 every key is home-owned and the fan-out degenerates to the single local
+/// call, so the whole path is byte-identical (no channel) to before this layer.
+///
+/// The per-connection `commands_processed` is bumped here for the remote / fan-out paths
+/// (matching the bump `handle_request` does on the home path), so every command is counted
+/// exactly once regardless of route.
+#[allow(clippy::too_many_arguments)]
+async fn route_and_dispatch(
+    ctx: &ServerContext,
+    conn: &mut ConnState,
+    home: ShardId,
+    inbox: &coordinator::Inbox,
+    env: &Rc<RefCell<SystemEnv>>,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    wheel_rc: &Rc<RefCell<TimingWheel>>,
+    state_rc: &Rc<RefCell<ShardState>>,
+    request: &Request,
+    out: &mut Vec<u8>,
+) -> bool {
+    let cmd_upper = ascii_upper(request.command());
+    let route = route::classify(&cmd_upper);
+
+    // The routing TARGET shard, if a KEYED command routes to exactly one NON-home shard
+    // (else `None` -> the home path). The single-key case keeps the zero-alloc fast path
+    // (one hash + compare); only the genuinely multi-key commands pay the `command_keys`
+    // walk. WholeKeyspace is NOT a single-target hop (it fans out in its own branch).
+    let target = match route {
+        route::CommandClass::KeyedSingle => route::single_key(request).and_then(|key| {
+            let owner = route::owner_shard(key, home.total);
+            (owner != home.index).then_some(owner)
+        }),
+        route::CommandClass::KeyedMulti => {
+            let spec = route::command_keys(&cmd_upper, request);
+            route::owner_shard_set(&spec, home.total).filter(|&owner| owner != home.index)
+        }
+        route::CommandClass::AlwaysHome | route::CommandClass::WholeKeyspace => None,
+    };
+
+    if matches!(route, route::CommandClass::WholeKeyspace) {
+        // WHOLE-KEYSPACE SCATTER-GATHER: cover EVERY shard's partition. SCAN walks one shard
+        // per call (composite cursor); the rest broadcast + merge on the home core. The home
+        // shard's partial runs LOCALLY + synchronously (no self-channel hop). These were
+        // never on the single-key hot path, so awaiting here is fine.
+        state_rc.borrow_mut().counters.on_command();
+        if cmd_upper == b"SCAN" {
+            crate::whole_keyspace::scan_cross_shard(
+                inbox, ctx, request, conn.db, home.index, out, conn.proto,
+            )
+            .await;
+        } else {
+            // RANDOMKEY draws its shard-pick from the home Env RNG seam ONCE (ADR-0003);
+            // the other whole-keyspace merges (DBSIZE / KEYS / FLUSHDB / FLUSHALL) ignore
+            // it. Gate the draw to RANDOMKEY (FIX 3): drawing unconditionally (for a bare
+            // arity-1 DBSIZE / FLUSHALL / FLUSHDB) would PERTURB the per-shard SplitMix64
+            // stream that RANDOMKEY / SPOP / *-random eviction read from, breaking ADR-0003
+            // replay AND the shards == 1 byte-identical parity (the home path draws 0 for
+            // these). Non-RANDOMKEY -> 0, no draw.
+            let pick = if cmd_upper == b"RANDOMKEY" {
+                crate::whole_keyspace::randomkey_pick(request)
+            } else {
+                0
+            };
+            crate::whole_keyspace::fan_out_and_merge(
+                inbox, ctx, &cmd_upper, request, conn.db, home.index, pick, out, conn.proto,
+            )
+            .await;
+        }
+        false
+    } else if let Some(target) = target {
+        // REMOTE keyed hop: enqueue to the owning shard, await its reply, encode here. The
+        // owning shard folded the data counters; here we only attribute commands_processed.
+        state_rc.borrow_mut().counters.on_command();
+        coordinator::dispatch_via(inbox, target, request, conn.db, out, conn.proto).await;
+        false
+    } else {
+        // HOME path: the SYNC fast path (zero await/channel). Covers the home-owned keyed
+        // commands, AlwaysHome, and the key-SPANNING multi-key commands (Stage 2 gap).
+        // Pass the ALREADY-uppercased command (FIX 5): we computed `cmd_upper` above for
+        // routing, so the home dispatch reuses it instead of re-uppercasing + re-allocating.
+        handle_request(
+            ctx, conn, env, store_rc, wheel_rc, state_rc, request, &cmd_upper, out,
+        )
+    }
+}
+
 /// Dispatch one request and append its encoded reply to `out`. Returns whether
 /// the connection should close after flushing (QUIT).
 ///
@@ -433,6 +610,7 @@ fn handle_request(
     wheel_rc: &Rc<RefCell<TimingWheel>>,
     state_rc: &Rc<RefCell<ShardState>>,
     request: &Request,
+    cmd_upper: &[u8],
     out: &mut Vec<u8>,
 ) -> bool {
     state_rc.borrow_mut().counters.on_command();
@@ -480,7 +658,9 @@ fn handle_request(
         // alias the held store/wheel borrows. `now` was already read above from a
         // distinct, now-dropped `env.borrow()`.
         let mut env_ref = env.borrow_mut();
-        let r = dispatch(
+        // Use the cross-shard serve loop's already-computed uppercased command (FIX 5):
+        // `dispatch_with_cmd` skips the second `ascii_upper` allocation on this hot path.
+        let r = dispatch_with_cmd(
             ctx,
             conn,
             &mut *env_ref,
@@ -492,6 +672,7 @@ fn handle_request(
             mem,
             &mut deltas,
             request,
+            cmd_upper,
         );
         drop(env_ref);
         lazy_expired = store.take_lazy_expired();
@@ -522,6 +703,14 @@ fn encode_into(out: &mut Vec<u8>, value: &ironcache_server::Value, proto: ProtoV
     let mut bm = bytes::BytesMut::with_capacity(64);
     ironcache_protocol::encode(&mut bm, value, proto);
     out.extend_from_slice(&bm);
+}
+
+/// ASCII-uppercase the command token for routing classification (RESP command tokens are
+/// ASCII; mirrors the dispatcher's own case-insensitive token handling). The classified
+/// token is used ONLY to pick a route; dispatch re-uppercases its own copy. `pub(crate)`
+/// so the [`crate::coordinator`] drain loop classifies the same way (keyed vs whole-keyspace).
+pub(crate) fn ascii_upper(b: &[u8]) -> Vec<u8> {
+    b.iter().map(u8::to_ascii_uppercase).collect()
 }
 
 /// Wait for a shutdown signal (SIGINT/SIGTERM) and then stop the shard set.
@@ -725,5 +914,77 @@ mod tests {
         let a = handle.rng().next_u64();
         let b = handle.rng().next_u64();
         assert_ne!(a, b, "RNG stream did not advance through the env handle");
+    }
+
+    #[test]
+    fn dbsize_flush_do_not_advance_rng_only_randomkey_does() {
+        // FIX 3 (deterministic regression guard): the whole-keyspace fan-out's RNG-draw
+        // decision -- the EXACT gate `route_and_dispatch` uses -- must draw the home Env
+        // RNG ONLY for RANDOMKEY. Drawing for DBSIZE / FLUSHALL / FLUSHDB (all arity-1)
+        // would advance the per-shard SplitMix64 stream that RANDOMKEY / SPOP / *-random
+        // eviction read from, breaking ADR-0003 replay AND the shards == 1 byte-identical
+        // parity (the home path draws 0 for these). We snapshot the thread-local RNG by
+        // CLONING it before and after each gate evaluation: if a non-RANDOMKEY command did
+        // not draw, the two clones are at the SAME state, so their next draw matches.
+        use ironcache_server::Request;
+
+        // The gate, lifted verbatim from `route_and_dispatch` (kept in sync by review): a
+        // non-RANDOMKEY whole-keyspace command must yield 0 WITHOUT touching the RNG.
+        fn gate_pick(cmd_upper: &[u8], request: &Request) -> u64 {
+            if cmd_upper == b"RANDOMKEY" {
+                crate::whole_keyspace::randomkey_pick(request)
+            } else {
+                0
+            }
+        }
+
+        fn req(parts: &[&[u8]]) -> Request {
+            Request {
+                args: parts
+                    .iter()
+                    .map(|p| bytes::Bytes::copy_from_slice(p))
+                    .collect(),
+            }
+        }
+
+        let env = shard_env();
+
+        // Snapshot = a CLONE of the live RNG state (cloning does NOT advance the real
+        // stream). Two snapshots taken with NO draw between them are at the same state, so
+        // their next draw matches; a draw in between makes the post-snapshot's next draw
+        // differ (the stream advanced).
+        let snapshot = |env: &Rc<RefCell<SystemEnv>>| -> ironcache_env::SplitMix64 {
+            env.borrow_mut().rng().clone()
+        };
+
+        // Non-RANDOMKEY arity-1 whole-keyspace commands must NOT draw: the stream stays put.
+        for cmd in [b"DBSIZE".as_slice(), b"FLUSHALL", b"FLUSHDB"] {
+            let mut before = snapshot(&env);
+            let pick = gate_pick(cmd, &req(&[cmd]));
+            assert_eq!(
+                pick,
+                0,
+                "{} must yield pick 0",
+                String::from_utf8_lossy(cmd)
+            );
+            let mut after = snapshot(&env);
+            assert_eq!(
+                before.next_u64(),
+                after.next_u64(),
+                "{} must NOT advance the RNG stream (FIX 3)",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+
+        // RANDOMKEY (arity 1) MUST draw: the live stream advances, so a snapshot before vs
+        // after the gate is at a DIFFERENT state (their next draws differ).
+        let mut before = snapshot(&env);
+        let _ = gate_pick(b"RANDOMKEY", &req(&[b"RANDOMKEY"]));
+        let mut after = snapshot(&env);
+        assert_ne!(
+            before.next_u64(),
+            after.next_u64(),
+            "RANDOMKEY MUST advance the RNG stream (the draw the gate exists to gate)"
+        );
     }
 }

@@ -213,6 +213,7 @@ dependencies = [
 name = "ironcache-config"
 version = "0.0.0"
 dependencies = [
+ "ironcache-storage",
  "serde",
  "thiserror",
  "toml",
