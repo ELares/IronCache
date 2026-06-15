@@ -36,8 +36,8 @@ use ironcache_config::{
     DEFAULT_ZSET_MAX_LISTPACK_ENTRIES, DEFAULT_ZSET_MAX_LISTPACK_VALUE,
 };
 use ironcache_storage::{
-    DataType, Encoding, HashValue, LexBound, ListValue, NewValueOwned, ScoreBound, SetValue,
-    UnixMillis, ZAddFlags, ZAddOutcome, ZSetValue,
+    DataType, Encoding, HashValue, IncrOutcome, LexBound, ListValue, NewValueOwned, ScoreBound,
+    SetValue, UnixMillis, ZAddFlags, ZAddOutcome, ZSetValue,
 };
 use std::collections::{BTreeSet, VecDeque};
 
@@ -1083,8 +1083,10 @@ impl SetValue for SetVal {
 // Members order by (score ASC, then member-bytes ASC for equal scores), the Redis
 // skiplist order [redis-zset-skiplist-plus-ht]. Scores compare with `f64::total_cmp` via
 // the `OrderedScore` newtype, which gives a total order over all finite + infinite f64
-// (+inf is the maximum, -inf the minimum). A NaN score is REJECTED by the command layer
-// before it reaches `add`/`incr`, so NaN never enters the order. `total_cmp` orders -0.0
+// (+inf is the maximum, -inf the minimum). A NaN INPUT score is rejected at parse time
+// before it reaches `add`/`incr`; a NaN ARITHMETIC RESULT (an existing +inf incremented by
+// -inf via ZINCRBY/ZADD INCR) is caught inside `incr`, which returns `IncrOutcome::Nan`
+// WITHOUT mutating, so a NaN never enters the order. `total_cmp` orders -0.0
 // before +0.0, but the command layer never produces a distinct -0.0 score (parse_f64
 // yields +0.0 for "0"/"-0"), so the -0.0/+0.0 distinction is not observable.
 //
@@ -1393,24 +1395,36 @@ impl ZSetValue for ZSetVal {
         }
     }
 
-    fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> Option<f64> {
+    fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> IncrOutcome {
         let Some(cur) = self.score(member) else {
             if flags.xx {
-                return None; // XX on a missing member: suppressed (INCR -> nil).
+                return IncrOutcome::Suppressed; // XX on a missing member: INCR -> nil.
             }
-            // Create at `delta` (ZINCRBY/ZADD INCR on a missing member starts from 0).
+            // Create at `delta` (ZINCRBY/ZADD INCR on a missing member starts from 0). A
+            // NaN delta itself was rejected at parse time, so the create score is never NaN;
+            // guard defensively anyway so the store never stores a NaN.
+            if delta.is_nan() {
+                return IncrOutcome::Nan;
+            }
             self.put(member, delta);
-            return Some(delta);
+            return IncrOutcome::Updated(delta);
         };
         if flags.nx {
-            return None; // NX on an existing member: suppressed (INCR -> nil).
+            return IncrOutcome::Suppressed; // NX on an existing member: INCR -> nil.
         }
         let new = cur + delta;
+        // A NaN RESULT (e.g. an existing +inf incremented by -inf) is rejected WITHOUT
+        // mutating: the store never holds a NaN score, and the command layer returns
+        // `-ERR resulting score is not a number (NaN)`. Checked BEFORE the gate so the
+        // NaN error takes precedence over a GT/LT suppression.
+        if new.is_nan() {
+            return IncrOutcome::Nan;
+        }
         if !gate_passes(cur, new, flags) {
-            return None; // GT/LT gate failed: suppressed (INCR -> nil).
+            return IncrOutcome::Suppressed; // GT/LT gate failed: INCR -> nil.
         }
         self.put(member, new);
-        Some(new)
+        IncrOutcome::Updated(new)
     }
 
     fn score(&self, member: &[u8]) -> Option<f64> {
@@ -2646,8 +2660,8 @@ mod tests {
     fn zsetval_incr_and_suppression() {
         let mut z = ZSetVal::new();
         // INCR on a missing member starts from delta.
-        assert_eq!(z.incr(b"a", 2.5, no_flags()), Some(2.5));
-        assert_eq!(z.incr(b"a", 2.5, no_flags()), Some(5.0));
+        assert_eq!(z.incr(b"a", 2.5, no_flags()), IncrOutcome::Updated(2.5));
+        assert_eq!(z.incr(b"a", 2.5, no_flags()), IncrOutcome::Updated(5.0));
         // NX INCR on an existing member: suppressed (nil).
         assert_eq!(
             z.incr(
@@ -2658,7 +2672,7 @@ mod tests {
                     ..no_flags()
                 }
             ),
-            None
+            IncrOutcome::Suppressed
         );
         // XX INCR on a missing member: suppressed (nil).
         assert_eq!(
@@ -2670,8 +2684,33 @@ mod tests {
                     ..no_flags()
                 }
             ),
-            None
+            IncrOutcome::Suppressed
         );
+    }
+
+    #[test]
+    fn zsetval_incr_nan_result_is_signalled_and_does_not_mutate() {
+        // An existing +inf incremented by -inf yields NaN: the store must NOT store it.
+        let mut z = ZSetVal::new();
+        assert_eq!(
+            z.incr(b"m", f64::INFINITY, no_flags()),
+            IncrOutcome::Updated(f64::INFINITY)
+        );
+        assert_eq!(
+            z.incr(b"m", f64::NEG_INFINITY, no_flags()),
+            IncrOutcome::Nan
+        );
+        // The member is UNCHANGED at +inf (no NaN stored, the order is untouched).
+        assert_eq!(z.score(b"m"), Some(f64::INFINITY));
+
+        // The symmetric case: an existing -inf incremented by +inf.
+        let mut z2 = ZSetVal::new();
+        assert_eq!(
+            z2.incr(b"m", f64::NEG_INFINITY, no_flags()),
+            IncrOutcome::Updated(f64::NEG_INFINITY)
+        );
+        assert_eq!(z2.incr(b"m", f64::INFINITY, no_flags()), IncrOutcome::Nan);
+        assert_eq!(z2.score(b"m"), Some(f64::NEG_INFINITY));
     }
 
     #[test]
