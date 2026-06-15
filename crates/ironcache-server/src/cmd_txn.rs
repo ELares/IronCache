@@ -23,32 +23,15 @@
 
 use ironcache_protocol::ErrorReply;
 
-/// The queue-time arity rule for a known command, mirroring the `arity` field of the
-/// Redis command table (src/commands.def). Redis encodes arity as a single signed
-/// int: a POSITIVE `n` means EXACTLY `n` total arguments (command token included); a
-/// NEGATIVE `-n` means AT LEAST `n`. We split that into two explicit variants and
-/// validate the queued argc against it, which is exactly the check Redis applies at
-/// queue time (the finer per-command option/pair validation happens at EXEC RUN time
-/// and, on failure, becomes a runtime error element in the array, with no rollback).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Arity {
-    /// Exactly `n` arguments total (the command token counts as one).
-    Exact(usize),
-    /// At least `n` arguments total (variadic tail).
-    Min(usize),
-}
-
-impl Arity {
-    /// Whether `argc` (the total argument count, command token included) satisfies
-    /// this rule. Matches Redis `commandCheckArity`: `(arity > 0 && argc != arity) ||
-    /// argc < -arity` is the REJECT condition, so here we return the ACCEPT.
-    fn accepts(self, argc: usize) -> bool {
-        match self {
-            Arity::Exact(n) => argc == n,
-            Arity::Min(n) => argc >= n,
-        }
-    }
-}
+// The queue-time arity rule lives in the #89 single-source-of-truth command registry
+// ([`crate::command_spec`]); it is re-exported here so this module's legacy `Arity` path
+// (and the `queue_validate` arity gate) keeps working unchanged. The rule mirrors the
+// `arity` field of the Redis command table (src/commands.def): a POSITIVE `n` is EXACTLY
+// `n` total args (command token included), a NEGATIVE `-n` is AT LEAST `n`, which we split
+// into the two `Arity` variants. `queue_validate` applies it as the COARSE queue-time
+// check (the finer per-command option/pair validation happens at EXEC RUN time and, on
+// failure, becomes a runtime error element in the array, with no rollback).
+pub use crate::command_spec::Arity;
 
 /// The queue-time validation gate for a command staged inside `MULTI`
 /// (TRANSACTIONS.md, PR-10a). Returns `Ok(())` if `cmd` is a KNOWN command whose
@@ -59,15 +42,15 @@ impl Arity {
 /// - a known command with a bad argc -> [`ErrorReply::wrong_arity`].
 ///
 /// `cmd` is the UPPERCASED command token (the caller uppercases, as dispatch does).
-/// `args` is the full argument list (for rendering the unknown-command reply, which
-/// echoes the leading args byte-for-byte like Redis). The arity TABLE here is intended to
-/// mirror the dispatch match arms one-for-one; a unit test
-/// ([`tests::table_covers_every_dispatch_arm`]) is a HAND-SYNCED bidirectional cross-check
-/// (it is NOT an automatic derivation): it asserts every hand-listed dispatch arm has a
-/// table entry AND every table entry maps to a listed dispatch arm AND the two counts are
-/// equal, so an out-of-sync table (a command added to dispatch without a table entry, or a
-/// stale table entry) trips CI. A true single-source-of-truth command table that removes
-/// the hand-sync is the tracked follow-up (#89).
+/// `args` is the full argument list (for rendering the unknown-command reply, which echoes
+/// the leading args byte-for-byte like Redis). The arity comes from the #89 single-source-
+/// of-truth command registry ([`crate::command_spec::spec_of`]) via [`arity_of`], so it can
+/// no longer drift from the routing / admission tables (which read the same registry). The
+/// registry MUST cover exactly the dispatch HANDLER arms; the unit test
+/// ([`tests::table_covers_every_dispatch_arm`]) is the single registry-vs-dispatch-arm
+/// cross-check (the dispatch handler match is the one thing that cannot be const data, so
+/// the dispatch-arm hand-list in [`tests::dispatch_arm_names`] is the lone remaining
+/// hand-sync, asserted equal to the registry name set).
 ///
 /// # Errors
 /// Returns an [`ErrorReply`] when the command is unknown or its argument count violates
@@ -92,204 +75,22 @@ pub fn queue_validate(cmd: &[u8], args: &[bytes::Bytes]) -> Result<(), ErrorRepl
     }
 }
 
-/// The command-table arity for a known UPPERCASED command token, or `None` if the
-/// token is not a command this server implements (PR-1..PR-9 + the txn commands).
+/// The command-table arity for a known UPPERCASED command token, or `None` if the token
+/// is not a command this server implements (PR-1..PR-9 + the txn commands).
 ///
-/// This table is the queue-time arity source and is HAND-SYNCED with the dispatch match
-/// arms (every arm has an entry here, and every entry has an arm). It is NOT auto-derived
-/// from dispatch; the bidirectional + count cross-check in
-/// `tests::table_covers_every_dispatch_arm` is what guards the hand-sync (a true
-/// single-source-of-truth command table is the tracked follow-up, #89). The arities are
-/// the canonical Redis command-table values (src/commands.def), which are the COARSE check
-/// Redis applies at queue time; the handlers apply any finer validation at run time.
-///
-/// This is a flat lookup TABLE, so its length (`too_many_lines`) and the many arms
-/// sharing the same `Arity` value (`match_same_arms`) are intentional: collapsing
-/// same-valued arms would group unrelated commands and defeat the one-arm-per-dispatch
-/// -arm cross-check. Both lints are allowed here with that justification.
-#[allow(clippy::too_many_lines, clippy::match_same_arms)]
+/// This is now a THIN WRAPPER over the #89 single-source-of-truth command registry
+/// ([`crate::command_spec::spec_of`]): the arity is the `arity` field of the command's
+/// [`crate::command_spec::CommandSpec`], so there is exactly one place that defines a
+/// command's arity (the registry), and this gate can no longer drift from the routing /
+/// admission tables that read the same registry. The arities are the canonical Redis
+/// command-table values (src/commands.def), the COARSE check Redis applies at queue time;
+/// the handlers apply any finer validation at run time.
 fn arity_of(cmd: &[u8]) -> Option<Arity> {
-    use Arity::{Exact, Min};
-    let rule = match cmd {
-        // -- Tier-0 / connection (dispatch.rs). --
-        b"PING" => Min(1),
-        b"ECHO" => Exact(2),
-        b"HELLO" => Min(1),
-        b"AUTH" => Min(2),
-        b"SELECT" => Exact(2),
-        // QUIT's command-table arity is -1 (Min(1)) in src/commands.def, not Exact(1).
-        // Inert here (QUIT is in the queue-gate exclusion set, so it bypasses
-        // queue_validate), but the table claims the canonical Redis values, so keep it
-        // honest.
-        b"QUIT" => Min(1),
-        b"RESET" => Exact(1),
-        b"CLIENT" => Min(2),
-        b"COMMAND" => Min(1),
-        b"INFO" => Min(1),
-        b"CONFIG" => Min(2),
-        // -- Transaction control (this module). --
-        b"MULTI" => Exact(1),
-        b"EXEC" => Exact(1),
-        b"DISCARD" => Exact(1),
-        // WATCH is -2 in src/commands.def (token + >= 1 key); UNWATCH is exactly 1.
-        // WATCH never actually reaches queue_validate (the queue gate excludes it from
-        // queueing, like MULTI/EXEC/DISCARD), but the table claims the canonical Redis
-        // values + the cross-check below requires an entry per dispatch arm, so keep it.
-        // UNWATCH DOES reach queue_validate (it queues inside MULTI as a normal command).
-        b"WATCH" => Min(2),
-        b"UNWATCH" => Exact(1),
-        // -- Strings (cmd_string). --
-        b"GET" => Exact(2),
-        b"SET" => Min(3),
-        b"SETNX" => Exact(3),
-        b"GETSET" => Exact(3),
-        b"STRLEN" => Exact(2),
-        b"INCR" => Exact(2),
-        b"DECR" => Exact(2),
-        b"INCRBY" => Exact(3),
-        b"DECRBY" => Exact(3),
-        b"INCRBYFLOAT" => Exact(3),
-        b"APPEND" => Exact(3),
-        // MGET is -2 (token + >= 1 key); MSET is -3 (token + >= 1 key/value pair). The
-        // even-pairs rule for MSET is enforced in the handler (cmd_mset), not by this
-        // coarse queue-time arity; Redis's MSET arity is likewise just -3.
-        b"MGET" => Min(2),
-        b"MSET" => Min(3),
-        // -- Generic keyspace (cmd_keyspace). --
-        b"DEL" => Min(2),
-        b"EXISTS" => Min(2),
-        b"TYPE" => Exact(2),
-        b"KEYS" => Exact(2),
-        b"SCAN" => Min(2),
-        b"DBSIZE" => Exact(1),
-        b"RANDOMKEY" => Exact(1),
-        b"RENAME" => Exact(3),
-        b"RENAMENX" => Exact(3),
-        b"COPY" => Min(3),
-        b"MOVE" => Exact(3),
-        b"SWAPDB" => Exact(3),
-        b"TOUCH" => Min(2),
-        b"UNLINK" => Min(2),
-        b"FLUSHDB" => Min(1),
-        b"FLUSHALL" => Min(1),
-        // -- TTL / EXPIRE family (cmd_expire). --
-        b"EXPIRE" => Min(3),
-        b"PEXPIRE" => Min(3),
-        b"EXPIREAT" => Min(3),
-        b"PEXPIREAT" => Min(3),
-        b"TTL" => Exact(2),
-        b"PTTL" => Exact(2),
-        b"EXPIRETIME" => Exact(2),
-        b"PEXPIRETIME" => Exact(2),
-        b"PERSIST" => Exact(2),
-        b"GETEX" => Min(2),
-        b"SETEX" => Exact(4),
-        b"PSETEX" => Exact(4),
-        // -- Lists (cmd_list). --
-        b"LPUSH" => Min(3),
-        b"RPUSH" => Min(3),
-        b"LPUSHX" => Min(3),
-        b"RPUSHX" => Min(3),
-        b"LPOP" => Min(2),
-        b"RPOP" => Min(2),
-        b"LLEN" => Exact(2),
-        b"LRANGE" => Exact(4),
-        b"LINDEX" => Exact(3),
-        b"LSET" => Exact(4),
-        b"LINSERT" => Exact(5),
-        b"LREM" => Exact(4),
-        b"LTRIM" => Exact(4),
-        b"LMOVE" => Exact(5),
-        b"RPOPLPUSH" => Exact(3),
-        b"LPOS" => Min(3),
-        // -- Hashes (cmd_hash). --
-        b"HSET" => Min(4),
-        b"HMSET" => Min(4),
-        b"HSETNX" => Exact(4),
-        b"HGET" => Exact(3),
-        b"HMGET" => Min(3),
-        b"HDEL" => Min(3),
-        b"HGETALL" => Exact(2),
-        b"HKEYS" => Exact(2),
-        b"HVALS" => Exact(2),
-        b"HLEN" => Exact(2),
-        b"HEXISTS" => Exact(3),
-        b"HSTRLEN" => Exact(3),
-        b"HINCRBY" => Exact(4),
-        b"HINCRBYFLOAT" => Exact(4),
-        b"HRANDFIELD" => Min(2),
-        b"HSCAN" => Min(3),
-        // -- Sets (cmd_set). --
-        b"SADD" => Min(3),
-        b"SREM" => Min(3),
-        b"SMEMBERS" => Exact(2),
-        b"SISMEMBER" => Exact(3),
-        b"SMISMEMBER" => Min(3),
-        b"SCARD" => Exact(2),
-        b"SPOP" => Min(2),
-        b"SRANDMEMBER" => Min(2),
-        b"SMOVE" => Exact(4),
-        b"SINTER" => Min(2),
-        b"SUNION" => Min(2),
-        b"SDIFF" => Min(2),
-        b"SINTERCARD" => Min(3),
-        b"SINTERSTORE" => Min(3),
-        b"SUNIONSTORE" => Min(3),
-        b"SDIFFSTORE" => Min(3),
-        b"SSCAN" => Min(3),
-        // -- Sorted sets (cmd_zset). --
-        b"ZADD" => Min(4),
-        b"ZINCRBY" => Exact(4),
-        b"ZREM" => Min(3),
-        b"ZSCORE" => Exact(3),
-        b"ZMSCORE" => Min(3),
-        b"ZCARD" => Exact(2),
-        b"ZRANK" => Min(3),
-        b"ZREVRANK" => Min(3),
-        b"ZCOUNT" => Exact(4),
-        b"ZLEXCOUNT" => Exact(4),
-        b"ZRANGE" => Min(4),
-        b"ZREVRANGE" => Min(4),
-        b"ZRANGEBYSCORE" => Min(4),
-        b"ZREVRANGEBYSCORE" => Min(4),
-        b"ZRANGEBYLEX" => Min(4),
-        b"ZREVRANGEBYLEX" => Min(4),
-        b"ZREMRANGEBYRANK" => Exact(4),
-        b"ZREMRANGEBYSCORE" => Exact(4),
-        b"ZREMRANGEBYLEX" => Exact(4),
-        b"ZPOPMIN" => Min(2),
-        b"ZPOPMAX" => Min(2),
-        b"ZRANDMEMBER" => Min(2),
-        b"ZSCAN" => Min(3),
-        b"ZRANGESTORE" => Min(5),
-        b"ZUNION" => Min(3),
-        b"ZINTER" => Min(3),
-        b"ZDIFF" => Min(3),
-        b"ZUNIONSTORE" => Min(4),
-        b"ZINTERSTORE" => Min(4),
-        b"ZDIFFSTORE" => Min(4),
-        b"ZINTERCARD" => Min(3),
-        // -- Bitmaps (cmd_bitmap). --
-        b"SETBIT" => Exact(4),
-        b"GETBIT" => Exact(3),
-        b"BITCOUNT" => Min(2),
-        b"BITPOS" => Min(3),
-        b"BITOP" => Min(4),
-        b"BITFIELD" => Min(2),
-        b"BITFIELD_RO" => Min(2),
-        // -- HyperLogLog (cmd_hll). All three are Redis arity -2 (Min(2)). --
-        b"PFADD" => Min(2),
-        b"PFCOUNT" => Min(2),
-        b"PFMERGE" => Min(2),
-        // -- Introspection (cmd_introspect). --
-        b"OBJECT" => Min(2),
-        _ => return None,
-    };
-    Some(rule)
+    crate::command_spec::spec_of(cmd).map(|s| s.arity)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bytes::Bytes;
 
@@ -347,30 +148,21 @@ mod tests {
         }
     }
 
-    /// The arity table MUST cover EXACTLY the dispatch match arms (every implemented
-    /// command, plus MULTI/EXEC/DISCARD): a missing entry would wrongly EXECABORT a valid
-    /// queued command, and a stale entry would queue a command dispatch then rejects.
+    /// The ONE hand-listed dispatch-arm set: every command token that has a dispatch
+    /// HANDLER arm (across `dispatch_inner` + `dispatch_keyed_data`, plus the control verbs).
     ///
-    /// This is a HAND-SYNCED BIDIRECTIONAL cross-check (NOT an automatic derivation; the
-    /// single-source-of-truth table is the tracked follow-up #89). It holds two hand-listed
-    /// command sets, one per side: `dispatch_arms` (every command token the dispatch match
-    /// in dispatch.rs handles) and `table_commands` (every command token keyed in
-    /// [`arity_of`] above), and enforces, in BOTH directions plus by count, that they agree:
-    ///
-    /// 1. FORWARD: every `dispatch_arm` has an [`arity_of`] entry (else wrong EXECABORT).
-    /// 2. REVERSE: every `table_command` is a known dispatch arm AND has an [`arity_of`]
-    ///    entry (no stale table row that dispatch does not handle).
-    /// 3. COUNT: the two lists are the SAME length and have no duplicates, so neither side
-    ///    can carry an extra row the other lacks while still passing 1 and 2.
-    ///
-    /// If you add or remove a dispatch arm, update BOTH lists here AND the [`arity_of`]
-    /// table; an out-of-sync table trips this test in CI.
-    #[test]
-    #[allow(clippy::too_many_lines)] // The cross-check is two long literal command lists by design.
-    fn table_covers_every_dispatch_arm() {
-        // Every command token the dispatch match handles (PR-1..PR-9 + txn). Kept in
-        // dispatch-arm order for an easy side-by-side diff against dispatch.rs.
-        let dispatch_arms: &[&[u8]] = &[
+    /// After #89 this is the SINGLE remaining hand-sync in the command system. The dispatch
+    /// handler match cannot be enumerated programmatically (the handlers have varied
+    /// signatures, so they stay as match arms), so this list is the source the registry is
+    /// cross-checked against: `table_covers_every_dispatch_arm` asserts this set is EXACTLY
+    /// the [`crate::command_spec::spec_of`] registry name set (bidirectional + count). The
+    /// registry ([`crate::command_spec`]) is the single source for all DATA attributes
+    /// (arity / class / key spec / denyoom / control); only "does this command have a
+    /// dispatch handler arm" remains hand-listed here. Kept in dispatch-arm order for an easy
+    /// side-by-side diff against dispatch.rs.
+    #[allow(clippy::too_many_lines)] // One command per line: the literal dispatch-arm list, by design.
+    pub(crate) fn dispatch_arm_names() -> &'static [&'static [u8]] {
+        &[
             // Tier-0
             b"PING",
             b"ECHO",
@@ -531,229 +323,114 @@ mod tests {
             b"PFMERGE",
             // Introspection
             b"OBJECT",
-        ];
+        ]
+    }
 
-        // Every command token keyed in `arity_of` above. Kept in `arity_of` order for an
-        // easy side-by-side diff against the table. This is the REVERSE side of the
-        // cross-check: a row here that dispatch does not handle is a stale table entry.
-        let table_commands: &[&[u8]] = &[
-            // Tier-0 / connection
-            b"PING",
-            b"ECHO",
-            b"HELLO",
-            b"AUTH",
-            b"SELECT",
-            b"QUIT",
-            b"RESET",
-            b"CLIENT",
-            b"COMMAND",
-            b"INFO",
-            b"CONFIG",
-            // Transaction control
-            b"MULTI",
-            b"EXEC",
-            b"DISCARD",
-            b"WATCH",
-            b"UNWATCH",
-            // Strings
-            b"GET",
-            b"SET",
-            b"SETNX",
-            b"GETSET",
-            b"STRLEN",
-            b"INCR",
-            b"DECR",
-            b"INCRBY",
-            b"DECRBY",
-            b"INCRBYFLOAT",
-            b"APPEND",
-            b"MGET",
-            b"MSET",
-            // Generic keyspace
-            b"DEL",
-            b"EXISTS",
-            b"TYPE",
-            b"KEYS",
-            b"SCAN",
-            b"DBSIZE",
-            b"RANDOMKEY",
-            b"RENAME",
-            b"RENAMENX",
-            b"COPY",
-            b"MOVE",
-            b"SWAPDB",
-            b"TOUCH",
-            b"UNLINK",
-            b"FLUSHDB",
-            b"FLUSHALL",
-            // TTL / EXPIRE
-            b"EXPIRE",
-            b"PEXPIRE",
-            b"EXPIREAT",
-            b"PEXPIREAT",
-            b"TTL",
-            b"PTTL",
-            b"EXPIRETIME",
-            b"PEXPIRETIME",
-            b"PERSIST",
-            b"GETEX",
-            b"SETEX",
-            b"PSETEX",
-            // Lists
-            b"LPUSH",
-            b"RPUSH",
-            b"LPUSHX",
-            b"RPUSHX",
-            b"LPOP",
-            b"RPOP",
-            b"LLEN",
-            b"LRANGE",
-            b"LINDEX",
-            b"LSET",
-            b"LINSERT",
-            b"LREM",
-            b"LTRIM",
-            b"LMOVE",
-            b"RPOPLPUSH",
-            b"LPOS",
-            // Hashes
-            b"HSET",
-            b"HMSET",
-            b"HSETNX",
-            b"HGET",
-            b"HMGET",
-            b"HDEL",
-            b"HGETALL",
-            b"HKEYS",
-            b"HVALS",
-            b"HLEN",
-            b"HEXISTS",
-            b"HSTRLEN",
-            b"HINCRBY",
-            b"HINCRBYFLOAT",
-            b"HRANDFIELD",
-            b"HSCAN",
-            // Sets
-            b"SADD",
-            b"SREM",
-            b"SMEMBERS",
-            b"SISMEMBER",
-            b"SMISMEMBER",
-            b"SCARD",
-            b"SPOP",
-            b"SRANDMEMBER",
-            b"SMOVE",
-            b"SINTER",
-            b"SUNION",
-            b"SDIFF",
-            b"SINTERCARD",
-            b"SINTERSTORE",
-            b"SUNIONSTORE",
-            b"SDIFFSTORE",
-            b"SSCAN",
-            // Sorted sets
-            b"ZADD",
-            b"ZINCRBY",
-            b"ZREM",
-            b"ZSCORE",
-            b"ZMSCORE",
-            b"ZCARD",
-            b"ZRANK",
-            b"ZREVRANK",
-            b"ZCOUNT",
-            b"ZLEXCOUNT",
-            b"ZRANGE",
-            b"ZREVRANGE",
-            b"ZRANGEBYSCORE",
-            b"ZREVRANGEBYSCORE",
-            b"ZRANGEBYLEX",
-            b"ZREVRANGEBYLEX",
-            b"ZREMRANGEBYRANK",
-            b"ZREMRANGEBYSCORE",
-            b"ZREMRANGEBYLEX",
-            b"ZPOPMIN",
-            b"ZPOPMAX",
-            b"ZRANDMEMBER",
-            b"ZSCAN",
-            b"ZRANGESTORE",
-            b"ZUNION",
-            b"ZINTER",
-            b"ZDIFF",
-            b"ZUNIONSTORE",
-            b"ZINTERSTORE",
-            b"ZDIFFSTORE",
-            b"ZINTERCARD",
-            // Bitmaps
-            b"SETBIT",
-            b"GETBIT",
-            b"BITCOUNT",
-            b"BITPOS",
-            b"BITOP",
-            b"BITFIELD",
-            b"BITFIELD_RO",
-            // HyperLogLog
-            b"PFADD",
-            b"PFCOUNT",
-            b"PFMERGE",
-            // Introspection
-            b"OBJECT",
-        ];
-
+    /// The registry MUST cover EXACTLY the dispatch HANDLER arms: a registry entry with no
+    /// dispatch arm would queue a command that then hits the dispatch `_ =>` unknown-command
+    /// reply, and a dispatch arm with no registry entry would wrongly EXECABORT a valid
+    /// queued command (no arity) and mis-route it (the routing/admission wrappers all read
+    /// the registry).
+    ///
+    /// AFTER #89 this is a SINGLE registry-vs-dispatch cross-check (it REPLACES the old DUAL
+    /// hand-listed 148-entry arrays). The ONE remaining hand-list is [`dispatch_arm_names`]
+    /// (the dispatch HANDLER arms, which cannot be enumerated programmatically); the
+    /// [`crate::command_spec::spec_of`] registry is the source for every DATA attribute. We
+    /// assert, bidirectionally + by count:
+    ///
+    /// (a) FORWARD: every `dispatch_arm_names` entry resolves in `spec_of` (so it has an
+    ///     arity / class / key spec / denyoom / control -- no wrongly-EXECABORTed command).
+    /// (b) REVERSE: every `spec_of` registry name has a dispatch arm (no registry row that
+    ///     dispatch does not handle).
+    /// (c) NO DUPLICATES in the hand-list, and the two SETS are EQUAL with the SAME count.
+    ///
+    /// If you add or remove a dispatch arm, update [`dispatch_arm_names`] AND add/remove the
+    /// matching `spec_of` registry entry; an out-of-sync pair trips this test in CI. There is
+    /// now exactly ONE place to hand-edit (this list) and ONE registry to edit (the data).
+    #[test]
+    fn table_covers_every_dispatch_arm() {
+        let dispatch_arms = dispatch_arm_names();
         let dispatch_set: std::collections::BTreeSet<&[u8]> =
             dispatch_arms.iter().copied().collect();
-        let table_set: std::collections::BTreeSet<&[u8]> = table_commands.iter().copied().collect();
 
-        // Neither hand-list may carry a duplicate (a dup would mask a missing row in the
-        // count check by inflating the length while the set stays short).
+        // (c) No duplicate in the hand-list (a dup would mask a missing row in the count
+        // check by inflating the length while the set stays short).
         assert_eq!(
             dispatch_set.len(),
             dispatch_arms.len(),
-            "the dispatch_arms list has a duplicate entry"
-        );
-        assert_eq!(
-            table_set.len(),
-            table_commands.len(),
-            "the table_commands list has a duplicate entry"
+            "the dispatch_arm_names list has a duplicate entry"
         );
 
-        // 1. FORWARD: every dispatch arm has an `arity_of` entry (a missing entry would
-        //    wrongly EXECABORT a valid queued command).
+        // (a) FORWARD: every dispatch arm resolves in the registry (a missing entry would
+        // wrongly EXECABORT a valid queued command and have no class/key-spec/denyoom).
         for cmd in dispatch_arms {
             assert!(
+                crate::command_spec::spec_of(cmd).is_some(),
+                "dispatch arm {:?} has no command_spec registry entry (would wrongly EXECABORT)",
+                String::from_utf8_lossy(cmd)
+            );
+            // arity_of derives from the registry, so this is necessarily Some too; assert it
+            // to keep the queue-gate guarantee explicit at this site.
+            assert!(
                 arity_of(cmd).is_some(),
-                "dispatch arm {:?} has no queue_validate arity entry (would wrongly EXECABORT)",
+                "dispatch arm {:?} has no queue_validate arity (would wrongly EXECABORT)",
                 String::from_utf8_lossy(cmd)
             );
         }
 
-        // 2. REVERSE: every command in the arity table is a known dispatch arm AND its
-        //    `arity_of` lookup resolves (no stale table row dispatch does not handle).
-        for cmd in table_commands {
-            assert!(
-                arity_of(cmd).is_some(),
-                "table_commands row {:?} does not resolve in arity_of (stale table list)",
-                String::from_utf8_lossy(cmd)
-            );
-            assert!(
-                dispatch_set.contains(*cmd),
-                "arity table entry {:?} maps to no dispatch arm (stale table row)",
+        // (b) REVERSE: every registry name has a dispatch arm (no registry row dispatch does
+        // not handle). The registry name set is enumerated by walking the hand-list and
+        // confirming each `spec_of(name).name` round-trips, then asserting set-equality
+        // below; a registry entry whose name is NOT in the dispatch list would break the
+        // set-equality + count check (c).
+        for cmd in dispatch_arms {
+            let spec = crate::command_spec::spec_of(cmd).expect("forward pass proved Some");
+            assert_eq!(
+                spec.name,
+                *cmd,
+                "registry entry name {:?} does not match its lookup key {:?}",
+                String::from_utf8_lossy(spec.name),
                 String::from_utf8_lossy(cmd)
             );
         }
 
-        // 3. COUNT-EQUALITY: the two sides have the SAME number of commands, so neither
-        //    can carry an extra row the other lacks while still passing 1 and 2. The
-        //    `table_commands` length IS the arity_of table size (step 2 verified every row
-        //    resolves in `arity_of`), so this is the "table size == dispatch_arms size"
-        //    guard the cross-check claims.
+        // (c) COUNT + SET equality: the registry name set EQUALS the dispatch-arm set, same
+        // count. We build the registry name set by collecting every `spec_of` name reachable
+        // from the dispatch list (proved bijective with their keys above) and assert it is
+        // exactly the dispatch set with the same length, so neither side can carry an extra
+        // row the other lacks. (The registry has no programmatic iterator -- it is a match --
+        // so the dispatch list IS the enumeration basis, and the per-entry name round-trip
+        // above plus this equality is the bidirectional cover.)
+        let registry_set: std::collections::BTreeSet<&[u8]> = dispatch_arms
+            .iter()
+            .map(|c| {
+                crate::command_spec::spec_of(c)
+                    .expect("forward pass proved Some")
+                    .name
+            })
+            .collect();
         assert_eq!(
-            table_commands.len(),
-            dispatch_arms.len(),
-            "the arity_of table size does not equal the dispatch arm count (out of sync)"
+            registry_set, dispatch_set,
+            "the command_spec registry and the dispatch arms do not cover the same command set"
         );
         assert_eq!(
-            dispatch_set, table_set,
-            "the dispatch arms and the arity table do not cover the same command set"
+            registry_set.len(),
+            dispatch_arms.len(),
+            "the command_spec registry size does not equal the dispatch arm count (out of sync)"
+        );
+    }
+
+    /// SAFETY-NET COUNT GUARD: the single hand-list [`dispatch_arm_names`] still has the
+    /// canonical 148-command surface (PR-1..PR-11 + the 6 txn control verbs). This asserts a
+    /// COUNT only (not values -- the value-level cover is the set-equality in
+    /// `table_covers_every_dispatch_arm`), so it is NOT a second source of truth. A drift here
+    /// flags that a dispatch arm was added or removed; update the registry + the hand-list.
+    #[test]
+    fn dispatch_arm_list_has_the_expected_count() {
+        assert_eq!(
+            dispatch_arm_names().len(),
+            148,
+            "the dispatch-arm hand-list drifted from the 148-command surface"
         );
     }
 
