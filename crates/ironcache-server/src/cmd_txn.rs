@@ -60,10 +60,14 @@ impl Arity {
 ///
 /// `cmd` is the UPPERCASED command token (the caller uppercases, as dispatch does).
 /// `args` is the full argument list (for rendering the unknown-command reply, which
-/// echoes the leading args byte-for-byte like Redis). The arity TABLE here mirrors the
-/// dispatch match arms one-for-one; a unit test ([`tests::table_covers_every_dispatch_arm`])
-/// cross-checks the two lists so a command added to dispatch without a table entry (which
-/// would wrongly EXECABORT a valid queued command) fails CI.
+/// echoes the leading args byte-for-byte like Redis). The arity TABLE here is intended to
+/// mirror the dispatch match arms one-for-one; a unit test
+/// ([`tests::table_covers_every_dispatch_arm`]) is a HAND-SYNCED bidirectional cross-check
+/// (it is NOT an automatic derivation): it asserts every hand-listed dispatch arm has a
+/// table entry AND every table entry maps to a listed dispatch arm AND the two counts are
+/// equal, so an out-of-sync table (a command added to dispatch without a table entry, or a
+/// stale table entry) trips CI. A true single-source-of-truth command table that removes
+/// the hand-sync is the tracked follow-up (#89).
 ///
 /// # Errors
 /// Returns an [`ErrorReply`] when the command is unknown or its argument count violates
@@ -91,12 +95,13 @@ pub fn queue_validate(cmd: &[u8], args: &[bytes::Bytes]) -> Result<(), ErrorRepl
 /// The command-table arity for a known UPPERCASED command token, or `None` if the
 /// token is not a command this server implements (PR-1..PR-9 + the txn commands).
 ///
-/// This table is the single source of the queue-time arity and MUST stay in lockstep
-/// with the dispatch match arms (every arm has an entry here, and every entry has an
-/// arm). The arities are the canonical Redis command-table values (src/commands.def),
-/// which are the COARSE check Redis applies at queue time; the handlers apply any finer
-/// validation at run time. `tests::table_covers_every_dispatch_arm` enforces the
-/// one-for-one correspondence so the two cannot drift.
+/// This table is the queue-time arity source and is HAND-SYNCED with the dispatch match
+/// arms (every arm has an entry here, and every entry has an arm). It is NOT auto-derived
+/// from dispatch; the bidirectional + count cross-check in
+/// `tests::table_covers_every_dispatch_arm` is what guards the hand-sync (a true
+/// single-source-of-truth command table is the tracked follow-up, #89). The arities are
+/// the canonical Redis command-table values (src/commands.def), which are the COARSE check
+/// Redis applies at queue time; the handlers apply any finer validation at run time.
 ///
 /// This is a flat lookup TABLE, so its length (`too_many_lines`) and the many arms
 /// sharing the same `Arity` value (`match_same_arms`) are intentional: collapsing
@@ -112,7 +117,11 @@ fn arity_of(cmd: &[u8]) -> Option<Arity> {
         b"HELLO" => Min(1),
         b"AUTH" => Min(2),
         b"SELECT" => Exact(2),
-        b"QUIT" => Exact(1),
+        // QUIT's command-table arity is -1 (Min(1)) in src/commands.def, not Exact(1).
+        // Inert here (QUIT is in the queue-gate exclusion set, so it bypasses
+        // queue_validate), but the table claims the canonical Redis values, so keep it
+        // honest.
+        b"QUIT" => Min(1),
         b"RESET" => Exact(1),
         b"CLIENT" => Min(2),
         b"COMMAND" => Min(1),
@@ -310,13 +319,26 @@ mod tests {
         }
     }
 
-    /// The arity table MUST cover exactly the dispatch match arms (every implemented
-    /// command, plus MULTI/EXEC/DISCARD). A missing entry would wrongly EXECABORT a
-    /// valid queued command; a stale entry would queue a command dispatch rejects. This
-    /// list is hand-synced with `dispatch_inner`'s match in dispatch.rs (the comment
-    /// there points back here). If you add a dispatch arm, add it here too.
+    /// The arity table MUST cover EXACTLY the dispatch match arms (every implemented
+    /// command, plus MULTI/EXEC/DISCARD): a missing entry would wrongly EXECABORT a valid
+    /// queued command, and a stale entry would queue a command dispatch then rejects.
+    ///
+    /// This is a HAND-SYNCED BIDIRECTIONAL cross-check (NOT an automatic derivation; the
+    /// single-source-of-truth table is the tracked follow-up #89). It holds two hand-listed
+    /// command sets, one per side: `dispatch_arms` (every command token the dispatch match
+    /// in dispatch.rs handles) and `table_commands` (every command token keyed in
+    /// [`arity_of`] above), and enforces, in BOTH directions plus by count, that they agree:
+    ///
+    /// 1. FORWARD: every `dispatch_arm` has an [`arity_of`] entry (else wrong EXECABORT).
+    /// 2. REVERSE: every `table_command` is a known dispatch arm AND has an [`arity_of`]
+    ///    entry (no stale table row that dispatch does not handle).
+    /// 3. COUNT: the two lists are the SAME length and have no duplicates, so neither side
+    ///    can carry an extra row the other lacks while still passing 1 and 2.
+    ///
+    /// If you add or remove a dispatch arm, update BOTH lists here AND the [`arity_of`]
+    /// table; an out-of-sync table trips this test in CI.
     #[test]
-    #[allow(clippy::too_many_lines)] // The cross-check is a long literal command list by design.
+    #[allow(clippy::too_many_lines)] // The cross-check is two long literal command lists by design.
     fn table_covers_every_dispatch_arm() {
         // Every command token the dispatch match handles (PR-1..PR-9 + txn). Kept in
         // dispatch-arm order for an easy side-by-side diff against dispatch.rs.
@@ -474,6 +496,184 @@ mod tests {
             // Introspection
             b"OBJECT",
         ];
+
+        // Every command token keyed in `arity_of` above. Kept in `arity_of` order for an
+        // easy side-by-side diff against the table. This is the REVERSE side of the
+        // cross-check: a row here that dispatch does not handle is a stale table entry.
+        let table_commands: &[&[u8]] = &[
+            // Tier-0 / connection
+            b"PING",
+            b"ECHO",
+            b"HELLO",
+            b"AUTH",
+            b"SELECT",
+            b"QUIT",
+            b"RESET",
+            b"CLIENT",
+            b"COMMAND",
+            b"INFO",
+            b"CONFIG",
+            // Transaction control
+            b"MULTI",
+            b"EXEC",
+            b"DISCARD",
+            // Strings
+            b"GET",
+            b"SET",
+            b"SETNX",
+            b"GETSET",
+            b"STRLEN",
+            b"INCR",
+            b"DECR",
+            b"INCRBY",
+            b"DECRBY",
+            b"INCRBYFLOAT",
+            b"APPEND",
+            // Generic keyspace
+            b"DEL",
+            b"EXISTS",
+            b"TYPE",
+            b"KEYS",
+            b"SCAN",
+            b"DBSIZE",
+            b"RANDOMKEY",
+            b"RENAME",
+            b"RENAMENX",
+            b"COPY",
+            b"MOVE",
+            b"SWAPDB",
+            b"TOUCH",
+            b"UNLINK",
+            b"FLUSHDB",
+            b"FLUSHALL",
+            // TTL / EXPIRE
+            b"EXPIRE",
+            b"PEXPIRE",
+            b"EXPIREAT",
+            b"PEXPIREAT",
+            b"TTL",
+            b"PTTL",
+            b"EXPIRETIME",
+            b"PEXPIRETIME",
+            b"PERSIST",
+            b"GETEX",
+            b"SETEX",
+            b"PSETEX",
+            // Lists
+            b"LPUSH",
+            b"RPUSH",
+            b"LPUSHX",
+            b"RPUSHX",
+            b"LPOP",
+            b"RPOP",
+            b"LLEN",
+            b"LRANGE",
+            b"LINDEX",
+            b"LSET",
+            b"LINSERT",
+            b"LREM",
+            b"LTRIM",
+            b"LMOVE",
+            b"RPOPLPUSH",
+            b"LPOS",
+            // Hashes
+            b"HSET",
+            b"HMSET",
+            b"HSETNX",
+            b"HGET",
+            b"HMGET",
+            b"HDEL",
+            b"HGETALL",
+            b"HKEYS",
+            b"HVALS",
+            b"HLEN",
+            b"HEXISTS",
+            b"HSTRLEN",
+            b"HINCRBY",
+            b"HINCRBYFLOAT",
+            b"HRANDFIELD",
+            b"HSCAN",
+            // Sets
+            b"SADD",
+            b"SREM",
+            b"SMEMBERS",
+            b"SISMEMBER",
+            b"SMISMEMBER",
+            b"SCARD",
+            b"SPOP",
+            b"SRANDMEMBER",
+            b"SMOVE",
+            b"SINTER",
+            b"SUNION",
+            b"SDIFF",
+            b"SINTERCARD",
+            b"SINTERSTORE",
+            b"SUNIONSTORE",
+            b"SDIFFSTORE",
+            b"SSCAN",
+            // Sorted sets
+            b"ZADD",
+            b"ZINCRBY",
+            b"ZREM",
+            b"ZSCORE",
+            b"ZMSCORE",
+            b"ZCARD",
+            b"ZRANK",
+            b"ZREVRANK",
+            b"ZCOUNT",
+            b"ZLEXCOUNT",
+            b"ZRANGE",
+            b"ZREVRANGE",
+            b"ZRANGEBYSCORE",
+            b"ZREVRANGEBYSCORE",
+            b"ZRANGEBYLEX",
+            b"ZREVRANGEBYLEX",
+            b"ZREMRANGEBYRANK",
+            b"ZREMRANGEBYSCORE",
+            b"ZREMRANGEBYLEX",
+            b"ZPOPMIN",
+            b"ZPOPMAX",
+            b"ZRANDMEMBER",
+            b"ZSCAN",
+            b"ZRANGESTORE",
+            b"ZUNION",
+            b"ZINTER",
+            b"ZDIFF",
+            b"ZUNIONSTORE",
+            b"ZINTERSTORE",
+            b"ZDIFFSTORE",
+            b"ZINTERCARD",
+            // Bitmaps
+            b"SETBIT",
+            b"GETBIT",
+            b"BITCOUNT",
+            b"BITPOS",
+            b"BITOP",
+            b"BITFIELD",
+            b"BITFIELD_RO",
+            // Introspection
+            b"OBJECT",
+        ];
+
+        let dispatch_set: std::collections::BTreeSet<&[u8]> =
+            dispatch_arms.iter().copied().collect();
+        let table_set: std::collections::BTreeSet<&[u8]> = table_commands.iter().copied().collect();
+
+        // Neither hand-list may carry a duplicate (a dup would mask a missing row in the
+        // count check by inflating the length while the set stays short).
+        assert_eq!(
+            dispatch_set.len(),
+            dispatch_arms.len(),
+            "the dispatch_arms list has a duplicate entry"
+        );
+        assert_eq!(
+            table_set.len(),
+            table_commands.len(),
+            "the table_commands list has a duplicate entry"
+        );
+
+        // 1. FORWARD: every dispatch arm has an `arity_of` entry (a missing entry would
+        //    wrongly EXECABORT a valid queued command).
         for cmd in dispatch_arms {
             assert!(
                 arity_of(cmd).is_some(),
@@ -481,6 +681,36 @@ mod tests {
                 String::from_utf8_lossy(cmd)
             );
         }
+
+        // 2. REVERSE: every command in the arity table is a known dispatch arm AND its
+        //    `arity_of` lookup resolves (no stale table row dispatch does not handle).
+        for cmd in table_commands {
+            assert!(
+                arity_of(cmd).is_some(),
+                "table_commands row {:?} does not resolve in arity_of (stale table list)",
+                String::from_utf8_lossy(cmd)
+            );
+            assert!(
+                dispatch_set.contains(*cmd),
+                "arity table entry {:?} maps to no dispatch arm (stale table row)",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+
+        // 3. COUNT-EQUALITY: the two sides have the SAME number of commands, so neither
+        //    can carry an extra row the other lacks while still passing 1 and 2. The
+        //    `table_commands` length IS the arity_of table size (step 2 verified every row
+        //    resolves in `arity_of`), so this is the "table size == dispatch_arms size"
+        //    guard the cross-check claims.
+        assert_eq!(
+            table_commands.len(),
+            dispatch_arms.len(),
+            "the arity_of table size does not equal the dispatch arm count (out of sync)"
+        );
+        assert_eq!(
+            dispatch_set, table_set,
+            "the dispatch arms and the arity table do not cover the same command set"
+        );
     }
 
     #[test]
