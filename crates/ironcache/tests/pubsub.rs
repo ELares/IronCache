@@ -1,0 +1,573 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Classic exact-channel Pub/Sub acceptance tests (SERVER_PUSH.md #20, PR 91a).
+//!
+//! These boot the REAL multi-shard `run_server` on an ephemeral port (the actual
+//! SO_REUSEPORT thread-per-core topology + cross-shard coordinator) and drive it over real
+//! sockets, so they exercise the whole path: the serve-layer SUBSCRIBE/UNSUBSCRIBE/PUBLISH
+//! interception, the per-shard subscription table, the cross-shard `__ICPUBLISH` fan-out, the
+//! per-connection push channel + the `select!` idle wait, the RESP3 `>` / RESP2 `*` framing,
+//! the subscribe-mode gate, PING-while-subscribed, back-pressure shedding, and disconnect
+//! cleanup. With shards=4 a publisher and a subscriber land on (likely) different cores, so
+//! the cross-shard fan-out is genuinely exercised.
+
+use ironcache::test_support::run_server_for_test;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+// jemalloc as this test binary's global allocator, mirroring the server binary.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Grab a free TCP port by binding an ephemeral listener and dropping it.
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// Connect with a few short retries (the shards bind asynchronously after `run_server`).
+async fn connect_retry(port: u16) -> TcpStream {
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+            let _ = s.set_nodelay(true);
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("server never came up on port {port}");
+}
+
+/// Boot a multi-shard server, returning (handle, port).
+fn boot(shards: usize) -> (ironcache_runtime::bootstrap::ShardSet, u16) {
+    let port = free_port();
+    let set = run_server_for_test(port, shards);
+    (set, port)
+}
+
+// ---------------------------------------------------------------------------
+// A minimal RESP2/RESP3 reader. It records the AGGREGATE FRAME TYPE (`*` array vs `>`
+// push) so a test can assert the RESP3 push vs RESP2 array distinction for a delivery.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resp {
+    Simple(Vec<u8>),
+    Error(Vec<u8>),
+    Integer(i64),
+    Bulk(Option<Vec<u8>>),
+    /// An aggregate (`*` array or `>` push). `is_push` records the wire frame byte so the
+    /// RESP3-`>`-vs-RESP2-`*` distinction is observable; both decode to the same elements.
+    Agg {
+        is_push: bool,
+        items: Vec<Resp>,
+    },
+    Null,
+}
+
+async fn read_line(client: &mut TcpStream, buf: &mut Vec<u8>) -> Vec<u8> {
+    loop {
+        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+            let line = buf[..pos].to_vec();
+            buf.drain(..pos + 2);
+            return line;
+        }
+        let mut chunk = [0u8; 1024];
+        let n = client.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "connection closed mid-reply");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+async fn read_bulk_body(client: &mut TcpStream, buf: &mut Vec<u8>, n: usize) -> Vec<u8> {
+    while buf.len() < n + 2 {
+        let mut chunk = [0u8; 1024];
+        let got = client.read(&mut chunk).await.unwrap();
+        assert!(got > 0, "connection closed mid-bulk");
+        buf.extend_from_slice(&chunk[..got]);
+    }
+    let body = buf[..n].to_vec();
+    buf.drain(..n + 2);
+    body
+}
+
+async fn read_agg(client: &mut TcpStream, buf: &mut Vec<u8>, rest: &[u8], is_push: bool) -> Resp {
+    let len: i64 = std::str::from_utf8(rest).unwrap().parse().unwrap();
+    if len < 0 {
+        return Resp::Null;
+    }
+    let mut items = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        items.push(Box::pin(read_reply(client, buf)).await);
+    }
+    Resp::Agg { is_push, items }
+}
+
+async fn read_reply(client: &mut TcpStream, buf: &mut Vec<u8>) -> Resp {
+    let line = read_line(client, buf).await;
+    let (tag, rest) = line.split_first().unwrap();
+    match tag {
+        b'+' => Resp::Simple(rest.to_vec()),
+        b'-' => Resp::Error(rest.to_vec()),
+        b':' => Resp::Integer(std::str::from_utf8(rest).unwrap().parse().unwrap()),
+        b'_' => Resp::Null,
+        b'$' => {
+            let len: i64 = std::str::from_utf8(rest).unwrap().parse().unwrap();
+            if len < 0 {
+                Resp::Bulk(None)
+            } else {
+                Resp::Bulk(Some(read_bulk_body(client, buf, len as usize).await))
+            }
+        }
+        b'*' => read_agg(client, buf, rest, false).await,
+        b'>' => read_agg(client, buf, rest, true).await,
+        // HELLO 3 replies a `%` map; we never read it as a structured reply (we drain it
+        // raw), so any other tag in these tests is unexpected.
+        other => panic!("unexpected RESP tag {:?}", *other as char),
+    }
+}
+
+/// Send a raw command built from `parts` as a RESP2 array.
+async fn send_cmd(client: &mut TcpStream, parts: &[&[u8]]) {
+    let mut frame = format!("*{}\r\n", parts.len()).into_bytes();
+    for p in parts {
+        frame.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+        frame.extend_from_slice(p);
+        frame.extend_from_slice(b"\r\n");
+    }
+    client.write_all(&frame).await.unwrap();
+}
+
+async fn send_and_read(client: &mut TcpStream, buf: &mut Vec<u8>, parts: &[&[u8]]) -> Resp {
+    send_cmd(client, parts).await;
+    read_reply(client, buf).await
+}
+
+/// Read with a timeout, returning None on timeout (used to assert "no message arrives").
+async fn read_with_timeout(client: &mut TcpStream, buf: &mut Vec<u8>, ms: u64) -> Option<Resp> {
+    tokio::time::timeout(Duration::from_millis(ms), read_reply(client, buf))
+        .await
+        .ok()
+}
+
+/// Switch a connection to RESP3 (`HELLO 3`) and drain its `%` map reply raw (we do not need
+/// to parse the map; we just consume bytes up to the point the server stops sending). We read
+/// once and discard whatever arrived (the HELLO map fits one read here).
+async fn hello3(client: &mut TcpStream) {
+    send_cmd(client, &[b"HELLO", b"3"]).await;
+    // Drain the HELLO reply: it is a `%` map. Read a chunk and discard; the map is small and
+    // arrives in one segment for our config. We then assert nothing else is pending.
+    let mut chunk = [0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_millis(500), client.read(&mut chunk))
+        .await
+        .expect("HELLO 3 reply timed out")
+        .unwrap();
+    assert!(n > 0, "HELLO 3 returned no bytes");
+}
+
+/// Assert a delivered message frame is `["message", channel, payload]` and return whether it
+/// was a RESP3 push (`>`) vs a RESP2 array (`*`).
+fn assert_message(reply: &Resp, channel: &[u8], payload: &[u8]) -> bool {
+    let Resp::Agg { is_push, items } = reply else {
+        panic!("delivery must be an aggregate, got {reply:?}");
+    };
+    assert_eq!(items.len(), 3, "message has 3 elements");
+    assert_eq!(items[0], Resp::Bulk(Some(b"message".to_vec())));
+    assert_eq!(items[1], Resp::Bulk(Some(channel.to_vec())));
+    assert_eq!(items[2], Resp::Bulk(Some(payload.to_vec())));
+    *is_push
+}
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn cross_shard_delivery_and_receiver_count() {
+    // Conn A SUBSCRIBE ch; conn B PUBLISH ch payload across shards=4 (A and B are likely on
+    // different cores). A receives the ["message", ch, payload] frame; B's PUBLISH returns 1.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut a = connect_retry(port).await;
+        let mut b = connect_retry(port).await;
+        let mut abuf = Vec::new();
+        let mut bbuf = Vec::new();
+
+        // A subscribes; the subscribe confirmation is ["subscribe", ch, 1].
+        let sub = send_and_read(&mut a, &mut abuf, &[b"SUBSCRIBE", b"ch"]).await;
+        let Resp::Agg { items, .. } = &sub else {
+            panic!("SUBSCRIBE confirm must be an aggregate, got {sub:?}");
+        };
+        assert_eq!(items[0], Resp::Bulk(Some(b"subscribe".to_vec())));
+        assert_eq!(items[1], Resp::Bulk(Some(b"ch".to_vec())));
+        assert_eq!(items[2], Resp::Integer(1));
+
+        // Give the subscription a beat to register on A's home shard before B publishes.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // B publishes; the count is 1 (one subscriber across all shards).
+        let pubr = send_and_read(&mut b, &mut bbuf, &[b"PUBLISH", b"ch", b"hello"]).await;
+        assert_eq!(pubr, Resp::Integer(1), "PUBLISH must report 1 receiver");
+
+        // A receives the message frame.
+        let msg = read_with_timeout(&mut a, &mut abuf, 1000)
+            .await
+            .expect("A must receive the published message");
+        assert_message(&msg, b"ch", b"hello");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn publish_counts_all_subscribers_and_zero_for_none() {
+    // N subscribers across shards -> PUBLISH returns N; PUBLISH to a channel with no
+    // subscribers returns 0.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        // Three subscribers on the same channel (they spread across shards via SO_REUSEPORT).
+        let mut subs = Vec::new();
+        for _ in 0..3 {
+            let mut s = connect_retry(port).await;
+            let mut sb = Vec::new();
+            let _ = send_and_read(&mut s, &mut sb, &[b"SUBSCRIBE", b"news"]).await;
+            subs.push((s, sb));
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let mut pubc = connect_retry(port).await;
+        let mut pb = Vec::new();
+        let n = send_and_read(&mut pubc, &mut pb, &[b"PUBLISH", b"news", b"x"]).await;
+        assert_eq!(n, Resp::Integer(3), "PUBLISH must count all 3 subscribers");
+
+        // A channel nobody subscribed to: 0 receivers.
+        let z = send_and_read(&mut pubc, &mut pb, &[b"PUBLISH", b"silent", b"x"]).await;
+        assert_eq!(z, Resp::Integer(0), "PUBLISH to no subscribers returns 0");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn subscribe_mode_gate_resp2_blocks_other_commands_resp3_allows() {
+    // RESP2 subscriber running GET -> the subscribe-mode error. RESP3 subscriber (HELLO 3 then
+    // SUBSCRIBE) running GET -> works (no restriction).
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+
+        // RESP2 path: subscribe, then GET is rejected with the exact Redis error.
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+        let _ = send_and_read(&mut c, &mut cb, &[b"SUBSCRIBE", b"ch"]).await;
+        let err = send_and_read(&mut c, &mut cb, &[b"GET", b"k"]).await;
+        let Resp::Error(line) = err else {
+            panic!("RESP2 subscriber GET must error, got {err:?}");
+        };
+        assert_eq!(
+            line,
+            b"ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+        );
+
+        // RESP3 path: HELLO 3, subscribe, then GET works (subscribe mode does not restrict RESP3).
+        let mut d = connect_retry(port).await;
+        let mut db = Vec::new();
+        hello3(&mut d).await;
+        let _ = send_and_read(&mut d, &mut db, &[b"SUBSCRIBE", b"ch"]).await;
+        // SET then GET on the RESP3 subscriber: both must succeed.
+        let setr = send_and_read(&mut d, &mut db, &[b"SET", b"k", b"v"]).await;
+        assert_eq!(setr, Resp::Simple(b"OK".to_vec()), "RESP3 subscriber SET works");
+        let getr = send_and_read(&mut d, &mut db, &[b"GET", b"k"]).await;
+        assert_eq!(getr, Resp::Bulk(Some(b"v".to_vec())), "RESP3 subscriber GET works");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn subscribe_reply_shape_and_unsubscribe_all() {
+    // SUBSCRIBE c1 c2 c3 -> one ["subscribe", ci, running_count] per channel, running count
+    // incrementing. UNSUBSCRIBE with NO args unsubscribes ALL (count walks down to 0).
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+
+        // One SUBSCRIBE with three channels: three confirmations, counts 1,2,3.
+        send_cmd(&mut c, &[b"SUBSCRIBE", b"c1", b"c2", b"c3"]).await;
+        for (i, ch) in [&b"c1"[..], b"c2", b"c3"].iter().enumerate() {
+            let r = read_reply(&mut c, &mut cb).await;
+            let Resp::Agg { items, .. } = &r else {
+                panic!("subscribe confirm must be an aggregate, got {r:?}");
+            };
+            assert_eq!(items[0], Resp::Bulk(Some(b"subscribe".to_vec())));
+            assert_eq!(items[1], Resp::Bulk(Some(ch.to_vec())));
+            assert_eq!(items[2], Resp::Integer(i as i64 + 1));
+        }
+
+        // Idempotent re-subscribe to c1 does NOT bump the count (stays 3).
+        let again = send_and_read(&mut c, &mut cb, &[b"SUBSCRIBE", b"c1"]).await;
+        let Resp::Agg { items, .. } = &again else {
+            panic!("re-subscribe confirm must be an aggregate, got {again:?}");
+        };
+        assert_eq!(
+            items[2],
+            Resp::Integer(3),
+            "re-subscribe does not bump count"
+        );
+
+        // UNSUBSCRIBE with no args: one confirmation per channel, count counting DOWN to 0.
+        send_cmd(&mut c, &[b"UNSUBSCRIBE"]).await;
+        let mut last_count = i64::MAX;
+        for _ in 0..3 {
+            let r = read_reply(&mut c, &mut cb).await;
+            let Resp::Agg { items, .. } = &r else {
+                panic!("unsubscribe confirm must be an aggregate, got {r:?}");
+            };
+            assert_eq!(items[0], Resp::Bulk(Some(b"unsubscribe".to_vec())));
+            let Resp::Integer(count) = items[2] else {
+                panic!("unsubscribe count must be an integer");
+            };
+            last_count = count;
+        }
+        assert_eq!(last_count, 0, "UNSUBSCRIBE-all ends at running count 0");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn resp3_push_frame_vs_resp2_array_frame() {
+    // The SAME delivered message renders as a RESP3 push (`>` first byte) on a RESP3 subscriber
+    // and a RESP2 array (`*`) on a RESP2 subscriber.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+
+        // RESP2 subscriber.
+        let mut r2 = connect_retry(port).await;
+        let mut r2b = Vec::new();
+        let _ = send_and_read(&mut r2, &mut r2b, &[b"SUBSCRIBE", b"ch"]).await;
+
+        // RESP3 subscriber.
+        let mut r3 = connect_retry(port).await;
+        let mut r3b = Vec::new();
+        hello3(&mut r3).await;
+        let _ = send_and_read(&mut r3, &mut r3b, &[b"SUBSCRIBE", b"ch"]).await;
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let mut p = connect_retry(port).await;
+        let mut pb = Vec::new();
+        let n = send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"ch", b"v"]).await;
+        assert_eq!(n, Resp::Integer(2), "two subscribers");
+
+        // RESP2 subscriber: a `*` array frame (is_push == false).
+        let m2 = read_with_timeout(&mut r2, &mut r2b, 1000)
+            .await
+            .expect("RESP2 subscriber must receive");
+        assert!(
+            !assert_message(&m2, b"ch", b"v"),
+            "RESP2 delivery is a `*` array"
+        );
+
+        // RESP3 subscriber: a `>` push frame (is_push == true).
+        let m3 = read_with_timeout(&mut r3, &mut r3b, 1000)
+            .await
+            .expect("RESP3 subscriber must receive");
+        assert!(
+            assert_message(&m3, b"ch", b"v"),
+            "RESP3 delivery is a `>` push"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn disconnect_cleanup_leaves_no_leak() {
+    // A subscriber drops its socket; a later PUBLISH returns 0 (the subscription was pruned).
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+
+        // We need the publisher to land on the SAME shard the subscriber used so the
+        // disconnect cleanup is observable as a 0-count publish on that channel regardless of
+        // shard. Since channels are not slotted, a PUBLISH fans out to ALL shards, so a single
+        // publisher observes the global count: after the subscriber disconnects, that is 0.
+        {
+            let mut s = connect_retry(port).await;
+            let mut sb = Vec::new();
+            let _ = send_and_read(&mut s, &mut sb, &[b"SUBSCRIBE", b"gone"]).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Drop the socket (s goes out of scope) -> the serve loop's disconnect cleanup
+            // deregisters the subscription from its home shard's table.
+        }
+        // Give the server a moment to observe the close + run cleanup.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut p = connect_retry(port).await;
+        let mut pb = Vec::new();
+        let n = send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"gone", b"x"]).await;
+        assert_eq!(
+            n,
+            Resp::Integer(0),
+            "a disconnected subscriber leaves no leak"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn ping_while_subscribed_resp2_is_pong_array() {
+    // PING while subscribed (RESP2) -> the ["pong", ""] (or ["pong", arg]) array, not +PONG.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+        let _ = send_and_read(&mut c, &mut cb, &[b"SUBSCRIBE", b"ch"]).await;
+
+        // Bare PING -> ["pong", ""].
+        let p = send_and_read(&mut c, &mut cb, &[b"PING"]).await;
+        let Resp::Agg { is_push, items } = &p else {
+            panic!("subscribed PING must be an array, got {p:?}");
+        };
+        assert!(!is_push, "the pong reply is a `*` array, not a push frame");
+        assert_eq!(items[0], Resp::Bulk(Some(b"pong".to_vec())));
+        assert_eq!(items[1], Resp::Bulk(Some(b"".to_vec())));
+
+        // PING with an argument -> ["pong", arg].
+        let p2 = send_and_read(&mut c, &mut cb, &[b"PING", b"hi"]).await;
+        let Resp::Agg { items, .. } = &p2 else {
+            panic!("subscribed PING arg must be an array, got {p2:?}");
+        };
+        assert_eq!(items[0], Resp::Bulk(Some(b"pong".to_vec())));
+        assert_eq!(items[1], Resp::Bulk(Some(b"hi".to_vec())));
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn back_pressure_sheds_slow_consumer_and_publisher_stays_responsive() {
+    // A subscriber that NEVER reads is flooded past the push-channel bound; it is shed
+    // (disconnected), and the publisher never blocks (it stays responsive throughout).
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+
+        // The slow consumer subscribes, reads ONLY its subscribe confirmation, then never
+        // reads again.
+        let mut slow = connect_retry(port).await;
+        let mut slowb = Vec::new();
+        let _ = send_and_read(&mut slow, &mut slowb, &[b"SUBSCRIBE", b"flood"]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The publisher floods well past PUSH_CHANNEL_BOUND (1024). The serve loop drains the
+        // push channel into the consumer's KERNEL socket buffer; since the consumer never reads,
+        // that socket buffer fills, the serve loop's `rt.send` then blocks, the channel stops
+        // draining and fills to the bound, and the next delivery's `try_send` SHEDS the
+        // consumer. A LARGE payload (8 KiB) fills both buffers quickly + deterministically.
+        // Every PUBLISH must return promptly (never block on the slow consumer).
+        let big = vec![b'x'; 8 * 1024];
+        let mut p = connect_retry(port).await;
+        let mut pb = Vec::new();
+        let mut saw_zero_after_full = false;
+        for _ in 0..6000u32 {
+            // Each PUBLISH is awaited with a generous timeout; a hang here (blocked on the
+            // slow consumer) would fail the test by timing out.
+            let n = tokio::time::timeout(
+                Duration::from_secs(2),
+                send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"flood", &big]),
+            )
+            .await
+            .expect("PUBLISH must never block on a slow consumer");
+            if n == Resp::Integer(0) {
+                saw_zero_after_full = true;
+                break;
+            }
+        }
+        assert!(
+            saw_zero_after_full,
+            "the slow consumer must be shed (count drops to 0) once its push channel overflows"
+        );
+
+        // The publisher is still fully responsive after the shed.
+        let still = send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"flood", b"x"]).await;
+        assert_eq!(
+            still,
+            Resp::Integer(0),
+            "publisher responsive; consumer gone"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn single_shard_subscribe_publish_parity() {
+    // shards == 1: SUBSCRIBE/PUBLISH work (the home delivery runs locally, no self-channel hop).
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(1);
+        let mut a = connect_retry(port).await;
+        let mut ab = Vec::new();
+        let _ = send_and_read(&mut a, &mut ab, &[b"SUBSCRIBE", b"one"]).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let mut b = connect_retry(port).await;
+        let mut bb = Vec::new();
+        let n = send_and_read(&mut b, &mut bb, &[b"PUBLISH", b"one", b"v"]).await;
+        assert_eq!(
+            n,
+            Resp::Integer(1),
+            "single-shard PUBLISH counts the subscriber"
+        );
+
+        let msg = read_with_timeout(&mut a, &mut ab, 1000)
+            .await
+            .expect("single-shard subscriber must receive");
+        assert_message(&msg, b"one", b"v");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn non_subscriber_hot_path_get_set_unchanged() {
+    // A normal (non-subscriber) connection's GET/SET still works -- the select! idle wait is
+    // bypassed when not subscribed, so the common hot path is unchanged.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+        let setr = send_and_read(&mut c, &mut cb, &[b"SET", b"k", b"v"]).await;
+        assert_eq!(setr, Resp::Simple(b"OK".to_vec()));
+        let getr = send_and_read(&mut c, &mut cb, &[b"GET", b"k"]).await;
+        assert_eq!(getr, Resp::Bulk(Some(b"v".to_vec())));
+        // A PING on a non-subscriber is the normal +PONG simple string (NOT the pong array).
+        let pong = send_and_read(&mut c, &mut cb, &[b"PING"]).await;
+        assert_eq!(pong, Resp::Simple(b"PONG".to_vec()));
+
+        server.shutdown_and_join().unwrap();
+    });
+}

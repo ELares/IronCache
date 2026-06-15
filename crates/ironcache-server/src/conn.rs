@@ -6,8 +6,10 @@
 //! (ADR-0002). It holds the negotiated protocol version, the selected DB, the
 //! client name, the authenticated flag, and the per-connection client id.
 
+use bytes::Bytes;
 use ironcache_protocol::{ProtoVersion, Request};
 use ironcache_storage::WatchEntry;
+use std::collections::HashSet;
 
 /// The mutable state of a single client connection.
 ///
@@ -62,6 +64,18 @@ pub struct ConnState {
     /// connection's accept shard, so revalidation + apply run on one owning core; a
     /// watched key on another shard (cross-shard EXEC) is out of scope (COORDINATOR.md).
     pub watch: Vec<WatchEntry>,
+    /// The exact channels this connection is SUBSCRIBEd to (classic Pub/Sub, SERVER_PUSH.md
+    /// #20, PR 91a). Holds only the channel NAMES (the per-shard subscription table in the
+    /// serve layer holds the `Send` push sender); a connection is "in subscribe mode" when
+    /// this or [`Self::sub_patterns`] is non-empty ([`Self::is_subscriber`]). It drives the
+    /// disconnect-cleanup deregistration (the serve loop removes this connection from each
+    /// named channel in the shard table). The push SENDER deliberately lives in the serve
+    /// layer, NOT here: it is a tokio handle, and this crate carries no tokio dependency.
+    pub sub_channels: HashSet<Bytes>,
+    /// The PSUBSCRIBE patterns this connection is subscribed to (SERVER_PUSH.md). RESERVED
+    /// for PR 91b; always empty this pass. Designed in now so [`Self::is_subscriber`] and the
+    /// disconnect cleanup already account for patterns without reshaping the struct.
+    pub sub_patterns: HashSet<Bytes>,
 }
 
 impl ConnState {
@@ -91,6 +105,8 @@ impl ConnState {
             queued: Vec::new(),
             dirty_exec: false,
             watch: Vec::new(),
+            sub_channels: HashSet::new(),
+            sub_patterns: HashSet::new(),
         }
     }
 
@@ -104,7 +120,23 @@ impl ConnState {
         self.name.clear();
         self.authenticated = !requires_auth;
         self.clear_txn();
+        // RESET exits subscribe mode (Redis: RESET unsubscribes from all channels/patterns).
+        // This clears the CONNECTION-side membership only; the serve layer deregisters the
+        // matching shard-table entries (it owns the push senders) when it observes the
+        // connection leave subscribe mode, the same split as the disconnect-cleanup path.
+        self.sub_channels.clear();
+        self.sub_patterns.clear();
         // should_close intentionally not touched by RESET.
+    }
+
+    /// Whether the connection is in SUBSCRIBE mode (SERVER_PUSH.md #20): it has at least one
+    /// active channel or pattern subscription. In RESP2 this mode RESTRICTS the allowed
+    /// commands (the subscribe-mode gate in `dispatch`); in RESP3 there is no restriction. It
+    /// also selects the serve loop's `select!` idle-wait (drain pushes vs read commands) and
+    /// the PING reply shape, so the non-subscriber hot path stays untouched.
+    #[must_use]
+    pub fn is_subscriber(&self) -> bool {
+        !self.sub_channels.is_empty() || !self.sub_patterns.is_empty()
     }
 
     /// Enter the transaction (queueing) state for a fresh `MULTI`: mark `in_multi`

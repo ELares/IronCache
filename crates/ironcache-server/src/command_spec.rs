@@ -38,6 +38,17 @@
 use crate::route::KeySpec;
 use ironcache_protocol::Request;
 
+/// The INTERNAL token the cross-shard coordinator uses to fan a PUBLISH out to every shard's
+/// LOCAL subscriber table (SERVER_PUSH.md #20 / COORDINATOR.md #107, PR 91a). NOT a client
+/// command: the serve-loop router gates it (like the `__ICSTORE*` dest-write verbs) so a
+/// client sending it gets `unknown command`; only the coordinator issues it (broadcasting
+/// `__ICPUBLISH <channel> <payload>` to peer shards, each of which delivers to its local
+/// subscribers and returns the local receiver count). It is in the [`spec_of`] registry so
+/// the registry-vs-dispatch cross-check stays exact and `classify` returns `AlwaysHome` (it
+/// has no routable key; the coordinator dispatches it directly, never through the router's
+/// keyed branches).
+pub const ICPUBLISH: &[u8] = b"__ICPUBLISH";
+
 /// The queue-time arity rule for a known command, mirroring the `arity` field of the
 /// Redis command table (src/commands.def). Redis encodes arity as a single signed int:
 /// a POSITIVE `n` means EXACTLY `n` total arguments (command token included); a NEGATIVE
@@ -1533,6 +1544,54 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             class: KeyedSingle,
             key_spec: Arg1,
             denyoom: true,
+            control: false,
+        },
+        // -- Pub/Sub (SERVER_PUSH.md #20, PR 91a; handled in the SERVE layer, NOT
+        // `dispatch_inner`). SUBSCRIBE/UNSUBSCRIBE/PUBLISH are AlwaysHome (no routable key:
+        // they register/look-up the per-shard subscription table on the connection's home
+        // shard, and PUBLISH fans out via the coordinator), control: false, denyoom: false.
+        // They are in the registry so their arity is validated and `classify` returns
+        // AlwaysHome (the router never treats them as keyed/whole-keyspace); the serve loop
+        // intercepts them before dispatch, so they have NO `dispatch_inner` arm and are NOT
+        // in `dispatch_arm_names` (the cross-check enumerates only the dispatch-arm list). --
+        b"SUBSCRIBE" => &CommandSpec {
+            name: b"SUBSCRIBE",
+            arity: Min(2),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+        },
+        b"UNSUBSCRIBE" => &CommandSpec {
+            name: b"UNSUBSCRIBE",
+            arity: Min(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+        },
+        b"PUBLISH" => &CommandSpec {
+            name: b"PUBLISH",
+            arity: Exact(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+        },
+        // -- INTERNAL cross-shard pub/sub fan-out verb (SERVER_PUSH.md #20 / COORDINATOR.md
+        // #107, PR 91a). `__ICPUBLISH <channel> <payload>` delivers to a shard's LOCAL
+        // subscribers and returns the local receiver count. AlwaysHome (no routable key); in
+        // the registry so the cross-check stays exact, but CLIENT-UNREACHABLE: the serve-loop
+        // router rejects a client `__ICPUBLISH` with unknown-command (the same gate as the
+        // `__ICSTORE*` verbs); only the coordinator issues it. Arity Exact(3) (token + channel
+        // + payload). It is handled by the coordinator's run_remote pub/sub branch, NOT a
+        // `dispatch_inner` arm, so it too is absent from `dispatch_arm_names`. --
+        b"__ICPUBLISH" => &CommandSpec {
+            name: b"__ICPUBLISH",
+            arity: Exact(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
             control: false,
         },
         _ => return None,

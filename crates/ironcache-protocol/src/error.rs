@@ -308,6 +308,28 @@ impl ErrorReply {
         )
     }
 
+    /// `ERR Can't execute '<cmd>': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT /
+    /// RESET are allowed in this context` - the reply Redis emits (src/server.c
+    /// `processCommand`, the `CLIENT_PUBSUB && resp == 2` gate -> `rejectCommandFormat(c,
+    /// "Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are
+    /// allowed in this context", c->cmd->fullname)`) when a RESP2 connection in SUBSCRIBE
+    /// mode runs a command other than the pub/sub control set + PING/QUIT/RESET.
+    ///
+    /// Byte-exact to current Redis (8.x / unstable): the alternations are `(P|S)` (the
+    /// sharded `S` form is in the message even where sharded pub/sub is not used), and the
+    /// `%s` is `c->cmd->fullname`, the canonical LOWERCASE command name. RESP3 has NO such
+    /// restriction (a RESP3 subscriber may run any command), so this fires only on RESP2.
+    /// Clients pattern-match the `allowed in this context` phrase.
+    #[must_use]
+    pub fn subscribe_mode(cmd: &str) -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            format!(
+                "Can't execute '{cmd}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+            ),
+        )
+    }
+
     /// `ERR AUTH <password> called without any password configured for the
     /// default user. Are you sure your configuration is correct?` - the current
     /// canonical Redis string for `AUTH` when no `requirepass`/ACL password is
@@ -977,6 +999,18 @@ mod tests {
             ErrorReply::txn_whole_keyspace_unsupported().code(),
             ErrorCode::Err
         );
+    }
+
+    #[test]
+    fn subscribe_mode_error_is_byte_exact() {
+        // Verified against redis/redis src/server.c processCommand (the CLIENT_PUBSUB &&
+        // resp == 2 gate): the (P|S) alternations and the lowercase command name. RESP3 has
+        // no restriction, so this fires only on RESP2 subscribers.
+        assert_eq!(
+            ErrorReply::subscribe_mode("get").line(),
+            "-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+        );
+        assert_eq!(ErrorReply::subscribe_mode("get").code(), ErrorCode::Err);
     }
 
     #[test]

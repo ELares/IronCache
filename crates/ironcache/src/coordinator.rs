@@ -174,6 +174,20 @@ pub async fn run_drain_loop(mut rx: mpsc::Receiver<ShardWork>, ctx: ServerContex
 /// Every borrow is taken and dropped inside this function: nothing escapes to be held
 /// across the caller's `.await` (the no-borrow-across-await contract).
 fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
+    // INTERNAL `__ICPUBLISH <channel> <payload>` (SERVER_PUSH.md #20, PR 91a): the cross-shard
+    // PUBLISH fan-out. It touches the per-shard SUBSCRIPTION table, NOT the store/wheel/env, so
+    // it is handled BEFORE any store borrow and produces NO counter deltas (a PUBLISH is not a
+    // keyed write). Delivery is synchronous non-blocking `try_send` (see `run_local_publish`),
+    // so no RefCell borrow is held across an `.await` (the drain loop's no-borrow-across-await
+    // contract). It returns the count of LOCAL subscribers that received the message; the home
+    // core SUMS the per-shard counts into the PUBLISH integer reply.
+    if crate::serve::ascii_upper(request.command()) == ironcache_server::ICPUBLISH {
+        return ShardReply {
+            value: run_local_publish(request),
+            deltas: CounterDeltas::default(),
+        };
+    }
+
     // Lazily init + clone the per-shard handles (Rc clones, cheap), exactly as
     // serve_connection / handle_request do. These accessors are the shared per-shard
     // lazy-init, so the drain loop and the connection tasks see the SAME store/wheel/env.
@@ -594,6 +608,118 @@ pub fn run_local_keyed(ctx: &ServerContext, request: &Request, db: u32) -> Shard
     }
 
     ShardReply { value, deltas }
+}
+
+/// Deliver an `__ICPUBLISH <channel> <payload>` to THIS shard's LOCAL subscribers and
+/// return the count delivered as a [`Value::Integer`] (SERVER_PUSH.md #20, PR 91a). This is
+/// the per-shard delivery the cross-shard PUBLISH fan-out runs on EVERY shard: the home shard
+/// runs it LOCALLY via [`fan_out_publish`]'s closure (no self-channel hop), every other shard
+/// runs it inside [`run_remote`] off the inbox.
+///
+/// It looks the channel up in this shard's [`crate::serve::shard_pubsub`] table and
+/// `try_send`s a [`crate::pubsub::ServerPush::Message`] to each local subscriber (NEVER
+/// `send().await`: a push must not block the publishing shard); a slow consumer past the
+/// channel bound is SHED inside `ShardPubSub::deliver` (its sender dropped, so its serve loop
+/// disconnects), keeping shard memory bounded. The borrow of the subscription table is taken +
+/// released entirely within this SYNCHRONOUS call (try_send is non-blocking), so nothing is
+/// held across the caller's `.await` (the no-borrow-across-await contract).
+///
+/// A malformed `__ICPUBLISH` (missing channel/payload) delivers to nobody and returns 0; the
+/// coordinator only ever issues it well-formed (the PUBLISH arity is validated client-side).
+#[must_use]
+pub fn run_local_publish(request: &Request) -> Value {
+    let (Some(channel), Some(payload)) = (request.args.get(1), request.args.get(2)) else {
+        return Value::Integer(0);
+    };
+    let push = crate::pubsub::ServerPush::Message {
+        channel: channel.clone(),
+        payload: payload.clone(),
+    };
+    let pubsub = crate::serve::shard_pubsub();
+    let count = pubsub.borrow_mut().deliver(channel.as_ref(), &push);
+    Value::Integer(count)
+}
+
+/// Fan a `PUBLISH <channel> <payload>` out to EVERY shard's LOCAL subscriber table and SUM the
+/// per-shard receiver counts into the PUBLISH integer reply (SERVER_PUSH.md #20 / COORDINATOR.md
+/// #107, PR 91a). Modeled on [`fan_out_all`]: classic Pub/Sub channels are NOT slotted, so a
+/// PUBLISH must reach subscribers on ANY core; it broadcasts the SAME `__ICPUBLISH channel
+/// payload` request to every shard.
+///
+/// The HOME shard's delivery runs LOCALLY + SYNCHRONOUSLY via [`run_local_publish`] (no
+/// self-channel hop, exactly like `fan_out_all`'s `local` closure); every OTHER shard gets a
+/// [`ShardWork`] carrying the `__ICPUBLISH` request (its [`run_remote`] pub/sub branch delivers
+/// to that shard's local subscribers and returns its local count). The home core then SUMS all
+/// the per-shard integer counts. A shard whose drain loop is gone (send error / cancelled
+/// oneshot, only at shutdown / a shard panic) contributes 0 (it cannot have delivered), so a
+/// degraded shard never hangs the PUBLISH.
+///
+/// `db` is carried for envelope symmetry with the other fan-outs (classic Pub/Sub channels are
+/// a single cross-DB namespace this pass, so delivery itself ignores it). The `local` closure
+/// (`run_local_publish`) returns before any `.await`, so NO RefCell borrow of the home shard's
+/// subscription table is held across the awaits (the no-borrow-across-await contract).
+pub async fn fan_out_publish(
+    inbox: &Inbox,
+    channel: &[u8],
+    payload: &[u8],
+    db: u32,
+    home: usize,
+) -> i64 {
+    let n_shards = inbox.len();
+    // The broadcast request the coordinator issues to every shard: the internal verb the
+    // run_remote pub/sub branch + the home `run_local_publish` both decode.
+    let request = Request {
+        args: vec![
+            bytes::Bytes::from_static(ironcache_server::ICPUBLISH),
+            bytes::Bytes::copy_from_slice(channel),
+            bytes::Bytes::copy_from_slice(payload),
+        ],
+    };
+
+    // Enqueue to every NON-home shard first (each with its own oneshot), so the shards deliver
+    // concurrently while the home core then delivers its OWN subset locally and gathers.
+    let mut pending: Vec<oneshot::Receiver<ShardReply>> = Vec::with_capacity(n_shards);
+    let mut total: i64 = 0;
+    for target in 0..n_shards {
+        if target == home {
+            continue;
+        }
+        let (tx, rx) = oneshot::channel::<ShardReply>();
+        let work = ShardWork {
+            request: request.clone(),
+            db,
+            reply: tx,
+        };
+        // Await-on-full back-pressure on the INBOX (the cross-shard queue, NOT the push
+        // channel). A send error means that shard's drain loop is gone (shutdown): it
+        // contributes 0 (it delivered to nobody), never a hang.
+        if inbox[target].send(work).await.is_ok() {
+            pending.push(rx);
+        }
+    }
+
+    // The HOME shard's delivery: LOCAL + SYNCHRONOUS (no self-channel hop), exactly like the
+    // single-key local fast path. The closure returns before the awaits below.
+    total += publish_count(&run_local_publish(&request));
+
+    // Gather the remote per-shard counts. A cancelled oneshot (a shard's drain loop went away
+    // after we enqueued) contributes 0, never a hang/panic.
+    for rx in pending {
+        if let Ok(reply) = rx.await {
+            total += publish_count(&reply.value);
+        }
+    }
+    total
+}
+
+/// Extract the integer receiver count a shard's `__ICPUBLISH` delivery returned. The pub/sub
+/// branch always replies a [`Value::Integer`]; anything else (the shard-unavailable error, only
+/// at shutdown) counts as 0 (that shard delivered to nobody).
+fn publish_count(value: &Value) -> i64 {
+    match value {
+        Value::Integer(n) => *n,
+        _ => 0,
+    }
 }
 
 /// A [`ShardReply`] carrying the cross-shard unavailable error (the owning shard's drain
