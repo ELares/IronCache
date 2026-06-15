@@ -466,6 +466,23 @@ impl ErrorReply {
         )
     }
 
+    /// `ERR index out of range` - the reply Redis emits (src/t_list.c
+    /// `lsetCommand` -> `addReplyError(c,"index out of range")`) when LSET targets an
+    /// index outside the list. Byte-exact (the plain `ERR` token, NOT `OUTOFRANGE`).
+    #[must_use]
+    pub fn index_out_of_range() -> Self {
+        ErrorReply::new(ErrorCode::Err, "index out of range")
+    }
+
+    /// `ERR value is out of range, must be positive` - the reply Redis emits (src/t_list.c
+    /// `lpopCommand`/`rpopCommand` -> `addReplyError(c,"value is out of range, must be
+    /// positive")`) when the optional LPOP/RPOP `count` argument is negative. A NON-integer
+    /// count is the separate not-an-integer error; this is specifically the negative case.
+    #[must_use]
+    pub fn value_out_of_range_must_be_positive() -> Self {
+        ErrorReply::new(ErrorCode::Err, "value is out of range, must be positive")
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free
@@ -704,6 +721,20 @@ mod tests {
         assert_eq!(
             ErrorReply::expire_unsupported_option("BOGUS").line(),
             "-ERR Unsupported option BOGUS"
+        );
+    }
+
+    #[test]
+    fn list_errors_are_byte_exact() {
+        // Verified against redis/redis src/t_list.c: LSET index-out-of-range and the
+        // LPOP/RPOP negative-count error. Both use the plain `ERR` token.
+        assert_eq!(
+            ErrorReply::index_out_of_range().line(),
+            "-ERR index out of range"
+        );
+        assert_eq!(
+            ErrorReply::value_out_of_range_must_be_positive().line(),
+            "-ERR value is out of range, must be positive"
         );
     }
 

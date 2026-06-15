@@ -11,7 +11,7 @@
 
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
-use crate::{cmd_config, cmd_expire, cmd_introspect, cmd_keyspace, cmd_string};
+use crate::{cmd_config, cmd_expire, cmd_introspect, cmd_keyspace, cmd_list, cmd_string};
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
 use ironcache_expiry::TimingWheel;
@@ -240,7 +240,11 @@ fn maybe_hot_swap_policy<E: Env, S: PolicySwap>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// The dispatcher is one large command-routing match (the command table); its arms
+// grow as commands land (PR-5 adds the 16 list commands). The big-match shape is the
+// intended structure, so the line-count lint is allowed here alongside the
+// arg-count one (the workspace lint note records the dispatch-surface exception).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
     ctx: &ServerContext,
     state: &mut ConnState,
@@ -406,6 +410,26 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
         b"UNLINK" => cmd_keyspace::cmd_unlink(store, db, now, req),
         b"FLUSHDB" => cmd_keyspace::cmd_flushdb(store, db, req),
         b"FLUSHALL" => cmd_keyspace::cmd_flushall(store, req),
+        // -- List commands (PR-5) over the in-place-mutation RMW extension. Mutating
+        // commands route through `rmw_mut` (OccupiedMut/Mutated) or Insert (create) /
+        // Delete (emptied); reads through `rmw_mut` with Keep. WRONGTYPE on a non-list.
+        // Blocking variants (BLPOP/...) are DEFERRED. --
+        b"LPUSH" => cmd_list::cmd_lpush(store, db, now, req),
+        b"RPUSH" => cmd_list::cmd_rpush(store, db, now, req),
+        b"LPUSHX" => cmd_list::cmd_lpushx(store, db, now, req),
+        b"RPUSHX" => cmd_list::cmd_rpushx(store, db, now, req),
+        b"LPOP" => cmd_list::cmd_lpop(store, db, now, req),
+        b"RPOP" => cmd_list::cmd_rpop(store, db, now, req),
+        b"LLEN" => cmd_list::cmd_llen(store, db, now, req),
+        b"LRANGE" => cmd_list::cmd_lrange(store, db, now, req),
+        b"LINDEX" => cmd_list::cmd_lindex(store, db, now, req),
+        b"LSET" => cmd_list::cmd_lset(store, db, now, req),
+        b"LINSERT" => cmd_list::cmd_linsert(store, db, now, req),
+        b"LREM" => cmd_list::cmd_lrem(store, db, now, req),
+        b"LTRIM" => cmd_list::cmd_ltrim(store, db, now, req),
+        b"LMOVE" => cmd_list::cmd_lmove(store, db, now, req),
+        b"RPOPLPUSH" => cmd_list::cmd_rpoplpush(store, db, now, req),
+        b"LPOS" => cmd_list::cmd_lpos(store, db, now, req),
         // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
         b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
         _ => {
@@ -4381,5 +4405,580 @@ mod tests {
         assert_eq!(a.policy_name(), b.policy_name());
         assert_eq!(a.used_memory(), b.used_memory());
         assert_eq!(a.len(), b.len());
+    }
+
+    // -- List commands (PR-5) through dispatch over a real ShardStore. --
+
+    /// An integer reply value (named `iv` to avoid colliding with the existing `int`
+    /// helper, which EXTRACTS an i64 from a Value).
+    fn iv(n: i64) -> Value {
+        Value::Integer(n)
+    }
+
+    /// A bulk-string array reply from byte slices.
+    fn arr(items: &[&[u8]]) -> Value {
+        Value::Array(Some(items.iter().map(|b| bulk(b)).collect()))
+    }
+
+    #[test]
+    fn lpush_rpush_order_and_return_len() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // RPUSH appends: k = [a, b, c]; returns the running length.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", b"a"]),
+            iv(1)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", b"b", b"c"]),
+            iv(3)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"a", b"b", b"c"])
+        );
+        // LPUSH prepends each in turn: LPUSH k x y -> y then x at the head, so the
+        // list becomes [y, x, a, b, c].
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LPUSH", b"k", b"x", b"y"]),
+            iv(5)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"y", b"x", b"a", b"b", b"c"])
+        );
+        // TYPE is list; OBJECT ENCODING is listpack while small.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"TYPE", b"k"]),
+            Value::simple("list")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"k"]),
+            bulk(b"listpack")
+        );
+    }
+
+    #[test]
+    fn pushx_only_when_exists() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // LPUSHX/RPUSHX on a missing key -> 0, no create.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LPUSHX", b"k", b"a"]),
+            iv(0)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RPUSHX", b"k", b"a"]),
+            iv(0)
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"LLEN", b"k"]), iv(0));
+        // Create with RPUSH, then PUSHX appends.
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", b"a"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RPUSHX", b"k", b"b"]),
+            iv(2)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LPUSHX", b"k", b"z"]),
+            iv(3)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"z", b"a", b"b"])
+        );
+    }
+
+    #[test]
+    fn lpop_rpop_single_count_and_nil() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"RPUSH", b"k", b"a", b"b", b"c", b"d"],
+        );
+        // Single LPOP -> bulk "a".
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"LPOP", b"k"]), bulk(b"a"));
+        // RPOP -> bulk "d".
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"RPOP", b"k"]), bulk(b"d"));
+        // LPOP with count -> array.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LPOP", b"k", b"2"]),
+            arr(&[b"b", b"c"])
+        );
+        // The list is now empty -> key deleted; LPOP -> nil (no count), nil array (count).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LPOP", b"k"]),
+            Value::Null
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LPOP", b"k", b"3"]),
+            Value::Array(None)
+        );
+        // A negative count is the must-be-positive error.
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", b"x"]);
+        match run_on(&c, &mut s, &mut st, t, &[b"LPOP", b"k", b"-1"]) {
+            Value::Error(e) => {
+                assert_eq!(e.line(), "-ERR value is out of range, must be positive");
+            }
+            other => panic!("expected must-be-positive error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lrange_inclusive_and_negative_indices() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"RPUSH", b"k", b"a", b"b", b"c", b"d", b"e"],
+        );
+        // Inclusive range.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"1", b"3"]),
+            arr(&[b"b", b"c", b"d"])
+        );
+        // Negative indices from the tail.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"-2", b"-1"]),
+            arr(&[b"d", b"e"])
+        );
+        // Out-of-range / inverted -> empty array.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"5", b"10"]),
+            Value::Array(Some(vec![]))
+        );
+        // Absent key -> empty array.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"nope", b"0", b"-1"]),
+            Value::Array(Some(vec![]))
+        );
+    }
+
+    #[test]
+    fn lindex_nil_out_of_range() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", b"a", b"b", b"c"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LINDEX", b"k", b"0"]),
+            bulk(b"a")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LINDEX", b"k", b"-1"]),
+            bulk(b"c")
+        );
+        // Out of range -> nil.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LINDEX", b"k", b"5"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn lset_no_such_key_index_out_of_range_and_success() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // LSET on a missing key -> -ERR no such key.
+        match run_on(&c, &mut s, &mut st, t, &[b"LSET", b"k", b"0", b"v"]) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR no such key"),
+            other => panic!("expected no such key, got {other:?}"),
+        }
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", b"a", b"b", b"c"]);
+        // Out-of-range index -> -ERR index out of range.
+        match run_on(&c, &mut s, &mut st, t, &[b"LSET", b"k", b"9", b"v"]) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR index out of range"),
+            other => panic!("expected index out of range, got {other:?}"),
+        }
+        // Success.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LSET", b"k", b"1", b"B"]),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"a", b"B", b"c"])
+        );
+    }
+
+    #[test]
+    fn linsert_before_after_pivot_not_found_and_key_absent() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // Absent key -> 0.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LINSERT", b"k", b"BEFORE", b"x", b"y"]
+            ),
+            iv(0)
+        );
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", b"a", b"c"]);
+        // BEFORE c -> insert b: [a, b, c]; returns new len 3.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LINSERT", b"k", b"BEFORE", b"c", b"b"]
+            ),
+            iv(3)
+        );
+        // AFTER a -> insert A: [a, A, b, c]; returns 4.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LINSERT", b"k", b"AFTER", b"a", b"A"]
+            ),
+            iv(4)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"a", b"A", b"b", b"c"])
+        );
+        // Pivot not found -> -1, no change.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LINSERT", b"k", b"BEFORE", b"zzz", b"q"]
+            ),
+            iv(-1)
+        );
+    }
+
+    #[test]
+    fn lrem_positive_negative_zero() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let seed = |st: &mut TestStore, s: &mut ConnState| {
+            run_on(&c, s, st, t, &[b"DEL", b"k"]);
+            run_on(
+                &c,
+                s,
+                st,
+                t,
+                &[b"RPUSH", b"k", b"a", b"b", b"a", b"c", b"a"],
+            );
+        };
+        // count > 0: remove first 2 'a' head->tail: [b, c, a].
+        seed(&mut st, &mut s);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LREM", b"k", b"2", b"a"]),
+            iv(2)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"b", b"c", b"a"])
+        );
+        // count < 0: remove first 1 'a' tail->head: [a, b, a, c].
+        seed(&mut st, &mut s);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LREM", b"k", b"-1", b"a"]),
+            iv(1)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"a", b"b", b"a", b"c"])
+        );
+        // count == 0: remove ALL 'a': [b, c].
+        seed(&mut st, &mut s);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LREM", b"k", b"0", b"a"]),
+            iv(3)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"b", b"c"])
+        );
+    }
+
+    #[test]
+    fn ltrim_inclusive_and_empty_deletes_key() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"RPUSH", b"k", b"a", b"b", b"c", b"d", b"e"],
+        );
+        // Keep [1, 3] -> [b, c, d].
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LTRIM", b"k", b"1", b"3"]),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"k", b"0", b"-1"]),
+            arr(&[b"b", b"c", b"d"])
+        );
+        // An out-of-range trim empties the list -> key deleted.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LTRIM", b"k", b"5", b"10"]),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"TYPE", b"k"]),
+            Value::simple("none")
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"k"]), iv(0));
+    }
+
+    #[test]
+    fn lmove_and_rpoplpush_including_src_eq_dst_rotate() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"RPUSH", b"src", b"a", b"b", b"c"],
+        );
+        // LMOVE src dst LEFT RIGHT: pop 'a' from src head, push to dst tail.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LMOVE", b"src", b"dst", b"LEFT", b"RIGHT"]
+            ),
+            bulk(b"a")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"src", b"0", b"-1"]),
+            arr(&[b"b", b"c"])
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"dst", b"0", b"-1"]),
+            arr(&[b"a"])
+        );
+        // RPOPLPUSH src dst: pop 'c' from src tail, push to dst head.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RPOPLPUSH", b"src", b"dst"]),
+            bulk(b"c")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"dst", b"0", b"-1"]),
+            arr(&[b"c", b"a"])
+        );
+        // src == dst rotate: RPOPLPUSH dst dst moves the tail to the head.
+        // dst = [c, a] -> rotate -> [a, c].
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RPOPLPUSH", b"dst", b"dst"]),
+            bulk(b"a")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"dst", b"0", b"-1"]),
+            arr(&[b"a", b"c"])
+        );
+        // LMOVE from an absent src -> nil.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LMOVE", b"nope", b"dst", b"LEFT", b"LEFT"]
+            ),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn lpos_rank_count_maxlen() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // [a, b, c, a, b, c, a]
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"RPUSH", b"k", b"a", b"b", b"c", b"a", b"b", b"c", b"a"],
+        );
+        // First 'a' -> index 0.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LPOS", b"k", b"a"]),
+            iv(0)
+        );
+        // RANK 2 -> the SECOND 'a' -> index 3.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LPOS", b"k", b"a", b"RANK", b"2"]
+            ),
+            iv(3)
+        );
+        // RANK -1 -> the last 'a' -> index 6.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LPOS", b"k", b"a", b"RANK", b"-1"]
+            ),
+            iv(6)
+        );
+        // COUNT 0 -> all 'a' positions [0, 3, 6].
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LPOS", b"k", b"a", b"COUNT", b"0"]
+            ),
+            Value::Array(Some(vec![iv(0), iv(3), iv(6)]))
+        );
+        // MAXLEN 2 with COUNT 0 -> only the first 2 elements are scanned -> [0].
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LPOS", b"k", b"a", b"COUNT", b"0", b"MAXLEN", b"2"]
+            ),
+            Value::Array(Some(vec![iv(0)]))
+        );
+        // No match -> nil (no COUNT), empty array (with COUNT).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LPOS", b"k", b"zzz"]),
+            Value::Null
+        );
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LPOS", b"k", b"zzz", b"COUNT", b"0"]
+            ),
+            Value::Array(Some(vec![]))
+        );
+    }
+
+    #[test]
+    fn wrongtype_on_a_string_key() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"str", b"hello"]);
+        for cmd in [
+            vec![b"LPUSH".as_slice(), b"str", b"x"],
+            vec![b"RPUSH", b"str", b"x"],
+            vec![b"LPOP", b"str"],
+            vec![b"LLEN", b"str"],
+            vec![b"LRANGE", b"str", b"0", b"-1"],
+            vec![b"LINDEX", b"str", b"0"],
+            vec![b"LSET", b"str", b"0", b"v"],
+            vec![b"LINSERT", b"str", b"BEFORE", b"a", b"b"],
+            vec![b"LREM", b"str", b"0", b"a"],
+            vec![b"LTRIM", b"str", b"0", b"-1"],
+            vec![b"LPOS", b"str", b"a"],
+        ] {
+            match run_on(&c, &mut s, &mut st, t, &cmd) {
+                Value::Error(e) => assert_eq!(
+                    e.line(),
+                    "-WRONGTYPE Operation against a key holding the wrong kind of value",
+                    "{cmd:?}"
+                ),
+                other => panic!("expected WRONGTYPE for {cmd:?}, got {other:?}"),
+            }
+        }
+        // The string value is untouched.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"str"]),
+            bulk(b"hello")
+        );
+    }
+
+    #[test]
+    fn object_encoding_listpack_then_quicklist() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", b"a"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"k"]),
+            bulk(b"listpack")
+        );
+        // Push a value over the 8 KB byte budget -> quicklist.
+        let big = vec![b'q'; 9000];
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"k", &big]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"OBJECT", b"ENCODING", b"k"]),
+            bulk(b"quicklist")
+        );
+    }
+
+    #[test]
+    fn list_command_arity_errors() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        for bad in [
+            vec![b"LPUSH".as_slice(), b"k"],         // needs >= 1 element
+            vec![b"LPOP", b"k", b"1", b"extra"],     // at most key + count
+            vec![b"LRANGE", b"k", b"0"],             // needs start AND stop
+            vec![b"LSET", b"k", b"0"],               // needs index AND element
+            vec![b"LINSERT", b"k", b"BEFORE", b"p"], // needs pivot AND element
+            vec![b"LLEN"],                           // needs a key
+        ] {
+            match run_on(&c, &mut s, &mut st, t, &bad) {
+                Value::Error(e) => assert!(
+                    e.line().contains("wrong number of arguments"),
+                    "{bad:?} -> {}",
+                    e.line()
+                ),
+                other => panic!("expected arity error for {bad:?}, got {other:?}"),
+            }
+        }
     }
 }

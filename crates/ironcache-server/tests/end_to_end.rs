@@ -543,6 +543,116 @@ fn parse_scan_reply(buf: &[u8]) -> (String, Vec<String>) {
 }
 
 #[test]
+fn list_commands_over_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // RPUSH mylist a b c -> :3
+        client
+            .write_all(b"*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+
+        // LLEN mylist -> :3
+        client
+            .write_all(b"*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+
+        // TYPE mylist -> +list
+        client
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$6\r\nmylist\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+list\r\n").await;
+
+        // LRANGE mylist 0 -1 -> *3 a b c
+        client
+            .write_all(b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n").await;
+
+        // LPOP mylist -> $1 a
+        client
+            .write_all(b"*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$1\r\na\r\n").await;
+
+        // OBJECT ENCODING mylist -> listpack (small).
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$6\r\nmylist\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$8\r\nlistpack\r\n").await;
+
+        // Push a value over the 8 KB listpack budget -> quicklist. Build the RPUSH
+        // frame with a 9000-byte element.
+        let big = vec![b'q'; 9000];
+        let mut frame =
+            format!("*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n${}\r\n", big.len()).into_bytes();
+        frame.extend_from_slice(&big);
+        frame.extend_from_slice(b"\r\n");
+        client.write_all(&frame).await.unwrap();
+        // Reply :3 (b, c, + big).
+        expect_reply(&mut client, b":3\r\n").await;
+
+        // OBJECT ENCODING mylist -> quicklist now.
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$6\r\nmylist\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"$9\r\nquicklist\r\n",
+            "got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        // WRONGTYPE: SET a string key, then a list command on it errors.
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nstr\r\n$1\r\nv\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*3\r\n$5\r\nLPUSH\r\n$3\r\nstr\r\n$1\r\nx\r\n")
+            .await
+            .unwrap();
+        let mut wbuf = [0u8; 128];
+        let wn = client.read(&mut wbuf).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&wbuf[..wn]).starts_with("-WRONGTYPE"),
+            "got {:?}",
+            String::from_utf8_lossy(&wbuf[..wn])
+        );
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
+#[test]
 fn unknown_command_error_over_socket() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rt = tokio::runtime::Builder::new_current_thread()
