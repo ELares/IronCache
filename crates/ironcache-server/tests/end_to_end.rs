@@ -16,6 +16,7 @@ use ironcache_server::{ConnState, CounterDeltas, TimingWheel, UnixMillis, dispat
 use ironcache_storage::CountingAccounting;
 use ironcache_store::{ShardStore, process_memory};
 use std::cell::RefCell;
+use std::rc::Rc;
 
 // jemalloc as this test binary's global allocator so the INFO used_memory figure
 // (process-global stats.allocated) is live, mirroring the server binary.
@@ -1340,6 +1341,196 @@ fn bitmap_commands_over_real_socket() {
         expect_reply(&mut client, b":2\r\n").await;
 
         drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
+/// The concrete shared per-shard store the cross-connection WATCH e2e test drives: an
+/// `Rc<RefCell<ShardStore>>` shared between connection tasks on ONE LocalSet, exactly as
+/// the binary shares its per-shard store across the connections on a shard thread.
+type SharedStore = Rc<RefCell<ShardStore<Policy, CountingAccounting>>>;
+
+/// Serve a single connection against a SHARED store (PR-10b cross-connection WATCH).
+/// Like [`serve_one`] but the store is supplied so several connections see the SAME
+/// keyspace + WATCH version slots (single-shard-per-connection). On close it deregisters
+/// this connection's WATCHes from the store, mirroring the serve-loop teardown in serve.rs.
+async fn serve_one_shared(
+    mut stream: tokio::net::TcpStream,
+    ctx: ServerContext,
+    store: SharedStore,
+) {
+    use ironcache_storage::Watch;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut env = SystemEnv::new();
+    let mut wheel = TimingWheel::new();
+    let counters = RefCell::new(CounterSnapshot::default());
+    let mut conn = ConnState::new(
+        1,
+        ProtoVersion::Resp2,
+        ctx.requires_auth(),
+        "test".to_owned(),
+        "test".to_owned(),
+    );
+    let limits = Limits::default();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut shard_gen = ctx.runtime.generation();
+    'outer: loop {
+        loop {
+            match decode(&buf, &limits) {
+                DecodeOutcome::Complete { request, consumed } => {
+                    let rollup = || *counters.borrow();
+                    let now = UnixMillis(env.now_unix_millis());
+                    let mut deltas = CounterDeltas::default();
+                    let reply = {
+                        let mut st = store.borrow_mut();
+                        dispatch(
+                            &ctx,
+                            &mut conn,
+                            &mut env,
+                            &mut *st,
+                            &mut wheel,
+                            now,
+                            &mut shard_gen,
+                            &rollup,
+                            MemoryInfo::default(),
+                            &mut deltas,
+                            &request,
+                        )
+                    };
+                    let bytes = encode_to_vec(&reply, conn.proto);
+                    if stream.write_all(&bytes).await.is_err() {
+                        break 'outer;
+                    }
+                    buf.drain(..consumed);
+                    if conn.should_close {
+                        break 'outer;
+                    }
+                }
+                DecodeOutcome::Incomplete => break,
+                DecodeOutcome::Error(e) => {
+                    let bytes = encode_to_vec(&ironcache_server::Value::Error(e), conn.proto);
+                    let _ = stream.write_all(&bytes).await;
+                    break 'outer;
+                }
+            }
+        }
+        let mut tmp = [0u8; 4096];
+        match stream.read(&mut tmp).await {
+            Ok(0) | Err(_) => break 'outer,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    // Connection-close watch deregistration (PR-10b), mirroring serve.rs teardown.
+    if !conn.watch.is_empty() {
+        store.borrow_mut().unwatch(&conn.watch);
+        conn.clear_watch();
+    }
+}
+
+// A socket round-trip over WATCH/MULTI/EXEC: the happy (CAS pass) path on one connection,
+// then a genuine cross-connection CAS ABORT where a SECOND connection writes the watched
+// key (on the SAME shared store) while the first holds an open WATCH+MULTI. Linear
+// write/expect pairs, so the length is inherent.
+#[allow(clippy::too_many_lines)]
+#[test]
+fn watch_multi_exec_over_real_socket() {
+    use tokio::io::AsyncWriteExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        // ONE shared store backs ALL connections (single-shard-per-connection).
+        let store: SharedStore = Rc::new(RefCell::new(ShardStore::with_hooks(
+            server_ctx.databases,
+            Policy::cache_default(),
+            CountingAccounting::new(),
+        )));
+        let store_for_acceptor = Rc::clone(&store);
+        // Accept the watcher (c1) and the external writer (c2) concurrently on the
+        // LocalSet, each served against the shared store. We drive them interleaved from
+        // the test so c2's write lands between c1's WATCH and c1's EXEC.
+        let acceptor = tokio::task::spawn_local(async move {
+            let (s1, _) = listener.accept().await.unwrap();
+            let _ = s1.set_nodelay(true);
+            let store_a = Rc::clone(&store_for_acceptor);
+            let ctx_a = server_ctx.clone();
+            let h1 = tokio::task::spawn_local(async move {
+                serve_one_shared(s1, ctx_a, store_a).await;
+            });
+            let (s2, _) = listener.accept().await.unwrap();
+            let _ = s2.set_nodelay(true);
+            let store_b = Rc::clone(&store_for_acceptor);
+            let ctx_b = server_ctx.clone();
+            let h2 = tokio::task::spawn_local(async move {
+                serve_one_shared(s2, ctx_b, store_b).await;
+            });
+            h1.await.unwrap();
+            h2.await.unwrap();
+        });
+
+        // -- Part 1: the WATCH/MULTI/EXEC happy path (CAS passes) on connection 1. --
+        let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c1.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut c1, b"+OK\r\n").await;
+        c1.write_all(b"*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut c1, b"+OK\r\n").await;
+        c1.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut c1, b"+OK\r\n").await;
+        c1.write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut c1, b"+QUEUED\r\n").await;
+        c1.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(&mut c1, b"*1\r\n:2\r\n").await; // CAS passed, INCR ran
+        c1.write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut c1, b"$1\r\n2\r\n").await;
+
+        // -- Part 2: cross-connection CAS ABORT. c1 WATCHes k again and opens MULTI; the
+        // external writer c2 SETs k; c1's EXEC then aborts with a null array. --
+        let mut c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c1.write_all(b"*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut c1, b"+OK\r\n").await;
+        c1.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut c1, b"+OK\r\n").await;
+        c1.write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut c1, b"+QUEUED\r\n").await;
+        // c2 (a different connection on the SAME shard) modifies the watched key.
+        c2.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\n99\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut c2, b"+OK\r\n").await;
+        // c1's EXEC now aborts: a null array (RESP2 *-1), nothing applied.
+        c1.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(&mut c1, b"*-1\r\n").await;
+        // k is c2's value, not an incremented one.
+        c1.write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut c1, b"$2\r\n99\r\n").await;
+
+        // Close both connections (c1's close path also exercises the watch teardown).
+        c1.write_all(b"*1\r\n$4\r\nQUIT\r\n").await.unwrap();
+        expect_reply(&mut c1, b"+OK\r\n").await;
+        c2.write_all(b"*1\r\n$4\r\nQUIT\r\n").await.unwrap();
+        expect_reply(&mut c2, b"+OK\r\n").await;
+        drop(c1);
+        drop(c2);
         acceptor.await.unwrap();
     });
 }

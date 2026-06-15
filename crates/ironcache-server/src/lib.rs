@@ -54,5 +54,7 @@ pub use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, Request, Value
 // the `now` basis. The binary depends on ironcache-storage transitively through
 // here for the trait, and on ironcache-store directly for the concrete impl. `Admit`
 // is the PR-3a admission surface dispatch bounds on (evict-to-fit + policy queries);
-// `ActiveExpiry` is the PR-3b active-drain surface (reap_if_expired).
-pub use ironcache_storage::{ActiveExpiry, Admit, Store, UnixMillis};
+// `ActiveExpiry` is the PR-3b active-drain surface (reap_if_expired). `Watch` is the
+// PR-10b WATCH optimistic-lock surface (watch_snapshot/watch_is_dirty/unwatch) dispatch
+// bounds on; `WatchEntry` is the per-key snapshot the connection holds.
+pub use ironcache_storage::{ActiveExpiry, Admit, Store, UnixMillis, Watch, WatchEntry};

@@ -22,7 +22,7 @@ use ironcache_observe::{
     CounterDeltas, CounterSnapshot, EffectiveMemoryConfig, MemoryInfo, ServerInfo, build_info,
 };
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
-use ironcache_storage::{ActiveExpiry, Admit, Keyspace, PolicySwap, Store, UnixMillis};
+use ironcache_storage::{ActiveExpiry, Admit, Keyspace, PolicySwap, Store, UnixMillis, Watch};
 use std::sync::Arc;
 
 /// The bounded number of expired keys the active timing-wheel drain reclaims per
@@ -268,7 +268,7 @@ fn maybe_hot_swap_policy<E: Env, S: PolicySwap>(
 /// because Redis evaluates `denyoom` per command at EXEC time (a queued over-budget
 /// write becomes an `-OOM` element in the array, no rollback).
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
+pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap + Watch>(
     ctx: &ServerContext,
     state: &mut ConnState,
     env: &mut E,
@@ -317,13 +317,19 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
     //     queue-time error (unknown command / wrong arity), reply the error NOW and
     //     mark the transaction dirty, so EXEC returns -EXECABORT and applies nothing.
     //   - otherwise stage a CLONE of the request and reply +QUEUED.
-    // The control commands fall through to their arms in `dispatch_inner`. WATCH/UNWATCH
-    // arrive in PR-10b; until then they are not in the pass-through set, so inside MULTI
-    // they queue-validate as unknown commands (faithful: they are not implemented yet).
+    // The control commands fall through to their arms in `dispatch_inner`.
+    //
+    // WATCH (PR-10b) is SPECIAL: WATCH inside MULTI is rejected with `-ERR WATCH inside
+    // MULTI is not allowed` and must NOT dirty the transaction (the txn stays open +
+    // clean, so a following EXEC still runs). So WATCH is added to the queue-gate
+    // exclusion set here (it does not queue) and its `dispatch_inner` arm returns the
+    // error when `in_multi`. UNWATCH, by contrast, is a NORMAL command inside MULTI: it
+    // QUEUES like any other (it is NOT in the exclusion set) and runs at EXEC (a no-op
+    // there, since the dirty-CAS already ran + cleared the watches at EXEC entry).
     if state.in_multi
         && !matches!(
             cmd.as_slice(),
-            b"MULTI" | b"EXEC" | b"DISCARD" | b"RESET" | b"QUIT"
+            b"MULTI" | b"EXEC" | b"DISCARD" | b"RESET" | b"QUIT" | b"WATCH"
         )
     {
         return match cmd_txn::queue_validate(&cmd, &req.args) {
@@ -353,7 +359,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>
 /// as commands land. The big-match shape is the intended structure, so the line-count
 /// lint is allowed here alongside the arg-count one.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
+fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap + Watch>(
     ctx: &ServerContext,
     state: &mut ConnState,
     env: &mut E,
@@ -420,12 +426,20 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
             Value::ok()
         }
         b"RESET" => {
+            // RESET clears any WATCH set too (TRANSACTIONS.md, PR-10b): deregister the
+            // watches from the store FIRST (the store holds the per-key watcher counts),
+            // then clear the connection-side list, then run the rest of the reset (which
+            // also aborts an open MULTI via clear_txn).
+            store.unwatch(&state.watch);
+            state.clear_watch();
             state.reset(ctx.requires_auth());
             Value::SimpleString("RESET".to_owned())
         }
-        // -- Transaction control: MULTI/EXEC/DISCARD (TRANSACTIONS.md, PR-10a). These
-        // reach `dispatch_inner` only as direct client commands (the queue gate in
-        // `dispatch` excludes them from queueing). WATCH/UNWATCH are PR-10b. --
+        // -- Transaction control: MULTI/EXEC/DISCARD (PR-10a) + WATCH/UNWATCH (PR-10b),
+        // TRANSACTIONS.md. These reach `dispatch_inner` only as direct client commands
+        // (the queue gate in `dispatch` excludes MULTI/EXEC/DISCARD/RESET/QUIT/WATCH from
+        // queueing); UNWATCH is a normal queued command inside MULTI and reaches here
+        // either directly (outside MULTI) or replayed by EXEC. --
         b"MULTI" => {
             // MULTI takes exactly the command token. A wrong-arity MULTI issued INSIDE a
             // transaction DIRTIES it (Redis runs commandCheckArity BEFORE the MULTI queue
@@ -459,10 +473,16 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
             if !state.in_multi {
                 return Value::error(ErrorReply::discard_without_multi());
             }
-            // Drop the queue + leave transaction state, applying nothing.
+            // Drop the queue + leave transaction state, applying nothing. DISCARD also
+            // clears the WATCH set (TRANSACTIONS.md, PR-10b): deregister from the store,
+            // then clear the connection-side list, then drop the queue (clear_txn).
+            store.unwatch(&state.watch);
+            state.clear_watch();
             state.clear_txn();
             Value::ok()
         }
+        b"WATCH" => cmd_watch(state, store, now, req),
+        b"UNWATCH" => cmd_unwatch(state, store, req),
         b"EXEC" => exec_transaction(ctx, state, env, store, wheel, now, rollup, mem, deltas, req),
         b"CLIENT" => cmd_client(state, req),
         b"COMMAND" => cmd_command(req),
@@ -693,6 +713,62 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
     }
 }
 
+/// `WATCH key [key ...]` (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Marks each key
+/// watched on the connection's accept shard: per key, [`Watch::watch_snapshot`] records
+/// the key's current version + present/absent status into a [`WatchEntry`] pushed onto
+/// `state.watch`. Replies `+OK`.
+///
+/// WATCH inside MULTI is rejected with `-ERR WATCH inside MULTI is not allowed` WITHOUT
+/// dirtying the transaction (the txn stays open + clean, so a following EXEC still runs):
+/// the queue gate excludes WATCH from queueing, and this arm returns the error when
+/// `in_multi`. WATCH is arity -2 (the command token + at least one key); the queue-gate
+/// arity table holds the same value, but WATCH outside MULTI is validated here too (the
+/// gate only runs inside MULTI), so check it explicitly.
+///
+/// SINGLE-SHARD-PER-CONNECTION (PR-10b scope): every watched key is registered on this
+/// connection's accept shard `store`; a watched key on a different shard is out of scope
+/// (cross-shard EXEC, COORDINATOR.md #29).
+fn cmd_watch<S: Store + Watch>(
+    state: &mut ConnState,
+    store: &mut S,
+    now: UnixMillis,
+    req: &Request,
+) -> Value {
+    // WATCH inside MULTI: error, txn left OPEN + CLEAN (no dirty_exec). Checked before
+    // arity so it matches Redis's order (watchCommand rejects in-MULTI first).
+    if state.in_multi {
+        return Value::error(ErrorReply::watch_inside_multi());
+    }
+    // Arity -2: command token + >= 1 key.
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("watch"));
+    }
+    let db = state.db;
+    for key in &req.args[1..] {
+        let entry = store.watch_snapshot(db, key, now);
+        state.watch.push(entry);
+    }
+    Value::ok()
+}
+
+/// `UNWATCH` (TRANSACTIONS.md, PR-10b). Flushes the connection's watch set: deregister
+/// every snapshot from the store ([`Watch::unwatch`]), then clear the connection-side
+/// list. Always replies `+OK` (UNWATCH never errors; an empty watch set is a clean
+/// no-op). Arity is exactly 1.
+///
+/// UNWATCH is a NORMAL command (NOT control-flow): inside MULTI it QUEUES like any other
+/// and is REPLAYED at EXEC, where it runs as a no-op-ish (the dirty-CAS already cleared
+/// the watches at EXEC entry, so `state.watch` is already empty). Outside MULTI it runs
+/// here directly. Either way it just clears whatever watch set is present.
+fn cmd_unwatch<S: Watch>(state: &mut ConnState, store: &mut S, req: &Request) -> Value {
+    if req.args.len() != 1 {
+        return Value::error(ErrorReply::wrong_arity("unwatch"));
+    }
+    store.unwatch(&state.watch);
+    state.clear_watch();
+    Value::ok()
+}
+
 /// Run `EXEC` (TRANSACTIONS.md "queue then apply", PR-10a). Decides the three Redis
 /// outcomes and, on the apply path, REPLAYS each queued command against the SAME
 /// already-borrowed store/wheel/env by calling [`dispatch_inner`] per command (the
@@ -709,7 +785,7 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
 /// once for this EXEC command, so a replay reaps/expires identically; no per-queued-
 /// command clock read. Exiting the transaction clears the queue in all three branches.
 #[allow(clippy::too_many_arguments)]
-fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap>(
+fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap + Watch>(
     ctx: &ServerContext,
     state: &mut ConnState,
     env: &mut E,
@@ -737,10 +813,35 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
     }
     if state.dirty_exec {
         // A queue-time error dirtied the batch: refuse the whole thing and apply
-        // nothing (clear_txn drops the queue + exits MULTI).
+        // nothing (clear_txn drops the queue + exits MULTI). EXEC clears the WATCH set on
+        // EVERY exit path (TRANSACTIONS.md, PR-10b), the EXECABORT path included:
+        // deregister the watches from the store, then clear the connection-side list.
+        store.unwatch(&state.watch);
+        state.clear_watch();
         state.clear_txn();
         return Value::error(ErrorReply::exec_abort());
     }
+    // WATCH dirty-CAS check (TRANSACTIONS.md per-key dirty-CAS, PR-10b), BEFORE running
+    // the batch. If ANY watched key was modified between WATCH and now (its version moved,
+    // or its present/absent status changed), the optimistic lock failed: EXEC ABORTS,
+    // returning a NULL ARRAY (`Value::Array(None)`, which the encoder renders as RESP2
+    // `*-1` / RESP3 `_`) and applying NOTHING. NOTE this is the null ARRAY, not the null
+    // bulk (`Value::Null` -> RESP2 `$-1`): Redis's abort reply is `addReply(c,
+    // shared.nullarray[...])` (src/multi.c execCommand). The watches are deregistered +
+    // cleared (EXEC always clears watches) and the transaction exits. The check is
+    // O(watched keys), each a version compare + a present/absent probe.
+    if state.watch.iter().any(|e| store.watch_is_dirty(e, now)) {
+        store.unwatch(&state.watch);
+        state.clear_watch();
+        state.clear_txn();
+        return Value::Array(None);
+    }
+    // The CAS passed: the watches have served their purpose. Deregister + clear them
+    // BEFORE running the batch (EXEC clears the watch set on the run path too), so the
+    // batch's own writes do not re-trigger a watch and a queued UNWATCH at EXEC is a
+    // clean no-op against an already-empty set.
+    store.unwatch(&state.watch);
+    state.clear_watch();
     // Take the queue OUT of `state` so we can pass `&mut state` to `dispatch_inner` per
     // command without aliasing `state.queued`. Exit the transaction NOW (before running)
     // so a queued RESET/MULTI/etc. sees a clean post-EXEC connection state, matching
@@ -5792,5 +5893,376 @@ mod tests {
         assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"QUIT"]), Value::ok());
         assert!(s.should_close);
         assert_eq!(s.queued.len(), 1, "QUIT was not queued");
+    }
+
+    // -- WATCH/UNWATCH optimistic-lock dirty-CAS (TRANSACTIONS.md, PR-10b). These drive
+    // dispatch over a PERSISTENT store via run_on; the cross-connection tests drive two
+    // ConnStates against the SAME store (the per-key version slots are shared on the one
+    // accept shard, single-shard-per-connection). --
+
+    #[test]
+    fn cas_abort_same_connection_modifies_then_exec_is_null() {
+        // WATCH k; SET k v (same connection, before MULTI); MULTI; INCR k; EXEC -> Null;
+        // nothing applied (the optimistic lock saw k change between WATCH and EXEC).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"k"]),
+            Value::ok()
+        );
+        // Modify the watched key (a plain SET runs now, it is not in MULTI).
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"2"]);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"INCR", b"k"]),
+            Value::simple("QUEUED")
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXEC"]),
+            Value::Array(None),
+            "a dirtied watch makes EXEC return the null array"
+        );
+        assert!(!s.in_multi);
+        assert!(s.watch.is_empty(), "EXEC cleared the watch set");
+        // The INCR did NOT apply: k is still "2" (from the modification), not 3.
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), bulk(b"2"));
+    }
+
+    #[test]
+    fn cas_pass_unmodified_then_exec_runs() {
+        // WATCH k; (no modification); MULTI; INCR k; EXEC -> runs; k incremented.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"k"]),
+            Value::ok()
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"k"]);
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], Value::Integer(2));
+            }
+            other => panic!("EXEC -> {other:?}"),
+        }
+        assert!(s.watch.is_empty(), "EXEC cleared the watch set");
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), bulk(b"2"));
+    }
+
+    #[test]
+    fn cas_abort_cross_connection() {
+        // conn1 WATCH k; conn2 SET k v (on the SAME store); conn1 MULTI; INCR k; EXEC ->
+        // Null. Two connections, one shared accept shard (single-shard-per-connection).
+        let c = ctx(None);
+        let mut s1 = state(&c);
+        let mut s2 = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let _ = run_on(&c, &mut s1, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s1, &mut st, t, &[b"WATCH", b"k"]),
+            Value::ok()
+        );
+        // conn2 modifies the watched key.
+        let _ = run_on(&c, &mut s2, &mut st, t, &[b"SET", b"k", b"99"]);
+        assert_eq!(run_on(&c, &mut s1, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s1, &mut st, t, &[b"INCR", b"k"]);
+        assert_eq!(
+            run_on(&c, &mut s1, &mut st, t, &[b"EXEC"]),
+            Value::Array(None),
+            "another connection's write on the same shard aborts the watcher's EXEC"
+        );
+        assert_eq!(
+            run_on(&c, &mut s1, &mut st, t, &[b"GET", b"k"]),
+            bulk(b"99")
+        );
+    }
+
+    #[test]
+    fn unwatch_cancels_the_watch() {
+        // WATCH k; UNWATCH; modify k; MULTI; INCR k; EXEC -> runs (the watch was canceled
+        // so the later modification does not abort).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"k"]),
+            Value::ok()
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"UNWATCH"]), Value::ok());
+        assert!(s.watch.is_empty(), "UNWATCH cleared the watch set");
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"5"]);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"k"]);
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => assert_eq!(items[0], Value::Integer(6)),
+            other => panic!("EXEC -> {other:?}"),
+        }
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), bulk(b"6"));
+    }
+
+    #[test]
+    fn watch_inside_multi_errors_without_dirtying() {
+        // MULTI; WATCH k -> the error, txn stays OPEN + CLEAN; a following SET queues; EXEC
+        // runs (NOT EXECABORT: WATCH-inside-MULTI does not dirty the batch).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"k"])),
+            "-ERR WATCH inside MULTI is not allowed"
+        );
+        // The txn is intact: still in MULTI, NOT dirty, watch set empty (WATCH did not run).
+        assert!(s.in_multi);
+        assert!(!s.dirty_exec, "WATCH inside MULTI does not dirty the batch");
+        assert!(s.watch.is_empty());
+        // A following command still queues, and EXEC runs cleanly.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"7"]),
+            Value::simple("QUEUED")
+        );
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], Value::ok());
+            }
+            other => panic!("EXEC after WATCH-inside-MULTI -> {other:?}"),
+        }
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]), bulk(b"7"));
+    }
+
+    #[test]
+    fn unwatch_inside_multi_queues_and_runs_at_exec() {
+        // UNWATCH inside MULTI is a NORMAL command: it QUEUES (+QUEUED) and runs at EXEC
+        // (as a +OK element). It is NOT control-flow (unlike WATCH).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"UNWATCH"]),
+            Value::simple("QUEUED"),
+            "UNWATCH queues inside MULTI"
+        );
+        assert_eq!(s.queued.len(), 1);
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], Value::ok(), "the queued UNWATCH ran as +OK");
+            }
+            other => panic!("EXEC -> {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_op_write_dirties_the_watch_through_dispatch() {
+        // SADD s a; WATCH s; SADD s a (already a member -> no value change); MULTI; INCR x;
+        // EXEC -> Null (the no-op write still bumped the version through dispatch).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SADD", b"s", b"a"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"s"]),
+            Value::ok()
+        );
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SADD", b"s", b"a"]); // no-op
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"x"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXEC"]),
+            Value::Array(None)
+        );
+    }
+
+    #[test]
+    fn watched_key_expiry_dirties_through_dispatch() {
+        // SET k v EX (a short TTL via PEXPIRE); WATCH k; advance `now` past the deadline so
+        // the lazy reap fires inside the EXEC CAS check; MULTI; INCR k; EXEC -> Null.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let mut wheel = TimingWheel::new();
+        let t0 = UnixMillis(0);
+        let _ = run_on_wheel(&c, &mut s, &mut st, &mut wheel, t0, &[b"SET", b"k", b"1"]);
+        // Set a deadline at t=10 (PEXPIRE 10 against now=0).
+        let _ = run_on_wheel(
+            &c,
+            &mut s,
+            &mut st,
+            &mut wheel,
+            t0,
+            &[b"PEXPIRE", b"k", b"10"],
+        );
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, t0, &[b"WATCH", b"k"]),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, t0, &[b"MULTI"]),
+            Value::ok()
+        );
+        let _ = run_on_wheel(&c, &mut s, &mut st, &mut wheel, t0, &[b"INCR", b"k"]);
+        // EXEC at t=100 (past the deadline): the watched key has expired -> Null.
+        let t_late = UnixMillis(100);
+        assert_eq!(
+            run_on_wheel(&c, &mut s, &mut st, &mut wheel, t_late, &[b"EXEC"]),
+            Value::Array(None),
+            "an expiry of the watched key aborts EXEC"
+        );
+    }
+
+    #[test]
+    fn already_absent_watch_stays_clean_through_dispatch() {
+        // WATCH missing; (stays missing); MULTI; SET other v; EXEC -> runs.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"missing"]),
+            Value::ok()
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"other", b"v"]);
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => assert_eq!(items[0], Value::ok()),
+            other => panic!("EXEC -> {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watched_absent_then_created_aborts_through_dispatch() {
+        // WATCH missing; SET missing v; MULTI; INCR x; EXEC -> Null.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"missing"]),
+            Value::ok()
+        );
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"missing", b"v"]);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"x"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXEC"]),
+            Value::Array(None)
+        );
+    }
+
+    #[test]
+    fn flushdb_dirties_a_watch_through_dispatch() {
+        // SET k v; WATCH k; FLUSHDB; MULTI; SET k 2; EXEC -> Null.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"k"]),
+            Value::ok()
+        );
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"FLUSHDB"]);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"2"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXEC"]),
+            Value::Array(None)
+        );
+    }
+
+    #[test]
+    fn discard_clears_the_watch_set() {
+        // WATCH k; MULTI; DISCARD -> the watch set is cleared (a later modification +
+        // MULTI/EXEC runs, the watch was dropped by DISCARD).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"k"]),
+            Value::ok()
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"DISCARD"]), Value::ok());
+        assert!(s.watch.is_empty(), "DISCARD cleared the watch set");
+        // The watch is gone: a modification then MULTI/EXEC runs.
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"9"]);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"k"]);
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => assert_eq!(items[0], Value::Integer(10)),
+            other => panic!("EXEC -> {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_clears_the_watch_set() {
+        // WATCH k; RESET -> the watch set is cleared (and the store deregistered, so a
+        // later modification + MULTI/EXEC runs).
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"k"]),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"RESET"]),
+            Value::SimpleString("RESET".to_owned())
+        );
+        assert!(s.watch.is_empty(), "RESET cleared the watch set");
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"4"]);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"k"]);
+        match run_on(&c, &mut s, &mut st, t, &[b"EXEC"]) {
+            Value::Array(Some(items)) => assert_eq!(items[0], Value::Integer(5)),
+            other => panic!("EXEC -> {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_arity_and_multi_key() {
+        // WATCH with no key -> arity error; WATCH of several keys, any one dirtied aborts.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"WATCH"])),
+            "-ERR wrong number of arguments for 'watch' command"
+        );
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"a", b"1"]);
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"1"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"WATCH", b"a", b"b"]),
+            Value::ok()
+        );
+        assert_eq!(s.watch.len(), 2, "both keys snapshotted");
+        // Modify the SECOND watched key only -> EXEC still aborts.
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"b", b"2"]);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"MULTI"]), Value::ok());
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"INCR", b"a"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXEC"]),
+            Value::Array(None)
+        );
     }
 }

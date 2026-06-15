@@ -131,6 +131,13 @@ fn arity_of(cmd: &[u8]) -> Option<Arity> {
         b"MULTI" => Exact(1),
         b"EXEC" => Exact(1),
         b"DISCARD" => Exact(1),
+        // WATCH is -2 in src/commands.def (token + >= 1 key); UNWATCH is exactly 1.
+        // WATCH never actually reaches queue_validate (the queue gate excludes it from
+        // queueing, like MULTI/EXEC/DISCARD), but the table claims the canonical Redis
+        // values + the cross-check below requires an entry per dispatch arm, so keep it.
+        // UNWATCH DOES reach queue_validate (it queues inside MULTI as a normal command).
+        b"WATCH" => Min(2),
+        b"UNWATCH" => Exact(1),
         // -- Strings (cmd_string). --
         b"GET" => Exact(2),
         b"SET" => Min(3),
@@ -288,6 +295,12 @@ mod tests {
         assert!(queue_validate(b"SET", &args(&[b"SET", b"k", b"v", b"EX", b"5"])).is_ok());
         assert!(queue_validate(b"INCR", &args(&[b"INCR", b"k"])).is_ok());
         assert!(queue_validate(b"MULTI", &args(&[b"MULTI"])).is_ok());
+        // WATCH is -2 (token + >= 1 key); UNWATCH is exactly 1 (PR-10b).
+        assert!(queue_validate(b"WATCH", &args(&[b"WATCH", b"k"])).is_ok());
+        assert!(queue_validate(b"WATCH", &args(&[b"WATCH", b"k1", b"k2"])).is_ok());
+        assert!(queue_validate(b"WATCH", &args(&[b"WATCH"])).is_err()); // no key -> arity
+        assert!(queue_validate(b"UNWATCH", &args(&[b"UNWATCH"])).is_ok());
+        assert!(queue_validate(b"UNWATCH", &args(&[b"UNWATCH", b"x"])).is_err()); // exact 1
         assert!(queue_validate(b"PING", &args(&[b"PING"])).is_ok());
         assert!(queue_validate(b"PING", &args(&[b"PING", b"msg"])).is_ok());
         assert!(queue_validate(b"MSET".as_slice(), &args(&[b"MSET"])).is_err()); // MSET not impl -> unknown
@@ -359,6 +372,8 @@ mod tests {
             b"MULTI",
             b"EXEC",
             b"DISCARD",
+            b"WATCH",
+            b"UNWATCH",
             // Strings
             b"GET",
             b"SET",
@@ -517,6 +532,8 @@ mod tests {
             b"MULTI",
             b"EXEC",
             b"DISCARD",
+            b"WATCH",
+            b"UNWATCH",
             // Strings
             b"GET",
             b"SET",

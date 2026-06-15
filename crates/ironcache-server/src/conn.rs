@@ -7,6 +7,7 @@
 //! client name, the authenticated flag, and the per-connection client id.
 
 use ironcache_protocol::{ProtoVersion, Request};
+use ironcache_storage::WatchEntry;
 
 /// The mutable state of a single client connection.
 ///
@@ -46,8 +47,21 @@ pub struct ConnState {
     /// table-arity error) has dirtied the transaction. When `true`, `EXEC` refuses the
     /// whole batch with `-EXECABORT` and applies nothing, faithful to Redis
     /// (TRANSACTIONS.md "queue-time command errors abort the whole batch"). WATCH's
-    /// dirty-CAS abort is a SEPARATE mechanism deferred to PR-10b.
+    /// dirty-CAS abort is a SEPARATE mechanism (the `watch` snapshot list below, PR-10b):
+    /// it makes EXEC return a null array, NOT EXECABORT, and does not set this flag.
     pub dirty_exec: bool,
+    /// The WATCHed-key snapshots for this connection (TRANSACTIONS.md per-key dirty-CAS,
+    /// PR-10b). Each [`WatchEntry`] is the version + present/absent snapshot taken at
+    /// `WATCH` time on the connection's accept shard. At `EXEC` the dispatcher
+    /// revalidates every entry against the store: if any is dirty, EXEC returns a null
+    /// array and applies nothing. The list is cleared (and the store deregistered via
+    /// `Watch::unwatch`) by `EXEC` (every exit path), `UNWATCH`, `DISCARD`, `RESET`, and
+    /// a connection close. Empty unless the connection has an active WATCH set.
+    ///
+    /// SINGLE-SHARD-PER-CONNECTION (PR-10b scope): every entry's `db`+`key` lives on this
+    /// connection's accept shard, so revalidation + apply run on one owning core; a
+    /// watched key on another shard (cross-shard EXEC) is out of scope (COORDINATOR.md).
+    pub watch: Vec<WatchEntry>,
 }
 
 impl ConnState {
@@ -76,6 +90,7 @@ impl ConnState {
             in_multi: false,
             queued: Vec::new(),
             dirty_exec: false,
+            watch: Vec::new(),
         }
     }
 
@@ -109,5 +124,15 @@ impl ConnState {
         self.in_multi = false;
         self.queued.clear();
         self.dirty_exec = false;
+    }
+
+    /// Clear the WATCH snapshot list (TRANSACTIONS.md, PR-10b). This drops the
+    /// connection-side snapshots ONLY; the dispatcher must deregister them from the store
+    /// FIRST via `Watch::unwatch(&state.watch)` (the store holds the per-key watcher
+    /// counts, which `ConnState` cannot reach), then call this. Invoked by `EXEC` (every
+    /// exit path), `UNWATCH`, `DISCARD`, `RESET`, and a connection close, so a stale watch
+    /// never lingers on either side.
+    pub fn clear_watch(&mut self) {
+        self.watch.clear();
     }
 }
