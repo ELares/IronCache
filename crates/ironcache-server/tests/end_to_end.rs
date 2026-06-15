@@ -1090,6 +1090,166 @@ fn zset_commands_over_real_socket() {
     });
 }
 
+// A socket round-trip over the full transaction surface (MULTI/EXEC/DISCARD + the
+// EXECABORT dirty path + the no-rollback runtime-error element + empty MULTI;EXEC + the
+// control-verb-dirties case) is inherently long; the steps are linear write/expect pairs.
+#[allow(clippy::too_many_lines)]
+#[test]
+fn transactions_over_real_socket() {
+    use tokio::io::AsyncWriteExt;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // MULTI -> +OK.
+        client.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        // SET k 1 -> +QUEUED (a simple string).
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+QUEUED\r\n").await;
+        // INCR k -> +QUEUED.
+        client
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+QUEUED\r\n").await;
+        // EXEC -> the per-command reply array: *2 then +OK then :2.
+        client.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(&mut client, b"*2\r\n+OK\r\n:2\r\n").await;
+        // The batch applied: GET k -> "2".
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$1\r\n2\r\n").await;
+
+        // DISCARD path: MULTI, queue a write, DISCARD, confirm it did not apply.
+        client.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nd\r\n$1\r\n9\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+QUEUED\r\n").await;
+        client.write_all(b"*1\r\n$7\r\nDISCARD\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        // GET d -> null bulk (the discarded SET never applied).
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nd\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$-1\r\n").await;
+
+        // EXEC without MULTI -> the control error.
+        client.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(&mut client, b"-ERR EXEC without MULTI\r\n").await;
+
+        // (a) EXECABORT dirty path: queue an UNKNOWN command inside MULTI (the queue-time
+        // error is reported now + dirties the txn), then EXEC -> the byte-exact EXECABORT.
+        client.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        // FROBNICATE a -> the unknown-command error reported now (txn dirtied).
+        client
+            .write_all(b"*2\r\n$10\r\nFROBNICATE\r\n$1\r\na\r\n")
+            .await
+            .unwrap();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut ebuf = [0u8; 128];
+            let en = client.read(&mut ebuf).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&ebuf[..en])
+                    .starts_with("-ERR unknown command 'FROBNICATE'"),
+                "got {:?}",
+                String::from_utf8_lossy(&ebuf[..en])
+            );
+        }
+        client.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(
+            &mut client,
+            b"-EXECABORT Transaction discarded because of previous errors.\r\n",
+        )
+        .await;
+
+        // (b) No-rollback runtime-error element: SET s hello; MULTI; INCR s (fails at run
+        // time); SET s2 ok (must still apply); EXEC -> a *2 array whose first element is
+        // the not-an-integer -ERR and whose second is +OK; then GET s2 -> "ok".
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\ns\r\n$5\r\nhello\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*2\r\n$4\r\nINCR\r\n$1\r\ns\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+QUEUED\r\n").await;
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$2\r\ns2\r\n$2\r\nok\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+QUEUED\r\n").await;
+        client.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(
+            &mut client,
+            b"*2\r\n-ERR value is not an integer or out of range\r\n+OK\r\n",
+        )
+        .await;
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$2\r\ns2\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$2\r\nok\r\n").await;
+
+        // (c) Empty MULTI;EXEC -> the empty array *0.
+        client.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(&mut client, b"*0\r\n").await;
+
+        // (d) Control-verb-dirties (fix 1): MULTI; EXEC x (wrong arity dirties the open
+        // txn); EXEC -> EXECABORT. The bad-arity EXEC replies its arity error first.
+        client.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*2\r\n$4\r\nEXEC\r\n$1\r\nx\r\n")
+            .await
+            .unwrap();
+        expect_reply(
+            &mut client,
+            b"-ERR wrong number of arguments for 'exec' command\r\n",
+        )
+        .await;
+        client.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+        expect_reply(
+            &mut client,
+            b"-EXECABORT Transaction discarded because of previous errors.\r\n",
+        )
+        .await;
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
 #[test]
 fn bitmap_commands_over_real_socket() {
     use tokio::io::AsyncWriteExt;

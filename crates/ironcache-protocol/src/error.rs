@@ -208,6 +208,35 @@ impl ErrorReply {
         )
     }
 
+    /// `ERR EXEC without MULTI` - the reply Redis emits (src/multi.c `execCommand`
+    /// -> `addReplyError(c,"EXEC without MULTI")`) when EXEC is issued while the
+    /// connection is NOT inside a transaction. Byte-exact (the plain `ERR` token, no
+    /// trailing period). Clients use it to detect a stray EXEC.
+    #[must_use]
+    pub fn exec_without_multi() -> Self {
+        ErrorReply::new(ErrorCode::Err, "EXEC without MULTI")
+    }
+
+    /// `ERR DISCARD without MULTI` - the reply Redis emits (src/multi.c
+    /// `discardCommand` -> `addReplyError(c,"DISCARD without MULTI")`) when DISCARD is
+    /// issued while the connection is NOT inside a transaction. Byte-exact (the plain
+    /// `ERR` token, no trailing period). The DISCARD analog of
+    /// [`Self::exec_without_multi`].
+    #[must_use]
+    pub fn discard_without_multi() -> Self {
+        ErrorReply::new(ErrorCode::Err, "DISCARD without MULTI")
+    }
+
+    /// `ERR MULTI calls can not be nested` - the reply Redis emits (src/multi.c
+    /// `multiCommand` -> `addReplyError(c,"MULTI calls can not be nested")`) when MULTI
+    /// is issued while the connection is ALREADY inside a transaction. Byte-exact (note
+    /// the two-word "can not", matching Redis verbatim). The transaction state and queue
+    /// are left unchanged; the connection stays in MULTI.
+    #[must_use]
+    pub fn multi_nested() -> Self {
+        ErrorReply::new(ErrorCode::Err, "MULTI calls can not be nested")
+    }
+
     /// `ERR AUTH <password> called without any password configured for the
     /// default user. Are you sure your configuration is correct?` - the current
     /// canonical Redis string for `AUTH` when no `requirepass`/ACL password is
@@ -801,6 +830,29 @@ mod tests {
             ErrorReply::auth_no_password_set().line(),
             "-ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"
         );
+    }
+
+    #[test]
+    fn transaction_control_strings_are_byte_exact() {
+        // Verified against redis/redis src/multi.c: the stray-EXEC, stray-DISCARD, and
+        // nested-MULTI control errors. All use the plain `ERR` token (NOT EXECABORT,
+        // which is the dirtied-batch reply tested above). Note "can not" is two words,
+        // matching Redis verbatim.
+        assert_eq!(
+            ErrorReply::exec_without_multi().line(),
+            "-ERR EXEC without MULTI"
+        );
+        assert_eq!(
+            ErrorReply::discard_without_multi().line(),
+            "-ERR DISCARD without MULTI"
+        );
+        assert_eq!(
+            ErrorReply::multi_nested().line(),
+            "-ERR MULTI calls can not be nested"
+        );
+        assert_eq!(ErrorReply::exec_without_multi().code(), ErrorCode::Err);
+        assert_eq!(ErrorReply::discard_without_multi().code(), ErrorCode::Err);
+        assert_eq!(ErrorReply::multi_nested().code(), ErrorCode::Err);
     }
 
     #[test]
