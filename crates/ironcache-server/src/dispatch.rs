@@ -3049,9 +3049,13 @@ mod tests {
 
     #[test]
     fn wtinylfu_eviction_preserves_a_hot_key_under_the_ceiling() {
-        // End-to-end W-TinyLFU through the real evict_to_fit flow (PR-3c): a frequently
-        // GET'd key survives eviction under memory pressure while cold keys are evicted
-        // (scan resistance). Configure the `allkeys-lfu` policy (now real W-TinyLFU).
+        // End-to-end W-TinyLFU through the real evict_to_fit flow, demonstrating the
+        // ACTUAL #57 mechanism (the candidate-admission door): a hot resident survives
+        // under memory pressure NOT because it was GET'd (on_access is now a no-op under
+        // #57, so GETs build no frequency), but because each cold SET candidate LOSES the
+        // admission door and self-evicts (stored-then-evicted), sparing the hot key.
+        // Frequency is built on the DECISION PATH only; here the hot key is warmed via
+        // REPEATED SETs (each on_insert is a decision-path bump), not GETs.
         let c = ctx_with_budget(400);
         let mut s = state(&c);
         let mut st = store_with(
@@ -3063,14 +3067,17 @@ mod tests {
         let t = UnixMillis(0);
         let val = vec![b'v'; 100];
 
-        // Plant the hot key and access it many times so the sketch records high frequency.
-        run_admit(&c, &mut s, &mut st, t, &[b"SET", b"hot", &val]);
+        // Warm the hot key via REPEATED SETs: each SET is a decision-path bump
+        // (on_insert min-increments the candidate), so the sketch records a high
+        // frequency for "hot". (A GET loop would be INERT here under #57.) These early
+        // SETs are under the budget, so no eviction yet.
         for _ in 0..20 {
-            run_on(&c, &mut s, &mut st, t, &[b"GET", b"hot"]);
+            run_admit(&c, &mut s, &mut st, t, &[b"SET", b"hot", &val]);
         }
-        // Now stream many cold keys, each written once. Eviction must target the cold
-        // keys (lowest estimated frequency), never the hot key. Tally the evictions so we
-        // can assert eviction actually happened.
+        // Now stream many cold keys, each written once. Each cold SET becomes the pending
+        // admission candidate; when the write pushes the shard over budget, evict_to_fit
+        // runs the door: the cold candidate (estimate ~1) does NOT strictly beat the hot
+        // incumbent, so the COLD candidate self-evicts. The hot key is never the victim.
         let mut total_evicted = 0u64;
         for i in 0u32..15 {
             let (_r, ev) = run_admit(
@@ -3082,21 +3089,22 @@ mod tests {
             );
             total_evicted += ev;
         }
-        // The hot key must still be present (it survived the cold-key flood): scan
-        // resistance, the headline W-TinyLFU property.
+        // The hot key must still be present: it survived because the cold SET candidates
+        // lost the admission door, NOT because it was read. This is the #57 door
+        // mechanism (the SELECTABLE W-TinyLFU variant's scan resistance).
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"GET", b"hot"]),
             Value::BulkString(Some(Bytes::copy_from_slice(&val))),
-            "the frequently-accessed key must survive W-TinyLFU eviction"
+            "the hot resident survives: cold SET candidates lose the door and self-evict"
         );
-        // Eviction actually happened (the budget is small, so the cold flood forced
-        // several evictions). Each was a COLD key, never the hot one (asserted above).
+        // Eviction actually happened (the budget is small, so the cold flood forced the
+        // door to fire). Every victim was a COLD candidate, never the hot incumbent.
         assert!(
             total_evicted > 0,
-            "the cold-key flood must have triggered W-TinyLFU eviction"
+            "the cold-candidate flood must have driven W-TinyLFU door evictions"
         );
         // The keyspace stayed small (bounded by the budget): far fewer than the 16 keys
-        // written, since cold keys were continually evicted to make room.
+        // written, since rejected cold candidates were continually self-evicted.
         assert!(
             st.len() < 8,
             "W-TinyLFU kept the resident set bounded under the ceiling ({} keys)",
