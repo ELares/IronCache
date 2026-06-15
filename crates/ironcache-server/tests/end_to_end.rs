@@ -653,6 +653,123 @@ fn list_commands_over_real_socket() {
 }
 
 #[test]
+fn hash_commands_over_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // HSET h f1 v1 f2 v2 -> :2 (two new fields).
+        client
+            .write_all(
+                b"*6\r\n$4\r\nHSET\r\n$1\r\nh\r\n$2\r\nf1\r\n$2\r\nv1\r\n$2\r\nf2\r\n$2\r\nv2\r\n",
+            )
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":2\r\n").await;
+
+        // TYPE h -> +hash.
+        client
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$1\r\nh\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+hash\r\n").await;
+
+        // HGET h f1 -> $2 v1.
+        client
+            .write_all(b"*3\r\n$4\r\nHGET\r\n$1\r\nh\r\n$2\r\nf1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$2\r\nv1\r\n").await;
+
+        // HGETALL h under RESP2 -> a flat 4-element array (field,value,field,value).
+        client
+            .write_all(b"*2\r\n$7\r\nHGETALL\r\n$1\r\nh\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = client.read(&mut buf).await.unwrap();
+        let body = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            body.starts_with("*4\r\n"),
+            "HGETALL under RESP2 is a flat 4-array, got {body:?}"
+        );
+        assert!(body.contains("v1") && body.contains("v2"), "got {body:?}");
+
+        // OBJECT ENCODING h -> listpack (small).
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\nh\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$8\r\nlistpack\r\n").await;
+
+        // HSET a value over the 64-byte cap -> hashtable encoding.
+        let big = vec![b'q'; 100];
+        let mut frame = format!(
+            "*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$3\r\nbig\r\n${}\r\n",
+            big.len()
+        )
+        .into_bytes();
+        frame.extend_from_slice(&big);
+        frame.extend_from_slice(b"\r\n");
+        client.write_all(&frame).await.unwrap();
+        expect_reply(&mut client, b":1\r\n").await;
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\nh\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$9\r\nhashtable\r\n").await;
+
+        // HDEL h f1 f2 big -> :3 ; the hash is now empty so the key is gone.
+        client
+            .write_all(b"*5\r\n$4\r\nHDEL\r\n$1\r\nh\r\n$2\r\nf1\r\n$2\r\nf2\r\n$3\r\nbig\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+        // EXISTS h -> :0 (empty hash deletes the key).
+        client
+            .write_all(b"*2\r\n$6\r\nEXISTS\r\n$1\r\nh\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+
+        // WRONGTYPE: a hash command on a string key.
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nstr\r\n$1\r\nv\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        client
+            .write_all(b"*4\r\n$4\r\nHSET\r\n$3\r\nstr\r\n$1\r\na\r\n$1\r\nx\r\n")
+            .await
+            .unwrap();
+        let mut wbuf = [0u8; 128];
+        let wn = client.read(&mut wbuf).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&wbuf[..wn]).starts_with("-WRONGTYPE"),
+            "got {:?}",
+            String::from_utf8_lossy(&wbuf[..wn])
+        );
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}
+
+#[test]
 fn unknown_command_error_over_socket() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rt = tokio::runtime::Builder::new_current_thread()
