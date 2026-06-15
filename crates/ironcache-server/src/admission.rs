@@ -75,15 +75,15 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             | b"HSETNX"
             | b"HINCRBY"
             | b"HINCRBYFLOAT"
-            // Set writes that allocate value bytes (PR-7). SADD grows the set; SMOVE
-            // materializes the member at the destination (created if absent);
+            // Set writes that allocate value bytes (PR-7). SADD grows the set;
             // SINTERSTORE/SUNIONSTORE/SDIFFSTORE materialize the result set at the
-            // destination. All are `denyoom` in Redis. SREM/SPOP are memory-RELEASING and
-            // the set reads / algebra reads (SMEMBERS/SISMEMBER/SMISMEMBER/SCARD/
-            // SRANDMEMBER/SINTER/SUNION/SDIFF/SINTERCARD/SSCAN) are read-only, so they are
-            // NOT gated.
+            // destination. All are `denyoom` in Redis. SMOVE is NOT denyoom (Redis flags it
+            // `write fast` without denyoom, like MOVE: it RELOCATES an existing member from
+            // src to dst, materializing no new value bytes), so it is intentionally absent.
+            // SREM/SPOP are memory-RELEASING and the set reads / algebra reads
+            // (SMEMBERS/SISMEMBER/SMISMEMBER/SCARD/SRANDMEMBER/SINTER/SUNION/SDIFF/
+            // SINTERCARD/SSCAN) are read-only, so they are NOT gated.
             | b"SADD"
-            | b"SMOVE"
             | b"SINTERSTORE"
             | b"SUNIONSTORE"
             | b"SDIFFSTORE"
@@ -128,7 +128,6 @@ mod tests {
             b"HINCRBYFLOAT",
             // Set writes (PR-7).
             b"SADD",
-            b"SMOVE",
             b"SINTERSTORE",
             b"SUNIONSTORE",
             b"SDIFFSTORE",
@@ -193,9 +192,11 @@ mod tests {
             b"HRANDFIELD",
             b"HSCAN",
             b"HDEL",
-            // Set reads + memory-releasing SREM/SPOP (PR-7): not denyoom.
+            // Set reads + memory-releasing SREM/SPOP (PR-7): not denyoom. SMOVE RELOCATES
+            // an existing member (write fast, not denyoom in Redis, like MOVE).
             b"SREM",
             b"SPOP",
+            b"SMOVE",
             b"SMEMBERS",
             b"SISMEMBER",
             b"SMISMEMBER",

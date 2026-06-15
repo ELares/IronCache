@@ -207,18 +207,20 @@ pub fn cmd_srem<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
 // (no write): the typed set view reads through the waist. A missing key reads as empty.
 // ---------------------------------------------------------------------------
 
-/// `SMEMBERS key` -> the array of members (empty if absent); WRONGTYPE on a non-set. The
-/// order is the set's deterministic `members()` order (unspecified to clients, stable here).
+/// `SMEMBERS key` -> the SET of members (empty if absent); WRONGTYPE on a non-set. Replies
+/// with a RESP3 set (`~`, degrading to a `*` array under RESP2) via [`Value::Set`], matching
+/// Redis's set reply for SMEMBERS. The order is the set's deterministic `members()` order
+/// (unspecified to clients, stable here).
 pub fn cmd_smembers<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("smembers"));
     }
     store.rmw_mut(db, &req.args[1], now, |entry| match entry {
-        RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
+        RmwEntry::Vacant => keep(Value::Set(Vec::new())),
         RmwEntry::OccupiedMut(mut o) => match o.as_set_mut() {
             Some(set) => {
                 let out = set.members().into_iter().map(bulk).collect();
-                keep(Value::Array(Some(out)))
+                keep(Value::Set(out))
             }
             None => wrong_type(),
         },
@@ -436,7 +438,9 @@ fn srandmember_reply(members: &[Vec<u8>], count: Option<i64>, seed: u64) -> Valu
             Value::Array(Some(chosen.into_iter().map(bulk).collect()))
         }
         Some(c) => {
-            // Negative: WITH REPEATS, exactly |count| members (each drawn independently).
+            // Negative: WITH REPEATS, exactly |count| members (each drawn independently). A
+            // large |count| allocates |count| slots; this MATCHES Redis's own unbounded
+            // SRANDMEMBER-negative-count behavior (parity, not a bug; deferred #8 follow-up).
             let want = c.unsigned_abs() as usize;
             let out: Vec<Value> = (0..want)
                 .map(|_| bulk(members[(rng.next() % n as u64) as usize].clone()))
@@ -464,11 +468,14 @@ pub fn cmd_smove<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
     let dst = req.args[2].clone();
     let member = req.args[3].clone();
 
-    // (1) Type-check BOTH keys first (Redis checks src and dst types before any edit). A
-    // non-set src or dst is WRONGTYPE with no change. A missing key is fine (treated as an
-    // empty set: src-missing -> member absent -> 0; dst-missing -> created on add).
-    if let Some(reply) = wrongtype_if_non_set(store, db, now, &src) {
-        return reply;
+    // (1) Probe SRC first, in Redis's `smoveCommand` order: a MISSING src short-circuits to
+    // 0 BEFORE the dst type is ever checked (so `SMOVE missing-src nonset-dst member` is 0,
+    // NOT WRONGTYPE); a NON-SET src is WRONGTYPE. ONLY THEN is dst's type checked (a non-set
+    // dst is WRONGTYPE). A missing dst is fine (created on the add).
+    match probe_set(store, db, now, &src) {
+        KeyState::Missing => return Value::Integer(0),
+        KeyState::NonSet => return Value::error(ErrorReply::wrong_type()),
+        KeyState::Set => {}
     }
     if let Some(reply) = wrongtype_if_non_set(store, db, now, &dst) {
         return reply;
@@ -486,7 +493,9 @@ pub fn cmd_smove<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
         });
     }
 
-    // (2) Remove the member from src. If it was not present, reply 0 WITHOUT touching dst.
+    // (2) Remove the member from src (src is a set, probed above). If the member was not in
+    // src, reply 0 WITHOUT touching dst. (The Vacant/non-set arms cannot fire after the
+    // probe above, but remain as defensive no-ops returning 0 / WRONGTYPE.)
     let m = member.clone();
     let removed = store.rmw_mut(db, &src, now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Integer(0)),
@@ -541,8 +550,41 @@ pub fn cmd_smove<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
     Value::Integer(1)
 }
 
+/// The type-probe state of a key for SMOVE's Redis-order checks: absent, a non-set value, or
+/// a set.
+#[derive(PartialEq)]
+enum KeyState {
+    Missing,
+    NonSet,
+    Set,
+}
+
+/// Probe `key`'s state ([`KeyState`]) without mutating it (routes through `rmw_mut` + Keep,
+/// no write). SMOVE uses this to apply Redis's `smoveCommand` ordering: a MISSING src
+/// short-circuits to 0 BEFORE dst's type is checked, distinct from a NON-SET src (WRONGTYPE).
+fn probe_set<S: Store>(store: &mut S, db: u32, now: UnixMillis, key: &[u8]) -> KeyState {
+    store.rmw_mut(db, key, now, |entry| {
+        let state = match entry {
+            RmwEntry::Vacant => KeyState::Missing,
+            RmwEntry::OccupiedMut(mut o) => {
+                if o.as_set_mut().is_some() {
+                    KeyState::Set
+                } else {
+                    KeyState::NonSet
+                }
+            }
+            RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+        };
+        RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Unchanged,
+            reply: state,
+        }
+    })
+}
+
 /// If `key` holds a NON-set value, return `Some(WRONGTYPE)`; otherwise `None` (a set, or
-/// absent). Used by SMOVE to type-check both keys before any edit. Routes through
+/// absent). Used by SMOVE to type-check the DST key (after the src probe). Routes through
 /// `rmw_mut` + Keep so it makes no write.
 fn wrongtype_if_non_set<S: Store>(
     store: &mut S,
@@ -675,7 +717,9 @@ fn compute_algebra<S: Store>(
 }
 
 /// `SINTER key [key ...]` / `SUNION key [key ...]` / `SDIFF key [key ...]` -> the result
-/// set as an array (a missing source key = empty set). WRONGTYPE if any key is a non-set.
+/// set (a missing source key = empty set). WRONGTYPE if any key is a non-set. Replies with a
+/// RESP3 set (`~`, degrading to a `*` array under RESP2) via [`Value::Set`], matching Redis's
+/// set reply for SINTER/SUNION/SDIFF.
 fn algebra_generic<S: Store>(
     store: &mut S,
     db: u32,
@@ -689,7 +733,7 @@ fn algebra_generic<S: Store>(
     }
     let keys: Vec<Bytes> = req.args[1..].to_vec();
     match compute_algebra(store, db, now, &keys, op) {
-        Ok(members) => Value::Array(Some(members.into_iter().map(bulk).collect())),
+        Ok(members) => Value::Set(members.into_iter().map(bulk).collect()),
         Err(()) => Value::error(ErrorReply::wrong_type()),
     }
 }
@@ -1049,22 +1093,22 @@ mod tests {
         }
     }
 
-    /// Sorted members from an array reply.
+    /// Sorted members from an array OR set reply (SMEMBERS/SINTER/SUNION/SDIFF reply with a
+    /// `Value::Set`; SPOP/SRANDMEMBER-count reply with a `Value::Array`).
     fn sorted_array(v: &Value) -> Vec<Vec<u8>> {
-        match v {
-            Value::Array(Some(items)) => {
-                let mut out: Vec<Vec<u8>> = items
-                    .iter()
-                    .map(|i| match i {
-                        Value::BulkString(Some(b)) => b.to_vec(),
-                        other => panic!("non-bulk in array: {other:?}"),
-                    })
-                    .collect();
-                out.sort();
-                out
-            }
-            other => panic!("expected an array, got {other:?}"),
-        }
+        let items = match v {
+            Value::Array(Some(items)) | Value::Set(items) => items,
+            other => panic!("expected an array or set, got {other:?}"),
+        };
+        let mut out: Vec<Vec<u8>> = items
+            .iter()
+            .map(|i| match i {
+                Value::BulkString(Some(b)) => b.to_vec(),
+                other => panic!("non-bulk in array/set: {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     // ---- SADD: new-member count, dedup, TYPE, WRONGTYPE. ----
@@ -1405,6 +1449,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn smove_missing_src_returns_zero_before_checking_dst_type() {
+        // Redis `smoveCommand` returns 0 immediately when the SOURCE key is missing, BEFORE
+        // checking the destination type. So a missing src with a non-set (string) dst is 0,
+        // NOT WRONGTYPE.
+        let mut s = test_store();
+        s.upsert(
+            0,
+            b"string-dst",
+            ironcache_storage::NewValue::Bytes(b"v"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        assert_eq!(
+            int(&cmd_smove(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"SMOVE", b"missing-src", b"string-dst", b"member"])
+            )),
+            0,
+            "missing src -> 0 (not WRONGTYPE), dst type not yet checked"
+        );
+        // The string dst is untouched (no write happened).
+        assert_eq!(s.read(0, b"string-dst", NOW).unwrap().as_bytes(), b"v");
+        // A NON-SET src is still WRONGTYPE (src probed before dst).
+        assert_eq!(
+            err_line(&cmd_smove(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"SMOVE", b"string-dst", b"other-dst", b"member"])
+            )),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+        // A SET src with a NON-SET dst is WRONGTYPE (dst checked after a present src), and the
+        // member is NOT removed from src.
+        cmd_sadd(&mut s, 0, NOW, &req(&[b"SADD", b"set-src", b"m"]));
+        assert_eq!(
+            err_line(&cmd_smove(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"SMOVE", b"set-src", b"string-dst", b"m"])
+            )),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+        assert_eq!(
+            int(&cmd_sismember(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"SISMEMBER", b"set-src", b"m"])
+            )),
+            1,
+            "a WRONGTYPE dst leaves the member in src"
+        );
+    }
+
     // ---- SINTER / SUNION / SDIFF incl. missing-key-as-empty. ----
 
     #[test]
@@ -1417,10 +1520,11 @@ mod tests {
             sorted_array(&cmd_sinter(&mut s, 0, NOW, &req(&[b"SINTER", b"a", b"b"]))),
             vec![b"2".to_vec(), b"3".to_vec()]
         );
-        // SINTER with a missing key -> empty (missing = empty set).
+        // SINTER with a missing key -> empty (missing = empty set). SINTER replies with a
+        // `Value::Set` (RESP3 `~`), so an empty result is the empty set.
         assert_eq!(
             cmd_sinter(&mut s, 0, NOW, &req(&[b"SINTER", b"a", b"missing"])),
-            Value::Array(Some(Vec::new()))
+            Value::Set(Vec::new())
         );
         // SUNION (missing key skipped).
         assert_eq!(
@@ -1437,10 +1541,10 @@ mod tests {
             sorted_array(&cmd_sdiff(&mut s, 0, NOW, &req(&[b"SDIFF", b"a", b"b"]))),
             vec![b"1".to_vec()]
         );
-        // SDIFF with a missing first key -> empty.
+        // SDIFF with a missing first key -> empty (the empty set reply).
         assert_eq!(
             cmd_sdiff(&mut s, 0, NOW, &req(&[b"SDIFF", b"missing", b"a"])),
-            Value::Array(Some(Vec::new()))
+            Value::Set(Vec::new())
         );
         // WRONGTYPE if any source is a non-set.
         s.upsert(
@@ -1459,6 +1563,66 @@ mod tests {
             )),
             "-WRONGTYPE Operation against a key holding the wrong kind of value"
         );
+    }
+
+    #[test]
+    fn smembers_and_algebra_reply_with_a_resp3_set_marker() {
+        // SMEMBERS/SINTER/SUNION/SDIFF reply with a `Value::Set`: RESP3 encodes the `~` set
+        // marker, degrading to a `*` array under RESP2 (canonical Redis set reply, ADR-0019).
+        use ironcache_protocol::{ProtoVersion, encode_to_vec};
+        let mut s = test_store();
+        cmd_sadd(&mut s, 0, NOW, &req(&[b"SADD", b"a", b"x"]));
+        cmd_sadd(&mut s, 0, NOW, &req(&[b"SADD", b"b", b"x"]));
+
+        // SMEMBERS is a set reply.
+        let m = cmd_smembers(&mut s, 0, NOW, &req(&[b"SMEMBERS", b"a"]));
+        assert!(matches!(m, Value::Set(_)), "SMEMBERS replies with a set");
+        assert_eq!(
+            encode_to_vec(&m, ProtoVersion::Resp3),
+            b"~1\r\n$1\r\nx\r\n",
+            "RESP3 SMEMBERS uses the `~` set marker"
+        );
+        assert_eq!(
+            encode_to_vec(&m, ProtoVersion::Resp2),
+            b"*1\r\n$1\r\nx\r\n",
+            "RESP2 SMEMBERS degrades to the `*` array marker"
+        );
+
+        // SINTER is a set reply too.
+        let i = cmd_sinter(&mut s, 0, NOW, &req(&[b"SINTER", b"a", b"b"]));
+        assert!(matches!(i, Value::Set(_)), "SINTER replies with a set");
+        assert_eq!(encode_to_vec(&i, ProtoVersion::Resp3), b"~1\r\n$1\r\nx\r\n");
+        assert_eq!(encode_to_vec(&i, ProtoVersion::Resp2), b"*1\r\n$1\r\nx\r\n");
+
+        // SUNION / SDIFF are set replies as well.
+        assert!(matches!(
+            cmd_sunion(&mut s, 0, NOW, &req(&[b"SUNION", b"a", b"b"])),
+            Value::Set(_)
+        ));
+        assert!(matches!(
+            cmd_sdiff(&mut s, 0, NOW, &req(&[b"SDIFF", b"a", b"b"])),
+            Value::Set(_)
+        ));
+
+        // The duplicate-/scan-/multi-bool replies STAY arrays in BOTH protocols (not sets):
+        // SPOP-with-count, SRANDMEMBER-with-count, SMISMEMBER, SSCAN.
+        cmd_sadd(&mut s, 0, NOW, &req(&[b"SADD", b"c", b"p", b"q"]));
+        assert!(matches!(
+            cmd_spop(&mut s, 0, SEED, NOW, &req(&[b"SPOP", b"c", b"1"])),
+            Value::Array(_)
+        ));
+        assert!(matches!(
+            cmd_srandmember(&mut s, 0, SEED, NOW, &req(&[b"SRANDMEMBER", b"c", b"2"])),
+            Value::Array(_)
+        ));
+        assert!(matches!(
+            cmd_smismember(&mut s, 0, NOW, &req(&[b"SMISMEMBER", b"c", b"p"])),
+            Value::Array(_)
+        ));
+        assert!(matches!(
+            cmd_sscan(&mut s, 0, NOW, &req(&[b"SSCAN", b"c", b"0"])),
+            Value::Array(_)
+        ));
     }
 
     // ---- SINTERCARD + LIMIT. ----

@@ -817,7 +817,8 @@ fn set_commands_over_real_socket() {
             .unwrap();
         expect_reply(&mut client, b"$6\r\nintset\r\n").await;
 
-        // SMEMBERS s -> a 3-element array (intset is ascending: 1,2,3).
+        // SMEMBERS s -> a 3-element set (RESP3 `~`), here degrading to a `*` array under the
+        // RESP2 default of a fresh connection (intset is ascending: 1,2,3).
         client
             .write_all(b"*2\r\n$8\r\nSMEMBERS\r\n$1\r\ns\r\n")
             .await
@@ -884,7 +885,7 @@ fn set_store_and_wrongtype_over_real_socket() {
             .await
             .unwrap();
         expect_reply(&mut client, b":2\r\n").await;
-        // SMEMBERS dest -> {2,3} (intset ascending).
+        // SMEMBERS dest -> {2,3} (intset ascending; RESP3 set degrading to `*` under RESP2).
         client
             .write_all(b"*2\r\n$8\r\nSMEMBERS\r\n$4\r\ndest\r\n")
             .await
