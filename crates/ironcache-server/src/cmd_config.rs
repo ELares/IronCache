@@ -417,12 +417,47 @@ mod tests {
             Value::ok()
         );
         assert!(c.runtime.requires_auth());
-        assert_eq!(c.runtime.requirepass().as_deref(), Some("pw"));
+        // SECURITY (#65): the overlay holds the SHA-256 hex of the plaintext, not "pw".
+        assert_eq!(
+            c.runtime.requirepass().as_deref(),
+            Some(ironcache_config::sha256_hex(b"pw").as_str())
+        );
+        assert_ne!(c.runtime.requirepass().as_deref(), Some("pw"));
         assert_eq!(
             run(&c, &[b"CONFIG", b"SET", b"requirepass", b""]).0,
             Value::ok()
         );
         assert!(!c.runtime.requires_auth());
+    }
+
+    #[test]
+    fn config_get_requirepass_returns_hash_and_empty_when_unset() {
+        // SECURITY DIVERGENCE (#65): CONFIG GET requirepass returns the SHA-256 hex
+        // digest (NOT the plaintext Redis echoes), and the empty string when unset (Redis
+        // parity for unset, not nil). Only an authenticated client reaches CONFIG GET.
+        let c = ctx_with(Config::default());
+        // Unset -> empty string.
+        let (v, _) = run(&c, &[b"CONFIG", b"GET", b"requirepass"]);
+        assert_eq!(
+            get_pairs(&v),
+            vec![("requirepass".to_owned(), String::new())]
+        );
+        // After SET, GET returns the hex digest of the plaintext, never the plaintext.
+        assert_eq!(
+            run(&c, &[b"CONFIG", b"SET", b"requirepass", b"s3cr3t"]).0,
+            Value::ok()
+        );
+        let (v, _) = run(&c, &[b"CONFIG", b"GET", b"requirepass"]);
+        let pairs = get_pairs(&v);
+        assert_eq!(
+            pairs,
+            vec![(
+                "requirepass".to_owned(),
+                ironcache_config::sha256_hex(b"s3cr3t")
+            )]
+        );
+        assert_ne!(pairs[0].1, "s3cr3t");
+        assert_eq!(pairs[0].1.len(), 64);
     }
 
     #[test]

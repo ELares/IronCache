@@ -74,8 +74,11 @@ pub struct RuntimeConfig {
 struct RuntimeStrings {
     /// The effective `maxmemory-policy` name (verbatim, the configured spelling).
     maxmemory_policy: String,
-    /// The effective `requirepass`. `None` means auth is not required (empty string
-    /// from `CONFIG SET requirepass ""` clears it to `None`).
+    /// The effective `requirepass`, stored as the SHA-256 HEX digest AT REST (#65),
+    /// NOT the plaintext. Seeded from `Config::requirepass` (already a hash) at boot and
+    /// re-hashed from the plaintext on every `CONFIG SET requirepass`. `None` means auth
+    /// is not required (an empty value clears it to `None`). No plaintext password ever
+    /// lands in this long-lived overlay.
     requirepass: Option<String>,
 }
 
@@ -131,9 +134,11 @@ impl RuntimeConfig {
             .clone()
     }
 
-    /// The current effective `requirepass` (a clone of the locked value, `None` if
-    /// auth is not required). Takes the lock; called off the hot path (a `CONFIG GET`,
-    /// or the auth check, which is rare relative to data commands).
+    /// The current effective `requirepass` as the stored SHA-256 HEX digest (a clone of
+    /// the locked value, `None` if auth is not required), NOT the plaintext (#65). Takes
+    /// the lock; called off the hot path (a `CONFIG GET`, or the auth check, which is
+    /// rare relative to data commands). The auth path hashes the provided guess and
+    /// compares against this digest.
     #[must_use]
     pub fn requirepass(&self) -> Option<String> {
         self.strings
@@ -180,19 +185,27 @@ impl RuntimeConfig {
         self.generation.fetch_add(1, Ordering::Release) + 1
     }
 
-    /// `CONFIG SET requirepass <value>`: update the locked password. An empty value
-    /// CLEARS it (`None`, disabling auth), matching Redis. No generation bump: the auth
-    /// path reads `requirepass()` directly. Takes the lock (rare, off the hot path).
+    /// `CONFIG SET requirepass <value>`: HASH the PLAINTEXT `value` to its SHA-256 hex
+    /// digest and store ONLY that (#65), so no plaintext password lands in the long-lived
+    /// overlay. The `value` is always a PLAINTEXT password (Redis `requirepass`
+    /// semantics); the ACL `#<hash>` pre-hashed syntax is #106 (later), so a digest read
+    /// back via `CONFIG GET requirepass` is NOT meant to be re-`SET` (doing so would hash
+    /// the hash). An empty value CLEARS it (`None`, disabling auth), matching Redis. No
+    /// generation bump: the auth path reads `requirepass()` directly. Takes the lock
+    /// (rare, off the hot path).
     pub fn set_requirepass(&self, value: &str) {
+        // Hash the plaintext BEFORE taking the lock so the transient plaintext is dropped
+        // promptly; the locked overlay only ever sees the digest.
+        let hashed = if value.is_empty() {
+            None
+        } else {
+            Some(crate::sha256_hex(value.as_bytes()))
+        };
         let mut s = self
             .strings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        s.requirepass = if value.is_empty() {
-            None
-        } else {
-            Some(value.to_owned())
-        };
+        s.requirepass = hashed;
     }
 }
 
@@ -203,16 +216,21 @@ mod tests {
 
     #[test]
     fn seeds_from_config_and_reads_back() {
+        // `Config::requirepass` already holds the SHA-256 HEX at rest (#65), so
+        // from_config copies that digest verbatim (it does NOT re-hash). We seed it with
+        // a digest to mirror what a real boot produces.
+        let stored = crate::sha256_hex(b"pw");
         let cfg = Config {
             maxmemory: 1024,
             maxmemory_policy: "allkeys-lru".to_owned(),
-            requirepass: Some("pw".to_owned()),
+            requirepass: Some(stored.clone()),
             ..Config::default()
         };
         let rc = RuntimeConfig::from_config(&cfg);
         assert_eq!(rc.maxmemory(), 1024);
         assert_eq!(rc.policy_name(), "allkeys-lru");
-        assert_eq!(rc.requirepass().as_deref(), Some("pw"));
+        // The runtime overlay holds the same digest the Config did (no plaintext).
+        assert_eq!(rc.requirepass().as_deref(), Some(stored.as_str()));
         assert!(rc.requires_auth());
         // Generation starts at 0 (no hot-swap yet).
         assert_eq!(rc.generation(), 0);
@@ -242,10 +260,14 @@ mod tests {
     }
 
     #[test]
-    fn set_requirepass_empty_clears_auth() {
+    fn set_requirepass_hashes_at_rest_and_empty_clears_auth() {
         let rc = RuntimeConfig::from_config(&Config::default());
+        // SECURITY (#65): CONFIG SET requirepass takes a PLAINTEXT password and stores
+        // ONLY its SHA-256 hex digest; the plaintext never lands in the overlay.
         rc.set_requirepass("secret");
-        assert_eq!(rc.requirepass().as_deref(), Some("secret"));
+        let stored = rc.requirepass().expect("requirepass should be set");
+        assert_eq!(stored, crate::sha256_hex(b"secret"));
+        assert_ne!(stored, "secret");
         assert!(rc.requires_auth());
         // Empty string disables auth (Redis parity).
         rc.set_requirepass("");

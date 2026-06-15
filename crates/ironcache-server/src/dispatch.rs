@@ -1278,19 +1278,25 @@ enum AuthResult {
 /// `requirepass`/default-user model (full ACL is later). The username must be `default`
 /// (or empty) when a password is set.
 ///
-/// The password comparison is CONSTANT-TIME (see [`constant_time_eq`]) so the reply
-/// latency does not leak how many leading bytes of a guess matched the secret (the
-/// timing-leak finding). The password is currently held in plaintext at rest in the
-/// runtime overlay; storing only a SHA-256 digest (verifying against the hash, never the
-/// plaintext) is a tracked AUTH-hardening follow-up (AUTH.md / threat-model #142) and is
-/// deliberately NOT implemented here (it ships in the dedicated AUTH PR), so the
-/// plaintext-at-rest choice is recorded rather than silent.
+/// The password is stored as a SHA-256 digest AT REST (#65): the runtime overlay holds
+/// only the SHA-256 HEX of the configured password, never the plaintext. Verification
+/// HASHES the provided guess with [`ironcache_config::sha256_hex`] and compares the two
+/// 64-char hex digests in CONSTANT TIME (see [`constant_time_eq`]), so the reply latency
+/// does not leak how many leading bytes of a guess matched the secret (the timing-leak
+/// finding). The plaintext guess lives only as the `pass` argument during hashing and is
+/// never stored or logged. The threat model (#142) accepts plain SHA-256 (not a KDF) for
+/// Redis behavioral equivalence (ADR-0009) and accepts the compare side-channel this
+/// milestone.
 fn check_auth(ctx: &ServerContext, user: &[u8], pass: &[u8]) -> AuthResult {
     match ctx.runtime.requirepass() {
         None => AuthResult::NoPasswordSet,
-        Some(configured) => {
+        Some(configured_hash) => {
             let user_ok = user.is_empty() || user.eq_ignore_ascii_case(b"default");
-            if user_ok && constant_time_eq(pass, configured.as_bytes()) {
+            // Hash the GUESS and compare digest-to-digest: the stored credential is the
+            // SHA-256 hex, so we never compare (or hold) the plaintext at rest. The
+            // compare is constant-time over the two fixed-width (64-char) hex digests.
+            let guess_hash = ironcache_config::sha256_hex(pass);
+            if user_ok && constant_time_eq(guess_hash.as_bytes(), configured_hash.as_bytes()) {
                 AuthResult::Ok
             } else {
                 AuthResult::WrongPass
@@ -1519,7 +1525,11 @@ mod tests {
         let boot = ironcache_config::Config {
             maxmemory,
             maxmemory_policy: policy.to_owned(),
-            requirepass: pass.map(str::to_owned),
+            // `Config::requirepass` holds the SHA-256 HEX at rest (#65), so the test
+            // harness hashes the test PLAINTEXT just as a real boot would (resolve()
+            // hashes it). AUTH with the plaintext then verifies by hashing the guess and
+            // matching this digest.
+            requirepass: pass.map(|p| ironcache_config::sha256_hex(p.as_bytes())),
             databases: 16,
             shards: 1,
             ..ironcache_config::Config::default()
@@ -1779,6 +1789,65 @@ mod tests {
         // A longer password with the secret as a prefix is WRONGPASS.
         let mut longp = state(&c);
         match run(&c, &mut longp, &[b"AUTH", b"s3cr3t!"]) {
+            Value::Error(e) => assert!(e.line().starts_with("-WRONGPASS")),
+            other => panic!("expected WRONGPASS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn requirepass_stored_as_hash_not_plaintext() {
+        // SECURITY (#65): the runtime overlay the auth path reads holds ONLY the SHA-256
+        // hex digest of the password, never the plaintext.
+        let c = ctx(Some("s3cr3t"));
+        let stored = c.runtime.requirepass().expect("requirepass should be set");
+        assert_eq!(stored, ironcache_config::sha256_hex(b"s3cr3t"));
+        assert_eq!(stored.len(), 64);
+        assert_ne!(stored, "s3cr3t");
+        // The boot config likewise holds the digest, not the plaintext.
+        assert_eq!(
+            c.boot.requirepass.as_deref(),
+            Some(ironcache_config::sha256_hex(b"s3cr3t").as_str())
+        );
+        assert_ne!(c.boot.requirepass.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn config_set_requirepass_then_auth_with_plaintext_succeeds() {
+        // SECURITY (#65): hash-on-set (CONFIG SET) and hash-on-verify (AUTH) converge.
+        // A CONFIG SET requirepass <plaintext> stores the digest; AUTH with that SAME
+        // plaintext then authenticates (the guess is hashed and matches the stored
+        // digest), while a wrong plaintext is WRONGPASS.
+        let c = ctx(None);
+        let mut admin = state(&c);
+        // No password yet: AUTH reports no-password-configured.
+        match run(&c, &mut admin, &[b"AUTH", b"newpass"]) {
+            Value::Error(e) => assert!(e.line().starts_with(
+                "-ERR AUTH <password> called without any password configured for the default user"
+            )),
+            other => panic!("expected auth_no_password_set, got {other:?}"),
+        }
+        // CONFIG SET requirepass with a plaintext password.
+        assert_eq!(
+            run(
+                &c,
+                &mut admin,
+                &[b"CONFIG", b"SET", b"requirepass", b"newpass"]
+            ),
+            Value::ok()
+        );
+        // The overlay now holds the DIGEST, not the plaintext.
+        assert_eq!(
+            c.runtime.requirepass().as_deref(),
+            Some(ironcache_config::sha256_hex(b"newpass").as_str())
+        );
+        // A fresh connection (built once a password is configured) starts unauthenticated.
+        let mut fresh = state(&c);
+        assert!(!fresh.authenticated);
+        assert_eq!(run(&c, &mut fresh, &[b"AUTH", b"newpass"]), Value::ok());
+        assert!(fresh.authenticated);
+        // A wrong plaintext is a digest mismatch -> WRONGPASS.
+        let mut wrong = state(&c);
+        match run(&c, &mut wrong, &[b"AUTH", b"nope"]) {
             Value::Error(e) => assert!(e.line().starts_with("-WRONGPASS")),
             other => panic!("expected WRONGPASS, got {other:?}"),
         }
