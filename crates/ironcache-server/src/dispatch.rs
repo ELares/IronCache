@@ -813,6 +813,30 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"PFMERGE" => cmd_hll::cmd_pfmerge(store, db, now, req),
         // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
         b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
+        // -- INTERNAL cross-shard *STORE dest-write verb (COORDINATOR.md #107, Stage 2b).
+        // `__ICSTORESET dest m...` writes a spanning set-*STORE result to the dest owner with
+        // the EXACT blind-overwrite-clearing-TTL semantics the single-shard *STORE uses. This
+        // arm is reached ONLY via the coordinator's internal dispatch (`dispatch_remote_keyed`
+        // / `run_local_keyed`); a CLIENT sending `__ICSTORESET` is rejected before routing (the
+        // serve-loop router + queue-time validator gate it), so it gets unknown-command and
+        // never reaches here. --
+        b"__ICSTORESET" => cmd_set::cmd_icstoreset(store, db, now, req),
+        // -- INTERNAL cross-shard zset *STORE / ZRANGESTORE dest-write verb (COORDINATOR.md
+        // #107, Stage 2b-2). `__ICSTOREZSET dest m1 s1 ...` writes a spanning zset *STORE /
+        // ZRANGESTORE result to the dest owner with the EXACT blind-overwrite-clearing-TTL
+        // semantics the single-shard *STORE / ZRANGESTORE uses. Reached ONLY via the
+        // coordinator's internal dispatch (`dispatch_remote_keyed` / `run_local_keyed`); a
+        // CLIENT sending `__ICSTOREZSET` is rejected before routing (the serve-loop router +
+        // queue-time validator gate it), so it gets unknown-command and never reaches here. --
+        b"__ICSTOREZSET" => cmd_zset::cmd_icstorezset(store, db, now, req),
+        // -- INTERNAL cross-shard PFMERGE dest-write verb (COORDINATOR.md #107, Stage 2b-3).
+        // `__ICSTOREHLL dest <dense-hll-bytes>` writes a spanning-PFMERGE merged HLL to the
+        // dest owner with the EXACT TTL-PRESERVING semantics the single-shard PFMERGE uses
+        // (so an existing dest TTL survives). Reached ONLY via the coordinator's internal
+        // dispatch (`dispatch_remote_keyed` / `run_local_keyed`); a CLIENT sending
+        // `__ICSTOREHLL` is rejected before routing (the serve-loop router gates it), so it
+        // gets unknown-command and never reaches here. --
+        b"__ICSTOREHLL" => cmd_hll::cmd_icstorehll(store, db, now, req),
         _ => {
             let name = String::from_utf8_lossy(req.command()).into_owned();
             let rest: Vec<&[u8]> = req.args[1..].iter().map(bytes::Bytes::as_ref).collect();

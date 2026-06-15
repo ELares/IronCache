@@ -566,8 +566,13 @@ pub fn cmd_bitop<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
 /// Compute the BITOP result bytes over `sources` (already materialized, missing keys
 /// as empty vecs). The result length equals the LONGEST source (shorter sources
 /// zero-padded); NOT inverts the single source to an equal-length result. Factored out
-/// for unit testing.
-fn bitop_compute(op: &[u8], sources: &[Vec<u8>]) -> Vec<u8> {
+/// for unit testing AND so the cross-shard coordinator's spanning BITOP shares the EXACT
+/// SAME combine as the single-shard handler (COORDINATOR.md #107, Stage 2b-3); the
+/// coordinator gathers each source's bytes from its owner shard (a missing key as an empty
+/// vec, a non-string as a WRONGTYPE abort) and passes them here, so a spanning BITOP can
+/// NOT drift from the single-shard one.
+#[must_use]
+pub fn bitop_compute(op: &[u8], sources: &[Vec<u8>]) -> Vec<u8> {
     if op == b"NOT" {
         // NOT: exactly one source (the caller enforced arity); invert every byte.
         let src = sources.first().map_or(&[][..], Vec::as_slice);

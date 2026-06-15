@@ -530,6 +530,24 @@ async fn route_and_dispatch(
     let cmd_upper = ascii_upper(request.command());
     let route = route::classify(&cmd_upper);
 
+    // -- INTERNAL-VERB CLIENT GATE (COORDINATOR.md #107, Stage 2b). `__ICSTORESET` /
+    // `__ICSTOREZSET` / `__ICSTOREHLL` are the coordinator's INTERNAL cross-shard *STORE
+    // dest-write verbs (set / zset / PFMERGE-HLL): each lives in the command registry + has a
+    // real dispatch arm (so it routes / admits like any keyed write and the registry-vs-dispatch
+    // cross-check stays exact) but must be UNREACHABLE from clients -- only the coordinator
+    // issues them (via `dispatch_one_value` / `run_local_keyed`, which call
+    // `dispatch_remote_keyed` DIRECTLY and never pass through this router). A CLIENT socket only
+    // ever reaches dispatch THROUGH this router, so rejecting them here -- before any routing or
+    // queueing -- makes a client `__ICSTORE*` (in or out of MULTI) get the standard
+    // unknown-command error while the coordinator's internal path is untouched.
+    if cmd_upper == ironcache_server::ICSTORESET
+        || cmd_upper == ironcache_server::ICSTOREZSET
+        || cmd_upper == ironcache_server::ICSTOREHLL
+    {
+        reject_internal_verb(conn, state_rc, request, out);
+        return false;
+    }
+
     // -- TRANSACTION CORRECTNESS UNDER PARTITIONING (COORDINATOR.md #107, the critical fix).
     //
     // The coordinator routes each command to its key's OWNER shard. But a command issued
@@ -602,6 +620,24 @@ async fn route_and_dispatch(
                 && route::owner_shard_set(&spec, home.total).is_none()
         };
 
+    // A SHARD-SPANNING gather-combine command -- set algebra (SINTER/SUNION/SDIFF/SINTERCARD
+    // + the three *STORE), zset algebra (ZUNION/ZINTER/ZDIFF/ZINTERCARD + the three *STORE +
+    // ZRANGESTORE), BITOP, or HyperLogLog (PFCOUNT/PFMERGE) -- routes to the GATHER + (shared)
+    // COMBINE + STORE path (COORDINATOR.md #107, Stage 2b-1 + 2b-2 + 2b-3). The gate is the
+    // SAME shape as `multikey_fan_out`: KeyedMulti, one of the supported tokens, and the keys
+    // genuinely SPAN shards (`Many` AND a `None` owner set). Co-located invocations route via
+    // Stage 1 below; a malformed/short request stays home (the handler emits the proper
+    // error). The two predicates are mutually exclusive (their command sets are disjoint). The
+    // remaining spanning multi-key commands (RENAME/COPY/MOVE/SMOVE/LMOVE/RPOPLPUSH moves)
+    // stay on the home fall-through (deferred).
+    let spanning_set_fan_out = matches!(route, route::CommandClass::KeyedMulti)
+        && is_fan_out_spanning_combine(&cmd_upper)
+        && {
+            let spec = route::command_keys(&cmd_upper, request);
+            matches!(spec, route::KeySpec::Many(_))
+                && route::owner_shard_set(&spec, home.total).is_none()
+        };
+
     // The routing TARGET shard, if a KEYED command routes to exactly one NON-home shard
     // (else `None` -> the home path). The single-key case keeps the zero-alloc fast path
     // (one hash + compare); only the genuinely multi-key commands pay the `command_keys`
@@ -661,6 +697,18 @@ async fn route_and_dispatch(
         )
         .await;
         false
+    } else if spanning_set_fan_out {
+        // SHARD-SPANNING gather-combine (COORDINATOR.md #107, Stage 2b-1/2b-2/2b-3): set /
+        // zset algebra, BITOP, or HyperLogLog (PFCOUNT/PFMERGE) whose keys span shards. The
+        // spanning_combine module gathers each source from its owner (the home subset LOCALLY
+        // + sync, the rest via their drain loops), combines with the PURE combiner shared with
+        // the single-shard handler, and for the write forms writes the result to the dest
+        // owner. Bump commands_processed here (matching the home / remote / whole-keyspace /
+        // multikey paths); the owning shards fold their own data counters. The per-command
+        // dispatch is split out so this router stays small.
+        state_rc.borrow_mut().counters.on_command();
+        dispatch_spanning_combine(ctx, conn, home, inbox, &cmd_upper, request, out).await;
+        false
     } else if let Some(target) = target {
         // REMOTE keyed hop: enqueue to the owning shard, await its reply, encode here. The
         // owning shard folded the data counters; here we only attribute commands_processed.
@@ -675,6 +723,60 @@ async fn route_and_dispatch(
         handle_request(
             ctx, conn, env, store_rc, wheel_rc, state_rc, request, &cmd_upper, out,
         )
+    }
+}
+
+/// Dispatch ONE shard-spanning gather-combine command to its per-command fan-out
+/// (COORDINATOR.md #107, Stage 2b), split out of [`route_and_dispatch`] so the router stays
+/// small. The caller has already established the command is a supported gather-combine token
+/// whose keys SPAN shards (the `spanning_set_fan_out` gate) and bumped `commands_processed`.
+///
+/// BITOP / PFCOUNT / PFMERGE (Stage 2b-3) each have their OWN parse + combine, so each gets a
+/// dedicated fan-out; the eight zset tokens (Stage 2b-2) share `fan_out_zset`; the seven set
+/// tokens (Stage 2b-1) share `fan_out_set`. The fan-out gathers each source from its owner
+/// (the home subset LOCALLY + sync, the rest via their drain loops), combines with the PURE
+/// combiner shared with the single-shard handler, and for the write forms writes the result
+/// to the dest owner, encoding the reply into `out`.
+async fn dispatch_spanning_combine(
+    ctx: &ServerContext,
+    conn: &ConnState,
+    home: ShardId,
+    inbox: &coordinator::Inbox,
+    cmd_upper: &[u8],
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    match cmd_upper {
+        b"BITOP" => {
+            crate::spanning_combine::fan_out_bitop(
+                inbox, ctx, request, conn.db, home, out, conn.proto,
+            )
+            .await;
+        }
+        b"PFCOUNT" => {
+            crate::spanning_combine::fan_out_pfcount(
+                inbox, ctx, request, conn.db, home, out, conn.proto,
+            )
+            .await;
+        }
+        b"PFMERGE" => {
+            crate::spanning_combine::fan_out_pfmerge(
+                inbox, ctx, request, conn.db, home, out, conn.proto,
+            )
+            .await;
+        }
+        _ if is_fan_out_spanning_zset(cmd_upper) => {
+            crate::spanning_combine::fan_out_zset(
+                inbox, ctx, cmd_upper, request, conn.db, home, out, conn.proto,
+            )
+            .await;
+        }
+        _ => {
+            crate::spanning_combine::fan_out_set(
+                inbox, ctx, cmd_upper, request, conn.db, home, out, conn.proto,
+            )
+            .await;
+        }
     }
 }
 
@@ -906,6 +1008,81 @@ fn is_fan_out_multikey(cmd_upper: &[u8]) -> bool {
     matches!(
         cmd_upper,
         b"MGET" | b"MSET" | b"DEL" | b"EXISTS" | b"UNLINK" | b"TOUCH"
+    )
+}
+
+/// Reply the standard unknown-command error for a CLIENT-issued INTERNAL verb (the
+/// coordinator's `__ICSTORESET`, COORDINATOR.md #107 Stage 2b). The verb is in the command
+/// registry so the coordinator's internal path can dispatch it, but a client must never reach
+/// it: this renders the SAME `-ERR unknown command ...` reply the dispatch `_ =>` arm renders
+/// for a genuinely unknown token (name + leading args, single-quoted), and bumps
+/// commands_processed like every other reply path so the rejection still counts.
+fn reject_internal_verb(
+    conn: &ConnState,
+    state_rc: &Rc<RefCell<ShardState>>,
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    state_rc.borrow_mut().counters.on_command();
+    let name = String::from_utf8_lossy(request.command()).into_owned();
+    let rest: Vec<&[u8]> = request.args[1..].iter().map(bytes::Bytes::as_ref).collect();
+    encode_into(
+        out,
+        &ironcache_server::Value::error(ironcache_protocol::ErrorReply::unknown_command(
+            &name, &rest,
+        )),
+        conn.proto,
+    );
+}
+
+/// Whether `cmd_upper` is one of the set-algebra OR sorted-set-algebra commands the
+/// coordinator GATHERS + (shared) COMBINES + STOREs across shards when its keys SPAN shards
+/// (COORDINATOR.md #107, Stage 2b-1 + 2b-2). This is the single gate the serve loop uses to
+/// route to the spanning-combine path; [`is_fan_out_spanning_zset`] then splits the zset
+/// subset (dispatched to [`crate::spanning_combine::fan_out_zset`]) from the set subset
+/// (dispatched to [`crate::spanning_combine::fan_out_set`]).
+///
+/// Set forms (Stage 2b-1): SINTER, SUNION, SDIFF, SINTERCARD (read) + SINTERSTORE,
+/// SUNIONSTORE, SDIFFSTORE (store). Zset forms (Stage 2b-2): ZUNION, ZINTER, ZDIFF,
+/// ZINTERCARD (read) + ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE (store) + ZRANGESTORE (a 2-key
+/// copy-range). BITOP + HyperLogLog forms (Stage 2b-3): BITOP (write), PFCOUNT (read),
+/// PFMERGE (write). Every OTHER spanning multi-key command (RENAME/COPY/MOVE/SMOVE/LMOVE/
+/// RPOPLPUSH) stays on the home sync fall-through (deferred). The command set is DISJOINT
+/// from [`is_fan_out_multikey`]'s, so the fan-out branches are mutually exclusive.
+fn is_fan_out_spanning_combine(cmd_upper: &[u8]) -> bool {
+    is_fan_out_spanning_zset(cmd_upper)
+        || matches!(
+            cmd_upper,
+            b"SINTER"
+                | b"SUNION"
+                | b"SDIFF"
+                | b"SINTERCARD"
+                | b"SINTERSTORE"
+                | b"SUNIONSTORE"
+                | b"SDIFFSTORE"
+                | b"BITOP"
+                | b"PFCOUNT"
+                | b"PFMERGE"
+        )
+}
+
+/// Whether `cmd_upper` is one of the EIGHT sorted-set-algebra commands the coordinator gathers,
+/// (shared) combines, and stores across shards (COORDINATOR.md #107, Stage 2b-2). The read
+/// forms are ZUNION, ZINTER, ZDIFF, ZINTERCARD; the store forms are ZUNIONSTORE, ZINTERSTORE,
+/// ZDIFFSTORE, and ZRANGESTORE (a 2-key copy-range). This splits the zset subset of
+/// [`is_fan_out_spanning_combine`] so the serve loop dispatches it to
+/// [`crate::spanning_combine::fan_out_zset`] (the set subset goes to `fan_out_set`).
+fn is_fan_out_spanning_zset(cmd_upper: &[u8]) -> bool {
+    matches!(
+        cmd_upper,
+        b"ZUNION"
+            | b"ZINTER"
+            | b"ZDIFF"
+            | b"ZINTERCARD"
+            | b"ZUNIONSTORE"
+            | b"ZINTERSTORE"
+            | b"ZDIFFSTORE"
+            | b"ZRANGESTORE"
     )
 }
 

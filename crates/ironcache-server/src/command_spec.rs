@@ -1488,6 +1488,53 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             denyoom: false,
             control: false,
         },
+        // -- INTERNAL cross-shard verb (cmd_set::cmd_icstoreset), COORDINATOR.md #107 Stage
+        // 2b. `__ICSTORESET dest m...` writes a spanning set-*STORE result to the dest owner
+        // (a single-key denyoom write keyed on args[1]). It is in the registry so it routes /
+        // admits like any keyed write AND so the registry-vs-dispatch cross-check stays exact,
+        // but it is CLIENT-UNREACHABLE: the serve-loop router and the queue-time validator
+        // reject it before routing, so a client `__ICSTORESET` gets unknown-command; only the
+        // coordinator issues it internally. Arity Min(2) (token + dest; members optional). --
+        b"__ICSTORESET" => &CommandSpec {
+            name: b"__ICSTORESET",
+            arity: Min(2),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: true,
+            control: false,
+        },
+        // -- INTERNAL cross-shard verb (cmd_zset::cmd_icstorezset), COORDINATOR.md #107 Stage
+        // 2b-2. `__ICSTOREZSET dest m1 s1 ...` writes a spanning zset *STORE / ZRANGESTORE
+        // result to the dest owner (a single-key denyoom write keyed on args[1]). It is in the
+        // registry so it routes / admits like any keyed write AND so the registry-vs-dispatch
+        // cross-check stays exact, but it is CLIENT-UNREACHABLE: the serve-loop router and the
+        // queue-time validator reject it before routing, so a client `__ICSTOREZSET` gets
+        // unknown-command; only the coordinator issues it internally. Arity Min(2) (token +
+        // dest; member/score pairs optional). --
+        b"__ICSTOREZSET" => &CommandSpec {
+            name: b"__ICSTOREZSET",
+            arity: Min(2),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: true,
+            control: false,
+        },
+        // -- INTERNAL cross-shard verb (cmd_hll::cmd_icstorehll), COORDINATOR.md #107 Stage
+        // 2b-3. `__ICSTOREHLL dest <dense-hll-bytes>` writes a spanning-PFMERGE merged HLL to
+        // the dest owner (a single-key denyoom write keyed on args[1]) with the dest TTL
+        // PRESERVED (unlike the set/zset *STORE verbs, which clear it). It is in the registry
+        // so it routes / admits like any keyed write AND so the registry-vs-dispatch
+        // cross-check stays exact, but it is CLIENT-UNREACHABLE: the serve-loop router rejects
+        // it before routing, so a client `__ICSTOREHLL` gets unknown-command; only the
+        // coordinator issues it internally. Arity Min(2) (token + dest; the object follows). --
+        b"__ICSTOREHLL" => &CommandSpec {
+            name: b"__ICSTOREHLL",
+            arity: Min(2),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: true,
+            control: false,
+        },
         _ => return None,
     };
     Some(spec)
