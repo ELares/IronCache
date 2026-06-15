@@ -18,13 +18,20 @@
 //! `CONFIG GET`/`CONFIG SET` dispatch over. Human sizes ("512mb") are parsed by
 //! [`parse_human_size`].
 
+// No unsafe anywhere in the config crate (it folds layered config and hashes the
+// requirepass password); the hand-rolled SHA-256 (#65) is pure safe Rust, so the
+// whole crate forbids unsafe, matching every other workspace crate.
+#![forbid(unsafe_code)]
+
 pub mod registry;
 pub mod runtime;
+pub mod sha256;
 
 pub use registry::{
     ParamSpec, SetKind, SetOutcome, apply_set, effective_value, lookup, param_specs,
 };
 pub use runtime::RuntimeConfig;
+pub use sha256::sha256_hex;
 
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr};
@@ -180,7 +187,15 @@ pub struct Config {
     /// ADR-0007 (cache mode), NOT Redis's `noeviction` default. Validated against the
     /// recognized names in [`Config::validate`].
     pub maxmemory_policy: String,
-    /// Optional `requirepass` password. `None` means auth is not required.
+    /// Optional `requirepass` credential, stored as the SHA-256 HEX digest of the
+    /// password AT REST (AUTH.md "Passwords are stored as SHA-256", #65), NOT the
+    /// plaintext. `None` means auth is not required.
+    ///
+    /// The boot INPUT (TOML/env/CLI) is plaintext, so the plaintext is folded through
+    /// the overlays and then hashed ONCE at the end of [`Config::resolve`] (via
+    /// [`Config::finalize_requirepass`]); the long-lived `Config` therefore holds only
+    /// the digest, and no plaintext password persists past config load. An
+    /// empty/unset password stays `None`.
     pub requirepass: Option<String>,
     /// Idle timeout in seconds; `0` disables idle disconnection (Redis default 0,
     /// CONNECTION_LIFECYCLE.md).
@@ -245,7 +260,28 @@ impl Config {
         for o in overlays {
             o.apply_to(&mut cfg)?;
         }
+        // SECURITY (#65): the overlays carry the requirepass PLAINTEXT (TOML/env/CLI
+        // input), and `apply_to` left the resolved plaintext in `cfg.requirepass`. Hash
+        // it AT THE END, after the full TOML < env < CLI layering has resolved the final
+        // plaintext, so the long-lived `Config` holds ONLY the SHA-256 digest and no
+        // plaintext password survives config load. An empty/unset password stays `None`.
+        cfg.finalize_requirepass();
         Ok(cfg)
+    }
+
+    /// Replace the resolved `requirepass` PLAINTEXT with its SHA-256 hex digest in place
+    /// (#65). Called once at the end of [`Config::resolve`], after the overlay fold has
+    /// produced the final plaintext, so the long-lived `Config` never retains the
+    /// plaintext. An empty string clears it to `None` (auth disabled); a `None` stays
+    /// `None`. Idempotency is NOT assumed: this must run exactly once on the resolved
+    /// plaintext (a second call would hash the hash). `resolve` is the single caller.
+    fn finalize_requirepass(&mut self) {
+        self.requirepass = match self.requirepass.take() {
+            Some(plaintext) if !plaintext.is_empty() => Some(sha256_hex(plaintext.as_bytes())),
+            // An explicit empty password disables auth, matching the runtime
+            // `set_requirepass("")` semantics; an unset password is already `None`.
+            _ => None,
+        };
     }
 
     /// Validate cross-field invariants after resolution.
@@ -568,7 +604,48 @@ mod tests {
         assert_eq!(cfg.port, 7000);
         assert_eq!(cfg.shards, 4);
         assert_eq!(cfg.maxmemory, 256 * 1024 * 1024);
-        assert_eq!(cfg.requirepass.as_deref(), Some("secret"));
+        // SECURITY (#65): requirepass is stored as the SHA-256 HEX of the plaintext AT
+        // REST, never the plaintext "secret" itself.
+        assert_eq!(
+            cfg.requirepass.as_deref(),
+            Some(sha256_hex(b"secret").as_str())
+        );
+        assert_ne!(cfg.requirepass.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn requirepass_is_hashed_at_rest_not_plaintext() {
+        // SECURITY (#65): the boot input is plaintext (TOML/env/CLI), but after resolve
+        // the long-lived Config holds ONLY the SHA-256 hex digest, never the plaintext.
+        let o = ConfigOverlay {
+            requirepass: Some("hunter2".to_owned()),
+            ..Default::default()
+        };
+        let cfg = Config::resolve(&[o]).unwrap();
+        let stored = cfg
+            .requirepass
+            .as_deref()
+            .expect("requirepass should be set");
+        assert_eq!(stored, sha256_hex(b"hunter2"));
+        assert_eq!(stored.len(), 64);
+        // The plaintext must NOT be retained anywhere in the stored credential.
+        assert_ne!(stored, "hunter2");
+        assert!(!stored.contains("hunter2"));
+    }
+
+    #[test]
+    fn empty_requirepass_resolves_to_none() {
+        // An explicit empty requirepass disables auth (None), and is never hashed into a
+        // bogus credential.
+        let o = ConfigOverlay {
+            requirepass: Some(String::new()),
+            ..Default::default()
+        };
+        let cfg = Config::resolve(&[o]).unwrap();
+        assert!(cfg.requirepass.is_none());
+        // An unset requirepass stays None too.
+        let cfg2 = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert!(cfg2.requirepass.is_none());
     }
 
     #[test]

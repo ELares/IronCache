@@ -217,7 +217,16 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // Runtime-settable: read the overlay (a CONFIG SET wins over the boot value).
         "maxmemory" => runtime.maxmemory().to_string(),
         "maxmemory-policy" => runtime.policy_name(),
-        // Redis reports an unset requirepass as the empty string (NOT nil).
+        // SECURITY DIVERGENCE (#65): `CONFIG GET requirepass` returns the stored SHA-256
+        // HEX digest, NOT the plaintext. Redis echoes the plaintext here; IronCache
+        // deliberately does not, because retaining the plaintext for CONFIG GET would
+        // defeat the at-rest hardening (the password is stored as a digest, AUTH.md /
+        // threat-model #142). This is low-risk: only an AUTHENTICATED client reaches
+        // CONFIG GET (it is NOAUTH-gated) and it already knows the password, so exposing
+        // the digest leaks nothing it could not compute itself. An unset requirepass
+        // reports the empty string (Redis parity for unset, NOT nil). NOTE: the value a
+        // client reads here is a hash and is NOT meant to be re-`SET` (CONFIG SET always
+        // treats its value as plaintext; the ACL `#<hash>` pre-hashed form is #106).
         "requirepass" => runtime.requirepass().unwrap_or_default(),
         // Accepted no-ops: fixed Redis-recognized defaults under the cache build.
         // `maxmemory-samples` defaults to 5 in Redis; save/appendonly default to off.
@@ -297,6 +306,10 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
             }
         }
         "requirepass" => {
+            // `value` is ALWAYS a PLAINTEXT password (Redis requirepass semantics);
+            // set_requirepass hashes it to SHA-256 before storing (#65). The ACL
+            // `#<hash>` pre-hashed syntax is #106 (later), so a digest read back via
+            // CONFIG GET is not meant to be re-SET here. An empty value disables auth.
             runtime.set_requirepass(value);
             SetOutcome::Applied
         }
@@ -450,11 +463,27 @@ mod tests {
             apply_set("maxmemory-policy", "allkeys-ttl", &rc),
             SetOutcome::InvalidValue(_)
         ));
-        // requirepass accepts any string; empty disables auth.
+        // requirepass accepts any plaintext string; empty disables auth.
         assert_eq!(apply_set("requirepass", "pw", &rc), SetOutcome::Applied);
         assert!(rc.requires_auth());
+        // SECURITY (#65): CONFIG GET requirepass returns the SHA-256 HEX of the plaintext
+        // that was SET, never the plaintext, and never nil.
+        let cfg = boot();
+        assert_eq!(
+            effective_value("requirepass", &rc, &cfg).as_deref(),
+            Some(crate::sha256_hex(b"pw").as_str())
+        );
+        assert_ne!(
+            effective_value("requirepass", &rc, &cfg).as_deref(),
+            Some("pw")
+        );
         assert_eq!(apply_set("requirepass", "", &rc), SetOutcome::Applied);
         assert!(!rc.requires_auth());
+        // Unset reports the empty string (Redis parity for unset), not nil.
+        assert_eq!(
+            effective_value("requirepass", &rc, &cfg).as_deref(),
+            Some("")
+        );
         // restart-required params report RestartRequired.
         assert_eq!(apply_set("port", "7000", &rc), SetOutcome::RestartRequired);
         assert_eq!(
