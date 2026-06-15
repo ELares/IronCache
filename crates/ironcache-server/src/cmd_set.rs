@@ -645,19 +645,93 @@ fn read_members<S: Store>(
     })
 }
 
-/// The set-algebra operation requested.
-#[derive(Clone, Copy)]
-enum SetOp {
+/// The set-algebra operation requested. PUBLIC so the cross-shard coordinator (which
+/// gathers the source member lists itself, then combines via the SHARED [`set_combine`])
+/// names the same operation the single-shard handlers do; re-exported from the crate root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    /// SINTER / SINTERSTORE / SINTERCARD: the intersection of all sources.
     Inter,
+    /// SUNION / SUNIONSTORE: the union of all sources.
     Union,
+    /// SDIFF / SDIFFSTORE: the first source minus all the rest.
     Diff,
+}
+
+/// The PURE set-algebra combiner: given the already-gathered member lists of the source
+/// keys IN ORIGINAL KEY ORDER (`sources[i]` is key `i`'s members; a missing/empty source
+/// key is an EMPTY `Vec`), return the sorted result members. This is the ONE SOURCE OF
+/// TRUTH for SINTER/SUNION/SDIFF semantics: BOTH the single-shard handler
+/// ([`compute_algebra`], which reads each key's members from the local store) AND the
+/// cross-shard coordinator (which gathers each key's members from its owner shard) call
+/// this, so the two CANNOT drift (COORDINATOR.md #107, Stage 2b: gather + shared combine).
+///
+/// The semantics, preserved EXACTLY from the prior in-line `compute_algebra`:
+/// - **Inter**: any empty source short-circuits to the empty result; otherwise intersect
+///   starting from the SMALLEST source for efficiency.
+/// - **Union**: every member of every source.
+/// - **Diff**: the FIRST source minus all the rest; a missing/empty first source -> empty.
+/// - The result is sorted (a `BTreeSet`) so the reply / stored value is deterministic.
+///
+/// An empty `sources` yields the empty result for every op (the single-shard callers
+/// validate arity >= one source key before gathering, so this is the defensive floor).
+#[must_use]
+pub fn set_combine(op: SetOp, sources: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
+    match op {
+        SetOp::Inter => {
+            if sources.is_empty() {
+                return Vec::new();
+            }
+            // SINTER: any empty/missing source -> empty intersection; otherwise intersect
+            // starting from the SMALLEST set for efficiency (the prior in-line behavior).
+            let sets: Vec<BTreeSet<Vec<u8>>> = sources
+                .iter()
+                .map(|members| members.iter().cloned().collect())
+                .collect();
+            if sets.iter().any(BTreeSet::is_empty) {
+                return Vec::new();
+            }
+            let start = sets
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.len())
+                .map_or(0, |(i, _)| i);
+            sets[start]
+                .iter()
+                .filter(|m| sets.iter().all(|s| s.contains(*m)))
+                .cloned()
+                .collect()
+        }
+        SetOp::Union => {
+            let mut result: BTreeSet<Vec<u8>> = BTreeSet::new();
+            for members in sources {
+                result.extend(members.iter().cloned());
+            }
+            result.into_iter().collect()
+        }
+        SetOp::Diff => {
+            // SDIFF: the first set minus all the rest. A missing first key -> empty result.
+            let Some((first, rest)) = sources.split_first() else {
+                return Vec::new();
+            };
+            let mut result: BTreeSet<Vec<u8>> = first.iter().cloned().collect();
+            for members in rest {
+                for m in members {
+                    result.remove(m);
+                }
+            }
+            result.into_iter().collect()
+        }
+    }
 }
 
 /// Compute the result of a set-algebra op over the source keys, in a DETERMINISTIC order:
 /// `Ok(members)` (the sorted result) or `Err(())` if any source is a non-set. A missing
-/// source key is an EMPTY set: SINTER with any missing/empty key is the empty result;
-/// SUNION/SDIFF skip a missing key (SDIFF subtracts nothing for it). The result is sorted
-/// (the algebra uses a `BTreeSet`) so the reply / stored value is deterministic.
+/// source key is an EMPTY set. This is the SINGLE-SHARD path: it READS each key's members
+/// from the local store (surfacing a WRONGTYPE on any non-set source), then delegates the
+/// PURE combine to the SHARED [`set_combine`] (the one source of truth the cross-shard
+/// coordinator also calls), so the two cannot drift. We read ALL sources (not short-circuit
+/// on an empty first) so a WRONGTYPE on ANY key is surfaced, matching Redis.
 fn compute_algebra<S: Store>(
     store: &mut S,
     db: u32,
@@ -665,55 +739,13 @@ fn compute_algebra<S: Store>(
     keys: &[Bytes],
     op: SetOp,
 ) -> Result<Vec<Vec<u8>>, ()> {
-    match op {
-        SetOp::Inter => {
-            // SINTER: read the FIRST key; if it is empty/missing the result is empty
-            // (still type-checking the rest is Redis's behavior, but a short-circuit on an
-            // empty first key after reading the rest matches the observable result; we read
-            // all to surface a WRONGTYPE on any key, then intersect).
-            let mut sets: Vec<BTreeSet<Vec<u8>>> = Vec::with_capacity(keys.len());
-            for k in keys {
-                let members = read_members(store, db, now, k)?;
-                sets.push(members.into_iter().collect());
-            }
-            // Any empty source -> empty intersection.
-            if sets.iter().any(BTreeSet::is_empty) {
-                return Ok(Vec::new());
-            }
-            // Intersect, starting from the smallest set for efficiency.
-            let start = sets
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, s)| s.len())
-                .map_or(0, |(i, _)| i);
-            let result: BTreeSet<Vec<u8>> = sets[start]
-                .iter()
-                .filter(|m| sets.iter().all(|s| s.contains(*m)))
-                .cloned()
-                .collect();
-            Ok(result.into_iter().collect())
-        }
-        SetOp::Union => {
-            let mut result: BTreeSet<Vec<u8>> = BTreeSet::new();
-            for k in keys {
-                let members = read_members(store, db, now, k)?;
-                result.extend(members);
-            }
-            Ok(result.into_iter().collect())
-        }
-        SetOp::Diff => {
-            // SDIFF: the first set minus all the rest. A missing first key -> empty result.
-            let first = read_members(store, db, now, &keys[0])?;
-            let mut result: BTreeSet<Vec<u8>> = first.into_iter().collect();
-            for k in &keys[1..] {
-                let members = read_members(store, db, now, k)?;
-                for m in members {
-                    result.remove(&m);
-                }
-            }
-            Ok(result.into_iter().collect())
-        }
+    // Gather each source key's members in ORIGINAL KEY ORDER (a missing key -> empty set);
+    // any non-set source aborts with WRONGTYPE BEFORE the combine, exactly as before.
+    let mut sources: Vec<Vec<Vec<u8>>> = Vec::with_capacity(keys.len());
+    for k in keys {
+        sources.push(read_members(store, db, now, k)?);
     }
+    Ok(set_combine(op, &sources))
 }
 
 /// `SINTER key [key ...]` / `SUNION key [key ...]` / `SDIFF key [key ...]` -> the result
@@ -868,6 +900,57 @@ pub fn cmd_sunionstore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &
 /// `SDIFFSTORE destination key [key ...]` -> the cardinality stored at destination.
 pub fn cmd_sdiffstore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
     store_generic(store, db, now, req, SetOp::Diff, "sdiffstore")
+}
+
+/// The internal token the cross-shard coordinator uses to write a *STORE result set to the
+/// dest owner shard (COORDINATOR.md #107, Stage 2b). NOT a client command: the decoder /
+/// router gate it so a client sending it gets `unknown command`; only the coordinator
+/// issues it (via `dispatch_one_value` / `run_local_keyed`) after it has GATHERED the
+/// sources cross-shard and COMBINED them with the shared [`set_combine`]. See
+/// [`cmd_icstoreset`].
+pub const ICSTORESET: &[u8] = b"__ICSTORESET";
+
+/// INTERNAL: `__ICSTORESET dest m1 m2 ...` -> the dest cardinality. The dest-write half of
+/// the cross-shard set *STORE (COORDINATOR.md #107, Stage 2b): write the supplied NON-EMPTY
+/// member list to `dest` on its OWNER shard with the EXACT blind-overwrite-clearing-TTL
+/// semantics the single-shard [`store_generic`] uses (`RmwAction::Insert(new_set)` +
+/// `ExpireWrite::Clear`), so a spanning SINTERSTORE/SUNIONSTORE/SDIFFSTORE is byte-identical
+/// to the single-shard write. The coordinator gathers + combines the sources itself (the
+/// shared [`set_combine`]) and routes the EMPTY-result case as a `DEL dest` (Redis deletes
+/// dest on an empty result), so this verb is only ever issued with a non-empty member list;
+/// it defensively DELETES dest on an empty arg list too (so the empty case stays correct
+/// even if a future caller routes it here). It is a single-key write keyed on `dest`
+/// (`args[1]`), so it routes + admits like any keyed write through the existing substrate.
+///
+/// CLIENT-UNREACHABLE: this is gated out of the client command path (the serve-loop router
+/// and the queue-time validator reject [`ICSTORESET`] before routing), so a client sending
+/// `__ICSTORESET` gets the standard unknown-command error; only the coordinator reaches this
+/// arm, via the internal `dispatch_remote_keyed` / `run_local_keyed` path.
+pub fn cmd_icstoreset<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    // `__ICSTORESET dest [m ...]`: at least the dest key. (Arity Min(2) in the registry.)
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("__icstoreset"));
+    }
+    let dest = req.args[1].clone();
+    let members: Vec<Vec<u8>> = req.args[2..].iter().map(|b| b.to_vec()).collect();
+    let card = count_distinct(&members);
+    if members.is_empty() {
+        // Defensive: an empty member list deletes dest (Redis deletes dest on an empty
+        // *STORE result). The coordinator normally routes the empty case as `DEL dest` and
+        // only issues this verb with members, but keep the semantics correct here too.
+        store.delete(db, &dest, now);
+        return Value::Integer(0);
+    }
+    // Blind OVERWRITE of dest with the result set, CLEARING any prior type/TTL -- the EXACT
+    // single-shard *STORE write (`store_generic`): build fresh via the create path (the
+    // encoding ladder), Insert replaces any existing value/type, ExpireWrite::Clear drops
+    // any prior TTL.
+    store.rmw_mut(db, &dest, now, move |_entry| RmwStep {
+        action: RmwAction::Insert(new_set(members)),
+        expire: ExpireWrite::Clear,
+        reply: (),
+    });
+    Value::Integer(card)
 }
 
 // ---------------------------------------------------------------------------

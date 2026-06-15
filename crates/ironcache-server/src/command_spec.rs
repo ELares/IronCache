@@ -1488,6 +1488,21 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             denyoom: false,
             control: false,
         },
+        // -- INTERNAL cross-shard verb (cmd_set::cmd_icstoreset), COORDINATOR.md #107 Stage
+        // 2b. `__ICSTORESET dest m...` writes a spanning set-*STORE result to the dest owner
+        // (a single-key denyoom write keyed on args[1]). It is in the registry so it routes /
+        // admits like any keyed write AND so the registry-vs-dispatch cross-check stays exact,
+        // but it is CLIENT-UNREACHABLE: the serve-loop router and the queue-time validator
+        // reject it before routing, so a client `__ICSTORESET` gets unknown-command; only the
+        // coordinator issues it internally. Arity Min(2) (token + dest; members optional). --
+        b"__ICSTORESET" => &CommandSpec {
+            name: b"__ICSTORESET",
+            arity: Min(2),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: true,
+            control: false,
+        },
         _ => return None,
     };
     Some(spec)

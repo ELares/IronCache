@@ -34,6 +34,11 @@ pub mod glob;
 pub mod route;
 
 pub use admission::is_denyoom;
+// The PURE set-algebra combiner + its op enum (the single source of truth shared by the
+// single-shard set handlers and the cross-shard coordinator's gather-combine, COORDINATOR.md
+// #107, Stage 2b), and the INTERNAL `__ICSTORESET` dest-write verb token (client-unreachable;
+// only the coordinator issues it to write a spanning *STORE result to the dest owner).
+pub use cmd_set::{ICSTORESET, SetOp, set_combine};
 // The #89 single-source-of-truth command registry. `CommandClass` is also re-exported via
 // `route` (its legacy path) below; `Arity` is re-exported via `cmd_txn` (its legacy path).
 pub use command_spec::{Arity, CommandSpec, KeySpecKind, spec_of};
