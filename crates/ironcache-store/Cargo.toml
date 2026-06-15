@@ -16,6 +16,12 @@ workspace = true
 [dependencies]
 # The frozen waist this crate implements.
 ironcache-storage = { workspace = true }
+# The collection encoding thresholds (PR-5: list-max-listpack-size byte budget +
+# element cap). The store reads these DEFAULTS to decide the listpack->quicklist
+# transition; config is a leaf crate (serde/toml only), so this edge introduces no
+# cycle. The runtime-settable form is a follow-up; the defaults live in config so
+# CONFIG GET can echo the recognized parameter (registry entry).
+ironcache-config = { workspace = true }
 # The pluggable eviction policies (EVICTION.md #48, ADR-0008). The store's
 # `evict_to_fit` + the policy-query accessors (policy_name/evicts/volatile_only)
 # name the EvictionPolicy trait; the binary wires a concrete `Policy` as the store's

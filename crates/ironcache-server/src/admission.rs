@@ -52,6 +52,19 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             | b"RENAME"
             | b"RENAMENX"
             | b"COPY"
+            // List writes that allocate value bytes (PR-5). LPUSH/RPUSH/LPUSHX/RPUSHX
+            // grow the list; LSET/LINSERT add/replace an element; LMOVE/RPOPLPUSH
+            // materialize an element at the destination. All are `denyoom` in Redis.
+            // LPOP/RPOP/LREM/LTRIM and the read commands (LLEN/LRANGE/LINDEX/LPOS) are
+            // memory-RELEASING or read-only, so they are NOT gated.
+            | b"LPUSH"
+            | b"RPUSH"
+            | b"LPUSHX"
+            | b"RPUSHX"
+            | b"LSET"
+            | b"LINSERT"
+            | b"LMOVE"
+            | b"RPOPLPUSH"
     )
 }
 
@@ -76,6 +89,15 @@ mod tests {
             b"RENAME",
             b"RENAMENX",
             b"COPY",
+            // List writes (PR-5).
+            b"LPUSH",
+            b"RPUSH",
+            b"LPUSHX",
+            b"RPUSHX",
+            b"LSET",
+            b"LINSERT",
+            b"LMOVE",
+            b"RPOPLPUSH",
         ] {
             assert!(is_denyoom(w), "{w:?} should be denyoom");
         }
@@ -116,6 +138,15 @@ mod tests {
             b"PTTL",
             b"PERSIST",
             b"EXPIREAT",
+            // List reads + memory-releasing list writes (PR-5): not denyoom.
+            b"LPOP",
+            b"RPOP",
+            b"LREM",
+            b"LTRIM",
+            b"LLEN",
+            b"LRANGE",
+            b"LINDEX",
+            b"LPOS",
         ] {
             assert!(!is_denyoom(r), "{r:?} must not be denyoom");
         }

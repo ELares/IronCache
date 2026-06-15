@@ -78,6 +78,8 @@ fn rmw_vacant_inserts() {
             expire: ExpireWrite::Unchanged,
             reply: 0,
         },
+        // The read-only `rmw` never yields the in-place-mutation arm (PR-5).
+        RmwEntry::OccupiedMut(_) => unreachable!("rmw never yields OccupiedMut"),
     });
     assert_eq!(reply, 1);
     assert_eq!(s.read(0, b"k", NOW).unwrap().as_bytes(), b"new");
@@ -99,6 +101,7 @@ fn rmw_occupied_mutates_and_replies() {
             expire: ExpireWrite::Unchanged,
             reply: Vec::new(),
         },
+        RmwEntry::OccupiedMut(_) => unreachable!("rmw never yields OccupiedMut"),
     });
     assert_eq!(old, b"old");
     assert_eq!(s.read(0, b"k", NOW).unwrap().as_bytes(), b"new");
@@ -118,6 +121,7 @@ fn rmw_observe_and_write_are_atomic() {
                 .parse::<i64>()
                 .unwrap(),
             RmwEntry::Vacant => 0,
+            RmwEntry::OccupiedMut(_) => unreachable!("rmw never yields OccupiedMut"),
         };
         let next = cur + 1;
         RmwStep {

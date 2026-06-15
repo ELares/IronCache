@@ -26,7 +26,9 @@
 
 use crate::encoding::{Classified, EMBSTR_THRESHOLD, classify};
 use bytes::Bytes;
-use ironcache_storage::{DataType, Encoding, NewValueOwned, UnixMillis};
+use ironcache_config::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES;
+use ironcache_storage::{DataType, Encoding, ListValue, NewValueOwned, UnixMillis};
+use std::collections::VecDeque;
 
 /// The inline-value buffer capacity (embstr). Matches [`EMBSTR_THRESHOLD`]; a
 /// value classified as embstr fits here without a separate allocation in the
@@ -68,11 +70,18 @@ impl Header {
     /// The maximum S3-FIFO rank (2-bit counter capped at 3, ADR-0008).
     pub const MAX_EVICTION_RANK: u8 = 3;
 
-    /// A header for a freshly written value of the given encoding/ttl.
+    /// A header for a freshly written STRING value of the given encoding/ttl.
     #[must_use]
     pub fn new(encoding: Encoding, ttl_present: bool) -> Self {
+        Header::with_type(DataType::String, encoding, ttl_present)
+    }
+
+    /// A header for a freshly written value of an explicit data type (PR-5: the LIST
+    /// path passes [`DataType::List`]; the string path uses [`Header::new`]).
+    #[must_use]
+    pub fn with_type(data_type: DataType, encoding: Encoding, ttl_present: bool) -> Self {
         Header {
-            data_type: DataType::String,
+            data_type,
             encoding,
             eviction_rank: 0,
             ttl_present,
@@ -125,29 +134,327 @@ pub enum ValueRepr {
     Inline(InlineBuf),
     /// A long string stored out-of-line. `OBJECT ENCODING` -> raw.
     Raw(Box<[u8]>),
+    /// A LIST value (PR-5). `OBJECT ENCODING` -> `listpack` while small, `quicklist`
+    /// once over the threshold (a pure function of the active repr, #40).
+    List(ListVal),
 }
 
 impl ValueRepr {
-    /// The encoding this representation reports.
+    /// The encoding this representation reports. For a LIST the name is a pure
+    /// function of the active repr ([`ListVal::encoding`]); see #40.
     #[must_use]
     pub fn encoding(&self) -> Encoding {
         match self {
             ValueRepr::Int(_) => Encoding::Int,
             ValueRepr::Inline(_) => Encoding::EmbStr,
             ValueRepr::Raw(_) => Encoding::Raw,
+            ValueRepr::List(l) => l.encoding(),
         }
     }
 
     /// The logical byte length of the value as the command layer sees it: the
-    /// decimal-digit count for an int, the byte length for a string. This is what
-    /// STRLEN reports and what the accounting hook charges for the value.
+    /// decimal-digit count for an int, the byte length for a string, the SUM of
+    /// element byte lengths for a list. This is what STRLEN reports for a string and
+    /// what the accounting hook charges for the value bytes.
     #[must_use]
     pub fn logical_len(&self) -> usize {
         match self {
             ValueRepr::Int(n) => int_decimal_len(*n),
             ValueRepr::Inline(b) => b.as_bytes().len(),
             ValueRepr::Raw(b) => b.len(),
+            ValueRepr::List(l) => l.element_bytes(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ListVal: the PR-5 list value (COLLECTIONS.md, LIST_LARGE.md, OBJECT_ENCODING_
+// MAPPING.md #40). A pragmatic v1 backed by a `VecDeque<Box<[u8]>>` of elements in
+// head-to-tail order, tracking the running element-byte total so accounting and the
+// encoding transition are O(1) reads.
+//
+// ## Representation and the cascade-free contract
+//
+// The exact Redis listpack BYTE format is DEFERRED: OBJECT ENCODING reports the NAME
+// by the ACTIVE repr (#40, OBJECT_ENCODING_MAPPING.md), not the byte layout, so a
+// contiguous element deque satisfies the wire contract. The cascade-free property
+// COLLECTIONS.md mandates ("an insert performs at most one tail memmove and no
+// predecessor rewrite") is satisfied because a `VecDeque` insert shifts the shorter
+// side ONCE with no per-element rewrite. The chunked-listpack quicklist (a
+// `VecDeque` of contiguous packed chunks) is the documented #8/#135/#136 follow-up;
+// it slots in behind this same `ListValue` API without touching the waist or the
+// command layer.
+//
+// ## The listpack -> quicklist transition (#40)
+//
+// The reported encoding is a PURE FUNCTION of the active state: a list is `listpack`
+// while its total element bytes are at or below the `list-max-listpack-size` byte
+// budget, and reports `quicklist` once it exceeds that budget. There is NO
+// element-count cap for lists (Redis's default `-2` negative fill sizes by BYTES with
+// the count left unlimited, so e.g. a 129-element list of small values stays
+// `listpack`). Reconfiguring the budget changes WHEN a value converts, never the name
+// reported for a value that has not converted.
+// ---------------------------------------------------------------------------
+
+/// A LIST value (PR-5). Elements are stored in head-to-tail order in a `VecDeque`,
+/// with a running element-byte total for O(1) accounting and an O(1) encoding
+/// transition check. The transition threshold is the config default byte budget
+/// (`list-max-listpack-size`, default 8 KB); there is NO element-count cap for lists.
+/// A runtime-settable budget is a follow-up.
+#[derive(Debug, Clone, Default)]
+pub struct ListVal {
+    /// The elements in head (front) to tail (back) order.
+    elems: VecDeque<Box<[u8]>>,
+    /// The running sum of element byte lengths (kept in lockstep with `elems` so the
+    /// accounting weight and the encoding transition are O(1)).
+    total_bytes: usize,
+}
+
+impl ListVal {
+    /// An empty list (used as the create-on-missing seed before the first push).
+    #[must_use]
+    pub fn new() -> Self {
+        ListVal {
+            elems: VecDeque::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// The sum of element byte lengths (the value-bytes side of accounting and the
+    /// `logical_len` for a list). Does NOT include the key bytes (the kvobj adds
+    /// those) or per-element bookkeeping (the FAM/chunk packing is a #8 follow-up).
+    #[must_use]
+    pub fn element_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// The encoding this list reports, a PURE FUNCTION of the active repr (#40):
+    /// `listpack` while the total element bytes stay at or below the byte budget,
+    /// `quicklist` once over it. There is NO element-count cap for lists: Redis's
+    /// default `list-max-listpack-size -2` is a negative fill, which sizes the listpack
+    /// node by BYTES (8 KB) with the element count left unlimited (quicklist.c
+    /// `quicklistNodeLimit` sets `count = UINT_MAX` for a negative fill). The 128-entry
+    /// cap is the HASH/ZSET default, NOT the list default. See the type docs.
+    #[must_use]
+    pub fn encoding(&self) -> Encoding {
+        if self.total_bytes > DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES {
+            Encoding::QuickList
+        } else {
+            Encoding::ListPack
+        }
+    }
+
+    /// Normalize a signed Redis index against the current length into a `usize`
+    /// in-bounds offset, or `None` if it falls outside `[0, len)`. A negative index
+    /// counts from the tail (`-1` is the last element).
+    fn resolve_index(&self, index: i64) -> Option<usize> {
+        let len = self.elems.len() as i64;
+        let i = if index < 0 { index + len } else { index };
+        if i < 0 || i >= len {
+            None
+        } else {
+            Some(i as usize)
+        }
+    }
+
+    /// Normalize a signed inclusive Redis range `[start, stop]` against the current
+    /// length into a half-open `usize` range `start_idx..end_idx` (end exclusive),
+    /// clamped to bounds. Returns an EMPTY range (`a..a`) when the range is empty or
+    /// inverted, matching Redis LRANGE/LTRIM normalization.
+    fn resolve_range(&self, start: i64, stop: i64) -> std::ops::Range<usize> {
+        let len = self.elems.len() as i64;
+        if len == 0 {
+            return 0..0;
+        }
+        let mut s = if start < 0 { start + len } else { start };
+        let mut e = if stop < 0 { stop + len } else { stop };
+        if s < 0 {
+            s = 0;
+        }
+        if e >= len {
+            e = len - 1;
+        }
+        if s > e || s >= len {
+            return 0..0;
+        }
+        // s..=e inclusive -> s..(e+1) half-open. Both are now in [0, len).
+        (s as usize)..((e + 1) as usize)
+    }
+}
+
+impl ListValue for ListVal {
+    fn push_front(&mut self, elem: &[u8]) {
+        self.total_bytes += elem.len();
+        self.elems.push_front(elem.to_vec().into_boxed_slice());
+    }
+
+    fn push_back(&mut self, elem: &[u8]) {
+        self.total_bytes += elem.len();
+        self.elems.push_back(elem.to_vec().into_boxed_slice());
+    }
+
+    fn pop_front(&mut self) -> Option<Vec<u8>> {
+        let e = self.elems.pop_front()?;
+        self.total_bytes -= e.len();
+        Some(e.into_vec())
+    }
+
+    fn pop_back(&mut self) -> Option<Vec<u8>> {
+        let e = self.elems.pop_back()?;
+        self.total_bytes -= e.len();
+        Some(e.into_vec())
+    }
+
+    fn len(&self) -> usize {
+        self.elems.len()
+    }
+
+    fn get(&self, index: i64) -> Option<Vec<u8>> {
+        let i = self.resolve_index(index)?;
+        self.elems.get(i).map(|e| e.to_vec())
+    }
+
+    fn set(&mut self, index: i64, elem: &[u8]) -> bool {
+        let Some(i) = self.resolve_index(index) else {
+            return false;
+        };
+        // One in-place entry rewrite (LSET): swap the element, adjust the byte total.
+        let slot = &mut self.elems[i];
+        self.total_bytes -= slot.len();
+        self.total_bytes += elem.len();
+        *slot = elem.to_vec().into_boxed_slice();
+        true
+    }
+
+    fn insert_before(&mut self, pivot: &[u8], elem: &[u8]) -> Option<usize> {
+        let at = self.elems.iter().position(|e| e.as_ref() == pivot)?;
+        // VecDeque::insert shifts the shorter side once (one tail memmove, no
+        // predecessor rewrite), satisfying the cascade-free contract.
+        self.elems.insert(at, elem.to_vec().into_boxed_slice());
+        self.total_bytes += elem.len();
+        Some(self.elems.len())
+    }
+
+    fn insert_after(&mut self, pivot: &[u8], elem: &[u8]) -> Option<usize> {
+        let at = self.elems.iter().position(|e| e.as_ref() == pivot)?;
+        self.elems.insert(at + 1, elem.to_vec().into_boxed_slice());
+        self.total_bytes += elem.len();
+        Some(self.elems.len())
+    }
+
+    fn remove_matching(&mut self, count: i64, elem: &[u8]) -> usize {
+        let mut removed = 0usize;
+        if count >= 0 {
+            // count == 0 -> remove all; count > 0 -> at most `count`, head to tail.
+            let cap = if count == 0 {
+                usize::MAX
+            } else {
+                count as usize
+            };
+            let mut i = 0;
+            while i < self.elems.len() && removed < cap {
+                if self.elems[i].as_ref() == elem {
+                    let e = self.elems.remove(i).expect("index in range");
+                    self.total_bytes -= e.len();
+                    removed += 1;
+                    // Do not advance `i`: the next element shifted into this slot.
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            // count < 0 -> at most |count|, tail to head.
+            let cap = count.unsigned_abs() as usize;
+            let mut i = self.elems.len();
+            while i > 0 && removed < cap {
+                i -= 1;
+                if self.elems[i].as_ref() == elem {
+                    let e = self.elems.remove(i).expect("index in range");
+                    self.total_bytes -= e.len();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
+    fn trim(&mut self, start: i64, stop: i64) {
+        let keep = self.resolve_range(start, stop);
+        if keep.is_empty() {
+            self.elems.clear();
+            self.total_bytes = 0;
+            return;
+        }
+        // Drop the tail past `keep.end`, then the head before `keep.start`. Crediting
+        // the byte total as we go keeps it exact.
+        while self.elems.len() > keep.end {
+            if let Some(e) = self.elems.pop_back() {
+                self.total_bytes -= e.len();
+            }
+        }
+        for _ in 0..keep.start {
+            if let Some(e) = self.elems.pop_front() {
+                self.total_bytes -= e.len();
+            }
+        }
+    }
+
+    fn range(&self, start: i64, stop: i64) -> Vec<Vec<u8>> {
+        let r = self.resolve_range(start, stop);
+        self.elems
+            .iter()
+            .skip(r.start)
+            .take(r.len())
+            .map(|e| e.to_vec())
+            .collect()
+    }
+
+    fn pos(&self, elem: &[u8], rank: i64, count: Option<usize>, maxlen: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let len = self.elems.len();
+        if len == 0 || rank == 0 {
+            return out;
+        }
+        // `count == Some(0)` means "all matches"; `None` means "just the first".
+        let want = match count {
+            None => 1,
+            Some(0) => usize::MAX,
+            Some(n) => n,
+        };
+        // `maxlen == 0` means no comparison limit.
+        let cmp_limit = if maxlen == 0 { usize::MAX } else { maxlen };
+
+        // The MAXLEN-bounded scan: `take(cmp_limit)` caps the elements COMPARED. For a
+        // positive rank we scan head->tail (the first `cmp_limit`); for a negative rank
+        // tail->head (the last `cmp_limit`). `to_skip` skips the first `|rank|-1`
+        // matches; then we collect up to `want` matches.
+        let mut to_skip = (rank.unsigned_abs() as usize) - 1;
+        let mut collect = |i: usize, e: &[u8]| -> bool {
+            // Returns true to STOP scanning (enough matches found).
+            if e == elem {
+                if to_skip > 0 {
+                    to_skip -= 1;
+                    return false;
+                }
+                out.push(i);
+                return out.len() >= want;
+            }
+            false
+        };
+        if rank > 0 {
+            for (i, e) in self.elems.iter().enumerate().take(cmp_limit) {
+                if collect(i, e) {
+                    break;
+                }
+            }
+        } else {
+            for (i, e) in self.elems.iter().enumerate().rev().take(cmp_limit) {
+                if collect(i, e) {
+                    break;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -266,6 +573,71 @@ impl KvObj {
         match value {
             NewValueOwned::Int(n) => KvObj::from_int(key, n, expire_at),
             NewValueOwned::Bytes(b) => KvObj::from_bytes(key, &b, expire_at),
+            // The PR-5 create-on-missing LIST path: build the list value from the
+            // head-to-tail elements. Subsequent edits go through the in-place
+            // RmwAction::Mutated path, not this rebuild.
+            NewValueOwned::List(elems) => {
+                let mut list = ListVal::new();
+                for e in &elems {
+                    list.push_back(e);
+                }
+                KvObj::from_list(key, list, expire_at)
+            }
+        }
+    }
+
+    /// Build a `KvObj` holding a LIST value (PR-5). The data type is
+    /// [`DataType::List`] and the encoding is read off the list's active repr
+    /// ([`ListVal::encoding`]); the store recomputes it after each in-place edit.
+    #[must_use]
+    pub fn from_list(key: &[u8], list: ListVal, expire_at: Option<UnixMillis>) -> Self {
+        let encoding = list.encoding();
+        KvObj {
+            header: Header::with_type(DataType::List, encoding, expire_at.is_some()),
+            key: key.to_vec().into_boxed_slice(),
+            value: ValueRepr::List(list),
+            expire_at,
+        }
+    }
+
+    /// Recompute and store `header.encoding` from the CURRENT value representation
+    /// (PR-5: called by the store after an in-place collection edit, so a list that
+    /// crossed the listpack->quicklist threshold reports the new name). A no-op for a
+    /// string value whose encoding is already in lockstep with its repr.
+    pub fn recompute_encoding(&mut self) {
+        self.header.encoding = self.value.encoding();
+    }
+
+    /// A mutable borrow of the stored LIST value, or `None` if this entry is not a
+    /// list (PR-5: the store hands this to the in-place-mutation arm; a non-list
+    /// yields `None` -> WRONGTYPE).
+    pub fn as_list_mut(&mut self) -> Option<&mut ListVal> {
+        match &mut self.value {
+            ValueRepr::List(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Whether this entry holds a LIST value (PR-5).
+    #[must_use]
+    pub fn is_list(&self) -> bool {
+        matches!(self.value, ValueRepr::List(_))
+    }
+
+    /// Whether this entry is a COLLECTION that currently holds zero ELEMENTS (PR-5:
+    /// the empty-collection-deletes-key check, by element COUNT, not byte count -- a
+    /// list of empty-string elements has zero value bytes but is NOT empty). Returns
+    /// `false` for a non-collection value (a string is never "empty" in this sense).
+    ///
+    /// PR-6/7/8 NOTE: this match handles only `ValueRepr::List` today. When the hash/
+    /// set/zset reprs land, add their arms HERE and to the `rmw_mut` type-dispatch in
+    /// `lib.rs` (the `as_*_mut` selection) IN LOCKSTEP, so every collection honors the
+    /// empty-collection-deletes-key contract.
+    #[must_use]
+    pub fn is_empty_collection(&self) -> bool {
+        match &self.value {
+            ValueRepr::List(l) => l.len() == 0,
+            _ => false,
         }
     }
 
@@ -395,5 +767,164 @@ mod tests {
         assert_eq!(o.accounted_bytes(), 3 + 5);
         let i = KvObj::from_int(b"k", 12345, None);
         assert_eq!(i.accounted_bytes(), 1 + 5); // "12345" is 5 decimal digits
+    }
+
+    // -- ListVal unit tests (PR-5): the abstract list-op vocabulary + the
+    // listpack->quicklist transition + accounting weight. --
+
+    #[test]
+    fn listval_push_pop_order() {
+        let mut l = ListVal::new();
+        l.push_back(b"a");
+        l.push_back(b"b");
+        l.push_front(b"z");
+        // [z, a, b]
+        assert_eq!(l.len(), 3);
+        assert_eq!(l.get(0), Some(b"z".to_vec()));
+        assert_eq!(l.get(-1), Some(b"b".to_vec()));
+        assert_eq!(l.pop_front(), Some(b"z".to_vec()));
+        assert_eq!(l.pop_back(), Some(b"b".to_vec()));
+        assert_eq!(l.len(), 1);
+        assert_eq!(l.pop_front(), Some(b"a".to_vec()));
+        assert!(l.is_empty());
+        assert_eq!(l.pop_front(), None);
+    }
+
+    #[test]
+    fn listval_set_and_index_out_of_range() {
+        let mut l = ListVal::new();
+        l.push_back(b"a");
+        l.push_back(b"b");
+        assert!(l.set(1, b"B"));
+        assert!(l.set(-2, b"A"));
+        assert_eq!(l.range(0, -1), vec![b"A".to_vec(), b"B".to_vec()]);
+        // Out of range -> false, no change.
+        assert!(!l.set(5, b"x"));
+        assert!(!l.set(-5, b"x"));
+        assert_eq!(l.get(9), None);
+    }
+
+    #[test]
+    fn listval_insert_remove_trim_range() {
+        let mut l = ListVal::new();
+        for e in [b"a", b"b", b"c", b"a"] {
+            l.push_back(e);
+        }
+        // insert_before/after by pivot.
+        assert_eq!(l.insert_before(b"b", b"X"), Some(5)); // [a, X, b, c, a]
+        assert_eq!(l.insert_after(b"c", b"Y"), Some(6)); // [a, X, b, c, Y, a]
+        assert_eq!(l.insert_before(b"zzz", b"q"), None); // pivot absent
+        assert_eq!(
+            l.range(0, -1),
+            vec![
+                b"a".to_vec(),
+                b"X".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"Y".to_vec(),
+                b"a".to_vec()
+            ]
+        );
+        // remove_matching count<0 (tail->head): remove the LAST 'a' -> index 5 gone.
+        assert_eq!(l.remove_matching(-1, b"a"), 1);
+        assert_eq!(l.get(0), Some(b"a".to_vec())); // head 'a' survives
+        // trim to [1, 2].
+        l.trim(1, 2);
+        assert_eq!(l.range(0, -1), vec![b"X".to_vec(), b"b".to_vec()]);
+        // trim to empty.
+        l.trim(5, 10);
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn listval_pos_rank_count_maxlen() {
+        let mut l = ListVal::new();
+        for e in [b"a", b"b", b"a", b"c", b"a"] {
+            l.push_back(e);
+        }
+        // First match.
+        assert_eq!(l.pos(b"a", 1, None, 0), vec![0]);
+        // RANK 2 -> second match.
+        assert_eq!(l.pos(b"a", 2, None, 0), vec![2]);
+        // RANK -1 -> last match.
+        assert_eq!(l.pos(b"a", -1, None, 0), vec![4]);
+        // COUNT 0 -> all matches.
+        assert_eq!(l.pos(b"a", 1, Some(0), 0), vec![0, 2, 4]);
+        // MAXLEN 3 with COUNT 0 -> only positions in the first 3 elements.
+        assert_eq!(l.pos(b"a", 1, Some(0), 3), vec![0, 2]);
+        // No match.
+        assert!(l.pos(b"zzz", 1, None, 0).is_empty());
+    }
+
+    #[test]
+    fn listval_encoding_transition_is_byte_driven_only() {
+        let mut l = ListVal::new();
+        l.push_back(b"a");
+        assert_eq!(l.encoding(), Encoding::ListPack);
+        // Over the byte budget -> quicklist.
+        let big = vec![b'q'; super::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES + 1];
+        l.push_back(&big);
+        assert_eq!(l.encoding(), Encoding::QuickList);
+        // Pop it back off -> listpack again (a pure function of the active repr).
+        assert_eq!(l.pop_back(), Some(big));
+        assert_eq!(l.encoding(), Encoding::ListPack);
+
+        // There is NO element-count cap for lists (Redis -2 negative fill: count
+        // unlimited). MANY small elements that stay UNDER the byte budget remain
+        // `listpack`, even well past the 128-entry hash/zset cap. Use 200 single-byte
+        // elements (200 bytes, far under the 8 KB budget).
+        let mut l2 = ListVal::new();
+        for _ in 0..200 {
+            l2.push_back(b"z");
+        }
+        assert_eq!(l2.elems.len(), 200);
+        assert_eq!(
+            l2.encoding(),
+            Encoding::ListPack,
+            "many small elements stay listpack: byte-driven transition only, no entry cap"
+        );
+
+        // Crossing the 8 KB byte budget with many small elements flips to quicklist.
+        // Each push of 100 bytes; after enough pushes the total exceeds 8 KB.
+        let chunk = vec![b'y'; 100];
+        let pushes = (super::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES / chunk.len()) + 2;
+        let mut l3 = ListVal::new();
+        for _ in 0..pushes {
+            l3.push_back(&chunk);
+        }
+        assert!(l3.element_bytes() > super::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES);
+        assert_eq!(
+            l3.encoding(),
+            Encoding::QuickList,
+            "crossing the 8 KB byte budget flips to quicklist"
+        );
+    }
+
+    #[test]
+    fn listval_element_bytes_tracks_edits() {
+        let mut l = ListVal::new();
+        l.push_back(b"abc"); // 3
+        l.push_front(b"de"); // 2
+        assert_eq!(l.element_bytes(), 5);
+        l.set(0, b"DEFG"); // de(2) -> DEFG(4): +2
+        assert_eq!(l.element_bytes(), 7);
+        l.pop_back(); // -3
+        assert_eq!(l.element_bytes(), 4);
+        l.remove_matching(0, b"DEFG"); // -4
+        assert_eq!(l.element_bytes(), 0);
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn kvobj_from_list_reports_list_type_and_encoding() {
+        let mut l = ListVal::new();
+        l.push_back(b"x");
+        let o = KvObj::from_list(b"k", l, None);
+        assert_eq!(o.header.data_type, DataType::List);
+        assert_eq!(o.header.encoding, Encoding::ListPack);
+        assert!(o.is_list());
+        assert!(!o.is_empty_collection());
+        // accounted_bytes = key + element bytes.
+        assert_eq!(o.accounted_bytes(), 1 + 1);
     }
 }

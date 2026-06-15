@@ -186,6 +186,8 @@ fn expire_generic<S: Store>(
                 return keep_int(0);
             }
             RmwEntry::Occupied(o) => o.expire_at(),
+            // Unreachable: the EXPIRE family uses the read-only `rmw`, not `rmw_mut`.
+            RmwEntry::OccupiedMut(_) => unreachable!("expire uses rmw, not rmw_mut"),
         };
 
         // Apply the NX/XX/GT/LT condition. Redis (src/expire.c) evaluates the
@@ -452,6 +454,8 @@ pub fn cmd_getex<S: Store>(
                 reply: value,
             }
         }
+        // Unreachable: GETEX uses the read-only `rmw`, never `rmw_mut`.
+        RmwEntry::OccupiedMut(_) => unreachable!("getex uses rmw, not rmw_mut"),
     });
 
     // Register the deadline only when GETEX actually set one on a live string (the

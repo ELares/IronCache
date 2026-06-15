@@ -38,8 +38,8 @@ use hashbrown::hash_map::Entry;
 use ironcache_eviction::{EvictionPolicy, Policy, map_policy_name};
 use ironcache_storage::{
     AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
-    MoveOutcome, NewValue, NullEviction, OccupiedEntry, RmwAction, RmwEntry, RmwStep, ScanCursor,
-    Store, UnixMillis, ValueRef,
+    MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
+    RmwStep, ScanCursor, Store, UnixMillis, ValueRef,
 };
 use kvobj::{KvObj, int_decimal_bytes};
 
@@ -352,6 +352,29 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         }
     }
 
+    /// Remove `key`'s object, crediting an EXPLICIT `bytes` weight (PR-5 in-place
+    /// path). Unlike [`Self::remove_object`], which reads the object's CURRENT weight,
+    /// this credits the caller-supplied figure: after an in-place collection edit the
+    /// in-memory object is already shorter than at observe time, so the
+    /// `rmw_mut` Delete / empty path must credit the PRE-EDIT weight (the bytes the
+    /// accounting hook was charged at insert time) to avoid leaking the popped bytes.
+    /// Returns whether the key existed.
+    fn remove_object_crediting(
+        &mut self,
+        db: u32,
+        db_idx: usize,
+        key: &[u8],
+        bytes: usize,
+    ) -> bool {
+        if self.dbs[db_idx].remove(key).is_some() {
+            self.account_sub(bytes);
+            self.eviction.on_remove(db, key, bytes);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Build the read-borrow view for an object. An int materializes its decimal
     /// bytes (owned); a string borrows the stored buffer.
     ///
@@ -373,6 +396,16 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             kvobj::ValueRepr::Raw(b) => {
                 ValueRef::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
+            // A LIST is not byte-readable as a string: the command layer only reads
+            // its data_type / encoding from the view (GET checks String; OBJECT
+            // ENCODING reads the encoding). The bytes are empty so a misrouted
+            // as_bytes() yields nothing rather than leaking a representation.
+            kvobj::ValueRepr::List(_) => ValueRef::borrowed(
+                obj.header.data_type,
+                obj.header.encoding,
+                obj.expire_at,
+                &[],
+            ),
         }
     }
 
@@ -395,6 +428,16 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             kvobj::ValueRepr::Raw(b) => {
                 OccupiedEntry::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
+            // A LIST observed through the READ-ONLY rmw arm (e.g. a numeric RMW that
+            // hits a list key) exposes empty bytes; the closure sees data_type=List
+            // and returns WRONGTYPE. In-place list edits use the MUTABLE arm
+            // (`rmw_mut` -> OccupiedEntryMut), not this read-only handle.
+            kvobj::ValueRepr::List(_) => OccupiedEntry::borrowed(
+                obj.header.data_type,
+                obj.header.encoding,
+                obj.expire_at,
+                &[],
+            ),
         }
     }
 }
@@ -505,6 +548,159 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             RmwAction::Delete => {
                 if live {
                     self.remove_object(db, db_idx, key);
+                }
+            }
+            // The READ-ONLY rmw arm hands out no mutable handle, so there is nothing
+            // to measure: Mutated is treated as Keep (TTL effect still honored). A
+            // value-internal in-place edit must go through `rmw_mut` (OccupiedMut).
+            RmwAction::Mutated => {
+                if live {
+                    let new_deadline = match step.expire {
+                        ExpireWrite::Unchanged => old_deadline,
+                        other => resolve_expire(other, old_deadline),
+                    };
+                    if new_deadline != old_deadline {
+                        if let Some(obj) = self.dbs[db_idx].get_mut(key) {
+                            obj.expire_at = new_deadline;
+                            obj.header.ttl_present = new_deadline.is_some();
+                        }
+                    }
+                }
+            }
+        }
+        step.reply
+    }
+
+    fn rmw_mut<R>(
+        &mut self,
+        db: u32,
+        key: &[u8],
+        now: UnixMillis,
+        f: impl FnOnce(RmwEntry<'_>) -> RmwStep<R>,
+    ) -> R {
+        let db_idx = self.db_index(db);
+        let live = self.expire_if_due(db, db_idx, key, now);
+
+        // For the OccupiedMut path the store MEASURES the accounting delta itself (it
+        // does not trust the handler): record the pre-edit weight, hand out a typed
+        // mutable handle, run the closure, then measure the post-edit weight.
+        let old_bytes = if live {
+            self.eviction.on_access(db, key);
+            self.dbs[db_idx].get(key).map_or(0, KvObj::accounted_bytes)
+        } else {
+            0
+        };
+
+        let step = if live {
+            let obj = self.dbs[db_idx].get_mut(key).expect("live entry present");
+            // Read the REAL pre-edit metadata off the header BEFORE taking the typed
+            // mutable borrow (these are Copy scalars; `as_list_mut` then borrows the
+            // value mutably). The mutable handle carries the same type/encoding/TTL the
+            // read-only `occupied_of()` path exposes, so PR-6/7/8 can read accurate
+            // metadata off the mutable arm. The store still recomputes the POST-edit
+            // encoding after a `Mutated` return; this is the PRE-edit snapshot.
+            let data_type = obj.header.data_type;
+            let encoding = obj.header.encoding;
+            let expire_at = obj.expire_at;
+            // Build the typed mutable view: a list yields the list arm, anything else
+            // the non-collection arm (the handler's as_list_mut returns None ->
+            // WRONGTYPE). The borrow of `obj` lives only for the closure call.
+            //
+            // PR-6/7/8 NOTE: this type-dispatch handles only the list arm today. When
+            // the hash/set/zset reprs land, add their `as_*_mut` arms HERE and to
+            // `KvObj::is_empty_collection` (kvobj.rs) IN LOCKSTEP.
+            let entry = match obj.as_list_mut() {
+                Some(list) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, list))
+                }
+                None => RmwEntry::OccupiedMut(OccupiedEntryMut::non_collection(
+                    data_type, encoding, expire_at,
+                )),
+            };
+            f(entry)
+        } else {
+            f(RmwEntry::Vacant)
+        };
+
+        let old_deadline = if live {
+            self.dbs[db_idx].get(key).and_then(|o| o.expire_at)
+        } else {
+            None
+        };
+
+        match step.action {
+            RmwAction::Keep => {
+                if live {
+                    let new_deadline = match step.expire {
+                        ExpireWrite::Unchanged => old_deadline,
+                        other => resolve_expire(other, old_deadline),
+                    };
+                    if new_deadline != old_deadline {
+                        if let Some(obj) = self.dbs[db_idx].get_mut(key) {
+                            obj.expire_at = new_deadline;
+                            obj.header.ttl_present = new_deadline.is_some();
+                        }
+                    }
+                }
+            }
+            RmwAction::Insert(v) | RmwAction::Replace(v) => {
+                let new_deadline = match step.expire {
+                    ExpireWrite::Unchanged => old_deadline,
+                    other => resolve_expire(other, old_deadline),
+                };
+                let obj = KvObj::from_new_owned(key, v, new_deadline);
+                self.put_object(db, db_idx, key, obj);
+            }
+            RmwAction::Delete => {
+                if live {
+                    // The handler may have edited the value in place on the borrowed
+                    // handle BEFORE returning Delete (e.g. LPOP that drains the last
+                    // element pops it, then returns Delete). The in-memory object is
+                    // therefore SHORTER than at observe time, so crediting its current
+                    // weight would leak the popped bytes. Credit the PRE-EDIT weight
+                    // (`old_bytes`) and remove the entry directly.
+                    self.remove_object_crediting(db, db_idx, key, old_bytes);
+                }
+            }
+            // The in-place collection edit already happened on the borrowed handle.
+            // The store now: (1) if the edit EMPTIED the collection, removes the key
+            // (empty-collection-deletes-key backstop); else (2) measures the byte
+            // delta, charges account_add/sub and re-fires on_remove(old)/on_insert(new)
+            // (the same re-account pattern put_object uses), recomputes the encoding
+            // from the post-edit repr, and applies any TTL effect.
+            RmwAction::Mutated => {
+                if live {
+                    let emptied = self.dbs[db_idx]
+                        .get(key)
+                        .is_some_and(KvObj::is_empty_collection);
+                    if emptied {
+                        // Same pre-edit-weight credit as the Delete arm: the edit
+                        // already shrank the in-memory object, so credit `old_bytes`.
+                        self.remove_object_crediting(db, db_idx, key, old_bytes);
+                    } else {
+                        let new_bytes = self.dbs[db_idx].get(key).map_or(0, KvObj::accounted_bytes);
+                        // Re-account the signed delta and re-fire the eviction sizing
+                        // so the policy's per-key byte estimate tracks the edit.
+                        if new_bytes != old_bytes {
+                            self.eviction.on_remove(db, key, old_bytes);
+                            self.account_sub(old_bytes);
+                            self.account_add(new_bytes);
+                            self.eviction.on_insert(db, key, new_bytes);
+                        }
+                        // Recompute the encoding (listpack <-> quicklist) and apply the
+                        // TTL effect.
+                        let new_deadline = match step.expire {
+                            ExpireWrite::Unchanged => old_deadline,
+                            other => resolve_expire(other, old_deadline),
+                        };
+                        if let Some(obj) = self.dbs[db_idx].get_mut(key) {
+                            obj.recompute_encoding();
+                            if new_deadline != old_deadline {
+                                obj.expire_at = new_deadline;
+                                obj.header.ttl_present = new_deadline.is_some();
+                            }
+                        }
+                    }
                 }
             }
         }

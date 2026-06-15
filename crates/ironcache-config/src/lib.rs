@@ -34,6 +34,35 @@ use thiserror::Error;
 /// compatibility (CLI_BINARY.md leaves the exact port open but defaults to parity).
 pub const DEFAULT_PORT: u16 = 6379;
 
+/// The default list listpack byte budget (`list-max-listpack-size`), expressed as a
+/// BYTE budget (PR-5, ENCODINGS.md / OBJECT_ENCODING_MAPPING.md #40, LIST_LARGE.md
+/// "Node sizing ~8 KB"). Redis's default `-2` means "8 KB per listpack node"; we
+/// store the resolved byte budget directly. A LIST whose total element bytes stay at
+/// or below this is `OBJECT ENCODING` -> `listpack`; once it exceeds this it
+/// transitions to `quicklist`. There is NO element-count cap for lists: the Redis
+/// `-2` negative fill sizes the node by BYTES with the element count left unlimited
+/// (`quicklistNodeLimit` sets `count = UINT_MAX`), so a 129-element list of small
+/// values stays `listpack`. The store reads this default; `CONFIG GET
+/// list-max-listpack-size` reports the Redis `-2` spelling.
+pub const DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES: usize = 8 * 1024;
+
+/// The default per-collection element-count cap for a HASH/ZSET listpack
+/// (`hash-max-listpack-entries` / `zset-max-listpack-entries`, default 128). A hash or
+/// sorted-set whose element count exceeds this transitions away from `listpack` even
+/// when it is under the byte budget. This is the HASH/ZSET cap, NOT the list cap
+/// (lists have no entry cap, only the byte budget above). Wired into the hash/zset
+/// encoding logic in their respective PRs (PR-6/7); kept here so those PRs share the
+/// pinned default.
+pub const DEFAULT_HASH_MAX_LISTPACK_ENTRIES: usize = 128;
+
+/// The Redis `list-max-listpack-size` default SPELLING (`-2` = "8 KB per node"). This
+/// is what `CONFIG GET list-max-listpack-size` echoes (the configured Redis form),
+/// while the store works in the resolved byte budget
+/// ([`DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES`]). Reported as an accepted, recognized
+/// parameter (CONFIG.md "accepted and echoed for compatibility"); changing it at
+/// runtime is a follow-up.
+pub const LIST_MAX_LISTPACK_SIZE_REDIS_DEFAULT: &str = "-2";
+
 /// The default shard count: the host's available parallelism via
 /// [`std::thread::available_parallelism`] (CONFIG.md), which honors cgroup CPU
 /// quotas (unlike the `num_cpus` crate). Never zero (a degenerate host reports at

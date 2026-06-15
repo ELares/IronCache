@@ -29,12 +29,18 @@
 //! without handing back a whole rebuilt value.
 //!
 //! VALUE-INTERNAL in-place mutation (LPUSH appending to a list, HSET setting one
-//! field, and the APPEND/SETRANGE efficiency path in PR-2b) is an ADDITIVE
-//! extension to [`OccupiedEntry`]/[`RmwAction`] (a new mutable accessor / a new
-//! action variant) to be co-designed WITH the Tier-2 value types. That extension
+//! field, and the APPEND/SETRANGE efficiency path) is an ADDITIVE extension to the
+//! RMW surface, LANDED in PR-5 for collections: a new action variant
+//! [`RmwAction::Mutated`] (carries no value: the edit already happened on the
+//! borrowed handle), a new entry arm [`RmwEntry::OccupiedMut`] carrying a typed
+//! mutable view [`OccupiedEntryMut`], a per-type abstract op vocabulary ([`ListValue`]
+//! for PR-5; the hash/set/zset traits are added in PR-6/7/8), and a convenience
+//! primitive [`Store::rmw_mut`] that hands out the mutable arm. The store measures
+//! the byte delta around the closure (it does not trust the handler), recomputes the
+//! encoding, and deletes the key if the edit empties the collection. The extension
 //! adds capability without churning existing string callers or PR-3's eviction/
-//! accounting callers, so it does not reopen the waist. It is deliberately NOT
-//! pre-designed here (no half-baked `Mutate` variant); this note records the plan.
+//! accounting callers (they bind only `Vacant`/`Occupied` and return the existing
+//! value actions), so it does not reopen the FROZEN four primitives.
 //!
 //! [`Store::contains`] and [`Store::type_of`] are cheap convenience entry points
 //! for EXISTS/TYPE (each is `read().is_some()` / the read's data type), provided so
@@ -150,8 +156,14 @@ pub enum Encoding {
     EmbStr,
     /// A string stored out-of-line (`OBJECT ENCODING` -> raw).
     Raw,
-    /// Reserved collection encodings (not produced in PR-2a).
+    /// A small collection stored in one contiguous listpack-equivalent pack
+    /// (`OBJECT ENCODING` -> listpack). PR-5 produces this for a small LIST.
     ListPack,
+    /// A large LIST stored as a quicklist-equivalent chunked deque (`OBJECT
+    /// ENCODING` -> quicklist). PR-5 produces this once a list exceeds the
+    /// `list-max-listpack-size` byte budget or the per-node element cap (#40,
+    /// LIST_LARGE.md). The reported NAME is a pure function of the active repr.
+    QuickList,
     /// Reserved (intset).
     IntSet,
     /// Reserved (hashtable for large hashes/sets).
@@ -169,6 +181,7 @@ impl Encoding {
             Encoding::EmbStr => "embstr",
             Encoding::Raw => "raw",
             Encoding::ListPack => "listpack",
+            Encoding::QuickList => "quicklist",
             Encoding::IntSet => "intset",
             Encoding::HashTable => "hashtable",
             Encoding::SkipList => "skiplist",
@@ -313,12 +326,24 @@ pub enum NewValueOwned {
     Bytes(Bytes),
     /// An already-parsed integer; stored as the int encoding with no value alloc.
     Int(i64),
+    /// A new LIST value (PR-5 create-on-missing path: LPUSH/RPUSH/LMOVE-push on a
+    /// vacant key). The elements are in head-to-tail order; the store builds the
+    /// concrete list value from them. The collection is built from a whole owned
+    /// value here (the create case); SUBSEQUENT edits go through the in-place
+    /// [`RmwAction::Mutated`] path, not a rebuild.
+    List(Vec<Vec<u8>>),
 }
 
 impl NewValueOwned {
     /// Convenience constructor for owned bytes from anything byte-like.
     pub fn bytes(b: impl Into<Bytes>) -> Self {
         NewValueOwned::Bytes(b.into())
+    }
+
+    /// Convenience constructor for a new LIST value from head-to-tail elements.
+    #[must_use]
+    pub fn list(elems: Vec<Vec<u8>>) -> Self {
+        NewValueOwned::List(elems)
     }
 }
 
@@ -349,14 +374,249 @@ pub enum ExpireWrite {
 // ---------------------------------------------------------------------------
 
 /// The entry handed to an [`Store::rmw`] closure: either the key is absent
-/// ([`RmwEntry::Vacant`]) or present and live ([`RmwEntry::Occupied`]). A lazily
-/// -expired key is presented as `Vacant` (the backstop ran before the closure).
-#[derive(Debug)]
+/// ([`RmwEntry::Vacant`]), present and observed READ-ONLY ([`RmwEntry::Occupied`]),
+/// or present and held with a TYPED MUTABLE view ([`RmwEntry::OccupiedMut`], the
+/// PR-5 collection in-place-mutation arm). A lazily-expired key is presented as
+/// `Vacant` (the backstop ran before the closure).
+///
+/// ## The OccupiedMut arm (PR-5, the in-place-mutation extension)
+///
+/// `OccupiedMut` is ADDITIVE: the existing string command handlers bind only
+/// `Vacant`/`Occupied` and are unaffected. A handler that wants to edit a stored
+/// COLLECTION in place (LPUSH appending one element, LSET rewriting one) asks the
+/// store for the mutable arm by requesting it via [`Store::rmw_mut`] (a thin
+/// convenience over `rmw` that hands out `OccupiedMut` instead of `Occupied`), then
+/// edits through a typed view ([`OccupiedEntryMut::as_list_mut`]) and returns
+/// [`RmwAction::Mutated`] to signal "the edit already happened on the borrowed
+/// handle". The STORE measures the accounting delta around the closure (it does NOT
+/// trust the handler), re-fires the eviction sizing hooks, recomputes the encoding
+/// from the post-edit representation, and removes the key if the edit emptied the
+/// collection. This mechanism is the FROZEN surface all four collection types build
+/// on (lists in PR-5; hashes/sets/zsets in PR-6/7/8 add `as_hash_mut`/`as_set_mut`/
+/// `as_zset_mut` to [`OccupiedEntryMut`] additively).
 pub enum RmwEntry<'a> {
     /// No live value for the key.
     Vacant,
-    /// A live value; observe it through [`OccupiedEntry`] before deciding the write.
+    /// A live value; observe it READ-ONLY through [`OccupiedEntry`] before deciding
+    /// the write (the string-command path: the write is a whole owned value).
     Occupied(OccupiedEntry<'a>),
+    /// A live value held with a TYPED MUTABLE view ([`OccupiedEntryMut`]) for a
+    /// value-internal in-place edit (the collection path, PR-5). The handler edits
+    /// through the typed accessor and returns [`RmwAction::Mutated`]; the store
+    /// measures the byte delta. Produced only by [`Store::rmw_mut`].
+    OccupiedMut(OccupiedEntryMut<'a>),
+}
+
+impl core::fmt::Debug for RmwEntry<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RmwEntry::Vacant => f.write_str("Vacant"),
+            RmwEntry::Occupied(o) => f.debug_tuple("Occupied").field(o).finish(),
+            // The mutable view carries a `&mut dyn` collection handle (not Debug), so
+            // print only its read-side metadata, not the value contents.
+            RmwEntry::OccupiedMut(o) => f
+                .debug_struct("OccupiedMut")
+                .field("data_type", &o.data_type())
+                .field("encoding", &o.encoding())
+                .finish(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The value-internal in-place-mutation surface (PR-5 collection extension,
+// COLLECTIONS.md / STORAGE_API.md "the RMW in-place-mutation contract").
+//
+// `OccupiedEntryMut` is the MUTABLE analog of `OccupiedEntry`: it exposes the same
+// read accessors PLUS a typed mutable view of the stored collection. The `*Value`
+// traits (`ListValue` here; `HashValue`/`SetValue`/`ZSetValue` in PR-6/7/8) are the
+// ABSTRACT collection-op vocabulary the command layer calls -- the value-layer
+// analog of the `Keyspace` side-trait. The per-command `dyn` indirection is off the
+// string hot path and is an accepted cost; a #8 perf follow-up may monomorphize it.
+// ---------------------------------------------------------------------------
+
+/// The abstract LIST mutation + read vocabulary the command layer calls through the
+/// in-place-mutation arm (COLLECTIONS.md, COMMANDS.md list semantics). The concrete
+/// list value (`ironcache_store::kvobj::ListVal`) implements it; the command layer
+/// names ONLY this trait, never the concrete list representation, so the listpack ->
+/// quicklist transition can change without reopening the command layer.
+///
+/// The method set is designed to cover ALL the list commands: LPUSH/RPUSH
+/// ([`push_front`](ListValue::push_front)/[`push_back`](ListValue::push_back)),
+/// LPOP/RPOP ([`pop_front`](ListValue::pop_front)/[`pop_back`](ListValue::pop_back)),
+/// LLEN ([`len`](ListValue::len)), LINDEX ([`get`](ListValue::get)), LSET
+/// ([`set`](ListValue::set)), LINSERT
+/// ([`insert_before`](ListValue::insert_before)/[`insert_after`](ListValue::insert_after)),
+/// LREM ([`remove_matching`](ListValue::remove_matching)), LTRIM
+/// ([`trim`](ListValue::trim)), LRANGE ([`range`](ListValue::range)), LPOS
+/// ([`pos`](ListValue::pos)). LMOVE/RPOPLPUSH compose pop + push.
+///
+/// Indices follow Redis: a non-negative index counts from the head (0-based); a
+/// negative index counts from the tail (`-1` is the last element). Out-of-range
+/// indices read as absent (the command layer maps that to nil / the index-out-of
+/// -range error as the command dictates).
+pub trait ListValue {
+    /// Prepend one element (LPUSH). After this the new element is at index 0.
+    fn push_front(&mut self, elem: &[u8]);
+
+    /// Append one element (RPUSH). After this the new element is the last.
+    fn push_back(&mut self, elem: &[u8]);
+
+    /// Remove and return the head element (LPOP), or `None` if the list is empty.
+    fn pop_front(&mut self) -> Option<Vec<u8>>;
+
+    /// Remove and return the tail element (RPOP), or `None` if the list is empty.
+    fn pop_back(&mut self) -> Option<Vec<u8>>;
+
+    /// The element count (LLEN).
+    fn len(&self) -> usize;
+
+    /// Whether the list holds no elements. (A list value should never be stored
+    /// empty -- the store removes the key when an edit empties it -- but the
+    /// predicate is part of the vocabulary so the store can detect the empty case.)
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The element at signed Redis `index` (LINDEX), or `None` if out of range. A
+    /// negative index counts from the tail (`-1` is the last element).
+    fn get(&self, index: i64) -> Option<Vec<u8>>;
+
+    /// Overwrite the element at signed Redis `index` with `elem` (LSET). Returns
+    /// `true` on success, `false` if the index is out of range (the command layer
+    /// maps `false` to the index-out-of-range error).
+    fn set(&mut self, index: i64, elem: &[u8]) -> bool;
+
+    /// Insert `elem` immediately BEFORE the first element equal to `pivot` (LINSERT
+    /// BEFORE). Returns the new length, or `None` if `pivot` is not present (the
+    /// command layer maps `None` to the `-1` reply).
+    fn insert_before(&mut self, pivot: &[u8], elem: &[u8]) -> Option<usize>;
+
+    /// Insert `elem` immediately AFTER the first element equal to `pivot` (LINSERT
+    /// AFTER). Returns the new length, or `None` if `pivot` is not present.
+    fn insert_after(&mut self, pivot: &[u8], elem: &[u8]) -> Option<usize>;
+
+    /// Remove up to `count` elements equal to `elem` (LREM). `count > 0` removes
+    /// from head to tail, `count < 0` from tail to head, `count == 0` removes all
+    /// matches. Returns the number removed.
+    fn remove_matching(&mut self, count: i64, elem: &[u8]) -> usize;
+
+    /// Trim the list to the inclusive signed range `[start, stop]` (LTRIM). Indices
+    /// are normalized Redis-identically (negative from the tail, clamped to bounds);
+    /// an empty resulting range removes every element (the store then deletes the
+    /// key).
+    fn trim(&mut self, start: i64, stop: i64);
+
+    /// The elements in the inclusive signed range `[start, stop]` (LRANGE), in head
+    /// -to-tail order. Out-of-range / inverted ranges yield an empty vector.
+    fn range(&self, start: i64, stop: i64) -> Vec<Vec<u8>>;
+
+    /// Find positions of `elem` (LPOS). `rank` selects which match to start from
+    /// (1-based; a negative rank scans from the tail); `count` bounds how many
+    /// matches to return (`Some(0)` means all matches, `None` means just the first);
+    /// `maxlen` bounds how many elements to compare (`0` means no limit). Returns the
+    /// matched 0-based indices in scan order.
+    fn pos(&self, elem: &[u8], rank: i64, count: Option<usize>, maxlen: usize) -> Vec<usize>;
+}
+
+/// A MUTABLE observation of an occupied entry inside a [`Store::rmw_mut`] closure
+/// (the collection in-place-mutation arm, PR-5). It exposes the same read accessors
+/// as [`OccupiedEntry`] PLUS typed mutable views of the stored collection.
+///
+/// A handler edits through the typed accessor (e.g. [`Self::as_list_mut`]) and
+/// returns [`RmwAction::Mutated`]; the store measures the byte delta around the
+/// closure, recomputes the encoding, and deletes the key if the edit emptied the
+/// collection (the empty-collection-deletes-key backstop). A type mismatch
+/// ([`Self::as_list_mut`] on a non-list) returns `None`, and the handler returns
+/// WRONGTYPE + [`RmwAction::Keep`] with no edit.
+///
+/// The `as_hash_mut`/`as_set_mut`/`as_zset_mut` accessors are RESERVED for
+/// PR-6/7/8: they are added additively (alongside the `HashValue`/`SetValue`/
+/// `ZSetValue` traits, which are NOT defined yet) without changing this struct's
+/// existing surface.
+pub struct OccupiedEntryMut<'a> {
+    data_type: DataType,
+    encoding: Encoding,
+    expire_at: Option<UnixMillis>,
+    /// The typed mutable view of the stored value. PR-5 carries only the list arm;
+    /// the other collection arms are added in their PRs.
+    value: ValueMut<'a>,
+}
+
+/// The typed mutable value view behind an [`OccupiedEntryMut`]. PR-5 has the list
+/// arm and a `NonCollection` arm (a string/int/embstr/raw value, for which the
+/// typed collection accessors all return `None` -> WRONGTYPE). The hash/set/zset
+/// arms are added additively in PR-6/7/8.
+pub enum ValueMut<'a> {
+    /// A non-collection value (string family). No typed collection view applies; the
+    /// `as_*_mut` accessors all return `None` so the handler returns WRONGTYPE.
+    NonCollection,
+    /// A list value, borrowed mutably for the closure (LPUSH/LPOP/LSET/... edits).
+    List(&'a mut dyn ListValue),
+}
+
+impl<'a> OccupiedEntryMut<'a> {
+    /// Construct a mutable view over a LIST value (the store hands this out when the
+    /// stored value is a list).
+    #[must_use]
+    pub fn list(
+        encoding: Encoding,
+        expire_at: Option<UnixMillis>,
+        list: &'a mut dyn ListValue,
+    ) -> Self {
+        OccupiedEntryMut {
+            data_type: DataType::List,
+            encoding,
+            expire_at,
+            value: ValueMut::List(list),
+        }
+    }
+
+    /// Construct a mutable view over a NON-collection value (string family): the
+    /// typed collection accessors return `None`, so a collection handler returns
+    /// WRONGTYPE without editing.
+    #[must_use]
+    pub fn non_collection(
+        data_type: DataType,
+        encoding: Encoding,
+        expire_at: Option<UnixMillis>,
+    ) -> Self {
+        OccupiedEntryMut {
+            data_type,
+            encoding,
+            expire_at,
+            value: ValueMut::NonCollection,
+        }
+    }
+
+    /// The logical data type (for WRONGTYPE checks inside the closure).
+    #[must_use]
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+
+    /// The internal encoding (read off the PRE-edit representation; the store
+    /// recomputes the post-edit encoding after the closure returns `Mutated`).
+    #[must_use]
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
+    /// The TTL deadline, if any.
+    #[must_use]
+    pub fn expire_at(&self) -> Option<UnixMillis> {
+        self.expire_at
+    }
+
+    /// The typed mutable LIST view, or `None` if the stored value is not a list (the
+    /// handler returns WRONGTYPE + [`RmwAction::Keep`] on `None`). PR-5's list
+    /// commands edit through this.
+    pub fn as_list_mut(&mut self) -> Option<&mut dyn ListValue> {
+        match &mut self.value {
+            ValueMut::List(l) => Some(&mut **l),
+            ValueMut::NonCollection => None,
+        }
+    }
 }
 
 /// A read-only observation of the occupied entry inside an [`Store::rmw`] closure.
@@ -470,6 +730,16 @@ pub enum RmwAction {
     Replace(NewValueOwned),
     /// Delete the entry.
     Delete,
+    /// The value was edited IN PLACE on the [`OccupiedEntryMut`] handle (PR-5
+    /// collection in-place mutation): the edit already happened, so this variant
+    /// carries NO value (it adds no generic parameter and does not touch the
+    /// existing variants). The store measures the byte delta around the closure,
+    /// re-fires the eviction sizing hooks, recomputes the encoding from the
+    /// post-edit representation, and -- if the edit EMPTIED the collection --
+    /// removes the key (the empty-collection-deletes-key backstop). Meaningful only
+    /// on the [`RmwEntry::OccupiedMut`] arm; on any other arm it is treated as
+    /// [`RmwAction::Keep`] (no value was borrowed to edit).
+    Mutated,
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +889,35 @@ pub trait Store {
     /// A lazily-expired key is presented as `Vacant` and removed before the closure
     /// runs.
     fn rmw<R>(
+        &mut self,
+        db: u32,
+        key: &[u8],
+        now: UnixMillis,
+        f: impl FnOnce(RmwEntry<'_>) -> RmwStep<R>,
+    ) -> R;
+
+    /// The atomic read-modify-write primitive WITH the collection in-place-mutation
+    /// arm (PR-5, COLLECTIONS.md). Identical to [`Store::rmw`] except a live entry is
+    /// presented as [`RmwEntry::OccupiedMut`] (a typed MUTABLE view) instead of
+    /// [`RmwEntry::Occupied`] (a read-only view), so the closure can edit a stored
+    /// collection in place and return [`RmwAction::Mutated`].
+    ///
+    /// This is NOT one of the frozen four primitives: it is the ADDITIVE in-place
+    /// -mutation extension the storage waist module docs reserved. It is a `Store`
+    /// trait method (not a separate side-trait) because it shares the exact same
+    /// write-funnel + TTL-resolution + hook-firing body as `rmw`; the only difference
+    /// is which observation handle the closure sees and the [`RmwAction::Mutated`]
+    /// post-processing (measure delta / recompute encoding / empty-deletes-key).
+    ///
+    /// THE STORE MEASURES THE ACCOUNTING DELTA (it does not trust the handler): it
+    /// records `accounted_bytes()` BEFORE handing out the mutable handle and AFTER the
+    /// closure returns `Mutated`, then charges the signed difference and re-fires
+    /// `on_remove(old)`/`on_insert(new)`. It recomputes the stored `encoding` from the
+    /// post-edit representation, and if the edit emptied the collection it removes the
+    /// key. A handler that already knows the post-edit count is zero may return
+    /// [`RmwAction::Delete`] directly instead; both are supported. A lazily-expired
+    /// key is presented as `Vacant` and removed before the closure runs.
+    fn rmw_mut<R>(
         &mut self,
         db: u32,
         key: &[u8],
@@ -946,6 +1245,9 @@ mod tests {
         assert_eq!(Encoding::Int.encoding_name(), "int");
         assert_eq!(Encoding::EmbStr.encoding_name(), "embstr");
         assert_eq!(Encoding::Raw.encoding_name(), "raw");
+        // PR-5 collection encodings: the two list names.
+        assert_eq!(Encoding::ListPack.encoding_name(), "listpack");
+        assert_eq!(Encoding::QuickList.encoding_name(), "quicklist");
     }
 
     #[test]

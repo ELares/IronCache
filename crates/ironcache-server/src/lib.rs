@@ -18,6 +18,7 @@ pub mod cmd_config;
 pub mod cmd_expire;
 pub mod cmd_introspect;
 pub mod cmd_keyspace;
+pub mod cmd_list;
 pub mod cmd_string;
 pub mod cmd_util;
 pub mod conn;
