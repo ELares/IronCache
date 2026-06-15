@@ -46,14 +46,25 @@ pub const DEFAULT_PORT: u16 = 6379;
 /// list-max-listpack-size` reports the Redis `-2` spelling.
 pub const DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES: usize = 8 * 1024;
 
-/// The default per-collection element-count cap for a HASH/ZSET listpack
-/// (`hash-max-listpack-entries` / `zset-max-listpack-entries`, default 128). A hash or
-/// sorted-set whose element count exceeds this transitions away from `listpack` even
-/// when it is under the byte budget. This is the HASH/ZSET cap, NOT the list cap
-/// (lists have no entry cap, only the byte budget above). Wired into the hash/zset
-/// encoding logic in their respective PRs (PR-6/7); kept here so those PRs share the
-/// pinned default.
-pub const DEFAULT_HASH_MAX_LISTPACK_ENTRIES: usize = 128;
+/// The default per-collection element-count cap for a HASH listpack
+/// (`hash-max-listpack-entries`, default 512; verified against Redis 7.4 `config.c` /
+/// `t_hash.c` and the pinned claim [redis-hash-max-listpack-entries-512]). A hash whose
+/// entry count exceeds this transitions away from `listpack` to `hashtable` even when it
+/// is under the per-element byte cap. This is the HASH cap SPECIFICALLY: it is NOT the
+/// list cap (lists have no entry cap, only the byte budget above) and NOT the ZSET/SET
+/// cap (those default to 128, see [`DEFAULT_ZSET_MAX_LISTPACK_ENTRIES`]; the older
+/// "128 shared by hash and zset" reading conflated the per-type defaults). Wired into the
+/// hash encoding logic in PR-6; kept here so the collection PRs share the pinned default.
+pub const DEFAULT_HASH_MAX_LISTPACK_ENTRIES: usize = 512;
+
+/// The default per-collection element-count cap for a ZSET listpack
+/// (`zset-max-listpack-entries`, default 128). RESERVED for the PR-8 sorted-set encoding
+/// logic; kept here so that PR shares the pinned default. This is DISTINCT from the HASH
+/// cap ([`DEFAULT_HASH_MAX_LISTPACK_ENTRIES`] = 512): Redis's 128 entry default applies to
+/// ZSETs and SETs (`set-max-listpack-entries`), NOT to hashes. SETs get their own constant
+/// in PR-7 (they also have `set-max-intset-entries`, a separate 512 default), so this is
+/// the ZSET constant only.
+pub const DEFAULT_ZSET_MAX_LISTPACK_ENTRIES: usize = 128;
 
 /// The default per-field/value BYTE cap for a HASH listpack (`hash-max-listpack-value`,
 /// default 64). A hash whose ANY field-or-value byte length exceeds this transitions
