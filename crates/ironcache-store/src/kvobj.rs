@@ -39,7 +39,7 @@ use ironcache_storage::{
     DataType, Encoding, HashValue, LexBound, ListValue, NewValueOwned, ScoreBound, SetValue,
     UnixMillis, ZAddFlags, ZAddOutcome, ZSetValue,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 /// The inline-value buffer capacity (embstr). Matches [`EMBSTR_THRESHOLD`]; a
 /// value classified as embstr fits here without a separate allocation in the
@@ -1059,7 +1059,7 @@ impl SetValue for SetVal {
 //
 // ## The provisional large form (ZSET_LARGE.md #134/#136)
 //
-// The ordered index is a `BTreeMap<(OrderedScore, Box<[u8]>), ()>` rather than a true
+// The ordered index is a `BTreeSet<(OrderedScore, Box<[u8]>)>` rather than a true
 // skiplist. ZSET_LARGE.md calls the skiplist "provisional" and commits this code to the
 // TRAIT (ZSetValue) the index sits behind, not the concrete structure; the #136 bake-off
 // (skiplist vs cache-conscious B-tree vs ART) picks the perf winner later. A BTreeMap
@@ -1135,12 +1135,12 @@ enum ZSetRepr {
     /// linear-scanned for membership. Reports [`Encoding::ListPack`].
     ListPack(Vec<ZSetEntry>),
     /// The large `skiplist` form: a dual structure -- an ordered index
-    /// `BTreeMap<(OrderedScore, member), ()>` for range/rank, plus a parallel
+    /// `BTreeSet<(OrderedScore, member)>` for range/rank, plus a parallel
     /// `HashMap<member, score>` for O(1) score lookup [redis-zset-skiplist-plus-ht].
     /// Reports [`Encoding::SkipList`]. One-way: never converts back to listpack.
     SkipList {
         /// The ordered index keyed by (score, member) for range and rank queries.
-        index: BTreeMap<(OrderedScore, Box<[u8]>), ()>,
+        index: BTreeSet<(OrderedScore, Box<[u8]>)>,
         /// The member -> score map for O(1) ZSCORE and ZADD score-update.
         scores: HashMap<Box<[u8]>, f64>,
     },
@@ -1202,18 +1202,17 @@ impl ZSetVal {
     /// once `entries > zset-max-listpack-entries` (128) OR any member byte length exceeds
     /// `zset-max-listpack-value` (64).
     fn listpack_overflows(entries: usize, member_len: usize) -> bool {
-        entries > DEFAULT_ZSET_MAX_LISTPACK_ENTRIES
-            || member_len > DEFAULT_ZSET_MAX_LISTPACK_VALUE
+        entries > DEFAULT_ZSET_MAX_LISTPACK_ENTRIES || member_len > DEFAULT_ZSET_MAX_LISTPACK_VALUE
     }
 
     /// Promote the small listpack form to the large skiplist form (one-way). A no-op if
     /// already a skiplist.
     fn convert_to_skiplist(&mut self) {
         if let ZSetRepr::ListPack(v) = &mut self.0 {
-            let mut index: BTreeMap<(OrderedScore, Box<[u8]>), ()> = BTreeMap::new();
+            let mut index: BTreeSet<(OrderedScore, Box<[u8]>)> = BTreeSet::new();
             let mut scores: HashMap<Box<[u8]>, f64> = HashMap::with_capacity(v.len());
             for (m, s) in v.drain(..) {
-                index.insert((OrderedScore(s), m.clone()), ());
+                index.insert((OrderedScore(s), m.clone()));
                 scores.insert(m, s);
             }
             self.0 = ZSetRepr::SkipList { index, scores };
@@ -1229,9 +1228,7 @@ impl ZSetVal {
     /// member) order. The caller guarantees `member` is NOT already present.
     fn listpack_insert_sorted(v: &mut Vec<ZSetEntry>, member: &[u8], score: f64) {
         let pos = v
-            .binary_search_by(|(m, s)| {
-                s.total_cmp(&score).then_with(|| m.as_ref().cmp(member))
-            })
+            .binary_search_by(|(m, s)| s.total_cmp(&score).then_with(|| m.as_ref().cmp(member)))
             .unwrap_or_else(|e| e);
         v.insert(pos, (member.to_vec().into_boxed_slice(), score));
     }
@@ -1262,11 +1259,11 @@ impl ZSetVal {
                     // Score update: remove-then-reinsert in the ordered index plus an
                     // in-place score rewrite in the map (the ZSET_LARGE.md sync invariant).
                     index.remove(&(OrderedScore(old), member.to_vec().into_boxed_slice()));
-                    index.insert((OrderedScore(score), member.to_vec().into_boxed_slice()), ());
+                    index.insert((OrderedScore(score), member.to_vec().into_boxed_slice()));
                     scores.insert(member.to_vec().into_boxed_slice(), score);
                     false
                 } else {
-                    index.insert((OrderedScore(score), member.to_vec().into_boxed_slice()), ());
+                    index.insert((OrderedScore(score), member.to_vec().into_boxed_slice()));
                     scores.insert(member.to_vec().into_boxed_slice(), score);
                     true
                 }
@@ -1280,7 +1277,7 @@ impl ZSetVal {
         match &self.0 {
             ZSetRepr::ListPack(v) => v.iter().map(|(m, s)| (m.to_vec(), *s)).collect(),
             ZSetRepr::SkipList { index, .. } => {
-                index.keys().map(|(s, m)| (m.to_vec(), s.0)).collect()
+                index.iter().map(|(s, m)| (m.to_vec(), s.0)).collect()
             }
         }
     }
@@ -1340,81 +1337,80 @@ impl ZSetVal {
     }
 }
 
+/// Whether a score UPDATE from `cur` to `new` passes the GT/LT gate (used by both `add`
+/// and `incr`). GT permits the update only when `new` is strictly greater than `cur`; LT
+/// only when strictly less; with neither set the update always passes. Written with
+/// positive comparisons (no negated partial-ord operator) so a non-finite score compares
+/// the IEEE way Redis relies on (GT vs `+inf` never updates, etc.).
+fn gate_passes(cur: f64, new: f64, flags: ZAddFlags) -> bool {
+    if flags.gt {
+        new > cur
+    } else if flags.lt {
+        new < cur
+    } else {
+        true
+    }
+}
+
 impl ZSetValue for ZSetVal {
+    #[allow(clippy::float_cmp)] // `score != cur` is the exact Redis CH "changed" check.
     fn add(&mut self, member: &[u8], score: f64, flags: ZAddFlags) -> ZAddOutcome {
-        let existing = self.score(member);
-        match existing {
-            Some(cur) => {
-                // The member exists: NX suppresses any update; GT/LT gate on the new score.
-                if flags.nx {
-                    return ZAddOutcome {
-                        added: false,
-                        changed: false,
-                        new_score: Some(cur),
-                    };
-                }
-                if (flags.gt && !(score > cur)) || (flags.lt && !(score < cur)) {
-                    return ZAddOutcome {
-                        added: false,
-                        changed: false,
-                        new_score: Some(cur),
-                    };
-                }
-                // Apply the score (a no-op-equal score still counts as unchanged, matching
-                // Redis: CH counts a member as changed only if the score actually differs).
-                let changed = score != cur;
-                if changed {
-                    self.put(member, score);
-                }
-                ZAddOutcome {
+        let Some(cur) = self.score(member) else {
+            // The member is absent: XX suppresses adding it; GT/LT alone DO add new members
+            // (per Redis they only gate UPDATES), so they fall through to the add.
+            if flags.xx {
+                return ZAddOutcome {
                     added: false,
-                    changed,
-                    new_score: Some(score),
-                }
+                    changed: false,
+                    new_score: None,
+                };
             }
-            None => {
-                // The member is absent: XX suppresses adding it (and GT/LT, which only
-                // update existing members, do NOT add when alone -- but ZADD GT/LT DO add
-                // new members per Redis, so GT/LT alone fall through to the add).
-                if flags.xx {
-                    return ZAddOutcome {
-                        added: false,
-                        changed: false,
-                        new_score: None,
-                    };
-                }
-                self.put(member, score);
-                ZAddOutcome {
-                    added: true,
-                    changed: true,
-                    new_score: Some(score),
-                }
-            }
+            self.put(member, score);
+            return ZAddOutcome {
+                added: true,
+                changed: true,
+                new_score: Some(score),
+            };
+        };
+        // The member exists: NX suppresses any update; GT/LT gate on the new score.
+        if flags.nx || !gate_passes(cur, score, flags) {
+            return ZAddOutcome {
+                added: false,
+                changed: false,
+                new_score: Some(cur),
+            };
+        }
+        // Apply the score (an equal score still counts as unchanged, matching Redis: CH
+        // counts a member as changed only if the score actually differs).
+        let changed = score != cur;
+        if changed {
+            self.put(member, score);
+        }
+        ZAddOutcome {
+            added: false,
+            changed,
+            new_score: Some(score),
         }
     }
 
     fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> Option<f64> {
-        match self.score(member) {
-            Some(cur) => {
-                if flags.nx {
-                    return None; // NX on an existing member: suppressed (INCR -> nil).
-                }
-                let new = cur + delta;
-                if (flags.gt && !(new > cur)) || (flags.lt && !(new < cur)) {
-                    return None; // GT/LT gate failed: suppressed (INCR -> nil).
-                }
-                self.put(member, new);
-                Some(new)
+        let Some(cur) = self.score(member) else {
+            if flags.xx {
+                return None; // XX on a missing member: suppressed (INCR -> nil).
             }
-            None => {
-                if flags.xx {
-                    return None; // XX on a missing member: suppressed (INCR -> nil).
-                }
-                // Create at `delta` (ZINCRBY/ZADD INCR on a missing member starts from 0).
-                self.put(member, delta);
-                Some(delta)
-            }
+            // Create at `delta` (ZINCRBY/ZADD INCR on a missing member starts from 0).
+            self.put(member, delta);
+            return Some(delta);
+        };
+        if flags.nx {
+            return None; // NX on an existing member: suppressed (INCR -> nil).
         }
+        let new = cur + delta;
+        if !gate_passes(cur, new, flags) {
+            return None; // GT/LT gate failed: suppressed (INCR -> nil).
+        }
+        self.put(member, new);
+        Some(new)
     }
 
     fn score(&self, member: &[u8]) -> Option<f64> {
@@ -2494,7 +2490,11 @@ mod tests {
         z.add(b"a", 1.0, no_flags());
         z.add(b"c", 2.0, no_flags()); // equal score to b -> member lex tiebreak (b before c)
         z.add(b"d", 1.0, no_flags()); // equal score to a -> a before d
-        let order: Vec<Vec<u8>> = z.members_with_scores().into_iter().map(|(m, _)| m).collect();
+        let order: Vec<Vec<u8>> = z
+            .members_with_scores()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(
             order,
             vec![b"a".to_vec(), b"d".to_vec(), b"b".to_vec(), b"c".to_vec()],
@@ -2508,7 +2508,11 @@ mod tests {
         z.add(b"mid", 0.0, no_flags());
         z.add(b"hi", f64::INFINITY, no_flags());
         z.add(b"lo", f64::NEG_INFINITY, no_flags());
-        let order: Vec<Vec<u8>> = z.members_with_scores().into_iter().map(|(m, _)| m).collect();
+        let order: Vec<Vec<u8>> = z
+            .members_with_scores()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(order, vec![b"lo".to_vec(), b"mid".to_vec(), b"hi".to_vec()]);
         assert_eq!(z.score(b"hi"), Some(f64::INFINITY));
         assert_eq!(z.score(b"lo"), Some(f64::NEG_INFINITY));
@@ -2525,7 +2529,11 @@ mod tests {
         assert!(out.changed);
         assert_eq!(out.new_score, Some(9.0));
         assert_eq!(z.len(), 2);
-        let order: Vec<Vec<u8>> = z.members_with_scores().into_iter().map(|(m, _)| m).collect();
+        let order: Vec<Vec<u8>> = z
+            .members_with_scores()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(order, vec![b"b".to_vec(), b"a".to_vec()]);
     }
 
@@ -2537,7 +2545,11 @@ mod tests {
             z.add(format!("m{i:04}").as_bytes(), i as f64, no_flags());
         }
         assert_eq!(z.len(), DEFAULT_ZSET_MAX_LISTPACK_ENTRIES);
-        assert_eq!(z.encoding(), Encoding::ListPack, "exactly 128 stays listpack");
+        assert_eq!(
+            z.encoding(),
+            Encoding::ListPack,
+            "exactly 128 stays listpack"
+        );
         z.add(b"overflow", 999.0, no_flags());
         assert_eq!(
             z.encoding(),
@@ -2560,7 +2572,11 @@ mod tests {
         z2.add(b"x", 1.0, no_flags());
         let at_cap = vec![b'q'; DEFAULT_ZSET_MAX_LISTPACK_VALUE];
         z2.add(&at_cap, 2.0, no_flags());
-        assert_eq!(z2.encoding(), Encoding::ListPack, "64-byte member at the cap");
+        assert_eq!(
+            z2.encoding(),
+            Encoding::ListPack,
+            "64-byte member at the cap"
+        );
         let over_cap = vec![b'q'; DEFAULT_ZSET_MAX_LISTPACK_VALUE + 1];
         z2.add(&over_cap, 3.0, no_flags());
         assert_eq!(
@@ -2671,10 +2687,7 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(
-            by_score,
-            vec![(b"b".to_vec(), 2.0), (b"c".to_vec(), 3.0)]
-        );
+        assert_eq!(by_score, vec![(b"b".to_vec(), 2.0), (b"c".to_vec(), 3.0)]);
         // exclusive lower (2 -> excludes b.
         let excl = z.range_by_score(
             ScoreBound::exclusive(2.0),

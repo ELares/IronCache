@@ -951,3 +951,141 @@ fn unknown_command_error_over_socket() {
         acceptor.await.unwrap();
     });
 }
+
+// A socket round-trip over the full zset surface (ZADD/ZSCORE/ZRANGE/WITHSCORES/
+// ZRANGEBYSCORE/ZPOPMIN + the listpack->skiplist transition + RESP3 WITHSCORES nesting)
+// is inherently long; the steps are linear write/expect pairs.
+#[allow(clippy::too_many_lines)]
+#[test]
+fn zset_commands_over_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // ZADD z 1 a 2 b 3 c -> :3.
+        client
+            .write_all(
+                b"*8\r\n$4\r\nZADD\r\n$1\r\nz\r\n$1\r\n1\r\n$1\r\na\r\n$1\r\n2\r\n$1\r\nb\r\n$1\r\n3\r\n$1\r\nc\r\n",
+            )
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3\r\n").await;
+
+        // TYPE z -> +zset.
+        client
+            .write_all(b"*2\r\n$4\r\nTYPE\r\n$1\r\nz\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"+zset\r\n").await;
+
+        // OBJECT ENCODING z -> listpack (small).
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\nz\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$8\r\nlistpack\r\n").await;
+
+        // ZSCORE z b -> $1 2 (bulk).
+        client
+            .write_all(b"*3\r\n$6\r\nZSCORE\r\n$1\r\nz\r\n$1\r\nb\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$1\r\n2\r\n").await;
+
+        // ZRANGE z 0 -1 -> [a, b, c].
+        client
+            .write_all(b"*4\r\n$6\r\nZRANGE\r\n$1\r\nz\r\n$1\r\n0\r\n$2\r\n-1\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n").await;
+
+        // ZRANGE z 0 -1 WITHSCORES -> RESP2 flat [a,1,b,2,c,3].
+        client
+            .write_all(
+                b"*5\r\n$6\r\nZRANGE\r\n$1\r\nz\r\n$1\r\n0\r\n$2\r\n-1\r\n$10\r\nWITHSCORES\r\n",
+            )
+            .await
+            .unwrap();
+        expect_reply(
+            &mut client,
+            b"*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n",
+        )
+        .await;
+
+        // ZRANGEBYSCORE z (1 +inf -> [b, c].
+        client
+            .write_all(
+                b"*4\r\n$13\r\nZRANGEBYSCORE\r\n$1\r\nz\r\n$2\r\n(1\r\n$4\r\n+inf\r\n",
+            )
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n").await;
+
+        // ZPOPMIN z -> [a, 1] (member + score interleaved under RESP2).
+        client
+            .write_all(b"*2\r\n$7\r\nZPOPMIN\r\n$1\r\nz\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"*2\r\n$1\r\na\r\n$1\r\n1\r\n").await;
+
+        // Drive the listpack->skiplist transition with a >64-byte member.
+        let big = vec![b'q'; 100];
+        let mut frame =
+            format!("*4\r\n$4\r\nZADD\r\n$1\r\nz\r\n$1\r\n9\r\n${}\r\n", big.len()).into_bytes();
+        frame.extend_from_slice(&big);
+        frame.extend_from_slice(b"\r\n");
+        client.write_all(&frame).await.unwrap();
+        expect_reply(&mut client, b":1\r\n").await;
+        client
+            .write_all(b"*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$1\r\nz\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"$8\r\nskiplist\r\n").await;
+
+        // Switch to RESP3 (HELLO 3 -> a map) then verify WITHSCORES nests under RESP3.
+        client
+            .write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+            .await
+            .unwrap();
+        let mut hbuf = [0u8; 512];
+        let hn = client.read(&mut hbuf).await.unwrap();
+        assert_eq!(hbuf[0], b'%', "expected RESP3 map, got {:?}", &hbuf[..hn]);
+        // A fresh small zset for a clean WITHSCORES shape under RESP3.
+        client
+            .write_all(
+                b"*6\r\n$4\r\nZADD\r\n$2\r\nz3\r\n$1\r\n1\r\n$1\r\na\r\n$1\r\n2\r\n$1\r\nb\r\n",
+            )
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":2\r\n").await;
+        client
+            .write_all(
+                b"*5\r\n$6\r\nZRANGE\r\n$2\r\nz3\r\n$1\r\n0\r\n$2\r\n-1\r\n$10\r\nWITHSCORES\r\n",
+            )
+            .await
+            .unwrap();
+        // RESP3: an array of [member, ,double] 2-arrays.
+        expect_reply(
+            &mut client,
+            b"*2\r\n*2\r\n$1\r\na\r\n,1\r\n*2\r\n$1\r\nb\r\n,2\r\n",
+        )
+        .await;
+
+        drop(client);
+        acceptor.await.unwrap();
+    });
+}

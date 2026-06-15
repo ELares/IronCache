@@ -753,14 +753,22 @@ impl ScoreBound {
     /// exclusive bound, `s >= score` for an inclusive one).
     #[must_use]
     pub fn allows_min(&self, s: f64) -> bool {
-        if self.inclusive { s >= self.score } else { s > self.score }
+        if self.inclusive {
+            s >= self.score
+        } else {
+            s > self.score
+        }
     }
 
     /// Whether `s` satisfies this bound as a MAXIMUM (upper) bound (`s < score` for an
     /// exclusive bound, `s <= score` for an inclusive one).
     #[must_use]
     pub fn allows_max(&self, s: f64) -> bool {
-        if self.inclusive { s <= self.score } else { s < self.score }
+        if self.inclusive {
+            s <= self.score
+        } else {
+            s < self.score
+        }
     }
 }
 
@@ -808,6 +816,12 @@ impl LexBound {
 /// NX/XX/GT/LT are validated for compatibility at the command layer BEFORE this is
 /// built (NX+GT/NX+LT/GT+LT/NX+XX are syntax errors), so a `ZAddFlags` is always a
 /// legal combination here.
+// The four flags mirror Redis's ZADD NX/XX/GT/LT option bits one-for-one; they are
+// independent boolean toggles (not a state enum), and the command layer validates the
+// illegal combinations before constructing this. A bitflags type would obscure the
+// direct correspondence to the Redis option tokens, so the four-bool struct is the
+// clearest faithful shape here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ZAddFlags {
     /// NX: only add a NEW member; never update an existing one.
@@ -1117,10 +1131,9 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_list_mut(&mut self) -> Option<&mut dyn ListValue> {
         match &mut self.value {
             ValueMut::List(l) => Some(&mut **l),
-            ValueMut::NonCollection
-            | ValueMut::Hash(_)
-            | ValueMut::Set(_)
-            | ValueMut::ZSet(_) => None,
+            ValueMut::NonCollection | ValueMut::Hash(_) | ValueMut::Set(_) | ValueMut::ZSet(_) => {
+                None
+            }
         }
     }
 
@@ -1130,10 +1143,9 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_hash_mut(&mut self) -> Option<&mut dyn HashValue> {
         match &mut self.value {
             ValueMut::Hash(h) => Some(&mut **h),
-            ValueMut::NonCollection
-            | ValueMut::List(_)
-            | ValueMut::Set(_)
-            | ValueMut::ZSet(_) => None,
+            ValueMut::NonCollection | ValueMut::List(_) | ValueMut::Set(_) | ValueMut::ZSet(_) => {
+                None
+            }
         }
     }
 
@@ -1143,10 +1155,9 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_set_mut(&mut self) -> Option<&mut dyn SetValue> {
         match &mut self.value {
             ValueMut::Set(s) => Some(&mut **s),
-            ValueMut::NonCollection
-            | ValueMut::List(_)
-            | ValueMut::Hash(_)
-            | ValueMut::ZSet(_) => None,
+            ValueMut::NonCollection | ValueMut::List(_) | ValueMut::Hash(_) | ValueMut::ZSet(_) => {
+                None
+            }
         }
     }
 
@@ -1159,10 +1170,9 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_zset_mut(&mut self) -> Option<&mut dyn ZSetValue> {
         match &mut self.value {
             ValueMut::ZSet(z) => Some(&mut **z),
-            ValueMut::NonCollection
-            | ValueMut::List(_)
-            | ValueMut::Hash(_)
-            | ValueMut::Set(_) => None,
+            ValueMut::NonCollection | ValueMut::List(_) | ValueMut::Hash(_) | ValueMut::Set(_) => {
+                None
+            }
         }
     }
 }

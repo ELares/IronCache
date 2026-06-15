@@ -58,9 +58,7 @@
 //! [`OccupiedEntryMut::as_zset_mut`]: ironcache_storage::OccupiedEntryMut::as_zset_mut
 //! [`format_human_double`]: ironcache_protocol::format_human_double
 
-use crate::cmd_util::{
-    ascii_upper, parse_f64, parse_i64, parse_lex_bound, parse_score_bound,
-};
+use crate::cmd_util::{ascii_upper, parse_f64, parse_i64, parse_lex_bound, parse_score_bound};
 use bytes::Bytes;
 use ironcache_protocol::{ErrorReply, Request, Value, format_human_double};
 use ironcache_storage::{
@@ -144,6 +142,10 @@ impl SeedRng {
 /// INCR a bulk score (or nil if the op was suppressed by NX/XX/GT/LT). Creates the zset on
 /// a missing key. WRONGTYPE on a non-zset. The GT/LT/NX conflict, NX+XX, the INCR
 /// single-pair rule, and a bad score are byte-exact errors.
+// `score`/`scores`-style bindings and the full flag/INCR/create/update matrix make this
+// the longest of the zset handlers; the structure (flag parse -> validate -> pair parse
+// -> rmw closure) is linear and clear, so the length/name lints are allowed here.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
     // ZADD key [opts...] score member [score member ...]: at least key + one pair.
     if req.args.len() < 4 {
@@ -632,7 +634,13 @@ struct RangeSpec {
 
 /// Evaluate a [`RangeSpec`] against the zset under `key`, replying with the member array
 /// (or WITHSCORES pairs). A missing key is an empty array; WRONGTYPE on a non-zset.
-fn eval_range<S: Store>(store: &mut S, db: u32, now: UnixMillis, key: &[u8], spec: RangeSpec) -> Value {
+fn eval_range<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    key: &[u8],
+    spec: RangeSpec,
+) -> Value {
     store.rmw_mut(db, key, now, move |entry| match entry {
         RmwEntry::Vacant => keep(members_reply(Vec::new(), spec.with_scores)),
         RmwEntry::OccupiedMut(mut o) => {
@@ -641,9 +649,7 @@ fn eval_range<S: Store>(store: &mut S, db: u32, now: UnixMillis, key: &[u8], spe
             };
             let pairs: Vec<(Vec<u8>, f64)> = match &spec.kind {
                 RangeKind::Rank(s, e) => zset.range_by_rank(*s, *e, spec.rev),
-                RangeKind::Score(min, max) => {
-                    zset.range_by_score(*min, *max, spec.rev, spec.limit)
-                }
+                RangeKind::Score(min, max) => zset.range_by_score(*min, *max, spec.rev, spec.limit),
                 RangeKind::Lex(min, max) => zset
                     .range_by_lex(min, max, spec.rev, spec.limit)
                     .into_iter()
@@ -845,7 +851,12 @@ fn rangebyscore_generic<S: Store>(
 }
 
 /// `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]`.
-pub fn cmd_zrangebyscore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+pub fn cmd_zrangebyscore<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+) -> Value {
     rangebyscore_generic(store, db, now, req, false, "zrangebyscore")
 }
 
@@ -950,9 +961,7 @@ fn pop_generic<S: Store>(
     let count: Option<i64> = if req.args.len() == 3 {
         match parse_i64(&req.args[2]) {
             Some(n) if n < 0 => {
-                return Value::error(ErrorReply::err(
-                    "value is out of range, must be positive",
-                ));
+                return Value::error(ErrorReply::err("value is out of range, must be positive"));
             }
             Some(n) => Some(n),
             None => return Value::error(ErrorReply::not_an_integer()),
@@ -1465,11 +1474,7 @@ struct AggArgs {
 /// for ZDIFF/ZDIFFSTORE (Redis ZDIFF has no WEIGHTS/AGGREGATE). `numkeys_at` is the arg
 /// index of `numkeys` (1 for the non-store forms, 2 for the STORE forms with a leading
 /// dest). Returns `Ok(args)` or an `Err(error_value)`.
-fn parse_agg_args(
-    req: &Request,
-    numkeys_at: usize,
-    allow_weights: bool,
-) -> Result<AggArgs, Value> {
+fn parse_agg_args(req: &Request, numkeys_at: usize, allow_weights: bool) -> Result<AggArgs, Value> {
     let Some(numkeys) = parse_i64(&req.args[numkeys_at]) else {
         return Err(Value::error(ErrorReply::not_an_integer()));
     };
@@ -1489,14 +1494,15 @@ fn parse_agg_args(
     while i < req.args.len() {
         match ascii_upper(&req.args[i]).as_slice() {
             b"WEIGHTS" if allow_weights => {
-                if i + numkeys >= req.args.len() + 1 || i + 1 + numkeys > req.args.len() {
+                // Need exactly `numkeys` weight values after the WEIGHTS token.
+                if i + 1 + numkeys > req.args.len() {
                     return Err(Value::error(ErrorReply::syntax_error()));
                 }
-                for k in 0..numkeys {
+                for (k, slot) in weights.iter_mut().enumerate() {
                     let Some(w) = parse_f64(&req.args[i + 1 + k]) else {
                         return Err(Value::error(ErrorReply::weight_not_a_float()));
                     };
-                    weights[k] = w;
+                    *slot = w;
                 }
                 i += 1 + numkeys;
             }
@@ -1731,5 +1737,1045 @@ pub fn cmd_zintercard<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &R
             Value::Integer(card as i64)
         }
         Err(()) => Value::error(ErrorReply::wrong_type()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironcache_protocol::{ProtoVersion, encode_to_vec};
+    use ironcache_storage::{CountingAccounting, DataType, Store};
+    use ironcache_store::ShardStore;
+
+    type TestStore = ShardStore<ironcache_eviction::Policy, CountingAccounting>;
+
+    fn test_store() -> TestStore {
+        ShardStore::with_hooks(
+            1,
+            ironcache_eviction::Policy::cache_default(),
+            CountingAccounting::new(),
+        )
+    }
+
+    fn req(parts: &[&[u8]]) -> Request {
+        Request {
+            args: parts.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        }
+    }
+
+    const NOW: UnixMillis = UnixMillis(0);
+    const SEED: u64 = 0xABCD_1234_5678_9EF0;
+
+    fn int(v: &Value) -> i64 {
+        match v {
+            Value::Integer(n) => *n,
+            other => panic!("expected an integer, got {other:?}"),
+        }
+    }
+
+    fn err_line(v: &Value) -> String {
+        match v {
+            Value::Error(e) => e.line(),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    fn bulk_str(v: &Value) -> Option<String> {
+        match v {
+            Value::BulkString(Some(b)) => Some(String::from_utf8(b.to_vec()).unwrap()),
+            Value::Null => None,
+            other => panic!("expected a bulk or nil, got {other:?}"),
+        }
+    }
+
+    /// The member strings from a plain-array members reply.
+    fn members(v: &Value) -> Vec<String> {
+        match v {
+            Value::Array(Some(items)) => items
+                .iter()
+                .map(|i| match i {
+                    Value::BulkString(Some(b)) => String::from_utf8(b.to_vec()).unwrap(),
+                    other => panic!("non-bulk member: {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    /// The (member, score) pairs from a WITHSCORES Value::Pairs reply.
+    fn pairs(v: &Value) -> Vec<(String, f64)> {
+        match v {
+            Value::Pairs(p) => p
+                .iter()
+                .map(|(m, s)| {
+                    let member = match m {
+                        Value::BulkString(Some(b)) => String::from_utf8(b.to_vec()).unwrap(),
+                        other => panic!("non-bulk member: {other:?}"),
+                    };
+                    let score = match s {
+                        Value::Double(d) => *d,
+                        other => panic!("non-double score: {other:?}"),
+                    };
+                    (member, score)
+                })
+                .collect(),
+            other => panic!("expected Value::Pairs, got {other:?}"),
+        }
+    }
+
+    fn zadd(s: &mut TestStore, parts: &[&[u8]]) -> Value {
+        cmd_zadd(s, 0, NOW, &req(parts))
+    }
+
+    // ---- ZADD matrix: counts, dedup, NX/XX/GT/LT/CH/INCR, conflicts, bad score. ----
+
+    #[test]
+    fn zadd_basic_count_and_type_and_score() {
+        let mut s = test_store();
+        assert_eq!(
+            int(&zadd(&mut s, &[b"ZADD", b"z", b"1", b"a", b"2", b"b"])),
+            2
+        );
+        assert_eq!(s.type_of(0, b"z", NOW), Some(DataType::ZSet));
+        assert_eq!(int(&cmd_zcard(&mut s, 0, NOW, &req(&[b"ZCARD", b"z"]))), 2);
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"a"]))),
+            Some("1".to_owned())
+        );
+        // Re-adding an existing member with a new score updates but is NOT counted (no CH).
+        assert_eq!(int(&zadd(&mut s, &[b"ZADD", b"z", b"5", b"a"])), 0);
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"a"]))),
+            Some("5".to_owned())
+        );
+        // CH counts the updated member.
+        assert_eq!(int(&zadd(&mut s, &[b"ZADD", b"z", b"CH", b"6", b"a"])), 1);
+    }
+
+    #[test]
+    fn zadd_nx_xx_gt_lt_and_incr() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"5", b"a"]);
+        // NX never updates an existing member.
+        assert_eq!(int(&zadd(&mut s, &[b"ZADD", b"z", b"NX", b"9", b"a"])), 0);
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"a"]))),
+            Some("5".to_owned())
+        );
+        // XX never adds a new member.
+        assert_eq!(int(&zadd(&mut s, &[b"ZADD", b"z", b"XX", b"1", b"new"])), 0);
+        assert!(
+            bulk_str(&cmd_zscore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZSCORE", b"z", b"new"])
+            ))
+            .is_none()
+        );
+        // GT only updates if greater: 3 < 5 -> no change.
+        zadd(&mut s, &[b"ZADD", b"z", b"GT", b"3", b"a"]);
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"a"]))),
+            Some("5".to_owned())
+        );
+        // GT updates if greater: 9 > 5.
+        zadd(&mut s, &[b"ZADD", b"z", b"GT", b"9", b"a"]);
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"a"]))),
+            Some("9".to_owned())
+        );
+        // INCR returns the new score as a bulk.
+        assert_eq!(
+            bulk_str(&zadd(&mut s, &[b"ZADD", b"z", b"INCR", b"1", b"a"])),
+            Some("10".to_owned())
+        );
+        // INCR suppressed by NX on an existing member -> nil.
+        assert_eq!(
+            zadd(&mut s, &[b"ZADD", b"z", b"NX", b"INCR", b"1", b"a"]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn zadd_flag_conflicts_and_bad_score_are_byte_exact_errors() {
+        let mut s = test_store();
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"z", b"NX", b"GT", b"1", b"a"])),
+            "-ERR GT, LT, and/or NX options at the same time are not compatible"
+        );
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"z", b"GT", b"LT", b"1", b"a"])),
+            "-ERR GT, LT, and/or NX options at the same time are not compatible"
+        );
+        // NX + XX is the generic syntax error.
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"z", b"NX", b"XX", b"1", b"a"])),
+            "-ERR syntax error"
+        );
+        // INCR with multiple pairs.
+        assert_eq!(
+            err_line(&zadd(
+                &mut s,
+                &[b"ZADD", b"z", b"INCR", b"1", b"a", b"2", b"b"]
+            )),
+            "-ERR INCR option supports a single increment-element pair"
+        );
+        // A bad score.
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"z", b"notanumber", b"a"])),
+            "-ERR value is not a valid float"
+        );
+        // NaN is rejected as not-a-valid-float.
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"z", b"nan", b"a"])),
+            "-ERR value is not a valid float"
+        );
+    }
+
+    #[test]
+    fn zadd_inf_scores_allowed_and_ordered() {
+        let mut s = test_store();
+        zadd(
+            &mut s,
+            &[b"ZADD", b"z", b"+inf", b"hi", b"-inf", b"lo", b"0", b"mid"],
+        );
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"0", b"-1"])
+            )),
+            vec!["lo", "mid", "hi"]
+        );
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"hi"]))),
+            Some("inf".to_owned())
+        );
+    }
+
+    #[test]
+    fn zadd_wrongtype_on_a_string_key() {
+        let mut s = test_store();
+        s.upsert(
+            0,
+            b"str",
+            ironcache_storage::NewValue::Bytes(b"v"),
+            ExpireWrite::Clear,
+            NOW,
+        );
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"str", b"1", b"a"])),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+    }
+
+    // ---- ZINCRBY / ZMSCORE. ----
+
+    #[test]
+    fn zincrby_and_zmscore() {
+        let mut s = test_store();
+        assert_eq!(
+            bulk_str(&cmd_zincrby(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZINCRBY", b"z", b"2.5", b"a"])
+            )),
+            Some("2.5".to_owned())
+        );
+        assert_eq!(
+            bulk_str(&cmd_zincrby(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZINCRBY", b"z", b"2.5", b"a"])
+            )),
+            Some("5".to_owned())
+        );
+        // ZMSCORE: present + absent.
+        match cmd_zmscore(&mut s, 0, NOW, &req(&[b"ZMSCORE", b"z", b"a", b"missing"])) {
+            Value::Array(Some(items)) => {
+                assert_eq!(bulk_str(&items[0]), Some("5".to_owned()));
+                assert_eq!(items[1], Value::Null);
+            }
+            other => panic!("ZMSCORE not an array: {other:?}"),
+        }
+        // ZMSCORE on a missing key -> all nil.
+        assert_eq!(
+            cmd_zmscore(&mut s, 0, NOW, &req(&[b"ZMSCORE", b"nope", b"a", b"b"])),
+            Value::Array(Some(vec![Value::Null, Value::Null]))
+        );
+    }
+
+    // ---- ZRANK / ZREVRANK (+WITHSCORE). ----
+
+    #[test]
+    fn zrank_revrank_withscore() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            int(&cmd_zrank(&mut s, 0, NOW, &req(&[b"ZRANK", b"z", b"a"]))),
+            0
+        );
+        assert_eq!(
+            int(&cmd_zrank(&mut s, 0, NOW, &req(&[b"ZRANK", b"z", b"c"]))),
+            2
+        );
+        assert_eq!(
+            int(&cmd_zrevrank(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZREVRANK", b"z", b"a"])
+            )),
+            2
+        );
+        // Missing member -> nil.
+        assert_eq!(
+            cmd_zrank(&mut s, 0, NOW, &req(&[b"ZRANK", b"z", b"zzz"])),
+            Value::Null
+        );
+        // WITHSCORE -> [rank, score].
+        match cmd_zrank(&mut s, 0, NOW, &req(&[b"ZRANK", b"z", b"b", b"WITHSCORE"])) {
+            Value::Array(Some(items)) => {
+                assert_eq!(items[0], Value::Integer(1));
+                assert_eq!(items[1], Value::Double(2.0));
+            }
+            other => panic!("WITHSCORE not an array: {other:?}"),
+        }
+    }
+
+    // ---- ZRANGE family: index / BYSCORE / BYLEX / REV / LIMIT / WITHSCORES. ----
+
+    #[test]
+    fn zrange_index_rev_and_withscores() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"0", b"-1"])
+            )),
+            vec!["a", "b", "c"]
+        );
+        // REV.
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"0", b"-1", b"REV"])
+            )),
+            vec!["c", "b", "a"]
+        );
+        // ZREVRANGE alias.
+        assert_eq!(
+            members(&cmd_zrevrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZREVRANGE", b"z", b"0", b"-1"])
+            )),
+            vec!["c", "b", "a"]
+        );
+        // WITHSCORES.
+        assert_eq!(
+            pairs(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"0", b"1", b"WITHSCORES"])
+            )),
+            vec![("a".to_owned(), 1.0), ("b".to_owned(), 2.0)]
+        );
+    }
+
+    #[test]
+    fn zrange_byscore_with_exclusive_inf_and_limit() {
+        let mut s = test_store();
+        zadd(
+            &mut s,
+            &[
+                b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d",
+            ],
+        );
+        // BYSCORE inclusive [2,3].
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"2", b"3", b"BYSCORE"])
+            )),
+            vec!["b", "c"]
+        );
+        // Exclusive lower (2 -> excludes b.
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"(2", b"+inf", b"BYSCORE"])
+            )),
+            vec!["c", "d"]
+        );
+        // Legacy ZRANGEBYSCORE with LIMIT.
+        assert_eq!(
+            members(&cmd_zrangebyscore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[
+                    b"ZRANGEBYSCORE",
+                    b"z",
+                    b"-inf",
+                    b"+inf",
+                    b"LIMIT",
+                    b"1",
+                    b"2"
+                ])
+            )),
+            vec!["b", "c"]
+        );
+        // ZREVRANGEBYSCORE: max first.
+        assert_eq!(
+            members(&cmd_zrevrangebyscore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZREVRANGEBYSCORE", b"z", b"+inf", b"-inf"])
+            )),
+            vec!["d", "c", "b", "a"]
+        );
+        // Bad bound.
+        assert_eq!(
+            err_line(&cmd_zrangebyscore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGEBYSCORE", b"z", b"bad", b"3"])
+            )),
+            "-ERR min or max is not a float"
+        );
+    }
+
+    #[test]
+    fn zrange_bylex_inclusive_exclusive_neg_pos() {
+        let mut s = test_store();
+        // Equal scores for a lex range.
+        zadd(
+            &mut s,
+            &[
+                b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d",
+            ],
+        );
+        // [b (d -> b, c.
+        assert_eq!(
+            members(&cmd_zrangebylex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGEBYLEX", b"z", b"[b", b"(d"])
+            )),
+            vec!["b", "c"]
+        );
+        // - + -> all.
+        assert_eq!(
+            members(&cmd_zrangebylex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGEBYLEX", b"z", b"-", b"+"])
+            )),
+            vec!["a", "b", "c", "d"]
+        );
+        // ZRANGE BYLEX REV.
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"+", b"-", b"BYLEX", b"REV"])
+            )),
+            vec!["d", "c", "b", "a"]
+        );
+        // Bad lex bound (missing [ or ().
+        assert_eq!(
+            err_line(&cmd_zrangebylex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGEBYLEX", b"z", b"b", b"d"])
+            )),
+            "-ERR min or max not valid string range item"
+        );
+    }
+
+    #[test]
+    fn zcount_and_zlexcount() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            int(&cmd_zcount(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZCOUNT", b"z", b"(1", b"3"])
+            )),
+            2
+        );
+        assert_eq!(
+            int(&cmd_zcount(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZCOUNT", b"z", b"-inf", b"+inf"])
+            )),
+            3
+        );
+        let mut s2 = test_store();
+        zadd(
+            &mut s2,
+            &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c"],
+        );
+        assert_eq!(
+            int(&cmd_zlexcount(
+                &mut s2,
+                0,
+                NOW,
+                &req(&[b"ZLEXCOUNT", b"z", b"-", b"+"])
+            )),
+            3
+        );
+        assert_eq!(
+            int(&cmd_zlexcount(
+                &mut s2,
+                0,
+                NOW,
+                &req(&[b"ZLEXCOUNT", b"z", b"[b", b"+"])
+            )),
+            2
+        );
+    }
+
+    // ---- ZPOPMIN/ZPOPMAX (count + empty-deletes). ----
+
+    #[test]
+    fn zpopmin_zpopmax_count_and_empty_deletes() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        // ZPOPMIN (no count) -> lowest as [member, score].
+        assert_eq!(
+            pairs(&cmd_zpopmin(&mut s, 0, NOW, &req(&[b"ZPOPMIN", b"z"]))),
+            vec![("a".to_owned(), 1.0)]
+        );
+        // ZPOPMAX count 5 -> remaining highest-first; drains the key.
+        assert_eq!(
+            pairs(&cmd_zpopmax(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZPOPMAX", b"z", b"5"])
+            )),
+            vec![("c".to_owned(), 3.0), ("b".to_owned(), 2.0)]
+        );
+        assert!(!s.contains(0, b"z", NOW), "draining deletes the key");
+        assert_eq!(s.used_memory(), 0);
+        // Missing key -> empty array.
+        assert_eq!(
+            cmd_zpopmin(&mut s, 0, NOW, &req(&[b"ZPOPMIN", b"z"])),
+            Value::Array(Some(Vec::new()))
+        );
+    }
+
+    // ---- ZREM + ZREMRANGEBY*. ----
+
+    #[test]
+    fn zrem_and_remrange_family() {
+        let mut s = test_store();
+        zadd(
+            &mut s,
+            &[
+                b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d",
+            ],
+        );
+        assert_eq!(
+            int(&cmd_zrem(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZREM", b"z", b"a", b"zzz"])
+            )),
+            1
+        );
+        // ZREMRANGEBYRANK 0 0 -> removes the now-lowest (b).
+        assert_eq!(
+            int(&cmd_zremrangebyrank(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZREMRANGEBYRANK", b"z", b"0", b"0"])
+            )),
+            1
+        );
+        // ZREMRANGEBYSCORE (3 +inf -> removes d (score 4); c (3) excluded.
+        assert_eq!(
+            int(&cmd_zremrangebyscore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZREMRANGEBYSCORE", b"z", b"(3", b"+inf"])
+            )),
+            1
+        );
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"0", b"-1"])
+            )),
+            vec!["c"]
+        );
+        // Remove the last -> key gone.
+        assert_eq!(
+            int(&cmd_zremrangebyrank(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZREMRANGEBYRANK", b"z", b"0", b"-1"])
+            )),
+            1
+        );
+        assert!(!s.contains(0, b"z", NOW));
+    }
+
+    #[test]
+    fn zremrangebylex_drains() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c"]);
+        assert_eq!(
+            int(&cmd_zremrangebylex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZREMRANGEBYLEX", b"z", b"-", b"+"])
+            )),
+            3
+        );
+        assert!(!s.contains(0, b"z", NOW));
+    }
+
+    // ---- ZRANGESTORE. ----
+
+    #[test]
+    fn zrangestore_stores_and_empty_deletes_dst() {
+        let mut s = test_store();
+        zadd(
+            &mut s,
+            &[b"ZADD", b"src", b"1", b"a", b"2", b"b", b"3", b"c"],
+        );
+        assert_eq!(
+            int(&cmd_zrangestore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGESTORE", b"dst", b"src", b"0", b"1"])
+            )),
+            2
+        );
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"dst", b"0", b"-1"])
+            )),
+            vec!["a", "b"]
+        );
+        // Pre-populate dst, then an empty range result deletes it.
+        zadd(&mut s, &[b"ZADD", b"dst2", b"1", b"x"]);
+        assert_eq!(
+            int(&cmd_zrangestore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGESTORE", b"dst2", b"src", b"(10", b"+inf", b"BYSCORE"])
+            )),
+            0
+        );
+        assert!(!s.contains(0, b"dst2", NOW), "empty result deletes dst");
+    }
+
+    // ---- Aggregations: ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE + WEIGHTS + AGGREGATE. ----
+
+    #[test]
+    fn zunionstore_weights_aggregate_and_empty_deletes() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"a", b"1", b"x", b"2", b"y"]);
+        zadd(&mut s, &[b"ZADD", b"b", b"10", b"y", b"20", b"z"]);
+        // SUM (default): x=1, y=2+10=12, z=20.
+        assert_eq!(
+            int(&cmd_zunionstore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZUNIONSTORE", b"dest", b"2", b"a", b"b"])
+            )),
+            3
+        );
+        assert_eq!(
+            bulk_str(&cmd_zscore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZSCORE", b"dest", b"y"])
+            )),
+            Some("12".to_owned())
+        );
+        // WEIGHTS 2 3: x=2, y=4+30=34, z=60.
+        cmd_zunionstore(
+            &mut s,
+            0,
+            NOW,
+            &req(&[
+                b"ZUNIONSTORE",
+                b"dest",
+                b"2",
+                b"a",
+                b"b",
+                b"WEIGHTS",
+                b"2",
+                b"3",
+            ]),
+        );
+        assert_eq!(
+            bulk_str(&cmd_zscore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZSCORE", b"dest", b"y"])
+            )),
+            Some("34".to_owned())
+        );
+        // AGGREGATE MAX: y = max(2, 10) = 10.
+        cmd_zunionstore(
+            &mut s,
+            0,
+            NOW,
+            &req(&[
+                b"ZUNIONSTORE",
+                b"dest",
+                b"2",
+                b"a",
+                b"b",
+                b"AGGREGATE",
+                b"MAX",
+            ]),
+        );
+        assert_eq!(
+            bulk_str(&cmd_zscore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZSCORE", b"dest", b"y"])
+            )),
+            Some("10".to_owned())
+        );
+    }
+
+    #[test]
+    fn zinterstore_zdiffstore_and_intercard() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"a", b"1", b"x", b"2", b"y", b"3", b"z"]);
+        zadd(
+            &mut s,
+            &[b"ZADD", b"b", b"10", b"y", b"20", b"z", b"30", b"w"],
+        );
+        // INTER: y, z.
+        assert_eq!(
+            int(&cmd_zinterstore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZINTERSTORE", b"i", b"2", b"a", b"b"])
+            )),
+            2
+        );
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"i", b"0", b"-1"])
+            )),
+            vec!["y", "z"]
+        );
+        // DIFF a - b: x only.
+        assert_eq!(
+            int(&cmd_zdiffstore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZDIFFSTORE", b"d", b"2", b"a", b"b"])
+            )),
+            1
+        );
+        assert_eq!(
+            members(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"d", b"0", b"-1"])
+            )),
+            vec!["x"]
+        );
+        // ZINTERCARD.
+        assert_eq!(
+            int(&cmd_zintercard(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZINTERCARD", b"2", b"a", b"b"])
+            )),
+            2
+        );
+        assert_eq!(
+            int(&cmd_zintercard(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZINTERCARD", b"2", b"a", b"b", b"LIMIT", b"1"])
+            )),
+            1
+        );
+        // Empty intersection deletes the dest.
+        zadd(&mut s, &[b"ZADD", b"only", b"1", b"q"]);
+        zadd(&mut s, &[b"ZADD", b"pre", b"9", b"keep"]);
+        assert_eq!(
+            int(&cmd_zinterstore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZINTERSTORE", b"pre", b"2", b"a", b"only"])
+            )),
+            0
+        );
+        assert!(
+            !s.contains(0, b"pre", NOW),
+            "empty inter result deletes dest"
+        );
+    }
+
+    #[test]
+    fn zunion_zdiff_withscores_reply() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"a", b"1", b"x", b"2", b"y"]);
+        zadd(&mut s, &[b"ZADD", b"b", b"10", b"y"]);
+        // ZUNION WITHSCORES -> a Value::Pairs ordered by (score, member): x=1, y=12.
+        assert_eq!(
+            pairs(&cmd_zunion(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZUNION", b"2", b"a", b"b", b"WITHSCORES"])
+            )),
+            vec![("x".to_owned(), 1.0), ("y".to_owned(), 12.0)]
+        );
+        // ZDIFF a - b -> x.
+        assert_eq!(
+            members(&cmd_zdiff(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZDIFF", b"2", b"a", b"b"])
+            )),
+            vec!["x"]
+        );
+        // Bad weight.
+        assert_eq!(
+            err_line(&cmd_zunion(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZUNION", b"2", b"a", b"b", b"WEIGHTS", b"nan", b"1"])
+            )),
+            "-ERR weight value is not a float"
+        );
+    }
+
+    // ---- ZSCAN reuse + small-collection one-shot + determinism. ----
+
+    #[test]
+    fn zscan_small_returns_all_at_cursor_zero() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        match cmd_zscan(&mut s, 0, NOW, &req(&[b"ZSCAN", b"z", b"0"])) {
+            Value::Array(Some(items)) => {
+                assert_eq!(bulk_str(&items[0]), Some("0".to_owned()), "complete cursor");
+                let inner = match &items[1] {
+                    Value::Array(Some(v)) => v,
+                    other => panic!("inner not array: {other:?}"),
+                };
+                // member + score interleaved -> 6 elements for 3 members.
+                assert_eq!(inner.len(), 6);
+            }
+            other => panic!("ZSCAN not the 2-element reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zscan_large_cursored_visits_every_member_once_deterministically() {
+        let mut s = test_store();
+        // Force the skiplist form (>128 members).
+        for i in 0..200 {
+            zadd(
+                &mut s,
+                &[
+                    b"ZADD",
+                    b"z",
+                    i.to_string().as_bytes(),
+                    format!("m{i:04}").as_bytes(),
+                ],
+            );
+        }
+        // OBJECT ENCODING would report skiplist; drive the cursor to completion twice and
+        // assert the same full set of members both times (determinism + resize-invariance).
+        let collect_all = |s: &mut TestStore| -> Vec<String> {
+            let mut seen = Vec::new();
+            let mut cursor = b"0".to_vec();
+            loop {
+                let reply = cmd_zscan(s, 0, NOW, &req(&[b"ZSCAN", b"z", &cursor, b"COUNT", b"7"]));
+                let items = match reply {
+                    Value::Array(Some(v)) => v,
+                    other => panic!("not array: {other:?}"),
+                };
+                cursor = match &items[0] {
+                    Value::BulkString(Some(b)) => b.to_vec(),
+                    other => panic!("cursor: {other:?}"),
+                };
+                if let Value::Array(Some(inner)) = &items[1] {
+                    let mut i = 0;
+                    while i < inner.len() {
+                        if let Value::BulkString(Some(m)) = &inner[i] {
+                            seen.push(String::from_utf8(m.to_vec()).unwrap());
+                        }
+                        i += 2; // skip the score
+                    }
+                }
+                if cursor == b"0" {
+                    break;
+                }
+            }
+            seen.sort();
+            seen
+        };
+        let first = collect_all(&mut s);
+        let second = collect_all(&mut s);
+        assert_eq!(first.len(), 200, "every member visited once");
+        assert_eq!(first, second, "ZSCAN is deterministic across replays");
+    }
+
+    #[test]
+    fn zrandmember_determinism_distinct_repeats_withscores() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        // Same seed -> byte-identical reply (determinism, ADR-0003).
+        let r1 = cmd_zrandmember(&mut s, 0, SEED, NOW, &req(&[b"ZRANDMEMBER", b"z", b"2"]));
+        let r2 = cmd_zrandmember(&mut s, 0, SEED, NOW, &req(&[b"ZRANDMEMBER", b"z", b"2"]));
+        assert_eq!(r1, r2, "seeded ZRANDMEMBER replays identically");
+        // +count distinct: count 10 > card 3 -> exactly 3 distinct.
+        let mut distinct = members(&cmd_zrandmember(
+            &mut s,
+            0,
+            SEED,
+            NOW,
+            &req(&[b"ZRANDMEMBER", b"z", b"10"]),
+        ));
+        distinct.sort();
+        assert_eq!(distinct, vec!["a", "b", "c"]);
+        // -count with repeats: exactly |count|.
+        assert_eq!(
+            members(&cmd_zrandmember(
+                &mut s,
+                0,
+                SEED,
+                NOW,
+                &req(&[b"ZRANDMEMBER", b"z", b"-5"])
+            ))
+            .len(),
+            5
+        );
+        // WITHSCORES -> Value::Pairs.
+        match cmd_zrandmember(
+            &mut s,
+            0,
+            SEED,
+            NOW,
+            &req(&[b"ZRANDMEMBER", b"z", b"2", b"WITHSCORES"]),
+        ) {
+            Value::Pairs(p) => assert_eq!(p.len(), 2),
+            other => panic!("WITHSCORES should be Value::Pairs: {other:?}"),
+        }
+        // No count -> a single bulk; the zset is not modified.
+        assert!(
+            bulk_str(&cmd_zrandmember(
+                &mut s,
+                0,
+                SEED,
+                NOW,
+                &req(&[b"ZRANDMEMBER", b"z"])
+            ))
+            .is_some()
+        );
+        assert_eq!(int(&cmd_zcard(&mut s, 0, NOW, &req(&[b"ZCARD", b"z"]))), 3);
+    }
+
+    // ---- WITHSCORES RESP2 flat vs RESP3 nested-pairs (encode in both modes). ----
+
+    #[test]
+    fn withscores_resp2_flat_resp3_nested() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"1", b"a", b"2", b"b"]);
+        let reply = cmd_zrange(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"ZRANGE", b"z", b"0", b"-1", b"WITHSCORES"]),
+        );
+        assert!(matches!(reply, Value::Pairs(ref p) if p.len() == 2));
+        // RESP2: a single flat array [a, 1, b, 2] (scores degrade to bulk strings).
+        let resp2 = encode_to_vec(&reply, ProtoVersion::Resp2);
+        assert_eq!(resp2, b"*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n");
+        // RESP3: an array of [member, ,double] 2-arrays.
+        let resp3 = encode_to_vec(&reply, ProtoVersion::Resp3);
+        assert_eq!(
+            resp3,
+            b"*2\r\n*2\r\n$1\r\na\r\n,1\r\n*2\r\n$1\r\nb\r\n,2\r\n"
+        );
+    }
+
+    // ---- OBJECT ENCODING transition via the store + TYPE. ----
+
+    #[test]
+    fn encoding_transition_listpack_to_skiplist() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"1", b"a"]);
+        assert_eq!(
+            s.read(0, b"z", NOW).unwrap().encoding().encoding_name(),
+            "listpack"
+        );
+        // A member over the 64-byte cap flips to skiplist.
+        let big = vec![b'q'; 65];
+        cmd_zadd(&mut s, 0, NOW, &req(&[b"ZADD", b"z", b"2", &big]));
+        assert_eq!(
+            s.read(0, b"z", NOW).unwrap().encoding().encoding_name(),
+            "skiplist"
+        );
+        assert_eq!(s.type_of(0, b"z", NOW), Some(DataType::ZSet));
     }
 }
