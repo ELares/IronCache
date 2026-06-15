@@ -150,6 +150,11 @@ fn arity_of(cmd: &[u8]) -> Option<Arity> {
         b"DECRBY" => Exact(3),
         b"INCRBYFLOAT" => Exact(3),
         b"APPEND" => Exact(3),
+        // MGET is -2 (token + >= 1 key); MSET is -3 (token + >= 1 key/value pair). The
+        // even-pairs rule for MSET is enforced in the handler (cmd_mset), not by this
+        // coarse queue-time arity; Redis's MSET arity is likewise just -3.
+        b"MGET" => Min(2),
+        b"MSET" => Min(3),
         // -- Generic keyspace (cmd_keyspace). --
         b"DEL" => Min(2),
         b"EXISTS" => Min(2),
@@ -307,7 +312,13 @@ mod tests {
         assert!(queue_validate(b"UNWATCH", &args(&[b"UNWATCH", b"x"])).is_err()); // exact 1
         assert!(queue_validate(b"PING", &args(&[b"PING"])).is_ok());
         assert!(queue_validate(b"PING", &args(&[b"PING", b"msg"])).is_ok());
-        assert!(queue_validate(b"MSET".as_slice(), &args(&[b"MSET"])).is_err()); // MSET not impl -> unknown
+        // MSET is implemented (arity Min(3)); bare `MSET` is a wrong-arity rejection.
+        assert_eq!(
+            queue_validate(b"MSET".as_slice(), &args(&[b"MSET"]))
+                .unwrap_err()
+                .line(),
+            "-ERR wrong number of arguments for 'mset' command"
+        );
     }
 
     #[test]
@@ -390,6 +401,8 @@ mod tests {
             b"DECRBY",
             b"INCRBYFLOAT",
             b"APPEND",
+            b"MGET",
+            b"MSET",
             // Keyspace
             b"DEL",
             b"EXISTS",
@@ -554,6 +567,8 @@ mod tests {
             b"DECRBY",
             b"INCRBYFLOAT",
             b"APPEND",
+            b"MGET",
+            b"MSET",
             // Generic keyspace
             b"DEL",
             b"EXISTS",

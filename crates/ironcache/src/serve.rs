@@ -530,6 +530,25 @@ async fn route_and_dispatch(
     let cmd_upper = ascii_upper(request.command());
     let route = route::classify(&cmd_upper);
 
+    // A SHARD-SPANNING KeyedMulti command (its keys land on >1 shard, so `owner_shard_set`
+    // is None) that is one of the SIX fan-out-supported commands routes to the multi-key
+    // SCATTER-GATHER (COORDINATOR.md #107, Stage 2a). Co-located KeyedMulti (Some(shard))
+    // routes via Stage 1 below; any OTHER spanning multi-key command stays on the home sync
+    // fall-through (the documented Stage 2b/2c gap), unchanged. We compute this BEFORE the
+    // single-target `target` so the two are mutually exclusive (a spanning command has no
+    // single owner, so `target` would be None anyway).
+    let multikey_fan_out =
+        matches!(route, route::CommandClass::KeyedMulti) && is_fan_out_multikey(&cmd_upper) && {
+            let spec = route::command_keys(&cmd_upper, request);
+            // None from owner_shard_set means EITHER a malformed/short request (keep home,
+            // the handler emits the proper error) OR a genuine spanning command. We only
+            // fan out when the spec actually has MULTIPLE keys spanning shards; a malformed
+            // command (KeySpec::None) must stay home. `command_keys` returns None/One for
+            // the degenerate cases, so require Many AND a None owner set (truly spanning).
+            matches!(spec, route::KeySpec::Many(_))
+                && route::owner_shard_set(&spec, home.total).is_none()
+        };
+
     // The routing TARGET shard, if a KEYED command routes to exactly one NON-home shard
     // (else `None` -> the home path). The single-key case keeps the zero-alloc fast path
     // (one hash + compare); only the genuinely multi-key commands pay the `command_keys`
@@ -575,6 +594,19 @@ async fn route_and_dispatch(
             )
             .await;
         }
+        false
+    } else if multikey_fan_out {
+        // SHARD-SPANNING multi-key SCATTER-GATHER (COORDINATOR.md #107, Stage 2a): one of
+        // the six (MGET/MSET/DEL/EXISTS/UNLINK/TOUCH) whose keys span shards. The multikey
+        // module groups the keys by owner, runs a per-shard sub-request (the home shard's
+        // subset LOCALLY + sync, the rest via their drain loops), and reassembles the reply.
+        // Bump commands_processed here (matching the home / remote / whole-keyspace paths);
+        // the owning shards fold their own data counters.
+        state_rc.borrow_mut().counters.on_command();
+        crate::multikey::fan_out_multikey(
+            inbox, ctx, &cmd_upper, request, conn.db, home, out, conn.proto,
+        )
+        .await;
         false
     } else if let Some(target) = target {
         // REMOTE keyed hop: enqueue to the owning shard, await its reply, encode here. The
@@ -703,6 +735,21 @@ fn encode_into(out: &mut Vec<u8>, value: &ironcache_server::Value, proto: ProtoV
     let mut bm = bytes::BytesMut::with_capacity(64);
     ironcache_protocol::encode(&mut bm, value, proto);
     out.extend_from_slice(&bm);
+}
+
+/// Whether `cmd_upper` is one of the SIX multi-key DATA commands the coordinator fans out
+/// across shards when its keys SPAN shards (COORDINATOR.md #107, Stage 2a): MGET, MSET,
+/// DEL, EXISTS, UNLINK, TOUCH. Every OTHER spanning multi-key command (SINTER*/SUNION*/
+/// SDIFF*/ZUNION*/ZINTER*/ZDIFF*/BITOP/PFCOUNT/PFMERGE spanning, RENAME/RENAMENX/COPY/MOVE/
+/// SMOVE/LMOVE/RPOPLPUSH) is DEFERRED (Stage 2b/2c) and stays on the home sync fall-through;
+/// MSETNX is DEFERRED to Stage 3 (it needs cross-shard atomicity), so it is NOT here. This
+/// list is the single gate the serve loop and [`crate::multikey::fan_out_multikey`]'s match
+/// agree on.
+fn is_fan_out_multikey(cmd_upper: &[u8]) -> bool {
+    matches!(
+        cmd_upper,
+        b"MGET" | b"MSET" | b"DEL" | b"EXISTS" | b"UNLINK" | b"TOUCH"
+    )
 }
 
 /// ASCII-uppercase the command token for routing classification (RESP command tokens are

@@ -45,6 +45,36 @@ pub fn cmd_strlen<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
     }
 }
 
+/// `MGET key [key ...]` -> a RESP array with one element per key: the bulk-string
+/// value if the key holds a STRING, else the null bulk string.
+///
+/// MGET NEVER errors on a wrong type (matching Redis `mgetCommand`, which calls
+/// `lookupKeyRead` + an `OBJ_STRING` check and emits a NULL for a non-string, NOT a
+/// WRONGTYPE): both a MISSING key and a key holding a non-string value yield
+/// [`Value::Null`] (the RESP2 `$-1` / RESP3 `_` null). It is read-only (no admission,
+/// no write). Arity is -2 (the command token + at least one key).
+///
+/// This is the SINGLE-SHARD handler: it returns the values in `req.args[1..]` order.
+/// The cross-shard SPANNING case is reassembled by [`crate::multikey`] from per-shard
+/// sub-MGETs (which each call this), preserving each key's ORIGINAL argument position.
+pub fn cmd_mget<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("mget"));
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(req.args.len() - 1);
+    for key in &req.args[1..] {
+        // A missing key OR a non-string key both yield Null: MGET never WRONGTYPEs.
+        let v = match store.read(db, key, now) {
+            Some(v) if v.data_type() == DataType::String => {
+                Value::BulkString(Some(Bytes::copy_from_slice(v.as_bytes())))
+            }
+            _ => Value::Null,
+        };
+        out.push(v);
+    }
+    Value::Array(Some(out))
+}
+
 /// The parsed SET option set (COMMANDS.md cross-cutting flags). Conflicting
 /// options (`NX`+`XX`, more than one of `EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`) are a
 /// syntax error.
@@ -349,6 +379,53 @@ pub fn cmd_getset<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
         // Unreachable: GETSET uses the read-only `rmw`, never `rmw_mut`.
         RmwEntry::OccupiedMut(_) => unreachable!("cmd_getset uses rmw, not rmw_mut"),
     })
+}
+
+/// `MSET key value [key value ...]` -> always `+OK`.
+///
+/// Sets each `key` to its `value` (a string), CLEARING any existing TTL
+/// ([`ExpireWrite::Clear`], the default SET semantics) and overwriting any existing
+/// value/type (a blind `upsert` per pair, like plain SET). It is a `denyoom` write.
+///
+/// Arity is -3 (the command token + at least one key/value pair) AND `argc - 1` must
+/// be EVEN (the key/value args pair up): an odd count is the wrong-arity error
+/// `wrong number of arguments for 'mset'`, matching Redis (`msetGenericCommand`
+/// rejects an even total argc -- i.e. an odd number of key+value args -- with the
+/// wrong-arity reply). The Min(3) table arity catches the empty case; the even-pairs
+/// check is enforced HERE (the command table has no "even" rule).
+///
+/// `wheel` mirrors [`cmd_set`]'s signature (SET takes the wheel to register TTLs); MSET
+/// never sets a TTL (it CLEARS), so no wheel registration is needed, but the parameter
+/// is kept so the dispatch arm threads it uniformly and a future MSET-with-TTL variant
+/// has the seam. This is the SINGLE-SHARD handler; [`crate::multikey`] reassembles the
+/// cross-shard SPANNING case from per-shard sub-MSETs (each calling this).
+pub fn cmd_mset<S: Store>(
+    store: &mut S,
+    wheel: &mut TimingWheel,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+) -> Value {
+    // Arity -3 (token + >= 1 pair) AND an EVEN number of key/value args.
+    if req.args.len() < 3 || (req.args.len() - 1) % 2 != 0 {
+        return Value::error(ErrorReply::wrong_arity("mset"));
+    }
+    // The wheel is unused (MSET clears TTLs, registering none); name it so the unused
+    // -parameter lint stays quiet while keeping cmd_set's signature shape.
+    let _ = &wheel;
+    let mut i = 1;
+    while i + 1 < req.args.len() {
+        // Blind upsert per pair: overwrite any existing value/type, clear any TTL.
+        store.upsert(
+            db,
+            &req.args[i],
+            NewValue::Bytes(&req.args[i + 1]),
+            ExpireWrite::Clear,
+            now,
+        );
+        i += 2;
+    }
+    Value::ok()
 }
 
 // ---------------------------------------------------------------------------

@@ -583,6 +583,13 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         // STRLEN) feed the keyspace hit/miss counters (PR-3b): a found live key is a
         // hit, an absent/expired key a miss. --
         b"GET" => keyspace_counted(deltas, cmd_string::cmd_get(store, db, now, req)),
+        // MGET / MSET are multi-key string commands (KeyedMulti). A co-located or
+        // single-key invocation runs here directly; a SHARD-SPANNING invocation is
+        // fanned out by the coordinator (crate::multikey) which runs per-shard sub-MGET/
+        // sub-MSET requests through this same arm on each owning shard (COORDINATOR.md
+        // #107, Stage 2a). MGET is read-only; MSET is a denyoom write (admission above).
+        b"MGET" => cmd_string::cmd_mget(store, db, now, req),
+        b"MSET" => cmd_string::cmd_mset(store, wheel, db, now, req),
         b"SET" => cmd_string::cmd_set(store, wheel, db, now, req),
         b"SETNX" => cmd_string::cmd_setnx(store, db, now, req),
         b"GETSET" => cmd_string::cmd_getset(store, db, now, req),
@@ -2264,6 +2271,129 @@ mod tests {
             run_on(&c, &mut s, &mut st, t, &[b"TYPE", b"lst"]),
             Value::simple("list")
         );
+    }
+
+    #[test]
+    fn mget_returns_null_for_missing_and_non_string_never_wrongtype() {
+        use ironcache_storage::{DataType, Encoding};
+        use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
+
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+
+        // A real string, a missing key, and a non-string (list) value.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SET", b"str", b"hi"]),
+            Value::ok()
+        );
+        let mut obj = KvObj::from_bytes(b"lst", b"x", None);
+        obj.header = Header {
+            data_type: DataType::List,
+            encoding: Encoding::ListPack,
+            eviction_rank: 0,
+            ttl_present: false,
+            snapshot_version: 0,
+        };
+        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        st.insert_object(0, obj);
+
+        // MGET str missing lst -> [bulk("hi"), Null, Null]. The non-string yields Null,
+        // NOT a WRONGTYPE error (MGET never errors on a wrong-type element, matching Redis).
+        let reply = run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"MGET", b"str", b"missing", b"lst"],
+        );
+        assert_eq!(
+            reply,
+            Value::Array(Some(vec![
+                Value::BulkString(Some(bytes::Bytes::from_static(b"hi"))),
+                Value::Null,
+                Value::Null,
+            ])),
+            "MGET: present string -> bulk, missing -> Null, non-string -> Null (no WRONGTYPE)"
+        );
+
+        // MGET arity: bare MGET (no key) is the wrong-arity error.
+        match run_on(&c, &mut s, &mut st, t, &[b"MGET"]) {
+            Value::Error(e) => {
+                assert_eq!(
+                    e.line(),
+                    "-ERR wrong number of arguments for 'mget' command"
+                );
+            }
+            other => panic!("bare MGET must be wrong-arity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mset_sets_pairs_clears_ttl_and_rejects_odd_args() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+
+        // A pre-existing key WITH a TTL, to prove MSET clears it (default SET semantics).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", b"k1", b"old", b"EX", b"100"]
+            ),
+            Value::ok()
+        );
+        assert!(
+            matches!(run_on(&c, &mut s, &mut st, t, &[b"TTL", b"k1"]), Value::Integer(n) if n > 0),
+            "k1 has a TTL before MSET"
+        );
+
+        // MSET k1 v1 k2 v2 -> +OK; overwrites k1 (clearing its TTL) and creates k2.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"MSET", b"k1", b"v1", b"k2", b"v2"]
+            ),
+            Value::ok()
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"k1"]),
+            Value::BulkString(Some(bytes::Bytes::from_static(b"v1")))
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"k2"]),
+            Value::BulkString(Some(bytes::Bytes::from_static(b"v2")))
+        );
+        // TTL cleared by MSET (-1 = no expire).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"TTL", b"k1"]),
+            Value::Integer(-1),
+            "MSET must CLEAR the existing TTL (default SET semantics)"
+        );
+
+        // Odd arg count (argc-1 odd) -> wrong-arity error.
+        match run_on(&c, &mut s, &mut st, t, &[b"MSET", b"a", b"1", b"b"]) {
+            Value::Error(e) => {
+                assert_eq!(
+                    e.line(),
+                    "-ERR wrong number of arguments for 'mset' command"
+                );
+            }
+            other => panic!("odd-arg MSET must be wrong-arity, got {other:?}"),
+        }
+        // Bare MSET (no pair) -> wrong-arity too.
+        assert!(matches!(
+            run_on(&c, &mut s, &mut st, t, &[b"MSET"]),
+            Value::Error(_)
+        ));
     }
 
     #[test]

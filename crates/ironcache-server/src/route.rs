@@ -164,7 +164,11 @@ pub fn classify(cmd_upper: &[u8]) -> CommandClass {
         // run correctly on the owning shard. MOVE has exactly ONE key (args[1]; args[2] is
         // the destination DB index, not a key). OBJECT's key is args[2] (the subcommand is
         // args[1]); `command_keys` extracts args[2] so a single OBJECT routes correctly.
-        b"DEL" | b"EXISTS" | b"UNLINK" | b"TOUCH"
+        // MGET (all of args[1..] are keys) and MSET (keys at args[1], args[3], args[5],
+        // ... -- every other arg, the values interleave). Both fan out when spanning
+        // (Stage 2a); a co-located / single-key invocation routes to the one owner.
+        b"MGET" | b"MSET"
+        | b"DEL" | b"EXISTS" | b"UNLINK" | b"TOUCH"
         | b"RENAME" | b"RENAMENX" | b"COPY" | b"MOVE"
         | b"SMOVE" | b"SINTER" | b"SUNION" | b"SDIFF" | b"SINTERCARD"
         | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE"
@@ -275,7 +279,9 @@ fn keys_at<'a>(req: &'a Request, idxs: &[usize]) -> KeySpec<'a> {
 /// - `args[1]` only (single key): every [`CommandClass::KeyedSingle`] command, plus MOVE
 ///   (args[2] is the destination DB index, NOT a key).
 /// - `args[1..]` all keys: DEL, EXISTS, UNLINK, TOUCH, SINTER, SUNION, SDIFF, PFCOUNT,
-///   PFMERGE.
+///   PFMERGE, MGET.
+/// - MSET: keys at `args[1]`, `args[3]`, `args[5]`, ... (every other arg starting at 1;
+///   the interleaved values are not keys). A malformed (odd-arg / empty) MSET -> home.
 /// - `args[1]` + `args[2]` (two keys): RENAME, RENAMENX, COPY (options follow the two
 ///   keys), SMOVE, LMOVE, RPOPLPUSH, ZRANGESTORE (dest, src).
 /// - dest `args[1]` + sources `args[2..]`: SINTERSTORE, SUNIONSTORE, SDIFFSTORE.
@@ -338,8 +344,23 @@ pub fn command_keys<'a>(cmd_upper: &[u8], req: &'a Request) -> KeySpec<'a> {
         //     joins the routed set so a co-located store routes too);
         //   - every arg a key: DEL/EXISTS/UNLINK/TOUCH/SINTER/SUNION/SDIFF/PFCOUNT/PFMERGE.
         b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE" | b"DEL" | b"EXISTS" | b"UNLINK"
-        | b"TOUCH" | b"SINTER" | b"SUNION" | b"SDIFF" | b"PFCOUNT" | b"PFMERGE" => {
+        | b"TOUCH" | b"SINTER" | b"SUNION" | b"SDIFF" | b"PFCOUNT" | b"PFMERGE" | b"MGET" => {
             keys_from(req, 1)
+        }
+        // MSET key value [key value ...]: the KEYS are args[1], args[3], args[5], ...
+        // (every other arg starting at 1); the interleaved values are NOT keys. A
+        // malformed MSET (no pairs, or an ODD arg count so the strided walk would read a
+        // value slot as a key) yields KeySpec::None -> the command stays HOME, where
+        // `cmd_mset` emits the proper wrong-arity error rather than the routing layer
+        // guessing.
+        b"MSET" => {
+            // args[0] is the command token; the key/value pairs are args[1..]. There must
+            // be at least one pair and an EVEN number of pair args (else malformed -> home).
+            if req.args.len() < 3 || (req.args.len() - 1) % 2 != 0 {
+                return KeySpec::None;
+            }
+            let idxs: Vec<usize> = (1..req.args.len()).step_by(2).collect();
+            keys_at(req, &idxs)
         }
         // OBJECT <subcommand> <key>: the key is args[2].
         b"OBJECT" => keys_at(req, &[2]),
@@ -483,6 +504,8 @@ mod tests {
             b"SMOVE",
             b"OBJECT",
             b"ZUNIONSTORE",
+            b"MGET",
+            b"MSET",
         ] {
             assert_eq!(classify(c), CommandClass::KeyedMulti, "{c:?} KeyedMulti");
         }
@@ -621,6 +644,35 @@ mod tests {
             ),
             KeySpec::Many(vec![b"dest", b"s1", b"s2"])
         );
+        // MGET: all of args[1..] are keys (like DEL).
+        assert_eq!(
+            command_keys(b"MGET", &req(&[b"MGET", b"a", b"b", b"c"])),
+            KeySpec::Many(vec![b"a", b"b", b"c"])
+        );
+        assert_eq!(
+            command_keys(b"MGET", &req(&[b"MGET", b"k"])),
+            KeySpec::One(b"k")
+        );
+        // MSET: keys at args[1], args[3], ... (every other arg); values are NOT keys.
+        assert_eq!(
+            command_keys(
+                b"MSET",
+                &req(&[b"MSET", b"k1", b"v1", b"k2", b"v2", b"k3", b"v3"])
+            ),
+            KeySpec::Many(vec![b"k1", b"k2", b"k3"])
+        );
+        // A single-pair MSET routes by its one key.
+        assert_eq!(
+            command_keys(b"MSET", &req(&[b"MSET", b"k", b"v"])),
+            KeySpec::One(b"k")
+        );
+        // A malformed (odd-arg) MSET -> None (home, proper wrong-arity there).
+        assert_eq!(
+            command_keys(b"MSET", &req(&[b"MSET", b"k1", b"v1", b"k2"])),
+            KeySpec::None
+        );
+        // An empty MSET (no pair) -> None.
+        assert_eq!(command_keys(b"MSET", &req(&[b"MSET"])), KeySpec::None);
         // A KeyedSingle command (the fallback arm): args[1] only.
         assert_eq!(
             command_keys(b"GET", &req(&[b"GET", b"k"])),
