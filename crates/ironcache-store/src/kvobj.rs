@@ -474,8 +474,8 @@ impl ListValue for ListVal {
 // MAPPING.md #40, HASHTABLE.md addendum). The HASH analog of `ListVal`: a small
 // listpack-like form (a `Vec<(field, value)>` with linear scan, reporting `listpack`)
 // that PROMOTES to a `hashbrown::HashMap` (reporting `hashtable`) once it grows past
-// the entry-count cap (128) OR any field-or-value byte length exceeds the per-element
-// byte cap (64).
+// the HASH entry-count cap (512, NOT the 128 ZSET/SET cap) OR any field-or-value byte
+// length exceeds the per-element byte cap (64).
 //
 // ## The listpack -> hashtable transition (#40), and its one-way ratchet
 //
@@ -508,8 +508,9 @@ type HashEntry = (Box<[u8]>, Box<[u8]>);
 
 /// A HASH value (PR-6). Stored as a small listpack-like `Vec<(field, value)>` while it
 /// fits the listpack thresholds, promoting to a `hashbrown::HashMap` once it exceeds the
-/// entry-count cap (128) OR any field-or-value byte length exceeds the per-element byte
-/// cap (64). A running field+value byte total is kept for O(1) accounting. The reported
+/// HASH entry-count cap (512; the 128 default is the ZSET/SET cap, not the hash one) OR
+/// any field-or-value byte length exceeds the per-element byte cap (64). A running
+/// field+value byte total is kept for O(1) accounting. The reported
 /// encoding is a pure function of the active form (`listpack` vs `hashtable`).
 #[derive(Debug, Clone)]
 pub enum HashVal {
@@ -558,8 +559,10 @@ impl HashVal {
 
     /// Whether the small listpack form should convert to the hashtable form after an
     /// edit that left `entries` entries with a new `field`/`value` (the #40 transition):
-    /// convert once `entries > hash-max-listpack-entries` (128) OR either the new field
-    /// or value byte length exceeds `hash-max-listpack-value` (64).
+    /// convert once `entries > hash-max-listpack-entries` (the HASH cap, 512, NOT the 128
+    /// ZSET/SET cap) OR either the new field or value byte length exceeds
+    /// `hash-max-listpack-value` (64). Reads the HASH entry constant
+    /// ([`DEFAULT_HASH_MAX_LISTPACK_ENTRIES`]).
     fn should_convert(entries: usize, field_len: usize, value_len: usize) -> bool {
         entries > DEFAULT_HASH_MAX_LISTPACK_ENTRIES
             || field_len > DEFAULT_HASH_MAX_LISTPACK_VALUE
@@ -618,6 +621,9 @@ impl HashValue for HashVal {
     }
 
     fn set_nx(&mut self, field: &[u8], value: &[u8]) -> bool {
+        // DEFERRED #8 follow-up (efficiency papercut, correctness-neutral): this does a
+        // double linear scan on the listpack form (contains then set both scan); a single
+        // entry-API pass would avoid the second scan.
         if self.contains(field) {
             return false;
         }
@@ -662,12 +668,19 @@ impl HashValue for HashVal {
         }
     }
 
+    // DEFERRED #8 follow-up (efficiency papercut, correctness-neutral): fields()/values()
+    // each materialize the FULL pairs() snapshot (cloning both halves) only to drop one;
+    // a half-clone path would avoid the wasted allocation.
     fn fields(&self) -> Vec<Vec<u8>> {
         self.pairs().into_iter().map(|(f, _)| f).collect()
     }
 
     fn values(&self) -> Vec<Vec<u8>> {
         self.pairs().into_iter().map(|(_, v)| v).collect()
+    }
+
+    fn is_listpack(&self) -> bool {
+        matches!(self, HashVal::ListPack(_))
     }
 
     fn pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1171,8 +1184,9 @@ mod tests {
 
         // There is NO element-count cap for lists (Redis -2 negative fill: count
         // unlimited). MANY small elements that stay UNDER the byte budget remain
-        // `listpack`, even well past the 128-entry hash/zset cap. Use 200 single-byte
-        // elements (200 bytes, far under the 8 KB budget).
+        // `listpack`, even well past any collection entry cap (the 512 hash / 128
+        // zset-set caps). Use 200 single-byte elements (200 bytes, far under the 8 KB
+        // budget).
         let mut l2 = ListVal::new();
         for _ in 0..200 {
             l2.push_back(b"z");
@@ -1213,6 +1227,44 @@ mod tests {
         l.remove_matching(0, b"DEFG"); // -4
         assert_eq!(l.element_bytes(), 0);
         assert!(l.is_empty());
+    }
+
+    // -- HashVal::should_convert boundary (PR-6 review): the Redis-correct 512/513 HASH
+    // entry boundary + the 64-byte per-element cap, tested DIRECTLY (no need to insert 513
+    // real elements; this pins the threshold constant + the comparison). --
+
+    #[test]
+    fn hashval_should_convert_pins_the_512_entry_and_64_byte_boundaries() {
+        // The HASH entry cap is 512 (NOT the 128 zset/set cap). Verified vs Redis 7.4
+        // config.c / t_hash.c and the pinned claim redis-hash-max-listpack-entries-512.
+        assert_eq!(DEFAULT_HASH_MAX_LISTPACK_ENTRIES, 512);
+        assert_eq!(DEFAULT_HASH_MAX_LISTPACK_VALUE, 64);
+
+        // Entry-count boundary: 512 small entries stay listpack; 513 flips to hashtable.
+        // `should_convert(entries, ..)` is called AFTER the edit, with the post-edit count.
+        assert!(
+            !HashVal::should_convert(512, 1, 1),
+            "exactly 512 entries (small field/value) stays listpack"
+        );
+        assert!(
+            HashVal::should_convert(513, 1, 1),
+            "513 entries flips to hashtable (over the 512 HASH cap)"
+        );
+
+        // Per-element byte boundary (independent of entry count): a field or value of 64
+        // bytes stays listpack; 65 bytes flips. Few entries, so only the byte cap fires.
+        assert!(
+            !HashVal::should_convert(2, 64, 64),
+            "a 64-byte field AND a 64-byte value (at the cap) stays listpack"
+        );
+        assert!(
+            HashVal::should_convert(2, 65, 1),
+            "a 65-byte field (over the 64 cap) flips to hashtable"
+        );
+        assert!(
+            HashVal::should_convert(2, 1, 65),
+            "a 65-byte value (over the 64 cap) flips to hashtable"
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@
 //! - a Mutated edit grows/shrinks `used_memory` by EXACTLY the field+value delta,
 //!   across a random HSET/HDEL/HINCRBY sequence INCLUDING the listpack->hashtable
 //!   transition (a property test against a from-scratch recompute of a shadow model);
-//! - the encoding flips to `hashtable` at BOTH thresholds (entry count 128 and
-//!   per-element byte 64) and is a one-way ratchet;
+//! - the encoding flips to `hashtable` at BOTH thresholds (the HASH entry count 512 --
+//!   NOT the 128 zset/set cap -- and per-element byte 64) and is a one-way ratchet;
 //! - an emptied hash DELETES the key (no empty hash observable);
 //! - WRONGTYPE on a string key (the typed view returns None, the handler returns
 //!   Keep, no edit / no accounting change).
@@ -102,10 +102,11 @@ fn mutated_tracks_used_memory_exactly_across_a_random_sequence() {
     // A seeded splitmix64 (deterministic; no std::time / no rand crate, ADR-0003) drives
     // a mix of HSET (new + overwrite) and HDEL on a SINGLE key, and we assert
     // used_memory equals a from-scratch recompute of the shadow model after every op,
-    // INCLUDING across the listpack->hashtable transition (fields/values grow past the
-    // 64-byte per-element cap and the 128-entry cap). The store measures the delta itself
-    // (it does not trust the handler), so this pins the measure-before/after-delta +
-    // re-account mechanism for hashes.
+    // INCLUDING across the listpack->hashtable transition (the per-element 64-byte cap is
+    // crossed by the variable-length values below; the entry-count transition is pinned
+    // separately and exactly in the dedicated threshold test). The store measures the
+    // delta itself (it does not trust the handler), so this pins the
+    // measure-before/after-delta + re-account mechanism for hashes.
     let key = b"H";
     let mut store = ShardStore::new(1);
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -123,8 +124,10 @@ fn mutated_tracks_used_memory_exactly_across_a_random_sequence() {
         let op = next() % 3;
         match op {
             // HSET a field (field id 0..40 so collisions / overwrites happen). The value
-            // is variable-length so totals cross the byte cap; the field id space (40) is
-            // small but values can be long, so BOTH transition thresholds are exercised.
+            // is variable-length so totals cross the per-element byte cap. The field id
+            // space (40) stays under the 512 HASH entry cap, so the byte-cap transition is
+            // what this property exercises; the entry-count transition is pinned in the
+            // dedicated threshold test.
             0 | 1 => {
                 let fid = next() % 40;
                 let field = format!("f{fid}").into_bytes();
@@ -164,12 +167,18 @@ fn mutated_tracks_used_memory_exactly_across_a_random_sequence() {
 
 #[test]
 fn encoding_flips_to_hashtable_at_the_entry_count_threshold() {
-    // Crossing the 128-entry cap (with small field/value bytes, under the byte cap) flips
-    // to hashtable. This isolates the ENTRY-COUNT threshold.
+    // Crossing the HASH entry cap (512, NOT the 128 zset/set cap; with small field/value
+    // bytes, under the byte cap) flips to hashtable. This isolates the ENTRY-COUNT
+    // threshold and pins the Redis-correct 512/513 boundary: exactly 512 entries stay
+    // listpack, 513 flips to hashtable.
+    assert_eq!(
+        DEFAULT_HASH_MAX_LISTPACK_ENTRIES, 512,
+        "the HASH entry cap is 512 (Redis 7.4 config.c / t_hash.c), not the 128 zset/set cap"
+    );
     let key = b"e";
     let mut store = ShardStore::new(1);
 
-    // Add exactly the cap many small fields: still listpack at the cap.
+    // Add exactly the cap many small fields (512): still listpack at the cap.
     for i in 0..DEFAULT_HASH_MAX_LISTPACK_ENTRIES {
         let f = format!("f{i}").into_bytes();
         hset(&mut store, key, &f, b"v");
@@ -177,15 +186,15 @@ fn encoding_flips_to_hashtable_at_the_entry_count_threshold() {
     assert_eq!(
         encoding_of(&mut store, key),
         "listpack",
-        "at the entry cap, still listpack"
+        "at the 512-entry cap, still listpack"
     );
 
-    // One more distinct field crosses the cap -> hashtable.
+    // One more distinct field (the 513th) crosses the cap -> hashtable.
     hset(&mut store, key, b"over_the_cap_field", b"v");
     assert_eq!(
         encoding_of(&mut store, key),
         "hashtable",
-        "over the 128-entry cap -> hashtable"
+        "over the 512-entry cap (the 513th field) -> hashtable"
     );
 
     // One-way ratchet: deleting back below the cap stays hashtable (Redis parity).
@@ -302,12 +311,14 @@ fn seeded_hash_workload_replays_identically() {
             z ^ (z >> 31)
         };
         for _ in 0..2000 {
-            // Mix HSET (driving the hash past 128 entries -> hashtable) and HDEL.
+            // Mix HSET (driving the hash to hashtable via the per-element byte cap) and
+            // HDEL. The vlen below can exceed the 64-byte value cap, which is what flips
+            // the encoding here (the 200 field-id space stays under the 512 entry cap).
             match next() % 3 {
                 0 | 1 => {
-                    let fid = next() % 200; // > 128 distinct -> crosses the entry cap
+                    let fid = next() % 200;
                     let f = format!("f{fid}").into_bytes();
-                    let vlen = (next() % 70) as usize;
+                    let vlen = (next() % 70) as usize; // up to 69 -> crosses the 64 value cap
                     let v = vec![b'a' + (next() % 26) as u8; vlen];
                     hset(&mut store, key, &f, &v);
                 }

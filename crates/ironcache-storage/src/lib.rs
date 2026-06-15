@@ -604,6 +604,20 @@ pub trait HashValue {
     /// rely on this stability for deterministic HSCAN/HRANDFIELD. (Named `pairs` rather
     /// than `iter` because it returns an OWNED snapshot Vec, not an `Iterator`.)
     fn pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// Whether the hash is in the small `listpack` encoding (vs the large `hashtable`
+    /// encoding). HSCAN uses this to match Redis's small-collection behavior: a
+    /// listpack-encoded hash is returned in ONE reply with cursor 0 (COUNT ignored),
+    /// while a hashtable-encoded hash paginates by COUNT (KEYSPACE.md + Redis
+    /// small-collection SCAN). This is the encoding name [`encoding`] would report,
+    /// surfaced as a cheap accessor so the command layer need not parse the encoding
+    /// string. Default `true` is the conservative small-collection answer (return all at
+    /// once) for any implementor that has not specialized it.
+    ///
+    /// [`encoding`]: crate::Encoding
+    fn is_listpack(&self) -> bool {
+        true
+    }
 }
 
 /// A MUTABLE observation of an occupied entry inside a [`Store::rmw_mut`] closure

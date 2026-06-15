@@ -33,13 +33,18 @@
 //!
 //! ## HSCAN cursor (KEYSPACE.md)
 //!
-//! HSCAN reuses the SAME hash-ordered cursor mechanism the keyspace SCAN uses
-//! (`scan_plan`'s algorithm), applied to the hash's OWN field table: the fields are
-//! ordered by a fixed-seed stable field hash ([`field_scan_hash`], the command-layer
-//! analog of the store's `scan_hash`, kept here because the command layer cannot name
-//! the concrete store, the layering contract), the cursor is the resume threshold in
-//! that order, and an equal-hash group is never split. A small hash returns all fields
-//! at once with cursor `0`.
+//! For a HASHTABLE-encoded hash, HSCAN reuses the SAME hash-ordered cursor mechanism the
+//! keyspace SCAN uses (`scan_plan`'s algorithm), applied to the hash's OWN field table:
+//! the fields are ordered by a fixed-seed stable field hash ([`field_scan_hash`], the
+//! command-layer analog of the store's `scan_hash`, kept here because the command layer
+//! cannot name the concrete store, the layering contract), the cursor is the resume
+//! threshold in that order, and an equal-hash group is never split.
+//!
+//! For a LISTPACK-encoded (small) hash, HSCAN returns the WHOLE hash in ONE reply with
+//! next-cursor `0`, IGNORING COUNT, matching Redis's small-collection SCAN behavior
+//! (KEYSPACE.md). The handler distinguishes the encoding via [`HashValue::is_listpack`].
+//!
+//! [`HashValue::is_listpack`]: ironcache_storage::HashValue::is_listpack
 
 use crate::cmd_util::{ascii_upper, parse_f64, parse_i64, parse_i64_strict};
 use bytes::Bytes;
@@ -642,21 +647,26 @@ fn hrandfield_reply(
     }
 }
 
-/// Build the field array (optionally interleaving values, WITHVALUES) from the chosen
-/// indices into `pairs`.
+/// Build the HRANDFIELD reply from the chosen indices into `pairs`.
+///
+/// WITHOUT values: a flat array of fields (`Value::Array`). WITH values: a
+/// [`Value::Pairs`] of `(field, value)` so the encoder NESTS each pair under RESP3 (an
+/// array of 2-element arrays) and FLATTENS to a single `[field, value, ...]` array under
+/// RESP2, matching Redis's WITHVALUES RESP2/RESP3 shapes.
 fn build_field_array(
     pairs: &[FieldValue],
     chosen: impl Iterator<Item = usize>,
     with_values: bool,
 ) -> Value {
-    let mut out: Vec<Value> = Vec::new();
-    for i in chosen {
-        out.push(bulk(pairs[i].0.clone()));
-        if with_values {
-            out.push(bulk(pairs[i].1.clone()));
-        }
+    if with_values {
+        let out: Vec<(Value, Value)> = chosen
+            .map(|i| (bulk(pairs[i].0.clone()), bulk(pairs[i].1.clone())))
+            .collect();
+        Value::Pairs(out)
+    } else {
+        let out: Vec<Value> = chosen.map(|i| bulk(pairs[i].0.clone())).collect();
+        Value::Array(Some(out))
     }
-    Value::Array(Some(out))
 }
 
 /// A deterministic splitmix64 PRNG seeded from the caller's Env-drawn seed (ADR-0003:
@@ -692,10 +702,12 @@ const HSCAN_DEFAULT_COUNT: usize = 10;
 /// means complete. MATCH globs the FIELD; NOVALUES omits the values. A missing key is
 /// `[0, []]`. WRONGTYPE on a non-hash.
 ///
-/// HSCAN reuses the SAME hash-ordered cursor mechanism the keyspace SCAN uses: the
-/// fields are ordered by the fixed-seed stable [`field_scan_hash`], the cursor is the
-/// resume threshold in that order, and an equal-hash group is never split (so a colliding
-/// pair of fields is returned together). A small hash returns all fields at once.
+/// A LISTPACK-encoded (small) hash returns ALL fields at once with cursor 0, ignoring
+/// COUNT (Redis small-collection SCAN). A HASHTABLE-encoded hash reuses the SAME
+/// hash-ordered cursor mechanism the keyspace SCAN uses: the fields are ordered by the
+/// fixed-seed stable [`field_scan_hash`], the cursor is the resume threshold in that
+/// order, and an equal-hash group is never split (so a colliding pair of fields is
+/// returned together).
 pub fn cmd_hscan<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
     if req.args.len() < 3 {
         return Value::error(ErrorReply::wrong_arity("hscan"));
@@ -737,18 +749,18 @@ pub fn cmd_hscan<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
     }
 
     store.rmw_mut(db, &req.args[1], now, move |entry| {
-        let pairs = match entry {
+        let (pairs, is_listpack) = match entry {
             // Missing key: complete (cursor 0) with an empty field list.
             RmwEntry::Vacant => {
                 return keep(hscan_reply(ScanCursor::START, Vec::new(), novalues));
             }
             RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
-                Some(hash) => hash.pairs(),
+                Some(hash) => (hash.pairs(), hash.is_listpack()),
                 None => return wrong_type(),
             },
             RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
         };
-        let (next, batch) = hscan_step(&pairs, cursor, count, pattern.as_deref());
+        let (next, batch) = hscan_step(&pairs, cursor, count, pattern.as_deref(), is_listpack);
         keep(hscan_reply(next, batch, novalues))
     })
 }
@@ -759,12 +771,33 @@ pub fn cmd_hscan<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
 /// This is the hash analog of the keyspace `scan_step` + `scan_plan` (the same cursor
 /// algorithm), implemented at the command layer because the command layer cannot name
 /// the concrete store's `scan_plan` (the layering contract).
+///
+/// `is_listpack` selects the Redis small-collection behavior: a LISTPACK-encoded hash
+/// returns the WHOLE hash in ONE batch with next-cursor 0, IGNORING COUNT (Redis returns
+/// a small/listpack collection in a single SCAN reply); a HASHTABLE-encoded hash uses the
+/// COUNT-budgeted hash-ordered cursor below.
 fn hscan_step(
     pairs: &[FieldValue],
     cursor: ScanCursor,
     count: usize,
     pattern: Option<&[u8]>,
+    is_listpack: bool,
 ) -> (ScanCursor, Vec<FieldValue>) {
+    // Small (listpack) hash: return everything at once with cursor 0, COUNT ignored
+    // (Redis small-collection HSCAN). The cursor is irrelevant for a one-shot reply, but a
+    // non-START resume cursor on a listpack hash yields nothing (the whole hash was already
+    // returned on the cursor-0 call), matching "the first reply completes".
+    if is_listpack {
+        if !cursor.is_start() {
+            return (ScanCursor::START, Vec::new());
+        }
+        let kept: Vec<FieldValue> = pairs
+            .iter()
+            .filter(|(f, _)| pattern.is_none_or(|p| crate::glob::glob_match(p, f)))
+            .cloned()
+            .collect();
+        return (ScanCursor::START, kept);
+    }
     // Build the sorted (field_hash, index) order. Sorting by (hash, field bytes) gives a
     // total order even for equal-hash fields, identical run-to-run (ADR-0003).
     let mut order: Vec<(u64, usize)> = pairs
@@ -1388,15 +1421,20 @@ mod tests {
             "negative count returns exactly |count| with repeats"
         );
 
-        // WITHVALUES: interleaves field, value (2 * count entries).
-        let wv = arr_strs(&cmd_hrandfield(
+        // WITHVALUES: a Value::Pairs of (field, value). It carries `count` pairs (2 here),
+        // which FLATTEN to 4 elements under RESP2 and NEST as 2 sub-arrays under RESP3.
+        // (The dedicated shape test below pins the exact RESP2/RESP3 bytes.)
+        let wv = cmd_hrandfield(
             &mut s,
             0,
             SEED,
             NOW,
             &req(&[b"HRANDFIELD", b"h", b"2", b"WITHVALUES"]),
-        ));
-        assert_eq!(wv.len(), 4, "WITHVALUES interleaves field+value");
+        );
+        match &wv {
+            Value::Pairs(p) => assert_eq!(p.len(), 2, "WITHVALUES returns `count` pairs"),
+            other => panic!("WITHVALUES should be Value::Pairs, got {other:?}"),
+        }
 
         // Missing key: nil (no count) / empty array (with count).
         assert_eq!(
@@ -1406,6 +1444,55 @@ mod tests {
         assert_eq!(
             cmd_hrandfield(&mut s, 0, SEED, NOW, &req(&[b"HRANDFIELD", b"nope", b"3"])),
             Value::Array(Some(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn hrandfield_withvalues_resp2_flat_and_resp3_nested_bytes() {
+        // The WITHVALUES reply is a Value::Pairs: it must FLATTEN to a single
+        // [field, value, ...] array under RESP2 and NEST as an array of 2-element
+        // [field, value] arrays under RESP3 (Redis WITHVALUES RESP2/RESP3 shapes). A
+        // negative count gives a deterministic, repeatable selection so the exact bytes are
+        // pinnable.
+        use ironcache_protocol::{ProtoVersion, encode_to_vec};
+        let mut s = test_store();
+        // A single-field hash makes the negative-count selection fully determined: every
+        // draw picks field "a" with value "1", so the bytes are exact regardless of seed.
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h", b"a", b"1"]));
+        let reply = cmd_hrandfield(
+            &mut s,
+            0,
+            SEED,
+            NOW,
+            &req(&[b"HRANDFIELD", b"h", b"-2", b"WITHVALUES"]),
+        );
+        assert!(
+            matches!(reply, Value::Pairs(ref p) if p.len() == 2),
+            "WITHVALUES is a Value::Pairs of `|count|` pairs, got {reply:?}"
+        );
+        // RESP2: FLAT array of 2n=4 elements (a 1 a 1).
+        assert_eq!(
+            encode_to_vec(&reply, ProtoVersion::Resp2),
+            b"*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "RESP2 WITHVALUES flattens to a single array"
+        );
+        // RESP3: NESTED outer *2, each pair a *2 [field, value] sub-array.
+        assert_eq!(
+            encode_to_vec(&reply, ProtoVersion::Resp3),
+            b"*2\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "RESP3 WITHVALUES nests each (field, value) pair"
+        );
+
+        // WITHOUT values stays a flat array of fields in BOTH protos (no nesting).
+        let plain = cmd_hrandfield(&mut s, 0, SEED, NOW, &req(&[b"HRANDFIELD", b"h", b"-2"]));
+        assert!(
+            matches!(plain, Value::Array(_)),
+            "no WITHVALUES -> flat array"
+        );
+        assert_eq!(
+            encode_to_vec(&plain, ProtoVersion::Resp3),
+            b"*2\r\n$1\r\na\r\n$1\r\na\r\n",
+            "no WITHVALUES: a flat array of fields under RESP3 too"
         );
     }
 
@@ -1494,6 +1581,49 @@ mod tests {
                 Value::bulk(b"0".to_vec()),
                 Value::Array(Some(Vec::new()))
             ]))
+        );
+    }
+
+    #[test]
+    fn hscan_listpack_returns_all_at_once_ignoring_count() {
+        // A listpack-encoded (small) hash returns the WHOLE hash in ONE reply with cursor 0,
+        // IGNORING COUNT, even when the field count exceeds COUNT (Redis small-collection
+        // HSCAN). 20 small fields stay listpack (under the 512 entry / 64 byte caps); a
+        // COUNT of 3 (< 20) must still complete in a SINGLE call at cursor 0.
+        let mut s = test_store();
+        for i in 0..20 {
+            let f = format!("f{i:02}");
+            cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h", f.as_bytes(), b"v"]));
+        }
+        // Confirm the hash is still listpack-encoded (precondition for all-at-once).
+        assert_eq!(
+            s.read(0, b"h", NOW).unwrap().encoding().encoding_name(),
+            "listpack",
+            "20 small fields stay listpack (under the 512/64 caps)"
+        );
+        // ONE HSCAN call with COUNT 3 must return ALL 20 fields and complete (cursor 0).
+        let reply = cmd_hscan(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HSCAN", b"h", b"0", b"COUNT", b"3"]),
+        );
+        let Value::Array(Some(items)) = reply else {
+            panic!("not an array");
+        };
+        assert_eq!(
+            items[0],
+            Value::bulk(b"0".to_vec()),
+            "listpack hash completes in one call (cursor 0), COUNT ignored"
+        );
+        let Value::Array(Some(kv)) = &items[1] else {
+            panic!("bad shape");
+        };
+        // 20 fields x (field, value) = 40 entries in the one batch.
+        assert_eq!(
+            kv.len(),
+            40,
+            "all 20 (field, value) pairs returned at once despite COUNT 3"
         );
     }
 

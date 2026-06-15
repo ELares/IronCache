@@ -295,8 +295,9 @@ fn encoding_flips_to_quicklist_at_the_threshold_and_back() {
     assert_eq!(encoding_of(&mut store, key), "none");
 
     // No element-count cap for lists (Redis -2 negative fill: count unlimited). MANY
-    // small elements that stay UNDER the byte budget remain `listpack`, well past the
-    // 128-entry hash/zset cap: 200 single-byte elements = 200 bytes, far under 8 KB.
+    // small elements that stay UNDER the byte budget remain `listpack`, well past any
+    // collection entry cap (512 hash / 128 zset-set): 200 single-byte elements = 200
+    // bytes, far under 8 KB.
     let key2 = b"e2";
     for _ in 0..200 {
         rpush(&mut store, key2, b"z");
