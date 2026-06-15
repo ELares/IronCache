@@ -100,6 +100,17 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             | b"ZUNIONSTORE"
             | b"ZINTERSTORE"
             | b"ZDIFFSTORE"
+            // Bitmap writes that allocate value bytes (PR-9). SETBIT grows/zero-extends
+            // the backing string; BITOP materializes the result string at the
+            // destination; BITFIELD with a SET/INCRBY grows the field's backing bytes.
+            // All are `denyoom` in Redis. GETBIT/BITCOUNT/BITPOS and BITFIELD_RO are
+            // read-only (never grow), so they are NOT gated. Redis flags BITFIELD as
+            // denyoom for the whole command (even an all-GET BITFIELD), which we mirror:
+            // the rare all-GET BITFIELD being gated over budget is harmless and matches
+            // Redis's command-flag-based classification.
+            | b"SETBIT"
+            | b"BITOP"
+            | b"BITFIELD"
     )
 }
 
@@ -151,6 +162,10 @@ mod tests {
             b"ZUNIONSTORE",
             b"ZINTERSTORE",
             b"ZDIFFSTORE",
+            // Bitmap writes (PR-9).
+            b"SETBIT",
+            b"BITOP",
+            b"BITFIELD",
         ] {
             assert!(is_denyoom(w), "{w:?} should be denyoom");
         }
@@ -253,6 +268,11 @@ mod tests {
             b"ZINTER",
             b"ZDIFF",
             b"ZINTERCARD",
+            // Bitmap reads (PR-9): GETBIT/BITCOUNT/BITPOS and BITFIELD_RO never grow.
+            b"GETBIT",
+            b"BITCOUNT",
+            b"BITPOS",
+            b"BITFIELD_RO",
         ] {
             assert!(!is_denyoom(r), "{r:?} must not be denyoom");
         }

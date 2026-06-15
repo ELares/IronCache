@@ -660,6 +660,85 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "resulting score is not a number (NaN)")
     }
 
+    /// `ERR bit offset is not an integer or out of range` - the reply Redis emits
+    /// (src/bitops.c `getBitOffsetFromArgument`) when a SETBIT/GETBIT/BITFIELD bit
+    /// offset is not a non-negative integer, or would grow the value past the
+    /// proto-max-bit-offset ceiling (2^32 bits, the 512 MB string limit). Byte-exact.
+    /// This is the error that guards against a huge unbounded allocation. DISTINCT from
+    /// the generic not-an-integer error (which is for non-offset integer arguments).
+    #[must_use]
+    pub fn bit_offset_out_of_range() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "bit offset is not an integer or out of range",
+        )
+    }
+
+    /// `ERR bit is not an integer or out of range` - the reply Redis emits (src/bitops.c
+    /// `setbitCommand`) when a SETBIT value is not exactly 0 or 1. Byte-exact. DISTINCT
+    /// from [`Self::bit_offset_out_of_range`] (the OFFSET) and the generic
+    /// not-an-integer error. NOTE: BITPOS does NOT reuse this string; a BITPOS bit
+    /// argument that is non-integer is the generic [`Self::not_an_integer`], and a
+    /// parsed-but-not-0/1 value is [`Self::bitpos_bit_arg`] ("The bit argument must be
+    /// 1 or 0.").
+    #[must_use]
+    pub fn bit_not_integer_or_range() -> Self {
+        ErrorReply::new(ErrorCode::Err, "bit is not an integer or out of range")
+    }
+
+    /// `ERR The bit argument must be 1 or 0.` - the reply Redis emits (src/bitops.c
+    /// `bitposCommand`) when the BITPOS `bit` argument PARSES as an integer but is not
+    /// exactly 0 or 1 (e.g. `2`, `-1`). Byte-exact (note the trailing period). A
+    /// non-integer / leading-zero bit argument is the earlier generic
+    /// [`Self::not_an_integer`] (the integer parse fails first).
+    #[must_use]
+    pub fn bitpos_bit_arg() -> Self {
+        ErrorReply::new(ErrorCode::Err, "The bit argument must be 1 or 0.")
+    }
+
+    /// `ERR BITOP NOT must be called with a single source key.` - the reply Redis emits
+    /// (src/bitops.c `bitopCommand`) when BITOP NOT is given more than one source key.
+    /// Byte-exact (note the trailing period). NOT inverts exactly one source.
+    #[must_use]
+    pub fn bitop_not_single_source() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "BITOP NOT must be called with a single source key.",
+        )
+    }
+
+    /// `ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not
+    /// supported but i64 is.` - the reply Redis emits (src/bitops.c
+    /// `getBitfieldTypeFromArgument`) for a malformed or out-of-range BITFIELD `i<N>` /
+    /// `u<N>` type token. Byte-exact (the full instructional sentence clients surface).
+    #[must_use]
+    pub fn invalid_bitfield_type() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.",
+        )
+    }
+
+    /// `ERR Invalid OVERFLOW type specified` - the reply Redis emits (src/bitops.c
+    /// `bitfieldGeneric`) for a BITFIELD `OVERFLOW` keyword that is not WRAP/SAT/FAIL.
+    /// Byte-exact.
+    #[must_use]
+    pub fn bitfield_invalid_overflow() -> Self {
+        ErrorReply::new(ErrorCode::Err, "Invalid OVERFLOW type specified")
+    }
+
+    /// `ERR BITFIELD_RO only supports the GET subcommand` - the reply Redis emits
+    /// (src/bitops.c `bitfieldGeneric` in the read-only path) when BITFIELD_RO is given a
+    /// SET / INCRBY / OVERFLOW subcommand. Byte-exact. The read-only variant rejects any
+    /// write op.
+    #[must_use]
+    pub fn bitfield_ro_no_writes() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "BITFIELD_RO only supports the GET subcommand",
+        )
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free
@@ -1023,6 +1102,45 @@ mod tests {
         assert_eq!(
             ErrorReply::zrange_limit_only_with_byscore_or_bylex().line(),
             "-ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
+        );
+    }
+
+    #[test]
+    fn bitmap_errors_are_byte_exact() {
+        // Verified against redis/redis src/bitops.c: the bit-offset / bit-value range
+        // errors, the BITOP NOT single-source error, the invalid bitfield-type and
+        // invalid-OVERFLOW errors, and the BITFIELD_RO write-rejection error. All use the
+        // plain `ERR` token. The bit-offset error is the one guarding against a huge
+        // allocation (proto-max-bit-offset).
+        assert_eq!(
+            ErrorReply::bit_offset_out_of_range().line(),
+            "-ERR bit offset is not an integer or out of range"
+        );
+        assert_eq!(
+            ErrorReply::bit_not_integer_or_range().line(),
+            "-ERR bit is not an integer or out of range"
+        );
+        // BITPOS's parsed-but-not-0/1 bit-argument error (note the trailing period).
+        // DISTINCT from SETBIT's bit-not-integer string above.
+        assert_eq!(
+            ErrorReply::bitpos_bit_arg().line(),
+            "-ERR The bit argument must be 1 or 0."
+        );
+        assert_eq!(
+            ErrorReply::bitop_not_single_source().line(),
+            "-ERR BITOP NOT must be called with a single source key."
+        );
+        assert_eq!(
+            ErrorReply::invalid_bitfield_type().line(),
+            "-ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is."
+        );
+        assert_eq!(
+            ErrorReply::bitfield_invalid_overflow().line(),
+            "-ERR Invalid OVERFLOW type specified"
+        );
+        assert_eq!(
+            ErrorReply::bitfield_ro_no_writes().line(),
+            "-ERR BITFIELD_RO only supports the GET subcommand"
         );
     }
 }
