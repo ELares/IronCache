@@ -344,6 +344,13 @@ pub enum NewValueOwned {
     /// with [`NewValueOwned::List`]/[`NewValueOwned::Hash`], this is the create case only;
     /// SUBSEQUENT edits go through the in-place [`RmwAction::Mutated`] path, not a rebuild.
     Set(Vec<Vec<u8>>),
+    /// A new ZSET value (PR-8 create-on-missing path: ZADD/ZINCRBY/*STORE/ZRANGESTORE on a
+    /// vacant key). The `(member, score)` pairs are deduplicated by the store as it builds
+    /// the concrete zset value (the LAST score for a repeated member wins, since the caller
+    /// already resolved aggregation), applying the listpack/skiplist ladder and the
+    /// (score, member) ordering. As with the other create variants, this is the create case
+    /// only; SUBSEQUENT edits go through the in-place [`RmwAction::Mutated`] path.
+    ZSet(Vec<(Vec<u8>, f64)>),
 }
 
 impl NewValueOwned {
@@ -370,6 +377,14 @@ impl NewValueOwned {
     #[must_use]
     pub fn set(members: Vec<Vec<u8>>) -> Self {
         NewValueOwned::Set(members)
+    }
+
+    /// Convenience constructor for a new ZSET value from `(member, score)` pairs (the
+    /// store deduplicates -- last score wins -- and applies the encoding ladder + ordering
+    /// as it builds the value).
+    #[must_use]
+    pub fn zset(pairs: Vec<(Vec<u8>, f64)>) -> Self {
+        NewValueOwned::ZSet(pairs)
     }
 }
 
@@ -694,6 +709,257 @@ pub trait SetValue {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ZSet (sorted-set) range/decision vocabulary (PR-8, ZSET_LARGE.md, COMMANDS.md zset
+// semantics). The waist OWNS these small value types so the command layer can express
+// a score range, a lex range, and the ZADD NX/XX/GT/LT decision WITHOUT naming the
+// concrete zset representation (the layering contract). They are pure data (no store
+// types), added ADDITIVELY alongside the [`ZSetValue`] trait.
+// ---------------------------------------------------------------------------
+
+/// One end of a SCORE range (ZRANGEBYSCORE / ZCOUNT / ZRANGE BYSCORE). The score is an
+/// `f64`; `inclusive` distinguishes the Redis `[`/inclusive vs `(`/exclusive bound. The
+/// command layer parses `-inf`/`+inf`/`(1.5`/`1.5` into this; `+inf`/`-inf` are just
+/// `f64::INFINITY`/`f64::NEG_INFINITY` (always inclusive in Redis since nothing equals
+/// infinity except infinity itself, which the inclusive flag handles correctly).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoreBound {
+    /// The score value (may be `+inf`/`-inf`).
+    pub score: f64,
+    /// Whether the bound is inclusive (`[`/bare) vs exclusive (`(`).
+    pub inclusive: bool,
+}
+
+impl ScoreBound {
+    /// An inclusive bound at `score`.
+    #[must_use]
+    pub fn inclusive(score: f64) -> Self {
+        ScoreBound {
+            score,
+            inclusive: true,
+        }
+    }
+
+    /// An exclusive bound at `score`.
+    #[must_use]
+    pub fn exclusive(score: f64) -> Self {
+        ScoreBound {
+            score,
+            inclusive: false,
+        }
+    }
+
+    /// Whether `s` satisfies this bound as a MINIMUM (lower) bound (`s > score` for an
+    /// exclusive bound, `s >= score` for an inclusive one).
+    #[must_use]
+    pub fn allows_min(&self, s: f64) -> bool {
+        if self.inclusive { s >= self.score } else { s > self.score }
+    }
+
+    /// Whether `s` satisfies this bound as a MAXIMUM (upper) bound (`s < score` for an
+    /// exclusive bound, `s <= score` for an inclusive one).
+    #[must_use]
+    pub fn allows_max(&self, s: f64) -> bool {
+        if self.inclusive { s <= self.score } else { s < self.score }
+    }
+}
+
+/// One end of a LEX range (ZRANGEBYLEX / ZLEXCOUNT / ZRANGE BYLEX). Redis lex ranges
+/// assume all members share a score and compare member BYTES: `[m` inclusive, `(m`
+/// exclusive, `-` the minimum (before all members), `+` the maximum (after all members).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LexBound {
+    /// `-` for a min bound / `+`-equivalent unreachable-low: smaller than every member.
+    NegInf,
+    /// `+` for a max bound: larger than every member.
+    PosInf,
+    /// `[m` inclusive at the member bytes.
+    Inclusive(Vec<u8>),
+    /// `(m` exclusive at the member bytes.
+    Exclusive(Vec<u8>),
+}
+
+impl LexBound {
+    /// Whether `m` satisfies this bound as a MINIMUM (lower) bound.
+    #[must_use]
+    pub fn allows_min(&self, m: &[u8]) -> bool {
+        match self {
+            LexBound::NegInf => true,
+            LexBound::PosInf => false,
+            LexBound::Inclusive(b) => m >= b.as_slice(),
+            LexBound::Exclusive(b) => m > b.as_slice(),
+        }
+    }
+
+    /// Whether `m` satisfies this bound as a MAXIMUM (upper) bound.
+    #[must_use]
+    pub fn allows_max(&self, m: &[u8]) -> bool {
+        match self {
+            LexBound::NegInf => false,
+            LexBound::PosInf => true,
+            LexBound::Inclusive(b) => m <= b.as_slice(),
+            LexBound::Exclusive(b) => m < b.as_slice(),
+        }
+    }
+}
+
+/// The ZADD per-member flag decision the command layer passes to [`ZSetValue::add`]
+/// (the NX/XX/GT/LT matrix). Pure data; the concrete zset applies it atomically.
+/// NX/XX/GT/LT are validated for compatibility at the command layer BEFORE this is
+/// built (NX+GT/NX+LT/GT+LT/NX+XX are syntax errors), so a `ZAddFlags` is always a
+/// legal combination here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZAddFlags {
+    /// NX: only add a NEW member; never update an existing one.
+    pub nx: bool,
+    /// XX: only update an EXISTING member; never add a new one.
+    pub xx: bool,
+    /// GT: only update if the new score is strictly GREATER than the current.
+    pub gt: bool,
+    /// LT: only update if the new score is strictly LESS than the current.
+    pub lt: bool,
+}
+
+/// The outcome of a single [`ZSetValue::add`] (one ZADD score/member pair under the
+/// flag matrix): whether the member was newly ADDED, whether its score CHANGED
+/// (added counts as changed), and the member's score AFTER the operation (`None` if
+/// the op was suppressed by NX/XX/GT/LT and the member is absent, so INCR returns nil).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZAddOutcome {
+    /// Whether a NEW member was added (the zset grew).
+    pub added: bool,
+    /// Whether the member's score was added-or-updated (ZADD CH counts this).
+    pub changed: bool,
+    /// The member's score AFTER the op, or `None` if the op did not apply and the
+    /// member is absent (NX-on-existing / XX-on-missing / GT/LT suppressed). For INCR
+    /// a `None` means the reply is nil.
+    pub new_score: Option<f64>,
+}
+
+/// The abstract SORTED-SET (zset) mutation + read vocabulary the command layer calls
+/// through the in-place-mutation arm (PR-8, ZSET_LARGE.md, COMMANDS.md zset semantics).
+/// The concrete zset value (`ironcache_store::kvobj::ZSetVal`) implements it; the command
+/// layer names ONLY this trait, never the concrete zset representation, so the listpack
+/// -> skiplist transition can change without reopening the command layer. This is the
+/// ZSET analog of [`ListValue`]/[`HashValue`]/[`SetValue`], added ADDITIVELY in PR-8.
+///
+/// A zset member is UNIQUE; each carries an `f64` score; the zset is ordered by
+/// `(score ASC, member-bytes ASC)` for equal scores (the Redis skiplist order,
+/// [redis-zset-skiplist-plus-ht]). A NaN score is rejected by the command layer BEFORE
+/// reaching [`Self::add`]/[`Self::incr`], so it never enters the order; `+inf`/`-inf`
+/// are allowed and ordered as the extreme scores.
+///
+/// A zset value is NEVER stored empty: when the last member is removed the store deletes
+/// the key (the empty-collection-deletes-key backstop), so an empty zset is never
+/// observable, matching Redis.
+pub trait ZSetValue {
+    /// ZADD one `(member, score)` pair under the NX/XX/GT/LT `flags`, returning the
+    /// [`ZAddOutcome`] (added? / changed? / new score). The implementation enforces the
+    /// flag matrix atomically: NX suppresses an update of an existing member; XX
+    /// suppresses adding a new member; GT/LT suppress an update unless the new score is
+    /// strictly greater/less than the current. The member ordering is maintained.
+    fn add(&mut self, member: &[u8], score: f64, flags: ZAddFlags) -> ZAddOutcome;
+
+    /// ZINCRBY / ZADD INCR: add `delta` to `member`'s score (creating it at `delta` if
+    /// absent, UNLESS suppressed by `flags`), returning the new score or `None` if the
+    /// op was suppressed (NX-on-existing / XX-on-missing / GT/LT). The member ordering
+    /// is maintained. The command layer rejects a resulting NaN before this is observed.
+    fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> Option<f64>;
+
+    /// The score of `member` (ZSCORE / ZMSCORE), or `None` if absent.
+    fn score(&self, member: &[u8]) -> Option<f64>;
+
+    /// Remove `member` (ZREM). Returns `true` if it existed and was removed.
+    fn remove(&mut self, member: &[u8]) -> bool;
+
+    /// The member count (ZCARD).
+    fn len(&self) -> usize;
+
+    /// Whether the zset holds no members. (A zset value should never be stored empty --
+    /// the store removes the key when an edit empties it -- but the predicate is part of
+    /// the vocabulary so the store can detect the empty case.)
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The 0-based RANK of `member` in `(score, member)` order (ZRANK), or in REVERSE
+    /// order when `rev` (ZREVRANK). `None` if the member is absent.
+    fn rank(&self, member: &[u8], rev: bool) -> Option<usize>;
+
+    /// The `(member, score)` pairs in the inclusive signed RANK range `[start, stop]`
+    /// (ZRANGE by index / ZREVRANGE), in `(score, member)` order, or reversed when
+    /// `rev`. Negative indices count from the tail; out-of-range / inverted ranges
+    /// yield an empty vector. Redis normalization (the same as LRANGE).
+    fn range_by_rank(&self, start: i64, stop: i64, rev: bool) -> Vec<(Vec<u8>, f64)>;
+
+    /// The `(member, score)` pairs whose score is within `[min, max]` (ZRANGEBYSCORE /
+    /// ZRANGE BYSCORE), in ascending `(score, member)` order, or DESCENDING when `rev`
+    /// (ZREVRANGEBYSCORE: in that case `min`/`max` are still the SMALLER/LARGER bound,
+    /// the command layer swaps the argument order before calling). `limit` is an
+    /// optional `(offset, count)` applied AFTER ordering (count < 0 means "to the end").
+    fn range_by_score(
+        &self,
+        min: ScoreBound,
+        max: ScoreBound,
+        rev: bool,
+        limit: Option<(i64, i64)>,
+    ) -> Vec<(Vec<u8>, f64)>;
+
+    /// The members whose bytes are within the lex range `[min, max]` (ZRANGEBYLEX /
+    /// ZRANGE BYLEX), in ascending member order or DESCENDING when `rev`. Defined for an
+    /// equal-score zset (Redis semantics); the implementation compares member bytes.
+    /// `limit` is an optional `(offset, count)` applied after ordering.
+    fn range_by_lex(
+        &self,
+        min: &LexBound,
+        max: &LexBound,
+        rev: bool,
+        limit: Option<(i64, i64)>,
+    ) -> Vec<Vec<u8>>;
+
+    /// The count of members whose score is within `[min, max]` (ZCOUNT).
+    fn count_by_score(&self, min: ScoreBound, max: ScoreBound) -> usize;
+
+    /// The count of members whose bytes are within the lex range `[min, max]`
+    /// (ZLEXCOUNT).
+    fn count_by_lex(&self, min: &LexBound, max: &LexBound) -> usize;
+
+    /// Remove and return up to `count` members with the LOWEST scores (ZPOPMIN), in
+    /// ascending `(score, member)` order. Returns the removed `(member, score)` pairs.
+    fn pop_min(&mut self, count: usize) -> Vec<(Vec<u8>, f64)>;
+
+    /// Remove and return up to `count` members with the HIGHEST scores (ZPOPMAX), in
+    /// DESCENDING `(score, member)` order (the highest first). Returns the removed
+    /// `(member, score)` pairs.
+    fn pop_max(&mut self, count: usize) -> Vec<(Vec<u8>, f64)>;
+
+    /// Remove every member whose rank is within the inclusive signed range `[start,
+    /// stop]` (ZREMRANGEBYRANK). Returns the number removed.
+    fn remove_range_by_rank(&mut self, start: i64, stop: i64) -> usize;
+
+    /// Remove every member whose score is within `[min, max]` (ZREMRANGEBYSCORE).
+    /// Returns the number removed.
+    fn remove_range_by_score(&mut self, min: ScoreBound, max: ScoreBound) -> usize;
+
+    /// Remove every member whose bytes are within the lex range `[min, max]`
+    /// (ZREMRANGEBYLEX). Returns the number removed.
+    fn remove_range_by_lex(&mut self, min: &LexBound, max: &LexBound) -> usize;
+
+    /// All `(member, score)` pairs in `(score, member)` order (ZSCAN / aggregation
+    /// source read / ZRANDMEMBER). A deterministic, stable order (the score order, with
+    /// member-byte tiebreak), so ZSCAN / ZRANDMEMBER are deterministic (ADR-0003).
+    fn members_with_scores(&self) -> Vec<(Vec<u8>, f64)>;
+
+    /// Whether the zset is in the small `listpack` encoding (vs the large `skiplist`
+    /// encoding). ZSCAN uses this to match Redis's small-collection behavior: a
+    /// listpack-encoded zset is returned in ONE reply with cursor 0 (COUNT ignored),
+    /// while a skiplist-encoded zset paginates by COUNT. Default `true` is the
+    /// conservative small-collection answer.
+    fn is_listpack(&self) -> bool {
+        true
+    }
+}
+
 /// A MUTABLE observation of an occupied entry inside a [`Store::rmw_mut`] closure
 /// (the collection in-place-mutation arm, PR-5). It exposes the same read accessors
 /// as [`OccupiedEntry`] PLUS typed mutable views of the stored collection.
@@ -738,6 +1004,9 @@ pub enum ValueMut<'a> {
     /// A set value, borrowed mutably for the closure (SADD/SREM/SPOP/... edits, PR-7).
     /// The SET analog of the [`ValueMut::List`]/[`ValueMut::Hash`] arms.
     Set(&'a mut dyn SetValue),
+    /// A sorted-set (zset) value, borrowed mutably for the closure (ZADD/ZREM/ZPOPMIN/...
+    /// edits, PR-8). The ZSET analog of the other collection arms.
+    ZSet(&'a mut dyn ZSetValue),
 }
 
 impl<'a> OccupiedEntryMut<'a> {
@@ -789,6 +1058,23 @@ impl<'a> OccupiedEntryMut<'a> {
         }
     }
 
+    /// Construct a mutable view over a ZSET value (PR-8: the store hands this out when
+    /// the stored value is a sorted set). The ZSET analog of [`Self::list`]/[`Self::hash`]/
+    /// [`Self::set`].
+    #[must_use]
+    pub fn zset(
+        encoding: Encoding,
+        expire_at: Option<UnixMillis>,
+        zset: &'a mut dyn ZSetValue,
+    ) -> Self {
+        OccupiedEntryMut {
+            data_type: DataType::ZSet,
+            encoding,
+            expire_at,
+            value: ValueMut::ZSet(zset),
+        }
+    }
+
     /// Construct a mutable view over a NON-collection value (string family): the
     /// typed collection accessors return `None`, so a collection handler returns
     /// WRONGTYPE without editing.
@@ -831,7 +1117,10 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_list_mut(&mut self) -> Option<&mut dyn ListValue> {
         match &mut self.value {
             ValueMut::List(l) => Some(&mut **l),
-            ValueMut::NonCollection | ValueMut::Hash(_) | ValueMut::Set(_) => None,
+            ValueMut::NonCollection
+            | ValueMut::Hash(_)
+            | ValueMut::Set(_)
+            | ValueMut::ZSet(_) => None,
         }
     }
 
@@ -841,7 +1130,10 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_hash_mut(&mut self) -> Option<&mut dyn HashValue> {
         match &mut self.value {
             ValueMut::Hash(h) => Some(&mut **h),
-            ValueMut::NonCollection | ValueMut::List(_) | ValueMut::Set(_) => None,
+            ValueMut::NonCollection
+            | ValueMut::List(_)
+            | ValueMut::Set(_)
+            | ValueMut::ZSet(_) => None,
         }
     }
 
@@ -851,7 +1143,26 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_set_mut(&mut self) -> Option<&mut dyn SetValue> {
         match &mut self.value {
             ValueMut::Set(s) => Some(&mut **s),
-            ValueMut::NonCollection | ValueMut::List(_) | ValueMut::Hash(_) => None,
+            ValueMut::NonCollection
+            | ValueMut::List(_)
+            | ValueMut::Hash(_)
+            | ValueMut::ZSet(_) => None,
+        }
+    }
+
+    /// The typed mutable ZSET view, or `None` if the stored value is not a sorted set
+    /// (the handler returns WRONGTYPE + [`RmwAction::Keep`] on `None`). PR-8's zset
+    /// commands edit through this. The ZSET analog of [`Self::as_list_mut`]/
+    /// [`Self::as_hash_mut`]/[`Self::as_set_mut`]. This was the RESERVED slot the PR-5
+    /// docs named; PR-8 fills it additively alongside the [`ZSetValue`] trait and the
+    /// [`ValueMut::ZSet`] arm.
+    pub fn as_zset_mut(&mut self) -> Option<&mut dyn ZSetValue> {
+        match &mut self.value {
+            ValueMut::ZSet(z) => Some(&mut **z),
+            ValueMut::NonCollection
+            | ValueMut::List(_)
+            | ValueMut::Hash(_)
+            | ValueMut::Set(_) => None,
         }
     }
 }
