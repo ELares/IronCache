@@ -55,6 +55,16 @@ pub const DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES: usize = 8 * 1024;
 /// pinned default.
 pub const DEFAULT_HASH_MAX_LISTPACK_ENTRIES: usize = 128;
 
+/// The default per-field/value BYTE cap for a HASH listpack (`hash-max-listpack-value`,
+/// default 64). A hash whose ANY field-or-value byte length exceeds this transitions
+/// away from `listpack` to `hashtable`, EVEN when it has few entries (the byte cap is
+/// per-element, not a total). This is the HASH companion to
+/// [`DEFAULT_HASH_MAX_LISTPACK_ENTRIES`] (the entry cap): a hash stays `listpack` while
+/// `entries <= hash-max-listpack-entries` AND every field-and-value byte length `<=
+/// hash-max-listpack-value`. Wired into the hash encoding logic in PR-6; kept here so
+/// PR-6/7 share the pinned default.
+pub const DEFAULT_HASH_MAX_LISTPACK_VALUE: usize = 64;
+
 /// The Redis `list-max-listpack-size` default SPELLING (`-2` = "8 KB per node"). This
 /// is what `CONFIG GET list-max-listpack-size` echoes (the configured Redis form),
 /// while the store works in the resolved byte budget

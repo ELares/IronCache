@@ -332,6 +332,12 @@ pub enum NewValueOwned {
     /// value here (the create case); SUBSEQUENT edits go through the in-place
     /// [`RmwAction::Mutated`] path, not a rebuild.
     List(Vec<Vec<u8>>),
+    /// A new HASH value (PR-6 create-on-missing path: HSET/HSETNX/HINCRBY/... on a
+    /// vacant key). The `(field, value)` pairs are in insertion order; the store builds
+    /// the concrete hash value from them. As with [`NewValueOwned::List`], this is the
+    /// create case only; SUBSEQUENT edits go through the in-place [`RmwAction::Mutated`]
+    /// path, not a rebuild.
+    Hash(Vec<(Vec<u8>, Vec<u8>)>),
 }
 
 impl NewValueOwned {
@@ -344,6 +350,13 @@ impl NewValueOwned {
     #[must_use]
     pub fn list(elems: Vec<Vec<u8>>) -> Self {
         NewValueOwned::List(elems)
+    }
+
+    /// Convenience constructor for a new HASH value from `(field, value)` pairs in
+    /// insertion order.
+    #[must_use]
+    pub fn hash(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        NewValueOwned::Hash(pairs)
     }
 }
 
@@ -519,6 +532,80 @@ pub trait ListValue {
     fn pos(&self, elem: &[u8], rank: i64, count: Option<usize>, maxlen: usize) -> Vec<usize>;
 }
 
+/// The abstract HASH mutation + read vocabulary the command layer calls through the
+/// in-place-mutation arm (PR-6, COLLECTIONS.md, COMMANDS.md hash semantics). The
+/// concrete hash value (`ironcache_store::kvobj::HashVal`) implements it; the command
+/// layer names ONLY this trait, never the concrete hash representation, so the listpack
+/// -> hashtable transition can change without reopening the command layer. This is the
+/// HASH analog of [`ListValue`], added ADDITIVELY in PR-6 (same shape, same `dyn`
+/// indirection off the string hot path).
+///
+/// The method set is designed to cover ALL the hash commands: HSET
+/// ([`set`](HashValue::set)), HSETNX ([`set_nx`](HashValue::set_nx)), HGET
+/// ([`get`](HashValue::get)), HMGET (repeated [`get`](HashValue::get)), HDEL
+/// ([`del`](HashValue::del)), HGETALL/HKEYS/HVALS ([`iter`](HashValue::iter) /
+/// [`fields`](HashValue::fields) / [`values`](HashValue::values)), HLEN
+/// ([`len`](HashValue::len)), HEXISTS ([`contains`](HashValue::contains)), HSTRLEN
+/// ([`strlen`](HashValue::strlen)), HINCRBY/HINCRBYFLOAT ([`get`](HashValue::get) +
+/// [`set`](HashValue::set) compose the read-modify-write), HRANDFIELD + HSCAN (over the
+/// field order [`iter`](HashValue::iter) / [`fields`](HashValue::fields) exposes).
+///
+/// A hash value is NEVER stored empty: when the last field is removed the store deletes
+/// the key (the empty-collection-deletes-key backstop), so an empty hash is never
+/// observable, matching Redis.
+pub trait HashValue {
+    /// Set `field` to `value` (HSET). Returns `true` if the field was NEW (the hash
+    /// grew), `false` if an existing field's value was overwritten in place.
+    fn set(&mut self, field: &[u8], value: &[u8]) -> bool;
+
+    /// Set `field` to `value` ONLY if the field does not already exist (HSETNX).
+    /// Returns `true` if the field was set (was absent), `false` if it already existed
+    /// (no change).
+    fn set_nx(&mut self, field: &[u8], value: &[u8]) -> bool;
+
+    /// The value of `field` (HGET / HMGET), or `None` if the field is absent.
+    fn get(&self, field: &[u8]) -> Option<&[u8]>;
+
+    /// Remove `field` (HDEL). Returns `true` if it existed and was removed.
+    fn del(&mut self, field: &[u8]) -> bool;
+
+    /// Whether `field` is present (HEXISTS).
+    fn contains(&self, field: &[u8]) -> bool;
+
+    /// The field count (HLEN).
+    fn len(&self) -> usize;
+
+    /// Whether the hash holds no fields. (A hash value should never be stored empty --
+    /// the store removes the key when an edit empties it -- but the predicate is part of
+    /// the vocabulary so the store can detect the empty case.)
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The byte length of `field`'s value (HSTRLEN), or `0` if the field is absent
+    /// (Redis HSTRLEN of a missing field is 0).
+    fn strlen(&self, field: &[u8]) -> usize {
+        self.get(field).map_or(0, <[u8]>::len)
+    }
+
+    /// All fields (HKEYS), in the hash's iteration order. The order matches
+    /// [`pairs`](HashValue::pairs) and is what HSCAN/HRANDFIELD index into.
+    fn fields(&self) -> Vec<Vec<u8>>;
+
+    /// All values (HVALS), in the hash's iteration order (paired 1:1 with
+    /// [`fields`](HashValue::fields)).
+    fn values(&self) -> Vec<Vec<u8>>;
+
+    /// All `(field, value)` pairs (HGETALL / HSCAN / HRANDFIELD), in the hash's
+    /// iteration order. The order is STABLE for a given representation (the listpack
+    /// small form preserves insertion order; the hashtable form is sorted by the
+    /// fixed-seed stable field hash so the order is deterministic across a resize, the
+    /// same resize-invariant order SCAN uses, ADR-0003). The store and command layer
+    /// rely on this stability for deterministic HSCAN/HRANDFIELD. (Named `pairs` rather
+    /// than `iter` because it returns an OWNED snapshot Vec, not an `Iterator`.)
+    fn pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)>;
+}
+
 /// A MUTABLE observation of an occupied entry inside a [`Store::rmw_mut`] closure
 /// (the collection in-place-mutation arm, PR-5). It exposes the same read accessors
 /// as [`OccupiedEntry`] PLUS typed mutable views of the stored collection.
@@ -530,10 +617,10 @@ pub trait ListValue {
 /// ([`Self::as_list_mut`] on a non-list) returns `None`, and the handler returns
 /// WRONGTYPE + [`RmwAction::Keep`] with no edit.
 ///
-/// The `as_hash_mut`/`as_set_mut`/`as_zset_mut` accessors are RESERVED for
-/// PR-6/7/8: they are added additively (alongside the `HashValue`/`SetValue`/
-/// `ZSetValue` traits, which are NOT defined yet) without changing this struct's
-/// existing surface.
+/// The `as_set_mut`/`as_zset_mut` accessors are RESERVED for PR-7/8: they are added
+/// additively (alongside the `SetValue`/`ZSetValue` traits, which are NOT defined yet)
+/// without changing this struct's existing surface. PR-6 adds the `as_hash_mut`
+/// accessor + the [`ValueMut::Hash`] arm + the [`HashValue`] trait exactly that way.
 pub struct OccupiedEntryMut<'a> {
     data_type: DataType,
     encoding: Encoding,
@@ -545,14 +632,19 @@ pub struct OccupiedEntryMut<'a> {
 
 /// The typed mutable value view behind an [`OccupiedEntryMut`]. PR-5 has the list
 /// arm and a `NonCollection` arm (a string/int/embstr/raw value, for which the
-/// typed collection accessors all return `None` -> WRONGTYPE). The hash/set/zset
-/// arms are added additively in PR-6/7/8.
+/// typed collection accessors all return `None` -> WRONGTYPE). PR-6 adds the [`Hash`]
+/// arm; the set/zset arms are added additively in PR-7/8.
+///
+/// [`Hash`]: ValueMut::Hash
 pub enum ValueMut<'a> {
     /// A non-collection value (string family). No typed collection view applies; the
     /// `as_*_mut` accessors all return `None` so the handler returns WRONGTYPE.
     NonCollection,
     /// A list value, borrowed mutably for the closure (LPUSH/LPOP/LSET/... edits).
     List(&'a mut dyn ListValue),
+    /// A hash value, borrowed mutably for the closure (HSET/HDEL/HINCRBY/... edits,
+    /// PR-6). The HASH analog of the [`ValueMut::List`] arm.
+    Hash(&'a mut dyn HashValue),
 }
 
 impl<'a> OccupiedEntryMut<'a> {
@@ -569,6 +661,22 @@ impl<'a> OccupiedEntryMut<'a> {
             encoding,
             expire_at,
             value: ValueMut::List(list),
+        }
+    }
+
+    /// Construct a mutable view over a HASH value (PR-6: the store hands this out when
+    /// the stored value is a hash). The HASH analog of [`Self::list`].
+    #[must_use]
+    pub fn hash(
+        encoding: Encoding,
+        expire_at: Option<UnixMillis>,
+        hash: &'a mut dyn HashValue,
+    ) -> Self {
+        OccupiedEntryMut {
+            data_type: DataType::Hash,
+            encoding,
+            expire_at,
+            value: ValueMut::Hash(hash),
         }
     }
 
@@ -614,7 +722,17 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_list_mut(&mut self) -> Option<&mut dyn ListValue> {
         match &mut self.value {
             ValueMut::List(l) => Some(&mut **l),
-            ValueMut::NonCollection => None,
+            ValueMut::NonCollection | ValueMut::Hash(_) => None,
+        }
+    }
+
+    /// The typed mutable HASH view, or `None` if the stored value is not a hash (the
+    /// handler returns WRONGTYPE + [`RmwAction::Keep`] on `None`). PR-6's hash commands
+    /// edit through this. The HASH analog of [`Self::as_list_mut`].
+    pub fn as_hash_mut(&mut self) -> Option<&mut dyn HashValue> {
+        match &mut self.value {
+            ValueMut::Hash(h) => Some(&mut **h),
+            ValueMut::NonCollection | ValueMut::List(_) => None,
         }
     }
 }
