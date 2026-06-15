@@ -1632,6 +1632,95 @@ pub trait PolicySwap {
 }
 
 // ---------------------------------------------------------------------------
+// WATCH optimistic-lock surface (TRANSACTIONS.md "WATCH optimistic locking via
+// per-key dirty-CAS", #19, PR-10b). A SEPARATE trait from the frozen four primitives
+// (like Admit/ActiveExpiry/Keyspace/PolicySwap): it lets the command-dispatch layer
+// register a watched key + revalidate it at EXEC WITHOUT naming the concrete map or
+// the per-key version counter. The watch state is PER-SHARD, single-thread, plain
+// fields on the concrete store (no std::sync, no atomics, ADR-0002/0005); the watch
+// MECHANISM is a u64 VERSION COUNTER bumped on the store's write funnel (no clock, no
+// rand, ADR-0003). This is ADDITIVE: it adds NO method to the four `Store`
+// primitives and does not change their signatures; dispatch bounds on
+// `S: Store + Admit + ActiveExpiry + Keyspace + Watch`.
+//
+// SINGLE-SHARD-PER-CONNECTION (PR-10b scope): a connection's watched keys and its
+// queued writes all live on its accept shard, so WATCH revalidation + EXEC apply run
+// on one owning core (the TRANSACTIONS.md single-shard fast path). CROSS-SHARD EXEC
+// (a watched key on a different shard than the connection's accept shard) is OUT OF
+// SCOPE here; it lands with the coordinator (COORDINATOR.md #29).
+// ---------------------------------------------------------------------------
+
+/// A WATCH snapshot of one key (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Recorded
+/// at WATCH time and revalidated at EXEC: a key is DIRTY iff its current version no
+/// longer equals [`Self::version`], OR its present/absent status at EXEC time differs
+/// from [`Self::present_at_watch`] (the Redis 6.0.9+ `wk->expired` rule: a key already
+/// absent at WATCH that stays absent is NOT a modification, but a watched-absent key
+/// that later becomes present IS).
+///
+/// It carries its own `(db, key)` so the connection holds a flat snapshot list with no
+/// back-reference to the store, and the connection-close deregistration can hand the
+/// whole list back to [`Watch::unwatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchEntry {
+    /// The logical DB the key was watched in (the connection's selected DB at WATCH).
+    pub db: u32,
+    /// The watched key bytes.
+    pub key: Box<[u8]>,
+    /// The key's version counter value at WATCH time. A later write to the key bumps
+    /// the store's slot version past this, which is how a modification is detected.
+    pub version: u64,
+    /// Whether the key was present-and-live at WATCH time (`read(db,key,now).is_some()`).
+    /// Compared against the present/absent status at EXEC: a transition either way is a
+    /// modification (a watched-live key that expired -> absent -> dirty; a watched
+    /// -absent key now present -> dirty). An already-absent key that stays absent is
+    /// clean (the `wk->expired` rule).
+    pub present_at_watch: bool,
+}
+
+/// The WATCH optimistic-lock surface the dispatch layer drives (TRANSACTIONS.md
+/// per-key dirty-CAS, PR-10b). NOT one of the frozen four primitives; an additive
+/// waist trait. The concrete per-shard store implements it over a per-key u64 version
+/// counter bumped on its write funnel (a deterministic counter, NOT a clock, ADR-0003);
+/// dispatch bounds on `S: Store + ... + Watch` so the WATCH/UNWATCH commands + the EXEC
+/// CAS check run generically.
+///
+/// The mechanism is O(watched keys), not O(db): WATCH stamps only the watched keys, a
+/// write notifies only if the key is watched (gated behind a cheap "any watches" flag so
+/// the non-watching hot path pays one branch), and EXEC revalidates only the snapshot
+/// list. A completed/aborted EXEC, DISCARD, RESET, and a connection close all
+/// deregister the connection's watches via [`Self::unwatch`], matching Redis unwatch
+/// timing.
+pub trait Watch {
+    /// Register `key` in `db` as WATCHed and return its current [`WatchEntry`] snapshot
+    /// (the key's current version + whether it is present-and-live at `now`). A slot is
+    /// created at the current version if the key was never watched; the watcher count is
+    /// incremented so a later [`Self::unwatch`] can drop the slot when the last watcher
+    /// leaves. Idempotent per connection in the sense that re-watching the same key adds
+    /// another watcher (Redis allows duplicate WATCH of a key; each pushes its own
+    /// snapshot, and each must be unwatched).
+    fn watch_snapshot(&mut self, db: u32, key: &[u8], now: UnixMillis) -> WatchEntry;
+
+    /// Whether `entry`'s watched key has been MODIFIED since the snapshot (the EXEC
+    /// dirty-CAS check). Dirty iff the key's CURRENT version counter differs from
+    /// `entry.version` (any create/overwrite/delete/expiry/flush of the key bumped it,
+    /// including a no-op write that did not change the value), OR its current present
+    /// /absent status (`read(db,key,now).is_some()`) differs from `entry.present_at_watch`
+    /// (a watched-live key that expired, or a watched-absent key now present).
+    ///
+    /// Logically a read, but NOT side-effect-free: the present/absent probe runs the lazy
+    /// expiry backstop, so it may reap an already-expired watched key as a side effect
+    /// (that reap IS the expiry dirty signal -- it both flips present/absent and bumps the
+    /// version). It mutates no value and is idempotent across repeated calls.
+    fn watch_is_dirty(&mut self, entry: &WatchEntry, now: UnixMillis) -> bool;
+
+    /// Deregister the watches in `entries` (the connection's whole snapshot list): per
+    /// entry, decrement the slot's watcher count and the store's any-watches flag, and
+    /// drop the slot when no watcher remains. Called on every EXEC exit path, on DISCARD,
+    /// on RESET, and on a connection close, so a stale watch never lingers in the store.
+    fn unwatch(&mut self, entries: &[WatchEntry]);
+}
+
+// ---------------------------------------------------------------------------
 // Keyspace iteration surface (KEYSPACE.md #129). A SEPARATE trait from the frozen
 // four primitives (like Admit and ActiveExpiry): it lets the command-dispatch layer
 // run the generic keyspace commands (SCAN/KEYS/DBSIZE/RANDOMKEY/RENAME/COPY/MOVE/

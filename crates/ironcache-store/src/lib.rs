@@ -39,7 +39,7 @@ use ironcache_eviction::{EvictionPolicy, Policy, map_policy_name};
 use ironcache_storage::{
     AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
     MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
-    RmwStep, ScanCursor, Store, UnixMillis, ValueRef,
+    RmwStep, ScanCursor, Store, UnixMillis, ValueRef, WatchEntry,
 };
 use kvobj::{KvObj, int_decimal_bytes};
 
@@ -188,6 +188,35 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// introspection accumulator on the concrete store), so it adds no primitive
     /// signature.
     lazy_expired: u64,
+    /// The WATCH per-key version slots (TRANSACTIONS.md per-key dirty-CAS, PR-10b).
+    /// Keyed by `(db, key)`; a slot exists ONLY while at least one connection watches
+    /// the key (created on WATCH, dropped on the last UNWATCH). The write funnel bumps
+    /// the watched key's `version` so a WATCH snapshot taken earlier reads as dirty.
+    /// Plain field, single-thread per shard (no std::sync, no atomics, ADR-0002/0005).
+    watch_versions: HashMap<(u32, Box<[u8]>), WatchSlot>,
+    /// The monotonically-increasing per-shard version clock (a u64 COUNTER, NOT a clock
+    /// or RNG: deterministic, ADR-0003). Each notify of a watched key bumps it and
+    /// stamps the key's slot, so distinct writes get strictly-increasing versions and a
+    /// stale snapshot's version never accidentally re-matches.
+    version_clock: u64,
+    /// The FAST-PATH gate for the write-funnel notify: the number of `(db, key)` slots
+    /// currently watched (== `watch_versions.len()`, tracked alongside so the funnel can
+    /// branch on a plain integer with NO hash probe). When `0` (the overwhelming common
+    /// case, no WATCH active) the funnel notify does a single integer check and returns;
+    /// the non-watching hot path pays ~one branch.
+    watched_count: usize,
+}
+
+/// One WATCH per-key version slot (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Held in
+/// [`ShardStore::watch_versions`] only while the key is watched.
+#[derive(Debug, Clone, Copy)]
+struct WatchSlot {
+    /// The key's current version. Bumped to the shard `version_clock` on every write to
+    /// the key while it is watched (the notify on the funnel).
+    version: u64,
+    /// How many connections currently watch this `(db, key)`. The slot is dropped when
+    /// this reaches zero (the last UNWATCH / EXEC / DISCARD / RESET / connection close).
+    watchers: u32,
 }
 
 impl ShardStore<NullEviction, CountingAccounting> {
@@ -213,6 +242,63 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             accounting,
             used: 0,
             lazy_expired: 0,
+            watch_versions: HashMap::new(),
+            version_clock: 0,
+            watched_count: 0,
+        }
+    }
+
+    /// The WATCH write-funnel NOTIFY (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Called
+    /// from the store-internal write funnel ([`Self::put_object`], [`Self::remove_object`],
+    /// [`Self::remove_object_crediting`]) so EVERY create/overwrite/delete/expiry of a
+    /// watched key bumps its version. This is the EXACT attach point the funnel doc
+    /// comment reserves for the OnWrite hook; it is store-internal, so adding it does NOT
+    /// reopen the frozen `Store` waist (STORAGE_API.md).
+    ///
+    /// FAST PATH: gated behind `watched_count > 0`. When no connection is watching
+    /// anything (the common case) this is a single integer compare and an immediate
+    /// return: the non-watching hot path pays ~one branch and does NO hash probe. Only
+    /// when a watch is active does it hash-probe `watch_versions` for `(db, key)` and, if
+    /// the key is watched, bump the shard `version_clock` and stamp the slot.
+    ///
+    /// Determinism (ADR-0003): the bump reads the u64 `version_clock` COUNTER, never a
+    /// clock or RNG.
+    fn touch_watch(&mut self, db: u32, key: &[u8]) {
+        // FAST PATH: no watches anywhere -> one branch, no hash probe.
+        if self.watched_count == 0 {
+            return;
+        }
+        // A watch is active: probe for THIS key. The tuple key `(u32, Box<[u8]>)` does
+        // not borrow as `(u32, &[u8])`, so we build an owned probe key. This allocation
+        // is OFF the non-watching hot path (gated by `watched_count > 0` above): it is
+        // paid only on a write while SOME key is watched, which is rare relative to the
+        // command stream, so it does not perturb the common path.
+        let probe = (db, key.to_vec().into_boxed_slice());
+        if let Some(slot) = self.watch_versions.get_mut(&probe) {
+            self.version_clock += 1;
+            slot.version = self.version_clock;
+        }
+    }
+
+    /// Dirty EVERY watched key in `db` (TRANSACTIONS.md, PR-10b): bump the version of
+    /// each watch slot whose db matches, INCLUDING watched-but-ABSENT keys. This is the
+    /// FLUSHDB/SWAPDB signal -- Redis's `touchAllWatchedKeysOnDb` (src/multi.c) dirties
+    /// every key watched in the flushed/swapped db, not just the resident ones, so a
+    /// watched key that was absent at WATCH and would have stayed absent is now dirtied
+    /// by the bulk operation (a flushed db is a structural change every watcher must see).
+    ///
+    /// Gated behind the `watched_count` fast path: when nothing is watched this is a
+    /// single integer check. Otherwise it iterates the watch slots ONCE (O(watched keys),
+    /// not O(db)). Determinism: bumps the u64 `version_clock` counter, no clock/RNG.
+    fn touch_all_watches_in_db(&mut self, db: u32) {
+        if self.watched_count == 0 {
+            return;
+        }
+        for (slot_db, slot) in &mut self.watch_versions {
+            if slot_db.0 == db {
+                self.version_clock += 1;
+                slot.version = self.version_clock;
+            }
         }
     }
 
@@ -283,10 +369,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             .and_then(|m| m.get(key))
             .is_some_and(|o| o.is_expired(now));
         if due {
-            if let Some(obj) = self.dbs[db_idx].remove(key) {
-                let bytes = obj.accounted_bytes();
-                self.account_sub(bytes);
-                self.eviction.on_remove(db, key, bytes);
+            // Route the removal through the WRITE FUNNEL (`remove_object`): it fires
+            // on_remove + account_sub AND `touch_watch`, so a watched key that lazily
+            // expires between WATCH and EXEC is dirtied (the lazy-expiry dirty signal).
+            // Inlining the remove here would skip that notify and rest the dirty signal
+            // ONLY on the present/absent fallback. The lazy-backstop counter is bumped
+            // AFTER, gated on the funnel actually having removed a resident entry.
+            if self.remove_object(db, db_idx, key) {
                 // Count the lazy-backstop reclamation for INFO `expired_keys` (PR-3b).
                 // The serve loop drains this with `take_lazy_expired` after each
                 // command. This is the lazy-path signal that complements the active
@@ -312,6 +401,12 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
     /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
     fn put_object(&mut self, db: u32, db_idx: usize, key: &[u8], obj: KvObj) -> bool {
+        // WATCH notify (PR-10b): a create or overwrite of a watched key bumps its
+        // version (gated behind the watched_count fast path inside touch_watch). This
+        // fires for a create on a watched-ABSENT key too (a watched-absent key now
+        // present is a modification), and for a no-op overwrite that stores the same
+        // bytes (any write touches the version, matching Redis).
+        self.touch_watch(db, key);
         let new_bytes = obj.accounted_bytes();
         let boxed: Box<[u8]> = key.to_vec().into_boxed_slice();
         // Replace inside the entry scope, capturing any old weight, then update the
@@ -336,12 +431,23 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         old_bytes.is_some()
     }
 
-    /// Remove `key`'s object, crediting the hooks. Returns whether it existed
-    /// (caller guarantees any due expiry already ran, so an existing entry is live).
+    /// Remove `key`'s object, crediting the hooks (the store-internal REMOVE FUNNEL).
+    /// Returns whether it existed. Used both for an explicit delete (the `rmw` Delete
+    /// arm, where the caller guarantees any due expiry already ran, so an existing entry
+    /// is live) AND for an expiry removal: BOTH the lazy backstop ([`Self::expire_if_due`])
+    /// and the active reaper ([`Self::reap_if_expired`]) route the actual removal through
+    /// here, so on_remove + account_sub + the WATCH notify fire on every removal path.
     ///
     /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
     /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
     fn remove_object(&mut self, db: u32, db_idx: usize, key: &[u8]) -> bool {
+        // WATCH notify (PR-10b): a delete or expiry of a watched key bumps its version.
+        // Because the lazy/active expiry paths reach here (expire_if_due / reap_if_expired
+        // both call remove_object), a watched key that expires is dirtied too, and
+        // FLUSHDB/FLUSHALL (which loop remove_object) dirty every watched key they remove.
+        // A watched-but-ABSENT key flush is handled in flush_db (it iterates the watch
+        // slots), since remove_object only fires for a key that was actually resident.
+        self.touch_watch(db, key);
         if let Some(obj) = self.dbs[db_idx].remove(key) {
             let bytes = obj.accounted_bytes();
             self.account_sub(bytes);
@@ -366,6 +472,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         key: &[u8],
         bytes: usize,
     ) -> bool {
+        // WATCH notify (PR-10b): the in-place Delete / empty-collection path also
+        // touches a watched key's version (a collection drained to empty by an edit is a
+        // modification, like any delete).
+        self.touch_watch(db, key);
         if self.dbs[db_idx].remove(key).is_some() {
             self.account_sub(bytes);
             self.eviction.on_remove(db, key, bytes);
@@ -537,6 +647,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         other => resolve_expire(other, old_deadline),
                     };
                     if new_deadline != old_deadline {
+                        // WATCH notify (PR-10b): a TTL change on a watched key IS a write
+                        // (EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT/PERSIST/GETEX-with-TTL all
+                        // signal in Redis -> keyModified -> touchWatchedKey). Scoped to the
+                        // real-change branch: a no-op TTL write (bare GETEX, an EXPIRE that
+                        // does not move the deadline) keeps the key CLEAN, matching Redis.
+                        self.touch_watch(db, key);
                         if let Some(obj) = self.dbs[db_idx].get_mut(key) {
                             obj.expire_at = new_deadline;
                             obj.header.ttl_present = new_deadline.is_some();
@@ -578,6 +694,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         step.reply
     }
 
+    // The in-place-mutation RMW funnel: observe -> typed mutable handle -> measure delta /
+    // recompute encoding / empty-deletes-key, with the PR-10b WATCH notify on the Mutated
+    // arm. The post-action match over Keep/Insert/Replace/Delete/Mutated is the intended
+    // shape, so the line-count lint is allowed here (the same allowance the read-only `rmw`
+    // would carry; the additive WATCH notify nudged this over the 100-line bar).
+    #[allow(clippy::too_many_lines)]
     fn rmw_mut<R>(
         &mut self,
         db: u32,
@@ -659,6 +781,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         other => resolve_expire(other, old_deadline),
                     };
                     if new_deadline != old_deadline {
+                        // WATCH notify (PR-10b): same as the read-only `rmw` Keep arm -- a
+                        // TTL change on a watched key is a write, scoped to the real-change
+                        // branch so a no-op TTL write stays clean (matches Redis).
+                        self.touch_watch(db, key);
                         if let Some(obj) = self.dbs[db_idx].get_mut(key) {
                             obj.expire_at = new_deadline;
                             obj.header.ttl_present = new_deadline.is_some();
@@ -699,8 +825,20 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                     if emptied {
                         // Same pre-edit-weight credit as the Delete arm: the edit
                         // already shrank the in-memory object, so credit `old_bytes`.
+                        // The WATCH notify fires inside remove_object_crediting (an
+                        // emptied collection is a delete), so it is NOT fired again here
+                        // -- each logical write bumps the version exactly once.
                         self.remove_object_crediting(db, db_idx, key, old_bytes);
                     } else {
+                        // WATCH notify (PR-10b): a non-emptying in-place collection edit IS
+                        // a write to the key, so it must bump a watched key's version EVEN
+                        // when the edit is a no-op on the value (SADD of an existing member,
+                        // HSET of the same value) -- Redis treats any write command touching
+                        // the key as a modification. The funnel functions
+                        // (put_object/remove_object) are NOT called on this non-emptying
+                        // same-size in-place path, so the notify must fire here. (The emptied
+                        // branch above already notifies via remove_object_crediting.)
+                        self.touch_watch(db, key);
                         let new_bytes = self.dbs[db_idx].get(key).map_or(0, KvObj::accounted_bytes);
                         // Re-account the signed delta and re-fire the eviction sizing
                         // so the policy's per-key byte estimate tracks the edit.
@@ -1103,11 +1241,16 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         };
         let mut removed = 0u64;
         for key in &keys {
-            // remove_object fires the eviction/accounting remove hooks and frees bytes.
+            // remove_object fires the eviction/accounting remove hooks and frees bytes
+            // (and notifies the WATCH version of each resident watched key, PR-10b).
             if self.remove_object(db, db_idx, key) {
                 removed += 1;
             }
         }
+        // WATCH (PR-10b): also dirty every key WATCHED in this db that was NOT resident
+        // (a watched-absent key), matching Redis touchAllWatchedKeysOnDb -- a FLUSHDB
+        // signals all of the db's watched keys, not only the ones that held a value.
+        self.touch_all_watches_in_db(db);
         removed
     }
 
@@ -1184,6 +1327,108 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
             // or destroyed, so no hook fires and the accounting total is unchanged
             // (the same entries are still resident, just under different db ids).
             self.dbs.swap(ai, bi);
+            // WATCH (PR-10b): the contents under db `a` and db `b` both changed wholesale,
+            // so every key watched in EITHER db is dirtied. Redis treats SWAPDB like a
+            // flush of both dbs for watch purposes (the watched (db,key) now maps to a
+            // different value or to absence). Bumps all watch slots in both dbs.
+            self.touch_all_watches_in_db(a);
+            self.touch_all_watches_in_db(b);
+        }
+    }
+}
+
+impl<E: EvictionHook, A: AccountingHook> ironcache_storage::Watch for ShardStore<E, A> {
+    /// Register `(db, key)` as watched and snapshot it (TRANSACTIONS.md per-key
+    /// dirty-CAS, PR-10b). Ensures a [`WatchSlot`] exists (created at the CURRENT
+    /// `version_clock` if the key was never watched), increments its watcher count and
+    /// the `watched_count` fast-path flag, and returns the [`WatchEntry`] carrying the
+    /// slot version + whether the key is present-and-live at `now`.
+    ///
+    /// The present/absent probe runs the LAZY expiry backstop ([`Self::expire_if_due`]):
+    /// a key already past its deadline at WATCH time is reaped now and recorded ABSENT
+    /// (`present_at_watch = false`), so an already-expired key watched and left absent is
+    /// clean at EXEC (the Redis 6.0.9+ `wk->expired` rule). That reap goes through
+    /// `remove_object`, which notifies the watch -- but the slot is (re)stamped to the
+    /// CURRENT clock AFTER the probe below, so the snapshot version matches the
+    /// post-probe slot and the just-reaped key does not read as spuriously dirty.
+    fn watch_snapshot(&mut self, db: u32, key: &[u8], now: UnixMillis) -> WatchEntry {
+        let db_idx = self.db_index(db);
+        // Probe present-and-live FIRST (this may lazily reap an already-expired key,
+        // bumping its slot if one already existed from a prior watcher). The snapshot
+        // version is read AFTER, so it reflects the post-reap state.
+        let present = self.expire_if_due(db, db_idx, key, now);
+        let probe = (db, key.to_vec().into_boxed_slice());
+        let version = match self.watch_versions.entry(probe) {
+            Entry::Occupied(mut e) => {
+                let slot = e.get_mut();
+                slot.watchers += 1;
+                self.watched_count += 1;
+                slot.version
+            }
+            Entry::Vacant(e) => {
+                let version = self.version_clock;
+                e.insert(WatchSlot {
+                    version,
+                    watchers: 1,
+                });
+                self.watched_count += 1;
+                version
+            }
+        };
+        WatchEntry {
+            db,
+            key: key.to_vec().into_boxed_slice(),
+            version,
+            present_at_watch: present,
+        }
+    }
+
+    /// Whether `entry`'s key has been modified since the snapshot (the EXEC dirty-CAS
+    /// check, PR-10b). Dirty iff the slot's CURRENT version differs from
+    /// `entry.version`, OR the current present/absent status differs from
+    /// `entry.present_at_watch`.
+    ///
+    /// The present/absent check runs the lazy backstop, so a watched key whose deadline
+    /// passed between WATCH and EXEC reads as absent here -> dirty if it was present at
+    /// watch (and that reap also bumped the version, so the version check would catch it
+    /// too; both signals agree). A watched-absent key that a write created reads present
+    /// -> dirty. If the slot is gone (e.g. all other watchers unwatched and the key was
+    /// never written), only the present/absent comparison remains, which is correct: an
+    /// untouched key has the same present/absent status it had at watch.
+    fn watch_is_dirty(&mut self, entry: &WatchEntry, now: UnixMillis) -> bool {
+        let db_idx = self.db_index(entry.db);
+        let present_now = self.expire_if_due(entry.db, db_idx, &entry.key, now);
+        if present_now != entry.present_at_watch {
+            return true;
+        }
+        let probe = (entry.db, entry.key.clone());
+        match self.watch_versions.get(&probe) {
+            // A live slot: dirty iff its version moved past the snapshot.
+            Some(slot) => slot.version != entry.version,
+            // No slot (the key was never written while watched and other watchers left):
+            // the version cannot have moved, so cleanliness rests on the present/absent
+            // check above (already equal here), so it is clean.
+            None => false,
+        }
+    }
+
+    /// Deregister `entries` (PR-10b): per entry decrement the slot's watcher count and
+    /// the `watched_count` flag, removing the slot when the last watcher leaves so the
+    /// store carries no watch state for an unwatched key (and the fast path returns to a
+    /// single integer check once every connection has unwatched).
+    fn unwatch(&mut self, entries: &[WatchEntry]) {
+        for entry in entries {
+            let probe = (entry.db, entry.key.clone());
+            if let Entry::Occupied(mut e) = self.watch_versions.entry(probe) {
+                let slot = e.get_mut();
+                slot.watchers = slot.watchers.saturating_sub(1);
+                // Each entry corresponds to exactly one watcher increment from
+                // `watch_snapshot`, so decrement the fast-path flag in lockstep.
+                self.watched_count = self.watched_count.saturating_sub(1);
+                if slot.watchers == 0 {
+                    e.remove();
+                }
+            }
         }
     }
 }
@@ -1203,6 +1448,29 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// accumulator on the concrete store.
     pub fn take_lazy_expired(&mut self) -> u64 {
         std::mem::take(&mut self.lazy_expired)
+    }
+
+    /// The number of `(db, key)` WATCH slots the store currently tracks (== the
+    /// fast-path `watched_count` flag, PR-10b). Zero when no connection is watching
+    /// anything, in which case the write-funnel notify ([`Self::touch_watch`]) does a
+    /// single integer check and returns with NO hash probe. Test/introspection helper:
+    /// the HOT-PATH test asserts this stays `0` for a connection that never WATCHes, so
+    /// the funnel notify provably does no work on the non-watching path. Not a waist
+    /// method.
+    #[must_use]
+    pub fn watched_count(&self) -> usize {
+        self.watched_count
+    }
+
+    /// The current per-shard WATCH version clock (the deterministic u64 COUNTER, PR-10b).
+    /// It is bumped ONLY when a watched key is touched by the write funnel; a write while
+    /// NOTHING is watched leaves it unchanged (the funnel fast path returns before the
+    /// bump). Test/introspection helper: the HOT-PATH test asserts it does not advance
+    /// across writes when `watched_count == 0`, proving the notify reads no clock/RNG and
+    /// does no per-key work on the non-watching path. Not a waist method.
+    #[must_use]
+    pub fn version_clock(&self) -> u64 {
+        self.version_clock
     }
 
     /// Insert a fully-formed [`KvObj`] under `db`, bypassing the string-only

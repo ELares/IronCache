@@ -399,6 +399,20 @@ async fn serve_connection(
         }
     }
 
+    // Connection close: deregister this connection's WATCHes from the shard store
+    // (TRANSACTIONS.md, PR-10b). `ConnState` holds the watch SNAPSHOTS but not the store
+    // handle (the store carries the per-key watcher counts), so the deregistration is
+    // done explicitly here in the serve loop before `conn` drops. This is the only exit
+    // that bypasses the dispatch arms (which deregister on EXEC/DISCARD/UNWATCH/RESET), so
+    // it prevents a watch from lingering in the store after a client disconnects mid-WATCH
+    // (a QUIT, an error close, or the peer closing the socket all land here). A no-op when
+    // the connection has no active watch set. Borrow the store separately from the state
+    // counter borrow below (distinct RefCells, no alias).
+    if !conn.watch.is_empty() {
+        use ironcache_storage::Watch;
+        store_rc.borrow_mut().unwatch(&conn.watch);
+        conn.clear_watch();
+    }
     state_rc.borrow_mut().counters.on_connection_close();
 }
 
