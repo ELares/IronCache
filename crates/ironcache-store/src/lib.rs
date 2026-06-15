@@ -396,17 +396,19 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             kvobj::ValueRepr::Raw(b) => {
                 ValueRef::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
-            // A LIST/HASH is not byte-readable as a string: the command layer only reads
-            // its data_type / encoding from the view (GET checks String; OBJECT
-            // ENCODING reads the encoding, e.g. listpack/quicklist/hashtable). The bytes
-            // are empty so a misrouted as_bytes() yields nothing rather than leaking a
-            // representation.
-            kvobj::ValueRepr::List(_) | kvobj::ValueRepr::Hash(_) => ValueRef::borrowed(
-                obj.header.data_type,
-                obj.header.encoding,
-                obj.expire_at,
-                &[],
-            ),
+            // A LIST/HASH/SET is not byte-readable as a string: the command layer only
+            // reads its data_type / encoding from the view (GET checks String; OBJECT
+            // ENCODING reads the encoding, e.g. listpack/quicklist/hashtable/intset). The
+            // bytes are empty so a misrouted as_bytes() yields nothing rather than leaking
+            // a representation.
+            kvobj::ValueRepr::List(_) | kvobj::ValueRepr::Hash(_) | kvobj::ValueRepr::Set(_) => {
+                ValueRef::borrowed(
+                    obj.header.data_type,
+                    obj.header.encoding,
+                    obj.expire_at,
+                    &[],
+                )
+            }
         }
     }
 
@@ -429,16 +431,18 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             kvobj::ValueRepr::Raw(b) => {
                 OccupiedEntry::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
-            // A LIST/HASH observed through the READ-ONLY rmw arm (e.g. a numeric RMW that
-            // hits a collection key) exposes empty bytes; the closure sees the collection
-            // data_type and returns WRONGTYPE. In-place collection edits use the MUTABLE
-            // arm (`rmw_mut` -> OccupiedEntryMut), not this read-only handle.
-            kvobj::ValueRepr::List(_) | kvobj::ValueRepr::Hash(_) => OccupiedEntry::borrowed(
-                obj.header.data_type,
-                obj.header.encoding,
-                obj.expire_at,
-                &[],
-            ),
+            // A LIST/HASH/SET observed through the READ-ONLY rmw arm (e.g. a numeric RMW
+            // that hits a collection key) exposes empty bytes; the closure sees the
+            // collection data_type and returns WRONGTYPE. In-place collection edits use the
+            // MUTABLE arm (`rmw_mut` -> OccupiedEntryMut), not this read-only handle.
+            kvobj::ValueRepr::List(_) | kvobj::ValueRepr::Hash(_) | kvobj::ValueRepr::Set(_) => {
+                OccupiedEntry::borrowed(
+                    obj.header.data_type,
+                    obj.header.encoding,
+                    obj.expire_at,
+                    &[],
+                )
+            }
         }
     }
 }
@@ -621,6 +625,9 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                 }
                 kvobj::ValueRepr::Hash(h) => {
                     RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, h))
+                }
+                kvobj::ValueRepr::Set(s) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, s))
                 }
                 kvobj::ValueRepr::Int(_)
                 | kvobj::ValueRepr::Inline(_)

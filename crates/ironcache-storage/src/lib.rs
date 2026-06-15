@@ -338,6 +338,12 @@ pub enum NewValueOwned {
     /// create case only; SUBSEQUENT edits go through the in-place [`RmwAction::Mutated`]
     /// path, not a rebuild.
     Hash(Vec<(Vec<u8>, Vec<u8>)>),
+    /// A new SET value (PR-7 create-on-missing path: SADD/SMOVE-into-dst/*STORE on a
+    /// vacant key). The members are in insertion order (deduplicated by the store as it
+    /// builds the concrete set value, applying the intset/listpack/hashtable ladder). As
+    /// with [`NewValueOwned::List`]/[`NewValueOwned::Hash`], this is the create case only;
+    /// SUBSEQUENT edits go through the in-place [`RmwAction::Mutated`] path, not a rebuild.
+    Set(Vec<Vec<u8>>),
 }
 
 impl NewValueOwned {
@@ -357,6 +363,13 @@ impl NewValueOwned {
     #[must_use]
     pub fn hash(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
         NewValueOwned::Hash(pairs)
+    }
+
+    /// Convenience constructor for a new SET value from members in insertion order
+    /// (the store deduplicates and applies the encoding ladder as it builds the value).
+    #[must_use]
+    pub fn set(members: Vec<Vec<u8>>) -> Self {
+        NewValueOwned::Set(members)
     }
 }
 
@@ -620,6 +633,67 @@ pub trait HashValue {
     }
 }
 
+/// The abstract SET mutation + read vocabulary the command layer calls through the
+/// in-place-mutation arm (PR-7, COLLECTIONS.md, COMMANDS.md set semantics). The
+/// concrete set value (`ironcache_store::kvobj::SetVal`) implements it; the command
+/// layer names ONLY this trait, never the concrete set representation, so the
+/// intset -> listpack -> hashtable ladder can change without reopening the command
+/// layer. This is the SET analog of [`ListValue`]/[`HashValue`], added ADDITIVELY in
+/// PR-7 (same shape, same `dyn` indirection off the string hot path).
+///
+/// The method set is designed to cover ALL the set commands: SADD
+/// ([`add`](SetValue::add)), SREM ([`remove`](SetValue::remove)), SISMEMBER/SMISMEMBER
+/// ([`contains`](SetValue::contains)), SCARD ([`len`](SetValue::len)), SMEMBERS /
+/// SINTER / SUNION / SDIFF / SSCAN ([`members`](SetValue::members) snapshot), SPOP /
+/// SRANDMEMBER (the caller indexes [`members`](SetValue::members) with Env-drawn
+/// indices, then SPOP calls [`remove`](SetValue::remove) on the chosen members), and
+/// SSCAN small-collection behavior ([`is_listpack`](SetValue::is_listpack)).
+///
+/// A set value is NEVER stored empty: when the last member is removed the store deletes
+/// the key (the empty-collection-deletes-key backstop), so an empty set is never
+/// observable, matching Redis.
+pub trait SetValue {
+    /// Add `member` (SADD). Returns `true` if the member was NEW (the set grew),
+    /// `false` if it was already present (no change).
+    fn add(&mut self, member: &[u8]) -> bool;
+
+    /// Remove `member` (SREM). Returns `true` if it existed and was removed.
+    fn remove(&mut self, member: &[u8]) -> bool;
+
+    /// Whether `member` is present (SISMEMBER / SMISMEMBER).
+    fn contains(&self, member: &[u8]) -> bool;
+
+    /// The member count (SCARD).
+    fn len(&self) -> usize;
+
+    /// Whether the set holds no members. (A set value should never be stored empty --
+    /// the store removes the key when an edit empties it -- but the predicate is part
+    /// of the vocabulary so the store can detect the empty case.)
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// All members (SMEMBERS / SSCAN / SINTER / SUNION / SDIFF / SPOP / SRANDMEMBER), in
+    /// the set's iteration order. The order is STABLE for a given representation (the
+    /// intset form is ascending-integer order; the listpack form is insertion order; the
+    /// hashtable form is sorted by the fixed-seed stable member hash so the order is
+    /// deterministic across a resize, the same resize-invariant order SCAN uses,
+    /// ADR-0003). The store and command layer rely on this stability for deterministic
+    /// SPOP/SRANDMEMBER/SSCAN. (Named `members` rather than `iter` because it returns an
+    /// OWNED snapshot Vec, not an `Iterator`.)
+    fn members(&self) -> Vec<Vec<u8>>;
+
+    /// Whether the set is in a SMALL encoding (`intset` or `listpack`) vs the large
+    /// `hashtable` encoding. SSCAN uses this to match Redis's small-collection behavior:
+    /// a small (intset/listpack) set is returned in ONE reply with cursor 0 (COUNT
+    /// ignored), while a hashtable-encoded set paginates by COUNT (KEYSPACE.md + Redis
+    /// small-collection SCAN). Default `true` is the conservative small-collection answer
+    /// (return all at once) for any implementor that has not specialized it.
+    fn is_listpack(&self) -> bool {
+        true
+    }
+}
+
 /// A MUTABLE observation of an occupied entry inside a [`Store::rmw_mut`] closure
 /// (the collection in-place-mutation arm, PR-5). It exposes the same read accessors
 /// as [`OccupiedEntry`] PLUS typed mutable views of the stored collection.
@@ -631,10 +705,11 @@ pub trait HashValue {
 /// ([`Self::as_list_mut`] on a non-list) returns `None`, and the handler returns
 /// WRONGTYPE + [`RmwAction::Keep`] with no edit.
 ///
-/// The `as_set_mut`/`as_zset_mut` accessors are RESERVED for PR-7/8: they are added
-/// additively (alongside the `SetValue`/`ZSetValue` traits, which are NOT defined yet)
-/// without changing this struct's existing surface. PR-6 adds the `as_hash_mut`
-/// accessor + the [`ValueMut::Hash`] arm + the [`HashValue`] trait exactly that way.
+/// The `as_zset_mut` accessor is RESERVED for PR-8: it is added additively (alongside
+/// the `ZSetValue` trait, which is NOT defined yet) without changing this struct's
+/// existing surface. PR-6 added the `as_hash_mut` accessor (with the [`ValueMut::Hash`]
+/// arm and the [`HashValue`] trait) that way; PR-7 adds [`Self::as_set_mut`] (with the
+/// [`ValueMut::Set`] arm and the [`SetValue`] trait) the same way.
 pub struct OccupiedEntryMut<'a> {
     data_type: DataType,
     encoding: Encoding,
@@ -647,9 +722,10 @@ pub struct OccupiedEntryMut<'a> {
 /// The typed mutable value view behind an [`OccupiedEntryMut`]. PR-5 has the list
 /// arm and a `NonCollection` arm (a string/int/embstr/raw value, for which the
 /// typed collection accessors all return `None` -> WRONGTYPE). PR-6 adds the [`Hash`]
-/// arm; the set/zset arms are added additively in PR-7/8.
+/// arm; PR-7 adds the [`Set`] arm; the zset arm is added additively in PR-8.
 ///
 /// [`Hash`]: ValueMut::Hash
+/// [`Set`]: ValueMut::Set
 pub enum ValueMut<'a> {
     /// A non-collection value (string family). No typed collection view applies; the
     /// `as_*_mut` accessors all return `None` so the handler returns WRONGTYPE.
@@ -659,6 +735,9 @@ pub enum ValueMut<'a> {
     /// A hash value, borrowed mutably for the closure (HSET/HDEL/HINCRBY/... edits,
     /// PR-6). The HASH analog of the [`ValueMut::List`] arm.
     Hash(&'a mut dyn HashValue),
+    /// A set value, borrowed mutably for the closure (SADD/SREM/SPOP/... edits, PR-7).
+    /// The SET analog of the [`ValueMut::List`]/[`ValueMut::Hash`] arms.
+    Set(&'a mut dyn SetValue),
 }
 
 impl<'a> OccupiedEntryMut<'a> {
@@ -691,6 +770,22 @@ impl<'a> OccupiedEntryMut<'a> {
             encoding,
             expire_at,
             value: ValueMut::Hash(hash),
+        }
+    }
+
+    /// Construct a mutable view over a SET value (PR-7: the store hands this out when
+    /// the stored value is a set). The SET analog of [`Self::list`]/[`Self::hash`].
+    #[must_use]
+    pub fn set(
+        encoding: Encoding,
+        expire_at: Option<UnixMillis>,
+        set: &'a mut dyn SetValue,
+    ) -> Self {
+        OccupiedEntryMut {
+            data_type: DataType::Set,
+            encoding,
+            expire_at,
+            value: ValueMut::Set(set),
         }
     }
 
@@ -736,7 +831,7 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_list_mut(&mut self) -> Option<&mut dyn ListValue> {
         match &mut self.value {
             ValueMut::List(l) => Some(&mut **l),
-            ValueMut::NonCollection | ValueMut::Hash(_) => None,
+            ValueMut::NonCollection | ValueMut::Hash(_) | ValueMut::Set(_) => None,
         }
     }
 
@@ -746,7 +841,17 @@ impl<'a> OccupiedEntryMut<'a> {
     pub fn as_hash_mut(&mut self) -> Option<&mut dyn HashValue> {
         match &mut self.value {
             ValueMut::Hash(h) => Some(&mut **h),
-            ValueMut::NonCollection | ValueMut::List(_) => None,
+            ValueMut::NonCollection | ValueMut::List(_) | ValueMut::Set(_) => None,
+        }
+    }
+
+    /// The typed mutable SET view, or `None` if the stored value is not a set (the
+    /// handler returns WRONGTYPE + [`RmwAction::Keep`] on `None`). PR-7's set commands
+    /// edit through this. The SET analog of [`Self::as_list_mut`]/[`Self::as_hash_mut`].
+    pub fn as_set_mut(&mut self) -> Option<&mut dyn SetValue> {
+        match &mut self.value {
+            ValueMut::Set(s) => Some(&mut **s),
+            ValueMut::NonCollection | ValueMut::List(_) | ValueMut::Hash(_) => None,
         }
     }
 }

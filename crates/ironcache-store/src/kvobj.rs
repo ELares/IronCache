@@ -28,11 +28,15 @@ use crate::encoding::{Classified, EMBSTR_THRESHOLD, classify};
 use crate::scan_hash;
 use bytes::Bytes;
 use hashbrown::HashMap;
+use hashbrown::HashSet;
 use ironcache_config::{
     DEFAULT_HASH_MAX_LISTPACK_ENTRIES, DEFAULT_HASH_MAX_LISTPACK_VALUE,
-    DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES,
+    DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES, DEFAULT_SET_MAX_INTSET_ENTRIES,
+    DEFAULT_SET_MAX_LISTPACK_ENTRIES, DEFAULT_SET_MAX_LISTPACK_VALUE,
 };
-use ironcache_storage::{DataType, Encoding, HashValue, ListValue, NewValueOwned, UnixMillis};
+use ironcache_storage::{
+    DataType, Encoding, HashValue, ListValue, NewValueOwned, SetValue, UnixMillis,
+};
 use std::collections::VecDeque;
 
 /// The inline-value buffer capacity (embstr). Matches [`EMBSTR_THRESHOLD`]; a
@@ -146,6 +150,11 @@ pub enum ValueRepr {
     /// once over the entry-count OR per-element-byte threshold (a pure function of the
     /// active repr, #40).
     Hash(HashVal),
+    /// A SET value (PR-7). `OBJECT ENCODING` -> `intset` while all-integer and small,
+    /// `listpack` once a non-integer member is added (and still small), `hashtable` once
+    /// over the entry-count OR per-member-byte threshold (a pure function of the active
+    /// repr, #40). The conversion is ONE-WAY (never demotes).
+    Set(SetVal),
 }
 
 impl ValueRepr {
@@ -159,6 +168,7 @@ impl ValueRepr {
             ValueRepr::Raw(_) => Encoding::Raw,
             ValueRepr::List(l) => l.encoding(),
             ValueRepr::Hash(h) => h.encoding(),
+            ValueRepr::Set(s) => s.encoding(),
         }
     }
 
@@ -174,6 +184,7 @@ impl ValueRepr {
             ValueRepr::Raw(b) => b.len(),
             ValueRepr::List(l) => l.element_bytes(),
             ValueRepr::Hash(h) => h.element_bytes(),
+            ValueRepr::Set(s) => s.element_bytes(),
         }
     }
 }
@@ -707,6 +718,365 @@ impl HashValue for HashVal {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SetVal: the PR-7 set value (COLLECTIONS.md, ENCODINGS.md, OBJECT_ENCODING_
+// MAPPING.md #40, the intset analog). The SET analog of `ListVal`/`HashVal`, with the
+// three-rung Redis encoding ladder:
+//
+//   1. `intset`    -- an ALL-INTEGER set, stored as a SORTED `Vec<i64>` with
+//                     binary-search membership (mirroring Redis's intset
+//                     [redis-intset-layout]). Reports `Encoding::IntSet`.
+//   2. `listpack`  -- a small MIXED-member set (or an all-integer set that took a
+//                     non-integer member), stored as a `Vec<Box<[u8]>>` of raw member
+//                     bytes with linear scan. Reports `Encoding::ListPack`.
+//   3. `hashtable` -- a large set, stored as a `hashbrown::HashSet<Box<[u8]>>`. Reports
+//                     `Encoding::HashTable`.
+//
+// ## The conversion ladder (#40, [redis-set-encodings-thresholds]) and its one-way ratchet
+//
+// Verified against Redis 7.4 src/t_set.c setTypeMaybeConvert / intsetUpgradeAndAdd and the
+// pinned claims [redis-set-encoding-defaults] / [redis-set-encodings-thresholds]:
+//
+//   - An all-integer set with count <= set-max-intset-entries (512) is `intset`.
+//   - Adding a NON-integer member, OR exceeding set-max-intset-entries, triggers a
+//     conversion: the set becomes `listpack` IFF the resulting member count is <=
+//     set-max-listpack-entries (128) AND every member byte length is <=
+//     set-max-listpack-value (64); otherwise it becomes `hashtable`. (Because 512 > 128,
+//     an integer set that exceeds 512 entries goes STRAIGHT to `hashtable`: it cannot fit
+//     the 128-member listpack.)
+//   - A `listpack` set that then grows past 128 members OR takes a member longer than 64
+//     bytes converts to `hashtable`.
+//
+// Conversions are ONE-WAY: a set that grew to `listpack` or `hashtable` STAYS there even
+// if later shrunk (Redis never demotes), so `OBJECT ENCODING` is a pure function of the
+// ACTIVE repr and the active form only ratchets up. A set that started `intset` and only
+// ever held integers stays `intset` (the count check fires on growth, never demotes on
+// removal).
+//
+// ## Iteration order (SMEMBERS/SPOP/SRANDMEMBER/SSCAN determinism, ADR-0003)
+//
+// The intset form is in ascending-integer order (a sorted Vec); the listpack form is in
+// insertion order (a Vec). The hashtable form's `hashbrown::HashSet` iteration order
+// varies run-to-run, which would break deterministic SPOP/SRANDMEMBER/SSCAN. So
+// `members()` SORTS the hashtable form by the fixed-seed stable member hash (`scan_hash`,
+// the same resize-invariant order the keyspace SCAN uses), giving a deterministic,
+// resize-invariant order. The intset/listpack forms are already deterministic.
+// ---------------------------------------------------------------------------
+
+/// A SET value (PR-7). The three Redis set encodings with a one-way intset -> listpack
+/// -> hashtable ladder (see the module comment). A running member-byte total is NOT kept
+/// (unlike `ListVal`): `element_bytes` is recomputed on demand, which is fine because the
+/// store measures the accounting delta around each in-place edit and the set sizes are
+/// bounded to the listpack thresholds before promotion. The reported encoding is a pure
+/// function of the active form.
+#[derive(Debug, Clone)]
+pub enum SetVal {
+    /// The all-integer `intset` form: a SORTED `Vec<i64>`, binary-search membership.
+    /// Reports [`Encoding::IntSet`].
+    IntSet(Vec<i64>),
+    /// The small mixed-member `listpack` form: raw member bytes in insertion order,
+    /// linear-scanned. Reports [`Encoding::ListPack`].
+    ListPack(Vec<Box<[u8]>>),
+    /// The large `hashtable` form: a `hashbrown::HashSet`. Reports [`Encoding::HashTable`].
+    /// One-way: a set never converts back to a smaller form (Redis parity).
+    HashTable(HashSet<Box<[u8]>>),
+}
+
+impl Default for SetVal {
+    fn default() -> Self {
+        SetVal::new()
+    }
+}
+
+impl SetVal {
+    /// An empty set (the create-on-missing seed before the first member), in the small
+    /// `intset` form (an empty set is all-integer vacuously, matching Redis's
+    /// `intsetNew`).
+    #[must_use]
+    pub fn new() -> Self {
+        SetVal::IntSet(Vec::new())
+    }
+
+    /// The sum of member byte lengths (the value-bytes side of accounting and the
+    /// `logical_len` for a set). For the intset form this is the sum of each integer's
+    /// DECIMAL length (the byte length it would serialize to on the wire, matching how a
+    /// member is returned to the client and how the listpack/hashtable forms store it),
+    /// so the accounting weight is continuous across the intset -> listpack conversion.
+    /// Does NOT include the key bytes (the kvobj adds those).
+    #[must_use]
+    pub fn element_bytes(&self) -> usize {
+        match self {
+            SetVal::IntSet(v) => v.iter().map(|n| int_decimal_len(*n)).sum(),
+            SetVal::ListPack(v) => v.iter().map(|m| m.len()).sum(),
+            SetVal::HashTable(m) => m.iter().map(|m| m.len()).sum(),
+        }
+    }
+
+    /// The encoding this set reports, a PURE FUNCTION of the active form (#40):
+    /// `intset` / `listpack` / `hashtable`.
+    #[must_use]
+    pub fn encoding(&self) -> Encoding {
+        match self {
+            SetVal::IntSet(_) => Encoding::IntSet,
+            SetVal::ListPack(_) => Encoding::ListPack,
+            SetVal::HashTable(_) => Encoding::HashTable,
+        }
+    }
+
+    /// Whether the set is in a SMALL form (`intset` or `listpack`) vs the large
+    /// `hashtable` form (drives SSCAN's small-collection one-shot behavior).
+    #[must_use]
+    pub fn is_small(&self) -> bool {
+        !matches!(self, SetVal::HashTable(_))
+    }
+
+    /// Parse a member as a CANONICAL i64 the way Redis decides intset membership
+    /// (`string2ll`): a member is intset-eligible iff it round-trips as a canonical
+    /// integer string (no leading zeros except "0", no "+", no whitespace), so the
+    /// decimal form of the parsed integer equals the original bytes. Returns `None` for
+    /// any non-canonical-integer member, which forces the listpack/hashtable form.
+    fn parse_canonical_int(member: &[u8]) -> Option<i64> {
+        let n = parse_set_i64(member)?;
+        // Round-trip check: a member like "007" parses as 7 but is NOT canonical, so it
+        // is NOT an intset member (Redis keeps it as a listpack member). The decimal
+        // form of the parsed integer must equal the original bytes.
+        if int_decimal_bytes(n).as_ref() == member {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
+    /// Build a set from members in insertion order (the create-on-missing path), applying
+    /// the encoding ladder. Deduplicates. All-integer + small -> intset; else the
+    /// listpack/hashtable choice per the thresholds.
+    fn from_members(members: &[Vec<u8>]) -> Self {
+        let mut set = SetVal::new();
+        for m in members {
+            set.add(m);
+        }
+        set
+    }
+
+    /// Convert the current form to `hashtable` (one-way). A no-op if already a hashtable.
+    fn convert_to_hashtable(&mut self) {
+        match self {
+            SetVal::HashTable(_) => {}
+            SetVal::IntSet(v) => {
+                let mut m: HashSet<Box<[u8]>> = HashSet::with_capacity(v.len());
+                for n in v.drain(..) {
+                    m.insert(int_decimal_bytes(n).as_ref().to_vec().into_boxed_slice());
+                }
+                *self = SetVal::HashTable(m);
+            }
+            SetVal::ListPack(v) => {
+                let mut m: HashSet<Box<[u8]>> = HashSet::with_capacity(v.len());
+                for member in v.drain(..) {
+                    m.insert(member);
+                }
+                *self = SetVal::HashTable(m);
+            }
+        }
+    }
+
+    /// Convert the current form to `listpack` (one-way relative to intset; never called
+    /// on a hashtable). Used when an all-integer intset takes a non-integer member while
+    /// still small enough to be a listpack.
+    fn convert_intset_to_listpack(&mut self) {
+        if let SetVal::IntSet(v) = self {
+            let listpack: Vec<Box<[u8]>> = v
+                .drain(..)
+                .map(|n| int_decimal_bytes(n).as_ref().to_vec().into_boxed_slice())
+                .collect();
+            *self = SetVal::ListPack(listpack);
+        }
+    }
+
+    /// Whether a listpack/intset-derived set of `entries` members where the LARGEST
+    /// member byte length is `max_member_len` must convert to `hashtable` (the #40
+    /// listpack thresholds): convert once `entries > set-max-listpack-entries` (128) OR
+    /// any member byte length exceeds `set-max-listpack-value` (64).
+    fn listpack_overflows(entries: usize, max_member_len: usize) -> bool {
+        entries > DEFAULT_SET_MAX_LISTPACK_ENTRIES
+            || max_member_len > DEFAULT_SET_MAX_LISTPACK_VALUE
+    }
+
+    /// Add a member to the intset form, applying the intset thresholds. Returns whether
+    /// the member was new. The caller guarantees `self` is the intset form and `n` is the
+    /// canonical integer for `member`.
+    fn add_int(&mut self, n: i64, member: &[u8]) -> bool {
+        let SetVal::IntSet(v) = self else {
+            unreachable!("add_int called on a non-intset form");
+        };
+        match v.binary_search(&n) {
+            Ok(_) => false, // already present
+            Err(pos) => {
+                v.insert(pos, n);
+                // Growth past set-max-intset-entries converts away from intset. Because
+                // 512 > 128 (the listpack entry cap), an integer set that exceeds 512
+                // members cannot fit a listpack and goes straight to hashtable. We re-use
+                // the listpack-overflow check after a tentative listpack conversion: if
+                // it would overflow the listpack, go hashtable instead.
+                if v.len() > DEFAULT_SET_MAX_INTSET_ENTRIES {
+                    let entries = v.len();
+                    // The largest integer member's decimal length (<= 20 < 64), so the
+                    // per-member byte cap never fires for integers; only the entry count
+                    // matters. 513 > 128 always, so this always promotes to hashtable.
+                    if SetVal::listpack_overflows(entries, member.len()) {
+                        self.convert_to_hashtable();
+                    } else {
+                        self.convert_intset_to_listpack();
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+impl SetValue for SetVal {
+    fn add(&mut self, member: &[u8]) -> bool {
+        match self {
+            SetVal::IntSet(_) => {
+                if let Some(n) = SetVal::parse_canonical_int(member) {
+                    self.add_int(n, member)
+                } else {
+                    // A non-integer member leaves intset: convert to listpack (or
+                    // hashtable if the resulting set would overflow the listpack), then
+                    // add the member.
+                    self.convert_intset_to_listpack();
+                    self.add(member)
+                }
+            }
+            SetVal::ListPack(v) => {
+                if v.iter().any(|m| m.as_ref() == member) {
+                    return false;
+                }
+                v.push(member.to_vec().into_boxed_slice());
+                // Re-check the listpack thresholds after the insert.
+                if SetVal::listpack_overflows(v.len(), member.len()) {
+                    self.convert_to_hashtable();
+                }
+                true
+            }
+            SetVal::HashTable(m) => m.insert(member.to_vec().into_boxed_slice()),
+        }
+    }
+
+    fn remove(&mut self, member: &[u8]) -> bool {
+        match self {
+            SetVal::IntSet(v) => {
+                let Some(n) = SetVal::parse_canonical_int(member) else {
+                    return false;
+                };
+                match v.binary_search(&n) {
+                    Ok(pos) => {
+                        v.remove(pos);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            // One-way ratchet: a listpack/hashtable set stays in its form as it shrinks
+            // (Redis parity), so we do NOT demote on removal.
+            SetVal::ListPack(v) => {
+                if let Some(pos) = v.iter().position(|m| m.as_ref() == member) {
+                    v.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            }
+            SetVal::HashTable(m) => m.remove(member),
+        }
+    }
+
+    fn contains(&self, member: &[u8]) -> bool {
+        match self {
+            SetVal::IntSet(v) => {
+                SetVal::parse_canonical_int(member).is_some_and(|n| v.binary_search(&n).is_ok())
+            }
+            SetVal::ListPack(v) => v.iter().any(|m| m.as_ref() == member),
+            SetVal::HashTable(m) => m.contains(member),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            SetVal::IntSet(v) => v.len(),
+            SetVal::ListPack(v) => v.len(),
+            SetVal::HashTable(m) => m.len(),
+        }
+    }
+
+    fn is_listpack(&self) -> bool {
+        self.is_small()
+    }
+
+    fn members(&self) -> Vec<Vec<u8>> {
+        match self {
+            // The intset form is already in deterministic ascending-integer order; emit
+            // each integer's decimal bytes.
+            SetVal::IntSet(v) => v
+                .iter()
+                .map(|n| int_decimal_bytes(*n).as_ref().to_vec())
+                .collect(),
+            // The listpack form is in deterministic insertion order.
+            SetVal::ListPack(v) => v.iter().map(|m| m.to_vec()).collect(),
+            // The hashtable form's `hashbrown` iteration order varies run-to-run, so SORT
+            // by the fixed-seed stable member hash (then raw bytes) for a deterministic,
+            // resize-invariant order (the same order SCAN uses, ADR-0003).
+            SetVal::HashTable(m) => {
+                let mut out: Vec<Vec<u8>> = m.iter().map(|m| m.to_vec()).collect();
+                out.sort_unstable_by(|a, b| scan_hash(a).cmp(&scan_hash(b)).then_with(|| a.cmp(b)));
+                out
+            }
+        }
+    }
+}
+
+/// Parse a member as an i64 the way Redis `string2ll` (src/util.c) does for intset
+/// membership: an optional single leading `-` then ASCII digits, full i64 range,
+/// rejecting leading `+`, whitespace, and overflow. Leading-zero canonicality is checked
+/// by the round-trip in [`SetVal::parse_canonical_int`], not here. Kept local to the
+/// store (the command layer has its own `parse_i64`; this is the store-side intset
+/// classifier).
+fn parse_set_i64(arg: &[u8]) -> Option<i64> {
+    if arg.is_empty() {
+        return None;
+    }
+    let (neg, digits) = if arg[0] == b'-' {
+        (true, &arg[1..])
+    } else {
+        (false, arg)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut acc: u64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+    }
+    if neg {
+        const MIN_MAGNITUDE: u64 = (i64::MAX as u64) + 1;
+        if acc > MIN_MAGNITUDE {
+            return None;
+        }
+        if acc == MIN_MAGNITUDE {
+            return Some(i64::MIN);
+        }
+        Some(-(acc as i64))
+    } else {
+        if acc > i64::MAX as u64 {
+            return None;
+        }
+        Some(acc as i64)
+    }
+}
+
 /// Decimal byte length of an i64 (digit count plus a sign for negatives), without
 /// allocating. Used by STRLEN and accounting for int-encoded values.
 #[must_use]
@@ -842,6 +1212,13 @@ impl KvObj {
                 }
                 KvObj::from_hash(key, hash, expire_at)
             }
+            // The PR-7 create-on-missing SET path: build the set value from the members
+            // (deduped + ladder-applied by `SetVal::from_members`). Subsequent edits go
+            // through the in-place RmwAction::Mutated path, not this rebuild.
+            NewValueOwned::Set(members) => {
+                let set = SetVal::from_members(&members);
+                KvObj::from_set(key, set, expire_at)
+            }
         }
     }
 
@@ -869,6 +1246,20 @@ impl KvObj {
             header: Header::with_type(DataType::Hash, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
             value: ValueRepr::Hash(hash),
+            expire_at,
+        }
+    }
+
+    /// Build a `KvObj` holding a SET value (PR-7). The data type is [`DataType::Set`]
+    /// and the encoding is read off the set's active form ([`SetVal::encoding`]); the
+    /// store recomputes it after each in-place edit.
+    #[must_use]
+    pub fn from_set(key: &[u8], set: SetVal, expire_at: Option<UnixMillis>) -> Self {
+        let encoding = set.encoding();
+        KvObj {
+            header: Header::with_type(DataType::Set, encoding, expire_at.is_some()),
+            key: key.to_vec().into_boxed_slice(),
+            value: ValueRepr::Set(set),
             expire_at,
         }
     }
@@ -902,6 +1293,16 @@ impl KvObj {
         }
     }
 
+    /// A mutable borrow of the stored SET value, or `None` if this entry is not a set
+    /// (PR-7: the store hands this to the in-place-mutation arm; a non-set yields `None`
+    /// -> WRONGTYPE). The SET analog of [`Self::as_list_mut`]/[`Self::as_hash_mut`].
+    pub fn as_set_mut(&mut self) -> Option<&mut SetVal> {
+        match &mut self.value {
+            ValueRepr::Set(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Whether this entry holds a LIST value (PR-5).
     #[must_use]
     pub fn is_list(&self) -> bool {
@@ -914,19 +1315,28 @@ impl KvObj {
         matches!(self.value, ValueRepr::Hash(_))
     }
 
-    /// Whether this entry is a COLLECTION at all (list/hash/...; PR-5 list, PR-6 hash).
-    /// The SINGLE source of "what reprs are collections", so the store's `rmw_mut`
-    /// type-dispatch and the empty-collection check stay in sync (the PR-5 review's
-    /// consolidation ask). A non-collection (string family) is `false`.
+    /// Whether this entry holds a SET value (PR-7).
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        matches!(self.value, ValueRepr::Set(_))
+    }
+
+    /// Whether this entry is a COLLECTION at all (list/hash/set/...; PR-5 list, PR-6 hash,
+    /// PR-7 set). The SINGLE source of "what reprs are collections", so the store's
+    /// `rmw_mut` type-dispatch and the empty-collection check stay in sync (the PR-5
+    /// review's consolidation ask). A non-collection (string family) is `false`.
     ///
-    /// PR-7/8 NOTE: when the set/zset reprs land, add their arms to the THREE collection
-    /// sites that share this enum -- [`Self::collection_len`] (which backs
+    /// PR-8 NOTE: when the zset repr lands, add its arm to the THREE collection sites that
+    /// share this enum -- [`Self::collection_len`] (which backs
     /// [`Self::is_empty_collection`]), the `rmw_mut` type-dispatch in `lib.rs`
     /// ([`crate::ShardStore`] selecting `as_*_mut`), and (if a read view is needed) the
     /// store's `view_of`/`occupied_of` collection arms -- IN LOCKSTEP.
     #[must_use]
     pub fn is_collection(&self) -> bool {
-        matches!(self.value, ValueRepr::List(_) | ValueRepr::Hash(_))
+        matches!(
+            self.value,
+            ValueRepr::List(_) | ValueRepr::Hash(_) | ValueRepr::Set(_)
+        )
     }
 
     /// The element COUNT of this entry IF it is a collection, else `None` (a
@@ -939,6 +1349,7 @@ impl KvObj {
         match &self.value {
             ValueRepr::List(l) => Some(l.len()),
             ValueRepr::Hash(h) => Some(h.len()),
+            ValueRepr::Set(s) => Some(s.len()),
             _ => None,
         }
     }
@@ -1265,6 +1676,203 @@ mod tests {
             HashVal::should_convert(2, 1, 65),
             "a 65-byte value (over the 64 cap) flips to hashtable"
         );
+    }
+
+    // -- SetVal unit tests (PR-7): the abstract set-op vocabulary + the
+    // intset->listpack->hashtable conversion ladder + accounting weight. --
+
+    #[test]
+    fn setval_intset_stays_intset_for_all_integer_members() {
+        let mut s = SetVal::new();
+        assert!(s.add(b"3"));
+        assert!(s.add(b"1"));
+        assert!(s.add(b"2"));
+        // Re-adding is a no-op.
+        assert!(!s.add(b"2"));
+        assert_eq!(s.encoding(), Encoding::IntSet);
+        assert_eq!(s.len(), 3);
+        // Members are in ASCENDING integer order (the intset sort).
+        assert_eq!(
+            s.members(),
+            vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]
+        );
+        // Binary-search membership.
+        assert!(s.contains(b"2"));
+        assert!(!s.contains(b"9"));
+        // element_bytes is the sum of each integer's DECIMAL length.
+        assert_eq!(s.element_bytes(), 3); // "1","2","3" = 1+1+1
+    }
+
+    #[test]
+    fn setval_non_canonical_int_is_not_an_intset_member() {
+        // "007" parses as 7 but is NOT canonical (leading zeros), so it leaves intset for
+        // listpack (Redis keeps it as a listpack member).
+        let mut s = SetVal::new();
+        assert!(s.add(b"7"));
+        assert_eq!(s.encoding(), Encoding::IntSet);
+        assert!(s.add(b"007"));
+        assert_eq!(
+            s.encoding(),
+            Encoding::ListPack,
+            "a non-canonical integer member converts intset -> listpack"
+        );
+        assert!(s.contains(b"7"));
+        assert!(s.contains(b"007"));
+        assert!(!s.contains(b"8"));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn setval_non_integer_member_converts_intset_to_listpack() {
+        let mut s = SetVal::new();
+        s.add(b"1");
+        s.add(b"2");
+        assert_eq!(s.encoding(), Encoding::IntSet);
+        // A non-integer member converts to listpack (still small).
+        assert!(s.add(b"hello"));
+        assert_eq!(s.encoding(), Encoding::ListPack);
+        assert_eq!(s.len(), 3);
+        // The previously-integer members are preserved as their decimal bytes.
+        let mut m = s.members();
+        m.sort();
+        assert_eq!(m, vec![b"1".to_vec(), b"2".to_vec(), b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn setval_intset_over_512_goes_straight_to_hashtable() {
+        // An all-integer set exceeding set-max-intset-entries (512) goes STRAIGHT to
+        // hashtable (512 > the 128 listpack cap, so it cannot fit a listpack).
+        let mut s = SetVal::new();
+        for i in 0..=DEFAULT_SET_MAX_INTSET_ENTRIES {
+            s.add(i.to_string().as_bytes());
+        }
+        // 513 members.
+        assert_eq!(s.len(), DEFAULT_SET_MAX_INTSET_ENTRIES + 1);
+        assert_eq!(
+            s.encoding(),
+            Encoding::HashTable,
+            "an integer set past 512 entries goes straight to hashtable (512 > 128)"
+        );
+        // Exactly 512 stays intset.
+        let mut s512 = SetVal::new();
+        for i in 0..DEFAULT_SET_MAX_INTSET_ENTRIES {
+            s512.add(i.to_string().as_bytes());
+        }
+        assert_eq!(s512.len(), DEFAULT_SET_MAX_INTSET_ENTRIES);
+        assert_eq!(
+            s512.encoding(),
+            Encoding::IntSet,
+            "exactly 512 integer entries stays intset"
+        );
+    }
+
+    #[test]
+    fn setval_listpack_over_128_entries_converts_to_hashtable() {
+        // A listpack set (a non-integer member forced it) that grows past
+        // set-max-listpack-entries (128) converts to hashtable.
+        let mut s = SetVal::new();
+        s.add(b"x"); // non-integer -> listpack
+        assert_eq!(s.encoding(), Encoding::ListPack);
+        for i in 0..DEFAULT_SET_MAX_LISTPACK_ENTRIES {
+            s.add(format!("m{i}").as_bytes());
+        }
+        assert!(s.len() > DEFAULT_SET_MAX_LISTPACK_ENTRIES);
+        assert_eq!(s.encoding(), Encoding::HashTable);
+    }
+
+    #[test]
+    fn setval_listpack_over_64_byte_member_converts_to_hashtable() {
+        // A listpack set with a member exceeding set-max-listpack-value (64 bytes)
+        // converts to hashtable, even with few members.
+        let mut s = SetVal::new();
+        s.add(b"x"); // non-integer -> listpack
+        assert_eq!(s.encoding(), Encoding::ListPack);
+        let big = vec![b'q'; DEFAULT_SET_MAX_LISTPACK_VALUE + 1];
+        s.add(&big);
+        assert_eq!(s.encoding(), Encoding::HashTable);
+        // A 64-byte member (at the cap) stays listpack.
+        let mut s2 = SetVal::new();
+        s2.add(b"y");
+        let at_cap = vec![b'q'; DEFAULT_SET_MAX_LISTPACK_VALUE];
+        s2.add(&at_cap);
+        assert_eq!(s2.encoding(), Encoding::ListPack);
+    }
+
+    #[test]
+    fn setval_conversion_is_one_way_no_demote() {
+        // Once a set is hashtable, removing members back down to a tiny size keeps it
+        // hashtable (Redis one-way ratchet).
+        let mut s = SetVal::new();
+        s.add(b"x"); // listpack
+        let big = vec![b'q'; DEFAULT_SET_MAX_LISTPACK_VALUE + 1];
+        s.add(&big); // -> hashtable
+        assert_eq!(s.encoding(), Encoding::HashTable);
+        assert!(s.remove(&big));
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            s.encoding(),
+            Encoding::HashTable,
+            "a hashtable set never demotes back to listpack/intset"
+        );
+        // Likewise an intset that converted to listpack stays listpack on shrink.
+        let mut s2 = SetVal::new();
+        s2.add(b"1");
+        s2.add(b"nonint"); // -> listpack
+        assert_eq!(s2.encoding(), Encoding::ListPack);
+        assert!(s2.remove(b"nonint"));
+        assert_eq!(
+            s2.encoding(),
+            Encoding::ListPack,
+            "a listpack set never demotes back to intset"
+        );
+    }
+
+    #[test]
+    fn setval_element_bytes_tracks_edits_across_forms() {
+        let mut s = SetVal::new();
+        s.add(b"10"); // intset, decimal len 2
+        s.add(b"200"); // intset, decimal len 3
+        assert_eq!(s.element_bytes(), 5);
+        // Convert to listpack with a non-integer member; the integer members keep their
+        // decimal byte weight (continuous across the conversion).
+        s.add(b"ab"); // +2 -> listpack
+        assert_eq!(s.element_bytes(), 7);
+        s.remove(b"200"); // -3
+        assert_eq!(s.element_bytes(), 4);
+    }
+
+    #[test]
+    fn kvobj_from_set_reports_set_type_and_encoding() {
+        let mut set = SetVal::new();
+        set.add(b"1");
+        let o = KvObj::from_set(b"k", set, None);
+        assert_eq!(o.header.data_type, DataType::Set);
+        assert_eq!(o.header.encoding, Encoding::IntSet);
+        assert!(o.is_set());
+        assert!(o.is_collection());
+        assert!(!o.is_empty_collection());
+        // accounted_bytes = key + member decimal bytes.
+        assert_eq!(o.accounted_bytes(), 1 + 1);
+    }
+
+    #[test]
+    fn kvobj_from_set_via_new_owned_dedupes_and_applies_ladder() {
+        // Create-on-missing through NewValueOwned::Set: dedupe + the ladder.
+        let o = KvObj::from_new_owned(
+            b"k",
+            NewValueOwned::set(vec![b"1".to_vec(), b"2".to_vec(), b"1".to_vec()]),
+            None,
+        );
+        assert_eq!(o.collection_len(), Some(2), "duplicate member deduped");
+        assert_eq!(o.header.encoding, Encoding::IntSet);
+        // A mixed create -> listpack.
+        let o2 = KvObj::from_new_owned(
+            b"k",
+            NewValueOwned::set(vec![b"1".to_vec(), b"x".to_vec()]),
+            None,
+        );
+        assert_eq!(o2.header.encoding, Encoding::ListPack);
+        assert_eq!(o2.collection_len(), Some(2));
     }
 
     #[test]

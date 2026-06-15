@@ -134,6 +134,23 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "hash-max-listpack-value",
             kind: SetKind::AcceptedNoOp,
         },
+        // The set intset->listpack->hashtable thresholds (PR-7, #40): the all-integer
+        // intset entry cap (512), the listpack entry cap (128), and the listpack
+        // per-member byte cap (64). Recognized + echoed for compatibility; the store
+        // reads its own resolved defaults, and a runtime change is a follow-up
+        // (CONFIG.md "accepted and echoed").
+        ParamSpec {
+            name: "set-max-intset-entries",
+            kind: SetKind::AcceptedNoOp,
+        },
+        ParamSpec {
+            name: "set-max-listpack-entries",
+            kind: SetKind::AcceptedNoOp,
+        },
+        ParamSpec {
+            name: "set-max-listpack-value",
+            kind: SetKind::AcceptedNoOp,
+        },
         // bind/port are MODIFIABLE_CONFIG in Redis (accepted at runtime), but IronCache
         // reports them restart-required as a DELIBERATE DIVERGENCE: the thread-per-core
         // boot binds the listening sockets once at startup and cannot re-bind / re-port
@@ -202,6 +219,12 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // entries, 64 bytes per element); the store reads these resolved defaults.
         "hash-max-listpack-entries" => crate::DEFAULT_HASH_MAX_LISTPACK_ENTRIES.to_string(),
         "hash-max-listpack-value" => crate::DEFAULT_HASH_MAX_LISTPACK_VALUE.to_string(),
+        // The set encoding-ladder thresholds: echo the pinned defaults (intset 512,
+        // listpack 128 entries, 64 bytes per member); the store reads these resolved
+        // defaults.
+        "set-max-intset-entries" => crate::DEFAULT_SET_MAX_INTSET_ENTRIES.to_string(),
+        "set-max-listpack-entries" => crate::DEFAULT_SET_MAX_LISTPACK_ENTRIES.to_string(),
+        "set-max-listpack-value" => crate::DEFAULT_SET_MAX_LISTPACK_VALUE.to_string(),
         // Restart-required: read the boot config (these never change at runtime).
         "bind" => boot.bind.to_string(),
         "port" => boot.port.to_string(),
@@ -354,6 +377,24 @@ mod tests {
         );
         assert!(lookup("hash-max-listpack-entries").is_some());
         assert!(lookup("hash-max-listpack-value").is_some());
+        // The set encoding-ladder thresholds echo their pinned defaults (PR-7):
+        // intset 512, listpack 128 entries, 64 bytes per member
+        // (redis-set-encodings-thresholds).
+        assert_eq!(
+            effective_value("set-max-intset-entries", &rc, &cfg).as_deref(),
+            Some("512")
+        );
+        assert_eq!(
+            effective_value("set-max-listpack-entries", &rc, &cfg).as_deref(),
+            Some("128")
+        );
+        assert_eq!(
+            effective_value("set-max-listpack-value", &rc, &cfg).as_deref(),
+            Some("64")
+        );
+        assert!(lookup("set-max-intset-entries").is_some());
+        assert!(lookup("set-max-listpack-entries").is_some());
+        assert!(lookup("set-max-listpack-value").is_some());
         // Unknown param -> None (CONFIG GET omits it).
         assert!(effective_value("bogus", &rc, &cfg).is_none());
     }
