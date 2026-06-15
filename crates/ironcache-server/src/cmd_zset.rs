@@ -27,11 +27,16 @@
 //! ## Ordering and WITHSCORES (ZSET_LARGE.md)
 //!
 //! Members order by (score ASC, member-bytes ASC for equal scores) [redis-zset-skiplist
-//! -plus-ht]. NaN scores are rejected at parse time ([`parse_score`] /
-//! [`cmd_util::parse_f64`] reject NaN); `+inf`/`-inf` are allowed. Scores reply as a bulk
-//! string formatted by [`format_human_double`] (ZSCORE/ZINCRBY) or, for the WITHSCORES
-//! nested shape, as a [`Value::Double`] inside a [`Value::Pairs`] (which nests each
-//! (member, score) pair under RESP3 and flattens to `[member, score, ...]` under RESP2).
+//! -plus-ht]. A NaN INPUT score is rejected at parse time ([`parse_score`] /
+//! [`cmd_util::parse_f64`] reject NaN); a NaN ARITHMETIC RESULT (ZINCRBY / ZADD INCR of an
+//! existing `+inf` by `-inf`) is caught in the store ([`IncrOutcome::Nan`]) and surfaced as
+//! `-ERR resulting score is not a number (NaN)` WITHOUT mutating; `+inf`/`-inf` are
+//! allowed. A SCALAR score reply (ZSCORE / ZMSCORE / ZINCRBY / ZADD INCR) is a
+//! [`Value::Double`] (RESP3 wire `,` with `inf`/`-inf`; a bulk string under RESP2), the
+//! Redis reply type for these commands. The WITHSCORES nested shape is a [`Value::Double`]
+//! inside a [`Value::Pairs`] (which nests each (member, score) pair under RESP3 and
+//! flattens to `[member, score, ...]` under RESP2). ZSCAN scores STAY bulk strings in both
+//! protocols (the SCAN family replies flat bulk arrays).
 //!
 //! ## ZRANDMEMBER determinism (ADR-0003)
 //!
@@ -62,8 +67,8 @@ use crate::cmd_util::{ascii_upper, parse_f64, parse_i64, parse_lex_bound, parse_
 use bytes::Bytes;
 use ironcache_protocol::{ErrorReply, Request, Value, format_human_double};
 use ironcache_storage::{
-    ExpireWrite, LexBound, NewValueOwned, RmwAction, RmwEntry, RmwStep, ScanCursor, ScoreBound,
-    Store, UnixMillis, ZAddFlags,
+    ExpireWrite, IncrOutcome, LexBound, NewValueOwned, RmwAction, RmwEntry, RmwStep, ScanCursor,
+    ScoreBound, Store, UnixMillis, ZAddFlags,
 };
 use std::collections::BTreeMap;
 
@@ -87,12 +92,21 @@ fn bulk(bytes: Vec<u8>) -> Value {
     Value::BulkString(Some(Bytes::from(bytes)))
 }
 
-/// A score reply as a bulk string in the Redis HUMAN spelling (ZSCORE/ZINCRBY): no
-/// trailing zeros, no scientific notation, `-0 -> 0`, `inf`/`-inf` for infinities. The
-/// same spelling INCRBYFLOAT uses (ADR-0019: a zset score is a bulk string, NOT a RESP3
-/// `,double`, for the scalar ZSCORE/ZINCRBY replies).
+/// A score reply as a bulk string in the Redis HUMAN spelling: no trailing zeros, no
+/// scientific notation, `-0 -> 0`, `inf`/`-inf` for infinities. Used ONLY for ZSCAN, whose
+/// scores stay flat bulk strings in BOTH protocols (the SCAN family replies flat bulk
+/// arrays, never a RESP3 typed double). The SCALAR score replies (ZSCORE / ZMSCORE /
+/// ZINCRBY / ZADD INCR) use [`score_double`] instead.
 fn score_bulk(score: f64) -> Value {
     bulk(format_human_double(score).into_bytes())
+}
+
+/// A SCALAR score reply as a [`Value::Double`]: the Redis reply type for ZSCORE / ZMSCORE /
+/// ZINCRBY / ZADD INCR. `Value::Double` encodes a RESP3 double (wire `,`, with `inf`/`-inf`
+/// for the infinities) and degrades to a bulk string under RESP2, so a RESP2 client still
+/// sees the human spelling while a RESP3 client gets the typed double Redis sends.
+fn score_double(score: f64) -> Value {
+    Value::Double(score)
 }
 
 /// Build the WITHSCORES reply from ordered `(member, score)` pairs: a [`Value::Pairs`] of
@@ -207,6 +221,11 @@ pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
                     if flags.xx {
                         return keep(Value::Null);
                     }
+                    // A NaN INCR delta was rejected at parse time, so the create score is
+                    // never NaN; guard defensively so a NaN is never stored.
+                    if score.is_nan() {
+                        return keep(Value::error(ErrorReply::zadd_score_is_nan()));
+                    }
                     // GT/LT on a missing member still ADD (they only gate UPDATES); NX adds.
                     return RmwStep {
                         action: RmwAction::Insert(NewValueOwned::zset(vec![(
@@ -214,7 +233,8 @@ pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
                             *score,
                         )])),
                         expire: ExpireWrite::Clear,
-                        reply: score_bulk(*score),
+                        // INCR replies the new score as a Double (RESP3 `,`; RESP2 bulk).
+                        reply: score_double(*score),
                     };
                 }
                 // Non-INCR create: apply XX (suppresses all adds -> empty, key not
@@ -223,19 +243,21 @@ pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
                 if flags.xx {
                     return keep(Value::Integer(0));
                 }
-                // Build the created set, deduping (last write wins) and counting added.
-                let mut built: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
-                for (score, member) in &pairs {
-                    built.insert(member.clone(), *score);
+                // Build the created set by feeding the pairs through the SAME sequential
+                // add()+gate logic the OccupiedMut branch uses (an empty starting zset),
+                // so a repeated member with GT/LT/NX gates identically on the create path
+                // (e.g. `ZADD k GT 2 m 1 m` -> m=2). A plain last-write-wins BTreeMap would
+                // wrongly let the later `1` overwrite the gated `2`.
+                let (created, added, changed) = resolve_create_pairs(&pairs, flags);
+                if created.is_empty() {
+                    // Every pair was gated out (e.g. all repeats failed GT/LT on members
+                    // that themselves never landed): nothing to create.
+                    return keep(Value::Integer(if ch { changed } else { added }));
                 }
-                let created: Vec<(Vec<u8>, f64)> = built.into_iter().collect();
-                let n = created.len() as i64;
                 RmwStep {
                     action: RmwAction::Insert(NewValueOwned::zset(created)),
                     expire: ExpireWrite::Clear,
-                    // Both default and CH report the count for a fresh create (all added =
-                    // all changed).
-                    reply: Value::Integer(n),
+                    reply: Value::Integer(if ch { changed } else { added }),
                 }
             }
             RmwEntry::OccupiedMut(mut o) => {
@@ -244,14 +266,21 @@ pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
                 };
                 if incr {
                     let (delta, member) = &pairs[0];
-                    let reply = match zset.incr(member, *delta, flags) {
-                        Some(new) => score_bulk(new),
-                        None => Value::Null,
-                    };
-                    return RmwStep {
-                        action: RmwAction::Mutated,
-                        expire: ExpireWrite::Unchanged,
-                        reply,
+                    // A NaN RESULT (existing +inf incremented by -inf) returns the
+                    // resulting-score-is-NaN error WITHOUT mutating (RmwAction::Keep, so the
+                    // store records no delta and the member keeps its prior score).
+                    return match zset.incr(member, *delta, flags) {
+                        IncrOutcome::Updated(new) => RmwStep {
+                            action: RmwAction::Mutated,
+                            expire: ExpireWrite::Unchanged,
+                            reply: score_double(new),
+                        },
+                        IncrOutcome::Suppressed => RmwStep {
+                            action: RmwAction::Mutated,
+                            expire: ExpireWrite::Unchanged,
+                            reply: Value::Null,
+                        },
+                        IncrOutcome::Nan => keep(Value::error(ErrorReply::zadd_score_is_nan())),
                     };
                 }
                 let mut added: i64 = 0;
@@ -276,6 +305,68 @@ pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
     })
 }
 
+/// Whether a score UPDATE from `cur` to `new` passes the GT/LT gate. Mirrors the store's
+/// private `gate_passes` so the ZADD CREATE path gates a repeated member identically to the
+/// in-place [`ZSetValue::add`] update path. GT permits the update only when `new` is
+/// strictly greater than `cur`; LT only when strictly less; with neither set it always
+/// passes. Positive comparisons (no negated partial-ord) so a non-finite score compares the
+/// IEEE way (GT vs `+inf` never updates).
+fn create_gate_passes(cur: f64, new: f64, flags: ZAddFlags) -> bool {
+    if flags.gt {
+        new > cur
+    } else if flags.lt {
+        new < cur
+    } else {
+        true
+    }
+}
+
+/// Resolve the ZADD CREATE-path `(score, member)` pairs into the `(member, score)` set to
+/// store, plus the `(added, changed)` counts, by feeding the pairs through the SAME
+/// sequential add()+gate logic [`ZSetValue::add`] applies on an empty zset. This makes a
+/// REPEATED member with GT/LT/NX gate identically on the create path: the first occurrence
+/// of a member is a new add (GT/LT do NOT gate a brand-new member), and a later occurrence
+/// is an UPDATE that NX suppresses and GT/LT gate against the running score. (A plain
+/// last-write-wins map would let a later, gated-out score win instead.) Insertion order is
+/// preserved (the store re-sorts into (score, member) order anyway). NaN was already
+/// rejected at parse time on this path, so no NaN check is needed here.
+#[allow(clippy::float_cmp)] // `score != cur` is the exact Redis CH "changed" check.
+fn resolve_create_pairs(
+    pairs: &[(f64, Vec<u8>)],
+    flags: ZAddFlags,
+) -> (Vec<(Vec<u8>, f64)>, i64, i64) {
+    // (member, current-score) in first-insertion order; a linear scan matches the small
+    // per-command pair count and keeps the order deterministic.
+    let mut built: Vec<(Vec<u8>, f64)> = Vec::with_capacity(pairs.len());
+    let mut added: i64 = 0;
+    let mut changed: i64 = 0;
+    for (score, member) in pairs {
+        match built.iter_mut().find(|(m, _)| m == member) {
+            None => {
+                // Absent: XX suppresses adding a new member; GT/LT alone still ADD (they
+                // only gate UPDATES), matching ZSetVal::add's vacant arm.
+                if flags.xx {
+                    continue;
+                }
+                built.push((member.clone(), *score));
+                added += 1;
+                changed += 1;
+            }
+            Some((_, cur)) => {
+                // Present (a repeat within this same ZADD): NX suppresses; GT/LT gate.
+                if flags.nx || !create_gate_passes(*cur, *score, flags) {
+                    continue;
+                }
+                if *score != *cur {
+                    *cur = *score;
+                    changed += 1;
+                }
+            }
+        }
+    }
+    (built, added, changed)
+}
+
 /// `ZINCRBY key increment member` -> the member's NEW score as a bulk string. Creates the
 /// zset / the member (starting from 0) on a missing key/member. WRONGTYPE on a non-zset; a
 /// bad increment is `not a valid float`.
@@ -288,23 +379,30 @@ pub fn cmd_zincrby<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
     };
     let member = req.args[3].to_vec();
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
+        // A missing key/member starts from 0; the parse already rejected a NaN delta, so the
+        // create score is never NaN. The new score replies as a Double (RESP3 `,`; RESP2 bulk).
         RmwEntry::Vacant => RmwStep {
             action: RmwAction::Insert(NewValueOwned::zset(vec![(member.clone(), delta)])),
             expire: ExpireWrite::Clear,
-            reply: score_bulk(delta),
+            reply: score_double(delta),
         },
         RmwEntry::OccupiedMut(mut o) => {
             let Some(zset) = o.as_zset_mut() else {
                 return wrong_type();
             };
-            // ZINCRBY has no NX/XX/GT/LT, so default flags: always create-or-add.
-            let new = zset
-                .incr(&member, delta, ZAddFlags::default())
-                .expect("default-flag incr never suppresses");
-            RmwStep {
-                action: RmwAction::Mutated,
-                expire: ExpireWrite::Unchanged,
-                reply: score_bulk(new),
+            // ZINCRBY has no NX/XX/GT/LT, so it never suppresses; a NaN RESULT (an existing
+            // +inf incremented by -inf) returns the resulting-score-is-NaN error WITHOUT
+            // mutating (Keep, no accounting delta, member keeps its prior score).
+            match zset.incr(&member, delta, ZAddFlags::default()) {
+                IncrOutcome::Updated(new) => RmwStep {
+                    action: RmwAction::Mutated,
+                    expire: ExpireWrite::Unchanged,
+                    reply: score_double(new),
+                },
+                IncrOutcome::Nan => keep(Value::error(ErrorReply::zadd_score_is_nan())),
+                IncrOutcome::Suppressed => {
+                    unreachable!("default-flag incr never suppresses")
+                }
             }
         }
         RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
@@ -325,7 +423,8 @@ pub fn cmd_zscore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Null),
         RmwEntry::OccupiedMut(mut o) => match o.as_zset_mut() {
-            Some(zset) => keep(zset.score(&member).map_or(Value::Null, score_bulk)),
+            // ZSCORE replies the score as a Double (RESP3 `,`; RESP2 bulk), nil if absent.
+            Some(zset) => keep(zset.score(&member).map_or(Value::Null, score_double)),
             None => wrong_type(),
         },
         RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
@@ -345,9 +444,11 @@ pub fn cmd_zmscore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         ))),
         RmwEntry::OccupiedMut(mut o) => match o.as_zset_mut() {
             Some(zset) => {
+                // ZMSCORE replies each score as a Double (RESP3 `,`; RESP2 bulk), nil if
+                // the member is absent.
                 let out: Vec<Value> = members
                     .iter()
-                    .map(|m| zset.score(m).map_or(Value::Null, score_bulk))
+                    .map(|m| zset.score(m).map_or(Value::Null, score_double))
                     .collect();
                 keep(Value::Array(Some(out)))
             }
@@ -703,15 +804,15 @@ pub fn cmd_zrange<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
     if by_score && by_lex {
         return Value::error(ErrorReply::syntax_error());
     }
+    // WITHSCORES is illegal with BYLEX (a lex range carries no scores) -> the specific
+    // Redis conflict message, NOT the generic syntax error.
     if with_scores && by_lex {
-        return Value::error(ErrorReply::syntax_error());
+        return Value::error(ErrorReply::zrange_withscores_not_with_bylex());
     }
     // LIMIT requires BYSCORE or BYLEX (Redis: "syntax error, LIMIT is only supported in
     // combination with either BYSCORE or BYLEX").
     if limit.is_some() && !(by_score || by_lex) {
-        return Value::error(ErrorReply::err(
-            "syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
-        ));
+        return Value::error(ErrorReply::zrange_limit_only_with_byscore_or_bylex());
     }
     let (lo, hi) = (&req.args[2], &req.args[3]);
     // For a REV range the client passes max first then min (ZRANGE REV BYSCORE max min),
@@ -1314,8 +1415,13 @@ pub fn cmd_zrangestore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &
         }
         i += 1;
     }
-    if (by_score && by_lex) || (limit.is_some() && !(by_score || by_lex)) {
+    // BYSCORE+BYLEX is the generic syntax error; LIMIT without BYSCORE/BYLEX is the same
+    // specific message ZRANGE uses (factored into a shared named constructor).
+    if by_score && by_lex {
         return Value::error(ErrorReply::syntax_error());
+    }
+    if limit.is_some() && !(by_score || by_lex) {
+        return Value::error(ErrorReply::zrange_limit_only_with_byscore_or_bylex());
     }
     let (lo, hi) = (&req.args[3], &req.args[4]);
     let kind = if by_score {
@@ -1451,10 +1557,16 @@ fn read_agg_source<S: Store>(
     })
 }
 
-/// Combine two scores under the aggregate function.
+/// Combine two scores under the aggregate function. SUM coerces a NaN result to 0, matching
+/// Redis (`zunionInterAggregate`: `if (isnan(*target)) *target = 0;` after each SUM step);
+/// `+inf + -inf` is the case that produces NaN. MIN/MAX never produce a NaN from finite or
+/// infinite inputs (a NaN input cannot occur: scores enter finite/infinite only).
 fn combine(agg: Aggregate, a: f64, b: f64) -> f64 {
     match agg {
-        Aggregate::Sum => a + b,
+        Aggregate::Sum => {
+            let r = a + b;
+            if r.is_nan() { 0.0 } else { r }
+        }
         Aggregate::Min => a.min(b),
         Aggregate::Max => a.max(b),
     }
@@ -1471,10 +1583,17 @@ struct AggArgs {
 
 /// Parse the `numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX] [WITHSCORES]`
 /// grammar shared by ZUNION/ZINTER/ZDIFF and their STORE forms. `allow_weights` is false
-/// for ZDIFF/ZDIFFSTORE (Redis ZDIFF has no WEIGHTS/AGGREGATE). `numkeys_at` is the arg
-/// index of `numkeys` (1 for the non-store forms, 2 for the STORE forms with a leading
-/// dest). Returns `Ok(args)` or an `Err(error_value)`.
-fn parse_agg_args(req: &Request, numkeys_at: usize, allow_weights: bool) -> Result<AggArgs, Value> {
+/// for ZDIFF/ZDIFFSTORE (Redis ZDIFF has no WEIGHTS/AGGREGATE). `allow_withscores` is false
+/// for the *STORE forms (ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE do NOT accept WITHSCORES -> a
+/// generic `-ERR syntax error`); it is true for the read ZUNION/ZINTER/ZDIFF forms.
+/// `numkeys_at` is the arg index of `numkeys` (1 for the non-store forms, 2 for the STORE
+/// forms with a leading dest). Returns `Ok(args)` or an `Err(error_value)`.
+fn parse_agg_args(
+    req: &Request,
+    numkeys_at: usize,
+    allow_weights: bool,
+    allow_withscores: bool,
+) -> Result<AggArgs, Value> {
     let Some(numkeys) = parse_i64(&req.args[numkeys_at]) else {
         return Err(Value::error(ErrorReply::not_an_integer()));
     };
@@ -1518,10 +1637,11 @@ fn parse_agg_args(req: &Request, numkeys_at: usize, allow_weights: bool) -> Resu
                 };
                 i += 2;
             }
-            b"WITHSCORES" => {
+            b"WITHSCORES" if allow_withscores => {
                 with_scores = true;
                 i += 1;
             }
+            // WITHSCORES in a *STORE context (or any unrecognized token) is a syntax error.
             _ => return Err(Value::error(ErrorReply::syntax_error())),
         }
     }
@@ -1549,8 +1669,11 @@ fn compute_agg<S: Store>(
         let w = args.weights[idx];
         let mut m: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
         for (member, score) in members {
-            // weight * score; weight*inf etc. follow IEEE (matching Redis WEIGHTS*inf).
-            m.insert(member, score * w);
+            // weight * score; weight*inf etc. follow IEEE. Redis coerces a NaN product to 0
+            // (`zunionInterAggregate`: `if (isnan(score)) score = 0;` after the WEIGHTS
+            // multiply); `0 * inf` is the case that produces NaN.
+            let p = score * w;
+            m.insert(member, if p.is_nan() { 0.0 } else { p });
         }
         sources.push(m);
     }
@@ -1609,7 +1732,8 @@ fn agg_read_generic<S: Store>(
     if req.args.len() < 3 {
         return Value::error(ErrorReply::wrong_arity(cmd_name));
     }
-    let args = match parse_agg_args(req, 1, op != AggOp::Diff) {
+    // The READ forms (ZUNION/ZINTER/ZDIFF) accept WITHSCORES.
+    let args = match parse_agg_args(req, 1, op != AggOp::Diff, true) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -1634,7 +1758,8 @@ fn agg_store_generic<S: Store>(
         return Value::error(ErrorReply::wrong_arity(cmd_name));
     }
     let dest = req.args[1].clone();
-    let args = match parse_agg_args(req, 2, op != AggOp::Diff) {
+    // The *STORE forms do NOT accept WITHSCORES (Redis -> `-ERR syntax error`).
+    let args = match parse_agg_args(req, 2, op != AggOp::Diff, false) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -1780,11 +1905,17 @@ mod tests {
         }
     }
 
+    /// The human score spelling from a scalar score reply, accepting BOTH a `Value::Double`
+    /// (ZSCORE / ZMSCORE / ZINCRBY / ZADD INCR now reply a Double, which degrades to this
+    /// same bulk spelling under RESP2) and a real bulk string (ZSCAN scores, the cursor
+    /// token). `None` for nil. The explicit RESP2/RESP3 wire shapes are asserted separately
+    /// by `scalar_score_resp2_bulk_resp3_double`.
     fn bulk_str(v: &Value) -> Option<String> {
         match v {
             Value::BulkString(Some(b)) => Some(String::from_utf8(b.to_vec()).unwrap()),
+            Value::Double(d) => Some(format_human_double(*d)),
             Value::Null => None,
-            other => panic!("expected a bulk or nil, got {other:?}"),
+            other => panic!("expected a bulk, double, or nil, got {other:?}"),
         }
     }
 
@@ -2756,6 +2887,251 @@ mod tests {
         assert_eq!(
             resp3,
             b"*2\r\n*2\r\n$1\r\na\r\n,1\r\n*2\r\n$1\r\nb\r\n,2\r\n"
+        );
+    }
+
+    // ---- Scalar score replies: RESP3 Double (`,`) vs RESP2 bulk string. ----
+
+    #[test]
+    #[allow(clippy::float_cmp)] // exact binary-representable scores; the value IS the assert.
+    fn scalar_score_resp2_bulk_resp3_double() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"3.5", b"a"]);
+        // ZSCORE: a Double value -> RESP3 `,3.5`, RESP2 bulk `$3\r\n3.5`.
+        let score = cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"a"]));
+        assert!(matches!(score, Value::Double(d) if d == 3.5));
+        assert_eq!(encode_to_vec(&score, ProtoVersion::Resp3), b",3.5\r\n");
+        assert_eq!(encode_to_vec(&score, ProtoVersion::Resp2), b"$3\r\n3.5\r\n");
+        // ZINCRBY: the new score, same Double shape.
+        let inc = cmd_zincrby(&mut s, 0, NOW, &req(&[b"ZINCRBY", b"z", b"1.5", b"a"]));
+        assert!(matches!(inc, Value::Double(d) if d == 5.0));
+        assert_eq!(encode_to_vec(&inc, ProtoVersion::Resp3), b",5\r\n");
+        assert_eq!(encode_to_vec(&inc, ProtoVersion::Resp2), b"$1\r\n5\r\n");
+        // ZADD ... INCR: also a Double.
+        let zadd_inc = zadd(&mut s, &[b"ZADD", b"z", b"INCR", b"2", b"a"]);
+        assert!(matches!(zadd_inc, Value::Double(d) if d == 7.0));
+        assert_eq!(encode_to_vec(&zadd_inc, ProtoVersion::Resp3), b",7\r\n");
+        // +inf scores encode as `,inf` (RESP3) / `$3\r\ninf` (RESP2).
+        zadd(&mut s, &[b"ZADD", b"z", b"inf", b"big"]);
+        let inf = cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"big"]));
+        assert_eq!(encode_to_vec(&inf, ProtoVersion::Resp3), b",inf\r\n");
+        assert_eq!(encode_to_vec(&inf, ProtoVersion::Resp2), b"$3\r\ninf\r\n");
+    }
+
+    #[test]
+    fn zscan_scores_stay_bulk_strings_in_both_protocols() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"3.5", b"a"]);
+        let reply = cmd_zscan(&mut s, 0, NOW, &req(&[b"ZSCAN", b"z", b"0"]));
+        let inner = match &reply {
+            Value::Array(Some(items)) => match &items[1] {
+                Value::Array(Some(v)) => v.clone(),
+                other => panic!("inner not array: {other:?}"),
+            },
+            other => panic!("ZSCAN not the 2-element reply: {other:?}"),
+        };
+        // [member, score]; the score stays a BULK STRING (NOT a Double) in BOTH protocols.
+        assert!(matches!(&inner[1], Value::BulkString(Some(_))));
+        assert_eq!(
+            encode_to_vec(&inner[1], ProtoVersion::Resp3),
+            b"$3\r\n3.5\r\n"
+        );
+        assert_eq!(
+            encode_to_vec(&inner[1], ProtoVersion::Resp2),
+            b"$3\r\n3.5\r\n"
+        );
+    }
+
+    // ---- A NaN arithmetic RESULT is rejected without mutating (ZINCRBY / ZADD INCR). ----
+
+    #[test]
+    fn zincrby_nan_result_errors_and_does_not_mutate() {
+        let mut s = test_store();
+        // ZADD k INCR inf m -> m=+inf, then ZINCRBY k -inf m -> NaN error, m UNCHANGED.
+        assert!(matches!(
+            zadd(&mut s, &[b"ZADD", b"z", b"INCR", b"inf", b"m"]),
+            Value::Double(d) if d.is_infinite() && d > 0.0
+        ));
+        assert_eq!(
+            err_line(&cmd_zincrby(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZINCRBY", b"z", b"-inf", b"m"])
+            )),
+            "-ERR resulting score is not a number (NaN)"
+        );
+        // The member is UNCHANGED at +inf (no NaN stored).
+        let score = cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"m"]));
+        assert!(matches!(score, Value::Double(d) if d.is_infinite() && d > 0.0));
+    }
+
+    #[test]
+    fn zadd_incr_nan_result_errors_and_does_not_mutate() {
+        let mut s = test_store();
+        // ZADD k INCR -inf m on a +inf member -> NaN error, m UNCHANGED at +inf.
+        zadd(&mut s, &[b"ZADD", b"z", b"inf", b"m"]);
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"z", b"INCR", b"-inf", b"m"])),
+            "-ERR resulting score is not a number (NaN)"
+        );
+        let score = cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"m"]));
+        assert!(matches!(score, Value::Double(d) if d.is_infinite() && d > 0.0));
+        // The symmetric case: a -inf member, INCR by +inf -> NaN error, unchanged.
+        zadd(&mut s, &[b"ZADD", b"z2", b"-inf", b"m"]);
+        assert_eq!(
+            err_line(&zadd(&mut s, &[b"ZADD", b"z2", b"INCR", b"inf", b"m"])),
+            "-ERR resulting score is not a number (NaN)"
+        );
+        let s2 = cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z2", b"m"]));
+        assert!(matches!(s2, Value::Double(d) if d.is_infinite() && d < 0.0));
+    }
+
+    // ---- Aggregate NaN -> 0 coercion (SUM of +inf/-inf; WEIGHTS 0 * inf). ----
+
+    #[test]
+    #[allow(clippy::float_cmp)] // exact 0.0 coercion result; the value IS the assert.
+    fn zunionstore_sum_inf_minus_inf_coerces_nan_to_zero() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"a", b"inf", b"m"]);
+        zadd(&mut s, &[b"ZADD", b"b", b"-inf", b"m"]);
+        // ZUNIONSTORE dest 2 a b AGGREGATE SUM -> m's score is 0 (NaN coerced), not NaN.
+        assert_eq!(
+            int(&cmd_zunionstore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[
+                    b"ZUNIONSTORE",
+                    b"dest",
+                    b"2",
+                    b"a",
+                    b"b",
+                    b"AGGREGATE",
+                    b"SUM"
+                ])
+            )),
+            1
+        );
+        let score = cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"dest", b"m"]));
+        assert!(matches!(score, Value::Double(d) if d == 0.0 && !d.is_nan()));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // exact 0.0 coercion result; the value IS the assert.
+    fn zunionstore_weight_zero_times_inf_coerces_nan_to_zero() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"a", b"inf", b"m"]);
+        // WEIGHTS 0 against an inf score: 0 * inf = NaN -> coerced to 0.
+        assert_eq!(
+            int(&cmd_zunionstore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZUNIONSTORE", b"dest", b"1", b"a", b"WEIGHTS", b"0"])
+            )),
+            1
+        );
+        let score = cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"dest", b"m"]));
+        assert!(matches!(score, Value::Double(d) if d == 0.0 && !d.is_nan()));
+    }
+
+    // ---- ZADD create-path duplicate-member GT/LT gates like the in-place path. ----
+
+    #[test]
+    fn zadd_create_path_gt_gates_repeated_member() {
+        let mut s = test_store();
+        // Fresh key: GT 2 m then 1 m. The first lands m=2; the repeat 1 < 2 fails the GT
+        // gate, so m stays 2 (NOT last-write-wins 1).
+        zadd(&mut s, &[b"ZADD", b"z", b"GT", b"2", b"m", b"1", b"m"]);
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z", b"m"]))),
+            Some("2".to_owned())
+        );
+        // LT mirrors: LT 1 m then 2 m -> the repeat 2 > 1 fails the LT gate, m stays 1.
+        zadd(&mut s, &[b"ZADD", b"z2", b"LT", b"1", b"m", b"2", b"m"]);
+        assert_eq!(
+            bulk_str(&cmd_zscore(&mut s, 0, NOW, &req(&[b"ZSCORE", b"z2", b"m"]))),
+            Some("1".to_owned())
+        );
+    }
+
+    // ---- *STORE rejects WITHSCORES; ZRANGE BYLEX+WITHSCORES; ZRANGESTORE LIMIT. ----
+
+    #[test]
+    fn store_aggregations_reject_withscores() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"a", b"1", b"x"]);
+        for cmd in [
+            &[b"ZUNIONSTORE".as_slice(), b"d", b"1", b"a", b"WITHSCORES"][..],
+            &[b"ZINTERSTORE".as_slice(), b"d", b"1", b"a", b"WITHSCORES"][..],
+            &[b"ZDIFFSTORE".as_slice(), b"d", b"1", b"a", b"WITHSCORES"][..],
+        ] {
+            let v = match cmd[0] {
+                b"ZUNIONSTORE" => cmd_zunionstore(&mut s, 0, NOW, &req(cmd)),
+                b"ZINTERSTORE" => cmd_zinterstore(&mut s, 0, NOW, &req(cmd)),
+                _ => cmd_zdiffstore(&mut s, 0, NOW, &req(cmd)),
+            };
+            assert_eq!(err_line(&v), "-ERR syntax error");
+        }
+        // The READ forms STILL accept WITHSCORES (sanity: not over-rejected).
+        assert!(matches!(
+            cmd_zunion(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZUNION", b"1", b"a", b"WITHSCORES"])
+            ),
+            Value::Pairs(_)
+        ));
+    }
+
+    #[test]
+    fn zrange_bylex_withscores_is_specific_syntax_error() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"0", b"a"]);
+        assert_eq!(
+            err_line(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"-", b"+", b"BYLEX", b"WITHSCORES"])
+            )),
+            "-ERR syntax error, WITHSCORES not supported in combination with BYLEX"
+        );
+    }
+
+    #[test]
+    fn zrange_and_zrangestore_limit_without_by_is_specific_syntax_error() {
+        let mut s = test_store();
+        zadd(&mut s, &[b"ZADD", b"z", b"0", b"a"]);
+        let expect = "-ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX";
+        assert_eq!(
+            err_line(&cmd_zrange(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"ZRANGE", b"z", b"0", b"-1", b"LIMIT", b"0", b"1"])
+            )),
+            expect
+        );
+        assert_eq!(
+            err_line(&cmd_zrangestore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[
+                    b"ZRANGESTORE",
+                    b"d",
+                    b"z",
+                    b"0",
+                    b"-1",
+                    b"LIMIT",
+                    b"0",
+                    b"1"
+                ])
+            )),
+            expect
         );
     }
 
