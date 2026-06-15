@@ -237,6 +237,17 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "MULTI calls can not be nested")
     }
 
+    /// `ERR WATCH inside MULTI is not allowed` - the reply Redis emits (src/multi.c
+    /// `watchCommand` -> `addReplyError(c,"WATCH inside MULTI is not allowed")`) when
+    /// WATCH is issued while the connection is ALREADY inside a transaction. Byte-exact
+    /// (the plain `ERR` token). The transaction is left OPEN and CLEAN: WATCH inside
+    /// MULTI does NOT dirty the batch (it is rejected before the queue block and does not
+    /// call flagTransaction), so a following EXEC still runs.
+    #[must_use]
+    pub fn watch_inside_multi() -> Self {
+        ErrorReply::new(ErrorCode::Err, "WATCH inside MULTI is not allowed")
+    }
+
     /// `ERR AUTH <password> called without any password configured for the
     /// default user. Are you sure your configuration is correct?` - the current
     /// canonical Redis string for `AUTH` when no `requirepass`/ACL password is
@@ -850,9 +861,17 @@ mod tests {
             ErrorReply::multi_nested().line(),
             "-ERR MULTI calls can not be nested"
         );
+        // WATCH inside MULTI (PR-10b): verified against redis/redis src/multi.c
+        // watchCommand. Plain `ERR` token; does NOT dirty the txn (the caller leaves the
+        // transaction open + clean on this error).
+        assert_eq!(
+            ErrorReply::watch_inside_multi().line(),
+            "-ERR WATCH inside MULTI is not allowed"
+        );
         assert_eq!(ErrorReply::exec_without_multi().code(), ErrorCode::Err);
         assert_eq!(ErrorReply::discard_without_multi().code(), ErrorCode::Err);
         assert_eq!(ErrorReply::multi_nested().code(), ErrorCode::Err);
+        assert_eq!(ErrorReply::watch_inside_multi().code(), ErrorCode::Err);
     }
 
     #[test]
