@@ -366,17 +366,20 @@ pub fn dispatch_with_cmd<
     //
     // WATCH (PR-10b) is SPECIAL: WATCH inside MULTI is rejected with `-ERR WATCH inside
     // MULTI is not allowed` and must NOT dirty the transaction (the txn stays open +
-    // clean, so a following EXEC still runs). So WATCH is added to the queue-gate
-    // exclusion set here (it does not queue) and its `dispatch_inner` arm returns the
-    // error when `in_multi`. UNWATCH, by contrast, is a NORMAL command inside MULTI: it
-    // QUEUES like any other (it is NOT in the exclusion set) and runs at EXEC (a no-op
-    // there, since the dirty-CAS already ran + cleared the watches at EXEC entry).
-    if state.in_multi
-        && !matches!(
-            cmd,
-            b"MULTI" | b"EXEC" | b"DISCARD" | b"RESET" | b"QUIT" | b"WATCH"
-        )
-    {
+    // clean, so a following EXEC still runs). So WATCH is in the queue-gate exclusion set
+    // (it does not queue) and its `dispatch_inner` arm returns the error when `in_multi`.
+    // UNWATCH, by contrast, is a NORMAL command inside MULTI: it QUEUES like any other (it
+    // is NOT in the exclusion set) and runs at EXEC (a no-op there, since the dirty-CAS
+    // already ran + cleared the watches at EXEC entry).
+    //
+    // The exclusion set is the `control` flag of the #89 single-source-of-truth command
+    // registry ([`command_spec::spec_of`]): the 6 control verbs (MULTI/EXEC/DISCARD/RESET/
+    // QUIT/WATCH) carry `control: true` and NOTHING else does (asserted by
+    // `command_spec::tests::control_set_is_exactly_the_six_queue_gate_verbs`), so this reads
+    // the registry instead of an inline `matches!`. An unknown command (not in the registry)
+    // is NOT control, so it correctly falls through to `queue_validate` (which rejects it
+    // with the unknown-command error and dirties the txn), exactly as before.
+    if state.in_multi && !crate::command_spec::spec_of(cmd).is_some_and(|s| s.control) {
         return match cmd_txn::queue_validate(cmd, &req.args) {
             Ok(()) => {
                 state.queued.push(req.clone());

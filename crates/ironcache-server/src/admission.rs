@@ -12,116 +12,33 @@
 //! must be able to read and free under memory pressure).
 
 /// Whether `cmd` (the UPPERCASED command token) is a `denyoom` write that the memory
-/// ceiling gates (ADMISSION.md). `true` for the string write/RMW commands that can
-/// grow memory; `false` for reads, the EXISTS/TYPE/STRLEN introspection, the
-/// memory-RELEASING `DEL`, the Tier-0 connection commands, and the EXPIRE/TTL/PERSIST
-/// family that 3b will add (those do not allocate value bytes).
+/// ceiling gates (ADMISSION.md). `true` for the write/RMW commands that can grow memory;
+/// `false` for reads, the EXISTS/TYPE/STRLEN introspection, the memory-RELEASING `DEL`,
+/// the Tier-0 connection commands, and the EXPIRE/TTL/PERSIST family (those do not
+/// allocate value bytes).
 ///
-/// This mirrors Redis's `CMD_DENYOOM` flag for the commands IronCache implements
-/// today. As collection writes (LPUSH/HSET/SADD/...) land they JOIN this set; the
-/// list is the single source of the classification so a new write cannot silently
-/// bypass the ceiling.
+/// This is now a THIN WRAPPER over the #89 single-source-of-truth command registry
+/// ([`crate::command_spec::spec_of`]): the flag is the `denyoom` field of the command's
+/// [`crate::command_spec::CommandSpec`], so the `denyoom` classification cannot drift from
+/// the arity / routing tables (which read the same registry), and a new write that is added
+/// to the registry with `denyoom: true` cannot silently bypass the ceiling. The set
+/// mirrors Redis's `CMD_DENYOOM` flag for the commands IronCache implements:
+///
+/// - String writes/RMW (SET/SETNX/GETSET/APPEND/INCR*/DECR*/SETEX/PSETEX/MSET) -- allocate
+///   a value.
+/// - RENAME/RENAMENX/COPY -- materialize a value at the destination. MOVE and SMOVE are NOT
+///   denyoom (Redis flags them write-fast: they RELOCATE rather than duplicate).
+/// - Collection writes that allocate value bytes: list (LPUSH/RPUSH/LPUSHX/RPUSHX/LSET/
+///   LINSERT/LMOVE/RPOPLPUSH), hash (HSET/HMSET/HSETNX/HINCRBY/HINCRBYFLOAT), set
+///   (SADD/SINTERSTORE/SUNIONSTORE/SDIFFSTORE), zset (ZADD/ZINCRBY/ZRANGESTORE/
+///   ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE), bitmap (SETBIT/BITOP/BITFIELD -- Redis flags the
+///   whole BITFIELD denyoom even all-GET), and HLL (PFADD/PFMERGE).
+///
+/// The memory-RELEASING writes (DEL/UNLINK/FLUSH*/LPOP/SREM/ZREM/...) and all reads are NOT
+/// gated, so a client can read and free under memory pressure.
 #[must_use]
 pub fn is_denyoom(cmd: &[u8]) -> bool {
-    matches!(
-        cmd,
-        b"SET"
-            | b"SETNX"
-            | b"GETSET"
-            | b"APPEND"
-            | b"INCR"
-            | b"DECR"
-            | b"INCRBY"
-            | b"DECRBY"
-            | b"INCRBYFLOAT"
-            // SETEX/PSETEX are denyoom writes (they allocate a value), so they are
-            // pre-classified here NOW even though their dispatch arms land in 3b. This
-            // ordering is deliberate: until 3b wires them, an over-budget SETEX/PSETEX
-            // is OOM'd by this gate BEFORE falling through to the unknown-command reply
-            // (OOM-before-unknown), matching Redis (the denyoom check precedes command
-            // lookup); the classification is the single source so the 3b arm cannot
-            // silently bypass the ceiling.
-            | b"SETEX"
-            | b"PSETEX"
-            // MSET allocates a value per key (a multi-key blind SET), so it is a
-            // `denyoom` write in Redis. MGET is a read and is NOT gated.
-            | b"MSET"
-            // RENAME/RENAMENX/COPY are `denyoom` writes in Redis (they materialize a
-            // value at the destination). MOVE is NOT denyoom (Redis flags it `write
-            // fast` without denyoom, since it relocates rather than duplicates), so it
-            // is intentionally absent. SWAPDB/FLUSHDB/FLUSHALL/TOUCH/UNLINK/SCAN/KEYS/
-            // DBSIZE/RANDOMKEY/OBJECT do not allocate value bytes, so they are not
-            // gated either (FLUSH* and UNLINK/DEL are memory-RELEASING).
-            | b"RENAME"
-            | b"RENAMENX"
-            | b"COPY"
-            // List writes that allocate value bytes (PR-5). LPUSH/RPUSH/LPUSHX/RPUSHX
-            // grow the list; LSET/LINSERT add/replace an element; LMOVE/RPOPLPUSH
-            // materialize an element at the destination. All are `denyoom` in Redis.
-            // LPOP/RPOP/LREM/LTRIM and the read commands (LLEN/LRANGE/LINDEX/LPOS) are
-            // memory-RELEASING or read-only, so they are NOT gated.
-            | b"LPUSH"
-            | b"RPUSH"
-            | b"LPUSHX"
-            | b"RPUSHX"
-            | b"LSET"
-            | b"LINSERT"
-            | b"LMOVE"
-            | b"RPOPLPUSH"
-            // Hash writes that allocate value bytes (PR-6). HSET/HMSET/HSETNX add or
-            // replace fields; HINCRBY/HINCRBYFLOAT create-on-missing and grow a field's
-            // value. All are `denyoom` in Redis. HDEL is memory-RELEASING and the hash
-            // reads (HGET/HMGET/HGETALL/HKEYS/HVALS/HLEN/HEXISTS/HSTRLEN/HRANDFIELD/HSCAN)
-            // are read-only, so they are NOT gated.
-            | b"HSET"
-            | b"HMSET"
-            | b"HSETNX"
-            | b"HINCRBY"
-            | b"HINCRBYFLOAT"
-            // Set writes that allocate value bytes (PR-7). SADD grows the set;
-            // SINTERSTORE/SUNIONSTORE/SDIFFSTORE materialize the result set at the
-            // destination. All are `denyoom` in Redis. SMOVE is NOT denyoom (Redis flags it
-            // `write fast` without denyoom, like MOVE: it RELOCATES an existing member from
-            // src to dst, materializing no new value bytes), so it is intentionally absent.
-            // SREM/SPOP are memory-RELEASING and the set reads / algebra reads
-            // (SMEMBERS/SISMEMBER/SMISMEMBER/SCARD/SRANDMEMBER/SINTER/SUNION/SDIFF/
-            // SINTERCARD/SSCAN) are read-only, so they are NOT gated.
-            | b"SADD"
-            | b"SINTERSTORE"
-            | b"SUNIONSTORE"
-            | b"SDIFFSTORE"
-            // Sorted-set writes that allocate value bytes (PR-8). ZADD/ZINCRBY grow the
-            // zset (or create-on-missing); ZRANGESTORE and ZUNIONSTORE/ZINTERSTORE/
-            // ZDIFFSTORE materialize a result zset at the destination. All are `denyoom`
-            // in Redis. ZREM/ZPOPMIN/ZPOPMAX/ZREMRANGE* are memory-RELEASING and the zset
-            // reads (ZSCORE/ZMSCORE/ZCARD/ZRANK/ZREVRANK/ZCOUNT/ZLEXCOUNT/ZRANGE*/
-            // ZRANDMEMBER/ZSCAN/ZUNION/ZINTER/ZDIFF/ZINTERCARD) are read-only, so they are
-            // NOT gated.
-            | b"ZADD"
-            | b"ZINCRBY"
-            | b"ZRANGESTORE"
-            | b"ZUNIONSTORE"
-            | b"ZINTERSTORE"
-            | b"ZDIFFSTORE"
-            // Bitmap writes that allocate value bytes (PR-9). SETBIT grows/zero-extends
-            // the backing string; BITOP materializes the result string at the
-            // destination; BITFIELD with a SET/INCRBY grows the field's backing bytes.
-            // All are `denyoom` in Redis. GETBIT/BITCOUNT/BITPOS and BITFIELD_RO are
-            // read-only (never grow), so they are NOT gated. Redis flags BITFIELD as
-            // denyoom for the whole command (even an all-GET BITFIELD), which we mirror:
-            // the rare all-GET BITFIELD being gated over budget is harmless and matches
-            // Redis's command-flag-based classification.
-            | b"SETBIT"
-            | b"BITOP"
-            | b"BITFIELD"
-            // HyperLogLog writes that allocate value bytes (PR-11). PFADD creates/updates
-            // the dense (12304-byte) backing string; PFMERGE materializes the union at
-            // the destination. Both are `denyoom` in Redis. PFCOUNT is read-only (it
-            // always recomputes the cardinality, never writing back a cache), so it is
-            // NOT gated.
-            | b"PFADD"
-            | b"PFMERGE"
-    )
+    crate::command_spec::spec_of(cmd).is_some_and(|s| s.denyoom)
 }
 
 #[cfg(test)]

@@ -64,31 +64,17 @@ pub fn owner_shard(key: &[u8], n_shards: usize) -> usize {
     usize::try_from(hash64(key) % n).expect("modulo n_shards fits usize")
 }
 
-/// How a command must be routed across shards (COORDINATOR.md #107).
-///
-/// STAGE 1 routes any KEYED command (single- or multi-key) whose keys ALL resolve to ONE
-/// shard to that shard (via [`command_keys`]); a key-SPANNING multi-key command, and the
-/// whole-keyspace commands, stay on the home shard (the documented Stage 2 gap), and
-/// [`CommandClass::AlwaysHome`] commands (no key / control / conn / txn) stay home always.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandClass {
-    /// Control / connection / transaction commands (and PING/ECHO/INFO/CONFIG/...).
-    /// These never touch a single owned key, so they ALWAYS run on the home shard.
-    AlwaysHome,
-    /// A single-key data command whose key is `args[1]` and whose handler touches only
-    /// the store/wheel/db/now/env-rng (no [`crate::ConnState`]). Routed to the owning
-    /// shard via the zero-alloc single-key fast path in the serve loop.
-    KeyedSingle,
-    /// A multi-key data command (DEL/EXISTS/SINTER/BITOP/PFCOUNT/RENAME/COPY/...). Its
-    /// keys are extracted by [`command_keys`]; if they ALL resolve to ONE shard the WHOLE
-    /// command routes there, else it stays home (the Stage 2 fan-out gap). Like
-    /// [`CommandClass::KeyedSingle`], its handler is [`crate::ConnState`]-free and runs via
-    /// the shared keyed-data arms, so it executes correctly on the owning shard.
-    KeyedMulti,
-    /// A whole-keyspace command (KEYS/SCAN/DBSIZE/FLUSHALL/FLUSHDB/RANDOMKEY). STAGE 1
-    /// keeps these home (single-shard scope, as today); a later pass fans them out.
-    WholeKeyspace,
-}
+// How a command must be routed across shards (COORDINATOR.md #107). The enum lives in the
+// #89 single-source-of-truth command registry ([`crate::command_spec`]); it is re-exported
+// here so this module's legacy `route::CommandClass` path (and every external `use
+// ironcache_server::route::CommandClass`) keeps working unchanged.
+//
+// STAGE 1 routes any KEYED command (single- or multi-key) whose keys ALL resolve to ONE
+// shard to that shard (via [`command_keys`]); a key-SPANNING multi-key command, and the
+// whole-keyspace commands, stay on the home shard (the documented Stage 2 gap), and
+// `CommandClass::AlwaysHome` commands (no key / control / conn / txn) stay home always. See
+// the variant docs in [`crate::command_spec::CommandClass`] for the per-variant semantics.
+pub use crate::command_spec::CommandClass;
 
 /// The key(s) a command operates on, extracted by [`command_keys`] for routing.
 ///
@@ -113,83 +99,21 @@ pub enum KeySpec<'a> {
 
 /// Classify the UPPERCASED command token into its [`CommandClass`].
 ///
-/// CONSERVATIVE BY DESIGN (correctness over coverage this pass): a command is
-/// [`CommandClass::KeyedSingle`] ONLY when it has been VERIFIED to (a) key on `args[1]`
-/// and (b) run a handler that touches no [`crate::ConnState`]. Anything whose single key
-/// is not at `args[1]` (e.g. `OBJECT ENCODING key`, where the key is `args[2]`), anything
-/// multi-key, anything whole-keyspace, and anything unrecognized falls into a HOME class
-/// so it keeps running on the accepting shard exactly as before this pass.
+/// This is now a THIN WRAPPER over the #89 single-source-of-truth command registry
+/// ([`crate::command_spec::spec_of`]): the class is the `class` field of the command's
+/// [`crate::command_spec::CommandSpec`]. An UNKNOWN token maps to
+/// [`CommandClass::AlwaysHome`] exactly as the legacy match's `_ =>` arm did, so a command
+/// the registry does not know stays on the accepting shard (the home handler then emits the
+/// proper unknown-command error).
 ///
-/// The [`KeyedSingle`](CommandClass::KeyedSingle) set is hand-synced with the keyed-data
-/// arms in `dispatch::dispatch_keyed_data` and audited by
+/// CONSERVATIVE BY DESIGN (preserved from the legacy table): a command is
+/// [`CommandClass::KeyedSingle`] ONLY when it keys on `args[1]` and runs a
+/// [`crate::ConnState`]-free handler. The [`KeyedSingle`](CommandClass::KeyedSingle) set is
+/// audited against the keyed-data dispatch arms by
 /// [`tests::keyed_single_commands_are_connstate_free`].
 #[must_use]
 pub fn classify(cmd_upper: &[u8]) -> CommandClass {
-    match cmd_upper {
-        // -- KeyedSingle: single-key data commands keyed on args[1], ConnState-free.
-        // Strings + numerics + APPEND (all key args[1]).
-        b"GET" | b"SET" | b"SETNX" | b"GETSET" | b"STRLEN" | b"INCR" | b"DECR" | b"INCRBY"
-        | b"DECRBY" | b"INCRBYFLOAT" | b"APPEND"
-        // SET-with-TTL helpers (key args[1]).
-        | b"SETEX" | b"PSETEX" | b"GETEX"
-        // Single-key keyspace introspection / TTL family (key args[1]).
-        | b"TYPE" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"TTL" | b"PTTL"
-        | b"EXPIRETIME" | b"PEXPIRETIME" | b"PERSIST"
-        // List (all key args[1]); LMOVE/RPOPLPUSH are MULTI-key (src+dst) -> not here.
-        | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LLEN"
-        | b"LRANGE" | b"LINDEX" | b"LSET" | b"LINSERT" | b"LREM" | b"LTRIM" | b"LPOS"
-        // Hash (all key args[1]).
-        | b"HSET" | b"HMSET" | b"HSETNX" | b"HGET" | b"HMGET" | b"HDEL" | b"HGETALL"
-        | b"HKEYS" | b"HVALS" | b"HLEN" | b"HEXISTS" | b"HSTRLEN" | b"HINCRBY"
-        | b"HINCRBYFLOAT" | b"HRANDFIELD" | b"HSCAN"
-        // Set single-key ops (key args[1]); SMOVE + the *STORE/algebra reads are MULTI-key.
-        | b"SADD" | b"SREM" | b"SMEMBERS" | b"SISMEMBER" | b"SMISMEMBER" | b"SCARD"
-        | b"SPOP" | b"SRANDMEMBER" | b"SSCAN"
-        // Sorted-set single-key ops (key args[1]); the *STORE/union/inter/diff are MULTI-key.
-        | b"ZADD" | b"ZINCRBY" | b"ZREM" | b"ZSCORE" | b"ZMSCORE" | b"ZCARD" | b"ZRANK"
-        | b"ZREVRANK" | b"ZCOUNT" | b"ZLEXCOUNT" | b"ZRANGE" | b"ZREVRANGE"
-        | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE" | b"ZRANGEBYLEX" | b"ZREVRANGEBYLEX"
-        | b"ZREMRANGEBYRANK" | b"ZREMRANGEBYSCORE" | b"ZREMRANGEBYLEX" | b"ZPOPMIN"
-        | b"ZPOPMAX" | b"ZRANDMEMBER" | b"ZSCAN"
-        // Bitmap single-key ops (key args[1]); BITOP is MULTI-key (dest + sources).
-        | b"SETBIT" | b"GETBIT" | b"BITCOUNT" | b"BITPOS" | b"BITFIELD" | b"BITFIELD_RO"
-        // HyperLogLog single-key add (key args[1]); PFCOUNT/PFMERGE are MULTI-key.
-        | b"PFADD" => CommandClass::KeyedSingle,
-
-        // -- KeyedMulti: multi-key (or non-args[1]-keyed) data commands. STAGE 1 extracts
-        // their key(s) via `command_keys` and routes the whole command to the owning shard
-        // when every key resolves to ONE shard (e.g. a single-key DEL/EXISTS/PFCOUNT, or a
-        // co-located RENAME); a key-SPANNING invocation stays home (the Stage 2 fan-out
-        // gap). All these handlers are ConnState-free (`dispatch_keyed_data` arms), so they
-        // run correctly on the owning shard. MOVE has exactly ONE key (args[1]; args[2] is
-        // the destination DB index, not a key). OBJECT's key is args[2] (the subcommand is
-        // args[1]); `command_keys` extracts args[2] so a single OBJECT routes correctly.
-        // MGET (all of args[1..] are keys) and MSET (keys at args[1], args[3], args[5],
-        // ... -- every other arg, the values interleave). Both fan out when spanning
-        // (Stage 2a); a co-located / single-key invocation routes to the one owner.
-        b"MGET" | b"MSET"
-        | b"DEL" | b"EXISTS" | b"UNLINK" | b"TOUCH"
-        | b"RENAME" | b"RENAMENX" | b"COPY" | b"MOVE"
-        | b"SMOVE" | b"SINTER" | b"SUNION" | b"SDIFF" | b"SINTERCARD"
-        | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE"
-        | b"ZUNION" | b"ZINTER" | b"ZDIFF" | b"ZINTERCARD"
-        | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"ZDIFFSTORE" | b"ZRANGESTORE"
-        | b"LMOVE" | b"RPOPLPUSH"
-        | b"BITOP" | b"PFCOUNT" | b"PFMERGE"
-        | b"OBJECT" => CommandClass::KeyedMulti,
-
-        // SWAPDB swaps two whole logical DBs by index (no key): it is a HOME-only control
-        // operation this stage (a true cross-shard SWAPDB is a later pass), so it is
-        // AlwaysHome below, NOT KeyedMulti.
-
-        // -- WholeKeyspace: span the whole keyspace (stay home this pass).
-        b"KEYS" | b"SCAN" | b"DBSIZE" | b"FLUSHALL" | b"FLUSHDB" | b"RANDOMKEY" => {
-            CommandClass::WholeKeyspace
-        }
-
-        // -- AlwaysHome: everything else (control / connection / transaction / probes).
-        _ => CommandClass::AlwaysHome,
-    }
+    crate::command_spec::spec_of(cmd_upper).map_or(CommandClass::AlwaysHome, |s| s.class)
 }
 
 /// The single routing key of a [`CommandClass::KeyedSingle`] command: `args[1]`.
@@ -204,175 +128,37 @@ pub fn single_key(req: &Request) -> Option<&[u8]> {
     req.args.get(1).map(bytes::Bytes::as_ref)
 }
 
-/// Parse `args[i]` as a NON-NEGATIVE decimal integer (a `numkeys`-style count). Returns
-/// `None` on a non-numeric / negative / overflowing token, so the caller falls back HOME
-/// (where the handler emits the proper error) rather than mis-routing a malformed command.
-fn parse_count(arg: &[u8]) -> Option<usize> {
-    // ASCII digits only (no sign, no whitespace): a `numkeys` is a bare non-negative int.
-    if arg.is_empty() || !arg.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(arg).ok()?.parse::<usize>().ok()
-}
-
-/// Collect `req.args[start..]` (all trailing args) as borrowed key slices into a
-/// [`KeySpec`], collapsing to [`KeySpec::One`] / [`KeySpec::None`] for 1 / 0 keys so the
-/// caller's single-key fast path stays alloc-free.
-fn keys_from(req: &Request, start: usize) -> KeySpec<'_> {
-    let Some(tail) = req.args.get(start..) else {
-        return KeySpec::None; // start past the end: malformed -> home.
-    };
-    match tail {
-        [] => KeySpec::None,
-        [one] => KeySpec::One(one.as_ref()),
-        many => KeySpec::Many(many.iter().map(bytes::Bytes::as_ref).collect()),
-    }
-}
-
-/// Collect the CONTIGUOUS range `req.args[start..end]` as borrowed key slices into a
-/// [`KeySpec`]. An out-of-range `end` (a `numkeys` that overruns the args) yields
-/// [`KeySpec::None`] -> home (the proper error). 0 -> `None`, 1 -> `One`, else `Many`.
-fn keys_range(req: &Request, start: usize, end: usize) -> KeySpec<'_> {
-    let Some(slice) = req.args.get(start..end) else {
-        return KeySpec::None;
-    };
-    match slice {
-        [] => KeySpec::None,
-        [one] => KeySpec::One(one.as_ref()),
-        many => KeySpec::Many(many.iter().map(bytes::Bytes::as_ref).collect()),
-    }
-}
-
-/// Collect the args at `idxs` (each an index into `req.args`) as borrowed key slices.
-/// An out-of-range index yields [`KeySpec::None`] (a malformed/short request -> home, where
-/// the handler emits the proper wrong-arity error). 0 -> `None`, 1 -> `One`, else `Many`.
-fn keys_at<'a>(req: &'a Request, idxs: &[usize]) -> KeySpec<'a> {
-    let mut keys: Vec<&'a [u8]> = Vec::with_capacity(idxs.len());
-    for &i in idxs {
-        match req.args.get(i) {
-            Some(b) => keys.push(b.as_ref()),
-            None => return KeySpec::None,
-        }
-    }
-    match keys.len() {
-        0 => KeySpec::None,
-        1 => KeySpec::One(keys[0]),
-        _ => KeySpec::Many(keys),
-    }
-}
-
 /// Extract the routing KEY(s) of `cmd_upper` from `req` (COORDINATOR.md #107, Stage 1).
 ///
-/// This is the per-command KEY SPEC: it returns the key positions Redis's command table
-/// defines, so the serve loop can compute the command's owner-shard SET and route the
-/// WHOLE command to one shard when every key co-locates (the local fast path if that shard
-/// is home, else a single remote hop), or keep it home when the keys SPAN shards (the
-/// documented Stage 2 fan-out gap). It is a PURE function of the bytes (no I/O, no state).
+/// This is now a THIN WRAPPER over the #89 single-source-of-truth command registry: it
+/// looks the command's [`crate::command_spec::KeySpecKind`] up via
+/// [`crate::command_spec::spec_of`] and runs the GENERIC per-pattern extraction
+/// ([`crate::command_spec::extract_keys`]); an unknown command (no registry entry) yields
+/// [`KeySpec::None`]. The per-pattern extraction logic (the `numkeys` parse, the MSET
+/// stride, the dest+sources walk) is preserved EXACTLY, now in one place keyed by
+/// `KeySpecKind`, so this function's observable output is byte-identical to the legacy
+/// per-command match.
 ///
-/// CONSERVATIVE BY DESIGN (correctness over coverage): a command whose key positions are
-/// not confidently known returns [`KeySpec::None`] (keep home). A malformed/short request
-/// (an index past the end, an unparseable `numkeys`) also returns [`KeySpec::None`] so the
-/// home handler emits the proper wrong-arity error rather than the routing layer guessing.
+/// It returns the key positions Redis's command table defines, so the serve loop can
+/// compute the command's owner-shard SET and route the WHOLE command to one shard when
+/// every key co-locates (the local fast path if that shard is home, else a single remote
+/// hop), or keep it home when the keys SPAN shards (the documented Stage 2 fan-out gap). It
+/// is a PURE function of the bytes (no I/O, no state).
 ///
-/// ## Key-spec table (matches the Redis command key specs)
+/// CONSERVATIVE BY DESIGN (preserved): a malformed/short request (an index past the end, an
+/// unparseable `numkeys`) returns [`KeySpec::None`] so the home handler emits the proper
+/// wrong-arity error rather than the routing layer guessing. The per-`KeySpecKind` key-spec
+/// mapping (args[1] only / args[1..] / MSET stride / two keys / dest+sources / BITOP /
+/// numkeys-prefixed / OBJECT args[2]) is documented on [`crate::command_spec::KeySpecKind`].
 ///
-/// - `args[1]` only (single key): every [`CommandClass::KeyedSingle`] command, plus MOVE
-///   (args[2] is the destination DB index, NOT a key).
-/// - `args[1..]` all keys: DEL, EXISTS, UNLINK, TOUCH, SINTER, SUNION, SDIFF, PFCOUNT,
-///   PFMERGE, MGET.
-/// - MSET: keys at `args[1]`, `args[3]`, `args[5]`, ... (every other arg starting at 1;
-///   the interleaved values are not keys). A malformed (odd-arg / empty) MSET -> home.
-/// - `args[1]` + `args[2]` (two keys): RENAME, RENAMENX, COPY (options follow the two
-///   keys), SMOVE, LMOVE, RPOPLPUSH, ZRANGESTORE (dest, src).
-/// - dest `args[1]` + sources `args[2..]`: SINTERSTORE, SUNIONSTORE, SDIFFSTORE.
-/// - BITOP: dest `args[2]` + sources `args[3..]` (args[1] is the OPERATION, not a key).
-/// - `numkeys`-prefixed: SINTERCARD/ZINTERCARD (numkeys=args[1], keys=args[2..2+numkeys]);
-///   ZUNION/ZINTER/ZDIFF (numkeys=args[1], keys=args[2..2+numkeys]);
-///   ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE (dest=args[1], numkeys=args[2],
-///   keys=args[3..3+numkeys]) -- the dest joins the routed key set so a co-located
-///   store routes too.
-/// - OBJECT: key at `args[2]` (the subcommand is args[1]).
-///
-/// WATCH is deliberately ABSENT (it is [`CommandClass::AlwaysHome`]): it must stay on the
-/// home shard with the per-connection transaction state (the cross-shard WATCH is a later
-/// transaction pass), so it is never routed.
+/// WATCH is [`CommandClass::AlwaysHome`] with `key_spec = Arg1`, but the serve loop never
+/// calls `command_keys` for an AlwaysHome command (it reads WATCH's keys directly), so
+/// WATCH is never routed via this path.
 #[must_use]
 pub fn command_keys<'a>(cmd_upper: &[u8], req: &'a Request) -> KeySpec<'a> {
-    match cmd_upper {
-        // dest=args[1], numkeys=args[2], keys=args[3..3+numkeys]; the DEST also joins the
-        // routed key set, so a store whose dest + sources co-locate routes to that shard.
-        b"ZUNIONSTORE" | b"ZINTERSTORE" | b"ZDIFFSTORE" => {
-            let Some(numkeys) = req.args.get(2).and_then(|a| parse_count(a)) else {
-                return KeySpec::None;
-            };
-            // Guard against a numkeys that overruns the args (malformed -> home). dest is
-            // args[1] and joins the routed key set, so the source span starts at args[3].
-            if numkeys == 0 || 3usize.saturating_add(numkeys) > req.args.len() {
-                return KeySpec::None;
-            }
-            let mut idxs = Vec::with_capacity(1 + numkeys);
-            idxs.push(1usize); // dest
-            idxs.extend(3..3 + numkeys); // source keys
-            keys_at(req, &idxs)
-        }
-        // numkeys=args[1], keys=args[2..2+numkeys]. ZINTERCARD/SINTERCARD have a trailing
-        // LIMIT option AFTER the keys, but the keys themselves are exactly the numkeys span.
-        b"ZUNION" | b"ZINTER" | b"ZDIFF" | b"ZINTERCARD" | b"SINTERCARD" => {
-            let Some(numkeys) = req.args.get(1).and_then(|a| parse_count(a)) else {
-                return KeySpec::None;
-            };
-            if numkeys == 0 || 2usize.saturating_add(numkeys) > req.args.len() {
-                return KeySpec::None;
-            }
-            keys_range(req, 2, 2 + numkeys)
-        }
-        // BITOP <op> <dest> <src...>: args[1] is the operation (NOT a key); dest=args[2],
-        // sources=args[3..].
-        b"BITOP" => {
-            if req.args.len() < 4 {
-                return KeySpec::None;
-            }
-            keys_from(req, 2)
-        }
-        // Two keys at args[1], args[2] (extra options, if any, follow the keys).
-        b"RENAME" | b"RENAMENX" | b"COPY" | b"SMOVE" | b"LMOVE" | b"RPOPLPUSH" | b"ZRANGESTORE" => {
-            keys_at(req, &[1, 2])
-        }
-        // All of args[1..] are keys. This covers two key-spec shapes that happen to span the
-        // SAME index range (so they share one arm):
-        //   - dest=args[1] + sources=args[2..]: SINTERSTORE/SUNIONSTORE/SDIFFSTORE (the dest
-        //     joins the routed set so a co-located store routes too);
-        //   - every arg a key: DEL/EXISTS/UNLINK/TOUCH/SINTER/SUNION/SDIFF/PFCOUNT/PFMERGE.
-        b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE" | b"DEL" | b"EXISTS" | b"UNLINK"
-        | b"TOUCH" | b"SINTER" | b"SUNION" | b"SDIFF" | b"PFCOUNT" | b"PFMERGE" | b"MGET" => {
-            keys_from(req, 1)
-        }
-        // MSET key value [key value ...]: the KEYS are args[1], args[3], args[5], ...
-        // (every other arg starting at 1); the interleaved values are NOT keys. A
-        // malformed MSET (no pairs, or an ODD arg count so the strided walk would read a
-        // value slot as a key) yields KeySpec::None -> the command stays HOME, where
-        // `cmd_mset` emits the proper wrong-arity error rather than the routing layer
-        // guessing.
-        b"MSET" => {
-            // args[0] is the command token; the key/value pairs are args[1..]. There must
-            // be at least one pair and an EVEN number of pair args (else malformed -> home).
-            if req.args.len() < 3 || (req.args.len() - 1) % 2 != 0 {
-                return KeySpec::None;
-            }
-            let idxs: Vec<usize> = (1..req.args.len()).step_by(2).collect();
-            keys_at(req, &idxs)
-        }
-        // OBJECT <subcommand> <key>: the key is args[2].
-        b"OBJECT" => keys_at(req, &[2]),
-        // MOVE has exactly ONE key (args[1]); args[2] is the destination DB INDEX, not a
-        // key. So it routes by owner(args[1]) like a single-key command.
-        b"MOVE" => keys_at(req, &[1]),
-        // Anything else: the single-key fast path (every KeyedSingle command), or a command
-        // we do not confidently route. A KeyedSingle command keys on args[1]; everything
-        // else (control/conn/txn/whole-keyspace, and SWAPDB which takes no key) has no
-        // routable key here and stays home. `single_key` already covers the args[1] case for
-        // the serve loop's fast path; this arm makes `command_keys` total for completeness.
-        _ => single_key(req).map_or(KeySpec::None, KeySpec::One),
+    match crate::command_spec::spec_of(cmd_upper).map(|s| s.key_spec) {
+        Some(kind) => crate::command_spec::extract_keys(kind, req),
+        None => KeySpec::None,
     }
 }
 

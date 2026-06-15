@@ -27,12 +27,16 @@ pub mod cmd_string;
 pub mod cmd_txn;
 pub mod cmd_util;
 pub mod cmd_zset;
+pub mod command_spec;
 pub mod conn;
 pub mod dispatch;
 pub mod glob;
 pub mod route;
 
 pub use admission::is_denyoom;
+// The #89 single-source-of-truth command registry. `CommandClass` is also re-exported via
+// `route` (its legacy path) below; `Arity` is re-exported via `cmd_txn` (its legacy path).
+pub use command_spec::{Arity, CommandSpec, KeySpecKind, spec_of};
 pub use conn::ConnState;
 pub use dispatch::{
     EXPIRE_CYCLE_INTERVAL, MAX_RECLAIM_PER_CALL, MAX_RECLAIM_PER_CYCLE, RollupFn, ServerContext,
