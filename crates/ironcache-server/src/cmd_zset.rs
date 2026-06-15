@@ -1507,20 +1507,40 @@ fn read_range_pairs<S: Store>(
 // Aggregations: ZUNION / ZINTER / ZDIFF (+ *STORE) + ZINTERCARD.
 // ===========================================================================
 
+/// A `(member, score)` pair: a zset member with its score. The unit the zset handlers and the
+/// shared [`zset_combine`] pass around (members + scores, in result order).
+pub type ScoredMember = (Vec<u8>, f64);
+
+/// One aggregation source for [`zset_combine`]: its already-gathered `(member, score)` pairs
+/// plus its WEIGHTS factor (applied inside the combine). The cross-shard coordinator builds
+/// these from its cross-shard gathers; the single-shard handler from its local store reads.
+pub type WeightedSource = (Vec<ScoredMember>, f64);
+
 /// The aggregate function for combining scores of a member present in multiple source
-/// zsets (the AGGREGATE option; default SUM).
-#[derive(Clone, Copy, PartialEq)]
-enum Aggregate {
+/// zsets (the AGGREGATE option; default SUM). PUBLIC so the cross-shard coordinator (which
+/// gathers each source's `(member, score)` pairs itself, then combines via the SHARED
+/// [`zset_combine`]) names the same aggregate the single-shard handlers do; re-exported from
+/// the crate root.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Aggregate {
+    /// AGGREGATE SUM (the default): combined score is the sum (NaN coerced to 0).
     Sum,
+    /// AGGREGATE MIN: combined score is the minimum.
     Min,
+    /// AGGREGATE MAX: combined score is the maximum.
     Max,
 }
 
-/// The aggregation operation requested.
-#[derive(Clone, Copy, PartialEq)]
-enum AggOp {
+/// The aggregation operation requested. PUBLIC so the cross-shard coordinator names the same
+/// operation the single-shard handlers do (it gathers each source's pairs, then combines via
+/// the SHARED [`zset_combine`]); re-exported from the crate root.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AggOp {
+    /// ZUNION / ZUNIONSTORE: accumulate every member of every source.
     Union,
+    /// ZINTER / ZINTERSTORE / ZINTERCARD: keep members present in all sources.
     Inter,
+    /// ZDIFF / ZDIFFSTORE: the first source minus all the rest (scores from the first).
     Diff,
 }
 
@@ -1653,50 +1673,74 @@ fn parse_agg_args(
     })
 }
 
-/// Compute the aggregation result over the source keys, in deterministic (score, member)
-/// order. `Ok(pairs)` or `Err(())` if any required source is a non-zset/non-set.
-fn compute_agg<S: Store>(
-    store: &mut S,
-    db: u32,
-    now: UnixMillis,
-    args: &AggArgs,
+/// The PURE zset-aggregation combiner: given each source's already-gathered
+/// `(members+scores, weight)` IN ORIGINAL KEY ORDER (`sources[i].0` is key `i`'s pairs,
+/// `sources[i].1` is key `i`'s WEIGHTS multiplier; a missing/empty source key is an EMPTY
+/// pair list), return the combined result in deterministic `(score, member)` order. This is
+/// the ONE SOURCE OF TRUTH for ZUNION/ZINTER/ZDIFF semantics: BOTH the single-shard handler
+/// ([`compute_agg`], which reads each key's pairs from the local store) AND the cross-shard
+/// coordinator (which gathers each key's pairs from its owner shard via ZRANGE WITHSCORES,
+/// with a SET-source-as-score-1.0 fallback) call this, so the two CANNOT drift
+/// (COORDINATOR.md #107, Stage 2b-2: gather + shared combine).
+///
+/// The semantics, preserved EXACTLY from the prior in-line `compute_agg`:
+/// - Each source's score is multiplied by its WEIGHTS factor; a NaN product (e.g. `0 * inf`)
+///   is coerced to `0.0`, matching Redis (`zunionInterAggregate`: `if (isnan(score)) score
+///   = 0;` after the WEIGHTS multiply).
+/// - **Union**: accumulate every member of every source, combining duplicate scores with
+///   the AGGREGATE function ([`combine`]).
+/// - **Inter**: keep a member of the FIRST source only if present in EVERY other source,
+///   combining its scores left-to-right with AGGREGATE.
+/// - **Diff**: members of the FIRST source not present in any other (scores from the first).
+/// - SUM coerces a NaN result to 0 ([`combine`]); MIN/MAX never produce a NaN.
+/// - The result is sorted by `(score, member)` with `f64::total_cmp` so the reply / stored
+///   value is deterministic.
+///
+/// An empty `sources` yields the empty result for every op (the single-shard callers
+/// validate arity before gathering, so this is the defensive floor).
+#[must_use]
+pub fn zset_combine(
     op: AggOp,
-) -> Result<Vec<(Vec<u8>, f64)>, ()> {
-    // Read each source applying its weight (weight multiplies the score).
-    let mut sources: Vec<BTreeMap<Vec<u8>, f64>> = Vec::with_capacity(args.keys.len());
-    for (idx, k) in args.keys.iter().enumerate() {
-        let members = read_agg_source(store, db, now, k)?;
-        let w = args.weights[idx];
-        let mut m: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
-        for (member, score) in members {
-            // weight * score; weight*inf etc. follow IEEE. Redis coerces a NaN product to 0
-            // (`zunionInterAggregate`: `if (isnan(score)) score = 0;` after the WEIGHTS
-            // multiply); `0 * inf` is the case that produces NaN.
-            let p = score * w;
-            m.insert(member, if p.is_nan() { 0.0 } else { p });
-        }
-        sources.push(m);
-    }
+    aggregate: Aggregate,
+    sources: &[WeightedSource],
+) -> Vec<ScoredMember> {
+    // Apply each source's WEIGHTS factor up front (weight multiplies the score; a NaN product
+    // is coerced to 0), collapsing duplicate members WITHIN a source via the same insert (the
+    // store yields each member once, so this also serves the defensive floor).
+    let weighted: Vec<BTreeMap<Vec<u8>, f64>> = sources
+        .iter()
+        .map(|(members, w)| {
+            let mut m: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
+            for (member, score) in members {
+                // weight * score; weight*inf etc. follow IEEE. Redis coerces a NaN product to
+                // 0 (`zunionInterAggregate`: `if (isnan(score)) score = 0;` after the WEIGHTS
+                // multiply); `0 * inf` is the case that produces NaN.
+                let p = score * w;
+                m.insert(member.clone(), if p.is_nan() { 0.0 } else { p });
+            }
+            m
+        })
+        .collect();
     let mut acc: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
     match op {
         AggOp::Union => {
-            for src in &sources {
+            for src in &weighted {
                 for (member, score) in src {
                     acc.entry(member.clone())
-                        .and_modify(|s| *s = combine(args.aggregate, *s, *score))
+                        .and_modify(|s| *s = combine(aggregate, *s, *score))
                         .or_insert(*score);
                 }
             }
         }
         AggOp::Inter => {
-            if let Some((first, rest)) = sources.split_first() {
+            if let Some((first, rest)) = weighted.split_first() {
                 'members: for (member, score) in first {
                     let mut combined = *score;
                     for src in rest {
                         let Some(other) = src.get(member) else {
                             continue 'members;
                         };
-                        combined = combine(args.aggregate, combined, *other);
+                        combined = combine(aggregate, combined, *other);
                     }
                     acc.insert(member.clone(), combined);
                 }
@@ -1704,7 +1748,7 @@ fn compute_agg<S: Store>(
         }
         AggOp::Diff => {
             // ZDIFF: members of the FIRST set not present in any other (scores from first).
-            if let Some((first, rest)) = sources.split_first() {
+            if let Some((first, rest)) = weighted.split_first() {
                 for (member, score) in first {
                     if !rest.iter().any(|s| s.contains_key(member)) {
                         acc.insert(member.clone(), *score);
@@ -1716,7 +1760,30 @@ fn compute_agg<S: Store>(
     // Order by (score, member).
     let mut out: Vec<(Vec<u8>, f64)> = acc.into_iter().collect();
     out.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    Ok(out)
+    out
+}
+
+/// Compute the aggregation result over the source keys, in deterministic (score, member)
+/// order. `Ok(pairs)` or `Err(())` if any required source is a non-zset/non-set. This is the
+/// SINGLE-SHARD path: it READS each key's pairs from the local store (surfacing a WRONGTYPE
+/// on a non-zset/non-set source), then delegates the PURE combine to the SHARED
+/// [`zset_combine`] (the one source of truth the cross-shard coordinator also calls), so the
+/// two cannot drift.
+fn compute_agg<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    args: &AggArgs,
+    op: AggOp,
+) -> Result<Vec<(Vec<u8>, f64)>, ()> {
+    // Read each source's pairs in ORIGINAL KEY ORDER, pairing each with its WEIGHTS factor;
+    // any non-zset/non-set source aborts with Err BEFORE the combine.
+    let mut sources: Vec<WeightedSource> = Vec::with_capacity(args.keys.len());
+    for (idx, k) in args.keys.iter().enumerate() {
+        let members = read_agg_source(store, db, now, k)?;
+        sources.push((members, args.weights[idx]));
+    }
+    Ok(zset_combine(op, args.aggregate, &sources))
 }
 
 /// Shared body for the non-STORE ZUNION/ZINTER/ZDIFF: reply with the result members (or
@@ -1863,6 +1930,75 @@ pub fn cmd_zintercard<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &R
         }
         Err(()) => Value::error(ErrorReply::wrong_type()),
     }
+}
+
+/// The internal token the cross-shard coordinator uses to write a zset *STORE / ZRANGESTORE
+/// result to the dest owner shard (COORDINATOR.md #107, Stage 2b-2). NOT a client command:
+/// the decoder / router gate it so a client sending it gets `unknown command`; only the
+/// coordinator issues it (via `dispatch_one_value` / `run_local_keyed`) after it has GATHERED
+/// the sources cross-shard and COMBINED them with the shared [`zset_combine`] (or, for
+/// ZRANGESTORE, gathered the selected range). See [`cmd_icstorezset`]. This is the zset
+/// counterpart of [`crate::cmd_set::ICSTORESET`].
+pub const ICSTOREZSET: &[u8] = b"__ICSTOREZSET";
+
+/// INTERNAL: `__ICSTOREZSET dest m1 s1 m2 s2 ...` -> the dest cardinality. The dest-write
+/// half of the cross-shard zset *STORE / ZRANGESTORE (COORDINATOR.md #107, Stage 2b-2): write
+/// the supplied NON-EMPTY `(member, score)` pairs to `dest` on its OWNER shard with the EXACT
+/// blind-overwrite-clearing-TTL semantics the single-shard [`agg_store_generic`] /
+/// [`cmd_zrangestore`] use (`RmwAction::Insert(zset)` + `ExpireWrite::Clear`), so a spanning
+/// ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE/ZRANGESTORE is byte-identical to the single-shard write.
+/// The coordinator gathers + combines the sources itself (the shared [`zset_combine`]) and
+/// routes the EMPTY-result case as a `DEL dest` (Redis deletes dest on an empty result), so
+/// this verb is only ever issued with a non-empty pair list; it defensively DELETES dest on an
+/// empty arg list too (so the empty case stays correct even if a future caller routes it
+/// here). It is a single-key write keyed on `dest` (`args[1]`), so it routes + admits like any
+/// keyed write through the existing substrate.
+///
+/// CLIENT-UNREACHABLE: this is gated out of the client command path (the serve-loop router and
+/// the queue-time validator reject [`ICSTOREZSET`] before routing), so a client sending
+/// `__ICSTOREZSET` gets the standard unknown-command error; only the coordinator reaches this
+/// arm, via the internal `dispatch_remote_keyed` / `run_local_keyed` path.
+// `store` (the param) and `score` (the parsed pair value) read as similar bindings; both are
+// the clear, established names in the zset handlers, so the similar-names lint is allowed here.
+#[allow(clippy::similar_names)]
+pub fn cmd_icstorezset<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    // `__ICSTOREZSET dest [m s ...]`: at least the dest key (arity Min(2) in the registry).
+    // The pairs are member/score couples, so the post-dest tail must have an EVEN length.
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("__icstorezset"));
+    }
+    let dest = req.args[1].clone();
+    let tail = &req.args[2..];
+    if tail.is_empty() {
+        // Defensive: an empty pair list deletes dest (Redis deletes dest on an empty *STORE /
+        // ZRANGESTORE result). The coordinator normally routes the empty case as `DEL dest`
+        // and only issues this verb with pairs, but keep the semantics correct here too.
+        store.delete(db, &dest, now);
+        return Value::Integer(0);
+    }
+    if tail.len() % 2 != 0 {
+        return Value::error(ErrorReply::syntax_error());
+    }
+    let mut pairs: Vec<(Vec<u8>, f64)> = Vec::with_capacity(tail.len() / 2);
+    let mut i = 0;
+    while i < tail.len() {
+        let member = tail[i].to_vec();
+        let Some(score) = parse_f64(&tail[i + 1]) else {
+            return Value::error(ErrorReply::zadd_score_not_a_float());
+        };
+        pairs.push((member, score));
+        i += 2;
+    }
+    let card = pairs.len() as i64;
+    // Blind OVERWRITE of dest with the result zset, CLEARING any prior type/TTL -- the EXACT
+    // single-shard *STORE / ZRANGESTORE write: Insert replaces any existing value/type,
+    // ExpireWrite::Clear drops any prior TTL.
+    store.rmw_mut(db, &dest, now, move |_entry| RmwStep {
+        action: RmwAction::Insert(NewValueOwned::zset(pairs)),
+        expire: ExpireWrite::Clear,
+        reply: (),
+    });
+    Value::Integer(card)
 }
 
 #[cfg(test)]

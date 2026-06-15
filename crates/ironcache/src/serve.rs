@@ -539,7 +539,7 @@ async fn route_and_dispatch(
     // ever reaches dispatch THROUGH this router, so rejecting it here -- before any routing or
     // queueing -- makes a client `__ICSTORESET` (in or out of MULTI) get the standard
     // unknown-command error while the coordinator's internal path is untouched.
-    if cmd_upper == ironcache_server::ICSTORESET {
+    if cmd_upper == ironcache_server::ICSTORESET || cmd_upper == ironcache_server::ICSTOREZSET {
         reject_internal_verb(conn, state_rc, request, out);
         return false;
     }
@@ -692,19 +692,27 @@ async fn route_and_dispatch(
         .await;
         false
     } else if spanning_set_fan_out {
-        // SHARD-SPANNING set-algebra GATHER + (shared) COMBINE + STORE (COORDINATOR.md #107,
-        // Stage 2b-1): one of the seven (SINTER/SUNION/SDIFF/SINTERCARD/SINTERSTORE/
-        // SUNIONSTORE/SDIFFSTORE) whose keys span shards. The spanning_combine module gathers
-        // each source's members from its owner (the home subset LOCALLY + sync, the rest via
-        // their drain loops), combines with the PURE `set_combine` shared with the
-        // single-shard handler, and for the *STORE forms writes the result to the dest owner.
-        // Bump commands_processed here (matching the home / remote / whole-keyspace / multikey
-        // paths); the owning shards fold their own data counters.
+        // SHARD-SPANNING set-/zset-algebra GATHER + (shared) COMBINE + STORE (COORDINATOR.md
+        // #107, Stage 2b-1 + 2b-2): one of the set forms (SINTER/SUNION/SDIFF/SINTERCARD +
+        // *STORE) or zset forms (ZUNION/ZINTER/ZDIFF/ZINTERCARD + *STORE + ZRANGESTORE) whose
+        // keys span shards. The spanning_combine module gathers each source from its owner
+        // (the home subset LOCALLY + sync, the rest via their drain loops), combines with the
+        // PURE `set_combine` / `zset_combine` shared with the single-shard handler, and for the
+        // *STORE forms writes the result to the dest owner. Bump commands_processed here
+        // (matching the home / remote / whole-keyspace / multikey paths); the owning shards
+        // fold their own data counters.
         state_rc.borrow_mut().counters.on_command();
-        crate::spanning_combine::fan_out_set(
-            inbox, ctx, &cmd_upper, request, conn.db, home, out, conn.proto,
-        )
-        .await;
+        if is_fan_out_spanning_zset(&cmd_upper) {
+            crate::spanning_combine::fan_out_zset(
+                inbox, ctx, &cmd_upper, request, conn.db, home, out, conn.proto,
+            )
+            .await;
+        } else {
+            crate::spanning_combine::fan_out_set(
+                inbox, ctx, &cmd_upper, request, conn.db, home, out, conn.proto,
+            )
+            .await;
+        }
         false
     } else if let Some(target) = target {
         // REMOTE keyed hop: enqueue to the owning shard, await its reply, encode here. The
@@ -978,25 +986,51 @@ fn reject_internal_verb(
     );
 }
 
-/// Whether `cmd_upper` is one of the SEVEN set-algebra commands the coordinator GATHERS +
-/// (shared) COMBINES + STOREs across shards when its keys SPAN shards (COORDINATOR.md #107,
-/// Stage 2b-1): SINTER, SUNION, SDIFF, SINTERCARD (read forms) and SINTERSTORE, SUNIONSTORE,
-/// SDIFFSTORE (store forms). This is the single gate the serve loop and
-/// [`crate::spanning_combine::fan_out_set`]'s match agree on. Every OTHER spanning multi-key
-/// command (zset algebra, BITOP, PFCOUNT/PFMERGE, RENAME/COPY/MOVE/SMOVE/LMOVE/RPOPLPUSH)
-/// stays on the home sync fall-through this pass (added in passes 2-3 / deferred). The
-/// command set is DISJOINT from [`is_fan_out_multikey`]'s, so the two fan-out branches are
-/// mutually exclusive.
+/// Whether `cmd_upper` is one of the set-algebra OR sorted-set-algebra commands the
+/// coordinator GATHERS + (shared) COMBINES + STOREs across shards when its keys SPAN shards
+/// (COORDINATOR.md #107, Stage 2b-1 + 2b-2). This is the single gate the serve loop uses to
+/// route to the spanning-combine path; [`is_fan_out_spanning_zset`] then splits the zset
+/// subset (dispatched to [`crate::spanning_combine::fan_out_zset`]) from the set subset
+/// (dispatched to [`crate::spanning_combine::fan_out_set`]).
+///
+/// Set forms (Stage 2b-1): SINTER, SUNION, SDIFF, SINTERCARD (read) + SINTERSTORE,
+/// SUNIONSTORE, SDIFFSTORE (store). Zset forms (Stage 2b-2): ZUNION, ZINTER, ZDIFF,
+/// ZINTERCARD (read) + ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE (store) + ZRANGESTORE (a 2-key
+/// copy-range). Every OTHER spanning multi-key command (BITOP, PFCOUNT/PFMERGE,
+/// RENAME/COPY/MOVE/SMOVE/LMOVE/RPOPLPUSH) stays on the home sync fall-through (pass 3 /
+/// deferred). The command set is DISJOINT from [`is_fan_out_multikey`]'s, so the fan-out
+/// branches are mutually exclusive.
 fn is_fan_out_spanning_combine(cmd_upper: &[u8]) -> bool {
+    is_fan_out_spanning_zset(cmd_upper)
+        || matches!(
+            cmd_upper,
+            b"SINTER"
+                | b"SUNION"
+                | b"SDIFF"
+                | b"SINTERCARD"
+                | b"SINTERSTORE"
+                | b"SUNIONSTORE"
+                | b"SDIFFSTORE"
+        )
+}
+
+/// Whether `cmd_upper` is one of the EIGHT sorted-set-algebra commands the coordinator gathers,
+/// (shared) combines, and stores across shards (COORDINATOR.md #107, Stage 2b-2). The read
+/// forms are ZUNION, ZINTER, ZDIFF, ZINTERCARD; the store forms are ZUNIONSTORE, ZINTERSTORE,
+/// ZDIFFSTORE, and ZRANGESTORE (a 2-key copy-range). This splits the zset subset of
+/// [`is_fan_out_spanning_combine`] so the serve loop dispatches it to
+/// [`crate::spanning_combine::fan_out_zset`] (the set subset goes to `fan_out_set`).
+fn is_fan_out_spanning_zset(cmd_upper: &[u8]) -> bool {
     matches!(
         cmd_upper,
-        b"SINTER"
-            | b"SUNION"
-            | b"SDIFF"
-            | b"SINTERCARD"
-            | b"SINTERSTORE"
-            | b"SUNIONSTORE"
-            | b"SDIFFSTORE"
+        b"ZUNION"
+            | b"ZINTER"
+            | b"ZDIFF"
+            | b"ZINTERCARD"
+            | b"ZUNIONSTORE"
+            | b"ZINTERSTORE"
+            | b"ZDIFFSTORE"
+            | b"ZRANGESTORE"
     )
 }
 

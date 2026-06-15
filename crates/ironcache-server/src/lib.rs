@@ -39,6 +39,12 @@ pub use admission::is_denyoom;
 // #107, Stage 2b), and the INTERNAL `__ICSTORESET` dest-write verb token (client-unreachable;
 // only the coordinator issues it to write a spanning *STORE result to the dest owner).
 pub use cmd_set::{ICSTORESET, SetOp, set_combine};
+// The PURE zset-algebra combiner + its op / aggregate enums (the single source of truth
+// shared by the single-shard zset handlers and the cross-shard coordinator's gather-combine,
+// COORDINATOR.md #107, Stage 2b-2), and the INTERNAL `__ICSTOREZSET` dest-write verb token
+// (client-unreachable; only the coordinator issues it to write a spanning zset *STORE /
+// ZRANGESTORE result to the dest owner).
+pub use cmd_zset::{AggOp, Aggregate, ICSTOREZSET, ScoredMember, WeightedSource, zset_combine};
 // The #89 single-source-of-truth command registry. `CommandClass` is also re-exported via
 // `route` (its legacy path) below; `Arity` is re-exported via `cmd_txn` (its legacy path).
 pub use command_spec::{Arity, CommandSpec, KeySpecKind, spec_of};
