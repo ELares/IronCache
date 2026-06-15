@@ -30,6 +30,7 @@
 
 use crate::serve::{ShardState, ShardStoreImpl, shard_env, shard_state, shard_store, shard_wheel};
 use ironcache_env::Clock;
+use ironcache_runtime::bootstrap::ShardId;
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
     CommandClass, CounterDeltas, ProtoVersion, Request, UnixMillis, Value, classify,
@@ -450,6 +451,149 @@ pub async fn fan_out_all(
     // RANDOMKEY, but reproducible). n_shards is small (one per core), so this is cheap.
     replies.sort_by_key(|&(shard, _)| shard);
     replies
+}
+
+/// SCATTER a DIFFERENT sub-request to each participating shard concurrently and gather
+/// the per-shard replies (COORDINATOR.md #107, Stage 2a -- the multi-key DATA fan-out).
+///
+/// This GENERALIZES [`fan_out_all`] (which broadcasts the SAME request to every shard)
+/// to the multi-key case, where each shard must run a DIFFERENT sub-request (only the
+/// keys that shard OWNS): `subreqs` is one `(shard_index, sub_request)` pair PER
+/// PARTICIPATING shard (the caller groups the command's keys by owner and builds one
+/// sub-request per shard that owns at least one key; a shard owning none is simply
+/// absent from `subreqs`).
+///
+/// The entry whose `shard == home.index` runs LOCALLY + SYNCHRONOUSLY via the `local`
+/// closure on the home thread-locals (mirroring [`fan_out_all`] / [`run_local_whole_keyspace`]
+/// -- NO self-channel hop). Every OTHER entry is sent as a [`ShardWork`] (that shard's
+/// sub-request + `db` + a oneshot) and the home core awaits all the replies concurrently
+/// (all enqueued first, then awaited, with the usual await-on-full back-pressure). A dead
+/// shard (send error / cancelled oneshot, only at shutdown / a shard panic) yields a
+/// SHARD-UNAVAILABLE [`ShardReply`] for that shard rather than a hang.
+///
+/// Returns the `(shard_index, reply)` pairs in NO guaranteed order (the caller maps each
+/// shard's reply back to the original key positions via the index bookkeeping it created
+/// when it built `subreqs`, so ordering here is irrelevant -- unlike [`fan_out_all`],
+/// which sorts by shard for a reproducible merge). The `local` closure runs SYNCHRONOUSLY
+/// and returns before any `.await`, so NO `RefCell` borrow of the home thread-locals is
+/// held across the awaits (the no-borrow-across-await contract, exactly as [`fan_out_all`]).
+pub async fn fan_out_split(
+    inbox: &Inbox,
+    home: ShardId,
+    db: u32,
+    subreqs: Vec<(usize, Request)>,
+    local: impl FnOnce(&Request) -> ShardReply,
+) -> Vec<(usize, ShardReply)> {
+    let mut replies: Vec<(usize, ShardReply)> = Vec::with_capacity(subreqs.len());
+    let mut pending: Vec<(usize, oneshot::Receiver<ShardReply>)> =
+        Vec::with_capacity(subreqs.len());
+    // The home shard's sub-request, deferred so its `local` closure runs AFTER every
+    // remote sub-request is enqueued (so the shards process concurrently while the home
+    // core then runs its own subset locally and finally gathers the remote replies).
+    let mut home_subreq: Option<Request> = None;
+
+    for (shard, req) in subreqs {
+        if shard == home.index {
+            // The home shard's subset: run it LOCALLY + SYNCHRONOUSLY below (no self hop).
+            home_subreq = Some(req);
+            continue;
+        }
+        let (tx, rx) = oneshot::channel::<ShardReply>();
+        let work = ShardWork {
+            request: req,
+            db,
+            reply: tx,
+        };
+        // Await-on-full back-pressure. A send error means the owning shard's receiver is
+        // gone (shutdown / shard died): record a shard-unavailable reply for it directly.
+        if inbox[shard].send(work).await.is_err() {
+            replies.push((shard, shard_unavailable_reply()));
+        } else {
+            pending.push((shard, rx));
+        }
+    }
+
+    // The HOME shard's subset (if it owns any key): run LOCALLY + SYNCHRONOUSLY on the
+    // home thread-locals, exactly like the single-key local fast path -- no self-channel
+    // hop. The closure returns before any await, so no borrow is held across the awaits.
+    if let Some(req) = home_subreq {
+        replies.push((home.index, local(&req)));
+    }
+
+    // Gather the remote replies. A cancelled oneshot (the owning shard's drain loop went
+    // away after we enqueued) maps to a shard-unavailable reply, never a hang/panic.
+    for (shard, rx) in pending {
+        match rx.await {
+            Ok(reply) => replies.push((shard, reply)),
+            Err(_) => replies.push((shard, shard_unavailable_reply())),
+        }
+    }
+
+    replies
+}
+
+/// Run ONE keyed sub-request's subset against THIS (home) shard's thread-local state,
+/// SYNCHRONOUSLY, for the multi-key DATA fan-out (COORDINATOR.md #107, Stage 2a). This is
+/// the `local` closure [`fan_out_split`] runs for the home shard: the home core does NOT
+/// round-trip its OWN subset through its channel; it runs it inline, exactly like the
+/// single-key local fast path and [`run_local_whole_keyspace`].
+///
+/// It is the byte-identical home-core counterpart of the per-shard [`run_remote`] keyed
+/// path: it reads `now` from THIS shard's Env clock (the determinism seam, ADR-0003), runs
+/// the SAME [`dispatch_remote_keyed`] every remote shard runs (so the home shard's subset
+/// is byte-identical to a remote shard's), and FOLDS the produced [`CounterDeltas`] into
+/// THIS shard's counters (the data the sub-MGET/sub-MSET touched lives here, so its data
+/// counters live here too). The returned [`ShardReply`] carries a COPY of the deltas so a
+/// future observability pass could attribute the home subset (the merge layer ignores
+/// them, like every other home-core path). Every per-shard borrow is taken + released
+/// inside this synchronous call (the no-borrow-across-await contract).
+#[must_use]
+pub fn run_local_keyed(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
+    let env = shard_env();
+    let store_rc = shard_store(
+        ctx.databases,
+        ctx.info.maxmemory_policy,
+        crate::serve::scan_reserved_bits(ctx.shards),
+    );
+    let wheel_rc = shard_wheel();
+    let state_rc = shard_state();
+
+    let now = UnixMillis(env.borrow().now_unix_millis());
+    let mut shard_generation = state_rc.borrow().last_policy_generation;
+
+    let mut deltas = CounterDeltas::default();
+    let lazy_expired;
+    let value = {
+        let mut store = store_rc.borrow_mut();
+        let mut wheel = wheel_rc.borrow_mut();
+        let mut env_ref = env.borrow_mut();
+        let v = dispatch_remote_keyed(
+            ctx,
+            &mut *env_ref,
+            &mut *store,
+            &mut wheel,
+            db,
+            now,
+            &mut shard_generation,
+            &mut deltas,
+            request,
+        );
+        drop(env_ref);
+        lazy_expired = store.take_lazy_expired();
+        v
+        // store + wheel borrows DROP here, before the state borrow below.
+    };
+
+    {
+        deltas.expired += lazy_expired;
+        let mut st = state_rc.borrow_mut();
+        if deltas != CounterDeltas::default() {
+            st.counters.apply(deltas);
+        }
+        st.last_policy_generation = shard_generation;
+    }
+
+    ShardReply { value, deltas }
 }
 
 /// A [`ShardReply`] carrying the cross-shard unavailable error (the owning shard's drain

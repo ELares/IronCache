@@ -43,6 +43,9 @@ pub fn is_denyoom(cmd: &[u8]) -> bool {
             // silently bypass the ceiling.
             | b"SETEX"
             | b"PSETEX"
+            // MSET allocates a value per key (a multi-key blind SET), so it is a
+            // `denyoom` write in Redis. MGET is a read and is NOT gated.
+            | b"MSET"
             // RENAME/RENAMENX/COPY are `denyoom` writes in Redis (they materialize a
             // value at the destination). MOVE is NOT denyoom (Redis flags it `write
             // fast` without denyoom, since it relocates rather than duplicates), so it
@@ -139,6 +142,8 @@ mod tests {
             b"INCRBYFLOAT",
             b"SETEX",
             b"PSETEX",
+            // MSET is a denyoom multi-key write.
+            b"MSET",
             b"RENAME",
             b"RENAMENX",
             b"COPY",
@@ -187,6 +192,8 @@ mod tests {
             // reads / introspection
             b"GET".as_slice(),
             b"STRLEN",
+            // MGET is a multi-key READ: never denyoom.
+            b"MGET",
             b"EXISTS",
             b"TYPE",
             // memory-releasing
