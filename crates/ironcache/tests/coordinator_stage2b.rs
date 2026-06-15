@@ -1902,3 +1902,80 @@ fn internal_icstorehll_verb_is_not_client_reachable() {
         }
     });
 }
+
+#[test]
+fn spanning_sintercard_limit_rejects_non_canonical_token_like_single_shard() {
+    // Stage 2b parity (review fix): the spanning SINTERCARD LIMIT parse must be STRICT (reject
+    // a leading '+' and surrounding whitespace), matching the single-shard handler's
+    // cmd_util::parse_i64. A lenient parse would accept "+2" cross-shard while the single-shard
+    // form errors. Assert the multi-shard and single-shard replies are IDENTICAL (both errors).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let mut replies = Vec::new();
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+            sadd(&mut c, &mut buf, "lc:a", &["1", "2", "3"]).await;
+            sadd(&mut c, &mut buf, "lc:b", &["2", "3", "4"]).await;
+            let r = roundtrip(
+                &mut c,
+                &mut buf,
+                &[b"SINTERCARD", b"2", b"lc:a", b"lc:b", b"LIMIT", b"+2"],
+            )
+            .await;
+            assert!(
+                matches!(&r, Resp::Error(_)),
+                "non-canonical LIMIT '+2' must error (shards={shards}), got {r:?}"
+            );
+            replies.push(r);
+            server.shutdown_and_join().unwrap();
+        }
+        assert_eq!(
+            replies[0], replies[1],
+            "spanning and single-shard SINTERCARD must reject '+2' identically"
+        );
+    });
+}
+
+#[test]
+fn spanning_zrangestore_rejects_withscores_like_single_shard() {
+    // Stage 2b parity (review fix): ZRANGESTORE accepts ONLY BYSCORE/BYLEX/REV/LIMIT. WITHSCORES
+    // is a legal ZRANGE option but NOT a legal ZRANGESTORE option, so a spanning
+    // `ZRANGESTORE dst src 0 -1 WITHSCORES` must return the same syntax error the single-shard
+    // form does (the spanning path now validates the option grammar on the home core).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let mut replies = Vec::new();
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+            zadd(&mut c, &mut buf, "zrs:src", &[("1", "a"), ("2", "b"), ("3", "c")]).await;
+            let r = roundtrip(
+                &mut c,
+                &mut buf,
+                &[b"ZRANGESTORE", b"zrs:dst", b"zrs:src", b"0", b"-1", b"WITHSCORES"],
+            )
+            .await;
+            assert!(
+                matches!(&r, Resp::Error(l) if String::from_utf8_lossy(l).starts_with("ERR syntax error")),
+                "ZRANGESTORE WITHSCORES must be a syntax error (shards={shards}), got {r:?}"
+            );
+            // The dst must NOT have been created by the rejected command.
+            let exists = roundtrip(&mut c, &mut buf, &[b"EXISTS", b"zrs:dst"]).await;
+            assert_eq!(exists, Resp::Integer(0), "rejected ZRANGESTORE must not write dst (shards={shards})");
+            replies.push(r);
+            server.shutdown_and_join().unwrap();
+        }
+        assert_eq!(replies[0], replies[1], "spanning and single-shard ZRANGESTORE WITHSCORES must match");
+    });
+}

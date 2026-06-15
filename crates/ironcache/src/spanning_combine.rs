@@ -340,10 +340,14 @@ fn ascii_upper(token: &[u8]) -> Vec<u8> {
     token.to_ascii_uppercase()
 }
 
-/// Parse a decimal `i64` (the SINTERCARD numkeys / LIMIT). `None` on a non-numeric token.
-/// Mirrors the server's `parse_i64` (the single-shard SINTERCARD uses the same parse).
+/// Parse a decimal `i64` (the SINTERCARD/ZINTERCARD numkeys + LIMIT). Delegates to the
+/// server's canonical `cmd_util::parse_i64` so the spanning parse is BYTE-IDENTICAL to the
+/// single-shard handler: that parser is strict (rejects surrounding whitespace and a leading
+/// `+`, only special-casing a leading `-`), unlike Rust's `i64::from_str`. Using a lenient
+/// local parse here would accept a non-canonical LIMIT token the single-shard command rejects
+/// (a Stage 2b parity break).
 fn parse_i64(b: &[u8]) -> Option<i64> {
-    std::str::from_utf8(b).ok()?.trim().parse::<i64>().ok()
+    ironcache_server::cmd_util::parse_i64(b)
 }
 
 /// Encode `value` for `proto` and append to `out` (the home-core encode; mirrors the serve
@@ -861,6 +865,51 @@ fn zset_members_reply(pairs: Vec<ScoredMember>, with_scores: bool) -> Value {
     }
 }
 
+/// Validate the `ZRANGESTORE dst src start stop [opts]` OPTION grammar on the home core,
+/// mirroring the single-shard `cmd_zrangestore` (cmd_zset.rs) EXACTLY so a malformed spanning
+/// ZRANGESTORE returns the byte-identical error. Accepts ONLY BYSCORE/BYLEX/REV/LIMIT (the
+/// options are at `args[5..]`); rejects WITHSCORES and any unknown token with `syntax_error`,
+/// BYSCORE+BYLEX with `syntax_error`, LIMIT without BY* with `zrange_limit_only_with_byscore_or_bylex`,
+/// LIMIT with a missing operand with `syntax_error`, and a non-integer LIMIT operand with
+/// `not_an_integer` (via the same canonical `parse_i64`). Returns `Ok(by_lex)` on success.
+fn validate_zrangestore_opts(request: &Request) -> Result<bool, Value> {
+    use ironcache_protocol::ErrorReply;
+    let mut by_score = false;
+    let mut by_lex = false;
+    let mut has_limit = false;
+    let mut i = 5;
+    while i < request.args.len() {
+        match ascii_upper(&request.args[i]).as_slice() {
+            b"BYSCORE" => by_score = true,
+            b"BYLEX" => by_lex = true,
+            b"REV" => {}
+            b"LIMIT" => {
+                if i + 2 >= request.args.len() {
+                    return Err(Value::error(ErrorReply::syntax_error()));
+                }
+                if parse_i64(&request.args[i + 1]).is_none()
+                    || parse_i64(&request.args[i + 2]).is_none()
+                {
+                    return Err(Value::error(ErrorReply::not_an_integer()));
+                }
+                has_limit = true;
+                i += 2;
+            }
+            _ => return Err(Value::error(ErrorReply::syntax_error())),
+        }
+        i += 1;
+    }
+    if by_score && by_lex {
+        return Err(Value::error(ErrorReply::syntax_error()));
+    }
+    if has_limit && !(by_score || by_lex) {
+        return Err(Value::error(
+            ErrorReply::zrange_limit_only_with_byscore_or_bylex(),
+        ));
+    }
+    Ok(by_lex)
+}
+
 /// The home-core GATHER + STORE for a SHARD-SPANNING `ZRANGESTORE dst src start stop [opts]`
 /// (COORDINATOR.md #107, Stage 2b-2): a 2-key copy-range. Gather the SELECTED range from the
 /// `src` owner (route the SAME range args with WITHSCORES; for a BYLEX range, where WITHSCORES
@@ -881,11 +930,18 @@ async fn fan_out_zrangestore(
     }
     let dst = request.args[1].clone();
     let src = request.args[2].clone();
-    // The src-side range args are start/stop ([3]/[4]) + the option tail ([5..]); BYLEX is the
-    // one option that forbids WITHSCORES on ZRANGE, so detect it to choose the gather path.
-    let is_bylex = request.args[5..]
-        .iter()
-        .any(|a| ascii_upper(a).as_slice() == b"BYLEX");
+    // Validate the ZRANGESTORE option grammar ON THE HOME CORE, mirroring the single-shard
+    // `cmd_zrangestore` EXACTLY. ZRANGESTORE accepts ONLY BYSCORE/BYLEX/REV/LIMIT; WITHSCORES
+    // (a legal ZRANGE option but NOT a ZRANGESTORE one) and any unknown token are a syntax
+    // error. Without this, the non-BYLEX path below forwards the tail to `ZRANGE ... WITHSCORES`,
+    // and ZRANGE accepts a stray WITHSCORES, so a spanning `ZRANGESTORE dst src 0 -1 WITHSCORES`
+    // would SUCCEED while the single-shard form errors (a parity break). The bounds (start/stop,
+    // LIMIT integers) are still validated by the owner's ZRANGE when forwarded; here we only gate
+    // the option tokens. Returns by_lex (to pick the gather path).
+    let is_bylex = match validate_zrangestore_opts(request) {
+        Ok(by_lex) => by_lex,
+        Err(e) => return e,
+    };
 
     let gathered = if is_bylex {
         match gather_zrange_bylex(inbox, ctx, home, db, &src, request).await {
