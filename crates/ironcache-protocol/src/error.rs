@@ -615,6 +615,31 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "weight value is not a float")
     }
 
+    /// `ERR syntax error, WITHSCORES not supported in combination with BYLEX` - the reply
+    /// Redis emits (src/t_zset.c `genericZrangebyscoreCommand` path / `zrangeGenericCommand`)
+    /// when ZRANGE is given both BYLEX and WITHSCORES (a lex range carries no scores).
+    /// DISTINCT from the generic syntax error so a client can tell the specific conflict.
+    /// Byte-exact.
+    #[must_use]
+    pub fn zrange_withscores_not_with_bylex() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "syntax error, WITHSCORES not supported in combination with BYLEX",
+        )
+    }
+
+    /// `ERR syntax error, LIMIT is only supported in combination with either BYSCORE or
+    /// BYLEX` - the reply Redis emits (src/t_zset.c `zrangeGenericCommand`) when ZRANGE /
+    /// ZRANGESTORE is given LIMIT without BYSCORE or BYLEX (LIMIT is meaningless for an
+    /// index range). DISTINCT from the generic syntax error. Byte-exact.
+    #[must_use]
+    pub fn zrange_limit_only_with_byscore_or_bylex() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX",
+        )
+    }
+
     /// `ERR syntax error` reused for the ZADD `INCR` no-op nil and conflicting-options
     /// cases is NOT this; this is the dedicated ZADD `nan` score path which Redis reports
     /// as the generic not-a-valid-float. (Kept as a named helper so the zset command code
@@ -623,6 +648,16 @@ impl ErrorReply {
     #[must_use]
     pub fn zadd_score_not_a_float() -> Self {
         ErrorReply::not_a_valid_float()
+    }
+
+    /// `ERR resulting score is not a number (NaN)` - the reply Redis emits (src/t_zset.c
+    /// `zaddGenericCommand`, INCR path) when a ZINCRBY / ZADD INCR would produce a NaN
+    /// score (an existing `+inf` incremented by `-inf`, or vice versa). Redis returns this
+    /// WITHOUT mutating the member. DISTINCT from the bad-score-input not-a-valid-float
+    /// error: this is the resulting-score-is-NaN arithmetic case. Byte-exact.
+    #[must_use]
+    pub fn zadd_score_is_nan() -> Self {
+        ErrorReply::new(ErrorCode::Err, "resulting score is not a number (NaN)")
     }
 
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
@@ -953,6 +988,41 @@ mod tests {
         assert_eq!(
             ErrorReply::hash_value_not_a_float().line(),
             "-ERR hash value is not a float"
+        );
+    }
+
+    #[test]
+    fn zset_errors_are_byte_exact() {
+        // Verified against redis/redis src/t_zset.c. The bound/weight parse errors, the
+        // ZADD flag-combination errors, and the resulting-score-is-NaN error (the INCR
+        // path: an existing +inf incremented by -inf). All use the plain `ERR` token.
+        assert_eq!(
+            ErrorReply::min_or_max_not_a_float().line(),
+            "-ERR min or max is not a float"
+        );
+        assert_eq!(
+            ErrorReply::weight_not_a_float().line(),
+            "-ERR weight value is not a float"
+        );
+        assert_eq!(
+            ErrorReply::zadd_gt_lt_nx_incompatible().line(),
+            "-ERR GT, LT, and/or NX options at the same time are not compatible"
+        );
+        // The resulting-score-is-NaN reply (ZINCRBY / ZADD INCR producing NaN). DISTINCT
+        // from the bad-score-input not-a-valid-float error.
+        assert_eq!(
+            ErrorReply::zadd_score_is_nan().line(),
+            "-ERR resulting score is not a number (NaN)"
+        );
+        assert_eq!(ErrorReply::zadd_score_is_nan().code(), ErrorCode::Err);
+        // The ZRANGE BYLEX+WITHSCORES and LIMIT-without-BYSCORE/BYLEX conflict replies.
+        assert_eq!(
+            ErrorReply::zrange_withscores_not_with_bylex().line(),
+            "-ERR syntax error, WITHSCORES not supported in combination with BYLEX"
+        );
+        assert_eq!(
+            ErrorReply::zrange_limit_only_with_byscore_or_bylex().line(),
+            "-ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
         );
     }
 }

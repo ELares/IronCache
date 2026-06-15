@@ -850,6 +850,26 @@ pub struct ZAddOutcome {
     pub new_score: Option<f64>,
 }
 
+/// The outcome of a single ZINCRBY / ZADD INCR (one increment against one member).
+/// Distinguishes the three cases the command layer must reply to differently: the
+/// increment APPLIED (the new score), the increment was SUPPRESSED by a NX/XX/GT/LT flag
+/// (the reply is nil), or the resulting score is NaN (an existing `+inf` incremented by
+/// `-inf`, or vice versa) which Redis reports as an error WITHOUT mutating the member.
+///
+/// The store NEVER stores a NaN: on [`Self::Nan`] the member is left UNCHANGED so the
+/// command layer can return `-ERR resulting score is not a number (NaN)` over a value the
+/// caller can still observe at its prior score.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IncrOutcome {
+    /// The increment applied; the value is the member's new (finite or infinite) score.
+    Updated(f64),
+    /// A NX/XX/GT/LT flag blocked the increment; the member is unchanged. INCR replies nil.
+    Suppressed,
+    /// The resulting score would be NaN (`+inf + -inf`); the member is left UNCHANGED and
+    /// the command layer returns the resulting-score-is-NaN error (no mutation).
+    Nan,
+}
+
 /// The abstract SORTED-SET (zset) mutation + read vocabulary the command layer calls
 /// through the in-place-mutation arm (PR-8, ZSET_LARGE.md, COMMANDS.md zset semantics).
 /// The concrete zset value (`ironcache_store::kvobj::ZSetVal`) implements it; the command
@@ -859,9 +879,11 @@ pub struct ZAddOutcome {
 ///
 /// A zset member is UNIQUE; each carries an `f64` score; the zset is ordered by
 /// `(score ASC, member-bytes ASC)` for equal scores (the Redis skiplist order,
-/// [redis-zset-skiplist-plus-ht]). A NaN score is rejected by the command layer BEFORE
-/// reaching [`Self::add`]/[`Self::incr`], so it never enters the order; `+inf`/`-inf`
-/// are allowed and ordered as the extreme scores.
+/// [redis-zset-skiplist-plus-ht]). A NaN INPUT score is rejected at parse time before
+/// reaching [`Self::add`]/[`Self::incr`]; a NaN ARITHMETIC RESULT inside [`Self::incr`]
+/// (an existing `+inf` incremented by `-inf`) is signalled as [`IncrOutcome::Nan`] WITHOUT
+/// mutating, so a NaN never enters the order. `+inf`/`-inf` are allowed and ordered as the
+/// extreme scores.
 ///
 /// A zset value is NEVER stored empty: when the last member is removed the store deletes
 /// the key (the empty-collection-deletes-key backstop), so an empty zset is never
@@ -875,10 +897,14 @@ pub trait ZSetValue {
     fn add(&mut self, member: &[u8], score: f64, flags: ZAddFlags) -> ZAddOutcome;
 
     /// ZINCRBY / ZADD INCR: add `delta` to `member`'s score (creating it at `delta` if
-    /// absent, UNLESS suppressed by `flags`), returning the new score or `None` if the
-    /// op was suppressed (NX-on-existing / XX-on-missing / GT/LT). The member ordering
-    /// is maintained. The command layer rejects a resulting NaN before this is observed.
-    fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> Option<f64>;
+    /// absent, UNLESS suppressed by `flags`), returning an [`IncrOutcome`]:
+    /// [`IncrOutcome::Updated`] with the new score on success, [`IncrOutcome::Suppressed`]
+    /// when a NX/XX/GT/LT flag blocks it (INCR replies nil), or [`IncrOutcome::Nan`] when
+    /// the resulting score is NaN (`+inf + -inf`). The store NEVER stores a NaN: on the Nan
+    /// outcome the member is left UNCHANGED so the command layer can return the
+    /// resulting-score-is-NaN error over an unmutated value. The member ordering is
+    /// maintained.
+    fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> IncrOutcome;
 
     /// The score of `member` (ZSCORE / ZMSCORE), or `None` if absent.
     fn score(&self, member: &[u8]) -> Option<f64>;
