@@ -147,20 +147,30 @@ pub enum ValueRepr {
     Raw(Box<[u8]>),
     /// A LIST value (PR-5). `OBJECT ENCODING` -> `listpack` while small, `quicklist`
     /// once over the threshold (a pure function of the active repr, #40).
-    List(ListVal),
+    ///
+    /// BOXED (memory Round 1): the four collection structs are the large `ValueRepr`
+    /// variants (`ListVal` 40 / `HashVal` 40 / `SetVal` 48 / `ZSetVal` 64). Holding them
+    /// behind a `Box` drops `ValueRepr` to the [`InlineBuf`] bound, which shrinks every
+    /// per-key `KvObj` and the hashbrown table slot. The string/int hot path
+    /// (`Int`/`Inline`/`Raw`) is UNBOXED so the embstr SSO is untouched; the collections
+    /// already heap-allocate their contents, so the `Box` is a negligible extra
+    /// indirection only on collection ops.
+    List(Box<ListVal>),
     /// A HASH value (PR-6). `OBJECT ENCODING` -> `listpack` while small, `hashtable`
     /// once over the entry-count OR per-element-byte threshold (a pure function of the
-    /// active repr, #40).
-    Hash(HashVal),
+    /// active repr, #40). BOXED (memory Round 1); see [`ValueRepr::List`].
+    Hash(Box<HashVal>),
     /// A SET value (PR-7). `OBJECT ENCODING` -> `intset` while all-integer and small,
     /// `listpack` once a non-integer member is added (and still small), `hashtable` once
     /// over the entry-count OR per-member-byte threshold (a pure function of the active
-    /// repr, #40). The conversion is ONE-WAY (never demotes).
-    Set(SetVal),
+    /// repr, #40). The conversion is ONE-WAY (never demotes). BOXED (memory Round 1);
+    /// see [`ValueRepr::List`].
+    Set(Box<SetVal>),
     /// A ZSET (sorted set) value (PR-8). `OBJECT ENCODING` -> `listpack` while small,
     /// `skiplist` once over the entry-count OR per-member-byte threshold (a pure function
-    /// of the active repr, #40). The conversion is ONE-WAY (never demotes).
-    ZSet(ZSetVal),
+    /// of the active repr, #40). The conversion is ONE-WAY (never demotes). BOXED
+    /// (memory Round 1); see [`ValueRepr::List`].
+    ZSet(Box<ZSetVal>),
 }
 
 impl ValueRepr {
@@ -1800,7 +1810,7 @@ impl KvObj {
         KvObj {
             header: Header::with_type(DataType::List, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
-            value: ValueRepr::List(list),
+            value: ValueRepr::List(Box::new(list)),
             expire_at,
         }
     }
@@ -1814,7 +1824,7 @@ impl KvObj {
         KvObj {
             header: Header::with_type(DataType::Hash, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
-            value: ValueRepr::Hash(hash),
+            value: ValueRepr::Hash(Box::new(hash)),
             expire_at,
         }
     }
@@ -1828,7 +1838,7 @@ impl KvObj {
         KvObj {
             header: Header::with_type(DataType::Set, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
-            value: ValueRepr::Set(set),
+            value: ValueRepr::Set(Box::new(set)),
             expire_at,
         }
     }
@@ -1842,7 +1852,7 @@ impl KvObj {
         KvObj {
             header: Header::with_type(DataType::ZSet, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
-            value: ValueRepr::ZSet(zset),
+            value: ValueRepr::ZSet(Box::new(zset)),
             expire_at,
         }
     }
@@ -1861,7 +1871,9 @@ impl KvObj {
     /// yields `None` -> WRONGTYPE).
     pub fn as_list_mut(&mut self) -> Option<&mut ListVal> {
         match &mut self.value {
-            ValueRepr::List(l) => Some(l),
+            // Deref through the `Box` (memory Round 1) to the `&mut ListVal` the
+            // collection trait + in-place RMW path expect.
+            ValueRepr::List(l) => Some(&mut **l),
             _ => None,
         }
     }
@@ -1871,7 +1883,7 @@ impl KvObj {
     /// `None` -> WRONGTYPE). The HASH analog of [`Self::as_list_mut`].
     pub fn as_hash_mut(&mut self) -> Option<&mut HashVal> {
         match &mut self.value {
-            ValueRepr::Hash(h) => Some(h),
+            ValueRepr::Hash(h) => Some(&mut **h),
             _ => None,
         }
     }
@@ -1881,7 +1893,7 @@ impl KvObj {
     /// -> WRONGTYPE). The SET analog of [`Self::as_list_mut`]/[`Self::as_hash_mut`].
     pub fn as_set_mut(&mut self) -> Option<&mut SetVal> {
         match &mut self.value {
-            ValueRepr::Set(s) => Some(s),
+            ValueRepr::Set(s) => Some(&mut **s),
             _ => None,
         }
     }
@@ -1892,7 +1904,7 @@ impl KvObj {
     /// [`Self::as_set_mut`].
     pub fn as_zset_mut(&mut self) -> Option<&mut ZSetVal> {
         match &mut self.value {
-            ValueRepr::ZSet(z) => Some(z),
+            ValueRepr::ZSet(z) => Some(&mut **z),
             _ => None,
         }
     }

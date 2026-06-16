@@ -823,17 +823,20 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // would each take and drop a fresh `&mut` and obscure the dispatch) so each
             // collection type maps to exactly one arm.
             let entry = match &mut obj.value {
+                // The collection variants are boxed (memory Round 1); deref through the
+                // `Box` (`&mut **`) to the concrete `&mut *Val`, which then coerces to the
+                // `&mut dyn *Value` trait object the typed view constructors take.
                 kvobj::ValueRepr::List(l) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, l))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, &mut **l))
                 }
                 kvobj::ValueRepr::Hash(h) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, h))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, &mut **h))
                 }
                 kvobj::ValueRepr::Set(s) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, s))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, &mut **s))
                 }
                 kvobj::ValueRepr::ZSet(z) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, z))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, &mut **z))
                 }
                 kvobj::ValueRepr::Int(_)
                 | kvobj::ValueRepr::Inline(_)
