@@ -107,7 +107,7 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     let cfg = load_config(cli)?;
     eprintln!(
         "ironcache {}: binding {}:{} across {} shard(s)",
-        env!("CARGO_PKG_VERSION"),
+        cli::BUILD_VERSION,
         cfg.bind,
         cfg.port,
         cfg.shards

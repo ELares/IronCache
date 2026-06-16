@@ -9,6 +9,25 @@ release.
 
 ### Added
 
+- Fully automated versioning and releases, in two channels (RELEASING.md). A new
+  `rolling-release` workflow publishes a calendar-versioned (`YYYY.MMDD.N`)
+  GitHub Release on every push to `main`: four reproducible `cargo-zigbuild`
+  tarballs (x86_64/aarch64, musl/glibc-2.17), a consolidated `SHA256SUMS`, and a
+  keyless Sigstore build-provenance attestation, as a normal release so
+  `releases/latest` tracks the newest build (`[skip release]` opts out). The
+  published version is stamped into the binary via `IRONCACHE_BUILD_VERSION`
+  (read by `option_env!` in `cli::BUILD_VERSION`, with a `build.rs`
+  `rerun-if-env-changed` so a warm target re-stamps), so `ironcache --version`
+  reports the build without touching `Cargo.lock` (pinned at `0.0.0`).
+- The formal `v*` `release` workflow is now a working pipeline rather than a
+  scaffold: a changelog gate (`scripts/ci/changelog-unreleased.sh`) that fails
+  an empty-changelog release before building, a real CycloneDX SBOM export from
+  the embedded `cargo-auditable` data (`auditable2cdx`, #123), a secret-gated
+  minisign signature over `SHA256SUMS` (ADR-0020), a keyless Sigstore
+  attestation, and `v0.*` prerelease marking. Fixed a `SHA256SUMS` bug where a
+  `merge-multiple` artifact-download filename collision left three of the four
+  tarballs unchecksummed; the consolidated file is now rebuilt from the tarballs
+  and self-checked.
 - First engine code (PR-1 "Boot + wire"): a Cargo virtual workspace and a
   minimal-but-real server that accepts RESP connections and answers the Tier-0
   connection commands. Seven crates: `ironcache-env` (the determinism Env seam,

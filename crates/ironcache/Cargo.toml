@@ -9,6 +9,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+# Emits `rerun-if-env-changed=IRONCACHE_BUILD_VERSION` so the compile-time
+# version stamp (cli::BUILD_VERSION) is re-read when the rolling-release workflow
+# changes it; see build.rs.
+build = "build.rs"
 
 [[bin]]
 name = "ironcache"

@@ -10,12 +10,28 @@ use clap::{Parser, Subcommand};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+/// The version string reported by `--version`/`-V` and the server boot banner.
+///
+/// Prefers the compile-time `IRONCACHE_BUILD_VERSION` (the rolling-release
+/// workflow stamps the calendar version `YYYY.MMDD.N` there, see RELEASING.md)
+/// and otherwise the workspace package version `CARGO_PKG_VERSION` (the normal
+/// dev/CI/test case, where the lockfile pins every crate at `0.0.0`).
+/// `option_env!` is read at compile time and never touches `Cargo.lock`, so it
+/// cannot break `cargo build --locked` the way bumping the `Cargo.toml` version
+/// would. `build.rs` emits `rerun-if-env-changed=IRONCACHE_BUILD_VERSION`, so a
+/// cached target still re-stamps when the variable changes rather than baking a
+/// stale value.
+pub const BUILD_VERSION: &str = match option_env!("IRONCACHE_BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Top-level CLI. The default subcommand (none given) is `server`, matching
 /// `ironcache server` zero-config boot (CLI_BINARY.md).
 #[derive(Debug, Parser)]
 #[command(
     name = "ironcache",
-    version,
+    version = BUILD_VERSION,
     about = "The most efficient Redis-compatible cache, in one static binary.",
     propagate_version = true
 )]
@@ -102,6 +118,24 @@ mod tests {
     fn cli_definition_is_valid() {
         // Catches arg-conflict / id-collision bugs at test time.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn build_version_matches_option_env_fallback() {
+        // BUILD_VERSION is IRONCACHE_BUILD_VERSION when the rolling-release
+        // workflow stamps it, and CARGO_PKG_VERSION otherwise. Mirror that exact
+        // fallback so this holds in both worlds (dev/CI where the var is unset,
+        // and a stamped release build where it is set).
+        let expected = option_env!("IRONCACHE_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+        assert_eq!(BUILD_VERSION, expected);
+        assert!(!BUILD_VERSION.is_empty());
+    }
+
+    #[test]
+    fn clap_version_is_wired_to_build_version() {
+        // The `version = BUILD_VERSION` attribute must actually reach clap, so
+        // `--version` prints the stamped build and not Cargo's `0.0.0`.
+        assert_eq!(Cli::command().get_version(), Some(BUILD_VERSION));
     }
 
     #[test]
