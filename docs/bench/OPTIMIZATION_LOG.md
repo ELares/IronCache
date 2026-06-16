@@ -95,6 +95,32 @@ single-alloc rewrite subsumes them (no tunnel vision on soon-replaced changes).
 
 | 6 | SPEED: O(1) S3-FIFO eviction index (generational slab + `hashbrown` index + handle queues) - kill the per-access O(N) scan | `bump_freq`/`tracks`/`remove` O(N)->O(1); `bump_freq` was the #1 IronCache COMPUTE frame in the load profile (3937 samples of linear queue scan on every access) | no per-key memory regression (key stored once in the slab; index holds only a u32; perf-gate bytes/key 0.00% change) | **perf-gate (same-runner HEAD vs base, Linux CI): qps_median 76861 -> 98914 = +28.69% PASS**; local macOS ~150k -> ~158k (modest there, fast cores so the scan was a smaller share); `bump_freq` profile 3937 -> 0 samples | **KEPT** - the #1 compute cost removed; 852 tests green; 2-lens adversarial review fuzz-proved soundness (4400 runs: live-counter/termination/index/ABA invariants) AND caught + fixed a MEDIUM ghost-cap fidelity divergence (free before ghost_record), regression-tested |
 
+| 7 | MEMORY: freq-in-object (move the 2-bit S3-FIFO freq onto the kvobj; slim the policy) | round 6's slab+index+handles added ~28 B/key to whole-process used_memory (INFO = jemalloc allocated), losing the memory h2h; reclaim it by dropping the index | h2h (128B/200k Linux) bytes/key 245 -> **216.6** (vs redis 234.85 = **0.92x WIN**, reclaimed); freq packs into the Str blob's spare flag bits (0 store bytes) | qps DROPPED 140k -> 70k on the slow Linux vCPU (the slimmed policy's on_remove is O(N) splice, fired on every replace) - SEE ROUND 8 | **KEPT (then fixed by round 8)** - reclaimed memory; 2-lens review SOUND + pinned an intentional freq-on-replace fidelity change; the speed regression it introduced is fixed in round 8 |
+
+| 8 | SPEED: a value-replace skips the eviction policy | round 7's O(N) on_remove fired on every value-replace (put_object did on_remove+on_insert) -> O(N) scan per SET, halving throughput on the slow vCPU | unchanged (accounting-only on replace) | h2h qps 70k -> **204.9k vs redis 179.9k = 1.14x WIN**; perf-gate qps +9.25% | **KEPT** - a value-replace does not change S3-FIFO membership (insertion-ordered; a write bumps freq via the carry, never repositions), so the policy is untouched on replace; hot path O(1) again |
+
+### MILESTONE (2026-06-16): CLEAR WINNER over redis on BOTH memory AND speed (indicative pinned-Linux h2h)
+After rounds 1-8, the pinned-Linux head-to-head (vs redis-server 7.0.15, 2 disjoint
+cores, 200k keys, 128B) shows IronCache winning BOTH headline metrics:
+
+| metric | IronCache | redis 7.0.15 | ratio | verdict |
+| --- | ---: | ---: | ---: | --- |
+| bytes-per-key (used_memory delta) | 216.6 | 234.85 | 0.92x | **WIN (memory)** |
+| qps (closed-loop, pinned) | 204862 | 179885 | 1.14x | **WIN (speed)** |
+
+The journey: from the 2026-06-16 baseline of **2.41x heavier memory and ~7x slower
+speed** to a clear win on both. HONESTY: the competitor is redis-server 7.0.15 (the
+ubuntu apt stand-in), NOT redis 8.8.0 (which adds io-threads) or the published bar
+valkey-server 9.1.0; and a GitHub-hosted 4-vCPU shared VM is INDICATIVE, not
+publishable. The memory ratio (0.92x) is a deterministic used_memory delta (reliable);
+the qps ratio has runner-to-runner variance (redis ranged 132k-180k across runs) but the
+post-round-8 ratio is consistently > 1. The AUTHORITATIVE claim still needs a dedicated
+bare-metal pinned-Linux run vs valkey 9.1.0 / redis 8.8.0 (docs/bench/COMPETITORS.md).
+LESSON: only the Linux h2h caught both the round-6 memory regression and the round-7
+speed regression - the perf-gate's memmodel measures the store in isolation (misses
+eviction-policy memory) and a fast runner hides O(N)-on-writes costs; ALWAYS re-run the
+Linux h2h after an eviction/datapath change.
+
 ### Round 6 detail (SPEED: the eviction hot path)
 The load profile (macOS `sample` under ~150k qps) showed the hottest IronCache COMPUTE
 frame was `ironcache_eviction::s3fifo::S3Fifo::bump_freq` (3937 samples) - a LINEAR SCAN
