@@ -8,19 +8,17 @@ is cut on every push to `main`, with no human tagging required.
 
 | Platform | Build target (internal) | Published asset |
 | --- | --- | --- |
-| x86_64, static | `x86_64-unknown-linux-musl` | `ironcache-linux-amd64-musl.tar.gz` |
-| aarch64, static | `aarch64-unknown-linux-musl` | `ironcache-linux-arm64-musl.tar.gz` |
-| x86_64, glibc >= 2.17 | `x86_64-unknown-linux-gnu.2.17` | `ironcache-linux-amd64-glibc.tar.gz` |
-| aarch64, glibc >= 2.17 | `aarch64-unknown-linux-gnu.2.17` | `ironcache-linux-arm64-glibc.tar.gz` |
+| x86_64, static | `x86_64-unknown-linux-musl` | `ironcache-<ver>-linux-amd64-musl.tar.gz` |
+| aarch64, static | `aarch64-unknown-linux-musl` | `ironcache-<ver>-linux-arm64-musl.tar.gz` |
+| x86_64, glibc >= 2.17 | `x86_64-unknown-linux-gnu.2.17` | `ironcache-<ver>-linux-amd64-glibc.tar.gz` |
+| aarch64, glibc >= 2.17 | `aarch64-unknown-linux-gnu.2.17` | `ironcache-<ver>-linux-arm64-glibc.tar.gz` |
 
-The published asset name uses a friendly CPU-arch (`amd64`/`arm64`) plus libc
-flavor, dropping the Rust triple's `unknown` vendor field (which confuses
-non-Rust operators), and carries no version, so
-`https://github.com/ELares/IronCache/releases/latest/download/<asset>` is a
-stable URL across builds (the version lives in the release tag and in
-`ironcache --version`). The `musl` builds are fully static (no libc needed); the
-`glibc` builds pin a glibc 2.17 floor for older distributions. Both carry an
-embedded `cargo-auditable` SBOM.
+The published asset name is `ironcache-<version>-linux-<arch>-<libc>.tar.gz`: a
+friendly CPU-arch (`amd64`/`arm64`) plus libc flavor, dropping the Rust triple's
+`unknown` vendor field (which confuses non-Rust operators), with the version in
+the name. The `musl` builds are fully static (no libc needed); the `glibc`
+builds pin a glibc 2.17 floor for older distributions. Both carry an embedded
+`cargo-auditable` SBOM.
 
 ## The two channels
 
