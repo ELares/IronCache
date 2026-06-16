@@ -184,13 +184,15 @@ COMPETITOR_VERSION_RAW="$("${COMPETITOR_BIN}" --version 2>&1 | head -n1)"
 COMPETITOR_KIND="unknown"
 COMPETITOR_NAME="competitor"
 case "${COMPETITOR_VERSION_RAW}" in
-  *[Vv]alkey*) COMPETITOR_KIND="valkey"; COMPETITOR_NAME="valkey" ;;
-  *[Rr]edis*)  COMPETITOR_KIND="redis";  COMPETITOR_NAME="redis"  ;;
+  *[Dd]ragonfly*) COMPETITOR_KIND="dragonfly"; COMPETITOR_NAME="dragonfly" ;;
+  *[Vv]alkey*)    COMPETITOR_KIND="valkey";    COMPETITOR_NAME="valkey" ;;
+  *[Rr]edis*)     COMPETITOR_KIND="redis";     COMPETITOR_NAME="redis"  ;;
   *)
     # Fall back to the binary name when the banner is unrecognized.
     case "${COMPETITOR_BASENAME}" in
-      *valkey*) COMPETITOR_KIND="valkey"; COMPETITOR_NAME="valkey" ;;
-      *redis*)  COMPETITOR_KIND="redis";  COMPETITOR_NAME="redis"  ;;
+      *dragonfly*) COMPETITOR_KIND="dragonfly"; COMPETITOR_NAME="dragonfly" ;;
+      *valkey*)    COMPETITOR_KIND="valkey";    COMPETITOR_NAME="valkey" ;;
+      *redis*)     COMPETITOR_KIND="redis";     COMPETITOR_NAME="redis"  ;;
     esac
     ;;
 esac
@@ -209,6 +211,13 @@ if [[ "${COMPETITOR_KIND}" == "redis" ]]; then
   echo "[h2h] WARNING: redis-server is a STAND-IN competitor (RESP/Valkey-wire-compatible)."
   echo "[h2h] WARNING: the PUBLISHED bar is the pinned valkey-server ${PINNED_VALKEY_VERSION}"
   echo "[h2h] WARNING: (docs/bench/COMPETITORS.md). This verdict is INDICATIVE until run vs valkey."
+elif [[ "${COMPETITOR_KIND}" == "dragonfly" ]]; then
+  STANDIN=1
+  echo "[h2h] NOTE: competitor is DragonflyDB (a thread-per-core io_uring cache, the"
+  echo "[h2h] NOTE: hardest RESP competitor; docs/research/dragonfly.md). It is a legitimate"
+  echo "[h2h] NOTE: head-to-head, but the PUBLISHED bar is the pinned valkey-server"
+  echo "[h2h] NOTE: ${PINNED_VALKEY_VERSION}, so this verdict is INDICATIVE (and a GitHub runner is"
+  echo "[h2h] NOTE: a small shared VM - Dragonfly's multi-core design needs real cores to shine)."
 elif [[ "${COMPETITOR_KIND}" == "valkey" ]]; then
   if [[ "${COMPETITOR_VERSION}" != "${PINNED_VALKEY_VERSION}" ]]; then
     STANDIN=1
@@ -490,6 +499,18 @@ measure_server() {
     IRONCACHE_MAXMEMORY="${MAXMEMORY}" IRONCACHE_SHARDS="${ic_shards}" \
       ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${IRONCACHE_BIN}" \
       --port "${PORT}" --shards "${ic_shards}" server \
+      >"${SERVER_LOG}" 2>&1 &
+    SERVER_PID=$!
+  elif [[ "${kind}" == "dragonfly" ]]; then
+    # DragonflyDB: its own flags. `--proactor_threads N` is the thread-per-core knob
+    # (the --io-threads analog), pinned to the same core set. Snapshots off via an empty
+    # `--dbfilename`. A GENEROUS `--maxmemory` (not 0 - Dragonfly requires a positive
+    # ceiling) so the populate never evicts, matching IronCache's overlay. Dragonfly uses
+    # io_uring by default on a modern kernel (the runner is 6.x); no fallback flag needed.
+    echo "[h2h] starting ${name} on ${HOST}:${PORT} (proactor_threads=${SERVER_CORE_COUNT}, maxmemory=${MAXMEMORY}, snapshots off)..."
+    ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
+      --port "${PORT}" --bind "${HOST}" --proactor_threads "${SERVER_CORE_COUNT}" \
+      --maxmemory "${MAXMEMORY}" --dbfilename '' --primary_port_http_enabled=false \
       >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
   else
