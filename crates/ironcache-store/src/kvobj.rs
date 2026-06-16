@@ -57,13 +57,14 @@ pub struct Header {
     pub data_type: DataType,
     /// The value encoding (4-bit field in the packed layout).
     pub encoding: Encoding,
-    /// The S3-FIFO eviction rank: a 2-bit frequency counter capped at 3 (ADR-0008).
-    /// RESERVED: in PR-3a the S3-FIFO 2-bit frequency is owned by the POLICY (a
-    /// per-key counter on the queued entry), because `select_victim` is policy-only
-    /// and cannot borrow this header. This field is carried for the eventual
-    /// single-source-of-truth migration (when the decision path can read the rank
-    /// across the storage boundary, a later PR), but the access path does NOT write it
-    /// today, since nothing reads it. Stored as a `u8` here, masked to two bits.
+    /// The 2-bit access frequency counter, capped at 3. This is the SINGLE SOURCE OF
+    /// TRUTH for eviction frequency (the freq-in-object work that superseded ADR-0008's
+    /// policy-owned S3-FIFO queues): the access path WRITES it (the store calls
+    /// `bump_freq` inline on every read) and the eviction path READS it (the cache-mode
+    /// `evict_to_fit` table-scan evicts the lowest-frequency entries first). It lives in
+    /// the live tagged-pointer `Entry` (the Str blob flags byte for thin string objects,
+    /// `CollEntry.eviction_rank` for boxed collections), NOT in this owned `Header` view,
+    /// which is the read-complete decode helper. Stored as a `u8`, masked to two bits.
     pub eviction_rank: u8,
     /// Whether a TTL deadline is present (the TTL-present flag bit). Mirrors
     /// `expire_at.is_some()`; kept explicit to match the packed-header shape.

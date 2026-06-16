@@ -105,6 +105,52 @@ fn cache_mode_under_budget_is_a_noop() {
 }
 
 #[test]
+fn cross_db_eviction_tie_break_is_deterministic() {
+    // The same key bytes can be resident in two dbs at the same frequency (each db is its
+    // own table; `scan_hash` is key-only), so the two eviction candidates differ ONLY in
+    // `db`. The victim sort must break that tie on `db` for a TOTAL, deterministic order
+    // (ADR-0003): without it the two candidates compare Equal and `sort_unstable` is free
+    // to order them by hashbrown's per-table RANDOMIZED iteration order, evicting a
+    // different db run-to-run. We force exactly one eviction over many FRESH stores (each
+    // with a fresh randomized hash state) and assert the LOWER db index is ALWAYS the
+    // victim; a regression would flip some iterations.
+    for _ in 0..64 {
+        let mut st = store_with(Policy::cache_default());
+        let v = vec![b'v'; 100];
+        // Identical (freq 0, scan_hash, key) in db 0 and db 1; differ only in db.
+        st.upsert(
+            0,
+            b"TIE",
+            NewValue::Bytes(&v),
+            ExpireWrite::Clear,
+            UnixMillis(0),
+        );
+        st.upsert(
+            1,
+            b"TIE",
+            NewValue::Bytes(&v),
+            ExpireWrite::Clear,
+            UnixMillis(0),
+        );
+        let two = st.used_memory();
+        // Budget fits exactly one of the two equal-size copies: exactly one eviction.
+        let evicted = st.evict_to_fit(two / 2, UnixMillis(0));
+        assert_eq!(
+            evicted, 1,
+            "exactly one of the two tied copies must be evicted"
+        );
+        assert!(
+            st.read(0, b"TIE", UnixMillis(0)).is_none(),
+            "the lower-db (db 0) copy must be the deterministic victim"
+        );
+        assert!(
+            st.read(1, b"TIE", UnixMillis(0)).is_some(),
+            "the higher-db (db 1) copy must survive"
+        );
+    }
+}
+
+#[test]
 fn volatile_only_evicts_ttl_keys_and_spares_non_ttl_keys() {
     // volatile-* restricts victims to TTL-bearing keys. Mix TTL and non-TTL keys,
     // force eviction, and confirm only the TTL keys can be freed.

@@ -1228,14 +1228,20 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
             // The expired-reap alone got us under budget; no LFU eviction needed.
             return 0;
         }
-        // Sort the LIVE candidates by ascending (freq, scan_hash, key): evict the
-        // lowest-frequency first, deterministic `scan_hash`/key tie-break (ADR-0003).
+        // Sort the LIVE candidates by ascending (freq, scan_hash, key, db): evict the
+        // lowest-frequency first, deterministic tie-break (ADR-0003). The `db` is the FINAL
+        // tie-break so the order is TOTAL: the same key bytes can be resident in two dbs at
+        // the same freq (each db is its own table; `scan_hash` is key-only), and without the
+        // `db` key those two candidates compare Equal, leaving `sort_unstable` free to order
+        // them by hashbrown's per-table randomized iteration order, which would make two
+        // shards with identical state evict different keys.
         let mut live: Vec<Candidate> = candidates.into_iter().filter(|c| !c.expired).collect();
         live.sort_unstable_by(|a, b| {
             a.freq
                 .cmp(&b.freq)
                 .then_with(|| a.scan_h.cmp(&b.scan_h))
                 .then_with(|| a.key.cmp(&b.key))
+                .then_with(|| a.db.cmp(&b.db))
         });
         // Walk candidates lowest-freq first and evict until `used <= budget`, then STOP.
         // This may evict warm keys in an all-warm keyspace (there is no other way to fit),
