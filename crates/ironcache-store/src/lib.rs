@@ -43,7 +43,7 @@ pub mod kvobj;
 use bytes::Bytes;
 use hashbrown::hash_map::Entry as WatchMapEntry;
 use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
-use ironcache_eviction::{EvictionPolicy, Policy, map_policy_name};
+use ironcache_eviction::{EvictionPolicy, Policy, VictimStrategy, map_policy_name};
 use ironcache_storage::{
     AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
     MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
@@ -1104,36 +1104,181 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
     /// hit). Returns the number of entries evicted (ADMISSION.md evict-to-fit;
     /// ADR-0007 cache mode).
     ///
-    /// The loop condition is strict `>` to match Redis's getMaxmemoryState (evict.c):
+    /// The over-budget test is strict `>` to match Redis's getMaxmemoryState (evict.c):
     /// memory is "under limit" at `used <= maxmemory`, so eviction frees down to
-    /// `used <= budget` (NOT strictly below it) and stops the instant the budget is
-    /// met exactly.
+    /// `used <= budget` (NOT strictly below it). When already at or under budget this is
+    /// a NO-OP that frees nothing (preserved across both victim strategies).
     ///
-    /// The store drives the policy through the [`EvictionHook`] surface: each round
-    /// asks [`EvictionHook::select_victim`] for a `(db, key)` and deletes it (which
-    /// fires `on_remove` and frees its bytes through the accounting hook), stopping as
-    /// soon as the budget is met. If `select_victim` returns `None` the policy cannot
-    /// free anything (an empty keyspace, or the `noeviction` policy), so we stop and
-    /// return what we evicted so far; the caller then decides whether to reply `-OOM`.
+    /// ## Two victim strategies (the zero-per-key-state cache-mode refactor)
     ///
-    /// ## Volatile-only enforcement (the #46 re-eligibility fix, completed in 3b)
+    /// The store branches on [`EvictionPolicy::victim_strategy`]:
+    ///
+    /// - [`VictimStrategy::None`] (`noeviction`): free nothing, return 0. The caller then
+    ///   replies `-OOM`.
+    /// - [`VictimStrategy::TableScanLowestFreq`] (the cache-mode default): the policy
+    ///   holds NO per-key state, so the store scans its own table for the lowest-frequency
+    ///   live entries and evicts those first (exact LFU over the in-object 2-bit freq).
+    ///   See [`Self::evict_to_fit_table_scan`].
+    /// - [`VictimStrategy::Roster`] (`Random` / `WTinyLfu`): the policy keeps its own
+    ///   candidate roster, driven round-by-round through [`EvictionHook::select_victim`].
+    ///   See [`Self::evict_to_fit_roster`].
+    fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
+        // NO-OP when already under budget, for EVERY strategy (preserved): the strict `>`
+        // test means a single under-budget call frees nothing and does not even scan.
+        if self.used_memory() <= budget_bytes {
+            return 0;
+        }
+        match self.eviction.victim_strategy() {
+            VictimStrategy::None => 0,
+            VictimStrategy::TableScanLowestFreq => self.evict_to_fit_table_scan(budget_bytes, now),
+            VictimStrategy::Roster => self.evict_to_fit_roster(budget_bytes, now),
+        }
+    }
+
+    /// The access-frequency estimate for OBJECT FREQ, delegated to the configured
+    /// policy (only the W-TinyLFU LFU engine returns `Some`; non-LFU policies return
+    /// `None`, which dispatch maps to the OBJECT FREQ LFU-gating error). Read-only.
+    fn access_freq(&self, db: u32, key: &[u8]) -> Option<u8> {
+        self.eviction.access_freq(db, key)
+    }
+}
+
+impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
+    /// Evict the lowest-frequency live entries by SCANNING the store's own table (the
+    /// [`VictimStrategy::TableScanLowestFreq`] cache-mode path). The eviction policy holds
+    /// NO per-key state: the 2-bit access frequency lives ON each stored object (bumped by
+    /// the store inline on read), so a single O(N) pass over the over-budget db's table
+    /// collects every eligible candidate's `(freq, scan_hash, key)`, and the store evicts
+    /// the LOWEST-freq candidates first (exact LFU). Returns the count evicted.
+    ///
+    /// ## Determinism (ADR-0003)
+    ///
+    /// Candidates are evicted in ascending `(freq, scan_hash, key)` order: frequency is the
+    /// primary key (the LFU signal), and `scan_hash` (then the raw key bytes, to break a
+    /// 64-bit hash collision) is the deterministic tie-break SCAN/RANDOMKEY already use. No
+    /// RNG, no wall-clock; two shards with identical keyspaces and access history evict the
+    /// same keys.
+    ///
+    /// ## Volatile-only (preserved)
+    ///
+    /// Under a `volatile_only` policy ONLY TTL-bearing entries are collected as candidates
+    /// (a non-TTL entry is skipped during the pass, never deleted), so the non-TTL keys are
+    /// spared exactly as before. If no TTL-bearing key exists nothing is collected and the
+    /// pass frees nothing (the -OOM path), matching Redis volatile-* with no expirable key.
+    ///
+    /// ## Evict EXACTLY to fit (Redis maxmemory semantics)
+    ///
+    /// The pass evicts the coldest candidates until `used <= budget`, then STOPS: it never
+    /// sheds live data that already fits. This matches Redis's evict loop (free until under
+    /// `maxmemory`, then stop) and keeps the behavior unsurprising on every keyspace size.
+    /// An already-expired candidate is reaped (the lazy backstop) and counts as forward
+    /// progress, not an eviction.
+    ///
+    /// The cost is one O(N) table scan per eviction EPISODE (the price of holding zero
+    /// per-key eviction state on a `hashbrown::HashTable`, which exposes no cheap random
+    /// sampling). This is OFF the throughput/memory benchmark path (those run with a ceiling
+    /// that holds the whole dataset, so eviction never fires); making sustained-eviction
+    /// workloads cheaper (segment-local or sampled eviction) is a separate future lever.
+    fn evict_to_fit_table_scan(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
+        // A collected eviction candidate (declared before any statement to satisfy
+        // clippy::items_after_statements). `freq` is the in-object 2-bit frequency (the
+        // LFU sort key), `scan_h` the deterministic scan-order tie-break (ADR-0003).
+        struct Candidate {
+            freq: u8,
+            scan_h: u64,
+            key: Box<[u8]>,
+            db: u32,
+            expired: bool,
+        }
+        let volatile_only = self.eviction.volatile_only();
+        // ONE pass over every db's table, collecting eligible candidates as
+        // (freq, scan_hash, key, db). The 2-bit freq is read straight off the object, so
+        // no per-key policy lookup is needed. Under volatile-only, only TTL-bearing live
+        // entries are eligible; an already-expired entry is collected as a free reap.
+        // `expired` candidates are kept (freq sorts them with the rest, but they free bytes
+        // for nothing), so list them FIRST (freq 0-equivalent is not special; instead we
+        // reap them up front, below, before the LFU eviction).
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (db_idx, table) in self.dbs.iter().enumerate() {
+            let db = db_idx as u32;
+            for obj in table {
+                let expired = obj.is_expired(now);
+                if !expired && volatile_only && obj.expire_at().is_none() {
+                    // Volatile-only spares a live non-TTL entry: it is NOT a candidate.
+                    continue;
+                }
+                let key = obj.key().to_vec().into_boxed_slice();
+                candidates.push(Candidate {
+                    freq: obj.freq(),
+                    scan_h: scan_hash(&key),
+                    key,
+                    db,
+                    expired,
+                });
+            }
+        }
+        // Reap already-expired candidates FIRST: they are dead weight the lazy/active
+        // backstops would reap anyway, so freeing them is free budget and counts as forward
+        // progress (NOT an eviction). This also shrinks what the LFU pass must evict.
+        for c in candidates.iter().filter(|c| c.expired) {
+            let db_idx = self.db_index(c.db);
+            self.expire_if_due(c.db, db_idx, &c.key, now);
+        }
+        if self.used_memory() <= budget_bytes {
+            // The expired-reap alone got us under budget; no LFU eviction needed.
+            return 0;
+        }
+        // Sort the LIVE candidates by ascending (freq, scan_hash, key): evict the
+        // lowest-frequency first, deterministic `scan_hash`/key tie-break (ADR-0003).
+        let mut live: Vec<Candidate> = candidates.into_iter().filter(|c| !c.expired).collect();
+        live.sort_unstable_by(|a, b| {
+            a.freq
+                .cmp(&b.freq)
+                .then_with(|| a.scan_h.cmp(&b.scan_h))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        // Walk candidates lowest-freq first and evict until `used <= budget`, then STOP.
+        // This may evict warm keys in an all-warm keyspace (there is no other way to fit),
+        // but always the coldest first, so the hottest keys are the LAST to go. It never
+        // sheds a key that already fits: budget met == loop done.
+        let mut evicted: u64 = 0;
+        for c in live {
+            if self.used_memory() <= budget_bytes {
+                break;
+            }
+            let db_idx = self.db_index(c.db);
+            if self.remove_object(c.db, db_idx, &c.key) {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    /// Evict by driving the policy's OWN candidate roster round-by-round through
+    /// [`EvictionHook::select_victim`] (the [`VictimStrategy::Roster`] path for `Random`
+    /// and `WTinyLfu`). Each round asks for a `(db, key)` and deletes it (firing
+    /// `on_remove` + freeing its bytes through the accounting hook), stopping as soon as
+    /// the budget is met. If `select_victim` returns `None` the policy can free no more, so
+    /// we return what we freed so far; the caller then decides whether to reply `-OOM`.
+    ///
+    /// ## Volatile-only enforcement (the #46 re-eligibility fix)
     ///
     /// For a `volatile_only` policy (the `volatile-*` family) only TTL-bearing keys
     /// are eligible. The frozen hooks do not pass TTL to the policy, so the FILTER
     /// lives here, where the store can read `expire_at`: a victim with NO TTL is
     /// RE-REGISTERED into the policy (NON-DESTRUCTIVELY, via
     /// [`EvictionPolicy::re_register`]) rather than dropped, and the loop asks for the
-    /// next victim. Re-registering (instead of the PR-3a `on_remove` drop) is the #46
-    /// fix: a non-TTL key the store declines to evict STAYS an eviction candidate, so
-    /// once a later EXPIRE attaches a TTL it becomes eligible. The scan is bounded by
-    /// tracking the distinct keys examined-and-skipped this call: once that set covers
-    /// the whole live keyspace with no eligible TTL-bearing victim found, the loop
-    /// returns what it freed so far (zero, here), leaving the over-budget write to be
-    /// rejected `-OOM` (matching Redis volatile-* with no expirable keys).
+    /// next victim. Re-registering (instead of an `on_remove` drop) is the #46 fix: a
+    /// non-TTL key the store declines to evict STAYS an eviction candidate, so once a later
+    /// EXPIRE attaches a TTL it becomes eligible. The scan is bounded by tracking the
+    /// distinct keys examined-and-skipped this call: once that set covers the whole live
+    /// keyspace with no eligible TTL-bearing victim found, the loop returns what it freed
+    /// so far (zero, here), leaving the over-budget write to be rejected `-OOM` (matching
+    /// Redis volatile-* with no expirable keys).
     ///
     /// `now` is consulted only to skip an ALREADY-expired victim (it will be reaped
     /// lazily anyway). The iteration cap is a defensive secondary bound.
-    fn evict_to_fit(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
+    fn evict_to_fit_roster(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
         let volatile_only = self.eviction.volatile_only();
         let mut evicted: u64 = 0;
         // The bounded-scan guard for the #46 re-eligibility fix, as a DISTINCT-KEY set.
@@ -1235,13 +1380,6 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
             // asks for the next victim; it does not count as an eviction.
         }
         evicted
-    }
-
-    /// The access-frequency estimate for OBJECT FREQ, delegated to the configured
-    /// policy (only the W-TinyLFU LFU engine returns `Some`; non-LFU policies return
-    /// `None`, which dispatch maps to the OBJECT FREQ LFU-gating error). Read-only.
-    fn access_freq(&self, db: u32, key: &[u8]) -> Option<u8> {
-        self.eviction.access_freq(db, key)
     }
 }
 
