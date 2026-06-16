@@ -88,7 +88,7 @@ jobs:
       RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build -C strip=symbols"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install Rust + cargo-zigbuild + cargo-auditable
+      - name: Install Rust + zig + cargo-zigbuild + cargo-auditable
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -97,6 +97,14 @@ jobs:
           # cargo-zigbuild itself consumes the dotted suffix on --target below.
           rustup target add "${TARGET%%.*}" || true
           cargo install --locked cargo-zigbuild cargo-auditable
+          # cargo-zigbuild shells out to `zig cc` as the cross-linker, so zig must
+          # be present (the cargo plugin alone is not enough). Install a pinned zig
+          # via the ziglang wheel so the cross-build stays reproducible;
+          # cargo-zigbuild discovers it through `python3 -m ziglang`. Pin 0.14.x to
+          # stay before zig 0.15+'s clang-18 requirement. --break-system-packages:
+          # the runner's system python is PEP 668 externally-managed.
+          python3 -m pip install --break-system-packages ziglang==0.14.1
+          python3 -m ziglang version
       - name: Cross-build (locked, reproducible, embedded SBOM)
         env:
           # Stamp the tag's version into the binary so `ironcache --version`
