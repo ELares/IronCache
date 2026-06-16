@@ -95,3 +95,36 @@ Run `scripts/bench/headtohead.sh` on a pinned Linux runner against valkey-server
 9.1.0 for the authoritative verdict, then execute L1 as the first optimization PR
 under the A5 perf-gate. The measurement infrastructure (A1 to A5) is complete and
 makes that work measurable and regression-safe.
+
+## UPDATE (2026-06-16): the pinned-Linux throughput verdict, and where the gap actually is
+
+The pinned-Linux head-to-head above was RUN (CI workflow `headtohead.yml`, ubuntu
+runner, server `taskset` 0-1 / client 2-3, 200k keys, 128B). It OVERTURNED the
+"throughput parity is probably a measurement artifact" guidance: on a clean pinned
+box IronCache did **~9k qps/core vs redis ~65k/core (~7x slower)**. Memory stayed a
+clear win on Linux too (0.92x). So the throughput gap is REAL, not a macOS artifact.
+
+The root cause was then isolated (measure-first, before touching any code):
+
+- **NOT the cross-shard coordinator.** Per-core throughput is FLAT as shards grow
+  (local: 1/2/4 shards all ~35k/core) while the cross-shard fraction climbs
+  0%->75%. The oneshot+mpsc hop is cheap.
+- **NOT thread oversubscription.** A controlled CI probe (the `IRONCACHE_SHARDS`
+  knob) ran 1 shard vs 2 shards on the SAME 2 pinned cores: 8.7k -> 17.2k qps, a
+  near-linear ~2x. Adding a shard thread DOUBLES throughput, so there is no
+  oversubscription collapse; IronCache scales cleanly with cores.
+- **IT IS per-request datapath cost.** A CPU profile under load (150k qps, macOS
+  `sample`) shows self-time dominated by syscalls + the async reactor + thread
+  parking: `kevent` + `__semwait_signal` + `__sendto` + `__recvfrom` ~= 24k
+  samples vs the IronCache compute + `memcmp`/`memmove` ~= 6k (~80% I/O+reactor,
+  ~20% cache logic). IronCache pays ~one `recv` + one `send` + tokio reactor/
+  task-scheduling round-trip PER request, where redis's hand-rolled epoll loop is
+  far leaner per op. The cache logic itself is cheap; the I/O datapath is the cost.
+
+So the throughput lever is the **I/O datapath, issue #28 (io_uring)** -- batched
+submission/completion to cut the per-request syscall + reactor overhead -- and/or a
+leaner event loop with read/write batching. It is NOT a memory, sharding, or
+threading change (memory is already a clear win; sharding/threading scale fine).
+The AUTHORITATIVE absolute number still wants a dedicated bare-metal pinned-Linux
+box vs valkey 9.1.0 (a shared GitHub 4-vCPU VM is indicative only), but the SHAPE
+of the gap (reactor/syscall-bound per-op) is now measured and clear.
