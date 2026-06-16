@@ -1,0 +1,206 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Per-PR PERFORMANCE-REGRESSION gate (PERF_REGRESSION_GATE.md #159, PR-A5 of the
+# performance track). It fails a PR that regresses the ADR-0016 headline metrics past
+# budget, comparing HEAD against the PR's merge-base measured on the SAME runner in the
+# SAME job (the doc sanctions a fresh build-and-measure of the merge-base; a committed
+# baseline fast-path is a documented FUTURE optimization).
+#
+# The two headline metrics (smaller halves of ADR-0016): bytes_per_key (deterministic,
+# allocator-true memmodel; tight budget, may NOT rise) and qps (noisy peak throughput
+# proxy; median of N short reps, generous budget + noise band, may NOT fall). Open-loop
+# tails / criterion micro-benches are reported-not-failed, not part of this ratchet.
+#
+# Flow: build release TWICE on this runner (a merge-base git WORKTREE, then HEAD) and
+# boot a short server each time. That double-build-and-boot is EXPECTED for a same-runner
+# gate; the macro point is kept SHORT so the job fits a per-PR budget. The job runs only
+# when Rust sources / Cargo manifests / the gate itself change (docs-only PRs skip), and
+# is guarded by the same has_cargo idiom rust.yml/release.yml use so a docs-only repo
+# state is a no-op. `[skip perf]` in the head commit is an escape hatch.
+name: perf-gate
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/bench/**"
+      - ".github/workflows/perf-gate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  guard:
+    name: guard (skip until a Cargo project exists)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_cargo: ${{ steps.check.outputs.has_cargo }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] && [ -f Cargo.lock ]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::repo is docs-only (no Cargo.toml/Cargo.lock); perf-gate is a no-op"
+          fi
+
+  perf-gate:
+    name: perf-gate (bytes_per_key + qps ratchet vs merge-base)
+    needs: guard
+    # Gate on a real Cargo project existing AND the head commit not opting out with
+    # [skip perf]. On workflow_dispatch there is no PR head-commit context, so the
+    # skip clause only applies to pull_request events.
+    if: >-
+      needs.guard.outputs.has_cargo == 'true' &&
+      ( github.event_name == 'workflow_dispatch' ||
+        !contains(github.event.pull_request.title, '[skip perf]') )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # fetch-depth 0 so `git merge-base` can resolve the PR base against HEAD, and so a
+      # worktree at the merge-base commit can be created.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      # NATIVE release build (we measure the runner's native arch, not a cross-compile),
+      # so only the stable toolchain is needed - no zig / cargo-zigbuild.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cache the target dir so the second (HEAD) build reuses crate artifacts from the
+      # first (merge-base) build where possible.
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2
+
+      # redis-cli (the readiness PING + the optional INFO path used by perf_measure.sh).
+      - name: Install redis-tools (redis-cli)
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+
+      - name: Resolve the merge-base
+        id: mb
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # On a pull_request event the PR base sha is authoritative; compute the
+          # merge-base of it and HEAD so a stale branch compares against the true fork
+          # point, not the tip of the base branch. On workflow_dispatch (no PR context)
+          # fall back to the default branch's merge-base.
+          if [ -n "${BASE_SHA:-}" ]; then
+            MERGE_BASE="$(git merge-base "${BASE_SHA}" HEAD)"
+          else
+            git fetch --no-tags --depth=200 origin "${GITHUB_REF_NAME:-main}" || true
+            MERGE_BASE="$(git merge-base "origin/${GITHUB_REF_NAME:-main}" HEAD || git rev-parse HEAD~1)"
+          fi
+          echo "merge_base=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
+          echo "::notice::perf-gate merge-base is ${MERGE_BASE}"
+
+      - name: Measure the merge-base (fresh worktree, same runner)
+        id: base
+        env:
+          MERGE_BASE: ${{ steps.mb.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/perf"
+          # A worktree leaves the HEAD checkout undisturbed: the merge-base is built and
+          # measured in its own directory. We run THAT worktree's copy of perf_measure.sh
+          # so the merge-base is measured exactly as it was at that commit.
+          git worktree add --detach "${RUNNER_TEMP}/mb-worktree" "${MERGE_BASE}"
+          # If the merge-base PREDATES the gate harness (no perf_measure.sh there), there
+          # is no comparable baseline. SKIP the gate (a no-op, green) rather than fail red
+          # for the wrong reason. This covers the gate's own bootstrap PR and any PR whose
+          # fork point is older than the harness.
+          if [ ! -f "${RUNNER_TEMP}/mb-worktree/scripts/bench/perf_measure.sh" ]; then
+            echo "::notice::merge-base ${MERGE_BASE} predates the perf-gate harness; skipping (no baseline to ratchet against)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            git worktree remove --force "${RUNNER_TEMP}/mb-worktree"
+            exit 0
+          fi
+          ( cd "${RUNNER_TEMP}/mb-worktree" && bash scripts/bench/perf_measure.sh --out "${RUNNER_TEMP}/perf/base.json" )
+          git worktree remove --force "${RUNNER_TEMP}/mb-worktree"
+
+      - name: Measure HEAD (same runner, same toolchain)
+        if: steps.base.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          bash scripts/bench/perf_measure.sh --out "${RUNNER_TEMP}/perf/head.json"
+
+      - name: Compare HEAD vs merge-base (ratchet)
+        id: compare
+        if: steps.base.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          # Capture the compare exit code WITHOUT aborting the step, so the report is
+          # always produced and posted even when the gate fails; the recorded code is
+          # re-applied at the end of the job to make the check red on FAIL.
+          set +e
+          bash scripts/bench/perf_compare.sh \
+            --base "${RUNNER_TEMP}/perf/base.json" \
+            --head "${RUNNER_TEMP}/perf/head.json" \
+            --report "${RUNNER_TEMP}/perf/report.md"
+          code=$?
+          set -e
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+
+      # Post (or update) the report as a single sticky PR comment. Skipped on
+      # workflow_dispatch (no PR to comment on). The marker comment in report.md lets us
+      # find-and-update one comment instead of stacking a new one each push.
+      - name: Post the perf-gate report as a PR comment
+        if: github.event_name == 'pull_request' && steps.base.outputs.skip != 'true'
+        # Fork PRs get a read-only GITHUB_TOKEN, so commenting is not permitted there.
+        # Do not fail the gate over a comment we cannot post: the verdict is still
+        # enforced below and the report is uploaded as an artifact (always()).
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          REPORT="${RUNNER_TEMP}/perf/report.md"
+          MARKER="<!-- ironcache-perf-gate -->"
+          # Find an existing sticky comment by its marker; edit it if present, else create.
+          existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"${MARKER}\")) | .id] | first // empty")"
+          if [ -n "${existing}" ]; then
+            gh api --method PATCH "repos/${REPO}/issues/comments/${existing}" \
+              -f body="$(cat "${REPORT}")" >/dev/null
+            echo "updated existing perf-gate comment ${existing}"
+          else
+            gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file "${REPORT}"
+            echo "created a new perf-gate comment"
+          fi
+
+      - name: Upload the gate artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: perf-gate
+          path: |
+            ${{ runner.temp }}/perf/base.json
+            ${{ runner.temp }}/perf/head.json
+            ${{ runner.temp }}/perf/report.md
+          if-no-files-found: warn
+
+      # Re-apply the compare verdict last, so the check is RED iff a headline metric
+      # regressed past budget (WARN/PASS are green). Doing this after the comment/upload
+      # guarantees the report is posted even on a failing gate.
+      - name: Enforce the verdict
+        if: steps.base.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          code="${{ steps.compare.outputs.exit_code }}"
+          if [ "${code}" != "0" ]; then
+            echo "perf-gate FAILED: a headline metric regressed past budget (see the PR comment / report.md)."
+            exit "${code}"
+          fi
+          echo "perf-gate passed (WARN/PASS)."
