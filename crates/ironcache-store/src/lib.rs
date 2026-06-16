@@ -26,7 +26,16 @@
 //! entry whose deadline has strictly passed (`now > expire_at`, the Valkey
 //! boundary; alive at `now == expire_at`) is removed and reported as absent.
 
-#![forbid(unsafe_code)]
+// `#![forbid(unsafe_code)]` is LIFTED for the tagged-pointer `Entry` representation
+// (the per-shard table slot, kvobj.rs): `Entry` is a single 8-byte `NonNull<u8>`
+// tagged pointer (low bit 0 = a manually-allocated Str thin blob, low bit 1 = a
+// `Box<CollEntry>`), which halves the table slot from 16 to 8 bytes. `unsafe` is
+// AUTHORIZED and is CONFINED to the one heavily-documented `Entry` impl in kvobj.rs;
+// every `unsafe` block there carries a `// SAFETY:` justification. Everything else in
+// this crate stays safe. `deny(unsafe_op_in_unsafe_fn)` keeps each unsafe operation
+// inside an explicit `unsafe {}` block (no implicit-unsafe-body) so the SAFETY
+// comments sit on the actual operations.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod encoding;
 pub mod kvobj;
@@ -845,22 +854,22 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // The repr is matched ONCE (not via sequential `as_*_mut` borrows, which would
             // each take and drop a fresh `&mut` and obscure the dispatch) so each
             // collection type maps to exactly one arm.
-            let entry = match obj {
-                Entry::Coll(c) => match &mut c.value {
-                    kvobj::CollVal::List(l) => {
-                        RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, l))
-                    }
-                    kvobj::CollVal::Hash(h) => {
-                        RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, h))
-                    }
-                    kvobj::CollVal::Set(s) => {
-                        RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, s))
-                    }
-                    kvobj::CollVal::ZSet(z) => {
-                        RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, z))
-                    }
-                },
-                Entry::Str(_) => RmwEntry::OccupiedMut(OccupiedEntryMut::non_collection(
+            let entry = match obj.as_coll_val_mut() {
+                Some(kvobj::CollVal::List(l)) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, l))
+                }
+                Some(kvobj::CollVal::Hash(h)) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, h))
+                }
+                Some(kvobj::CollVal::Set(s)) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, s))
+                }
+                Some(kvobj::CollVal::ZSet(z)) => {
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, z))
+                }
+                // A Str entry yields the non-collection arm (the handler's `as_*_mut`
+                // then returns None -> WRONGTYPE).
+                None => RmwEntry::OccupiedMut(OccupiedEntryMut::non_collection(
                     data_type, encoding, expire_at,
                 )),
             };

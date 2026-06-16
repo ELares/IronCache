@@ -91,6 +91,8 @@ single-alloc rewrite subsumes them (no tunnel vision on soon-replaced changes).
 
 | 3 | L-FAM (v1): single-allocation blob `Entry` in `hashbrown::HashTable` (no key dup) | 3 allocs->1, slot 80->16, approach redis | bytes/key (128B) 386.85 -> **221.5** (gap 1.77x -> **1.01x, near parity**); 32B 291 -> **121** (2.88x -> 1.20x); memmodel table slack 125.8 -> 26.2, int 155.8 -> 57.8 | qps ~71k (within noise/budget of round 2's 78k; blob parse on access) | **KEPT (pending review)** - collapsed the 2.4x memory gap to ~parity; all 840 tests green, waist unchanged |
 
+| 5 | L-FAM (v2): 8-byte TAGGED-POINTER `Entry` (unsafe `NonNull<u8>`, low bit = Str/Coll tag) | slot 16->8, halve `table_bytes_per_key`, push memory CLEARLY below redis | h2h (128B, 300k, macOS) bytes/key **221.5 -> 199.69 vs redis 218.61 = 0.91x, a CLEAR WIN** (was parity); memmodel `table_bytes_per_key` 26.2 -> **13.11**, totals int 44.72 / embstr(16) 61.07 / raw(256) 333.37; `size_of::<Entry>()` 16 -> 8 | qps macOS contention-bound (not authoritative); criterion micro-bench neutral | **KEPT** - first CLEAR memory win vs redis 8.8.0; 849 tests green + miri strict-provenance clean (lib + all integration); 3-lens adversarial review (UB/aliasing/parity) found + fixed a CRITICAL u32-prefix dealloc-UB (regression vs round 3) and a HIGH alignment guard; unsafe confined to one documented `Entry` impl |
+
 ### Round 3 detail
 Per-db table is now `hashbrown::HashTable<Entry>` (low-level explicit-hash API,
 no key duplication) with `Entry = Str(Box<[u8]>)` single blob
@@ -102,6 +104,71 @@ SAFE (no unsafe; safe blob slicing). Near-parity with redis 8.8.0 on memory.
 NEXT to CLEARLY win memory: a thin pointer (ThinVec/ThinArc) slot 16->8 + cache
 the hash in the header (also helps lookup); and the throughput gap (still ~2x,
 unproven-clean on macOS) needs hot-path work + a pinned-Linux run.
+
+### Round 4 (SPEED track): userspace connection distributor (#264, merged)
+
+A throughput change in `ironcache-runtime`, not the store. The per-shard
+SO_REUSEPORT accept did not load-balance on macOS (every connection landed on one
+shard, so 8 shards == 1 shard ~85k qps). Replaced with ONE central blocking-accept
+thread that round-robins accepted `TcpStream`s to per-shard mpsc channels, so the
+work spreads across shards. Effect: IronCache throughput SCALES with shards on macOS
+(85k -> 158k single-box), parity-to-winning vs redis at low shard counts; perf-gate
+confirmed Linux-neutral (no regression where SO_REUSEPORT already balanced). The
+clean multi-core throughput verdict still needs pinned Linux: the macOS h2h qps
+number is contention-bound (loadgen co-resident) and NOT authoritative. This is why
+the Round-5 h2h table still shows IronCache behind on raw macOS qps even though the
+design scales - the macOS box cannot prove the speed win.
+
+### Round 5 detail (L-FAM v2: the 8-byte tagged-pointer slot - FIRST CLEAR MEMORY WIN)
+
+`Entry` went from a 16-byte enum (`Str(Box<[u8]>)` fat pointer | `Coll(Box<CollEntry>)`,
+which needed a discriminant + the fat-pointer length word) to a SINGLE 8-byte
+`NonNull<u8>` tagged pointer. The low bit is the tag: `0` = a manually-allocated Str
+THIN blob `[u32 total_len][the Round-3 blob]` (the length moved INTO the allocation,
+so the pointer is thin), `1` = `Box::into_raw(Box<CollEntry>)`. Both allocations are
+>= 2-aligned (Str is align 8; `CollEntry` has pointer/u32 fields), so the low bit is
+always free. This took LIFTING `#![forbid(unsafe_code)]` on ironcache-store (Zeke
+authorized "use unsafe if you have to"), replaced with `#![deny(unsafe_op_in_unsafe_fn)]`.
+The unsafe is CONFINED to one `Entry` impl in kvobj.rs (manual alloc/dealloc, tag
+set/clear via strict-provenance `map_addr`, the access reconstructions, Drop, Clone),
+every block with a `// SAFETY:` justification; the blob CONTENT is still parsed with
+SAFE bounds-checked slicing through the `str_blob()` accessor. The Store waist +
+ValueRef/RmwEntry/side-traits are UNCHANGED (only `lib.rs`'s rmw type-dispatch swapped
+the old `match obj { Entry::Coll/Entry::Str }` for `obj.as_coll_val_mut()` now that
+`Entry` is opaque).
+
+RESULT - the first CLEAR memory win over redis 8.8.0 (the goal):
+- h2h (128B, 300k keys, unpinned macOS): **199.69 vs redis 218.61 bytes/key = 0.91x,
+  CLEARLY BELOW** (Round 3 was 221.5 == parity). The used_memory delta is the reliable
+  metric on any box.
+- memmodel (allocator-true, deterministic): `table_bytes_per_key` 26.2 -> **13.11**
+  (halved, as the 16->8 slot predicts); totals int 44.72 / embstr(16) 61.07 /
+  raw(256) 333.37; `size_of::<Entry>()` 16 -> 8, `Option<Entry>` 8 (NonNull niche).
+
+GATES: cargo build/test (849) green; clippy `-D warnings`, fmt, invariant-lint clean;
+**miri under `-Zmiri-strict-provenance` clean** across the store lib (64 tests incl. 8
+dedicated Entry unsafe-path tests) AND every integration test (primitives, keyspace,
+eviction, the four collection in-place suites, watch). The jemalloc `accounting` test
+is `#[cfg_attr(miri, ignore)]` (FFI not miri-executable; documented, non-UB reason).
+This is the lever Round 3's detail flagged as "NEXT" (thin pointer, slot 16->8); the
+hash-in-header idea is deferred (hashbrown re-hashes on resize regardless).
+
+ADVERSARIAL REVIEW (3 independent lenses: UB/soundness, aliasing/borrow, behavioral
+parity) ran on the committed change. Aliasing = SOUND, parity = PRESERVED. The UB lens
+found and we FIXED two real issues miri's executed paths could not catch:
+- **CRITICAL (fixed):** the new `u32` total-length prefix would TRUNCATE for a single
+  value > 4 GiB, so `Drop` would `dealloc` with a wrong `Layout` = UB. Reachable because
+  APPEND grew a value unbounded (no `proto-max-bulk-len` check, unlike Redis
+  `checkStringLength`). NOTE this was a REGRESSION the prefix introduced: Round 3's
+  `Box<[u8]>` carried a `usize` length, so it had no 4 GiB limit. Layered fix: (1) a
+  hard `expect` in `alloc_str_blob` so the saturation branch is gone (UB -> a controlled
+  panic backstop on the unsafe boundary); (2) cap APPEND at 512 MB returning the exact
+  Redis error (new `ErrorReply::string_exceeds_max`), which matches Redis AND keeps every
+  value < 4 GiB so the backstop is unreachable in practice.
+- **HIGH (fixed):** the tag scheme needs the Str blob and `Box<CollEntry>` to be >= 2
+  -aligned, but only a release-stripped `debug_assert!` guarded it. Added two `const`
+  assertions (`STR_ALIGN >= 2`, `align_of::<CollEntry>() >= 2`) so a future
+  alignment-breaking edit fails the BUILD instead of silently corrupting the tag.
 
 ### Round 3 (built; was: next, the big one): single-allocation blob entry - VALIDATED design
 

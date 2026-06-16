@@ -624,6 +624,25 @@ pub fn cmd_incrbyfloat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &
 /// documented value-internal-mutation extension to the waist (STORAGE_API.md notes
 /// the "APPEND/SETRANGE efficiency path" as the additive `RmwAction` follow-up); it
 /// is intentionally NOT done here.
+/// The `proto-max-bulk-len` string ceiling (512 MB, the Redis default). A single
+/// string value may not exceed this; the only command that can grow a value
+/// unboundedly is APPEND, which is capped here exactly like Redis `checkStringLength`
+/// (src/t_string.c). This ALSO keeps every value below 4 GiB, which the store's manual
+/// Str-blob allocator depends on (its u32 length prefix must not truncate). Mirrors the
+/// bitmap module's `PROTO_MAX_BIT_OFFSET`, which derives the same 512 MB ceiling.
+pub(crate) const PROTO_MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+
+/// Whether an APPEND of `suffix_len` bytes onto an `old_len`-byte string would exceed
+/// the `proto-max-bulk-len` ceiling (Redis `checkStringLength`: reject when the RESULT
+/// would be larger). `checked_add` treats a `usize` overflow as "exceeds" (defensive;
+/// unreachable for real values bounded by the per-bulk decode limit).
+#[must_use]
+pub(crate) fn append_would_exceed_max(old_len: usize, suffix_len: usize) -> bool {
+    old_len
+        .checked_add(suffix_len)
+        .is_none_or(|total| total > PROTO_MAX_BULK_LEN)
+}
+
 pub fn cmd_append<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
     if req.args.len() != 3 {
         return Value::error(ErrorReply::wrong_arity("append"));
@@ -631,7 +650,8 @@ pub fn cmd_append<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
     let suffix = req.args[2].clone();
     store.rmw(db, &req.args[1], now, move |entry| match entry {
         // Absent: APPEND behaves like SET, returns len(value), clears TTL (SET
-        // semantics on create).
+        // semantics on create). The suffix alone is bounded by the per-bulk decode
+        // limit (proto-max-bulk-len), so no ceiling check is needed on create.
         RmwEntry::Vacant => {
             let len = suffix.len() as i64;
             RmwStep {
@@ -648,6 +668,13 @@ pub fn cmd_append<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
         // The TTL is preserved (Redis APPEND does not touch the expire).
         RmwEntry::Occupied(o) => {
             let old = o.as_bytes();
+            // Reject (BEFORE allocating the combined buffer) when the result would
+            // exceed proto-max-bulk-len, exactly like Redis checkStringLength. This
+            // both matches Redis and keeps the value below the store's 4 GiB blob
+            // limit; no write occurs.
+            if append_would_exceed_max(old.len(), suffix.len()) {
+                return keep_err(ErrorReply::string_exceeds_max());
+            }
             let mut combined = Vec::with_capacity(old.len() + suffix.len());
             combined.extend_from_slice(old);
             combined.extend_from_slice(&suffix);
@@ -661,4 +688,24 @@ pub fn cmd_append<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
         // Unreachable: APPEND uses the read-only `rmw`, never `rmw_mut`.
         RmwEntry::OccupiedMut(_) => unreachable!("cmd_append uses rmw, not rmw_mut"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PROTO_MAX_BULK_LEN, append_would_exceed_max};
+
+    #[test]
+    fn append_ceiling_matches_proto_max_bulk_len() {
+        // Exactly at the ceiling is allowed; one byte over is rejected (Redis
+        // checkStringLength rejects when the RESULT would EXCEED the limit).
+        assert!(!append_would_exceed_max(PROTO_MAX_BULK_LEN, 0));
+        assert!(!append_would_exceed_max(PROTO_MAX_BULK_LEN - 1, 1));
+        assert!(append_would_exceed_max(PROTO_MAX_BULK_LEN, 1));
+        assert!(append_would_exceed_max(PROTO_MAX_BULK_LEN - 1, 2));
+        // A small append onto a small value is never rejected.
+        assert!(!append_would_exceed_max(0, 0));
+        assert!(!append_would_exceed_max(10, 10));
+        // A usize-overflowing pair is treated as "exceeds" (defensive, unreachable).
+        assert!(append_would_exceed_max(usize::MAX, 1));
+    }
 }

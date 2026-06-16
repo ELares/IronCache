@@ -19,9 +19,26 @@ use ironcache_storage::{ExpireWrite, NewValue, Store, UnixMillis};
 use ironcache_store::{ShardStore, process_allocated_bytes, process_resident_bytes};
 
 // jemalloc as this test binary's global allocator so the mallctl stats are live.
+// NOT under miri: miri cannot execute jemalloc's foreign allocator/`mallctl` C
+// functions, and a `#[global_allocator]` is exercised at binary STARTUP (before any
+// test), so leaving jemalloc registered would abort the whole binary under miri. Gating
+// it out lets the miri run LOAD this binary; the one test inside is `ignore`d under miri
+// (it still needs the live mallctl stats), and miri uses its own allocator for the
+// binary's startup. Outside miri, jemalloc is the global allocator exactly as before.
+#[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Ignored under miri ONLY: this test reads jemalloc's `mallctl` FFI (epoch::advance /
+// stats::allocated), which miri cannot execute, and it needs the jemalloc
+// `#[global_allocator]` (gated out under miri above) for the stats to be live. This is a
+// non-UB incompatibility (a shell-out to the jemalloc allocator), NOT an Entry-safety
+// concern — the Entry alloc/dealloc/drop/access paths are covered by the kvobj unit
+// tests + the other store tests, which DO run under miri. Outside miri it runs normally.
+#[cfg_attr(
+    miri,
+    ignore = "needs the jemalloc global allocator + mallctl FFI, which miri cannot execute"
+)]
 #[test]
 fn process_allocated_bytes_is_positive_and_grows() {
     // After boot the process has allocated SOMETHING, so the figure is > 0.
