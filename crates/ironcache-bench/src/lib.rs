@@ -32,7 +32,41 @@
 //! - [`EncodingClass::Raw`]: a longer string stored out-of-line (a separate heap
 //!   allocation). `OBJECT ENCODING` -> `raw`.
 
+//! ## The load generator (PR-A2, BENCHMARK.md #8, PERF_REGRESSION_GATE.md #159)
+//!
+//! The other half of this crate is a self-contained macro load generator that
+//! drives a running IronCache (or any RESP server) over TCP with a SEEDED zipf
+//! workload, in two passes that are never conflated:
+//!
+//! - [`closed_loop`]: N concurrent connections each loop request->reply as fast as
+//!   possible for a duration; reports peak throughput (total ops / wall seconds).
+//! - [`open_loop`]: a wrk2-style constant-rate pass that issues requests on a FIXED
+//!   schedule (partitioned round-robin across the connections, each its own task with
+//!   its own seeded RNG and local histogram) and measures each request's latency from
+//!   its INTENDED send time, so the reported tail is free of coordinated omission. The
+//!   per-request wait uses a coarse-sleep-then-busy-spin (`open_loop::wait_until`) for
+//!   microsecond dispatch precision instead of tokio's ~1ms timer floor, and the
+//!   result flags a generator-limited (`saturated`) run.
+//!
+//! The shared pieces are the [`workload`] generator (deterministic given a seed),
+//! the minimal async RESP [`client`], and the [`report`] JSON serializer. The thin
+//! CLI wiring lives in `src/bin/loadgen.rs`. Every time stamp goes through
+//! `ironcache_env` and every workload draw goes through a seeded
+//! `ironcache_env::SplitMix64`, so the .rs files here contain no direct
+//! `Instant`/`SystemTime`/`rand` use (invariant 2, ADR-0003).
+
 #![forbid(unsafe_code)]
+
+pub mod client;
+pub mod closed_loop;
+pub mod open_loop;
+pub mod report;
+pub mod workload;
+
+/// An in-test RESP stub server, shared by the closed-loop and open-loop unit tests
+/// so neither requires a real IronCache. Compiled only under `cfg(test)`.
+#[cfg(test)]
+pub mod testutil;
 
 use ironcache_storage::{ExpireWrite, NewValue, Store, UnixMillis};
 use ironcache_store::ShardStore;

@@ -23,8 +23,40 @@ ironcache-store = { workspace = true }
 ironcache-storage = { workspace = true }
 ironcache-eviction = { workspace = true }
 ironcache-expiry = { workspace = true }
+# The determinism seam (ADR-0003, invariant 2). The load generator MUST route the
+# monotonic clock (latency stamps, the open-loop schedule base) and the workload
+# RNG (seeded zipf + op-mix draws) through this crate; the invariant lint forbids a
+# direct Instant/SystemTime/rand anywhere else (PERF_REGRESSION_GATE.md #159).
+ironcache-env = { workspace = true }
 # Byte buffers (matches the codec/store byte type).
 bytes = { workspace = true }
+# CLI dispatch for the `loadgen` binary (derive only, mirrors the main binary).
+clap = { workspace = true }
+# Error context for the thin `loadgen` main (mirrors the main binary's anyhow use).
+anyhow = { workspace = true }
+# HdrHistogram for the open-loop latency tail (p50/p99/p999/p9999) with bounded,
+# constant memory and no precision loss across decades. default-features = false
+# drops serialization/flate2/base64/nom/crossbeam so the dependency tree is just
+# byteorder (Unlicense OR MIT) + num-traits (MIT OR Apache-2.0), both cargo-deny
+# clean; the histogram artifact is dumped as plain percentile JSON, not the V2
+# wire format, so the serialization feature is not needed.
+hdrhistogram = { version = "7", default-features = false }
+# Async runtime for the load generator CLIENT. Unlike the engine (which is
+# current-thread, shared-nothing per ADR-0002), the load generator is an external
+# client whose job is to SATURATE many connections, so a multi-thread work-stealing
+# runtime is appropriate here (sized to the connection count, since the open-loop
+# scheduler busy-spins for dispatch precision). `time` gives the open-loop pacing's
+# coarse sleep; the lint explicitly permits tokio::time (it is the deterministic
+# Duration / runtime timer seam), so the pacing sleeps do not trip the determinism
+# check.
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "sync",
+] }
 # jemalloc as the global allocator for the memmodel binary (ADR-0006) and the
 # mallctl `stats.allocated` reader the memory model samples. Gated to the non-MSVC
 # targets where jemalloc is available (mirrors the binary's cfg); on MSVC the
@@ -38,6 +70,12 @@ tikv-jemalloc-ctl = { workspace = true }
 # (plotters) and rayon to keep the dependency tree and cargo-deny clean; only the
 # cargo_bench_support feature (the `cargo bench` harness shim) is enabled.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# The macro load generator (PR-A2): a RESP client driver with closed-loop peak-QPS
+# and open-loop coordinated-omission-free latency-tail passes.
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
 
 # Criterion micro-benches use their own timing harness, so `harness = false`.
 [[bench]]

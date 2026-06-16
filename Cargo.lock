@@ -86,6 +86,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -289,6 +295,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hdrhistogram"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "765c9198f173dd59ce26ff9f95ef0aafd0a0fe01fb9d72841bc5066a4c06511d"
+dependencies = [
+ "byteorder",
+ "num-traits",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -336,8 +352,12 @@ dependencies = [
 name = "ironcache-bench"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "bytes",
+ "clap",
  "criterion",
+ "hdrhistogram",
+ "ironcache-env",
  "ironcache-eviction",
  "ironcache-expiry",
  "ironcache-protocol",
@@ -345,6 +365,7 @@ dependencies = [
  "ironcache-store",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
+ "tokio",
 ]
 
 [[package]]
