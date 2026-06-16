@@ -39,6 +39,10 @@ on:
         description: "Measured closed-loop pass duration (seconds)."
         type: string
         default: "8"
+      ironcache_shards:
+        description: "Override IronCache shard (= runtime-thread) count; blank = one per pinned core. Probes thread-oversubscription (e.g. 1 shard on 2 pinned cores)."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -100,6 +104,7 @@ jobs:
           KEYSPACE: ${{ inputs.keycount }}
           DURATION_SECS: ${{ inputs.duration_secs }}
           WARMUP_SECS: "3"
+          IRONCACHE_SHARDS: ${{ inputs.ironcache_shards }}
         run: |
           set -euo pipefail
           # The harness resolves the competitor (valkey-server, else redis-server),

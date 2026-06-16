@@ -474,10 +474,16 @@ measure_server() {
 
   # (b) Boot it, pinned, persistence OFF + eviction OFF for the measurement.
   if [[ "${kind}" == "ironcache" ]]; then
-    echo "[h2h] starting ${name} on ${HOST}:${PORT} (shards=${SERVER_CORE_COUNT}, maxmemory=${MAXMEMORY})..."
+    # IRONCACHE_SHARDS lets a probe DECOUPLE the shard (= runtime-thread) count from the
+    # pinned core count, to isolate thread-oversubscription effects (e.g. 1 shard vs 2
+    # shards on the SAME 2 pinned cores). Defaults to one shard per pinned core (the
+    # thread-per-core norm). The qps_per_core denominator stays SERVER_CORE_COUNT (cores),
+    # so a probe compares RAW qps across shard counts.
+    local ic_shards="${IRONCACHE_SHARDS:-${SERVER_CORE_COUNT}}"
+    echo "[h2h] starting ${name} on ${HOST}:${PORT} (shards=${ic_shards} over ${SERVER_CORE_COUNT} pinned cores, maxmemory=${MAXMEMORY})..."
     IRONCACHE_MAXMEMORY="${MAXMEMORY}" \
       ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${IRONCACHE_BIN}" \
-      --port "${PORT}" --shards "${SERVER_CORE_COUNT}" server \
+      --port "${PORT}" --shards "${ic_shards}" server \
       >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
   else
