@@ -20,3 +20,9 @@ ironcache-storage = { workspace = true }
 # The determinism seam (ADR-0003): the Random policy draws its victim through the
 # Env Rng, never std rand. Held as a small seeded RNG snapshot the binary feeds in.
 ironcache-env = { workspace = true }
+# The low-level explicit-hash SwissTable powering the S3-FIFO O(1) key->slot index
+# (the same crate the store uses for its per-DB keyspace). The index stores ONLY the
+# u32 slab index (no key duplication); it is a POINT-LOOKUP index, never iterated for
+# any client-visible order, so it is driven with a FIXED-SEED hasher (ADR-0003
+# determinism). Stock hashbrown, unsynchronized, owned by one core.
+hashbrown = { workspace = true }
