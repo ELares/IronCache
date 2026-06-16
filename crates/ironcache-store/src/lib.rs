@@ -32,16 +32,16 @@ pub mod encoding;
 pub mod kvobj;
 
 use bytes::Bytes;
-use hashbrown::HashMap;
-use hashbrown::HashSet;
-use hashbrown::hash_map::Entry;
+use hashbrown::hash_map::Entry as WatchMapEntry;
+use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
 use ironcache_eviction::{EvictionPolicy, Policy, map_policy_name};
 use ironcache_storage::{
     AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
     MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
     RmwStep, ScanCursor, Store, UnixMillis, ValueRef, WatchEntry,
 };
-use kvobj::{KvObj, int_decimal_bytes};
+use kvobj::{Entry, KvObj};
+use std::hash::BuildHasher;
 
 /// The FIXED-SEED stable key hash that the SCAN cursor iterates in ascending order
 /// (KEYSPACE.md "the full hash recomputed from the embedded key"). It is a small
@@ -199,8 +199,21 @@ fn scan_plan<'a>(
 /// [`NullEviction`] and [`CountingAccounting`].
 #[derive(Debug)]
 pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = CountingAccounting> {
-    /// One key->kvobj map per database. `dbs[db]` is the keyspace for `SELECT db`.
-    dbs: Vec<HashMap<Box<[u8]>, KvObj>>,
+    /// One per-database SwissTable, each storing a single-allocation [`Entry`] per key
+    /// (memory Round 3). `dbs[db]` is the keyspace for `SELECT db`. Unlike a
+    /// `HashMap<Box<[u8]>, _>`, the low-level [`HashTable`] stores ONLY the entry and
+    /// derives the key from inside it ([`Entry::key`]), so there is no separate map key
+    /// allocation and no key duplication. Lookups hash the probe key with [`Self::hasher`]
+    /// and pass the hash + an eq closure to `find`/`find_entry`/`entry`.
+    dbs: Vec<HashTable<Entry>>,
+    /// The fixed per-store hasher used for EVERY key hash fed to the [`HashTable`]
+    /// explicit-hash API (the table stores no hasher of its own). One `RandomState`
+    /// instance shared across all dbs so a key hashes identically regardless of which db
+    /// it lands in; constructed once at boot. This is `hashbrown`'s default
+    /// (`foldhash`), the same hasher the prior `HashMap` used internally. It is NOT the
+    /// SCAN order hash ([`scan_hash`], a fixed-seed stable hash); this one only needs to
+    /// be a good table hash and may vary run-to-run.
+    hasher: DefaultHashBuilder,
     /// The eviction policy hook (no-op in PR-2a).
     eviction: E,
     /// The accounting hook (logical-byte counter in PR-2a). It is fed the same
@@ -275,10 +288,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         let n = databases.max(1) as usize;
         let mut dbs = Vec::with_capacity(n);
         for _ in 0..n {
-            dbs.push(HashMap::new());
+            dbs.push(HashTable::new());
         }
         ShardStore {
             dbs,
+            hasher: DefaultHashBuilder::default(),
             eviction,
             accounting,
             used: 0,
@@ -322,9 +336,19 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// signature and changes no observable command behavior, only the table's
     /// pre-allocated capacity.
     pub fn reserve(&mut self, db: u32, additional: usize) {
-        if let Some(map) = self.dbs.get_mut(db as usize) {
-            map.reserve(additional);
+        let hasher = self.hasher.clone();
+        if let Some(table) = self.dbs.get_mut(db as usize) {
+            // The explicit-hash table's `reserve` needs a hasher closure to re-place
+            // entries on a grow: hash each entry's embedded key.
+            table.reserve(additional, |e| hasher.hash_one(e.key()));
         }
+    }
+
+    /// Hash a probe key with the store's fixed table hasher (the value fed to the
+    /// [`HashTable`] explicit-hash API). NOT the SCAN order hash.
+    #[inline]
+    fn key_hash(&self, key: &[u8]) -> u64 {
+        self.hasher.hash_one(key)
     }
 
     /// The WATCH write-funnel NOTIFY (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Called
@@ -403,13 +427,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// waist method).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.dbs.iter().map(HashMap::len).sum()
+        self.dbs.iter().map(HashTable::len).sum()
     }
 
     /// Whether the store holds no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.dbs.iter().all(HashMap::is_empty)
+        self.dbs.iter().all(HashTable::is_empty)
     }
 
     /// The map index for the validated logical `db`. The command layer validates the
@@ -442,10 +466,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// single hash probe with the Entry API (or a get-once handle threaded to the
     /// caller) once the read path is restructured around it. No change now.
     fn expire_if_due(&mut self, db: u32, db_idx: usize, key: &[u8], now: UnixMillis) -> bool {
+        let h = self.key_hash(key);
         let due = self
             .dbs
             .get(db_idx)
-            .and_then(|m| m.get(key))
+            .and_then(|t| t.find(h, |e| e.key() == key))
             .is_some_and(|o| o.is_expired(now));
         if due {
             // Route the removal through the WRITE FUNNEL (`remove_object`): it fires
@@ -464,7 +489,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             return false;
         }
         // Present-and-live iff it exists (it did not expire above).
-        self.dbs.get(db_idx).is_some_and(|m| m.contains_key(key))
+        self.dbs
+            .get(db_idx)
+            .is_some_and(|t| t.find(h, |e| e.key() == key).is_some())
     }
 
     /// Insert or replace `key`'s object, adjusting the accounting/eviction hooks for
@@ -479,7 +506,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     ///
     /// `db` is the validated logical DB id passed to the hooks; `db_idx` is the
     /// (possibly clamped) Vec index for the map (see [`Self::db_index`]).
-    fn put_object(&mut self, db: u32, db_idx: usize, key: &[u8], obj: KvObj) -> bool {
+    fn put_object(&mut self, db: u32, db_idx: usize, key: &[u8], obj: Entry) -> bool {
         // WATCH notify (PR-10b): a create or overwrite of a watched key bumps its
         // version (gated behind the watched_count fast path inside touch_watch). This
         // fires for a create on a watched-ABSENT key too (a watched-absent key now
@@ -487,20 +514,24 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // bytes (any write touches the version, matching Redis).
         self.touch_watch(db, key);
         let new_bytes = obj.accounted_bytes();
-        let boxed: Box<[u8]> = key.to_vec().into_boxed_slice();
+        let h = self.key_hash(key);
+        let hasher = self.hasher.clone();
         // Replace inside the entry scope, capturing any old weight, then update the
-        // hooks AFTER the table borrow ends (the hooks borrow `self` mutably).
-        let old_bytes = match self.dbs[db_idx].entry(boxed) {
-            Entry::Occupied(mut e) => {
-                let old = e.get().accounted_bytes();
-                *e.get_mut() = obj;
-                Some(old)
-            }
-            Entry::Vacant(e) => {
-                e.insert(obj);
-                None
-            }
-        };
+        // hooks AFTER the table borrow ends (the hooks borrow `self` mutably). The
+        // explicit-hash `entry` takes the probe hash, an eq closure (compare embedded
+        // keys), and a hasher closure (re-place entries on a grow).
+        let old_bytes =
+            match self.dbs[db_idx].entry(h, |e| e.key() == key, |e| hasher.hash_one(e.key())) {
+                hashbrown::hash_table::Entry::Occupied(mut e) => {
+                    let old = e.get().accounted_bytes();
+                    *e.get_mut() = obj;
+                    Some(old)
+                }
+                hashbrown::hash_table::Entry::Vacant(e) => {
+                    e.insert(obj);
+                    None
+                }
+            };
         if let Some(old) = old_bytes {
             self.account_sub(old);
             self.eviction.on_remove(db, key, old);
@@ -527,8 +558,15 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // A watched-but-ABSENT key flush is handled in flush_db (it iterates the watch
         // slots), since remove_object only fires for a key that was actually resident.
         self.touch_watch(db, key);
-        if let Some(obj) = self.dbs[db_idx].remove(key) {
-            let bytes = obj.accounted_bytes();
+        let h = self.key_hash(key);
+        let removed = match self.dbs[db_idx].find_entry(h, |e| e.key() == key) {
+            Ok(occ) => {
+                let (obj, _) = occ.remove();
+                Some(obj.accounted_bytes())
+            }
+            Err(_absent) => None,
+        };
+        if let Some(bytes) = removed {
             self.account_sub(bytes);
             self.eviction.on_remove(db, key, bytes);
             true
@@ -555,7 +593,15 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // touches a watched key's version (a collection drained to empty by an edit is a
         // modification, like any delete).
         self.touch_watch(db, key);
-        if self.dbs[db_idx].remove(key).is_some() {
+        let h = self.key_hash(key);
+        let existed = match self.dbs[db_idx].find_entry(h, |e| e.key() == key) {
+            Ok(occ) => {
+                occ.remove();
+                true
+            }
+            Err(_absent) => false,
+        };
+        if existed {
             self.account_sub(bytes);
             self.eviction.on_remove(db, key, bytes);
             true
@@ -564,69 +610,47 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         }
     }
 
-    /// Build the read-borrow view for an object. An int materializes its decimal
-    /// bytes (owned); a string borrows the stored buffer.
-    ///
-    /// FOLLOW-UP (#8/Efficient): the int branch allocates a fresh `Bytes` per read
-    /// via `int_decimal_bytes`. When the FAM object-layout work lands, format the
-    /// decimal digits into an inline/borrowable buffer carried by the view (or by
-    /// the object) so an int read does no per-read heap allocation. No change now.
-    fn view_of(obj: &KvObj) -> ValueRef<'_> {
-        match &obj.value {
-            kvobj::ValueRepr::Int(n) => {
-                ValueRef::from_int_bytes(obj.header.data_type, obj.expire_at, int_decimal_bytes(*n))
-            }
-            // Embstr and raw both borrow their bytes the same way; the embstr-vs-raw
-            // distinction is carried by `obj.header.encoding`, not the variant.
-            kvobj::ValueRepr::Inline(b) | kvobj::ValueRepr::Raw(b) => {
-                ValueRef::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
-            }
-            // A LIST/HASH/SET is not byte-readable as a string: the command layer only
-            // reads its data_type / encoding from the view (GET checks String; OBJECT
-            // ENCODING reads the encoding, e.g. listpack/quicklist/hashtable/intset). The
-            // bytes are empty so a misrouted as_bytes() yields nothing rather than leaking
-            // a representation.
-            kvobj::ValueRepr::List(_)
-            | kvobj::ValueRepr::Hash(_)
-            | kvobj::ValueRepr::Set(_)
-            | kvobj::ValueRepr::ZSet(_) => ValueRef::borrowed(
-                obj.header.data_type,
-                obj.header.encoding,
-                obj.expire_at,
-                &[],
-            ),
+    /// Set the TTL deadline of the entry for `key` in table `db_idx` (the TTL-only
+    /// write path shared by the `rmw`/`rmw_mut` Keep/Mutated arms). For a Str entry an
+    /// add/remove of the deadline rebuilds the blob (the 8-byte field appears/
+    /// disappears); a deadline-only change patches in place. A no-op if the key is gone.
+    fn set_entry_expire(&mut self, db_idx: usize, key: &[u8], deadline: Option<UnixMillis>) {
+        let h = self.key_hash(key);
+        if let Some(obj) = self.dbs[db_idx].find_mut(h, |e| e.key() == key) {
+            obj.set_expire_at(deadline);
         }
     }
 
-    /// Build the rmw observation handle for an object (same int-materialization as
-    /// [`Self::view_of`]). Returns the handle plus the int decimal `Bytes` keeper so
-    /// the borrow stays valid for the closure.
-    fn occupied_of(obj: &KvObj) -> OccupiedEntry<'_> {
-        match &obj.value {
-            kvobj::ValueRepr::Int(n) => OccupiedEntry::from_int_bytes(
-                obj.header.data_type,
-                obj.expire_at,
-                int_decimal_bytes(*n),
-            ),
-            // Embstr and raw both borrow their bytes the same way; the embstr-vs-raw
-            // distinction is carried by `obj.header.encoding`, not the variant.
-            kvobj::ValueRepr::Inline(b) | kvobj::ValueRepr::Raw(b) => {
-                OccupiedEntry::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
-            }
-            // A LIST/HASH/SET observed through the READ-ONLY rmw arm (e.g. a numeric RMW
-            // that hits a collection key) exposes empty bytes; the closure sees the
-            // collection data_type and returns WRONGTYPE. In-place collection edits use the
-            // MUTABLE arm (`rmw_mut` -> OccupiedEntryMut), not this read-only handle.
-            kvobj::ValueRepr::List(_)
-            | kvobj::ValueRepr::Hash(_)
-            | kvobj::ValueRepr::Set(_)
-            | kvobj::ValueRepr::ZSet(_) => OccupiedEntry::borrowed(
-                obj.header.data_type,
-                obj.header.encoding,
-                obj.expire_at,
-                &[],
-            ),
-        }
+    /// Build the read-borrow view for an entry. Memory Round 3: an int-encoded value
+    /// stores its CANONICAL DECIMAL bytes INLINE in the blob (encoding reported as
+    /// `int` from the header), so the view borrows them directly with NO per-read
+    /// allocation (the prior `int_decimal_bytes` allocation the FOLLOW-UP note flagged
+    /// is now eliminated). A string borrows its stored bytes; a collection borrows an
+    /// empty slice (only its data_type / encoding are read for GET / OBJECT ENCODING).
+    fn view_of(obj: &Entry) -> ValueRef<'_> {
+        // `str_value_bytes()` is the int decimal digits / embstr / raw bytes for a Str
+        // entry and an empty slice for a Coll entry (which is not byte-readable as a
+        // string: GET checks the String data_type; OBJECT ENCODING reads the encoding).
+        ValueRef::borrowed(
+            obj.data_type(),
+            obj.encoding(),
+            obj.expire_at(),
+            obj.str_value_bytes(),
+        )
+    }
+
+    /// Build the rmw observation handle for an entry (same borrow rule as
+    /// [`Self::view_of`]: int decimal bytes are inline, so no per-read allocation).
+    /// A collection observed through the READ-ONLY rmw arm exposes empty bytes; the
+    /// closure sees the collection data_type and returns WRONGTYPE. In-place collection
+    /// edits use the MUTABLE arm (`rmw_mut` -> OccupiedEntryMut), not this handle.
+    fn occupied_of(obj: &Entry) -> OccupiedEntry<'_> {
+        OccupiedEntry::borrowed(
+            obj.data_type(),
+            obj.encoding(),
+            obj.expire_at(),
+            obj.str_value_bytes(),
+        )
     }
 }
 
@@ -641,7 +665,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // eventual single-source migration (see the eviction crate docs) and is not
         // written on the access path, since nothing reads it today.
         self.eviction.on_access(db, key);
-        self.dbs[db_idx].get(key).map(Self::view_of)
+        let h = self.key_hash(key);
+        self.dbs[db_idx]
+            .find(h, |e| e.key() == key)
+            .map(Self::view_of)
     }
 
     fn upsert(
@@ -657,14 +684,17 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // its old deadline (for ExpireWrite::Keep).
         let existed = self.expire_if_due(db, db_idx, key, now);
         let old_deadline = if existed {
-            self.dbs[db_idx].get(key).and_then(|o| o.expire_at)
+            let h = self.key_hash(key);
+            self.dbs[db_idx]
+                .find(h, |e| e.key() == key)
+                .and_then(Entry::expire_at)
         } else {
             None
         };
         let new_deadline = resolve_expire(expire, old_deadline);
         let obj = match value {
-            NewValue::Bytes(b) => KvObj::from_bytes(key, b, new_deadline),
-            NewValue::Int(n) => KvObj::from_int(key, n, new_deadline),
+            NewValue::Bytes(b) => Entry::str_from_bytes(key, b, new_deadline),
+            NewValue::Int(n) => Entry::str_from_int(key, n, new_deadline),
         };
         self.put_object(db, db_idx, key, obj);
         existed
@@ -695,7 +725,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // `on_access`); the kvobj `eviction_rank` header field is RESERVED, not
             // written here (nothing reads it). See the eviction crate docs.
             self.eviction.on_access(db, key);
-            let obj = self.dbs[db_idx].get(key).expect("live entry present");
+            let h = self.key_hash(key);
+            let obj = self.dbs[db_idx]
+                .find(h, |e| e.key() == key)
+                .expect("live entry present");
             let entry = RmwEntry::Occupied(Self::occupied_of(obj));
             f(entry)
         } else {
@@ -704,7 +737,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
 
         // The current (pre-write) deadline, for ExpireWrite::Keep/Unchanged.
         let old_deadline = if live {
-            self.dbs[db_idx].get(key).and_then(|o| o.expire_at)
+            let h = self.key_hash(key);
+            self.dbs[db_idx]
+                .find(h, |e| e.key() == key)
+                .and_then(Entry::expire_at)
         } else {
             None
         };
@@ -724,10 +760,7 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         // real-change branch: a no-op TTL write (bare GETEX, an EXPIRE that
                         // does not move the deadline) keeps the key CLEAN, matching Redis.
                         self.touch_watch(db, key);
-                        if let Some(obj) = self.dbs[db_idx].get_mut(key) {
-                            obj.expire_at = new_deadline;
-                            obj.header.ttl_present = new_deadline.is_some();
-                        }
+                        self.set_entry_expire(db_idx, key, new_deadline);
                     }
                 }
             }
@@ -736,7 +769,7 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                     ExpireWrite::Unchanged => old_deadline,
                     other => resolve_expire(other, old_deadline),
                 };
-                let obj = KvObj::from_new_owned(key, v, new_deadline);
+                let obj = Entry::from_new_owned(key, v, new_deadline);
                 self.put_object(db, db_idx, key, obj);
             }
             RmwAction::Delete => {
@@ -754,10 +787,7 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         other => resolve_expire(other, old_deadline),
                     };
                     if new_deadline != old_deadline {
-                        if let Some(obj) = self.dbs[db_idx].get_mut(key) {
-                            obj.expire_at = new_deadline;
-                            obj.header.ttl_present = new_deadline.is_some();
-                        }
+                        self.set_entry_expire(db_idx, key, new_deadline);
                     }
                 }
             }
@@ -784,57 +814,55 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // For the OccupiedMut path the store MEASURES the accounting delta itself (it
         // does not trust the handler): record the pre-edit weight, hand out a typed
         // mutable handle, run the closure, then measure the post-edit weight.
+        let key_h = self.key_hash(key);
         let old_bytes = if live {
             self.eviction.on_access(db, key);
-            self.dbs[db_idx].get(key).map_or(0, KvObj::accounted_bytes)
+            self.dbs[db_idx]
+                .find(key_h, |e| e.key() == key)
+                .map_or(0, Entry::accounted_bytes)
         } else {
             0
         };
 
         let step = if live {
-            let obj = self.dbs[db_idx].get_mut(key).expect("live entry present");
-            // Read the REAL pre-edit metadata off the header BEFORE taking the typed
-            // mutable borrow (these are Copy scalars; `as_list_mut` then borrows the
-            // value mutably). The mutable handle carries the same type/encoding/TTL the
-            // read-only `occupied_of()` path exposes, so PR-6/7/8 can read accurate
-            // metadata off the mutable arm. The store still recomputes the POST-edit
+            let obj = self.dbs[db_idx]
+                .find_mut(key_h, |e| e.key() == key)
+                .expect("live entry present");
+            // Read the REAL pre-edit metadata BEFORE taking the typed mutable borrow
+            // (these are Copy scalars; `as_*_mut` then borrows the value mutably). The
+            // mutable handle carries the same type/encoding/TTL the read-only
+            // `occupied_of()` path exposes. The store still recomputes the POST-edit
             // encoding after a `Mutated` return; this is the PRE-edit snapshot.
-            let data_type = obj.header.data_type;
-            let encoding = obj.header.encoding;
-            let expire_at = obj.expire_at;
-            // Build the typed mutable view: a list yields the list arm, a hash the hash
-            // arm, anything else the non-collection arm (the handler's `as_*_mut` then
-            // returns None -> WRONGTYPE). The borrow of `obj` lives only for the closure
-            // call. The collection arms are selected per repr; the empty-collection check
-            // after a Mutated return uses `KvObj::is_empty_collection`, which is defined
-            // over the SAME `collection_len` mapping (kvobj.rs), so the two sites cannot
-            // drift (the PR-5 review's consolidation; new collection types add an arm
-            // here AND a `collection_len` arm there in lockstep).
+            let data_type = obj.data_type();
+            let encoding = obj.encoding();
+            let expire_at = obj.expire_at();
+            // Build the typed mutable view from the entry's collection arm: a list yields
+            // the list arm, etc.; a Str entry yields the non-collection arm (the handler's
+            // `as_*_mut` then returns None -> WRONGTYPE). The empty-collection check after
+            // a Mutated return uses `Entry::is_empty_collection`, defined over the SAME
+            // `collection_len` mapping (kvobj.rs), so the two sites cannot drift.
             //
-            // The repr is matched ONCE (not via sequential `as_*_mut` borrows, which
-            // would each take and drop a fresh `&mut` and obscure the dispatch) so each
+            // The repr is matched ONCE (not via sequential `as_*_mut` borrows, which would
+            // each take and drop a fresh `&mut` and obscure the dispatch) so each
             // collection type maps to exactly one arm.
-            let entry = match &mut obj.value {
-                // The collection variants are boxed (memory Round 1); deref through the
-                // `Box` (`&mut **`) to the concrete `&mut *Val`, which then coerces to the
-                // `&mut dyn *Value` trait object the typed view constructors take.
-                kvobj::ValueRepr::List(l) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, &mut **l))
-                }
-                kvobj::ValueRepr::Hash(h) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, &mut **h))
-                }
-                kvobj::ValueRepr::Set(s) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, &mut **s))
-                }
-                kvobj::ValueRepr::ZSet(z) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, &mut **z))
-                }
-                kvobj::ValueRepr::Int(_)
-                | kvobj::ValueRepr::Inline(_)
-                | kvobj::ValueRepr::Raw(_) => RmwEntry::OccupiedMut(
-                    OccupiedEntryMut::non_collection(data_type, encoding, expire_at),
-                ),
+            let entry = match obj {
+                Entry::Coll(c) => match &mut c.value {
+                    kvobj::CollVal::List(l) => {
+                        RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, l))
+                    }
+                    kvobj::CollVal::Hash(h) => {
+                        RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, h))
+                    }
+                    kvobj::CollVal::Set(s) => {
+                        RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, s))
+                    }
+                    kvobj::CollVal::ZSet(z) => {
+                        RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, z))
+                    }
+                },
+                Entry::Str(_) => RmwEntry::OccupiedMut(OccupiedEntryMut::non_collection(
+                    data_type, encoding, expire_at,
+                )),
             };
             f(entry)
         } else {
@@ -842,7 +870,9 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         };
 
         let old_deadline = if live {
-            self.dbs[db_idx].get(key).and_then(|o| o.expire_at)
+            self.dbs[db_idx]
+                .find(key_h, |e| e.key() == key)
+                .and_then(Entry::expire_at)
         } else {
             None
         };
@@ -859,10 +889,7 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         // TTL change on a watched key is a write, scoped to the real-change
                         // branch so a no-op TTL write stays clean (matches Redis).
                         self.touch_watch(db, key);
-                        if let Some(obj) = self.dbs[db_idx].get_mut(key) {
-                            obj.expire_at = new_deadline;
-                            obj.header.ttl_present = new_deadline.is_some();
-                        }
+                        self.set_entry_expire(db_idx, key, new_deadline);
                     }
                 }
             }
@@ -871,7 +898,7 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                     ExpireWrite::Unchanged => old_deadline,
                     other => resolve_expire(other, old_deadline),
                 };
-                let obj = KvObj::from_new_owned(key, v, new_deadline);
+                let obj = Entry::from_new_owned(key, v, new_deadline);
                 self.put_object(db, db_idx, key, obj);
             }
             RmwAction::Delete => {
@@ -894,8 +921,8 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             RmwAction::Mutated => {
                 if live {
                     let emptied = self.dbs[db_idx]
-                        .get(key)
-                        .is_some_and(KvObj::is_empty_collection);
+                        .find(key_h, |e| e.key() == key)
+                        .is_some_and(Entry::is_empty_collection);
                     if emptied {
                         // Same pre-edit-weight credit as the Delete arm: the edit
                         // already shrank the in-memory object, so credit `old_bytes`.
@@ -913,7 +940,9 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         // same-size in-place path, so the notify must fire here. (The emptied
                         // branch above already notifies via remove_object_crediting.)
                         self.touch_watch(db, key);
-                        let new_bytes = self.dbs[db_idx].get(key).map_or(0, KvObj::accounted_bytes);
+                        let new_bytes = self.dbs[db_idx]
+                            .find(key_h, |e| e.key() == key)
+                            .map_or(0, Entry::accounted_bytes);
                         // Re-account the signed delta and re-fire the eviction sizing
                         // so the policy's per-key byte estimate tracks the edit.
                         if new_bytes != old_bytes {
@@ -928,11 +957,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                             ExpireWrite::Unchanged => old_deadline,
                             other => resolve_expire(other, old_deadline),
                         };
-                        if let Some(obj) = self.dbs[db_idx].get_mut(key) {
+                        if let Some(obj) = self.dbs[db_idx].find_mut(key_h, |e| e.key() == key) {
                             obj.recompute_encoding();
                             if new_deadline != old_deadline {
-                                obj.expire_at = new_deadline;
-                                obj.header.ttl_present = new_deadline.is_some();
+                                obj.set_expire_at(new_deadline);
                             }
                         }
                     }
@@ -952,7 +980,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         if !self.expire_if_due(db, db_idx, key, now) {
             return None;
         }
-        self.dbs[db_idx].get(key).map(|o| o.header.data_type)
+        let h = self.key_hash(key);
+        self.dbs[db_idx]
+            .find(h, |e| e.key() == key)
+            .map(Entry::data_type)
     }
 
     fn used_memory(&self) -> u64 {
@@ -1062,10 +1093,12 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
             let db_idx = self.db_index(db);
             // Inspect the candidate (immutable borrow), extract the state, then drop
             // the borrow before any mutating call (the hooks borrow self mut).
-            let (present, is_expired, lacks_ttl) = match self.dbs[db_idx].get(&*key) {
-                Some(obj) => (true, obj.is_expired(now), obj.expire_at.is_none()),
-                None => (false, false, true),
-            };
+            let kh = self.key_hash(&key);
+            let (present, is_expired, lacks_ttl) =
+                match self.dbs[db_idx].find(kh, |e| e.key() == &key[..]) {
+                    Some(obj) => (true, obj.is_expired(now), obj.expire_at().is_none()),
+                    None => (false, false, true),
+                };
             // A STALE victim (the policy offered a key the store no longer holds, e.g.
             // a Random roster entry the store did not actually delete on a prior skip):
             // prune it from the policy so it is not re-offered, then ask for the next.
@@ -1157,13 +1190,17 @@ impl<A: AccountingHook> ironcache_storage::PolicySwap for ShardStore<Policy, A> 
             .dbs
             .iter()
             .enumerate()
-            .flat_map(|(db_idx, map)| {
+            .flat_map(|(db_idx, table)| {
                 let db = db_idx as u32;
-                map.iter().filter_map(move |(key, obj)| {
+                table.iter().filter_map(move |obj| {
                     if obj.is_expired(now) {
                         None
                     } else {
-                        Some((db, key.clone(), obj.accounted_bytes()))
+                        Some((
+                            db,
+                            obj.key().to_vec().into_boxed_slice(),
+                            obj.accounted_bytes(),
+                        ))
                     }
                 })
             })
@@ -1197,10 +1234,11 @@ impl<E: EvictionHook, A: AccountingHook> ironcache_storage::ActiveExpiry for Sha
     /// count.
     fn reap_if_expired(&mut self, db: u32, key: &[u8], now: UnixMillis) -> bool {
         let db_idx = self.db_index(db);
+        let h = self.key_hash(key);
         let expired = self
             .dbs
             .get(db_idx)
-            .and_then(|m| m.get(key))
+            .and_then(|t| t.find(h, |e| e.key() == key))
             .is_some_and(|o| o.is_expired(now));
         if !expired {
             return false;
@@ -1238,19 +1276,23 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         mut keep: impl FnMut(&[u8], DataType) -> bool,
     ) -> (ScanCursor, Vec<Box<[u8]>>) {
         let db_idx = self.db_index(db);
-        let Some(map) = self.dbs.get(db_idx) else {
+        let Some(table) = self.dbs.get(db_idx) else {
             return (ScanCursor::START, Vec::new());
         };
-        if map.is_empty() {
+        if table.is_empty() {
             // Empty db -> complete immediately (cursor 0).
             return (ScanCursor::START, Vec::new());
         }
 
         // The sorted (scan_hash, key_bytes) view. `scan_hash` is recomputed from the
-        // key bytes here, NOT read from the table's internal hasher, so the order is
-        // stable across calls and across a resize (KEYSPACE.md). Sorting by (hash,
-        // bytes) gives a total order even for equal-hash keys.
-        let mut order: Vec<(u64, &[u8])> = map.keys().map(|k| (scan_hash(k), k.as_ref())).collect();
+        // key bytes (read out of each entry), NOT from the table's internal hasher, so
+        // the order is stable across calls and across a resize (KEYSPACE.md). Sorting by
+        // (hash, bytes) gives a total order even for equal-hash keys. Each `&[u8]`
+        // borrows the key INSIDE its entry (no separate key allocation).
+        let mut order: Vec<(u64, &[u8])> = table
+            .iter()
+            .map(|e| (scan_hash(e.key()), e.key()))
+            .collect();
         order.sort_unstable();
 
         // Walk the sorted order, choosing which keys to EXAMINE this batch and what the
@@ -1264,11 +1306,15 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         // MATCH/TYPE `keep` filter BEFORE cloning the key into the result.
         let mut kept: Vec<Box<[u8]>> = Vec::with_capacity(plan.examined.len());
         for &key in &plan.examined {
-            if let Some(obj) = map.get(key) {
+            // Re-find the entry by its embedded key (the `order`/`plan.examined`
+            // slices borrow the keys inside the entries; `find` reaches the entry to
+            // read its metadata). `self.hasher` and `table` are disjoint fields, so
+            // both immutable borrows coexist.
+            if let Some(obj) = table.find(self.hasher.hash_one(key), |e| e.key() == key) {
                 if obj.is_expired(now) {
                     continue;
                 }
-                if keep(key, obj.header.data_type) {
+                if keep(key, obj.data_type()) {
                     kept.push(key.to_vec().into_boxed_slice());
                 }
             }
@@ -1280,30 +1326,30 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         let db_idx = self.db_index(db);
         // RAW table length (Redis does not active-expire on DBSIZE): the dict size,
         // including not-yet-reaped expired keys. No lazy backstop here.
-        self.dbs.get(db_idx).map_or(0, HashMap::len)
+        self.dbs.get(db_idx).map_or(0, HashTable::len)
     }
 
     fn random_key(&mut self, db: u32, pick: u64, now: UnixMillis) -> Option<Box<[u8]>> {
         let db_idx = self.db_index(db);
-        let map = self.dbs.get(db_idx)?;
-        let n = map.len();
+        let table = self.dbs.get(db_idx)?;
+        let n = table.len();
         if n == 0 {
             return None;
         }
         // The caller drew `pick` from the Env RNG (ADR-0003: the store reads no RNG).
         // Map it to a starting index, then probe forward DETERMINISTICALLY in the
         // sorted scan order, skipping expired keys, so an expired key at the picked
-        // position does not yield `None` while live keys remain.
-        let mut order: Vec<&[u8]> = map.keys().map(std::convert::AsRef::as_ref).collect();
-        order.sort_unstable_by(|a, b| scan_hash(a).cmp(&scan_hash(b)).then(a.cmp(b)));
+        // position does not yield `None` while live keys remain. The order carries the
+        // key + its live/expired flag so no re-lookup is needed.
+        let mut order: Vec<(&[u8], bool)> =
+            table.iter().map(|e| (e.key(), e.is_expired(now))).collect();
+        order.sort_unstable_by(|a, b| scan_hash(a.0).cmp(&scan_hash(b.0)).then(a.0.cmp(b.0)));
         let start = (pick % n as u64) as usize;
         for off in 0..n {
             let idx = (start + off) % n;
-            let key = order[idx];
-            if let Some(obj) = map.get(key) {
-                if !obj.is_expired(now) {
-                    return Some(key.to_vec().into_boxed_slice());
-                }
+            let (key, expired) = order[idx];
+            if !expired {
+                return Some(key.to_vec().into_boxed_slice());
             }
         }
         None
@@ -1312,7 +1358,10 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
     fn flush_db(&mut self, db: u32) -> u64 {
         let db_idx = self.db_index(db);
         let keys: Vec<Box<[u8]>> = match self.dbs.get(db_idx) {
-            Some(map) => map.keys().cloned().collect(),
+            Some(table) => table
+                .iter()
+                .map(|e| e.key().to_vec().into_boxed_slice())
+                .collect(),
             None => return 0,
         };
         let mut removed = 0u64;
@@ -1375,11 +1424,14 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
 
         // Take the source object INTACT (preserving encoding + remaining TTL). Re-key it
         // to the destination key bytes; the value representation and `expire_at` are
-        // carried unchanged (KEYSPACE.md "moves the value object INTACT").
-        let Some(mut obj) = self.dbs[src_idx].get(src).cloned() else {
+        // carried unchanged (KEYSPACE.md "moves the value object INTACT"). For a Str
+        // entry `rekey` rebuilds the blob with the new embedded key; for a Coll it is a
+        // field write.
+        let src_h = self.key_hash(src);
+        let Some(mut obj) = self.dbs[src_idx].find(src_h, |e| e.key() == src).cloned() else {
             return MoveOutcome::NoSource;
         };
-        obj.key = dst.to_vec().into_boxed_slice();
+        obj.rekey(dst);
 
         // Write the destination through the funnel (fires insert hooks, accounts bytes;
         // a replaced live destination is credited inside put_object).
@@ -1435,13 +1487,13 @@ impl<E: EvictionHook, A: AccountingHook> ironcache_storage::Watch for ShardStore
         let present = self.expire_if_due(db, db_idx, key, now);
         let probe = (db, key.to_vec().into_boxed_slice());
         let version = match self.watch_versions.entry(probe) {
-            Entry::Occupied(mut e) => {
+            WatchMapEntry::Occupied(mut e) => {
                 let slot = e.get_mut();
                 slot.watchers += 1;
                 self.watched_count += 1;
                 slot.version
             }
-            Entry::Vacant(e) => {
+            WatchMapEntry::Vacant(e) => {
                 let version = self.version_clock;
                 e.insert(WatchSlot {
                     version,
@@ -1495,7 +1547,7 @@ impl<E: EvictionHook, A: AccountingHook> ironcache_storage::Watch for ShardStore
     fn unwatch(&mut self, entries: &[WatchEntry]) {
         for entry in entries {
             let probe = (entry.db, entry.key.clone());
-            if let Entry::Occupied(mut e) = self.watch_versions.entry(probe) {
+            if let WatchMapEntry::Occupied(mut e) = self.watch_versions.entry(probe) {
                 let slot = e.get_mut();
                 slot.watchers = slot.watchers.saturating_sub(1);
                 // Each entry corresponds to exactly one watcher increment from
@@ -1558,7 +1610,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     pub fn insert_object(&mut self, db: u32, obj: KvObj) {
         let db_idx = self.db_index(db);
         let key = obj.key.clone();
-        self.put_object(db, db_idx, &key, obj);
+        // The public builder/transfer type is `KvObj` (tests construct it and set its
+        // fields directly); convert it to the single-allocation table `Entry` at the
+        // funnel boundary.
+        let entry = Entry::from_kvobj(obj);
+        self.put_object(db, db_idx, &key, entry);
     }
 }
 
@@ -1577,7 +1633,7 @@ fn resolve_expire(expire: ExpireWrite, old: Option<UnixMillis>) -> Option<UnixMi
 /// it ever needs to format an int reply without a read).
 #[must_use]
 pub fn format_int(n: i64) -> Bytes {
-    int_decimal_bytes(n)
+    kvobj::int_decimal_bytes(n)
 }
 
 // ---------------------------------------------------------------------------

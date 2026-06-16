@@ -1994,6 +1994,622 @@ impl KvObj {
     }
 }
 
+// ===========================================================================
+// The SINGLE-ALLOCATION table entry (memory Round 3, OBJECT_LAYOUT.md #111).
+//
+// The per-shard table now stores ONE `Entry` per key, NOT a `HashMap` key/value
+// pair. The previous representation was `hashbrown::HashMap<Box<[u8]>, KvObj>`:
+// THREE allocations per string key (the map's owned key `Box`, the `KvObj`'s own
+// duplicate key `Box`, and the value `Box`), carried in an 80-byte map slot.
+//
+// `Entry` collapses a STRING key to ONE allocation (`Entry::Str`): a single blob
+// that holds, contiguously, a small packed header, the optional TTL deadline, the
+// key length, the key bytes, and the value bytes (the value is INLINE in the same
+// blob, tighter than redis's two-allocation kvobj). The table itself stores ONLY
+// the `Entry` and derives the key from inside it (the `entry_key` helper), so there
+// is no separate map key allocation and no key duplication. The slot is one machine
+// word (the `Box<[u8]>` fat pointer is two words, but the enum is `repr`-sized to
+// the larger arm, see the slot-size note on [`Entry`]).
+//
+// A COLLECTION key (`Entry::Coll`) is a `Box<CollEntry>`: a small header + the key
+// + the existing boxed collection value. Collections already heap-allocate their
+// contents, so one extra small box is negligible and keeps the `Entry` enum small.
+//
+// The blob is parsed with SAFE slicing only (`get(..)` / `try_into` /
+// `u64::from_le_bytes`); there is NO `unsafe` (the crate is `#![forbid(unsafe_code)]`).
+// ===========================================================================
+
+/// The byte offset of the key-length field is computed from the header + optional
+/// TTL; these constants name the fixed-size pieces of the [`Entry::Str`] blob.
+mod blob {
+    /// Header: `[data_type:u8][encoding:u8][flags:u8]`.
+    pub const HEADER_LEN: usize = 3;
+    /// The TTL deadline (u64 little-endian milliseconds), present iff the
+    /// [`FLAG_HAS_TTL`] bit is set in the flags byte.
+    pub const TTL_LEN: usize = 8;
+    /// The key-length prefix (u32 little-endian), always present.
+    pub const KEYLEN_LEN: usize = 4;
+    /// The flags byte bit: a TTL deadline u64 follows the header.
+    pub const FLAG_HAS_TTL: u8 = 0b0000_0001;
+}
+
+/// Encode a [`DataType`] as the blob header's first byte.
+fn data_type_to_u8(t: DataType) -> u8 {
+    match t {
+        DataType::String => 0,
+        DataType::List => 1,
+        DataType::Set => 2,
+        DataType::Hash => 3,
+        DataType::ZSet => 4,
+        DataType::Stream => 5,
+    }
+}
+
+/// Decode the blob header's first byte back into a [`DataType`].
+fn data_type_from_u8(b: u8) -> DataType {
+    match b {
+        1 => DataType::List,
+        2 => DataType::Set,
+        3 => DataType::Hash,
+        4 => DataType::ZSet,
+        5 => DataType::Stream,
+        // 0 (and any unexpected byte, defensively) is String.
+        _ => DataType::String,
+    }
+}
+
+/// Encode an [`Encoding`] as the blob header's second byte.
+fn encoding_to_u8(e: Encoding) -> u8 {
+    match e {
+        Encoding::Int => 0,
+        Encoding::EmbStr => 1,
+        Encoding::Raw => 2,
+        Encoding::ListPack => 3,
+        Encoding::QuickList => 4,
+        Encoding::IntSet => 5,
+        Encoding::HashTable => 6,
+        Encoding::SkipList => 7,
+    }
+}
+
+/// Decode the blob header's second byte back into an [`Encoding`].
+fn encoding_from_u8(b: u8) -> Encoding {
+    match b {
+        0 => Encoding::Int,
+        2 => Encoding::Raw,
+        3 => Encoding::ListPack,
+        4 => Encoding::QuickList,
+        5 => Encoding::IntSet,
+        6 => Encoding::HashTable,
+        7 => Encoding::SkipList,
+        // 1 (and any unexpected byte, defensively) is EmbStr.
+        _ => Encoding::EmbStr,
+    }
+}
+
+/// The collection value held inside a [`CollEntry`]. The four collection structs
+/// (`ListVal`/`HashVal`/`SetVal`/`ZSetVal`) are owned here UNCHANGED; the `CollEntry`
+/// `Box` provides the single indirection (memory Round 1 boxed the values inside the
+/// old `ValueRepr`; Round 3 moves that box up to the whole collection entry).
+#[derive(Debug, Clone)]
+pub enum CollVal {
+    /// A LIST value (PR-5).
+    List(ListVal),
+    /// A HASH value (PR-6).
+    Hash(HashVal),
+    /// A SET value (PR-7).
+    Set(SetVal),
+    /// A ZSET value (PR-8).
+    ZSet(ZSetVal),
+}
+
+impl CollVal {
+    /// The data type this collection reports.
+    #[must_use]
+    pub fn data_type(&self) -> DataType {
+        match self {
+            CollVal::List(_) => DataType::List,
+            CollVal::Hash(_) => DataType::Hash,
+            CollVal::Set(_) => DataType::Set,
+            CollVal::ZSet(_) => DataType::ZSet,
+        }
+    }
+
+    /// The encoding this collection reports (a pure function of its active repr).
+    #[must_use]
+    pub fn encoding(&self) -> Encoding {
+        match self {
+            CollVal::List(l) => l.encoding(),
+            CollVal::Hash(h) => h.encoding(),
+            CollVal::Set(s) => s.encoding(),
+            CollVal::ZSet(z) => z.encoding(),
+        }
+    }
+
+    /// The sum of element byte lengths (the value side of accounting).
+    #[must_use]
+    pub fn element_bytes(&self) -> usize {
+        match self {
+            CollVal::List(l) => l.element_bytes(),
+            CollVal::Hash(h) => h.element_bytes(),
+            CollVal::Set(s) => s.element_bytes(),
+            CollVal::ZSet(z) => z.element_bytes(),
+        }
+    }
+
+    /// The element count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            CollVal::List(l) => l.len(),
+            CollVal::Hash(h) => h.len(),
+            CollVal::Set(s) => s.len(),
+            CollVal::ZSet(z) => z.len(),
+        }
+    }
+
+    /// Whether the collection holds zero elements.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A COLLECTION table entry (memory Round 3): a small header, the key bytes, the
+/// optional TTL deadline, and the boxed-up collection value. One `Box<CollEntry>`
+/// behind the [`Entry::Coll`] arm. The key is stored INSIDE so the table's eq/hash
+/// closures read it (no separate map key allocation).
+#[derive(Debug, Clone)]
+pub struct CollEntry {
+    /// The eviction rank (2-bit S3-FIFO counter; RESERVED, mirrors the old
+    /// `Header::eviction_rank`). Not load-bearing today (the policy owns the rank).
+    pub eviction_rank: u8,
+    /// The forkless-snapshot version stamp (#60; RESERVED, mirrors the old
+    /// `Header::snapshot_version`).
+    pub snapshot_version: u32,
+    /// The absolute TTL deadline, if any.
+    pub expire_at: Option<UnixMillis>,
+    /// The key bytes (stored here so the table eq/hash closures can read them).
+    pub key: Box<[u8]>,
+    /// The collection value.
+    pub value: CollVal,
+}
+
+/// One key/value table entry as a SINGLE allocation behind a small slot (memory
+/// Round 3, OBJECT_LAYOUT.md #111). The per-shard `hashbrown::HashTable` stores
+/// `Entry` directly and derives the key from inside it.
+///
+/// ## Slot size
+///
+/// The enum is two arms, each one pointer wide (`Box<[u8]>` is a fat pointer, two
+/// words; `Box<CollEntry>` is one word), so `size_of::<Entry>()` is 16 bytes on a
+/// 64-bit target (the `Box<[u8]>` fat-pointer arm dominates; the discriminant folds
+/// into the niche/padding). The hashbrown `HashTable<Entry>` slot is therefore 16
+/// bytes plus the 1-byte control tag, versus the old `HashMap<Box<[u8]>, KvObj>`
+/// whose value alone (`KvObj`) was 64 bytes carried in an 80-byte slot, AND which
+/// owned a separate key `Box`. This is the Round 3 win: a small slot, one allocation
+/// per string key, and no key duplication.
+#[derive(Debug, Clone)]
+pub enum Entry {
+    /// A STRING-family value (int/embstr/raw): ONE blob holding the packed header,
+    /// the optional TTL, the key length, the key bytes, then the value bytes. For an
+    /// int-encoded value the value bytes are the CANONICAL DECIMAL bytes (so a read
+    /// borrows them directly and `OBJECT ENCODING` still reports `int` from the
+    /// header), realizing the int materialization with no per-read allocation.
+    Str(Box<[u8]>),
+    /// A COLLECTION value (list/hash/set/zset): the boxed [`CollEntry`].
+    Coll(Box<CollEntry>),
+}
+
+impl Entry {
+    /// Assemble a [`Entry::Str`] blob from its parts (the single write site for the
+    /// blob layout). `value_bytes` are the bytes stored after the key: for int the
+    /// canonical decimal digits, for embstr/raw the string bytes.
+    fn build_str_blob(
+        data_type: DataType,
+        encoding: Encoding,
+        expire_at: Option<UnixMillis>,
+        key: &[u8],
+        value_bytes: &[u8],
+    ) -> Box<[u8]> {
+        let has_ttl = expire_at.is_some();
+        let ttl_len = if has_ttl { blob::TTL_LEN } else { 0 };
+        let total = blob::HEADER_LEN + ttl_len + blob::KEYLEN_LEN + key.len() + value_bytes.len();
+        let mut buf = Vec::with_capacity(total);
+        // Header: type, encoding, flags.
+        buf.push(data_type_to_u8(data_type));
+        buf.push(encoding_to_u8(encoding));
+        buf.push(if has_ttl { blob::FLAG_HAS_TTL } else { 0 });
+        // Optional TTL deadline (u64 LE).
+        if let Some(UnixMillis(deadline)) = expire_at {
+            buf.extend_from_slice(&deadline.to_le_bytes());
+        }
+        // Key length (u32 LE) + key bytes. A key longer than u32::MAX is not
+        // representable; Redis keys are bounded far below this, and the command
+        // layer rejects oversize keys, so the cast is safe in practice. Saturate
+        // defensively rather than wrap.
+        let key_len = u32::try_from(key.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&key_len.to_le_bytes());
+        buf.extend_from_slice(key);
+        // Value bytes (the rest of the blob).
+        buf.extend_from_slice(value_bytes);
+        buf.into_boxed_slice()
+    }
+
+    /// Build a STRING entry from a key and an already-[`classify`]d value.
+    #[must_use]
+    pub fn str_from_classified(
+        key: &[u8],
+        classified: Classified,
+        bytes: &[u8],
+        expire_at: Option<UnixMillis>,
+    ) -> Self {
+        match classified {
+            Classified::Int(n) => Entry::str_from_int(key, n, expire_at),
+            Classified::EmbStr => Entry::Str(Entry::build_str_blob(
+                DataType::String,
+                Encoding::EmbStr,
+                expire_at,
+                key,
+                bytes,
+            )),
+            Classified::Raw => Entry::Str(Entry::build_str_blob(
+                DataType::String,
+                Encoding::Raw,
+                expire_at,
+                key,
+                bytes,
+            )),
+        }
+    }
+
+    /// Build a STRING entry from a key and raw value bytes, classifying the encoding.
+    #[must_use]
+    pub fn str_from_bytes(key: &[u8], bytes: &[u8], expire_at: Option<UnixMillis>) -> Self {
+        Entry::str_from_classified(key, classify(bytes), bytes, expire_at)
+    }
+
+    /// Build an int-encoded STRING entry: the value bytes are the canonical decimal
+    /// digits (so the read path borrows them; `OBJECT ENCODING` reports `int`).
+    #[must_use]
+    pub fn str_from_int(key: &[u8], n: i64, expire_at: Option<UnixMillis>) -> Self {
+        let mut buf = [0u8; 20];
+        let digits = format_i64(n, &mut buf);
+        Entry::Str(Entry::build_str_blob(
+            DataType::String,
+            Encoding::Int,
+            expire_at,
+            key,
+            digits,
+        ))
+    }
+
+    /// Build a COLLECTION entry from a key and a [`CollVal`].
+    #[must_use]
+    pub fn coll(key: &[u8], value: CollVal, expire_at: Option<UnixMillis>) -> Self {
+        Entry::Coll(Box::new(CollEntry {
+            eviction_rank: 0,
+            snapshot_version: 0,
+            expire_at,
+            key: key.to_vec().into_boxed_slice(),
+            value,
+        }))
+    }
+
+    /// Build an entry from a key and an owned RMW write value ([`NewValueOwned`]).
+    #[must_use]
+    pub fn from_new_owned(key: &[u8], value: NewValueOwned, expire_at: Option<UnixMillis>) -> Self {
+        match value {
+            NewValueOwned::Int(n) => Entry::str_from_int(key, n, expire_at),
+            NewValueOwned::Bytes(b) => Entry::str_from_bytes(key, &b, expire_at),
+            NewValueOwned::List(elems) => {
+                let mut list = ListVal::new();
+                for e in &elems {
+                    list.push_back(e);
+                }
+                Entry::coll(key, CollVal::List(list), expire_at)
+            }
+            NewValueOwned::Hash(pairs) => {
+                let mut hash = HashVal::new();
+                for (f, v) in &pairs {
+                    hash.set(f, v);
+                }
+                Entry::coll(key, CollVal::Hash(hash), expire_at)
+            }
+            NewValueOwned::Set(members) => {
+                Entry::coll(key, CollVal::Set(SetVal::from_members(&members)), expire_at)
+            }
+            NewValueOwned::ZSet(pairs) => {
+                Entry::coll(key, CollVal::ZSet(ZSetVal::from_pairs(&pairs)), expire_at)
+            }
+        }
+    }
+
+    /// Build an `Entry` from a fully-formed [`KvObj`] (the `insert_object` / move
+    /// paths; the `KvObj` is the public builder/transfer type the tests construct).
+    #[must_use]
+    pub fn from_kvobj(obj: KvObj) -> Self {
+        let KvObj {
+            header,
+            key,
+            value,
+            expire_at,
+        } = obj;
+        match value {
+            ValueRepr::Int(n) => Entry::str_from_int(&key, n, expire_at),
+            // The embstr-vs-raw distinction lives in the HEADER encoding, not the
+            // variant, so honor `header.encoding` when laying down the blob.
+            ValueRepr::Inline(b) | ValueRepr::Raw(b) => Entry::Str(Entry::build_str_blob(
+                header.data_type,
+                header.encoding,
+                expire_at,
+                &key,
+                &b,
+            )),
+            ValueRepr::List(l) => Entry::coll(&key, CollVal::List(*l), expire_at),
+            ValueRepr::Hash(h) => Entry::coll(&key, CollVal::Hash(*h), expire_at),
+            ValueRepr::Set(s) => Entry::coll(&key, CollVal::Set(*s), expire_at),
+            ValueRepr::ZSet(z) => Entry::coll(&key, CollVal::ZSet(*z), expire_at),
+        }
+    }
+
+    // -- STRING blob parsing (SAFE slicing only) --
+
+    /// The flags byte of a Str blob.
+    fn str_flags(blob: &[u8]) -> u8 {
+        blob.get(2).copied().unwrap_or(0)
+    }
+
+    /// The byte offset where the key-length field begins (after the header and the
+    /// optional TTL).
+    fn str_keylen_offset(blob: &[u8]) -> usize {
+        if Entry::str_flags(blob) & blob::FLAG_HAS_TTL != 0 {
+            blob::HEADER_LEN + blob::TTL_LEN
+        } else {
+            blob::HEADER_LEN
+        }
+    }
+
+    /// The key length stored in a Str blob.
+    fn str_key_len(blob: &[u8]) -> usize {
+        let off = Entry::str_keylen_offset(blob);
+        blob.get(off..off + blob::KEYLEN_LEN)
+            .and_then(|s| s.try_into().ok())
+            .map_or(0, |a: [u8; 4]| u32::from_le_bytes(a) as usize)
+    }
+
+    /// The byte offset where the key bytes begin in a Str blob.
+    fn str_key_offset(blob: &[u8]) -> usize {
+        Entry::str_keylen_offset(blob) + blob::KEYLEN_LEN
+    }
+
+    /// The KEY bytes of this entry (used by the table's eq/hash closures and the
+    /// eviction/SCAN hooks). For a `Coll` this is the stored `CollEntry.key`.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Entry::Str(blob) => {
+                let off = Entry::str_key_offset(blob);
+                let klen = Entry::str_key_len(blob);
+                blob.get(off..off + klen).unwrap_or(&[])
+            }
+            Entry::Coll(c) => &c.key,
+        }
+    }
+
+    /// The VALUE bytes of a STRING entry (decimal digits for int, the string bytes
+    /// for embstr/raw). Returns an empty slice for a collection entry (which has no
+    /// byte-readable value, matching the old `view_of` for a collection).
+    #[must_use]
+    pub fn str_value_bytes(&self) -> &[u8] {
+        match self {
+            Entry::Str(blob) => {
+                let val_off = Entry::str_key_offset(blob) + Entry::str_key_len(blob);
+                blob.get(val_off..).unwrap_or(&[])
+            }
+            Entry::Coll(_) => &[],
+        }
+    }
+
+    /// The logical data type (for TYPE / WRONGTYPE / the SCAN type filter).
+    #[must_use]
+    pub fn data_type(&self) -> DataType {
+        match self {
+            Entry::Str(blob) => data_type_from_u8(blob.first().copied().unwrap_or(0)),
+            Entry::Coll(c) => c.value.data_type(),
+        }
+    }
+
+    /// The internal encoding (for `OBJECT ENCODING`). For a Str entry it is read
+    /// straight from the header byte; for a Coll it is the live pure-function repr.
+    #[must_use]
+    pub fn encoding(&self) -> Encoding {
+        match self {
+            Entry::Str(blob) => encoding_from_u8(blob.get(1).copied().unwrap_or(1)),
+            Entry::Coll(c) => c.value.encoding(),
+        }
+    }
+
+    /// The absolute TTL deadline, if any.
+    #[must_use]
+    pub fn expire_at(&self) -> Option<UnixMillis> {
+        match self {
+            Entry::Str(blob) => {
+                if Entry::str_flags(blob) & blob::FLAG_HAS_TTL != 0 {
+                    blob.get(blob::HEADER_LEN..blob::HEADER_LEN + blob::TTL_LEN)
+                        .and_then(|s| s.try_into().ok())
+                        .map(|a: [u8; 8]| UnixMillis(u64::from_le_bytes(a)))
+                } else {
+                    None
+                }
+            }
+            Entry::Coll(c) => c.expire_at,
+        }
+    }
+
+    /// Overwrite this entry's TTL deadline in place (EXPIRE/PERSIST/KEEPTTL on an
+    /// otherwise-untouched value). For a Str entry a TTL add/remove changes the blob
+    /// LENGTH (the 8-byte deadline field appears/disappears), so the blob is rebuilt;
+    /// a deadline-only change to an already-TTL'd blob is patched in place. For a
+    /// Coll entry it is a plain field write.
+    pub fn set_expire_at(&mut self, expire_at: Option<UnixMillis>) {
+        match self {
+            Entry::Str(blob) => {
+                let had_ttl = Entry::str_flags(blob) & blob::FLAG_HAS_TTL != 0;
+                match (had_ttl, expire_at) {
+                    // Patch the existing TTL field in place (same blob length).
+                    (true, Some(UnixMillis(deadline))) => {
+                        let bytes = deadline.to_le_bytes();
+                        for (i, b) in bytes.iter().enumerate() {
+                            blob[blob::HEADER_LEN + i] = *b;
+                        }
+                    }
+                    // No change (no TTL before, none after).
+                    (false, None) => {}
+                    // Add or remove the TTL field: the blob length changes, so rebuild.
+                    _ => {
+                        let data_type = self.data_type();
+                        let encoding = self.encoding();
+                        // Re-extract key + value from the OLD blob before rebuilding.
+                        let key = self.key().to_vec();
+                        let value = self.str_value_bytes().to_vec();
+                        *self = Entry::Str(Entry::build_str_blob(
+                            data_type, encoding, expire_at, &key, &value,
+                        ));
+                    }
+                }
+            }
+            Entry::Coll(c) => c.expire_at = expire_at,
+        }
+    }
+
+    /// Whether this entry's TTL deadline has strictly passed at `now` (the lazy
+    /// backstop predicate; `now > deadline`, alive at `now == deadline`).
+    #[must_use]
+    pub fn is_expired(&self, now: UnixMillis) -> bool {
+        match self.expire_at() {
+            Some(deadline) => now > deadline,
+            None => false,
+        }
+    }
+
+    /// The logical byte length of the value (STRLEN basis).
+    #[must_use]
+    pub fn logical_len(&self) -> usize {
+        match self {
+            Entry::Str(_) => self.str_value_bytes().len(),
+            Entry::Coll(c) => c.value.element_bytes(),
+        }
+    }
+
+    /// The accounting weight: key bytes + value logical bytes. Identical model to the
+    /// old `KvObj::accounted_bytes` (the `used_memory` counter and the accounting
+    /// tests rely on this exact figure).
+    #[must_use]
+    pub fn accounted_bytes(&self) -> usize {
+        self.key().len() + self.logical_len()
+    }
+
+    /// Whether this entry is a COLLECTION (list/hash/set/zset).
+    #[must_use]
+    pub fn is_collection(&self) -> bool {
+        matches!(self, Entry::Coll(_))
+    }
+
+    /// The element count IF this is a collection, else `None`.
+    #[must_use]
+    pub fn collection_len(&self) -> Option<usize> {
+        match self {
+            Entry::Coll(c) => Some(c.value.len()),
+            Entry::Str(_) => None,
+        }
+    }
+
+    /// Whether this is a COLLECTION holding zero elements (the empty-collection
+    /// -deletes-key backstop check, by element count).
+    #[must_use]
+    pub fn is_empty_collection(&self) -> bool {
+        self.collection_len() == Some(0)
+    }
+
+    /// Recompute and store the encoding for a COLLECTION entry from its current repr
+    /// (after an in-place edit a list may cross listpack->quicklist, etc.). A no-op
+    /// for a Str entry (its encoding is fixed at write time and patched by
+    /// `set_value_bytes`). Mirrors the old `KvObj::recompute_encoding`.
+    pub fn recompute_encoding(&mut self) {
+        if let Entry::Coll(_c) = self {
+            // The Coll encoding is a PURE FUNCTION of the live value (read via
+            // `c.value.encoding()`), so there is nothing cached to update: `encoding()`
+            // already reflects the post-edit repr. Kept as an explicit no-op so the
+            // store's call site reads the same as the old KvObj path.
+        }
+    }
+
+    /// A mutable borrow of the stored collection value as a `&mut dyn ListValue`, or
+    /// `None` if this entry is not a list.
+    pub fn as_list_mut(&mut self) -> Option<&mut ListVal> {
+        match self {
+            Entry::Coll(c) => match &mut c.value {
+                CollVal::List(l) => Some(l),
+                _ => None,
+            },
+            Entry::Str(_) => None,
+        }
+    }
+
+    /// A mutable borrow of the stored HASH value, or `None`.
+    pub fn as_hash_mut(&mut self) -> Option<&mut HashVal> {
+        match self {
+            Entry::Coll(c) => match &mut c.value {
+                CollVal::Hash(h) => Some(h),
+                _ => None,
+            },
+            Entry::Str(_) => None,
+        }
+    }
+
+    /// A mutable borrow of the stored SET value, or `None`.
+    pub fn as_set_mut(&mut self) -> Option<&mut SetVal> {
+        match self {
+            Entry::Coll(c) => match &mut c.value {
+                CollVal::Set(s) => Some(s),
+                _ => None,
+            },
+            Entry::Str(_) => None,
+        }
+    }
+
+    /// A mutable borrow of the stored ZSET value, or `None`.
+    pub fn as_zset_mut(&mut self) -> Option<&mut ZSetVal> {
+        match self {
+            Entry::Coll(c) => match &mut c.value {
+                CollVal::ZSet(z) => Some(z),
+                _ => None,
+            },
+            Entry::Str(_) => None,
+        }
+    }
+
+    /// Re-key this entry to `new_key` (the RENAME/MOVE/COPY relocation; the value
+    /// object is preserved INTACT with its encoding + remaining TTL). For a Str entry
+    /// the key is INSIDE the blob, so the blob is rebuilt with the new key; for a Coll
+    /// entry it is a field write.
+    pub fn rekey(&mut self, new_key: &[u8]) {
+        match self {
+            Entry::Str(_) => {
+                let data_type = self.data_type();
+                let encoding = self.encoding();
+                let expire_at = self.expire_at();
+                let value = self.str_value_bytes().to_vec();
+                *self = Entry::Str(Entry::build_str_blob(
+                    data_type, encoding, expire_at, new_key, &value,
+                ));
+            }
+            Entry::Coll(c) => c.key = new_key.to_vec().into_boxed_slice(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
