@@ -569,6 +569,13 @@ measure_server() {
     if [[ "${EVICT}" == "1" ]]; then
       df_cache_flag=(--cache_mode=true)
       echo "[h2h] ${name}: EVICTION mode (--cache_mode=true under maxmemory=${MAXMEMORY})."
+      # IMPORTANT: Dragonfly REFUSES to boot unless maxmemory >= 256 MiB * proactor_threads
+      # (dfly_main.cc: 'There are N threads, so X MiB are required. Exiting...'). So a fair
+      # eviction h2h vs Dragonfly needs MAXMEMORY >= 256MiB*SERVER_CORE_COUNT (e.g. >= 512mb
+      # for 2 cores) AND a dataset larger than that to force eviction. A low MAXMEMORY (the
+      # natural choice for a cheap small-resident eviction test) boots IronCache/redis but
+      # ABORTS Dragonfly; wait_ready then surfaces the Dragonfly log with the exact reason.
+      echo "[h2h] NOTE: Dragonfly requires maxmemory >= 256MiB * ${SERVER_CORE_COUNT} threads to boot; set MAXMEMORY accordingly for an eviction h2h."
     fi
     echo "[h2h] starting ${name} on ${HOST}:${PORT} (proactor_threads=${SERVER_CORE_COUNT}, maxmemory=${MAXMEMORY}, snapshots off)..."
     ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
