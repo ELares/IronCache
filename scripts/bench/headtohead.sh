@@ -201,16 +201,26 @@ COMPETITOR_BASENAME="$(basename "${COMPETITOR_BIN}")"
 COMPETITOR_VERSION_RAW="$("${COMPETITOR_BIN}" --version 2>&1 | head -n1)"
 COMPETITOR_KIND="unknown"
 COMPETITOR_NAME="competitor"
+# KeyDB and Memcached classification arms MUST precede the generic redis arm. KeyDB's
+# banner advertises "KeyDB" but its version line also embeds "redis" (it is a Redis fork
+# whose banner reads e.g. "KeyDB server v=6.3.4 ... based on Redis"), so a *[Rr]edis*
+# match first would mislabel it as plain redis; the keydb arm classifies it correctly and
+# routes the boot to the --server-threads branch. Memcached is a NON-RESP server measured
+# for MEMORY ONLY (see its measure_server branch and the WHY note there).
 case "${COMPETITOR_VERSION_RAW}" in
-  *[Dd]ragonfly*) COMPETITOR_KIND="dragonfly"; COMPETITOR_NAME="dragonfly" ;;
-  *[Vv]alkey*)    COMPETITOR_KIND="valkey";    COMPETITOR_NAME="valkey" ;;
-  *[Rr]edis*)     COMPETITOR_KIND="redis";     COMPETITOR_NAME="redis"  ;;
+  *[Dd]ragonfly*)   COMPETITOR_KIND="dragonfly"; COMPETITOR_NAME="dragonfly" ;;
+  *[Kk]ey[Dd][Bb]*) COMPETITOR_KIND="keydb";     COMPETITOR_NAME="keydb" ;;
+  *[Mm]emcached*)   COMPETITOR_KIND="memcached"; COMPETITOR_NAME="memcached" ;;
+  *[Vv]alkey*)      COMPETITOR_KIND="valkey";    COMPETITOR_NAME="valkey" ;;
+  *[Rr]edis*)       COMPETITOR_KIND="redis";     COMPETITOR_NAME="redis"  ;;
   *)
     # Fall back to the binary name when the banner is unrecognized.
     case "${COMPETITOR_BASENAME}" in
-      *dragonfly*) COMPETITOR_KIND="dragonfly"; COMPETITOR_NAME="dragonfly" ;;
-      *valkey*)    COMPETITOR_KIND="valkey";    COMPETITOR_NAME="valkey" ;;
-      *redis*)     COMPETITOR_KIND="redis";     COMPETITOR_NAME="redis"  ;;
+      *dragonfly*)   COMPETITOR_KIND="dragonfly"; COMPETITOR_NAME="dragonfly" ;;
+      *keydb*)       COMPETITOR_KIND="keydb";     COMPETITOR_NAME="keydb" ;;
+      *memcached*)   COMPETITOR_KIND="memcached"; COMPETITOR_NAME="memcached" ;;
+      *valkey*)      COMPETITOR_KIND="valkey";    COMPETITOR_NAME="valkey" ;;
+      *redis*)       COMPETITOR_KIND="redis";     COMPETITOR_NAME="redis"  ;;
     esac
     ;;
 esac
@@ -236,6 +246,21 @@ elif [[ "${COMPETITOR_KIND}" == "dragonfly" ]]; then
   echo "[h2h] NOTE: head-to-head, but the PUBLISHED bar is the pinned valkey-server"
   echo "[h2h] NOTE: ${PINNED_VALKEY_VERSION}, so this verdict is INDICATIVE (and a GitHub runner is"
   echo "[h2h] NOTE: a small shared VM - Dragonfly's multi-core design needs real cores to shine)."
+elif [[ "${COMPETITOR_KIND}" == "keydb" ]]; then
+  STANDIN=1
+  echo "[h2h] NOTE: competitor is KeyDB (a multi-threaded Redis fork; speaks RESP and is"
+  echo "[h2h] NOTE: redis-cli compatible, so the same PING/INFO/--pipe + RESP-loadgen path"
+  echo "[h2h] NOTE: drives it - only its threading flag differs: --server-threads, not"
+  echo "[h2h] NOTE: --io-threads). A legitimate full head-to-head, but the PUBLISHED bar is the"
+  echo "[h2h] NOTE: pinned valkey-server ${PINNED_VALKEY_VERSION}, so this verdict is INDICATIVE."
+elif [[ "${COMPETITOR_KIND}" == "memcached" ]]; then
+  STANDIN=1
+  echo "[h2h] NOTE: competitor is Memcached, which does NOT speak RESP. redis-cli"
+  echo "[h2h] NOTE: (PING/INFO/--pipe) and the RESP loadgen CANNOT drive it, so a RESP-contract"
+  echo "[h2h] NOTE: THROUGHPUT/LATENCY comparison is apples-to-oranges and is OUT OF SCOPE. This"
+  echo "[h2h] NOTE: run is MEMORY-ONLY: it populates KEYCOUNT keys over the memcached TEXT"
+  echo "[h2h] NOTE: protocol and reports bytes-per-key from 'stats' bytes; qps/p50/p99 are"
+  echo "[h2h] NOTE: emitted as 0 (NOT measured). Verdict is INDICATIVE."
 elif [[ "${COMPETITOR_KIND}" == "valkey" ]]; then
   if [[ "${COMPETITOR_VERSION}" != "${PINNED_VALKEY_VERSION}" ]]; then
     STANDIN=1
@@ -506,15 +531,19 @@ ratio_div() {
 # bytes-per-key + peak QPS + an optional open-loop latency pass, then stop it cleanly.
 # Args:
 #   $1 = logical name ("ironcache" | competitor name)
-#   $2 = kind ("ironcache" | "valkey" | "redis" | "unknown")
+#   $2 = kind ("ironcache" | "valkey" | "redis" | "keydb" | "dragonfly" | "memcached" |
+#        "unknown")
 # Writes the per-metric results to the global out-vars RES_QPS / RES_QPS_PER_CORE /
-# RES_BYTES_PER_KEY / RES_P50 / RES_P99 (read by the caller before the next server).
+# RES_BYTES_PER_KEY / RES_P50 / RES_P99 / RES_PROTOCOL (read by the caller before the next
+# server). RES_PROTOCOL is "resp" for every RESP server and "memcached-text" for the
+# memory-only memcached path, so the JSON marks memcached as memory-only / non-RESP.
 # ---------------------------------------------------------------------------
 RES_QPS=""
 RES_QPS_PER_CORE=""
 RES_BYTES_PER_KEY=""
 RES_P50=""
 RES_P99=""
+RES_PROTOCOL=""
 
 measure_server() {
   local name="$1" kind="$2"
@@ -528,6 +557,131 @@ measure_server() {
     echo "error: ${HOST}:${PORT} is already in use before starting ${name}. Free it or set PORT=." >&2
     exit 1
   fi
+
+  # ---------------------------------------------------------------------------
+  # MEMCACHED: a NON-RESP, MEMORY-ONLY divergent path that boots/populates/measures over
+  # the memcached TEXT protocol and RETURNS before the RESP throughput/latency passes.
+  #
+  # WHY a separate path (and why memory-only): memcached does NOT speak RESP, so redis-cli
+  # (PING/INFO/--pipe) and the in-repo RESP loadgen CANNOT drive it. A RESP-contract
+  # throughput/latency comparison would be apples-to-oranges, so it is OUT OF SCOPE here;
+  # we compare ONLY bytes-per-key, the one metric we can measure honestly on both. The
+  # readiness probe, populate, and memory read all use the memcached text protocol over
+  # `nc` instead of redis-cli; the RESP helpers (server_ready/populate_keys/run_loadgen/
+  # read_used_memory) are bypassed entirely so the RESP path stays unchanged.
+  # ---------------------------------------------------------------------------
+  if [[ "${kind}" == "memcached" ]]; then
+    # memcached -m is a MEGABYTE item-memory cap. Parse MAXMEMORY (e.g. 4gb / 512mb / a bare
+    # byte count) into whole MB. The non-evict standard run wants a GENEROUS cap so the
+    # populate never hits the slab ceiling; floor at 64 MB. EVICTION mode is not modeled for
+    # memcached here (its LRU is slab-class-local and not comparable to a RESP allkeys-lru);
+    # the cap is still applied, but bytes-per-key under eviction is not meaningful (same
+    # caveat the RESP path already documents).
+    local mc_mb
+    mc_mb="$(awk -v v="${MAXMEMORY}" 'BEGIN {
+      s = tolower(v); mult = 1
+      if (s ~ /kb?$/) { mult = 1024 } else if (s ~ /mb?$/) { mult = 1024*1024 }
+      else if (s ~ /gb?$/) { mult = 1024*1024*1024 } else { mult = 1 }
+      gsub(/[^0-9.]/, "", s)
+      if (s == "") s = 0
+      mb = (s * mult) / (1024*1024)
+      mb = int(mb)
+      if (mb < 64) mb = 64
+      print mb
+    }')"
+    echo "[h2h] starting ${name} on ${HOST}:${PORT} (threads=${SERVER_CORE_COUNT}, -m ${mc_mb} MB, text protocol)..."
+    # FOREGROUND (no -d) backgrounded by the script (& + SERVER_PID), matching how every
+    # other server is launched and killed by the shared trap/stop_server. taskset pins it to
+    # the same server cores as the RESP servers. -t is the worker-thread count (the
+    # --io-threads/--server-threads analog).
+    ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
+      -p "${PORT}" -l "${HOST}" -t "${SERVER_CORE_COUNT}" -m "${mc_mb}" \
+      >"${SERVER_LOG}" 2>&1 &
+    SERVER_PID=$!
+
+    # Readiness: memcached has NO PING/PONG. Probe the text-protocol `version` command and
+    # look for the `VERSION` reply line. Bounded ~10s, mirroring wait_ready, and fail loudly
+    # (dumping the log) on a startup crash or timeout.
+    local mc_ready=0 _i
+    for _i in $(seq 1 40); do
+      if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+        echo "error: ${name} exited during startup. Log:" >&2
+        cat "${SERVER_LOG}" >&2 || true
+        exit 1
+      fi
+      if printf 'version\r\n' | nc -q1 "${HOST}" "${PORT}" 2>/dev/null | grep -q '^VERSION'; then
+        mc_ready=1; break
+      fi
+      sleep 0.25
+    done
+    if [[ "${mc_ready}" -ne 1 ]]; then
+      echo "error: ${name} did not answer 'version' on ${HOST}:${PORT} within ~10s. Log:" >&2
+      cat "${SERVER_LOG}" >&2 || true
+      exit 1
+    fi
+    echo "[h2h] ${name} ready (pid ${SERVER_PID})."
+
+    # bytes-per-key: read `stats` `bytes` on the EMPTY server (before), populate EXACTLY
+    # KEYCOUNT keys k:0..k:N-1 each with a VALUE_SIZE-byte value over the text protocol, then
+    # re-read `bytes` (after). bytes_per_key = (after - before) / KEYCOUNT.
+    #
+    # The key encoding MUST stay `k:<n>` to match the loadgen's Workload::key_bytes and the
+    # RESP populate (a prior `key:<n>` mismatch was a benchmark bug); the loadgen never runs
+    # against memcached, but keeping the SAME encoding makes the bytes-per-key number directly
+    # comparable to the RESP servers' (same key strings, same value size).
+    #
+    # `stats` `bytes` is the count of item bytes CURRENTLY stored (key + value + memcached's
+    # per-item overhead, accounted within slabs); it is the closest analog to redis
+    # used_memory for a memory comparison. It is NOT process RSS, so it excludes the empty
+    # slab pages memcached preallocates - a fair item-level memory figure.
+    echo "[h2h] ${name}: measuring bytes-per-key over ${KEYCOUNT} keys (value_size=${VALUE_SIZE}, memcached text protocol)..."
+    local mc_before mc_after mc_bpk
+    mc_before="$(printf 'stats\r\nquit\r\n' | nc -q1 "${HOST}" "${PORT}" 2>/dev/null \
+      | awk '/^STAT bytes / { gsub(/\r/, "", $3); print $3; exit }')"
+    [[ -n "${mc_before}" ]] || mc_before="0"
+
+    # Emit one `set` per key into a SINGLE nc connection (the text-protocol analog of the
+    # awk|redis-cli --pipe populate). `set <key> <flags> <exptime> <bytes>\r\n<data>\r\n`;
+    # exptime 0 = never expire. memcached replies `STORED` per key; we count them to VERIFY
+    # the populate landed (the bytes-per-key delta is only meaningful if all N keys stored).
+    local mc_stored
+    mc_stored="$(awk -v n="${KEYCOUNT}" -v vsize="${VALUE_SIZE}" 'BEGIN {
+      val = ""
+      for (i = 0; i < vsize; i++) val = val "x"
+      for (k = 0; k < n; k++) {
+        printf "set k:%d 0 0 %d\r\n%s\r\n", k, vsize, val
+      }
+      printf "quit\r\n"
+    }' | nc -q5 "${HOST}" "${PORT}" 2>/dev/null | grep -c '^STORED')"
+    [[ -n "${mc_stored}" ]] || mc_stored="0"
+    if [[ "${EVICT}" == "1" ]]; then
+      echo "[h2h] EVICTION mode: ${mc_stored}/${KEYCOUNT} keys STORED (memcached slab LRU is not comparable to a RESP allkeys-lru; bytes-per-key is not meaningful here)."
+    elif [[ "${mc_stored}" -lt "${KEYCOUNT}" ]]; then
+      echo "error: memcached populate stored only ${mc_stored}/${KEYCOUNT} keys on ${HOST}:${PORT} (raise -m, currently ${mc_mb} MB)" >&2
+      return 1
+    fi
+
+    mc_after="$(printf 'stats\r\nquit\r\n' | nc -q1 "${HOST}" "${PORT}" 2>/dev/null \
+      | awk '/^STAT bytes / { gsub(/\r/, "", $3); print $3; exit }')"
+    [[ -n "${mc_after}" ]] || mc_after="0"
+    mc_bpk="$(awk -v a="${mc_after}" -v b="${mc_before}" -v n="${KEYCOUNT}" \
+      'BEGIN { if (n == 0) { print "0" } else { printf "%.2f", (a - b) / n } }')"
+    echo "[h2h] ${name}: stats bytes ${mc_before} -> ${mc_after}; bytes_per_key=${mc_bpk} (memory-only, non-RESP)"
+
+    # SKIP the warmup/closed-loop/open-loop passes: there is no RESP loadgen for memcached.
+    # qps/p50/p99 are reported as 0 (NOT measured) and RES_PROTOCOL marks this memory-only.
+    stop_server "${name}"
+    RES_QPS="0"
+    RES_QPS_PER_CORE="0"
+    RES_BYTES_PER_KEY="${mc_bpk}"
+    RES_P50="0"
+    RES_P99="0"
+    RES_PROTOCOL="memcached-text"
+    return 0
+  fi
+
+  # Every path below here is a RESP server (redis/valkey/keydb/dragonfly/ironcache).
+  RES_PROTOCOL="resp"
 
   # (b) Boot it, pinned, persistence OFF + eviction OFF for the measurement.
   if [[ "${kind}" == "ironcache" ]]; then
@@ -584,6 +738,40 @@ measure_server() {
       ${df_cache_flag[@]+"${df_cache_flag[@]}"} \
       >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
+  elif [[ "${kind}" == "keydb" ]]; then
+    # KeyDB: a multi-threaded Redis FORK. It is redis-cli/RESP/INFO/--pipe compatible, so
+    # everything downstream (readiness PING, bytes-per-key, the RESP loadgen) is IDENTICAL to
+    # the redis/valkey path. The ONE difference is the multi-threading flag: KeyDB uses
+    # `--server-threads N` (its worker-thread count), NOT redis's `--io-threads N`. Same
+    # persistence-off + eviction handling as redis/valkey: --save '' --appendonly no, and
+    # --maxmemory 0 by default, or a LOW ceiling + allkeys-lru under EVICT=1. The maxmemory
+    # args are built ONCE and reused in the initial + fallback launch so they stay in lockstep.
+    local kdb_mem_args=(--maxmemory 0)
+    local kdb_mem_desc="maxmemory off"
+    if [[ "${EVICT}" == "1" ]]; then
+      kdb_mem_args=(--maxmemory "${MAXMEMORY}" --maxmemory-policy allkeys-lru)
+      kdb_mem_desc="maxmemory=${MAXMEMORY} policy=allkeys-lru (EVICTION mode)"
+    fi
+    echo "[h2h] starting ${name} on ${HOST}:${PORT} (server-threads=${SERVER_CORE_COUNT}, ${kdb_mem_desc}, persistence off)..."
+    ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
+      --port "${PORT}" --bind "${HOST}" --save '' --appendonly no \
+      "${kdb_mem_args[@]}" --daemonize no --server-threads "${SERVER_CORE_COUNT}" \
+      >"${SERVER_LOG}" 2>&1 &
+    SERVER_PID=$!
+    # Defensive fallback (mirrors redis/valkey): if KeyDB rejects --server-threads and exits
+    # at boot, retry without it and note it.
+    sleep 0.5
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+      echo "[h2h] NOTE: ${name} exited at boot (likely rejected --server-threads); retrying WITHOUT it."
+      wait "${SERVER_PID}" 2>/dev/null || true
+      SERVER_PID=""
+      if ! port_free; then sleep 0.5; fi
+      ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
+        --port "${PORT}" --bind "${HOST}" --save '' --appendonly no \
+        "${kdb_mem_args[@]}" --daemonize no \
+        >"${SERVER_LOG}" 2>&1 &
+      SERVER_PID=$!
+    fi
   else
     # Valkey / Redis. Persistence off (--save '' --appendonly no). EVICTION: off by default
     # (--maxmemory 0); when EVICT=1 a LOW ceiling + allkeys-lru so writes EVICT instead of
@@ -696,6 +884,7 @@ IC_QPS_PER_CORE="${RES_QPS_PER_CORE}"
 IC_BYTES_PER_KEY="${RES_BYTES_PER_KEY}"
 IC_P50="${RES_P50}"
 IC_P99="${RES_P99}"
+IC_PROTOCOL="${RES_PROTOCOL}"
 
 measure_server "${COMPETITOR_NAME}" "${COMPETITOR_KIND}"
 CO_QPS="${RES_QPS}"
@@ -703,26 +892,41 @@ CO_QPS_PER_CORE="${RES_QPS_PER_CORE}"
 CO_BYTES_PER_KEY="${RES_BYTES_PER_KEY}"
 CO_P50="${RES_P50}"
 CO_P99="${RES_P99}"
+CO_PROTOCOL="${RES_PROTOCOL}"
 
 # ---------------------------------------------------------------------------
 # RATIOS + ADR-0017 VERDICT.
 #   qps_per_core: IronCache PASSES when it EXCEEDS the competitor's (ratio > 1).
 #   bytes_per_key: IronCache PASSES when it is BELOW the competitor's (ratio < 1).
+#
+# MEMORY-ONLY competitors (memcached): there is no comparable QPS (non-RESP, not measured),
+# so the qps_per_core leg is N/A and the OVERALL verdict reduces to the bytes_per_key leg
+# alone. The qps_per_core ratio is left as 0 (CO_QPS_PER_CORE is 0) and reported as "n/a".
 # ---------------------------------------------------------------------------
+MEMORY_ONLY=0
+if [[ "${CO_PROTOCOL}" == "memcached-text" ]]; then MEMORY_ONLY=1; fi
+
 QPS_RATIO="$(ratio_div "${IC_QPS_PER_CORE}" "${CO_QPS_PER_CORE}")"           # ic / competitor; >1 is good.
 BYTES_RATIO="$(ratio_div "${IC_BYTES_PER_KEY}" "${CO_BYTES_PER_KEY}")"       # ic / competitor; <1 is good.
 
-QPS_VERDICT="FAIL"
-if awk -v a="${IC_QPS_PER_CORE}" -v b="${CO_QPS_PER_CORE}" 'BEGIN { exit !(a > b) }'; then
-  QPS_VERDICT="PASS"
-fi
 BYTES_VERDICT="FAIL"
 if awk -v a="${IC_BYTES_PER_KEY}" -v b="${CO_BYTES_PER_KEY}" 'BEGIN { exit !(a < b) }'; then
   BYTES_VERDICT="PASS"
 fi
-OVERALL="FAIL"
-if [[ "${QPS_VERDICT}" == "PASS" && "${BYTES_VERDICT}" == "PASS" ]]; then
-  OVERALL="PASS"
+
+if [[ "${MEMORY_ONLY}" -eq 1 ]]; then
+  # memory-only: no throughput leg; OVERALL == the bytes leg.
+  QPS_VERDICT="N/A"
+  OVERALL="${BYTES_VERDICT}"
+else
+  QPS_VERDICT="FAIL"
+  if awk -v a="${IC_QPS_PER_CORE}" -v b="${CO_QPS_PER_CORE}" 'BEGIN { exit !(a > b) }'; then
+    QPS_VERDICT="PASS"
+  fi
+  OVERALL="FAIL"
+  if [[ "${QPS_VERDICT}" == "PASS" && "${BYTES_VERDICT}" == "PASS" ]]; then
+    OVERALL="PASS"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -752,6 +956,10 @@ fi
 QPS_PASS_BOOL="false"; [[ "${QPS_VERDICT}" == "PASS" ]] && QPS_PASS_BOOL="true"
 BYTES_PASS_BOOL="false"; [[ "${BYTES_VERDICT}" == "PASS" ]] && BYTES_PASS_BOOL="true"
 OVERALL_BOOL="false"; [[ "${OVERALL}" == "PASS" ]] && OVERALL_BOOL="true"
+MEMORY_ONLY_BOOL="false"; [[ "${MEMORY_ONLY}" -eq 1 ]] && MEMORY_ONLY_BOOL="true"
+# Per-server wire protocol, so the JSON marks a memory-only / non-RESP competitor.
+IC_PROTOCOL="${IC_PROTOCOL:-resp}"
+CO_PROTOCOL="${CO_PROTOCOL:-resp}"
 
 H2H_JSON="${OUT_DIR}/headtohead.json"
 cat >"${H2H_JSON}" <<EOF
@@ -798,6 +1006,7 @@ cat >"${H2H_JSON}" <<EOF
     "ironcache": {
       "name": "ironcache",
       "version": "${IC_VER}",
+      "protocol": "${IC_PROTOCOL}",
       "qps": ${IC_QPS},
       "qps_per_core": ${IC_QPS_PER_CORE},
       "bytes_per_key": ${IC_BYTES_PER_KEY},
@@ -807,6 +1016,7 @@ cat >"${H2H_JSON}" <<EOF
     "competitor": {
       "name": "${COMPETITOR_NAME}",
       "version": "${COMPETITOR_VERSION}",
+      "protocol": "${CO_PROTOCOL}",
       "qps": ${CO_QPS},
       "qps_per_core": ${CO_QPS_PER_CORE},
       "bytes_per_key": ${CO_BYTES_PER_KEY},
@@ -819,6 +1029,7 @@ cat >"${H2H_JSON}" <<EOF
     "bytes_per_key_ironcache_over_competitor": ${BYTES_RATIO}
   },
   "verdict": {
+    "memory_only": ${MEMORY_ONLY_BOOL},
     "qps_per_core_exceeds": ${QPS_PASS_BOOL},
     "bytes_per_key_below": ${BYTES_PASS_BOOL},
     "pass": ${OVERALL_BOOL},
@@ -854,18 +1065,39 @@ if [[ "${SMOKE}" == "1" ]]; then
 fi
 echo "  knobs:       keyspace=${KEYSPACE} keycount=${KEYCOUNT} theta=${THETA} read_ratio=${READ_RATIO} value_size=${VALUE_SIZE} dur=${DURATION_SECS}s conns=${CONNECTIONS} rate=${RATE}"
 echo "  ---"
+if [[ "${MEMORY_ONLY}" -eq 1 ]]; then
+  echo "  mode:        MEMORY-ONLY (competitor ${COMPETITOR_NAME} is non-RESP; throughput/latency NOT measured)"
+fi
 printf '  %-16s %18s %18s %18s\n' "metric" "ironcache" "${COMPETITOR_NAME}" "ic/competitor"
-printf '  %-16s %18s %18s %18s\n' "qps"            "${IC_QPS}"          "${CO_QPS}"          "-"
-printf '  %-16s %18s %18s %18s\n' "qps_per_core"   "${IC_QPS_PER_CORE}" "${CO_QPS_PER_CORE}" "${QPS_RATIO}"
-printf '  %-16s %18s %18s %18s\n' "bytes_per_key"  "${IC_BYTES_PER_KEY}" "${CO_BYTES_PER_KEY}" "${BYTES_RATIO}"
-printf '  %-16s %18s %18s %18s\n' "p50_us"         "${IC_P50}"          "${CO_P50}"          "-"
-printf '  %-16s %18s %18s %18s\n' "p99_us"         "${IC_P99}"          "${CO_P99}"          "-"
+if [[ "${MEMORY_ONLY}" -eq 1 ]]; then
+  # memory-only: throughput/latency were not measured for the competitor; show n/a.
+  printf '  %-16s %18s %18s %18s\n' "qps"            "${IC_QPS}"           "n/a"  "n/a"
+  printf '  %-16s %18s %18s %18s\n' "qps_per_core"   "${IC_QPS_PER_CORE}"  "n/a"  "n/a"
+  printf '  %-16s %18s %18s %18s\n' "bytes_per_key"  "${IC_BYTES_PER_KEY}" "${CO_BYTES_PER_KEY}" "${BYTES_RATIO}"
+  printf '  %-16s %18s %18s %18s\n' "p50_us"         "${IC_P50}"           "n/a"  "-"
+  printf '  %-16s %18s %18s %18s\n' "p99_us"         "${IC_P99}"           "n/a"  "-"
+else
+  printf '  %-16s %18s %18s %18s\n' "qps"            "${IC_QPS}"          "${CO_QPS}"          "-"
+  printf '  %-16s %18s %18s %18s\n' "qps_per_core"   "${IC_QPS_PER_CORE}" "${CO_QPS_PER_CORE}" "${QPS_RATIO}"
+  printf '  %-16s %18s %18s %18s\n' "bytes_per_key"  "${IC_BYTES_PER_KEY}" "${CO_BYTES_PER_KEY}" "${BYTES_RATIO}"
+  printf '  %-16s %18s %18s %18s\n' "p50_us"         "${IC_P50}"          "${CO_P50}"          "-"
+  printf '  %-16s %18s %18s %18s\n' "p99_us"         "${IC_P99}"          "${CO_P99}"          "-"
+fi
 echo "  ---"
 echo "  ADR-0017 VERDICT:"
-echo "    qps_per_core EXCEEDS competitor?  ${QPS_VERDICT}   (${IC_QPS_PER_CORE} vs ${CO_QPS_PER_CORE}, want >)"
+if [[ "${MEMORY_ONLY}" -eq 1 ]]; then
+  echo "    qps_per_core EXCEEDS competitor?  N/A   (memory-only: ${COMPETITOR_NAME} is non-RESP, throughput not measured)"
+else
+  echo "    qps_per_core EXCEEDS competitor?  ${QPS_VERDICT}   (${IC_QPS_PER_CORE} vs ${CO_QPS_PER_CORE}, want >)"
+fi
 echo "    bytes_per_key BELOW competitor?   ${BYTES_VERDICT}   (${IC_BYTES_PER_KEY} vs ${CO_BYTES_PER_KEY}, want <)"
 echo "    OVERALL: ${OVERALL}"
-if [[ "${STANDIN}" -eq 1 ]]; then
+if [[ "${MEMORY_ONLY}" -eq 1 ]]; then
+  echo "    NOTE: ${COMPETITOR_NAME} does NOT speak RESP; this is a MEMORY-ONLY (bytes-per-key)"
+  echo "          comparison. The OVERALL verdict reduces to the bytes-per-key leg alone; the"
+  echo "          throughput/latency comparison is OUT OF SCOPE (apples-to-oranges over a"
+  echo "          non-RESP protocol). This verdict is INDICATIVE."
+elif [[ "${STANDIN}" -eq 1 ]]; then
   if [[ "${COMPETITOR_KIND}" == "redis" ]]; then
     echo "    NOTE: competitor was a redis-server STAND-IN; the published bar is the pinned"
     echo "          valkey-server ${PINNED_VALKEY_VERSION} (docs/bench/COMPETITORS.md). This verdict is INDICATIVE."
