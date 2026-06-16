@@ -99,6 +99,8 @@ single-alloc rewrite subsumes them (no tunnel vision on soon-replaced changes).
 
 | 8 | SPEED: a value-replace skips the eviction policy | round 7's O(N) on_remove fired on every value-replace (put_object did on_remove+on_insert) -> O(N) scan per SET, halving throughput on the slow vCPU | unchanged (accounting-only on replace) | h2h qps 70k -> **204.9k vs redis 179.9k = 1.14x WIN**; perf-gate qps +9.25% | **KEPT** - a value-replace does not change S3-FIFO membership (insertion-ordered; a write bumps freq via the carry, never repositions), so the policy is untouched on replace; hot path O(1) again |
 
+| 9 | MEMORY (vs Dragonfly): zero-per-key-state batch-LFU - delete the S3-FIFO per-key queues entirely (PR #277) | the per-key `VecDeque` FIFOs + ghost ring cost ~49 B/key on whole-process `used_memory`, which LOST the memory h2h to DragonflyDB even though IronCache's STORE alone already beat it; the 2-bit freq already lives ON the object (round 7), so the policy needs NO per-key structure - over budget the STORE table-scans the lowest in-object freq and evicts exactly to fit | h2h (128B/1M keys, pinned Linux, vs **dragonfly 1.39.0**) bytes/key **180.28 vs dragonfly 178.6 = 1.009x** (a DEAD HEAT, ~0.9% behind; was 1.39x heavier before this round). Net -369 lines | qps/core **73462 vs 72577 = 1.012x WIN**; p50 7515 vs 9039 us, p99 44095 vs 67839 us (latency clear WIN) | **KEPT** - removed the entire memory loss vs Dragonfly (1.39x -> ~tied) while winning speed + latency; supersedes ADR-0008 S3-FIFO with exact-LFU-over-2-bit-freq; eviction is now O(N)/episode but provably OFF the benchmark path (4gb ceiling holds the whole 1M-key dataset, eviction never fires); 2-lens adversarial review caught + fixed a non-deterministic cross-db victim tie-break (ADR-0003) and a stale freq-in-object doc |
+
 ### MILESTONE (2026-06-16): CLEAR WINNER over redis on BOTH memory AND speed (indicative pinned-Linux h2h)
 After rounds 1-8, the pinned-Linux head-to-head (vs redis-server 7.0.15, 2 disjoint
 cores, 200k keys, 128B) shows IronCache winning BOTH headline metrics:
@@ -120,6 +122,55 @@ LESSON: only the Linux h2h caught both the round-6 memory regression and the rou
 speed regression - the perf-gate's memmodel measures the store in isolation (misses
 eviction-policy memory) and a fast runner hides O(N)-on-writes costs; ALWAYS re-run the
 Linux h2h after an eviction/datapath change.
+
+## DragonflyDB campaign (target: a CLEAR winner over Dragonfly on memory AND speed)
+
+Same approach as the redis campaign (measure -> tally -> innovate -> pivot after ~10
+dead-ends). Dragonfly is open source, so we study its actual strategy (Dashtable
+extendible hashing, CompactObject inlining, integrated segment-local eviction, mimalloc)
+and improve on it, rather than guessing.
+
+### DECISIVE DIAGNOSIS (before round 9)
+With the redis-era S3-FIFO eviction still in place, IronCache LOST the Dragonfly memory
+h2h by ~1.39x even though the STORE ALONE (the tagged-pointer blob table) already beat
+Dragonfly. The entire gap was the eviction policy's per-key state: three
+`VecDeque<(u32, Box<[u8]>)>` FIFOs + a ghost ring, ~49 B/key on whole-process
+`used_memory` (a key copy + a `Box` alloc + deque slack on top of the store's own blob).
+The 2-bit access frequency that drove the policy already lived ON each object
+(freq-in-object, round 7), so the policy needed NO separate per-key structure. Round 9
+deletes it.
+
+### MILESTONE after round 9 (2026-06-16): a DEAD HEAT with Dragonfly (won speed + latency, ~tied on memory)
+Pinned-Linux h2h (vs **dragonfly 1.39.0**, 2 disjoint cores, 1,000,000 keys, 128B values,
+4gb ceiling so neither side evicts):
+
+| metric | IronCache | dragonfly 1.39.0 | ratio | verdict |
+| --- | ---: | ---: | ---: | --- |
+| bytes-per-key (used_memory delta) | 180.28 | 178.60 | 1.009x | ~tie (0.9% BEHIND) |
+| qps/core (closed-loop, pinned) | 73462 | 72577 | 1.012x | **WIN (speed)** |
+| open-loop p50 | 7515 us | 9039 us | 0.83x | **WIN (latency)** |
+| open-loop p99 | 44095 us | 67839 us | 0.65x | **WIN (latency)** |
+
+Round 9 took the memory result from **1.39x heavier (clear LOSS)** to **1.009x (dead
+heat)** while winning throughput and latency. NOT YET the goal: "a CLEAR winner" needs
+bytes/key CLEARLY below 178.6 (we are 1.68 B/key above). HONESTY: dragonfly is the
+stand-in for the published valkey 9.1.0 bar; a GitHub 4-vCPU shared VM is INDICATIVE; the
+used_memory delta is deterministic/reliable but 0.9% is within plausible run noise (treated
+as a loss to stay honest). The authoritative claim still needs bare metal.
+
+### WHERE THE REMAINING ~1.7 B/key GAP LIKELY IS (hypothesis, to verify next)
+At 1M keys / 2 shards (500k keys each), hashbrown sizes each per-shard `HashTable` to the
+next power of two above `keys / 0.875`: 500k needs > 2^19*0.875 = 458k, so it takes
+2^20 = 1.048M buckets at only ~48% load - the WORST point of hashbrown's power-of-two
+doubling trough, ~half the bucket array empty (~9 of the ~19 table B/key are wasted empty
+slots + control bytes). Dragonfly's Dashtable grows by incremental SEGMENT SPLITS, so it
+never sits in a half-empty doubling trough - this is the structural memory edge that bites
+exactly at this keycount. Next levers to get CLEARLY below Dragonfly (ranked, pending the
+Dragonfly-strategy deep-research): (1) escape the hashbrown doubling trough (a Dash-style
+incrementally-grown table, or a denser sizing strategy); (2) shave the object blob header
+(the u32 total-len prefix -> smaller); (3) allocator (mimalloc like Dragonfly vs jemalloc).
+NB: eviction is now O(N)/episode but OFF the measured path; if a future round adds a
+sustained-eviction benchmark, revisit segment-local/sampled eviction.
 
 ### Round 6 detail (SPEED: the eviction hot path)
 The load profile (macOS `sample` under ~150k qps) showed the hottest IronCache COMPUTE
