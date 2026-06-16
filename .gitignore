@@ -12,3 +12,8 @@ proptest-regressions/
 # local scratch
 *.tmp
 *.bak
+
+# Benchmark run artifacts (scripts/bench/run.sh writes JSON/histogram/manifest here).
+# Only the run script, the competitor matrix, and the README are committed; never the
+# per-run output.
+bench-results/
