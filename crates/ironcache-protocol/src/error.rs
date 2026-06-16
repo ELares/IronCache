@@ -164,6 +164,21 @@ impl ErrorReply {
         )
     }
 
+    /// `ERR string exceeds maximum allowed size (proto-max-bulk-len)`.
+    ///
+    /// Byte-exact to Redis `checkStringLength` (src/t_string.c): returned when a write
+    /// (e.g. APPEND) would grow a string value past the `proto-max-bulk-len` ceiling
+    /// (512 MB default). Matching Redis here both preserves compatibility AND keeps every
+    /// single value below 4 GiB, which the store's manual Str-blob allocator relies on
+    /// (its u32 length prefix must not truncate).
+    #[must_use]
+    pub fn string_exceeds_max() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "string exceeds maximum allowed size (proto-max-bulk-len)",
+        )
+    }
+
     /// `WRONGTYPE Operation against a key holding the wrong kind of value`.
     ///
     /// Note: the pinned Valkey wording is the SINGULAR "Operation"; ERRORS.md's

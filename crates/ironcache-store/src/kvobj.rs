@@ -39,7 +39,9 @@ use ironcache_storage::{
     DataType, Encoding, HashValue, IncrOutcome, LexBound, ListValue, NewValueOwned, ScoreBound,
     SetValue, UnixMillis, ZAddFlags, ZAddOutcome, ZSetValue,
 };
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::collections::{BTreeSet, VecDeque};
+use std::ptr::NonNull;
 
 /// The packed per-key header (OBJECT_LAYOUT.md "packed header and metadata bits").
 ///
@@ -2002,21 +2004,35 @@ impl KvObj {
 // THREE allocations per string key (the map's owned key `Box`, the `KvObj`'s own
 // duplicate key `Box`, and the value `Box`), carried in an 80-byte map slot.
 //
-// `Entry` collapses a STRING key to ONE allocation (`Entry::Str`): a single blob
-// that holds, contiguously, a small packed header, the optional TTL deadline, the
-// key length, the key bytes, and the value bytes (the value is INLINE in the same
-// blob, tighter than redis's two-allocation kvobj). The table itself stores ONLY
-// the `Entry` and derives the key from inside it (the `entry_key` helper), so there
-// is no separate map key allocation and no key duplication. The slot is one machine
-// word (the `Box<[u8]>` fat pointer is two words, but the enum is `repr`-sized to
-// the larger arm, see the slot-size note on [`Entry`]).
+// `Entry` collapses a STRING key to ONE allocation (the Str arm): a single thin blob
+// that holds, contiguously, a `u32` total-length prefix, then a small packed header,
+// the optional TTL deadline, the key length, the key bytes, and the value bytes (the
+// value is INLINE in the same blob, tighter than redis's two-allocation kvobj). The
+// table itself stores ONLY the `Entry` and derives the key from inside it (the
+// `Entry::key` helper), so there is no separate map key allocation and no key
+// duplication.
 //
-// A COLLECTION key (`Entry::Coll`) is a `Box<CollEntry>`: a small header + the key
-// + the existing boxed collection value. Collections already heap-allocate their
-// contents, so one extra small box is negligible and keeps the `Entry` enum small.
+// A COLLECTION key (the Coll arm) is a `Box<CollEntry>`: a small header + the key +
+// the existing boxed collection value. Collections already heap-allocate their
+// contents, so one extra small box is negligible.
 //
-// The blob is parsed with SAFE slicing only (`get(..)` / `try_into` /
-// `u64::from_le_bytes`); there is NO `unsafe` (the crate is `#![forbid(unsafe_code)]`).
+// ## The 8-byte tagged-pointer slot (perf/tagged-slot)
+//
+// `Entry` is an 8-byte TAGGED POINTER (`NonNull<u8>`), not a 16-byte enum. The Str arm
+// was a `Box<[u8]>` FAT pointer (ptr + length, 16 bytes); moving the length into the
+// allocation as the `u32` prefix leaves a one-word THIN pointer, and the Str/Coll arms
+// are distinguished by the pointer's low bit (0 = Str blob, 1 = `Box<CollEntry>`)
+// rather than an enum discriminant. This HALVES the `hashbrown::HashTable<Entry>` slot
+// (16 -> 8 bytes), roughly halving `table_bytes_per_key`. Distinguishing by the low
+// bit is sound because both allocations are >= 2-aligned (the Str blob is allocated
+// align 8; `CollEntry` has align >= 2), so the low bit is always free.
+//
+// This is the ONLY place `ironcache-store` uses `unsafe`: the manual Str allocation,
+// the tag set/clear, the access reconstructions, and the `Drop`/`dealloc`. Every
+// `unsafe` block in the `Entry` impl carries a `// SAFETY:` justification (alignment,
+// validity, provenance, no-aliasing, no-double-free). The blob CONTENT is still parsed
+// with SAFE slicing only (`get(..)` / `try_into` / `u64::from_le_bytes`) over the
+// `&[u8]` the safe `str_blob()` accessor hands back. See [`Entry`].
 // ===========================================================================
 
 /// The byte offset of the key-length field is computed from the header + optional
@@ -2175,43 +2191,284 @@ pub struct CollEntry {
     pub value: CollVal,
 }
 
-/// One key/value table entry as a SINGLE allocation behind a small slot (memory
-/// Round 3, OBJECT_LAYOUT.md #111). The per-shard `hashbrown::HashTable` stores
-/// `Entry` directly and derives the key from inside it.
+/// One key/value table entry as a SINGLE allocation behind an 8-byte TAGGED-POINTER
+/// slot (the `perf/tagged-slot` shrink of memory Round 3, OBJECT_LAYOUT.md #111). The
+/// per-shard `hashbrown::HashTable` stores `Entry` directly and derives the key from
+/// inside it.
+///
+/// ## Representation: an 8-byte tagged `NonNull<u8>` (was a 16-byte enum)
+///
+/// `Entry` is a SINGLE machine word: a `NonNull<u8>` whose LOW BIT is a tag.
+///
+/// - **Str** (low bit `0`): a MANUALLY allocated THIN blob. The old `Entry::Str` was a
+///   `Box<[u8]>` FAT pointer (ptr + length = 16 bytes), so the enum was 16 bytes. Here
+///   the length is moved INTO the allocation as a fixed `u32` prefix, leaving a THIN
+///   one-word pointer. The blob is allocated with alignment 8 (>= 2), so the pointer is
+///   always even and the low bit is free to tag. Layout:
+///   `[u32 total_len][the Round-3 blob: type|enc|flags|ttl?|key_len|key|value]`.
+///   `total_len` is the WHOLE allocation size (prefix included) so `Drop` can recover
+///   the exact `Layout` to `dealloc`. All the existing blob parsing is preserved,
+///   relocated behind this thin pointer at the fixed [`STR_BLOB_OFFSET`] (just past the
+///   length prefix).
+/// - **Coll** (low bit `1`): `Box::into_raw(Box<CollEntry>)`. A `CollEntry` has
+///   alignment >= 2 (it contains `u32`/pointer fields), so its box pointer is even and
+///   the low bit is free. We set the low bit to tag; on access we mask it off and
+///   reconstruct `&CollEntry` / `&mut CollEntry`; on `Drop` we mask and `Box::from_raw`.
 ///
 /// ## Slot size
 ///
-/// The enum is two arms, each one pointer wide (`Box<[u8]>` is a fat pointer, two
-/// words; `Box<CollEntry>` is one word), so `size_of::<Entry>()` is 16 bytes on a
-/// 64-bit target (the `Box<[u8]>` fat-pointer arm dominates; the discriminant folds
-/// into the niche/padding). The hashbrown `HashTable<Entry>` slot is therefore 16
-/// bytes plus the 1-byte control tag, versus the old `HashMap<Box<[u8]>, KvObj>`
-/// whose value alone (`KvObj`) was 64 bytes carried in an 80-byte slot, AND which
-/// owned a separate key `Box`. This is the Round 3 win: a small slot, one allocation
-/// per string key, and no key duplication.
-#[derive(Debug, Clone)]
-pub enum Entry {
-    /// A STRING-family value (int/embstr/raw): ONE blob holding the packed header,
-    /// the optional TTL, the key length, the key bytes, then the value bytes. For an
-    /// int-encoded value the value bytes are the CANONICAL DECIMAL bytes (so a read
-    /// borrows them directly and `OBJECT ENCODING` still reports `int` from the
-    /// header), realizing the int materialization with no per-read allocation.
-    Str(Box<[u8]>),
-    /// A COLLECTION value (list/hash/set/zset): the boxed [`CollEntry`].
-    Coll(Box<CollEntry>),
-}
+/// `size_of::<Entry>()` is 8 bytes on a 64-bit target (one `NonNull<u8>`, no length
+/// word, no discriminant — the tag lives in the pointer's low bit). The hashbrown
+/// `HashTable<Entry>` slot is therefore 8 bytes plus the 1-byte control tag, HALF the
+/// prior 16-byte enum, which roughly halves `table_bytes_per_key`. This keeps the
+/// Round-3 win (one allocation per string key, no key duplication, value inline) and
+/// adds the slot shrink.
+///
+/// ## `unsafe` discipline (this is the ONLY unsafe in the crate)
+///
+/// All `unsafe` in `ironcache-store` is confined to this `Entry` impl. Every `unsafe`
+/// block carries a `// SAFETY:` comment. `Entry` owns a raw pointer (a Str blob it must
+/// `dealloc`, or a `Box<CollEntry>` it must drop), with the same single-owner semantics
+/// the old `enum { Box<[u8]>, Box<CollEntry> }` had. Holding a raw pointer makes `Entry`
+/// auto-`!Send`/`!Sync`; that is CORRECT and intended (the per-shard store is owned by
+/// one core, single-threaded, ADR-0002/0005 — it is never sent across threads), and no
+/// `unsafe impl Send/Sync` is added.
+pub struct Entry(NonNull<u8>);
+
+/// The byte offset of the Round-3 blob inside a Str allocation: just past the `u32`
+/// total-length prefix. The blob's own header/ttl/key/value parsing offsets are then
+/// RELATIVE to a slice that starts here, so the existing `blob::*` constants and the
+/// `str_*` parsers are reused verbatim against `str_blob()`.
+const STR_BLOB_OFFSET: usize = 4;
+
+/// The alignment of a Str blob allocation. MUST be `>= 2` so the low pointer bit is
+/// always 0 and free for the tag; 8 also satisfies the `u32` length prefix's natural
+/// alignment so the prefix read/write is aligned.
+const STR_ALIGN: usize = 8;
+
+/// The tag bit carried in [`Entry`]'s pointer low bit: `0` = Str thin blob, `1` = Coll
+/// `Box<CollEntry>`.
+const TAG_COLL: usize = 1;
+
+// Compile-time guards for the tagged-pointer invariant: BOTH the Str blob and the
+// `Box<CollEntry>` must be at least 2-aligned so the low bit is always free for the
+// tag. These are `const` assertions (not `debug_assert!`, which is stripped in release
+// where production runs), so a future change that broke either alignment (e.g. making
+// `CollEntry` a 1-aligned type) fails the BUILD rather than silently corrupting the
+// tag scheme at runtime.
+const _: () = assert!(
+    STR_ALIGN >= 2,
+    "STR_ALIGN must be >= 2 so the Str blob pointer's low tag bit is always free"
+);
+const _: () = assert!(
+    std::mem::align_of::<CollEntry>() >= 2,
+    "CollEntry must be >= 2-aligned so the Coll pointer's low tag bit is always free"
+);
 
 impl Entry {
-    /// Assemble a [`Entry::Str`] blob from its parts (the single write site for the
-    /// blob layout). `value_bytes` are the bytes stored after the key: for int the
-    /// canonical decimal digits, for embstr/raw the string bytes.
-    fn build_str_blob(
+    /// Allocate a Str thin blob: a `u32` total-length prefix followed by the Round-3
+    /// blob bytes, with alignment [`STR_ALIGN`] (so the pointer is even and tag-free).
+    /// Returns an even (low-bit-0) `NonNull<u8>` to the start of the allocation.
+    ///
+    /// The blob bytes are produced by [`Self::build_str_blob_bytes`] (the SAFE layout
+    /// builder); this function only does the manual allocation + copy + length prefix.
+    fn alloc_str_blob(blob_bytes: &[u8]) -> NonNull<u8> {
+        let total = STR_BLOB_OFFSET + blob_bytes.len();
+        // The u32 length prefix MUST equal the real allocation size, because `Drop`
+        // recovers the dealloc `Layout` from it: if the prefix were SATURATED (clamped to
+        // u32::MAX) while the allocation is `total > u32::MAX` bytes, `dealloc` would run
+        // with a size-mismatched Layout = undefined behavior. So this is a HARD invariant,
+        // not a saturating cast. It is unreachable in practice: a single value is bounded
+        // by proto-max-bulk-len (512 MB) and the only unbounded-growth command (APPEND)
+        // rejects a result past that ceiling (see `cmd_append`), so `total` never
+        // approaches 4 GiB. The `expect` is the soundness backstop for the manual-alloc
+        // boundary: a panic on a >4 GiB blob is strictly better than heap corruption.
+        let total_u32 = u32::try_from(total).expect(
+            "Str blob total length must fit u32 (4 GiB); values are bounded by \
+             proto-max-bulk-len (512 MB) and APPEND rejects larger, so this is unreachable",
+        );
+        // A Layout with size == total (>= STR_BLOB_OFFSET == 4, never zero) and align 8.
+        // align 8 is a valid power-of-two; size is rounded-up implicitly by alloc.
+        let layout = Layout::from_size_align(total, STR_ALIGN)
+            .expect("Str blob layout: align 8 is valid and size is bounded");
+        // SAFETY: `layout` has a non-zero size (total >= STR_BLOB_OFFSET == 4 > 0) and a
+        // valid power-of-two alignment (8), the two requirements of `alloc`. The returned
+        // pointer is either null (handled below via `handle_alloc_error`) or points to
+        // `total` uninitialized, properly-aligned bytes that we exclusively own and fully
+        // initialize before any read.
+        let raw = unsafe { alloc(layout) };
+        let Some(ptr) = NonNull::new(raw) else {
+            // Allocation failure: never return a dangling/null pointer.
+            handle_alloc_error(layout);
+        };
+        // SAFETY: `ptr` points to `total` writable bytes we just allocated and uniquely
+        // own. The two writes stay within `[0, total)`: the 4-byte length prefix occupies
+        // `[0, 4)`, and the `blob_bytes` copy occupies `[4, 4 + blob_bytes.len()) ==
+        // [STR_BLOB_OFFSET, total)`. `write_unaligned` is used for the prefix because the
+        // `u32` is written through a `*mut u8` (byte pointer); align 8 actually makes it
+        // aligned, but `write_unaligned` is correct regardless and avoids any aliasing
+        // assumption. Source and destination of the copy do not overlap (a fresh alloc).
+        unsafe {
+            let len_bytes = total_u32.to_le_bytes();
+            ptr.as_ptr().cast::<[u8; 4]>().write_unaligned(len_bytes);
+            ptr.as_ptr()
+                .add(STR_BLOB_OFFSET)
+                .copy_from_nonoverlapping(blob_bytes.as_ptr(), blob_bytes.len());
+        }
+        // The alloc returned an 8-aligned pointer, so the low bit is 0 (the Str tag).
+        debug_assert_eq!(
+            ptr.as_ptr().addr() & TAG_COLL,
+            0,
+            "Str blob pointer must be even (align >= 2) so the tag bit is free"
+        );
+        ptr
+    }
+
+    /// Construct a Str [`Entry`] from already-built Round-3 blob bytes (the single place
+    /// a Str pointer is tagged). The pointer is even out of [`Self::alloc_str_blob`], so
+    /// the Str tag (low bit 0) needs no bit-set.
+    fn str_from_blob_bytes(blob_bytes: &[u8]) -> Self {
+        let ptr = Entry::alloc_str_blob(blob_bytes);
+        // Low bit already 0 == Str; store the provenance-carrying pointer verbatim.
+        Entry(ptr)
+    }
+
+    /// Construct a Coll [`Entry`] from a `Box<CollEntry>` (the single place a Coll
+    /// pointer is tagged): take the box's raw pointer (even, since `CollEntry`'s align is
+    /// at least 2) and SET the low bit via strict-provenance `map_addr` so the tagged
+    /// pointer keeps the box's provenance.
+    fn coll_from_box(b: Box<CollEntry>) -> Self {
+        let raw: *mut CollEntry = Box::into_raw(b);
+        debug_assert_eq!(
+            raw.addr() & TAG_COLL,
+            0,
+            "CollEntry box pointer must be even (align >= 2) so the tag bit is free"
+        );
+        // Set the tag bit while PRESERVING provenance (`map_addr` keeps the original
+        // allocation's provenance; a bare `as usize | 1` cast back to a pointer would
+        // strip it). Cast to `*mut u8` first so the addr is the byte address.
+        let tagged: *mut u8 = raw.cast::<u8>().map_addr(|a| a | TAG_COLL);
+        // SAFETY: `raw` came from `Box::into_raw` so it is non-null; OR-ing a bit into a
+        // non-null even address keeps it non-null (the high bits are unchanged), so the
+        // `NonNull` invariant holds.
+        Entry(unsafe { NonNull::new_unchecked(tagged) })
+    }
+
+    /// Whether this entry is the Coll arm (low tag bit set). A Str entry returns `false`.
+    #[inline]
+    fn is_coll(&self) -> bool {
+        (self.0.as_ptr().addr() & TAG_COLL) == TAG_COLL
+    }
+
+    /// The Str blob (the Round-3 bytes WITHOUT the length prefix) as a shared slice, or
+    /// `None` if this is a Coll entry. The returned slice borrows `self`.
+    ///
+    /// The slice is `[STR_BLOB_OFFSET, total_len)` of the allocation. This is the single
+    /// place the manual-alloc layout is read back into a safe `&[u8]`; every Str parser
+    /// (`str_flags`/`str_key_len`/`key`/`str_value_bytes`/...) goes through here.
+    fn str_blob(&self) -> Option<&[u8]> {
+        if self.is_coll() {
+            return None;
+        }
+        let ptr = self.0.as_ptr();
+        // SAFETY: this is a Str entry (low bit 0), so `self.0` points to the start of a
+        // Str allocation we own: a `u32` LE total-length prefix at offset 0 followed by
+        // the blob bytes. The prefix was written in `alloc_str_blob` and is always
+        // initialized. We read it (unaligned-safe through a byte pointer) to recover the
+        // allocation length, then form a slice over the blob region `[STR_BLOB_OFFSET,
+        // total)`, which lies entirely within the allocation (`total` is the full size).
+        // The borrow is tied to `&self`, so the allocation outlives the slice and is not
+        // mutated through another path while the slice lives.
+        let total = unsafe {
+            let len_bytes = ptr.cast::<[u8; 4]>().read_unaligned();
+            u32::from_le_bytes(len_bytes) as usize
+        };
+        let blob_len = total - STR_BLOB_OFFSET;
+        // SAFETY: `ptr.add(STR_BLOB_OFFSET)` is in-bounds (STR_BLOB_OFFSET == 4 <= total),
+        // `blob_len == total - STR_BLOB_OFFSET` bytes from there stay within the
+        // allocation, the bytes were initialized by `alloc_str_blob`'s copy, and the
+        // resulting `&[u8]` borrows `self` (so the allocation stays alive and un-aliased).
+        let slice = unsafe { std::slice::from_raw_parts(ptr.add(STR_BLOB_OFFSET), blob_len) };
+        Some(slice)
+    }
+
+    /// The Str blob as a MUTABLE slice (for the in-place TTL patch), or `None` for a Coll
+    /// entry. Borrows `self` mutably so no shared `str_blob()` borrow can co-exist.
+    fn str_blob_mut(&mut self) -> Option<&mut [u8]> {
+        if self.is_coll() {
+            return None;
+        }
+        let ptr = self.0.as_ptr();
+        // SAFETY: Str entry; same length-prefix recovery as `str_blob`. See its SAFETY.
+        let total = unsafe {
+            let len_bytes = ptr.cast::<[u8; 4]>().read_unaligned();
+            u32::from_le_bytes(len_bytes) as usize
+        };
+        let blob_len = total - STR_BLOB_OFFSET;
+        // SAFETY: same in-bounds + initialized reasoning as `str_blob`, but `&mut self`
+        // guarantees this is the UNIQUE borrow of the allocation for the slice's lifetime,
+        // so a `&mut [u8]` is sound (no aliasing). The slice covers `[STR_BLOB_OFFSET,
+        // total)` of the allocation we own.
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr.add(STR_BLOB_OFFSET), blob_len) };
+        Some(slice)
+    }
+
+    /// The untagged `*mut CollEntry` behind a Coll entry: clear the low tag bit
+    /// (provenance-preserving) to recover the exact pointer `Box::into_raw` returned. The
+    /// caller MUST have checked [`Self::is_coll`]; on a Str entry this would mis-cast.
+    ///
+    /// `cast_ptr_alignment` is allowed here with justification: the byte pointer's
+    /// ADDRESS is `Box<CollEntry>`'s original address (the box was correctly `CollEntry`-
+    /// aligned, align >= 2, and we only toggled bit 0 then cleared it), so the recovered
+    /// `*mut CollEntry` is properly aligned. The lint fires on the static `u8 -> CollEntry`
+    /// cast and cannot see the runtime alignment invariant.
+    #[allow(clippy::cast_ptr_alignment)]
+    fn coll_ptr(&self) -> *mut CollEntry {
+        // Clear the tag bit while PRESERVING provenance (`map_addr`), then re-type.
+        self.0
+            .as_ptr()
+            .map_addr(|a| a & !TAG_COLL)
+            .cast::<CollEntry>()
+    }
+
+    /// The `&CollEntry` behind a Coll entry, or `None` for a Str entry. Borrows `self`.
+    fn coll_ref(&self) -> Option<&CollEntry> {
+        if !self.is_coll() {
+            return None;
+        }
+        let ce = self.coll_ptr();
+        // SAFETY: this is a Coll entry, so `self.0` is a tagged `Box<CollEntry>` pointer
+        // produced by `coll_from_box`. `coll_ptr` masks off the low tag bit and recovers
+        // the exact, properly-aligned, non-null pointer `Box::into_raw` returned, which
+        // points to a live, initialized `CollEntry` we own. The reference borrows `&self`,
+        // so the box outlives it and is not mutably aliased for its lifetime.
+        Some(unsafe { &*ce })
+    }
+
+    /// The `&mut CollEntry` behind a Coll entry, or `None` for a Str entry. Borrows
+    /// `self` mutably (unique access).
+    fn coll_mut(&mut self) -> Option<&mut CollEntry> {
+        if !self.is_coll() {
+            return None;
+        }
+        let ce = self.coll_ptr();
+        // SAFETY: as in `coll_ref()`, `coll_ptr` masks the tag and recovers the live
+        // `Box<CollEntry>` pointer. `&mut self` makes this the unique borrow, so handing
+        // out `&mut CollEntry` is sound (no aliasing) for the borrow's lifetime.
+        Some(unsafe { &mut *ce })
+    }
+
+    /// Assemble the Round-3 Str blob BYTES (header, optional TTL, key-len, key, value).
+    /// SAFE: pure `Vec<u8>` construction, identical layout to the prior `build_str_blob`.
+    /// The thin-pointer allocation (length prefix + this) happens in
+    /// [`Self::alloc_str_blob`]; this is just the byte layout.
+    fn build_str_blob_bytes(
         data_type: DataType,
         encoding: Encoding,
         expire_at: Option<UnixMillis>,
         key: &[u8],
         value_bytes: &[u8],
-    ) -> Box<[u8]> {
+    ) -> Vec<u8> {
         let has_ttl = expire_at.is_some();
         let ttl_len = if has_ttl { blob::TTL_LEN } else { 0 };
         let total = blob::HEADER_LEN + ttl_len + blob::KEYLEN_LEN + key.len() + value_bytes.len();
@@ -2233,7 +2490,21 @@ impl Entry {
         buf.extend_from_slice(key);
         // Value bytes (the rest of the blob).
         buf.extend_from_slice(value_bytes);
-        buf.into_boxed_slice()
+        buf
+    }
+
+    /// Assemble a Str [`Entry`] from its parts (the single write site for the Str blob
+    /// layout). `value_bytes` are the bytes stored after the key: for int the canonical
+    /// decimal digits, for embstr/raw the string bytes.
+    fn build_str_blob(
+        data_type: DataType,
+        encoding: Encoding,
+        expire_at: Option<UnixMillis>,
+        key: &[u8],
+        value_bytes: &[u8],
+    ) -> Self {
+        let bytes = Entry::build_str_blob_bytes(data_type, encoding, expire_at, key, value_bytes);
+        Entry::str_from_blob_bytes(&bytes)
     }
 
     /// Build a STRING entry from a key and an already-[`classify`]d value.
@@ -2246,20 +2517,12 @@ impl Entry {
     ) -> Self {
         match classified {
             Classified::Int(n) => Entry::str_from_int(key, n, expire_at),
-            Classified::EmbStr => Entry::Str(Entry::build_str_blob(
-                DataType::String,
-                Encoding::EmbStr,
-                expire_at,
-                key,
-                bytes,
-            )),
-            Classified::Raw => Entry::Str(Entry::build_str_blob(
-                DataType::String,
-                Encoding::Raw,
-                expire_at,
-                key,
-                bytes,
-            )),
+            Classified::EmbStr => {
+                Entry::build_str_blob(DataType::String, Encoding::EmbStr, expire_at, key, bytes)
+            }
+            Classified::Raw => {
+                Entry::build_str_blob(DataType::String, Encoding::Raw, expire_at, key, bytes)
+            }
         }
     }
 
@@ -2275,19 +2538,13 @@ impl Entry {
     pub fn str_from_int(key: &[u8], n: i64, expire_at: Option<UnixMillis>) -> Self {
         let mut buf = [0u8; 20];
         let digits = format_i64(n, &mut buf);
-        Entry::Str(Entry::build_str_blob(
-            DataType::String,
-            Encoding::Int,
-            expire_at,
-            key,
-            digits,
-        ))
+        Entry::build_str_blob(DataType::String, Encoding::Int, expire_at, key, digits)
     }
 
     /// Build a COLLECTION entry from a key and a [`CollVal`].
     #[must_use]
     pub fn coll(key: &[u8], value: CollVal, expire_at: Option<UnixMillis>) -> Self {
-        Entry::Coll(Box::new(CollEntry {
+        Entry::coll_from_box(Box::new(CollEntry {
             eviction_rank: 0,
             snapshot_version: 0,
             expire_at,
@@ -2339,13 +2596,9 @@ impl Entry {
             ValueRepr::Int(n) => Entry::str_from_int(&key, n, expire_at),
             // The embstr-vs-raw distinction lives in the HEADER encoding, not the
             // variant, so honor `header.encoding` when laying down the blob.
-            ValueRepr::Inline(b) | ValueRepr::Raw(b) => Entry::Str(Entry::build_str_blob(
-                header.data_type,
-                header.encoding,
-                expire_at,
-                &key,
-                &b,
-            )),
+            ValueRepr::Inline(b) | ValueRepr::Raw(b) => {
+                Entry::build_str_blob(header.data_type, header.encoding, expire_at, &key, &b)
+            }
             ValueRepr::List(l) => Entry::coll(&key, CollVal::List(*l), expire_at),
             ValueRepr::Hash(h) => Entry::coll(&key, CollVal::Hash(*h), expire_at),
             ValueRepr::Set(s) => Entry::coll(&key, CollVal::Set(*s), expire_at),
@@ -2387,13 +2640,13 @@ impl Entry {
     /// eviction/SCAN hooks). For a `Coll` this is the stored `CollEntry.key`.
     #[must_use]
     pub fn key(&self) -> &[u8] {
-        match self {
-            Entry::Str(blob) => {
-                let off = Entry::str_key_offset(blob);
-                let klen = Entry::str_key_len(blob);
-                blob.get(off..off + klen).unwrap_or(&[])
-            }
-            Entry::Coll(c) => &c.key,
+        if let Some(blob) = self.str_blob() {
+            let off = Entry::str_key_offset(blob);
+            let klen = Entry::str_key_len(blob);
+            blob.get(off..off + klen).unwrap_or(&[])
+        } else {
+            // Coll: the key is stored inside the CollEntry.
+            self.coll_ref().map_or(&[], |c| &c.key)
         }
     }
 
@@ -2402,21 +2655,22 @@ impl Entry {
     /// byte-readable value, matching the old `view_of` for a collection).
     #[must_use]
     pub fn str_value_bytes(&self) -> &[u8] {
-        match self {
-            Entry::Str(blob) => {
-                let val_off = Entry::str_key_offset(blob) + Entry::str_key_len(blob);
-                blob.get(val_off..).unwrap_or(&[])
-            }
-            Entry::Coll(_) => &[],
+        if let Some(blob) = self.str_blob() {
+            let val_off = Entry::str_key_offset(blob) + Entry::str_key_len(blob);
+            blob.get(val_off..).unwrap_or(&[])
+        } else {
+            &[]
         }
     }
 
     /// The logical data type (for TYPE / WRONGTYPE / the SCAN type filter).
     #[must_use]
     pub fn data_type(&self) -> DataType {
-        match self {
-            Entry::Str(blob) => data_type_from_u8(blob.first().copied().unwrap_or(0)),
-            Entry::Coll(c) => c.value.data_type(),
+        if let Some(blob) = self.str_blob() {
+            data_type_from_u8(blob.first().copied().unwrap_or(0))
+        } else {
+            self.coll_ref()
+                .map_or(DataType::String, |c| c.value.data_type())
         }
     }
 
@@ -2424,26 +2678,27 @@ impl Entry {
     /// straight from the header byte; for a Coll it is the live pure-function repr.
     #[must_use]
     pub fn encoding(&self) -> Encoding {
-        match self {
-            Entry::Str(blob) => encoding_from_u8(blob.get(1).copied().unwrap_or(1)),
-            Entry::Coll(c) => c.value.encoding(),
+        if let Some(blob) = self.str_blob() {
+            encoding_from_u8(blob.get(1).copied().unwrap_or(1))
+        } else {
+            self.coll_ref()
+                .map_or(Encoding::EmbStr, |c| c.value.encoding())
         }
     }
 
     /// The absolute TTL deadline, if any.
     #[must_use]
     pub fn expire_at(&self) -> Option<UnixMillis> {
-        match self {
-            Entry::Str(blob) => {
-                if Entry::str_flags(blob) & blob::FLAG_HAS_TTL != 0 {
-                    blob.get(blob::HEADER_LEN..blob::HEADER_LEN + blob::TTL_LEN)
-                        .and_then(|s| s.try_into().ok())
-                        .map(|a: [u8; 8]| UnixMillis(u64::from_le_bytes(a)))
-                } else {
-                    None
-                }
+        if let Some(blob) = self.str_blob() {
+            if Entry::str_flags(blob) & blob::FLAG_HAS_TTL != 0 {
+                blob.get(blob::HEADER_LEN..blob::HEADER_LEN + blob::TTL_LEN)
+                    .and_then(|s| s.try_into().ok())
+                    .map(|a: [u8; 8]| UnixMillis(u64::from_le_bytes(a)))
+            } else {
+                None
             }
-            Entry::Coll(c) => c.expire_at,
+        } else {
+            self.coll_ref().and_then(|c| c.expire_at)
         }
     }
 
@@ -2453,33 +2708,37 @@ impl Entry {
     /// a deadline-only change to an already-TTL'd blob is patched in place. For a
     /// Coll entry it is a plain field write.
     pub fn set_expire_at(&mut self, expire_at: Option<UnixMillis>) {
-        match self {
-            Entry::Str(blob) => {
-                let had_ttl = Entry::str_flags(blob) & blob::FLAG_HAS_TTL != 0;
-                match (had_ttl, expire_at) {
-                    // Patch the existing TTL field in place (same blob length).
-                    (true, Some(UnixMillis(deadline))) => {
-                        let bytes = deadline.to_le_bytes();
-                        for (i, b) in bytes.iter().enumerate() {
-                            blob[blob::HEADER_LEN + i] = *b;
-                        }
-                    }
-                    // No change (no TTL before, none after).
-                    (false, None) => {}
-                    // Add or remove the TTL field: the blob length changes, so rebuild.
-                    _ => {
-                        let data_type = self.data_type();
-                        let encoding = self.encoding();
-                        // Re-extract key + value from the OLD blob before rebuilding.
-                        let key = self.key().to_vec();
-                        let value = self.str_value_bytes().to_vec();
-                        *self = Entry::Str(Entry::build_str_blob(
-                            data_type, encoding, expire_at, &key, &value,
-                        ));
+        if let Some(c) = self.coll_mut() {
+            c.expire_at = expire_at;
+            return;
+        }
+        // Str entry. Read the current TTL-present flag through the shared blob view.
+        let had_ttl = self
+            .str_blob()
+            .is_some_and(|b| Entry::str_flags(b) & blob::FLAG_HAS_TTL != 0);
+        match (had_ttl, expire_at) {
+            // Patch the existing TTL field in place (same blob length) via the mutable
+            // blob view (no realloc).
+            (true, Some(UnixMillis(deadline))) => {
+                if let Some(blob) = self.str_blob_mut() {
+                    let bytes = deadline.to_le_bytes();
+                    for (i, b) in bytes.iter().enumerate() {
+                        blob[blob::HEADER_LEN + i] = *b;
                     }
                 }
             }
-            Entry::Coll(c) => c.expire_at = expire_at,
+            // No change (no TTL before, none after).
+            (false, None) => {}
+            // Add or remove the TTL field: the blob length changes, so rebuild (the old
+            // allocation is freed when the old `self` is dropped by the assignment).
+            _ => {
+                let data_type = self.data_type();
+                let encoding = self.encoding();
+                // Re-extract key + value from the OLD blob before rebuilding.
+                let key = self.key().to_vec();
+                let value = self.str_value_bytes().to_vec();
+                *self = Entry::build_str_blob(data_type, encoding, expire_at, &key, &value);
+            }
         }
     }
 
@@ -2496,9 +2755,10 @@ impl Entry {
     /// The logical byte length of the value (STRLEN basis).
     #[must_use]
     pub fn logical_len(&self) -> usize {
-        match self {
-            Entry::Str(_) => self.str_value_bytes().len(),
-            Entry::Coll(c) => c.value.element_bytes(),
+        if let Some(c) = self.coll_ref() {
+            c.value.element_bytes()
+        } else {
+            self.str_value_bytes().len()
         }
     }
 
@@ -2513,16 +2773,13 @@ impl Entry {
     /// Whether this entry is a COLLECTION (list/hash/set/zset).
     #[must_use]
     pub fn is_collection(&self) -> bool {
-        matches!(self, Entry::Coll(_))
+        self.is_coll()
     }
 
     /// The element count IF this is a collection, else `None`.
     #[must_use]
     pub fn collection_len(&self) -> Option<usize> {
-        match self {
-            Entry::Coll(c) => Some(c.value.len()),
-            Entry::Str(_) => None,
-        }
+        self.coll_ref().map(|c| c.value.len())
     }
 
     /// Whether this is a COLLECTION holding zero elements (the empty-collection
@@ -2537,57 +2794,53 @@ impl Entry {
     /// for a Str entry (its encoding is fixed at write time and patched by
     /// `set_value_bytes`). Mirrors the old `KvObj::recompute_encoding`.
     pub fn recompute_encoding(&mut self) {
-        if let Entry::Coll(_c) = self {
-            // The Coll encoding is a PURE FUNCTION of the live value (read via
-            // `c.value.encoding()`), so there is nothing cached to update: `encoding()`
-            // already reflects the post-edit repr. Kept as an explicit no-op so the
-            // store's call site reads the same as the old KvObj path.
-        }
+        // The Coll encoding is a PURE FUNCTION of the live value (read via
+        // `c.value.encoding()`), so there is nothing cached to update: `encoding()`
+        // already reflects the post-edit repr; a Str entry's encoding is fixed at write
+        // time. An explicit no-op, kept so the store's call site reads the same as the
+        // old KvObj path.
     }
 
-    /// A mutable borrow of the stored collection value as a `&mut dyn ListValue`, or
-    /// `None` if this entry is not a list.
+    /// A mutable borrow of the stored collection value as a `&mut ListVal`, or `None`
+    /// if this entry is not a list.
     pub fn as_list_mut(&mut self) -> Option<&mut ListVal> {
-        match self {
-            Entry::Coll(c) => match &mut c.value {
-                CollVal::List(l) => Some(l),
-                _ => None,
-            },
-            Entry::Str(_) => None,
+        match self.coll_mut()?.value {
+            CollVal::List(ref mut l) => Some(l),
+            _ => None,
         }
     }
 
     /// A mutable borrow of the stored HASH value, or `None`.
     pub fn as_hash_mut(&mut self) -> Option<&mut HashVal> {
-        match self {
-            Entry::Coll(c) => match &mut c.value {
-                CollVal::Hash(h) => Some(h),
-                _ => None,
-            },
-            Entry::Str(_) => None,
+        match self.coll_mut()?.value {
+            CollVal::Hash(ref mut h) => Some(h),
+            _ => None,
         }
     }
 
     /// A mutable borrow of the stored SET value, or `None`.
     pub fn as_set_mut(&mut self) -> Option<&mut SetVal> {
-        match self {
-            Entry::Coll(c) => match &mut c.value {
-                CollVal::Set(s) => Some(s),
-                _ => None,
-            },
-            Entry::Str(_) => None,
+        match self.coll_mut()?.value {
+            CollVal::Set(ref mut s) => Some(s),
+            _ => None,
         }
     }
 
     /// A mutable borrow of the stored ZSET value, or `None`.
     pub fn as_zset_mut(&mut self) -> Option<&mut ZSetVal> {
-        match self {
-            Entry::Coll(c) => match &mut c.value {
-                CollVal::ZSet(z) => Some(z),
-                _ => None,
-            },
-            Entry::Str(_) => None,
+        match self.coll_mut()?.value {
+            CollVal::ZSet(ref mut z) => Some(z),
+            _ => None,
         }
+    }
+
+    /// A mutable borrow of the whole stored [`CollVal`] (the collection value union),
+    /// or `None` for a Str entry. The store's `rmw_mut` type-dispatch matches on this in
+    /// ONE place to build the typed mutable view, replacing the prior `match obj {
+    /// Entry::Coll(c) => &mut c.value, .. }` now that `Entry` is an opaque tagged pointer
+    /// (the variant is no longer a public field). Borrows `self` mutably (unique access).
+    pub fn as_coll_val_mut(&mut self) -> Option<&mut CollVal> {
+        self.coll_mut().map(|c| &mut c.value)
     }
 
     /// Re-key this entry to `new_key` (the RENAME/MOVE/COPY relocation; the value
@@ -2595,17 +2848,102 @@ impl Entry {
     /// the key is INSIDE the blob, so the blob is rebuilt with the new key; for a Coll
     /// entry it is a field write.
     pub fn rekey(&mut self, new_key: &[u8]) {
-        match self {
-            Entry::Str(_) => {
-                let data_type = self.data_type();
-                let encoding = self.encoding();
-                let expire_at = self.expire_at();
-                let value = self.str_value_bytes().to_vec();
-                *self = Entry::Str(Entry::build_str_blob(
-                    data_type, encoding, expire_at, new_key, &value,
-                ));
+        if let Some(c) = self.coll_mut() {
+            c.key = new_key.to_vec().into_boxed_slice();
+            return;
+        }
+        let data_type = self.data_type();
+        let encoding = self.encoding();
+        let expire_at = self.expire_at();
+        let value = self.str_value_bytes().to_vec();
+        *self = Entry::build_str_blob(data_type, encoding, expire_at, new_key, &value);
+    }
+}
+
+impl Drop for Entry {
+    /// Free the owned allocation: a Coll reconstructs and drops the `Box<CollEntry>`; a
+    /// Str recovers the `Layout` from the total-length prefix and `dealloc`s. Exactly one
+    /// of the two paths runs per `Entry`, so there is NO double-free and NO leak.
+    fn drop(&mut self) {
+        if self.is_coll() {
+            // Coll: mask the tag and reconstruct the original `Box<CollEntry>` so its
+            // own Drop frees the box (and recursively the collection contents).
+            let ce = self.coll_ptr();
+            // SAFETY: this Entry owns a Coll pointer produced by `coll_from_box`
+            // (`Box::into_raw` + low-bit tag). `coll_ptr` masks the tag and recovers the
+            // EXACT pointer `into_raw` returned, so `Box::from_raw` reconstitutes the
+            // original box with matching allocator/layout. `drop` runs at most once per
+            // value (Drop contract), so the box is freed exactly once: no double-free, no
+            // leak.
+            unsafe {
+                drop(Box::from_raw(ce));
             }
-            Entry::Coll(c) => c.key = new_key.to_vec().into_boxed_slice(),
+        } else {
+            // Str: read the total-length prefix to rebuild the exact allocation Layout,
+            // then dealloc the whole block.
+            let ptr = self.0.as_ptr();
+            // SAFETY: Str entry (low bit 0); `self.0` points at the start of a Str
+            // allocation whose first 4 bytes are the LE `u32` total length written by
+            // `alloc_str_blob`. Reading them (unaligned-safe) recovers the original
+            // allocation size.
+            let total = unsafe {
+                let len_bytes = ptr.cast::<[u8; 4]>().read_unaligned();
+                u32::from_le_bytes(len_bytes) as usize
+            };
+            // The Layout MUST match the one `alloc_str_blob` used: size == total, align
+            // == STR_ALIGN. `expect` cannot fire (the same args succeeded at alloc time).
+            let layout = Layout::from_size_align(total, STR_ALIGN)
+                .expect("Str blob layout matches the allocation-time layout");
+            // SAFETY: `ptr` was returned by `alloc(layout)` in `alloc_str_blob` with this
+            // exact `layout` (same size recovered from the prefix, same STR_ALIGN), and is
+            // still live and owned by this Entry. `dealloc` runs once per value (Drop
+            // contract), so the block is freed exactly once.
+            unsafe {
+                dealloc(ptr, layout);
+            }
+        }
+    }
+}
+
+impl Clone for Entry {
+    /// A DEEP clone: a Coll clones its `CollEntry` (re-boxed + re-tagged); a Str copies
+    /// its blob bytes into a fresh thin allocation. Each clone owns a DISTINCT allocation,
+    /// so the two `Entry`s drop independently (no shared ownership, no double-free). The
+    /// only `.clone()` caller is the MOVE/COPY path (`find(..).cloned()`), which needs an
+    /// owned copy; the hot read/write paths never clone an `Entry`.
+    fn clone(&self) -> Self {
+        if let Some(c) = self.coll_ref() {
+            // Deep-clone the CollEntry (its derived Clone clones the key + collection
+            // value), re-box, and re-tag.
+            Entry::coll_from_box(Box::new(c.clone()))
+        } else {
+            // Copy the blob bytes into a fresh thin allocation (the length prefix is
+            // re-derived from the byte length, so the clone is layout-identical).
+            let blob = self.str_blob().unwrap_or(&[]);
+            Entry::str_from_blob_bytes(blob)
+        }
+    }
+}
+
+impl std::fmt::Debug for Entry {
+    /// A structural debug view that reads through the tagged pointer (the raw pointer
+    /// itself is not informative). Mirrors what the old `#[derive(Debug)]` enum showed:
+    /// the arm plus the key/type/encoding/ttl, so `ShardStore`'s derived `Debug` (which
+    /// formats the `HashTable<Entry>`) stays readable.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(c) = self.coll_ref() {
+            f.debug_struct("Entry::Coll")
+                .field("key", &c.key)
+                .field("value", &c.value)
+                .field("expire_at", &c.expire_at)
+                .finish()
+        } else {
+            f.debug_struct("Entry::Str")
+                .field("key", &self.key())
+                .field("data_type", &self.data_type())
+                .field("encoding", &self.encoding())
+                .field("expire_at", &self.expire_at())
+                .finish()
         }
     }
 }
@@ -3405,5 +3743,175 @@ mod tests {
         } else {
             panic!("expected a zset value");
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // Entry tagged-pointer (perf/tagged-slot) unit tests. These exercise the
+    // manual alloc / dealloc / Drop / Clone / tagged-access UNSAFE paths in
+    // isolation, so `cargo +nightly miri test -p ironcache-store` flags any UB
+    // (provenance, aliasing, double-free, leak) on the Entry representation.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn entry_slot_is_one_word() {
+        // The whole point of the change: the slot is 8 bytes (was 16), and `NonNull`'s
+        // niche keeps `Option<Entry>` at 8 too.
+        assert_eq!(std::mem::size_of::<Entry>(), 8);
+        assert_eq!(std::mem::size_of::<Option<Entry>>(), 8);
+    }
+
+    #[test]
+    fn entry_str_roundtrips_key_value_type_encoding_and_drops() {
+        // Build/read each string encoding; the Entry drops at end of scope, exercising
+        // the Str dealloc path under miri.
+        let raw = vec![b'z'; 100];
+        let cases: &[(&[u8], &[u8], Encoding)] = &[
+            (b"k1", b"12345", Encoding::Int), // int: value bytes are the decimal digits
+            (b"k2", b"hello", Encoding::EmbStr), // short string
+            (b"k3", &raw, Encoding::Raw),     // long string
+        ];
+        for (key, val, enc) in cases {
+            let e = Entry::str_from_bytes(key, val, None);
+            assert_eq!(e.key(), *key, "key parsed back from the blob");
+            assert_eq!(e.str_value_bytes(), *val, "value parsed back from the blob");
+            assert_eq!(e.data_type(), DataType::String);
+            assert_eq!(e.encoding(), *enc);
+            assert_eq!(e.expire_at(), None);
+            assert_eq!(e.accounted_bytes(), key.len() + val.len());
+            assert!(!e.is_collection());
+            assert_eq!(e.collection_len(), None);
+        }
+    }
+
+    #[test]
+    fn entry_str_ttl_present_and_patch_and_add_remove() {
+        // With a TTL: the deadline parses back, the blob carries the 8-byte field.
+        let e = Entry::str_from_bytes(b"key", b"val", Some(UnixMillis(1234)));
+        assert_eq!(e.expire_at(), Some(UnixMillis(1234)));
+        assert_eq!(e.key(), b"key");
+        assert_eq!(e.str_value_bytes(), b"val");
+
+        // In-place patch (same blob length): a deadline-only change must NOT realloc and
+        // must round-trip.
+        let mut e = e;
+        e.set_expire_at(Some(UnixMillis(9999)));
+        assert_eq!(e.expire_at(), Some(UnixMillis(9999)));
+        assert_eq!(e.key(), b"key", "patch leaves key intact");
+        assert_eq!(e.str_value_bytes(), b"val", "patch leaves value intact");
+
+        // Remove the TTL: the blob shrinks (rebuild), the old alloc is freed.
+        e.set_expire_at(None);
+        assert_eq!(e.expire_at(), None);
+        assert_eq!(e.key(), b"key");
+        assert_eq!(e.str_value_bytes(), b"val");
+
+        // Add a TTL back: the blob grows (rebuild).
+        e.set_expire_at(Some(UnixMillis(42)));
+        assert_eq!(e.expire_at(), Some(UnixMillis(42)));
+        assert_eq!(e.str_value_bytes(), b"val");
+    }
+
+    #[test]
+    fn entry_clone_is_a_deep_independent_copy_str() {
+        // Cloning a Str entry copies the blob into a fresh allocation; both drop
+        // independently (no double-free, no shared ownership), which miri verifies.
+        let original = Entry::str_from_bytes(b"shared", b"payload", Some(UnixMillis(7)));
+        let cloned = original.clone();
+        assert_eq!(cloned.key(), b"shared");
+        assert_eq!(cloned.str_value_bytes(), b"payload");
+        assert_eq!(cloned.expire_at(), Some(UnixMillis(7)));
+        // Mutating the clone's TTL must not touch the original (distinct allocations).
+        let mut cloned = cloned;
+        cloned.set_expire_at(Some(UnixMillis(8)));
+        assert_eq!(cloned.expire_at(), Some(UnixMillis(8)));
+        assert_eq!(original.expire_at(), Some(UnixMillis(7)));
+        drop(cloned);
+        // The original is still valid after the clone dropped.
+        assert_eq!(original.str_value_bytes(), b"payload");
+    }
+
+    #[test]
+    fn entry_coll_tagged_pointer_access_mutate_clone_and_drop() {
+        // A Coll entry: the low tag bit marks it; access masks it off. Build a list,
+        // read it, mutate in place through `as_list_mut`, clone, and drop.
+        let mut list = ListVal::new();
+        list.push_back(b"a");
+        list.push_back(b"b");
+        let mut e = Entry::coll(b"mykey", CollVal::List(list), Some(UnixMillis(5)));
+        assert!(e.is_collection());
+        assert_eq!(e.key(), b"mykey");
+        assert_eq!(e.data_type(), DataType::List);
+        assert_eq!(e.encoding(), Encoding::ListPack);
+        assert_eq!(e.expire_at(), Some(UnixMillis(5)));
+        assert_eq!(e.collection_len(), Some(2));
+        assert!(!e.is_empty_collection());
+
+        // Mutate through the tagged pointer (`coll_mut` masks the tag).
+        {
+            let l = e.as_list_mut().expect("list arm");
+            l.push_back(b"c");
+        }
+        assert_eq!(e.collection_len(), Some(3));
+
+        // A non-matching `as_*_mut` returns None (WRONGTYPE), not the wrong arm.
+        assert!(e.as_hash_mut().is_none());
+        assert!(e.as_set_mut().is_none());
+        assert!(e.as_zset_mut().is_none());
+
+        // Deep clone: an independent CollEntry box (re-boxed + re-tagged).
+        let cloned = e.clone();
+        assert_eq!(cloned.collection_len(), Some(3));
+        assert_eq!(cloned.key(), b"mykey");
+
+        // Re-key the original (a Coll field write); the clone is unaffected.
+        let mut e = e;
+        e.rekey(b"renamed");
+        assert_eq!(e.key(), b"renamed");
+        assert_eq!(cloned.key(), b"mykey", "clone unaffected by original rekey");
+        // Both drop here: two distinct boxes freed exactly once each.
+    }
+
+    #[test]
+    fn entry_coll_set_expire_at_is_a_field_write() {
+        let mut set = SetVal::new();
+        set.add(b"1");
+        let mut e = Entry::coll(b"s", CollVal::Set(set), None);
+        assert_eq!(e.expire_at(), None);
+        e.set_expire_at(Some(UnixMillis(100)));
+        assert_eq!(e.expire_at(), Some(UnixMillis(100)));
+        e.set_expire_at(None);
+        assert_eq!(e.expire_at(), None);
+        assert_eq!(e.data_type(), DataType::Set);
+    }
+
+    #[test]
+    fn entry_str_rekey_rebuilds_blob_with_new_key() {
+        let mut e = Entry::str_from_bytes(b"old", b"value", Some(UnixMillis(3)));
+        e.rekey(b"new-and-longer-key");
+        assert_eq!(e.key(), b"new-and-longer-key");
+        assert_eq!(
+            e.str_value_bytes(),
+            b"value",
+            "value preserved across rekey"
+        );
+        assert_eq!(
+            e.expire_at(),
+            Some(UnixMillis(3)),
+            "ttl preserved across rekey"
+        );
+        assert_eq!(e.data_type(), DataType::String);
+    }
+
+    #[test]
+    fn entry_empty_key_and_empty_value_are_well_formed() {
+        // Boundary: an empty key and/or empty value still produce a valid thin blob
+        // (the total length is >= STR_BLOB_OFFSET, never a zero-size alloc).
+        let e = Entry::str_from_bytes(b"", b"", None);
+        assert_eq!(e.key(), b"");
+        assert_eq!(e.str_value_bytes(), b"");
+        assert_eq!(e.accounted_bytes(), 0);
+        let e2 = Entry::str_from_bytes(b"k", b"", None);
+        assert_eq!(e2.key(), b"k");
+        assert_eq!(e2.str_value_bytes(), b"");
     }
 }
