@@ -25,6 +25,7 @@ members = [
     "crates/ironcache-store",
     "crates/ironcache-server",
     "crates/ironcache",
+    "crates/ironcache-bench",
 ]
 
 [workspace.package]
