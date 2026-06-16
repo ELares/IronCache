@@ -101,12 +101,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `target` is the internal cargo/cross-build triple; `asset` is the
+        # published, human-friendly name. The `unknown` vendor field in a Rust
+        # Linux triple confuses non-Rust operators, so the released asset drops
+        # the triple for an obvious CPU-arch + libc name (amd64/arm64, musl/glibc).
         include:
           - target: x86_64-unknown-linux-musl
+            asset: ironcache-linux-amd64-musl
           - target: aarch64-unknown-linux-musl
+            asset: ironcache-linux-arm64-musl
           # glibc-version-pinned gnu fallback (pin the minimum glibc per target).
           - target: x86_64-unknown-linux-gnu.2.17
+            asset: ironcache-linux-amd64-glibc
           - target: aarch64-unknown-linux-gnu.2.17
+            asset: ironcache-linux-arm64-glibc
     env:
       # Reproducibility contract (same as release.yml): pinned Cargo.lock is the
       # input base; CARGO_INCREMENTAL=0 and a fixed SOURCE_DATE_EPOCH keep the
@@ -146,31 +154,32 @@ jobs:
           cargo auditable zigbuild --release --locked --target "${{ matrix.target }}"
       - name: Package the tarball
         shell: bash
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          arch="${{ matrix.target }}"
+          target="${{ matrix.target }}"
           # cargo-zigbuild writes to the BARE rustc target dir; the `.2.17` glibc
           # pin is a zigbuild linker hint, not part of the target/ path (so a
           # `gnu.2.17` build lands in target/<triple-without-suffix>/release).
-          # Strip the suffix for the directory (the same ${arch%%.*} transform the
-          # install step uses), but keep the full name in the published asset so
-          # the glibc floor is visible. musl has no suffix, so it is unchanged.
-          tdir="target/${arch%%.*}/release"
-          out="ironcache-${VERSION}-${arch}.tar.gz"
+          # Strip the suffix for the directory (the same ${target%%.*} transform
+          # the install step uses); musl has no suffix, so it is unchanged.
+          tdir="target/${target%%.*}/release"
+          # The published asset uses the friendly amd64/arm64 + libc name (no
+          # `unknown` triple, no version) so releases/latest/download/<asset> is a
+          # stable URL across builds; the version lives in the release tag and in
+          # `ironcache --version`.
+          out="${{ matrix.asset }}.tar.gz"
           # Deterministic tar (sorted, no owner/uid/gid, fixed mtime) so a re-run
           # of the same inputs yields a byte-identical archive.
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" -C "$tdir" -czf "$out" ironcache
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        # A UNIQUE artifact name per target (no shared SHA256SUMS file), so the
+        # A UNIQUE artifact name per asset (no shared SHA256SUMS file), so the
         # publish job's merge-multiple download cannot have two same-named files
         # overwrite each other. The consolidated SHA256SUMS is built once, in
         # publish, over the four downloaded tarballs.
         with:
-          name: ironcache-${{ matrix.target }}
-          path: ironcache-*.tar.gz
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz
           if-no-files-found: error
 
   publish:
@@ -231,10 +240,10 @@ jobs:
 
           | Platform | Asset |
           | --- | --- |
-          | x86_64, static (no libc needed) | \`ironcache-${VERSION}-x86_64-unknown-linux-musl.tar.gz\` |
-          | aarch64, static (no libc needed) | \`ironcache-${VERSION}-aarch64-unknown-linux-musl.tar.gz\` |
-          | x86_64, glibc >= 2.17 | \`ironcache-${VERSION}-x86_64-unknown-linux-gnu.2.17.tar.gz\` |
-          | aarch64, glibc >= 2.17 | \`ironcache-${VERSION}-aarch64-unknown-linux-gnu.2.17.tar.gz\` |
+          | x86_64, static (no libc needed) | \`ironcache-linux-amd64-musl.tar.gz\` |
+          | aarch64, static (no libc needed) | \`ironcache-linux-arm64-musl.tar.gz\` |
+          | x86_64, glibc >= 2.17 | \`ironcache-linux-amd64-glibc.tar.gz\` |
+          | aarch64, glibc >= 2.17 | \`ironcache-linux-arm64-glibc.tar.gz\` |
 
           Verify integrity with \`sha256sum -c SHA256SUMS\`, and provenance with
           \`gh attestation verify <asset> --repo ${REPO}\`. The formal, tagged

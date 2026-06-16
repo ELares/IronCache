@@ -74,12 +74,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `target` is the internal cargo/cross-build triple; `asset` is the
+        # published, human-friendly name (amd64/arm64 + libc), dropping the
+        # `unknown` vendor of the Rust triple. Same mapping as rolling-release.yml.
         include:
           - target: x86_64-unknown-linux-musl
+            asset: ironcache-linux-amd64-musl
           - target: aarch64-unknown-linux-musl
+            asset: ironcache-linux-arm64-musl
           # glibc-version-pinned gnu fallback (pin the minimum glibc per target).
           - target: x86_64-unknown-linux-gnu.2.17
+            asset: ironcache-linux-amd64-glibc
           - target: aarch64-unknown-linux-gnu.2.17
+            asset: ironcache-linux-arm64-glibc
     env:
       # Reproducibility contract: pinned Cargo.lock is the input base; a re-run
       # of the same tag must yield byte-identical artifact digests.
@@ -120,26 +127,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
-          arch="${{ matrix.target }}"
+          target="${{ matrix.target }}"
           # cargo-zigbuild writes to the BARE rustc target dir; the `.2.17` glibc
           # pin is a zigbuild linker hint, not part of the target/ path (so a
           # `gnu.2.17` build lands in target/<triple-without-suffix>/release).
-          # Strip the suffix for the directory (the same ${arch%%.*} transform the
-          # install step uses), but keep the full name in the published asset so
-          # the glibc floor is visible. musl has no suffix, so it is unchanged.
-          tdir="target/${arch%%.*}/release"
-          out="ironcache-${ver}-${arch}.tar.gz"
+          # Strip the suffix for the directory (the same ${target%%.*} transform
+          # the install step uses); musl has no suffix, so it is unchanged.
+          tdir="target/${target%%.*}/release"
+          # Friendly asset name (amd64/arm64 + libc, no `unknown` triple, no
+          # version) so it matches the rolling channel and gives stable URLs.
+          out="${{ matrix.asset }}.tar.gz"
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" -C "$tdir" -czf "$out" ironcache
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        # A UNIQUE artifact name per target (no shared SHA256SUMS file), so the
+        # A UNIQUE artifact name per asset (no shared SHA256SUMS file), so the
         # publish job's merge-multiple download cannot have two same-named files
         # overwrite each other. The consolidated SHA256SUMS is built once, in
         # publish, over the four downloaded tarballs.
         with:
-          name: ironcache-${{ matrix.target }}
-          path: ironcache-*.tar.gz
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz
           if-no-files-found: error
 
   publish:
@@ -181,12 +188,7 @@ jobs:
           # target-independent for this pure-Rust workspace. Extract the
           # x86_64-musl binary and convert it.
           mkdir -p extracted
-          musl_tar=""
-          for f in artifacts/ironcache-*-x86_64-unknown-linux-musl.tar.gz; do
-            musl_tar="$f"; break
-          done
-          test -n "$musl_tar"
-          tar -xzf "$musl_tar" -C extracted
+          tar -xzf artifacts/ironcache-linux-amd64-musl.tar.gz -C extracted
           auditable2cdx extracted/ironcache > artifacts/ironcache.cyclonedx.json
           # Fail here, not at attach time, if the SBOM is empty or malformed.
           test -s artifacts/ironcache.cyclonedx.json
