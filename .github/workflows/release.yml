@@ -120,9 +120,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tdir="target/${{ matrix.target }}/release"
           ver="${GITHUB_REF_NAME#v}"
           arch="${{ matrix.target }}"
+          # cargo-zigbuild writes to the BARE rustc target dir; the `.2.17` glibc
+          # pin is a zigbuild linker hint, not part of the target/ path (so a
+          # `gnu.2.17` build lands in target/<triple-without-suffix>/release).
+          # Strip the suffix for the directory (the same ${arch%%.*} transform the
+          # install step uses), but keep the full name in the published asset so
+          # the glibc floor is visible. musl has no suffix, so it is unchanged.
+          tdir="target/${arch%%.*}/release"
           out="ironcache-${ver}-${arch}.tar.gz"
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" -C "$tdir" -czf "$out" ironcache
