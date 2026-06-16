@@ -2,11 +2,17 @@
 
 **The most efficient Redis-compatible cache, in one static Rust binary.**
 
-> Status: research and specification phase. No engine code yet, by design. The
-> architecture is being vetted in the GitHub issues before a line of the cache
-> is written. Start at the [vision EPIC (#1)](https://github.com/ELares/IronCache/issues/1),
-> read the [prior-art survey](docs/PRIOR_ART.md), and browse the
-> [research corpus](docs/research/).
+> Status: the engine is FUNCTIONAL and under active, measured optimization. IronCache
+> speaks RESP2 and RESP3 with 150+ commands across all core types (strings, lists,
+> hashes, sets, sorted sets, bitmaps, HyperLogLog), plus transactions, pub/sub, and a
+> cross-shard coordinator, backed by 800+ tests. A reproducible head-to-head (see
+> [Benchmarks](#benchmarks-how-it-compares)) shows it PARITY-OR-BETTER on memory and
+> FASTER per core than Redis 8.8.0, Valkey 8.1.8, KeyDB, DragonflyDB 1.39.0, and
+> Memcached on a pinned-core Linux runner. Persistence and clustering remain on the
+> [roadmap](docs/ROADMAP.md). The design record lives in the
+> [GitHub issues](https://github.com/ELares/IronCache/issues) (start at the
+> [vision EPIC (#1)](https://github.com/ELares/IronCache/issues/1)), the
+> [prior-art survey](docs/PRIOR_ART.md), and the [research corpus](docs/research/).
 
 IronCache is a cache that speaks the Redis wire protocol, keeps the Redis
 contract for the commands it supports, and is built from the first commit to be
@@ -69,6 +75,60 @@ from one node to many. IronCache exists to be exactly that intersection.
 
 ---
 
+## Benchmarks: how it compares
+
+IronCache is built to be measured, not asserted. The numbers below are a reproducible
+head-to-head ([`scripts/bench/headtohead.sh`](scripts/bench/headtohead.sh), run via the
+`headtohead` GitHub Actions workflow) against every cache this project benchmarks
+against, on identical hardware.
+
+**Setup.** GitHub-hosted `ubuntu-latest` (a shared 4-vCPU VM). The server and the load
+generator are pinned to DISJOINT cores with `taskset` (server on cores 0-1, client on
+cores 2-3) so they never contend for a core. Workload: a YCSB-style Zipfian (theta 0.99)
+mix, 90% GET / 10% SET, 1,000,000 distinct keys, 128-byte values. IronCache runs 2
+shards (one per pinned core). Each competitor is installed at the leanest version that
+installs on the runner (the latest memory-optimized line where it matters).
+
+- **Memory** is the `INFO used_memory` delta over a deterministic 1M-key populate,
+  divided by the key count (bytes per key). It is deterministic and reliable on any box,
+  and is the metric we ratchet hardest.
+- **Throughput** is closed-loop peak QPS divided by the 2 pinned server cores (QPS per
+  core).
+- **Latency** is an open-loop, coordinated-omission-free p50/p99 at a 50k ops/s target.
+
+| Competitor (measured version) | Memory IC / comp B/key | Throughput IC / comp QPS/core | p50 us (IC / comp) | p99 us (IC / comp) |
+| --- | --- | --- | --- | --- |
+| **Redis 8.8.0** (kvobj) | **180.3 / 206.2 = 0.87x** (IC 13% lighter) | **72,903 / 47,809 = 1.52x** | 8,175 / 7,907 | 63,679 / 52,735 |
+| **Valkey 8.1.8** (embedded key) | **180.3 / 209.6 = 0.86x** (IC 14% lighter) | **74,115 / 45,939 = 1.61x** | 8,199 / 8,131 | **53,471 / 150,911** |
+| **DragonflyDB 1.39.0** | 180.3 / 178.6 = 1.01x (parity) | **72,564 / 71,549 = 1.01x** | **8,119 / 10,607** | **94,015 / 108,415** |
+| **KeyDB 6.3.4** | **180.3 / 240.4 = 0.75x** (IC 25% lighter) | **72,514 / 59,474 = 1.22x** | 9,231 / 5,951 | 77,439 / 25,295 |
+| **Memcached 1.6.24** | **180.3 / 194.9 = 0.93x** (IC 7% lighter) | n/a (non-RESP) | n/a | n/a |
+
+A memory ratio below 1.0 means IronCache stores the same data in fewer bytes per key; a
+throughput ratio above 1.0 means it does more work per core. **IronCache is
+parity-or-better on memory against all five, and faster per core than every
+Redis-protocol competitor.** It is roughly tied with DragonflyDB (the vertical-efficiency
+state of the art) on both axes, and beats Redis, Valkey, and KeyDB on both. Even against
+the latest memory-optimized Redis (the 8.2+ kvobj) and Valkey (the 8.0 embedded key +
+8.1 hashtable redesign), the 8-byte tagged-pointer slot and the single-allocation
+key+value+TTL blob keep IronCache lighter.
+
+**Honesty notes.** A GitHub-hosted shared 4-vCPU VM is INDICATIVE, not publishable; the
+authoritative verdict needs dedicated bare metal. Memory (bytes per key) is deterministic
+and the most trustworthy figure; QPS, and especially p99 latency, carry meaningful
+runner-to-runner variance (the p99 column is noisy on a shared box, which is why it goes
+both ways). Memcached does not speak the Redis wire protocol, so only its memory is
+compared (populated over the memcached text protocol, read from its own `stats`); a
+throughput comparison would be cross-protocol and is out of scope. Memory is value-size
+and key-count sensitive (both engines' hash tables have fill-state effects), so the win
+margin moves with the workload; the full sweep and the round-by-round optimization
+history are in [docs/bench/OPTIMIZATION_LOG.md](docs/bench/OPTIMIZATION_LOG.md), and the
+version-pinned competitor matrix is in
+[docs/bench/COMPETITORS.md](docs/bench/COMPETITORS.md). Reproduce any row with
+`gh workflow run headtohead.yml -f competitor=<redis|valkey|dragonfly|keydb|memcached>`.
+
+---
+
 ## The five tenets
 
 We rank the tenets, and when two conflict we resolve in this order:
@@ -93,9 +153,11 @@ We rank the tenets, and when two conflict we resolve in this order:
 - A shared-nothing, thread-per-core engine: the keyspace is sharded so each
   shard is owned and mutated by exactly one core, eliminating hot-path locks and
   using every core in the box.
-- Memory-frugal: compact encodings and a low-metadata hash table, with optional
-  transparent compression for large or cold values, aiming to beat Redis and
-  match or beat Dragonfly on bytes per item.
+- Memory-frugal: compact encodings and a low-metadata hash table (an 8-byte
+  tagged-pointer slot over a single-allocation key+value+TTL blob), with optional
+  transparent compression for large or cold values. Measured (see
+  [Benchmarks](#benchmarks-how-it-compares)): lighter per key than Redis, Valkey, KeyDB,
+  and Memcached, and at parity with Dragonfly, on the 128-byte head-to-head.
 - Smart about eviction: a modern, concurrency-friendly policy (the
   TinyLFU, S3-FIFO, and SIEVE family) chosen by measured hit ratio per byte,
   not a legacy approximated LRU.
@@ -179,26 +241,31 @@ ironcache upgrade
 
 ## Building
 
-The first engine code has landed (the PR-1 "Boot + wire" slice: a workspace and a
-server that speaks RESP and answers the Tier-0 connection commands). To build and
-run from source you need a stable Rust toolchain (MSRV 1.85, edition 2024):
+The engine is functional: a shared-nothing, thread-per-core server speaking RESP2/RESP3
+with 150+ commands across all core types (strings, lists, hashes, sets, sorted sets,
+bitmaps, HyperLogLog), transactions (MULTI/EXEC/WATCH), pub/sub, AUTH, a maxmemory
+ceiling with eviction, and a cross-shard coordinator. To build and run from source you
+need a stable Rust toolchain (MSRV 1.85, edition 2024):
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace          # 800+ tests
 
-# boot the server (Tier-0: PING, HELLO, AUTH, SELECT, QUIT, RESET, CLIENT,
-# COMMAND, INFO, ECHO) on the default port and talk to it with any Redis client
+# boot the server on every core (sharded, thread-per-core) and talk to it with any
+# Redis client; GET/SET/DEL, the collection types, TTLs, and the maxmemory ceiling work
 cargo run -p ironcache -- server
-redis-cli -p 6379 PING        # -> PONG
+redis-cli -p 6379 SET hello world   # -> OK
+redis-cli -p 6379 GET hello         # -> "world"
 
 # other modes: print the effective config, or run a config self-check
 cargo run -p ironcache -- config
 cargo run -p ironcache -- check
 ```
 
-The storage engine (GET/SET/DEL and the memory ceiling) arrives in the following
-PRs; see [docs/ROADMAP.md](docs/ROADMAP.md) for the thin-vertical-slice order.
+Persistence (a forkless snapshot) and the multi-node cluster are the remaining v1
+milestones; see [docs/ROADMAP.md](docs/ROADMAP.md) for the slice order, and
+[docs/bench/OPTIMIZATION_LOG.md](docs/bench/OPTIMIZATION_LOG.md) for the efficiency
+campaign that produced the [Benchmarks](#benchmarks-how-it-compares) above.
 
 ---
 

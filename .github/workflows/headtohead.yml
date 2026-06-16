@@ -28,6 +28,8 @@ on:
           - redis
           - valkey
           - dragonfly
+          - keydb
+          - memcached
       value_size:
         description: "SET value bytes (also the bytes-per-key value size)."
         type: string
@@ -102,7 +104,25 @@ jobs:
           set -euo pipefail
           case "${{ inputs.competitor }}" in
             valkey)
-              sudo apt-get install -y valkey-server || sudo apt-get install -y redis-server
+              # The pinned head-to-head bar is the LATEST valkey (the 8.x line added the big
+              # memory wins: embedded key/value in 8.0 + the 8.1 hashtable redesign, ~20-30
+              # B/key lighter than 7.x). Ubuntu's apt valkey is only ~7.2.x (pre-embedded-key),
+              # which would OVERSTATE IronCache's memory edge, so BUILD the latest 8.1.x from
+              # source for an honest bar; fall back to apt valkey, then redis, if the build
+              # fails. The harness reads the real version from --version and labels it.
+              set -x
+              if sudo apt-get install -y build-essential pkg-config \
+                 && { git clone --depth 1 --branch 8.1.8 https://github.com/valkey-io/valkey.git /tmp/valkey \
+                      || git clone --depth 1 https://github.com/valkey-io/valkey.git /tmp/valkey; } \
+                 && make -C /tmp/valkey -j"$(nproc)" BUILD_TLS=no valkey-server \
+                 && sudo install -m 0755 /tmp/valkey/src/valkey-server /usr/local/bin/valkey-server; then
+                /usr/local/bin/valkey-server --version
+                echo "COMPETITOR_BIN=/usr/local/bin/valkey-server" >> "$GITHUB_ENV"
+              else
+                echo "::warning::valkey 8.1.x source build failed; falling back to apt valkey (~7.2.x, pre-embedded-key) or redis."
+                sudo apt-get install -y valkey-server || sudo apt-get install -y redis-server
+              fi
+              set +x
               ;;
             dragonfly)
               # DragonflyDB ships a prebuilt x86_64 binary on its GitHub releases (no apt
@@ -116,8 +136,101 @@ jobs:
               /usr/local/bin/dragonfly --version
               echo "COMPETITOR_BIN=/usr/local/bin/dragonfly" >> "$GITHUB_ENV"
               ;;
+            keydb)
+              # KeyDB is a multi-threaded Redis FORK (RESP / redis-cli compatible), but it is
+              # NOT in the default Ubuntu apt repos and the project is DORMANT (last release
+              # v6.3.4, Oct 2023). Try the most robust install in order; if BOTH paths fail we
+              # exit NON-ZERO (no silent fall back to redis - that would mislabel the
+              # competitor and the harness would report a redis verdict under the keydb name).
+              #
+              # (a) The official KeyDB apt repo (download.keydb.dev/open-source-dist) for the
+              #     runner's codename. NOTE: as of this writing the repo has NO 'noble' (24.04)
+              #     Release file, so on the current ubuntu-latest (noble) this path is EXPECTED
+              #     to fail and we fall through to (b). It is kept first so that if/when KeyDB
+              #     publishes a noble repo, or the runner image is an older codename, apt is
+              #     preferred (it resolves deps cleanly).
+              # (b) The prebuilt jammy .deb from the KeyDB package archive. `dpkg -i` then
+              #     `apt-get -f install -y` pulls runtime deps. On noble the jammy deb's
+              #     libcurl4 dep was renamed to libcurl4t64 (the t64 transition), so this may
+              #     fail to satisfy deps; that surfaces as a non-zero exit (loud failure), which
+              #     is what we want.
+              set -x
+              CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+              installed=0
+              # (a) apt repo for the runner codename.
+              if echo "deb https://download.keydb.dev/open-source-dist ${CODENAME} main" \
+                   | sudo tee /etc/apt/sources.list.d/keydb.list >/dev/null \
+                 && sudo wget -qO /etc/apt/trusted.gpg.d/keydb.gpg \
+                      https://download.keydb.dev/open-source-dist/keyring.gpg \
+                 && sudo apt-get update \
+                 && sudo apt-get install -y keydb-server; then
+                installed=1
+              else
+                echo "::notice::KeyDB apt repo install failed for codename '${CODENAME}' (the repo has no noble Release as of 2026-06); trying the prebuilt jammy .deb."
+                sudo rm -f /etc/apt/sources.list.d/keydb.list
+                sudo apt-get update || true
+              fi
+              # (b) prebuilt jammy .deb fallback (the keydb-latest symlink resolves to v6.3.4).
+              if [ "$installed" -ne 1 ]; then
+                BASE="https://download.keydb.dev/pkg/open_source/deb/ubuntu22.04_jammy/amd64/keydb-latest"
+                if curl -fsSL -o /tmp/keydb-server.deb \
+                     "${BASE}/keydb-server_6.3.4-1~jammy1_amd64.deb" \
+                   && curl -fsSL -o /tmp/keydb-tools.deb \
+                     "${BASE}/keydb-tools_6.3.4-1~jammy1_amd64.deb"; then
+                  # dpkg first (it may leave unmet deps), then `apt-get -f install -y` resolves
+                  # them. If deps cannot be satisfied (e.g. libcurl4 vs libcurl4t64 on noble),
+                  # apt exits non-zero and the step fails loudly.
+                  sudo dpkg -i /tmp/keydb-tools.deb /tmp/keydb-server.deb || true
+                  sudo apt-get -f install -y
+                  installed=1
+                fi
+              fi
+              if [ "$installed" -ne 1 ] || ! command -v keydb-server >/dev/null 2>&1; then
+                echo "::error::Could NOT install KeyDB via the apt repo OR the prebuilt jammy .deb. KeyDB is dormant (last release v6.3.4, 2023) and its apt repo lacks a noble Release; the jammy deb may not satisfy noble's t64 libcurl. Failing loudly instead of falling back to redis (which would mislabel the competitor)."
+                exit 1
+              fi
+              # Point the harness at the resolved keydb-server (mirrors how dragonfly sets
+              # COMPETITOR_BIN). It is redis-cli/RESP compatible, so PING/INFO/--pipe + loadgen
+              # all work; only the threading flag differs (--server-threads, handled in the
+              # harness keydb branch).
+              KEYDB_BIN="$(command -v keydb-server)"
+              keydb-server --version
+              echo "COMPETITOR_BIN=${KEYDB_BIN}" >> "$GITHUB_ENV"
+              set +x
+              ;;
+            memcached)
+              # Memcached does NOT speak RESP, so the harness drives it over the memcached TEXT
+              # protocol with `nc` (netcat-openbsd) and measures MEMORY ONLY (bytes-per-key);
+              # throughput/latency are out of scope. libmemcached-tools provides memccat/memcdump/
+              # memcping (handy diagnostics); the harness itself uses raw `nc`, so netcat-openbsd
+              # is the load-bearing dependency. Memcached IS in the default Ubuntu apt repos.
+              sudo apt-get install -y memcached libmemcached-tools netcat-openbsd
+              MEMCACHED_BIN="$(command -v memcached || echo /usr/bin/memcached)"
+              "${MEMCACHED_BIN}" --version || "${MEMCACHED_BIN}" -h | head -n1 || true
+              echo "COMPETITOR_BIN=${MEMCACHED_BIN}" >> "$GITHUB_ENV"
+              ;;
             *)
-              sudo apt-get install -y redis-server
+              # redis: the pinned bar is the 8.x kvobj line (the unified key-value object,
+              # 25-37% lighter for short strings than the 7.x dict). Ubuntu apt ships only
+              # ~7.x, so install from the OFFICIAL redis apt repo (packages.redis.io) to get
+              # 8.x for an honest memory bar; fall back to ubuntu apt (~7.x) if the repo is
+              # unreachable. The harness reads the real version from INFO and labels it.
+              set -x
+              if curl -fsSL https://packages.redis.io/gpg \
+                   | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg \
+                 && sudo chmod 0644 /usr/share/keyrings/redis-archive-keyring.gpg \
+                 && echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
+                      | sudo tee /etc/apt/sources.list.d/redis.list >/dev/null \
+                 && sudo apt-get update \
+                 && sudo apt-get install -y redis-server; then
+                redis-server --version
+              else
+                echo "::warning::official redis apt repo install failed; falling back to ubuntu apt redis-server (~7.x)."
+                sudo rm -f /etc/apt/sources.list.d/redis.list
+                sudo apt-get update || true
+                sudo apt-get install -y redis-server
+              fi
+              set +x
               ;;
           esac
 
