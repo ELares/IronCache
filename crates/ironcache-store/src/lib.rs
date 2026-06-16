@@ -590,12 +590,25 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                     None
                 }
             };
+        // A value REPLACE does NOT change the key's eviction-policy membership: the key
+        // stays tracked, at its current FIFO position, with its carried freq (set above).
+        // S3-FIFO is insertion-ordered (a write is an access that bumps freq, never a
+        // reposition), so the policy needs NO notification - only the accounting byte
+        // delta. Firing on_remove + on_insert here was both a fidelity wart (it moved the
+        // key to the back of its queue) AND, with the freq-in-object policy's O(N)
+        // on_remove queue splice, an O(N) cost on EVERY replace (catastrophic on a large
+        // keyspace: it halved the head-to-head throughput). Only a TRUE insert (a new key,
+        // the Vacant arm) enters the policy; a true delete/eviction fires on_remove via
+        // `remove_object`.
         if let Some(old) = old_bytes {
+            // Replace: accounting only, no policy churn (the key stays tracked in place).
             self.account_sub(old);
-            self.eviction.on_remove(db, key, old);
+            self.account_add(new_bytes);
+        } else {
+            // Fresh insert: the new key enters the eviction policy's queues.
+            self.account_add(new_bytes);
+            self.eviction.on_insert(db, key, new_bytes);
         }
-        self.account_add(new_bytes);
-        self.eviction.on_insert(db, key, new_bytes);
         old_bytes.is_some()
     }
 
