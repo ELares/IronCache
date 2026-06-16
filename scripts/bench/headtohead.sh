@@ -481,7 +481,13 @@ measure_server() {
     # so a probe compares RAW qps across shard counts.
     local ic_shards="${IRONCACHE_SHARDS:-${SERVER_CORE_COUNT}}"
     echo "[h2h] starting ${name} on ${HOST}:${PORT} (shards=${ic_shards} over ${SERVER_CORE_COUNT} pinned cores, maxmemory=${MAXMEMORY})..."
-    IRONCACHE_MAXMEMORY="${MAXMEMORY}" \
+    # Set IRONCACHE_SHARDS to the RESOLVED numeric value on the launch (not just the
+    # --shards flag): the binary ALSO reads IRONCACHE_SHARDS from its env-config, and an
+    # EMPTY inherited value (e.g. a blank workflow input flowing in as IRONCACHE_SHARDS="")
+    # makes it fail startup with "invalid config value for shards: not a number". Pinning
+    # it to ${ic_shards} here overrides any empty inherited env so the binary always gets a
+    # valid count.
+    IRONCACHE_MAXMEMORY="${MAXMEMORY}" IRONCACHE_SHARDS="${ic_shards}" \
       ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${IRONCACHE_BIN}" \
       --port "${PORT}" --shards "${ic_shards}" server \
       >"${SERVER_LOG}" 2>&1 &
