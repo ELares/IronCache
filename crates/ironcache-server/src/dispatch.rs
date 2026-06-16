@@ -355,6 +355,35 @@ pub fn dispatch_with_cmd<
         return Value::error(ErrorReply::noauth());
     }
 
+    // THE SUBSCRIBE-MODE GATE (SERVER_PUSH.md #20, PR 91a). A RESP2 connection in SUBSCRIBE
+    // mode may run ONLY the pub/sub control set + PING/QUIT/RESET; anything else is rejected
+    // with the byte-exact Redis "allowed in this context" error. RESP3 has NO restriction (a
+    // RESP3 subscriber may run any command, per HELLO 3 semantics), so this gate is RESP2-only.
+    //
+    // The pub/sub commands themselves (SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE/PUBLISH)
+    // are intercepted in the SERVE layer (`route_and_dispatch`) BEFORE dispatch -- registration
+    // needs the per-connection push sender + the per-shard table, which live there -- so this
+    // gate never sees them; it only sees the non-pubsub commands a subscriber tries to run.
+    // PING/QUIT/RESET DO reach dispatch and must stay allowed (Redis allows them in this mode),
+    // so they are in the allow set here. PSUBSCRIBE/PUNSUBSCRIBE are listed for forward
+    // compatibility (PR 91b) so the allow set is the full Redis set even before they are wired.
+    if state.is_subscriber()
+        && state.proto == ProtoVersion::Resp2
+        && !matches!(
+            cmd,
+            b"SUBSCRIBE"
+                | b"UNSUBSCRIBE"
+                | b"PSUBSCRIBE"
+                | b"PUNSUBSCRIBE"
+                | b"PING"
+                | b"QUIT"
+                | b"RESET"
+        )
+    {
+        let name = String::from_utf8_lossy(cmd).to_ascii_lowercase();
+        return Value::error(ErrorReply::subscribe_mode(&name));
+    }
+
     // THE QUEUE GATE (TRANSACTIONS.md "queue then apply", PR-10a). While inside a
     // transaction, every command EXCEPT the control commands MULTI/EXEC/DISCARD (and
     // RESET/QUIT, which act on the connection itself) is QUEUED rather than executed:

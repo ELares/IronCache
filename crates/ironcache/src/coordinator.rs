@@ -174,6 +174,32 @@ pub async fn run_drain_loop(mut rx: mpsc::Receiver<ShardWork>, ctx: ServerContex
 /// Every borrow is taken and dropped inside this function: nothing escapes to be held
 /// across the caller's `.await` (the no-borrow-across-await contract).
 fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
+    // INTERNAL `__ICPUBLISH <channel> <payload>` (SERVER_PUSH.md #20, PR 91a): the cross-shard
+    // PUBLISH fan-out. It touches the per-shard SUBSCRIPTION table, NOT the store/wheel/env, so
+    // it is handled BEFORE any store borrow and produces NO counter deltas (a PUBLISH is not a
+    // keyed write). Delivery is synchronous non-blocking `try_send` (see `run_local_publish`),
+    // so no RefCell borrow is held across an `.await` (the drain loop's no-borrow-across-await
+    // contract). It returns the count of LOCAL subscribers that received the message; the home
+    // core SUMS the per-shard counts into the PUBLISH integer reply.
+    if crate::serve::ascii_upper(request.command()) == ironcache_server::ICPUBLISH {
+        return ShardReply {
+            value: run_local_publish(request),
+            deltas: CounterDeltas::default(),
+        };
+    }
+
+    // INTERNAL `__ICPUBSUB <subcommand> [args]` (SERVER_PUSH.md #20, PR 91b): the cross-shard
+    // PUBSUB-introspection gather. Like `__ICPUBLISH` it touches ONLY the per-shard SUBSCRIPTION
+    // table (read-only) and produces NO counter deltas (introspection is not a keyed write), so it
+    // is handled BEFORE any store borrow. It returns THIS shard's local partial (channels with a
+    // local sub / per-channel local counts / local patterns); the home core MERGES the partials.
+    if crate::serve::ascii_upper(request.command()) == ironcache_server::ICPUBSUB {
+        return ShardReply {
+            value: run_local_pubsub(request),
+            deltas: CounterDeltas::default(),
+        };
+    }
+
     // Lazily init + clone the per-shard handles (Rc clones, cheap), exactly as
     // serve_connection / handle_request do. These accessors are the shared per-shard
     // lazy-init, so the drain loop and the connection tasks see the SAME store/wheel/env.
@@ -594,6 +620,293 @@ pub fn run_local_keyed(ctx: &ServerContext, request: &Request, db: u32) -> Shard
     }
 
     ShardReply { value, deltas }
+}
+
+/// Deliver an `__ICPUBLISH <channel> <payload>` to THIS shard's LOCAL subscribers and
+/// return the count delivered as a [`Value::Integer`] (SERVER_PUSH.md #20, PR 91a). This is
+/// the per-shard delivery the cross-shard PUBLISH fan-out runs on EVERY shard: the home shard
+/// runs it LOCALLY via [`fan_out_publish`]'s closure (no self-channel hop), every other shard
+/// runs it inside [`run_remote`] off the inbox.
+///
+/// It looks the channel up in this shard's [`crate::serve::shard_pubsub`] table and
+/// `try_send`s a [`crate::pubsub::ServerPush::Message`] to each local subscriber (NEVER
+/// `send().await`: a push must not block the publishing shard); a slow consumer past the
+/// channel bound is SHED inside `ShardPubSub::deliver` (its sender dropped, so its serve loop
+/// disconnects), keeping shard memory bounded. The borrow of the subscription table is taken +
+/// released entirely within this SYNCHRONOUS call (try_send is non-blocking), so nothing is
+/// held across the caller's `.await` (the no-borrow-across-await contract).
+///
+/// A malformed `__ICPUBLISH` (missing channel/payload) delivers to nobody and returns 0; the
+/// coordinator only ever issues it well-formed (the PUBLISH arity is validated client-side).
+///
+/// PATTERN delivery (PR 91b): in addition to the exact `channel` subscribers, this also delivers
+/// to every LOCAL pattern subscriber whose pattern `glob_match`es `channel` (a `pmessage`), via
+/// [`crate::pubsub::ShardPubSub::deliver_patterns`] with the binary-safe Redis matcher. The
+/// returned count is exact-channel + pattern receivers (a connection subscribed to BOTH the
+/// exact channel AND a matching pattern is counted TWICE -- it receives BOTH a `message` and a
+/// `pmessage`, Redis semantics, NO dedup). Both fan-outs hold the table borrow only across the
+/// synchronous `try_send`s (no `.await` between borrow and release).
+#[must_use]
+pub fn run_local_publish(request: &Request) -> Value {
+    let (Some(channel), Some(payload)) = (request.args.get(1), request.args.get(2)) else {
+        return Value::Integer(0);
+    };
+    let push = crate::pubsub::ServerPush::Message {
+        channel: channel.clone(),
+        payload: payload.clone(),
+    };
+    let pubsub = crate::serve::shard_pubsub();
+    let mut count = pubsub.borrow_mut().deliver(channel.as_ref(), &push);
+    // Pattern subscribers: each matching pattern delivers a `pmessage` and counts toward the
+    // PUBLISH receiver total IN ADDITION to the exact-channel delivery above (no dedup).
+    count += pubsub.borrow_mut().deliver_patterns(
+        channel.as_ref(),
+        payload,
+        ironcache_server::glob::glob_match,
+    );
+    Value::Integer(count)
+}
+
+/// Fan a `PUBLISH <channel> <payload>` out to EVERY shard's LOCAL subscriber table and SUM the
+/// per-shard receiver counts into the PUBLISH integer reply (SERVER_PUSH.md #20 / COORDINATOR.md
+/// #107, PR 91a). Modeled on [`fan_out_all`]: classic Pub/Sub channels are NOT slotted, so a
+/// PUBLISH must reach subscribers on ANY core; it broadcasts the SAME `__ICPUBLISH channel
+/// payload` request to every shard.
+///
+/// The HOME shard's delivery runs LOCALLY + SYNCHRONOUSLY via [`run_local_publish`] (no
+/// self-channel hop, exactly like `fan_out_all`'s `local` closure); every OTHER shard gets a
+/// [`ShardWork`] carrying the `__ICPUBLISH` request (its [`run_remote`] pub/sub branch delivers
+/// to that shard's local subscribers and returns its local count). The home core then SUMS all
+/// the per-shard integer counts. A shard whose drain loop is gone (send error / cancelled
+/// oneshot, only at shutdown / a shard panic) contributes 0 (it cannot have delivered), so a
+/// degraded shard never hangs the PUBLISH.
+///
+/// `db` is carried for envelope symmetry with the other fan-outs (classic Pub/Sub channels are
+/// a single cross-DB namespace this pass, so delivery itself ignores it). The `local` closure
+/// (`run_local_publish`) returns before any `.await`, so NO RefCell borrow of the home shard's
+/// subscription table is held across the awaits (the no-borrow-across-await contract).
+pub async fn fan_out_publish(
+    inbox: &Inbox,
+    channel: &[u8],
+    payload: &[u8],
+    db: u32,
+    home: usize,
+) -> i64 {
+    let n_shards = inbox.len();
+    // The broadcast request the coordinator issues to every shard: the internal verb the
+    // run_remote pub/sub branch + the home `run_local_publish` both decode.
+    let request = Request {
+        args: vec![
+            bytes::Bytes::from_static(ironcache_server::ICPUBLISH),
+            bytes::Bytes::copy_from_slice(channel),
+            bytes::Bytes::copy_from_slice(payload),
+        ],
+    };
+
+    // Enqueue to every NON-home shard first (each with its own oneshot), so the shards deliver
+    // concurrently while the home core then delivers its OWN subset locally and gathers.
+    let mut pending: Vec<oneshot::Receiver<ShardReply>> = Vec::with_capacity(n_shards);
+    let mut total: i64 = 0;
+    for target in 0..n_shards {
+        if target == home {
+            continue;
+        }
+        let (tx, rx) = oneshot::channel::<ShardReply>();
+        let work = ShardWork {
+            request: request.clone(),
+            db,
+            reply: tx,
+        };
+        // Await-on-full back-pressure on the INBOX (the cross-shard queue, NOT the push
+        // channel). A send error means that shard's drain loop is gone (shutdown): it
+        // contributes 0 (it delivered to nobody), never a hang.
+        if inbox[target].send(work).await.is_ok() {
+            pending.push(rx);
+        }
+    }
+
+    // The HOME shard's delivery: LOCAL + SYNCHRONOUS (no self-channel hop), exactly like the
+    // single-key local fast path. The closure returns before the awaits below.
+    total += publish_count(&run_local_publish(&request));
+
+    // Gather the remote per-shard counts. A cancelled oneshot (a shard's drain loop went away
+    // after we enqueued) contributes 0, never a hang/panic.
+    for rx in pending {
+        if let Ok(reply) = rx.await {
+            total += publish_count(&reply.value);
+        }
+    }
+    total
+}
+
+/// Extract the integer receiver count a shard's `__ICPUBLISH` delivery returned. The pub/sub
+/// branch always replies a [`Value::Integer`]; anything else (the shard-unavailable error, only
+/// at shutdown) counts as 0 (that shard delivered to nobody).
+fn publish_count(value: &Value) -> i64 {
+    match value {
+        Value::Integer(n) => *n,
+        _ => 0,
+    }
+}
+
+/// Run an `__ICPUBSUB <subcommand> [args]` PUBSUB-introspection PARTIAL against THIS shard's
+/// LOCAL subscription table and return the shard's contribution as a [`Value`] (SERVER_PUSH.md
+/// #20, PR 91b). The home core MERGES the per-shard partials (see [`fan_out_pubsub`]); the wire
+/// shape of each partial is chosen so the merge is a simple union / sum / union-count:
+///
+/// - `CHANNELS [pat]` -> a [`Value::Array`] of this shard's channel names that have >= 1 LOCAL
+///   subscriber (glob-filtered by `pat` if present). Home UNIONS + dedups.
+/// - `NUMSUB [ch ...]` -> a FLAT [`Value::Array`] `[ch1, n1, ch2, n2, ...]` of this shard's LOCAL
+///   per-channel subscriber counts, in the REQUESTED order (a channel with no local sub -> 0).
+///   Home SUMS the counts per channel position.
+/// - `NUMPAT` -> a [`Value::Array`] of this shard's LOCAL pattern names (with >= 1 subscriber).
+///   Home UNIONS them and COUNTS the DISTINCT total (the same pattern on two shards is ONE).
+///
+/// It borrows the per-shard subscription table briefly (read-only) and returns before any
+/// `.await` (the drain loop's no-borrow-across-await contract). A malformed `__ICPUBSUB` (no
+/// subcommand) contributes an empty array (the home merge surfaces the client-side error; the
+/// coordinator only issues it well-formed, validated client-side).
+#[must_use]
+pub fn run_local_pubsub(request: &Request) -> Value {
+    let Some(sub) = request.args.get(1) else {
+        return Value::Array(Some(Vec::new()));
+    };
+    let pubsub = crate::serve::shard_pubsub();
+    let table = pubsub.borrow();
+    match crate::serve::ascii_upper(sub.as_ref()).as_slice() {
+        b"CHANNELS" => {
+            // Optional glob filter (args[2]); None -> every locally-subscribed channel.
+            let pat = request.args.get(2).map(bytes::Bytes::as_ref);
+            let names = table.local_channels(pat, ironcache_server::glob::glob_match);
+            Value::Array(Some(names.into_iter().map(Value::bulk).collect()))
+        }
+        b"NUMSUB" => {
+            // One [name, local_count] pair per requested channel, in the requested order.
+            let mut flat: Vec<Value> = Vec::with_capacity((request.args.len() - 2) * 2);
+            for ch in &request.args[2..] {
+                flat.push(Value::bulk(ch.clone()));
+                flat.push(Value::Integer(table.local_numsub(ch.as_ref())));
+            }
+            Value::Array(Some(flat))
+        }
+        b"NUMPAT" => {
+            let names = table.local_patterns();
+            Value::Array(Some(names.into_iter().map(Value::bulk).collect()))
+        }
+        // An unknown subcommand never reaches the coordinator (the serve layer validates it
+        // before fanning out); contribute an empty array defensively.
+        _ => Value::Array(Some(Vec::new())),
+    }
+}
+
+/// Fan a `PUBSUB <subcommand> [args]` introspection request out to EVERY shard's LOCAL
+/// subscription table and MERGE the per-shard partials into the Redis-shaped reply
+/// (SERVER_PUSH.md #20 / COORDINATOR.md #107, PR 91b). Modeled on [`fan_out_all`]: subscription
+/// state is per-shard (a channel may have subscribers on several shards), so introspection must
+/// gather from every core. It broadcasts the SAME internal `__ICPUBSUB <subcommand> [args]`
+/// request (built from `request.args[1..]`) to every shard.
+///
+/// The HOME shard's partial runs LOCALLY + SYNCHRONOUSLY via [`run_local_pubsub`] (no
+/// self-channel hop, exactly like `fan_out_all`'s `local` closure); every OTHER shard runs it in
+/// its [`run_remote`] `__ICPUBSUB` branch. The home core then MERGES per subcommand:
+///
+/// - CHANNELS: UNION + dedup the per-shard channel-name arrays -> array of bulk strings.
+/// - NUMSUB: SUM the per-shard `[ch, n]` pairs per channel, preserving the REQUESTED order ->
+///   flat `[ch1, n1, ch2, n2, ...]` array.
+/// - NUMPAT: UNION the per-shard pattern-name arrays + COUNT the distinct total -> integer.
+///
+/// A shard whose drain loop is gone (send error / cancelled oneshot, only at shutdown / a shard
+/// panic) contributes an empty partial (it had no subscribers to report), so a degraded shard
+/// never hangs the introspection. The `local` closure returns before any `.await`, so NO RefCell
+/// borrow of the home shard's table is held across the awaits (the no-borrow-across-await
+/// contract).
+pub async fn fan_out_pubsub(inbox: &Inbox, request: &Request, home: usize) -> Value {
+    // The broadcast request: the internal verb + the original subcommand and its args.
+    let mut args: Vec<bytes::Bytes> = Vec::with_capacity(request.args.len());
+    args.push(bytes::Bytes::from_static(ironcache_server::ICPUBSUB));
+    args.extend(request.args[1..].iter().cloned());
+    let ic_request = Request { args };
+
+    // `db` is irrelevant to introspection (channels are a single cross-DB namespace this pass);
+    // pass 0 for envelope symmetry with the other fan-outs.
+    let replies = fan_out_all(inbox, &ic_request, 0, home, || ShardReply {
+        value: run_local_pubsub(&ic_request),
+        deltas: CounterDeltas::default(),
+    })
+    .await;
+
+    // The subcommand drives the merge (the serve layer already validated it is one of the three).
+    match crate::serve::ascii_upper(request.args.get(1).map_or(&b""[..], bytes::Bytes::as_ref))
+        .as_slice()
+    {
+        b"NUMSUB" => merge_pubsub_numsub(&request.args[2..], &replies),
+        b"NUMPAT" => merge_pubsub_numpat(replies),
+        // CHANNELS (or any other token, which cannot reach here post-validation).
+        _ => merge_pubsub_channels(replies),
+    }
+}
+
+/// MERGE the per-shard `PUBSUB CHANNELS` partials: UNION + DEDUP the per-shard channel-name
+/// arrays into one array of bulk strings (a channel may have subscribers on more than one shard,
+/// so the same name can appear in two partials -> dedup). Order is irrelevant (Redis gives none).
+fn merge_pubsub_channels(replies: Vec<(usize, ShardReply)>) -> Value {
+    let mut seen: std::collections::HashSet<bytes::Bytes> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::new();
+    for (_, r) in replies {
+        if let Value::Array(Some(items)) = r.value {
+            for item in items {
+                if let Value::BulkString(Some(name)) = item {
+                    if seen.insert(name.clone()) {
+                        out.push(Value::bulk(name));
+                    }
+                }
+            }
+        }
+    }
+    Value::Array(Some(out))
+}
+
+/// MERGE the per-shard `PUBSUB NUMSUB` partials: each partial is a flat `[ch, n, ch, n, ...]`
+/// array in the SAME requested order, so the home SUMS the counts position by position and emits
+/// the flat `[ch1, sum1, ch2, sum2, ...]` reply in the requested order. `requested` is the
+/// original channel list (the source of truth for order + names); a channel with no subscriber on
+/// any shard sums to 0. A shard-unavailable empty partial contributes 0 to every channel.
+fn merge_pubsub_numsub(requested: &[bytes::Bytes], replies: &[(usize, ShardReply)]) -> Value {
+    let mut totals: Vec<i64> = vec![0; requested.len()];
+    for (_, r) in replies {
+        if let Value::Array(Some(items)) = &r.value {
+            // The partial is [ch0, n0, ch1, n1, ...]; the counts sit at odd indices, aligned to
+            // `requested` by position (run_local_pubsub built it in the requested order).
+            for (pos, total) in totals.iter_mut().enumerate() {
+                if let Some(Value::Integer(n)) = items.get(pos * 2 + 1) {
+                    *total = total.saturating_add(*n);
+                }
+            }
+        }
+    }
+    let mut flat: Vec<Value> = Vec::with_capacity(requested.len() * 2);
+    for (ch, total) in requested.iter().zip(totals) {
+        flat.push(Value::bulk(ch.clone()));
+        flat.push(Value::Integer(total));
+    }
+    Value::Array(Some(flat))
+}
+
+/// MERGE the per-shard `PUBSUB NUMPAT` partials: UNION the per-shard pattern-name arrays and
+/// COUNT the DISTINCT total (the same pattern subscribed on two shards is ONE pattern, NOT two),
+/// returning a [`Value::Integer`]. A shard-unavailable empty partial contributes no pattern.
+fn merge_pubsub_numpat(replies: Vec<(usize, ShardReply)>) -> Value {
+    let mut seen: std::collections::HashSet<bytes::Bytes> = std::collections::HashSet::new();
+    for (_, r) in replies {
+        if let Value::Array(Some(items)) = r.value {
+            for item in items {
+                if let Value::BulkString(Some(name)) = item {
+                    seen.insert(name);
+                }
+            }
+        }
+    }
+    Value::Integer(i64::try_from(seen.len()).unwrap_or(i64::MAX))
 }
 
 /// A [`ShardReply`] carrying the cross-shard unavailable error (the owning shard's drain

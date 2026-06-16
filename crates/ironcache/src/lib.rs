@@ -13,6 +13,7 @@
 
 pub mod coordinator;
 pub mod multikey;
+pub mod pubsub;
 pub mod serve;
 pub mod spanning_combine;
 pub mod test_support;
