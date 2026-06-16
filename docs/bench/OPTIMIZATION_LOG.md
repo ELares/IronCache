@@ -89,7 +89,21 @@ stay boxed structs (not flat blobs). Scoped as Round 3 (the big one). Micro-twea
 (u64 TTL sentinel, inline short keys) are deliberately SKIPPED because the
 single-alloc rewrite subsumes them (no tunnel vision on soon-replaced changes).
 
-### Round 3 (next, the big one): single-allocation blob entry - VALIDATED design
+| 3 | L-FAM (v1): single-allocation blob `Entry` in `hashbrown::HashTable` (no key dup) | 3 allocs->1, slot 80->16, approach redis | bytes/key (128B) 386.85 -> **221.5** (gap 1.77x -> **1.01x, near parity**); 32B 291 -> **121** (2.88x -> 1.20x); memmodel table slack 125.8 -> 26.2, int 155.8 -> 57.8 | qps ~71k (within noise/budget of round 2's 78k; blob parse on access) | **KEPT (pending review)** - collapsed the 2.4x memory gap to ~parity; all 840 tests green, waist unchanged |
+
+### Round 3 detail
+Per-db table is now `hashbrown::HashTable<Entry>` (low-level explicit-hash API,
+no key duplication) with `Entry = Str(Box<[u8]>)` single blob
+`[type|enc|flags|ttl?|key_len|key|value]` or `Coll(Box<CollEntry>)`; key+value+ttl
+in ONE allocation for strings (3 allocs -> 1), slot 80 -> 16. Confined to
+ironcache-store internals; the Store waist + ValueRef/RmwEntry/side-traits
+unchanged; SCAN keeps the deterministic scan_hash cursor; TTL in the blob header.
+SAFE (no unsafe; safe blob slicing). Near-parity with redis 8.8.0 on memory.
+NEXT to CLEARLY win memory: a thin pointer (ThinVec/ThinArc) slot 16->8 + cache
+the hash in the header (also helps lookup); and the throughput gap (still ~2x,
+unproven-clean on macOS) needs hot-path work + a pinned-Linux run.
+
+### Round 3 (built; was: next, the big one): single-allocation blob entry - VALIDATED design
 
 Research (redis 8.2 kvobj, valkey 8.0/8.1, Dragonfly Dashtable, hashbrown,
 SwissTable/Dash/MemC3/F14 papers) confirms the lever and a SAFE Rust path:
