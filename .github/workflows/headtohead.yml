@@ -44,6 +44,14 @@ on:
         description: "Override IronCache shard (= runtime-thread) count; blank = one per pinned core. Probes thread-oversubscription (e.g. 1 shard on 2 pinned cores)."
         type: string
         default: ""
+      eviction:
+        description: "EVICTION workload: boot every server in its evicting cache mode (set maxmemory BELOW the dataset). Measures sustained eviction, not the never-evict baseline."
+        type: boolean
+        default: false
+      maxmemory:
+        description: "Memory ceiling for the run (e.g. 64mb). Set this BELOW the dataset when eviction=true so eviction fires; blank = the harness default (4gb, never evicts)."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -121,8 +129,20 @@ jobs:
           DURATION_SECS: ${{ inputs.duration_secs }}
           WARMUP_SECS: "3"
           IRONCACHE_SHARDS: ${{ inputs.ironcache_shards }}
+          # EVICT=1 when the eviction toggle is on; the harness then boots every server in
+          # its evicting cache mode. The MAXMEMORY input is exported only if non-empty (see
+          # the run body) so a blank keeps the harness default (4gb, never evicts).
+          EVICT: ${{ inputs.eviction == true && '1' || '0' }}
+          MAXMEMORY_INPUT: ${{ inputs.maxmemory }}
         run: |
           set -euo pipefail
+          # Export MAXMEMORY ONLY when the input is non-empty: an empty export would shadow
+          # the harness default (4gb) with a blank, which the harness would reject. With a
+          # value it sets the ceiling (set it BELOW the dataset when EVICT=1 so eviction
+          # fires continuously).
+          if [ -n "${MAXMEMORY_INPUT}" ]; then
+            export MAXMEMORY="${MAXMEMORY_INPUT}"
+          fi
           # The harness resolves the competitor (valkey-server, else redis-server),
           # auto-pins on Linux (taskset present), and writes headtohead.json + per-server
           # artifacts to the out dir. It never fails the job: the ADR-0017 verdict is

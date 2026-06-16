@@ -151,6 +151,52 @@ fn cross_db_eviction_tie_break_is_deterministic() {
 }
 
 #[test]
+fn pooled_eviction_is_deterministic_across_pool_carryover() {
+    // The pooled cache-mode evictor CARRIES its victim pool across `evict_to_fit` calls (the
+    // amortization), and a warm carried candidate can trigger a one-shot refill. Drive the
+    // SAME multi-call sequence (warm a subset, then several partial-drain evictions that each
+    // leave pool leftovers for the next call) on many FRESH stores -- each with a fresh
+    // randomized table hash state -- and assert the final resident keyset is IDENTICAL across
+    // all of them. A nondeterministic victim order (e.g. hashbrown's per-table iteration order
+    // leaking through the carried pool) would diverge run-to-run. Locks ADR-0003 for the
+    // pool carry-state, which the fresh-store and roster-path determinism tests do not cover.
+    let mut reference: Option<Vec<bool>> = None;
+    for _ in 0..16 {
+        let mut st = store_with(Policy::cache_default());
+        for i in 0u32..60 {
+            set(&mut st, format!("k{i}").as_bytes());
+        }
+        // Warm the first 15 keys (bump in-object freq) so the victim order is freq-driven and
+        // the warm-candidate carryover path is exercised.
+        for _ in 0..3 {
+            for i in 0u32..15 {
+                let _ = st.read(0, format!("k{i}").as_bytes(), UnixMillis(0));
+            }
+        }
+        // Several partial-drain evictions with a DECREASING budget so each call evicts a few
+        // and leaves pool leftovers for the next (exercises carryover + the warm-retry).
+        let full = st.used_memory();
+        for step in 1..=5u64 {
+            st.evict_to_fit(full.saturating_sub(full * step / 8), UnixMillis(0));
+        }
+        // Snapshot which of the 60 original keys survived (deterministic key order).
+        let resident: Vec<bool> = (0u32..60)
+            .map(|i| {
+                st.read(0, format!("k{i}").as_bytes(), UnixMillis(0))
+                    .is_some()
+            })
+            .collect();
+        match &reference {
+            None => reference = Some(resident),
+            Some(r) => assert_eq!(
+                *r, resident,
+                "pooled eviction diverged across table-hash seeds (nondeterministic carryover)"
+            ),
+        }
+    }
+}
+
+#[test]
 fn volatile_only_evicts_ttl_keys_and_spares_non_ttl_keys() {
     // volatile-* restricts victims to TTL-bearing keys. Mix TTL and non-TTL keys,
     // force eviction, and confirm only the TTL keys can be freed.
@@ -442,4 +488,131 @@ fn policy_name_and_accessors_reflect_the_configured_policy() {
     // A volatile policy reports its configured name and the volatile posture.
     let vol = store_with(map_policy_name("volatile-ttl", 1).unwrap());
     assert!(vol.policy_volatile_only());
+}
+
+#[test]
+fn pool_eviction_frees_lowest_freq_to_fit_a_hot_key_survives_a_cold_one() {
+    // The amortized eviction-pool path frees the LOWEST-frequency victims first, exactly
+    // like the prior full-scan path: a hot key (read several times, freq up) survives over
+    // a never-touched cold key. This is the pool's coldest-first ordering under test.
+    let mut st = store_with(Policy::cache_default());
+    set(&mut st, b"hot");
+    for _ in 0..3 {
+        assert!(st.read(0, b"hot", UnixMillis(0)).is_some());
+    }
+    set(&mut st, b"cold");
+    let before = st.used_memory();
+    // Budget fits roughly one of the two ~101-byte entries: the cold (freq 0) one is the
+    // pooled coldest and goes first; the hot one (high freq) is spared.
+    let evicted = st.evict_to_fit(before / 2, UnixMillis(0));
+    assert!(evicted >= 1, "the pool must evict the cold key to fit");
+    assert!(
+        st.read(0, b"cold", UnixMillis(0)).is_none(),
+        "the cold (freq 0) key is the pooled coldest victim"
+    );
+    assert!(
+        st.read(0, b"hot", UnixMillis(0)).is_some(),
+        "the hot (high freq) key survives the pooled eviction"
+    );
+}
+
+#[test]
+fn sustained_pool_eviction_stays_under_budget_and_spares_a_hot_key() {
+    // SUSTAINED eviction (the workload the amortized pool exists for): a cache pinned at a
+    // low budget where insert after insert exceeds it. After every batch of cold inserts
+    // the store must drive `used_memory()` back to at or under budget, and a hot
+    // (freq-bumped) key must survive MANY cold inserts (it is never the pooled coldest).
+    let mut st = store_with(Policy::cache_default());
+    // Establish a hot key and saturate its frequency.
+    set(&mut st, b"hot");
+    for _ in 0..8 {
+        assert!(st.read(0, b"hot", UnixMillis(0)).is_some());
+    }
+    // A budget that holds only a handful of entries (~101 bytes each).
+    let budget = 600u64;
+    // Insert WELL past budget, repeatedly, re-touching the hot key each round so it stays
+    // hot, and evict-to-fit after each round (the serve loop's post-write evict-to-fit).
+    for round in 0u32..200 {
+        set(&mut st, format!("cold{round}").as_bytes());
+        assert!(st.read(0, b"hot", UnixMillis(0)).is_some());
+        st.evict_to_fit(budget, UnixMillis(0));
+        assert!(
+            st.used_memory() <= budget,
+            "round {round}: used {} exceeds budget {budget} after evict-to-fit",
+            st.used_memory()
+        );
+    }
+    // The hot key survived the whole sustained-eviction run.
+    assert!(
+        st.read(0, b"hot", UnixMillis(0)).is_some(),
+        "the hot key must survive many rounds of cold inserts under pooled eviction"
+    );
+}
+
+#[test]
+fn pooled_candidate_deleted_between_refill_and_eviction_is_handled() {
+    // A pooled candidate can go STALE: deleted between the refill scan and the pop that
+    // would evict it. The pool re-validates on every pop, so a missing key is SKIPPED (no
+    // panic, no false eviction) and the episode still makes progress (it refills and evicts
+    // a live key). We force a refill+partial-drain, delete a victim that is still pooled,
+    // then continue evicting and assert no panic and that we end at or under budget.
+    let mut st = store_with(Policy::cache_default());
+    for i in 0u32..40 {
+        set(&mut st, format!("k{i}").as_bytes());
+    }
+    let total = st.used_memory();
+    // First episode: evict down to a budget that frees only a few keys, so the pool is
+    // refilled once and only PARTIALLY drained (candidates remain pooled for next time).
+    let high_budget = total - 250;
+    st.evict_to_fit(high_budget, UnixMillis(0));
+    assert!(st.used_memory() <= high_budget);
+    // Delete several still-resident keys directly (some are likely still in the pool from
+    // the partial drain above): the next episode's pops must tolerate the stale entries.
+    for i in 0u32..40 {
+        st.delete(0, format!("k{i}").as_bytes(), UnixMillis(0));
+        if i >= 5 {
+            break;
+        }
+    }
+    // Second episode: drive hard. It must NOT panic on the stale (deleted) pooled entries
+    // and must end at or under budget by refilling and evicting the live remainder.
+    let evicted = st.evict_to_fit(300, UnixMillis(0));
+    let _ = evicted; // progress is asserted via the budget check, not a fixed count
+    assert!(
+        st.used_memory() <= 300,
+        "after stale-skip handling the store must still reach budget: used {}",
+        st.used_memory()
+    );
+}
+
+#[test]
+fn volatile_only_pool_eviction_spares_non_ttl_keys() {
+    // Volatile-only under the amortized pool: live non-TTL keys are NEVER collected into the
+    // pool (spared), exactly as the full-scan path spared them. Only the TTL-bearing keys
+    // can be freed. (The same contract as `volatile_only_evicts_ttl_keys_and_spares_non_ttl_keys`,
+    // re-asserted here explicitly against the pooled path.)
+    let mut st = store_with(Policy::S3Fifo(ironcache_eviction::S3Fifo::new(true)));
+    assert!(st.policy_volatile_only());
+    set(&mut st, b"keep1");
+    set(&mut st, b"keep2");
+    set_ttl(&mut st, b"ttl1", 1_000_000);
+    set_ttl(&mut st, b"ttl2", 1_000_000);
+    // Budget 0 tries to free everything, but only the TTL keys are eligible.
+    let _ = st.evict_to_fit(0, UnixMillis(0));
+    assert!(
+        st.read(0, b"ttl1", UnixMillis(0)).is_none(),
+        "ttl1 (TTL) is a pooled victim"
+    );
+    assert!(
+        st.read(0, b"ttl2", UnixMillis(0)).is_none(),
+        "ttl2 (TTL) is a pooled victim"
+    );
+    assert!(
+        st.read(0, b"keep1", UnixMillis(0)).is_some(),
+        "keep1 (no TTL) is never pooled and must survive"
+    );
+    assert!(
+        st.read(0, b"keep2", UnixMillis(0)).is_some(),
+        "keep2 (no TTL) is never pooled and must survive"
+    );
 }

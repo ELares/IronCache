@@ -268,6 +268,17 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// [`ScanCursor::SHARD_BITS`] when more than one shard is configured. Set ONCE at
     /// construction from the boot shard count; the store reads no shard topology otherwise.
     scan_band_bits: u32,
+    /// The cache-mode AMORTIZED-EVICTION POOL: a small BOUNDED, TRANSIENT staging buffer
+    /// of victim candidates harvested by ONE table scan ([`Self::refill_evict_pool`]) and
+    /// consumed across MANY eviction episodes ([`Self::evict_to_fit_pooled`]), so the O(N)
+    /// scan is amortized over up to [`EVICT_POOL_CAP`] evictions (EVICTION.md, Redis
+    /// evict.c eviction pool). It is BOUNDED by `EVICT_POOL_CAP` and so is NOT per-key
+    /// state: it never grows with the keyspace, preserving the zero-per-key-state memory
+    /// property of the cache-mode policy. It is stored HOTTEST-LAST (sorted so the COLDEST
+    /// victim is at the BACK), so an eviction episode takes the coldest with an O(1)
+    /// `pop` (never `remove(0)`). Empty at rest and between refills; only the cache-mode
+    /// (`TableScanLowestFreq`) path ever touches it (the roster path is unchanged).
+    evict_pool: Vec<PoolCandidate>,
 }
 
 /// The store-side [`VictimFreq`] the eviction policy reads through during
@@ -308,6 +319,41 @@ impl VictimFreq for TableVictimFreq<'_> {
             obj.dec_freq();
         }
     }
+}
+
+/// The cache-mode eviction-pool size: the small BOUNDED set of victim candidates one
+/// table scan harvests, then consumes across many eviction episodes (EVICTION.md
+/// amortized cache-mode eviction). It is the SCAN AMORTIZATION FACTOR: one O(N) refill
+/// scan is amortized over up to `EVICT_POOL_CAP` evictions, so a cache pinned at
+/// capacity pays the O(N) scan once per `EVICT_POOL_CAP` evictions instead of once per
+/// eviction episode. This is Redis's eviction-pool idea (evict.c `EVPOOL_SIZE`); 64 is
+/// large enough to amortize the scan well while staying tiny relative to any real
+/// keyspace (so the pool is never per-key state, see [`PoolCandidate`]).
+const EVICT_POOL_CAP: usize = 64;
+
+/// One harvested cache-mode eviction candidate, held in the BOUNDED, TRANSIENT
+/// [`ShardStore::evict_pool`]. This is NOT per-key state: the pool holds at most
+/// [`EVICT_POOL_CAP`] entries no matter how large the keyspace grows, so it does not
+/// scale with N and preserves the zero-per-key-state memory property of the cache-mode
+/// policy (the eviction policy itself still holds nothing per key; the 2-bit access
+/// `freq` lives ON the stored object). The pool is a short-lived staging buffer for
+/// the coldest victims a refill scan found, drained as eviction episodes consume it and
+/// re-validated against the live table on every pop (a pooled key may have been
+/// deleted / overwritten / expired / persisted since the refill).
+///
+/// The fields are exactly the cache-mode total-order keys (EVICTION.md, ADR-0003):
+/// `freq` (the LFU primary key), the `scan_hash` of `key`, the raw `key` bytes, and the
+/// `db` final tie-break, so the pool can be ordered by the SAME deterministic total
+/// order the full-scan path used.
+#[derive(Debug)]
+struct PoolCandidate {
+    /// The candidate's logical db (the final, total-order tie-break).
+    db: u32,
+    /// The candidate key bytes (owned: the table entry it was read from may be gone or
+    /// moved by a resize by the time the pool is consumed).
+    key: Box<[u8]>,
+    /// The in-object 2-bit access frequency at refill time (the LFU sort primary key).
+    freq: u8,
 }
 
 /// One WATCH per-key version slot (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Held in
@@ -353,6 +399,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // pre-coordinator byte-identical SCAN behavior. The boot path sets the real
             // reserved-band width via [`Self::with_scan_band_bits`] when shards > 1.
             scan_band_bits: 0,
+            // Empty at boot: the cache-mode eviction pool is filled lazily by the first
+            // over-budget refill scan and drained as eviction episodes consume it. It is
+            // BOUNDED by EVICT_POOL_CAP, never per-key state.
+            evict_pool: Vec::new(),
         }
     }
 
@@ -1118,7 +1168,9 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
     /// - [`VictimStrategy::TableScanLowestFreq`] (the cache-mode default): the policy
     ///   holds NO per-key state, so the store scans its own table for the lowest-frequency
     ///   live entries and evicts those first (exact LFU over the in-object 2-bit freq).
-    ///   See [`Self::evict_to_fit_table_scan`].
+    ///   The scan is AMORTIZED through a bounded eviction pool: one scan harvests the
+    ///   coldest [`EVICT_POOL_CAP`] candidates, then many eviction episodes drain that
+    ///   pool before the next scan. See [`Self::evict_to_fit_pooled`].
     /// - [`VictimStrategy::Roster`] (`Random` / `WTinyLfu`): the policy keeps its own
     ///   candidate roster, driven round-by-round through [`EvictionHook::select_victim`].
     ///   See [`Self::evict_to_fit_roster`].
@@ -1130,7 +1182,7 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
         }
         match self.eviction.victim_strategy() {
             VictimStrategy::None => 0,
-            VictimStrategy::TableScanLowestFreq => self.evict_to_fit_table_scan(budget_bytes, now),
+            VictimStrategy::TableScanLowestFreq => self.evict_to_fit_pooled(budget_bytes, now),
             VictimStrategy::Roster => self.evict_to_fit_roster(budget_bytes, now),
         }
     }
@@ -1144,46 +1196,184 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
 }
 
 impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
-    /// Evict the lowest-frequency live entries by SCANNING the store's own table (the
+    /// Evict the lowest-frequency live entries through an AMORTIZED EVICTION POOL (the
     /// [`VictimStrategy::TableScanLowestFreq`] cache-mode path). The eviction policy holds
     /// NO per-key state: the 2-bit access frequency lives ON each stored object (bumped by
-    /// the store inline on read), so a single O(N) pass over the over-budget db's table
-    /// collects every eligible candidate's `(freq, scan_hash, key)`, and the store evicts
-    /// the LOWEST-freq candidates first (exact LFU). Returns the count evicted.
+    /// the store inline on read). Returns the count evicted.
+    ///
+    /// ## The amortized-pool design (why this is not an O(N) scan per eviction)
+    ///
+    /// The previous design did one O(N) table scan per eviction EPISODE; under SUSTAINED
+    /// eviction (a cache pinned at capacity where most SETs insert a non-resident key) an
+    /// episode is essentially every insert, so the scan degraded to O(N) PER INSERT. This
+    /// design replaces the per-episode scan with a small BOUNDED, TRANSIENT pool of victim
+    /// candidates ([`ShardStore::evict_pool`], at most [`EVICT_POOL_CAP`]): ONE scan
+    /// ([`Self::refill_evict_pool`]) harvests the coldest `EVICT_POOL_CAP` candidates, and
+    /// then up to `EVICT_POOL_CAP` eviction episodes drain that pool with NO scan, so the
+    /// O(N) scan is amortized over `EVICT_POOL_CAP` evictions (Redis's evict.c eviction
+    /// pool). The pool is BOUNDED, so it is NOT per-key state: it never grows with the
+    /// keyspace, preserving the cache-mode policy's zero-per-key-state memory property.
     ///
     /// ## Determinism (ADR-0003)
     ///
-    /// Candidates are evicted in ascending `(freq, scan_hash, key)` order: frequency is the
-    /// primary key (the LFU signal), and `scan_hash` (then the raw key bytes, to break a
-    /// 64-bit hash collision) is the deterministic tie-break SCAN/RANDOMKEY already use. No
-    /// RNG, no wall-clock; two shards with identical keyspaces and access history evict the
-    /// same keys.
+    /// Victims are taken in ascending `(freq, scan_hash, key, db)` order, the SAME total
+    /// order the prior full scan used: frequency is the primary key (the LFU signal),
+    /// `scan_hash` then the raw key bytes break a 64-bit hash collision, and `db` is the
+    /// FINAL tie-break so the order is TOTAL (the same key bytes can be resident in two dbs
+    /// at the same freq, differing only in db). The pool is filled by the same order, so
+    /// two shards with identical keyspaces and access history evict identical keys. No RNG,
+    /// no wall-clock (only the passed `now`).
     ///
     /// ## Volatile-only (preserved)
     ///
-    /// Under a `volatile_only` policy ONLY TTL-bearing entries are collected as candidates
-    /// (a non-TTL entry is skipped during the pass, never deleted), so the non-TTL keys are
-    /// spared exactly as before. If no TTL-bearing key exists nothing is collected and the
-    /// pass frees nothing (the -OOM path), matching Redis volatile-* with no expirable key.
+    /// Under a `volatile_only` policy ONLY TTL-bearing live entries are collected into the
+    /// pool (a live non-TTL entry is never collected, so it is spared), exactly as before.
+    /// A pooled key that LOST its TTL (a PERSIST between refill and pop) is re-validated and
+    /// SKIPPED at pop time. If no TTL-bearing key exists nothing is collected and the
+    /// episode frees nothing (the -OOM path), matching Redis volatile-* with no expirable key.
+    ///
+    /// ## Progress / termination
+    ///
+    /// The loop terminates when `used <= budget` OR a refill yields an EMPTY pool (nothing
+    /// evictable -> return what was freed; the caller replies `-OOM`). A pool entry that is
+    /// stale at pop time (the key was deleted / overwritten away / persisted / already
+    /// expired since the refill) is skipped, which SHRINKS the pool; an empty pool triggers
+    /// exactly ONE refill, and a refill that finds no eligible live candidate returns an
+    /// empty pool -> break. So a run of stale skips cannot loop forever.
     ///
     /// ## Evict EXACTLY to fit (Redis maxmemory semantics)
     ///
-    /// The pass evicts the coldest candidates until `used <= budget`, then STOPS: it never
-    /// sheds live data that already fits. This matches Redis's evict loop (free until under
-    /// `maxmemory`, then stop) and keeps the behavior unsurprising on every keyspace size.
-    /// An already-expired candidate is reaped (the lazy backstop) and counts as forward
-    /// progress, not an eviction.
+    /// Victims are evicted coldest-first until `used <= budget`, then the loop STOPS: it
+    /// never sheds live data that already fits (Redis's evict loop). Any candidates left in
+    /// the pool are simply carried to the NEXT call (still valid victims to re-validate);
+    /// they are bounded, so carrying them keeps no per-key state. This carry-across-calls is
+    /// the whole point: a cache pinned at capacity calls `evict_to_fit` once per SET, each
+    /// needing ~1 eviction, and ONE refill scan serves up to `EVICT_POOL_CAP` of those.
     ///
-    /// The cost is one O(N) table scan per eviction EPISODE (the price of holding zero
-    /// per-key eviction state on a `hashbrown::HashTable`, which exposes no cheap random
-    /// sampling). This is OFF the throughput/memory benchmark path (those run with a ceiling
-    /// that holds the whole dataset, so eviction never fires); making sustained-eviction
-    /// workloads cheaper (segment-local or sampled eviction) is a separate future lever.
-    fn evict_to_fit_table_scan(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
-        // A collected eviction candidate (declared before any statement to satisfy
-        // clippy::items_after_statements). `freq` is the in-object 2-bit frequency (the
-        // LFU sort key), `scan_h` the deterministic scan-order tie-break (ADR-0003).
-        struct Candidate {
+    /// ## Coldest-first across a carried (possibly stale) pool
+    ///
+    /// A carried pool was ordered coldest-first AT ITS REFILL; later SETs insert FRESH cold
+    /// (freq-0) keys that are NOT in the carried pool. So a pooled candidate that is WARM
+    /// (live freq > 0) might be popped while a colder fresh key exists outside the pool.
+    /// Before evicting a warm candidate the loop therefore does ONE fresh refill (picking up
+    /// the fresh cold keys) and retries; the `refreshed_since_progress` latch caps this at
+    /// one extra scan between evictions, so if the freshly-refilled pool's coldest is STILL
+    /// warm (no colder key exists anywhere) the warm key is then evicted -- progress is
+    /// guaranteed and the hottest keys are always the last to go.
+    fn evict_to_fit_pooled(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
+        let volatile_only = self.eviction.volatile_only();
+        let mut evicted: u64 = 0;
+        // Whether the pool has been (re)scanned at all THIS call. Gates the one-shot
+        // "refill-before-evicting-a-warm-candidate" quality retry to AT MOST ONCE per call,
+        // NOT once per eviction. The retry only exists to refresh a STALE pool CARRIED from a
+        // prior call (whose coldest leftovers may be warmer than keys inserted since); once
+        // we have rescanned this call the pool reflects the current keyspace (no inserts
+        // happen DURING an evict_to_fit call), so every later refill is already fresh and no
+        // further retry is needed. Capping it per-call (rather than resetting after each
+        // eviction) is what keeps eviction AMORTIZED at O(N/CAP): in the common case (a large
+        // freq-0 cold tail >> CAP) the carried pool's first pop is cold, the retry never
+        // fires, and the pool drains CAP victims per scan. (An all-warm keyspace - no freq-0
+        // key - is inherently O(N)/episode for an EXACT-LFU scan with no random sampling;
+        // that is the floor here, not a regression.)
+        let mut refilled_this_call = false;
+        loop {
+            if self.used_memory() <= budget_bytes {
+                break;
+            }
+            if self.evict_pool.is_empty() {
+                // ONE bounded scan: reap expired entries (free budget) and harvest the
+                // coldest live eligible candidates into the pool.
+                self.refill_evict_pool(now);
+                refilled_this_call = true;
+                // The expired-reap inside refill may already have freed enough.
+                if self.used_memory() <= budget_bytes {
+                    break;
+                }
+                // Nothing evictable (e.g. volatile-only with no live TTL key): the caller
+                // then replies -OOM. This is the termination guard for a no-progress refill.
+                if self.evict_pool.is_empty() {
+                    break;
+                }
+            }
+            // Take the COLDEST candidate. The pool is stored HOTTEST-LAST (the coldest at
+            // the back), so `pop` is the coldest victim in O(1) (never `remove(0)`).
+            let Some(cand) = self.evict_pool.pop() else {
+                // Defensive: the is_empty()/refill guard above means the pool is non-empty
+                // here, but a pop guard keeps the loop total without an unwrap.
+                break;
+            };
+            let db_idx = self.db_index(cand.db);
+            let h = self.key_hash(&cand.key);
+            // Re-validate against the live table: the pool can be STALE (the key may have
+            // been deleted, overwritten away, persisted, expired, or WARMED UP since the
+            // refill). Read only the fields we need under the immutable borrow, then drop it
+            // before any mutating funnel call.
+            let Some((lost_ttl, is_expired, live_freq)) = self.dbs[db_idx]
+                .find(h, |e| e.key() == &cand.key[..])
+                .map(|obj| (obj.expire_at().is_none(), obj.is_expired(now), obj.freq()))
+            else {
+                // The key is gone since the refill: skip it (no progress; the pool shrank
+                // by this pop, so an emptied pool triggers a fresh refill on the next turn).
+                continue;
+            };
+            if is_expired {
+                // Already expired since the refill: reap it (the lazy backstop). This frees
+                // budget but is NOT counted as an eviction, exactly as the full-scan path
+                // treated an expired candidate. It is forward progress.
+                self.expire_if_due(cand.db, db_idx, &cand.key, now);
+                continue;
+            }
+            if volatile_only && lost_ttl {
+                // The pooled key LOST its TTL (a PERSIST between refill and pop): it is no
+                // longer eligible under volatile-only, so skip it (it was spared). The pool
+                // shrinks toward the next refill, which re-harvests only eligible keys.
+                continue;
+            }
+            // The candidate's cold-ness is the MAX of the freq it was POOLED at
+            // (`cand.freq`, the pool's ordering key) and its LIVE freq (`live_freq`): a key
+            // never gets colder on its own, so `live_freq >= cand.freq`, but reading both
+            // keeps the warm-check honest about a candidate that was already warm at harvest
+            // AND one that warmed up since (a read between refill and pop).
+            let cand_freq = cand.freq.max(live_freq);
+            // COLDEST-FIRST across a CARRIED (stale) pool: a WARM candidate (freq > 0) from a
+            // pool carried over from a PRIOR call might be popped while a colder key inserted
+            // since that pool's scan exists (not yet pooled). If we have NOT rescanned this
+            // call yet, do ONE fresh refill to surface the current coldest, then retry. This
+            // fires AT MOST ONCE per call (gated by `refilled_this_call`, never reset): after
+            // it, the pool reflects the current keyspace (no inserts happen DURING this call),
+            // so every later pop - warm or cold - is genuinely the coldest available and is
+            // evicted directly. This preserves O(N/CAP) amortization (the retry never fires on
+            // the common freq-0-cold-tail pool) while sparing a hot key over a fresh cold one
+            // in the carried-pool case. A genuinely warm-only keyspace still evicts (the
+            // refill's coldest is also warm), and the loop terminates.
+            if cand_freq > 0 && !refilled_this_call {
+                self.evict_pool.clear();
+                self.refill_evict_pool(now);
+                refilled_this_call = true;
+                continue;
+            }
+            if self.remove_object(cand.db, db_idx, &cand.key) {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    /// Refill the cache-mode eviction pool with one BOUNDED scan (the amortized-scan core
+    /// of [`Self::evict_to_fit_pooled`]). This is essentially the prior full-scan eviction
+    /// pass, but instead of evicting it (a) reaps already-expired entries inline (the free
+    /// lazy backstop, NOT an eviction) and (b) FILLS [`ShardStore::evict_pool`] with the
+    /// coldest [`EVICT_POOL_CAP`] live eligible candidates, in the deterministic
+    /// `(freq, scan_hash, key, db)` total order (ADR-0003).
+    ///
+    /// The pool is left sorted HOTTEST-LAST (coldest at the back) so the consumer takes the
+    /// coldest with an O(1) `pop`. It holds at most `EVICT_POOL_CAP` entries, so it is
+    /// BOUNDED and never per-key state.
+    fn refill_evict_pool(&mut self, now: UnixMillis) {
+        // A scanned eviction candidate (declared before any statement to satisfy
+        // clippy::items_after_statements). `scan_h` is the deterministic scan-order
+        // tie-break (ADR-0003); `expired` marks an entry the scan reaps for free.
+        struct Scanned {
             freq: u8,
             scan_h: u64,
             key: Box<[u8]>,
@@ -1192,13 +1382,10 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
         }
         let volatile_only = self.eviction.volatile_only();
         // ONE pass over every db's table, collecting eligible candidates as
-        // (freq, scan_hash, key, db). The 2-bit freq is read straight off the object, so
-        // no per-key policy lookup is needed. Under volatile-only, only TTL-bearing live
-        // entries are eligible; an already-expired entry is collected as a free reap.
-        // `expired` candidates are kept (freq sorts them with the rest, but they free bytes
-        // for nothing), so list them FIRST (freq 0-equivalent is not special; instead we
-        // reap them up front, below, before the LFU eviction).
-        let mut candidates: Vec<Candidate> = Vec::new();
+        // (freq, scan_hash, key, db). The 2-bit freq is read straight off the object, so no
+        // per-key policy lookup is needed. Under volatile-only only TTL-bearing live entries
+        // are eligible; an already-expired entry is collected only to reap it for free below.
+        let mut scanned: Vec<Scanned> = Vec::new();
         for (db_idx, table) in self.dbs.iter().enumerate() {
             let db = db_idx as u32;
             for obj in table {
@@ -1208,7 +1395,7 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
                     continue;
                 }
                 let key = obj.key().to_vec().into_boxed_slice();
-                candidates.push(Candidate {
+                scanned.push(Scanned {
                     freq: obj.freq(),
                     scan_h: scan_hash(&key),
                     key,
@@ -1219,23 +1406,20 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
         }
         // Reap already-expired candidates FIRST: they are dead weight the lazy/active
         // backstops would reap anyway, so freeing them is free budget and counts as forward
-        // progress (NOT an eviction). This also shrinks what the LFU pass must evict.
-        for c in candidates.iter().filter(|c| c.expired) {
+        // progress (NOT an eviction). This shrinks what the LFU eviction must then free and
+        // may by itself bring `used` under budget (the caller re-checks after this returns).
+        for c in scanned.iter().filter(|c| c.expired) {
             let db_idx = self.db_index(c.db);
             self.expire_if_due(c.db, db_idx, &c.key, now);
         }
-        if self.used_memory() <= budget_bytes {
-            // The expired-reap alone got us under budget; no LFU eviction needed.
-            return 0;
-        }
-        // Sort the LIVE candidates by ascending (freq, scan_hash, key, db): evict the
-        // lowest-frequency first, deterministic tie-break (ADR-0003). The `db` is the FINAL
-        // tie-break so the order is TOTAL: the same key bytes can be resident in two dbs at
-        // the same freq (each db is its own table; `scan_hash` is key-only), and without the
-        // `db` key those two candidates compare Equal, leaving `sort_unstable` free to order
-        // them by hashbrown's per-table randomized iteration order, which would make two
-        // shards with identical state evict different keys.
-        let mut live: Vec<Candidate> = candidates.into_iter().filter(|c| !c.expired).collect();
+        // Order the LIVE candidates by ascending (freq, scan_hash, key, db) -- the SAME
+        // total order the prior full scan used. `db` is the FINAL tie-break so the order is
+        // TOTAL: the same key bytes can be resident in two dbs at the same freq (each db is
+        // its own table; `scan_hash` is key-only), and without the `db` key those two
+        // candidates compare Equal, leaving `sort_unstable` free to order them by
+        // hashbrown's per-table randomized iteration order, which would make two shards with
+        // identical state evict different keys.
+        let mut live: Vec<Scanned> = scanned.into_iter().filter(|c| !c.expired).collect();
         live.sort_unstable_by(|a, b| {
             a.freq
                 .cmp(&b.freq)
@@ -1243,21 +1427,20 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
                 .then_with(|| a.key.cmp(&b.key))
                 .then_with(|| a.db.cmp(&b.db))
         });
-        // Walk candidates lowest-freq first and evict until `used <= budget`, then STOP.
-        // This may evict warm keys in an all-warm keyspace (there is no other way to fit),
-        // but always the coldest first, so the hottest keys are the LAST to go. It never
-        // sheds a key that already fits: budget met == loop done.
-        let mut evicted: u64 = 0;
-        for c in live {
-            if self.used_memory() <= budget_bytes {
-                break;
-            }
-            let db_idx = self.db_index(c.db);
-            if self.remove_object(c.db, db_idx, &c.key) {
-                evicted += 1;
-            }
-        }
-        evicted
+        // Keep only the coldest EVICT_POOL_CAP candidates (the pool bound: the amortization
+        // factor and the reason the pool is never per-key state). `live` is sorted
+        // COLDEST-FIRST; we want the pool stored HOTTEST-LAST so the consumer `pop`s the
+        // coldest, so truncate to the coldest CAP then REVERSE once (O(CAP)).
+        live.truncate(EVICT_POOL_CAP);
+        live.reverse();
+        self.evict_pool = live
+            .into_iter()
+            .map(|c| PoolCandidate {
+                db: c.db,
+                key: c.key,
+                freq: c.freq,
+            })
+            .collect();
     }
 
     /// Evict by driving the policy's OWN candidate roster round-by-round through
