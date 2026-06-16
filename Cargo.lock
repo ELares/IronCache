@@ -386,6 +386,7 @@ version = "0.0.0"
 name = "ironcache-eviction"
 version = "0.0.0"
 dependencies = [
+ "hashbrown 0.16.1",
  "ironcache-env",
  "ironcache-storage",
 ]
