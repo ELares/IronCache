@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/ironcache-logo.png" alt="IronCache" width="320">
+</p>
+
 # IronCache
 
 **The most efficient Redis-compatible cache, in one static Rust binary.**
