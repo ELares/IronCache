@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Rolling release: publish a calendar-versioned GitHub Release on EVERY push to
+# main, so "install IronCache" is "grab the latest release". This is the
+# CONTINUOUS channel; the formal `v*` channel (release.yml) keeps the curated,
+# tagged releases (changelog gate, minisign, CycloneDX export). The two-channel
+# model mirrors IronBus (see RELEASING.md).
+#
+# Each rolling build ships the four reproducible cross-built binaries (x86_64 +
+# aarch64, musl + glibc-2.17, via cargo-zigbuild, reusing release.yml's proven
+# build VERBATIM), one consolidated SHA256SUMS, and a keyless Sigstore
+# build-provenance attestation over the binaries + SHA256SUMS. The calendar
+# version is stamped into the binary via IRONCACHE_BUILD_VERSION (read by
+# option_env! in cli::BUILD_VERSION), so `ironcache --version` reports the
+# published build without touching Cargo.lock (which pins every crate at 0.0.0).
+#
+# The version is YYYY.MMDD.N (UTC date + per-day build number); the first push of
+# a day is .1, the next .2, the next day resets. A NORMAL release (not draft, not
+# prerelease) so GitHub's releases/latest points at the newest rolling build.
+# Skip a build by putting `[skip release]` in the head commit message.
+name: rolling-release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialize close-together pushes so two builds never collide on the per-day
+# build number: max+1 is computed against published releases, so two near
+# simultaneous runs must not race between "compute N" and "create the release".
+concurrency:
+  group: rolling-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard (skip until a Cargo project exists)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_cargo: ${{ steps.check.outputs.has_cargo }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] && [ -f Cargo.lock ]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::repo is docs-only (no Cargo.toml/Cargo.lock); rolling-release is a no-op"
+          fi
+
+  version:
+    name: compute calendar version
+    needs: guard
+    # Run on workflow_dispatch always; on push, skip when the head commit opts
+    # out with [skip release]. Both gated on a real Cargo project existing.
+    if: >-
+      needs.guard.outputs.has_cargo == 'true' &&
+      ( github.event_name == 'workflow_dispatch' ||
+        !contains(github.event.head_commit.message, '[skip release]') )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+    steps:
+      - id: compute
+        name: compute YYYY.MMDD.N
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The UTC calendar date with leading-zero month/day, e.g. 2026.0615.
+          # This is a deliberate CalVer string used only as a tag and a printed
+          # version, never semver-parsed, so the leading zeros are fine.
+          DATE="$(date -u +%Y.%m%d)"
+          # N is the per-day build number: the MAX of the existing same-day build
+          # numbers plus one, NOT count + one. Counting is gap-fragile: a deleted
+          # tag, or an operator-created tag that jumped ahead, would make count+1
+          # collide with an existing tag and `gh release create` would fail,
+          # shipping nothing. max+1 is robust against gaps. The next day, with no
+          # prior "$DATE." releases, max is 0 so the first build is 1 (each day
+          # resets). `startswith` + `split(".")` avoids escaping the date's dots.
+          maxn="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
+            --jq "[.[].tagName | select(startswith(\"${DATE}.\")) | split(\".\")[-1] | tonumber] | max // 0")"
+          build=$((maxn + 1))
+          VERSION="${DATE}.${build}"
+          echo "computed rolling version: $VERSION (highest existing $DATE.* build: $maxn)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+          # glibc-version-pinned gnu fallback (pin the minimum glibc per target).
+          - target: x86_64-unknown-linux-gnu.2.17
+          - target: aarch64-unknown-linux-gnu.2.17
+    env:
+      # Reproducibility contract (same as release.yml): pinned Cargo.lock is the
+      # input base; CARGO_INCREMENTAL=0 and a fixed SOURCE_DATE_EPOCH keep the
+      # artifact bytes stable. The only intended per-build difference is the
+      # stamped version string, set below.
+      SOURCE_DATE_EPOCH: "1"
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build -C strip=symbols"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust + cargo-zigbuild + cargo-auditable
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          # Strip any glibc version suffix (e.g. .2.17) before `rustup target add`;
+          # cargo-zigbuild itself consumes the dotted suffix on --target below.
+          rustup target add "${TARGET%%.*}" || true
+          cargo install --locked cargo-zigbuild cargo-auditable
+      - name: Cross-build (locked, reproducible, embedded SBOM, stamped version)
+        env:
+          # Stamp the calendar version into the binary; option_env! in
+          # cli::BUILD_VERSION reads it, so `ironcache --version` reports the
+          # published rolling build. Compile-time only; Cargo.lock stays at 0.0.0
+          # so --locked still holds. build.rs's rerun-if-env-changed makes this
+          # re-stamp reliably even on a warm target.
+          IRONCACHE_BUILD_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cargo auditable zigbuild --release --locked --target "${{ matrix.target }}"
+      - name: Package the tarball
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tdir="target/${{ matrix.target }}/release"
+          arch="${{ matrix.target }}"
+          out="ironcache-${VERSION}-${arch}.tar.gz"
+          # Deterministic tar (sorted, no owner/uid/gid, fixed mtime) so a re-run
+          # of the same inputs yields a byte-identical archive.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" -C "$tdir" -czf "$out" ironcache
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        # A UNIQUE artifact name per target (no shared SHA256SUMS file), so the
+        # publish job's merge-multiple download cannot have two same-named files
+        # overwrite each other. The consolidated SHA256SUMS is built once, in
+        # publish, over the four downloaded tarballs.
+        with:
+          name: ironcache-${{ matrix.target }}
+          path: ironcache-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish rolling release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the tag + GitHub Release
+      id-token: write # keyless Sigstore signing via OIDC
+      attestations: write # store the build-provenance attestation
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Build the consolidated SHA256SUMS over the four tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # Build SHA256SUMS from the tarballs themselves (not from per-job files),
+          # so all four arch tarballs are always covered. Self-check before it
+          # ships, so a bad upload can never produce a SHA256SUMS that does not
+          # match its own artifacts.
+          sha256sum ironcache-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          # Keyless Sigstore build-provenance over the binaries + SHA256SUMS, so a
+          # verifier can anchor the whole set to one provenance (verify with
+          # `gh attestation verify <asset> --repo <owner>/<repo>`).
+          subject-path: |
+            artifacts/ironcache-*.tar.gz
+            artifacts/SHA256SUMS
+      - name: Publish the rolling GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Heredoc keeps the markdown readable; no changelog gate (rolling builds
+          # are continuous, not curated). A NORMAL release (no --prerelease, no
+          # --draft) so releases/latest resolves to this newest build. --target
+          # pins the tag to this exact commit.
+          notes="$(cat <<EOF
+          Automatic rolling build \`${VERSION}\` from commit \`${SHA}\`.
+
+          Reproducible cross-built binaries for four Linux targets (x86_64 and
+          aarch64, each as a static \`musl\` build and a glibc-2.17-pinned \`gnu\`
+          build). Each carries an embedded cargo-auditable SBOM. Pick the tarball
+          for your platform, extract, and run \`ironcache --version\` to confirm
+          it reports \`${VERSION}\`.
+
+          | Platform | Asset |
+          | --- | --- |
+          | x86_64, static (no libc needed) | \`ironcache-${VERSION}-x86_64-unknown-linux-musl.tar.gz\` |
+          | aarch64, static (no libc needed) | \`ironcache-${VERSION}-aarch64-unknown-linux-musl.tar.gz\` |
+          | x86_64, glibc >= 2.17 | \`ironcache-${VERSION}-x86_64-unknown-linux-gnu.2.17.tar.gz\` |
+          | aarch64, glibc >= 2.17 | \`ironcache-${VERSION}-aarch64-unknown-linux-gnu.2.17.tar.gz\` |
+
+          Verify integrity with \`sha256sum -c SHA256SUMS\`, and provenance with
+          \`gh attestation verify <asset> --repo ${REPO}\`. The formal, tagged
+          \`v*\` channel (with the changelog gate, minisign signatures, and the
+          standalone CycloneDX SBOM) is described in RELEASING.md.
+          EOF
+          )"
+          gh release create "$VERSION" \
+            --repo "$REPO" \
+            --title "$VERSION" \
+            --target "$SHA" \
+            --notes "$notes" \
+            artifacts/ironcache-*.tar.gz \
+            artifacts/SHA256SUMS

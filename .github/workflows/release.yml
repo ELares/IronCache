@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
-# IronCache release pipeline: reproducible cross-build matrix on cargo-zigbuild
-# (#121), per-release SHA256 attestation + CycloneDX SBOM export (#123),
-# publishing the install paths from packaging/ (#122). See docs/design/PACKAGING.md.
-#
-# SCAFFOLD: inert until the first tagged release. It triggers only on `v*` tags
-# and short-circuits while the repo is docs-only (no Cargo.toml). minisign
-# signing and the embedded cargo-auditable SBOM are owned by ADR-0020 and
-# docs/design/SUPPLY_CHAIN.md; the CycloneDX export below is added by
+# IronCache formal release pipeline: the curated, tagged `v*` channel. Builds the
+# reproducible cross-build matrix on cargo-zigbuild (#121), exports a per-release
+# CycloneDX SBOM from the binary's embedded cargo-auditable data (#123), signs
+# the checksum file with minisign (ADR-0020), and attaches a keyless Sigstore
+# build-provenance attestation. The CONTINUOUS channel is rolling-release.yml
+# (calendar-versioned, published on every push to main); see RELEASING.md and
 # docs/design/PACKAGING.md.
+#
+# Triggers only on a `v*` tag push (the maintainer's action) or a manual
+# workflow_dispatch. Opening or merging a PR triggers nothing, so this file
+# publishes no release until a tag is cut. A changelog gate runs first and FAILS
+# the whole release if the CHANGELOG section for the release is empty.
 name: release
 
 on:
@@ -18,16 +21,21 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   guard:
     name: guard (skip until a Cargo project exists)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       has_cargo: ${{ steps.check.outputs.has_cargo }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - id: check
         shell: bash
         run: |
@@ -38,11 +46,31 @@ jobs:
             echo "::notice::repo is docs-only (no Cargo.toml/Cargo.lock); release scaffold is a no-op"
           fi
 
-  build:
-    name: build ${{ matrix.target }}
+  changelog-gate:
+    name: changelog section is non-empty
     needs: guard
     if: needs.guard.outputs.has_cargo == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # A tagged release that ships no changelog entries erodes the audit trail.
+      # FAIL here, before any binary is built, if the release's CHANGELOG
+      # section is empty. The build job needs: this gate, so the whole release is
+      # blocked on a non-empty changelog. The script checks `## [X.Y.Z]` if
+      # RELEASING.md's flow already moved the entries under the version heading,
+      # and otherwise `## [Unreleased]`, so it is correct either way.
+      - name: assert the release CHANGELOG section is not empty
+        env:
+          TAG: ${{ github.ref_name }}
+        run: sh scripts/ci/changelog-unreleased.sh CHANGELOG.md "$TAG"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [guard, changelog-gate]
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -59,20 +87,28 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build -C strip=symbols"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install Rust + cargo-zigbuild + cargo-auditable
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           rustup toolchain install stable --profile minimal
           # Strip any glibc version suffix (e.g. .2.17) before `rustup target add`;
           # cargo-zigbuild itself consumes the dotted suffix on --target below.
           rustup target add "${TARGET%%.*}" || true
           cargo install --locked cargo-zigbuild cargo-auditable
-        env:
-          TARGET: ${{ matrix.target }}
       - name: Cross-build (locked, reproducible, embedded SBOM)
+        env:
+          # Stamp the tag's version into the binary so `ironcache --version`
+          # reports the released version; option_env! in cli::BUILD_VERSION reads
+          # it (compile-time only, Cargo.lock stays 0.0.0 so --locked holds).
+          IRONCACHE_BUILD_VERSION: ${{ github.ref_name }}
         run: |
+          # Drop the leading `v` from the tag for the stamped version string.
+          IRONCACHE_BUILD_VERSION="${IRONCACHE_BUILD_VERSION#v}"
+          export IRONCACHE_BUILD_VERSION
           cargo auditable zigbuild --release --locked --target "${{ matrix.target }}"
-      - name: Package + per-artifact SHA256
+      - name: Package the tarball
         shell: bash
         run: |
           set -euo pipefail
@@ -82,37 +118,136 @@ jobs:
           out="ironcache-${ver}-${arch}.tar.gz"
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" -C "$tdir" -czf "$out" ironcache
-          sha256sum "$out" | tee -a "SHA256SUMS"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        # A UNIQUE artifact name per target (no shared SHA256SUMS file), so the
+        # publish job's merge-multiple download cannot have two same-named files
+        # overwrite each other. The consolidated SHA256SUMS is built once, in
+        # publish, over the four downloaded tarballs.
         with:
           name: ironcache-${{ matrix.target }}
-          path: |
-            ironcache-*.tar.gz
-            SHA256SUMS
+          path: ironcache-*.tar.gz
+          if-no-files-found: error
 
   publish:
-    name: attest + publish release
+    name: attest + sign + publish release
     needs: [guard, build]
     if: needs.guard.outputs.has_cargo == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # keyless Sigstore signing via OIDC
+      attestations: write # store the build-provenance attestation
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with: { path: artifacts, merge-multiple: true }
-      - name: Aggregate SHA256SUMS
-        run: cat artifacts/SHA256SUMS | sort -u > SHA256SUMS
-      - name: Export CycloneDX SBOM from embedded cargo-auditable data
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Build the consolidated SHA256SUMS over the four tarballs
+        shell: bash
         run: |
-          cargo install --locked auditable2cdx || true
-          # auditable2cdx converts the binary's embedded cargo-auditable data to
-          # a standalone CycloneDX artifact, published per release (#123).
-          echo "::notice::CycloneDX SBOM exported from embedded cargo-auditable data (PACKAGING.md #123)"
-      - name: Sign artifacts (minisign, ADR-0020)
-        run: echo "::notice::minisign detached signatures per ADR-0020 (key from secrets)"
-      - name: Publish GitHub release
+          set -euo pipefail
+          cd artifacts
+          # Build SHA256SUMS from the tarballs themselves so all four arch
+          # tarballs are always covered (the previous per-job-file approach lost
+          # three of four to a merge-multiple filename collision). Self-check
+          # before it ships.
+          sha256sum ironcache-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l
+      - name: Export the CycloneDX SBOM from the embedded cargo-auditable data (#123)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked auditable2cdx
+          # auditable2cdx reads the binary's embedded cargo-auditable section (it
+          # parses the ELF, it does not execute it), so the x86_64 runner can emit
+          # the CycloneDX manifest from any one tarball; the dependency graph is
+          # target-independent for this pure-Rust workspace. Extract the
+          # x86_64-musl binary and convert it.
+          mkdir -p extracted
+          musl_tar=""
+          for f in artifacts/ironcache-*-x86_64-unknown-linux-musl.tar.gz; do
+            musl_tar="$f"; break
+          done
+          test -n "$musl_tar"
+          tar -xzf "$musl_tar" -C extracted
+          auditable2cdx extracted/ironcache > artifacts/ironcache.cyclonedx.json
+          # Fail here, not at attach time, if the SBOM is empty or malformed.
+          test -s artifacts/ironcache.cyclonedx.json
+          grep -q '"bomFormat": *"CycloneDX"' artifacts/ironcache.cyclonedx.json
+          grep -q 'ironcache' artifacts/ironcache.cyclonedx.json
+      - name: Sign the checksum file (minisign, ADR-0020)
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            artifacts/ironcache-*.tar.gz SHA256SUMS \
-            --title "${GITHUB_REF_NAME}" --generate-notes
+          set -euo pipefail
+          # Detached minisign signature over SHA256SUMS (ADR-0020). The signature
+          # transitively covers every artifact, since SHA256SUMS pins their
+          # digests. This is secret-gated: when MINISIGN_SECRET_KEY is provisioned
+          # the release is signed; until then it warns and the keyless Sigstore
+          # attestation below remains the no-secret provenance. The key is fed on
+          # stdin (never argv), so it is not exposed in the process table.
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY not set; skipping minisign signature (ADR-0020). The keyless Sigstore attestation still ships. Provision the secret to enable detached signatures."
+            exit 0
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
+          trap 'shred -u minisign.key 2>/dev/null || rm -f minisign.key' EXIT
+          printf '%s' "${MINISIGN_PASSWORD:-}" | \
+            minisign -S -s minisign.key -m artifacts/SHA256SUMS -x artifacts/SHA256SUMS.minisig
+          echo "signed artifacts/SHA256SUMS -> artifacts/SHA256SUMS.minisig"
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          # Keyless Sigstore build-provenance over every shipped artifact (verify
+          # with `gh attestation verify <asset> --repo <owner>/<repo>`). The
+          # SHA256SUMS and the CycloneDX SBOM are attested too, so a verifier can
+          # anchor the whole set to one provenance.
+          subject-path: |
+            artifacts/ironcache-*.tar.gz
+            artifacts/SHA256SUMS
+            artifacts/ironcache.cyclonedx.json
+      - name: Determine prerelease (0.x and calendar 0.* are prereleases)
+        id: prerelease
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # A `v0.` (or bare `v0`) tag is pre-1.0 and not yet a stability promise.
+          case "$TAG" in
+            v0.*|v0) echo "value=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "value=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: Publish the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.prerelease.outputs.value }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          if [ "$PRERELEASE" = "true" ]; then
+            prerelease_flag="--prerelease"
+          fi
+          # Attach the minisign signature only when it was produced (secret-gated).
+          sig_args=()
+          [ -f artifacts/SHA256SUMS.minisig ] && sig_args+=(artifacts/SHA256SUMS.minisig)
+          # The tarball glob expands to the four built archives. $prerelease_flag is
+          # deliberately word-split (empty or a single flag), hence the SC2086 waiver.
+          # shellcheck disable=SC2086
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TAG" \
+            --verify-tag \
+            --generate-notes \
+            $prerelease_flag \
+            artifacts/ironcache-*.tar.gz \
+            artifacts/SHA256SUMS \
+            "${sig_args[@]}" \
+            artifacts/ironcache.cyclonedx.json
