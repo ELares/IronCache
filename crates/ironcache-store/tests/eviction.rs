@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Integration: the per-shard store driving a real `EvictionPolicy` through
-//! evict-to-fit + the memory ceiling (PR-3a; EVICTION.md, ADMISSION.md, ADR-0007/8).
+//! evict-to-fit + the memory ceiling (EVICTION.md, ADMISSION.md, ADR-0007/8).
 //!
-//! These exercise the store's `evict_to_fit` against the bundled policies: cache mode
-//! (S3-FIFO) frees memory under the budget; `noeviction` frees nothing; `volatile-*`
-//! only frees TTL-bearing keys. The store is constructed with an explicit policy via
-//! `with_hooks` (the binary's wiring path).
+//! These exercise the store's `evict_to_fit` against the bundled policies under the
+//! zero-per-key-state batch-LFU contract:
+//! - UNDER budget: `evict_to_fit` is a no-op (frees nothing, does not even scan).
+//! - OVER budget (cache mode): the store SCANS its table and frees the LOWEST-frequency
+//!   live entries to fit (a hotter key survives over a never-accessed cold key); the
+//!   cache-mode policy holds NO per-key state.
+//! - `noeviction`: frees nothing (the -OOM path).
+//! - `volatile-*`: only frees TTL-bearing keys (a non-TTL key is never a candidate).
+//!
+//! The store is constructed with an explicit policy via `with_hooks` (the binary's
+//! wiring path).
 
 use ironcache_eviction::Policy;
 use ironcache_storage::{
@@ -98,6 +105,52 @@ fn cache_mode_under_budget_is_a_noop() {
 }
 
 #[test]
+fn cross_db_eviction_tie_break_is_deterministic() {
+    // The same key bytes can be resident in two dbs at the same frequency (each db is its
+    // own table; `scan_hash` is key-only), so the two eviction candidates differ ONLY in
+    // `db`. The victim sort must break that tie on `db` for a TOTAL, deterministic order
+    // (ADR-0003): without it the two candidates compare Equal and `sort_unstable` is free
+    // to order them by hashbrown's per-table RANDOMIZED iteration order, evicting a
+    // different db run-to-run. We force exactly one eviction over many FRESH stores (each
+    // with a fresh randomized hash state) and assert the LOWER db index is ALWAYS the
+    // victim; a regression would flip some iterations.
+    for _ in 0..64 {
+        let mut st = store_with(Policy::cache_default());
+        let v = vec![b'v'; 100];
+        // Identical (freq 0, scan_hash, key) in db 0 and db 1; differ only in db.
+        st.upsert(
+            0,
+            b"TIE",
+            NewValue::Bytes(&v),
+            ExpireWrite::Clear,
+            UnixMillis(0),
+        );
+        st.upsert(
+            1,
+            b"TIE",
+            NewValue::Bytes(&v),
+            ExpireWrite::Clear,
+            UnixMillis(0),
+        );
+        let two = st.used_memory();
+        // Budget fits exactly one of the two equal-size copies: exactly one eviction.
+        let evicted = st.evict_to_fit(two / 2, UnixMillis(0));
+        assert_eq!(
+            evicted, 1,
+            "exactly one of the two tied copies must be evicted"
+        );
+        assert!(
+            st.read(0, b"TIE", UnixMillis(0)).is_none(),
+            "the lower-db (db 0) copy must be the deterministic victim"
+        );
+        assert!(
+            st.read(1, b"TIE", UnixMillis(0)).is_some(),
+            "the higher-db (db 1) copy must survive"
+        );
+    }
+}
+
+#[test]
 fn volatile_only_evicts_ttl_keys_and_spares_non_ttl_keys() {
     // volatile-* restricts victims to TTL-bearing keys. Mix TTL and non-TTL keys,
     // force eviction, and confirm only the TTL keys can be freed.
@@ -139,38 +192,40 @@ fn volatile_only_evicts_ttl_keys_and_spares_non_ttl_keys() {
 
 #[test]
 fn a_read_then_replaced_hot_key_keeps_its_frequency_and_survives_eviction() {
-    // freq-in-object semantic (INTENTIONAL fidelity change, pinned here): the 2-bit
-    // S3-FIFO promote frequency lives ON the entry, so a key that is READ (hotness up)
-    // then REPLACED via a blind SET KEEPS its frequency - it promotes to main on
-    // eviction and survives over never-touched cold one-hit-wonders. The pre-freq-in
-    // -object policy reset freq to 0 on any replace (an artifact of free-then-reinsert),
-    // which would have evicted this key FIRST as a cold one-hit-wonder. This pins the
-    // chosen, more-correct behavior (a written key is an accessed key) so it cannot
-    // silently regress.
+    // freq-in-object + batch-LFU eviction (pinned here): the 2-bit access frequency lives
+    // ON the entry, so a key that is READ (freq up) then REPLACED via a blind SET KEEPS
+    // its frequency (the put_object freq-carry path). The cache-mode policy holds NO
+    // per-key state; when over budget the STORE scans its table and evicts the
+    // LOWEST-frequency entries first, so the read-then-replaced hot key (high freq)
+    // survives over never-touched cold one-hit-wonders (freq 0). The pre-freq-in-object
+    // policy reset freq to 0 on any replace (an artifact of free-then-reinsert), which
+    // would have evicted this key as a cold one-hit-wonder. This pins the chosen,
+    // more-correct behavior (a written key is an accessed key) so it cannot regress.
     let mut st = store_with(Policy::cache_default());
-    // Hot key: insert, read several times (freq saturates past the promote threshold),
-    // then REPLACE it with a blind SET (the put_object freq-carry path under test).
+    // Hot key: insert, read several times (freq saturates), then REPLACE it with a blind
+    // SET (the freq-carry path under test).
     set(&mut st, b"hot");
     for _ in 0..3 {
         assert!(st.read(0, b"hot", UnixMillis(0)).is_some());
     }
     set(&mut st, b"hot"); // replace; the carried freq must survive
-    // Twenty never-touched cold one-hit-wonders inserted AFTER the hot key.
+    // Twenty never-touched cold one-hit-wonders (freq 0).
     for i in 0u32..20 {
         set(&mut st, format!("cold{i}").as_bytes());
     }
     let before = st.used_memory();
-    // Evict hard. The hot key (inserted first, so the front of small) is drawn first and
-    // PROMOTED to main (freq > 1), surviving; the cold keys are then freed to fit.
+    // Evict hard. The table scan sorts by ascending frequency: the cold keys (freq 0) are
+    // freed first to fit the budget; the hot key (high freq) is the LAST candidate and
+    // survives.
     let _ = st.evict_to_fit(400, UnixMillis(0));
     assert!(st.used_memory() < before, "eviction must free cold keys");
     assert!(
         st.read(0, b"cold0", UnixMillis(0)).is_none(),
-        "a cold one-hit-wonder is evicted"
+        "a cold one-hit-wonder is evicted (lowest freq first)"
     );
     assert!(
         st.read(0, b"hot", UnixMillis(0)).is_some(),
-        "a read-then-replaced hot key keeps its frequency and survives (carried, not reset)"
+        "a read-then-replaced hot key keeps its frequency and survives over cold keys"
     );
 }
 
@@ -266,22 +321,25 @@ fn volatile_re_eligibility_after_expire_attaches_a_ttl() {
 
 #[test]
 fn volatile_main_resident_ttl_victim_is_evicted_not_false_oom() {
-    // The #2 fix (false -OOM under volatile-only): a TTL key promoted into MAIN, with
-    // many non-TTL keys flooding the SMALL queue, must still be found and evicted rather
-    // than the scan tripping a premature -OOM while an evictable volatile key exists.
-    // The old consecutive-skip bound + re-register-into-small kept small over its ~10%
-    // target and STARVED main, so the main-resident TTL victim was never reached; the
-    // distinct-key bound + the lowest-priority re-offer queue reach it.
+    // Volatile-only over the batch-LFU table scan: a single TTL-bearing key, even one
+    // with a HIGH access frequency, surrounded by many never-accessed non-TTL keys, must
+    // still be found and evicted (it is the ONLY eligible victim) rather than the scan
+    // replying a premature -OOM while an evictable volatile key exists. The table scan
+    // collects only TTL-bearing live entries as candidates under volatile-only, so the
+    // single TTL key is always reachable regardless of its frequency; the non-TTL keys
+    // are never candidates. (Originally a regression guard for the old S3-FIFO
+    // small/main-starvation false-OOM bug, #2; the failure mode is structurally gone now
+    // that there are no queues, but the volatile-only correctness it asserts is pinned.)
     let mut st = store_with(Policy::S3Fifo(ironcache_eviction::S3Fifo::new(true)));
     assert!(st.policy_volatile_only());
 
-    // One TTL key, read several times so a later eviction PROMOTES it into MAIN (the
-    // S3-FIFO small->main promotion fires when a high-frequency small entry is drawn).
+    // One TTL key, read several times so it carries a HIGH frequency (it is still the only
+    // eligible victim under volatile-only, so frequency does not spare it here).
     set_ttl(&mut st, b"vol", 1_000_000);
     for _ in 0..5 {
         assert!(st.read(0, b"vol", UnixMillis(0)).is_some());
     }
-    // Many non-TTL keys flooding the small queue (well past small's ~10% target).
+    // Many never-accessed non-TTL keys (none is an eligible victim under volatile-only).
     for i in 0u32..30 {
         set(&mut st, format!("plain{i}").as_bytes());
     }
