@@ -312,6 +312,21 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         self
     }
 
+    /// Pre-size database `db`'s keyspace to hold at least `additional` more keys
+    /// without an intermediate rehash. A bulk-load and measurement seam: the
+    /// memory-model harness (BENCHMARK.md #8) reserves to the final key count so a
+    /// fill triggers no table resize, which lets it separate the per-entry data
+    /// cost (resize-free, key-count-independent) from the hash table's slot slack
+    /// (whose size is a function of capacity, not of the stored object). An
+    /// out-of-range `db` is a no-op. Purely additive: it touches no primitive
+    /// signature and changes no observable command behavior, only the table's
+    /// pre-allocated capacity.
+    pub fn reserve(&mut self, db: u32, additional: usize) {
+        if let Some(map) = self.dbs.get_mut(db as usize) {
+            map.reserve(additional);
+        }
+    }
+
     /// The WATCH write-funnel NOTIFY (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Called
     /// from the store-internal write funnel ([`Self::put_object`], [`Self::remove_object`],
     /// [`Self::remove_object_crediting`]) so EVERY create/overwrite/delete/expiry of a
