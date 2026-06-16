@@ -99,6 +99,8 @@ single-alloc rewrite subsumes them (no tunnel vision on soon-replaced changes).
 
 | 8 | SPEED: a value-replace skips the eviction policy | round 7's O(N) on_remove fired on every value-replace (put_object did on_remove+on_insert) -> O(N) scan per SET, halving throughput on the slow vCPU | unchanged (accounting-only on replace) | h2h qps 70k -> **204.9k vs redis 179.9k = 1.14x WIN**; perf-gate qps +9.25% | **KEPT** - a value-replace does not change S3-FIFO membership (insertion-ordered; a write bumps freq via the carry, never repositions), so the policy is untouched on replace; hot path O(1) again |
 
+| 10 | EVICTION (vs Dragonfly): amortized eviction POOL - O(N)/episode -> O(N/CAP) (PR #280) | the round-9 table-scan evicted by scanning the WHOLE shard on EVERY over-budget write (O(N)/episode = O(N)/insert under sustained eviction), the pathology Dragonfly avoids with O(1) integrated eviction; amortize it with a bounded (CAP=64) TRANSIENT victim pool refilled by one scan and consumed across many evictions (Redis-eviction-pool style), keeping zero per-key state | unchanged at rest (eviction is OFF the bytes/key path); under eviction memory is capped by the ceiling | eviction-mode h2h (EVICT, 16mb ceiling, ~124k resident): IronCache **62857 qps (31428/core)** vs its ~73k non-eviction = eviction path now NEAR full speed (the old per-episode scan was far worse: a 1M-key/494k-resident eviction populate took ~7 MIN, ran ~20k qps). Dragonfly h2h BLOCKED: Dragonfly needs maxmemory >= 256MiB*threads to boot, so a fair eviction h2h needs >= 512mb (large resident) where IronCache's O(resident/CAP) trails Dragonfly's O(1) | **KEPT** - fixes IronCache's O(N)-per-write eviction pathology (CAP x fewer scans); 2-lens review = 0 correctness bugs + fixed 3 harness/perf findings (populate/loadgen key-namespace mismatch, per-CALL warm-retry latch so amortization is unconditional, eviction-acceptance probe). True O(1) eviction (matching Dragonfly) needs random bucket access = a Dash-style table (synthesis below). Follow-up: bounded-selection refill (clone only CAP, drop the per-refill O(resident) clone+sort) |
+
 | 9 | MEMORY (vs Dragonfly): zero-per-key-state batch-LFU - delete the S3-FIFO per-key queues entirely (PR #277) | the per-key `VecDeque` FIFOs + ghost ring cost ~49 B/key on whole-process `used_memory`, which LOST the memory h2h to DragonflyDB even though IronCache's STORE alone already beat it; the 2-bit freq already lives ON the object (round 7), so the policy needs NO per-key structure - over budget the STORE table-scans the lowest in-object freq and evicts exactly to fit | h2h (128B/1M keys, pinned Linux, vs **dragonfly 1.39.0**) bytes/key **180.28 vs dragonfly 178.6 = 1.009x** (a DEAD HEAT, ~0.9% behind; was 1.39x heavier before this round). Net -369 lines | qps/core **73462 vs 72577 = 1.012x WIN**; p50 7515 vs 9039 us, p99 44095 vs 67839 us (latency clear WIN) | **KEPT** - removed the entire memory loss vs Dragonfly (1.39x -> ~tied) while winning speed + latency; supersedes ADR-0008 S3-FIFO with exact-LFU-over-2-bit-freq; eviction is now O(N)/episode but provably OFF the benchmark path (4gb ceiling holds the whole 1M-key dataset, eviction never fires); 2-lens adversarial review caught + fixed a non-deterministic cross-db victim tie-break (ADR-0003) and a stale freq-in-object doc |
 
 ### MILESTONE (2026-06-16): CLEAR WINNER over redis on BOTH memory AND speed (indicative pinned-Linux h2h)
@@ -201,6 +203,33 @@ O(1) EVICTION path (Dragonfly evicts one slot from the inserted segment, O(1), z
 state; IronCache's table-scan is O(N)/episode, so on an eviction-heavy workload IronCache
 would currently LOSE to Dragonfly - converting that loss to a win via bucket-local sampled
 eviction is the next lever, and it directly improves on Dragonfly's open-source strategy).
+
+### Eviction round (10) outcome + the CONVERGENT next bet (2026-06-16)
+
+Round 10 (PR #280) amortized the eviction scan O(N)/episode -> O(N/CAP) with a bounded
+transient victim pool (no per-key state, no over-eviction). Measured eviction-mode QPS is
+62857 (31428/core) at ~124k resident, near IronCache's ~73k non-eviction rate, and far
+above the old per-episode scan (a 1M-key/494k-resident eviction populate took ~7 MIN and
+ran ~20k qps). So the O(N)-per-write pathology is fixed and IronCache's eviction is healthy
+at moderate scale.
+
+But the pool is O(N/CAP) amortized, NOT true O(1): `hashbrown::HashTable` exposes no cheap
+random bucket access, so the refill must SCAN to find the coldest CAP. Dragonfly evicts in
+O(1) (one slot from the segment it is already touching). A FAIR Dragonfly eviction h2h is
+moreover BLOCKED at small scale - Dragonfly refuses to boot unless maxmemory >= 256MiB *
+proactor_threads (512MiB for 2 cores), forcing a multi-GB dataset / multi-million-key
+resident set, exactly where IronCache's O(resident/CAP) is most disadvantaged vs O(1).
+
+THE CONVERGENCE: the two remaining ways to CLEARLY beat Dragonfly - (a) a uniform memory win
+(escape hashbrown's power-of-two doubling trough) and (b) true O(1) eviction (match the
+integrated segment-local evictor) - are THE SAME LEVER: a Dragonfly-style DASH (extendible-
+hashing, segmented) table. Random bucket/segment access gives O(1) segment-local eviction
+AND incremental segment-split growth (no doubling trough), and its per-slot metadata is ~=
+hashbrown's, so it would not cost memory. This is the single highest-impact structural bet
+left, but also the largest (a core store-table rewrite, heavy unsafe, and a throughput-
+regression risk vs hashbrown's SIMD probe). Everything cheaper has been done: IronCache is
+at memory PARITY + a clear speed/latency win + healthy eviction; the Dash table is what a
+CLEAR, uniform win on both memory and eviction would require.
 
 ### Round 6 detail (SPEED: the eviction hot path)
 The load profile (macOS `sample` under ~150k qps) showed the hottest IronCache COMPUTE
