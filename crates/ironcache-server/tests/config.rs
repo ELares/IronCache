@@ -49,6 +49,8 @@ fn ctx(runtime: Arc<RuntimeConfig>, boot: Config) -> ServerContext {
             maxmemory: boot.maxmemory,
             maxmemory_policy: "allkeys-lru",
             mem_allocator: "jemalloc",
+            cluster_node_id: "0000000000000000000000000000000000000000",
+            cluster_enabled: false,
         },
         boot,
     }

@@ -400,6 +400,19 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             denyoom: false,
             control: false,
         },
+        // CLUSTER (CLUSTER_CONTRACT.md #70, slice 1): the read-only/introspection CLUSTER
+        // surface. Like CONFIG it is an admin container command: AlwaysHome (never
+        // key-routed -- KEYSLOT computes the slot of an ARGUMENT but the command itself
+        // owns no key), arity Min(2) (the token plus a subcommand), not denyoom, not a txn
+        // control verb.
+        b"CLUSTER" => &CommandSpec {
+            name: b"CLUSTER",
+            arity: Min(2),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+        },
         // -- Transaction control (cmd_txn / dispatch). The 6 control verbs (control: true)
         // bypass MULTI queueing; WATCH/UNWATCH arities are -2 / 1 (src/commands.def). --
         b"MULTI" => &CommandSpec {

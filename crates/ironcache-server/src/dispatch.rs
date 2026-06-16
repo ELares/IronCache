@@ -12,8 +12,8 @@
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{
-    cmd_bitmap, cmd_config, cmd_expire, cmd_hash, cmd_hll, cmd_introspect, cmd_keyspace, cmd_list,
-    cmd_set, cmd_string, cmd_txn, cmd_zset,
+    cmd_bitmap, cmd_cluster, cmd_config, cmd_expire, cmd_hash, cmd_hll, cmd_introspect,
+    cmd_keyspace, cmd_list, cmd_set, cmd_string, cmd_txn, cmd_zset,
 };
 use ironcache_config::{Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
@@ -535,6 +535,11 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // shard's counter reset via `deltas.reset_stats` (the serve loop honors it in
         // ShardCounters::apply); the serving-shard scope is documented in cmd_config.
         b"CONFIG" => cmd_config::cmd_config(ctx, deltas, req),
+        // CLUSTER (cluster-disabled-but-introspectable, CLUSTER_CONTRACT.md #70, slice 1):
+        // the read-only CLUSTER surface (KEYSLOT/MYID/INFO/SLOTS/SHARDS/NODES/...) plus the
+        // cluster-disabled reject for mutating subcommands. AlwaysHome, never key-routed; it
+        // reads only ctx.info (node id, listen addr, cluster_enabled). No store/wheel/state.
+        b"CLUSTER" => cmd_cluster::cmd_cluster(ctx, req),
         // Every OTHER command is a KEYED-DATA command (or an unknown token): it touches
         // only store/wheel/db/now (+ env for the RNG-drawing members), NO ConnState. The
         // bodies live in [`dispatch_keyed_data`], the SINGLE keyed-arm definition that
@@ -1600,6 +1605,8 @@ mod tests {
                 maxmemory,
                 maxmemory_policy: "allkeys-lru",
                 mem_allocator: "jemalloc",
+                cluster_node_id: "0000000000000000000000000000000000000000",
+                cluster_enabled: false,
             },
             boot,
         }

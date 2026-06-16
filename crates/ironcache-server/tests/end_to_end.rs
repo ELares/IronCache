@@ -45,6 +45,10 @@ fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
             maxmemory: 0,
             maxmemory_policy: "allkeys-lru",
             mem_allocator: "jemalloc",
+            // A fixed 40-hex node id for the test harness (the real binary draws one at
+            // boot from the SystemEnv RNG); cluster mode off (CLUSTER_CONTRACT.md #70).
+            cluster_node_id: "abcdef0123456789abcdef0123456789abcdef01",
+            cluster_enabled: false,
         },
         boot,
     }
@@ -1531,6 +1535,130 @@ fn watch_multi_exec_over_real_socket() {
         expect_reply(&mut c2, b"+OK\r\n").await;
         drop(c1);
         drop(c2);
+        acceptor.await.unwrap();
+    });
+}
+
+/// CLUSTER command surface (cluster-disabled-but-introspectable, CLUSTER_CONTRACT.md #70,
+/// slice 1) over a real socket: KEYSLOT (CRC16/XMODEM + hash-tag co-location), MYID
+/// (40-hex), INFO (the exact disabled lines), SLOTS/SHARDS (empty arrays),
+/// COUNTKEYSINSLOT (bounds-checked), and the INFO `# Cluster` section.
+#[test]
+fn cluster_commands_over_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // CLUSTER KEYSLOT foo -> :12182 (the reference CRC16/XMODEM vector).
+        client
+            .write_all(b"*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$3\r\nfoo\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":12182\r\n").await;
+
+        // CLUSTER KEYSLOT of two hash-tag-co-located keys must be EQUAL (both hash by
+        // `user1000`).
+        client
+            .write_all(b"*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$20\r\n{user1000}.following\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3443\r\n").await;
+        client
+            .write_all(b"*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$20\r\n{user1000}.followers\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":3443\r\n").await;
+
+        // CLUSTER MYID -> a 40-char lowercase-hex bulk string.
+        client
+            .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$4\r\nMYID\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = client.read(&mut buf).await.unwrap();
+        // Expect `$40\r\n<40 hex>\r\n`.
+        assert!(buf.starts_with(b"$40\r\n"), "got {:?}", &buf[..n]);
+        let id = &buf[5..45];
+        assert!(
+            id.iter()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "MYID is not 40 lowercase hex: {:?}",
+            String::from_utf8_lossy(id)
+        );
+
+        // CLUSTER INFO -> a bulk string containing the disabled-mode lines.
+        client
+            .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n")
+            .await
+            .unwrap();
+        let mut ibuf = [0u8; 1024];
+        let inn = client.read(&mut ibuf).await.unwrap();
+        let info = String::from_utf8_lossy(&ibuf[..inn]);
+        assert!(info.contains("cluster_enabled:0"), "got {info}");
+        assert!(info.contains("cluster_state:ok"), "got {info}");
+        assert!(info.contains("cluster_slots_assigned:0"), "got {info}");
+
+        // CLUSTER SLOTS -> empty array (*0); CLUSTER SHARDS -> empty array (*0).
+        client
+            .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"*0\r\n").await;
+        client
+            .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$6\r\nSHARDS\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b"*0\r\n").await;
+
+        // CLUSTER COUNTKEYSINSLOT 0 -> :0; an out-of-bounds slot -> an -ERR.
+        client
+            .write_all(b"*3\r\n$7\r\nCLUSTER\r\n$15\r\nCOUNTKEYSINSLOT\r\n$1\r\n0\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":0\r\n").await;
+        client
+            .write_all(b"*3\r\n$7\r\nCLUSTER\r\n$15\r\nCOUNTKEYSINSLOT\r\n$5\r\n99999\r\n")
+            .await
+            .unwrap();
+        let mut ebuf = [0u8; 128];
+        let en = client.read(&mut ebuf).await.unwrap();
+        assert!(
+            ebuf.starts_with(b"-ERR"),
+            "out-of-bounds slot should be an -ERR, got {:?}",
+            String::from_utf8_lossy(&ebuf[..en])
+        );
+
+        // INFO cluster -> contains `cluster_enabled:0` (consistent with CLUSTER INFO).
+        client
+            .write_all(b"*2\r\n$4\r\nINFO\r\n$7\r\ncluster\r\n")
+            .await
+            .unwrap();
+        let mut cbuf = [0u8; 1024];
+        let cn = client.read(&mut cbuf).await.unwrap();
+        let cluster_info = String::from_utf8_lossy(&cbuf[..cn]);
+        assert!(cluster_info.contains("# Cluster"), "got {cluster_info}");
+        assert!(
+            cluster_info.contains("cluster_enabled:0"),
+            "got {cluster_info}"
+        );
+
+        client.write_all(b"*1\r\n$4\r\nQUIT\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
         acceptor.await.unwrap();
     });
 }

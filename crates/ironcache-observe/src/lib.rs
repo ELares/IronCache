@@ -206,6 +206,18 @@ pub struct ServerInfo {
     /// the same cfg that picks the `#[global_allocator]`, so INFO never claims
     /// jemalloc on a build that linked the system allocator.
     pub mem_allocator: &'static str,
+    /// The stable 40-lowercase-hex cluster node id, generated ONCE at boot through the
+    /// determinism seam (ADR-0003: drawn from the binary's `SystemEnv` RNG in
+    /// `serve::run_server`, then leaked to `'static`), identical across shards
+    /// (CLUSTER_CONTRACT.md #70). Reported by `CLUSTER MYID` / `CLUSTER NODES`. A real
+    /// Redis assigns a 40-hex node id whether or not cluster mode is on, and so does
+    /// IronCache.
+    pub cluster_node_id: &'static str,
+    /// Whether the server booted in cluster mode (Redis `cluster-enabled`,
+    /// CLUSTER_CONTRACT.md #70). Reported by the INFO `# Cluster` section
+    /// (`cluster_enabled:0/1`) and `CLUSTER INFO`. Slice 1 is cluster-disabled, so this is
+    /// `false` in practice; the field is sourced from config so a later slice can flip it.
+    pub cluster_enabled: bool,
 }
 
 /// A memory snapshot for the INFO `memory` section (ADR-0006, OBSERVABILITY.md).
@@ -353,6 +365,20 @@ pub fn build_info<C: Clock>(
         let _ = write!(out, "keyspace_misses:{}\r\n", rolled.keyspace_misses);
         out.push_str("\r\n");
     }
+    if want("cluster") {
+        // The `# Cluster` section (CLUSTER_CONTRACT.md #70). Redis emits this section
+        // (after Stats) whether or not cluster mode is on; the single `cluster_enabled`
+        // field is `0` when disabled and `1` when enabled, sourced from config and kept
+        // consistent with `CLUSTER INFO`'s `cluster_enabled:` line. Slice 1 is
+        // cluster-disabled, so this reports `0`.
+        out.push_str("# Cluster\r\n");
+        let _ = write!(
+            out,
+            "cluster_enabled:{}\r\n",
+            u8::from(server.cluster_enabled)
+        );
+        out.push_str("\r\n");
+    }
     out
 }
 
@@ -399,6 +425,8 @@ mod tests {
             maxmemory: 0,
             maxmemory_policy: "allkeys-lru",
             mem_allocator: "jemalloc",
+            cluster_node_id: "0000000000000000000000000000000000000000",
+            cluster_enabled: false,
         }
     }
 
@@ -425,6 +453,10 @@ mod tests {
         assert!(body.contains("# Clients\r\n"));
         assert!(body.contains("# Memory\r\n"));
         assert!(body.contains("# Stats\r\n"));
+        // The `# Cluster` section reports cluster_enabled:0 in the cluster-disabled
+        // default (CLUSTER_CONTRACT.md #70).
+        assert!(body.contains("# Cluster\r\n"));
+        assert!(body.contains("cluster_enabled:0\r\n"));
         assert!(body.contains("tcp_port:6379\r\n"));
         assert!(body.contains("connected_clients:0\r\n"));
         assert!(body.contains("mem_allocator:jemalloc\r\n"));
@@ -552,6 +584,20 @@ mod tests {
         );
         assert!(only_server.contains("# Server\r\n"));
         assert!(!only_server.contains("# Memory\r\n"));
+        // The `# Cluster` section is gated by the filter too: a server-only INFO omits it.
+        assert!(!only_server.contains("# Cluster\r\n"));
+        // Asking for the cluster section yields it with the disabled flag.
+        let only_cluster = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            Some("cluster"),
+        );
+        assert!(only_cluster.contains("# Cluster\r\n"));
+        assert!(only_cluster.contains("cluster_enabled:0\r\n"));
+        assert!(!only_cluster.contains("# Server\r\n"));
     }
 
     #[test]

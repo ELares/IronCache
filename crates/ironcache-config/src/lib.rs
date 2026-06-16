@@ -200,6 +200,14 @@ pub struct Config {
     /// Idle timeout in seconds; `0` disables idle disconnection (Redis default 0,
     /// CONNECTION_LIFECYCLE.md).
     pub timeout_secs: u64,
+    /// Whether the server runs in cluster mode (Redis `cluster-enabled`,
+    /// CLUSTER_CONTRACT.md #70). BOOT-ONLY (immutable at runtime, like Redis): it is
+    /// reported by `CLUSTER INFO` (`cluster_enabled:0/1`) and the INFO `# Cluster`
+    /// section, and gates the mutating CLUSTER subcommands. Defaults to `false`
+    /// (cluster-disabled), matching a standalone Redis. Slice 1 only ever observes
+    /// `false`: it adds the read-only CLUSTER introspection surface without any routing
+    /// change; turning this on is a later slice.
+    pub cluster_enabled: bool,
 }
 
 impl Default for Config {
@@ -224,6 +232,9 @@ impl Default for Config {
             maxmemory_policy: "allkeys-lru".to_owned(),
             requirepass: None,
             timeout_secs: 0,
+            // Standalone by default (Redis `cluster-enabled no`). Slice 1 is
+            // cluster-disabled-but-introspectable (CLUSTER_CONTRACT.md #70).
+            cluster_enabled: false,
         }
     }
 }
@@ -363,6 +374,9 @@ pub struct ConfigOverlay {
     pub requirepass: Option<String>,
     /// Idle timeout in seconds.
     pub timeout: Option<u64>,
+    /// Whether to run in cluster mode (Redis `cluster-enabled`, CLUSTER_CONTRACT.md #70).
+    /// Boot-only; `None` leaves the lower layer (default `false`) showing through.
+    pub cluster_enabled: Option<bool>,
 }
 
 impl ConfigOverlay {
@@ -412,6 +426,12 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_REQUIREPASS") {
             o.requirepass = Some(v);
         }
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_ENABLED") {
+            o.cluster_enabled = Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
+                field: "cluster-enabled",
+                reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
+            })?);
+        }
         Ok(o)
     }
 
@@ -454,6 +474,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.timeout {
             cfg.timeout_secs = v;
+        }
+        if let Some(v) = self.cluster_enabled {
+            cfg.cluster_enabled = v;
         }
         Ok(())
     }
@@ -518,6 +541,19 @@ pub fn parse_human_size(s: &str) -> Result<u64, ConfigError> {
     })
 }
 
+/// Parse a boolean config value, accepting both the Redis spellings (`yes`/`no`) and the
+/// common `true`/`false`/`1`/`0` forms, case-insensitively with surrounding whitespace
+/// trimmed. Returns `None` on any other token (the caller maps it to a config error).
+/// Used by the `IRONCACHE_CLUSTER_ENABLED` env var.
+#[must_use]
+pub fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "yes" | "true" | "1" | "on" => Some(true),
+        "no" | "false" | "0" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +569,32 @@ mod tests {
         assert_eq!(c.maxmemory_policy, "allkeys-lru");
         assert_ne!(c.maxmemory_policy, "noeviction");
         assert!(c.requirepass.is_none());
+        // Cluster mode is OFF by default (standalone, Redis `cluster-enabled no`).
+        assert!(!c.cluster_enabled);
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn cluster_enabled_overlay_and_parse_bool() {
+        // The overlay sets the boot-only cluster flag; default is false.
+        let on = Config::resolve(&[ConfigOverlay {
+            cluster_enabled: Some(true),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert!(on.cluster_enabled);
+        let off = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert!(!off.cluster_enabled);
+        // parse_bool accepts the Redis yes/no spellings plus true/false/1/0/on/off
+        // (case-insensitive, trimmed) and rejects anything else.
+        for t in ["yes", "TRUE", " 1 ", "on"] {
+            assert_eq!(parse_bool(t), Some(true), "{t:?} should be true");
+        }
+        for f in ["no", "False", "0", "OFF"] {
+            assert_eq!(parse_bool(f), Some(false), "{f:?} should be false");
+        }
+        assert_eq!(parse_bool("maybe"), None);
+        assert_eq!(parse_bool(""), None);
     }
 
     #[test]
