@@ -74,6 +74,16 @@ HOST="127.0.0.1"                         # loopback, always (isolation).
 # so the measurement never evicts. The competitor runs with --maxmemory 0 (off).
 MAXMEMORY="${MAXMEMORY:-4gb}"
 
+# EVICTION WORKLOAD mode (default OFF = the standard never-evict measurement). When EVICT=1
+# the caller sets MAXMEMORY LOW (below the dataset) so eviction fires continuously, and
+# every server is booted in its EVICTING cache mode (IronCache: its default allkeys-lru
+# under a low IRONCACHE_MAXMEMORY; Dragonfly: --cache_mode true; redis/valkey:
+# --maxmemory <low> --maxmemory-policy allkeys-lru). The populate then INTENTIONALLY
+# exceeds the ceiling, so DBSIZE < KEYCOUNT is EXPECTED (keys evict during populate) and is
+# tolerated; the bytes-per-key number is not meaningful under eviction but is still emitted.
+# The script does NOT override MAXMEMORY itself - the caller picks the low ceiling.
+EVICT="${EVICT:-0}"
+
 # The pinned competitor version (the published bar). Used to WARN on a version mismatch.
 PINNED_VALKEY_VERSION="9.1.0"
 
@@ -120,6 +130,14 @@ if [[ "${SMOKE}" == "1" ]]; then
   CONNECTIONS=4
   RATE=2000
   echo "[h2h] SMOKE mode: tiny durations/keyspace/keycount; results are NOT publishable."
+fi
+
+# Announce EVICTION mode (the caller is responsible for a LOW MAXMEMORY below the dataset).
+if [[ "${EVICT}" == "1" ]]; then
+  echo "[h2h] EVICTION mode ON: every server boots in its evicting cache mode under"
+  echo "[h2h] MAXMEMORY=${MAXMEMORY} (caller-set, expected BELOW the dataset). The populate"
+  echo "[h2h] will exceed the ceiling, so DBSIZE < KEYCOUNT is EXPECTED and tolerated; the"
+  echo "[h2h] bytes-per-key number is not meaningful under continuous eviction."
 fi
 
 # ---------------------------------------------------------------------------
@@ -427,6 +445,14 @@ populate_keys() {
   local dbsize
   dbsize="$(redis-cli -h "${HOST}" -p "${PORT}" DBSIZE 2>/dev/null | tr -dc '0-9')"
   [[ -n "${dbsize}" ]] || dbsize=0
+  # EVICTION mode: the populate INTENTIONALLY exceeds maxmemory, so keys evict DURING the
+  # populate and DBSIZE < n is EXPECTED (the whole point of this mode). Tolerate it - just
+  # note the resident count - instead of failing the run. The bytes-per-key figure is not
+  # meaningful under eviction, but the run must complete so the throughput pass can run.
+  if [[ "${EVICT}" == "1" ]]; then
+    echo "[h2h] EVICTION mode: ${dbsize}/${n} keys resident after populate (eviction during fill is expected)."
+    return 0
+  fi
   if [[ "${dbsize}" -lt "${n}" ]]; then
     echo "error: populate landed only ${dbsize}/${n} keys on ${HOST}:${PORT} (DBSIZE verify)" >&2
     return 1
@@ -506,6 +532,11 @@ measure_server() {
     # so a probe compares RAW qps across shard counts.
     local ic_shards="${IRONCACHE_SHARDS:-${SERVER_CORE_COUNT}}"
     echo "[h2h] starting ${name} on ${HOST}:${PORT} (shards=${ic_shards} over ${SERVER_CORE_COUNT} pinned cores, maxmemory=${MAXMEMORY})..."
+    if [[ "${EVICT}" == "1" ]]; then
+      # No boot change needed: IronCache defaults to maxmemory-policy allkeys-lru, so under
+      # the caller's low IRONCACHE_MAXMEMORY it EVICTS to fit. Just note that eviction is on.
+      echo "[h2h] ${name}: EVICTION mode (default allkeys-lru under IRONCACHE_MAXMEMORY=${MAXMEMORY})."
+    fi
     # Set IRONCACHE_SHARDS to the RESOLVED numeric value on the launch (not just the
     # --shards flag): the binary ALSO reads IRONCACHE_SHARDS from its env-config, and an
     # EMPTY inherited value (e.g. a blank workflow input flowing in as IRONCACHE_SHARDS="")
@@ -523,20 +554,37 @@ measure_server() {
     # `--dbfilename`. A GENEROUS `--maxmemory` (not 0 - Dragonfly requires a positive
     # ceiling) so the populate never evicts, matching IronCache's overlay. Dragonfly uses
     # io_uring by default on a modern kernel (the runner is 6.x); no fallback flag needed.
+    # EVICTION mode: Dragonfly only EVICTS in cache mode (its default REJECTS writes with
+    # OOM once maxmemory is hit). `--cache_mode true` turns on item eviction. Injected only
+    # when EVICT=1; the standard run leaves it off (the generous ceiling never evicts anyway).
+    local df_cache_flag=()
+    if [[ "${EVICT}" == "1" ]]; then
+      df_cache_flag=(--cache_mode true)
+      echo "[h2h] ${name}: EVICTION mode (--cache_mode true under maxmemory=${MAXMEMORY})."
+    fi
     echo "[h2h] starting ${name} on ${HOST}:${PORT} (proactor_threads=${SERVER_CORE_COUNT}, maxmemory=${MAXMEMORY}, snapshots off)..."
     ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
       --port "${PORT}" --bind "${HOST}" --proactor_threads "${SERVER_CORE_COUNT}" \
       --maxmemory "${MAXMEMORY}" --dbfilename '' --primary_port_http_enabled=false \
+      ${df_cache_flag[@]+"${df_cache_flag[@]}"} \
       >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
   else
-    # Valkey / Redis. Persistence off (--save '' --appendonly no), eviction off
-    # (--maxmemory 0). --io-threads lets the server use the pinned cores; if the build
-    # rejects the flag we retry without it and note it.
-    echo "[h2h] starting ${name} on ${HOST}:${PORT} (io-threads=${SERVER_CORE_COUNT}, maxmemory off, persistence off)..."
+    # Valkey / Redis. Persistence off (--save '' --appendonly no). EVICTION: off by default
+    # (--maxmemory 0); when EVICT=1 a LOW ceiling + allkeys-lru so writes EVICT instead of
+    # erroring. --io-threads lets the server use the pinned cores; if the build rejects the
+    # flag we retry without it and note it. The maxmemory args are built ONCE here and reused
+    # in both the initial and the fallback launch so the two stay in lockstep.
+    local rv_mem_args=(--maxmemory 0)
+    local rv_mem_desc="maxmemory off"
+    if [[ "${EVICT}" == "1" ]]; then
+      rv_mem_args=(--maxmemory "${MAXMEMORY}" --maxmemory-policy allkeys-lru)
+      rv_mem_desc="maxmemory=${MAXMEMORY} policy=allkeys-lru (EVICTION mode)"
+    fi
+    echo "[h2h] starting ${name} on ${HOST}:${PORT} (io-threads=${SERVER_CORE_COUNT}, ${rv_mem_desc}, persistence off)..."
     ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
       --port "${PORT}" --bind "${HOST}" --save '' --appendonly no \
-      --maxmemory 0 --daemonize no --io-threads "${SERVER_CORE_COUNT}" \
+      "${rv_mem_args[@]}" --daemonize no --io-threads "${SERVER_CORE_COUNT}" \
       >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
     # Detect an immediate exit caused by an unsupported flag (e.g. --io-threads) and
@@ -549,7 +597,7 @@ measure_server() {
       if ! port_free; then sleep 0.5; fi
       ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
         --port "${PORT}" --bind "${HOST}" --save '' --appendonly no \
-        --maxmemory 0 --daemonize no \
+        "${rv_mem_args[@]}" --daemonize no \
         >"${SERVER_LOG}" 2>&1 &
       SERVER_PID=$!
     fi
@@ -659,6 +707,7 @@ COMPETITOR_BIN_ESC="${COMPETITOR_BIN_ESC//\"/\\\"}"
 if [[ "${PINNED}" -eq 1 ]]; then PINNED_BOOL="true"; else PINNED_BOOL="false"; fi
 if [[ "${SMOKE}" == "1" ]]; then SMOKE_BOOL="true"; else SMOKE_BOOL="false"; fi
 if [[ "${STANDIN}" -eq 1 ]]; then STANDIN_BOOL="true"; else STANDIN_BOOL="false"; fi
+if [[ "${EVICT}" == "1" ]]; then EVICT_BOOL="true"; else EVICT_BOOL="false"; fi
 # indicative_only is the CONSERVATIVE headline flag: the verdict is non-authoritative
 # if the competitor was a stand-in / version mismatch (STANDIN), OR the run was SMOKE
 # (tiny, not publishable), OR it was UNPINNED (no disjoint server/client cores). A
@@ -704,7 +753,8 @@ cat >"${H2H_JSON}" <<EOF
     "connections": ${CONNECTIONS},
     "rate": ${RATE},
     "port": ${PORT},
-    "ironcache_maxmemory": "${MAXMEMORY}"
+    "ironcache_maxmemory": "${MAXMEMORY}",
+    "eviction": ${EVICT_BOOL}
   },
   "competitor_resolution": {
     "binary": "${COMPETITOR_BIN_ESC}",
