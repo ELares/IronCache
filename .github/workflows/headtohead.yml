@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# On-demand IronCache vs competitor HEAD-TO-HEAD on a LINUX runner (BENCHMARK.md #8 /
+# #96, the A4 harness). This exists because the per-PR perf-gate only ratchets IronCache
+# against ITSELF (HEAD vs merge-base); it never measures IronCache against redis/valkey.
+# This job runs scripts/bench/headtohead.sh on ubuntu-latest, where (unlike the macOS dev
+# box) SO_REUSEPORT load-balances AND `taskset` exists, so the server and load generator
+# run on DISJOINT pinned cores. That makes the throughput comparison far cleaner than the
+# contention-bound macOS run.
+#
+# HONESTY: a GitHub-hosted runner is a small (4 vCPU), shared, virtualized box, so this is
+# INDICATIVE, not publishable. The authoritative verdict still needs a dedicated
+# bare-metal pinned-Linux runner vs the pinned valkey-server 9.1.0 (docs/bench/
+# COMPETITORS.md). This job answers the OPEN question the macOS run could not: on Linux
+# (working SO_REUSEPORT + core pinning), is IronCache's per-core throughput competitive?
+#
+# workflow_dispatch only (never on push/PR): it is a manual measurement, not a gate.
+name: headtohead
+
+on:
+  workflow_dispatch:
+    inputs:
+      competitor:
+        description: "Competitor server to install and measure against."
+        type: choice
+        default: redis
+        options:
+          - redis
+          - valkey
+      value_size:
+        description: "SET value bytes (also the bytes-per-key value size)."
+        type: string
+        default: "128"
+      keycount:
+        description: "Distinct keys populated for the bytes-per-key measurement."
+        type: string
+        default: "200000"
+      duration_secs:
+        description: "Measured closed-loop pass duration (seconds)."
+        type: string
+        default: "8"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard (skip until a Cargo project exists)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_cargo: ${{ steps.check.outputs.has_cargo }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] && [ -f Cargo.lock ]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::repo is docs-only (no Cargo.toml/Cargo.lock); headtohead is a no-op"
+          fi
+
+  headtohead:
+    name: headtohead (IronCache vs competitor, pinned Linux)
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # NATIVE release build (the runner's own arch), so only the stable toolchain.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2
+
+      # redis-cli is required by the harness (readiness PING, INFO used_memory, --pipe
+      # populate). util-linux provides `taskset` (present by default, installed
+      # defensively) so the harness pins the server and client to disjoint cores.
+      - name: Install redis-tools + taskset
+        run: sudo apt-get update && sudo apt-get install -y redis-tools util-linux
+
+      # Install the chosen competitor server. apt's version is whatever the runner's
+      # Ubuntu ships (redis ~7.x, valkey ~7.2.x), so the harness flags the verdict as a
+      # version-mismatch STAND-IN; that is fine for the Linux per-core throughput signal.
+      - name: Install competitor (${{ inputs.competitor }})
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.competitor }}" = "valkey" ]; then
+            sudo apt-get install -y valkey-server || sudo apt-get install -y redis-server
+          else
+            sudo apt-get install -y redis-server
+          fi
+
+      - name: Run head-to-head (auto-pinned via taskset)
+        env:
+          VALUE_SIZE: ${{ inputs.value_size }}
+          KEYCOUNT: ${{ inputs.keycount }}
+          KEYSPACE: ${{ inputs.keycount }}
+          DURATION_SECS: ${{ inputs.duration_secs }}
+          WARMUP_SECS: "3"
+        run: |
+          set -euo pipefail
+          # The harness resolves the competitor (valkey-server, else redis-server),
+          # auto-pins on Linux (taskset present), and writes headtohead.json + per-server
+          # artifacts to the out dir. It never fails the job: the ADR-0017 verdict is
+          # reported, not enforced (this is a measurement, not a gate).
+          bash scripts/bench/headtohead.sh --out-dir "${RUNNER_TEMP}/h2h"
+
+      - name: Summarize verdict to the job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          J="${RUNNER_TEMP}/h2h/headtohead.json"
+          if [ -f "$J" ]; then
+            {
+              echo "## head-to-head (pinned Linux, INDICATIVE)"
+              echo '```json'
+              cat "$J"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::no headtohead.json produced"
+          fi
+
+      - name: Upload head-to-head artifacts
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: headtohead-${{ inputs.competitor }}-linux
+          path: ${{ runner.temp }}/h2h/
+          if-no-files-found: warn
