@@ -561,12 +561,14 @@ measure_server() {
     # ceiling) so the populate never evicts, matching IronCache's overlay. Dragonfly uses
     # io_uring by default on a modern kernel (the runner is 6.x); no fallback flag needed.
     # EVICTION mode: Dragonfly only EVICTS in cache mode (its default REJECTS writes with
-    # OOM once maxmemory is hit). `--cache_mode true` turns on item eviction. Injected only
-    # when EVICT=1; the standard run leaves it off (the generous ceiling never evicts anyway).
+    # OOM once maxmemory is hit). `--cache_mode=true` turns on item eviction. Dragonfly uses
+    # gflags, which require the `--flag=value` form: the space form `--cache_mode true` makes
+    # gflags treat `true` as a stray positional arg and ABORT at boot. Injected only when
+    # EVICT=1; the standard run leaves it off (the generous ceiling never evicts anyway).
     local df_cache_flag=()
     if [[ "${EVICT}" == "1" ]]; then
-      df_cache_flag=(--cache_mode true)
-      echo "[h2h] ${name}: EVICTION mode (--cache_mode true under maxmemory=${MAXMEMORY})."
+      df_cache_flag=(--cache_mode=true)
+      echo "[h2h] ${name}: EVICTION mode (--cache_mode=true under maxmemory=${MAXMEMORY})."
     fi
     echo "[h2h] starting ${name} on ${HOST}:${PORT} (proactor_threads=${SERVER_CORE_COUNT}, maxmemory=${MAXMEMORY}, snapshots off)..."
     ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
