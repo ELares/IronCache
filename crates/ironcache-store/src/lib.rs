@@ -576,13 +576,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             kvobj::ValueRepr::Int(n) => {
                 ValueRef::from_int_bytes(obj.header.data_type, obj.expire_at, int_decimal_bytes(*n))
             }
-            kvobj::ValueRepr::Inline(b) => ValueRef::borrowed(
-                obj.header.data_type,
-                obj.header.encoding,
-                obj.expire_at,
-                b.as_bytes(),
-            ),
-            kvobj::ValueRepr::Raw(b) => {
+            // Embstr and raw both borrow their bytes the same way; the embstr-vs-raw
+            // distinction is carried by `obj.header.encoding`, not the variant.
+            kvobj::ValueRepr::Inline(b) | kvobj::ValueRepr::Raw(b) => {
                 ValueRef::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
             // A LIST/HASH/SET is not byte-readable as a string: the command layer only
@@ -612,13 +608,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 obj.expire_at,
                 int_decimal_bytes(*n),
             ),
-            kvobj::ValueRepr::Inline(b) => OccupiedEntry::borrowed(
-                obj.header.data_type,
-                obj.header.encoding,
-                obj.expire_at,
-                b.as_bytes(),
-            ),
-            kvobj::ValueRepr::Raw(b) => {
+            // Embstr and raw both borrow their bytes the same way; the embstr-vs-raw
+            // distinction is carried by `obj.header.encoding`, not the variant.
+            kvobj::ValueRepr::Inline(b) | kvobj::ValueRepr::Raw(b) => {
                 OccupiedEntry::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
             // A LIST/HASH/SET observed through the READ-ONLY rmw arm (e.g. a numeric RMW
@@ -823,17 +815,20 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // would each take and drop a fresh `&mut` and obscure the dispatch) so each
             // collection type maps to exactly one arm.
             let entry = match &mut obj.value {
+                // The collection variants are boxed (memory Round 1); deref through the
+                // `Box` (`&mut **`) to the concrete `&mut *Val`, which then coerces to the
+                // `&mut dyn *Value` trait object the typed view constructors take.
                 kvobj::ValueRepr::List(l) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, l))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, &mut **l))
                 }
                 kvobj::ValueRepr::Hash(h) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, h))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, &mut **h))
                 }
                 kvobj::ValueRepr::Set(s) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, s))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, &mut **s))
                 }
                 kvobj::ValueRepr::ZSet(z) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, z))
+                    RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, &mut **z))
                 }
                 kvobj::ValueRepr::Int(_)
                 | kvobj::ValueRepr::Inline(_)

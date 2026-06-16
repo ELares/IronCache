@@ -24,7 +24,7 @@
 //! command layer. The folded-header metadata (below) is laid out as the FAM
 //! version will pack it, so that follow-up is a representation change only.
 
-use crate::encoding::{Classified, EMBSTR_THRESHOLD, classify};
+use crate::encoding::{Classified, classify};
 use crate::scan_hash;
 use bytes::Bytes;
 use hashbrown::HashMap;
@@ -40,12 +40,6 @@ use ironcache_storage::{
     SetValue, UnixMillis, ZAddFlags, ZAddOutcome, ZSetValue,
 };
 use std::collections::{BTreeSet, VecDeque};
-
-/// The inline-value buffer capacity (embstr). Matches [`EMBSTR_THRESHOLD`]; a
-/// value classified as embstr fits here without a separate allocation in the
-/// eventual FAM layout. In the safe rep it is a fixed-size inline array plus a
-/// length, so an embstr value adds no heap allocation beyond the `KvObj` itself.
-pub const INLINE_CAP: usize = EMBSTR_THRESHOLD;
 
 /// The packed per-key header (OBJECT_LAYOUT.md "packed header and metadata bits").
 ///
@@ -101,66 +95,53 @@ impl Header {
     }
 }
 
-/// A small inline string buffer ([`INLINE_CAP`] bytes plus a length), the safe-rep
-/// stand-in for the FAM inline-value region. An embstr value lives here with no
-/// extra heap allocation.
-#[derive(Debug, Clone)]
-pub struct InlineBuf {
-    buf: [u8; INLINE_CAP],
-    len: u8,
-}
-
-impl InlineBuf {
-    /// Build from bytes that are known to fit ([`INLINE_CAP`]). Panics if too long;
-    /// callers (the classifier path) only construct this for embstr-sized values.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        assert!(
-            bytes.len() <= INLINE_CAP,
-            "InlineBuf overflow: {} > {INLINE_CAP}",
-            bytes.len()
-        );
-        let mut buf = [0u8; INLINE_CAP];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        InlineBuf {
-            buf,
-            len: bytes.len() as u8,
-        }
-    }
-
-    /// The inline bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.len as usize]
-    }
-}
-
 /// The value representation inside a [`KvObj`] (ENCODINGS.md #112).
 #[derive(Debug, Clone)]
 pub enum ValueRepr {
     /// An int-encoded value: the raw i64, NO value allocation (the decimal bytes
     /// are materialized on read). `OBJECT ENCODING` -> int.
     Int(i64),
-    /// A short string stored inline. `OBJECT ENCODING` -> embstr.
-    Inline(InlineBuf),
+    /// A short string (embstr). `OBJECT ENCODING` -> embstr.
+    ///
+    /// BOXED (memory Round 2): the bytes live behind a `Box<[u8]>` rather than a
+    /// fixed inline buffer, so this variant is one pointer wide and the largest
+    /// `ValueRepr` variant shrinks to a `Box<[u8]>`, cutting every per-key `KvObj`
+    /// and the hashbrown table slot. The embstr-vs-raw distinction is the SAME (it is
+    /// recorded in [`Header::encoding`], NOT by the variant): a value classified as
+    /// embstr by [`crate::encoding::EMBSTR_THRESHOLD`] is `Inline`, a longer one is
+    /// [`ValueRepr::Raw`],
+    /// and `OBJECT ENCODING` reports `embstr` / `raw` exactly as before. Redis/Valkey
+    /// also heap-allocate the object body, so this is allocation-parity with redis
+    /// plus a smaller slot.
+    Inline(Box<[u8]>),
     /// A long string stored out-of-line. `OBJECT ENCODING` -> raw.
     Raw(Box<[u8]>),
     /// A LIST value (PR-5). `OBJECT ENCODING` -> `listpack` while small, `quicklist`
     /// once over the threshold (a pure function of the active repr, #40).
-    List(ListVal),
+    ///
+    /// BOXED (memory Round 1): the four collection structs are the large `ValueRepr`
+    /// variants (`ListVal` 40 / `HashVal` 40 / `SetVal` 48 / `ZSetVal` 64). Holding them
+    /// behind a `Box` drops `ValueRepr` to the string-variant bound, which shrinks every
+    /// per-key `KvObj` and the hashbrown table slot. The string/int hot path
+    /// (`Int`/`Inline`/`Raw`) is UNBOXED so the embstr SSO is untouched; the collections
+    /// already heap-allocate their contents, so the `Box` is a negligible extra
+    /// indirection only on collection ops.
+    List(Box<ListVal>),
     /// A HASH value (PR-6). `OBJECT ENCODING` -> `listpack` while small, `hashtable`
     /// once over the entry-count OR per-element-byte threshold (a pure function of the
-    /// active repr, #40).
-    Hash(HashVal),
+    /// active repr, #40). BOXED (memory Round 1); see [`ValueRepr::List`].
+    Hash(Box<HashVal>),
     /// A SET value (PR-7). `OBJECT ENCODING` -> `intset` while all-integer and small,
     /// `listpack` once a non-integer member is added (and still small), `hashtable` once
     /// over the entry-count OR per-member-byte threshold (a pure function of the active
-    /// repr, #40). The conversion is ONE-WAY (never demotes).
-    Set(SetVal),
+    /// repr, #40). The conversion is ONE-WAY (never demotes). BOXED (memory Round 1);
+    /// see [`ValueRepr::List`].
+    Set(Box<SetVal>),
     /// A ZSET (sorted set) value (PR-8). `OBJECT ENCODING` -> `listpack` while small,
     /// `skiplist` once over the entry-count OR per-member-byte threshold (a pure function
-    /// of the active repr, #40). The conversion is ONE-WAY (never demotes).
-    ZSet(ZSetVal),
+    /// of the active repr, #40). The conversion is ONE-WAY (never demotes). BOXED
+    /// (memory Round 1); see [`ValueRepr::List`].
+    ZSet(Box<ZSetVal>),
 }
 
 impl ValueRepr {
@@ -187,8 +168,9 @@ impl ValueRepr {
     pub fn logical_len(&self) -> usize {
         match self {
             ValueRepr::Int(n) => int_decimal_len(*n),
-            ValueRepr::Inline(b) => b.as_bytes().len(),
-            ValueRepr::Raw(b) => b.len(),
+            // Embstr and raw both hold the value bytes behind a `Box<[u8]>`; the
+            // embstr-vs-raw distinction lives in `Header.encoding`, not the variant.
+            ValueRepr::Inline(b) | ValueRepr::Raw(b) => b.len(),
             ValueRepr::List(l) => l.element_bytes(),
             ValueRepr::Hash(h) => h.element_bytes(),
             ValueRepr::Set(s) => s.element_bytes(),
@@ -1714,7 +1696,7 @@ impl KvObj {
     ) -> Self {
         let value = match classified {
             Classified::Int(n) => ValueRepr::Int(n),
-            Classified::EmbStr => ValueRepr::Inline(InlineBuf::from_bytes(bytes)),
+            Classified::EmbStr => ValueRepr::Inline(bytes.to_vec().into_boxed_slice()),
             Classified::Raw => ValueRepr::Raw(bytes.to_vec().into_boxed_slice()),
         };
         let header = Header::new(value.encoding(), expire_at.is_some());
@@ -1800,7 +1782,7 @@ impl KvObj {
         KvObj {
             header: Header::with_type(DataType::List, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
-            value: ValueRepr::List(list),
+            value: ValueRepr::List(Box::new(list)),
             expire_at,
         }
     }
@@ -1814,7 +1796,7 @@ impl KvObj {
         KvObj {
             header: Header::with_type(DataType::Hash, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
-            value: ValueRepr::Hash(hash),
+            value: ValueRepr::Hash(Box::new(hash)),
             expire_at,
         }
     }
@@ -1828,7 +1810,7 @@ impl KvObj {
         KvObj {
             header: Header::with_type(DataType::Set, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
-            value: ValueRepr::Set(set),
+            value: ValueRepr::Set(Box::new(set)),
             expire_at,
         }
     }
@@ -1842,7 +1824,7 @@ impl KvObj {
         KvObj {
             header: Header::with_type(DataType::ZSet, encoding, expire_at.is_some()),
             key: key.to_vec().into_boxed_slice(),
-            value: ValueRepr::ZSet(zset),
+            value: ValueRepr::ZSet(Box::new(zset)),
             expire_at,
         }
     }
@@ -1861,7 +1843,9 @@ impl KvObj {
     /// yields `None` -> WRONGTYPE).
     pub fn as_list_mut(&mut self) -> Option<&mut ListVal> {
         match &mut self.value {
-            ValueRepr::List(l) => Some(l),
+            // Deref through the `Box` (memory Round 1) to the `&mut ListVal` the
+            // collection trait + in-place RMW path expect.
+            ValueRepr::List(l) => Some(&mut **l),
             _ => None,
         }
     }
@@ -1871,7 +1855,7 @@ impl KvObj {
     /// `None` -> WRONGTYPE). The HASH analog of [`Self::as_list_mut`].
     pub fn as_hash_mut(&mut self) -> Option<&mut HashVal> {
         match &mut self.value {
-            ValueRepr::Hash(h) => Some(h),
+            ValueRepr::Hash(h) => Some(&mut **h),
             _ => None,
         }
     }
@@ -1881,7 +1865,7 @@ impl KvObj {
     /// -> WRONGTYPE). The SET analog of [`Self::as_list_mut`]/[`Self::as_hash_mut`].
     pub fn as_set_mut(&mut self) -> Option<&mut SetVal> {
         match &mut self.value {
-            ValueRepr::Set(s) => Some(s),
+            ValueRepr::Set(s) => Some(&mut **s),
             _ => None,
         }
     }
@@ -1892,7 +1876,7 @@ impl KvObj {
     /// [`Self::as_set_mut`].
     pub fn as_zset_mut(&mut self) -> Option<&mut ZSetVal> {
         match &mut self.value {
-            ValueRepr::ZSet(z) => Some(z),
+            ValueRepr::ZSet(z) => Some(&mut **z),
             _ => None,
         }
     }
@@ -1972,7 +1956,7 @@ impl KvObj {
     pub fn set_value_bytes(&mut self, bytes: &[u8]) {
         self.value = match classify(bytes) {
             Classified::Int(n) => ValueRepr::Int(n),
-            Classified::EmbStr => ValueRepr::Inline(InlineBuf::from_bytes(bytes)),
+            Classified::EmbStr => ValueRepr::Inline(bytes.to_vec().into_boxed_slice()),
             Classified::Raw => ValueRepr::Raw(bytes.to_vec().into_boxed_slice()),
         };
         self.header.encoding = self.value.encoding();
