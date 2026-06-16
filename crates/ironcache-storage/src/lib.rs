@@ -1353,6 +1353,19 @@ pub enum RmwAction {
 /// a reserved-hook refinement, NOT a change to the FROZEN four primitives.
 pub trait EvictionHook {
     /// A live key was read or observed in an rmw.
+    ///
+    /// ## The 2-bit S3-FIFO frequency moved OUT of `on_access` (freq-in-object)
+    ///
+    /// PR-3a kept the S3-FIFO 2-bit promote frequency in a policy-side per-key index,
+    /// bumped here on every read. That index (slab + handle queues + key->slot map)
+    /// was net-new per-key memory (~28 B/key on the whole-process `used_memory`),
+    /// which lost the memory head-to-head. The freq now lives ON the stored object
+    /// (the kvobj's `CollEntry.eviction_rank` / the Str blob's spare FLAGS bits), and
+    /// the STORE bumps the just-accessed entry's freq INLINE on the read path (it
+    /// already holds the entry, so this is O(1) with no policy lookup). The store
+    /// therefore NO LONGER calls `on_access` on the hot path: it is dead for the
+    /// FIFO-class engine. The method is retained for the no-op policies and any
+    /// future hook that wants a notification, but the per-read bump is the store's.
     fn on_access(&mut self, db: u32, key: &[u8]);
     /// A new value was inserted, costing `bytes` logical bytes.
     fn on_insert(&mut self, db: u32, key: &[u8], bytes: usize);
@@ -1362,9 +1375,43 @@ pub trait EvictionHook {
     /// `(db, key)` pair so the caller (`ShardStore::evict_to_fit`) can delete it
     /// from the correct per-DB map: the KEY bytes (not a hash) are returned because
     /// the store's table is keyed by the owned key bytes (`Box<[u8]>`, ADR-0008), so
-    /// a hash cannot drive the delete (EVICTION.md `evict_victim() -> key`). PR-3's
-    /// S3-FIFO evicts through this surface.
-    fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)>;
+    /// a hash cannot drive the delete (EVICTION.md `evict_victim() -> key`).
+    ///
+    /// ## `freq`: the store-side per-key frequency accessor (freq-in-object)
+    ///
+    /// The S3-FIFO promote/second-chance decision needs each candidate's 2-bit
+    /// frequency. That frequency now lives ON the stored object, not in the policy,
+    /// so the policy reads/decrements it through `freq` (a [`VictimFreq`] the store
+    /// passes, backed by its own per-DB tables). `freq.get` returns `None` when the
+    /// key is no longer present (a stale queue entry the policy must skip);
+    /// `freq.dec` decrements the live entry's frequency for a main second-chance. The
+    /// S3-FIFO ordering LOGIC (10/90 small/main split, ghost ring, re-offer drain,
+    /// guaranteed-progress rounds) stays IN the policy; only the freq STORAGE moved.
+    /// Policies that keep their own frequency (W-TinyLFU's sketch) or none (Random,
+    /// NoEviction) ignore `freq`.
+    fn select_victim(&mut self, freq: &mut dyn VictimFreq) -> Option<(u32, Box<[u8]>)>;
+}
+
+/// The store-side per-key frequency accessor a policy's [`EvictionHook::select_victim`]
+/// uses to read and decrement a candidate's 2-bit S3-FIFO frequency (freq-in-object).
+///
+/// The 2-bit promote frequency moved OUT of the eviction policy (where it cost a
+/// net-new per-key index) and ONTO the stored object. `select_victim` is still
+/// policy-only, so the store passes this trait object as the bridge: the policy holds
+/// only the key queues, and reaches the freq (which lives in the store's tables)
+/// through here.
+///
+/// - [`Self::get`] returns the candidate's frequency, or `None` if the key is no
+///   longer present (a stale queue entry the policy skips as a tombstone).
+/// - [`Self::dec`] decrements the live entry's frequency by one (saturating at 0),
+///   the main-queue second-chance step.
+pub trait VictimFreq {
+    /// The 2-bit frequency (0..=3) of the live entry for `(db, key)`, or `None` if the
+    /// key is no longer present (skip it as a stale tombstone).
+    fn get(&self, db: u32, key: &[u8]) -> Option<u8>;
+    /// Decrement the live entry's frequency by one (saturating at 0). A no-op if the
+    /// key is no longer present.
+    fn dec(&mut self, db: u32, key: &[u8]);
 }
 
 /// A no-op eviction hook (PR-2a default). Eviction-on-by-default (ADR-0007) and
@@ -1380,7 +1427,7 @@ impl EvictionHook for NullEviction {
     #[inline]
     fn on_remove(&mut self, _db: u32, _key: &[u8], _bytes: usize) {}
     #[inline]
-    fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
+    fn select_victim(&mut self, _freq: &mut dyn VictimFreq) -> Option<(u32, Box<[u8]>)> {
         None
     }
 }
@@ -2050,13 +2097,24 @@ mod tests {
         assert_eq!(a.used(), 0);
     }
 
+    /// A no-op [`VictimFreq`] for unit tests: no key is ever present, so a policy that
+    /// consults it treats every candidate as a stale tombstone. Used where the test does
+    /// not exercise the freq-keyed promote/second-chance path.
+    struct NoFreq;
+    impl VictimFreq for NoFreq {
+        fn get(&self, _db: u32, _key: &[u8]) -> Option<u8> {
+            None
+        }
+        fn dec(&mut self, _db: u32, _key: &[u8]) {}
+    }
+
     #[test]
     fn null_eviction_selects_nothing_and_is_inert() {
         let mut e = NullEviction;
         e.on_access(0, b"k");
         e.on_insert(0, b"k", 10);
         e.on_remove(0, b"k", 10);
-        assert_eq!(e.select_victim(), None);
+        assert_eq!(e.select_victim(&mut NoFreq), None);
     }
 
     #[test]

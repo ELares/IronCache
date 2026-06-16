@@ -2047,6 +2047,14 @@ mod blob {
     pub const KEYLEN_LEN: usize = 4;
     /// The flags byte bit: a TTL deadline u64 follows the header.
     pub const FLAG_HAS_TTL: u8 = 0b0000_0001;
+    /// The S3-FIFO 2-bit promote frequency, packed into bits 1-2 of the flags byte
+    /// (freq-in-object). Bit 0 is [`FLAG_HAS_TTL`]; bits 1-2 hold the 0..=3 frequency
+    /// the eviction policy reads through the store's `VictimFreq` accessor. Packing it
+    /// into the EXISTING flags byte adds NO bytes to the blob and needs NO new `unsafe`
+    /// (the byte is read/written through the safe `str_blob()`/`str_blob_mut()` views).
+    pub const FREQ_SHIFT: u8 = 1;
+    /// The 2-bit mask for the freq field once shifted down (a value in 0..=3).
+    pub const FREQ_MASK: u8 = 0b0000_0011;
 }
 
 /// Encode a [`DataType`] as the blob header's first byte.
@@ -2734,10 +2742,14 @@ impl Entry {
             _ => {
                 let data_type = self.data_type();
                 let encoding = self.encoding();
+                // Carry the S3-FIFO freq across the rebuild: this is a TTL-only change to
+                // the SAME value, not a fresh write, so the promote frequency must survive.
+                let freq = self.freq();
                 // Re-extract key + value from the OLD blob before rebuilding.
                 let key = self.key().to_vec();
                 let value = self.str_value_bytes().to_vec();
                 *self = Entry::build_str_blob(data_type, encoding, expire_at, &key, &value);
+                self.set_freq(freq);
             }
         }
     }
@@ -2750,6 +2762,60 @@ impl Entry {
             Some(deadline) => now > deadline,
             None => false,
         }
+    }
+
+    /// The maximum S3-FIFO 2-bit promote frequency (capped at 3, ADR-0008).
+    const MAX_FREQ: u8 = 3;
+
+    /// The S3-FIFO 2-bit promote frequency of this entry (0..=3), the freq-in-object
+    /// counter the eviction policy reads through the store's `VictimFreq` accessor.
+    ///
+    /// For a Str entry it is bits 1-2 of the flags byte (read via the safe `str_blob()`
+    /// view; bit 0 is the TTL-present flag). For a Coll entry it is the
+    /// `CollEntry.eviction_rank` field, masked to 2 bits.
+    #[must_use]
+    pub fn freq(&self) -> u8 {
+        if let Some(blob) = self.str_blob() {
+            (Entry::str_flags(blob) >> blob::FREQ_SHIFT) & blob::FREQ_MASK
+        } else {
+            self.coll_ref()
+                .map_or(0, |c| c.eviction_rank & blob::FREQ_MASK)
+        }
+    }
+
+    /// Set the S3-FIFO 2-bit promote frequency (capped at [`Self::MAX_FREQ`]). For a Str
+    /// entry it patches bits 1-2 of the flags byte in place through the safe
+    /// `str_blob_mut()` view (no realloc, no layout change, no new `unsafe`); for a Coll
+    /// entry it writes `CollEntry.eviction_rank`.
+    pub fn set_freq(&mut self, f: u8) {
+        let f = f.min(Entry::MAX_FREQ);
+        if let Some(c) = self.coll_mut() {
+            c.eviction_rank = f;
+            return;
+        }
+        if let Some(blob) = self.str_blob_mut() {
+            // Clear the existing freq bits (1-2), then OR in the new value, leaving the
+            // TTL-present bit (0) and any high bits untouched. The flags byte is at the
+            // fixed blob offset 2 (after data_type and encoding).
+            let flags = blob[2];
+            blob[2] = (flags & !(blob::FREQ_MASK << blob::FREQ_SHIFT)) | (f << blob::FREQ_SHIFT);
+        }
+    }
+
+    /// Bump the S3-FIFO 2-bit promote frequency by one, saturating at
+    /// [`Self::MAX_FREQ`] (the read-path hot bump: the store calls this on the
+    /// just-accessed entry, so the freq lives with the object and `on_access` needs no
+    /// policy lookup).
+    pub fn bump_freq(&mut self) {
+        let next = (self.freq() + 1).min(Entry::MAX_FREQ);
+        self.set_freq(next);
+    }
+
+    /// Decrement the S3-FIFO 2-bit promote frequency by one, saturating at 0 (the
+    /// main-queue second-chance step, driven by the policy through `VictimFreq::dec`).
+    pub fn dec_freq(&mut self) {
+        let cur = self.freq();
+        self.set_freq(cur.saturating_sub(1));
     }
 
     /// The logical byte length of the value (STRLEN basis).
@@ -2855,8 +2921,12 @@ impl Entry {
         let data_type = self.data_type();
         let encoding = self.encoding();
         let expire_at = self.expire_at();
+        // The value object is preserved INTACT (encoding + remaining TTL), so the
+        // S3-FIFO freq travels with it across the rebuild rather than resetting to 0.
+        let freq = self.freq();
         let value = self.str_value_bytes().to_vec();
         *self = Entry::build_str_blob(data_type, encoding, expire_at, new_key, &value);
+        self.set_freq(freq);
     }
 }
 
@@ -3030,6 +3100,89 @@ mod tests {
         assert_eq!(o.accounted_bytes(), 3 + 5);
         let i = KvObj::from_int(b"k", 12345, None);
         assert_eq!(i.accounted_bytes(), 1 + 5); // "12345" is 5 decimal digits
+    }
+
+    // -- freq-in-object (S3-FIFO 2-bit promote frequency on the stored Entry): the
+    // Str path packs it into spare FLAGS bits (no blob layout change, no new unsafe);
+    // the Coll path uses CollEntry.eviction_rank. These run under `cargo miri test`. --
+
+    #[test]
+    fn str_entry_freq_packs_into_spare_flags_bits_and_caps_at_3() {
+        let mut e = Entry::str_from_bytes(b"k", b"value", None);
+        assert_eq!(e.freq(), 0, "a fresh entry starts at freq 0");
+        e.bump_freq();
+        assert_eq!(e.freq(), 1);
+        e.bump_freq();
+        e.bump_freq();
+        assert_eq!(e.freq(), 3);
+        e.bump_freq();
+        assert_eq!(e.freq(), 3, "freq caps at MAX_FREQ (3)");
+        e.set_freq(2);
+        assert_eq!(e.freq(), 2);
+        e.set_freq(7);
+        assert_eq!(e.freq(), 3, "set_freq caps at 3");
+        e.dec_freq();
+        assert_eq!(e.freq(), 2);
+        // The freq bits must NOT disturb the rest of the entry: key/value/type/encoding
+        // and the TTL-present flag are all read through the same blob bytes.
+        assert_eq!(e.key(), b"k");
+        assert_eq!(e.str_value_bytes(), b"value");
+        assert_eq!(e.data_type(), DataType::String);
+        assert_eq!(
+            e.expire_at(),
+            None,
+            "no TTL: bit 0 untouched by the freq bits"
+        );
+    }
+
+    #[test]
+    fn str_entry_freq_and_ttl_flag_are_independent() {
+        // The freq bits (1-2) and the TTL-present bit (0) share the flags byte; setting
+        // one must not corrupt the other.
+        let mut e = Entry::str_from_bytes(b"k", b"v", Some(UnixMillis(12345)));
+        assert_eq!(e.expire_at(), Some(UnixMillis(12345)));
+        assert_eq!(e.freq(), 0);
+        e.set_freq(3);
+        assert_eq!(e.freq(), 3);
+        // The TTL deadline still reads back exactly (TTL-present bit + the deadline
+        // bytes are untouched by the freq write).
+        assert_eq!(e.expire_at(), Some(UnixMillis(12345)));
+        assert_eq!(e.key(), b"k");
+        assert_eq!(e.str_value_bytes(), b"v");
+    }
+
+    #[test]
+    fn coll_entry_freq_uses_eviction_rank() {
+        let mut list = ListVal::new();
+        list.push_back(b"a");
+        let mut e = Entry::coll(b"mylist", CollVal::List(list), None);
+        assert!(e.is_collection());
+        assert_eq!(e.freq(), 0);
+        e.bump_freq();
+        e.bump_freq();
+        assert_eq!(e.freq(), 2);
+        e.set_freq(9);
+        assert_eq!(e.freq(), 3, "Coll freq caps at 3 (masked to 2 bits)");
+        e.dec_freq();
+        assert_eq!(e.freq(), 2);
+        assert_eq!(e.key(), b"mylist");
+    }
+
+    #[test]
+    fn freq_survives_a_ttl_rebuild_and_a_rekey() {
+        // A TTL add/remove rebuilds the Str blob; a rekey rebuilds it with a new key.
+        // Both preserve the SAME value, so the S3-FIFO freq must travel across.
+        let mut e = Entry::str_from_bytes(b"k", b"v", None);
+        e.set_freq(3);
+        e.set_expire_at(Some(UnixMillis(999))); // adds the TTL field -> rebuild
+        assert_eq!(e.freq(), 3, "freq survives a TTL-add rebuild");
+        assert_eq!(e.expire_at(), Some(UnixMillis(999)));
+        e.set_expire_at(None); // removes the TTL field -> rebuild
+        assert_eq!(e.freq(), 3, "freq survives a TTL-remove rebuild");
+        e.rekey(b"newkey");
+        assert_eq!(e.freq(), 3, "freq survives a rekey");
+        assert_eq!(e.key(), b"newkey");
+        assert_eq!(e.str_value_bytes(), b"v");
     }
 
     // -- ListVal unit tests (PR-5): the abstract list-op vocabulary + the

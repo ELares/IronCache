@@ -11,48 +11,35 @@
 //! capped at 3 [s3fifo-freq-counter-2bit-cap3] drives the promote/second-chance
 //! decision.
 //!
-//! ## 2-bit frequency: policy-side counter (PR-3a)
+//! ## 2-bit frequency: in the STORED OBJECT, not the policy (freq-in-object)
 //!
-//! The frequency lives ON each tracked key (the slab [`Slot::freq`]), bumped in
-//! [`EvictionHook::on_access`], and this is the SINGLE source of truth. The crate docs
-//! explain why it is the policy-side counter rather than the kvobj `eviction_rank`:
-//! `select_victim` is policy-only and cannot borrow the kvobj header. The kvobj
-//! `eviction_rank` field is RESERVED for a later single-source migration and is NOT
-//! written on the store's access path today. The counter is bounded (one per tracked
-//! key, dropped when the key leaves all queues) and capped at 3, so it is the 2-bit
-//! field S3-FIFO needs.
+//! The frequency lives ON the stored object (the kvobj's `CollEntry.eviction_rank` /
+//! the Str blob's spare FLAGS bits), NOT in the policy. PR-3a kept a policy-side
+//! per-key index (a slab + handle queues + a `key->slot` hash map) purely so the hot
+//! `on_access` 2-bit bump could be O(1); but that index was net-new per-key memory
+//! (~28 B/key on the whole-process `used_memory`), which lost the memory head-to-head.
 //!
-//! ## O(1) layout: generational slab + key->slot index + FIFO queues of handles
+//! The fix (this rewrite): the STORE bumps the just-accessed entry's freq INLINE on the
+//! read path (it already holds the entry, so the bump is O(1) with no policy call), so
+//! `on_access` no longer needs the policy AT ALL, and the policy no longer needs its
+//! per-key index/slab/handles. The policy is back to ~its pre-rewrite memory footprint:
+//! three FIFO queues holding the KEY directly + the ghost ring + a few counters.
+//! `select_victim` still makes the promote/second-chance/ghost decision, but it reads
+//! and decrements each candidate's freq through a [`VictimFreq`] the store passes
+//! (backed by the store's own tables). The hot path stays O(1); the policy memory is
+//! reclaimed.
 //!
-//! The hot path ([`EvictionHook::on_access`] -> [`S3Fifo::bump_freq`]) is a SINGLE
-//! point lookup, NOT a scan. The state is three pieces (the #8 follow-up the PR-3a
-//! comment promised; PR-3a held the keys directly in the three `VecDeque`s and SCANNED
-//! them on every access, an O(N) cost the load profile flagged as the #1 compute hot
-//! frame):
+//! ## The queue layout (KEY-in-queue, O(N) splice on remove)
 //!
-//! - A SLAB ([`Slot`]) owns each live key's data ONCE: a `Vec<Slot>` plus a freelist of
-//!   free indices. A freed slot bumps its `gen` (the generation counter) so any stale
-//!   handle that still names it is detected by a `gen` mismatch. Allocating reuses a
-//!   freelist slot or pushes a new one.
-//! - A [`Handle`] is `{ idx, generation }` (8 bytes, `Copy`). The three FIFO queues are
-//!   `VecDeque<Handle>` in FIFO order, preserving the exact small/main/reoffer ordering
-//!   semantics PR-3a had.
-//! - An INDEX (`hashbrown::HashTable<u32>` of slot indices) gives O(1) key->slot
-//!   lookup. It uses the LOW-LEVEL explicit-hash API (`find`/`insert_unique`/
-//!   `find_entry`): it stores ONLY the u32 slot index (the key bytes live in the slab,
-//!   never duplicated), and is fed a FIXED, deterministic hash of `(db, key)` -- the
-//!   same [`S3Fifo::fingerprint`] FNV-1a constant used for the ghost ring, so the index
-//!   is reproducible run-to-run (ADR-0003: no `RandomState`, no OS entropy). The index
-//!   is a POINT-LOOKUP structure ONLY; it is NEVER iterated for any client-visible
-//!   order, so a fixed seed is sound (ADR-0003 forbids a randomly-seeded hasher only
-//!   where iteration order would leak across calls -- this index has no such order).
-//!
-//! Each queue carries a LIVE count (`*_live`), and the policy a total `live`, so
-//! `entry_count`/`small_cap`/the `draw_small` heuristic compute on LIVE keys EXACTLY as
-//! PR-3a did -- a stale handle still sitting in a `VecDeque` (left there when its key was
-//! removed via `on_remove`) does NOT count. A stale handle is discarded lazily when
-//! `select_victim` pops it (gen mismatch), so removal stays O(1) (no scan to splice it
-//! out).
+//! The state is three `VecDeque<(u32 db, Box<[u8]> key)>` FIFOs (small / main / reoffer)
+//! plus the ghost ring. A key sits in exactly one queue. `on_insert` pushes the key;
+//! `on_remove` splices it out (an O(N) scan of the three queues, ACCEPTABLE because
+//! removal fires only on writes/deletes (~10% of ops), NOT the read hot path that the
+//! profile flagged). `select_victim` pops the front of the chosen queue and consults
+//! `VictimFreq` for the freq. A popped key whose `freq.get` returns `None` is a stale
+//! tombstone (removed since) and is skipped. This is the SAME exact ordering algorithm
+//! PR-3a had (10/90 draw_small, freq>1 small->main promote, freq>0 main second-chance,
+//! reoffer drained last, rounds-bounded progress, ghost on small/cold evictions only).
 //!
 //! ## Byte-budget-driven, not count-driven
 //!
@@ -66,13 +53,9 @@
 
 use std::collections::VecDeque;
 
-use hashbrown::HashTable;
-use ironcache_storage::EvictionHook;
+use ironcache_storage::{EvictionHook, VictimFreq};
 
 use crate::EvictionPolicy;
-
-/// The S3-FIFO 2-bit frequency cap (ADR-0008 `s3fifo-freq-counter-2bit-cap3`).
-const MAX_FREQ: u8 = 3;
 
 /// The small (probationary) queue's share of the running entry count. S3-FIFO uses
 /// about 10% small / 90% main [s3fifo-small-main-split].
@@ -86,75 +69,22 @@ const GHOST_FRACTION_NUM: usize = 9;
 const GHOST_FRACTION_DEN: usize = 10;
 const GHOST_FLOOR: usize = 8;
 
-/// Which FIFO queue a live slot's handle currently sits in. Mirrors the queue the
-/// handle was last pushed to, so a removal can decrement the right per-queue live count
-/// without scanning, and `select_victim` can keep `Slot::queue` in lockstep on a
-/// promotion / second-chance requeue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueueTag {
-    Small,
-    Main,
-    Reoffer,
-}
-
-/// A slab slot owning one tracked key's data ONCE (no key duplication anywhere else;
-/// the index holds only this slot's `u32` position). A free slot is identified by a
-/// `gen` bump relative to the handles that still name it.
-#[derive(Debug, Clone)]
-struct Slot {
-    /// The logical database id of the tracked key.
-    db: u32,
-    /// The tracked key bytes (the SINGLE owned copy).
-    key: Box<[u8]>,
-    /// The 2-bit access frequency (capped at [`MAX_FREQ`]).
-    freq: u8,
-    /// Which FIFO queue this slot's handle currently sits in (kept in lockstep with the
-    /// queue moves so a removal decrements the correct per-queue live count).
-    queue: QueueTag,
-    /// The generation counter: bumped each time the slot is freed, so a stale [`Handle`]
-    /// left in a `VecDeque` is detected by a generation mismatch (a tombstone to discard).
-    /// (Named `generation`, not `gen`, since `gen` is a reserved keyword in edition 2024.)
-    generation: u32,
-    /// Whether this slot is currently LIVE (occupied). A freed slot stays in the `Vec`
-    /// (its index recycles via the freelist) but is marked dead so a lookup that races a
-    /// recycled `gen` cannot resolve a tombstone as live.
-    live: bool,
-}
-
-impl Slot {
-    /// Whether this slot holds the live key `(db, key)`.
-    fn matches(&self, db: u32, key: &[u8]) -> bool {
-        self.live && self.db == db && self.key.as_ref() == key
-    }
-}
-
-/// A FIFO-queue handle naming a slab slot (`Copy`, 8 bytes). It is STABLE: removing the
-/// key frees the slot and bumps its `gen`, so the handle becomes a tombstone detected on
-/// pop rather than being spliced out (O(1) removal, no scan).
-#[derive(Debug, Clone, Copy)]
-struct Handle {
-    idx: u32,
-    generation: u32,
-}
+/// One tracked key in a FIFO queue: its logical db id and the owned key bytes (the
+/// SINGLE owned copy; the freq lives on the stored object, not here).
+type QKey = (u32, Box<[u8]>);
 
 /// The S3-FIFO policy state (per shard, unsynchronized; ADR-0005).
+///
+/// freq-in-object: the per-key 2-bit frequency is NOT here (it lives on the stored
+/// object, read via [`VictimFreq`] in `select_victim`). This struct is back to ~the
+/// pre-rewrite footprint: three key FIFOs + the ghost ring + the posture flags.
 #[derive(Debug, Clone)]
 pub struct S3Fifo {
-    /// The slab owning each live key's data once (indexed by `Handle::idx`).
-    slots: Vec<Slot>,
-    /// The freelist of recyclable slot indices (a freed slot's index lands here and is
-    /// reused on the next allocation, after a `gen` bump).
-    free: Vec<u32>,
-    /// The O(1) key->slot index: `hashbrown::HashTable<u32>` of LIVE slot indices, keyed
-    /// by the deterministic [`Self::fingerprint`] of `(db, key)` (fixed seed, ADR-0003).
-    /// Stores ONLY the index (the key lives in the slab). Point lookups only, never
-    /// iterated for any client-visible order.
-    index: HashTable<u32>,
-    /// The small probationary FIFO (fresh keys land here unless ghost-readmitted). Holds
-    /// handles in FIFO order; a stale handle (its slot freed) is discarded on pop.
-    small: VecDeque<Handle>,
+    /// The small probationary FIFO (fresh keys land here unless ghost-readmitted),
+    /// holding `(db, key)` in FIFO order.
+    small: VecDeque<QKey>,
     /// The large main FIFO (promoted / ghost-readmitted keys).
-    main: VecDeque<Handle>,
+    main: VecDeque<QKey>,
     /// The LOWEST-priority re-offer FIFO for the volatile-* re-eligibility fix (#46):
     /// a non-TTL victim the store declines to delete is re-registered HERE rather than
     /// back into small/main. `select_victim` drains this queue ONLY after small and main
@@ -166,17 +96,7 @@ pub struct S3Fifo {
     /// starvation in either direction. The store's distinct-key skip set then terminates
     /// the scan once every live key (now all sitting here) has been offered with no
     /// eligible TTL victim.
-    reoffer: VecDeque<Handle>,
-    /// The count of LIVE handles in the small queue (excludes stale tombstones still
-    /// sitting in `small`). `small_cap`/`draw_small` read this, NOT `small.len()`.
-    small_live: usize,
-    /// The count of LIVE handles in the main queue.
-    main_live: usize,
-    /// The count of LIVE handles in the re-offer queue.
-    reoffer_live: usize,
-    /// The total count of live slots, so `entry_count` is O(1) and EXACT (==
-    /// `small_live + main_live + reoffer_live` == the number of live slab slots).
-    live: usize,
+    reoffer: VecDeque<QKey>,
     /// The ghost ring of recently-evicted key fingerprints (FIFO, bounded).
     ghost: VecDeque<u64>,
     /// Whether victims are restricted to TTL-bearing keys (the volatile-* family),
@@ -211,16 +131,9 @@ impl S3Fifo {
     #[must_use]
     pub fn with_name(volatile_only: bool, name: &str) -> Self {
         S3Fifo {
-            slots: Vec::new(),
-            free: Vec::new(),
-            index: HashTable::new(),
             small: VecDeque::new(),
             main: VecDeque::new(),
             reoffer: VecDeque::new(),
-            small_live: 0,
-            main_live: 0,
-            reoffer_live: 0,
-            live: 0,
             ghost: VecDeque::new(),
             volatile_only,
             name: name.to_owned(),
@@ -240,13 +153,11 @@ impl S3Fifo {
         }
     }
 
-    /// A stable, deterministic fingerprint of a `(db, key)` for the ghost ring AND the
-    /// key->slot index hash. This is NOT cryptographic and NOT the store's hash; it is a
-    /// fixed-constant FNV-1a over `db` then the key bytes, so it is identical on every
-    /// run (ADR-0003: no OS entropy, no `RandomState`). For the ghost ring a collision
-    /// only costs a spurious main-admission, which is harmless; for the index it only
-    /// costs an extra `eq` probe of a colliding slot's `(db, key)` (the `eq` closure
-    /// disambiguates exactly), so correctness does not depend on collision-freedom.
+    /// A stable, deterministic fingerprint of a `(db, key)` for the ghost ring. This is
+    /// NOT cryptographic and NOT the store's hash; it is a fixed-constant FNV-1a over
+    /// `db` then the key bytes, so it is identical on every run (ADR-0003: no OS
+    /// entropy, no `RandomState`). For the ghost ring a collision only costs a spurious
+    /// main-admission, which is harmless.
     fn fingerprint(db: u32, key: &[u8]) -> u64 {
         // FNV-1a 64-bit, fixed offset basis and prime (public-domain constants).
         let mut h: u64 = 0xCBF2_9CE4_8422_2325;
@@ -261,32 +172,23 @@ impl S3Fifo {
         h
     }
 
-    /// The running total of tracked keys (small + main + the re-offer queue), counting
-    /// LIVE keys only (stale handles excluded). All three queues hold LIVE keys the
-    /// store still tracks, so they all count toward the cap sizing and the
-    /// guaranteed-progress round bound. O(1) (a maintained counter, not a sum of
-    /// `VecDeque::len()`, which would include stale tombstones).
+    /// The running total of tracked keys (small + main + the re-offer queue). All three
+    /// queues hold LIVE keys the store still tracks, so they all count toward the cap
+    /// sizing and the guaranteed-progress round bound. (A key that was removed via
+    /// `on_remove` is spliced OUT of its queue, so no stale entry is counted here.)
     fn entry_count(&self) -> usize {
-        self.live
+        self.small.len() + self.main.len() + self.reoffer.len()
     }
 
-    /// O(1) key->slot lookup: the LIVE slot index for `(db, key)`, or `None`. Hashes
-    /// `(db, key)` with the fixed [`Self::fingerprint`] and disambiguates collisions via
-    /// the slot's [`Slot::matches`].
-    fn lookup(&self, db: u32, key: &[u8]) -> Option<u32> {
-        let fp = Self::fingerprint(db, key);
-        self.index
-            .find(fp, |&i| self.slots[i as usize].matches(db, key))
-            .copied()
-    }
-
-    /// Whether `(db, key)` is tracked (in any of the three queues). O(1).
+    /// Whether `(db, key)` is tracked in any of the three queues. O(N) (a scan), used
+    /// only on the WRITE path (`re_register` idempotence), never on the read hot path.
     fn tracks(&self, db: u32, key: &[u8]) -> bool {
-        self.lookup(db, key).is_some()
+        let hit = |q: &VecDeque<QKey>| q.iter().any(|(d, k)| *d == db && k.as_ref() == key);
+        hit(&self.small) || hit(&self.main) || hit(&self.reoffer)
     }
 
     /// The current small-queue target capacity (~10% of the running entry count, at
-    /// least 1 so a fresh key always has a home). Computed on LIVE counts.
+    /// least 1 so a fresh key always has a home).
     fn small_cap(&self) -> usize {
         (self.entry_count() * SMALL_FRACTION_NUM / SMALL_FRACTION_DEN).max(1)
     }
@@ -321,205 +223,96 @@ impl S3Fifo {
         }
     }
 
-    /// Allocate a slab slot for a fresh `(db, key)` with `freq = 0` and the given queue
-    /// tag, insert it into the index, bump the total live count, and return its handle.
-    /// Reuses a freelist slot (bumping its `gen`) or pushes a new one. The CALLER pushes
-    /// the returned handle to the matching queue and bumps that queue's live count.
-    fn alloc_slot(&mut self, db: u32, key: &[u8], queue: QueueTag) -> Handle {
-        let idx = if let Some(idx) = self.free.pop() {
-            let slot = &mut self.slots[idx as usize];
-            slot.db = db;
-            slot.key = key.to_vec().into_boxed_slice();
-            slot.freq = 0;
-            slot.queue = queue;
-            slot.generation = slot.generation.wrapping_add(1);
-            slot.live = true;
-            idx
-        } else {
-            let idx = u32::try_from(self.slots.len()).expect("slab index fits in u32");
-            self.slots.push(Slot {
-                db,
-                key: key.to_vec().into_boxed_slice(),
-                freq: 0,
-                queue,
-                generation: 0,
-                live: true,
-            });
-            idx
+    /// Splice `(db, key)` out of whichever of the three queues holds it (the O(N)
+    /// removal). Returns whether it was found. Fires only on the WRITE path
+    /// (`on_remove`), NOT the read hot path, so the scan is not the profile's
+    /// bottleneck.
+    fn remove_key(&mut self, db: u32, key: &[u8]) -> bool {
+        let splice = |q: &mut VecDeque<QKey>| -> bool {
+            if let Some(i) = q.iter().position(|(d, k)| *d == db && k.as_ref() == key) {
+                q.remove(i);
+                true
+            } else {
+                false
+            }
         };
-        let g = self.slots[idx as usize].generation;
-        // Insert the index entry: the hash closure reads the (db, key) from the slot in
-        // the slab (no key duplication in the index), so a future resize re-places by
-        // re-hashing the slot's key.
-        let fp = Self::fingerprint(db, key);
-        self.index
-            .insert_unique(fp, idx, |&i| Self::slot_hash(&self.slots, i));
-        self.live += 1;
-        Handle { idx, generation: g }
-    }
-
-    /// The index hash of a slot's `(db, key)` (the hasher closure passed to the
-    /// explicit-hash table). Reads the key from the slab so the index stores no key.
-    fn slot_hash(slots: &[Slot], idx: u32) -> u64 {
-        let s = &slots[idx as usize];
-        Self::fingerprint(s.db, &s.key)
-    }
-
-    /// Free the live slot at `idx`: remove it from the index, mark it dead, bump its
-    /// `gen`, push its index to the freelist, and decrement the total live count. Does
-    /// NOT touch the queues -- the handle that named this slot is left in its `VecDeque`
-    /// as a STALE tombstone (discarded on pop), so freeing is O(1) with no queue scan.
-    /// The CALLER decrements the relevant per-queue live count.
-    fn free_slot(&mut self, idx: u32) {
-        let (db, fp) = {
-            let s = &self.slots[idx as usize];
-            (s.db, Self::fingerprint(s.db, &s.key))
-        };
-        // Remove the index entry for this exact slot (match on the index value being
-        // this slot idx, not just the key, so a recycled fingerprint cannot remove the
-        // wrong entry).
-        if let Ok(occ) = self
-            .index
-            .find_entry(fp, |&i| i == idx && self.slots[i as usize].db == db)
-        {
-            occ.remove();
-        }
-        let slot = &mut self.slots[idx as usize];
-        slot.live = false;
-        slot.generation = slot.generation.wrapping_add(1);
-        // Drop the key bytes eagerly so a freed slot does not pin memory while parked on
-        // the freelist (re-set on the next alloc).
-        slot.key = Box::default();
-        self.free.push(idx);
-        self.live -= 1;
-    }
-
-    /// Resolve a popped handle to a LIVE slot index, or `None` if it is a STALE tombstone
-    /// (the slot was freed by a prior `on_remove`, detected by the `gen` mismatch / a
-    /// not-live slot). A stale handle represents no live key, so the caller discards it.
-    fn resolve(&self, h: Handle) -> Option<u32> {
-        let slot = self.slots.get(h.idx as usize)?;
-        if slot.live && slot.generation == h.generation {
-            Some(h.idx)
-        } else {
-            None
-        }
-    }
-
-    /// Decrement the per-queue live count for `queue` (the handle just left that queue).
-    fn dec_queue_live(&mut self, queue: QueueTag) {
-        match queue {
-            QueueTag::Small => self.small_live -= 1,
-            QueueTag::Main => self.main_live -= 1,
-            QueueTag::Reoffer => self.reoffer_live -= 1,
-        }
-    }
-
-    /// Bump the 2-bit frequency of the slot for `(db, key)`, if tracked. O(1).
-    fn bump_freq(&mut self, db: u32, key: &[u8]) {
-        if let Some(idx) = self.lookup(db, key) {
-            let slot = &mut self.slots[idx as usize];
-            slot.freq = (slot.freq + 1).min(MAX_FREQ);
-        }
-    }
-
-    /// Remove a `(db, key)` (on an external delete / replace / expiry). Frees its slot
-    /// (leaving a stale handle in whatever queue held it) and decrements that queue's
-    /// live count. Returns whether it was found. O(1) (no queue scan).
-    fn remove_entry(&mut self, db: u32, key: &[u8]) -> bool {
-        let Some(idx) = self.lookup(db, key) else {
-            return false;
-        };
-        let queue = self.slots[idx as usize].queue;
-        self.free_slot(idx);
-        self.dec_queue_live(queue);
-        true
+        // A key sits in exactly one queue, so stop at the first hit.
+        splice(&mut self.small) || splice(&mut self.main) || splice(&mut self.reoffer)
     }
 }
 
 impl EvictionHook for S3Fifo {
-    fn on_access(&mut self, db: u32, key: &[u8]) {
-        // A single in-place metadata write (the 2-bit bump) behind ONE O(1) index
-        // lookup, no relink (EVICTION.md hot-path contract). The PR-3a linear scan of
-        // the three queues is gone: the key->slot index resolves the slot directly.
-        self.bump_freq(db, key);
+    fn on_access(&mut self, _db: u32, _key: &[u8]) {
+        // freq-in-object: the 2-bit promote frequency lives ON the stored object and the
+        // STORE bumps it inline on the read path (it holds the entry). The policy no
+        // longer keeps a per-key freq, so there is nothing to do here. The store no
+        // longer calls this on the hot path; kept as a no-op for the trait contract.
     }
 
     fn on_insert(&mut self, db: u32, key: &[u8], _bytes: usize) {
-        // A replace of an already-tracked key: it is already tracked, so just treat it
-        // as a fresh access (bump) rather than duplicating it.
-        if let Some(idx) = self.lookup(db, key) {
-            let slot = &mut self.slots[idx as usize];
-            slot.freq = (slot.freq + 1).min(MAX_FREQ);
-            return;
-        }
+        // A fresh insert: admit to main if the fingerprint is still in the ghost (it was
+        // popular enough to come back), else to the probationary small queue.
+        //
+        // A REPLACE of an already-tracked key is delivered by the store as on_remove
+        // THEN on_insert (the put funnel fires both), so the old queue entry was already
+        // spliced out by on_remove and there is no duplicate to guard against here. The
+        // store separately carries the REUSED KEY'S FREQUENCY across the replace (it
+        // copies the old entry's freq onto the new entry), preserving the S3-FIFO "a
+        // reused key keeps its frequency" semantic without the policy tracking it.
         let fp = Self::fingerprint(db, key);
         if self.ghost_contains(fp) {
-            // Seen recently: admit straight to main (it earned a second life).
             self.ghost_remove(fp);
-            let h = self.alloc_slot(db, key, QueueTag::Main);
-            self.main.push_back(h);
-            self.main_live += 1;
+            self.main.push_back((db, key.to_vec().into_boxed_slice()));
         } else {
-            // Fresh: probationary small queue.
-            let h = self.alloc_slot(db, key, QueueTag::Small);
-            self.small.push_back(h);
-            self.small_live += 1;
+            self.small.push_back((db, key.to_vec().into_boxed_slice()));
         }
     }
 
     fn on_remove(&mut self, db: u32, key: &[u8], _bytes: usize) {
-        // An external delete/replace/expiry: drop it from its queue so a stale entry
-        // is never returned as a victim. (A replace re-inserts afterwards via the
-        // store's put funnel, which fires on_remove then on_insert.) O(1): the slot is
-        // freed and its handle becomes a stale tombstone discarded on a later pop.
-        self.remove_entry(db, key);
+        // An external delete/replace/expiry: splice it out of its queue so a stale entry
+        // is never offered as a victim. (A replace re-inserts afterwards via the store's
+        // put funnel, which fires on_remove then on_insert.) O(N) splice, on the write
+        // path only.
+        self.remove_key(db, key);
     }
 
-    fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
-        // A returned victim has been pop_front'd OUT of its queue and freed: the policy
-        // no longer tracks it. The store may then SKIP deleting it (a volatile-* policy
-        // skips a non-TTL victim, see `ShardStore::evict_to_fit`); in that case the store
-        // calls [`EvictionPolicy::re_register`] to put the key BACK as a candidate (the
-        // #46 re-eligibility fix), so a later EXPIRE that attaches a TTL makes it eligible
-        // without a rewrite. (PR-3a instead DROPPED such a key, which under-evicted a
-        // volatile-* policy; #46 is now fixed.)
+    fn select_victim(&mut self, freq: &mut dyn VictimFreq) -> Option<(u32, Box<[u8]>)> {
+        // A returned victim has been pop_front'd OUT of its queue: the policy no longer
+        // tracks it. The store may then SKIP deleting it (a volatile-* policy skips a
+        // non-TTL victim, see `ShardStore::evict_to_fit`); in that case the store calls
+        // [`EvictionPolicy::re_register`] to put the key BACK as a candidate (the #46
+        // re-eligibility fix).
+        //
+        // freq-in-object: the promote/second-chance decision needs each candidate's
+        // freq, which lives on the STORED OBJECT now. We read it via `freq.get` and
+        // decrement it via `freq.dec`. A popped key whose `freq.get` returns `None` is a
+        // STALE tombstone (removed since, e.g. concurrently expired) and is skipped
+        // WITHOUT consuming a promotion round.
         //
         // Guaranteed progress: cap the total promotion/second-chance rounds so an
-        // all-hot keyspace still yields a victim instead of spinning. The bound is
-        // the current LIVE entry count plus a margin: after that many promotions every
-        // live entry's freq has been examined, and the eventual victim is returned. The
-        // +1 guarantees at least one attempt even with a single entry. A STALE handle
-        // (a tombstone from a prior `on_remove`) does NOT consume a round and is NOT a
-        // candidate: it is discarded and the loop continues, so the round budget is spent
-        // only on LIVE keys. Stale handles are finite and each is removed from its queue
-        // when popped, so the loop always makes progress and terminates.
+        // all-hot keyspace still yields a victim instead of spinning. The bound is the
+        // current entry count plus a margin: after that many promotions every live
+        // entry's freq has been examined, and the eventual victim is returned. The +1
+        // guarantees at least one attempt even with a single entry.
         let mut rounds = self.entry_count().saturating_add(1);
 
         loop {
             if rounds == 0 {
-                // Promotion cap hit (all-hot keyspace). Force-evict the small front,
-                // then main, then the re-offer queue, whichever has a LIVE handle, so the
-                // store always makes progress (it must be able to free SOMETHING to honor
-                // the budget). Stale handles encountered here are discarded.
-                if let Some((idx, _)) = self.pop_live(QueueTag::Small) {
-                    let (db, key) = self.take_key(idx);
-                    // Free (decrement `live`) BEFORE `ghost_record` so `ghost_cap`'s
-                    // `entry_count()` EXCLUDES this victim - matching PR-3a, which had
-                    // pop_front'd the victim out of its queue before recording the ghost.
-                    // (`take_key` already cloned the key out, so freeing here is safe.)
-                    self.free_slot(idx);
+                // Promotion cap hit (all-hot keyspace). Force-evict the small front, then
+                // main, then the re-offer queue, whichever has a key, so the store always
+                // makes progress (it must be able to free SOMETHING to honor the budget).
+                // Stale tombstones (freq None) are discarded as encountered.
+                if let Some((db, key)) = self.pop_present(QueueTag::Small, freq) {
+                    // Splice-count parity with PR-3a: the victim is OUT of its queue
+                    // (pop_front), so `entry_count()` already EXCLUDES it before
+                    // `ghost_record` computes `ghost_cap`.
                     self.ghost_record(Self::fingerprint(db, &key));
                     return Some((db, key));
                 }
-                if let Some((idx, _)) = self.pop_live(QueueTag::Main) {
-                    let (db, key) = self.take_key(idx);
-                    self.free_slot(idx);
+                if let Some((db, key)) = self.pop_present(QueueTag::Main, freq) {
                     return Some((db, key));
                 }
-                if let Some((idx, _)) = self.pop_live(QueueTag::Reoffer) {
-                    let (db, key) = self.take_key(idx);
-                    self.free_slot(idx);
+                if let Some((db, key)) = self.pop_present(QueueTag::Reoffer, freq) {
                     return Some((db, key));
                 }
                 return None;
@@ -530,105 +323,109 @@ impl EvictionHook for S3Fifo {
             // OVER its ~10% target (its overflow is the probationary churn S3-FIFO
             // evicts first); otherwise drain main with a second chance. When small is
             // within target but main is empty, fall back to small so a tiny keyspace
-            // (all in small) still yields a victim. The re-offer queue (skipped
-            // non-TTL volatile candidates, #46) is drained LAST, only once small and
-            // main are exhausted, so every fresh small/main candidate is offered first.
-            // Counts are LIVE counts (stale handles excluded).
-            let draw_small =
-                (self.small_live > self.small_cap() || self.main_live == 0) && self.small_live > 0;
+            // (all in small) still yields a victim. The re-offer queue (skipped non-TTL
+            // volatile candidates, #46) is drained LAST, only once small and main are
+            // exhausted, so every fresh small/main candidate is offered first.
+            let draw_small = (self.small.len() > self.small_cap() || self.main.is_empty())
+                && !self.small.is_empty();
 
             if draw_small {
-                let Some((idx, _)) = self.pop_live(QueueTag::Small) else {
-                    // Only stale handles remained in small; nothing live consumed. Retry
-                    // (the stale handles were drained by pop_live without using a round's
-                    // worth of decision, but we already spent a round; loop again).
+                let Some((db, key, f)) = self.pop_with_freq(QueueTag::Small, freq) else {
+                    // Only stale tombstones remained in small; nothing live consumed.
+                    // Loop again (we already spent a round).
                     continue;
                 };
-                if self.slots[idx as usize].freq > 1 {
-                    // Reused while probationary: promote to main (keep its frequency).
-                    let slot = &mut self.slots[idx as usize];
-                    slot.freq = MAX_FREQ.min(slot.freq);
-                    slot.queue = QueueTag::Main;
-                    let g = slot.generation;
-                    self.main.push_back(Handle { idx, generation: g });
-                    self.main_live += 1;
+                if f > 1 {
+                    // Reused while probationary: promote to main (its freq stays on the
+                    // object; nothing to write here).
+                    self.main.push_back((db, key));
                     continue;
                 }
-                // Cold one-hit-wonder: evict and remember its fingerprint. Free
-                // (decrement `live`) BEFORE `ghost_record` so `ghost_cap`'s
-                // `entry_count()` EXCLUDES this victim, matching PR-3a (which pop_front'd
-                // the victim before recording the ghost). `take_key` already cloned out.
-                let (db, key) = self.take_key(idx);
-                self.free_slot(idx);
+                // Cold one-hit-wonder: evict and remember its fingerprint. The key is
+                // already pop_front'd OUT, so `entry_count()` excludes it before
+                // `ghost_cap` (PR-3a parity).
                 self.ghost_record(Self::fingerprint(db, &key));
                 return Some((db, key));
             }
 
             // Second-chance scan of main.
-            if let Some((idx, _)) = self.pop_live(QueueTag::Main) {
-                if self.slots[idx as usize].freq > 0 {
-                    // Second chance: decrement and re-queue at the back.
-                    let slot = &mut self.slots[idx as usize];
-                    slot.freq -= 1;
-                    slot.queue = QueueTag::Main;
-                    let g = slot.generation;
-                    self.main.push_back(Handle { idx, generation: g });
-                    self.main_live += 1;
+            if let Some((db, key, f)) = self.pop_with_freq(QueueTag::Main, freq) {
+                if f > 0 {
+                    // Second chance: decrement the object's freq and re-queue at the back.
+                    freq.dec(db, &key);
+                    self.main.push_back((db, key));
                     continue;
                 }
                 // Cold in main: evict (no ghost record for main evictions, matching
                 // S3-FIFO: the ghost tracks SMALL-queue evictions of one-hit wonders).
-                let (db, key) = self.take_key(idx);
-                self.free_slot(idx);
                 return Some((db, key));
             }
 
-            // Small and main exhausted (of live handles): drain the lowest-priority
+            // Small and main exhausted (of present keys): drain the lowest-priority
             // re-offer queue (#46). These are keys the store skipped (non-TTL under
             // volatile-*) and asked to keep as candidates; offering them only now
             // guarantees a fresh small/main candidate (an eligible TTL victim included)
             // is always reached first. The store re-checks TTL and either evicts (if a
             // TTL has since been attached) or re-registers again; its distinct-key skip
             // set bounds the cycle.
-            if let Some((idx, _)) = self.pop_live(QueueTag::Reoffer) {
-                let (db, key) = self.take_key(idx);
-                self.free_slot(idx);
+            if let Some((db, key)) = self.pop_present(QueueTag::Reoffer, freq) {
                 return Some((db, key));
             }
 
-            // All three queues empty of live handles: nothing to evict.
+            // All three queues empty of present keys: nothing to evict.
             return None;
         }
     }
 }
 
+/// Which FIFO queue a `pop_*` helper draws from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueTag {
+    Small,
+    Main,
+    Reoffer,
+}
+
 impl S3Fifo {
-    /// Pop the front LIVE handle of `queue`, discarding any leading STALE tombstones
-    /// (their slots were freed by a prior `on_remove`), and decrement that queue's live
-    /// count for the live handle returned. Returns `(slot_idx, handle)` or `None` if the
-    /// queue holds no live handle. The slot is NOT freed here -- the caller decides to
-    /// evict (free) or requeue (push a fresh handle).
-    fn pop_live(&mut self, queue: QueueTag) -> Option<(u32, Handle)> {
+    /// Pop the front of `queue`, returning the first key that is STILL PRESENT in the
+    /// store (its `freq.get` is `Some`). Leading stale tombstones (removed since;
+    /// `freq.get` is `None`) are discarded as they are popped. Returns `(db, key)` or
+    /// `None` if the queue holds no present key.
+    fn pop_present(&mut self, queue: QueueTag, freq: &dyn VictimFreq) -> Option<(u32, Box<[u8]>)> {
         loop {
-            let h = match queue {
-                QueueTag::Small => self.small.pop_front(),
-                QueueTag::Main => self.main.pop_front(),
-                QueueTag::Reoffer => self.reoffer.pop_front(),
-            }?;
-            if let Some(idx) = self.resolve(h) {
-                self.dec_queue_live(queue);
-                return Some((idx, h));
+            let (db, key) = self.pop_front(queue)?;
+            if freq.get(db, &key).is_some() {
+                return Some((db, key));
             }
-            // Stale tombstone: skip it (its key was already removed; no live count to
-            // touch, it was decremented at removal time).
+            // Stale tombstone: the store removed this key since it was queued. Drop it
+            // and keep popping.
         }
     }
 
-    /// Clone out the `(db, key)` of the live slot at `idx` BEFORE freeing it (the victim
-    /// payload returned to the store).
-    fn take_key(&self, idx: u32) -> (u32, Box<[u8]>) {
-        let s = &self.slots[idx as usize];
-        (s.db, s.key.clone())
+    /// Pop the front PRESENT key of `queue` together with its current freq (read off the
+    /// stored object via `freq`). Leading stale tombstones are discarded. Returns
+    /// `(db, key, freq)` or `None`.
+    fn pop_with_freq(
+        &mut self,
+        queue: QueueTag,
+        freq: &dyn VictimFreq,
+    ) -> Option<(u32, Box<[u8]>, u8)> {
+        loop {
+            let (db, key) = self.pop_front(queue)?;
+            if let Some(f) = freq.get(db, &key) {
+                return Some((db, key, f));
+            }
+            // Stale tombstone: discard and keep popping.
+        }
+    }
+
+    /// Pop the raw front entry of `queue` (no presence check).
+    fn pop_front(&mut self, queue: QueueTag) -> Option<QKey> {
+        match queue {
+            QueueTag::Small => self.small.pop_front(),
+            QueueTag::Main => self.main.pop_front(),
+            QueueTag::Reoffer => self.reoffer.pop_front(),
+        }
     }
 }
 
@@ -651,18 +448,18 @@ impl EvictionPolicy for S3Fifo {
 
     fn access_freq(&self, _db: u32, _key: &[u8]) -> Option<u8> {
         // S3-FIFO is NOT an LFU engine: it keeps a 2-bit promote-frequency for its OWN
-        // queue decisions, not a Redis OBJECT FREQ estimate. OBJECT FREQ requires an
-        // LFU maxmemory policy, so the FIFO-class engine reports None and the dispatch
-        // layer emits the LFU-gating error (matching Redis, which errors OBJECT FREQ
-        // unless maxmemory-policy is *-lfu).
+        // queue decisions (now on the stored object), not a Redis OBJECT FREQ estimate.
+        // OBJECT FREQ requires an LFU maxmemory policy, so the FIFO-class engine reports
+        // None and the dispatch layer emits the LFU-gating error (matching Redis, which
+        // errors OBJECT FREQ unless maxmemory-policy is *-lfu).
         None
     }
 
     fn re_register(&mut self, db: u32, key: &[u8]) {
-        // The volatile-* re-eligibility fix (#46): `select_victim` pop_front'd this
-        // key, and the store declined to delete it (a non-TTL key under a volatile-*
-        // policy). Put it BACK so it stays an eviction candidate; a later EXPIRE that
-        // attaches a TTL then makes it eligible.
+        // The volatile-* re-eligibility fix (#46): `select_victim` pop_front'd this key,
+        // and the store declined to delete it (a non-TTL key under a volatile-* policy).
+        // Put it BACK so it stays an eviction candidate; a later EXPIRE that attaches a
+        // TTL then makes it eligible.
         //
         // We re-queue to the dedicated LOWEST-PRIORITY re-offer queue, NOT small or main.
         // Feeding skipped keys back into small kept it permanently OVER its ~10% target
@@ -670,194 +467,282 @@ impl EvictionPolicy for S3Fifo {
         // producing a false `-OOM` while an evictable volatile key existed (the #46 bug);
         // feeding them into main would symmetrically risk starving small. The separate
         // re-offer queue (drained by `select_victim` only after small and main) removes
-        // the starvation in BOTH directions: every fresh small/main candidate (an
-        // eligible TTL victim included) is offered before any re-registered key cycles
-        // again. The store's distinct-key skip set (see `ShardStore::evict_to_fit`) then
-        // terminates the scan once every live key has been offered with no eligible TTL
-        // victim. Idempotent: do not duplicate an already-tracked key.
+        // the starvation in BOTH directions. Idempotent: do not duplicate an
+        // already-tracked key.
         if self.tracks(db, key) {
             return;
         }
-        let h = self.alloc_slot(db, key, QueueTag::Reoffer);
-        self.reoffer.push_back(h);
-        self.reoffer_live += 1;
+        self.reoffer
+            .push_back((db, key.to_vec().into_boxed_slice()));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
-    fn ins(p: &mut S3Fifo, key: &[u8]) {
-        p.on_insert(0, key, key.len());
+    /// A test [`VictimFreq`] standing in for the store's tables: a `(db, key) -> freq`
+    /// map. A key absent from the map is treated as "no longer present" (a stale
+    /// tombstone), exactly as the real store reports a key it no longer holds. The tests
+    /// drive `ins`/`acc`/remove against BOTH this map and the policy so they stay in
+    /// lockstep, mirroring how the store bumps freq inline while the policy queues keys.
+    #[derive(Default)]
+    struct FreqMap {
+        freqs: HashMap<(u32, Vec<u8>), u8>,
     }
-    fn acc(p: &mut S3Fifo, key: &[u8]) {
-        p.on_access(0, key);
+
+    impl FreqMap {
+        fn insert(&mut self, db: u32, key: &[u8]) {
+            // A fresh key starts at freq 0 (the store's fresh-entry default). A replace
+            // keeps the existing freq (the store carries it across), so do not reset.
+            self.freqs.entry((db, key.to_vec())).or_insert(0);
+        }
+        fn bump(&mut self, db: u32, key: &[u8]) {
+            let e = self.freqs.entry((db, key.to_vec())).or_insert(0);
+            *e = (*e + 1).min(3);
+        }
+        fn remove(&mut self, db: u32, key: &[u8]) {
+            self.freqs.remove(&(db, key.to_vec()));
+        }
     }
-    fn victim_key(p: &mut S3Fifo) -> Option<Vec<u8>> {
-        p.select_victim().map(|(_, k)| k.into_vec())
+
+    impl VictimFreq for FreqMap {
+        fn get(&self, db: u32, key: &[u8]) -> Option<u8> {
+            self.freqs.get(&(db, key.to_vec())).copied()
+        }
+        fn dec(&mut self, db: u32, key: &[u8]) {
+            if let Some(f) = self.freqs.get_mut(&(db, key.to_vec())) {
+                *f = f.saturating_sub(1);
+            }
+        }
+    }
+
+    /// A policy + its companion freq map, driven together so the freq the store would
+    /// hold on the object is what `select_victim` reads through `VictimFreq`.
+    struct Harness {
+        p: S3Fifo,
+        f: FreqMap,
+    }
+
+    impl Harness {
+        fn new(volatile_only: bool) -> Self {
+            Harness {
+                p: S3Fifo::new(volatile_only),
+                f: FreqMap::default(),
+            }
+        }
+        /// Insert a key: the store would `on_insert` the key into the policy AND seed the
+        /// object's freq. A replace (key already present) keeps the freq (store carries
+        /// it), so the map is not reset.
+        fn ins(&mut self, key: &[u8]) {
+            self.f.insert(0, key);
+            self.p.on_insert(0, key, key.len());
+        }
+        /// Access a key: the store bumps the OBJECT's freq inline (the policy's on_access
+        /// is now a no-op).
+        fn acc(&mut self, key: &[u8]) {
+            self.f.bump(0, key);
+            self.p.on_access(0, key);
+        }
+        /// Remove a key (delete/expiry): the store drops the object (so the freq map
+        /// loses it) and fires on_remove.
+        fn rem(&mut self, key: &[u8]) {
+            self.f.remove(0, key);
+            self.p.on_remove(0, key, key.len());
+        }
+        /// Select a victim and, like the store, delete it from the freq map (the store
+        /// removes the object on a real eviction).
+        fn victim_key(&mut self) -> Option<Vec<u8>> {
+            let v = self.p.select_victim(&mut self.f);
+            if let Some((db, key)) = &v {
+                self.f.remove(*db, key);
+            }
+            v.map(|(_, k)| k.into_vec())
+        }
+        /// Select a victim WITHOUT deleting it from the freq map (the volatile-* skip
+        /// path: the store offers the key but declines to delete, then re-registers it).
+        fn offer_victim(&mut self) -> Option<Vec<u8>> {
+            self.p.select_victim(&mut self.f).map(|(_, k)| k.into_vec())
+        }
+        fn tracks(&self, key: &[u8]) -> bool {
+            self.p.tracks(0, key)
+        }
+        fn in_small(&self, key: &[u8]) -> bool {
+            self.p
+                .small
+                .iter()
+                .any(|(d, k)| *d == 0 && k.as_ref() == key)
+        }
+        fn in_main(&self, key: &[u8]) -> bool {
+            self.p
+                .main
+                .iter()
+                .any(|(d, k)| *d == 0 && k.as_ref() == key)
+        }
+        fn small_or_main_has(&self, key: &[u8]) -> bool {
+            self.in_small(key) || self.in_main(key)
+        }
+        fn live_count(&self) -> usize {
+            self.p.entry_count()
+        }
+        fn ghost_contains(&self, fp: u64) -> bool {
+            self.p.ghost_contains(fp)
+        }
     }
 
     #[test]
     fn ghost_cap_on_a_cold_eviction_excludes_the_victim_just_like_pr3a() {
         // REGRESSION (review finding): `ghost_record`'s `ghost_cap()` reads
-        // `entry_count()`. PR-3a pop_front'd the victim BEFORE recording the ghost, so the
-        // count EXCLUDED the victim. The O(1) rewrite must free the slot (decrement
-        // `live`) BEFORE `ghost_record` so the cap is computed on the same N-1, or the
-        // ghost ring keeps one extra fingerprint at the boundary, flipping a later
-        // re-insert's admission (main vs small) and the victim order. This only shows up
-        // at >= 10 live keys (below that `ghost_cap` floors at 8 and the off-by-one hides).
-        let mut p = S3Fifo::new(false);
+        // `entry_count()`. The victim is pop_front'd OUT of its queue BEFORE recording
+        // the ghost, so the count EXCLUDES the victim. If it did not, the ghost ring
+        // would keep one extra fingerprint at the boundary, flipping a later re-insert's
+        // admission (main vs small) and the victim order. This only shows up at >= 10
+        // live keys (below that `ghost_cap` floors at 8 and the off-by-one hides).
+        let mut h = Harness::new(false);
         // (1) Evict 8 distinct cold keys so the ghost ring fills to its floor of 8.
         let cold: [&[u8]; 8] = [b"a0", b"a1", b"a2", b"a3", b"a4", b"a5", b"a6", b"a7"];
         for k in cold {
-            ins(&mut p, k);
-            assert_eq!(victim_key(&mut p), Some(k.to_vec()));
+            h.ins(k);
+            assert_eq!(h.victim_key(), Some(k.to_vec()));
         }
         for k in cold {
-            assert!(p.ghost_contains(S3Fifo::fingerprint(0, k)));
+            assert!(h.ghost_contains(S3Fifo::fingerprint(0, k)));
         }
         // (2) Insert 10 fresh keys: now entry_count == 10 (> the 9-key ghost-cap knee).
         let fresh: [&[u8]; 10] = [
             b"f0", b"f1", b"f2", b"f3", b"f4", b"f5", b"f6", b"f7", b"f8", b"f9",
         ];
         for k in fresh {
-            ins(&mut p, k);
+            h.ins(k);
         }
         // (3) The first cold eviction records fresh f0's fingerprint. With the victim
         // EXCLUDED (live 10 -> 9 before the cap), ghost_cap == 8, so pushing f0 trims the
         // OLDEST fingerprint (a0). The buggy ordering (cap computed on 10) would keep a0.
-        assert_eq!(victim_key(&mut p), Some(b"f0".to_vec()));
+        assert_eq!(h.victim_key(), Some(b"f0".to_vec()));
         assert!(
-            !p.ghost_contains(S3Fifo::fingerprint(0, b"a0")),
+            !h.ghost_contains(S3Fifo::fingerprint(0, b"a0")),
             "a0 must be trimmed: ghost_cap on a cold eviction must exclude the victim (PR-3a parity)"
         );
         // The just-evicted f0 and a still-recent a7 remain in the ring (it is not empty).
-        assert!(p.ghost_contains(S3Fifo::fingerprint(0, b"f0")));
-        assert!(p.ghost_contains(S3Fifo::fingerprint(0, b"a7")));
+        assert!(h.ghost_contains(S3Fifo::fingerprint(0, b"f0")));
+        assert!(h.ghost_contains(S3Fifo::fingerprint(0, b"a7")));
         // (4) Re-inserting a0 now MISSES the ghost -> admitted to small (not main), the
         // PR-3a admission this fix preserves.
-        ins(&mut p, b"a0");
+        h.ins(b"a0");
         assert!(
-            p.in_small(b"a0"),
+            h.in_small(b"a0"),
             "a0 missed the ghost, so it lands in small"
         );
     }
 
-    // Test-only helpers over the new representation (the PR-3a tests poked the
-    // `VecDeque<Entry>` directly; these check the same facts against the slab + handle
-    // queues). A key is "in small" iff a LIVE handle in the small queue resolves to a
-    // slot matching it, etc.
-    impl S3Fifo {
-        /// Whether a LIVE handle in `queue` resolves to a slot holding `(0, key)`.
-        fn contains_in(&self, queue: &VecDeque<Handle>, key: &[u8]) -> bool {
-            queue.iter().any(|&h| {
-                self.slots
-                    .get(h.idx as usize)
-                    .is_some_and(|s| s.live && s.generation == h.generation && s.matches(0, key))
-            })
-        }
-        fn in_small(&self, key: &[u8]) -> bool {
-            self.contains_in(&self.small, key)
-        }
-        fn in_main(&self, key: &[u8]) -> bool {
-            self.contains_in(&self.main, key)
-        }
-        fn small_or_main_has(&self, key: &[u8]) -> bool {
-            self.in_small(key) || self.in_main(key)
-        }
-        /// The total LIVE tracked count (== `entry_count`), for the "drained empty" checks.
-        fn live_count(&self) -> usize {
-            self.entry_count()
-        }
-    }
-
     #[test]
     fn cold_key_is_evicted_before_a_hot_one() {
-        let mut p = S3Fifo::new(false);
-        ins(&mut p, b"cold");
-        ins(&mut p, b"hot");
+        let mut h = Harness::new(false);
+        h.ins(b"cold");
+        h.ins(b"hot");
         // "hot" is accessed several times (freq > 1), "cold" never.
-        acc(&mut p, b"hot");
-        acc(&mut p, b"hot");
+        h.acc(b"hot");
+        h.acc(b"hot");
         // The first victim must be the cold key: the hot key is skipped (its freq
         // keeps it; it is either promoted past or left queued behind cold).
-        assert_eq!(victim_key(&mut p), Some(b"cold".to_vec()));
+        assert_eq!(h.victim_key(), Some(b"cold".to_vec()));
         // The hot key survived the first eviction (it is still tracked somewhere).
         assert!(
-            p.small_or_main_has(b"hot"),
+            h.small_or_main_has(b"hot"),
             "the hot key must survive the cold eviction"
         );
         // The cold key is gone from both queues.
         assert!(
-            !p.small_or_main_has(b"cold"),
+            !h.small_or_main_has(b"cold"),
             "the cold key must be evicted"
         );
         // A subsequent eviction (with no further accesses) eventually frees the hot
         // key too, demonstrating the second-chance drain terminates.
-        let next = victim_key(&mut p);
+        let next = h.victim_key();
         assert_eq!(next, Some(b"hot".to_vec()));
-        assert!(p.live_count() == 0);
+        assert!(h.live_count() == 0);
     }
 
     #[test]
     fn ghost_readmits_a_returning_key_to_main() {
-        let mut p = S3Fifo::new(false);
-        ins(&mut p, b"k");
+        let mut h = Harness::new(false);
+        h.ins(b"k");
         // Evict it (cold) -> fingerprint lands in ghost.
-        assert_eq!(victim_key(&mut p), Some(b"k".to_vec()));
-        assert!(p.ghost_contains(S3Fifo::fingerprint(0, b"k")));
+        assert_eq!(h.victim_key(), Some(b"k".to_vec()));
+        assert!(h.ghost_contains(S3Fifo::fingerprint(0, b"k")));
         // Re-insert: it was in ghost, so it is admitted straight to main.
-        ins(&mut p, b"k");
-        assert!(p.in_main(b"k"));
-        assert!(!p.in_small(b"k"));
+        h.ins(b"k");
+        assert!(h.in_main(b"k"));
+        assert!(!h.in_small(b"k"));
         // And the ghost entry was consumed.
-        assert!(!p.ghost_contains(S3Fifo::fingerprint(0, b"k")));
+        assert!(!h.ghost_contains(S3Fifo::fingerprint(0, b"k")));
     }
 
     #[test]
     fn all_keys_hot_still_yields_a_victim_within_the_promotion_cap() {
         // Every key is hot (high freq). The promotion cap must still force a victim
         // out so the store's evict-to-fit loop terminates (guaranteed progress).
-        let mut p = S3Fifo::new(false);
+        let mut h = Harness::new(false);
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
-            ins(&mut p, k);
-            // Hammer each key so freq saturates at MAX in both small and (later) main.
+            h.ins(k);
+            // Hammer each key so freq saturates at MAX.
             for _ in 0..10 {
-                acc(&mut p, k);
+                h.acc(k);
             }
         }
         // Even though nothing is cold, select_victim must return Some within bounded
         // rounds (not loop forever).
-        let v = victim_key(&mut p);
+        let v = h.victim_key();
         assert!(v.is_some(), "an all-hot keyspace must still yield a victim");
         // Draining keeps yielding victims until empty, never spinning.
         let mut count = 1;
-        while victim_key(&mut p).is_some() {
+        while h.victim_key().is_some() {
             count += 1;
             assert!(
                 count <= 100,
                 "select_victim must not spin on a hot keyspace"
             );
         }
-        assert!(p.live_count() == 0);
+        assert!(h.live_count() == 0);
     }
 
     #[test]
     fn empty_policy_yields_no_victim() {
-        let mut p = S3Fifo::new(false);
-        assert_eq!(p.select_victim(), None);
+        let mut h = Harness::new(false);
+        assert_eq!(h.offer_victim(), None);
     }
 
     #[test]
     fn on_remove_drops_a_queued_key_so_it_is_not_returned() {
-        let mut p = S3Fifo::new(false);
-        ins(&mut p, b"x");
-        ins(&mut p, b"y");
-        p.on_remove(0, b"x", 1);
+        let mut h = Harness::new(false);
+        h.ins(b"x");
+        h.ins(b"y");
+        h.rem(b"x");
         // x was removed externally; the only victim now is y.
-        assert_eq!(victim_key(&mut p), Some(b"y".to_vec()));
-        assert_eq!(p.select_victim(), None);
+        assert_eq!(h.victim_key(), Some(b"y".to_vec()));
+        assert_eq!(h.offer_victim(), None);
+    }
+
+    #[test]
+    fn a_stale_tombstone_in_the_queue_is_skipped_not_returned() {
+        // freq-in-object edge: if the store removed a key from the OBJECT TABLE but the
+        // policy's queue still holds it (e.g. a path that did not fire on_remove), the
+        // freq map reports None and select_victim skips it WITHOUT consuming a round or
+        // returning a dead key. Force this by removing only from the freq map.
+        let mut h = Harness::new(false);
+        h.ins(b"gone");
+        h.ins(b"live");
+        // Simulate the store dropping `gone` from its tables without an on_remove: only
+        // the freq map loses it, the policy queue still holds the stale key.
+        h.f.remove(0, b"gone");
+        // select_victim pops `gone` (freq None -> skip), then returns `live`.
+        assert_eq!(h.victim_key(), Some(b"live".to_vec()));
+        assert_eq!(
+            h.offer_victim(),
+            None,
+            "the stale tombstone was skipped, not returned"
+        );
     }
 
     #[test]
@@ -889,36 +774,26 @@ mod tests {
     #[test]
     fn re_register_keeps_a_skipped_victim_trackable() {
         // The #46 re-eligibility fix: a victim the store declines to delete (a non-TTL
-        // key under volatile-*) is RE-REGISTERED, so the policy keeps offering it. The
-        // PR-3a path dropped it (on_remove), so it could never be a victim again.
-        let mut p = S3Fifo::new(true);
-        ins(&mut p, b"x");
+        // key under volatile-*) is RE-REGISTERED, so the policy keeps offering it.
+        let mut h = Harness::new(true);
+        h.ins(b"x");
         // The store pulls x as a victim, then (non-TTL under volatile-*) re-registers
-        // it instead of deleting.
-        let v = p.select_victim().expect("x is offered as a victim");
-        assert_eq!(v.1.as_ref(), b"x");
+        // it instead of deleting (so it stays in the freq map: use offer_victim).
+        let v = h.offer_victim().expect("x is offered as a victim");
+        assert_eq!(v, b"x".to_vec());
         // After select_victim, x is no longer queued (it was pop_front'd).
-        assert!(!p.tracks(0, b"x"), "select_victim pops the candidate out");
-        // Re-register puts it back (into the lowest-priority re-offer queue) so it stays
-        // a candidate.
-        p.re_register(0, b"x");
-        assert!(
-            p.tracks(0, b"x"),
-            "re_register keeps the key trackable (#46)"
-        );
-        // It is offered again on the next pass (now eligible if it has since gained a
-        // TTL at the store; the policy does not know about TTL, the store filters).
-        assert_eq!(
-            p.select_victim().map(|(_, k)| k.into_vec()),
-            Some(b"x".to_vec())
-        );
+        assert!(!h.tracks(b"x"), "select_victim pops the candidate out");
+        // Re-register puts it back (into the lowest-priority re-offer queue).
+        h.p.re_register(0, b"x");
+        assert!(h.tracks(b"x"), "re_register keeps the key trackable (#46)");
+        // It is offered again on the next pass.
+        assert_eq!(h.offer_victim(), Some(b"x".to_vec()));
         // re_register is idempotent: re-registering a still-tracked key does not dup.
-        p.re_register(0, b"x"); // x was just popped, so this re-adds once
-        p.re_register(0, b"x"); // already present now -> no-op
-        // Exactly one live tracked instance of x (no duplicate).
-        assert!(p.tracks(0, b"x"));
+        h.p.re_register(0, b"x"); // x was just popped, so this re-adds once
+        h.p.re_register(0, b"x"); // already present now -> no-op
+        assert!(h.tracks(b"x"));
         assert_eq!(
-            p.live_count(),
+            h.live_count(),
             1,
             "re_register must not duplicate a tracked key"
         );
@@ -933,33 +808,15 @@ mod tests {
     }
 
     #[test]
-    fn slot_recycling_does_not_resurrect_a_removed_key() {
-        // A removed key's handle becomes a stale tombstone; its slot recycles for a new
-        // key. The stale handle must NOT resolve to the new key, and the index must not
-        // report the removed key as tracked.
-        let mut p = S3Fifo::new(false);
-        ins(&mut p, b"a");
-        ins(&mut p, b"b");
-        p.on_remove(0, b"a", 1); // frees a's slot (likely idx 0), leaves a stale handle
-        assert!(!p.tracks(0, b"a"));
-        ins(&mut p, b"c"); // recycles the freed slot for c (bumps gen)
-        assert!(p.tracks(0, b"c"));
-        assert!(!p.tracks(0, b"a"), "removed key must not resurrect");
-        // The live tracked set is exactly {b, c}.
-        assert_eq!(p.live_count(), 2);
-        assert!(p.tracks(0, b"b"));
-    }
-
-    #[test]
-    fn replace_of_a_tracked_key_bumps_not_duplicates() {
-        // on_insert of an already-tracked key bumps its freq (a replace) rather than
-        // allocating a second slot (the O(1) tracks-then-bump path).
-        let mut p = S3Fifo::new(false);
-        ins(&mut p, b"k");
-        ins(&mut p, b"k");
-        ins(&mut p, b"k");
-        assert_eq!(p.live_count(), 1, "a replace must not duplicate the key");
-        let idx = p.lookup(0, b"k").expect("k tracked");
-        assert!(p.slots[idx as usize].freq >= 1, "the replace bumped freq");
+    fn replace_does_not_duplicate_the_key_in_a_queue() {
+        // The store delivers a replace as on_remove THEN on_insert, so the old queue
+        // entry is spliced out first and there is exactly one queue entry for the key.
+        let mut h = Harness::new(false);
+        h.ins(b"k");
+        // Simulate the store's replace funnel: on_remove then on_insert.
+        h.p.on_remove(0, b"k", 1);
+        h.p.on_insert(0, b"k", 1);
+        assert_eq!(h.live_count(), 1, "a replace must not duplicate the key");
+        assert!(h.tracks(b"k"));
     }
 }

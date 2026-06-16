@@ -71,7 +71,7 @@ pub use random::Random;
 pub use s3fifo::S3Fifo;
 pub use wtinylfu::{CmSketch, WTinyLfu};
 
-use ironcache_storage::EvictionHook;
+use ironcache_storage::{EvictionHook, VictimFreq};
 
 /// The pluggable eviction policy contract (EVICTION.md #48). It EXTENDS the reserved
 /// storage hook [`EvictionHook`] (the per-access/insert/remove callbacks and victim
@@ -186,12 +186,14 @@ impl EvictionHook for Policy {
     }
 
     #[inline]
-    fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
+    fn select_victim(&mut self, freq: &mut dyn VictimFreq) -> Option<(u32, Box<[u8]>)> {
         match self {
             Policy::NoEviction => None,
-            Policy::S3Fifo(p) => p.select_victim(),
-            Policy::Random(p) => p.select_victim(),
-            Policy::WTinyLfu(p) => p.select_victim(),
+            // Only S3-FIFO reads `freq` (the store-side object freq); Random/W-TinyLFU
+            // keep their own (or no) frequency and ignore it.
+            Policy::S3Fifo(p) => p.select_victim(freq),
+            Policy::Random(p) => p.select_victim(freq),
+            Policy::WTinyLfu(p) => p.select_victim(freq),
         }
     }
 }

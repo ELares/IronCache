@@ -47,7 +47,7 @@ use ironcache_eviction::{EvictionPolicy, Policy, map_policy_name};
 use ironcache_storage::{
     AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
     MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
-    RmwStep, ScanCursor, Store, UnixMillis, ValueRef, WatchEntry,
+    RmwStep, ScanCursor, Store, UnixMillis, ValueRef, VictimFreq, WatchEntry,
 };
 use kvobj::{Entry, KvObj};
 use std::hash::BuildHasher;
@@ -268,6 +268,46 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// [`ScanCursor::SHARD_BITS`] when more than one shard is configured. Set ONCE at
     /// construction from the boot shard count; the store reads no shard topology otherwise.
     scan_band_bits: u32,
+}
+
+/// The store-side [`VictimFreq`] the eviction policy reads through during
+/// `select_victim` (freq-in-object). It borrows the store's per-DB tables + the table
+/// hasher so it can look up the live entry for a candidate `(db, key)` and read or
+/// decrement its 2-bit S3-FIFO promote frequency (which now lives ON the entry).
+///
+/// `evict_to_fit` SPLITS the `ShardStore` borrow (`&mut self.eviction` plus this over
+/// `&mut self.dbs`) so the policy can read the freq out of the tables WITHOUT a
+/// double-borrow of `self`. It mirrors `db_index`'s clamp (the command layer validates
+/// the db range upstream; the clamp is the same defensive backstop).
+struct TableVictimFreq<'a> {
+    dbs: &'a mut Vec<HashTable<Entry>>,
+    hasher: &'a DefaultHashBuilder,
+}
+
+impl TableVictimFreq<'_> {
+    /// The clamped map index for `db` (same backstop as [`ShardStore::db_index`]).
+    fn db_index(&self, db: u32) -> usize {
+        (db as usize).min(self.dbs.len().saturating_sub(1))
+    }
+}
+
+impl VictimFreq for TableVictimFreq<'_> {
+    fn get(&self, db: u32, key: &[u8]) -> Option<u8> {
+        let db_idx = self.db_index(db);
+        let h = self.hasher.hash_one(key);
+        self.dbs
+            .get(db_idx)?
+            .find(h, |e| e.key() == key)
+            .map(Entry::freq)
+    }
+
+    fn dec(&mut self, db: u32, key: &[u8]) {
+        let db_idx = self.db_index(db);
+        let h = self.hasher.hash_one(key);
+        if let Some(obj) = self.dbs[db_idx].find_mut(h, |e| e.key() == key) {
+            obj.dec_freq();
+        }
+    }
 }
 
 /// One WATCH per-key version slot (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Held in
@@ -533,6 +573,15 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             match self.dbs[db_idx].entry(h, |e| e.key() == key, |e| hasher.hash_one(e.key())) {
                 hashbrown::hash_table::Entry::Occupied(mut e) => {
                     let old = e.get().accounted_bytes();
+                    // freq-in-object: a reused key KEEPS its S3-FIFO promote frequency
+                    // (the policy semantic "a replaced key carries its frequency"). The
+                    // freq now lives ON the entry, so an upsert that swaps the value
+                    // would reset it to 0 unless we carry the old entry's freq onto the
+                    // new entry here. (The policy's on_remove/on_insert below only moves
+                    // the KEY between queues; the freq is the store's to preserve.)
+                    let old_freq = e.get().freq();
+                    let mut obj = obj;
+                    obj.set_freq(old_freq);
                     *e.get_mut() = obj;
                     Some(old)
                 }
@@ -669,12 +718,16 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         if !self.expire_if_due(db, db_idx, key, now) {
             return None;
         }
-        // The S3-FIFO 2-bit frequency is owned by the POLICY (per-key counter bumped
-        // in `on_access`); the kvobj `eviction_rank` header field is RESERVED for the
-        // eventual single-source migration (see the eviction crate docs) and is not
-        // written on the access path, since nothing reads it today.
-        self.eviction.on_access(db, key);
+        // freq-in-object: the S3-FIFO 2-bit promote frequency lives ON the stored entry,
+        // and the store bumps the just-accessed entry INLINE here (it already holds the
+        // entry, so this is O(1) with NO policy lookup). The eviction policy no longer
+        // owns a per-key index, and the per-access `on_access` policy call is GONE from
+        // the hot path (the no-op policies do nothing with it, and the FIFO-class engine
+        // reads the freq off the object at `select_victim` time via `VictimFreq`).
         let h = self.key_hash(key);
+        if let Some(obj) = self.dbs[db_idx].find_mut(h, |e| e.key() == key) {
+            obj.bump_freq();
+        }
         self.dbs[db_idx]
             .find(h, |e| e.key() == key)
             .map(Self::view_of)
@@ -730,11 +783,14 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
 
         // Observe (atomically with the write that follows, on the owning core).
         let step = if live {
-            // The S3-FIFO 2-bit frequency is owned by the POLICY (bumped in
-            // `on_access`); the kvobj `eviction_rank` header field is RESERVED, not
-            // written here (nothing reads it). See the eviction crate docs.
-            self.eviction.on_access(db, key);
+            // freq-in-object: bump the just-accessed entry's S3-FIFO freq INLINE (the
+            // store holds the entry, O(1), no policy lookup). The per-access `on_access`
+            // policy call is gone from the hot path; the policy reads the freq off the
+            // object at `select_victim` time via `VictimFreq`.
             let h = self.key_hash(key);
+            if let Some(obj) = self.dbs[db_idx].find_mut(h, |e| e.key() == key) {
+                obj.bump_freq();
+            }
             let obj = self.dbs[db_idx]
                 .find(h, |e| e.key() == key)
                 .expect("live entry present");
@@ -825,10 +881,15 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // mutable handle, run the closure, then measure the post-edit weight.
         let key_h = self.key_hash(key);
         let old_bytes = if live {
-            self.eviction.on_access(db, key);
+            // freq-in-object: bump the accessed entry's S3-FIFO freq INLINE (O(1), no
+            // policy lookup) and read its pre-edit weight in the SAME mutable borrow.
+            // The per-access `on_access` policy call is gone from the hot path.
             self.dbs[db_idx]
-                .find(key_h, |e| e.key() == key)
-                .map_or(0, Entry::accounted_bytes)
+                .find_mut(key_h, |e| e.key() == key)
+                .map_or(0, |obj| {
+                    obj.bump_freq();
+                    obj.accounted_bytes()
+                })
         } else {
             0
         };
@@ -1096,7 +1157,17 @@ impl<E: EvictionPolicy, A: AccountingHook> ironcache_storage::Admit for ShardSto
                 break;
             }
             rounds += 1;
-            let Some((db, key)) = self.eviction.select_victim() else {
+            // freq-in-object: the policy reads each candidate's S3-FIFO freq through a
+            // `VictimFreq` backed by the store's own tables. `self.eviction` and
+            // `self.dbs` are SEPARATE fields, so we split the borrow: bind each as its
+            // own `&mut` rather than going through `&mut self` (which would double-borrow
+            // when the closure over `dbs` is handed to `eviction.select_victim`).
+            let evict = &mut self.eviction;
+            let mut freq = TableVictimFreq {
+                dbs: &mut self.dbs,
+                hasher: &self.hasher,
+            };
+            let Some((db, key)) = evict.select_victim(&mut freq) else {
                 break;
             };
             let db_idx = self.db_index(db);
@@ -1951,9 +2022,21 @@ mod policy_swap_tests {
 
     use super::*;
     use ironcache_eviction::EvictionPolicy;
-    use ironcache_storage::{Admit, CountingAccounting, NewValue, PolicySwap, Store};
+    use ironcache_storage::{Admit, CountingAccounting, NewValue, PolicySwap, Store, VictimFreq};
 
     type TestStore = ShardStore<Policy, CountingAccounting>;
+
+    /// A no-op [`VictimFreq`] for the policy-direct tests: the Random policy ignores
+    /// freq entirely (it has no recency/frequency notion), so `select_victim` is fed a
+    /// `VictimFreq` that reports no key present. (The S3-FIFO freq path is exercised by
+    /// the integration tests in `tests/eviction.rs`, which drive a real store.)
+    struct NoFreq;
+    impl VictimFreq for NoFreq {
+        fn get(&self, _db: u32, _key: &[u8]) -> Option<u8> {
+            None
+        }
+        fn dec(&mut self, _db: u32, _key: &[u8]) {}
+    }
 
     fn store_with(name: &str) -> TestStore {
         let policy = map_policy_name(name, 1).expect("known policy name");
@@ -2129,6 +2212,9 @@ mod policy_swap_tests {
         assert!(a.set_policy_by_name("allkeys-random", 12345, UnixMillis(0)));
         assert!(b.set_policy_by_name("allkeys-random", 12345, UnixMillis(0)));
         // The same seed over the same re-seeded roster yields the same victim choice.
-        assert_eq!(a.eviction.select_victim(), b.eviction.select_victim());
+        assert_eq!(
+            a.eviction.select_victim(&mut NoFreq),
+            b.eviction.select_victim(&mut NoFreq)
+        );
     }
 }
