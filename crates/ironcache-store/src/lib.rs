@@ -576,13 +576,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             kvobj::ValueRepr::Int(n) => {
                 ValueRef::from_int_bytes(obj.header.data_type, obj.expire_at, int_decimal_bytes(*n))
             }
-            kvobj::ValueRepr::Inline(b) => ValueRef::borrowed(
-                obj.header.data_type,
-                obj.header.encoding,
-                obj.expire_at,
-                b.as_bytes(),
-            ),
-            kvobj::ValueRepr::Raw(b) => {
+            // Embstr and raw both borrow their bytes the same way; the embstr-vs-raw
+            // distinction is carried by `obj.header.encoding`, not the variant.
+            kvobj::ValueRepr::Inline(b) | kvobj::ValueRepr::Raw(b) => {
                 ValueRef::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
             // A LIST/HASH/SET is not byte-readable as a string: the command layer only
@@ -612,13 +608,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 obj.expire_at,
                 int_decimal_bytes(*n),
             ),
-            kvobj::ValueRepr::Inline(b) => OccupiedEntry::borrowed(
-                obj.header.data_type,
-                obj.header.encoding,
-                obj.expire_at,
-                b.as_bytes(),
-            ),
-            kvobj::ValueRepr::Raw(b) => {
+            // Embstr and raw both borrow their bytes the same way; the embstr-vs-raw
+            // distinction is carried by `obj.header.encoding`, not the variant.
+            kvobj::ValueRepr::Inline(b) | kvobj::ValueRepr::Raw(b) => {
                 OccupiedEntry::borrowed(obj.header.data_type, obj.header.encoding, obj.expire_at, b)
             }
             // A LIST/HASH/SET observed through the READ-ONLY rmw arm (e.g. a numeric RMW

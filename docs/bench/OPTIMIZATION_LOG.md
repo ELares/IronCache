@@ -71,6 +71,24 @@ needle ~10 times, abandon it and try a structurally different one.
 | --- | --- | --- | --- | --- | --- |
 | 1 | L-COLL: box List/Hash/Set/ZSet variants | ValueRepr 72->48, slot 128->104, ~20 B/key | bytes/key 526.7 -> 421.86 (-20%; gap 2.41x -> 1.93x). memmodel table slack 209.7 -> 146.8 | qps 71.4k -> 77.9k (+9%, smaller slot = better cache density) | **KEPT** - improved BOTH, zero behavior change (all tests green), SSO preserved |
 
+| 2 | L-VR: box the embstr inline buffer (Inline(InlineBuf) -> Inline(Box<[u8]>)) | ValueRepr 48->24, slot 104->80, more table savings | bytes/key (128B) 421.86 -> 386.85 (gap 1.93x -> 1.77x); table slack 146.8 -> 125.8; embstr total 177 -> 172 | qps ~77.6k (flat) | **KEPT** - improved 128B memory; allocation-parity with redis (which also heap-allocs the object) |
+
+### KEY STRUCTURAL FINDING (after rounds 1-2)
+The SMALL-value case exposes the real wall. At 32B values: IronCache 291 vs redis
+101 bytes/key = 2.88x. redis 8.8's kvobj packs key+value+ttl into ONE allocation
+(~69 B overhead) behind a pointer-sized dict slot. IronCache makes ~3 allocations
+per key (the key Box, the value Box, and carries a 64 B object in an 80 B table
+slot) AND duplicates the key (the hashbrown key + nothing shares it). Safe
+field-shrinks (rounds 1-2) cannot close this; the per-key FIXED overhead is
+structural. THE LEVER: a SINGLE-ALLOCATION entry holding header+key+value in one
+Box<[u8]> blob, in a key-dedup table (hashbrown's low-level HashTable, hashing the
+key slice inside the blob), so a string key is ONE allocation and a pointer-sized
+slot, like Redis/Dragonfly. This is SAFE (Box<[u8]> slicing, no unsafe), so it
+does NOT need an unsafe/ADR decision; it is a large store-core rewrite. Collections
+stay boxed structs (not flat blobs). Scoped as Round 3 (the big one). Micro-tweaks
+(u64 TTL sentinel, inline short keys) are deliberately SKIPPED because the
+single-alloc rewrite subsumes them (no tunnel vision on soon-replaced changes).
+
 ### Round 1 detail
 Boxed `ValueRepr::{List,Hash,Set,ZSet}` (kvobj.rs) + the rmw dispatch / accessors
 (lib.rs); 2 files, ~13 sites, all tests green, sizeof KvObj 112->88, ValueRepr

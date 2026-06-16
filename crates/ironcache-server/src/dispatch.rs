@@ -2372,7 +2372,7 @@ mod tests {
             ttl_present: false,
             snapshot_version: 0,
         };
-        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        obj.value = ValueRepr::Inline(Box::from(&b"x"[..]));
         st.insert_object(0, obj);
 
         // GET / STRLEN / GETSET against the non-string -> WRONGTYPE.
@@ -2421,7 +2421,7 @@ mod tests {
             ttl_present: false,
             snapshot_version: 0,
         };
-        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        obj.value = ValueRepr::Inline(Box::from(&b"x"[..]));
         st.insert_object(0, obj);
 
         // MGET str missing lst -> [bulk("hi"), Null, Null]. The non-string yields Null,
@@ -2726,7 +2726,7 @@ mod tests {
             ttl_present: false,
             snapshot_version: 0,
         };
-        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        obj.value = ValueRepr::Inline(Box::from(&b"x"[..]));
         st.insert_object(0, obj);
         assert_eq!(
             err_line(run_on(&c, &mut s, &mut st, t, &[b"INCR", b"lst"])),
@@ -2769,7 +2769,7 @@ mod tests {
             ttl_present: false,
             snapshot_version: 0,
         };
-        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        obj.value = ValueRepr::Inline(Box::from(&b"x"[..]));
         st.insert_object(0, obj);
         assert_eq!(
             err_line(run_on(
@@ -4196,7 +4196,7 @@ mod tests {
             ttl_present: false,
             snapshot_version: 0,
         };
-        obj.value = ValueRepr::Inline(ironcache_store::kvobj::InlineBuf::from_bytes(b"x"));
+        obj.value = ValueRepr::Inline(Box::from(&b"x"[..]));
         st.insert_object(0, obj);
         match run_on_wheel(&c, &mut s, &mut st, &mut wheel, t, &[b"GETEX", b"lst"]) {
             Value::Error(e) => assert_eq!(

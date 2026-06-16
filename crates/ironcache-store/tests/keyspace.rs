@@ -13,7 +13,7 @@ use ironcache_storage::{
     UnixMillis,
 };
 use ironcache_store::ShardStore;
-use ironcache_store::kvobj::{Header, InlineBuf, KvObj, ValueRepr};
+use ironcache_store::kvobj::{Header, KvObj, ValueRepr};
 use std::collections::HashSet;
 
 const NOW: UnixMillis = UnixMillis(1_000);
@@ -256,7 +256,7 @@ fn scan_type_filter_selects_by_data_type() {
         ttl_present: false,
         snapshot_version: 0,
     };
-    lst.value = ValueRepr::Inline(InlineBuf::from_bytes(b"x"));
+    lst.value = ValueRepr::Inline(Box::from(&b"x"[..]));
     s.insert_object(0, lst);
 
     let mut out = Vec::new();

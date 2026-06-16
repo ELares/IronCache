@@ -22,13 +22,14 @@
 //! all three so bytes-per-key is reported per class:
 //!
 //! - [`EncodingClass::Int`]: a canonical i64 in decimal (e.g. `"12345"`). Stored
-//!   with NO value heap allocation (the integer lives inline in the object).
-//!   Note its per-key footprint equals embstr's: the stored-value enum is sized
-//!   for its largest inline variant, so int saves a heap allocation but not slot
-//!   bytes. `OBJECT ENCODING` -> `int`.
+//!   inline in the per-key object's value enum with NO value heap allocation (the
+//!   `int` variant is the only string-family variant that does not box its bytes).
+//!   `OBJECT ENCODING` -> `int`.
 //! - [`EncodingClass::EmbStr`]: a short string at or below the embstr threshold
-//!   (44 bytes, [`ironcache_store::encoding::EMBSTR_THRESHOLD`]), stored inline in
-//!   the object (SSO). `OBJECT ENCODING` -> `embstr`.
+//!   (44 bytes, [`ironcache_store::encoding::EMBSTR_THRESHOLD`]), stored in a single
+//!   boxed value allocation (memory Round 2 shrank the per-key slot by boxing the
+//!   embstr bytes rather than carrying a fixed inline buffer). `OBJECT ENCODING` ->
+//!   `embstr`.
 //! - [`EncodingClass::Raw`]: a longer string stored out-of-line (a separate heap
 //!   allocation). `OBJECT ENCODING` -> `raw`.
 
