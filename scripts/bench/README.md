@@ -2,6 +2,12 @@
 
 # IronCache benchmark run script
 
+> Where IronCache stands today, and the prioritized optimization scope, are in
+> [docs/bench/FINDINGS.md](../../docs/bench/FINDINGS.md) (A6). Headline: memory is
+> the real gap (~2.1x heavier per key than redis in an indicative run, driven by a
+> fat per-slot value + hash-table slack); throughput needs a pinned-Linux run vs
+> valkey to judge.
+
 `scripts/bench/run.sh` is the one scripted invocation that reproduces a published
 benchmark run end to end (BENCHMARK.md #8, PR-A3 of the performance track). It builds
 the release binaries, boots a real IronCache server, warms the hot keyset, runs three
