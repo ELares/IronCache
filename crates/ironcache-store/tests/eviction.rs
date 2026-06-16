@@ -138,6 +138,43 @@ fn volatile_only_evicts_ttl_keys_and_spares_non_ttl_keys() {
 }
 
 #[test]
+fn a_read_then_replaced_hot_key_keeps_its_frequency_and_survives_eviction() {
+    // freq-in-object semantic (INTENTIONAL fidelity change, pinned here): the 2-bit
+    // S3-FIFO promote frequency lives ON the entry, so a key that is READ (hotness up)
+    // then REPLACED via a blind SET KEEPS its frequency - it promotes to main on
+    // eviction and survives over never-touched cold one-hit-wonders. The pre-freq-in
+    // -object policy reset freq to 0 on any replace (an artifact of free-then-reinsert),
+    // which would have evicted this key FIRST as a cold one-hit-wonder. This pins the
+    // chosen, more-correct behavior (a written key is an accessed key) so it cannot
+    // silently regress.
+    let mut st = store_with(Policy::cache_default());
+    // Hot key: insert, read several times (freq saturates past the promote threshold),
+    // then REPLACE it with a blind SET (the put_object freq-carry path under test).
+    set(&mut st, b"hot");
+    for _ in 0..3 {
+        assert!(st.read(0, b"hot", UnixMillis(0)).is_some());
+    }
+    set(&mut st, b"hot"); // replace; the carried freq must survive
+    // Twenty never-touched cold one-hit-wonders inserted AFTER the hot key.
+    for i in 0u32..20 {
+        set(&mut st, format!("cold{i}").as_bytes());
+    }
+    let before = st.used_memory();
+    // Evict hard. The hot key (inserted first, so the front of small) is drawn first and
+    // PROMOTED to main (freq > 1), surviving; the cold keys are then freed to fit.
+    let _ = st.evict_to_fit(400, UnixMillis(0));
+    assert!(st.used_memory() < before, "eviction must free cold keys");
+    assert!(
+        st.read(0, b"cold0", UnixMillis(0)).is_none(),
+        "a cold one-hit-wonder is evicted"
+    );
+    assert!(
+        st.read(0, b"hot", UnixMillis(0)).is_some(),
+        "a read-then-replaced hot key keeps its frequency and survives (carried, not reset)"
+    );
+}
+
+#[test]
 fn volatile_only_with_no_ttl_keys_frees_nothing() {
     let mut st = store_with(Policy::S3Fifo(ironcache_eviction::S3Fifo::new(true)));
     set(&mut st, b"a");

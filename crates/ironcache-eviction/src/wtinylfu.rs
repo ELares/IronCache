@@ -89,7 +89,7 @@
 
 use std::collections::VecDeque;
 
-use ironcache_storage::EvictionHook;
+use ironcache_storage::{EvictionHook, VictimFreq};
 
 use crate::EvictionPolicy;
 
@@ -562,7 +562,9 @@ impl EvictionHook for WTinyLfu {
         }
     }
 
-    fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
+    fn select_victim(&mut self, _freq: &mut dyn VictimFreq) -> Option<(u32, Box<[u8]>)> {
+        // W-TinyLFU keeps its OWN frequency (the 4-bit count-min sketch), so it IGNORES
+        // the store-side `VictimFreq` (which carries the S3-FIFO 2-bit object freq).
         // ONE-SHOT candidate-admission door: on the FIRST select_victim of an
         // evict_to_fit run, consume the pending candidate (the just-inserted key) and
         // run it through the door (admit on a strict win by evicting the victim, else
@@ -632,6 +634,21 @@ impl EvictionPolicy for WTinyLfu {
 mod tests {
     use super::*;
 
+    /// A no-op [`VictimFreq`]: W-TinyLFU keeps its own sketch and ignores the store-side
+    /// object freq, so the tests feed it a stub that reports no key present.
+    struct NoFreq;
+    impl VictimFreq for NoFreq {
+        fn get(&self, _db: u32, _key: &[u8]) -> Option<u8> {
+            None
+        }
+        fn dec(&mut self, _db: u32, _key: &[u8]) {}
+    }
+    /// `select_victim` with the no-op freq accessor (the W-TinyLFU choice does not read
+    /// it). The single call site for tests, so the signature change touches one place.
+    fn pick(p: &mut WTinyLfu) -> Option<(u32, Box<[u8]>)> {
+        p.select_victim(&mut NoFreq)
+    }
+
     fn ins(p: &mut WTinyLfu, key: &[u8]) {
         p.on_insert(0, key, key.len());
     }
@@ -639,7 +656,7 @@ mod tests {
         p.on_access(0, key);
     }
     fn victim_key(p: &mut WTinyLfu) -> Option<Vec<u8>> {
-        p.select_victim().map(|(_, k)| k.into_vec())
+        pick(p).map(|(_, k)| k.into_vec())
     }
     /// Raise a key's sketch estimate by `n` DECISION-PATH increments, the genuine
     /// frequency dimension under #57 (on_access is a no-op, so a GET loop cannot do
@@ -940,7 +957,7 @@ mod tests {
             "the sole resident candidate self-evicts"
         );
         assert!(!p.tracks(0, b"solo"));
-        assert_eq!(p.select_victim(), None, "nothing left to evict");
+        assert_eq!(pick(&mut p), None, "nothing left to evict");
     }
 
     #[test]
@@ -965,7 +982,7 @@ mod tests {
     #[test]
     fn empty_policy_yields_no_victim() {
         let mut p = WTinyLfu::new(false);
-        assert_eq!(p.select_victim(), None);
+        assert_eq!(pick(&mut p), None);
     }
 
     #[test]
@@ -976,7 +993,7 @@ mod tests {
         p.on_remove(0, b"x", 1);
         // x removed; the only victim now is y.
         assert_eq!(victim_key(&mut p), Some(b"y".to_vec()));
-        assert_eq!(p.select_victim(), None);
+        assert_eq!(pick(&mut p), None);
     }
 
     #[test]
@@ -1007,7 +1024,7 @@ mod tests {
         // of dropping it, which would make it un-evictable forever).
         let mut p = WTinyLfu::new(true);
         ins(&mut p, b"x");
-        let v = p.select_victim().expect("x is offered as a victim");
+        let v = pick(&mut p).expect("x is offered as a victim");
         assert_eq!(v.1.as_ref(), b"x");
         assert!(!p.tracks(0, b"x"), "select_victim pops the candidate out");
         p.re_register(0, b"x");
@@ -1015,10 +1032,7 @@ mod tests {
             p.tracks(0, b"x"),
             "re_register keeps the key trackable (#46)"
         );
-        assert_eq!(
-            p.select_victim().map(|(_, k)| k.into_vec()),
-            Some(b"x".to_vec())
-        );
+        assert_eq!(pick(&mut p).map(|(_, k)| k.into_vec()), Some(b"x".to_vec()));
         // Idempotent: re-registering a still-tracked key does not duplicate.
         p.re_register(0, b"x"); // x was just popped; re-adds once
         p.re_register(0, b"x"); // already present; no-op
@@ -1038,7 +1052,7 @@ mod tests {
         let mut p = WTinyLfu::new(true);
         ins(&mut p, b"a");
         // Pull "a" and re-register it (store declined: non-TTL under volatile-*).
-        let v = p.select_victim().unwrap();
+        let v = pick(&mut p).unwrap();
         assert_eq!(v.1.as_ref(), b"a");
         p.re_register(0, b"a");
         // Now a fresh resident "b" arrives: it must be offered before "a" cycles again.
@@ -1071,7 +1085,7 @@ mod tests {
             // last inserted "k39", a cold key), then the rest are plain coldest-first
             // choices, so the cold keys go before the hot subset.
             let mut out = Vec::new();
-            while let Some((db, k)) = p.select_victim() {
+            while let Some((db, k)) = pick(&mut p) {
                 p.on_remove(db, &k, 0);
                 out.push(k.into_vec());
             }

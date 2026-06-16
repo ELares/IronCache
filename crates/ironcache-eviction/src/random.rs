@@ -10,7 +10,7 @@
 //! not see TTL through the frozen hooks.
 
 use ironcache_env::{Rng, SplitMix64};
-use ironcache_storage::EvictionHook;
+use ironcache_storage::{EvictionHook, VictimFreq};
 
 use crate::EvictionPolicy;
 
@@ -88,7 +88,10 @@ impl EvictionHook for Random {
         }
     }
 
-    fn select_victim(&mut self) -> Option<(u32, Box<[u8]>)> {
+    fn select_victim(&mut self, _freq: &mut dyn VictimFreq) -> Option<(u32, Box<[u8]>)> {
+        // Random eviction has no recency/frequency notion, so it IGNORES the store-side
+        // freq accessor (freq-in-object is an S3-FIFO concern). The victim is a uniform
+        // draw from the roster.
         if self.keys.is_empty() {
             return None;
         }
@@ -141,6 +144,16 @@ impl EvictionPolicy for Random {
 mod tests {
     use super::*;
 
+    /// A no-op [`VictimFreq`]: Random ignores freq entirely, so the tests feed it a
+    /// stub that reports no key present.
+    struct NoFreq;
+    impl VictimFreq for NoFreq {
+        fn get(&self, _db: u32, _key: &[u8]) -> Option<u8> {
+            None
+        }
+        fn dec(&mut self, _db: u32, _key: &[u8]) {}
+    }
+
     fn insert(p: &mut Random, key: &[u8]) {
         p.on_insert(0, key, key.len());
     }
@@ -148,7 +161,7 @@ mod tests {
     #[test]
     fn empty_roster_yields_no_victim() {
         let mut p = Random::new(1, false);
-        assert_eq!(p.select_victim(), None);
+        assert_eq!(p.select_victim(&mut NoFreq), None);
     }
 
     #[test]
@@ -167,7 +180,9 @@ mod tests {
             // Draw, then prune that key (simulating the store's delete) so the roster
             // shrinks like a real eviction run.
             for _ in 0..keys.len() {
-                let (db, key) = p.select_victim().expect("victim while roster non-empty");
+                let (db, key) = p
+                    .select_victim(&mut NoFreq)
+                    .expect("victim while roster non-empty");
                 p.on_remove(db, &key, key.len());
                 out.push(key);
             }
@@ -195,7 +210,7 @@ mod tests {
         assert_eq!(p.keys.len(), 1);
         p.on_remove(0, b"x", 1);
         assert_eq!(p.keys.len(), 0);
-        assert_eq!(p.select_victim(), None);
+        assert_eq!(p.select_victim(&mut NoFreq), None);
     }
 
     #[test]
