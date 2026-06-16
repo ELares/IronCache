@@ -104,7 +104,25 @@ jobs:
           set -euo pipefail
           case "${{ inputs.competitor }}" in
             valkey)
-              sudo apt-get install -y valkey-server || sudo apt-get install -y redis-server
+              # The pinned head-to-head bar is the LATEST valkey (the 8.x line added the big
+              # memory wins: embedded key/value in 8.0 + the 8.1 hashtable redesign, ~20-30
+              # B/key lighter than 7.x). Ubuntu's apt valkey is only ~7.2.x (pre-embedded-key),
+              # which would OVERSTATE IronCache's memory edge, so BUILD the latest 8.1.x from
+              # source for an honest bar; fall back to apt valkey, then redis, if the build
+              # fails. The harness reads the real version from --version and labels it.
+              set -x
+              if sudo apt-get install -y build-essential pkg-config \
+                 && { git clone --depth 1 --branch 8.1.8 https://github.com/valkey-io/valkey.git /tmp/valkey \
+                      || git clone --depth 1 https://github.com/valkey-io/valkey.git /tmp/valkey; } \
+                 && make -C /tmp/valkey -j"$(nproc)" BUILD_TLS=no valkey-server \
+                 && sudo install -m 0755 /tmp/valkey/src/valkey-server /usr/local/bin/valkey-server; then
+                /usr/local/bin/valkey-server --version
+                echo "COMPETITOR_BIN=/usr/local/bin/valkey-server" >> "$GITHUB_ENV"
+              else
+                echo "::warning::valkey 8.1.x source build failed; falling back to apt valkey (~7.2.x, pre-embedded-key) or redis."
+                sudo apt-get install -y valkey-server || sudo apt-get install -y redis-server
+              fi
+              set +x
               ;;
             dragonfly)
               # DragonflyDB ships a prebuilt x86_64 binary on its GitHub releases (no apt
@@ -192,7 +210,27 @@ jobs:
               echo "COMPETITOR_BIN=${MEMCACHED_BIN}" >> "$GITHUB_ENV"
               ;;
             *)
-              sudo apt-get install -y redis-server
+              # redis: the pinned bar is the 8.x kvobj line (the unified key-value object,
+              # 25-37% lighter for short strings than the 7.x dict). Ubuntu apt ships only
+              # ~7.x, so install from the OFFICIAL redis apt repo (packages.redis.io) to get
+              # 8.x for an honest memory bar; fall back to ubuntu apt (~7.x) if the repo is
+              # unreachable. The harness reads the real version from INFO and labels it.
+              set -x
+              if curl -fsSL https://packages.redis.io/gpg \
+                   | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg \
+                 && sudo chmod 0644 /usr/share/keyrings/redis-archive-keyring.gpg \
+                 && echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
+                      | sudo tee /etc/apt/sources.list.d/redis.list >/dev/null \
+                 && sudo apt-get update \
+                 && sudo apt-get install -y redis-server; then
+                redis-server --version
+              else
+                echo "::warning::official redis apt repo install failed; falling back to ubuntu apt redis-server (~7.x)."
+                sudo rm -f /etc/apt/sources.list.d/redis.list
+                sudo apt-get update || true
+                sudo apt-get install -y redis-server
+              fi
+              set +x
               ;;
           esac
 
