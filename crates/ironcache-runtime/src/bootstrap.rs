@@ -2,9 +2,24 @@
 //! Thread-per-core bootstrap (RUNTIME.md "topology", ADR-0002).
 //!
 //! [`run_shards`] spawns one OS thread per shard, each with its own current-thread
-//! tokio runtime and `LocalSet` (the shard executor) and its own `SO_REUSEPORT`
-//! accept loop. A connection accepted on a shard is served entirely on that shard,
-//! so per-connection state is core-local with no shared hot-path structure.
+//! tokio runtime and `LocalSet` (the shard executor). A single dedicated ACCEPTOR
+//! thread owns the one listening socket and round-robins each accepted connection
+//! to a shard over a per-shard channel; the receiving shard adopts the connection
+//! onto ITS reactor and serves it entirely on that shard, so per-connection state
+//! is core-local with no shared hot-path structure.
+//!
+//! ## Why a userspace acceptor instead of per-shard `SO_REUSEPORT`
+//!
+//! Earlier each shard bound its own `SO_REUSEPORT` listener and ran its own accept
+//! loop, relying on the KERNEL to load-balance accepts across the listeners. That
+//! balances on Linux but NOT on macOS/BSD, where accepts concentrate on a single
+//! listener, so N shards behaved like one shard for I/O (all connections funneled
+//! to one core). Distributing accepts in USERSPACE (one acceptor, round-robin to
+//! per-shard channels) is portable: it balances identically on every platform and
+//! makes throughput scale with shard count. The acceptor only does `accept()` +
+//! hand-off; the connection still lives its whole life on the shard that adopts it
+//! (which shard accepts a connection does not affect correctness, only I/O spread,
+//! because keyspace ops route by key through the coordinator).
 //!
 //! The per-connection serve logic is supplied by the caller as an async closure
 //! over the shard's [`crate::Runtime`], keeping this layer free of any protocol or
@@ -32,7 +47,8 @@ pub struct ShardId {
 pub struct ShardConfig {
     /// Number of shards (one OS thread / current-thread runtime each).
     pub shards: usize,
-    /// The address every shard binds with `SO_REUSEPORT`.
+    /// The single address the acceptor thread binds and accepts on; connections
+    /// are then round-robined to the shards in userspace.
     pub bind: SocketAddr,
 }
 
@@ -93,7 +109,7 @@ pub fn available_shards() -> usize {
 mod tokio_bootstrap {
     use super::{Arc, AtomicBool, DRAIN_GRACE, Duration, Ordering, ShardConfig, ShardId, ShardSet};
     use crate::TokioRuntime;
-    use crate::tokio_rt::{bind_reuseport, bind_reuseport_std};
+    use crate::tokio_rt::bind_reuseport_std;
     use std::cell::Cell;
     use std::future::Future;
     use std::rc::Rc;
@@ -113,12 +129,18 @@ mod tokio_bootstrap {
         }
     }
 
-    /// Run the shard set. For each shard this spawns an OS thread that:
+    /// Run the shard set. ONE listener is bound up front and a single dedicated
+    /// ACCEPTOR thread round-robins accepted connections to the shards over a
+    /// per-shard channel (userspace load-balancing, portable across platforms; see
+    /// the module docs for why this replaces per-shard `SO_REUSEPORT`). For each
+    /// shard this spawns an OS thread that:
     ///   1. builds a current-thread tokio runtime (NOT multi-thread; ADR-0002),
-    ///   2. binds the shared address with `SO_REUSEPORT`,
-    ///   3. accepts connections in a loop, spawning `serve` per connection on the
-    ///      shard-local `LocalSet`,
-    ///   4. stops accepting when the shutdown flag is set.
+    ///   2. awaits ITS connection channel for inbound `std::net::TcpStream`s handed
+    ///      over by the acceptor, adopting each onto THIS shard's reactor with
+    ///      `tokio::net::TcpStream::from_std` (the connection now lives on this core),
+    ///   3. spawns `serve` per connection on the shard-local `LocalSet`,
+    ///   4. stops taking new connections and drains in-flight tasks when the
+    ///      shutdown flag is set.
     ///
     /// `serve` is cloned per shard and invoked per connection with the shard's
     /// [`TokioRuntime`], the accepted [`tokio::net::TcpStream`], and the
@@ -159,21 +181,50 @@ mod tokio_bootstrap {
             inboxes.len()
         );
 
-        // Pre-flight bind probe so a bind failure (e.g. port in use) surfaces as
-        // an error from this synchronous call rather than silently inside a shard
-        // thread. The probe uses the std (reactor-free) binder; shards re-bind
-        // with SO_REUSEPORT inside their own tokio runtimes.
-        let probe = bind_reuseport_std(cfg.bind)?;
-        drop(probe);
+        // Bind the ONE listening socket up front, in this synchronous call, so a
+        // bind failure (e.g. port in use) surfaces as an error here rather than
+        // inside a spawned thread. This std listener is owned by the acceptor
+        // thread; the shards never bind. `set_reuse_port` on it is harmless and
+        // kept only so a fast restart can rebind the address; it no longer does
+        // any load-balancing (that is now the acceptor's job).
+        let listener = bind_reuseport_std(cfg.bind)?;
 
-        let mut handles = Vec::with_capacity(total);
+        // One connection channel per shard: the acceptor sends accepted
+        // `std::net::TcpStream`s, the shard receives them. Unbounded so the
+        // (synchronous, non-async) acceptor can hand off without blocking on a
+        // shard's reactor; the hand-off is just a queued pointer, and a shard
+        // that is momentarily busy buffers a few connections rather than stalling
+        // the acceptor (and thus every other shard). These channels carry only the
+        // raw socket, no per-key/hot-path data (shared-nothing ADR-0002 intact).
+        let mut conn_senders = Vec::with_capacity(total);
+        let mut conn_receivers = Vec::with_capacity(total);
+        for _ in 0..total {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<std::net::TcpStream>();
+            conn_senders.push(tx);
+            conn_receivers.push(rx);
+        }
+
+        let mut handles = Vec::with_capacity(total + 1);
+
+        // The ACCEPTOR thread: owns the single listener, accepts in a loop, and
+        // round-robins each connection to the next shard's channel. It is a plain
+        // OS thread (no tokio runtime): a blocking `std` accept loop with a
+        // shutdown-aware poll. `tokio::sync::mpsc::UnboundedSender::send` does not
+        // require a runtime, so the hand-off is valid from this sync context.
+        {
+            let shutdown = Arc::clone(&shutdown);
+            let acceptor = std::thread::Builder::new()
+                .name("ironcache-acceptor".to_string())
+                .spawn(move || acceptor_loop(&listener, &conn_senders, &shutdown))?;
+            handles.push(acceptor);
+        }
+
         // Hand each shard its own inbox by moving items OUT of the vec by index. The
         // vec is consumed (into_iter) so each `I` is owned by exactly one shard thread.
-        for (index, inbox) in inboxes.into_iter().enumerate() {
+        for ((index, inbox), conn_rx) in inboxes.into_iter().enumerate().zip(conn_receivers) {
             let shutdown = Arc::clone(&shutdown);
             let serve = serve.clone();
             let drain = drain.clone();
-            let bind = cfg.bind;
             let shard = ShardId { index, total };
             let handle = std::thread::Builder::new()
                 .name(format!("ironcache-shard-{index}"))
@@ -189,30 +240,22 @@ mod tokio_bootstrap {
                         }
                     };
                     let local = tokio::task::LocalSet::new();
-                    // Catch a panic escaping the accept loop so the thread logs it
+                    // Catch a panic escaping the serve loop so the thread logs it
                     // (and bumps a per-shard shard_died counter for future
                     // OBSERVABILITY wiring) before it exits, instead of unwinding
                     // silently. The panic is then resumed so `join()` still surfaces
                     // it to `shutdown_and_join` (which no longer discards it).
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         local.block_on(&rt, async move {
-                            let listener = match bind_reuseport(bind) {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    eprintln!("shard {index}: bind {bind} failed: {e}");
-                                    return;
-                                }
-                            };
                             // Spawn the cross-shard DRAIN LOOP on this shard's LocalSet
-                            // BEFORE the accept loop (COORDINATOR.md #107): a shard can
+                            // BEFORE the serve loop (COORDINATOR.md #107): a shard can
                             // own keys and must service remote work even if it never
-                            // accepts a connection. The accept loop below then runs for
+                            // accepts a connection. The serve loop below then runs for
                             // the shard's lifetime; the drain loop runs concurrently on
                             // the same single-threaded LocalSet (interleaved, never
                             // parallel, so the shard-local RefCells stay single-threaded).
                             tokio::task::spawn_local(drain(inbox));
-                            let runtime = TokioRuntime::new();
-                            accept_loop(&listener, &runtime, &serve, shard, &shutdown).await;
+                            serve_loop(conn_rx, &serve, shard, &shutdown).await;
                         });
                     }));
                     if let Err(panic) = result {
@@ -221,7 +264,7 @@ mod tokio_bootstrap {
                         // wiring (OBSERVABILITY.md #152) reads it later.
                         let shard_died: u64 = 1;
                         eprintln!(
-                            "shard {index}: accept loop panicked (shard_died={shard_died}); \
+                            "shard {index}: serve loop panicked (shard_died={shard_died}); \
                              shard thread exiting"
                         );
                         std::panic::resume_unwind(panic);
@@ -233,9 +276,67 @@ mod tokio_bootstrap {
         Ok(ShardSet { shutdown, handles })
     }
 
-    async fn accept_loop<S, Fut>(
-        listener: &tokio::net::TcpListener,
-        runtime: &TokioRuntime,
+    /// The single acceptor's loop: accept on the one listener and round-robin each
+    /// connection to a shard's channel. Runs on a dedicated OS thread with NO tokio
+    /// runtime (plain blocking `std` accept).
+    ///
+    /// The listener is set non-blocking so the loop can observe the shutdown flag
+    /// between polls instead of parking forever in `accept()` while no connection
+    /// arrives: on `WouldBlock` it sleeps briefly (a 1ms poll, not a hot spin) and
+    /// re-checks shutdown. On shutdown it stops accepting and returns, which drops
+    /// every shard sender; each shard's `recv()` then observes channel-closed and
+    /// proceeds to drain (SHUTDOWN.md).
+    fn acceptor_loop(
+        listener: &std::net::TcpListener,
+        conn_senders: &[tokio::sync::mpsc::UnboundedSender<std::net::TcpStream>],
+        shutdown: &Arc<AtomicBool>,
+    ) {
+        // Non-blocking so a quiet listener cannot keep us from seeing shutdown.
+        if let Err(e) = listener.set_nonblocking(true) {
+            eprintln!("acceptor: set_nonblocking failed: {e}; shutdown may be delayed");
+        }
+        let poll = Duration::from_millis(1);
+        let mut next: usize = 0;
+        let n = conn_senders.len().max(1);
+        while !shutdown.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _peer)) => {
+                    // Disable Nagle here so it is set regardless of which shard
+                    // adopts the socket; request/reply caches want low latency.
+                    let _ = stream.set_nodelay(true);
+                    // Round-robin to the next shard. A plain integer counter (NOT
+                    // rand): deterministic spread, no entropy needed.
+                    let target = next % n;
+                    next = next.wrapping_add(1);
+                    // If a shard thread is gone (its receiver dropped) the send
+                    // fails; skip that connection rather than crash the acceptor.
+                    if let Err(e) = conn_senders[target].send(stream) {
+                        eprintln!("acceptor: shard {target} channel closed: {e}");
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No pending connection: nap briefly, then re-check shutdown.
+                    std::thread::sleep(poll);
+                }
+                Err(e) => {
+                    // Transient accept errors (e.g. EMFILE) should not kill the
+                    // acceptor; back off briefly and continue.
+                    eprintln!("acceptor: accept error: {e}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        // Returning drops `conn_senders`, closing every shard channel so the shard
+        // serve loops observe channel-closed and move on to drain.
+    }
+
+    /// The shard's serve loop: instead of accepting, it AWAITS its connection
+    /// channel for `std::net::TcpStream`s handed over by the acceptor, adopts each
+    /// onto THIS shard's tokio reactor, and spawns `serve` per connection on the
+    /// shard-local `LocalSet`. Runs concurrently with the drain loop on the same
+    /// single-threaded executor.
+    async fn serve_loop<S, Fut>(
+        mut conn_rx: tokio::sync::mpsc::UnboundedReceiver<std::net::TcpStream>,
         serve: &S,
         shard: ShardId,
         shutdown: &Arc<AtomicBool>,
@@ -243,19 +344,34 @@ mod tokio_bootstrap {
         S: Fn(TokioRuntime, tokio::net::TcpStream, ShardId) -> Fut + Clone + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        let _ = runtime;
         // Core-local count of in-flight connection tasks, for the bounded drain.
         let live: LiveTasks = Rc::new(Cell::new(0));
 
         while !shutdown.load(Ordering::Relaxed) {
-            // Race the accept against a short timer so a shutdown is observed even
-            // when no new connection arrives (no blocking accept that ignores the
-            // flag).
+            // Race the channel recv against a short timer so a shutdown is observed
+            // even when no new connection arrives (the acceptor also closes the
+            // channel on shutdown, which `recv()` reports as `None`).
             tokio::select! {
-                res = listener.accept() => {
-                    match res {
-                        Ok((stream, _peer)) => {
-                            let _ = stream.set_nodelay(true);
+                maybe = conn_rx.recv() => {
+                    match maybe {
+                        Some(std_stream) => {
+                            // Adopt the connection onto THIS shard's reactor: the
+                            // socket must be non-blocking for tokio, then `from_std`
+                            // registers it with this thread's runtime so all of its
+                            // I/O readiness lives on this core (ADR-0002). That
+                            // registration is the whole point of the userspace
+                            // hand-off: it distributes connections across cores.
+                            if let Err(e) = std_stream.set_nonblocking(true) {
+                                eprintln!("shard {}: set_nonblocking failed: {e}; dropping connection", shard.index);
+                                continue;
+                            }
+                            let stream = match tokio::net::TcpStream::from_std(std_stream) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("shard {}: from_std failed: {e}; dropping connection", shard.index);
+                                    continue;
+                                }
+                            };
                             let fut = serve(TokioRuntime::new(), stream, shard);
                             // Track this connection for the drain: bump the live
                             // count, and decrement via a drop guard when the task
@@ -269,11 +385,10 @@ mod tokio_bootstrap {
                                 fut.await;
                             });
                         }
-                        Err(e) => {
-                            // Transient accept errors (e.g. EMFILE) should not kill
-                            // the shard; back off briefly and continue.
-                            eprintln!("shard {}: accept error: {e}", shard.index);
-                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        None => {
+                            // The acceptor dropped its sender (shutdown). Stop taking
+                            // new connections and fall through to the drain.
+                            break;
                         }
                     }
                 }
@@ -281,10 +396,10 @@ mod tokio_bootstrap {
             }
         }
 
-        // Shutdown observed: stop accepting (loop exited) and drain in-flight
-        // connection tasks up to the grace deadline. We poll the live count on a
-        // short tick rather than collecting JoinHandles, which keeps this O(1) in
-        // bookkeeping and works with the fire-and-forget spawn_local model.
+        // Shutdown observed: stop taking new connections (loop exited) and drain
+        // in-flight connection tasks up to the grace deadline. We poll the live
+        // count on a short tick rather than collecting JoinHandles, which keeps this
+        // O(1) in bookkeeping and works with the fire-and-forget spawn_local model.
         drain_live_tasks(&live, shard).await;
     }
 

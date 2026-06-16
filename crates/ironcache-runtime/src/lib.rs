@@ -12,12 +12,14 @@
 //!    (RUNTIME_ABSTRACTION.md). PR-1 ships exactly one backend (tokio+epoll/kqueue);
 //!    monoio/glommio are future Cargo features behind the same trait.
 //!
-//! 2. The [`bootstrap`] layer: spins up one OS thread per shard, each pinned to a
-//!    core with its own current-thread tokio runtime and its own `SO_REUSEPORT`
-//!    accept loop, so a connection lives its whole life on one core with no shared
-//!    hot-path state. The multi-thread work-stealing scheduler is deliberately NOT
-//!    used: work-stealing forces `Send + Sync` and re-introduces cross-core
-//!    atomics, the opposite of shared-nothing (ADR-0002, RUNTIME.md).
+//! 2. The [`bootstrap`] layer: spins up one OS thread per shard, each with its own
+//!    current-thread tokio runtime, plus a single acceptor thread that binds the
+//!    one listening socket and round-robins accepted connections to the shards in
+//!    userspace (portable load-balancing; kernel `SO_REUSEPORT` does not balance on
+//!    macOS/BSD). A connection lives its whole life on the shard that adopts it,
+//!    with no shared hot-path state. The multi-thread work-stealing scheduler is
+//!    deliberately NOT used: work-stealing forces `Send + Sync` and re-introduces
+//!    cross-core atomics, the opposite of shared-nothing (ADR-0002, RUNTIME.md).
 //!
 //! ## Freeze point
 //!
