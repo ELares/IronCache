@@ -1263,11 +1263,19 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
     fn evict_to_fit_pooled(&mut self, budget_bytes: u64, now: UnixMillis) -> u64 {
         let volatile_only = self.eviction.volatile_only();
         let mut evicted: u64 = 0;
-        // Whether the pool has been FRESHLY refilled since the last actual eviction (or
-        // since loop entry). Gates the "refill-before-evicting-a-warm-candidate" retry so it
-        // runs AT MOST once per eviction: after a fresh refill the warm candidate is evicted
-        // (it is genuinely the coldest available), guaranteeing termination.
-        let mut refreshed_since_progress = false;
+        // Whether the pool has been (re)scanned at all THIS call. Gates the one-shot
+        // "refill-before-evicting-a-warm-candidate" quality retry to AT MOST ONCE per call,
+        // NOT once per eviction. The retry only exists to refresh a STALE pool CARRIED from a
+        // prior call (whose coldest leftovers may be warmer than keys inserted since); once
+        // we have rescanned this call the pool reflects the current keyspace (no inserts
+        // happen DURING an evict_to_fit call), so every later refill is already fresh and no
+        // further retry is needed. Capping it per-call (rather than resetting after each
+        // eviction) is what keeps eviction AMORTIZED at O(N/CAP): in the common case (a large
+        // freq-0 cold tail >> CAP) the carried pool's first pop is cold, the retry never
+        // fires, and the pool drains CAP victims per scan. (An all-warm keyspace - no freq-0
+        // key - is inherently O(N)/episode for an EXACT-LFU scan with no random sampling;
+        // that is the floor here, not a regression.)
+        let mut refilled_this_call = false;
         loop {
             if self.used_memory() <= budget_bytes {
                 break;
@@ -1276,7 +1284,7 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
                 // ONE bounded scan: reap expired entries (free budget) and harvest the
                 // coldest live eligible candidates into the pool.
                 self.refill_evict_pool(now);
-                refreshed_since_progress = true;
+                refilled_this_call = true;
                 // The expired-reap inside refill may already have freed enough.
                 if self.used_memory() <= budget_bytes {
                     break;
@@ -1313,7 +1321,6 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
                 // budget but is NOT counted as an eviction, exactly as the full-scan path
                 // treated an expired candidate. It is forward progress.
                 self.expire_if_due(cand.db, db_idx, &cand.key, now);
-                refreshed_since_progress = false;
                 continue;
             }
             if volatile_only && lost_ttl {
@@ -1328,23 +1335,25 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
             // keeps the warm-check honest about a candidate that was already warm at harvest
             // AND one that warmed up since (a read between refill and pop).
             let cand_freq = cand.freq.max(live_freq);
-            // COLDEST-FIRST across a carried/stale pool: a WARM candidate (freq > 0) might be
-            // popped while a colder FRESH key (inserted after the refill, so not pooled)
-            // exists. Do ONE fresh refill to surface the fresh cold keys, then retry; the
-            // latch caps this at one extra scan per eviction, so a genuinely warm-only
-            // keyspace still evicts the warm key (the refill's coldest is also warm) and the
-            // loop terminates.
-            if cand_freq > 0 && !refreshed_since_progress {
+            // COLDEST-FIRST across a CARRIED (stale) pool: a WARM candidate (freq > 0) from a
+            // pool carried over from a PRIOR call might be popped while a colder key inserted
+            // since that pool's scan exists (not yet pooled). If we have NOT rescanned this
+            // call yet, do ONE fresh refill to surface the current coldest, then retry. This
+            // fires AT MOST ONCE per call (gated by `refilled_this_call`, never reset): after
+            // it, the pool reflects the current keyspace (no inserts happen DURING this call),
+            // so every later pop - warm or cold - is genuinely the coldest available and is
+            // evicted directly. This preserves O(N/CAP) amortization (the retry never fires on
+            // the common freq-0-cold-tail pool) while sparing a hot key over a fresh cold one
+            // in the carried-pool case. A genuinely warm-only keyspace still evicts (the
+            // refill's coldest is also warm), and the loop terminates.
+            if cand_freq > 0 && !refilled_this_call {
                 self.evict_pool.clear();
                 self.refill_evict_pool(now);
-                refreshed_since_progress = true;
+                refilled_this_call = true;
                 continue;
             }
             if self.remove_object(cand.db, db_idx, &cand.key) {
                 evicted += 1;
-                // An eviction shrank the keyspace and freed budget; a later warm candidate
-                // again deserves a fresh-refill check against any keys inserted meanwhile.
-                refreshed_since_progress = false;
             }
         }
         evicted

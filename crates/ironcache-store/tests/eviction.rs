@@ -151,6 +151,52 @@ fn cross_db_eviction_tie_break_is_deterministic() {
 }
 
 #[test]
+fn pooled_eviction_is_deterministic_across_pool_carryover() {
+    // The pooled cache-mode evictor CARRIES its victim pool across `evict_to_fit` calls (the
+    // amortization), and a warm carried candidate can trigger a one-shot refill. Drive the
+    // SAME multi-call sequence (warm a subset, then several partial-drain evictions that each
+    // leave pool leftovers for the next call) on many FRESH stores -- each with a fresh
+    // randomized table hash state -- and assert the final resident keyset is IDENTICAL across
+    // all of them. A nondeterministic victim order (e.g. hashbrown's per-table iteration order
+    // leaking through the carried pool) would diverge run-to-run. Locks ADR-0003 for the
+    // pool carry-state, which the fresh-store and roster-path determinism tests do not cover.
+    let mut reference: Option<Vec<bool>> = None;
+    for _ in 0..16 {
+        let mut st = store_with(Policy::cache_default());
+        for i in 0u32..60 {
+            set(&mut st, format!("k{i}").as_bytes());
+        }
+        // Warm the first 15 keys (bump in-object freq) so the victim order is freq-driven and
+        // the warm-candidate carryover path is exercised.
+        for _ in 0..3 {
+            for i in 0u32..15 {
+                let _ = st.read(0, format!("k{i}").as_bytes(), UnixMillis(0));
+            }
+        }
+        // Several partial-drain evictions with a DECREASING budget so each call evicts a few
+        // and leaves pool leftovers for the next (exercises carryover + the warm-retry).
+        let full = st.used_memory();
+        for step in 1..=5u64 {
+            st.evict_to_fit(full.saturating_sub(full * step / 8), UnixMillis(0));
+        }
+        // Snapshot which of the 60 original keys survived (deterministic key order).
+        let resident: Vec<bool> = (0u32..60)
+            .map(|i| {
+                st.read(0, format!("k{i}").as_bytes(), UnixMillis(0))
+                    .is_some()
+            })
+            .collect();
+        match &reference {
+            None => reference = Some(resident),
+            Some(r) => assert_eq!(
+                *r, resident,
+                "pooled eviction diverged across table-hash seeds (nondeterministic carryover)"
+            ),
+        }
+    }
+}
+
+#[test]
 fn volatile_only_evicts_ttl_keys_and_spares_non_ttl_keys() {
     // volatile-* restricts victims to TTL-bearing keys. Mix TTL and non-TTL keys,
     // force eviction, and confirm only the TTL keys can be freed.

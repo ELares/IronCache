@@ -414,12 +414,18 @@ read_used_memory() {
 }
 
 # ---------------------------------------------------------------------------
-# populate_keys N: deterministically insert EXACTLY N distinct keys key:0..key:N-1, each
+# populate_keys N: deterministically insert EXACTLY N distinct keys k:0..k:N-1, each
 # with a VALUE_SIZE-byte value, via `redis-cli --pipe` (fast, RESP, works on IronCache
 # too since it supports ECHO for the pipe sentinel). The loadgen is deliberately NOT used
 # here: its zipf SETs do not cover the keyspace uniformly, so they would not land N
 # distinct keys. We emit inline RESP commands (redis-cli --pipe accepts them) generated
 # by awk: a fixed VALUE_SIZE-byte value of 'x', one SET per key.
+#
+# The key encoding MUST match the loadgen's `Workload::key_bytes` (`k:<idx>`,
+# crates/ironcache-bench/src/workload.rs) so the throughput pass operates on the SAME
+# resident keyspace it populated: the 90% GETs HIT (the real YCSB workload, not all-miss)
+# and an eviction-mode run evicts/re-inserts the SAME keys the loadgen reads. A mismatch
+# (`key:<idx>` here vs `k:<idx>` in the loadgen) makes every GET a guaranteed MISS.
 # ---------------------------------------------------------------------------
 populate_keys() {
   local n="$1"
@@ -434,7 +440,7 @@ populate_keys() {
     val = ""
     for (i = 0; i < vsize; i++) val = val "x"
     for (k = 0; k < n; k++) {
-      key = "key:" k
+      key = "k:" k
       # RESP array: *3 SET <key> <val>. $<len> precedes each bulk string.
       printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(key), key, vsize, val
     }
@@ -612,6 +618,22 @@ measure_server() {
   local before after bytes_per_key
   before="$(read_used_memory)"
   populate_keys "${KEYCOUNT}"
+  # EVICTION-mode honesty guard: the populate intentionally over-fills, so the server is now
+  # AT its ceiling. A genuinely EVICTING server still ACCEPTS a write (it frees room first and
+  # replies +OK); a server mis-configured to REJECT under pressure replies -OOM, which a
+  # closed-loop client counts as a FAST completed op and reports as bogus extra throughput. So
+  # probe one SET and require +OK: an OOM-rejecting server fails the run LOUDLY instead of
+  # posting a dishonest, inflated eviction-mode QPS. (The probe key uses the k: namespace so it
+  # does not perturb a later DBSIZE-by-prefix; it is one key, negligible to the measurement.)
+  if [[ "${EVICT}" == "1" ]]; then
+    local probe
+    probe="$(redis-cli -h "${HOST}" -p "${PORT}" SET k:__evict_probe__ x 2>&1 | tr -d '[:space:]')"
+    if [[ "${probe}" != "OK" ]]; then
+      echo "error: ${name} did NOT accept a write under memory pressure (reply: '${probe}'): it is REJECTING, not evicting, so eviction-mode QPS would be dishonest. Check the eviction policy / --cache_mode flag." >&2
+      return 1
+    fi
+    echo "[h2h] ${name}: eviction sanity OK (accepted a write at the memory ceiling)."
+  fi
   after="$(read_used_memory)"
   bytes_per_key="$(awk -v a="${after}" -v b="${before}" -v n="${KEYCOUNT}" \
     'BEGIN { if (n == 0) { print "0" } else { printf "%.2f", (a - b) / n } }')"
