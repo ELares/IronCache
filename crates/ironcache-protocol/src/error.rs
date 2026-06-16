@@ -330,6 +330,41 @@ impl ErrorReply {
         )
     }
 
+    /// `ERR <CMD> is not allowed in transactions` - the reply IronCache emits when a
+    /// SERVE-LAYER pub/sub command (SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE /
+    /// PUBLISH / PUBSUB) is issued INSIDE a `MULTI` (SERVER_PUSH.md #20, the pub/sub-in-MULTI
+    /// reject). The `cmd` is rendered UPPERCASE (e.g. `SUBSCRIBE is not allowed in
+    /// transactions`).
+    ///
+    /// ## Deliberate divergence from current Redis (documented)
+    ///
+    /// In CURRENT Redis the pub/sub commands do NOT carry `CMD_NO_MULTI` (verified against
+    /// the redis/redis `src/commands/*.json` flags: SUBSCRIBE/PUBLISH carry `PUBSUB` +
+    /// `LOADING`/`STALE`/... but NOT `NO_MULTI`), so Redis QUEUES them and runs them at EXEC.
+    /// IronCache handles pub/sub in the SERVE layer (`route_and_dispatch`), NOT in
+    /// `dispatch_inner` where EXEC replays the queued batch, so EXEC CANNOT replay a pub/sub
+    /// command in this build. Rather than execute them EAGERLY inside MULTI (silently wrong,
+    /// out of transaction order) or queue-then-fail-at-EXEC, we REJECT them LOUDLY at queue
+    /// time and dirty the transaction (so EXEC returns `-EXECABORT`): the same
+    /// "correct, or explicitly aborted, never silently wrong" contract as the cross-shard
+    /// in-MULTI guards. Serve-layer EXEC replay of pub/sub is the tracked follow-up that
+    /// removes this divergence. The verb is rendered UPPERCASE to read as a clear
+    /// per-command rejection.
+    ///
+    /// The historical Redis `CMD_NO_MULTI` rejection (`-ERR Command not allowed inside a
+    /// transaction`, `src/server.c processCommand`) is the nearest precedent; we phrase this
+    /// per-command so the client can see which verb was rejected.
+    #[must_use]
+    pub fn not_allowed_in_transactions(cmd: &str) -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            format!(
+                "{} is not allowed in transactions",
+                cmd.to_ascii_uppercase()
+            ),
+        )
+    }
+
     /// `ERR AUTH <password> called without any password configured for the
     /// default user. Are you sure your configuration is correct?` - the current
     /// canonical Redis string for `AUTH` when no `requirepass`/ACL password is
@@ -997,6 +1032,27 @@ mod tests {
         assert_eq!(ErrorReply::watch_cross_shard().code(), ErrorCode::Err);
         assert_eq!(
             ErrorReply::txn_whole_keyspace_unsupported().code(),
+            ErrorCode::Err
+        );
+    }
+
+    #[test]
+    fn not_allowed_in_transactions_is_byte_exact() {
+        // The pub/sub-in-MULTI reject (SERVER_PUSH.md #20): a serve-layer pub/sub command
+        // inside MULTI is rejected per-command and the verb is UPPERCASED. This is a
+        // documented divergence from current Redis (which queues pub/sub at EXEC, since the
+        // commands do not carry CMD_NO_MULTI) because IronCache cannot replay serve-layer
+        // commands at EXEC; see the constructor doc. Plain `ERR` token.
+        assert_eq!(
+            ErrorReply::not_allowed_in_transactions("subscribe").line(),
+            "-ERR SUBSCRIBE is not allowed in transactions"
+        );
+        assert_eq!(
+            ErrorReply::not_allowed_in_transactions("publish").line(),
+            "-ERR PUBLISH is not allowed in transactions"
+        );
+        assert_eq!(
+            ErrorReply::not_allowed_in_transactions("subscribe").code(),
             ErrorCode::Err
         );
     }

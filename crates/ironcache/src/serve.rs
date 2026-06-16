@@ -399,6 +399,13 @@ fn shard_started_at() -> ironcache_env::Monotonic {
     STARTED_AT.with(|s| s.borrow().unwrap_or(ironcache_env::Monotonic::ZERO))
 }
 
+// `too_many_lines` is allowed: this is the per-connection WIRING + read/dispatch/write loop --
+// the shard-handle lazy-inits, the per-connection push channel + shed signal (FIX D), the
+// pipelined decode/route/flush loop, the subscribe-mode idle wait, and the close-path cleanup
+// (subscription deregistration + WATCH deregistration + counter close). Each is a documented step
+// the connection lifecycle must run in one place; splitting it would scatter the loop's control
+// flow across helpers that all need the same locals.
+#[allow(clippy::too_many_lines)]
 async fn serve_connection(
     rt: TokioRuntime,
     mut stream: tokio::net::TcpStream,
@@ -448,12 +455,20 @@ async fn serve_connection(
     // handle registered into the home shard's subscription table on SUBSCRIBE (so a PUBLISH on
     // any core can hand this connection a message); `push_rx` is owned by THIS serve loop and
     // drained in the subscribe-mode idle-wait below. Bounded for back-pressure: a slow consumer
-    // past the bound is shed by the publisher (its sender dropped), so `push_rx.recv()` then
-    // returns None and this loop exits (treated as a disconnect). Created for EVERY connection
-    // (cheap), but only WIRED into the select! once the connection enters subscribe mode, so the
-    // non-subscriber hot path never touches it.
-    let (push_tx, mut push_rx) =
+    // past the bound is shed by the publisher. Created for EVERY connection (cheap), but only
+    // WIRED into the select! once the connection enters subscribe mode, so the non-subscriber
+    // hot path never touches it.
+    let (mut push_tx, mut push_rx) =
         tokio::sync::mpsc::channel::<crate::pubsub::ServerPush>(crate::pubsub::PUSH_CHANNEL_BOUND);
+    // The per-connection SHED/kill signal (SERVER_PUSH.md #20, FIX D). When the publisher sheds
+    // this connection (its bounded push channel overflowed past the bound), it both drops the
+    // table sender AND trips this signal; the subscriber idle-wait observes it and CLOSES the
+    // connection. This is necessary because the serve loop holds its OWN `push_tx` clone, so
+    // `push_rx.recv()` would NEVER return None on a shed alone -- the signal is the disconnect
+    // trigger. Registered into the table alongside `push_tx` on each (P)SUBSCRIBE. Shared
+    // cross-core (the publisher runs on any shard), so an `Arc<ShedSignal>` (an atomic latch +
+    // a `Notify` for a spin-free wake).
+    let mut shed_flag = std::sync::Arc::new(crate::pubsub::ShedSignal::default());
 
     let limits = Limits::default();
     let mut read_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
@@ -470,8 +485,19 @@ async fn serve_connection(
                     // appending its encoded reply to `out`; returns whether to close (QUIT).
                     // Factored out of the serve loop so the connection loop stays small.
                     let close = route_and_dispatch(
-                        &ctx, &mut conn, home, &inbox, &push_tx, &env, &store_rc, &wheel_rc,
-                        &state_rc, &request, &mut out,
+                        &ctx,
+                        &mut conn,
+                        home,
+                        &inbox,
+                        &mut push_tx,
+                        &mut push_rx,
+                        &mut shed_flag,
+                        &env,
+                        &store_rc,
+                        &wheel_rc,
+                        &state_rc,
+                        &request,
+                        &mut out,
                     )
                     .await;
                     read_buf.drain(..consumed);
@@ -512,6 +538,7 @@ async fn serve_connection(
                 &rt,
                 &mut stream,
                 &mut push_rx,
+                &shed_flag,
                 &mut read_buf,
                 &mut out,
                 conn.proto,
@@ -561,32 +588,46 @@ async fn serve_connection(
 }
 
 /// The SUBSCRIBE-mode idle wait (SERVER_PUSH.md #20, PR 91a): `select!` between draining the
-/// per-connection push channel and reading the next command. Returns `true` when the connection
-/// should CLOSE (the push consumer was shed -> sender dropped, a peer close, or an I/O error),
-/// `false` to keep looping. Split out of [`serve_connection`] so the hot non-subscriber path
-/// stays a plain `rt.recv` and this select! lives in one place.
+/// per-connection push channel, observing the SHED kill-signal, and reading the next command.
+/// Returns `true` when the connection should CLOSE (the push consumer was SHED for back-pressure,
+/// a peer close, or an I/O error), `false` to keep looping. Split out of [`serve_connection`] so
+/// the hot non-subscriber path stays a plain `rt.recv` and this select! lives in one place.
 ///
-/// The push branch is `biased` first (a ready push is delivered promptly), but the read branch
-/// is polled each iteration too, so a command is never starved. A delivered push is COALESCED
-/// with any further already-queued pushes (`try_recv`, non-blocking) into ONE write. The read
-/// branch reads into a FRESH buffer and APPENDS to `read_buf`: had the push branch won instead,
-/// a `read_buf` moved into the CANCELLED recv future would be lost with any partial frame it
-/// held; reading into a temporary keeps `read_buf`'s partial bytes safe across cancellation. No
-/// RefCell borrow is held across the `.await`s (render is pure; the subscription table is untouched).
+/// The select! is FAIR (no `biased;`, FIX E): a `biased` push-first poll could STARVE the read
+/// arm for a fast-flooded subscriber (the push arm would always be ready first), so the connection
+/// could never re-arm its command read; random fairness re-arms the read promptly. All three arms
+/// are still polled each iteration, so a command is never starved and a ready push is still
+/// delivered. A delivered push is COALESCED with any further already-queued pushes (`try_recv`,
+/// non-blocking) into ONE write. The read branch reads into a FRESH buffer and APPENDS to
+/// `read_buf`: had another branch won, a `read_buf` moved into the CANCELLED recv future would be
+/// lost with any partial frame it held; reading into a temporary keeps `read_buf`'s partial bytes
+/// safe across cancellation. No RefCell borrow is held across the `.await`s (render is pure; the
+/// subscription table is untouched).
+///
+/// The SHED arm (FIX D) `await`s `shed.wait()`: when the publisher overflows this connection's
+/// bound it trips the signal AND drops the table sender, but the serve loop holds its OWN
+/// `push_tx` clone, so `push_rx.recv()` would NOT return `None`. The signal is the disconnect
+/// trigger; `wait()` parks on the signal's `Notify` (SPIN-FREE, no busy poll), so a healthy
+/// subscriber pays nothing for this arm.
 async fn subscriber_idle_wait(
     rt: &TokioRuntime,
     stream: &mut tokio::net::TcpStream,
     push_rx: &mut tokio::sync::mpsc::Receiver<crate::pubsub::ServerPush>,
+    shed: &std::sync::Arc<crate::pubsub::ShedSignal>,
     read_buf: &mut Vec<u8>,
     out: &mut Vec<u8>,
     proto: ProtoVersion,
 ) -> bool {
+    // Fast pre-check: if the publisher already shed this connection between iterations, close
+    // now without entering the select! (the table sender is gone; nothing more will arrive).
+    if shed.is_tripped() {
+        return true;
+    }
     tokio::select! {
-        biased;
         maybe_push = push_rx.recv() => {
             let Some(push) = maybe_push else {
-                // Sender dropped: the publisher SHED this slow consumer (its push channel
-                // overflowed past the bound). Treat as a disconnect and close.
+                // Both the table sender(s) AND the serve loop's own push_tx are gone: the
+                // channel is fully closed. Treat as a disconnect and close.
                 return true;
             };
             // `out` was flushed before the idle wait, so it is empty here; rendering into it
@@ -600,6 +641,11 @@ async fn subscriber_idle_wait(
                 *out = returned;
                 false
             })
+        }
+        () = shed.wait() => {
+            // The publisher SHED this slow consumer (its push channel overflowed past the
+            // bound): close the connection (its subscriptions are cleaned up on the close path).
+            true
         }
         res = rt.recv(stream, Vec::new()) => {
             let Ok(res) = res else { return true; };
@@ -678,18 +724,29 @@ fn subscriber_gate_blocks(
 /// (matching the bump `handle_request` does on the home path), so every command is counted
 /// exactly once regardless of route.
 ///
+/// The router enforces a STRICT ORDER for the pub/sub-related gates (the root-cause fix for the
+/// adversarial-review findings): the internal-verb gate (FIX F), then the in-MULTI pub/sub REJECT
+/// (FIX C), then the RESP2 subscribe-mode gate (FIX B, MOVED to run BEFORE pub/sub interception so
+/// a RESP2 subscriber's PUBLISH/PUBSUB is rejected), then RESET interception (FIX A, deregisters
+/// subscriptions + swaps the push channel), then `try_handle_pubsub`. The previous order ran the
+/// pub/sub interception BEFORE both the in-MULTI gate and the subscribe-mode gate, so pub/sub
+/// commands BYPASSED both; the order below closes that hole.
+///
 /// `too_many_lines` is allowed: this is the connection's central ROUTING HUB (the internal-verb
-/// gate, the pub/sub interception, the subscribe-mode gate, the in-MULTI/WATCH guards, then the
-/// keyed / multikey / spanning / whole-keyspace / home branches), each a documented decision the
-/// router must make in one place; splitting it further would scatter the routing contract. The
-/// same precedent as `dispatch_inner` / `command_spec::spec_of`.
+/// gate, the in-MULTI pub/sub reject, the subscribe-mode gate, RESET interception, the pub/sub
+/// interception, the in-MULTI/WATCH guards, then the keyed / multikey / spanning / whole-keyspace
+/// / home branches), each a documented decision the router must make in one place; splitting it
+/// further would scatter the routing contract. The same precedent as `dispatch_inner` /
+/// `command_spec::spec_of`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn route_and_dispatch(
     ctx: &ServerContext,
     conn: &mut ConnState,
     home: ShardId,
     inbox: &coordinator::Inbox,
-    push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    push_tx: &mut tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    push_rx: &mut tokio::sync::mpsc::Receiver<crate::pubsub::ServerPush>,
+    shed_flag: &mut std::sync::Arc<crate::pubsub::ShedSignal>,
     env: &Rc<RefCell<SystemEnv>>,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     wheel_rc: &Rc<RefCell<TimingWheel>>,
@@ -723,34 +780,99 @@ async fn route_and_dispatch(
         // unreachable; only the coordinator issues it (via the inbox per shard).
         || cmd_upper == ironcache_server::ICPUBSUB
     {
+        // FIX F: when a client issues an internal verb INSIDE a MULTI, dirty the transaction in
+        // addition to replying the unknown-command error, so EXEC returns -EXECABORT exactly as
+        // a genuine unknown command would (the queue gate dirties an unknown command at queue
+        // time; this router intercepts the internal verb BEFORE that gate, so it must dirty here).
         reject_internal_verb(conn, state_rc, request, out);
+        if conn.in_multi {
+            conn.dirty_exec = true;
+        }
         return false;
     }
 
+    // -- IN-MULTI PUB/SUB REJECT (SERVER_PUSH.md #20, FIX C). The pub/sub commands are handled in
+    // THIS serve layer (`try_handle_pubsub`), NOT in `dispatch_inner`, so EXEC -- which replays
+    // the queued batch through `dispatch_inner` -- cannot run them. Rather than execute them
+    // EAGERLY inside MULTI (silently wrong + out of transaction order, the bug the interception
+    // order caused) or queue-then-fail-at-EXEC, REJECT them loudly at queue time and dirty the
+    // transaction (so EXEC returns -EXECABORT and applies nothing): the same "correct, or
+    // explicitly aborted, never silently wrong" contract as the cross-shard in-MULTI guards.
+    //
+    // DOCUMENTED DIVERGENCE from current Redis: Redis QUEUES the pub/sub commands inside MULTI
+    // and runs them at EXEC (they do NOT carry CMD_NO_MULTI; verified against redis/redis
+    // src/commands/*.json). Serve-layer EXEC replay of pub/sub is the tracked follow-up that
+    // removes this divergence; until then we reject (never silently mis-execute). The reject runs
+    // BEFORE `try_handle_pubsub` so the command is neither executed nor queued.
+    if conn.in_multi && is_serve_pubsub_command(&cmd_upper) {
+        state_rc.borrow_mut().counters.on_command();
+        conn.dirty_exec = true;
+        let name = String::from_utf8_lossy(&cmd_upper).into_owned();
+        encode_into(
+            out,
+            &ironcache_server::Value::error(
+                ironcache_protocol::ErrorReply::not_allowed_in_transactions(&name),
+            ),
+            conn.proto,
+        );
+        return false;
+    }
+
+    // -- SUBSCRIBE-MODE GATE (SERVER_PUSH.md #20, FIX B). MOVED to run BEFORE the pub/sub
+    // interception: a RESP2 subscriber may run ONLY the (P)SUBSCRIBE / (P)UNSUBSCRIBE control set
+    // + PING/QUIT/RESET; PUBLISH and PUBSUB are NOT allowed. The previous order intercepted
+    // PUBLISH/PUBSUB before this gate, so a RESP2 subscriber wrongly executed them. The gate's
+    // allowlist still passes the subscribe-family + PING/QUIT/RESET through to interception (so
+    // SUBSCRIBE while subscribed, the subscribed PING array, etc. still work); only PUBLISH/PUBSUB
+    // (and any other non-pub/sub command) get the subscribe-mode error. RESP3 has NO restriction.
+    // The check + reply live in `subscriber_gate_blocks` (kept out of this router so it stays
+    // small); it returns true (and has written the error) when the command is blocked. See that
+    // helper for WHY the gate is ALSO in `dispatch` (a remote keyed hop bypasses the dispatch gate).
+    if subscriber_gate_blocks(conn, state_rc, &cmd_upper, out) {
+        return false;
+    }
+
+    // -- RESET INTERCEPTION (SERVER_PUSH.md #20, FIX A). RESET goes through the home dispatch path
+    // (`dispatch_inner`'s RESET arm), which clears `conn.sub_channels` / `sub_patterns` but CANNOT
+    // reach the per-shard subscription table (the push senders live in this serve layer). Without
+    // this interception a post-RESET connection would still appear subscribed in the shard table:
+    // a PUBLISH would still count + deliver to it (a GHOST), and PUBSUB CHANNELS would still list
+    // it. So when RESET arrives on a subscriber, we FIRST deregister all its subscriptions from
+    // the table (driven off the PRE-reset conn sub sets), THEN replace the per-connection push
+    // channel (drop the old sender/receiver + shed flag, install a fresh trio) so a post-RESET
+    // SUBSCRIBE re-registers cleanly with a live channel, and only THEN let dispatch run RESET
+    // (which clears the conn sub sets + the rest of the reset). A RESET on a non-subscriber skips
+    // straight to dispatch (the deregister is a no-op), so the non-subscriber path is unchanged.
+    if cmd_upper == b"RESET" && conn.is_subscriber() {
+        deregister_all_subscriptions(conn);
+        // Swap in a fresh push channel + shed flag: the old `push_tx`/`push_rx`/`shed_flag` are
+        // dropped, so any in-flight ghost sender the publisher still holds is closed, and a fresh
+        // SUBSCRIBE after RESET registers the NEW sender. The serve loop owns these by &mut, so
+        // the swap is visible to the idle wait on the next iteration.
+        let (new_tx, new_rx) = tokio::sync::mpsc::channel::<crate::pubsub::ServerPush>(
+            crate::pubsub::PUSH_CHANNEL_BOUND,
+        );
+        *push_tx = new_tx;
+        *push_rx = new_rx;
+        *shed_flag = std::sync::Arc::new(crate::pubsub::ShedSignal::default());
+        // Fall through to dispatch so the RESET arm clears the conn sub sets + the rest of reset
+        // and replies "+RESET".
+    }
+
     // -- PUB/SUB SERVE-LAYER INTERCEPTION (SERVER_PUSH.md #20, PR 91a). SUBSCRIBE / UNSUBSCRIBE /
-    // PUBLISH (and PING-while-subscribed under RESP2) are handled HERE, before routing/queueing,
-    // because registration needs the per-connection push sender + the per-shard subscription
-    // table that live in this serve layer (the server crate has no tokio dep). Intercepting
-    // BEFORE the in-MULTI gate runs a subscriber's pub/sub commands immediately (they are not
-    // queueable). When `try_handle_pubsub` handled the command it returns `Some(close)`; every
-    // other command (`None`) falls through to the normal routing + dispatch (where the RESP2
-    // subscribe-mode gate rejects disallowed commands). Split out so this router stays small.
+    // PUBLISH (and PING-while-subscribed under RESP2) are handled HERE because registration needs
+    // the per-connection push sender + the per-shard subscription table that live in this serve
+    // layer (the server crate has no tokio dep). By the time we reach here the in-MULTI reject and
+    // the RESP2 subscribe-mode gate have already run (FIX C / FIX B), so a pub/sub command that
+    // arrives here is NOT in MULTI and (if a RESP2 subscriber) is in the allowed control set. When
+    // `try_handle_pubsub` handled the command it returns `Some(close)`; every other command
+    // (`None`) falls through to the normal routing + dispatch. Split out so this router stays small.
     if let Some(close) = try_handle_pubsub(
-        conn, home, inbox, push_tx, state_rc, &cmd_upper, request, out,
+        conn, home, inbox, push_tx, shed_flag, state_rc, &cmd_upper, request, out,
     )
     .await
     {
         return close;
-    }
-
-    // -- SUBSCRIBE-MODE GATE under partitioning (SERVER_PUSH.md #20, PR 91a). A RESP2 subscriber
-    // may run ONLY the pub/sub control set + PING/QUIT/RESET; any other command is rejected. The
-    // check + reply live in `subscriber_gate_blocks` (kept out of this router so it stays small);
-    // it returns true (and has written the error to `out`) when the command is blocked. See that
-    // helper for WHY the gate is ALSO here and not only in `dispatch` (a remote keyed hop bypasses
-    // the dispatch gate).
-    if subscriber_gate_blocks(conn, state_rc, &cmd_upper, out) {
-        return false;
     }
 
     // -- TRANSACTION CORRECTNESS UNDER PARTITIONING (COORDINATOR.md #107, the critical fix).
@@ -1201,6 +1323,20 @@ fn all_keys_home_owned(cmd_upper: &[u8], request: &Request, home: ShardId) -> bo
     }
 }
 
+/// Whether `cmd_upper` is one of the SERVE-LAYER pub/sub commands intercepted by
+/// [`try_handle_pubsub`] (SERVER_PUSH.md #20): SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE /
+/// PUNSUBSCRIBE / PUBLISH / PUBSUB. These are handled in the serve layer (not `dispatch_inner`),
+/// so EXEC cannot replay them; the in-MULTI reject (FIX C) uses this to decide which commands to
+/// reject + dirty inside a transaction. PING is NOT in this set (a subscribed PING is handled by
+/// `try_handle_pubsub` but PING is a normal command that DOES reach `dispatch_inner`, so it
+/// queues + replays at EXEC like any other command).
+fn is_serve_pubsub_command(cmd_upper: &[u8]) -> bool {
+    matches!(
+        cmd_upper,
+        b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH" | b"PUBSUB"
+    )
+}
+
 /// Whether `cmd_upper` is one of the SIX multi-key DATA commands the coordinator fans out
 /// across shards when its keys SPAN shards (COORDINATOR.md #107, Stage 2a): MGET, MSET,
 /// DEL, EXISTS, UNLINK, TOUCH. Every OTHER spanning multi-key command (SINTER*/SUNION*/
@@ -1264,6 +1400,7 @@ async fn try_handle_pubsub(
     home: ShardId,
     inbox: &coordinator::Inbox,
     push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
     state_rc: &Rc<RefCell<ShardState>>,
     cmd_upper: &[u8],
     request: &Request,
@@ -1275,7 +1412,7 @@ async fn try_handle_pubsub(
             // Arity (>= 2) is the registry's; a bare SUBSCRIBE with no channel is a wrong-arity
             // error, mirroring the dispatch arity path for the other serve-routed commands.
             if request.args.len() >= 2 {
-                handle_subscribe(conn, push_tx, request, out);
+                handle_subscribe(conn, push_tx, shed_flag, request, out);
             } else {
                 encode_into(
                     out,
@@ -1297,7 +1434,7 @@ async fn try_handle_pubsub(
             // Arity (>= 2) is the registry's; a bare PSUBSCRIBE with no pattern is a
             // wrong-arity error, mirroring SUBSCRIBE's inline arity path.
             if request.args.len() >= 2 {
-                handle_psubscribe(conn, push_tx, request, out);
+                handle_psubscribe(conn, push_tx, shed_flag, request, out);
             } else {
                 encode_into(
                     out,
@@ -1380,15 +1517,21 @@ fn running_count(conn: &ConnState) -> i64 {
 fn handle_subscribe(
     conn: &mut ConnState,
     push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
     request: &Request,
     out: &mut Vec<u8>,
 ) {
     let pubsub = shard_pubsub();
     for channel in &request.args[1..] {
         conn.sub_channels.insert(channel.clone());
-        pubsub
-            .borrow_mut()
-            .subscribe(channel.clone(), conn.id, push_tx.clone());
+        pubsub.borrow_mut().subscribe(
+            channel.clone(),
+            conn.id,
+            crate::pubsub::Subscriber {
+                sender: push_tx.clone(),
+                shed: std::sync::Arc::clone(shed_flag),
+            },
+        );
         let count = running_count(conn);
         encode_into(
             out,
@@ -1448,15 +1591,21 @@ fn handle_unsubscribe(conn: &mut ConnState, request: &Request, out: &mut Vec<u8>
 fn handle_psubscribe(
     conn: &mut ConnState,
     push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
     request: &Request,
     out: &mut Vec<u8>,
 ) {
     let pubsub = shard_pubsub();
     for pattern in &request.args[1..] {
         conn.sub_patterns.insert(pattern.clone());
-        pubsub
-            .borrow_mut()
-            .subscribe_pattern(pattern.clone(), conn.id, push_tx.clone());
+        pubsub.borrow_mut().subscribe_pattern(
+            pattern.clone(),
+            conn.id,
+            crate::pubsub::Subscriber {
+                sender: push_tx.clone(),
+                shed: std::sync::Arc::clone(shed_flag),
+            },
+        );
         let count = running_count(conn);
         encode_into(
             out,
@@ -1514,8 +1663,17 @@ fn handle_punsubscribe(conn: &mut ConnState, request: &Request, out: &mut Vec<u8
 /// [args]` request out to EVERY shard via [`coordinator::fan_out_pubsub`] (the home shard runs
 /// it locally, peers via their drain loops) and MERGES the per-shard partials per subcommand:
 /// CHANNELS unions+dedups the channel names, NUMSUB sums the per-channel counts, NUMPAT unions
-/// the pattern names and counts the DISTINCT total. An unknown subcommand is the Redis
-/// unknown-subcommand error (no fan-out). `commands_processed` was already bumped by the caller.
+/// the pattern names and counts the DISTINCT total. `commands_processed` was already bumped by
+/// the caller.
+///
+/// Per-subcommand ARITY is validated here, byte-exact to Redis `pubsubCommand` (verified against
+/// redis/redis src/pubsub.c): CHANNELS accepts `argc == 2 || argc == 3` (at MOST one pattern arg,
+/// FIX H), NUMPAT accepts EXACTLY `argc == 2` (NO args, FIX H), NUMSUB accepts `argc >= 2` (any
+/// number of channels). A bare `PUBSUB` (no subcommand) is a WRONG-ARITY error (FIX G; the
+/// registry arity is min-2, and Redis returns wrong-arity for a missing subcommand). Every other
+/// invalid case -- an unknown subcommand, OR a known subcommand with the wrong arg count -- is the
+/// Redis `addReplySubcommandSyntaxError` (our [`ErrorReply::unknown_subcommand`], byte-identical:
+/// `ERR unknown subcommand or wrong number of arguments for '<sub>'. Try PUBSUB HELP.`).
 async fn handle_pubsub(
     conn: &ConnState,
     inbox: &coordinator::Inbox,
@@ -1523,21 +1681,31 @@ async fn handle_pubsub(
     request: &Request,
     out: &mut Vec<u8>,
 ) {
-    // PUBSUB requires a subcommand (arity >= 2 in the registry; the serve loop does not arity-gate
-    // it, so validate here). A bare `PUBSUB` is the unknown-subcommand error (matching Redis,
-    // which rejects a missing subcommand the same way as an unknown one).
+    // FIX G: a bare `PUBSUB` (no subcommand) is WRONG-ARITY (not unknown-subcommand). The registry
+    // arity is min-2; Redis rejects a missing subcommand with the wrong-arity error.
     let Some(sub_raw) = request.args.get(1) else {
         encode_into(
             out,
-            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::unknown_subcommand(
-                "pubsub", "",
-            )),
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_arity("pubsub")),
             conn.proto,
         );
         return;
     };
     let sub_upper = ascii_upper(sub_raw.as_ref());
-    if !matches!(sub_upper.as_slice(), b"CHANNELS" | b"NUMSUB" | b"NUMPAT") {
+    let argc = request.args.len();
+    // Each known subcommand carries its own arg-count rule (FIX H), byte-exact to Redis
+    // pubsubCommand. A present-but-unrecognized subcommand OR a recognized subcommand with a bad
+    // arg count both fall to the same subcommand-syntax error (Redis's addReplySubcommandSyntaxError).
+    let valid = match sub_upper.as_slice() {
+        // CHANNELS [pattern]: at most one pattern -> argc 2 or 3.
+        b"CHANNELS" => argc == 2 || argc == 3,
+        // NUMSUB [channel ...]: any number of channels -> argc >= 2 (no upper bound).
+        b"NUMSUB" => argc >= 2,
+        // NUMPAT: takes NO args -> argc exactly 2.
+        b"NUMPAT" => argc == 2,
+        _ => false,
+    };
+    if !valid {
         encode_into(
             out,
             &ironcache_server::Value::error(ironcache_protocol::ErrorReply::unknown_subcommand(

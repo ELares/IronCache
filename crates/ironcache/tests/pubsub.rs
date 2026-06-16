@@ -928,3 +928,378 @@ fn single_shard_pattern_delivery_parity() {
         server.shutdown_and_join().unwrap();
     });
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial-review regression tests (SERVER_PUSH.md #20, FIX A-H). Each pins the
+// behavior a finding was about so it cannot silently regress.
+// ---------------------------------------------------------------------------
+
+/// Pull the `-...` error text (without the trailing CRLF) out of an error reply, panicking on
+/// any other shape.
+fn err_text(reply: &Resp) -> Vec<u8> {
+    match reply {
+        Resp::Error(line) => line.clone(),
+        other => panic!("expected an error reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn fix_a_reset_clears_subscriptions_from_the_shard_table() {
+    // FIX A: after SUBSCRIBE then RESET, the connection is NO LONGER in the shard subscription
+    // table -- a PUBLISH to the channel returns 0 (no ghost delivery) and PUBSUB CHANNELS is
+    // empty. Before the fix, RESET cleared the conn-side sets but left the table entry, so the
+    // connection stayed a ghost subscriber.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut a = connect_retry(port).await;
+        let mut ab = Vec::new();
+
+        // Subscribe, then RESET. RESET replies the simple string "+RESET".
+        let _ = send_and_read(&mut a, &mut ab, &[b"SUBSCRIBE", b"ch"]).await;
+        let reset = send_and_read(&mut a, &mut ab, &[b"RESET"]).await;
+        assert_eq!(
+            reset,
+            Resp::Simple(b"RESET".to_vec()),
+            "RESET replies +RESET"
+        );
+        // Give the home shard a beat (the deregister ran synchronously in route_and_dispatch,
+        // but allow scheduling slack before the cross-shard PUBSUB gather).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A PUBLISH to the channel finds NO subscriber (the table entry was deregistered).
+        let mut p = connect_retry(port).await;
+        let mut pb = Vec::new();
+        let n = send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"ch", b"v"]).await;
+        assert_eq!(
+            n,
+            Resp::Integer(0),
+            "PUBLISH after RESET must find no subscriber (no ghost)"
+        );
+
+        // PUBSUB CHANNELS is empty (the channel has no subscribers anywhere).
+        let chans = send_and_read(&mut p, &mut pb, &[b"PUBSUB", b"CHANNELS"]).await;
+        assert!(
+            sorted_channel_names(&chans).is_empty(),
+            "PUBSUB CHANNELS must be empty after the only subscriber RESET"
+        );
+
+        // The post-RESET connection is no longer in subscribe mode: a plain GET works (it left
+        // the RESP2 subscribe-mode restriction), and a fresh SUBSCRIBE re-registers cleanly.
+        let getr = send_and_read(&mut a, &mut ab, &[b"GET", b"missing"]).await;
+        assert_eq!(
+            getr,
+            Resp::Bulk(None),
+            "post-RESET GET works (left subscribe mode)"
+        );
+        let resub = send_and_read(&mut a, &mut ab, &[b"SUBSCRIBE", b"ch"]).await;
+        let items = agg_items(&resub);
+        assert_eq!(items[0], Resp::Bulk(Some(b"subscribe".to_vec())));
+        assert_eq!(
+            items[2],
+            Resp::Integer(1),
+            "fresh SUBSCRIBE re-registers at count 1"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The re-subscribe registered the NEW push channel: a PUBLISH now counts + delivers.
+        let n2 = send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"ch", b"again"]).await;
+        assert_eq!(n2, Resp::Integer(1), "re-subscribe after RESET delivers");
+        let msg = read_with_timeout(&mut a, &mut ab, 1000)
+            .await
+            .expect("re-subscribed connection must receive on its fresh push channel");
+        assert_message(&msg, b"ch", b"again");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn fix_b_resp2_subscriber_publish_and_pubsub_are_subscribe_mode_errors() {
+    // FIX B: the RESP2 subscribe-mode gate must cover PUBLISH and PUBSUB (they are NOT in the
+    // allowed set). Before the fix, try_handle_pubsub intercepted them BEFORE the gate, so a
+    // RESP2 subscriber executed them. A RESP3 subscriber has NO restriction (PUBLISH/PUBSUB
+    // work), and a NON-subscriber PUBLISH always works.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+
+        // RESP2 subscriber: PUBLISH and PUBSUB are both rejected with the subscribe-mode error.
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+        let _ = send_and_read(&mut c, &mut cb, &[b"SUBSCRIBE", b"ch"]).await;
+        let pub_err = send_and_read(&mut c, &mut cb, &[b"PUBLISH", b"ch", b"v"]).await;
+        assert_eq!(
+            err_text(&pub_err),
+            b"ERR Can't execute 'publish': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+        );
+        let pubsub_err = send_and_read(&mut c, &mut cb, &[b"PUBSUB", b"CHANNELS"]).await;
+        assert_eq!(
+            err_text(&pubsub_err),
+            b"ERR Can't execute 'pubsub': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+        );
+        // SUBSCRIBE-family + PING still pass the gate (the allowlist reaches interception).
+        let again = send_and_read(&mut c, &mut cb, &[b"SUBSCRIBE", b"ch2"]).await;
+        assert_eq!(agg_items(&again)[0], Resp::Bulk(Some(b"subscribe".to_vec())));
+
+        // RESP3 subscriber: PUBLISH and PUBSUB both work (no subscribe-mode restriction).
+        let mut d = connect_retry(port).await;
+        let mut db = Vec::new();
+        hello3(&mut d).await;
+        let _ = send_and_read(&mut d, &mut db, &[b"SUBSCRIBE", b"chd"]).await;
+        let pubr = send_and_read(&mut d, &mut db, &[b"PUBLISH", b"nobody", b"v"]).await;
+        assert_eq!(pubr, Resp::Integer(0), "RESP3 subscriber PUBLISH works");
+        let chans = send_and_read(&mut d, &mut db, &[b"PUBSUB", b"CHANNELS"]).await;
+        // chd has a subscriber (this connection): CHANNELS lists it (alongside any channels the
+        // still-connected RESP2 subscriber holds -- the gather is global, so assert containment
+        // rather than exclusive equality).
+        assert!(
+            sorted_channel_names(&chans).contains(&b"chd".to_vec()),
+            "RESP3 subscriber PUBSUB CHANNELS works (lists chd)"
+        );
+
+        // Non-subscriber PUBLISH always works.
+        let mut e = connect_retry(port).await;
+        let mut eb = Vec::new();
+        let n = send_and_read(&mut e, &mut eb, &[b"PUBLISH", b"none", b"v"]).await;
+        assert_eq!(n, Resp::Integer(0), "non-subscriber PUBLISH works");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn fix_c_pubsub_commands_in_multi_are_rejected_and_execabort() {
+    // FIX C: a serve-layer pub/sub command inside MULTI must NOT execute eagerly. It is rejected
+    // (the "is not allowed in transactions" error) and dirties the transaction, so EXEC returns
+    // -EXECABORT. This is a documented divergence from Redis (which queues + runs at EXEC); see
+    // the constructor doc. Covers SUBSCRIBE and PUBLISH.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+
+        let multi = send_and_read(&mut c, &mut cb, &[b"MULTI"]).await;
+        assert_eq!(multi, Resp::Simple(b"OK".to_vec()));
+
+        // SUBSCRIBE inside MULTI: rejected, NOT +QUEUED.
+        let sub = send_and_read(&mut c, &mut cb, &[b"SUBSCRIBE", b"ch"]).await;
+        assert_eq!(
+            err_text(&sub),
+            b"ERR SUBSCRIBE is not allowed in transactions",
+            "SUBSCRIBE in MULTI is rejected, not queued"
+        );
+        // PUBLISH inside MULTI: rejected too.
+        let pubr = send_and_read(&mut c, &mut cb, &[b"PUBLISH", b"ch", b"v"]).await;
+        assert_eq!(
+            err_text(&pubr),
+            b"ERR PUBLISH is not allowed in transactions",
+            "PUBLISH in MULTI is rejected, not queued"
+        );
+
+        // The transaction was dirtied: EXEC -> -EXECABORT, applying nothing.
+        let exec = send_and_read(&mut c, &mut cb, &[b"EXEC"]).await;
+        assert_eq!(
+            err_text(&exec),
+            b"EXECABORT Transaction discarded because of previous errors.",
+            "a rejected pub/sub command in MULTI dirties the txn -> EXECABORT"
+        );
+
+        // The connection is NOT in subscribe mode (the SUBSCRIBE never executed): a GET works.
+        let getr = send_and_read(&mut c, &mut cb, &[b"GET", b"missing"]).await;
+        assert_eq!(
+            getr,
+            Resp::Bulk(None),
+            "the rejected SUBSCRIBE did not subscribe"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn fix_d_flooded_non_reading_subscriber_is_disconnected() {
+    // FIX D: a subscriber that never reads is flooded past the push-channel bound; it is shed
+    // AND its socket is actively CLOSED (read returns 0 = EOF), and the publisher stays
+    // responsive. The active disconnect (not just table removal) is the fix: the serve loop
+    // holds its own push_tx clone, so the shed signal -- not push_rx closing -- drives the close.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+
+        // The slow consumer subscribes, reads only its confirmation, then never reads again.
+        let mut slow = connect_retry(port).await;
+        let mut slowb = Vec::new();
+        let _ = send_and_read(&mut slow, &mut slowb, &[b"SUBSCRIBE", b"flood"]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Flood well past the bound with a large payload, like the existing back-pressure test,
+        // until the publisher observes the shed (count 0). Every PUBLISH must return promptly.
+        let big = vec![b'x'; 8 * 1024];
+        let mut p = connect_retry(port).await;
+        let mut pb = Vec::new();
+        let mut shed = false;
+        for _ in 0..6000u32 {
+            let n = tokio::time::timeout(
+                Duration::from_secs(2),
+                send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"flood", &big]),
+            )
+            .await
+            .expect("PUBLISH must never block on a slow consumer");
+            if n == Resp::Integer(0) {
+                shed = true;
+                break;
+            }
+        }
+        assert!(
+            shed,
+            "the slow consumer must be shed once its push channel overflows"
+        );
+
+        // FIX D: the shed connection's SOCKET is actively closed. A read on it returns 0 (EOF)
+        // promptly (the serve loop observed the shed signal and broke its loop). Drain any
+        // buffered pushes first, then assert EOF within a bounded wait. The read buffer is a
+        // heap Vec (not a 16 KiB stack array) so the awaited future stays small.
+        let eof = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut chunk = vec![0u8; 16 * 1024];
+            loop {
+                // Ok(0) is a clean EOF (the server closed the socket); Err is a reset/error.
+                // Both mean the connection is gone -> return true. Ok(n>0) is buffered push
+                // bytes: keep draining.
+                match slow.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return true,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("the shed subscriber's socket must close (EOF) within the timeout");
+        assert!(
+            eof,
+            "the flooded non-reading subscriber is disconnected (EOF)"
+        );
+
+        // The publisher is still fully responsive after the shed + disconnect.
+        let still = send_and_read(&mut p, &mut pb, &[b"PUBLISH", b"flood", b"x"]).await;
+        assert_eq!(
+            still,
+            Resp::Integer(0),
+            "publisher responsive; consumer gone"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn fix_f_client_internal_verb_in_multi_dirties_and_execaborts() {
+    // FIX F: a client-issued INTERNAL verb (__ICPUBLISH) inside MULTI must reject with the
+    // unknown-command error AND dirty the transaction, so EXEC returns -EXECABORT (exactly as a
+    // genuine unknown command in MULTI does). Before the fix the reject path did not set
+    // dirty_exec, so the internal verb did not abort the batch.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+
+        assert_eq!(
+            send_and_read(&mut c, &mut cb, &[b"MULTI"]).await,
+            Resp::Simple(b"OK".to_vec())
+        );
+
+        // A client __ICPUBLISH in MULTI: rejected as unknown-command (the internal verb is
+        // client-unreachable), NOT +QUEUED.
+        let icpub = send_and_read(&mut c, &mut cb, &[b"__ICPUBLISH", b"ch", b"v"]).await;
+        let text = err_text(&icpub);
+        assert!(
+            text.starts_with(b"ERR unknown command '__ICPUBLISH'"),
+            "client __ICPUBLISH is the unknown-command error; got {:?}",
+            String::from_utf8_lossy(&text)
+        );
+
+        // The txn was dirtied: EXEC -> -EXECABORT.
+        let exec = send_and_read(&mut c, &mut cb, &[b"EXEC"]).await;
+        assert_eq!(
+            err_text(&exec),
+            b"EXECABORT Transaction discarded because of previous errors.",
+            "a client internal verb in MULTI dirties the txn -> EXECABORT"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn fix_g_bare_pubsub_is_wrong_arity() {
+    // FIX G: a bare `PUBSUB` (no subcommand) returns the WRONG-ARITY error, not the
+    // unknown-subcommand error (Redis returns wrong-arity for a missing subcommand).
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+        let err = send_and_read(&mut c, &mut cb, &[b"PUBSUB"]).await;
+        assert_eq!(
+            err_text(&err),
+            b"ERR wrong number of arguments for 'pubsub' command",
+            "bare PUBSUB is wrong-arity, not unknown-subcommand"
+        );
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn fix_h_pubsub_channels_and_numpat_reject_extra_args() {
+    // FIX H: PUBSUB CHANNELS takes at most ONE pattern arg; PUBSUB NUMPAT takes NO args. Extra
+    // args -> the Redis subcommand-syntax error (addReplySubcommandSyntaxError = our
+    // unknown-subcommand text). NUMSUB takes any number of channels (no upper bound), so it
+    // stays valid with several channels.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(2);
+        let mut c = connect_retry(port).await;
+        let mut cb = Vec::new();
+
+        // CHANNELS with TWO pattern args (one too many) -> the subcommand-syntax error.
+        let chans_err =
+            send_and_read(&mut c, &mut cb, &[b"PUBSUB", b"CHANNELS", b"a*", b"b*"]).await;
+        assert_eq!(
+            err_text(&chans_err),
+            b"ERR unknown subcommand or wrong number of arguments for 'CHANNELS'. Try PUBSUB HELP.",
+            "PUBSUB CHANNELS with >1 pattern is the syntax/arity error"
+        );
+
+        // NUMPAT with ANY arg -> the subcommand-syntax error (it takes no args).
+        let numpat_err = send_and_read(&mut c, &mut cb, &[b"PUBSUB", b"NUMPAT", b"x"]).await;
+        assert_eq!(
+            err_text(&numpat_err),
+            b"ERR unknown subcommand or wrong number of arguments for 'NUMPAT'. Try PUBSUB HELP.",
+            "PUBSUB NUMPAT with any arg is the syntax/arity error"
+        );
+
+        // CHANNELS with exactly one pattern is VALID (an empty array here, nobody subscribed).
+        let chans_ok = send_and_read(&mut c, &mut cb, &[b"PUBSUB", b"CHANNELS", b"a*"]).await;
+        assert!(
+            sorted_channel_names(&chans_ok).is_empty(),
+            "PUBSUB CHANNELS with one pattern is valid"
+        );
+        // NUMSUB with several channels stays valid (flat [ch, 0, ch, 0] pairs).
+        let numsub_ok =
+            send_and_read(&mut c, &mut cb, &[b"PUBSUB", b"NUMSUB", b"x", b"y", b"z"]).await;
+        assert_eq!(
+            agg_items(&numsub_ok).len(),
+            6,
+            "PUBSUB NUMSUB accepts any number of channels"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}

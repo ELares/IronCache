@@ -29,13 +29,76 @@
 //! Delivery uses [`mpsc::Sender::try_send`], NEVER `send().await`: a push must never block
 //! the publishing shard. A subscriber whose bounded push channel ([`PUSH_CHANNEL_BOUND`])
 //! is FULL (a slow consumer) is DEREGISTERED from the shard table on the spot (its sender
-//! is dropped); its serve loop then sees `push_rx.recv()` return `None` and treats that as
-//! a disconnect, so shard memory stays bounded.
+//! is dropped) AND its per-connection shed signal ([`Subscriber::shed`]) is flipped, so its
+//! serve loop's idle wait observes the kill flag and CLOSES the connection (it does not rely
+//! on `push_rx` returning `None`: the serve loop holds its OWN `push_tx` clone, which would
+//! keep the channel open). Disconnecting the slow consumer keeps shard memory bounded
+//! (SERVER_PUSH.md "a slow pubsub consumer over its hard limit is disconnected").
 
 use bytes::Bytes;
 use ironcache_protocol::{ProtoVersion, Value};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Notify, mpsc};
+
+/// The per-connection SHED/kill signal (SERVER_PUSH.md #20, FIX D): a one-shot latch the
+/// publisher trips when it sheds a slow consumer (its bounded push channel overflowed past
+/// [`PUSH_CHANNEL_BOUND`]). The consumer's serve-loop idle wait holds a clone (registered into
+/// the shard table via [`Subscriber::shed`]) and CLOSES the connection once tripped. This is
+/// necessary because the serve loop holds its OWN `push_tx` clone, so `push_rx.recv()` would NOT
+/// return `None` on a shed alone -- the latch is the disconnect trigger.
+///
+/// It pairs an [`AtomicBool`] (the observable, idempotent latch state, so the table side / a
+/// pre-check / a test can read whether the connection was shed) with a [`Notify`] (a SPIN-FREE
+/// wake, so the idle-wait `select!` arm `await`s rather than busy-polling). [`Self::trip`] sets
+/// the flag and wakes the waiter; [`Self::wait`] resolves once tripped (immediately if already
+/// tripped, via the permit `Notify::notify_one` leaves). Shared cross-core (the publisher runs on
+/// any shard), so it lives behind an [`Arc`].
+#[derive(Debug, Default)]
+pub struct ShedSignal {
+    flagged: AtomicBool,
+    wake: Notify,
+}
+
+impl ShedSignal {
+    /// Trip the latch: mark it shed and WAKE any waiter (the consumer's idle-wait shed arm).
+    /// Idempotent -- a second trip is a no-op latch-wise and just re-wakes (harmless). Called by
+    /// the publisher inside [`ShardPubSub::deliver`] / [`ShardPubSub::deliver_patterns`] on a
+    /// `Full`/`Closed` send.
+    pub fn trip(&self) {
+        self.flagged.store(true, Ordering::Relaxed);
+        // Wake the (single) waiter; `notify_one` leaves a permit if no waiter is parked yet, so a
+        // `wait()` that starts AFTER the trip still returns immediately (no lost wakeup).
+        self.wake.notify_one();
+    }
+
+    /// Whether the latch is tripped (the connection was shed). A relaxed load: the latch is a
+    /// one-shot monotonic signal; no ordering with other state is needed to decide to disconnect.
+    #[must_use]
+    pub fn is_tripped(&self) -> bool {
+        self.flagged.load(Ordering::Relaxed)
+    }
+
+    /// Resolve once the latch is tripped, WITHOUT busy-spinning (the idle-wait `select!` arm).
+    /// Returns immediately if already tripped (re-checking the flag after registering interest,
+    /// so a trip that races the registration is not missed); otherwise parks on the [`Notify`]
+    /// until [`Self::trip`] wakes it.
+    pub async fn wait(&self) {
+        loop {
+            if self.flagged.load(Ordering::Relaxed) {
+                return;
+            }
+            // Register interest BEFORE the re-check so a trip between the check above and the
+            // await below leaves a permit that makes `notified()` return at once (no lost wakeup).
+            let notified = self.wake.notified();
+            if self.flagged.load(Ordering::Relaxed) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// The bounded depth of each subscriber connection's per-connection push channel
 /// (SERVER_PUSH.md back-pressure). A push is `try_send`'d into this channel by the
@@ -107,37 +170,58 @@ impl ServerPush {
     }
 }
 
+/// A single LOCAL subscriber's delivery handles in the per-shard table (SERVER_PUSH.md #20).
+/// Bundles the `Send` push `sender` with a per-connection `shed` kill-signal so the publisher,
+/// when it SHEDS a slow consumer (its bounded push channel is `Full`), can both drop the table
+/// entry AND trip the signal the consumer's serve loop awaits, so the shed connection is actively
+/// DISCONNECTED rather than left as a zombie (FIX D). Both halves are `Send` so the subscriber
+/// struct crosses the publishing-shard -> consumer-core boundary.
+#[derive(Debug, Clone)]
+pub struct Subscriber {
+    /// The connection's bounded push channel sender. A push is `try_send`'d here (never
+    /// blocking); a `Full`/`Closed` result sheds the subscriber.
+    pub sender: mpsc::Sender<ServerPush>,
+    /// The connection's shared shed/kill signal ([`ShedSignal`]). Tripped by
+    /// [`ShardPubSub::deliver`] / [`ShardPubSub::deliver_patterns`] when this subscriber is shed
+    /// for back-pressure (`Full`); the consumer's serve-loop idle wait also holds a clone and
+    /// CLOSES the connection when it observes the trip (spin-free, via the signal's `Notify`).
+    /// Shared cross-core (the connection lives on one core, but the publisher may run on another).
+    pub shed: Arc<ShedSignal>,
+}
+
 /// The PER-SHARD subscription table (SERVER_PUSH.md routing tables). Maps a channel (and a
 /// PSUBSCRIBE glob pattern, PR 91b) to the set of LOCAL subscriber connections by connection
-/// id, each carrying that connection's `Send` push sender.
+/// id, each carrying that connection's delivery handles ([`Subscriber`]: the `Send` push
+/// sender + the shared shed signal).
 ///
 /// Core-local (a thread-local in [`crate::serve`]); NO lock (ADR-0002 shared-nothing). The
-/// only cross-core handle stored is the `Send` [`mpsc::Sender<ServerPush>`]: a PUBLISH that
-/// fans out to every shard reaches each shard's own `ShardPubSub` (via the cross-shard
-/// coordinator), so each shard renders to ITS connections from ITS table with no shared
-/// lock. The `patterns` map holds PSUBSCRIBE subscriptions; one PUBLISH delivers to BOTH the
-/// exact `channels` entry AND every matching pattern (no dedup, Redis semantics).
+/// only cross-core handles stored are the `Send` [`mpsc::Sender<ServerPush>`] and the shed
+/// `Arc<AtomicBool>`: a PUBLISH that fans out to every shard reaches each shard's own
+/// `ShardPubSub` (via the cross-shard coordinator), so each shard renders to ITS connections
+/// from ITS table with no shared lock. The `patterns` map holds PSUBSCRIBE subscriptions; one
+/// PUBLISH delivers to BOTH the exact `channels` entry AND every matching pattern (no dedup,
+/// Redis semantics).
 #[derive(Debug, Default)]
 pub struct ShardPubSub {
-    /// channel -> {conn id -> push sender}. A channel with no subscribers is absent (the
+    /// channel -> {conn id -> subscriber}. A channel with no subscribers is absent (the
     /// last UNSUBSCRIBE / disconnect removes the empty inner map).
-    pub channels: HashMap<Bytes, HashMap<u64, mpsc::Sender<ServerPush>>>,
-    /// pattern -> {conn id -> push sender} (PSUBSCRIBE, PR 91b). A pattern with no subscribers
+    pub channels: HashMap<Bytes, HashMap<u64, Subscriber>>,
+    /// pattern -> {conn id -> subscriber} (PSUBSCRIBE, PR 91b). A pattern with no subscribers
     /// is absent (the last PUNSUBSCRIBE / disconnect removes the empty inner map). A PUBLISH
     /// iterates these and `glob_match`es each pattern against the published channel.
-    pub patterns: HashMap<Bytes, HashMap<u64, mpsc::Sender<ServerPush>>>,
+    pub patterns: HashMap<Bytes, HashMap<u64, Subscriber>>,
 }
 
 impl ShardPubSub {
-    /// Register `conn_id`'s push `sender` as a subscriber of `channel` on THIS shard. A
-    /// re-subscribe (same conn id, same channel) overwrites the stale sender with the
-    /// current one (idempotent on the table; the caller decides whether the running count
-    /// bumps, matching Redis's "already subscribed does not bump" rule).
-    pub fn subscribe(&mut self, channel: Bytes, conn_id: u64, sender: mpsc::Sender<ServerPush>) {
+    /// Register `conn_id`'s `subscriber` (push sender + shed signal) as a subscriber of
+    /// `channel` on THIS shard. A re-subscribe (same conn id, same channel) overwrites the
+    /// stale entry with the current one (idempotent on the table; the caller decides whether
+    /// the running count bumps, matching Redis's "already subscribed does not bump" rule).
+    pub fn subscribe(&mut self, channel: Bytes, conn_id: u64, subscriber: Subscriber) {
         self.channels
             .entry(channel)
             .or_default()
-            .insert(conn_id, sender);
+            .insert(conn_id, subscriber);
     }
 
     /// Deregister `conn_id` from `channel` on THIS shard, pruning the channel entry when it
@@ -151,21 +235,16 @@ impl ShardPubSub {
         }
     }
 
-    /// Register `conn_id`'s push `sender` as a subscriber of `pattern` on THIS shard (the
-    /// PSUBSCRIBE analog of [`Self::subscribe`], PR 91b). A re-subscribe (same conn id, same
-    /// pattern) overwrites the stale sender with the current one (idempotent on the table; the
-    /// caller decides whether the running count bumps, matching Redis's "already subscribed does
-    /// not bump" rule).
-    pub fn subscribe_pattern(
-        &mut self,
-        pattern: Bytes,
-        conn_id: u64,
-        sender: mpsc::Sender<ServerPush>,
-    ) {
+    /// Register `conn_id`'s `subscriber` (push sender + shed signal) as a subscriber of
+    /// `pattern` on THIS shard (the PSUBSCRIBE analog of [`Self::subscribe`], PR 91b). A
+    /// re-subscribe (same conn id, same pattern) overwrites the stale entry with the current
+    /// one (idempotent on the table; the caller decides whether the running count bumps,
+    /// matching Redis's "already subscribed does not bump" rule).
+    pub fn subscribe_pattern(&mut self, pattern: Bytes, conn_id: u64, subscriber: Subscriber) {
         self.patterns
             .entry(pattern)
             .or_default()
-            .insert(conn_id, sender);
+            .insert(conn_id, subscriber);
     }
 
     /// Deregister `conn_id` from `pattern` on THIS shard (the PSUBSCRIBE analog of
@@ -215,12 +294,19 @@ impl ShardPubSub {
                 payload: payload.clone(),
             };
             let mut shed: Vec<u64> = Vec::new();
-            for (&conn_id, sender) in subs.iter() {
-                match sender.try_send(push.clone()) {
+            for (&conn_id, sub) in subs.iter() {
+                match sub.sender.try_send(push.clone()) {
                     Ok(()) => delivered += 1,
                     Err(
                         mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_),
-                    ) => shed.push(conn_id),
+                    ) => {
+                        // Trip the per-connection shed signal so the consumer's serve loop
+                        // observes it and CLOSES the connection (FIX D), then drop the table
+                        // entry. Tripping for a Closed sender is harmless (the serve loop is
+                        // already tearing down).
+                        sub.shed.trip();
+                        shed.push(conn_id);
+                    }
                 }
             }
             for conn_id in shed {
@@ -276,9 +362,11 @@ impl ShardPubSub {
     /// number actually delivered (SERVER_PUSH.md fan-out). Delivery is NON-BLOCKING
     /// [`mpsc::Sender::try_send`] (a push must never block the publishing shard); a
     /// subscriber whose channel is FULL (a slow consumer past [`PUSH_CHANNEL_BOUND`]) is
-    /// SHED here -- removed from the table so its `push_rx.recv()` returns `None` and its
-    /// serve loop disconnects it, keeping shard memory bounded. A shed subscriber is NOT
-    /// counted as a receiver (it did not receive this message).
+    /// SHED here -- removed from the table AND its [`Subscriber::shed`] signal is flipped so
+    /// its serve loop's idle wait disconnects it (FIX D; the serve loop holds its own push
+    /// sender clone, so dropping the table entry alone would NOT close `push_rx`), keeping
+    /// shard memory bounded. A shed subscriber is NOT counted as a receiver (it did not
+    /// receive this message).
     pub fn deliver(&mut self, channel: &[u8], push: &ServerPush) -> i64 {
         let Some(subs) = self.channels.get_mut(channel) else {
             return 0;
@@ -286,14 +374,17 @@ impl ShardPubSub {
         let mut delivered: i64 = 0;
         // Collect the conn ids to shed; we cannot remove while iterating the same map.
         let mut shed: Vec<u64> = Vec::new();
-        for (&conn_id, sender) in subs.iter() {
-            match sender.try_send(push.clone()) {
+        for (&conn_id, sub) in subs.iter() {
+            match sub.sender.try_send(push.clone()) {
                 Ok(()) => delivered += 1,
-                // Full: a slow consumer past the bound -> SHED (drop its sender so its serve
-                // loop sees push_rx closed and disconnects). Closed: the receiver is already
-                // gone (the connection dropped push_rx but its disconnect cleanup has not pruned
-                // the table yet) -> drop it here too. Both outcomes shed the subscriber.
+                // Full: a slow consumer past the bound -> SHED. Flip its shed signal (FIX D) so
+                // its serve loop's idle-wait CLOSES the connection, then drop the table entry.
+                // Closed: the receiver is already gone (the connection dropped push_rx but its
+                // disconnect cleanup has not pruned the table yet) -> drop it here too (setting
+                // the flag is harmless, the serve loop is already tearing down). Both outcomes
+                // shed the subscriber.
                 Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+                    sub.shed.trip();
                     shed.push(conn_id);
                 }
             }
@@ -316,6 +407,15 @@ mod tests {
         ServerPush::Message {
             channel: Bytes::copy_from_slice(ch),
             payload: Bytes::copy_from_slice(p),
+        }
+    }
+
+    /// Wrap a bare push sender into a [`Subscriber`] with a fresh shed signal (the tests below
+    /// that do not inspect the signal use this; the shed tests build the signal explicitly).
+    fn sub(sender: mpsc::Sender<ServerPush>) -> Subscriber {
+        Subscriber {
+            sender,
+            shed: Arc::new(ShedSignal::default()),
         }
     }
 
@@ -348,7 +448,15 @@ mod tests {
         let mut t = ShardPubSub::default();
         // A subscriber with a tiny channel: the second push fills it, the third sheds it.
         let (tx, mut rx) = mpsc::channel::<ServerPush>(1);
-        t.subscribe(Bytes::from_static(b"ch"), 7, tx);
+        let shed = Arc::new(ShedSignal::default());
+        t.subscribe(
+            Bytes::from_static(b"ch"),
+            7,
+            Subscriber {
+                sender: tx,
+                shed: Arc::clone(&shed),
+            },
+        );
         // First deliver fits (count 1).
         assert_eq!(t.deliver(b"ch", &msg(b"ch", b"a")), 1);
         // Channel now holds 1 (the bound); the next deliver finds it FULL and sheds conn 7,
@@ -356,6 +464,8 @@ mod tests {
         assert_eq!(t.deliver(b"ch", &msg(b"ch", b"b")), 0);
         // Shed: the channel entry is pruned (no subscribers left).
         assert!(!t.channels.contains_key(b"ch".as_slice()));
+        // FIX D: the per-connection shed signal is tripped, so the consumer's serve loop closes.
+        assert!(shed.is_tripped(), "shed signal is tripped on Full");
         // The one queued message is still readable (shedding only drops the SENDER).
         assert_eq!(rx.try_recv().unwrap(), msg(b"ch", b"a"));
     }
@@ -364,7 +474,7 @@ mod tests {
     fn unsubscribe_prunes_empty_channels() {
         let mut t = ShardPubSub::default();
         let (tx, _rx) = mpsc::channel::<ServerPush>(4);
-        t.subscribe(Bytes::from_static(b"ch"), 1, tx);
+        t.subscribe(Bytes::from_static(b"ch"), 1, sub(tx));
         assert!(t.channels.contains_key(b"ch".as_slice()));
         t.unsubscribe(b"ch", 1);
         assert!(!t.channels.contains_key(b"ch".as_slice()));
@@ -387,7 +497,7 @@ mod tests {
     fn deliver_patterns_matches_and_renders_pmessage() {
         let mut t = ShardPubSub::default();
         let (tx, mut rx) = mpsc::channel::<ServerPush>(4);
-        t.subscribe_pattern(Bytes::from_static(b"news.*"), 3, tx);
+        t.subscribe_pattern(Bytes::from_static(b"news.*"), 3, sub(tx));
         let payload = Bytes::from_static(b"hello");
         // A matching channel delivers exactly one pmessage; a non-matching one delivers zero.
         assert_eq!(t.deliver_patterns(b"news.tech", &payload, star_suffix), 1);
@@ -409,8 +519,8 @@ mod tests {
         // PER pattern (Redis: no dedup across patterns).
         let mut t = ShardPubSub::default();
         let (tx, mut rx) = mpsc::channel::<ServerPush>(8);
-        t.subscribe_pattern(Bytes::from_static(b"news.*"), 3, tx.clone());
-        t.subscribe_pattern(Bytes::from_static(b"n*"), 3, tx);
+        t.subscribe_pattern(Bytes::from_static(b"news.*"), 3, sub(tx.clone()));
+        t.subscribe_pattern(Bytes::from_static(b"n*"), 3, sub(tx));
         let payload = Bytes::from_static(b"x");
         assert_eq!(t.deliver_patterns(b"news.tech", &payload, star_suffix), 2);
         assert!(rx.try_recv().is_ok());
@@ -421,20 +531,30 @@ mod tests {
     fn deliver_patterns_sheds_full_consumer_and_prunes() {
         let mut t = ShardPubSub::default();
         let (tx, _rx) = mpsc::channel::<ServerPush>(1);
-        t.subscribe_pattern(Bytes::from_static(b"p*"), 9, tx);
+        let shed = Arc::new(ShedSignal::default());
+        t.subscribe_pattern(
+            Bytes::from_static(b"p*"),
+            9,
+            Subscriber {
+                sender: tx,
+                shed: Arc::clone(&shed),
+            },
+        );
         let payload = Bytes::from_static(b"a");
         // First delivery fits the bound.
         assert_eq!(t.deliver_patterns(b"px", &payload, star_suffix), 1);
         // Channel is full now -> the next delivery sheds conn 9 and prunes the empty pattern.
         assert_eq!(t.deliver_patterns(b"px", &payload, star_suffix), 0);
         assert!(!t.patterns.contains_key(b"p*".as_slice()));
+        // FIX D: the per-connection shed signal is tripped on the pattern shed path too.
+        assert!(shed.is_tripped(), "pattern shed signal is tripped on Full");
     }
 
     #[test]
     fn unsubscribe_pattern_prunes_empty_patterns() {
         let mut t = ShardPubSub::default();
         let (tx, _rx) = mpsc::channel::<ServerPush>(4);
-        t.subscribe_pattern(Bytes::from_static(b"p*"), 1, tx);
+        t.subscribe_pattern(Bytes::from_static(b"p*"), 1, sub(tx));
         assert!(t.patterns.contains_key(b"p*".as_slice()));
         t.unsubscribe_pattern(b"p*", 1);
         assert!(!t.patterns.contains_key(b"p*".as_slice()));
@@ -444,10 +564,10 @@ mod tests {
     fn local_introspection_channels_numsub_patterns() {
         let mut t = ShardPubSub::default();
         let (tx, _rx) = mpsc::channel::<ServerPush>(4);
-        t.subscribe(Bytes::from_static(b"news.tech"), 1, tx.clone());
-        t.subscribe(Bytes::from_static(b"news.tech"), 2, tx.clone());
-        t.subscribe(Bytes::from_static(b"weather"), 1, tx.clone());
-        t.subscribe_pattern(Bytes::from_static(b"news.*"), 1, tx);
+        t.subscribe(Bytes::from_static(b"news.tech"), 1, sub(tx.clone()));
+        t.subscribe(Bytes::from_static(b"news.tech"), 2, sub(tx.clone()));
+        t.subscribe(Bytes::from_static(b"weather"), 1, sub(tx.clone()));
+        t.subscribe_pattern(Bytes::from_static(b"news.*"), 1, sub(tx));
 
         // CHANNELS unfiltered: both channels (order-independent).
         let mut chans = t.local_channels(None, star_suffix);
