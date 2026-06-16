@@ -405,6 +405,12 @@ read_used_memory() {
 # ---------------------------------------------------------------------------
 populate_keys() {
   local n="$1"
+  # redis-cli --pipe ends with an ECHO sentinel handshake to detect completion. Dragonfly's
+  # strict RESP parser ERRORS on that sentinel ("ERR unknown command `*2`/`$4`/...") and
+  # makes redis-cli --pipe exit NON-ZERO even though all N SETs landed (redis/valkey tolerate
+  # the sentinel). So the pipe's exit code is NOT authoritative here - `|| true` keeps the
+  # `set -e` shell from aborting on that benign sentinel error, and the DBSIZE check below is
+  # the real verification that the populate landed.
   awk -v n="${n}" -v vsize="${VALUE_SIZE}" 'BEGIN {
     # Build the fixed-size value once.
     val = ""
@@ -414,7 +420,17 @@ populate_keys() {
       # RESP array: *3 SET <key> <val>. $<len> precedes each bulk string.
       printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(key), key, vsize, val
     }
-  }' | redis-cli -h "${HOST}" -p "${PORT}" --pipe
+  }' | redis-cli -h "${HOST}" -p "${PORT}" --pipe || true
+  # VERIFY the populate landed (the bytes-per-key delta is only meaningful if all N distinct
+  # keys are resident): the freshly-booted server started empty, so DBSIZE must now be >= n.
+  # This fails loudly on a genuinely-broken populate while tolerating the sentinel quirk.
+  local dbsize
+  dbsize="$(redis-cli -h "${HOST}" -p "${PORT}" DBSIZE 2>/dev/null | tr -dc '0-9')"
+  [[ -n "${dbsize}" ]] || dbsize=0
+  if [[ "${dbsize}" -lt "${n}" ]]; then
+    echo "error: populate landed only ${dbsize}/${n} keys on ${HOST}:${PORT} (DBSIZE verify)" >&2
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
