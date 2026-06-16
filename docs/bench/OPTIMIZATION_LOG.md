@@ -89,6 +89,40 @@ stay boxed structs (not flat blobs). Scoped as Round 3 (the big one). Micro-twea
 (u64 TTL sentinel, inline short keys) are deliberately SKIPPED because the
 single-alloc rewrite subsumes them (no tunnel vision on soon-replaced changes).
 
+### Round 3 (next, the big one): single-allocation blob entry - VALIDATED design
+
+Research (redis 8.2 kvobj, valkey 8.0/8.1, Dragonfly Dashtable, hashbrown,
+SwissTable/Dash/MemC3/F14 papers) confirms the lever and a SAFE Rust path:
+
+- **Table:** `hashbrown::HashTable<Entry>` (the low-level explicit-hash API, what
+  IndexMap uses), with caller-supplied `hash`/`eq` closures that read the key
+  slice from INSIDE the entry. The table stores ONLY the entry handle and does
+  NOT duplicate the key. Empirically compiles under `#![forbid(unsafe_code)]`
+  (hashbrown's unsafe is encapsulated; we call only its safe API). hashbrown
+  HashTable since 0.14.2, MSRV 1.85 - matches ours; we already depend on it.
+- **Entry:** a THIN-pointer single allocation (8 B slot, not Box's 16 B fat
+  pointer): `triomphe::ThinArc<Header,[u8]>` (header can cache the u64 hash to
+  avoid re-hash on resize; refcounted, copy-on-write writes) OR
+  `thin-vec::ThinVec<u8>` (unique ownership, in-place growth). Layout
+  `[packed header | (ttl u64) | key_len | key | value]`, key BEFORE value (key is
+  immutable), value inlined when header+key+value fits an allocator bin (our
+  embstr analogue), else an out-of-line value pointer. Mirrors redis kvobj exactly.
+- **Collections** (List/Hash/Set/ZSet, structured) stay boxed structs referenced
+  by the entry's value pointer; the entry still collapses the KEY into one
+  key+header allocation (the main win).
+- **Expected:** 3 allocations/key -> 1 (short strings) or 2 (long/collections),
+  an 8 B slot, and NO key duplication -> the redis 8.2 / valkey 8.1 regime
+  (~20-30 B/key overhead), closing the small-value gap (today 2.88x at 32B).
+- **Risks:** safe bounds-checked blob parsing on every access (keep in one
+  property-tested module); ThinArc writes are copy-on-write (rebuild blob, redis
+  also reallocs); cache the hash in the header to avoid resize re-hash; embedding
+  TTL drops the separate expires index (decide active-expiry: scan or a secondary
+  light index); hashbrown's post-doubling trough (~39 B/entry) is the one spot a
+  future Dash table would beat - note, do not block.
+- This is a large ironcache-store core rewrite (the entry rep + the table +
+  the primitives behind the frozen Store waist), staged and gated by the A5
+  perf-gate + the full test suite. Sources logged in the research transcript.
+
 ### Round 1 detail
 Boxed `ValueRepr::{List,Hash,Set,ZSet}` (kvobj.rs) + the rmw dispatch / accessors
 (lib.rs); 2 files, ~13 sites, all tests green, sizeof KvObj 112->88, ValueRepr
