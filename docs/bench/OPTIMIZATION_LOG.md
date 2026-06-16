@@ -93,6 +93,24 @@ single-alloc rewrite subsumes them (no tunnel vision on soon-replaced changes).
 
 | 5 | L-FAM (v2): 8-byte TAGGED-POINTER `Entry` (unsafe `NonNull<u8>`, low bit = Str/Coll tag) | slot 16->8, halve `table_bytes_per_key`, push memory CLEARLY below redis | h2h (128B, 300k, macOS) bytes/key **221.5 -> 199.69 vs redis 218.61 = 0.91x, a CLEAR WIN** (was parity); memmodel `table_bytes_per_key` 26.2 -> **13.11**, totals int 44.72 / embstr(16) 61.07 / raw(256) 333.37; `size_of::<Entry>()` 16 -> 8 | qps macOS contention-bound (not authoritative); criterion micro-bench neutral | **KEPT** - first CLEAR memory win vs redis 8.8.0; 849 tests green + miri strict-provenance clean (lib + all integration); 3-lens adversarial review (UB/aliasing/parity) found + fixed a CRITICAL u32-prefix dealloc-UB (regression vs round 3) and a HIGH alignment guard; unsafe confined to one documented `Entry` impl |
 
+| 6 | SPEED: O(1) S3-FIFO eviction index (generational slab + `hashbrown` index + handle queues) - kill the per-access O(N) scan | `bump_freq`/`tracks`/`remove` O(N)->O(1); `bump_freq` was the #1 IronCache COMPUTE frame in the load profile (3937 samples of linear queue scan on every access) | no per-key memory regression (key stored once in the slab; index holds only a u32; perf-gate bytes/key 0.00% change) | **perf-gate (same-runner HEAD vs base, Linux CI): qps_median 76861 -> 98914 = +28.69% PASS**; local macOS ~150k -> ~158k (modest there, fast cores so the scan was a smaller share); `bump_freq` profile 3937 -> 0 samples | **KEPT** - the #1 compute cost removed; 852 tests green; 2-lens adversarial review fuzz-proved soundness (4400 runs: live-counter/termination/index/ABA invariants) AND caught + fixed a MEDIUM ghost-cap fidelity divergence (free before ghost_record), regression-tested |
+
+### Round 6 detail (SPEED: the eviction hot path)
+The load profile (macOS `sample` under ~150k qps) showed the hottest IronCache COMPUTE
+frame was `ironcache_eviction::s3fifo::S3Fifo::bump_freq` (3937 samples) - a LINEAR SCAN
+of the three `VecDeque<Entry>` eviction queues to find a key, run on EVERY cache access
+(a 90%-read workload). With no eviction pressure the queues hold the whole keyspace, so
+the scan cost grows with N. The fix is the O(1) "intrusive-link" layout the code already
+promised: a generational SLAB (`Vec<Slot>` + freelist, key stored once) + a fixed-seed
+`hashbrown::HashTable<u32>` index (low-level explicit-hash, point-lookup only, ADR-0003
+deterministic) + `VecDeque<Handle>` FIFO queues + lazy tombstone-skip (`pop_live`) + LIVE
+counters. `select_victim`'s algorithm is byte-for-byte preserved (10/90 draw_small,
+promotion, second-chance, reoffer-last, ghost, rounds bound). On the SLOWER Linux CI box
+the scan was a much larger per-op share than on fast macOS cores, so the win there was
++28.69% qps (vs ~5% locally). This is the #1 LOCAL-TESTABLE speed lever; the DOMINANT
+remaining speed cost is the I/O datapath (the profile is ~80% syscalls + tokio reactor +
+thread parking), which is the io_uring lever (#28, Linux-only) - see docs/bench/FINDINGS.md.
+
 ### Round 3 detail
 Per-db table is now `hashbrown::HashTable<Entry>` (low-level explicit-hash API,
 no key duplication) with `Entry = Str(Box<[u8]>)` single blob
