@@ -27,6 +27,7 @@ on:
         options:
           - redis
           - valkey
+          - dragonfly
       value_size:
         description: "SET value bytes (also the bytes-per-key value size)."
         type: string
@@ -91,11 +92,26 @@ jobs:
       - name: Install competitor (${{ inputs.competitor }})
         run: |
           set -euo pipefail
-          if [ "${{ inputs.competitor }}" = "valkey" ]; then
-            sudo apt-get install -y valkey-server || sudo apt-get install -y redis-server
-          else
-            sudo apt-get install -y redis-server
-          fi
+          case "${{ inputs.competitor }}" in
+            valkey)
+              sudo apt-get install -y valkey-server || sudo apt-get install -y redis-server
+              ;;
+            dragonfly)
+              # DragonflyDB ships a prebuilt x86_64 binary on its GitHub releases (no apt
+              # package). Grab the latest stable, install it, and point the harness at it
+              # via COMPETITOR_BIN (persisted to later steps through GITHUB_ENV). It speaks
+              # RESP, so redis-cli (PING/INFO/--pipe) and the loadgen work unchanged.
+              curl -fsSL -o /tmp/dragonfly.tar.gz \
+                https://github.com/dragonflydb/dragonfly/releases/latest/download/dragonfly-x86_64.tar.gz
+              tar -xzf /tmp/dragonfly.tar.gz -C /tmp
+              sudo install -m 0755 /tmp/dragonfly-x86_64 /usr/local/bin/dragonfly
+              /usr/local/bin/dragonfly --version
+              echo "COMPETITOR_BIN=/usr/local/bin/dragonfly" >> "$GITHUB_ENV"
+              ;;
+            *)
+              sudo apt-get install -y redis-server
+              ;;
+          esac
 
       - name: Run head-to-head (auto-pinned via taskset)
         env:
