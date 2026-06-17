@@ -215,9 +215,15 @@ where
                     replid,
                 });
             }
-            // Any other frame (a stray heartbeat, a replica-side frame) is not part of the
-            // full-sync stream; ignore it and keep loading.
-            Frame::ReplConf { .. } | Frame::ReplPing { .. } => {}
+            // Any other frame (a stray heartbeat, a replica-side frame, or a steady-state
+            // tail frame that raced ahead of SYNCEND) is not part of the full-sync stream;
+            // ignore it and keep loading. The HA-7c tail begins only AFTER SYNCEND, so a
+            // STREAMPUT/STREAMDEL here is a stray and is dropped (the replica applies the
+            // tail from `end_offset` once the snapshot is loaded).
+            Frame::ReplConf { .. }
+            | Frame::ReplPing { .. }
+            | Frame::StreamPut { .. }
+            | Frame::StreamDel { .. } => {}
         }
     }
 }

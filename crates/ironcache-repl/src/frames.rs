@@ -40,6 +40,10 @@ pub const FULLSYNC: &[u8] = b"FULLSYNC";
 pub const SYNCKV: &[u8] = b"SYNCKV";
 /// The SYNCEND verb (primary -> replica: terminate the full-sync stream).
 pub const SYNCEND: &[u8] = b"SYNCEND";
+/// The STREAMPUT verb (primary -> replica: one steady-state put in the tail stream).
+pub const STREAMPUT: &[u8] = b"STREAMPUT";
+/// The STREAMDEL verb (primary -> replica: one steady-state delete in the tail stream).
+pub const STREAMDEL: &[u8] = b"STREAMDEL";
 
 /// A replication frame is malformed: a RESP framing error, or a complete command
 /// that is not a decodable replication frame (wrong verb / arity, a non-numeric
@@ -111,6 +115,40 @@ pub enum Frame {
         /// The offset at the snapshot cut (the resume point for the 7c tail).
         end_offset: ReplOffset,
     },
+    /// `["STREAMPUT", <offset>, <db>, <key>, <kvobj-bytes>]` (primary -> replica).
+    ///
+    /// One STEADY-STATE put in the HA-7c tail (a create / overwrite / in-place collection
+    /// edit / TTL change). `offset` is the LOGICAL write-sequence position this put occupies
+    /// (the post-snapshot tail is strictly increasing, gap-free per shard), `db`+`key` route
+    /// it, and `kvobj_bytes` is the [`crate::kvcodec::encode_kvobj`] post-image. The replica
+    /// verifies `offset == applied_offset.next()`, applies the decoded `KvObj` via
+    /// `insert_object` (idempotent: an overwrite replaces in place), and advances its
+    /// `applied_offset`. An out-of-order offset triggers a full re-sync (HA-7b).
+    StreamPut {
+        /// The logical offset of this write in the tail (strictly increasing per shard).
+        offset: ReplOffset,
+        /// The database the write belongs to.
+        db: u32,
+        /// The key bytes (also inside `kvobj_bytes`; here for routing/debugging).
+        key: Vec<u8>,
+        /// The [`crate::kvcodec`] wire encoding of the post-image `KvObj`.
+        kvobj_bytes: Vec<u8>,
+    },
+    /// `["STREAMDEL", <offset>, <db>, <key>]` (primary -> replica).
+    ///
+    /// One STEADY-STATE delete in the HA-7c tail (an explicit delete, an expiry, a flush, an
+    /// eviction, a RENAME source removal, or an in-place edit that drained a collection to
+    /// empty). `offset` is the logical write-sequence position; the replica verifies it is
+    /// the next expected offset, removes `(db, key)` idempotently (a delete of an absent key
+    /// is a no-op), and advances `applied_offset`.
+    StreamDel {
+        /// The logical offset of this delete in the tail (strictly increasing per shard).
+        offset: ReplOffset,
+        /// The database the key left.
+        db: u32,
+        /// The key removed.
+        key: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -145,6 +183,24 @@ impl Frame {
             Frame::SyncEnd { end_offset } => {
                 encode_command(&[SYNCEND, end_offset.0.to_string().as_bytes()])
             }
+            Frame::StreamPut {
+                offset,
+                db,
+                key,
+                kvobj_bytes,
+            } => encode_command(&[
+                STREAMPUT,
+                offset.0.to_string().as_bytes(),
+                db.to_string().as_bytes(),
+                key,
+                kvobj_bytes,
+            ]),
+            Frame::StreamDel { offset, db, key } => encode_command(&[
+                STREAMDEL,
+                offset.0.to_string().as_bytes(),
+                db.to_string().as_bytes(),
+                key,
+            ]),
         }
     }
 
@@ -209,6 +265,29 @@ fn decode_args(args: &[Vec<u8>]) -> Result<Frame, FrameError> {
         }
         let end_offset = ReplOffset(parse_u64(&args[1])?);
         Ok(Frame::SyncEnd { end_offset })
+    } else if verb.eq_ignore_ascii_case(STREAMPUT) {
+        if args.len() != 5 {
+            return Err(FrameError);
+        }
+        let offset = ReplOffset(parse_u64(&args[1])?);
+        let db = u32::try_from(parse_u64(&args[2])?).map_err(|_| FrameError)?;
+        // The key and kvobj bytes are opaque binary; the RESP bulk length delimits them.
+        let key = args[3].clone();
+        let kvobj_bytes = args[4].clone();
+        Ok(Frame::StreamPut {
+            offset,
+            db,
+            key,
+            kvobj_bytes,
+        })
+    } else if verb.eq_ignore_ascii_case(STREAMDEL) {
+        if args.len() != 4 {
+            return Err(FrameError);
+        }
+        let offset = ReplOffset(parse_u64(&args[1])?);
+        let db = u32::try_from(parse_u64(&args[2])?).map_err(|_| FrameError)?;
+        let key = args[3].clone();
+        Ok(Frame::StreamDel { offset, db, key })
     } else {
         Err(FrameError)
     }
@@ -382,6 +461,45 @@ mod tests {
         });
         assert_round_trips(&Frame::SyncEnd {
             end_offset: ReplOffset(u64::MAX),
+        });
+
+        // STREAMPUT (HA-7c): a steady-state put. The key and kvobj bytes are OPAQUE BINARY
+        // (embedded CRLF + NUL) the length-delimited bulk codec carries verbatim; the offset
+        // and db are at their edges, plus the empty-key / empty-payload edge.
+        assert_round_trips(&Frame::StreamPut {
+            offset: ReplOffset(1),
+            db: 0,
+            key: b"plain-key".to_vec(),
+            kvobj_bytes: b"some-encoded-kvobj-bytes".to_vec(),
+        });
+        assert_round_trips(&Frame::StreamPut {
+            offset: ReplOffset(u64::MAX),
+            db: u32::MAX,
+            key: b"binary\r\nkey\x00".to_vec(),
+            kvobj_bytes: vec![0u8, 1, 2, b'\r', b'\n', 255, 13, 10],
+        });
+        assert_round_trips(&Frame::StreamPut {
+            offset: ReplOffset(0),
+            db: 7,
+            key: Vec::new(),
+            kvobj_bytes: Vec::new(),
+        });
+
+        // STREAMDEL (HA-7c): a steady-state delete, at the offset/db edges and a binary key.
+        assert_round_trips(&Frame::StreamDel {
+            offset: ReplOffset(0),
+            db: 0,
+            key: b"k".to_vec(),
+        });
+        assert_round_trips(&Frame::StreamDel {
+            offset: ReplOffset(u64::MAX),
+            db: u32::MAX,
+            key: b"binary\r\nkey\x00".to_vec(),
+        });
+        assert_round_trips(&Frame::StreamDel {
+            offset: ReplOffset(99),
+            db: 3,
+            key: Vec::new(),
         });
     }
 

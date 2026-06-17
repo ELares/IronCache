@@ -33,9 +33,16 @@
 //!    ([`run_replica_link`] / [`run_primary_repl_listener`]) that drive it over the
 //!    `Runtime` seam and reconnect-resume on a drop.
 //!
-//! NO snapshot, NO data, NO apply: those are HA-7b (full-sync) and HA-7c (the
-//! steady-state KV stream + apply, wired to the HA-5a write-observation seam). This
-//! slice is purely additive: a new crate exercising the cursor + heartbeat + ack.
+//! ## The data pieces (7b/7c)
+//!
+//! HA-7b added the FULL-SYNC ([`fullsync`] + [`kvcodec`]): the primary's whole snapshot
+//! shipped to a fresh replica. HA-7c adds the STEADY-STATE TAIL: the [`observer`]
+//! ([`ReplObserver`] + the bounded [`ReplRing`]) plugged into the HA-5a write-observation
+//! seam advances the primary's offset PER WRITE and enqueues each as a [`StreamOp`]; the
+//! [`stream`] half ships them ([`drain_and_ship`]) and the replica applies them in offset
+//! order, idempotently, full-resyncing on a gap ([`ReplicaApplier`]). The convergence gate
+//! (in `tests/convergence.rs`) drives a seeded workload + injected link faults and asserts
+//! the replica keyspace equals the primary's over many seeds.
 //!
 //! ## The data-plane port offset
 //!
@@ -50,7 +57,9 @@ pub mod cursor;
 pub use cursor::{ReplId, ReplOffset};
 
 pub mod frames;
-pub use frames::{FULLSYNC, Frame, FrameError, REPLCONF, REPLPING, SYNCEND, SYNCKV};
+pub use frames::{
+    FULLSYNC, Frame, FrameError, REPLCONF, REPLPING, STREAMDEL, STREAMPUT, SYNCEND, SYNCKV,
+};
 
 pub mod kvcodec;
 pub use kvcodec::{decode_kvobj, encode_kvobj};
@@ -60,6 +69,12 @@ pub use link::{DEFAULT_HEARTBEAT, LinkEffects, LinkEvent, PrimaryLink, ReplState
 
 pub mod fullsync;
 pub use fullsync::{FullSyncError, drive_full_sync, receive_full_sync};
+
+pub mod observer;
+pub use observer::{ReplObserver, ReplRing, StreamOp};
+
+pub mod stream;
+pub use stream::{ApplyOutcome, ReplicaApplier, ShipOutcome, drain_and_ship};
 
 pub mod transport;
 pub use transport::{ReplicaObserver, run_primary_repl_listener, run_replica_link};
