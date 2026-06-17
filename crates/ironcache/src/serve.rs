@@ -41,9 +41,10 @@ pub const GLOBAL_ALLOCATOR_NAME: &str = "jemalloc";
 pub const GLOBAL_ALLOCATOR_NAME: &str = "libc";
 
 /// Format a 40-lowercase-hex cluster node id from the determinism seam's RNG
-/// (CLUSTER_CONTRACT.md #70). It draws THREE `u64`s (192 bits) and renders the first
-/// 160 bits (the high 32 bits of the third word are dropped) as 40 lowercase hex chars,
-/// matching the Redis 40-hex node-id width.
+/// (CLUSTER_CONTRACT.md #70). It draws THREE `u64`s (192 bits) and renders 160 of them as
+/// 40 lowercase hex chars: the full first two words plus the LOW 32 bits of the third
+/// (`c as u32` keeps the low half; the high 32 bits are dropped), matching the Redis 40-hex
+/// node-id width.
 ///
 /// This helper is PURE: it takes `&mut impl Rng` and does NO time/OS-entropy access of
 /// its own, so the no-rand invariant lint stays green (the only entropy comes through the
@@ -2146,6 +2147,34 @@ mod tests {
             before.next_u64(),
             after.next_u64(),
             "RANDOMKEY MUST advance the RNG stream (the draw the gate exists to gate)"
+        );
+    }
+
+    /// The cluster node id is DRAWN ONLY FROM THE ENV SEAM (ADR-0003), so the same seed
+    /// yields the same 40-hex id every time: `node_id_hex` is pure over `&mut impl Rng`.
+    /// This pins the determinism contract (CLUSTER_CONTRACT.md #70) without touching the OS.
+    #[test]
+    fn node_id_hex_is_deterministic_for_a_seed() {
+        const SEED: u64 = 0xC0FF_EE12_3456_789A;
+        let mut a = ironcache_env::TestEnv::new(SEED);
+        let mut b = ironcache_env::TestEnv::new(SEED);
+        let id_a = node_id_hex(a.rng());
+        let id_b = node_id_hex(b.rng());
+        // Same seed -> identical id (the determinism invariant).
+        assert_eq!(id_a, id_b, "same seed must yield the same node id");
+        // Shape: exactly 40 lowercase-hex chars, matching the Redis node-id width.
+        assert_eq!(id_a.len(), 40, "node id must be 40 hex chars: {id_a:?}");
+        assert!(
+            id_a.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "node id must be lowercase hex: {id_a:?}"
+        );
+        // A DIFFERENT seed yields a different id (the draw actually uses the stream).
+        let mut c = ironcache_env::TestEnv::new(SEED ^ 0x1);
+        assert_ne!(
+            id_a,
+            node_id_hex(c.rng()),
+            "a different seed should yield a different id"
         );
     }
 }
