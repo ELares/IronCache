@@ -40,6 +40,13 @@
 pub mod encoding;
 pub mod kvobj;
 
+/// Re-export the per-shard table value type at the crate root so the store-public
+/// [`WriteObserver`] trait (HA-5a) can name its `on_put` post-image argument with a
+/// root-accessible path and external implementors (serve/repl) can reference the same
+/// type. Purely additive: `kvobj::Entry` is unchanged and still reachable by its module
+/// path.
+pub use kvobj::Entry;
+
 use bytes::Bytes;
 use hashbrown::hash_map::Entry as WatchMapEntry;
 use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
@@ -49,7 +56,7 @@ use ironcache_storage::{
     MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
     RmwStep, ScanCursor, Store, UnixMillis, ValueRef, VictimFreq, WatchEntry,
 };
-use kvobj::{Entry, KvObj};
+use kvobj::KvObj;
 use std::hash::BuildHasher;
 
 /// The FIXED-SEED stable key hash that the SCAN cursor iterates in ascending order
@@ -279,6 +286,70 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// `pop` (never `remove(0)`). Empty at rest and between refills; only the cache-mode
     /// (`TableScanLowestFreq`) path ever touches it (the roster path is unchanged).
     evict_pool: Vec<PoolCandidate>,
+    /// The OPTIONAL data-plane WRITE OBSERVER (HA-5a): a background sink that observes
+    /// EVERY applied write to this shard (create/overwrite/in-place edit/TTL change ->
+    /// [`WriteObserver::on_put`]; delete/expiry/flush/eviction -> [`WriteObserver::on_remove`]).
+    /// It is the FOUNDATION reused by replication (HA-7) and migration (HA-6): the
+    /// observer turns the store's in-process write funnel into a replayable write stream.
+    ///
+    /// It is a DYNAMIC, shard-local, single-threaded field (the shard is owned by one core
+    /// and touched as `&mut self`, so the observer is called `&mut`, with NO lock and NO
+    /// atomic, ADR-0002/0005). It is `None` by default; serve/repl installs one later via
+    /// [`Self::set_write_observer`]. Adding it does NOT reopen the frozen `Store` waist:
+    /// it is store-internal, fired from the same write-funnel attach points the funnel doc
+    /// reserves for the OnWrite hook (STORAGE_API.md).
+    repl_observer: Option<Box<dyn WriteObserver>>,
+    /// The FAST-PATH gate for the write-observer fire (the exact sibling of
+    /// [`Self::watched_count`]). `false` by default (no observer installed: the static
+    /// datastore path and the raft control plane never observe), in which case EACH write
+    /// funnel site does a SINGLE bool test and proceeds with NO further work, NO box
+    /// dereference, and NO observer call: the same cost profile as the shipped
+    /// `watched_count == 0` WATCH gate. Set `true` only while an observer is installed
+    /// (kept in lockstep with `repl_observer.is_some()`), so the funnel can branch on a
+    /// plain bool with no `Option` probe on the non-observing hot path.
+    repl_active: bool,
+}
+
+/// The data-plane WRITE OBSERVER (HA-5a): a background sink the per-shard store calls on
+/// EVERY applied write, so a replication (HA-7) or migration (HA-6) task can mirror the
+/// shard's mutations as a replayable stream. It is the hot-path-safe observation seam: it
+/// is installed via [`ShardStore::set_write_observer`] and is gated OFF by default (the
+/// non-observing path pays at most one bool branch, see [`ShardStore::repl_active`]).
+///
+/// The store calls the observer AFTER the table mutation has been applied, so each call
+/// carries the POST-IMAGE (the committed new state), which is what a replication stream
+/// replays to reconstruct the write:
+///
+/// - [`Self::on_put`] fires for a create / overwrite / in-place collection edit / TTL-only
+///   change, with `new` borrowing the COMMITTED post-write [`Entry`] (its value bytes,
+///   data type, encoding and deadline are all readable through the entry's accessors).
+/// - [`Self::on_remove`] fires for a delete / expiry (lazy backstop + active reaper) /
+///   FLUSHDB / FLUSHALL / eviction / a RENAME's source removal / an in-place edit that
+///   drains a collection to empty, with the `(db, key)` that left the keyspace.
+///
+/// SINGLE-THREADED: the store is shard-local and owned by one core, so the observer is
+/// called `&mut self` with no synchronization (ADR-0002/0005). DETERMINISM (ADR-0003): the
+/// store passes the observer no clock and no RNG; the observer sees only the `(db, key)`
+/// and the post-image, and any timestamp it needs comes from the caller's `now`, never the
+/// store. An implementor MUST NOT block or panic on the hot path (it runs inline on the
+/// owning core); the intended shape is an enqueue onto a shard-local ring the background
+/// repl/migration task drains.
+///
+/// Requires [`std::fmt::Debug`] so the boxed observer fits the `#[derive(Debug)]` on
+/// [`ShardStore`] (the same reason the store's hook generics are `Debug`); a trivial
+/// `#[derive(Debug)]` on the implementor satisfies it.
+pub trait WriteObserver: std::fmt::Debug {
+    /// A key was created or overwritten (or edited in place, or had its TTL changed):
+    /// `new` is the POST-IMAGE, the committed new [`Entry`] as it now sits in the table.
+    /// Read the value bytes via [`Entry::str_value_bytes`], the type via
+    /// [`Entry::data_type`], the encoding via [`Entry::encoding`], and the deadline via
+    /// [`Entry::expire_at`] (the post-image carries everything needed to reconstruct the
+    /// write). Fired AFTER the table mutation, so `new` is the value a replica would store.
+    fn on_put(&mut self, db: u32, key: &[u8], new: &Entry);
+    /// A key was removed from `db` (an explicit delete, a lazy/active expiry, a FLUSHDB /
+    /// FLUSHALL, an eviction, a RENAME's source removal, or an in-place edit that emptied a
+    /// collection). Fired AFTER the entry has left the table.
+    fn on_remove(&mut self, db: u32, key: &[u8]);
 }
 
 /// The store-side [`VictimFreq`] the eviction policy reads through during
@@ -403,6 +474,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // over-budget refill scan and drained as eviction episodes consume it. It is
             // BOUNDED by EVICT_POOL_CAP, never per-key state.
             evict_pool: Vec::new(),
+            // No write observer at boot (HA-5a): the static datastore path and the raft
+            // control plane never observe. The fast-path gate `repl_active` is `false`, so
+            // every write funnel site does a single bool test and proceeds (the same cost
+            // profile as the `watched_count == 0` WATCH gate). serve/repl installs an
+            // observer later via `set_write_observer`.
+            repl_observer: None,
+            repl_active: false,
         }
     }
 
@@ -501,6 +579,54 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 self.version_clock += 1;
                 slot.version = self.version_clock;
             }
+        }
+    }
+
+    /// Fire the write observer's `on_put` POST-IMAGE for `(db, key)` (HA-5a write-funnel
+    /// fire). Called from the write funnel AFTER the table mutation, so the entry it borrows
+    /// is the COMMITTED new value: a replication stream replays the post-image.
+    ///
+    /// FAST PATH: gated behind `repl_active` (the exact sibling of the `watched_count` WATCH
+    /// gate). When no observer is installed (the default, the static datastore + raft control
+    /// plane) this is a single bool compare and an immediate return: no box dereference, no
+    /// table probe, no observer call. Only when an observer is installed does it re-find the
+    /// post-write entry in `db_idx`'s table and hand the observer a borrow of it.
+    ///
+    /// The entry is re-found (rather than threaded through every funnel site) so the fire is
+    /// a self-contained gated helper, mirroring `touch_watch`; the re-find is OFF the
+    /// non-observing hot path (gated by `repl_active` above) and the table lookup is the same
+    /// O(1) probe the funnel already pays. The split borrow (`repl_observer` mutable,
+    /// `dbs` immutable) is taken by destructuring the distinct fields of `self`, so there is
+    /// no double-borrow of `self`. A key that is somehow absent post-write (it never is on
+    /// the put paths) is a no-op.
+    fn observe_put(&mut self, db: u32, db_idx: usize, key: &[u8]) {
+        // FAST PATH: no observer installed -> one branch, no probe, no box deref.
+        if !self.repl_active {
+            return;
+        }
+        // Split the borrow across the two distinct fields (no `&mut self` method call that
+        // would borrow the whole store). The observer is `&mut`; the table is read-only.
+        let Some(observer) = self.repl_observer.as_mut() else {
+            return;
+        };
+        let h = self.hasher.hash_one(key);
+        if let Some(obj) = self.dbs[db_idx].find(h, |e| e.key() == key) {
+            observer.on_put(db, key, obj);
+        }
+    }
+
+    /// Fire the write observer's `on_remove` for `(db, key)` (HA-5a write-funnel fire).
+    /// Called from the remove funnel AFTER the entry has left the table. Gated behind the
+    /// `repl_active` fast path exactly like [`Self::observe_put`]: one bool branch and an
+    /// immediate return when no observer is installed (the default), so the non-observing
+    /// hot path pays the same ~one-branch cost as the `watched_count == 0` WATCH gate.
+    fn observe_remove(&mut self, db: u32, key: &[u8]) {
+        // FAST PATH: no observer installed -> one branch, no box deref.
+        if !self.repl_active {
+            return;
+        }
+        if let Some(observer) = self.repl_observer.as_mut() {
+            observer.on_remove(db, key);
         }
     }
 
@@ -659,6 +785,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             self.account_add(new_bytes);
             self.eviction.on_insert(db, key, new_bytes);
         }
+        // Write observer (HA-5a): a create or overwrite of `key` is an applied write. Fire
+        // the post-image AFTER the table mutation + accounting (so the entry the observer
+        // borrows is the committed new value), gated behind the `repl_active` fast path
+        // inside `observe_put` (one bool branch when no observer is installed). This covers
+        // every put-funnel caller: blind upsert, the rmw/rmw_mut Insert/Replace arms, a
+        // RENAME/COPY destination write, and the test/collection `insert_object` seam.
+        self.observe_put(db, db_idx, key);
         old_bytes.is_some()
     }
 
@@ -690,6 +823,12 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         if let Some(bytes) = removed {
             self.account_sub(bytes);
             self.eviction.on_remove(db, key, bytes);
+            // Write observer (HA-5a): a removal is an applied write. Fire AFTER the entry has
+            // left the table, gated behind `repl_active`. Because EVERY removal path funnels
+            // through here (explicit delete, the rmw Delete arm, the lazy expiry backstop and
+            // the active reaper, FLUSHDB/FLUSHALL, eviction, and a RENAME's source removal),
+            // this one fire covers them all.
+            self.observe_remove(db, key);
             true
         } else {
             false
@@ -725,6 +864,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         if existed {
             self.account_sub(bytes);
             self.eviction.on_remove(db, key, bytes);
+            // Write observer (HA-5a): the in-place Delete / emptied-collection path also
+            // removes the key, so it is an applied removal. Fire AFTER the entry has left the
+            // table, gated behind `repl_active`.
+            self.observe_remove(db, key);
             true
         } else {
             false
@@ -889,6 +1032,13 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         // does not move the deadline) keeps the key CLEAN, matching Redis.
                         self.touch_watch(db, key);
                         self.set_entry_expire(db_idx, key, new_deadline);
+                        // Write observer (HA-5a): a real TTL change (EXPIRE/PEXPIRE/PERSIST/
+                        // GETEX-with-TTL) is an applied write to the key. `set_entry_expire`
+                        // patches the deadline in place (it does not go through put_object),
+                        // so fire the post-image here with the new deadline; gated behind the
+                        // `repl_active` fast path. Scoped to the real-change branch (mirrors
+                        // the WATCH notify above), so a no-op TTL write fires nothing.
+                        self.observe_put(db, db_idx, key);
                     }
                 }
             }
@@ -898,10 +1048,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                     other => resolve_expire(other, old_deadline),
                 };
                 let obj = Entry::from_new_owned(key, v, new_deadline);
+                // put_object fires the write observer (on_put post-image).
                 self.put_object(db, db_idx, key, obj);
             }
             RmwAction::Delete => {
                 if live {
+                    // remove_object fires the write observer (on_remove).
                     self.remove_object(db, db_idx, key);
                 }
             }
@@ -1023,6 +1175,11 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         // branch so a no-op TTL write stays clean (matches Redis).
                         self.touch_watch(db, key);
                         self.set_entry_expire(db_idx, key, new_deadline);
+                        // Write observer (HA-5a): a real TTL change is an applied write;
+                        // `set_entry_expire` patches in place (not through put_object), so
+                        // fire the post-image here. Same real-change scoping as the WATCH
+                        // notify, gated behind `repl_active`.
+                        self.observe_put(db, db_idx, key);
                     }
                 }
             }
@@ -1032,6 +1189,7 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                     other => resolve_expire(other, old_deadline),
                 };
                 let obj = Entry::from_new_owned(key, v, new_deadline);
+                // put_object fires the write observer (on_put post-image).
                 self.put_object(db, db_idx, key, obj);
             }
             RmwAction::Delete => {
@@ -1096,6 +1254,16 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                                 obj.set_expire_at(new_deadline);
                             }
                         }
+                        // Write observer (HA-5a): a non-emptying in-place collection edit
+                        // (LPUSH/SADD/HSET/ZADD...) is an applied write that NEVER funnels
+                        // through put_object/remove_object on this path, so fire it here --
+                        // AFTER the encoding recompute + TTL apply, so the post-image the
+                        // observer borrows is the fully-committed edited entry. Fired
+                        // unconditionally in the non-emptying branch (like the WATCH notify
+                        // above), so even a no-op same-size edit (SADD of an existing member)
+                        // is observed. Gated behind `repl_active`. (The emptied branch above
+                        // already fired on_remove via remove_object_crediting.)
+                        self.observe_put(db, db_idx, key);
                     }
                 }
             }
@@ -2019,6 +2187,41 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     #[must_use]
     pub fn version_clock(&self) -> u64 {
         self.version_clock
+    }
+
+    /// Install the data-plane WRITE OBSERVER (HA-5a). After this, EVERY applied write to
+    /// the shard is reported to `observer` (create/overwrite/in-place edit/TTL change ->
+    /// [`WriteObserver::on_put`] with the committed post-image; delete/expiry/flush/
+    /// eviction/RENAME-source/emptied-collection -> [`WriteObserver::on_remove`]). Flips the
+    /// `repl_active` fast-path gate ON, so the funnel sites begin firing.
+    ///
+    /// Store-public so serve/repl installs it on the owning core when replication (HA-7) or
+    /// migration (HA-6) starts for this shard. Replaces any previously-installed observer
+    /// (the prior box is dropped). The shard is single-threaded, so this is a plain `&mut`
+    /// field write with no synchronization (ADR-0002/0005).
+    pub fn set_write_observer(&mut self, observer: Box<dyn WriteObserver>) {
+        self.repl_observer = Some(observer);
+        self.repl_active = true;
+    }
+
+    /// Clear the data-plane write observer (HA-5a): drop the installed box and flip the
+    /// `repl_active` fast-path gate back OFF, so the funnel sites return to the default
+    /// single-bool-branch cost profile (identical to a store that never had an observer).
+    /// Store-public so serve/repl tears it down when replication/migration stops. A no-op
+    /// (beyond clearing the already-`false` flag) if no observer was installed.
+    pub fn clear_write_observer(&mut self) {
+        self.repl_observer = None;
+        self.repl_active = false;
+    }
+
+    /// Whether a write observer is currently installed (the `repl_active` fast-path gate,
+    /// HA-5a). `false` by default and after [`Self::clear_write_observer`]; `true` between a
+    /// [`Self::set_write_observer`] and the next clear. Test/introspection helper: the
+    /// HOT-PATH test asserts this stays `false` on the default path, proving the funnel
+    /// fires no observer work when none is installed. Not a waist method.
+    #[must_use]
+    pub fn write_observer_active(&self) -> bool {
+        self.repl_active
     }
 
     /// Insert a fully-formed [`KvObj`] under `db`, bypassing the string-only
