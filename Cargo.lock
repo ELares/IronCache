@@ -462,6 +462,8 @@ dependencies = [
  "ironcache-env",
  "ironcache-runtime",
  "ironcache-sim",
+ "ironcache-storage",
+ "ironcache-store",
  "tokio",
 ]
 

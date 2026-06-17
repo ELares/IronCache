@@ -25,6 +25,16 @@ ironcache-runtime = { workspace = true }
 # through SystemEnv's Clock to schedule heartbeats; the link state machine itself
 # is a pure step function over events and owns no clock.
 ironcache-env = { workspace = true }
+# The per-shard store (HA-7b full-sync): the primary's full-sync driver pulls
+# `snapshot_chunk` from a `ShardStore` and the replica replays each entry via
+# `insert_object`. The KvObj wire codec encodes/decodes the public `KvObj` transfer
+# type the snapshot iterator yields. A normal higher-level dep (repl sits above the
+# store), the SAME direction the future serve wiring uses; the store has no edge back.
+ironcache-store = { workspace = true }
+# The frozen storage waist: the data-type / encoding tags (`DataType`, `Encoding`),
+# the `UnixMillis` TTL basis, and the collection `*Value` traits the KvObj codec reads
+# off and rebuilds the value reprs through.
+ironcache-storage = { workspace = true }
 
 [dev-dependencies]
 # The DST harness (TESTING.md): the link state machine is exercised as a SimNode
