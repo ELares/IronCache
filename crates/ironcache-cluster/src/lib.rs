@@ -512,6 +512,23 @@ impl SlotMap {
         self.current_epoch.load(Ordering::Acquire)
     }
 
+    /// UNCHECKED setter for `current_epoch`, used ONLY by the Raft apply path (HA-4c).
+    ///
+    /// The Raft control plane drives a MONOTONIC, log-driven epoch (incremented once per applied
+    /// config entry, a deterministic function of the committed prefix; CONTROL_PLANE.md). To
+    /// surface that epoch in `CLUSTER INFO cluster_current_epoch` it must be written directly,
+    /// bypassing the Redis admin-command guards [`set_config_epoch`](Self::set_config_epoch)
+    /// (rejected once peers are known) and [`bump_epoch`](Self::bump_epoch) (STILL once at the
+    /// max) carry: those guard SEMANTICS are wrong for a log-driven counter. This setter just
+    /// stores the value with no guard, with a `Release` store so a concurrent reader on a shard
+    /// thread sees a consistent value (it follows the same ordering as the other epoch stores).
+    ///
+    /// The static-governance (slice 2/3) path NEVER calls this; only `ConfigSm::apply` does, on
+    /// the single Raft control-plane task. So it does not perturb any pre-HA-4c behavior.
+    pub fn set_committed_epoch(&self, epoch: u64) {
+        self.current_epoch.store(epoch, Ordering::Release);
+    }
+
     /// Coalesce contiguous runs of equal-owner slots into `(start, end, node_index)` ranges,
     /// ascending by slot. This is the shape `CLUSTER SLOTS / SHARDS / NODES` all need: a node
     /// owning `0-100` and `101-200` coalesces to one `0-200`, and a node owning two
@@ -1089,6 +1106,25 @@ mod tests {
         assert!(!map.owns(1));
         // ID1's slot 2 is untouched by self's FLUSHSLOTS.
         assert_eq!(map.owner_id(2).unwrap().as_ref(), ID1);
+    }
+
+    #[test]
+    fn set_committed_epoch_stores_unchecked_for_the_raft_apply_path() {
+        // The Raft apply path drives a log-driven epoch directly, bypassing the Redis admin
+        // guards. set_config_epoch is rejected once peers are known, but set_committed_epoch
+        // is unguarded (HA-4c): it just stores the value.
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2)); // now knows a peer -> set_config_epoch would reject
+        assert!(matches!(
+            map.set_config_epoch(7),
+            Err(SlotMutError::EpochKnowsOthers)
+        ));
+        // set_committed_epoch stores regardless, and current_epoch reflects it (monotone is the
+        // caller's responsibility; here we just prove the unchecked store + read-back).
+        map.set_committed_epoch(7);
+        assert_eq!(map.current_epoch(), 7);
+        map.set_committed_epoch(42);
+        assert_eq!(map.current_epoch(), 42);
     }
 
     #[test]

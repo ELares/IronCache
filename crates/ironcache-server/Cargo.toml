@@ -22,6 +22,12 @@ ironcache-config = { workspace = true }
 # (cmd_cluster) reads it via ServerContext.cluster to render the real multi-node SLOTS /
 # SHARDS / NODES / INFO. Leaf crate (only ironcache-protocol), so no cycle.
 ironcache-cluster = { workspace = true }
+# The Raft control-plane HANDLE (HA-4c). ServerContext carries an Optional `RaftHandle` so a
+# raft-mode CLUSTER mutator proposes a ConfigCmd through the log instead of mutating the local
+# map directly. Only the clonable `Send` handle (the inbox sender + status watch) is named here;
+# this crate does NOT drive the engine. raft-net does not depend on ironcache-server, so the
+# edge is acyclic (and the layering test still forbids only the concrete store).
+ironcache-raft-net = { workspace = true }
 # The storage WAIST only (not ironcache-store): the command layer names the four
 # primitives + the hook types, never the concrete map. This dependency edge is the
 # compile-time proof of the layering contract (STORAGE_API.md).

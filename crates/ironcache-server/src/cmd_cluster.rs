@@ -966,6 +966,9 @@ mod tests {
             // No slot map: the single-node-owns-all fallback (slice-1 behavior). The
             // projection tests below use `ctx_with_map` to supply a real multi-node map.
             cluster: None,
+            // No raft handle: the cmd_cluster unit tests exercise the STATIC path only (the
+            // raft-mode proposal interception lives in serve.rs, tested over real sockets).
+            raft: None,
             boot,
         }
     }
