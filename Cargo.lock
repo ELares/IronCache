@@ -490,6 +490,7 @@ dependencies = [
  "ironcache-observe",
  "ironcache-protocol",
  "ironcache-raft-net",
+ "ironcache-repl",
  "ironcache-runtime",
  "ironcache-storage",
  "ironcache-store",

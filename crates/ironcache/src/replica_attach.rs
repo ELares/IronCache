@@ -71,8 +71,8 @@ use std::rc::Rc;
 
 use ironcache_env::Clock;
 use ironcache_repl::{
-    ApplyOutcome, Frame, FrameError, ReplId, ReplObserver, ReplOffset, ReplRing, ReplicaApplier,
-    ShipOutcome, drain_and_ship, encode_kvobj, receive_full_sync,
+    ApplyOutcome, Frame, FrameError, ReplId, ReplNodeStatus, ReplObserver, ReplOffset, ReplRing,
+    ReplicaApplier, ShipOutcome, drain_and_ship, encode_kvobj, receive_full_sync,
 };
 use ironcache_runtime::tokio_rt::bind_exclusive;
 use ironcache_runtime::{Runtime, TokioRuntime};
@@ -196,12 +196,23 @@ pub(crate) fn spawn_on_shard(
     let replid = ReplId::from_hex(ctx.info.cluster_node_id.as_bytes())
         .unwrap_or_else(|| ReplId::from_bytes([0u8; 20]));
 
+    // The NODE-LEVEL replication status cell (HA-7e): the repl tasks publish role / offsets / link
+    // state here for INFO / CLUSTER SHARDS + the HA-8 promotion gate. Raft-mode always installs
+    // one (serve::run_server), so `Some` in practice; a defensive fresh cell keeps the wiring
+    // total without an Option threading through every task. It is `Send + Sync` (atomics), so it
+    // clones cheaply into both shard-local tasks.
+    let status: std::sync::Arc<ReplNodeStatus> = ctx
+        .repl_status
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::new(ReplNodeStatus::new()));
+
     let rt = TokioRuntime::new();
 
     // --- PRIMARY: bind the repl listener + serve replica connections. ---
     let listen_addr = SocketAddr::new(bind, repl_port(client_port));
     let listener_ring = Rc::clone(&ring);
     let listener_store = Rc::clone(&store_rc);
+    let listener_status = std::sync::Arc::clone(&status);
     rt.spawn_on_shard(async move {
         run_primary_listener(
             TokioRuntime::new(),
@@ -209,6 +220,7 @@ pub(crate) fn spawn_on_shard(
             replid,
             listener_store,
             listener_ring,
+            listener_status,
         )
         .await;
     });
@@ -225,6 +237,7 @@ pub(crate) fn spawn_on_shard(
             databases,
             policy_name,
             reserved_bits,
+            status,
         )
         .await;
     });
@@ -245,6 +258,7 @@ async fn run_primary_listener(
     replid: ReplId,
     store_rc: Rc<RefCell<ShardStoreImpl>>,
     ring: Rc<RefCell<ReplRing>>,
+    status: std::sync::Arc<ReplNodeStatus>,
 ) {
     // EXCLUSIVE bind (NO SO_REUSEPORT): the repl listener is a single per-node socket that must
     // never SHARE a port with another service. A reuseport bind would let the kernel load-balance
@@ -258,6 +272,9 @@ async fn run_primary_listener(
             return;
         }
     };
+    // Publish this node's current head as a master from the moment the listener is up (HA-7e), so
+    // INFO / CLUSTER SHARDS report the real master offset even before any replica attaches.
+    status.set_master_head(ring.borrow().head());
     loop {
         let Ok((stream, _peer)) = rt.accept(&listener).await else {
             return; // listener failed; the primary is going away.
@@ -265,8 +282,9 @@ async fn run_primary_listener(
         let rt2 = TokioRuntime::new();
         let store = Rc::clone(&store_rc);
         let ring = Rc::clone(&ring);
+        let status = std::sync::Arc::clone(&status);
         rt.spawn_on_shard(async move {
-            serve_replica_conn(rt2, stream, replid, store, ring).await;
+            serve_replica_conn(rt2, stream, replid, store, ring, status).await;
         });
     }
 }
@@ -283,17 +301,22 @@ async fn serve_replica_conn(
     replid: ReplId,
     store_rc: Rc<RefCell<ShardStoreImpl>>,
     ring: Rc<RefCell<ReplRing>>,
+    status: std::sync::Arc<ReplNodeStatus>,
 ) {
     let stream = Rc::new(RefCell::new(Some(stream)));
 
     // (1) Read the attach REPLCONF handshake (the replica names itself + its resume offset).
     // A replica that has never synced sends ack 0; we always full-sync from scratch in this
     // MVP (a partial resume from the tail is HA-7e), so the ack is read-and-acknowledged but
-    // the sync starts at the snapshot cut regardless.
+    // the sync starts at the snapshot cut regardless. The handshake `ack` is the master's view
+    // of the replica's resume offset (HA-7e); a steady-state per-ack stream is an HA-7e follow-up.
     let mut pending: Vec<u8> = Vec::new();
-    if !read_attach_handshake(&rt, &stream, &mut pending).await {
+    let Some(handshake_ack) = read_attach_handshake(&rt, &stream, &mut pending).await else {
         return; // the replica closed / sent garbage before attaching.
-    }
+    };
+    // Publish that a replica is connected (PRIMARY side, HA-7e): connected_slaves -> 1 with the
+    // replica's resume offset. INFO renders the `slaveN:` line + the master-side lag from this.
+    status.set_replica_connected(handshake_ack);
 
     // (2) Drive the full sync. CARRY-FORWARD 1 (ATOMIC end_offset capture) is satisfied inside
     // `drive_full_sync_chunked` (see its doc + the cited code point): the cut is the ring head
@@ -302,7 +325,8 @@ async fn serve_replica_conn(
         .await
         .is_err()
     {
-        return; // the link dropped mid-sync; the replica reconnects + re-syncs.
+        status.set_replica_disconnected(); // the link dropped mid-sync; the replica re-syncs.
+        return;
     }
 
     // (3) The steady-state tail: ship newly-observed ops in offset order. `drain_and_ship`
@@ -310,7 +334,8 @@ async fn serve_replica_conn(
     // sends (so the write funnel is never blocked behind a network await). On an overflow the
     // replica fell too far behind: drop the connection so it reconnects + re-full-syncs (MVP
     // full-resync-on-gap). When the batch is empty, wait the poll interval (timer seam) so an
-    // idle tail does not busy-spin.
+    // idle tail does not busy-spin. After EACH pass, publish the current head (PRIMARY side,
+    // HA-7e) so INFO / CLUSTER SHARDS report the advancing master offset.
     loop {
         let send_stream = Rc::clone(&stream);
         let rt_send = rt;
@@ -320,13 +345,19 @@ async fn serve_replica_conn(
             async move { send_bytes(&rt_send, &stream, bytes).await }
         })
         .await;
+        // Publish the advancing master head (and re-affirm the slave's last-known offset) so the
+        // observable master offset tracks the writes shipped. Cold node-level publish, not per key.
+        status.set_master_head(ring.borrow().head());
         match outcome {
             ShipOutcome::Shipped(0) => rt.timer(POLL_INTERVAL).await,
             ShipOutcome::Shipped(_) => {}
             // The ring overflowed (the replica is too far behind) or the link dropped: end the
             // connection. The replica reconnects and re-attaches, which full-syncs from a fresh
             // cut; the ring's resync latch is cleared by the next attach's rebase-at-head.
-            ShipOutcome::ResyncNeeded | ShipOutcome::LinkDown => return,
+            ShipOutcome::ResyncNeeded | ShipOutcome::LinkDown => {
+                status.set_replica_disconnected();
+                return;
+            }
         }
     }
 }
@@ -407,28 +438,29 @@ async fn drive_full_sync_chunked(
     send_bytes(rt, stream, Frame::SyncEnd { end_offset }.encode()).await
 }
 
-/// Read inbound bytes until the replica's attach `REPLCONF` arrives, returning `true` once it
-/// does (the handshake), or `false` if the socket closes / sends a malformed frame first. Any
-/// non-REPLCONF frame before the handshake is ignored (a stray heartbeat). `pending` carries
-/// the partial read buffer across reads.
+/// Read inbound bytes until the replica's attach `REPLCONF` arrives, returning `Some(ack)` with
+/// the replica's resume offset once it does (the handshake), or `None` if the socket closes /
+/// sends a malformed frame first. Any non-REPLCONF frame before the handshake is ignored (a stray
+/// heartbeat). `pending` carries the partial read buffer across reads. The `ack` is the master's
+/// view of the replica's resume offset, published into the node status for INFO (HA-7e).
 async fn read_attach_handshake(
     rt: &TokioRuntime,
     stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
     pending: &mut Vec<u8>,
-) -> bool {
+) -> Option<ReplOffset> {
     loop {
         // Drain any complete frames already buffered.
         loop {
             match Frame::decode(pending) {
                 Ok(Some((frame, consumed))) => {
                     pending.drain(..consumed);
-                    if matches!(frame, Frame::ReplConf { .. }) {
-                        return true; // attached.
+                    if let Frame::ReplConf { ack, .. } = frame {
+                        return Some(ack); // attached; carry the replica's resume offset.
                     }
                     // A non-REPLCONF frame before the handshake: ignore, keep reading.
                 }
-                Ok(None) => break,               // need more bytes.
-                Err(FrameError) => return false, // malformed: drop the connection.
+                Ok(None) => break,              // need more bytes.
+                Err(FrameError) => return None, // malformed: drop the connection.
             }
         }
         // Read another chunk (TAKE/put-back so no borrow crosses the await).
@@ -439,11 +471,11 @@ async fn read_attach_handshake(
         match res {
             Ok(r) => {
                 if r.n == 0 {
-                    return false; // replica closed before attaching.
+                    return None; // replica closed before attaching.
                 }
                 *pending = r.buf;
             }
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
 }
@@ -463,6 +495,7 @@ async fn run_replica_control(
     databases: u32,
     policy_name: &'static str,
     reserved_bits: u32,
+    status: std::sync::Arc<ReplNodeStatus>,
 ) {
     loop {
         // Should THIS shard be a replica right now? (single-shard: replica of ANY slot.)
@@ -476,16 +509,26 @@ async fn run_replica_control(
                 {
                     // Attach: full-sync + atomic swap + passive + tail. Returns when the link
                     // drops or a Gap forces a re-attach; we loop and re-attach (re-checking the
-                    // map first, so a role removal stops us).
+                    // map first, so a role removal stops us). Publishes the replica-side status
+                    // (role / link / offsets) into `status` for INFO / CLUSTER SHARDS + the HA-8
+                    // gate; the master ENDPOINT reported is the owner's advertised CLIENT
+                    // host:port (what an operator dials), not the internal repl port.
                     attach_once(
                         &rt,
                         owner_addr,
+                        &host,
+                        owner_client_port,
                         &store_rc,
                         databases,
                         policy_name,
                         reserved_bits,
+                        &status,
                     )
                     .await;
+                    // The attach returned: the link is down (drop / gap / dial fail). Publish the
+                    // link-down state (HA-7e) so INFO reports master_link_status:down and the
+                    // promotion gate sees this replica as not in sync until it re-attaches.
+                    status.set_master_link_down();
                     // After a link drop, back off briefly before re-attaching.
                     rt.timer(RECONNECT_BACKOFF).await;
                     continue;
@@ -508,13 +551,22 @@ async fn run_replica_control(
 /// On a FAILED / interrupted sync the partial temp store is DISCARDED (it is dropped on the
 /// error return inside `receive_full_sync`, never swapped) and we return WITHOUT having
 /// perturbed the live store: a half-loaded store is NEVER swapped in.
+///
+/// The over-7-args lint is allowed: each argument is a distinct, orthogonal seam (the runtime,
+/// the owner's repl dial address vs its advertised CLIENT endpoint for the status report, the
+/// live store handle, the store-construction facts, and the node status cell to publish into);
+/// bundling them would just move the same fields behind one name.
+#[allow(clippy::too_many_arguments)]
 async fn attach_once(
     rt: &TokioRuntime,
     owner_addr: SocketAddr,
+    owner_host: &str,
+    owner_client_port: u16,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     databases: u32,
     policy_name: &'static str,
     reserved_bits: u32,
+    status: &std::sync::Arc<ReplNodeStatus>,
 ) {
     // Dial the owner's repl endpoint. A failed dial returns; the caller backs off + retries.
     let Ok(stream) = rt.connect(owner_addr).await else {
@@ -577,10 +629,17 @@ async fn attach_once(
     store_rc.borrow_mut().set_passive(true);
     crate::serve::set_replica_passive(true);
 
+    // Publish the REPLICA-side status (HA-7e): this node is now a replica of `owner_host:port`,
+    // link UP, with the snapshot cut as its initial applied + observed-master offset. INFO renders
+    // `role:replica`/`master_host`/`master_link_status:up`/the offsets, and the HA-8 gate reads
+    // `is_in_sync` off this. The endpoint is the owner's advertised CLIENT host:port (what
+    // operators see), not the internal repl port the replica dials.
+    status.set_replica_attached(owner_host, owner_client_port, loaded.end_offset);
+
     // Run the steady-state tail from the snapshot cut. On a Gap (a missing offset / corrupt
     // frame) the replica fell behind the primary's bounded buffer; tear down + re-attach (the
     // caller's loop re-dials, which full-syncs from a fresh cut).
-    run_replica_tail(rt, &stream, store_rc, loaded.end_offset).await;
+    run_replica_tail(rt, &stream, store_rc, loaded.end_offset, status).await;
 }
 
 /// The replica STEADY-STATE TAIL (HA-7c apply): recv stream frames and apply them in offset
@@ -593,6 +652,7 @@ async fn run_replica_tail(
     stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     start: ReplOffset,
+    status: &std::sync::Arc<ReplNodeStatus>,
 ) {
     let mut applier = ReplicaApplier::new(start);
     let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
@@ -601,17 +661,39 @@ async fn run_replica_tail(
         let Some(frame) = next_frame(rt, stream, &pending, &queue).await else {
             return; // link dropped / peer closed: the caller re-attaches.
         };
+        // The master's head as observed on the link (HA-7e): a stream put/del carries the offset
+        // of a write the master produced, so it is a lower bound on the master head. Publishing it
+        // BEFORE the apply keeps the replica's lag (`master_offset - applied`) honest even while a
+        // batch of frames is still being drained. A heartbeat / non-stream frame carries no
+        // offset, so it leaves the observed head unchanged.
+        if let Some(off) = stream_frame_offset(&frame) {
+            status.set_observed_master_head(off);
+        }
         // Apply synchronously: borrow the store ONLY for the apply, release before next recv.
         let outcome = {
             let mut store = store_rc.borrow_mut();
             applier.apply(&mut store, frame, now_from_env())
         };
         match outcome {
-            ApplyOutcome::Applied(_) | ApplyOutcome::Duplicate => {}
+            ApplyOutcome::Applied(_) | ApplyOutcome::Duplicate => {
+                // Publish the advancing applied offset (REPLICA side, HA-7e). Monotonic; a
+                // duplicate leaves it unchanged. Cold node-level publish, not per stored key.
+                status.set_replica_applied(applier.applied());
+            }
             // A gap (a missing offset or a corrupt post-image): the safe recovery is a full
             // re-sync. Return so the caller re-dials + full-syncs from a fresh cut.
             ApplyOutcome::Gap => return,
         }
+    }
+}
+
+/// The replication offset a STREAM frame (a `StreamPut` / `StreamDel`) carries, or `None` for a
+/// non-stream frame (a stray heartbeat / handshake). Used by the replica tail to observe the
+/// master's head (HA-7e); a stream frame's offset is a lower bound on the master head.
+fn stream_frame_offset(frame: &Frame) -> Option<ReplOffset> {
+    match frame {
+        Frame::StreamPut { offset, .. } | Frame::StreamDel { offset, .. } => Some(*offset),
+        _ => None,
     }
 }
 
@@ -833,7 +915,8 @@ mod tests {
                 let (stream, _peer) = rt.accept(&listener).await.expect("accept");
                 let stream = Rc::new(RefCell::new(Some(stream)));
                 let mut pending = Vec::new();
-                if !read_attach_handshake(&rt, &stream, &mut pending).await {
+                let attached = read_attach_handshake(&rt, &stream, &mut pending).await;
+                if attached.is_none() {
                     return;
                 }
                 let replid = ReplId::from_bytes([0xCD; 20]);

@@ -238,6 +238,68 @@ pub struct MemoryInfo {
     pub used_memory_rss: u64,
 }
 
+/// One connected replica's line in a master's INFO `# Replication` section (HA-7e): the
+/// `slaveN:ip=..,port=..,state=online,offset=..,lag=..` entry Redis emits per connected slave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaLine {
+    /// The replica's advertised IP/host.
+    pub ip: String,
+    /// The replica's advertised client port.
+    pub port: u16,
+    /// The replica's last-acked replication offset.
+    pub offset: u64,
+    /// The replica's lag in logical writes (the master's `head - replica_acked`).
+    pub lag: u64,
+}
+
+/// The replication facts INFO's `# Replication` section renders (HA-7e), translated by the serve
+/// layer from the node-level replication status (`ironcache_repl::ReplStatusSnapshot`).
+///
+/// This is a PLAIN POD with NO dependency on the replication crate, so `ironcache-observe` stays
+/// a leaf: the server crate (which DOES know the repl status) fills it in. The DEFAULT
+/// ([`ReplicationInfo::standalone`]) is a master with no slaves at offset 0, byte-compatible with
+/// a standalone Redis's `# Replication` section, which is what the default static path reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationInfo {
+    /// `true` if this node is a master, `false` if it is a replica.
+    pub is_master: bool,
+    /// The node's own replication offset (`master_repl_offset` on a master; the replica's
+    /// applied offset is reported separately as `slave_repl_offset`).
+    pub master_repl_offset: u64,
+    /// MASTER side: the connected replicas (each rendered as a `slaveN:` line). Empty on a master
+    /// with no slaves and on a replica.
+    pub slaves: Vec<ReplicaLine>,
+    /// REPLICA side: `Some((host, port))` the master endpoint when this node is a replica.
+    pub master_endpoint: Option<(String, u16)>,
+    /// REPLICA side: whether the link to the master is up (`master_link_status:up|down`).
+    pub master_link_up: bool,
+    /// REPLICA side: this replica's own applied offset (`slave_repl_offset`).
+    pub slave_repl_offset: u64,
+}
+
+impl ReplicationInfo {
+    /// The standalone/default `# Replication` posture: a master with no slaves at offset 0. This
+    /// is byte-compatible with a standalone Redis and is what the DEFAULT static path reports
+    /// (no replication status cell present).
+    #[must_use]
+    pub fn standalone() -> Self {
+        ReplicationInfo {
+            is_master: true,
+            master_repl_offset: 0,
+            slaves: Vec::new(),
+            master_endpoint: None,
+            master_link_up: false,
+            slave_repl_offset: 0,
+        }
+    }
+}
+
+impl Default for ReplicationInfo {
+    fn default() -> Self {
+        Self::standalone()
+    }
+}
+
 /// The CURRENT effective `maxmemory`/`maxmemory_policy` INFO reports (CONFIG.md, the
 /// `CONFIG SET` hot-swap, PR-4b). The boot values live in [`ServerInfo`] as static
 /// facts, but a runtime `CONFIG SET` changes the effective ceiling/policy, so the
@@ -272,6 +334,7 @@ pub fn build_info<C: Clock>(
     rolled: CounterSnapshot,
     memory: MemoryInfo,
     effective: EffectiveMemoryConfig<'_>,
+    replication: &ReplicationInfo,
     section: Option<&str>,
 ) -> String {
     // `write!` into a String never fails; the `let _ =` discards the Result.
@@ -365,6 +428,9 @@ pub fn build_info<C: Clock>(
         let _ = write!(out, "keyspace_misses:{}\r\n", rolled.keyspace_misses);
         out.push_str("\r\n");
     }
+    if want("replication") {
+        push_replication_section(&mut out, replication);
+    }
     if want("cluster") {
         // The `# Cluster` section (CLUSTER_CONTRACT.md #70). Redis emits this section
         // (after Stats) whether or not cluster mode is on; the single `cluster_enabled`
@@ -380,6 +446,63 @@ pub fn build_info<C: Clock>(
         out.push_str("\r\n");
     }
     out
+}
+
+/// Append the INFO `# Replication` section (HA-7e) to `out`, matching Redis's field names + shape
+/// so existing parsers / `redis_exporter` read it. A MASTER reports `role:master`,
+/// `connected_slaves`, and one `slaveN:` line per connected replica; a REPLICA additionally
+/// reports its `master_host`/`master_port`/`master_link_status`/`slave_repl_offset`/
+/// `slave_read_only`. In the DEFAULT static (standalone) posture this is `role:master` with 0
+/// slaves at offset 0, byte-compatible with a standalone Redis.
+fn push_replication_section(out: &mut String, replication: &ReplicationInfo) {
+    use core::fmt::Write as _;
+    out.push_str("# Replication\r\n");
+    if replication.is_master {
+        out.push_str("role:master\r\n");
+        let _ = write!(out, "connected_slaves:{}\r\n", replication.slaves.len());
+        for (i, s) in replication.slaves.iter().enumerate() {
+            // slaveN:ip=<ip>,port=<port>,state=online,offset=<offset>,lag=<lag>
+            let _ = write!(
+                out,
+                "slave{i}:ip={},port={},state=online,offset={},lag={}\r\n",
+                s.ip, s.port, s.offset, s.lag
+            );
+        }
+    } else {
+        out.push_str("role:replica\r\n");
+        // The master endpoint: host/port the replica is attached to (empty strings / 0 if not yet
+        // resolved, matching Redis's pre-attach placeholders).
+        let (mhost, mport) = replication
+            .master_endpoint
+            .clone()
+            .unwrap_or_else(|| (String::new(), 0));
+        let _ = write!(out, "master_host:{mhost}\r\n");
+        let _ = write!(out, "master_port:{mport}\r\n");
+        let _ = write!(
+            out,
+            "master_link_status:{}\r\n",
+            if replication.master_link_up {
+                "up"
+            } else {
+                "down"
+            }
+        );
+        // A replica is read-only by default (HA-7d passive replica): slave_read_only:1.
+        out.push_str("slave_read_only:1\r\n");
+        let _ = write!(
+            out,
+            "slave_repl_offset:{}\r\n",
+            replication.slave_repl_offset
+        );
+    }
+    // master_repl_offset is reported in BOTH roles (Redis does too): the master's head, or the
+    // master offset a replica last observed.
+    let _ = write!(
+        out,
+        "master_repl_offset:{}\r\n",
+        replication.master_repl_offset
+    );
+    out.push_str("\r\n");
 }
 
 /// A stable-per-process placeholder run id. The real 40-hex run id ships with the
@@ -438,6 +561,11 @@ mod tests {
         }
     }
 
+    /// The default (standalone) replication info for the tests.
+    fn repl() -> ReplicationInfo {
+        ReplicationInfo::standalone()
+    }
+
     #[test]
     fn info_has_standard_sections_and_fields() {
         let env = TestEnv::new(1);
@@ -447,6 +575,7 @@ mod tests {
             CounterSnapshot::default(),
             MemoryInfo::default(),
             eff(),
+            &repl(),
             None,
         );
         assert!(body.contains("# Server\r\n"));
@@ -480,6 +609,7 @@ mod tests {
             CounterSnapshot::default(),
             MemoryInfo::default(),
             effective,
+            &repl(),
             Some("memory"),
         );
         assert!(
@@ -508,6 +638,7 @@ mod tests {
             rolled,
             MemoryInfo::default(),
             effective,
+            &repl(),
             None,
         );
         assert!(body.contains("maxmemory_policy:volatile-ttl\r\n"), "{body}");
@@ -530,6 +661,7 @@ mod tests {
             CounterSnapshot::default(),
             mem,
             eff(),
+            &repl(),
             Some("memory"),
         );
         assert!(
@@ -554,6 +686,7 @@ mod tests {
             CounterSnapshot::default(),
             MemoryInfo::default(),
             eff(),
+            &repl(),
             Some("memory"),
         );
         assert!(body.contains("used_memory:0\r\n"), "{body}");
@@ -580,6 +713,7 @@ mod tests {
             CounterSnapshot::default(),
             MemoryInfo::default(),
             eff(),
+            &repl(),
             Some("server"),
         );
         assert!(only_server.contains("# Server\r\n"));
@@ -593,6 +727,7 @@ mod tests {
             CounterSnapshot::default(),
             MemoryInfo::default(),
             eff(),
+            &repl(),
             Some("cluster"),
         );
         assert!(only_cluster.contains("# Cluster\r\n"));
@@ -610,9 +745,146 @@ mod tests {
             CounterSnapshot::default(),
             MemoryInfo::default(),
             eff(),
+            &repl(),
             Some("server"),
         );
         assert!(body.contains("uptime_in_seconds:90\r\n"), "{body}");
+    }
+
+    /// A master with NO slaves renders the byte-compatible standalone `# Replication` posture:
+    /// role:master, connected_slaves:0, master_repl_offset:0, and NO slaveN lines.
+    #[test]
+    fn info_replication_master_no_slaves_matches_standalone() {
+        let env = TestEnv::new(1);
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &ReplicationInfo::standalone(),
+            Some("replication"),
+        );
+        assert!(body.contains("# Replication\r\n"), "{body}");
+        assert!(body.contains("role:master\r\n"), "{body}");
+        assert!(body.contains("connected_slaves:0\r\n"), "{body}");
+        assert!(body.contains("master_repl_offset:0\r\n"), "{body}");
+        assert!(!body.contains("slave0:"), "{body}");
+        // A standalone reports neither master_host nor slave_read_only (those are replica-only).
+        assert!(!body.contains("master_host:"), "{body}");
+        assert!(!body.contains("slave_read_only:"), "{body}");
+    }
+
+    /// A master WITH a connected slave renders `connected_slaves:1` and a `slave0:` line carrying
+    /// the slave's offset + lag, plus its own master_repl_offset.
+    #[test]
+    fn info_replication_master_with_slave_reports_offset_and_lag() {
+        let env = TestEnv::new(1);
+        let repl = ReplicationInfo {
+            is_master: true,
+            master_repl_offset: 100,
+            slaves: vec![ReplicaLine {
+                ip: "10.0.0.2".to_owned(),
+                port: 6380,
+                offset: 95,
+                lag: 5,
+            }],
+            master_endpoint: None,
+            master_link_up: false,
+            slave_repl_offset: 0,
+        };
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl,
+            Some("replication"),
+        );
+        assert!(body.contains("role:master\r\n"), "{body}");
+        assert!(body.contains("connected_slaves:1\r\n"), "{body}");
+        assert!(
+            body.contains("slave0:ip=10.0.0.2,port=6380,state=online,offset=95,lag=5\r\n"),
+            "{body}"
+        );
+        assert!(body.contains("master_repl_offset:100\r\n"), "{body}");
+    }
+
+    /// A replica renders `role:replica`, its master endpoint + link status, `slave_read_only:1`,
+    /// its own `slave_repl_offset`, and the master's `master_repl_offset`.
+    #[test]
+    fn info_replication_replica_reports_master_link_and_offsets() {
+        let env = TestEnv::new(1);
+        let repl = ReplicationInfo {
+            is_master: false,
+            master_repl_offset: 100, // the master's head as observed
+            slaves: Vec::new(),
+            master_endpoint: Some(("10.0.0.1".to_owned(), 6379)),
+            master_link_up: true,
+            slave_repl_offset: 98, // this replica's applied offset
+        };
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl,
+            Some("replication"),
+        );
+        assert!(body.contains("role:replica\r\n"), "{body}");
+        assert!(body.contains("master_host:10.0.0.1\r\n"), "{body}");
+        assert!(body.contains("master_port:6379\r\n"), "{body}");
+        assert!(body.contains("master_link_status:up\r\n"), "{body}");
+        assert!(body.contains("slave_read_only:1\r\n"), "{body}");
+        assert!(body.contains("slave_repl_offset:98\r\n"), "{body}");
+        assert!(body.contains("master_repl_offset:100\r\n"), "{body}");
+        // A replica reports no connected_slaves line / no slaveN entries.
+        assert!(!body.contains("connected_slaves:"), "{body}");
+        // A down link reports master_link_status:down.
+        let down = ReplicationInfo {
+            master_link_up: false,
+            ..repl
+        };
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &down,
+            Some("replication"),
+        );
+        assert!(body.contains("master_link_status:down\r\n"), "{body}");
+    }
+
+    /// The `# Replication` section is gated by the section filter (a server-only INFO omits it; a
+    /// replication-only INFO yields it and not the others).
+    #[test]
+    fn info_replication_section_is_filtered() {
+        let env = TestEnv::new(1);
+        let only_server = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl(),
+            Some("server"),
+        );
+        assert!(!only_server.contains("# Replication\r\n"), "{only_server}");
+        let only_repl = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl(),
+            Some("replication"),
+        );
+        assert!(only_repl.contains("# Replication\r\n"), "{only_repl}");
+        assert!(!only_repl.contains("# Server\r\n"), "{only_repl}");
     }
 
     #[test]

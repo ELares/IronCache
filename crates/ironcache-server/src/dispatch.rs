@@ -19,7 +19,8 @@ use ironcache_config::{ClusterMode, Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
 use ironcache_expiry::TimingWheel;
 use ironcache_observe::{
-    CounterDeltas, CounterSnapshot, EffectiveMemoryConfig, MemoryInfo, ServerInfo, build_info,
+    CounterDeltas, CounterSnapshot, EffectiveMemoryConfig, MemoryInfo, ReplicaLine,
+    ReplicationInfo, ServerInfo, build_info,
 };
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
 use ironcache_storage::{ActiveExpiry, Admit, Keyspace, PolicySwap, Store, UnixMillis, Watch};
@@ -146,6 +147,20 @@ pub struct ServerContext {
     /// shared `cluster` map. The handle is the clonable `Send` inbox/status handle, NOT the
     /// `!Send` engine (which lives on its own control-plane thread).
     pub raft: Option<ironcache_raft_net::RaftHandle>,
+    /// The NODE-LEVEL replication status cell (HA-7e), present ONLY in raft-governance mode
+    /// (`raft.is_some()`); `None` for the DEFAULT static path (and every standalone / slice-2/3
+    /// node), so INFO reports the byte-compatible standalone `role:master`/`connected_slaves:0`
+    /// posture and CLUSTER SHARDS the unchanged single-master-at-offset-0-online projection.
+    ///
+    /// When `Some`, the repl tasks (the primary per-replica serve task + the replica control/tail
+    /// task, each a SINGLE WRITER for its half) publish the current role / offsets / link state
+    /// here on the replication cadence (per attach / per shipped batch / per applied op), and the
+    /// serve layer reads a `ReplStatusSnapshot` to render the INFO `# Replication` section +
+    /// CLUSTER SHARDS health/offset. It is a small bag of ATOMICS (no hot-path lock) shared as an
+    /// `Arc`; it is NODE-LEVEL cold state, NEVER touched per stored key, so the data hot path and
+    /// `bytes_per_key` are unaffected. HA-8's promotion gate consumes `ReplNodeStatus::is_in_sync`
+    /// off the same cell.
+    pub repl_status: Option<Arc<ironcache_repl::ReplNodeStatus>>,
 }
 
 impl ServerContext {
@@ -1551,15 +1566,74 @@ fn cmd_info<C: Clock>(
         maxmemory: ctx.runtime.maxmemory(),
         maxmemory_policy: &policy,
     };
+    // The `# Replication` section facts (HA-7e): translate the node-level repl status snapshot to
+    // the observe POD. `None` (the default static path, no status cell) -> the byte-compatible
+    // standalone master-at-offset-0 posture.
+    let replication = replication_info(ctx);
     let body = build_info(
         clock,
         &ctx.info,
         rollup(),
         mem,
         effective,
+        &replication,
         section.as_deref(),
     );
     Value::bulk(body.into_bytes())
+}
+
+/// Build the INFO `# Replication` facts (HA-7e) from `ctx`'s node-level replication status. When
+/// no status cell is present (the DEFAULT static path / standalone), returns
+/// [`ReplicationInfo::standalone`] -- a master with no slaves at offset 0, byte-compatible with a
+/// standalone Redis. In raft-mode it reads a [`ReplStatusSnapshot`] and maps it to Redis's field
+/// shape: a master reports its head + a `slaveN:` line (with the per-replica lag) per connected
+/// replica; a replica reports its master endpoint, link status, and applied offset.
+fn replication_info(ctx: &ServerContext) -> ReplicationInfo {
+    let Some(status) = ctx.repl_status.as_ref() else {
+        return ReplicationInfo::standalone();
+    };
+    let snap = status.snapshot();
+    match snap.role {
+        ironcache_repl::ReplRole::Master => {
+            // One `slaveN:` line per connected replica (0 or 1 in the single-shard HA-7d wiring).
+            // The lag is the master's view (`head - replica_acked`), known while connected.
+            let mut slaves = Vec::new();
+            if snap.connected_slaves > 0 {
+                let lag = snap
+                    .slave_lag()
+                    .and_then(ironcache_repl::ReplicaLag::lag)
+                    .unwrap_or(0);
+                // The master does not learn the replica's advertised client endpoint over the
+                // current handshake (HA-7d sends node id + ack only), so report a placeholder
+                // endpoint; the offset + lag (the load-bearing fields HA-8 + operators read) are
+                // real. A follow-up can carry the replica's advertised endpoint in the handshake.
+                slaves.push(ReplicaLine {
+                    ip: String::new(),
+                    port: 0,
+                    offset: snap.slave_offset.0,
+                    lag,
+                });
+            }
+            ReplicationInfo {
+                is_master: true,
+                master_repl_offset: snap.node_offset.0,
+                slaves,
+                master_endpoint: None,
+                master_link_up: false,
+                slave_repl_offset: 0,
+            }
+        }
+        ironcache_repl::ReplRole::Replica => ReplicationInfo {
+            is_master: false,
+            // master_repl_offset on a replica = the master's head as last observed on the link.
+            master_repl_offset: snap.master_offset.0,
+            slaves: Vec::new(),
+            master_endpoint: snap.master_endpoint.clone(),
+            master_link_up: snap.master_link.is_up(),
+            // slave_repl_offset = this replica's own applied offset.
+            slave_repl_offset: snap.node_offset.0,
+        },
+    }
 }
 
 // -- helpers --
@@ -1659,6 +1733,7 @@ mod tests {
             },
             cluster: None,
             raft: None,
+            repl_status: None,
             boot,
         }
     }
@@ -2082,6 +2157,73 @@ mod tests {
             }
             other => panic!("expected bulk, got {other:?}"),
         }
+    }
+
+    /// The INFO body as a `String` (the test reads the bulk reply text).
+    fn info_text(c: &ServerContext, s: &mut ConnState, section: &[&[u8]]) -> String {
+        let mut args: Vec<&[u8]> = vec![b"INFO"];
+        args.extend_from_slice(section);
+        match run(c, s, &args) {
+            Value::BulkString(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
+            other => panic!("expected bulk INFO, got {other:?}"),
+        }
+    }
+
+    /// HA-7e: with NO repl status cell (the default static path), INFO `# Replication` reports the
+    /// byte-compatible standalone posture: role:master, connected_slaves:0, master_repl_offset:0.
+    #[test]
+    fn info_replication_default_is_standalone_master() {
+        let c = ctx(None); // ctx has repl_status: None
+        let mut s = state(&c);
+        let body = info_text(&c, &mut s, &[b"replication"]);
+        assert!(body.contains("# Replication\r\n"), "{body}");
+        assert!(body.contains("role:master\r\n"), "{body}");
+        assert!(body.contains("connected_slaves:0\r\n"), "{body}");
+        assert!(body.contains("master_repl_offset:0\r\n"), "{body}");
+        assert!(!body.contains("slave0:"), "{body}");
+    }
+
+    /// HA-7e: a master with a connected replica reports connected_slaves:1 + a slave0: line with
+    /// the slave's offset + lag.
+    #[test]
+    fn info_replication_master_with_connected_slave() {
+        let mut c = ctx(None);
+        let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
+        status.set_master_head(ironcache_repl::ReplOffset(200));
+        status.set_replica_connected(ironcache_repl::ReplOffset(190)); // lag 10
+        c.repl_status = Some(status);
+        let mut s = state(&c);
+        let body = info_text(&c, &mut s, &[b"replication"]);
+        assert!(body.contains("role:master\r\n"), "{body}");
+        assert!(body.contains("connected_slaves:1\r\n"), "{body}");
+        // The slaveN line carries the offset + lag (the endpoint is a placeholder in the MVP
+        // handshake; the offset/lag are the load-bearing fields).
+        assert!(
+            body.contains("state=online,offset=190,lag=10\r\n"),
+            "{body}"
+        );
+        assert!(body.contains("master_repl_offset:200\r\n"), "{body}");
+    }
+
+    /// HA-7e: a replica reports role:replica, its master endpoint, master_link_status, the offsets,
+    /// and slave_read_only:1.
+    #[test]
+    fn info_replication_replica_view() {
+        let mut c = ctx(None);
+        let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
+        status.set_replica_attached("10.0.0.9", 6400, ironcache_repl::ReplOffset(50));
+        status.set_observed_master_head(ironcache_repl::ReplOffset(60));
+        status.set_replica_applied(ironcache_repl::ReplOffset(58));
+        c.repl_status = Some(status);
+        let mut s = state(&c);
+        let body = info_text(&c, &mut s, &[b"replication"]);
+        assert!(body.contains("role:replica\r\n"), "{body}");
+        assert!(body.contains("master_host:10.0.0.9\r\n"), "{body}");
+        assert!(body.contains("master_port:6400\r\n"), "{body}");
+        assert!(body.contains("master_link_status:up\r\n"), "{body}");
+        assert!(body.contains("slave_read_only:1\r\n"), "{body}");
+        assert!(body.contains("slave_repl_offset:58\r\n"), "{body}");
+        assert!(body.contains("master_repl_offset:60\r\n"), "{body}");
     }
 
     // -- Data commands (PR-2a) through dispatch over a real ShardStore. --

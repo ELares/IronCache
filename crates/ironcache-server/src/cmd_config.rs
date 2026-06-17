@@ -193,6 +193,7 @@ mod tests {
             },
             cluster: None,
             raft: None,
+            repl_status: None,
             boot,
         }
     }
