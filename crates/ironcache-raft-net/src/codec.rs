@@ -54,6 +54,7 @@ const CFG_REMOVE_NODE: u8 = 1;
 const CFG_SET_SLOT_OWNER: u8 = 2;
 const CFG_ASSIGN_SLOTS: u8 = 3;
 const CFG_SET_CONFIG_EPOCH: u8 = 4;
+const CFG_ASSIGN_REPLICA: u8 = 5;
 
 // ---------------------------------------------------------------------------
 // Encoding.
@@ -176,6 +177,16 @@ fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
         ConfigCmd::SetConfigEpoch(epoch) => {
             out.push(CFG_SET_CONFIG_EPOCH);
             put_u64(out, *epoch);
+        }
+        ConfigCmd::AssignReplica { node, slots } => {
+            // Same shape as AssignSlots (node string + length-prefixed slot list); a distinct
+            // discriminant keeps the two unambiguous on the wire.
+            out.push(CFG_ASSIGN_REPLICA);
+            put_str(out, node);
+            put_u64(out, slots.len() as u64);
+            for slot in slots {
+                put_u16(out, *slot);
+            }
         }
     }
 }
@@ -374,6 +385,15 @@ fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
             Some(ConfigCmd::AssignSlots { node, slots })
         }
         CFG_SET_CONFIG_EPOCH => Some(ConfigCmd::SetConfigEpoch(cur.u64()?)),
+        CFG_ASSIGN_REPLICA => {
+            let node = cur.string()?;
+            let count = usize::try_from(cur.u64()?).ok()?;
+            let mut slots = Vec::with_capacity(count.min(16384));
+            for _ in 0..count {
+                slots.push(cur.u16()?);
+            }
+            Some(ConfigCmd::AssignReplica { node, slots })
+        }
         _ => None,
     }
 }

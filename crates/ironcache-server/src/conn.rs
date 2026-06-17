@@ -76,6 +76,13 @@ pub struct ConnState {
     /// for PR 91b; always empty this pass. Designed in now so [`Self::is_subscriber`] and the
     /// disconnect cleanup already account for patterns without reshaping the struct.
     pub sub_patterns: HashSet<Bytes>,
+    /// The per-connection CLUSTER read-only bit (REPLICA_READ.md #147, HA-7d). `false` (read
+    /// -write) by default; `READONLY` sets it, `READWRITE` clears it. On a REPLICA node, a keyed
+    /// READ for a slot this node replicates is served LOCALLY only when this bit is set; otherwise
+    /// (or for any WRITE) the replica returns `-MOVED` to the slot owner. The bit is independent of
+    /// node role, so on a non-replica / standalone node it is harmless (the routing only consults
+    /// it on the cold replica-read path). RESET clears it back to read-write (Redis parity).
+    pub readonly: bool,
 }
 
 impl ConnState {
@@ -107,6 +114,9 @@ impl ConnState {
             watch: Vec::new(),
             sub_channels: HashSet::new(),
             sub_patterns: HashSet::new(),
+            // Read-write by default (the strong-read behavior unmodified clients expect); a client
+            // opts into replica reads with READONLY (REPLICA_READ.md #147).
+            readonly: false,
         }
     }
 
@@ -126,6 +136,8 @@ impl ConnState {
         // connection leave subscribe mode, the same split as the disconnect-cleanup path.
         self.sub_channels.clear();
         self.sub_patterns.clear();
+        // RESET clears the CLUSTER read-only bit back to read-write (Redis parity).
+        self.readonly = false;
         // should_close intentionally not touched by RESET.
     }
 

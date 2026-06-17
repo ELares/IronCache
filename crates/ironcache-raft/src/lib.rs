@@ -192,6 +192,21 @@ pub enum ConfigCmd {
     /// on a fresh, alone node). Used to pin a starting epoch; ordinary ownership
     /// changes advance the epoch via `SlotMap::bump_epoch` instead.
     SetConfigEpoch(u64),
+    /// Assign `node` as a REPLICA of every slot in `slots` (HA-7d; drives
+    /// `SlotMap::set_slot_replica` per slot). This is the COMMITTED-log analog of "this
+    /// node now replicates these slots from their primary": once committed, every node's
+    /// config state machine records `node` in the slot's replica set (a NEW parallel
+    /// structure, NOT the hot `owns()` bitmap), and the named node, seeing itself in a
+    /// committed replica assignment, attaches its shards to the slot OWNER's primary
+    /// (full-sync + tail) and serves READONLY reads. The named node MUST already be known
+    /// (a prior committed [`ConfigCmd::AddNode`]); the committed-log order guarantees that.
+    /// Advances the config epoch ONCE on apply (like [`ConfigCmd::AssignSlots`]).
+    AssignReplica {
+        /// The id of the node that should REPLICATE every slot in `slots`.
+        node: String,
+        /// The slots `node` should replicate, applied in order.
+        slots: Vec<u16>,
+    },
 }
 
 /// One entry in a node's replicated log.
@@ -3054,6 +3069,13 @@ mod tests {
                 ConfigCmd::AssignSlots { node, slots } => {
                     for &slot in slots {
                         let _ = self.map.set_slot_node(slot, node);
+                    }
+                }
+                ConfigCmd::AssignReplica { node, slots } => {
+                    // HA-7d: record `node` as the slot's replica in the parallel structure
+                    // (deterministic across nodes, like the owner assignment above).
+                    for &slot in slots {
+                        let _ = self.map.set_slot_replica(slot, node);
                     }
                 }
                 ConfigCmd::SetConfigEpoch(_epoch) => {

@@ -129,6 +129,26 @@ pub fn bind_reuseport(addr: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::from_std(bind_reuseport_std(addr)?)
 }
 
+/// Bind a tokio TCP listener EXCLUSIVELY (plain `bind`, NO `SO_REUSEPORT`), so a second
+/// binder of the same address FAILS with `EADDRINUSE` instead of silently SHARING the port
+/// and having the kernel load-balance traffic across both sockets.
+///
+/// This is the right primitive for a SINGLE per-node listener that must NOT alias any other
+/// service's port (HA-7d's replication listener): with `SO_REUSEPORT` two listeners on the
+/// same address co-exist and the kernel splits incoming connections between them, so a repl
+/// listener that happened to land on another service's port (e.g. the Raft cluster-bus port
+/// of an adjacent ephemeral test port) would STEAL half that service's traffic. A plain
+/// exclusive bind turns such a collision into a clean, observable bind error the caller can
+/// log and degrade on, never a silent cross-wiring. MUST be called inside a tokio runtime.
+pub fn bind_exclusive(addr: SocketAddr) -> io::Result<TcpListener> {
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    // tokio's `from_std` requires a NONBLOCKING listener (a blocking one would stall the reactor);
+    // `std::net::TcpListener::bind` returns a blocking socket, so flip it here (the reuseport
+    // helper sets this via socket2; we must do the same for the plain path).
+    std_listener.set_nonblocking(true)?;
+    TcpListener::from_std(std_listener)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

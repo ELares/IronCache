@@ -171,6 +171,8 @@ pub(crate) mod tests {
             b"SELECT",
             b"QUIT",
             b"RESET",
+            b"READONLY",
+            b"READWRITE",
             b"CLIENT",
             b"COMMAND",
             b"INFO",
@@ -459,20 +461,20 @@ pub(crate) mod tests {
     }
 
     /// SAFETY-NET COUNT GUARD: the single hand-list [`dispatch_arm_names`] still has the
-    /// canonical 149-command CLIENT surface (PR-1..PR-11 + the 6 txn control verbs + CLUSTER,
-    /// CLUSTER_CONTRACT.md #70 slice 1) PLUS the 3 INTERNAL cross-shard verbs
-    /// (`__ICSTORESET` + `__ICSTOREZSET` + `__ICSTOREHLL`, COORDINATOR.md #107 Stage 2b --
-    /// real dispatch arms + registry entries, but client-unreachable), so 152 dispatch arms
-    /// total. This asserts a COUNT only (not values -- the value-level cover is the
-    /// set-equality in `table_covers_every_dispatch_arm`), so it is NOT a second source of
-    /// truth. A drift here flags that a dispatch arm was added or removed; update the
-    /// registry + the hand-list.
+    /// canonical 151-command CLIENT surface (PR-1..PR-11 + the 6 txn control verbs + CLUSTER,
+    /// CLUSTER_CONTRACT.md #70 slice 1, + READONLY/READWRITE, REPLICA_READ.md #147 HA-7d) PLUS
+    /// the 3 INTERNAL cross-shard verbs (`__ICSTORESET` + `__ICSTOREZSET` + `__ICSTOREHLL`,
+    /// COORDINATOR.md #107 Stage 2b -- real dispatch arms + registry entries, but
+    /// client-unreachable), so 154 dispatch arms total. This asserts a COUNT only (not values --
+    /// the value-level cover is the set-equality in `table_covers_every_dispatch_arm`), so it is
+    /// NOT a second source of truth. A drift here flags that a dispatch arm was added or removed;
+    /// update the registry + the hand-list.
     #[test]
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            152,
-            "the dispatch-arm hand-list drifted from the 149 client commands + 3 internal verbs"
+            154,
+            "the dispatch-arm hand-list drifted from the 151 client commands + 3 internal verbs"
         );
     }
 

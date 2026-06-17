@@ -150,6 +150,22 @@ pub async fn run_drain_loop(mut rx: mpsc::Receiver<ShardWork>, ctx: ServerContex
         ctx.info.maxmemory_policy,
         crate::serve::scan_reserved_bits(ctx.shards),
     );
+    // HA-7d LIVE replica attach: ONLY in raft-governance mode (`ctx.raft.is_some()`). The
+    // DEFAULT static path and the raft-control-plane-WITHOUT-replicas path are byte-unchanged:
+    // this is the SOLE invocation of `replica_attach`, gated here, and it does no work until an
+    // `AssignReplica` naming this node is committed into `ctx.cluster`. It installs this shard's
+    // primary repl observer + listener and spawns the replica control task on the shard's
+    // LocalSet (the drain loop runs there), exactly the executor `spawn_on_shard` needs. It is
+    // idempotent per shard (guarded), so a connection arriving before the drain loop's first
+    // poll calling it again is harmless. The store handle is the SAME `Rc` the serve loop holds.
+    if ctx.raft.is_some() {
+        let store_rc = crate::serve::shard_store(
+            ctx.databases,
+            ctx.info.maxmemory_policy,
+            crate::serve::scan_reserved_bits(ctx.shards),
+        );
+        crate::replica_attach::spawn_on_shard(&ctx, store_rc, ctx.boot.bind, ctx.info.tcp_port);
+    }
     while let Some(work) = rx.recv().await {
         // run_remote borrows + releases the shard thread-locals ENTIRELY within this
         // synchronous call; nothing is borrowed when we loop back to `recv().await`.

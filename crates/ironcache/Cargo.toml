@@ -49,6 +49,12 @@ ironcache-cluster = { workspace = true }
 # types the boot wiring names; `ironcache-raft-net` the adapter + FileStorage + ConfigSm + handle.
 ironcache-raft = { workspace = true }
 ironcache-raft-net = { workspace = true }
+# The replication data plane (HA-7). In raft-governance mode a node that becomes a committed
+# REPLICA of some slots attaches its shard to the slot OWNER's primary: it installs a
+# ReplObserver on its store + serves replica connections (the primary side), and dials the
+# owner to full-sync + tail (the replica side). The DEFAULT static path never reaches this
+# module, so the dependency adds no cost there. Mirrors the `ironcache-cluster` leaf line.
+ironcache-repl = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }

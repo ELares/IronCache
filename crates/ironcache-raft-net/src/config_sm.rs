@@ -117,6 +117,16 @@ impl StateMachine for ConfigSm {
                     let _ = self.map.set_slot_node(slot, node);
                 }
             }
+            ConfigCmd::AssignReplica { node, slots } => {
+                // HA-7d: record `node` as the replica of each slot in the NEW parallel structure
+                // (set_slot_replica), NOT the owner bitmap. Deterministic across nodes (same map
+                // state + same command), so swallowing the unknown-node error keeps every node's
+                // apply identical; the leader proposes AddNode{node} before this, so the committed
+                // order never produces a spurious error.
+                for &slot in slots {
+                    let _ = self.map.set_slot_replica(slot, node);
+                }
+            }
             ConfigCmd::SetConfigEpoch(_epoch) => {
                 // The Raft-driven config epoch is the log-driven counter above; the SlotMap's
                 // own (Redis-client) epoch is not used for the linearizable-ownership property.
@@ -254,5 +264,110 @@ mod tests {
         assert!(map0.owns(0) && map0.owns(5) && map0.owns(100));
         assert!(map1.owns(1) && map1.owns(2) && map1.owns(3));
         assert!(!map0.owns(1) && !map1.owns(0));
+    }
+
+    /// HA-7d: a committed AssignReplica records the named node as the slot's REPLICA in the
+    /// parallel structure (NOT the owner bitmap, so owns() is unchanged), bumps the log-driven
+    /// epoch once, and is idempotent on re-apply.
+    #[test]
+    fn assign_replica_populates_replicas_bumps_epoch_and_is_idempotent() {
+        let map = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let mut sm = ConfigSm::new(Arc::clone(&map));
+        // ID0 owns [0,1]; ID1 (a known peer) replicates them.
+        sm.apply(&config_entry(
+            1,
+            ConfigCmd::AddNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7001,
+            },
+        ));
+        sm.apply(&config_entry(
+            2,
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![0, 1],
+            },
+        ));
+        let epoch_before = sm.config_epoch();
+        sm.apply(&config_entry(
+            3,
+            ConfigCmd::AssignReplica {
+                node: ID1.to_owned(),
+                slots: vec![0, 1],
+            },
+        ));
+        // The replica is recorded; ownership (owns()) is untouched.
+        assert!(map.is_replica_of(0, ID1) && map.is_replica_of(1, ID1));
+        assert!(
+            map.owns(0) && map.owns(1),
+            "AssignReplica must not change owns()"
+        );
+        assert!(
+            !map.is_replica_of(0, ID0),
+            "the owner is not recorded as a replica"
+        );
+        // Exactly one epoch bump for the one AssignReplica entry.
+        assert_eq!(sm.config_epoch(), epoch_before + 1);
+        assert_eq!(map.current_epoch(), sm.config_epoch());
+
+        // Idempotent re-apply: same replica, same epoch +1 per entry (deterministic), no change to
+        // the projection beyond the bump.
+        sm.apply(&config_entry(
+            4,
+            ConfigCmd::AssignReplica {
+                node: ID1.to_owned(),
+                slots: vec![0, 1],
+            },
+        ));
+        assert!(map.is_replica_of(0, ID1) && map.is_replica_of(1, ID1));
+        assert_eq!(sm.config_epoch(), epoch_before + 2);
+    }
+
+    /// HA-7d: two independent ConfigSms fed the IDENTICAL committed sequence (including an
+    /// AssignReplica) converge to the same (owner, replica) projection on both nodes -- the
+    /// linearizable-ownership property extended to the replica leg.
+    #[test]
+    fn assign_replica_converges_two_nodes() {
+        let seq = [
+            ConfigCmd::AddNode {
+                id: ID0.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7000,
+            },
+            ConfigCmd::AddNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7001,
+            },
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![0, 5, 100],
+            },
+            ConfigCmd::AssignReplica {
+                node: ID1.to_owned(),
+                slots: vec![0, 5, 100],
+            },
+        ];
+        let map0 = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let map1 = Arc::new(SlotMap::empty_self(ID1, "127.0.0.1", 7001));
+        let mut sm0 = ConfigSm::new(Arc::clone(&map0));
+        let mut sm1 = ConfigSm::new(Arc::clone(&map1));
+        for (i, cmd) in seq.iter().enumerate() {
+            let idx = i as u64 + 1;
+            sm0.apply(&config_entry(idx, cmd.clone()));
+            sm1.apply(&config_entry(idx, cmd.clone()));
+        }
+        assert_eq!(map0.current_epoch(), map1.current_epoch());
+        // Both nodes agree: ID0 owns the slots, ID1 replicates them (the id-based projection is
+        // index-independent, so it converges regardless of per-node table order).
+        for slot in [0u16, 5, 100] {
+            assert!(map0.owns(slot), "node0 view: ID0 owns {slot}");
+            assert!(!map1.owns(slot), "node1 view: ID0 (not self) owns {slot}");
+            assert!(
+                map0.is_replica_of(slot, ID1) && map1.is_replica_of(slot, ID1),
+                "both nodes agree ID1 replicates slot {slot}"
+            );
+        }
     }
 }

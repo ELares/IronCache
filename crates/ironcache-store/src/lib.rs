@@ -311,6 +311,14 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// (kept in lockstep with `repl_observer.is_some()`), so the funnel can branch on a
     /// plain bool with no `Option` probe on the non-observing hot path.
     repl_active: bool,
+    /// PASSIVE-REPLICA mode (HA-7d, CARRY-FORWARD 2): when `true`, this shard is a replica
+    /// that mirrors a primary, so it removes keys ONLY from the replication stream (the
+    /// primary's `StreamDel`), never on its own. A due key is reported as logically expired
+    /// (absent) on read but is NOT physically removed, matching real-Redis replica semantics:
+    /// physical removal waits for the master's DEL, so the replica stays in lockstep with the
+    /// primary and does not pre-empt the primary's expiry or double-count `expired_keys`.
+    /// Default `false`; the only mutator is [`Self::set_passive`].
+    passive: bool,
 }
 
 /// The data-plane WRITE OBSERVER (HA-5a): a background sink the per-shard store calls on
@@ -484,6 +492,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // observer later via `set_write_observer`.
             repl_observer: None,
             repl_active: false,
+            passive: false,
         }
     }
 
@@ -701,6 +710,16 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             .and_then(|t| t.find(h, |e| e.key() == key))
             .is_some_and(|o| o.is_expired(now));
         if due {
+            // PASSIVE REPLICA (HA-7d, CARRY-FORWARD 2): a replica reports a due key as
+            // logically expired (absent) but does NOT physically remove it. Removal comes
+            // ONLY from the replication stream (the primary's StreamDel), so the replica
+            // never pre-empts the primary's own expiry, never double-counts `expired_keys`,
+            // and never fires on_remove/account_sub for an expiry the primary owns. A
+            // re-SET on the primary before its reaper fires arrives as a StreamPut and
+            // overwrites the still-resident entry; the eventual StreamDel removes it.
+            if self.passive {
+                return false;
+            }
             // Route the removal through the WRITE FUNNEL (`remove_object`): it fires
             // on_remove + account_sub AND `touch_watch`, so a watched key that lazily
             // expires between WATCH and EXEC is dirtied (the lazy-expiry dirty signal).
@@ -2225,6 +2244,21 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     #[must_use]
     pub fn write_observer_active(&self) -> bool {
         self.repl_active
+    }
+
+    /// Mark this shard a PASSIVE REPLICA (HA-7d, CARRY-FORWARD 2) or clear it. When passive,
+    /// the shard removes keys ONLY from the replication stream: a due key is reported absent
+    /// on read but not physically removed (see [`Self::expire_if_due`]). The caller (the
+    /// replica-attach path) sets this `true` right after swapping in the full-synced store,
+    /// and the active-expiry/eviction reapers are never invoked on it. Default `false`.
+    pub fn set_passive(&mut self, passive: bool) {
+        self.passive = passive;
+    }
+
+    /// Whether this shard is a passive replica (removal only via the replication stream).
+    #[must_use]
+    pub fn is_passive(&self) -> bool {
+        self.passive
     }
 
     /// Insert a fully-formed [`KvObj`] under `db`, bypassing the string-only

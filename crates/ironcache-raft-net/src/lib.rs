@@ -865,6 +865,23 @@ mod tests {
                 index: 12,
                 payload: EntryPayload::Config(ConfigCmd::SetConfigEpoch(u64::MAX)),
             },
+            LogEntry {
+                term: 8,
+                index: 13,
+                payload: EntryPayload::Config(ConfigCmd::AssignReplica {
+                    node: "6666666666666666666666666666666666666666".to_owned(),
+                    slots: vec![0, 1, 2, 100, 8191, 8192, 16_383],
+                }),
+            },
+            LogEntry {
+                term: 8,
+                index: 14,
+                payload: EntryPayload::Config(ConfigCmd::AssignReplica {
+                    // An empty replica slot list is a valid (if degenerate) batch.
+                    node: "7777777777777777777777777777777777777777".to_owned(),
+                    slots: vec![],
+                }),
+            },
         ]
     }
 

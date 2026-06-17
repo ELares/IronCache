@@ -178,6 +178,23 @@ pub struct CommandSpec {
     /// (MULTI/EXEC/DISCARD/RESET/QUIT/WATCH); these fall through to their dispatch arms
     /// instead of being staged.
     pub control: bool,
+    /// `true` iff this command MUTATES the keyspace (HA-7d replica-read gate, REPLICA_READ.md
+    /// #147). A REPLICA serves a keyed command locally (under the connection READONLY bit) ONLY
+    /// when `is_write == false`; a write (`is_write == true`) always returns `-MOVED` to the slot
+    /// owner, never a stale local mutation. CONSERVATIVE: an unknown command (no registry entry)
+    /// is treated as a write by [`is_write`], so a replica never serves an unrecognized command
+    /// locally. This flag is consulted ONLY on the cold cluster-redirect path; it does not touch
+    /// the hot owns() routing.
+    pub is_write: bool,
+}
+
+/// Whether `cmd_upper` (UPPERCASE token) MUTATES the keyspace (HA-7d replica-read gate). A thin
+/// wrapper over the registry's [`CommandSpec::is_write`]; an UNKNOWN command (no registry entry)
+/// is conservatively treated as a write (`true`), so the replica-read router never serves an
+/// unrecognized command locally on a replica. Pure function of the bytes (no I/O, no state).
+#[must_use]
+pub fn is_write(cmd_upper: &[u8]) -> bool {
+    spec_of(cmd_upper).is_none_or(|s| s.is_write)
 }
 
 /// Extract the routing KEY(s) of a command from `req` per its [`KeySpecKind`]
@@ -325,6 +342,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ECHO" => &CommandSpec {
             name: b"ECHO",
@@ -333,6 +351,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HELLO" => &CommandSpec {
             name: b"HELLO",
@@ -341,6 +360,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"AUTH" => &CommandSpec {
             name: b"AUTH",
@@ -349,6 +369,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SELECT" => &CommandSpec {
             name: b"SELECT",
@@ -357,6 +378,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // QUIT's command-table arity is -1 (Min(1)) in src/commands.def, not Exact(1).
         b"QUIT" => &CommandSpec {
@@ -366,6 +388,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: true,
+            is_write: false,
         },
         b"RESET" => &CommandSpec {
             name: b"RESET",
@@ -374,6 +397,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: true,
+            is_write: false,
         },
         b"CLIENT" => &CommandSpec {
             name: b"CLIENT",
@@ -382,6 +406,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"COMMAND" => &CommandSpec {
             name: b"COMMAND",
@@ -390,6 +415,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"INFO" => &CommandSpec {
             name: b"INFO",
@@ -398,6 +424,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"CONFIG" => &CommandSpec {
             name: b"CONFIG",
@@ -406,6 +433,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // CLUSTER (CLUSTER_CONTRACT.md #70, slice 1): the read-only/introspection CLUSTER
         // surface. Like CONFIG it is an admin container command: AlwaysHome (never
@@ -419,6 +447,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // -- Transaction control (cmd_txn / dispatch). The 6 control verbs (control: true)
         // bypass MULTI queueing; WATCH/UNWATCH arities are -2 / 1 (src/commands.def). --
@@ -429,6 +458,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: true,
+            is_write: false,
         },
         b"EXEC" => &CommandSpec {
             name: b"EXEC",
@@ -437,6 +467,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: true,
+            is_write: false,
         },
         b"DISCARD" => &CommandSpec {
             name: b"DISCARD",
@@ -445,6 +476,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: true,
+            is_write: false,
         },
         b"WATCH" => &CommandSpec {
             name: b"WATCH",
@@ -453,6 +485,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: true,
+            is_write: false,
         },
         b"UNWATCH" => &CommandSpec {
             name: b"UNWATCH",
@@ -461,6 +494,27 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
+        },
+        // READONLY / READWRITE (REPLICA_READ.md #147, HA-7d): connection commands that set/clear
+        // the per-connection read-only bit. AlwaysHome (no key), arity 1, not a write.
+        b"READONLY" => &CommandSpec {
+            name: b"READONLY",
+            arity: Exact(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        b"READWRITE" => &CommandSpec {
+            name: b"READWRITE",
+            arity: Exact(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
         },
         // -- Strings (cmd_string). --
         b"GET" => &CommandSpec {
@@ -470,6 +524,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SET" => &CommandSpec {
             name: b"SET",
@@ -478,6 +533,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"SETNX" => &CommandSpec {
             name: b"SETNX",
@@ -486,6 +542,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"GETSET" => &CommandSpec {
             name: b"GETSET",
@@ -494,6 +551,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"STRLEN" => &CommandSpec {
             name: b"STRLEN",
@@ -502,6 +560,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"INCR" => &CommandSpec {
             name: b"INCR",
@@ -510,6 +569,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"DECR" => &CommandSpec {
             name: b"DECR",
@@ -518,6 +578,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"INCRBY" => &CommandSpec {
             name: b"INCRBY",
@@ -526,6 +587,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"DECRBY" => &CommandSpec {
             name: b"DECRBY",
@@ -534,6 +596,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"INCRBYFLOAT" => &CommandSpec {
             name: b"INCRBYFLOAT",
@@ -542,6 +605,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"APPEND" => &CommandSpec {
             name: b"APPEND",
@@ -550,6 +614,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"MGET" => &CommandSpec {
             name: b"MGET",
@@ -558,6 +623,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"MSET" => &CommandSpec {
             name: b"MSET",
@@ -566,6 +632,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: MsetStrided,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         // -- Generic keyspace (cmd_keyspace). --
         b"DEL" => &CommandSpec {
@@ -575,6 +642,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"EXISTS" => &CommandSpec {
             name: b"EXISTS",
@@ -583,6 +651,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"TYPE" => &CommandSpec {
             name: b"TYPE",
@@ -591,6 +660,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"KEYS" => &CommandSpec {
             name: b"KEYS",
@@ -599,6 +669,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SCAN" => &CommandSpec {
             name: b"SCAN",
@@ -607,6 +678,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"DBSIZE" => &CommandSpec {
             name: b"DBSIZE",
@@ -615,6 +687,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"RANDOMKEY" => &CommandSpec {
             name: b"RANDOMKEY",
@@ -623,6 +696,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"RENAME" => &CommandSpec {
             name: b"RENAME",
@@ -631,6 +705,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: TwoKeysArg1Arg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"RENAMENX" => &CommandSpec {
             name: b"RENAMENX",
@@ -639,6 +714,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: TwoKeysArg1Arg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"COPY" => &CommandSpec {
             name: b"COPY",
@@ -647,6 +723,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: TwoKeysArg1Arg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         // MOVE has exactly ONE key (args[1]); args[2] is the destination DB index, NOT a
         // key -- so its key_spec is Arg1, and it is NOT denyoom (Redis flags it write-fast).
@@ -657,6 +734,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"SWAPDB" => &CommandSpec {
             name: b"SWAPDB",
@@ -665,6 +743,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"TOUCH" => &CommandSpec {
             name: b"TOUCH",
@@ -673,6 +752,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"UNLINK" => &CommandSpec {
             name: b"UNLINK",
@@ -681,6 +761,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"FLUSHDB" => &CommandSpec {
             name: b"FLUSHDB",
@@ -689,6 +770,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"FLUSHALL" => &CommandSpec {
             name: b"FLUSHALL",
@@ -697,6 +779,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         // -- TTL / EXPIRE family (cmd_expire). --
         b"EXPIRE" => &CommandSpec {
@@ -706,6 +789,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"PEXPIRE" => &CommandSpec {
             name: b"PEXPIRE",
@@ -714,6 +798,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"EXPIREAT" => &CommandSpec {
             name: b"EXPIREAT",
@@ -722,6 +807,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"PEXPIREAT" => &CommandSpec {
             name: b"PEXPIREAT",
@@ -730,6 +816,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"TTL" => &CommandSpec {
             name: b"TTL",
@@ -738,6 +825,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"PTTL" => &CommandSpec {
             name: b"PTTL",
@@ -746,6 +834,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"EXPIRETIME" => &CommandSpec {
             name: b"EXPIRETIME",
@@ -754,6 +843,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"PEXPIRETIME" => &CommandSpec {
             name: b"PEXPIRETIME",
@@ -762,6 +852,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"PERSIST" => &CommandSpec {
             name: b"PERSIST",
@@ -770,6 +861,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"GETEX" => &CommandSpec {
             name: b"GETEX",
@@ -778,6 +870,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"SETEX" => &CommandSpec {
             name: b"SETEX",
@@ -786,6 +879,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"PSETEX" => &CommandSpec {
             name: b"PSETEX",
@@ -794,6 +888,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         // -- Lists (cmd_list). --
         b"LPUSH" => &CommandSpec {
@@ -803,6 +898,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"RPUSH" => &CommandSpec {
             name: b"RPUSH",
@@ -811,6 +907,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"LPUSHX" => &CommandSpec {
             name: b"LPUSHX",
@@ -819,6 +916,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"RPUSHX" => &CommandSpec {
             name: b"RPUSHX",
@@ -827,6 +925,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"LPOP" => &CommandSpec {
             name: b"LPOP",
@@ -835,6 +934,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"RPOP" => &CommandSpec {
             name: b"RPOP",
@@ -843,6 +943,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"LLEN" => &CommandSpec {
             name: b"LLEN",
@@ -851,6 +952,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"LRANGE" => &CommandSpec {
             name: b"LRANGE",
@@ -859,6 +961,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"LINDEX" => &CommandSpec {
             name: b"LINDEX",
@@ -867,6 +970,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"LSET" => &CommandSpec {
             name: b"LSET",
@@ -875,6 +979,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"LINSERT" => &CommandSpec {
             name: b"LINSERT",
@@ -883,6 +988,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"LREM" => &CommandSpec {
             name: b"LREM",
@@ -891,6 +997,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"LTRIM" => &CommandSpec {
             name: b"LTRIM",
@@ -899,6 +1006,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"LMOVE" => &CommandSpec {
             name: b"LMOVE",
@@ -907,6 +1015,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: TwoKeysArg1Arg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"RPOPLPUSH" => &CommandSpec {
             name: b"RPOPLPUSH",
@@ -915,6 +1024,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: TwoKeysArg1Arg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"LPOS" => &CommandSpec {
             name: b"LPOS",
@@ -923,6 +1033,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // -- Hashes (cmd_hash). --
         b"HSET" => &CommandSpec {
@@ -932,6 +1043,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"HMSET" => &CommandSpec {
             name: b"HMSET",
@@ -940,6 +1052,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"HSETNX" => &CommandSpec {
             name: b"HSETNX",
@@ -948,6 +1061,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"HGET" => &CommandSpec {
             name: b"HGET",
@@ -956,6 +1070,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HMGET" => &CommandSpec {
             name: b"HMGET",
@@ -964,6 +1079,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HDEL" => &CommandSpec {
             name: b"HDEL",
@@ -972,6 +1088,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"HGETALL" => &CommandSpec {
             name: b"HGETALL",
@@ -980,6 +1097,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HKEYS" => &CommandSpec {
             name: b"HKEYS",
@@ -988,6 +1106,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HVALS" => &CommandSpec {
             name: b"HVALS",
@@ -996,6 +1115,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HLEN" => &CommandSpec {
             name: b"HLEN",
@@ -1004,6 +1124,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HEXISTS" => &CommandSpec {
             name: b"HEXISTS",
@@ -1012,6 +1133,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HSTRLEN" => &CommandSpec {
             name: b"HSTRLEN",
@@ -1020,6 +1142,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HINCRBY" => &CommandSpec {
             name: b"HINCRBY",
@@ -1028,6 +1151,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"HINCRBYFLOAT" => &CommandSpec {
             name: b"HINCRBYFLOAT",
@@ -1036,6 +1160,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"HRANDFIELD" => &CommandSpec {
             name: b"HRANDFIELD",
@@ -1044,6 +1169,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"HSCAN" => &CommandSpec {
             name: b"HSCAN",
@@ -1052,6 +1178,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // -- Sets (cmd_set). --
         b"SADD" => &CommandSpec {
@@ -1061,6 +1188,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"SREM" => &CommandSpec {
             name: b"SREM",
@@ -1069,6 +1197,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"SMEMBERS" => &CommandSpec {
             name: b"SMEMBERS",
@@ -1077,6 +1206,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SISMEMBER" => &CommandSpec {
             name: b"SISMEMBER",
@@ -1085,6 +1215,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SMISMEMBER" => &CommandSpec {
             name: b"SMISMEMBER",
@@ -1093,6 +1224,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SCARD" => &CommandSpec {
             name: b"SCARD",
@@ -1101,6 +1233,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SPOP" => &CommandSpec {
             name: b"SPOP",
@@ -1109,6 +1242,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"SRANDMEMBER" => &CommandSpec {
             name: b"SRANDMEMBER",
@@ -1117,6 +1251,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SMOVE" => &CommandSpec {
             name: b"SMOVE",
@@ -1125,6 +1260,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: TwoKeysArg1Arg2,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"SINTER" => &CommandSpec {
             name: b"SINTER",
@@ -1133,6 +1269,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SUNION" => &CommandSpec {
             name: b"SUNION",
@@ -1141,6 +1278,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SDIFF" => &CommandSpec {
             name: b"SDIFF",
@@ -1149,6 +1287,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SINTERCARD" => &CommandSpec {
             name: b"SINTERCARD",
@@ -1157,6 +1296,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: NumkeysAtArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"SINTERSTORE" => &CommandSpec {
             name: b"SINTERSTORE",
@@ -1165,6 +1305,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"SUNIONSTORE" => &CommandSpec {
             name: b"SUNIONSTORE",
@@ -1173,6 +1314,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"SDIFFSTORE" => &CommandSpec {
             name: b"SDIFFSTORE",
@@ -1181,6 +1323,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"SSCAN" => &CommandSpec {
             name: b"SSCAN",
@@ -1189,6 +1332,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // -- Sorted sets (cmd_zset). --
         b"ZADD" => &CommandSpec {
@@ -1198,6 +1342,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"ZINCRBY" => &CommandSpec {
             name: b"ZINCRBY",
@@ -1206,6 +1351,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"ZREM" => &CommandSpec {
             name: b"ZREM",
@@ -1214,6 +1360,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"ZSCORE" => &CommandSpec {
             name: b"ZSCORE",
@@ -1222,6 +1369,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZMSCORE" => &CommandSpec {
             name: b"ZMSCORE",
@@ -1230,6 +1378,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZCARD" => &CommandSpec {
             name: b"ZCARD",
@@ -1238,6 +1387,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZRANK" => &CommandSpec {
             name: b"ZRANK",
@@ -1246,6 +1396,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZREVRANK" => &CommandSpec {
             name: b"ZREVRANK",
@@ -1254,6 +1405,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZCOUNT" => &CommandSpec {
             name: b"ZCOUNT",
@@ -1262,6 +1414,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZLEXCOUNT" => &CommandSpec {
             name: b"ZLEXCOUNT",
@@ -1270,6 +1423,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZRANGE" => &CommandSpec {
             name: b"ZRANGE",
@@ -1278,6 +1432,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZREVRANGE" => &CommandSpec {
             name: b"ZREVRANGE",
@@ -1286,6 +1441,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZRANGEBYSCORE" => &CommandSpec {
             name: b"ZRANGEBYSCORE",
@@ -1294,6 +1450,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZREVRANGEBYSCORE" => &CommandSpec {
             name: b"ZREVRANGEBYSCORE",
@@ -1302,6 +1459,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZRANGEBYLEX" => &CommandSpec {
             name: b"ZRANGEBYLEX",
@@ -1310,6 +1468,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZREVRANGEBYLEX" => &CommandSpec {
             name: b"ZREVRANGEBYLEX",
@@ -1318,6 +1477,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZREMRANGEBYRANK" => &CommandSpec {
             name: b"ZREMRANGEBYRANK",
@@ -1326,6 +1486,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"ZREMRANGEBYSCORE" => &CommandSpec {
             name: b"ZREMRANGEBYSCORE",
@@ -1334,6 +1495,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"ZREMRANGEBYLEX" => &CommandSpec {
             name: b"ZREMRANGEBYLEX",
@@ -1342,6 +1504,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"ZPOPMIN" => &CommandSpec {
             name: b"ZPOPMIN",
@@ -1350,6 +1513,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"ZPOPMAX" => &CommandSpec {
             name: b"ZPOPMAX",
@@ -1358,6 +1522,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         b"ZRANDMEMBER" => &CommandSpec {
             name: b"ZRANDMEMBER",
@@ -1366,6 +1531,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZSCAN" => &CommandSpec {
             name: b"ZSCAN",
@@ -1374,6 +1540,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZRANGESTORE" => &CommandSpec {
             name: b"ZRANGESTORE",
@@ -1382,6 +1549,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: TwoKeysArg1Arg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"ZUNION" => &CommandSpec {
             name: b"ZUNION",
@@ -1390,6 +1558,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: NumkeysAtArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZINTER" => &CommandSpec {
             name: b"ZINTER",
@@ -1398,6 +1567,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: NumkeysAtArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZDIFF" => &CommandSpec {
             name: b"ZDIFF",
@@ -1406,6 +1576,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: NumkeysAtArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"ZUNIONSTORE" => &CommandSpec {
             name: b"ZUNIONSTORE",
@@ -1414,6 +1585,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: ZstoreDestNumkeysAtArg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"ZINTERSTORE" => &CommandSpec {
             name: b"ZINTERSTORE",
@@ -1422,6 +1594,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: ZstoreDestNumkeysAtArg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"ZDIFFSTORE" => &CommandSpec {
             name: b"ZDIFFSTORE",
@@ -1430,6 +1603,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: ZstoreDestNumkeysAtArg2,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"ZINTERCARD" => &CommandSpec {
             name: b"ZINTERCARD",
@@ -1438,6 +1612,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: NumkeysAtArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // -- Bitmaps (cmd_bitmap). --
         b"SETBIT" => &CommandSpec {
@@ -1447,6 +1622,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"GETBIT" => &CommandSpec {
             name: b"GETBIT",
@@ -1455,6 +1631,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"BITCOUNT" => &CommandSpec {
             name: b"BITCOUNT",
@@ -1463,6 +1640,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"BITPOS" => &CommandSpec {
             name: b"BITPOS",
@@ -1471,6 +1649,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"BITOP" => &CommandSpec {
             name: b"BITOP",
@@ -1479,6 +1658,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: BitopDestArg2SourcesFrom3,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"BITFIELD" => &CommandSpec {
             name: b"BITFIELD",
@@ -1487,6 +1667,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"BITFIELD_RO" => &CommandSpec {
             name: b"BITFIELD_RO",
@@ -1495,6 +1676,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // -- HyperLogLog (cmd_hll). All three are Redis arity -2 (Min(2)). --
         b"PFADD" => &CommandSpec {
@@ -1504,6 +1686,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         b"PFCOUNT" => &CommandSpec {
             name: b"PFCOUNT",
@@ -1512,6 +1695,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"PFMERGE" => &CommandSpec {
             name: b"PFMERGE",
@@ -1520,6 +1704,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: AllFromArg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         // -- Introspection (cmd_introspect). --
         b"OBJECT" => &CommandSpec {
@@ -1529,6 +1714,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: ObjectArg2,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // -- INTERNAL cross-shard verb (cmd_set::cmd_icstoreset), COORDINATOR.md #107 Stage
         // 2b. `__ICSTORESET dest m...` writes a spanning set-*STORE result to the dest owner
@@ -1544,6 +1730,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         // -- INTERNAL cross-shard verb (cmd_zset::cmd_icstorezset), COORDINATOR.md #107 Stage
         // 2b-2. `__ICSTOREZSET dest m1 s1 ...` writes a spanning zset *STORE / ZRANGESTORE
@@ -1560,6 +1747,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         // -- INTERNAL cross-shard verb (cmd_hll::cmd_icstorehll), COORDINATOR.md #107 Stage
         // 2b-3. `__ICSTOREHLL dest <dense-hll-bytes>` writes a spanning-PFMERGE merged HLL to
@@ -1576,6 +1764,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: true,
             control: false,
+            is_write: true,
         },
         // -- Pub/Sub (SERVER_PUSH.md #20, PR 91a; handled in the SERVE layer, NOT
         // `dispatch_inner`). SUBSCRIBE/UNSUBSCRIBE/PUBLISH are AlwaysHome (no routable key:
@@ -1592,6 +1781,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"UNSUBSCRIBE" => &CommandSpec {
             name: b"UNSUBSCRIBE",
@@ -1600,6 +1790,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         // -- Pattern Pub/Sub + introspection (SERVER_PUSH.md #20, PR 91b; also SERVE-layer
         // routed, NOT `dispatch_inner`). PSUBSCRIBE (arity Min 2) / PUNSUBSCRIBE (arity Min 1,
@@ -1615,6 +1806,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"PUNSUBSCRIBE" => &CommandSpec {
             name: b"PUNSUBSCRIBE",
@@ -1623,6 +1815,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"PUBSUB" => &CommandSpec {
             name: b"PUBSUB",
@@ -1631,6 +1824,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         b"PUBLISH" => &CommandSpec {
             name: b"PUBLISH",
@@ -1639,6 +1833,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         // -- INTERNAL cross-shard pub/sub fan-out verb (SERVER_PUSH.md #20 / COORDINATOR.md
         // #107, PR 91a). `__ICPUBLISH <channel> <payload>` delivers to a shard's LOCAL
@@ -1655,6 +1850,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: true,
         },
         // -- INTERNAL cross-shard PUBSUB-introspection gather verb (SERVER_PUSH.md #20 /
         // COORDINATOR.md #107, PR 91b). `__ICPUBSUB <subcommand> [args]` returns a shard's LOCAL
@@ -1671,6 +1867,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             key_spec: Arg1,
             denyoom: false,
             control: false,
+            is_write: false,
         },
         _ => return None,
     };
