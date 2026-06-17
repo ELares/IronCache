@@ -456,6 +456,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironcache-repl"
+version = "0.0.0"
+dependencies = [
+ "ironcache-env",
+ "ironcache-runtime",
+ "ironcache-sim",
+ "tokio",
+]
+
+[[package]]
 name = "ironcache-runtime"
 version = "0.0.0"
 dependencies = [
