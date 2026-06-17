@@ -5,8 +5,8 @@
 //!
 //! ## Two layers
 //!
-//! 1. The [`Runtime`] trait: the minimal `accept` / `recv` / `send` / `timer` /
-//!    `spawn_on_shard` surface the command core compiles against, with associated
+//! 1. The [`Runtime`] trait: the minimal `accept` / `connect` / `recv` / `send` /
+//!    `timer` / `spawn_on_shard` surface the command core compiles against, with associated
 //!    `Listener` / `Stream` / `Buf` types fixed per backend. The core is generic
 //!    over this trait so it monomorphizes with no `dyn` on the hot path
 //!    (RUNTIME_ABSTRACTION.md). PR-1 ships exactly one backend (tokio+epoll/kqueue);
@@ -86,6 +86,18 @@ pub trait Runtime {
         &self,
         listener: &Self::Listener,
     ) -> impl Future<Output = Result<(Self::Stream, SocketAddr), Self::Error>>;
+
+    /// Open an OUTBOUND connection to `addr`, returning a connected stream of the
+    /// same `Stream` type [`Runtime::accept`] yields, so `recv` / `send` operate on
+    /// it uniformly.
+    ///
+    /// This is the node-to-node counterpart of `accept`: the cluster control plane,
+    /// replication, and migration links (CONTROL_PLANE.md / REPLICATION.md /
+    /// MIGRATION.md) each need a node to act as a client to its peers, which the
+    /// inbound-only `accept` cannot provide. Like `accept`, it is real I/O on a
+    /// production backend; a deterministic-simulation `Runtime` (TESTING.md) drives
+    /// it through a virtual network for replayable multi-node tests.
+    fn connect(&self, addr: SocketAddr) -> impl Future<Output = Result<Self::Stream, Self::Error>>;
 
     /// Read from `stream` into the owned `buf`, appending to its existing
     /// contents, and return the buffer plus the byte count (0 = peer closed).
@@ -171,6 +183,45 @@ mod tests {
             let mut reply = [0u8; 7];
             client.read_exact(&mut reply).await.unwrap();
             assert_eq!(&reply, b"+PONG\r\n");
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn connect_send_recv_roundtrip() {
+        // The outbound connect() seam: a client built ENTIRELY on Runtime methods
+        // (connect + send + recv) talks to a Runtime accept loop, with no raw tokio
+        // on the client side. This is the node-to-node path the cluster control
+        // plane builds on.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let runtime = TokioRuntime::new();
+            let listener = tokio_rt::bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server = tokio::task::spawn_local(async move {
+                let (mut stream, _peer) = runtime.accept(&listener).await.unwrap();
+                let buf: Vec<u8> = Vec::with_capacity(64);
+                let res = runtime.recv(&mut stream, buf).await.unwrap();
+                assert_eq!(&res.buf[..res.n], b"PING\r\n");
+                let _ = runtime
+                    .send(&mut stream, b"+PONG\r\n".to_vec())
+                    .await
+                    .unwrap();
+            });
+
+            let client = TokioRuntime::new();
+            let mut peer = client.connect(addr).await.unwrap();
+            let _ = client.send(&mut peer, b"PING\r\n".to_vec()).await.unwrap();
+            let res = client
+                .recv(&mut peer, Vec::with_capacity(16))
+                .await
+                .unwrap();
+            assert_eq!(&res.buf[..res.n], b"+PONG\r\n");
             server.await.unwrap();
         });
     }

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-clusterbus"
+description = "Inter-node transport (HA-1): an outbound RESP peer connection over the Runtime seam, the substrate the cluster control plane, replication, and migration links build on."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ironcache-runtime = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
