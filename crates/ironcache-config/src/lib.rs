@@ -164,6 +164,36 @@ pub enum ConfigError {
     },
 }
 
+/// One node in the static cluster topology (CLUSTER_CONTRACT.md #70, slice 2). TOML-only
+/// (a nested array-of-tables); there is no env/CLI form for the structured topology.
+///
+/// `id` is the stable 40-lowercase-hex node id, `host`/`port` are the ADVERTISED endpoint
+/// clients dial (a MOVED redirect points here, NOT at the bind address, which may be
+/// `0.0.0.0`), and `slots` is the list of inclusive `[start, end]` slot ranges this node
+/// owns. Validation (gap/overlap/dup-id/bad-range/bad-id) is delegated to
+/// `ironcache_cluster::SlotMap::build` so there is one slot-assignment validator.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ClusterNode {
+    /// The stable 40-lowercase-hex node id.
+    pub id: String,
+    /// The advertised host clients dial (NOT the bind address).
+    pub host: String,
+    /// The advertised TCP port clients dial.
+    pub port: u16,
+    /// The inclusive `[start, end]` slot ranges this node owns.
+    pub slots: Vec<[u16; 2]>,
+}
+
+/// The static cluster topology: the full set of nodes and their slot assignments
+/// (CLUSTER_CONTRACT.md #70, slice 2). TOML-only (`[[cluster_topology.nodes]]`). When set
+/// (and `cluster_enabled`), it flips IronCache from the slice-1 single-node-owns-all
+/// behavior to real multi-node routing (MOVED / CROSSSLOT / multi-node projection).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct ClusterTopology {
+    /// The nodes, in declaration order.
+    pub nodes: Vec<ClusterNode>,
+}
+
 /// The fully-resolved, effective configuration the server boots from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -208,6 +238,19 @@ pub struct Config {
     /// `false`: it adds the read-only CLUSTER introspection surface without any routing
     /// change; turning this on is a later slice.
     pub cluster_enabled: bool,
+    /// The static cluster topology (CLUSTER_CONTRACT.md #70, slice 2). TOML-only. `None`
+    /// keeps the slice-1 single-node-owns-all behavior even when `cluster_enabled` (a
+    /// topology is opt-in); `Some` flips on multi-node routing (MOVED / CROSSSLOT) and the
+    /// multi-node CLUSTER projection. Validated in [`Config::validate`] via
+    /// `ironcache_cluster::SlotMap::build` when `cluster_enabled` is set.
+    pub cluster_topology: Option<ClusterTopology>,
+    /// THIS node's announce id, used to find self in [`cluster_topology`](Self::cluster_topology).
+    /// REQUIRED when a topology is set (the bind address may be `0.0.0.0`, so a node cannot
+    /// be matched to its topology entry by address; the id is explicit). TOML + the
+    /// `IRONCACHE_CLUSTER_ANNOUNCE_ID` env var (a single scalar, useful for per-pod identity
+    /// injection). In cluster-map mode the node id IS this announce id (stable across boots),
+    /// so `CLUSTER MYID` / `CLUSTER NODES` self-line / MOVED-target identity all agree.
+    pub cluster_announce_id: Option<String>,
 }
 
 impl Default for Config {
@@ -235,6 +278,11 @@ impl Default for Config {
             // Standalone by default (Redis `cluster-enabled no`). Slice 1 is
             // cluster-disabled-but-introspectable (CLUSTER_CONTRACT.md #70).
             cluster_enabled: false,
+            // No static topology by default: an unconfigured (or cluster-enabled but
+            // topology-less) boot stays single-node-owns-all (slice-1 behavior). A topology
+            // is opt-in (CLUSTER_CONTRACT.md #70, slice 2).
+            cluster_topology: None,
+            cluster_announce_id: None,
         }
     }
 }
@@ -346,8 +394,71 @@ impl Config {
                 ),
             });
         }
+        // CLUSTER TOPOLOGY (CLUSTER_CONTRACT.md #70, slice 2). When cluster mode is enabled
+        // AND a static topology is configured, it must be a COMPLETE, non-overlapping,
+        // well-formed map that includes THIS node (by announce id). A topology is opt-in: a
+        // cluster-enabled node with no topology stays single-node-owns-all (slice-1), so this
+        // block only runs when both are present. The validation is delegated to
+        // `ironcache_cluster::SlotMap::build` (the single slot-assignment validator), so the
+        // router, the projection, and config all agree on what a valid map is.
+        if self.cluster_enabled {
+            if let Some(topo) = &self.cluster_topology {
+                // announce-id is REQUIRED when a topology is set (bind may be 0.0.0.0, so self
+                // cannot be matched by address). `field` is &'static str, so the dynamic
+                // context lives in `reason`.
+                let announce =
+                    self.cluster_announce_id
+                        .as_deref()
+                        .ok_or_else(|| ConfigError::Invalid {
+                            field: "cluster-announce-id",
+                            reason:
+                                "is required when cluster_topology is set (the bind address may \
+                                 be 0.0.0.0, so this node cannot be matched to a topology entry \
+                                 by address)"
+                                    .to_owned(),
+                        })?;
+                validate_topology(topo, announce)?;
+            }
+        }
         Ok(())
     }
+}
+
+/// Validate a [`ClusterTopology`] against `announce_id` (THIS node's id) by building a
+/// throwaway [`ironcache_cluster::SlotMap`] and mapping any [`ironcache_cluster::SlotMapError`]
+/// onto [`ConfigError::Invalid`]. This is the bridge that lets `Config::validate` reuse the
+/// ONE slot-assignment validator (gap / overlap / duplicate id / bad range / bad id / empty /
+/// self-not-present) the router and projection also build from, so the rules never drift.
+///
+/// `field` is `&'static str`, so the dynamic context (which slot, which ids) goes in `reason`
+/// via the [`ironcache_cluster::SlotMapError`] `Display`.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Invalid`] with `field = "cluster_topology"` and a `reason` derived
+/// from the [`ironcache_cluster::SlotMapError`] when the topology is not a complete, valid,
+/// self-inclusive static map.
+pub fn validate_topology(topo: &ClusterTopology, announce_id: &str) -> Result<(), ConfigError> {
+    let nodes: Vec<(ironcache_cluster::NodeEntry, Vec<[u16; 2]>)> = topo
+        .nodes
+        .iter()
+        .map(|n| {
+            (
+                ironcache_cluster::NodeEntry {
+                    id: n.id.clone().into_boxed_str(),
+                    host: n.host.clone().into_boxed_str(),
+                    port: n.port,
+                },
+                n.slots.clone(),
+            )
+        })
+        .collect();
+    ironcache_cluster::SlotMap::build(nodes, announce_id)
+        .map(|_| ())
+        .map_err(|e| ConfigError::Invalid {
+            field: "cluster_topology",
+            reason: e.to_string(),
+        })
 }
 
 /// A single layer of optional overrides. The TOML file deserializes directly into
@@ -377,6 +488,11 @@ pub struct ConfigOverlay {
     /// Whether to run in cluster mode (Redis `cluster-enabled`, CLUSTER_CONTRACT.md #70).
     /// Boot-only; `None` leaves the lower layer (default `false`) showing through.
     pub cluster_enabled: Option<bool>,
+    /// The static cluster topology (CLUSTER_CONTRACT.md #70, slice 2). TOML-only (deserialized
+    /// from `[[cluster_topology.nodes]]`); there is no env/CLI form for the structured map.
+    pub cluster_topology: Option<ClusterTopology>,
+    /// THIS node's announce id. TOML + the `IRONCACHE_CLUSTER_ANNOUNCE_ID` env var.
+    pub cluster_announce_id: Option<String>,
 }
 
 impl ConfigOverlay {
@@ -432,6 +548,12 @@ impl ConfigOverlay {
                 reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
             })?);
         }
+        // The announce id is a single scalar, so it is env-encodable (useful for per-pod
+        // identity injection in a stateful set). The structured topology is TOML-only. The id
+        // is validated (40-hex + present in topology) by Config::validate via the slot map.
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_ANNOUNCE_ID") {
+            o.cluster_announce_id = Some(v);
+        }
         Ok(o)
     }
 
@@ -477,6 +599,12 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.cluster_enabled {
             cfg.cluster_enabled = v;
+        }
+        if let Some(ref v) = self.cluster_topology {
+            cfg.cluster_topology = Some(v.clone());
+        }
+        if let Some(ref v) = self.cluster_announce_id {
+            cfg.cluster_announce_id = Some(v.clone());
         }
         Ok(())
     }
@@ -803,6 +931,183 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The example multi-node topology TOML (`[[cluster_topology.nodes]]` array-of-tables)
+    /// deserializes into the expected `ClusterTopology`, and a full-coverage 3-way split plus
+    /// a matching announce id passes `validate`.
+    #[test]
+    fn cluster_topology_full_coverage_validates_and_round_trips() {
+        let toml_src = r#"
+            cluster_enabled = true
+            cluster_announce_id = "1111111111111111111111111111111111111111"
+
+            [[cluster_topology.nodes]]
+            id = "0000000000000000000000000000000000000000"
+            host = "10.0.0.10"
+            port = 6379
+            slots = [[0, 5460]]
+
+            [[cluster_topology.nodes]]
+            id = "1111111111111111111111111111111111111111"
+            host = "10.0.0.11"
+            port = 6379
+            slots = [[5461, 10922]]
+
+            [[cluster_topology.nodes]]
+            id = "2222222222222222222222222222222222222222"
+            host = "10.0.0.12"
+            port = 6379
+            slots = [[10923, 16383]]
+        "#;
+        let o = ConfigOverlay::from_toml_str(toml_src).unwrap();
+        // The structured topology round-trips into the expected shape.
+        let topo = o.cluster_topology.clone().expect("topology parsed");
+        assert_eq!(topo.nodes.len(), 3);
+        assert_eq!(topo.nodes[0].id, "0000000000000000000000000000000000000000");
+        assert_eq!(topo.nodes[1].host, "10.0.0.11");
+        assert_eq!(topo.nodes[2].slots, vec![[10923u16, 16383u16]]);
+        assert_eq!(
+            o.cluster_announce_id.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        // And a complete, self-inclusive map validates.
+        let cfg = Config::resolve(&[o]).unwrap();
+        cfg.validate()
+            .expect("a full 3-way split with a matching announce id is valid");
+    }
+
+    #[test]
+    fn cluster_topology_gap_is_rejected() {
+        // ID0 owns 0-8190, ID1 owns 8192-16383: slot 8191 is unassigned.
+        let cfg = topology_config(
+            true,
+            Some("0000000000000000000000000000000000000000"),
+            &[
+                ("0000000000000000000000000000000000000000", &[[0, 8190]]),
+                ("1111111111111111111111111111111111111111", &[[8192, 16383]]),
+            ],
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    field: "cluster_topology",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("8191"),
+            "reason names the gap: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_topology_overlap_is_rejected() {
+        // ID0 owns 0-8191, ID1 owns 8000-16383: slot 8000 is the first overlap.
+        let cfg = topology_config(
+            true,
+            Some("0000000000000000000000000000000000000000"),
+            &[
+                ("0000000000000000000000000000000000000000", &[[0, 8191]]),
+                ("1111111111111111111111111111111111111111", &[[8000, 16383]]),
+            ],
+        );
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::Invalid {
+                field: "cluster_topology",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cluster_topology_self_missing_is_rejected() {
+        // announce id is well-formed but names no node in the topology.
+        let cfg = topology_config(
+            true,
+            Some("9999999999999999999999999999999999999999"),
+            &[
+                ("0000000000000000000000000000000000000000", &[[0, 8191]]),
+                ("1111111111111111111111111111111111111111", &[[8192, 16383]]),
+            ],
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                field: "cluster_topology",
+                ..
+            }
+        ));
+        assert!(
+            err.to_string().contains("9999"),
+            "reason names the announce id: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_announce_id_required_when_topology_set() {
+        // A topology with NO announce id is rejected on the dedicated field.
+        let cfg = topology_config(
+            true,
+            None,
+            &[
+                ("0000000000000000000000000000000000000000", &[[0, 8191]]),
+                ("1111111111111111111111111111111111111111", &[[8192, 16383]]),
+            ],
+        );
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::Invalid {
+                field: "cluster-announce-id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cluster_topology_ignored_when_cluster_disabled() {
+        // A topology supplied with cluster_enabled = false is NOT validated (and never used):
+        // the topology block only engages when cluster mode is on. Even a deliberately broken
+        // (gappy) topology passes validate when disabled.
+        let cfg = topology_config(
+            false,
+            None,
+            &[("0000000000000000000000000000000000000000", &[[0, 100]])],
+        );
+        cfg.validate()
+            .expect("topology is inert when cluster is disabled");
+    }
+
+    /// Build a resolved `Config` with a cluster topology directly (bypassing TOML) so the
+    /// validation tests can assemble exactly the (possibly invalid) maps they need.
+    fn topology_config(
+        enabled: bool,
+        announce: Option<&str>,
+        nodes: &[(&str, &[[u16; 2]])],
+    ) -> Config {
+        Config {
+            cluster_enabled: enabled,
+            cluster_announce_id: announce.map(str::to_owned),
+            cluster_topology: Some(ClusterTopology {
+                nodes: nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, slots))| ClusterNode {
+                        id: (*id).to_owned(),
+                        host: format!("10.0.0.{i}"),
+                        port: 6379,
+                        slots: slots.to_vec(),
+                    })
+                    .collect(),
+            }),
+            ..Config::default()
+        }
     }
 
     #[test]

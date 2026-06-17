@@ -191,6 +191,7 @@ mod tests {
                 cluster_node_id: "0000000000000000000000000000000000000000",
                 cluster_enabled: false,
             },
+            cluster: None,
             boot,
         }
     }

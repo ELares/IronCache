@@ -164,6 +164,13 @@ pub struct CommandSpec {
     /// The cross-shard routing class.
     pub class: CommandClass,
     /// The key-extraction pattern (see [`KeySpecKind`]).
+    ///
+    /// CLUSTER (CLUSTER_CONTRACT.md, slice 2): adding a keyed
+    /// (`KeyedSingle`/`KeyedMulti`) command requires choosing the CORRECT `KeySpecKind` so the
+    /// cluster slot check (`serve::cluster_redirect`) extracts the right keys; a wrong kind
+    /// yields the wrong slot (wrong MOVED / missing CROSSSLOT / local exec of a foreign key).
+    /// The `keyed_command_set_is_pinned_for_cluster_slot_correctness` guard test enforces a
+    /// conscious review by failing whenever the keyed-command set changes.
     pub key_spec: KeySpecKind,
     /// `true` iff this is a `denyoom` write the `maxmemory` ceiling gates (ADMISSION.md).
     pub denyoom: bool,
@@ -1768,6 +1775,176 @@ mod tests {
             .filter(|c| spec_of(c).is_some_and(|s| s.control))
             .count();
         assert_eq!(n_control, control_verbs.len(), "exactly 6 control verbs");
+    }
+
+    /// CLUSTER SLOT-CHECK GUARD (CLUSTER_CONTRACT.md #70, slice 2). The per-command
+    /// `KeySpecKind` is the SINGLE chokepoint the cluster redirect check
+    /// (`serve::cluster_redirect`) reads to extract a command's keys and compute its slot. A
+    /// future multi-key / odd-key-position command (SORT, EVAL, GEORADIUS ... STORE, LMPOP,
+    /// ZMPOP, XREAD) added as `KeyedSingle`/`KeyedMulti` WITHOUT a correct `KeySpecKind` would
+    /// silently get the WRONG slot (wrong MOVED / missing CROSSSLOT / local exec of a foreign
+    /// key). This guard PINS the exact set of keyed (`KeyedSingle` + `KeyedMulti`) command
+    /// names: adding (or reclassifying) a keyed command FAILS this test until the author
+    /// consciously updates the list AND, in doing so, reviews the new command's `KeySpecKind`
+    /// for cluster correctness. (`AlwaysHome` WATCH is keyed in Redis but is handled by its own
+    /// dedicated cluster WATCH guard in `serve`, so it is intentionally NOT in this set.)
+    #[test]
+    #[allow(clippy::too_many_lines)] // the pinned keyed-command name list is intentionally long
+    fn keyed_command_set_is_pinned_for_cluster_slot_correctness() {
+        let mut keyed: Vec<&'static [u8]> = all_registry_names()
+            .into_iter()
+            .filter(|c| {
+                spec_of(c).is_some_and(|s| {
+                    matches!(
+                        s.class,
+                        CommandClass::KeyedSingle | CommandClass::KeyedMulti
+                    )
+                })
+            })
+            .collect();
+        keyed.sort_unstable();
+
+        // The EXACT sorted set of keyed (KeyedSingle + KeyedMulti) commands. To add a keyed
+        // command: add it here AND verify its `KeySpecKind` extracts the right keys so the
+        // cluster slot check (CROSSSLOT / MOVED) is correct for it.
+        // NOTE: byte (ASCII) order, NOT lexical-case order: `_` (0x5F) sorts AFTER `Z` (0x5A),
+        // so the `__ICSTORE*` internal store verbs come LAST.
+        let expected: &[&[u8]] = &[
+            b"APPEND",
+            b"BITCOUNT",
+            b"BITFIELD",
+            b"BITFIELD_RO",
+            b"BITOP",
+            b"BITPOS",
+            b"COPY",
+            b"DECR",
+            b"DECRBY",
+            b"DEL",
+            b"EXISTS",
+            b"EXPIRE",
+            b"EXPIREAT",
+            b"EXPIRETIME",
+            b"GET",
+            b"GETBIT",
+            b"GETEX",
+            b"GETSET",
+            b"HDEL",
+            b"HEXISTS",
+            b"HGET",
+            b"HGETALL",
+            b"HINCRBY",
+            b"HINCRBYFLOAT",
+            b"HKEYS",
+            b"HLEN",
+            b"HMGET",
+            b"HMSET",
+            b"HRANDFIELD",
+            b"HSCAN",
+            b"HSET",
+            b"HSETNX",
+            b"HSTRLEN",
+            b"HVALS",
+            b"INCR",
+            b"INCRBY",
+            b"INCRBYFLOAT",
+            b"LINDEX",
+            b"LINSERT",
+            b"LLEN",
+            b"LMOVE",
+            b"LPOP",
+            b"LPOS",
+            b"LPUSH",
+            b"LPUSHX",
+            b"LRANGE",
+            b"LREM",
+            b"LSET",
+            b"LTRIM",
+            b"MGET",
+            b"MOVE",
+            b"MSET",
+            b"OBJECT",
+            b"PERSIST",
+            b"PEXPIRE",
+            b"PEXPIREAT",
+            b"PEXPIRETIME",
+            b"PFADD",
+            b"PFCOUNT",
+            b"PFMERGE",
+            b"PSETEX",
+            b"PTTL",
+            b"RENAME",
+            b"RENAMENX",
+            b"RPOP",
+            b"RPOPLPUSH",
+            b"RPUSH",
+            b"RPUSHX",
+            b"SADD",
+            b"SCARD",
+            b"SDIFF",
+            b"SDIFFSTORE",
+            b"SET",
+            b"SETBIT",
+            b"SETEX",
+            b"SETNX",
+            b"SINTER",
+            b"SINTERCARD",
+            b"SINTERSTORE",
+            b"SISMEMBER",
+            b"SMEMBERS",
+            b"SMISMEMBER",
+            b"SMOVE",
+            b"SPOP",
+            b"SRANDMEMBER",
+            b"SREM",
+            b"SSCAN",
+            b"STRLEN",
+            b"SUNION",
+            b"SUNIONSTORE",
+            b"TOUCH",
+            b"TTL",
+            b"TYPE",
+            b"UNLINK",
+            b"ZADD",
+            b"ZCARD",
+            b"ZCOUNT",
+            b"ZDIFF",
+            b"ZDIFFSTORE",
+            b"ZINCRBY",
+            b"ZINTER",
+            b"ZINTERCARD",
+            b"ZINTERSTORE",
+            b"ZLEXCOUNT",
+            b"ZMSCORE",
+            b"ZPOPMAX",
+            b"ZPOPMIN",
+            b"ZRANDMEMBER",
+            b"ZRANGE",
+            b"ZRANGEBYLEX",
+            b"ZRANGEBYSCORE",
+            b"ZRANGESTORE",
+            b"ZRANK",
+            b"ZREM",
+            b"ZREMRANGEBYLEX",
+            b"ZREMRANGEBYRANK",
+            b"ZREMRANGEBYSCORE",
+            b"ZREVRANGE",
+            b"ZREVRANGEBYLEX",
+            b"ZREVRANGEBYSCORE",
+            b"ZREVRANK",
+            b"ZSCAN",
+            b"ZSCORE",
+            b"ZUNION",
+            b"ZUNIONSTORE",
+            b"__ICSTOREHLL",
+            b"__ICSTORESET",
+            b"__ICSTOREZSET",
+        ];
+        assert_eq!(
+            keyed, expected,
+            "the keyed (KeyedSingle/KeyedMulti) command set changed: a keyed command was added \
+             or reclassified. Update the pinned list AND verify the new command's KeySpecKind \
+             extracts the correct keys so the cluster slot check (CROSSSLOT/MOVED) is correct."
+        );
     }
 
     /// `extract_keys` is byte-identical to the legacy `command_keys` per-pattern logic. A

@@ -124,6 +124,16 @@ pub struct ServerContext {
     pub shards: usize,
     /// Static server facts for INFO/HELLO.
     pub info: ServerInfo,
+    /// The static cluster slot-ownership map (CLUSTER_CONTRACT.md #70, slice 2). `Some` iff
+    /// cluster mode is enabled AND a topology was configured; `None` for a standalone node OR
+    /// a cluster-enabled node with no topology (which stays single-node-owns-all, slice-1).
+    ///
+    /// Shared by `Arc` across every shard task (the map is immutable after boot). The `Arc` is
+    /// a shared-ownership pointer, NOT a lock, so the shared-nothing invariant (ADR-0002) holds;
+    /// it is the blessed path the runtime already uses for the cross-shard shutdown flag. The
+    /// CLUSTER projection reads it to render the real multi-node SLOTS/SHARDS/NODES/INFO; the
+    /// serve-layer router reads it to decide MOVED/CROSSSLOT redirection.
+    pub cluster: Option<Arc<ironcache_cluster::SlotMap>>,
 }
 
 impl ServerContext {
@@ -1608,6 +1618,7 @@ mod tests {
                 cluster_node_id: "0000000000000000000000000000000000000000",
                 cluster_enabled: false,
             },
+            cluster: None,
             boot,
         }
     }

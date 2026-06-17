@@ -5,7 +5,7 @@
 //! plumbing. Not part of the binary's runtime path.
 
 use crate::serve::run_server;
-use ironcache_config::Config;
+use ironcache_config::{ClusterTopology, Config};
 use ironcache_runtime::bootstrap::ShardSet;
 
 /// Boot a real server on `127.0.0.1:port` across `shards` shards and return the running
@@ -26,4 +26,36 @@ pub fn run_server_for_test(port: u16, shards: usize) -> ShardSet {
         ..Config::default()
     };
     run_server(&config).expect("test server failed to bind")
+}
+
+/// Boot a real CLUSTER-mode server on `127.0.0.1:port` (single shard) with a static slot
+/// `topology` and this node's `announce_id`, returning the running [`ShardSet`]
+/// (CLUSTER_CONTRACT.md #70, slice 2). The topology is shared by every node in a cluster
+/// integration test; each node passes its OWN matching announce id, so the same map yields a
+/// different `self` per node and thus the right MOVED targets.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind, OR if the topology fails to validate (a bad map is a
+/// test bug the harness should surface immediately, not swallow).
+#[must_use]
+pub fn run_cluster_node_for_test(
+    port: u16,
+    topology: ClusterTopology,
+    announce_id: &str,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards: 1,
+        databases: 16,
+        cluster_enabled: true,
+        cluster_topology: Some(topology),
+        cluster_announce_id: Some(announce_id.to_owned()),
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test cluster topology must validate");
+    run_server(&config).expect("test cluster node failed to bind")
 }

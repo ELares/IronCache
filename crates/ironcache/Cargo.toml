@@ -37,6 +37,11 @@ ironcache-store = { workspace = true }
 # store as the E hook. The library names only the EvictionPolicy/Admit traits.
 ironcache-eviction = { workspace = true }
 ironcache-server = { workspace = true }
+# The static slot-ownership map (CLUSTER_CONTRACT.md #70, slice 2). The binary builds the
+# `SlotMap` once at boot from the resolved topology and threads it (Arc) into every shard's
+# ServerContext; the serve-layer router reads it to decide MOVED / CROSSSLOT redirection. It
+# is a leaf (only ironcache-protocol), so it adds no third-party deps.
+ironcache-cluster = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }

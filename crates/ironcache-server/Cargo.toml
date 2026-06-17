@@ -18,6 +18,10 @@ ironcache-env = { workspace = true }
 ironcache-protocol = { workspace = true }
 ironcache-observe = { workspace = true }
 ironcache-config = { workspace = true }
+# The static slot-ownership map (CLUSTER_CONTRACT.md #70, slice 2). The CLUSTER projection
+# (cmd_cluster) reads it via ServerContext.cluster to render the real multi-node SLOTS /
+# SHARDS / NODES / INFO. Leaf crate (only ironcache-protocol), so no cycle.
+ironcache-cluster = { workspace = true }
 # The storage WAIST only (not ironcache-store): the command layer names the four
 # primitives + the hook types, never the concrete map. This dependency edge is the
 # compile-time proof of the layering contract (STORAGE_API.md).

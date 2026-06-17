@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-cluster"
+description = "The static, config-driven 16384-slot ownership map for the multi-node cluster wire contract (CLUSTER_CONTRACT.md #70, slice 2)."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The ONLY dependency: the protocol crate for CLUSTER_SLOTS (the 16384 wire constant).
+# This crate is a LEAF (config and server depend on it, not the reverse), which breaks
+# the config -> server dependency cycle that would arise if the slot map lived in either.
+# It is PURE: no rand, no std::time, no locks (ADR-0003 determinism, ADR-0002 shared-nothing).
+ironcache-protocol = { workspace = true }
