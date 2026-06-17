@@ -19,3 +19,6 @@ ironcache-env = { workspace = true }
 [dev-dependencies]
 ironcache-sim = { workspace = true }
 ironcache-env = { workspace = true }
+# The config state machine (3e) drives the cluster SlotMap; it lives in the test
+# module (the engine itself stays payload-agnostic), so this is a dev-dependency.
+ironcache-cluster = { workspace = true }
