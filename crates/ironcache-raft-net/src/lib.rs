@@ -34,8 +34,13 @@
 //!
 //! ## Scope (4a)
 //!
-//! - [`MemStorage`](ironcache_raft::MemStorage) for now; a fsync-backed
-//!   [`RaftStorage`](ironcache_raft::RaftStorage) is the next sub-slice (4b).
+//! - HA-4b adds a durable, fsync-backed [`RaftStorage`](ironcache_raft::RaftStorage),
+//!   [`FileStorage`] (in [`storage`]): an append-only, CRC-framed record log that is
+//!   `fsync`'d before every mutating method returns and REPLAYED on restart, so a
+//!   crashed node recovers its `currentTerm` / `votedFor` / `log` and cannot
+//!   double-vote in a term it already voted in. The loopback proof still boots fresh
+//!   [`MemStorage`](ironcache_raft::MemStorage); `FileStorage` recovery is unit-tested
+//!   directly in [`storage`].
 //! - NO `serve.rs` / `cmd_cluster` / dispatch changes: this is a new crate plus
 //!   tests, purely additive, so it cannot perturb the live cluster.
 //! - The [`RecordingSm`] test state machine records the applied entry sequence so
@@ -59,6 +64,9 @@ use tokio::sync::{mpsc, watch};
 
 pub mod codec;
 pub use codec::{decode_raft_msg, encode_raft_msg};
+
+pub mod storage;
+pub use storage::FileStorage;
 
 /// The cluster-bus command verb that carries an encoded [`RaftMsg`].
 ///
