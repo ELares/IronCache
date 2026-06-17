@@ -1,0 +1,1149 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! A durable, fsync-backed [`RaftStorage`] for the production adapter (HA-4b).
+//!
+//! [`MemStorage`](ironcache_raft::MemStorage) (HA-4a) holds the persistent Raft state
+//! (`currentTerm`, `votedFor`, `log[]`) in RAM, so a crashed-and-restarted node forgets
+//! everything. That is a SAFETY hole, not just an availability one: Raft's Figure 2
+//! lists those three as "Persistent state on all servers (Updated on stable storage
+//! before responding to RPCs)" precisely because a node that forgets its term and vote
+//! can vote a SECOND time in a term it already voted in, which breaks Election Safety
+//! (at most one leader per term) and admits split brain. [`FileStorage`] closes that
+//! hole: every mutation is appended to an fsync'd on-disk record log BEFORE the method
+//! returns, and on restart the log is REPLAYED to rebuild the exact pre-crash state.
+//!
+//! ## Shape: append-only record log + an in-memory mirror
+//!
+//! The on-disk file is the SOURCE OF TRUTH across restarts; an in-memory mirror (the
+//! same `(term, vote, Vec<LogEntry>)` shape as [`MemStorage`]) serves every READ so the
+//! hot path never touches the disk. Each persistent mutation appends exactly one record
+//! and is mirrored in memory. The four record kinds map one-to-one to the mutating
+//! [`RaftStorage`] methods:
+//!
+//! - [`SetTerm`](Record::SetTerm) from [`set_current_term`](RaftStorage::set_current_term)
+//! - [`SetVote`](Record::SetVote) from [`set_voted_for`](RaftStorage::set_voted_for)
+//! - [`AppendEntry`](Record::AppendEntry) from [`append`](RaftStorage::append) and from
+//!   [`append_entries`](RaftStorage::append_entries) (one record per entry)
+//! - [`Truncate`](Record::Truncate) from [`truncate_from`](RaftStorage::truncate_from)
+//!
+//! A log is never rewritten in place: a `truncate_from` is itself an APPENDED record
+//! (it shrinks the mirror's `Vec`, but the file only grows), so the file is strictly
+//! append-only and a crash can only ever lose a trailing suffix, never corrupt a record
+//! already fsync'd.
+//!
+//! ## Framing + checksum (torn-write detection)
+//!
+//! Each record is length-delimited and checksummed so a partially-written trailing
+//! record (a "torn write": the process or machine died mid-append, after the length
+//! went down but before the body was fully flushed) is DETECTED and dropped on replay
+//! rather than mis-decoded into a fabricated state. The frame is:
+//!
+//! ```text
+//!   [ u32 body_len ][ u32 crc32(body) ][ body_len bytes of body ]
+//! ```
+//!
+//! all little-endian, where `body` is `[ u8 kind ][ kind-specific payload ]`. The body
+//! reuses the SAME compact, length-delimited, hand-rolled binary style as the wire
+//! [`codec`](crate::codec) (no serde); the only addition over the wire format is this
+//! outer length+CRC framing, which the wire codec does not need (RESP frames the wire
+//! message) but the on-disk log does (so replay can find record boundaries and reject a
+//! torn tail). The checksum is a standard CRC-32 (IEEE 802.3 / zlib polynomial), small
+//! and inline; it catches both a truncated body and bit-rot in a fully-written one.
+//!
+//! ## Persist-before-respond
+//!
+//! Every mutating method appends its record(s) and `fsync`s (`File::sync_all`) the file
+//! BEFORE returning and BEFORE the mirror read paths can observe the change as durable,
+//! exactly the Figure 2 ordering. `append_entries` batches all its records into a SINGLE
+//! fsync (one stable-storage barrier for the whole AppendEntries RPC). This blocks the
+//! caller until the data is on stable storage; that caller is the single Raft
+//! control-plane task (`ironcache-raft-net`'s run loop), NOT a data-path request, so the
+//! latency is acceptable and is the price of correctness.
+
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use ironcache_raft::{ConfigCmd, EntryPayload, LogEntry, NodeId, RaftStorage};
+
+// Record-kind discriminants (the first body byte). Distinct value space from the wire
+// codec's message discriminants; these tag a PERSISTED MUTATION, not a wire message.
+const REC_SET_TERM: u8 = 1;
+const REC_SET_VOTE: u8 = 2;
+const REC_APPEND_ENTRY: u8 = 3;
+const REC_TRUNCATE: u8 = 4;
+
+// Payload discriminants for an entry's EntryPayload, mirroring the wire codec so the
+// on-disk entry body is byte-for-byte the same shape an AppendEntry record carries.
+const PAYLOAD_NOOP: u8 = 0;
+const PAYLOAD_BYTES: u8 = 1;
+const PAYLOAD_CONFIG: u8 = 2;
+
+// ConfigCmd discriminants, again mirroring the wire codec.
+const CFG_ADD_NODE: u8 = 0;
+const CFG_REMOVE_NODE: u8 = 1;
+const CFG_SET_SLOT_OWNER: u8 = 2;
+const CFG_ASSIGN_SLOTS: u8 = 3;
+const CFG_SET_CONFIG_EPOCH: u8 = 4;
+
+// The fixed frame header: a u32 body length followed by a u32 CRC of the body.
+const FRAME_HEADER_LEN: usize = 8;
+
+// ---------------------------------------------------------------------------
+// CRC-32 (IEEE 802.3 / zlib polynomial), small and inline.
+// ---------------------------------------------------------------------------
+
+/// The reflected IEEE 802.3 CRC-32 polynomial (`0xEDB88320`), the same one zlib /
+/// gzip / PNG use. We compute the table on the fly per call: a record body is tiny and
+/// this storage is the control plane, not the data path, so a 256-entry table build per
+/// record is irrelevant and it keeps the helper a pure, allocation-light function with
+/// no `static`/`OnceLock` (which the determinism lint would have to reason about).
+const CRC32_POLY: u32 = 0xEDB8_8320;
+
+/// Standard CRC-32 of `data` (initial `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`).
+///
+/// Deterministic and pure: the same bytes always yield the same checksum, so a record
+/// written on one run verifies on the next. Used only to detect a torn / corrupt
+/// trailing record on replay, never for security.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (CRC32_POLY & mask);
+        }
+    }
+    !crc
+}
+
+// ---------------------------------------------------------------------------
+// Records.
+// ---------------------------------------------------------------------------
+
+/// One persisted mutation, the unit the log appends and replay applies.
+///
+/// Each variant corresponds to exactly one mutating [`RaftStorage`] method; replaying
+/// the records in file order rebuilds the mirror's `(term, vote, log)` from empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Record {
+    /// `set_current_term(term)`: the new persisted current term.
+    SetTerm(u64),
+    /// `set_voted_for(v)`: the new persisted vote for the current term (`None` clears).
+    SetVote(Option<NodeId>),
+    /// `append(entry)` / one element of `append_entries`: append this entry to the log.
+    AppendEntry(LogEntry),
+    /// `truncate_from(index)`: drop every log entry with `entry.index >= index`.
+    Truncate(u64),
+}
+
+/// Encode a record's BODY (the bytes the frame's length + CRC cover): a kind byte then
+/// the kind-specific payload, in the wire codec's compact little-endian style.
+fn encode_body(record: &Record) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    match record {
+        Record::SetTerm(term) => {
+            out.push(REC_SET_TERM);
+            put_u64(&mut out, *term);
+        }
+        Record::SetVote(vote) => {
+            out.push(REC_SET_VOTE);
+            // An Option<NodeId> as a presence byte (0 = None, 1 = Some) then the id.
+            match vote {
+                None => out.push(0),
+                Some(id) => {
+                    out.push(1);
+                    put_u64(&mut out, id.0);
+                }
+            }
+        }
+        Record::AppendEntry(entry) => {
+            out.push(REC_APPEND_ENTRY);
+            put_entry(&mut out, entry);
+        }
+        Record::Truncate(index) => {
+            out.push(REC_TRUNCATE);
+            put_u64(&mut out, *index);
+        }
+    }
+    out
+}
+
+/// Frame a record for the log: `[u32 body_len][u32 crc32(body)][body]`, all
+/// little-endian. The header lets replay find the next record boundary; the CRC lets it
+/// reject a torn or corrupt body.
+fn encode_frame(record: &Record) -> Vec<u8> {
+    let body = encode_body(record);
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
+    // body_len as u32: a single Raft record is tiny (an entry payload is bounded by the
+    // command size), so u32 is ample and keeps the header fixed-width.
+    let body_len = u32::try_from(body.len()).expect("a single record body fits in u32");
+    frame.extend_from_slice(&body_len.to_le_bytes());
+    frame.extend_from_slice(&crc32(&body).to_le_bytes());
+    frame.extend_from_slice(&body);
+    frame
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// A length-prefixed byte blob: a `u64` length then the bytes (matches the wire codec).
+fn put_blob(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u64(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+/// A length-prefixed UTF-8 string (its UTF-8 bytes as a blob).
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_blob(out, s.as_bytes());
+}
+
+/// Append a [`LogEntry`]: term, index, then payload.
+fn put_entry(out: &mut Vec<u8>, entry: &LogEntry) {
+    put_u64(out, entry.term);
+    put_u64(out, entry.index);
+    put_payload(out, &entry.payload);
+}
+
+/// Append an [`EntryPayload`] led by its discriminant byte (mirrors the wire codec).
+fn put_payload(out: &mut Vec<u8>, payload: &EntryPayload) {
+    match payload {
+        EntryPayload::Noop => out.push(PAYLOAD_NOOP),
+        EntryPayload::Bytes(bytes) => {
+            out.push(PAYLOAD_BYTES);
+            put_blob(out, bytes);
+        }
+        EntryPayload::Config(cmd) => {
+            out.push(PAYLOAD_CONFIG);
+            put_config(out, cmd);
+        }
+    }
+}
+
+/// Append a [`ConfigCmd`] led by its discriminant byte (mirrors the wire codec).
+fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
+    match cmd {
+        ConfigCmd::AddNode { id, host, port } => {
+            out.push(CFG_ADD_NODE);
+            put_str(out, id);
+            put_str(out, host);
+            put_u16(out, *port);
+        }
+        ConfigCmd::RemoveNode { id } => {
+            out.push(CFG_REMOVE_NODE);
+            put_str(out, id);
+        }
+        ConfigCmd::SetSlotOwner { slot, node } => {
+            out.push(CFG_SET_SLOT_OWNER);
+            put_u16(out, *slot);
+            put_str(out, node);
+        }
+        ConfigCmd::AssignSlots { node, slots } => {
+            out.push(CFG_ASSIGN_SLOTS);
+            put_str(out, node);
+            put_u64(out, slots.len() as u64);
+            for slot in slots {
+                put_u16(out, *slot);
+            }
+        }
+        ConfigCmd::SetConfigEpoch(epoch) => {
+            out.push(CFG_SET_CONFIG_EPOCH);
+            put_u64(out, *epoch);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoding a record body.
+// ---------------------------------------------------------------------------
+
+/// A forward-only, bounds-checked cursor over a record body, mirroring the wire codec's
+/// `Cursor`. Every read returns `None` on a short buffer, so a body that passed the CRC
+/// but is structurally malformed (which a correct writer never produces) still cannot
+/// over-read; decode bubbles the `None` up and replay treats it as the end of the
+/// valid log (defensive: a CRC match makes this path unreachable in practice).
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Cursor { buf, pos: 0 }
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let end = self.pos.checked_add(2)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(u16::from_le_bytes([slice[0], slice[1]]))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let end = self.pos.checked_add(8)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(slice);
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    fn blob(&mut self) -> Option<Vec<u8>> {
+        let len = usize::try_from(self.u64()?).ok()?;
+        let end = self.pos.checked_add(len)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice.to_vec())
+    }
+
+    fn string(&mut self) -> Option<String> {
+        String::from_utf8(self.blob()?).ok()
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+}
+
+/// Decode a record from its body bytes (the CRC-verified frame payload). Returns `None`
+/// for an unknown kind, a truncated body, or trailing bytes after a complete record;
+/// the caller treats that as the end of the valid prefix.
+fn decode_body(body: &[u8]) -> Option<Record> {
+    let mut cur = Cursor::new(body);
+    let record = match cur.u8()? {
+        REC_SET_TERM => Record::SetTerm(cur.u64()?),
+        REC_SET_VOTE => {
+            let present = cur.u8()?;
+            let vote = match present {
+                0 => None,
+                1 => Some(NodeId(cur.u64()?)),
+                _ => return None,
+            };
+            Record::SetVote(vote)
+        }
+        REC_APPEND_ENTRY => Record::AppendEntry(get_entry(&mut cur)?),
+        REC_TRUNCATE => Record::Truncate(cur.u64()?),
+        _ => return None,
+    };
+    if cur.at_end() { Some(record) } else { None }
+}
+
+/// Read a [`LogEntry`] (term, index, payload).
+fn get_entry(cur: &mut Cursor<'_>) -> Option<LogEntry> {
+    let term = cur.u64()?;
+    let index = cur.u64()?;
+    let payload = get_payload(cur)?;
+    Some(LogEntry {
+        term,
+        index,
+        payload,
+    })
+}
+
+/// Read an [`EntryPayload`] by its discriminant byte.
+fn get_payload(cur: &mut Cursor<'_>) -> Option<EntryPayload> {
+    match cur.u8()? {
+        PAYLOAD_NOOP => Some(EntryPayload::Noop),
+        PAYLOAD_BYTES => Some(EntryPayload::Bytes(cur.blob()?)),
+        PAYLOAD_CONFIG => Some(EntryPayload::Config(get_config(cur)?)),
+        _ => None,
+    }
+}
+
+/// Read a [`ConfigCmd`] by its discriminant byte.
+fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
+    match cur.u8()? {
+        CFG_ADD_NODE => Some(ConfigCmd::AddNode {
+            id: cur.string()?,
+            host: cur.string()?,
+            port: cur.u16()?,
+        }),
+        CFG_REMOVE_NODE => Some(ConfigCmd::RemoveNode { id: cur.string()? }),
+        CFG_SET_SLOT_OWNER => Some(ConfigCmd::SetSlotOwner {
+            slot: cur.u16()?,
+            node: cur.string()?,
+        }),
+        CFG_ASSIGN_SLOTS => {
+            let node = cur.string()?;
+            let count = usize::try_from(cur.u64()?).ok()?;
+            let mut slots = Vec::with_capacity(count.min(16384));
+            for _ in 0..count {
+                slots.push(cur.u16()?);
+            }
+            Some(ConfigCmd::AssignSlots { node, slots })
+        }
+        CFG_SET_CONFIG_EPOCH => Some(ConfigCmd::SetConfigEpoch(cur.u64()?)),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The in-memory mirror (same shape as MemStorage).
+// ---------------------------------------------------------------------------
+
+/// The in-memory mirror of the persisted state: the SAME `(term, vote, Vec<LogEntry>)`
+/// shape as [`MemStorage`](ironcache_raft::MemStorage), serving every read so the hot
+/// path never hits the disk. Replay applies records into one of these; each mutation
+/// updates it in lockstep with the appended record.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Mirror {
+    current_term: u64,
+    voted_for: Option<NodeId>,
+    log: Vec<LogEntry>,
+}
+
+impl Mirror {
+    /// Apply one record to the mirror, exactly as the corresponding mutating method
+    /// does. This is the single place replay and the live mutators agree, so the
+    /// rebuilt-from-disk mirror is byte-identical to the live one.
+    fn apply(&mut self, record: Record) {
+        match record {
+            Record::SetTerm(term) => self.current_term = term,
+            Record::SetVote(vote) => self.voted_for = vote,
+            Record::AppendEntry(entry) => self.log.push(entry),
+            Record::Truncate(index) => {
+                // Drop entries with entry.index >= index. index <= 1 clears the whole
+                // log (index 0 sentinel, index 1 first real entry); an index past the
+                // end truncates nothing. Same rule as MemStorage::truncate_from.
+                let keep = if index <= 1 {
+                    0
+                } else {
+                    usize::try_from(index - 1).unwrap_or(usize::MAX)
+                };
+                if keep < self.log.len() {
+                    self.log.truncate(keep);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FileStorage.
+// ---------------------------------------------------------------------------
+
+/// A durable, fsync-backed [`RaftStorage`]: an append-only record log on disk (the
+/// source of truth across restarts) plus an in-memory [`Mirror`] that serves every
+/// read.
+///
+/// Open it with [`FileStorage::open`], which replays the on-disk log to rebuild the
+/// mirror (stopping at and truncating away any torn trailing record). Thereafter every
+/// mutating [`RaftStorage`] method appends its record(s), `fsync`s, and updates the
+/// mirror before returning; every read is served from the mirror.
+#[derive(Debug)]
+pub struct FileStorage {
+    /// The append-only log file, kept open and positioned at the end for appends.
+    file: File,
+    /// The path, retained for diagnostics (and so the type is self-describing).
+    path: PathBuf,
+    /// The in-memory mirror that serves all reads.
+    mirror: Mirror,
+}
+
+impl FileStorage {
+    /// Open (creating if absent) the record log at `path` and REPLAY it to recover the
+    /// persisted Raft state.
+    ///
+    /// Replay reads frames in order, verifying each frame's length and CRC; it applies
+    /// every valid record to the mirror and STOPS at the first record that is torn
+    /// (a short header, a body shorter than its declared length, a CRC mismatch, or a
+    /// body that does not decode). At that point it TRUNCATES the file to the offset
+    /// just past the last good record, so the next append starts from a clean boundary
+    /// and the torn tail can never be replayed again. A brand-new or empty file
+    /// recovers to the initial state (term 0, no vote, empty log).
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        // Open read+write, creating if absent. We read the whole file to replay, then
+        // keep the handle for appends.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+
+        let (mirror, good_len) = replay(&bytes);
+
+        // If a torn / partial tail was found, physically truncate the file to the last
+        // good offset so future appends are clean and a re-open sees no torn record.
+        if good_len < bytes.len() {
+            file.set_len(good_len as u64)?;
+            file.sync_all()?;
+        }
+        // Position the write cursor at the end (the last good offset) for appends.
+        file.seek(SeekFrom::Start(good_len as u64))?;
+
+        Ok(FileStorage { file, path, mirror })
+    }
+
+    /// The path of the underlying record log (for diagnostics / tests).
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Append one framed record to the file, fsync, then apply it to the mirror.
+    ///
+    /// The fsync is the persist-before-respond barrier: the record is on stable storage
+    /// before this returns, so a crash right after the call cannot lose it. The mirror
+    /// is updated AFTER the durable write, so the in-memory view never reflects a
+    /// mutation that is not yet durable.
+    fn append_record(&mut self, record: Record) -> io::Result<()> {
+        let frame = encode_frame(&record);
+        self.file.write_all(&frame)?;
+        self.file.sync_all()?;
+        self.mirror.apply(record);
+        Ok(())
+    }
+
+    /// Append several framed records, then a SINGLE fsync, then apply them all to the
+    /// mirror. One stable-storage barrier for the whole batch (used by
+    /// [`append_entries`](RaftStorage::append_entries): one AppendEntries RPC = one
+    /// fsync).
+    fn append_records(&mut self, records: Vec<Record>) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        for record in &records {
+            buf.extend_from_slice(&encode_frame(record));
+        }
+        self.file.write_all(&buf)?;
+        self.file.sync_all()?;
+        for record in records {
+            self.mirror.apply(record);
+        }
+        Ok(())
+    }
+}
+
+/// Replay raw file bytes into a [`Mirror`], returning the rebuilt mirror and the byte
+/// length of the VALID prefix (the offset just past the last good record).
+///
+/// Stops at the first torn / invalid record: a header shorter than 8 bytes, a body
+/// shorter than its declared length, a CRC mismatch, or a body that does not decode to
+/// a known record. The returned length is where the file should be truncated so the
+/// torn tail is discarded.
+fn replay(bytes: &[u8]) -> (Mirror, usize) {
+    let mut mirror = Mirror::default();
+    let mut pos = 0usize;
+    loop {
+        // Need a full fixed header (u32 len + u32 crc) to even know the body length.
+        if pos + FRAME_HEADER_LEN > bytes.len() {
+            break;
+        }
+        let body_len =
+            u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
+        let stored_crc = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]);
+        let body_start = pos + FRAME_HEADER_LEN;
+        // A corrupt length that would overflow on add is a torn trailing record.
+        let Some(body_end) = body_start.checked_add(body_len) else {
+            break;
+        };
+        // A body that runs past the end of the file is a torn trailing write.
+        if body_end > bytes.len() {
+            break;
+        }
+        let body = &bytes[body_start..body_end];
+        // CRC mismatch: bit-rot or a torn body whose length happened to fit. Reject.
+        if crc32(body) != stored_crc {
+            break;
+        }
+        // A CRC-clean body that nonetheless fails to decode would mean a writer bug;
+        // treat it like a torn record (stop) rather than fabricate state.
+        let Some(record) = decode_body(body) else {
+            break;
+        };
+        mirror.apply(record);
+        pos = body_end;
+    }
+    (mirror, pos)
+}
+
+impl RaftStorage for FileStorage {
+    fn current_term(&self) -> u64 {
+        self.mirror.current_term
+    }
+
+    fn set_current_term(&mut self, term: u64) {
+        self.append_record(Record::SetTerm(term))
+            .expect("FileStorage: fsync current_term to stable storage");
+    }
+
+    fn voted_for(&self) -> Option<NodeId> {
+        self.mirror.voted_for
+    }
+
+    fn set_voted_for(&mut self, v: Option<NodeId>) {
+        self.append_record(Record::SetVote(v))
+            .expect("FileStorage: fsync voted_for to stable storage");
+    }
+
+    fn last_log_index(&self) -> u64 {
+        self.mirror.log.last().map_or(0, |e| e.index)
+    }
+
+    fn last_log_term(&self) -> u64 {
+        self.mirror.log.last().map_or(0, |e| e.term)
+    }
+
+    fn append(&mut self, entry: LogEntry) {
+        self.append_record(Record::AppendEntry(entry))
+            .expect("FileStorage: fsync appended entry to stable storage");
+    }
+
+    fn term_at(&self, index: u64) -> u64 {
+        if index == 0 {
+            // The empty-log sentinel always "matches" prev_log_index 0 (Figure 2
+            // AppendEntries rule 2), same as MemStorage.
+            return 0;
+        }
+        usize::try_from(index - 1)
+            .ok()
+            .and_then(|pos| self.mirror.log.get(pos))
+            .map_or(0, |e| e.term)
+    }
+
+    fn entries_from(&self, index: u64) -> Vec<LogEntry> {
+        let start = if index <= 1 {
+            0
+        } else {
+            usize::try_from(index - 1).unwrap_or(usize::MAX)
+        };
+        self.mirror
+            .log
+            .get(start..)
+            .map_or_else(Vec::new, <[LogEntry]>::to_vec)
+    }
+
+    fn truncate_from(&mut self, index: u64) {
+        self.append_record(Record::Truncate(index))
+            .expect("FileStorage: fsync truncate to stable storage");
+    }
+
+    fn append_entries(&mut self, entries: &[LogEntry]) {
+        // One record per entry, one fsync for the whole batch (the AppendEntries RPC's
+        // single stable-storage barrier).
+        let records = entries
+            .iter()
+            .cloned()
+            .map(Record::AppendEntry)
+            .collect::<Vec<_>>();
+        self.append_records(records)
+            .expect("FileStorage: fsync appended entries to stable storage");
+    }
+
+    fn entry_at(&self, index: u64) -> Option<LogEntry> {
+        if index == 0 {
+            return None;
+        }
+        usize::try_from(index - 1)
+            .ok()
+            .and_then(|pos| self.mirror.log.get(pos))
+            .cloned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironcache_raft::MemStorage;
+
+    /// A deterministic temp-file path for a test, derived from the TEST NAME plus this
+    /// process's id. NO clock and NO RNG (ADR-0003 / the determinism lint forbid both,
+    /// in tests too): the test name makes the path unique ACROSS tests, and the pid
+    /// makes it unique across concurrent `cargo test` runs / processes, so two tests
+    /// never collide on one file. The caller removes any stale file at the start, so a
+    /// previous run's leftover never contaminates a fresh open.
+    fn temp_path(test_name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "ironcache-raft-net-filestorage-{}-{}.log",
+            test_name,
+            std::process::id()
+        ));
+        p
+    }
+
+    /// A fresh, removed path for `test_name`: derive the deterministic path and delete
+    /// any leftover so the test starts from a guaranteed-absent file.
+    fn fresh_path(test_name: &str) -> PathBuf {
+        let p = temp_path(test_name);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Remove the test's file (best-effort cleanup at the end of a test).
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A small set of entries spanning every payload kind, for the log-recovery tests.
+    fn sample_entries() -> Vec<LogEntry> {
+        vec![
+            LogEntry {
+                term: 1,
+                index: 1,
+                payload: EntryPayload::Noop,
+            },
+            LogEntry {
+                term: 2,
+                index: 2,
+                payload: EntryPayload::Bytes(b"hello-durable-world".to_vec()),
+            },
+            LogEntry {
+                term: 3,
+                index: 3,
+                payload: EntryPayload::Config(ConfigCmd::AddNode {
+                    id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    host: "10.0.0.5".to_owned(),
+                    port: 6379,
+                }),
+            },
+        ]
+    }
+
+    #[test]
+    fn crc32_matches_known_check_value() {
+        // The canonical CRC-32 (IEEE / zlib) check value for the ASCII "123456789" is
+        // 0xCBF43926; pinning it proves our inline implementation is the standard one.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        // Empty input is the post-final-XOR of the all-ones initial state: 0.
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn frame_round_trips_every_record_kind() {
+        // Each record kind must frame -> replay back to itself. Build a buffer of one
+        // frame per kind (including every payload / config shape via an AppendEntry)
+        // and replay it; the mirror must reflect the applied sequence and the valid
+        // prefix must be the whole buffer (nothing torn).
+        let records = vec![
+            Record::SetTerm(42),
+            Record::SetVote(Some(NodeId(7))),
+            Record::SetVote(None),
+            Record::AppendEntry(LogEntry {
+                term: 1,
+                index: 1,
+                payload: EntryPayload::Noop,
+            }),
+            Record::AppendEntry(LogEntry {
+                term: 2,
+                index: 2,
+                payload: EntryPayload::Config(ConfigCmd::AssignSlots {
+                    node: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                    slots: vec![0, 1, 16_383],
+                }),
+            }),
+            Record::Truncate(2),
+        ];
+        let mut buf = Vec::new();
+        for r in &records {
+            buf.extend_from_slice(&encode_frame(r));
+        }
+        let (mirror, good_len) = replay(&buf);
+        assert_eq!(good_len, buf.len(), "every frame must be valid");
+        // After SetTerm(42), SetVote(7), SetVote(None), append 2 entries, Truncate(2):
+        // term 42, no vote, log holds only the index-1 entry.
+        assert_eq!(mirror.current_term, 42);
+        assert_eq!(mirror.voted_for, None);
+        assert_eq!(mirror.log.len(), 1);
+        assert_eq!(mirror.log[0].index, 1);
+    }
+
+    #[test]
+    fn recovers_term_vote_and_log_after_reopen() {
+        let path = fresh_path("recovers_term_vote_and_log_after_reopen");
+
+        let entries = sample_entries();
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            s.set_current_term(7);
+            s.set_voted_for(Some(NodeId(3)));
+            for e in &entries {
+                s.append(e.clone());
+            }
+            // s dropped here (its File closes); the on-disk log is the source of truth.
+        }
+
+        let s = FileStorage::open(&path).expect("reopen recovers");
+        assert_eq!(s.current_term(), 7, "current_term must survive a reopen");
+        assert_eq!(
+            s.voted_for(),
+            Some(NodeId(3)),
+            "voted_for must survive a reopen"
+        );
+        assert_eq!(s.last_log_index(), 3);
+        assert_eq!(s.last_log_term(), 3);
+        // The whole log must match, both via entry_at and entries_from.
+        for e in &entries {
+            assert_eq!(s.entry_at(e.index).as_ref(), Some(e));
+        }
+        assert_eq!(s.entries_from(1), entries);
+        assert_eq!(s.entries_from(2), entries[1..].to_vec());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn truncate_then_recover() {
+        let path = fresh_path("truncate_then_recover");
+
+        let new_at_3 = LogEntry {
+            term: 9,
+            index: 3,
+            payload: EntryPayload::Bytes(b"post-truncate-entry-3".to_vec()),
+        };
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            // Append entries 1..=5.
+            for i in 1..=5u64 {
+                s.append(LogEntry {
+                    term: 1,
+                    index: i,
+                    payload: EntryPayload::Bytes(format!("orig-{i}").into_bytes()),
+                });
+            }
+            assert_eq!(s.last_log_index(), 5);
+            // Truncate from index 3 (drops 3, 4, 5), then append a NEW entry at 3.
+            s.truncate_from(3);
+            assert_eq!(s.last_log_index(), 2);
+            s.append(new_at_3.clone());
+            assert_eq!(s.last_log_index(), 3);
+        }
+
+        let s = FileStorage::open(&path).expect("reopen recovers post-truncate state");
+        // The recovered log is [1, 2, 3'] (post-truncate), NOT the pre-truncate tail.
+        assert_eq!(s.last_log_index(), 3);
+        assert_eq!(
+            s.entry_at(1).unwrap().payload,
+            EntryPayload::Bytes(b"orig-1".to_vec())
+        );
+        assert_eq!(
+            s.entry_at(2).unwrap().payload,
+            EntryPayload::Bytes(b"orig-2".to_vec())
+        );
+        // Index 3 is the post-truncate entry, term 9, not the original term-1 "orig-3".
+        assert_eq!(s.entry_at(3).as_ref(), Some(&new_at_3));
+        // There is no index 4 or 5 anymore.
+        assert_eq!(s.entry_at(4), None);
+        assert_eq!(s.entry_at(5), None);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn torn_trailing_record_is_ignored_on_replay() {
+        let path = fresh_path("torn_trailing_record_is_ignored_on_replay");
+
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            s.set_current_term(4);
+            s.set_voted_for(Some(NodeId(2)));
+            s.append(LogEntry {
+                term: 4,
+                index: 1,
+                payload: EntryPayload::Bytes(b"committed".to_vec()),
+            });
+        }
+
+        // Append GARBAGE directly to the file: a plausible-looking but corrupt trailing
+        // record (a header claiming a body plus a too-short / wrong-CRC body). This
+        // simulates a write that died mid-append.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            // body_len says 16, crc is bogus, and we write only 4 body bytes: the body
+            // runs past EOF AND the CRC is wrong, both of which replay must reject.
+            f.write_all(&16u32.to_le_bytes()).unwrap();
+            f.write_all(&0xDEAD_BEEFu32.to_le_bytes()).unwrap();
+            f.write_all(&[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Reopen: the torn record is dropped, recovery yields the last consistent state,
+        // and the file is truncated to the last good offset.
+        let len_before_reopen = std::fs::metadata(&path).unwrap().len();
+        {
+            let s = FileStorage::open(&path).expect("reopen ignores torn tail");
+            assert_eq!(s.current_term(), 4);
+            assert_eq!(s.voted_for(), Some(NodeId(2)));
+            assert_eq!(s.last_log_index(), 1);
+            assert_eq!(
+                s.entry_at(1).unwrap().payload,
+                EntryPayload::Bytes(b"committed".to_vec())
+            );
+        }
+        let len_after_reopen = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            len_after_reopen < len_before_reopen,
+            "the torn tail must be truncated away ({len_after_reopen} < {len_before_reopen})"
+        );
+
+        // A subsequent append + reopen round-trips cleanly (the file is a clean
+        // boundary again, so the new record is the new valid tail).
+        {
+            let mut s = FileStorage::open(&path).expect("reopen clean");
+            s.append(LogEntry {
+                term: 5,
+                index: 2,
+                payload: EntryPayload::Bytes(b"after-recovery".to_vec()),
+            });
+        }
+        let s = FileStorage::open(&path).expect("final reopen");
+        assert_eq!(s.last_log_index(), 2);
+        assert_eq!(
+            s.entry_at(2).unwrap().payload,
+            EntryPayload::Bytes(b"after-recovery".to_vec())
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn empty_file_recovers_to_initial_state() {
+        let path = fresh_path("empty_file_recovers_to_initial_state");
+
+        // A brand-new path: open must create it and recover the initial state.
+        let s = FileStorage::open(&path).expect("open brand-new path");
+        assert_eq!(s.current_term(), 0, "fresh storage starts at term 0");
+        assert_eq!(s.voted_for(), None, "fresh storage has no vote");
+        assert_eq!(s.last_log_index(), 0, "fresh storage has an empty log");
+        assert_eq!(s.last_log_term(), 0);
+        assert_eq!(s.entries_from(1), Vec::<LogEntry>::new());
+        assert_eq!(s.entry_at(1), None);
+        // term_at(0) is the sentinel match; past-end is 0.
+        assert_eq!(s.term_at(0), 0);
+        assert_eq!(s.term_at(1), 0);
+
+        cleanup(&path);
+    }
+
+    /// A parity test: a FileStorage and a MemStorage, driven through the IDENTICAL
+    /// sequence of mutations, must answer every read the same way. This pins
+    /// FileStorage as a drop-in for the in-memory store the engine is verified against,
+    /// and a reopen of the FileStorage in the middle proves durability does not perturb
+    /// that parity.
+    #[test]
+    fn parity_with_memstorage_across_a_mutation_sequence() {
+        let path = fresh_path("parity_with_memstorage_across_a_mutation_sequence");
+
+        let mut mem = MemStorage::new();
+        let mut file = FileStorage::open(&path).expect("open fresh");
+
+        // Apply a representative mutation sequence to BOTH, asserting parity throughout.
+        // A closure cannot borrow both stores as &mut dyn easily, so apply inline.
+        macro_rules! both {
+            ($call:expr) => {{
+                let _ = $call(&mut mem as &mut dyn RaftStorage);
+                let _ = $call(&mut file as &mut dyn RaftStorage);
+            }};
+        }
+        macro_rules! assert_parity {
+            () => {{
+                assert_eq!(
+                    mem.current_term(),
+                    file.current_term(),
+                    "current_term parity"
+                );
+                assert_eq!(mem.voted_for(), file.voted_for(), "voted_for parity");
+                assert_eq!(
+                    mem.last_log_index(),
+                    file.last_log_index(),
+                    "last_log_index parity"
+                );
+                assert_eq!(
+                    mem.last_log_term(),
+                    file.last_log_term(),
+                    "last_log_term parity"
+                );
+                for i in 0..=mem.last_log_index() + 2 {
+                    assert_eq!(mem.term_at(i), file.term_at(i), "term_at({i}) parity");
+                    assert_eq!(mem.entry_at(i), file.entry_at(i), "entry_at({i}) parity");
+                    assert_eq!(
+                        mem.entries_from(i),
+                        file.entries_from(i),
+                        "entries_from({i}) parity"
+                    );
+                }
+            }};
+        }
+
+        both!(|s: &mut dyn RaftStorage| s.set_current_term(3));
+        both!(|s: &mut dyn RaftStorage| s.set_voted_for(Some(NodeId(1))));
+        assert_parity!();
+
+        for e in sample_entries() {
+            both!(|s: &mut dyn RaftStorage| s.append(e.clone()));
+        }
+        assert_parity!();
+
+        // A bulk append (the append_entries path), then a truncate, then a fresh append.
+        let bulk = vec![
+            LogEntry {
+                term: 3,
+                index: 4,
+                payload: EntryPayload::Noop,
+            },
+            LogEntry {
+                term: 3,
+                index: 5,
+                payload: EntryPayload::Bytes(b"bulk-5".to_vec()),
+            },
+        ];
+        both!(|s: &mut dyn RaftStorage| s.append_entries(&bulk));
+        assert_parity!();
+
+        both!(|s: &mut dyn RaftStorage| s.truncate_from(4));
+        both!(|s: &mut dyn RaftStorage| s.set_current_term(4));
+        both!(|s: &mut dyn RaftStorage| s.set_voted_for(None));
+        both!(|s: &mut dyn RaftStorage| s.append(LogEntry {
+            term: 4,
+            index: 4,
+            payload: EntryPayload::Bytes(b"new-4".to_vec()),
+        }));
+        assert_parity!();
+
+        // Reopen the FileStorage from disk: durability must not perturb parity.
+        drop(file);
+        let file = FileStorage::open(&path).expect("reopen mid-sequence");
+        assert_eq!(mem.current_term(), file.current_term());
+        assert_eq!(mem.voted_for(), file.voted_for());
+        assert_eq!(mem.last_log_index(), file.last_log_index());
+        for i in 0..=mem.last_log_index() + 2 {
+            assert_eq!(
+                mem.entry_at(i),
+                file.entry_at(i),
+                "post-reopen entry_at({i})"
+            );
+            assert_eq!(
+                mem.entries_from(i),
+                file.entries_from(i),
+                "post-reopen entries_from({i})"
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    /// A FileStorage drives the real engine and SURVIVES a restart with its persisted
+    /// term + vote: open a store, run a node through an election (so it persists a term
+    /// and a self-vote), drop the node, REOPEN the SAME FileStorage file into a fresh
+    /// node, and assert the recovered node sees its prior term and vote (so it will not
+    /// re-vote in that term). This is the safety property HA-4b exists for, exercised
+    /// against the engine without needing the full TCP loopback harness.
+    #[test]
+    fn engine_recovers_persisted_term_and_vote_from_filestorage() {
+        use ironcache_env::Monotonic;
+        use ironcache_raft::{Effects, RaftConfig, RaftNode, RaftRng, Role};
+        use std::collections::BTreeSet;
+
+        // A deterministic, env-free RNG for the test (no real RNG: ADR-0003). Election
+        // jitter does not affect the property under test; a fixed-zero draw is fine.
+        // Declared before any statement so the items-after-statements lint is happy.
+        struct ZeroRng;
+        impl RaftRng for ZeroRng {
+            fn gen_below(&mut self, _bound: u64) -> u64 {
+                0
+            }
+        }
+
+        let path = fresh_path("engine_recovers_persisted_term_and_vote_from_filestorage");
+
+        // A single-voter cluster: an election timeout makes the node leader at once and,
+        // crucially, PERSISTS term 1 and a self-vote through the FileStorage.
+        let voters: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        {
+            let storage = FileStorage::open(&path).expect("open fresh");
+            let mut node = RaftNode::new(NodeId(1), voters.clone(), storage, RaftConfig::default());
+            let mut rng = ZeroRng;
+            let mut out = Effects::new();
+            // A fixed virtual time; the engine reads time only via this argument.
+            let now = Monotonic::ZERO;
+            node.start(now, &mut rng, &mut out);
+            let mut out = Effects::new();
+            // Fire the election timeout: increments term to 1, self-votes (both
+            // persisted through FileStorage), and (single voter) wins leadership.
+            node.on_timer(now, &mut rng, ironcache_raft::ELECTION_TIMEOUT, &mut out);
+            assert_eq!(node.current_term(), 1);
+            assert_eq!(node.role(), Role::Leader);
+            assert_eq!(node.storage().voted_for(), Some(NodeId(1)));
+            // node (and its FileStorage) dropped here, flushing nothing new (already
+            // fsync'd); the on-disk log holds term 1 + the self-vote.
+        }
+
+        // Reopen the SAME file into a fresh engine: the recovered persistent state must
+        // carry term 1 and the self-vote, so the node cannot grant a SECOND vote in
+        // term 1 to some other candidate (the double-vote / split-brain hazard).
+        let storage = FileStorage::open(&path).expect("reopen recovers");
+        assert_eq!(
+            storage.current_term(),
+            1,
+            "the recovered node must remember term 1"
+        );
+        assert_eq!(
+            storage.voted_for(),
+            Some(NodeId(1)),
+            "the recovered node must remember it already voted in term 1"
+        );
+
+        // Prove it refuses a competing same-term vote. Rebuild a node on the recovered
+        // storage and feed a RequestVote from a DIFFERENT candidate at term 1.
+        let mut node = RaftNode::new(NodeId(1), voters, storage, RaftConfig::default());
+        let mut rng = ZeroRng;
+        let mut out = Effects::new();
+        let now = Monotonic::ZERO;
+        node.start(now, &mut rng, &mut out);
+        let mut out = Effects::new();
+        node.on_message(
+            now,
+            &mut rng,
+            NodeId(2),
+            ironcache_raft::RaftMsg::RequestVote {
+                term: 1,
+                candidate: NodeId(2),
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+            &mut out,
+        );
+        // The reply must DENY the vote: we already voted for NodeId(1) in term 1.
+        let granted = out.sends.iter().any(|(_, m)| {
+            matches!(
+                m,
+                ironcache_raft::RaftMsg::RequestVoteResp {
+                    vote_granted: true,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !granted,
+            "a recovered node must NOT grant a second vote in a term it already voted in"
+        );
+
+        cleanup(&path);
+    }
+}
