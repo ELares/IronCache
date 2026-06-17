@@ -462,6 +462,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironcache-sim"
+version = "0.0.0"
+dependencies = [
+ "ironcache-env",
+]
+
+[[package]]
 name = "ironcache-storage"
 version = "0.0.0"
 dependencies = [

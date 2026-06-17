@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-sim"
+description = "Deterministic single-threaded multi-node simulation harness (TESTING.md / JEPSEN_PLAN.md): virtual-time message network + fault injection for replayable consensus/replication tests."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ironcache-env = { workspace = true }
