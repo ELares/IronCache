@@ -15,6 +15,10 @@ pub mod coordinator;
 pub mod multikey;
 pub mod pubsub;
 pub mod raft_boot;
+/// HA-7d LIVE per-shard replica attach. Reached ONLY in raft-mode once an `AssignReplica`
+/// naming this node is committed; the default static path never touches it. `pub(crate)`:
+/// internal serve wiring, not a client surface.
+pub(crate) mod replica_attach;
 pub mod serve;
 pub mod spanning_combine;
 pub mod test_support;

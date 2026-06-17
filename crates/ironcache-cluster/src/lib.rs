@@ -110,7 +110,11 @@ struct NodeTable {
 ///   read only while holding the table lock so the index is consistent with the `nodes` snapshot;
 /// - the `table` (nodes + epochs, behind a `Mutex`) drives the COLD projection
 ///   ([`ranges`](Self::ranges) coalesces contiguous equal-owner runs into the `(start, end,
-///   node)` shape `CLUSTER SLOTS / SHARDS / NODES` need) and MOVED ([`moved_target`](Self::moved_target)).
+///   node)` shape `CLUSTER SLOTS / SHARDS / NODES` need) and MOVED ([`moved_target`](Self::moved_target));
+/// - the dense `replicas` array (slot -> replica node index, HA-7d) is a SEPARATE cold structure
+///   for the replica-read routing path ([`is_replica_of`](Self::is_replica_of) /
+///   [`replicas_of`](Self::replicas_of)), written only by the Raft `AssignReplica` apply
+///   ([`set_slot_replica`](Self::set_slot_replica)) and NEVER read by `owns()`.
 #[derive(Debug)]
 pub struct SlotMap {
     /// The node table + epochs (cold path: projection / MOVED / MEET / FORGET). NEVER read by
@@ -129,6 +133,17 @@ pub struct SlotMap {
     /// the `nodes` snapshot during a FORGET renumber), published by the slot mutators (`Release`).
     /// NOT read by [`owns`](Self::owns).
     owner: Box<[AtomicU16; CLUSTER_SLOTS as usize]>,
+    /// Dense slot -> REPLICA node-index map (32 KiB of `AtomicU16`, boxed off-stack), PARALLEL
+    /// to `owner` (HA-7d). `replicas[slot]` is the index into `table.nodes` of the node that
+    /// REPLICATES `slot` (the MVP single-replica-per-slot), or [`UNASSIGNED`] for a slot with no
+    /// replica. This is a NEW, purely-additive cold structure: it is read ONLY on the COLD replica
+    /// -read routing path ([`is_replica_of`](Self::is_replica_of) / [`replicas_of`](Self::replicas_of),
+    /// both lock-taking like [`moved_target`](Self::moved_target)), written ONLY by the Raft apply
+    /// path ([`set_slot_replica`](Self::set_slot_replica)), and NEVER touched by the hot `owns()`
+    /// path or the `mine[]` bitmap. So `owns()` stays a single `mine[slot]` atomic load and the
+    /// default static path is byte-unchanged (this array is all-[`UNASSIGNED`] unless an
+    /// AssignReplica is committed). It is renumbered alongside `owner` on FORGET.
+    replicas: Box<[AtomicU16; CLUSTER_SLOTS as usize]>,
     /// The index into `table.nodes` of THIS node. An atomic because FORGET can shift indices.
     /// Used ONLY on the cold projection / MOVED / mutation paths; [`owns`](Self::owns) does not
     /// read it (it reads `mine` instead).
@@ -371,6 +386,9 @@ impl SlotMap {
             }),
             mine,
             owner,
+            // No replicas at boot (the static path never assigns them; HA-7d's AssignReplica is
+            // the only writer). All-UNASSIGNED keeps the cold replica-read path inert.
+            replicas: new_owner_array(UNASSIGNED),
             self_idx: AtomicU16::new(self_idx_u16),
             my_epoch: AtomicU64::new(0),
             current_epoch: AtomicU64::new(0),
@@ -399,6 +417,8 @@ impl SlotMap {
             // A fresh node owns ZERO slots, so the self-ownership bitmap is all-false.
             mine: new_mine_array(false),
             owner: new_owner_array(UNASSIGNED),
+            // No replicas at boot (HA-7d AssignReplica is the only writer; see the field doc).
+            replicas: new_owner_array(UNASSIGNED),
             self_idx: AtomicU16::new(0),
             my_epoch: AtomicU64::new(0),
             current_epoch: AtomicU64::new(0),
@@ -444,6 +464,70 @@ impl SlotMap {
             .nodes
             .get(idx as usize)
             .map(|n| (n.host.to_string(), n.port))
+    }
+
+    /// The node INDICES that replicate `slot` (HA-7d), as an owned `Vec` so the caller holds no
+    /// borrow into the locked table. COLD projection, parallel to [`moved_target`](Self::moved_target):
+    /// it reads `replicas[slot]` (the MVP single replica) and returns it (or empty if none). The hot
+    /// `owns()` path never reads `replicas`, so this is purely additive.
+    ///
+    /// The returned indices are positions in the [`nodes`](Self::nodes) snapshot; callers that need
+    /// the node identity should take it alongside (or use [`is_replica_of`](Self::is_replica_of),
+    /// which resolves an id directly). MVP: at most one replica per slot, so the `Vec` has length 0
+    /// or 1; the `Vec` return shape leaves room for a multi-replica set without an API change.
+    #[must_use]
+    pub fn replicas_of(&self, slot: u16) -> Vec<u16> {
+        let idx = self.replicas[slot as usize].load(Ordering::Acquire);
+        if idx == UNASSIGNED {
+            Vec::new()
+        } else {
+            vec![idx]
+        }
+    }
+
+    /// Whether the node with id `node_id` REPLICATES `slot` (HA-7d). COLD: it loads `replicas[slot]`
+    /// and, under the node lock, compares the named node's table position (so the index stays
+    /// consistent with the `nodes` snapshot during a FORGET renumber, exactly like
+    /// [`moved_target`](Self::moved_target)). Returns `false` for an unassigned replica slot or an
+    /// unknown id. The hot `owns()` path is untouched; a node that is a slot's replica but NOT its
+    /// owner has `owns(slot) == false` and `is_replica_of(slot, self_id) == true`, which is what the
+    /// replica-read router keys on.
+    #[must_use]
+    pub fn is_replica_of(&self, slot: u16, node_id: &str) -> bool {
+        let idx = self.replicas[slot as usize].load(Ordering::Acquire);
+        if idx == UNASSIGNED {
+            return false;
+        }
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        table
+            .nodes
+            .get(idx as usize)
+            .is_some_and(|n| n.id.as_ref() == node_id)
+    }
+
+    /// Whether THIS node is a REPLICA of `slot` (HA-7d). COLD: it loads `replicas[slot]` then, IF
+    /// set, compares the replica node entry's advertised `(host, port)` to THIS node's advertised
+    /// endpoint under the node lock. Matching by ENDPOINT (not the table index) is deliberate: the
+    /// same physical node can appear in the table under MORE THAN ONE id (its own `empty_self`
+    /// announce id AND a host:port-synthesized id a peer's `CLUSTER MEET` added), so a committed
+    /// `AssignReplica` that named the synth id would point `replicas[slot]` at the synth-id entry
+    /// while `self_idx` points at the announce-id entry; both share this node's endpoint, so the
+    /// endpoint compare correctly recognizes self either way. It does NOT read the hot `mine[]`
+    /// bitmap, so `owns()` is untouched; a node can have `owns(slot) == false` while
+    /// `is_replica_of_self(slot) == true` (the exact replica-read condition).
+    #[must_use]
+    pub fn is_replica_of_self(&self, slot: u16) -> bool {
+        let idx = self.replicas[slot as usize].load(Ordering::Acquire);
+        if idx == UNASSIGNED {
+            return false;
+        }
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let self_idx = self.self_idx.load(Ordering::Acquire) as usize;
+        let (Some(rep), Some(me)) = (table.nodes.get(idx as usize), table.nodes.get(self_idx))
+        else {
+            return false;
+        };
+        rep.host == me.host && rep.port == me.port
     }
 
     /// THIS node's entry (id + advertised endpoint), cloned out from under the node lock.
@@ -662,6 +746,27 @@ impl SlotMap {
         Ok(())
     }
 
+    /// Assign `node_id` as the REPLICA of `slot` (HA-7d; the [`ConfigCmd::AssignReplica`] apply).
+    /// The node id must be known (a prior committed `AddNode`). Writes the new parallel
+    /// `replicas[slot]` index; it does NOT touch `owner[slot]`, `mine[slot]`, or `owns()`, so the
+    /// hot path is unaffected and a slot can have a distinct owner and replica simultaneously.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotMutError::UnknownNode`] if `node_id` is not in the node table.
+    pub fn set_slot_replica(&self, slot: u16, node_id: &str) -> Result<(), SlotMutError> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = table
+            .nodes
+            .iter()
+            .position(|n| n.id.as_ref() == node_id)
+            .ok_or_else(|| SlotMutError::UnknownNode(node_id.to_owned()))?;
+        // `idx` fits u16 (node count is bounded far below u16::MAX by the 16384 slots). Publish with
+        // a Release store so a concurrent cold reader on a shard thread sees a consistent value.
+        self.replicas[slot as usize].store(idx as u16, Ordering::Release);
+        Ok(())
+    }
+
     /// `CLUSTER FLUSHSLOTS`: release every slot THIS node owns (set them UNASSIGNED). Slots owned
     /// by OTHER nodes are untouched. Always succeeds.
     ///
@@ -737,6 +842,19 @@ impl SlotMap {
             let idx = o.load(Ordering::Acquire);
             if idx != UNASSIGNED && idx > removed_u16 {
                 o.store(idx - 1, Ordering::Release);
+            }
+        }
+        // Renumber `replicas[]` identically (HA-7d): a replica index strictly above `removed`
+        // shifts down by one, and any slot whose REPLICA was the removed node is cleared to
+        // UNASSIGNED (that replica is gone). This keeps `replicas[]` consistent with the shrunk
+        // node table, exactly as the owner renumber does for `owner[]`. `mine[]` is still
+        // untouched (the owns()-race reasoning is unchanged; replicas[] is never read by owns()).
+        for r in self.replicas.iter() {
+            let idx = r.load(Ordering::Acquire);
+            if idx == removed_u16 {
+                r.store(UNASSIGNED, Ordering::Release);
+            } else if idx != UNASSIGNED && idx > removed_u16 {
+                r.store(idx - 1, Ordering::Release);
             }
         }
         if me > removed {
@@ -1345,6 +1463,76 @@ mod tests {
         assert!(map.owns(0) && map.owns(1) && !map.owns(2));
         // ID2's slot still resolves after the renumber (owner-index path stays correct).
         assert_eq!(map.owner_id(2).unwrap().as_ref(), ID2);
+    }
+
+    // ----- HA-7d: replica assignment (the new parallel replicas[] structure) -----
+
+    #[test]
+    fn set_slot_replica_records_in_parallel_structure_without_touching_ownership() {
+        // self=ID0 owns slot 5; ID1 is a known peer assigned as the slot's REPLICA. The owner,
+        // the mine[] bitmap, and owns() must be UNAFFECTED by the replica assignment.
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.add_slots(&[5]).unwrap(); // self owns slot 5
+        assert!(map.owns(5));
+        assert!(map.replicas_of(5).is_empty(), "no replica yet");
+        assert!(!map.is_replica_of(5, ID1));
+
+        map.set_slot_replica(5, ID1).unwrap();
+        // Ownership is unchanged: self still owns slot 5 (owns() reads only mine[]).
+        assert!(map.owns(5), "replica assignment must not change owns()");
+        assert_eq!(map.owner_id(5).unwrap().as_ref(), ID0);
+        // The replica is recorded in the parallel structure.
+        assert!(map.is_replica_of(5, ID1));
+        assert!(
+            !map.is_replica_of(5, ID0),
+            "the owner is not its own replica here"
+        );
+        let reps = map.replicas_of(5);
+        assert_eq!(reps.len(), 1, "MVP single replica per slot");
+
+        // An unknown node id is rejected with the exact error (no mutation).
+        let err = map.set_slot_replica(5, ID2).unwrap_err();
+        assert_eq!(err, SlotMutError::UnknownNode(ID2.to_owned()));
+    }
+
+    #[test]
+    fn replicas_empty_by_default_and_owns_unchanged() {
+        // The default (no AssignReplica) map has an empty replica set for every slot, and the hot
+        // owns() path is byte-identical to the pre-HA-7d behavior (the static-path guarantee).
+        let map = three_node();
+        for slot in [0u16, 5461, 10922, 16383] {
+            assert!(map.replicas_of(slot).is_empty());
+            assert!(!map.is_replica_of(slot, ID0));
+            assert!(!map.is_replica_of(slot, ID1));
+        }
+        // owns() still reflects ONLY ownership (ID1 = the middle third).
+        assert!(map.owns(5461) && map.owns(10922));
+        assert!(!map.owns(0) && !map.owns(16383));
+    }
+
+    #[test]
+    fn forget_renumbers_and_clears_replicas() {
+        // self=ID0 (idx0), ID1 (idx1), ID2 (idx2). ID2 replicates slot 7; ID1 replicates slot 8.
+        // FORGET ID1 (slotless owner): ID2 shifts idx2->idx1, slot 7 must STILL resolve to ID2 as
+        // its replica; slot 8's replica (the removed ID1) must be CLEARED.
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.meet(node(ID2, "h2", 3));
+        map.set_slot_replica(7, ID2).unwrap();
+        map.set_slot_replica(8, ID1).unwrap();
+        assert!(map.is_replica_of(7, ID2));
+        assert!(map.is_replica_of(8, ID1));
+
+        map.forget(ID1).unwrap();
+        assert!(
+            map.is_replica_of(7, ID2),
+            "ID2's replica survives the reindex"
+        );
+        assert!(
+            map.replicas_of(8).is_empty(),
+            "the forgotten node's replica entry is cleared"
+        );
     }
 
     // ----- test-only helper: an owned owner id for a slot (mirrors the removed `owner()` ref) -----

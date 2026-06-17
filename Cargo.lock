@@ -342,6 +342,7 @@ dependencies = [
  "ironcache-protocol",
  "ironcache-raft",
  "ironcache-raft-net",
+ "ironcache-repl",
  "ironcache-runtime",
  "ironcache-server",
  "ironcache-storage",

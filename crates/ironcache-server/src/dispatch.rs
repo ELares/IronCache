@@ -508,6 +508,24 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
             state.reset(ctx.requires_auth());
             Value::SimpleString("RESET".to_owned())
         }
+        // READONLY / READWRITE (REPLICA_READ.md #147, HA-7d): set / clear the per-connection
+        // read-only bit. On a REPLICA the bit lets a keyed READ for a replicated slot be served
+        // locally; on any node it always replies +OK (Redis: these are accepted unconditionally,
+        // the bit only changes routing). Each takes exactly the command token (arity 1).
+        b"READONLY" => {
+            if req.args.len() != 1 {
+                return Value::error(ErrorReply::wrong_arity("readonly"));
+            }
+            state.readonly = true;
+            Value::ok()
+        }
+        b"READWRITE" => {
+            if req.args.len() != 1 {
+                return Value::error(ErrorReply::wrong_arity("readwrite"));
+            }
+            state.readonly = false;
+            Value::ok()
+        }
         // -- Transaction control: MULTI/EXEC/DISCARD (PR-10a) + WATCH/UNWATCH (PR-10b),
         // TRANSACTIONS.md. These reach `dispatch_inner` only as direct client commands
         // (the queue gate in `dispatch` excludes MULTI/EXEC/DISCARD/RESET/QUIT/WATCH from

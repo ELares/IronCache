@@ -333,6 +333,21 @@ thread_local! {
     // expired memory with no further commands. A plain Cell suffices (single-threaded
     // per shard; shared-nothing ADR-0002).
     static EXPIRE_TASK_SPAWNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Whether THIS shard is a PASSIVE REPLICA (HA-7d, CARRY-FORWARD 2). A replica's store is
+    // a faithful mirror of the slot OWNER's: it must apply key removals ONLY from the
+    // replication stream (via `ReplicaApplier`), NEVER from its OWN active-expiry reaper or
+    // capacity eviction -- else it would independently drop keys the primary still holds and
+    // DIVERGE from the primary. Set `true` by [`crate::replica_attach`] when this shard
+    // becomes a committed replica (the atomic store swap point), and checked at the TOP of
+    // [`expire_cycle_tick`] (the background reaper) which returns 0 immediately when passive.
+    // A plain `Cell` suffices (single-threaded per shard; shared-nothing ADR-0002). DEFAULTS
+    // `false`, so the non-replica path is byte-unchanged: the reaper runs exactly as before
+    // and this Cell is only ever read (one bool load) on a path that already borrows the
+    // shard state. The eviction/admission removal path is unreachable on a replica for a
+    // separate reason (documented on `set_replica_passive`): a replica never serves the
+    // owner's WRITE path, so no admission/evict runs there; removals arrive only via the
+    // stream. This guard closes the one remaining self-removal source (the timer reaper).
+    static REPLICA_PASSIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // The shard's PER-SHARD Pub/Sub subscription table (SERVER_PUSH.md #20, PR 91a): channel
     // -> {conn id -> push sender}. Core-local (per shard, shared-nothing ADR-0002) with NO
     // lock; held as Rc<RefCell<..>> exactly like STORE/WHEEL/ENV so a connection task, the
@@ -342,6 +357,44 @@ thread_local! {
     // to every shard, so each shard renders to its own connections from its own table).
     static PUBSUB: RefCell<Option<Rc<RefCell<crate::pubsub::ShardPubSub>>>> =
         const { RefCell::new(None) };
+}
+
+/// Mark THIS shard as a PASSIVE REPLICA (HA-7d, CARRY-FORWARD 2), or clear the mark.
+///
+/// `pub(crate)` so [`crate::replica_attach`] sets it `true` at the ATOMIC STORE SWAP point
+/// (when this shard adopts the owner's full-sync) and clears it back to `false` if the shard
+/// ever stops being a replica (a future role change / teardown). Once set, the background
+/// active-expiry reaper ([`expire_cycle_tick`]) is INERT on this shard (returns 0 without
+/// touching the store), so the replica never independently reaps a key the owner still holds.
+///
+/// ## Why this is the only self-removal source to gate
+///
+/// A passive replica must remove keys ONLY from the replication stream (via
+/// `ironcache_repl::ReplicaApplier`), so its keyspace stays byte-identical to the owner's.
+/// There are exactly THREE places the store removes a key on its OWN initiative:
+/// 1. the BACKGROUND active-expiry timer ([`spawn_expire_task`] -> [`expire_cycle_tick`]) --
+///    gated HERE (the reaper returns 0 when passive);
+/// 2. the OPPORTUNISTIC per-command active-expiry drain + lazy-expiry probe -- reached only on
+///    the COMMAND path, which a replica connection never drives for its replicated slots (a
+///    READONLY read returns the value; a write returns `-MOVED` to the owner before any store
+///    borrow), and the cross-shard drain loop only runs work the coordinator routes to an
+///    OWNED slot, never a replicated one;
+/// 3. capacity EVICTION on the ADMISSION path -- reached only on the owner's WRITE path, which
+///    a replica never serves (a write to a replicated slot is `-MOVED` to the owner).
+///
+/// So gating the timer reaper here, plus the structural fact that a replica never serves the
+/// write/admission path, makes the replica store removal-passive end to end. The applier's
+/// own `delete` (from a `StreamDel`) is the SANCTIONED removal and is unaffected.
+pub(crate) fn set_replica_passive(passive: bool) {
+    REPLICA_PASSIVE.with(|c| c.set(passive));
+}
+
+/// Whether THIS shard is currently a passive replica (HA-7d, CARRY-FORWARD 2). Defaults
+/// `false` (the non-replica path), a single `Cell` bool load. `pub(crate)` for
+/// [`crate::replica_attach`] to read its own attach state and for the reaper guard.
+#[must_use]
+pub(crate) fn is_replica_passive() -> bool {
+    REPLICA_PASSIVE.with(std::cell::Cell::get)
 }
 
 /// The shard's per-shard Pub/Sub subscription table handle (SERVER_PUSH.md #20, PR 91a),
@@ -436,6 +489,15 @@ fn expire_cycle_tick(
     wheel_rc: &Rc<RefCell<TimingWheel>>,
     state_rc: &Rc<RefCell<ShardState>>,
 ) -> u64 {
+    // CARRY-FORWARD 2 (PASSIVE replica, HA-7d): a replica shard must NOT run its own active
+    // expiry -- it would independently reap keys the slot OWNER still holds and DIVERGE. When
+    // this shard is a passive replica, the reaper is INERT: return 0 BEFORE taking any store /
+    // wheel borrow (a single `Cell` bool load). Removals on a replica arrive ONLY from the
+    // replication stream (`ReplicaApplier`). DEFAULTS `false`, so the non-replica path is
+    // byte-unchanged (one bool test, then the identical reap below). See `set_replica_passive`.
+    if is_replica_passive() {
+        return 0;
+    }
     // The WORK (which keys are due) is decided by the Env clock (ADR-0003), so a DST
     // replay reaps the identical keys; only the FIRING schedule is wall-clock.
     let now = UnixMillis(env.borrow().now_unix_millis());
@@ -492,6 +554,34 @@ pub(crate) fn scan_reserved_bits(total_shards: usize) -> u32 {
     }
 }
 
+/// Build a FRESH [`ShardStoreImpl`] with this shard's configured eviction policy, accounting,
+/// and scan-band width, WITHOUT caching it in the thread-local (unlike [`shard_store`], which
+/// builds-once-and-caches the LIVE store).
+///
+/// This is the constructor the HA-7d replica attach hands to `receive_full_sync` as its
+/// `make_store` argument. The temp store a full-sync loads into must be the SAME concrete type
+/// the live serve path uses, so an ATOMIC SWAP of it into the live `STORE` handle is
+/// type-identical and behaves the same (same Policy from the configured name, same
+/// `CountingAccounting`, same scan-band bits). It shares the build logic with [`shard_store`]
+/// so the two never drift. `pub(crate)` for [`crate::replica_attach`].
+pub(crate) fn fresh_shard_store(
+    databases: u32,
+    policy_name: &str,
+    reserved_bits: u32,
+) -> ShardStoreImpl {
+    // Build the shard's eviction policy from the configured name, seeding the Random variant
+    // from THIS shard's Env RNG (ADR-0003: no std rand; the seed comes through the determinism
+    // seam). The name was validated at config time, so map_policy_name cannot return None here;
+    // fall back to the cache default defensively if a future un-validated path slips in.
+    let seed = shard_env().borrow_mut().rng().next_u64();
+    let policy = map_policy_name(policy_name, seed).unwrap_or_else(Policy::cache_default);
+    // The reserved-band width makes `scan_step` return band-aligned next cursors for the
+    // cross-shard composite cursor (0 on a single-shard server, so SCAN stays byte-identical to
+    // before the coordinator layer; FIX 1).
+    ShardStore::with_hooks(databases, policy, CountingAccounting::new())
+        .with_scan_band_bits(reserved_bits)
+}
+
 pub(crate) fn shard_store(
     databases: u32,
     policy_name: &str,
@@ -500,19 +590,11 @@ pub(crate) fn shard_store(
     STORE.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.is_none() {
-            // Build the shard's eviction policy from the configured name, seeding the
-            // Random variant from THIS shard's Env RNG (ADR-0003: no std rand; the
-            // seed comes through the determinism seam). The name was validated at
-            // config time, so map_policy_name cannot return None here; fall back to
-            // the cache default defensively if a future un-validated path slips in.
-            let seed = shard_env().borrow_mut().rng().next_u64();
-            let policy = map_policy_name(policy_name, seed).unwrap_or_else(Policy::cache_default);
-            // The reserved-band width makes `scan_step` return band-aligned next cursors
-            // for the cross-shard composite cursor (0 on a single-shard server, so SCAN
-            // stays byte-identical to before the coordinator layer; FIX 1).
-            let store = ShardStore::with_hooks(databases, policy, CountingAccounting::new())
-                .with_scan_band_bits(reserved_bits);
-            *b = Some(Rc::new(RefCell::new(store)));
+            *b = Some(Rc::new(RefCell::new(fresh_shard_store(
+                databases,
+                policy_name,
+                reserved_bits,
+            ))));
         }
         Rc::clone(b.as_ref().unwrap())
     })
@@ -880,6 +962,7 @@ fn cluster_redirect(
     route: route::CommandClass,
     cmd_upper: &[u8],
     request: &Request,
+    readonly: bool,
 ) -> Option<ironcache_protocol::ErrorReply> {
     // (a) keyless / admin exemption: only KEYED data commands carry slots.
     let spec = match route {
@@ -891,6 +974,13 @@ fn cluster_redirect(
         route::CommandClass::AlwaysHome | route::CommandClass::WholeKeyspace => return None,
     };
 
+    // HA-7d replica-read gate (REPLICA_READ.md #147): a READ on a READONLY connection MAY be
+    // served locally by a replica of the slot. A WRITE never is (it returns MOVED to the owner),
+    // and a non-READONLY connection never is (the default strong-read behavior). The command's
+    // write-ness comes from the #89 registry (`is_write`); an unknown command is treated as a
+    // write (conservative), so a replica never serves an unrecognized command locally.
+    let replica_serves = readonly && !ironcache_server::command_spec::is_write(cmd_upper);
+
     // (b) reduce the key(s) to a slot via the CLIENT-VISIBLE key_slot (CRC16 + hash-tag) and
     // apply the ONE shared redirect rule (CROSSSLOT-before-MOVED). The `route::KeySpec` is just
     // a borrowed view over the request bytes, so collapse it to an iterator of key slices and
@@ -898,8 +988,8 @@ fn cluster_redirect(
     match spec {
         // No routable key (malformed / short): fall through, the handler errors properly.
         route::KeySpec::None => None,
-        route::KeySpec::One(k) => redirect_for_keys(map, std::iter::once(k)),
-        route::KeySpec::Many(keys) => redirect_for_keys(map, keys.iter().copied()),
+        route::KeySpec::One(k) => redirect_for_keys(map, std::iter::once(k), replica_serves),
+        route::KeySpec::Many(keys) => redirect_for_keys(map, keys.iter().copied(), replica_serves),
     }
 }
 
@@ -922,6 +1012,7 @@ fn cluster_redirect(
 fn redirect_for_keys<'a, I>(
     map: &ironcache_cluster::SlotMap,
     keys: I,
+    replica_serves: bool,
 ) -> Option<ironcache_protocol::ErrorReply>
 where
     I: IntoIterator<Item = &'a [u8]>,
@@ -936,22 +1027,38 @@ where
             return Some(ironcache_protocol::ErrorReply::crossslot());
         }
     }
-    // All keys co-locate on one slot: MOVED if this node does not own it.
-    moved_if_unowned(map, first_slot)
+    // All keys co-locate on one slot: MOVED if this node neither owns nor (read-only) replicates
+    // it. `replica_serves` carries the HA-7d READONLY-read gate (see `moved_if_unowned`).
+    moved_if_unowned(map, first_slot, replica_serves)
 }
 
-/// `Some(-MOVED <slot> <owner host:port>)` when THIS node does not own `slot`, else `None`.
+/// `Some(-MOVED <slot> <owner host:port>)` when THIS node does not own `slot` (and does not serve
+/// it as a read-only replica), else `None`.
+///
+/// `replica_serves` is the HA-7d replica-read gate: `true` when the request is a READ on a
+/// READONLY connection (computed by the caller from `conn.readonly && !is_write`). When set, a
+/// slot this node does NOT own but IS a committed replica of ([`SlotMap::is_replica_of_self`]) is
+/// served LOCALLY (returns `None`), the replica-read leg of REPLICA_READ.md #147. A write, a
+/// non-READONLY read, or a slot this node neither owns nor replicates still returns `-MOVED` to
+/// the OWNER. `replica_serves` is `false` for every non-replica/non-readonly path, so the default
+/// (owner-only) routing is byte-unchanged; the cold `is_replica_of_self` check runs ONLY when a
+/// slot is already known foreign AND the connection opted into replica reads.
 ///
 /// The redirect target is the OWNER node's advertised `host:port` (what the client should dial),
 /// never the bind address. `moved_target` resolves the owner's advertised endpoint under the
 /// node lock (the COLD redirect path); the `?` on its `None` (an unassigned slot) is defensive
-/// (an empty-self / mid-formation node may not yet own the slot, and slice 3 has no peer that
-/// could serve it, so we simply do not redirect rather than dial a nonexistent owner).
+/// (an empty-self / mid-formation node may not yet own the slot, so we simply do not redirect
+/// rather than dial a nonexistent owner).
 fn moved_if_unowned(
     map: &ironcache_cluster::SlotMap,
     slot: u16,
+    replica_serves: bool,
 ) -> Option<ironcache_protocol::ErrorReply> {
     if map.owns(slot) {
+        return None;
+    }
+    // HA-7d replica read: a READONLY read for a slot this node replicates is served locally.
+    if replica_serves && map.is_replica_of_self(slot) {
         return None;
     }
     let (host, port) = map.moved_target(slot)?;
@@ -1179,7 +1286,11 @@ async fn route_and_dispatch(
     // client-visible, retryable redirect) takes precedence over the internal-shard error.
     if cmd_upper == b"WATCH" && request.args.len() >= 2 {
         if let Some(map) = ctx.cluster.as_deref() {
-            if let Some(reply) = redirect_for_keys(map, request.args[1..].iter().map(AsRef::as_ref))
+            // WATCH snapshots for a transaction (a CAS that gates a WRITE), so it must NEVER be
+            // served by a replica's stale state: pass `replica_serves = false` so a WATCH of a
+            // foreign slot always MOVEDs to the owner, even on a READONLY replica connection.
+            if let Some(reply) =
+                redirect_for_keys(map, request.args[1..].iter().map(AsRef::as_ref), false)
             {
                 state_rc.borrow_mut().counters.on_command();
                 encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
@@ -1221,7 +1332,7 @@ async fn route_and_dispatch(
     // The in-MULTI path does NOT reach here (it returned to `route_in_multi` above); queued
     // commands are checked at QUEUE time there, reusing this SAME predicate.
     if let Some(map) = ctx.cluster.as_deref() {
-        if let Some(reply) = cluster_redirect(map, route, &cmd_upper, request) {
+        if let Some(reply) = cluster_redirect(map, route, &cmd_upper, request, conn.readonly) {
             state_rc.borrow_mut().counters.on_command();
             encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
             // Short-circuit WITHOUT closing the connection (same as the WATCH guard above):
@@ -1434,6 +1545,11 @@ async fn try_raft_cluster_mutator(
         b"MEET" => Some(build_meet(request).map(|c| vec![c])),
         b"FORGET" => Some(build_forget(request).map(|c| vec![c])),
         b"SET-CONFIG-EPOCH" => Some(build_set_config_epoch(request).map(|c| vec![c])),
+        // HA-7d: `CLUSTER REPLICATE <node-id> <slot> [slot ...]` assigns `<node-id>` as a REPLICA
+        // of the listed slots (drives `AssignReplica`). The named node must already be known (a
+        // prior MEET / AddNode); the committed log order guarantees that, and the replica node
+        // then attaches to each slot OWNER's primary (full-sync + tail) and serves READONLY reads.
+        b"REPLICATE" => Some(build_replicate(request).map(|c| vec![c])),
         // No UNASSIGN ConfigCmd yet (scoped out): a clear not-supported reply, not a silent
         // fall-through to the static local mutator (which would diverge from the committed map).
         b"DELSLOTS" | b"DELSLOTSRANGE" | b"FLUSHSLOTS" => {
@@ -1448,8 +1564,8 @@ async fn try_raft_cluster_mutator(
             );
             return Some(false);
         }
-        // Any other subcommand (the introspection set, BUMPEPOCH, REPLICATE, HELP, unknown, ...)
-        // is NOT a mutator: fall through to the unchanged home dispatch.
+        // Any other subcommand (the introspection set, BUMPEPOCH, HELP, unknown, ...) is NOT a
+        // mutator: fall through to the unchanged home dispatch.
         _ => None,
     };
 
@@ -1660,6 +1776,30 @@ fn build_set_config_epoch(
     Ok(ironcache_raft::ConfigCmd::SetConfigEpoch(epoch as u64))
 }
 
+/// Build the `AssignReplica { node, slots }` ConfigCmd for raft-mode `CLUSTER REPLICATE <node-id>
+/// <slot> [slot ...]` (HA-7d). The first arg after the subcommand is the node id that should
+/// REPLICATE the listed slots; the rest are strictly-validated slots. Arity is Min(4) (the verb,
+/// REPLICATE, the node id, and at least one slot). The committed entry records `node` as the
+/// replica of each slot in the shared map; the named node then attaches to each slot owner's
+/// primary and serves READONLY reads.
+fn build_replicate(
+    request: &Request,
+) -> Result<ironcache_raft::ConfigCmd, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::ErrorReply;
+    if request.args.len() < 4 {
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&request.args[1]),
+        ));
+    }
+    let node = String::from_utf8_lossy(&request.args[2]).into_owned();
+    let mut slots = Vec::with_capacity(request.args.len() - 3);
+    for a in &request.args[3..] {
+        slots.push(parse_slot_strict(a)?);
+    }
+    Ok(ironcache_raft::ConfigCmd::AssignReplica { node, slots })
+}
+
 /// THIS node's committed identity `(id, host, port)` for a self-`AddNode` / `AssignSlots`,
 /// read from the shared map's self entry (the advertised endpoint a MOVED redirect points at).
 /// Falls back to the boot node id + bind/port if the map is somehow absent (unreachable in
@@ -1803,7 +1943,7 @@ fn route_in_multi(
     // intra-node `all_keys_home_owned` gate: cluster ownership (which NODE) is the outer
     // question, internal-shard ownership (which of MY shards) the inner one.
     if let Some(map) = ctx.cluster.as_deref() {
-        if let Some(reply) = cluster_redirect(map, route, cmd_upper, request) {
+        if let Some(reply) = cluster_redirect(map, route, cmd_upper, request, conn.readonly) {
             state_rc.borrow_mut().counters.on_command();
             conn.dirty_exec = true;
             encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
@@ -2880,7 +3020,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req),
+            cluster_redirect(&map, route, b"GET", &req, false),
             None,
             "an owned single-key command proceeds (no redirect)"
         );
@@ -2893,7 +3033,8 @@ mod tests {
         let slot = ironcache_protocol::key_slot(key.as_bytes());
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
-        let reply = cluster_redirect(&map, route, b"GET", &req).expect("foreign key -> MOVED");
+        let reply =
+            cluster_redirect(&map, route, b"GET", &req, false).expect("foreign key -> MOVED");
         // The MOVED carries the CLIENT-VISIBLE slot and node B's ADVERTISED host:port.
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -2906,7 +3047,8 @@ mod tests {
         let hi = key_in_slot_range(8192, 16383);
         let req = rreq(&[b"MGET", lo.as_bytes(), hi.as_bytes()]);
         let route = route::classify(b"MGET");
-        let reply = cluster_redirect(&map, route, b"MGET", &req).expect("cross-slot -> CROSSSLOT");
+        let reply =
+            cluster_redirect(&map, route, b"MGET", &req, false).expect("cross-slot -> CROSSSLOT");
         assert_eq!(
             reply.line(),
             "-CROSSSLOT Keys in request don't hash to the same slot"
@@ -2923,7 +3065,7 @@ mod tests {
             })
             .expect("a second distinct high-half slot");
         let req2 = rreq(&[b"MGET", h1.as_bytes(), h2.as_bytes()]);
-        let reply2 = cluster_redirect(&map, route, b"MGET", &req2).expect("still CROSSSLOT");
+        let reply2 = cluster_redirect(&map, route, b"MGET", &req2, false).expect("still CROSSSLOT");
         assert_eq!(
             reply2.line(),
             "-CROSSSLOT Keys in request don't hash to the same slot",
@@ -2952,7 +3094,7 @@ mod tests {
         let req = rreq(&[b"MGET", k1.as_bytes(), k2.as_bytes()]);
         let route = route::classify(b"MGET");
         assert_eq!(
-            cluster_redirect(&map, route, b"MGET", &req),
+            cluster_redirect(&map, route, b"MGET", &req, false),
             None,
             "co-located + owned multi-key proceeds"
         );
@@ -2967,7 +3109,7 @@ mod tests {
             let req = rreq(&[cmd, b"*"]);
             let route = route::classify(cmd);
             assert_eq!(
-                cluster_redirect(&map, route, cmd, &req),
+                cluster_redirect(&map, route, cmd, &req, false),
                 None,
                 "{} must be exempt from cluster redirect",
                 String::from_utf8_lossy(cmd)
@@ -2982,7 +3124,7 @@ mod tests {
         // the proper wrong-arity error rather than a redirect.
         let req = rreq(&[b"GET"]);
         let route = route::classify(b"GET");
-        assert_eq!(cluster_redirect(&map, route, b"GET", &req), None);
+        assert_eq!(cluster_redirect(&map, route, b"GET", &req, false), None);
     }
 
     // ----- redirect_for_keys (the SHARED predicate WATCH uses directly over its key args) -----
@@ -2997,7 +3139,7 @@ mod tests {
         let map = redirect_map();
         let key = key_in_slot_range(0, 8191); // owned by self
         assert_eq!(
-            redirect_for_keys(&map, std::iter::once(key.as_bytes())),
+            redirect_for_keys(&map, std::iter::once(key.as_bytes()), false),
             None,
             "a single owned key proceeds (this is the WATCH-of-owned-key +OK case)"
         );
@@ -3008,7 +3150,7 @@ mod tests {
         let map = redirect_map();
         let key = key_in_slot_range(8192, 16383); // owned by node B
         let slot = ironcache_protocol::key_slot(key.as_bytes());
-        let reply = redirect_for_keys(&map, std::iter::once(key.as_bytes()))
+        let reply = redirect_for_keys(&map, std::iter::once(key.as_bytes()), false)
             .expect("foreign key -> MOVED (the WATCH-of-foreign-key case)");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -3019,7 +3161,7 @@ mod tests {
         let lo = key_in_slot_range(0, 8191);
         let hi = key_in_slot_range(8192, 16383);
         let keys = [lo.as_bytes(), hi.as_bytes()];
-        let reply = redirect_for_keys(&map, keys.iter().copied())
+        let reply = redirect_for_keys(&map, keys.iter().copied(), false)
             .expect("two keys spanning slots -> CROSSSLOT (the WATCH-of-two-spanning-keys case)");
         assert_eq!(
             reply.line(),
@@ -3032,9 +3174,77 @@ mod tests {
         let map = redirect_map();
         let empty: std::iter::Empty<&[u8]> = std::iter::empty();
         assert_eq!(
-            redirect_for_keys(&map, empty),
+            redirect_for_keys(&map, empty, false),
             None,
             "no key -> None (defensive; a well-formed WATCH always has >=1 key)"
         );
+    }
+
+    // ----- HA-7d replica-read routing (REPLICA_READ.md #147) -----
+    //
+    // `self` = node A owns the low half [0,8191]; node B owns [8192,16383]. We make A a REPLICA
+    // of one of B's slots and assert: a READONLY read for that slot is served locally (None),
+    // a WRITE is MOVED to B even under READONLY, and a non-READONLY read is MOVED to B.
+
+    /// `redirect_map()` plus: `self` (node A) is made a replica of a single B-owned slot. Returns
+    /// `(map, foreign_replicated_key)` where the key hashes to that slot.
+    fn redirect_map_with_self_replica() -> (ironcache_cluster::SlotMap, String) {
+        let map = redirect_map();
+        let key = key_in_slot_range(8192, 16383); // B-owned
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        // A (== self, RID_A) replicates this B-owned slot.
+        map.set_slot_replica(slot, RID_A)
+            .expect("RID_A is a known node");
+        (map, key)
+    }
+
+    #[test]
+    fn replica_serves_readonly_read_locally() {
+        let (map, key) = redirect_map_with_self_replica();
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        // READONLY (replica_serves = true via readonly=true & GET is a read): served locally.
+        assert_eq!(
+            cluster_redirect(&map, route, b"GET", &req, true),
+            None,
+            "a READONLY GET for a replicated slot is served locally (no MOVED)"
+        );
+    }
+
+    #[test]
+    fn replica_moves_write_even_under_readonly() {
+        let (map, key) = redirect_map_with_self_replica();
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        let req = rreq(&[b"SET", key.as_bytes(), b"v"]);
+        let route = route::classify(b"SET");
+        // SET is a write: MOVED to the OWNER (B) even on a READONLY connection.
+        let reply = cluster_redirect(&map, route, b"SET", &req, true)
+            .expect("a write on a replica is MOVED to the owner even under READONLY");
+        assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
+    }
+
+    #[test]
+    fn replica_moves_non_readonly_read() {
+        let (map, key) = redirect_map_with_self_replica();
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        // A non-READONLY (default) connection gets MOVED to the owner for the strong read.
+        let reply = cluster_redirect(&map, route, b"GET", &req, false)
+            .expect("a non-READONLY read of a replicated-but-not-owned slot is MOVED to the owner");
+        assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
+    }
+
+    #[test]
+    fn replica_read_does_not_engage_for_a_slot_this_node_does_not_replicate() {
+        // A READONLY read for a B-owned slot this node does NOT replicate is still MOVED.
+        let map = redirect_map(); // no replica assignment
+        let key = key_in_slot_range(8192, 16383);
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        let reply = cluster_redirect(&map, route, b"GET", &req, true)
+            .expect("READONLY does not serve a slot this node neither owns nor replicates");
+        assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
 }
