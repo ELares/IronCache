@@ -229,6 +229,16 @@ pub(crate) fn spawn_on_shard(
     let databases = ctx.databases;
     let policy_name = ctx.info.maxmemory_policy;
     let reserved_bits = crate::serve::scan_reserved_bits(ctx.shards);
+    // HA-8 failover inputs: the Raft handle to PROPOSE a promotion, this node's 40-hex id (the
+    // `new_primary` of a self-proposed promotion), the lag bound (promotion eligibility gate), and
+    // the link-down timeout before proposing. The handle is cloned (Send); a `None` (defensive,
+    // raft-mode always has one) simply disables self-promotion.
+    let raft = ctx.raft.clone();
+    let self_node_id = ctx.info.cluster_node_id.to_string();
+    let failover = FailoverParams {
+        replica_max_lag: ctx.boot.replica_max_lag,
+        failover_timeout: Duration::from_secs(ctx.boot.failover_timeout_secs),
+    };
     rt.spawn_on_shard(async move {
         run_replica_control(
             TokioRuntime::new(),
@@ -238,9 +248,25 @@ pub(crate) fn spawn_on_shard(
             policy_name,
             reserved_bits,
             status,
+            raft,
+            self_node_id,
+            failover,
         )
         .await;
     });
+}
+
+/// HA-8 failover-detection knobs handed to the replica control task (kept in one struct so the
+/// task's already-wide signature does not grow two more scalars).
+#[derive(Debug, Clone, Copy)]
+struct FailoverParams {
+    /// The replication-lag bound (logical writes): a replica is promotion-eligible ONLY when it
+    /// was in sync within this bound at last contact (ADR-0026, so a stale replica is never
+    /// promoted -> no data loss beyond the async-replication window).
+    replica_max_lag: u64,
+    /// How long the master link must be CONTINUOUSLY down before this replica proposes its own
+    /// promotion (the failover-detection timeout).
+    failover_timeout: Duration,
 }
 
 // ===========================================================================================
@@ -488,6 +514,18 @@ async fn read_attach_handshake(
 /// should be a replica and is not yet attached, attach (full-sync + tail). Loops forever (the
 /// shard's lifetime), so a role change that makes this node a replica LATER is picked up, and a
 /// detached / dropped link is re-attached.
+///
+/// HA-8 FAILOVER DETECTION lives here (the cleanest place: this task already owns the
+/// replica-side link lifecycle). When `attach_once` returns the link is down; this task records
+/// HOW LONG it has been continuously down, and once that exceeds `failover.failover_timeout` AND
+/// the replica was IN SYNC at last contact (the lag gate, so a stale replica is never promoted),
+/// it PROPOSES `PromoteReplica { its replicated slots, itself }` to the Raft leader through the
+/// `Send` [`RaftHandle`]. On the leader the proposal commits and every node (including the OLD
+/// primary, once it rejoins) applies it; the committed log + the epoch bump is THE SPLIT-BRAIN
+/// FENCE (only one owner per slot at any committed epoch). A spurious promotion (the primary was
+/// actually alive) is SAFE for split-brain -- the committed entry atomically transfers ownership
+/// and the old primary steps down on apply; it costs only an unnecessary failover (like Sentinel).
+#[allow(clippy::too_many_arguments)]
 async fn run_replica_control(
     rt: TokioRuntime,
     cluster: std::sync::Arc<ironcache_cluster::SlotMap>,
@@ -496,7 +534,14 @@ async fn run_replica_control(
     policy_name: &'static str,
     reserved_bits: u32,
     status: std::sync::Arc<ReplNodeStatus>,
+    raft: Option<ironcache_server::RaftHandle>,
+    self_node_id: String,
+    failover: FailoverParams,
 ) {
+    // HA-8: how long the master link has been CONTINUOUSLY down (None == the link is up / never
+    // attached). Reset to the current env time on the FIRST down observation after a healthy
+    // contact, and cleared on a successful (re)attach, so the elapsed measures one unbroken outage.
+    let mut down_since: Option<ironcache_env::Monotonic> = None;
     loop {
         // Should THIS shard be a replica right now? (single-shard: replica of ANY slot.)
         if let Some(slot) = any_replica_of_self(&cluster) {
@@ -525,22 +570,141 @@ async fn run_replica_control(
                         &status,
                     )
                     .await;
-                    // The attach returned: the link is down (drop / gap / dial fail). Publish the
-                    // link-down state (HA-7e) so INFO reports master_link_status:down and the
-                    // promotion gate sees this replica as not in sync until it re-attaches.
+                    // The attach returned: the link is down (drop / gap / dial fail). BEFORE we
+                    // publish link-down, snapshot whether the replica was in sync AT LAST CONTACT:
+                    // `attach_once` left the status with link UP (set at attach) + the last
+                    // observed master head + applied offset, so `is_in_sync` here reflects the lag
+                    // at the moment the link broke. A dial-fail (never attached this round) leaves
+                    // the prior link state; in_sync is false then, which correctly withholds a
+                    // promotion until a real in-sync contact has happened.
+                    let in_sync_at_last_contact = status.is_in_sync(failover.replica_max_lag);
+                    // Was the link actually UP this round (a real attach), vs a dial-fail that never
+                    // connected? A real attach means THIS return starts a FRESH outage, so reset the
+                    // outage clock; a dial-fail leaves the running outage clock intact (the master
+                    // has been unreachable continuously). Snapshot the link BEFORE marking it down.
+                    let was_attached = status.snapshot().master_link.is_up();
+                    // Publish the link-down state (HA-7e) so INFO reports master_link_status:down
+                    // and the read-staleness + promotion gates see this replica as not in sync
+                    // until it re-attaches.
                     status.set_master_link_down();
+                    // HA-8: the outage clock. A fresh attach-then-drop RESTARTS it at `now` (so the
+                    // failover timeout measures THIS unbroken outage, not a stale earlier one); a
+                    // dial-fail with the link already down KEEPS the existing start. Then check
+                    // whether the outage + the lag gate warrant a self-promotion.
+                    let now = now_monotonic();
+                    if was_attached {
+                        down_since = Some(now);
+                    }
+                    let started = *down_since.get_or_insert(now);
+                    if now.saturating_duration_since(started) >= failover.failover_timeout {
+                        maybe_propose_self_promotion(
+                            &cluster,
+                            raft.as_ref(),
+                            &self_node_id,
+                            in_sync_at_last_contact,
+                        )
+                        .await;
+                        // Whether or not the proposal landed (it may have been NotLeader, or the
+                        // committed promotion may not have applied here yet), keep retrying on the
+                        // backoff cadence; once the promotion commits, this node OWNS the slots and
+                        // `any_replica_of_self` returns None, so the loop falls through to the idle
+                        // poll (it is no longer a replica of anything).
+                    }
                     // After a link drop, back off briefly before re-attaching.
                     rt.timer(RECONNECT_BACKOFF).await;
                     continue;
                 }
             }
-            // Owner not resolvable yet: back off and re-check.
+            // Owner not resolvable yet: treat as a down link for the outage clock too, then back
+            // off and re-check.
+            down_since.get_or_insert_with(now_monotonic);
             rt.timer(RECONNECT_BACKOFF).await;
         } else {
-            // Not a replica (the steady state until an AssignReplica commits): idle-poll.
+            // Not a replica (the steady state until an AssignReplica commits, OR after a committed
+            // promotion made THIS node the owner). The link is healthy-or-irrelevant: clear the
+            // outage clock so a future replica role starts a fresh failover-timeout window.
+            down_since = None;
             rt.timer(POLL_INTERVAL).await;
         }
     }
+}
+
+/// The replica-side HA-8 failover proposal: if this node was IN SYNC at last contact (the lag
+/// gate) and a Raft handle is available, PROPOSE `PromoteReplica { the slots this node replicates,
+/// itself }` to the leader. A no-op when not in sync (a stale replica must NOT be promoted -> no
+/// data loss) or when there is no handle (defensive; raft-mode always has one). The proposal is
+/// fire-and-forget from this task's perspective: a `NotLeader` outcome just means we retry on the
+/// next outage tick; a committed promotion flips ownership cluster-wide via the fenced log.
+async fn maybe_propose_self_promotion(
+    cluster: &ironcache_cluster::SlotMap,
+    raft: Option<&ironcache_server::RaftHandle>,
+    self_node_id: &str,
+    in_sync_at_last_contact: bool,
+) {
+    // Decide WHAT to promote via the pure lag gate, factored into `promotion_proposal` so the gate
+    // is unit-testable WITHOUT a RaftHandle. `None` -> a stale replica (the gate refused) or this
+    // node replicates nothing: propose nothing.
+    let Some(slots) = promotion_proposal(cluster, in_sync_at_last_contact) else {
+        return;
+    };
+    let Some(handle) = raft else {
+        return; // no control-plane handle (defensive): cannot propose.
+    };
+    // Propose the promotion. Committed -> every node applies the owner flip (the fence); NotLeader
+    // -> a follower cannot commit, so we simply retry on the next outage tick (the usual way a
+    // forming cluster finds the leader; HA-4c surfaces no leader hint yet).
+    let _ = handle
+        .propose(ironcache_raft::ConfigCmd::PromoteReplica {
+            slots,
+            new_primary: self_node_id.to_owned(),
+        })
+        .await;
+}
+
+/// The PURE HA-8 failover DECISION (the lag gate), split out from [`maybe_propose_self_promotion`]
+/// so it is unit-testable without a control-plane handle. Returns `Some(slots)` ONLY when BOTH:
+/// (1) this node was IN SYNC within the bound at last contact (the lag gate -- a STALE replica
+/// must NEVER be promoted, or a committed promotion would lose the writes it had not yet pulled),
+/// and (2) it currently replicates at least one slot (the set it would become primary of). Returns
+/// `None` otherwise. A deterministic function of the committed map + the in-sync flag the caller
+/// snapshotted BEFORE the link went down; no time / rand / IO. The slot scan runs only on the cold
+/// control cadence (never the hot path).
+#[must_use]
+fn promotion_proposal(
+    cluster: &ironcache_cluster::SlotMap,
+    in_sync_at_last_contact: bool,
+) -> Option<Vec<u16>> {
+    // THE LAG GATE: never promote a replica that was not in sync within the bound at last contact.
+    if !in_sync_at_last_contact {
+        return None;
+    }
+    let slots = slots_replicated_by_self(cluster);
+    if slots.is_empty() {
+        return None;
+    }
+    Some(slots)
+}
+
+/// Every slot THIS node is a committed REPLICA of (HA-8: the set a self-promotion would transfer
+/// to it). A cold scan of `is_replica_of_self` over the 16384 slots, run only on the control
+/// task's failover cadence (never the hot path), mirroring [`any_replica_of_self`] but collecting
+/// the whole set rather than the first.
+#[must_use]
+fn slots_replicated_by_self(map: &ironcache_cluster::SlotMap) -> Vec<u16> {
+    (0..ironcache_cluster::CLUSTER_SLOTS)
+        .filter(|&slot| map.is_replica_of_self(slot))
+        .collect()
+}
+
+/// The current monotonic instant through THIS shard's stable `SystemEnv` clock seam (ADR-0003):
+/// the failover outage clock reads time ONLY here, never `std::time` directly (the determinism
+/// invariant). It uses the SAME per-shard env [`now_from_env`] uses, so every `Monotonic` reading
+/// shares ONE origin and `saturating_duration_since` between two readings measures real elapsed
+/// time. A freshly-constructed `SystemEnv` per call would instead anchor a NEW origin each time
+/// (its `now()` is `origin.elapsed()`), making two readings incomparable -- the outage clock would
+/// never advance; reusing the shard env is what makes the failover timeout meaningful.
+fn now_monotonic() -> ironcache_env::Monotonic {
+    crate::serve::shard_env().borrow().now()
 }
 
 /// Attach ONCE to the owner at `owner_addr`: dial, [`receive_full_sync`] into a FRESH
@@ -848,6 +1012,95 @@ mod tests {
         // The owner of slot 0 is still id0 (replica assignment does not change ownership), so a
         // replica resolves the owner endpoint via moved_target.
         assert_eq!(map.moved_target(0), Some(("10.0.0.10".to_string(), 6379)));
+    }
+
+    /// A 2-node map with self (id1) committed as a replica of two id0-owned slots, the way a
+    /// committed AssignReplica leaves it.
+    fn map_self_replicates_two_slots() -> ironcache_cluster::SlotMap {
+        let id0 = "0000000000000000000000000000000000000000";
+        let id1 = "1111111111111111111111111111111111111111";
+        let map = ironcache_cluster::SlotMap::build(
+            vec![
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: id0.into(),
+                        host: "10.0.0.10".into(),
+                        port: 6379,
+                    },
+                    vec![[0, 8191]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: id1.into(),
+                        host: "10.0.0.11".into(),
+                        port: 6379,
+                    },
+                    vec![[8192, 16383]],
+                ),
+            ],
+            id1,
+        )
+        .expect("valid 2-node map");
+        // self (id1) replicates two slots id0 owns.
+        map.set_slot_replica(0, id1).expect("known node");
+        map.set_slot_replica(7, id1).expect("known node");
+        map
+    }
+
+    /// THE LAG GATE (HA-8, the safety half of the failover decision). `promotion_proposal` proposes
+    /// the replicated slots ONLY when the node was in sync at last contact; a NOT-in-sync (stale)
+    /// replica is refused (`None`) so a committed promotion can never lose the writes it had not yet
+    /// pulled. This drives the gate decision directly (the `if !in_sync` branch), which the DST
+    /// split-brain gate proves the APPLY of but does not itself exercise.
+    #[test]
+    fn promotion_proposal_lag_gate_refuses_a_stale_replica() {
+        let map = map_self_replicates_two_slots();
+
+        // In sync -> propose exactly the slots this node replicates.
+        assert_eq!(
+            promotion_proposal(&map, true),
+            Some(vec![0, 7]),
+            "an in-sync replica proposes its replicated slots"
+        );
+        // NOT in sync (stale / past the lag bound at last contact) -> propose NOTHING.
+        assert_eq!(
+            promotion_proposal(&map, false),
+            None,
+            "a stale replica must NEVER be promoted (the lag gate)"
+        );
+    }
+
+    /// `promotion_proposal` is also `None` for an in-sync node that replicates NO slot (nothing to
+    /// promote) -- the second half of the decision, so an idle in-sync node never proposes a
+    /// no-op (empty-slots) promotion.
+    #[test]
+    fn promotion_proposal_is_none_when_node_replicates_nothing() {
+        let id0 = "0000000000000000000000000000000000000000";
+        let id1 = "1111111111111111111111111111111111111111";
+        let map = ironcache_cluster::SlotMap::build(
+            vec![
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: id0.into(),
+                        host: "10.0.0.10".into(),
+                        port: 6379,
+                    },
+                    vec![[0, 8191]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: id1.into(),
+                        host: "10.0.0.11".into(),
+                        port: 6379,
+                    },
+                    vec![[8192, 16383]],
+                ),
+            ],
+            id1,
+        )
+        .expect("valid 2-node map");
+        // In sync but replicates nothing -> no proposal.
+        assert_eq!(promotion_proposal(&map, true), None);
     }
 
     /// END-TO-END over real loopback TCP: a primary shard with an installed [`ReplObserver`]

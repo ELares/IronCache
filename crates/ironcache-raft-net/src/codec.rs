@@ -55,6 +55,7 @@ const CFG_SET_SLOT_OWNER: u8 = 2;
 const CFG_ASSIGN_SLOTS: u8 = 3;
 const CFG_SET_CONFIG_EPOCH: u8 = 4;
 const CFG_ASSIGN_REPLICA: u8 = 5;
+const CFG_PROMOTE_REPLICA: u8 = 6;
 
 // ---------------------------------------------------------------------------
 // Encoding.
@@ -187,6 +188,17 @@ fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
             for slot in slots {
                 put_u16(out, *slot);
             }
+        }
+        ConfigCmd::PromoteReplica { slots, new_primary } => {
+            // HA-8 failover. Encoded length-prefixed-slots-then-node (the slots lead here, vs the
+            // node-then-slots shape of AssignSlots/AssignReplica, matching the variant's field
+            // order); a distinct discriminant keeps it unambiguous on the wire + in the log.
+            out.push(CFG_PROMOTE_REPLICA);
+            put_u64(out, slots.len() as u64);
+            for slot in slots {
+                put_u16(out, *slot);
+            }
+            put_str(out, new_primary);
         }
     }
 }
@@ -393,6 +405,15 @@ fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
                 slots.push(cur.u16()?);
             }
             Some(ConfigCmd::AssignReplica { node, slots })
+        }
+        CFG_PROMOTE_REPLICA => {
+            let count = usize::try_from(cur.u64()?).ok()?;
+            let mut slots = Vec::with_capacity(count.min(16384));
+            for _ in 0..count {
+                slots.push(cur.u16()?);
+            }
+            let new_primary = cur.string()?;
+            Some(ConfigCmd::PromoteReplica { slots, new_primary })
         }
         _ => None,
     }

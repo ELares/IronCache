@@ -974,12 +974,25 @@ fn subscriber_gate_blocks(
 ///
 /// A malformed / short request that yields no key ([`route::KeySpec::None`]) returns `None`, so
 /// the home handler emits the proper wrong-arity error rather than a redirect.
+/// Whether THIS node's replica link is currently IN SYNC within the configured
+/// `replica_max_lag` (HA-8 replica-read staleness bound): the HA-7e `is_in_sync` signal off
+/// `ctx.repl_status` (link up AND lag <= max_lag). Returns `false` when there is no repl-status
+/// cell (the default static / non-raft path), which combined with the `readonly` gate keeps that
+/// path's routing byte-unchanged (it never reaches the replica-serve leg anyway). Cold: reads a
+/// handful of atomics off the node-level status cell, never per stored key.
+fn replica_read_in_sync(ctx: &ServerContext) -> bool {
+    ctx.repl_status
+        .as_ref()
+        .is_some_and(|s| s.is_in_sync(ctx.boot.replica_max_lag))
+}
+
 fn cluster_redirect(
     map: &ironcache_cluster::SlotMap,
     route: route::CommandClass,
     cmd_upper: &[u8],
     request: &Request,
     readonly: bool,
+    replica_in_sync: bool,
 ) -> Option<ironcache_protocol::ErrorReply> {
     // (a) keyless / admin exemption: only KEYED data commands carry slots.
     let spec = match route {
@@ -996,7 +1009,17 @@ fn cluster_redirect(
     // and a non-READONLY connection never is (the default strong-read behavior). The command's
     // write-ness comes from the #89 registry (`is_write`); an unknown command is treated as a
     // write (conservative), so a replica never serves an unrecognized command locally.
-    let replica_serves = readonly && !ironcache_server::command_spec::is_write(cmd_upper);
+    //
+    // HA-8 REPLICA-READ STALENESS BOUND (REPLICA_READ.md, finishing the 7d TODO): a replica may
+    // serve the READONLY read ONLY while WITHIN the lag bound (link up AND lag <= max_lag, the
+    // HA-7e `is_in_sync` signal, threaded in as `replica_in_sync`). Past the bound (or link down)
+    // it is NOT in sync, so `replica_serves` is false and the slot it replicates-but-does-not-own
+    // returns MOVED to the OWNER -- a stale replica never serves a stale read. In the default
+    // static path there is no replication, so the caller passes `replica_in_sync = false` AND
+    // `readonly` is the only other gate, keeping that path byte-unchanged (a static node owns its
+    // slots, so it never reaches the replica leg regardless).
+    let replica_serves =
+        readonly && replica_in_sync && !ironcache_server::command_spec::is_write(cmd_upper);
 
     // (b) reduce the key(s) to a slot via the CLIENT-VISIBLE key_slot (CRC16 + hash-tag) and
     // apply the ONE shared redirect rule (CROSSSLOT-before-MOVED). The `route::KeySpec` is just
@@ -1349,7 +1372,10 @@ async fn route_and_dispatch(
     // The in-MULTI path does NOT reach here (it returned to `route_in_multi` above); queued
     // commands are checked at QUEUE time there, reusing this SAME predicate.
     if let Some(map) = ctx.cluster.as_deref() {
-        if let Some(reply) = cluster_redirect(map, route, &cmd_upper, request, conn.readonly) {
+        let in_sync = replica_read_in_sync(ctx);
+        if let Some(reply) =
+            cluster_redirect(map, route, &cmd_upper, request, conn.readonly, in_sync)
+        {
             state_rc.borrow_mut().counters.on_command();
             encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
             // Short-circuit WITHOUT closing the connection (same as the WATCH guard above):
@@ -1960,7 +1986,10 @@ fn route_in_multi(
     // intra-node `all_keys_home_owned` gate: cluster ownership (which NODE) is the outer
     // question, internal-shard ownership (which of MY shards) the inner one.
     if let Some(map) = ctx.cluster.as_deref() {
-        if let Some(reply) = cluster_redirect(map, route, cmd_upper, request, conn.readonly) {
+        let in_sync = replica_read_in_sync(ctx);
+        if let Some(reply) =
+            cluster_redirect(map, route, cmd_upper, request, conn.readonly, in_sync)
+        {
             state_rc.borrow_mut().counters.on_command();
             conn.dirty_exec = true;
             encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
@@ -3037,7 +3066,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, false),
+            cluster_redirect(&map, route, b"GET", &req, false, false),
             None,
             "an owned single-key command proceeds (no redirect)"
         );
@@ -3050,8 +3079,8 @@ mod tests {
         let slot = ironcache_protocol::key_slot(key.as_bytes());
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
-        let reply =
-            cluster_redirect(&map, route, b"GET", &req, false).expect("foreign key -> MOVED");
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false)
+            .expect("foreign key -> MOVED");
         // The MOVED carries the CLIENT-VISIBLE slot and node B's ADVERTISED host:port.
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -3064,8 +3093,8 @@ mod tests {
         let hi = key_in_slot_range(8192, 16383);
         let req = rreq(&[b"MGET", lo.as_bytes(), hi.as_bytes()]);
         let route = route::classify(b"MGET");
-        let reply =
-            cluster_redirect(&map, route, b"MGET", &req, false).expect("cross-slot -> CROSSSLOT");
+        let reply = cluster_redirect(&map, route, b"MGET", &req, false, false)
+            .expect("cross-slot -> CROSSSLOT");
         assert_eq!(
             reply.line(),
             "-CROSSSLOT Keys in request don't hash to the same slot"
@@ -3082,7 +3111,8 @@ mod tests {
             })
             .expect("a second distinct high-half slot");
         let req2 = rreq(&[b"MGET", h1.as_bytes(), h2.as_bytes()]);
-        let reply2 = cluster_redirect(&map, route, b"MGET", &req2, false).expect("still CROSSSLOT");
+        let reply2 =
+            cluster_redirect(&map, route, b"MGET", &req2, false, false).expect("still CROSSSLOT");
         assert_eq!(
             reply2.line(),
             "-CROSSSLOT Keys in request don't hash to the same slot",
@@ -3111,7 +3141,7 @@ mod tests {
         let req = rreq(&[b"MGET", k1.as_bytes(), k2.as_bytes()]);
         let route = route::classify(b"MGET");
         assert_eq!(
-            cluster_redirect(&map, route, b"MGET", &req, false),
+            cluster_redirect(&map, route, b"MGET", &req, false, false),
             None,
             "co-located + owned multi-key proceeds"
         );
@@ -3126,7 +3156,7 @@ mod tests {
             let req = rreq(&[cmd, b"*"]);
             let route = route::classify(cmd);
             assert_eq!(
-                cluster_redirect(&map, route, cmd, &req, false),
+                cluster_redirect(&map, route, cmd, &req, false, false),
                 None,
                 "{} must be exempt from cluster redirect",
                 String::from_utf8_lossy(cmd)
@@ -3141,7 +3171,10 @@ mod tests {
         // the proper wrong-arity error rather than a redirect.
         let req = rreq(&[b"GET"]);
         let route = route::classify(b"GET");
-        assert_eq!(cluster_redirect(&map, route, b"GET", &req, false), None);
+        assert_eq!(
+            cluster_redirect(&map, route, b"GET", &req, false, false),
+            None
+        );
     }
 
     // ----- redirect_for_keys (the SHARED predicate WATCH uses directly over its key args) -----
@@ -3222,10 +3255,27 @@ mod tests {
         let route = route::classify(b"GET");
         // READONLY (replica_serves = true via readonly=true & GET is a read): served locally.
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, true),
+            cluster_redirect(&map, route, b"GET", &req, true, true),
             None,
             "a READONLY GET for a replicated slot is served locally (no MOVED)"
         );
+    }
+
+    #[test]
+    fn replica_read_past_the_lag_bound_moves_to_owner() {
+        // HA-8 staleness bound (REPLICA_READ.md, finishing the 7d TODO): a READONLY read for a
+        // slot this node replicates is served LOCALLY only while IN SYNC. When the replica is NOT
+        // in sync (link down OR lag > max_lag, surfaced as replica_in_sync = false), the SAME read
+        // returns MOVED to the OWNER -- a stale replica never serves a stale read. (Contrast
+        // `replica_serves_readonly_read_locally`, which passes in_sync = true and is served local.)
+        let (map, key) = redirect_map_with_self_replica();
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        // READONLY but NOT in sync: the replica is too stale to serve -> MOVED to the owner (B).
+        let reply = cluster_redirect(&map, route, b"GET", &req, true, false)
+            .expect("a READONLY read past the lag bound MOVEDs to the owner");
+        assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
 
     #[test]
@@ -3235,7 +3285,7 @@ mod tests {
         let req = rreq(&[b"SET", key.as_bytes(), b"v"]);
         let route = route::classify(b"SET");
         // SET is a write: MOVED to the OWNER (B) even on a READONLY connection.
-        let reply = cluster_redirect(&map, route, b"SET", &req, true)
+        let reply = cluster_redirect(&map, route, b"SET", &req, true, true)
             .expect("a write on a replica is MOVED to the owner even under READONLY");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -3247,7 +3297,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         // A non-READONLY (default) connection gets MOVED to the owner for the strong read.
-        let reply = cluster_redirect(&map, route, b"GET", &req, false)
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false)
             .expect("a non-READONLY read of a replicated-but-not-owned slot is MOVED to the owner");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -3260,7 +3310,7 @@ mod tests {
         let slot = ironcache_protocol::key_slot(key.as_bytes());
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
-        let reply = cluster_redirect(&map, route, b"GET", &req, true)
+        let reply = cluster_redirect(&map, route, b"GET", &req, true, true)
             .expect("READONLY does not serve a slot this node neither owns nor replicates");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }

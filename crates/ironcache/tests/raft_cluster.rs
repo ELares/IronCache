@@ -563,6 +563,173 @@ fn ha7d_replica_is_passive_note() {
     // without re-driving a flaky real-time TTL race here.
 }
 
+// `too_many_lines` + `needless_range_loop` allowed: ONE end-to-end HA-8 acceptance flow (formation,
+// owner + in-sync replica, READONLY serve, then KILL the owner so the replica's link drops, and
+// assert the live HA-8 replica-read STALENESS BOUND -- the replica stops serving the now-stale read
+// and MOVEDs to the owner), read in sequence, indexing parallel `clients[i]`/`ports[i]`.
+#[test]
+#[allow(clippy::too_many_lines, clippy::needless_range_loop)]
+fn raft_mode_replica_read_staleness_bound_moves_when_link_drops() {
+    // This is the LIVE, deterministic half of HA-8 over real TCP: the replica-read staleness gate.
+    // (The PROMOTION half -- a committed PromoteReplica transferring ownership and the old primary
+    // losing owns() on apply -- is proven exhaustively by the DST split-brain gate
+    // `ironcache_raft::tests::failover_split_brain_gate` over 1000+ partition/heal timelines, and
+    // by the production wiring's in-crate unit tests; it is NOT re-driven over real sockets here
+    // because the test harness cannot stop a killed node's DETACHED raft thread, so a self-promotion
+    // -- which commits only on the Raft leader -- cannot be made deterministic in loopback. This
+    // test drives the part that IS deterministic and load-bearing live: the staleness gate.)
+    let timeout = Duration::from_secs(40);
+
+    let ports = [free_port(), free_port(), free_port()];
+    clean_raft_logs(ports);
+    let topo = three_node_topology(ports);
+    let ids = [ID0, ID1, ID2];
+
+    // Keep the ShardSets so we can KILL the owner (shutdown_and_join stops its data shards -> its
+    // repl listener -> the replica's link drops). The raft control thread is detached and keeps
+    // voting, so the Raft quorum survives the data-plane kill.
+    let mut nodes: Vec<Option<ironcache_runtime::bootstrap::ShardSet>> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| Some(run_raft_node_for_test(ports[i], topo.clone(), id)))
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let nodes = rt.block_on(async move {
+        let env = SystemEnv::new();
+        let mut clients = Vec::new();
+        for p in ports {
+            clients.push(connect_retry(p).await);
+        }
+
+        // ---- (1) Discover the leader (the OWNER, node A) by probing a CLUSTER write.
+        let leader_idx = {
+            let start = env.now();
+            let mut found = None;
+            'discover: loop {
+                for i in 0..3 {
+                    let peer = (i + 1) % 3;
+                    let reply = cmd(
+                        &mut clients[i],
+                        &["CLUSTER", "MEET", "127.0.0.1", &ports[peer].to_string()],
+                    )
+                    .await;
+                    if reply.starts_with("+OK") {
+                        found = Some(i);
+                        break 'discover;
+                    }
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            found.expect("a unique leader must emerge")
+        };
+
+        // ---- (2) The leader (OWNER) MEETs both peers, claims the whole slot space, and commits
+        // `CLUSTER REPLICATE <peer-B> <slot>` so a PEER (node B) replicates a leader-owned slot.
+        for i in 0..3 {
+            if i == leader_idx {
+                continue;
+            }
+            let r = cmd(
+                &mut clients[leader_idx],
+                &["CLUSTER", "MEET", "127.0.0.1", &ports[i].to_string()],
+            )
+            .await;
+            assert!(r.starts_with("+OK"), "leader MEET should commit, got {r:?}");
+        }
+        let r = cmd(
+            &mut clients[leader_idx],
+            &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "leader ADDSLOTSRANGE should commit, got {r:?}");
+
+        let replica_idx = (leader_idx + 1) % 3; // node B: the pure replica
+        let replica_port = ports[replica_idx];
+        let replica_synth_id = synth_meet_node_id("127.0.0.1", replica_port);
+        let leader_port = ports[leader_idx];
+        let key = key_in_range(100, 100);
+        let slot = key_slot(key.as_bytes());
+
+        let r = cmd(
+            &mut clients[leader_idx],
+            &["CLUSTER", "REPLICATE", &replica_synth_id, &slot.to_string()],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "leader CLUSTER REPLICATE should commit, got {r:?}");
+
+        // ---- (3) Write the key on the OWNER (leader). It owns the slot, so SET serves locally.
+        let set = cmd(&mut clients[leader_idx], &["SET", &key, "hello"]).await;
+        assert!(set.starts_with("+OK"), "owner serves SET locally, got {set:?}");
+
+        // ---- (4) The REPLICA (B) attaches + is IN SYNC: a READONLY GET serves the value LOCALLY
+        // (link up + lag <= max_lag -> the HA-8 staleness gate allows the local read).
+        let ro = cmd(&mut clients[replica_idx], &["READONLY"]).await;
+        assert!(ro.starts_with("+OK"), "READONLY should reply +OK, got {ro:?}");
+        let served = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[replica_idx], &["GET", &key]).await;
+                if reply.starts_with("$5\r\nhello") {
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        assert!(served, "an in-sync READONLY replica must serve the converged value locally");
+
+        // ---- (5) KILL the OWNER (leader's data shards): the replica B's link to it drops, so B is
+        // no longer in sync (link down). A's detached raft thread keeps voting, so the quorum holds.
+        let _ = clients; // release the borrow set; we reconnect to B below.
+        let killed = nodes[leader_idx].take().expect("the owner node is live");
+        let _ = killed.shutdown_and_join();
+
+        let mut b = connect_retry(replica_port).await;
+
+        // ---- (6) THE STALENESS BOUND (HA-8, finishing the 7d TODO): once B's link to the owner is
+        // down (B is past the lag bound / not in sync), a READONLY GET that was served locally a
+        // moment ago must now MOVED to the OWNER. A stale replica never serves a stale read. The
+        // MOVED target is the (now-dead) owner's advertised endpoint -- the client would retry there
+        // and discover the new topology; the load-bearing assertion is that B STOPPED serving stale.
+        let expect_moved_to_owner = format!("-MOVED {slot} 127.0.0.1:{leader_port}");
+        let moved = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut b, &["GET", &key]).await;
+                if reply.starts_with(&expect_moved_to_owner) {
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        assert!(
+            moved,
+            "once the replica's link is down (not in sync), a READONLY read must MOVED to the owner \
+             (the HA-8 staleness bound: a stale replica stops serving stale reads)"
+        );
+        nodes
+    });
+
+    // Drop every surviving ShardSet (each signals its shards to drain); raft threads are detached.
+    for n in nodes.into_iter().flatten() {
+        let _ = n.shutdown_and_join();
+    }
+    clean_raft_logs(ports);
+}
+
 /// The deterministic 40-hex placeholder id a raft-mode `CLUSTER MEET <host> <port>` synthesizes
 /// for the MEET'd peer (FNV-1a over `host:port`, hex-padded to 40). MUST match `serve.rs`'s
 /// `synth_meet_node_id` so the test can name the MEET'd peer in a SETSLOT.

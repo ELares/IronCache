@@ -127,6 +127,31 @@ impl StateMachine for ConfigSm {
                     let _ = self.map.set_slot_replica(slot, node);
                 }
             }
+            ConfigCmd::PromoteReplica { slots, new_primary } => {
+                // HA-8 FAILOVER (the SOLE ownership-transfer-on-failover path). For each slot:
+                // (1) flip the OWNER to `new_primary` via the SAME `set_slot_node` path the other
+                // ownership commands use, which keeps `mine[]` in lockstep with `owner[]` (so the
+                // hot `owns()` bitmap is correct on every node, INCLUDING the old primary once it
+                // catches its log up: its `mine[slot]` goes false -> `owns()` false -> it serves
+                // MOVED); then (2) CLEAR `new_primary` from the slot's replica set (it is the owner
+                // now, not a replica). Deterministic across nodes (same map state + same command),
+                // so swallowing the unknown-node error keeps every node's apply identical; the
+                // promotion is proposed only after `new_primary` is a committed AddNode + replica,
+                // so the committed order never produces a spurious error. IDEMPOTENT: re-applying
+                // sets the same owner and re-clears an already-clear replica entry (a no-op).
+                //
+                // THE SPLIT-BRAIN FENCE is exactly this apply: promotion ownership flows ONLY
+                // through the committed log, so there is never a committed state in which two nodes
+                // both `owns()` a slot. The per-entry epoch bump advances the cluster config epoch
+                // monotonically, so a node holding stale ownership at an OLDER epoch is provably
+                // behind; a client hitting the old owner gets a standard MOVED redirect to the new
+                // owner (the redirect itself carries no epoch -- the epoch is the consensus-side
+                // ordering that guarantees the old owner stops owning once it applies this entry).
+                for &slot in slots {
+                    let _ = self.map.set_slot_node(slot, new_primary);
+                    self.map.clear_slot_replica(slot, new_primary);
+                }
+            }
             ConfigCmd::SetConfigEpoch(_epoch) => {
                 // The Raft-driven config epoch is the log-driven counter above; the SlotMap's
                 // own (Redis-client) epoch is not used for the linearizable-ownership property.
@@ -322,6 +347,191 @@ mod tests {
         ));
         assert!(map.is_replica_of(0, ID1) && map.is_replica_of(1, ID1));
         assert_eq!(sm.config_epoch(), epoch_before + 2);
+    }
+
+    /// HA-8 FAILOVER: a committed PromoteReplica flips each slot's OWNER to `new_primary`, CLEARS
+    /// `new_primary` from the slot's replica set, bumps the log-driven epoch once, keeps `mine[]`
+    /// in lockstep ON THE NEW OWNER (owns() true), and is idempotent on re-apply.
+    #[test]
+    fn promote_replica_flips_owner_clears_replica_bumps_epoch_and_is_idempotent() {
+        // Node ID1's view (self == ID1): ID0 owns [0,1]; ID1 replicates them; then ID1 is promoted.
+        let map = Arc::new(SlotMap::empty_self(ID1, "127.0.0.1", 7001));
+        let mut sm = ConfigSm::new(Arc::clone(&map));
+        sm.apply(&config_entry(
+            1,
+            ConfigCmd::AddNode {
+                id: ID0.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7000,
+            },
+        ));
+        sm.apply(&config_entry(
+            2,
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![0, 1],
+            },
+        ));
+        sm.apply(&config_entry(
+            3,
+            ConfigCmd::AssignReplica {
+                node: ID1.to_owned(),
+                slots: vec![0, 1],
+            },
+        ));
+        // Pre-promotion: ID0 owns (so ID1 does not), ID1 is the replica.
+        assert!(
+            !map.owns(0) && !map.owns(1),
+            "ID0 owns pre-promotion, not self (ID1)"
+        );
+        assert!(map.is_replica_of(0, ID1) && map.is_replica_of(1, ID1));
+        let epoch_before = sm.config_epoch();
+        let map_epoch_before = map.current_epoch();
+
+        // PROMOTE ID1 (self) to owner of [0,1].
+        sm.apply(&config_entry(
+            4,
+            ConfigCmd::PromoteReplica {
+                slots: vec![0, 1],
+                new_primary: ID1.to_owned(),
+            },
+        ));
+        // The new owner is ID1 (self): owns() flips TRUE (mine[] in lockstep), replica cleared.
+        assert!(
+            map.owns(0) && map.owns(1),
+            "the promoted node now owns() the slots"
+        );
+        assert!(
+            !map.is_replica_of(0, ID1) && !map.is_replica_of(1, ID1),
+            "the promoted node is cleared from the replica set"
+        );
+        // Exactly one epoch bump for the one PromoteReplica entry (the split-brain fence: a stale
+        // client sees the advanced epoch in its MOVED).
+        assert_eq!(sm.config_epoch(), epoch_before + 1);
+        assert!(map.current_epoch() > map_epoch_before);
+        assert_eq!(map.current_epoch(), sm.config_epoch());
+
+        // Idempotent re-apply: same owner, replica stays clear, epoch advances +1 per entry.
+        sm.apply(&config_entry(
+            5,
+            ConfigCmd::PromoteReplica {
+                slots: vec![0, 1],
+                new_primary: ID1.to_owned(),
+            },
+        ));
+        assert!(map.owns(0) && map.owns(1));
+        assert!(!map.is_replica_of(0, ID1) && !map.is_replica_of(1, ID1));
+        assert_eq!(sm.config_epoch(), epoch_before + 2);
+    }
+
+    /// HA-8 THE SPLIT-BRAIN FENCE (apply-side): the OLD primary applying the SAME committed
+    /// PromoteReplica LOSES ownership (owns() -> false), so once it catches its Raft log up it
+    /// serves MOVED to the new owner -- there is no committed state with two owners.
+    #[test]
+    fn old_primary_loses_ownership_when_promotion_applies() {
+        // Node ID0's view (self == ID0): ID0 OWNS [0,1] (the old primary); ID1 replicates them.
+        let map = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let mut sm = ConfigSm::new(Arc::clone(&map));
+        sm.apply(&config_entry(
+            1,
+            ConfigCmd::AddNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7001,
+            },
+        ));
+        sm.apply(&config_entry(
+            2,
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![0, 1],
+            },
+        ));
+        sm.apply(&config_entry(
+            3,
+            ConfigCmd::AssignReplica {
+                node: ID1.to_owned(),
+                slots: vec![0, 1],
+            },
+        ));
+        // The old primary owns the slots before the promotion applies.
+        assert!(map.owns(0) && map.owns(1), "ID0 is the owner pre-promotion");
+
+        // The SAME committed PromoteReplica{ID1} applies here (the old primary's log catches up).
+        sm.apply(&config_entry(
+            4,
+            ConfigCmd::PromoteReplica {
+                slots: vec![0, 1],
+                new_primary: ID1.to_owned(),
+            },
+        ));
+        // THE FENCE: the old primary's owns() is now FALSE -> it serves MOVED to ID1, the new
+        // owner. moved_target resolves to ID1's advertised endpoint (port 7001).
+        assert!(
+            !map.owns(0) && !map.owns(1),
+            "the OLD primary loses ownership when the promotion applies (no two owners)"
+        );
+        assert_eq!(map.moved_target(0), Some(("127.0.0.1".to_owned(), 7001)));
+        assert_eq!(map.moved_target(1), Some(("127.0.0.1".to_owned(), 7001)));
+    }
+
+    /// HA-8: two independent ConfigSms (the new owner's view and the old owner's view) fed the
+    /// IDENTICAL committed sequence including a PromoteReplica converge so that EXACTLY ONE node
+    /// owns each slot -- the linearizable-ownership property across a failover.
+    #[test]
+    fn promote_replica_converges_to_one_owner_across_nodes() {
+        let seq = [
+            ConfigCmd::AddNode {
+                id: ID0.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7000,
+            },
+            ConfigCmd::AddNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7001,
+            },
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![10, 20],
+            },
+            ConfigCmd::AssignReplica {
+                node: ID1.to_owned(),
+                slots: vec![10, 20],
+            },
+            ConfigCmd::PromoteReplica {
+                slots: vec![10, 20],
+                new_primary: ID1.to_owned(),
+            },
+        ];
+        let map0 = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let map1 = Arc::new(SlotMap::empty_self(ID1, "127.0.0.1", 7001));
+        let mut sm0 = ConfigSm::new(Arc::clone(&map0));
+        let mut sm1 = ConfigSm::new(Arc::clone(&map1));
+        for (i, cmd) in seq.iter().enumerate() {
+            let idx = i as u64 + 1;
+            sm0.apply(&config_entry(idx, cmd.clone()));
+            sm1.apply(&config_entry(idx, cmd.clone()));
+        }
+        // Same log-driven epoch on both nodes.
+        assert_eq!(map0.current_epoch(), map1.current_epoch());
+        for slot in [10u16, 20] {
+            // The new owner (ID1) owns; the old owner (ID0) does NOT -> exactly one owner.
+            assert!(!map0.owns(slot), "old owner ID0 lost the slot {slot}");
+            assert!(map1.owns(slot), "new owner ID1 owns the slot {slot}");
+            // Both nodes resolve MOVED / ownership to the SAME endpoint (ID1, port 7001).
+            assert_eq!(
+                map0.moved_target(slot),
+                map1.moved_target(slot),
+                "nodes disagree on the owner of slot {slot} after failover"
+            );
+            assert_eq!(
+                map0.moved_target(slot),
+                Some(("127.0.0.1".to_owned(), 7001))
+            );
+            // The promoted node is the replica of NEITHER slot anymore (it is the owner).
+            assert!(!map0.is_replica_of(slot, ID1) && !map1.is_replica_of(slot, ID1));
+        }
     }
 
     /// HA-7d: two independent ConfigSms fed the IDENTICAL committed sequence (including an

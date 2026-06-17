@@ -85,6 +85,7 @@ const CFG_SET_SLOT_OWNER: u8 = 2;
 const CFG_ASSIGN_SLOTS: u8 = 3;
 const CFG_SET_CONFIG_EPOCH: u8 = 4;
 const CFG_ASSIGN_REPLICA: u8 = 5;
+const CFG_PROMOTE_REPLICA: u8 = 6;
 
 // The fixed frame header: a u32 body length followed by a u32 CRC of the body.
 const FRAME_HEADER_LEN: usize = 8;
@@ -263,6 +264,17 @@ fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
                 put_u16(out, *slot);
             }
         }
+        ConfigCmd::PromoteReplica { slots, new_primary } => {
+            // HA-8 failover; slots-then-node order (matches the wire codec + the variant's field
+            // order). Must round-trip through the fsync log so a committed promotion survives a
+            // restart (Figure-8: a new leader cannot lose it).
+            out.push(CFG_PROMOTE_REPLICA);
+            put_u64(out, slots.len() as u64);
+            for slot in slots {
+                put_u16(out, *slot);
+            }
+            put_str(out, new_primary);
+        }
     }
 }
 
@@ -400,6 +412,15 @@ fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
                 slots.push(cur.u16()?);
             }
             Some(ConfigCmd::AssignReplica { node, slots })
+        }
+        CFG_PROMOTE_REPLICA => {
+            let count = usize::try_from(cur.u64()?).ok()?;
+            let mut slots = Vec::with_capacity(count.min(16384));
+            for _ in 0..count {
+                slots.push(cur.u16()?);
+            }
+            let new_primary = cur.string()?;
+            Some(ConfigCmd::PromoteReplica { slots, new_primary })
         }
         _ => None,
     }
@@ -823,6 +844,51 @@ mod tests {
         assert_eq!(s.entries_from(1), entries);
         assert_eq!(s.entries_from(2), entries[1..].to_vec());
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn promote_replica_entry_survives_fsync_log_reopen() {
+        // HA-8 crash-survival: a committed `PromoteReplica` (the failover ownership transfer) MUST
+        // round-trip through the fsync log codec so a node that crashes mid-promotion replays the
+        // committed entry on restart and converges to the NEW owner (it must NOT resurrect the old
+        // one). The fsync log is a SEPARATE codec from the wire codec, so it is proven separately
+        // here. Covers the empty-slots edge and a multi-slot batch (incl. the boundary slot).
+        let path = fresh_path("promote_replica_entry_survives_fsync_log_reopen");
+        let entries = vec![
+            LogEntry {
+                term: 4,
+                index: 1,
+                payload: EntryPayload::Config(ConfigCmd::PromoteReplica {
+                    slots: vec![0, 1, 16_383],
+                    new_primary: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                }),
+            },
+            LogEntry {
+                term: 4,
+                index: 2,
+                payload: EntryPayload::Config(ConfigCmd::PromoteReplica {
+                    slots: vec![],
+                    new_primary: "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                }),
+            },
+        ];
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            for e in &entries {
+                s.append(e.clone());
+            }
+        }
+        let s = FileStorage::open(&path).expect("reopen recovers");
+        assert_eq!(s.last_log_index(), 2);
+        for e in &entries {
+            assert_eq!(
+                s.entry_at(e.index).as_ref(),
+                Some(e),
+                "the committed PromoteReplica must replay byte-identical after a reopen"
+            );
+        }
+        assert_eq!(s.entries_from(1), entries);
         cleanup(&path);
     }
 

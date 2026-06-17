@@ -207,6 +207,30 @@ pub enum ConfigCmd {
         /// The slots `node` should replicate, applied in order.
         slots: Vec<u16>,
     },
+    /// PROMOTE `new_primary` to be the OWNER of every slot in `slots` (HA-8 failover; drives
+    /// `SlotMap::set_slot_node` per slot, then `SlotMap::clear_slot_replica`). This is the SOLE
+    /// ownership-transfer-on-failover path, and because it flows through the committed log it is
+    /// atomic + crash-safe: Figure-8 commit safety guarantees a new leader can never lose a
+    /// committed promotion.
+    ///
+    /// On apply (in committed-log order, on EVERY node), each slot's `owner` flips to
+    /// `new_primary` (its `mine[]` bitmap kept in lockstep by the same `set_slot_node` path the
+    /// other ownership commands use) and `new_primary` is CLEARED from the slot's replica set (it
+    /// is now the owner, not a replica). The config epoch advances once on apply.
+    ///
+    /// THE SPLIT-BRAIN FENCE: when this committed entry applies on the OLD primary (once it
+    /// rejoins and catches its Raft log up), the old primary's `owner[slot]` becomes
+    /// `new_primary`, so its `mine[slot]` is false -> `owns()` is false -> it serves MOVED to the
+    /// new owner. There is therefore NEVER a committed state in which two nodes both `owns()` a
+    /// slot. The named node MUST already be known (a prior committed [`ConfigCmd::AddNode`]);
+    /// IDEMPOTENT: re-applying yields the same owner. Advances the epoch ONCE on apply (like
+    /// [`ConfigCmd::AssignSlots`]).
+    PromoteReplica {
+        /// The slots whose ownership transfers to `new_primary`, applied in order.
+        slots: Vec<u16>,
+        /// The id of the in-sync replica being promoted to OWNER of every slot in `slots`.
+        new_primary: String,
+    },
 }
 
 /// One entry in a node's replicated log.
@@ -3078,6 +3102,16 @@ mod tests {
                         let _ = self.map.set_slot_replica(slot, node);
                     }
                 }
+                ConfigCmd::PromoteReplica { slots, new_primary } => {
+                    // HA-8 FAILOVER: flip each slot's OWNER to `new_primary` (set_slot_node keeps
+                    // mine[] in lockstep, so the OLD primary's owns() goes false on apply -- the
+                    // split-brain fence) and CLEAR `new_primary` from the slot's replica set (it is
+                    // the owner now). Deterministic + idempotent, like the assignment arms above.
+                    for &slot in slots {
+                        let _ = self.map.set_slot_node(slot, new_primary);
+                        self.map.clear_slot_replica(slot, new_primary);
+                    }
+                }
                 ConfigCmd::SetConfigEpoch(_epoch) => {
                     // The Raft-driven config epoch is the log-driven counter above;
                     // the SlotMap's own (Redis-client) epoch is not used for the
@@ -3629,6 +3663,363 @@ mod tests {
             }
         }
     }
+
+    // =====================================================================
+    // HA-8: FAILOVER (promotion) -- THE SPLIT-BRAIN GATE.
+    //
+    // A committed PromoteReplica transfers a slot's ownership from a (dead) primary
+    // to an in-sync replica. The danger is SPLIT-BRAIN (two owners of a slot) and
+    // DATA LOSS (promoting a stale replica). These scenarios prove the APPLY-side
+    // fence: across an entire partition/heal failover timeline, NO two nodes ever
+    // `owns()` a slot at the SAME committed state, and the epoch advances on the
+    // promotion. The pure engine here has no replication link, so it always feeds an
+    // in-sync candidate; the DATA-LOSS half (a too-stale replica is NEVER proposed)
+    // is the LAG GATE, proven directly where it lives by the unit test
+    // `ironcache::replica_attach::tests::promotion_proposal_lag_gate_refuses_a_stale_replica`.
+    // =====================================================================
+
+    /// THE SPLIT-BRAIN ASSERTION (the merge-blocker): NO two nodes ever have
+    /// `owns()==true` for the same slot AT THE SAME CONFIG EPOCH. It asserts the
+    /// `owns()` PROPERTY but evaluates it via each node's COLD `owner_by_slot`
+    /// projection (the `owner[]` array, coalesced from `ranges()`), which is
+    /// equivalent to the hot `mine[]`/`owns()` bitmap by the separately-tested
+    /// owner/`mine[]` lockstep invariant -- and O(assigned) per node, so the
+    /// thousands-of-timelines sweep stays fast.
+    ///
+    /// This is the rigorous form of THE FENCE (CONTROL_PLANE.md / the HA-8 design point
+    /// 2): the config epoch advances on every committed ownership change, so two nodes
+    /// at the SAME epoch have applied the identical committed prefix and therefore agree
+    /// on every slot's single owner. The qualifier "at the same committed state" is the
+    /// EPOCH: a client (or node) at epoch E always sees exactly one owner of a slot.
+    ///
+    /// Why epoch-keyed and not unconditional: during an ACTIVE partition a stale
+    /// minority node sits at an EARLIER epoch (it cannot commit), still showing
+    /// `owns()==true` for a slot it last owned, while the majority commits a
+    /// PromoteReplica that gives a NEW owner the slot at a HIGHER epoch. That transient
+    /// is NOT split-brain -- the two believe they own at DIFFERENT epochs, and a client
+    /// touching the stale node gets MOVED carrying the OLD epoch (the system as a whole
+    /// has advanced). The DANGEROUS thing -- two owners a client could see as
+    /// simultaneously authoritative -- is exactly two owners AT ONE EPOCH, which this
+    /// forbids. (The post-heal convergence to ONE global owner is asserted separately,
+    /// unconditionally, once every node has caught its log up.)
+    ///
+    /// Because each node's `ConfigSm` is seeded `empty_self` for THAT node's id,
+    /// `map(id).owns(slot)` is true iff node `id` is the slot's owner in its OWN
+    /// committed view; this scans all nodes and groups self-owned slots by (slot, epoch).
+    ///
+    /// It iterates each node's `owner_by_slot()` projection (the ASSIGNED slots only,
+    /// coalesced from `ranges()`) rather than all 16384 raw slots, and counts a slot as
+    /// owned by `id` only when that node's OWN view resolves the owner to `id` (i.e.
+    /// `owns()` would be true) -- the same fact, but O(assigned) per node so the
+    /// thousands-of-timelines sweep stays fast. A slot owned by two nodes at one epoch
+    /// is exactly the split-brain a failover must never produce.
+    fn assert_at_most_one_owner_per_slot(cluster: &ConfigCluster) {
+        // (slot, epoch) -> the (single) node observed to own it at that epoch.
+        let mut owner_of: BTreeMap<(u16, u64), NodeId> = BTreeMap::new();
+        for &id in &cluster.ids {
+            let epoch = cluster.current_epoch(id);
+            let self_id = slot_id(id);
+            // owner_by_slot resolves each ASSIGNED slot to its owner's 40-hex id in THIS
+            // node's view; a slot whose owner is `self_id` is one this node `owns()`.
+            for (slot, owner) in cluster.owner_by_slot(id) {
+                if owner != self_id {
+                    continue; // this node does not own the slot in its own view.
+                }
+                if let Some(&other) = owner_of.get(&(slot, epoch)) {
+                    panic!(
+                        "SPLIT-BRAIN: slot {slot} is owns()==true on BOTH node {other:?} and \
+                         node {id:?} at the SAME config epoch {epoch} (two owners at one \
+                         committed state)"
+                    );
+                }
+                owner_of.insert((slot, epoch), id);
+            }
+        }
+    }
+
+    /// The UNCONDITIONAL post-convergence form: once the cluster has fully healed and
+    /// every node has caught its committed log up, NO slot may be `owns()==true` on more
+    /// than one node, FULL STOP (every node is at the same final epoch, so this is the
+    /// epoch-keyed property collapsed to one epoch). Called only at the end of a
+    /// scenario, after `run_until_idle`, to prove the failover converged to ONE owner.
+    fn assert_exactly_one_owner_after_convergence(cluster: &ConfigCluster) {
+        let mut owner_of: BTreeMap<u16, NodeId> = BTreeMap::new();
+        for &id in &cluster.ids {
+            let self_id = slot_id(id);
+            for (slot, owner) in cluster.owner_by_slot(id) {
+                if owner != self_id {
+                    continue; // not self-owned in this node's view.
+                }
+                if let Some(&other) = owner_of.get(&slot) {
+                    panic!(
+                        "POST-HEAL SPLIT-BRAIN: slot {slot} is owns()==true on BOTH node \
+                         {other:?} and node {id:?} after full convergence (the failover did \
+                         not converge to one owner)"
+                    );
+                }
+                owner_of.insert(slot, id);
+            }
+        }
+    }
+
+    /// Elect a single leader CONFINED to `group` (a partitioned side). Returns it, or
+    /// `None` if the side does not elect one within the budget. Asserts the
+    /// split-brain invariant at every chunk so a bad promotion mid-election trips.
+    fn run_to_leader_in_group(
+        cluster: &mut ConfigCluster,
+        group: &[SimId],
+        max_rounds: usize,
+    ) -> Option<NodeId> {
+        for _ in 0..max_rounds {
+            cluster.run_steps(500);
+            assert_at_most_one_owner_per_slot(cluster);
+            let ls: Vec<NodeId> = cluster
+                .leaders()
+                .into_iter()
+                .filter(|id| group.contains(&to_sim(*id)))
+                .collect();
+            if ls.len() == 1 {
+                return Some(ls[0]);
+            }
+        }
+        None
+    }
+
+    /// Replay the HA-8 split-brain failover gate for one `seed` with `partition_after`
+    /// controlling WHEN (in chunks) the owner is partitioned away, so the seed sweep
+    /// randomizes partition timing. Returns the final per-node owner-by-slot snapshot +
+    /// epoch (for the seed-sweep convergence assertion). The split-brain checker
+    /// (`assert_at_most_one_owner_per_slot`) and the epoch-monotonic checker run at
+    /// EVERY quiescent step throughout.
+    ///
+    /// The lag gate is modeled at the DECISION LEVEL: the pure engine has no
+    /// replication link, so the test plays the role of HA-8's failover controller and
+    /// promotes ONLY the replica it has marked in-sync (`in_sync_replica`); it asserts
+    /// a too-stale replica (`stale_replica`) is NEVER named in a promotion. This is the
+    /// same gate `replica_is_in_sync` enforces in production (the controller proposes
+    /// PromoteReplica only for an in-sync candidate); here we prove the COMMITTED
+    /// PROMOTION itself is split-brain-safe given that gate.
+    #[allow(clippy::too_many_lines)]
+    fn run_failover_split_brain_gate(
+        seed: u64,
+        partition_after: usize,
+    ) -> Vec<(BTreeMap<u16, String>, u64)> {
+        // 3 voters: this is the N=3 cluster the gate spec calls for. The OWNER is the
+        // first leader; the IN-SYNC replica + the stale replica are the other two.
+        let mut cluster = ConfigCluster::new(3, seed, RaftConfig::default());
+        cluster
+            .net
+            .set_latency(Duration::from_millis(1), Duration::from_millis(15));
+        let mut epochs = EpochMonotonic::new();
+        let owner = elect_config_leader(&mut cluster);
+        assert_3e_invariants(&cluster, &mut epochs);
+        assert_at_most_one_owner_per_slot(&cluster);
+
+        // Build the node table (committed before any slot/replica reference).
+        for id in cluster.ids.clone() {
+            cluster.propose(
+                owner,
+                ConfigCmd::AddNode {
+                    id: slot_id(id),
+                    host: slot_host(id),
+                    port: SLOT_PORT,
+                },
+            );
+        }
+        cluster.run_steps(3_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // The slots under failover. The OWNER claims them; ONE peer is the in-sync
+        // replica (promotable), the OTHER is a deliberately-stale replica (must NOT be
+        // promoted -- the lag gate). The peers are the two non-owner ids.
+        let slots: [u16; 3] = [0, 6000, 12000];
+        let peers: Vec<NodeId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != owner)
+            .collect();
+        let in_sync_replica = peers[0];
+        let stale_replica = peers[1];
+        for &s in &slots {
+            cluster.propose(
+                owner,
+                ConfigCmd::SetSlotOwner {
+                    slot: s,
+                    node: slot_id(owner),
+                },
+            );
+        }
+        // Record BOTH peers as replicas of the slots (AssignReplica). They are equal in
+        // the committed map; the lag gate (which one is in-sync) lives in the failover
+        // controller's decision, modeled below.
+        cluster.propose(
+            owner,
+            ConfigCmd::AssignReplica {
+                node: slot_id(in_sync_replica),
+                slots: slots.to_vec(),
+            },
+        );
+        cluster.propose(
+            owner,
+            ConfigCmd::AssignReplica {
+                node: slot_id(stale_replica),
+                slots: slots.to_vec(),
+            },
+        );
+        cluster.run_steps(3_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+        assert_at_most_one_owner_per_slot(&cluster);
+
+        // The pre-promotion epoch (every node agrees once converged; sample the owner's).
+        let pre_promotion_epoch = cluster.current_epoch(owner);
+
+        // Let the cluster run a randomized number of chunks BEFORE the partition, so the
+        // partition lands at different points relative to in-flight replication.
+        for _ in 0..partition_after {
+            cluster.run_steps(200);
+            assert_at_most_one_owner_per_slot(&cluster);
+        }
+
+        // PARTITION the owner away from the other two (the majority). The owner (1 of 3)
+        // cannot commit; the two-node majority elects a leader and runs the failover.
+        let majority: Vec<SimId> = peers.iter().copied().map(to_sim).collect();
+        cluster.net.partition(&[to_sim(owner)], &majority);
+
+        // The majority elects a leader. The failover controller (this test) PROMOTES the
+        // IN-SYNC replica -- NEVER the stale one (the lag gate). A spurious promotion
+        // (the owner is actually alive across the partition) is SAFE for split-brain: the
+        // committed entry atomically transfers ownership and the old owner steps down on
+        // apply (proven by the checker, which runs through the whole timeline).
+        let maj_leader = run_to_leader_in_group(&mut cluster, &majority, 200)
+            .expect("the majority side must elect a leader");
+
+        // THE PROMOTION: name the IN-SYNC replica as the new primary of the slots. The
+        // lag gate is the choice of `in_sync_replica` here; assert we never name the
+        // stale one.
+        let new_primary = in_sync_replica;
+        assert_ne!(
+            new_primary, stale_replica,
+            "the lag gate must never promote the too-stale replica"
+        );
+        cluster.propose(
+            maj_leader,
+            ConfigCmd::PromoteReplica {
+                slots: slots.to_vec(),
+                new_primary: slot_id(new_primary),
+            },
+        );
+        for _ in 0..25 {
+            cluster.run_steps(500);
+            assert_at_most_one_owner_per_slot(&cluster);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+
+        // The new primary, on the majority side, now OWNS the slots (committed there).
+        for &s in &slots {
+            assert!(
+                cluster.map(new_primary).owns(s),
+                "seed {seed}: the promoted in-sync replica must own slot {s} after the commit"
+            );
+        }
+        // The new owner's epoch advanced past the pre-promotion epoch (the fence's epoch bump).
+        assert!(
+            cluster.current_epoch(new_primary) > pre_promotion_epoch,
+            "seed {seed}: the new owner's epoch ({}) must exceed the pre-promotion epoch ({})",
+            cluster.current_epoch(new_primary),
+            pre_promotion_epoch
+        );
+
+        // HEAL. The OLD primary, catching its Raft log up, applies the committed
+        // PromoteReplica: its `owns()` for the slots goes FALSE (it serves MOVED). The
+        // split-brain checker runs through the entire reconciliation.
+        cluster.net.heal();
+        for _ in 0..30 {
+            cluster.run_steps(500);
+            assert_at_most_one_owner_per_slot(&cluster);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+        cluster.run_until_idle(100_000);
+        assert_at_most_one_owner_per_slot(&cluster);
+        assert_3e_invariants(&cluster, &mut epochs);
+        // Post-heal: every node has caught its committed log up, so there is now EXACTLY
+        // one owner per slot across the whole cluster (the epoch-keyed transient is gone).
+        assert_exactly_one_owner_after_convergence(&cluster);
+
+        // The OLD primary lost ownership (the fence) and now resolves MOVED to the new
+        // owner's endpoint for every promoted slot.
+        for &s in &slots {
+            assert!(
+                !cluster.map(owner).owns(s),
+                "seed {seed}: the OLD primary must lose ownership of slot {s} after heal (MOVED)"
+            );
+            let moved = cluster.map(owner).moved_target(s);
+            assert_eq!(
+                moved,
+                Some((slot_host(new_primary), SLOT_PORT)),
+                "seed {seed}: the old primary must MOVED slot {s} to the new owner's endpoint"
+            );
+        }
+        // No committed change was lost: every node's committed prefix agrees with the leader's.
+        let final_leader = {
+            let ls = cluster.leaders();
+            assert_eq!(ls.len(), 1, "seed {seed}: exactly one leader after heal");
+            ls[0]
+        };
+        assert_committed_prefix_agrees(&cluster, final_leader);
+
+        cluster
+            .ids
+            .iter()
+            .map(|&id| (cluster.owner_by_slot(id), cluster.current_epoch(id)))
+            .collect()
+    }
+
+    #[test]
+    fn failover_split_brain_gate() {
+        // THE MERGE-BLOCKER, across thousands of (seed, partition-timing) pairs. For
+        // each seed we vary `partition_after` so the owner is isolated at different
+        // points in the timeline (randomized partition timing). Throughout EVERY run:
+        // - the split-brain checker (`assert_at_most_one_owner_per_slot`) runs at every
+        //   quiescent step -> two simultaneous owners would panic immediately;
+        // - the epoch is monotone everywhere and the new owner's epoch exceeds the
+        //   pre-promotion epoch;
+        // - the lag gate never promotes the stale replica;
+        // and after heal all nodes converge to ONE ownership view (the old primary
+        // having lost the slots and MOVED to the new owner).
+        //
+        // 200 seeds x 5 partition-timing offsets = 1000 distinct failover timelines,
+        // each scanning all 3 nodes' ASSIGNED slots (epoch-keyed) for two owners at
+        // every quiescent chunk across the partition/heal timeline.
+        for seed in 0..200u64 {
+            for partition_after in 0..5usize {
+                let snaps = run_failover_split_brain_gate(seed, partition_after);
+                let (ref_owner, ref_epoch) = &snaps[0];
+                for (owner, epoch) in &snaps {
+                    assert_eq!(
+                        owner, ref_owner,
+                        "seed {seed}/{partition_after}: all nodes must converge to one \
+                         slot->owner view after the failover heals"
+                    );
+                    assert_eq!(
+                        epoch, ref_epoch,
+                        "seed {seed}/{partition_after}: all nodes must agree on the config \
+                         epoch after the failover heals"
+                    );
+                }
+            }
+        }
+    }
+
+    // THE LAG GATE (no data loss): a too-stale replica is NEVER promoted. The gate
+    // PREDICATE itself (`ironcache_repl::replica_is_in_sync`: link up AND lag <=
+    // max_lag, the only promotion-eligible state) is unit-tested in
+    // `ironcache-repl/src/lag.rs` (`in_sync_true_only_when_up_and_within_lag`), and is
+    // NOT re-tested here to keep the pure engine crate free of an `ironcache-repl`
+    // dependency. The split-brain DST gate above models that gate at the DECISION level
+    // -- the failover controller (the test) promotes ONLY the in-sync replica and
+    // asserts it never names the stale one -- which is exactly how the production
+    // controller consumes the predicate before proposing a `PromoteReplica`.
 
     // -- scenario determinism_replay_3e ----------------------------------------
 

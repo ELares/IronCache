@@ -767,6 +767,35 @@ impl SlotMap {
         Ok(())
     }
 
+    /// Clear `slot`'s REPLICA entry IFF it currently names `node_id` (HA-8; the
+    /// [`ConfigCmd::PromoteReplica`] apply calls this AFTER flipping the owner to `node_id`, so the
+    /// just-promoted node is no longer recorded as the slot's replica -- it is the OWNER now). A
+    /// no-op when `slot`'s replica is unassigned, names a DIFFERENT node, or `node_id` is unknown:
+    /// promotion must never silently clear some OTHER node's replica role, and re-applying the same
+    /// committed promotion (idempotent) is harmless because the entry is already cleared. Writes
+    /// `replicas[slot]` only (NEVER `owner[slot]`, `mine[slot]`, or `owns()`); the hot path is
+    /// untouched and the default static path stays inert (this array is all-`UNASSIGNED` until an
+    /// AssignReplica/PromoteReplica is committed).
+    pub fn clear_slot_replica(&self, slot: u16, node_id: &str) {
+        // Load the current replica index OUTSIDE the lock first (the common case is UNASSIGNED:
+        // nothing to do, no lock needed). Only when a replica IS recorded do we take the node lock
+        // to resolve its id consistently with the `nodes` snapshot (like `is_replica_of`).
+        let idx = self.replicas[slot as usize].load(Ordering::Acquire);
+        if idx == UNASSIGNED {
+            return;
+        }
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let names_node = table
+            .nodes
+            .get(idx as usize)
+            .is_some_and(|n| n.id.as_ref() == node_id);
+        if names_node {
+            // The slot's recorded replica is exactly `node_id`: clear it (it is now the owner).
+            // Release store so a concurrent cold reader on a shard thread sees the cleared value.
+            self.replicas[slot as usize].store(UNASSIGNED, Ordering::Release);
+        }
+    }
+
     /// `CLUSTER FLUSHSLOTS`: release every slot THIS node owns (set them UNASSIGNED). Slots owned
     /// by OTHER nodes are untouched. Always succeeds.
     ///
@@ -1509,6 +1538,68 @@ mod tests {
         // owns() still reflects ONLY ownership (ID1 = the middle third).
         assert!(map.owns(5461) && map.owns(10922));
         assert!(!map.owns(0) && !map.owns(16383));
+    }
+
+    // ----- HA-8: promotion-side replica clearing (clear_slot_replica) -----
+
+    #[test]
+    fn clear_slot_replica_clears_only_the_named_replica_and_is_idempotent() {
+        // self=ID0 owns slot 5; ID1 replicates it. PROMOTION flips the owner to ID1 then clears
+        // ID1's replica entry (it is the owner now). clear_slot_replica must clear ONLY when the
+        // recorded replica is exactly the named node, and be a no-op otherwise + on re-apply.
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.meet(node(ID2, "h2", 3));
+        map.add_slots(&[5]).unwrap();
+        map.set_slot_replica(5, ID1).unwrap();
+        assert!(map.is_replica_of(5, ID1));
+
+        // Clearing a DIFFERENT node's name is a no-op (ID1 is still the replica).
+        map.clear_slot_replica(5, ID2);
+        assert!(
+            map.is_replica_of(5, ID1),
+            "clearing a non-matching id is a no-op"
+        );
+
+        // The promotion sequence: flip owner to ID1, then clear ID1 from the replica set.
+        map.set_slot_node(5, ID1).unwrap();
+        map.clear_slot_replica(5, ID1);
+        assert_eq!(
+            map.owner_id(5).unwrap().as_ref(),
+            ID1,
+            "ID1 now owns slot 5"
+        );
+        assert!(
+            !map.is_replica_of(5, ID1),
+            "the promoted node is no longer recorded as a replica"
+        );
+        assert!(
+            map.replicas_of(5).is_empty(),
+            "the replica entry is cleared"
+        );
+
+        // Idempotent re-apply: clearing an already-clear entry is harmless.
+        map.clear_slot_replica(5, ID1);
+        assert!(map.replicas_of(5).is_empty());
+
+        // A clear on an UNASSIGNED-replica slot (slot 6 never had a replica) is a no-op, no lock.
+        map.clear_slot_replica(6, ID1);
+        assert!(map.replicas_of(6).is_empty());
+    }
+
+    #[test]
+    fn clear_slot_replica_does_not_touch_ownership_or_owns() {
+        // clear_slot_replica must NEVER alter owner[]/mine[]/owns(): it writes only replicas[].
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.add_slots(&[7]).unwrap(); // self (ID0) owns slot 7
+        map.set_slot_replica(7, ID1).unwrap();
+        assert!(map.owns(7));
+        // Clear ID1's replica role on a slot ID0 still owns: ownership is untouched.
+        map.clear_slot_replica(7, ID1);
+        assert!(map.owns(7), "clear_slot_replica must not change owns()");
+        assert_eq!(map.owner_id(7).unwrap().as_ref(), ID0);
+        assert!(!map.is_replica_of(7, ID1));
     }
 
     #[test]
