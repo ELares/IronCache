@@ -36,22 +36,29 @@
 //! `RuntimeConfig` uses: interior atomics for the HOT-PATH read (`owns`) plus a `Mutex` for the
 //! rarely-written, cold-read node table:
 //!
-//! * `owner` is a dense `[AtomicU16; 16384]`: the hot ownership query [`owns`](SlotMap::owns) is
-//!   a single lock-free `Acquire` load + compare, allocation-free, exactly like slice 2's array
-//!   index. Slot mutators publish with a `Release` store.
+//! * `mine` is a dense `[AtomicBool; 16384]` SELF-ownership bitmap: the hot ownership query
+//!   [`owns`](SlotMap::owns) is a SINGLE lock-free `Acquire` load (`mine[slot]`), allocation-free.
+//!   It reads ONLY this one atomic, so it can NEVER observe a torn `(owner[slot], self_idx)` pair
+//!   while FORGET renumbers the owner array under the lock. The mutators keep `mine[slot]` in
+//!   lockstep with `owner[slot]` at EVERY mutation site (`mine[slot] = (owner[slot] == self_idx)`).
+//! * `owner` is a dense `[AtomicU16; 16384]` (slot -> node index). It is the COLD projection / MOVED
+//!   structure ONLY: a slot's node index, read while holding the table lock so the index stays
+//!   consistent with the `nodes` snapshot during a FORGET renumber. Slot mutators publish with a
+//!   `Release` store. `owns()` does NOT read it.
 //! * `nodes` (and the parallel `config_epochs`) live behind a `std::sync::Mutex`. They are
 //!   mutated only by MEET / FORGET / SETSLOT-bookkeeping and read only on the COLD projection /
-//!   MOVED path (`CLUSTER SLOTS / SHARDS / NODES`, and `moved_target`). `owns()` NEVER takes the
-//!   lock. This crate is NOT in the hot-path-crate set the shared-nothing invariant guards
-//!   (`scripts/ci/check-rust-invariants.sh`: storage/store/eviction/expiry/server/observe), so a
-//!   `Mutex` here is permitted, and it follows the `RuntimeConfig` precedent (Arc + interior
-//!   mutability, written rarely, read off the hot path).
+//!   MOVED path (`CLUSTER SLOTS / SHARDS / NODES`, and `moved_target`, which now reads `owner[]`
+//!   INSIDE the lock). `owns()` NEVER takes the lock. This crate is NOT in the hot-path-crate set
+//!   the shared-nothing invariant guards (`scripts/ci/check-rust-invariants.sh`:
+//!   storage/store/eviction/expiry/server/observe), so a `Mutex` here is permitted, and it follows
+//!   the `RuntimeConfig` precedent (Arc + interior mutability, written rarely, read off the hot
+//!   path).
 //! * `self_idx`, `my_epoch`, and `current_epoch` are atomics (FORGET can shift indices;
 //!   the epochs are scalar counters). ADR-0003 determinism holds: no rand, no `std::time`, no
 //!   clock; atomics and `std::sync::Mutex` carry no nondeterminism.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 /// The number of hash slots in the Redis-Cluster wire space (16384), re-exported from the
 /// protocol crate (the single source of the wire constant). A key's slot is its
@@ -95,9 +102,12 @@ struct NodeTable {
 /// The runtime-mutable slot ownership map: which node owns each of the 16384 slots, which node
 /// is THIS one, and the cluster epochs.
 ///
-/// Two representations are kept, each serving a different consumer:
-/// - the dense `owner` array (slot -> node index) is the HOT-PATH structure: [`owns`](Self::owns)
-///   is a single O(1) lock-free atomic load, allocation-free per request;
+/// THREE representations are kept, each serving a different consumer:
+/// - the dense `mine` self-ownership bitmap is the HOT-PATH structure: [`owns`](Self::owns) is a
+///   SINGLE O(1) lock-free atomic load, allocation-free per request, and reads NOTHING else (so it
+///   can never observe a torn `(owner, self_idx)` pair while FORGET renumbers `owner` under lock);
+/// - the dense `owner` array (slot -> node index) is the COLD MOVED / projection structure,
+///   read only while holding the table lock so the index is consistent with the `nodes` snapshot;
 /// - the `table` (nodes + epochs, behind a `Mutex`) drives the COLD projection
 ///   ([`ranges`](Self::ranges) coalesces contiguous equal-owner runs into the `(start, end,
 ///   node)` shape `CLUSTER SLOTS / SHARDS / NODES` need) and MOVED ([`moved_target`](Self::moved_target)).
@@ -106,11 +116,22 @@ pub struct SlotMap {
     /// The node table + epochs (cold path: projection / MOVED / MEET / FORGET). NEVER read by
     /// [`owns`](Self::owns).
     table: Mutex<NodeTable>,
+    /// Dense per-slot SELF-ownership bitmap (16 KiB of `AtomicBool`, boxed off-stack). `mine[slot]`
+    /// is `true` iff THIS node owns `slot`. The ONLY thing [`owns`](Self::owns) reads, lock-free
+    /// (`Acquire`); kept in lockstep with `owner[slot]` at every mutation site (set to
+    /// `owner[slot] == self_idx` on each owner store). Because `owns()` reads this one atomic and
+    /// nothing else, a concurrent FORGET renumber of `owner`/`self_idx` (under the lock) can NEVER
+    /// produce a torn read that mis-homes a slot.
+    mine: Box<[AtomicBool; CLUSTER_SLOTS as usize]>,
     /// Dense slot -> node-index map (32 KiB of `AtomicU16`, boxed off-stack). `owner[slot]` is
-    /// the index into `table.nodes`, or [`UNASSIGNED`] for a slot no node owns. Read lock-free
-    /// on the hot path (`Acquire`), published by the slot mutators (`Release`).
+    /// the index into `table.nodes`, or [`UNASSIGNED`] for a slot no node owns. The COLD MOVED /
+    /// projection structure: read while holding the table lock (so the index stays consistent with
+    /// the `nodes` snapshot during a FORGET renumber), published by the slot mutators (`Release`).
+    /// NOT read by [`owns`](Self::owns).
     owner: Box<[AtomicU16; CLUSTER_SLOTS as usize]>,
     /// The index into `table.nodes` of THIS node. An atomic because FORGET can shift indices.
+    /// Used ONLY on the cold projection / MOVED / mutation paths; [`owns`](Self::owns) does not
+    /// read it (it reads `mine` instead).
     self_idx: AtomicU16,
     /// THIS node's config epoch (CLUSTER INFO `cluster_my_epoch`). Set by SET-CONFIG-EPOCH /
     /// BUMPEPOCH.
@@ -249,6 +270,19 @@ fn new_owner_array(init: u16) -> Box<[AtomicU16; CLUSTER_SLOTS as usize]> {
         .expect("the vec is exactly CLUSTER_SLOTS long")
 }
 
+/// Allocate a dense `[AtomicBool; CLUSTER_SLOTS]` on the HEAP filled with `init` (the per-slot
+/// self-ownership bitmap), avoiding a 16 KiB stack array (clippy::large_stack_arrays). Built via a
+/// `Vec` then converted to a boxed fixed-size array, mirroring [`new_owner_array`].
+fn new_mine_array(init: bool) -> Box<[AtomicBool; CLUSTER_SLOTS as usize]> {
+    let mut v: Vec<AtomicBool> = Vec::with_capacity(CLUSTER_SLOTS as usize);
+    for _ in 0..CLUSTER_SLOTS {
+        v.push(AtomicBool::new(init));
+    }
+    v.into_boxed_slice()
+        .try_into()
+        .expect("the vec is exactly CLUSTER_SLOTS long")
+}
+
 impl SlotMap {
     /// Build and validate a STATIC slot map from the resolved topology and THIS node's announce
     /// id (the slice-2 boot path, byte-for-byte unchanged in behaviour).
@@ -319,14 +353,25 @@ impl SlotMap {
             .position(|e| e.id.as_ref() == self_id)
             .ok_or_else(|| SlotMapError::SelfNotPresent(self_id.to_owned()))?;
 
+        // Initialize the self-ownership bitmap in lockstep with `owner`: `mine[slot]` is true iff
+        // `owner[slot]` is THIS node. (At build time there are no concurrent readers, so Relaxed.)
+        let self_idx_u16 = self_idx as u16;
+        let mine = new_mine_array(false);
+        for slot in 0..CLUSTER_SLOTS {
+            if owner[slot as usize].load(Ordering::Relaxed) == self_idx_u16 {
+                mine[slot as usize].store(true, Ordering::Relaxed);
+            }
+        }
+
         let config_epochs = vec![0u64; entries.len()];
         Ok(SlotMap {
             table: Mutex::new(NodeTable {
                 nodes: entries,
                 config_epochs,
             }),
+            mine,
             owner,
-            self_idx: AtomicU16::new(self_idx as u16),
+            self_idx: AtomicU16::new(self_idx_u16),
             my_epoch: AtomicU64::new(0),
             current_epoch: AtomicU64::new(0),
         })
@@ -351,6 +396,8 @@ impl SlotMap {
                 }],
                 config_epochs: vec![0u64],
             }),
+            // A fresh node owns ZERO slots, so the self-ownership bitmap is all-false.
+            mine: new_mine_array(false),
             owner: new_owner_array(UNASSIGNED),
             self_idx: AtomicU16::new(0),
             my_epoch: AtomicU64::new(0),
@@ -360,8 +407,13 @@ impl SlotMap {
 
     // ----- HOT PATH (lock-free) -----
 
-    /// Whether THIS node owns `slot` (the hot path). A single lock-free `Acquire` load + compare,
-    /// allocation-free, NEVER takes the node lock.
+    /// Whether THIS node owns `slot` (the hot path). A SINGLE lock-free `Acquire` load of the
+    /// self-ownership bitmap, allocation-free, NEVER takes the node lock.
+    ///
+    /// Reading ONLY `mine[slot]` (and not the `(owner[slot], self_idx)` pair) is what makes this
+    /// race-free: FORGET renumbers `owner`/`self_idx` under the table lock, but a fresh `self_idx`
+    /// can never be paired with a stale `owner[slot]` here, so a node never mistakes a foreign slot
+    /// for its own. The mutators keep `mine[slot]` in lockstep with `owner[slot]`.
     ///
     /// # Panics
     ///
@@ -369,7 +421,7 @@ impl SlotMap {
     /// returns a slot in range). Indexing the fixed-size array bounds-checks this.
     #[must_use]
     pub fn owns(&self, slot: u16) -> bool {
-        self.owner[slot as usize].load(Ordering::Acquire) == self.self_idx.load(Ordering::Acquire)
+        self.mine[slot as usize].load(Ordering::Acquire)
     }
 
     // ----- COLD PATH (node-lock-taking accessors; owned clones) -----
@@ -377,13 +429,17 @@ impl SlotMap {
     /// The advertised `(host, port)` of the node that owns `slot`, or `None` if the slot is
     /// unassigned. Computed under the node lock (cold MOVED path). Returns an OWNED `(String,
     /// u16)` so the caller holds no borrow into the locked table.
+    ///
+    /// The `owner[slot]` load happens INSIDE the lock: FORGET renumbers `owner[]` and removes from
+    /// `nodes` under the SAME lock, so reading the index here while holding the lock guarantees the
+    /// index is consistent with the `nodes` snapshot (no torn index-into-a-shifted-vec).
     #[must_use]
     pub fn moved_target(&self, slot: u16) -> Option<(String, u16)> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
         let idx = self.owner[slot as usize].load(Ordering::Acquire);
         if idx == UNASSIGNED {
             return None;
         }
-        let table = self.table.lock().expect("slot-map node lock poisoned");
         table
             .nodes
             .get(idx as usize)
@@ -526,6 +582,8 @@ impl SlotMap {
         let me = self.self_idx.load(Ordering::Acquire);
         for &slot in slots {
             self.owner[slot as usize].store(me, Ordering::Release);
+            // These slots are now THIS node's: set the self-ownership bitmap in lockstep.
+            self.mine[slot as usize].store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -552,6 +610,8 @@ impl SlotMap {
         }
         for &slot in slots {
             self.owner[slot as usize].store(UNASSIGNED, Ordering::Release);
+            // These slots are now unassigned, hence no longer ours: clear the bitmap in lockstep.
+            self.mine[slot as usize].store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -563,6 +623,13 @@ impl SlotMap {
     /// # Errors
     ///
     /// [`SlotMutError::UnknownNode`] if `node_id` is not in the node table.
+    ///
+    /// DOCUMENTED SLICE-3 BOUNDARY: this is a single owner store with NO migration state, so a slot
+    /// flipped AWAY from self can briefly still be served locally by an in-flight request that read
+    /// `owns()` just before this store (and, symmetrically, a slot flipped TO self may be served a
+    /// moment late). This is the inherent SETSLOT-without-migration window; it is NOT a torn read
+    /// (each atomic is internally consistent). The durable fix is the slice-4 MIGRATING / IMPORTING
+    /// / ASK state machine, which gates serving during the handoff.
     pub fn set_slot_node(&self, slot: u16, node_id: &str) -> Result<(), SlotMutError> {
         let table = self.table.lock().expect("slot-map node lock poisoned");
         let idx = table
@@ -570,18 +637,29 @@ impl SlotMap {
             .iter()
             .position(|n| n.id.as_ref() == node_id)
             .ok_or_else(|| SlotMutError::UnknownNode(node_id.to_owned()))?;
-        self.owner[slot as usize].store(idx as u16, Ordering::Release);
+        let idx_u16 = idx as u16;
+        self.owner[slot as usize].store(idx_u16, Ordering::Release);
+        // Keep the self-ownership bitmap in lockstep: this slot is ours iff it now points at self.
+        let me = self.self_idx.load(Ordering::Acquire);
+        self.mine[slot as usize].store(idx_u16 == me, Ordering::Release);
         Ok(())
     }
 
     /// `CLUSTER FLUSHSLOTS`: release every slot THIS node owns (set them UNASSIGNED). Slots owned
     /// by OTHER nodes are untouched. Always succeeds.
+    ///
+    /// DOCUMENTED DIVERGENCE from Redis 7.4: Redis errors `DB must be empty to perform CLUSTER
+    /// FLUSHSLOTS.` when the DB is non-empty. IronCache has no per-slot / per-DB key-count index
+    /// yet (the same gap COUNTKEYSINSLOT documents), so it cannot test DB-emptiness and always
+    /// succeeds. The emptiness gate lands with the cross-shard slot index in a later slice.
     pub fn flush_slots(&self) {
         let _guard = self.table.lock().expect("slot-map node lock poisoned");
         let me = self.self_idx.load(Ordering::Acquire);
-        for o in self.owner.iter() {
+        for (slot, o) in self.owner.iter().enumerate() {
             if o.load(Ordering::Acquire) == me {
                 o.store(UNASSIGNED, Ordering::Release);
+                // Released slot is no longer ours: clear the self-ownership bitmap in lockstep.
+                self.mine[slot].store(false, Ordering::Release);
             }
         }
     }
@@ -630,6 +708,12 @@ impl SlotMap {
         // Remove from the table, then reindex the owner array and self_idx: every index strictly
         // above `removed` shifts down by one. UNASSIGNED (u16::MAX) is far above any real index,
         // so it is never `> removed` in the meaningful sense; guard it explicitly anyway.
+        //
+        // NOTE: `mine[]` is deliberately UNCHANGED here. The guard above proved the removed node
+        // owns ZERO slots, so no slot's ownership flips; and `mine[slot]` records "is this slot
+        // self's", which is invariant under the owner/self_idx renumber (self's slots stay self's,
+        // whatever index self lands on). This is also WHY `owns()` (which reads only `mine`) does
+        // not race this renumber: the renumber it would otherwise race no longer feeds `owns()`.
         table.nodes.remove(removed);
         table.config_epochs.remove(removed);
         for o in self.owner.iter() {
@@ -673,20 +757,48 @@ impl SlotMap {
         Ok(())
     }
 
-    /// `CLUSTER BUMPEPOCH`: advance `current_epoch` by one and adopt it as THIS node's config
-    /// epoch. Returns the new epoch. Always succeeds.
-    pub fn bump_epoch(&self) -> u64 {
-        let table = self.table.lock().expect("slot-map node lock poisoned");
-        let next = self.current_epoch.load(Ordering::Acquire) + 1;
-        self.current_epoch.store(next, Ordering::Release);
-        self.my_epoch.store(next, Ordering::Release);
-        let me = self.self_idx.load(Ordering::Acquire) as usize;
-        let mut table = table;
-        if let Some(e) = table.config_epochs.get_mut(me) {
-            *e = next;
+    /// `CLUSTER BUMPEPOCH`: conditionally advance the config epoch, mirroring Redis's
+    /// `clusterBumpConfigEpochWithoutConsensus`. Computes `maxEpoch = max(current_epoch, max node
+    /// config epoch)` and bumps ONLY when `my_epoch == 0 || my_epoch != maxEpoch`: then
+    /// `current_epoch = maxEpoch + 1`, `my_epoch = current_epoch`, and it returns
+    /// [`BumpEpoch::Bumped`] with the new epoch. Otherwise nothing changes and it returns
+    /// [`BumpEpoch::Still`] with the unchanged `my_epoch`. Always succeeds.
+    pub fn bump_epoch(&self) -> BumpEpoch {
+        let mut table = self.table.lock().expect("slot-map node lock poisoned");
+        let my = self.my_epoch.load(Ordering::Acquire);
+        // maxEpoch over current_epoch and every known node's config epoch (Redis scans the node
+        // dict; we scan the parallel config_epochs vec).
+        let max_epoch = table
+            .config_epochs
+            .iter()
+            .copied()
+            .fold(self.current_epoch.load(Ordering::Acquire), u64::max);
+        // Redis bumps only when this node's epoch is zero or not already the max.
+        if my == 0 || my != max_epoch {
+            let next = max_epoch + 1;
+            self.current_epoch.store(next, Ordering::Release);
+            self.my_epoch.store(next, Ordering::Release);
+            let me = self.self_idx.load(Ordering::Acquire) as usize;
+            if let Some(e) = table.config_epochs.get_mut(me) {
+                *e = next;
+            }
+            BumpEpoch::Bumped(next)
+        } else {
+            // Already at the max: no change, report STILL with the unchanged epoch.
+            BumpEpoch::Still(my)
         }
-        next
     }
+}
+
+/// The outcome of [`SlotMap::bump_epoch`], mirroring Redis's BUMPEPOCH reply
+/// (`+BUMPED <epoch>` on a real bump, `+STILL <epoch>` when the epoch was already the max).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BumpEpoch {
+    /// The epoch was advanced; carries the new (and current) `my_epoch`. Reply `+BUMPED <epoch>`.
+    Bumped(u64),
+    /// No change (the epoch was already the max); carries the unchanged `my_epoch`. Reply
+    /// `+STILL <epoch>`.
+    Still(u64),
 }
 
 #[cfg(test)]
@@ -1070,14 +1182,32 @@ mod tests {
     }
 
     #[test]
-    fn bump_epoch_advances_current_and_my() {
+    fn bump_epoch_bumps_then_holds_still_at_the_max() {
+        // Redis's clusterBumpConfigEpochWithoutConsensus: the FIRST bump on a my_epoch==0 node
+        // advances to 1; a SECOND immediate bump is a no-op (my_epoch already == maxEpoch == 1),
+        // so it replies STILL with the unchanged epoch.
         let map = SlotMap::empty_self(ID0, "h0", 1);
-        assert_eq!(map.bump_epoch(), 1);
+        assert_eq!(map.bump_epoch(), BumpEpoch::Bumped(1));
         assert_eq!(map.current_epoch(), 1);
         assert_eq!(map.my_epoch(), 1);
-        assert_eq!(map.bump_epoch(), 2);
-        assert_eq!(map.current_epoch(), 2);
-        assert_eq!(map.my_epoch(), 2);
+        // Second consecutive bump: no change, STILL 1 (epoch stays 1).
+        assert_eq!(map.bump_epoch(), BumpEpoch::Still(1));
+        assert_eq!(
+            map.current_epoch(),
+            1,
+            "STILL leaves current_epoch unchanged"
+        );
+        assert_eq!(map.my_epoch(), 1, "STILL leaves my_epoch unchanged");
+    }
+
+    #[test]
+    fn bump_epoch_after_set_config_epoch_is_still() {
+        // SET-CONFIG-EPOCH 5 makes my_epoch == maxEpoch == 5, so an immediate BUMPEPOCH is STILL 5.
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.set_config_epoch(5).unwrap();
+        assert_eq!(map.bump_epoch(), BumpEpoch::Still(5));
+        assert_eq!(map.my_epoch(), 5);
+        assert_eq!(map.current_epoch(), 5);
     }
 
     #[test]
@@ -1109,6 +1239,76 @@ mod tests {
             drive(),
             "the same mutation sequence is deterministic"
         );
+    }
+
+    /// THE self-ownership invariant (FINDING 1): after EVERY mutator, `owns(slot)` (which reads only
+    /// the `mine` bitmap) must agree with the cold `owner[slot] == self_idx` truth for ALL 16384
+    /// slots. If `mine` and `owner`/`self_idx` ever disagreed, a node could mis-home a write; this
+    /// drives a full add/del/set/flush/forget sequence and asserts they never diverge.
+    #[test]
+    fn mine_bitmap_never_disagrees_with_owner_and_self_idx() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.meet(node(ID2, "h2", 3));
+
+        // A helper that asserts the invariant across every slot using the cold owner/self_idx truth.
+        let check = |m: &SlotMap, ctx: &str| {
+            let self_idx = m.self_idx.load(Ordering::Acquire);
+            for slot in 0..CLUSTER_SLOTS {
+                let owner = m.owner[slot as usize].load(Ordering::Acquire);
+                let cold = owner == self_idx; // the pre-fix definition of self-ownership
+                assert_eq!(
+                    m.owns(slot),
+                    cold,
+                    "{ctx}: mine/owner disagree at slot {slot} (owner={owner}, self_idx={self_idx})"
+                );
+            }
+        };
+
+        check(&map, "fresh empty_self");
+        map.add_slots(&[0, 1, 2, 3, 4, 5]).unwrap();
+        check(&map, "after add_slots");
+        map.del_slots(&[2, 4]).unwrap();
+        check(&map, "after del_slots");
+        map.set_slot_node(1, ID1).unwrap(); // flip a self slot AWAY
+        check(&map, "after set_slot_node away");
+        map.set_slot_node(1, ID0).unwrap(); // flip it BACK to self
+        check(&map, "after set_slot_node back");
+        map.add_slots(&[100, 101]).unwrap();
+        map.set_slot_node(100, ID2).unwrap();
+        check(&map, "after mixed adds + set to peer");
+        map.flush_slots();
+        check(&map, "after flush_slots");
+        // FORGET a slotless node (ID1 owns nothing now) and re-check the invariant holds.
+        map.forget(ID1).unwrap();
+        check(&map, "after forget");
+    }
+
+    /// FORGET removes a node that owns ZERO slots (its guard enforces this), so it must NOT alter
+    /// any `mine[]` entry: self's owned slots stay self's across the owner/self_idx renumber. This
+    /// pins the FINDING-1 reasoning that `owns()` (reading only `mine`) cannot race the renumber.
+    #[test]
+    fn forget_does_not_alter_the_mine_bitmap() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2)); // idx1, slotless
+        map.meet(node(ID2, "h2", 3)); // idx2
+        map.add_slots(&[0, 1, 2]).unwrap(); // self (idx0) owns 0,1,2
+        map.set_slot_node(2, ID2).unwrap(); // slot 2 -> ID2 (idx2); self keeps 0,1
+
+        // Snapshot the mine bitmap before FORGET.
+        let before: Vec<bool> = (0..CLUSTER_SLOTS)
+            .map(|s| map.mine[s as usize].load(Ordering::Acquire))
+            .collect();
+        // FORGET ID1 (slotless): ID2 renumbers from idx2 to idx1, self_idx stays 0.
+        map.forget(ID1).unwrap();
+        let after: Vec<bool> = (0..CLUSTER_SLOTS)
+            .map(|s| map.mine[s as usize].load(Ordering::Acquire))
+            .collect();
+        assert_eq!(before, after, "FORGET must not touch any mine[] entry");
+        // And self still owns exactly 0 and 1 (slot 2 is ID2's).
+        assert!(map.owns(0) && map.owns(1) && !map.owns(2));
+        // ID2's slot still resolves after the renumber (owner-index path stays correct).
+        assert_eq!(map.owner_id(2).unwrap().as_ref(), ID2);
     }
 
     // ----- test-only helper: an owned owner id for a slot (mirrors the removed `owner()` ref) -----

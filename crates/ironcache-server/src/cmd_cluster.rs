@@ -146,10 +146,22 @@ fn mut_err(e: &ironcache_cluster::SlotMutError) -> Value {
     Value::error(ErrorReply::err(e.to_string()))
 }
 
+/// The Redis `addReplySubcommandSyntaxError` reply for a CLUSTER subcommand whose token matched but
+/// whose argument count is too small (Redis returns this class, NOT a bare wrong-arity, for an
+/// under-arity mutator subcommand). Uses the raw subcommand token from `req.args[1]`, matching the
+/// `_ =>` unknown-subcommand arm's call style.
+fn cluster_subcommand_syntax_error(req: &Request) -> Value {
+    Value::error(ErrorReply::unknown_subcommand(
+        "CLUSTER",
+        &String::from_utf8_lossy(&req.args[1]),
+    ))
+}
+
 /// `CLUSTER ADDSLOTS <slot> [<slot> ...]` -> claim each slot for self. Arity Min(3).
 fn cluster_addslots(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() < 3 {
-        return Value::error(ErrorReply::wrong_arity("cluster|addslots"));
+        // Under-arity: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
     }
     let slots = match parse_slot_list(&req.args[2..]) {
         Ok(s) => s,
@@ -168,7 +180,8 @@ fn cluster_addslots(ctx: &ServerContext, req: &Request) -> Value {
 /// `CLUSTER DELSLOTS <slot> [<slot> ...]` -> release each slot. Arity Min(3).
 fn cluster_delslots(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() < 3 {
-        return Value::error(ErrorReply::wrong_arity("cluster|delslots"));
+        // Under-arity: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
     }
     let slots = match parse_slot_list(&req.args[2..]) {
         Ok(s) => s,
@@ -222,20 +235,25 @@ fn cluster_delslotsrange(ctx: &ServerContext, req: &Request) -> Value {
 /// `NODE` ownership-transfer form). `MIGRATING` / `IMPORTING` / `STABLE` are the live-resharding
 /// state machine and are deferred to slice 4 (clear not-supported). Arity exactly 5.
 fn cluster_setslot(ctx: &ServerContext, req: &Request) -> Value {
-    // SETSLOT <slot> <subcmd> ... : the shortest supported form (NODE) is 5 args.
+    // SETSLOT <slot> <subcmd> ... : the shortest form (STABLE) is 4 args.
     if req.args.len() < 4 {
-        return Value::error(ErrorReply::wrong_arity("cluster|setslot"));
+        // Under-arity base guard: the addReplySubcommandSyntaxError class (Redis parity).
+        return cluster_subcommand_syntax_error(req);
     }
-    let slot = match parse_slot(&req.args[2]) {
+    let slot = match parse_slot_strict(&req.args[2]) {
         Ok(s) => s,
         Err(e) => return Value::error(e),
     };
     let setsub = ascii_upper(&req.args[3]);
+    // Any unmatched action OR a matched action at the WRONG argc is the single Redis message
+    // (cluster_legacy.c SETSLOT: `Invalid CLUSTER SETSLOT action or number of arguments.`).
+    let setslot_err = || {
+        Value::error(ErrorReply::err(
+            "Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP",
+        ))
+    };
     match setsub.as_slice() {
-        b"NODE" => {
-            if req.args.len() != 5 {
-                return Value::error(ErrorReply::wrong_arity("cluster|setslot"));
-            }
+        b"NODE" if req.args.len() == 5 => {
             let node_id = String::from_utf8_lossy(&req.args[4]);
             let map = match cluster_map(ctx, "SETSLOT") {
                 Ok(m) => m,
@@ -246,19 +264,33 @@ fn cluster_setslot(ctx: &ServerContext, req: &Request) -> Value {
                 Err(e) => mut_err(&e),
             }
         }
-        // The live-resharding states are slice 4; reply with the documented not-supported error.
-        b"MIGRATING" | b"IMPORTING" | b"STABLE" => Value::error(ErrorReply::err(format!(
-            "SETSLOT {} is not supported on a single-node cluster",
-            String::from_utf8_lossy(&setsub)
-        ))),
-        _ => Value::error(ErrorReply::syntax_error()),
+        // The live-resharding states are slice 4; reply with the documented not-supported error,
+        // but only at their correct argc (MIGRATING/IMPORTING take a node id at argc==5, STABLE
+        // takes none at argc==4). At a wrong argc they fall through to the SETSLOT error below.
+        b"MIGRATING" | b"IMPORTING" if req.args.len() == 5 => {
+            Value::error(ErrorReply::err(format!(
+                "SETSLOT {} is not supported on a single-node cluster",
+                String::from_utf8_lossy(&setsub)
+            )))
+        }
+        b"STABLE" if req.args.len() == 4 => Value::error(ErrorReply::err(
+            "SETSLOT STABLE is not supported on a single-node cluster",
+        )),
+        // Unknown action, or a known action at the wrong argc (incl. NODE with argc != 5).
+        _ => setslot_err(),
     }
 }
 
 /// `CLUSTER FLUSHSLOTS` -> release every slot THIS node owns. Arity exactly 2.
+///
+/// DOCUMENTED DIVERGENCE from Redis 7.4: Redis errors `DB must be empty to perform CLUSTER
+/// FLUSHSLOTS.` when the keyspace is non-empty. IronCache has no per-slot / per-DB key-count index
+/// yet (the same gap COUNTKEYSINSLOT documents), so it cannot test DB-emptiness and always returns
+/// `+OK`. The emptiness gate lands with the cross-shard slot index in a later slice.
 fn cluster_flushslots(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
-        return Value::error(ErrorReply::wrong_arity("cluster|flushslots"));
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
     }
     let map = match cluster_map(ctx, "FLUSHSLOTS") {
         Ok(m) => m,
@@ -275,18 +307,31 @@ fn cluster_flushslots(ctx: &ServerContext, req: &Request) -> Value {
 /// `SETSLOT` / `FORGET` in this slice (documented divergence).
 fn cluster_meet(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 4 && req.args.len() != 5 {
-        return Value::error(ErrorReply::wrong_arity("cluster|meet"));
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
     }
     let host = String::from_utf8_lossy(&req.args[2]).into_owned();
+    let port_arg = String::from_utf8_lossy(&req.args[3]).into_owned();
+    // Non-parseable base port -> Redis `Invalid base port specified: %s` (uses the raw arg).
     let Some(port) = parse_i64(&req.args[3]) else {
-        return Value::error(ErrorReply::not_an_integer());
+        return Value::error(ErrorReply::err(format!(
+            "Invalid base port specified: {port_arg}"
+        )));
     };
-    if !(1..=65535).contains(&port) {
-        return Value::error(ErrorReply::err("Invalid base port"));
-    }
     // The optional cluster-bus port (arg 4) is parsed for validity but unused (no bus yet).
+    // Non-parseable bus port -> Redis `Invalid bus port specified: %s` (uses the raw arg).
     if req.args.len() == 5 && parse_i64(&req.args[4]).is_none() {
-        return Value::error(ErrorReply::not_an_integer());
+        let bus_arg = String::from_utf8_lossy(&req.args[4]).into_owned();
+        return Value::error(ErrorReply::err(format!(
+            "Invalid bus port specified: {bus_arg}"
+        )));
+    }
+    // Out-of-range base port (or any otherwise-invalid address/port) -> Redis
+    // `Invalid node address specified: %s:%s` (the ip:port).
+    if !(1..=65535).contains(&port) {
+        return Value::error(ErrorReply::err(format!(
+            "Invalid node address specified: {host}:{port_arg}"
+        )));
     }
     let map = match cluster_map(ctx, "MEET") {
         Ok(m) => m,
@@ -305,7 +350,8 @@ fn cluster_meet(ctx: &ServerContext, req: &Request) -> Value {
 /// Arity exactly 3.
 fn cluster_forget(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 3 {
-        return Value::error(ErrorReply::wrong_arity("cluster|forget"));
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
     }
     let node_id = String::from_utf8_lossy(&req.args[2]);
     let map = match cluster_map(ctx, "FORGET") {
@@ -318,19 +364,27 @@ fn cluster_forget(ctx: &ServerContext, req: &Request) -> Value {
     }
 }
 
-/// `CLUSTER BUMPEPOCH` -> advance the config epoch by one and adopt it. Replies the Redis status
-/// `+BUMPED <epoch>`. Arity exactly 2.
+/// `CLUSTER BUMPEPOCH` -> conditionally advance the config epoch (Redis's
+/// `clusterBumpConfigEpochWithoutConsensus`): `+BUMPED <epoch>` on a real bump, `+STILL <epoch>`
+/// when the epoch was already the cluster max. Arity exactly 2.
 fn cluster_bumpepoch(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
-        return Value::error(ErrorReply::wrong_arity("cluster|bumpepoch"));
+        // Under-arity: the addReplySubcommandSyntaxError class, not a bare wrong-arity (Redis
+        // parity for a matched-but-malformed CLUSTER subcommand).
+        return Value::error(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&req.args[1]),
+        ));
     }
     let map = match cluster_map(ctx, "BUMPEPOCH") {
         Ok(m) => m,
         Err(v) => return v,
     };
-    let epoch = map.bump_epoch();
-    // Redis replies `+BUMPED <epoch>` (a simple status), not +OK.
-    Value::simple(&format!("BUMPED {epoch}"))
+    // Redis replies the status `+BUMPED <epoch>` on a real bump and `+STILL <epoch>` otherwise.
+    match map.bump_epoch() {
+        ironcache_cluster::BumpEpoch::Bumped(epoch) => Value::simple(&format!("BUMPED {epoch}")),
+        ironcache_cluster::BumpEpoch::Still(epoch) => Value::simple(&format!("STILL {epoch}")),
+    }
 }
 
 /// `CLUSTER SET-CONFIG-EPOCH <epoch>` -> set this node's config epoch (only when fresh and
@@ -338,7 +392,8 @@ fn cluster_bumpepoch(ctx: &ServerContext, req: &Request) -> Value {
 /// error.
 fn cluster_set_config_epoch(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 3 {
-        return Value::error(ErrorReply::wrong_arity("cluster|set-config-epoch"));
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
     }
     let Some(epoch) = parse_i64(&req.args[2]) else {
         return Value::error(ErrorReply::not_an_integer());
@@ -359,26 +414,43 @@ fn cluster_set_config_epoch(ctx: &ServerContext, req: &Request) -> Value {
     }
 }
 
-/// Parse a list of slot arguments (each `parse_slot`-validated). Returns the first parse/range
-/// error encountered, matching Redis's left-to-right validation in `getSlotOrReply`.
+/// Parse a list of slot arguments for the MUTATOR paths (ADDSLOTS / DELSLOTS), each
+/// `parse_slot_strict`-validated (the single `Invalid or out of range slot` message Redis's
+/// `getSlotOrReply` emits for both a non-integer and an out-of-range value). Returns the first
+/// error encountered, matching Redis's left-to-right validation.
 fn parse_slot_list(args: &[bytes::Bytes]) -> Result<Vec<u16>, ErrorReply> {
-    args.iter().map(|a| parse_slot(a)).collect()
+    args.iter().map(|a| parse_slot_strict(a)).collect()
 }
 
 /// Parse the `<start> <end> [<start> <end> ...]` pairs of ADDSLOTSRANGE / DELSLOTSRANGE into the
 /// expanded, deduplicated-by-position slot list. The args after the subcommand must be a non-empty
-/// EVEN count (>= 2). Each `start`/`end` is a valid slot and `start <= end`. `cmd` is the
-/// wrong-arity command label (e.g. `cluster|addslotsrange`).
+/// EVEN count (>= 2). Each `start`/`end` is a valid slot (strict getSlotOrReply parse) and
+/// `start <= end`. `cmd` is the wrong-arity command label (e.g. `cluster|addslotsrange`).
+///
+/// Two distinct argc errors, matching Redis (cluster_legacy.c ADDSLOTSRANGE/DELSLOTSRANGE):
+/// * UNDER-arity (fewer than the 4-arg minimum `CLUSTER <sub> <start> <end>`, i.e. no pair at all)
+///   -> the `addReplySubcommandSyntaxError` class (a matched-but-malformed subcommand), like the
+///   other under-arity mutator guards;
+/// * an ODD number of range args while >= 4 (`c->argc % 2 == 1`) -> Redis calls `addReplyErrorArity`
+///   (a real wrong-arity), so this case keeps `wrong_arity(cmd)`.
 fn parse_slot_ranges(args: &[bytes::Bytes], cmd: &str) -> Result<Vec<u16>, ErrorReply> {
     // args[0]=CLUSTER, args[1]=subcommand; the range pairs start at args[2].
     let pairs = &args[2..];
-    if pairs.is_empty() || pairs.len() % 2 != 0 {
+    if pairs.is_empty() {
+        // Under-arity (no <start> <end> pair): the subcommand-syntax-error class.
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&args[1]),
+        ));
+    }
+    if pairs.len() % 2 != 0 {
+        // >= 4 args but an odd count: Redis's addReplyErrorArity (a real wrong-arity).
         return Err(ErrorReply::wrong_arity(cmd));
     }
     let mut out = Vec::new();
     for pair in pairs.chunks_exact(2) {
-        let start = parse_slot(&pair[0])?;
-        let end = parse_slot(&pair[1])?;
+        let start = parse_slot_strict(&pair[0])?;
+        let end = parse_slot_strict(&pair[1])?;
         if start > end {
             // Redis: `start slot number %d is greater than end slot number %d`.
             return Err(ErrorReply::err(format!(
@@ -848,6 +920,19 @@ fn parse_slot(arg: &[u8]) -> Result<u16, ErrorReply> {
         Ok(n as u16)
     } else {
         Err(ErrorReply::err("Invalid slot"))
+    }
+}
+
+/// Parse and bounds-check a slot the way Redis's `getSlotOrReply` does for the MUTATOR paths
+/// (ADDSLOTS / DELSLOTS / SETSLOT / ADDSLOTSRANGE / DELSLOTSRANGE). Unlike [`parse_slot`] (the
+/// COUNTKEYSINSLOT / GETKEYSINSLOT path), Redis's `getSlotOrReply` returns the SINGLE message
+/// `Invalid or out of range slot` for BOTH a non-integer arg AND an out-of-range value (it does
+/// `getLongLongFromObject ... || slot < 0 || slot >= CLUSTER_SLOTS` and replies once).
+fn parse_slot_strict(arg: &[u8]) -> Result<u16, ErrorReply> {
+    match parse_i64(arg) {
+        Some(n) if (0..i64::from(CLUSTER_SLOTS)).contains(&n) => Ok(n as u16),
+        // Non-integer OR out of range -> the one getSlotOrReply error.
+        _ => Err(ErrorReply::err("Invalid or out of range slot")),
     }
 }
 
@@ -1571,7 +1656,8 @@ mod tests {
         assert!(info3.contains("cluster_my_epoch:1\r\n"), "{info3:?}");
     }
 
-    /// SET-CONFIG-EPOCH on a fresh, alone node sets my_epoch; BUMPEPOCH then advances it.
+    /// SET-CONFIG-EPOCH on a fresh, alone node sets my_epoch; an immediate BUMPEPOCH is then STILL
+    /// (my_epoch already == the cluster max, Redis's clusterBumpConfigEpochWithoutConsensus).
     #[test]
     fn empty_self_set_config_epoch_then_bumpepoch() {
         let (c, _map) = ctx_empty_self();
@@ -1582,10 +1668,19 @@ mod tests {
         let info = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
         assert!(info.contains("cluster_my_epoch:5\r\n"), "{info:?}");
         assert!(info.contains("cluster_current_epoch:5\r\n"), "{info:?}");
-        // BUMPEPOCH advances current_epoch to 6.
+        // my_epoch (5) is already the cluster max, so BUMPEPOCH replies STILL 5 (no change).
         assert_eq!(
             run(&c, &[b"CLUSTER", b"BUMPEPOCH"]),
-            Value::simple("BUMPED 6")
+            Value::simple("STILL 5")
+        );
+        let info2 = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info2.contains("cluster_my_epoch:5\r\n"),
+            "STILL leaves my_epoch at 5: {info2:?}"
+        );
+        assert!(
+            info2.contains("cluster_current_epoch:5\r\n"),
+            "STILL leaves current_epoch at 5: {info2:?}"
         );
     }
 
@@ -1623,15 +1718,147 @@ mod tests {
             )),
             format!("-ERR Unknown node {unknown}")
         );
-        // Out-of-range slot in ADDSLOTS -> getSlotOrReply error.
+        // Out-of-range slot in a MUTATOR (ADDSLOTS) -> the single getSlotOrReply message
+        // `Invalid or out of range slot` (NOT the COUNTKEYSINSLOT "Invalid slot").
         assert_eq!(
             err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTS", b"99999"])),
-            "-ERR Invalid slot"
+            "-ERR Invalid or out of range slot"
+        );
+        // A NON-integer slot in a mutator gets the SAME single message (getSlotOrReply: one error
+        // for both a non-integer and an out-of-range value).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTS", b"abc"])),
+            "-ERR Invalid or out of range slot"
+        );
+        // The same single message on a DELSLOTS mutator (non-integer) and SETSLOT (out of range).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"DELSLOTS", b"xyz"])),
+            "-ERR Invalid or out of range slot"
+        );
+        assert_eq!(
+            err_line(&run(
+                &c,
+                &[
+                    b"CLUSTER",
+                    b"SETSLOT",
+                    b"99999",
+                    b"NODE",
+                    TEST_NODE_ID.as_bytes()
+                ]
+            )),
+            "-ERR Invalid or out of range slot"
+        );
+        // A slot named TWICE in one ADD/DEL batch -> `Slot N specified multiple times`.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTS", b"5", b"5"])),
+            "-ERR Slot 5 specified multiple times"
         );
         // ADDSLOTSRANGE with start > end -> the Redis range error.
         assert_eq!(
             err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTSRANGE", b"50", b"10"])),
             "-ERR start slot number 50 is greater than end slot number 10"
+        );
+    }
+
+    /// FINDING 3: an under-arity mutator subcommand (token matches, argc too small) is the
+    /// addReplySubcommandSyntaxError class, NOT a bare wrong-arity. Redis:
+    /// `unknown subcommand or wrong number of arguments for '<sub>'. Try CLUSTER HELP.`
+    #[test]
+    fn under_arity_mutator_subcommands_are_subcommand_syntax_errors() {
+        let (c, _map) = ctx_empty_self();
+        // Each of these matches its token but is one arg short of the minimum.
+        let cases: &[&[&[u8]]] = &[
+            &[b"CLUSTER", b"ADDSLOTS"],
+            &[b"CLUSTER", b"DELSLOTS"],
+            &[b"CLUSTER", b"SETSLOT", b"0"], // base guard: argc < 4
+            &[b"CLUSTER", b"FLUSHSLOTS", b"extra"], // argc != 2
+            &[b"CLUSTER", b"MEET", b"127.0.0.1"], // argc not 4/5
+            &[b"CLUSTER", b"FORGET"],        // argc != 3
+            &[b"CLUSTER", b"BUMPEPOCH", b"extra"], // argc != 2
+            &[b"CLUSTER", b"SET-CONFIG-EPOCH"], // argc != 3
+            &[b"CLUSTER", b"ADDSLOTSRANGE"], // no pair at all
+            &[b"CLUSTER", b"DELSLOTSRANGE"], // no pair at all
+        ];
+        for parts in cases {
+            let line = err_line(&run(&c, parts));
+            assert!(
+                line.contains("unknown subcommand or wrong number of arguments")
+                    && line.contains("Try CLUSTER HELP."),
+                "{parts:?} should be a subcommand-syntax error, got {line:?}"
+            );
+        }
+    }
+
+    /// FINDING 3 EXCEPTION: ADDSLOTSRANGE / DELSLOTSRANGE with >= 4 args but an ODD count is a
+    /// REAL wrong-arity (Redis addReplyErrorArity), not the subcommand-syntax error.
+    #[test]
+    fn odd_range_args_are_real_wrong_arity() {
+        let (c, _map) = ctx_empty_self();
+        for sub in [b"ADDSLOTSRANGE".as_slice(), b"DELSLOTSRANGE"] {
+            // Three range args (one pair + a dangling one): odd while >= 4 total.
+            let line = err_line(&run(&c, &[b"CLUSTER", sub, b"0", b"5", b"7"]));
+            assert!(
+                line.contains("wrong number of arguments") && !line.contains("unknown subcommand"),
+                "{:?} odd args should be wrong-arity, got {line:?}",
+                String::from_utf8_lossy(sub)
+            );
+        }
+    }
+
+    /// FINDING 4: CLUSTER MEET port / address error strings (Redis 7.4 exact).
+    #[test]
+    fn meet_port_and_address_errors_are_byte_exact() {
+        let (c, _map) = ctx_empty_self();
+        // Non-integer base port -> `Invalid base port specified: <arg>`.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"MEET", b"127.0.0.1", b"notaport"])),
+            "-ERR Invalid base port specified: notaport"
+        );
+        // Non-integer bus port -> `Invalid bus port specified: <arg>`.
+        assert_eq!(
+            err_line(&run(
+                &c,
+                &[b"CLUSTER", b"MEET", b"127.0.0.1", b"7000", b"busbad"]
+            )),
+            "-ERR Invalid bus port specified: busbad"
+        );
+        // Out-of-range base port -> `Invalid node address specified: <ip>:<port>`.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"MEET", b"10.0.0.9", b"99999"])),
+            "-ERR Invalid node address specified: 10.0.0.9:99999"
+        );
+        // A valid MEET still succeeds.
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"MEET", b"10.0.0.9", b"7000"]),
+            "valid MEET",
+        );
+    }
+
+    /// FINDING 5: SETSLOT bad-action / wrong-argc inner error is the SINGLE Redis message.
+    #[test]
+    fn setslot_bad_action_or_wrong_argc_is_one_message() {
+        const SETSLOT_ERR: &str =
+            "-ERR Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP";
+        let (c, _map) = ctx_empty_self();
+        // Unrecognized action.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"BOGUS"])),
+            SETSLOT_ERR
+        );
+        // NODE form at the wrong argc (missing the node id) -> the SAME message (was wrong-arity).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"NODE"])),
+            SETSLOT_ERR
+        );
+        // STABLE at the wrong argc (an extra arg) -> the SAME message (STABLE is argc==4).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"STABLE", b"x"])),
+            SETSLOT_ERR
+        );
+        // MIGRATING at the wrong argc (missing node id) -> the SAME message (MIGRATING is argc==5).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"MIGRATING"])),
+            SETSLOT_ERR
         );
     }
 

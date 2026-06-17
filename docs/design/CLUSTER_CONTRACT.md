@@ -100,10 +100,18 @@ slot projection, gated on `cluster-enabled` exactly like Redis's `clusterCommand
 - With `cluster-enabled yes` IronCache behaves as a SINGLE-NODE cluster that
   AUTO-OWNS all 16384 slots: CLUSTER INFO reports `cluster_enabled:1`,
   `cluster_slots_assigned:16384`, `cluster_size:1`; CLUSTER SLOTS / SHARDS / NODES
-  render one `0-16383` range owned by self. The topology-mutation subcommands
-  (MEET / ADDSLOTS / SETSLOT / DELSLOTS / FORGET / REPLICATE / FAILOVER / RESET /
-  BUMPEPOCH / FLUSHSLOTS / SET-CONFIG-EPOCH) return
-  `-ERR <SUBCOMMAND> is not supported on a single-node cluster`.
+  render one `0-16383` range owned by self. In slice 1 the topology-mutation
+  subcommands returned `-ERR <SUBCOMMAND> is not supported on a single-node
+  cluster`. UPDATED in slice 3 (runtime self-formation): the slot / membership /
+  epoch mutators (MEET / ADDSLOTS / ADDSLOTSRANGE / DELSLOTS / DELSLOTSRANGE /
+  SETSLOT NODE / FLUSHSLOTS / FORGET / BUMPEPOCH / SET-CONFIG-EPOCH) are now
+  IMPLEMENTED and mutate this node's local view. CLUSTER FLUSHSLOTS is a DOCUMENTED
+  DIVERGENCE: Redis errors `DB must be empty to perform CLUSTER FLUSHSLOTS.` when
+  the keyspace is non-empty, but IronCache has no per-slot / per-DB key-count index
+  yet, so it always returns `+OK` (the emptiness gate lands with that index in a
+  later slice). Only the replication / failover subcommands (REPLICATE / FAILOVER /
+  RESET) and the live-resharding SETSLOT states (MIGRATING / IMPORTING / STABLE)
+  remain `-ERR <SUBCOMMAND> is not supported on a single-node cluster` (slice 4).
 
 This single-node auto-slots behavior is the ONE deliberate divergence from Redis:
 a fresh real-Redis cluster-enabled node owns NO slots until `CLUSTER ADDSLOTS`,
