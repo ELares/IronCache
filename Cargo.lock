@@ -334,6 +334,7 @@ dependencies = [
  "bytes",
  "clap",
  "ironcache-cluster",
+ "ironcache-clusterbus",
  "ironcache-config",
  "ironcache-env",
  "ironcache-eviction",
@@ -374,6 +375,14 @@ name = "ironcache-cluster"
 version = "0.0.0"
 dependencies = [
  "ironcache-protocol",
+]
+
+[[package]]
+name = "ironcache-clusterbus"
+version = "0.0.0"
+dependencies = [
+ "ironcache-runtime",
+ "tokio",
 ]
 
 [[package]]

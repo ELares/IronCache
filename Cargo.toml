@@ -19,6 +19,7 @@ members = [
     "crates/ironcache-runtime",
     "crates/ironcache-config",
     "crates/ironcache-cluster",
+    "crates/ironcache-clusterbus",
     "crates/ironcache-observe",
     "crates/ironcache-storage",
     "crates/ironcache-eviction",
@@ -93,6 +94,7 @@ ironcache-protocol = { path = "crates/ironcache-protocol" }
 ironcache-runtime = { path = "crates/ironcache-runtime" }
 ironcache-config = { path = "crates/ironcache-config" }
 ironcache-cluster = { path = "crates/ironcache-cluster" }
+ironcache-clusterbus = { path = "crates/ironcache-clusterbus" }
 ironcache-observe = { path = "crates/ironcache-observe" }
 ironcache-storage = { path = "crates/ironcache-storage" }
 ironcache-eviction = { path = "crates/ironcache-eviction" }

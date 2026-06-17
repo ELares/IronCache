@@ -46,6 +46,14 @@ impl Runtime for TokioRuntime {
         Ok((stream, peer))
     }
 
+    async fn connect(&self, addr: SocketAddr) -> Result<Self::Stream, Self::Error> {
+        let stream = TcpStream::connect(addr).await?;
+        // Disable Nagle to match accept: node-to-node request/reply wants low
+        // latency over coalescing, same as the inbound data path.
+        let _ = stream.set_nodelay(true);
+        Ok(stream)
+    }
+
     async fn recv(
         &self,
         stream: &mut Self::Stream,

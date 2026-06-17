@@ -59,3 +59,6 @@ tikv-jemalloc-ctl = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
+# The inter-node transport (HA-1): the ha_transport integration test drives a real
+# node-to-node connection over the Runtime seam against two in-process nodes.
+ironcache-clusterbus = { workspace = true }
