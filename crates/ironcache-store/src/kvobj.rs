@@ -2615,6 +2615,66 @@ impl Entry {
         }
     }
 
+    /// Reconstruct the public [`KvObj`] transfer type from this stored entry (HA-5b #60:
+    /// the REVERSE of [`Self::from_kvobj`]). This is the OWNED, borrow-free per-entry
+    /// representation the forkless SNAPSHOT iterator emits: it carries everything a replica
+    /// needs to replay the write (the data type + encoding in the header, the key bytes, the
+    /// value -- string bytes or a deep-cloned collection -- and the TTL deadline). A replica
+    /// re-applies it through [`ShardStore::insert_object`](crate::ShardStore::insert_object),
+    /// which round-trips it back to an `Entry`.
+    ///
+    /// READ-ONLY over the existing blob/`CollEntry` fields: it adds NO per-key bytes and
+    /// does NOT touch the hot write path. The value is reconstructed FAITHFULLY: an
+    /// int-encoded string yields [`ValueRepr::Int`] (parsed from its canonical decimal
+    /// digits), an embstr/raw string yields [`ValueRepr::Inline`]/[`ValueRepr::Raw`] per the
+    /// stored encoding, and a collection yields the matching boxed [`ValueRepr`] variant by
+    /// DEEP-CLONING the stored `CollVal` (the only allocation on the snapshot path, bounded
+    /// per chunk). The reserved [`Header::snapshot_version`] is left at its default -- it is
+    /// not load-bearing for the snapshot (correctness comes from the HA-5a stream, not a
+    /// per-key version; see [`ShardStore::snapshot_chunk`](crate::ShardStore::snapshot_chunk)).
+    #[must_use]
+    pub fn to_kvobj(&self) -> KvObj {
+        let data_type = self.data_type();
+        let encoding = self.encoding();
+        let expire_at = self.expire_at();
+        let key = self.key().to_vec().into_boxed_slice();
+        let value = if let Some(c) = self.coll_ref() {
+            // Deep-clone the collection value into the matching boxed ValueRepr variant.
+            match &c.value {
+                CollVal::List(l) => ValueRepr::List(Box::new(l.clone())),
+                CollVal::Hash(h) => ValueRepr::Hash(Box::new(h.clone())),
+                CollVal::Set(s) => ValueRepr::Set(Box::new(s.clone())),
+                CollVal::ZSet(z) => ValueRepr::ZSet(Box::new(z.clone())),
+            }
+        } else {
+            let bytes = self.str_value_bytes();
+            match encoding {
+                // An int-encoded string stores its canonical decimal digits; parse them
+                // back to the i64 so the replica stores it int-encoded too. The digits are
+                // always valid (they were produced by `format_i64`), so the parse cannot
+                // realistically fail; fall back to a Raw byte copy if it ever did, which is
+                // still a faithful value (the replica re-classifies it).
+                Encoding::Int => std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map_or_else(
+                        || ValueRepr::Raw(bytes.to_vec().into_boxed_slice()),
+                        ValueRepr::Int,
+                    ),
+                Encoding::Raw => ValueRepr::Raw(bytes.to_vec().into_boxed_slice()),
+                // EmbStr (and any other string encoding, defensively) is inline.
+                _ => ValueRepr::Inline(bytes.to_vec().into_boxed_slice()),
+            }
+        };
+        let header = Header::with_type(data_type, encoding, expire_at.is_some());
+        KvObj {
+            header,
+            key,
+            value,
+            expire_at,
+        }
+    }
+
     // -- STRING blob parsing (SAFE slicing only) --
 
     /// The flags byte of a Str blob.

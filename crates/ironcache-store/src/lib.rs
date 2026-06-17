@@ -46,6 +46,10 @@ pub mod kvobj;
 /// type. Purely additive: `kvobj::Entry` is unchanged and still reachable by its module
 /// path.
 pub use kvobj::Entry;
+/// Re-export [`kvobj::KvObj`] at the crate root: the public, owned builder/transfer type
+/// the forkless SNAPSHOT iterator (HA-5b #60) yields per entry and a replica replays via
+/// [`ShardStore::insert_object`]. Purely additive.
+pub use kvobj::KvObj;
 
 use bytes::Bytes;
 use hashbrown::hash_map::Entry as WatchMapEntry;
@@ -56,7 +60,6 @@ use ironcache_storage::{
     MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
     RmwStep, ScanCursor, Store, UnixMillis, ValueRef, VictimFreq, WatchEntry,
 };
-use kvobj::KvObj;
 use std::hash::BuildHasher;
 
 /// The FIXED-SEED stable key hash that the SCAN cursor iterates in ascending order
@@ -2238,6 +2241,205 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // funnel boundary.
         let entry = Entry::from_kvobj(obj);
         self.put_object(db, db_idx, &key, entry);
+    }
+}
+
+/// One snapshot entry (HA-5b #60): the `(db, key, value)` triple the SNAPSHOT iterator
+/// yields, where `value` is an OWNED, borrow-free [`KvObj`] reconstruction a replica
+/// replays via [`ShardStore::insert_object`]. A type alias so the chunk return type stays
+/// readable (and clippy's `type_complexity` lint is satisfied) at every call site.
+pub type SnapshotEntry = (u32, Box<[u8]>, KvObj);
+
+/// A RESUMABLE snapshot cursor (HA-5b #60): the position of a chunked snapshot iteration
+/// across the shard's keyspace. It encodes WHICH database is being scanned (`db_index`,
+/// iterated 0, 1, 2, ... in turn) and WHERE in that database's `scan_hash` order the next
+/// chunk resumes (`scan`, an inner [`ScanCursor`]).
+///
+/// The caller starts at [`SnapshotCursor::START`], passes the returned cursor to the next
+/// [`ShardStore::snapshot_chunk`] call, and stops when [`SnapshotCursor::is_done`] is true.
+/// Between chunks the cursor is a plain `Copy` value the caller can hold while it releases
+/// the store borrow and awaits (e.g. shipping the chunk to a replica), then resumes -- this
+/// is what makes the iteration CONSTANT-MEMORY (a bounded chunk per call, never a
+/// full-keyspace materialization) and FORKLESS (no copy-on-write of the table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotCursor {
+    /// The database currently being scanned (0-based). When it reaches the database count
+    /// the iteration is COMPLETE (no more databases to visit); see [`Self::is_done`]. The
+    /// store advances it to the next database once a database's inner scan completes.
+    db_index: u32,
+    /// The inner per-database SCAN resume position (the same resize-stable `scan_hash`
+    /// cursor SCAN uses). [`ScanCursor::START`] means "start this database from the
+    /// beginning"; a non-start value is the `scan_hash` threshold to resume at.
+    scan: ScanCursor,
+}
+
+impl SnapshotCursor {
+    /// The start-of-iteration cursor: database 0, inner scan at the start.
+    pub const START: SnapshotCursor = SnapshotCursor {
+        db_index: 0,
+        scan: ScanCursor::START,
+    };
+
+    /// Whether the iteration is COMPLETE for a store with `databases` databases: every
+    /// database has been fully scanned (`db_index` has advanced past the last one). The
+    /// caller loops `while !cursor.is_done(n)`.
+    #[must_use]
+    pub fn is_done(self, databases: usize) -> bool {
+        self.db_index as usize >= databases
+    }
+
+    /// The database this cursor is positioned at (introspection / tests).
+    #[must_use]
+    pub fn db_index(self) -> u32 {
+        self.db_index
+    }
+}
+
+impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
+    /// Pull ONE bounded chunk of a SNAPSHOT of this shard (HA-5b #60), resuming at
+    /// `cursor`. Returns the chunk (each entry as `(db, key, KvObj)`, an owned borrow-free
+    /// reconstruction the replica replays via [`Self::insert_object`]) and the NEXT cursor
+    /// to pass back. The iteration is COMPLETE once the returned cursor
+    /// [`SnapshotCursor::is_done`] is true.
+    ///
+    /// ## What the snapshot IS: the bulk base of a snapshot+stream protocol
+    ///
+    /// The snapshot is a resumable, constant-memory SCAN DUMP that emits `(db, key,
+    /// current-value)` for EVERY live key, AT-LEAST-ONCE. It is NOT a strict point-in-time
+    /// copy and carries NO per-key version. Correctness comes from LAST-WRITE-WINS via the
+    /// HA-5a mutation stream: a replica/importer loads the snapshot, THEN applies the stream
+    /// from the offset captured at snapshot-begin. The stream is authoritative + idempotent,
+    /// so:
+    /// - a key NOT modified after begin -> its snapshot value IS its current value (correct);
+    /// - a key modified/created/deleted after begin -> the stream carries that write (offset
+    ///   > begin) and the replica applies it AFTER the snapshot (correct, last-write-wins);
+    /// - a key the SCAN emits redundantly (also in the stream) -> idempotent.
+    ///
+    /// So emitting ALL current keys, UNFILTERED, is correct; the point-in-time-ness is
+    /// provided by the stream-from-begin-offset (HA-7), NOT by this snapshot. There is no
+    /// `cut` parameter and no version filter -- adding either would only narrow the dump,
+    /// which the stream already reconciles. (The begin-OFFSET coupling is the replication
+    /// offset counter, which does not exist yet; it is HA-7's job.)
+    ///
+    /// ## Constant memory + resumability (the chunked pull)
+    ///
+    /// The chunk EXAMINES at most `max` keys (`max == 0` is treated as 1 so progress is
+    /// always made), so the returned `Vec` and the per-entry clones are BOUNDED by `max`,
+    /// NEVER a full-keyspace materialization. The caller takes the store borrow per chunk,
+    /// collects the bounded batch, releases the borrow, awaits (ships the batch), then
+    /// resumes with the returned cursor.
+    ///
+    /// ## Resize tolerance + at-least-once
+    ///
+    /// The per-database walk REUSES the SCAN cursor core ([`scan_plan`]) over the
+    /// resize-stable `scan_hash` order, with `band_bits == 0` (this is a shard-local
+    /// iteration, not the cross-shard composite SCAN, so it wants the exact next-key cursor,
+    /// not a band floor). Because `scan_hash` is invariant across a `hashbrown` resize,
+    /// iteration is TOTAL across concurrent table growth between chunks: a key present
+    /// throughout the snapshot is visited at least once. SCAN's AT-LEAST-ONCE guarantee is
+    /// fine here -- the replica applies each `(db, key, value)` idempotently, so a key
+    /// emitted twice is harmless.
+    ///
+    /// ## Per-database progression
+    ///
+    /// Database 0 is scanned to completion, then database 1, etc. (the cursor encodes
+    /// `(db_index, scan)`). A chunk may SPAN a database boundary: when a database's inner
+    /// scan completes with budget left, the walk advances to the next database and keeps
+    /// filling the same chunk, so empty databases never waste a round-trip and an empty
+    /// shard terminates in a single call.
+    ///
+    /// `now` is the caller's clock (ADR-0003: the store reads no clock): a lazily-expired
+    /// entry is SKIPPED (the snapshot never ships a logically-dead key, no
+    /// tombstones-as-live), matching SCAN.
+    #[must_use]
+    pub fn snapshot_chunk(
+        &self,
+        cursor: SnapshotCursor,
+        max: usize,
+        now: UnixMillis,
+    ) -> (Vec<SnapshotEntry>, SnapshotCursor) {
+        let databases = self.dbs.len();
+        let budget = max.max(1);
+        let mut out: Vec<SnapshotEntry> = Vec::new();
+        let mut db_index = cursor.db_index;
+        let mut scan = cursor.scan;
+
+        // Walk databases in order, filling the chunk up to `budget` EXAMINED keys. A chunk
+        // may span a database boundary so empty dbs do not waste round-trips.
+        while (db_index as usize) < databases {
+            let db_idx = db_index as usize;
+            // Remaining examine-budget for this chunk (bounds the total keys touched, so the
+            // chunk and its clones stay constant-memory regardless of keyspace size).
+            let remaining = budget - out.len().min(budget);
+            if remaining == 0 {
+                break;
+            }
+            let (next_scan, examined) = self.snapshot_scan_db(db_idx, scan, remaining);
+            // Emit each examined key's CURRENT value, reconstructed as an owned KvObj
+            // transfer value. No version filter (correctness comes from the stream); only a
+            // lazy-expiry skip so a logically-dead key is never shipped as live.
+            for key in examined {
+                let h = self.hasher.hash_one(&*key);
+                if let Some(obj) = self.dbs[db_idx].find(h, |e| e.key() == &*key) {
+                    if obj.is_expired(now) {
+                        continue;
+                    }
+                    let kv = obj.to_kvobj();
+                    out.push((db_index, key, kv));
+                }
+            }
+            if next_scan.is_start() {
+                // This database is fully scanned: advance to the next, resetting the inner
+                // scan to the start. The outer loop continues filling the same chunk.
+                db_index += 1;
+                scan = ScanCursor::START;
+            } else {
+                // More of this database remains: stop here with the resume position. (The
+                // budget is spent or this database is not yet exhausted.)
+                scan = next_scan;
+                break;
+            }
+        }
+
+        (out, SnapshotCursor { db_index, scan })
+    }
+
+    /// One bounded SCAN step over database `db_idx`'s table for the snapshot walk: returns
+    /// the next inner [`ScanCursor`] and the EXAMINED keys (owned, so the table borrow is
+    /// released before the caller re-finds + reconstructs each). It is the snapshot's reuse
+    /// of the SCAN cursor core ([`scan_plan`]) with `band_bits == 0` (shard-local exact
+    /// cursor). Separated so the borrow of `self.dbs[db_idx]` is scoped to building the
+    /// sorted order + the plan, then dropped before the caller re-borrows `self` to
+    /// reconstruct values.
+    fn snapshot_scan_db(
+        &self,
+        db_idx: usize,
+        cursor: ScanCursor,
+        count: usize,
+    ) -> (ScanCursor, Vec<Box<[u8]>>) {
+        let Some(table) = self.dbs.get(db_idx) else {
+            return (ScanCursor::START, Vec::new());
+        };
+        if table.is_empty() {
+            return (ScanCursor::START, Vec::new());
+        }
+        // The sorted (scan_hash, key) view, identical to `scan_step`: `scan_hash` is
+        // recomputed from the key bytes, so the order is stable across calls AND across a
+        // hashbrown resize between chunks (writes continue during the snapshot).
+        let mut order: Vec<(u64, &[u8])> = table
+            .iter()
+            .map(|e| (scan_hash(e.key()), e.key()))
+            .collect();
+        order.sort_unstable();
+        // band_bits == 0: the snapshot is shard-local, so it wants the EXACT next-key
+        // cursor (no cross-shard band rounding). The plan EXAMINES up to `count` keys.
+        let plan = scan_plan(&order, cursor, count, 0);
+        let examined: Vec<Box<[u8]>> = plan
+            .examined
+            .iter()
+            .map(|&k| k.to_vec().into_boxed_slice())
+            .collect();
+        (plan.next, examined)
     }
 }
 
