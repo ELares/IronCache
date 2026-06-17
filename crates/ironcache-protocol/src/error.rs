@@ -943,6 +943,22 @@ impl ErrorReply {
             "command not allowed when used memory > 'maxmemory'.",
         )
     }
+
+    /// `ERR This instance has cluster support disabled` - the reply a real Redis emits
+    /// (src/cluster.c `clusterCommand`, the `server.cluster_enabled == 0` gate) for a
+    /// CLUSTER subcommand that requires cluster mode (MEET / ADDSLOTS / SETSLOT / FORGET /
+    /// REPLICATE / FAILOVER / RESET / ... and the other mutating/cluster-only verbs) when
+    /// the server runs with `cluster-enabled no`. Byte-exact (plain `ERR` token, no
+    /// trailing period). IronCache slice 1 (CLUSTER_CONTRACT.md #70) is cluster-DISABLED,
+    /// so it matches this Redis behavior exactly; the introspection subcommands
+    /// (KEYSLOT / MYID / INFO / SLOTS / SHARDS / NODES / COUNTKEYSINSLOT / ...) still
+    /// reply normally, like a real `cluster-enabled no` instance. NO MOVED/ASK/CROSSSLOT
+    /// redirection codes are added in slice 1 (those are a later slice); this is the only
+    /// cluster-specific error this slice introduces.
+    #[must_use]
+    pub fn cluster_disabled() -> Self {
+        ErrorReply::new(ErrorCode::Err, "This instance has cluster support disabled")
+    }
 }
 
 /// Truncate a `&str` to at most `max` bytes without splitting a UTF-8 char (so
@@ -1158,6 +1174,19 @@ mod tests {
         );
         assert_eq!(ErrorReply::oom().code(), ErrorCode::Oom);
         assert_eq!(ErrorCode::Oom.token(), "OOM");
+    }
+
+    #[test]
+    fn cluster_disabled_is_byte_exact() {
+        // Verified against redis/redis src/cluster.c clusterCommand (the
+        // cluster_enabled == 0 gate): the plain `ERR` token, no trailing period. This is
+        // the reply IronCache slice 1 (cluster-disabled, CLUSTER_CONTRACT.md #70) emits for
+        // a mutating/cluster-only CLUSTER subcommand.
+        assert_eq!(
+            ErrorReply::cluster_disabled().line(),
+            "-ERR This instance has cluster support disabled"
+        );
+        assert_eq!(ErrorReply::cluster_disabled().code(), ErrorCode::Err);
     }
 
     #[test]

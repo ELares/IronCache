@@ -25,11 +25,20 @@ use std::rc::Rc;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
+    ctx_cfg(port, pass, false)
+}
+
+/// Build a server context on `port`, optionally requiring `pass`, with cluster mode set by
+/// `cluster_enabled`. The cluster slice-1 e2e test boots BOTH a disabled node (the default,
+/// `cluster-enabled no`) and an enabled single-node cluster (`cluster-enabled yes`) to
+/// exercise the gate in `cmd_cluster` over a real socket (CLUSTER_CONTRACT.md #70).
+fn ctx_cfg(port: u16, pass: Option<&str>, cluster_enabled: bool) -> ServerContext {
     let boot = ironcache_config::Config {
         port,
         databases: 16,
         shards: 1,
         requirepass: pass.map(str::to_owned),
+        cluster_enabled,
         ..ironcache_config::Config::default()
     };
     let runtime = ironcache_config::RuntimeConfig::from_config(&boot);
@@ -45,6 +54,11 @@ fn ctx(port: u16, pass: Option<&str>) -> ServerContext {
             maxmemory: 0,
             maxmemory_policy: "allkeys-lru",
             mem_allocator: "jemalloc",
+            // A fixed 40-hex node id for the test harness (the real binary draws one at
+            // boot from the SystemEnv RNG); cluster mode per `cluster_enabled`
+            // (CLUSTER_CONTRACT.md #70).
+            cluster_node_id: "abcdef0123456789abcdef0123456789abcdef01",
+            cluster_enabled,
         },
         boot,
     }
@@ -1531,6 +1545,143 @@ fn watch_multi_exec_over_real_socket() {
         expect_reply(&mut c2, b"+OK\r\n").await;
         drop(c1);
         drop(c2);
+        acceptor.await.unwrap();
+    });
+}
+
+/// CLUSTER command surface with cluster mode DISABLED (the slice-1 default,
+/// `cluster-enabled no`, CLUSTER_CONTRACT.md #70) over a real socket. A real Redis rejects
+/// EVERY CLUSTER subcommand with `-ERR This instance has cluster support disabled`; we
+/// assert that for KEYSLOT and INFO, and that the INFO `# Cluster` section reports
+/// `cluster_enabled:0`.
+#[test]
+fn cluster_disabled_over_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Default boot: cluster mode OFF.
+        let server_ctx = ctx(addr.port(), None);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // CLUSTER KEYSLOT foo -> the cluster-disabled error (no introspection carve-out).
+        client
+            .write_all(b"*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$3\r\nfoo\r\n")
+            .await
+            .unwrap();
+        expect_reply(
+            &mut client,
+            b"-ERR This instance has cluster support disabled\r\n",
+        )
+        .await;
+
+        // CLUSTER INFO -> the same cluster-disabled error.
+        client
+            .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n")
+            .await
+            .unwrap();
+        expect_reply(
+            &mut client,
+            b"-ERR This instance has cluster support disabled\r\n",
+        )
+        .await;
+
+        // INFO cluster -> the `# Cluster` section reports `cluster_enabled:0`.
+        client
+            .write_all(b"*2\r\n$4\r\nINFO\r\n$7\r\ncluster\r\n")
+            .await
+            .unwrap();
+        let mut cbuf = [0u8; 1024];
+        let cn = client.read(&mut cbuf).await.unwrap();
+        let cluster_info = String::from_utf8_lossy(&cbuf[..cn]);
+        assert!(cluster_info.contains("# Cluster"), "got {cluster_info}");
+        assert!(
+            cluster_info.contains("cluster_enabled:0"),
+            "got {cluster_info}"
+        );
+
+        client.write_all(b"*1\r\n$4\r\nQUIT\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
+        acceptor.await.unwrap();
+    });
+}
+
+/// CLUSTER command surface with cluster mode ENABLED (a single-node cluster owning all
+/// 16384 slots, CLUSTER_CONTRACT.md #70 slice-1 simplification) over a real socket. The
+/// introspection subcommands now reply: KEYSLOT computes the slot, INFO reports
+/// `cluster_enabled:1` + `cluster_slots_assigned:16384`, and SLOTS renders one `0-16383`
+/// range owned by self.
+#[test]
+fn cluster_enabled_over_real_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Boot in cluster-ENABLED mode (single-node cluster).
+        let server_ctx = ctx_cfg(addr.port(), None, true);
+        let acceptor = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = stream.set_nodelay(true);
+            serve_one(stream, server_ctx).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // CLUSTER KEYSLOT foo -> :12182 (the reference CRC16/XMODEM vector).
+        client
+            .write_all(b"*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$3\r\nfoo\r\n")
+            .await
+            .unwrap();
+        expect_reply(&mut client, b":12182\r\n").await;
+
+        // CLUSTER INFO -> cluster_enabled:1 + cluster_slots_assigned:16384 (the single-node
+        // cluster owns all slots). The reply is a RESP3 verbatim string that degrades to a
+        // bulk string under RESP2, so the body is in the wire payload either way.
+        client
+            .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n")
+            .await
+            .unwrap();
+        let mut ibuf = [0u8; 1024];
+        let inn = client.read(&mut ibuf).await.unwrap();
+        let info = String::from_utf8_lossy(&ibuf[..inn]);
+        assert!(info.contains("cluster_enabled:1"), "got {info}");
+        assert!(info.contains("cluster_state:ok"), "got {info}");
+        assert!(info.contains("cluster_slots_assigned:16384"), "got {info}");
+        assert!(info.contains("cluster_size:1"), "got {info}");
+
+        // CLUSTER SLOTS -> one range owning 0-16383: *1 then a *3 of [0, 16383, [served-by]].
+        client
+            .write_all(b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n")
+            .await
+            .unwrap();
+        let mut sbuf = [0u8; 512];
+        let sn = client.read(&mut sbuf).await.unwrap();
+        let slots = String::from_utf8_lossy(&sbuf[..sn]);
+        // One range (outer *1), inner range starts `*3\r\n:0\r\n:16383\r\n` (start, end, ...).
+        assert!(slots.starts_with("*1\r\n"), "got {slots:?}");
+        assert!(slots.contains(":0\r\n"), "got {slots:?}");
+        assert!(slots.contains(":16383\r\n"), "got {slots:?}");
+
+        client.write_all(b"*1\r\n$4\r\nQUIT\r\n").await.unwrap();
+        expect_reply(&mut client, b"+OK\r\n").await;
         acceptor.await.unwrap();
     });
 }

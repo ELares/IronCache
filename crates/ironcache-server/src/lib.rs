@@ -15,6 +15,7 @@
 
 pub mod admission;
 pub mod cmd_bitmap;
+pub mod cmd_cluster;
 pub mod cmd_config;
 pub mod cmd_expire;
 pub mod cmd_hash;

@@ -40,6 +40,26 @@ pub const GLOBAL_ALLOCATOR_NAME: &str = "jemalloc";
 #[cfg(target_env = "msvc")]
 pub const GLOBAL_ALLOCATOR_NAME: &str = "libc";
 
+/// Format a 40-lowercase-hex cluster node id from the determinism seam's RNG
+/// (CLUSTER_CONTRACT.md #70). It draws THREE `u64`s (192 bits) and renders 160 of them as
+/// 40 lowercase hex chars: the full first two words plus the LOW 32 bits of the third
+/// (`c as u32` keeps the low half; the high 32 bits are dropped), matching the Redis 40-hex
+/// node-id width.
+///
+/// This helper is PURE: it takes `&mut impl Rng` and does NO time/OS-entropy access of
+/// its own, so the no-rand invariant lint stays green (the only entropy comes through the
+/// `ironcache-env` seam the caller owns, ADR-0003). The caller draws from the binary's
+/// `SystemEnv` ONCE at boot so the id is stable for the process lifetime and identical
+/// across shards.
+fn node_id_hex(rng: &mut impl Rng) -> String {
+    let a = rng.next_u64();
+    let b = rng.next_u64();
+    let c = rng.next_u64();
+    // 64 + 64 + 32 = 160 bits = 40 hex nibbles. `{:016x}` and `{:08x}` zero-pad to the
+    // full nibble width so the id is always exactly 40 chars.
+    format!("{a:016x}{b:016x}{:08x}", c as u32)
+}
+
 /// The concrete per-shard store the binary wires: the `ShardStore` over the
 /// configured eviction [`Policy`] and the logical-byte accounting hook. The generic
 /// dispatch runs against this through the `Store` + `Admit` waist traits.
@@ -81,6 +101,16 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     // RuntimeConfig cell; INFO reads it from there (PR-4b). One small leak at boot.
     let policy_name: &'static str = Box::leak(config.maxmemory_policy.clone().into_boxed_str());
 
+    // The cluster node id (CLUSTER_CONTRACT.md #70): a stable 40-lowercase-hex id drawn
+    // ONCE here at boot from the binary's SystemEnv RNG (the sanctioned determinism seam,
+    // ADR-0003: no `rand` outside ironcache-env), then leaked to a 'static str exactly like
+    // `policy_name`. It is generated at the run_server level (NOT per shard) so it is
+    // IDENTICAL across every shard, and shared by value via the cloned ServerContext.
+    // `CLUSTER MYID`/`CLUSTER NODES` report it; a real Redis assigns a 40-hex node id
+    // whether or not cluster mode is on, and so does IronCache. One small leak at boot.
+    let mut boot_env = SystemEnv::new();
+    let cluster_node_id: &'static str = Box::leak(node_id_hex(boot_env.rng()).into_boxed_str());
+
     // The process-wide runtime-config overlay (PR-4b, the highest-precedence layer):
     // ONE Arc shared (cloned) into every shard's context, exactly like the shutdown
     // AtomicBool precedent. A `CONFIG SET` mutates it; the per-command reads are cheap
@@ -106,6 +136,11 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
             maxmemory: config.maxmemory,
             maxmemory_policy: policy_name,
             mem_allocator: GLOBAL_ALLOCATOR_NAME,
+            // The boot-generated 40-hex node id (identical across shards) and the boot
+            // cluster-mode flag (CLUSTER_CONTRACT.md #70). Slice 1 is cluster-disabled, so
+            // `cluster_enabled` is `false` in practice, but it is sourced from config.
+            cluster_node_id,
+            cluster_enabled: config.cluster_enabled,
         },
     };
     let default_proto = if config.default_resp3 {
@@ -2112,6 +2147,34 @@ mod tests {
             before.next_u64(),
             after.next_u64(),
             "RANDOMKEY MUST advance the RNG stream (the draw the gate exists to gate)"
+        );
+    }
+
+    /// The cluster node id is DRAWN ONLY FROM THE ENV SEAM (ADR-0003), so the same seed
+    /// yields the same 40-hex id every time: `node_id_hex` is pure over `&mut impl Rng`.
+    /// This pins the determinism contract (CLUSTER_CONTRACT.md #70) without touching the OS.
+    #[test]
+    fn node_id_hex_is_deterministic_for_a_seed() {
+        const SEED: u64 = 0xC0FF_EE12_3456_789A;
+        let mut a = ironcache_env::TestEnv::new(SEED);
+        let mut b = ironcache_env::TestEnv::new(SEED);
+        let id_a = node_id_hex(a.rng());
+        let id_b = node_id_hex(b.rng());
+        // Same seed -> identical id (the determinism invariant).
+        assert_eq!(id_a, id_b, "same seed must yield the same node id");
+        // Shape: exactly 40 lowercase-hex chars, matching the Redis node-id width.
+        assert_eq!(id_a.len(), 40, "node id must be 40 hex chars: {id_a:?}");
+        assert!(
+            id_a.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "node id must be lowercase hex: {id_a:?}"
+        );
+        // A DIFFERENT seed yields a different id (the draw actually uses the stream).
+        let mut c = ironcache_env::TestEnv::new(SEED ^ 0x1);
+        assert_ne!(
+            id_a,
+            node_id_hex(c.rng()),
+            "a different seed should yield a different id"
         );
     }
 }

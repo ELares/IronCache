@@ -87,10 +87,44 @@ routing, which is split to #147 (PR-20).
   CLUSTER SLOTS / SHARDS suffices; default is SLOTS/SHARDS-only unless a target
   client forces NODES.
 
+## Slice-1 scope and the single-node divergence
+
+Slice 1 ships the client-visible `CLUSTER` command surface and the CRC16/XMODEM
+slot projection, gated on `cluster-enabled` exactly like Redis's `clusterCommand`:
+
+- With `cluster-enabled no` (the slice-1 default) a real Redis rejects EVERY
+  `CLUSTER` subcommand at the top of `clusterCommand` with
+  `-ERR This instance has cluster support disabled` (the
+  `server.cluster_enabled == 0` gate). There is NO per-subcommand carve-out: even
+  KEYSLOT / INFO / SLOTS are rejected. IronCache matches this byte-for-byte.
+- With `cluster-enabled yes` IronCache behaves as a SINGLE-NODE cluster that
+  AUTO-OWNS all 16384 slots: CLUSTER INFO reports `cluster_enabled:1`,
+  `cluster_slots_assigned:16384`, `cluster_size:1`; CLUSTER SLOTS / SHARDS / NODES
+  render one `0-16383` range owned by self. The topology-mutation subcommands
+  (MEET / ADDSLOTS / SETSLOT / DELSLOTS / FORGET / REPLICATE / FAILOVER / RESET /
+  BUMPEPOCH / FLUSHSLOTS / SET-CONFIG-EPOCH) return
+  `-ERR <SUBCOMMAND> is not supported on a single-node cluster`.
+
+This single-node auto-slots behavior is the ONE deliberate divergence from Redis:
+a fresh real-Redis cluster-enabled node owns NO slots until `CLUSTER ADDSLOTS`,
+whereas an enabled IronCache node owns all 16384 immediately (so an unmodified
+client routes to it without a slot-assignment step). Multi-node slot assignment,
+`CLUSTER ADDSLOTS`, MOVED/ASK redirection, and CROSSSLOT enforcement arrive in
+slice 2; everything else in this slice matches Redis. CLUSTER COUNTKEYSINSLOT and
+GETKEYSINSLOT are bounds-validated but return a documented placeholder (0 / empty)
+because an accurate per-slot count needs the cross-shard slot index built in slice
+2. CLUSTER INFO and CLUSTER NODES are RESP3 verbatim (`txt`) strings, matching
+Redis's `addReplyVerbatim`.
+
 ## Acceptance and test hooks
 
 - CRC16/XMODEM slot assignment matches a reference Redis Cluster bit-for-bit
   across a key corpus, including hash-tagged and empty-/missing-brace keys.
+- With `cluster-enabled no`, every CLUSTER subcommand (including KEYSLOT/INFO/
+  SLOTS) returns `-ERR This instance has cluster support disabled`; with
+  `cluster-enabled yes`, the introspection subcommands reply with the single-node
+  (all-16384-slots) projection and the topology-mutation subcommands return the
+  single-node "not supported" error. This is the one documented divergence (above).
 - Unmodified redis-cli, go-redis, lettuce, and ioredis route reads and writes with
   no errors against a running IronCache.
 - A cross-slot multi-key command returns CROSSSLOT; a hash-tag-co-located one
