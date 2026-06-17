@@ -107,12 +107,18 @@ pub enum Role {
 /// [`EntryPayload::Noop`] is the no-op a fresh leader appends to its log on
 /// election (so it has a current-term entry it can commit; see the paper's section
 /// 8 and the "commit-only-current-term" rule of 5.4.2). [`EntryPayload::Bytes`] is
-/// a minimal OPAQUE payload: 3b's commit/apply pipeline treats entries as opaque
-/// bytes and apply is a sink, so the engine never interprets these; the tests use
-/// them solely to give proposed entries a distinguishable identity when asserting
-/// log convergence and state-machine safety. Real config payloads (the slot map,
-/// epoch, roster, roles per ADR-0027) arrive in later sub-slices as further
-/// variants.
+/// a minimal OPAQUE payload: the engine never interprets these; the tests use them
+/// solely to give proposed entries a distinguishable identity when asserting log
+/// convergence and state-machine safety. [`EntryPayload::Config`] is the REAL 3e
+/// payload: a committed [`ConfigCmd`] that the config [`StateMachine`] applies to
+/// the cluster's `SlotMap`, which is what makes Raft
+/// the single source of truth for slot ownership (ADR-0027, CONTROL_PLANE.md).
+///
+/// The engine itself is STILL payload-agnostic: it commits a `Config` entry by the
+/// exact same replication + Figure-8 commit path as any other entry and never
+/// looks inside it. Interpretation happens only in [`apply_committed`], which hands
+/// each committed entry to the [`StateMachine`] seam; a non-`Config` payload
+/// (Noop/Bytes) is a no-op for the config state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryPayload {
     /// A leader's election no-op. Carries no data; advances the log index/term.
@@ -120,6 +126,72 @@ pub enum EntryPayload {
     /// An opaque client-proposed payload. The engine never interprets the bytes;
     /// they exist so a proposed entry has a distinguishable identity in tests.
     Bytes(Vec<u8>),
+    /// A committed CONFIG command (3e): a slot-map / membership / epoch mutation the
+    /// config [`StateMachine`] replays onto its `SlotMap`
+    /// when the entry is applied. The engine treats this as just another opaque
+    /// payload on the replication and commit paths; only the state machine reads it.
+    Config(ConfigCmd),
+}
+
+/// A committed cluster-configuration command (CONTROL_PLANE.md #73): the deltas
+/// that, replayed in committed-log order on every node, converge each node's
+/// `SlotMap` to one identical global ownership view.
+///
+/// These are the Raft analog of the over-the-wire `CLUSTER MEET / SETSLOT /
+/// ADDSLOTS / FORGET / SET-CONFIG-EPOCH` verbs (`ironcache-cluster` slice 3), but
+/// instead of mutating one node's local view directly they go THROUGH the log:
+/// a leader [`proposes`](RaftNode::propose) the command, Raft commits it, and EVERY
+/// node applies the SAME committed sequence in the SAME order. Because committed
+/// entries are byte-identical on every node and [`StateMachine::apply`] is
+/// deterministic, the resulting `SlotMap`s are identical, which is the linearizable
+/// slot-ownership property: no two nodes ever claim the same slot at the same config
+/// epoch.
+///
+/// Ids are owned `String`s (not the engine's `NodeId`) because the `SlotMap`'s node
+/// identity is its 40-hex string id, NOT the raft transport id; the sim adapter
+/// documents the fixed `NodeId(u64)` -> string mapping it uses (`tests::slot_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCmd {
+    /// Add a node to the cluster's node table (drives `SlotMap::meet`). Must be
+    /// committed BEFORE any [`ConfigCmd::SetSlotOwner`] / [`ConfigCmd::AssignSlots`]
+    /// that names this node; the committed-log order guarantees that ordering.
+    AddNode {
+        /// The node's stable 40-hex id (the `SlotMap` node identity).
+        id: String,
+        /// The advertised host clients dial.
+        host: String,
+        /// The advertised TCP port clients dial.
+        port: u16,
+    },
+    /// Remove a node from the table (drives `SlotMap::forget`). The node must own no
+    /// slots at apply time (the `SlotMap` guards this); ownership is moved away first
+    /// by a prior committed [`ConfigCmd::SetSlotOwner`].
+    RemoveNode {
+        /// The id of the node to forget.
+        id: String,
+    },
+    /// Flip a single slot's owner to `node` (drives `SlotMap::set_slot_node`). The
+    /// node must already be known (a prior committed [`ConfigCmd::AddNode`]). This is
+    /// the unit of slot-ownership transfer; it advances the config epoch on apply.
+    SetSlotOwner {
+        /// The slot to (re)assign.
+        slot: u16,
+        /// The id of the node that should own it.
+        node: String,
+    },
+    /// Assign a batch of slots to one node: equivalent to a [`ConfigCmd::SetSlotOwner`]
+    /// per slot, applied in `slots` order. A single committed entry so a whole shard
+    /// hand-off is one atomic log record; it advances the config epoch ONCE on apply.
+    AssignSlots {
+        /// The id of the node that should own every slot in `slots`.
+        node: String,
+        /// The slots to assign to `node`, applied in order.
+        slots: Vec<u16>,
+    },
+    /// Seed THIS node's config epoch (drives `SlotMap::set_config_epoch`, valid only
+    /// on a fresh, alone node). Used to pin a starting epoch; ordinary ownership
+    /// changes advance the epoch via `SlotMap::bump_epoch` instead.
+    SetConfigEpoch(u64),
 }
 
 /// One entry in a node's replicated log.
@@ -253,6 +325,17 @@ pub trait RaftStorage {
     /// The caller is responsible for having truncated any conflicting suffix first;
     /// this is a plain extend.
     fn append_entries(&mut self, entries: &[LogEntry]);
+
+    // -- 3e apply extension -------------------------------------------------
+
+    /// The full [`LogEntry`] at `index` (1-based), or `None` for `index == 0` (the
+    /// empty-log sentinel) or any `index` past the end of the log. This is what the
+    /// apply pipeline ([`RaftNode::apply_committed`]) reads to hand a committed entry
+    /// to the [`StateMachine`]: 3b's apply was a counter and never needed the entry
+    /// body, but 3e applies the entry's `payload` to the config state machine, so it
+    /// must fetch the whole entry by index. The default impl is derived from the
+    /// other 1-based accessors; [`MemStorage`] overrides it with a direct `Vec` index.
+    fn entry_at(&self, index: u64) -> Option<LogEntry>;
 }
 
 /// An in-memory [`RaftStorage`] backed by a `Vec` log plus the term and vote.
@@ -356,6 +439,19 @@ impl RaftStorage for MemStorage {
     fn append_entries(&mut self, entries: &[LogEntry]) {
         self.log.extend_from_slice(entries);
     }
+
+    fn entry_at(&self, index: u64) -> Option<LogEntry> {
+        if index == 0 {
+            // The empty-log sentinel: there is no entry at index 0.
+            return None;
+        }
+        // The log is 1-based and contiguous: the entry with `index` is at vec
+        // position `index - 1`. An index past the end yields None.
+        usize::try_from(index - 1)
+            .ok()
+            .and_then(|pos| self.log.get(pos))
+            .cloned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +475,70 @@ pub trait RaftRng {
 impl<R: ironcache_env::Rng> RaftRng for R {
     fn gen_below(&mut self, bound: u64) -> u64 {
         ironcache_env::Rng::gen_below(self, bound)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State-machine seam (3e).
+// ---------------------------------------------------------------------------
+
+/// The replicated state machine a [`RaftNode`] drives from its committed log
+/// (Raft Figure 2, "All Servers": apply `log[lastApplied]` to the state machine).
+///
+/// This is the 3e seam that turns the 3b apply SINK into a real apply. The engine
+/// owns one `M: StateMachine` and, in [`RaftNode::apply_committed`], hands it each
+/// newly-committed entry in index order exactly once. Apply MUST be deterministic
+/// and side-effect-free beyond the machine's own state: the whole linearizable
+/// slot-ownership guarantee rests on every node applying the SAME committed
+/// sequence and reaching the SAME state, so any nondeterminism here (a clock, an
+/// RNG, ordering on a hash map) would let two nodes diverge. ADR-0003 forbids those
+/// in this crate; an implementor must honor the same bar.
+///
+/// The trivial [`CountingSm`] is the default for callers that do not care about
+/// config (it preserves the 3b applied-counter behavior so the existing tests are
+/// unchanged); the real implementor is the config state machine in the tests
+/// (`tests::ConfigSm`), which drives a `SlotMap`.
+pub trait StateMachine {
+    /// Apply one committed `entry` to the state machine. Called exactly once per
+    /// entry, in ascending index order, from [`RaftNode::apply_committed`]. The
+    /// engine guarantees the entry is committed (durable on a majority) before this
+    /// fires, so an apply is never speculative and never replays a rolled-back entry.
+    fn apply(&mut self, entry: &LogEntry);
+}
+
+/// The trivial default [`StateMachine`]: it interprets NO payload and merely counts
+/// the entries applied to it, reproducing 3b's apply-sink behavior verbatim.
+///
+/// This is the `M` the election / log-replication tests use, where the payload is
+/// opaque and only the apply WATERMARK matters. Keeping a real (if trivial) state
+/// machine here is what let 3e generalize [`RaftNode`] over `M` without perturbing
+/// those tests: the count this keeps is surfaced through
+/// [`RaftNode::applied_count`], exactly as the 3b sink was.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CountingSm {
+    /// How many entries have been applied (the 3b sink counter).
+    applied: u64,
+}
+
+impl CountingSm {
+    /// A fresh counter at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many entries this machine has applied.
+    #[must_use]
+    pub fn applied(&self) -> u64 {
+        self.applied
+    }
+}
+
+impl StateMachine for CountingSm {
+    fn apply(&mut self, _entry: &LogEntry) {
+        // The 3b sink: count the entry, interpret nothing. Saturating so a
+        // pathological replay can never wrap (it never decreases).
+        self.applied = self.applied.saturating_add(1);
     }
 }
 
@@ -498,7 +658,7 @@ pub const HEARTBEAT: u64 = 1;
 /// only via the `now` argument and randomness only via the [`RaftRng`] argument;
 /// it never blocks and performs no I/O.
 #[derive(Debug)]
-pub struct RaftNode<S: RaftStorage> {
+pub struct RaftNode<S: RaftStorage, M: StateMachine = CountingSm> {
     /// This node's id.
     id: NodeId,
     /// The static set of voting members (includes `id`). Static in 3a.
@@ -528,18 +688,48 @@ pub struct RaftNode<S: RaftStorage> {
     /// replicated on that peer (initialized to 0 on election). Only populated while
     /// `role == Leader`; cleared on step-down.
     match_index: BTreeMap<NodeId, u64>,
-    /// The apply SINK counter: how many entries this node has "applied" (3b stands
-    /// in for the real state machine; HA-3e replaces this with the SlotMap apply).
-    /// Exposed via [`RaftNode::applied_count`] for the state-machine-safety checker.
+    /// The apply watermark counter: how many entries this node has applied. In 3b
+    /// this WAS the whole apply (a sink); in 3e it remains as an apply-progress
+    /// witness (the state-machine-safety checker proves the apply hook ran, not just
+    /// that `last_applied` moved) and is kept in lockstep with the real
+    /// [`StateMachine`] apply below. Exposed via [`RaftNode::applied_count`].
     applied_count: u64,
+    /// The replicated state machine (3e). Each committed entry is handed to
+    /// [`StateMachine::apply`] exactly once, in index order, by
+    /// [`RaftNode::apply_committed`]. With the default `M = CountingSm` this is the
+    /// 3b sink; with the config state machine it drives the cluster
+    /// `SlotMap`.
+    sm: M,
 }
 
-impl<S: RaftStorage> RaftNode<S> {
-    /// Construct a node `id` in a cluster of `voters` (must include `id`), backed
-    /// by `storage` and timed by `config`. The node starts as a `Follower`; call
-    /// [`RaftNode::start`] to arm its first election timer.
+impl<S: RaftStorage> RaftNode<S, CountingSm> {
+    /// Construct a node `id` in a cluster of `voters` (must include `id`), backed by
+    /// `storage` and timed by `config`, with the DEFAULT [`CountingSm`] state
+    /// machine (the 3b apply-sink behavior). This is the constructor the election /
+    /// log-replication tests use unchanged; callers that need a real state machine
+    /// use [`RaftNode::with_state_machine`].
+    ///
+    /// The node starts as a `Follower`; call [`RaftNode::start`] to arm its first
+    /// election timer.
     #[must_use]
     pub fn new(id: NodeId, voters: BTreeSet<NodeId>, storage: S, config: RaftConfig) -> Self {
+        Self::with_state_machine(id, voters, storage, config, CountingSm::new())
+    }
+}
+
+impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
+    /// Construct a node with an EXPLICIT state machine `sm` (3e). Identical to
+    /// [`RaftNode::new`] except the caller supplies the `M: StateMachine` the apply
+    /// pipeline drives (e.g. the config state machine over a
+    /// `SlotMap`). The node starts as a `Follower`.
+    #[must_use]
+    pub fn with_state_machine(
+        id: NodeId,
+        voters: BTreeSet<NodeId>,
+        storage: S,
+        config: RaftConfig,
+        sm: M,
+    ) -> Self {
         RaftNode {
             id,
             voters,
@@ -552,6 +742,7 @@ impl<S: RaftStorage> RaftNode<S> {
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             applied_count: 0,
+            sm,
         }
     }
 
@@ -610,12 +801,20 @@ impl<S: RaftStorage> RaftNode<S> {
         self.last_applied
     }
 
-    /// How many entries this node has "applied" to the 3b apply sink. Equals
-    /// `last_applied` in steady state; exposed separately so a test can prove the
-    /// apply hook actually ran (not just that the watermark moved).
+    /// How many entries this node has applied. Equals `last_applied` in steady
+    /// state; exposed separately so a test can prove the apply hook actually ran
+    /// (not just that the watermark moved).
     #[must_use]
     pub fn applied_count(&self) -> u64 {
         self.applied_count
+    }
+
+    /// Borrow the state machine (3e), for test inspection of the applied config
+    /// (e.g. projecting the `SlotMap` the config state
+    /// machine has converged to).
+    #[must_use]
+    pub fn state_machine(&self) -> &M {
+        &self.sm
     }
 
     // -- step entry points --------------------------------------------------
@@ -1239,15 +1438,31 @@ impl<S: RaftStorage> RaftNode<S> {
 
     /// The apply pipeline (Figure 2, "All Servers": if `commitIndex > lastApplied`,
     /// increment `lastApplied` and apply `log[lastApplied]` to the state machine).
-    /// In 3b apply is a SINK: we advance `last_applied` to `commit_index` and bump
-    /// an applied counter per entry. HA-3e replaces the per-entry hook with the real
-    /// SlotMap apply. Idempotent and monotone: `last_applied` never exceeds
-    /// `commit_index` and never moves backward.
+    ///
+    /// 3e makes this the REAL apply: for each newly-committed index
+    /// `last_applied+1..=commit_index`, fetch the full [`LogEntry`] from storage and
+    /// hand it to [`StateMachine::apply`] (with the default [`CountingSm`] that is
+    /// the 3b sink; with the config state machine it drives the
+    /// `SlotMap`). The `applied_count` witness is kept
+    /// in lockstep so a test can still prove the hook ran. Idempotent and monotone:
+    /// `last_applied` never exceeds `commit_index` and never moves backward, so an
+    /// entry is applied EXACTLY ONCE, which is what keeps the state machine a
+    /// faithful image of the committed prefix.
     fn apply_committed(&mut self) {
         while self.last_applied < self.commit_index {
-            self.last_applied += 1;
-            // 3b apply sink: in HA-3e this is where log[last_applied].payload is
-            // applied to the SlotMap state machine. Here we only count it.
+            let next = self.last_applied + 1;
+            // Fetch the committed entry to apply. It MUST exist: `commit_index` never
+            // exceeds the leader-vouched / majority-replicated last index, so every
+            // index up to it is present in this node's log. A missing entry would be a
+            // commit-bookkeeping bug; surface it loudly rather than silently skipping.
+            let entry = self
+                .storage
+                .entry_at(next)
+                .expect("a committed index must have a log entry to apply");
+            self.last_applied = next;
+            self.sm.apply(&entry);
+            // Keep the apply witness in lockstep with the state machine (it counted
+            // every applied entry in 3b; it still does, regardless of `M`).
             self.applied_count += 1;
         }
     }
@@ -2704,5 +2919,777 @@ mod tests {
             node.commit_index() >= 1,
             "commit never regresses; no COMMITTED entry was overwritten (idx1 survives)"
         );
+    }
+
+    // =====================================================================
+    // 3e: config state-machine apply -> SlotMap (CONTROL_PLANE.md #73).
+    //
+    // These exercise the REAL apply: committed ConfigCmd entries replayed onto each
+    // node's own SlotMap, proving the headline property - LINEARIZABLE SLOT
+    // OWNERSHIP: no two nodes ever claim the same slot at the same config epoch.
+    // The engine is unchanged on the replication/commit paths; only the state
+    // machine seam differs from the CountingSm scenarios above.
+    // =====================================================================
+
+    use ironcache_cluster::{NodeEntry, SlotMap};
+
+    /// The fixed `NodeId(u64)` -> SlotMap-string-id mapping the 3e sim adapter
+    /// commits to. The SlotMap's node identity is a 40-lowercase-hex string (Redis
+    /// node-id shape, validated by the cluster crate), distinct from the engine's
+    /// transport `NodeId(u64)`; this is the analog of [`to_sim`] / [`to_raft`] for
+    /// the cluster layer. A `u64` is at most 16 hex digits, so `{:040x}` zero-pads to
+    /// exactly 40 lowercase-hex characters - always a valid SlotMap id, and a
+    /// bijection on the `u64`, so distinct raft ids map to distinct cluster ids.
+    fn slot_id(id: NodeId) -> String {
+        format!("{:040x}", id.0)
+    }
+
+    /// A deterministic advertised endpoint for a node (the SlotMap stores host/port
+    /// for MOVED redirects; the values are irrelevant to ownership, but must be
+    /// identical across nodes so the converged node tables match byte-for-byte).
+    fn slot_host(id: NodeId) -> String {
+        format!("10.0.0.{}", id.0)
+    }
+
+    const SLOT_PORT: u16 = 6379;
+
+    /// The config state machine (3e): a [`StateMachine`] that replays committed
+    /// [`ConfigCmd`]s onto an [`ironcache_cluster::SlotMap`].
+    ///
+    /// Each raft node owns its OWN `ConfigSm`, seeded with `SlotMap::empty_self` for
+    /// THAT node's id (so `me()` / `owns()` are node-relative), but every node
+    /// applies the SAME committed `ConfigCmd` sequence in the SAME order. Because
+    /// `apply` is deterministic and the committed log is byte-identical on every
+    /// node (Raft's Log Matching + State Machine Safety), the node tables and the
+    /// slot->owner projection converge to one identical GLOBAL view: that is the
+    /// linearizable-slot-ownership property under test.
+    ///
+    /// EPOCH POLICY (CONTROL_PLANE.md line 39, "every committed change advances the
+    /// epoch"): on every committed slot-OWNERSHIP change (`SetSlotOwner` /
+    /// `AssignSlots`) the machine calls [`SlotMap::bump_epoch`]. That is the
+    /// Redis-faithful BUMPEPOCH primitive the cluster crate exposes; it is monotone
+    /// and deterministic, so `current_epoch()` never decreases and is identical
+    /// across nodes at any committed point. (BUMPEPOCH is idempotent once a node is
+    /// already at the max epoch - the Redis "+STILL" reply - so the epoch is
+    /// monotone-non-decreasing and convergent rather than strictly +1 per change;
+    /// that is exactly what the no-two-owners-per-epoch and epoch-monotonic checkers
+    /// require, since identical deterministic apply means all nodes agree on the
+    /// owner at any shared epoch.) `AddNode` / `RemoveNode` are table-only and do not
+    /// bump; `SetConfigEpoch` seeds the epoch directly (only valid while alone).
+    ///
+    /// Mutation errors from the SlotMap (e.g. a `forget` of a slot-owning node) are
+    /// DETERMINISTIC across nodes (same map state + same command), so swallowing
+    /// them keeps every node's apply identical; the scenarios are constructed so the
+    /// committed order never produces a spurious error (AddNode precedes any
+    /// reference to the node; ownership is moved away before a RemoveNode).
+    struct ConfigSm {
+        map: SlotMap,
+        /// A monotonic config epoch driven by the COMMITTED LOG: incremented once per
+        /// applied config entry, so it is a deterministic function of the applied
+        /// prefix. NOT the SlotMap's Redis-client-facing epoch (whose
+        /// bump_epoch/set_config_epoch carry admin-command STILL / guard semantics
+        /// that are wrong for a log-driven counter; see apply).
+        epoch: u64,
+    }
+
+    impl ConfigSm {
+        /// Seed a fresh config state machine for the node `id`: an `empty_self`
+        /// SlotMap owning ZERO slots, with this node alone in its table (peers arrive
+        /// via committed `AddNode`s). Matches a fresh cluster-enabled node's boot map.
+        fn seed(id: NodeId) -> Self {
+            ConfigSm {
+                map: SlotMap::empty_self(&slot_id(id), &slot_host(id), SLOT_PORT),
+                epoch: 0,
+            }
+        }
+
+        /// Borrow the converged slot map (test inspection).
+        fn map(&self) -> &SlotMap {
+            &self.map
+        }
+
+        /// The monotonic, log-driven config epoch (count of applied config entries).
+        fn config_epoch(&self) -> u64 {
+            self.epoch
+        }
+    }
+
+    impl StateMachine for ConfigSm {
+        fn apply(&mut self, entry: &LogEntry) {
+            // Only Config payloads touch the slot map; Noop (election no-op) and
+            // Bytes (opaque) are no-ops for the config machine, exactly as the engine
+            // commits them without interpretation.
+            let EntryPayload::Config(cmd) = &entry.payload else {
+                return;
+            };
+            // Every committed config entry advances the monotonic config epoch
+            // (CONTROL_PLANE.md line 39). The +1-per-applied-entry counter makes the
+            // epoch a DETERMINISTIC FUNCTION OF THE APPLIED PREFIX: two nodes at the
+            // same epoch have applied the identical config prefix and therefore agree
+            // on every slot's owner (the linearizable-ownership property). We do NOT
+            // use SlotMap::bump_epoch / set_config_epoch for this: those carry Redis
+            // admin-command semantics (bump returns STILL once my_epoch == maxEpoch;
+            // set is rejected once the node knows peers), which are wrong for a
+            // log-driven counter and would let distinct ownership states share an
+            // epoch (and trip the no-two-owners-per-epoch invariant).
+            self.epoch += 1;
+            match cmd {
+                ConfigCmd::AddNode { id, host, port } => {
+                    // Idempotent: a node applying AddNode for its OWN id (already in
+                    // its empty_self table) is a no-op in the cluster crate.
+                    self.map.meet(NodeEntry {
+                        id: id.as_str().into(),
+                        host: host.as_str().into(),
+                        port: *port,
+                    });
+                }
+                ConfigCmd::RemoveNode { id } => {
+                    // Deterministic across nodes (same table + same command). The
+                    // scenarios move ownership away first, so this never orphans.
+                    let _ = self.map.forget(id);
+                }
+                ConfigCmd::SetSlotOwner { slot, node } => {
+                    let _ = self.map.set_slot_node(*slot, node);
+                }
+                ConfigCmd::AssignSlots { node, slots } => {
+                    for &slot in slots {
+                        let _ = self.map.set_slot_node(slot, node);
+                    }
+                }
+                ConfigCmd::SetConfigEpoch(_epoch) => {
+                    // The Raft-driven config epoch is the log-driven counter above;
+                    // the SlotMap's own (Redis-client) epoch is not used for the
+                    // linearizable-ownership property in 3e.
+                }
+            }
+        }
+    }
+
+    // -- config-cluster sim harness (parallel to RaftCluster, ConfigSm-backed) --
+
+    /// A [`SimNode`] wrapping a config-state-machine raft node. Mirrors
+    /// [`RaftSimNode`] exactly (lazy `start`, effects drain), but the engine carries
+    /// a [`ConfigSm`] instead of the default `CountingSm`, so committed `ConfigCmd`s
+    /// drive a real `SlotMap`.
+    ///
+    /// [`SimNode`]: ironcache_sim::SimNode
+    struct ConfigSimNode {
+        engine: RaftNode<MemStorage, ConfigSm>,
+        started: bool,
+    }
+
+    impl ConfigSimNode {
+        fn new(id: NodeId, voters: BTreeSet<NodeId>, config: RaftConfig) -> Self {
+            ConfigSimNode {
+                engine: RaftNode::with_state_machine(
+                    id,
+                    voters,
+                    MemStorage::new(),
+                    config,
+                    ConfigSm::seed(id),
+                ),
+                started: false,
+            }
+        }
+
+        fn ensure_started(&mut self, ctx: &mut SimCtx<'_, RaftMsg>) {
+            if self.started {
+                return;
+            }
+            self.started = true;
+            let now = ctx.now();
+            let mut effects = Effects::new();
+            {
+                let mut rng = SimRng { ctx };
+                self.engine.start(now, &mut rng, &mut effects);
+            }
+            drain(ctx, effects);
+        }
+    }
+
+    impl ironcache_sim::SimNode for ConfigSimNode {
+        type Msg = RaftMsg;
+
+        fn on_message(&mut self, from: SimId, msg: RaftMsg, ctx: &mut SimCtx<'_, RaftMsg>) {
+            self.ensure_started(ctx);
+            let now = ctx.now();
+            let mut effects = Effects::new();
+            {
+                let mut rng = SimRng { ctx };
+                self.engine
+                    .on_message(now, &mut rng, to_raft(from), msg, &mut effects);
+            }
+            drain(ctx, effects);
+        }
+
+        fn on_timer(&mut self, token: u64, ctx: &mut SimCtx<'_, RaftMsg>) {
+            self.ensure_started(ctx);
+            let now = ctx.now();
+            let mut effects = Effects::new();
+            {
+                let mut rng = SimRng { ctx };
+                self.engine.on_timer(now, &mut rng, token, &mut effects);
+            }
+            drain(ctx, effects);
+        }
+    }
+
+    /// A config-cluster harness: `n` voters each with a [`ConfigSm`], built and
+    /// bootstrapped exactly as [`RaftCluster`]. Exposes the role/term/commit reads
+    /// the scenarios need plus SlotMap projections per node.
+    struct ConfigCluster {
+        net: Network<ConfigSimNode>,
+        ids: Vec<NodeId>,
+    }
+
+    impl ConfigCluster {
+        fn new(n: u64, seed: u64, config: RaftConfig) -> Self {
+            let ids: Vec<NodeId> = (1..=n).map(NodeId).collect();
+            let voters: BTreeSet<NodeId> = ids.iter().copied().collect();
+            let mut net = Network::new(seed);
+            for &id in &ids {
+                net.add_node(to_sim(id), ConfigSimNode::new(id, voters.clone(), config));
+            }
+            let mut cluster = ConfigCluster { net, ids };
+            cluster.start_all();
+            cluster
+        }
+
+        /// Bootstrap every node (same harmless term-0 self-AppendEntries trigger as
+        /// [`RaftCluster::start_all`]).
+        fn start_all(&mut self) {
+            for &id in &self.ids {
+                self.net.tell(
+                    to_sim(id),
+                    to_sim(id),
+                    RaftMsg::AppendEntries {
+                        term: 0,
+                        leader: id,
+                        prev_log_index: 0,
+                        prev_log_term: 0,
+                        entries: Vec::new(),
+                        leader_commit: 0,
+                    },
+                );
+            }
+        }
+
+        fn engine(&self, id: NodeId) -> &RaftNode<MemStorage, ConfigSm> {
+            &self.net.node(to_sim(id)).expect("node exists").engine
+        }
+
+        fn role(&self, id: NodeId) -> Role {
+            self.engine(id).role()
+        }
+
+        fn leaders(&self) -> Vec<NodeId> {
+            self.ids
+                .iter()
+                .copied()
+                .filter(|&id| self.role(id) == Role::Leader)
+                .collect()
+        }
+
+        fn commit_index(&self, id: NodeId) -> u64 {
+            self.engine(id).commit_index()
+        }
+
+        fn log(&self, id: NodeId) -> Vec<LogEntry> {
+            self.engine(id).storage().log().to_vec()
+        }
+
+        /// The node's converged SlotMap (via the state-machine accessor).
+        fn map(&self, id: NodeId) -> &SlotMap {
+            self.engine(id).state_machine().map()
+        }
+
+        fn current_epoch(&self, id: NodeId) -> u64 {
+            // The Raft-driven, log-monotonic config epoch (a deterministic function
+            // of the applied prefix), NOT the SlotMap's Redis-client epoch.
+            self.engine(id).state_machine().config_epoch()
+        }
+
+        /// The node's slot->owner-string projection: for each ASSIGNED slot, the
+        /// 40-hex id of its owner. The directly comparable global ownership view (the
+        /// `ranges()` shape carries node INDICES that differ per node's table order,
+        /// so we resolve to owner IDs for a node-independent comparison).
+        fn owner_by_slot(&self, id: NodeId) -> BTreeMap<u16, String> {
+            let map = self.map(id);
+            let nodes = map.nodes();
+            let mut out = BTreeMap::new();
+            for (start, end, node_idx) in map.ranges() {
+                let owner = nodes[node_idx].id.to_string();
+                for slot in start..=end {
+                    out.insert(slot, owner.clone());
+                }
+            }
+            out
+        }
+
+        fn propose(&mut self, leader: NodeId, cmd: ConfigCmd) {
+            self.net.tell(
+                to_sim(leader),
+                to_sim(leader),
+                RaftMsg::Propose {
+                    payload: EntryPayload::Config(cmd),
+                },
+            );
+        }
+
+        fn run_steps(&mut self, n: usize) -> usize {
+            self.net.run_steps(n)
+        }
+
+        fn run_until_idle(&mut self, max_steps: usize) -> usize {
+            self.net.run_until_idle(max_steps)
+        }
+    }
+
+    // -- 3e checkers: linearizable slot ownership + epoch monotonicity ----------
+
+    /// LINEARIZABLE SLOT OWNERSHIP (the headline #73 property): across all nodes,
+    /// for each slot, no two nodes report a DIFFERENT owner while at the SAME
+    /// `current_epoch()`.
+    ///
+    /// Because committed entries are byte-identical and `ConfigSm::apply` is
+    /// deterministic, every node at a given committed epoch holds the same
+    /// owner-per-slot; this checker proves that empirically and would catch an apply
+    /// bug (a node mis-applying a `ConfigCmd` would expose a divergent owner at a
+    /// shared epoch). It groups (slot, epoch) -> set-of-owners and asserts each group
+    /// is a singleton.
+    fn assert_no_two_owners_per_epoch(cluster: &ConfigCluster) {
+        // (slot, epoch) -> the owner id first seen, plus the node that reported it.
+        let mut seen: BTreeMap<(u16, u64), (String, NodeId)> = BTreeMap::new();
+        for &id in &cluster.ids {
+            let epoch = cluster.current_epoch(id);
+            for (slot, owner) in cluster.owner_by_slot(id) {
+                match seen.get(&(slot, epoch)) {
+                    Some((prev_owner, prev_node)) => assert_eq!(
+                        prev_owner, &owner,
+                        "linearizable-ownership violated: slot {slot} at epoch {epoch} is owned by \
+                         {prev_owner} per node {prev_node:?} but by {owner} per node {id:?}"
+                    ),
+                    None => {
+                        seen.insert((slot, epoch), (owner, id));
+                    }
+                }
+            }
+        }
+    }
+
+    /// EPOCH MONOTONICITY: no node's `current_epoch()` ever decreases across
+    /// observations. Sampled against a running per-node high-water map; each call
+    /// asserts the current epoch is `>=` the highest previously seen for that node,
+    /// then records the new high-water.
+    #[derive(Default)]
+    struct EpochMonotonic {
+        high_water: BTreeMap<NodeId, u64>,
+    }
+
+    impl EpochMonotonic {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn observe(&mut self, cluster: &ConfigCluster) {
+            for &id in &cluster.ids {
+                let epoch = cluster.current_epoch(id);
+                let hw = self.high_water.entry(id).or_insert(0);
+                assert!(
+                    epoch >= *hw,
+                    "epoch monotonicity violated: node {id:?} epoch went {hw} -> {epoch}"
+                );
+                *hw = epoch;
+            }
+        }
+    }
+
+    /// Run both 3e checkers at a quiescent point (the epoch-monotonic one against a
+    /// supplied tracker so it spans the whole scenario).
+    fn assert_3e_invariants(cluster: &ConfigCluster, epochs: &mut EpochMonotonic) {
+        assert_no_two_owners_per_epoch(cluster);
+        epochs.observe(cluster);
+    }
+
+    /// Elect a single leader on a config cluster and settle the election no-op.
+    fn elect_config_leader(cluster: &mut ConfigCluster) -> NodeId {
+        for _ in 0..200 {
+            cluster.run_steps(500);
+            let leaders = cluster.leaders();
+            if leaders.len() == 1 {
+                cluster.run_steps(5_000);
+                return leaders[0];
+            }
+        }
+        panic!("config cluster did not converge to a single leader");
+    }
+
+    /// Assert every node's committed log is a consistent prefix of the leader's (no
+    /// committed config change is lost or reordered): for each node, every entry up
+    /// to its commit_index equals the leader's entry at that index.
+    fn assert_committed_prefix_agrees(cluster: &ConfigCluster, leader: NodeId) {
+        let leader_log = cluster.log(leader);
+        for &id in &cluster.ids {
+            let ci = cluster.commit_index(id);
+            let log = cluster.log(id);
+            for idx in 1..=ci {
+                let pos = usize::try_from(idx - 1).unwrap();
+                assert_eq!(
+                    log.get(pos),
+                    leader_log.get(pos),
+                    "node {id:?} committed index {idx} disagrees with the leader's log \
+                     (a committed config change was lost or reordered)"
+                );
+            }
+        }
+    }
+
+    // -- scenario H: config applies and converges (partition + heal) -----------
+
+    #[test]
+    fn config_applies_and_converges() {
+        // 5 voters. Elect a leader; propose AddNode for every peer, then assign the
+        // slot space across the nodes, partition the leader off and heal, and assert
+        // every node's SlotMap projection is IDENTICAL at the final committed epoch,
+        // the epoch is monotone everywhere, and no-two-owners holds throughout.
+        let mut cluster = ConfigCluster::new(5, 101, RaftConfig::default());
+        let mut epochs = EpochMonotonic::new();
+        let leader = elect_config_leader(&mut cluster);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // AddNode every node (including the leader's own id; meet is idempotent on
+        // self). Committed BEFORE any slot assignment references them.
+        for id in cluster.ids.clone() {
+            cluster.propose(
+                leader,
+                ConfigCmd::AddNode {
+                    id: slot_id(id),
+                    host: slot_host(id),
+                    port: SLOT_PORT,
+                },
+            );
+            cluster.run_steps(1_500);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+
+        // Assign the 16384-slot space in contiguous bands, one band per node, via a
+        // mix of AssignSlots (batches) and one SetSlotOwner (single slot), so both
+        // apply paths are exercised.
+        let n = cluster.ids.len() as u32;
+        let band = u32::from(ironcache_cluster::CLUSTER_SLOTS) / n;
+        for (k, id) in cluster.ids.clone().into_iter().enumerate() {
+            let start = (k as u32) * band;
+            let end = if k + 1 == cluster.ids.len() {
+                u32::from(ironcache_cluster::CLUSTER_SLOTS) - 1
+            } else {
+                start + band - 1
+            };
+            let slots: Vec<u16> = (start..=end).map(|s| s as u16).collect();
+            // Assign all but the last slot of the band as a batch, the last as a
+            // single SetSlotOwner.
+            let (head, tail) = slots.split_at(slots.len() - 1);
+            cluster.propose(
+                leader,
+                ConfigCmd::AssignSlots {
+                    node: slot_id(id),
+                    slots: head.to_vec(),
+                },
+            );
+            cluster.propose(
+                leader,
+                ConfigCmd::SetSlotOwner {
+                    slot: tail[0],
+                    node: slot_id(id),
+                },
+            );
+            cluster.run_steps(2_000);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+
+        // A SetConfigEpoch is a no-op here (the leader knows other nodes, so the
+        // SlotMap rejects it deterministically on every node); include it to prove
+        // the command is handled uniformly and does not perturb convergence.
+        cluster.propose(leader, ConfigCmd::SetConfigEpoch(99));
+        cluster.run_steps(1_500);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // Partition the leader off; a new leader rises and keeps committing nothing
+        // new here (we stop proposing), then heal and let everything reconcile.
+        let others: Vec<SimId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != leader)
+            .map(to_sim)
+            .collect();
+        cluster.net.partition(&[to_sim(leader)], &others);
+        for _ in 0..40 {
+            cluster.run_steps(500);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+        cluster.net.heal();
+        cluster.run_until_idle(200_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // Final state: every node's slot->owner projection is IDENTICAL, the whole
+        // space is assigned, and the epoch agrees everywhere.
+        let reference = cluster.owner_by_slot(cluster.ids[0]);
+        assert_eq!(
+            reference.len(),
+            usize::from(ironcache_cluster::CLUSTER_SLOTS),
+            "the full slot space must be assigned after convergence"
+        );
+        let ref_epoch = cluster.current_epoch(cluster.ids[0]);
+        for &id in &cluster.ids {
+            assert_eq!(
+                cluster.owner_by_slot(id),
+                reference,
+                "node {id:?} slot->owner projection must match every other node's"
+            );
+            assert_eq!(
+                cluster.current_epoch(id),
+                ref_epoch,
+                "node {id:?} config epoch must match every other node's once converged"
+            );
+        }
+        assert_no_two_owners_per_epoch(&cluster);
+    }
+
+    // -- scenario I: slot ownership under partition (THE headline gate) ---------
+
+    /// Replay scenario I for one `seed`: a migration-shaped SetSlotOwner sequence
+    /// proposed while the cluster is partitioned, then healed. Returns the final
+    /// per-node owner-by-slot snapshot + epoch so a seed sweep can compare, and runs
+    /// the no-two-owners + epoch-monotonic checkers throughout.
+    fn run_slot_ownership_under_partition(seed: u64) -> Vec<(BTreeMap<u16, String>, u64)> {
+        let mut cluster = ConfigCluster::new(5, seed, RaftConfig::default());
+        cluster
+            .net
+            .set_latency(Duration::from_millis(1), Duration::from_millis(15));
+        let mut epochs = EpochMonotonic::new();
+        let leader = elect_config_leader(&mut cluster);
+
+        // Build the node table first (committed before any slot reference).
+        for id in cluster.ids.clone() {
+            cluster.propose(
+                leader,
+                ConfigCmd::AddNode {
+                    id: slot_id(id),
+                    host: slot_host(id),
+                    port: SLOT_PORT,
+                },
+            );
+        }
+        cluster.run_steps(5_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // Claim a handful of slots for the leader, then run a MIGRATION-shaped
+        // sequence (re-home each slot to successive nodes) WHILE PARTITIONED: the
+        // majority side keeps committing the ownership flips; the minority cannot.
+        let slots: [u16; 4] = [0, 4096, 8192, 12288];
+        for &s in &slots {
+            cluster.propose(
+                leader,
+                ConfigCmd::SetSlotOwner {
+                    slot: s,
+                    node: slot_id(leader),
+                },
+            );
+        }
+        cluster.run_steps(3_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // Partition: leader + one follower as the minority (2 of 5, cannot commit);
+        // the other three are the majority and elect their own leader.
+        let minority_follower = *cluster
+            .ids
+            .iter()
+            .find(|&&id| id != leader)
+            .expect("a follower exists");
+        let minority: Vec<SimId> = [leader, minority_follower]
+            .iter()
+            .copied()
+            .map(to_sim)
+            .collect();
+        let majority: Vec<SimId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != leader && id != minority_follower)
+            .map(to_sim)
+            .collect();
+        cluster.net.partition(&minority, &majority);
+
+        // The majority elects a leader; migrate each slot to a NEW owner on that side.
+        let mut maj_leader = None;
+        for _ in 0..200 {
+            cluster.run_steps(500);
+            assert_3e_invariants(&cluster, &mut epochs);
+            let ml: Vec<NodeId> = cluster
+                .leaders()
+                .into_iter()
+                .filter(|id| majority.contains(&to_sim(*id)))
+                .collect();
+            if ml.len() == 1 {
+                maj_leader = Some(ml[0]);
+                break;
+            }
+        }
+        let maj_leader = maj_leader.expect("the majority side must elect a leader");
+        // Migrate every slot to the majority leader (the migration-shaped change
+        // that must never produce two owners at one epoch).
+        for &s in &slots {
+            cluster.propose(
+                maj_leader,
+                ConfigCmd::SetSlotOwner {
+                    slot: s,
+                    node: slot_id(maj_leader),
+                },
+            );
+        }
+        for _ in 0..40 {
+            cluster.run_steps(500);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+
+        // Heal; the minority side adopts the majority's committed config. Sample the
+        // checkers throughout the reconciliation.
+        cluster.net.heal();
+        for _ in 0..80 {
+            cluster.run_steps(500);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+        cluster.run_until_idle(200_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // No committed config change is lost: every node's committed prefix agrees
+        // with the (final) majority leader's log.
+        let final_leader = {
+            let ls = cluster.leaders();
+            assert_eq!(ls.len(), 1, "exactly one leader after heal");
+            ls[0]
+        };
+        assert_committed_prefix_agrees(&cluster, final_leader);
+
+        cluster
+            .ids
+            .iter()
+            .map(|&id| (cluster.owner_by_slot(id), cluster.current_epoch(id)))
+            .collect()
+    }
+
+    #[test]
+    fn slot_ownership_under_partition() {
+        // THE headline gate, across a seed sweep: no epoch ever shows two owners for
+        // one slot (asserted inside the run via assert_no_two_owners_per_epoch every
+        // chunk) and, after heal, all nodes converge to one ownership view with no
+        // committed change lost.
+        for seed in 0..30u64 {
+            let snaps = run_slot_ownership_under_partition(seed);
+            let (ref_owner, ref_epoch) = &snaps[0];
+            for (owner, epoch) in &snaps {
+                assert_eq!(
+                    owner, ref_owner,
+                    "seed {seed}: all nodes must converge to one slot->owner view after heal"
+                );
+                assert_eq!(
+                    epoch, ref_epoch,
+                    "seed {seed}: all nodes must agree on the config epoch after heal"
+                );
+            }
+            // The migration landed: every probed slot is owned (by the same node on
+            // every replica, already asserted above).
+            for s in [0u16, 4096, 8192, 12288] {
+                assert!(
+                    ref_owner.contains_key(&s),
+                    "seed {seed}: migrated slot {s} must have an owner after convergence"
+                );
+            }
+        }
+    }
+
+    // -- scenario determinism_replay_3e ----------------------------------------
+
+    /// A per-node replay snapshot: the SlotMap's slot ranges plus the node's
+    /// current config epoch. Compared for byte-identical equality across two
+    /// same-seed runs to prove deterministic replay of the config state machine.
+    type NodeConfigSnapshot = (Vec<(u16, u16, usize)>, u64);
+
+    /// One config-proposal + partition + heal run for `seed`, returning the trace
+    /// plus a per-node (ranges, current_epoch) snapshot for byte-identical replay
+    /// comparison. The fault script is fixed (partition the first leader after a
+    /// fixed proposal set), so a same-seed replay is identical. The 3e checkers run
+    /// inside the run (via the shared helper).
+    fn replay_config_partition(
+        seed: u64,
+    ) -> (Vec<ironcache_sim::TraceRecord>, Vec<NodeConfigSnapshot>) {
+        let mut cluster = ConfigCluster::new(5, seed, RaftConfig::default());
+        let mut epochs = EpochMonotonic::new();
+        let leader = elect_config_leader(&mut cluster);
+
+        for id in cluster.ids.clone() {
+            cluster.propose(
+                leader,
+                ConfigCmd::AddNode {
+                    id: slot_id(id),
+                    host: slot_host(id),
+                    port: SLOT_PORT,
+                },
+            );
+        }
+        cluster.run_steps(3_000);
+        // A fixed slot-assignment + migration script.
+        for (k, id) in cluster.ids.clone().into_iter().enumerate() {
+            cluster.propose(
+                leader,
+                ConfigCmd::AssignSlots {
+                    node: slot_id(id),
+                    slots: vec![(k as u16) * 1000, (k as u16) * 1000 + 1],
+                },
+            );
+            cluster.run_steps(1_500);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+
+        let others: Vec<SimId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != leader)
+            .map(to_sim)
+            .collect();
+        cluster.net.partition(&[to_sim(leader)], &others);
+        cluster.run_steps(40_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+        cluster.net.heal();
+        cluster.run_steps(40_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        let snapshot: Vec<NodeConfigSnapshot> = cluster
+            .ids
+            .iter()
+            .map(|&id| (cluster.map(id).ranges(), cluster.current_epoch(id)))
+            .collect();
+        (cluster.net.trace().to_vec(), snapshot)
+    }
+
+    #[test]
+    fn determinism_replay_3e() {
+        // A config-proposal + partition + heal scenario must replay byte-identically
+        // across >=100 seeds: same trace AND same per-node (ranges, current_epoch)
+        // snapshot, with the no-two-owners + epoch-monotonic checkers asserted each
+        // seed (inside replay_config_partition).
+        for seed in 0..100u64 {
+            let (trace_a, snap_a) = replay_config_partition(seed);
+            let (trace_b, snap_b) = replay_config_partition(seed);
+            assert_eq!(
+                trace_a, trace_b,
+                "seed {seed}: config+partition+heal trace must replay byte-identically"
+            );
+            assert_eq!(
+                snap_a, snap_b,
+                "seed {seed}: per-node (ranges, current_epoch) must replay identically"
+            );
+        }
     }
 }

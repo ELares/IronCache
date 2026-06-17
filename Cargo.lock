@@ -436,6 +436,7 @@ dependencies = [
 name = "ironcache-raft"
 version = "0.0.0"
 dependencies = [
+ "ironcache-cluster",
  "ironcache-env",
  "ironcache-sim",
 ]
