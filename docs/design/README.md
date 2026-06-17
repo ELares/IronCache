@@ -89,6 +89,9 @@ Specs added as the M1 milestone progresses.
 - [PERSISTENCE.md](PERSISTENCE.md): the persistence umbrella: three durability
   tiers with honest loss windows, durable_offset/fsync-lag, fail-closed, shared
   io_uring write path, hybrid-log + segment/manifest layout (#58).
+- [CLUSTERING_ROADMAP.md](CLUSTERING_ROADMAP.md): implementation status and roadmap
+  for multi-node clustering: shipped slices (1-3 + the 3-node benchmark) and what
+  remains with its dependencies (#68).
 - [CLUSTER_CONTRACT.md](CLUSTER_CONTRACT.md): the Redis-Cluster-compatible client
   wire contract (CRC16/16384 slots, hash tags, CROSSSLOT, MOVED/ASK, CLUSTER
   SLOTS/SHARDS, sharded Pub/Sub) (#70).
