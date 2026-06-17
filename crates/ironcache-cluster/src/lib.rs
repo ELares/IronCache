@@ -1,50 +1,77 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! The static, config-driven 16384-slot ownership map (CLUSTER_CONTRACT.md #70, slice 2).
+//! The 16384-slot ownership map (CLUSTER_CONTRACT.md #70). Slice 2 made it a STATIC,
+//! config-driven map resolved once at boot; slice 3 makes it RUNTIME-MUTABLE so a node can
+//! form a cluster from itself (`CLUSTER MEET / ADDSLOTS / SETSLOT / FORGET / ...`).
 //!
 //! Slice 1 gave IronCache the client-visible `CLUSTER` introspection surface and the pure
 //! CRC16/XMODEM slot projection, but every node still behaved as a single-node cluster that
-//! auto-owned all 16384 slots. Slice 2 introduces a REAL multi-node topology: a STATIC map,
-//! resolved once at boot from config, that assigns each of the 16384 wire slots to exactly
-//! one node. This map is what drives MOVED redirection, CROSSSLOT enforcement, and the
-//! multi-node `CLUSTER SLOTS / SHARDS / NODES / INFO` projection.
+//! auto-owned all 16384 slots. Slice 2 introduced a REAL multi-node topology: a static map,
+//! resolved once at boot from config, assigning each of the 16384 wire slots to exactly one
+//! node. This map is what drives MOVED redirection, CROSSSLOT enforcement, and the multi-node
+//! `CLUSTER SLOTS / SHARDS / NODES / INFO` projection.
+//!
+//! ## Slice 3: runtime self-formation (Option A)
+//!
+//! A cluster-enabled node now boots with an EMPTY single-node map ([`SlotMap::empty_self`])
+//! that owns ZERO slots (matching a fresh real-Redis cluster-enabled node), and the operator
+//! drives it to a full cluster over the wire: `CLUSTER MEET` grows the node set, `CLUSTER
+//! ADDSLOTS / ADDSLOTSRANGE` claims slots, `CLUSTER SETSLOT <slot> NODE <id>` flips ownership,
+//! `CLUSTER FORGET` drops a node, and the epoch verbs (`SET-CONFIG-EPOCH` / `BUMPEPOCH`) set
+//! the config epoch. Inter-node SYNC of these mutations (gossip / outbound TCP) is DEFERRED to
+//! slice 3b; each node mutates only its OWN local view here.
 //!
 //! ## Why a dedicated leaf crate
 //!
 //! The slot map has THREE consumers: the router (in `ironcache`), the projection (in
-//! `ironcache-server`), and the validation (in `ironcache-config`). Pulling the map into
-//! any one of them creates a dependency cycle, because `ironcache-config` must NOT depend
-//! on `ironcache-server` (config is a lower layer). A leaf crate depending only on
-//! `ironcache-protocol` (for the `CLUSTER_SLOTS` constant) breaks the cycle: config and
-//! server both depend on it, and it depends on neither.
+//! `ironcache-server`), and the validation (in `ironcache-config`). Pulling the map into any
+//! one of them creates a dependency cycle, because `ironcache-config` must NOT depend on
+//! `ironcache-server` (config is a lower layer). A leaf crate depending only on
+//! `ironcache-protocol` (for the `CLUSTER_SLOTS` constant) breaks the cycle: config and server
+//! both depend on it, and it depends on neither.
 //!
-//! ## Purity (ADR-0003 / ADR-0002)
+//! ## Concurrency model (mirrors `ironcache-config::RuntimeConfig`)
 //!
-//! The map is PURE: [`SlotMap::build`] is a deterministic function of its `(nodes, self_id)`
-//! input, and the query methods are deterministic functions of the map. There is no `rand`,
-//! no `std::time`, and no lock anywhere in this crate, so the determinism invariant
-//! (ADR-0003) and the shared-nothing invariant (ADR-0002) hold trivially. The hot-path
-//! ownership query ([`SlotMap::owns`]) is a single O(1) dense-array index with no branch.
+//! Slice 2 was PURE (no rand, no time, no lock). Slice 3 must allow runtime mutation that is
+//! visible across every shard's `Arc<SlotMap>` clone, so it adopts the SAME shape
+//! `RuntimeConfig` uses: interior atomics for the HOT-PATH read (`owns`) plus a `Mutex` for the
+//! rarely-written, cold-read node table:
+//!
+//! * `owner` is a dense `[AtomicU16; 16384]`: the hot ownership query [`owns`](SlotMap::owns) is
+//!   a single lock-free `Acquire` load + compare, allocation-free, exactly like slice 2's array
+//!   index. Slot mutators publish with a `Release` store.
+//! * `nodes` (and the parallel `config_epochs`) live behind a `std::sync::Mutex`. They are
+//!   mutated only by MEET / FORGET / SETSLOT-bookkeeping and read only on the COLD projection /
+//!   MOVED path (`CLUSTER SLOTS / SHARDS / NODES`, and `moved_target`). `owns()` NEVER takes the
+//!   lock. This crate is NOT in the hot-path-crate set the shared-nothing invariant guards
+//!   (`scripts/ci/check-rust-invariants.sh`: storage/store/eviction/expiry/server/observe), so a
+//!   `Mutex` here is permitted, and it follows the `RuntimeConfig` precedent (Arc + interior
+//!   mutability, written rarely, read off the hot path).
+//! * `self_idx`, `my_epoch`, and `current_epoch` are atomics (FORGET can shift indices;
+//!   the epochs are scalar counters). ADR-0003 determinism holds: no rand, no `std::time`, no
+//!   clock; atomics and `std::sync::Mutex` carry no nondeterminism.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 /// The number of hash slots in the Redis-Cluster wire space (16384), re-exported from the
 /// protocol crate (the single source of the wire constant). A key's slot is its
 /// CRC16/XMODEM reduced into this range; this map assigns each of those 16384 slots an owner.
 pub const CLUSTER_SLOTS: u16 = ironcache_protocol::CLUSTER_SLOTS;
 
-/// The sentinel `owner[slot]` value for an UNASSIGNED slot (no node owns it). It can only
-/// appear when [`SlotMap::fully_assigned`] is `false`; slice-2 validation rejects a gappy
-/// map at boot ([`SlotMapError::Gap`]), so a fully-validated map never carries this value.
-/// It exists for forward-compatibility (a partial map is structurally representable) and so
-/// [`SlotMap::owner`] can return `None` for an unassigned slot rather than index a bogus node.
+/// The sentinel `owner[slot]` value for an UNASSIGNED slot (no node owns it). A fresh
+/// [`SlotMap::empty_self`] node carries this in every slot until `CLUSTER ADDSLOTS`, and a
+/// partial map (mid-formation) carries it in the not-yet-claimed slots. [`SlotMap::owner`]
+/// returns `None` for it rather than indexing a bogus node.
 const UNASSIGNED: u16 = u16::MAX;
 
-/// One node's identity and advertised endpoint, resolved from the cluster topology config.
+/// One node's identity and advertised endpoint.
 ///
 /// The `host`/`port` are what CLIENTS dial (the advertised endpoint a MOVED redirect points
 /// at), NOT the node's bind address (which may be `0.0.0.0`). The `id` is the stable
 /// 40-lowercase-hex node id, the same value `CLUSTER MYID` reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeEntry {
-    /// The stable 40-lowercase-hex node id (validated by [`SlotMap::build`]).
+    /// The stable 40-lowercase-hex node id (validated by [`SlotMap::build`] / [`SlotMap::meet`]).
     pub id: Box<str>,
     /// The advertised host clients dial (NOT the bind address).
     pub host: Box<str>,
@@ -52,29 +79,48 @@ pub struct NodeEntry {
     pub port: u16,
 }
 
-/// The immutable, boot-resolved slot ownership map: which node owns each of the 16384 slots,
-/// and which node is THIS one.
+/// The node table and its parallel per-node config epochs, behind one lock so a node's
+/// addition / removal (MEET / FORGET) and its epoch are mutated together atomically.
+#[derive(Debug, Clone, Default)]
+struct NodeTable {
+    /// The nodes, deduplicated by id. Index into this by the values in `owner`. The order is
+    /// append-on-MEET (config order at boot), so the projection is stable between mutations.
+    nodes: Vec<NodeEntry>,
+    /// Each node's config epoch, parallel to `nodes` (`config_epochs[i]` is `nodes[i]`'s). Slice
+    /// 3 only ever sets THIS node's epoch (SET-CONFIG-EPOCH / BUMPEPOCH); peers stay 0 until
+    /// gossip lands them (slice 3b).
+    config_epochs: Vec<u64>,
+}
+
+/// The runtime-mutable slot ownership map: which node owns each of the 16384 slots, which node
+/// is THIS one, and the cluster epochs.
 ///
 /// Two representations are kept, each serving a different consumer:
 /// - the dense `owner` array (slot -> node index) is the HOT-PATH structure: [`owns`](Self::owns)
-///   and [`owner`](Self::owner) are O(1) array indexes, allocation-free per request;
-/// - the `nodes` vector drives the projection ([`ranges`](Self::ranges) coalesces contiguous
-///   equal-owner runs into the `(start, end, node)` shape `CLUSTER SLOTS / SHARDS / NODES` need).
-#[derive(Debug, Clone)]
+///   is a single O(1) lock-free atomic load, allocation-free per request;
+/// - the `table` (nodes + epochs, behind a `Mutex`) drives the COLD projection
+///   ([`ranges`](Self::ranges) coalesces contiguous equal-owner runs into the `(start, end,
+///   node)` shape `CLUSTER SLOTS / SHARDS / NODES` need) and MOVED ([`moved_target`](Self::moved_target)).
+#[derive(Debug)]
 pub struct SlotMap {
-    /// The nodes, deduplicated by id, in declaration (config) order. Index into this by the
-    /// values in `owner`. Order is deterministic (ADR-0003) so the projection is stable.
-    nodes: Vec<NodeEntry>,
-    /// Dense slot -> node-index map (32 KiB, boxed off-stack). `owner[slot]` is the index
-    /// into `nodes`, or [`UNASSIGNED`] for a gap (only possible when `fully_assigned` is false).
-    owner: Box<[u16; CLUSTER_SLOTS as usize]>,
-    /// The index into `nodes` of THIS node (the one whose announce id was passed to `build`).
-    self_idx: usize,
-    /// Whether every one of the 16384 slots has an owner. Slice-2 validation requires this.
-    fully_assigned: bool,
+    /// The node table + epochs (cold path: projection / MOVED / MEET / FORGET). NEVER read by
+    /// [`owns`](Self::owns).
+    table: Mutex<NodeTable>,
+    /// Dense slot -> node-index map (32 KiB of `AtomicU16`, boxed off-stack). `owner[slot]` is
+    /// the index into `table.nodes`, or [`UNASSIGNED`] for a slot no node owns. Read lock-free
+    /// on the hot path (`Acquire`), published by the slot mutators (`Release`).
+    owner: Box<[AtomicU16; CLUSTER_SLOTS as usize]>,
+    /// The index into `table.nodes` of THIS node. An atomic because FORGET can shift indices.
+    self_idx: AtomicU16,
+    /// THIS node's config epoch (CLUSTER INFO `cluster_my_epoch`). Set by SET-CONFIG-EPOCH /
+    /// BUMPEPOCH.
+    my_epoch: AtomicU64,
+    /// The highest config epoch this node has observed (CLUSTER INFO `cluster_current_epoch`).
+    /// Raised by SET-CONFIG-EPOCH / BUMPEPOCH; in slice 3 (no gossip) it tracks `my_epoch`.
+    current_epoch: AtomicU64,
 }
 
-/// Why a topology failed to build into a valid [`SlotMap`]. Mapped onto
+/// Why a topology failed to build into a valid [`SlotMap`] at boot. Mapped onto
 /// `ironcache_config::ConfigError::Invalid` by the config crate so a bad topology hard-fails
 /// boot with a precise, operator-readable reason rather than a silent fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +169,64 @@ impl core::fmt::Display for SlotMapError {
     }
 }
 
+/// Why a runtime CLUSTER mutation (ADDSLOTS / DELSLOTS / SETSLOT / FORGET / SET-CONFIG-EPOCH)
+/// was rejected. Its [`Display`](core::fmt::Display) is BYTE-EXACT to the message Redis emits
+/// from `clusterCommand` (src/cluster_legacy.c), so the server wraps it directly into the
+/// `-ERR <message>` reply. The strings were verified against
+/// `https://raw.githubusercontent.com/redis/redis/7.4.0/src/cluster_legacy.c`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotMutError {
+    /// ADDSLOTS / ADDSLOTSRANGE on a slot already owned by someone.
+    /// Redis: `addReplyErrorFormat(c,"Slot %d is already busy", slot)`.
+    SlotBusy(u16),
+    /// DELSLOTS / DELSLOTSRANGE on a slot that has no owner.
+    /// Redis: `addReplyErrorFormat(c,"Slot %d is already unassigned", slot)`.
+    SlotUnassigned(u16),
+    /// A slot named more than once in a single ADD/DEL batch.
+    /// Redis: `addReplyErrorFormat(c,"Slot %d specified multiple times",(int)slot)`.
+    SlotDuplicate(u16),
+    /// SETSLOT / FORGET naming a node id not in this node's table.
+    /// Redis: `addReplyErrorFormat(c,"Unknown node %s", ...)`.
+    UnknownNode(String),
+    /// FORGET on this node itself.
+    /// Redis: `addReplyError(c,"I tried hard but I can't forget myself...")`.
+    ForgetSelf,
+    /// FORGET on a node that still owns slots. Redis 7.4's FORGET has NO such guard (it
+    /// blacklists + deletes any non-self, non-master node); this is an IronCache-specific
+    /// safety guard so a slot is never left orphaned (no gossip to re-home it in slice 3).
+    /// Documented deviation; carries the node id.
+    NodeOwnsSlots(String),
+    /// SET-CONFIG-EPOCH when this node already knows other nodes.
+    /// Redis: `addReplyError(c,"The user can assign a config epoch only when the node does not know any other node.")`.
+    EpochKnowsOthers,
+    /// SET-CONFIG-EPOCH when this node's config epoch is already non-zero.
+    /// Redis: `addReplyError(c,"Node config epoch is already non-zero")`.
+    EpochAlreadySet,
+}
+
+impl core::fmt::Display for SlotMutError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SlotMutError::SlotBusy(n) => write!(f, "Slot {n} is already busy"),
+            SlotMutError::SlotUnassigned(n) => write!(f, "Slot {n} is already unassigned"),
+            SlotMutError::SlotDuplicate(n) => write!(f, "Slot {n} specified multiple times"),
+            SlotMutError::UnknownNode(id) => write!(f, "Unknown node {id}"),
+            SlotMutError::ForgetSelf => {
+                write!(f, "I tried hard but I can't forget myself...")
+            }
+            // Deviation from Redis 7.4 (which has no such guard); see the variant doc.
+            SlotMutError::NodeOwnsSlots(id) => {
+                write!(f, "Can't forget node {id} while it still serves slots")
+            }
+            SlotMutError::EpochKnowsOthers => write!(
+                f,
+                "The user can assign a config epoch only when the node does not know any other node."
+            ),
+            SlotMutError::EpochAlreadySet => write!(f, "Node config epoch is already non-zero"),
+        }
+    }
+}
+
 /// Validate that a node id is exactly 40 lowercase hex characters (the Redis node-id shape).
 #[must_use]
 fn is_valid_node_id(id: &str) -> bool {
@@ -132,18 +236,31 @@ fn is_valid_node_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Allocate a dense `[AtomicU16; CLUSTER_SLOTS]` on the HEAP filled with `init`, avoiding a
+/// 32 KiB stack array (clippy::large_stack_arrays). Built via a `Vec` then converted to a
+/// boxed fixed-size array.
+fn new_owner_array(init: u16) -> Box<[AtomicU16; CLUSTER_SLOTS as usize]> {
+    let mut v: Vec<AtomicU16> = Vec::with_capacity(CLUSTER_SLOTS as usize);
+    for _ in 0..CLUSTER_SLOTS {
+        v.push(AtomicU16::new(init));
+    }
+    v.into_boxed_slice()
+        .try_into()
+        .expect("the vec is exactly CLUSTER_SLOTS long")
+}
+
 impl SlotMap {
-    /// Build and validate a slot map from the resolved topology and THIS node's announce id.
+    /// Build and validate a STATIC slot map from the resolved topology and THIS node's announce
+    /// id (the slice-2 boot path, byte-for-byte unchanged in behaviour).
     ///
     /// `nodes` carries each node's id, advertised endpoint, and the inclusive `[start, end]`
     /// slot ranges it owns (as `slot_ranges`, parallel to `nodes`). `self_id` is this node's
     /// 40-hex announce id; it must match exactly one node's id.
     ///
-    /// Returns the single source of truth, or a precise [`SlotMapError`] on the first
-    /// problem detected (empty / bad id / duplicate id / bad range / overlap / gap /
-    /// self-not-present). This is the ONE place the topology is validated; the config crate
-    /// calls it (with a throwaway result) for `Config::validate`, and the server calls it
-    /// for real at boot.
+    /// Returns the single source of truth, or a precise [`SlotMapError`] on the first problem
+    /// detected (empty / bad id / duplicate id / bad range / overlap / gap / self-not-present).
+    /// This is the ONE place a static topology is validated; the config crate calls it (with a
+    /// throwaway result) for `Config::validate`, and the server calls it for real at boot.
     ///
     /// # Errors
     ///
@@ -156,14 +273,8 @@ impl SlotMap {
             return Err(SlotMapError::Empty);
         }
 
-        // Dense slot -> node-index map, sentinel-filled. Built on the HEAP via a Vec then
-        // converted to a boxed fixed-size array (avoids materializing a 32 KiB array on the
-        // stack, which `Box::new([..; N])` would do before the move; clippy::large_stack_arrays).
-        let mut owner: Box<[u16; CLUSTER_SLOTS as usize]> =
-            vec![UNASSIGNED; CLUSTER_SLOTS as usize]
-                .into_boxed_slice()
-                .try_into()
-                .expect("the vec is exactly CLUSTER_SLOTS long");
+        // Dense slot -> node-index map, sentinel-filled (heap-allocated, see `new_owner_array`).
+        let owner = new_owner_array(UNASSIGNED);
         let mut entries: Vec<NodeEntry> = Vec::with_capacity(nodes.len());
 
         for (idx, (entry, ranges)) in nodes.into_iter().enumerate() {
@@ -181,26 +292,24 @@ impl SlotMap {
                     return Err(SlotMapError::BadRange(start, end));
                 }
                 for slot in start..=end {
-                    let cur = owner[slot as usize];
+                    let cur = owner[slot as usize].load(Ordering::Relaxed);
                     if cur != UNASSIGNED {
                         // Already owned by an earlier node: report both ids.
                         let first = entries[cur as usize].id.to_string();
                         return Err(SlotMapError::Overlap(slot, first, entry.id.into_string()));
                     }
                     // `idx` fits u16: MAX nodes is bounded by the 16384 slots, far below u16::MAX.
-                    owner[slot as usize] = idx as u16;
+                    owner[slot as usize].store(idx as u16, Ordering::Relaxed);
                 }
             }
             entries.push(entry);
         }
 
         // (5) full coverage: no gap. Slice 2 requires a complete map (partial -> ASK, deferred),
-        // so a gap is a hard error and a successfully-built map is ALWAYS fully assigned. The
-        // `fully_assigned` field stays in the struct for the forward-compat partial-map shape
-        // and so the projection counters do not assume completeness.
-        for (slot, &o) in owner.iter().enumerate() {
-            if o == UNASSIGNED {
-                return Err(SlotMapError::Gap(slot as u16));
+        // so a gap is a hard error and a successfully-built static map is ALWAYS fully assigned.
+        for slot in 0..CLUSTER_SLOTS {
+            if owner[slot as usize].load(Ordering::Relaxed) == UNASSIGNED {
+                return Err(SlotMapError::Gap(slot));
             }
         }
 
@@ -210,15 +319,49 @@ impl SlotMap {
             .position(|e| e.id.as_ref() == self_id)
             .ok_or_else(|| SlotMapError::SelfNotPresent(self_id.to_owned()))?;
 
+        let config_epochs = vec![0u64; entries.len()];
         Ok(SlotMap {
-            nodes: entries,
+            table: Mutex::new(NodeTable {
+                nodes: entries,
+                config_epochs,
+            }),
             owner,
-            self_idx,
-            fully_assigned: true,
+            self_idx: AtomicU16::new(self_idx as u16),
+            my_epoch: AtomicU64::new(0),
+            current_epoch: AtomicU64::new(0),
         })
     }
 
-    /// Whether THIS node owns `slot` (the hot path). O(1) dense-array index, no branch.
+    /// A fresh single-node map: THIS node alone, owning ZERO slots, epochs 0. The boot state of
+    /// a cluster-enabled node with no static topology (slice 3). The operator drives it to a
+    /// full cluster with `CLUSTER MEET` / `ADDSLOTS` / ... (matching a fresh real-Redis node,
+    /// which owns no slots until `CLUSTER ADDSLOTS`).
+    ///
+    /// `id` is this node's 40-hex node id; `host`/`port` its advertised endpoint. The id is NOT
+    /// re-validated here (the boot path supplies the same id `ServerInfo` reports); a malformed
+    /// id simply yields a node whose `CLUSTER MYID` is that id.
+    #[must_use]
+    pub fn empty_self(id: &str, host: &str, port: u16) -> SlotMap {
+        SlotMap {
+            table: Mutex::new(NodeTable {
+                nodes: vec![NodeEntry {
+                    id: id.into(),
+                    host: host.into(),
+                    port,
+                }],
+                config_epochs: vec![0u64],
+            }),
+            owner: new_owner_array(UNASSIGNED),
+            self_idx: AtomicU16::new(0),
+            my_epoch: AtomicU64::new(0),
+            current_epoch: AtomicU64::new(0),
+        }
+    }
+
+    // ----- HOT PATH (lock-free) -----
+
+    /// Whether THIS node owns `slot` (the hot path). A single lock-free `Acquire` load + compare,
+    /// allocation-free, NEVER takes the node lock.
     ///
     /// # Panics
     ///
@@ -226,78 +369,106 @@ impl SlotMap {
     /// returns a slot in range). Indexing the fixed-size array bounds-checks this.
     #[must_use]
     pub fn owns(&self, slot: u16) -> bool {
-        self.owner[slot as usize] == self.self_idx as u16
+        self.owner[slot as usize].load(Ordering::Acquire) == self.self_idx.load(Ordering::Acquire)
     }
 
-    /// The node that owns `slot`, or `None` if the slot is unassigned (only possible on a
-    /// partial map, which slice-2 validation rejects at boot). O(1).
+    // ----- COLD PATH (node-lock-taking accessors; owned clones) -----
+
+    /// The advertised `(host, port)` of the node that owns `slot`, or `None` if the slot is
+    /// unassigned. Computed under the node lock (cold MOVED path). Returns an OWNED `(String,
+    /// u16)` so the caller holds no borrow into the locked table.
     #[must_use]
-    pub fn owner(&self, slot: u16) -> Option<&NodeEntry> {
-        let idx = self.owner[slot as usize];
+    pub fn moved_target(&self, slot: u16) -> Option<(String, u16)> {
+        let idx = self.owner[slot as usize].load(Ordering::Acquire);
         if idx == UNASSIGNED {
-            None
-        } else {
-            self.nodes.get(idx as usize)
+            return None;
         }
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        table
+            .nodes
+            .get(idx as usize)
+            .map(|n| (n.host.to_string(), n.port))
     }
 
-    /// THIS node's entry (id + advertised endpoint).
+    /// THIS node's entry (id + advertised endpoint), cloned out from under the node lock.
     #[must_use]
-    pub fn me(&self) -> &NodeEntry {
-        &self.nodes[self.self_idx]
+    pub fn me(&self) -> NodeEntry {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = self.self_idx.load(Ordering::Acquire) as usize;
+        table.nodes[idx].clone()
     }
 
-    /// All nodes, in declaration (config) order, for the projection.
+    /// All nodes, in table order, cloned out from under the node lock (the projection).
     #[must_use]
-    pub fn nodes(&self) -> &[NodeEntry] {
-        &self.nodes
-    }
-
-    /// Whether every one of the 16384 slots has an owner (always `true` for a slice-2
-    /// validated map, since [`build`](Self::build) rejects a gap).
-    #[must_use]
-    pub fn is_fully_assigned(&self) -> bool {
-        self.fully_assigned
-    }
-
-    /// The total number of assigned slots (for `CLUSTER INFO cluster_slots_assigned`).
-    #[must_use]
-    pub fn slots_assigned(&self) -> u32 {
-        self.owner.iter().filter(|&&o| o != UNASSIGNED).count() as u32
+    pub fn nodes(&self) -> Vec<NodeEntry> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        table.nodes.clone()
     }
 
     /// The number of known nodes (for `CLUSTER INFO cluster_known_nodes`).
     #[must_use]
     pub fn known_nodes(&self) -> usize {
-        self.nodes.len()
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        table.nodes.len()
     }
 
-    /// The number of nodes serving at least one slot (Redis's `cluster_size`). Equals
-    /// [`known_nodes`](Self::known_nodes) for a complete map (every node owns >= 1 slot in a
-    /// valid slice-2 topology).
+    /// Whether every one of the 16384 slots has an owner (`CLUSTER INFO cluster_state:ok`).
+    #[must_use]
+    pub fn is_fully_assigned(&self) -> bool {
+        self.owner
+            .iter()
+            .all(|o| o.load(Ordering::Acquire) != UNASSIGNED)
+    }
+
+    /// The total number of assigned slots (for `CLUSTER INFO cluster_slots_assigned`).
+    #[must_use]
+    pub fn slots_assigned(&self) -> u32 {
+        self.owner
+            .iter()
+            .filter(|o| o.load(Ordering::Acquire) != UNASSIGNED)
+            .count() as u32
+    }
+
+    /// The number of nodes serving at least one slot (Redis's `cluster_size`). Computed under
+    /// the node lock so it is consistent with the node table.
     #[must_use]
     pub fn cluster_size(&self) -> usize {
-        // A node serves >= 1 slot iff its index appears in `owner`. Count distinct owners.
-        let mut seen = vec![false; self.nodes.len()];
-        for &o in self.owner.iter() {
-            if o != UNASSIGNED {
-                seen[o as usize] = true;
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let mut seen = vec![false; table.nodes.len()];
+        for o in self.owner.iter() {
+            let idx = o.load(Ordering::Acquire);
+            if idx != UNASSIGNED && (idx as usize) < seen.len() {
+                seen[idx as usize] = true;
             }
         }
         seen.iter().filter(|&&s| s).count()
     }
 
+    /// THIS node's config epoch (`CLUSTER INFO cluster_my_epoch`).
+    #[must_use]
+    pub fn my_epoch(&self) -> u64 {
+        self.my_epoch.load(Ordering::Acquire)
+    }
+
+    /// The highest config epoch this node has observed (`CLUSTER INFO cluster_current_epoch`).
+    #[must_use]
+    pub fn current_epoch(&self) -> u64 {
+        self.current_epoch.load(Ordering::Acquire)
+    }
+
     /// Coalesce contiguous runs of equal-owner slots into `(start, end, node_index)` ranges,
     /// ascending by slot. This is the shape `CLUSTER SLOTS / SHARDS / NODES` all need: a node
-    /// owning `0-100` and `101-200` (two config ranges) coalesces to one `0-200` range, and
-    /// a node owning two NON-contiguous spans yields two ranges. Unassigned slots (partial
-    /// map) are skipped, so a gap simply splits the surrounding ranges.
+    /// owning `0-100` and `101-200` coalesces to one `0-200`, and a node owning two
+    /// NON-contiguous spans yields two ranges. Unassigned slots are skipped, so a gap simply
+    /// splits the surrounding ranges. Reads the owner array atomically; the `node_index` indexes
+    /// the [`nodes`](Self::nodes) snapshot taken by the caller (the projection takes both in one
+    /// breath, and slice 3 mutates only from the single command path).
     #[must_use]
     pub fn ranges(&self) -> Vec<(u16, u16, usize)> {
         let mut out = Vec::new();
         let mut run_start: Option<(u16, u16)> = None; // (start_slot, owner_idx)
         for slot in 0..CLUSTER_SLOTS {
-            let o = self.owner[slot as usize];
+            let o = self.owner[slot as usize].load(Ordering::Acquire);
             match run_start {
                 Some((_, owner_idx)) if o == owner_idx => {
                     // The run continues; nothing to emit yet.
@@ -325,6 +496,196 @@ impl SlotMap {
             out.push((start, CLUSTER_SLOTS - 1, owner_idx as usize));
         }
         out
+    }
+
+    // ----- MUTATORS (slice 3; validate-the-whole-batch-first, then mutate; all-or-nothing) -----
+
+    /// `CLUSTER ADDSLOTS / ADDSLOTSRANGE`: claim each slot for THIS node. ALL of `slots` must be
+    /// UNASSIGNED and named at most once, else nothing is mutated and the first offending slot is
+    /// reported ([`SlotMutError::SlotBusy`] / [`SlotMutError::SlotDuplicate`]).
+    ///
+    /// # Errors
+    ///
+    /// [`SlotMutError::SlotBusy`] if a slot is already owned; [`SlotMutError::SlotDuplicate`] if
+    /// a slot is named twice in `slots`.
+    pub fn add_slots(&self, slots: &[u16]) -> Result<(), SlotMutError> {
+        // Validate the WHOLE batch first (all-or-nothing): each slot UNASSIGNED, no duplicate in
+        // the request. We hold the node lock for the duration so a concurrent mutator cannot
+        // interleave (slice 3 mutates from one command path, but this keeps the batch atomic).
+        let _guard = self.table.lock().expect("slot-map node lock poisoned");
+        let mut seen = vec![false; CLUSTER_SLOTS as usize];
+        for &slot in slots {
+            if seen[slot as usize] {
+                return Err(SlotMutError::SlotDuplicate(slot));
+            }
+            seen[slot as usize] = true;
+            if self.owner[slot as usize].load(Ordering::Acquire) != UNASSIGNED {
+                return Err(SlotMutError::SlotBusy(slot));
+            }
+        }
+        let me = self.self_idx.load(Ordering::Acquire);
+        for &slot in slots {
+            self.owner[slot as usize].store(me, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// `CLUSTER DELSLOTS / DELSLOTSRANGE`: release each slot (set it UNASSIGNED). ALL of `slots`
+    /// must currently be assigned and named at most once, else nothing is mutated and the first
+    /// offending slot is reported.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotMutError::SlotUnassigned`] if a slot has no owner; [`SlotMutError::SlotDuplicate`]
+    /// if a slot is named twice in `slots`.
+    pub fn del_slots(&self, slots: &[u16]) -> Result<(), SlotMutError> {
+        let _guard = self.table.lock().expect("slot-map node lock poisoned");
+        let mut seen = vec![false; CLUSTER_SLOTS as usize];
+        for &slot in slots {
+            if seen[slot as usize] {
+                return Err(SlotMutError::SlotDuplicate(slot));
+            }
+            seen[slot as usize] = true;
+            if self.owner[slot as usize].load(Ordering::Acquire) == UNASSIGNED {
+                return Err(SlotMutError::SlotUnassigned(slot));
+            }
+        }
+        for &slot in slots {
+            self.owner[slot as usize].store(UNASSIGNED, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// `CLUSTER SETSLOT <slot> NODE <node-id>`: flip `slot`'s owner to the named node (the
+    /// ownership-transfer form; MIGRATING / IMPORTING / STABLE are slice 4). The node id must be
+    /// known.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotMutError::UnknownNode`] if `node_id` is not in the node table.
+    pub fn set_slot_node(&self, slot: u16, node_id: &str) -> Result<(), SlotMutError> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = table
+            .nodes
+            .iter()
+            .position(|n| n.id.as_ref() == node_id)
+            .ok_or_else(|| SlotMutError::UnknownNode(node_id.to_owned()))?;
+        self.owner[slot as usize].store(idx as u16, Ordering::Release);
+        Ok(())
+    }
+
+    /// `CLUSTER FLUSHSLOTS`: release every slot THIS node owns (set them UNASSIGNED). Slots owned
+    /// by OTHER nodes are untouched. Always succeeds.
+    pub fn flush_slots(&self) {
+        let _guard = self.table.lock().expect("slot-map node lock poisoned");
+        let me = self.self_idx.load(Ordering::Acquire);
+        for o in self.owner.iter() {
+            if o.load(Ordering::Acquire) == me {
+                o.store(UNASSIGNED, Ordering::Release);
+            }
+        }
+    }
+
+    /// `CLUSTER MEET`: add `entry` to the node table. Appends if its id is new; a duplicate id is
+    /// idempotent (Ok, no-op), matching Redis (MEET to a known node is harmless). Slice 3 only
+    /// records the node locally; the actual handshake / gossip is slice 3b.
+    pub fn meet(&self, entry: NodeEntry) {
+        let mut table = self.table.lock().expect("slot-map node lock poisoned");
+        if table.nodes.iter().any(|n| n.id == entry.id) {
+            return; // idempotent: already known.
+        }
+        table.nodes.push(entry);
+        table.config_epochs.push(0);
+    }
+
+    /// `CLUSTER FORGET <node-id>`: remove the named node from the table and REINDEX the owner
+    /// array (every owner index `> removed` is decremented, and `self_idx` likewise if it was
+    /// `> removed`).
+    ///
+    /// # Errors
+    ///
+    /// [`SlotMutError::ForgetSelf`] if `node_id` is this node; [`SlotMutError::UnknownNode`] if it
+    /// is not in the table; [`SlotMutError::NodeOwnsSlots`] if it still owns at least one slot
+    /// (an IronCache safety guard, see the variant doc).
+    pub fn forget(&self, node_id: &str) -> Result<(), SlotMutError> {
+        let mut table = self.table.lock().expect("slot-map node lock poisoned");
+        let removed = table
+            .nodes
+            .iter()
+            .position(|n| n.id.as_ref() == node_id)
+            .ok_or_else(|| SlotMutError::UnknownNode(node_id.to_owned()))?;
+        let me = self.self_idx.load(Ordering::Acquire) as usize;
+        if removed == me {
+            return Err(SlotMutError::ForgetSelf);
+        }
+        // Guard: refuse to orphan slots (no gossip to re-home them in slice 3).
+        let removed_u16 = removed as u16;
+        if self
+            .owner
+            .iter()
+            .any(|o| o.load(Ordering::Acquire) == removed_u16)
+        {
+            return Err(SlotMutError::NodeOwnsSlots(node_id.to_owned()));
+        }
+        // Remove from the table, then reindex the owner array and self_idx: every index strictly
+        // above `removed` shifts down by one. UNASSIGNED (u16::MAX) is far above any real index,
+        // so it is never `> removed` in the meaningful sense; guard it explicitly anyway.
+        table.nodes.remove(removed);
+        table.config_epochs.remove(removed);
+        for o in self.owner.iter() {
+            let idx = o.load(Ordering::Acquire);
+            if idx != UNASSIGNED && idx > removed_u16 {
+                o.store(idx - 1, Ordering::Release);
+            }
+        }
+        if me > removed {
+            self.self_idx.store((me - 1) as u16, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// `CLUSTER SET-CONFIG-EPOCH <epoch>`: set THIS node's config epoch, allowed ONLY when the
+    /// node is totally fresh (it knows no other node AND its config epoch is still 0). Raises
+    /// `current_epoch` to `epoch` if higher. Mirrors Redis's cluster-creation rule.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotMutError::EpochKnowsOthers`] if the node knows other nodes;
+    /// [`SlotMutError::EpochAlreadySet`] if its config epoch is already non-zero.
+    pub fn set_config_epoch(&self, epoch: u64) -> Result<(), SlotMutError> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        if table.nodes.len() > 1 {
+            return Err(SlotMutError::EpochKnowsOthers);
+        }
+        if self.my_epoch.load(Ordering::Acquire) != 0 {
+            return Err(SlotMutError::EpochAlreadySet);
+        }
+        self.my_epoch.store(epoch, Ordering::Release);
+        if self.current_epoch.load(Ordering::Acquire) < epoch {
+            self.current_epoch.store(epoch, Ordering::Release);
+        }
+        // Reflect into this node's parallel config-epoch slot.
+        let me = self.self_idx.load(Ordering::Acquire) as usize;
+        let mut table = table;
+        if let Some(e) = table.config_epochs.get_mut(me) {
+            *e = epoch;
+        }
+        Ok(())
+    }
+
+    /// `CLUSTER BUMPEPOCH`: advance `current_epoch` by one and adopt it as THIS node's config
+    /// epoch. Returns the new epoch. Always succeeds.
+    pub fn bump_epoch(&self) -> u64 {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let next = self.current_epoch.load(Ordering::Acquire) + 1;
+        self.current_epoch.store(next, Ordering::Release);
+        self.my_epoch.store(next, Ordering::Release);
+        let me = self.self_idx.load(Ordering::Acquire) as usize;
+        let mut table = table;
+        if let Some(e) = table.config_epochs.get_mut(me) {
+            *e = next;
+        }
+        next
     }
 }
 
@@ -358,16 +719,17 @@ mod tests {
         .expect("a full 3-way split is valid")
     }
 
+    // ----- slice-2 behaviour (preserved byte-for-byte) -----
+
     #[test]
     fn owns_and_owner_are_consistent_across_all_slots() {
         let map = three_node();
         let me = map.me().id.clone();
         for slot in 0..CLUSTER_SLOTS {
-            let owner = map.owner(slot).expect("full map has no gap");
-            // owns(slot) iff the owner is me.
+            let owner = map.owner_id(slot).expect("full map has no gap");
             assert_eq!(
                 map.owns(slot),
-                owner.id == me,
+                owner == me,
                 "owns/owner disagree at slot {slot}"
             );
         }
@@ -381,7 +743,6 @@ mod tests {
 
     #[test]
     fn ranges_coalesce_contiguous_and_are_sorted() {
-        // Two config ranges for one node that ABUT (0-100, 101-200) coalesce to one 0-200.
         let map = SlotMap::build(
             vec![
                 (node(ID0, "h0", 1), vec![[0, 100], [101, 200]]),
@@ -390,9 +751,8 @@ mod tests {
             ID0,
         )
         .unwrap();
-        let ranges = map.ranges();
         assert_eq!(
-            ranges,
+            map.ranges(),
             vec![(0, 200, 0), (201, 16383, 1)],
             "abutting same-owner ranges coalesce; ascending"
         );
@@ -400,7 +760,6 @@ mod tests {
 
     #[test]
     fn ranges_split_on_owner_change_and_noncontiguous() {
-        // ID0 owns 0-10 AND 21-30 (non-contiguous); ID1 owns 11-20 and 31-16383.
         let map = SlotMap::build(
             vec![
                 (node(ID0, "h0", 1), vec![[0, 10], [21, 30]]),
@@ -409,10 +768,8 @@ mod tests {
             ID0,
         )
         .unwrap();
-        let ranges = map.ranges();
-        // Ascending, split at every owner boundary; ID0's two spans stay separate.
         assert_eq!(
-            ranges,
+            map.ranges(),
             vec![(0, 10, 0), (11, 20, 1), (21, 30, 0), (31, 16383, 1),]
         );
     }
@@ -436,18 +793,15 @@ mod tests {
 
     #[test]
     fn reject_bad_node_id() {
-        // Too short.
         assert!(matches!(
             SlotMap::build(vec![(node("abc", "h", 1), vec![[0, 16383]])], "abc"),
             Err(SlotMapError::BadId(_))
         ));
-        // Uppercase hex is rejected (Redis ids are lowercase).
         let upper = "A000000000000000000000000000000000000000";
         assert!(matches!(
             SlotMap::build(vec![(node(upper, "h", 1), vec![[0, 16383]])], upper),
             Err(SlotMapError::BadId(_))
         ));
-        // Non-hex char.
         let nonhex = "g000000000000000000000000000000000000000";
         assert!(matches!(
             SlotMap::build(vec![(node(nonhex, "h", 1), vec![[0, 16383]])], nonhex),
@@ -470,12 +824,10 @@ mod tests {
 
     #[test]
     fn reject_bad_range() {
-        // start > end.
         assert_eq!(
             SlotMap::build(vec![(node(ID0, "h", 1), vec![[100, 50]])], ID0).unwrap_err(),
             SlotMapError::BadRange(100, 50)
         );
-        // end >= 16384.
         assert_eq!(
             SlotMap::build(vec![(node(ID0, "h", 1), vec![[0, 16384]])], ID0).unwrap_err(),
             SlotMapError::BadRange(0, 16384)
@@ -484,7 +836,6 @@ mod tests {
 
     #[test]
     fn reject_overlap() {
-        // ID0 owns 0-8191, ID1 owns 8000-16383: slot 8000 is the first overlap.
         let err = SlotMap::build(
             vec![
                 (node(ID0, "h0", 1), vec![[0, 8191]]),
@@ -501,7 +852,6 @@ mod tests {
 
     #[test]
     fn reject_gap() {
-        // ID0 owns 0-8190, ID1 owns 8192-16383: slot 8191 is unassigned.
         let err = SlotMap::build(
             vec![
                 (node(ID0, "h0", 1), vec![[0, 8190]]),
@@ -529,13 +879,250 @@ mod tests {
 
     #[test]
     fn single_node_owns_all_slots() {
-        // A one-node topology owning the whole space is valid (degenerate but legal).
         let map = SlotMap::build(vec![(node(ID0, "h", 1), vec![[0, 16383]])], ID0).unwrap();
         assert_eq!(map.ranges(), vec![(0, 16383, 0)]);
         assert_eq!(map.known_nodes(), 1);
         assert_eq!(map.cluster_size(), 1);
         for slot in 0..CLUSTER_SLOTS {
             assert!(map.owns(slot));
+        }
+    }
+
+    // ----- slice-3: empty_self + mutators -----
+
+    #[test]
+    fn empty_self_owns_zero_slots() {
+        let map = SlotMap::empty_self(ID0, "127.0.0.1", 7000);
+        assert_eq!(map.slots_assigned(), 0);
+        assert_eq!(map.known_nodes(), 1);
+        assert_eq!(map.cluster_size(), 0); // owns no slot -> serves no slot
+        assert!(!map.is_fully_assigned());
+        assert_eq!(map.me().id.as_ref(), ID0);
+        assert_eq!(map.my_epoch(), 0);
+        assert_eq!(map.current_epoch(), 0);
+        for slot in 0..CLUSTER_SLOTS {
+            assert!(!map.owns(slot));
+        }
+        assert!(map.ranges().is_empty());
+    }
+
+    #[test]
+    fn add_slots_claims_for_self_then_busy_with_no_partial_mutation() {
+        let map = SlotMap::empty_self(ID0, "h", 1);
+        map.add_slots(&[0, 1, 2, 3]).unwrap();
+        for s in 0..=3 {
+            assert!(map.owns(s));
+        }
+        assert_eq!(map.slots_assigned(), 4);
+        // A batch that includes an already-owned slot is rejected with the exact busy error,
+        // and NOTHING in the batch is applied (all-or-nothing).
+        let err = map.add_slots(&[5, 6, 2]).unwrap_err();
+        assert_eq!(err, SlotMutError::SlotBusy(2));
+        assert_eq!(err.to_string(), "Slot 2 is already busy");
+        assert!(!map.owns(5), "no partial mutation on a rejected batch");
+        assert!(!map.owns(6), "no partial mutation on a rejected batch");
+        assert_eq!(map.slots_assigned(), 4);
+    }
+
+    #[test]
+    fn add_slots_rejects_duplicate_in_batch() {
+        let map = SlotMap::empty_self(ID0, "h", 1);
+        let err = map.add_slots(&[7, 8, 7]).unwrap_err();
+        assert_eq!(err, SlotMutError::SlotDuplicate(7));
+        assert_eq!(err.to_string(), "Slot 7 specified multiple times");
+        assert_eq!(map.slots_assigned(), 0, "no partial mutation");
+    }
+
+    #[test]
+    fn del_slots_unassigns_self_and_rejects_unassigned_or_duplicate() {
+        let map = SlotMap::empty_self(ID0, "h", 1);
+        map.add_slots(&[10, 11, 12]).unwrap();
+        map.del_slots(&[10, 11]).unwrap();
+        assert!(!map.owns(10));
+        assert!(!map.owns(11));
+        assert!(map.owns(12));
+        // Deleting an unassigned slot is the exact error, all-or-nothing.
+        let err = map.del_slots(&[12, 99]).unwrap_err();
+        assert_eq!(err, SlotMutError::SlotUnassigned(99));
+        assert_eq!(err.to_string(), "Slot 99 is already unassigned");
+        assert!(map.owns(12), "no partial mutation: 12 stays owned");
+        // A duplicate in a DEL batch is rejected too.
+        let dup = map.del_slots(&[12, 12]).unwrap_err();
+        assert_eq!(dup, SlotMutError::SlotDuplicate(12));
+    }
+
+    #[test]
+    fn set_slot_node_flips_to_known_node_and_rejects_unknown() {
+        let map = SlotMap::empty_self(ID0, "h", 1);
+        map.add_slots(&[0]).unwrap();
+        map.meet(node(ID1, "h1", 2));
+        // Flip slot 0 to ID1: self no longer owns it, the owner_id is ID1.
+        map.set_slot_node(0, ID1).unwrap();
+        assert!(!map.owns(0));
+        assert_eq!(map.owner_id(0).unwrap().as_ref(), ID1);
+        // Unknown node id -> the exact error.
+        let err = map.set_slot_node(0, ID2).unwrap_err();
+        assert_eq!(err, SlotMutError::UnknownNode(ID2.to_owned()));
+        assert_eq!(err.to_string(), format!("Unknown node {ID2}"));
+    }
+
+    #[test]
+    fn flush_slots_releases_only_self_owned() {
+        let map = SlotMap::empty_self(ID0, "h", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.add_slots(&[0, 1, 2]).unwrap();
+        map.set_slot_node(2, ID1).unwrap(); // slot 2 now ID1's
+        map.flush_slots();
+        assert!(!map.owns(0));
+        assert!(!map.owns(1));
+        // ID1's slot 2 is untouched by self's FLUSHSLOTS.
+        assert_eq!(map.owner_id(2).unwrap().as_ref(), ID1);
+    }
+
+    #[test]
+    fn meet_appends_and_is_idempotent_on_duplicate_id() {
+        let map = SlotMap::empty_self(ID0, "h", 1);
+        assert_eq!(map.known_nodes(), 1);
+        map.meet(node(ID1, "h1", 2));
+        assert_eq!(map.known_nodes(), 2);
+        // A duplicate id is idempotent: no growth, no error.
+        map.meet(node(ID1, "different-host", 999));
+        assert_eq!(map.known_nodes(), 2, "duplicate MEET is a no-op");
+        let nodes = map.nodes();
+        // The original entry is preserved (the dup did not overwrite host/port).
+        let id1 = nodes.iter().find(|n| n.id.as_ref() == ID1).unwrap();
+        assert_eq!(id1.host.as_ref(), "h1");
+        assert_eq!(id1.port, 2);
+    }
+
+    #[test]
+    fn forget_removes_slotless_node_and_reindexes_owner() {
+        // 3-node empty-self map: self=ID0 (idx0), peers ID1 (idx1), ID2 (idx2).
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.meet(node(ID2, "h2", 3));
+        // Give ID2 a slot via SETSLOT (so after reindexing we can prove it still resolves).
+        map.add_slots(&[5]).unwrap(); // self owns slot 5
+        map.set_slot_node(5, ID2).unwrap(); // slot 5 -> ID2 (idx2)
+        assert_eq!(map.owner_id(5).unwrap().as_ref(), ID2);
+        // FORGET ID1 (idx1, owns no slots): ID2 shifts from idx2 to idx1, and slot 5 must STILL
+        // resolve to ID2 after the owner-array reindex.
+        map.forget(ID1).unwrap();
+        assert_eq!(map.known_nodes(), 2);
+        let nodes = map.nodes();
+        assert!(nodes.iter().all(|n| n.id.as_ref() != ID1));
+        assert_eq!(
+            map.owner_id(5).unwrap().as_ref(),
+            ID2,
+            "ID2's slot survives the reindex"
+        );
+    }
+
+    #[test]
+    fn forget_self_is_rejected() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        let err = map.forget(ID0).unwrap_err();
+        assert_eq!(err, SlotMutError::ForgetSelf);
+        assert_eq!(err.to_string(), "I tried hard but I can't forget myself...");
+    }
+
+    #[test]
+    fn forget_unknown_node_is_rejected() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        let err = map.forget(ID1).unwrap_err();
+        assert_eq!(err, SlotMutError::UnknownNode(ID1.to_owned()));
+        assert_eq!(err.to_string(), format!("Unknown node {ID1}"));
+    }
+
+    #[test]
+    fn forget_node_owning_slots_is_rejected() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.add_slots(&[0]).unwrap();
+        map.set_slot_node(0, ID1).unwrap(); // ID1 now owns slot 0
+        let err = map.forget(ID1).unwrap_err();
+        assert_eq!(err, SlotMutError::NodeOwnsSlots(ID1.to_owned()));
+    }
+
+    #[test]
+    fn set_config_epoch_only_when_alone_and_unset() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.set_config_epoch(7).unwrap();
+        assert_eq!(map.my_epoch(), 7);
+        assert_eq!(map.current_epoch(), 7);
+        // Already non-zero -> rejected.
+        let err = map.set_config_epoch(8).unwrap_err();
+        assert_eq!(err, SlotMutError::EpochAlreadySet);
+        assert_eq!(err.to_string(), "Node config epoch is already non-zero");
+        assert_eq!(map.my_epoch(), 7, "unchanged after rejection");
+
+        // Fresh map that knows another node -> rejected with the other error.
+        let map2 = SlotMap::empty_self(ID0, "h0", 1);
+        map2.meet(node(ID1, "h1", 2));
+        let err2 = map2.set_config_epoch(1).unwrap_err();
+        assert_eq!(err2, SlotMutError::EpochKnowsOthers);
+        assert_eq!(
+            err2.to_string(),
+            "The user can assign a config epoch only when the node does not know any other node."
+        );
+        assert_eq!(map2.my_epoch(), 0, "unchanged after rejection");
+    }
+
+    #[test]
+    fn bump_epoch_advances_current_and_my() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        assert_eq!(map.bump_epoch(), 1);
+        assert_eq!(map.current_epoch(), 1);
+        assert_eq!(map.my_epoch(), 1);
+        assert_eq!(map.bump_epoch(), 2);
+        assert_eq!(map.current_epoch(), 2);
+        assert_eq!(map.my_epoch(), 2);
+    }
+
+    #[test]
+    fn owns_and_ranges_consistent_after_a_mutation_sequence() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.add_slots(&[0, 1, 2, 3, 4]).unwrap();
+        map.del_slots(&[2]).unwrap();
+        // Now self owns 0,1,3,4 (slot 2 is a gap). ranges() must split around the gap.
+        assert_eq!(map.ranges(), vec![(0, 1, 0), (3, 4, 0)]);
+        for s in [0, 1, 3, 4] {
+            assert!(map.owns(s));
+        }
+        assert!(!map.owns(2));
+        assert_eq!(map.slots_assigned(), 4);
+    }
+
+    #[test]
+    fn determinism_same_sequence_yields_identical_ranges() {
+        let drive = || {
+            let m = SlotMap::empty_self(ID0, "h0", 1);
+            m.meet(node(ID1, "h1", 2));
+            m.add_slots(&[0, 1, 2, 3, 4, 5]).unwrap();
+            m.set_slot_node(3, ID1).unwrap();
+            m.del_slots(&[5]).unwrap();
+            m.ranges()
+        };
+        assert_eq!(
+            drive(),
+            drive(),
+            "the same mutation sequence is deterministic"
+        );
+    }
+
+    // ----- test-only helper: an owned owner id for a slot (mirrors the removed `owner()` ref) -----
+
+    impl SlotMap {
+        /// The id of the node owning `slot`, or `None` if unassigned. Test-only convenience that
+        /// reads the owner index then the (locked) node table.
+        fn owner_id(&self, slot: u16) -> Option<Box<str>> {
+            let idx = self.owner[slot as usize].load(Ordering::Acquire);
+            if idx == UNASSIGNED {
+                return None;
+            }
+            let table = self.table.lock().expect("slot-map node lock poisoned");
+            table.nodes.get(idx as usize).map(|n| n.id.clone())
         }
     }
 }
