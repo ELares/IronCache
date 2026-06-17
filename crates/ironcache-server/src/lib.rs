@@ -80,6 +80,15 @@ pub use route::{
 // `+OK` / `-CLUSTERDOWN`.
 pub use ironcache_raft_net::{ProposeOutcome, RaftHandle};
 
+// Re-export the replication STATUS types (HA-7e) carried by `ServerContext::repl_status`, so the
+// serve layer (and the binary's repl tasks that publish to it) can name them via
+// `ironcache_server::{ReplNodeStatus, ...}` without each taking its own repl dependency edge. The
+// INFO `# Replication` section + CLUSTER SHARDS render from a `ReplStatusSnapshot`; HA-8 consumes
+// `replica_is_in_sync` / `ReplNodeStatus::is_in_sync` as the promotion gate.
+pub use ironcache_repl::{
+    LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag, replica_is_in_sync,
+};
+
 // Re-export the observe types the binary supplies to dispatch (the INFO memory
 // snapshot it reads once at the binary edge, and the per-command counter deltas the
 // serve loop folds into the shard counters after dispatch returns).

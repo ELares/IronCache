@@ -54,6 +54,7 @@ fn ctx(runtime: Arc<RuntimeConfig>, boot: Config) -> ServerContext {
         },
         cluster: None,
         raft: None,
+        repl_status: None,
         boot,
     }
 }

@@ -73,6 +73,11 @@ pub use fullsync::{FullSyncError, drive_full_sync, receive_full_sync};
 pub mod observer;
 pub use observer::{ReplObserver, ReplRing, StreamOp};
 
+pub mod lag;
+pub use lag::{
+    LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag, lag, replica_is_in_sync,
+};
+
 pub mod stream;
 pub use stream::{ApplyOutcome, ReplicaApplier, ShipOutcome, drain_and_ship};
 

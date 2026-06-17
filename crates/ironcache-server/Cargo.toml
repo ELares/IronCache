@@ -28,6 +28,14 @@ ironcache-cluster = { workspace = true }
 # this crate does NOT drive the engine. raft-net does not depend on ironcache-server, so the
 # edge is acyclic (and the layering test still forbids only the concrete store).
 ironcache-raft-net = { workspace = true }
+# The replication STATUS types (HA-7e): ServerContext carries an Optional node-level
+# `Arc<ReplNodeStatus>` so the INFO `# Replication` section and CLUSTER SHARDS render the
+# real role / offset / lag / link state the repl tasks publish. Only the PURE status + lag
+# types (ReplNodeStatus / ReplStatusSnapshot / ReplicaLag / replica_is_in_sync) are named
+# here; this crate does NOT drive the replication transport. ironcache-repl does not depend
+# on ironcache-server, so the edge is acyclic; and the status types expose no concrete store
+# (the layering contract still forbids only a DIRECT ironcache-store edge, asserted below).
+ironcache-repl = { workspace = true }
 # The storage WAIST only (not ironcache-store): the command layer names the four
 # primitives + the hook types, never the concrete map. This dependency edge is the
 # compile-time proof of the layering contract (STORAGE_API.md).

@@ -62,6 +62,7 @@ fn ctx_cfg(port: u16, pass: Option<&str>, cluster_enabled: bool) -> ServerContex
         },
         cluster: None,
         raft: None,
+        repl_status: None,
         boot,
     }
 }

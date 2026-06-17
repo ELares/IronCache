@@ -673,34 +673,156 @@ fn cluster_shards(ctx: &ServerContext, req: &Request) -> Value {
     }
     match &ctx.cluster {
         Some(map) => {
-            // One shard map per node. Collect each node's coalesced ranges from `map.ranges()`,
-            // emit `{slots => [s0,e0, s1,e1, ...], nodes => [<master node map>]}`. Slice 2 has
-            // no replicas, so exactly one (master) node per shard.
+            // One shard map per slot-OWNING node. Collect each node's coalesced ranges from
+            // `map.ranges()`, emit `{slots => [s0,e0, s1,e1, ...], nodes => [<master>, <replica>*]}`.
+            // The master node entry reports its REAL replication-offset + health (HA-7e); each
+            // node that REPLICATES one of the shard's slots is appended as a `role => replica`
+            // entry. In static mode (no replicas assigned, no repl status cell) this reduces to
+            // exactly the slice-2/3 projection: one master per shard at offset 0, health online.
             let ranges = map.ranges();
             let nodes = map.nodes();
+            // THIS node's live replication status, used to fill the real offset/health/role for
+            // the self entry (a node has live repl state only for ITSELF; peers keep the
+            // projection default). `None` -> the byte-compatible master/0/online default. Self is
+            // identified by the MAP's own `me()` id (the authority on which table entry is this
+            // node), so the status is applied to the right entry even if the same physical node
+            // appears under more than one id.
+            let self_status = ctx.repl_status.as_ref().map(|s| s.snapshot());
+            let self_id = map.me().id;
             let shards = nodes
                 .iter()
                 .enumerate()
-                .map(|(idx, n)| {
-                    // The flat [start, end] integer pairs for THIS node, in slot order.
+                .filter_map(|(idx, n)| {
+                    // The flat [start, end] integer pairs for THIS owner node, in slot order.
                     let mut slots = Vec::new();
+                    let mut owned_slots: Vec<u16> = Vec::new();
                     for &(start, end, owner) in &ranges {
                         if owner == idx {
                             slots.push(Value::Integer(i64::from(start)));
                             slots.push(Value::Integer(i64::from(end)));
+                            owned_slots.push(start);
                         }
                     }
-                    let node = shard_node_map(&n.host, n.port, &n.id);
-                    Value::Map(vec![
+                    // A node that owns no slots is not a shard MASTER (it appears, if at all, as a
+                    // replica under the shard it mirrors); skip it here.
+                    if slots.is_empty() {
+                        return None;
+                    }
+                    // The master node entry: real status iff it is self, else the projection default.
+                    let mut shard_nodes = vec![shard_node_entry(
+                        n,
+                        ShardRole::Master,
+                        node_status_for(n, &self_id, self_status.as_ref()),
+                    )];
+                    // Append each node that REPLICATES one of this shard's slots (HA-7d). The MVP
+                    // single-replica-per-slot means at most one replica per slot; dedup so a node
+                    // replicating several of the shard's slots appears once.
+                    let mut seen_replicas: Vec<usize> = Vec::new();
+                    let rep_slot = owned_slots.first().copied();
+                    if let Some(slot) = rep_slot {
+                        for rep_idx in map.replicas_of(slot) {
+                            let rep_idx = rep_idx as usize;
+                            if seen_replicas.contains(&rep_idx) {
+                                continue;
+                            }
+                            seen_replicas.push(rep_idx);
+                            if let Some(rep) = nodes.get(rep_idx) {
+                                shard_nodes.push(shard_node_entry(
+                                    rep,
+                                    ShardRole::Replica,
+                                    node_status_for(rep, &self_id, self_status.as_ref()),
+                                ));
+                            }
+                        }
+                    }
+                    Some(Value::Map(vec![
                         (Value::bulk_str("slots"), Value::Array(Some(slots))),
-                        (Value::bulk_str("nodes"), Value::Array(Some(vec![node]))),
-                    ])
+                        (Value::bulk_str("nodes"), Value::Array(Some(shard_nodes))),
+                    ]))
                 })
                 .collect();
             Value::Array(Some(shards))
         }
         None => cluster_shards_singlenode(ctx),
     }
+}
+
+/// The role a node plays WITHIN a CLUSTER SHARDS shard map (HA-7e): the shard's master, or one of
+/// its replicas. Distinct from the node's globally-observed [`ironcache_repl::ReplRole`]; here it
+/// is the structural position in the projection (the owner is the master, an assigned replica is a
+/// replica).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardRole {
+    Master,
+    Replica,
+}
+
+/// The REAL replication offset + health a node reports in CLUSTER SHARDS (HA-7e). For THIS node it
+/// comes from the live repl status; for a peer (no live data) it is the projection default
+/// (offset 0, online).
+#[derive(Debug, Clone, Copy)]
+struct NodeShardStatus {
+    /// The node's replication offset (CLUSTER SHARDS `replication-offset`).
+    offset: i64,
+    /// The node's health (`online` | `loading` | `fail`).
+    health: &'static str,
+}
+
+impl NodeShardStatus {
+    /// The projection DEFAULT for a node this server has no live repl data for (a peer, or any
+    /// node in static mode): offset 0, online. This is the byte-compatible slice-2/3 value.
+    fn default_online() -> Self {
+        NodeShardStatus {
+            offset: 0,
+            health: "online",
+        }
+    }
+}
+
+/// Resolve a node's CLUSTER SHARDS replication status (HA-7e): the node's REAL offset + health
+/// when it is THIS node (from the live repl snapshot), else the projection default (offset 0,
+/// online), since a node has live replication state only for itself.
+///
+/// For self as a MASTER: offset = its head, health online. For self as a REPLICA: offset = its
+/// applied offset; health is `online` while the master link is up, `loading` while it is down (it
+/// is re-syncing / catching up), matching Redis's `loading` health for a replica that is not
+/// caught up. (`fail` is reserved for a node believed down by the cluster, which the single-node
+/// repl status cannot determine alone; a master-believed-down judgment is HA-8 territory.)
+fn node_status_for(
+    node: &ironcache_cluster::NodeEntry,
+    self_id: &str,
+    self_status: Option<&ironcache_repl::ReplStatusSnapshot>,
+) -> NodeShardStatus {
+    // Only THIS node's entry gets real status; match by node id.
+    if node.id.as_ref() != self_id {
+        return NodeShardStatus::default_online();
+    }
+    let Some(snap) = self_status else {
+        return NodeShardStatus::default_online();
+    };
+    match snap.role {
+        ironcache_repl::ReplRole::Master => NodeShardStatus {
+            offset: offset_to_i64(snap.node_offset.0),
+            health: "online",
+        },
+        ironcache_repl::ReplRole::Replica => NodeShardStatus {
+            offset: offset_to_i64(snap.node_offset.0),
+            // A replica is `online` once its link is up + applying; `loading` while the link is
+            // down (re-dialing / re-syncing, not yet caught up).
+            health: if snap.master_link.is_up() {
+                "online"
+            } else {
+                "loading"
+            },
+        },
+    }
+}
+
+/// Clamp a `u64` replication offset to the `i64` the RESP Integer carries (saturating at
+/// `i64::MAX`, an offset never reached in practice). CLUSTER SHARDS `replication-offset` is a
+/// signed integer in the Redis reply.
+fn offset_to_i64(offset: u64) -> i64 {
+    i64::try_from(offset).unwrap_or(i64::MAX)
 }
 
 /// The slice-1 single-node `CLUSTER SHARDS`: one shard owning `[0, 16383]` served by self.
@@ -723,26 +845,62 @@ fn cluster_shards_singlenode(ctx: &ServerContext) -> Value {
     Value::Array(Some(vec![shard]))
 }
 
-/// A `CLUSTER SHARDS` node map: a master at `0` replication offset reporting `health: online`,
-/// exactly the fields (AND the field ORDER) Redis populates in `addNodeDetailsToShardReply`
-/// (no replicas in slice 2). The field order is byte-faithful to Redis: id, port, tls-port,
-/// ip, endpoint, role, replication-offset, health. `tls-port` is `0` (TLS is off in slice 2);
-/// the `ip` and `endpoint` are both the advertised host.
-fn shard_node_map(host: &str, port: u16, id: &str) -> Value {
+/// A `CLUSTER SHARDS` node map for a node ENTRY (HA-7e): the `role` (master | replica), the REAL
+/// `replication-offset`, and the `health` (online | loading | fail) supplied in `status`. The
+/// field set AND order are byte-faithful to Redis's `addNodeDetailsToShardReply`: id, port,
+/// tls-port, ip, endpoint, role, replication-offset, health. `tls-port` is `0` (TLS off); `ip`
+/// and `endpoint` are both the advertised host.
+///
+/// A master with `status = NodeShardStatus::default_online()` renders EXACTLY the slice-2/3 bytes
+/// (role master, replication-offset 0, health online), so the static-mode projection is unchanged.
+fn shard_node_entry(
+    node: &ironcache_cluster::NodeEntry,
+    role: ShardRole,
+    status: NodeShardStatus,
+) -> Value {
+    let role_str = match role {
+        ShardRole::Master => "master",
+        ShardRole::Replica => "replica",
+    };
     Value::Map(vec![
-        (Value::bulk_str("id"), Value::bulk(id.as_bytes().to_vec())),
-        (Value::bulk_str("port"), Value::Integer(i64::from(port))),
-        // tls-port: 0 (TLS off in slice 2). Real Redis emits this right after `port`.
+        (
+            Value::bulk_str("id"),
+            Value::bulk(node.id.as_bytes().to_vec()),
+        ),
+        (
+            Value::bulk_str("port"),
+            Value::Integer(i64::from(node.port)),
+        ),
+        // tls-port: 0 (TLS off). Real Redis emits this right after `port`.
         (Value::bulk_str("tls-port"), Value::Integer(0)),
-        (Value::bulk_str("ip"), Value::bulk(host.as_bytes().to_vec())),
+        (
+            Value::bulk_str("ip"),
+            Value::bulk(node.host.as_bytes().to_vec()),
+        ),
         (
             Value::bulk_str("endpoint"),
-            Value::bulk(host.as_bytes().to_vec()),
+            Value::bulk(node.host.as_bytes().to_vec()),
         ),
-        (Value::bulk_str("role"), Value::bulk_str("master")),
-        (Value::bulk_str("replication-offset"), Value::Integer(0)),
-        (Value::bulk_str("health"), Value::bulk_str("online")),
+        (Value::bulk_str("role"), Value::bulk_str(role_str)),
+        (
+            Value::bulk_str("replication-offset"),
+            Value::Integer(status.offset),
+        ),
+        (Value::bulk_str("health"), Value::bulk_str(status.health)),
     ])
+}
+
+/// The single-node `CLUSTER SHARDS` node map: a master at `0` replication offset, `health:
+/// online`. Builds an owned [`NodeEntry`] from the `(host, port, id)` triple and delegates to
+/// [`shard_node_entry`] with the default-online status, so the single-node bytes match Redis (and
+/// the multi-node master-default path) exactly.
+fn shard_node_map(host: &str, port: u16, id: &str) -> Value {
+    let node = ironcache_cluster::NodeEntry {
+        id: id.into(),
+        host: host.into(),
+        port,
+    };
+    shard_node_entry(&node, ShardRole::Master, NodeShardStatus::default_online())
 }
 
 /// `CLUSTER NODES` -> a RESP3 verbatim string (txt) with ONE line for self, owning the full
@@ -969,6 +1127,7 @@ mod tests {
             // No raft handle: the cmd_cluster unit tests exercise the STATIC path only (the
             // raft-mode proposal interception lives in serve.rs, tested over real sockets).
             raft: None,
+            repl_status: None,
             boot,
         }
     }
@@ -1480,6 +1639,165 @@ mod tests {
         assert_eq!(field("ip"), Some(Value::bulk_str("10.0.0.11")));
         assert_eq!(field("role"), Some(Value::bulk_str("master")));
         assert_eq!(field("health"), Some(Value::bulk_str("online")));
+    }
+
+    /// A small helper to read a node map's field by name.
+    fn node_field(node: &Value, name: &str) -> Option<Value> {
+        let Value::Map(fields) = node else {
+            panic!("expected a node map, got {node:?}");
+        };
+        fields
+            .iter()
+            .find(|(k, _)| *k == Value::bulk_str(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// HA-7e: with a node-level repl status cell present and THIS node (ID1) advertising a real
+    /// MASTER head, its CLUSTER SHARDS node entry reports that REAL replication-offset (not the
+    /// hard-coded 0) + health online. The OTHER nodes (no live data) keep the offset-0 default.
+    #[test]
+    fn shards_reports_real_master_offset_for_self() {
+        let mut c = ctx_with_map(); // self == ID1, the middle shard
+        let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
+        status.set_master_head(ironcache_repl::ReplOffset(4242));
+        c.repl_status = Some(status);
+
+        let Value::Array(Some(shards)) = run(&c, &[b"CLUSTER", b"SHARDS"]) else {
+            panic!("expected an array");
+        };
+        // ID1 (self) reports the real offset 4242 + online; ID0/ID2 stay at the default 0.
+        let nodes_of = |shard: &Value| -> Vec<Value> {
+            let Value::Map(s) = shard else { panic!() };
+            let Value::Array(Some(ns)) = &s
+                .iter()
+                .find(|(k, _)| *k == Value::bulk_str("nodes"))
+                .unwrap()
+                .1
+            else {
+                panic!()
+            };
+            ns.clone()
+        };
+        let self_node = &nodes_of(&shards[1])[0];
+        assert_eq!(node_field(self_node, "id"), Some(Value::bulk_str(MAP_ID1)));
+        assert_eq!(
+            node_field(self_node, "role"),
+            Some(Value::bulk_str("master"))
+        );
+        assert_eq!(
+            node_field(self_node, "replication-offset"),
+            Some(Value::Integer(4242))
+        );
+        assert_eq!(
+            node_field(self_node, "health"),
+            Some(Value::bulk_str("online"))
+        );
+        // A PEER (ID0) keeps the offset-0 default (this node has no live data for it).
+        let peer = &nodes_of(&shards[0])[0];
+        assert_eq!(
+            node_field(peer, "replication-offset"),
+            Some(Value::Integer(0))
+        );
+    }
+
+    /// HA-7e: when THIS node (ID1) is a committed REPLICA of another node's slot AND its repl
+    /// status says role=replica, the replica appears as a `role => replica` node entry under the
+    /// owning master's shard, reporting its applied offset + health (online while the link is up,
+    /// loading while down). The master entry stays a master. This exercises the
+    /// raft-mode-with-a-replica projection (the static-mode byte shape is unchanged: no replicas
+    /// assigned -> one node per shard).
+    #[test]
+    fn shards_reports_replica_node_entry_with_offset_and_health() {
+        let c = ctx_with_map(); // self == ID1
+        // Commit "self (ID1) replicates a slot OWNED by ID0 (the 0-5460 shard)", exactly as the
+        // ConfigSm apply does. ID0 owns slot 0.
+        let map = c.cluster.as_ref().unwrap();
+        map.set_slot_replica(0, MAP_ID1).expect("known node");
+
+        // Publish this node's REPLICA status: attached to ID0's endpoint, link up, applied 77.
+        let mut c = c;
+        let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
+        status.set_replica_attached("10.0.0.10", 7000, ironcache_repl::ReplOffset(70));
+        status.set_observed_master_head(ironcache_repl::ReplOffset(80));
+        status.set_replica_applied(ironcache_repl::ReplOffset(77));
+        c.repl_status = Some(status);
+
+        let Value::Array(Some(shards)) = run(&c, &[b"CLUSTER", b"SHARDS"]) else {
+            panic!("expected an array");
+        };
+        // Find the shard owned by ID0 (slots [0, 5460]); it now has a master (ID0) + a replica
+        // (ID1, self).
+        let id0_shard = shards
+            .iter()
+            .find(|sh| {
+                let Value::Map(s) = sh else { return false };
+                let Value::Array(Some(ns)) = &s
+                    .iter()
+                    .find(|(k, _)| *k == Value::bulk_str("nodes"))
+                    .unwrap()
+                    .1
+                else {
+                    return false;
+                };
+                node_field(&ns[0], "id") == Some(Value::bulk_str(MAP_ID0))
+            })
+            .expect("ID0's shard");
+        let Value::Map(s) = id0_shard else { panic!() };
+        let Value::Array(Some(nodes)) = &s
+            .iter()
+            .find(|(k, _)| *k == Value::bulk_str("nodes"))
+            .unwrap()
+            .1
+        else {
+            panic!()
+        };
+        assert_eq!(nodes.len(), 2, "the master + its one replica");
+        // The master entry: ID0, role master.
+        assert_eq!(node_field(&nodes[0], "id"), Some(Value::bulk_str(MAP_ID0)));
+        assert_eq!(
+            node_field(&nodes[0], "role"),
+            Some(Value::bulk_str("master"))
+        );
+        // The replica entry: ID1 (self), role replica, applied offset 77, health online (link up).
+        let rep = &nodes[1];
+        assert_eq!(node_field(rep, "id"), Some(Value::bulk_str(MAP_ID1)));
+        assert_eq!(node_field(rep, "role"), Some(Value::bulk_str("replica")));
+        assert_eq!(
+            node_field(rep, "replication-offset"),
+            Some(Value::Integer(77))
+        );
+        assert_eq!(node_field(rep, "health"), Some(Value::bulk_str("online")));
+
+        // When the link drops, the replica reports `loading` (re-syncing, not caught up).
+        let mut c2 = c;
+        let status2 = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
+        status2.set_replica_attached("10.0.0.10", 7000, ironcache_repl::ReplOffset(70));
+        status2.set_replica_applied(ironcache_repl::ReplOffset(77));
+        status2.set_master_link_down();
+        c2.repl_status = Some(status2);
+        let Value::Array(Some(shards2)) = run(&c2, &[b"CLUSTER", b"SHARDS"]) else {
+            panic!();
+        };
+        let id0_shard2 = shards2
+            .iter()
+            .find_map(|sh| {
+                let Value::Map(s) = sh else { return None };
+                let Value::Array(Some(ns)) = &s
+                    .iter()
+                    .find(|(k, _)| *k == Value::bulk_str("nodes"))
+                    .unwrap()
+                    .1
+                else {
+                    return None;
+                };
+                (node_field(&ns[0], "id") == Some(Value::bulk_str(MAP_ID0))).then(|| ns.clone())
+            })
+            .expect("ID0's shard");
+        assert_eq!(
+            node_field(&id0_shard2[1], "health"),
+            Some(Value::bulk_str("loading")),
+            "a replica with a down link reports loading"
+        );
     }
 
     #[test]

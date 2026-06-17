@@ -224,6 +224,19 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
         None
     };
 
+    // The NODE-LEVEL replication status cell (HA-7e): one per node, shared by `Arc` onto every
+    // shard's context. `Some` ONLY in raft-governance mode (the same gate as `raft`), so the
+    // default static path carries `None` and INFO/CLUSTER SHARDS render the byte-compatible
+    // standalone posture. The repl tasks (installed only in raft-mode by `replica_attach`)
+    // publish role / offsets / link state here; the serve layer reads a snapshot for INFO /
+    // CLUSTER SHARDS, and HA-8's gate reads `is_in_sync`. It is cold node-level state (atomics,
+    // no hot-path lock), never touched per stored key.
+    let repl_status: Option<Arc<ironcache_server::ReplNodeStatus>> = if raft.is_some() {
+        Some(Arc::new(ironcache_server::ReplNodeStatus::new()))
+    } else {
+        None
+    };
+
     // Static, cheaply-cloned server context shared by value onto each shard. The
     // mutable cross-shard state is ONLY the runtime cell (an Arc); the rest is
     // immutable, so cloning per shard does not violate shared-nothing.
@@ -256,6 +269,10 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
         // `None` (the default static path). Cloned by value onto every shard's context; the
         // clone is the cheap `Send` inbox/status handle, not the `!Send` engine.
         raft: raft.clone(),
+        // The node-level replication status cell (HA-7e), `Some` only in raft-mode. Cloned by
+        // Arc onto every shard's context so any shard serving INFO / CLUSTER SHARDS reads the
+        // same cell the repl tasks publish to.
+        repl_status: repl_status.clone(),
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
