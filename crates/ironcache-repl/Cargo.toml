@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-repl"
+description = "Replication transport (HA-7a): the primary->replica link, the (replid, offset) cursor, and the wire frames, separate from the Raft cluster-bus so replication never blocks consensus."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The Runtime seam (accept/connect/recv/send/timer/spawn): every byte of socket
+# I/O and every heartbeat timer goes through this, never raw tokio, so the link
+# runs over the production tokio backend today and a simulated runtime later
+# (RUNTIME_ABSTRACTION.md, ADR-0002). The replication link is built ENTIRELY on
+# this seam, exactly as the Raft cluster-bus is, but on its OWN dedicated
+# listener/dialer + port so replication traffic never shares the consensus path.
+ironcache-runtime = { workspace = true }
+# The determinism seam (ADR-0003): the replica/primary transports read `now`
+# through SystemEnv's Clock to schedule heartbeats; the link state machine itself
+# is a pure step function over events and owns no clock.
+ironcache-env = { workspace = true }
+
+[dev-dependencies]
+# The DST harness (TESTING.md): the link state machine is exercised as a SimNode
+# pair under the virtual-time Network with partition/heal so the resume-from-acked
+# -offset behavior is verified deterministically before any real socket is touched.
+ironcache-sim = { workspace = true }
+# Async primitives + a current-thread runtime for the loopback integration test.
+tokio = { workspace = true, features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "sync",
+] }
