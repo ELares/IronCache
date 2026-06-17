@@ -51,6 +51,18 @@ pub enum ErrorCode {
     /// (`-NOTBUSY No scripts in execution right now.`). NOT `UNWATCH`/`DISCARD`:
     /// those reply with the plain `ERR` token, not `NOTBUSY`.
     NotBusy,
+    /// `-MOVED <slot> <ip:port>` cluster redirection: the slot is permanently owned by
+    /// another node (CLUSTER_CONTRACT.md #70, slice 2). The client updates its cached slot
+    /// map and retries at the advertised address. (ASK, the transient-move sibling, is slice
+    /// 5 and intentionally NOT added here.)
+    Moved,
+    /// `-CROSSSLOT ...` a multi-key command whose keys do not all hash to one slot, rejected
+    /// in cluster mode (CLUSTER_CONTRACT.md #70, slice 2) rather than scattered.
+    CrossSlot,
+    /// `-CLUSTERDOWN ...` a slot is unassigned / not served (the cluster is not fully
+    /// covered). Slice-2 validation requires a complete static map, so this is reachable only
+    /// on a (currently rejected) partial map; the constructor exists for completeness.
+    ClusterDown,
 }
 
 impl ErrorCode {
@@ -69,6 +81,9 @@ impl ErrorCode {
             ErrorCode::BusyKey => "BUSYKEY",
             ErrorCode::OutOfRange => "OUTOFRANGE",
             ErrorCode::NotBusy => "NOTBUSY",
+            ErrorCode::Moved => "MOVED",
+            ErrorCode::CrossSlot => "CROSSSLOT",
+            ErrorCode::ClusterDown => "CLUSTERDOWN",
         }
     }
 }
@@ -959,6 +974,47 @@ impl ErrorReply {
     pub fn cluster_disabled() -> Self {
         ErrorReply::new(ErrorCode::Err, "This instance has cluster support disabled")
     }
+
+    /// `-MOVED <slot> <ip:port>` - the permanent cluster redirection a node returns when a
+    /// keyed command's slot is owned by ANOTHER node (CLUSTER_CONTRACT.md #70, slice 2). The
+    /// client updates its cached slot map and retries at `<addr>`.
+    ///
+    /// Verified against redis/redis `src/cluster.c` (`clusterRedirectClient`,
+    /// `"-%s %d %s:%d"` with `"MOVED"`): the slot is rendered as a DECIMAL integer and the
+    /// address is the unbracketed `ip:port` (the caller formats `host:port`). No trailing
+    /// period. Clients pattern-match the `MOVED` token to drive their slot-cache refresh.
+    #[must_use]
+    pub fn moved(slot: u16, addr: &str) -> Self {
+        ErrorReply::new(ErrorCode::Moved, format!("{slot} {addr}"))
+    }
+
+    /// `-CROSSSLOT Keys in request don't hash to the same slot` - the reply a node returns
+    /// for a multi-key command whose keys do not all resolve to one slot, in cluster mode
+    /// (CLUSTER_CONTRACT.md #70, slice 2). Best-effort scatter is rejected because it violates
+    /// the client's atomicity expectation.
+    ///
+    /// Byte-exact to redis/redis `src/cluster.c` (`"-CROSSSLOT Keys in request don't hash to
+    /// the same slot"`): the contraction `don't`, and NO trailing period. Clients pattern-match
+    /// the `CROSSSLOT` token.
+    #[must_use]
+    pub fn crossslot() -> Self {
+        ErrorReply::new(
+            ErrorCode::CrossSlot,
+            "Keys in request don't hash to the same slot",
+        )
+    }
+
+    /// `-CLUSTERDOWN Hash slot not served` - the reply a node returns when the addressed slot
+    /// has no owner (the cluster is not fully covered). Slice-2 validation requires a COMPLETE
+    /// static map (a gap hard-fails boot), so this is reachable only on a partial map; the
+    /// constructor exists so the slot lookup has a faithful error to return if a gap is ever
+    /// permitted.
+    ///
+    /// Byte-exact to redis/redis `src/cluster.c` (`"-CLUSTERDOWN Hash slot not served"`).
+    #[must_use]
+    pub fn clusterdown_slot_unserved() -> Self {
+        ErrorReply::new(ErrorCode::ClusterDown, "Hash slot not served")
+    }
 }
 
 /// Truncate a `&str` to at most `max` bytes without splitting a UTF-8 char (so
@@ -1187,6 +1243,40 @@ mod tests {
             "-ERR This instance has cluster support disabled"
         );
         assert_eq!(ErrorReply::cluster_disabled().code(), ErrorCode::Err);
+    }
+
+    #[test]
+    fn moved_is_byte_exact() {
+        // Verified against redis/redis src/cluster.c (clusterRedirectClient, "-%s %d %s:%d"
+        // with "MOVED"): the slot is a DECIMAL integer, the address is the unbracketed
+        // ip:port, no trailing period. Clients pattern-match the MOVED token to refresh their
+        // slot cache and retry at the advertised address.
+        let e = ErrorReply::moved(866, "127.0.0.1:7001");
+        assert_eq!(e.line(), "-MOVED 866 127.0.0.1:7001");
+        assert_eq!(e.code(), ErrorCode::Moved);
+        assert_eq!(ErrorCode::Moved.token(), "MOVED");
+    }
+
+    #[test]
+    fn crossslot_is_byte_exact() {
+        // Verified against redis/redis src/cluster.c: "-CROSSSLOT Keys in request don't hash
+        // to the same slot". Note the contraction `don't` and NO trailing period.
+        let e = ErrorReply::crossslot();
+        assert_eq!(
+            e.line(),
+            "-CROSSSLOT Keys in request don't hash to the same slot"
+        );
+        assert_eq!(e.code(), ErrorCode::CrossSlot);
+        assert_eq!(ErrorCode::CrossSlot.token(), "CROSSSLOT");
+    }
+
+    #[test]
+    fn clusterdown_is_byte_exact() {
+        // Verified against redis/redis src/cluster.c: "-CLUSTERDOWN Hash slot not served".
+        let e = ErrorReply::clusterdown_slot_unserved();
+        assert_eq!(e.line(), "-CLUSTERDOWN Hash slot not served");
+        assert_eq!(e.code(), ErrorCode::ClusterDown);
+        assert_eq!(ErrorCode::ClusterDown.token(), "CLUSTERDOWN");
     }
 
     #[test]

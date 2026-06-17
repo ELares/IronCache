@@ -101,15 +101,28 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     // RuntimeConfig cell; INFO reads it from there (PR-4b). One small leak at boot.
     let policy_name: &'static str = Box::leak(config.maxmemory_policy.clone().into_boxed_str());
 
-    // The cluster node id (CLUSTER_CONTRACT.md #70): a stable 40-lowercase-hex id drawn
-    // ONCE here at boot from the binary's SystemEnv RNG (the sanctioned determinism seam,
-    // ADR-0003: no `rand` outside ironcache-env), then leaked to a 'static str exactly like
-    // `policy_name`. It is generated at the run_server level (NOT per shard) so it is
+    // The cluster node id (CLUSTER_CONTRACT.md #70), leaked to a 'static str at boot exactly
+    // like `policy_name`. It is resolved ONCE at the run_server level (NOT per shard) so it is
     // IDENTICAL across every shard, and shared by value via the cloned ServerContext.
-    // `CLUSTER MYID`/`CLUSTER NODES` report it; a real Redis assigns a 40-hex node id
-    // whether or not cluster mode is on, and so does IronCache. One small leak at boot.
+    // `CLUSTER MYID` / `CLUSTER NODES` report it. There are two sources, reconciled here:
+    //
+    //   * CLUSTER-MAP MODE (slice 2: `cluster_enabled` + a topology + an announce id): the id
+    //     IS the configured announce id, so it is STABLE across boots and matches the node's
+    //     entry in the static topology. `Config::validate` already proved the announce id is
+    //     40-hex AND present in the topology, so this is the node's permanent identity and the
+    //     MOVED target / `CLUSTER NODES` self line / `map.me().id` all agree on it.
+    //   * SLICE-1 / NON-CLUSTER / NO-MAP: keep the deterministic random id drawn from the
+    //     binary's SystemEnv RNG (the sanctioned determinism seam, ADR-0003: no `rand` outside
+    //     ironcache-env). A real Redis assigns a 40-hex id whether or not cluster mode is on,
+    //     and so does IronCache; this path and its determinism test are unchanged.
+    //
+    // One small leak at boot in either case.
     let mut boot_env = SystemEnv::new();
-    let cluster_node_id: &'static str = Box::leak(node_id_hex(boot_env.rng()).into_boxed_str());
+    let cluster_node_id: &'static str =
+        match (&config.cluster_topology, &config.cluster_announce_id) {
+            (Some(_), Some(id)) if config.cluster_enabled => Box::leak(id.clone().into_boxed_str()),
+            _ => Box::leak(node_id_hex(boot_env.rng()).into_boxed_str()),
+        };
 
     // The process-wide runtime-config overlay (PR-4b, the highest-precedence layer):
     // ONE Arc shared (cloned) into every shard's context, exactly like the shutdown
@@ -117,6 +130,35 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     // atomic loads (maxmemory/generation) with the string params behind a lock taken
     // only on CONFIG SET. Seeded from the boot-resolved config.
     let runtime = RuntimeConfig::from_config(config);
+
+    // The static cluster slot-ownership map (CLUSTER_CONTRACT.md #70, slice 2), built ONCE
+    // here at boot and threaded (Arc) into every shard's context. It is `Some` IFF cluster
+    // mode is enabled AND a topology is configured; otherwise `None` (a standalone node, OR a
+    // cluster-enabled node with no topology, which stays slice-1 single-node-owns-all). The
+    // build cannot fail here: `Config::validate` already ran `SlotMap::build` on the same
+    // (topology, announce-id) input and the process would have exited non-zero on any error,
+    // so `.expect("validated")` documents that invariant rather than re-handling the error.
+    let cluster: Option<Arc<ironcache_cluster::SlotMap>> = if config.cluster_enabled {
+        config.cluster_topology.as_ref().map(|topo| {
+            let nodes: Vec<(ironcache_cluster::NodeEntry, Vec<[u16; 2]>)> = topo
+                .nodes
+                .iter()
+                .map(|n| {
+                    (
+                        ironcache_cluster::NodeEntry {
+                            id: n.id.clone().into_boxed_str(),
+                            host: n.host.clone().into_boxed_str(),
+                            port: n.port,
+                        },
+                        n.slots.clone(),
+                    )
+                })
+                .collect();
+            Arc::new(ironcache_cluster::SlotMap::build(nodes, cluster_node_id).expect("validated"))
+        })
+    } else {
+        None
+    };
 
     // Static, cheaply-cloned server context shared by value onto each shard. The
     // mutable cross-shard state is ONLY the runtime cell (an Arc); the rest is
@@ -142,6 +184,9 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
             cluster_node_id,
             cluster_enabled: config.cluster_enabled,
         },
+        // The boot-resolved static slot map (None unless cluster mode + a topology). Shared
+        // by Arc-clone into every shard's context (immutable after boot; ADR-0002).
+        cluster: cluster.clone(),
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
@@ -738,6 +783,90 @@ fn subscriber_gate_blocks(
     true
 }
 
+/// The cluster slot-ownership decision for one command (CLUSTER_CONTRACT.md #70, slice 2):
+/// returns `Some(error)` when the command must be REDIRECTED (`-MOVED`) or REJECTED
+/// (`-CROSSSLOT`) because its key(s) are not served by THIS node, else `None` (proceed to the
+/// normal local / internal-shard routing). It is a PURE function of `(map, route, cmd, request)`
+/// and is the SINGLE source of the cluster redirect rule, reused by both the live command path
+/// ([`route_and_dispatch`]) and the MULTI queue-time hook ([`route_in_multi`]).
+///
+/// The rules (matching Redis `getNodeByQuery` in src/cluster.c):
+/// - KEYLESS / ADMIN commands carry no slot, so [`route::CommandClass::AlwaysHome`] and
+///   [`route::CommandClass::WholeKeyspace`] are NEVER redirected (`-> None`). Only `KeyedSingle`
+///   / `KeyedMulti` reach the slot logic.
+/// - The CLIENT-VISIBLE slot is [`ironcache_protocol::key_slot`] (CRC16/XMODEM + the hash-tag
+///   rule), NOT `route::hash64` (the internal FNV-1a shard hash): they answer different
+///   questions (which NODE owns the wire slot vs which of MY shards owns the key).
+/// - For a multi-key command, ALL keys must hash to ONE slot; if they SPAN slots the reply is
+///   `-CROSSSLOT` and this is checked BEFORE ownership (a cross-slot command is CROSSSLOT even
+///   when none of its slots is local, matching Redis), so cluster mode never scatters a
+///   cross-slot multi-key command.
+/// - A single resolved slot NOT owned by this node yields `-MOVED <slot> <owner host:port>`;
+///   an owned (or co-located + owned) slot yields `None` and falls through unchanged.
+///
+/// A malformed / short request that yields no key ([`route::KeySpec::None`]) returns `None`, so
+/// the home handler emits the proper wrong-arity error rather than a redirect.
+fn cluster_redirect(
+    map: &ironcache_cluster::SlotMap,
+    route: route::CommandClass,
+    cmd_upper: &[u8],
+    request: &Request,
+) -> Option<ironcache_protocol::ErrorReply> {
+    // (a) keyless / admin exemption: only KEYED data commands carry slots.
+    let spec = match route {
+        route::CommandClass::KeyedSingle => match route::single_key(request) {
+            Some(k) => route::KeySpec::One(k),
+            None => return None, // malformed/short: home handler emits the arity error.
+        },
+        route::CommandClass::KeyedMulti => route::command_keys(cmd_upper, request),
+        route::CommandClass::AlwaysHome | route::CommandClass::WholeKeyspace => return None,
+    };
+
+    // (b) reduce the key(s) to a slot via the CLIENT-VISIBLE key_slot (CRC16 + hash-tag).
+    match spec {
+        // No routable key (malformed / short): fall through, the handler errors properly.
+        route::KeySpec::None => None,
+        // Single key: MOVED if this node does not own its slot.
+        route::KeySpec::One(k) => moved_if_unowned(map, ironcache_protocol::key_slot(k)),
+        route::KeySpec::Many(keys) => {
+            let mut iter = keys.iter();
+            // An empty Many cannot occur (extract collapses 0 -> None), but treat it as
+            // "no key" defensively (`?` returns None) rather than indexing.
+            let first = iter.next()?;
+            let first_slot = ironcache_protocol::key_slot(first);
+            // (c) CROSSSLOT (keys span slots) takes precedence over MOVED, regardless of
+            // ownership: a cross-slot multi-key command is rejected, never scattered.
+            for k in iter {
+                if ironcache_protocol::key_slot(k) != first_slot {
+                    return Some(ironcache_protocol::ErrorReply::crossslot());
+                }
+            }
+            // (d) all keys co-locate on one slot: MOVED if this node does not own it.
+            moved_if_unowned(map, first_slot)
+        }
+    }
+}
+
+/// `Some(-MOVED <slot> <owner host:port>)` when THIS node does not own `slot`, else `None`.
+///
+/// The redirect target is the OWNER node's advertised `host:port` (what the client should dial),
+/// never the bind address. A slice-2 validated map is fully assigned, so the owner is always
+/// present; the `?` on the partial-map gap is defensive (it would only fire on a future partial
+/// map, which validation currently rejects at boot).
+fn moved_if_unowned(
+    map: &ironcache_cluster::SlotMap,
+    slot: u16,
+) -> Option<ironcache_protocol::ErrorReply> {
+    if map.owns(slot) {
+        return None;
+    }
+    let owner = map.owner(slot)?;
+    Some(ironcache_protocol::ErrorReply::moved(
+        slot,
+        &format!("{}:{}", owner.host, owner.port),
+    ))
+}
+
 /// ROUTE + DISPATCH one decoded request (COORDINATOR.md #107, Stage 1), appending its
 /// encoded reply to `out` and returning whether the connection should close (QUIT). Split
 /// out of the serve loop so the connection loop stays small; the routing decision is:
@@ -963,6 +1092,25 @@ async fn route_and_dispatch(
         return false;
     }
 
+    // CLUSTER SLOT OWNERSHIP (CLUSTER_CONTRACT.md #70, slice 2). BEFORE any internal shard
+    // routing (the multikey / spanning / single-target fan-out below): in cluster-map mode a
+    // KEYED data command whose key(s) are not served by THIS node is REDIRECTED (`-MOVED`) or
+    // REJECTED (`-CROSSSLOT`). `ctx.cluster` is `Some` ONLY when cluster mode is enabled AND a
+    // topology is configured, so a standalone (or topology-less) node skips this entirely and
+    // is byte-identical to slice 1 (Redis parity: a non-cluster node never sends MOVED). Keyless
+    // / admin / whole-keyspace commands are exempt (`cluster_redirect` returns None for them).
+    // The in-MULTI path does NOT reach here (it returned to `route_in_multi` above); queued
+    // commands are checked at QUEUE time there, reusing this SAME predicate.
+    if let Some(map) = ctx.cluster.as_deref() {
+        if let Some(reply) = cluster_redirect(map, route, &cmd_upper, request) {
+            state_rc.borrow_mut().counters.on_command();
+            encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
+            // Short-circuit WITHOUT closing the connection (same as the WATCH guard above):
+            // the client keeps the connection and retries at the redirect target.
+            return false;
+        }
+    }
+
     // A SHARD-SPANNING KeyedMulti command (its keys land on >1 shard, so `owner_shard_set`
     // is None) that is one of the SIX fan-out-supported commands routes to the multi-key
     // SCATTER-GATHER (COORDINATOR.md #107, Stage 2a). Co-located KeyedMulti (Some(shard))
@@ -1173,6 +1321,23 @@ fn route_in_multi(
         route,
         route::CommandClass::KeyedSingle | route::CommandClass::KeyedMulti
     );
+    // CLUSTER QUEUE-TIME REDIRECT (CLUSTER_CONTRACT.md #70, slice 2). A queued data command
+    // whose key(s) are not served by THIS node must honor cluster routing too, or a
+    // `MULTI; SET foreign-key v; EXEC` would silently execute a non-owned write. Redis replies
+    // the MOVED / CROSSSLOT error at QUEUE time AND dirties the transaction (so `EXEC` returns
+    // `-EXECABORT` and applies nothing). We run the SAME `cluster_redirect` predicate as the
+    // live path (one source of truth, no second key extractor), and on a redirect reply the
+    // error for the queued command and mark the transaction dirty. This is checked BEFORE the
+    // intra-node `all_keys_home_owned` gate: cluster ownership (which NODE) is the outer
+    // question, internal-shard ownership (which of MY shards) the inner one.
+    if let Some(map) = ctx.cluster.as_deref() {
+        if let Some(reply) = cluster_redirect(map, route, cmd_upper, request) {
+            state_rc.borrow_mut().counters.on_command();
+            conn.dirty_exec = true;
+            encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
+            return false;
+        }
+    }
     // A KEYED DATA command whose keys are not ALL home-owned is rejected at queue time (Redis's
     // queue-time-error behavior): reply the cross-shard error NOW and dirty the transaction, so
     // EXEC returns -EXECABORT and applies nothing. Bump commands_processed like the other paths.
@@ -2176,5 +2341,175 @@ mod tests {
             node_id_hex(c.rng()),
             "a different seed should yield a different id"
         );
+    }
+
+    // ----- cluster_redirect / moved_if_unowned (CLUSTER_CONTRACT.md #70, slice 2) -----
+    //
+    // `cluster_redirect` is PURE over (map, route, cmd, request), so it is tested directly
+    // without a socket. The fixture is a TWO-node map: node A (self) owns the LOW half
+    // [0, 8191], node B owns the HIGH half [8192, 16383]. A key whose `key_slot` is in the
+    // high half is therefore foreign (-> MOVED), one in the low half is owned (-> None).
+
+    const RID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A two-node SlotMap with `self` = node A (low half), node B advertised on
+    /// `10.0.0.2:7002` (the MOVED target).
+    fn redirect_map() -> ironcache_cluster::SlotMap {
+        ironcache_cluster::SlotMap::build(
+            vec![
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: RID_A.into(),
+                        host: "10.0.0.1".into(),
+                        port: 7001,
+                    },
+                    vec![[0, 8191]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: RID_B.into(),
+                        host: "10.0.0.2".into(),
+                        port: 7002,
+                    },
+                    vec![[8192, 16383]],
+                ),
+            ],
+            RID_A,
+        )
+        .expect("a two-way split is valid")
+    }
+
+    fn rreq(parts: &[&[u8]]) -> Request {
+        Request {
+            args: parts
+                .iter()
+                .map(|p| bytes::Bytes::copy_from_slice(p))
+                .collect(),
+        }
+    }
+
+    /// Find a short key whose `key_slot` is in `[lo, hi]` (the slot space is dense).
+    fn key_in_slot_range(lo: u16, hi: u16) -> String {
+        for i in 0..100_000u32 {
+            let k = format!("k{i}");
+            let s = ironcache_protocol::key_slot(k.as_bytes());
+            if s >= lo && s <= hi {
+                return k;
+            }
+        }
+        panic!("no key in [{lo}, {hi}]");
+    }
+
+    #[test]
+    fn redirect_owned_single_key_proceeds() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191); // owned by self (node A)
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        assert_eq!(
+            cluster_redirect(&map, route, b"GET", &req),
+            None,
+            "an owned single-key command proceeds (no redirect)"
+        );
+    }
+
+    #[test]
+    fn redirect_foreign_single_key_is_moved() {
+        let map = redirect_map();
+        let key = key_in_slot_range(8192, 16383); // owned by node B
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        let reply = cluster_redirect(&map, route, b"GET", &req).expect("foreign key -> MOVED");
+        // The MOVED carries the CLIENT-VISIBLE slot and node B's ADVERTISED host:port.
+        assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
+    }
+
+    #[test]
+    fn redirect_cross_slot_multi_key_is_crossslot_regardless_of_ownership() {
+        let map = redirect_map();
+        // Two keys in DIFFERENT slots: CROSSSLOT, even though neither/both ownership matters.
+        let lo = key_in_slot_range(0, 8191);
+        let hi = key_in_slot_range(8192, 16383);
+        let req = rreq(&[b"MGET", lo.as_bytes(), hi.as_bytes()]);
+        let route = route::classify(b"MGET");
+        let reply = cluster_redirect(&map, route, b"MGET", &req).expect("cross-slot -> CROSSSLOT");
+        assert_eq!(
+            reply.line(),
+            "-CROSSSLOT Keys in request don't hash to the same slot"
+        );
+        // Cross-slot precedence holds even when BOTH keys are in the FOREIGN half (so the
+        // command would otherwise be MOVED): CROSSSLOT still wins.
+        let h1 = key_in_slot_range(8192, 16383);
+        // A second high-half key in a DIFFERENT slot than h1.
+        let h2 = (0..100_000u32)
+            .map(|i| format!("h{i}"))
+            .find(|k| {
+                let s = ironcache_protocol::key_slot(k.as_bytes());
+                s >= 8192 && s != ironcache_protocol::key_slot(h1.as_bytes())
+            })
+            .expect("a second distinct high-half slot");
+        let req2 = rreq(&[b"MGET", h1.as_bytes(), h2.as_bytes()]);
+        let reply2 = cluster_redirect(&map, route, b"MGET", &req2).expect("still CROSSSLOT");
+        assert_eq!(
+            reply2.line(),
+            "-CROSSSLOT Keys in request don't hash to the same slot",
+            "CROSSSLOT takes precedence over MOVED even when all keys are foreign"
+        );
+    }
+
+    #[test]
+    fn redirect_colocated_multi_key_owned_proceeds() {
+        let map = redirect_map();
+        // Hash-tagged keys co-locate on ONE slot; pick a tag whose slot is owned by self.
+        let tag = (0..100_000u32)
+            .map(|i| format!("t{i}"))
+            .find(|t| {
+                let s = ironcache_protocol::key_slot(format!("{{{t}}}a").as_bytes());
+                s <= 8191
+            })
+            .expect("a tag whose slot is owned by self");
+        let k1 = format!("{{{tag}}}a");
+        let k2 = format!("{{{tag}}}b");
+        assert_eq!(
+            ironcache_protocol::key_slot(k1.as_bytes()),
+            ironcache_protocol::key_slot(k2.as_bytes()),
+            "hash-tagged keys co-locate"
+        );
+        let req = rreq(&[b"MGET", k1.as_bytes(), k2.as_bytes()]);
+        let route = route::classify(b"MGET");
+        assert_eq!(
+            cluster_redirect(&map, route, b"MGET", &req),
+            None,
+            "co-located + owned multi-key proceeds"
+        );
+    }
+
+    #[test]
+    fn redirect_exempts_keyless_admin_and_whole_keyspace() {
+        let map = redirect_map();
+        // AlwaysHome (PING / CLUSTER / MULTI) and WholeKeyspace (KEYS / SCAN) never redirect,
+        // even though a foreign-slot key would otherwise be MOVED.
+        for cmd in [b"PING".as_slice(), b"CLUSTER", b"MULTI", b"KEYS", b"SCAN"] {
+            let req = rreq(&[cmd, b"*"]);
+            let route = route::classify(cmd);
+            assert_eq!(
+                cluster_redirect(&map, route, cmd, &req),
+                None,
+                "{} must be exempt from cluster redirect",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_malformed_keyed_command_falls_through() {
+        let map = redirect_map();
+        // A GET with NO key (arity-wrong) yields no slot: fall through so the handler emits
+        // the proper wrong-arity error rather than a redirect.
+        let req = rreq(&[b"GET"]);
+        let route = route::classify(b"GET");
+        assert_eq!(cluster_redirect(&map, route, b"GET", &req), None);
     }
 }

@@ -23,3 +23,8 @@ thiserror = { workspace = true }
 # (COORDINATOR.md #107, FIX 2). storage is the leaf waist (only `bytes`), so this is not
 # a dependency cycle and pulls in no extra third-party crates.
 ironcache-storage = { workspace = true }
+# The slot-map crate owns topology validation (gap/overlap/dup-id/self-present/bad-range),
+# so Config::validate delegates to it: ONE validator the router, projection, and config all
+# share (no second copy of the slot-assignment rules). It is a leaf (only ironcache-protocol),
+# so this is not a cycle: config -> cluster -> protocol (CLUSTER_CONTRACT.md #70, slice 2).
+ironcache-cluster = { workspace = true }

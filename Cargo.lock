@@ -333,6 +333,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "ironcache-cluster",
  "ironcache-config",
  "ironcache-env",
  "ironcache-eviction",
@@ -369,9 +370,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironcache-cluster"
+version = "0.0.0"
+dependencies = [
+ "ironcache-protocol",
+]
+
+[[package]]
 name = "ironcache-config"
 version = "0.0.0"
 dependencies = [
+ "ironcache-cluster",
  "ironcache-storage",
  "serde",
  "thiserror",
@@ -428,6 +437,7 @@ name = "ironcache-server"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "ironcache-cluster",
  "ironcache-config",
  "ironcache-env",
  "ironcache-eviction",

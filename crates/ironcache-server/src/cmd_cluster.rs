@@ -20,8 +20,17 @@
 //! * cluster-ENABLED (`cluster-enabled yes`): the introspection subcommands (KEYSLOT /
 //!   MYID / INFO / SLOTS / SHARDS / NODES / COUNTKEYSINSLOT / GETKEYSINSLOT / HELP) reply,
 //!   and the topology-mutation subcommands (MEET / ADDSLOTS / SETSLOT / ...) return the
-//!   single-node "not supported" error (slice 2 adds real topology). See [`cmd_cluster`]
-//!   for the deliberate slice-1 single-node auto-slots simplification.
+//!   single-node "not supported" error (runtime topology mutation is a later slice).
+//!
+//! ## Slice 2: map-driven multi-node projection
+//!
+//! When a STATIC topology is configured (`ctx.cluster.is_some()`), the introspection
+//! subcommands project the REAL multi-node map: SLOTS / SHARDS / NODES render every node's
+//! coalesced slot ranges (from `SlotMap::ranges()`), and INFO reports the map's
+//! `cluster_known_nodes` / `cluster_size` / `cluster_slots_assigned`. When NO topology is
+//! configured (`ctx.cluster.is_none()`, even if cluster mode is enabled), the slice-1
+//! single-node-owns-all bodies (the `*_singlenode` helpers) render exactly as before. A
+//! topology is opt-in, so every slice-1 test stays green via the fallback.
 //!
 //! The node id and the cluster-enabled flag come from [`ServerContext::info`] (the
 //! boot-stable [`ironcache_observe::ServerInfo`]).
@@ -79,7 +88,7 @@ pub fn cmd_cluster(ctx: &ServerContext, req: &Request) -> Value {
     match sub.as_slice() {
         b"KEYSLOT" => cluster_keyslot(req),
         b"MYID" => cluster_myid(ctx, req),
-        b"INFO" => cluster_info(req),
+        b"INFO" => cluster_info(ctx, req),
         b"SLOTS" => cluster_slots(ctx, req),
         b"SHARDS" => cluster_shards(ctx, req),
         b"NODES" => cluster_nodes(ctx, req),
@@ -118,11 +127,19 @@ fn cluster_keyslot(req: &Request) -> Value {
 }
 
 /// `CLUSTER MYID` -> the 40-hex node id (a bulk string). Arity exactly 2.
+///
+/// In cluster-map mode the id comes from the map (`map.me().id`), which equals
+/// `ctx.info.cluster_node_id` after the boot-time node-id reconciliation (the announce id);
+/// without a map it is `ctx.info.cluster_node_id` (the slice-1 random/boot id). Both agree, so
+/// this is belt-and-suspenders.
 fn cluster_myid(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("cluster|myid"));
     }
-    Value::bulk_str(ctx.info.cluster_node_id)
+    match &ctx.cluster {
+        Some(map) => Value::bulk(map.me().id.as_bytes().to_vec()),
+        None => Value::bulk_str(ctx.info.cluster_node_id),
+    }
 }
 
 /// `CLUSTER INFO` -> the cluster status as a RESP3 verbatim string (txt) with the exact
@@ -134,24 +151,38 @@ fn cluster_myid(ctx: &ServerContext, req: &Request) -> Value {
 /// Epochs and message counters are zero (no gossip yet). Redis replies CLUSTER INFO via
 /// `addReplyVerbatim(..., "txt")`, so this is a `VerbatimString` (it degrades to a bulk
 /// string under RESP2 automatically).
-fn cluster_info(req: &Request) -> Value {
+fn cluster_info(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("cluster|info"));
     }
-    let body = "cluster_enabled:1\r\n\
+    // Map-driven counts when a topology is configured; else the single-node-owns-all picture.
+    let (slots_assigned, known_nodes, cluster_size) = match &ctx.cluster {
+        Some(map) => (map.slots_assigned(), map.known_nodes(), map.cluster_size()),
+        None => (u32::from(CLUSTER_SLOTS), 1, 1),
+    };
+    verbatim_txt(cluster_info_body(slots_assigned, known_nodes, cluster_size).as_bytes())
+}
+
+/// Build the `CLUSTER INFO` `field:value` body (each line `\r\n`-terminated) from the slot
+/// counts, shared by the map-driven and single-node paths. `cluster_state` stays `ok` because
+/// a slice-2 map is always fully assigned (validation rejects a gap); epochs and message
+/// counters are zero (no gossip yet).
+fn cluster_info_body(slots_assigned: u32, known_nodes: usize, cluster_size: usize) -> String {
+    format!(
+        "cluster_enabled:1\r\n\
          cluster_state:ok\r\n\
-         cluster_slots_assigned:16384\r\n\
-         cluster_slots_ok:16384\r\n\
+         cluster_slots_assigned:{slots_assigned}\r\n\
+         cluster_slots_ok:{slots_assigned}\r\n\
          cluster_slots_pfail:0\r\n\
          cluster_slots_fail:0\r\n\
-         cluster_known_nodes:1\r\n\
-         cluster_size:1\r\n\
+         cluster_known_nodes:{known_nodes}\r\n\
+         cluster_size:{cluster_size}\r\n\
          cluster_current_epoch:0\r\n\
          cluster_my_epoch:0\r\n\
          cluster_stats_messages_sent:0\r\n\
          cluster_stats_messages_received:0\r\n\
-         total_cluster_links_buffer_limit_exceeded:0\r\n";
-    verbatim_txt(body.as_bytes())
+         total_cluster_links_buffer_limit_exceeded:0\r\n"
+    )
 }
 
 /// `CLUSTER SLOTS` -> an array with ONE slot range, `[0, 16383, [ip, port, node_id]]`,
@@ -165,19 +196,60 @@ fn cluster_slots(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("cluster|slots"));
     }
-    let ip = ctx.boot.bind.to_string();
-    let port = i64::from(ctx.info.tcp_port);
-    let node = Value::Array(Some(vec![
-        Value::bulk(ip.into_bytes()),
-        Value::Integer(port),
-        Value::bulk_str(ctx.info.cluster_node_id),
-    ]));
+    match &ctx.cluster {
+        Some(map) => {
+            // Project each coalesced (start, end, owner) range as [start, end, [host, port, id]].
+            let ranges = map
+                .ranges()
+                .into_iter()
+                .map(|(start, end, idx)| {
+                    let n = &map.nodes()[idx];
+                    let served = served_by_triple(&n.host, n.port, &n.id);
+                    Value::Array(Some(vec![
+                        Value::Integer(i64::from(start)),
+                        Value::Integer(i64::from(end)),
+                        served,
+                    ]))
+                })
+                .collect();
+            Value::Array(Some(ranges))
+        }
+        None => cluster_slots_singlenode(ctx),
+    }
+}
+
+/// The slice-1 single-node `CLUSTER SLOTS`: one `[0, 16383, [bind, port, node_id]]` range.
+fn cluster_slots_singlenode(ctx: &ServerContext) -> Value {
+    let served = served_by_triple_str(
+        &ctx.boot.bind.to_string(),
+        ctx.info.tcp_port,
+        ctx.info.cluster_node_id,
+    );
     let range = Value::Array(Some(vec![
         Value::Integer(0),
         Value::Integer(i64::from(CLUSTER_SLOTS) - 1),
-        node,
+        served,
     ]));
     Value::Array(Some(vec![range]))
+}
+
+/// A `CLUSTER SLOTS` served-by triple `[host, port, id]` from owned-byte node fields.
+fn served_by_triple(host: &str, port: u16, id: &str) -> Value {
+    Value::Array(Some(vec![
+        Value::bulk(host.as_bytes().to_vec()),
+        Value::Integer(i64::from(port)),
+        Value::bulk(id.as_bytes().to_vec()),
+    ]))
+}
+
+/// A `CLUSTER SLOTS` served-by triple `[host, port, id]` from `&str` fields (the single-node
+/// path, whose id is a `'static str`).
+fn served_by_triple_str(host: &str, port: u16, id: &str) -> Value {
+    Value::Array(Some(vec![
+        Value::bulk_str(host),
+        Value::Integer(i64::from(port)),
+        Value::bulk_str(id),
+    ]))
 }
 
 /// `CLUSTER SHARDS` -> an array with ONE shard owning the whole slot space (single-node
@@ -190,20 +262,45 @@ fn cluster_shards(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("cluster|shards"));
     }
-    let ip = ctx.boot.bind.to_string();
-    let port = i64::from(ctx.info.tcp_port);
-    let node = Value::Map(vec![
-        (
-            Value::bulk_str("id"),
-            Value::bulk_str(ctx.info.cluster_node_id),
-        ),
-        (Value::bulk_str("port"), Value::Integer(port)),
-        (Value::bulk_str("ip"), Value::bulk(ip.clone().into_bytes())),
-        (Value::bulk_str("endpoint"), Value::bulk(ip.into_bytes())),
-        (Value::bulk_str("role"), Value::bulk_str("master")),
-        (Value::bulk_str("replication-offset"), Value::Integer(0)),
-        (Value::bulk_str("health"), Value::bulk_str("online")),
-    ]);
+    match &ctx.cluster {
+        Some(map) => {
+            // One shard map per node. Collect each node's coalesced ranges from `map.ranges()`,
+            // emit `{slots => [s0,e0, s1,e1, ...], nodes => [<master node map>]}`. Slice 2 has
+            // no replicas, so exactly one (master) node per shard.
+            let ranges = map.ranges();
+            let shards = map
+                .nodes()
+                .iter()
+                .enumerate()
+                .map(|(idx, n)| {
+                    // The flat [start, end] integer pairs for THIS node, in slot order.
+                    let mut slots = Vec::new();
+                    for &(start, end, owner) in &ranges {
+                        if owner == idx {
+                            slots.push(Value::Integer(i64::from(start)));
+                            slots.push(Value::Integer(i64::from(end)));
+                        }
+                    }
+                    let node = shard_node_map(&n.host, n.port, &n.id);
+                    Value::Map(vec![
+                        (Value::bulk_str("slots"), Value::Array(Some(slots))),
+                        (Value::bulk_str("nodes"), Value::Array(Some(vec![node]))),
+                    ])
+                })
+                .collect();
+            Value::Array(Some(shards))
+        }
+        None => cluster_shards_singlenode(ctx),
+    }
+}
+
+/// The slice-1 single-node `CLUSTER SHARDS`: one shard owning `[0, 16383]` served by self.
+fn cluster_shards_singlenode(ctx: &ServerContext) -> Value {
+    let node = shard_node_map(
+        &ctx.boot.bind.to_string(),
+        ctx.info.tcp_port,
+        ctx.info.cluster_node_id,
+    );
     let shard = Value::Map(vec![
         (
             Value::bulk_str("slots"),
@@ -215,6 +312,24 @@ fn cluster_shards(ctx: &ServerContext, req: &Request) -> Value {
         (Value::bulk_str("nodes"), Value::Array(Some(vec![node]))),
     ]);
     Value::Array(Some(vec![shard]))
+}
+
+/// A `CLUSTER SHARDS` node map: a master at `0` replication offset reporting `health: online`,
+/// exactly the fields Redis populates in `clusterReplyShards` (no replicas in slice 2). The
+/// `ip` and `endpoint` are both the advertised host.
+fn shard_node_map(host: &str, port: u16, id: &str) -> Value {
+    Value::Map(vec![
+        (Value::bulk_str("id"), Value::bulk(id.as_bytes().to_vec())),
+        (Value::bulk_str("port"), Value::Integer(i64::from(port))),
+        (Value::bulk_str("ip"), Value::bulk(host.as_bytes().to_vec())),
+        (
+            Value::bulk_str("endpoint"),
+            Value::bulk(host.as_bytes().to_vec()),
+        ),
+        (Value::bulk_str("role"), Value::bulk_str("master")),
+        (Value::bulk_str("replication-offset"), Value::Integer(0)),
+        (Value::bulk_str("health"), Value::bulk_str("online")),
+    ])
 }
 
 /// `CLUSTER NODES` -> a RESP3 verbatim string (txt) with ONE line for self, owning the full
@@ -230,16 +345,61 @@ fn cluster_nodes(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("cluster|nodes"));
     }
-    let id = ctx.info.cluster_node_id;
-    let ip = ctx.boot.bind;
-    let port = ctx.info.tcp_port;
+    let Some(map) = &ctx.cluster else {
+        return cluster_nodes_singlenode(ctx);
+    };
+    // One gossip line per node, in declaration order; THIS node is flagged `myself,master`,
+    // the others `master`. Each node's served slot ranges (its coalesced runs from
+    // `map.ranges()`) are space-joined as the trailing field.
+    let ranges = map.ranges();
+    let self_id = &map.me().id;
+    let mut text = String::new();
+    for n in map.nodes() {
+        let flags = if &n.id == self_id {
+            "myself,master"
+        } else {
+            "master"
+        };
+        let owned: Vec<String> = ranges
+            .iter()
+            .filter(|&&(_, _, idx)| map.nodes()[idx].id == n.id)
+            .map(|&(start, end, _)| {
+                if start == end {
+                    start.to_string()
+                } else {
+                    format!("{start}-{end}")
+                }
+            })
+            .collect();
+        text.push_str(&node_line(&n.host, n.port, &n.id, flags, &owned.join(" ")));
+    }
+    verbatim_txt(text.as_bytes())
+}
+
+/// The slice-1 single-node `CLUSTER NODES` line: self owns the whole `0-16383` space, flagged
+/// `myself,master`, `connected`. Used when no static topology is configured.
+fn cluster_nodes_singlenode(ctx: &ServerContext) -> Value {
     let last_slot = CLUSTER_SLOTS - 1;
-    // The cluster bus port is the listen port + 10000 (Redis's fixed offset). The
-    // trailing `\n` (NOT `\r\n`) terminates each node line in the Redis NODES text format.
-    // The final `0-16383` field is the served slot range (single-node owns all slots).
-    let cport = u32::from(port) + 10_000;
-    let line = format!("{id} {ip}:{port}@{cport} myself,master - 0 0 0 connected 0-{last_slot}\n");
+    let line = node_line(
+        &ctx.boot.bind.to_string(),
+        ctx.info.tcp_port,
+        ctx.info.cluster_node_id,
+        "myself,master",
+        &format!("0-{last_slot}"),
+    );
     verbatim_txt(line.as_bytes())
+}
+
+/// Build one Redis `CLUSTER NODES` gossip text line:
+/// `<id> <host>:<port>@<cport> <flags> <master> 0 0 0 connected <ranges>\n`.
+///
+/// The cluster bus port is the listen port + 10000 (Redis's fixed offset). The `<master>`
+/// field is `-` (no replicas in slice 2). The trailing `\n` (NOT `\r\n`) terminates each line
+/// in the Redis NODES text format. `ranges` is the already-formatted served-slot field (e.g.
+/// `0-5460` or `0-100 200-300`).
+fn node_line(host: &str, port: u16, id: &str, flags: &str, ranges: &str) -> String {
+    let cport = u32::from(port) + 10_000;
+    format!("{id} {host}:{port}@{cport} {flags} - 0 0 0 connected {ranges}\n")
 }
 
 /// A RESP3 verbatim string with the `txt` format (degrades to a bulk string under RESP2).
@@ -375,6 +535,9 @@ mod tests {
                 cluster_node_id: TEST_NODE_ID,
                 cluster_enabled: boot.cluster_enabled,
             },
+            // No slot map: the single-node-owns-all fallback (slice-1 behavior). The
+            // projection tests below use `ctx_with_map` to supply a real multi-node map.
+            cluster: None,
             boot,
         }
     }
@@ -401,6 +564,51 @@ mod tests {
             cluster_enabled: true,
             ..Config::default()
         })
+    }
+
+    const MAP_ID0: &str = "0000000000000000000000000000000000000000";
+    const MAP_ID1: &str = "1111111111111111111111111111111111111111";
+    const MAP_ID2: &str = "2222222222222222222222222222222222222222";
+
+    /// A cluster-ENABLED ctx carrying a real 3-node slot map (ID0=0-5460, ID1=5461-10922,
+    /// ID2=10923-16383), with `self` = ID1. Used by the multi-node projection tests.
+    fn ctx_with_map() -> ServerContext {
+        let map = ironcache_cluster::SlotMap::build(
+            vec![
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: MAP_ID0.into(),
+                        host: "10.0.0.10".into(),
+                        port: 7000,
+                    },
+                    vec![[0, 5460]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: MAP_ID1.into(),
+                        host: "10.0.0.11".into(),
+                        port: 7001,
+                    },
+                    vec![[5461, 10922]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: MAP_ID2.into(),
+                        host: "10.0.0.12".into(),
+                        port: 7002,
+                    },
+                    vec![[10923, 16383]],
+                ),
+            ],
+            MAP_ID1,
+        )
+        .expect("a full 3-way split is valid");
+        let mut ctx = ctx_with(Config {
+            cluster_enabled: true,
+            ..Config::default()
+        });
+        ctx.cluster = Some(std::sync::Arc::new(map));
+        ctx
     }
 
     /// The textual payload of a CLUSTER INFO / NODES reply. These are RESP3 verbatim
@@ -756,5 +964,129 @@ mod tests {
             Value::Error(e) => assert!(e.line().contains("unknown subcommand"), "got {}", e.line()),
             other => panic!("expected unknown subcommand, got {other:?}"),
         }
+    }
+
+    // ----- MAP-DRIVEN multi-node projection (slice 2) -----
+
+    #[test]
+    fn map_slots_reflects_three_ranges() {
+        let c = ctx_with_map();
+        let Value::Array(Some(ranges)) = run(&c, &[b"CLUSTER", b"SLOTS"]) else {
+            panic!("expected an array");
+        };
+        assert_eq!(ranges.len(), 3, "three nodes -> three slot ranges");
+        // Each range is [start, end, [host, port, id]]. Check the boundaries and served-by.
+        let expect = [
+            (0i64, 5460i64, "10.0.0.10", 7000i64, MAP_ID0),
+            (5461, 10922, "10.0.0.11", 7001, MAP_ID1),
+            (10923, 16383, "10.0.0.12", 7002, MAP_ID2),
+        ];
+        for (range, (start, end, host, port, id)) in ranges.iter().zip(expect) {
+            let Value::Array(Some(r)) = range else {
+                panic!("expected a range array");
+            };
+            assert_eq!(r[0], Value::Integer(start));
+            assert_eq!(r[1], Value::Integer(end));
+            let Value::Array(Some(served)) = &r[2] else {
+                panic!("expected a served-by triple");
+            };
+            assert_eq!(served[0], Value::bulk_str(host));
+            assert_eq!(served[1], Value::Integer(port));
+            assert_eq!(served[2], Value::bulk_str(id));
+        }
+    }
+
+    #[test]
+    fn map_shards_reflects_three_nodes() {
+        let c = ctx_with_map();
+        let Value::Array(Some(shards)) = run(&c, &[b"CLUSTER", b"SHARDS"]) else {
+            panic!("expected an array");
+        };
+        assert_eq!(shards.len(), 3, "three nodes -> three shards");
+        // The middle shard (ID1) owns [5461, 10922] and is a master, online.
+        let Value::Map(shard) = &shards[1] else {
+            panic!("expected a shard map");
+        };
+        let slots = &shard
+            .iter()
+            .find(|(k, _)| *k == Value::bulk_str("slots"))
+            .expect("shard has slots")
+            .1;
+        assert_eq!(
+            *slots,
+            Value::Array(Some(vec![Value::Integer(5461), Value::Integer(10922)]))
+        );
+        let Value::Array(Some(nodes)) = &shard
+            .iter()
+            .find(|(k, _)| *k == Value::bulk_str("nodes"))
+            .expect("shard has nodes")
+            .1
+        else {
+            panic!("expected a nodes array");
+        };
+        assert_eq!(nodes.len(), 1, "no replicas in slice 2");
+        let Value::Map(node) = &nodes[0] else {
+            panic!("expected a node map");
+        };
+        let field = |name: &str| {
+            node.iter()
+                .find(|(k, _)| *k == Value::bulk_str(name))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(field("id"), Some(Value::bulk_str(MAP_ID1)));
+        assert_eq!(field("port"), Some(Value::Integer(7001)));
+        assert_eq!(field("ip"), Some(Value::bulk_str("10.0.0.11")));
+        assert_eq!(field("role"), Some(Value::bulk_str("master")));
+        assert_eq!(field("health"), Some(Value::bulk_str("online")));
+    }
+
+    #[test]
+    fn map_nodes_renders_one_line_per_node_with_self_flagged() {
+        let c = ctx_with_map();
+        let body = text_body(&run(&c, &[b"CLUSTER", b"NODES"]));
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "one gossip line per node");
+        // Self (ID1) is `myself,master` with its bus port = 7001 + 10000; owns 5461-10922.
+        let self_line = lines
+            .iter()
+            .find(|l| l.starts_with(MAP_ID1))
+            .expect("a self line");
+        assert!(
+            self_line.contains("10.0.0.11:7001@17001"),
+            "got {self_line}"
+        );
+        assert!(self_line.contains("myself,master"), "got {self_line}");
+        assert!(
+            self_line.ends_with("connected 5461-10922"),
+            "got {self_line}"
+        );
+        // The other two are plain `master` (not myself), with their own ranges.
+        let other = lines
+            .iter()
+            .find(|l| l.starts_with(MAP_ID0))
+            .expect("the ID0 line");
+        assert!(other.contains(" master - "), "got {other}");
+        assert!(!other.contains("myself"), "got {other}");
+        assert!(other.ends_with("connected 0-5460"), "got {other}");
+    }
+
+    #[test]
+    fn map_info_counts_from_map() {
+        let c = ctx_with_map();
+        let body = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(body.contains("cluster_known_nodes:3\r\n"), "got {body:?}");
+        assert!(body.contains("cluster_size:3\r\n"), "got {body:?}");
+        assert!(
+            body.contains("cluster_slots_assigned:16384\r\n"),
+            "got {body:?}"
+        );
+        assert!(body.contains("cluster_state:ok\r\n"), "got {body:?}");
+    }
+
+    #[test]
+    fn map_myid_is_the_self_node_id() {
+        let c = ctx_with_map();
+        // In map mode MYID is the map's self id (the announce id), NOT the ServerInfo id.
+        assert_eq!(bulk_string(&run(&c, &[b"CLUSTER", b"MYID"])), MAP_ID1);
     }
 }
