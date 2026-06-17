@@ -50,10 +50,16 @@ pub mod cursor;
 pub use cursor::{ReplId, ReplOffset};
 
 pub mod frames;
-pub use frames::{Frame, FrameError, REPLCONF, REPLPING};
+pub use frames::{FULLSYNC, Frame, FrameError, REPLCONF, REPLPING, SYNCEND, SYNCKV};
+
+pub mod kvcodec;
+pub use kvcodec::{decode_kvobj, encode_kvobj};
 
 pub mod link;
 pub use link::{DEFAULT_HEARTBEAT, LinkEffects, LinkEvent, PrimaryLink, ReplState, ReplicaLink};
+
+pub mod fullsync;
+pub use fullsync::{FullSyncError, drive_full_sync, receive_full_sync};
 
 pub mod transport;
 pub use transport::{ReplicaObserver, run_primary_repl_listener, run_replica_link};

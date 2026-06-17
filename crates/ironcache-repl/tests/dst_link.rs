@@ -100,6 +100,9 @@ impl SimNode for ReplNode {
                     // a REPLCONF, so this only schedules the dial loop.)
                     ctx.set_timer(TOK_DIAL, DIAL_PERIOD);
                 }
+                // The HA-7b full-sync frames are not exercised by this 7a heartbeat/cursor
+                // DST scenario; ignore them here (their own tests cover them).
+                Frame::FullSync { .. } | Frame::SyncKv { .. } | Frame::SyncEnd { .. } => {}
             },
         }
     }

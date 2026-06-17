@@ -589,6 +589,18 @@ impl HashVal {
     fn listpack_pos(v: &[HashEntry], field: &[u8]) -> Option<usize> {
         v.iter().position(|(f, _)| f.as_ref() == field)
     }
+
+    /// Force the large `hashtable` form regardless of the current entry count (a no-op if
+    /// already a hashtable). The faithful-reconstruction seam (HA-7b): the one-way encoding
+    /// ratchet means a hash that grew to `hashtable` then shrank below the listpack
+    /// thresholds STAYS `hashtable` ([`HashValue::del`] never demotes), so a wire codec that
+    /// rebuilds a hash from its logical pairs (which would otherwise pick the SMALL listpack
+    /// form for a now-small entry set) must be able to reproduce the captured active repr.
+    /// `OBJECT ENCODING` is a pure function of the active form, so this restores the exact
+    /// encoding the source object reported. No effect on contents, only on the resident form.
+    pub fn force_large_encoding(&mut self) {
+        self.convert_to_hashtable();
+    }
 }
 
 impl HashValue for HashVal {
@@ -925,6 +937,27 @@ impl SetVal {
             }
         }
     }
+
+    /// Force the large `hashtable` form regardless of the current member count (a no-op if
+    /// already a hashtable). The faithful-reconstruction seam (HA-7b): the one-way encoding
+    /// ratchet means a set that grew to `hashtable` then shrank STAYS `hashtable`
+    /// ([`SetValue::remove`] never demotes), so a wire codec that rebuilds a set from its
+    /// logical members (which would otherwise pick a smaller form for a now-small set) must
+    /// be able to reproduce the captured active repr. See [`HashVal::force_large_encoding`].
+    pub fn force_large_encoding(&mut self) {
+        self.convert_to_hashtable();
+    }
+
+    /// Force the `listpack` form from an `intset` (a no-op for an already-`listpack` or
+    /// `hashtable` set). The faithful-reconstruction seam (HA-7b): an all-integer set that
+    /// reached `listpack` (because it once held a non-integer member that was later removed,
+    /// or it crossed the intset-entries cap) does NOT demote back to `intset`
+    /// ([`SetValue::remove`] never demotes), so a wire codec that rebuilds an all-integer set
+    /// from its members (which would otherwise pick `intset`) must be able to reproduce the
+    /// captured `listpack` repr. See [`Self::force_large_encoding`].
+    pub fn force_listpack(&mut self) {
+        self.convert_intset_to_listpack();
+    }
 }
 
 impl SetValue for SetVal {
@@ -1204,6 +1237,17 @@ impl ZSetVal {
             }
             self.0 = ZSetRepr::SkipList { index, scores };
         }
+    }
+
+    /// Force the large `skiplist` form regardless of the current member count (a no-op if
+    /// already a skiplist). The faithful-reconstruction seam (HA-7b): the one-way encoding
+    /// ratchet means a zset that grew to `skiplist` then shrank STAYS `skiplist`
+    /// ([`ZSetValue::remove`] never demotes), so a wire codec that rebuilds a zset from its
+    /// (member, score) pairs (which would otherwise pick the SMALL listpack form for a
+    /// now-small zset) must be able to reproduce the captured active repr.
+    /// See [`HashVal::force_large_encoding`].
+    pub fn force_large_encoding(&mut self) {
+        self.convert_to_skiplist();
     }
 
     /// Find the index of `member` in the sorted listpack form (linear scan), or `None`.

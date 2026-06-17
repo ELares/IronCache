@@ -34,6 +34,12 @@ use crate::cursor::{ReplId, ReplOffset};
 pub const REPLCONF: &[u8] = b"REPLCONF";
 /// The REPLPING verb (primary -> replica: heartbeat carrying replid + offset).
 pub const REPLPING: &[u8] = b"REPLPING";
+/// The FULLSYNC verb (primary -> replica: begin a full sync, naming the resume offset).
+pub const FULLSYNC: &[u8] = b"FULLSYNC";
+/// The SYNCKV verb (primary -> replica: one snapshot entry in the full-sync stream).
+pub const SYNCKV: &[u8] = b"SYNCKV";
+/// The SYNCEND verb (primary -> replica: terminate the full-sync stream).
+pub const SYNCEND: &[u8] = b"SYNCEND";
 
 /// A replication frame is malformed: a RESP framing error, or a complete command
 /// that is not a decodable replication frame (wrong verb / arity, a non-numeric
@@ -68,6 +74,43 @@ pub enum Frame {
         /// The primary's current logical [`ReplOffset`].
         offset: ReplOffset,
     },
+    /// `["FULLSYNC", <replid>, <end_offset>]` (primary -> replica).
+    ///
+    /// BEGINS a full sync (HA-7b): the primary is about to stream its whole snapshot.
+    /// `replid` names the stream the replica will be on; `end_offset` is the primary's
+    /// [`ReplOffset`] at the snapshot CUT -- the point the snapshot is consistent through
+    /// and where the HA-7c steady-state tail resumes. The replica creates a FRESH store and
+    /// applies the [`Frame::SyncKv`] entries that follow until [`Frame::SyncEnd`].
+    FullSync {
+        /// The primary's replication id for this stream.
+        replid: ReplId,
+        /// The offset at the snapshot cut (the resume point for the 7c tail).
+        end_offset: ReplOffset,
+    },
+    /// `["SYNCKV", <db>, <key>, <kvobj-bytes>]` (primary -> replica).
+    ///
+    /// One snapshot entry in the full-sync stream (HA-7b): the database index, the key, and
+    /// the [`crate::kvcodec::encode_kvobj`] encoding of the entry's [`ironcache_store::KvObj`].
+    /// The replica decodes `kvobj_bytes` and applies it to the in-progress fresh store via
+    /// `insert_object`. One frame per live key; the stream is bounded by [`Frame::SyncEnd`].
+    SyncKv {
+        /// The database the entry belongs to.
+        db: u32,
+        /// The key bytes (also carried inside `kvobj_bytes`; here for routing/debugging).
+        key: Vec<u8>,
+        /// The [`crate::kvcodec`] wire encoding of the entry's `KvObj`.
+        kvobj_bytes: Vec<u8>,
+    },
+    /// `["SYNCEND", <end_offset>]` (primary -> replica).
+    ///
+    /// TERMINATES the full-sync stream (HA-7b): every snapshot entry has been sent. The
+    /// replica completes the sync (the fresh store is fully loaded) and adopts `end_offset`
+    /// as its resume point for the HA-7c tail. `end_offset` repeats the [`Frame::FullSync`]
+    /// value so the terminator is self-contained.
+    SyncEnd {
+        /// The offset at the snapshot cut (the resume point for the 7c tail).
+        end_offset: ReplOffset,
+    },
 }
 
 impl Frame {
@@ -89,6 +132,19 @@ impl Frame {
                 replid.as_hex().as_bytes(),
                 offset.0.to_string().as_bytes(),
             ]),
+            Frame::FullSync { replid, end_offset } => encode_command(&[
+                FULLSYNC,
+                replid.as_hex().as_bytes(),
+                end_offset.0.to_string().as_bytes(),
+            ]),
+            Frame::SyncKv {
+                db,
+                key,
+                kvobj_bytes,
+            } => encode_command(&[SYNCKV, db.to_string().as_bytes(), key, kvobj_bytes]),
+            Frame::SyncEnd { end_offset } => {
+                encode_command(&[SYNCEND, end_offset.0.to_string().as_bytes()])
+            }
         }
     }
 
@@ -126,6 +182,33 @@ fn decode_args(args: &[Vec<u8>]) -> Result<Frame, FrameError> {
         let replid = ReplId::from_hex(&args[1]).ok_or(FrameError)?;
         let offset = ReplOffset(parse_u64(&args[2])?);
         Ok(Frame::ReplPing { replid, offset })
+    } else if verb.eq_ignore_ascii_case(FULLSYNC) {
+        if args.len() != 3 {
+            return Err(FrameError);
+        }
+        let replid = ReplId::from_hex(&args[1]).ok_or(FrameError)?;
+        let end_offset = ReplOffset(parse_u64(&args[2])?);
+        Ok(Frame::FullSync { replid, end_offset })
+    } else if verb.eq_ignore_ascii_case(SYNCKV) {
+        if args.len() != 4 {
+            return Err(FrameError);
+        }
+        let db = u32::try_from(parse_u64(&args[1])?).map_err(|_| FrameError)?;
+        // The key and the kvobj bytes are opaque binary (the RESP bulk length delimits
+        // them, so embedded CRLF is safe); take them as-is.
+        let key = args[2].clone();
+        let kvobj_bytes = args[3].clone();
+        Ok(Frame::SyncKv {
+            db,
+            key,
+            kvobj_bytes,
+        })
+    } else if verb.eq_ignore_ascii_case(SYNCEND) {
+        if args.len() != 2 {
+            return Err(FrameError);
+        }
+        let end_offset = ReplOffset(parse_u64(&args[1])?);
+        Ok(Frame::SyncEnd { end_offset })
     } else {
         Err(FrameError)
     }
@@ -259,6 +342,46 @@ mod tests {
         assert_round_trips(&Frame::ReplPing {
             replid: ReplId::from_hex(b"abcdef0123456789abcdef0123456789abcdef01").unwrap(),
             offset: ReplOffset(u64::MAX),
+        });
+
+        // FULLSYNC (HA-7b): the begin-full-sync frame, at the offset edges.
+        assert_round_trips(&Frame::FullSync {
+            replid: ReplId::from_hex(b"abcdef0123456789abcdef0123456789abcdef01").unwrap(),
+            end_offset: ReplOffset(0),
+        });
+        assert_round_trips(&Frame::FullSync {
+            replid: ReplId::from_hex(b"2222222222222222222222222222222222222222").unwrap(),
+            end_offset: ReplOffset(u64::MAX),
+        });
+
+        // SYNCKV (HA-7b): a snapshot entry. The key and kvobj bytes are OPAQUE BINARY,
+        // including embedded CRLF and a NUL, which the length-delimited bulk codec carries
+        // verbatim. Also the empty-key / empty-payload edge.
+        assert_round_trips(&Frame::SyncKv {
+            db: 0,
+            key: b"plain-key".to_vec(),
+            kvobj_bytes: b"some-encoded-kvobj-bytes".to_vec(),
+        });
+        assert_round_trips(&Frame::SyncKv {
+            db: u32::MAX,
+            key: b"binary\r\nkey\x00".to_vec(),
+            kvobj_bytes: vec![0u8, 1, 2, b'\r', b'\n', 255, 13, 10],
+        });
+        assert_round_trips(&Frame::SyncKv {
+            db: 3,
+            key: Vec::new(),
+            kvobj_bytes: Vec::new(),
+        });
+
+        // SYNCEND (HA-7b): the terminator, at the offset edges.
+        assert_round_trips(&Frame::SyncEnd {
+            end_offset: ReplOffset(0),
+        });
+        assert_round_trips(&Frame::SyncEnd {
+            end_offset: ReplOffset(123_456),
+        });
+        assert_round_trips(&Frame::SyncEnd {
+            end_offset: ReplOffset(u64::MAX),
         });
     }
 
