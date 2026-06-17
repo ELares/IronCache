@@ -22,6 +22,7 @@ members = [
     "crates/ironcache-clusterbus",
     "crates/ironcache-sim",
     "crates/ironcache-raft",
+    "crates/ironcache-raft-net",
     "crates/ironcache-observe",
     "crates/ironcache-storage",
     "crates/ironcache-eviction",
@@ -99,6 +100,7 @@ ironcache-cluster = { path = "crates/ironcache-cluster" }
 ironcache-clusterbus = { path = "crates/ironcache-clusterbus" }
 ironcache-sim = { path = "crates/ironcache-sim" }
 ironcache-raft = { path = "crates/ironcache-raft" }
+ironcache-raft-net = { path = "crates/ironcache-raft-net" }
 ironcache-observe = { path = "crates/ironcache-observe" }
 ironcache-storage = { path = "crates/ironcache-storage" }
 ironcache-eviction = { path = "crates/ironcache-eviction" }

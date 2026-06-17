@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-raft-net"
+description = "Production adapter (HA-4a): drives the pure ironcache-raft engine over real TCP via the clusterbus + Runtime + SystemEnv seams, with a per-node control-plane task."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The PURE step engine this crate drives. The adapter never reimplements consensus;
+# it feeds the engine events and drains its Effects (ADR-0027).
+ironcache-raft = { workspace = true }
+# The outbound node-to-node RESP connection (PeerConn) the adapter ships RaftMsgs
+# over, plus the Reply decoder (HA-1).
+ironcache-clusterbus = { workspace = true }
+# The Runtime seam (accept/connect/recv/send/timer/spawn): all I/O and every timer
+# goes through this, never raw tokio sockets/sleep on a decision path
+# (RUNTIME_ABSTRACTION.md, ADR-0002).
+ironcache-runtime = { workspace = true }
+# The determinism seam (ADR-0003): the adapter reads `now` through SystemEnv's Clock
+# and election-jitter randomness through SystemEnv's Rng. The engine itself owns
+# neither; the adapter passes them in per step.
+ironcache-env = { workspace = true }
+# Async primitives for the per-node control-plane task: the mpsc event inbox and a
+# watch channel for the status snapshot the run loop publishes for readers.
+tokio = { workspace = true, features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "sync",
+] }

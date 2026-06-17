@@ -442,6 +442,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironcache-raft-net"
+version = "0.0.0"
+dependencies = [
+ "ironcache-clusterbus",
+ "ironcache-env",
+ "ironcache-raft",
+ "ironcache-runtime",
+ "tokio",
+]
+
+[[package]]
 name = "ironcache-runtime"
 version = "0.0.0"
 dependencies = [

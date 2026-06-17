@@ -1,0 +1,379 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! A compact, hand-rolled binary codec for [`RaftMsg`] (HA-4a).
+//!
+//! The pure engine ([`ironcache_raft`]) models a Raft RPC as a plain `RaftMsg`
+//! value; to drive it over the real cluster bus the adapter must serialize that
+//! value to bytes on the sending node and reconstruct the IDENTICAL value on the
+//! receiving node. This module is that serialization, and it is the ONE place a
+//! wire-level mistake could silently corrupt consensus (a flipped field, a
+//! mis-framed entry vector, a truncated payload), so it is deliberately simple,
+//! self-delimiting, and round-trip tested over EVERY variant
+//! ([`super::tests::codec_round_trips_every_raftmsg_variant`]).
+//!
+//! ## Why hand-rolled (no serde)
+//!
+//! The workspace carries no serde dependency on the engine crates; adding one to a
+//! boundary adapter would pull a derive-macro tree into the consensus path for no
+//! benefit. The `RaftMsg` surface is small and stable (four RPC variants plus the
+//! local `Propose`, a handful of scalar fields, and a `Vec<LogEntry>` whose payload
+//! is one of three shapes), so a fixed-layout binary encoding is both smaller and
+//! easier to audit than a generic format.
+//!
+//! ## Layout
+//!
+//! Everything is little-endian and length-delimited so decode never reads past a
+//! field. A `u64` is 8 bytes; a [`NodeId`] is its inner `u64`; a variable-length
+//! blob (a `Bytes` payload, a config id `String`, a slot list) is a `u64` length
+//! prefix followed by that many bytes / elements. Each message, entry, and payload
+//! leads with a single discriminant byte. Decode is total: any malformed,
+//! truncated, or unknown-discriminant input yields `None` (the caller drops the
+//! frame; Raft retries via heartbeat), never a panic.
+//!
+//! The encoded `RaftMsg` is carried as the third argument of the cluster-bus
+//! command `["RAFTMSG", <self_node_id_decimal>, <encoded-bytes>]`
+//! (see [`super::RAFTMSG`]); this module owns only the third argument's bytes, not
+//! the RESP framing around it.
+
+use ironcache_raft::{ConfigCmd, EntryPayload, LogEntry, NodeId, RaftMsg};
+
+// Message discriminants (the outer `RaftMsg` variant tag).
+const MSG_REQUEST_VOTE: u8 = 1;
+const MSG_REQUEST_VOTE_RESP: u8 = 2;
+const MSG_APPEND_ENTRIES: u8 = 3;
+const MSG_APPEND_ENTRIES_RESP: u8 = 4;
+const MSG_PROPOSE: u8 = 5;
+
+// Payload discriminants (the `EntryPayload` variant tag).
+const PAYLOAD_NOOP: u8 = 0;
+const PAYLOAD_BYTES: u8 = 1;
+const PAYLOAD_CONFIG: u8 = 2;
+
+// Config-command discriminants (the `ConfigCmd` variant tag).
+const CFG_ADD_NODE: u8 = 0;
+const CFG_REMOVE_NODE: u8 = 1;
+const CFG_SET_SLOT_OWNER: u8 = 2;
+const CFG_ASSIGN_SLOTS: u8 = 3;
+const CFG_SET_CONFIG_EPOCH: u8 = 4;
+
+// ---------------------------------------------------------------------------
+// Encoding.
+// ---------------------------------------------------------------------------
+
+/// Serialize a [`RaftMsg`] to the wire bytes carried in the `RAFTMSG` command.
+///
+/// The inverse of [`decode_raft_msg`]; the pair round-trips every variant
+/// byte-for-byte (the codec round-trip test is the gate). The output is a fresh
+/// `Vec<u8>` the adapter hands to [`ironcache_clusterbus::PeerConn::request`] as a
+/// bulk-string argument.
+#[must_use]
+pub fn encode_raft_msg(msg: &RaftMsg) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    match msg {
+        RaftMsg::RequestVote {
+            term,
+            candidate,
+            last_log_index,
+            last_log_term,
+        } => {
+            out.push(MSG_REQUEST_VOTE);
+            put_u64(&mut out, *term);
+            put_node(&mut out, *candidate);
+            put_u64(&mut out, *last_log_index);
+            put_u64(&mut out, *last_log_term);
+        }
+        RaftMsg::RequestVoteResp { term, vote_granted } => {
+            out.push(MSG_REQUEST_VOTE_RESP);
+            put_u64(&mut out, *term);
+            out.push(u8::from(*vote_granted));
+        }
+        RaftMsg::AppendEntries {
+            term,
+            leader,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        } => {
+            out.push(MSG_APPEND_ENTRIES);
+            put_u64(&mut out, *term);
+            put_node(&mut out, *leader);
+            put_u64(&mut out, *prev_log_index);
+            put_u64(&mut out, *prev_log_term);
+            put_u64(&mut out, *leader_commit);
+            // The entries vector, length-prefixed so decode knows exactly how many
+            // to read (a heartbeat is simply a zero-length vector).
+            put_u64(&mut out, entries.len() as u64);
+            for entry in entries {
+                put_entry(&mut out, entry);
+            }
+        }
+        RaftMsg::AppendEntriesResp {
+            term,
+            success,
+            match_index,
+        } => {
+            out.push(MSG_APPEND_ENTRIES_RESP);
+            put_u64(&mut out, *term);
+            out.push(u8::from(*success));
+            put_u64(&mut out, *match_index);
+        }
+        RaftMsg::Propose { payload } => {
+            out.push(MSG_PROPOSE);
+            put_payload(&mut out, payload);
+        }
+    }
+    out
+}
+
+/// Append a [`LogEntry`]: its term, index, then its payload.
+fn put_entry(out: &mut Vec<u8>, entry: &LogEntry) {
+    put_u64(out, entry.term);
+    put_u64(out, entry.index);
+    put_payload(out, &entry.payload);
+}
+
+/// Append an [`EntryPayload`] led by its discriminant byte.
+fn put_payload(out: &mut Vec<u8>, payload: &EntryPayload) {
+    match payload {
+        EntryPayload::Noop => out.push(PAYLOAD_NOOP),
+        EntryPayload::Bytes(bytes) => {
+            out.push(PAYLOAD_BYTES);
+            put_blob(out, bytes);
+        }
+        EntryPayload::Config(cmd) => {
+            out.push(PAYLOAD_CONFIG);
+            put_config(out, cmd);
+        }
+    }
+}
+
+/// Append a [`ConfigCmd`] led by its discriminant byte.
+fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
+    match cmd {
+        ConfigCmd::AddNode { id, host, port } => {
+            out.push(CFG_ADD_NODE);
+            put_str(out, id);
+            put_str(out, host);
+            put_u16(out, *port);
+        }
+        ConfigCmd::RemoveNode { id } => {
+            out.push(CFG_REMOVE_NODE);
+            put_str(out, id);
+        }
+        ConfigCmd::SetSlotOwner { slot, node } => {
+            out.push(CFG_SET_SLOT_OWNER);
+            put_u16(out, *slot);
+            put_str(out, node);
+        }
+        ConfigCmd::AssignSlots { node, slots } => {
+            out.push(CFG_ASSIGN_SLOTS);
+            put_str(out, node);
+            put_u64(out, slots.len() as u64);
+            for slot in slots {
+                put_u16(out, *slot);
+            }
+        }
+        ConfigCmd::SetConfigEpoch(epoch) => {
+            out.push(CFG_SET_CONFIG_EPOCH);
+            put_u64(out, *epoch);
+        }
+    }
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_node(out: &mut Vec<u8>, id: NodeId) {
+    put_u64(out, id.0);
+}
+
+/// A length-prefixed byte blob: a `u64` length then the bytes.
+fn put_blob(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u64(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+/// A length-prefixed UTF-8 string (encoded as a byte blob of its UTF-8 bytes).
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_blob(out, s.as_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Decoding.
+// ---------------------------------------------------------------------------
+
+/// A forward-only cursor over the encoded bytes. Every read is bounds-checked and
+/// returns `None` on a short buffer, so a truncated or corrupt frame can never
+/// over-read; the whole decode bubbles the `None` up to the caller, which drops the
+/// frame (Raft re-sends on the next heartbeat).
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Cursor { buf, pos: 0 }
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let end = self.pos.checked_add(2)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(u16::from_le_bytes([slice[0], slice[1]]))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let end = self.pos.checked_add(8)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(slice);
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    fn node(&mut self) -> Option<NodeId> {
+        Some(NodeId(self.u64()?))
+    }
+
+    fn bool(&mut self) -> Option<bool> {
+        // Any non-zero byte decodes as true; the encoder only ever writes 0/1.
+        Some(self.u8()? != 0)
+    }
+
+    /// A length-prefixed byte blob: read the `u64` length, then exactly that many
+    /// bytes (bounds-checked).
+    fn blob(&mut self) -> Option<Vec<u8>> {
+        let len = usize::try_from(self.u64()?).ok()?;
+        let end = self.pos.checked_add(len)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice.to_vec())
+    }
+
+    /// A length-prefixed UTF-8 string; rejects invalid UTF-8 (returns `None`).
+    fn string(&mut self) -> Option<String> {
+        String::from_utf8(self.blob()?).ok()
+    }
+
+    /// Whether the cursor has consumed the whole buffer (a well-formed frame has no
+    /// trailing bytes; trailing garbage is rejected so a corrupt tail is not
+    /// silently ignored).
+    fn at_end(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+}
+
+/// Deserialize a [`RaftMsg`] from the `RAFTMSG` command's encoded-bytes argument.
+///
+/// The inverse of [`encode_raft_msg`]. Returns `None` for ANY input that is not a
+/// byte-exact encoding of some `RaftMsg` (unknown discriminant, short buffer,
+/// non-UTF-8 config string, or trailing bytes after a complete message); the caller
+/// treats a `None` as a dropped frame.
+#[must_use]
+pub fn decode_raft_msg(buf: &[u8]) -> Option<RaftMsg> {
+    let mut cur = Cursor::new(buf);
+    let msg = match cur.u8()? {
+        MSG_REQUEST_VOTE => RaftMsg::RequestVote {
+            term: cur.u64()?,
+            candidate: cur.node()?,
+            last_log_index: cur.u64()?,
+            last_log_term: cur.u64()?,
+        },
+        MSG_REQUEST_VOTE_RESP => RaftMsg::RequestVoteResp {
+            term: cur.u64()?,
+            vote_granted: cur.bool()?,
+        },
+        MSG_APPEND_ENTRIES => {
+            let term = cur.u64()?;
+            let leader = cur.node()?;
+            let prev_log_index = cur.u64()?;
+            let prev_log_term = cur.u64()?;
+            let leader_commit = cur.u64()?;
+            let count = usize::try_from(cur.u64()?).ok()?;
+            let mut entries = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                entries.push(get_entry(&mut cur)?);
+            }
+            RaftMsg::AppendEntries {
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            }
+        }
+        MSG_APPEND_ENTRIES_RESP => RaftMsg::AppendEntriesResp {
+            term: cur.u64()?,
+            success: cur.bool()?,
+            match_index: cur.u64()?,
+        },
+        MSG_PROPOSE => RaftMsg::Propose {
+            payload: get_payload(&mut cur)?,
+        },
+        _ => return None,
+    };
+    // Reject trailing bytes: a complete message must consume the whole frame.
+    if cur.at_end() { Some(msg) } else { None }
+}
+
+/// Read a [`LogEntry`] (term, index, payload).
+fn get_entry(cur: &mut Cursor<'_>) -> Option<LogEntry> {
+    let term = cur.u64()?;
+    let index = cur.u64()?;
+    let payload = get_payload(cur)?;
+    Some(LogEntry {
+        term,
+        index,
+        payload,
+    })
+}
+
+/// Read an [`EntryPayload`] by its discriminant byte.
+fn get_payload(cur: &mut Cursor<'_>) -> Option<EntryPayload> {
+    match cur.u8()? {
+        PAYLOAD_NOOP => Some(EntryPayload::Noop),
+        PAYLOAD_BYTES => Some(EntryPayload::Bytes(cur.blob()?)),
+        PAYLOAD_CONFIG => Some(EntryPayload::Config(get_config(cur)?)),
+        _ => None,
+    }
+}
+
+/// Read a [`ConfigCmd`] by its discriminant byte.
+fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
+    match cur.u8()? {
+        CFG_ADD_NODE => Some(ConfigCmd::AddNode {
+            id: cur.string()?,
+            host: cur.string()?,
+            port: cur.u16()?,
+        }),
+        CFG_REMOVE_NODE => Some(ConfigCmd::RemoveNode { id: cur.string()? }),
+        CFG_SET_SLOT_OWNER => Some(ConfigCmd::SetSlotOwner {
+            slot: cur.u16()?,
+            node: cur.string()?,
+        }),
+        CFG_ASSIGN_SLOTS => {
+            let node = cur.string()?;
+            let count = usize::try_from(cur.u64()?).ok()?;
+            let mut slots = Vec::with_capacity(count.min(16384));
+            for _ in 0..count {
+                slots.push(cur.u16()?);
+            }
+            Some(ConfigCmd::AssignSlots { node, slots })
+        }
+        CFG_SET_CONFIG_EPOCH => Some(ConfigCmd::SetConfigEpoch(cur.u64()?)),
+        _ => None,
+    }
+}
