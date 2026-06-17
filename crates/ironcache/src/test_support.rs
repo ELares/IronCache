@@ -74,7 +74,25 @@ pub fn run_cluster_node_for_test(
 /// Panics if the server fails to bind, OR if the topology fails to validate.
 #[must_use]
 pub fn run_raft_node_for_test(port: u16, topology: ClusterTopology, announce_id: &str) -> ShardSet {
-    let config = Config {
+    run_raft_node_for_test_with(port, topology, announce_id, None)
+}
+
+/// Like [`run_raft_node_for_test`] but with an OPTIONAL short HA-8 `failover_timeout_secs`
+/// override (`Some(secs)`), so a failover test can drive a promotion in seconds instead of
+/// waiting the production default. `None` leaves the default. `replica_max_lag` keeps its default
+/// (generous, so an attached-and-caught-up replica is in-sync and thus promotable).
+///
+/// # Panics
+///
+/// Panics if the server fails to bind, OR if the topology fails to validate.
+#[must_use]
+pub fn run_raft_node_for_test_with(
+    port: u16,
+    topology: ClusterTopology,
+    announce_id: &str,
+    failover_timeout_secs: Option<u64>,
+) -> ShardSet {
+    let mut config = Config {
         bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         port,
         shards: 1,
@@ -85,6 +103,9 @@ pub fn run_raft_node_for_test(port: u16, topology: ClusterTopology, announce_id:
         cluster_announce_id: Some(announce_id.to_owned()),
         ..Config::default()
     };
+    if let Some(secs) = failover_timeout_secs {
+        config.failover_timeout_secs = secs;
+    }
     config
         .validate()
         .expect("test raft cluster topology must validate");

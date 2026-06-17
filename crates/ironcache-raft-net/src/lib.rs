@@ -882,6 +882,24 @@ mod tests {
                     slots: vec![],
                 }),
             },
+            LogEntry {
+                term: 9,
+                index: 15,
+                payload: EntryPayload::Config(ConfigCmd::PromoteReplica {
+                    // HA-8 failover: slots-then-node wire shape must round-trip byte-for-byte.
+                    slots: vec![0, 1, 2, 100, 8191, 8192, 16_383],
+                    new_primary: "8888888888888888888888888888888888888888".to_owned(),
+                }),
+            },
+            LogEntry {
+                term: 9,
+                index: 16,
+                payload: EntryPayload::Config(ConfigCmd::PromoteReplica {
+                    // An empty promotion slot list is a valid (if degenerate) batch.
+                    slots: vec![],
+                    new_primary: "9999999999999999999999999999999999999999".to_owned(),
+                }),
+            },
         ]
     }
 

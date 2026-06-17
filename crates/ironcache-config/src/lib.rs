@@ -279,6 +279,21 @@ pub struct Config {
     /// [`ClusterMode::Raft`] opts the node into the Raft-governed control plane. TOML
     /// (`cluster_mode = "raft"`) + the `IRONCACHE_CLUSTER_MODE` env var.
     pub cluster_mode: ClusterMode,
+    /// The replication-lag bound, in LOGICAL WRITES, that gates BOTH (a) HA-8 promotion
+    /// eligibility (a replica is promotable only when its link is up AND its lag is
+    /// `<= replica_max_lag`, ADR-0026, so a stale replica is never promoted -> no data
+    /// loss beyond the async-replication window) and (b) the HA-8 replica-read staleness
+    /// bound (a READONLY read is served by a replica only while within this lag bound;
+    /// past it the read returns MOVED to the owner). Meaningful ONLY in raft-governance
+    /// mode (the default static path never reads it). Defaults to
+    /// [`DEFAULT_REPLICA_MAX_LAG`].
+    pub replica_max_lag: u64,
+    /// How long (in SECONDS) a replica's link to its master must be CONTINUOUSLY DOWN
+    /// before the replica PROPOSES its own promotion (HA-8 failover detection). A larger
+    /// value tolerates longer transient master blips before failing over; a smaller one
+    /// fails over faster (at the cost of more spurious-but-safe promotions). Meaningful
+    /// ONLY in raft-governance mode. Defaults to [`DEFAULT_FAILOVER_TIMEOUT_SECS`].
+    pub failover_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -314,9 +329,23 @@ impl Default for Config {
             // The slot map is STATICALLY governed by default (HA-4c): the pre-HA-4c
             // behavior, byte-unchanged. Raft governance is strictly opt-in.
             cluster_mode: ClusterMode::Static,
+            // HA-8 defaults; meaningful only in raft-governance mode (the static path
+            // never reads them, so they do not perturb the default posture).
+            replica_max_lag: DEFAULT_REPLICA_MAX_LAG,
+            failover_timeout_secs: DEFAULT_FAILOVER_TIMEOUT_SECS,
         }
     }
 }
+
+/// Default HA-8 replication-lag bound (logical writes) for promotion eligibility + the
+/// replica-read staleness gate. A modest window: a replica more than this many writes
+/// behind is neither promotable nor allowed to serve a (stale) READONLY read.
+pub const DEFAULT_REPLICA_MAX_LAG: u64 = 256;
+
+/// Default HA-8 failover timeout (seconds): how long a replica's master link must be
+/// continuously down before the replica proposes its own promotion. Comfortably above
+/// the replication poll cadence so a single missed poll does not trigger a failover.
+pub const DEFAULT_FAILOVER_TIMEOUT_SECS: u64 = 5;
 
 /// The eight Redis `maxmemory-policy` names IronCache accepts (EVICTION.md #50).
 /// Inlined here (rather than depending on `ironcache-eviction`) to keep the config
@@ -595,6 +624,14 @@ pub struct ConfigOverlay {
     /// How the slot map is governed (HA-4c). TOML (`cluster_mode = "raft"`) + the
     /// `IRONCACHE_CLUSTER_MODE` env var. `None` leaves the lower layer (default `Static`).
     pub cluster_mode: Option<ClusterMode>,
+    /// HA-8 replication-lag bound (logical writes) for promotion + replica-read staleness.
+    /// TOML (`replica_max_lag = N`) + the `IRONCACHE_REPLICA_MAX_LAG` env var. `None` leaves
+    /// the lower layer (default [`DEFAULT_REPLICA_MAX_LAG`]).
+    pub replica_max_lag: Option<u64>,
+    /// HA-8 failover timeout (seconds): link-down duration before a replica self-proposes
+    /// promotion. TOML (`failover_timeout_secs = N`) + the `IRONCACHE_FAILOVER_TIMEOUT_SECS`
+    /// env var. `None` leaves the lower layer (default [`DEFAULT_FAILOVER_TIMEOUT_SECS`]).
+    pub failover_timeout_secs: Option<u64>,
 }
 
 impl ConfigOverlay {
@@ -666,6 +703,21 @@ impl ConfigOverlay {
                 reason: format!("not a cluster mode (expected static/raft): {v}"),
             })?);
         }
+        // HA-8 knobs (single scalars, so env-encodable for per-pod injection). Both are
+        // meaningful only in raft-mode; a malformed value hard-fails boot rather than
+        // silently picking a default.
+        if let Ok(v) = std::env::var("IRONCACHE_REPLICA_MAX_LAG") {
+            o.replica_max_lag = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "replica-max-lag",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_FAILOVER_TIMEOUT_SECS") {
+            o.failover_timeout_secs = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "failover-timeout-secs",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
         Ok(o)
     }
 
@@ -720,6 +772,12 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.cluster_mode {
             cfg.cluster_mode = v;
+        }
+        if let Some(v) = self.replica_max_lag {
+            cfg.replica_max_lag = v;
+        }
+        if let Some(v) = self.failover_timeout_secs {
+            cfg.failover_timeout_secs = v;
         }
         Ok(())
     }
@@ -827,7 +885,31 @@ mod tests {
         assert!(c.requirepass.is_none());
         // Cluster mode is OFF by default (standalone, Redis `cluster-enabled no`).
         assert!(!c.cluster_enabled);
+        // HA-8 knobs default to the documented constants (meaningful only in raft-mode).
+        assert_eq!(c.replica_max_lag, DEFAULT_REPLICA_MAX_LAG);
+        assert_eq!(c.failover_timeout_secs, DEFAULT_FAILOVER_TIMEOUT_SECS);
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn ha8_knobs_parse_from_overlay_and_toml() {
+        // The overlay sets the HA-8 knobs; an unset overlay leaves the defaults.
+        let c = Config::resolve(&[ConfigOverlay {
+            replica_max_lag: Some(1024),
+            failover_timeout_secs: Some(12),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(c.replica_max_lag, 1024);
+        assert_eq!(c.failover_timeout_secs, 12);
+        let unset = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert_eq!(unset.replica_max_lag, DEFAULT_REPLICA_MAX_LAG);
+        assert_eq!(unset.failover_timeout_secs, DEFAULT_FAILOVER_TIMEOUT_SECS);
+        // TOML form.
+        let o = ConfigOverlay::from_toml_str("replica_max_lag = 64\nfailover_timeout_secs = 3\n")
+            .unwrap();
+        assert_eq!(o.replica_max_lag, Some(64));
+        assert_eq!(o.failover_timeout_secs, Some(3));
     }
 
     #[test]
