@@ -13,20 +13,33 @@
 //! the real clusterbus and `ironcache-env`'s `Clock` / `Rng`; only the adapter
 //! differs (ADR-0027).
 //!
-//! ## Scope: sub-slice 3a (election + terms ONLY)
+//! ## Scope: sub-slices 3a (election) + 3b (log replication + commit)
 //!
-//! This first sub-slice implements LEADER ELECTION and TERM SAFETY, the
-//! foundation on which the rest of Raft is built. A bug here is split-brain, so
-//! the correctness bar is the Election Safety property (at most one leader per
-//! term), proven by the DST scenarios in the test module across a seed sweep.
+//! Sub-slice 3a implemented LEADER ELECTION and TERM SAFETY, the foundation on
+//! which the rest of Raft is built. A bug there is split-brain, so the correctness
+//! bar is the Election Safety property (at most one leader per term), proven by the
+//! DST scenarios in the test module across a seed sweep.
 //!
-//! What 3a does NOT do: there are no real log payloads beyond a single
-//! [`EntryPayload::Noop`] (the no-op a fresh leader appends per section 8 / the
-//! "commit-only-current-term" machinery; in 3a it is just a placeholder that
-//! advances the log so the up-to-date check has something to compare), no client
-//! proposals, no log replication, no commit advancement, and no state-machine
-//! apply. [`RaftMsg::AppendEntries`] is used purely as the leader's HEARTBEAT
-//! (its `entries` vector is always empty in 3a). Those land in later sub-slices.
+//! Sub-slice 3b (this slice) adds LOG REPLICATION and COMMIT (sections 5.3 and
+//! 5.4.2). [`RaftMsg::AppendEntries`] is now the real replication RPC: a leader
+//! ships log entries to followers with the `(prev_log_index, prev_log_term)`
+//! consistency check (Figure 2, AppendEntries rules 1-5), followers truncate
+//! conflicts and append, and the leader advances its `commitIndex` under the
+//! section-5.4.2 "commit-only-current-term" rule (THE Figure-8 safety rule:
+//! entries from a prior term are never committed by counting replicas alone; they
+//! commit transitively only once a current-term entry above them commits). Clients
+//! propose entries through [`RaftNode::propose`]. A committed entry is "applied" to
+//! a SINK in 3b (a `last_applied` watermark plus an applied counter); the real
+//! state-machine apply that drives the SlotMap is HA-3e.
+//!
+//! What 3b still does NOT do: payloads remain opaque ([`EntryPayload::Noop`] plus
+//! a minimal test-only [`EntryPayload::Bytes`]); there is no snapshotting / log
+//! compaction, no membership change, and no real state machine. The conflict-index
+//! fast-backup optimization (the dissertation's accelerated `nextIndex` rewind) is
+//! deliberately NOT implemented; the receiver returns a simple last-index hint and
+//! the leader decrements `nextIndex` by one per failed round, which is correct (if
+//! slower to converge) and keeps the safety reasoning trivial. Those land in later
+//! sub-slices.
 //!
 //! ## The step surface
 //!
@@ -55,7 +68,7 @@
 #![forbid(unsafe_code)]
 
 use core::time::Duration;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ironcache_env::Monotonic;
 
@@ -91,15 +104,22 @@ pub enum Role {
 
 /// The payload of a [`LogEntry`].
 ///
-/// In sub-slice 3a the ONLY variant is [`EntryPayload::Noop`], the no-op a fresh
-/// leader appends to its log on election (so it has a current-term entry; see the
-/// paper's section 8 and the "commit-only-current-term" rule of 5.4.2). Real
-/// config payloads (the slot map, epoch, roster, roles per ADR-0027) arrive in
-/// later sub-slices as additional variants.
+/// [`EntryPayload::Noop`] is the no-op a fresh leader appends to its log on
+/// election (so it has a current-term entry it can commit; see the paper's section
+/// 8 and the "commit-only-current-term" rule of 5.4.2). [`EntryPayload::Bytes`] is
+/// a minimal OPAQUE payload: 3b's commit/apply pipeline treats entries as opaque
+/// bytes and apply is a sink, so the engine never interprets these; the tests use
+/// them solely to give proposed entries a distinguishable identity when asserting
+/// log convergence and state-machine safety. Real config payloads (the slot map,
+/// epoch, roster, roles per ADR-0027) arrive in later sub-slices as further
+/// variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryPayload {
     /// A leader's election no-op. Carries no data; advances the log index/term.
     Noop,
+    /// An opaque client-proposed payload. The engine never interprets the bytes;
+    /// they exist so a proposed entry has a distinguishable identity in tests.
+    Bytes(Vec<u8>),
 }
 
 /// One entry in a node's replicated log.
@@ -169,6 +189,16 @@ pub enum RaftMsg {
         /// The follower's last index after applying (its `lastLogIndex`).
         match_index: u64,
     },
+    /// A CLIENT PROPOSAL, not a peer RPC. This is NOT part of the Raft wire
+    /// protocol; it is the local "append this command" request a client makes to a
+    /// leader, modeled as a message so the DST harness can inject it through the
+    /// same deterministic transport (a node self-`tell`s it). The engine's real
+    /// entry point is [`RaftNode::propose`]; the dispatch for this variant just
+    /// forwards to it. A non-leader recipient rejects it (no effect).
+    Propose {
+        /// The opaque payload to append (the engine never interprets it).
+        payload: EntryPayload,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -197,9 +227,32 @@ pub trait RaftStorage {
     fn last_log_index(&self) -> u64;
     /// The term of the last log entry (0 if the log is empty).
     fn last_log_term(&self) -> u64;
-    /// Append `entry` to the log. In 3a only the leader's election no-op is
-    /// appended.
+    /// Append `entry` to the log. Used for the leader's own appends (the election
+    /// no-op and client proposals); followers use [`RaftStorage::append_entries`].
     fn append(&mut self, entry: LogEntry);
+
+    // -- 3b log-replication extensions (sections 5.3, 5.4.2) ----------------
+
+    /// The term of the entry at `index`, or `0` for `index == 0` (the empty-log
+    /// sentinel) or any `index` past the end of the log. This is what the
+    /// AppendEntries consistency check (Figure 2, rule 2) compares `prev_log_term`
+    /// against, and what the section-5.4.2 commit rule reads as `log[N].term`.
+    fn term_at(&self, index: u64) -> u64;
+
+    /// Every entry with `entry.index >= index`, in log order. A leader builds an
+    /// AppendEntries `entries` vector from `entries_from(next_index)`; with
+    /// `index == last_log_index + 1` this is empty (a pure heartbeat).
+    fn entries_from(&self, index: u64) -> Vec<LogEntry>;
+
+    /// Delete every entry with `entry.index >= index` (conflict resolution, Figure
+    /// 2 AppendEntries rule 3). `index == 0` or `index == 1` clears the whole log;
+    /// an `index` past the end is a no-op.
+    fn truncate_from(&mut self, index: u64);
+
+    /// Bulk-append `entries` to the log (Figure 2 AppendEntries rule 4), in order.
+    /// The caller is responsible for having truncated any conflicting suffix first;
+    /// this is a plain extend.
+    fn append_entries(&mut self, entries: &[LogEntry]);
 }
 
 /// An in-memory [`RaftStorage`] backed by a `Vec` log plus the term and vote.
@@ -255,6 +308,53 @@ impl RaftStorage for MemStorage {
 
     fn append(&mut self, entry: LogEntry) {
         self.log.push(entry);
+    }
+
+    fn term_at(&self, index: u64) -> u64 {
+        if index == 0 {
+            // The empty-log sentinel always "matches" prev_log_index 0 (Figure 2
+            // AppendEntries rule 2): a leader replicating from the very start sends
+            // prev_log_index 0, prev_log_term 0, which every log contains.
+            return 0;
+        }
+        // The log is 1-based and contiguous: the entry with `index` is at vec
+        // position `index - 1`. An index past the end yields 0 (no such entry).
+        usize::try_from(index - 1)
+            .ok()
+            .and_then(|pos| self.log.get(pos))
+            .map_or(0, |e| e.term)
+    }
+
+    fn entries_from(&self, index: u64) -> Vec<LogEntry> {
+        // Entries with `entry.index >= index`. With a contiguous 1-based log the
+        // first such entry is at vec position `index - 1`; `index <= 1` means "from
+        // the start" (whole log), and an index past the end yields an empty vec.
+        let start = if index <= 1 {
+            0
+        } else {
+            usize::try_from(index - 1).unwrap_or(usize::MAX)
+        };
+        self.log
+            .get(start..)
+            .map_or_else(Vec::new, <[LogEntry]>::to_vec)
+    }
+
+    fn truncate_from(&mut self, index: u64) {
+        // Delete entries with `entry.index >= index`. `index <= 1` clears the whole
+        // log (index 0 is the sentinel, index 1 is the first real entry); an index
+        // past the end truncates nothing.
+        let keep = if index <= 1 {
+            0
+        } else {
+            usize::try_from(index - 1).unwrap_or(usize::MAX)
+        };
+        if keep < self.log.len() {
+            self.log.truncate(keep);
+        }
+    }
+
+    fn append_entries(&mut self, entries: &[LogEntry]) {
+        self.log.extend_from_slice(entries);
     }
 }
 
@@ -412,6 +512,26 @@ pub struct RaftNode<S: RaftStorage> {
     config: RaftConfig,
     /// Persistent state (term, vote, log).
     storage: S,
+    /// Volatile state on ALL servers (Figure 2): the highest log index known to be
+    /// committed. Monotonic; initialized to 0. A follower advances it from
+    /// `leader_commit`; the leader advances it under the section-5.4.2 rule.
+    commit_index: u64,
+    /// Volatile state on ALL servers (Figure 2): the highest log index applied to
+    /// the state machine. `last_applied <= commit_index` always; the apply pipeline
+    /// advances it toward `commit_index` (in 3b, apply is a SINK).
+    last_applied: u64,
+    /// Volatile LEADER state (Figure 2): per-peer index of the next log entry to
+    /// send to that peer (initialized to `last_log_index + 1` on election). Only
+    /// populated while `role == Leader`; cleared on step-down.
+    next_index: BTreeMap<NodeId, u64>,
+    /// Volatile LEADER state (Figure 2): per-peer highest log index known to be
+    /// replicated on that peer (initialized to 0 on election). Only populated while
+    /// `role == Leader`; cleared on step-down.
+    match_index: BTreeMap<NodeId, u64>,
+    /// The apply SINK counter: how many entries this node has "applied" (3b stands
+    /// in for the real state machine; HA-3e replaces this with the SlotMap apply).
+    /// Exposed via [`RaftNode::applied_count`] for the state-machine-safety checker.
+    applied_count: u64,
 }
 
 impl<S: RaftStorage> RaftNode<S> {
@@ -427,6 +547,11 @@ impl<S: RaftStorage> RaftNode<S> {
             votes: BTreeSet::new(),
             config,
             storage,
+            commit_index: 0,
+            last_applied: 0,
+            next_index: BTreeMap::new(),
+            match_index: BTreeMap::new(),
+            applied_count: 0,
         }
     }
 
@@ -469,6 +594,30 @@ impl<S: RaftStorage> RaftNode<S> {
         &self.storage
     }
 
+    /// The highest log index known to be committed (volatile, monotonic; section
+    /// 5.3 / Figure 2 `commitIndex`). A committed entry is durable: it is present
+    /// on a majority and will never be overwritten (State Machine Safety).
+    #[must_use]
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index
+    }
+
+    /// The highest log index applied to the state machine (volatile; Figure 2
+    /// `lastApplied`). Always `<= commit_index`. In 3b apply is a sink, so this is
+    /// the watermark the apply pipeline has advanced to.
+    #[must_use]
+    pub fn last_applied(&self) -> u64 {
+        self.last_applied
+    }
+
+    /// How many entries this node has "applied" to the 3b apply sink. Equals
+    /// `last_applied` in steady state; exposed separately so a test can prove the
+    /// apply hook actually ran (not just that the watermark moved).
+    #[must_use]
+    pub fn applied_count(&self) -> u64 {
+        self.applied_count
+    }
+
     // -- step entry points --------------------------------------------------
 
     /// Handle an inbound message `from` a peer at virtual time `now`.
@@ -501,11 +650,34 @@ impl<S: RaftStorage> RaftNode<S> {
             RaftMsg::RequestVoteResp { term, vote_granted } => {
                 self.on_request_vote_resp(now, rng, from, term, vote_granted, out);
             }
-            RaftMsg::AppendEntries { term, leader, .. } => {
-                self.on_append_entries(rng, term, leader, out);
+            RaftMsg::AppendEntries {
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => self.on_append_entries(
+                rng,
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+                out,
+            ),
+            RaftMsg::AppendEntriesResp {
+                term,
+                success,
+                match_index,
+            } => {
+                self.on_append_entries_resp(now, rng, from, term, success, match_index, out);
             }
-            RaftMsg::AppendEntriesResp { term, .. } => {
-                self.on_append_entries_resp(rng, from, term, out);
+            RaftMsg::Propose { payload } => {
+                // A client proposal (not a peer RPC); forward to the real entry
+                // point. The returned index is for a direct caller; here we ignore it.
+                let _ = self.propose(payload, now, rng, out);
             }
         }
     }
@@ -652,30 +824,57 @@ impl<S: RaftStorage> RaftNode<S> {
     }
 
     /// APPENDENTRIES receiver (Figure 2, "AppendEntries RPC, Receiver
-    /// implementation", rule 1). In 3a this is the heartbeat handler.
+    /// implementation", rules 1-5; section 5.3). This is now the real
+    /// log-replication RPC (an empty `entries` is a heartbeat, the degenerate case
+    /// of the same path).
     ///
+    /// Order of operations:
     /// 1. "All Servers": adopt a strictly greater term (step down, clear vote).
-    /// 2. Reply false if `term < currentTerm` (rule 1): a stale leader; the reply
-    ///    carries our higher term so the stale leader steps down.
-    /// 3. Otherwise (`term == currentTerm`): recognize the leader. A `Candidate`
-    ///    in this term concedes to the leader and becomes a `Follower` (Figure 2,
-    ///    "Candidates": if AppendEntries received from new leader, convert to
-    ///    follower). RESET the election timer (we have heard from the leader) and
-    ///    reply success with our last index.
+    /// 2. RULE 1: reply false if `term < currentTerm` (a stale leader); the reply
+    ///    carries our higher term so the stale leader steps down. We do NOT reset
+    ///    our election timer for a stale leader.
+    /// 3. `term == currentTerm`: a legitimate leader for this term. A `Candidate`
+    ///    concedes and becomes a `Follower` (Figure 2, "Candidates"); RESET the
+    ///    election timer (we have heard from the current leader).
+    /// 4. RULE 2 (log consistency check): reply false if our log does not contain
+    ///    an entry at `prev_log_index` whose term == `prev_log_term`. `prev_log_index
+    ///    == 0` (the sentinel) always matches. On failure we reply false with a
+    ///    `match_index` hint of our last index (no fast-backup; the leader decrements
+    ///    `nextIndex` and retries).
+    /// 5. RULE 3 (conflict truncation) + RULE 4 (append): walk the incoming entries
+    ///    against our log; at the first index whose term differs (a conflict) we
+    ///    TRUNCATE from there and append the remaining incoming entries. Entries we
+    ///    already hold identically are left untouched (so a duplicated/retried
+    ///    AppendEntries does not truncate committed suffix - the section-5.3
+    ///    idempotence the paper's rule 3 "(same index but different terms)" wording
+    ///    requires).
+    /// 6. RULE 5: set `commit_index = min(leader_commit, index of last new entry)`,
+    ///    then drive the apply pipeline. "Index of last new entry" is the index of
+    ///    the LAST entry this RPC reconciled into our log (`prev_log_index +
+    ///    entries.len()`), not our overall last index, so a lagging follower does
+    ///    not over-advance commit past what this leader vouched for.
+    // Takes `entries` by value to match `on_message`'s by-value step surface (the
+    // transport hands ownership of the decoded message in); we only borrow/slice it
+    // here, hence the needless_pass_by_value allow, same as `on_message`.
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn on_append_entries(
         &mut self,
         rng: &mut dyn RaftRng,
         term: u64,
         leader: NodeId,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
         out: &mut Effects,
     ) {
-        let _ = leader;
         self.observe_term(term, rng, out);
         let current = self.storage.current_term();
 
         if term < current {
             // Rule 1: stale leader. Do not reset our timer; reply with our higher
-            // term so the stale leader steps down.
+            // term so the stale leader steps down. The match_index hint is moot on a
+            // term-rejected reply (the leader will step down on the higher term).
             out.send(
                 leader,
                 RaftMsg::AppendEntriesResp {
@@ -691,30 +890,135 @@ impl<S: RaftStorage> RaftNode<S> {
         if self.role != Role::Follower {
             self.step_down_to_follower(out);
         }
-        // Recognize the leader: reset the election timer (heard from leader).
+        // Recognize the leader: reset the election timer (heard from leader). We do
+        // this BEFORE the consistency check: even a check-failing AppendEntries is
+        // proof of a live current-term leader, so we must not time out and disrupt it.
         self.arm_election_timer(rng, out);
+
+        // Rule 2: log consistency check. The log must contain an entry at
+        // prev_log_index whose term matches prev_log_term. prev_log_index 0 (the
+        // empty-log sentinel) always matches (term_at returns 0 == prev_log_term 0).
+        if self.storage.term_at(prev_log_index) != prev_log_term {
+            out.send(
+                leader,
+                RaftMsg::AppendEntriesResp {
+                    term: current,
+                    success: false,
+                    // Hint our last index so the leader can bound its rewind. We do
+                    // not implement the fast-backup conflict index; one decrement per
+                    // round is correct, just slower.
+                    match_index: self.storage.last_log_index(),
+                },
+            );
+            return;
+        }
+
+        // Rules 3 + 4: reconcile `entries` into our log. Find the first incoming
+        // entry that is NOT already present-and-identical; truncate any conflicting
+        // suffix from there, then append the rest. Entries we already hold are left
+        // in place so a retransmitted prefix does not truncate (and potentially lose)
+        // an already-committed suffix.
+        let mut append_from = 0usize; // index into `entries` of the first to append
+        for (i, entry) in entries.iter().enumerate() {
+            // The 1-based log index this incoming entry would occupy.
+            let idx = prev_log_index + 1 + u64::try_from(i).unwrap_or(u64::MAX);
+            let existing_term = self.storage.term_at(idx);
+            if existing_term == 0 {
+                // No existing entry here (term_at returns 0 past the end): from this
+                // point on everything is genuinely new.
+                append_from = i;
+                break;
+            }
+            if existing_term != entry.term {
+                // Rule 3: conflict (same index, different term). Truncate from here
+                // and append from this incoming entry onward.
+                self.storage.truncate_from(idx);
+                append_from = i;
+                break;
+            }
+            // Same index, same term: identical (Log Matching). Already present; skip.
+            append_from = i + 1;
+        }
+        if append_from < entries.len() {
+            self.storage.append_entries(&entries[append_from..]);
+        }
+
+        // Rule 5: advance commit_index toward leader_commit, capped at the index of
+        // the last entry THIS RPC vouched for (prev_log_index + entries.len()).
+        let last_new_index = prev_log_index + u64::try_from(entries.len()).unwrap_or(u64::MAX);
+        if leader_commit > self.commit_index {
+            let new_commit = leader_commit.min(last_new_index);
+            if new_commit > self.commit_index {
+                self.commit_index = new_commit;
+                self.apply_committed();
+            }
+        }
+
         out.send(
             leader,
             RaftMsg::AppendEntriesResp {
                 term: current,
                 success: true,
-                match_index: self.storage.last_log_index(),
+                // The highest index we now agree with the leader on: the last entry
+                // this RPC reconciled. Using last_new_index (not our overall last
+                // index) keeps match_index honest if our log had a longer stale tail.
+                match_index: last_new_index,
             },
         );
     }
 
-    /// APPENDENTRIES response handler. In 3a only the term check matters (no log
-    /// replication bookkeeping yet): a response with a greater term steps the
-    /// leader down. Everything else is a no-op until log replication lands.
+    /// APPENDENTRIES response handler (Figure 2, "Leaders": on AppendEntries
+    /// response, update `nextIndex`/`matchIndex` and advance `commitIndex`).
+    ///
+    /// 1. "All Servers": a response with a greater term steps the leader down. We
+    ///    return immediately in that case (the stale-leader bookkeeping is moot).
+    /// 2. Only a `Leader` in the SAME term as the response cares (a stale response
+    ///    from an old term is ignored).
+    /// 3. On success: set `match_index[from] = msg.match_index` and `next_index[from]
+    ///    = match_index + 1` (taking the MAX so a reordered/duplicated older success
+    ///    cannot rewind progress), then try to advance our `commit_index` under the
+    ///    section-5.4.2 rule.
+    /// 4. On failure (and we did not step down): DECREMENT `next_index[from]`
+    ///    (floor 1) and immediately retry with the earlier prev (the paper's
+    ///    "decrement nextIndex and retry" backup).
+    #[allow(clippy::too_many_arguments)]
     fn on_append_entries_resp(
         &mut self,
+        now: Monotonic,
         rng: &mut dyn RaftRng,
         from: NodeId,
         term: u64,
+        success: bool,
+        match_index: u64,
         out: &mut Effects,
     ) {
-        let _ = from;
-        self.observe_term(term, rng, out);
+        let _ = now;
+        if self.observe_term(term, rng, out) {
+            // We stepped down on a higher term; we are no longer leader.
+            return;
+        }
+        if self.role != Role::Leader || term != self.storage.current_term() {
+            // Stale response (old term) or we are not leader: ignore.
+            return;
+        }
+
+        if success {
+            // Advance this peer's replicated/next markers. Take the MAX so a delayed
+            // or duplicated older success can never rewind an already-higher marker.
+            let m = self.match_index.entry(from).or_insert(0);
+            *m = (*m).max(match_index);
+            let mi = *m;
+            self.next_index.insert(from, mi + 1);
+            // A peer made progress: maybe a new index is now on a majority.
+            self.maybe_advance_commit();
+        } else {
+            // Rule: decrement nextIndex (floor 1) and retry with the earlier prev.
+            let ni = self.next_index.entry(from).or_insert(1);
+            if *ni > 1 {
+                *ni -= 1;
+            }
+            self.send_append_entries_to(from, out);
+        }
     }
 
     /// HEARTBEAT timer (Figure 2, "Leaders": send empty AppendEntries to each
@@ -755,6 +1059,9 @@ impl<S: RaftStorage> RaftNode<S> {
             let was_leader = self.role == Role::Leader;
             self.role = Role::Follower;
             self.votes.clear();
+            // Drop leader-only volatile state (reinitialized on the next election).
+            self.next_index.clear();
+            self.match_index.clear();
             if was_leader {
                 out.cancel_timer(HEARTBEAT);
             }
@@ -784,12 +1091,21 @@ impl<S: RaftStorage> RaftNode<S> {
         }
         self.role = Role::Follower;
         self.votes.clear();
+        // Leader-only volatile state is meaningless once we are not leader; clear it
+        // so a future re-election reinitializes it cleanly (Figure 2 reinitializes
+        // nextIndex/matchIndex on every election).
+        self.next_index.clear();
+        self.match_index.clear();
     }
 
     /// Become `Leader` if the current vote tally is a strict majority of voters
-    /// (Figure 2, "Candidates"). On winning: cancel the election timer, append a
-    /// no-op to our own log (so the leader has a current-term entry), broadcast the
-    /// initial empty `AppendEntries`, and arm the heartbeat timer.
+    /// (Figure 2, "Candidates"). On winning: cancel the election timer; INITIALIZE
+    /// the per-peer replication state (`nextIndex = lastLogIndex + 1`, `matchIndex =
+    /// 0`, Figure 2 "Leaders"); append a no-op to our own log (section 8: a
+    /// current-term entry the new leader can commit, which is also what lets the
+    /// commit-only-current-term rule carry forward prior-term entries; see
+    /// [`RaftNode::maybe_advance_commit`]); then broadcast the initial replication
+    /// AppendEntries and arm the heartbeat timer.
     fn maybe_become_leader(&mut self, out: &mut Effects) {
         if self.role != Role::Candidate {
             return;
@@ -801,8 +1117,22 @@ impl<S: RaftStorage> RaftNode<S> {
         self.role = Role::Leader;
         out.cancel_timer(ELECTION_TIMEOUT);
 
+        // Initialize leader replication state for every peer (Figure 2, "Leaders":
+        // on election, nextIndex = last log index + 1, matchIndex = 0). Our own
+        // match is implicit (we always have our whole log); the commit counter
+        // counts the leader itself separately.
+        let next = self.storage.last_log_index() + 1;
+        self.next_index.clear();
+        self.match_index.clear();
+        for &peer in &self.voters {
+            if peer != self.id {
+                self.next_index.insert(peer, next);
+                self.match_index.insert(peer, 0);
+            }
+        }
+
         // Append the election no-op (section 8; a current-term entry the leader can
-        // commit). In 3a it is the only thing in the log beyond prior no-ops.
+        // commit, which also makes prior-term entries committable transitively).
         let next_index = self.storage.last_log_index() + 1;
         let term = self.storage.current_term();
         self.storage.append(LogEntry {
@@ -811,30 +1141,148 @@ impl<S: RaftStorage> RaftNode<S> {
             payload: EntryPayload::Noop,
         });
 
+        // Replicate (the no-op plus any backlog) to every peer and start heartbeats.
         self.broadcast_heartbeat(out);
         out.set_timer(HEARTBEAT, self.config.heartbeat_interval);
     }
 
-    /// Broadcast an empty (heartbeat) `AppendEntries` to every other voter.
+    /// Broadcast a replication `AppendEntries` to every other voter (Figure 2,
+    /// "Leaders"). Each peer's RPC carries `prev` and `entries` derived from that
+    /// peer's `nextIndex`, so this is heartbeat AND log shipping in one: a
+    /// caught-up peer gets an empty `entries` (a pure heartbeat), a lagging peer
+    /// gets the entries it is missing. Replaces 3a's always-empty heartbeat.
     fn broadcast_heartbeat(&self, out: &mut Effects) {
-        let term = self.storage.current_term();
-        let prev_log_index = self.storage.last_log_index();
-        let prev_log_term = self.storage.last_log_term();
         for &peer in &self.voters {
             if peer != self.id {
-                out.send(
-                    peer,
-                    RaftMsg::AppendEntries {
-                        term,
-                        leader: self.id,
-                        prev_log_index,
-                        prev_log_term,
-                        entries: Vec::new(),
-                        leader_commit: 0,
-                    },
-                );
+                self.send_append_entries_to(peer, out);
             }
         }
+    }
+
+    /// Send a single replication `AppendEntries` to `peer` from its `nextIndex`
+    /// (Figure 2, "Leaders": send AppendEntries with log entries starting at
+    /// nextIndex). `prev_log_index = nextIndex - 1`, `prev_log_term =
+    /// term_at(prev_log_index)`, `entries = entries_from(nextIndex)`, `leader_commit
+    /// = commit_index`. Only meaningful while `role == Leader`.
+    fn send_append_entries_to(&self, peer: NodeId, out: &mut Effects) {
+        let term = self.storage.current_term();
+        let next = self.next_index.get(&peer).copied().unwrap_or(1);
+        let prev_log_index = next.saturating_sub(1);
+        let prev_log_term = self.storage.term_at(prev_log_index);
+        let entries = self.storage.entries_from(next);
+        out.send(
+            peer,
+            RaftMsg::AppendEntries {
+                term,
+                leader: self.id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: self.commit_index,
+            },
+        );
+    }
+
+    /// Advance the leader's `commit_index` under the section-5.4.2 rule (THE
+    /// Figure-8 safety rule). Find the highest index `N > commit_index` such that:
+    ///
+    /// - a MAJORITY of voters (counting the leader itself, whose whole log is
+    ///   trivially replicated) have `match_index >= N`, AND
+    /// - `log[N].term == currentTerm`.
+    ///
+    /// The second clause is the crux of 5.4.2: a leader NEVER commits an entry from
+    /// a PRIOR term by counting replicas, because a later leader could still
+    /// overwrite a prior-term entry that is merely present on a majority (Figure 8).
+    /// A prior-term entry becomes committed only TRANSITIVELY: once a current-term
+    /// entry above it reaches a majority and commits, every entry below it is
+    /// committed by the Log Matching Property. Advancing commit then drives apply.
+    fn maybe_advance_commit(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let current_term = self.storage.current_term();
+        let last = self.storage.last_log_index();
+        let majority = self.voters.len() / 2 + 1;
+
+        // Scan from the highest index downward; the first N that satisfies both
+        // clauses is the new commit index (commit is monotone, so a higher N
+        // dominates). Stop at commit_index + 1 (no point re-confirming what is
+        // already committed).
+        let mut new_commit = self.commit_index;
+        let mut n = last;
+        while n > self.commit_index {
+            // Clause 2 (5.4.2): only current-term entries are committable by count.
+            if self.storage.term_at(n) == current_term {
+                // Count voters with match_index >= n. The leader counts itself (it
+                // holds every entry up to `last`, so it replicates N for any N <=
+                // last); each peer counts if its tracked match_index >= n.
+                let mut replicated = 1; // the leader itself
+                for (&peer, &mi) in &self.match_index {
+                    let _ = peer;
+                    if mi >= n {
+                        replicated += 1;
+                    }
+                }
+                if replicated >= majority {
+                    new_commit = n;
+                    break;
+                }
+            }
+            n -= 1;
+        }
+
+        if new_commit > self.commit_index {
+            self.commit_index = new_commit;
+            self.apply_committed();
+        }
+    }
+
+    /// The apply pipeline (Figure 2, "All Servers": if `commitIndex > lastApplied`,
+    /// increment `lastApplied` and apply `log[lastApplied]` to the state machine).
+    /// In 3b apply is a SINK: we advance `last_applied` to `commit_index` and bump
+    /// an applied counter per entry. HA-3e replaces the per-entry hook with the real
+    /// SlotMap apply. Idempotent and monotone: `last_applied` never exceeds
+    /// `commit_index` and never moves backward.
+    fn apply_committed(&mut self) {
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            // 3b apply sink: in HA-3e this is where log[last_applied].payload is
+            // applied to the SlotMap state machine. Here we only count it.
+            self.applied_count += 1;
+        }
+    }
+
+    /// Accept a client proposal on a leader: append an opaque entry at the current
+    /// term and replicate it (Figure 2, "Leaders": on a client command, append to
+    /// the local log, then replicate). Returns the new entry's index on success, or
+    /// `None` if this node is not the leader (the caller should redirect to the
+    /// leader; 3b carries no redirect hint, the `None` IS the redirect signal).
+    ///
+    /// A single-voter cluster commits the entry immediately (the leader alone is a
+    /// majority), which `maybe_advance_commit` handles.
+    pub fn propose(
+        &mut self,
+        payload: EntryPayload,
+        now: Monotonic,
+        rng: &mut dyn RaftRng,
+        out: &mut Effects,
+    ) -> Option<u64> {
+        let _ = (now, rng);
+        if self.role != Role::Leader {
+            return None;
+        }
+        let index = self.storage.last_log_index() + 1;
+        let term = self.storage.current_term();
+        self.storage.append(LogEntry {
+            term,
+            index,
+            payload,
+        });
+        // Replicate at once so a quiet cluster does not wait a heartbeat interval,
+        // and so a single-voter leader's own append commits immediately.
+        self.broadcast_heartbeat(out);
+        self.maybe_advance_commit();
+        Some(index)
     }
 
     /// Arm (reset) the election timer with a fresh randomized timeout in
@@ -1092,6 +1540,47 @@ mod tests {
                 .filter(|&id| self.role(id) == Role::Leader)
                 .collect()
         }
+
+        // -- 3b log/commit accessors ---------------------------------------
+
+        /// A node's committed index (the 3b watermark; see [`RaftNode::commit_index`]).
+        fn commit_index(&self, id: NodeId) -> u64 {
+            self.net
+                .node(to_sim(id))
+                .expect("node exists")
+                .engine
+                .commit_index()
+        }
+
+        /// A node's last-applied watermark.
+        fn last_applied(&self, id: NodeId) -> u64 {
+            self.net
+                .node(to_sim(id))
+                .expect("node exists")
+                .engine
+                .last_applied()
+        }
+
+        /// A node's log entries, cloned for inspection (via the storage accessor).
+        fn log(&self, id: NodeId) -> Vec<LogEntry> {
+            self.net
+                .node(to_sim(id))
+                .expect("node exists")
+                .engine
+                .storage()
+                .log()
+                .to_vec()
+        }
+
+        /// Inject a client proposal at `leader` by self-`tell`ing a
+        /// [`RaftMsg::Propose`] (delivered through the same deterministic transport
+        /// as any message, so it is part of the reproducible run). On a non-leader
+        /// it is a no-op (the engine rejects it), which is exactly the redirect
+        /// behavior under test.
+        fn propose(&mut self, leader: NodeId, payload: EntryPayload) {
+            self.net
+                .tell(to_sim(leader), to_sim(leader), RaftMsg::Propose { payload });
+        }
     }
 
     // -- election-safety checker -------------------------------------------
@@ -1118,6 +1607,146 @@ mod tests {
                 "election safety violated: term {term} has leaders {leaders:?}"
             );
         }
+    }
+
+    // -- 3b invariant checkers: Log Matching + State Machine Safety --------
+
+    /// The Log Matching Property (Raft section 5.3): "if two logs contain an entry
+    /// with the same index and term, then the logs are identical in all entries up
+    /// through that index." We assert it pairwise over every node pair: for each
+    /// common index, if both logs hold an entry there with the SAME term, then every
+    /// entry at-or-before that index (term AND payload) must be identical between the
+    /// two logs. A divergence here means replication corrupted a log; it is the
+    /// structural invariant that underwrites the up-to-date check and commit safety.
+    fn assert_log_matching(cluster: &RaftCluster) {
+        let logs: Vec<(NodeId, Vec<LogEntry>)> = cluster
+            .ids
+            .iter()
+            .map(|&id| (id, cluster.log(id)))
+            .collect();
+        for i in 0..logs.len() {
+            for j in (i + 1)..logs.len() {
+                let (id_a, log_a) = (&logs[i].0, &logs[i].1);
+                let (id_b, log_b) = (&logs[j].0, &logs[j].1);
+                let common = log_a.len().min(log_b.len());
+                for k in 0..common {
+                    let ea = &log_a[k];
+                    let eb = &log_b[k];
+                    // Logs are 1-based and contiguous, so position k is index k+1 in
+                    // both; assert the index bookkeeping holds before comparing terms.
+                    let idx = u64::try_from(k + 1).unwrap_or(u64::MAX);
+                    assert_eq!(ea.index, idx, "node {id_a:?} log index bookkeeping");
+                    assert_eq!(eb.index, idx, "node {id_b:?} log index bookkeeping");
+                    if ea.term == eb.term {
+                        // Same (index, term): every entry up through k must match
+                        // exactly (term and payload) on both logs.
+                        for m in 0..=k {
+                            assert_eq!(
+                                log_a[m],
+                                log_b[m],
+                                "log matching violated: nodes {id_a:?} and {id_b:?} \
+                                 agree at index {idx} (term {}) but differ at index {}",
+                                ea.term,
+                                m + 1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// State Machine Safety (Raft section 5.4.3 / Figure 3): "if a server has
+    /// applied a log entry at a given index to its state machine, no other server
+    /// will ever apply a different log entry for the same index." Because 3b's apply
+    /// is a sink, we assert the equivalent over the COMMITTED prefix: no two nodes
+    /// hold a DIFFERENT entry at any index that BOTH consider committed (index <=
+    /// their respective `commit_index`). A committed entry is, by definition, agreed;
+    /// a divergence in a committed prefix is exactly the data loss 5.4.2 forbids.
+    ///
+    /// This is a snapshot check; the cross-TIME guarantee (a once-committed entry is
+    /// never later overwritten) is enforced by [`CommitLedger`], which records every
+    /// committed entry ever observed and re-checks it on each step.
+    fn assert_state_machine_safety(cluster: &RaftCluster) {
+        for i in 0..cluster.ids.len() {
+            for j in (i + 1)..cluster.ids.len() {
+                let id_a = cluster.ids[i];
+                let id_b = cluster.ids[j];
+                let log_a = cluster.log(id_a);
+                let log_b = cluster.log(id_b);
+                let committed = cluster.commit_index(id_a).min(cluster.commit_index(id_b));
+                for idx in 1..=committed {
+                    let pos = usize::try_from(idx - 1).unwrap_or(usize::MAX);
+                    let ea = log_a.get(pos);
+                    let eb = log_b.get(pos);
+                    // Both nodes claim idx committed, so both MUST have the entry and
+                    // the entries must be identical (a committed entry is agreed).
+                    assert_eq!(
+                        ea, eb,
+                        "state machine safety violated: nodes {id_a:?} and {id_b:?} \
+                         both committed index {idx} but hold different entries \
+                         ({ea:?} vs {eb:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A cross-TIME ledger of every committed entry ever observed, to prove the
+    /// strongest State Machine Safety statement: once an entry is committed at an
+    /// index, NO node ever holds a different entry at that index again (it is never
+    /// overwritten or lost). A snapshot check cannot see this; the ledger is sampled
+    /// on every step chunk and remembers (index -> the committed entry), then asserts
+    /// every node's current log is consistent with that history.
+    ///
+    /// This is THE Figure-8 gate's witness: the section-5.4.2 commit rule exists
+    /// precisely so this ledger never has to overwrite an entry it already recorded.
+    #[derive(Default)]
+    struct CommitLedger {
+        /// index -> the entry that was observed committed there (the durable truth).
+        committed: BTreeMap<u64, LogEntry>,
+    }
+
+    impl CommitLedger {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        /// Sample the cluster: for every node, record each entry at-or-below that
+        /// node's `commit_index` as durable, and assert it never contradicts a
+        /// previously recorded entry at the same index. Recording from EVERY node is
+        /// safe because the committed prefix is, by the algorithm's correctness, the
+        /// same on all nodes that have it (snapshot SMS guards the same-step case).
+        fn observe_and_check(&mut self, cluster: &RaftCluster) {
+            for &id in &cluster.ids {
+                let ci = cluster.commit_index(id);
+                let log = cluster.log(id);
+                for idx in 1..=ci {
+                    let pos = usize::try_from(idx - 1).unwrap_or(usize::MAX);
+                    let Some(entry) = log.get(pos) else {
+                        panic!("node {id:?} claims commit_index {ci} but lacks index {idx}");
+                    };
+                    match self.committed.get(&idx) {
+                        Some(prev) => assert_eq!(
+                            prev, entry,
+                            "state machine safety violated ACROSS TIME: index {idx} was \
+                             committed as {prev:?} but node {id:?} now holds {entry:?} \
+                             (a committed entry was overwritten - Figure-8 failure)"
+                        ),
+                        None => {
+                            self.committed.insert(idx, entry.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Convenience: run all three structural invariants at a quiescent point.
+    fn assert_3b_invariants(cluster: &RaftCluster) {
+        assert_election_safety(cluster);
+        assert_log_matching(cluster);
+        assert_state_machine_safety(cluster);
     }
 
     // -- scenario 1: clean start elects exactly one leader -----------------
@@ -1516,5 +2145,564 @@ mod tests {
                 cluster.leaders()
             );
         }
+    }
+
+    // =====================================================================
+    // 3b DST scenarios (log replication + commit; sections 5.3, 5.4.2).
+    // =====================================================================
+
+    /// Run `cluster` to a single leader, then return it. A thin wrapper that also
+    /// asserts the 3b structural invariants once quiescent.
+    fn elect_one_leader(cluster: &mut RaftCluster) -> NodeId {
+        let leader = run_to_single_leader(cluster, 500, 200);
+        // Drain any in-flight replication so the no-op the leader appended on
+        // election settles before we start proposing.
+        cluster.net.run_steps(5_000);
+        assert_3b_invariants(cluster);
+        leader
+    }
+
+    fn payload(tag: u8) -> EntryPayload {
+        EntryPayload::Bytes(vec![tag])
+    }
+
+    // -- scenario 1: a replicated entry commits and all logs converge ------
+
+    #[test]
+    fn replicated_entry_commits_and_converges() {
+        // 3 voters. Elect a leader, propose several entries, run to quiescence.
+        // Assert: every node's log converges to the same sequence, commit_index
+        // advances past the proposals on a majority, last_applied tracks it, and the
+        // two 3b structural invariants hold.
+        let mut cluster = RaftCluster::new(3, 11, RaftConfig::default());
+        let leader = elect_one_leader(&mut cluster);
+        let commit_before = cluster.commit_index(leader);
+
+        // Propose 5 opaque entries at the leader.
+        for tag in 0..5u8 {
+            cluster.propose(leader, payload(tag));
+            cluster.net.run_steps(2_000);
+            assert_3b_invariants(&cluster);
+        }
+        cluster.run_until_idle(100_000);
+        assert_3b_invariants(&cluster);
+
+        // The leader's commit_index advanced by at least the 5 proposals (plus the
+        // election no-op committed transitively once a current-term entry committed).
+        let leader_commit = cluster.commit_index(leader);
+        assert!(
+            leader_commit >= commit_before + 5,
+            "leader commit_index must advance past the proposals: {commit_before} -> {leader_commit}"
+        );
+
+        // Every node converges to the leader's exact log, and every node commits and
+        // applies up to (at least) the same watermark.
+        let leader_log = cluster.log(leader);
+        for &id in &cluster.ids {
+            assert_eq!(
+                cluster.log(id),
+                leader_log,
+                "node {id:?} log must converge to the leader's"
+            );
+            assert_eq!(
+                cluster.commit_index(id),
+                leader_commit,
+                "node {id:?} commit_index must match the leader's once idle"
+            );
+            assert_eq!(
+                cluster.last_applied(id),
+                cluster.commit_index(id),
+                "node {id:?} must have applied up to its commit_index (apply sink)"
+            );
+        }
+    }
+
+    // -- scenario 2 (D): log convergence after partition heal --------------
+
+    #[test]
+    fn log_convergence_after_partition_heal() {
+        // 5 voters. The leader commits entries with a 3-node majority while 2 nodes
+        // are partitioned off; on heal, the lagging nodes catch up via the nextIndex
+        // decrement/retry backup and every log agrees up to commit_index.
+        let mut cluster = RaftCluster::new(5, 23, RaftConfig::default());
+        let leader = elect_one_leader(&mut cluster);
+
+        // Choose two followers to isolate; keep the leader + two others as the
+        // majority side (3 of 5 = a majority, so the leader stays authoritative and
+        // can still commit).
+        let followers: Vec<NodeId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != leader)
+            .collect();
+        let lagging = [followers[0], followers[1]];
+        let majority_side: Vec<SimId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != lagging[0] && id != lagging[1])
+            .map(to_sim)
+            .collect();
+        let lagging_side: Vec<SimId> = lagging.iter().copied().map(to_sim).collect();
+        cluster.net.partition(&majority_side, &lagging_side);
+
+        // Propose while partitioned; the majority side commits these.
+        for tag in 0..6u8 {
+            cluster.propose(leader, payload(tag));
+            cluster.net.run_steps(3_000);
+            assert_3b_invariants(&cluster);
+        }
+        cluster.net.run_steps(10_000);
+        assert_3b_invariants(&cluster);
+
+        let committed_while_partitioned = cluster.commit_index(leader);
+        assert!(
+            committed_while_partitioned > 0,
+            "the majority side must commit while the minority is partitioned"
+        );
+        // The lagging nodes did NOT receive the new entries (they were partitioned).
+        for &id in &lagging {
+            assert!(
+                cluster.commit_index(id) < committed_while_partitioned,
+                "lagging node {id:?} must trail the committed index while partitioned"
+            );
+        }
+
+        // Heal; the lagging nodes must catch up via nextIndex decrement/retry.
+        cluster.net.heal();
+        cluster.run_until_idle(200_000);
+        assert_3b_invariants(&cluster);
+
+        let leader_log = cluster.log(leader);
+        let target_commit = cluster.commit_index(leader);
+        for &id in &cluster.ids {
+            assert_eq!(
+                cluster.log(id),
+                leader_log,
+                "node {id:?} log must converge after heal"
+            );
+            assert_eq!(
+                cluster.commit_index(id),
+                target_commit,
+                "node {id:?} must catch up to the committed index after heal"
+            );
+        }
+    }
+
+    // -- scenario 3 (E1): the Figure-8 commit-safety gate ------------------
+
+    /// THE Figure-8 safety rule (section 5.4.2), proven on the PURE engine where the
+    /// exact log states the paper draws can be constructed deterministically (the
+    /// sim's single-partition model cannot force the precise 5-way leader hand-off
+    /// Figure 8 requires; driving the engine directly is the faithful reproduction).
+    ///
+    /// Construction mirrors Figure 8 exactly. Cluster S1..S5. We make S1 the leader
+    /// in term 4 with this log: index1=(term1), index2=(term2). S2 also has
+    /// index2=(term2) (S1 replicated it to S2 back in term 2). S3,S4,S5 have only
+    /// index1. The danger the rule guards: S1 must NOT commit index2 (a term-2 entry)
+    /// just because index2 is now on a MAJORITY {S1,S2,S1-counts-3rd?}. We drive S1's
+    /// commit logic with match_index showing index2 on a majority and assert S1 does
+    /// NOT advance commit to index2 (it is a PRIOR-term entry). Then S1 appends a
+    /// term-4 entry at index3, gets it onto a majority, and NOW commit jumps to
+    /// index3, carrying index2 with it transitively. That committed state is then
+    /// durable: a subsequent leader cannot overwrite it (it is on a majority with a
+    /// current-or-newer term).
+    #[test]
+    fn figure_8_commit_safety() {
+        let voters: BTreeSet<NodeId> = (1..=5).map(NodeId).collect();
+        // Build S1's storage exactly as Figure 8 (c): index1 term1, index2 term2.
+        let mut s1 = MemStorage::new();
+        s1.set_current_term(4);
+        s1.append(LogEntry {
+            term: 1,
+            index: 1,
+            payload: EntryPayload::Noop,
+        });
+        s1.append(LogEntry {
+            term: 2,
+            index: 2,
+            payload: payload(0xAA),
+        });
+        let mut leader = RaftNode::new(NodeId(1), voters.clone(), s1, RaftConfig::default());
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+
+        // Force S1 to leader in term 4 the way the engine reaches it: it just won an
+        // election. We replay that by hand so next_index/match_index initialize.
+        // (Directly flipping role would skip the Figure-2 leader init.) Win via a
+        // crafted vote round at the engine boundary instead: easier and faithful is
+        // to call the internal promotion path through a candidate transition.
+        // Simplest deterministic path: set role to Candidate with a full tally, then
+        // run maybe_become_leader, which initializes next/match and appends the
+        // term-4 no-op. To avoid the no-op perturbing the index math below, we model
+        // the post-election state by initializing leader markers ourselves and then
+        // exercising ONLY the commit rule. The commit rule is the unit under test.
+        promote_to_leader_for_test(&mut leader);
+
+        // After promotion the leader appended a term-4 no-op at index3. Figure 8's
+        // index2 (term 2) is now the SECOND entry; the no-op is index3 (term 4).
+        assert_eq!(leader.storage().last_log_index(), 3);
+        assert_eq!(
+            leader.storage().term_at(2),
+            2,
+            "index2 is the prior-term entry"
+        );
+        assert_eq!(
+            leader.storage().term_at(3),
+            4,
+            "index3 is the current-term no-op"
+        );
+        assert_eq!(leader.commit_index(), 0, "nothing committed yet");
+
+        // STEP 1 (the dangerous one): a MAJORITY now stores index2 (the term-2
+        // entry). Model S2 acknowledging up to index2, and S1 itself has it: that is
+        // 2 of 5; bring in S3 acking index2 too -> 3 of 5 = a majority storing
+        // index2. The section-5.4.2 rule MUST refuse to commit index2 by this count,
+        // because index2 is from a PRIOR term (term 2 != currentTerm 4).
+        let mut out = Effects::new();
+        leader.on_append_entries_resp(now, &mut rng, NodeId(2), 4, true, 2, &mut out);
+        leader.on_append_entries_resp(now, &mut rng, NodeId(3), 4, true, 2, &mut out);
+        assert_eq!(
+            leader.commit_index(),
+            0,
+            "FIGURE 8: a prior-term entry (index2, term2) on a MAJORITY must NOT be \
+             committed by replica count (section 5.4.2)"
+        );
+
+        // STEP 2: the leader replicates its CURRENT-term entry (index3, term4) to a
+        // majority. The moment index3 is on a majority, commit jumps to index3 - and
+        // index2 commits TRANSITIVELY (Log Matching: index2 precedes the now-committed
+        // index3). This is the ONLY way the prior-term entry becomes committed.
+        leader.on_append_entries_resp(now, &mut rng, NodeId(2), 4, true, 3, &mut out);
+        leader.on_append_entries_resp(now, &mut rng, NodeId(3), 4, true, 3, &mut out);
+        assert_eq!(
+            leader.commit_index(),
+            3,
+            "once a CURRENT-term entry (index3, term4) is on a majority, commit \
+             advances to it and carries index2 with it transitively"
+        );
+        assert_eq!(
+            leader.last_applied(),
+            3,
+            "apply pipeline follows commit_index"
+        );
+
+        // STEP 3 (durability): index2 is now committed. Assert the engine never
+        // un-commits it and never overwrites it. Re-running the commit rule (more
+        // acks, idle heartbeats) only ever advances or holds commit, never rewinds.
+        let committed_log = leader.storage().log().to_vec();
+        leader.on_append_entries_resp(now, &mut rng, NodeId(4), 4, true, 3, &mut out);
+        leader.on_append_entries_resp(now, &mut rng, NodeId(5), 4, true, 3, &mut out);
+        assert_eq!(
+            leader.commit_index(),
+            3,
+            "commit_index is monotone: extra acks never rewind it"
+        );
+        assert_eq!(
+            &leader.storage().log()[..2],
+            &committed_log[..2],
+            "the committed prefix (index1, index2) is never overwritten"
+        );
+    }
+
+    /// A second, end-to-end Figure-8 witness over the FULL sim across a seed sweep:
+    /// drive leader changes and partitions so old-term entries get replicated widely,
+    /// and assert the cross-TIME [`CommitLedger`] never sees a committed entry
+    /// overwritten (the safety property the 5.4.2 rule guarantees). This is the
+    /// "closest deterministic reproduction" the spec asks for when a fully scripted
+    /// 5-way Figure 8 cannot be forced through the single-partition sim model.
+    #[test]
+    fn figure_8_commit_safety_seed_sweep() {
+        let config = RaftConfig::default();
+        for seed in 0..40u64 {
+            let mut cluster = RaftCluster::new(5, seed, config);
+            cluster
+                .net
+                .set_latency(Duration::from_millis(1), Duration::from_millis(15));
+            let mut ledger = CommitLedger::new();
+
+            // Round after round: find the current leader, propose, then partition it
+            // off so a NEW leader rises with the old leader's entries possibly only
+            // partially replicated (the Figure-8 precondition: prior-term entries
+            // scattered across a changing majority). Heal and repeat. The ledger is
+            // sampled every chunk; it must never record an overwrite.
+            for round in 0..6 {
+                let leader = run_to_single_leader(&mut cluster, 500, 200);
+                ledger.observe_and_check(&cluster);
+                assert_3b_invariants(&cluster);
+
+                // Propose a couple of entries tagged by round so they are distinct.
+                cluster.propose(leader, payload(round));
+                cluster.propose(leader, payload(round.wrapping_add(100)));
+                // Let them partially replicate.
+                cluster.net.run_steps(800);
+                ledger.observe_and_check(&cluster);
+
+                // Isolate the leader -> a new leader must rise on the majority side.
+                let others: Vec<SimId> = cluster
+                    .ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != leader)
+                    .map(to_sim)
+                    .collect();
+                cluster.net.partition(&[to_sim(leader)], &others);
+                for _ in 0..20 {
+                    cluster.net.run_steps(500);
+                    ledger.observe_and_check(&cluster);
+                    assert_3b_invariants(&cluster);
+                }
+                // Heal; let everything reconcile, sampling the ledger throughout.
+                cluster.net.heal();
+                for _ in 0..20 {
+                    cluster.net.run_steps(500);
+                    ledger.observe_and_check(&cluster);
+                    assert_3b_invariants(&cluster);
+                }
+            }
+            cluster.run_until_idle(200_000);
+            ledger.observe_and_check(&cluster);
+            assert_3b_invariants(&cluster);
+        }
+    }
+
+    // -- scenario 4: determinism replay of propose+partition+heal ----------
+
+    /// Replay one propose+partition+heal run for `seed`, returning the trace plus a
+    /// per-node (log, commit_index) snapshot, so two same-seed runs can be compared
+    /// byte-for-byte. The fault script is fixed (partition the first elected leader
+    /// after a fixed set of proposals), so a same-seed replay is identical.
+    fn replay_propose_partition(
+        seed: u64,
+    ) -> (Vec<ironcache_sim::TraceRecord>, Vec<(Vec<LogEntry>, u64)>) {
+        let mut cluster = RaftCluster::new(5, seed, RaftConfig::default());
+        let leader = run_to_single_leader(&mut cluster, 500, 200);
+        cluster.net.run_steps(5_000);
+
+        // A fixed proposal + partition + heal script.
+        for tag in 0..4u8 {
+            cluster.propose(leader, payload(tag));
+            cluster.net.run_steps(1_500);
+        }
+        let others: Vec<SimId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != leader)
+            .map(to_sim)
+            .collect();
+        cluster.net.partition(&[to_sim(leader)], &others);
+        cluster.net.run_steps(40_000);
+        cluster.net.heal();
+        cluster.net.run_steps(40_000);
+
+        assert_3b_invariants(&cluster);
+        let snapshot: Vec<(Vec<LogEntry>, u64)> = cluster
+            .ids
+            .iter()
+            .map(|&id| (cluster.log(id), cluster.commit_index(id)))
+            .collect();
+        (cluster.net.trace().to_vec(), snapshot)
+    }
+
+    #[test]
+    fn determinism_replay_3b() {
+        // A propose+partition+heal scenario must replay byte-identically across a
+        // 100-seed sweep, with the log-matching + state-machine-safety invariants
+        // asserted (inside replay) each seed.
+        for seed in 0..100u64 {
+            let (trace_a, snap_a) = replay_propose_partition(seed);
+            let (trace_b, snap_b) = replay_propose_partition(seed);
+            assert_eq!(
+                trace_a, trace_b,
+                "seed {seed}: propose+partition+heal trace must replay byte-identically"
+            );
+            assert_eq!(
+                snap_a, snap_b,
+                "seed {seed}: per-node (log, commit_index) must replay identically"
+            );
+        }
+    }
+
+    /// Promote a candidate-free node directly to leader for the Figure-8 unit test:
+    /// seat a full vote tally and run the engine's own promotion path so
+    /// `next_index`/`match_index` initialize per Figure 2 and the election no-op is
+    /// appended, exactly as a real election would leave the node. Test-only.
+    fn promote_to_leader_for_test(node: &mut RaftNode<MemStorage>) {
+        // Move to Candidate in the current term with every vote, then let the
+        // engine's maybe_become_leader run via a self vote record. We reach the
+        // private transition through the public step surface: simulate winning by
+        // delivering granted RequestVoteResp from a majority. First become candidate
+        // by timing out is wrong (it bumps the term); instead we seat the role and
+        // votes through a direct election timeout would change term. To keep term 4,
+        // we drive promotion by hand-seating the candidate state and invoking the
+        // crate-internal maybe_become_leader (same module, so it is reachable).
+        node.role = Role::Candidate;
+        node.votes.clear();
+        node.votes.insert(NodeId(1));
+        node.votes.insert(NodeId(2));
+        node.votes.insert(NodeId(3));
+        let mut out = Effects::new();
+        node.maybe_become_leader(&mut out);
+        assert!(node.is_leader(), "promotion must reach Leader");
+    }
+
+    // -- AppendEntries reconciliation safety (engine-direct, closing review gaps) --
+    //
+    // The truncate-only-on-conflict loop and the follower commit cap are the most
+    // safety-critical follower logic. These drive on_append_entries directly so a
+    // regression is caught deterministically, without relying on the sim to stumble
+    // into the precise race.
+
+    /// Build a follower at `term` whose log holds the given (term, index) entries.
+    fn follower_with_log(id: u64, term: u64, log: &[(u64, u64)]) -> RaftNode<MemStorage> {
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2), NodeId(3)].into_iter().collect();
+        let mut storage = MemStorage::new();
+        storage.set_current_term(term);
+        for &(t, i) in log {
+            storage.append(LogEntry {
+                term: t,
+                index: i,
+                payload: EntryPayload::Noop,
+            });
+        }
+        RaftNode::new(NodeId(id), voters, storage, RaftConfig::default())
+    }
+
+    fn noop(term: u64, index: u64) -> LogEntry {
+        LogEntry {
+            term,
+            index,
+            payload: EntryPayload::Noop,
+        }
+    }
+
+    fn log_terms(node: &RaftNode<MemStorage>) -> Vec<u64> {
+        node.storage().log().iter().map(|e| e.term).collect()
+    }
+
+    #[test]
+    fn identical_retransmit_does_not_truncate_the_log() {
+        // G2(a): a duplicate/retransmitted AppendEntries whose entries the follower
+        // already holds identically must leave the log byte-identical (truncate
+        // nothing) - else a delayed RPC could drop a committed suffix.
+        let mut node = follower_with_log(2, 5, &[(1, 1), (5, 2), (5, 3)]);
+        let mut rng = ZeroRng;
+        let mut out = Effects::new();
+        // Leader (term 5) retransmits the whole log from the start.
+        node.on_append_entries(
+            &mut rng,
+            5,
+            NodeId(1),
+            0,
+            0,
+            vec![noop(1, 1), noop(5, 2), noop(5, 3)],
+            3,
+            &mut out,
+        );
+        assert_eq!(
+            log_terms(&node),
+            vec![1, 5, 5],
+            "identical retransmit must not alter the log"
+        );
+    }
+
+    #[test]
+    fn conflicting_entry_truncates_from_the_conflict_index() {
+        // G2(b): a genuine conflict (same index, different term) truncates from that
+        // index and appends the leader's entries.
+        let mut node = follower_with_log(2, 5, &[(1, 1), (2, 2), (2, 3)]);
+        let mut rng = ZeroRng;
+        let mut out = Effects::new();
+        // Leader (term 5) has [t1@1, t5@2]; prev (1, t1) matches, entry @2 is t5 != t2.
+        node.on_append_entries(&mut rng, 5, NodeId(1), 1, 1, vec![noop(5, 2)], 0, &mut out);
+        assert_eq!(
+            log_terms(&node),
+            vec![1, 5],
+            "conflict at index 2 must truncate the stale t2 tail and append t5"
+        );
+    }
+
+    #[test]
+    fn stale_leader_commit_does_not_regress_commit_index() {
+        // G2(c): a delayed/duplicate AppendEntries carrying a SMALLER leader_commit
+        // must not lower the follower's commit_index.
+        let mut node = follower_with_log(2, 5, &[(1, 1), (5, 2), (5, 3)]);
+        let mut rng = ZeroRng;
+        // First, a fresh leader_commit of 3 commits up to index 3.
+        let mut out1 = Effects::new();
+        node.on_append_entries(&mut rng, 5, NodeId(1), 3, 5, Vec::new(), 3, &mut out1);
+        assert_eq!(node.commit_index(), 3, "commit advances to leader_commit");
+        // Then a stale RPC with leader_commit 1: commit must hold at 3.
+        let mut out2 = Effects::new();
+        node.on_append_entries(&mut rng, 5, NodeId(1), 3, 5, Vec::new(), 1, &mut out2);
+        assert_eq!(
+            node.commit_index(),
+            3,
+            "a smaller leader_commit must not regress commit_index"
+        );
+    }
+
+    #[test]
+    fn follower_caps_commit_at_the_vouched_index_not_a_stale_tail() {
+        // G3: a follower with a longer STALE tail must commit only up to the last
+        // entry THIS RPC vouched for (prev_log_index + entries.len()), never up to
+        // its own last_log_index. Also covers G4: the apply hook actually ran
+        // (applied_count tracks commit_index), not just the watermark moving.
+        let mut node = follower_with_log(2, 5, &[(1, 1), (2, 2), (2, 3)]);
+        let mut rng = ZeroRng;
+        let mut out = Effects::new();
+        // Leader vouches only for index 1 (entries=[t1@1], prev 0) but leader_commit=3.
+        node.on_append_entries(&mut rng, 5, NodeId(1), 0, 0, vec![noop(1, 1)], 3, &mut out);
+        assert_eq!(
+            node.commit_index(),
+            1,
+            "commit must be capped at the vouched index 1, not the stale tail at 3"
+        );
+        assert_eq!(
+            node.applied_count(),
+            1,
+            "the apply hook ran for exactly the committed entry"
+        );
+        assert_eq!(
+            node.last_applied(),
+            node.commit_index(),
+            "last_applied tracks commit_index"
+        );
+    }
+
+    #[test]
+    fn uncommitted_prior_term_entry_is_safely_overwritten() {
+        // G1: the OVERWRITE path the CommitLedger guards is reachable and safe. A
+        // follower holds an UNCOMMITTED prior-term entry (idx2=t2, commit_index=1).
+        // A higher-term leader (term 3) that lacks it sends a conflicting entry at
+        // idx2; the follower overwrites idx2=t2 with t3. This is SAFE precisely
+        // because t2 was never committed (commit_index stays >= 1 and never covered
+        // idx2), which is the section-5.4.2 guarantee: only an entry NOT yet
+        // committed can be overwritten.
+        let mut node = follower_with_log(2, 2, &[(1, 1), (2, 2)]);
+        // Commit only index 1 (idx2=t2 is replicated but NOT committed).
+        let mut rng = ZeroRng;
+        let mut warm = Effects::new();
+        node.on_append_entries(&mut rng, 2, NodeId(1), 1, 1, Vec::new(), 1, &mut warm);
+        assert_eq!(
+            node.commit_index(),
+            1,
+            "only index 1 is committed before the leader change"
+        );
+        // A term-3 leader without idx2's t2 entry conflicts at index 2 with t3.
+        let mut out = Effects::new();
+        node.on_append_entries(&mut rng, 3, NodeId(5), 1, 1, vec![noop(3, 2)], 1, &mut out);
+        assert_eq!(node.current_term(), 3, "the higher term is adopted");
+        assert_eq!(
+            log_terms(&node),
+            vec![1, 3],
+            "the uncommitted prior-term entry is overwritten by the new leader"
+        );
+        assert!(
+            node.commit_index() >= 1,
+            "commit never regresses; no COMMITTED entry was overwritten (idx1 survives)"
+        );
     }
 }
