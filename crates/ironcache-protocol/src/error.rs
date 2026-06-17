@@ -1015,6 +1015,16 @@ impl ErrorReply {
     pub fn clusterdown_slot_unserved() -> Self {
         ErrorReply::new(ErrorCode::ClusterDown, "Hash slot not served")
     }
+
+    /// `-CLUSTERDOWN <message>` with a CUSTOM message (HA-4c). Used by the raft-mode CLUSTER
+    /// mutator redirect: a node that is not the current Raft leader cannot commit a config
+    /// change, so it replies `-CLUSTERDOWN ...` and the client retries against the leader (the
+    /// usual way a client discovers the leader in a forming cluster). The `-CLUSTERDOWN` code is
+    /// the Redis-idiomatic "the cluster cannot serve this right now, retry" signal.
+    #[must_use]
+    pub fn clusterdown(message: impl Into<String>) -> Self {
+        ErrorReply::new(ErrorCode::ClusterDown, message)
+    }
 }
 
 /// Truncate a `&str` to at most `max` bytes without splitting a UTF-8 char (so

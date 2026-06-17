@@ -340,6 +340,8 @@ dependencies = [
  "ironcache-eviction",
  "ironcache-observe",
  "ironcache-protocol",
+ "ironcache-raft",
+ "ironcache-raft-net",
  "ironcache-runtime",
  "ironcache-server",
  "ironcache-storage",
@@ -445,6 +447,7 @@ dependencies = [
 name = "ironcache-raft-net"
 version = "0.0.0"
 dependencies = [
+ "ironcache-cluster",
  "ironcache-clusterbus",
  "ironcache-env",
  "ironcache-raft",
@@ -473,6 +476,7 @@ dependencies = [
  "ironcache-expiry",
  "ironcache-observe",
  "ironcache-protocol",
+ "ironcache-raft-net",
  "ironcache-runtime",
  "ironcache-storage",
  "ironcache-store",

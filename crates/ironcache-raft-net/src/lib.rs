@@ -68,6 +68,12 @@ pub use codec::{decode_raft_msg, encode_raft_msg};
 pub mod storage;
 pub use storage::FileStorage;
 
+pub mod config_sm;
+pub use config_sm::ConfigSm;
+
+pub mod raft_handle;
+pub use raft_handle::{ProposeOutcome, RaftHandle};
+
 /// The cluster-bus command verb that carries an encoded [`RaftMsg`].
 ///
 /// The outbound request is the RESP array `["RAFTMSG", <self_node_id_decimal>,

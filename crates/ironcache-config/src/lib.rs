@@ -194,6 +194,29 @@ pub struct ClusterTopology {
     pub nodes: Vec<ClusterNode>,
 }
 
+/// HOW the cluster's slot-ownership map is GOVERNED at runtime (HA-4c). Only meaningful when
+/// `cluster_enabled`; the default ([`ClusterMode::Static`]) keeps the slice-2/slice-3 behavior
+/// BYTE-UNCHANGED.
+///
+/// * [`Static`](ClusterMode::Static) (DEFAULT): the slot map is a STATIC config-driven map
+///   (slice 2) OR is mutated DIRECTLY by the local `CLUSTER MEET / ADDSLOTS / SETSLOT / ...`
+///   verbs (slice 3). This is the only path slice 1-3 ever exercised; a node compiled and run
+///   in this mode pays ZERO new cost and behaves exactly as before HA-4c.
+/// * [`Raft`](ClusterMode::Raft) (OPT-IN): the merged, DST-verified Raft control plane GOVERNS
+///   the cluster. A `CLUSTER ADDSLOTS / SETSLOT / MEET / FORGET / SET-CONFIG-EPOCH` becomes a
+///   PROPOSAL the leader commits through the replicated log; every node applies the SAME
+///   committed sequence into its shared `SlotMap`, so all nodes converge to one identical
+///   ownership view (no two owners per epoch). A follower redirects the mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterMode {
+    /// The pre-HA-4c behavior: static topology / slice-3 local direct mutation. The DEFAULT.
+    #[default]
+    Static,
+    /// Opt-in: the Raft control plane governs slot ownership via committed proposals (HA-4c).
+    Raft,
+}
+
 /// The fully-resolved, effective configuration the server boots from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -251,6 +274,11 @@ pub struct Config {
     /// injection). In cluster-map mode the node id IS this announce id (stable across boots),
     /// so `CLUSTER MYID` / `CLUSTER NODES` self-line / MOVED-target identity all agree.
     pub cluster_announce_id: Option<String>,
+    /// HOW the slot-ownership map is governed (HA-4c). Only meaningful when `cluster_enabled`.
+    /// Defaults to [`ClusterMode::Static`] (the pre-HA-4c behavior, byte-unchanged);
+    /// [`ClusterMode::Raft`] opts the node into the Raft-governed control plane. TOML
+    /// (`cluster_mode = "raft"`) + the `IRONCACHE_CLUSTER_MODE` env var.
+    pub cluster_mode: ClusterMode,
 }
 
 impl Default for Config {
@@ -283,6 +311,9 @@ impl Default for Config {
             // is opt-in (CLUSTER_CONTRACT.md #70, slice 2).
             cluster_topology: None,
             cluster_announce_id: None,
+            // The slot map is STATICALLY governed by default (HA-4c): the pre-HA-4c
+            // behavior, byte-unchanged. Raft governance is strictly opt-in.
+            cluster_mode: ClusterMode::Static,
         }
     }
 }
@@ -417,7 +448,18 @@ impl Config {
                                  by address)"
                                     .to_owned(),
                         })?;
-                validate_topology(topo, announce)?;
+                match self.cluster_mode {
+                    // STATIC governance: the topology IS the slot map, so it must be a COMPLETE,
+                    // non-overlapping, self-inclusive static assignment (slice 2 rule).
+                    ClusterMode::Static => validate_topology(topo, announce)?,
+                    // RAFT governance (HA-4c): the topology supplies ONLY the voter set + the
+                    // peer cluster-bus addresses; slot ownership is established at runtime through
+                    // committed proposals (each node boots `empty_self` owning zero slots). So the
+                    // slot RANGES are ignored and the completeness/overlap rules do NOT apply;
+                    // only the node-IDENTITY rules (40-hex ids, no duplicates, self present) are
+                    // enforced here so the voter set is well-formed.
+                    ClusterMode::Raft => validate_raft_topology(topo, announce)?,
+                }
             }
         }
         Ok(())
@@ -461,6 +503,63 @@ pub fn validate_topology(topo: &ClusterTopology, announce_id: &str) -> Result<()
         })
 }
 
+/// Validate a [`ClusterTopology`] for RAFT governance (HA-4c): the topology supplies only the
+/// voter set + peer cluster-bus addresses, NOT a static slot map, so this enforces ONLY the
+/// node-IDENTITY rules and IGNORES the slot ranges (which are established at runtime through
+/// committed proposals). The rules:
+///   * at least one node;
+///   * every id is exactly 40 lowercase hex characters (the Redis node-id shape the SlotMap
+///     and the Raft id mapping require);
+///   * no duplicate ids;
+///   * `announce_id` names one of the nodes (this node is in its own voter set).
+///
+/// This deliberately does NOT call `SlotMap::build` (which requires complete, non-overlapping
+/// slot coverage) because a raft-mode topology legitimately carries EMPTY slot ranges.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Invalid`] with `field = "cluster_topology"` (or `"cluster-announce-id"`
+/// when self is absent) describing the first identity problem found.
+pub fn validate_raft_topology(
+    topo: &ClusterTopology,
+    announce_id: &str,
+) -> Result<(), ConfigError> {
+    let invalid = |reason: String| ConfigError::Invalid {
+        field: "cluster_topology",
+        reason,
+    };
+    if topo.nodes.is_empty() {
+        return Err(invalid("cluster topology has no nodes".to_owned()));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(topo.nodes.len());
+    for n in &topo.nodes {
+        let id = n.id.as_str();
+        // 40 lowercase hex (the Redis node-id shape).
+        let well_formed = id.len() == 40
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !well_formed {
+            return Err(invalid(format!(
+                "node id '{id}' is not 40 lowercase hex characters"
+            )));
+        }
+        if seen.contains(&id) {
+            return Err(invalid(format!("duplicate node id '{id}'")));
+        }
+        seen.push(id);
+    }
+    if !seen.contains(&announce_id) {
+        return Err(ConfigError::Invalid {
+            field: "cluster-announce-id",
+            reason: format!(
+                "this node's announce id '{announce_id}' is not present in cluster_topology"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// A single layer of optional overrides. The TOML file deserializes directly into
 /// this; the env and CLI layers construct it field by field. A `None` field means
 /// "this layer does not set this key" and the lower layer shows through.
@@ -493,6 +592,9 @@ pub struct ConfigOverlay {
     pub cluster_topology: Option<ClusterTopology>,
     /// THIS node's announce id. TOML + the `IRONCACHE_CLUSTER_ANNOUNCE_ID` env var.
     pub cluster_announce_id: Option<String>,
+    /// How the slot map is governed (HA-4c). TOML (`cluster_mode = "raft"`) + the
+    /// `IRONCACHE_CLUSTER_MODE` env var. `None` leaves the lower layer (default `Static`).
+    pub cluster_mode: Option<ClusterMode>,
 }
 
 impl ConfigOverlay {
@@ -554,6 +656,16 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_ANNOUNCE_ID") {
             o.cluster_announce_id = Some(v);
         }
+        // The cluster-governance mode (HA-4c): `static` (default) or `raft`. A single scalar,
+        // so it is env-encodable (per-pod injection alongside the announce id). Mirrors the
+        // `cluster_enabled` env handling: an unrecognized token hard-fails rather than
+        // silently picking a mode.
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_MODE") {
+            o.cluster_mode = Some(parse_cluster_mode(&v).ok_or_else(|| ConfigError::Invalid {
+                field: "cluster-mode",
+                reason: format!("not a cluster mode (expected static/raft): {v}"),
+            })?);
+        }
         Ok(o)
     }
 
@@ -606,7 +718,23 @@ impl ConfigOverlay {
         if let Some(ref v) = self.cluster_announce_id {
             cfg.cluster_announce_id = Some(v.clone());
         }
+        if let Some(v) = self.cluster_mode {
+            cfg.cluster_mode = v;
+        }
         Ok(())
+    }
+}
+
+/// Parse a cluster-governance mode token (HA-4c), accepting `static` / `raft`
+/// case-insensitively with surrounding whitespace trimmed. Returns `None` on any other
+/// token (the caller maps it to a config error). Used by the `IRONCACHE_CLUSTER_MODE` env
+/// var; TOML deserializes [`ClusterMode`] directly (lowercase-renamed serde).
+#[must_use]
+pub fn parse_cluster_mode(s: &str) -> Option<ClusterMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "static" => Some(ClusterMode::Static),
+        "raft" => Some(ClusterMode::Raft),
+        _ => None,
     }
 }
 
@@ -700,6 +828,86 @@ mod tests {
         // Cluster mode is OFF by default (standalone, Redis `cluster-enabled no`).
         assert!(!c.cluster_enabled);
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn cluster_mode_defaults_static_and_parses_static_or_raft() {
+        // DEFAULT is Static (the pre-HA-4c, byte-unchanged behavior).
+        assert_eq!(Config::default().cluster_mode, ClusterMode::Static);
+        assert_eq!(ClusterMode::default(), ClusterMode::Static);
+
+        // The overlay sets the mode; an unset overlay leaves the default Static.
+        let raft = Config::resolve(&[ConfigOverlay {
+            cluster_mode: Some(ClusterMode::Raft),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(raft.cluster_mode, ClusterMode::Raft);
+        let unset = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert_eq!(unset.cluster_mode, ClusterMode::Static);
+
+        // parse_cluster_mode accepts static/raft (case-insensitive, trimmed) and rejects else.
+        assert_eq!(parse_cluster_mode("static"), Some(ClusterMode::Static));
+        assert_eq!(parse_cluster_mode(" RAFT "), Some(ClusterMode::Raft));
+        assert_eq!(parse_cluster_mode("gossip"), None);
+        assert_eq!(parse_cluster_mode(""), None);
+
+        // TOML deserializes the lowercase-renamed enum directly.
+        let o = ConfigOverlay::from_toml_str("cluster_mode = \"raft\"").unwrap();
+        assert_eq!(o.cluster_mode, Some(ClusterMode::Raft));
+    }
+
+    #[test]
+    fn raft_mode_topology_ignores_empty_slot_ranges_but_enforces_identity() {
+        // In RAFT mode the topology supplies only the voter set, so EMPTY slot ranges validate
+        // (the static-completeness rule does NOT apply): the would-be "gap" is ignored.
+        let cfg = Config {
+            cluster_mode: ClusterMode::Raft,
+            ..topology_config(
+                true,
+                Some("0000000000000000000000000000000000000000"),
+                &[
+                    ("0000000000000000000000000000000000000000", &[]),
+                    ("1111111111111111111111111111111111111111", &[]),
+                ],
+            )
+        };
+        cfg.validate()
+            .expect("raft-mode topology with empty slot ranges should validate");
+
+        // But identity rules still hold: a missing self announce id is rejected.
+        let bad_self = Config {
+            cluster_mode: ClusterMode::Raft,
+            ..topology_config(
+                true,
+                Some("9999999999999999999999999999999999999999"),
+                &[("0000000000000000000000000000000000000000", &[])],
+            )
+        };
+        assert!(matches!(
+            bad_self.validate().unwrap_err(),
+            ConfigError::Invalid {
+                field: "cluster-announce-id",
+                ..
+            }
+        ));
+
+        // The SAME topology under STATIC mode is rejected (empty ranges == a gap).
+        let static_cfg = Config {
+            cluster_mode: ClusterMode::Static,
+            ..topology_config(
+                true,
+                Some("0000000000000000000000000000000000000000"),
+                &[("0000000000000000000000000000000000000000", &[])],
+            )
+        };
+        assert!(matches!(
+            static_cfg.validate().unwrap_err(),
+            ConfigError::Invalid {
+                field: "cluster_topology",
+                ..
+            }
+        ));
     }
 
     #[test]

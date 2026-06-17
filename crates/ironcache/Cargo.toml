@@ -42,6 +42,13 @@ ironcache-server = { workspace = true }
 # ServerContext; the serve-layer router reads it to decide MOVED / CROSSSLOT redirection. It
 # is a leaf (only ironcache-protocol), so it adds no third-party deps.
 ironcache-cluster = { workspace = true }
+# The Raft control plane (HA-4c). In raft-governance mode (`cluster_mode = raft`, opt-in) the
+# binary builds a shared Arc<SlotMap>, a ConfigSm over it, and spawns the RaftClusterBusNode
+# control-plane task on a dedicated thread; the RaftHandle goes into ServerContext so a CLUSTER
+# mutator proposes through the log. `ironcache-raft` supplies the engine + ConfigCmd/RaftConfig
+# types the boot wiring names; `ironcache-raft-net` the adapter + FileStorage + ConfigSm + handle.
+ironcache-raft = { workspace = true }
+ironcache-raft-net = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }

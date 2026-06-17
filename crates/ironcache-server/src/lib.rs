@@ -74,6 +74,12 @@ pub use route::{
     CommandClass, KeySpec, classify, command_keys, owner_shard, owner_shard_set, single_key,
 };
 
+// Re-export the Raft control-plane handle (HA-4c) carried by `ServerContext::raft`, so the
+// serve layer can name it via `ironcache_server::RaftHandle` without taking its own raft-net
+// dependency edge. `ProposeOutcome` is the typed result a raft-mode CLUSTER mutator maps to
+// `+OK` / `-CLUSTERDOWN`.
+pub use ironcache_raft_net::{ProposeOutcome, RaftHandle};
+
 // Re-export the observe types the binary supplies to dispatch (the INFO memory
 // snapshot it reads once at the binary edge, and the per-command counter deltas the
 // serve loop folds into the shard counters after dispatch returns).

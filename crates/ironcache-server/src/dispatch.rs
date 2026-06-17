@@ -15,7 +15,7 @@ use crate::{
     cmd_bitmap, cmd_cluster, cmd_config, cmd_expire, cmd_hash, cmd_hll, cmd_introspect,
     cmd_keyspace, cmd_list, cmd_set, cmd_string, cmd_txn, cmd_zset,
 };
-use ironcache_config::{Config, RuntimeConfig};
+use ironcache_config::{ClusterMode, Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
 use ironcache_expiry::TimingWheel;
 use ironcache_observe::{
@@ -128,12 +128,24 @@ pub struct ServerContext {
     /// cluster mode is enabled AND a topology was configured; `None` for a standalone node OR
     /// a cluster-enabled node with no topology (which stays single-node-owns-all, slice-1).
     ///
-    /// Shared by `Arc` across every shard task (the map is immutable after boot). The `Arc` is
-    /// a shared-ownership pointer, NOT a lock, so the shared-nothing invariant (ADR-0002) holds;
-    /// it is the blessed path the runtime already uses for the cross-shard shutdown flag. The
-    /// CLUSTER projection reads it to render the real multi-node SLOTS/SHARDS/NODES/INFO; the
-    /// serve-layer router reads it to decide MOVED/CROSSSLOT redirection.
+    /// Shared by `Arc` across every shard task (the map is immutable after boot in STATIC mode;
+    /// in RAFT mode the same `Arc` is written by the single control-plane task via the config
+    /// state machine and read concurrently by the shards). The `Arc` is a shared-ownership
+    /// pointer, NOT a lock, so the shared-nothing invariant (ADR-0002) holds; it is the blessed
+    /// path the runtime already uses for the cross-shard shutdown flag. The CLUSTER projection
+    /// reads it to render the real multi-node SLOTS/SHARDS/NODES/INFO; the serve-layer router
+    /// reads it to decide MOVED/CROSSSLOT redirection.
     pub cluster: Option<Arc<ironcache_cluster::SlotMap>>,
+    /// The Raft control-plane handle (HA-4c), present ONLY in raft-governance mode
+    /// (`cluster_mode == Raft`); `None` for the DEFAULT static path (and every standalone /
+    /// slice-2/3 node), so that path is byte-unchanged and pays zero new cost.
+    ///
+    /// When `Some`, a CLUSTER MUTATOR (ADDSLOTS / SETSLOT / MEET / FORGET / SET-CONFIG-EPOCH)
+    /// PROPOSES a `ConfigCmd` through the log via this handle instead of mutating the local map
+    /// directly; on commit every node's config state machine applies the same change into its
+    /// shared `cluster` map. The handle is the clonable `Send` inbox/status handle, NOT the
+    /// `!Send` engine (which lives on its own control-plane thread).
+    pub raft: Option<ironcache_raft_net::RaftHandle>,
 }
 
 impl ServerContext {
@@ -171,6 +183,15 @@ impl ServerContext {
     #[must_use]
     pub fn ceiling_enabled(&self) -> bool {
         self.maxmemory() > 0
+    }
+
+    /// HOW the cluster's slot map is governed (HA-4c): the boot `cluster_mode`. The DEFAULT is
+    /// [`ClusterMode::Static`] (the byte-unchanged pre-HA-4c path). Only [`ClusterMode::Raft`]
+    /// routes a CLUSTER mutator through the control plane (and only then is [`Self::raft`] set).
+    /// Boot-only (like `cluster_enabled`), so it reads the boot config, not the runtime overlay.
+    #[must_use]
+    pub fn cluster_mode(&self) -> ClusterMode {
+        self.boot.cluster_mode
     }
 }
 
@@ -1619,6 +1640,7 @@ mod tests {
                 cluster_enabled: false,
             },
             cluster: None,
+            raft: None,
             boot,
         }
     }

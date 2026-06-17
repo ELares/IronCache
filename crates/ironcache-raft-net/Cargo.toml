@@ -17,6 +17,11 @@ workspace = true
 # The PURE step engine this crate drives. The adapter never reimplements consensus;
 # it feeds the engine events and drains its Effects (ADR-0027).
 ironcache-raft = { workspace = true }
+# The shared slot-ownership map (CLUSTER_CONTRACT.md #70). The production ConfigSm (HA-4c)
+# replays committed ConfigCmds onto an Arc<SlotMap> shared with the live serve path, so this
+# is now a NORMAL dependency (the test config state machine lived in ironcache-raft). Leaf
+# crate (only ironcache-protocol), so it adds no third-party deps.
+ironcache-cluster = { workspace = true }
 # The outbound node-to-node RESP connection (PeerConn) the adapter ships RaftMsgs
 # over, plus the Reply decoder (HA-1).
 ironcache-clusterbus = { workspace = true }

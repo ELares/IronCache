@@ -88,6 +88,14 @@ pub(crate) struct ShardState {
 /// Boot the server: derive the shard config from `config`, start the shard set,
 /// and return the [`ShardSet`] handle for shutdown. Errors if the listener cannot
 /// bind (e.g. port in use).
+///
+/// `too_many_lines` is allowed: this is the single BOOT wiring point (the leaked policy/node-id
+/// statics, the runtime overlay, the cluster slot-map build, the OPT-IN raft control-plane
+/// bootstrap, the shared ServerContext template, and the coordinator inbox + shard spawn). Each
+/// is a documented step the boot must run in one place; splitting it would scatter the wiring
+/// across helpers that all need the same boot-resolved locals. The same precedent as
+/// `route_and_dispatch` / `serve_connection`.
+#[allow(clippy::too_many_lines)]
 pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     let bind: SocketAddr = SocketAddr::new(config.bind, config.port);
     let shard_cfg = ShardConfig {
@@ -145,9 +153,15 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     //     ADDSLOTS / SETSLOT / ...` (slice 3). NOTE: a cluster-enabled no-topology node previously
     //     (slice 1/2) reported single-node-owns-all (16384 slots, state:ok); it now owns ZERO slots
     //     until ADDSLOTS and reports cluster_state:fail, matching a fresh real-Redis node.
-    let cluster: Option<Arc<ironcache_cluster::SlotMap>> = if config.cluster_enabled {
+    // In RAFT mode the slot map is built fresh as `empty_self` and governed by the control plane
+    // (handled in the raft block below), so the STATIC topology build (which requires a complete
+    // map) is skipped: a raft-mode topology legitimately carries empty slot ranges. A raft-mode
+    // node therefore takes the `empty_self` arm here exactly like a no-topology node, and the
+    // shared governed map replaces it below.
+    let build_static_topology = config.cluster_mode == ironcache_config::ClusterMode::Static;
+    let mut cluster: Option<Arc<ironcache_cluster::SlotMap>> = if config.cluster_enabled {
         match config.cluster_topology.as_ref() {
-            Some(topo) => {
+            Some(topo) if build_static_topology => {
                 let nodes: Vec<(ironcache_cluster::NodeEntry, Vec<[u16; 2]>)> = topo
                     .nodes
                     .iter()
@@ -166,12 +180,46 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
                     ironcache_cluster::SlotMap::build(nodes, cluster_node_id).expect("validated"),
                 ))
             }
-            None => Some(Arc::new(ironcache_cluster::SlotMap::empty_self(
+            // No topology, OR raft-mode (the static build is skipped): an EMPTY single-node map.
+            // The raft block below REPLACES this with the shared, control-plane-governed map.
+            Some(_) | None => Some(Arc::new(ironcache_cluster::SlotMap::empty_self(
                 cluster_node_id,
                 &config.bind.to_string(),
                 config.port,
             ))),
         }
+    } else {
+        None
+    };
+
+    // RAFT-GOVERNANCE MODE (HA-4c), strictly opt-in (`cluster_mode == Raft`, only meaningful
+    // with `cluster_enabled` + a topology). The DEFAULT (`Static`) path skips this ENTIRELY, so
+    // `raft` stays `None` and `cluster` keeps the slice-2/3 shape (byte-unchanged).
+    //
+    // In raft-mode the slot map is GOVERNED by the merged Raft control plane: build ONE shared
+    // `Arc<SlotMap>` seeded `empty_self` (a fresh cluster-enabled node owning ZERO slots, exactly
+    // like the no-topology slice-3 boot), install it as BOTH `ctx.cluster` (routing + the CLUSTER
+    // projection read committed state with NO change to those readers) AND the config state
+    // machine's map, then spawn the per-node control-plane task. A CLUSTER mutator then PROPOSES a
+    // ConfigCmd through the log; on commit every node applies the same change into its shared map.
+    let raft: Option<ironcache_server::RaftHandle> = if config.cluster_enabled
+        && config.cluster_mode == ironcache_config::ClusterMode::Raft
+        && config.cluster_topology.is_some()
+    {
+        // The shared map the control plane WRITES (via apply) and the shards READ. Seeded
+        // empty_self for THIS node; the topology only supplies the voter set + peer bus addrs
+        // (slot ownership is established at runtime through committed proposals, not the static
+        // ranges). The `cluster_node_id` is the validated announce id (== this node's id).
+        let shared = Arc::new(ironcache_cluster::SlotMap::empty_self(
+            cluster_node_id,
+            &config.bind.to_string(),
+            config.port,
+        ));
+        let boot = crate::raft_boot::spawn_control_plane(config, cluster_node_id, shared);
+        // Install the SHARED map as ctx.cluster (replacing the static/empty map built above) so
+        // every shard's routing + projection reads the SAME map the ConfigSm converges.
+        cluster = Some(boot.cluster);
+        Some(boot.raft)
     } else {
         None
     };
@@ -201,8 +249,13 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
             cluster_enabled: config.cluster_enabled,
         },
         // The boot-resolved static slot map (None unless cluster mode + a topology). Shared
-        // by Arc-clone into every shard's context (immutable after boot; ADR-0002).
+        // by Arc-clone into every shard's context (immutable after boot in static mode; the
+        // shared map written by the control plane in raft-mode; ADR-0002).
         cluster: cluster.clone(),
+        // The Raft control-plane handle (HA-4c): `Some` only in raft-governance mode, else
+        // `None` (the default static path). Cloned by value onto every shard's context; the
+        // clone is the cheap `Send` inbox/status handle, not the `!Send` engine.
+        raft: raft.clone(),
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
@@ -1177,6 +1230,31 @@ async fn route_and_dispatch(
         }
     }
 
+    // RAFT-MODE CLUSTER MUTATOR -> PROPOSAL (HA-4c). A `CLUSTER ADDSLOTS / ADDSLOTSRANGE /
+    // SETSLOT / MEET / FORGET / SET-CONFIG-EPOCH` is normally handled SYNCHRONOUSLY by
+    // `cmd_cluster` (the slice-3 direct local mutation). In raft-governance mode the slot map is
+    // owned by the committed log, so the mutator becomes a PROPOSAL: build a `ConfigCmd`, await
+    // its commit through the leader, and reply `+OK` (committed) or `-CLUSTERDOWN` (this node is
+    // not the leader). This branch fires ONLY when `cluster_mode == Raft` AND a handle is present
+    // (`ctx.raft.is_some()`), so the DEFAULT static path never reaches it and is byte-unchanged.
+    //
+    // It is intercepted HERE (the async router), NOT in `cmd_cluster` (which is sync and cannot
+    // await a commit): `CLUSTER` is `AlwaysHome`, so none of the keyed routing below applies to
+    // it, and the await parks on the proposal's one-shot ack (the single control-plane task
+    // fulfills it) WITHOUT blocking the shard executor. The introspection subcommands (SLOTS /
+    // SHARDS / NODES / INFO / MYID / ...) are NOT mutators, so they fall through to the unchanged
+    // home dispatch, which reads the committed `ctx.cluster` map.
+    if cmd_upper == b"CLUSTER"
+        && ctx.cluster_mode() == ironcache_config::ClusterMode::Raft
+        && ctx.raft.is_some()
+    {
+        if let Some(close) = try_raft_cluster_mutator(ctx, conn, state_rc, request, out).await {
+            return close;
+        }
+        // Not a mutator (an introspection subcommand or a malformed CLUSTER): fall through to the
+        // unchanged home dispatch.
+    }
+
     // A SHARD-SPANNING KeyedMulti command (its keys land on >1 shard, so `owner_shard_set`
     // is None) that is one of the SIX fan-out-supported commands routes to the multi-key
     // SCATTER-GATHER (COORDINATOR.md #107, Stage 2a). Co-located KeyedMulti (Some(shard))
@@ -1300,6 +1378,334 @@ async fn route_and_dispatch(
             ctx, conn, env, store_rc, wheel_rc, state_rc, request, &cmd_upper, out,
         )
     }
+}
+
+/// Handle a raft-mode `CLUSTER` MUTATOR by proposing the matching [`ConfigCmd`](ironcache_raft::ConfigCmd)
+/// through the control plane (HA-4c). Returns `Some(close)` (always `Some(false)`) when the
+/// subcommand WAS a mutator (a reply has been written to `out`), or `None` for a non-mutator
+/// subcommand (the caller falls through to the unchanged home dispatch, which reads the committed
+/// `ctx.cluster` map for the introspection projections).
+///
+/// The caller has already established `cluster_mode == Raft` and `ctx.raft.is_some()`. The
+/// mutator -> ConfigCmd mapping (CONTROL_PLANE.md / the HA-3e `ConfigCmd` taxonomy):
+///   * `ADDSLOTS` / `ADDSLOTSRANGE`  -> `AssignSlots { node: self_id, slots }`
+///   * `SETSLOT <slot> NODE <id>`    -> `SetSlotOwner { slot, node: id }`
+///   * `MEET <ip> <port> [bus]`      -> `AddNode { id, host, port }`
+///   * `FORGET <id>`                 -> `RemoveNode { id }`
+///   * `SET-CONFIG-EPOCH <epoch>`    -> `SetConfigEpoch(epoch)`
+///   * `DELSLOTS` / `DELSLOTSRANGE` / `FLUSHSLOTS` -> a clear "not supported in raft-mode" error
+///     (the `ConfigCmd` taxonomy has no slot-UNASSIGN verb yet; ADDSLOTS/SETSLOT/MEET/FORGET are
+///     the ones the cluster forms with, so this is the documented scoped gap).
+///
+/// On commit -> `+OK`; when this node is NOT the leader -> `-CLUSTERDOWN ...` (the client retries
+/// against the leader). The slot/argument validation mirrors the Redis error shapes the static
+/// `cmd_cluster` mutators use for the common cases. `commands_processed` is bumped exactly once
+/// (matching every other route), regardless of outcome.
+async fn try_raft_cluster_mutator(
+    ctx: &ServerContext,
+    conn: &ConnState,
+    state_rc: &Rc<RefCell<ShardState>>,
+    request: &Request,
+    out: &mut Vec<u8>,
+) -> Option<bool> {
+    use ironcache_protocol::ErrorReply;
+    use ironcache_server::Value;
+
+    // A bare `CLUSTER` (no subcommand) is not a mutator: let the home dispatch emit the arity
+    // error (byte-identical to the static path).
+    if request.args.len() < 2 {
+        return None;
+    }
+    let sub = ascii_upper(&request.args[1]);
+
+    // Build the ConfigCmd SEQUENCE for a recognized mutator, or return the appropriate immediate
+    // error / None (non-mutator). `Err(reply)` is a validation error to send WITHOUT proposing;
+    // `Ok(cmds)` is the ordered batch to propose+commit; `None` falls through to home dispatch.
+    //
+    // ADDSLOTS / ADDSLOTSRANGE prepend a self-`AddNode` (build_self_assign): they assign slots to
+    // THIS node, but a FOLLOWER's committed map does not yet know the leader's id (each node boots
+    // `empty_self` knowing only itself; MEET is leader -> peer). Committing `AddNode{self}` FIRST
+    // teaches every node the leader's id+endpoint, so the following `AssignSlots{self}` applies
+    // (and MOVED resolves) on every node. AddNode is idempotent on the leader's own table.
+    let built: Option<Result<Vec<ironcache_raft::ConfigCmd>, ErrorReply>> = match sub.as_slice() {
+        b"ADDSLOTS" => Some(build_self_assign(ctx, request, parse_addslots_slots)),
+        b"ADDSLOTSRANGE" => Some(build_self_assign(ctx, request, parse_addslotsrange_slots)),
+        b"SETSLOT" => Some(build_setslot(request).map(|c| vec![c])),
+        b"MEET" => Some(build_meet(request).map(|c| vec![c])),
+        b"FORGET" => Some(build_forget(request).map(|c| vec![c])),
+        b"SET-CONFIG-EPOCH" => Some(build_set_config_epoch(request).map(|c| vec![c])),
+        // No UNASSIGN ConfigCmd yet (scoped out): a clear not-supported reply, not a silent
+        // fall-through to the static local mutator (which would diverge from the committed map).
+        b"DELSLOTS" | b"DELSLOTSRANGE" | b"FLUSHSLOTS" => {
+            state_rc.borrow_mut().counters.on_command();
+            let name = String::from_utf8_lossy(&sub);
+            encode_into(
+                out,
+                &Value::error(ErrorReply::err(format!(
+                    "{name} is not supported in raft cluster mode yet"
+                ))),
+                conn.proto,
+            );
+            return Some(false);
+        }
+        // Any other subcommand (the introspection set, BUMPEPOCH, REPLICATE, HELP, unknown, ...)
+        // is NOT a mutator: fall through to the unchanged home dispatch.
+        _ => None,
+    };
+
+    let cmds = match built? {
+        Ok(cmds) => cmds,
+        Err(reply) => {
+            // A validation error (bad slot / arity / node id): reply now, do not propose.
+            state_rc.borrow_mut().counters.on_command();
+            encode_into(out, &Value::error(reply), conn.proto);
+            return Some(false);
+        }
+    };
+
+    // Count the command once (matching the home / remote / fan-out paths), then propose each
+    // ConfigCmd in order and await its commit. The whole mutator replies `+OK` only if EVERY
+    // entry commits; the FIRST NotLeader short-circuits to the `-CLUSTERDOWN` redirect (a
+    // follower never commits anything, so a partial batch cannot land).
+    state_rc.borrow_mut().counters.on_command();
+    let handle = ctx
+        .raft
+        .as_ref()
+        .expect("caller checked ctx.raft.is_some() before dispatching a raft mutator");
+    for cmd in cmds {
+        if matches!(
+            handle.propose(cmd).await,
+            ironcache_server::ProposeOutcome::NotLeader
+        ) {
+            // Not the leader: redirect. Include the best-effort leader hint when known (HA-4c
+            // surfaces none yet, so this is a bare retry signal today).
+            let msg = match handle.leader_hint() {
+                Some(addr) => {
+                    format!("The cluster leader is {addr}; retry the CLUSTER write there")
+                }
+                None => {
+                    "this node is not the raft leader; retry the CLUSTER write against the leader"
+                        .to_owned()
+                }
+            };
+            encode_into(out, &Value::error(ErrorReply::clusterdown(msg)), conn.proto);
+            return Some(false);
+        }
+    }
+    encode_into(out, &Value::ok(), conn.proto);
+    // The connection stays open in every case (mirrors the static CLUSTER path).
+    Some(false)
+}
+
+/// Build the `AssignSlots { node: self, slots }` ConfigCmd for raft-mode `CLUSTER ADDSLOTS`
+/// (HA-4c). Build the SELF-ASSIGN batch for `CLUSTER ADDSLOTS` / `ADDSLOTSRANGE`: a self-`AddNode`
+/// (so every node learns this node's id+endpoint before the assignment references it; idempotent
+/// on self) FOLLOWED by `AssignSlots { node: self, slots }`. `parse_slots` extracts the slot list
+/// from the request (the per-verb arity + slot validation, mirroring the static `cmd_cluster`
+/// Redis error shapes).
+fn build_self_assign(
+    ctx: &ServerContext,
+    request: &Request,
+    parse_slots: impl Fn(&Request) -> Result<Vec<u16>, ironcache_protocol::ErrorReply>,
+) -> Result<Vec<ironcache_raft::ConfigCmd>, ironcache_protocol::ErrorReply> {
+    let slots = parse_slots(request)?;
+    let (id, host, port) = self_node_endpoint(ctx);
+    Ok(vec![
+        ironcache_raft::ConfigCmd::AddNode {
+            id: id.clone(),
+            host,
+            port,
+        },
+        ironcache_raft::ConfigCmd::AssignSlots { node: id, slots },
+    ])
+}
+
+/// Parse the slot list of `CLUSTER ADDSLOTS <slot>...` (arity Min(3); each slot strictly
+/// validated, mirroring the static path's Redis error shapes).
+fn parse_addslots_slots(request: &Request) -> Result<Vec<u16>, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::ErrorReply;
+    if request.args.len() < 3 {
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&request.args[1]),
+        ));
+    }
+    let mut slots = Vec::with_capacity(request.args.len() - 2);
+    for a in &request.args[2..] {
+        slots.push(parse_slot_strict(a)?);
+    }
+    Ok(slots)
+}
+
+/// Parse + expand the `<start> <end>` pairs of `CLUSTER ADDSLOTSRANGE` (even, non-empty arg count;
+/// each slot strictly validated, `start <= end`).
+fn parse_addslotsrange_slots(
+    request: &Request,
+) -> Result<Vec<u16>, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::ErrorReply;
+    let pairs = &request.args[2..];
+    if pairs.is_empty() {
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&request.args[1]),
+        ));
+    }
+    if pairs.len() % 2 != 0 {
+        return Err(ErrorReply::wrong_arity("cluster|addslotsrange"));
+    }
+    let mut slots = Vec::new();
+    for pair in pairs.chunks_exact(2) {
+        let start = parse_slot_strict(&pair[0])?;
+        let end = parse_slot_strict(&pair[1])?;
+        if start > end {
+            return Err(ErrorReply::err(format!(
+                "start slot number {start} is greater than end slot number {end}"
+            )));
+        }
+        slots.extend(start..=end);
+    }
+    Ok(slots)
+}
+
+/// Build the `SetSlotOwner { slot, node }` ConfigCmd for raft-mode `CLUSTER SETSLOT <slot> NODE
+/// <id>` (HA-4c). Only the `NODE` ownership-transfer form is supported (matching slice-3); the
+/// live-resharding states (MIGRATING/IMPORTING/STABLE) are not.
+fn build_setslot(
+    request: &Request,
+) -> Result<ironcache_raft::ConfigCmd, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::ErrorReply;
+    let setslot_err = || {
+        ErrorReply::err("Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP")
+    };
+    if request.args.len() != 5 {
+        return Err(setslot_err());
+    }
+    let slot = parse_slot_strict(&request.args[2])?;
+    if !ascii_upper(&request.args[3]).eq_ignore_ascii_case(b"NODE") {
+        return Err(setslot_err());
+    }
+    let node = String::from_utf8_lossy(&request.args[4]).into_owned();
+    Ok(ironcache_raft::ConfigCmd::SetSlotOwner { slot, node })
+}
+
+/// Build the `AddNode { id, host, port }` ConfigCmd for raft-mode `CLUSTER MEET <ip> <port>
+/// [bus]` (HA-4c). The peer's id is synthesized deterministically from `host:port` (no gossip to
+/// learn the real id; documented divergence, the same shape slice-3's static MEET uses).
+fn build_meet(
+    request: &Request,
+) -> Result<ironcache_raft::ConfigCmd, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::ErrorReply;
+    if request.args.len() != 4 && request.args.len() != 5 {
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&request.args[1]),
+        ));
+    }
+    let host = String::from_utf8_lossy(&request.args[2]).into_owned();
+    let port_arg = String::from_utf8_lossy(&request.args[3]).into_owned();
+    let Some(port) = ironcache_server::cmd_util::parse_i64(&request.args[3]) else {
+        return Err(ErrorReply::err(format!(
+            "Invalid base port specified: {port_arg}"
+        )));
+    };
+    if !(1..=65535).contains(&port) {
+        return Err(ErrorReply::err(format!(
+            "Invalid node address specified: {host}:{port_arg}"
+        )));
+    }
+    let id = synth_meet_node_id(&host, port as u16);
+    Ok(ironcache_raft::ConfigCmd::AddNode {
+        id,
+        host,
+        port: port as u16,
+    })
+}
+
+/// Build the `RemoveNode { id }` ConfigCmd for raft-mode `CLUSTER FORGET <id>` (HA-4c).
+fn build_forget(
+    request: &Request,
+) -> Result<ironcache_raft::ConfigCmd, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::ErrorReply;
+    if request.args.len() != 3 {
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&request.args[1]),
+        ));
+    }
+    Ok(ironcache_raft::ConfigCmd::RemoveNode {
+        id: String::from_utf8_lossy(&request.args[2]).into_owned(),
+    })
+}
+
+/// Build the `SetConfigEpoch(epoch)` ConfigCmd for raft-mode `CLUSTER SET-CONFIG-EPOCH <epoch>`
+/// (HA-4c). A negative epoch is the Redis invalid-epoch error.
+fn build_set_config_epoch(
+    request: &Request,
+) -> Result<ironcache_raft::ConfigCmd, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::ErrorReply;
+    if request.args.len() != 3 {
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&request.args[1]),
+        ));
+    }
+    let Some(epoch) = ironcache_server::cmd_util::parse_i64(&request.args[2]) else {
+        return Err(ErrorReply::not_an_integer());
+    };
+    if epoch < 0 {
+        return Err(ErrorReply::err(format!(
+            "Invalid config epoch specified: {epoch}"
+        )));
+    }
+    Ok(ironcache_raft::ConfigCmd::SetConfigEpoch(epoch as u64))
+}
+
+/// THIS node's committed identity `(id, host, port)` for a self-`AddNode` / `AssignSlots`,
+/// read from the shared map's self entry (the advertised endpoint a MOVED redirect points at).
+/// Falls back to the boot node id + bind/port if the map is somehow absent (unreachable in
+/// raft-mode, which always installs the shared map as `ctx.cluster`).
+fn self_node_endpoint(ctx: &ServerContext) -> (String, String, u16) {
+    match ctx.cluster.as_deref() {
+        Some(m) => {
+            let me = m.me();
+            (me.id.to_string(), me.host.to_string(), me.port)
+        }
+        None => (
+            ctx.info.cluster_node_id.to_owned(),
+            ctx.boot.bind.to_string(),
+            ctx.info.tcp_port,
+        ),
+    }
+}
+
+/// Parse + bounds-check a slot the way Redis's `getSlotOrReply` does for the mutator paths: a
+/// non-integer OR an out-of-range value is the single `Invalid or out of range slot` error.
+fn parse_slot_strict(arg: &[u8]) -> Result<u16, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::{CLUSTER_SLOTS, ErrorReply};
+    match ironcache_server::cmd_util::parse_i64(arg) {
+        Some(n) if (0..i64::from(CLUSTER_SLOTS)).contains(&n) => Ok(n as u16),
+        _ => Err(ErrorReply::err("Invalid or out of range slot")),
+    }
+}
+
+/// Synthesize a deterministic 40-lowercase-hex placeholder node id from a MEET endpoint (FNV-1a
+/// over `host:port`, hex-padded to 40), so the MEET'd peer is addressable before gossip learns
+/// its real id. The SAME derivation the static slice-3 `cmd_cluster` MEET uses, so a node MEET'd
+/// in either mode gets the identical id.
+fn synth_meet_node_id(host: &str, port: u16) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let endpoint = format!("{host}:{port}");
+    for b in endpoint.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let hex16 = format!("{h:016x}");
+    let mut id = String::with_capacity(40);
+    while id.len() < 40 {
+        id.push_str(&hex16);
+    }
+    id.truncate(40);
+    id
 }
 
 /// Dispatch ONE shard-spanning gather-combine command to its per-command fan-out

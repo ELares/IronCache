@@ -556,6 +556,7 @@ mod tests {
                 cluster_enabled: false,
             },
             cluster: None,
+            raft: None,
             boot,
         }
     }
