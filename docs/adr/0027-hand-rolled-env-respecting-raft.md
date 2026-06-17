@@ -67,6 +67,30 @@ importing a crate verified against its own model:
   State-Machine Safety, committed-entry durability, and no-two-owners-per-epoch)
   run as harness assertions after every scenario, not as one-off spot checks.
 
+## Rejected Alternatives
+
+Wrap a mature Raft crate (raft-rs, openraft, async-raft) behind an adapter.
+Rejected: each owns its clock (`Instant::now` / `tokio::time`), its RNG for
+election jitter, and an async executor. Interposing the `ironcache-env` seam is
+not supported by their APIs, so the engine could not be single-stepped in
+virtual time and a run could not replay byte-identically from a seed. This
+breaks ADR-0003 and fails the invariant lint and the DST replay obligation.
+
+Fork a crate and rip out its time / rand / executor. Rejected: the fork would be
+deep enough that we own the correctness surface anyway, with less visibility
+than code we wrote, plus a permanent rebase burden against upstream.
+
+Defer real consensus: ship a single-voter degenerate control plane first and add
+multi-voter Raft last. Rejected: the degenerate path exercises none of the
+election / replication safety logic, so it would mask exactly the bugs that
+matter and give false confidence; it also could not be tested against the
+partition / membership failure classes the bar requires.
+
+Skip the control plane and keep the slot map authoritative per node (gossip /
+point-to-point sync). Rejected by ADR-0025 / CONTROL_PLANE.md already: an
+unsynchronized per-node map cannot give linearizable slot ownership (no
+two-owners-at-one-epoch), which is the property the cluster contract depends on.
+
 ## Consequences
 
 Positive: full Env-determinism is preserved; there is zero foreign
