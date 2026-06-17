@@ -131,31 +131,47 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     // only on CONFIG SET. Seeded from the boot-resolved config.
     let runtime = RuntimeConfig::from_config(config);
 
-    // The static cluster slot-ownership map (CLUSTER_CONTRACT.md #70, slice 2), built ONCE
-    // here at boot and threaded (Arc) into every shard's context. It is `Some` IFF cluster
-    // mode is enabled AND a topology is configured; otherwise `None` (a standalone node, OR a
-    // cluster-enabled node with no topology, which stays slice-1 single-node-owns-all). The
-    // build cannot fail here: `Config::validate` already ran `SlotMap::build` on the same
-    // (topology, announce-id) input and the process would have exited non-zero on any error,
-    // so `.expect("validated")` documents that invariant rather than re-handling the error.
+    // The cluster slot-ownership map (CLUSTER_CONTRACT.md #70), built ONCE here at boot and
+    // threaded (Arc) into every shard's context. Slice 3: a cluster-ENABLED node ALWAYS gets a
+    // `Some(map)`, in one of two shapes; a cluster-DISABLED standalone node gets `None` (and keeps
+    // the slice-1 single-node-owns-all CLUSTER projection bodies).
+    //
+    //   * STATIC TOPOLOGY (cluster_enabled + a configured topology): build the validated multi-node
+    //     map from config. The build cannot fail here: `Config::validate` already ran
+    //     `SlotMap::build` on the same (topology, announce-id) input and the process would have
+    //     exited non-zero on any error, so `.expect("validated")` documents that invariant.
+    //   * NO TOPOLOGY (cluster_enabled, no topology): an EMPTY single-node map owning ZERO slots
+    //     (`SlotMap::empty_self`). The operator forms the cluster at runtime via `CLUSTER MEET /
+    //     ADDSLOTS / SETSLOT / ...` (slice 3). NOTE: a cluster-enabled no-topology node previously
+    //     (slice 1/2) reported single-node-owns-all (16384 slots, state:ok); it now owns ZERO slots
+    //     until ADDSLOTS and reports cluster_state:fail, matching a fresh real-Redis node.
     let cluster: Option<Arc<ironcache_cluster::SlotMap>> = if config.cluster_enabled {
-        config.cluster_topology.as_ref().map(|topo| {
-            let nodes: Vec<(ironcache_cluster::NodeEntry, Vec<[u16; 2]>)> = topo
-                .nodes
-                .iter()
-                .map(|n| {
-                    (
-                        ironcache_cluster::NodeEntry {
-                            id: n.id.clone().into_boxed_str(),
-                            host: n.host.clone().into_boxed_str(),
-                            port: n.port,
-                        },
-                        n.slots.clone(),
-                    )
-                })
-                .collect();
-            Arc::new(ironcache_cluster::SlotMap::build(nodes, cluster_node_id).expect("validated"))
-        })
+        match config.cluster_topology.as_ref() {
+            Some(topo) => {
+                let nodes: Vec<(ironcache_cluster::NodeEntry, Vec<[u16; 2]>)> = topo
+                    .nodes
+                    .iter()
+                    .map(|n| {
+                        (
+                            ironcache_cluster::NodeEntry {
+                                id: n.id.clone().into_boxed_str(),
+                                host: n.host.clone().into_boxed_str(),
+                                port: n.port,
+                            },
+                            n.slots.clone(),
+                        )
+                    })
+                    .collect();
+                Some(Arc::new(
+                    ironcache_cluster::SlotMap::build(nodes, cluster_node_id).expect("validated"),
+                ))
+            }
+            None => Some(Arc::new(ironcache_cluster::SlotMap::empty_self(
+                cluster_node_id,
+                &config.bind.to_string(),
+                config.port,
+            ))),
+        }
     } else {
         None
     };
@@ -874,9 +890,10 @@ where
 /// `Some(-MOVED <slot> <owner host:port>)` when THIS node does not own `slot`, else `None`.
 ///
 /// The redirect target is the OWNER node's advertised `host:port` (what the client should dial),
-/// never the bind address. A slice-2 validated map is fully assigned, so the owner is always
-/// present; the `?` on the partial-map gap is defensive (it would only fire on a future partial
-/// map, which validation currently rejects at boot).
+/// never the bind address. `moved_target` resolves the owner's advertised endpoint under the
+/// node lock (the COLD redirect path); the `?` on its `None` (an unassigned slot) is defensive
+/// (an empty-self / mid-formation node may not yet own the slot, and slice 3 has no peer that
+/// could serve it, so we simply do not redirect rather than dial a nonexistent owner).
 fn moved_if_unowned(
     map: &ironcache_cluster::SlotMap,
     slot: u16,
@@ -884,10 +901,10 @@ fn moved_if_unowned(
     if map.owns(slot) {
         return None;
     }
-    let owner = map.owner(slot)?;
+    let (host, port) = map.moved_target(slot)?;
     Some(ironcache_protocol::ErrorReply::moved(
         slot,
-        &format!("{}:{}", owner.host, owner.port),
+        &format!("{host}:{port}"),
     ))
 }
 

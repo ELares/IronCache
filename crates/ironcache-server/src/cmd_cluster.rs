@@ -95,15 +95,23 @@ pub fn cmd_cluster(ctx: &ServerContext, req: &Request) -> Value {
         b"COUNTKEYSINSLOT" => cluster_countkeysinslot(req),
         b"GETKEYSINSLOT" => cluster_getkeysinslot(req),
         b"HELP" => cluster_help(),
-        // Topology-mutation / cluster-only subcommands. On a single-node cluster IronCache
-        // cannot reshard or change membership in slice 1, so each returns
-        // `-ERR <SUBCOMMAND> is not supported on a single-node cluster`. Real topology
-        // (ADDSLOTS / SETSLOT / MEET / ...) plus MOVED/ASK/CROSSSLOT arrives in slice 2.
-        // (When cluster mode is DISABLED these never reach here; the gate above already
-        // returned the cluster-disabled error.)
-        b"MEET" | b"ADDSLOTS" | b"ADDSLOTSRANGE" | b"DELSLOTS" | b"DELSLOTSRANGE" | b"SETSLOT"
-        | b"FORGET" | b"REPLICATE" | b"FAILOVER" | b"RESET" | b"BUMPEPOCH" | b"FLUSHSLOTS"
-        | b"SET-CONFIG-EPOCH" => Value::error(ErrorReply::err(format!(
+        // Slice-3 topology-mutation subcommands: each drives a `SlotMap` mutator (the real
+        // local self-formation surface). Inter-node SYNC of these is slice 3b; here a node
+        // mutates only its OWN view. Cluster mode is enabled (the gate above), so `ctx.cluster`
+        // is `Some` per the slice-3 boot wiring; the `None` arm is a defensive fallback.
+        b"ADDSLOTS" => cluster_addslots(ctx, req),
+        b"DELSLOTS" => cluster_delslots(ctx, req),
+        b"ADDSLOTSRANGE" => cluster_addslotsrange(ctx, req),
+        b"DELSLOTSRANGE" => cluster_delslotsrange(ctx, req),
+        b"SETSLOT" => cluster_setslot(ctx, req),
+        b"FLUSHSLOTS" => cluster_flushslots(ctx, req),
+        b"MEET" => cluster_meet(ctx, req),
+        b"FORGET" => cluster_forget(ctx, req),
+        b"BUMPEPOCH" => cluster_bumpepoch(ctx, req),
+        b"SET-CONFIG-EPOCH" => cluster_set_config_epoch(ctx, req),
+        // Replication / failover / reset are deferred to a later slice (slice 4): IronCache has
+        // no replicas yet. They keep the documented not-supported reply.
+        b"REPLICATE" | b"FAILOVER" | b"RESET" => Value::error(ErrorReply::err(format!(
             "{} is not supported on a single-node cluster",
             String::from_utf8_lossy(&sub)
         ))),
@@ -114,6 +122,367 @@ pub fn cmd_cluster(ctx: &ServerContext, req: &Request) -> Value {
             &String::from_utf8_lossy(&req.args[1]),
         )),
     }
+}
+
+/// The `Some(map)` slot map for a mutator subcommand, or the documented not-supported error
+/// when there is no map (a defensive fallback; the slice-3 boot wiring always supplies a map
+/// for a cluster-enabled node).
+fn cluster_map<'a>(
+    ctx: &'a ServerContext,
+    sub: &str,
+) -> Result<&'a std::sync::Arc<ironcache_cluster::SlotMap>, Value> {
+    ctx.cluster.as_ref().ok_or_else(|| {
+        Value::error(ErrorReply::err(format!(
+            "{sub} is not supported on a single-node cluster"
+        )))
+    })
+}
+
+/// Wrap a [`SlotMutError`](ironcache_cluster::SlotMutError) into the `-ERR <message>` reply.
+/// `SlotMutError::Display` is byte-exact to Redis's `clusterCommand` message (cluster_legacy.c),
+/// so the reply matches Redis on the parity cases (busy / unassigned / unknown-node / forget-self
+/// / the epoch errors).
+fn mut_err(e: &ironcache_cluster::SlotMutError) -> Value {
+    Value::error(ErrorReply::err(e.to_string()))
+}
+
+/// The Redis `addReplySubcommandSyntaxError` reply for a CLUSTER subcommand whose token matched but
+/// whose argument count is too small (Redis returns this class, NOT a bare wrong-arity, for an
+/// under-arity mutator subcommand). Uses the raw subcommand token from `req.args[1]`, matching the
+/// `_ =>` unknown-subcommand arm's call style.
+fn cluster_subcommand_syntax_error(req: &Request) -> Value {
+    Value::error(ErrorReply::unknown_subcommand(
+        "CLUSTER",
+        &String::from_utf8_lossy(&req.args[1]),
+    ))
+}
+
+/// `CLUSTER ADDSLOTS <slot> [<slot> ...]` -> claim each slot for self. Arity Min(3).
+fn cluster_addslots(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() < 3 {
+        // Under-arity: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
+    }
+    let slots = match parse_slot_list(&req.args[2..]) {
+        Ok(s) => s,
+        Err(e) => return Value::error(e),
+    };
+    let map = match cluster_map(ctx, "ADDSLOTS") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    match map.add_slots(&slots) {
+        Ok(()) => Value::ok(),
+        Err(e) => mut_err(&e),
+    }
+}
+
+/// `CLUSTER DELSLOTS <slot> [<slot> ...]` -> release each slot. Arity Min(3).
+fn cluster_delslots(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() < 3 {
+        // Under-arity: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
+    }
+    let slots = match parse_slot_list(&req.args[2..]) {
+        Ok(s) => s,
+        Err(e) => return Value::error(e),
+    };
+    let map = match cluster_map(ctx, "DELSLOTS") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    match map.del_slots(&slots) {
+        Ok(()) => Value::ok(),
+        Err(e) => mut_err(&e),
+    }
+}
+
+/// `CLUSTER ADDSLOTSRANGE <start> <end> [<start> <end> ...]` -> claim each inclusive range for
+/// self. The args after the subcommand must come in pairs (even count, >= 2). Each `start`/`end`
+/// is a valid slot and `start <= end`; the full expanded slot set is added all-or-nothing.
+fn cluster_addslotsrange(ctx: &ServerContext, req: &Request) -> Value {
+    let slots = match parse_slot_ranges(&req.args, "cluster|addslotsrange") {
+        Ok(s) => s,
+        Err(e) => return Value::error(e),
+    };
+    let map = match cluster_map(ctx, "ADDSLOTSRANGE") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    match map.add_slots(&slots) {
+        Ok(()) => Value::ok(),
+        Err(e) => mut_err(&e),
+    }
+}
+
+/// `CLUSTER DELSLOTSRANGE <start> <end> [<start> <end> ...]` -> release each inclusive range.
+fn cluster_delslotsrange(ctx: &ServerContext, req: &Request) -> Value {
+    let slots = match parse_slot_ranges(&req.args, "cluster|delslotsrange") {
+        Ok(s) => s,
+        Err(e) => return Value::error(e),
+    };
+    let map = match cluster_map(ctx, "DELSLOTSRANGE") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    match map.del_slots(&slots) {
+        Ok(()) => Value::ok(),
+        Err(e) => mut_err(&e),
+    }
+}
+
+/// `CLUSTER SETSLOT <slot> NODE <node-id>` -> flip the slot's owner (slice 3 supports ONLY the
+/// `NODE` ownership-transfer form). `MIGRATING` / `IMPORTING` / `STABLE` are the live-resharding
+/// state machine and are deferred to slice 4 (clear not-supported). Arity exactly 5.
+fn cluster_setslot(ctx: &ServerContext, req: &Request) -> Value {
+    // SETSLOT <slot> <subcmd> ... : the shortest form (STABLE) is 4 args.
+    if req.args.len() < 4 {
+        // Under-arity base guard: the addReplySubcommandSyntaxError class (Redis parity).
+        return cluster_subcommand_syntax_error(req);
+    }
+    let slot = match parse_slot_strict(&req.args[2]) {
+        Ok(s) => s,
+        Err(e) => return Value::error(e),
+    };
+    let setsub = ascii_upper(&req.args[3]);
+    // Any unmatched action OR a matched action at the WRONG argc is the single Redis message
+    // (cluster_legacy.c SETSLOT: `Invalid CLUSTER SETSLOT action or number of arguments.`).
+    let setslot_err = || {
+        Value::error(ErrorReply::err(
+            "Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP",
+        ))
+    };
+    match setsub.as_slice() {
+        b"NODE" if req.args.len() == 5 => {
+            let node_id = String::from_utf8_lossy(&req.args[4]);
+            let map = match cluster_map(ctx, "SETSLOT") {
+                Ok(m) => m,
+                Err(v) => return v,
+            };
+            match map.set_slot_node(slot, &node_id) {
+                Ok(()) => Value::ok(),
+                Err(e) => mut_err(&e),
+            }
+        }
+        // The live-resharding states are slice 4; reply with the documented not-supported error,
+        // but only at their correct argc (MIGRATING/IMPORTING take a node id at argc==5, STABLE
+        // takes none at argc==4). At a wrong argc they fall through to the SETSLOT error below.
+        b"MIGRATING" | b"IMPORTING" if req.args.len() == 5 => {
+            Value::error(ErrorReply::err(format!(
+                "SETSLOT {} is not supported on a single-node cluster",
+                String::from_utf8_lossy(&setsub)
+            )))
+        }
+        b"STABLE" if req.args.len() == 4 => Value::error(ErrorReply::err(
+            "SETSLOT STABLE is not supported on a single-node cluster",
+        )),
+        // Unknown action, or a known action at the wrong argc (incl. NODE with argc != 5).
+        _ => setslot_err(),
+    }
+}
+
+/// `CLUSTER FLUSHSLOTS` -> release every slot THIS node owns. Arity exactly 2.
+///
+/// DOCUMENTED DIVERGENCE from Redis 7.4: Redis errors `DB must be empty to perform CLUSTER
+/// FLUSHSLOTS.` when the keyspace is non-empty. IronCache has no per-slot / per-DB key-count index
+/// yet (the same gap COUNTKEYSINSLOT documents), so it cannot test DB-emptiness and always returns
+/// `+OK`. The emptiness gate lands with the cross-shard slot index in a later slice.
+fn cluster_flushslots(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() != 2 {
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
+    }
+    let map = match cluster_map(ctx, "FLUSHSLOTS") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    map.flush_slots();
+    Value::ok()
+}
+
+/// `CLUSTER MEET <ip> <port> [<bus-port>]` -> add the named node to this node's table. Slice 3
+/// records the node locally (no handshake / gossip yet, slice 3b). Arity 4 or 5 (the optional
+/// cluster-bus port is accepted but unused). The new node's id is unknown until gossip, so a
+/// deterministic placeholder id is synthesized from the endpoint so the entry is addressable by
+/// `SETSLOT` / `FORGET` in this slice (documented divergence).
+fn cluster_meet(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() != 4 && req.args.len() != 5 {
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
+    }
+    let host = String::from_utf8_lossy(&req.args[2]).into_owned();
+    let port_arg = String::from_utf8_lossy(&req.args[3]).into_owned();
+    // Non-parseable base port -> Redis `Invalid base port specified: %s` (uses the raw arg).
+    let Some(port) = parse_i64(&req.args[3]) else {
+        return Value::error(ErrorReply::err(format!(
+            "Invalid base port specified: {port_arg}"
+        )));
+    };
+    // The optional cluster-bus port (arg 4) is parsed for validity but unused (no bus yet).
+    // Non-parseable bus port -> Redis `Invalid bus port specified: %s` (uses the raw arg).
+    if req.args.len() == 5 && parse_i64(&req.args[4]).is_none() {
+        let bus_arg = String::from_utf8_lossy(&req.args[4]).into_owned();
+        return Value::error(ErrorReply::err(format!(
+            "Invalid bus port specified: {bus_arg}"
+        )));
+    }
+    // Out-of-range base port (or any otherwise-invalid address/port) -> Redis
+    // `Invalid node address specified: %s:%s` (the ip:port).
+    if !(1..=65535).contains(&port) {
+        return Value::error(ErrorReply::err(format!(
+            "Invalid node address specified: {host}:{port_arg}"
+        )));
+    }
+    let map = match cluster_map(ctx, "MEET") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    let id = synth_node_id(&host, port as u16);
+    map.meet(ironcache_cluster::NodeEntry {
+        id: id.into_boxed_str(),
+        host: host.into_boxed_str(),
+        port: port as u16,
+    });
+    Value::ok()
+}
+
+/// `CLUSTER FORGET <node-id>` -> remove the node from this node's table (reindexing ownership).
+/// Arity exactly 3.
+fn cluster_forget(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
+    }
+    let node_id = String::from_utf8_lossy(&req.args[2]);
+    let map = match cluster_map(ctx, "FORGET") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    match map.forget(&node_id) {
+        Ok(()) => Value::ok(),
+        Err(e) => mut_err(&e),
+    }
+}
+
+/// `CLUSTER BUMPEPOCH` -> conditionally advance the config epoch (Redis's
+/// `clusterBumpConfigEpochWithoutConsensus`): `+BUMPED <epoch>` on a real bump, `+STILL <epoch>`
+/// when the epoch was already the cluster max. Arity exactly 2.
+fn cluster_bumpepoch(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() != 2 {
+        // Under-arity: the addReplySubcommandSyntaxError class, not a bare wrong-arity (Redis
+        // parity for a matched-but-malformed CLUSTER subcommand).
+        return Value::error(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&req.args[1]),
+        ));
+    }
+    let map = match cluster_map(ctx, "BUMPEPOCH") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    // Redis replies the status `+BUMPED <epoch>` on a real bump and `+STILL <epoch>` otherwise.
+    match map.bump_epoch() {
+        ironcache_cluster::BumpEpoch::Bumped(epoch) => Value::simple(&format!("BUMPED {epoch}")),
+        ironcache_cluster::BumpEpoch::Still(epoch) => Value::simple(&format!("STILL {epoch}")),
+    }
+}
+
+/// `CLUSTER SET-CONFIG-EPOCH <epoch>` -> set this node's config epoch (only when fresh and
+/// alone). Arity exactly 3. A negative epoch is the Redis `Invalid config epoch specified:`
+/// error.
+fn cluster_set_config_epoch(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return cluster_subcommand_syntax_error(req);
+    }
+    let Some(epoch) = parse_i64(&req.args[2]) else {
+        return Value::error(ErrorReply::not_an_integer());
+    };
+    if epoch < 0 {
+        // Redis: `addReplyErrorFormat(c,"Invalid config epoch specified: %lld",epoch)`.
+        return Value::error(ErrorReply::err(format!(
+            "Invalid config epoch specified: {epoch}"
+        )));
+    }
+    let map = match cluster_map(ctx, "SET-CONFIG-EPOCH") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
+    match map.set_config_epoch(epoch as u64) {
+        Ok(()) => Value::ok(),
+        Err(e) => mut_err(&e),
+    }
+}
+
+/// Parse a list of slot arguments for the MUTATOR paths (ADDSLOTS / DELSLOTS), each
+/// `parse_slot_strict`-validated (the single `Invalid or out of range slot` message Redis's
+/// `getSlotOrReply` emits for both a non-integer and an out-of-range value). Returns the first
+/// error encountered, matching Redis's left-to-right validation.
+fn parse_slot_list(args: &[bytes::Bytes]) -> Result<Vec<u16>, ErrorReply> {
+    args.iter().map(|a| parse_slot_strict(a)).collect()
+}
+
+/// Parse the `<start> <end> [<start> <end> ...]` pairs of ADDSLOTSRANGE / DELSLOTSRANGE into the
+/// expanded, deduplicated-by-position slot list. The args after the subcommand must be a non-empty
+/// EVEN count (>= 2). Each `start`/`end` is a valid slot (strict getSlotOrReply parse) and
+/// `start <= end`. `cmd` is the wrong-arity command label (e.g. `cluster|addslotsrange`).
+///
+/// Two distinct argc errors, matching Redis (cluster_legacy.c ADDSLOTSRANGE/DELSLOTSRANGE):
+/// * UNDER-arity (fewer than the 4-arg minimum `CLUSTER <sub> <start> <end>`, i.e. no pair at all)
+///   -> the `addReplySubcommandSyntaxError` class (a matched-but-malformed subcommand), like the
+///   other under-arity mutator guards;
+/// * an ODD number of range args while >= 4 (`c->argc % 2 == 1`) -> Redis calls `addReplyErrorArity`
+///   (a real wrong-arity), so this case keeps `wrong_arity(cmd)`.
+fn parse_slot_ranges(args: &[bytes::Bytes], cmd: &str) -> Result<Vec<u16>, ErrorReply> {
+    // args[0]=CLUSTER, args[1]=subcommand; the range pairs start at args[2].
+    let pairs = &args[2..];
+    if pairs.is_empty() {
+        // Under-arity (no <start> <end> pair): the subcommand-syntax-error class.
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&args[1]),
+        ));
+    }
+    if pairs.len() % 2 != 0 {
+        // >= 4 args but an odd count: Redis's addReplyErrorArity (a real wrong-arity).
+        return Err(ErrorReply::wrong_arity(cmd));
+    }
+    let mut out = Vec::new();
+    for pair in pairs.chunks_exact(2) {
+        let start = parse_slot_strict(&pair[0])?;
+        let end = parse_slot_strict(&pair[1])?;
+        if start > end {
+            // Redis: `start slot number %d is greater than end slot number %d`.
+            return Err(ErrorReply::err(format!(
+                "start slot number {start} is greater than end slot number {end}"
+            )));
+        }
+        out.extend(start..=end);
+    }
+    Ok(out)
+}
+
+/// Synthesize a deterministic 40-lowercase-hex placeholder node id from a MEET endpoint, so the
+/// MEET'd node is addressable by `SETSLOT` / `FORGET` before gossip learns its real id (slice 3b).
+/// DOCUMENTED DIVERGENCE: real Redis learns the peer's actual id over the cluster bus; with no bus
+/// in slice 3 we derive a stable id from `host:port` (FNV-1a over the endpoint, hex-padded to 40).
+fn synth_node_id(host: &str, port: u16) -> String {
+    // FNV-1a 64-bit over "host:port" (deterministic, no rand/time, ADR-0003), rendered as hex and
+    // repeated to fill the 40-hex node-id width.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let endpoint = format!("{host}:{port}");
+    for b in endpoint.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let hex16 = format!("{h:016x}");
+    // 16 hex chars per hash; concatenate three copies and truncate to exactly 40.
+    let mut id = String::with_capacity(40);
+    while id.len() < 40 {
+        id.push_str(&hex16);
+    }
+    id.truncate(40);
+    id
 }
 
 /// `CLUSTER KEYSLOT <key>` -> the integer slot `CRC16(hash_tag(key)) % 16384`. Works
@@ -142,43 +511,81 @@ fn cluster_myid(ctx: &ServerContext, req: &Request) -> Value {
     }
 }
 
+// NOTE (slice 3): `CLUSTER MYID` and the SLOTS/SHARDS/NODES projection now read OWNED snapshots
+// (`map.me()` clones the self entry, `map.nodes()` clones the table) because slice 3 made the node
+// table mutable behind a lock; each projection takes ONE `nodes()` snapshot and pairs it with ONE
+// `ranges()` read so the two stay self-consistent.
+
 /// `CLUSTER INFO` -> the cluster status as a RESP3 verbatim string (txt) with the exact
 /// `field:value` lines a real Redis emits (each `\r\n`-terminated). Arity exactly 2.
 ///
-/// Reachable only when cluster mode is ENABLED (the disabled gate in [`cmd_cluster`] runs
-/// first), so this reports the single-node-cluster picture: `cluster_enabled:1`,
-/// `cluster_state:ok`, all 16384 slots assigned and OK, one known node, `cluster_size:1`.
-/// Epochs and message counters are zero (no gossip yet). Redis replies CLUSTER INFO via
-/// `addReplyVerbatim(..., "txt")`, so this is a `VerbatimString` (it degrades to a bulk
-/// string under RESP2 automatically).
+/// Reachable only when cluster mode is ENABLED (the disabled gate in [`cmd_cluster`] runs first).
+/// The counts/epochs/state come from the live map (slice 3: always present when cluster mode is on):
+/// `cluster_slots_assigned` / `cluster_known_nodes` / `cluster_size` from the map, `cluster_state`
+/// is `ok` iff every slot is owned (a fresh / mid-formation node is `fail`), and the epochs from
+/// `current_epoch()` / `my_epoch()`. Message counters are zero (no gossip yet). Redis replies
+/// CLUSTER INFO via `addReplyVerbatim(..., "txt")`, so this is a `VerbatimString` (it degrades to a
+/// bulk string under RESP2 automatically).
 fn cluster_info(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("cluster|info"));
     }
-    // Map-driven counts when a topology is configured; else the single-node-owns-all picture.
-    let (slots_assigned, known_nodes, cluster_size) = match &ctx.cluster {
-        Some(map) => (map.slots_assigned(), map.known_nodes(), map.cluster_size()),
-        None => (u32::from(CLUSTER_SLOTS), 1, 1),
+    // Map-driven counts/epochs/state when a map is present (slice 3: always present when cluster
+    // mode is enabled); else the slice-1 single-node-owns-all picture with `None` epochs.
+    let info = match &ctx.cluster {
+        Some(map) => ClusterInfoFields {
+            slots_assigned: map.slots_assigned(),
+            known_nodes: map.known_nodes(),
+            cluster_size: map.cluster_size(),
+            // A node with every slot owned is `ok`; a fresh / mid-formation node is `fail`
+            // (matches real Redis, which is `fail` until all 16384 slots are assigned).
+            state_ok: map.is_fully_assigned(),
+            current_epoch: map.current_epoch(),
+            my_epoch: map.my_epoch(),
+        },
+        None => ClusterInfoFields {
+            slots_assigned: u32::from(CLUSTER_SLOTS),
+            known_nodes: 1,
+            cluster_size: 1,
+            state_ok: true,
+            current_epoch: 0,
+            my_epoch: 0,
+        },
     };
-    verbatim_txt(cluster_info_body(slots_assigned, known_nodes, cluster_size).as_bytes())
+    verbatim_txt(cluster_info_body(&info).as_bytes())
 }
 
-/// Build the `CLUSTER INFO` `field:value` body (each line `\r\n`-terminated) from the slot
-/// counts, shared by the map-driven and single-node paths. `cluster_state` stays `ok` because
-/// a slice-2 map is always fully assigned (validation rejects a gap); epochs and message
-/// counters are zero (no gossip yet).
-fn cluster_info_body(slots_assigned: u32, known_nodes: usize, cluster_size: usize) -> String {
+/// The `CLUSTER INFO` fields that vary between the map-driven and single-node paths.
+struct ClusterInfoFields {
+    slots_assigned: u32,
+    known_nodes: usize,
+    cluster_size: usize,
+    state_ok: bool,
+    current_epoch: u64,
+    my_epoch: u64,
+}
+
+/// Build the `CLUSTER INFO` `field:value` body (each line `\r\n`-terminated) from the resolved
+/// fields, shared by the map-driven and single-node paths. The message counters are zero (no
+/// gossip yet); `cluster_state` is `ok` iff every slot is assigned.
+fn cluster_info_body(f: &ClusterInfoFields) -> String {
+    let state = if f.state_ok { "ok" } else { "fail" };
+    let slots_assigned = f.slots_assigned;
+    let known_nodes = f.known_nodes;
+    let cluster_size = f.cluster_size;
+    let current_epoch = f.current_epoch;
+    let my_epoch = f.my_epoch;
     format!(
         "cluster_enabled:1\r\n\
-         cluster_state:ok\r\n\
+         cluster_state:{state}\r\n\
          cluster_slots_assigned:{slots_assigned}\r\n\
          cluster_slots_ok:{slots_assigned}\r\n\
          cluster_slots_pfail:0\r\n\
          cluster_slots_fail:0\r\n\
          cluster_known_nodes:{known_nodes}\r\n\
          cluster_size:{cluster_size}\r\n\
-         cluster_current_epoch:0\r\n\
-         cluster_my_epoch:0\r\n\
+         cluster_current_epoch:{current_epoch}\r\n\
+         cluster_my_epoch:{my_epoch}\r\n\
          cluster_stats_messages_sent:0\r\n\
          cluster_stats_messages_received:0\r\n\
          total_cluster_links_buffer_limit_exceeded:0\r\n"
@@ -198,18 +605,20 @@ fn cluster_slots(ctx: &ServerContext, req: &Request) -> Value {
     }
     match &ctx.cluster {
         Some(map) => {
-            // Project each coalesced (start, end, owner) range as [start, end, [host, port, id]].
+            // ONE owned snapshot of the node table, paired with ONE ranges() read; the
+            // `owner` index from ranges() indexes this snapshot.
+            let nodes = map.nodes();
             let ranges = map
                 .ranges()
                 .into_iter()
-                .map(|(start, end, idx)| {
-                    let n = &map.nodes()[idx];
+                .filter_map(|(start, end, idx)| {
+                    let n = nodes.get(idx)?;
                     let served = served_by_triple(&n.host, n.port, &n.id);
-                    Value::Array(Some(vec![
+                    Some(Value::Array(Some(vec![
                         Value::Integer(i64::from(start)),
                         Value::Integer(i64::from(end)),
                         served,
-                    ]))
+                    ])))
                 })
                 .collect();
             Value::Array(Some(ranges))
@@ -268,8 +677,8 @@ fn cluster_shards(ctx: &ServerContext, req: &Request) -> Value {
             // emit `{slots => [s0,e0, s1,e1, ...], nodes => [<master node map>]}`. Slice 2 has
             // no replicas, so exactly one (master) node per shard.
             let ranges = map.ranges();
-            let shards = map
-                .nodes()
+            let nodes = map.nodes();
+            let shards = nodes
                 .iter()
                 .enumerate()
                 .map(|(idx, n)| {
@@ -352,21 +761,23 @@ fn cluster_nodes(ctx: &ServerContext, req: &Request) -> Value {
     let Some(map) = &ctx.cluster else {
         return cluster_nodes_singlenode(ctx);
     };
-    // One gossip line per node, in declaration order; THIS node is flagged `myself,master`,
-    // the others `master`. Each node's served slot ranges (its coalesced runs from
-    // `map.ranges()`) are space-joined as the trailing field.
+    // One gossip line per node, in table order; THIS node is flagged `myself,master`, the
+    // others `master`. Each node's served slot ranges (its coalesced runs from `map.ranges()`)
+    // are space-joined as the trailing field. ONE owned `nodes()` snapshot + ONE `ranges()`
+    // read, paired so the `owner` index from ranges() indexes this snapshot.
     let ranges = map.ranges();
-    let self_id = &map.me().id;
+    let nodes = map.nodes();
+    let self_id = map.me().id;
     let mut text = String::new();
-    for n in map.nodes() {
-        let flags = if &n.id == self_id {
+    for (node_idx, n) in nodes.iter().enumerate() {
+        let flags = if n.id == self_id {
             "myself,master"
         } else {
             "master"
         };
         let owned: Vec<String> = ranges
             .iter()
-            .filter(|&&(_, _, idx)| map.nodes()[idx].id == n.id)
+            .filter(|&&(_, _, idx)| idx == node_idx)
             .map(|&(start, end, _)| {
                 if start == end {
                     start.to_string()
@@ -509,6 +920,19 @@ fn parse_slot(arg: &[u8]) -> Result<u16, ErrorReply> {
         Ok(n as u16)
     } else {
         Err(ErrorReply::err("Invalid slot"))
+    }
+}
+
+/// Parse and bounds-check a slot the way Redis's `getSlotOrReply` does for the MUTATOR paths
+/// (ADDSLOTS / DELSLOTS / SETSLOT / ADDSLOTSRANGE / DELSLOTSRANGE). Unlike [`parse_slot`] (the
+/// COUNTKEYSINSLOT / GETKEYSINSLOT path), Redis's `getSlotOrReply` returns the SINGLE message
+/// `Invalid or out of range slot` for BOTH a non-integer arg AND an out-of-range value (it does
+/// `getLongLongFromObject ... || slot < 0 || slot >= CLUSTER_SLOTS` and replies once).
+fn parse_slot_strict(arg: &[u8]) -> Result<u16, ErrorReply> {
+    match parse_i64(arg) {
+        Some(n) if (0..i64::from(CLUSTER_SLOTS)).contains(&n) => Ok(n as u16),
+        // Non-integer OR out of range -> the one getSlotOrReply error.
+        _ => Err(ErrorReply::err("Invalid or out of range slot")),
     }
 }
 
@@ -940,28 +1364,15 @@ mod tests {
         }
     }
 
-    /// On a single-node cluster the topology-mutation subcommands return the documented
-    /// `-ERR <SUBCOMMAND> is not supported on a single-node cluster` (slice 2 adds the real
-    /// topology). They are reachable only because cluster mode is ENABLED here; when
-    /// DISABLED they hit the cluster-disabled gate instead.
+    /// REPLICATE / FAILOVER / RESET (replication / failover, deferred to slice 4) still return
+    /// the documented `-ERR <SUBCOMMAND> is not supported on a single-node cluster`. They are
+    /// reachable only because cluster mode is ENABLED here; when DISABLED they hit the
+    /// cluster-disabled gate instead. (The slot/membership/epoch mutators are now SUPPORTED in
+    /// slice 3 and tested in the empty-self section below.)
     #[test]
-    fn enabled_topology_mutation_subcommands_are_not_supported() {
+    fn enabled_replication_subcommands_are_not_supported() {
         let c = enabled(6390);
-        for sub in [
-            b"MEET".as_slice(),
-            b"ADDSLOTS",
-            b"ADDSLOTSRANGE",
-            b"DELSLOTS",
-            b"DELSLOTSRANGE",
-            b"SETSLOT",
-            b"FORGET",
-            b"REPLICATE",
-            b"FAILOVER",
-            b"RESET",
-            b"BUMPEPOCH",
-            b"FLUSHSLOTS",
-            b"SET-CONFIG-EPOCH",
-        ] {
+        for sub in [b"REPLICATE".as_slice(), b"FAILOVER", b"RESET"] {
             match cmd_cluster(&c, &req(&[b"CLUSTER", sub])) {
                 Value::Error(e) => {
                     let want = format!(
@@ -1116,5 +1527,464 @@ mod tests {
         let c = ctx_with_map();
         // In map mode MYID is the map's self id (the announce id), NOT the ServerInfo id.
         assert_eq!(bulk_string(&run(&c, &[b"CLUSTER", b"MYID"])), MAP_ID1);
+    }
+
+    // ----- SLICE 3: runtime self-formation (empty-self map + mutator dispatch) -----
+
+    /// A cluster-ENABLED ctx carrying a fresh EMPTY-SELF map (self owns ZERO slots), the slice-3
+    /// boot state of a cluster-enabled node with no static topology. Returns the ctx AND the
+    /// shared `Arc<SlotMap>` so a test can build a SECOND ctx clone over the SAME map (the
+    /// cross-shard-visibility test).
+    fn ctx_empty_self() -> (ServerContext, std::sync::Arc<ironcache_cluster::SlotMap>) {
+        let map = std::sync::Arc::new(ironcache_cluster::SlotMap::empty_self(
+            TEST_NODE_ID,
+            "127.0.0.1",
+            6390,
+        ));
+        let mut ctx = ctx_with(Config {
+            cluster_enabled: true,
+            ..Config::default()
+        });
+        ctx.cluster = Some(map.clone());
+        (ctx, map)
+    }
+
+    /// Assert a `Value` is `+OK`.
+    fn assert_ok(v: &Value, ctx: &str) {
+        assert_eq!(*v, Value::ok(), "{ctx}: expected +OK, got {v:?}");
+    }
+
+    /// The `-ERR <message>` line of an error reply, or panic.
+    fn err_line(v: &Value) -> String {
+        match v {
+            Value::Error(e) => e.line(),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// Drive the documented single-node create sequence on ONE empty-self node: MEET peers, claim
+    /// the slot space in two ADDSLOTSRANGE halves, then assert SLOTS / INFO converge.
+    #[test]
+    fn empty_self_create_sequence_converges_to_full_ownership() {
+        let (c, _map) = ctx_empty_self();
+
+        // Fresh node: owns zero slots, state:fail, my_epoch:0.
+        let info0 = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info0.contains("cluster_slots_assigned:0\r\n"),
+            "fresh node owns zero slots: {info0:?}"
+        );
+        assert!(
+            info0.contains("cluster_state:fail\r\n"),
+            "fresh node state is fail: {info0:?}"
+        );
+        assert!(info0.contains("cluster_known_nodes:1\r\n"), "{info0:?}");
+
+        // MEET two peers (the node set grows; ids are synthesized from the endpoints).
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"MEET", b"10.0.0.2", b"7002"]),
+            "MEET peer 2",
+        );
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"MEET", b"10.0.0.3", b"7003"]),
+            "MEET peer 3",
+        );
+        let info_after_meet = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info_after_meet.contains("cluster_known_nodes:3\r\n"),
+            "two MEETs grow the node set to 3: {info_after_meet:?}"
+        );
+
+        // ADDSLOTSRANGE the first half -> +OK; INFO shows 5461 assigned, still fail.
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"ADDSLOTSRANGE", b"0", b"5460"]),
+            "ADDSLOTSRANGE 0 5460",
+        );
+        let info1 = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info1.contains("cluster_slots_assigned:5461\r\n"),
+            "first half assigned: {info1:?}"
+        );
+        assert!(
+            info1.contains("cluster_state:fail\r\n"),
+            "partial map is fail: {info1:?}"
+        );
+
+        // CLUSTER SLOTS shows the single [0, 5460, self] range.
+        let Value::Array(Some(ranges)) = run(&c, &[b"CLUSTER", b"SLOTS"]) else {
+            panic!("expected a SLOTS array");
+        };
+        assert_eq!(ranges.len(), 1, "one owned range so far");
+        let Value::Array(Some(r)) = &ranges[0] else {
+            panic!("expected a range array");
+        };
+        assert_eq!(r[0], Value::Integer(0));
+        assert_eq!(r[1], Value::Integer(5460));
+        let Value::Array(Some(served)) = &r[2] else {
+            panic!("expected a served-by triple");
+        };
+        assert_eq!(served[2], Value::bulk_str(TEST_NODE_ID), "self serves it");
+
+        // ADDSLOTSRANGE the rest -> all 16384 assigned, state:ok.
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"ADDSLOTSRANGE", b"5461", b"16383"]),
+            "ADDSLOTSRANGE 5461 16383",
+        );
+        let info2 = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info2.contains("cluster_slots_assigned:16384\r\n"),
+            "fully assigned: {info2:?}"
+        );
+        assert!(
+            info2.contains("cluster_state:ok\r\n"),
+            "full map is ok: {info2:?}"
+        );
+
+        // SET-CONFIG-EPOCH would now be rejected (knows other nodes), so test it on a fresh node;
+        // here just exercise BUMPEPOCH, which works regardless of node count.
+        let bumped = run(&c, &[b"CLUSTER", b"BUMPEPOCH"]);
+        assert_eq!(
+            bumped,
+            Value::simple("BUMPED 1"),
+            "BUMPEPOCH replies +BUMPED <epoch>"
+        );
+        let info3 = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info3.contains("cluster_current_epoch:1\r\n"),
+            "BUMPEPOCH advanced current_epoch: {info3:?}"
+        );
+        assert!(info3.contains("cluster_my_epoch:1\r\n"), "{info3:?}");
+    }
+
+    /// SET-CONFIG-EPOCH on a fresh, alone node sets my_epoch; an immediate BUMPEPOCH is then STILL
+    /// (my_epoch already == the cluster max, Redis's clusterBumpConfigEpochWithoutConsensus).
+    #[test]
+    fn empty_self_set_config_epoch_then_bumpepoch() {
+        let (c, _map) = ctx_empty_self();
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"SET-CONFIG-EPOCH", b"5"]),
+            "SET-CONFIG-EPOCH 5",
+        );
+        let info = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(info.contains("cluster_my_epoch:5\r\n"), "{info:?}");
+        assert!(info.contains("cluster_current_epoch:5\r\n"), "{info:?}");
+        // my_epoch (5) is already the cluster max, so BUMPEPOCH replies STILL 5 (no change).
+        assert_eq!(
+            run(&c, &[b"CLUSTER", b"BUMPEPOCH"]),
+            Value::simple("STILL 5")
+        );
+        let info2 = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info2.contains("cluster_my_epoch:5\r\n"),
+            "STILL leaves my_epoch at 5: {info2:?}"
+        );
+        assert!(
+            info2.contains("cluster_current_epoch:5\r\n"),
+            "STILL leaves current_epoch at 5: {info2:?}"
+        );
+    }
+
+    /// Byte-exact Redis error parity for the mutator rejections.
+    #[test]
+    fn mutator_errors_are_byte_exact_to_redis() {
+        let (c, _map) = ctx_empty_self();
+        // ADDSLOTS then re-ADD the same slot -> `Slot N is already busy`.
+        assert_ok(&run(&c, &[b"CLUSTER", b"ADDSLOTS", b"100"]), "ADDSLOTS 100");
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTS", b"100"])),
+            "-ERR Slot 100 is already busy"
+        );
+        // DELSLOTS an unassigned slot -> `Slot N is already unassigned`.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"DELSLOTS", b"200"])),
+            "-ERR Slot 200 is already unassigned"
+        );
+        // FORGET self -> the exact "can't forget myself" line.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"FORGET", TEST_NODE_ID.as_bytes()])),
+            "-ERR I tried hard but I can't forget myself..."
+        );
+        // FORGET unknown node -> `Unknown node <id>`.
+        let unknown = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"FORGET", unknown.as_bytes()])),
+            format!("-ERR Unknown node {unknown}")
+        );
+        // SETSLOT <slot> NODE <unknown> -> `Unknown node <id>`.
+        assert_eq!(
+            err_line(&run(
+                &c,
+                &[b"CLUSTER", b"SETSLOT", b"0", b"NODE", unknown.as_bytes()]
+            )),
+            format!("-ERR Unknown node {unknown}")
+        );
+        // Out-of-range slot in a MUTATOR (ADDSLOTS) -> the single getSlotOrReply message
+        // `Invalid or out of range slot` (NOT the COUNTKEYSINSLOT "Invalid slot").
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTS", b"99999"])),
+            "-ERR Invalid or out of range slot"
+        );
+        // A NON-integer slot in a mutator gets the SAME single message (getSlotOrReply: one error
+        // for both a non-integer and an out-of-range value).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTS", b"abc"])),
+            "-ERR Invalid or out of range slot"
+        );
+        // The same single message on a DELSLOTS mutator (non-integer) and SETSLOT (out of range).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"DELSLOTS", b"xyz"])),
+            "-ERR Invalid or out of range slot"
+        );
+        assert_eq!(
+            err_line(&run(
+                &c,
+                &[
+                    b"CLUSTER",
+                    b"SETSLOT",
+                    b"99999",
+                    b"NODE",
+                    TEST_NODE_ID.as_bytes()
+                ]
+            )),
+            "-ERR Invalid or out of range slot"
+        );
+        // A slot named TWICE in one ADD/DEL batch -> `Slot N specified multiple times`.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTS", b"5", b"5"])),
+            "-ERR Slot 5 specified multiple times"
+        );
+        // ADDSLOTSRANGE with start > end -> the Redis range error.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"ADDSLOTSRANGE", b"50", b"10"])),
+            "-ERR start slot number 50 is greater than end slot number 10"
+        );
+    }
+
+    /// FINDING 3: an under-arity mutator subcommand (token matches, argc too small) is the
+    /// addReplySubcommandSyntaxError class, NOT a bare wrong-arity. Redis:
+    /// `unknown subcommand or wrong number of arguments for '<sub>'. Try CLUSTER HELP.`
+    #[test]
+    fn under_arity_mutator_subcommands_are_subcommand_syntax_errors() {
+        let (c, _map) = ctx_empty_self();
+        // Each of these matches its token but is one arg short of the minimum.
+        let cases: &[&[&[u8]]] = &[
+            &[b"CLUSTER", b"ADDSLOTS"],
+            &[b"CLUSTER", b"DELSLOTS"],
+            &[b"CLUSTER", b"SETSLOT", b"0"], // base guard: argc < 4
+            &[b"CLUSTER", b"FLUSHSLOTS", b"extra"], // argc != 2
+            &[b"CLUSTER", b"MEET", b"127.0.0.1"], // argc not 4/5
+            &[b"CLUSTER", b"FORGET"],        // argc != 3
+            &[b"CLUSTER", b"BUMPEPOCH", b"extra"], // argc != 2
+            &[b"CLUSTER", b"SET-CONFIG-EPOCH"], // argc != 3
+            &[b"CLUSTER", b"ADDSLOTSRANGE"], // no pair at all
+            &[b"CLUSTER", b"DELSLOTSRANGE"], // no pair at all
+        ];
+        for parts in cases {
+            let line = err_line(&run(&c, parts));
+            assert!(
+                line.contains("unknown subcommand or wrong number of arguments")
+                    && line.contains("Try CLUSTER HELP."),
+                "{parts:?} should be a subcommand-syntax error, got {line:?}"
+            );
+        }
+    }
+
+    /// FINDING 3 EXCEPTION: ADDSLOTSRANGE / DELSLOTSRANGE with >= 4 args but an ODD count is a
+    /// REAL wrong-arity (Redis addReplyErrorArity), not the subcommand-syntax error.
+    #[test]
+    fn odd_range_args_are_real_wrong_arity() {
+        let (c, _map) = ctx_empty_self();
+        for sub in [b"ADDSLOTSRANGE".as_slice(), b"DELSLOTSRANGE"] {
+            // Three range args (one pair + a dangling one): odd while >= 4 total.
+            let line = err_line(&run(&c, &[b"CLUSTER", sub, b"0", b"5", b"7"]));
+            assert!(
+                line.contains("wrong number of arguments") && !line.contains("unknown subcommand"),
+                "{:?} odd args should be wrong-arity, got {line:?}",
+                String::from_utf8_lossy(sub)
+            );
+        }
+    }
+
+    /// FINDING 4: CLUSTER MEET port / address error strings (Redis 7.4 exact).
+    #[test]
+    fn meet_port_and_address_errors_are_byte_exact() {
+        let (c, _map) = ctx_empty_self();
+        // Non-integer base port -> `Invalid base port specified: <arg>`.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"MEET", b"127.0.0.1", b"notaport"])),
+            "-ERR Invalid base port specified: notaport"
+        );
+        // Non-integer bus port -> `Invalid bus port specified: <arg>`.
+        assert_eq!(
+            err_line(&run(
+                &c,
+                &[b"CLUSTER", b"MEET", b"127.0.0.1", b"7000", b"busbad"]
+            )),
+            "-ERR Invalid bus port specified: busbad"
+        );
+        // Out-of-range base port -> `Invalid node address specified: <ip>:<port>`.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"MEET", b"10.0.0.9", b"99999"])),
+            "-ERR Invalid node address specified: 10.0.0.9:99999"
+        );
+        // A valid MEET still succeeds.
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"MEET", b"10.0.0.9", b"7000"]),
+            "valid MEET",
+        );
+    }
+
+    /// FINDING 5: SETSLOT bad-action / wrong-argc inner error is the SINGLE Redis message.
+    #[test]
+    fn setslot_bad_action_or_wrong_argc_is_one_message() {
+        const SETSLOT_ERR: &str =
+            "-ERR Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP";
+        let (c, _map) = ctx_empty_self();
+        // Unrecognized action.
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"BOGUS"])),
+            SETSLOT_ERR
+        );
+        // NODE form at the wrong argc (missing the node id) -> the SAME message (was wrong-arity).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"NODE"])),
+            SETSLOT_ERR
+        );
+        // STABLE at the wrong argc (an extra arg) -> the SAME message (STABLE is argc==4).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"STABLE", b"x"])),
+            SETSLOT_ERR
+        );
+        // MIGRATING at the wrong argc (missing node id) -> the SAME message (MIGRATING is argc==5).
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"MIGRATING"])),
+            SETSLOT_ERR
+        );
+    }
+
+    /// SETSLOT's live-resharding states are deferred (slice 4): a clear not-supported reply.
+    #[test]
+    fn setslot_migrating_importing_stable_are_not_supported() {
+        let (c, _map) = ctx_empty_self();
+        for state in [b"MIGRATING".as_slice(), b"IMPORTING"] {
+            assert_eq!(
+                err_line(&run(
+                    &c,
+                    &[b"CLUSTER", b"SETSLOT", b"0", state, TEST_NODE_ID.as_bytes()]
+                )),
+                format!(
+                    "-ERR SETSLOT {} is not supported on a single-node cluster",
+                    String::from_utf8_lossy(state)
+                )
+            );
+        }
+        assert_eq!(
+            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"STABLE"])),
+            "-ERR SETSLOT STABLE is not supported on a single-node cluster"
+        );
+    }
+
+    /// FLUSHSLOTS releases every self-owned slot.
+    #[test]
+    fn flushslots_releases_all_self_slots() {
+        let (c, _map) = ctx_empty_self();
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"ADDSLOTSRANGE", b"0", b"99"]),
+            "claim 0-99",
+        );
+        assert_ok(&run(&c, &[b"CLUSTER", b"FLUSHSLOTS"]), "FLUSHSLOTS");
+        let info = text_body(&run(&c, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info.contains("cluster_slots_assigned:0\r\n"),
+            "FLUSHSLOTS cleared all slots: {info:?}"
+        );
+    }
+
+    /// Cross-shard visibility: two ServerContext clones share ONE `Arc<SlotMap>`. A mutation via
+    /// one ctx is visible through the other (the Arc is the cross-shard mutable state).
+    #[test]
+    fn mutation_via_one_ctx_is_visible_via_a_clone_sharing_the_arc() {
+        let (c1, map) = ctx_empty_self();
+        // c2 shares the SAME Arc<SlotMap> (as every shard's ctx clone does at runtime).
+        let mut c2 = ctx_with(Config {
+            cluster_enabled: true,
+            ..Config::default()
+        });
+        c2.cluster = Some(map.clone());
+
+        // Claim a range via c1; assert it is visible via c2's projection AND owns().
+        assert_ok(
+            &run(&c1, &[b"CLUSTER", b"ADDSLOTSRANGE", b"0", b"10"]),
+            "claim via c1",
+        );
+        assert!(
+            map.owns(0),
+            "shared map owns slot 0 after c1's ADDSLOTSRANGE"
+        );
+        let info2 = text_body(&run(&c2, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info2.contains("cluster_slots_assigned:11\r\n"),
+            "c2 sees c1's mutation through the shared Arc: {info2:?}"
+        );
+    }
+
+    /// SLICE-3 3a-GAP NEGATIVE test: a node mutates only its OWN local view; with no inter-node
+    /// sync (slice 3b), node1 does NOT learn node2's slot assignments. We model two INDEPENDENT
+    /// empty-self nodes (separate Arcs), drive each to claim a half, and assert each node's local
+    /// view is correct AND that node1 does NOT see node2's range.
+    #[test]
+    fn three_a_gap_node_does_not_see_a_peers_local_assignments() {
+        // Two independent nodes (their own maps), NOT sharing an Arc (the 3a reality: no sync).
+        let map1 = std::sync::Arc::new(ironcache_cluster::SlotMap::empty_self(
+            MAP_ID0, "10.0.0.1", 7001,
+        ));
+        let map2 = std::sync::Arc::new(ironcache_cluster::SlotMap::empty_self(
+            MAP_ID1, "10.0.0.2", 7002,
+        ));
+        let mut c1 = ctx_with(Config {
+            cluster_enabled: true,
+            ..Config::default()
+        });
+        c1.cluster = Some(map1.clone());
+        let mut c2 = ctx_with(Config {
+            cluster_enabled: true,
+            ..Config::default()
+        });
+        c2.cluster = Some(map2.clone());
+
+        // Each node claims its OWN half locally.
+        assert_ok(
+            &run(&c1, &[b"CLUSTER", b"ADDSLOTSRANGE", b"0", b"8191"]),
+            "node1 claims low half",
+        );
+        assert_ok(
+            &run(&c2, &[b"CLUSTER", b"ADDSLOTSRANGE", b"8192", b"16383"]),
+            "node2 claims high half",
+        );
+
+        // Each node's LOCAL view is correct.
+        assert!(map1.owns(0) && !map1.owns(8192), "node1 owns only its half");
+        assert!(map2.owns(8192) && !map2.owns(0), "node2 owns only its half");
+
+        // 3a GAP: node1 does NOT see node2's range. Its INFO shows only its own 8192 slots
+        // (NOT 16384) and state:fail, and its SLOTS has exactly one range (its own).
+        let info1 = text_body(&run(&c1, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            info1.contains("cluster_slots_assigned:8192\r\n"),
+            "node1 sees only its own half, NOT node2's: {info1:?}"
+        );
+        assert!(
+            info1.contains("cluster_state:fail\r\n"),
+            "node1's map is incomplete without node2's range: {info1:?}"
+        );
+        let Value::Array(Some(ranges1)) = run(&c1, &[b"CLUSTER", b"SLOTS"]) else {
+            panic!("expected a SLOTS array");
+        };
+        assert_eq!(
+            ranges1.len(),
+            1,
+            "node1 sees ONLY its own range, not node2's (no sync in slice 3a)"
+        );
+        // SLICE 3b will flip this to a positive assertion (both ranges visible on each node).
     }
 }
