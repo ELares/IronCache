@@ -433,6 +433,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironcache-raft"
+version = "0.0.0"
+dependencies = [
+ "ironcache-env",
+ "ironcache-sim",
+]
+
+[[package]]
 name = "ironcache-runtime"
 version = "0.0.0"
 dependencies = [

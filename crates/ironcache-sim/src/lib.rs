@@ -387,6 +387,14 @@ impl<N: SimNode> Network<N> {
         self.nodes.insert(id, node);
     }
 
+    /// Borrow the node stored under `id`, or `None` if no such node is present. A
+    /// read-only accessor so a test can inspect a protocol's observable state (e.g.
+    /// a Raft node's role/term) after a scenario without exposing the node map.
+    #[must_use]
+    pub fn node(&self, id: NodeId) -> Option<&N> {
+        self.nodes.get(&id)
+    }
+
     /// The dispatch trace so far (one [`TraceRecord`] per dispatched event). Compare
     /// two seeded runs' traces for the reproducibility assertion.
     #[must_use]

@@ -32,6 +32,7 @@ in [OPEN.md](OPEN.md); research questions in [QUESTIONS.md](QUESTIONS.md).
 | [0024](0024-geo-command-scope.md) | Geo command family scope (non-goal for v1) | Accepted | #133 |
 | [0025](0025-cluster-partition-count.md) | Cluster keyspace partition count (16384 dual-purpose unit) | Accepted | #72 |
 | [0026](0026-replication-consistency-model.md) | Default replication and consistency model (async primary/replica plus WAIT) | Accepted | #76 |
+| [0027](0027-hand-rolled-env-respecting-raft.md) | Hand-rolled, Env-respecting Raft, verified in deterministic simulation | Accepted | #73 |
 
 As `[DECISION]` issues close, each adds its row here and its `NNNN-*.md` record.
 The numbering is monotonic and never reused, even after supersession.
