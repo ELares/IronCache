@@ -129,6 +129,17 @@ async fn mget_raw(client: &mut TcpStream, k1: &str, k2: &str) -> Vec<u8> {
     read_raw(client).await
 }
 
+/// `WATCH key [key ...]` (RESP2 array); return the raw reply.
+async fn watch_raw(client: &mut TcpStream, keys: &[&str]) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let mut frame = format!("*{}\r\n$5\r\nWATCH\r\n", keys.len() + 1);
+    for k in keys {
+        write!(frame, "${}\r\n{}\r\n", k.len(), k).unwrap();
+    }
+    client.write_all(frame.as_bytes()).await.unwrap();
+    read_raw(client).await
+}
+
 /// `CLUSTER <sub>` (RESP2 array); read enough to capture the whole reply.
 async fn cluster_sub(client: &mut TcpStream, sub: &str) -> Vec<u8> {
     let frame = format!("*2\r\n$7\r\nCLUSTER\r\n${}\r\n{}\r\n", sub.len(), sub);
@@ -244,6 +255,57 @@ fn cross_slot_mget_is_rejected() {
             b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
             "cross-slot MGET must be CROSSSLOT, got {:?}",
             String::from_utf8_lossy(&reply)
+        );
+
+        drop(c);
+        n1.shutdown_and_join().unwrap();
+        n2.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn watch_foreign_slot_key_is_moved() {
+    with_runtime(async {
+        let (n1, n2, port1, port2) = boot_two_nodes();
+        let mut c = connect_retry(port1).await;
+
+        // WATCH is AlwaysHome (a connection-state verb) but carries a key spec in Redis, so a
+        // WATCH of a foreign-slot key must MOVED to the owner (NOT snapshot locally + reply +OK,
+        // which would be a bogus optimistic lock). The reply must be byte-exact to the data path.
+        let key = key_in_range(8192, 16383);
+        let slot = key_slot(key.as_bytes());
+        assert!(slot >= 8192);
+        let reply = watch_raw(&mut c, &[&key]).await;
+        let expect = format!("-MOVED {slot} 127.0.0.1:{port2}\r\n");
+        assert_eq!(
+            reply,
+            expect.as_bytes(),
+            "WATCH of a foreign-slot key must be MOVED to the owner, got {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+
+        // WATCH of an OWNED-slot key proceeds and replies +OK.
+        let owned = key_in_range(0, 8191);
+        assert!(key_slot(owned.as_bytes()) <= 8191);
+        let ok = watch_raw(&mut c, &[&owned]).await;
+        assert_eq!(
+            ok,
+            b"+OK\r\n",
+            "WATCH of an owned-slot key must reply +OK, got {:?}",
+            String::from_utf8_lossy(&ok)
+        );
+
+        // WATCH of TWO keys spanning slots -> CROSSSLOT (checked before ownership), exactly like
+        // a multi-key data command.
+        let k_lo = key_in_range(0, 8191);
+        let k_hi = key_in_range(8192, 16383);
+        assert_ne!(key_slot(k_lo.as_bytes()), key_slot(k_hi.as_bytes()));
+        let cross = watch_raw(&mut c, &[&k_lo, &k_hi]).await;
+        assert_eq!(
+            cross,
+            b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+            "WATCH of two keys spanning slots must be CROSSSLOT, got {:?}",
+            String::from_utf8_lossy(&cross)
         );
 
         drop(c);

@@ -822,29 +822,53 @@ fn cluster_redirect(
         route::CommandClass::AlwaysHome | route::CommandClass::WholeKeyspace => return None,
     };
 
-    // (b) reduce the key(s) to a slot via the CLIENT-VISIBLE key_slot (CRC16 + hash-tag).
+    // (b) reduce the key(s) to a slot via the CLIENT-VISIBLE key_slot (CRC16 + hash-tag) and
+    // apply the ONE shared redirect rule (CROSSSLOT-before-MOVED). The `route::KeySpec` is just
+    // a borrowed view over the request bytes, so collapse it to an iterator of key slices and
+    // hand it to `redirect_for_keys` (the SINGLE predicate WATCH also uses).
     match spec {
         // No routable key (malformed / short): fall through, the handler errors properly.
         route::KeySpec::None => None,
-        // Single key: MOVED if this node does not own its slot.
-        route::KeySpec::One(k) => moved_if_unowned(map, ironcache_protocol::key_slot(k)),
-        route::KeySpec::Many(keys) => {
-            let mut iter = keys.iter();
-            // An empty Many cannot occur (extract collapses 0 -> None), but treat it as
-            // "no key" defensively (`?` returns None) rather than indexing.
-            let first = iter.next()?;
-            let first_slot = ironcache_protocol::key_slot(first);
-            // (c) CROSSSLOT (keys span slots) takes precedence over MOVED, regardless of
-            // ownership: a cross-slot multi-key command is rejected, never scattered.
-            for k in iter {
-                if ironcache_protocol::key_slot(k) != first_slot {
-                    return Some(ironcache_protocol::ErrorReply::crossslot());
-                }
-            }
-            // (d) all keys co-locate on one slot: MOVED if this node does not own it.
-            moved_if_unowned(map, first_slot)
+        route::KeySpec::One(k) => redirect_for_keys(map, std::iter::once(k)),
+        route::KeySpec::Many(keys) => redirect_for_keys(map, keys.iter().copied()),
+    }
+}
+
+/// The SINGLE cluster redirect predicate over a sequence of CLIENT-VISIBLE keys: the one
+/// place the CROSSSLOT-before-MOVED rule lives, shared by [`cluster_redirect`] (data commands)
+/// and the WATCH cluster guard in [`route_and_dispatch`] (WATCH is `AlwaysHome` for
+/// connection-state reasons but carries a key spec in Redis, so it must redirect like a keyed
+/// command). Returns `Some(error)` when the keys must be REJECTED (`-CROSSSLOT`, they span
+/// slots) or REDIRECTED (`-MOVED`, their single slot is foreign), else `None` (proceed local).
+///
+/// The rule, matching Redis `getNodeByQuery` (src/cluster.c):
+/// - reduce each key to its slot via [`ironcache_protocol::key_slot`] (CRC16/XMODEM + hash-tag);
+/// - if any key's slot differs from the first key's slot -> `-CROSSSLOT` (checked BEFORE
+///   ownership: a cross-slot request is CROSSSLOT even when none of its slots is local);
+/// - else the request resolves to ONE slot -> `-MOVED <slot> <owner host:port>` if this node
+///   does not own it, else `None`.
+///
+/// An EMPTY key sequence yields `None` (no routable key: the home handler errors properly); it
+/// cannot occur for a well-formed command but is handled defensively rather than indexing.
+fn redirect_for_keys<'a, I>(
+    map: &ironcache_cluster::SlotMap,
+    keys: I,
+) -> Option<ironcache_protocol::ErrorReply>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut iter = keys.into_iter();
+    let first = iter.next()?;
+    let first_slot = ironcache_protocol::key_slot(first);
+    // CROSSSLOT (keys span slots) takes precedence over MOVED, regardless of ownership: a
+    // cross-slot request is rejected, never scattered.
+    for k in iter {
+        if ironcache_protocol::key_slot(k) != first_slot {
+            return Some(ironcache_protocol::ErrorReply::crossslot());
         }
     }
+    // All keys co-locate on one slot: MOVED if this node does not own it.
+    moved_if_unowned(map, first_slot)
 }
 
 /// `Some(-MOVED <slot> <owner host:port>)` when THIS node does not own `slot`, else `None`.
@@ -1067,6 +1091,31 @@ async fn route_and_dispatch(
         return route_in_multi(
             ctx, conn, home, env, store_rc, wheel_rc, state_rc, &cmd_upper, route, request, out,
         );
+    }
+
+    // (3a) CLUSTER WATCH SLOT GUARD (CLUSTER_CONTRACT.md #70, slice 2). WATCH is classified
+    // `AlwaysHome` (it is a connection-state verb that bypasses MULTI queueing), so the data
+    // `cluster_redirect` below EXEMPTS it; but in Redis WATCH carries a key spec and goes
+    // through `getNodeByQuery`, so a `WATCH <foreign-slot key>` must reply `-MOVED` (and two
+    // keys spanning slots `-CROSSSLOT`), NOT snapshot locally and reply +OK (a bogus optimistic
+    // lock + a parity hole). We therefore run the SAME shared `redirect_for_keys` predicate the
+    // keyed-data path uses, over WATCH's keys (args[1..], read DIRECTLY because `command_keys`
+    // does not extract an AlwaysHome command's keys), and only when a cluster map is configured
+    // (`ctx.cluster` Some). On a redirect we short-circuit exactly like the data redirect below:
+    // bump the command counter, encode the error, do NOT run WATCH, do NOT close. A WATCH whose
+    // keys are all home-slot (or a malformed/arity-wrong WATCH that yields no key) returns None
+    // and falls through to the cross-shard WATCH guard, then the home dispatch, unchanged. This
+    // runs BEFORE the internal cross-shard WATCH guard so cluster MOVED/CROSSSLOT (the
+    // client-visible, retryable redirect) takes precedence over the internal-shard error.
+    if cmd_upper == b"WATCH" && request.args.len() >= 2 {
+        if let Some(map) = ctx.cluster.as_deref() {
+            if let Some(reply) = redirect_for_keys(map, request.args[1..].iter().map(AsRef::as_ref))
+            {
+                state_rc.borrow_mut().counters.on_command();
+                encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
+                return false;
+            }
+        }
     }
 
     // (3) CROSS-SHARD WATCH GUARD (only when NOT in_multi; WATCH inside MULTI already errors
@@ -2511,5 +2560,58 @@ mod tests {
         let req = rreq(&[b"GET"]);
         let route = route::classify(b"GET");
         assert_eq!(cluster_redirect(&map, route, b"GET", &req), None);
+    }
+
+    // ----- redirect_for_keys (the SHARED predicate WATCH uses directly over its key args) -----
+    //
+    // `cluster_redirect` reduces a `KeySpec` to this same iterator-based predicate, and the
+    // WATCH cluster guard calls it directly with `args[1..]`. These pin the predicate over a
+    // raw key sequence (the exact WATCH call shape) so WATCH and the data path provably share
+    // ONE rule.
+
+    #[test]
+    fn redirect_for_keys_owned_single_proceeds() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191); // owned by self
+        assert_eq!(
+            redirect_for_keys(&map, std::iter::once(key.as_bytes())),
+            None,
+            "a single owned key proceeds (this is the WATCH-of-owned-key +OK case)"
+        );
+    }
+
+    #[test]
+    fn redirect_for_keys_foreign_single_is_moved() {
+        let map = redirect_map();
+        let key = key_in_slot_range(8192, 16383); // owned by node B
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        let reply = redirect_for_keys(&map, std::iter::once(key.as_bytes()))
+            .expect("foreign key -> MOVED (the WATCH-of-foreign-key case)");
+        assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
+    }
+
+    #[test]
+    fn redirect_for_keys_cross_slot_is_crossslot() {
+        let map = redirect_map();
+        let lo = key_in_slot_range(0, 8191);
+        let hi = key_in_slot_range(8192, 16383);
+        let keys = [lo.as_bytes(), hi.as_bytes()];
+        let reply = redirect_for_keys(&map, keys.iter().copied())
+            .expect("two keys spanning slots -> CROSSSLOT (the WATCH-of-two-spanning-keys case)");
+        assert_eq!(
+            reply.line(),
+            "-CROSSSLOT Keys in request don't hash to the same slot"
+        );
+    }
+
+    #[test]
+    fn redirect_for_keys_empty_is_none() {
+        let map = redirect_map();
+        let empty: std::iter::Empty<&[u8]> = std::iter::empty();
+        assert_eq!(
+            redirect_for_keys(&map, empty),
+            None,
+            "no key -> None (defensive; a well-formed WATCH always has >=1 key)"
+        );
     }
 }

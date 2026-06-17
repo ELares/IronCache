@@ -315,12 +315,16 @@ fn cluster_shards_singlenode(ctx: &ServerContext) -> Value {
 }
 
 /// A `CLUSTER SHARDS` node map: a master at `0` replication offset reporting `health: online`,
-/// exactly the fields Redis populates in `clusterReplyShards` (no replicas in slice 2). The
-/// `ip` and `endpoint` are both the advertised host.
+/// exactly the fields (AND the field ORDER) Redis populates in `addNodeDetailsToShardReply`
+/// (no replicas in slice 2). The field order is byte-faithful to Redis: id, port, tls-port,
+/// ip, endpoint, role, replication-offset, health. `tls-port` is `0` (TLS is off in slice 2);
+/// the `ip` and `endpoint` are both the advertised host.
 fn shard_node_map(host: &str, port: u16, id: &str) -> Value {
     Value::Map(vec![
         (Value::bulk_str("id"), Value::bulk(id.as_bytes().to_vec())),
         (Value::bulk_str("port"), Value::Integer(i64::from(port))),
+        // tls-port: 0 (TLS off in slice 2). Real Redis emits this right after `port`.
+        (Value::bulk_str("tls-port"), Value::Integer(0)),
         (Value::bulk_str("ip"), Value::bulk(host.as_bytes().to_vec())),
         (
             Value::bulk_str("endpoint"),
@@ -839,8 +843,31 @@ mod tests {
         };
         assert_eq!(field("id"), Some(Value::bulk_str(TEST_NODE_ID)));
         assert_eq!(field("port"), Some(Value::Integer(6390)));
+        // tls-port: 0 (TLS off), emitted right after port (Redis field order/fidelity).
+        assert_eq!(field("tls-port"), Some(Value::Integer(0)));
         assert_eq!(field("role"), Some(Value::bulk_str("master")));
         assert_eq!(field("health"), Some(Value::bulk_str("online")));
+        // Field set AND order match Redis `addNodeDetailsToShardReply`.
+        let field_names: Vec<Vec<u8>> = node
+            .iter()
+            .map(|(k, _)| match k {
+                Value::BulkString(Some(b)) => b.to_vec(),
+                other => panic!("non-bulk field key: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            field_names,
+            vec![
+                b"id".to_vec(),
+                b"port".to_vec(),
+                b"tls-port".to_vec(),
+                b"ip".to_vec(),
+                b"endpoint".to_vec(),
+                b"role".to_vec(),
+                b"replication-offset".to_vec(),
+                b"health".to_vec(),
+            ]
+        );
     }
 
     #[test]
@@ -1035,6 +1062,7 @@ mod tests {
         };
         assert_eq!(field("id"), Some(Value::bulk_str(MAP_ID1)));
         assert_eq!(field("port"), Some(Value::Integer(7001)));
+        assert_eq!(field("tls-port"), Some(Value::Integer(0)));
         assert_eq!(field("ip"), Some(Value::bulk_str("10.0.0.11")));
         assert_eq!(field("role"), Some(Value::bulk_str("master")));
         assert_eq!(field("health"), Some(Value::bulk_str("online")));
