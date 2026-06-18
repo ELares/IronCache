@@ -395,6 +395,17 @@ impl<N: SimNode> Network<N> {
         self.nodes.get(&id)
     }
 
+    /// Mutably borrow the node stored under `id`, or `None` if absent. Used by a test
+    /// driver that must reach INTO a node between steps to drive an out-of-band protocol
+    /// action that is not a network message -- e.g. a Raft leader PROPOSING a membership
+    /// change (HA-3d), which the engine exposes as a direct method, not a wire RPC. The
+    /// effects of such a call are NOT auto-drained onto the network (this accessor does
+    /// not run a step); the test must drain them itself if the action emits any. For pure
+    /// network-driven protocols this is unused; the sim's own tests do not need it.
+    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut N> {
+        self.nodes.get_mut(&id)
+    }
+
     /// The dispatch trace so far (one [`TraceRecord`] per dispatched event). Compare
     /// two seeded runs' traces for the reproducibility assertion.
     #[must_use]

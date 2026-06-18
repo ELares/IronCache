@@ -34,7 +34,9 @@
 //! (see [`super::RAFTMSG`]); this module owns only the third argument's bytes, not
 //! the RESP framing around it.
 
-use ironcache_raft::{ConfigCmd, EntryPayload, LogEntry, NodeId, RaftMsg};
+use std::collections::BTreeSet;
+
+use ironcache_raft::{ConfigCmd, EntryPayload, LogEntry, MembershipChange, NodeId, RaftMsg};
 
 // Message discriminants (the outer `RaftMsg` variant tag).
 const MSG_REQUEST_VOTE: u8 = 1;
@@ -53,6 +55,14 @@ const MSG_INSTALL_SNAPSHOT_RESP: u8 = 9;
 const PAYLOAD_NOOP: u8 = 0;
 const PAYLOAD_BYTES: u8 = 1;
 const PAYLOAD_CONFIG: u8 = 2;
+// HA-3d raft cluster-membership change: the next free payload discriminant.
+const PAYLOAD_CONFIG_CHANGE: u8 = 3;
+
+// Membership-change discriminants (the `MembershipChange` variant tag, HA-3d).
+const MEMBER_ADD_VOTER: u8 = 0;
+const MEMBER_REMOVE_VOTER: u8 = 1;
+const MEMBER_ADD_LEARNER: u8 = 2;
+const MEMBER_PROMOTE_LEARNER: u8 = 3;
 
 // Config-command discriminants (the `ConfigCmd` variant tag).
 const CFG_ADD_NODE: u8 = 0;
@@ -159,15 +169,22 @@ pub fn encode_raft_msg(msg: &RaftMsg) -> Vec<u8> {
             last_included_index,
             last_included_term,
             data,
+            voters,
+            learners,
         } => {
             // HA-3c: term, leader, the snapshot's (index, term), then the snapshot bytes
             // as a length-prefixed blob (single chunk; chunking is a future extension).
+            // HA-3d: the config baseline (voter + learner node sets) the snapshot reflects,
+            // each a length-prefixed list of NodeIds, so an installing follower can rebuild
+            // its configuration (its log below the snapshot is gone).
             out.push(MSG_INSTALL_SNAPSHOT);
             put_u64(&mut out, *term);
             put_node(&mut out, *leader_id);
             put_u64(&mut out, *last_included_index);
             put_u64(&mut out, *last_included_term);
             put_blob(&mut out, data);
+            put_node_set(&mut out, voters);
+            put_node_set(&mut out, learners);
         }
         RaftMsg::InstallSnapshotResp {
             term,
@@ -205,6 +222,42 @@ fn put_payload(out: &mut Vec<u8>, payload: &EntryPayload) {
             out.push(PAYLOAD_CONFIG);
             put_config(out, cmd);
         }
+        EntryPayload::ConfigChange(change) => {
+            out.push(PAYLOAD_CONFIG_CHANGE);
+            put_membership(out, *change);
+        }
+    }
+}
+
+/// Append a [`MembershipChange`] led by its discriminant byte, then the one NodeId it
+/// names (HA-3d). Every variant carries exactly one node.
+fn put_membership(out: &mut Vec<u8>, change: MembershipChange) {
+    match change {
+        MembershipChange::AddVoter(node) => {
+            out.push(MEMBER_ADD_VOTER);
+            put_node(out, node);
+        }
+        MembershipChange::RemoveVoter(node) => {
+            out.push(MEMBER_REMOVE_VOTER);
+            put_node(out, node);
+        }
+        MembershipChange::AddLearner(node) => {
+            out.push(MEMBER_ADD_LEARNER);
+            put_node(out, node);
+        }
+        MembershipChange::PromoteLearner(node) => {
+            out.push(MEMBER_PROMOTE_LEARNER);
+            put_node(out, node);
+        }
+    }
+}
+
+/// A length-prefixed set of [`NodeId`]s (a `u64` count then each id's inner `u64`), in
+/// the set's deterministic ascending order (HA-3d config baseline on the wire).
+fn put_node_set(out: &mut Vec<u8>, set: &BTreeSet<NodeId>) {
+    put_u64(out, set.len() as u64);
+    for &id in set {
+        put_node(out, id);
     }
 }
 
@@ -441,11 +494,16 @@ pub fn decode_raft_msg(buf: &[u8]) -> Option<RaftMsg> {
             }
         }
         MSG_INSTALL_SNAPSHOT => RaftMsg::InstallSnapshot {
+            // Read in WIRE order: term, leader, (index, term), the data blob, then the
+            // HA-3d config baseline (voters then learners). Field order in this literal
+            // matches the encode order so the cursor reads sequentially correct.
             term: cur.u64()?,
             leader_id: cur.node()?,
             last_included_index: cur.u64()?,
             last_included_term: cur.u64()?,
             data: cur.blob()?,
+            voters: get_node_set(&mut cur)?,
+            learners: get_node_set(&mut cur)?,
         },
         MSG_INSTALL_SNAPSHOT_RESP => RaftMsg::InstallSnapshotResp {
             term: cur.u64()?,
@@ -475,8 +533,33 @@ fn get_payload(cur: &mut Cursor<'_>) -> Option<EntryPayload> {
         PAYLOAD_NOOP => Some(EntryPayload::Noop),
         PAYLOAD_BYTES => Some(EntryPayload::Bytes(cur.blob()?)),
         PAYLOAD_CONFIG => Some(EntryPayload::Config(get_config(cur)?)),
+        PAYLOAD_CONFIG_CHANGE => Some(EntryPayload::ConfigChange(get_membership(cur)?)),
         _ => None,
     }
+}
+
+/// Read a [`MembershipChange`] by its discriminant byte, then the one NodeId (HA-3d).
+fn get_membership(cur: &mut Cursor<'_>) -> Option<MembershipChange> {
+    match cur.u8()? {
+        MEMBER_ADD_VOTER => Some(MembershipChange::AddVoter(cur.node()?)),
+        MEMBER_REMOVE_VOTER => Some(MembershipChange::RemoveVoter(cur.node()?)),
+        MEMBER_ADD_LEARNER => Some(MembershipChange::AddLearner(cur.node()?)),
+        MEMBER_PROMOTE_LEARNER => Some(MembershipChange::PromoteLearner(cur.node()?)),
+        _ => None,
+    }
+}
+
+/// Read a length-prefixed set of [`NodeId`]s (HA-3d). The encoder wrote them in
+/// ascending order; collecting into a `BTreeSet` restores the same set regardless.
+fn get_node_set(cur: &mut Cursor<'_>) -> Option<BTreeSet<NodeId>> {
+    let count = usize::try_from(cur.u64()?).ok()?;
+    let mut set = BTreeSet::new();
+    for _ in 0..count {
+        // A bounds-checked read returns None on a short buffer, so a bogus huge count
+        // bubbles up as a dropped frame rather than allocating; the set itself is small.
+        set.insert(cur.node()?);
+    }
+    Some(set)
 }
 
 /// Read a [`ConfigCmd`] by its discriminant byte.

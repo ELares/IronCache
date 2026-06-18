@@ -59,11 +59,14 @@
 //! control-plane task (`ironcache-raft-net`'s run loop), NOT a data-path request, so the
 //! latency is acceptable and is the price of correctness.
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use ironcache_raft::{ConfigCmd, EntryPayload, LogEntry, NodeId, RaftStorage, SnapshotMeta};
+use ironcache_raft::{
+    ConfigCmd, EntryPayload, LogEntry, MembershipChange, NodeId, RaftStorage, SnapshotMeta,
+};
 
 // Record-kind discriminants (the first body byte). Distinct value space from the wire
 // codec's message discriminants; these tag a PERSISTED MUTATION, not a wire message.
@@ -77,6 +80,14 @@ const REC_TRUNCATE: u8 = 4;
 const PAYLOAD_NOOP: u8 = 0;
 const PAYLOAD_BYTES: u8 = 1;
 const PAYLOAD_CONFIG: u8 = 2;
+// HA-3d raft cluster-membership change (mirror the wire codec's next free value).
+const PAYLOAD_CONFIG_CHANGE: u8 = 3;
+
+// MembershipChange discriminants, mirroring the wire codec (HA-3d).
+const MEMBER_ADD_VOTER: u8 = 0;
+const MEMBER_REMOVE_VOTER: u8 = 1;
+const MEMBER_ADD_LEARNER: u8 = 2;
+const MEMBER_PROMOTE_LEARNER: u8 = 3;
 
 // ConfigCmd discriminants, again mirroring the wire codec.
 const CFG_ADD_NODE: u8 = 0;
@@ -227,7 +238,24 @@ fn put_payload(out: &mut Vec<u8>, payload: &EntryPayload) {
             out.push(PAYLOAD_CONFIG);
             put_config(out, cmd);
         }
+        EntryPayload::ConfigChange(change) => {
+            out.push(PAYLOAD_CONFIG_CHANGE);
+            put_membership(out, *change);
+        }
     }
+}
+
+/// Append a [`MembershipChange`] led by its discriminant byte, then its one NodeId
+/// (HA-3d; mirrors the wire codec).
+fn put_membership(out: &mut Vec<u8>, change: MembershipChange) {
+    let (tag, node) = match change {
+        MembershipChange::AddVoter(n) => (MEMBER_ADD_VOTER, n),
+        MembershipChange::RemoveVoter(n) => (MEMBER_REMOVE_VOTER, n),
+        MembershipChange::AddLearner(n) => (MEMBER_ADD_LEARNER, n),
+        MembershipChange::PromoteLearner(n) => (MEMBER_PROMOTE_LEARNER, n),
+    };
+    out.push(tag);
+    put_u64(out, node.0);
 }
 
 /// Append a [`ConfigCmd`] led by its discriminant byte (mirrors the wire codec).
@@ -401,6 +429,20 @@ fn get_payload(cur: &mut Cursor<'_>) -> Option<EntryPayload> {
         PAYLOAD_NOOP => Some(EntryPayload::Noop),
         PAYLOAD_BYTES => Some(EntryPayload::Bytes(cur.blob()?)),
         PAYLOAD_CONFIG => Some(EntryPayload::Config(get_config(cur)?)),
+        PAYLOAD_CONFIG_CHANGE => Some(EntryPayload::ConfigChange(get_membership(cur)?)),
+        _ => None,
+    }
+}
+
+/// Read a [`MembershipChange`] by its discriminant byte, then its one NodeId (HA-3d).
+fn get_membership(cur: &mut Cursor<'_>) -> Option<MembershipChange> {
+    let tag = cur.u8()?;
+    let node = NodeId(cur.u64()?);
+    match tag {
+        MEMBER_ADD_VOTER => Some(MembershipChange::AddVoter(node)),
+        MEMBER_REMOVE_VOTER => Some(MembershipChange::RemoveVoter(node)),
+        MEMBER_ADD_LEARNER => Some(MembershipChange::AddLearner(node)),
+        MEMBER_PROMOTE_LEARNER => Some(MembershipChange::PromoteLearner(node)),
         _ => None,
     }
 }
@@ -484,6 +526,12 @@ struct Mirror {
     snap_meta: Option<SnapshotMeta>,
     /// The most recent snapshot's serialized state-machine bytes, if any.
     snap_data: Vec<u8>,
+    /// HA-3d: the persisted CONFIGURATION BASELINE (voter set, learner set) saved beside
+    /// the snapshot, or `None` if none was saved (the never-compacted / pre-3d path). The
+    /// engine seeds its configuration from this on restart and replays the surviving log's
+    /// `ConfigChange` deltas on top, so a membership history that was compacted away is not
+    /// lost across a restart. Recovered in [`FileStorage::open`] from the `.cfg` sidecar.
+    config_baseline: Option<(BTreeSet<NodeId>, BTreeSet<NodeId>)>,
 }
 
 impl Mirror {
@@ -597,6 +645,16 @@ pub struct FileStorage {
 /// shape.
 const SNAPSHOT_SUFFIX: &str = ".snap";
 
+/// The filesystem suffix for a node's CONFIG-BASELINE sidecar file (HA-3d). The baseline
+/// (the committed voter + learner sets as of the last snapshot) lives BESIDE the record
+/// log (`<log>.cfg`), written + fsync'd atomically (tmp + rename) exactly like the
+/// `.snap` snapshot sidecar. It is small and rewritten whole on each save, so there is no
+/// torn-tail concern beyond the CRC the frame already carries; a torn / absent file
+/// recovers as "no baseline" (the engine falls back to the constructor voter set, the
+/// byte-unchanged static-membership path). It is co-located with the log just like the
+/// snapshot sidecar, so a configured `data_dir` keeps it durable across a `/tmp` clear.
+const CONFIG_BASELINE_SUFFIX: &str = ".cfg";
+
 impl FileStorage {
     /// Open (creating if absent) the record log at `path` and REPLAY it to recover the
     /// persisted Raft state.
@@ -634,6 +692,12 @@ impl FileStorage {
             seed.snap_meta = Some(meta);
             seed.snap_data = data;
         }
+
+        // HA-3d: RECOVER THE CONFIG BASELINE from its `.cfg` sidecar (independent of the
+        // log replay; the engine reads it AFTER construction and replays the surviving
+        // log's ConfigChange deltas on top). A torn / absent file yields no baseline, so a
+        // node falls back to the constructor voter set -- the byte-unchanged pre-3d path.
+        seed.config_baseline = load_config_baseline_file(&config_baseline_path(&path))?;
 
         let (mirror, good_len) = replay_into(seed, &bytes);
 
@@ -685,6 +749,41 @@ impl FileStorage {
         // Mirror the snapshot in memory (reads serve from the mirror).
         self.mirror.snap_meta = Some(meta);
         self.mirror.snap_data = data.to_vec();
+        Ok(())
+    }
+
+    /// Persist the config baseline (HA-3d): write `(voters, learners)` to the `.cfg`
+    /// sidecar ATOMICALLY (write a `.cfg.tmp`, fsync it, rename over the real path) and
+    /// update the mirror's in-memory copy. The atomic rename means a crash mid-write leaves
+    /// either the old baseline or the new one, never a torn one, so a reopen always loads a
+    /// consistent baseline. The engine saves this beside the snapshot at the same
+    /// compaction point, so on restart `recovered config = baseline + surviving-tail
+    /// ConfigChange deltas` reconstructs the exact pre-restart configuration even though the
+    /// membership history below the snapshot was compacted out of the log.
+    fn persist_config_baseline(
+        &mut self,
+        voters: &BTreeSet<NodeId>,
+        learners: &BTreeSet<NodeId>,
+    ) -> io::Result<()> {
+        let cfg_path = config_baseline_path(&self.path);
+        let tmp_path = {
+            let mut p = cfg_path.clone().into_os_string();
+            p.push(".tmp");
+            PathBuf::from(p)
+        };
+        let frame = encode_config_baseline_frame(voters, learners);
+        {
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp.write_all(&frame)?;
+            tmp.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &cfg_path)?;
+        // Mirror the baseline in memory (reads serve from the mirror).
+        self.mirror.config_baseline = Some((voters.clone(), learners.clone()));
         Ok(())
     }
 
@@ -918,6 +1017,88 @@ fn load_snapshot_file(path: &Path) -> io::Result<Option<(SnapshotMeta, Vec<u8>)>
     )))
 }
 
+/// The config-baseline sidecar path for a record log (`<log>.cfg`), HA-3d.
+fn config_baseline_path(log_path: &Path) -> PathBuf {
+    let mut p = log_path.to_path_buf().into_os_string();
+    p.push(CONFIG_BASELINE_SUFFIX);
+    PathBuf::from(p)
+}
+
+/// Frame a config baseline for its sidecar file (HA-3d): the SAME `[u32 body_len][u32
+/// crc32(body)][body]` framing as a log record / snapshot sidecar, where `body` is `[u64
+/// voter_count][voter ids...][u64 learner_count][learner ids...]`, each id a `u64`. The
+/// CRC lets a reopen reject a torn baseline (a crash mid-write, though the atomic rename
+/// normally prevents that) and fall back to no baseline rather than fabricating one.
+fn encode_config_baseline_frame(voters: &BTreeSet<NodeId>, learners: &BTreeSet<NodeId>) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_u64(&mut body, voters.len() as u64);
+    for v in voters {
+        put_u64(&mut body, v.0);
+    }
+    put_u64(&mut body, learners.len() as u64);
+    for l in learners {
+        put_u64(&mut body, l.0);
+    }
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
+    let body_len = u32::try_from(body.len()).expect("a config-baseline body fits in u32");
+    frame.extend_from_slice(&body_len.to_le_bytes());
+    frame.extend_from_slice(&crc32(&body).to_le_bytes());
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Load the config-baseline sidecar at `path` (HA-3d), returning `(voters, learners)` or
+/// `None` if the file is absent, empty, or torn (a CRC mismatch / short body /
+/// structurally invalid body). A torn baseline recovers as "no baseline" rather than an
+/// error, so a node falls back to the constructor voter set (the pre-3d behaviour) instead
+/// of refusing to boot.
+fn load_config_baseline_file(
+    path: &Path,
+) -> io::Result<Option<(BTreeSet<NodeId>, BTreeSet<NodeId>)>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if bytes.len() < FRAME_HEADER_LEN {
+        return Ok(None);
+    }
+    let body_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let stored_crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let Some(body_end) = FRAME_HEADER_LEN.checked_add(body_len) else {
+        return Ok(None);
+    };
+    if body_end > bytes.len() {
+        return Ok(None);
+    }
+    let body = &bytes[FRAME_HEADER_LEN..body_end];
+    if crc32(body) != stored_crc {
+        return Ok(None);
+    }
+    let mut cur = Cursor::new(body);
+    let Some(set_voters) = read_node_set(&mut cur) else {
+        return Ok(None);
+    };
+    let Some(set_learners) = read_node_set(&mut cur) else {
+        return Ok(None);
+    };
+    if !cur.at_end() {
+        return Ok(None);
+    }
+    Ok(Some((set_voters, set_learners)))
+}
+
+/// Read a length-prefixed set of `NodeId`s (a `u64` count then that many `u64` ids) from
+/// `cur`, or `None` on a short / structurally invalid body (HA-3d baseline decode helper).
+fn read_node_set(cur: &mut Cursor) -> Option<BTreeSet<NodeId>> {
+    let count = cur.u64()?;
+    let mut set = BTreeSet::new();
+    for _ in 0..count {
+        set.insert(NodeId(cur.u64()?));
+    }
+    Some(set)
+}
+
 impl RaftStorage for FileStorage {
     fn current_term(&self) -> u64 {
         self.mirror.current_term
@@ -1026,6 +1207,15 @@ impl RaftStorage for FileStorage {
     fn compact_to(&mut self, index: u64) {
         self.compact_log_to(index)
             .expect("FileStorage: rewrite compacted log to stable storage");
+    }
+
+    fn save_config_baseline(&mut self, voters: &BTreeSet<NodeId>, learners: &BTreeSet<NodeId>) {
+        self.persist_config_baseline(voters, learners)
+            .expect("FileStorage: fsync config baseline to stable storage");
+    }
+
+    fn load_config_baseline(&self) -> Option<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        self.mirror.config_baseline.clone()
     }
 
     fn log_start_index(&self) -> u64 {
@@ -1473,6 +1663,157 @@ mod tests {
 
         cleanup(&path);
         let _ = std::fs::remove_file(&snap);
+    }
+
+    #[test]
+    fn config_baseline_persists_across_reopen() {
+        // FIX2 (HA-3d): FileStorage durably persists the config baseline beside the
+        // snapshot and recovers it on reopen. Save a baseline + a snapshot, compact, drop
+        // the store, REOPEN, and assert the loaded baseline is EXACTLY what was saved (and
+        // the snapshot/tail recover alongside it). Before this fix FileStorage used the
+        // trait-default no-op save/load, so the baseline was SILENTLY LOST on restart.
+        let path = fresh_path("config_baseline_persists_across_reopen");
+        let snap = snapshot_path(&path);
+        let cfg = config_baseline_path(&path);
+        let _ = std::fs::remove_file(&snap);
+        let _ = std::fs::remove_file(&cfg);
+
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        let learners: BTreeSet<NodeId> = [NodeId(3)].into_iter().collect();
+        let meta = SnapshotMeta {
+            last_included_index: 3,
+            last_included_term: 2,
+        };
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            // No baseline saved yet -> the trait method returns None (the fallback path).
+            assert_eq!(
+                s.load_config_baseline(),
+                None,
+                "a fresh store has no persisted baseline"
+            );
+            for i in 1..=3u64 {
+                s.append(LogEntry {
+                    term: 2,
+                    index: i,
+                    payload: EntryPayload::Noop,
+                });
+            }
+            // Save the baseline + snapshot, then compact (the engine's maybe_compact order).
+            s.save_config_baseline(&voters, &learners);
+            s.save_snapshot(meta, b"sm-bytes");
+            s.compact_to(3);
+            assert_eq!(
+                s.load_config_baseline(),
+                Some((voters.clone(), learners.clone())),
+                "the live store serves the just-saved baseline from the mirror"
+            );
+        }
+
+        // REOPEN: the durable baseline recovers EXACTLY, alongside the snapshot.
+        let s = FileStorage::open(&path).expect("reopen recovers");
+        assert_eq!(
+            s.load_config_baseline(),
+            Some((voters, learners)),
+            "the persisted config baseline recovers byte-for-byte across a reopen"
+        );
+        assert!(s.load_snapshot().is_some(), "the snapshot recovers too");
+
+        cleanup(&path);
+        let _ = std::fs::remove_file(&snap);
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn membership_config_reconstructs_via_snapshot_after_filestorage_restart() {
+        // FIX2 end-to-end (HA-3d): a node drives the REAL engine on a FileStorage with
+        // compaction ON; an AddLearner(2) commits then is compacted away; after a restart
+        // the recovered config must STILL be `baseline + surviving-tail deltas`, i.e. the
+        // exact pre-restart voter/learner set -- proving the durable baseline closes the
+        // "membership history silently lost on restart" hole. Without FIX2 the restart
+        // would seed the config from the constructor voter set (no learners) and the
+        // compacted-away learner would VANISH.
+        use ironcache_env::Monotonic;
+        use ironcache_raft::{Effects, MembershipChange, RaftConfig, RaftNode, RaftRng};
+
+        struct ZeroRng;
+        impl RaftRng for ZeroRng {
+            fn gen_below(&mut self, _bound: u64) -> u64 {
+                0
+            }
+        }
+
+        let path =
+            fresh_path("membership_config_reconstructs_via_snapshot_after_filestorage_restart");
+        let snap = snapshot_path(&path);
+        let cfg = config_baseline_path(&path);
+        let _ = std::fs::remove_file(&snap);
+        let _ = std::fs::remove_file(&cfg);
+
+        let config = RaftConfig {
+            snapshot_threshold: 2,
+            ..RaftConfig::default()
+        };
+        let voters: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        {
+            let storage = FileStorage::open(&path).expect("open fresh");
+            let mut node = RaftNode::new(NodeId(1), voters.clone(), storage, config);
+            let mut rng = ZeroRng;
+            let now = Monotonic::ZERO;
+            node.start(now, &mut rng, &mut Effects::new());
+            node.on_timer(
+                now,
+                &mut rng,
+                ironcache_raft::ELECTION_TIMEOUT,
+                &mut Effects::new(),
+            );
+            // AddLearner(2) commits at once (single-voter majority), adopting {learner 2}.
+            node.propose_membership_change(
+                MembershipChange::AddLearner(NodeId(2)),
+                now,
+                &mut rng,
+                &mut Effects::new(),
+            )
+            .expect("AddLearner accepted");
+            // Pile on plain entries to cross the snapshot threshold and compact past the
+            // AddLearner index.
+            for tag in 0..6u8 {
+                node.propose(
+                    EntryPayload::Bytes(vec![tag]),
+                    now,
+                    &mut rng,
+                    &mut Effects::new(),
+                );
+            }
+            assert!(
+                node.storage().log_start_index() > 1,
+                "the log compacted past the AddLearner entry"
+            );
+            assert!(
+                node.storage().load_config_baseline().is_some(),
+                "the config baseline was persisted to the FileStorage sidecar"
+            );
+            assert_eq!(node.learners(), &[NodeId(2)].into_iter().collect());
+        }
+
+        // RESTART on the SAME FileStorage file: the recovered config restores the learner
+        // from the durable baseline (its ConfigChange entry is compacted out of the log).
+        let storage = FileStorage::open(&path).expect("reopen recovers");
+        let restored = RaftNode::new(NodeId(1), voters, storage, config);
+        assert_eq!(
+            restored.learners(),
+            &[NodeId(2)].into_iter().collect(),
+            "the learner is reconstructed from the durable baseline after restart"
+        );
+        assert_eq!(
+            restored.voters(),
+            &[NodeId(1)].into_iter().collect(),
+            "the voter set is reconstructed correctly after restart"
+        );
+
+        cleanup(&path);
+        let _ = std::fs::remove_file(&snap);
+        let _ = std::fs::remove_file(&cfg);
     }
 
     #[test]

@@ -919,7 +919,9 @@ impl StateMachine for RecordingSm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironcache_raft::{ConfigCmd, RaftMsg};
+    use std::collections::BTreeSet;
+
+    use ironcache_raft::{ConfigCmd, MembershipChange, RaftMsg};
 
     /// A single round-trip assertion: encode then decode must reproduce the input
     /// byte-for-byte (PartialEq over the whole `RaftMsg`).
@@ -1051,6 +1053,9 @@ mod tests {
             last_included_index: 0,
             last_included_term: 0,
             data: vec![],
+            // HA-3d: empty config baseline (a static / pre-membership cluster).
+            voters: BTreeSet::new(),
+            learners: BTreeSet::new(),
         });
         assert_round_trips(&RaftMsg::InstallSnapshot {
             term: 12,
@@ -1058,6 +1063,9 @@ mod tests {
             last_included_index: 9_001,
             last_included_term: 11,
             data: vec![0, 1, 2, 255, 254, 13, 10, 0, 42],
+            // HA-3d: a populated config baseline (voters + a learner) round-trips too.
+            voters: [NodeId(1), NodeId(4), NodeId(7)].into_iter().collect(),
+            learners: [NodeId(9)].into_iter().collect(),
         });
         assert_round_trips(&RaftMsg::InstallSnapshot {
             term: u64::MAX,
@@ -1065,6 +1073,8 @@ mod tests {
             last_included_index: u64::MAX,
             last_included_term: u64::MAX,
             data: vec![7; 128],
+            voters: [NodeId(0), NodeId(u64::MAX)].into_iter().collect(),
+            learners: BTreeSet::new(),
         });
 
         // HA-3c InstallSnapshotResp: the term PLUS the echoed last_included_index (Figure
@@ -1207,6 +1217,28 @@ mod tests {
                 term: 10,
                 index: 19,
                 payload: EntryPayload::Config(ConfigCmd::SetSlotStable { slot: 8192 }),
+            },
+            // HA-3d: a LogEntry of every MembershipChange shape inside a ConfigChange
+            // payload, exercising the new wire discriminant + the one-NodeId tail.
+            LogEntry {
+                term: 11,
+                index: 20,
+                payload: EntryPayload::ConfigChange(MembershipChange::AddVoter(NodeId(5))),
+            },
+            LogEntry {
+                term: 11,
+                index: 21,
+                payload: EntryPayload::ConfigChange(MembershipChange::RemoveVoter(NodeId(3))),
+            },
+            LogEntry {
+                term: 12,
+                index: 22,
+                payload: EntryPayload::ConfigChange(MembershipChange::AddLearner(NodeId(8))),
+            },
+            LogEntry {
+                term: 12,
+                index: 23,
+                payload: EntryPayload::ConfigChange(MembershipChange::PromoteLearner(NodeId(8))),
             },
         ]
     }
