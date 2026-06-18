@@ -274,6 +274,24 @@ pub enum ConfigCmd {
         /// The slots to assign to `node`, applied in order.
         slots: Vec<u16>,
     },
+    /// UN-assign a batch of slots: clear each slot's owner so it is owned by NOBODY (drives
+    /// `SlotMap::clear_slot_owner` per slot). This is the committed-log analog of Redis
+    /// `CLUSTER DELSLOTS / DELSLOTSRANGE / FLUSHSLOTS`: once committed, EVERY node's config state
+    /// machine sets each slot UNASSIGNED, so the slot disappears from `cluster_slots_assigned` and a
+    /// key on it is served the unassigned (CLUSTERDOWN) behavior instead of being owned. The inverse
+    /// of [`ConfigCmd::AssignSlots`]: a single committed entry so a whole release is one atomic log
+    /// record, applied in `slots` order, advancing the config epoch ONCE on apply.
+    ///
+    /// On apply (in committed-log order, on EVERY node) each slot's `owner` is set UNASSIGNED and its
+    /// `mine[]` bitmap is cleared in LOCKSTEP (the same invariant every ownership mutator keeps), so
+    /// a node that previously owned a slot loses it (`owns()` goes false) and a node that did not is
+    /// unaffected. NODE-RELATIVE is automatic: every node clears the SAME slots from the shared
+    /// committed map, so no node id is carried. IDEMPOTENT: clearing an already-unassigned slot is a
+    /// no-op, so re-applying a committed entry yields the identical map.
+    UnassignSlots {
+        /// The slots to UN-assign (clear the owner of), applied in order.
+        slots: Vec<u16>,
+    },
     /// Seed THIS node's config epoch (drives `SlotMap::set_config_epoch`, valid only
     /// on a fresh, alone node). Used to pin a starting epoch; ordinary ownership
     /// changes advance the epoch via `SlotMap::bump_epoch` instead.
@@ -5344,6 +5362,15 @@ mod tests {
                 ConfigCmd::AssignSlots { node, slots } => {
                     for &slot in slots {
                         let _ = self.map.set_slot_node(slot, node);
+                    }
+                }
+                ConfigCmd::UnassignSlots { slots } => {
+                    // The inverse of AssignSlots: clear each slot's owner (owner=UNASSIGNED +
+                    // mine[] cleared in lockstep) so it is owned by NOBODY. NODE-RELATIVE is
+                    // automatic (every node clears the same slots) + idempotent. Mirrors the
+                    // production ConfigSm.
+                    for &slot in slots {
+                        self.map.clear_slot_owner(slot);
                     }
                 }
                 ConfigCmd::AssignReplica { node, slots } => {

@@ -1900,9 +1900,9 @@ async fn route_and_dispatch(
 ///   * `MEET <ip> <port> [bus]`      -> `AddNode { id, host, port }`
 ///   * `FORGET <id>`                 -> `RemoveNode { id }`
 ///   * `SET-CONFIG-EPOCH <epoch>`    -> `SetConfigEpoch(epoch)`
-///   * `DELSLOTS` / `DELSLOTSRANGE` / `FLUSHSLOTS` -> a clear "not supported in raft-mode" error
-///     (the `ConfigCmd` taxonomy has no slot-UNASSIGN verb yet; ADDSLOTS/SETSLOT/MEET/FORGET are
-///     the ones the cluster forms with, so this is the documented scoped gap).
+///   * `DELSLOTS` / `DELSLOTSRANGE`  -> `UnassignSlots { slots }` (the parsed / range-expanded list)
+///   * `FLUSHSLOTS`                  -> `UnassignSlots { slots }` (every slot THIS node owns in the
+///     committed map; Redis FLUSHSLOTS clears the node's own slots)
 ///
 /// On commit -> `+OK`; when this node is NOT the leader -> `-CLUSTERDOWN ...` (the client retries
 /// against the leader). The slot/argument validation mirrors the Redis error shapes the static
@@ -1952,20 +1952,13 @@ async fn try_raft_cluster_mutator(
         // prior MEET / AddNode); the committed log order guarantees that, and the replica node
         // then attaches to each slot OWNER's primary (full-sync + tail) and serves READONLY reads.
         b"REPLICATE" => Some(build_replicate(request).map(|c| vec![c])),
-        // No UNASSIGN ConfigCmd yet (scoped out): a clear not-supported reply, not a silent
-        // fall-through to the static local mutator (which would diverge from the committed map).
-        b"DELSLOTS" | b"DELSLOTSRANGE" | b"FLUSHSLOTS" => {
-            state_rc.borrow_mut().counters.on_command();
-            let name = String::from_utf8_lossy(&sub);
-            encode_into(
-                out,
-                &Value::error(ErrorReply::err(format!(
-                    "{name} is not supported in raft cluster mode yet"
-                ))),
-                conn.proto,
-            );
-            return Some(false);
-        }
+        // DELSLOTS / DELSLOTSRANGE UN-assign the parsed / range-expanded slots (the inverse of
+        // ADDSLOTS / ADDSLOTSRANGE; the SAME slot-parse helpers). FLUSHSLOTS UN-assigns every slot
+        // THIS node owns in the committed map. Each commits an `UnassignSlots` ConfigCmd, so the
+        // slots become owned by nobody on every node (cluster_slots_assigned drops by that many).
+        b"DELSLOTS" => Some(build_unassign(request, parse_addslots_slots)),
+        b"DELSLOTSRANGE" => Some(build_unassign(request, parse_addslotsrange_slots)),
+        b"FLUSHSLOTS" => Some(build_flushslots(ctx, request)),
         // Any other subcommand (the introspection set, BUMPEPOCH, HELP, unknown, ...) is NOT a
         // mutator: fall through to the unchanged home dispatch.
         _ => None,
@@ -2042,6 +2035,51 @@ fn build_self_assign(
         },
         ironcache_raft::ConfigCmd::AssignSlots { node: id, slots },
     ])
+}
+
+/// Build the `UnassignSlots { slots }` ConfigCmd for raft-mode `CLUSTER DELSLOTS` / `DELSLOTSRANGE`
+/// (the inverse of [`build_self_assign`]). `parse_slots` is the SAME per-verb slot parser ADDSLOTS /
+/// ADDSLOTSRANGE use (`parse_addslots_slots` / `parse_addslotsrange_slots`), so the arity + slot +
+/// range validation (and the Redis error shapes) match the add path exactly. UN-assign needs no
+/// `AddNode` prefix (it references no node) and clears the slots on EVERY node (the committed map is
+/// shared), so a single `UnassignSlots` entry is the whole proposal.
+fn build_unassign(
+    request: &Request,
+    parse_slots: impl Fn(&Request) -> Result<Vec<u16>, ironcache_protocol::ErrorReply>,
+) -> Result<Vec<ironcache_raft::ConfigCmd>, ironcache_protocol::ErrorReply> {
+    let slots = parse_slots(request)?;
+    Ok(vec![ironcache_raft::ConfigCmd::UnassignSlots { slots }])
+}
+
+/// Build the `UnassignSlots { slots }` ConfigCmd for raft-mode `CLUSTER FLUSHSLOTS` (Redis clears
+/// the node's OWN slots). Arity is exactly 2 (the Redis FLUSHSLOTS form; a wrong argc is the
+/// addReplySubcommandSyntaxError class, mirroring the static path). The slot set is every slot THIS
+/// node currently owns in the committed map (read via `owns()`), so the proposal UN-assigns exactly
+/// the running node's slots; an empty set (the node owns nothing) is a valid, degenerate batch.
+///
+/// DOCUMENTED DIVERGENCE (same as the static `cluster_flushslots`): Redis errors `DB must be empty
+/// to perform CLUSTER FLUSHSLOTS.` when the keyspace is non-empty; IronCache has no per-slot key
+/// count index yet, so it cannot test DB-emptiness and proposes unconditionally.
+fn build_flushslots(
+    ctx: &ServerContext,
+    request: &Request,
+) -> Result<Vec<ironcache_raft::ConfigCmd>, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::{CLUSTER_SLOTS, ErrorReply};
+    if request.args.len() != 2 {
+        // Wrong argc: the addReplySubcommandSyntaxError class (Redis parity), not wrong-arity.
+        return Err(ErrorReply::unknown_subcommand(
+            "CLUSTER",
+            &String::from_utf8_lossy(&request.args[1]),
+        ));
+    }
+    // The committed map is always installed as ctx.cluster in raft-mode (the caller established
+    // cluster_mode == Raft); collect the slots this node owns. If, defensively, no map is present,
+    // there are no owned slots to clear, so the batch is empty (a harmless no-op proposal).
+    let slots: Vec<u16> = match ctx.cluster.as_deref() {
+        Some(map) => (0..CLUSTER_SLOTS).filter(|&s| map.owns(s)).collect(),
+        None => Vec::new(),
+    };
+    Ok(vec![ironcache_raft::ConfigCmd::UnassignSlots { slots }])
 }
 
 /// Parse the slot list of `CLUSTER ADDSLOTS <slot>...` (arity Min(3); each slot strictly
@@ -3738,6 +3776,92 @@ mod tests {
             reply2.line(),
             "-CROSSSLOT Keys in request don't hash to the same slot",
             "CROSSSLOT takes precedence over MOVED even when all keys are foreign"
+        );
+    }
+
+    // ----- raft-mode UNASSIGN builders (DELSLOTS / DELSLOTSRANGE / FLUSHSLOTS, slice ha-unassign) --
+    //
+    // build_unassign / build_flushslots are PURE over (request[, ctx]), so they are tested directly
+    // without a socket: each must produce a single `UnassignSlots { slots }` ConfigCmd carrying the
+    // right slot set, and the Redis-shaped error on a bad argument.
+
+    /// Pull the slots out of a one-element `[UnassignSlots]` batch (the shape both DELSLOTS builders
+    /// and FLUSHSLOTS return); panics if the batch is not exactly that, which is itself the assertion.
+    fn unassign_slots(batch: Vec<ironcache_raft::ConfigCmd>) -> Vec<u16> {
+        assert_eq!(batch.len(), 1, "an UNASSIGN is exactly one ConfigCmd");
+        match batch.into_iter().next().unwrap() {
+            ironcache_raft::ConfigCmd::UnassignSlots { slots } => slots,
+            other => panic!("expected UnassignSlots, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_unassign_delslots_parses_the_slot_list() {
+        // DELSLOTS <slot ...> -> UnassignSlots { the parsed slots } (the inverse of ADDSLOTS, the
+        // SAME parser). The boundary slot 16383 is accepted.
+        let req = rreq(&[b"CLUSTER", b"DELSLOTS", b"0", b"100", b"16383"]);
+        let slots = unassign_slots(build_unassign(&req, parse_addslots_slots).expect("valid"));
+        assert_eq!(slots, vec![0, 100, 16_383]);
+    }
+
+    #[test]
+    fn build_unassign_delslotsrange_expands_the_ranges() {
+        // DELSLOTSRANGE <start end ...> -> UnassignSlots { the inclusive-range expansion } (the
+        // inverse of ADDSLOTSRANGE, the SAME parser). Two pairs expand + concatenate in order.
+        let req = rreq(&[b"CLUSTER", b"DELSLOTSRANGE", b"0", b"2", b"10", b"11"]);
+        let slots = unassign_slots(build_unassign(&req, parse_addslotsrange_slots).expect("valid"));
+        assert_eq!(slots, vec![0, 1, 2, 10, 11]);
+    }
+
+    #[test]
+    fn build_unassign_delslots_bad_slot_is_the_redis_error() {
+        // A non-integer / out-of-range slot is the single Redis `Invalid or out of range slot`
+        // error (mirroring ADDSLOTS), produced WITHOUT building a proposal.
+        let req = rreq(&[b"CLUSTER", b"DELSLOTS", b"xyz"]);
+        let err = build_unassign(&req, parse_addslots_slots).expect_err("bad slot");
+        assert_eq!(err.line(), "-ERR Invalid or out of range slot");
+    }
+
+    #[test]
+    fn build_unassign_delslotsrange_start_gt_end_is_the_redis_error() {
+        // start > end is the Redis range error (mirroring ADDSLOTSRANGE).
+        let req = rreq(&[b"CLUSTER", b"DELSLOTSRANGE", b"50", b"10"]);
+        let err = build_unassign(&req, parse_addslotsrange_slots).expect_err("start > end");
+        assert_eq!(
+            err.line(),
+            "-ERR start slot number 50 is greater than end slot number 10"
+        );
+    }
+
+    #[test]
+    fn build_flushslots_unassigns_exactly_the_self_owned_slots() {
+        // FLUSHSLOTS -> UnassignSlots { every slot THIS node owns in the committed map }. The
+        // fixture map has self (RID_A) owning the LOW half [0, 8191], so the batch is exactly those
+        // 8192 slots (and NOT the high half node B owns).
+        let ctx = guardrail_ctx(0, 0); // cluster == redirect_map(): self owns [0, 8191].
+        let req = rreq(&[b"CLUSTER", b"FLUSHSLOTS"]);
+        let slots = unassign_slots(build_flushslots(&ctx, &req).expect("valid arity"));
+        assert_eq!(slots.len(), 8192, "self owns the low half (8192 slots)");
+        assert_eq!(*slots.first().unwrap(), 0);
+        assert_eq!(*slots.last().unwrap(), 8191);
+        assert!(
+            slots.iter().all(|&s| s <= 8191),
+            "FLUSHSLOTS must clear ONLY the self-owned half, never node B's slots"
+        );
+    }
+
+    #[test]
+    fn build_flushslots_wrong_argc_is_the_subcommand_syntax_error() {
+        // FLUSHSLOTS takes exactly 2 args (CLUSTER FLUSHSLOTS). An extra arg is the
+        // addReplySubcommandSyntaxError class (Redis parity), produced without proposing.
+        let ctx = guardrail_ctx(0, 0);
+        let req = rreq(&[b"CLUSTER", b"FLUSHSLOTS", b"extra"]);
+        let err = build_flushslots(&ctx, &req).expect_err("wrong argc");
+        assert!(
+            err.line()
+                .starts_with("-ERR unknown subcommand or wrong number of arguments"),
+            "unexpected error line: {:?}",
+            err.line()
         );
     }
 

@@ -1343,6 +1343,22 @@ impl SlotMap {
         Ok(())
     }
 
+    /// UN-assign `slot`: clear its owner so it is owned by NOBODY (the [`ConfigCmd::UnassignSlots`]
+    /// apply; the committed-log analog of `CLUSTER DELSLOTS / DELSLOTSRANGE / FLUSHSLOTS`). Sets
+    /// `owner[slot]` to [`UNASSIGNED`] and clears `mine[slot]` in LOCKSTEP (the same invariant
+    /// [`SlotMap::del_slots`] / [`SlotMap::flush_slots`] keep), so a node that owned the slot loses
+    /// it (`owns()` goes false) and a node that did not is unaffected. Unlike [`SlotMap::del_slots`]
+    /// (the Redis-client mutator, which ERRORS if a slot is already unassigned), this is
+    /// UNCONDITIONAL and IDEMPOTENT: clearing an already-unassigned slot is a no-op, so re-applying a
+    /// committed entry yields the identical map. Always succeeds (no node-id lookup, no precondition).
+    pub fn clear_slot_owner(&self, slot: u16) {
+        let _guard = self.table.lock().expect("slot-map node lock poisoned");
+        self.owner[slot as usize].store(UNASSIGNED, Ordering::Release);
+        // The slot is now unassigned, hence no longer ours: clear the self-ownership bitmap in
+        // lockstep so owns() (a single mine[slot] load) is correct on every node.
+        self.mine[slot as usize].store(false, Ordering::Release);
+    }
+
     /// Assign `node_id` as the REPLICA of `slot` (HA-7d; the [`ConfigCmd::AssignReplica`] apply).
     /// The node id must be known (a prior committed `AddNode`). Writes the new parallel
     /// `replicas[slot]` index; it does NOT touch `owner[slot]`, `mine[slot]`, or `owns()`, so the

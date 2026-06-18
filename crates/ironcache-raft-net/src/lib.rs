@@ -1218,26 +1218,43 @@ mod tests {
                 index: 19,
                 payload: EntryPayload::Config(ConfigCmd::SetSlotStable { slot: 8192 }),
             },
+            LogEntry {
+                term: 10,
+                index: 20,
+                payload: EntryPayload::Config(ConfigCmd::UnassignSlots {
+                    // The inverse of AssignSlots: a length-prefixed slot list with NO node string
+                    // must round-trip byte-for-byte (incl. the boundary slot 16383).
+                    slots: vec![0, 1, 2, 100, 8191, 8192, 16_383],
+                }),
+            },
+            LogEntry {
+                term: 10,
+                index: 21,
+                payload: EntryPayload::Config(ConfigCmd::UnassignSlots {
+                    // An empty UN-assign slot list is a valid (if degenerate) batch.
+                    slots: vec![],
+                }),
+            },
             // HA-3d: a LogEntry of every MembershipChange shape inside a ConfigChange
             // payload, exercising the new wire discriminant + the one-NodeId tail.
             LogEntry {
                 term: 11,
-                index: 20,
+                index: 22,
                 payload: EntryPayload::ConfigChange(MembershipChange::AddVoter(NodeId(5))),
             },
             LogEntry {
                 term: 11,
-                index: 21,
+                index: 23,
                 payload: EntryPayload::ConfigChange(MembershipChange::RemoveVoter(NodeId(3))),
             },
             LogEntry {
                 term: 12,
-                index: 22,
+                index: 24,
                 payload: EntryPayload::ConfigChange(MembershipChange::AddLearner(NodeId(8))),
             },
             LogEntry {
                 term: 12,
-                index: 23,
+                index: 25,
                 payload: EntryPayload::ConfigChange(MembershipChange::PromoteLearner(NodeId(8))),
             },
         ]

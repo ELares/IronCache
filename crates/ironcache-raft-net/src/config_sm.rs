@@ -117,6 +117,19 @@ impl StateMachine for ConfigSm {
                     let _ = self.map.set_slot_node(slot, node);
                 }
             }
+            ConfigCmd::UnassignSlots { slots } => {
+                // The inverse of AssignSlots (the committed analog of CLUSTER DELSLOTS /
+                // DELSLOTSRANGE / FLUSHSLOTS): clear each slot's owner so it is owned by NOBODY.
+                // `clear_slot_owner` sets owner[slot]=UNASSIGNED and mine[slot]=false in LOCKSTEP
+                // (the same invariant set_slot_node keeps), so a node that owned the slot loses it
+                // (owns() -> false) and a node that did not is unaffected. NODE-RELATIVE is
+                // automatic: every node clears the SAME slots from the shared committed map, so no
+                // node id is carried. IDEMPOTENT: clearing an already-unassigned slot is a no-op,
+                // so re-applying a committed entry yields the identical map.
+                for &slot in slots {
+                    self.map.clear_slot_owner(slot);
+                }
+            }
             ConfigCmd::AssignReplica { node, slots } => {
                 // HA-7d: record `node` as the replica of each slot in the NEW parallel structure
                 // (set_slot_replica), NOT the owner bitmap. Deterministic across nodes (same map
@@ -872,5 +885,135 @@ mod tests {
                 "both nodes agree ID1 replicates slot {slot}"
             );
         }
+    }
+
+    /// A committed `UnassignSlots` clears the owner of each named slot (the inverse of AssignSlots;
+    /// the committed analog of CLUSTER DELSLOTS / DELSLOTSRANGE / FLUSHSLOTS): a node that OWNED a
+    /// slot loses it (`owns()` -> false, the slot becomes unassigned and drops from
+    /// `slots_assigned`), it bumps the log-driven epoch once like every config entry, and it is
+    /// IDEMPOTENT (re-applying clears an already-clear slot = a no-op, same map + same epoch delta).
+    #[test]
+    fn unassign_slots_clears_owner_bumps_epoch_and_is_idempotent() {
+        let map = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let mut sm = ConfigSm::new(Arc::clone(&map));
+
+        // Self claims [0, 1, 2, 16383] (the boundary slot included).
+        sm.apply(&config_entry(
+            1,
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![0, 1, 2, 16_383],
+            },
+        ));
+        assert_eq!(map.slots_assigned(), 4);
+        for slot in [0u16, 1, 2, 16_383] {
+            assert!(map.owns(slot), "ID0 owns {slot} after AssignSlots");
+        }
+        assert_eq!(sm.config_epoch(), 1);
+
+        // UN-assign a SUBSET (slots 1 and 16383): each loses its owner (owns() -> false, the slot
+        // is unassigned), the untouched slots (0, 2) stay owned, and the epoch bumps once.
+        sm.apply(&config_entry(
+            2,
+            ConfigCmd::UnassignSlots {
+                slots: vec![1, 16_383],
+            },
+        ));
+        assert!(!map.owns(1), "slot 1 is unassigned after UnassignSlots");
+        assert!(
+            !map.owns(16_383),
+            "slot 16383 is unassigned after UnassignSlots"
+        );
+        assert!(map.owns(0), "slot 0 (not named) stays owned");
+        assert!(map.owns(2), "slot 2 (not named) stays owned");
+        assert_eq!(map.slots_assigned(), 2, "two slots remain assigned");
+        assert_eq!(sm.config_epoch(), 2, "UnassignSlots bumps the epoch once");
+
+        // IDEMPOTENT: re-applying the SAME UnassignSlots (clearing already-clear slots) leaves the
+        // map identical; only the per-entry epoch advances (every committed entry does).
+        sm.apply(&config_entry(
+            3,
+            ConfigCmd::UnassignSlots {
+                slots: vec![1, 16_383],
+            },
+        ));
+        assert!(
+            !map.owns(1) && !map.owns(16_383),
+            "still unassigned (no-op)"
+        );
+        assert!(
+            map.owns(0) && map.owns(2),
+            "0 and 2 still owned (untouched)"
+        );
+        assert_eq!(
+            map.slots_assigned(),
+            2,
+            "idempotent re-apply: still 2 assigned"
+        );
+        assert_eq!(sm.config_epoch(), 3);
+    }
+
+    /// Two independent ConfigSms fed the IDENTICAL committed sequence (an AssignSlots then an
+    /// UnassignSlots) converge to the same ownership projection: the node that owned the
+    /// unassigned slot loses it, and BOTH nodes agree the slot is owned by NOBODY -- the
+    /// linearizable-ownership property extended to the UN-assign leg.
+    #[test]
+    fn unassign_slots_converges_two_nodes() {
+        let seq = [
+            ConfigCmd::AddNode {
+                id: ID0.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7000,
+            },
+            ConfigCmd::AddNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7001,
+            },
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![0, 5, 100],
+            },
+            ConfigCmd::AssignSlots {
+                node: ID1.to_owned(),
+                slots: vec![1, 2, 3],
+            },
+            // UN-assign one of ID0's slots and one of ID1's: each owner loses its slot.
+            ConfigCmd::UnassignSlots { slots: vec![5, 2] },
+        ];
+        let map0 = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let map1 = Arc::new(SlotMap::empty_self(ID1, "127.0.0.1", 7001));
+        let mut sm0 = ConfigSm::new(Arc::clone(&map0));
+        let mut sm1 = ConfigSm::new(Arc::clone(&map1));
+        for (i, cmd) in seq.iter().enumerate() {
+            let idx = i as u64 + 1;
+            sm0.apply(&config_entry(idx, cmd.clone()));
+            sm1.apply(&config_entry(idx, cmd.clone()));
+        }
+        assert_eq!(map0.current_epoch(), map1.current_epoch());
+        // The unassigned slots (5, 2) are owned by NOBODY on BOTH nodes: the prior owner lost it
+        // and no node claims it.
+        assert!(
+            !map0.owns(5),
+            "node0: slot 5 (ID0's, unassigned) no longer owned"
+        );
+        assert!(!map1.owns(5), "node1: slot 5 unassigned");
+        assert!(
+            !map1.owns(2),
+            "node1: slot 2 (ID1's, unassigned) no longer owned"
+        );
+        assert!(!map0.owns(2), "node0: slot 2 unassigned");
+        // The untouched slots stay owned by their original owner on both views.
+        assert!(
+            map0.owns(0) && map0.owns(100),
+            "node0 still owns its untouched slots"
+        );
+        assert!(
+            map1.owns(1) && map1.owns(3),
+            "node1 still owns its untouched slots"
+        );
+        // Both converge to the same assigned count (4 of the original 6 remain).
+        assert_eq!(map0.slots_assigned(), map1.slots_assigned());
+        assert_eq!(map0.slots_assigned(), 4);
     }
 }
