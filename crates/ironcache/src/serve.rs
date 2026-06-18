@@ -1005,17 +1005,27 @@ fn replica_read_in_sync(ctx: &ServerContext) -> bool {
 
 /// The HA-6 migration context the redirect needs that the static/WATCH paths do NOT: whether the
 /// connection set the one-shot `ASKING` flag, and a resolver telling whether a given CLIENT-VISIBLE
-/// key is PRESENT in the local store. The resolver is the only store-touching part of the redirect;
-/// the serve path supplies it (reading the home shard), so [`cluster_redirect`] / [`redirect_for_keys`]
+/// key is PRESENT (and live) on the shard that OWNS it. The resolver is the only store-touching part
+/// of the redirect; the serve path supplies it, so [`cluster_redirect`] / [`redirect_for_keys`]
 /// stay pure functions over `(map, keys, ...)` plus this borrowed context. `None` (the static path,
 /// raft-without-migration, and the WATCH guard) makes the redirect byte-identical to pre-HA-6: the
 /// migration arms are reached ONLY when a slot is actually tagged MIGRATING/IMPORTING.
+///
+/// MULTI-SHARD EXACTNESS (COORDINATOR.md #107): the resolver is now EXACT on a multi-shard node. A
+/// migrating-slot key lives on the shard it FNV-hashes to ([`route::owner_shard`]), which on a
+/// multi-shard node may be a SIBLING of the accept shard. The serve path pre-resolves any such
+/// non-home key on its owner shard via the coordinator presence hop ([`coordinator::presence_via`])
+/// and feeds the EXACT owner-shard answer here, so the source ASKs only for genuinely absent keys
+/// (no more spurious `-ASK` for a present sibling-shard key). With `shards == 1` every key is home,
+/// so the resolver is a pure local `contains_live` read -- byte-identical to before this fix.
 struct MigrationCtx<'a> {
     /// Whether the connection's one-shot `ASKING` flag is set for THIS command (consumed by the
     /// caller after dispatch). Gates serving an IMPORTING slot locally.
     asking: bool,
-    /// Resolve whether a CLIENT-VISIBLE key is present in the local store (the home shard). Used to
-    /// decide ASK (all keys gone) vs serve (all present) vs TRYAGAIN (mixed) on a MIGRATING slot.
+    /// Resolve whether a CLIENT-VISIBLE key is present-and-live on the shard that OWNS it (the home
+    /// shard for a home key; a sibling shard's pre-resolved answer for a non-home key on a
+    /// multi-shard node). Used to decide ASK (all keys gone) vs serve (all present) vs TRYAGAIN
+    /// (mixed) on a MIGRATING slot.
     key_present: &'a dyn Fn(&[u8]) -> bool,
 }
 
@@ -1262,6 +1272,93 @@ impl MigrationDecision {
 /// MOVED and the destination owns. So there is never a state where two nodes both serve a key as
 /// owner: the source serves only present keys (handing absent ones to dest via ASK), and the dest
 /// serves only under ASKING (or after it owns).
+/// The NON-HOME keys whose presence the HA-6 migration ASK decision must resolve on a SIBLING
+/// shard (COORDINATOR.md #107, the multi-shard exactness fix), each paired with its OWNER shard
+/// index, or `None` when no cross-shard presence resolution is needed (so the caller uses the
+/// byte-identical LOCAL `contains_live` resolver). The fast `None` short-circuit keeps the
+/// `shards == 1` / default / hot path untouched.
+///
+/// Returns `None` (use the local resolver) UNLESS ALL of:
+/// - there is more than one shard (`home.total > 1`); with one shard every key is home-owned, so
+///   the local read is already exact -- this is the FIRST gate, so the single-shard path never
+///   even looks at the slot or the keys (byte-identical to pre-fix);
+/// - the command is KEYED (only `KeyedSingle` / `KeyedMulti` carry a slot the migration arm reads);
+/// - the command's keys resolve to ONE slot (a CROSSSLOT multi-key command is rejected before the
+///   migration arm, so presence is never consulted for it) and THIS node is MIGRATING that slot
+///   (`MigrationState::Migrating` AND `owns(slot)` -- the ONLY arm of `migration_decision` that
+///   calls `key_present`; IMPORTING / non-migrating slots never consult presence);
+/// - at least one key is NOT home-owned (a key on a SIBLING shard, where the accept-shard read
+///   could be wrong). When EVERY key is home-owned, the local read is exact and we return `None`.
+///
+/// When it returns `Some`, the vec holds EVERY non-home key of the migrating slot (deduplicated)
+/// paired with its FNV `owner_shard` -- the SAME hash the coordinator routes a single-key op with,
+/// so the presence hop lands on the shard that actually stores the key. Home-owned keys are
+/// deliberately OMITTED (the caller resolves them locally), so a co-located subset still uses the
+/// zero-hop local read. The migrating slot's keys all share ONE client-visible slot (CROSSSLOT is
+/// enforced upstream) but may map to DIFFERENT internal FNV shards, so the multi-key case can yield
+/// several owners -- one presence hop each (mirroring the coordinator's per-owner multi-key gather).
+fn xshard_presence_keys(
+    map: &ironcache_cluster::SlotMap,
+    route: route::CommandClass,
+    cmd_upper: &[u8],
+    request: &Request,
+    home: ShardId,
+) -> Option<Vec<(Vec<u8>, usize)>> {
+    use ironcache_cluster::MigrationState;
+    // FIRST gate: a single-shard node never needs a cross-shard hop (every key is home-owned).
+    // This short-circuits BEFORE touching the slot map or extracting keys, so the shards == 1
+    // path is byte-identical to before this fix.
+    if home.total <= 1 {
+        return None;
+    }
+    // Only KEYED commands carry a slot the migration arm consults; reduce to the key spec exactly
+    // as `cluster_redirect` does (so "which bytes are keys" cannot drift from the redirect).
+    let spec = match route {
+        route::CommandClass::KeyedSingle => match route::single_key(request) {
+            Some(k) => route::KeySpec::One(k),
+            None => return None,
+        },
+        route::CommandClass::KeyedMulti => route::command_keys(cmd_upper, request),
+        route::CommandClass::AlwaysHome | route::CommandClass::WholeKeyspace => return None,
+    };
+    let keys: Vec<&[u8]> = match spec {
+        route::KeySpec::None => return None,
+        route::KeySpec::One(k) => vec![k],
+        route::KeySpec::Many(ks) => ks,
+    };
+    let first = *keys.first()?;
+    let slot = ironcache_protocol::key_slot(first);
+    // A multi-key command spanning client-visible slots is rejected (-CROSSSLOT) BEFORE the
+    // migration arm, so presence is never consulted for it; only resolve when every key shares the
+    // first key's slot (the single-slot case the migration arm actually reaches).
+    if keys[1..]
+        .iter()
+        .any(|k| ironcache_protocol::key_slot(k) != slot)
+    {
+        return None;
+    }
+    // Presence is consulted ONLY on the migration SOURCE arm (MIGRATING + this node owns the slot);
+    // IMPORTING / non-migrating slots never call `key_present`, so no hop is needed for them.
+    if !(map.migration_state(slot) == MigrationState::Migrating && map.owns(slot)) {
+        return None;
+    }
+    // Collect the NON-home keys (deduplicated) with their owner shard. A home-owned key is resolved
+    // locally by the caller (zero hop), so omit it. If EVERY key is home-owned, return None so the
+    // caller uses the pure local resolver (no cross-shard work at all).
+    let mut remote: Vec<(Vec<u8>, usize)> = Vec::new();
+    for &k in &keys {
+        let owner = route::owner_shard(k, home.total);
+        if owner != home.index && !remote.iter().any(|(existing, _)| existing.as_slice() == k) {
+            remote.push((k.to_vec(), owner));
+        }
+    }
+    if remote.is_empty() {
+        None
+    } else {
+        Some(remote)
+    }
+}
+
 fn migration_decision(
     map: &ironcache_cluster::SlotMap,
     slot: u16,
@@ -1476,6 +1573,13 @@ async fn route_and_dispatch(
         // #20, PR 91b): the same gate -- registry-present (cross-check exact) but client-
         // unreachable; only the coordinator issues it (via the inbox per shard).
         || cmd_upper == ironcache_server::ICPUBSUB
+        // `__ICEXISTS` is the INTERNAL cross-shard KEY-PRESENCE query (HA-6 multi-shard migration,
+        // COORDINATOR.md #107): the same gate -- client-unreachable; only the coordinator issues it
+        // (via `coordinator::presence_via` to the key's owner shard). It is NOT in the `spec_of`
+        // registry (it is dispatched directly, never classified), so a client sending it would
+        // already fall to the unknown-command home arm; rejecting it HERE keeps the contract
+        // explicit and uniform with the other internal verbs.
+        || cmd_upper == ironcache_server::ICEXISTS
     {
         // FIX F: when a client issues an internal verb INSIDE a MULTI, dirty the transaction in
         // addition to replying the unknown-command error, so EXEC returns -EXECABORT exactly as
@@ -1697,19 +1801,54 @@ async fn route_and_dispatch(
         // / WATCH early return into this decision. The migration redirect is consulted only in raft
         // cluster mode (a committed MIGRATING/IMPORTING tag); a non-migrating slot makes the resolver
         // irrelevant and the decision byte-identical to pre-HA-6.
-        // The key-presence resolver reads THIS connection's accept-shard store at the current time.
-        // Cold: called only when a slot is actually MIGRATING and a key must be classified
-        // present/absent for the ASK decision. SCOPE: this is exact for the single-shard-per-node
-        // topology (the migration acceptance + loopback path); on a MULTI-shard node a migrating
-        // slot's key may live on a sibling shard, in which case `contains_live` here can report it
-        // absent and the source emits a (safe, idempotent) -ASK the client retries -- never a
-        // wrong-owner serve. The per-home-shard presence query for multi-shard migration is a
-        // documented follow-up (it needs a cross-shard presence hop, like the COORDINATOR.md data
-        // fan-out); the committed STATE MACHINE + FLIP + redirect semantics proven here do not
-        // depend on it.
         let now = UnixMillis(env.borrow().now_unix_millis());
         let db = conn.db;
-        let key_present = |k: &[u8]| store_rc.borrow().contains_live(db, k, now);
+
+        // HA-6 MULTI-SHARD EXACT PRESENCE (COORDINATOR.md #107): the migration source's ASK
+        // decision classifies each key present/absent against the shard that OWNS it (the FNV
+        // `owner_shard`). On a SINGLE-shard node every key is home, so the local `contains_live`
+        // is already exact -- and `xshard_presence_keys` returns `None`, so this whole block is a
+        // single cheap predicate and the resolver below is BYTE-IDENTICAL to pre-fix (the hot path
+        // is untouched). On a MULTI-shard node a migrating-slot key may live on a SIBLING shard;
+        // there the accept-shard `contains_live` could report a present key ABSENT and emit a
+        // (safe but unnecessary) extra `-ASK`. So when the command's keys are on a slot this node
+        // is MIGRATING (the only case `migration_decision` consults presence) AND some key is NOT
+        // home-owned, we PRE-RESOLVE that key's presence on its owner shard via the coordinator
+        // (`presence_via`, the cross-shard `contains_live`), making the decision EXACT. This is a
+        // COLD path (a slot actually MIGRATING + a keyed command landing on this owner) and the
+        // hop is the same deadlock-free single-key mechanism Stage 1 routing uses (see
+        // `presence_via`); the borrow of `store_rc` for a home key is taken + dropped INSIDE the
+        // closure, never across the awaits done here.
+        let xshard_presence: Vec<(Vec<u8>, bool)> =
+            match xshard_presence_keys(map, route, &cmd_upper, request, home) {
+                None => Vec::new(),
+                Some(remote_keys) => {
+                    let mut resolved = Vec::with_capacity(remote_keys.len());
+                    for (key, owner) in remote_keys {
+                        // Each remote key is resolved on its OWNER shard (a cross-shard hop). No
+                        // `RefCell` borrow is held across this await (the only borrows in this fn
+                        // are the brief `env.borrow()` above, already dropped, and the per-call
+                        // closure borrow below).
+                        let present = coordinator::presence_via(inbox, owner, &key, db).await;
+                        resolved.push((key, present));
+                    }
+                    resolved
+                }
+            };
+
+        // The key-presence resolver. For a HOME-owned key (always true when shards == 1) it reads
+        // THIS shard's store via the pure `contains_live` -- byte-identical to before. For a key
+        // PRE-RESOLVED on a sibling shard above (multi-shard migration only) it returns the EXACT
+        // owner-shard answer. A key that is neither (cannot occur: `xshard_presence_keys` returns
+        // EVERY non-home key of the migrating slot) falls back to the local read, the safe default.
+        let key_present = |k: &[u8]| {
+            if let Some(&(_, present)) = xshard_presence.iter().find(|(key, _)| key.as_slice() == k)
+            {
+                present
+            } else {
+                store_rc.borrow().contains_live(db, k, now)
+            }
+        };
         let mig = MigrationCtx {
             asking,
             key_present: &key_present,
@@ -2548,9 +2687,18 @@ fn route_in_multi(
         // destination, while WITHOUT ASKING the same queued command MOVEDs/dirties (the migration arm
         // is inert unless the slot is actually MIGRATING/IMPORTING, so a non-migrating slot is
         // byte-identical to before -- the static MOVED/CROSSSLOT decision). The key-presence resolver
-        // reads THIS connection's accept-shard store at the current time, exactly as the non-MULTI
-        // path; it is consulted ONLY when a slot is mid-migration (the cold path) and carries the same
-        // single-shard-per-node scope note as the live path.
+        // reads THIS connection's accept-shard store at the current time, consulted ONLY when a slot
+        // is mid-migration (the cold path).
+        //
+        // MULTI-SHARD note: unlike the non-MULTI live path (which pre-resolves a sibling-shard key's
+        // presence via the coordinator for an EXACT ASK), the QUEUE-TIME path uses the LOCAL read and
+        // does NOT hop. It does not need to: this redirect runs BEFORE the `all_keys_home_owned` gate
+        // below, which REJECTS (and dirties the transaction with the cross-shard error) any queued
+        // keyed command with a key on a SIBLING shard -- such a command can never EXEC correctly
+        // home-only (cross-shard transactions are Stage 3), so it is aborted regardless of presence.
+        // The only key the local read can mis-classify (a present sibling-shard key) is one that is
+        // about to be rejected anyway; for a HOME-owned key the local read is already exact. So the
+        // queue-time path is correctly conservative without a hop (and `route_in_multi` stays sync).
         let now = UnixMillis(env.borrow().now_unix_millis());
         let db = conn.db;
         let key_present = |k: &[u8]| store_rc.borrow().contains_live(db, k, now);
@@ -4234,6 +4382,93 @@ mod tests {
             reply.line(),
             format!("-MOVED {slot} 10.0.0.2:7002"),
             "after the FLIP the source serves MOVED to the new owner, never ASK"
+        );
+    }
+
+    // ----- HA-6 MULTI-SHARD presence exactness: the `xshard_presence_keys` routing predicate -----
+    //
+    // It decides WHEN the migration ASK decision needs a CROSS-SHARD presence hop (vs the
+    // byte-identical local read). `home(index, total)` builds the accept shard's identity.
+
+    fn home(index: usize, total: usize) -> ShardId {
+        ShardId { index, total }
+    }
+
+    /// SINGLE-SHARD short-circuit: `home.total == 1` always returns None (every key is home-owned),
+    /// so the resolver stays the pure local `contains_live` -- byte-identical to pre-fix. This is the
+    /// FIRST gate, checked before the slot map or the keys are even looked at.
+    #[test]
+    fn xshard_presence_single_shard_is_always_none() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191); // self-owned
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        map.set_migrating(slot, RID_B).expect("B is known"); // even a MIGRATING slot
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        assert_eq!(
+            xshard_presence_keys(&map, route, b"GET", &req, home(0, 1)),
+            None,
+            "a single-shard node never needs a cross-shard presence hop"
+        );
+    }
+
+    /// NON-MIGRATING slot: even on a multi-shard node, a slot that is NOT MIGRATING (or not owned)
+    /// never consults presence, so no hop is needed -> None (local resolver, byte-unchanged).
+    #[test]
+    fn xshard_presence_non_migrating_slot_is_none() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191); // self-owned, NOT migrating
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        // 8 shards: the key's FNV owner is almost surely not the accept shard we pass, but the slot
+        // is not migrating, so it does not matter.
+        assert_eq!(
+            xshard_presence_keys(&map, route, b"GET", &req, home(0, 8)),
+            None,
+            "a non-migrating slot never consults presence, so no hop"
+        );
+    }
+
+    /// MIGRATING slot, key on a SIBLING shard: returns Some([(key, owner)]) so the caller hops to the
+    /// FNV owner shard for an EXACT presence read. This is the multi-shard case the fix targets.
+    #[test]
+    fn xshard_presence_migrating_sibling_key_returns_owner_hop() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191); // self-owned slot
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        map.set_migrating(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        let total = 8;
+        let owner = route::owner_shard(key.as_bytes(), total);
+        // Accept on a DIFFERENT shard than the FNV owner (a sibling): the local read would be wrong.
+        let accept = (owner + 1) % total;
+        let got = xshard_presence_keys(&map, route, b"GET", &req, home(accept, total))
+            .expect("a migrating-slot key on a sibling shard needs a presence hop");
+        assert_eq!(
+            got,
+            vec![(key.as_bytes().to_vec(), owner)],
+            "the hop targets the key's FNV owner shard"
+        );
+    }
+
+    /// MIGRATING slot, key HOME-owned: returns None (the local read is exact, zero hop), even on a
+    /// multi-shard node -- the cross-shard branch is taken ONLY for a non-home key.
+    #[test]
+    fn xshard_presence_migrating_home_key_is_none() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191);
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        map.set_migrating(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        let total = 8;
+        let owner = route::owner_shard(key.as_bytes(), total);
+        // Accept ON the FNV owner shard: the key is home, so the local read is exact -> no hop.
+        assert_eq!(
+            xshard_presence_keys(&map, route, b"GET", &req, home(owner, total)),
+            None,
+            "a home-owned key uses the exact local read, no cross-shard hop"
         );
     }
 

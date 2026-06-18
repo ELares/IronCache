@@ -60,6 +60,38 @@ pub fn run_cluster_node_for_test(
     run_server(&config).expect("test cluster node failed to bind")
 }
 
+/// Like [`run_cluster_node_for_test`] but across `shards` shards (HA-6 multi-shard online slot
+/// migration, COORDINATOR.md #107): the migration ASK decision must resolve a key's presence on the
+/// shard that OWNS it (the FNV `owner_shard`), which on a multi-shard node may be a SIBLING of the
+/// connection's accept shard. A static cluster node lets a test drive the migration state machine
+/// directly (`CLUSTER SETSLOT <slot> MIGRATING <dest>`) without standing up a full raft quorum.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind, OR if the topology fails to validate.
+#[must_use]
+pub fn run_cluster_node_for_test_shards(
+    port: u16,
+    shards: usize,
+    topology: ClusterTopology,
+    announce_id: &str,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        cluster_enabled: true,
+        cluster_topology: Some(topology),
+        cluster_announce_id: Some(announce_id.to_owned()),
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test cluster topology must validate");
+    run_server(&config).expect("test cluster node failed to bind")
+}
+
 /// Boot a real RAFT-GOVERNANCE node (HA-4c) on `127.0.0.1:port` (single shard): cluster mode
 /// enabled, `cluster_mode = Raft`, with the shared `topology` (which supplies the voter set + the
 /// peer cluster-bus addresses) and this node's `announce_id`. The node spawns its Raft
