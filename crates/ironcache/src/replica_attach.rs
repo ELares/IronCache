@@ -765,11 +765,16 @@ async fn run_replica_control(
                 // on every (re)attach -- a restarted owner pod that kept its DNS name but got a new IP
                 // is dialed at its new address. The old IP-only parse silently skipped a DNS-named
                 // owner (no replication ever attached). A not-yet-resolvable host backs off + retries.
+                //
+                // H1: `resolve` is ASYNC (getaddrinfo on tokio's blocking pool, bounded by
+                // RESOLVE_TIMEOUT via the Runtime timer seam), so a wedged resolver never freezes this
+                // shard's executor; awaited with the shard's `rt`.
                 if let Ok(owner_addr) = ironcache_clusterbus::PeerEndpoint::new(
                     host.clone(),
                     repl_port(owner_client_port),
                 )
-                .resolve()
+                .resolve(&rt)
+                .await
                 {
                     // Attach: full-sync + atomic swap + passive + tail. Returns when the link
                     // drops or a Gap forces a re-attach; we loop and re-attach (re-checking the
@@ -1172,9 +1177,14 @@ async fn run_import_control(
                 // RESOLVE the migration source's repl endpoint accepting a DNS hostname OR an IP
                 // literal (k8s); `host` is re-read from the committed map each loop iteration so it
                 // re-resolves per (re)dial. The old IP-only parse silently skipped a DNS-named source.
+                //
+                // H1: `resolve` is ASYNC (getaddrinfo on tokio's blocking pool, bounded by
+                // RESOLVE_TIMEOUT via the Runtime timer seam), so a wedged resolver never freezes this
+                // shard's executor; awaited with the shard's `rt`.
                 if let Ok(src_addr) =
                     ironcache_clusterbus::PeerEndpoint::new(host, repl_port(src_client_port))
-                        .resolve()
+                        .resolve(&rt)
+                        .await
                 {
                     // The committed-map predicate the tail polls so it STOPS once the FLIP / abort
                     // clears the IMPORTING tag for THIS slot (re-reads the shared map each frame).

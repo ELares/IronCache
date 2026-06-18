@@ -298,20 +298,42 @@ fn spawn_control_plane_inner(
     // address + bus port so the listener still comes up on a routable local interface -- the
     // byte-identical behavior an IP-literal `config.bind` already had. A non-resolving SELF host is
     // logged so it is diagnosable, never silent.
+    //
+    // H1: `PeerEndpoint::resolve` is now ASYNC (it runs `getaddrinfo` on tokio's blocking pool,
+    // bounded by `RESOLVE_TIMEOUT`, so a wedged resolver cannot freeze the executor). This is the
+    // ONE boot-time, before-the-control-plane-thread resolution (it runs once on the boot thread,
+    // not on the single-threaded run loop), so drive the async resolve on a short-lived
+    // current-thread runtime here (boot is a plain sync `fn`, no ambient runtime), mirroring the
+    // CLI's `block_on` shape. An IP-literal host (the byte-identical default) completes immediately.
     let listen_addr = self_host
         .as_ref()
-        .and_then(
-            |(host, port)| match PeerEndpoint::new(host.clone(), *port).resolve() {
-                Ok(addr) => Some(addr),
-                Err(e) => {
+        .and_then(|(host, port)| {
+            let endpoint = PeerEndpoint::new(host.clone(), *port);
+            let resolved = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .map(|boot_rt| {
+                    boot_rt.block_on(async { endpoint.resolve(&TokioRuntime::new()).await })
+                });
+            match resolved {
+                Some(Ok(addr)) => Some(addr),
+                Some(Err(e)) => {
                     eprintln!(
                         "raft control plane: self bus host {host}:{port} did not resolve ({e}); \
                          binding the configured bind address instead"
                     );
                     None
                 }
-            },
-        )
+                None => {
+                    eprintln!(
+                        "raft control plane: could not build a runtime to resolve self bus host \
+                         {host}:{port}; binding the configured bind address instead"
+                    );
+                    None
+                }
+            }
+        })
         .unwrap_or_else(|| SocketAddr::new(config.bind, bus_port(config.port)));
 
     // (3) The durable storage path: <data_dir>/ironcache-raft-<bus-port>.log when a `data_dir` is

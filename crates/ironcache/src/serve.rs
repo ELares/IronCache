@@ -3087,15 +3087,22 @@ async fn build_meet(
 /// can never poison the committed table with a junk id.
 async fn learn_or_synth_meet_id(host: &str, port: u16) -> String {
     let synth = || synth_meet_node_id(host, port);
+    let rt = TokioRuntime::new();
     // The advertised CLIENT endpoint (what a MOVED redirect / a client dials). RESOLVE it accepting
     // a DNS hostname OR an IP literal (k8s): a hostname-addressed peer can now be dialed to learn its
     // real id, where the old IP-only parse fell straight back to the synth id for any DNS name. A
     // host that does not resolve (a peer not yet up) still falls back to the synth id so the cluster
     // forms; the id is reconciled later via the auto-promote / status path.
-    let Ok(addr) = ironcache_clusterbus::PeerEndpoint::new(host, port).resolve() else {
+    //
+    // H1: `resolve` is now ASYNC (getaddrinfo on tokio's blocking pool, bounded by RESOLVE_TIMEOUT
+    // via the Runtime timer seam), so a wedged resolver can never freeze THIS serve task; it is
+    // awaited with the same `rt` that bounds the id fetch below.
+    let Ok(addr) = ironcache_clusterbus::PeerEndpoint::new(host, port)
+        .resolve(&rt)
+        .await
+    else {
         return synth();
     };
-    let rt = TokioRuntime::new();
     // Bound the fetch: whichever of the fetch or the timer completes first wins. The timer is the
     // sanctioned time seam (no `std::time` / `tokio::time` directly), matching the adapter's
     // FORWARD_TIMEOUT shape.
