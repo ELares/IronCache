@@ -32,9 +32,19 @@
 //! a SINK in 3b (a `last_applied` watermark plus an applied counter); the real
 //! state-machine apply that drives the SlotMap is HA-3e.
 //!
+//! Sub-slice 3d adds RAFT CLUSTER-MEMBERSHIP CHANGES (section 6): single-server
+//! voter add / remove and non-voting LEARNERS with a catch-up-then-promote phase.
+//! The configuration (voter set + learner set) is DERIVED FROM THE LOG and a node
+//! adopts a new configuration the moment it APPENDS an [`EntryPayload::ConfigChange`]
+//! entry (not when it commits) -- the section-6 rule that keeps single-server changes
+//! safe because the old and new majorities always overlap. Only single-server changes
+//! are implemented (NOT joint consensus), since those are provably safe without a joint
+//! configuration. A cluster that never issues a `ConfigChange` is byte-identical to the
+//! pre-3d engine (the variant is inert unless used). See [`MembershipChange`].
+//!
 //! What 3b still does NOT do: payloads remain opaque ([`EntryPayload::Noop`] plus
 //! a minimal test-only [`EntryPayload::Bytes`]); there is no snapshotting / log
-//! compaction, no membership change, and no real state machine. The conflict-index
+//! compaction and no real state machine. The conflict-index
 //! fast-backup optimization (the dissertation's accelerated `nextIndex` rewind) is
 //! deliberately NOT implemented; the receiver returns a simple last-index hint and
 //! the leader decrements `nextIndex` by one per failed round, which is correct (if
@@ -114,11 +124,18 @@ pub enum Role {
 /// the cluster's `SlotMap`, which is what makes Raft
 /// the single source of truth for slot ownership (ADR-0027, CONTROL_PLANE.md).
 ///
-/// The engine itself is STILL payload-agnostic: it commits a `Config` entry by the
-/// exact same replication + Figure-8 commit path as any other entry and never
-/// looks inside it. Interpretation happens only in [`apply_committed`], which hands
-/// each committed entry to the [`StateMachine`] seam; a non-`Config` payload
+/// The engine itself is STILL payload-agnostic FOR `Config`: it commits a `Config`
+/// entry by the exact same replication + Figure-8 commit path as any other entry and
+/// never looks inside it. Interpretation happens only in [`apply_committed`], which
+/// hands each committed entry to the [`StateMachine`] seam; a non-`Config` payload
 /// (Noop/Bytes) is a no-op for the config state machine.
+///
+/// The one payload the engine DOES read is [`EntryPayload::ConfigChange`] (HA-3d Raft
+/// section 6 cluster-membership): the voter / learner sets the engine counts quora over
+/// are DERIVED FROM THE LOG, adopted on APPEND (not commit). It still replicates and
+/// commits by the identical path; the difference is only that appending one recomputes
+/// [`RaftNode`]'s configuration. A `ConfigChange` payload is a no-op for the
+/// [`StateMachine`] (it governs the Raft voter set, not the slot map).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryPayload {
     /// A leader's election no-op. Carries no data; advances the log index/term.
@@ -131,6 +148,75 @@ pub enum EntryPayload {
     /// when the entry is applied. The engine treats this as just another opaque
     /// payload on the replication and commit paths; only the state machine reads it.
     Config(ConfigCmd),
+    /// A RAFT CLUSTER-MEMBERSHIP change (HA-3d, Raft section 6): a single-server
+    /// addition or removal of a voter, or a learner add / promotion. UNLIKE every
+    /// other payload, the engine itself READS this one: the cluster CONFIGURATION (the
+    /// voter set the engine counts votes and commits over, plus the learner set it
+    /// replicates to but never counts) is DERIVED FROM THE LOG, and a node adopts a new
+    /// configuration AS SOON AS THIS ENTRY IS APPENDED TO ITS LOG -- NOT when it commits
+    /// (the section-6 rule that makes single-server changes safe, since the old and new
+    /// majorities always overlap when adding or removing exactly one server). The
+    /// payload still replicates and commits by the identical Figure-8 path as any other
+    /// entry; only the moment a node recomputes its [`voters`]/[`learners`] from the log
+    /// differs (on append, not on commit). See [`MembershipChange`] and
+    /// [`RaftNode::recompute_config_from_log`].
+    ///
+    /// [`voters`]: RaftNode
+    /// [`learners`]: RaftNode
+    ConfigChange(MembershipChange),
+}
+
+/// A SINGLE-SERVER Raft cluster-membership change (HA-3d, Raft section 6).
+///
+/// Raft section 6 proves that adding or removing exactly ONE server at a time is safe
+/// WITHOUT joint consensus: any majority of the OLD configuration and any majority of
+/// the NEW configuration always overlap (they differ by one server), so two leaders
+/// can never be elected in the same term across the change. This engine implements
+/// THOSE single-server changes (never joint consensus): every variant adds or removes
+/// at most one node from the voter or learner set.
+///
+/// LEARNERS (non-voting, section 6's catch-up phase): a brand-new server is first
+/// added as a LEARNER ([`MembershipChange::AddLearner`]). A learner receives
+/// AppendEntries / InstallSnapshot and replicates the full log, but is NOT counted in
+/// ANY majority (neither an election quorum nor a commit quorum). Once a learner's
+/// `match_index` is close enough to the leader (a lag gate, the round-based caught-up
+/// check of section 6), the leader proposes [`MembershipChange::PromoteLearner`], which
+/// moves it from the learner set INTO the voter set. This staged join avoids a fresh,
+/// far-behind server stalling commit by being counted toward a quorum it cannot satisfy.
+///
+/// The engine NEVER interprets the node ids beyond set membership; the production
+/// adapter maps these to real cluster nodes (a follow-up; HA-3d ships the engine + the
+/// deterministic-simulation safety gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// Add `0` to the VOTER set (a single-server addition). Counted in every majority
+    /// from the moment the entry is appended. Typically a new node is added as a
+    /// [`MembershipChange::AddLearner`] first and promoted via
+    /// [`MembershipChange::PromoteLearner`]; a direct `AddVoter` is the degenerate
+    /// "skip the catch-up phase" form (safe, but it can briefly stall commit if the new
+    /// voter is far behind, which is exactly what learners avoid).
+    AddVoter(NodeId),
+    /// Remove `0` from the VOTER set (a single-server removal). Counted out of every
+    /// majority from the moment the entry is appended. A LEADER that removes ITSELF
+    /// steps down AFTER this entry commits (section 6: it must first replicate the entry
+    /// that removes it to a majority of the NEW configuration, then it is no longer part
+    /// of the cluster and yields).
+    RemoveVoter(NodeId),
+    /// Add `0` to the LEARNER set (a non-voting catch-up member). The leader begins
+    /// replicating to it immediately, but it is excluded from every majority until a
+    /// later [`MembershipChange::PromoteLearner`] turns it into a voter.
+    AddLearner(NodeId),
+    /// Promote `0` from the LEARNER set to the VOTER set (the catch-up phase is done).
+    /// Equivalent to a `RemoveLearner` + `AddVoter` in one committed delta.
+    ///
+    /// CATCH-UP IS ADVISORY (HA-3d). The engine ACCEPTS this promotion at ANY lag: a
+    /// promotion is always SAFE (a new voter never violates election safety), and promoting
+    /// a far-behind learner only briefly stalls commit until it catches up (the larger
+    /// quorum now includes a lagging voter). [`RaftNode::learner_caught_up`] is therefore an
+    /// ADVISORY gate the engine does not enforce; consulting it before proposing
+    /// `PromoteLearner` (so a far-behind learner is not promoted prematurely) is the
+    /// (future) production driver's responsibility, not the engine's.
+    PromoteLearner(NodeId),
 }
 
 /// A committed cluster-configuration command (CONTROL_PLANE.md #73): the deltas
@@ -420,6 +506,17 @@ pub enum RaftMsg {
         last_included_term: u64,
         /// The [`StateMachine`]-serialized state at `last_included_index` (single chunk).
         data: Vec<u8>,
+        /// HA-3d: the CONFIG BASELINE (the voter set) as of `last_included_index`. The
+        /// snapshot subsumes the `ConfigChange` entries of the compacted prefix, so the
+        /// follower cannot rebuild the configuration from its (now-truncated) log alone;
+        /// the leader ships the committed config baseline it persisted at the compaction
+        /// point so the installing follower adopts exactly that, then applies any surviving
+        /// post-snapshot `ConfigChange` tail on top. Empty for a pre-3d / static cluster
+        /// (the leader's config equals the constructor voter set), which keeps the install
+        /// path config-inert there.
+        voters: BTreeSet<NodeId>,
+        /// HA-3d: the LEARNER set as of `last_included_index` (companion to `voters`).
+        learners: BTreeSet<NodeId>,
     },
     /// A follower's reply to a [`RaftMsg::InstallSnapshot`] (Raft Figure 13 results).
     /// Carries the follower's `term` (so the leader can step down on a higher one) AND
@@ -547,6 +644,33 @@ pub trait RaftStorage {
     fn log_start_index(&self) -> u64 {
         1
     }
+
+    // -- 3d membership-config baseline (Raft section 6) ---------------------
+
+    /// Durably persist the cluster CONFIGURATION BASELINE: the voter and learner sets as
+    /// of the last snapshot point (HA-3d). Because the live configuration is DERIVED FROM
+    /// THE LOG (a node adopts a new config on appending each [`EntryPayload::ConfigChange`]),
+    /// recovering it on restart needs the baseline the surviving log tail's `ConfigChange`
+    /// entries are replayed ON TOP OF: everything below the snapshot was compacted away, so
+    /// the baseline records the config the compacted-away `ConfigChange` prefix produced.
+    /// The engine writes this beside [`save_snapshot`](RaftStorage::save_snapshot) (the
+    /// snapshot and the baseline are taken at the same index). The DEFAULT is a no-op: a
+    /// store that never compacts (or a pre-3d store) keeps the whole log, so the engine can
+    /// rebuild the config from the constructor's voter set plus the whole `ConfigChange`
+    /// log, and never needs a persisted baseline. `MemStorage` overrides it so the
+    /// engine restart-via-snapshot path is exercised.
+    fn save_config_baseline(&mut self, voters: &BTreeSet<NodeId>, learners: &BTreeSet<NodeId>) {
+        let _ = (voters, learners);
+    }
+
+    /// The persisted configuration baseline (voter set, learner set) saved at the last
+    /// snapshot, or `None` if none was saved (the default / never-compacted path). On
+    /// restart the engine seeds its configuration from this baseline (when present) and
+    /// then replays the surviving log's [`EntryPayload::ConfigChange`] entries on top.
+    /// The default returns `None`; `MemStorage` overrides it.
+    fn load_config_baseline(&self) -> Option<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        None
+    }
 }
 
 /// A snapshot's metadata (Raft section 7): the index and term of the LAST log entry
@@ -590,6 +714,11 @@ pub struct MemStorage {
     snap_meta: Option<SnapshotMeta>,
     /// The most recent persisted snapshot's serialized state-machine bytes, if any.
     snap_data: Vec<u8>,
+    /// The membership CONFIGURATION BASELINE persisted at the last snapshot (HA-3d): the
+    /// `(voters, learners)` the compacted-away `ConfigChange` prefix produced. `None`
+    /// until the engine first persists one (it does so beside `save_snapshot`), so a
+    /// never-compacted store has nothing here and the default config-rebuild path runs.
+    config_baseline: Option<(BTreeSet<NodeId>, BTreeSet<NodeId>)>,
 }
 
 impl MemStorage {
@@ -765,6 +894,14 @@ impl RaftStorage for MemStorage {
 
     fn log_start_index(&self) -> u64 {
         self.start()
+    }
+
+    fn save_config_baseline(&mut self, voters: &BTreeSet<NodeId>, learners: &BTreeSet<NodeId>) {
+        self.config_baseline = Some((voters.clone(), learners.clone()));
+    }
+
+    fn load_config_baseline(&self) -> Option<(BTreeSet<NodeId>, BTreeSet<NodeId>)> {
+        self.config_baseline.clone()
     }
 }
 
@@ -1021,24 +1158,76 @@ pub const ELECTION_TIMEOUT: u64 = 0;
 /// broadcasts an empty [`RaftMsg::AppendEntries`].
 pub const HEARTBEAT: u64 = 1;
 
+/// The learner CATCH-UP LAG GATE (HA-3d, Raft section 6's round-based caught-up
+/// check, simplified to a fixed lag bound). A leader will only propose
+/// [`MembershipChange::PromoteLearner`] for a learner whose tracked `match_index` is
+/// within this many entries of the leader's last log index. The paper bounds the join
+/// by ROUNDS of replication taking less than an election timeout; a fixed small lag is
+/// the deterministic, time-free analog the pure engine uses (it reads no clock), and is
+/// sufficient for safety -- promotion is safe at ANY lag (a new voter never violates
+/// election safety), the gate exists only to avoid promoting a far-behind voter that
+/// would briefly stall commit. Exposed via [`RaftNode::learner_caught_up`].
+pub const LEARNER_CATCHUP_LAG: u64 = 2;
+
 // ---------------------------------------------------------------------------
 // The node.
 // ---------------------------------------------------------------------------
 
+/// The decoded fields of a [`RaftMsg::InstallSnapshot`], bundled so
+/// [`RaftNode::on_install_snapshot`] stays under the argument cap (the message gained
+/// HA-3d config-baseline fields). Constructed in the `on_message` dispatch and moved in.
+struct InstallSnapshotArgs {
+    /// The leader's term.
+    term: u64,
+    /// The leader id (recorded / redirected to, mirrors AppendEntries).
+    leader_id: NodeId,
+    /// The snapshot's last included log index.
+    last_included_index: u64,
+    /// The term of the snapshot's last included entry.
+    last_included_term: u64,
+    /// The state-machine-serialized state at `last_included_index`.
+    data: Vec<u8>,
+    /// HA-3d: the config baseline voter set as of `last_included_index`.
+    voters: BTreeSet<NodeId>,
+    /// HA-3d: the config baseline learner set as of `last_included_index`.
+    learners: BTreeSet<NodeId>,
+}
+
 /// A single Raft node: the pure step engine.
 ///
-/// Holds the node's identity, the static voter set (membership changes are a later
-/// sub-slice), the volatile role and the in-flight vote tally, the timing config,
-/// and the persistent [`RaftStorage`]. It is driven by [`RaftNode::start`] once,
-/// then [`RaftNode::on_message`] / [`RaftNode::on_timer`] per event. It reads time
-/// only via the `now` argument and randomness only via the [`RaftRng`] argument;
-/// it never blocks and performs no I/O.
+/// Holds the node's identity, the CONFIGURATION (the voter set + the learner set,
+/// DERIVED FROM THE LOG since HA-3d, section 6), the volatile role and the in-flight
+/// vote tally, the timing config, and the persistent [`RaftStorage`]. It is driven by
+/// [`RaftNode::start`] once, then [`RaftNode::on_message`] / [`RaftNode::on_timer`] per
+/// event. It reads time only via the `now` argument and randomness only via the
+/// [`RaftRng`] argument; it never blocks and performs no I/O.
 #[derive(Debug)]
 pub struct RaftNode<S: RaftStorage, M: StateMachine = CountingSm> {
     /// This node's id.
     id: NodeId,
-    /// The static set of voting members (includes `id`). Static in 3a.
+    /// The current set of VOTING members (HA-3d). Counted in every majority (election
+    /// and commit). Seeded from the constructor's argument, then RECOMPUTED from the log
+    /// whenever the log changes: a node ADOPTS a new configuration the moment it APPENDS
+    /// an [`EntryPayload::ConfigChange`] entry (Raft section 6, the append-time rule that
+    /// keeps single-server changes safe). Never includes a node that is currently a
+    /// learner. May or may not include `id` (a removed leader is no longer a voter).
     voters: BTreeSet<NodeId>,
+    /// The current set of LEARNERS (HA-3d, non-voting members in their catch-up phase).
+    /// A learner is replicated to (it receives AppendEntries / InstallSnapshot) but is
+    /// NEVER counted in any majority. Like [`voters`](RaftNode::voters), it is derived
+    /// from the log and adopted on append. A node is in AT MOST one of `voters` /
+    /// `learners` (PromoteLearner moves it from the latter to the former). Empty unless a
+    /// membership change has introduced a learner, so the default path is byte-unchanged.
+    learners: BTreeSet<NodeId>,
+    /// The CONFIGURATION BASELINE (voters, learners) as of the last snapshot point
+    /// (HA-3d). The live config is `baseline` plus every `ConfigChange` entry surviving
+    /// in the log above the snapshot. Kept so [`recompute_config_from_log`] can rebuild
+    /// the config after a truncation (which may remove `ConfigChange` entries) without
+    /// re-reading the compacted-away prefix. Seeded from the constructor's voter set
+    /// (learners empty), or from the persisted baseline on a restart-from-snapshot.
+    ///
+    /// [`recompute_config_from_log`]: RaftNode::recompute_config_from_log
+    config_baseline: (BTreeSet<NodeId>, BTreeSet<NodeId>),
     /// The current role (volatile; rebuilt from persistence + elections on boot).
     role: Role,
     /// Votes received in the current term while a `Candidate` (includes self).
@@ -1133,9 +1322,21 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             }
             None => (0, 0),
         };
-        RaftNode {
+        // HA-3d configuration recovery. The CONFIG BASELINE is what the surviving log's
+        // `ConfigChange` entries are replayed on top of: a persisted baseline (saved at
+        // the last snapshot, the config the compacted-away `ConfigChange` prefix
+        // produced) when one exists, else the constructor's voter set with no learners (a
+        // fresh node, or a node whose whole `ConfigChange` history is still in the log).
+        // Consume the `voters` argument here (it is the fallback baseline when nothing was
+        // persisted), so it is not needlessly cloned.
+        let config_baseline = storage
+            .load_config_baseline()
+            .unwrap_or((voters, BTreeSet::new()));
+        let mut node = RaftNode {
             id,
-            voters,
+            voters: config_baseline.0.clone(),
+            learners: config_baseline.1.clone(),
+            config_baseline,
             role: Role::Follower,
             votes: BTreeSet::new(),
             leader_id: None,
@@ -1150,7 +1351,13 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             // a per-run hook-ran witness, not a persisted count).
             applied_count: 0,
             sm,
-        }
+        };
+        // Adopt the configuration the SURVIVING LOG implies: the baseline plus every
+        // `ConfigChange` entry still present (Raft section 6, append-time adoption). With
+        // no `ConfigChange` entries this is exactly `config_baseline`, so the default /
+        // static-membership path keeps `voters` == the constructor argument byte-for-byte.
+        node.recompute_config_from_log();
+        node
     }
 
     /// Arm the initial election timer. Call exactly once, right after construction
@@ -1311,13 +1518,19 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 last_included_index,
                 last_included_term,
                 data,
+                voters,
+                learners,
             } => self.on_install_snapshot(
                 rng,
-                term,
-                leader_id,
-                last_included_index,
-                last_included_term,
-                data,
+                InstallSnapshotArgs {
+                    term,
+                    leader_id,
+                    last_included_index,
+                    last_included_term,
+                    data,
+                    voters,
+                    learners,
+                },
                 out,
             ),
             RaftMsg::InstallSnapshotResp {
@@ -1360,6 +1573,18 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     fn on_election_timeout(&mut self, now: Monotonic, rng: &mut dyn RaftRng, out: &mut Effects) {
         let _ = now;
         if self.role == Role::Leader {
+            return;
+        }
+        // HA-3d: a node that is NOT a voter in its own (log-derived) configuration must not
+        // start an election. A LEARNER is non-voting (it replicates but never campaigns,
+        // Raft section 6) and a node already REMOVED from the cluster (or not yet added as
+        // a voter) likewise cannot win and would only churn the term. We RE-ARM the timer
+        // so it keeps a timer live (a learner being promoted, or a node about to be added,
+        // becomes a voter the moment its log gains the AddVoter/PromoteLearner entry, after
+        // which a later timeout campaigns normally). With a static voter set every node is
+        // a voter, so this guard never fires and the default election path is byte-identical.
+        if !self.voters.contains(&self.id) {
+            self.arm_election_timer(rng, out);
             return;
         }
         let new_term = self.storage.current_term() + 1;
@@ -1575,6 +1800,7 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // in place so a retransmitted prefix does not truncate (and potentially lose)
         // an already-committed suffix.
         let mut append_from = 0usize; // index into `entries` of the first to append
+        let mut truncated = false; // whether a conflict truncation dropped a suffix
         for (i, entry) in entries.iter().enumerate() {
             // The 1-based log index this incoming entry would occupy.
             let idx = prev_log_index + 1 + u64::try_from(i).unwrap_or(u64::MAX);
@@ -1589,14 +1815,28 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 // Rule 3: conflict (same index, different term). Truncate from here
                 // and append from this incoming entry onward.
                 self.storage.truncate_from(idx);
+                truncated = true;
                 append_from = i;
                 break;
             }
             // Same index, same term: identical (Log Matching). Already present; skip.
             append_from = i + 1;
         }
-        if append_from < entries.len() {
+        let appended = append_from < entries.len();
+        if appended {
             self.storage.append_entries(&entries[append_from..]);
+        }
+        // HA-3d APPEND-TIME ADOPTION (Raft section 6): a follower adopts the configuration
+        // its log implies the instant a `ConfigChange` entry lands (or a truncation drops
+        // one). Recompute only when this RPC actually CHANGED the surviving log (a
+        // truncation or an append), so an idempotent retransmit does no work. With no
+        // `ConfigChange` entries anywhere this is a no-op over the baseline, keeping the
+        // default path byte-identical (it only ever changes the sets when a membership
+        // entry is present). A follower's vote eligibility then reflects its own log's
+        // config, which is exactly the section-6 caveat: a joining node that already holds
+        // the AddVoter entry can vote, and the cluster does not deadlock.
+        if truncated || appended {
+            self.recompute_config_from_log();
         }
 
         // Rule 5: advance commit_index toward leader_commit, capped at the index of
@@ -1666,7 +1906,7 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             let mi = *m;
             self.next_index.insert(from, mi + 1);
             // A peer made progress: maybe a new index is now on a majority.
-            self.maybe_advance_commit();
+            self.maybe_advance_commit(out);
         } else {
             // Rule: decrement nextIndex (floor 1) and retry with the earlier prev.
             let ni = self.next_index.entry(from).or_insert(1);
@@ -1770,8 +2010,18 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         if self.role != Role::Candidate {
             return;
         }
+        // HA-3d: win on a strict majority of the CURRENT-CONFIG VOTER SET, counting only
+        // votes FROM voters (a learner that grants a vote is replicating, not voting, so it
+        // must not count toward the election quorum). With a static voter set the granted
+        // votes are all from voters and `self.votes.len()` already equals the voter count,
+        // so this is byte-identical to the pre-3d `self.votes.len() >= needed` check.
         let needed = self.voters.len() / 2 + 1;
-        if self.votes.len() < needed {
+        let votes_from_voters = self
+            .votes
+            .iter()
+            .filter(|v| self.voters.contains(v))
+            .count();
+        if votes_from_voters < needed {
             return;
         }
         self.role = Role::Leader;
@@ -1783,11 +2033,13 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // Initialize leader replication state for every peer (Figure 2, "Leaders":
         // on election, nextIndex = last log index + 1, matchIndex = 0). Our own
         // match is implicit (we always have our whole log); the commit counter
-        // counts the leader itself separately.
+        // counts the leader itself separately. HA-3d: replicate to LEARNERS too (they
+        // catch up the log) -- they get markers and AppendEntries but are never counted
+        // toward a quorum; the chain over voters AND learners is what ships them the log.
         let next = self.storage.last_log_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
-        for &peer in &self.voters {
+        for &peer in self.voters.iter().chain(self.learners.iter()) {
             if peer != self.id {
                 self.next_index.insert(peer, next);
                 self.match_index.insert(peer, 0);
@@ -1809,13 +2061,15 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         out.set_timer(HEARTBEAT, self.config.heartbeat_interval);
     }
 
-    /// Broadcast a replication `AppendEntries` to every other voter (Figure 2,
-    /// "Leaders"). Each peer's RPC carries `prev` and `entries` derived from that
-    /// peer's `nextIndex`, so this is heartbeat AND log shipping in one: a
-    /// caught-up peer gets an empty `entries` (a pure heartbeat), a lagging peer
-    /// gets the entries it is missing. Replaces 3a's always-empty heartbeat.
+    /// Broadcast a replication `AppendEntries` to every other voter AND learner (Figure
+    /// 2, "Leaders"; HA-3d for learners). Each peer's RPC carries `prev` and `entries`
+    /// derived from that peer's `nextIndex`, so this is heartbeat AND log shipping in one:
+    /// a caught-up peer gets an empty `entries` (a pure heartbeat), a lagging peer gets
+    /// the entries it is missing. LEARNERS are replicated to exactly like voters (so they
+    /// catch up); they simply never count toward a quorum. With no learners (the default)
+    /// the iterated set is exactly the voter set, so the default path is byte-identical.
     fn broadcast_heartbeat(&self, out: &mut Effects) {
-        for &peer in &self.voters {
+        for &peer in self.voters.iter().chain(self.learners.iter()) {
             if peer != self.id {
                 self.send_append_entries_to(peer, out);
             }
@@ -1843,6 +2097,13 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // prev term, so a normal AppendEntries works.
         if let Some((meta, data)) = self.storage.load_snapshot() {
             if next <= meta.last_included_index {
+                // HA-3d: ship the persisted CONFIG BASELINE the snapshot reflects so the
+                // installing follower can rebuild its configuration (its log below the
+                // snapshot is gone). Empty for a static cluster (config-inert there).
+                let (voters, learners) = self
+                    .storage
+                    .load_config_baseline()
+                    .unwrap_or_else(|| (BTreeSet::new(), BTreeSet::new()));
                 out.send(
                     peer,
                     RaftMsg::InstallSnapshot {
@@ -1851,6 +2112,8 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                         last_included_index: meta.last_included_index,
                         last_included_term: meta.last_included_term,
                         data,
+                        voters,
+                        learners,
                     },
                 );
                 return;
@@ -1886,13 +2149,22 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     /// A prior-term entry becomes committed only TRANSITIVELY: once a current-term
     /// entry above it reaches a majority and commits, every entry below it is
     /// committed by the Log Matching Property. Advancing commit then drives apply.
-    fn maybe_advance_commit(&mut self) {
+    fn maybe_advance_commit(&mut self, out: &mut Effects) {
         if self.role != Role::Leader {
             return;
         }
         let current_term = self.storage.current_term();
         let last = self.storage.last_log_index();
+        // HA-3d: the majority is over the CURRENT-CONFIG VOTER SET (the latest config in
+        // this leader's log), counting NEITHER learners NOR a self that is no longer a
+        // voter (a leader mid-self-removal). With a static voter set this is exactly
+        // `voters.len()/2+1` as before, so the default path is byte-identical.
         let majority = self.voters.len() / 2 + 1;
+        // Does the leader count itself? Only if it is still a voter in the current config
+        // (a leader that appended `RemoveVoter(self)` is not, and must not count itself
+        // toward the very entry that removes it). It always holds its whole log, so when
+        // it IS a voter it replicates every N <= last.
+        let self_is_voter = self.voters.contains(&self.id);
 
         // Scan from the highest index downward; the first N that satisfies both
         // clauses is the new commit index (commit is monotone, so a higher N
@@ -1903,17 +2175,16 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         while n > self.commit_index {
             // Clause 2 (5.4.2): only current-term entries are committable by count.
             if self.storage.term_at(n) == current_term {
-                // Count voters with match_index >= n. The leader counts itself (it
-                // holds every entry up to `last`, so it replicates N for any N <=
-                // last); each peer counts if its tracked match_index >= n.
-                let mut replicated = 1; // the leader itself
+                // Count CURRENT-CONFIG VOTERS with match_index >= n. The leader counts
+                // itself iff it is a voter; each peer counts iff it is a voter (learners
+                // are excluded) AND its tracked match_index >= n.
+                let mut replicated = u64::from(self_is_voter);
                 for (&peer, &mi) in &self.match_index {
-                    let _ = peer;
-                    if mi >= n {
+                    if self.voters.contains(&peer) && mi >= n {
                         replicated += 1;
                     }
                 }
-                if replicated >= majority {
+                if usize::try_from(replicated).unwrap_or(usize::MAX) >= majority {
                     new_commit = n;
                     break;
                 }
@@ -1925,6 +2196,71 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             self.commit_index = new_commit;
             self.apply_committed();
         }
+
+        // HA-3d LEADER SELF-REMOVAL STEP-DOWN (Raft section 6): a leader that has
+        // committed a `RemoveVoter(self)` is no longer part of the cluster and must yield.
+        // The entry that removes it is committed iff the COMMITTED config (baseline +
+        // ConfigChange entries up to commit_index) excludes self. We check after advancing
+        // commit above, so the removal step-down fires exactly when its entry commits --
+        // never before (it could otherwise step down while still needed to commit the very
+        // removal entry on the new-config majority). With a static cluster the leader is
+        // always in its committed voters, so this never fires (default path unchanged).
+        if self.role == Role::Leader && !self.committed_config_contains_self() {
+            self.step_down_to_follower(out);
+            // Re-arm the election timer like any step-down: the node is now a plain
+            // follower (out of the cluster, but a leftover follower until the adapter
+            // tears it down), and must not sit with no timer armed.
+            self.arm_election_timer_now(out);
+        }
+    }
+
+    /// The CONFIGURATION (voter set, learner set) AS OF a given log index (HA-3d): the
+    /// persisted [`config_baseline`](RaftNode::config_baseline) with every
+    /// [`EntryPayload::ConfigChange`] entry whose index is `<= index` replayed in log order
+    /// on top. Scans only the surviving log tail (the compacted-away prefix's deltas are
+    /// already folded into the baseline), so it never reads a compacted index. Indices
+    /// above `last_log_index` simply replay the whole surviving log; indices at or below
+    /// the snapshot boundary replay nothing and return the baseline unchanged.
+    ///
+    /// This is the single source of truth for "what config did index N produce", used both
+    /// to bound the COMMITTED config (`config_at(commit_index)`) and to capture the
+    /// committed config at a snapshot point (`config_at(last_included_index)`), so the two
+    /// callers can never disagree on the fold.
+    fn config_at(&self, index: u64) -> (BTreeSet<NodeId>, BTreeSet<NodeId>) {
+        let (mut voters, mut learners) = self.config_baseline.clone();
+        let start = self.storage.log_start_index();
+        let last = self.storage.last_log_index().min(index);
+        let mut idx = start;
+        while idx <= last {
+            if let Some(entry) = self.storage.entry_at(idx) {
+                if let EntryPayload::ConfigChange(change) = entry.payload {
+                    Self::apply_membership_delta(&mut voters, &mut learners, change);
+                }
+            }
+            idx += 1;
+        }
+        (voters, learners)
+    }
+
+    /// Whether THIS node is a voter in the COMMITTED configuration (HA-3d): the baseline
+    /// plus every `ConfigChange` entry at-or-below `commit_index`. Used for the
+    /// leader-self-removal step-down, which must fire only once the removing entry has
+    /// COMMITTED (the live `self.voters` already excludes self at APPEND time, which is too
+    /// early to step down). Delegates to [`config_at`](RaftNode::config_at) bounded at
+    /// `commit_index`, so it scans only the surviving committed log tail.
+    fn committed_config_contains_self(&self) -> bool {
+        self.config_at(self.commit_index).0.contains(&self.id)
+    }
+
+    /// Arm the election timer with NO rng (HA-3d step-down convenience). The leader
+    /// self-removal step-down happens inside `maybe_advance_commit`, which (matching the
+    /// other commit-path callers) has no `RaftRng` handle; arming WITHOUT jitter here is
+    /// safe because this node has just left the cluster and its election timing no longer
+    /// affects consensus (it is being torn down by the adapter). Uses the base timeout, no
+    /// random draw, so it perturbs no RNG stream. The normal jittered arm
+    /// ([`arm_election_timer`]) is used everywhere a real election can result.
+    fn arm_election_timer_now(&self, out: &mut Effects) {
+        out.set_timer(ELECTION_TIMEOUT, self.config.election_timeout_base);
     }
 
     /// The apply pipeline (Figure 2, "All Servers": if `commitIndex > lastApplied`,
@@ -2005,6 +2341,21 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         let last_included_index = self.last_applied;
         let last_included_term = self.storage.term_at(last_included_index);
         let data = self.sm.snapshot();
+        // HA-3d: persist the CONFIG BASELINE alongside the snapshot. The compacted-away
+        // prefix folds its `ConfigChange` deltas into this baseline, so a restart restores
+        // the config as `baseline + surviving-log ConfigChange entries`. The baseline is
+        // the COMMITTED config AS OF the compaction point, NOT the live `self.voters`:
+        // `self.voters` is derived from the ENTIRE log including UNCOMMITTED `ConfigChange`
+        // entries above `last_applied` (append-time adoption), and if such an uncommitted
+        // entry is later TRUNCATED (it was on a deposed leader's log) a baseline that folded
+        // it could never un-adopt it -- the baseline is the recompute floor. We therefore
+        // capture `config_at(last_included_index)`; since `last_included_index ==
+        // last_applied <= commit_index`, this is exactly the COMMITTED config at the
+        // snapshot point. Update the in-memory baseline to match (future recomputes scan
+        // only the surviving tail on top of it).
+        let baseline = self.config_at(last_included_index);
+        self.storage.save_config_baseline(&baseline.0, &baseline.1);
+        self.config_baseline = baseline;
         self.storage.save_snapshot(
             SnapshotMeta {
                 last_included_index,
@@ -2038,17 +2389,22 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     /// committed prefix and can never overwrite a different committed entry at the same
     /// index (State-Machine-Safety), because two leaders can never commit conflicting
     /// entries at one index.
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value)]
     fn on_install_snapshot(
         &mut self,
         rng: &mut dyn RaftRng,
-        term: u64,
-        leader_id: NodeId,
-        last_included_index: u64,
-        last_included_term: u64,
-        data: Vec<u8>,
+        args: InstallSnapshotArgs,
         out: &mut Effects,
     ) {
+        let InstallSnapshotArgs {
+            term,
+            leader_id,
+            last_included_index,
+            last_included_term,
+            data,
+            voters,
+            learners,
+        } = args;
         self.observe_term(term, rng, out);
         let current = self.storage.current_term();
 
@@ -2120,6 +2476,16 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         self.storage.compact_to(last_included_index);
         self.sm.restore(&data);
 
+        // HA-3d: ADOPT the config baseline the snapshot reflects. The snapshot subsumed the
+        // compacted prefix's `ConfigChange` entries, so the follower's truncated log can no
+        // longer rebuild the configuration alone; the leader shipped the committed baseline.
+        // Persist it and recompute the live config as `baseline + surviving-tail
+        // ConfigChange entries`. Empty sets (a static / pre-3d cluster) leave the config
+        // governed by the constructor's voter set, so this is config-inert there.
+        self.config_baseline = (voters.clone(), learners.clone());
+        self.storage.save_config_baseline(&voters, &learners);
+        self.recompute_config_from_log();
+
         // Advance the committed / applied watermarks to the snapshot's index (it is a
         // committed prefix). Forward-only: we entered this branch only because
         // last_included_index > commit_index.
@@ -2180,7 +2546,7 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         *m = (*m).max(installed_index);
         let mi = *m;
         self.next_index.insert(from, mi + 1);
-        self.maybe_advance_commit();
+        self.maybe_advance_commit(out);
         // Resume normal replication of the entries above the snapshot at once.
         self.send_append_entries_to(from, out);
     }
@@ -2204,6 +2570,15 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         if self.role != Role::Leader {
             return None;
         }
+        let is_config_change = matches!(payload, EntryPayload::ConfigChange(_));
+        // HA-3d ONE-CHANGE-IN-FLIGHT (Raft section 6): a leader refuses a new membership
+        // change while a previous one is still uncommitted, because two overlapping
+        // configuration transitions could yield disjoint majorities. Enforced HERE so it
+        // holds no matter which entry point proposed the change (the direct
+        // `propose_membership_change`, or a `RaftMsg::Propose` carrying a `ConfigChange`).
+        if is_config_change && self.membership_change_in_flight() {
+            return None;
+        }
         let index = self.storage.last_log_index() + 1;
         let term = self.storage.current_term();
         self.storage.append(LogEntry {
@@ -2211,10 +2586,27 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             index,
             payload,
         });
+        // HA-3d APPEND-TIME ADOPTION (Raft section 6): if this is a membership change,
+        // the leader adopts the new configuration NOW (on append, not on commit) and
+        // counts subsequent quora over it. Recompute before initializing replication
+        // state below so a freshly-added voter / learner is replicated to at once.
+        if is_config_change {
+            self.recompute_config_from_log();
+            // A newly-introduced peer (voter or learner) has no replication markers yet;
+            // seed them so the very next broadcast ships it the log from the start. An
+            // existing peer keeps its markers (the entry() guards do not overwrite).
+            let next = self.storage.last_log_index() + 1;
+            for &peer in self.voters.iter().chain(self.learners.iter()) {
+                if peer != self.id {
+                    self.next_index.entry(peer).or_insert(next);
+                    self.match_index.entry(peer).or_insert(0);
+                }
+            }
+        }
         // Replicate at once so a quiet cluster does not wait a heartbeat interval,
         // and so a single-voter leader's own append commits immediately.
         self.broadcast_heartbeat(out);
-        self.maybe_advance_commit();
+        self.maybe_advance_commit(out);
         Some(index)
     }
 
@@ -2256,6 +2648,150 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         }
         self.votes.insert(voter);
         self.maybe_become_leader(out);
+    }
+
+    // -- HA-3d membership (Raft section 6) ----------------------------------
+
+    /// RECOMPUTE the live configuration (voter set + learner set) from the log (HA-3d,
+    /// Raft section 6 APPEND-TIME ADOPTION). The config is the persisted
+    /// [`config_baseline`](RaftNode::config_baseline) with every surviving
+    /// [`EntryPayload::ConfigChange`] delta replayed in log order on top. Called after
+    /// EVERY log mutation that can add or remove a `ConfigChange` entry (a leader's own
+    /// append, a follower's append / conflict-truncation, a snapshot install), so a node
+    /// adopts a new configuration the instant the entry lands in its log -- BEFORE it is
+    /// committed. This is the section-6 rule that makes single-server changes safe: the
+    /// leader counts votes and commit-quora over the LATEST config in its OWN log.
+    ///
+    /// Scans only the SURVIVING log (above any snapshot); the compacted-away prefix's
+    /// deltas are already folded into the baseline, so this never reads a compacted entry.
+    /// With no `ConfigChange` entries anywhere the result equals the baseline, which for a
+    /// static-membership cluster is the constructor's voter set -- so the default path is
+    /// byte-identical (this only ever shrinks/grows the sets when a `ConfigChange` exists).
+    fn recompute_config_from_log(&mut self) {
+        let (mut voters, mut learners) = self.config_baseline.clone();
+        let start = self.storage.log_start_index();
+        let last = self.storage.last_log_index();
+        let mut idx = start;
+        while idx <= last {
+            if let Some(entry) = self.storage.entry_at(idx) {
+                if let EntryPayload::ConfigChange(change) = entry.payload {
+                    Self::apply_membership_delta(&mut voters, &mut learners, change);
+                }
+            }
+            idx += 1;
+        }
+        self.voters = voters;
+        self.learners = learners;
+    }
+
+    /// Apply ONE [`MembershipChange`] delta to a `(voters, learners)` pair (HA-3d). Pure
+    /// and total: each variant is a single-server add or remove, and a node is kept in at
+    /// most one of the two sets (PromoteLearner removes from learners then adds to
+    /// voters). Idempotent re-application yields the same sets, so replaying the same log
+    /// prefix twice (a restart, a re-derive after truncation) converges identically.
+    fn apply_membership_delta(
+        voters: &mut BTreeSet<NodeId>,
+        learners: &mut BTreeSet<NodeId>,
+        change: MembershipChange,
+    ) {
+        match change {
+            MembershipChange::AddVoter(node) => {
+                // A direct voter add: also ensure it is not lingering as a learner.
+                learners.remove(&node);
+                voters.insert(node);
+            }
+            MembershipChange::RemoveVoter(node) => {
+                voters.remove(&node);
+            }
+            MembershipChange::AddLearner(node) => {
+                // A learner is non-voting; if it was somehow a voter, it is not now.
+                voters.remove(&node);
+                learners.insert(node);
+            }
+            MembershipChange::PromoteLearner(node) => {
+                // The catch-up phase is over: move it from learners into voters.
+                learners.remove(&node);
+                voters.insert(node);
+            }
+        }
+    }
+
+    /// Is there a membership change CURRENTLY IN FLIGHT (appended but not yet committed)?
+    /// (HA-3d, the section-6 ONE-CHANGE-IN-FLIGHT rule.) A leader refuses to propose a new
+    /// `ConfigChange` while one is uncommitted, because two overlapping configuration
+    /// transitions could produce disjoint majorities (the very hazard single-server
+    /// changes otherwise avoid). True iff any `ConfigChange` entry sits ABOVE the
+    /// committed watermark in the surviving log.
+    fn membership_change_in_flight(&self) -> bool {
+        let start = self.storage.log_start_index().max(self.commit_index + 1);
+        let last = self.storage.last_log_index();
+        let mut idx = start;
+        while idx <= last {
+            if let Some(entry) = self.storage.entry_at(idx) {
+                if matches!(entry.payload, EntryPayload::ConfigChange(_)) {
+                    return true;
+                }
+            }
+            idx += 1;
+        }
+        false
+    }
+
+    /// Whether `learner` has caught up enough to be promoted to a voter (HA-3d,
+    /// [`LEARNER_CATCHUP_LAG`]). Only meaningful on a leader, which tracks each peer's
+    /// `match_index`. A learner is "caught up" when its `match_index` is within
+    /// [`LEARNER_CATCHUP_LAG`] of the leader's last log index. Returns false if the node
+    /// is not a known learner or this node is not the leader.
+    ///
+    /// ADVISORY ONLY. This is a query the (future) production driver consults BEFORE
+    /// proposing [`MembershipChange::PromoteLearner`]; the engine does NOT enforce it.
+    /// `propose_membership_change(PromoteLearner(..))` succeeds at ANY lag, because a
+    /// promotion is always SAFE (a new voter never breaks election safety) -- promoting a
+    /// far-behind learner merely stalls commit briefly until the new voter catches up, since
+    /// the now-larger quorum includes a lagging member. So this gate is a liveness hint, not
+    /// a safety precondition, and skipping it cannot corrupt the cluster.
+    #[must_use]
+    pub fn learner_caught_up(&self, learner: NodeId) -> bool {
+        if self.role != Role::Leader || !self.learners.contains(&learner) {
+            return false;
+        }
+        let last = self.storage.last_log_index();
+        let mi = self.match_index.get(&learner).copied().unwrap_or(0);
+        mi + LEARNER_CATCHUP_LAG >= last
+    }
+
+    /// The current VOTER set (HA-3d), for test inspection. Derived from the log.
+    #[must_use]
+    pub fn voters(&self) -> &BTreeSet<NodeId> {
+        &self.voters
+    }
+
+    /// The current LEARNER set (HA-3d, non-voting members), for test inspection.
+    #[must_use]
+    pub fn learners(&self) -> &BTreeSet<NodeId> {
+        &self.learners
+    }
+
+    /// Propose a single-server membership change on a leader (HA-3d, Raft section 6).
+    /// This is a thin wrapper over [`propose`](RaftNode::propose) that ALSO enforces the
+    /// ONE-CHANGE-IN-FLIGHT rule: it refuses (returns `None`) if this node is not the
+    /// leader OR if a previous membership change is still uncommitted. On success it
+    /// appends an [`EntryPayload::ConfigChange`] entry, which (per append-time adoption)
+    /// immediately updates THIS leader's voter / learner sets, and replicates it.
+    ///
+    /// Returns the new entry's 1-based log index, or `None` when the change was refused.
+    pub fn propose_membership_change(
+        &mut self,
+        change: MembershipChange,
+        now: Monotonic,
+        rng: &mut dyn RaftRng,
+        out: &mut Effects,
+    ) -> Option<u64> {
+        // Delegates to `propose`, which enforces BOTH the leader-only and the section-6
+        // one-change-in-flight guards for a `ConfigChange` payload (so the rule holds for
+        // every entry point). This wrapper exists as the named, intention-revealing public
+        // API for proposing membership and to keep the `ConfigChange`-construction here.
+        self.propose(EntryPayload::ConfigChange(change), now, rng, out)
     }
 }
 
@@ -2513,6 +3049,79 @@ mod tests {
         fn propose(&mut self, leader: NodeId, payload: EntryPayload) {
             self.net
                 .tell(to_sim(leader), to_sim(leader), RaftMsg::Propose { payload });
+        }
+
+        // -- HA-3d membership helpers --------------------------------------
+
+        /// Propose a single-server membership change at `leader` THROUGH THE WIRE: a
+        /// self-`tell`ed `RaftMsg::Propose` carrying the [`EntryPayload::ConfigChange`], so
+        /// the proposal and its replication ride the SAME deterministic transport (and
+        /// auto-drain through [`RaftSimNode`]) as any message -- exactly like
+        /// [`RaftCluster::propose`]. The engine's `propose` path enforces the leader-only +
+        /// one-change-in-flight guards; on a non-leader (or an in-flight change) it is an
+        /// inert no-op, which is the refusal under test. (For the engine's RETURN-VALUE
+        /// verdict -- accepted index vs refused -- the unit tests call
+        /// [`RaftNode::propose_membership_change`] directly; the DST gate observes the
+        /// EFFECT on the committed config instead.)
+        fn propose_membership(&mut self, leader: NodeId, change: MembershipChange) {
+            self.net.tell(
+                to_sim(leader),
+                to_sim(leader),
+                RaftMsg::Propose {
+                    payload: EntryPayload::ConfigChange(change),
+                },
+            );
+        }
+
+        /// Add a FRESH node `id` mid-run (a joining server, HA-3d), seeded with the given
+        /// `voters` argument as its constructor config. A joining node typically starts
+        /// with a config that does NOT yet include itself (it learns it is a voter/learner
+        /// once the AddVoter/AddLearner entry replicates into its log); this helper lets a
+        /// scenario pick that seed. The node is bootstrapped (its first callback arms the
+        /// election timer) via the same harmless term-0 self-AppendEntries
+        /// [`RaftCluster::start_all`] uses.
+        fn add_joining_node(
+            &mut self,
+            id: NodeId,
+            seed_voters: BTreeSet<NodeId>,
+            config: RaftConfig,
+        ) {
+            self.net
+                .add_node(to_sim(id), RaftSimNode::new(id, seed_voters, config));
+            self.ids.push(id);
+            self.ids.sort_unstable();
+            self.net.tell(
+                to_sim(id),
+                to_sim(id),
+                RaftMsg::AppendEntries {
+                    term: 0,
+                    leader: id,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                },
+            );
+        }
+
+        /// The current (log-derived) voter set of `id`'s engine (HA-3d inspection).
+        fn voters_of(&self, id: NodeId) -> BTreeSet<NodeId> {
+            self.net
+                .node(to_sim(id))
+                .expect("node exists")
+                .engine
+                .voters()
+                .clone()
+        }
+
+        /// The current learner set of `id`'s engine (HA-3d inspection).
+        fn learners_of(&self, id: NodeId) -> BTreeSet<NodeId> {
+            self.net
+                .node(to_sim(id))
+                .expect("node exists")
+                .engine
+                .learners()
+                .clone()
         }
     }
 
@@ -3460,6 +4069,390 @@ mod tests {
         }
     }
 
+    // =====================================================================
+    // 3d DST MEMBERSHIP-SAFETY GATE (the merge-blocker, Raft section 6).
+    //
+    // Grow a cluster 1 -> 3 (then exercise learners + a leader self-removal) UNDER
+    // PARTITIONS, across many seeds, asserting across the WHOLE timeline that
+    // ELECTION SAFETY holds (NEVER two leaders in one term, even mid-reconfiguration
+    // with a partition that could split old-vs-new config -- the disjoint-majority
+    // hazard single-server changes must rule out), plus Log-Matching + State-Machine
+    // -Safety across the config changes, and determinism replay.
+    // =====================================================================
+
+    /// Run one membership scenario for `seed`: a 1-voter cluster GROWS to 3 by adding
+    /// two voters one at a time (each via a committed ConfigChange), UNDER an injected
+    /// partition that isolates one node mid-reconfiguration, then heals. Returns the final
+    /// per-node (voters, committed-log) snapshot so two same-seed runs can be compared.
+    /// Election safety + log-matching + state-machine-safety are asserted at every
+    /// quiescent checkpoint INSIDE the run (the gate is the in-run asserts; the returned
+    /// snapshot is the determinism witness).
+    fn run_membership_grow_under_partition(seed: u64) -> Vec<(BTreeSet<NodeId>, Vec<LogEntry>)> {
+        let config = RaftConfig::default();
+        // Start with a single voter that self-elects, plus two not-yet-members standing by
+        // (seeded with an empty-of-self config so they do not campaign until added).
+        let mut cluster = RaftCluster::new(1, seed, config);
+        cluster
+            .net
+            .set_latency(Duration::from_millis(1), Duration::from_millis(15));
+        cluster.run_until_idle(20_000);
+        assert_election_safety(&cluster);
+        let leader = cluster.leaders();
+        assert_eq!(leader.len(), 1, "seed {seed}: the lone voter self-elects");
+        let leader = leader[0];
+
+        // Bring up two fresh joining nodes (NodeId 2, 3) whose seed config is just {1}
+        // (they learn they are voters when the AddVoter entry replicates to them).
+        let seed_cfg: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        cluster.add_joining_node(NodeId(2), seed_cfg.clone(), config);
+        cluster.add_joining_node(NodeId(3), seed_cfg, config);
+
+        // GROW 1 -> 2: propose AddVoter(2); let it replicate + commit, asserting safety
+        // throughout. We checkpoint election safety in chunks (mid-reconfiguration).
+        cluster.propose_membership(leader, MembershipChange::AddVoter(NodeId(2)));
+        for _ in 0..30 {
+            cluster.net.run_steps(200);
+            assert_election_safety(&cluster);
+            assert_log_matching(&cluster);
+        }
+        cluster.run_until_idle(50_000);
+        assert_election_safety(&cluster);
+
+        // PARTITION the new node (2) away from {1,3} mid-reconfiguration, then GROW 1 -> 3
+        // by proposing AddVoter(3) from whoever is leader. The partition is exactly the
+        // disjoint-majority setup: while it holds, no term may have two leaders.
+        let cur_leader = cluster.leaders().first().copied().unwrap_or(leader);
+        cluster.net.partition(
+            &[to_sim(NodeId(2))],
+            &[to_sim(NodeId(1)), to_sim(NodeId(3))],
+        );
+        cluster.propose_membership(cur_leader, MembershipChange::AddVoter(NodeId(3)));
+        for _ in 0..40 {
+            cluster.net.run_steps(200);
+            // THE GATE: election safety must hold at EVERY checkpoint, even with the
+            // partition splitting the cluster mid-reconfiguration.
+            assert_election_safety(&cluster);
+            assert_log_matching(&cluster);
+            assert_state_machine_safety(&cluster);
+        }
+
+        // HEAL and converge. Election safety still holds; the cluster settles to one leader.
+        cluster.net.heal();
+        for _ in 0..60 {
+            cluster.net.run_steps(500);
+            assert_election_safety(&cluster);
+            assert_log_matching(&cluster);
+            assert_state_machine_safety(&cluster);
+            if cluster.leaders().len() == 1 {
+                break;
+            }
+        }
+        cluster.run_until_idle(100_000);
+        assert_election_safety(&cluster);
+        assert_log_matching(&cluster);
+        assert_state_machine_safety(&cluster);
+
+        // Snapshot the final per-node (voters, committed-log prefix) for the determinism
+        // assertion (committed prefix is the agreed truth).
+        cluster
+            .ids
+            .iter()
+            .map(|&id| {
+                let ci = cluster.commit_index(id);
+                let log = cluster.log(id);
+                let committed: Vec<LogEntry> = log.into_iter().filter(|e| e.index <= ci).collect();
+                (cluster.voters_of(id), committed)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn membership_grow_under_partition_keeps_election_safety() {
+        // THE merge-blocker gate across a seed sweep: grow 1 -> 3 under a partition that
+        // splits old-vs-new config mid-reconfiguration; election safety + log-matching +
+        // state-machine-safety hold across the WHOLE timeline (asserted inside the run),
+        // and the cluster converges to a single 3-voter leader.
+        for seed in 0..40u64 {
+            let snap = run_membership_grow_under_partition(seed);
+            // After heal + convergence every node agrees the config is the 3-voter set.
+            let all_three: BTreeSet<NodeId> = (1..=3).map(NodeId).collect();
+            for (voters, _) in &snap {
+                assert_eq!(
+                    voters, &all_three,
+                    "seed {seed}: every node converges to the 3-voter config"
+                );
+            }
+        }
+    }
+
+    /// FIX3 DISJOINT-MAJORITY GATE (Raft section 6 overlap proof). Grow 4 -> 5 and, DURING
+    /// the reconfiguration window (after AddVoter(5) is appended on the leader, before it
+    /// commits cluster-wide), PARTITION the cluster exactly along the OLD-vs-NEW majority
+    /// boundary, then let BOTH sides try to elect under randomized timing.
+    ///
+    /// THE BOUNDARY. C_old = {1,2,3,4} (majority 3); C_new = {1,2,3,4,5} (majority 3). The
+    /// partition is `A = {1,2,3}` against `B = {4,5}`. Side A is a majority of BOTH configs
+    /// (3 of 4 old, 3 of 5 new), so A can elect a leader on whichever config its members
+    /// hold. Side B includes the JUST-ADDED voter 5 (which, under append-time adoption,
+    /// believes the config is C_new) plus the highest old voter 4. Under the WRONG rule
+    /// (adopt-on-COMMIT) a node on B that has NOT yet learned of voter 5 would count quora
+    /// over the smaller C_old, and 5 (which thinks it is a full voter) could grant / solicit
+    /// votes -- the exact path to a SECOND leader in a term A also leads.
+    ///
+    /// The single-server overlap theorem says any C_old-majority and any C_new-majority
+    /// SHARE a node (because the two configs differ by exactly one member), so two DISJOINT
+    /// electing majorities cannot exist on opposite sides of ANY partition, and B (a
+    /// minority of both) can never elect while A holds a majority. The gate asserts that
+    /// headline across the WHOLE timeline: `assert_election_safety` (NEVER two leaders in one
+    /// term), plus Log-Matching, State-Machine-Safety, and committed-entries-survive (the
+    /// `CommitLedger`) -- AND that the reconfiguration CONVERGES to the correct 5-voter
+    /// config (the caller's post-run assertion).
+    ///
+    /// NON-VACUITY (confirmed by a scratch experiment, not committed). Flipping append-time
+    /// adoption to adopt-on-COMMIT (fold only ConfigChange entries at index <= commit_index
+    /// in `recompute_config_from_log`) makes this gate FAIL: a node on side B that has the
+    /// uncommitted AddVoter(5) in its log no longer counts itself / voter 5, so it falls back
+    /// to the smaller C_old quorum, and the cluster does NOT converge to the appended 5-voter
+    /// config (the committed voter set ends up {1,2,3,4}, tripping the caller's convergence
+    /// assertion). Because the overlap theorem holds in BOTH rules within this crash-free
+    /// harness, the observable break under the wrong rule is the RECONFIGURATION CORRECTNESS
+    /// / LIVENESS one, which is exactly what this scenario exercises; a genuine two-leaders
+    /// (`assert_election_safety`) failure here would be a real engine bug to FIX, not assert
+    /// around.
+    ///
+    /// Returns the final per-node (voters, committed-log) snapshot for the determinism
+    /// replay assertion.
+    fn run_membership_grow_disjoint_majority(seed: u64) -> Vec<(BTreeSet<NodeId>, Vec<LogEntry>)> {
+        // A short, well-separated election window so both partition sides genuinely attempt
+        // elections within the run (the jitter varies the interleaving across seeds).
+        let config = RaftConfig {
+            election_timeout_base: Duration::from_millis(150),
+            election_timeout_jitter: Duration::from_millis(150),
+            heartbeat_interval: Duration::from_millis(50),
+            ..RaftConfig::default()
+        };
+        let mut cluster = RaftCluster::new(4, seed, config);
+        cluster
+            .net
+            .set_latency(Duration::from_millis(1), Duration::from_millis(20));
+        let mut ledger = CommitLedger::new();
+
+        // Converge the 4-voter cluster to a single leader.
+        let leader = run_to_single_leader(&mut cluster, 200, 400);
+        cluster.run_until_idle(50_000);
+        assert_election_safety(&cluster);
+        ledger.observe_and_check(&cluster);
+
+        // Bring up the joining node 5 (seed config = the 4 voters; it learns it is a voter
+        // when AddVoter(5) replicates into its log).
+        let voters4: BTreeSet<NodeId> = (1..=4).map(NodeId).collect();
+        cluster.add_joining_node(NodeId(5), voters4, config);
+
+        // OPEN THE RECONFIGURATION WINDOW: propose AddVoter(5) on the leader. Append-time
+        // adoption flips the leader to C_new immediately; the entry is not yet committed
+        // cluster-wide. Step only a LITTLE so the change is mid-flight (partially
+        // replicated), then partition along the old-vs-new boundary.
+        cluster.propose_membership(leader, MembershipChange::AddVoter(NodeId(5)));
+        for _ in 0..3 {
+            cluster.net.run_steps(40);
+            assert_election_safety(&cluster);
+            assert_log_matching(&cluster);
+            assert_state_machine_safety(&cluster);
+            ledger.observe_and_check(&cluster);
+        }
+
+        // PARTITION exactly along the boundary: A = {1,2,3} (a majority of both configs) vs
+        // B = {4,5} (a minority of both; carries the just-added voter 5). Both sides will
+        // time out and campaign under randomized jitter.
+        cluster.net.partition(
+            &[to_sim(NodeId(1)), to_sim(NodeId(2)), to_sim(NodeId(3))],
+            &[to_sim(NodeId(4)), to_sim(NodeId(5))],
+        );
+        for _ in 0..60 {
+            cluster.net.run_steps(100);
+            // THE GATE: at EVERY checkpoint while the partition straddles the old/new
+            // boundary, there is never more than one leader per term, and committed
+            // history never diverges.
+            assert_election_safety(&cluster);
+            assert_log_matching(&cluster);
+            assert_state_machine_safety(&cluster);
+            ledger.observe_and_check(&cluster);
+        }
+
+        // HEAL and converge to a single 5-voter leader; safety holds throughout.
+        cluster.net.heal();
+        for _ in 0..120 {
+            cluster.net.run_steps(500);
+            assert_election_safety(&cluster);
+            assert_log_matching(&cluster);
+            assert_state_machine_safety(&cluster);
+            ledger.observe_and_check(&cluster);
+            if cluster.leaders().len() == 1 && cluster.voters_of(cluster.leaders()[0]).len() == 5 {
+                break;
+            }
+        }
+        cluster.run_until_idle(200_000);
+        assert_election_safety(&cluster);
+        assert_log_matching(&cluster);
+        assert_state_machine_safety(&cluster);
+        ledger.observe_and_check(&cluster);
+
+        cluster
+            .ids
+            .iter()
+            .map(|&id| {
+                let ci = cluster.commit_index(id);
+                let log = cluster.log(id);
+                let committed: Vec<LogEntry> = log.into_iter().filter(|e| e.index <= ci).collect();
+                (cluster.voters_of(id), committed)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn membership_grow_disjoint_majority_keeps_election_safety() {
+        // FIX3: the disjoint-majority gate across a seed sweep. Grow 4 -> 5 and partition
+        // along the old-vs-new majority boundary mid-reconfiguration; ELECTION SAFETY (never
+        // two leaders per term) plus Log-Matching + State-Machine-Safety +
+        // committed-entries-survive hold across the WHOLE timeline (asserted inside the run),
+        // and the cluster converges to a single 5-voter leader.
+        for seed in 0..40u64 {
+            let snap = run_membership_grow_disjoint_majority(seed);
+            let all_five: BTreeSet<NodeId> = (1..=5).map(NodeId).collect();
+            for (voters, _) in &snap {
+                assert_eq!(
+                    voters, &all_five,
+                    "seed {seed}: every node converges to the 5-voter config"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn membership_grow_disjoint_majority_replays_deterministically() {
+        // The disjoint-majority scenario is deterministic: two same-seed runs produce
+        // identical final per-node (voters, committed-log) snapshots.
+        for seed in 0..15u64 {
+            let a = run_membership_grow_disjoint_majority(seed);
+            let b = run_membership_grow_disjoint_majority(seed);
+            assert_eq!(
+                a, b,
+                "seed {seed}: the disjoint-majority scenario must replay identically"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_grow_under_partition_replays_deterministically() {
+        // Two same-seed runs of the grow-under-partition scenario produce IDENTICAL final
+        // per-node (voters, committed-log) snapshots: the membership path is deterministic.
+        for seed in 0..20u64 {
+            let a = run_membership_grow_under_partition(seed);
+            let b = run_membership_grow_under_partition(seed);
+            assert_eq!(
+                a, b,
+                "seed {seed}: membership grow-under-partition must replay identically"
+            );
+        }
+    }
+
+    #[test]
+    fn learner_catches_up_then_is_promoted_to_voter() {
+        // A 3-voter cluster adds a LEARNER (NodeId 4) that catches up via AppendEntries,
+        // then is promoted to a voter once caught up -- all while staying election-safe.
+        let config = RaftConfig::default();
+        let mut cluster = RaftCluster::new(3, 4242, config);
+        let leader = run_to_single_leader(&mut cluster, 500, 200);
+        cluster.net.run_steps(5_000);
+        assert_election_safety(&cluster);
+
+        // Pile some committed entries onto the cluster so a fresh learner is BEHIND.
+        for tag in 0..6u8 {
+            cluster.propose(leader, EntryPayload::Bytes(vec![tag]));
+            cluster.net.run_steps(1_000);
+        }
+        cluster.run_until_idle(50_000);
+
+        // Add a fresh learner (NodeId 4), seeded with the 3-voter config (it is not yet a
+        // member of it). Propose AddLearner(4); it replicates the whole log to catch up.
+        let voters3: BTreeSet<NodeId> = (1..=3).map(NodeId).collect();
+        cluster.add_joining_node(NodeId(4), voters3, config);
+        let leader = cluster.leaders().first().copied().expect("a leader");
+        cluster.propose_membership(leader, MembershipChange::AddLearner(NodeId(4)));
+        cluster.run_until_idle(100_000);
+        assert_election_safety(&cluster);
+        // The leader sees NodeId(4) as a learner (not a voter).
+        assert!(
+            cluster.learners_of(leader).contains(&NodeId(4)),
+            "the new node is a learner on the leader"
+        );
+        assert!(
+            !cluster.voters_of(leader).contains(&NodeId(4)),
+            "a learner is not counted as a voter"
+        );
+        // The learner caught up: its committed prefix matches the leader's.
+        let leader_ci = cluster.commit_index(leader);
+        assert!(
+            cluster.commit_index(NodeId(4)) >= leader_ci.saturating_sub(LEARNER_CATCHUP_LAG),
+            "the learner caught up to within the lag gate"
+        );
+
+        // PROMOTE the learner to a voter; the cluster is now 4 voters and stays safe.
+        cluster.propose_membership(leader, MembershipChange::PromoteLearner(NodeId(4)));
+        cluster.run_until_idle(100_000);
+        assert_election_safety(&cluster);
+        let voters4: BTreeSet<NodeId> = (1..=4).map(NodeId).collect();
+        for &id in &cluster.ids {
+            assert_eq!(
+                cluster.voters_of(id),
+                voters4,
+                "node {id:?} converged to the 4-voter config after promotion"
+            );
+        }
+        assert_eq!(
+            cluster.leaders().len(),
+            1,
+            "exactly one leader in the grown 4-voter cluster"
+        );
+    }
+
+    #[test]
+    fn shrink_cluster_removes_a_voter_and_stays_safe() {
+        // A 3-voter cluster SHRINKS to 2 by removing a non-leader voter, under election
+        // safety; the committed config converges to {remaining two}.
+        let config = RaftConfig::default();
+        let mut cluster = RaftCluster::new(3, 909, config);
+        let leader = run_to_single_leader(&mut cluster, 500, 200);
+        cluster.net.run_steps(5_000);
+        assert_election_safety(&cluster);
+        // Remove a voter that is NOT the leader.
+        let victim = cluster
+            .ids
+            .iter()
+            .copied()
+            .find(|&id| id != leader)
+            .expect("a non-leader voter");
+        cluster.propose_membership(leader, MembershipChange::RemoveVoter(victim));
+        for _ in 0..40 {
+            cluster.net.run_steps(300);
+            assert_election_safety(&cluster);
+            assert_log_matching(&cluster);
+        }
+        cluster.run_until_idle(100_000);
+        assert_election_safety(&cluster);
+        // The leader's committed config excludes the victim.
+        assert!(
+            !cluster.voters_of(leader).contains(&victim),
+            "the removed voter is gone from the leader's config"
+        );
+        assert_eq!(
+            cluster.voters_of(leader).len(),
+            2,
+            "the cluster shrank to 2 voters"
+        );
+        assert_eq!(cluster.leaders().len(), 1, "still exactly one leader");
+    }
+
     /// Promote a candidate-free node directly to leader for the Figure-8 unit test:
     /// seat a full vote tally and run the engine's own promotion path so
     /// `next_index`/`match_index` initialize per Figure 2 and the election no-op is
@@ -3710,6 +4703,511 @@ mod tests {
             node.leader_id(),
             Some(NodeId(2)),
             "the new term's accepted leader is recorded after the step-down"
+        );
+    }
+
+    // =====================================================================
+    // 3d: RAFT CLUSTER-MEMBERSHIP (single-server changes + learners, section 6).
+    //
+    // Engine-direct unit tests pinning the membership rules (append-time config
+    // adoption, majority math over the current voter set, learner exclusion,
+    // one-change-in-flight, persisted-config-survives-restart). The DST
+    // membership-safety GATE (no two leaders mid-reconfiguration under partition,
+    // across many seeds) lives further below with the other DST sweeps.
+    // =====================================================================
+
+    /// Drive a single-voter node to leadership (it self-elects instantly), returning it
+    /// ready to propose. Used by the membership unit tests that grow a cluster from 1.
+    fn leader_single_voter(id: NodeId) -> RaftNode<MemStorage> {
+        let voters: BTreeSet<NodeId> = [id].into_iter().collect();
+        let mut node = RaftNode::new(id, voters, MemStorage::new(), RaftConfig::default());
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.start(now, &mut rng, &mut Effects::new());
+        node.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut Effects::new());
+        assert!(node.is_leader(), "single voter self-elects");
+        node
+    }
+
+    /// Propose a membership change directly on an engine (test helper), returning the
+    /// verdict. Drains nothing (the test inspects state, not the wire).
+    fn propose_member(node: &mut RaftNode<MemStorage>, change: MembershipChange) -> Option<u64> {
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.propose_membership_change(change, now, &mut rng, &mut Effects::new())
+    }
+
+    #[test]
+    fn add_voter_adopts_config_on_append_and_updates_majority() {
+        // A 1-voter leader appends AddVoter(2): it adopts {1,2} ON APPEND (section 6),
+        // BEFORE the entry commits. The majority needed jumps from 1 to 2 at once.
+        let mut node = leader_single_voter(NodeId(1));
+        assert_eq!(node.voters(), &[NodeId(1)].into_iter().collect());
+        // Before the change, the single voter has committed its own appends (majority 1).
+        let idx = propose_member(&mut node, MembershipChange::AddVoter(NodeId(2)))
+            .expect("leader accepts the membership change");
+        assert!(idx >= 1);
+        // APPEND-TIME ADOPTION: the voter set is {1,2} immediately, not after commit.
+        assert_eq!(
+            node.voters(),
+            &[NodeId(1), NodeId(2)].into_iter().collect(),
+            "the new voter is adopted on append (section 6)"
+        );
+        // The AddVoter entry is NOT yet committed: NodeId(2) is unreachable in this unit
+        // test, so a 2-voter majority cannot form. commit_index must NOT have advanced to
+        // include the AddVoter entry (the majority math now needs 2, and only the leader
+        // has it).
+        assert!(
+            node.commit_index() < idx,
+            "the AddVoter entry is uncommitted (needs the new 2-voter majority)"
+        );
+    }
+
+    #[test]
+    fn remove_voter_adopts_config_on_append() {
+        // A 3-voter leader removes a peer; on append it adopts the 2-voter config and the
+        // remaining-2 majority (2) governs subsequent commits.
+        let voters: BTreeSet<NodeId> = (1..=3).map(NodeId).collect();
+        let mut node = RaftNode::new(NodeId(1), voters, MemStorage::new(), RaftConfig::default());
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.start(now, &mut rng, &mut Effects::new());
+        // Force leadership at term 1 with a self-vote majority is awkward here; drive an
+        // election and grant from peers directly.
+        node.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut Effects::new());
+        node.on_message(
+            now,
+            &mut rng,
+            NodeId(2),
+            RaftMsg::RequestVoteResp {
+                term: node.current_term(),
+                vote_granted: true,
+            },
+            &mut Effects::new(),
+        );
+        assert!(node.is_leader(), "won with 2 of 3 votes");
+        propose_member(&mut node, MembershipChange::RemoveVoter(NodeId(3)))
+            .expect("leader accepts the removal");
+        assert_eq!(
+            node.voters(),
+            &[NodeId(1), NodeId(2)].into_iter().collect(),
+            "the removed voter is dropped on append (section 6)"
+        );
+    }
+
+    #[test]
+    fn learner_is_added_replicated_to_but_excluded_from_majority() {
+        // AddLearner(2) puts 2 in the learner set, NOT the voter set: the single voter
+        // remains the whole majority, so the AddLearner entry commits at once (a learner
+        // never gates commit). A subsequent client entry also commits with majority 1.
+        let mut node = leader_single_voter(NodeId(1));
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        let mut out = Effects::new();
+        let idx = node
+            .propose_membership_change(
+                MembershipChange::AddLearner(NodeId(2)),
+                now,
+                &mut rng,
+                &mut out,
+            )
+            .expect("leader accepts AddLearner");
+        assert_eq!(node.learners(), &[NodeId(2)].into_iter().collect());
+        assert_eq!(
+            node.voters(),
+            &[NodeId(1)].into_iter().collect(),
+            "a learner is NOT a voter"
+        );
+        // The learner does not gate commit: the lone voter is still a majority, so the
+        // AddLearner entry committed immediately.
+        assert!(
+            node.commit_index() >= idx,
+            "AddLearner commits at once (learner excluded from majority)"
+        );
+        // The leader DOES replicate to the learner: a broadcast addresses NodeId(2).
+        let addressed_learner = out.sends.iter().any(|(to, _)| *to == NodeId(2));
+        assert!(
+            addressed_learner,
+            "the leader replicates to the learner (AppendEntries addressed to it)"
+        );
+    }
+
+    #[test]
+    fn promote_learner_moves_it_into_the_voter_set() {
+        let mut node = leader_single_voter(NodeId(1));
+        propose_member(&mut node, MembershipChange::AddLearner(NodeId(2))).expect("AddLearner");
+        // Pretend the learner caught up (set its match_index to the leader's last index),
+        // so promotion is reasonable; the engine permits promotion regardless (safe).
+        let last = node.storage().last_log_index();
+        node.match_index.insert(NodeId(2), last);
+        assert!(
+            node.learner_caught_up(NodeId(2)),
+            "the learner is within the catch-up lag gate"
+        );
+        propose_member(&mut node, MembershipChange::PromoteLearner(NodeId(2)))
+            .expect("PromoteLearner");
+        assert_eq!(
+            node.voters(),
+            &[NodeId(1), NodeId(2)].into_iter().collect(),
+            "the promoted learner is now a voter"
+        );
+        assert!(
+            node.learners().is_empty(),
+            "the promoted learner left the learner set"
+        );
+    }
+
+    #[test]
+    fn only_one_membership_change_in_flight() {
+        // The section-6 one-change-in-flight rule: while an AddVoter is uncommitted (the
+        // new voter is unreachable here, so it cannot commit), a SECOND membership change
+        // is REFUSED. A non-membership client proposal is still accepted (only membership
+        // is gated).
+        let mut node = leader_single_voter(NodeId(1));
+        propose_member(&mut node, MembershipChange::AddVoter(NodeId(2)))
+            .expect("first change accepted");
+        // The AddVoter is uncommitted (needs the new 2-voter majority, which cannot form).
+        assert!(node.membership_change_in_flight());
+        let second = propose_member(&mut node, MembershipChange::AddVoter(NodeId(3)));
+        assert_eq!(
+            second, None,
+            "a second membership change is refused while one is in flight"
+        );
+        // A plain client entry is NOT gated by the membership-in-flight rule.
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        let client = node.propose(
+            EntryPayload::Bytes(vec![9]),
+            now,
+            &mut rng,
+            &mut Effects::new(),
+        );
+        assert!(
+            client.is_some(),
+            "a non-membership proposal is still accepted"
+        );
+    }
+
+    #[test]
+    fn a_learner_does_not_start_elections() {
+        // A node whose own log-derived config makes it a LEARNER (here: it is in neither
+        // its voters nor... actually a learner) must not campaign on an election timeout.
+        // We seed a node that is not a voter in its own config and confirm a timeout does
+        // not make it a candidate or inflate the term.
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        // NodeId(3) is NOT in its own seed config (a joining node before it learns it is a
+        // voter): it must not start elections (it cannot win and would only churn terms).
+        let mut joiner = RaftNode::new(NodeId(3), voters, MemStorage::new(), RaftConfig::default());
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        joiner.start(now, &mut rng, &mut Effects::new());
+        let term_before = joiner.current_term();
+        joiner.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut Effects::new());
+        assert_eq!(
+            joiner.role(),
+            Role::Follower,
+            "a non-voter does not become a candidate on timeout"
+        );
+        assert_eq!(
+            joiner.current_term(),
+            term_before,
+            "a non-voter does not inflate the term"
+        );
+    }
+
+    #[test]
+    fn a_learner_vote_does_not_count_toward_the_election_quorum() {
+        // A candidate counts only votes FROM CURRENT-CONFIG VOTERS. We build a leader with
+        // voters {1,2} and a learner {3}; a granted vote from the learner must NOT count
+        // toward the 2-voter majority. Drive an election on NodeId(1) with voters {1,2}
+        // and learner {3}: a vote from learner 3 alone (plus self) is NOT a majority of
+        // voters (needs 2 voters, has only self=1 voter).
+        let mut node = leader_single_voter(NodeId(1));
+        // Grow to voters {1,2} + learner {3} via committed changes is heavy here; instead
+        // verify the counting helper directly: append AddVoter(2) + AddLearner is awkward
+        // without a reachable peer. So assert the rule via maybe_become_leader counting:
+        // make NodeId(1) a fresh candidate in a 3-config {1,2} voters + {3} learner.
+        // Simplest: a 2-voter candidate that only gets a learner's vote stays a candidate.
+        propose_member(&mut node, MembershipChange::AddVoter(NodeId(2))).expect("AddVoter(2)");
+        // Now config is voters {1,2} (adopted on append; AddVoter is uncommitted as 2 is
+        // unreachable). Re-campaign by hand-seating candidate state, then assert the
+        // counting rule: a 2-voter config needs 2 VOTER votes; a learner's vote never tips.
+        node.role = Role::Candidate;
+        node.votes.clear();
+        node.votes.insert(NodeId(1));
+        node.maybe_become_leader(&mut Effects::new());
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "a single voter-vote is not a majority of the 2-voter config"
+        );
+        // A vote from a NON-voter (e.g. learner id 3) must not tip it over.
+        node.votes.insert(NodeId(3));
+        node.maybe_become_leader(&mut Effects::new());
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "a learner's vote does not count toward the voter majority"
+        );
+        // A genuine second VOTER vote wins.
+        node.votes.insert(NodeId(2));
+        node.maybe_become_leader(&mut Effects::new());
+        assert_eq!(node.role(), Role::Leader, "two voter-votes is a majority");
+    }
+
+    #[test]
+    fn membership_config_survives_restart_via_log() {
+        // A node's voter set is DERIVED FROM THE LOG, so it must recover across a restart.
+        // Build a single-voter leader, commit AddLearner(2) (commits at once), crash
+        // (extract storage), rebuild on it: the recovered node re-derives {learner 2} from
+        // the surviving log (no snapshot here, so the whole log is replayed).
+        let mut node = leader_single_voter(NodeId(1));
+        propose_member(&mut node, MembershipChange::AddLearner(NodeId(2))).expect("AddLearner");
+        assert_eq!(node.learners(), &[NodeId(2)].into_iter().collect());
+        let RaftNode { storage, .. } = node;
+        let voters: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let restored =
+            RaftNode::<MemStorage>::new(NodeId(1), voters, storage, RaftConfig::default());
+        assert_eq!(
+            restored.learners(),
+            &[NodeId(2)].into_iter().collect(),
+            "the learner config is re-derived from the surviving log on restart"
+        );
+        assert_eq!(
+            restored.voters(),
+            &[NodeId(1)].into_iter().collect(),
+            "the voter set is re-derived from the log on restart"
+        );
+    }
+
+    #[test]
+    fn membership_config_survives_restart_via_snapshot() {
+        // With compaction ON, the AddLearner entry is compacted away; the config baseline
+        // persisted beside the snapshot is what a restart restores the config from. A
+        // single-voter leader proposes enough entries to cross the threshold + compact,
+        // then crashes and rebuilds: the recovered config must still show the learner even
+        // though its ConfigChange entry was compacted out of the log.
+        let config = RaftConfig {
+            snapshot_threshold: 2,
+            ..RaftConfig::default()
+        };
+        let voters: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let mut node = RaftNode::new(NodeId(1), voters.clone(), MemStorage::new(), config);
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.start(now, &mut rng, &mut Effects::new());
+        node.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut Effects::new());
+        // AddLearner(2) commits at once (single voter majority), adopting {learner 2}.
+        propose_member(&mut node, MembershipChange::AddLearner(NodeId(2))).expect("AddLearner");
+        // Pile on plain entries to cross the snapshot threshold and trigger compaction past
+        // the AddLearner index.
+        for tag in 0..6u8 {
+            node.propose(
+                EntryPayload::Bytes(vec![tag]),
+                now,
+                &mut rng,
+                &mut Effects::new(),
+            );
+        }
+        assert!(
+            node.storage().log_start_index() > 1,
+            "the log compacted past the AddLearner entry"
+        );
+        assert!(
+            node.storage().load_config_baseline().is_some(),
+            "the config baseline was persisted beside the snapshot"
+        );
+        // CRASH + RESTART on the same storage.
+        let RaftNode { storage, .. } = node;
+        let restored = RaftNode::new(NodeId(1), voters, storage, config);
+        assert_eq!(
+            restored.learners(),
+            &[NodeId(2)].into_iter().collect(),
+            "the learner config is restored from the persisted snapshot baseline"
+        );
+    }
+
+    #[test]
+    fn compaction_baseline_excludes_an_uncommitted_configchange_then_reverts_on_truncation() {
+        // FIX1 REGRESSION (HA-3d): compaction must capture the COMMITTED config as of the
+        // snapshot point, NOT the live `self.voters` (which adopts UNCOMMITTED ConfigChange
+        // entries on append). A follower holds an uncommitted AddVoter ABOVE last_applied
+        // when compaction fires; that entry is later truncated (it was on a deposed
+        // leader's log). The node's config MUST revert to exclude the truncated voter.
+        //
+        // OLD CODE: baseline = self.voters = {1,2} (folds the uncommitted AddVoter at idx 4)
+        // -> after truncation, recompute = {1,2} + empty tail = {1,2}: the change is NEVER
+        // un-adopted (the baseline is the recompute floor) -> WRONG majority. This test
+        // FAILS on the old code (final voters {1,2}) and PASSES on the fixed code ({1}).
+        let config = RaftConfig {
+            snapshot_threshold: 2,
+            ..RaftConfig::default()
+        };
+        let voters: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let mut node = RaftNode::new(NodeId(1), voters.clone(), MemStorage::new(), config);
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.start(now, &mut rng, &mut Effects::new());
+
+        // A term-1 leader (NodeId(9)) ships four entries: plain entries at 1..=3 and an
+        // AddVoter(2) ConfigChange at index 4, but advertises leader_commit = 3. So the
+        // follower COMMITS only 1..=3 (AddVoter at 4 stays UNCOMMITTED) yet ADOPTS {1,2}
+        // on append (append-time adoption). last_applied advances to 3, crossing the
+        // snapshot threshold (3 entries above the empty snapshot > 2), so compaction fires
+        // at last_included_index = 3 WHILE the uncommitted AddVoter sits at index 4.
+        let entries = vec![
+            LogEntry {
+                term: 1,
+                index: 1,
+                payload: EntryPayload::Bytes(vec![1]),
+            },
+            LogEntry {
+                term: 1,
+                index: 2,
+                payload: EntryPayload::Bytes(vec![2]),
+            },
+            LogEntry {
+                term: 1,
+                index: 3,
+                payload: EntryPayload::Bytes(vec![3]),
+            },
+            LogEntry {
+                term: 1,
+                index: 4,
+                payload: EntryPayload::ConfigChange(MembershipChange::AddVoter(NodeId(2))),
+            },
+        ];
+        node.on_message(
+            now,
+            &mut rng,
+            NodeId(9),
+            RaftMsg::AppendEntries {
+                term: 1,
+                leader: NodeId(9),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 3,
+            },
+            &mut Effects::new(),
+        );
+        // Append-time adoption took {1,2}, but only 1..=3 are committed.
+        assert_eq!(
+            node.voters(),
+            &[NodeId(1), NodeId(2)].into_iter().collect(),
+            "the follower adopts the uncommitted AddVoter on append"
+        );
+        assert_eq!(node.commit_index(), 3, "only entries 1..=3 are committed");
+        assert!(
+            node.storage().log_start_index() > 3,
+            "compaction fired at the committed/applied watermark (index 3)"
+        );
+        // THE FIX: the persisted baseline is the COMMITTED config at index 3 ({1}), NOT the
+        // live voters ({1,2}). On the old code this baseline would (wrongly) be {1,2}.
+        assert_eq!(
+            node.storage().load_config_baseline(),
+            Some(([NodeId(1)].into_iter().collect(), BTreeSet::new())),
+            "the saved baseline is the COMMITTED config at the snapshot point (excludes the \
+             uncommitted AddVoter)"
+        );
+
+        // The term-1 leader is deposed. A term-2 leader (NodeId(8)) re-replicates index 4
+        // with a DIFFERENT (term-2) entry that is NOT a ConfigChange: prev = (3, term 1)
+        // still matches the follower's surviving entry at 3, so the consistency check
+        // passes; the conflicting index-4 entry TRUNCATES the AddVoter and appends a plain
+        // entry. After truncation the surviving log carries NO ConfigChange.
+        node.on_message(
+            now,
+            &mut rng,
+            NodeId(8),
+            RaftMsg::AppendEntries {
+                term: 2,
+                leader: NodeId(8),
+                prev_log_index: 3,
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    term: 2,
+                    index: 4,
+                    payload: EntryPayload::Bytes(vec![44]),
+                }],
+                leader_commit: 3,
+            },
+            &mut Effects::new(),
+        );
+        // THE HEADLINE: the config REVERTS to exclude the truncated AddVoter. With the bug
+        // (baseline {1,2}) this would still report {1,2} -> wrong majority forever.
+        assert_eq!(
+            node.voters(),
+            &[NodeId(1)].into_iter().collect(),
+            "the truncated AddVoter is un-adopted: config reverts to the committed baseline"
+        );
+        assert!(
+            node.learners().is_empty(),
+            "no spurious learners survive the truncation"
+        );
+    }
+
+    #[test]
+    fn leader_removing_itself_steps_down_after_the_entry_commits() {
+        // A 3-voter leader removes ITSELF: on append it adopts the new 2-voter config
+        // {2,3}; the removing entry commits on the NEW-config majority (2 of {2,3}); once
+        // committed, the leader (no longer a voter) STEPS DOWN (section 6). We drive the
+        // two remaining voters' acks directly so the removal commits, then check step-down.
+        let voters: BTreeSet<NodeId> = (1..=3).map(NodeId).collect();
+        let mut node = RaftNode::new(NodeId(1), voters, MemStorage::new(), RaftConfig::default());
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.start(now, &mut rng, &mut Effects::new());
+        node.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut Effects::new());
+        node.on_message(
+            now,
+            &mut rng,
+            NodeId(2),
+            RaftMsg::RequestVoteResp {
+                term: node.current_term(),
+                vote_granted: true,
+            },
+            &mut Effects::new(),
+        );
+        assert!(node.is_leader(), "won with 2 of 3 votes");
+        // The leader proposes its own removal; on append the config is {2,3}.
+        let removal_idx = node
+            .propose_membership_change(
+                MembershipChange::RemoveVoter(NodeId(1)),
+                now,
+                &mut rng,
+                &mut Effects::new(),
+            )
+            .expect("leader proposes its own removal");
+        assert_eq!(
+            node.voters(),
+            &[NodeId(2), NodeId(3)].into_iter().collect(),
+            "on append the leader adopts the new 2-voter config (without itself)"
+        );
+        assert!(node.is_leader(), "still leader until the removal COMMITS");
+        // The two remaining voters ack up to the removal entry: that is a NEW-config
+        // majority (2 of {2,3}), so the removal commits and the leader steps down.
+        for peer in [NodeId(2), NodeId(3)] {
+            node.on_message(
+                now,
+                &mut rng,
+                peer,
+                RaftMsg::AppendEntriesResp {
+                    term: node.current_term(),
+                    success: true,
+                    match_index: removal_idx,
+                },
+                &mut Effects::new(),
+            );
+        }
+        assert!(
+            node.commit_index() >= removal_idx,
+            "the removal entry committed on the new-config majority"
+        );
+        assert_eq!(
+            node.role(),
+            Role::Follower,
+            "a leader that committed its own removal steps down (section 6)"
         );
     }
 
