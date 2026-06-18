@@ -74,6 +74,15 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// [`Runtime::timer`] seam, never wall-clock (ADR-0003).
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a parked propose (local or forwarded) waits for its entry to COMMIT before the run loop
+/// resolves it `NotLeader` (HA-prod-commit-ack). Because the engine has no check-quorum leader
+/// lease, an isolated minority leader never advances commit and never sees a higher term, so without
+/// this bound a parked ack would hang the caller for the entire partition. Generous relative to a
+/// healthy commit (one replication round-trip, sub-millisecond) so it almost never fires on a live
+/// majority; on expiry the idempotent caller retries. Measured through the [`Runtime::timer`] seam,
+/// never wall-clock (ADR-0003).
+const PROPOSE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub mod codec;
 pub use codec::{decode_raft_msg, encode_raft_msg};
 
@@ -149,6 +158,20 @@ pub enum Event {
     ForwardTimeout {
         /// The correlation id of the forward whose deadline elapsed.
         corr: u64,
+    },
+    /// A parked propose (local or forwarded) has exceeded [`PROPOSE_COMMIT_TIMEOUT`] without its
+    /// entry committing. The engine has NO check-quorum step-down, so an isolated minority leader
+    /// would otherwise never resolve a parked ack (no commit, no higher-term message) and hang the
+    /// caller for the whole partition. This bounds that wait: if the entry at `index` is still
+    /// parked under `term`, resolve it `None` (the idempotent caller retries). An entry that already
+    /// committed / overwrote / re-armed under a different term is absent or term-mismatched, so the
+    /// fire is a no-op.
+    ProposeCommitTimeout {
+        /// The log index of the parked entry whose deadline elapsed.
+        index: u64,
+        /// The term the entry was parked under (guards against a reused index resolving a fresh
+        /// parked entry).
+        term: u64,
     },
 }
 
@@ -510,6 +533,12 @@ where
                         let _ = ack.send(None);
                     }
                 }
+                Event::ProposeCommitTimeout { index, term } => {
+                    // HA-prod-commit-ack: a parked propose exceeded PROPOSE_COMMIT_TIMEOUT without
+                    // committing (an isolated minority leader). Resolve it NotLeader if still parked
+                    // under the same term. No engine step, so no effects.
+                    self.on_propose_commit_timeout(index, term).await;
+                }
             }
             // HA-prod-commit-ack: capture the commit high-water this step reached BEFORE
             // the effects are drained (drain consumes them by value), then resolve any
@@ -561,6 +590,9 @@ where
                     let term = self.raft.current_term();
                     self.pending_commits
                         .insert(index, PendingCommit { term, ack });
+                    // Bound the wait: an isolated minority leader never commits this entry and
+                    // never sees a higher term, so without a timeout the ack would hang forever.
+                    self.arm_propose_commit_timeout(index, term);
                 }
                 // propose() returned None (not leader after all -- a race the is_leader()
                 // guard makes unlikely, but handle it): nothing landed, so NotLeader now.
@@ -639,6 +671,10 @@ where
                         corr,
                     },
                 );
+                // Bound the wait so a forwarded entry that never commits (minority leader) does
+                // not leak the parked result indefinitely; on expiry the origin is told NotLeader
+                // (it also has its own FORWARD_TIMEOUT, so it never hangs regardless).
+                self.arm_propose_commit_timeout(index, term);
                 return;
             }
             // propose() returned None despite being leader (e.g. a one-change-in-flight
@@ -683,21 +719,39 @@ where
     /// Monotone + leak-free: an entry is removed the first time either pass settles it, so
     /// each ack fires exactly once and the maps never retain a settled entry.
     async fn resolve_pending_commits(&mut self, committed_through: Option<u64>) {
-        // Pass 1: COMMIT everything at-or-below the new high-water.
+        // Pass 1: COMMIT everything at-or-below the new high-water -- but ONLY if OUR entry
+        // (the one we parked, identified by its term) is the entry that actually committed at
+        // that index. A partition-heal can, in a SINGLE AppendEntries step, truncate our
+        // uncommitted term-T entry, append a DIFFERENT entry there in a higher term, AND
+        // advance commit past the index (when leader_commit covers it) -- all before this node
+        // steps down. Acking Committed blindly would then report a FALSE commit for a proposal
+        // that was discarded. So gate each pass-1 ack on `entry_overwritten`: if the index now
+        // holds a different term, OUR proposal lost the index -> fail it `None` (the idempotent
+        // caller retries); only the genuinely-still-ours entry acks `Some(index)`.
         if let Some(hi) = committed_through {
-            // Local proposals: split off the committed prefix [..=hi] and ack each.
+            // Local proposals: split off the committed prefix [..=hi] and settle each.
             let mut committed = self.pending_commits.split_off(&(hi + 1));
             core::mem::swap(&mut committed, &mut self.pending_commits);
             for (index, pending) in committed {
-                let _ = pending.ack.send(Some(index));
+                let outcome = if self.entry_overwritten(index, pending.term) {
+                    None
+                } else {
+                    Some(index)
+                };
+                let _ = pending.ack.send(outcome);
             }
-            // Forwarded proposals: same, but ship a ForwardProposeResult to the origin.
+            // Forwarded proposals: same term-gated settlement, shipped to the origin.
             let mut committed_fwd = self.pending_forward_results.split_off(&(hi + 1));
             core::mem::swap(&mut committed_fwd, &mut self.pending_forward_results);
             for (index, pending) in committed_fwd {
+                let outcome = if self.entry_overwritten(index, pending.term) {
+                    None
+                } else {
+                    Some(index)
+                };
                 let msg = RaftMsg::ForwardProposeResult {
                     corr: pending.corr,
-                    outcome: Some(index),
+                    outcome,
                 };
                 self.send_to_peer(pending.origin, &msg).await;
             }
@@ -745,6 +799,51 @@ where
     /// resolved by pass 1 and removed, so it is never re-examined here).
     fn entry_overwritten(&self, index: u64, parked_term: u64) -> bool {
         self.raft.storage().term_at(index) != parked_term
+    }
+
+    /// Arm the bounded [`PROPOSE_COMMIT_TIMEOUT`] for a freshly parked propose at `index` (appended
+    /// under `term`). On expiry it posts [`Event::ProposeCommitTimeout`], which resolves the entry
+    /// `NotLeader` if it is still parked under the same term (HA-prod-commit-ack: the engine has no
+    /// check-quorum step-down, so an entry that never commits would otherwise hang the caller for the
+    /// whole partition). Mirrors the [`FORWARD_TIMEOUT`] arming; the closed-inbox / already-resolved
+    /// cases make the fire a harmless no-op.
+    fn arm_propose_commit_timeout(&self, index: u64, term: u64) {
+        let tx = self.inbox_tx.clone();
+        let rt = self.rt.clone();
+        self.rt.spawn_on_shard(async move {
+            rt.timer(PROPOSE_COMMIT_TIMEOUT).await;
+            let _ = tx.send(Event::ProposeCommitTimeout { index, term });
+        });
+    }
+
+    /// Resolve a parked propose whose [`PROPOSE_COMMIT_TIMEOUT`] elapsed (HA-prod-commit-ack). If the
+    /// entry at `index` is still parked under `term` (it did not commit, overwrite, or re-arm under a
+    /// new term in the meantime) resolve it `NotLeader`: locally by acking `None`, or for a forward by
+    /// shipping `ForwardProposeResult { None }` to the origin. A term mismatch / absent entry (already
+    /// settled) is a no-op.
+    async fn on_propose_commit_timeout(&mut self, index: u64, term: u64) {
+        if self
+            .pending_commits
+            .get(&index)
+            .is_some_and(|p| p.term == term)
+        {
+            if let Some(pending) = self.pending_commits.remove(&index) {
+                let _ = pending.ack.send(None);
+            }
+        }
+        if self
+            .pending_forward_results
+            .get(&index)
+            .is_some_and(|p| p.term == term)
+        {
+            if let Some(pending) = self.pending_forward_results.remove(&index) {
+                let msg = RaftMsg::ForwardProposeResult {
+                    corr: pending.corr,
+                    outcome: None,
+                };
+                self.send_to_peer(pending.origin, &msg).await;
+            }
+        }
     }
 
     /// Drain one step's [`Effects`]: arm/cancel timers first, then send messages
@@ -1622,6 +1721,84 @@ mod tests {
             assert!(
                 node.pending_commits.is_empty(),
                 "the failed ack must be removed (no leak)"
+            );
+        });
+    }
+
+    /// REGRESSION (review C1): pass 1 must NOT ack `Committed` for a parked index whose entry was
+    /// OVERWRITTEN, even when commit advances PAST that index in the same step. A partition-heal can
+    /// truncate this leader's uncommitted term-T entry, append + commit a DIFFERENT entry at the
+    /// index, all before it steps down. We park an ack at an index the log does not hold at the
+    /// parked term, then resolve with `committed_through` COVERING it (the pass-1 path): it must
+    /// resolve `None` (our proposal was discarded), NOT a false `Some(index)`.
+    #[test]
+    fn pass1_commit_for_overwritten_index_resolves_not_leader() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut node, _handle) = lone_voter_node();
+            drive_to_leader(&mut node);
+
+            // Park at index 999 / term 7; term_at(999) reads 0 (past the log end) != 7, so the
+            // entry is "overwritten". committed_through COVERS 999, so pass 1 (not pass 2) handles
+            // it: before the fix pass 1 blindly acked Some(999) (the false commit); the term guard
+            // now fails it None.
+            let (tx, rx) = oneshot::channel();
+            node.pending_commits
+                .insert(999, PendingCommit { term: 7, ack: tx });
+            node.resolve_pending_commits(Some(999)).await;
+            let outcome = rx.await.expect("the parked ack must resolve");
+            assert_eq!(
+                outcome, None,
+                "a committed-past but OVERWRITTEN parked index must resolve NotLeader, not a false Some(index)"
+            );
+            assert!(
+                node.pending_commits.is_empty(),
+                "the failed ack must be removed (no leak)"
+            );
+        });
+    }
+
+    /// REGRESSION (review HIGH): a parked propose that never commits (an isolated minority leader,
+    /// which the engine never steps down via check-quorum) is bounded by `PROPOSE_COMMIT_TIMEOUT`.
+    /// `on_propose_commit_timeout` resolves the still-parked entry `NotLeader`; a term-mismatched
+    /// fire (the index was re-parked under a new term) is a no-op.
+    #[test]
+    fn parked_propose_times_out_to_not_leader() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut node, _handle) = lone_voter_node();
+            drive_to_leader(&mut node);
+
+            // Park an ack at index 5 / term 3 (an entry that does not commit in this test).
+            let (tx, rx) = oneshot::channel();
+            node.pending_commits
+                .insert(5, PendingCommit { term: 3, ack: tx });
+
+            // A term-MISMATCHED timeout fire is a no-op (the slot was re-parked under a new term).
+            node.on_propose_commit_timeout(5, 99).await;
+            assert!(
+                node.pending_commits.contains_key(&5),
+                "a term-mismatched timeout must not resolve the entry"
+            );
+
+            // The matching timeout resolves the parked ack NotLeader.
+            node.on_propose_commit_timeout(5, 3).await;
+            let outcome = rx.await.expect("the parked ack must resolve on timeout");
+            assert_eq!(
+                outcome, None,
+                "a parked propose that times out without committing resolves NotLeader"
+            );
+            assert!(
+                node.pending_commits.is_empty(),
+                "the timed-out ack must be removed (no leak)"
             );
         });
     }
