@@ -1866,11 +1866,17 @@ async fn try_raft_cluster_mutator(
             handle.propose(cmd).await,
             ironcache_server::ProposeOutcome::NotLeader
         ) {
-            // Not the leader: redirect. Include the best-effort leader hint when known (HA-4c
-            // surfaces none yet, so this is a bare retry signal today).
+            // No leader reachable (no leader recognized, or a forward to the leader timed out;
+            // with HA-9 forwarding a follower normally COMMITS transparently, so this is the
+            // genuine no-leader / timeout case). Include the leader hint when known. NOTE the hint
+            // is the leader's CLUSTER-BUS endpoint (host:port+10000), not its client port, so the
+            // message labels it as such rather than presenting it as a dial-able client target;
+            // resolving the leader's client endpoint here is a tracked follow-up.
             let msg = match handle.leader_hint() {
                 Some(addr) => {
-                    format!("The cluster leader is {addr}; retry the CLUSTER write there")
+                    format!(
+                        "the raft leader's cluster-bus endpoint is {addr}; retry the CLUSTER write against the leader"
+                    )
                 }
                 None => {
                     "this node is not the raft leader; retry the CLUSTER write against the leader"

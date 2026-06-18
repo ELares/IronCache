@@ -344,3 +344,167 @@ fn cluster_elects_commits_and_a_restarted_follower_catches_up() {
         node.stop();
     }
 }
+
+/// HA-9 LEADER-FORWARDING over real TCP: a `propose()` issued to a FOLLOWER is transparently
+/// forwarded to the leader, commits, and applies on EVERY node (so a follower no longer has to
+/// be the leader for a proposal to land). This is the headline property forwarding unlocks.
+#[test]
+fn follower_propose_forwards_to_leader_commits_and_converges() {
+    let timeout = Duration::from_secs(10);
+
+    let addrs: BTreeMap<NodeId, SocketAddr> = [N1, N2, N3]
+        .into_iter()
+        .map(|id| (id, format!("127.0.0.1:{}", free_port()).parse().unwrap()))
+        .collect();
+    let peers = peer_maps(&addrs);
+
+    let ids = [N1, N2, N3];
+    let mut nodes: Vec<RunningNode> = ids
+        .iter()
+        .map(|&id| spawn_node(id, addrs[&id], peers[&id].clone()))
+        .collect();
+
+    // Elect a leader, then pick a FOLLOWER. Also confirm the follower has LEARNED the leader
+    // (its status `leader_id` resolves to the elected leader) so the forward has a target; this
+    // is the surfaced engine `leader_id` the forwarding path routes on.
+    let leader_idx = poll_until(timeout, || unique_leader(&nodes))
+        .expect("a unique leader must be elected within the timeout");
+    let leader_id = nodes[leader_idx].handle.id();
+    let follower_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let learned = poll_until(timeout, || {
+        (nodes[follower_idx].status().leader_id == Some(leader_id)).then_some(())
+    });
+    assert!(
+        learned.is_some(),
+        "the follower must learn (recognize) the leader before forwarding; leader_id = {:?}",
+        nodes[follower_idx].status().leader_id
+    );
+
+    // Propose ON THE FOLLOWER. With forwarding, this returns Some(index): the follower forwarded
+    // the entry to the leader, which appended + replicated it.
+    let want = EntryPayload::Bytes(b"ha-9-follower-forward".to_vec());
+    let proposed_index = propose_on(&nodes[follower_idx].handle, want.clone())
+        .expect("a follower propose must FORWARD to the leader and return the committed index");
+    assert!(proposed_index >= 1, "a proposed index is 1-based");
+
+    // Every node applies through the forwarded entry's index.
+    let converged = poll_until(timeout, || {
+        nodes
+            .iter()
+            .all(|n| n.status().last_applied >= proposed_index)
+            .then_some(())
+    });
+    assert!(
+        converged.is_some(),
+        "all nodes must apply the forwarded entry through index {proposed_index}; got {:?}",
+        nodes
+            .iter()
+            .map(|n| n.status().last_applied)
+            .collect::<Vec<_>>()
+    );
+
+    // The committed entry at the forwarded index is OUR payload on every node.
+    let applied: [Vec<LogEntry>; 3] = [
+        drain_applied(&mut nodes[0]),
+        drain_applied(&mut nodes[1]),
+        drain_applied(&mut nodes[2]),
+    ];
+    assert_converged(&applied, proposed_index, &want);
+
+    for mut node in nodes {
+        node.stop();
+    }
+}
+
+/// HA-9: a `propose()` on a node that recognizes NO leader returns `None` AT ONCE (no hang). A
+/// single node booted into a THREE-voter set can never reach a majority, so it never elects a
+/// leader and never learns one: its `leader_id` stays `None`. A propose there must resolve
+/// `None` promptly (the caller retries), not block waiting for a leader that will never appear.
+#[test]
+fn propose_with_no_known_leader_returns_none_without_hanging() {
+    let timeout = Duration::from_secs(10);
+
+    // Three configured voters, but we boot only ONE of them, with the other two as (unreachable)
+    // peers. With 1 of 3 alive there is no quorum: this node oscillates Follower/Candidate and
+    // never recognizes a leader.
+    let addrs: BTreeMap<NodeId, SocketAddr> = [N1, N2, N3]
+        .into_iter()
+        .map(|id| (id, format!("127.0.0.1:{}", free_port()).parse().unwrap()))
+        .collect();
+    let mut lone = spawn_node(N1, addrs[&N1], peers_excluding(&addrs, N1));
+
+    // It must NOT be (and stay not) a leader, and its leader_id stays None.
+    assert!(
+        !lone.status().is_leader(),
+        "a lone node in a 3-voter set must not win leadership"
+    );
+
+    // A propose must come back None well within the timeout (bounded, no hang). We measure the
+    // call returns at all (a hang would never return); the value is None (no leader to forward to).
+    let got = poll_until(timeout, || {
+        Some(propose_on(&lone.handle, EntryPayload::Noop))
+    });
+    assert_eq!(
+        got,
+        Some(None),
+        "a propose with no recognized leader must resolve None promptly, not hang"
+    );
+
+    lone.stop();
+}
+
+/// HA-9: the forward await is BOUNDED. After a leader is elected and a follower has learned it,
+/// we KILL a quorum (the leader + the other follower) so (a) no new leader can be elected and
+/// (b) the recognized leader is unreachable. A `propose()` on the surviving follower must still
+/// RETURN (resolving `None`) within a bounded time -- via the forward timeout if the forward was
+/// sent to the now-dead leader, or immediately once the survivor's own election clears its
+/// `leader_id`. The load-bearing assertion is "it returns, it does not hang".
+#[test]
+fn forward_to_partitioned_leader_returns_none_within_timeout_no_hang() {
+    let timeout = Duration::from_secs(10);
+
+    let addrs: BTreeMap<NodeId, SocketAddr> = [N1, N2, N3]
+        .into_iter()
+        .map(|id| (id, format!("127.0.0.1:{}", free_port()).parse().unwrap()))
+        .collect();
+    let peers = peer_maps(&addrs);
+
+    let ids = [N1, N2, N3];
+    let mut nodes: Vec<RunningNode> = ids
+        .iter()
+        .map(|&id| spawn_node(id, addrs[&id], peers[&id].clone()))
+        .collect();
+
+    let leader_idx = poll_until(timeout, || unique_leader(&nodes))
+        .expect("a unique leader must be elected within the timeout");
+    let leader_id = nodes[leader_idx].handle.id();
+    let survivor_idx = (0..3).find(|&i| i != leader_idx).unwrap();
+    let other_follower_idx = (0..3)
+        .find(|&i| i != leader_idx && i != survivor_idx)
+        .unwrap();
+
+    // The survivor must have learned the leader (so it would attempt a forward).
+    let learned = poll_until(timeout, || {
+        (nodes[survivor_idx].status().leader_id == Some(leader_id)).then_some(())
+    });
+    assert!(
+        learned.is_some(),
+        "the survivor must recognize the leader before we partition it"
+    );
+
+    // KILL the leader and the other follower: 2 of 3 dead -> no quorum -> the recognized leader is
+    // gone and no replacement can be elected. The survivor's forward target is now unreachable.
+    nodes[leader_idx].stop();
+    nodes[other_follower_idx].stop();
+
+    // A propose on the survivor MUST return (not hang): either the forward to the dead leader times
+    // out (FORWARD_TIMEOUT) and resolves None, or the survivor has since become a Candidate (its
+    // leader_id cleared) and resolves None immediately. Both are None; both are bounded.
+    let got = propose_on(&nodes[survivor_idx].handle, EntryPayload::Noop);
+    assert_eq!(
+        got, None,
+        "a forward to a partitioned-away leader must resolve None (bounded), never hang"
+    );
+
+    nodes[survivor_idx].stop();
+}

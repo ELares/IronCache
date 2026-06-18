@@ -635,6 +635,14 @@ async fn run_replica_control(
 /// data loss) or when there is no handle (defensive; raft-mode always has one). The proposal is
 /// fire-and-forget from this task's perspective: a `NotLeader` outcome just means we retry on the
 /// next outage tick; a committed promotion flips ownership cluster-wide via the fenced log.
+///
+/// HA-9 LEADER-FORWARDING is what makes this work from ANY in-sync replica, not just one that
+/// happens to be the raft leader: `handle.propose()` on a follower now transparently FORWARDS the
+/// `PromoteReplica` to the recognized leader, which proposes + commits it (the fenced owner flip
+/// then applies on every node). Before forwarding, a follower's propose returned `NotLeader` and
+/// self-promotion could only fire when the in-sync replica was itself the leader; now any in-sync
+/// replica can drive its own promotion. No logic change here is needed: the forward lives in the
+/// control-plane run loop behind this same `propose()` call.
 async fn maybe_propose_self_promotion(
     cluster: &ironcache_cluster::SlotMap,
     raft: Option<&ironcache_server::RaftHandle>,

@@ -8,16 +8,20 @@
 //! `cluster_slice2.rs` and the HA-4a `loopback_cluster.rs` proof). It then drives the cluster
 //! OVER REAL CLIENT SOCKETS:
 //!
-//!   1. FORMATION: a unique leader emerges (discovered over the wire: a CLUSTER write returns
-//!      `+OK` on the leader and `-CLUSTERDOWN` on a follower).
-//!   2. PROPOSE -> COMMIT -> CONVERGE: the leader MEETs its peers and claims the whole slot
+//!   1. FORMATION: a node that ACCEPTS a CLUSTER write emerges (discovered over the wire: until a
+//!      leader exists every node returns `-CLUSTERDOWN`; once one does, that node's writes commit).
+//!      The owning operations below are all issued through that SAME node, which becomes the
+//!      committed owner whether it is the physical raft leader or a follower forwarding to it.
+//!   2. PROPOSE -> COMMIT -> CONVERGE: that node MEETs its peers and claims the whole slot
 //!      space (`CLUSTER ADDSLOTSRANGE 0 16383`); every committed change converges, so ALL THREE
 //!      nodes' `CLUSTER SLOTS` reflect 16384 assigned and `CLUSTER INFO` shows
 //!      `cluster_state:ok` + `cluster_slots_assigned:16384`.
-//!   3. SERVE + MOVED: a key in a leader-owned slot is SET/GET-served on the leader; after the
-//!      leader SETSLOTs a specific slot to a peer (committed), a key in that slot returns
-//!      `-MOVED <slot> <peer host:port>`.
-//!   4. REDIRECT: proposing a CLUSTER write to a FOLLOWER returns `-CLUSTERDOWN`.
+//!   3. SERVE + MOVED: a key in an owned slot is SET/GET-served on the owner; after it SETSLOTs a
+//!      specific slot to a peer (committed), a key in that slot returns `-MOVED <slot> <peer
+//!      host:port>`.
+//!   4. HA-9 FORWARDING: a CLUSTER write issued to a FOLLOWER now returns `+OK` (the follower
+//!      transparently forwards the proposal to the leader, which commits it), NOT the old
+//!      `-CLUSTERDOWN` redirect. CLUSTER INFO still converges on all nodes.
 //!
 //! This is the PRODUCTION path (not the deterministic DST suite), so it polls with generous
 //! real-time timeouts and discovers the leader by behavior rather than asserting timing.
@@ -259,10 +263,12 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
 
         let env = SystemEnv::new();
 
-        // ---- (1) FORMATION + leader discovery over the wire. A CLUSTER write returns +OK on the
-        // leader and -CLUSTERDOWN on a follower; poll until exactly one node accepts. We probe
-        // with a MEET of a peer (a real, idempotent mutator) so discovery also begins forming the
-        // node table on the leader.
+        // ---- (1) FORMATION + writer discovery over the wire. Until a leader exists, EVERY node
+        // returns -CLUSTERDOWN; once one is elected its writes commit (+OK), and after HA-9 a
+        // follower that has learned the leader also returns +OK by forwarding. We poll until SOME
+        // node accepts and use it as the owner for every owning op below (it becomes the committed
+        // owner regardless of whether it is the physical leader). We probe with a MEET of a peer (a
+        // real, idempotent mutator) so discovery also begins forming the node table.
         let leader_idx = {
             let start = env.now();
             let mut found = None;
@@ -285,27 +291,40 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            found.expect("a unique leader must emerge and accept a CLUSTER write")
+            found.expect("a node must emerge that accepts a CLUSTER write")
         };
 
-        // Sanity: the OTHER two nodes reject a CLUSTER write with -CLUSTERDOWN (the redirect).
+        // HA-9: the OTHER two nodes are FOLLOWERS, and a CLUSTER write to a follower now COMMITS by
+        // FORWARDING to the leader (it returns +OK), instead of the old -CLUSTERDOWN redirect. Poll
+        // until each follower accepts (it must first learn the leader to forward to it); a MEET of
+        // the leader is idempotent, so re-trying is harmless.
         for i in 0..3 {
             if i == leader_idx {
                 continue;
             }
-            let reply = cmd(
-                &mut clients[i],
-                &[
-                    "CLUSTER",
-                    "MEET",
-                    "127.0.0.1",
-                    &ports[leader_idx].to_string(),
-                ],
-            )
-            .await;
+            let start = env.now();
+            let forwarded_ok = loop {
+                let reply = cmd(
+                    &mut clients[i],
+                    &[
+                        "CLUSTER",
+                        "MEET",
+                        "127.0.0.1",
+                        &ports[leader_idx].to_string(),
+                    ],
+                )
+                .await;
+                if reply.starts_with("+OK") {
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
             assert!(
-                reply.starts_with("-CLUSTERDOWN"),
-                "a follower must redirect a CLUSTER write with -CLUSTERDOWN, got {reply:?}"
+                forwarded_ok,
+                "HA-9: a follower must FORWARD a CLUSTER write to the leader and reply +OK"
             );
         }
 
@@ -432,16 +451,29 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
             "expected {expect_moved:?}, got {moved:?}"
         );
 
-        // ---- (4) REDIRECT: a CLUSTER write to a FOLLOWER returns -CLUSTERDOWN (already shown in
-        // step 1, re-asserted directly here against the chosen peer with a SETSLOT write).
-        let follower_reply = cmd(
-            &mut clients[peer_idx],
-            &["CLUSTER", "SETSLOT", "5", "NODE", ID0],
-        )
-        .await;
+        // ---- (4) HA-9 FORWARDING: a CLUSTER write to a FOLLOWER now COMMITS by forwarding to the
+        // leader (it replies +OK), repurposing the old "follower -> -CLUSTERDOWN" assertion. We
+        // assign slot 5 to ID0 through the FOLLOWER (peer_idx); the follower forwards the proposal
+        // to the leader, which commits it, so the write succeeds from any node. Poll until accepted
+        // (the follower must recognize the leader to forward; SETSLOT NODE is idempotent).
+        let start = env.now();
+        let follower_forward_ok = loop {
+            let reply = cmd(
+                &mut clients[peer_idx],
+                &["CLUSTER", "SETSLOT", "5", "NODE", ID0],
+            )
+            .await;
+            if reply.starts_with("+OK") {
+                break true;
+            }
+            if deadline_passed(&env, start, timeout) {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         assert!(
-            follower_reply.starts_with("-CLUSTERDOWN"),
-            "a follower must redirect a CLUSTER write with -CLUSTERDOWN, got {follower_reply:?}"
+            follower_forward_ok,
+            "HA-9: a CLUSTER write to a follower must FORWARD to the leader and reply +OK"
         );
     });
 

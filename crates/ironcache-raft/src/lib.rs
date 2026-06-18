@@ -361,6 +361,38 @@ pub enum RaftMsg {
         /// The opaque payload to append (the engine never interprets it).
         payload: EntryPayload,
     },
+    /// A FOLLOWER-TO-LEADER proposal FORWARD (HA-9 leader-forwarding). This is NOT a
+    /// consensus RPC and the pure engine never originates, consumes, or reacts to it:
+    /// it is a TRANSPORT-LEVEL request carried on the same cluster bus so a follower
+    /// can hand a [`ConfigCmd`] proposal (a CLUSTER write, or a replica's
+    /// self-promotion) to the node it recognizes as leader, instead of failing with a
+    /// bare redirect. The production adapter (`ironcache-raft-net`) intercepts it
+    /// BEFORE the engine, proposes locally on the leader, and replies
+    /// [`RaftMsg::ForwardProposeResult`]. The variant lives on `RaftMsg` only because
+    /// the wire codec and the cluster bus carry `RaftMsg` values; the engine's
+    /// [`on_message`](RaftNode::on_message) treats it (and the result) as an inert
+    /// no-op so no consensus decision or [`Effects`] ever depends on it.
+    ForwardPropose {
+        /// A correlation id, allocated by the forwarding follower (a monotonic run-loop
+        /// counter, never random), echoed back in the result so the follower matches
+        /// the reply to its pending await.
+        corr: u64,
+        /// The opaque payload to propose on the leader (the engine never interprets it).
+        payload: EntryPayload,
+    },
+    /// The LEADER-TO-FOLLOWER reply to a [`RaftMsg::ForwardPropose`] (HA-9). Like its
+    /// request, this is transport-level and inert to the pure engine. `outcome` is
+    /// `Some(index)` when the leader accepted the forwarded proposal (the assigned
+    /// 1-based log index, exactly as a local `Propose` ack reports) or `None` when the
+    /// recipient was NOT the leader (ONE-HOP rule: a non-leader that receives a
+    /// `ForwardPropose` does not chain it onward; it replies `None` and the origin
+    /// retries, by then knowing the new leader).
+    ForwardProposeResult {
+        /// The correlation id from the originating [`RaftMsg::ForwardPropose`].
+        corr: u64,
+        /// `Some(index)` if the leader accepted the forwarded proposal, else `None`.
+        outcome: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +790,17 @@ pub struct RaftNode<S: RaftStorage, M: StateMachine = CountingSm> {
     /// Votes received in the current term while a `Candidate` (includes self).
     /// Empty unless `role == Candidate`.
     votes: BTreeSet<NodeId>,
+    /// The leader THIS node currently recognizes for its term, if any (HA-9
+    /// leader-forwarding). This is a PASSIVE RECORD of information the engine already
+    /// observes - the AppendEntries sender it accepts, the higher-term step-down
+    /// sender, or self on winning - and is NEVER read by any vote / commit / append
+    /// decision or by any [`Effects`] computation. It exists so a follower can be told
+    /// (through the production adapter's status watch) WHICH peer to forward a proposal
+    /// to. Because it feeds no decision and changes no effect, every DST scenario
+    /// replays byte-identically with it present. Set when a current-term AppendEntries
+    /// is accepted, set to self on becoming leader, cleared on starting an election
+    /// (Candidate) and on the higher-term step-down (the new leader is not yet known).
+    leader_id: Option<NodeId>,
     /// Timing parameters.
     config: RaftConfig,
     /// Persistent state (term, vote, log).
@@ -825,6 +868,7 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             voters,
             role: Role::Follower,
             votes: BTreeSet::new(),
+            leader_id: None,
             config,
             storage,
             commit_index: 0,
@@ -861,6 +905,19 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.role == Role::Leader
+    }
+
+    /// The leader this node currently recognizes for its term, if any (HA-9
+    /// leader-forwarding). A PASSIVE record (see the `leader_id` field): it never
+    /// influences a decision, so reading it cannot perturb consensus. A leader returns
+    /// `Some(self)`; a follower returns the current-term leader it last accepted an
+    /// AppendEntries from; a candidate (or a node that has just stepped down to a
+    /// higher term whose new leader is not yet known) returns `None`. The production
+    /// adapter surfaces this through its status watch so a follower can forward a
+    /// proposal to the right peer.
+    #[must_use]
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.leader_id
     }
 
     /// This node's id.
@@ -968,6 +1025,13 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 // point. The returned index is for a direct caller; here we ignore it.
                 let _ = self.propose(payload, now, rng, out);
             }
+            RaftMsg::ForwardPropose { .. } | RaftMsg::ForwardProposeResult { .. } => {
+                // HA-9 transport-level forwarding (see the variant docs): the production
+                // adapter intercepts these BEFORE the engine and never delivers them
+                // here. If one ever reaches the pure engine it is an inert no-op - the
+                // engine takes NO consensus action on it, so no decision or Effect can
+                // depend on the forwarding path. This keeps the DST trace unchanged.
+            }
         }
     }
 
@@ -1010,6 +1074,10 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         self.role = Role::Candidate;
         self.votes.clear();
         self.votes.insert(self.id);
+        // Starting an election: we no longer recognize any leader (HA-9 passive record).
+        // Cleared here, set again to self on winning or to the sender on accepting a
+        // current-term AppendEntries. This is a record only; it changes no decision.
+        self.leader_id = None;
 
         let last_log_index = self.storage.last_log_index();
         let last_log_term = self.storage.last_log_term();
@@ -1183,6 +1251,11 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // this BEFORE the consistency check: even a check-failing AppendEntries is
         // proof of a live current-term leader, so we must not time out and disrupt it.
         self.arm_election_timer(rng, out);
+        // Record WHO the current-term leader is (HA-9 passive record): this is the very
+        // `leader` field Raft already ships in AppendEntries "so a follower can redirect
+        // clients" (Figure 2). We capture it for proposal-forwarding. It is read by no
+        // decision and changes no effect, so the DST trace is unchanged.
+        self.leader_id = Some(leader);
 
         // Rule 2: log consistency check. The log must contain an entry at
         // prev_log_index whose term matches prev_log_term. prev_log_index 0 (the
@@ -1348,6 +1421,10 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             let was_leader = self.role == Role::Leader;
             self.role = Role::Follower;
             self.votes.clear();
+            // A higher term invalidates the leader we recognized (HA-9 passive record):
+            // the new term's leader is not yet known and will be set when its first
+            // AppendEntries is accepted. A record only; changes no decision/effect.
+            self.leader_id = None;
             // Drop leader-only volatile state (reinitialized on the next election).
             self.next_index.clear();
             self.match_index.clear();
@@ -1404,6 +1481,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             return;
         }
         self.role = Role::Leader;
+        // We are the leader for this term (HA-9 passive record): a forwarded proposal
+        // routed here proposes locally rather than chaining. A record only.
+        self.leader_id = Some(self.id);
         out.cancel_timer(ELECTION_TIMEOUT);
 
         // Initialize leader replication state for every peer (Figure 2, "Leaders":
@@ -3008,6 +3088,78 @@ mod tests {
         assert!(
             node.commit_index() >= 1,
             "commit never regresses; no COMMITTED entry was overwritten (idx1 survives)"
+        );
+    }
+
+    // -- HA-9 leader-forwarding: the leader_id passive record ----------------
+
+    #[test]
+    fn leader_id_tracks_accept_and_clears_on_election_start() {
+        // HA-9: after accepting a current-term AppendEntries a follower records the
+        // sender as its leader; on starting its own election (becoming Candidate) the
+        // record clears (the new term's leader is not yet known). leader_id is a
+        // PASSIVE record - asserting it here pins the forwarding-routing source without
+        // touching any decision.
+        let mut node = follower_with_log(2, 5, &[]);
+        assert_eq!(node.leader_id(), None, "a fresh follower knows no leader");
+
+        // A valid current-term (term 5) leader (node 1) heartbeats this follower.
+        let mut rng = ZeroRng;
+        let mut out = Effects::new();
+        node.on_append_entries(&mut rng, 5, NodeId(1), 0, 0, Vec::new(), 0, &mut out);
+        assert_eq!(
+            node.leader_id(),
+            Some(NodeId(1)),
+            "accepting a current-term AppendEntries records the sender as leader"
+        );
+        assert_eq!(
+            node.role(),
+            Role::Follower,
+            "still a follower after a heartbeat"
+        );
+
+        // The follower's election timer fires: it becomes a Candidate and no longer
+        // recognizes any leader.
+        let mut out2 = Effects::new();
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut out2);
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "the election timer makes us a candidate"
+        );
+        assert_eq!(
+            node.leader_id(),
+            None,
+            "starting an election clears the recognized leader"
+        );
+    }
+
+    #[test]
+    fn leader_id_is_self_on_winning_and_clears_on_higher_term_step_down() {
+        // HA-9: a node that wins leadership records ITSELF as leader (a forwarded
+        // proposal routed to it proposes locally); a later higher-term step-down clears
+        // the record (the new term's leader is unknown until its first AppendEntries).
+        let mut node = follower_with_log(1, 4, &[]);
+        promote_to_leader_for_test(&mut node);
+        assert_eq!(
+            node.leader_id(),
+            Some(NodeId(1)),
+            "a freshly elected leader recognizes itself"
+        );
+
+        // A higher-term (term 9) AppendEntries from a new leader (node 2) steps us down;
+        // observe_term clears the stale self-record before the same-term recognize path
+        // re-sets it to the new leader.
+        let mut rng = ZeroRng;
+        let mut out = Effects::new();
+        node.on_append_entries(&mut rng, 9, NodeId(2), 0, 0, Vec::new(), 0, &mut out);
+        assert_eq!(node.current_term(), 9, "the higher term is adopted");
+        assert_eq!(node.role(), Role::Follower, "stepped down to follower");
+        assert_eq!(
+            node.leader_id(),
+            Some(NodeId(2)),
+            "the new term's accepted leader is recorded after the step-down"
         );
     }
 
