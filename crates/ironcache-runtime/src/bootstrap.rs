@@ -169,7 +169,11 @@ mod tokio_bootstrap {
         S: Fn(TokioRuntime, tokio::net::TcpStream, ShardId) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = ()> + 'static,
         I: Send + 'static,
-        D: Fn(I) -> DFut + Clone + Send + 'static,
+        // The drain closure receives THIS shard's index (0-based) alongside its inbox, so a
+        // per-shard background task (the cross-shard drain loop, and #58 persistence load/save)
+        // can name its own shard (e.g. its `dump-shard-<index>.icss` snapshot file). The index is
+        // the same `ShardId.index` the serve closure sees, so the two agree.
+        D: Fn(usize, I) -> DFut + Clone + Send + 'static,
         DFut: Future<Output = ()> + 'static,
     {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -254,7 +258,7 @@ mod tokio_bootstrap {
                             // the shard's lifetime; the drain loop runs concurrently on
                             // the same single-threaded LocalSet (interleaved, never
                             // parallel, so the shard-local RefCells stay single-threaded).
-                            tokio::task::spawn_local(drain(inbox));
+                            tokio::task::spawn_local(drain(index, inbox));
                             serve_loop(conn_rx, &serve, shard, &shutdown).await;
                         });
                     }));

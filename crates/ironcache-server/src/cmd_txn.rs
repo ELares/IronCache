@@ -178,6 +178,11 @@ pub(crate) mod tests {
             b"INFO",
             b"CONFIG",
             b"CLUSTER",
+            // Persistence (#58): SAVE / BGSAVE / LASTSAVE. The real cross-shard save lives in the
+            // binary serve layer; these dispatch arms are the persistence-disabled fallback.
+            b"SAVE",
+            b"BGSAVE",
+            b"LASTSAVE",
             // Transaction control
             b"MULTI",
             b"EXEC",
@@ -461,11 +466,12 @@ pub(crate) mod tests {
     }
 
     /// SAFETY-NET COUNT GUARD: the single hand-list [`dispatch_arm_names`] still has the
-    /// canonical 151-command CLIENT surface (PR-1..PR-11 + the 6 txn control verbs + CLUSTER,
-    /// CLUSTER_CONTRACT.md #70 slice 1, + READONLY/READWRITE, REPLICA_READ.md #147 HA-7d) PLUS
-    /// the 3 INTERNAL cross-shard verbs (`__ICSTORESET` + `__ICSTOREZSET` + `__ICSTOREHLL`,
-    /// COORDINATOR.md #107 Stage 2b -- real dispatch arms + registry entries, but
-    /// client-unreachable), so 154 dispatch arms total. This asserts a COUNT only (not values --
+    /// canonical 154-command CLIENT surface (PR-1..PR-11 + the 6 txn control verbs + CLUSTER,
+    /// CLUSTER_CONTRACT.md #70 slice 1, + READONLY/READWRITE, REPLICA_READ.md #147 HA-7d, +
+    /// SAVE/BGSAVE/LASTSAVE, #58 persistence) PLUS the 3 INTERNAL cross-shard verbs
+    /// (`__ICSTORESET` + `__ICSTOREZSET` + `__ICSTOREHLL`, COORDINATOR.md #107 Stage 2b -- real
+    /// dispatch arms + registry entries, but client-unreachable), so 157 dispatch arms total. This
+    /// asserts a COUNT only (not values --
     /// the value-level cover is the set-equality in `table_covers_every_dispatch_arm`), so it is
     /// NOT a second source of truth. A drift here flags that a dispatch arm was added or removed;
     /// update the registry + the hand-list.
@@ -473,8 +479,9 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            154,
-            "the dispatch-arm hand-list drifted from the 151 client commands + 3 internal verbs"
+            157,
+            "the dispatch-arm hand-list drifted from the 154 client commands (incl. SAVE/BGSAVE/\
+             LASTSAVE, #58 persistence) + 3 internal verbs"
         );
     }
 

@@ -13,6 +13,10 @@
 
 pub mod coordinator;
 pub mod multikey;
+/// Durable on-disk SNAPSHOT persistence serve wiring (#58): the cross-shard SAVE/BGSAVE fan-out,
+/// the manifest commit, LASTSAVE, load-on-boot, and the periodic save policy. Default-off (only
+/// engaged when a `data_dir` is configured); the engine half lives in `ironcache-persist`.
+pub mod persist;
 pub mod pubsub;
 pub mod raft_boot;
 /// HA-7d LIVE per-shard replica attach. Reached ONLY in raft-mode once an `AssignReplica`

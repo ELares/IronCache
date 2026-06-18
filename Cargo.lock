@@ -350,6 +350,7 @@ dependencies = [
  "ironcache-env",
  "ironcache-eviction",
  "ironcache-observe",
+ "ironcache-persist",
  "ironcache-protocol",
  "ironcache-raft",
  "ironcache-raft-net",
@@ -436,6 +437,15 @@ name = "ironcache-observe"
 version = "0.0.0"
 dependencies = [
  "ironcache-env",
+]
+
+[[package]]
+name = "ironcache-persist"
+version = "0.0.0"
+dependencies = [
+ "ironcache-repl",
+ "ironcache-storage",
+ "ironcache-store",
 ]
 
 [[package]]

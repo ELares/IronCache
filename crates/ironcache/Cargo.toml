@@ -32,6 +32,13 @@ ironcache-observe = { workspace = true }
 # depends only on the waist; the binary is where the concrete impl is wired in.
 ironcache-storage = { workspace = true }
 ironcache-store = { workspace = true }
+# Durable on-disk SNAPSHOT persistence (#58/#62/#63). The binary owns the concrete per-shard
+# stores + the data_dir + the env Clock, so the cross-shard SAVE/BGSAVE fan-out (each shard dumps
+# its own partition via the forkless snapshot_chunk) + the atomic manifest commit + load-on-boot
+# are wired HERE. Default-off: with no data_dir configured the persist path is never entered and
+# the boot + hot path are byte-unchanged. A leaf above the store (reuses the KvObj codec from
+# ironcache-repl), so it adds no third-party deps.
+ironcache-persist = { workspace = true }
 # The concrete eviction policy: the binary constructs the configured `Policy`
 # (S3-FIFO/Random/NoEviction via map_policy_name) and wires it into the per-shard
 # store as the E hook. The library names only the EvictionPolicy/Admit traits.

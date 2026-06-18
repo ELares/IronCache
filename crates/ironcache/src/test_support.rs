@@ -29,6 +29,39 @@ pub fn run_server_for_test(port: u16, shards: usize) -> ShardSet {
     run_server(&config).expect("test server failed to bind")
 }
 
+/// Boot a real server with PERSISTENCE ENABLED (#58) on `127.0.0.1:port` across `shards` shards,
+/// using `data_dir` as the on-disk snapshot location. The server LOADS any committed snapshot in
+/// `data_dir` at boot, and `SAVE` / `BGSAVE` write `<data_dir>/dump-shard-<n>.icss` +
+/// `<data_dir>/dump.manifest`. `save_interval_secs` / `save_min_changes` set the optional periodic
+/// save policy (pass `0`/`0` to disable it -> only explicit SAVE/BGSAVE persist).
+///
+/// # Panics
+///
+/// Panics if the config fails to validate or the server fails to bind.
+#[must_use]
+pub fn run_persist_server_for_test(
+    port: u16,
+    shards: usize,
+    data_dir: PathBuf,
+    save_interval_secs: u64,
+    save_min_changes: u64,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        data_dir: Some(data_dir),
+        save_interval_secs,
+        save_min_changes,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test persist config must validate");
+    run_server(&config).expect("test persist server failed to bind")
+}
+
 /// Boot a real server with embedded TLS ENABLED (`tls = on`, #105) on `127.0.0.1:port` across
 /// `shards` shards, presenting the cert/key at `cert_path` / `key_path`, and return the running
 /// [`ShardSet`]. The client listener is TLS-only: a plaintext client to this port fails the
