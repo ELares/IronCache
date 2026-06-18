@@ -1504,6 +1504,133 @@ impl SlotMap {
         Ok(())
     }
 
+    /// Collapse duplicate node-table entries that advertise the SAME `(host, port)` ENDPOINT into a
+    /// single entry, reindexing `owner` / `replicas` / `migration_peer` / `self_idx` so routing is
+    /// preserved. Returns the number of entries removed (0 = the table was already endpoint-unique).
+    ///
+    /// WHY (item-7 id-reconciliation, DEFENSIVE): the raft-mode MEET now LEARNS a peer's real
+    /// announce id (`serve::build_meet`), so a fresh cluster never creates a synth/announce
+    /// duplicate. But a table built BEFORE that fix (or one that fell back to the synth id once for
+    /// an unreachable peer, then later learned the real id on a re-MEET) can hold TWO entries for one
+    /// physical node: its real announce id AND a `host:port`-synthesized id. Both share the node's
+    /// endpoint, so routing/ownership were already correct (they match by endpoint), but
+    /// `cluster_known_nodes` / `CLUSTER NODES` were INFLATED. This reconciles those duplicates.
+    ///
+    /// THE RULE: for each endpoint group, KEEP one canonical entry and remove the rest. The kept
+    /// entry is THIS node's entry when self is in the group (so `self_idx` keeps naming self),
+    /// otherwise the LOWEST-INDEX entry in the group (stable / order-independent). Every owner /
+    /// replica / migration-peer index that pointed at a removed duplicate is REMAPPED onto the kept
+    /// index FIRST, then the duplicates are removed and the surviving indices are renumbered (every
+    /// index above a removed slot shifts down), exactly like [`forget`](Self::forget) does for one
+    /// node. `mine[]` is left untouched: it records "is this slot self's", which is invariant under a
+    /// renumber that only collapses ALIASES of an endpoint (self's slots stay self's), so the hot
+    /// `owns()` path is unaffected and never races this cold, lock-held reconciliation.
+    ///
+    /// This is purely additive: it touches only the cold node table + the cold index arrays under
+    /// the table lock; the default static path never calls it.
+    pub fn dedup_nodes_by_endpoint(&self) -> usize {
+        let mut table = self.table.lock().expect("slot-map node lock poisoned");
+        let me = self.self_idx.load(Ordering::Acquire) as usize;
+
+        // Map each old index -> the index of its endpoint group's CANONICAL (kept) entry. Walk in
+        // table order; the first entry seen for an endpoint is canonical UNLESS self shares that
+        // endpoint, in which case self becomes canonical (so self_idx keeps naming self).
+        let n = table.nodes.len();
+        let mut canonical: Vec<usize> = (0..n).collect();
+        for i in 0..n {
+            for j in 0..i {
+                if canonical[j] == j // j is a group leader (not itself an alias)
+                    && table.nodes[j].host == table.nodes[i].host
+                    && table.nodes[j].port == table.nodes[i].port
+                {
+                    // i is a duplicate of group-leader j. Prefer self as the leader if i IS self.
+                    if i == me {
+                        // Re-point the whole existing group (j and any alias already mapped to j)
+                        // at self (i), then i leads.
+                        for c in &mut canonical {
+                            if *c == j {
+                                *c = i;
+                            }
+                        }
+                        canonical[i] = i;
+                    } else {
+                        canonical[i] = canonical[j];
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Which OLD indices are aliases (removed)? An index is removed iff it is not its own
+        // canonical. Nothing to do when the table is already endpoint-unique.
+        let removed_any = (0..n).any(|i| canonical[i] != i);
+        if !removed_any {
+            return 0;
+        }
+
+        // First REMAP every index array off the removed aliases onto their canonical (still using
+        // OLD indices), so no array points at an entry about to be deleted.
+        let remap = |idx: u16| -> u16 {
+            if idx == UNASSIGNED {
+                idx
+            } else {
+                canonical[idx as usize] as u16
+            }
+        };
+        for o in self.owner.iter() {
+            o.store(remap(o.load(Ordering::Acquire)), Ordering::Release);
+        }
+        for r in self.replicas.iter() {
+            r.store(remap(r.load(Ordering::Acquire)), Ordering::Release);
+        }
+        for p in self.migration_peer.iter() {
+            p.store(remap(p.load(Ordering::Acquire)), Ordering::Release);
+        }
+        // self_idx onto its canonical (self is its own canonical by the rule above, but the leader
+        // it pointed at may differ if self was an alias of an earlier entry; remap is correct).
+        let new_self_old = canonical[me];
+
+        // Now COMPACT: build the kept set (old indices that are their own canonical), in order, and
+        // an old->new index translation for the survivors.
+        let mut old_to_new: Vec<u16> = vec![UNASSIGNED; n];
+        let mut new_nodes: Vec<NodeEntry> = Vec::with_capacity(n);
+        let mut new_epochs: Vec<u64> = Vec::with_capacity(n);
+        let mut next_new = 0u16;
+        for i in 0..n {
+            if canonical[i] == i {
+                old_to_new[i] = next_new;
+                new_nodes.push(table.nodes[i].clone());
+                new_epochs.push(table.config_epochs[i]);
+                next_new += 1;
+            }
+        }
+        let removed = n - new_nodes.len();
+
+        // Translate every (already-remapped) index array from old survivor indices to new ones.
+        let translate = |idx: u16| -> u16 {
+            if idx == UNASSIGNED {
+                idx
+            } else {
+                old_to_new[idx as usize]
+            }
+        };
+        for o in self.owner.iter() {
+            o.store(translate(o.load(Ordering::Acquire)), Ordering::Release);
+        }
+        for r in self.replicas.iter() {
+            r.store(translate(r.load(Ordering::Acquire)), Ordering::Release);
+        }
+        for p in self.migration_peer.iter() {
+            p.store(translate(p.load(Ordering::Acquire)), Ordering::Release);
+        }
+        self.self_idx
+            .store(old_to_new[new_self_old], Ordering::Release);
+
+        table.nodes = new_nodes;
+        table.config_epochs = new_epochs;
+        removed
+    }
+
     /// `CLUSTER SET-CONFIG-EPOCH <epoch>`: set THIS node's config epoch, allowed ONLY when the
     /// node is totally fresh (it knows no other node AND its config epoch is still 0). Raises
     /// `current_epoch` to `epoch` if higher. Mirrors Redis's cluster-creation rule.
@@ -1923,6 +2050,111 @@ mod tests {
         let id1 = nodes.iter().find(|n| n.id.as_ref() == ID1).unwrap();
         assert_eq!(id1.host.as_ref(), "h1");
         assert_eq!(id1.port, 2);
+    }
+
+    /// item-7: MEET with a peer's REAL announce id COINCIDES with the peer's SELF-added announce
+    /// entry (a duplicate id), so it is a no-op -- the table holds ONE entry per node. This is the
+    /// invariant the serve-layer "learn the real id on MEET" relies on: once the leader learns and
+    /// commits the peer's real id, re-meeting it (or the peer self-adding) does not inflate the
+    /// table. Contrast the OLD behaviour, where a host:port-SYNTHESIZED id differs from the announce
+    /// id and so APPENDED a duplicate-by-endpoint entry (proven in the dedup test below).
+    #[test]
+    fn meet_with_real_id_is_idempotent_vs_the_self_added_announce_entry() {
+        // The peer (ID1 @ h1:2) self-added its announce entry.
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        assert_eq!(map.known_nodes(), 2);
+        // A leader that LEARNED ID1's real announce id commits AddNode{ID1, h1, 2}: idempotent
+        // (same id), so NO duplicate -- known_nodes stays 2.
+        map.meet(node(ID1, "h1", 2));
+        assert_eq!(
+            map.known_nodes(),
+            2,
+            "MEET with the peer's real announce id must not inflate the table"
+        );
+    }
+
+    /// item-7 (defensive reconciliation): `dedup_nodes_by_endpoint` collapses a SYNTH-id entry and
+    /// an ANNOUNCE-id entry that share one physical endpoint into a SINGLE entry, while PRESERVING
+    /// routing (owner/replica/migration indices follow the kept entry) and self-recognition.
+    #[test]
+    fn dedup_nodes_by_endpoint_collapses_synth_and_announce_pair() {
+        // A synth id (distinct from any announce id) that a stale MEET would have appended for ID1.
+        const SYNTH_FOR_ID1: &str = "5555555555555555555555555555555555555555";
+
+        // self=ID0 @ h0:1. ID1 @ h1:2 is present under BOTH its announce id AND a synth id (the old
+        // inflation). ID2 @ h2:3 is a normal single-entry peer.
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2)); // ID1's announce entry (idx 1)
+        map.meet(node(SYNTH_FOR_ID1, "h1", 2)); // the synth duplicate of ID1's endpoint (idx 2)
+        map.meet(node(ID2, "h2", 3)); // a clean peer (idx 3)
+        assert_eq!(
+            map.known_nodes(),
+            4,
+            "the synth duplicate inflated the table"
+        );
+
+        // Own a couple of slots and assign cross-node state that REFERENCES the synth entry, so the
+        // dedup's index remap is exercised:
+        map.add_slots(&[0, 1]).unwrap(); // self owns 0,1
+        map.set_slot_node(0, SYNTH_FOR_ID1).unwrap(); // slot 0 owned by the synth entry
+        map.set_slot_node(1, ID2).unwrap(); // slot 1 owned by ID2
+        map.set_slot_replica(1, SYNTH_FOR_ID1).unwrap(); // slot 1 replicated by the synth entry
+
+        // Reconcile: the synth entry collapses into ID1's announce entry (same endpoint).
+        let removed = map.dedup_nodes_by_endpoint();
+        assert_eq!(removed, 1, "exactly the one synth duplicate is removed");
+        assert_eq!(map.known_nodes(), 3, "one entry per physical node now");
+
+        // The surviving id for h1:2 is the ANNOUNCE id (the kept canonical), and the synth id is
+        // gone.
+        let nodes = map.nodes();
+        assert!(nodes.iter().any(|n| n.id.as_ref() == ID1));
+        assert!(
+            !nodes.iter().any(|n| n.id.as_ref() == SYNTH_FOR_ID1),
+            "the synth id must be gone after dedup"
+        );
+
+        // ROUTING PRESERVED: slot 0's owner (was the synth entry) now resolves to ID1's announce id
+        // by the remap; slot 1 still owned by ID2 and replicated by ID1's (remapped) entry.
+        assert_eq!(map.owner_id(0).unwrap().as_ref(), ID1);
+        assert_eq!(map.owner_id(1).unwrap().as_ref(), ID2);
+        assert!(
+            map.is_replica_of(1, ID1),
+            "replica index followed the remap"
+        );
+        // self_idx still names self (ID0 still owns no remapped change to its own slots semantics;
+        // self owned none of the deduped slots, but is_self must still hold).
+        assert!(map.is_self(ID0), "self recognition survives the reindex");
+
+        // Idempotent: a second dedup finds nothing to do.
+        assert_eq!(map.dedup_nodes_by_endpoint(), 0, "already endpoint-unique");
+    }
+
+    /// `dedup_nodes_by_endpoint` keeps SELF as the canonical when self shares an endpoint with a
+    /// later synth-id alias (so `self_idx` keeps naming self) and is a no-op on an already-unique
+    /// table.
+    #[test]
+    fn dedup_prefers_self_and_is_noop_when_unique() {
+        const SYNTH_FOR_SELF: &str = "6666666666666666666666666666666666666666";
+        // self=ID0 @ 127.0.0.1:7000; a synth alias of SELF's own endpoint was appended (e.g. a peer
+        // MEET'd this node under a synth id before learning its real id).
+        let map = SlotMap::empty_self(ID0, "127.0.0.1", 7000);
+        map.meet(node(SYNTH_FOR_SELF, "127.0.0.1", 7000));
+        map.meet(node(ID1, "127.0.0.1", 7001));
+        assert_eq!(map.known_nodes(), 3);
+
+        let removed = map.dedup_nodes_by_endpoint();
+        assert_eq!(removed, 1);
+        assert_eq!(map.known_nodes(), 2);
+        // self is STILL recognized by its announce id, and the kept entry for 127.0.0.1:7000 is the
+        // announce id (self), not the synth alias.
+        assert!(map.is_self(ID0));
+        let nodes = map.nodes();
+        assert!(nodes.iter().any(|n| n.id.as_ref() == ID0));
+        assert!(!nodes.iter().any(|n| n.id.as_ref() == SYNTH_FOR_SELF));
+        // A clean table is left untouched.
+        assert_eq!(map.dedup_nodes_by_endpoint(), 0);
     }
 
     #[test]

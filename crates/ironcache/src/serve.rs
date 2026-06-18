@@ -1938,7 +1938,13 @@ async fn try_raft_cluster_mutator(
         b"ADDSLOTS" => Some(build_self_assign(ctx, request, parse_addslots_slots)),
         b"ADDSLOTSRANGE" => Some(build_self_assign(ctx, request, parse_addslotsrange_slots)),
         b"SETSLOT" => Some(build_setslot(ctx, request).map(|c| vec![c])),
-        b"MEET" => Some(build_meet(request).map(|c| vec![c])),
+        // MEET LEARNS the peer's REAL announce id over the cluster bus (item-7 id-reconciliation),
+        // which is real I/O (a bounded `CLUSTER MYID` fetch through the Runtime seam), so it is the
+        // one builder that is `async`. On a reachable peer the committed `AddNode { id: real_id }`
+        // COINCIDES with the peer's self-added announce entry (meet is idempotent on a duplicate
+        // id), so no synth/announce duplicate inflates `cluster_known_nodes`; on an unreachable peer
+        // it falls back to the synth id so the cluster still forms. See `build_meet`.
+        b"MEET" => Some(build_meet(request).await.map(|c| vec![c])),
         b"FORGET" => Some(build_forget(request).map(|c| vec![c])),
         b"SET-CONFIG-EPOCH" => Some(build_set_config_epoch(request).map(|c| vec![c])),
         // HA-7d: `CLUSTER REPLICATE <node-id> <slot> [slot ...]` assigns `<node-id>` as a REPLICA
@@ -2156,10 +2162,48 @@ fn build_setslot(
     }
 }
 
-/// Build the `AddNode { id, host, port }` ConfigCmd for raft-mode `CLUSTER MEET <ip> <port>
-/// [bus]` (HA-4c). The peer's id is synthesized deterministically from `host:port` (no gossip to
-/// learn the real id; documented divergence, the same shape slice-3's static MEET uses).
-fn build_meet(
+/// The bound on the MEET id-learning fetch: how long a raft-mode `CLUSTER MEET` will wait for the
+/// peer's `CLUSTER MYID` before falling back to the synth id. Generous enough for a one-round-trip
+/// loopback / LAN fetch, short enough that a MEET to a not-yet-up peer does not hang the serve
+/// path (it falls back and the cluster still forms). Read through the Runtime timer seam.
+const MEET_ID_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Build the `AddNode { id, host, port }` ConfigCmd for raft-mode `CLUSTER MEET <ip> <port> [bus]`
+/// (HA-4c + item-7 id-reconciliation).
+///
+/// HISTORY / THE BUG THIS FIXES: the original raft-mode MEET SYNTHESIZED the peer's id from
+/// `host:port` (`synth_meet_node_id`) because there is no gossip to learn the real id. But every
+/// node ALSO self-adds under its REAL announce id (`empty_self`) and is declared under that id, so
+/// a MEET'd peer ended up in the committed node table under BOTH a synth id AND its announce id ->
+/// `cluster_known_nodes` / `CLUSTER NODES` were INFLATED with a duplicate per MEET'd peer (routing
+/// stayed correct -- it matches by ENDPOINT -- but the operator-visible node count was wrong).
+///
+/// THE FIX: on a raft-mode MEET we LEARN the peer's REAL announce id by dialing the peer's RESP
+/// CLIENT port (`host:port`, the same endpoint a client / a MOVED redirect uses -- NOT the
+/// `+10000` cluster-bus port, which speaks only RAFTMSG) and reading `CLUSTER MYID` over the
+/// cluster-bus `peer_node_id` helper. The fetch is BOUNDED by [`MEET_ID_FETCH_TIMEOUT`] through
+/// the Runtime timer seam so it can never hang the serve path. We then propose
+/// `AddNode { id: real_id, host, port }`; because the peer self-added that SAME announce id and the
+/// committed `meet` apply is idempotent on a duplicate id, the table holds ONE entry per node and
+/// `cluster_known_nodes` equals the real node count (no inflation).
+///
+/// FALLBACK (peer unreachable): if the fetch fails or times out (the peer is not yet up, refuses,
+/// or returns a non-id reply), we FALL BACK to the deterministic `synth_meet_node_id` so a MEET to
+/// a transiently-down peer STILL makes progress and the cluster forms (the synth entry later
+/// reconciles when the peer comes up and is re-MEET'd, or via the cluster crate's defensive
+/// `SlotMap::dedup_nodes_by_endpoint`). This is the documented fallback the slice-3 static MEET
+/// also uses.
+///
+/// SCOPING (no SWIM): this is a LIGHTWEIGHT id-reconciliation, deliberately NOT a SWIM/Lifeguard
+/// failure detector. Raft already provides the cluster's liveness + failover signal (heartbeats,
+/// elections, committed `PromoteReplica`), so a separate gossip failure detector would be
+/// redundant. The only gap raft-mode MEET had was learning a peer's stable IDENTITY at join time,
+/// which one bounded `CLUSTER MYID` fetch closes; ongoing liveness stays Raft's job.
+///
+/// The `request` is the validated `CLUSTER MEET` frame; the runtime is a fresh zero-sized
+/// [`TokioRuntime`] (the dial is one short-lived outbound connection over the seam, like the
+/// expire task's runtime; no shard state is touched and no hot-path lock is taken).
+async fn build_meet(
     request: &Request,
 ) -> Result<ironcache_raft::ConfigCmd, ironcache_protocol::ErrorReply> {
     use ironcache_protocol::ErrorReply;
@@ -2181,12 +2225,56 @@ fn build_meet(
             "Invalid node address specified: {host}:{port_arg}"
         )));
     }
-    let id = synth_meet_node_id(&host, port as u16);
-    Ok(ironcache_raft::ConfigCmd::AddNode {
-        id,
-        host,
-        port: port as u16,
-    })
+    let port = port as u16;
+    // Learn the peer's REAL announce id over the bus (bounded); fall back to the synth id when the
+    // peer is unreachable so the cluster still forms.
+    let id = learn_or_synth_meet_id(&host, port).await;
+    Ok(ironcache_raft::ConfigCmd::AddNode { id, host, port })
+}
+
+/// Resolve the node id to commit for a raft-mode `CLUSTER MEET <host> <port>`: the peer's REAL
+/// announce id when it can be fetched within [`MEET_ID_FETCH_TIMEOUT`], else the deterministic
+/// `synth_meet_node_id` fallback (item-7). Dials the peer's RESP CLIENT port (`host:port`) and
+/// reads `CLUSTER MYID` via [`ironcache_clusterbus::peer_node_id`], BOUNDED by the Runtime timer
+/// seam (`select!` of the fetch vs the timer) so a not-yet-up peer never hangs the serve path.
+///
+/// The fetched id is accepted ONLY when it is a syntactically valid node id (40 lowercase hex);
+/// any other reply (an empty / malformed id, an error, a wrong reply kind) is treated as a failed
+/// fetch and falls back to the synth id, so a peer that is up but not yet cluster-identity-ready
+/// can never poison the committed table with a junk id.
+async fn learn_or_synth_meet_id(host: &str, port: u16) -> String {
+    let synth = || synth_meet_node_id(host, port);
+    // The advertised CLIENT endpoint (what a MOVED redirect / a client dials). A host that does
+    // not parse to a SocketAddr (e.g. a DNS name) cannot be dialed by the address-based bus helper
+    // here, so fall straight back to the synth id (the same best-effort posture raft_boot uses for
+    // a non-parsing peer host).
+    let Ok(addr) = format!("{host}:{port}").parse::<std::net::SocketAddr>() else {
+        return synth();
+    };
+    let rt = TokioRuntime::new();
+    // Bound the fetch: whichever of the fetch or the timer completes first wins. The timer is the
+    // sanctioned time seam (no `std::time` / `tokio::time` directly), matching the adapter's
+    // FORWARD_TIMEOUT shape.
+    let learned = tokio::select! {
+        r = ironcache_clusterbus::peer_node_id(&rt, addr) => r.ok(),
+        () = rt.timer(MEET_ID_FETCH_TIMEOUT) => None,
+    };
+    match learned {
+        Some(id) if is_valid_node_id(&id) => id,
+        // Unreachable / timed out / a non-id reply: fall back to the synth id so the cluster forms.
+        _ => synth(),
+    }
+}
+
+/// Whether `id` is a syntactically valid IronCache node id: exactly 40 lowercase-hex characters
+/// (the shape `CLUSTER MYID` / the announce id / `synth_meet_node_id` all produce). Used to gate a
+/// fetched MEET id so a peer that answers with a malformed / empty id falls back to the synth id
+/// rather than committing junk into the node table.
+fn is_valid_node_id(id: &str) -> bool {
+    id.len() == 40
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Build the `RemoveNode { id }` ConfigCmd for raft-mode `CLUSTER FORGET <id>` (HA-4c).
@@ -4097,5 +4185,64 @@ mod tests {
         conn.asking = true;
         conn.reset(false);
         assert!(!conn.asking, "RESET clears the one-shot ASKING");
+    }
+
+    /// `is_valid_node_id` accepts EXACTLY a 40-lowercase-hex string (the announce-id / MYID /
+    /// synth-id shape) and rejects everything else, so a peer that answers MEET's `CLUSTER MYID`
+    /// fetch with a malformed / empty / wrong-length / uppercase id falls back to the synth id
+    /// rather than committing junk into the node table.
+    #[test]
+    fn is_valid_node_id_accepts_only_40_lowercase_hex() {
+        // The canonical shapes that MUST be accepted.
+        assert!(is_valid_node_id(&"a".repeat(40)));
+        assert!(is_valid_node_id("0123456789abcdef0123456789abcdef01234567"));
+        assert!(is_valid_node_id(&synth_meet_node_id("127.0.0.1", 7000)));
+        // Rejections: wrong length, uppercase hex, non-hex, empty.
+        assert!(!is_valid_node_id(&"a".repeat(39)), "too short");
+        assert!(!is_valid_node_id(&"a".repeat(41)), "too long");
+        assert!(
+            !is_valid_node_id(&"A".repeat(40)),
+            "uppercase is not accepted"
+        );
+        assert!(!is_valid_node_id(&"g".repeat(40)), "non-hex letter");
+        assert!(!is_valid_node_id(""), "empty");
+    }
+
+    /// MEET-with-UNREACHABLE-peer FALLBACK (item-7, the no-hang guarantee): `learn_or_synth_meet_id`
+    /// dialing a CLOSED port must NOT hang -- it returns the deterministic synth id (the documented
+    /// fallback) well within the test budget. We grab a free port, DROP its listener so the connect
+    /// is refused, and assert the helper returns the synth id quickly. This proves a MEET to a
+    /// not-yet-up peer still makes progress (commits the synth fallback) instead of blocking the
+    /// serve path. The bound itself is `MEET_ID_FETCH_TIMEOUT` (read through the Runtime timer seam).
+    #[test]
+    fn meet_id_learn_falls_back_to_synth_on_unreachable_peer() {
+        // A port that nothing is listening on (bind then immediately drop the listener).
+        let dead_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let expect_synth = synth_meet_node_id("127.0.0.1", dead_port);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let id = local.block_on(&rt, async move {
+            // A wall-clock CEILING far above MEET_ID_FETCH_TIMEOUT: if the helper ever HUNG this
+            // outer timeout would trip and the unwrap below would panic (a loud failure), so a PASS
+            // proves the fetch is bounded. A connection-refused normally returns immediately; the
+            // ceiling only guards a true hang.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                learn_or_synth_meet_id("127.0.0.1", dead_port),
+            )
+            .await
+            .expect("learn_or_synth_meet_id must not hang on an unreachable peer")
+        });
+        assert_eq!(
+            id, expect_synth,
+            "an unreachable-peer MEET must FALL BACK to the deterministic synth id (no hang)"
+        );
     }
 }
