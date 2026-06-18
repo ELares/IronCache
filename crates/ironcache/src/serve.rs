@@ -2170,8 +2170,10 @@ async fn route_and_dispatch(
 ///   parity), then replies `+OK` (or an `-ERR` on a shard / manifest failure). The fan-out is the
 ///   forkless, borrow-releasing per-shard dump, so it never double-memories the keyspace.
 /// - `BGSAVE`: SPAWNS the SAME save off the request path on the home shard's executor and replies
-///   `+Background saving started` IMMEDIATELY. The dump runs on the shards' executors, yielding
-///   between chunks, so it does not block any shard's hot path materially.
+///   `+Background saving started` IMMEDIATELY, so the ISSUING connection is not blocked. NOTE (M4):
+///   each dumping shard STILL holds its store borrow across its full dump + fsync (it does not yield
+///   between chunks), so BGSAVE BLOCKS EACH SHARD for ITS OWN dump duration; the win over SAVE is
+///   only that the issuing client is freed immediately.
 /// - `LASTSAVE`: replies `:<unix_secs>` of the last committed save (`:0` until the first save).
 ///
 /// Concurrent saves are serialized by [`crate::persist::PersistState::try_begin_save`]: a SAVE /
@@ -2192,6 +2194,22 @@ async fn handle_persist_command(
     use ironcache_runtime::Runtime;
     use ironcache_server::Value;
     shard_state().borrow_mut().counters.on_command();
+
+    // -- AUTH GATE (H2). This router INTERCEPTS SAVE/BGSAVE/LASTSAVE before `dispatch_inner`'s auth
+    // gate (dispatch.rs: `requires_auth() && !authenticated`) ever runs, so without this an
+    // UNAUTHENTICATED client with `requirepass` set could trigger SAVE/BGSAVE (a CPU/disk DoS) and
+    // read LASTSAVE. Mirror the SAME decision dispatch makes (`ctx.requires_auth()` reads the
+    // runtime requirepass overlay; `conn.authenticated` is the per-conn flag AUTH sets) and return
+    // the IDENTICAL `-NOAUTH` reply WITHOUT performing any save. With persistence OFF these commands
+    // reach dispatch and are gated there; this restores that gate for the persistence-on path.
+    if ctx.requires_auth() && !conn.authenticated {
+        encode_into(
+            out,
+            &Value::error(ironcache_protocol::ErrorReply::noauth()),
+            conn.proto,
+        );
+        return;
+    }
 
     match cmd_upper {
         b"LASTSAVE" => {
@@ -2222,13 +2240,13 @@ async fn handle_persist_command(
             // proceeding once free is overkill here; a SAVE that races a BGSAVE simply runs after the
             // latch frees on the next attempt. Acquire-or-bail: if busy, report the in-progress save
             // as a success (its data is being written), matching the "save is happening" intent.
-            if !persist.try_begin_save() {
+            // The RAII guard releases the latch on completion AND on a panic unwinding the save (H3).
+            let Some(_guard) = persist.try_begin_save() else {
                 encode_into(out, &Value::ok(), conn.proto);
                 return;
-            }
+            };
             let result =
                 crate::persist::do_save_all(persist, inbox, ctx, home, conn.db, now_secs).await;
-            persist.release_save();
             match result {
                 Ok(()) => encode_into(out, &Value::ok(), conn.proto),
                 Err(msg) => encode_into(
@@ -2244,17 +2262,20 @@ async fn handle_persist_command(
             // a faithful start time; the dump runs after, but LASTSAVE reporting the request time is
             // Redis-faithful enough (Redis stamps lastsave at fork time).
             let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
-            if persist.try_begin_save() {
+            if let Some(guard) = persist.try_begin_save() {
                 // Spawn the save on THIS (home) shard's executor; it owns the borrow-free fan-out.
+                // The RAII guard is MOVED into the task so the latch releases when the task finishes
+                // OR when it is CANCELLED at shutdown (the bare release_save() before could be
+                // skipped on cancel, wedging the latch forever -- H3).
                 let persist = Arc::clone(persist);
                 let inbox = inbox.clone();
                 let ctx = ctx.clone();
                 let db = conn.db;
                 let rt = ironcache_runtime::TokioRuntime::new();
                 rt.spawn_on_shard(async move {
+                    let _guard = guard; // dropped on task completion or cancellation -> releases.
                     let _ = crate::persist::do_save_all(&persist, &inbox, &ctx, home, db, now_secs)
                         .await;
-                    persist.release_save();
                 });
             }
             // Whether we won the latch or a save was already running, the Redis-faithful reply is

@@ -12,10 +12,13 @@
 //!
 //! - The FORKLESS, memory-neutral per-shard dump iterator
 //!   [`ironcache_store::ShardStore::snapshot_chunk`] (HA-5b #60): a resumable, constant-memory
-//!   SCAN dump that yields each live key as an owned [`ironcache_store::KvObj`] and RELEASES the
-//!   store borrow between chunks. [`dump_shard_keyspace`] drives it chunk by chunk, so a save
-//!   never double-memories the keyspace and (for `BGSAVE`) never blocks the shard's hot path
-//!   materially.
+//!   SCAN dump that yields each live key as an owned [`ironcache_store::KvObj`]. [`dump_shard_keyspace`]
+//!   drives it chunk by chunk, so a save never double-memories the keyspace (its transient memory is
+//!   O(`DUMP_CHUNK`), not the whole keyspace). NOTE: the per-shard dump caller currently holds the
+//!   store borrow across the WHOLE dump + fsync (see [`crate::dump_shard_keyspace`] / the
+//!   coordinator), so BGSAVE BLOCKS the dumping shard for its full keyspace dump + fsync latency
+//!   (per-shard-consistent); it does NOT yield the shard between chunks. The borrow-release the
+//!   chunked iterator MAKES POSSIBLE is not exploited by the current caller.
 //! - The KvObj WIRE CODEC ([`ironcache_repl::encode_kvobj`] / [`ironcache_repl::decode_kvobj`]):
 //!   the SAME faithful, one-way-ratchet-preserving encoding the HA-7b replication full-sync uses
 //!   is reused VERBATIM as the on-disk record value, so the snapshot file and the replication
@@ -30,6 +33,23 @@
 //! Every shard file is written atomically (tmp -> fsync -> rename) and the COMMIT MANIFEST is
 //! written + fsync'd LAST, so a crash mid-save leaves the PRIOR good snapshot. A torn file is
 //! caught by its CRC and treated as no-snapshot (start empty), never as corrupt-load.
+//!
+//! ## Snapshot consistency: per-shard-consistent, cross-shard FUZZY
+//!
+//! Each shard dumps its OWN partition on its OWN thread (no global lock, no fork-COW), so a shard's
+//! file is a CONSISTENT point-in-time view of THAT shard, but DIFFERENT shards dump at slightly
+//! DIFFERENT instants. The cross-shard snapshot is therefore FUZZY (not a single global
+//! point-in-time): a write that lands on shard A after A dumped but before B dumped is in B's file
+//! and not A's. This is ACCEPTABLE for a cache (no cross-key transactional durability is promised);
+//! it is NOT a fork-COW point-in-time snapshot like Redis RDB.
+//!
+//! ## Re-shard on load (correct across a shard-count change)
+//!
+//! The per-shard files were partitioned by the shard count AT SAVE TIME. The loading node may have
+//! a DIFFERENT shard count, so load does NOT blindly replay file-i into shard-i (that would lose
+//! keys when the count shrinks and misroute every GET when it grows). Instead each shard reads
+//! EVERY manifest file and keeps only the keys it OWNS under the current count, using the router's
+//! own `owner_shard` hash (passed in as `route`). See [`load_shard_resharded`] / [`load_all`].
 //!
 //! ## Default-off (the hot path + boot path are byte-unchanged)
 //!
@@ -61,11 +81,14 @@ use ironcache_store::{ShardStore, SnapshotCursor};
 /// The number of keys [`dump_shard_keyspace`] EXAMINES per
 /// [`ironcache_store::ShardStore::snapshot_chunk`] call. Bounds the per-chunk owned `Vec` (and
 /// its per-entry `KvObj` clones), so the dump's transient memory is O(`DUMP_CHUNK`), NEVER a
-/// full-keyspace materialization (the forkless, memory-neutral property HA-5b provides). Between
-/// chunks the store borrow is released, so a `BGSAVE` driven on the shard's executor yields the
-/// shard back to its connection tasks every chunk (it does not block the hot path materially).
-/// 512 is a balance: large enough to amortize the per-chunk borrow/sort overhead, small enough to
-/// bound the transient buffer and keep the shard responsive.
+/// full-keyspace materialization (the forkless, memory-neutral property HA-5b provides). 512 is a
+/// balance: large enough to amortize the per-chunk borrow/sort overhead, small enough to bound the
+/// transient buffer.
+///
+/// NOTE: the chunked iterator RELEASES the store borrow between chunks (so a caller COULD yield the
+/// shard between chunks), but the current per-shard dump caller holds the store borrow across the
+/// whole walk, so BGSAVE blocks the dumping shard for its full dump + fsync. The chunking still
+/// bounds memory regardless; the borrow-release is just not currently exploited for yielding.
 pub const DUMP_CHUNK: usize = 512;
 
 /// The result of dumping one shard's keyspace to a byte buffer ([`dump_shard_keyspace`]).
@@ -91,14 +114,17 @@ pub struct ShardDump {
 /// `now` is the lazy-expiry basis: `snapshot_chunk` SKIPS a logically-dead key (so the snapshot
 /// never persists an already-expired key), exactly as SCAN does.
 ///
-/// ## Forkless + memory-neutral + hot-path-safe
+/// ## Forkless + memory-neutral (NOT yield-between-chunks as used today)
 ///
 /// The chunked pull bounds the transient memory to O([`DUMP_CHUNK`]) (the per-chunk `Vec` + its
 /// `KvObj` clones), never the whole keyspace, and `snapshot_chunk` RELEASES the store borrow
-/// between chunks. So a `BGSAVE` that calls this on the shard's own executor (re-borrowing the
-/// store per chunk and yielding between chunks) does not double the shard's memory and does not
-/// hold the shard's hot path for the whole dump. A synchronous `SAVE` holds the borrow for the
-/// dump (it blocks by design, Redis parity), but still never double-memories.
+/// between chunks. The MEMORY property holds unconditionally: a `BGSAVE` or `SAVE` never doubles the
+/// shard's memory. The borrow-release between chunks MAKES IT POSSIBLE to yield the shard between
+/// chunks, but the current per-shard dump caller (the coordinator's `save_shard_local`) holds the
+/// store borrow across the WHOLE `dump_shard_keyspace` call + the fsync, so BOTH `SAVE` AND `BGSAVE`
+/// BLOCK the dumping shard for its full keyspace dump + fsync latency (per-shard-consistent). BGSAVE
+/// differs from SAVE only in not blocking the ISSUING connection (it spawns + acks immediately); it
+/// does NOT make the dump itself non-blocking on the dumping shard.
 ///
 /// `&S` is a SHARED borrow: the dump never mutates the store (it does not even reap the
 /// lazily-expired keys it skips, unlike a command-path read), so it is purely an observer.
@@ -201,6 +227,24 @@ pub fn read_manifest(dir: &Path) -> Option<Manifest> {
     Manifest::decode(&bytes)
 }
 
+/// Read + CRC-validate one shard's committed snapshot file, returning its RECORD BODY bytes, or
+/// `None` when there is nothing loadable for that shard (a referenced-but-missing file, a foreign /
+/// wrong-version / wrong-shard header, or a CRC mismatch = a TORN file).
+///
+/// CRASH-SAFETY: a CRC mismatch means the file is torn (a half-written file the manifest does not
+/// vouch for, or bit-rot); the caller treats `None` as no-snapshot for that file (load nothing)
+/// rather than feeding corrupt bytes to the decoder.
+fn read_validated_shard_file(dir: &Path, entry: &ShardManifestEntry) -> Option<Vec<u8>> {
+    let path = dir.join(&entry.file);
+    let bytes = format::read_file(&path)?; // a referenced-but-missing file: load nothing.
+    // split_shard_header borrows `bytes`; recompute the body range so we can return an OWNED body.
+    let body = format::split_shard_header(&bytes, entry.shard)?; // foreign / wrong-version / shard.
+    if format::crc32(body) != entry.crc {
+        return None; // a torn file: never corrupt-load.
+    }
+    Some(bytes[format::SHARD_HEADER_LEN..].to_vec())
+}
+
 /// LOAD one shard's committed snapshot file into `store` (the load-on-boot path), replaying each
 /// decoded [`ironcache_store::KvObj`] through [`ironcache_store::ShardStore::insert_object`] under
 /// its recorded `db`. Returns the number of keys loaded.
@@ -215,62 +259,108 @@ pub fn read_manifest(dir: &Path) -> Option<Manifest> {
 /// `now` is not inserted), so a snapshot taken long ago does not resurrect dead keys.
 ///
 /// A missing file (the manifest references a file that is not present) loads nothing.
+///
+/// NOTE: this is the SAME-SHARD-COUNT helper used by the persist crate's own tests; the binary's
+/// boot path uses [`load_all`], which RE-SHARDS every key by `route(key, shard_count)` and is
+/// therefore correct across a shard-count change (see [`load_all`]).
 pub fn load_shard_from_dir<E: EvictionHook, A: AccountingHook>(
     store: &mut ShardStore<E, A>,
     dir: &Path,
     entry: &ShardManifestEntry,
     now: UnixMillis,
 ) -> u64 {
-    let path = dir.join(&entry.file);
-    let Some(bytes) = format::read_file(&path) else {
-        return 0; // a referenced-but-missing file: load nothing for this shard.
-    };
-    let Some(body) = format::split_shard_header(&bytes, entry.shard) else {
-        return 0; // a foreign / wrong-version / wrong-shard header: ignore the file.
-    };
-    // CRASH-SAFETY: validate the body against the committed manifest CRC. A mismatch means the
-    // file is torn (a half-written file the manifest does not vouch for, or bit-rot): treat the
-    // shard as no-snapshot (load nothing) rather than feeding corrupt bytes to the decoder.
-    if format::crc32(body) != entry.crc {
+    let Some(body) = read_validated_shard_file(dir, entry) else {
         return 0;
-    }
-    load_records_into(store, body, now)
+    };
+    // No re-shard filter: accept every record (the caller is the single-store, same-layout path).
+    load_records_into(store, &body, now, |_key| true)
 }
 
-/// LOAD the WHOLE committed snapshot in `dir` into `stores` (one mutable store per shard, in
-/// shard-index order), the boot convenience wrapper [`read_manifest`] + [`load_shard_from_dir`]
-/// per shard. Returns the total keys loaded, or `0` (and loads nothing) when there is no loadable
-/// snapshot. A manifest entry whose shard index is past `stores.len()` is loaded into the store
-/// at `shard % stores.len()` so a snapshot taken with MORE shards than the loading node has still
-/// reconstructs the full keyspace (the store re-hashes each key into its owning db; SCAN order is
-/// recomputed from the key bytes, so a shard-count change is correctness-preserving).
-pub fn load_all<E: EvictionHook, A: AccountingHook>(
-    stores: &mut [&mut ShardStore<E, A>],
+/// LOAD this shard's slice of a committed snapshot, RE-SHARDING across a shard-count change (the
+/// C1 fix). `this_shard` / `shard_count` are the CURRENT (loading-node) shard index + total; the
+/// boot path calls this once per shard, EACH shard reading the WHOLE snapshot and keeping only the
+/// keys it now owns. Returns the keys loaded into THIS shard's `store`.
+///
+/// ## Correct across a shard-count change
+///
+/// The snapshot's per-shard files were partitioned by the shard count AT SAVE TIME
+/// (`manifest.shards`). The loading node may have a DIFFERENT count (`shard_count`): a key in
+/// file-i at save time is NOT necessarily owned by shard-i now. So load does NOT blindly replay
+/// file-i into shard-i (which would SILENTLY LOSE keys when the count shrinks, and MISROUTE every
+/// GET when it grows). Instead THIS shard reads EVERY manifest shard file, decodes each key, and
+/// inserts ONLY the keys where `route(key, shard_count) == this_shard` -- the SAME owner-shard hash
+/// the router uses, so a reloaded key lives exactly where a fresh client write would put it. Every
+/// shard doing this reconstructs the full keyspace for ANY N->M change; with N == M each shard's
+/// own file is the only file that contributes keys it owns, so the result equals a per-file replay.
+/// (Per-shard reads-all-files = boot-time read amplification, accepted.)
+///
+/// `route` MUST be the router's owner-shard function (`ironcache_server::owner_shard`); passing a
+/// different hash would scatter keys to the wrong shards.
+///
+/// A torn / CRC-bad / missing shard file is skipped (its keys are absent), never corrupt-loaded.
+/// `now` drops an already-expired key on load.
+pub fn load_shard_resharded<E: EvictionHook, A: AccountingHook, R: Fn(&[u8], usize) -> usize>(
+    store: &mut ShardStore<E, A>,
     dir: &Path,
+    this_shard: usize,
+    shard_count: usize,
     now: UnixMillis,
+    route: R,
 ) -> u64 {
     let Some(manifest) = read_manifest(dir) else {
         return 0;
     };
-    if stores.is_empty() {
+    if shard_count == 0 {
         return 0;
     }
     let mut total = 0u64;
+    // Read EVERY manifest shard file once (boot-time read amplification, accepted) and keep only the
+    // keys this shard now owns under the CURRENT shard count.
     for entry in &manifest.entries {
-        let idx = (entry.shard as usize) % stores.len();
-        total += load_shard_from_dir(stores[idx], dir, entry, now);
+        let Some(body) = read_validated_shard_file(dir, entry) else {
+            continue; // a torn / missing file: its keys are absent (never corrupt-load).
+        };
+        total += load_records_into(store, &body, now, |key| {
+            route(key, shard_count) == this_shard
+        });
+    }
+    total
+}
+
+/// LOAD the WHOLE committed snapshot in `dir` into `stores` (one mutable store per shard, in
+/// shard-index order), RE-SHARDING every key into its OWNING shard for the CURRENT shard count.
+/// This is the all-stores convenience wrapper around [`load_shard_resharded`] (it loops the shards
+/// for the caller); the binary's boot path instead calls [`load_shard_resharded`] per shard because
+/// each shard owns its store on its own thread. Returns the total keys loaded, or `0` when there is
+/// no loadable snapshot. See [`load_shard_resharded`] for the re-shard correctness argument.
+///
+/// `route` MUST be the router's owner-shard function (`ironcache_server::owner_shard`).
+pub fn load_all<E: EvictionHook, A: AccountingHook, R: Fn(&[u8], usize) -> usize + Copy>(
+    stores: &mut [&mut ShardStore<E, A>],
+    dir: &Path,
+    now: UnixMillis,
+    route: R,
+) -> u64 {
+    let n = stores.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut total = 0u64;
+    for (shard, store) in stores.iter_mut().enumerate() {
+        total += load_shard_resharded(store, dir, shard, n, now, route);
     }
     total
 }
 
 /// Decode every record in a shard file `body` and insert each into `store` under its recorded db,
-/// dropping any key whose TTL has already passed at `now`. Returns the count inserted. TOTAL: a
-/// record that fails to decode, or whose db is out of range, is skipped (the decode is
-/// bounds-checked and never panics).
-fn load_records_into<E: EvictionHook, A: AccountingHook>(
+/// dropping any key whose TTL has already passed at `now` and any key `keep` rejects. Returns the
+/// count inserted. TOTAL: a record that fails to decode, or whose db is out of range, is skipped
+/// (the decode is bounds-checked and never panics).
+fn load_records_into<E: EvictionHook, A: AccountingHook, K: Fn(&[u8]) -> bool>(
     store: &mut ShardStore<E, A>,
     body: &[u8],
     now: UnixMillis,
+    keep: K,
 ) -> u64 {
     let databases = store.databases() as u32;
     let mut loaded = 0u64;
@@ -282,6 +372,9 @@ fn load_records_into<E: EvictionHook, A: AccountingHook>(
         let Some(kv) = ironcache_repl::decode_kvobj(rec) else {
             continue; // a malformed record (cannot happen once the CRC matched): skip it.
         };
+        if !keep(&kv.key) {
+            continue; // a key this caller does not own (the re-shard filter): skip it.
+        }
         // Drop an already-expired key on load: a deadline strictly in the past at `now` is dead.
         if let Some(UnixMillis(deadline)) = kv.expire_at {
             if now.0 > deadline {
@@ -301,6 +394,36 @@ mod tests {
     use ironcache_store::{KvObj, ShardStore};
 
     type TestStore = ShardStore<NullEviction, CountingAccounting>;
+
+    /// The shard count the C1 mismatch test SAVES with (re-shard then loads into 2 + 8).
+    const SAVE_SHARDS: usize = 4;
+    /// The DATABASE count for every test store (the `ShardStore::new` arg; unrelated to shards).
+    const DBS: u32 = 4;
+
+    // The EXACT router owner-shard hash (FNV-1a 64-bit, the same constants as
+    // `ironcache_server::route::owner_shard`). This crate does not depend on `ironcache-server`, so
+    // the tests reproduce the hash to verify re-shard places a key EXACTLY where the live router
+    // would. The binary passes `ironcache_server::owner_shard` itself (see `crate::persist`).
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn test_hash64(key: &[u8]) -> u64 {
+        let mut hash = FNV_OFFSET_BASIS;
+        for &b in key {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+    fn test_owner_shard(key: &[u8], n_shards: usize) -> usize {
+        let n = n_shards.max(1) as u64;
+        usize::try_from(test_hash64(key) % n).expect("modulo fits usize")
+    }
+
+    /// Load a single shard file body into one store with NO re-shard filter (the test helper for the
+    /// same-shard-count path; mirrors `load_shard_from_dir`'s `|_| true`).
+    fn load_body_all(store: &mut TestStore, body: &[u8], now: UnixMillis) -> u64 {
+        load_records_into(store, body, now, |_key| true)
+    }
 
     /// A throwaway temp directory unique to the test + process (so concurrent test runs do not
     /// collide). Created fresh; the caller removes it at the end.
@@ -361,7 +484,7 @@ mod tests {
         );
 
         let mut dst: TestStore = ShardStore::new(4);
-        let loaded = load_records_into(&mut dst, body, now);
+        let loaded = load_body_all(&mut dst, body, now);
         assert_eq!(loaded, expected);
         assert_eq!(dst.len(), src.len(), "DBSIZE-equivalent matches");
 
@@ -399,7 +522,7 @@ mod tests {
         let body = format::split_shard_header(&dump.bytes, 0).unwrap();
         let mut dst: TestStore = ShardStore::new(1);
         // Load LATER (now=7000 > 6000): the expired key is dropped, the permanent one kept.
-        let loaded = load_records_into(&mut dst, body, UnixMillis(7_000));
+        let loaded = load_body_all(&mut dst, body, UnixMillis(7_000));
         assert_eq!(loaded, 1, "the expired key is dropped on load");
         assert!(dst.read(0, b"soon", UnixMillis(7_000)).is_none());
         assert!(dst.read(0, b"keep", UnixMillis(7_000)).is_some());
@@ -434,16 +557,18 @@ mod tests {
         let now = UnixMillis(2_000);
         let dir = temp_dir("manifest");
 
-        // Two shards, each with its own partition.
-        let mut s0: TestStore = ShardStore::new(2);
-        let mut s1: TestStore = ShardStore::new(2);
-        s0.insert_object(0, KvObj::from_bytes(b"a", b"1", None));
-        s0.insert_object(1, KvObj::from_int(b"b", 99, None));
-        s1.insert_object(0, KvObj::from_bytes(b"c", b"three", None));
+        // Two shards: place each key on its REAL owner (the router hash), so the per-shard files
+        // hold exactly the keys their shard owns -- the production invariant the dump preserves.
+        let mut s: [TestStore; 2] = [ShardStore::new(2), ShardStore::new(2)];
+        let keyvals: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"bee", b"99"), (b"c", b"three")];
+        for (k, v) in keyvals {
+            let owner = test_owner_shard(k, 2);
+            s[owner].insert_object(0, KvObj::from_bytes(k, v, None));
+        }
 
         // SAVE: per-shard files, then commit the manifest LAST.
-        let e0 = save_shard_to_dir(&s0, 0, &dir, now).unwrap();
-        let e1 = save_shard_to_dir(&s1, 1, &dir, now).unwrap();
+        let e0 = save_shard_to_dir(&s[0], 0, &dir, now).unwrap();
+        let e1 = save_shard_to_dir(&s[1], 1, &dir, now).unwrap();
         let manifest = write_manifest(&dir, 1, 1_700_000_000, vec![e1, e0]).unwrap();
         assert_eq!(manifest.shards, 2);
         assert_eq!(manifest.total_keys(), 3);
@@ -452,15 +577,75 @@ mod tests {
         assert_eq!(manifest.entries[0].shard, 0);
         assert_eq!(manifest.entries[1].shard, 1);
 
-        // LOAD the whole snapshot into fresh stores via the manifest.
+        // LOAD the whole snapshot into fresh stores via the manifest, RE-SHARDING by the router hash
+        // (same shard count, so each key lands back on its owner). All three keys round-trip.
         let mut d0: TestStore = ShardStore::new(2);
         let mut d1: TestStore = ShardStore::new(2);
         let mut stores: Vec<&mut TestStore> = vec![&mut d0, &mut d1];
-        let total = load_all(&mut stores, &dir, now);
+        let total = load_all(&mut stores, &dir, now, test_owner_shard);
         assert_eq!(total, 3);
-        assert!(d0.read(0, b"a", now).is_some());
-        assert!(d0.read(1, b"b", now).is_some());
-        assert!(d1.read(0, b"c", now).is_some());
+        for (k, v) in keyvals {
+            let owner = test_owner_shard(k, 2);
+            let got = stores[owner]
+                .read(0, k, now)
+                .expect("key present on its owner");
+            assert_eq!(got.as_bytes(), *v, "{k:?} round-trips on its owner shard");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE C1 TEST: a snapshot saved with N shards loads CORRECTLY into a node with M != N shards
+    /// (re-shard on load). Save 4 shards, then reload into 2 and into 8, and assert EVERY key is
+    /// readable on its (re-computed) owner -- no key lost when the count shrinks, no GET misrouted
+    /// when it grows. This is the bug the old "file-i -> shard-i" load would have silently failed.
+    #[test]
+    fn shard_count_mismatch_reshards_every_key() {
+        let now = UnixMillis(1_000);
+        let dir = temp_dir("reshard");
+
+        // Save with 4 shards: distribute 200 keys onto their real owners over 4 shards. (The store
+        // ctor arg is the DATABASE count, unrelated to the logical shard count the route uses.)
+        let total_keys = 200usize;
+        let mut src: Vec<TestStore> = (0..SAVE_SHARDS).map(|_| ShardStore::new(DBS)).collect();
+        for i in 0..total_keys {
+            let key = format!("key:{i}");
+            let owner = test_owner_shard(key.as_bytes(), SAVE_SHARDS);
+            src[owner].insert_object(
+                0,
+                KvObj::from_bytes(key.as_bytes(), format!("v{i}").as_bytes(), None),
+            );
+        }
+        let mut entries = Vec::new();
+        for (shard, store) in src.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let e = save_shard_to_dir(store, shard as u32, &dir, now).unwrap();
+            entries.push(e);
+        }
+        let manifest = write_manifest(&dir, 1, 1_700_000_000, entries).unwrap();
+        assert_eq!(manifest.shards, 4);
+        assert_eq!(manifest.total_keys() as usize, total_keys);
+
+        // Reload into a DIFFERENT shard count and assert every key is present on its new owner.
+        for &load_shards in &[2usize, 8usize] {
+            let mut dst: Vec<TestStore> = (0..load_shards).map(|_| ShardStore::new(DBS)).collect();
+            let mut refs: Vec<&mut TestStore> = dst.iter_mut().collect();
+            let loaded = load_all(&mut refs, &dir, now, test_owner_shard) as usize;
+            assert_eq!(
+                loaded, total_keys,
+                "all {total_keys} keys re-shard into {load_shards} shards (none lost)"
+            );
+            for i in 0..total_keys {
+                let key = format!("key:{i}");
+                let owner = test_owner_shard(key.as_bytes(), load_shards);
+                let got = refs[owner]
+                    .read(0, key.as_bytes(), now)
+                    .unwrap_or_else(|| panic!("key:{i} missing after reshard to {load_shards}"));
+                assert_eq!(got.as_bytes(), format!("v{i}").as_bytes());
+            }
+            // And no key landed on the WRONG shard (a misroute would leave it unreadable on owner).
+            let dbsize: usize = refs.iter().map(|s| s.len()).sum();
+            assert_eq!(dbsize, total_keys, "no duplicate / stray key after reshard");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -471,7 +656,10 @@ mod tests {
         let mut stores: Vec<&mut TestStore> = vec![&mut d0];
         // No save has happened: read_manifest is None, load_all loads nothing (start-empty).
         assert!(read_manifest(&dir).is_none());
-        assert_eq!(load_all(&mut stores, &dir, UnixMillis(1)), 0);
+        assert_eq!(
+            load_all(&mut stores, &dir, UnixMillis(1), test_owner_shard),
+            0
+        );
         assert!(d0.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }

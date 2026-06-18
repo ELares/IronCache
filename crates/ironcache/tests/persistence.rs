@@ -7,7 +7,7 @@
 //! cross-shard `__ICSAVE` fan-out (each shard dumps its own partition via the forkless
 //! `snapshot_chunk`) -> the atomic manifest commit -> load-on-boot in each shard's drain loop.
 
-use ironcache::test_support::run_persist_server_for_test;
+use ironcache::test_support::{run_persist_server_for_test, run_persist_server_with_auth_for_test};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -72,6 +72,17 @@ async fn get_raw(client: &mut TcpStream, key: &str) -> Vec<u8> {
 /// Send a bare arity-1 command (SAVE / LASTSAVE / BGSAVE / DBSIZE) and return its raw reply.
 async fn cmd1(client: &mut TcpStream, name: &str) -> Vec<u8> {
     let frame = format!("*1\r\n${}\r\n{}\r\n", name.len(), name);
+    client.write_all(frame.as_bytes()).await.unwrap();
+    read_one(client).await
+}
+
+/// Encode + send an arbitrary command (each arg a bulk string) and return its raw reply.
+async fn cmd(client: &mut TcpStream, args: &[&str]) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let mut frame = format!("*{}\r\n", args.len());
+    for a in args {
+        write!(frame, "${}\r\n{}\r\n", a.len(), a).unwrap();
+    }
     client.write_all(frame.as_bytes()).await.unwrap();
     read_one(client).await
 }
@@ -238,4 +249,149 @@ async fn persistence_off_is_noop_and_writes_no_files() {
     assert_eq!(get_raw(&mut c, "k").await, bulk("v"));
     drop(c);
     server.shutdown_and_join().unwrap();
+}
+
+/// H2 REGRESSION: with `requirepass` set, the persistence-command interception is AUTH-GATED. An
+/// UNAUTHENTICATED client gets `-NOAUTH` for SAVE / BGSAVE / LASTSAVE and NO snapshot is written;
+/// after AUTH the same commands work and a snapshot is committed. (Before the fix the interception
+/// returned before dispatch's auth gate, so an unauthenticated client could DoS via SAVE/BGSAVE and
+/// read LASTSAVE.)
+#[tokio::test(flavor = "current_thread")]
+async fn persistence_commands_are_auth_gated() {
+    let dir = temp_data_dir("auth");
+    let port = free_port();
+    let server = run_persist_server_with_auth_for_test(port, 2, dir.clone(), "s3cr3t");
+    let mut c = connect_retry(port).await;
+
+    // UNAUTHENTICATED: every persistence command is rejected with NOAUTH (and performs no save).
+    let noauth = b"-NOAUTH Authentication required.\r\n";
+    assert_eq!(cmd1(&mut c, "SAVE").await, noauth, "unauth SAVE is NOAUTH");
+    assert_eq!(
+        cmd1(&mut c, "BGSAVE").await,
+        noauth,
+        "unauth BGSAVE is NOAUTH"
+    );
+    assert_eq!(
+        cmd1(&mut c, "LASTSAVE").await,
+        noauth,
+        "unauth LASTSAVE is NOAUTH"
+    );
+    // Give any (wrongly-spawned) background save a moment, then assert NOTHING was written.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !dir.join("dump.manifest").exists(),
+        "no snapshot committed by an unauthenticated client"
+    );
+
+    // AUTH, then the same commands succeed.
+    assert_eq!(cmd(&mut c, &["AUTH", "s3cr3t"]).await, b"+OK\r\n");
+    assert_eq!(
+        cmd1(&mut c, "LASTSAVE").await,
+        b":0\r\n",
+        "auth LASTSAVE ok"
+    );
+    set(&mut c, "k", "v").await;
+    assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n", "auth SAVE persists");
+    assert!(
+        dir.join("dump.manifest").exists(),
+        "an authenticated SAVE commits the snapshot"
+    );
+    drop(c);
+    server.shutdown_and_join().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Broadened round-trip (the task's test-gap fix): a key of EVERY core type -- string, list, hash,
+/// set, zset, plus a bitmap (string-backed) and an HLL -- SAVE, restart, and assert each round-trips
+/// intact through the snapshot codec.
+#[tokio::test(flavor = "current_thread")]
+async fn all_types_round_trip_through_save_restart() {
+    let dir = temp_data_dir("alltypes");
+    let port = free_port();
+
+    // -- Boot 1: write one key of each type, SAVE. --
+    {
+        let server = run_persist_server_for_test(port, 4, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+        set(&mut c, "str", "hello").await;
+        assert_eq!(
+            cmd(&mut c, &["RPUSH", "lst", "a", "b", "c"]).await,
+            b":3\r\n"
+        );
+        assert_eq!(
+            cmd(&mut c, &["HSET", "hsh", "f1", "v1", "f2", "v2"]).await,
+            b":2\r\n"
+        );
+        assert_eq!(
+            cmd(&mut c, &["SADD", "set", "x", "y", "z"]).await,
+            b":3\r\n"
+        );
+        assert_eq!(
+            cmd(&mut c, &["ZADD", "zst", "1", "one", "2", "two"]).await,
+            b":2\r\n"
+        );
+        // A bitmap (string-backed): SETBIT returns the prior bit (0).
+        assert_eq!(cmd(&mut c, &["SETBIT", "bmp", "7", "1"]).await, b":0\r\n");
+        // An HLL: PFADD of new elements returns 1 (the registers changed).
+        assert_eq!(
+            cmd(&mut c, &["PFADD", "hll", "e1", "e2", "e3"]).await,
+            b":1\r\n"
+        );
+        assert_eq!(cmd1(&mut c, "SAVE").await, b"+OK\r\n");
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    // -- Boot 2: a fresh server reloads each type intact. --
+    {
+        let server = run_persist_server_for_test(port, 4, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+        assert_eq!(get_raw(&mut c, "str").await, bulk("hello"), "string");
+        // List: LRANGE 0 -1 -> [a b c].
+        assert_eq!(
+            cmd(&mut c, &["LRANGE", "lst", "0", "-1"]).await,
+            b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+            "list order + members"
+        );
+        // Hash: HGET each field.
+        assert_eq!(
+            cmd(&mut c, &["HGET", "hsh", "f1"]).await,
+            bulk("v1"),
+            "hash f1"
+        );
+        assert_eq!(
+            cmd(&mut c, &["HGET", "hsh", "f2"]).await,
+            bulk("v2"),
+            "hash f2"
+        );
+        // Set: SCARD == 3, and a member is present.
+        assert_eq!(cmd(&mut c, &["SCARD", "set"]).await, b":3\r\n", "set card");
+        assert_eq!(
+            cmd(&mut c, &["SISMEMBER", "set", "y"]).await,
+            b":1\r\n",
+            "set member"
+        );
+        // Zset: ZSCORE round-trips the score.
+        assert_eq!(
+            cmd(&mut c, &["ZSCORE", "zst", "two"]).await,
+            bulk("2"),
+            "zset score"
+        );
+        // Bitmap: the set bit survives.
+        assert_eq!(
+            cmd(&mut c, &["GETBIT", "bmp", "7"]).await,
+            b":1\r\n",
+            "bitmap bit"
+        );
+        // HLL: the cardinality estimate is 3 for our 3 distinct elements.
+        assert_eq!(
+            cmd(&mut c, &["PFCOUNT", "hll"]).await,
+            b":3\r\n",
+            "hll count"
+        );
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
 }

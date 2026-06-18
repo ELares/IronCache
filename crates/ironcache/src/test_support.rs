@@ -62,6 +62,38 @@ pub fn run_persist_server_for_test(
     run_server(&config).expect("test persist server failed to bind")
 }
 
+/// Boot a real server with PERSISTENCE ENABLED and a `requirepass` (#58 + #65), so a test can prove
+/// the persistence command interception is AUTH-GATED (H2): an UNAUTHENTICATED client must get
+/// `-NOAUTH` for SAVE / BGSAVE / LASTSAVE and write no snapshot. `password` is the PLAINTEXT a client
+/// AUTHs with; it is stored hashed at rest (SHA-256 hex), matching `Config::finalize_requirepass`
+/// (this builds `Config` directly, bypassing `resolve`, so it must hash here).
+///
+/// # Panics
+///
+/// Panics if the config fails to validate or the server fails to bind.
+#[must_use]
+pub fn run_persist_server_with_auth_for_test(
+    port: u16,
+    shards: usize,
+    data_dir: PathBuf,
+    password: &str,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        data_dir: Some(data_dir),
+        // The runtime auth overlay reads the requirepass as the SHA-256 hex digest AT REST (#65).
+        requirepass: Some(ironcache_config::sha256_hex(password.as_bytes())),
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test persist+auth config must validate");
+    run_server(&config).expect("test persist+auth server failed to bind")
+}
+
 /// Boot a real server with embedded TLS ENABLED (`tls = on`, #105) on `127.0.0.1:port` across
 /// `shards` shards, presenting the cert/key at `cert_path` / `key_path`, and return the running
 /// [`ShardSet`]. The client listener is TLS-only: a plaintext client to this port fails the

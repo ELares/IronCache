@@ -804,8 +804,11 @@ pub fn run_local_publish(request: &Request) -> Value {
 /// It reads `now` from THIS shard's Env clock (the determinism seam, ADR-0003: the lazy-expiry
 /// basis the dump skips dead keys at) via a SHORT shared borrow, and borrows the store READ-ONLY
 /// for the dump (the dump never mutates). Both borrows are taken + released inside this synchronous
-/// call (the no-borrow-across-await contract; the dump's `snapshot_chunk` itself releases + retakes
-/// the store borrow per chunk, so even a large dump never holds the borrow across the whole walk).
+/// call (the no-borrow-across-await contract). NOTE (M4): this holds the store borrow across the
+/// ENTIRE `save_shard_to_dir` call -- the whole keyspace dump AND the file fsync -- so this shard is
+/// BLOCKED for its full dump + fsync latency (per-shard-consistent). The chunked `snapshot_chunk`
+/// bounds the dump's MEMORY to O(`DUMP_CHUNK`), but the borrow is NOT released between chunks here,
+/// so BGSAVE blocks this shard exactly as SAVE does (BGSAVE only frees the ISSUING connection).
 /// Produces NO counter deltas (a save is not a keyed write).
 #[must_use]
 fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
@@ -866,24 +869,21 @@ pub fn run_local_save(ctx: &ServerContext, request: &Request) -> ShardReply {
     }
 }
 
-/// LOAD this shard's committed snapshot file into its store at boot (#58 load-on-boot), if there is
-/// a loadable snapshot whose manifest references `shard_index`. A missing manifest / a missing or
-/// torn shard file loads NOTHING (the shard starts empty, today's behavior). Synchronous: the store
-/// borrow is taken + released here (no `.await` held across it), and `now` is read from THIS shard's
-/// Env clock (the determinism seam, ADR-0003: an already-expired key is dropped on load).
+/// LOAD this shard's slice of the committed snapshot into its store at boot (#58 load-on-boot),
+/// RE-SHARDING across any shard-count change (the C1 fix). THIS shard reads EVERY manifest shard
+/// file and keeps only the keys it OWNS under the CURRENT shard count (`ctx.shards`), using the
+/// SAME `ironcache_server::owner_shard` hash the router routes a single-key command with. So a
+/// snapshot saved with N shards loads CORRECTLY into a node with M != N shards: with fewer shards
+/// no key is lost (every file is read), with more shards no GET misroutes (each key lands on its
+/// real owner). A missing manifest / a missing or torn shard file loads NOTHING for that file (the
+/// shard's keys from it are absent, never corrupt-loaded). Synchronous: the store borrow is taken +
+/// released here (no `.await` held across it), and `now` is read from THIS shard's Env clock (the
+/// determinism seam, ADR-0003: an already-expired key is dropped on load).
 fn load_shard_on_boot(
     ctx: &ServerContext,
     persist: &Arc<crate::persist::PersistState>,
     shard_index: usize,
 ) {
-    let Some(manifest) = ironcache_persist::read_manifest(&persist.dir) else {
-        return; // no committed snapshot: start empty (byte-unchanged default).
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let want = shard_index as u32;
-    let Some(entry) = manifest.entries.iter().find(|e| e.shard == want) else {
-        return; // the manifest does not reference this shard (e.g. a shard-count change): empty.
-    };
     let env = shard_env();
     let store_rc = shard_store(
         ctx.databases,
@@ -891,9 +891,19 @@ fn load_shard_on_boot(
         crate::serve::scan_reserved_bits(ctx.shards),
     );
     let now = UnixMillis(env.borrow().now_unix_millis());
+    // The CURRENT shard count: the router computes owner_shard(key, shard_count), so re-shard with
+    // the SAME count + hash the live serve loop routes with.
+    let shard_count = ctx.shards.max(1);
     let loaded = {
         let mut store = store_rc.borrow_mut();
-        ironcache_persist::load_shard_from_dir(&mut store, &persist.dir, entry, now)
+        ironcache_persist::load_shard_resharded(
+            &mut store,
+            &persist.dir,
+            shard_index,
+            shard_count,
+            now,
+            ironcache_server::owner_shard,
+        )
     };
     if loaded > 0 {
         eprintln!(
@@ -937,13 +947,13 @@ fn spawn_periodic_save(
                 continue;
             }
             // Serialize against a concurrent SAVE/BGSAVE; if one is already running, skip this tick.
-            if !persist.try_begin_save() {
+            // The RAII guard releases the latch on completion, panic, OR cancellation (H3).
+            let Some(_guard) = persist.try_begin_save() else {
                 continue;
-            }
+            };
             // The save timestamp from shard 0's Env clock (the determinism seam, ADR-0003).
             let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
             let _ = crate::persist::do_save_all(&persist, &inbox, &ctx, home, 0, now_secs).await;
-            persist.release_save();
         }
     });
 }

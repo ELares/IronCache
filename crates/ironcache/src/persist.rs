@@ -18,19 +18,24 @@
 //! A node runs `shards` per-core stores (ADR-0002, shared-nothing). A save FANS OUT an internal
 //! `__ICSAVE` verb to every shard via the coordinator: each shard runs
 //! [`ironcache_persist::save_shard_to_dir`] against ITS OWN store ON ITS OWN thread (the forkless,
-//! memory-neutral, borrow-releasing `snapshot_chunk` pull), writes `<data_dir>/dump-shard-<n>.icss`
-//! ATOMICALLY (tmp -> fsync -> rename), and returns its manifest entry. The home core then COMMITS
-//! the snapshot by writing the manifest LAST (atomic + fsync'd), so a crash mid-save leaves the
-//! prior good snapshot.
+//! memory-neutral `snapshot_chunk` pull), writes `<data_dir>/dump-shard-<n>.icss` ATOMICALLY (tmp ->
+//! fsync -> rename), and returns its manifest entry. The home core then COMMITS the snapshot by
+//! writing the manifest LAST (atomic + fsync'd), so a crash mid-save leaves the prior good snapshot.
+//!
+//! Because each shard dumps at its OWN instant, the cross-shard snapshot is PER-SHARD-CONSISTENT but
+//! CROSS-SHARD FUZZY (no global point-in-time); acceptable for a cache, NOT a fork-COW RDB.
 //!
 //! ## `SAVE` vs `BGSAVE`
 //!
 //! - `SAVE` BLOCKS the issuing connection until every shard has written + the manifest is committed
-//!   (Redis parity), then replies `+OK`. The per-shard dump still uses the forkless
-//!   borrow-releasing `snapshot_chunk`, so it never double-memories the keyspace.
-//! - `BGSAVE` kicks the SAME save off the request path (spawned on the home shard's executor) and
-//!   replies `+Background saving started` immediately. The dump runs on the shards' executors via
-//!   the coordinator, yielding between chunks, so it does not block any shard's hot path materially.
+//!   (Redis parity), then replies `+OK`. The per-shard dump uses the forkless `snapshot_chunk`, so
+//!   it never double-memories the keyspace.
+//! - `BGSAVE` kicks the SAME save off the ISSUING request path (spawned on the home shard's
+//!   executor) and replies `+Background saving started` immediately, so the ISSUING connection is
+//!   not blocked. NOTE: each dumping shard STILL holds its store borrow across its full dump + fsync
+//!   (`save_shard_local` does not yield between chunks), so BGSAVE BLOCKS EACH SHARD for the
+//!   duration of ITS OWN dump (per-shard-consistent); it is not a fully non-blocking background dump
+//!   on the dumping shard. The win over SAVE is purely that the issuing client is freed immediately.
 //!
 //! ## Default-off (#58)
 //!
@@ -130,15 +135,31 @@ impl PersistState {
         self.dirty.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Try to ACQUIRE the save latch; returns `true` if this caller won it (and must
-    /// [`Self::release_save`] when done), `false` if a save is already in progress.
-    pub fn try_begin_save(&self) -> bool {
-        self.saving
+    /// Try to ACQUIRE the save latch, returning a [`SaveGuard`] RAII handle if this caller won it
+    /// (the guard CLEARS the latch on drop -- normal completion, panic-unwind, OR task cancellation),
+    /// or `None` if a save is already in progress.
+    ///
+    /// H3: the guard is the ONLY release path. The previous bare `release_save()` after the
+    /// `.await` was NOT panic/cancel-safe: if `do_save_all` panicked, or a spawned BGSAVE task was
+    /// cancelled at shutdown before the release ran, the `saving` flag stayed `true` FOREVER and
+    /// every later save became a silent no-op (so a later restart lost everything since the stuck
+    /// save). Releasing in `Drop` fixes all three (completion, unwind, cancel).
+    pub fn try_begin_save(self: &Arc<Self>) -> Option<SaveGuard> {
+        if self
+            .saving
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+        {
+            Some(SaveGuard {
+                persist: Arc::clone(self),
+            })
+        } else {
+            None
+        }
     }
 
-    /// Release the save latch after a save completes (success or failure).
+    /// Release the save latch (the low-level primitive [`SaveGuard`] calls on drop). Prefer
+    /// [`Self::try_begin_save`]'s guard; this is exposed only for the guard's `Drop`.
     pub fn release_save(&self) {
         self.saving.store(false, Ordering::Release);
     }
@@ -156,6 +177,23 @@ impl PersistState {
     #[must_use]
     pub fn next_save_id(&self) -> u64 {
         self.save_id.load(Ordering::Relaxed).saturating_add(1)
+    }
+}
+
+/// An RAII guard for the save latch (H3): held for the duration of one save, it CLEARS the `saving`
+/// flag on [`Drop`] -- on normal completion, on a panic unwinding through the save, AND on a spawned
+/// save task being CANCELLED (e.g. at shutdown). This guarantees ONE failed/cancelled save can never
+/// permanently wedge the latch (which would silently disable every later SAVE/BGSAVE and the
+/// periodic save). Obtain it from [`PersistState::try_begin_save`]; do NOT call `release_save`
+/// manually while a guard is live (the guard owns the release).
+#[derive(Debug)]
+pub struct SaveGuard {
+    persist: Arc<PersistState>,
+}
+
+impl Drop for SaveGuard {
+    fn drop(&mut self) {
+        self.persist.release_save();
     }
 }
 
@@ -220,8 +258,9 @@ fn icsave_request(save_unix_secs: u64, shard: usize, dir: &std::path::Path) -> R
 /// counter) and returns `Ok(())`; on any shard error or the manifest write failing returns an
 /// `Err(message)` the caller surfaces.
 ///
-/// SERIALIZED: the caller must hold the save latch ([`PersistState::try_begin_save`]) so two saves
-/// never race on the same files + manifest.
+/// SERIALIZED: the caller must hold the save latch ([`PersistState::try_begin_save`]'s [`SaveGuard`])
+/// so two saves never race on the same files + manifest. The guard releases the latch on drop
+/// (completion, panic, or cancellation), so this fn never needs to release it itself.
 ///
 /// The fan-out reuses [`coordinator::fan_out_split`] (a DIFFERENT sub-request per shard -- each
 /// carries its own shard index for its file name): the home shard's `__ICSAVE` runs LOCALLY +
@@ -279,12 +318,18 @@ pub async fn do_save_all(
     }
 }
 
-/// LOAD a committed snapshot into the per-shard stores at boot (#58 load-on-boot). Returns the
-/// total keys loaded, or `0` (loads nothing) when there is no loadable snapshot (no manifest / a
-/// torn manifest). Each manifest entry's file is loaded into the store for `entry.shard %
-/// stores.len()`, so a snapshot taken with a different shard count still reconstructs the full
-/// keyspace (the store re-hashes each key into its owning db; SCAN order is recomputed from the key
-/// bytes). A torn / CRC-bad shard file is skipped (that shard loads empty), never corrupt-loaded.
+/// LOAD a committed snapshot into the per-shard stores at boot (#58 load-on-boot), RE-SHARDING every
+/// key into its OWNING shard for the CURRENT shard count (the C1 fix). Returns the total keys
+/// loaded, or `0` (loads nothing) when there is no loadable snapshot (no manifest / a torn
+/// manifest). EVERY manifest shard file is read and each key is inserted into the store for
+/// `ironcache_server::owner_shard(key, stores.len())` -- the SAME owner-shard hash the router uses --
+/// so a snapshot taken with a DIFFERENT shard count reconstructs the full keyspace correctly (no key
+/// lost when the count shrinks, no GET misrouted when it grows). A torn / CRC-bad / missing shard
+/// file is skipped (its keys are absent), never corrupt-loaded.
+///
+/// The binary's live boot path does NOT call this (each shard owns its store on its own thread, so
+/// it calls [`ironcache_persist::load_shard_resharded`] per shard via the drain loop); this
+/// all-stores wrapper is the single-thread convenience used where every store is reachable at once.
 ///
 /// `now` is the boot wall-clock (the env Clock seam): an already-expired key is dropped on load.
 pub fn load_on_boot(
@@ -292,5 +337,74 @@ pub fn load_on_boot(
     stores: &mut [&mut crate::serve::ShardStoreImpl],
     now: ironcache_storage::UnixMillis,
 ) -> u64 {
-    ironcache_persist::load_all(stores, &persist.dir, now)
+    ironcache_persist::load_all(stores, &persist.dir, now, ironcache_server::owner_shard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// A bare `PersistState` for latch tests (no real data dir / save fan-out needed).
+    fn latch_state() -> Arc<PersistState> {
+        Arc::new(PersistState {
+            dir: PathBuf::from("/nonexistent-test-dir"),
+            interval_secs: 0,
+            min_changes: 0,
+            last_save_unix_secs: AtomicU64::new(0),
+            save_id: AtomicU64::new(0),
+            dirty: AtomicU64::new(0),
+            saving: AtomicBool::new(false),
+        })
+    }
+
+    /// The RAII guard serializes: while it is held a second `try_begin_save` is denied, and dropping
+    /// it frees the latch so the next save proceeds.
+    #[test]
+    fn save_guard_serializes_and_releases_on_drop() {
+        let p = latch_state();
+        let g = p.try_begin_save().expect("first save wins the latch");
+        assert!(
+            p.saving.load(Ordering::Acquire),
+            "latch held while guard live"
+        );
+        assert!(
+            p.try_begin_save().is_none(),
+            "a concurrent save is denied while the guard is held"
+        );
+        drop(g);
+        assert!(
+            !p.saving.load(Ordering::Acquire),
+            "the latch releases when the guard drops"
+        );
+        // The next save now proceeds (the latch is free).
+        let g2 = p
+            .try_begin_save()
+            .expect("the next save wins after release");
+        drop(g2);
+    }
+
+    /// H3 REGRESSION: a save that PANICS (unwinds) through the held guard STILL releases the latch,
+    /// so the next save is NOT permanently wedged. The old bare `release_save()` after the await was
+    /// skipped on a panic / cancellation, leaving `saving == true` forever.
+    #[test]
+    fn panicking_save_still_releases_the_latch() {
+        let p = latch_state();
+        let p2 = Arc::clone(&p);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = p2.try_begin_save().expect("won the latch");
+            assert!(p2.saving.load(Ordering::Acquire));
+            panic!("simulate a save panicking mid-flight");
+        }));
+        assert!(res.is_err(), "the save panicked");
+        assert!(
+            !p.saving.load(Ordering::Acquire),
+            "the latch is released on unwind (not wedged), so the next save can proceed"
+        );
+        // Prove the next save proceeds.
+        let g = p
+            .try_begin_save()
+            .expect("the next save proceeds after a panicked save");
+        drop(g);
+    }
 }

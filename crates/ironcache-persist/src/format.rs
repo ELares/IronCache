@@ -10,10 +10,15 @@
 //! of the keyspace on its own thread. So each shard writes its OWN file ON ITS OWN
 //! THREAD with no cross-shard lock (the per-shard dump is driven by the forkless
 //! `snapshot_chunk`, see [`crate::dump_shard_keyspace`]). The MANIFEST is the single
-//! COMMIT POINT that ties a set of per-shard files into one consistent snapshot: it
+//! COMMIT POINT that ties a set of per-shard files into ONE loadable snapshot: it
 //! records the format version, the shard count, and per-shard `(file, key count, CRC)`,
 //! plus a monotone save id / timestamp the caller passes through the env seam (the store
 //! reads no clock, ADR-0003).
+//!
+//! The snapshot is PER-SHARD-CONSISTENT but CROSS-SHARD FUZZY: each shard's file is a
+//! consistent point-in-time view of THAT shard, but shards dump at slightly different
+//! instants (no global lock / no fork-COW), so there is NO single global point-in-time.
+//! This is acceptable for a cache; it is NOT a fork-COW point-in-time snapshot (Redis RDB).
 //!
 //! ## Crash-safety (the atomic manifest commit)
 //!
@@ -126,10 +131,13 @@ pub struct ShardManifestEntry {
 pub struct Manifest {
     /// The on-disk format version ([`FORMAT_VERSION`] at write time; load rejects an unknown one).
     pub version: u32,
-    /// The number of shards this snapshot was taken from. Load reconstructs the keyspace from
-    /// EVERY listed shard; the shard count may differ from the loading node's shard count (a
-    /// reconfiguration), which is fine because the store re-hashes each key into its owning DB on
-    /// `insert_object` and the SCAN order is recomputed from the key bytes.
+    /// The number of shards this snapshot was taken from (the partition count at SAVE TIME). The
+    /// loading node may have a DIFFERENT shard count (a reconfiguration); load handles this by
+    /// RE-SHARDING -- each loading shard reads EVERY listed shard file and keeps only the keys it
+    /// OWNS under the CURRENT shard count, using the router's `owner_shard` hash (see
+    /// [`crate::load_shard_resharded`]). So this count is recorded for diagnostics + to drive that
+    /// re-shard; the WITHIN-store re-hash on `insert_object` only places a key into its owning DB,
+    /// NOT across shards, so the across-shard placement MUST come from the re-shard on load.
     pub shards: u32,
     /// A monotone SAVE ID (incremented per successful save). Informational / debugging; the
     /// commit ordering is the manifest rename, not this id.
