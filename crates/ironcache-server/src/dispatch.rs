@@ -298,6 +298,24 @@ fn maybe_hot_swap_policy<E: Env, S: PolicySwap>(
     }
 }
 
+/// The PRE-AUTH ALLOW-LIST (Redis: `HELLO`, `AUTH`, `QUIT`, `RESET`). With `requirepass`
+/// configured, a connection that has NOT yet authenticated may run ONLY these commands;
+/// every other command (data, admin, whole-keyspace, CLUSTER mutators, persistence,
+/// SHUTDOWN, the cross-shard fan-outs) is `-NOAUTH`. This is the SINGLE SOURCE OF TRUTH
+/// for that allow-list: both the downstream `dispatch_with_cmd` gate AND the hoisted
+/// serve-layer router chokepoint (`crate::serve::route_and_dispatch`) call it, so the two
+/// gates can NEVER diverge on which commands are allowed before auth. `cmd` MUST be the
+/// uppercased command token (the only form the callers hold).
+///
+/// Keep this list IDENTICAL to Redis (`ACLCheckAllPerm` allow-set: HELLO/AUTH/RESET +
+/// QUIT, which is connection teardown): do NOT add or remove a command here without a
+/// deliberate parity change -- it is the security boundary.
+#[inline]
+#[must_use]
+pub fn command_allowed_pre_auth(cmd: &[u8]) -> bool {
+    matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
+}
+
 /// Dispatch one CLIENT command: the top-of-command work that must run ONCE per
 /// command from the wire, then either QUEUE it (inside a transaction) or run it.
 ///
@@ -399,14 +417,19 @@ pub fn dispatch_with_cmd<
     // ONCE per client command (here), not per queued command at EXEC time.
     deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
 
-    // Auth gate: before authenticating, only a small set of commands is allowed
-    // (Redis: HELLO, AUTH, QUIT, RESET). Everything else (including the data
-    // commands) is NOAUTH. Runs once per client command; queued commands at EXEC time
-    // are already past auth (you cannot MULTI before authenticating).
-    if ctx.requires_auth()
-        && !state.authenticated
-        && !matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
-    {
+    // Auth gate (DEFENSE IN DEPTH): before authenticating, only the pre-auth allow-list
+    // (Redis: HELLO, AUTH, QUIT, RESET) is allowed; everything else is NOAUTH. The PRIMARY
+    // gate now lives HOISTED at the top of the serve router (`route_and_dispatch`), the
+    // single chokepoint EVERY client command passes through BEFORE any interception /
+    // cross-shard fan-out / CLUSTER-mutator path -- which is why a foreign-shard key, a
+    // whole-keyspace fan-out, or a CLUSTER mutator can no longer reach execution unauth.
+    // This local gate is kept as a redundant backstop for any direct `dispatch` caller
+    // (tests, EXEC re-dispatch) that does NOT come through the router; it shares the EXACT
+    // `command_allowed_pre_auth` predicate, so it can never diverge from the hoisted gate
+    // and never double-replies NOAUTH (the router already short-circuited the unauth case
+    // before this runs). Runs once per client command; queued commands at EXEC time are
+    // already past auth (you cannot MULTI before authenticating).
+    if ctx.requires_auth() && !state.authenticated && !command_allowed_pre_auth(cmd) {
         return Value::error(ErrorReply::noauth());
     }
 

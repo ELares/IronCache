@@ -1635,6 +1635,42 @@ async fn route_and_dispatch(
     let cmd_upper = ascii_upper(request.command());
     let route = route::classify(&cmd_upper);
 
+    // -- THE HOISTED NOAUTH CHOKEPOINT (production security fix). This is the SINGLE earliest
+    // point after the command name is known but BEFORE any interception, cross-shard fan-out,
+    // CLUSTER-mutator proposal, persistence/shutdown handling, MULTI queueing, or local dispatch.
+    // EVERY client command reaches dispatch THROUGH this router, so gating here closes -- in one
+    // place -- the whole class of auth-bypass holes that existed when the gate lived DOWNSTREAM in
+    // `dispatch_inner` (which the router's early-returning forks never reach):
+    //   * a GET/SET on a FOREIGN-shard key (the `coordinator::dispatch_via` remote hop below),
+    //   * the whole-keyspace fan-outs (KEYS/SCAN/DBSIZE/FLUSHDB/FLUSHALL/RANDOMKEY),
+    //   * the multi-key + spanning-combine scatter-gather fan-outs,
+    //   * the CLUSTER topology mutators (MEET/FORGET/ADDSLOTS/SETSLOT/DELSLOTS/REPLICATE/
+    //     SET-CONFIG-EPOCH, whether handled synchronously by `cmd_cluster` or proposed via Raft),
+    //   * SAVE/BGSAVE/LASTSAVE + SHUTDOWN (previously point-fixed inline; now gated here too),
+    //   * a command issued INSIDE a MULTI (the `route_in_multi` queue path is downstream of here,
+    //     so a queued command from an unauth client is rejected, never staged -- Redis parity).
+    // The pre-auth allow-list is the EXACT shared `command_allowed_pre_auth` predicate the
+    // downstream `dispatch_with_cmd` gate uses (AUTH/HELLO/QUIT/RESET), so the two can never
+    // diverge and AUTH / HELLO AUTH still work pre-auth unchanged.
+    //
+    // DEFAULT (no requirepass) is BYTE-UNCHANGED + adds no cost: `ctx.requires_auth()` reads the
+    // runtime requirepass overlay (the same load the connection's `authenticated` init + the
+    // dispatch gate already do) and short-circuits the `&&` immediately, so an authed or
+    // no-auth-configured connection pays at most this single bool check before falling through to
+    // the identical routing below. The reply is the IDENTICAL `-NOAUTH` the dispatch gate emits.
+    if ctx.requires_auth()
+        && !conn.authenticated
+        && !ironcache_server::command_allowed_pre_auth(&cmd_upper)
+    {
+        state_rc.borrow_mut().counters.on_command();
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::noauth()),
+            conn.proto,
+        );
+        return false;
+    }
+
     // HA-6: consume the one-shot ASKING EXACTLY ONCE PER COMMAND, BEFORE any early return
     // (pubsub interception / in_multi / WATCH cluster-redirect / WATCH cross-shard / the internal-
     // verb gate), so a set flag can NEVER leak into a later command. Previously the flag was
@@ -2236,21 +2272,12 @@ async fn handle_persist_command(
     use ironcache_server::Value;
     shard_state().borrow_mut().counters.on_command();
 
-    // -- AUTH GATE (H2). This router INTERCEPTS SAVE/BGSAVE/LASTSAVE before `dispatch_inner`'s auth
-    // gate (dispatch.rs: `requires_auth() && !authenticated`) ever runs, so without this an
-    // UNAUTHENTICATED client with `requirepass` set could trigger SAVE/BGSAVE (a CPU/disk DoS) and
-    // read LASTSAVE. Mirror the SAME decision dispatch makes (`ctx.requires_auth()` reads the
-    // runtime requirepass overlay; `conn.authenticated` is the per-conn flag AUTH sets) and return
-    // the IDENTICAL `-NOAUTH` reply WITHOUT performing any save. With persistence OFF these commands
-    // reach dispatch and are gated there; this restores that gate for the persistence-on path.
-    if ctx.requires_auth() && !conn.authenticated {
-        encode_into(
-            out,
-            &Value::error(ironcache_protocol::ErrorReply::noauth()),
-            conn.proto,
-        );
-        return;
-    }
+    // -- AUTH (H2). The old inline NOAUTH gate that lived here was REMOVED when the gate was hoisted
+    // to the single router chokepoint at the top of `route_and_dispatch`: an unauthenticated client
+    // (requirepass set) is now short-circuited with `-NOAUTH` THERE, before SAVE/BGSAVE/LASTSAVE is
+    // ever intercepted, so this handler is unreachable unauth and the inline gate was dead code. The
+    // chokepoint covers this path AND every other (cross-shard, fan-out, CLUSTER mutator, SHUTDOWN),
+    // which the point-fix here never could. See the hoisted gate for the full rationale.
 
     match cmd_upper {
         b"LASTSAVE" => {
@@ -2334,9 +2361,11 @@ async fn handle_persist_command(
 /// LIVE path for every non-MULTI SHUTDOWN (the serve router intercepts it before generic dispatch,
 /// which cannot exit the process). The sequence (Redis-faithful):
 ///
-/// 1. AUTH GATE (mirrors the SAVE/BGSAVE/LASTSAVE H2 gate EXACTLY): an UNAUTHENTICATED client with
-///    `requirepass` set gets the IDENTICAL `-NOAUTH` reply and the server does NOT shut down -- so a
-///    public port cannot be killed by an anonymous SHUTDOWN.
+/// 1. AUTH is enforced UPSTREAM by the hoisted NOAUTH chokepoint at the top of `route_and_dispatch`
+///    (an UNAUTHENTICATED client with `requirepass` set is short-circuited with `-NOAUTH` before
+///    SHUTDOWN is ever intercepted), so a public port still cannot be killed by an anonymous
+///    SHUTDOWN -- the gate moved upstream + now covers every command, so the old inline gate here
+///    was removed as dead code.
 /// 2. PARSE the modifier ([`ironcache_server::parse_shutdown`], shared with the dispatch fallback so
 ///    the grammar cannot diverge): a bad/extra modifier replies `-ERR syntax error` and does NOT
 ///    exit.
@@ -2372,16 +2401,11 @@ async fn handle_shutdown_command(
     use ironcache_server::{ShutdownMode, Value};
     shard_state().borrow_mut().counters.on_command();
 
-    // 1. AUTH GATE (mirror the SAVE H2 gate exactly): an unauthenticated client with requirepass set
-    // gets the identical -NOAUTH reply and the server stays up.
-    if ctx.requires_auth() && !conn.authenticated {
-        encode_into(
-            out,
-            &Value::error(ironcache_protocol::ErrorReply::noauth()),
-            conn.proto,
-        );
-        return;
-    }
+    // 1. AUTH. The old inline NOAUTH gate here was REMOVED when the gate was hoisted to the single
+    // router chokepoint at the top of `route_and_dispatch`: an unauthenticated client (requirepass
+    // set) is short-circuited with `-NOAUTH` THERE, before SHUTDOWN is ever intercepted, so a public
+    // port still cannot be killed by an anonymous SHUTDOWN -- the protection moved upstream and now
+    // covers every path uniformly, not just this one. See the hoisted gate for the full rationale.
 
     // 2. PARSE the modifier (shared grammar with the dispatch fallback). A bad modifier is a syntax
     // error and does NOT shut down.

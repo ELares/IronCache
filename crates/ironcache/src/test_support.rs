@@ -29,6 +29,66 @@ pub fn run_server_for_test(port: u16, shards: usize) -> ShardSet {
     run_server(&config).expect("test server failed to bind")
 }
 
+/// Boot a real server with a `requirepass` (#65) on `127.0.0.1:port` across `shards` shards (NO
+/// persistence), so a test can prove the HOISTED router NOAUTH chokepoint gates EVERY path: an
+/// UNAUTHENTICATED client must get `-NOAUTH` for a FOREIGN-shard keyed command (the cross-shard
+/// hop), the whole-keyspace fan-outs (KEYS/SCAN/FLUSHALL), and the in-MULTI queue path; after
+/// `AUTH <password>` the same commands work. `password` is the PLAINTEXT a client AUTHs with; it is
+/// stored hashed at rest (SHA-256 hex), matching `Config::finalize_requirepass` (this builds
+/// `Config` directly, bypassing `resolve`, so it must hash here).
+///
+/// # Panics
+///
+/// Panics if the config fails to validate or the server fails to bind.
+#[must_use]
+pub fn run_server_with_auth_for_test(port: u16, shards: usize, password: &str) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        // The runtime auth overlay reads the requirepass as the SHA-256 hex digest AT REST (#65).
+        requirepass: Some(ironcache_config::sha256_hex(password.as_bytes())),
+        ..Config::default()
+    };
+    config.validate().expect("test auth config must validate");
+    run_server(&config).expect("test auth server failed to bind")
+}
+
+/// Boot a real CLUSTER-mode server (static `topology`, this node's `announce_id`) WITH a
+/// `requirepass` across `shards` shards, so a test can prove the hoisted NOAUTH chokepoint gates the
+/// CLUSTER topology MUTATORS (MEET/FORGET/ADDSLOTS/SETSLOT/DELSLOTS/REPLICATE/SET-CONFIG-EPOCH)
+/// before they can take over or WIPE the cluster: an UNAUTHENTICATED client must get `-NOAUTH`, not
+/// the mutator's reply. `password` is the PLAINTEXT a client AUTHs with (stored SHA-256 hex at rest).
+///
+/// # Panics
+///
+/// Panics if the config fails to validate (a bad topology / password) or the server fails to bind.
+#[must_use]
+pub fn run_cluster_node_with_auth_for_test(
+    port: u16,
+    shards: usize,
+    topology: ClusterTopology,
+    announce_id: &str,
+    password: &str,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        cluster_enabled: true,
+        cluster_topology: Some(topology),
+        cluster_announce_id: Some(announce_id.to_owned()),
+        requirepass: Some(ironcache_config::sha256_hex(password.as_bytes())),
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test cluster+auth config must validate");
+    run_server(&config).expect("test cluster+auth node failed to bind")
+}
+
 /// Boot a real server with PERSISTENCE ENABLED (#58) on `127.0.0.1:port` across `shards` shards,
 /// using `data_dir` as the on-disk snapshot location. The server LOADS any committed snapshot in
 /// `data_dir` at boot, and `SAVE` / `BGSAVE` write `<data_dir>/dump-shard-<n>.icss` +
