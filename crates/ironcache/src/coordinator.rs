@@ -216,6 +216,36 @@ fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
         };
     }
 
+    // INTERNAL `__ICEXISTS <key>` (HA-6 online slot migration on a MULTI-SHARD node,
+    // COORDINATOR.md #107): the cross-shard PRESENCE query. The migration SOURCE shard's ASK
+    // decision needs to know whether a migrating-slot key is still PRESENT on the shard that
+    // OWNS it (the FNV `owner_shard`), which on a multi-shard node may be a SIBLING of the
+    // accept shard. This runs a PURE `contains_live` read against THIS shard's store: it never
+    // reaps the key, fires a hook, or folds a counter (so NO deltas, like the pub/sub verbs),
+    // exactly the cold-redirect-safe semantics of the local `contains_live`. It reads `now` from
+    // THIS shard's Env clock (the determinism seam, ADR-0003 -- the owning shard's wall clock,
+    // not a home-supplied timestamp) and borrows the store read-only, both taken + released
+    // inside this synchronous call (the no-borrow-across-await contract). It replies `:1` when
+    // the key is present-and-live here, else `:0` (a malformed `__ICEXISTS` with no key -> `:0`).
+    if crate::serve::ascii_upper(request.command()) == ironcache_server::ICEXISTS {
+        let present = request.args.get(1).is_some_and(|key| {
+            let env = shard_env();
+            let store_rc = shard_store(
+                ctx.databases,
+                ctx.info.maxmemory_policy,
+                crate::serve::scan_reserved_bits(ctx.shards),
+            );
+            let now = UnixMillis(env.borrow().now_unix_millis());
+            // A SHORT read-only borrow that drops before this closure returns; no `.await` runs
+            // while it is held (this whole `run_remote` is synchronous).
+            store_rc.borrow().contains_live(db, key.as_ref(), now)
+        });
+        return ShardReply {
+            value: Value::Integer(i64::from(present)),
+            deltas: CounterDeltas::default(),
+        };
+    }
+
     // Lazily init + clone the per-shard handles (Rc clones, cheap), exactly as
     // serve_connection / handle_request do. These accessors are the shared per-shard
     // lazy-init, so the drain loop and the connection tasks see the SAME store/wheel/env.
@@ -418,6 +448,48 @@ pub async fn dispatch_one_value(inbox: &Inbox, target: usize, request: &Request,
     match rx.await {
         Ok(reply) => reply.value,
         Err(_) => Value::error(shard_unavailable_error()),
+    }
+}
+
+/// CROSS-SHARD KEY-PRESENCE query (HA-6 online slot migration on a MULTI-SHARD node,
+/// COORDINATOR.md #107): ask the shard that OWNS `key` whether it is PRESENT and LIVE, returning
+/// the bool. This is the cross-shard counterpart of a local `contains_live`, reusing the EXACT
+/// single-target hop mechanism a coordinated single-key op already uses ([`dispatch_one_value`]):
+/// it builds an `__ICEXISTS <key>` request, enqueues it to `inbox[target]` (await-on-full
+/// back-pressure), and awaits the owning shard's `:1` / `:0` reply.
+///
+/// ## Deadlock-free (the same reasoning as every other single-key cross-shard hop)
+///
+/// The migration SOURCE shard calls this from its serve loop (the cold migration redirect, BEFORE
+/// holding any `RefCell` borrow -- the caller drops every store borrow before awaiting). The owning
+/// shard's drain loop runs on a SEPARATE LocalSet / core and answers `__ICEXISTS` in [`run_remote`]
+/// (a synchronous `contains_live` read that holds no borrow across an `.await`), so the awaiting
+/// source shard never blocks the owner's progress and the owner never re-enters the source. This is
+/// byte-for-byte the [`dispatch_via`] / [`dispatch_one_value`] pattern that Stage 1 routing already
+/// proved deadlock-free; the presence verb is just a different, side-effect-free unit of work.
+///
+/// On a dead owner shard (send error / cancelled oneshot, only at shutdown or a shard panic) it
+/// returns `false` -- "treat as absent" -- so the SOURCE emits the SAFE, idempotent `-ASK` the
+/// client retries (the pre-fix conservative behavior), never a wrong-owner serve.
+pub async fn presence_via(inbox: &Inbox, target: usize, key: &[u8], db: u32) -> bool {
+    let request = Request {
+        args: vec![
+            bytes::Bytes::from_static(ironcache_server::ICEXISTS),
+            bytes::Bytes::copy_from_slice(key),
+        ],
+    };
+    let (tx, rx) = oneshot::channel::<ShardReply>();
+    let work = ShardWork {
+        request,
+        db,
+        reply: tx,
+    };
+    if inbox[target].send(work).await.is_err() {
+        return false;
+    }
+    match rx.await {
+        Ok(reply) => matches!(reply.value, Value::Integer(1)),
+        Err(_) => false,
     }
 }
 

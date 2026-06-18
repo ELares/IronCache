@@ -60,6 +60,21 @@ pub const ICPUBLISH: &[u8] = b"__ICPUBLISH";
 /// it directly, never through the router's keyed branches).
 pub const ICPUBSUB: &[u8] = b"__ICPUBSUB";
 
+/// The INTERNAL token the cross-shard coordinator uses to ask the shard that OWNS a key whether
+/// that key is PRESENT and LIVE (HA-6 online slot migration on a MULTI-SHARD node, COORDINATOR.md
+/// #107). NOT a client command: the serve-loop router gates it (like `__ICPUBLISH` / the
+/// `__ICSTORE*` verbs) so a client sending it gets `unknown command`; only the coordinator issues
+/// it (`__ICEXISTS <key>` to the key's owner shard, which replies `:1` / `:0` from a pure
+/// [`crate::route`]-routed `contains_live` read -- never reaping, never folding a counter).
+///
+/// Unlike `__ICPUBLISH` / `__ICPUBSUB`, this verb is DELIBERATELY ABSENT from the [`spec_of`]
+/// registry: it is dispatched DIRECTLY by the coordinator's presence hop and is NEVER seen by
+/// `classify` or the dispatch-arm match (the migration source builds + sends it itself, and the
+/// owner shard's drain loop answers it in `run_remote` BEFORE any keyed dispatch). `spec_of`
+/// therefore returns `None` for it (an unknown token), exactly as for any unregistered byte
+/// string, so the registry-vs-dispatch cross-check is untouched.
+pub const ICEXISTS: &[u8] = b"__ICEXISTS";
+
 /// The queue-time arity rule for a known command, mirroring the `arity` field of the
 /// Redis command table (src/commands.def). Redis encodes arity as a single signed int:
 /// a POSITIVE `n` means EXACTLY `n` total arguments (command token included); a NEGATIVE
