@@ -1052,8 +1052,11 @@ fn spawn_periodic_save(
 ///
 /// MUST run on SHARD 0's executor (it owns `home == shard 0` + the inbox the fan-out needs); the
 /// drain loop is that executor. Returns `true` iff a save was attempted-and-committed, `false` if no
-/// save was warranted or it was already running (the latch was busy -- the in-progress save covers
-/// the data). A save FAILURE is logged (the signal path has no client to reply to) and returns
+/// save was warranted, the latch wait TIMED OUT (a wedged in-flight save, the LOW case -- proceed
+/// best-effort), or the save failed. If a save was ALREADY running this BOUNDED-WAITS for it to
+/// commit + free the latch (H1: bytes are NOT durable until `write_manifest`, so exiting OVER an
+/// in-flight save would lose every write since the prior commit), THEN runs a FRESH save before
+/// returning. A save FAILURE is logged (the signal path has no client to reply to) and returns
 /// `false`; the process still exits (the prior committed manifest stays valid).
 ///
 /// ## Borrow / determinism discipline
@@ -1070,9 +1073,24 @@ pub async fn save_on_exit_if_configured(
     let Some(persist) = persist.filter(|p| p.has_save_policy()) else {
         return false;
     };
-    // Serialize against a racing periodic save / BGSAVE; if one is already running, the in-progress
-    // save covers the data, so skip (no double manifest write). The RAII guard releases on drop.
-    let Some(_guard) = persist.try_begin_save() else {
+    // H1 (data loss): the OLD code did `try_begin_save() else { return false }` and then the caller
+    // exited(0). But a concurrent BGSAVE / periodic save may be mid-`do_save_all` with some `.icss`
+    // files written and the manifest (the atomic COMMIT point) NOT yet run, so exiting over it KILLS
+    // that save before it commits -- the committed manifest still points at the PRIOR snapshot and
+    // every write since is LOST despite this save-on-exit. The fix: BOUNDED-WAIT for the busy latch
+    // to free (the in-flight save commits + drops its guard; on a single-threaded executor the timer
+    // await yields to it), THEN run a FRESH save (guarantees CURRENT data), THEN return so the caller
+    // exits. No borrow is held across the wait, so it cannot deadlock the save it waits on.
+    let Some(_guard) =
+        crate::persist::wait_to_begin_save(persist, crate::persist::SHUTDOWN_SAVE_WAIT).await
+    else {
+        // The wait TIMED OUT: a genuinely wedged save never freed the latch (the LOW case). Do NOT
+        // hang the exit forever -- return false best-effort (the caller exits; the in-flight save MAY
+        // still commit its prior-or-partial state, and the prior committed manifest stays valid).
+        eprintln!(
+            "ironcache: save-on-exit -- a prior save did not finish within SHUTDOWN_SAVE_WAIT; \
+             exiting best-effort (the in-flight save may still commit)"
+        );
         return false;
     };
     let home = ShardId {
@@ -1081,7 +1099,20 @@ pub async fn save_on_exit_if_configured(
     };
     // The save timestamp from shard 0's Env clock (the determinism seam, ADR-0003).
     let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
-    match crate::persist::do_save_all(persist, inbox, ctx, home, 0, now_secs).await {
+    // BOUNDED so a wedged sibling drain loop (alive but stuck) cannot hang the exit save fan-out (L1)
+    // -- the signal path escapes via the second-signal force-exit watcher, but bounding here makes a
+    // single SIGTERM self-terminating too.
+    match crate::persist::do_save_all_bounded(
+        persist,
+        inbox,
+        ctx,
+        home,
+        0,
+        now_secs,
+        crate::persist::SHUTDOWN_SAVE_WAIT,
+    )
+    .await
+    {
         Ok(()) => true,
         Err(msg) => {
             eprintln!(

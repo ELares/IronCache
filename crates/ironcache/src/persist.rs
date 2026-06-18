@@ -68,6 +68,22 @@ use crate::coordinator::{self, Inbox};
 /// `spec_of` registry (like `__ICEXISTS`).
 pub const ICSAVE: &[u8] = b"__ICSAVE";
 
+/// The bound for the EXIT-path save wait (#139, H1/L1): the longest an exit path (a `SHUTDOWN SAVE`,
+/// a bare `SHUTDOWN` with a policy, or a SIGTERM save-on-exit) will (a) wait for a busy save latch to
+/// free before its own fresh save, and (b) let its OWN save fan-out run before giving up. It is sized
+/// like the drain grace (a few seconds): generous for a healthy save, far under any supervisor's
+/// hard-kill grace. On a genuinely wedged save the exit proceeds best-effort rather than hanging
+/// forever (the in-flight save MAY still commit its prior-or-partial state; we cannot do better
+/// without unbounded waiting). The wait is driven through the Runtime timer SEAM (ADR-0003), never
+/// wall-clock.
+pub const SHUTDOWN_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The poll cadence the exit-path latch wait uses while it waits for a busy save to free the latch
+/// (#139, H1). On a single-threaded shard executor each timer await YIELDS to the in-flight save
+/// task so it can run to completion + drop its `SaveGuard`; this short tick keeps the wait responsive
+/// without busy-spinning. Driven through the Runtime timer seam (ADR-0003).
+const SHUTDOWN_SAVE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// The NODE-LEVEL persistence state: the on-disk snapshot location, the save policy, and the
 /// runtime atomics (the last-save timestamp `LASTSAVE` reports, a monotone save id, the dirty
 /// write counter the periodic policy reads, and a save-in-progress latch that serializes
@@ -331,6 +347,80 @@ pub async fn do_save_all(
     }
 }
 
+/// WAIT (BOUNDED) to acquire the save latch on an EXIT path (#139, H1: never exit OVER an in-flight
+/// save). Polls [`PersistState::try_begin_save`] through the Runtime timer SEAM (ADR-0003, NOT
+/// wall-clock) until it WINS the latch (returns `Some(guard)`) OR the `deadline` elapses (returns
+/// `None`). On a single-threaded shard executor each `rt.timer(..)` await YIELDS to the in-flight
+/// save task so it can finish its `do_save_all` (commit its manifest) and DROP its `SaveGuard`,
+/// freeing the latch for this waiter on a later poll.
+///
+/// THE DATA-LOSS FIX: the old exit paths did `try_begin_save() else { exit(0) }` -- a busy latch made
+/// them exit IMMEDIATELY over a concurrent save that had written some `.icss` files but NOT yet its
+/// `write_manifest` (the atomic commit point), so the committed manifest still pointed at the PRIOR
+/// snapshot and every write since was lost. Waiting for the latch to free guarantees that in-flight
+/// save commits (or that we then run a fresh one) before exit.
+///
+/// A `None` return is the LOW-case wedged-save outcome: a genuinely stuck save never frees the latch,
+/// so the caller proceeds to a BEST-EFFORT exit (it logs + exits rather than hanging forever; the
+/// in-flight save may still commit its prior-or-partial state). This bounds the worst case.
+///
+/// Holds NO borrow across the await (it only touches the `saving` atomic + the timer), so it cannot
+/// deadlock the in-flight save it is waiting on.
+pub async fn wait_to_begin_save(
+    persist: &Arc<PersistState>,
+    deadline: std::time::Duration,
+) -> Option<SaveGuard> {
+    use ironcache_runtime::Runtime;
+    // Fast path: the latch is free right now (no in-flight save), so win it without a single tick.
+    if let Some(guard) = persist.try_begin_save() {
+        return Some(guard);
+    }
+    let rt = ironcache_runtime::TokioRuntime::new();
+    let mut waited = std::time::Duration::ZERO;
+    while waited < deadline {
+        // Yield to the in-flight save task (single-threaded executor) so it can commit + drop its
+        // guard; then retry. The poll never exceeds the remaining budget (`waited < deadline` here,
+        // so the saturating_sub is non-zero; it just keeps the arithmetic panic-free).
+        let tick = SHUTDOWN_SAVE_POLL.min(deadline.saturating_sub(waited));
+        rt.timer(tick).await;
+        waited += tick;
+        if let Some(guard) = persist.try_begin_save() {
+            return Some(guard);
+        }
+    }
+    None
+}
+
+/// Run [`do_save_all`] on an EXIT path with a BOUNDED fan-out (#139, L1: a wedged sibling whose drain
+/// loop is ALIVE but stuck never answers + never drops its oneshot sender, so a bare `do_save_all`
+/// awaits FOREVER -- the signal path escapes via the second-signal force-exit watcher, but a pure
+/// `SHUTDOWN SAVE` command had no escape). This races the save against the Runtime timer SEAM
+/// (ADR-0003): on timeout it surfaces a failed/partial save (`Err`) so the EXIT path can proceed
+/// (reply an error and still exit, or best-effort exit) rather than hang.
+///
+/// The caller MUST hold the save latch (a [`SaveGuard`]) for the duration, exactly like
+/// [`do_save_all`]. The NORMAL SAVE / BGSAVE / periodic paths are UNCHANGED (they keep the plain
+/// `do_save_all`); only the exit paths use this bound, where a hang is the real hazard.
+pub async fn do_save_all_bounded(
+    persist: &Arc<PersistState>,
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    home: ShardId,
+    db: u32,
+    save_unix_secs: u64,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    use ironcache_runtime::Runtime;
+    let rt = ironcache_runtime::TokioRuntime::new();
+    tokio::select! {
+        biased;
+        result = do_save_all(persist, inbox, ctx, home, db, save_unix_secs) => result,
+        () = rt.timer(timeout) => Err(
+            "save fan-out timed out (a shard did not answer in time)".to_owned()
+        ),
+    }
+}
+
 /// LOAD a committed snapshot into the per-shard stores at boot (#58 load-on-boot), RE-SHARDING every
 /// key into its OWNING shard for the CURRENT shard count (the C1 fix). Returns the total keys
 /// loaded, or `0` (loads nothing) when there is no loadable snapshot (no manifest / a torn
@@ -356,6 +446,7 @@ pub fn load_on_boot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
     use std::sync::atomic::AtomicBool;
 
     /// A bare `PersistState` for latch tests (no real data dir / save fan-out needed).
@@ -441,5 +532,121 @@ mod tests {
             .try_begin_save()
             .expect("the next save proceeds after a panicked save");
         drop(g);
+    }
+
+    /// Run an async body on a current-thread tokio runtime + `LocalSet` (the shard executor shape the
+    /// Runtime timer seam + `spawn_local` need). The test uses SHORT real timers (the wait polls on a
+    /// 20ms cadence) through the exact Runtime seam the production wait uses, so each test resolves in
+    /// well under a second.
+    fn block_on_shard<F: std::future::Future>(body: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, body)
+    }
+
+    /// H1 (data loss) -- the EXIT-path wait does NOT acquire the latch WHILE an in-flight save holds
+    /// it, and DOES acquire it once that save releases. We simulate the in-flight save by holding a
+    /// `SaveGuard`, drive `wait_to_begin_save` as a spawned task on the SAME single-threaded executor,
+    /// release the guard partway through, and confirm the waiter only then wins the latch -- never
+    /// returning "acquired" while the latch was held. This is the property the data-loss fix needs:
+    /// an exit never proceeds OVER an in-flight (uncommitted) save.
+    #[test]
+    fn wait_to_begin_save_blocks_while_held_then_acquires_on_release() {
+        block_on_shard(async {
+            use ironcache_runtime::Runtime;
+            let p = latch_state();
+            // The "in-flight save" holds the latch.
+            let in_flight = p
+                .try_begin_save()
+                .expect("the in-flight save wins the latch");
+
+            // A flag the waiter sets the instant it acquires, so we can assert it had NOT acquired
+            // while the guard was still held.
+            let acquired = Rc::new(std::cell::Cell::new(false));
+            let acquired_in_task = Rc::clone(&acquired);
+            let p_task = Arc::clone(&p);
+            let rt = ironcache_runtime::TokioRuntime::new();
+            rt.spawn_on_shard(async move {
+                let guard = wait_to_begin_save(&p_task, std::time::Duration::from_secs(60)).await;
+                assert!(guard.is_some(), "the waiter acquires after the latch frees");
+                acquired_in_task.set(true);
+                drop(guard); // release for tidiness.
+            });
+
+            // Let the waiter run a few polls WHILE we still hold the latch: it must NOT acquire.
+            let rt2 = ironcache_runtime::TokioRuntime::new();
+            for _ in 0..5 {
+                rt2.timer(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                !acquired.get(),
+                "the waiter must NOT acquire while the in-flight save holds the latch (H1)"
+            );
+            assert!(p.saving.load(Ordering::Acquire), "latch still held");
+
+            // Release the in-flight save's guard; the waiter should win the latch on its next poll.
+            drop(in_flight);
+            for _ in 0..5 {
+                rt2.timer(std::time::Duration::from_millis(20)).await;
+                if acquired.get() {
+                    break;
+                }
+            }
+            assert!(
+                acquired.get(),
+                "the waiter acquires once the in-flight save releases the latch (H1)"
+            );
+        });
+    }
+
+    /// L1 / the bounded-wait timeout -- when the latch stays held PAST the deadline (a genuinely
+    /// wedged save), `wait_to_begin_save` returns `None` CLEANLY (no hang) so the exit path can
+    /// proceed best-effort. We hold a `SaveGuard` for the whole test and assert the wait, given a
+    /// short deadline, gives up with `None` (and never falsely returns a guard while the latch is
+    /// held).
+    #[test]
+    fn wait_to_begin_save_times_out_cleanly_when_latch_stays_held() {
+        block_on_shard(async {
+            let p = latch_state();
+            // Hold the latch for the entire wait (simulate a wedged in-flight save).
+            let _held = p.try_begin_save().expect("hold the latch");
+            let outcome = wait_to_begin_save(&p, std::time::Duration::from_millis(200)).await;
+            assert!(
+                outcome.is_none(),
+                "a latch held past the deadline times out to None (no hang, no false acquire)"
+            );
+            assert!(
+                p.saving.load(Ordering::Acquire),
+                "the latch is STILL held by the simulated in-flight save (the waiter never took it)"
+            );
+        });
+    }
+
+    /// The fast path: with the latch FREE, `wait_to_begin_save` acquires immediately (returns a real
+    /// guard) and that guard serializes a concurrent attempt, exactly like `try_begin_save`.
+    #[test]
+    fn wait_to_begin_save_acquires_immediately_when_free() {
+        block_on_shard(async {
+            let p = latch_state();
+            let guard = wait_to_begin_save(&p, std::time::Duration::from_secs(5))
+                .await
+                .expect("a free latch is won at once");
+            assert!(
+                p.saving.load(Ordering::Acquire),
+                "the waiter holds the latch"
+            );
+            assert!(
+                p.try_begin_save().is_none(),
+                "a concurrent save is denied while the waiter's guard is held"
+            );
+            drop(guard);
+            assert!(
+                !p.saving.load(Ordering::Acquire),
+                "the latch frees when the waiter's guard drops"
+            );
+        });
     }
 }

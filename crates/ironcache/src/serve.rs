@@ -2405,24 +2405,52 @@ async fn handle_shutdown_command(
         let persist = persist.expect("want_save implies persistence is configured");
         // The save timestamp from the home shard's Env clock (ADR-0003), in unix seconds.
         let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
-        // Hold the save latch for the exit save (serializes against a racing periodic/BGSAVE; the
-        // RAII guard releases on the unlikely error-return path below). If a save is already running
-        // we still want the exit save to commit a fresh snapshot, but racing two manifest writes is
-        // unsafe; if the latch is busy we report the in-progress save as covering the data and exit
-        // (its bytes are being written), matching SAVE's busy-latch handling.
-        if let Some(_guard) = persist.try_begin_save() {
-            match crate::persist::do_save_all(persist, inbox, ctx, home, conn.db, now_secs).await {
-                Ok(()) => {} // committed; fall through to the clean exit.
-                Err(msg) => {
-                    encode_into(
-                        out,
-                        &Value::error(ironcache_protocol::ErrorReply::err(format!(
-                            "Errors trying to SHUTDOWN. Check logs. ({msg})"
-                        ))),
-                        conn.proto,
-                    );
-                    return;
-                }
+        // H1 (data loss): the OLD code did `try_begin_save() else { /* covered */ }` and FELL THROUGH
+        // to exit(0) when the latch was busy. But a concurrent BGSAVE / periodic save may be mid-
+        // `do_save_all` with some `.icss` files written and the manifest (the atomic COMMIT point)
+        // NOT yet run, so exiting over it KILLS that save before it commits -- the committed manifest
+        // still points at the PRIOR snapshot and every write since is LOST despite this explicit
+        // SAVE-on-exit. The fix: BOUNDED-WAIT for the busy latch to free (the in-flight save commits
+        // + drops its guard; on a single-threaded executor the timer await yields to it), THEN run a
+        // FRESH save (the operator demanded a CURRENT save), THEN exit. No borrow is held across the
+        // wait (it only touches the `saving` atomic + the timer seam), so it cannot deadlock.
+        let Some(_guard) =
+            crate::persist::wait_to_begin_save(persist, crate::persist::SHUTDOWN_SAVE_WAIT).await
+        else {
+            // The wait TIMED OUT: a genuinely wedged save never freed the latch (the LOW case). Do
+            // NOT hang forever -- proceed to a BEST-EFFORT exit. The in-flight save MAY still commit
+            // its prior-or-partial state; we cannot do better without unbounded waiting.
+            eprintln!(
+                "ironcache: SHUTDOWN ({mode:?}) -- a prior save did not finish within \
+                 SHUTDOWN_SAVE_WAIT; exiting best-effort (the in-flight save may still commit)"
+            );
+            std::process::exit(0);
+        };
+        // We hold the freed latch: run a FRESH save, BOUNDED so a wedged sibling drain loop (alive
+        // but stuck) cannot hang the exit (L1). A failure (or fan-out timeout) is fail-closed: reply
+        // the error and do NOT exit, so the orchestrator does not record a clean stop over unwritten
+        // data and the connection keeps serving.
+        match crate::persist::do_save_all_bounded(
+            persist,
+            inbox,
+            ctx,
+            home,
+            conn.db,
+            now_secs,
+            crate::persist::SHUTDOWN_SAVE_WAIT,
+        )
+        .await
+        {
+            Ok(()) => {} // committed; fall through to the clean exit.
+            Err(msg) => {
+                encode_into(
+                    out,
+                    &Value::error(ironcache_protocol::ErrorReply::err(format!(
+                        "Errors trying to SHUTDOWN. Check logs. ({msg})"
+                    ))),
+                    conn.proto,
+                );
+                return;
             }
         }
     }
