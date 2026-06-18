@@ -56,6 +56,10 @@ const CFG_ASSIGN_SLOTS: u8 = 3;
 const CFG_SET_CONFIG_EPOCH: u8 = 4;
 const CFG_ASSIGN_REPLICA: u8 = 5;
 const CFG_PROMOTE_REPLICA: u8 = 6;
+// HA-6 online slot migration: new discriminants continue from 7 (the next free value).
+const CFG_SET_SLOT_MIGRATING: u8 = 7;
+const CFG_SET_SLOT_IMPORTING: u8 = 8;
+const CFG_SET_SLOT_STABLE: u8 = 9;
 
 // ---------------------------------------------------------------------------
 // Encoding.
@@ -199,6 +203,27 @@ fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
                 put_u16(out, *slot);
             }
             put_str(out, new_primary);
+        }
+        ConfigCmd::SetSlotMigrating { slot, dest } => {
+            // HA-6: a single slot + the dest node id (slot-then-node, matching the variant's field
+            // order); a distinct discriminant keeps it unambiguous on the wire + in the log.
+            out.push(CFG_SET_SLOT_MIGRATING);
+            put_u16(out, *slot);
+            put_str(out, dest);
+        }
+        ConfigCmd::SetSlotImporting { slot, src, dest } => {
+            // HA-6: a single slot + the src node id + the dest node id (slot-then-src-then-dest,
+            // matching the variant's field order). The discriminant is UNCHANGED; the `dest` field
+            // is appended, so the decoder reads src then dest in the same order.
+            out.push(CFG_SET_SLOT_IMPORTING);
+            put_u16(out, *slot);
+            put_str(out, src);
+            put_str(out, dest);
+        }
+        ConfigCmd::SetSlotStable { slot } => {
+            // HA-6: just the slot (clears its migration state).
+            out.push(CFG_SET_SLOT_STABLE);
+            put_u16(out, *slot);
         }
     }
 }
@@ -415,6 +440,18 @@ fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
             let new_primary = cur.string()?;
             Some(ConfigCmd::PromoteReplica { slots, new_primary })
         }
+        CFG_SET_SLOT_MIGRATING => Some(ConfigCmd::SetSlotMigrating {
+            slot: cur.u16()?,
+            dest: cur.string()?,
+        }),
+        CFG_SET_SLOT_IMPORTING => Some(ConfigCmd::SetSlotImporting {
+            // Read in WIRE order: slot, then src, then the appended dest. The struct-literal field
+            // order here matches the encode order so the cursor reads sequentially correct.
+            slot: cur.u16()?,
+            src: cur.string()?,
+            dest: cur.string()?,
+        }),
+        CFG_SET_SLOT_STABLE => Some(ConfigCmd::SetSlotStable { slot: cur.u16()? }),
         _ => None,
     }
 }

@@ -53,8 +53,7 @@ pub enum ErrorCode {
     NotBusy,
     /// `-MOVED <slot> <ip:port>` cluster redirection: the slot is permanently owned by
     /// another node (CLUSTER_CONTRACT.md #70, slice 2). The client updates its cached slot
-    /// map and retries at the advertised address. (ASK, the transient-move sibling, is slice
-    /// 5 and intentionally NOT added here.)
+    /// map and retries at the advertised address.
     Moved,
     /// `-CROSSSLOT ...` a multi-key command whose keys do not all hash to one slot, rejected
     /// in cluster mode (CLUSTER_CONTRACT.md #70, slice 2) rather than scattered.
@@ -63,6 +62,17 @@ pub enum ErrorCode {
     /// covered). Slice-2 validation requires a complete static map, so this is reachable only
     /// on a (currently rejected) partial map; the constructor exists for completeness.
     ClusterDown,
+    /// `-ASK <slot> <ip:port>` the TRANSIENT cluster redirection (HA-6 online slot migration):
+    /// the slot is MIGRATING and the requested key has already moved to the destination. UNLIKE
+    /// MOVED, the client does NOT update its slot map (ownership has not changed); it sends
+    /// `ASKING` then the command ONCE to the destination. Verified against redis/redis
+    /// `src/cluster.c` (`clusterRedirectClient`, `"-ASK %d %s:%d"`).
+    Ask,
+    /// `-TRYAGAIN ...` (HA-6): a MULTI-KEY command on a MIGRATING slot whose keys are SPLIT (some
+    /// already migrated to the destination, some still local) cannot be served atomically on either
+    /// side, so the client is asked to retry shortly (the migration will converge). Verified against
+    /// redis/redis `src/cluster.c` (`"-TRYAGAIN Multiple keys request during rehashing of slot"`).
+    TryAgain,
 }
 
 impl ErrorCode {
@@ -84,6 +94,8 @@ impl ErrorCode {
             ErrorCode::Moved => "MOVED",
             ErrorCode::CrossSlot => "CROSSSLOT",
             ErrorCode::ClusterDown => "CLUSTERDOWN",
+            ErrorCode::Ask => "ASK",
+            ErrorCode::TryAgain => "TRYAGAIN",
         }
     }
 }
@@ -1001,6 +1013,38 @@ impl ErrorReply {
         ErrorReply::new(
             ErrorCode::CrossSlot,
             "Keys in request don't hash to the same slot",
+        )
+    }
+
+    /// `-ASK <slot> <ip:port>` - the TRANSIENT cluster redirection a node returns for a key that
+    /// has already migrated to `addr` while `slot` is MIGRATING (HA-6 online slot migration). The
+    /// client sends `ASKING` then re-issues the command ONCE at `addr`, WITHOUT updating its cached
+    /// slot map (ownership is unchanged until the committed FLIP; only then does the node serve
+    /// MOVED). The wire shape mirrors MOVED exactly (`<slot> <ip:port>`); only the leading token
+    /// differs (ASK vs MOVED), which is how a client distinguishes the one-time hint from the
+    /// permanent redirect.
+    ///
+    /// Verified against redis/redis `src/cluster.c` (`clusterRedirectClient`, `"-%s %d %s:%d"` with
+    /// `"ASK"`): the slot is a DECIMAL integer, the address the unbracketed `ip:port`, no trailing
+    /// period. Clients pattern-match the `ASK` token.
+    #[must_use]
+    pub fn ask(slot: u16, addr: &str) -> Self {
+        ErrorReply::new(ErrorCode::Ask, format!("{slot} {addr}"))
+    }
+
+    /// `-TRYAGAIN Multiple keys request during rehashing of slot` - the reply for a MULTI-KEY
+    /// command on a MIGRATING slot whose keys are SPLIT across the source and destination (HA-6):
+    /// some keys have already migrated, some have not, so the command cannot run atomically on
+    /// either node. The client retries shortly (the migration converges, after which all keys are
+    /// on one side and the command serves or ASKs cleanly).
+    ///
+    /// Byte-exact to redis/redis `src/cluster.c` (`"-TRYAGAIN Multiple keys request during rehashing
+    /// of slot"`): no trailing period. Clients pattern-match the `TRYAGAIN` token.
+    #[must_use]
+    pub fn tryagain() -> Self {
+        ErrorReply::new(
+            ErrorCode::TryAgain,
+            "Multiple keys request during rehashing of slot",
         )
     }
 

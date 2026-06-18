@@ -541,6 +541,18 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
             state.readonly = false;
             Value::ok()
         }
+        // ASKING (HA-6 online slot migration): set the one-shot ASKING flag and reply +OK. In the
+        // SERVE path this is intercepted by the router (which consumes the flag for the next
+        // command); this home arm is the fallback (a non-cluster node, or any path that reaches
+        // dispatch directly) so the command is never an unknown-command error and the flag is set
+        // consistently. Arity 1, like READONLY/READWRITE.
+        b"ASKING" => {
+            if req.args.len() != 1 {
+                return Value::error(ErrorReply::wrong_arity("asking"));
+            }
+            state.asking = true;
+            Value::ok()
+        }
         // -- Transaction control: MULTI/EXEC/DISCARD (PR-10a) + WATCH/UNWATCH (PR-10b),
         // TRANSACTIONS.md. These reach `dispatch_inner` only as direct client commands
         // (the queue gate in `dispatch` excludes MULTI/EXEC/DISCARD/RESET/QUIT/WATCH from

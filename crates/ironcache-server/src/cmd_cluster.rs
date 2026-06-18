@@ -231,9 +231,13 @@ fn cluster_delslotsrange(ctx: &ServerContext, req: &Request) -> Value {
     }
 }
 
-/// `CLUSTER SETSLOT <slot> NODE <node-id>` -> flip the slot's owner (slice 3 supports ONLY the
-/// `NODE` ownership-transfer form). `MIGRATING` / `IMPORTING` / `STABLE` are the live-resharding
-/// state machine and are deferred to slice 4 (clear not-supported). Arity exactly 5.
+/// `CLUSTER SETSLOT <slot> <NODE|MIGRATING|IMPORTING> <node-id>` / `<slot> STABLE` -> flip the
+/// slot's owner (NODE) or drive the HA-6 online-migration state machine (MIGRATING / IMPORTING /
+/// STABLE) on the LOCAL static slot map. NODE/MIGRATING/IMPORTING take a node id (argc == 5); STABLE
+/// takes none (argc == 4). In RAFT mode these become committed proposals (handled in the serve
+/// router, not here); this static-path arm mutates the node-local view directly (slice 3 semantics),
+/// now extended with the migration verbs since the `SlotMap` carries the (additive, owns()-inert)
+/// migration state.
 fn cluster_setslot(ctx: &ServerContext, req: &Request) -> Value {
     // SETSLOT <slot> <subcmd> ... : the shortest form (STABLE) is 4 args.
     if req.args.len() < 4 {
@@ -252,30 +256,42 @@ fn cluster_setslot(ctx: &ServerContext, req: &Request) -> Value {
             "Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP",
         ))
     };
+    let map = match cluster_map(ctx, "SETSLOT") {
+        Ok(m) => m,
+        Err(v) => return v,
+    };
     match setsub.as_slice() {
         b"NODE" if req.args.len() == 5 => {
+            // The committed FLIP (also clears any in-flight migration on the slot, in the SlotMap).
             let node_id = String::from_utf8_lossy(&req.args[4]);
-            let map = match cluster_map(ctx, "SETSLOT") {
-                Ok(m) => m,
-                Err(v) => return v,
-            };
             match map.set_slot_node(slot, &node_id) {
                 Ok(()) => Value::ok(),
                 Err(e) => mut_err(&e),
             }
         }
-        // The live-resharding states are slice 4; reply with the documented not-supported error,
-        // but only at their correct argc (MIGRATING/IMPORTING take a node id at argc==5, STABLE
-        // takes none at argc==4). At a wrong argc they fall through to the SETSLOT error below.
-        b"MIGRATING" | b"IMPORTING" if req.args.len() == 5 => {
-            Value::error(ErrorReply::err(format!(
-                "SETSLOT {} is not supported on a single-node cluster",
-                String::from_utf8_lossy(&setsub)
-            )))
+        b"MIGRATING" if req.args.len() == 5 => {
+            // HA-6 source-side: tag the slot MIGRATING toward the named dest (additive state, never
+            // touches owns()). The dest must be a known node.
+            let dest = String::from_utf8_lossy(&req.args[4]);
+            match map.set_migrating(slot, &dest) {
+                Ok(()) => Value::ok(),
+                Err(e) => mut_err(&e),
+            }
         }
-        b"STABLE" if req.args.len() == 4 => Value::error(ErrorReply::err(
-            "SETSLOT STABLE is not supported on a single-node cluster",
-        )),
+        b"IMPORTING" if req.args.len() == 5 => {
+            // HA-6 destination-side: tag the slot IMPORTING from the named src. The src must be
+            // known.
+            let src = String::from_utf8_lossy(&req.args[4]);
+            match map.set_importing(slot, &src) {
+                Ok(()) => Value::ok(),
+                Err(e) => mut_err(&e),
+            }
+        }
+        b"STABLE" if req.args.len() == 4 => {
+            // HA-6: clear the slot's migration state (the abort path; always succeeds, idempotent).
+            map.clear_migration(slot);
+            Value::ok()
+        }
         // Unknown action, or a known action at the wrong argc (incl. NODE with argc != 5).
         _ => setslot_err(),
     }
@@ -2183,25 +2199,72 @@ mod tests {
         );
     }
 
-    /// SETSLOT's live-resharding states are deferred (slice 4): a clear not-supported reply.
+    /// HA-6: SETSLOT MIGRATING / IMPORTING / STABLE drive the (additive, owns()-inert) migration
+    /// state on the static slot map. MIGRATING/IMPORTING to a KNOWN node succeed; an UNKNOWN node is
+    /// the standard cluster mutation error; STABLE always succeeds. The node MIGRATING/IMPORTING is
+    /// named here as TEST_NODE_ID (self -- always a known node), proving the verb wires through.
     #[test]
-    fn setslot_migrating_importing_stable_are_not_supported() {
-        let (c, _map) = ctx_empty_self();
-        for state in [b"MIGRATING".as_slice(), b"IMPORTING"] {
-            assert_eq!(
-                err_line(&run(
-                    &c,
-                    &[b"CLUSTER", b"SETSLOT", b"0", state, TEST_NODE_ID.as_bytes()]
-                )),
-                format!(
-                    "-ERR SETSLOT {} is not supported on a single-node cluster",
-                    String::from_utf8_lossy(state)
-                )
-            );
-        }
+    fn setslot_migrating_importing_stable_drive_migration_state() {
+        let (c, map) = ctx_empty_self();
+        // MIGRATING to a KNOWN node (self) -> +OK; the slot's migration state is now set.
+        assert_ok(
+            &run(
+                &c,
+                &[
+                    b"CLUSTER",
+                    b"SETSLOT",
+                    b"0",
+                    b"MIGRATING",
+                    TEST_NODE_ID.as_bytes(),
+                ],
+            ),
+            "SETSLOT 0 MIGRATING <self>",
+        );
         assert_eq!(
-            err_line(&run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"STABLE"])),
-            "-ERR SETSLOT STABLE is not supported on a single-node cluster"
+            map.migration_state(0),
+            ironcache_cluster::MigrationState::Migrating
+        );
+        // STABLE clears it (always succeeds).
+        assert_ok(
+            &run(&c, &[b"CLUSTER", b"SETSLOT", b"0", b"STABLE"]),
+            "SETSLOT 0 STABLE",
+        );
+        assert_eq!(
+            map.migration_state(0),
+            ironcache_cluster::MigrationState::None
+        );
+        // IMPORTING to a KNOWN node -> +OK; the slot's migration state is now IMPORTING.
+        assert_ok(
+            &run(
+                &c,
+                &[
+                    b"CLUSTER",
+                    b"SETSLOT",
+                    b"1",
+                    b"IMPORTING",
+                    TEST_NODE_ID.as_bytes(),
+                ],
+            ),
+            "SETSLOT 1 IMPORTING <self>",
+        );
+        assert_eq!(
+            map.migration_state(1),
+            ironcache_cluster::MigrationState::Importing
+        );
+        // MIGRATING / IMPORTING to an UNKNOWN node -> the standard `Unknown node` mutation error.
+        let unknown = "0000000000000000000000000000000000000000";
+        assert_eq!(
+            err_line(&run(
+                &c,
+                &[
+                    b"CLUSTER",
+                    b"SETSLOT",
+                    b"2",
+                    b"MIGRATING",
+                    unknown.as_bytes()
+                ]
+            )),
+            format!("-ERR Unknown node {unknown}")
         );
     }
 

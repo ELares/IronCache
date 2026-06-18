@@ -986,6 +986,22 @@ fn replica_read_in_sync(ctx: &ServerContext) -> bool {
         .is_some_and(|s| s.is_in_sync(ctx.boot.replica_max_lag))
 }
 
+/// The HA-6 migration context the redirect needs that the static/WATCH paths do NOT: whether the
+/// connection set the one-shot `ASKING` flag, and a resolver telling whether a given CLIENT-VISIBLE
+/// key is PRESENT in the local store. The resolver is the only store-touching part of the redirect;
+/// the serve path supplies it (reading the home shard), so [`cluster_redirect`] / [`redirect_for_keys`]
+/// stay pure functions over `(map, keys, ...)` plus this borrowed context. `None` (the static path,
+/// raft-without-migration, and the WATCH guard) makes the redirect byte-identical to pre-HA-6: the
+/// migration arms are reached ONLY when a slot is actually tagged MIGRATING/IMPORTING.
+struct MigrationCtx<'a> {
+    /// Whether the connection's one-shot `ASKING` flag is set for THIS command (consumed by the
+    /// caller after dispatch). Gates serving an IMPORTING slot locally.
+    asking: bool,
+    /// Resolve whether a CLIENT-VISIBLE key is present in the local store (the home shard). Used to
+    /// decide ASK (all keys gone) vs serve (all present) vs TRYAGAIN (mixed) on a MIGRATING slot.
+    key_present: &'a dyn Fn(&[u8]) -> bool,
+}
+
 fn cluster_redirect(
     map: &ironcache_cluster::SlotMap,
     route: route::CommandClass,
@@ -993,6 +1009,7 @@ fn cluster_redirect(
     request: &Request,
     readonly: bool,
     replica_in_sync: bool,
+    migration: Option<&MigrationCtx<'_>>,
 ) -> Option<ironcache_protocol::ErrorReply> {
     // (a) keyless / admin exemption: only KEYED data commands carry slots.
     let spec = match route {
@@ -1028,8 +1045,12 @@ fn cluster_redirect(
     match spec {
         // No routable key (malformed / short): fall through, the handler errors properly.
         route::KeySpec::None => None,
-        route::KeySpec::One(k) => redirect_for_keys(map, std::iter::once(k), replica_serves),
-        route::KeySpec::Many(keys) => redirect_for_keys(map, keys.iter().copied(), replica_serves),
+        route::KeySpec::One(k) => {
+            redirect_for_keys(map, std::iter::once(k), replica_serves, migration)
+        }
+        route::KeySpec::Many(keys) => {
+            redirect_for_keys(map, keys.iter().copied(), replica_serves, migration)
+        }
     }
 }
 
@@ -1049,27 +1070,147 @@ fn cluster_redirect(
 ///
 /// An EMPTY key sequence yields `None` (no routable key: the home handler errors properly); it
 /// cannot occur for a well-formed command but is handled defensively rather than indexing.
+///
+/// HA-6: when `migration` is `Some`, the single resolved slot's MIGRATING / IMPORTING state is
+/// consulted AFTER CROSSSLOT but BEFORE the plain MOVED, producing `-ASK` / serve-locally /
+/// `-TRYAGAIN` per [`migration_decision`]. When `None` (static / WATCH path) the migration arm is
+/// skipped entirely and the result is byte-identical to pre-HA-6.
 fn redirect_for_keys<'a, I>(
     map: &ironcache_cluster::SlotMap,
     keys: I,
     replica_serves: bool,
+    migration: Option<&MigrationCtx<'_>>,
 ) -> Option<ironcache_protocol::ErrorReply>
 where
     I: IntoIterator<Item = &'a [u8]>,
 {
-    let mut iter = keys.into_iter();
-    let first = iter.next()?;
+    // Collect the keys into a slice so the migration arm can iterate them twice (presence per key);
+    // for the common single-key command this is a one-element Vec and the CROSSSLOT loop is trivial.
+    let key_vec: Vec<&[u8]> = keys.into_iter().collect();
+    let first = *key_vec.first()?;
     let first_slot = ironcache_protocol::key_slot(first);
-    // CROSSSLOT (keys span slots) takes precedence over MOVED, regardless of ownership: a
+    // CROSSSLOT (keys span slots) takes precedence over MOVED/ASK, regardless of ownership: a
     // cross-slot request is rejected, never scattered.
-    for k in iter {
+    for &k in &key_vec[1..] {
         if ironcache_protocol::key_slot(k) != first_slot {
             return Some(ironcache_protocol::ErrorReply::crossslot());
         }
     }
-    // All keys co-locate on one slot: MOVED if this node neither owns nor (read-only) replicates
-    // it. `replica_serves` carries the HA-7d READONLY-read gate (see `moved_if_unowned`).
+    // HA-6: if the slot is mid-migration AND the caller supplied a migration context, the per-key
+    // cutover decision (ASK / serve / TRYAGAIN / IMPORTING-ASKING) replaces the plain MOVED. The
+    // function returns None to FALL THROUGH to the static decision below when the slot is not
+    // migrating, so the default path is unchanged.
+    if let Some(mig) = migration {
+        if let Some(decision) = migration_decision(map, first_slot, &key_vec, mig) {
+            return decision.into_reply();
+        }
+    }
+    // All keys co-locate on one non-migrating slot: MOVED if this node neither owns nor (read-only)
+    // replicates it. `replica_serves` carries the HA-7d READONLY-read gate (see `moved_if_unowned`).
     moved_if_unowned(map, first_slot, replica_serves)
+}
+
+/// The outcome of the HA-6 migration redirect decision for one slot's keys. Distinct from a bare
+/// `Option<ErrorReply>` so the "serve locally" outcome (None reply) is explicit and cannot be
+/// confused with "not migrating, fall through to the static decision".
+enum MigrationDecision {
+    /// Serve the command locally (the keys are present here on a MIGRATING slot, or this is an
+    /// IMPORTING slot with ASKING set). The redirect returns `None`.
+    Serve,
+    /// `-ASK <slot> <dest:port>`: every key has already migrated to the destination.
+    Ask(ironcache_protocol::ErrorReply),
+    /// `-TRYAGAIN ...`: a multi-key command on a MIGRATING slot whose keys are split.
+    TryAgain,
+}
+
+impl MigrationDecision {
+    /// The redirect reply for this decision: `None` to serve locally, `Some(error)` to redirect.
+    fn into_reply(self) -> Option<ironcache_protocol::ErrorReply> {
+        match self {
+            MigrationDecision::Serve => None,
+            MigrationDecision::Ask(reply) => Some(reply),
+            MigrationDecision::TryAgain => Some(ironcache_protocol::ErrorReply::tryagain()),
+        }
+    }
+}
+
+/// THE HA-6 per-slot migration redirect decision (the heart of online slot migration). Returns
+/// `Some(decision)` when `slot` is mid-migration in a way that overrides the plain MOVED/serve, or
+/// `None` when the slot is NOT migrating (the caller falls through to the static MOVED/owns/replica
+/// decision, so the default path is byte-unchanged).
+///
+/// The decision table (real Redis Cluster semantics, adapted to the Raft-committed map):
+///
+/// - Slot is MIGRATING toward `dest` AND THIS node still OWNS it (the SOURCE side):
+///   * EVERY key is present locally -> Serve (the key has not migrated yet; serve it here).
+///   * EVERY key is absent locally -> `-ASK <slot> <dest>` (migrated already / never existed; the
+///     destination is where it lives now -- a ONE-TIME hint, NOT MOVED, ownership unchanged).
+///   * MIXED (some present, some absent; only possible for a multi-key command) -> `-TRYAGAIN`
+///     (cannot serve atomically on either side; the client retries as the migration converges).
+/// - Slot is IMPORTING from `src` AND THIS node does NOT yet own it (the DESTINATION side):
+///   * the connection set `ASKING` -> Serve (the migrated key has arrived; this is the second leg
+///     of the ASK redirect).
+///   * `ASKING` NOT set -> `None` (fall through to the static MOVED-to-owner: a client that lands
+///     here without ASKING is talking to the wrong node for a slot it does not own yet).
+/// - Any other combination (not migrating, or MIGRATING but this node does not own it, or IMPORTING
+///   but already owns it) -> `None` (fall through to the static decision).
+///
+/// SAFETY: this never grants ownership; it only decides WHERE a request is served DURING the
+/// migration window. Ownership transfers solely through the committed FLIP, after which the slot is
+/// no longer MIGRATING/IMPORTING (the FLIP clears it) and this returns `None` -> the source serves
+/// MOVED and the destination owns. So there is never a state where two nodes both serve a key as
+/// owner: the source serves only present keys (handing absent ones to dest via ASK), and the dest
+/// serves only under ASKING (or after it owns).
+fn migration_decision(
+    map: &ironcache_cluster::SlotMap,
+    slot: u16,
+    keys: &[&[u8]],
+    mig: &MigrationCtx<'_>,
+) -> Option<MigrationDecision> {
+    use ironcache_cluster::MigrationState;
+    match map.migration_state(slot) {
+        MigrationState::Migrating if map.owns(slot) => {
+            // SOURCE side: decide by local key presence.
+            let mut any_present = false;
+            let mut any_absent = false;
+            for &k in keys {
+                if (mig.key_present)(k) {
+                    any_present = true;
+                } else {
+                    any_absent = true;
+                }
+            }
+            if any_present && any_absent {
+                // Multi-key split across the cutover: cannot serve atomically -> TRYAGAIN.
+                Some(MigrationDecision::TryAgain)
+            } else if any_absent {
+                // All keys gone (migrated / never existed): ASK to the destination. The dest
+                // endpoint must resolve; if it somehow does not (peer forgotten mid-migration),
+                // `map()` yields None and we fall through to the static decision rather than dial a
+                // nonexistent node.
+                map.migration_peer_endpoint(slot).map(|(host, port)| {
+                    MigrationDecision::Ask(ironcache_protocol::ErrorReply::ask(
+                        slot,
+                        &format!("{host}:{port}"),
+                    ))
+                })
+            } else {
+                // All keys present: serve locally (not migrated yet).
+                Some(MigrationDecision::Serve)
+            }
+        }
+        MigrationState::Importing if !map.owns(slot) => {
+            // DESTINATION side: serve locally ONLY under ASKING; otherwise fall through to MOVED.
+            if mig.asking {
+                Some(MigrationDecision::Serve)
+            } else {
+                None
+            }
+        }
+        // Not migrating, or a migration tag that does not match this node's ownership (e.g. a stale
+        // MIGRATING tag on a node that no longer owns the slot): fall through to the static rule.
+        _ => None,
+    }
 }
 
 /// `Some(-MOVED <slot> <owner host:port>)` when THIS node does not own `slot` (and does not serve
@@ -1143,6 +1284,25 @@ fn moved_if_unowned(
 /// / home branches), each a documented decision the router must make in one place; splitting it
 /// further would scatter the routing contract. The same precedent as `dispatch_inner` /
 /// `command_spec::spec_of`.
+/// HA-6: consume the one-shot `ASKING` flag for THIS command and return whether it was set.
+///
+/// `ASKING` itself just SETS the flag (handled in the router) and must NOT consume the flag it is
+/// about to set, so for the `ASKING` command this returns `false` WITHOUT touching `conn.asking`.
+/// For EVERY other command it reads the flag, CLEARS it, and returns its prior value. Calling this
+/// EXACTLY ONCE at the top of `route_and_dispatch` -- before any early return (pubsub / in_multi /
+/// WATCH) -- is what guarantees a set flag can never LEAK into a later command (the adversarial-
+/// review Finding 1 hole). It is a single bool read+write; a non-cluster / non-migrating connection
+/// never sets `asking`, so the value is always `false` and the static path is unaffected.
+fn consume_one_shot_asking(cmd_upper: &[u8], conn: &mut ConnState) -> bool {
+    if cmd_upper == b"ASKING" {
+        false
+    } else {
+        let a = conn.asking;
+        conn.asking = false;
+        a
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn route_and_dispatch(
     ctx: &ServerContext,
@@ -1161,6 +1321,21 @@ async fn route_and_dispatch(
 ) -> bool {
     let cmd_upper = ascii_upper(request.command());
     let route = route::classify(&cmd_upper);
+
+    // HA-6: consume the one-shot ASKING EXACTLY ONCE PER COMMAND, BEFORE any early return
+    // (pubsub interception / in_multi / WATCH cluster-redirect / WATCH cross-shard / the internal-
+    // verb gate), so a set flag can NEVER leak into a later command. Previously the flag was
+    // captured + cleared only inside the `ctx.cluster` block below, but the early returns above it
+    // left `conn.asking` still true: `ASKING` then `SUBSCRIBE ch` (pubsub early return) then `GET
+    // <key in an IMPORTING slot>` would see asking == true and serve LOCALLY on a node that does
+    // NOT own the slot (a following `SET` there writes an orphaned key -> divergence / lost write
+    // on a migration abort). `ASKING` itself (the command, handled below) must NOT clear the flag
+    // it is about to set, so it is excluded here. Capturing for every OTHER command -- including
+    // the early-returning ones -- means the flag is consumed once and the leak is closed; the
+    // captured `asking` local is read by the migration redirect in the cluster block. A non-cluster
+    // / non-migrating connection never sets `asking`, so this is a single bool read+write on the
+    // cold path and the default static path is byte-unchanged.
+    let asking = consume_one_shot_asking(&cmd_upper, conn);
 
     // -- INTERNAL-VERB CLIENT GATE (COORDINATOR.md #107, Stage 2b). `__ICSTORESET` /
     // `__ICSTOREZSET` / `__ICSTOREHLL` are the coordinator's INTERNAL cross-shard *STORE
@@ -1329,9 +1504,15 @@ async fn route_and_dispatch(
             // WATCH snapshots for a transaction (a CAS that gates a WRITE), so it must NEVER be
             // served by a replica's stale state: pass `replica_serves = false` so a WATCH of a
             // foreign slot always MOVEDs to the owner, even on a READONLY replica connection.
-            if let Some(reply) =
-                redirect_for_keys(map, request.args[1..].iter().map(AsRef::as_ref), false)
-            {
+            // WATCH never participates in the HA-6 migration ASK/IMPORTING handshake (it is a CAS
+            // gate, not a data read/write that the client retries with ASKING), so pass `None`:
+            // the migration arm is skipped and WATCH redirects exactly as before HA-6.
+            if let Some(reply) = redirect_for_keys(
+                map,
+                request.args[1..].iter().map(AsRef::as_ref),
+                false,
+                None,
+            ) {
                 state_rc.borrow_mut().counters.on_command();
                 encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
                 return false;
@@ -1371,11 +1552,60 @@ async fn route_and_dispatch(
     // / admin / whole-keyspace commands are exempt (`cluster_redirect` returns None for them).
     // The in-MULTI path does NOT reach here (it returned to `route_in_multi` above); queued
     // commands are checked at QUEUE time there, reusing this SAME predicate.
+    // HA-6 ASKING: the one-shot per-connection flag. `ASKING` itself just sets the flag and replies
+    // +OK (it does NOT consume it -- the NEXT command does). Handled HERE (the router) so the flag
+    // is in scope for the migration redirect below; `ASKING` is `AlwaysHome`, so it otherwise falls
+    // through to the home dispatch, but intercepting it here keeps the one-shot lifetime tight.
+    if cmd_upper == b"ASKING" {
+        state_rc.borrow_mut().counters.on_command();
+        if request.args.len() == 1 {
+            conn.asking = true;
+            encode_into(out, &ironcache_server::Value::ok(), conn.proto);
+        } else {
+            encode_into(
+                out,
+                &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_arity(
+                    "asking",
+                )),
+                conn.proto,
+            );
+        }
+        return false;
+    }
+
     if let Some(map) = ctx.cluster.as_deref() {
         let in_sync = replica_read_in_sync(ctx);
-        if let Some(reply) =
-            cluster_redirect(map, route, &cmd_upper, request, conn.readonly, in_sync)
-        {
+        // HA-6: use the one-shot ASKING captured + cleared at the TOP of this function (before any
+        // early return), so a flag set by an earlier `ASKING` can never leak past a pubsub / in_multi
+        // / WATCH early return into this decision. The migration redirect is consulted only in raft
+        // cluster mode (a committed MIGRATING/IMPORTING tag); a non-migrating slot makes the resolver
+        // irrelevant and the decision byte-identical to pre-HA-6.
+        // The key-presence resolver reads THIS connection's accept-shard store at the current time.
+        // Cold: called only when a slot is actually MIGRATING and a key must be classified
+        // present/absent for the ASK decision. SCOPE: this is exact for the single-shard-per-node
+        // topology (the migration acceptance + loopback path); on a MULTI-shard node a migrating
+        // slot's key may live on a sibling shard, in which case `contains_live` here can report it
+        // absent and the source emits a (safe, idempotent) -ASK the client retries -- never a
+        // wrong-owner serve. The per-home-shard presence query for multi-shard migration is a
+        // documented follow-up (it needs a cross-shard presence hop, like the COORDINATOR.md data
+        // fan-out); the committed STATE MACHINE + FLIP + redirect semantics proven here do not
+        // depend on it.
+        let now = UnixMillis(env.borrow().now_unix_millis());
+        let db = conn.db;
+        let key_present = |k: &[u8]| store_rc.borrow().contains_live(db, k, now);
+        let mig = MigrationCtx {
+            asking,
+            key_present: &key_present,
+        };
+        if let Some(reply) = cluster_redirect(
+            map,
+            route,
+            &cmd_upper,
+            request,
+            conn.readonly,
+            in_sync,
+            Some(&mig),
+        ) {
             state_rc.borrow_mut().counters.on_command();
             encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
             // Short-circuit WITHOUT closing the connection (same as the WATCH guard above):
@@ -1584,7 +1814,7 @@ async fn try_raft_cluster_mutator(
     let built: Option<Result<Vec<ironcache_raft::ConfigCmd>, ErrorReply>> = match sub.as_slice() {
         b"ADDSLOTS" => Some(build_self_assign(ctx, request, parse_addslots_slots)),
         b"ADDSLOTSRANGE" => Some(build_self_assign(ctx, request, parse_addslotsrange_slots)),
-        b"SETSLOT" => Some(build_setslot(request).map(|c| vec![c])),
+        b"SETSLOT" => Some(build_setslot(ctx, request).map(|c| vec![c])),
         b"MEET" => Some(build_meet(request).map(|c| vec![c])),
         b"FORGET" => Some(build_forget(request).map(|c| vec![c])),
         b"SET-CONFIG-EPOCH" => Some(build_set_config_epoch(request).map(|c| vec![c])),
@@ -1726,25 +1956,75 @@ fn parse_addslotsrange_slots(
     Ok(slots)
 }
 
-/// Build the `SetSlotOwner { slot, node }` ConfigCmd for raft-mode `CLUSTER SETSLOT <slot> NODE
-/// <id>` (HA-4c). Only the `NODE` ownership-transfer form is supported (matching slice-3); the
-/// live-resharding states (MIGRATING/IMPORTING/STABLE) are not.
+/// Build the SETSLOT ConfigCmd for raft-mode `CLUSTER SETSLOT` (HA-4c + HA-6). Four forms:
+/// - `<slot> NODE <id>`      -> [`ConfigCmd::SetSlotOwner`]   (the committed FLIP, HA-4c).
+/// - `<slot> MIGRATING <id>` -> [`ConfigCmd::SetSlotMigrating`] (source-side handshake, HA-6).
+/// - `<slot> IMPORTING <id>` -> [`ConfigCmd::SetSlotImporting`] (destination-side handshake, HA-6).
+/// - `<slot> STABLE`         -> [`ConfigCmd::SetSlotStable`]    (clear/abort, HA-6).
+///
+/// NODE/MIGRATING/IMPORTING take a node id (argc == 5); STABLE takes none (argc == 4). Any other
+/// action or a known action at the wrong argc is the single Redis SETSLOT error.
+///
+/// HA-6 (Finding 2): the `IMPORTING <src>` proposal carries an explicit `dest` so apply tags
+/// IMPORTING on EXACTLY the destination node (via `SlotMap::is_self`), never on a bystander
+/// non-owner. The wire command stays `SETSLOT <slot> IMPORTING <src>` (the operator names only the
+/// source). In IronCache's raft model every CLUSTER mutator is proposed by the LEADER (a follower
+/// replies `-CLUSTERDOWN`), so "the node running the command" is the leader, NOT the importer --
+/// using the local node id would tag the leader, which is wrong. The slot is already MIGRATING
+/// toward a known DEST (the MIGRATING step of the handshake committed first), so the builder reads
+/// the recorded migration peer (`migration_peer_id`) as the dest. If the slot is not yet migrating
+/// on the leader (a malformed handshake with no prior MIGRATING, or a single node issuing IMPORTING
+/// against itself), it falls back to the local node id -- the conservative choice that tags the
+/// running node, matching the standalone Redis-style case.
 fn build_setslot(
+    ctx: &ServerContext,
     request: &Request,
 ) -> Result<ironcache_raft::ConfigCmd, ironcache_protocol::ErrorReply> {
     use ironcache_protocol::ErrorReply;
     let setslot_err = || {
         ErrorReply::err("Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP")
     };
-    if request.args.len() != 5 {
+    // The shortest form (STABLE) is 4 args; a node-id form is 5.
+    if request.args.len() < 4 {
         return Err(setslot_err());
     }
     let slot = parse_slot_strict(&request.args[2])?;
-    if !ascii_upper(&request.args[3]).eq_ignore_ascii_case(b"NODE") {
-        return Err(setslot_err());
+    let action = ascii_upper(&request.args[3]);
+    let node = |request: &Request| String::from_utf8_lossy(&request.args[4]).into_owned();
+    match action.as_slice() {
+        b"NODE" if request.args.len() == 5 => Ok(ironcache_raft::ConfigCmd::SetSlotOwner {
+            slot,
+            node: node(request),
+        }),
+        b"MIGRATING" if request.args.len() == 5 => {
+            Ok(ironcache_raft::ConfigCmd::SetSlotMigrating {
+                slot,
+                dest: node(request),
+            })
+        }
+        b"IMPORTING" if request.args.len() == 5 => {
+            // The dest is the node this slot is MIGRATING toward (the recorded migration peer the
+            // prior committed MIGRATING step set), so apply tags IMPORTING on EXACTLY that node --
+            // never on the leader (which proposes every mutator) or a bystander non-owner. Fall back
+            // to the local node id when the slot is not yet migrating on the leader (a handshake with
+            // no prior MIGRATING, or a node issuing IMPORTING against itself).
+            let dest = ctx
+                .cluster
+                .as_deref()
+                .and_then(|m| m.migration_peer_id(slot))
+                .unwrap_or_else(|| self_node_endpoint(ctx).0);
+            Ok(ironcache_raft::ConfigCmd::SetSlotImporting {
+                slot,
+                src: node(request),
+                dest,
+            })
+        }
+        b"STABLE" if request.args.len() == 4 => {
+            Ok(ironcache_raft::ConfigCmd::SetSlotStable { slot })
+        }
+        // Unknown action, or a known action at the wrong argc.
+        _ => Err(setslot_err()),
     }
-    let node = String::from_utf8_lossy(&request.args[4]).into_owned();
-    Ok(ironcache_raft::ConfigCmd::SetSlotOwner { slot, node })
 }
 
 /// Build the `AddNode { id, host, port }` ConfigCmd for raft-mode `CLUSTER MEET <ip> <port>
@@ -1987,8 +2267,20 @@ fn route_in_multi(
     // question, internal-shard ownership (which of MY shards) the inner one.
     if let Some(map) = ctx.cluster.as_deref() {
         let in_sync = replica_read_in_sync(ctx);
+        // HA-6: the in-MULTI QUEUE-TIME redirect deliberately passes `None` for the migration
+        // context, so it reproduces the pre-HA-6 MOVED/CROSSSLOT behavior exactly. The migration
+        // ASK/ASKING handshake is a SINGLE-command-retry protocol (the client sends ASKING then
+        // re-issues ONE command at the destination); it does not compose with transaction queueing
+        // (a queued ASK would have to redirect the whole MULTI, which Redis also does not do), so a
+        // migrating slot inside MULTI is treated as owned-or-MOVED, the conservative + correct
+        // choice (a key that has migrated away is simply absent, and the queued command runs against
+        // the source's view at EXEC). Documented scope boundary, mirroring how WATCH passes `None`.
+        // TODO(HA-6): ASKING through the MULTI queue-time redirect. The one-shot is already CONSUMED
+        // at the top of `route_and_dispatch` (so it can never LEAK into a later command), but it is
+        // not threaded into this queued redirect; an in-MULTI ASK-then-command is out of scope (Redis
+        // does not redirect a whole MULTI on ASK either), so passing `None` here is intentional.
         if let Some(reply) =
-            cluster_redirect(map, route, cmd_upper, request, conn.readonly, in_sync)
+            cluster_redirect(map, route, cmd_upper, request, conn.readonly, in_sync, None)
         {
             state_rc.borrow_mut().counters.on_command();
             conn.dirty_exec = true;
@@ -3066,7 +3358,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, false, false),
+            cluster_redirect(&map, route, b"GET", &req, false, false, None),
             None,
             "an owned single-key command proceeds (no redirect)"
         );
@@ -3079,7 +3371,7 @@ mod tests {
         let slot = ironcache_protocol::key_slot(key.as_bytes());
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
-        let reply = cluster_redirect(&map, route, b"GET", &req, false, false)
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, None)
             .expect("foreign key -> MOVED");
         // The MOVED carries the CLIENT-VISIBLE slot and node B's ADVERTISED host:port.
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
@@ -3093,7 +3385,7 @@ mod tests {
         let hi = key_in_slot_range(8192, 16383);
         let req = rreq(&[b"MGET", lo.as_bytes(), hi.as_bytes()]);
         let route = route::classify(b"MGET");
-        let reply = cluster_redirect(&map, route, b"MGET", &req, false, false)
+        let reply = cluster_redirect(&map, route, b"MGET", &req, false, false, None)
             .expect("cross-slot -> CROSSSLOT");
         assert_eq!(
             reply.line(),
@@ -3111,8 +3403,8 @@ mod tests {
             })
             .expect("a second distinct high-half slot");
         let req2 = rreq(&[b"MGET", h1.as_bytes(), h2.as_bytes()]);
-        let reply2 =
-            cluster_redirect(&map, route, b"MGET", &req2, false, false).expect("still CROSSSLOT");
+        let reply2 = cluster_redirect(&map, route, b"MGET", &req2, false, false, None)
+            .expect("still CROSSSLOT");
         assert_eq!(
             reply2.line(),
             "-CROSSSLOT Keys in request don't hash to the same slot",
@@ -3141,7 +3433,7 @@ mod tests {
         let req = rreq(&[b"MGET", k1.as_bytes(), k2.as_bytes()]);
         let route = route::classify(b"MGET");
         assert_eq!(
-            cluster_redirect(&map, route, b"MGET", &req, false, false),
+            cluster_redirect(&map, route, b"MGET", &req, false, false, None),
             None,
             "co-located + owned multi-key proceeds"
         );
@@ -3156,7 +3448,7 @@ mod tests {
             let req = rreq(&[cmd, b"*"]);
             let route = route::classify(cmd);
             assert_eq!(
-                cluster_redirect(&map, route, cmd, &req, false, false),
+                cluster_redirect(&map, route, cmd, &req, false, false, None),
                 None,
                 "{} must be exempt from cluster redirect",
                 String::from_utf8_lossy(cmd)
@@ -3172,7 +3464,7 @@ mod tests {
         let req = rreq(&[b"GET"]);
         let route = route::classify(b"GET");
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, false, false),
+            cluster_redirect(&map, route, b"GET", &req, false, false, None),
             None
         );
     }
@@ -3189,7 +3481,7 @@ mod tests {
         let map = redirect_map();
         let key = key_in_slot_range(0, 8191); // owned by self
         assert_eq!(
-            redirect_for_keys(&map, std::iter::once(key.as_bytes()), false),
+            redirect_for_keys(&map, std::iter::once(key.as_bytes()), false, None),
             None,
             "a single owned key proceeds (this is the WATCH-of-owned-key +OK case)"
         );
@@ -3200,7 +3492,7 @@ mod tests {
         let map = redirect_map();
         let key = key_in_slot_range(8192, 16383); // owned by node B
         let slot = ironcache_protocol::key_slot(key.as_bytes());
-        let reply = redirect_for_keys(&map, std::iter::once(key.as_bytes()), false)
+        let reply = redirect_for_keys(&map, std::iter::once(key.as_bytes()), false, None)
             .expect("foreign key -> MOVED (the WATCH-of-foreign-key case)");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -3211,7 +3503,7 @@ mod tests {
         let lo = key_in_slot_range(0, 8191);
         let hi = key_in_slot_range(8192, 16383);
         let keys = [lo.as_bytes(), hi.as_bytes()];
-        let reply = redirect_for_keys(&map, keys.iter().copied(), false)
+        let reply = redirect_for_keys(&map, keys.iter().copied(), false, None)
             .expect("two keys spanning slots -> CROSSSLOT (the WATCH-of-two-spanning-keys case)");
         assert_eq!(
             reply.line(),
@@ -3224,7 +3516,7 @@ mod tests {
         let map = redirect_map();
         let empty: std::iter::Empty<&[u8]> = std::iter::empty();
         assert_eq!(
-            redirect_for_keys(&map, empty, false),
+            redirect_for_keys(&map, empty, false, None),
             None,
             "no key -> None (defensive; a well-formed WATCH always has >=1 key)"
         );
@@ -3255,7 +3547,7 @@ mod tests {
         let route = route::classify(b"GET");
         // READONLY (replica_serves = true via readonly=true & GET is a read): served locally.
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, true, true),
+            cluster_redirect(&map, route, b"GET", &req, true, true, None),
             None,
             "a READONLY GET for a replicated slot is served locally (no MOVED)"
         );
@@ -3273,7 +3565,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         // READONLY but NOT in sync: the replica is too stale to serve -> MOVED to the owner (B).
-        let reply = cluster_redirect(&map, route, b"GET", &req, true, false)
+        let reply = cluster_redirect(&map, route, b"GET", &req, true, false, None)
             .expect("a READONLY read past the lag bound MOVEDs to the owner");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -3285,7 +3577,7 @@ mod tests {
         let req = rreq(&[b"SET", key.as_bytes(), b"v"]);
         let route = route::classify(b"SET");
         // SET is a write: MOVED to the OWNER (B) even on a READONLY connection.
-        let reply = cluster_redirect(&map, route, b"SET", &req, true, true)
+        let reply = cluster_redirect(&map, route, b"SET", &req, true, true, None)
             .expect("a write on a replica is MOVED to the owner even under READONLY");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -3297,7 +3589,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         // A non-READONLY (default) connection gets MOVED to the owner for the strong read.
-        let reply = cluster_redirect(&map, route, b"GET", &req, false, false)
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, None)
             .expect("a non-READONLY read of a replicated-but-not-owned slot is MOVED to the owner");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -3310,8 +3602,259 @@ mod tests {
         let slot = ironcache_protocol::key_slot(key.as_bytes());
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
-        let reply = cluster_redirect(&map, route, b"GET", &req, true, true)
+        let reply = cluster_redirect(&map, route, b"GET", &req, true, true, None)
             .expect("READONLY does not serve a slot this node neither owns nor replicates");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
+    }
+
+    // ----- HA-6 online slot migration: the ASK / ASKING / MOVED / TRYAGAIN decision table -----
+    //
+    // `self` = node A owns the low half [0,8191]; node B owns [8192,16383] advertised on
+    // 10.0.0.2:7002. These pin the migration redirect over every case in `migration_decision`,
+    // using an in-test `key_present` closure (the serve path supplies the real store resolver).
+
+    /// SOURCE side, MIGRATING slot, the key is ABSENT locally (migrated already) -> -ASK to dest.
+    #[test]
+    fn migrating_source_absent_key_is_ask_to_dest() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191); // A-owned (self is the source)
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        map.set_migrating(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        // The key is NOT present locally (migrated away / never existed).
+        let key_present = |_k: &[u8]| false;
+        let ctx = MigrationCtx {
+            asking: false,
+            key_present: &key_present,
+        };
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx))
+            .expect("absent key on a migrating slot -> ASK");
+        // ASK carries the client-visible slot and the DEST's advertised host:port (B = 10.0.0.2:7002).
+        assert_eq!(reply.line(), format!("-ASK {slot} 10.0.0.2:7002"));
+    }
+
+    /// SOURCE side, MIGRATING slot, the key IS present locally (not migrated yet) -> serve (None).
+    #[test]
+    fn migrating_source_present_key_is_served() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191);
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        map.set_migrating(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        let key_present = |_k: &[u8]| true; // present locally
+        let ctx = MigrationCtx {
+            asking: false,
+            key_present: &key_present,
+        };
+        assert_eq!(
+            cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx)),
+            None,
+            "a present key on a migrating slot is served locally"
+        );
+    }
+
+    /// SOURCE side, MIGRATING slot, MULTI-KEY split (one present, one absent) -> -TRYAGAIN.
+    #[test]
+    fn migrating_source_mixed_multikey_is_tryagain() {
+        let map = redirect_map();
+        // Two co-located (hash-tagged) keys on an A-owned slot.
+        let tag = (0..100_000u32)
+            .map(|i| format!("t{i}"))
+            .find(|t| ironcache_protocol::key_slot(format!("{{{t}}}a").as_bytes()) <= 8191)
+            .expect("a self-owned tag");
+        let k1 = format!("{{{tag}}}a");
+        let k2 = format!("{{{tag}}}b");
+        let slot = ironcache_protocol::key_slot(k1.as_bytes());
+        map.set_migrating(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"MGET", k1.as_bytes(), k2.as_bytes()]);
+        let route = route::classify(b"MGET");
+        // k1 present, k2 absent -> split across the cutover.
+        let k1_bytes = k1.clone();
+        let key_present = move |k: &[u8]| k == k1_bytes.as_bytes();
+        let ctx = MigrationCtx {
+            asking: false,
+            key_present: &key_present,
+        };
+        let reply = cluster_redirect(&map, route, b"MGET", &req, false, false, Some(&ctx))
+            .expect("a split multi-key on a migrating slot -> TRYAGAIN");
+        assert_eq!(
+            reply.line(),
+            "-TRYAGAIN Multiple keys request during rehashing of slot"
+        );
+    }
+
+    /// DESTINATION side, IMPORTING slot, NO ASKING -> MOVED to the real owner (not served here).
+    #[test]
+    fn importing_dest_without_asking_is_moved_to_owner() {
+        let map = redirect_map();
+        // A B-owned slot that self (A) is IMPORTING (does not own yet).
+        let key = key_in_slot_range(8192, 16383);
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        map.set_importing(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        let key_present = |_k: &[u8]| false;
+        let ctx = MigrationCtx {
+            asking: false, // NO ASKING
+            key_present: &key_present,
+        };
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx))
+            .expect("an importing slot without ASKING -> MOVED to the owner");
+        // MOVED to the OWNER (B = 10.0.0.2:7002), NOT served locally.
+        assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
+    }
+
+    /// DESTINATION side, IMPORTING slot, ASKING set -> serve locally (None). The ASK second leg.
+    #[test]
+    fn importing_dest_with_asking_is_served() {
+        let map = redirect_map();
+        let key = key_in_slot_range(8192, 16383);
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        map.set_importing(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        let key_present = |_k: &[u8]| false;
+        let ctx = MigrationCtx {
+            asking: true, // ASKING set
+            key_present: &key_present,
+        };
+        assert_eq!(
+            cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx)),
+            None,
+            "an importing slot WITH ASKING is served locally (the ASK second leg)"
+        );
+    }
+
+    /// POST-FLIP: once ownership has flipped to B and the migration is cleared (the FLIP clears it
+    /// in lockstep), the old owner (self) serves plain MOVED, never ASK.
+    #[test]
+    fn post_flip_source_serves_moved_not_ask() {
+        let map = redirect_map();
+        let key = key_in_slot_range(0, 8191); // was A-owned
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        // Migrate, then FLIP ownership to B (set_slot_node clears the migration in lockstep).
+        map.set_migrating(slot, RID_B).expect("B is known");
+        map.set_slot_node(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        // Even an ABSENT key now yields MOVED (not ASK): the slot is no longer migrating.
+        let key_present = |_k: &[u8]| false;
+        let ctx = MigrationCtx {
+            asking: false,
+            key_present: &key_present,
+        };
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx))
+            .expect("post-FLIP the old owner serves MOVED");
+        assert_eq!(
+            reply.line(),
+            format!("-MOVED {slot} 10.0.0.2:7002"),
+            "after the FLIP the source serves MOVED to the new owner, never ASK"
+        );
+    }
+
+    /// THE STATIC-PATH IDENTITY: with NO migration state on the map, the migration-aware redirect
+    /// (Some(ctx)) is BYTE-IDENTICAL to the static redirect (None) for every owned/foreign case --
+    /// the migration arms never fire when no slot is tagged, so the default path is unchanged.
+    #[test]
+    fn no_migration_state_is_byte_identical_to_static_redirect() {
+        let map = redirect_map();
+        let owned = key_in_slot_range(0, 8191);
+        let foreign = key_in_slot_range(8192, 16383);
+        // A present resolver + ASKING set that WOULD change a migrating/importing decision IF a slot
+        // were tagged; with no tag, neither matters and both calls must agree.
+        let key_present = |_k: &[u8]| true;
+        let ctx_ask = MigrationCtx {
+            asking: true,
+            key_present: &key_present,
+        };
+        for (cmd, key) in [(b"GET".as_slice(), &owned), (b"GET".as_slice(), &foreign)] {
+            let req = rreq(&[cmd, key.as_bytes()]);
+            let route = route::classify(cmd);
+            let with_mig = cluster_redirect(&map, route, cmd, &req, false, false, Some(&ctx_ask));
+            let without_mig = cluster_redirect(&map, route, cmd, &req, false, false, None);
+            assert_eq!(
+                with_mig, without_mig,
+                "no migration state -> Some(ctx) must equal None for key {key}"
+            );
+        }
+    }
+
+    // ----- HA-6 Finding 1: the one-shot ASKING is consumed EXACTLY ONCE PER COMMAND, before any
+    // early return -- so a flag set by `ASKING` can never LEAK past a pubsub / in_multi / WATCH
+    // early return into a later command (which would serve a key on a non-owner -> divergence). -----
+
+    /// A fresh connection for the consume-asking unit tests.
+    fn test_conn() -> ConnState {
+        ConnState::new(
+            1,
+            ProtoVersion::Resp2,
+            false,
+            "10.0.0.9:5000".to_string(),
+            "10.0.0.1:7001".to_string(),
+        )
+    }
+
+    /// `ASKING` itself sets the flag (in the router) and must NOT consume the flag it is about to
+    /// set: `consume_one_shot_asking` returns false for `ASKING` and leaves `conn.asking` untouched.
+    #[test]
+    fn consume_asking_does_not_clear_on_the_asking_command_itself() {
+        let mut conn = test_conn();
+        conn.asking = true; // a prior ASKING already set it; this command IS `ASKING`
+        let was = consume_one_shot_asking(b"ASKING", &mut conn);
+        assert!(!was, "ASKING does not report itself as a captured one-shot");
+        assert!(
+            conn.asking,
+            "ASKING must NOT clear the flag it is about to (re)set"
+        );
+    }
+
+    /// THE LEAK-CLOSED INVARIANT: after `ASKING`, the VERY NEXT command -- including an early-
+    /// returning one (a pubsub command like SUBSCRIBE, or a no-op) -- CONSUMES the flag. So a third
+    /// command can never see a stale `asking == true`. This is exactly the sequence the Finding 1
+    /// hole allowed: `ASKING; SUBSCRIBE ch; GET <importing-slot key>` previously left the flag set
+    /// for the GET because SUBSCRIBE returned early before the (old) consume site.
+    #[test]
+    fn consume_asking_clears_on_an_early_returning_command_no_leak() {
+        let mut conn = test_conn();
+        // ASKING set the flag (its own handler does conn.asking = true).
+        conn.asking = true;
+        // The NEXT command is SUBSCRIBE -- a pubsub command that EARLY-RETURNS in route_and_dispatch.
+        // consume_one_shot_asking runs at the TOP, BEFORE that early return, so it consumes here.
+        let captured = consume_one_shot_asking(b"SUBSCRIBE", &mut conn);
+        assert!(captured, "the command right after ASKING captures asking");
+        assert!(
+            !conn.asking,
+            "the one-shot is cleared even though SUBSCRIBE early-returns -> NO leak to the next cmd"
+        );
+        // The THIRD command (e.g. GET on an importing slot) now sees asking == false: it would be
+        // MOVED to the owner, never wrongly served locally on this non-owner node.
+        let next = consume_one_shot_asking(b"GET", &mut conn);
+        assert!(
+            !next,
+            "a command two hops after ASKING must NOT see a leaked asking"
+        );
+    }
+
+    /// A non-ASKING command with NO prior ASKING captures false and leaves the flag clear (the
+    /// overwhelmingly common path: a single bool read+write, no behavioral change).
+    #[test]
+    fn consume_asking_is_false_without_a_prior_asking() {
+        let mut conn = test_conn();
+        assert!(!conn.asking);
+        let captured = consume_one_shot_asking(b"GET", &mut conn);
+        assert!(!captured);
+        assert!(!conn.asking, "still clear");
+    }
+
+    /// RESET still clears a pending ASKING (conn.rs reset() parity), so the consume helper and RESET
+    /// agree: neither lets a stale one-shot survive.
+    #[test]
+    fn reset_clears_a_pending_asking() {
+        let mut conn = test_conn();
+        conn.asking = true;
+        conn.reset(false);
+        assert!(!conn.asking, "RESET clears the one-shot ASKING");
     }
 }

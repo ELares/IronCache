@@ -86,6 +86,10 @@ const CFG_ASSIGN_SLOTS: u8 = 3;
 const CFG_SET_CONFIG_EPOCH: u8 = 4;
 const CFG_ASSIGN_REPLICA: u8 = 5;
 const CFG_PROMOTE_REPLICA: u8 = 6;
+// HA-6 online slot migration (mirror the wire codec's discriminants, continuing from 7).
+const CFG_SET_SLOT_MIGRATING: u8 = 7;
+const CFG_SET_SLOT_IMPORTING: u8 = 8;
+const CFG_SET_SLOT_STABLE: u8 = 9;
 
 // The fixed frame header: a u32 body length followed by a u32 CRC of the body.
 const FRAME_HEADER_LEN: usize = 8;
@@ -275,6 +279,26 @@ fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
             }
             put_str(out, new_primary);
         }
+        ConfigCmd::SetSlotMigrating { slot, dest } => {
+            // HA-6: slot-then-node (matches the wire codec + the variant's field order). Must
+            // round-trip through the fsync log so a committed migration tag survives a restart.
+            out.push(CFG_SET_SLOT_MIGRATING);
+            put_u16(out, *slot);
+            put_str(out, dest);
+        }
+        ConfigCmd::SetSlotImporting { slot, src, dest } => {
+            // HA-6: slot-then-src-then-dest (matches the wire codec + the variant's field order).
+            // The `dest` field is appended (discriminant unchanged) so a committed IMPORTING tag's
+            // destination survives a restart.
+            out.push(CFG_SET_SLOT_IMPORTING);
+            put_u16(out, *slot);
+            put_str(out, src);
+            put_str(out, dest);
+        }
+        ConfigCmd::SetSlotStable { slot } => {
+            out.push(CFG_SET_SLOT_STABLE);
+            put_u16(out, *slot);
+        }
     }
 }
 
@@ -422,6 +446,17 @@ fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
             let new_primary = cur.string()?;
             Some(ConfigCmd::PromoteReplica { slots, new_primary })
         }
+        CFG_SET_SLOT_MIGRATING => Some(ConfigCmd::SetSlotMigrating {
+            slot: cur.u16()?,
+            dest: cur.string()?,
+        }),
+        CFG_SET_SLOT_IMPORTING => Some(ConfigCmd::SetSlotImporting {
+            // Read in WIRE order: slot, src, then the appended dest (matches the encode order).
+            slot: cur.u16()?,
+            src: cur.string()?,
+            dest: cur.string()?,
+        }),
+        CFG_SET_SLOT_STABLE => Some(ConfigCmd::SetSlotStable { slot: cur.u16()? }),
         _ => None,
     }
 }
@@ -886,6 +921,58 @@ mod tests {
                 s.entry_at(e.index).as_ref(),
                 Some(e),
                 "the committed PromoteReplica must replay byte-identical after a reopen"
+            );
+        }
+        assert_eq!(s.entries_from(1), entries);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn migration_entries_survive_fsync_log_reopen() {
+        // HA-6 crash-survival: the three committed migration ConfigCmds (SetSlotMigrating /
+        // SetSlotImporting / SetSlotStable) MUST round-trip through the fsync log codec so a node
+        // that crashes mid-migration replays the committed migration tag / FLIP correctly. The
+        // fsync log is a SEPARATE codec from the wire codec, so it is proven separately here.
+        let path = fresh_path("migration_entries_survive_fsync_log_reopen");
+        let entries = vec![
+            LogEntry {
+                term: 5,
+                index: 1,
+                payload: EntryPayload::Config(ConfigCmd::SetSlotMigrating {
+                    slot: 16_383,
+                    dest: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                }),
+            },
+            LogEntry {
+                term: 5,
+                index: 2,
+                payload: EntryPayload::Config(ConfigCmd::SetSlotImporting {
+                    // HA-6: slot-then-src-then-dest must survive the fsync-log reopen; distinct
+                    // src/dest ids prove both string fields recover in order.
+                    slot: 0,
+                    src: "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                    dest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+                }),
+            },
+            LogEntry {
+                term: 5,
+                index: 3,
+                payload: EntryPayload::Config(ConfigCmd::SetSlotStable { slot: 8192 }),
+            },
+        ];
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            for e in &entries {
+                s.append(e.clone());
+            }
+        }
+        let s = FileStorage::open(&path).expect("reopen recovers");
+        assert_eq!(s.last_log_index(), 3);
+        for e in &entries {
+            assert_eq!(
+                s.entry_at(e.index).as_ref(),
+                Some(e),
+                "the committed migration entry must replay byte-identical after a reopen"
             );
         }
         assert_eq!(s.entries_from(1), entries);

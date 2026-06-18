@@ -2172,6 +2172,22 @@ impl<E: EvictionHook, A: AccountingHook> ironcache_storage::Watch for ShardStore
 }
 
 impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
+    /// Whether `key` is PRESENT and LIVE (not expired as of `now`) in `db` (HA-6 online slot
+    /// migration: the source-side ASK decision needs to know if a key has already migrated away /
+    /// never existed vs is still here). A pure READ: it never reaps the key or fires any hook (a
+    /// lazily-expired key reports `false` but is left for the normal reap path), so it is safe to
+    /// call from the cold redirect path. Independent of the WATCH funnel and the hot put/get path;
+    /// the default (non-migration) routing never calls it.
+    #[must_use]
+    pub fn contains_live(&self, db: u32, key: &[u8], now: UnixMillis) -> bool {
+        let db_idx = self.db_index(db);
+        let h = self.key_hash(key);
+        self.dbs
+            .get(db_idx)
+            .and_then(|t| t.find(h, |e| e.key() == key))
+            .is_some_and(|o| !o.is_expired(now))
+    }
+
     /// Borrow the accounting hook (test/introspection helper).
     #[must_use]
     pub fn accounting(&self) -> &A {
