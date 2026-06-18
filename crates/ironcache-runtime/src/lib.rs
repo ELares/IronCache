@@ -147,7 +147,7 @@ pub use tokio_rt::TokioRuntime;
 #[cfg(feature = "tls")]
 pub mod tls;
 #[cfg(feature = "tls")]
-pub use tls::{ClientStream, TlsConfigError, accept_tls, build_acceptor};
+pub use tls::{ClientStream, HANDSHAKE_TIMEOUT, TlsConfigError, accept_tls, build_acceptor};
 
 pub mod bootstrap;
 pub use bootstrap::{ShardConfig, ShardId, ShardSet, available_shards};

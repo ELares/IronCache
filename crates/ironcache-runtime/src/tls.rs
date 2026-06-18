@@ -34,6 +34,7 @@ use rustls_pki_types::pem::PemObject;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor as RustlsAcceptor;
@@ -158,6 +159,12 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
     })
 }
 
+/// The maximum time a client may take to complete the TLS handshake before the connection
+/// is dropped. Bounds the slow-loris vector: half-open handshakes cannot accumulate and
+/// exhaust the per-shard serve tasks. Ten seconds matches the common industry default
+/// (e.g. the `tls-listener` crate) and is generous for a legitimate client.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Perform the TLS server handshake on a freshly accepted [`TcpStream`], returning a
 /// [`ClientStream::Tls`] the serve loop reads/writes transparently.
 ///
@@ -170,9 +177,18 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
 /// # Errors
 ///
 /// Returns the [`std::io::Error`] from a failed handshake (a non-TLS client, an
-/// untrusted client cert if mTLS were on, an unsupported protocol version, etc.).
+/// untrusted client cert if mTLS were on, an unsupported protocol version, etc.), or a
+/// [`std::io::ErrorKind::TimedOut`] error if the handshake does not complete within
+/// [`HANDSHAKE_TIMEOUT`].
 pub async fn accept_tls(acceptor: &RustlsAcceptor, tcp: TcpStream) -> io::Result<ClientStream> {
-    let tls = acceptor.accept(tcp).await?;
+    // Bound the handshake: a client that completes the TCP connect but then dribbles or
+    // never sends a valid ClientHello would otherwise pin this per-shard serve task
+    // forever (tokio-rustls imposes no handshake timeout of its own), which is a classic
+    // slow-loris DoS that is especially cheap against the thread-per-core runtime. After
+    // the bound the connection is dropped, freeing the slot.
+    let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
     Ok(ClientStream::Tls(Box::new(tls)))
 }
 

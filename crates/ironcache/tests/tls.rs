@@ -189,3 +189,52 @@ fn plaintext_client_to_tls_port_is_rejected() {
 
     set.shutdown_and_join().expect("clean shutdown");
 }
+
+#[test]
+fn stalled_tls_handshake_is_dropped_within_the_timeout() {
+    // SLOW-LORIS GUARD (#323 review C1): a client that opens TCP to the TLS port but then STALLS
+    // mid-handshake (sends the start of a TLS record and nothing more) must be DROPPED after the
+    // bounded `HANDSHAKE_TIMEOUT`, not pin the per-shard serve task forever. Before the timeout was
+    // added, the read below would hang for the entire connection lifetime (the DoS). This test
+    // would FAIL (time out) on the unbounded code and PASS now.
+    let port = free_port();
+    let set = run_tls_server_for_test(port, 1, cert_path(), key_path());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut tcp = None;
+        for _ in 0..50 {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+                tcp = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut tcp = tcp.expect("TLS port never accepted a TCP connection");
+        // One byte: the TLS handshake content-type (0x16) starting a record that never completes,
+        // so the rustls handshake blocks waiting for the rest of the ClientHello.
+        let _ = tcp.write_all(&[0x16u8]).await;
+
+        // The server must close the stalled connection within the handshake timeout (plus a
+        // scheduling margin), never hang. The bound is read from the public const so it tracks the
+        // server's actual timeout.
+        let bound = ironcache_runtime::HANDSHAKE_TIMEOUT + Duration::from_secs(5);
+        let mut chunk = [0u8; 16];
+        let read = tokio::time::timeout(bound, tcp.read(&mut chunk))
+            .await
+            .expect("stalled TLS handshake was NOT dropped within the timeout (slow-loris hang)");
+        // A clean close (Ok(0)) or a reset/error is the expected drop; the server must never serve
+        // RESP back on a stalled handshake.
+        if let Ok(n) = read {
+            assert!(
+                n == 0 || !chunk[..n].starts_with(b"+"),
+                "a stalled TLS handshake must be dropped, never served"
+            );
+        }
+    });
+
+    set.shutdown_and_join().expect("clean shutdown");
+}
