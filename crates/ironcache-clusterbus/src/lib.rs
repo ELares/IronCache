@@ -22,6 +22,9 @@ use ironcache_runtime::Runtime;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+pub mod security;
+pub use security::{BusStream, ClusterSecurity};
+
 /// Upper bound on a single peer-address resolution (H1): a SYNCHRONOUS `getaddrinfo` can block for
 /// SECONDS on a slow / unreachable resolver, and the dial path runs on the SINGLE-THREADED raft
 /// control-plane / shard executors (`new_current_thread` + `LocalSet`). [`PeerEndpoint::resolve`]
@@ -197,6 +200,25 @@ pub enum BusError<E> {
     /// StatefulSet support): a DNS name with no record, or a not-yet-up pod. Surfaced loudly by
     /// the dial path (logged + reconnect) instead of the old silent peer drop.
     Resolve(ResolveError),
+    /// The intra-cluster SECURITY handshake failed (PROD-3): a TLS handshake error (an untrusted
+    /// peer cert, a plaintext peer to a TLS port, a handshake timeout) OR the shared-secret peer
+    /// authentication mismatch / malformed-frame. The connection MUST be dropped (and re-dialed):
+    /// a peer that cannot complete the secure handshake is not a trusted cluster member. The string
+    /// is the rendered cause for the dial-path log.
+    Secure(String),
+}
+
+impl<E> BusError<E> {
+    /// Fold a [`security::WriteError`] from a [`BusStream`] send / recv into a [`BusError`]: the
+    /// plaintext runtime-seam error stays [`BusError::Io`], a secure (TLS) I/O error becomes
+    /// [`BusError::Secure`] (rendered) so both transports report through one error type.
+    fn from_write(e: security::WriteError<E>) -> Self {
+        match e {
+            security::WriteError::Runtime(io) => BusError::Io(io),
+            #[cfg(feature = "tls")]
+            security::WriteError::Secure(io) => BusError::Secure(io.to_string()),
+        }
+    }
 }
 
 /// An outbound RESP connection to a peer node, built on the [`Runtime`] seam.
@@ -206,7 +228,7 @@ pub enum BusError<E> {
 /// (`From`/`Into<Vec<u8>>`) is satisfied trivially by the tokio backend's `Vec<u8>`
 /// buffer and lets a future simulated buffer participate too.
 pub struct PeerConn<R: Runtime> {
-    stream: R::Stream,
+    stream: BusStream<R>,
     /// Bytes received but not yet consumed by a parsed reply.
     pending: Vec<u8>,
 }
@@ -216,11 +238,11 @@ where
     R: Runtime,
     R::Buf: From<Vec<u8>> + Into<Vec<u8>>,
 {
-    /// Open a connection to `addr` over the runtime seam.
+    /// Open a PLAINTEXT connection to `addr` over the runtime seam (the default, byte-unchanged).
     pub async fn connect(rt: &R, addr: SocketAddr) -> Result<Self, BusError<R::Error>> {
         let stream = rt.connect(addr).await.map_err(BusError::Io)?;
         Ok(Self {
-            stream,
+            stream: BusStream::Runtime(stream),
             pending: Vec::new(),
         })
     }
@@ -241,17 +263,54 @@ where
         Self::connect(rt, addr).await
     }
 
+    /// Open a connection to a peer by its advertised [`PeerEndpoint`], applying the optional cluster
+    /// transport SECURITY (PROD-3): when `security` is `Some`, the dialed `TcpStream` is TLS-wrapped
+    /// (if a connector is configured) and the shared-secret peer-authentication handshake runs
+    /// BEFORE any RAFTMSG byte; when `None`, this is byte-identical to [`Self::connect_endpoint`]
+    /// (plaintext over the runtime seam).
+    ///
+    /// The secure path requires the runtime's `Stream` to be a tokio `TcpStream` (the production
+    /// `TokioRuntime`), expressed by the `Into<tokio::net::TcpStream>` bound, because rustls wraps a
+    /// concrete TCP stream; the deterministic-simulation runtimes never carry security (they drive
+    /// the pure engine, not this transport), so they only ever take the `None` plaintext path.
+    pub async fn connect_endpoint_secure(
+        rt: &R,
+        endpoint: &PeerEndpoint,
+        security: Option<&ClusterSecurity>,
+    ) -> Result<Self, BusError<R::Error>>
+    where
+        R::Stream: Into<tokio::net::TcpStream>,
+    {
+        let addr = endpoint.resolve(rt).await.map_err(BusError::Resolve)?;
+        let raw = rt.connect(addr).await.map_err(BusError::Io)?;
+        let stream = match security {
+            None => BusStream::Runtime(raw),
+            Some(sec) => {
+                let secure = sec
+                    .dial(raw.into())
+                    .await
+                    .map_err(|e| BusError::Secure(e.to_string()))?;
+                BusStream::Secure(secure)
+            }
+        };
+        Ok(Self {
+            stream,
+            pending: Vec::new(),
+        })
+    }
+
     /// Send one command (an array of bulk-string args) and read exactly one reply.
     ///
     /// The request is RESP-encoded and written through the seam's owned-buffer
     /// `send`; the reply is read by appending `recv` chunks until one full reply
-    /// decodes from the pending buffer.
+    /// decodes from the pending buffer. Routed through [`BusStream`] so the plaintext
+    /// (runtime-seam) and the secure (TLS/secret) variants share one request loop.
     pub async fn request(&mut self, rt: &R, args: &[&[u8]]) -> Result<Reply, BusError<R::Error>> {
-        let encoded: R::Buf = encode_command(args).into();
-        let _ = rt
-            .send(&mut self.stream, encoded)
+        let encoded = encode_command(args);
+        self.stream
+            .send(rt, encoded)
             .await
-            .map_err(BusError::Io)?;
+            .map_err(BusError::from_write)?;
         loop {
             if let Some((reply, consumed)) =
                 parse_reply(&self.pending).map_err(BusError::Protocol)?
@@ -261,15 +320,16 @@ where
             }
             // Need more bytes: hand the pending buffer to recv (it appends) and take
             // it back grown. For the tokio backend the From/Into is identity (no copy).
-            let taken: R::Buf = core::mem::take(&mut self.pending).into();
-            let res = rt
-                .recv(&mut self.stream, taken)
+            let taken = core::mem::take(&mut self.pending);
+            let res = self
+                .stream
+                .recv(rt, taken)
                 .await
-                .map_err(BusError::Io)?;
+                .map_err(BusError::from_write)?;
             if res.n == 0 {
                 return Err(BusError::Eof);
             }
-            self.pending = res.buf.into();
+            self.pending = res.buf;
         }
     }
 }

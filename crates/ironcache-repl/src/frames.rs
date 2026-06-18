@@ -375,6 +375,15 @@ fn parse_command_array(buf: &[u8]) -> Result<Option<ParsedCommand>, FrameError> 
             return Ok(None);
         };
         let len = usize::try_from(len).map_err(|_| FrameError)?;
+        // FRAME BOUND (PROD-3, memory-DoS fix): reject a per-arg length over the cluster frame cap
+        // BEFORE waiting for / allocating the body. The length is attacker-controlled on the
+        // replication wire; without this an over-cap `$<huge>\r\n` header drives the replica/source
+        // recv buffer to grow unboundedly trying to satisfy the claimed length, OOMing the node. A
+        // real repl frame (one key's encoded value) is far under the 512 MiB cap. Enforced on the
+        // (default) plaintext path too -- it is a parser-correctness fix, not a TLS feature.
+        if len > ironcache_runtime::MAX_CLUSTER_FRAME_LEN {
+            return Err(FrameError);
+        }
         let body_start = next;
         let body_end = body_start.checked_add(len).ok_or(FrameError)?;
         let crlf_end = body_end.checked_add(2).ok_or(FrameError)?;
@@ -410,6 +419,41 @@ fn read_int_line(buf: &[u8], start: usize) -> Result<Option<(i64, usize)>, Frame
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PROD-3 FRAME BOUND: a replication frame whose per-arg length header claims MORE than
+    /// `MAX_CLUSTER_FRAME_LEN` is REJECTED (`Err(FrameError)`) at decode time, BEFORE the body is
+    /// awaited / allocated, so a forged huge length on the replication wire cannot drive an
+    /// unbounded recv-buffer growth (memory DoS). A length AT the cap is still accepted (the parser
+    /// asks for more bytes), so the bound never rejects a legitimate large value.
+    #[test]
+    fn frame_over_the_length_cap_is_rejected() {
+        let over = ironcache_runtime::MAX_CLUSTER_FRAME_LEN + 1;
+        // A SYNCKV-shaped array header with a kvobj arg claiming an over-cap body length, header
+        // only (no body). Without the cap this is "need more bytes"; with it, an immediate Err.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"*4\r\n");
+        frame.extend_from_slice(b"$6\r\nSYNCKV\r\n");
+        frame.extend_from_slice(b"$1\r\n0\r\n");
+        frame.extend_from_slice(b"$3\r\nfoo\r\n");
+        frame.extend_from_slice(format!("${over}\r\n").as_bytes());
+        assert!(
+            Frame::decode(&frame).is_err(),
+            "an over-cap per-arg length must be rejected, not awaited (memory DoS)"
+        );
+
+        // A length AT the cap (no body yet) is legitimate -> the parser asks for more bytes (Ok(None)).
+        let at = ironcache_runtime::MAX_CLUSTER_FRAME_LEN;
+        let mut ok_frame = Vec::new();
+        ok_frame.extend_from_slice(b"*4\r\n");
+        ok_frame.extend_from_slice(b"$6\r\nSYNCKV\r\n");
+        ok_frame.extend_from_slice(b"$1\r\n0\r\n");
+        ok_frame.extend_from_slice(b"$3\r\nfoo\r\n");
+        ok_frame.extend_from_slice(format!("${at}\r\n").as_bytes());
+        assert!(
+            matches!(Frame::decode(&ok_frame), Ok(None)),
+            "a length AT the cap is legitimate; the parser must ask for more bytes, not reject"
+        );
+    }
 
     /// A single round-trip assertion: encode then decode must reproduce the input
     /// byte-for-byte AND consume exactly the encoded length.

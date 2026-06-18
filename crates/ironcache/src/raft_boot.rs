@@ -45,12 +45,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ironcache_clusterbus::PeerEndpoint;
-use ironcache_config::Config;
+use ironcache_clusterbus::{ClusterSecurity, PeerEndpoint};
+use ironcache_config::{Config, TlsMode};
 use ironcache_env::SystemEnv;
 use ironcache_raft::{NodeId, RaftConfig, RaftNode};
 use ironcache_raft_net::{
-    ConfigSm, FileStorage, NodeHandle, RaftClusterBusNode, RaftHandle, run_listener,
+    ConfigSm, FileStorage, NodeHandle, RaftClusterBusNode, RaftHandle, run_listener_secure,
 };
 use ironcache_runtime::TokioRuntime;
 use ironcache_runtime::tokio_rt::bind_reuseport;
@@ -170,6 +170,65 @@ fn node_id_map(topo: &ironcache_config::ClusterTopology) -> BTreeMap<String, Nod
         .iter()
         .map(|n| (n.id.clone(), node_id_from_announce(&n.id)))
         .collect()
+}
+
+/// Build the optional intra-cluster transport SECURITY (PROD-3) from the resolved config: the TLS
+/// connector (dial side, verifying the peer against the optional cluster CA) + the TLS acceptor
+/// (listener side, presenting the cluster cert/key) + the shared secret bytes. The SAME handle is
+/// cloned onto the control-plane node (the dial) and the RAFTMSG listener (the accept), and reused
+/// by the replication transport.
+///
+/// Returns:
+/// * `Ok(None)` when neither TLS nor a secret is configured (the default plaintext bus, byte-
+///   unchanged): the bus + repl take the pre-PROD-3 path with no handshake.
+/// * `Ok(Some(_))` when TLS and/or a secret is configured (validated readable + consistent by
+///   `Config::validate`, so the PEM loads here should succeed).
+///
+/// # Errors
+///
+/// Returns [`BootError`] if a configured cert/key/CA PEM cannot be loaded into a rustls config
+/// (a corrupt PEM that passed the cheap readability pre-flight but rustls rejects). Mirrors the
+/// client-listener TLS boot, which also fails boot loudly on a bad cert rather than starting a
+/// listener that rejects every peer.
+fn build_cluster_security(config: &Config) -> Result<Option<ClusterSecurity>, BootError> {
+    let tls_on = config.cluster_tls == TlsMode::On;
+    let secret = config
+        .cluster_secret
+        .as_ref()
+        .map(|s| s.as_bytes().to_vec());
+    // Nothing configured -> the plaintext bus, byte-unchanged. (Config::validate already rejected an
+    // empty secret and a CA-without-TLS, so we never reach here with a degenerate config.)
+    if !tls_on && secret.is_none() {
+        return Ok(None);
+    }
+    let (connector, acceptor) = if tls_on {
+        // Config::validate proved cert + key are set + readable when cluster_tls = on.
+        let cert = config
+            .cluster_tls_cert_path
+            .as_ref()
+            .expect("Config::validate requires cluster_tls_cert_path when cluster_tls = on");
+        let key = config
+            .cluster_tls_key_path
+            .as_ref()
+            .expect("Config::validate requires cluster_tls_key_path when cluster_tls = on");
+        // The acceptor (listener side) presents the cluster cert/key. Reuse the client-TLS builder.
+        let acceptor =
+            ironcache_runtime::build_acceptor(&cert.to_string_lossy(), &key.to_string_lossy())
+                .map_err(|e| BootError(format!("cluster TLS acceptor build failed: {e}")))?;
+        // The connector (dial side) verifies the peer cert against the optional cluster CA; with no
+        // CA it accepts the cert and relies on the shared secret for peer authentication.
+        let ca = config
+            .cluster_ca_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let connector = ironcache_runtime::build_cluster_client_config(ca.as_deref())
+            .map_err(|e| BootError(format!("cluster TLS client config build failed: {e}")))?;
+        (Some(connector), Some(acceptor))
+    } else {
+        // Secret-only (plaintext-but-authenticated) cluster: no TLS configs, just the secret.
+        (None, None)
+    };
+    Ok(Some(ClusterSecurity::new(connector, acceptor, secret)))
 }
 
 /// Wire up the raft-mode control plane for THIS node. Called only from the raft-mode branch of
@@ -354,6 +413,12 @@ fn spawn_control_plane_inner(
         ..RaftConfig::default()
     };
 
+    // INTRA-CLUSTER TRANSPORT SECURITY (PROD-3): build the optional TLS + shared-secret handle from
+    // config. `None` (the default) is the plaintext bus, byte-unchanged. Built on the boot thread
+    // (it reads the cert/key/CA PEMs); the rustls configs are Send + Sync so the handle travels to
+    // the control-plane thread. A bad PEM fails boot loudly (BootError), like the client-listener TLS.
+    let security = build_cluster_security(config)?;
+
     // Build the engine + adapter + handle on the spawned control-plane thread (the engine and its
     // FileStorage / PeerConns are !Send, so they must be constructed where they live). Hand a
     // BootResult (the Send NodeHandle, or a fatal F1 BootError) back over a std mpsc, mirroring the
@@ -369,6 +434,7 @@ fn spawn_control_plane_inner(
                     voters,
                     topology_node_ids,
                     raft_config,
+                    security,
                 },
                 peers,
                 listen_addr,
@@ -407,6 +473,10 @@ struct ControlPlaneParams {
     /// scheme (an in-place upgrade hazard), so the node must refuse to boot.
     topology_node_ids: BTreeSet<NodeId>,
     raft_config: RaftConfig,
+    /// The optional intra-cluster transport SECURITY (PROD-3): the TLS connector + acceptor + shared
+    /// secret, cloned onto the control-plane node (dial) and the RAFTMSG listener (accept). `None` is
+    /// the plaintext bus (byte-unchanged).
+    security: Option<ClusterSecurity>,
 }
 
 /// The body of the dedicated control-plane OS thread: build a current-thread tokio runtime + a
@@ -429,6 +499,7 @@ fn run_control_plane_thread(
         voters,
         topology_node_ids,
         raft_config,
+        security,
     } = params;
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -523,17 +594,26 @@ fn run_control_plane_thread(
         }
 
         let runtime = TokioRuntime::new();
-        let (node, handle) = RaftClusterBusNode::new(raft, SystemEnv::new(), runtime, peers);
+        // SECURITY (PROD-3): the SAME handle drives the dial (new_secure) and the listener
+        // (run_listener_secure). `None` is the plaintext bus, byte-unchanged.
+        let (node, handle) = RaftClusterBusNode::new_secure(
+            raft,
+            SystemEnv::new(),
+            runtime,
+            peers,
+            security.clone(),
+        );
 
         // Hand the Send handle back to run_server's thread so it can install it in ServerContext.
         // A receive error means run_server already moved on; nothing to do.
         let _ = handle_tx.send(Ok(handle.clone()));
 
-        // The listener feeds Event::Inbound into the run loop's inbox.
+        // The listener feeds Event::Inbound into the run loop's inbox. The accepted RAFTMSG
+        // connections are TLS-terminated + secret-verified when `security` is configured.
         let inbox = handle.inbox().clone();
         let lrt = TokioRuntime::new();
         tokio::task::spawn_local(async move {
-            run_listener::<TokioRuntime>(lrt, listener, inbox).await;
+            run_listener_secure::<TokioRuntime>(lrt, listener, inbox, security).await;
         });
 
         // The control-plane run loop owns the engine for the process lifetime. When every

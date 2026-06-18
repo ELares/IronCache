@@ -13,6 +13,14 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# `tls` (default ON, implied by ironcache-runtime's default) adds the intra-cluster transport
+# security (PROD-3): the TLS dial / accept wrappers + the shared-secret peer-authentication
+# handshake (security.rs). With `tls` OFF the crate compiles plaintext-only (the BusStream::Secure
+# variant + ClusterSecurity disappear), byte-unchanged. It layers on ironcache-runtime's `tls`.
+default = ["tls"]
+tls = ["ironcache-runtime/tls", "dep:tokio-rustls"]
+
 [dependencies]
 ironcache-runtime = { workspace = true }
 # H1: peer-address resolution runs on tokio's BLOCKING pool via `tokio::net::lookup_host` so a
@@ -21,6 +29,10 @@ ironcache-runtime = { workspace = true }
 # DNS outage). Only the `net` feature is needed (the lookup); the timeout bound is read through the
 # Runtime timer seam, not tokio::time directly.
 tokio = { workspace = true, features = ["net"] }
+# Intra-cluster transport security (PROD-3): the rustls TlsAcceptor / TlsConnector types the
+# ClusterSecurity handle holds. OPTIONAL behind `tls`; the plaintext build pulls none of it. The
+# `ring` provider + version floor are pinned at the workspace level (reused from the client-TLS infra).
+tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }

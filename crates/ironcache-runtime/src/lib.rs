@@ -56,6 +56,25 @@ impl IoBuf for Vec<u8> {
     }
 }
 
+/// The maximum byte length any single framed argument (a RESP bulk-string body) on an
+/// intra-cluster link (the Raft cluster-bus `RAFTMSG` control plane OR the replication stream)
+/// may claim, bounding a memory-DoS from a FORGED huge length (PROD-3, HIGH severity).
+///
+/// The bus / repl frame parsers read a per-argument length off the wire and would otherwise accept
+/// any value up to `usize::MAX`, letting a malicious peer drive an unbounded buffer growth /
+/// allocation with a single `$999999999999\r\n` header (the serve loop keeps reading to satisfy the
+/// claimed body length). The parsers enforce this cap against the claimed length BEFORE any
+/// allocation, so an over-cap frame is rejected (the connection is dropped) rather than OOMing the
+/// node.
+///
+/// 512 MiB matches Redis's `proto-max-bulk-len` default: comfortably above any legitimate
+/// intra-cluster frame -- a Raft `AppendEntries` batch (a handful of small log entries) or a single
+/// replication entry (one key's encoded value) -- while bounding the forged-length vector to a
+/// single sane allocation ceiling. It lives here (NOT behind the `tls` feature) because the bound
+/// is a parser-correctness fix that applies to BOTH the TLS and the (default) plaintext path: a
+/// plaintext cluster is hardened against the DoS too.
+pub const MAX_CLUSTER_FRAME_LEN: usize = 512 * 1024 * 1024;
+
 /// The result of one `recv`: the (possibly grown) buffer and the count of bytes
 /// read into it. A read count of `0` signals a clean peer close (EOF).
 pub struct RecvResult<B> {
@@ -148,6 +167,15 @@ pub use tokio_rt::TokioRuntime;
 pub mod tls;
 #[cfg(feature = "tls")]
 pub use tls::{ClientStream, HANDSHAKE_TIMEOUT, TlsConfigError, accept_tls, build_acceptor};
+// Intra-cluster transport security (PROD-3): the node-to-node secure stream + the client-side
+// handshake + the shared-secret peer auth + the forged-length frame bound, reused by the Raft
+// cluster-bus and the replication transports. Behind the same `tls` feature (default ON).
+#[cfg(feature = "tls")]
+pub use tls::{
+    CLUSTER_TLS_SERVER_NAME, MAX_SECRET_LEN, SecretError, SecureStream, accept_cluster_tls,
+    authenticate_peer, build_cluster_client_config, connect_tls, constant_time_eq,
+    read_peer_secret, send_secret,
+};
 
 pub mod bootstrap;
 pub use bootstrap::{ShardConfig, ShardId, ShardSet, available_shards};
