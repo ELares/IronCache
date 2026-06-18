@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ironcache_config::Config;
@@ -57,6 +58,23 @@ pub fn bus_port(port: u16) -> u16 {
         port + BUS_PORT_OFFSET
     } else {
         port - BUS_PORT_OFFSET
+    }
+}
+
+/// The durable Raft-log path for a node, keyed by its cluster-bus `port` so co-located nodes do
+/// not share a log. When `data_dir` is `Some`, the log lives at
+/// `<data_dir>/ironcache-raft-<port>.log` (durable across a reboot that clears the OS temp dir).
+/// When `None` (the default), it lives at `<temp>/ironcache-raft-<port>.log`, the byte-unchanged
+/// pre-existing behavior. This is a PURE function (it computes a path, it does NOT create the
+/// directory or touch the file); the caller creates the `data_dir` directory beside opening the
+/// storage so an IO error degrades safely. Reading the OS temp dir is allowed by the determinism
+/// invariant (which forbids only clocks/entropy, not path reads).
+#[must_use]
+pub fn raft_log_path(data_dir: Option<&Path>, port: u16) -> PathBuf {
+    let file = format!("ironcache-raft-{port}.log");
+    match data_dir {
+        Some(dir) => dir.join(file),
+        None => std::env::temp_dir().join(file),
     }
 }
 
@@ -135,12 +153,14 @@ pub fn spawn_control_plane(
     let listen_addr =
         self_bus_addr.unwrap_or_else(|| SocketAddr::new(config.bind, bus_port(config.port)));
 
-    // (3) The durable storage path: <temp>/ironcache-raft-<bus-port>.log, keyed by the bus port
-    // so co-located test nodes do not share a log. There is no `data-dir` config knob yet; the
-    // temp dir is a deterministic, writable location (no time/rand; an OS path read is allowed by
-    // the determinism invariant, which forbids only clocks/entropy).
-    let storage_path =
-        std::env::temp_dir().join(format!("ironcache-raft-{}.log", listen_addr.port()));
+    // (3) The durable storage path: <data_dir>/ironcache-raft-<bus-port>.log when a `data_dir` is
+    // configured (durable across a reboot that clears /tmp), else <temp>/ironcache-raft-<bus-port>.log
+    // (the byte-unchanged default). Either way it is keyed by the BUS port so co-located test nodes
+    // do not share a log. An OS path read / dir create is allowed by the determinism invariant
+    // (which forbids only clocks/entropy); the directory is created on the control-plane thread
+    // beside FileStorage::open so an IO error logs and stops the control plane safely (a node that
+    // cannot persist its log must not vote), matching the existing storage-open degradation.
+    let storage_path = raft_log_path(config.data_dir.as_deref(), listen_addr.port());
 
     // Build the engine + adapter + handle on the spawned control-plane thread (the engine and its
     // FileStorage / PeerConns are !Send, so they must be constructed where they live). Hand the
@@ -212,6 +232,23 @@ fn run_control_plane_thread(
                 return;
             }
         };
+
+        // Ensure the log's parent directory exists. With the default (temp-dir) path this is a
+        // no-op (the OS temp dir always exists); with a configured `data_dir` this creates the
+        // durable directory if missing. A create failure is fatal to the control plane (it cannot
+        // persist its log there), so log a clear error and stop rather than run unsafe -- the same
+        // safe degradation as a storage-open failure below.
+        if let Some(parent) = storage_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!(
+                        "raft control plane: failed to create data directory {}: {e}",
+                        parent.display()
+                    );
+                    return;
+                }
+            }
+        }
 
         // Durable, fsync-backed storage; replays any prior log on restart (HA-4b). A failure to
         // open the log is fatal to the control plane (it cannot vote safely without persistence),
@@ -297,5 +334,28 @@ mod tests {
         assert_eq!(m["1111111111111111111111111111111111111111"], NodeId(1));
         assert_eq!(m["2222222222222222222222222222222222222222"], NodeId(2));
         assert_eq!(m.len(), 3);
+    }
+
+    /// `raft_log_path` joins a configured `data_dir` (durable), and falls back to the OS temp dir
+    /// (byte-unchanged) when none is set. Either way the file is keyed by the bus port so
+    /// co-located nodes do not share a log.
+    #[test]
+    fn raft_log_path_uses_data_dir_when_set_else_temp_dir() {
+        // Some(data_dir): <data_dir>/ironcache-raft-<port>.log.
+        let dir = Path::new("/var/lib/ironcache");
+        let set = raft_log_path(Some(dir), 17_001);
+        assert_eq!(set, dir.join("ironcache-raft-17001.log"));
+
+        // None: EXACTLY the pre-existing temp-dir path (byte-unchanged default).
+        let unset = raft_log_path(None, 17_001);
+        let expected = std::env::temp_dir().join("ironcache-raft-17001.log");
+        assert_eq!(unset, expected);
+
+        // The port keys the file name, so two co-located nodes get distinct logs.
+        let a = raft_log_path(Some(dir), 7000);
+        let b = raft_log_path(Some(dir), 7001);
+        assert_ne!(a, b);
+        assert!(a.ends_with("ironcache-raft-7000.log"));
+        assert!(b.ends_with("ironcache-raft-7001.log"));
     }
 }

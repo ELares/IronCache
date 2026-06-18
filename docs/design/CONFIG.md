@@ -76,6 +76,17 @@ validation as startup.
 The default memory ceiling (ADR-0007) is derived from the cgroup limit when
 present, not just host RAM, so a containerized IronCache sizes itself correctly.
 
+### Durable data directory
+
+`data_dir` (TOML key `data_dir`, env `IRONCACHE_DATA_DIR`, no CLI flag, defaulting
+to unset) names the durable directory for on-disk state. Today its only consumer is
+the raft-mode control plane, which writes its committed Raft log to
+`<data_dir>/ironcache-raft-<bus-port>.log` (keyed by the bus port so co-located
+nodes do not share a log) and creates the directory if missing. When `data_dir` is
+unset the log lives under the OS temp directory, which is writable and ephemeral but
+is NOT durable across a reboot that clears the temp dir, so a production raft node
+should set it. An empty `data_dir` is rejected at boot (a likely operator mistake).
+
 ## Open questions
 
 - The exact hot-swappable vs restart-required parameter partition (which knobs

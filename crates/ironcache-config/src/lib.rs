@@ -35,6 +35,7 @@ pub use sha256::sha256_hex;
 
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// The default RESP port. Redis/Valkey use 6379; IronCache keeps it for drop-in
@@ -294,6 +295,14 @@ pub struct Config {
     /// fails over faster (at the cost of more spurious-but-safe promotions). Meaningful
     /// ONLY in raft-governance mode. Defaults to [`DEFAULT_FAILOVER_TIMEOUT_SECS`].
     pub failover_timeout_secs: u64,
+    /// The durable data directory for the Raft log (and future on-disk state). When set, a
+    /// raft-mode node persists its committed Raft log at `<data_dir>/ironcache-raft-<bus-port>.log`,
+    /// so the control-plane state survives a reboot that clears the OS temp dir. When `None`
+    /// (the default) the log lives under [`std::env::temp_dir`], the pre-existing behavior
+    /// (byte-unchanged), which is fine for tests and ephemeral nodes but is NOT durable across a
+    /// `/tmp`-clearing reboot. TOML (`data_dir = "/var/lib/ironcache"`) + the `IRONCACHE_DATA_DIR`
+    /// env var. Meaningful only in raft-governance mode (the static path never reads it).
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -333,6 +342,10 @@ impl Default for Config {
             // never reads them, so they do not perturb the default posture).
             replica_max_lag: DEFAULT_REPLICA_MAX_LAG,
             failover_timeout_secs: DEFAULT_FAILOVER_TIMEOUT_SECS,
+            // No data directory by default: the Raft log lands under the OS temp dir
+            // (byte-unchanged pre-existing behavior). Setting it makes the log durable
+            // across a reboot that clears /tmp. Meaningful only in raft-governance mode.
+            data_dir: None,
         }
     }
 }
@@ -453,6 +466,19 @@ impl Config {
                     MAXMEMORY_POLICY_NAMES.join(", ")
                 ),
             });
+        }
+        // DATA DIRECTORY (the durable Raft-log location). When set it must not be empty: an
+        // empty path would resolve the log relative to the process CWD, which is almost
+        // certainly an operator mistake (it defeats the durability intent), so it hard-fails
+        // boot rather than silently writing the log somewhere surprising. `None` (the default)
+        // is fine: it keeps the OS-temp-dir behavior.
+        if let Some(dir) = &self.data_dir {
+            if dir.as_os_str().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "data_dir",
+                    reason: "must not be empty when set".to_owned(),
+                });
+            }
         }
         // CLUSTER TOPOLOGY (CLUSTER_CONTRACT.md #70, slice 2). When cluster mode is enabled
         // AND a static topology is configured, it must be a COMPLETE, non-overlapping,
@@ -632,6 +658,10 @@ pub struct ConfigOverlay {
     /// promotion. TOML (`failover_timeout_secs = N`) + the `IRONCACHE_FAILOVER_TIMEOUT_SECS`
     /// env var. `None` leaves the lower layer (default [`DEFAULT_FAILOVER_TIMEOUT_SECS`]).
     pub failover_timeout_secs: Option<u64>,
+    /// The durable data directory for the Raft log (and future on-disk state). TOML
+    /// (`data_dir = "/var/lib/ironcache"`, a string path) + the `IRONCACHE_DATA_DIR` env var.
+    /// `None` leaves the lower layer (default `None` = the OS temp dir, byte-unchanged).
+    pub data_dir: Option<PathBuf>,
 }
 
 impl ConfigOverlay {
@@ -718,6 +748,12 @@ impl ConfigOverlay {
                 reason: format!("not a number: {v}"),
             })?);
         }
+        // The durable data directory is a single scalar path, so it is env-encodable (useful
+        // for per-pod injection in a stateful set alongside the announce id). A path is taken
+        // verbatim (no parse can fail); an empty value is rejected by Config::validate.
+        if let Ok(v) = std::env::var("IRONCACHE_DATA_DIR") {
+            o.data_dir = Some(PathBuf::from(v));
+        }
         Ok(o)
     }
 
@@ -778,6 +814,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.failover_timeout_secs {
             cfg.failover_timeout_secs = v;
+        }
+        if let Some(ref v) = self.data_dir {
+            cfg.data_dir = Some(v.clone());
         }
         Ok(())
     }
@@ -888,7 +927,48 @@ mod tests {
         // HA-8 knobs default to the documented constants (meaningful only in raft-mode).
         assert_eq!(c.replica_max_lag, DEFAULT_REPLICA_MAX_LAG);
         assert_eq!(c.failover_timeout_secs, DEFAULT_FAILOVER_TIMEOUT_SECS);
+        // No data directory by default: the Raft log lands under the OS temp dir (unchanged).
+        assert!(c.data_dir.is_none());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn data_dir_parses_from_overlay_and_toml_and_defaults_none() {
+        // The overlay sets the durable data directory; an unset overlay leaves the default None.
+        let c = Config::resolve(&[ConfigOverlay {
+            data_dir: Some(PathBuf::from("/var/lib/ironcache")),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(
+            c.data_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/ironcache"))
+        );
+        c.validate().expect("a non-empty data_dir validates");
+
+        // Unset -> None (the byte-unchanged temp-dir default).
+        let unset = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert!(unset.data_dir.is_none());
+
+        // TOML form: a string path deserializes into the Option<PathBuf>.
+        let o = ConfigOverlay::from_toml_str("data_dir = \"/srv/ironcache/data\"\n").unwrap();
+        assert_eq!(
+            o.data_dir.as_deref(),
+            Some(std::path::Path::new("/srv/ironcache/data"))
+        );
+
+        // An empty data_dir is rejected by validate (a likely operator mistake, not durable).
+        let empty = Config {
+            data_dir: Some(PathBuf::new()),
+            ..Config::default()
+        };
+        assert!(matches!(
+            empty.validate().unwrap_err(),
+            ConfigError::Invalid {
+                field: "data_dir",
+                ..
+            }
+        ));
     }
 
     #[test]
