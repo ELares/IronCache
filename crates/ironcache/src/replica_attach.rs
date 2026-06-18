@@ -72,8 +72,9 @@ use std::rc::Rc;
 use ironcache_env::Clock;
 use ironcache_protocol::slot::key_slot;
 use ironcache_repl::{
-    ApplyOutcome, Frame, FrameError, ReplId, ReplNodeStatus, ReplObserver, ReplOffset, ReplRing,
-    ReplicaApplier, ShipOutcome, decode_kvobj, drain_and_ship, encode_kvobj, receive_full_sync,
+    ApplyOutcome, Frame, FrameError, InSyncReplicas, ReplId, ReplNodeStatus, ReplObserver,
+    ReplOffset, ReplRing, ReplicaApplier, ShipOutcome, decode_kvobj, drain_and_ship, encode_kvobj,
+    receive_full_sync,
 };
 use ironcache_runtime::tokio_rt::bind_exclusive;
 use ironcache_runtime::{Runtime, TokioRuntime};
@@ -220,6 +221,18 @@ pub(crate) fn spawn_on_shard(
         .clone()
         .unwrap_or_else(|| std::sync::Arc::new(ReplNodeStatus::new()));
 
+    // The SOURCE-SIDE in-sync-replica COUNT (ADR-0026, the WRITE-SIDE `min-replicas-to-write`
+    // guardrail): the primary's per-replica serve tasks maintain it (lock-free per-connection
+    // deltas) and the WRITE path reads it. Raft-mode always installs one (serve::run_server), so
+    // `Some` in practice; a defensive fresh cell keeps the wiring total. It is `Send + Sync` (a
+    // single AtomicUsize), cloned cheaply into the listener task. The LAG GATE the count uses is
+    // `min_replicas_max_lag` (the same offset-lag units as replica_max_lag).
+    let in_sync: std::sync::Arc<InSyncReplicas> = ctx
+        .in_sync_replicas
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::new(InSyncReplicas::new()));
+    let min_replicas_max_lag = ctx.boot.min_replicas_max_lag;
+
     let rt = TokioRuntime::new();
 
     // --- PRIMARY: bind the repl listener + serve replica connections. ---
@@ -227,6 +240,7 @@ pub(crate) fn spawn_on_shard(
     let listener_ring = Rc::clone(&ring);
     let listener_store = Rc::clone(&store_rc);
     let listener_status = std::sync::Arc::clone(&status);
+    let listener_in_sync = std::sync::Arc::clone(&in_sync);
     rt.spawn_on_shard(async move {
         run_primary_listener(
             TokioRuntime::new(),
@@ -235,6 +249,8 @@ pub(crate) fn spawn_on_shard(
             listener_store,
             listener_ring,
             listener_status,
+            listener_in_sync,
+            min_replicas_max_lag,
         )
         .await;
     });
@@ -304,6 +320,12 @@ struct FailoverParams {
 /// [`ironcache_repl::run_primary_repl_listener`]'s accept-and-spawn shape but serves the HA-7b
 /// full-sync + HA-7c tail (not just heartbeats). A bind failure logs and returns (the data
 /// path still runs; replication simply never serves, the safe degradation).
+///
+/// The over-7-args lint is allowed: each argument is a distinct, orthogonal seam (the runtime, the
+/// listen address, the repl id, the live store handle, the tail ring, the node status cell, plus the
+/// write-side guardrail count cell + its lag bound); bundling them would just move the same fields
+/// behind one name.
+#[allow(clippy::too_many_arguments)]
 async fn run_primary_listener(
     rt: TokioRuntime,
     listen_addr: SocketAddr,
@@ -311,6 +333,8 @@ async fn run_primary_listener(
     store_rc: Rc<RefCell<ShardStoreImpl>>,
     ring: Rc<RefCell<ReplRing>>,
     status: std::sync::Arc<ReplNodeStatus>,
+    in_sync: std::sync::Arc<InSyncReplicas>,
+    min_replicas_max_lag: u64,
 ) {
     // EXCLUSIVE bind (NO SO_REUSEPORT): the repl listener is a single per-node socket that must
     // never SHARE a port with another service. A reuseport bind would let the kernel load-balance
@@ -335,8 +359,19 @@ async fn run_primary_listener(
         let store = Rc::clone(&store_rc);
         let ring = Rc::clone(&ring);
         let status = std::sync::Arc::clone(&status);
+        let in_sync = std::sync::Arc::clone(&in_sync);
         rt.spawn_on_shard(async move {
-            serve_replica_conn(rt2, stream, replid, store, ring, status).await;
+            serve_replica_conn(
+                rt2,
+                stream,
+                replid,
+                store,
+                ring,
+                status,
+                in_sync,
+                min_replicas_max_lag,
+            )
+            .await;
         });
     }
 }
@@ -358,6 +393,12 @@ async fn run_primary_listener(
 ///
 /// The stream lives behind `Rc<RefCell<Option<_>>>` so each send/recv TAKES it out, awaits on
 /// the owned value, and puts it back -- no `RefCell` borrow crosses an `.await`.
+///
+/// The over-7-args lint is allowed: each argument is a distinct, orthogonal seam (the runtime, the
+/// accepted stream, the repl id, the live store handle, the tail ring, the node status cell, plus
+/// the write-side guardrail count cell + its lag bound); bundling them would just move the same
+/// fields behind one name.
+#[allow(clippy::too_many_arguments)]
 async fn serve_replica_conn(
     rt: TokioRuntime,
     stream: <TokioRuntime as Runtime>::Stream,
@@ -365,8 +406,17 @@ async fn serve_replica_conn(
     store_rc: Rc<RefCell<ShardStoreImpl>>,
     ring: Rc<RefCell<ReplRing>>,
     status: std::sync::Arc<ReplNodeStatus>,
+    in_sync: std::sync::Arc<InSyncReplicas>,
+    min_replicas_max_lag: u64,
 ) {
     let stream = Rc::new(RefCell::new(Some(stream)));
+    // THIS connection's contribution to the source-side in-sync-replica COUNT (ADR-0026, the
+    // WRITE-SIDE guardrail). The task is the SINGLE WRITER of its own contribution: `counted`
+    // tracks whether it currently counts toward the quorum, and every step nudges the shared
+    // counter by exactly one on a verdict change (lock-free `fetch_add`/`fetch_sub`). On EVERY
+    // exit path below it is cleared via `in_sync.replica_gone(counted)` so a disconnected replica
+    // stops counting; `counted` is updated in lockstep so that final clear is exact.
+    let mut counted = false;
 
     // (1) Read the attach handshake. A leading IMPORTREQ scopes the transfer to ONE slot (an
     // importing destination, HA-6 data-copy); otherwise it is a plain whole-store replica attach
@@ -394,8 +444,22 @@ async fn serve_replica_conn(
         drive_full_sync_chunked(&rt, &stream, replid, &store_rc, &ring, slot_filter).await
     else {
         status.set_replica_disconnected(); // the link dropped mid-sync; the replica re-syncs.
+        in_sync.replica_gone(counted); // no-op (never counted pre-sync), kept for uniform cleanup.
         return;
     };
+    // The full sync completed: this replica is now caught up to the snapshot cut (send_cursor ==
+    // cut), so it is IN SYNC. Count it toward the write-side quorum (ADR-0026). An IMPORT scope
+    // (slot_filter Some) is a slot-migration data-copy, NOT a durability replica, so it must NOT
+    // count toward the write quorum -- a write must be on real replicas, not a transient importer.
+    let lag_eligible = slot_filter.is_none();
+    counted = update_in_sync(
+        &in_sync,
+        &ring,
+        cut,
+        min_replicas_max_lag,
+        lag_eligible,
+        counted,
+    );
     // C1: THIS connection's OWN send cursor, starting at the snapshot cut. The ring keeps no
     // shared send cursor, so two concurrent consumers (e.g. this connection AND another replica
     // / an importer draining the same source ring) each advance their OWN cursor and each see
@@ -434,6 +498,19 @@ async fn serve_replica_conn(
         // Publish the advancing master head (and re-affirm the slave's last-known offset) so the
         // observable master offset tracks the writes shipped. Cold node-level publish, not per key.
         status.set_master_head(ring.borrow().head());
+        // WRITE-SIDE GUARDRAIL (ADR-0026): recompute this replica's in-sync verdict from the lag
+        // it has SHIPPED to (`head - send_cursor`) and nudge the shared count on a change. The
+        // source measures lag by how far its shipping is behind the head: a replica being kept
+        // current (send_cursor near head) is in sync; one that fell behind (the ring is filling
+        // faster than it drains) is not. Cold node-level update, not per stored key.
+        counted = update_in_sync(
+            &in_sync,
+            &ring,
+            send_cursor,
+            min_replicas_max_lag,
+            lag_eligible,
+            counted,
+        );
         match outcome {
             ShipOutcome::Shipped(0) => rt.timer(POLL_INTERVAL).await,
             ShipOutcome::Shipped(_) => {}
@@ -442,10 +519,36 @@ async fn serve_replica_conn(
             // cut; the ring's resync latch is cleared by the next attach's rebase-at-head.
             ShipOutcome::ResyncNeeded | ShipOutcome::LinkDown => {
                 status.set_replica_disconnected();
+                in_sync.replica_gone(counted); // this replica is gone: drop its quorum contribution.
                 return;
             }
         }
     }
+}
+
+/// Recompute THIS replica connection's in-sync verdict for the WRITE-SIDE guardrail count
+/// (ADR-0026) and publish the one-step delta, returning the new `counted` state.
+///
+/// The SOURCE measures lag as `head - shipped`: how far the primary's current offset is ahead of
+/// what this connection has SHIPPED (`shipped` is the per-connection send cursor). A replica is IN
+/// SYNC when `eligible` (a real durability replica, not a transient slot importer) AND that lag is
+/// `<= max_lag` (the [`InSyncReplicas`] lag gate, the same offset-lag semantics as the promotion
+/// gate). `head < shipped` cannot happen (the cursor never outruns the head) but is clamped to 0 by
+/// `saturating_sub` defensively. The actual counter mutation (a single `fetch_add`/`fetch_sub` on a
+/// change, a no-op when unchanged) lives in [`InSyncReplicas::set_replica_in_sync`]; this is the
+/// thin source-side adapter that reads `head` off the ring (one synchronous borrow, no `.await`).
+fn update_in_sync(
+    in_sync: &InSyncReplicas,
+    ring: &Rc<RefCell<ReplRing>>,
+    shipped: ReplOffset,
+    max_lag: u64,
+    eligible: bool,
+    counted: bool,
+) -> bool {
+    let head = ring.borrow().head();
+    let lag = head.0.saturating_sub(shipped.0);
+    let now_in_sync = eligible && lag <= max_lag;
+    in_sync.set_replica_in_sync(counted, now_in_sync)
 }
 
 /// Drive a full sync of THIS shard's live store (behind `store_rc`) to a replica, capturing the
@@ -1821,6 +1924,10 @@ mod tests {
                     let store = Rc::clone(&src_store);
                     let ring = Rc::clone(&src_ring);
                     let status = std::sync::Arc::new(ReplNodeStatus::new());
+                    // This test exercises the two-consumer tail fan-out, not the write-side
+                    // guardrail: pass a fresh in-sync count cell + a generous lag bound (the count
+                    // is maintained but unread here).
+                    let in_sync = std::sync::Arc::new(InSyncReplicas::new());
                     tokio::task::spawn_local(async move {
                         serve_replica_conn(
                             TokioRuntime::new(),
@@ -1829,6 +1936,8 @@ mod tests {
                             store,
                             ring,
                             status,
+                            in_sync,
+                            u64::MAX,
                         )
                         .await;
                     });

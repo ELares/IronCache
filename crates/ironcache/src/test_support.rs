@@ -111,3 +111,39 @@ pub fn run_raft_node_for_test_with(
         .expect("test raft cluster topology must validate");
     run_server(&config).expect("test raft cluster node failed to bind")
 }
+
+/// Like [`run_raft_node_for_test`] but with the WRITE-SIDE replication guardrail enabled
+/// (`min-replicas-to-write`, ADR-0026) at `min_replicas_to_write`, so a guardrail loopback test can
+/// drive an owner that REJECTS a write (`-NOREPLICAS`) until enough replicas are in sync. The lag
+/// bound (`min_replicas_max_lag`) is left generous so an attached + caught-up replica counts toward
+/// the quorum promptly; the failover timeout keeps its default.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind, OR if the topology fails to validate.
+#[must_use]
+pub fn run_raft_node_for_test_min_replicas(
+    port: u16,
+    topology: ClusterTopology,
+    announce_id: &str,
+    min_replicas_to_write: u32,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards: 1,
+        databases: 16,
+        cluster_enabled: true,
+        cluster_mode: ClusterMode::Raft,
+        cluster_topology: Some(topology),
+        cluster_announce_id: Some(announce_id.to_owned()),
+        min_replicas_to_write,
+        // A generous lag bound so a caught-up replica is counted in-sync quickly.
+        min_replicas_max_lag: 1_000_000,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test raft cluster topology must validate");
+    run_server(&config).expect("test raft cluster node failed to bind")
+}

@@ -295,6 +295,25 @@ pub struct Config {
     /// fails over faster (at the cost of more spurious-but-safe promotions). Meaningful
     /// ONLY in raft-governance mode. Defaults to [`DEFAULT_FAILOVER_TIMEOUT_SECS`].
     pub failover_timeout_secs: u64,
+    /// The WRITE-SIDE replication guardrail (Redis `min-replicas-to-write`, ADR-0026): the
+    /// minimum number of IN-SYNC replicas an owner must have before it ACCEPTS a write to a
+    /// slot it owns. When the count of in-sync replicas drops below this, the owner REJECTS the
+    /// write with `-NOREPLICAS Not enough good replicas to write.`, so an ACKNOWLEDGED write is
+    /// known to be on at least this many replicas -- bounding how many writes a failover can lose
+    /// to the async-replication window (the READ side is already bounded by [`replica_max_lag`]).
+    ///
+    /// DEFAULT 0 = DISABLED (the Redis default): the write hot path is BYTE-UNCHANGED -- the
+    /// guardrail is a single `> 0` short-circuit that never reads the in-sync count. Meaningful
+    /// ONLY in raft-governance mode (the default static path never reads it). TOML
+    /// (`min_replicas_to_write = N`) + the `IRONCACHE_MIN_REPLICAS_TO_WRITE` env var.
+    pub min_replicas_to_write: u32,
+    /// The lag bound (in LOGICAL WRITES) for the [`min_replicas_to_write`] guardrail: a replica
+    /// counts toward the in-sync quorum ONLY while its link is up AND its lag is `<= this` (the
+    /// same offset-lag semantics as [`replica_max_lag`], which Redis expresses in seconds as
+    /// `min-replicas-max-lag`). Meaningful ONLY when `min_replicas_to_write > 0` (and in
+    /// raft-governance mode). Defaults to [`DEFAULT_MIN_REPLICAS_MAX_LAG`]. TOML
+    /// (`min_replicas_max_lag = N`) + the `IRONCACHE_MIN_REPLICAS_MAX_LAG` env var.
+    pub min_replicas_max_lag: u64,
     /// The HA-3c Raft-log compaction threshold: once the number of committed-and-applied
     /// log entries ABOVE the last snapshot exceeds this, the raft control plane snapshots
     /// its state machine and compacts the log to there (Raft section 7), bounding the
@@ -352,6 +371,11 @@ impl Default for Config {
             // never reads them, so they do not perturb the default posture).
             replica_max_lag: DEFAULT_REPLICA_MAX_LAG,
             failover_timeout_secs: DEFAULT_FAILOVER_TIMEOUT_SECS,
+            // The WRITE-SIDE guardrail is DISABLED by default (min_replicas_to_write = 0, the
+            // Redis default): the write hot path is byte-unchanged. The lag bound carries a sane
+            // default but is only read when the guardrail is enabled. Meaningful only in raft-mode.
+            min_replicas_to_write: 0,
+            min_replicas_max_lag: DEFAULT_MIN_REPLICAS_MAX_LAG,
             // A NON-ZERO production compaction cadence (the engine's own default is 0 =
             // disabled, to keep the determinism sweep byte-identical); a real raft-mode
             // node compacts once its log grows this far past the last snapshot.
@@ -373,6 +397,14 @@ pub const DEFAULT_REPLICA_MAX_LAG: u64 = 256;
 /// continuously down before the replica proposes its own promotion. Comfortably above
 /// the replication poll cadence so a single missed poll does not trigger a failover.
 pub const DEFAULT_FAILOVER_TIMEOUT_SECS: u64 = 5;
+
+/// Default lag bound (logical writes) for the `min-replicas-to-write` guardrail's in-sync
+/// quorum: a replica counts toward the write-side quorum only while within this many writes of
+/// the master. A modest window (10) consistent with Redis's small `min-replicas-max-lag` default
+/// (10 seconds): a replica more than this far behind is not counted, so an accepted write is on
+/// at least `min_replicas_to_write` replicas that were recently current. Only read when the
+/// guardrail is enabled (`min_replicas_to_write > 0`), so the default path never touches it.
+pub const DEFAULT_MIN_REPLICAS_MAX_LAG: u64 = 10;
 
 /// Default HA-3c Raft-log compaction threshold (entries above the last snapshot). A
 /// PRODUCTION default of 1024: a real raft-mode deployment compacts its log once it grows
@@ -683,6 +715,15 @@ pub struct ConfigOverlay {
     /// promotion. TOML (`failover_timeout_secs = N`) + the `IRONCACHE_FAILOVER_TIMEOUT_SECS`
     /// env var. `None` leaves the lower layer (default [`DEFAULT_FAILOVER_TIMEOUT_SECS`]).
     pub failover_timeout_secs: Option<u64>,
+    /// The WRITE-SIDE replication guardrail `min-replicas-to-write` (ADR-0026): minimum in-sync
+    /// replicas before an owner accepts a write. TOML (`min_replicas_to_write = N`) + the
+    /// `IRONCACHE_MIN_REPLICAS_TO_WRITE` env var. `None` leaves the lower layer (default 0 =
+    /// DISABLED, the write hot path byte-unchanged).
+    pub min_replicas_to_write: Option<u32>,
+    /// The lag bound (logical writes) for the `min-replicas-to-write` quorum. TOML
+    /// (`min_replicas_max_lag = N`) + the `IRONCACHE_MIN_REPLICAS_MAX_LAG` env var. `None` leaves
+    /// the lower layer (default [`DEFAULT_MIN_REPLICAS_MAX_LAG`]).
+    pub min_replicas_max_lag: Option<u64>,
     /// HA-3c Raft-log compaction threshold (entries above the last snapshot). TOML
     /// (`raft_snapshot_threshold = N`) + the `IRONCACHE_RAFT_SNAPSHOT_THRESHOLD` env var.
     /// `None` leaves the lower layer (default [`DEFAULT_RAFT_SNAPSHOT_THRESHOLD`]); `0`
@@ -778,6 +819,21 @@ impl ConfigOverlay {
                 reason: format!("not a number: {v}"),
             })?);
         }
+        // The write-side replication guardrail knobs (single scalars, env-encodable for per-pod
+        // injection). Both are meaningful only in raft-mode AND only when the guardrail is
+        // enabled; a malformed value hard-fails boot rather than silently picking a default.
+        if let Ok(v) = std::env::var("IRONCACHE_MIN_REPLICAS_TO_WRITE") {
+            o.min_replicas_to_write = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "min-replicas-to-write",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_MIN_REPLICAS_MAX_LAG") {
+            o.min_replicas_max_lag = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "min-replicas-max-lag",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
         if let Ok(v) = std::env::var("IRONCACHE_RAFT_SNAPSHOT_THRESHOLD") {
             o.raft_snapshot_threshold = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "raft-snapshot-threshold",
@@ -850,6 +906,12 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.failover_timeout_secs {
             cfg.failover_timeout_secs = v;
+        }
+        if let Some(v) = self.min_replicas_to_write {
+            cfg.min_replicas_to_write = v;
+        }
+        if let Some(v) = self.min_replicas_max_lag {
+            cfg.min_replicas_max_lag = v;
         }
         if let Some(v) = self.raft_snapshot_threshold {
             cfg.raft_snapshot_threshold = v;
@@ -966,6 +1028,10 @@ mod tests {
         // HA-8 knobs default to the documented constants (meaningful only in raft-mode).
         assert_eq!(c.replica_max_lag, DEFAULT_REPLICA_MAX_LAG);
         assert_eq!(c.failover_timeout_secs, DEFAULT_FAILOVER_TIMEOUT_SECS);
+        // The WRITE-SIDE guardrail is DISABLED by default (0 = the Redis default): the write hot
+        // path is byte-unchanged. The lag bound carries a sane default (only read when enabled).
+        assert_eq!(c.min_replicas_to_write, 0);
+        assert_eq!(c.min_replicas_max_lag, DEFAULT_MIN_REPLICAS_MAX_LAG);
         // HA-3c compaction threshold defaults to the NON-ZERO production cadence so a real
         // raft-mode node actually compacts (the engine's own default is 0 = disabled).
         assert_eq!(c.raft_snapshot_threshold, DEFAULT_RAFT_SNAPSHOT_THRESHOLD);
@@ -1049,6 +1115,33 @@ mod tests {
         assert_eq!(o.replica_max_lag, Some(64));
         assert_eq!(o.failover_timeout_secs, Some(3));
         assert_eq!(o.raft_snapshot_threshold, Some(2048));
+    }
+
+    #[test]
+    fn min_replicas_to_write_knobs_parse_and_default_disabled() {
+        // DEFAULT: the write-side guardrail is DISABLED (0); the lag bound carries the sane
+        // default. An unset overlay leaves both at their defaults (write hot path byte-unchanged).
+        let unset = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert_eq!(unset.min_replicas_to_write, 0);
+        assert_eq!(unset.min_replicas_max_lag, DEFAULT_MIN_REPLICAS_MAX_LAG);
+
+        // The overlay enables + tunes the guardrail.
+        let c = Config::resolve(&[ConfigOverlay {
+            min_replicas_to_write: Some(2),
+            min_replicas_max_lag: Some(32),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(c.min_replicas_to_write, 2);
+        assert_eq!(c.min_replicas_max_lag, 32);
+        c.validate().expect("an enabled guardrail validates");
+
+        // TOML form.
+        let o =
+            ConfigOverlay::from_toml_str("min_replicas_to_write = 1\nmin_replicas_max_lag = 5\n")
+                .unwrap();
+        assert_eq!(o.min_replicas_to_write, Some(1));
+        assert_eq!(o.min_replicas_max_lag, Some(5));
     }
 
     #[test]

@@ -86,7 +86,8 @@ pub use ironcache_raft_net::{ProposeOutcome, RaftHandle};
 // INFO `# Replication` section + CLUSTER SHARDS render from a `ReplStatusSnapshot`; HA-8 consumes
 // `replica_is_in_sync` / `ReplNodeStatus::is_in_sync` as the promotion gate.
 pub use ironcache_repl::{
-    LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag, replica_is_in_sync,
+    InSyncReplicas, LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag,
+    replica_is_in_sync,
 };
 
 // Re-export the observe types the binary supplies to dispatch (the INFO memory

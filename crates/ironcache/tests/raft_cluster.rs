@@ -27,7 +27,7 @@
 //! real-time timeouts and discovers the leader by behavior rather than asserting timing.
 
 use ironcache::raft_boot::bus_port;
-use ironcache::test_support::run_raft_node_for_test;
+use ironcache::test_support::{run_raft_node_for_test, run_raft_node_for_test_min_replicas};
 use ironcache_config::{ClusterNode, ClusterTopology};
 use ironcache_env::{Clock, SystemEnv};
 use ironcache_protocol::key_slot;
@@ -1167,6 +1167,161 @@ fn raft_mode_replica_attaches_full_syncs_and_serves_readonly_reads() {
         assert!(
             strong_read.starts_with(&format!("-MOVED {slot} {owner_endpoint}")),
             "a non-READONLY read on the replica must MOVED to the owner, got {strong_read:?}"
+        );
+    });
+
+    clean_raft_logs(ports);
+}
+
+// The WRITE-SIDE replication guardrail (ADR-0026, Redis `min-replicas-to-write`) over real TCP: an
+// owner with `min_replicas_to_write = 1` and NO in-sync replica REJECTS a write with `-NOREPLICAS`;
+// once a peer becomes a committed replica of the slot, attaches, and full-syncs (in-sync count -> 1),
+// the SAME write succeeds. This proves the source-side in-sync count + the write-path check end to
+// end. `too_many_lines` + `needless_range_loop` allowed: ONE sequential acceptance flow indexing
+// parallel `clients[i]`/`ports[i]`.
+#[test]
+#[allow(clippy::too_many_lines, clippy::needless_range_loop)]
+fn raft_mode_min_replicas_to_write_rejects_until_a_replica_is_in_sync() {
+    // Attach involves leader election + several committed proposals + a full-sync; generous bound.
+    let timeout = Duration::from_secs(30);
+
+    let ports = [free_port(), free_port(), free_port()];
+    clean_raft_logs(ports);
+    let topo = three_node_topology(ports);
+
+    let ids = [ID0, ID1, ID2];
+    // Boot all three nodes with the WRITE-SIDE guardrail enabled (min_replicas_to_write = 1).
+    let _nodes: Vec<ShardSet> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| run_raft_node_for_test_min_replicas(ports[i], topo.clone(), id, 1))
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let mut clients = Vec::new();
+        for p in ports {
+            clients.push(connect_retry(p).await);
+        }
+        let env = SystemEnv::new();
+
+        // ---- (1) Discover the leader by probing a CLUSTER write (until a leader exists every
+        // node returns -CLUSTERDOWN; once one accepts, it is the owner "node A").
+        let leader_idx = {
+            let start = env.now();
+            let mut found = None;
+            'discover: loop {
+                for i in 0..3 {
+                    let peer = (i + 1) % 3;
+                    let reply = cmd(
+                        &mut clients[i],
+                        &["CLUSTER", "MEET", "127.0.0.1", &ports[peer].to_string()],
+                    )
+                    .await;
+                    if reply.starts_with("+OK") {
+                        found = Some(i);
+                        break 'discover;
+                    }
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            found.expect("a unique leader must emerge")
+        };
+
+        // ---- (2) The leader MEETs both peers + claims the WHOLE slot space (so it OWNS the slot
+        // under test). NO replica is assigned yet, so the owner has ZERO in-sync replicas.
+        for i in 0..3 {
+            if i == leader_idx {
+                continue;
+            }
+            let r = cmd(
+                &mut clients[leader_idx],
+                &["CLUSTER", "MEET", "127.0.0.1", &ports[i].to_string()],
+            )
+            .await;
+            assert!(r.starts_with("+OK"), "leader MEET should commit, got {r:?}");
+        }
+        let r = cmd(
+            &mut clients[leader_idx],
+            &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"],
+        )
+        .await;
+        assert!(
+            r.starts_with("+OK"),
+            "leader ADDSLOTSRANGE should commit, got {r:?}"
+        );
+
+        let key = key_in_range(100, 100);
+        let slot = key_slot(key.as_bytes());
+
+        // ---- (3) With the guardrail enabled and NO in-sync replica, an owned WRITE on the owner
+        // is REJECTED with -NOREPLICAS (the write hot path's guardrail short-circuit fires because
+        // min_replicas_to_write = 1 > the in-sync count 0).
+        let rejected = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[leader_idx], &["SET", &key, "hello"]).await;
+                if reply.starts_with("-NOREPLICAS") {
+                    assert_eq!(
+                        reply.trim_end(),
+                        "-NOREPLICAS Not enough good replicas to write.",
+                        "the guardrail reply must be the byte-exact Redis string"
+                    );
+                    break true;
+                }
+                // Until the owner has fully claimed the slots it may still be converging; keep
+                // polling for the steady-state rejection.
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            rejected,
+            "an owned write with 0 in-sync replicas must be rejected with -NOREPLICAS"
+        );
+
+        // ---- (4) Commit "node B replicates this leader-owned slot" so B attaches + full-syncs and
+        // becomes an IN-SYNC replica (the source-side in-sync count rises to 1).
+        let replica_idx = (leader_idx + 1) % 3;
+        let replica_synth_id = synth_meet_node_id("127.0.0.1", ports[replica_idx]);
+        let r = cmd(
+            &mut clients[leader_idx],
+            &["CLUSTER", "REPLICATE", &replica_synth_id, &slot.to_string()],
+        )
+        .await;
+        assert!(
+            r.starts_with("+OK"),
+            "leader CLUSTER REPLICATE <peer> <slot> should commit, got {r:?}"
+        );
+
+        // ---- (5) Once B has attached + synced (in-sync count -> 1 >= the required 1), the SAME
+        // owned WRITE now SUCCEEDS. Poll until the guardrail clears.
+        let accepted = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[leader_idx], &["SET", &key, "hello"]).await;
+                if reply.starts_with("+OK") {
+                    break true;
+                }
+                // Still -NOREPLICAS until B attaches + syncs; keep polling.
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        assert!(
+            accepted,
+            "after a replica attaches + syncs (in sync), the owned write must succeed"
         );
     });
 

@@ -9,6 +9,19 @@ release.
 
 ### Added
 
+- The WRITE-SIDE replication guardrail (`min-replicas-to-write` /
+  `min-replicas-max-lag`, ADR-0026): an owner REJECTS a write to a slot it owns
+  with `-NOREPLICAS Not enough good replicas to write.` when fewer than
+  `min_replicas_to_write` replicas are currently in sync (lag within
+  `min_replicas_max_lag`), so an acknowledged write is known to be on at least
+  that many replicas, bounding the failover loss window (the read side was
+  already bounded by `replica_max_lag`). The primary's per-replica serve tasks
+  maintain a node-level in-sync count as a single lock-free `AtomicUsize` (one
+  relaxed load on the write path); the check is owned-write-only,
+  cluster/raft-mode-only, and DISABLED by default (`min_replicas_to_write = 0`,
+  the Redis default), so the write hot path is byte-unchanged at the default.
+  Configurable via TOML / `IRONCACHE_MIN_REPLICAS_TO_WRITE` /
+  `IRONCACHE_MIN_REPLICAS_MAX_LAG`.
 - Fully automated versioning and releases, in two channels (RELEASING.md). A new
   `rolling-release` workflow publishes a calendar-versioned (`YYYY.MMDD.N`)
   GitHub Release on every push to `main`: four reproducible `cargo-zigbuild`
