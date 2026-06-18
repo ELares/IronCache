@@ -501,6 +501,24 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        // -- GRACEFUL SHUTDOWN (#139, SHUTDOWN.md). `SHUTDOWN [NOSAVE|SAVE]` is an admin command
+        // with NO key: AlwaysHome (never key-routed), arity Min(1) (the bare token plus an OPTIONAL
+        // NOSAVE/SAVE modifier; src/commands.def gives SHUTDOWN arity -1), not denyoom (it allocates
+        // no keyspace), not a txn control verb, and NOT is_write (it does not mutate the keyspace --
+        // it optionally DUMPs it then exits, exactly like SAVE; the replica-read gate must not treat
+        // SHUTDOWN as a write). The actual save-on-exit + the process exit-0 live in the binary's
+        // serve layer (it owns the per-shard stores, the data_dir, and the env Clock for the save
+        // timestamp); the serve router INTERCEPTS SHUTDOWN before this generic dispatch, so this arm
+        // is only the never-intercepted fallback (a SHUTDOWN inside MULTI, a documented divergence).
+        b"SHUTDOWN" => &CommandSpec {
+            name: b"SHUTDOWN",
+            arity: Min(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
         // -- Transaction control (cmd_txn / dispatch). The 6 control verbs (control: true)
         // bypass MULTI queueing; WATCH/UNWATCH arities are -2 / 1 (src/commands.def). --
         b"MULTI" => &CommandSpec {
