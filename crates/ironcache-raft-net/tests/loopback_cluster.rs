@@ -345,6 +345,82 @@ fn cluster_elects_commits_and_a_restarted_follower_catches_up() {
     }
 }
 
+/// HA-prod-commit-ack over real TCP: a `propose()` resolves `Committed` only AFTER a MAJORITY
+/// commit, and a majority does NOT require ALL voters. We elect a 3-voter leader, STOP one
+/// follower (so only leader + 1 follower remain = 2 of 3 = a majority), then propose on the
+/// leader. With the ack now resolving on the COMMIT-ADVANCE (not at append), the propose must
+/// still return its index -- the surviving follower's ack carries the entry onto a majority and
+/// commits it -- and the two live nodes converge. (Before this change the ack resolved at append
+/// regardless of replication; this proves it now waits for a real majority, yet does not need the
+/// dead third node.)
+#[test]
+fn propose_commits_on_majority_with_one_follower_down() {
+    let timeout = Duration::from_secs(10);
+
+    let addrs: BTreeMap<NodeId, SocketAddr> = [N1, N2, N3]
+        .into_iter()
+        .map(|id| (id, format!("127.0.0.1:{}", free_port()).parse().unwrap()))
+        .collect();
+    let peers = peer_maps(&addrs);
+
+    let ids = [N1, N2, N3];
+    let mut nodes: Vec<RunningNode> = ids
+        .iter()
+        .map(|&id| spawn_node(id, addrs[&id], peers[&id].clone()))
+        .collect();
+
+    let leader_idx = poll_until(timeout, || unique_leader(&nodes))
+        .expect("a unique leader must be elected within the timeout");
+    let follower_a = (0..3).find(|&i| i != leader_idx).unwrap();
+    let follower_b = (0..3)
+        .find(|&i| i != leader_idx && i != follower_a)
+        .unwrap();
+
+    // STOP one follower: leader + the OTHER follower is 2 of 3 = still a majority.
+    nodes[follower_a].stop();
+
+    // Propose on the leader. The ack resolves on the COMMIT-ADVANCE: the surviving follower acks,
+    // the entry reaches a 2/3 majority, commit advances, and the parked ack fires Committed(index).
+    // This MUST return (a quorum is live) with a 1-based index.
+    let want = EntryPayload::Bytes(b"commit-on-majority".to_vec());
+    let proposed_index = propose_on(&nodes[leader_idx].handle, want.clone()).expect(
+        "a quorum is live, so the propose must COMMIT on the majority and return its index",
+    );
+    assert!(proposed_index >= 1, "a proposed index is 1-based");
+
+    // The two LIVE nodes apply through the committed index (the dead one cannot, and is not needed).
+    let converged = poll_until(timeout, || {
+        (nodes[leader_idx].status().last_applied >= proposed_index
+            && nodes[follower_b].status().last_applied >= proposed_index)
+            .then_some(())
+    });
+    assert!(
+        converged.is_some(),
+        "the leader and the surviving follower must apply through index {proposed_index}; got \
+         leader={}, follower={}",
+        nodes[leader_idx].status().last_applied,
+        nodes[follower_b].status().last_applied
+    );
+
+    // The committed entry at the proposed index is OUR payload on both live nodes.
+    let leader_applied = drain_applied(&mut nodes[leader_idx]);
+    let follower_applied = drain_applied(&mut nodes[follower_b]);
+    let li = proposed_index as usize - 1;
+    assert_eq!(leader_applied[li].index, proposed_index);
+    assert_eq!(
+        &leader_applied[li].payload, &want,
+        "the committed entry must be our payload on the leader"
+    );
+    assert_eq!(
+        &follower_applied[li].payload, &want,
+        "the committed entry must be our payload on the surviving follower"
+    );
+
+    for mut node in nodes {
+        node.stop();
+    }
+}
+
 /// HA-9 LEADER-FORWARDING over real TCP: a `propose()` issued to a FOLLOWER is transparently
 /// forwarded to the leader, commits, and applies on EVERY node (so a follower no longer has to
 /// be the leader for a proposal to land). This is the headline property forwarding unlocks.
