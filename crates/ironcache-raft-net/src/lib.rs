@@ -58,10 +58,11 @@ use std::sync::Arc;
 use ironcache_clusterbus::{PeerConn, Reply};
 use ironcache_env::{Clock, Env, SystemEnv};
 use ironcache_raft::{
-    Effects, EntryPayload, LogEntry, NodeId, RaftMsg, RaftNode, RaftRng, RaftStorage, Role,
-    StateMachine, TimerOp,
+    Effects, EntryPayload, LogEntry, MembershipChange, NodeId, RaftMsg, RaftNode, RaftRng,
+    RaftStorage, Role, StateMachine, TimerOp,
 };
 use ironcache_runtime::Runtime;
+use std::collections::BTreeSet;
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// How long a follower waits for a [`RaftMsg::ForwardProposeResult`] before giving up and
@@ -82,6 +83,18 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 /// majority; on expiry the idempotent caller retries. Measured through the [`Runtime::timer`] seam,
 /// never wall-clock (ADR-0003).
 const PROPOSE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the LEADER's auto-promote driver wakes to check whether any LEARNER has caught up
+/// (HA-prod-membership). On each tick a leader, with NO membership change in flight, finds the
+/// first learner whose tracked `match_index` is within
+/// [`LEARNER_CATCHUP_LAG`](ironcache_raft::LEARNER_CATCHUP_LAG) of the committed log
+/// ([`RaftNode::learner_caught_up`]) and proposes [`MembershipChange::PromoteLearner`] for it -- ONE
+/// at a time (the engine's one-change-in-flight rule plus the in-flight pre-check ensure only one
+/// reconfiguration is ever outstanding). A short cadence keeps a freshly-joined learner's promotion
+/// prompt; it is pure liveness, never safety (a missed tick only delays a promotion). Measured
+/// through the [`Runtime::timer`] seam, never wall-clock (ADR-0003); on a non-leader the tick is a
+/// cheap no-op so a follower pays almost nothing for it.
+const MEMBERSHIP_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub mod codec;
 pub use codec::{decode_raft_msg, encode_raft_msg};
@@ -173,6 +186,32 @@ pub enum Event {
         /// parked entry).
         term: u64,
     },
+    /// An OPERATOR-driven single-server membership change (HA-prod-membership): grow or shrink the
+    /// Raft voter / learner set at runtime. Funneled through the same single run loop so the
+    /// quorum-affecting decision is serialized with every other engine step.
+    ///
+    /// On the LEADER the run loop (a) for an `AddLearner` / `AddVoter` carrying `addr`, REGISTERS
+    /// the new node's cluster-bus address so the leader can replicate to it; (b) for a `RemoveVoter`
+    /// applies the QUORUM-SAFETY guard (refusing a removal that would break majority); (c) proposes
+    /// the change via [`RaftNode::propose_membership_change`] (which enforces one-change-in-flight),
+    /// parking `ack` for resolution on TRUE COMMIT. A non-leader answers [`MembershipOutcome::NotLeader`]
+    /// at once (a membership change is NOT forwarded; the operator targets the leader).
+    Membership {
+        /// The single-server change to apply.
+        change: MembershipChange,
+        /// For a node being ADDED (`AddLearner` / `AddVoter`), its cluster-bus `SocketAddr` so the
+        /// leader can open a connection and replicate the log to it (a runtime-joined node is not in
+        /// the static topology peer map). `None` for a removal or when the address is already known.
+        addr: Option<SocketAddr>,
+        /// The one-shot the [`NodeHandle::propose_membership`] await parks on.
+        ack: oneshot::Sender<MembershipOutcome>,
+    },
+    /// The AUTO-PROMOTE driver tick (HA-prod-membership): on the leader, find the first caught-up
+    /// learner ([`RaftNode::learner_caught_up`]) and, if no membership change is in flight, propose
+    /// [`MembershipChange::PromoteLearner`] for it (ONE at a time). A no-op on a follower / when no
+    /// learner has caught up. Posted by the self-rearming driver task every
+    /// [`MEMBERSHIP_TICK_INTERVAL`]; pure liveness, never safety.
+    MembershipTick,
 }
 
 /// A point-in-time snapshot of the engine state, published to a [`watch`] channel
@@ -211,6 +250,48 @@ impl Status {
     }
 }
 
+/// The live Raft CONFIGURATION (voter set + learner set) this node has adopted from its log
+/// (HA-prod-membership). Published on its own watch channel (NOT folded into the `Copy`
+/// [`Status`], which must stay cheap) so an operator-facing reader -- `CLUSTER INFO`, a status
+/// probe, the membership loopback test -- can observe the committed/adopted membership WITHOUT
+/// racing the single-writer run loop. The sets are the engine's [`RaftNode::voters`] /
+/// [`RaftNode::learners`] snapshotted after each step; on a leader they reflect APPEND-TIME
+/// adoption (a just-appended `ConfigChange` is visible before it commits), which is exactly the
+/// section-6 configuration the leader counts quora over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterConfig {
+    /// The current VOTER set (counted in every election + commit quorum).
+    pub voters: BTreeSet<NodeId>,
+    /// The current LEARNER set (non-voting catch-up members; never counted in a quorum).
+    pub learners: BTreeSet<NodeId>,
+}
+
+/// The outcome of proposing a single-server [`MembershipChange`] through the control plane
+/// (HA-prod-membership). Distinguishes the section-6 ONE-CHANGE-IN-FLIGHT refusal (retryable once
+/// the in-flight change commits) and a QUORUM-SAFETY refusal (a removal that would break quorum --
+/// terminal, never retried) from a plain not-leader, so the operator path can react correctly to
+/// each WITHOUT ever proposing a doomed or unsafe entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipOutcome {
+    /// The membership change COMMITTED on a majority at the carried 1-based log index (resolved on
+    /// the true commit-advance, like every other proposal -- see [`ProposeOutcome::Committed`]).
+    Committed(u64),
+    /// This node is not the leader (or the control plane stopped); nothing was proposed. The caller
+    /// retries against the leader. UNLIKE a `ConfigCmd`, a membership change is NOT forwarded: the
+    /// operator path issues it on the leader (or retries), keeping the quorum-affecting decision on
+    /// the one node that owns the configuration.
+    NotLeader,
+    /// A membership change is already IN FLIGHT (appended but not yet committed): the section-6
+    /// one-change-in-flight rule forbids a second. RETRYABLE: the caller waits and retries once the
+    /// in-flight change commits. Never a safety violation -- the engine refuses the second change
+    /// regardless, this just reports WHY so the caller does not mistake it for not-leader.
+    InFlight,
+    /// The change was REFUSED by the adapter's quorum-safety guard (a `RemoveVoter` that would leave
+    /// the voter set unable to form a majority). TERMINAL: re-proposing the same removal would be
+    /// refused identically. The string is an operator-facing explanation.
+    Refused(String),
+}
+
 /// A handle to a running [`RaftClusterBusNode`], held by whoever spawned it.
 ///
 /// It carries the inbox sender (so the listener and local proposers can feed events
@@ -222,6 +303,10 @@ pub struct NodeHandle {
     id: NodeId,
     inbox: mpsc::UnboundedSender<Event>,
     status: watch::Receiver<Status>,
+    /// The live cluster CONFIGURATION (voter + learner sets) the run loop publishes after every
+    /// step (HA-prod-membership). On its own watch channel so the `Copy` [`Status`] stays cheap;
+    /// readers observe membership lock-free without racing the single-writer run loop.
+    config: watch::Receiver<ClusterConfig>,
     /// Every voter id (including self) to the `SocketAddr` of its `RAFTMSG` cluster-bus listener
     /// (HA-9). Shared so [`NodeHandle::leader_hint`] can resolve the watched `leader_id` to a
     /// `host:port` for a redirect reply, without reaching into the run loop. `Arc` because the
@@ -283,6 +368,47 @@ impl NodeHandle {
             return None;
         }
         rx.await.ok().flatten()
+    }
+
+    /// The latest published cluster CONFIGURATION snapshot (voter + learner sets, HA-prod-membership):
+    /// a cheap clone of the watch channel's current value; never blocks. Used by an operator-facing
+    /// reader (`CLUSTER INFO` / the membership loopback test) to observe the adopted membership.
+    #[must_use]
+    pub fn config(&self) -> ClusterConfig {
+        self.config.borrow().clone()
+    }
+
+    /// Propose a single-server [`MembershipChange`] through the control plane and await its outcome
+    /// (HA-prod-membership). `addr` is the new node's cluster-bus `SocketAddr` for an add
+    /// (`AddLearner` / `AddVoter`) so the leader can replicate to a runtime-joined node not in the
+    /// static peer map; pass `None` for a removal or an already-known peer.
+    ///
+    /// Returns [`MembershipOutcome::Committed`] once the change commits on a majority (resolved on
+    /// TRUE COMMIT), [`MembershipOutcome::NotLeader`] if this node is not the leader (a membership
+    /// change is NOT forwarded), [`MembershipOutcome::InFlight`] if a previous change is still
+    /// uncommitted (the section-6 one-change-in-flight rule -- retry after it commits), or
+    /// [`MembershipOutcome::Refused`] if the adapter's quorum-safety guard rejected a removal that
+    /// would break majority. The await parks on a one-shot the single run loop fulfills; it does not
+    /// block the caller's executor.
+    pub async fn propose_membership(
+        &self,
+        change: MembershipChange,
+        addr: Option<SocketAddr>,
+    ) -> MembershipOutcome {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .inbox
+            .send(Event::Membership {
+                change,
+                addr,
+                ack: tx,
+            })
+            .is_err()
+        {
+            return MembershipOutcome::NotLeader;
+        }
+        // A dropped sender (the run loop stopped) resolves to NotLeader, the safe retryable default.
+        rx.await.unwrap_or(MembershipOutcome::NotLeader)
     }
 }
 
@@ -391,6 +517,28 @@ where
     /// The status-snapshot publisher; the run loop sends a fresh [`Status`] after
     /// every step.
     status_tx: watch::Sender<Status>,
+    /// The cluster-configuration publisher (HA-prod-membership): the run loop sends a fresh
+    /// [`ClusterConfig`] (voter + learner sets) after every step, on its own channel so [`Status`]
+    /// stays `Copy`.
+    config_tx: watch::Sender<ClusterConfig>,
+    /// OPERATOR membership changes appended on THIS leader but not yet COMMITTED
+    /// (HA-prod-membership): the assigned log index to the parked [`MembershipOutcome`] one-shot +
+    /// the entry's term. Resolved in the SAME post-step pass as `pending_commits` (true commit ->
+    /// `Committed`; step-down / overwrite -> `NotLeader`). Kept separate from `pending_commits`
+    /// because the resolved type differs (`MembershipOutcome`, not `Option<u64>`); owned solely by
+    /// the run loop (no lock).
+    pending_membership: BTreeMap<u64, PendingMembership>,
+}
+
+/// An OPERATOR membership change appended on this leader but not yet COMMITTED (HA-prod-membership).
+/// The membership analog of [`PendingCommit`]: the run loop parks it keyed by the assigned log index
+/// and resolves the one-shot on the commit-advance (`Committed(index)`) or on a step-down / overwrite
+/// (`NotLeader`), so a membership `Committed` also means COMMITTED on a majority.
+struct PendingMembership {
+    /// The term of the appended entry, to detect a new leader overwriting the index before it commits.
+    term: u64,
+    /// The originating [`NodeHandle::propose_membership`] one-shot.
+    ack: oneshot::Sender<MembershipOutcome>,
 }
 
 impl<R, S, M> RaftClusterBusNode<R, S, M>
@@ -427,6 +575,15 @@ where
         };
         let (status_tx, status_rx) = watch::channel(initial);
 
+        // The initial cluster configuration (HA-prod-membership): the engine's boot voter / learner
+        // sets. Published on its own watch channel so readers observe membership without racing the
+        // run loop and without bloating the `Copy` Status.
+        let initial_config = ClusterConfig {
+            voters: raft.voters().clone(),
+            learners: raft.learners().clone(),
+        };
+        let (config_tx, config_rx) = watch::channel(initial_config);
+
         // The peer-address map for leader_hint resolution (HA-9): the OTHER voters' bus endpoints.
         // SELF is deliberately absent (its bus address is not in `peers`): the serve path only
         // calls leader_hint on a NON-leader redirect, so the resolved leader is always a PEER; a
@@ -437,6 +594,7 @@ where
             id,
             inbox: inbox_tx.clone(),
             status: status_rx,
+            config: config_rx,
             addrs,
         };
         let node = RaftClusterBusNode {
@@ -453,6 +611,8 @@ where
             inbox_tx,
             inbox_rx: Some(inbox_rx),
             status_tx,
+            config_tx,
+            pending_membership: BTreeMap::new(),
         };
         (node, handle)
     }
@@ -489,6 +649,24 @@ where
         self.drain_effects(effects).await;
         self.resolve_pending_commits(committed_through).await;
         self.publish_status();
+        self.publish_config();
+
+        // Arm the auto-promote driver (HA-prod-membership): a self-rearming background task posts an
+        // Event::MembershipTick every MEMBERSHIP_TICK_INTERVAL. It runs for the node's lifetime; a
+        // closed inbox (the node going away) ends it via the send error. A follower's tick is a
+        // cheap no-op, so this costs almost nothing until a learner exists to promote.
+        {
+            let tx = self.inbox_tx.clone();
+            let rt = self.rt.clone();
+            self.rt.spawn_on_shard(async move {
+                loop {
+                    rt.timer(MEMBERSHIP_TICK_INTERVAL).await;
+                    if tx.send(Event::MembershipTick).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
 
         while let Some(event) = inbox.recv().await {
             let mut effects = Effects::new();
@@ -539,6 +717,18 @@ where
                     // under the same term. No engine step, so no effects.
                     self.on_propose_commit_timeout(index, term).await;
                 }
+                Event::Membership { change, addr, ack } => {
+                    // HA-prod-membership: an operator-driven grow / shrink of the voter / learner
+                    // set. Registers a runtime peer's bus addr (for an add), applies the
+                    // quorum-safety guard (for a removal), then proposes via the engine (one change
+                    // in flight). The engine step's replication effects are drained below.
+                    self.on_membership(change, addr, ack, &mut effects);
+                }
+                Event::MembershipTick => {
+                    // HA-prod-membership: the auto-promote driver. On a leader with no change in
+                    // flight, promote the first caught-up learner. Its propose effects drain below.
+                    self.on_membership_tick(&mut effects);
+                }
             }
             // HA-prod-commit-ack: capture the commit high-water this step reached BEFORE
             // the effects are drained (drain consumes them by value), then resolve any
@@ -547,6 +737,7 @@ where
             self.drain_effects(effects).await;
             self.resolve_pending_commits(committed_through).await;
             self.publish_status();
+            self.publish_config();
         }
 
         // The inbox closed (every NodeHandle dropped): the node is going away. Drop every
@@ -556,6 +747,9 @@ where
         // retry). No leak: both maps are emptied as `self` is dropped.
         self.pending_commits.clear();
         self.pending_forward_results.clear();
+        // HA-prod-membership: drop every still-parked membership ack so its caller does not hang;
+        // the dropped one-shot resolves NodeHandle::propose_membership to NotLeader (retryable).
+        self.pending_membership.clear();
     }
 
     /// Handle a LOCAL [`Event::Propose`] (HA-9 leader-forwarding). Three cases:
@@ -633,6 +827,166 @@ where
                 }
             }
         }
+    }
+
+    /// Handle an OPERATOR membership change (HA-prod-membership): grow / shrink the Raft voter or
+    /// learner set at runtime. SAFETY is paramount here (this is quorum-affecting), so the order is
+    /// deliberate:
+    ///
+    /// 1. NOT the leader -> answer [`MembershipOutcome::NotLeader`] at once. A membership change is
+    ///    NEVER forwarded (UNLIKE a `ConfigCmd`): the quorum-affecting decision stays on the one node
+    ///    that owns the configuration, and the operator path retries against the leader. This also
+    ///    means the engine's append-time adoption only ever happens on the proposing leader.
+    /// 2. A node being ADDED carries its cluster-bus `addr`: REGISTER it in `peers` FIRST so the very
+    ///    next replication broadcast (the propose below) can actually reach a runtime-joined node
+    ///    that is not in the static topology peer map. Registering an address is harmless on its own
+    ///    (it does not change consensus); it only enables replication.
+    /// 3. A `RemoveVoter` is gated by [`would_break_quorum`](Self::would_break_quorum): a removal
+    ///    that would leave the voter set unable to form a majority is REFUSED
+    ///    ([`MembershipOutcome::Refused`]) WITHOUT proposing -- the engine would technically accept
+    ///    it (a removal is a valid single-server change), but losing quorum would wedge the cluster,
+    ///    so the adapter refuses it as an operator-safety guard.
+    /// 4. Propose via [`RaftNode::propose_membership_change`], which enforces the section-6
+    ///    one-change-in-flight rule. `Some(index)` -> park the ack for TRUE COMMIT resolution (like
+    ///    every proposal). `None` while leader -> a change is already in flight -> answer
+    ///    [`MembershipOutcome::InFlight`] (retryable). The engine is the authority on the in-flight
+    ///    rule; the pre-check below only classifies the refusal for the caller.
+    fn on_membership(
+        &mut self,
+        change: MembershipChange,
+        addr: Option<SocketAddr>,
+        ack: oneshot::Sender<MembershipOutcome>,
+        effects: &mut Effects,
+    ) {
+        if !self.raft.is_leader() {
+            let _ = ack.send(MembershipOutcome::NotLeader);
+            return;
+        }
+
+        // (1b) DEMOTION GUARD (engine-authoritative). `AddLearner` of a node that is ALREADY a voter
+        // would move it voters -> learners (apply_membership_delta), SHRINKING quorum -- a serious
+        // safety bug if a MEET names an existing voter (the boot voters MEET each other during
+        // formation). Reading the engine's LIVE config here (not a possibly-stale watch) is the
+        // authoritative check: an AddLearner naming a current voter, or a node already a learner, is
+        // a NO-OP success (the node table MEET still stands; the raft config is left correct). An
+        // AddVoter of an existing voter is idempotent in the engine, so it is left to proceed.
+        if let MembershipChange::AddLearner(node) = change {
+            if self.raft.voters().contains(&node) || self.raft.learners().contains(&node) {
+                // Still register the address (harmless) so the leader can reach it if needed.
+                if let Some(addr) = addr {
+                    if node != self.raft.id() {
+                        self.peers.entry(node).or_insert(addr);
+                    }
+                }
+                let _ = ack.send(MembershipOutcome::Committed(self.raft.commit_index()));
+                return;
+            }
+        }
+
+        // (2) Register a runtime-joined node's bus address so the leader can replicate to it. Only
+        // for an ADD that names a node not already a configured peer; a removal / known peer is a
+        // no-op. SELF is never registered (a leader does not dial itself).
+        if let (Some(addr), Some(node)) = (addr, added_node(&change)) {
+            if node != self.raft.id() {
+                self.peers.entry(node).or_insert(addr);
+            }
+        }
+
+        // (3) QUORUM-SAFETY GUARD: refuse a RemoveVoter that would break majority.
+        if let MembershipChange::RemoveVoter(node) = change {
+            if self.would_break_quorum(node) {
+                let _ = ack.send(MembershipOutcome::Refused(format!(
+                    "removing voter {} would leave the cluster without a viable quorum; refusing",
+                    node.0
+                )));
+                return;
+            }
+        }
+
+        // (4) Propose (the engine enforces one-change-in-flight). On a leader, a None return means a
+        // change is already in flight; classify it as InFlight (retryable), NOT NotLeader.
+        let now = self.env.now();
+        let rng: &mut dyn RaftRng = self.env.rng();
+        match self
+            .raft
+            .propose_membership_change(change, now, rng, effects)
+        {
+            Some(index) => {
+                let term = self.raft.current_term();
+                self.pending_membership
+                    .insert(index, PendingMembership { term, ack });
+                // Bound the wait: a membership entry an isolated minority leader can never commit
+                // would otherwise leave the ack parked for the whole partition.
+                self.arm_propose_commit_timeout(index, term);
+            }
+            None => {
+                let _ = ack.send(MembershipOutcome::InFlight);
+            }
+        }
+    }
+
+    /// The AUTO-PROMOTE driver tick (HA-prod-membership). On the LEADER, with NO membership change in
+    /// flight, find the FIRST learner that has caught up ([`RaftNode::learner_caught_up`]: its tracked
+    /// `match_index` is within [`LEARNER_CATCHUP_LAG`](ironcache_raft::LEARNER_CATCHUP_LAG) of the
+    /// log) and propose [`MembershipChange::PromoteLearner`] for it. ONE at a time: the in-flight
+    /// pre-check plus the engine's own one-change-in-flight rule guarantee at most one reconfiguration
+    /// is outstanding, so a tick never proposes a second promotion while one is pending. Pure liveness
+    /// -- a follower tick, a no-caught-up-learner tick, or an in-flight tick all do nothing.
+    ///
+    /// A promoted learner is NOT parked for an ack (no operator is awaiting it); the promotion's
+    /// commit is observed through the published [`ClusterConfig`]. The propose's replication effects
+    /// are drained by the run loop.
+    fn on_membership_tick(&mut self, effects: &mut Effects) {
+        if !self.raft.is_leader() || self.raft.has_membership_change_in_flight() {
+            return;
+        }
+        // The learner set is small; the first caught-up one is promoted this tick, the next on a
+        // later tick (one change in flight). Deterministic order (BTreeSet) so the choice is stable.
+        let Some(&learner) = self
+            .raft
+            .learners()
+            .iter()
+            .find(|&&l| self.raft.learner_caught_up(l))
+        else {
+            return;
+        };
+        let now = self.env.now();
+        let rng: &mut dyn RaftRng = self.env.rng();
+        // propose_membership_change re-checks one-change-in-flight + leader; a None here (a race) is
+        // simply skipped and retried on the next tick. No ack to resolve (auto-driven).
+        let _ = self.raft.propose_membership_change(
+            MembershipChange::PromoteLearner(learner),
+            now,
+            rng,
+            effects,
+        );
+    }
+
+    /// Would removing voter `node` leave the cluster unable to form a majority (HA-prod-membership
+    /// quorum-safety guard)? The post-removal voter set is the current voters minus `node`; a Raft
+    /// cluster needs a strict majority `floor(n/2)+1` of its voters to elect / commit, and with the
+    /// leader (which proposes the removal) stepping out of the set, the SURVIVORS must still be able
+    /// to form that majority among themselves. We refuse if the post-removal set is EMPTY (removing
+    /// the last voter wedges the cluster forever -- no node could ever be elected to re-add one) or
+    /// has just ONE voter when the removed node was needed for the current quorum, i.e. we refuse any
+    /// removal that drops the voter count below 1. Concretely: a removal is allowed only if at least
+    /// one voter remains AFTER it. Removing `node` when it is not even a voter is a harmless no-op
+    /// (the engine ignores it), so it is not refused.
+    ///
+    /// This is intentionally CONSERVATIVE and SAFE: it never refuses a removal that keeps a viable
+    /// (non-empty) voter set, and it always refuses removing the final voter. It does NOT try to
+    /// reason about transient unreachability (that is Raft's liveness concern, not a config-safety
+    /// one); it guards only the STRUCTURAL invariant that a configuration must retain at least one
+    /// voter to remain operable.
+    fn would_break_quorum(&self, node: NodeId) -> bool {
+        let voters = self.raft.voters();
+        // Removing a non-voter (e.g. a learner, or an unknown id) does not shrink the voter set.
+        if !voters.contains(&node) {
+            return false;
+        }
+        // After removing `node`, how many voters remain? Refuse if NONE would remain (the last
+        // voter): an empty voter set can never elect a leader, so the cluster could never recover.
+        voters.len().saturating_sub(1) == 0
     }
 
     /// Handle an inbound [`RaftMsg::ForwardPropose`] (HA-9): a peer `from` asked us to propose
@@ -755,6 +1109,20 @@ where
                 };
                 self.send_to_peer(pending.origin, &msg).await;
             }
+            // OPERATOR membership changes (HA-prod-membership): same term-gated settlement, resolved
+            // to a MembershipOutcome. A genuinely-still-ours committed entry -> Committed(index); an
+            // overwritten index -> NotLeader (our change lost the index; the idempotent operator
+            // retries).
+            let mut committed_member = self.pending_membership.split_off(&(hi + 1));
+            core::mem::swap(&mut committed_member, &mut self.pending_membership);
+            for (index, pending) in committed_member {
+                let outcome = if self.entry_overwritten(index, pending.term) {
+                    MembershipOutcome::NotLeader
+                } else {
+                    MembershipOutcome::Committed(index)
+                };
+                let _ = pending.ack.send(outcome);
+            }
         }
 
         // Pass 2: FAIL anything that can no longer commit here (step-down or overwrite).
@@ -785,6 +1153,19 @@ where
                     outcome: None,
                 };
                 self.send_to_peer(pending.origin, &msg).await;
+            }
+        }
+        // OPERATOR membership changes: a step-down or an overwrite of the uncommitted entry means it
+        // can no longer commit HERE -> resolve NotLeader (the idempotent operator re-proposes).
+        let fail_member: Vec<u64> = self
+            .pending_membership
+            .iter()
+            .filter(|&(&index, p)| stepped_down || self.entry_overwritten(index, p.term))
+            .map(|(&index, _)| index)
+            .collect();
+        for index in fail_member {
+            if let Some(pending) = self.pending_membership.remove(&index) {
+                let _ = pending.ack.send(MembershipOutcome::NotLeader);
             }
         }
     }
@@ -842,6 +1223,18 @@ where
                     outcome: None,
                 };
                 self.send_to_peer(pending.origin, &msg).await;
+            }
+        }
+        // HA-prod-membership: a parked operator membership change that never committed (an isolated
+        // minority leader) resolves NotLeader on the same bounded timeout, so the operator does not
+        // hang for the whole partition.
+        if self
+            .pending_membership
+            .get(&index)
+            .is_some_and(|p| p.term == term)
+        {
+            if let Some(pending) = self.pending_membership.remove(&index) {
+                let _ = pending.ack.send(MembershipOutcome::NotLeader);
             }
         }
     }
@@ -941,6 +1334,38 @@ where
         };
         // A send error means every reader dropped; the node can still run, so ignore.
         let _ = self.status_tx.send(status);
+    }
+
+    /// Publish a fresh [`ClusterConfig`] (voter + learner sets) to its watch channel
+    /// (HA-prod-membership). Only sends when the config actually CHANGED (the watch's `send_if_modified`
+    /// semantics via an equality check) so a quiet cluster does not churn the channel; the sets are
+    /// small and cloned only on a real change. A send error (all readers dropped) is ignored.
+    fn publish_config(&self) {
+        let voters = self.raft.voters();
+        let learners = self.raft.learners();
+        // Avoid cloning the sets on every step: only publish when they differ from the last value.
+        let changed = {
+            let cur = self.config_tx.borrow();
+            cur.voters != *voters || cur.learners != *learners
+        };
+        if changed {
+            let _ = self.config_tx.send(ClusterConfig {
+                voters: voters.clone(),
+                learners: learners.clone(),
+            });
+        }
+    }
+}
+
+/// The [`NodeId`] a membership change ADDS (an `AddVoter` / `AddLearner`), if any; `None` for a
+/// removal or a promotion (the node is already known). Used by the run loop to register a
+/// runtime-joined node's bus address before replicating to it.
+fn added_node(change: &MembershipChange) -> Option<NodeId> {
+    match *change {
+        MembershipChange::AddVoter(n) | MembershipChange::AddLearner(n) => Some(n),
+        MembershipChange::RemoveVoter(_)
+        | MembershipChange::PromoteLearner(_)
+        | MembershipChange::RemoveLearner(_) => None,
     }
 }
 
@@ -1542,6 +1967,11 @@ mod tests {
                 index: 25,
                 payload: EntryPayload::ConfigChange(MembershipChange::PromoteLearner(NodeId(8))),
             },
+            LogEntry {
+                term: 12,
+                index: 26,
+                payload: EntryPayload::ConfigChange(MembershipChange::RemoveLearner(NodeId(8))),
+            },
         ]
     }
 
@@ -1875,5 +2305,220 @@ mod tests {
                 "every pending ack is failed on step-down (no leak)"
             );
         });
+    }
+
+    // -- HA-prod-membership: the operator membership path ----------------------------------------
+
+    /// `on_membership(AddLearner)` on a leader parks the ack and resolves `Committed` on the
+    /// commit-advance (a 1-voter leader commits the learner-add at once, since a learner never gates
+    /// commit), and the learner enters the engine's learner set + the published config.
+    #[test]
+    fn membership_add_learner_commits_and_appears_in_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut node, _handle) = lone_voter_node();
+            drive_to_leader(&mut node);
+
+            let (tx, rx) = oneshot::channel();
+            let mut effects = Effects::new();
+            node.on_membership(
+                MembershipChange::AddLearner(NodeId(2)),
+                None,
+                tx,
+                &mut effects,
+            );
+            assert!(
+                node.pending_membership
+                    .contains_key(&node.raft.storage().last_log_index()),
+                "the membership ack is parked awaiting commit"
+            );
+            node.resolve_pending_commits(effects.committed_through)
+                .await;
+            assert_eq!(
+                rx.await.expect("the membership ack resolves"),
+                MembershipOutcome::Committed(node.raft.commit_index()),
+                "AddLearner commits on a 1-voter leader (a learner never gates commit)"
+            );
+            assert!(
+                node.raft.learners().contains(&NodeId(2)),
+                "the node is now a learner in the engine config"
+            );
+            node.publish_config();
+            assert!(
+                node.config_tx.borrow().learners.contains(&NodeId(2)),
+                "the learner is visible in the published ClusterConfig"
+            );
+            assert!(
+                !node.raft.voters().contains(&NodeId(2)),
+                "a learner is NOT a voter"
+            );
+        });
+    }
+
+    /// `on_membership` on a NON-leader resolves `NotLeader` at once WITHOUT proposing (a membership
+    /// change is never forwarded).
+    #[test]
+    fn membership_on_follower_resolves_not_leader() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            // A fresh node has not elected itself (no timer fired): it is a Follower.
+            let (mut node, _handle) = lone_voter_node();
+            assert!(!node.raft.is_leader());
+            let (tx, rx) = oneshot::channel();
+            let mut effects = Effects::new();
+            node.on_membership(
+                MembershipChange::AddLearner(NodeId(2)),
+                None,
+                tx,
+                &mut effects,
+            );
+            assert_eq!(
+                rx.await.expect("resolves immediately"),
+                MembershipOutcome::NotLeader,
+                "a non-leader refuses a membership change without proposing"
+            );
+        });
+    }
+
+    /// A SECOND membership change while one is uncommitted resolves `InFlight` (the section-6
+    /// one-change-in-flight rule), NOT `NotLeader`. We grow the cluster to 2 voters so the first
+    /// change (AddVoter of an unreachable peer) cannot commit and stays in flight.
+    #[test]
+    fn second_membership_change_in_flight_resolves_inflight() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            // A lone-voter leader proposes AddVoter(2): the new 2-voter majority cannot form (peer 2
+            // is unreachable), so the change stays IN FLIGHT, and a second change is refused InFlight.
+            let (mut node, _h) = lone_voter_node();
+            drive_to_leader(&mut node);
+            let (tx1, _rx1) = oneshot::channel();
+            let mut effects = Effects::new();
+            node.on_membership(MembershipChange::AddVoter(NodeId(2)), None, tx1, &mut effects);
+            assert!(
+                node.raft.has_membership_change_in_flight(),
+                "AddVoter(2) needs the new 2-voter majority (peer 2 unreachable), so it stays in flight"
+            );
+            let (tx2, rx2) = oneshot::channel();
+            let mut effects2 = Effects::new();
+            node.on_membership(MembershipChange::AddLearner(NodeId(3)), None, tx2, &mut effects2);
+            assert_eq!(
+                rx2.await.expect("resolves immediately"),
+                MembershipOutcome::InFlight,
+                "a second membership change while one is in flight resolves InFlight (retryable)"
+            );
+        });
+    }
+
+    /// The quorum-safety guard: removing the LAST voter is refused (`Refused`) WITHOUT proposing; a
+    /// removal that leaves at least one voter is allowed; removing a non-voter is a no-op success.
+    #[test]
+    fn membership_remove_last_voter_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut node, _handle) = lone_voter_node();
+            drive_to_leader(&mut node);
+            // The lone voter is the LAST voter: removing it would empty the voter set -> refuse.
+            assert!(
+                node.would_break_quorum(NodeId(1)),
+                "removing the last voter breaks quorum"
+            );
+            let (tx, rx) = oneshot::channel();
+            let mut effects = Effects::new();
+            node.on_membership(
+                MembershipChange::RemoveVoter(NodeId(1)),
+                None,
+                tx,
+                &mut effects,
+            );
+            match rx.await.expect("resolves immediately") {
+                MembershipOutcome::Refused(_) => {}
+                other => panic!("expected Refused, got {other:?}"),
+            }
+            // The voter set is UNCHANGED (nothing was proposed).
+            assert!(
+                node.raft.voters().contains(&NodeId(1)),
+                "the refused removal did not apply"
+            );
+            // Removing a NON-voter does not break quorum (a no-op).
+            assert!(
+                !node.would_break_quorum(NodeId(2)),
+                "removing a non-voter does not break quorum"
+            );
+        });
+    }
+
+    /// The auto-promote tick promotes a CAUGHT-UP learner to a voter, one at a time. We add a
+    /// learner, mark it caught up (set its match_index), tick, and assert it is promoted; a second
+    /// tick with a change in flight does nothing.
+    #[test]
+    fn membership_tick_promotes_a_caught_up_learner() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut node, _handle) = lone_voter_node();
+            drive_to_leader(&mut node);
+            // Add a learner (commits at once on a 1-voter leader).
+            let (tx, rx) = oneshot::channel();
+            let mut effects = Effects::new();
+            node.on_membership(
+                MembershipChange::AddLearner(NodeId(2)),
+                None,
+                tx,
+                &mut effects,
+            );
+            node.resolve_pending_commits(effects.committed_through)
+                .await;
+            assert_committed(&rx.await.expect("ack"));
+            assert!(node.raft.learners().contains(&NodeId(2)));
+            // On a quiet 1-voter leader the log is short and the freshly-seeded learner's
+            // match_index (0) is within LEARNER_CATCHUP_LAG of the last index, so it is already
+            // "caught up" by the engine's advisory gate -- which is exactly the signal the
+            // auto-promote driver consults. (The DST gates exercise the lagging case under
+            // replication; here we exercise the driver's promote action.)
+            assert!(
+                node.raft.learner_caught_up(NodeId(2)),
+                "a fresh learner on a short-log leader is within the catch-up lag gate"
+            );
+            // Tick: the caught-up learner is promoted (PromoteLearner proposed + committed at once).
+            let mut tick_effects = Effects::new();
+            node.on_membership_tick(&mut tick_effects);
+            node.resolve_pending_commits(tick_effects.committed_through)
+                .await;
+            assert!(
+                node.raft.voters().contains(&NodeId(2)),
+                "the caught-up learner is auto-promoted to a voter"
+            );
+            assert!(
+                !node.raft.learners().contains(&NodeId(2)),
+                "the promoted learner left the learner set"
+            );
+        });
+    }
+
+    /// Test helper: assert a [`MembershipOutcome`] is `Committed`, panicking otherwise.
+    fn assert_committed(outcome: &MembershipOutcome) {
+        assert!(
+            matches!(outcome, MembershipOutcome::Committed(_)),
+            "expected Committed, got {outcome:?}"
+        );
     }
 }

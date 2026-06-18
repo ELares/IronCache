@@ -88,16 +88,50 @@ pub struct RaftBoot {
     pub raft: RaftHandle,
 }
 
-/// Map the topology's string ids to stable `NodeId(u64)`s by their position in the id-SORTED
-/// topology. Sorting makes the mapping AGREE on every node regardless of declaration order, so
-/// every node names every voter by the same `NodeId` (the property the peer-address map and the
-/// `RAFTMSG` `from`-id depend on). Returns the `(id -> NodeId)` map.
+/// Derive a stable `NodeId(u64)` DETERMINISTICALLY from a node's 40-hex announce id
+/// (HA-prod-membership). The engine's `NodeId` is a `u64`; the cluster's node identity is the
+/// 40-hex string. This maps the latter to the former by parsing the FIRST 16 hex digits (the high
+/// 64 bits) of the id as a `u64`. Announce ids are 160 bits of entropy, so the top 64 bits collide
+/// with negligible probability for any real cluster; the mapping is a PURE function of the id
+/// alone, so EVERY node computes the SAME `NodeId` for a given announce id WITHOUT needing the full
+/// membership list -- which is exactly the property a RUNTIME join needs (the leader proposing
+/// `AddLearner(id)` and the joining node stamping its own `RAFTMSG` `from`-id must agree on the
+/// `NodeId`, and they do because both derive it from the same announce id). A non-hex / short id
+/// (defensive: `Config::validate` already rejects a malformed announce id) falls back to a length-
+/// salted hash so it is still deterministic and total.
+#[must_use]
+pub fn node_id_from_announce(id: &str) -> NodeId {
+    // The common, validated case: a 40-lowercase-hex id. Use the first 16 hex chars as the high
+    // u64. (Using a stable PREFIX rather than a hash keeps the mapping trivially reproducible and,
+    // for the deterministic test ids "0000.."/"1111.."/.., yields the obvious 0x0000.. / 0x1111..)
+    if id.len() >= 16 {
+        if let Ok(v) = u64::from_str_radix(&id[..16], 16) {
+            return NodeId(v);
+        }
+    }
+    // Defensive fallback for a non-hex id: a simple deterministic FNV-1a over the bytes (no time /
+    // entropy, so determinism is preserved). Unreachable for a validated announce id.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    NodeId(h)
+}
+
+/// Map the topology's string ids to stable `NodeId(u64)`s via [`node_id_from_announce`] (HA-4c +
+/// HA-prod-membership). DERIVING each `NodeId` from the announce id ALONE (not from the node's
+/// position in the topology) is what makes a RUNTIME join consistent: a node added later via
+/// `CLUSTER MEET` -- which is NOT in this topology -- still gets the same `NodeId` on every node,
+/// because the leader and the joining node both derive it from the same announce id. The pre-3d
+/// boot is unaffected in BEHAVIOR (every topology node still maps to one stable `NodeId`, the
+/// voter set is still the same SET); only the specific integer changes from a sorted-position
+/// index to an id-derived value, which no consumer depends on (the serve layer + the acceptance
+/// tests address nodes by their 40-hex string id over the wire, never by the raw `NodeId`).
 fn node_id_map(topo: &ironcache_config::ClusterTopology) -> BTreeMap<String, NodeId> {
-    let mut ids: Vec<&str> = topo.nodes.iter().map(|n| n.id.as_str()).collect();
-    ids.sort_unstable();
-    ids.iter()
-        .enumerate()
-        .map(|(i, id)| ((*id).to_owned(), NodeId(i as u64)))
+    topo.nodes
+        .iter()
+        .map(|n| (n.id.clone(), node_id_from_announce(&n.id)))
         .collect()
 }
 
@@ -119,6 +153,40 @@ pub fn spawn_control_plane(
     self_id: &str,
     cluster: Arc<ironcache_cluster::SlotMap>,
 ) -> RaftBoot {
+    // The default boot: every topology node (including self) is an initial VOTER (`joining = false`).
+    spawn_control_plane_inner(config, self_id, cluster, false)
+}
+
+/// Boot the control plane for a node that is JOINING an already-formed cluster at runtime
+/// (HA-prod-membership): self is NOT an initial voter (the engine guards a non-voter from
+/// campaigning, Raft section 6), and EVERY topology node -- including the existing voters -- is a
+/// peer, so the joiner can receive replication and reply. It learns it is a member only when the
+/// leader's committed `AddLearner` (then `PromoteLearner`) entry replicates to it. The topology
+/// here lists all nodes (so the joiner can derive every `NodeId` + bus address); only the initial
+/// voter-set membership of SELF differs from the normal boot.
+///
+/// # Panics
+///
+/// Panics if `self_id` is not in the topology.
+#[must_use]
+pub fn spawn_control_plane_joining(
+    config: &Config,
+    self_id: &str,
+    cluster: Arc<ironcache_cluster::SlotMap>,
+) -> RaftBoot {
+    spawn_control_plane_inner(config, self_id, cluster, true)
+}
+
+/// The shared body of [`spawn_control_plane`] / [`spawn_control_plane_joining`]. When `joining` is
+/// true, SELF is excluded from the initial voter set (a non-voting joiner that adopts its membership
+/// from the replicated log) and is connected to EVERY other node (including all existing voters);
+/// when false, every topology node is an initial voter (the byte-unchanged default boot).
+fn spawn_control_plane_inner(
+    config: &Config,
+    self_id: &str,
+    cluster: Arc<ironcache_cluster::SlotMap>,
+    joining: bool,
+) -> RaftBoot {
     let topo = config
         .cluster_topology
         .as_ref()
@@ -126,12 +194,19 @@ pub fn spawn_control_plane(
 
     // (1) ids -> NodeId, the voter set, and this node's NodeId.
     let id_map = node_id_map(topo);
-    let voters: BTreeSet<NodeId> = id_map.values().copied().collect();
     let self_node_id = *id_map
         .get(self_id)
         .expect("self announce id must be present in the topology (validated at boot)");
+    // The initial VOTER set: every topology node by default; on a JOINING node, every node EXCEPT
+    // self (self joins as a non-voter and learns its membership from the committed log).
+    let voters: BTreeSet<NodeId> = id_map
+        .values()
+        .copied()
+        .filter(|&nid| !joining || nid != self_node_id)
+        .collect();
 
-    // (1b) Peer cluster-bus addresses: every OTHER voter id -> host:(port + BUS_PORT_OFFSET).
+    // (1b) Peer cluster-bus addresses: every OTHER node id -> host:(port + BUS_PORT_OFFSET). (On a
+    // joining node this includes the existing voters, so it can receive/reply replication.)
     let mut peers: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
     let mut self_bus_addr: Option<SocketAddr> = None;
     for n in &topo.nodes {
@@ -351,16 +426,32 @@ mod tests {
         }
     }
 
-    /// The id -> NodeId mapping is by id-SORTED position, so it AGREES regardless of the
-    /// topology's declaration order: the lexicographically smallest id is NodeId(0), etc. This
-    /// is what makes every node name every voter by the same NodeId.
+    /// The id -> NodeId mapping is DERIVED FROM THE ANNOUNCE ID ALONE (the high 64 bits of the
+    /// 40-hex id), so it AGREES regardless of the topology's declaration order AND is the SAME
+    /// value a runtime-joined node (not in this topology) would compute for itself -- the property
+    /// a `CLUSTER MEET` join depends on. For the deterministic test ids it is the obvious prefix.
     #[test]
-    fn node_id_map_is_sorted_and_order_independent() {
+    fn node_id_map_is_announce_id_derived_and_order_independent() {
         let m = node_id_map(&topo());
-        assert_eq!(m["0000000000000000000000000000000000000000"], NodeId(0));
-        assert_eq!(m["1111111111111111111111111111111111111111"], NodeId(1));
-        assert_eq!(m["2222222222222222222222222222222222222222"], NodeId(2));
+        assert_eq!(
+            m["0000000000000000000000000000000000000000"],
+            NodeId(0x0000_0000_0000_0000)
+        );
+        assert_eq!(
+            m["1111111111111111111111111111111111111111"],
+            NodeId(0x1111_1111_1111_1111)
+        );
+        assert_eq!(
+            m["2222222222222222222222222222222222222222"],
+            NodeId(0x2222_2222_2222_2222)
+        );
         assert_eq!(m.len(), 3);
+        // Same as deriving each id directly (the map is just node_id_from_announce per node), so a
+        // runtime-joined node computes its own NodeId identically without the topology.
+        assert_eq!(
+            node_id_from_announce("3333333333333333333333333333333333333333"),
+            NodeId(0x3333_3333_3333_3333)
+        );
     }
 
     /// `raft_log_path` joins a configured `data_dir` (durable), and falls back to the OS temp dir

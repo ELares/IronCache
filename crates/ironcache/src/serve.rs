@@ -95,8 +95,19 @@ pub(crate) struct ShardState {
 /// is a documented step the boot must run in one place; splitting it would scatter the wiring
 /// across helpers that all need the same boot-resolved locals. The same precedent as
 /// `route_and_dispatch` / `serve_connection`.
-#[allow(clippy::too_many_lines)]
 pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
+    run_server_inner(config).map(|(set, _raft)| set)
+}
+
+/// Like [`run_server`] but ALSO returns the raft-mode [`RaftHandle`] (HA-prod-membership), so a
+/// test can directly observe the live Raft CONFIGURATION (voter / learner sets via
+/// `RaftHandle::config`) without a new wire surface. `None` outside raft-governance mode. Boots
+/// exactly as `run_server` (which is `run_server_inner` discarding the handle); production never
+/// needs the handle out here (it lives in `ServerContext`).
+#[allow(clippy::too_many_lines)]
+pub fn run_server_inner(
+    config: &Config,
+) -> anyhow::Result<(ShardSet, Option<ironcache_server::RaftHandle>)> {
     let bind: SocketAddr = SocketAddr::new(config.bind, config.port);
     let shard_cfg = ShardConfig {
         shards: config.shards,
@@ -215,7 +226,14 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
             &config.bind.to_string(),
             config.port,
         ));
-        let boot = crate::raft_boot::spawn_control_plane(config, cluster_node_id, shared);
+        // A JOINING node (HA-prod-membership) boots as a non-voter that learns its membership from
+        // the replicated log (after an operator CLUSTER MEET); the default boot makes every topology
+        // node an initial voter (byte-unchanged).
+        let boot = if config.cluster_raft_joining {
+            crate::raft_boot::spawn_control_plane_joining(config, cluster_node_id, shared)
+        } else {
+            crate::raft_boot::spawn_control_plane(config, cluster_node_id, shared)
+        };
         // Install the SHARED map as ctx.cluster (replacing the static/empty map built above) so
         // every shard's routing + projection reads the SAME map the ConfigSm converges.
         cluster = Some(boot.cluster);
@@ -402,7 +420,7 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     };
 
     let set = ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?;
-    Ok(set)
+    Ok((set, raft))
 }
 
 thread_local! {
@@ -2550,6 +2568,31 @@ async fn try_raft_cluster_mutator(
         }
     };
 
+    // HA-prod-membership: a raft-mode MEET / FORGET ALSO drives the Raft VOTER / LEARNER set, not
+    // just the node TABLE. Capture the membership intent from the built ConfigCmd batch BEFORE it is
+    // consumed by the propose loop: MEET's `AddNode { id, host, port }` -> stage the node in as a
+    // non-voting LEARNER (it catches up, then the leader's auto-promote driver promotes it to a
+    // voter); FORGET's `RemoveNode { id }` -> drop it from the voter / learner set. The node-table
+    // change and the membership change are SEPARATE committed entries (the table commits first
+    // below; the membership change is proposed after), each correct on its own.
+    let membership_intent = match sub.as_slice() {
+        b"MEET" => cmds.iter().find_map(|c| match c {
+            ironcache_raft::ConfigCmd::AddNode { id, host, port } => Some(MembershipIntent::Add {
+                id: id.clone(),
+                host: host.clone(),
+                client_port: *port,
+            }),
+            _ => None,
+        }),
+        b"FORGET" => cmds.iter().find_map(|c| match c {
+            ironcache_raft::ConfigCmd::RemoveNode { id } => {
+                Some(MembershipIntent::Remove { id: id.clone() })
+            }
+            _ => None,
+        }),
+        _ => None,
+    };
+
     // Count the command once (matching the home / remote / fan-out paths), then propose each
     // ConfigCmd in order and await its commit. The whole mutator replies `+OK` only if EVERY
     // entry commits; the FIRST NotLeader short-circuits to the `-CLUSTERDOWN` redirect (a
@@ -2585,9 +2628,131 @@ async fn try_raft_cluster_mutator(
             return Some(false);
         }
     }
+
+    // HA-prod-membership: the node-table change committed; now drive the Raft config. A failure here
+    // (not leader, in flight, refused) does NOT fail the whole CLUSTER command -- the table change is
+    // already committed and the membership change is idempotent / retryable -- so it is surfaced as a
+    // NOTE appended to the reply rather than a hard error, keeping the byte-compatible `+OK` for the
+    // success path while telling the operator when the membership step needs a retry.
+    if let Some(intent) = membership_intent {
+        if let Some(note) = apply_membership_intent(handle, intent).await {
+            // A non-empty note means the membership step did not (yet) take effect; reply with a
+            // -CLUSTERDOWN-style error carrying the reason so the operator retries the membership.
+            encode_into(
+                out,
+                &Value::error(ErrorReply::clusterdown(note)),
+                conn.proto,
+            );
+            return Some(false);
+        }
+    }
+
     encode_into(out, &Value::ok(), conn.proto);
     // The connection stays open in every case (mirrors the static CLUSTER path).
     Some(false)
+}
+
+/// The Raft-membership side of a raft-mode `CLUSTER MEET` / `FORGET` (HA-prod-membership), captured
+/// from the built [`ConfigCmd`](ironcache_raft::ConfigCmd) batch so the voter / learner set is
+/// driven ALONGSIDE the node table.
+enum MembershipIntent {
+    /// MEET: stage the node in as a non-voting LEARNER (it catches up, then auto-promotes to voter).
+    /// Carries the 40-hex id (to derive the `NodeId`) plus the advertised host + client port (to
+    /// derive the cluster-bus `SocketAddr` the leader replicates to).
+    Add {
+        id: String,
+        host: String,
+        client_port: u16,
+    },
+    /// FORGET: drop the node from the voter / learner set.
+    Remove { id: String },
+}
+
+/// Apply the [`MembershipIntent`] of a committed raft-mode MEET / FORGET to the Raft config
+/// (HA-prod-membership). Returns `None` on success (the membership change committed, or the FORGET
+/// found nothing to remove), or `Some(note)` with an operator-facing reason when the membership step
+/// did not take effect (not leader, a change already in flight, or a quorum-safety refusal) so the
+/// operator can retry. The node-table commit has already happened; this only governs consensus
+/// membership, which is idempotent and safely retryable.
+///
+/// MEET stages the node as a LEARNER ([`MembershipChange::AddLearner`]): a non-voting member that
+/// receives the log and catches up but is counted in NO quorum, so adding it can never stall
+/// consensus. The leader's auto-promote driver later promotes it to a voter once it has caught up.
+/// The new node's cluster-bus address (`host:bus_port(client_port)`, reconstructed from the MEET
+/// args) is passed so the leader can replicate to a runtime-joined node that is NOT in the static
+/// topology peer map; a host that does not parse to a `SocketAddr` (e.g. a DNS name) passes `None`,
+/// so the learner is still added but the leader can only reach it once the address is otherwise
+/// known (the same best-effort posture the boot peer map uses for a non-parsing host).
+async fn apply_membership_intent(
+    handle: &ironcache_server::RaftHandle,
+    intent: MembershipIntent,
+) -> Option<String> {
+    use ironcache_raft::MembershipChange;
+    match intent {
+        MembershipIntent::Add {
+            id,
+            host,
+            client_port,
+        } => {
+            let node = crate::raft_boot::node_id_from_announce(&id);
+            // CRITICAL SAFETY: do NOT AddLearner a node that is ALREADY a voter (or this node
+            // itself). The boot topology's voters MEET each other during formation, and a MEET is
+            // idempotent on the node table; but `AddLearner` of an existing voter would DEMOTE it
+            // out of the voter set (apply_membership_delta moves it voters -> learners), shrinking
+            // quorum. So skip the learner-add when the named node is already a voter or is self --
+            // the node table still records the MEET, the raft config is left correct. A node already
+            // a LEARNER is also skipped (idempotent; it is already staged and catching up).
+            let cfg = handle.config();
+            if node == handle.node_id()
+                || cfg.voters.contains(&node)
+                || cfg.learners.contains(&node)
+            {
+                return None;
+            }
+            // The new node's cluster-bus endpoint: host:(client_port + BUS_PORT_OFFSET). Parse it so
+            // the leader can dial + replicate to this runtime-joined node; a non-parsing host yields
+            // None (the learner is still added, the address is just not pre-registered).
+            let bus = crate::raft_boot::bus_port(client_port);
+            let addr = format!("{host}:{bus}").parse::<std::net::SocketAddr>().ok();
+            match handle
+                .propose_membership(MembershipChange::AddLearner(node), addr)
+                .await
+            {
+                ironcache_server::MembershipOutcome::Committed(_) => None,
+                ironcache_server::MembershipOutcome::NotLeader => {
+                    Some("MEET committed the node table but this node is not the raft leader; retry to add it to the raft config".to_owned())
+                }
+                ironcache_server::MembershipOutcome::InFlight => {
+                    Some("MEET committed the node table but a raft membership change is in flight; retry to add it to the raft config".to_owned())
+                }
+                ironcache_server::MembershipOutcome::Refused(why) => Some(why),
+            }
+        }
+        MembershipIntent::Remove { id } => {
+            let node = crate::raft_boot::node_id_from_announce(&id);
+            let cfg = handle.config();
+            // Nothing to do if the node is neither a voter nor a learner (a FORGET of an unknown id,
+            // or one only ever in the table): the table removal already handled it.
+            if !cfg.voters.contains(&node) && !cfg.learners.contains(&node) {
+                return None;
+            }
+            let change = if cfg.voters.contains(&node) {
+                MembershipChange::RemoveVoter(node)
+            } else {
+                MembershipChange::RemoveLearner(node)
+            };
+            match handle.propose_membership(change, None).await {
+                ironcache_server::MembershipOutcome::Committed(_) => None,
+                ironcache_server::MembershipOutcome::NotLeader => {
+                    Some("FORGET committed the node table but this node is not the raft leader; retry to remove it from the raft config".to_owned())
+                }
+                ironcache_server::MembershipOutcome::InFlight => {
+                    Some("FORGET committed the node table but a raft membership change is in flight; retry to remove it from the raft config".to_owned())
+                }
+                ironcache_server::MembershipOutcome::Refused(why) => Some(why),
+            }
+        }
+    }
 }
 
 /// Build the `AssignSlots { node: self, slots }` ConfigCmd for raft-mode `CLUSTER ADDSLOTS`

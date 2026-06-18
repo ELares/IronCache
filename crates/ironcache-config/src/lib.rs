@@ -303,6 +303,13 @@ pub struct Config {
     /// [`ClusterMode::Raft`] opts the node into the Raft-governed control plane. TOML
     /// (`cluster_mode = "raft"`) + the `IRONCACHE_CLUSTER_MODE` env var.
     pub cluster_mode: ClusterMode,
+    /// Whether this node is JOINING an already-formed Raft cluster at runtime (HA-prod-membership),
+    /// rather than being one of the cluster's initial (boot-time) voters. When `true` (and
+    /// `cluster_mode = raft`), the node boots as a NON-VOTER: it does not campaign and is not in the
+    /// initial voter set; it learns it is a member only when the leader's committed `AddLearner`
+    /// (then auto-promote `PromoteLearner`) entry replicates to it after an operator `CLUSTER MEET`.
+    /// Defaults to `false` (a normal boot voter), so the established boot path is byte-unchanged.
+    pub cluster_raft_joining: bool,
     /// The replication-lag bound, in LOGICAL WRITES, that gates BOTH (a) HA-8 promotion
     /// eligibility (a replica is promotable only when its link is up AND its lag is
     /// `<= replica_max_lag`, ADR-0026, so a stale replica is never promoted -> no data
@@ -423,6 +430,7 @@ impl Default for Config {
             // is opt-in (CLUSTER_CONTRACT.md #70, slice 2).
             cluster_topology: None,
             cluster_announce_id: None,
+            cluster_raft_joining: false,
             // The slot map is STATICALLY governed by default (HA-4c): the pre-HA-4c
             // behavior, byte-unchanged. Raft governance is strictly opt-in.
             cluster_mode: ClusterMode::Static,

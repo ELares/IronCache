@@ -1800,3 +1800,321 @@ fn synth_meet_node_id(host: &str, port: u16) -> String {
     id.truncate(40);
     id
 }
+
+// ============================================================================================
+// HA-prod-membership: operator-driven dynamic Raft membership over the live serve path.
+//
+// Form a 3-VOTER raft cluster; bring up a 4th node as a JOINER (a non-voter); MEET the 4th from
+// the cluster (CLUSTER MEET -> committed node-table AddNode + a proposed AddLearner). Assert the
+// 4th joins as a non-voting LEARNER (the election/commit quorum is UNCHANGED, still 3 voters),
+// then CATCHES UP and is AUTO-PROMOTED to a VOTER (the committed voter set becomes 4, observed via
+// the leader's RaftHandle::config). Then CLUSTER FORGET the 4th and assert it leaves the voter set
+// (RemoveVoter, quorum-guarded). Committed CLUSTER writes are driven throughout so quorum is proven
+// correct at each step.
+// ============================================================================================
+
+/// The 4th node's id (the runtime joiner). Sorts after ID0/ID1/ID2; its NodeId is derived from the
+/// announce id alone (the high 64 bits), so every node agrees on it without coordination.
+const ID3: &str = "3333333333333333333333333333333333333333";
+
+/// A 4-node topology (the 3 voters + the joiner), used to boot the JOINER so it knows every node's
+/// bus address + can derive every NodeId. The 3 voters boot with the 3-node topology (so they are
+/// the initial voter set); the joiner boots `cluster_raft_joining` so it is NOT an initial voter.
+fn four_node_topology(ports: [u16; 4]) -> ClusterTopology {
+    ClusterTopology {
+        nodes: vec![
+            ClusterNode {
+                id: ID0.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: ports[0],
+                slots: vec![],
+            },
+            ClusterNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: ports[1],
+                slots: vec![],
+            },
+            ClusterNode {
+                id: ID2.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: ports[2],
+                slots: vec![],
+            },
+            ClusterNode {
+                id: ID3.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: ports[3],
+                slots: vec![],
+            },
+        ],
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines, clippy::needless_range_loop)]
+fn raft_mode_meet_stages_a_learner_auto_promotes_then_forget_removes_it() {
+    use ironcache::raft_boot::node_id_from_announce;
+    use ironcache::test_support::{run_raft_joining_node_with_handle, run_raft_node_with_handle};
+
+    let timeout = Duration::from_secs(30);
+
+    let ports4 = [free_port(), free_port(), free_port(), free_port()];
+    let voter_ports = [ports4[0], ports4[1], ports4[2]];
+    clean_raft_logs(voter_ports);
+    clean_raft_logs([ports4[3], ports4[3], ports4[3]]);
+
+    let voter_topo = three_node_topology(voter_ports);
+    let joiner_topo = four_node_topology(ports4);
+
+    // The 3 VOTERS boot with the 3-node topology (their initial voter set is {0,1,2}); we keep each
+    // node's RaftHandle so the test can read the live Raft config (voter / learner sets).
+    let voter_ids = [ID0, ID1, ID2];
+    let mut voter_nodes: Vec<ShardSet> = Vec::new();
+    let mut voter_handles = Vec::new();
+    for i in 0..3 {
+        let (set, raft) =
+            run_raft_node_with_handle(voter_ports[i], voter_topo.clone(), voter_ids[i]);
+        voter_nodes.push(set);
+        voter_handles.push(raft.expect("a raft-mode node has a RaftHandle"));
+    }
+
+    // The 4th node JOINS: it boots with the 4-node topology (so it knows the 3 voters' bus addrs +
+    // its own NodeId) but as a NON-VOTER (cluster_raft_joining), so it does not campaign and is not
+    // in the initial voter set; it adopts its membership from the replicated log.
+    let (_joiner_node, joiner_raft) =
+        run_raft_joining_node_with_handle(ports4[3], joiner_topo.clone(), ID3);
+    let _joiner_raft = joiner_raft.expect("a raft-mode joiner has a RaftHandle");
+
+    let node3 = node_id_from_announce(ID3);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let env = SystemEnv::new();
+        // Client sockets to the 3 voters (we drive committed CLUSTER writes through whichever is the
+        // owner/leader; the 4th is reached by raft replication, not a client here).
+        let mut clients = Vec::new();
+        for &p in &voter_ports {
+            clients.push(connect_retry(p).await);
+        }
+
+        // ---- (1) FORM the 3-voter cluster, then identify the PHYSICAL LEADER. A raft-mode CLUSTER
+        // MEET / FORGET also drives a Raft membership change, which (UNLIKE a slot ConfigCmd) is
+        // NOT forwarded -- it must be issued on the leader (the operator targets the leader). So we
+        // wait for a leader to emerge (via its RaftHandle status) and drive the membership ops there.
+        // We probe an idempotent MEET first to kick the cluster into forming.
+        let leader_idx = {
+            let start = env.now();
+            let mut found = None;
+            'discover: loop {
+                // Kick formation: each node MEETs its next peer (idempotent on the leader).
+                for i in 0..3 {
+                    let peer = (i + 1) % 3;
+                    let _ = cmd(
+                        &mut clients[i],
+                        &[
+                            "CLUSTER",
+                            "MEET",
+                            "127.0.0.1",
+                            &voter_ports[peer].to_string(),
+                        ],
+                    )
+                    .await;
+                }
+                // The PHYSICAL leader is the voter whose RaftHandle reports is_leader().
+                for i in 0..3 {
+                    if voter_handles[i].is_leader() {
+                        found = Some(i);
+                        break 'discover;
+                    }
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            found.expect("a physical raft leader must emerge")
+        };
+
+        // MEET both other voters from the leader so the node table holds all three (idempotent).
+        for i in 0..3 {
+            if i == leader_idx {
+                continue;
+            }
+            let start = env.now();
+            loop {
+                let r = cmd(
+                    &mut clients[leader_idx],
+                    &["CLUSTER", "MEET", "127.0.0.1", &voter_ports[i].to_string()],
+                )
+                .await;
+                if r.starts_with("+OK") {
+                    break;
+                }
+                assert!(
+                    !deadline_passed(&env, start, timeout),
+                    "leader MEET of a voter must commit"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        // The committed voter set is exactly the 3 boot voters; NO learner yet (formation MEETs do
+        // not demote a voter or add a learner -- the demotion guard skips an already-voter).
+        let leader = &voter_handles[leader_idx];
+        let cfg = leader.config();
+        assert_eq!(cfg.voters.len(), 3, "the boot voter set is 3 voters");
+        assert!(
+            cfg.learners.is_empty(),
+            "no learner before the 4th node is MEET'd"
+        );
+
+        // ---- (2) MEET the 4TH node from the leader: this commits AddNode (node table) AND proposes
+        // AddLearner(node3) (raft config). The 4th joins as a NON-VOTING learner.
+        {
+            let start = env.now();
+            loop {
+                let r = cmd(
+                    &mut clients[leader_idx],
+                    &["CLUSTER", "MEET", "127.0.0.1", &ports4[3].to_string()],
+                )
+                .await;
+                if r.starts_with("+OK") {
+                    break;
+                }
+                assert!(
+                    !deadline_passed(&env, start, timeout),
+                    "MEET of the 4th node must commit (got {r:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        // Assert the 4th is a LEARNER (not yet a voter): the election/commit quorum is UNCHANGED at
+        // 3 voters, so adding it cannot have stalled consensus. Poll (the AddLearner commits +
+        // adoption is async relative to the +OK on the node-table entry).
+        let became_learner = {
+            let start = env.now();
+            loop {
+                let cfg = leader.config();
+                if cfg.learners.contains(&node3) {
+                    assert!(
+                        !cfg.voters.contains(&node3),
+                        "the 4th node is a LEARNER, not yet a voter"
+                    );
+                    assert_eq!(
+                        cfg.voters.len(),
+                        3,
+                        "the voter quorum is still 3 while it catches up"
+                    );
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            became_learner,
+            "MEET must stage the 4th node in as a non-voting learner"
+        );
+
+        // ---- (3) AUTO-PROMOTE: once the learner catches up to the leader's commit index, the
+        // leader's auto-promote driver proposes PromoteLearner; the committed voter set becomes 4.
+        let became_voter = {
+            let start = env.now();
+            loop {
+                let cfg = leader.config();
+                if cfg.voters.contains(&node3) {
+                    assert!(
+                        !cfg.learners.contains(&node3),
+                        "the promoted node left the learner set"
+                    );
+                    assert_eq!(cfg.voters.len(), 4, "the committed voter set is now 4");
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            became_voter,
+            "the caught-up learner must be AUTO-PROMOTED to a voter"
+        );
+
+        // A committed CLUSTER write still succeeds with the 4-voter quorum (proves quorum is correct
+        // after the growth -- writes commit on a majority of 4).
+        {
+            let start = env.now();
+            loop {
+                let r = cmd(
+                    &mut clients[leader_idx],
+                    &[
+                        "CLUSTER",
+                        "MEET",
+                        "127.0.0.1",
+                        &voter_ports[(leader_idx + 1) % 3].to_string(),
+                    ],
+                )
+                .await;
+                if r.starts_with("+OK") {
+                    break;
+                }
+                assert!(
+                    !deadline_passed(&env, start, timeout),
+                    "a write must commit on the 4-voter quorum"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        // ---- (4) FORGET the 4th node: CLUSTER FORGET <id> -> RemoveVoter(node3) (quorum-guarded:
+        // 3 voters remain, so the removal is allowed). Assert it leaves the voter set.
+        {
+            let start = env.now();
+            loop {
+                let r = cmd(&mut clients[leader_idx], &["CLUSTER", "FORGET", ID3]).await;
+                if r.starts_with("+OK") {
+                    break;
+                }
+                assert!(
+                    !deadline_passed(&env, start, timeout),
+                    "FORGET of the 4th node must commit (got {r:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        let left_voters = {
+            let start = env.now();
+            loop {
+                let cfg = leader.config();
+                if !cfg.voters.contains(&node3) && !cfg.learners.contains(&node3) {
+                    assert_eq!(
+                        cfg.voters.len(),
+                        3,
+                        "the voter set is back to 3 after FORGET"
+                    );
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            left_voters,
+            "FORGET must remove the 4th node from the raft voter set"
+        );
+    });
+
+    clean_raft_logs(voter_ports);
+    clean_raft_logs([ports4[3], ports4[3], ports4[3]]);
+}

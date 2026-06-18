@@ -248,6 +248,101 @@ pub fn run_raft_node_for_test_with(
 /// # Panics
 ///
 /// Panics if the server fails to bind, OR if the topology fails to validate.
+/// Like [`run_raft_node_for_test`] but ALSO returns the raft-mode [`RaftHandle`](ironcache_server::RaftHandle)
+/// (HA-prod-membership), so a test can observe the live Raft CONFIGURATION (voter / learner sets)
+/// directly via `RaftHandle::config` without a new wire surface.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind, OR if the topology fails to validate.
+#[must_use]
+pub fn run_raft_node_with_handle(
+    port: u16,
+    topology: ClusterTopology,
+    announce_id: &str,
+) -> (ShardSet, Option<ironcache_server::RaftHandle>) {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards: 1,
+        databases: 16,
+        cluster_enabled: true,
+        cluster_mode: ClusterMode::Raft,
+        cluster_topology: Some(topology),
+        cluster_announce_id: Some(announce_id.to_owned()),
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test raft cluster topology must validate");
+    crate::serve::run_server_inner(&config).expect("test raft node failed to bind")
+}
+
+/// Like [`run_raft_joining_node_for_test`] but ALSO returns the raft-mode
+/// [`RaftHandle`](ironcache_server::RaftHandle), so a test can observe the joiner's adopted
+/// membership directly (HA-prod-membership).
+///
+/// # Panics
+///
+/// Panics if the server fails to bind, OR if the topology fails to validate.
+#[must_use]
+pub fn run_raft_joining_node_with_handle(
+    port: u16,
+    topology: ClusterTopology,
+    announce_id: &str,
+) -> (ShardSet, Option<ironcache_server::RaftHandle>) {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards: 1,
+        databases: 16,
+        cluster_enabled: true,
+        cluster_mode: ClusterMode::Raft,
+        cluster_topology: Some(topology),
+        cluster_announce_id: Some(announce_id.to_owned()),
+        cluster_raft_joining: true,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test raft joining topology must validate");
+    crate::serve::run_server_inner(&config).expect("test raft joining node failed to bind")
+}
+
+/// Boot a real RAFT node that is JOINING an already-formed cluster at runtime (HA-prod-membership):
+/// `cluster_raft_joining = true`, so it boots as a NON-VOTER (it does not campaign and is not in the
+/// initial voter set) and learns it is a member only when the leader's committed `AddLearner` (then
+/// auto-promote `PromoteLearner`) entry replicates to it after an operator `CLUSTER MEET`. The
+/// `topology` lists ALL nodes (so the joiner derives every `NodeId` + bus address); `announce_id` is
+/// this joiner's id. Used by the membership loopback to bring up a 4th node that MEET stages in.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind, OR if the topology fails to validate.
+#[must_use]
+pub fn run_raft_joining_node_for_test(
+    port: u16,
+    topology: ClusterTopology,
+    announce_id: &str,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards: 1,
+        databases: 16,
+        cluster_enabled: true,
+        cluster_mode: ClusterMode::Raft,
+        cluster_topology: Some(topology),
+        cluster_announce_id: Some(announce_id.to_owned()),
+        cluster_raft_joining: true,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test raft joining topology must validate");
+    run_server(&config).expect("test raft joining node failed to bind")
+}
+
 #[must_use]
 pub fn run_raft_node_for_test_min_replicas(
     port: u16,

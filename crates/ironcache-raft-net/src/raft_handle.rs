@@ -13,9 +13,11 @@
 //! [`ProposeOutcome`] the mutator maps to `+OK` / `-CLUSTERDOWN`, and (c) the `is_leader()` /
 //! `leader_hint()` reads the redirect uses.
 
-use ironcache_raft::{ConfigCmd, EntryPayload};
+use std::net::SocketAddr;
 
-use crate::NodeHandle;
+use ironcache_raft::{ConfigCmd, EntryPayload, MembershipChange, NodeId};
+
+use crate::{ClusterConfig, MembershipOutcome, NodeHandle};
 
 /// The outcome of proposing a [`ConfigCmd`] through the Raft control plane.
 ///
@@ -103,5 +105,40 @@ impl RaftHandle {
             Some(index) => ProposeOutcome::Committed(index),
             None => ProposeOutcome::NotLeader,
         }
+    }
+
+    /// This node's Raft [`NodeId`] (HA-prod-membership). The operator-membership path uses it to
+    /// avoid registering / removing SELF and to know which voter the FORGET removal names.
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.inner.id()
+    }
+
+    /// The live cluster CONFIGURATION (voter + learner sets) this node has adopted (HA-prod-membership).
+    /// A cheap, non-blocking read of the published config-watch snapshot; the operator path consults it
+    /// to apply the FORGET quorum-safety reasoning at the serve layer and to surface membership.
+    #[must_use]
+    pub fn config(&self) -> ClusterConfig {
+        self.inner.config()
+    }
+
+    /// Propose a single-server Raft [`MembershipChange`] and await its outcome (HA-prod-membership).
+    ///
+    /// This is the OPERATOR PATH that grows / shrinks the Raft VOTER / LEARNER set at runtime, the
+    /// quorum-affecting complement to [`propose`](RaftHandle::propose) (which moves the slot / node
+    /// TABLE). `addr` is a newly-added node's cluster-bus `SocketAddr` so the leader can replicate to
+    /// a runtime-joined node not in the static topology (pass `None` for a removal / known peer).
+    ///
+    /// Returns [`MembershipOutcome::Committed`] on true commit, [`MembershipOutcome::NotLeader`] when
+    /// this node is not the leader (a membership change is NOT forwarded; it is issued on the leader),
+    /// [`MembershipOutcome::InFlight`] when a previous change is still uncommitted (section-6
+    /// one-change-in-flight -- retryable), or [`MembershipOutcome::Refused`] when the adapter's
+    /// quorum-safety guard rejected a removal that would break majority.
+    pub async fn propose_membership(
+        &self,
+        change: MembershipChange,
+        addr: Option<SocketAddr>,
+    ) -> MembershipOutcome {
+        self.inner.propose_membership(change, addr).await
     }
 }
