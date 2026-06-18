@@ -42,6 +42,9 @@ const MSG_REQUEST_VOTE_RESP: u8 = 2;
 const MSG_APPEND_ENTRIES: u8 = 3;
 const MSG_APPEND_ENTRIES_RESP: u8 = 4;
 const MSG_PROPOSE: u8 = 5;
+// HA-9 leader-forwarding: new transport-level message tags continue from 6 (the next free value).
+const MSG_FORWARD_PROPOSE: u8 = 6;
+const MSG_FORWARD_PROPOSE_RESULT: u8 = 7;
 
 // Payload discriminants (the `EntryPayload` variant tag).
 const PAYLOAD_NOOP: u8 = 0;
@@ -126,6 +129,26 @@ pub fn encode_raft_msg(msg: &RaftMsg) -> Vec<u8> {
         RaftMsg::Propose { payload } => {
             out.push(MSG_PROPOSE);
             put_payload(&mut out, payload);
+        }
+        RaftMsg::ForwardPropose { corr, payload } => {
+            // HA-9: the correlation id then the opaque payload to propose on the leader.
+            out.push(MSG_FORWARD_PROPOSE);
+            put_u64(&mut out, *corr);
+            put_payload(&mut out, payload);
+        }
+        RaftMsg::ForwardProposeResult { corr, outcome } => {
+            // HA-9: the correlation id then the outcome as a present-flag + index. A
+            // `None` writes flag 0 (and a zero index that decode ignores); `Some(i)`
+            // writes flag 1 + the index. The fixed-width tail keeps decode total.
+            out.push(MSG_FORWARD_PROPOSE_RESULT);
+            put_u64(&mut out, *corr);
+            if let Some(index) = outcome {
+                out.push(1);
+                put_u64(&mut out, *index);
+            } else {
+                out.push(0);
+                put_u64(&mut out, 0);
+            }
         }
     }
     out
@@ -371,6 +394,20 @@ pub fn decode_raft_msg(buf: &[u8]) -> Option<RaftMsg> {
         MSG_PROPOSE => RaftMsg::Propose {
             payload: get_payload(&mut cur)?,
         },
+        MSG_FORWARD_PROPOSE => RaftMsg::ForwardPropose {
+            corr: cur.u64()?,
+            payload: get_payload(&mut cur)?,
+        },
+        MSG_FORWARD_PROPOSE_RESULT => {
+            let corr = cur.u64()?;
+            // The present-flag (0/1) then a fixed u64 index (meaningful only when 1).
+            let present = cur.bool()?;
+            let index = cur.u64()?;
+            RaftMsg::ForwardProposeResult {
+                corr,
+                outcome: if present { Some(index) } else { None },
+            }
+        }
         _ => return None,
     };
     // Reject trailing bytes: a complete message must consume the whole frame.

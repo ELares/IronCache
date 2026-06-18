@@ -50,17 +50,29 @@
 
 #![forbid(unsafe_code)]
 
+use core::time::Duration;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use ironcache_clusterbus::{PeerConn, Reply};
 use ironcache_env::{Clock, Env, SystemEnv};
 use ironcache_raft::{
-    Effects, EntryPayload, LogEntry, NodeId, RaftNode, RaftRng, RaftStorage, Role, StateMachine,
-    TimerOp,
+    Effects, EntryPayload, LogEntry, NodeId, RaftMsg, RaftNode, RaftRng, RaftStorage, Role,
+    StateMachine, TimerOp,
 };
 use ironcache_runtime::Runtime;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// How long a follower waits for a [`RaftMsg::ForwardProposeResult`] before giving up and
+/// resolving the proposal [`NotLeader`](raft_handle::ProposeOutcome::NotLeader) (HA-9
+/// leader-forwarding). The await MUST be bounded: a lost forward, a leader change mid-flight, or a
+/// partitioned leader would otherwise hang the caller forever. The bound is generous relative to
+/// the election timeout (base+jitter 150-300ms) so a healthy leader almost always answers well
+/// inside it; on expiry the caller (a CLUSTER mutator, or the replica promotion task) simply
+/// retries, by which point it has re-learned the current leader. Measured through the
+/// [`Runtime::timer`] seam, never wall-clock (ADR-0003).
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub mod codec;
 pub use codec::{decode_raft_msg, encode_raft_msg};
@@ -113,15 +125,30 @@ pub enum Event {
         /// The arm-epoch this fire was scheduled under.
         generation: u64,
     },
-    /// A LOCAL client proposal: append `payload` to the log (leader-only; a non-leader
-    /// recipient's engine rejects it with no effect). The optional `ack` reports back
-    /// the assigned log index (`Some(index)`) or `None` if this node was not leader,
-    /// so a caller can learn where (and whether) its entry landed.
+    /// A LOCAL client proposal: append `payload` to the log. The optional `ack` reports back
+    /// the assigned log index (`Some(index)`) or `None` if the proposal could not land, so a
+    /// caller can learn where (and whether) its entry landed.
+    ///
+    /// HA-9 LEADER-FORWARDING changed the non-leader case: the run loop no longer immediately
+    /// answers `None` on a follower. If this node IS the leader it proposes locally as before; if
+    /// it is a FOLLOWER that recognizes a leader, it FORWARDS the proposal to that leader over the
+    /// cluster bus and `ack` is fulfilled when the leader replies (or `None` on a bounded timeout);
+    /// only when NO leader is known does it answer `None` at once. So `ack = Some(index)` may now be
+    /// a commit that happened on the leader after a forward; the caller's contract is unchanged.
     Propose {
         /// The opaque payload to append (the engine never interprets it).
         payload: EntryPayload,
-        /// An optional one-shot to receive the proposed index (`None` = not leader).
-        ack: Option<tokio::sync::oneshot::Sender<Option<u64>>>,
+        /// An optional one-shot to receive the proposed index (`None` = not leader / no leader /
+        /// forward timed out).
+        ack: Option<oneshot::Sender<Option<u64>>>,
+    },
+    /// A pending forward (HA-9) has exceeded [`FORWARD_TIMEOUT`]: if `corr` is still pending, resolve
+    /// it `None` (the caller retries). Posted by the per-forward timeout task the run loop spawns so
+    /// a lost `ForwardProposeResult` (a partitioned / changed leader) cannot hang the caller. A
+    /// `corr` already completed by its result is simply absent and the fire is a no-op.
+    ForwardTimeout {
+        /// The correlation id of the forward whose deadline elapsed.
+        corr: u64,
     },
 }
 
@@ -145,6 +172,12 @@ pub struct Status {
     pub last_applied: u64,
     /// How many entries the state machine has applied (the apply witness).
     pub applied_count: u64,
+    /// The leader this node currently recognizes for its term, if any (HA-9
+    /// leader-forwarding). Mirrors the engine's passive [`RaftNode::leader_id`] record:
+    /// `Some(self)` on a leader, the recognized peer on a follower, `None` on a
+    /// candidate / just-stepped-down node. A follower forwards a proposal to this peer;
+    /// [`NodeHandle::leader_hint`] resolves it to a `host:port` via the static peer map.
+    pub leader_id: Option<NodeId>,
 }
 
 impl Status {
@@ -166,6 +199,12 @@ pub struct NodeHandle {
     id: NodeId,
     inbox: mpsc::UnboundedSender<Event>,
     status: watch::Receiver<Status>,
+    /// Every voter id (including self) to the `SocketAddr` of its `RAFTMSG` cluster-bus listener
+    /// (HA-9). Shared so [`NodeHandle::leader_hint`] can resolve the watched `leader_id` to a
+    /// `host:port` for a redirect reply, without reaching into the run loop. `Arc` because the
+    /// handle is `Clone` (the listener task and the serve path each hold one) and the map is
+    /// immutable after boot.
+    addrs: Arc<BTreeMap<NodeId, SocketAddr>>,
 }
 
 impl NodeHandle {
@@ -189,11 +228,27 @@ impl NodeHandle {
         *self.status.borrow()
     }
 
-    /// Submit a local proposal and await the assigned log index, or `None` if this
-    /// node was not the leader when the run loop processed it. Returns `None` too if
-    /// the run loop has stopped (the inbox is closed) before answering.
+    /// The current leader's cluster-bus `host:port`, resolved from the watched
+    /// `leader_id` via the static peer map, or `None` when no leader is recognized
+    /// (HA-9). Used by the serve path's redirect reply when a forward could not land.
+    /// The address is the leader's RAFTMSG (cluster-bus) endpoint, which is the only
+    /// per-node address this adapter holds; it is informational in the redirect.
+    #[must_use]
+    pub fn leader_hint(&self) -> Option<String> {
+        let leader = self.status().leader_id?;
+        self.addrs.get(&leader).map(SocketAddr::to_string)
+    }
+
+    /// Submit a local proposal and await the assigned log index, or `None` if it could not land.
+    ///
+    /// HA-9 LEADER-FORWARDING: on the LEADER this proposes locally as before; on a FOLLOWER that
+    /// recognizes a leader the run loop FORWARDS the proposal to that leader and this await is
+    /// fulfilled by the leader's reply (so `Some(index)` may be a commit that happened on the
+    /// leader after a forward), bounded by [`FORWARD_TIMEOUT`]; with NO known leader it returns
+    /// `None` at once. Returns `None` too if the run loop has stopped (the inbox is closed). The
+    /// await does NOT block the shard executor: it parks on the proposal's one-shot ack channel.
     pub async fn propose(&self, payload: EntryPayload) -> Option<u64> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         if self
             .inbox
             .send(Event::Propose {
@@ -237,6 +292,16 @@ where
     /// The static peer-address map: every OTHER voter's id to the `SocketAddr` of its
     /// `RAFTMSG` listener. Used to (lazily) open an outbound connection per peer.
     peers: BTreeMap<NodeId, SocketAddr>,
+    /// Pending follower-side forwards (HA-9): the correlation id of each in-flight
+    /// [`RaftMsg::ForwardPropose`] to the one-shot that the originating
+    /// [`NodeHandle::propose`] await parks on. Fulfilled (and removed) when the matching
+    /// [`RaftMsg::ForwardProposeResult`] arrives or the forward's [`FORWARD_TIMEOUT`]
+    /// elapses. Owned solely by the single run-loop task (no lock needed).
+    pending_forwards: BTreeMap<u64, oneshot::Sender<Option<u64>>>,
+    /// The next correlation id to assign a forward (HA-9). A monotonic run-loop counter,
+    /// NEVER random (ADR-0003): it only needs to be unique among this node's in-flight
+    /// forwards, and uniqueness from a counter is deterministic.
+    next_corr: u64,
     /// Lazily-opened outbound connections, one per peer. A connection is opened on
     /// first send to a peer and dropped on any I/O error (the next send reconnects);
     /// a dropped `RaftMsg` is harmless because Raft re-sends on the next heartbeat.
@@ -288,19 +353,29 @@ where
             commit_index: raft.commit_index(),
             last_applied: raft.last_applied(),
             applied_count: raft.applied_count(),
+            leader_id: raft.leader_id(),
         };
         let (status_tx, status_rx) = watch::channel(initial);
+
+        // The peer-address map for leader_hint resolution (HA-9): the OTHER voters' bus endpoints.
+        // SELF is deliberately absent (its bus address is not in `peers`): the serve path only
+        // calls leader_hint on a NON-leader redirect, so the resolved leader is always a PEER; a
+        // self-leader never redirects. Immutable after boot, shared by Arc with every handle clone.
+        let addrs = Arc::new(peers.clone());
 
         let handle = NodeHandle {
             id,
             inbox: inbox_tx.clone(),
             status: status_rx,
+            addrs,
         };
         let node = RaftClusterBusNode {
             raft,
             env,
             rt,
             peers,
+            pending_forwards: BTreeMap::new(),
+            next_corr: 0,
             conns: BTreeMap::new(),
             timer_gen: BTreeMap::new(),
             inbox_tx,
@@ -345,9 +420,22 @@ where
             let mut effects = Effects::new();
             match event {
                 Event::Inbound { from, msg } => {
-                    let now = self.env.now();
-                    let rng: &mut dyn RaftRng = self.env.rng();
-                    self.raft.on_message(now, rng, from, msg, &mut effects);
+                    // HA-9: intercept the transport-level forwarding messages BEFORE the engine
+                    // (the pure engine treats them as inert no-ops; the forwarding logic lives
+                    // here in the adapter). Everything else is a real RPC for the engine.
+                    match msg {
+                        RaftMsg::ForwardPropose { corr, payload } => {
+                            self.on_forward_propose(from, corr, payload, &mut effects);
+                        }
+                        RaftMsg::ForwardProposeResult { corr, outcome } => {
+                            self.on_forward_result(corr, outcome);
+                        }
+                        other => {
+                            let now = self.env.now();
+                            let rng: &mut dyn RaftRng = self.env.rng();
+                            self.raft.on_message(now, rng, from, other, &mut effects);
+                        }
+                    }
                 }
                 Event::Timer { token, generation } => {
                     // Drop a superseded fire: if this token has been re-armed or
@@ -361,17 +449,115 @@ where
                     self.raft.on_timer(now, rng, token, &mut effects);
                 }
                 Event::Propose { payload, ack } => {
-                    let now = self.env.now();
-                    let rng: &mut dyn RaftRng = self.env.rng();
-                    let index = self.raft.propose(payload, now, rng, &mut effects);
-                    if let Some(ack) = ack {
-                        // The receiver may have gone away; a failed send is fine.
-                        let _ = ack.send(index);
+                    self.on_local_propose(payload, ack, &mut effects).await;
+                }
+                Event::ForwardTimeout { corr } => {
+                    // HA-9: a forward exceeded FORWARD_TIMEOUT. If still pending, resolve it
+                    // `None` so the caller stops waiting and retries; an already-answered corr is
+                    // absent and this is a no-op. No engine step, so no effects.
+                    if let Some(ack) = self.pending_forwards.remove(&corr) {
+                        let _ = ack.send(None);
                     }
                 }
             }
             self.drain_effects(effects).await;
             self.publish_status();
+        }
+    }
+
+    /// Handle a LOCAL [`Event::Propose`] (HA-9 leader-forwarding). Three cases:
+    ///
+    /// - THIS node IS the leader: propose locally exactly as before, ack the assigned index.
+    /// - A FOLLOWER that recognizes a leader: FORWARD the proposal to that leader over the cluster
+    ///   bus (a fresh correlation id, the ack parked in `pending_forwards`, a bounded timeout armed)
+    ///   and DO NOT ack now; the ack is fulfilled by the leader's `ForwardProposeResult` or the
+    ///   timeout. No engine step runs (the follower's engine would just reject it), so `effects` is
+    ///   untouched here; the bus send happens immediately below.
+    /// - NO leader known (a candidate, or just after a step-down): ack `None` at once. The caller
+    ///   retries, and by then a leader is usually known.
+    async fn on_local_propose(
+        &mut self,
+        payload: EntryPayload,
+        ack: Option<oneshot::Sender<Option<u64>>>,
+        effects: &mut Effects,
+    ) {
+        if self.raft.is_leader() {
+            let now = self.env.now();
+            let rng: &mut dyn RaftRng = self.env.rng();
+            let index = self.raft.propose(payload, now, rng, effects);
+            if let Some(ack) = ack {
+                let _ = ack.send(index);
+            }
+            return;
+        }
+
+        // Not the leader: forward to the recognized leader if there is one. A leader that is THIS
+        // node was handled above; leader_id() == Some(self) cannot occur on a non-leader.
+        let leader = self.raft.leader_id();
+        match (leader, ack) {
+            (Some(leader), Some(ack)) if self.peers.contains_key(&leader) => {
+                let corr = self.next_corr;
+                self.next_corr = self.next_corr.wrapping_add(1);
+                self.pending_forwards.insert(corr, ack);
+                // Arm the bounded timeout so a lost result / changed leader cannot hang the caller.
+                let tx = self.inbox_tx.clone();
+                let rt = self.rt.clone();
+                self.rt.spawn_on_shard(async move {
+                    rt.timer(FORWARD_TIMEOUT).await;
+                    let _ = tx.send(Event::ForwardTimeout { corr });
+                });
+                // Send the forward over the cluster bus (best-effort, like any send; on drop the
+                // timeout resolves NotLeader and the caller retries).
+                let msg = RaftMsg::ForwardPropose { corr, payload };
+                self.send_to_peer(leader, &msg).await;
+            }
+            // A known leader that is not a configured peer (defensive), no leader at all, or no ack
+            // channel: there is nothing to forward to / nobody to answer. Resolve NotLeader now.
+            (_, ack) => {
+                if let Some(ack) = ack {
+                    let _ = ack.send(None);
+                }
+            }
+        }
+    }
+
+    /// Handle an inbound [`RaftMsg::ForwardPropose`] (HA-9): a peer `from` asked us to propose
+    /// `payload` on its behalf. If we are the leader, propose locally (the same engine machinery a
+    /// local `Propose` uses) and reply [`RaftMsg::ForwardProposeResult`] with the assigned index.
+    /// If we are NOT the leader, reply `None` WITHOUT chaining the forward onward (the ONE-HOP rule:
+    /// the origin retries and by then knows the new leader, so a second hop would only add latency
+    /// and risk a loop). The local propose's `effects` (the replication AppendEntries it triggers)
+    /// are drained by the caller; the result reply is sent immediately so the origin is not blocked.
+    fn on_forward_propose(
+        &mut self,
+        from: NodeId,
+        corr: u64,
+        payload: EntryPayload,
+        effects: &mut Effects,
+    ) {
+        let outcome = if self.raft.is_leader() {
+            let now = self.env.now();
+            let rng: &mut dyn RaftRng = self.env.rng();
+            // propose() appends + replicates and returns the assigned index (Some) on a leader.
+            self.raft.propose(payload, now, rng, effects)
+        } else {
+            // One-hop only: we are not the leader, so we do not re-forward; the origin retries.
+            None
+        };
+        // Reply to the origin. Queue it as an engine SEND so it ships after this step's other
+        // effects, through the same encode + PeerConn path.
+        effects
+            .sends
+            .push((from, RaftMsg::ForwardProposeResult { corr, outcome }));
+    }
+
+    /// Handle an inbound [`RaftMsg::ForwardProposeResult`] (HA-9): the leader answered a forward we
+    /// sent. Complete and remove the matching pending one-shot so the originating
+    /// [`NodeHandle::propose`] await resolves with the outcome. A `corr` we no longer hold (already
+    /// timed out, or a duplicate result) is simply ignored.
+    fn on_forward_result(&mut self, corr: u64, outcome: Option<u64>) {
+        if let Some(ack) = self.pending_forwards.remove(&corr) {
+            let _ = ack.send(outcome);
         }
     }
 
@@ -466,6 +652,7 @@ where
             commit_index: self.raft.commit_index(),
             last_applied: self.raft.last_applied(),
             applied_count: self.raft.applied_count(),
+            leader_id: self.raft.leader_id(),
         };
         // A send error means every reader dropped; the node can still run, so ignore.
         let _ = self.status_tx.send(status);
@@ -789,6 +976,39 @@ mod tests {
             prev_log_term: 5,
             entries: vec![],
             leader_commit: 4,
+        });
+
+        // HA-9 ForwardPropose: a follower hands the leader a proposal. Cover each
+        // payload kind + the zero/large corr edges.
+        assert_round_trips(&RaftMsg::ForwardPropose {
+            corr: 0,
+            payload: EntryPayload::Noop,
+        });
+        assert_round_trips(&RaftMsg::ForwardPropose {
+            corr: u64::MAX,
+            payload: EntryPayload::Bytes(vec![0, 1, 2, 255, 13, 10]),
+        });
+        assert_round_trips(&RaftMsg::ForwardPropose {
+            corr: 7,
+            payload: EntryPayload::Config(ConfigCmd::PromoteReplica {
+                slots: vec![0, 100, 16_383],
+                new_primary: "abababababababababababababababababababab".to_owned(),
+            }),
+        });
+
+        // HA-9 ForwardProposeResult: BOTH outcomes (Some(index) accepted, None
+        // not-leader) + the zero/large edges must round-trip byte-for-byte.
+        assert_round_trips(&RaftMsg::ForwardProposeResult {
+            corr: 7,
+            outcome: Some(42),
+        });
+        assert_round_trips(&RaftMsg::ForwardProposeResult {
+            corr: u64::MAX,
+            outcome: Some(0),
+        });
+        assert_round_trips(&RaftMsg::ForwardProposeResult {
+            corr: 0,
+            outcome: None,
         });
 
         // AppendEntries: a vector with a LogEntry of EVERY payload kind, including

@@ -288,16 +288,23 @@ redis-cli -p 7002 CLUSTER ADDSLOTSRANGE 0 16383
 redis-cli -p 7001 CLUSTER INFO   # cluster_state:ok, cluster_slots_assigned:16384 on every node
 ```
 
+A cluster mutation, or a replica self-promotion, can be issued to **any** node: a
+follower transparently FORWARDS the proposal to the current Raft leader over the cluster
+bus, awaits the commit, and relays the result, so a CLUSTER write to a follower returns
+`+OK` and an in-sync replica self-promotes regardless of which node holds leadership. (A
+`-CLUSTERDOWN` redirect remains only for the genuine no-leader / forward-timeout case.)
+
 **Known limitations (today).**
 
-- A cluster mutation commits only on the current Raft *leader*; a follower replies
-  `-CLUSTERDOWN` rather than forwarding. In particular, replica self-promotion fires only
-  when the in-sync replica is itself the leader. Leader-forwarding is a tracked follow-up;
-  failover *correctness* is fully proven by the DST gate regardless.
 - Raft-mode `CLUSTER MEET` synthesizes a peer's node id from its `host:port` (there is no
   gossip), so a node can appear under both its announce id and a synthesized id; ownership
   and routing match by endpoint, but `CLUSTER NODES` / `cluster_known_nodes` reflect those
   extra entries.
+- A `propose` ack resolves when the leader appends the entry (it commits on a majority
+  immediately after); resolving the ack on the commit advance, and surfacing the leader's
+  client endpoint (not its cluster-bus endpoint) in the rare redirect hint, are tracked
+  follow-ups. Every cluster `ConfigCmd` is idempotent, so a re-proposal after a missed
+  commit is safe.
 
 ---
 
