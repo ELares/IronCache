@@ -1438,6 +1438,22 @@ async fn route_and_dispatch(
     // cold path and the default static path is byte-unchanged.
     let asking = consume_one_shot_asking(&cmd_upper, conn);
 
+    // HA-6 ASKING-IN-MULTI: carry the PRE-MULTI one-shot ASKING into the transaction it opens. The
+    // one-shot is consumed PER COMMAND above (so it cannot LEAK past a command), which would
+    // otherwise drop a flag set by `ASKING` BEFORE `MULTI` before the transaction's commands are
+    // QUEUED. Redis keeps the single `CLIENT_ASKING` flag live across the MULTI queueing phase (its
+    // cluster redirect runs at QUEUE time), so `ASKING; MULTI; <cmd on an IMPORTING slot>; EXEC`
+    // queues + serves on the importing destination. We mirror that by recording the consumed
+    // `asking` into the transaction-scoped `conn.txn_asking` for the MULTI that OPENS a transaction
+    // (a nested `MULTI` is `in_multi` already and routes through `route_in_multi`, so it never
+    // reaches here). The queue-time redirect in `route_in_multi` consults `txn_asking`; `clear_txn`
+    // / `reset` clear it on EXEC / DISCARD / RESET, so it can NEVER leak past the transaction. On a
+    // non-cluster / non-migrating connection `asking` is always false, so this is a single cold
+    // bool write and the default path is byte-unchanged.
+    if cmd_upper == b"MULTI" && !conn.in_multi {
+        conn.txn_asking = asking;
+    }
+
     // -- INTERNAL-VERB CLIENT GATE (COORDINATOR.md #107, Stage 2b). `__ICSTORESET` /
     // `__ICSTOREZSET` / `__ICSTOREHLL` are the coordinator's INTERNAL cross-shard *STORE
     // dest-write verbs (set / zset / PFMERGE-HLL): each lives in the command registry + has a
@@ -2522,21 +2538,35 @@ fn route_in_multi(
     // question, internal-shard ownership (which of MY shards) the inner one.
     if let Some(map) = ctx.cluster.as_deref() {
         let in_sync = replica_read_in_sync(ctx);
-        // HA-6: the in-MULTI QUEUE-TIME redirect deliberately passes `None` for the migration
-        // context, so it reproduces the pre-HA-6 MOVED/CROSSSLOT behavior exactly. The migration
-        // ASK/ASKING handshake is a SINGLE-command-retry protocol (the client sends ASKING then
-        // re-issues ONE command at the destination); it does not compose with transaction queueing
-        // (a queued ASK would have to redirect the whole MULTI, which Redis also does not do), so a
-        // migrating slot inside MULTI is treated as owned-or-MOVED, the conservative + correct
-        // choice (a key that has migrated away is simply absent, and the queued command runs against
-        // the source's view at EXEC). Documented scope boundary, mirroring how WATCH passes `None`.
-        // TODO(HA-6): ASKING through the MULTI queue-time redirect. The one-shot is already CONSUMED
-        // at the top of `route_and_dispatch` (so it can never LEAK into a later command), but it is
-        // not threaded into this queued redirect; an in-MULTI ASK-then-command is out of scope (Redis
-        // does not redirect a whole MULTI on ASK either), so passing `None` here is intentional.
-        if let Some(reply) =
-            cluster_redirect(map, route, cmd_upper, request, conn.readonly, in_sync, None)
-        {
+        // HA-6: the in-MULTI QUEUE-TIME redirect honors ASKING exactly like the non-MULTI live path,
+        // by building the SAME `MigrationCtx { asking, key_present }` and passing `Some(&mig)` to the
+        // shared `cluster_redirect`. The `asking` is the TRANSACTION-SCOPED `conn.txn_asking` (the
+        // PRE-MULTI one-shot the router carried into this transaction), NOT the per-command one-shot
+        // (consumed at the top of `route_and_dispatch` and gone by the time commands queue). This
+        // mirrors Redis, whose cluster redirect runs at QUEUE time with `CLIENT_ASKING` still live:
+        // `ASKING; MULTI; <cmd on an IMPORTING slot>; EXEC` is QUEUED + served on the importing
+        // destination, while WITHOUT ASKING the same queued command MOVEDs/dirties (the migration arm
+        // is inert unless the slot is actually MIGRATING/IMPORTING, so a non-migrating slot is
+        // byte-identical to before -- the static MOVED/CROSSSLOT decision). The key-presence resolver
+        // reads THIS connection's accept-shard store at the current time, exactly as the non-MULTI
+        // path; it is consulted ONLY when a slot is mid-migration (the cold path) and carries the same
+        // single-shard-per-node scope note as the live path.
+        let now = UnixMillis(env.borrow().now_unix_millis());
+        let db = conn.db;
+        let key_present = |k: &[u8]| store_rc.borrow().contains_live(db, k, now);
+        let mig = MigrationCtx {
+            asking: conn.txn_asking,
+            key_present: &key_present,
+        };
+        if let Some(reply) = cluster_redirect(
+            map,
+            route,
+            cmd_upper,
+            request,
+            conn.readonly,
+            in_sync,
+            Some(&mig),
+        ) {
             state_rc.borrow_mut().counters.on_command();
             conn.dirty_exec = true;
             encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
@@ -4309,6 +4339,124 @@ mod tests {
         conn.asking = true;
         conn.reset(false);
         assert!(!conn.asking, "RESET clears the one-shot ASKING");
+    }
+
+    // ----- HA-6 ASKING-IN-MULTI: the PRE-MULTI one-shot ASKING is carried into the transaction it
+    // opens (`conn.txn_asking`) so the in-MULTI QUEUE-TIME cluster redirect honors it, and it is
+    // cleared on EXEC / DISCARD / RESET so it can NEVER leak past the transaction. These pin the
+    // connection-state side of the fix (the router records `txn_asking` for the opening MULTI; the
+    // queue-time redirect in `route_in_multi` consults it). -----
+
+    /// The PRE-MULTI ASKING carried into a transaction is CLEARED when the transaction ends
+    /// (`clear_txn`, called by EXEC / DISCARD), so an `ASKING; MULTI; ...; EXEC` cannot leave a stale
+    /// `txn_asking` for a command issued AFTER the transaction. This is the leak-fix invariant
+    /// extended across the transaction boundary.
+    #[test]
+    fn txn_asking_is_cleared_when_the_transaction_ends() {
+        let mut conn = test_conn();
+        // The router records the pre-MULTI ASKING into txn_asking for the MULTI that opens the txn.
+        conn.txn_asking = true;
+        conn.enter_multi();
+        assert!(
+            conn.txn_asking,
+            "enter_multi must NOT clobber the router-recorded pre-MULTI ASKING"
+        );
+        // EXEC / DISCARD clear the transaction (and with it txn_asking): no leak past the txn.
+        conn.clear_txn();
+        assert!(
+            !conn.txn_asking,
+            "clear_txn (EXEC/DISCARD) clears the transaction-scoped ASKING -> no leak past the txn"
+        );
+    }
+
+    /// RESET inside a MULTI aborts the transaction AND clears the transaction-scoped ASKING, so a
+    /// RESET cannot carry a pre-MULTI ASKING forward (the same no-leak contract as the one-shot).
+    #[test]
+    fn reset_clears_the_transaction_scoped_asking() {
+        let mut conn = test_conn();
+        conn.txn_asking = true;
+        conn.enter_multi();
+        conn.reset(false);
+        assert!(
+            !conn.txn_asking,
+            "RESET clears the transaction-scoped ASKING (no carry past the aborted txn)"
+        );
+        assert!(!conn.in_multi, "RESET also aborts the transaction");
+    }
+
+    /// THE IN-MULTI QUEUE-TIME DECISION the wiring fix enables: the SAME `cluster_redirect` predicate
+    /// `route_in_multi` now calls, over an IMPORTING slot, built with the transaction-scoped ASKING.
+    /// WITH asking -> served (None, the queued command runs on the importing destination at EXEC);
+    /// WITHOUT asking -> MOVED to the owner (the queued command would dirty the transaction). This is
+    /// exactly the non-MULTI importing behavior, now reachable from inside a transaction.
+    #[test]
+    fn in_multi_importing_slot_honors_transaction_scoped_asking() {
+        let map = redirect_map();
+        let key = key_in_slot_range(8192, 16383); // a B-owned slot self (A) is IMPORTING
+        let slot = ironcache_protocol::key_slot(key.as_bytes());
+        map.set_importing(slot, RID_B).expect("B is known");
+        let req = rreq(&[b"GET", key.as_bytes()]);
+        let route = route::classify(b"GET");
+        let key_present = |_k: &[u8]| false;
+
+        // txn_asking == true (the client did `ASKING; MULTI; GET k; ...`): the queued command is
+        // SERVED on the importing destination (None -> proceed -> queue, run at EXEC).
+        let mig_asking = MigrationCtx {
+            asking: true,
+            key_present: &key_present,
+        };
+        assert_eq!(
+            cluster_redirect(&map, route, b"GET", &req, false, false, Some(&mig_asking)),
+            None,
+            "an in-MULTI command on an IMPORTING slot WITH the transaction-scoped ASKING is served"
+        );
+
+        // txn_asking == false (a plain `MULTI; GET k; ...`, no preceding ASKING): MOVED to the owner,
+        // which the in-MULTI path turns into a dirtied transaction -> EXECABORT, exactly as today.
+        let mig_no_asking = MigrationCtx {
+            asking: false,
+            key_present: &key_present,
+        };
+        let reply = cluster_redirect(
+            &map,
+            route,
+            b"GET",
+            &req,
+            false,
+            false,
+            Some(&mig_no_asking),
+        )
+        .expect("an in-MULTI importing command WITHOUT ASKING is MOVED (dirties the txn)");
+        assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
+    }
+
+    /// THE DEFAULT-PATH IDENTITY for the in-MULTI redirect: on a NON-migrating slot, the migration
+    /// context the in-MULTI path now passes (`Some(ctx)`, with the transaction-scoped ASKING) is
+    /// BYTE-IDENTICAL to the pre-fix `None`, for both an owned (proceed) and a foreign (MOVED) key --
+    /// so a transaction over non-migrating slots queues / redirects EXACTLY as before HA-6.
+    #[test]
+    fn in_multi_non_migrating_slot_is_byte_identical_to_pre_fix() {
+        let map = redirect_map();
+        let owned = key_in_slot_range(0, 8191);
+        let foreign = key_in_slot_range(8192, 16383);
+        // An ASKING + present resolver that WOULD matter on a migrating/importing slot; with no tag
+        // neither is consulted, so the migration-aware call must equal the old `None` call.
+        let key_present = |_k: &[u8]| true;
+        let ctx_ask = MigrationCtx {
+            asking: true,
+            key_present: &key_present,
+        };
+        for key in [&owned, &foreign] {
+            let req = rreq(&[b"GET", key.as_bytes()]);
+            let route = route::classify(b"GET");
+            let with_mig =
+                cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx_ask));
+            let pre_fix = cluster_redirect(&map, route, b"GET", &req, false, false, None);
+            assert_eq!(
+                with_mig, pre_fix,
+                "no migration state -> the in-MULTI Some(ctx) must equal the pre-fix None for {key}"
+            );
+        }
     }
 
     /// `is_valid_node_id` accepts EXACTLY a 40-lowercase-hex string (the announce-id / MYID /

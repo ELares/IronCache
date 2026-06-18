@@ -91,6 +91,22 @@ pub struct ConnState {
     /// and consulted ONLY on the cold migration redirect path, so a non-importing / standalone node
     /// is unaffected. RESET clears it (Redis parity), and the router clears it after each command.
     pub asking: bool,
+    /// The TRANSACTION-SCOPED `ASKING` state for the in-`MULTI` QUEUE-TIME cluster redirect (HA-6).
+    /// The one-shot [`Self::asking`] is consumed PER COMMAND at the top of the router (so it can
+    /// never LEAK past a command), which means the flag a client set with `ASKING` BEFORE `MULTI`
+    /// would otherwise be gone by the time the transaction's commands are QUEUED. Redis keeps the
+    /// single `CLIENT_ASKING` flag live across the MULTI queueing phase (its cluster redirect runs
+    /// at queue time, BEFORE the flag is cleared per executed command), so an `ASKING; MULTI; <cmd
+    /// on an IMPORTING slot>; EXEC` queues + serves on the importing destination. We mirror that by
+    /// CARRYING the ASKING in effect when `MULTI` opens into this transaction-scoped field: the
+    /// queue-time redirect in `route_in_multi` consults THIS (not the per-command one-shot) so every
+    /// command queued inside the transaction honors the pre-MULTI `ASKING`. It is bounded to the
+    /// transaction lifetime -- `enter_multi` initializes it from the pre-MULTI one-shot, and
+    /// `clear_txn` / `reset` clear it on EXEC / DISCARD / RESET -- so it can NEVER leak past the
+    /// transaction (the leak-fix invariant is preserved). On a non-cluster / non-migrating node it
+    /// is always `false` and is consulted only on the cold migration redirect, so the default path
+    /// is unaffected.
+    pub txn_asking: bool,
 }
 
 impl ConnState {
@@ -127,6 +143,8 @@ impl ConnState {
             readonly: false,
             // No ASKING pending on a fresh connection (HA-6); set only by an explicit ASKING.
             asking: false,
+            // No transaction in flight on a fresh connection, so no transaction-scoped ASKING.
+            txn_asking: false,
         }
     }
 
@@ -149,7 +167,8 @@ impl ConnState {
         // RESET clears the CLUSTER read-only bit back to read-write (Redis parity).
         self.readonly = false;
         // RESET clears any pending one-shot ASKING (HA-6): a fresh baseline never carries a stale
-        // ASKING into the next command.
+        // ASKING into the next command. `clear_txn` (called above) already cleared the
+        // transaction-scoped `txn_asking`, so a RESET inside a MULTI cannot carry ASKING forward.
         self.asking = false;
         // should_close intentionally not touched by RESET.
     }
@@ -167,6 +186,13 @@ impl ConnState {
     /// Enter the transaction (queueing) state for a fresh `MULTI`: mark `in_multi`
     /// and clear any stale queue/dirty flag from a prior transaction so the new
     /// transaction starts clean (TRANSACTIONS.md, PR-10a).
+    ///
+    /// `txn_asking` is deliberately NOT touched here: the ASKING in effect when `MULTI`
+    /// opens is the PRE-MULTI one-shot, which the router has already consumed by the time
+    /// dispatch reaches this arm (HA-6). The router therefore records it into `txn_asking`
+    /// for the MULTI command BEFORE this runs, and a prior transaction's `txn_asking` was
+    /// already cleared by `clear_txn` / `reset` -- so a fresh transaction's `txn_asking`
+    /// reflects exactly the pre-MULTI ASKING with no stale carry.
     pub fn enter_multi(&mut self) {
         self.in_multi = true;
         self.queued.clear();
@@ -175,12 +201,18 @@ impl ConnState {
 
     /// Leave the transaction state, dropping the staged queue and the dirty flag.
     /// Called by `EXEC` (after running or aborting the batch), `DISCARD`, and
-    /// `RESET`. All three of the MULTI fields are cleared together so no stale queue
-    /// leaks into the next command (TRANSACTIONS.md "exiting MULTI clears the queue").
+    /// `RESET`. All the MULTI fields are cleared together so no stale queue leaks into
+    /// the next command (TRANSACTIONS.md "exiting MULTI clears the queue").
+    ///
+    /// `txn_asking` (the HA-6 transaction-scoped ASKING for the in-MULTI queue-time
+    /// cluster redirect) is cleared here too, so the pre-MULTI ASKING applies ONLY to the
+    /// transaction it opened and can NEVER leak past EXEC / DISCARD / RESET into a later
+    /// command -- the one-shot leak-fix invariant, extended across the transaction.
     pub fn clear_txn(&mut self) {
         self.in_multi = false;
         self.queued.clear();
         self.dirty_exec = false;
+        self.txn_asking = false;
     }
 
     /// Clear the WATCH snapshot list (TRANSACTIONS.md, PR-10b). This drops the

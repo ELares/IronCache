@@ -740,6 +740,48 @@ fn raft_mode_slot_migration_asks_serves_under_asking_and_flips_to_moved() {
             "ASKING; GET on the IMPORTING DEST must serve the value locally, got {get_on_dest:?}"
         );
 
+        // ---- (5b) ASKING-IN-MULTI (HA-6): `ASKING; MULTI; GET <key>; EXEC` on the IMPORTING DEST
+        // must QUEUE the GET (the pre-MULTI ASKING is carried into the transaction's queue-time
+        // cluster redirect) and SERVE the migrated value at EXEC -- the ASK second leg now works for
+        // a command INSIDE a transaction, not just a bare command. The slot is still IMPORTING here
+        // (the FLIP is below), and the migrated key is present on DEST (the `ASKING; SET` above), so
+        // EXEC returns a one-element array with the value. The DEST is single-shard (`shards: 1`), so
+        // the intra-node `all_keys_home_owned` gate passes and the queued GET runs home-only at EXEC.
+        let ask_ok = cmd(&mut clients[dest_idx], &["ASKING"]).await;
+        assert!(ask_ok.starts_with("+OK"), "ASKING should reply +OK, got {ask_ok:?}");
+        let multi_ok = cmd(&mut clients[dest_idx], &["MULTI"]).await;
+        assert!(multi_ok.starts_with("+OK"), "MULTI should reply +OK, got {multi_ok:?}");
+        // The GET on the IMPORTING slot, WITH the carried ASKING, is QUEUED (not MOVED).
+        let queued = cmd(&mut clients[dest_idx], &["GET", &key]).await;
+        assert!(
+            queued.starts_with("+QUEUED"),
+            "ASKING; MULTI; GET on the IMPORTING DEST must QUEUE (carried ASKING honored), got {queued:?}"
+        );
+        let exec = cmd(&mut clients[dest_idx], &["EXEC"]).await;
+        assert!(
+            exec.starts_with("*1\r\n$8\r\nmigrated"),
+            "EXEC must serve the migrated value from the IMPORTING DEST (the ASK second leg in a MULTI), got {exec:?}"
+        );
+
+        // ---- (5c) THE NEGATIVE CONTROL: `MULTI; GET <key>; EXEC` WITHOUT a preceding ASKING. The
+        // GET on the IMPORTING slot is MOVED to the owner AT QUEUE TIME (no carried ASKING), which
+        // DIRTIES the transaction, so EXEC returns `-EXECABORT` and serves nothing locally -- exactly
+        // the pre-fix in-MULTI behavior, proving the carried ASKING (not a leaked one-shot) is what
+        // enables the (5b) serve. (The pure unit `in_multi_importing_slot_honors_transaction_scoped_asking`
+        // pins the with/without-ASKING decision deterministically; this is its end-to-end shadow.)
+        let multi_ok = cmd(&mut clients[dest_idx], &["MULTI"]).await;
+        assert!(multi_ok.starts_with("+OK"), "MULTI should reply +OK, got {multi_ok:?}");
+        let moved_at_queue = cmd(&mut clients[dest_idx], &["GET", &key]).await;
+        assert!(
+            moved_at_queue.starts_with("-MOVED"),
+            "MULTI; GET (no ASKING) on the IMPORTING DEST must MOVED at queue time, got {moved_at_queue:?}"
+        );
+        let exec_abort = cmd(&mut clients[dest_idx], &["EXEC"]).await;
+        assert!(
+            exec_abort.starts_with("-EXECABORT"),
+            "the dirtied transaction (queue-time MOVED) must EXECABORT, got {exec_abort:?}"
+        );
+
         // ---- (6) THE FLIP: commit SETSLOT <slot> NODE <dest> (ownership transfer). On apply, DEST
         // owns and the migration clears on every node. SRC then serves MOVED (NOT ASK) to DEST.
         let r = cmd(
