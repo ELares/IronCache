@@ -313,13 +313,52 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     // work; the per-connection serve closure clones the original per connection.
     let drain_ctx = ctx_template.clone();
 
+    // EMBEDDED TRANSPORT TLS for the CLIENT listener (#105, docs/design/TLS.md). Build the rustls
+    // acceptor ONCE at boot when `tls = on`, from the configured cert/key PEM, and clone the cheap
+    // (Arc-inside) handle into every connection's serve closure. When `tls = off` (the DEFAULT)
+    // this is `None` and the serve path returns a PLAIN TcpStream exactly as before -- no rustls,
+    // no per-byte cost, byte-unchanged. A build failure here (unreadable / unparseable cert or key)
+    // is a hard boot error: a TLS-only listener with no usable material would reject every client,
+    // so we refuse to start rather than silently serve nothing. `Config::validate` already proved
+    // the paths are present + readable, so this is the PEM-parse + rustls-acceptance step.
+    let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if config.tls
+        == ironcache_config::TlsMode::On
+    {
+        // validate() guaranteed both paths are Some + readable; expressing it as a clear error here
+        // keeps the boot failure precise if a future path reaches this without validation.
+        let cert = config.tls_cert_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("tls = on requires tls_cert_path (should have been caught by validate)")
+        })?;
+        let key = config.tls_key_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("tls = on requires tls_key_path (should have been caught by validate)")
+        })?;
+        let acceptor =
+            ironcache_runtime::build_acceptor(&cert.to_string_lossy(), &key.to_string_lossy())
+                .map_err(|e| anyhow::anyhow!("building the TLS listener: {e}"))?;
+        eprintln!(
+            "ironcache: TLS enabled (rustls, server-auth) on the client listener; cert={} key={}",
+            cert.display(),
+            key.display()
+        );
+        Some(acceptor)
+    } else {
+        None
+    };
+
     let serve = {
         let inbox = inbox.clone();
-        move |rt: TokioRuntime, stream: tokio::net::TcpStream, shard: ShardId| {
+        // `run_shards` hands the shard's `TokioRuntime` backend; the per-connection serve loop
+        // drives data I/O through the `ClientStream` (plain or TLS), and the shard's background
+        // timer task constructs its own zero-sized backend, so this connection path no longer
+        // needs the handle directly (the underscore keeps the run_shards closure shape).
+        move |_rt: TokioRuntime, stream: tokio::net::TcpStream, shard: ShardId| {
             let ctx = ctx_template.clone();
             let inbox = inbox.clone();
+            // Clone the cheap acceptor handle (Arc inside) per connection; `None` when tls = off,
+            // in which case the serve loop takes the plaintext fast path.
+            let tls_acceptor = tls_acceptor.clone();
             async move {
-                serve_connection(rt, stream, shard, ctx, default_proto, inbox).await;
+                serve_connection(stream, shard, ctx, default_proto, inbox, tls_acceptor).await;
             }
         }
     };
@@ -672,13 +711,32 @@ fn shard_started_at() -> ironcache_env::Monotonic {
 // flow across helpers that all need the same locals.
 #[allow(clippy::too_many_lines)]
 async fn serve_connection(
-    rt: TokioRuntime,
-    mut stream: tokio::net::TcpStream,
+    tcp: tokio::net::TcpStream,
     home: ShardId,
     mut ctx: ServerContext,
     default_proto: ProtoVersion,
     inbox: coordinator::Inbox,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
+    // TLS HANDSHAKE (or plaintext passthrough), #105. When TLS is enabled the accepted TCP
+    // connection is upgraded RIGHT HERE, before any RESP byte is read: a rustls handshake runs
+    // and yields a `ClientStream::Tls` the serve loop reads/writes transparently. A plaintext
+    // client to a TLS port FAILS this handshake -> the connection is dropped (rejected, not hung).
+    // When TLS is OFF (the default) we wrap the same TcpStream in `ClientStream::Plain`, a thin
+    // passthrough to the identical TcpStream read/write code -- the plaintext hot path is
+    // byte-unchanged. The client stream's own recv/send carry the data bytes from here on.
+    let mut stream = match tls_acceptor {
+        Some(acceptor) => match ironcache_runtime::accept_tls(&acceptor, tcp).await {
+            Ok(s) => s,
+            Err(_e) => {
+                // A failed handshake (a non-TLS client, an unsupported version, a truncated
+                // ClientHello): close the connection. The bytes that arrived were never RESP and
+                // never reached the engine, so there is nothing to flush -- just return.
+                return;
+            }
+        },
+        None => ironcache_runtime::ClientStream::plain(tcp),
+    };
     let env = shard_env();
     let state_rc = shard_state();
     // The reserved-band width is derived from the configured TOTAL shard count so SCAN's
@@ -769,8 +827,10 @@ async fn serve_connection(
                     if close {
                         // Flush the QUIT reply then close. send returns the owned
                         // buffer (owned-buffer model); we are closing, so the
-                        // returned buffer is dropped rather than reclaimed.
-                        let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
+                        // returned buffer is dropped rather than reclaimed. Sent over the
+                        // CLIENT stream (plain or TLS); the plain arm is byte-identical to the
+                        // prior `rt.send` (it calls the same TcpStream write_all), #105.
+                        let _ = stream.send(std::mem::take(&mut out)).await;
                         break 'conn;
                     }
                 }
@@ -778,15 +838,17 @@ async fn serve_connection(
                 DecodeOutcome::Error(e) => {
                     // Protocol error: write it and close the connection (hardening).
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
-                    let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
+                    let _ = stream.send(std::mem::take(&mut out)).await;
                     break 'conn;
                 }
             }
         }
 
         if !out.is_empty() {
-            // Owned-buffer send: hand `out` over and take the returned buffer back.
-            match rt.send(&mut stream, std::mem::take(&mut out)).await {
+            // Owned-buffer send: hand `out` over and take the returned buffer back. Over the
+            // client stream (plain or TLS); the plain arm is the same TcpStream write the prior
+            // `rt.send` did (#105).
+            match stream.send(std::mem::take(&mut out)).await {
                 Ok(returned) => out = returned,
                 Err(_) => break,
             }
@@ -800,7 +862,6 @@ async fn serve_connection(
         // -- a push never precedes a command reply on the connection (SERVER_PUSH.md FIFO).
         if conn.is_subscriber() {
             if subscriber_idle_wait(
-                &rt,
                 &mut stream,
                 &mut push_rx,
                 &shed_flag,
@@ -813,8 +874,9 @@ async fn serve_connection(
                 break;
             }
         } else {
-            // Need more bytes: read.
-            let Ok(res) = rt.recv(&mut stream, std::mem::take(&mut read_buf)).await else {
+            // Need more bytes: read over the client stream (plain or TLS). The plain arm is the
+            // same TcpStream read the prior `rt.recv` did, so the plaintext hot path is unchanged.
+            let Ok(res) = stream.recv(std::mem::take(&mut read_buf)).await else {
                 break;
             };
             read_buf = res.buf;
@@ -875,8 +937,7 @@ async fn serve_connection(
 /// trigger; `wait()` parks on the signal's `Notify` (SPIN-FREE, no busy poll), so a healthy
 /// subscriber pays nothing for this arm.
 async fn subscriber_idle_wait(
-    rt: &TokioRuntime,
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut ironcache_runtime::ClientStream,
     push_rx: &mut tokio::sync::mpsc::Receiver<crate::pubsub::ServerPush>,
     shed: &std::sync::Arc<crate::pubsub::ShedSignal>,
     read_buf: &mut Vec<u8>,
@@ -902,7 +963,7 @@ async fn subscriber_idle_wait(
             while let Ok(next) = push_rx.try_recv() {
                 encode_into(out, &next.render(proto), proto);
             }
-            rt.send(stream, std::mem::take(out)).await.map_or(true, |returned| {
+            stream.send(std::mem::take(out)).await.map_or(true, |returned| {
                 *out = returned;
                 false
             })
@@ -912,7 +973,7 @@ async fn subscriber_idle_wait(
             // bound): close the connection (its subscriptions are cleaned up on the close path).
             true
         }
-        res = rt.recv(stream, Vec::new()) => {
+        res = stream.recv(Vec::new()) => {
             let Ok(res) = res else { return true; };
             if res.n == 0 {
                 return true; // peer closed
