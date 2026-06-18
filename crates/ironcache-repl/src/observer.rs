@@ -108,15 +108,25 @@ impl StreamOp {
 /// once a resync re-bases the replica at a fresh cut the surviving window is gap-free above
 /// it.
 ///
-/// ## send_cursor: drain without forgetting
+/// ## PER-CONNECTION drain (no shared fan-out cursor): read-only window reads
 ///
-/// The stream task ships ops it has not yet sent by reading FORWARD of `send_cursor` (the
-/// highest offset shipped on the current connection), NOT by removing from the front -- so a
-/// shipped op stays retained for a possible re-send until the replica acks it. A reconnect
-/// REWINDS `send_cursor` to the replica's acked offset ([`Self::rewind_send`]); the next
-/// drain re-ships from there. If the rewind target is below the oldest retained op (the
-/// primary evicted it), the primary cannot serve the resume -> [`Self::can_serve_from`] is
-/// false and the caller full-resyncs.
+/// The ring holds NO single fan-out cursor. Each replica/import CONNECTION keeps its OWN local
+/// send cursor (the highest offset IT has shipped) and reads ops it has not yet sent by reading
+/// FORWARD of that local cursor with [`Self::ops_after`] -- a READ-ONLY scan that does NOT
+/// mutate ring state, so two concurrent consumers (e.g. an HA-7 replica connection AND an HA-6
+/// importer connection both draining this one source shard's ring) EACH see EVERY op in
+/// `(their cursor, head]`. A single shared cursor would have split the tail: each op going to
+/// whichever consumer drained it first, the other silently missing it (divergence / lost write).
+/// Reading forward of a per-connection cursor instead fans the tail out faithfully to all.
+///
+/// Retention stays the bounded `(oldest_retained, head]` window: an op stays retained for a
+/// possible re-send until the replica ACKS past it ([`Self::ack`]) or the window overflows
+/// `cap` (evicting the oldest + latching `must_resync`). A connection whose local cursor falls
+/// BELOW [`Self::oldest_retained`] (it fell behind the retained window) cannot be served the
+/// next op it needs -> [`Self::can_serve_from`] is false and that connection FULL-RE-SYNCS
+/// (the existing Gap path) rather than silently skipping. Pruning is by the replica's ack (the
+/// single steady-state consumer's resume bound) plus the hard `cap`; a consumer the ack pruned
+/// past simply fall-behind-resyncs, which is correct for any number of consumers.
 #[derive(Debug)]
 pub struct ReplRing {
     /// The retained ops in `(acked, head]`, oldest first. Length never exceeds `cap`.
@@ -129,9 +139,6 @@ pub struct ReplRing {
     /// The highest offset the replica has ACKED; ops at or below it are pruned (the replica
     /// has them durably). Monotonic.
     acked: ReplOffset,
-    /// The highest offset the stream task has SHIPPED on the current connection. The next
-    /// drain ships ops with offset > this. A reconnect rewinds it to the replica's ack.
-    send_cursor: ReplOffset,
     /// Latched when an UN-ACKED op was evicted (the retained window overflowed `cap`). Once
     /// set, the primary has lost part of the resume window, so the replica that needs it must
     /// drop to a fresh HA-7b full re-sync. Cleared by [`Self::take_resync`].
@@ -151,7 +158,6 @@ impl ReplRing {
             cap: cap.max(1),
             head: start,
             acked: start,
-            send_cursor: start,
             must_resync: false,
         }))
     }
@@ -190,9 +196,11 @@ impl ReplRing {
     }
 
     /// The lowest offset still retained (the front of the resume window), or `head` if the
-    /// buffer is empty. The primary can serve a resume from `from` iff `from + 1 >= this`.
+    /// buffer is empty. The primary can serve a resume from `from` iff `from + 1 >= this`. A
+    /// per-connection consumer whose local cursor falls below this has fallen behind the
+    /// retained window and must full-re-sync (see [`Self::can_serve_from`]).
     #[must_use]
-    fn oldest_retained(&self) -> ReplOffset {
+    pub fn oldest_retained(&self) -> ReplOffset {
         self.ops.front().map_or(self.head, StreamOp::offset)
     }
 
@@ -222,35 +230,35 @@ impl ReplRing {
         }
         if self.ops.len() >= self.cap {
             // The retained window is full: evict the oldest un-acked op to make room and latch
-            // the resume gap. The evicted op is below where the replica could now resume from.
-            let evicted = self.ops.pop_front();
-            // The send cursor cannot point below what we still retain after the eviction.
-            if let Some(ev) = evicted {
-                self.send_cursor = self.send_cursor.max_with(ev.offset());
-            }
+            // the resume gap. The evicted op is below where any consumer could now resume from;
+            // a per-connection cursor below it will fall-behind-resync (see `can_serve_from`).
+            self.ops.pop_front();
             self.must_resync = true;
         }
         self.ops.push_back(op);
         assigned
     }
 
-    /// Drain up to `max` ops the stream task has NOT yet shipped on this connection (offset >
-    /// `send_cursor`), in offset order, advancing `send_cursor` past them. They stay RETAINED
-    /// for a possible re-send until acked. The borrow-then-release discipline: the caller
-    /// holds the ring borrow only for this O(max) copy, then drops it before awaiting the
-    /// sends. `max == 0` ships nothing.
-    pub fn drain_batch(&mut self, max: usize) -> Vec<StreamOp> {
+    /// READ-ONLY: copy up to `max` retained ops with offset strictly greater than `cursor`, in
+    /// offset order, WITHOUT mutating any ring state (no shared cursor advance, no prune). Each
+    /// CONNECTION calls this with ITS OWN local send cursor, so two concurrent consumers
+    /// draining one ring EACH see every op past their own cursor -- the per-connection fan-out
+    /// that the old shared `send_cursor` (which split the tail between consumers) is replaced
+    /// by. The caller advances its OWN local cursor past the returned ops and ships them; they
+    /// stay RETAINED for other consumers / a re-send until acked. `max == 0` returns nothing.
+    ///
+    /// The borrow-then-release discipline is unchanged: the caller holds the ring borrow only
+    /// for this O(min(len, max)) copy, then drops it before awaiting the sends.
+    #[must_use]
+    pub fn ops_after(&self, cursor: ReplOffset, max: usize) -> Vec<StreamOp> {
         let mut out = Vec::new();
         for op in &self.ops {
             if out.len() >= max {
                 break;
             }
-            if op.offset().0 > self.send_cursor.0 {
+            if op.offset().0 > cursor.0 {
                 out.push(op.clone());
             }
-        }
-        if let Some(last) = out.last() {
-            self.send_cursor = self.send_cursor.max_with(last.offset());
         }
         out
     }
@@ -279,14 +287,6 @@ impl ReplRing {
         }
     }
 
-    /// REWIND the send cursor to `from` (a reconnect resuming from the replica's acked
-    /// offset): the next [`Self::drain_batch`] re-ships everything retained past `from`. If
-    /// `from` is below the oldest retained op the primary cannot serve it (see
-    /// [`Self::can_serve_from`]); the caller checks that first and full-resyncs instead.
-    pub fn rewind_send(&mut self, from: ReplOffset) {
-        self.send_cursor = from;
-    }
-
     /// Take and CLEAR the `must_resync` latch (the stream task acknowledging it is doing a
     /// full re-sync). The caller re-bases the buffer afterwards with [`Self::rebase`]. Returns
     /// whether a resync was pending.
@@ -298,13 +298,13 @@ impl ReplRing {
 
     /// RE-BASE the buffer at a fresh snapshot cut `cut` (the `end_offset` a new HA-7b
     /// full-sync just took): discard the entire retained window (it is below the cut and
-    /// redundant) and set `acked`/`send_cursor` to `cut`. `head` is UNCHANGED (writes that
-    /// happened after the cut are already counted; the next produced op is `head + 1`, still
-    /// gap-free above the cut). Ops produced between the cut and this call remain retained iff
-    /// their offset is past `cut`.
+    /// redundant) and advance `acked` to `cut`. `head` is UNCHANGED (writes that happened after
+    /// the cut are already counted; the next produced op is `head + 1`, still gap-free above the
+    /// cut). Ops produced between the cut and this call remain retained iff their offset is past
+    /// `cut`. (Per-connection send cursors are owned by each connection and re-based by the
+    /// caller to the cut after a fresh full-sync; the ring keeps no shared send cursor.)
     pub fn rebase(&mut self, cut: ReplOffset) {
         self.acked = self.acked.max_with(cut);
-        self.send_cursor = self.send_cursor.max_with(cut);
         while self.ops.front().is_some_and(|op| op.offset().0 <= cut.0) {
             self.ops.pop_front();
         }
@@ -387,7 +387,7 @@ mod tests {
         store.upsert(0, b"a", NewValue::Bytes(b"3"), ExpireWrite::Clear, NOW); // overwrite
         store.delete(0, b"b", NOW);
 
-        let ops = ring.borrow_mut().drain_batch(usize::MAX);
+        let ops = ring.borrow().ops_after(ReplOffset::ZERO, usize::MAX);
         assert_eq!(ops.len(), 4, "four writes -> four ops");
         // Offsets are 1,2,3,4 in order (gap-free, strictly increasing).
         assert_eq!(ops[0].offset(), ReplOffset(1));
@@ -480,6 +480,64 @@ mod tests {
             "with the acked op pruned, the third write did not overflow"
         );
         assert_eq!(ring.borrow().len(), 2);
+    }
+
+    /// C1 (the per-connection fan-out): TWO independent local cursors reading `ops_after` the
+    /// SAME ring EACH see EVERY retained op, with NO split between them. `ops_after` is read-only
+    /// (it never advances a shared cursor), so consumer A reading every op does NOT consume them
+    /// out from under consumer B -- the exact divergence the old shared `send_cursor` caused
+    /// (each op went to whichever consumer drained it first). This is the unit proof of the C1
+    /// fix; the live two-consumer wire proof is `raft_cluster.rs`.
+    #[test]
+    fn two_local_cursors_each_see_every_op_no_split() {
+        let ring = ReplRing::new(1024, ReplOffset::ZERO);
+        let mut store: ShardStore = ShardStore::new(4);
+        store.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        store.upsert(0, b"a", NewValue::Bytes(b"1"), ExpireWrite::Clear, NOW);
+        store.upsert(0, b"b", NewValue::Bytes(b"2"), ExpireWrite::Clear, NOW);
+        store.upsert(0, b"c", NewValue::Bytes(b"3"), ExpireWrite::Clear, NOW);
+
+        // Consumer A drains everything from its own cursor.
+        let mut cursor_a = ReplOffset::ZERO;
+        let a = ring.borrow().ops_after(cursor_a, usize::MAX);
+        if let Some(last) = a.last() {
+            cursor_a = last.offset();
+        }
+        // Consumer B, with its OWN cursor, STILL sees all three -- A's drain did not consume them.
+        let mut cursor_b = ReplOffset::ZERO;
+        let b = ring.borrow().ops_after(cursor_b, usize::MAX);
+        if let Some(last) = b.last() {
+            cursor_b = last.offset();
+        }
+
+        let a_offsets: Vec<_> = a.iter().map(StreamOp::offset).collect();
+        let b_offsets: Vec<_> = b.iter().map(StreamOp::offset).collect();
+        assert_eq!(
+            a_offsets,
+            vec![ReplOffset(1), ReplOffset(2), ReplOffset(3)],
+            "consumer A sees every op"
+        );
+        assert_eq!(
+            b_offsets,
+            vec![ReplOffset(1), ReplOffset(2), ReplOffset(3)],
+            "consumer B ALSO sees every op (no split with A)"
+        );
+        assert_eq!(cursor_a, ReplOffset(3));
+        assert_eq!(cursor_b, ReplOffset(3));
+
+        // A later write is seen by each, forward of its now-advanced cursor (still no split).
+        store.upsert(0, b"d", NewValue::Bytes(b"4"), ExpireWrite::Clear, NOW);
+        let a2 = ring.borrow().ops_after(cursor_a, usize::MAX);
+        let b2 = ring.borrow().ops_after(cursor_b, usize::MAX);
+        assert_eq!(
+            a2.iter().map(StreamOp::offset).collect::<Vec<_>>(),
+            vec![ReplOffset(4)]
+        );
+        assert_eq!(
+            b2.iter().map(StreamOp::offset).collect::<Vec<_>>(),
+            vec![ReplOffset(4)],
+            "the new op fans out to BOTH cursors, not just whichever read first"
+        );
     }
 
     /// The observer-off hot path is unchanged (HA-5a's gate): with no observer installed the

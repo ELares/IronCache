@@ -228,9 +228,12 @@ async fn serve_connection(
         && ring.borrow().can_serve_from(resume_from)
         && !ring.borrow().needs_resync();
 
+    // C1: THIS connection's OWN send cursor (the ring keeps no shared one). It starts at the
+    // replica's ack on a resume, or at the snapshot cut after a fresh full-sync.
+    let mut send_cursor;
     if can_resume {
-        // Resume the tail from the replica's ack: rewind the send cursor, no snapshot.
-        ring.borrow_mut().rewind_send(resume_from);
+        // Resume the tail from the replica's ack: this connection's cursor starts there.
+        send_cursor = resume_from;
     } else {
         // Full-sync at the cut, then tail from the cut.
         let fs_stream = Rc::clone(&stream);
@@ -244,13 +247,13 @@ async fn serve_connection(
         if ok.is_err() {
             return;
         }
-        ring.borrow_mut().rewind_send(snapshot_cut);
+        send_cursor = snapshot_cut;
     }
 
     // Ship every not-yet-sent op up to the head, until the link drops or there is nothing left.
     loop {
         let ship_stream = Rc::clone(&stream);
-        let outcome = drain_and_ship(ring, 16, move |frame| {
+        let outcome = drain_and_ship(ring, &mut send_cursor, 16, move |frame| {
             let st = Rc::clone(&ship_stream);
             let rt3 = TokioRuntime::new();
             async move { send_frame(&rt3, &st, frame).await }

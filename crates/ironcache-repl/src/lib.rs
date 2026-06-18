@@ -58,7 +58,8 @@ pub use cursor::{ReplId, ReplOffset};
 
 pub mod frames;
 pub use frames::{
-    FULLSYNC, Frame, FrameError, REPLCONF, REPLPING, STREAMDEL, STREAMPUT, SYNCEND, SYNCKV,
+    FULLSYNC, Frame, FrameError, IMPORTREQ, REPLCONF, REPLPING, STREAMDEL, STREAMPUT, SYNCEND,
+    SYNCKV,
 };
 
 pub mod kvcodec;

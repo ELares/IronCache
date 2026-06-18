@@ -70,9 +70,10 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use ironcache_env::Clock;
+use ironcache_protocol::slot::key_slot;
 use ironcache_repl::{
     ApplyOutcome, Frame, FrameError, ReplId, ReplNodeStatus, ReplObserver, ReplOffset, ReplRing,
-    ReplicaApplier, ShipOutcome, drain_and_ship, encode_kvobj, receive_full_sync,
+    ReplicaApplier, ShipOutcome, decode_kvobj, drain_and_ship, encode_kvobj, receive_full_sync,
 };
 use ironcache_runtime::tokio_rt::bind_exclusive;
 use ironcache_runtime::{Runtime, TokioRuntime};
@@ -147,6 +148,19 @@ pub(crate) fn repl_port(port: u16) -> u16 {
 #[must_use]
 fn any_replica_of_self(map: &ironcache_cluster::SlotMap) -> Option<u16> {
     (0..ironcache_cluster::CLUSTER_SLOTS).find(|&slot| map.is_replica_of_self(slot))
+}
+
+/// Whether THIS node is the committed IMPORTING destination of SOME slot (HA-6 data-copy), and
+/// which one. The IMPORTING tag is set ONLY on the destination node (the `ConfigSm` apply gates
+/// `set_importing` on `is_self(dest)`), so a committed `MigrationState::Importing` on this node's
+/// shared map means THIS node is the importer; no extra `is_self` check is needed. A cold scan of
+/// the parallel `migration_state` array (one relaxed atomic load per slot), run only on the import
+/// control task's poll cadence (never the hot path). Returns the FIRST such slot; `None` in the
+/// steady state until a `SetSlotImporting` naming this node commits.
+#[must_use]
+fn any_importing_slot(map: &ironcache_cluster::SlotMap) -> Option<u16> {
+    (0..ironcache_cluster::CLUSTER_SLOTS)
+        .find(|&slot| map.migration_state(slot) == ironcache_cluster::MigrationState::Importing)
 }
 
 /// Spawn the HA-7d replica-attach machinery on THIS shard's `LocalSet` (the per-shard
@@ -239,20 +253,32 @@ pub(crate) fn spawn_on_shard(
         replica_max_lag: ctx.boot.replica_max_lag,
         failover_timeout: Duration::from_secs(ctx.boot.failover_timeout_secs),
     };
+    let replica_cluster = std::sync::Arc::clone(&cluster);
+    let replica_store = Rc::clone(&store_rc);
+    let replica_status = std::sync::Arc::clone(&status);
     rt.spawn_on_shard(async move {
         run_replica_control(
             TokioRuntime::new(),
-            cluster,
-            store_rc,
+            replica_cluster,
+            replica_store,
             databases,
             policy_name,
             reserved_bits,
-            status,
+            replica_status,
             raft,
             self_node_id,
             failover,
         )
         .await;
+    });
+
+    // --- IMPORT: the HA-6 data-copy control task that pulls a migrating slot's data when this
+    // node is the committed IMPORTING destination. Distinct from the replica control task above
+    // (a node can replicate some slots AND import another at the same time): this one drives the
+    // ADDITIVE per-slot merge into the SAME live store, never a store swap and never passive. It
+    // does nothing until a committed `SetSlotImporting` naming this node lands in the shared map.
+    rt.spawn_on_shard(async move {
+        run_import_control(TokioRuntime::new(), cluster, store_rc).await;
     });
 }
 
@@ -319,6 +345,17 @@ async fn run_primary_listener(
 /// snapshot (capturing the cut `end_offset` per CARRY-FORWARD 1), then loop [`drain_and_ship`]
 /// to stream the tail until the link drops.
 ///
+/// ## Two attach modes (HA-7d replica vs HA-6 slot-import), distinguished by a leading frame
+///
+/// A plain REPLICA sends [`Frame::ReplConf`] first and wants the WHOLE store: `slot_filter`
+/// stays `None`, the full-sync + tail are unfiltered, and this is the byte-identical HA-7d path.
+/// An IMPORTING DESTINATION sends [`Frame::ImportReq`] FIRST (then `REPLCONF`) to scope the
+/// attach to one migrating slot: `slot_filter` becomes `Some(slot)`, and BOTH the snapshot and
+/// the steady-state tail are filtered to keys hashing to that slot (`key_slot(key) == slot`).
+/// The source keeps OWNING + serving the slot throughout (ownership transfers only at the
+/// committed FLIP), so its live writes to the slot land in the tail and reach the importer until
+/// the FLIP makes the importer the owner and it stops importing.
+///
 /// The stream lives behind `Rc<RefCell<Option<_>>>` so each send/recv TAKES it out, awaits on
 /// the owned value, and puts it back -- no `RefCell` borrow crosses an `.await`.
 async fn serve_replica_conn(
@@ -331,14 +368,17 @@ async fn serve_replica_conn(
 ) {
     let stream = Rc::new(RefCell::new(Some(stream)));
 
-    // (1) Read the attach REPLCONF handshake (the replica names itself + its resume offset).
-    // A replica that has never synced sends ack 0; we always full-sync from scratch in this
-    // MVP (a partial resume from the tail is HA-7e), so the ack is read-and-acknowledged but
-    // the sync starts at the snapshot cut regardless. The handshake `ack` is the master's view
-    // of the replica's resume offset (HA-7e); a steady-state per-ack stream is an HA-7e follow-up.
+    // (1) Read the attach handshake. A leading IMPORTREQ scopes the transfer to ONE slot (an
+    // importing destination, HA-6 data-copy); otherwise it is a plain whole-store replica attach
+    // (HA-7d, `slot_filter == None`, byte-identical). Either way the REPLCONF handshake follows
+    // (the replica names itself + its resume offset). A replica that has never synced sends ack 0;
+    // we always full-sync from scratch in this MVP, so the ack is read-and-acknowledged but the
+    // sync starts at the snapshot cut regardless.
     let mut pending: Vec<u8> = Vec::new();
-    let Some(handshake_ack) = read_attach_handshake(&rt, &stream, &mut pending).await else {
-        return; // the replica closed / sent garbage before attaching.
+    let Some((slot_filter, handshake_ack)) =
+        read_attach_handshake(&rt, &stream, &mut pending).await
+    else {
+        return; // the peer closed / sent garbage before attaching.
     };
     // Publish that a replica is connected (PRIMARY side, HA-7e): connected_slaves -> 1 with the
     // replica's resume offset. INFO renders the `slaveN:` line + the master-side lag from this.
@@ -346,14 +386,21 @@ async fn serve_replica_conn(
 
     // (2) Drive the full sync. CARRY-FORWARD 1 (ATOMIC end_offset capture) is satisfied inside
     // `drive_full_sync_chunked` (see its doc + the cited code point): the cut is the ring head
-    // captured with NO `.await` between the head read and the first snapshot chunk pull.
-    if drive_full_sync_chunked(&rt, &stream, replid, &store_rc, &ring)
-        .await
-        .is_err()
-    {
+    // captured with NO `.await` between the head read and the first snapshot chunk pull. When
+    // `slot_filter` is `Some(slot)`, only that slot's keys are shipped (a scoped snapshot). The
+    // returned cut is THIS connection's per-connection send-cursor START (C1): the tail ships
+    // ops with offset strictly greater than it, from this connection's OWN cursor.
+    let Ok(cut) =
+        drive_full_sync_chunked(&rt, &stream, replid, &store_rc, &ring, slot_filter).await
+    else {
         status.set_replica_disconnected(); // the link dropped mid-sync; the replica re-syncs.
         return;
-    }
+    };
+    // C1: THIS connection's OWN send cursor, starting at the snapshot cut. The ring keeps no
+    // shared send cursor, so two concurrent consumers (e.g. this connection AND another replica
+    // / an importer draining the same source ring) each advance their OWN cursor and each see
+    // every tail op past it -- no split.
+    let mut send_cursor = cut;
 
     // (3) The steady-state tail: ship newly-observed ops in offset order. `drain_and_ship`
     // takes the ring borrow only for the bounded batch copy, releases it, then awaits the
@@ -362,13 +409,26 @@ async fn serve_replica_conn(
     // full-resync-on-gap). When the batch is empty, wait the poll interval (timer seam) so an
     // idle tail does not busy-spin. After EACH pass, publish the current head (PRIMARY side,
     // HA-7e) so INFO / CLUSTER SHARDS report the advancing master offset.
+    //
+    // SCOPED TAIL (HA-6): when `slot_filter` is `Some(slot)`, a frame whose key does NOT hash to
+    // the slot is DROPPED here on the source before the send (the importer wants only that slot's
+    // mutations). The drop does NOT desync the offset stream: the importer's apply path is
+    // ADDITIVE + offset-agnostic in import mode (see `run_import_tail`), so a missing offset is
+    // not a gap. A plain replica (`None`) keeps every frame, byte-identical.
     loop {
         let send_stream = Rc::clone(&stream);
         let rt_send = rt;
-        let outcome = drain_and_ship(&ring, TAIL_SHIP_BATCH, move |frame| {
+        let outcome = drain_and_ship(&ring, &mut send_cursor, TAIL_SHIP_BATCH, move |frame| {
             let stream = Rc::clone(&send_stream);
+            let pass = frame_in_slot(&frame, slot_filter);
             let bytes = frame.encode();
-            async move { send_bytes(&rt_send, &stream, bytes).await }
+            async move {
+                if pass {
+                    send_bytes(&rt_send, &stream, bytes).await
+                } else {
+                    Ok(()) // filtered out of a scoped slot-import tail; not an error.
+                }
+            }
         })
         .await;
         // Publish the advancing master head (and re-affirm the slave's last-known offset) so the
@@ -415,14 +475,16 @@ async fn serve_replica_conn(
 ///
 /// # Errors
 /// Returns `Err(())` if any frame send fails (the replica link dropped mid-sync); the caller
-/// drops the connection and the replica reconnects + re-syncs.
+/// drops the connection and the replica reconnects + re-syncs. On success returns the captured
+/// snapshot cut `end_offset` -- THIS connection's per-connection send-cursor START (C1).
 async fn drive_full_sync_chunked(
     rt: &TokioRuntime,
     stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
     replid: ReplId,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     ring: &Rc<RefCell<ReplRing>>,
-) -> Result<(), ()> {
+    slot_filter: Option<u16>,
+) -> Result<ReplOffset, ()> {
     // `now` for the snapshot's lazy-expiry skip (ADR-0003 clock seam), captured ONCE for the scan.
     let now = now_from_env();
 
@@ -445,6 +507,13 @@ async fn drive_full_sync_chunked(
             cursor = next;
             chunk
                 .into_iter()
+                // SCOPED SNAPSHOT (HA-6): when `slot_filter` is `Some(slot)`, ship ONLY keys
+                // hashing to it. The filter runs on the bounded chunk (at most FULLSYNC_CHUNK_MAX
+                // entries already in hand), so it is MEMORY-NEUTRAL: `snapshot_chunk` already
+                // bounds the per-chunk materialization, and filtering only drops entries from that
+                // bounded batch (it never widens it). A plain replica passes `None` -> every key
+                // ships, byte-identical to the HA-7d path.
+                .filter(|(_, key, _)| key_in_slot(key, slot_filter))
                 .map(|(db, key, kv)| {
                     Frame::SyncKv {
                         db,
@@ -461,29 +530,42 @@ async fn drive_full_sync_chunked(
     }
 
     // Terminate the stream with the cut offset (self-contained SYNCEND).
-    send_bytes(rt, stream, Frame::SyncEnd { end_offset }.encode()).await
+    send_bytes(rt, stream, Frame::SyncEnd { end_offset }.encode()).await?;
+    Ok(end_offset)
 }
 
-/// Read inbound bytes until the replica's attach `REPLCONF` arrives, returning `Some(ack)` with
-/// the replica's resume offset once it does (the handshake), or `None` if the socket closes /
-/// sends a malformed frame first. Any non-REPLCONF frame before the handshake is ignored (a stray
-/// heartbeat). `pending` carries the partial read buffer across reads. The `ack` is the master's
-/// view of the replica's resume offset, published into the node status for INFO (HA-7e).
+/// Read inbound bytes until the attach `REPLCONF` arrives, returning `Some((slot_filter, ack))`
+/// once it does (the handshake), or `None` if the socket closes / sends a malformed frame first.
+///
+/// A leading [`Frame::ImportReq`] (sent by an IMPORTING destination, HA-6 data-copy) BEFORE the
+/// REPLCONF scopes the attach to one slot: its slot is captured into `slot_filter` and returned
+/// alongside the `ack`. A plain replica sends no IMPORTREQ, so `slot_filter` is `None` and the
+/// transfer is the unfiltered whole-store HA-7d attach (byte-identical). Any OTHER non-REPLCONF
+/// frame before the handshake is ignored (a stray heartbeat). `pending` carries the partial read
+/// buffer across reads. The `ack` is the master's view of the peer's resume offset (HA-7e INFO).
 async fn read_attach_handshake(
     rt: &TokioRuntime,
     stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
     pending: &mut Vec<u8>,
-) -> Option<ReplOffset> {
+) -> Option<(Option<u16>, ReplOffset)> {
+    let mut slot_filter: Option<u16> = None;
     loop {
         // Drain any complete frames already buffered.
         loop {
             match Frame::decode(pending) {
                 Ok(Some((frame, consumed))) => {
                     pending.drain(..consumed);
-                    if let Frame::ReplConf { ack, .. } = frame {
-                        return Some(ack); // attached; carry the replica's resume offset.
+                    match frame {
+                        Frame::ReplConf { ack, .. } => {
+                            // Attached; carry the scope (if any) + the peer's resume offset.
+                            return Some((slot_filter, ack));
+                        }
+                        // A leading IMPORTREQ scopes this attach to one slot (HA-6 data-copy).
+                        // Record it and keep reading for the REPLCONF that follows.
+                        Frame::ImportReq { slot } => slot_filter = Some(slot),
+                        // Any other non-REPLCONF frame before the handshake: ignore, keep reading.
+                        _ => {}
                     }
-                    // A non-REPLCONF frame before the handshake: ignore, keep reading.
                 }
                 Ok(None) => break,              // need more bytes.
                 Err(FrameError) => return None, // malformed: drop the connection.
@@ -553,6 +635,23 @@ async fn run_replica_control(
     let mut last_contact_in_sync = false;
     loop {
         // Should THIS shard be a replica right now? (single-shard: replica of ANY slot.)
+        //
+        // H1 DUAL-ROLE GUARD (fail safe, never corrupt): on the single-shard model a shard
+        // serves ONE of {owner-importing, passive-replica} at a time, because the replica role
+        // SWAPS the whole store + marks it passive while the import role ADDITIVELY merges into
+        // the live store -- running both on one `Rc<RefCell<ShardStoreImpl>>` would clash (the
+        // swap discards the importer's merged keys; additive writes into a passive mirror have
+        // wrong delete semantics). So if THIS node is ALSO a committed importer of some slot, do
+        // NOT attach as a passive replica: skip to the idle poll until the import completes /
+        // aborts (then `any_importing_slot` clears and a later iteration attaches). The import
+        // control task holds the complementary guard. The multi-shard generalization (a distinct
+        // shard per role) is the real fix, tracked; here we guarantee no corruption.
+        if any_importing_slot(&cluster).is_some() {
+            down_since = None;
+            last_contact_in_sync = false;
+            rt.timer(POLL_INTERVAL).await;
+            continue;
+        }
         if let Some(slot) = any_replica_of_self(&cluster) {
             // Resolve the slot OWNER's advertised CLIENT endpoint; the repl listener is at
             // `repl_port` of that client port. `moved_target` returns None for an unassigned
@@ -892,6 +991,300 @@ async fn run_replica_tail(
     }
 }
 
+// ===========================================================================================
+// IMPORT (DESTINATION) SIDE -- HA-6 online slot migration data-copy
+// ===========================================================================================
+//
+// The IMPORTING destination of a migrating slot pulls the slot's data from the SOURCE (the
+// current owner) and applies it ADDITIVELY into its EXISTING live store, so by the time the
+// committed FLIP makes it the owner it already HAS every key in the slot. This is the live
+// data-copy MIGRATION.md describes (snapshot the migrating slot, stream incremental mutations,
+// flip in one Raft step), reusing the HA-5b snapshot + HA-7c tail transport scoped to one slot.
+//
+// THE KEY DIFFERENCE FROM REPLICA-ATTACH (`attach_once`): a replica SWAPS a fresh full-synced
+// store into the live handle and marks the shard PASSIVE. An importer must NOT do either: it
+// already OWNS other slots whose data must survive (a swap would discard them), and it actively
+// serves those slots (passive would wrongly stop their reaper + lazy-expiry). So the importer
+// INSERTS the scoped snapshot + the scoped tail directly into the live store via `insert_object`
+// (additive) / `delete`, leaving every other slot's data untouched.
+//
+// OFFSET-AGNOSTIC APPLY (why not `ReplicaApplier`): the source FILTERS the stream to the slot, so
+// the importer sees a SUBSET of the source's offset sequence (the other slots' offsets are
+// dropped on the source). A gap in offsets is therefore EXPECTED, not corruption, so the importer
+// applies each scoped frame unconditionally (additively + idempotently) rather than gating on
+// `offset == applied.next()`. Last-write-wins still holds: the snapshot loads first, then the
+// tail (every write after the snapshot cut) applies on top, in offset order on the wire.
+
+/// The IMPORT CONTROL task (HA-6 data-copy): poll the committed map on the timer cadence; when
+/// THIS node is the committed IMPORTING destination of some slot, run a scoped [`import_once`] to
+/// that slot's SOURCE (the slot's recorded migration peer = the current owner). Loops forever (the
+/// shard's lifetime), so a fresh `SetSlotImporting` is picked up, and a dropped import link is
+/// re-dialed while the slot is still IMPORTING here.
+///
+/// LIFECYCLE: IMPORTING (committed) -> import (snapshot + scoped tail, additive) -> the committed
+/// FLIP clears the IMPORTING tag -> `any_importing_slot` returns `None` (this node now OWNS the
+/// slot) -> the task falls through to the idle poll. A STABLE abort clears the tag the same way.
+/// It NEVER swaps the store and NEVER marks the shard passive, so it does not perturb the
+/// replica-of-a-slot path (the separate replica control task owns the swap/passive lifecycle) or
+/// the HA-8 promotion latch (which lives entirely in the replica control task). The default static
+/// path + raft-without-migration never reach here (no IMPORTING tag is ever committed).
+async fn run_import_control(
+    rt: TokioRuntime,
+    cluster: std::sync::Arc<ironcache_cluster::SlotMap>,
+    store_rc: Rc<RefCell<ShardStoreImpl>>,
+) {
+    loop {
+        // H1 DUAL-ROLE GUARD (fail safe, never corrupt): the import role merges ADDITIVELY into
+        // the LIVE store, but the replica role SWAPS the whole store + marks it PASSIVE. On the
+        // single-shard model the two cannot share one `Rc<RefCell<ShardStoreImpl>>` (an additive
+        // insert into a passive mirror has wrong delete semantics; a replica store swap would
+        // discard the importer's merged keys). So if THIS shard is acting as a passive replica --
+        // or is a committed replica of any slot (the replica control task is about to / has
+        // attached + swapped) -- do NOT run the import: skip to the idle poll until the replica
+        // role clears. The replica control task holds the complementary guard (it does not attach
+        // while this node is a committed importer). One of the two roles always yields, so the
+        // shard serves exactly one of {owner-importing, passive-replica} at a time -- no
+        // corruption. The multi-shard generalization (a distinct shard per role) is the real fix,
+        // tracked. The `is_passive` read borrows the store only for the synchronous flag check.
+        let acting_passive = store_rc.borrow().is_passive();
+        if acting_passive || any_replica_of_self(&cluster).is_some() {
+            rt.timer(POLL_INTERVAL).await;
+            continue;
+        }
+        // Is THIS node importing some slot right now? (the committed IMPORTING tag is set only on
+        // the destination, so a hit means this node is the importer.)
+        if let Some(slot) = any_importing_slot(&cluster) {
+            // Resolve the slot's SOURCE endpoint: when IMPORTING, the recorded migration peer is
+            // the SRC (the current owner), whose repl listener is at `repl_port` of its client
+            // port. `None` (peer not yet resolvable mid-formation) -> back off + re-check.
+            if let Some((host, src_client_port)) = cluster.migration_peer_endpoint(slot) {
+                if let Ok(src_addr) =
+                    format!("{host}:{}", repl_port(src_client_port)).parse::<SocketAddr>()
+                {
+                    // The committed-map predicate the tail polls so it STOPS once the FLIP / abort
+                    // clears the IMPORTING tag for THIS slot (re-reads the shared map each frame).
+                    let importing_cluster = std::sync::Arc::clone(&cluster);
+                    let is_still_importing = move || {
+                        importing_cluster.migration_state(slot)
+                            == ironcache_cluster::MigrationState::Importing
+                    };
+                    import_once(&rt, src_addr, slot, &store_rc, &is_still_importing).await;
+                    // M2 ABORT PURGE: the import returned (link drop / FLIP / abort). Purge the
+                    // partially-merged slot ONLY when the import truly ENDED WITHOUT WINNING the
+                    // slot: the IMPORTING tag has cleared (a committed FLIP or a STABLE abort) AND
+                    // this node does NOT own the slot. Then the merged keys are ORPHANS -- purge
+                    // them so an aborted migration does not LEAK memory across repeated attempts,
+                    // and so they cannot resurface as live if that slot is later assigned here
+                    // without a fresh migration. A committed FLIP-TO-SELF leaves `owns(slot)` true
+                    // -> KEEP every merged key (it is now ours). A bare LINK DROP while the slot is
+                    // STILL IMPORTING here is NOT a purge (the tag is still set): the loop re-dials
+                    // and the source's snapshot continues the merge, so in-progress data is never
+                    // churned. The purge is slot-scoped (the caller owns `key_slot`; the store stays
+                    // slot-agnostic) and observer-silent (these keys were never owned / replicated
+                    // out, so no downstream HA-7 replica must be told to delete them).
+                    if !is_still_importing() && !cluster.owns(slot) {
+                        let purged = store_rc
+                            .borrow_mut()
+                            .remove_keys_where(|key| key_slot(key) == slot);
+                        let _ = purged; // count is for tests / future observability.
+                    }
+                    // Back off briefly, then the loop re-checks the map: if the slot still IMPORTs
+                    // here, re-dial; if the FLIP cleared it, `any_importing_slot` is now None and we
+                    // idle.
+                    rt.timer(RECONNECT_BACKOFF).await;
+                    continue;
+                }
+            }
+            // Source not resolvable yet: back off and re-check.
+            rt.timer(RECONNECT_BACKOFF).await;
+        } else {
+            // Not importing anything (the steady state until a SetSlotImporting commits, OR after
+            // the FLIP made this node the owner): idle poll.
+            rt.timer(POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// Drive ONE import attach to the SOURCE at `src_addr` for `slot`: dial, send the scoped attach
+/// (`IMPORTREQ slot` then `REPLCONF`), apply the scoped full-sync ADDITIVELY into the LIVE store,
+/// then tail the scoped mutation stream additively until the link drops OR the FLIP clears the
+/// IMPORTING tag (the caller re-checks the map and stops). Returns when any terminal condition is
+/// reached (dial fail, sync fail, link drop, or the import is no longer wanted); the caller backs
+/// off + re-dials while the slot is still IMPORTING here.
+///
+/// `is_still_importing` is the committed-map predicate the tail polls so it STOPS promptly once
+/// the FLIP (or a STABLE abort) clears the IMPORTING tag -- the importer then owns the slot (or
+/// the migration aborted) and must not keep pulling.
+async fn import_once<F>(
+    rt: &TokioRuntime,
+    src_addr: SocketAddr,
+    slot: u16,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    is_still_importing: &F,
+) where
+    F: Fn() -> bool,
+{
+    // Dial the source's repl endpoint. A failed dial returns; the caller backs off + retries.
+    let Ok(stream) = rt.connect(src_addr).await else {
+        return;
+    };
+    let stream = Rc::new(RefCell::new(Some(stream)));
+
+    // Scope the attach to THIS slot: IMPORTREQ first (so the source filters its snapshot + tail),
+    // then the REPLCONF handshake the source's serve loop waits for. ack 0 -> full sync from
+    // scratch (the importer holds no prior offset for the slot in this MVP).
+    if !send_bytes_ok(rt, &stream, Frame::ImportReq { slot }.encode()).await {
+        return;
+    }
+    let handshake = Frame::ReplConf {
+        node: 0,
+        ack: ReplOffset::ZERO,
+    }
+    .encode();
+    if !send_bytes_ok(rt, &stream, handshake).await {
+        return;
+    }
+
+    // Receive the scoped full-sync ADDITIVELY into the LIVE store (no fresh store, no swap, no
+    // passive). Returns the cut offset on SYNCEND, or None on a mid-sync drop (the caller
+    // re-dials). The live store keeps all its OTHER slots' keys throughout.
+    let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let queue = Rc::new(RefCell::new(std::collections::VecDeque::<Frame>::new()));
+    if receive_scoped_snapshot(rt, &stream, store_rc, &pending, &queue)
+        .await
+        .is_none()
+    {
+        return; // the sync did not complete; re-dial.
+    }
+
+    // Tail the scoped mutation stream additively until the link drops or the import is no longer
+    // wanted (the FLIP / abort cleared the IMPORTING tag). Reuses the same recv buffers so any
+    // tail frames that raced ahead of SYNCEND are already queued.
+    run_import_tail(
+        rt,
+        &stream,
+        slot,
+        store_rc,
+        &pending,
+        &queue,
+        is_still_importing,
+    )
+    .await;
+}
+
+/// Receive a SCOPED full-sync ADDITIVELY into the LIVE store (HA-6 import): on `FULLSYNC` start
+/// loading, apply each `SyncKv` via `insert_object` (additive, into the existing store), and on
+/// `SyncEnd` return the cut offset. Returns `None` on a mid-sync drop / malformed entry / EOF
+/// before SYNCEND (the caller re-dials). Unlike [`receive_full_sync`] this NEVER builds a fresh
+/// store and NEVER swaps -- the importer's other slots must survive, so the snapshot is merged in.
+///
+/// No `RefCell` borrow crosses an `.await`: each frame is recv'd (store borrow not held), THEN the
+/// store is borrowed only for the synchronous `insert_object`, THEN dropped before the next recv.
+async fn receive_scoped_snapshot(
+    rt: &TokioRuntime,
+    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    pending: &Rc<RefCell<Vec<u8>>>,
+    queue: &Rc<RefCell<std::collections::VecDeque<Frame>>>,
+) -> Option<ReplOffset> {
+    let mut began = false;
+    loop {
+        let frame = next_frame(rt, stream, pending, queue).await?;
+        match frame {
+            Frame::FullSync { .. } => began = true,
+            Frame::SyncKv {
+                db, kvobj_bytes, ..
+            } => {
+                if !began {
+                    return None; // a data frame before FULLSYNC: protocol violation, re-dial.
+                }
+                let obj = decode_kvobj(&kvobj_bytes)?; // malformed -> re-dial.
+                // ADDITIVE merge into the LIVE store: insert the slot's key alongside this node's
+                // existing keys (every other slot untouched).
+                store_rc.borrow_mut().insert_object(db, obj);
+            }
+            Frame::SyncEnd { end_offset } => return Some(end_offset),
+            // A stray heartbeat, or a pre-SYNCEND StreamPut/StreamDel. This arm DISCARDS the frame
+            // (it was popped from the queue here, NOT deferred into the tail). That is safe ONLY
+            // because of the SOURCE ORDERING invariant: the in-tree source sends the WHOLE scoped
+            // snapshot before ANY tail frame -- `drive_full_sync_chunked` ships every SyncKv and
+            // the SyncEnd, and RETURNS, before `serve_replica_conn` enters its `drain_and_ship`
+            // tail loop. So no StreamPut/StreamDel can arrive before SYNCEND, and this arm only
+            // ever drops genuine non-data frames (a stray heartbeat). It is NOT relied upon that
+            // "the tail loop drains it afterwards" (it does not -- the frame is gone); the
+            // correctness rests on the source never emitting a tail frame inside the snapshot.
+            _ => {}
+        }
+    }
+}
+
+/// The IMPORT STEADY-STATE TAIL (HA-6): recv the SCOPED stream and apply each put/del ADDITIVELY
+/// into the LIVE store until the link drops OR the slot is no longer IMPORTING here (the committed
+/// FLIP / abort cleared it). Offset-agnostic by design (the source filtered the stream to the
+/// slot, so the importer sees a subsequence with expected gaps): every scoped frame is applied
+/// unconditionally + idempotently (a put overwrites in place, a delete of an absent key is a
+/// no-op), which is correct because the snapshot loaded first and the tail carries every write
+/// after the cut in wire order (last-write-wins).
+///
+/// No `RefCell` borrow crosses an `.await`: recv (no store borrow), then borrow for the
+/// synchronous apply, then drop before the next recv. The IMPORTING re-check is a cold map read
+/// between frames (never the hot path).
+async fn run_import_tail<F>(
+    rt: &TokioRuntime,
+    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    slot: u16,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    pending: &Rc<RefCell<Vec<u8>>>,
+    queue: &Rc<RefCell<std::collections::VecDeque<Frame>>>,
+    is_still_importing: &F,
+) where
+    F: Fn() -> bool,
+{
+    loop {
+        // Stop promptly once the FLIP (or a STABLE abort) cleared the IMPORTING tag: this node now
+        // OWNS the slot (the source serves MOVED) and must not keep pulling, or the migration was
+        // aborted. Checked BEFORE the next recv so a freshly-committed FLIP ends the import on the
+        // next frame boundary without waiting for the source to close the link.
+        if !is_still_importing() {
+            return;
+        }
+        let Some(frame) = next_frame(rt, stream, pending, queue).await else {
+            return; // link dropped / source closed: the caller re-checks the map + re-dials.
+        };
+        // Apply the scoped frame additively. A frame for a key NOT in our slot should never arrive
+        // (the source filters), but defend anyway: drop it rather than pollute another slot.
+        let now = now_from_env();
+        let mut store = store_rc.borrow_mut();
+        match frame {
+            Frame::StreamPut {
+                db,
+                key,
+                kvobj_bytes,
+                ..
+            } => {
+                if key_slot(&key) == slot {
+                    if let Some(obj) = decode_kvobj(&kvobj_bytes) {
+                        store.insert_object(db, obj);
+                    }
+                    // A malformed post-image on a scoped import is dropped (not a full-resync
+                    // trigger): the next snapshot on re-dial re-establishes the key. Defensive;
+                    // the source encodes with the same codec, so this never fires in practice.
+                }
+            }
+            Frame::StreamDel { db, key, .. } => {
+                if key_slot(&key) == slot {
+                    use ironcache_storage::Store;
+                    store.delete(db, &key, now);
+                }
+            }
+            // A non-stream frame (a stray heartbeat): nothing to apply.
+            _ => {}
+        }
+        // The store borrow drops here at end of scope, before the next recv.
+        drop(store);
+    }
+}
+
 /// The replication offset a STREAM frame (a `StreamPut` / `StreamDel`) carries, or `None` for a
 /// non-stream frame (a stray heartbeat / handshake). Used by the replica tail to observe the
 /// master's head (HA-7e); a stream frame's offset is a lower bound on the master head.
@@ -899,6 +1292,32 @@ fn stream_frame_offset(frame: &Frame) -> Option<ReplOffset> {
     match frame {
         Frame::StreamPut { offset, .. } | Frame::StreamDel { offset, .. } => Some(*offset),
         _ => None,
+    }
+}
+
+/// Whether `key` belongs in a transfer scoped by `slot_filter` (HA-6 data-copy). `None` (a plain
+/// whole-store replica attach) accepts EVERY key, so the replica path is byte-identical; `Some(s)`
+/// (an importing destination scoped to slot `s`) accepts only keys whose `key_slot` is `s`. Pure
+/// (CRC16/XMODEM over the hash-tag), no clock / rand / IO.
+#[must_use]
+fn key_in_slot(key: &[u8], slot_filter: Option<u16>) -> bool {
+    match slot_filter {
+        None => true,
+        Some(slot) => key_slot(key) == slot,
+    }
+}
+
+/// Whether a STREAM frame (a `StreamPut` / `StreamDel`) belongs in a tail scoped by `slot_filter`
+/// (HA-6 data-copy). A non-stream frame (a stray heartbeat) is always kept (it carries no key);
+/// a stream frame is kept iff its key hashes to the scoped slot. `None` keeps everything (the
+/// byte-identical replica tail).
+#[must_use]
+fn frame_in_slot(frame: &Frame, slot_filter: Option<u16>) -> bool {
+    match frame {
+        Frame::StreamPut { key, .. } | Frame::StreamDel { key, .. } => {
+            key_in_slot(key, slot_filter)
+        }
+        _ => true,
     }
 }
 
@@ -1246,8 +1665,10 @@ mod tests {
                     return;
                 }
                 let replid = ReplId::from_bytes([0xCD; 20]);
+                // Plain whole-store attach (no slot filter): the byte-identical HA-7d path.
                 let _ =
-                    drive_full_sync_chunked(&rt, &stream, replid, &prim_store, &prim_ring).await;
+                    drive_full_sync_chunked(&rt, &stream, replid, &prim_store, &prim_ring, None)
+                        .await;
             });
 
             // REPLICA task: dial, send REPLCONF, receive_full_sync into a fresh store.
@@ -1296,6 +1717,489 @@ mod tests {
                 "the replica's store matches the primary key-for-key after SYNCEND"
             );
         });
+    }
+
+    /// A consumer for `two_consumers_on_one_source_ring_each_receive_every_tail_op`: dial the
+    /// source, REPLCONF (plain whole-store attach), drain the snapshot to SYNCEND, then collect the
+    /// tail StreamPut keys until it has seen the post-attach key `live`, returning the tail key set.
+    async fn two_consumer_collect_tail(addr: SocketAddr) -> std::collections::BTreeSet<Vec<u8>> {
+        let rt = TokioRuntime::new();
+        let stream = loop {
+            match rt.connect(addr).await {
+                Ok(s) => break s,
+                Err(_) => rt.timer(Duration::from_millis(10)).await,
+            }
+        };
+        let stream = Rc::new(RefCell::new(Some(stream)));
+        send_bytes(
+            &rt,
+            &stream,
+            Frame::ReplConf {
+                node: 0,
+                ack: ReplOffset::ZERO,
+            }
+            .encode(),
+        )
+        .await
+        .expect("replconf");
+
+        let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let queue = Rc::new(RefCell::new(std::collections::VecDeque::<Frame>::new()));
+        let mut tail_keys: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        let mut past_syncend = false;
+        loop {
+            let Some(frame) = next_frame(&rt, &stream, &pending, &queue).await else {
+                break;
+            };
+            match frame {
+                Frame::SyncEnd { .. } => past_syncend = true,
+                Frame::StreamPut { key, .. } if past_syncend => {
+                    let done = key == b"live";
+                    tail_keys.insert(key);
+                    if done {
+                        break; // saw the post-attach write; done.
+                    }
+                }
+                _ => {}
+            }
+        }
+        tail_keys
+    }
+
+    /// C1 OVER REAL LOOPBACK (the production serve path): TWO concurrent consumers attach to ONE
+    /// source shard's ring via the live [`serve_replica_conn`] -- each on its OWN connection. A
+    /// write made on the source AFTER both have attached must reach BOTH through the tail. With the
+    /// OLD shared `send_cursor` the first connection's `drain_and_ship` advanced the one shared
+    /// cursor past the new op, so the SECOND connection silently shipped NOTHING for it (the split
+    /// / lost write). With the per-connection cursor each connection ships every op past its OWN
+    /// cursor, so BOTH receivers observe the post-attach write. This drives the exact wired path
+    /// (`serve_replica_conn` -> `drain_and_ship(&ring, &mut send_cursor, ...)`) the live listener
+    /// runs, with two consumers on one ring.
+    #[test]
+    fn two_consumers_on_one_source_ring_each_receive_every_tail_op() {
+        use ironcache_storage::{ExpireWrite, NewValue, Store};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener = bind_exclusive(addr).unwrap();
+
+            // The SOURCE shard store + observer/ring (the spawn_on_shard wiring).
+            let store_rc: Rc<RefCell<ShardStoreImpl>> = Rc::new(RefCell::new(
+                crate::serve::fresh_shard_store(2, "noeviction", 0),
+            ));
+            let ring = ReplRing::new(TAIL_RING_CAP, ReplOffset::ZERO);
+            store_rc
+                .borrow_mut()
+                .set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+            // One pre-existing key (part of the snapshot both consumers receive).
+            store_rc.borrow_mut().upsert(
+                0,
+                b"pre",
+                NewValue::Bytes(b"v0"),
+                ExpireWrite::Clear,
+                now_from_env(),
+            );
+
+            // The SOURCE serves EACH accepted connection with the production `serve_replica_conn`,
+            // both draining the SAME ring (the two-consumer fan-out). Accept exactly two.
+            let src_store = Rc::clone(&store_rc);
+            let src_ring = Rc::clone(&ring);
+            tokio::task::spawn_local(async move {
+                let rt = TokioRuntime::new();
+                let replid = ReplId::from_bytes([0x5a; 20]);
+                for _ in 0..2 {
+                    let (stream, _peer) = rt.accept(&listener).await.expect("accept");
+                    let store = Rc::clone(&src_store);
+                    let ring = Rc::clone(&src_ring);
+                    let status = std::sync::Arc::new(ReplNodeStatus::new());
+                    tokio::task::spawn_local(async move {
+                        serve_replica_conn(
+                            TokioRuntime::new(),
+                            stream,
+                            replid,
+                            store,
+                            ring,
+                            status,
+                        )
+                        .await;
+                    });
+                }
+                // Keep the listener task alive for the duration (the connections were spawned).
+                rt.timer(Duration::from_secs(5)).await;
+            });
+
+            // Start BOTH consumers (the helper `two_consumer_collect_tail` dials, REPLCONFs,
+            // drains the snapshot, then collects tail StreamPut keys until it sees `live`).
+            let c1 = tokio::task::spawn_local(two_consumer_collect_tail(addr));
+            let c2 = tokio::task::spawn_local(two_consumer_collect_tail(addr));
+            // After both have connected, make a POST-ATTACH write on the source. It must fan out to
+            // BOTH consumers' tails. A short timer lets both handshakes + snapshots complete first.
+            let writer_store = Rc::clone(&store_rc);
+            tokio::task::spawn_local(async move {
+                let rt = TokioRuntime::new();
+                rt.timer(Duration::from_millis(150)).await;
+                writer_store.borrow_mut().upsert(
+                    0,
+                    b"live",
+                    NewValue::Bytes(b"v1"),
+                    ExpireWrite::Clear,
+                    now_from_env(),
+                );
+            });
+
+            let r1 = c1.await.expect("consumer 1 joined");
+            let r2 = c2.await.expect("consumer 2 joined");
+            assert!(
+                r1.contains(b"live".as_slice()),
+                "consumer 1 received the post-attach tail write"
+            );
+            assert!(
+                r2.contains(b"live".as_slice()),
+                "consumer 2 ALSO received it -- the tail fanned out to BOTH, no split"
+            );
+        });
+    }
+
+    /// THE PER-SLOT SNAPSHOT FILTER (HA-6 source): with `slot_filter == Some(slot)`, the chunked
+    /// driver ships ONLY keys hashing to that slot; with `None` (the replica path) it ships every
+    /// key. Proven over real loopback: a primary populated with keys spread across many slots,
+    /// scoped to ONE slot, transfers exactly that slot's keys to the receiver and nothing else.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scoped_snapshot_ships_only_the_slots_keys() {
+        use ironcache_storage::{ExpireWrite, NewValue, Store};
+        use std::collections::VecDeque;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener = bind_exclusive(addr).unwrap();
+
+            // Populate a primary across MANY slots. Pick the target slot as the slot of one key,
+            // then record exactly which of the populated keys hash to it (the expected scoped set).
+            let store_rc: Rc<RefCell<ShardStoreImpl>> = Rc::new(RefCell::new(
+                crate::serve::fresh_shard_store(2, "noeviction", 0),
+            ));
+            let ring = ReplRing::new(TAIL_RING_CAP, ReplOffset::ZERO);
+            store_rc
+                .borrow_mut()
+                .set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+            let keys: Vec<String> = (0..120u32).map(|i| format!("key{i:04}")).collect();
+            let target_slot = key_slot(keys[0].as_bytes());
+            let mut expected: Vec<(u32, Vec<u8>)> = Vec::new();
+            {
+                let now = now_from_env();
+                let mut s = store_rc.borrow_mut();
+                for (i, k) in keys.iter().enumerate() {
+                    let db = (i % 2) as u32;
+                    s.upsert(
+                        db,
+                        k.as_bytes(),
+                        NewValue::Bytes(b"v"),
+                        ExpireWrite::Clear,
+                        now,
+                    );
+                    if key_slot(k.as_bytes()) == target_slot {
+                        expected.push((db, k.as_bytes().to_vec()));
+                    }
+                }
+            }
+            expected.sort();
+            assert!(
+                !expected.is_empty(),
+                "the target slot must have at least one key"
+            );
+
+            // SOURCE: accept, read the (scoped) handshake, drive the SCOPED full-sync.
+            let prim_store = Rc::clone(&store_rc);
+            let prim_ring = Rc::clone(&ring);
+            tokio::task::spawn_local(async move {
+                let rt = TokioRuntime::new();
+                let (stream, _peer) = rt.accept(&listener).await.expect("accept");
+                let stream = Rc::new(RefCell::new(Some(stream)));
+                let mut pending = Vec::new();
+                let Some((slot_filter, _ack)) =
+                    read_attach_handshake(&rt, &stream, &mut pending).await
+                else {
+                    return;
+                };
+                assert_eq!(
+                    slot_filter,
+                    Some(target_slot),
+                    "the source reads the IMPORTREQ scope from the handshake"
+                );
+                let replid = ReplId::from_bytes([0xAB; 20]);
+                let _ = drive_full_sync_chunked(
+                    &rt,
+                    &stream,
+                    replid,
+                    &prim_store,
+                    &prim_ring,
+                    slot_filter,
+                )
+                .await;
+            });
+
+            // IMPORTER: dial, send IMPORTREQ(target) then REPLCONF, COLLECT the SYNCKV keys.
+            let got = tokio::task::spawn_local(async move {
+                let rt = TokioRuntime::new();
+                let stream = loop {
+                    match rt.connect(addr).await {
+                        Ok(s) => break s,
+                        Err(_) => rt.timer(Duration::from_millis(10)).await,
+                    }
+                };
+                let stream = Rc::new(RefCell::new(Some(stream)));
+                send_bytes(
+                    &rt,
+                    &stream,
+                    Frame::ImportReq { slot: target_slot }.encode(),
+                )
+                .await
+                .expect("importreq");
+                send_bytes(
+                    &rt,
+                    &stream,
+                    Frame::ReplConf {
+                        node: 0,
+                        ack: ReplOffset::ZERO,
+                    }
+                    .encode(),
+                )
+                .await
+                .expect("replconf");
+
+                let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
+                let queue = Rc::new(RefCell::new(VecDeque::<Frame>::new()));
+                let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
+                loop {
+                    let Some(frame) = next_frame(&rt, &stream, &pending, &queue).await else {
+                        break;
+                    };
+                    match frame {
+                        Frame::SyncKv { db, key, .. } => out.push((db, key)),
+                        Frame::SyncEnd { .. } => break,
+                        _ => {}
+                    }
+                }
+                out.sort();
+                out
+            })
+            .await
+            .expect("importer joined");
+
+            assert_eq!(
+                got, expected,
+                "the scoped snapshot ships EXACTLY the target slot's keys, no others"
+            );
+        });
+    }
+
+    /// THE ADDITIVE DEST APPLY (HA-6 import): `receive_scoped_snapshot` merges the scoped snapshot
+    /// into the EXISTING live store via `insert_object`, leaving every OTHER slot's pre-existing
+    /// data intact (it never swaps a fresh store in, unlike the replica attach). Proven directly on
+    /// a store: pre-load an unrelated key, additively insert a slot key, assert BOTH survive.
+    #[test]
+    fn additive_insert_leaves_other_slots_intact() {
+        use ironcache_storage::{ExpireWrite, NewValue, Store};
+
+        let mut store = crate::serve::fresh_shard_store(2, "noeviction", 0);
+        let now = now_from_env();
+        // Pre-existing data on the dest in some OTHER slot (an owned slot the importer must keep).
+        store.upsert(
+            0,
+            b"keep-me",
+            NewValue::Bytes(b"original"),
+            ExpireWrite::Clear,
+            now,
+        );
+        let kept_slot = key_slot(b"keep-me");
+
+        // The migrating slot's key, ADDITIVELY inserted (the same call `receive_scoped_snapshot`
+        // uses). Pick a key that is in a DIFFERENT slot than `keep-me` so the two never collide.
+        let mut migrated_key = String::new();
+        for i in 0..200_000u32 {
+            let k = format!("m{i}");
+            if key_slot(k.as_bytes()) != kept_slot {
+                migrated_key = k;
+                break;
+            }
+        }
+        assert!(!migrated_key.is_empty(), "found a distinct-slot key");
+        // Build a KvObj the additive path inserts (mirror the wire round-trip: encode then decode).
+        store.upsert(
+            1,
+            migrated_key.as_bytes(),
+            NewValue::Bytes(b"imported"),
+            ExpireWrite::Clear,
+            now,
+        );
+        let obj = {
+            let mut cur = SnapshotCursor::START;
+            let mut found = None;
+            while !cur.is_done(store.databases()) {
+                let (chunk, next) = store.snapshot_chunk(cur, 64, now);
+                for (db, key, kv) in chunk {
+                    if db == 1 && &*key == migrated_key.as_bytes() {
+                        found = Some(kv);
+                    }
+                }
+                cur = next;
+            }
+            found.expect("the migrated key is in the store")
+        };
+        // Fresh dest store: pre-load ONLY the kept key, then ADDITIVELY insert the migrated obj.
+        let mut dest = crate::serve::fresh_shard_store(2, "noeviction", 0);
+        dest.upsert(
+            0,
+            b"keep-me",
+            NewValue::Bytes(b"original"),
+            ExpireWrite::Clear,
+            now,
+        );
+        dest.insert_object(1, obj); // <-- the additive merge (no swap).
+
+        // BOTH survive: the pre-existing other-slot key AND the additively-merged slot key.
+        assert_eq!(
+            dest.read(0, b"keep-me", now).unwrap().as_bytes(),
+            b"original",
+            "the pre-existing OTHER-slot key survives the additive import"
+        );
+        assert_eq!(
+            dest.read(1, migrated_key.as_bytes(), now)
+                .unwrap()
+                .as_bytes(),
+            b"imported",
+            "the additively-merged migrating-slot key is present"
+        );
+    }
+
+    /// M2 (the abort purge): the slot-scoped purge the import control task runs on an aborted /
+    /// un-won import removes EXACTLY the migrating slot's partially-merged keys from the live store,
+    /// leaving every OTHER slot's keys (the importer's owned data) intact. This is the same
+    /// `remove_keys_where(|k| key_slot(k) == slot)` call the import control task issues when the
+    /// import ends without owning the slot; here we drive it directly on a mixed-slot store.
+    #[test]
+    fn aborted_import_purge_removes_only_the_slot_keys() {
+        use ironcache_storage::{ExpireWrite, NewValue, Store};
+
+        let mut store = crate::serve::fresh_shard_store(2, "noeviction", 0);
+        let now = now_from_env();
+
+        // An OWNED key (some other slot) the importer must KEEP across the abort purge.
+        store.upsert(
+            0,
+            b"keep-me",
+            NewValue::Bytes(b"owned"),
+            ExpireWrite::Clear,
+            now,
+        );
+        let kept_slot = key_slot(b"keep-me");
+
+        // Several partially-merged keys ALL in ONE migrating slot (the import's payload). Find a
+        // hash-tag that lands in a different slot than `keep-me`, then co-locate the merged keys.
+        let migrating_slot = (0..200_000u32)
+            .map(|i| key_slot(format!("{{m{i}}}:x").as_bytes()))
+            .find(|&s| s != kept_slot)
+            .expect("a distinct slot");
+        let merged: Vec<String> = (0..5)
+            .map(|i| {
+                // Use the SAME hash tag so every merged key hashes to `migrating_slot`.
+                let tag_owner = (0..200_000u32)
+                    .find(|&j| key_slot(format!("{{m{j}}}:x").as_bytes()) == migrating_slot)
+                    .unwrap();
+                format!("{{m{tag_owner}}}:{i}")
+            })
+            .collect();
+        for k in &merged {
+            assert_eq!(
+                key_slot(k.as_bytes()),
+                migrating_slot,
+                "co-located in the slot"
+            );
+            store.upsert(
+                0,
+                k.as_bytes(),
+                NewValue::Bytes(b"imported"),
+                ExpireWrite::Clear,
+                now,
+            );
+        }
+        assert_eq!(store.len(), 1 + merged.len());
+
+        // THE PURGE (the import-abort cleanup): remove the migrating slot's keys.
+        let purged = store.remove_keys_where(|key| key_slot(key) == migrating_slot);
+        assert_eq!(purged, merged.len(), "all merged slot keys purged");
+
+        // The owned other-slot key SURVIVES; none of the slot's keys remain.
+        assert_eq!(store.read(0, b"keep-me", now).unwrap().as_bytes(), b"owned");
+        for k in &merged {
+            assert!(
+                store.read(0, k.as_bytes(), now).is_none(),
+                "the aborted import's slot key {k:?} is gone (no orphan leak)"
+            );
+        }
+        assert_eq!(store.len(), 1, "only the owned key remains");
+    }
+
+    /// The pure scope predicates: `None` (a plain replica attach) accepts every key + frame
+    /// (byte-identical), `Some(slot)` accepts only that slot's keys; a non-stream frame is always
+    /// kept (it carries no key).
+    #[test]
+    fn slot_scope_predicates_filter_correctly() {
+        let slot = key_slot(b"alpha");
+        // None == accept everything (the byte-identical replica path).
+        assert!(key_in_slot(b"alpha", None));
+        assert!(key_in_slot(b"beta", None));
+        // Some(slot) accepts only that slot's keys.
+        assert!(key_in_slot(b"alpha", Some(slot)));
+        // A key in a different slot is rejected (find one deterministically).
+        let other = (0..200_000u32)
+            .map(|i| format!("x{i}"))
+            .find(|k| key_slot(k.as_bytes()) != slot)
+            .expect("a distinct-slot key");
+        assert!(!key_in_slot(other.as_bytes(), Some(slot)));
+        // frame_in_slot: a non-stream frame is always kept; a stream frame is filtered by key.
+        assert!(frame_in_slot(
+            &Frame::ReplPing {
+                replid: ReplId::from_bytes([0u8; 20]),
+                offset: ReplOffset::ZERO,
+            },
+            Some(slot)
+        ));
+        assert!(frame_in_slot(
+            &Frame::StreamDel {
+                offset: ReplOffset(1),
+                db: 0,
+                key: b"alpha".to_vec(),
+            },
+            Some(slot)
+        ));
+        assert!(!frame_in_slot(
+            &Frame::StreamDel {
+                offset: ReplOffset(1),
+                db: 0,
+                key: other.into_bytes(),
+            },
+            Some(slot)
+        ));
     }
 
     /// A comparable `(db, key, encode_kvobj-bytes)` fingerprint of every live key, sorted; two

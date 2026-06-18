@@ -107,7 +107,8 @@ impl SimNode for ReplNode {
                 | Frame::SyncKv { .. }
                 | Frame::SyncEnd { .. }
                 | Frame::StreamPut { .. }
-                | Frame::StreamDel { .. } => {}
+                | Frame::StreamDel { .. }
+                | Frame::ImportReq { .. } => {}
             },
         }
     }

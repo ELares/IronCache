@@ -44,6 +44,15 @@ pub const SYNCEND: &[u8] = b"SYNCEND";
 pub const STREAMPUT: &[u8] = b"STREAMPUT";
 /// The STREAMDEL verb (primary -> replica: one steady-state delete in the tail stream).
 pub const STREAMDEL: &[u8] = b"STREAMDEL";
+/// The IMPORTREQ verb (IMPORTER -> SOURCE: scope this attach to ONE migrating slot).
+///
+/// HA-6 data-copy: sent by an IMPORTING destination right after dialing the source's repl
+/// listener, BEFORE the [`Frame::ReplConf`] attach handshake. It names the single slot whose
+/// keys + mutations the source should ship (a SCOPED snapshot+stream), so a slot migration
+/// reuses the HA-5b snapshot + HA-7c tail transport WITHOUT shipping the source's whole
+/// keyspace. A plain replica NEVER sends it (it wants the whole store), so the replica path is
+/// byte-identical: the source defaults to the unfiltered full transfer when no IMPORTREQ arrives.
+pub const IMPORTREQ: &[u8] = b"IMPORTREQ";
 
 /// A replication frame is malformed: a RESP framing error, or a complete command
 /// that is not a decodable replication frame (wrong verb / arity, a non-numeric
@@ -149,6 +158,18 @@ pub enum Frame {
         /// The key removed.
         key: Vec<u8>,
     },
+    /// `["IMPORTREQ", <slot>]` (IMPORTER -> SOURCE).
+    ///
+    /// HA-6 data-copy attach scope: the connecting node is the IMPORTING destination of `slot`
+    /// and wants only THAT slot's keys + mutations, not the whole store. Sent before the
+    /// [`Frame::ReplConf`] handshake; the source records the slot and FILTERS its full-sync
+    /// snapshot and its steady-state tail to keys hashing to it (`key_slot(key) == slot`). A
+    /// plain replica never sends it, so the source's default unfiltered transfer (and thus the
+    /// replica path) is byte-identical.
+    ImportReq {
+        /// The single slot whose keys + mutations the source should ship (scoped transfer).
+        slot: u16,
+    },
 }
 
 impl Frame {
@@ -201,6 +222,7 @@ impl Frame {
                 db.to_string().as_bytes(),
                 key,
             ]),
+            Frame::ImportReq { slot } => encode_command(&[IMPORTREQ, slot.to_string().as_bytes()]),
         }
     }
 
@@ -288,6 +310,12 @@ fn decode_args(args: &[Vec<u8>]) -> Result<Frame, FrameError> {
         let db = u32::try_from(parse_u64(&args[2])?).map_err(|_| FrameError)?;
         let key = args[3].clone();
         Ok(Frame::StreamDel { offset, db, key })
+    } else if verb.eq_ignore_ascii_case(IMPORTREQ) {
+        if args.len() != 2 {
+            return Err(FrameError);
+        }
+        let slot = u16::try_from(parse_u64(&args[1])?).map_err(|_| FrameError)?;
+        Ok(Frame::ImportReq { slot })
     } else {
         Err(FrameError)
     }
@@ -501,6 +529,11 @@ mod tests {
             db: 3,
             key: Vec::new(),
         });
+
+        // IMPORTREQ (HA-6 data-copy): the scoped-attach request, at the slot edges (0 and the
+        // last valid slot 16383).
+        assert_round_trips(&Frame::ImportReq { slot: 0 });
+        assert_round_trips(&Frame::ImportReq { slot: 16_383 });
     }
 
     /// Decode rejects malformed input rather than panicking or fabricating a frame:

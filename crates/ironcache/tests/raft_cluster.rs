@@ -744,6 +744,272 @@ fn raft_mode_slot_migration_asks_serves_under_asking_and_flips_to_moved() {
     clean_raft_logs(ports);
 }
 
+// `too_many_lines` + `needless_range_loop` allowed: ONE end-to-end HA-6 LIVE-DATA-COPY migration
+// flow, read in sequence, indexing parallel `clients[i]`/`ports[i]`.
+//
+// This is the STRENGTHENED migration loopback: unlike the redirect-protocol test above (which
+// FAKES the data move via `ASKING; SET` to isolate the ASK/ASKING/MOVED semantics), this one lets
+// the REAL live copy run -- the IMPORTING destination's import control task pulls the slot's data
+// from the source as a scoped snapshot PLUS a live mutation stream, applied additively, with NO
+// `ASKING; SET` faking. It proves BOTH halves of the copy:
+//   * the SNAPSHOT: several keys SET on the SOURCE owner BEFORE the migration land on the DEST.
+//   * the STREAM: a key UPDATED on the SOURCE DURING the migration (served locally because it is
+//     present on the still-owning source) reaches the DEST via the scoped tail.
+// After the committed FLIP, a PLAIN GET on the DEST (no ASKING) serves every key with its latest
+// value, and the SOURCE serves MOVED -- the dest actually HAS the data by FLIP time.
+#[test]
+#[allow(clippy::too_many_lines, clippy::needless_range_loop)]
+fn raft_mode_slot_migration_live_copies_snapshot_and_stream_to_dest() {
+    let timeout = Duration::from_secs(30);
+
+    let ports = [free_port(), free_port(), free_port()];
+    clean_raft_logs(ports);
+    let topo = three_node_topology(ports);
+
+    let ids = [ID0, ID1, ID2];
+    let _nodes: Vec<ShardSet> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| run_raft_node_for_test(ports[i], topo.clone(), id))
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let mut clients = Vec::new();
+        for p in ports {
+            clients.push(connect_retry(p).await);
+        }
+        let env = SystemEnv::new();
+
+        // ---- (1) Discover the leader (SRC, the owner).
+        let src_idx = {
+            let start = env.now();
+            let mut found = None;
+            'discover: loop {
+                for i in 0..3 {
+                    let peer = (i + 1) % 3;
+                    let reply = cmd(
+                        &mut clients[i],
+                        &["CLUSTER", "MEET", "127.0.0.1", &ports[peer].to_string()],
+                    )
+                    .await;
+                    if reply.starts_with("+OK") {
+                        found = Some(i);
+                        break 'discover;
+                    }
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            found.expect("a unique leader (SRC) must emerge")
+        };
+
+        // ---- (2) SRC MEETs both peers and claims the whole slot space (so it owns the slot).
+        for i in 0..3 {
+            if i == src_idx {
+                continue;
+            }
+            let r = cmd(
+                &mut clients[src_idx],
+                &["CLUSTER", "MEET", "127.0.0.1", &ports[i].to_string()],
+            )
+            .await;
+            assert!(r.starts_with("+OK"), "SRC MEET should commit, got {r:?}");
+        }
+        let r = cmd(
+            &mut clients[src_idx],
+            &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "SRC ADDSLOTSRANGE should commit, got {r:?}");
+
+        let dest_idx = (src_idx + 1) % 3;
+        let dest_port = ports[dest_idx];
+        let dest_synth_id = synth_meet_node_id("127.0.0.1", dest_port);
+        let src_announce_id = ids[src_idx];
+
+        // Several PRE-EXISTING keys in ONE fixed slot SRC owns (the snapshot's payload). They are
+        // co-located via a hash tag so every one hashes to the SAME slot, which is the migration
+        // unit. SET them on SRC BEFORE the migration so they are part of the slot's snapshot.
+        let pre_keys = ["{mig}:a", "{mig}:b", "{mig}:c", "{mig}:d"];
+        let slot = key_slot(pre_keys[0].as_bytes());
+        for k in &pre_keys {
+            assert_eq!(key_slot(k.as_bytes()), slot, "hash-tag co-locates the keys");
+            let r = cmd(&mut clients[src_idx], &["SET", k, "v0"]).await;
+            assert!(r.starts_with("+OK"), "pre-migration SET on SRC, got {r:?}");
+        }
+
+        // ---- (3a) MIGRATION HANDSHAKE, SOURCE LEG: SETSLOT <slot> MIGRATING <dest>.
+        let r = cmd(
+            &mut clients[src_idx],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "MIGRATING", &dest_synth_id],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "SETSLOT MIGRATING should commit, got {r:?}");
+
+        // Confirm the MIGRATING tag is LIVE on the leader before the IMPORTING leg (the leader fills
+        // the IMPORTING proposal's `dest` from the slot's recorded migration peer, which exists only
+        // once MIGRATING has APPLIED). An absent key on the migrating slot -ASKs to DEST once it is.
+        let expect_ask = format!("-ASK {slot} 127.0.0.1:{dest_port}");
+        let asked = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[src_idx], &["GET", "{mig}:absent"]).await;
+                if reply.starts_with(&expect_ask) {
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(asked, "the MIGRATING tag must be live on the leader (absent key -ASKs to DEST)");
+
+        // ---- (3b) MIGRATION HANDSHAKE, DESTINATION LEG: SETSLOT <slot> IMPORTING <src>. On apply
+        // this tags IMPORTING on EXACTLY the DEST node, which STARTS the DEST's import control task
+        // pulling the slot's scoped snapshot + tail from SRC (the live data copy).
+        let r = cmd(
+            &mut clients[src_idx],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "IMPORTING", src_announce_id],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "SETSLOT IMPORTING should commit, got {r:?}");
+
+        // Wait until the committed IMPORTING tag has APPLIED on DEST (probe with ASKING; GET, which
+        // is served locally only once IMPORTING is live -- the same positive signal the protocol
+        // test uses; we do NOT write any data through it).
+        let dest_importing_live = {
+            let start = env.now();
+            loop {
+                let ask = cmd(&mut clients[dest_idx], &["ASKING"]).await;
+                assert!(ask.starts_with("+OK"), "ASKING should reply +OK, got {ask:?}");
+                let reply = cmd(&mut clients[dest_idx], &["GET", pre_keys[0]]).await;
+                if !reply.starts_with("-MOVED") {
+                    break true; // served locally -> IMPORTING is applied on DEST
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(dest_importing_live, "the committed IMPORTING tag must apply on DEST");
+
+        // ---- (4) THE LIVE STREAM DURING MIGRATION: UPDATE a pre-existing key on SRC while the
+        // migration is live. The key is PRESENT on the still-owning SRC, so the SET is served
+        // LOCALLY on SRC (the migration redirect serves present keys), the write lands in SRC's
+        // store, SRC's observer enqueues it, and the DEST's scoped import tail must ship it across.
+        // We do NOT touch DEST here -- the ONLY path the new value can reach DEST is the live copy.
+        let r = cmd(&mut clients[src_idx], &["SET", pre_keys[0], "v1-during"]).await;
+        assert!(
+            r.starts_with("+OK"),
+            "a SET of a PRESENT key on the MIGRATING source is served locally, got {r:?}"
+        );
+
+        // CONVERGENCE GATE (during the window, BEFORE the flip): wait until the DEST's scoped
+        // import tail has applied BOTH the snapshot value of an untouched key AND the during-
+        // migration update -- observed via `ASKING; GET` on the still-IMPORTING DEST (served
+        // locally, no data written through it). Confirming convergence here proves the live copy
+        // (snapshot + stream) landed the data BEFORE the flip, so the flip cannot lose it. (A real
+        // deployment gates the flip on this apply-lag bound; MIGRATION.md's FENCING phase. Here the
+        // test waits for it explicitly, which is the same guarantee for the loopback.)
+        let converged = {
+            let start = env.now();
+            loop {
+                // The snapshot key (untouched, original value).
+                let ask = cmd(&mut clients[dest_idx], &["ASKING"]).await;
+                assert!(ask.starts_with("+OK"));
+                let snap = cmd(&mut clients[dest_idx], &["GET", pre_keys[1]]).await;
+                // The during-migration updated key (new value).
+                let ask = cmd(&mut clients[dest_idx], &["ASKING"]).await;
+                assert!(ask.starts_with("+OK"));
+                let upd = cmd(&mut clients[dest_idx], &["GET", pre_keys[0]]).await;
+                if snap.starts_with("$2\r\nv0") && upd.starts_with("$9\r\nv1-during") {
+                    break true; // the live copy converged on DEST during the window.
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            converged,
+            "the live copy (scoped snapshot + during-migration stream) must converge on DEST before the flip"
+        );
+
+        // ---- (5) THE FLIP: commit SETSLOT <slot> NODE <dest>. DEST becomes the owner; its import
+        // task sees IMPORTING cleared and stops. SRC serves MOVED.
+        let r = cmd(
+            &mut clients[src_idx],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", &dest_synth_id],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "the FLIP (SETSLOT NODE) should commit, got {r:?}");
+
+        // SRC now MOVEDs the slot's keys to DEST (the migration cleared by the committed FLIP).
+        let expect_moved = format!("-MOVED {slot} 127.0.0.1:{dest_port}");
+        let moved = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[src_idx], &["GET", pre_keys[1]]).await;
+                if reply.starts_with("-MOVED") {
+                    assert!(
+                        reply.starts_with(&expect_moved),
+                        "post-FLIP SRC must MOVED to DEST: expected {expect_moved:?}, got {reply:?}"
+                    );
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(moved, "after the FLIP, SRC must serve MOVED (not ASK) to DEST");
+
+        // ---- (6) THE PROOF: after the FLIP, DEST OWNS the slot and serves EVERY key on a PLAIN
+        // GET (no ASKING) -- the pre-existing snapshot keys at their values AND the during-migration
+        // updated key at its NEW value. The data was copied by the live snapshot + stream, NOT
+        // faked. Poll for the during-migration value first (it must converge through the tail).
+        let updated_on_dest = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[dest_idx], &["GET", pre_keys[0]]).await;
+                if reply.starts_with("$9\r\nv1-during") {
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            updated_on_dest,
+            "the DURING-migration update must reach DEST via the live stream (proves the tail)"
+        );
+        // The other pre-existing snapshot keys are present on DEST at their original value (proves
+        // the snapshot). A plain GET on the owner serves locally, no ASKING.
+        for k in &pre_keys[1..] {
+            let reply = cmd(&mut clients[dest_idx], &["GET", k]).await;
+            assert!(
+                reply.starts_with("$2\r\nv0"),
+                "pre-existing snapshot key {k:?} must be served by DEST post-FLIP, got {reply:?}"
+            );
+        }
+    });
+
+    clean_raft_logs(ports);
+}
+
 // `too_many_lines` + `needless_range_loop` allowed: ONE end-to-end HA-7d acceptance flow
 // (formation, owner+replica assignment, write-to-owner, replica attach + READONLY serve, MOVED on
 // write / non-READONLY read), read in sequence, indexing parallel `clients[i]`/`ports[i]`.

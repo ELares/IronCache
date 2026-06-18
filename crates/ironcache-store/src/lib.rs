@@ -2292,6 +2292,48 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         let entry = Entry::from_kvobj(obj);
         self.put_object(db, db_idx, &key, entry);
     }
+
+    /// Remove EVERY live key (across all databases) for which `pred(key)` is true, returning the
+    /// count removed. A LOCAL-CLEANUP primitive (HA-6 M2): when an aborted / un-won slot import
+    /// ends, the importer purges the partially-merged slot's keys (`pred = |k| key_slot(k) ==
+    /// slot`, the slot predicate supplied by the caller, which owns the protocol `key_slot` -- the
+    /// store stays slot-agnostic). Without this an aborted migration LEAKS the merged keys (memory,
+    /// and a future un-migrated re-assignment of that slot to this node would resurface stale data).
+    ///
+    /// Unlike [`Store::delete`] this does NOT fire the write observer: the purged keys belong to a
+    /// slot this node never OWNED and never replicated out, so a downstream HA-7 replica must NOT be
+    /// told to delete them (it correctly never had them). Accounting + the eviction hook ARE
+    /// credited (the bytes really leave the store) and a watched key's version IS bumped (a removal
+    /// is a modification), keeping every other invariant intact.
+    ///
+    /// Two phases per database so no table borrow is held across the mutation: COLLECT the matching
+    /// keys (a bounded owned `Vec`), then remove each via the crediting removal path.
+    pub fn remove_keys_where<P: Fn(&[u8]) -> bool>(&mut self, pred: P) -> usize {
+        let mut removed = 0usize;
+        for db_idx in 0..self.dbs.len() {
+            // Phase 1: collect the matching keys (release the table borrow before mutating).
+            let victims: Vec<Box<[u8]>> = self.dbs[db_idx]
+                .iter()
+                .filter(|e| pred(e.key()))
+                .map(|e| e.key().to_vec().into_boxed_slice())
+                .collect();
+            // Phase 2: remove each, crediting accounting + the eviction hook + the watch version,
+            // WITHOUT firing the write observer (this is local cleanup, not a replicated write).
+            for key in victims {
+                let db = db_idx as u32;
+                self.touch_watch(db, &key);
+                let h = self.key_hash(&key);
+                if let Ok(occ) = self.dbs[db_idx].find_entry(h, |e| e.key() == &*key) {
+                    let (obj, _) = occ.remove();
+                    let bytes = obj.accounted_bytes();
+                    self.account_sub(bytes);
+                    self.eviction.on_remove(db, &key, bytes);
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
 }
 
 /// One snapshot entry (HA-5b #60): the `(db, key, value)` triple the SNAPSHOT iterator
@@ -3010,6 +3052,89 @@ mod policy_swap_tests {
         assert_eq!(
             a.eviction.select_victim(&mut NoFreq),
             b.eviction.select_victim(&mut NoFreq)
+        );
+    }
+
+    /// M2 (the abort-purge primitive): `remove_keys_where` removes EVERY matching key across all
+    /// databases, leaves non-matching keys intact, credits accounting (used_memory drops), and
+    /// returns the count removed. (The HA-6 importer passes a slot predicate; here we use a key
+    /// prefix to test the primitive directly.)
+    #[test]
+    fn remove_keys_where_purges_matching_keys_across_dbs_and_credits_accounting() {
+        let mut store = store_with("noeviction");
+        let now = UnixMillis(0);
+        // Two "doomed" keys (prefix d) in different dbs, and two "kept" keys (prefix k).
+        store.upsert(0, b"d-one", NewValue::Bytes(b"x"), ExpireWrite::Clear, now);
+        store.upsert(1, b"d-two", NewValue::Bytes(b"y"), ExpireWrite::Clear, now);
+        store.upsert(0, b"k-one", NewValue::Bytes(b"a"), ExpireWrite::Clear, now);
+        store.upsert(2, b"k-two", NewValue::Bytes(b"b"), ExpireWrite::Clear, now);
+        assert_eq!(store.len(), 4);
+        let used_before = store.used_memory();
+
+        let removed = store.remove_keys_where(|key| key.starts_with(b"d-"));
+        assert_eq!(removed, 2, "both doomed keys removed");
+        assert_eq!(store.len(), 2, "only the kept keys remain");
+        // The doomed keys are gone; the kept keys survive (across the dbs they were in).
+        assert!(store.read(0, b"d-one", now).is_none());
+        assert!(store.read(1, b"d-two", now).is_none());
+        assert_eq!(store.read(0, b"k-one", now).unwrap().as_bytes(), b"a");
+        assert_eq!(store.read(2, b"k-two", now).unwrap().as_bytes(), b"b");
+        // Accounting was credited (the purged bytes left the per-shard counter).
+        assert!(
+            store.used_memory() < used_before,
+            "purged bytes credited from used_memory"
+        );
+
+        // A predicate matching nothing is a no-op returning 0.
+        assert_eq!(store.remove_keys_where(|_| false), 0);
+        assert_eq!(store.len(), 2);
+    }
+
+    /// M2 invariant: the purge is OBSERVER-SILENT (a local cleanup of never-owned import data is
+    /// NOT a replicated write). With an observer installed, removing keys via `remove_keys_where`
+    /// enqueues NOTHING onto the replication ring, whereas an ordinary `delete` does.
+    #[test]
+    fn remove_keys_where_does_not_fire_the_write_observer() {
+        use core::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        // A tiny capturing observer: counts on_remove calls.
+        #[derive(Debug, Default)]
+        struct Counter {
+            removes: Rc<StdRefCell<usize>>,
+        }
+        impl WriteObserver for Counter {
+            fn on_put(&mut self, _db: u32, _key: &[u8], _new: &Entry) {}
+            fn on_remove(&mut self, _db: u32, _key: &[u8]) {
+                *self.removes.borrow_mut() += 1;
+            }
+        }
+
+        let mut store = store_with("noeviction");
+        let now = UnixMillis(0);
+        let removes = Rc::new(StdRefCell::new(0usize));
+        store.set_write_observer(Box::new(Counter {
+            removes: Rc::clone(&removes),
+        }));
+
+        store.upsert(0, b"d-one", NewValue::Bytes(b"x"), ExpireWrite::Clear, now);
+        store.upsert(0, b"k-one", NewValue::Bytes(b"a"), ExpireWrite::Clear, now);
+
+        // The purge fires NO observer removal (silent local cleanup).
+        let purged = store.remove_keys_where(|key| key.starts_with(b"d-"));
+        assert_eq!(purged, 1);
+        assert_eq!(
+            *removes.borrow(),
+            0,
+            "remove_keys_where is observer-silent (no StreamDel shipped)"
+        );
+
+        // A normal delete, by contrast, DOES fire the observer (one removal observed).
+        assert!(store.delete(0, b"k-one", now));
+        assert_eq!(
+            *removes.borrow(),
+            1,
+            "an ordinary delete still fires the observer"
         );
     }
 }

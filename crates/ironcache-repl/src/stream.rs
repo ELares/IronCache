@@ -79,18 +79,31 @@ fn op_to_frame(op: StreamOp) -> Frame {
 /// Drain up to `max` not-yet-shipped ops off `ring` and ship them in offset order through the
 /// async frame `send` sink (PRIMARY, HA-7c).
 ///
-/// THE BORROW DISCIPLINE: the ring borrow is taken ONLY to check the resync latch and to copy
-/// a bounded batch of ops out (an O(max) read forward of the send cursor), then DROPPED before
-/// any `.await`. The sends happen after the borrow ends, so the store funnel (which shares the
-/// ring) is never blocked behind a network await.
+/// ## PER-CONNECTION cursor (C1: no shared fan-out cursor)
 ///
-/// Returns [`ShipOutcome::ResyncNeeded`] if the buffer overflowed (an un-acked op was evicted
-/// from the resume window); the CALLER then performs a fresh HA-7b full-sync and calls
-/// [`ReplRing::rebase`]. Returns [`ShipOutcome::LinkDown`] if a send fails, else
-/// [`ShipOutcome::Shipped`]`(n)`. The shipped ops stay RETAINED (for a possible re-send) until
-/// the replica acks them via [`ReplRing::ack`].
+/// `cursor` is THIS connection's OWN send cursor (the highest offset it has shipped). The ring
+/// holds NO shared send cursor, so two concurrent consumers each pass their OWN `cursor` and
+/// EACH receive every op past it -- the per-connection fan-out that replaces the old shared
+/// `send_cursor`, which split the tail (each op going to whichever consumer drained it first,
+/// the other silently missing it -> divergence). On success `cursor` is advanced past the
+/// shipped ops; the CALLER persists it across passes (and re-bases it to the cut after a fresh
+/// full-sync). The ring read is via the read-only [`ReplRing::ops_after`], which mutates nothing.
+///
+/// THE BORROW DISCIPLINE: the ring borrow is taken ONLY to check the resync latch / the
+/// fall-behind condition and to copy a bounded batch out (an O(max) read forward of `cursor`),
+/// then DROPPED before any `.await`. The sends happen after the borrow ends, so the store
+/// funnel (which shares the ring) is never blocked behind a network await.
+///
+/// Returns [`ShipOutcome::ResyncNeeded`] if the ring overflowed (an un-acked op was evicted) OR
+/// if THIS connection's `cursor` has fallen BELOW the oldest retained op (it fell behind the
+/// retained window): either way the next op this connection needs is gone, so the CALLER does a
+/// fresh HA-7b full-sync, re-bases `cursor` to the new cut, and (for the ring-overflow case)
+/// `rebase`s the ring. Returns [`ShipOutcome::LinkDown`] if a send fails, else
+/// [`ShipOutcome::Shipped`]`(n)`. The shipped ops stay RETAINED (for a possible re-send / the
+/// other consumers) until the replica acks them via [`ReplRing::ack`].
 pub async fn drain_and_ship<S, Fut>(
     ring: &Rc<RefCell<ReplRing>>,
+    cursor: &mut ReplOffset,
     max: usize,
     mut send: S,
 ) -> ShipOutcome
@@ -98,18 +111,30 @@ where
     S: FnMut(Frame) -> Fut,
     Fut: Future<Output = Result<(), ()>>,
 {
-    // --- Borrow the ring: check the gap latch, else copy a bounded batch out. RELEASE. ---
+    // --- Borrow the ring: check the gap / fall-behind, else copy a bounded batch out. RELEASE. ---
     let batch: Vec<StreamOp> = {
-        let mut r = ring.borrow_mut();
+        let r = ring.borrow();
         if r.needs_resync() {
-            // A resume-window gap: signal the caller to full-resync. The latch + the buffer
-            // re-base are left to the caller's resync path (it does the full-sync, then
-            // `rebase`s the buffer at the new cut), so this call ships nothing and does not
-            // mutate the buffer.
+            // A resume-window gap (the ring evicted an un-acked op): signal the caller to
+            // full-resync. The latch + the ring re-base are left to the caller's resync path
+            // (it full-syncs, re-bases `cursor` to the cut, then `rebase`s the ring), so this
+            // call ships nothing and does not mutate the ring.
             return ShipOutcome::ResyncNeeded;
         }
-        r.drain_batch(max)
+        // THIS connection fell behind the retained window: the next op it needs (cursor+1) is no
+        // longer retained, so it cannot be served forward -> full-resync THIS connection (the
+        // ring is untouched; other consumers that are still within the window keep streaming).
+        if !r.can_serve_from(*cursor) {
+            return ShipOutcome::ResyncNeeded;
+        }
+        r.ops_after(*cursor, max)
     }; // the ring borrow ends here, before any await below.
+
+    // Advance THIS connection's cursor before the awaits (the ops are about to be shipped; a
+    // send failure returns LinkDown and the caller re-attaches, re-basing the cursor anyway).
+    if let Some(last) = batch.last() {
+        *cursor = cursor.max_with(last.offset());
+    }
 
     // --- Await the sends; the ring borrow is already dropped. ---
     let n = batch.len();
@@ -195,12 +220,14 @@ impl ReplicaApplier {
                 kvobj_bytes,
             } => (offset, true, db, key, kvobj_bytes),
             Frame::StreamDel { offset, db, key } => (offset, false, db, key, Vec::new()),
-            // A non-stream frame on the tail (a stray heartbeat); nothing to apply, no gap.
+            // A non-stream frame on the tail (a stray heartbeat / a scoped-attach request that
+            // only ever flows the other way); nothing to apply, no gap.
             Frame::ReplConf { .. }
             | Frame::ReplPing { .. }
             | Frame::FullSync { .. }
             | Frame::SyncKv { .. }
-            | Frame::SyncEnd { .. } => return ApplyOutcome::Applied(self.applied),
+            | Frame::SyncEnd { .. }
+            | Frame::ImportReq { .. } => return ApplyOutcome::Applied(self.applied),
         };
 
         let expected = self.applied.next();
@@ -251,7 +278,8 @@ mod tests {
         // Ship synchronously through a Vec sink (the in-memory channel is always Ready).
         let shipped: Rc<RefCell<Vec<Frame>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = Rc::clone(&shipped);
-        let out = block_on(drain_and_ship(&ring, 16, move |f| {
+        let mut cursor = ReplOffset::ZERO;
+        let out = block_on(drain_and_ship(&ring, &mut cursor, 16, move |f| {
             let s = Rc::clone(&sink);
             async move {
                 s.borrow_mut().push(f);
@@ -259,6 +287,7 @@ mod tests {
             }
         }));
         assert_eq!(out, ShipOutcome::Shipped(1));
+        assert_eq!(cursor, ReplOffset(1), "the per-connection cursor advanced");
 
         // Apply on the replica from the cut at offset 0.
         let mut replica: ShardStore = ShardStore::new(4);
@@ -271,6 +300,121 @@ mod tests {
         }
         assert_eq!(applier.applied(), ReplOffset(1));
         assert_eq!(replica.read(0, b"k", NOW).unwrap().as_bytes(), b"v");
+    }
+
+    /// C1 (the per-connection fan-out, at the ship layer): TWO connections, each `drain_and_ship`
+    /// with its OWN cursor off the SAME ring, BOTH ship EVERY op -- no split. With the old shared
+    /// `send_cursor` the first drain would advance the shared cursor and the second would ship
+    /// NOTHING (the silent miss). Here each cursor is independent, so both replicas converge.
+    #[test]
+    fn two_connections_each_ship_every_op_no_split() {
+        let ring = ReplRing::new(64, ReplOffset::ZERO);
+        let mut primary: ShardStore = ShardStore::new(4);
+        primary.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        primary.upsert(0, b"a", NewValue::Bytes(b"1"), ExpireWrite::Clear, NOW);
+        primary.upsert(0, b"b", NewValue::Bytes(b"2"), ExpireWrite::Clear, NOW);
+
+        // Connection A ships from its own cursor.
+        let a_sink: Rc<RefCell<Vec<Frame>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut cursor_a = ReplOffset::ZERO;
+        {
+            let sink = Rc::clone(&a_sink);
+            let out = block_on(drain_and_ship(&ring, &mut cursor_a, 16, move |f| {
+                let s = Rc::clone(&sink);
+                async move {
+                    s.borrow_mut().push(f);
+                    Ok(())
+                }
+            }));
+            assert_eq!(out, ShipOutcome::Shipped(2));
+        }
+        // Connection B, with its OWN cursor, STILL ships both (A did not consume them).
+        let b_sink: Rc<RefCell<Vec<Frame>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut cursor_b = ReplOffset::ZERO;
+        {
+            let sink = Rc::clone(&b_sink);
+            let out = block_on(drain_and_ship(&ring, &mut cursor_b, 16, move |f| {
+                let s = Rc::clone(&sink);
+                async move {
+                    s.borrow_mut().push(f);
+                    Ok(())
+                }
+            }));
+            assert_eq!(
+                out,
+                ShipOutcome::Shipped(2),
+                "connection B ships BOTH ops too -- no split with A"
+            );
+        }
+        assert_eq!(a_sink.borrow().len(), 2);
+        assert_eq!(b_sink.borrow().len(), 2);
+        assert_eq!(cursor_a, ReplOffset(2));
+        assert_eq!(cursor_b, ReplOffset(2));
+
+        // Apply on TWO independent replicas; each converges both keys (proving no op was lost).
+        for sink in [&a_sink, &b_sink] {
+            let mut replica: ShardStore = ShardStore::new(4);
+            let mut applier = ReplicaApplier::new(ReplOffset::ZERO);
+            for f in sink.borrow().iter().cloned() {
+                assert!(matches!(
+                    applier.apply(&mut replica, f, NOW),
+                    ApplyOutcome::Applied(_)
+                ));
+            }
+            assert_eq!(replica.read(0, b"a", NOW).unwrap().as_bytes(), b"1");
+            assert_eq!(replica.read(0, b"b", NOW).unwrap().as_bytes(), b"2");
+        }
+    }
+
+    /// A per-connection cursor that has fallen BELOW the oldest retained op reports ResyncNeeded
+    /// (the next op it needs was evicted from the window), so that connection full-resyncs rather
+    /// than silently skipping. The ring itself is not mutated by the check.
+    #[test]
+    fn fallen_behind_cursor_reports_resync_needed() {
+        // cap-2 ring; produce 4 ops so the window holds only offsets 3,4 (1,2 evicted). The
+        // overflow also latches `must_resync`; ack past it to clear the latch but leave the
+        // window at {3,4}, so a cursor at 0 is below oldest_retained (3) -> fall-behind resync.
+        let ring = ReplRing::new(2, ReplOffset::ZERO);
+        let mut primary: ShardStore = ShardStore::new(4);
+        primary.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        for (k, v) in [
+            (b"a".as_slice(), b"1".as_slice()),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+        ] {
+            primary.upsert(0, k, NewValue::Bytes(v), ExpireWrite::Clear, NOW);
+        }
+        // Clear the overflow latch (a different consumer rebased) but keep the {3,4} window.
+        ring.borrow_mut().take_resync();
+        assert!(!ring.borrow().needs_resync());
+        assert_eq!(ring.borrow().oldest_retained(), ReplOffset(3));
+
+        // A connection still at offset 0 cannot be served op 1 (evicted): ResyncNeeded.
+        let mut behind = ReplOffset::ZERO;
+        let out = block_on(drain_and_ship(
+            &ring,
+            &mut behind,
+            16,
+            move |_f| async move { Ok(()) },
+        ));
+        assert_eq!(out, ShipOutcome::ResyncNeeded);
+        assert_eq!(
+            behind,
+            ReplOffset::ZERO,
+            "a resync does not advance the cursor"
+        );
+
+        // A connection already at offset 3 is still served op 4 (within the window).
+        let mut current = ReplOffset(3);
+        let out = block_on(drain_and_ship(
+            &ring,
+            &mut current,
+            16,
+            move |_f| async move { Ok(()) },
+        ));
+        assert_eq!(out, ShipOutcome::Shipped(1));
+        assert_eq!(current, ReplOffset(4));
     }
 
     /// Out-of-order and duplicate frames are classified without applying: a future offset is
@@ -328,7 +472,13 @@ mod tests {
         primary.upsert(0, b"a", NewValue::Bytes(b"1"), ExpireWrite::Clear, NOW);
         primary.upsert(0, b"b", NewValue::Bytes(b"2"), ExpireWrite::Clear, NOW); // overflow
 
-        let out = block_on(drain_and_ship(&ring, 16, move |_f| async move { Ok(()) }));
+        let mut cursor = ReplOffset::ZERO;
+        let out = block_on(drain_and_ship(
+            &ring,
+            &mut cursor,
+            16,
+            move |_f| async move { Ok(()) },
+        ));
         assert_eq!(out, ShipOutcome::ResyncNeeded);
         assert!(
             ring.borrow().needs_resync(),
@@ -348,7 +498,13 @@ mod tests {
         primary.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
         primary.upsert(0, b"a", NewValue::Bytes(b"1"), ExpireWrite::Clear, NOW);
 
-        let out = block_on(drain_and_ship(&ring, 16, move |_f| async move { Err(()) }));
+        let mut cursor = ReplOffset::ZERO;
+        let out = block_on(drain_and_ship(
+            &ring,
+            &mut cursor,
+            16,
+            move |_f| async move { Err(()) },
+        ));
         assert_eq!(out, ShipOutcome::LinkDown);
     }
 
