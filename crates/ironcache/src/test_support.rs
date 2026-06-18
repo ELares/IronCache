@@ -5,8 +5,9 @@
 //! plumbing. Not part of the binary's runtime path.
 
 use crate::serve::run_server;
-use ironcache_config::{ClusterMode, ClusterTopology, Config};
+use ironcache_config::{ClusterMode, ClusterTopology, Config, TlsMode};
 use ironcache_runtime::bootstrap::ShardSet;
+use std::path::PathBuf;
 
 /// Boot a real server on `127.0.0.1:port` across `shards` shards and return the running
 /// [`ShardSet`]. The caller keeps the handle alive for the server's lifetime and calls
@@ -26,6 +27,35 @@ pub fn run_server_for_test(port: u16, shards: usize) -> ShardSet {
         ..Config::default()
     };
     run_server(&config).expect("test server failed to bind")
+}
+
+/// Boot a real server with embedded TLS ENABLED (`tls = on`, #105) on `127.0.0.1:port` across
+/// `shards` shards, presenting the cert/key at `cert_path` / `key_path`, and return the running
+/// [`ShardSet`]. The client listener is TLS-only: a plaintext client to this port fails the
+/// handshake.
+///
+/// # Panics
+///
+/// Panics if the config fails to validate (e.g. an unreadable cert) or the server fails to bind.
+#[must_use]
+pub fn run_tls_server_for_test(
+    port: u16,
+    shards: usize,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        tls: TlsMode::On,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..Config::default()
+    };
+    config.validate().expect("test TLS config must validate");
+    run_server(&config).expect("test TLS server failed to bind")
 }
 
 /// Boot a real CLUSTER-mode server on `127.0.0.1:port` (single shard) with a static slot

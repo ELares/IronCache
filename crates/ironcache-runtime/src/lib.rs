@@ -138,6 +138,17 @@ pub mod tokio_rt;
 #[cfg(feature = "tokio")]
 pub use tokio_rt::TokioRuntime;
 
+// The embedded rustls CLIENT-listener TLS layer (#105, docs/design/TLS.md): the
+// `ClientStream` enum the serve loop reads/writes (plain TcpStream OR a rustls
+// TlsStream) plus the cert/key acceptor builder. Behind the `tls` feature (default
+// ON); with `tls` off the crate has no rustls dep and exposes only the plaintext
+// path (byte-unchanged). It is part of the I/O seam, NOT the Runtime trait: the
+// trait's `Stream` type is unchanged, so the cluster-bus / repl links are untouched.
+#[cfg(feature = "tls")]
+pub mod tls;
+#[cfg(feature = "tls")]
+pub use tls::{ClientStream, HANDSHAKE_TIMEOUT, TlsConfigError, accept_tls, build_acceptor};
+
 pub mod bootstrap;
 pub use bootstrap::{ShardConfig, ShardId, ShardSet, available_shards};
 

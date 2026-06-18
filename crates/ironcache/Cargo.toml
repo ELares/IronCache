@@ -61,6 +61,14 @@ ironcache-repl = { workspace = true }
 # peer's self-added announce entry (no synth/announce duplicate). The DEFAULT static path never
 # reaches this, so it adds no cost there. A leaf on the Runtime seam (no extra third-party deps).
 ironcache-clusterbus = { workspace = true }
+# Embedded transport TLS for the CLIENT listener (#105, docs/design/TLS.md). The boot wiring
+# builds the rustls acceptor (via ironcache-runtime's `build_acceptor`) when `tls = on` and names
+# the `tokio_rustls::TlsAcceptor` handle type it threads into each connection's serve closure; the
+# ClientStream + handshake live in ironcache-runtime. The `ring` provider is pinned at the
+# workspace level (no aws-lc-rs/cmake, no system OpenSSL) for the reproducible static build. When
+# `tls = off` (the default) the acceptor is never built and the serve path is plaintext
+# byte-unchanged.
+tokio-rustls = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
@@ -81,3 +89,7 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"
 # NOTE: `ironcache-clusterbus` is now a NORMAL dependency (above): the raft-mode MEET path uses
 # its `peer_node_id` to learn a MEET'd peer's real announce id. The `ha_transport` integration
 # test that drives a node-to-node connection over the Runtime seam still sees it through that.
+# The TLS acceptance test (tests/tls.rs, #105) drives a tokio-rustls CLIENT that trusts the
+# checked-in self-signed test cert; it parses that cert via rustls-pki-types' `PemObject`,
+# re-exported through tokio-rustls (already a normal dependency above), so it needs no extra
+# dev-dependency.

@@ -218,6 +218,29 @@ pub enum ClusterMode {
     Raft,
 }
 
+/// The embedded transport-TLS posture for the CLIENT listener (#105, docs/design/TLS.md).
+/// The default ([`TlsMode::Off`]) keeps the listener PLAINTEXT and byte-unchanged.
+///
+/// * [`Off`](TlsMode::Off) (DEFAULT): the client port speaks plaintext RESP exactly as before
+///   TLS existed. No cert/key is loaded; the rustls layer is never touched (the accept path
+///   returns a plain `TcpStream`, the hot path has no per-byte TLS cost).
+/// * [`On`](TlsMode::On) (OPT-IN): the client port is TLS-ONLY. Every accepted connection
+///   performs a rustls handshake (TLS 1.2/1.3, server-auth) BEFORE the RESP loop; a plaintext
+///   client to this port FAILS the handshake and is rejected (not hung). Requires
+///   [`Config::tls_cert_path`] + [`Config::tls_key_path`] (validated readable at boot).
+///
+/// A mixed both-ports posture (a separate `tls-port` alongside the plaintext port, the shape
+/// docs/design/TLS.md sketches) is a documented follow-up; v1 is off|on on the one client port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    /// Plaintext client listener (the default, byte-unchanged).
+    #[default]
+    Off,
+    /// TLS-only client listener (opt-in): every connection is rustls-terminated.
+    On,
+}
+
 /// The fully-resolved, effective configuration the server boots from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -330,8 +353,44 @@ pub struct Config {
     /// (the default) the log lives under [`std::env::temp_dir`], the pre-existing behavior
     /// (byte-unchanged), which is fine for tests and ephemeral nodes but is NOT durable across a
     /// `/tmp`-clearing reboot. TOML (`data_dir = "/var/lib/ironcache"`) + the `IRONCACHE_DATA_DIR`
-    /// env var. Meaningful only in raft-governance mode (the static path never reads it).
+    /// env var.
+    ///
+    /// PERSISTENCE (#58): `data_dir` is ALSO the on-disk SNAPSHOT location and the SINGLE enable
+    /// switch for durable persistence. When set, the serve layer LOADS any committed snapshot at
+    /// boot and WRITES `<data_dir>/dump-shard-<n>.icss` + `<data_dir>/dump.manifest` on `SAVE` /
+    /// `BGSAVE` (and on the periodic save policy below). When `None` (the default) persistence is
+    /// OFF: no snapshot is loaded or written, boot starts empty, and the hot write path is
+    /// byte-unchanged. (It is read by the PERSISTENCE path regardless of cluster mode; the Raft
+    /// log use of it is the separate raft-governance concern above.)
     pub data_dir: Option<PathBuf>,
+    /// The embedded transport-TLS posture for the CLIENT listener (#105, docs/design/TLS.md).
+    /// Defaults to [`TlsMode::Off`] (plaintext, byte-unchanged). [`TlsMode::On`] makes the
+    /// client port TLS-only and REQUIRES [`Self::tls_cert_path`] + [`Self::tls_key_path`]. TOML
+    /// (`tls = "on"`) + the `IRONCACHE_TLS` env var.
+    pub tls: TlsMode,
+    /// Path to the PEM certificate CHAIN (leaf first, then any intermediates) the TLS listener
+    /// presents (#105). REQUIRED + readable when [`Self::tls`] is [`TlsMode::On`]; ignored when
+    /// off. TOML (`tls_cert_path = "..."`) + the `IRONCACHE_TLS_CERT_PATH` env var.
+    pub tls_cert_path: Option<PathBuf>,
+    /// Path to the PEM PRIVATE KEY (PKCS#8 / RSA / SEC1) matching [`Self::tls_cert_path`] (#105).
+    /// REQUIRED + readable when [`Self::tls`] is [`TlsMode::On`]; ignored when off. TOML
+    /// (`tls_key_path = "..."`) + the `IRONCACHE_TLS_KEY_PATH` env var.
+    pub tls_key_path: Option<PathBuf>,
+    /// The PERIODIC SAVE INTERVAL in SECONDS (#58 persistence save policy): when non-zero AND a
+    /// [`Self::data_dir`] is set, the server triggers a background save every `save_interval_secs`
+    /// seconds PROVIDED at least [`Self::save_min_changes`] keyspace writes have happened since the
+    /// last save (the Redis `save <seconds> <changes>` cadence, expressed as two scalars). `0`
+    /// (the DEFAULT) DISABLES the periodic save: only an explicit `SAVE` / `BGSAVE` persists, so
+    /// the default posture adds no background timer. TOML (`save_interval_secs = 900`) + the
+    /// `IRONCACHE_SAVE_INTERVAL_SECS` env var.
+    pub save_interval_secs: u64,
+    /// The MINIMUM keyspace writes (since the last save) the periodic save policy requires before
+    /// it fires (#58, the `changes` half of Redis `save <seconds> <changes>`). With the default
+    /// `0` an enabled interval saves unconditionally on each tick; a non-zero value skips a tick
+    /// when fewer than this many writes happened (avoiding a needless save of an idle keyspace).
+    /// Meaningful only when [`Self::save_interval_secs`] is non-zero. TOML (`save_min_changes = 1`)
+    /// + the `IRONCACHE_SAVE_MIN_CHANGES` env var.
+    pub save_min_changes: u64,
 }
 
 impl Default for Config {
@@ -384,6 +443,17 @@ impl Default for Config {
             // (byte-unchanged pre-existing behavior). Setting it makes the log durable
             // across a reboot that clears /tmp. Meaningful only in raft-governance mode.
             data_dir: None,
+            // TLS is OFF by default (#105): the client listener is plaintext and byte-unchanged.
+            // No cert/key is loaded and the rustls layer is never touched. Turning it on is opt-in
+            // and requires a cert + key.
+            tls: TlsMode::Off,
+            tls_cert_path: None,
+            tls_key_path: None,
+            // The PERIODIC SAVE policy is OFF by default (#58): 0 = no background save timer, so
+            // the default posture is unchanged (only an explicit SAVE/BGSAVE persists, and only
+            // when a data_dir is set). A non-zero interval + a data_dir enables the cadence.
+            save_interval_secs: 0,
+            save_min_changes: 0,
         }
     }
 }
@@ -537,6 +607,11 @@ impl Config {
                 });
             }
         }
+        // TRANSPORT TLS (#105, docs/design/TLS.md). A no-op when `tls = off` (the default), so the
+        // plaintext path is byte-unchanged; otherwise it requires a readable cert + key. Factored
+        // into a helper so `validate` stays within the line budget and the TLS pre-flight lives in
+        // one place.
+        self.validate_tls()?;
         // CLUSTER TOPOLOGY (CLUSTER_CONTRACT.md #70, slice 2). When cluster mode is enabled
         // AND a static topology is configured, it must be a COMPLETE, non-overlapping,
         // well-formed map that includes THIS node (by announce id). A topology is opt-in: a
@@ -573,6 +648,57 @@ impl Config {
                     ClusterMode::Raft => validate_raft_topology(topo, announce)?,
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validate the transport-TLS pre-flight (#105, docs/design/TLS.md). A NO-OP when `tls = off`
+    /// (the default), so the plaintext path is byte-unchanged. When `tls = on` (the TLS-only
+    /// client listener), a cert AND a key path are REQUIRED and both must be READABLE at boot: a
+    /// TLS-only listener with no usable cert/key would reject every handshake, so this is a LOUD
+    /// boot error (the operator sees it immediately) rather than a listener that silently refuses
+    /// all clients. The actual PEM parse + rustls acceptance happens at boot in the runtime layer;
+    /// here we only assert the paths are set and the files OPEN (a cheap, clear pre-flight: a
+    /// typo'd path or an unreadable key fails here with a precise field).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Invalid`] (`field = "tls_cert_path"` / `"tls_key_path"`) when TLS is
+    /// on and a path is missing or unreadable.
+    fn validate_tls(&self) -> Result<(), ConfigError> {
+        if self.tls != TlsMode::On {
+            return Ok(());
+        }
+        let cert = self
+            .tls_cert_path
+            .as_ref()
+            .ok_or_else(|| ConfigError::Invalid {
+                field: "tls_cert_path",
+                reason: "is required when tls = on (the TLS listener needs a certificate chain)"
+                    .to_owned(),
+            })?;
+        let key = self
+            .tls_key_path
+            .as_ref()
+            .ok_or_else(|| ConfigError::Invalid {
+                field: "tls_key_path",
+                reason: "is required when tls = on (the TLS listener needs a private key)"
+                    .to_owned(),
+            })?;
+        // Pre-flight readability: open each file so a bad path / permission problem is a clear boot
+        // error here, not an opaque handshake failure later. `field` is &'static str, so the
+        // offending path goes in `reason`.
+        if let Err(e) = std::fs::File::open(cert) {
+            return Err(ConfigError::Invalid {
+                field: "tls_cert_path",
+                reason: format!("cannot read certificate at {}: {e}", cert.display()),
+            });
+        }
+        if let Err(e) = std::fs::File::open(key) {
+            return Err(ConfigError::Invalid {
+                field: "tls_key_path",
+                reason: format!("cannot read private key at {}: {e}", key.display()),
+            });
         }
         Ok(())
     }
@@ -733,6 +859,25 @@ pub struct ConfigOverlay {
     /// (`data_dir = "/var/lib/ironcache"`, a string path) + the `IRONCACHE_DATA_DIR` env var.
     /// `None` leaves the lower layer (default `None` = the OS temp dir, byte-unchanged).
     pub data_dir: Option<PathBuf>,
+    /// The transport-TLS posture for the client listener (#105). TOML (`tls = "on"`) + the
+    /// `IRONCACHE_TLS` env var. `None` leaves the lower layer (default [`TlsMode::Off`],
+    /// plaintext byte-unchanged).
+    pub tls: Option<TlsMode>,
+    /// Path to the PEM certificate chain for the TLS listener (#105). TOML (`tls_cert_path =
+    /// "..."`, a string path) + the `IRONCACHE_TLS_CERT_PATH` env var. `None` leaves the lower
+    /// layer (default `None`).
+    pub tls_cert_path: Option<PathBuf>,
+    /// Path to the PEM private key for the TLS listener (#105). TOML (`tls_key_path = "..."`) +
+    /// the `IRONCACHE_TLS_KEY_PATH` env var. `None` leaves the lower layer (default `None`).
+    pub tls_key_path: Option<PathBuf>,
+    /// The periodic save interval in seconds (#58 persistence save policy). TOML
+    /// (`save_interval_secs = 900`) + the `IRONCACHE_SAVE_INTERVAL_SECS` env var. `None` leaves the
+    /// lower layer (default `0` = no periodic save).
+    pub save_interval_secs: Option<u64>,
+    /// The minimum keyspace writes the periodic save policy requires before firing (#58). TOML
+    /// (`save_min_changes = 1`) + the `IRONCACHE_SAVE_MIN_CHANGES` env var. `None` leaves the lower
+    /// layer (default `0`).
+    pub save_min_changes: Option<u64>,
 }
 
 impl ConfigOverlay {
@@ -753,6 +898,13 @@ impl ConfigOverlay {
 
     /// Build an overlay from `IRONCACHE_*` environment variables. Unset variables
     /// leave their field `None`. Size/number parse errors are returned.
+    ///
+    /// `too_many_lines` is allowed: this is a FLAT one-block-per-knob env reader (bind, port,
+    /// shards, maxmemory, policy, requirepass, cluster, the HA-8 knobs, data_dir, and the TLS
+    /// knobs). Each block is a self-contained `if let Ok(v) = env::var(..)`; splitting them into
+    /// helpers would scatter the single env-mapping surface for no readability gain. The same
+    /// precedent as the `validate` / `run_server` wiring points.
+    #[allow(clippy::too_many_lines)]
     pub fn from_env() -> Result<ConfigOverlay, ConfigError> {
         let mut o = ConfigOverlay::default();
         if let Ok(v) = std::env::var("IRONCACHE_BIND") {
@@ -846,6 +998,38 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_DATA_DIR") {
             o.data_dir = Some(PathBuf::from(v));
         }
+        // TRANSPORT TLS knobs (#105). The mode is a single scalar token (off/on, case-insensitive),
+        // env-encodable for per-pod injection; an unrecognized token hard-fails boot rather than
+        // silently picking a posture (mirrors `cluster_enabled` / `cluster_mode`). The cert/key are
+        // scalar paths taken verbatim (no parse can fail); their readability is checked in
+        // Config::validate when tls = on.
+        if let Ok(v) = std::env::var("IRONCACHE_TLS") {
+            o.tls = Some(parse_tls_mode(&v).ok_or_else(|| ConfigError::Invalid {
+                field: "tls",
+                reason: format!("not a TLS mode (expected off/on): {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_TLS_CERT_PATH") {
+            o.tls_cert_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_TLS_KEY_PATH") {
+            o.tls_key_path = Some(PathBuf::from(v));
+        }
+        // PERSISTENCE save-policy knobs (#58, single scalars, env-encodable for per-pod injection).
+        // Both are meaningful only when a data_dir is set; a malformed value hard-fails boot rather
+        // than silently picking a default (mirrors the other numeric knobs above).
+        if let Ok(v) = std::env::var("IRONCACHE_SAVE_INTERVAL_SECS") {
+            o.save_interval_secs = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "save-interval-secs",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_SAVE_MIN_CHANGES") {
+            o.save_min_changes = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "save-min-changes",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
         Ok(o)
     }
 
@@ -919,7 +1103,36 @@ impl ConfigOverlay {
         if let Some(ref v) = self.data_dir {
             cfg.data_dir = Some(v.clone());
         }
+        if let Some(v) = self.tls {
+            cfg.tls = v;
+        }
+        if let Some(ref v) = self.tls_cert_path {
+            cfg.tls_cert_path = Some(v.clone());
+        }
+        if let Some(ref v) = self.tls_key_path {
+            cfg.tls_key_path = Some(v.clone());
+        }
+        if let Some(v) = self.save_interval_secs {
+            cfg.save_interval_secs = v;
+        }
+        if let Some(v) = self.save_min_changes {
+            cfg.save_min_changes = v;
+        }
         Ok(())
+    }
+}
+
+/// Parse a transport-TLS mode token (#105), accepting `off` / `on` case-insensitively with
+/// surrounding whitespace trimmed (and the Redis-style `no`/`yes` spellings, mirroring
+/// [`parse_bool`], so an operator can write either). Returns `None` on any other token (the
+/// caller maps it to a config error). Used by the `IRONCACHE_TLS` env var; TOML deserializes
+/// [`TlsMode`] directly (lowercase-renamed serde).
+#[must_use]
+pub fn parse_tls_mode(s: &str) -> Option<TlsMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "no" | "false" | "0" => Some(TlsMode::Off),
+        "on" | "yes" | "true" | "1" => Some(TlsMode::On),
+        _ => None,
     }
 }
 
@@ -1038,7 +1251,35 @@ mod tests {
         assert_ne!(c.raft_snapshot_threshold, 0);
         // No data directory by default: the Raft log lands under the OS temp dir (unchanged).
         assert!(c.data_dir.is_none());
+        // PERSISTENCE save policy is OFF by default (#58): no periodic save timer in the default
+        // posture (only an explicit SAVE/BGSAVE, and only when a data_dir is set).
+        assert_eq!(c.save_interval_secs, 0);
+        assert_eq!(c.save_min_changes, 0);
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn save_policy_parses_from_overlay_toml_and_env() {
+        // The overlay sets the periodic save policy; an unset overlay leaves the defaults (0/0).
+        let c = Config::resolve(&[ConfigOverlay {
+            save_interval_secs: Some(900),
+            save_min_changes: Some(1),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(c.save_interval_secs, 900);
+        assert_eq!(c.save_min_changes, 1);
+
+        // Unset -> the disabled defaults (byte-unchanged posture).
+        let unset = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert_eq!(unset.save_interval_secs, 0);
+        assert_eq!(unset.save_min_changes, 0);
+
+        // TOML form: two scalars deserialize into the Option<u64> overlay fields.
+        let o = ConfigOverlay::from_toml_str("save_interval_secs = 300\nsave_min_changes = 10\n")
+            .unwrap();
+        assert_eq!(o.save_interval_secs, Some(300));
+        assert_eq!(o.save_min_changes, Some(10));
     }
 
     #[test]
@@ -1142,6 +1383,124 @@ mod tests {
                 .unwrap();
         assert_eq!(o.min_replicas_to_write, Some(1));
         assert_eq!(o.min_replicas_max_lag, Some(5));
+    }
+
+    #[test]
+    fn tls_defaults_off_and_parses_off_or_on() {
+        // DEFAULT is Off (plaintext, byte-unchanged): no cert/key required, validate passes.
+        let c = Config::default();
+        assert_eq!(c.tls, TlsMode::Off);
+        assert_eq!(TlsMode::default(), TlsMode::Off);
+        assert!(c.tls_cert_path.is_none());
+        assert!(c.tls_key_path.is_none());
+        c.validate().expect("tls off needs no cert/key");
+
+        // The overlay sets the mode + paths; an unset overlay leaves the default Off.
+        let on = Config::resolve(&[ConfigOverlay {
+            tls: Some(TlsMode::On),
+            tls_cert_path: Some(PathBuf::from("/etc/ssl/cert.pem")),
+            tls_key_path: Some(PathBuf::from("/etc/ssl/key.pem")),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(on.tls, TlsMode::On);
+        assert_eq!(
+            on.tls_cert_path.as_deref(),
+            Some(std::path::Path::new("/etc/ssl/cert.pem"))
+        );
+        let unset = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert_eq!(unset.tls, TlsMode::Off);
+
+        // parse_tls_mode accepts off/on (+ no/yes/true/false/0/1), trimmed + case-insensitive.
+        for t in ["off", "OFF", " no ", "false", "0"] {
+            assert_eq!(parse_tls_mode(t), Some(TlsMode::Off), "{t:?} -> off");
+        }
+        for t in ["on", "ON", " yes ", "true", "1"] {
+            assert_eq!(parse_tls_mode(t), Some(TlsMode::On), "{t:?} -> on");
+        }
+        assert_eq!(parse_tls_mode("maybe"), None);
+        assert_eq!(parse_tls_mode(""), None);
+
+        // TOML deserializes the lowercase-renamed enum directly.
+        let o = ConfigOverlay::from_toml_str(
+            "tls = \"on\"\ntls_cert_path = \"/c.pem\"\ntls_key_path = \"/k.pem\"\n",
+        )
+        .unwrap();
+        assert_eq!(o.tls, Some(TlsMode::On));
+        assert_eq!(
+            o.tls_cert_path.as_deref(),
+            Some(std::path::Path::new("/c.pem"))
+        );
+        assert_eq!(
+            o.tls_key_path.as_deref(),
+            Some(std::path::Path::new("/k.pem"))
+        );
+    }
+
+    #[test]
+    fn tls_on_without_cert_or_key_fails_validate() {
+        // tls = on with NO cert path -> a precise field error.
+        let no_cert = Config {
+            tls: TlsMode::On,
+            ..Config::default()
+        };
+        assert!(matches!(
+            no_cert.validate().unwrap_err(),
+            ConfigError::Invalid {
+                field: "tls_cert_path",
+                ..
+            }
+        ));
+
+        // A guaranteed-readable file (this crate's own Cargo.toml), absolute via the manifest dir
+        // so it resolves regardless of the test's CWD. Used where the readability pre-flight must
+        // PASS so we reach the next check.
+        let readable_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        // tls = on with a cert but NO key -> the key field error (use a path that exists so the
+        // cert readability check passes and we reach the key check).
+        let with_cert_no_key = Config {
+            tls: TlsMode::On,
+            tls_cert_path: Some(readable_path.clone()),
+            ..Config::default()
+        };
+        assert!(matches!(
+            with_cert_no_key.validate().unwrap_err(),
+            ConfigError::Invalid {
+                field: "tls_key_path",
+                ..
+            }
+        ));
+
+        // tls = on with cert + key paths that do NOT exist -> a readability error on the cert.
+        let unreadable = Config {
+            tls: TlsMode::On,
+            tls_cert_path: Some(PathBuf::from("/nonexistent/cert.pem")),
+            tls_key_path: Some(PathBuf::from("/nonexistent/key.pem")),
+            ..Config::default()
+        };
+        let err = unreadable.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                field: "tls_cert_path",
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("cannot read"), "reason: {err}");
+
+        // tls = on with cert + key that DO exist (use a real file for both) validates: the
+        // readability pre-flight only opens the files, it does not parse the PEM (that is the
+        // runtime layer's job at boot).
+        let readable = Config {
+            tls: TlsMode::On,
+            tls_cert_path: Some(readable_path.clone()),
+            tls_key_path: Some(readable_path),
+            ..Config::default()
+        };
+        readable
+            .validate()
+            .expect("tls on with readable cert+key paths passes the pre-flight");
     }
 
     #[test]
