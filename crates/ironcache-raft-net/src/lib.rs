@@ -807,6 +807,9 @@ mod tests {
     /// A log-entry vector exercising every [`EntryPayload`] shape, including every
     /// [`ConfigCmd`] variant inside a `Config` payload. Factored out of the round-trip
     /// test so each stays under the line cap and the payload taxonomy is named once.
+    // A flat builder enumerating one entry per payload/ConfigCmd shape; it is intentionally long
+    // (it names the whole taxonomy in one place) and grows by one block per new variant.
+    #[allow(clippy::too_many_lines)]
     fn every_payload_kind_entries() -> Vec<LogEntry> {
         vec![
             LogEntry {
@@ -899,6 +902,32 @@ mod tests {
                     slots: vec![],
                     new_primary: "9999999999999999999999999999999999999999".to_owned(),
                 }),
+            },
+            LogEntry {
+                term: 10,
+                index: 17,
+                payload: EntryPayload::Config(ConfigCmd::SetSlotMigrating {
+                    // HA-6: slot-then-node wire shape must round-trip byte-for-byte (incl. the
+                    // boundary slot 16383).
+                    slot: 16_383,
+                    dest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                }),
+            },
+            LogEntry {
+                term: 10,
+                index: 18,
+                payload: EntryPayload::Config(ConfigCmd::SetSlotImporting {
+                    // HA-6: slot-then-src-then-dest wire shape must round-trip byte-for-byte; the
+                    // distinct src/dest ids prove both string fields decode in order.
+                    slot: 0,
+                    src: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                    dest: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                }),
+            },
+            LogEntry {
+                term: 10,
+                index: 19,
+                payload: EntryPayload::Config(ConfigCmd::SetSlotStable { slot: 8192 }),
             },
         ]
     }

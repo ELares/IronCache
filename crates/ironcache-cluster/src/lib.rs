@@ -58,7 +58,7 @@
 //!   clock; atomics and `std::sync::Mutex` carry no nondeterminism.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 
 /// The number of hash slots in the Redis-Cluster wire space (16384), re-exported from the
 /// protocol crate (the single source of the wire constant). A key's slot is its
@@ -70,6 +70,34 @@ pub const CLUSTER_SLOTS: u16 = ironcache_protocol::CLUSTER_SLOTS;
 /// partial map (mid-formation) carries it in the not-yet-claimed slots. [`SlotMap::owner`]
 /// returns `None` for it rather than indexing a bogus node.
 const UNASSIGNED: u16 = u16::MAX;
+
+/// The per-slot migration phase tag (HA-6 online slot migration). A COLD, purely-additive
+/// scalar stored in `migration_state[slot]` (an `AtomicU8`) PARALLEL to `owner`/`replicas`,
+/// NEVER read by the hot [`owns`](SlotMap::owns) path. The default static path (and raft mode
+/// before any `SETSLOT MIGRATING/IMPORTING` commits) leaves every slot at [`MigrationState::None`],
+/// so it is entirely inert and the routing is byte-unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationState {
+    /// Not migrating. The default for every slot; the static path never leaves this.
+    None,
+    /// `CLUSTER SETSLOT <slot> MIGRATING <dest>`: THIS node still OWNS the slot, but is shipping
+    /// its keys to `dest` (the index in `migration_peer[slot]`). A command on this slot whose
+    /// key is ALREADY GONE (migrated / never existed) is answered `-ASK <slot> <dest>` (a one-time
+    /// hint, NOT MOVED: ownership has not changed). Keys still present are served locally.
+    Migrating,
+    /// `CLUSTER SETSLOT <slot> IMPORTING <src>`: THIS node is RECEIVING the slot from `src` (the
+    /// index in `migration_peer[slot]`) but does NOT yet own it. A normal command is MOVED to the
+    /// real owner UNLESS the connection set the one-shot `ASKING` flag, in which case it is served
+    /// locally (the migrated key has arrived here).
+    Importing,
+}
+
+/// The migration-tag byte stored in the `AtomicU8` parallel array. Kept distinct from the public
+/// [`MigrationState`] enum so the in-memory representation is fixed (a `repr`-stable byte) and the
+/// enum can carry the peer index separately.
+const MIG_NONE: u8 = 0;
+const MIG_MIGRATING: u8 = 1;
+const MIG_IMPORTING: u8 = 2;
 
 /// One node's identity and advertised endpoint.
 ///
@@ -144,6 +172,27 @@ pub struct SlotMap {
     /// default static path is byte-unchanged (this array is all-[`UNASSIGNED`] unless an
     /// AssignReplica is committed). It is renumbered alongside `owner` on FORGET.
     replicas: Box<[AtomicU16; CLUSTER_SLOTS as usize]>,
+    /// Dense per-slot MIGRATION-PHASE tag (16 KiB of `AtomicU8`, boxed off-stack), PARALLEL to
+    /// `owner` (HA-6). `migration_state[slot]` is one of [`MIG_NONE`] / [`MIG_MIGRATING`] /
+    /// [`MIG_IMPORTING`]. This is a NEW, purely-additive COLD structure, mirroring how `replicas`
+    /// was added (HA-7d): it is read ONLY on the cold redirect path
+    /// ([`migration_state`](Self::migration_state)), written ONLY by the Raft apply path
+    /// ([`set_migrating`](Self::set_migrating) / [`set_importing`](Self::set_importing) /
+    /// [`clear_migration`](Self::clear_migration)), and NEVER touched by the hot `owns()` path or
+    /// the `mine[]` bitmap. So `owns()` stays a single `mine[slot]` atomic load and the default
+    /// static path is byte-unchanged (this array is all-[`MIG_NONE`] until a `SETSLOT MIGRATING /
+    /// IMPORTING` is committed). It is reset to [`MIG_NONE`] for a slot whenever its OWNER flips
+    /// (the FLIP clears any in-flight migration) and renumber-safe on FORGET (the tag is a phase,
+    /// not a node index, so a FORGET renumber does not touch it; the PEER index below IS renumbered).
+    migration_state: Box<[AtomicU8; CLUSTER_SLOTS as usize]>,
+    /// Dense per-slot MIGRATION-PEER node-index map (32 KiB of `AtomicU16`, boxed off-stack),
+    /// PARALLEL to `owner` (HA-6). For a slot tagged [`MIG_MIGRATING`] this is the DEST node index
+    /// (where keys are being shipped, the `-ASK` target); for [`MIG_IMPORTING`] it is the SRC node
+    /// index (the current owner the importer will adopt from). [`UNASSIGNED`] when the slot is not
+    /// migrating. Read only alongside `migration_state` on the cold redirect path; renumbered on
+    /// FORGET exactly like `replicas` (an index above the removed shifts down; an index equal to
+    /// the removed clears the migration). NEVER read by `owns()`.
+    migration_peer: Box<[AtomicU16; CLUSTER_SLOTS as usize]>,
     /// The index into `table.nodes` of THIS node. An atomic because FORGET can shift indices.
     /// Used ONLY on the cold projection / MOVED / mutation paths; [`owns`](Self::owns) does not
     /// read it (it reads `mine` instead).
@@ -298,6 +347,19 @@ fn new_mine_array(init: bool) -> Box<[AtomicBool; CLUSTER_SLOTS as usize]> {
         .expect("the vec is exactly CLUSTER_SLOTS long")
 }
 
+/// Allocate a dense `[AtomicU8; CLUSTER_SLOTS]` on the HEAP filled with `init` (the per-slot
+/// migration-phase tag, HA-6), avoiding an 8 KiB stack array (clippy::large_stack_arrays). Built
+/// via a `Vec` then converted to a boxed fixed-size array, mirroring [`new_mine_array`].
+fn new_mig_array(init: u8) -> Box<[AtomicU8; CLUSTER_SLOTS as usize]> {
+    let mut v: Vec<AtomicU8> = Vec::with_capacity(CLUSTER_SLOTS as usize);
+    for _ in 0..CLUSTER_SLOTS {
+        v.push(AtomicU8::new(init));
+    }
+    v.into_boxed_slice()
+        .try_into()
+        .expect("the vec is exactly CLUSTER_SLOTS long")
+}
+
 impl SlotMap {
     /// Build and validate a STATIC slot map from the resolved topology and THIS node's announce
     /// id (the slice-2 boot path, byte-for-byte unchanged in behaviour).
@@ -389,6 +451,10 @@ impl SlotMap {
             // No replicas at boot (the static path never assigns them; HA-7d's AssignReplica is
             // the only writer). All-UNASSIGNED keeps the cold replica-read path inert.
             replicas: new_owner_array(UNASSIGNED),
+            // No migration at boot (HA-6): all-NONE keeps the cold redirect path inert, so the
+            // static routing is byte-unchanged until a SETSLOT MIGRATING/IMPORTING commits.
+            migration_state: new_mig_array(MIG_NONE),
+            migration_peer: new_owner_array(UNASSIGNED),
             self_idx: AtomicU16::new(self_idx_u16),
             my_epoch: AtomicU64::new(0),
             current_epoch: AtomicU64::new(0),
@@ -419,6 +485,9 @@ impl SlotMap {
             owner: new_owner_array(UNASSIGNED),
             // No replicas at boot (HA-7d AssignReplica is the only writer; see the field doc).
             replicas: new_owner_array(UNASSIGNED),
+            // No migration at boot (HA-6); the cold redirect path stays inert (see the field docs).
+            migration_state: new_mig_array(MIG_NONE),
+            migration_peer: new_owner_array(UNASSIGNED),
             self_idx: AtomicU16::new(0),
             my_epoch: AtomicU64::new(0),
             current_epoch: AtomicU64::new(0),
@@ -530,12 +599,155 @@ impl SlotMap {
         rep.host == me.host && rep.port == me.port
     }
 
+    // ----- HA-6: per-slot migration state (cold, additive; NEVER read by owns()) -----
+
+    /// `slot`'s current migration phase (HA-6): [`MigrationState::None`] (not migrating),
+    /// [`MigrationState::Migrating`] (THIS node owns it but is shipping it OUT), or
+    /// [`MigrationState::Importing`] (THIS node is receiving it IN). A SINGLE relaxed-ordering
+    /// `AtomicU8` load of the parallel `migration_state[slot]`, allocation-free. COLD: the redirect
+    /// path consults it ONLY for an already-foreign-or-owned slot decision; the hot `owns()` path
+    /// never reads it, so the default static path (all-NONE) is byte-unchanged.
+    #[must_use]
+    pub fn migration_state(&self, slot: u16) -> MigrationState {
+        match self.migration_state[slot as usize].load(Ordering::Acquire) {
+            MIG_MIGRATING => MigrationState::Migrating,
+            MIG_IMPORTING => MigrationState::Importing,
+            // Any other byte (only ever MIG_NONE is written for "not migrating") is treated as None.
+            _ => MigrationState::None,
+        }
+    }
+
+    /// The advertised `(host, port)` of `slot`'s MIGRATION PEER (HA-6): the DEST when the slot is
+    /// MIGRATING (the `-ASK` redirect target) or the SRC when IMPORTING, or `None` when the slot is
+    /// not migrating / the peer index is unset / unknown. Computed under the node lock (cold path),
+    /// returning an OWNED `(String, u16)` so the caller holds no borrow into the locked table,
+    /// exactly like [`moved_target`](Self::moved_target).
+    #[must_use]
+    pub fn migration_peer_endpoint(&self, slot: u16) -> Option<(String, u16)> {
+        // Cheap pre-check OUTSIDE the lock: a non-migrating slot has no peer (the common case).
+        if self.migration_state[slot as usize].load(Ordering::Acquire) == MIG_NONE {
+            return None;
+        }
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = self.migration_peer[slot as usize].load(Ordering::Acquire);
+        if idx == UNASSIGNED {
+            return None;
+        }
+        table
+            .nodes
+            .get(idx as usize)
+            .map(|n| (n.host.to_string(), n.port))
+    }
+
+    /// The NODE ID of `slot`'s MIGRATION PEER (HA-6): the DEST id when the slot is MIGRATING, the
+    /// SRC id when IMPORTING, or `None` when the slot is not migrating / the peer index is unset /
+    /// unknown. The id-typed companion to [`migration_peer_endpoint`](Self::migration_peer_endpoint),
+    /// used by the raft-mode `SETSLOT IMPORTING` proposal builder to fill the `dest` field: the
+    /// command names only `src`, but the slot is already MIGRATING toward a known DEST (the MIGRATING
+    /// step of the handshake committed first), so the leader reads the recorded DEST here and tags
+    /// IMPORTING on EXACTLY that node (via `is_self(dest)`), never on the leader or a bystander.
+    /// Cold path (a node-lock read, only on a SETSLOT proposal).
+    #[must_use]
+    pub fn migration_peer_id(&self, slot: u16) -> Option<String> {
+        if self.migration_state[slot as usize].load(Ordering::Acquire) == MIG_NONE {
+            return None;
+        }
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = self.migration_peer[slot as usize].load(Ordering::Acquire);
+        if idx == UNASSIGNED {
+            return None;
+        }
+        table.nodes.get(idx as usize).map(|n| n.id.to_string())
+    }
+
+    /// `CLUSTER SETSLOT <slot> MIGRATING <dest>` apply ([`ConfigCmd::SetSlotMigrating`]): tag `slot`
+    /// MIGRATING with `dest` as the peer (the `-ASK` target). `dest` must be a known node. Writes
+    /// ONLY the parallel `migration_state` / `migration_peer` arrays; it does NOT touch `owner`,
+    /// `mine`, `replicas`, or `owns()`, so the slot stays OWNED by whoever owned it (this node, in
+    /// the source-side handshake). Inert on the hot path.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotMutError::UnknownNode`] if `dest` is not in the node table.
+    pub fn set_migrating(&self, slot: u16, dest: &str) -> Result<(), SlotMutError> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = table
+            .nodes
+            .iter()
+            .position(|n| n.id.as_ref() == dest)
+            .ok_or_else(|| SlotMutError::UnknownNode(dest.to_owned()))?;
+        // Publish the peer index FIRST, then the phase tag, both Release; a cold reader that sees
+        // MIG_MIGRATING is guaranteed to also see the matching peer index.
+        self.migration_peer[slot as usize].store(idx as u16, Ordering::Release);
+        self.migration_state[slot as usize].store(MIG_MIGRATING, Ordering::Release);
+        Ok(())
+    }
+
+    /// `CLUSTER SETSLOT <slot> IMPORTING <src>` apply ([`ConfigCmd::SetSlotImporting`]): tag `slot`
+    /// IMPORTING with `src` as the peer (the current owner the importer adopts from). `src` must be
+    /// a known node. Writes ONLY the parallel arrays; it does NOT touch `owner`, `mine`,
+    /// `replicas`, or `owns()`, so the slot is NOT yet owned by this node until the committed FLIP.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotMutError::UnknownNode`] if `src` is not in the node table.
+    pub fn set_importing(&self, slot: u16, src: &str) -> Result<(), SlotMutError> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let idx = table
+            .nodes
+            .iter()
+            .position(|n| n.id.as_ref() == src)
+            .ok_or_else(|| SlotMutError::UnknownNode(src.to_owned()))?;
+        self.migration_peer[slot as usize].store(idx as u16, Ordering::Release);
+        self.migration_state[slot as usize].store(MIG_IMPORTING, Ordering::Release);
+        Ok(())
+    }
+
+    /// `CLUSTER SETSLOT <slot> STABLE` apply ([`ConfigCmd::SetSlotStable`]) AND the FLIP-side
+    /// migration clear: reset `slot` to [`MigrationState::None`] (clears both the phase tag and the
+    /// peer index). Idempotent (clearing an already-clear slot is a no-op). Writes ONLY the parallel
+    /// arrays; never touches `owner`, `mine`, `replicas`, or `owns()`. Called by `SetSlotStable`
+    /// (abort a migration) and by [`set_slot_node`](Self::set_slot_node)'s caller after a committed
+    /// FLIP (the migration is complete once ownership transfers).
+    pub fn clear_migration(&self, slot: u16) {
+        // Clear the phase FIRST (so a cold reader stops treating the slot as migrating), then the
+        // peer index. Both Release.
+        self.migration_state[slot as usize].store(MIG_NONE, Ordering::Release);
+        self.migration_peer[slot as usize].store(UNASSIGNED, Ordering::Release);
+    }
+
     /// THIS node's entry (id + advertised endpoint), cloned out from under the node lock.
     #[must_use]
     pub fn me(&self) -> NodeEntry {
         let table = self.table.lock().expect("slot-map node lock poisoned");
         let idx = self.self_idx.load(Ordering::Acquire) as usize;
         table.nodes[idx].clone()
+    }
+
+    /// Whether `node_id` names THIS node (HA-6). Self is recognized FIRST by an exact id match, then
+    /// by the advertised `(host, port)` ENDPOINT against `me()` -- the SAME dual-identity recognition
+    /// `set_slot_node` / `is_replica_of_self` use: the same physical node can appear in the table
+    /// under MORE THAN ONE id (its own `empty_self` announce id AND a host:port-synthesized id a
+    /// peer's `CLUSTER MEET` added), so a committed `SetSlotImporting { dest }` that named the synth
+    /// id must still be recognized as self by endpoint. Returns false when `node_id` is unknown or
+    /// either entry is missing (a non-self / defensive case). It reads ONLY the node table, NEVER the
+    /// hot `mine[]` bitmap, so `owns()` is untouched.
+    #[must_use]
+    pub fn is_self(&self, node_id: &str) -> bool {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+        let me_idx = self.self_idx.load(Ordering::Acquire) as usize;
+        let Some(my_entry) = table.nodes.get(me_idx) else {
+            return false;
+        };
+        if my_entry.id.as_ref() == node_id {
+            return true;
+        }
+        // Fall back to the endpoint compare for the dual announce-id / synth-id identity.
+        table
+            .nodes
+            .iter()
+            .find(|n| n.id.as_ref() == node_id)
+            .is_some_and(|n| n.host == my_entry.host && n.port == my_entry.port)
     }
 
     /// All nodes, in table order, cloned out from under the node lock (the projection).
@@ -725,12 +937,19 @@ impl SlotMap {
     ///
     /// [`SlotMutError::UnknownNode`] if `node_id` is not in the node table.
     ///
-    /// DOCUMENTED SLICE-3 BOUNDARY: this is a single owner store with NO migration state, so a slot
-    /// flipped AWAY from self can briefly still be served locally by an in-flight request that read
-    /// `owns()` just before this store (and, symmetrically, a slot flipped TO self may be served a
-    /// moment late). This is the inherent SETSLOT-without-migration window; it is NOT a torn read
-    /// (each atomic is internally consistent). The durable fix is the slice-4 MIGRATING / IMPORTING
-    /// / ASK state machine, which gates serving during the handoff.
+    /// DOCUMENTED SLICE-3 BOUNDARY: this is a single owner store, so a slot flipped AWAY from self
+    /// can briefly still be served locally by an in-flight request that read `owns()` just before
+    /// this store (and, symmetrically, a slot flipped TO self may be served a moment late). This is
+    /// the inherent SETSLOT window; it is NOT a torn read (each atomic is internally consistent).
+    /// The HA-6 MIGRATING / IMPORTING / ASK state machine gates serving during the handoff so the
+    /// per-key cutover is clean; this single FLIP is the atomic ownership-transfer step at its end.
+    ///
+    /// HA-6: a committed FLIP also CLEARS any in-flight migration state on the slot (the migration
+    /// is complete once ownership transfers), so the source stops sending ASK and serves MOVED, and
+    /// the destination stops requiring ASKING. Clearing here keeps the FLIP atomic with the
+    /// migration teardown on EVERY node's apply (idempotent: clearing an already-clear slot is a
+    /// no-op), which is what makes a committed FLIP leave EXACTLY one owner and no stale migration
+    /// tag, on both endpoints, after they catch their logs up.
     pub fn set_slot_node(&self, slot: u16, node_id: &str) -> Result<(), SlotMutError> {
         let table = self.table.lock().expect("slot-map node lock poisoned");
         let idx = table
@@ -740,9 +959,29 @@ impl SlotMap {
             .ok_or_else(|| SlotMutError::UnknownNode(node_id.to_owned()))?;
         let idx_u16 = idx as u16;
         self.owner[slot as usize].store(idx_u16, Ordering::Release);
-        // Keep the self-ownership bitmap in lockstep: this slot is ours iff it now points at self.
-        let me = self.self_idx.load(Ordering::Acquire);
-        self.mine[slot as usize].store(idx_u16 == me, Ordering::Release);
+        // Keep the self-ownership bitmap in lockstep: this slot is ours iff the new owner IS self.
+        // Self is recognized by table INDEX (the common case) OR by advertised ENDPOINT (the
+        // dual-identity case, mirroring `is_replica_of_self`): the SAME physical node can appear in
+        // the table under MORE THAN ONE id -- its own `empty_self` announce id AND a host:port-
+        // synthesized id a peer's `CLUSTER MEET` added. A committed FLIP that names the synth id
+        // would point `owner[slot]` at the synth-id entry while `self_idx` points at the announce-id
+        // entry; both share this node's endpoint, so the endpoint compare correctly recognizes self
+        // either way (without it, a node would fail to claim a slot flipped to its own synth id and
+        // would MOVED to itself). owns() still reads ONLY this `mine[slot]` bit, unchanged.
+        let me = self.self_idx.load(Ordering::Acquire) as usize;
+        let is_self = idx == me
+            || match (table.nodes.get(idx), table.nodes.get(me)) {
+                (Some(new_owner), Some(my_entry)) => {
+                    new_owner.host == my_entry.host && new_owner.port == my_entry.port
+                }
+                // Defensive: a missing entry cannot be self.
+                _ => false,
+            };
+        self.mine[slot as usize].store(is_self, Ordering::Release);
+        // HA-6: the FLIP completes (or aborts) any migration on this slot. Clear the parallel
+        // migration arrays in lockstep with the owner store (cold path, never read by owns()).
+        self.migration_state[slot as usize].store(MIG_NONE, Ordering::Release);
+        self.migration_peer[slot as usize].store(UNASSIGNED, Ordering::Release);
         Ok(())
     }
 
@@ -884,6 +1123,21 @@ impl SlotMap {
                 r.store(UNASSIGNED, Ordering::Release);
             } else if idx != UNASSIGNED && idx > removed_u16 {
                 r.store(idx - 1, Ordering::Release);
+            }
+        }
+        // Renumber `migration_peer[]` identically (HA-6): a peer index strictly above `removed`
+        // shifts down by one, and any slot whose migration PEER (dest/src) was the removed node has
+        // its migration CLEARED (the peer is gone, so the in-flight migration can no longer
+        // complete). `migration_state[]` is the phase TAG (not a node index), so a slot whose peer
+        // is cleared also drops to MIG_NONE here to keep the two arrays consistent. `mine[]` is
+        // still untouched (the owns()-race reasoning is unchanged; neither array feeds owns()).
+        for slot in 0..CLUSTER_SLOTS as usize {
+            let idx = self.migration_peer[slot].load(Ordering::Acquire);
+            if idx == removed_u16 {
+                self.migration_peer[slot].store(UNASSIGNED, Ordering::Release);
+                self.migration_state[slot].store(MIG_NONE, Ordering::Release);
+            } else if idx != UNASSIGNED && idx > removed_u16 {
+                self.migration_peer[slot].store(idx - 1, Ordering::Release);
             }
         }
         if me > removed {
@@ -1240,6 +1494,29 @@ mod tests {
         let err = map.set_slot_node(0, ID2).unwrap_err();
         assert_eq!(err, SlotMutError::UnknownNode(ID2.to_owned()));
         assert_eq!(err.to_string(), format!("Unknown node {ID2}"));
+    }
+
+    /// HA-6 Finding 2: `is_self` recognizes THIS node by id, by advertised endpoint (the dual
+    /// announce-id / synth-id identity), and rejects a peer / an unknown id.
+    #[test]
+    fn is_self_recognizes_own_id_and_endpoint() {
+        let map = SlotMap::empty_self(ID0, "127.0.0.1", 7000);
+        // A second table entry with a DIFFERENT id but THIS node's endpoint (the synth-id case a
+        // peer's MEET adds): is_self must recognize it by host:port even though the id differs.
+        map.meet(node(ID2, "127.0.0.1", 7000));
+        // A genuine peer at a different endpoint.
+        map.meet(node(ID1, "127.0.0.1", 7001));
+
+        assert!(map.is_self(ID0), "own announce id is self");
+        assert!(
+            map.is_self(ID2),
+            "a synth id sharing this node's endpoint is self (endpoint compare)"
+        );
+        assert!(!map.is_self(ID1), "a peer at another endpoint is NOT self");
+        assert!(
+            !map.is_self("ffffffffffffffffffffffffffffffffffffffff"),
+            "an unknown id is NOT self"
+        );
     }
 
     #[test]
@@ -1624,6 +1901,130 @@ mod tests {
             map.replicas_of(8).is_empty(),
             "the forgotten node's replica entry is cleared"
         );
+    }
+
+    // ----- HA-6: online slot migration state (the new parallel migration_state/peer arrays) -----
+
+    #[test]
+    fn migration_state_set_and_clear_with_accessors_and_default_none() {
+        // self=ID0 owns slot 5; ID1 is a known peer. Default is None for every slot.
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.add_slots(&[5]).unwrap();
+        assert_eq!(map.migration_state(5), MigrationState::None);
+        assert!(map.migration_peer_endpoint(5).is_none());
+        assert!(map.migration_peer_id(5).is_none());
+
+        // SETSLOT 5 MIGRATING ID1: the slot is tagged MIGRATING with ID1 as the dest (ASK target);
+        // ownership is UNCHANGED (owns() still true) -- migration state never feeds owns().
+        map.set_migrating(5, ID1).unwrap();
+        assert_eq!(map.migration_state(5), MigrationState::Migrating);
+        assert_eq!(map.migration_peer_endpoint(5), Some(("h1".to_owned(), 2)));
+        // The id-typed peer accessor (HA-6 Finding 2: the IMPORTING proposal builder reads this for
+        // the dest) names the recorded migration peer.
+        assert_eq!(map.migration_peer_id(5).as_deref(), Some(ID1));
+        assert!(map.owns(5), "MIGRATING must not change owns()");
+        assert_eq!(map.owner_id(5).unwrap().as_ref(), ID0);
+
+        // STABLE clears it back to None (idempotent).
+        map.clear_migration(5);
+        assert_eq!(map.migration_state(5), MigrationState::None);
+        assert!(map.migration_peer_endpoint(5).is_none());
+        assert!(map.migration_peer_id(5).is_none());
+        map.clear_migration(5); // idempotent no-op
+        assert_eq!(map.migration_state(5), MigrationState::None);
+
+        // IMPORTING on a slot this node does NOT own (slot 6, owned by nobody here): tagged
+        // IMPORTING with ID1 as the src; owns() stays false.
+        map.set_importing(6, ID1).unwrap();
+        assert_eq!(map.migration_state(6), MigrationState::Importing);
+        assert_eq!(map.migration_peer_endpoint(6), Some(("h1".to_owned(), 2)));
+        assert!(!map.owns(6), "IMPORTING must not grant ownership");
+
+        // An unknown dest/src is rejected with the exact error (no mutation).
+        let err = map.set_migrating(5, ID2).unwrap_err();
+        assert_eq!(err, SlotMutError::UnknownNode(ID2.to_owned()));
+        let err = map.set_importing(7, ID2).unwrap_err();
+        assert_eq!(err, SlotMutError::UnknownNode(ID2.to_owned()));
+    }
+
+    /// THE owns()-INDEPENDENCE invariant (HA-6 FINDING): migration state must NEVER affect owns().
+    /// Drive a full migrating/importing/clear sequence and assert owns() reflects ONLY ownership at
+    /// every step, and that the default (no migration) is byte-identical to the pre-HA-6 behavior.
+    #[test]
+    fn migration_state_never_affects_owns() {
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.add_slots(&[0, 1, 2]).unwrap(); // self owns 0,1,2
+
+        // Snapshot owns() across all slots before any migration tag.
+        let before: Vec<bool> = (0..CLUSTER_SLOTS).map(|s| map.owns(s)).collect();
+        // Tag a self-owned slot MIGRATING, a foreign slot IMPORTING, then clear both.
+        map.set_migrating(0, ID1).unwrap();
+        map.set_importing(5000, ID1).unwrap();
+        let after_tag: Vec<bool> = (0..CLUSTER_SLOTS).map(|s| map.owns(s)).collect();
+        assert_eq!(
+            before, after_tag,
+            "tagging MIGRATING/IMPORTING must not change any owns()"
+        );
+        map.clear_migration(0);
+        map.clear_migration(5000);
+        let after_clear: Vec<bool> = (0..CLUSTER_SLOTS).map(|s| map.owns(s)).collect();
+        assert_eq!(
+            before, after_clear,
+            "clearing migration must not change owns()"
+        );
+    }
+
+    #[test]
+    fn set_slot_node_flip_clears_migration_state() {
+        // self=ID0 owns slot 5, MIGRATING to ID1. The committed FLIP (set_slot_node -> ID1) must
+        // transfer ownership AND clear the migration in one atomic apply (no stale ASK afterward).
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.add_slots(&[5]).unwrap();
+        map.set_migrating(5, ID1).unwrap();
+        assert_eq!(map.migration_state(5), MigrationState::Migrating);
+        assert!(map.owns(5));
+
+        // THE FLIP: ownership moves to ID1; migration state clears in lockstep.
+        map.set_slot_node(5, ID1).unwrap();
+        assert!(!map.owns(5), "the FLIP transfers ownership away");
+        assert_eq!(map.owner_id(5).unwrap().as_ref(), ID1);
+        assert_eq!(
+            map.migration_state(5),
+            MigrationState::None,
+            "the FLIP clears the migration state (no stale ASK)"
+        );
+        assert!(map.migration_peer_endpoint(5).is_none());
+    }
+
+    #[test]
+    fn forget_renumbers_and_clears_migration_peer() {
+        // self=ID0 (idx0), ID1 (idx1), ID2 (idx2). Slot 7 MIGRATING to ID2; slot 8 IMPORTING from
+        // ID1. FORGET ID1 (slotless): ID2 shifts idx2->idx1, slot 7's peer must STILL resolve to
+        // ID2; slot 8's peer (the removed ID1) must be CLEARED (migration abandoned).
+        let map = SlotMap::empty_self(ID0, "h0", 1);
+        map.meet(node(ID1, "h1", 2));
+        map.meet(node(ID2, "h2", 3));
+        map.add_slots(&[7]).unwrap(); // self owns slot 7 (so it can MIGRATE out)
+        map.set_migrating(7, ID2).unwrap();
+        map.set_importing(8, ID1).unwrap();
+        assert_eq!(map.migration_peer_endpoint(7), Some(("h2".to_owned(), 3)));
+        assert_eq!(map.migration_peer_endpoint(8), Some(("h1".to_owned(), 2)));
+
+        map.forget(ID1).unwrap();
+        assert_eq!(
+            map.migration_peer_endpoint(7),
+            Some(("h2".to_owned(), 3)),
+            "ID2's migration peer survives the reindex"
+        );
+        assert_eq!(
+            map.migration_state(8),
+            MigrationState::None,
+            "the forgotten peer's migration is cleared"
+        );
+        assert!(map.migration_peer_endpoint(8).is_none());
     }
 
     // ----- test-only helper: an owned owner id for a slot (mirrors the removed `owner()` ref) -----

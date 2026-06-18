@@ -105,22 +105,89 @@ async fn connect_retry(port: u16) -> TcpStream {
 /// Read until quiet (a small reply may arrive in one or two segments).
 async fn read_reply(client: &mut TcpStream) -> String {
     let mut acc = Vec::new();
-    loop {
-        let mut buf = [0u8; 8192];
-        let n = tokio::time::timeout(Duration::from_millis(250), client.read(&mut buf))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(0);
-        if n == 0 {
-            break;
+    // Up to ~120 * 1s reads: an absolute cap so a TRUE hang fails loudly instead of blocking
+    // forever. A complete reply normally arrives in milliseconds; the cap only bounds a hang.
+    for _ in 0..120 {
+        // Return as soon as ONE complete RESP reply is buffered. Do NOT break on a short or slow
+        // read: under load a reply can arrive split across reads or after a delay, and breaking
+        // early (the old fixed-250ms-timeout behaviour) returned a partial/empty string that
+        // desynced every subsequent request/response pair on the connection (a late reply then
+        // paired with the next request). Parsing for one complete reply keeps cmd() strictly
+        // request -> response under any timing.
+        if let Some(len) = resp_reply_len(&acc, 0) {
+            return String::from_utf8_lossy(&acc[..len]).into_owned();
         }
-        acc.extend_from_slice(&buf[..n]);
-        if n < buf.len() {
-            break;
+        let mut buf = [0u8; 8192];
+        // CRITICAL: distinguish a READ TIMEOUT from EOF. The old code mapped both to n==0 and
+        // returned immediately. Under heavy test oversubscription a server thread can be starved
+        // for seconds, so a reply that is genuinely COMING is delayed; returning early then left an
+        // empty/partial string AND, worse, the real reply later landed in the socket buffer where
+        // the NEXT command's read picked it up -> every subsequent request/response pair desynced.
+        // We must keep waiting for a pending reply (timeout -> continue), and only stop on real EOF
+        // / error, with a generous absolute cap so a true hang still fails (rather than blocking
+        // forever). A complete reply normally arrives in milliseconds; the cap only bounds a hang.
+        match tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf)).await {
+            Ok(Ok(0) | Err(_)) => break, // EOF (peer closed) or read error: stop
+            Ok(Ok(n)) => acc.extend_from_slice(&buf[..n]),
+            Err(_) => {} // read timeout: a reply may still be in flight -> keep waiting
         }
     }
+    // Absolute cap reached or EOF/error without a complete reply: return what we have so the
+    // caller's assertion fails loudly (a true hang) rather than silently desyncing.
     String::from_utf8_lossy(&acc).into_owned()
+}
+
+/// Byte length of the FIRST complete RESP reply at `buf[start..]`, or `None` if the buffer does not
+/// yet hold one complete reply. Handles RESP2 + RESP3 framing (simple/error/integer/null/bool/
+/// double/bignum lines; bulk/verbatim/blob-error strings; and array/set/push/map aggregates) so a
+/// test read returns EXACTLY one reply and never a partial that would desync the next command.
+fn resp_reply_len(buf: &[u8], start: usize) -> Option<usize> {
+    if start >= buf.len() {
+        return None;
+    }
+    let kind = buf[start];
+    // The type/header line ends at the first CRLF at or after start+1.
+    let mut i = start + 1;
+    let crlf = loop {
+        if i + 1 >= buf.len() {
+            return None; // header line not yet complete
+        }
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            break i;
+        }
+        i += 1;
+    };
+    let header = &buf[start + 1..crlf];
+    let after = crlf + 2;
+    match kind {
+        // Length-prefixed blobs: bulk string, verbatim string, blob error.
+        b'$' | b'=' | b'!' => {
+            let n: i64 = std::str::from_utf8(header).ok()?.parse().ok()?;
+            if n < 0 {
+                return Some(after); // $-1 null bulk
+            }
+            let end = after + n as usize + 2; // payload + CRLF
+            if end <= buf.len() { Some(end) } else { None }
+        }
+        // Aggregates: array, set, push (n elements); map (n key+value pairs).
+        b'*' | b'~' | b'>' | b'%' => {
+            let mut n: i64 = std::str::from_utf8(header).ok()?.parse().ok()?;
+            if n < 0 {
+                return Some(after); // *-1 null array
+            }
+            if kind == b'%' {
+                n = n.checked_mul(2)?;
+            }
+            let mut p = after;
+            for _ in 0..n {
+                p = resp_reply_len(buf, p)?;
+            }
+            Some(p)
+        }
+        // Everything else is a single CRLF-terminated line: simple string, error, integer, null,
+        // bool, double, big number (and any unknown type byte, best effort).
+        _ => Some(after),
+    }
 }
 
 /// Send a RESP array command (each arg a bulk string) and read the reply as a string.
@@ -380,6 +447,268 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
 
     // The ShardSets drop here (each signals its shards to drain); the raft control-plane threads
     // are detached and exit with the process. Clean the logs we created.
+    clean_raft_logs(ports);
+}
+
+// `too_many_lines` + `needless_range_loop` allowed: ONE end-to-end HA-6 online-slot-migration flow
+// (formation, SRC owns all, SETSLOT MIGRATING/IMPORTING handshake, -ASK for an absent key on SRC,
+// ASKING-then-serve on DEST, the committed FLIP, then MOVED on SRC + owns on DEST), read in
+// sequence, indexing parallel `clients[i]`/`ports[i]`.
+//
+// HONEST SCOPE NOTE (mirrors the HA-8 loopback note): the live DATA MOVE (the source dumping the
+// migrating slot's keys and streaming them to the destination) is NOT wired in this slice -- it
+// reuses the HA-5b snapshot + HA-7c stream transport, driven by a later slice. Here the data move is
+// TEST-DRIVEN: the destination-side key is written explicitly via `ASKING; SET` so the IMPORTING
+// node holds it, exactly as the real transfer would leave it. What is FULLY WIRED and proven here is
+// the part that cannot be stubbed: the committed migration STATE MACHINE (MIGRATING/IMPORTING via
+// committed ConfigCmds), the -ASK / ASKING / MOVED REDIRECT semantics over real sockets, and the
+// committed FLIP transferring ownership (after which SRC serves MOVED, never ASK).
+#[test]
+#[allow(clippy::too_many_lines, clippy::needless_range_loop)]
+fn raft_mode_slot_migration_asks_serves_under_asking_and_flips_to_moved() {
+    let timeout = Duration::from_secs(20);
+
+    let ports = [free_port(), free_port(), free_port()];
+    clean_raft_logs(ports);
+    let topo = three_node_topology(ports);
+
+    let ids = [ID0, ID1, ID2];
+    let _nodes: Vec<ShardSet> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| run_raft_node_for_test(ports[i], topo.clone(), id))
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let mut clients = Vec::new();
+        for p in ports {
+            clients.push(connect_retry(p).await);
+        }
+        let env = SystemEnv::new();
+
+        // ---- (1) Discover the leader (SRC, the owner) over the wire.
+        let src_idx = {
+            let start = env.now();
+            let mut found = None;
+            'discover: loop {
+                for i in 0..3 {
+                    let peer = (i + 1) % 3;
+                    let reply = cmd(
+                        &mut clients[i],
+                        &["CLUSTER", "MEET", "127.0.0.1", &ports[peer].to_string()],
+                    )
+                    .await;
+                    if reply.starts_with("+OK") {
+                        found = Some(i);
+                        break 'discover;
+                    }
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            found.expect("a unique leader (SRC) must emerge")
+        };
+
+        // ---- (2) SRC MEETs both peers and claims the WHOLE slot space (so it OWNS the migrating
+        // slot). The DEST is the leader's first peer; its committed synth id is host:port-derived.
+        for i in 0..3 {
+            if i == src_idx {
+                continue;
+            }
+            let r = cmd(
+                &mut clients[src_idx],
+                &["CLUSTER", "MEET", "127.0.0.1", &ports[i].to_string()],
+            )
+            .await;
+            assert!(r.starts_with("+OK"), "SRC MEET should commit, got {r:?}");
+        }
+        let r = cmd(
+            &mut clients[src_idx],
+            &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "SRC ADDSLOTSRANGE should commit, got {r:?}");
+
+        let dest_idx = (src_idx + 1) % 3;
+        let dest_port = ports[dest_idx];
+        // DEST is named by the SYNTH id SRC's MEET committed for it (every node learns DEST under
+        // that id), so MIGRATING <dest> and the FLIP NODE <dest> resolve on all nodes.
+        let dest_synth_id = synth_meet_node_id("127.0.0.1", dest_port);
+        // SRC is named by its ANNOUNCE id: SRC's self-AddNode (prepended by ADDSLOTSRANGE) committed
+        // SRC under its announce id on every node, so IMPORTING <src> resolves (a synth id would be
+        // unknown -- SRC was never MEET'd, only self-added -- and the apply would silently no-op).
+        let src_announce_id = ids[src_idx];
+
+        // A key in a fixed slot SRC owns; this slot will migrate to DEST.
+        let key = key_in_range(100, 100);
+        let slot = key_slot(key.as_bytes());
+
+        // ---- (3a) THE MIGRATION HANDSHAKE, SOURCE LEG (committed through the leader = SRC). SETSLOT
+        // <slot> MIGRATING <dest> records SRC's view (the migration peer = DEST) and is a committed
+        // ConfigCmd, so it applies on EVERY node's shared map.
+        let r = cmd(
+            &mut clients[src_idx],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "MIGRATING", &dest_synth_id],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "SETSLOT MIGRATING should commit, got {r:?}");
+
+        // ---- (4) -ASK: a GET for an ABSENT key in the migrating slot on SRC returns
+        // `-ASK <slot> <dest host:port>` (the key is not present locally on SRC -> it has migrated /
+        // never existed, so SRC hands the client to DEST -- a ONE-TIME hint, ownership unchanged).
+        // We poll this BEFORE the IMPORTING leg: a `+OK` propose ack returns on COMMIT, but the
+        // leader's shared map reflects the committed MIGRATING tag only once the control-plane task
+        // ADVANCES last_applied past it (a small commit-vs-apply gap). Confirming -ASK here proves
+        // the MIGRATING tag (and so the recorded migration peer = DEST) is LIVE on the leader, so the
+        // IMPORTING proposal it builds next reads the correct DEST as the tag target (Finding 2).
+        let expect_ask = format!("-ASK {slot} 127.0.0.1:{dest_port}");
+        let asked = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[src_idx], &["GET", &key]).await;
+                if reply.starts_with("-ASK") {
+                    assert!(
+                        reply.starts_with(&expect_ask),
+                        "expected {expect_ask:?}, got {reply:?}"
+                    );
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(asked, "an absent key on a MIGRATING slot must -ASK to the destination");
+
+        // ---- (3b) THE MIGRATION HANDSHAKE, DESTINATION LEG. SETSLOT <slot> IMPORTING <src> tags the
+        // DEST's view. The wire command names only the source; the leader fills the proposal's `dest`
+        // from the slot's recorded migration peer (DEST, confirmed live by the -ASK poll above), so
+        // apply tags IMPORTING on EXACTLY the DEST node (via `is_self(dest)`), never on the leader
+        // (SRC) or the third bystander node (Finding 2).
+        let r = cmd(
+            &mut clients[src_idx],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "IMPORTING", src_announce_id],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "SETSLOT IMPORTING should commit, got {r:?}");
+
+        // ---- (5) ASKING -> serve on DEST. DEST is IMPORTING the slot (does not own it yet), so a
+        // plain command there is MOVED to the owner (SRC). With ASKING set first, DEST serves the
+        // command LOCALLY. We use this to DRIVE THE (test-driven) DATA MOVE: `ASKING; SET` writes the
+        // migrated key on DEST, exactly as the real transfer would leave it. ASKING is ONE-SHOT, so
+        // each command that must be served on DEST is preceded by its own ASKING.
+        //
+        // First wait until the committed IMPORTING tag has APPLIED on DEST. The only signal a client
+        // can observe for that is `ASKING; <cmd>` being SERVED locally: a PLAIN command MOVEDs to the
+        // owner whether or not IMPORTING is live (a non-owner that has not yet applied IMPORTING also
+        // MOVEDs, and so does an importing-no-ASKING node), so polling a plain GET for MOVED cannot
+        // distinguish the two and would race the apply under load. Probe with `ASKING; GET` until it
+        // is served (a non-MOVED reply -- here `$-1`, the key absent on DEST), which positively
+        // confirms IMPORTING is applied. ASKING is one-shot, so each probe re-sends it.
+        let dest_importing_live = {
+            let start = env.now();
+            loop {
+                let ask = cmd(&mut clients[dest_idx], &["ASKING"]).await;
+                assert!(ask.starts_with("+OK"), "ASKING should reply +OK, got {ask:?}");
+                let reply = cmd(&mut clients[dest_idx], &["GET", &key]).await;
+                if !reply.starts_with("-MOVED") {
+                    break true; // served locally -> the committed IMPORTING tag is applied on DEST
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            dest_importing_live,
+            "the committed IMPORTING tag must apply on DEST so ASKING serves locally"
+        );
+        // (The contrast -- an IMPORTING DEST WITHOUT ASKING MOVEDs to the owner -- is a NEGATIVE
+        // property that races the one-shot flag state in a live concurrent cluster, so it is proven
+        // DETERMINISTICALLY by the pure unit test `serve::importing_dest_without_asking_is_moved_to_owner`
+        // rather than re-asserted flakily here. This loopback proves the POSITIVE end-to-end path:
+        // -ASK from the source, ASKING serves on the dest, and the FLIP -> MOVED below.)
+        //
+        // ASKING then SET on DEST: served locally (the migrated key now lives on DEST). Each command
+        // that must be served on DEST is self-contained (its own ASKING immediately precedes it), so
+        // it does not depend on any prior flag state.
+        let ask_ok = cmd(&mut clients[dest_idx], &["ASKING"]).await;
+        assert!(ask_ok.starts_with("+OK"), "ASKING should reply +OK, got {ask_ok:?}");
+        let set_on_dest = cmd(&mut clients[dest_idx], &["SET", &key, "migrated"]).await;
+        assert!(
+            set_on_dest.starts_with("+OK"),
+            "ASKING; SET on the IMPORTING DEST must be served locally, got {set_on_dest:?}"
+        );
+        // ASKING then GET on DEST: serves the value (the second leg of the -ASK redirect).
+        let ask_ok = cmd(&mut clients[dest_idx], &["ASKING"]).await;
+        assert!(ask_ok.starts_with("+OK"), "ASKING should reply +OK, got {ask_ok:?}");
+        let get_on_dest = cmd(&mut clients[dest_idx], &["GET", &key]).await;
+        assert!(
+            get_on_dest.starts_with("$8\r\nmigrated"),
+            "ASKING; GET on the IMPORTING DEST must serve the value locally, got {get_on_dest:?}"
+        );
+
+        // ---- (6) THE FLIP: commit SETSLOT <slot> NODE <dest> (ownership transfer). On apply, DEST
+        // owns and the migration clears on every node. SRC then serves MOVED (NOT ASK) to DEST.
+        let r = cmd(
+            &mut clients[src_idx],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", &dest_synth_id],
+        )
+        .await;
+        assert!(r.starts_with("+OK"), "the FLIP (SETSLOT NODE) should commit, got {r:?}");
+
+        // SRC now MOVEDs the key to DEST (not ASK): the migration is cleared by the committed FLIP.
+        let expect_moved_to_dest = format!("-MOVED {slot} 127.0.0.1:{dest_port}");
+        let moved = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[src_idx], &["GET", &key]).await;
+                if reply.starts_with("-MOVED") {
+                    assert!(
+                        reply.starts_with(&expect_moved_to_dest),
+                        "post-FLIP SRC must MOVED to DEST: expected {expect_moved_to_dest:?}, got {reply:?}"
+                    );
+                    break true;
+                }
+                // Until the FLIP applies, SRC still owns + is MIGRATING, so the absent key ASKs;
+                // keep polling until ownership has flipped (MOVED).
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(moved, "after the committed FLIP, SRC must serve MOVED (not ASK) to DEST");
+
+        // And DEST now OWNS the slot: a plain GET there (no ASKING) serves the value locally.
+        let owned_on_dest = {
+            let start = env.now();
+            loop {
+                let reply = cmd(&mut clients[dest_idx], &["GET", &key]).await;
+                if reply.starts_with("$8\r\nmigrated") {
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            owned_on_dest,
+            "after the FLIP, DEST owns the slot and serves the key locally with no ASKING"
+        );
+    });
+
     clean_raft_logs(ports);
 }
 

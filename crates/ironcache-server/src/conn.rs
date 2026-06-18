@@ -83,6 +83,14 @@ pub struct ConnState {
     /// node role, so on a non-replica / standalone node it is harmless (the routing only consults
     /// it on the cold replica-read path). RESET clears it back to read-write (Redis parity).
     pub readonly: bool,
+    /// The per-connection ONE-SHOT `ASKING` flag (HA-6 online slot migration). `ASKING` sets it;
+    /// the VERY NEXT command consumes it (whether or not it was a keyed command). When set, a keyed
+    /// command on a slot THIS node is IMPORTING is served LOCALLY instead of being redirected with
+    /// `-MOVED` to the (still-)owner -- this is the second leg of an `-ASK` redirect (the client
+    /// sends `ASKING` then re-issues the command at the destination). It is independent of node role
+    /// and consulted ONLY on the cold migration redirect path, so a non-importing / standalone node
+    /// is unaffected. RESET clears it (Redis parity), and the router clears it after each command.
+    pub asking: bool,
 }
 
 impl ConnState {
@@ -117,6 +125,8 @@ impl ConnState {
             // Read-write by default (the strong-read behavior unmodified clients expect); a client
             // opts into replica reads with READONLY (REPLICA_READ.md #147).
             readonly: false,
+            // No ASKING pending on a fresh connection (HA-6); set only by an explicit ASKING.
+            asking: false,
         }
     }
 
@@ -138,6 +148,9 @@ impl ConnState {
         self.sub_patterns.clear();
         // RESET clears the CLUSTER read-only bit back to read-write (Redis parity).
         self.readonly = false;
+        // RESET clears any pending one-shot ASKING (HA-6): a fresh baseline never carries a stale
+        // ASKING into the next command.
+        self.asking = false;
         // should_close intentionally not touched by RESET.
     }
 

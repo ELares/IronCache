@@ -516,6 +516,19 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        // ASKING (HA-6 online slot migration): the one-shot connection command a client sends after
+        // an -ASK redirect, before re-issuing the command at the destination. AlwaysHome (no key),
+        // arity 1, not a write. Intercepted by the serve router (which owns the one-shot flag), but
+        // registered here so COMMAND/arity see it and the home dispatch has a real arm.
+        b"ASKING" => &CommandSpec {
+            name: b"ASKING",
+            arity: Exact(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
         // -- Strings (cmd_string). --
         b"GET" => &CommandSpec {
             name: b"GET",

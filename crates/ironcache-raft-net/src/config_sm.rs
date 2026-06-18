@@ -152,6 +152,42 @@ impl StateMachine for ConfigSm {
                     self.map.clear_slot_replica(slot, new_primary);
                 }
             }
+            ConfigCmd::SetSlotMigrating { slot, dest } => {
+                // HA-6 SOURCE-side: tag the slot MIGRATING toward `dest`. Because committed
+                // ConfigCmds apply on EVERY node, the tag must be NODE-RELATIVE: ONLY the slot's
+                // current OWNER (the SOURCE) carries a MIGRATING tag (a non-owner is not the source
+                // and must not show MIGRATING -- otherwise a later SetSlotImporting on the same node
+                // would clobber it, or a non-source would wrongly ASK). `owns()` is the node-relative
+                // discriminator. Writes the parallel migration arrays only, NOT the owner bitmap, so
+                // owns() is unchanged. Deterministic + idempotent; the unknown-node error is swallowed
+                // (the leader proposes AddNode{dest} first, so the committed order never errors).
+                if self.map.owns(*slot) {
+                    let _ = self.map.set_migrating(*slot, dest);
+                }
+            }
+            ConfigCmd::SetSlotImporting { slot, src, dest } => {
+                // HA-6 DESTINATION-side: tag the slot IMPORTING from `src` on EXACTLY the `dest`
+                // node. NODE-RELATIVE: a committed ConfigCmd applies on EVERY node, so the tag must
+                // be set only where THIS node IS the destination. The discriminator is
+                // `is_self(dest)` (an endpoint compare against `me()`, mirroring `set_slot_node` /
+                // `is_replica_of_self` so the dual announce-id / synth-id identity is handled), NOT
+                // `!owns()`: in an N>=3 cluster a BYSTANDER (a third node that is neither `src` nor
+                // `dest`) is ALSO a non-owner, so the old `!owns()` form tagged IT importing too --
+                // which, combined with a leaked one-shot ASKING, would serve a key on a wrong-owner
+                // node. Gating on the dest tags EXACTLY the one importer. Writes the parallel arrays
+                // only; owns() unchanged -- ownership stays with `src` until the committed FLIP.
+                // Deterministic + idempotent; the unknown-node error is swallowed (the leader
+                // proposes AddNode{src} first, so the committed order never errors). MIGRATING stays
+                // gated on owns() (uniquely the source), so it needs no dest.
+                if self.map.is_self(dest) {
+                    let _ = self.map.set_importing(*slot, src);
+                }
+            }
+            ConfigCmd::SetSlotStable { slot } => {
+                // HA-6: clear the slot's migration state (the abort path; a committed FLIP clears
+                // it on its own via set_slot_node). Idempotent; node-relative clears are harmless.
+                self.map.clear_migration(*slot);
+            }
             ConfigCmd::SetConfigEpoch(_epoch) => {
                 // The Raft-driven config epoch is the log-driven counter above; the SlotMap's
                 // own (Redis-client) epoch is not used for the linearizable-ownership property.
@@ -167,6 +203,7 @@ mod tests {
 
     const ID0: &str = "0000000000000000000000000000000000000000";
     const ID1: &str = "1111111111111111111111111111111111111111";
+    const ID2: &str = "2222222222222222222222222222222222222222";
 
     fn config_entry(index: u64, cmd: ConfigCmd) -> LogEntry {
         LogEntry {
@@ -532,6 +569,227 @@ mod tests {
             // The promoted node is the replica of NEITHER slot anymore (it is the owner).
             assert!(!map0.is_replica_of(slot, ID1) && !map1.is_replica_of(slot, ID1));
         }
+    }
+
+    /// HA-6: SetSlotMigrating / SetSlotImporting / SetSlotStable drive the parallel migration
+    /// arrays (NOT owns()), each bumps the log-driven epoch once, and SetSlotStable / the FLIP clear
+    /// the state. The SOURCE owns the slot throughout MIGRATING; the committed FLIP (SetSlotOwner)
+    /// transfers ownership AND clears the migration in one apply.
+    #[test]
+    fn migration_setslot_drives_state_without_touching_owns_and_flip_clears_it() {
+        use ironcache_cluster::MigrationState;
+        // Node ID0's view (self == ID0): ID0 OWNS [0]; ID1 is the migration DEST.
+        let map = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let mut sm = ConfigSm::new(Arc::clone(&map));
+        sm.apply(&config_entry(
+            1,
+            ConfigCmd::AddNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7001,
+            },
+        ));
+        sm.apply(&config_entry(
+            2,
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![0],
+            },
+        ));
+        assert!(map.owns(0));
+        assert_eq!(map.migration_state(0), MigrationState::None);
+        let epoch_before = sm.config_epoch();
+
+        // MIGRATING 0 -> ID1: tagged MIGRATING, but ID0 STILL OWNS (owns() unchanged); epoch +1.
+        sm.apply(&config_entry(
+            3,
+            ConfigCmd::SetSlotMigrating {
+                slot: 0,
+                dest: ID1.to_owned(),
+            },
+        ));
+        assert_eq!(map.migration_state(0), MigrationState::Migrating);
+        assert!(map.owns(0), "MIGRATING must not change owns()");
+        assert_eq!(
+            map.migration_peer_endpoint(0),
+            Some(("127.0.0.1".to_owned(), 7001))
+        );
+        assert_eq!(sm.config_epoch(), epoch_before + 1);
+
+        // THE FLIP (SetSlotOwner 0 -> ID1): ownership transfers AND migration clears in one apply.
+        sm.apply(&config_entry(
+            4,
+            ConfigCmd::SetSlotOwner {
+                slot: 0,
+                node: ID1.to_owned(),
+            },
+        ));
+        assert!(
+            !map.owns(0),
+            "the FLIP transfers ownership away from the source"
+        );
+        assert_eq!(
+            map.migration_state(0),
+            MigrationState::None,
+            "the committed FLIP clears the migration state (no stale ASK)"
+        );
+        assert_eq!(sm.config_epoch(), epoch_before + 2);
+
+        // SetSlotStable on a fresh slot (the abort path): IMPORTING then STABLE clears. This sm's
+        // self is ID0, so dest = ID0 makes THIS node the importer (Finding 2: only the dest tags).
+        sm.apply(&config_entry(
+            5,
+            ConfigCmd::SetSlotImporting {
+                slot: 5,
+                src: ID1.to_owned(),
+                dest: ID0.to_owned(),
+            },
+        ));
+        assert_eq!(map.migration_state(5), MigrationState::Importing);
+        sm.apply(&config_entry(6, ConfigCmd::SetSlotStable { slot: 5 }));
+        assert_eq!(map.migration_state(5), MigrationState::None);
+        assert_eq!(sm.config_epoch(), epoch_before + 4);
+    }
+
+    /// HA-6: two independent ConfigSms (the SOURCE's view and the DEST's view) fed the IDENTICAL
+    /// committed migration+FLIP sequence converge so EXACTLY ONE node owns the slot and NEITHER has
+    /// a lingering migration tag -- the linearizable-ownership property across a slot migration.
+    #[test]
+    fn migration_then_flip_converges_to_one_owner_across_nodes() {
+        use ironcache_cluster::MigrationState;
+        let seq = [
+            ConfigCmd::AddNode {
+                id: ID0.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7000,
+            },
+            ConfigCmd::AddNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7001,
+            },
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![42],
+            },
+            // SOURCE (ID0) MIGRATING 42 -> DEST (ID1).
+            ConfigCmd::SetSlotMigrating {
+                slot: 42,
+                dest: ID1.to_owned(),
+            },
+            // DEST (ID1) IMPORTING 42 from SOURCE (ID0): dest = ID1, so ONLY map1 (self == ID1)
+            // tags IMPORTING; map0 (the source) does not (Finding 2: only the dest is tagged).
+            ConfigCmd::SetSlotImporting {
+                slot: 42,
+                src: ID0.to_owned(),
+                dest: ID1.to_owned(),
+            },
+            // THE FLIP: ownership transfers to ID1 (clears migration on both nodes' apply).
+            ConfigCmd::SetSlotOwner {
+                slot: 42,
+                node: ID1.to_owned(),
+            },
+        ];
+        let map0 = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let map1 = Arc::new(SlotMap::empty_self(ID1, "127.0.0.1", 7001));
+        let mut sm0 = ConfigSm::new(Arc::clone(&map0));
+        let mut sm1 = ConfigSm::new(Arc::clone(&map1));
+        for (i, cmd) in seq.iter().enumerate() {
+            let idx = i as u64 + 1;
+            sm0.apply(&config_entry(idx, cmd.clone()));
+            sm1.apply(&config_entry(idx, cmd.clone()));
+        }
+        assert_eq!(map0.current_epoch(), map1.current_epoch());
+        // EXACTLY ONE owner (the new owner ID1); the old owner ID0 lost it.
+        assert!(!map0.owns(42), "old owner ID0 lost the slot after the FLIP");
+        assert!(map1.owns(42), "new owner ID1 owns the slot after the FLIP");
+        // No lingering migration tag on EITHER node (the FLIP cleared it on both).
+        assert_eq!(map0.migration_state(42), MigrationState::None);
+        assert_eq!(map1.migration_state(42), MigrationState::None);
+        // Both nodes resolve MOVED to the SAME endpoint (ID1, port 7001) for a stale client.
+        assert_eq!(map0.moved_target(42), map1.moved_target(42));
+        assert_eq!(map0.moved_target(42), Some(("127.0.0.1".to_owned(), 7001)));
+    }
+
+    /// HA-6 Finding 2: in an N>=3 cluster, `SetSlotImporting { src, dest }` tags IMPORTING on EXACTLY
+    /// the `dest` node and on NO bystander. SOURCE = ID0 (owner), DEST = ID1, BYSTANDER = ID2 (a third
+    /// node that owns nothing here and is NOT the dest). All three apply the SAME committed sequence.
+    /// Only the DEST records IMPORTING; the bystander (also a non-owner, which the old `!owns()` gate
+    /// wrongly tagged) records NONE. The source keeps its MIGRATING tag.
+    #[test]
+    fn set_slot_importing_tags_only_the_dest_not_a_bystander() {
+        use ironcache_cluster::MigrationState;
+        let seq = [
+            ConfigCmd::AddNode {
+                id: ID0.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7000,
+            },
+            ConfigCmd::AddNode {
+                id: ID1.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7001,
+            },
+            ConfigCmd::AddNode {
+                id: ID2.to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 7002,
+            },
+            // SOURCE (ID0) owns the slot.
+            ConfigCmd::AssignSlots {
+                node: ID0.to_owned(),
+                slots: vec![7],
+            },
+            // SOURCE MIGRATING toward DEST (ID1).
+            ConfigCmd::SetSlotMigrating {
+                slot: 7,
+                dest: ID1.to_owned(),
+            },
+            // DEST IMPORTING from SOURCE: dest == ID1. ONLY ID1 must tag IMPORTING; ID2 (a bystander
+            // non-owner) must NOT, even though `!owns(7)` is true for it.
+            ConfigCmd::SetSlotImporting {
+                slot: 7,
+                src: ID0.to_owned(),
+                dest: ID1.to_owned(),
+            },
+        ];
+        // One ConfigSm per node, each with its OWN self identity, all fed the identical committed log.
+        let map_src = Arc::new(SlotMap::empty_self(ID0, "127.0.0.1", 7000));
+        let map_dest = Arc::new(SlotMap::empty_self(ID1, "127.0.0.1", 7001));
+        let map_bystander = Arc::new(SlotMap::empty_self(ID2, "127.0.0.1", 7002));
+        let mut sm_src = ConfigSm::new(Arc::clone(&map_src));
+        let mut sm_dest = ConfigSm::new(Arc::clone(&map_dest));
+        let mut sm_bystander = ConfigSm::new(Arc::clone(&map_bystander));
+        for (i, cmd) in seq.iter().enumerate() {
+            let idx = i as u64 + 1;
+            sm_src.apply(&config_entry(idx, cmd.clone()));
+            sm_dest.apply(&config_entry(idx, cmd.clone()));
+            sm_bystander.apply(&config_entry(idx, cmd.clone()));
+        }
+        // SOURCE: still owns + tagged MIGRATING (it is the source, gated on owns()).
+        assert!(
+            map_src.owns(7),
+            "SOURCE still owns the slot during migration"
+        );
+        assert_eq!(
+            map_src.migration_state(7),
+            MigrationState::Migrating,
+            "SOURCE is tagged MIGRATING"
+        );
+        // DEST: the ONE importer.
+        assert!(!map_dest.owns(7), "DEST does not own the slot yet");
+        assert_eq!(
+            map_dest.migration_state(7),
+            MigrationState::Importing,
+            "DEST is tagged IMPORTING (it is the named dest)"
+        );
+        // BYSTANDER: a non-owner that is NOT the dest -> NO migration tag (the Finding 2 fix).
+        assert!(!map_bystander.owns(7), "the bystander owns nothing here");
+        assert_eq!(
+            map_bystander.migration_state(7),
+            MigrationState::None,
+            "the bystander (a non-owner non-dest) must NOT be tagged IMPORTING"
+        );
     }
 
     /// HA-7d: two independent ConfigSms fed the IDENTICAL committed sequence (including an

@@ -231,6 +231,57 @@ pub enum ConfigCmd {
         /// The id of the in-sync replica being promoted to OWNER of every slot in `slots`.
         new_primary: String,
     },
+    /// Tag `slot` MIGRATING toward `dest` (HA-6 online slot migration; drives
+    /// `SlotMap::set_migrating`). This is the SOURCE-side step of `CLUSTER SETSLOT <slot> MIGRATING
+    /// <dest>`: the slot stays OWNED by its current owner, but the owner begins shipping its keys to
+    /// `dest` and answers `-ASK <slot> <dest>` for a key that has already migrated away. It records
+    /// migration STATE only (a NEW parallel structure, NOT the hot `owns()` bitmap), so ownership is
+    /// unchanged and the hot path is byte-unchanged until the committed FLIP
+    /// ([`ConfigCmd::SetSlotOwner`]). `dest` MUST already be known (a prior committed
+    /// [`ConfigCmd::AddNode`]); the committed-log order guarantees that. Advances the config epoch
+    /// once on apply (every committed config entry does). IDEMPOTENT (re-applying re-tags the same).
+    SetSlotMigrating {
+        /// The slot to tag MIGRATING.
+        slot: u16,
+        /// The id of the DESTINATION node (the `-ASK` target keys are being shipped to).
+        dest: String,
+    },
+    /// Tag `slot` IMPORTING from `src` ON `dest` (HA-6; drives `SlotMap::set_importing`). The
+    /// DESTINATION-side step of `CLUSTER SETSLOT <slot> IMPORTING <src>`: the `dest` node is
+    /// RECEIVING the slot but does NOT yet own it (ownership stays with `src` until the committed
+    /// FLIP). A normal command on the slot is MOVED to the real owner UNLESS the connection set the
+    /// one-shot `ASKING` flag. Records migration STATE only (the parallel structure), so the hot path
+    /// is byte-unchanged.
+    ///
+    /// `dest` is carried so apply tags IMPORTING on EXACTLY the destination node. The earlier dest-
+    /// less form tagged IMPORTING on EVERY non-owner (anything where `!owns(slot)`), so in an N>=3
+    /// cluster a BYSTANDER (a third node that is neither `src` nor the real `dest`) was ALSO tagged
+    /// IMPORTING(src) -- which, combined with a leaked one-shot `ASKING`, would serve a key on a
+    /// wrong-owner node (a lost write on migration abort). Apply now gates the IMPORTING tag on
+    /// `SlotMap::is_self(dest)` (an endpoint compare against `me()`, mirroring how `set_slot_node` /
+    /// `is_replica_of_self` recognize self under the dual announce-id / synth-id identity). MIGRATING
+    /// stays gated on `owns(slot)`, which is uniquely the source, so it needs no dest.
+    ///
+    /// Both `src` and `dest` MUST already be known (prior committed [`ConfigCmd::AddNode`]s). Advances
+    /// the config epoch once on apply. IDEMPOTENT.
+    SetSlotImporting {
+        /// The slot to tag IMPORTING.
+        slot: u16,
+        /// The id of the SOURCE node (the current owner the importer adopts from).
+        src: String,
+        /// The id of the DESTINATION node (the ONLY node that tags IMPORTING on apply).
+        dest: String,
+    },
+    /// Clear `slot`'s migration state back to NONE (HA-6; drives `SlotMap::clear_migration`). The
+    /// `CLUSTER SETSLOT <slot> STABLE` step, used to ABORT a migration that has not flipped (a
+    /// committed FLIP [`ConfigCmd::SetSlotOwner`] clears the migration on its own, so STABLE is for
+    /// the abort path). Records migration STATE only; ownership and the hot path are unchanged.
+    /// Advances the config epoch once on apply. IDEMPOTENT (clearing an already-clear slot is a
+    /// no-op).
+    SetSlotStable {
+        /// The slot whose migration state to clear.
+        slot: u16,
+    },
 }
 
 /// One entry in a node's replicated log.
@@ -3112,6 +3163,29 @@ mod tests {
                         self.map.clear_slot_replica(slot, new_primary);
                     }
                 }
+                ConfigCmd::SetSlotMigrating { slot, dest } => {
+                    // HA-6: NODE-RELATIVE -- only the slot's current OWNER (the SOURCE) carries a
+                    // MIGRATING tag (committed cmds apply on every node, so the tag must be scoped
+                    // by `owns()`). Parallel arrays only; owns() unchanged. Mirrors the production
+                    // ConfigSm.
+                    if self.map.owns(*slot) {
+                        let _ = self.map.set_migrating(*slot, dest);
+                    }
+                }
+                ConfigCmd::SetSlotImporting { slot, src, dest } => {
+                    // HA-6: NODE-RELATIVE -- ONLY the `dest` node carries an IMPORTING tag, gated on
+                    // `is_self(dest)` (endpoint compare). The old `!owns()` form tagged EVERY non-
+                    // owner, so a BYSTANDER (a third non-owner that is not the dest) was wrongly
+                    // tagged too; gating on the dest tags exactly the one importer. Parallel arrays
+                    // only. Mirrors the production ConfigSm.
+                    if self.map.is_self(dest) {
+                        let _ = self.map.set_importing(*slot, src);
+                    }
+                }
+                ConfigCmd::SetSlotStable { slot } => {
+                    // HA-6: clear the slot's migration state (abort path; idempotent).
+                    self.map.clear_migration(*slot);
+                }
                 ConfigCmd::SetConfigEpoch(_epoch) => {
                     // The Raft-driven config epoch is the log-driven counter above;
                     // the SlotMap's own (Redis-client) epoch is not used for the
@@ -4020,6 +4094,514 @@ mod tests {
     // -- the failover controller (the test) promotes ONLY the in-sync replica and
     // asserts it never names the stale one -- which is exactly how the production
     // controller consumes the predicate before proposing a `PromoteReplica`.
+
+    // =====================================================================
+    // HA-6: ONLINE SLOT MIGRATION -- THE CRASH-AT-FLIP GATE.
+    //
+    // A migration moves a slot's data SRC -> DEST, then transfers ownership in ONE committed
+    // SetSlotOwner (the FLIP). The danger is LOST KEYS / DOUBLE-OWNERSHIP at the FLIP boundary: a
+    // crash/partition right as the FLIP is proposed must leave EXACTLY ONE owner -- SRC if the FLIP
+    // did not commit, DEST if it did, never both, and a committed FLIP is NEVER lost. This gate
+    // partitions the leader away at randomized points around the FLIP across thousands of timelines
+    // and asserts, at every quiescent step: no two nodes owns()==true for a slot at one epoch
+    // (`assert_at_most_one_owner_per_slot`); the epoch is monotone; and after heal EXACTLY one owner
+    // (`assert_exactly_one_owner_after_convergence`), with every node's committed prefix agreeing.
+    //
+    // It reuses the SAME owns()-property checkers as the HA-8 failover gate (the migration FLIP and
+    // the failover promotion both transfer ownership through one committed ConfigCmd, so the
+    // split-brain property is identical), driven by the migration handshake (SetSlotMigrating /
+    // SetSlotImporting then the SetSlotOwner FLIP). The data MOVE itself is not modeled in the pure
+    // engine (it has no store / replication link); this gate proves the STATE MACHINE + the
+    // committed FLIP + the crash-at-FLIP safety, which is the part that cannot be stubbed.
+    // =====================================================================
+
+    /// Replay the HA-6 crash-at-FLIP gate for one `seed` with `partition_after` controlling WHEN (in
+    /// chunks) the leader is partitioned away relative to the FLIP proposal, so the seed sweep
+    /// randomizes the crash timing. Returns the final per-node owner-by-slot snapshot + epoch (for
+    /// the seed-sweep convergence assertion). The split-brain checker and the epoch-monotonic checker
+    /// run at EVERY quiescent step throughout.
+    #[allow(clippy::too_many_lines)]
+    fn run_migration_crash_at_flip_gate(
+        seed: u64,
+        partition_after: usize,
+    ) -> Vec<(BTreeMap<u16, String>, u64)> {
+        // 3 voters: SRC is the first leader (the slot owner); DEST is a peer (the migration target).
+        let mut cluster = ConfigCluster::new(3, seed, RaftConfig::default());
+        cluster
+            .net
+            .set_latency(Duration::from_millis(1), Duration::from_millis(15));
+        let mut epochs = EpochMonotonic::new();
+        let src = elect_config_leader(&mut cluster);
+        assert_3e_invariants(&cluster, &mut epochs);
+        assert_at_most_one_owner_per_slot(&cluster);
+
+        // Build the node table (committed before any slot / migration reference).
+        for id in cluster.ids.clone() {
+            cluster.propose(
+                src,
+                ConfigCmd::AddNode {
+                    id: slot_id(id),
+                    host: slot_host(id),
+                    port: SLOT_PORT,
+                },
+            );
+        }
+        cluster.run_steps(3_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // The migrating slots. SRC claims them, then begins the migration handshake to DEST.
+        let slots: [u16; 3] = [0, 6000, 12000];
+        let dest = *cluster
+            .ids
+            .iter()
+            .find(|&&id| id != src)
+            .expect("a peer to migrate to");
+        for &s in &slots {
+            cluster.propose(
+                src,
+                ConfigCmd::SetSlotOwner {
+                    slot: s,
+                    node: slot_id(src),
+                },
+            );
+        }
+        // SRC MIGRATING the slots to DEST; DEST IMPORTING from SRC (the per-slot handshake). These
+        // tag migration STATE (the parallel arrays), NOT ownership -- SRC still owns throughout.
+        for &s in &slots {
+            cluster.propose(
+                src,
+                ConfigCmd::SetSlotMigrating {
+                    slot: s,
+                    dest: slot_id(dest),
+                },
+            );
+            cluster.propose(
+                src,
+                ConfigCmd::SetSlotImporting {
+                    slot: s,
+                    src: slot_id(src),
+                    // Finding 2: the IMPORTING tag is set on EXACTLY the dest (DEST here), never on
+                    // the third bystander voter -- so only DEST records IMPORTING during the handshake.
+                    dest: slot_id(dest),
+                },
+            );
+        }
+        cluster.run_steps(3_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+        assert_at_most_one_owner_per_slot(&cluster);
+        // SRC still owns every migrating slot (the handshake never transfers ownership).
+        for &s in &slots {
+            assert!(
+                cluster.map(src).owns(s),
+                "seed {seed}: SRC must still own slot {s} during the migration handshake"
+            );
+        }
+
+        let pre_flip_epoch = cluster.current_epoch(src);
+
+        // Run a randomized number of chunks BEFORE the partition, so it lands at different points
+        // relative to in-flight replication of the handshake.
+        for _ in 0..partition_after {
+            cluster.run_steps(200);
+            assert_at_most_one_owner_per_slot(&cluster);
+        }
+
+        // PARTITION the leader (SRC) away from the other two. SRC (1 of 3) cannot commit; the
+        // two-node majority (which includes DEST) elects a leader and drives the FLIP. This models
+        // the crash AT the FLIP boundary: the FLIP is proposed under partition, so across the seed
+        // sweep it sometimes commits (majority side) and sometimes does not (if SRC was the only
+        // node that could have proposed and it is isolated).
+        let majority: Vec<SimId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != src)
+            .map(to_sim)
+            .collect();
+        cluster.net.partition(&[to_sim(src)], &majority);
+
+        // The majority elects a leader, then proposes THE FLIP: SetSlotOwner(slot -> DEST). On
+        // commit, DEST owns and the migration clears (set_slot_node clears the migration in
+        // lockstep). A spurious FLIP (SRC alive across the partition) is SAFE for split-brain: the
+        // committed entry atomically transfers ownership and SRC steps down on apply.
+        let maj_leader = run_to_leader_in_group(&mut cluster, &majority, 200)
+            .expect("the majority side must elect a leader");
+        for &s in &slots {
+            cluster.propose(
+                maj_leader,
+                ConfigCmd::SetSlotOwner {
+                    slot: s,
+                    node: slot_id(dest),
+                },
+            );
+        }
+        for _ in 0..25 {
+            cluster.run_steps(500);
+            assert_at_most_one_owner_per_slot(&cluster);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+
+        // The majority committed the FLIP: DEST now OWNS the slots (committed there) and the
+        // migration state is cleared on the majority side.
+        for &s in &slots {
+            assert!(
+                cluster.map(dest).owns(s),
+                "seed {seed}: DEST must own slot {s} after the committed FLIP"
+            );
+        }
+        assert!(
+            cluster.current_epoch(dest) > pre_flip_epoch,
+            "seed {seed}: the FLIP must advance the epoch ({} > {pre_flip_epoch})",
+            cluster.current_epoch(dest)
+        );
+
+        // HEAL. SRC, catching its Raft log up, applies the committed FLIP: its owns() for the slots
+        // goes FALSE (it serves MOVED, not ASK -- the migration is cleared). The split-brain checker
+        // runs through the entire reconciliation.
+        cluster.net.heal();
+        for _ in 0..30 {
+            cluster.run_steps(500);
+            assert_at_most_one_owner_per_slot(&cluster);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+        cluster.run_until_idle(100_000);
+        assert_at_most_one_owner_per_slot(&cluster);
+        assert_3e_invariants(&cluster, &mut epochs);
+        // Post-heal: every node caught up -> EXACTLY one owner per slot (the committed FLIP is never
+        // lost; a node that never saw a FLIP commit would leave SRC the sole owner -- also exactly
+        // one -- but here the majority committed it, so DEST is the converged owner).
+        assert_exactly_one_owner_after_convergence(&cluster);
+
+        // SRC lost ownership and resolves MOVED to DEST for every migrated slot (NOT ASK: the FLIP
+        // cleared the migration tag, so the cold redirect path no longer treats the slot as
+        // migrating). We assert the OWNERSHIP fence here; the ASK-vs-MOVED redirect itself is unit-
+        // and loopback-tested where the redirect lives (the pure engine has no redirect path).
+        for &s in &slots {
+            assert!(
+                !cluster.map(src).owns(s),
+                "seed {seed}: SRC must lose ownership of slot {s} after heal (MOVED, not ASK)"
+            );
+            assert_eq!(
+                cluster.map(src).migration_state(s),
+                ironcache_cluster::MigrationState::None,
+                "seed {seed}: the committed FLIP cleared SRC's migration tag for slot {s}"
+            );
+            assert_eq!(
+                cluster.map(src).moved_target(s),
+                Some((slot_host(dest), SLOT_PORT)),
+                "seed {seed}: SRC must MOVED slot {s} to the new owner DEST"
+            );
+        }
+        // No committed change was lost: every node's committed prefix agrees with the leader's.
+        let final_leader = {
+            let ls = cluster.leaders();
+            assert_eq!(ls.len(), 1, "seed {seed}: exactly one leader after heal");
+            ls[0]
+        };
+        assert_committed_prefix_agrees(&cluster, final_leader);
+
+        cluster
+            .ids
+            .iter()
+            .map(|&id| (cluster.owner_by_slot(id), cluster.current_epoch(id)))
+            .collect()
+    }
+
+    /// Replay the HA-6 crash-at-FLIP gate's COMPLEMENTARY half: the ABORT timeline, where the FLIP
+    /// does NOT commit. The `run_migration_crash_at_flip_gate` above always lands the FLIP on the
+    /// majority (so it always commits and DEST always becomes the owner); it never exercises the
+    /// other branch its comment claims -- "SRC remains the sole clean owner if the FLIP did not
+    /// commit (migration safely abortable)". This gate proves that branch:
+    ///
+    ///   1. Drive the migration handshake (SRC owns; SRC MIGRATING -> DEST; DEST IMPORTING from SRC).
+    ///   2. Partition SRC (the leader, a minority of 1) away from the majority {DEST, bystander}.
+    ///   3. PROPOSE THE FLIP on the ISOLATED SRC. With only 1 of 3 it can NEVER reach quorum, so the
+    ///      FLIP is appended to SRC's local log but is NEVER committed (and never applied anywhere).
+    ///   4. The MAJORITY elects a leader and commits `SetSlotStable{slot}` -- the ABORT.
+    ///   5. HEAL. Raft log reconciliation OVERWRITES SRC's uncommitted FLIP tail with the majority
+    ///      leader's log (which carries the committed STABLE, not the FLIP), so the FLIP is discarded.
+    ///
+    /// Asserts, with the SAME checkers as the commit gate: at every quiescent step NEVER two owners
+    /// per slot per epoch (`assert_at_most_one_owner_per_slot`); epoch monotone (`assert_3e_invariants`
+    /// via `EpochMonotonic`); and after heal EXACTLY ONE owner per slot (`assert_exactly_one_owner_
+    /// after_convergence`) which is the SOURCE (the un-committed FLIP was discarded -> ownership never
+    /// transferred), with SRC's migration_state back to None (the committed STABLE cleared it) and
+    /// every node's committed prefix agreeing. Randomized partition timing over the seed sweep.
+    #[allow(clippy::too_many_lines)]
+    fn run_migration_abort_leaves_one_owner_gate(
+        seed: u64,
+        partition_after: usize,
+    ) -> Vec<(BTreeMap<u16, String>, u64)> {
+        // 3 voters: SRC is the first leader (the slot owner); DEST is the migration target; the
+        // third node is a bystander voter that, with DEST, forms the majority once SRC is isolated.
+        let mut cluster = ConfigCluster::new(3, seed, RaftConfig::default());
+        cluster
+            .net
+            .set_latency(Duration::from_millis(1), Duration::from_millis(15));
+        let mut epochs = EpochMonotonic::new();
+        let src = elect_config_leader(&mut cluster);
+        assert_3e_invariants(&cluster, &mut epochs);
+        assert_at_most_one_owner_per_slot(&cluster);
+
+        // Build the node table (committed before any slot / migration reference).
+        for id in cluster.ids.clone() {
+            cluster.propose(
+                src,
+                ConfigCmd::AddNode {
+                    id: slot_id(id),
+                    host: slot_host(id),
+                    port: SLOT_PORT,
+                },
+            );
+        }
+        cluster.run_steps(3_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // SRC claims the slots, then begins the migration handshake to DEST.
+        let slots: [u16; 3] = [0, 6000, 12000];
+        let dest = *cluster
+            .ids
+            .iter()
+            .find(|&&id| id != src)
+            .expect("a peer to migrate to");
+        // The handshake is ORDER-SENSITIVE per slot (the owner claim must apply BEFORE the MIGRATING
+        // tag, which `set_migrating` gates on `owns()`). Proposals are delivered fire-and-forget and
+        // the sim REORDERS them, so we propose each step and SETTLE it (run until it commits) before
+        // the next -- a deterministic, in-order handshake. `propose_and_settle` returns when the
+        // leader's commit index has advanced past the proposal (bounded), so the abort timeline below
+        // starts from a known LIVE migration on SRC, not a reordered partial.
+        let propose_and_settle = |cluster: &mut ConfigCluster, cmd: ConfigCmd| {
+            let before = cluster.commit_index(src);
+            cluster.propose(src, cmd);
+            for _ in 0..40 {
+                cluster.run_steps(500);
+                assert_at_most_one_owner_per_slot(cluster);
+                if cluster.commit_index(src) > before {
+                    return;
+                }
+            }
+            panic!("seed {seed}: a handshake proposal did not commit on SRC");
+        };
+        for &s in &slots {
+            propose_and_settle(
+                &mut cluster,
+                ConfigCmd::SetSlotOwner {
+                    slot: s,
+                    node: slot_id(src),
+                },
+            );
+        }
+        // SRC MIGRATING the slots to DEST; DEST IMPORTING from SRC (the per-slot handshake). These
+        // tag migration STATE only -- SRC still owns throughout (no ownership transfer yet).
+        for &s in &slots {
+            propose_and_settle(
+                &mut cluster,
+                ConfigCmd::SetSlotMigrating {
+                    slot: s,
+                    dest: slot_id(dest),
+                },
+            );
+            propose_and_settle(
+                &mut cluster,
+                ConfigCmd::SetSlotImporting {
+                    slot: s,
+                    src: slot_id(src),
+                    dest: slot_id(dest),
+                },
+            );
+        }
+        assert_3e_invariants(&cluster, &mut epochs);
+        assert_at_most_one_owner_per_slot(&cluster);
+        // The handshake is fully applied + IN-ORDER: SRC owns every slot AND is tagged MIGRATING (a
+        // LIVE migration to then abort). DEST is NOT tagged (it only applies its own IMPORTING, and
+        // we drive the abort before any data move) -- the bystander is never tagged (Finding 2).
+        for &s in &slots {
+            assert!(
+                cluster.map(src).owns(s),
+                "seed {seed}: SRC must still own slot {s} during the migration handshake"
+            );
+            assert_eq!(
+                cluster.map(src).migration_state(s),
+                ironcache_cluster::MigrationState::Migrating,
+                "seed {seed}: SRC is tagged MIGRATING during the handshake (a live migration to abort)"
+            );
+        }
+
+        // Run a randomized number of chunks BEFORE the partition (randomized abort timing).
+        for _ in 0..partition_after {
+            cluster.run_steps(200);
+            assert_at_most_one_owner_per_slot(&cluster);
+        }
+
+        // PARTITION SRC (the leader, 1 of 3) away from the majority {DEST, bystander}.
+        let majority: Vec<SimId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != src)
+            .map(to_sim)
+            .collect();
+        cluster.net.partition(&[to_sim(src)], &majority);
+
+        // PROPOSE THE FLIP on the ISOLATED SRC. As a minority of 1 it cannot reach quorum, so this
+        // entry is appended to SRC's LOCAL log but is NEVER committed (and never applied anywhere).
+        // Give it time to land locally + churn the network; the FLIP must stay uncommitted.
+        for &s in &slots {
+            cluster.propose(
+                src,
+                ConfigCmd::SetSlotOwner {
+                    slot: s,
+                    node: slot_id(dest),
+                },
+            );
+        }
+        for _ in 0..10 {
+            cluster.run_steps(200);
+            assert_at_most_one_owner_per_slot(&cluster);
+        }
+        // The isolated SRC's FLIP did NOT commit: SRC still owns and is still tagged MIGRATING (no
+        // apply happened), and DEST has NOT become the owner.
+        for &s in &slots {
+            assert!(
+                cluster.map(src).owns(s),
+                "seed {seed}: the isolated SRC's un-quorate FLIP must NOT transfer ownership"
+            );
+            assert!(
+                !cluster.map(dest).owns(s),
+                "seed {seed}: DEST must NOT own slot {s} while the FLIP is uncommitted"
+            );
+        }
+
+        // The MAJORITY elects a leader and commits the ABORT: SetSlotStable on each slot. STABLE
+        // clears the migration tag WITHOUT transferring ownership.
+        let maj_leader = run_to_leader_in_group(&mut cluster, &majority, 200)
+            .expect("the majority side must elect a leader");
+        for &s in &slots {
+            cluster.propose(maj_leader, ConfigCmd::SetSlotStable { slot: s });
+        }
+        for _ in 0..25 {
+            cluster.run_steps(500);
+            assert_at_most_one_owner_per_slot(&cluster);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+
+        // HEAL. SRC, catching its Raft log up, has its uncommitted FLIP tail OVERWRITTEN by the
+        // majority leader's log (Figure-8 reconciliation): the FLIP is discarded and the committed
+        // STABLE is applied, so SRC's migration tag clears and its ownership is UNCHANGED.
+        cluster.net.heal();
+        for _ in 0..30 {
+            cluster.run_steps(500);
+            assert_at_most_one_owner_per_slot(&cluster);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+        cluster.run_until_idle(100_000);
+        assert_at_most_one_owner_per_slot(&cluster);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // Post-heal: EXACTLY ONE owner per slot, and it is the SOURCE -- the un-committed FLIP was
+        // discarded, so ownership never transferred; the migration aborted cleanly.
+        assert_exactly_one_owner_after_convergence(&cluster);
+        for &s in &slots {
+            assert!(
+                cluster.map(src).owns(s),
+                "seed {seed}: after an ABORTED migration the SOURCE remains the sole owner of slot {s}"
+            );
+            assert!(
+                !cluster.map(dest).owns(s),
+                "seed {seed}: DEST never owns slot {s} when the FLIP did not commit"
+            );
+            // The STABLE abort cleared the SOURCE's migration tag back to None on EVERY node.
+            for &id in &cluster.ids {
+                assert_eq!(
+                    cluster.map(id).migration_state(s),
+                    ironcache_cluster::MigrationState::None,
+                    "seed {seed}: the committed STABLE abort cleared the migration tag on node {id:?} \
+                     for slot {s}"
+                );
+            }
+            // SRC, still the owner, resolves MOVED to ITSELF (it never gave the slot up).
+            assert_eq!(
+                cluster.map(src).moved_target(s),
+                Some((slot_host(src), SLOT_PORT)),
+                "seed {seed}: the SOURCE still owns slot {s} after the abort (MOVED to self)"
+            );
+        }
+        // No committed change was lost or reordered (the discarded FLIP was never committed).
+        let final_leader = {
+            let ls = cluster.leaders();
+            assert_eq!(ls.len(), 1, "seed {seed}: exactly one leader after heal");
+            ls[0]
+        };
+        assert_committed_prefix_agrees(&cluster, final_leader);
+
+        cluster
+            .ids
+            .iter()
+            .map(|&id| (cluster.owner_by_slot(id), cluster.current_epoch(id)))
+            .collect()
+    }
+
+    #[test]
+    fn migration_abort_leaves_one_owner_gate() {
+        // THE COMPLEMENTARY HALF of the crash-at-FLIP gate: across (seed, partition-timing) pairs,
+        // an ABORTED migration (the FLIP proposed on an isolated minority, never committed; a STABLE
+        // committed on the majority) must leave the SOURCE the SOLE clean owner with the migration
+        // cleared -- never two owners, never a lost SOURCE, never a half-applied FLIP. 200 seeds x 5
+        // partition-timing offsets = 1000 distinct abort timelines, each scanning all assigned slots
+        // for two owners at every quiescent chunk and asserting one-owner==SOURCE after heal.
+        for seed in 0..200u64 {
+            for partition_after in 0..5usize {
+                let snaps = run_migration_abort_leaves_one_owner_gate(seed, partition_after);
+                let (ref_owner, ref_epoch) = &snaps[0];
+                for (owner, epoch) in &snaps {
+                    assert_eq!(
+                        owner, ref_owner,
+                        "seed {seed}/{partition_after}: all nodes must converge to one \
+                         slot->owner view after the migration aborts"
+                    );
+                    assert_eq!(
+                        epoch, ref_epoch,
+                        "seed {seed}/{partition_after}: all nodes must agree on the config \
+                         epoch after the migration aborts"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migration_crash_at_flip_gate() {
+        // THE HA-6 MERGE-BLOCKER, across thousands of (seed, partition-timing) pairs. For each seed
+        // we vary `partition_after` so the leader is isolated at different points around the FLIP
+        // (randomized crash timing). Throughout EVERY run:
+        // - the split-brain checker (`assert_at_most_one_owner_per_slot`) runs at every quiescent
+        //   step -> two simultaneous owners of a migrating/flipped slot would panic immediately;
+        // - the epoch is monotone everywhere and the FLIP advances it past the pre-FLIP epoch;
+        // and after heal all nodes converge to ONE ownership view (SRC having lost the slots, the
+        // migration tag cleared, MOVED to DEST). A committed FLIP is never lost.
+        //
+        // 200 seeds x 5 partition-timing offsets = 1000 distinct migration timelines, each scanning
+        // all 3 nodes' ASSIGNED slots (epoch-keyed) for two owners at every quiescent chunk across
+        // the partition/heal timeline.
+        for seed in 0..200u64 {
+            for partition_after in 0..5usize {
+                let snaps = run_migration_crash_at_flip_gate(seed, partition_after);
+                let (ref_owner, ref_epoch) = &snaps[0];
+                for (owner, epoch) in &snaps {
+                    assert_eq!(
+                        owner, ref_owner,
+                        "seed {seed}/{partition_after}: all nodes must converge to one \
+                         slot->owner view after the migration heals"
+                    );
+                    assert_eq!(
+                        epoch, ref_epoch,
+                        "seed {seed}/{partition_after}: all nodes must agree on the config \
+                         epoch after the migration heals"
+                    );
+                }
+            }
+        }
+    }
 
     // -- scenario determinism_replay_3e ----------------------------------------
 
