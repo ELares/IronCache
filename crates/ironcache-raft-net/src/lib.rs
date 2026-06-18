@@ -893,6 +893,23 @@ impl StateMachine for RecordingSm {
             let _ = sink.send(entry.clone());
         }
     }
+
+    fn snapshot(&self) -> Vec<u8> {
+        // HA-3c: the loopback recorder's whole applied state is the COUNT of entries it has
+        // applied (the convergence witness is the apply sequence, which the test collects via
+        // the sink). Serialize that count little-endian so a node restored from a snapshot
+        // resumes a consistent apply WATERMARK; the per-entry record is a test artifact that
+        // does not survive compaction (compaction is opt-in via the config and this test SM is
+        // only used by the loopback proof, which does not exercise it).
+        (self.applied.len() as u64).to_le_bytes().to_vec()
+    }
+
+    fn restore(&mut self, _data: &[u8]) {
+        // HA-3c: restore by clearing the recorded sequence (the snapshot subsumes it). The
+        // count is implicit in the cleared-then-replayed tail; the recorder does not need to
+        // reconstruct the pre-snapshot entries (it never serialized them), so this is a clear.
+        self.applied.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -919,6 +936,7 @@ mod tests {
     /// wire codec is the one place that can silently corrupt consensus, so this
     /// exercises the full surface, not just the scalar messages.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn codec_round_trips_every_raftmsg_variant() {
         // RequestVote.
         assert_round_trips(&RaftMsg::RequestVote {
@@ -1021,6 +1039,47 @@ mod tests {
             prev_log_term: 5,
             entries: every_payload_kind_entries(),
             leader_commit: 11,
+        });
+
+        // HA-3c InstallSnapshot: empty data, a typical config-snapshot blob (arbitrary
+        // bytes incl. zero / CRLF / 0xFF), and the zero/large index/term edges, all
+        // round-trip byte-for-byte (the snapshot data is the field most likely to be
+        // mis-framed, so cover the length-prefixed blob edges).
+        assert_round_trips(&RaftMsg::InstallSnapshot {
+            term: 0,
+            leader_id: NodeId(0),
+            last_included_index: 0,
+            last_included_term: 0,
+            data: vec![],
+        });
+        assert_round_trips(&RaftMsg::InstallSnapshot {
+            term: 12,
+            leader_id: NodeId(4),
+            last_included_index: 9_001,
+            last_included_term: 11,
+            data: vec![0, 1, 2, 255, 254, 13, 10, 0, 42],
+        });
+        assert_round_trips(&RaftMsg::InstallSnapshot {
+            term: u64::MAX,
+            leader_id: NodeId(u64::MAX),
+            last_included_index: u64::MAX,
+            last_included_term: u64::MAX,
+            data: vec![7; 128],
+        });
+
+        // HA-3c InstallSnapshotResp: the term PLUS the echoed last_included_index (Figure
+        // 13), at the zero and large edges of both fields.
+        assert_round_trips(&RaftMsg::InstallSnapshotResp {
+            term: 0,
+            last_included_index: 0,
+        });
+        assert_round_trips(&RaftMsg::InstallSnapshotResp {
+            term: u64::MAX,
+            last_included_index: u64::MAX,
+        });
+        assert_round_trips(&RaftMsg::InstallSnapshotResp {
+            term: 7,
+            last_included_index: 9_001,
         });
     }
 

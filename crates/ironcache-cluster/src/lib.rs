@@ -321,6 +321,127 @@ fn is_valid_node_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+// ---------------------------------------------------------------------------
+// Compact, deterministic (de)serialization for the committed-config SNAPSHOT
+// (HA-3c). A tiny hand-rolled little-endian codec (no serde), mirroring the
+// raft-net wire / fsync-log style: a `u64` length-prefixed string, fixed-width
+// scalars, every read bounds-checked so a malformed buffer yields None.
+// ---------------------------------------------------------------------------
+
+fn ser_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn ser_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// A length-prefixed UTF-8 string: a `u64` byte length then the UTF-8 bytes.
+fn ser_str(out: &mut Vec<u8>, s: &str) {
+    ser_u64(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// A forward-only, bounds-checked cursor over a committed-config snapshot buffer.
+struct De<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> De<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        De { buf, pos: 0 }
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let end = self.pos.checked_add(2)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(u16::from_le_bytes([slice[0], slice[1]]))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let end = self.pos.checked_add(8)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(slice);
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    fn string(&mut self) -> Option<String> {
+        let len = usize::try_from(self.u64()?).ok()?;
+        let end = self.pos.checked_add(len)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        String::from_utf8(slice.to_vec()).ok()
+    }
+}
+
+/// The fully-decoded committed-config snapshot (the output of [`decode_committed_snapshot`],
+/// the input to the atomic publish phase of [`SlotMap::restore_committed`]). Holding the whole
+/// decode as owned buffers is what lets the restore reject a malformed snapshot BEFORE touching
+/// the live map (so a bad snapshot never half-wipes a good committed view) and then publish the
+/// good one in a single locked pass.
+struct CommittedSnapshot {
+    /// The committed cluster epoch (the log-driven counter).
+    epoch: u64,
+    /// The node table the snapshot carries (sorted by id by `serialize_committed`).
+    snap_nodes: Vec<NodeEntry>,
+    /// `(slot, owner_id)` for each assigned slot.
+    owners: Vec<(u16, String)>,
+    /// `(slot, replica_id)` for each slot with a replica.
+    reps: Vec<(u16, String)>,
+    /// `(slot, state_byte, peer_id)` for each migrating slot.
+    migs: Vec<(u16, u8, String)>,
+}
+
+/// Decode a committed-config snapshot (the inverse of [`SlotMap::serialize_committed`]) into
+/// owned buffers, or `None` on ANY short / malformed read. PURE: it touches no map state, so a
+/// `None` lets the caller leave the live map untouched (atomic-on-garbage). Mirrors the
+/// bounds-checked, no-serde decode style the rest of the crate uses.
+fn decode_committed_snapshot(data: &[u8]) -> Option<CommittedSnapshot> {
+    let mut cur = De::new(data);
+    let epoch = cur.u64()?;
+    let node_count = usize::try_from(cur.u64()?).ok()?;
+    let mut snap_nodes: Vec<NodeEntry> = Vec::with_capacity(node_count.min(CLUSTER_SLOTS as usize));
+    for _ in 0..node_count {
+        snap_nodes.push(NodeEntry {
+            id: cur.string()?.as_str().into(),
+            host: cur.string()?.as_str().into(),
+            port: cur.u16()?,
+        });
+    }
+    let owner_count = cur.u64()?;
+    let mut owners: Vec<(u16, String)> = Vec::new();
+    for _ in 0..owner_count {
+        owners.push((cur.u16()?, cur.string()?));
+    }
+    let rep_count = cur.u64()?;
+    let mut reps: Vec<(u16, String)> = Vec::new();
+    for _ in 0..rep_count {
+        reps.push((cur.u16()?, cur.string()?));
+    }
+    let mig_count = cur.u64()?;
+    let mut migs: Vec<(u16, u8, String)> = Vec::new();
+    for _ in 0..mig_count {
+        migs.push((cur.u16()?, cur.u8()?, cur.string()?));
+    }
+    Some(CommittedSnapshot {
+        epoch,
+        snap_nodes,
+        owners,
+        reps,
+        migs,
+    })
+}
+
 /// Allocate a dense `[AtomicU16; CLUSTER_SLOTS]` on the HEAP filled with `init`, avoiding a
 /// 32 KiB stack array (clippy::large_stack_arrays). Built via a `Vec` then converted to a
 /// boxed fixed-size array.
@@ -823,6 +944,243 @@ impl SlotMap {
     /// the single Raft control-plane task. So it does not perturb any pre-HA-4c behavior.
     pub fn set_committed_epoch(&self, epoch: u64) {
         self.current_epoch.store(epoch, Ordering::Release);
+    }
+
+    /// Serialize THIS map's COMMITTED CONFIG STATE to a compact, deterministic,
+    /// NODE-INDEPENDENT byte form (HA-3c Raft snapshot, CONTROL_PLANE.md). The bytes
+    /// capture the committed slot-ownership view -- the node table, owner-per-slot,
+    /// replica-per-slot, migration-per-slot, and the cluster epoch -- so a fresh node
+    /// fed the SAME committed `ConfigCmd` prefix produces the SAME bytes and a
+    /// [`restore_committed`](Self::restore_committed) of those bytes reaches an
+    /// IDENTICAL committed view. This is the `SlotMap` half of the config state
+    /// machine's `StateMachine::snapshot`.
+    ///
+    /// NODE-INDEPENDENCE is the whole point: `owner[]` / `replicas[]` /
+    /// `migration_peer[]` hold table INDICES, which differ per node's table order (each
+    /// node lists ITSELF first via `empty_self`), so the on-the-wire form is keyed by
+    /// node-ID STRING instead, and the node list is sorted by id, so two nodes at the
+    /// same committed prefix emit byte-identical snapshots. THIS node's own identity
+    /// (`self_idx`) is NOT serialized: a restore preserves the restoring node's own
+    /// `empty_self` identity (it stays node-relative), exactly as replaying the
+    /// committed log entry-by-entry would.
+    ///
+    /// The local advertised endpoint of self is part of the node list (so a restore on
+    /// a peer rebuilds the same table), but the committed epoch carried is the
+    /// log-driven `current_epoch`. Reads the whole state under the node lock so the
+    /// node table, owner array, and the parallel arrays are a consistent snapshot.
+    #[must_use]
+    pub fn serialize_committed(&self) -> Vec<u8> {
+        let table = self.table.lock().expect("slot-map node lock poisoned");
+
+        // The node-id for a table index, or None for UNASSIGNED / out of range.
+        let id_of = |idx: u16| -> Option<&str> {
+            if idx == UNASSIGNED {
+                return None;
+            }
+            table.nodes.get(idx as usize).map(|n| n.id.as_ref())
+        };
+
+        // Nodes, SORTED BY ID for a node-independent byte order.
+        let mut nodes: Vec<&NodeEntry> = table.nodes.iter().collect();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut out = Vec::with_capacity(256);
+        // The committed cluster epoch (the log-driven counter the ConfigSm publishes).
+        ser_u64(&mut out, self.current_epoch.load(Ordering::Acquire));
+        // Node table (sorted by id): count, then (id, host, port) each.
+        ser_u64(&mut out, nodes.len() as u64);
+        for n in &nodes {
+            ser_str(&mut out, &n.id);
+            ser_str(&mut out, &n.host);
+            ser_u16(&mut out, n.port);
+        }
+        // Owner-per-slot, as (slot, owner_id) for each ASSIGNED slot (ascending slot).
+        let mut owners: Vec<(u16, &str)> = Vec::new();
+        for slot in 0..CLUSTER_SLOTS {
+            if let Some(id) = id_of(self.owner[slot as usize].load(Ordering::Acquire)) {
+                owners.push((slot, id));
+            }
+        }
+        ser_u64(&mut out, owners.len() as u64);
+        for (slot, id) in &owners {
+            ser_u16(&mut out, *slot);
+            ser_str(&mut out, id);
+        }
+        // Replica-per-slot, as (slot, replica_id) for each slot with a replica.
+        let mut reps: Vec<(u16, &str)> = Vec::new();
+        for slot in 0..CLUSTER_SLOTS {
+            if let Some(id) = id_of(self.replicas[slot as usize].load(Ordering::Acquire)) {
+                reps.push((slot, id));
+            }
+        }
+        ser_u64(&mut out, reps.len() as u64);
+        for (slot, id) in &reps {
+            ser_u16(&mut out, *slot);
+            ser_str(&mut out, id);
+        }
+        // Migration-per-slot, as (slot, state_byte, peer_id) for each migrating slot.
+        let mut migs: Vec<(u16, u8, &str)> = Vec::new();
+        for slot in 0..CLUSTER_SLOTS {
+            let st = self.migration_state[slot as usize].load(Ordering::Acquire);
+            if st == MIG_NONE {
+                continue;
+            }
+            if let Some(id) = id_of(self.migration_peer[slot as usize].load(Ordering::Acquire)) {
+                migs.push((slot, st, id));
+            }
+        }
+        ser_u64(&mut out, migs.len() as u64);
+        for (slot, st, id) in &migs {
+            ser_u16(&mut out, *slot);
+            out.push(*st);
+            ser_str(&mut out, id);
+        }
+        out
+    }
+
+    /// REPLACE this map's committed config state with the one serialized in `data`
+    /// (HA-3c Raft snapshot restore). The inverse of
+    /// [`serialize_committed`](Self::serialize_committed): after a restore the map's
+    /// committed view (node table, owner / replica / migration per slot, epoch) is
+    /// IDENTICAL to a map that had applied the same committed prefix, EXCEPT it keeps
+    /// THIS node's own `empty_self` self-identity (so `owns()` / `me()` stay
+    /// node-relative). Used when the config state machine installs a leader's snapshot
+    /// or restores from a persisted snapshot on restart.
+    ///
+    /// It MUTATES THE EXISTING (shared) map in place rather than returning a new one,
+    /// because the production `ConfigSm` holds an `Arc<SlotMap>` ALSO read by the serve
+    /// path; an in-place restore keeps that shared `Arc` valid.
+    ///
+    /// ## ATOMIC vs concurrent `owns()` READERS (FIX 3)
+    ///
+    /// This is the SINGLE writer (the Raft control-plane task), but it is NOT the only
+    /// accessor: the serve / routing threads call [`owns`](Self::owns) (a lock-free
+    /// `Acquire` load of `mine[slot]`) on the hot path WITHOUT taking the table lock. The
+    /// earlier "clear every `mine[]` to false, release the lock, then re-set the owned
+    /// slots one at a time" shape therefore had a WINDOW: a concurrent `owns(slot)` for a
+    /// slot this node actually owns could observe the transient `false` and emit a SPURIOUS
+    /// `MOVED` for an owned key, for the whole 16384-slot rebuild. Holding the table lock
+    /// alone does NOT fix this (`owns()` never takes that lock).
+    ///
+    /// So the restore is now COMPUTE-THEN-PUBLISH: it DECODES the whole snapshot into local
+    /// buffers FIRST, then under the table lock writes each per-slot atomic exactly ONCE to
+    /// its FINAL value. A slot owned by self both before and after is written `true` (its
+    /// observable value never dips to `false`); a slot that changes hands is written once to
+    /// its new value. A concurrent `owns(slot)` thus sees only the BEFORE or the AFTER value
+    /// for that slot, never a torn all-cleared intermediate. The node table (`nodes` /
+    /// `config_epochs` / `self_idx`) is swapped under the SAME held lock so the cold MOVED /
+    /// projection readers (which DO take the lock) see a consistent table+index snapshot.
+    ///
+    /// ## Atomicity on malformed input
+    ///
+    /// A malformed / truncated `data` (never produced by `serialize_committed`) is detected
+    /// DURING the decode phase, BEFORE any mutation, so the map is left UNCHANGED (a bad
+    /// snapshot never half-wipes a good committed view). Restore stays total (no panic).
+    ///
+    /// Self-identity is preserved: the restored table keeps THIS node's own `empty_self`
+    /// entry as `self_idx`, with the snapshot's other nodes appended (a snapshot node whose
+    /// id equals self's is folded onto self, exactly as the prior `meet`-is-idempotent-on-
+    /// self-by-id path did), so `owns()` / `me()` stay node-relative.
+    ///
+    /// FORWARD-ONLY SAFETY: the engine restores only from a snapshot of an APPLIED =
+    /// COMMITTED prefix, so this never installs an uncommitted or conflicting view.
+    pub fn restore_committed(&self, data: &[u8]) {
+        // -- PHASE 1: DECODE into local buffers. A short / malformed read yields None and the
+        // map is left UNCHANGED (no half-wipe of a good committed view).
+        let Some(CommittedSnapshot {
+            epoch,
+            snap_nodes,
+            owners,
+            reps,
+            migs,
+        }) = decode_committed_snapshot(data)
+        else {
+            return;
+        };
+
+        // -- PHASE 2: PUBLISH atomically under the table lock. Build the new node table
+        // (self preserved + snapshot peers appended), resolve every id to its index in that
+        // table, then write each slot's atomics ONCE to its final value (no clear-pass), so a
+        // concurrent lock-free owns() sees only before-or-after per slot.
+        let mut table = self.table.lock().expect("slot-map node lock poisoned");
+
+        // Keep THIS node's own entry as self (node-relative identity). Append each snapshot
+        // node whose id is NOT already present (self's id is present), mirroring the prior
+        // forget-all-then-meet-each path (meet is idempotent on self by id).
+        let me_idx = self.self_idx.load(Ordering::Acquire) as usize;
+        let self_entry = table.nodes[me_idx].clone();
+        let mut new_nodes: Vec<NodeEntry> = Vec::with_capacity(snap_nodes.len() + 1);
+        let mut new_epochs: Vec<u64> = Vec::with_capacity(snap_nodes.len() + 1);
+        new_nodes.push(self_entry.clone());
+        new_epochs.push(0);
+        for n in snap_nodes {
+            if new_nodes.iter().any(|e| e.id == n.id) {
+                continue; // idempotent on self / any duplicate id, exactly like meet().
+            }
+            new_nodes.push(n);
+            new_epochs.push(0);
+        }
+        // An id -> new-table-index lookup over the rebuilt node list.
+        let index_of = |id: &str| -> Option<u16> {
+            new_nodes
+                .iter()
+                .position(|e| e.id.as_ref() == id)
+                .map(|p| p as u16)
+        };
+
+        // Per-slot FINAL values, defaulting to the empty baseline; the snapshot lists fill
+        // in the assigned slots. Computing into dense fixed arrays keeps the publish a single
+        // pass of one-store-per-atomic with no transient clear.
+        let n_slots = CLUSTER_SLOTS as usize;
+        let mut owner_of = vec![UNASSIGNED; n_slots];
+        let mut mine_of = vec![false; n_slots];
+        let mut replica_of = vec![UNASSIGNED; n_slots];
+        let mut mig_state_of = vec![MIG_NONE; n_slots];
+        let mut mig_peer_of = vec![UNASSIGNED; n_slots];
+
+        for (slot, id) in &owners {
+            if let (true, Some(idx)) = ((*slot as usize) < n_slots, index_of(id)) {
+                owner_of[*slot as usize] = idx;
+                // mine[slot] is true iff the new owner IS self: by table index OR by
+                // advertised endpoint (the dual announce-id / synth-id identity), the same
+                // rule set_slot_node uses. self is at index 0 of new_nodes.
+                let is_self = idx == 0
+                    || new_nodes.get(idx as usize).is_some_and(|owner| {
+                        owner.host == self_entry.host && owner.port == self_entry.port
+                    });
+                mine_of[*slot as usize] = is_self;
+            }
+        }
+        for (slot, id) in &reps {
+            if let (true, Some(idx)) = ((*slot as usize) < n_slots, index_of(id)) {
+                replica_of[*slot as usize] = idx;
+            }
+        }
+        for (slot, st, id) in &migs {
+            if (*slot as usize) < n_slots && (*st == MIG_MIGRATING || *st == MIG_IMPORTING) {
+                if let Some(idx) = index_of(id) {
+                    mig_state_of[*slot as usize] = *st;
+                    mig_peer_of[*slot as usize] = idx;
+                }
+            }
+        }
+
+        // Swap in the new node table + reset self to index 0 (where we placed it), THEN write
+        // each slot's atomics ONCE to its final value, all while holding the lock.
+        table.nodes = new_nodes;
+        table.config_epochs = new_epochs;
+        self.self_idx.store(0, Ordering::Release);
+        for slot in 0..n_slots {
+            self.owner[slot].store(owner_of[slot], Ordering::Release);
+            self.mine[slot].store(mine_of[slot], Ordering::Release);
+            self.replicas[slot].store(replica_of[slot], Ordering::Release);
+            self.migration_state[slot].store(mig_state_of[slot], Ordering::Release);
+            self.migration_peer[slot].store(mig_peer_of[slot], Ordering::Release);
+        }
+        // Publish the committed epoch (the log-driven counter) under the SAME lock, so a
+        // reader that already holds a consistent table also reads the matching epoch.
+        self.current_epoch.store(epoch, Ordering::Release);
+        drop(table);
     }
 
     /// Coalesce contiguous runs of equal-owner slots into `(start, end, node_index)` ranges,
@@ -2040,5 +2398,172 @@ mod tests {
             let table = self.table.lock().expect("slot-map node lock poisoned");
             table.nodes.get(idx as usize).map(|n| n.id.clone())
         }
+    }
+
+    // ----- HA-3c: committed-config serialize / restore (the Raft snapshot SlotMap half) -----
+
+    /// `serialize_committed` -> `restore_committed` round-trips the WHOLE committed view: a map
+    /// with peers, owners (incl. a foreign owner), a replica, and a live migration restores into a
+    /// fresh `empty_self` of the SAME node to an IDENTICAL committed view (node-relative owns(),
+    /// owner ids per slot, replica, migration state + peer, epoch). This is the property the config
+    /// state machine's snapshot/restore rests on.
+    #[test]
+    fn serialize_restore_round_trips_the_committed_view() {
+        // Build a rich committed view on node ID0's map.
+        let src = SlotMap::empty_self(ID0, "10.0.0.0", 7000);
+        src.meet(node(ID1, "10.0.0.1", 7001));
+        src.meet(node(ID2, "10.0.0.2", 7002));
+        // ID0 owns [0,1,2]; ID1 owns [100]; ID2 owns [200].
+        src.set_slot_node(0, ID0).unwrap();
+        src.set_slot_node(1, ID0).unwrap();
+        src.set_slot_node(2, ID0).unwrap();
+        src.set_slot_node(100, ID1).unwrap();
+        src.set_slot_node(200, ID2).unwrap();
+        // ID1 replicates slot 0; slot 2 is MIGRATING from ID0 -> ID1 (ID0 owns it, so the tag holds).
+        src.set_slot_replica(0, ID1).unwrap();
+        src.set_migrating(2, ID1).unwrap();
+        src.set_committed_epoch(7);
+
+        let bytes = src.serialize_committed();
+
+        // Restore into a FRESH empty_self of the SAME node (keeps ID0's self-identity).
+        let dst = SlotMap::empty_self(ID0, "10.0.0.0", 7000);
+        dst.restore_committed(&bytes);
+
+        // The committed view is identical: node-relative ownership, owner ids per slot, the
+        // replica, the migration, and the epoch.
+        assert_eq!(dst.known_nodes(), 3);
+        assert!(dst.owns(0) && dst.owns(1) && dst.owns(2));
+        assert!(!dst.owns(100) && !dst.owns(200));
+        assert_eq!(dst.owner_id(100).as_deref(), Some(ID1));
+        assert_eq!(dst.owner_id(200).as_deref(), Some(ID2));
+        assert!(dst.is_replica_of(0, ID1));
+        assert_eq!(dst.migration_state(2), MigrationState::Migrating);
+        assert_eq!(dst.migration_peer_id(2).as_deref(), Some(ID1));
+        assert_eq!(dst.current_epoch(), 7);
+        // Re-serializing the restored map yields the SAME bytes (a fixed point: the form is a
+        // deterministic function of the committed view, so a round-trip is idempotent).
+        assert_eq!(dst.serialize_committed(), bytes);
+    }
+
+    /// restore_committed REPLACES whatever was in the map: a map already carrying stale committed
+    /// state (different owners / replicas / migration) is fully overwritten by the snapshot, so the
+    /// restored view matches the snapshot and not the prior state (the install-on-a-lagging-node
+    /// case). Self-identity is preserved.
+    #[test]
+    fn restore_overwrites_prior_committed_state() {
+        // Source view: ID1's map where ID0 owns [0], ID1 owns [1].
+        let src = SlotMap::empty_self(ID1, "10.0.0.1", 7001);
+        src.meet(node(ID0, "10.0.0.0", 7000));
+        src.set_slot_node(0, ID0).unwrap();
+        src.set_slot_node(1, ID1).unwrap();
+        src.set_committed_epoch(3);
+        let bytes = src.serialize_committed();
+
+        // Destination starts with DIFFERENT stale committed state (ID1 owns [0,1], a stale peer).
+        let dst = SlotMap::empty_self(ID1, "10.0.0.1", 7001);
+        dst.meet(node(ID2, "10.0.0.2", 7002));
+        dst.set_slot_node(0, ID1).unwrap();
+        dst.set_slot_node(1, ID1).unwrap();
+        dst.set_slot_node(50, ID2).unwrap();
+        dst.set_committed_epoch(99);
+        assert!(dst.owns(0));
+
+        dst.restore_committed(&bytes);
+
+        // The stale state is gone; the snapshot view is in place. ID1's self-identity is kept, so
+        // owns() is node-relative: ID1 owns [1], ID0 owns [0], slot 50 is unassigned, epoch is 3.
+        assert!(
+            !dst.owns(0),
+            "slot 0 is ID0's in the snapshot, not self (ID1)"
+        );
+        assert!(dst.owns(1), "slot 1 is self's (ID1) in the snapshot");
+        assert_eq!(dst.owner_id(0).as_deref(), Some(ID0));
+        assert_eq!(dst.owner_id(50), None, "the stale slot 50 is gone");
+        assert_eq!(dst.current_epoch(), 3);
+        assert_eq!(dst.serialize_committed(), bytes);
+    }
+
+    /// A malformed / truncated buffer (never produced by `serialize_committed`) leaves the map
+    /// UNCHANGED rather than panicking (restore is total). FIX 3 made restore decode-first-then-
+    /// publish, so a bad snapshot is rejected DURING the decode phase before ANY mutation: a
+    /// malformed snapshot can no longer half-wipe a good committed view (strictly safer than the
+    /// prior clear-to-baseline behaviour, and an extension of the atomic-restore property).
+    #[test]
+    fn restore_of_garbage_is_total_and_leaves_the_map_unchanged() {
+        let map = SlotMap::empty_self(ID0, "10.0.0.0", 7000);
+        map.meet(node(ID1, "10.0.0.1", 7001));
+        map.set_slot_node(0, ID0).unwrap();
+        map.set_committed_epoch(5);
+        // Truncated buffer (a half-written u64 epoch) is rejected before any mutation.
+        map.restore_committed(&[1, 2, 3]);
+        // The prior good committed view is intact (the bad snapshot did not touch it).
+        assert!(
+            map.owns(0),
+            "the owned slot survives a rejected garbage restore"
+        );
+        assert_eq!(map.slots_assigned(), 1);
+        assert_eq!(map.known_nodes(), 2);
+        assert_eq!(map.current_epoch(), 5);
+    }
+
+    /// FIX 3: a restore writes each `mine[slot]` ONCE to its FINAL value (compute-then-publish),
+    /// never through an all-cleared intermediate, so a concurrent lock-free `owns(slot)` for a
+    /// slot that is self's both BEFORE and AFTER the restore can never observe a transient
+    /// `false` (the spurious-MOVED window the old clear-then-reset shape had). We cannot easily
+    /// catch a sub-microsecond torn read deterministically, but we CAN prove the post-restore
+    /// `owns()` view exactly matches the serialized state, and (the structural guarantee) that a
+    /// slot owned in both the prior and the restored view stays owned with no API that clears it
+    /// first. This ordering test hammers owns() on a stable-owned slot across many restores from
+    /// a separate thread and asserts it is NEVER observed false.
+    #[test]
+    fn restore_never_transiently_clears_a_stably_owned_slot() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+
+        // ID0 owns slot 0 in BOTH the source and a second source, so slot 0 is self's across
+        // every restore: a correct compute-then-publish never dips owns(0) to false.
+        let make_bytes = |peer_owns_extra: u16| -> Vec<u8> {
+            let src = SlotMap::empty_self(ID0, "10.0.0.0", 7000);
+            src.meet(node(ID1, "10.0.0.1", 7001));
+            src.set_slot_node(0, ID0).unwrap(); // slot 0 is ALWAYS self's.
+            src.set_slot_node(peer_owns_extra, ID1).unwrap(); // a churning foreign slot.
+            src.set_committed_epoch(1);
+            src.serialize_committed()
+        };
+        let bytes_a = make_bytes(100);
+        let bytes_b = make_bytes(200);
+
+        let map = StdArc::new(SlotMap::empty_self(ID0, "10.0.0.0", 7000));
+        map.restore_committed(&bytes_a); // establish the initial owned view.
+        assert!(map.owns(0));
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let saw_false = StdArc::new(AtomicBool::new(false));
+        let reader = {
+            let map = StdArc::clone(&map);
+            let stop = StdArc::clone(&stop);
+            let saw_false = StdArc::clone(&saw_false);
+            std::thread::spawn(move || {
+                while !stop.load(O::Acquire) {
+                    if !map.owns(0) {
+                        saw_false.store(true, O::Release);
+                    }
+                }
+            })
+        };
+        // Hammer restores from the writer side; slot 0 must stay owned throughout.
+        for i in 0..2000u32 {
+            map.restore_committed(if i % 2 == 0 { &bytes_a } else { &bytes_b });
+        }
+        stop.store(true, O::Release);
+        reader.join().expect("reader thread joins");
+        assert!(
+            !saw_false.load(O::Acquire),
+            "owns(0) for a stably-owned slot must NEVER be observed false during a restore"
+        );
+        // And the final view is exactly the serialized state.
+        assert!(map.owns(0));
+        assert!(!map.owns(100) && !map.owns(200));
     }
 }

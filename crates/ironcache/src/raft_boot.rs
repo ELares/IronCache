@@ -162,6 +162,15 @@ pub fn spawn_control_plane(
     // cannot persist its log must not vote), matching the existing storage-open degradation.
     let storage_path = raft_log_path(config.data_dir.as_deref(), listen_addr.port());
 
+    // The PRODUCTION RaftConfig: the engine's own default `snapshot_threshold` is 0 (compaction
+    // OFF, so the determinism sweep + direct-`RaftConfig` tests stay byte-identical), but a real
+    // raft-mode deployment must compact (HA-3c), so override it with the configured
+    // `raft_snapshot_threshold` (default 1024, non-zero). Everything else stays the engine default.
+    let raft_config = RaftConfig {
+        snapshot_threshold: config.raft_snapshot_threshold,
+        ..RaftConfig::default()
+    };
+
     // Build the engine + adapter + handle on the spawned control-plane thread (the engine and its
     // FileStorage / PeerConns are !Send, so they must be constructed where they live). Hand the
     // Send NodeHandle back over a std mpsc, mirroring the HA-4a loopback proof's spawn pattern.
@@ -171,8 +180,11 @@ pub fn spawn_control_plane(
         .name("ironcache-raft".to_string())
         .spawn(move || {
             run_control_plane_thread(
-                self_node_id,
-                voters,
+                ControlPlaneParams {
+                    self_node_id,
+                    voters,
+                    raft_config,
+                },
                 peers,
                 listen_addr,
                 storage_path,
@@ -196,6 +208,16 @@ pub fn spawn_control_plane(
     }
 }
 
+/// The inputs the control-plane thread needs to STAND UP THE ENGINE: this node's id, the static
+/// voter set, and the production [`RaftConfig`] (default timing + the configured HA-3c compaction
+/// threshold). Bundled into one struct so [`run_control_plane_thread`] stays under the argument
+/// cap and the engine-identity inputs are named together.
+struct ControlPlaneParams {
+    self_node_id: NodeId,
+    voters: BTreeSet<NodeId>,
+    raft_config: RaftConfig,
+}
+
 /// The body of the dedicated control-plane OS thread: build a current-thread tokio runtime + a
 /// `LocalSet`, bind the RAFTMSG listener, construct the engine (FileStorage + ConfigSm over the
 /// shared map), and run [`RaftClusterBusNode::run`] + [`run_listener`] until the process ends.
@@ -204,14 +226,18 @@ pub fn spawn_control_plane(
 /// HA-4a loopback proof exactly. The `LocalSet` keeps the engine + connections shard-local
 /// (`!Send`), matching the shared-nothing model (ADR-0002).
 fn run_control_plane_thread(
-    self_node_id: NodeId,
-    voters: BTreeSet<NodeId>,
+    params: ControlPlaneParams,
     peers: BTreeMap<NodeId, SocketAddr>,
     listen_addr: SocketAddr,
     storage_path: std::path::PathBuf,
     cluster: Arc<ironcache_cluster::SlotMap>,
     handle_tx: &std::sync::mpsc::Sender<NodeHandle>,
 ) {
+    let ControlPlaneParams {
+        self_node_id,
+        voters,
+        raft_config,
+    } = params;
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -264,13 +290,14 @@ fn run_control_plane_thread(
             }
         };
 
-        // The engine: this node's id, the static voter set, durable storage, default Raft timing,
-        // and the PRODUCTION ConfigSm over the SHARED Arc<SlotMap> (also ctx.cluster).
+        // The engine: this node's id, the static voter set, durable storage, the PRODUCTION
+        // RaftConfig (default timing + the configured non-zero compaction threshold, HA-3c), and
+        // the PRODUCTION ConfigSm over the SHARED Arc<SlotMap> (also ctx.cluster).
         let raft = RaftNode::with_state_machine(
             self_node_id,
             voters,
             storage,
-            RaftConfig::default(),
+            raft_config,
             ConfigSm::new(cluster),
         );
         let runtime = TokioRuntime::new();

@@ -295,6 +295,16 @@ pub struct Config {
     /// fails over faster (at the cost of more spurious-but-safe promotions). Meaningful
     /// ONLY in raft-governance mode. Defaults to [`DEFAULT_FAILOVER_TIMEOUT_SECS`].
     pub failover_timeout_secs: u64,
+    /// The HA-3c Raft-log compaction threshold: once the number of committed-and-applied
+    /// log entries ABOVE the last snapshot exceeds this, the raft control plane snapshots
+    /// its state machine and compacts the log to there (Raft section 7), bounding the
+    /// on-disk log + the post-restart replay. Passed straight into
+    /// `RaftConfig.snapshot_threshold`. Defaults to [`DEFAULT_RAFT_SNAPSHOT_THRESHOLD`]
+    /// (1024, NON-ZERO) so a real deployment actually compacts; `0` DISABLES compaction
+    /// (the log grows unbounded, the pre-3c behaviour). Meaningful ONLY in raft-governance
+    /// mode (the default static path never builds a `RaftConfig`). TOML
+    /// (`raft_snapshot_threshold = N`) + the `IRONCACHE_RAFT_SNAPSHOT_THRESHOLD` env var.
+    pub raft_snapshot_threshold: u64,
     /// The durable data directory for the Raft log (and future on-disk state). When set, a
     /// raft-mode node persists its committed Raft log at `<data_dir>/ironcache-raft-<bus-port>.log`,
     /// so the control-plane state survives a reboot that clears the OS temp dir. When `None`
@@ -342,6 +352,10 @@ impl Default for Config {
             // never reads them, so they do not perturb the default posture).
             replica_max_lag: DEFAULT_REPLICA_MAX_LAG,
             failover_timeout_secs: DEFAULT_FAILOVER_TIMEOUT_SECS,
+            // A NON-ZERO production compaction cadence (the engine's own default is 0 =
+            // disabled, to keep the determinism sweep byte-identical); a real raft-mode
+            // node compacts once its log grows this far past the last snapshot.
+            raft_snapshot_threshold: DEFAULT_RAFT_SNAPSHOT_THRESHOLD,
             // No data directory by default: the Raft log lands under the OS temp dir
             // (byte-unchanged pre-existing behavior). Setting it makes the log durable
             // across a reboot that clears /tmp. Meaningful only in raft-governance mode.
@@ -359,6 +373,17 @@ pub const DEFAULT_REPLICA_MAX_LAG: u64 = 256;
 /// continuously down before the replica proposes its own promotion. Comfortably above
 /// the replication poll cadence so a single missed poll does not trigger a failover.
 pub const DEFAULT_FAILOVER_TIMEOUT_SECS: u64 = 5;
+
+/// Default HA-3c Raft-log compaction threshold (entries above the last snapshot). A
+/// PRODUCTION default of 1024: a real raft-mode deployment compacts its log once it grows
+/// this far past the last snapshot, bounding the on-disk log and the replay time after a
+/// restart -- the whole point of HA-3c. NON-ZERO so a real node actually compacts, unlike
+/// the pure-engine default ([`ironcache_raft::DEFAULT_SNAPSHOT_THRESHOLD`] = 0, which keeps
+/// the determinism sweep + every direct-`RaftConfig` test byte-identical). The config
+/// snapshot is tiny (the committed `SlotMap` state), so 1024 entries between snapshots is a
+/// comfortable, cheap cadence. Only the raft-governance boot path reads this; the default
+/// static path never does.
+pub const DEFAULT_RAFT_SNAPSHOT_THRESHOLD: u64 = 1024;
 
 /// The eight Redis `maxmemory-policy` names IronCache accepts (EVICTION.md #50).
 /// Inlined here (rather than depending on `ironcache-eviction`) to keep the config
@@ -658,6 +683,11 @@ pub struct ConfigOverlay {
     /// promotion. TOML (`failover_timeout_secs = N`) + the `IRONCACHE_FAILOVER_TIMEOUT_SECS`
     /// env var. `None` leaves the lower layer (default [`DEFAULT_FAILOVER_TIMEOUT_SECS`]).
     pub failover_timeout_secs: Option<u64>,
+    /// HA-3c Raft-log compaction threshold (entries above the last snapshot). TOML
+    /// (`raft_snapshot_threshold = N`) + the `IRONCACHE_RAFT_SNAPSHOT_THRESHOLD` env var.
+    /// `None` leaves the lower layer (default [`DEFAULT_RAFT_SNAPSHOT_THRESHOLD`]); `0`
+    /// disables compaction.
+    pub raft_snapshot_threshold: Option<u64>,
     /// The durable data directory for the Raft log (and future on-disk state). TOML
     /// (`data_dir = "/var/lib/ironcache"`, a string path) + the `IRONCACHE_DATA_DIR` env var.
     /// `None` leaves the lower layer (default `None` = the OS temp dir, byte-unchanged).
@@ -748,6 +778,12 @@ impl ConfigOverlay {
                 reason: format!("not a number: {v}"),
             })?);
         }
+        if let Ok(v) = std::env::var("IRONCACHE_RAFT_SNAPSHOT_THRESHOLD") {
+            o.raft_snapshot_threshold = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "raft-snapshot-threshold",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
         // The durable data directory is a single scalar path, so it is env-encodable (useful
         // for per-pod injection in a stateful set alongside the announce id). A path is taken
         // verbatim (no parse can fail); an empty value is rejected by Config::validate.
@@ -814,6 +850,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.failover_timeout_secs {
             cfg.failover_timeout_secs = v;
+        }
+        if let Some(v) = self.raft_snapshot_threshold {
+            cfg.raft_snapshot_threshold = v;
         }
         if let Some(ref v) = self.data_dir {
             cfg.data_dir = Some(v.clone());
@@ -927,6 +966,10 @@ mod tests {
         // HA-8 knobs default to the documented constants (meaningful only in raft-mode).
         assert_eq!(c.replica_max_lag, DEFAULT_REPLICA_MAX_LAG);
         assert_eq!(c.failover_timeout_secs, DEFAULT_FAILOVER_TIMEOUT_SECS);
+        // HA-3c compaction threshold defaults to the NON-ZERO production cadence so a real
+        // raft-mode node actually compacts (the engine's own default is 0 = disabled).
+        assert_eq!(c.raft_snapshot_threshold, DEFAULT_RAFT_SNAPSHOT_THRESHOLD);
+        assert_ne!(c.raft_snapshot_threshold, 0);
         // No data directory by default: the Raft log lands under the OS temp dir (unchanged).
         assert!(c.data_dir.is_none());
         c.validate().unwrap();
@@ -977,19 +1020,35 @@ mod tests {
         let c = Config::resolve(&[ConfigOverlay {
             replica_max_lag: Some(1024),
             failover_timeout_secs: Some(12),
+            raft_snapshot_threshold: Some(256),
             ..Default::default()
         }])
         .unwrap();
         assert_eq!(c.replica_max_lag, 1024);
         assert_eq!(c.failover_timeout_secs, 12);
+        assert_eq!(c.raft_snapshot_threshold, 256);
         let unset = Config::resolve(&[ConfigOverlay::default()]).unwrap();
         assert_eq!(unset.replica_max_lag, DEFAULT_REPLICA_MAX_LAG);
         assert_eq!(unset.failover_timeout_secs, DEFAULT_FAILOVER_TIMEOUT_SECS);
+        assert_eq!(
+            unset.raft_snapshot_threshold,
+            DEFAULT_RAFT_SNAPSHOT_THRESHOLD
+        );
+        // An explicit 0 disables compaction (the pre-3c unbounded-log behaviour).
+        let disabled = Config::resolve(&[ConfigOverlay {
+            raft_snapshot_threshold: Some(0),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(disabled.raft_snapshot_threshold, 0);
         // TOML form.
-        let o = ConfigOverlay::from_toml_str("replica_max_lag = 64\nfailover_timeout_secs = 3\n")
-            .unwrap();
+        let o = ConfigOverlay::from_toml_str(
+            "replica_max_lag = 64\nfailover_timeout_secs = 3\nraft_snapshot_threshold = 2048\n",
+        )
+        .unwrap();
         assert_eq!(o.replica_max_lag, Some(64));
         assert_eq!(o.failover_timeout_secs, Some(3));
+        assert_eq!(o.raft_snapshot_threshold, Some(2048));
     }
 
     #[test]

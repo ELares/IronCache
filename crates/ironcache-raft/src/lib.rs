@@ -393,6 +393,55 @@ pub enum RaftMsg {
         /// `Some(index)` if the leader accepted the forwarded proposal, else `None`.
         outcome: Option<u64>,
     },
+    /// The INSTALLSNAPSHOT RPC (Raft section 7 / Figure 13): a leader ships its whole
+    /// state-machine snapshot to a follower whose required log entries the leader has
+    /// ALREADY COMPACTED away (the follower's `next_index` fell below the leader's
+    /// `log_start_index`, so an AppendEntries can no longer carry the missing prefix).
+    /// This is a single-chunk install: the config snapshot the real workload carries is
+    /// small (the `SlotMap`'s committed state), so the whole snapshot fits in one message;
+    /// CHUNKING (`offset` / `done`, Figure 13) is a documented future extension and is
+    /// NOT needed for correctness at this size.
+    ///
+    /// SAFETY (State-Machine-Safety): a leader snapshots ONLY its applied = committed
+    /// prefix, so `last_included_index` is committed; installing it on a follower moves
+    /// that follower FORWARD to a committed prefix and can never overwrite a different
+    /// committed entry. The follower runs the standard [`observe_term`] higher-term
+    /// step-down FIRST, exactly like the other RPC handlers.
+    InstallSnapshot {
+        /// The leader's term.
+        term: u64,
+        /// The leader, so the follower records / redirects to it (mirrors AppendEntries).
+        leader_id: NodeId,
+        /// The snapshot's last included log index (its state subsumes every entry
+        /// at-or-below this).
+        last_included_index: u64,
+        /// The term of the snapshot's last included entry (the prev-log-term the entry
+        /// FOLLOWING the snapshot is checked against).
+        last_included_term: u64,
+        /// The [`StateMachine`]-serialized state at `last_included_index` (single chunk).
+        data: Vec<u8>,
+    },
+    /// A follower's reply to a [`RaftMsg::InstallSnapshot`] (Raft Figure 13 results).
+    /// Carries the follower's `term` (so the leader can step down on a higher one) AND
+    /// the `last_included_index` of the snapshot the follower just installed, ECHOED back
+    /// from the request. (No success flag: a same-or-lower-term InstallSnapshot is always
+    /// installable, and a higher-term reply steps the leader down.)
+    ///
+    /// SAFETY (no false-commit): the leader advances the follower's
+    /// `match_index`/`next_index` from THIS echoed index, NOT from the leader's OWN
+    /// current `load_snapshot()` meta. The leader may compact AGAIN (to a higher index
+    /// `K'`) between sending `InstallSnapshot(K)` and receiving this reply; reading the
+    /// leader's current meta would set `match_index[from] = K' > K`, claiming the follower
+    /// replicated past what it actually installed and risking a commit on a non-majority
+    /// (Figure 13). Echoing `K` keeps `match_index` honest.
+    InstallSnapshotResp {
+        /// The follower's current term, for the leader to update itself.
+        term: u64,
+        /// The `last_included_index` of the snapshot the follower installed, echoed from
+        /// the [`RaftMsg::InstallSnapshot`] request so the leader advances this follower's
+        /// markers from exactly that index (and never past it).
+        last_included_index: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +507,62 @@ pub trait RaftStorage {
     /// must fetch the whole entry by index. The default impl is derived from the
     /// other 1-based accessors; [`MemStorage`] overrides it with a direct `Vec` index.
     fn entry_at(&self, index: u64) -> Option<LogEntry>;
+
+    // -- 3c snapshot + log-compaction extensions (Raft section 7) -----------
+
+    /// Durably persist a snapshot's metadata + `data`, REPLACING any prior snapshot.
+    /// `meta` carries the snapshot's `last_included_index` / `last_included_term` (the
+    /// last log entry the snapshot subsumes); `data` is the [`StateMachine`]-serialized
+    /// state at that index. After this returns the store can answer
+    /// [`term_at`](RaftStorage::term_at)`(last_included_index)` as `last_included_term`
+    /// EVEN ONCE the underlying entries are compacted away (see [`compact_to`]). A
+    /// snapshot is the durable "everything up to `last_included_index` is committed and
+    /// applied" record a restart restores from.
+    ///
+    /// [`compact_to`]: RaftStorage::compact_to
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]);
+
+    /// The most recent persisted snapshot (metadata + data), or `None` if none was
+    /// ever saved. On restart the node restores its [`StateMachine`] from this, sets
+    /// `last_applied`/`commit_index` to the snapshot's `last_included_index`, then
+    /// replays the surviving log tail.
+    fn load_snapshot(&self) -> Option<(SnapshotMeta, Vec<u8>)>;
+
+    /// Drop every log entry with `entry.index <= index` (Raft section 7 log
+    /// compaction). After compaction the log STARTS just above `index`; the dropped
+    /// prefix's prev-log consistency is answered by the snapshot's
+    /// `last_included_term` ([`term_at`](RaftStorage::term_at)`(index)` must keep
+    /// returning it). The caller compacts only to an index it has already snapshotted
+    /// and applied (`index <= last_applied`), so a compacted entry is never needed for
+    /// apply again. An `index` below the current log start, or `0`, is a no-op.
+    fn compact_to(&mut self, index: u64);
+
+    /// The 1-based index of the FIRST entry still present in the log (the entry just
+    /// above the last compaction point), or `last_log_index + 1` when the log is
+    /// empty. With no compaction this is `1` (the log is whole), so the default impl
+    /// returns `1`; a store that compacts ([`MemStorage`] / `FileStorage`) overrides
+    /// it. The leader compares a peer's `next_index` against this to decide whether the
+    /// entries it needs were already compacted (and an InstallSnapshot is required
+    /// instead of an AppendEntries).
+    fn log_start_index(&self) -> u64 {
+        1
+    }
+}
+
+/// A snapshot's metadata (Raft section 7): the index and term of the LAST log entry
+/// the snapshot's state subsumes.
+///
+/// `(last_included_index, last_included_term)` is exactly the `(prev_log_index,
+/// prev_log_term)` consistency pair for the entry that would FOLLOW the snapshot, so a
+/// follower that installs the snapshot can still pass the AppendEntries log check for
+/// the first post-snapshot entry. It is the snapshot analog of a [`LogEntry`]'s
+/// `(index, term)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotMeta {
+    /// The index of the last log entry the snapshot includes.
+    pub last_included_index: u64,
+    /// The term of the last log entry the snapshot includes.
+    pub last_included_term: u64,
 }
 
 /// An in-memory [`RaftStorage`] backed by a `Vec` log plus the term and vote.
@@ -470,6 +575,21 @@ pub struct MemStorage {
     current_term: u64,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
+    /// The 1-based log index of `log[0]` once a compaction has dropped a prefix
+    /// (Raft section 7). `0` means "no compaction": the log is whole and starts at
+    /// index 1 (so `log[0]` is index 1). After [`compact_to`](RaftStorage::compact_to)
+    /// the first surviving entry is at this index, and `log[i].index == log_start + i`.
+    /// Kept separate from the snapshot meta so an empty post-compaction log still knows
+    /// where the next append lands.
+    log_start: u64,
+    /// The most recent persisted snapshot's metadata, if any (Raft section 7). Its
+    /// `last_included_term` is what [`term_at`](RaftStorage::term_at) answers for
+    /// `last_included_index` once the underlying entry has been compacted away, so the
+    /// AppendEntries prev-log consistency check still passes for the entry that follows
+    /// the snapshot.
+    snap_meta: Option<SnapshotMeta>,
+    /// The most recent persisted snapshot's serialized state-machine bytes, if any.
+    snap_data: Vec<u8>,
 }
 
 impl MemStorage {
@@ -483,6 +603,34 @@ impl MemStorage {
     #[must_use]
     pub fn log(&self) -> &[LogEntry] {
         &self.log
+    }
+}
+
+impl MemStorage {
+    /// The 1-based index of `log[0]` (Raft section 7 compaction). With no compaction
+    /// (`log_start == 0`) the log is whole and starts at index 1; after a compaction it
+    /// starts at the recorded `log_start`. The vec position of a present `index` is
+    /// `index - start`.
+    #[inline]
+    fn start(&self) -> u64 {
+        if self.log_start == 0 {
+            1
+        } else {
+            self.log_start
+        }
+    }
+
+    /// The vec position of 1-based `index`, or `None` if it is below the compacted log
+    /// start or past the end (so the accessors stay total over a compacted log).
+    #[inline]
+    fn pos_of(&self, index: u64) -> Option<usize> {
+        let start = self.start();
+        if index < start {
+            return None;
+        }
+        usize::try_from(index - start)
+            .ok()
+            .filter(|&p| p < self.log.len())
     }
 }
 
@@ -504,11 +652,22 @@ impl RaftStorage for MemStorage {
     }
 
     fn last_log_index(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.index)
+        // The last entry's index if the log is non-empty, else the snapshot's
+        // last_included_index (a fully-compacted log still ends at the snapshot), else
+        // 0 (the empty-log sentinel).
+        self.log.last().map_or_else(
+            || self.snap_meta.map_or(0, |m| m.last_included_index),
+            |e| e.index,
+        )
     }
 
     fn last_log_term(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.term)
+        // The last entry's term, or (for a fully-compacted log) the snapshot's
+        // last_included_term, else 0.
+        self.log.last().map_or_else(
+            || self.snap_meta.map_or(0, |m| m.last_included_term),
+            |e| e.term,
+        )
     }
 
     fn append(&mut self, entry: LogEntry) {
@@ -522,36 +681,43 @@ impl RaftStorage for MemStorage {
             // prev_log_index 0, prev_log_term 0, which every log contains.
             return 0;
         }
-        // The log is 1-based and contiguous: the entry with `index` is at vec
-        // position `index - 1`. An index past the end yields 0 (no such entry).
-        usize::try_from(index - 1)
-            .ok()
-            .and_then(|pos| self.log.get(pos))
-            .map_or(0, |e| e.term)
+        // A snapshot answers the term at its last_included_index even after the entry
+        // was compacted away (Raft section 7): the prev-log check for the entry FOLLOWING
+        // the snapshot must still pass.
+        if let Some(meta) = self.snap_meta {
+            if index == meta.last_included_index {
+                return meta.last_included_term;
+            }
+        }
+        // Otherwise read the surviving log; an index below the compacted start or past
+        // the end yields 0 (no such entry here).
+        self.pos_of(index).map_or(0, |pos| self.log[pos].term)
     }
 
     fn entries_from(&self, index: u64) -> Vec<LogEntry> {
-        // Entries with `entry.index >= index`. With a contiguous 1-based log the
-        // first such entry is at vec position `index - 1`; `index <= 1` means "from
-        // the start" (whole log), and an index past the end yields an empty vec.
-        let start = if index <= 1 {
-            0
-        } else {
-            usize::try_from(index - 1).unwrap_or(usize::MAX)
+        // Entries with `entry.index >= index`. Clamp the request to the compacted start
+        // so a leader asking from a still-present index gets the surviving suffix; an
+        // index below the start clamps to the whole surviving log. (A leader that needs
+        // entries BELOW the start sends an InstallSnapshot instead, so this never has to
+        // fabricate compacted entries.)
+        let start = self.start();
+        let from = index.max(start);
+        let Ok(pos) = usize::try_from(from - start) else {
+            return Vec::new();
         };
         self.log
-            .get(start..)
+            .get(pos..)
             .map_or_else(Vec::new, <[LogEntry]>::to_vec)
     }
 
     fn truncate_from(&mut self, index: u64) {
-        // Delete entries with `entry.index >= index`. `index <= 1` clears the whole
-        // log (index 0 is the sentinel, index 1 is the first real entry); an index
-        // past the end truncates nothing.
-        let keep = if index <= 1 {
+        // Delete entries with `entry.index >= index`. An index at or below the compacted
+        // start clears the whole surviving log; an index past the end truncates nothing.
+        let start = self.start();
+        let keep = if index <= start {
             0
         } else {
-            usize::try_from(index - 1).unwrap_or(usize::MAX)
+            usize::try_from(index - start).unwrap_or(usize::MAX)
         };
         if keep < self.log.len() {
             self.log.truncate(keep);
@@ -567,12 +733,38 @@ impl RaftStorage for MemStorage {
             // The empty-log sentinel: there is no entry at index 0.
             return None;
         }
-        // The log is 1-based and contiguous: the entry with `index` is at vec
-        // position `index - 1`. An index past the end yields None.
-        usize::try_from(index - 1)
-            .ok()
-            .and_then(|pos| self.log.get(pos))
-            .cloned()
+        self.pos_of(index).map(|pos| self.log[pos].clone())
+    }
+
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) {
+        self.snap_meta = Some(meta);
+        self.snap_data = data.to_vec();
+    }
+
+    fn load_snapshot(&self) -> Option<(SnapshotMeta, Vec<u8>)> {
+        self.snap_meta.map(|meta| (meta, self.snap_data.clone()))
+    }
+
+    fn compact_to(&mut self, index: u64) {
+        // Drop entries with entry.index <= index. The first surviving entry is at index
+        // `index + 1`; if nothing survives, the next append lands at `index + 1`, so
+        // log_start records that boundary. An index below the current start (a stale /
+        // duplicate compaction) is a no-op.
+        let start = self.start();
+        if index < start || index == 0 {
+            return;
+        }
+        // Number of entries to drop from the front: those with index in [start, index].
+        let drop = usize::try_from(index - start + 1).unwrap_or(usize::MAX);
+        let drop = drop.min(self.log.len());
+        self.log.drain(..drop);
+        // The new start is one past the compaction point (where the next surviving /
+        // appended entry lives). Stored as the literal index so start() reads it back.
+        self.log_start = index + 1;
+    }
+
+    fn log_start_index(&self) -> u64 {
+        self.start()
     }
 }
 
@@ -626,6 +818,33 @@ pub trait StateMachine {
     /// engine guarantees the entry is committed (durable on a majority) before this
     /// fires, so an apply is never speculative and never replays a rolled-back entry.
     fn apply(&mut self, entry: &LogEntry);
+
+    /// Serialize the CURRENT applied state to bytes (Raft section 7 snapshotting). The
+    /// bytes are an opaque, deterministic image of everything this machine has applied
+    /// so far; the engine pairs them with the `(last_included_index, last_included_term)`
+    /// of the log entry the state reflects ([`SnapshotMeta`]) and hands the pair to
+    /// [`RaftStorage::save_snapshot`]. MUST be deterministic (a function of the applied
+    /// prefix only): the whole point is that a follower [`restore`](StateMachine::restore)d
+    /// from a leader's snapshot reaches a state IDENTICAL to having applied the same
+    /// committed prefix entry-by-entry. The default panics so an implementor that opts
+    /// into compaction supplies a real serialization; the trivial [`CountingSm`]
+    /// overrides it.
+    fn snapshot(&self) -> Vec<u8> {
+        unimplemented!("StateMachine::snapshot is required for log compaction (Raft section 7)")
+    }
+
+    /// REPLACE this machine's state with the one serialized in `data` (Raft section 7).
+    /// The inverse of [`snapshot`](StateMachine::snapshot): after a restore the machine
+    /// is byte-identical to one that had applied the committed prefix the snapshot
+    /// covers. Called by the engine when it installs a leader's snapshot on a lagging
+    /// follower, or on restart from a persisted snapshot. MUST move the machine FORWARD
+    /// only (the engine restores only from a snapshot of an applied = committed prefix),
+    /// which is why it never violates State-Machine-Safety. The default panics; the
+    /// trivial [`CountingSm`] overrides it.
+    fn restore(&mut self, data: &[u8]) {
+        let _ = data;
+        unimplemented!("StateMachine::restore is required for log compaction (Raft section 7)")
+    }
 }
 
 /// The trivial default [`StateMachine`]: it interprets NO payload and merely counts
@@ -661,6 +880,24 @@ impl StateMachine for CountingSm {
         // The 3b sink: count the entry, interpret nothing. Saturating so a
         // pathological replay can never wrap (it never decreases).
         self.applied = self.applied.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        // The whole applied state is the counter: serialize it little-endian (8 bytes),
+        // deterministic and tiny. A node restored from this resumes the same count, so
+        // the apply WATERMARK the election / replication tests assert is preserved.
+        self.applied.to_le_bytes().to_vec()
+    }
+
+    fn restore(&mut self, data: &[u8]) {
+        // Restore the counter from the 8-byte little-endian image. A short / malformed
+        // buffer (never produced by `snapshot`) restores to zero rather than panicking,
+        // keeping restore total like the rest of the engine's decode paths.
+        let counter = data
+            .get(..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map_or(0, u64::from_le_bytes);
+        self.applied = counter;
     }
 }
 
@@ -748,7 +985,23 @@ pub struct RaftConfig {
     pub election_timeout_jitter: Duration,
     /// How often a leader sends heartbeats.
     pub heartbeat_interval: Duration,
+    /// The log-compaction threshold (Raft section 7): once the number of log entries
+    /// ABOVE the last snapshot exceeds this, the node snapshots its state machine at
+    /// `last_applied` and compacts the log to there. A function of the applied prefix +
+    /// this constant, so it is fully DETERMINISTIC (no time / RNG) and replays
+    /// identically. `0` DISABLES compaction (the log grows unbounded, the pre-3c
+    /// behaviour), which keeps every existing DST scenario byte-identical: they all use
+    /// [`RaftConfig::default`], whose value is below.
+    pub snapshot_threshold: u64,
 }
+
+/// The default log-compaction threshold ([`RaftConfig::snapshot_threshold`]). `0`
+/// DISABLES compaction, so the DEFAULT config never snapshots and every existing DST
+/// scenario (which builds its config from `RaftConfig::default`) replays exactly as
+/// before; the snapshot tests opt IN by setting a small positive threshold. The config
+/// state machine's snapshot is tiny, so production wiring can pick a modest value
+/// (e.g. a few hundred) without the size of a snapshot being a concern.
+pub const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 0;
 
 impl Default for RaftConfig {
     fn default() -> Self {
@@ -756,6 +1009,7 @@ impl Default for RaftConfig {
             election_timeout_base: Duration::from_millis(150),
             election_timeout_jitter: Duration::from_millis(150),
             heartbeat_interval: Duration::from_millis(50),
+            snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
         }
     }
 }
@@ -861,8 +1115,24 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         voters: BTreeSet<NodeId>,
         storage: S,
         config: RaftConfig,
-        sm: M,
+        mut sm: M,
     ) -> Self {
+        // RECOVER FROM A PERSISTED SNAPSHOT (Raft section 7): if the storage holds a
+        // snapshot, the state machine's state at `last_included_index` is in it, and the
+        // surviving log is only the tail above it. Restore the machine and set the
+        // commit / apply watermarks to the snapshot's index so the apply pipeline
+        // replays ONLY the post-snapshot tail (never the compacted-away prefix). This is
+        // the restart half of compaction: a node that compacted before crashing comes
+        // back with its applied state intact without replaying the whole log. With no
+        // snapshot (the default / pre-3c path) the watermarks start at 0, exactly as
+        // before, so this is inert unless compaction was used.
+        let (commit_index, last_applied) = match storage.load_snapshot() {
+            Some((meta, data)) => {
+                sm.restore(&data);
+                (meta.last_included_index, meta.last_included_index)
+            }
+            None => (0, 0),
+        };
         RaftNode {
             id,
             voters,
@@ -871,10 +1141,13 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             leader_id: None,
             config,
             storage,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index,
+            last_applied,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            // The apply witness counts entries applied THIS process; a restore from a
+            // snapshot did not stream entries through `apply`, so it starts at 0 (it is
+            // a per-run hook-ran witness, not a persisted count).
             applied_count: 0,
             sm,
         }
@@ -1031,6 +1304,27 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 // here. If one ever reaches the pure engine it is an inert no-op - the
                 // engine takes NO consensus action on it, so no decision or Effect can
                 // depend on the forwarding path. This keeps the DST trace unchanged.
+            }
+            RaftMsg::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                data,
+            } => self.on_install_snapshot(
+                rng,
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                data,
+                out,
+            ),
+            RaftMsg::InstallSnapshotResp {
+                term,
+                last_included_index,
+            } => {
+                self.on_install_snapshot_resp(rng, from, term, last_included_index, out);
             }
         }
     }
@@ -1536,6 +1830,33 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     fn send_append_entries_to(&self, peer: NodeId, out: &mut Effects) {
         let term = self.storage.current_term();
         let next = self.next_index.get(&peer).copied().unwrap_or(1);
+
+        // Raft section 7: if the entry the peer needs (`next`, and its `prev` at
+        // `next - 1`) has been COMPACTED away on this leader, an AppendEntries can no
+        // longer carry the missing prefix - send an InstallSnapshot instead. The
+        // boundary is `log_start_index`: entries with index < log_start are gone, except
+        // that `term_at(snapshot.last_included_index)` is still answerable. So we must
+        // install a snapshot exactly when `prev_log_index` is BELOW the snapshot's
+        // last_included_index (the prev entry's term is unknowable), i.e. when
+        // `next - 1 < last_included_index`, equivalently `next <= last_included_index`.
+        // When `prev_log_index == last_included_index` the snapshot still answers the
+        // prev term, so a normal AppendEntries works.
+        if let Some((meta, data)) = self.storage.load_snapshot() {
+            if next <= meta.last_included_index {
+                out.send(
+                    peer,
+                    RaftMsg::InstallSnapshot {
+                        term,
+                        leader_id: self.id,
+                        last_included_index: meta.last_included_index,
+                        last_included_term: meta.last_included_term,
+                        data,
+                    },
+                );
+                return;
+            }
+        }
+
         let prev_log_index = next.saturating_sub(1);
         let prev_log_term = self.storage.term_at(prev_log_index);
         let entries = self.storage.entries_from(next);
@@ -1635,6 +1956,233 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             // every applied entry in 3b; it still does, regardless of `M`).
             self.applied_count += 1;
         }
+        // Raft section 7: once the applied prefix is large enough, snapshot + compact.
+        self.maybe_compact();
+    }
+
+    /// THE COMPACTION TRIGGER (Raft section 7). When the number of log entries ABOVE
+    /// the last snapshot exceeds [`RaftConfig::snapshot_threshold`] AND there is newly
+    /// applied state to snapshot (`last_applied` is above the snapshot's
+    /// `last_included_index`), serialize the state machine at `last_applied`, persist
+    /// the snapshot, and compact the log to `last_applied`.
+    ///
+    /// DETERMINISM: this reads no clock and no RNG and emits no [`Effects`]; the
+    /// decision is a pure function of the log length, the applied prefix, and the
+    /// constant threshold, so two nodes (or two replays) driven through the SAME
+    /// committed sequence compact at the SAME points. It is therefore safe inside the
+    /// engine step and does not perturb the DST trace (which compares Effects, not
+    /// storage internals); with the default `snapshot_threshold == 0` it never fires,
+    /// so every existing scenario is byte-identical.
+    ///
+    /// SAFETY: it snapshots only `last_applied`, which is `<= commit_index`, i.e. a
+    /// COMMITTED, durable prefix; compacting at-or-below it can never drop an entry the
+    /// node still needs to apply, and the snapshot it leaves is a faithful image of a
+    /// committed prefix.
+    fn maybe_compact(&mut self) {
+        let threshold = self.config.snapshot_threshold;
+        if threshold == 0 {
+            // Compaction disabled (the default): the log grows unbounded as before.
+            return;
+        }
+        let snap_index = self
+            .storage
+            .load_snapshot()
+            .map_or(0, |(meta, _)| meta.last_included_index);
+        // Nothing new applied since the last snapshot: nothing to compact to.
+        if self.last_applied <= snap_index {
+            return;
+        }
+        // Entries currently above the last snapshot. The compaction point is the
+        // APPLIED watermark, so we only ever compact committed-and-applied state.
+        let above_snapshot = self.last_applied - snap_index;
+        if above_snapshot <= threshold {
+            return;
+        }
+        // Snapshot the state machine at `last_applied` and persist it with the matching
+        // meta, then drop the now-redundant log prefix. `term_at(last_applied)` is read
+        // BEFORE the compaction so the snapshot records the correct last_included_term
+        // (after compaction the storage answers that term from the snapshot meta).
+        let last_included_index = self.last_applied;
+        let last_included_term = self.storage.term_at(last_included_index);
+        let data = self.sm.snapshot();
+        self.storage.save_snapshot(
+            SnapshotMeta {
+                last_included_index,
+                last_included_term,
+            },
+            &data,
+        );
+        self.storage.compact_to(last_included_index);
+    }
+
+    /// INSTALLSNAPSHOT receiver (Raft section 7 / Figure 13). A leader is shipping its
+    /// snapshot because the entries this follower needs were already compacted on the
+    /// leader.
+    ///
+    /// Order of operations (mirrors the other receivers):
+    /// 1. "All Servers": adopt a strictly greater term (step down, clear vote), via
+    ///    [`observe_term`], exactly like AppendEntries / RequestVote.
+    /// 2. Reply false-by-term if `term < currentTerm` (a stale leader): just reply our
+    ///    higher term so the stale leader steps down; do NOT install or reset the timer.
+    /// 3. `term == currentTerm`: a legitimate leader. Concede candidacy, reset the
+    ///    election timer (we heard from the leader), record the leader.
+    /// 4. If the snapshot does not advance us (`last_included_index <= commit_index`),
+    ///    it is stale/duplicate: reply our term and stop (never move backward).
+    /// 5. Otherwise INSTALL: persist the snapshot, restore the state machine from it,
+    ///    discard the log up to `last_included_index` (keeping a longer VALID suffix per
+    ///    the paper - only if our entry at `last_included_index` matches the term), set
+    ///    `commit_index`/`last_applied` to `last_included_index`, and reply our term.
+    ///
+    /// FORWARD-ONLY SAFETY: a leader snapshots only its applied = committed prefix, so
+    /// `last_included_index` is COMMITTED. Installing it moves this follower FORWARD to a
+    /// committed prefix and can never overwrite a different committed entry at the same
+    /// index (State-Machine-Safety), because two leaders can never commit conflicting
+    /// entries at one index.
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    fn on_install_snapshot(
+        &mut self,
+        rng: &mut dyn RaftRng,
+        term: u64,
+        leader_id: NodeId,
+        last_included_index: u64,
+        last_included_term: u64,
+        data: Vec<u8>,
+        out: &mut Effects,
+    ) {
+        self.observe_term(term, rng, out);
+        let current = self.storage.current_term();
+
+        if term < current {
+            // Stale leader: reply our higher term so it steps down; do not install. Echo
+            // the offered index anyway (Figure 13); the stale leader steps down on our
+            // higher term before it would advance any marker, so the value is inert here.
+            out.send(
+                leader_id,
+                RaftMsg::InstallSnapshotResp {
+                    term: current,
+                    last_included_index,
+                },
+            );
+            return;
+        }
+
+        // term == current: a legitimate leader. A candidate concedes; reset the timer
+        // (we heard from the leader) and record it - the same recognize-leader path
+        // AppendEntries uses.
+        if self.role != Role::Follower {
+            self.step_down_to_follower(out);
+        }
+        self.arm_election_timer(rng, out);
+        self.leader_id = Some(leader_id);
+
+        // A stale / duplicate snapshot that does not advance our committed prefix: never
+        // move backward. Reply our term and stop. Echo the offered index: we provably hold
+        // at least that prefix (it is `<= commit_index`), so the leader advancing our
+        // markers to it is honest.
+        if last_included_index <= self.commit_index {
+            out.send(
+                leader_id,
+                RaftMsg::InstallSnapshotResp {
+                    term: current,
+                    last_included_index,
+                },
+            );
+            return;
+        }
+
+        // KEEP A VALID LONGER SUFFIX (Raft Figure 13 step 6): if our log already holds
+        // an entry AT last_included_index whose term matches last_included_term, the
+        // snapshot is a prefix of our log - keep the tail above it. Otherwise our tail
+        // conflicts with the snapshot's committed prefix, so discard the WHOLE log (it
+        // will be re-replicated from the leader above the snapshot).
+        let suffix_valid = self.storage.term_at(last_included_index) == last_included_term;
+        if !suffix_valid {
+            // Drop the entire current log; the snapshot subsumes everything and the leader
+            // re-ships the post-snapshot tail.
+            self.storage.truncate_from(self.storage.log_start_index());
+        }
+
+        // Persist the snapshot FIRST so the storage answers term_at(last_included_index)
+        // from the snapshot meta, then COMPACT the log to the snapshot index in BOTH
+        // branches. The compaction is what advances the storage's log-start boundary to
+        // `last_included_index + 1`: in the valid-suffix branch it drops the redundant
+        // prefix and keeps the tail; in the discard branch (log already empty) it just
+        // sets the boundary so the leader's next AppendEntries appends at the right index
+        // and the apply loop never reads a compacted index. After this the next
+        // AppendEntries (prev = last_included_index) passes its consistency check.
+        self.storage.save_snapshot(
+            SnapshotMeta {
+                last_included_index,
+                last_included_term,
+            },
+            &data,
+        );
+        self.storage.compact_to(last_included_index);
+        self.sm.restore(&data);
+
+        // Advance the committed / applied watermarks to the snapshot's index (it is a
+        // committed prefix). Forward-only: we entered this branch only because
+        // last_included_index > commit_index.
+        self.commit_index = last_included_index;
+        self.last_applied = last_included_index;
+
+        // ECHO the installed index (Figure 13): the leader advances our markers from
+        // exactly what we installed, never from its own (possibly newer) snapshot meta.
+        out.send(
+            leader_id,
+            RaftMsg::InstallSnapshotResp {
+                term: current,
+                last_included_index,
+            },
+        );
+    }
+
+    /// INSTALLSNAPSHOT response handler (Raft section 7 / Figure 13). Mirrors the
+    /// AppendEntries response handler's leader bookkeeping for the install case.
+    ///
+    /// 1. "All Servers": a higher-term reply steps the leader down (return then).
+    /// 2. Only a `Leader` in the SAME term cares (a stale reply is ignored).
+    /// 3. The follower has now installed the snapshot, so it holds everything up to the
+    ///    index it ECHOED (`installed_index`): advance `match_index`/`next_index` past it
+    ///    (taking the MAX so a reordered older reply cannot rewind), then immediately send
+    ///    the next AppendEntries to continue replicating the post-snapshot tail, and try
+    ///    to advance commit.
+    ///
+    /// FALSE-COMMIT SAFETY (Figure 13): the marker advance reads the follower's ECHOED
+    /// `installed_index`, NOT this leader's CURRENT `load_snapshot()` meta. If the leader
+    /// compacted AGAIN (to a higher `K'`) while this `InstallSnapshot(K)` was in flight,
+    /// reading the current meta would set `match_index[from] = K' > K` -- claiming the
+    /// follower holds entries it never installed -- and `maybe_advance_commit` could then
+    /// commit an index that is NOT on a majority (a lost-committed-entry hazard on a
+    /// later leader change). Echoing `K` keeps the marker honest.
+    fn on_install_snapshot_resp(
+        &mut self,
+        rng: &mut dyn RaftRng,
+        from: NodeId,
+        term: u64,
+        installed_index: u64,
+        out: &mut Effects,
+    ) {
+        if self.observe_term(term, rng, out) {
+            // We stepped down on a higher term; we are no longer leader.
+            return;
+        }
+        if self.role != Role::Leader || term != self.storage.current_term() {
+            // Stale reply (old term) or we are not leader: ignore.
+            return;
+        }
+        // The follower installed the snapshot at `installed_index` (the value it echoed
+        // from our request), so it now holds the prefix up to there - and ONLY up to
+        // there, regardless of any LATER compaction on this leader. Advance its markers to
+        // that echoed index (MAX-guarded against a reordered older reply), then continue
+        // with the tail above it.
+        let m = self.match_index.entry(from).or_insert(0);
+        *m = (*m).max(installed_index);
+        let mi = *m;
+        self.next_index.insert(from, mi + 1);
+        self.maybe_advance_commit();
+        // Resume normal replication of the entries above the snapshot at once.
+        self.send_append_entries_to(from, out);
     }
 
     /// Accept a client proposal on a leader: append an opaque entry at the current
@@ -2175,6 +2723,8 @@ mod tests {
             election_timeout_base: Duration::from_millis(150),
             election_timeout_jitter: Duration::from_millis(150),
             heartbeat_interval: Duration::from_millis(50),
+            // Compaction off (the default): this is a pure election-safety scenario.
+            ..RaftConfig::default()
         };
         for seed in 0..50u64 {
             let mut cluster = RaftCluster::new(5, seed, config);
@@ -3345,6 +3895,28 @@ mod tests {
                 }
             }
         }
+
+        fn snapshot(&self) -> Vec<u8> {
+            // 3c: the applied config state is the SlotMap committed view + the log-driven
+            // epoch counter. Layout [u64 epoch][SlotMap committed-config bytes], the same
+            // shape the production ConfigSm uses, so the round-trip + DST tests exercise
+            // the real serialization.
+            let mut out = self.epoch.to_le_bytes().to_vec();
+            out.extend_from_slice(&self.map.serialize_committed());
+            out
+        }
+
+        fn restore(&mut self, data: &[u8]) {
+            // 3c: restore the log-driven epoch counter then rebuild the SlotMap committed
+            // view in place (keeping this node's own empty_self identity). A short buffer
+            // restores to the cleared baseline (never produced by `snapshot`).
+            let (epoch_bytes, map_bytes) = data.split_at(data.len().min(8));
+            self.epoch = epoch_bytes
+                .get(..8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map_or(0, u64::from_le_bytes);
+            self.map.restore_committed(map_bytes);
+        }
     }
 
     // -- config-cluster sim harness (parallel to RaftCluster, ConfigSm-backed) --
@@ -3489,6 +4061,17 @@ mod tests {
             // The Raft-driven, log-monotonic config epoch (a deterministic function
             // of the applied prefix), NOT the SlotMap's Redis-client epoch.
             self.engine(id).state_machine().config_epoch()
+        }
+
+        /// The 1-based index of the FIRST entry still in `id`'s log (HA-3c). `> 1` means
+        /// the node has compacted a prefix (the snapshot subsumes it).
+        fn log_start(&self, id: NodeId) -> u64 {
+            self.engine(id).storage().log_start_index()
+        }
+
+        /// Whether `id` holds a persisted snapshot (HA-3c).
+        fn has_snapshot(&self, id: NodeId) -> bool {
+            self.engine(id).storage().load_snapshot().is_some()
         }
 
         /// The node's slot->owner-string projection: for each ASSIGNED slot, the
@@ -4838,5 +5421,672 @@ mod tests {
                 "seed {seed}: per-node (ranges, current_epoch) must replay identically"
             );
         }
+    }
+
+    // =====================================================================
+    // HA-3c: snapshot + log compaction (Raft section 7).
+    //
+    // The state machine is snapshotted, the log is compacted below the snapshot
+    // index, and a leader installs its snapshot on a follower whose required entries
+    // were already compacted. These exercise the StateMachine snapshot/restore seam,
+    // the RaftStorage save/load/compact_to seam, and the InstallSnapshot RPC, ending
+    // with a DST gate that proves a long-partitioned follower is caught up via
+    // InstallSnapshot to the IDENTICAL committed state, with the safety checkers held.
+    // =====================================================================
+
+    // -- StateMachine snapshot/restore unit ---------------------------------
+
+    #[test]
+    fn counting_sm_snapshot_restore_round_trips() {
+        // The trivial machine's whole state is its applied counter; snapshot -> restore
+        // into a fresh machine recovers the same count.
+        let mut sm = CountingSm::new();
+        for _ in 0..7 {
+            sm.apply(&noop(1, 1));
+        }
+        assert_eq!(sm.applied(), 7);
+        let snap = sm.snapshot();
+        let mut fresh = CountingSm::new();
+        fresh.restore(&snap);
+        assert_eq!(fresh.applied(), 7, "restore recovers the applied watermark");
+    }
+
+    #[test]
+    fn config_sm_snapshot_restore_round_trips() {
+        // Build a ConfigSm with owners / replicas / migration / epoch set, snapshot it,
+        // restore into a FRESH ConfigSm of the SAME node, and assert identical SlotMap
+        // state + epoch (the config-state-machine half of the Raft snapshot).
+        let id = NodeId(1);
+        let mut sm = ConfigSm::seed(id);
+        // Apply a committed config sequence: add peers, claim slots, a replica, a migration.
+        let peer2 = NodeId(2);
+        let peer3 = NodeId(3);
+        let seq = [
+            ConfigCmd::AddNode {
+                id: slot_id(peer2),
+                host: slot_host(peer2),
+                port: SLOT_PORT,
+            },
+            ConfigCmd::AddNode {
+                id: slot_id(peer3),
+                host: slot_host(peer3),
+                port: SLOT_PORT,
+            },
+            ConfigCmd::AssignSlots {
+                node: slot_id(id),
+                slots: vec![0, 1, 2],
+            },
+            ConfigCmd::SetSlotOwner {
+                slot: 100,
+                node: slot_id(peer2),
+            },
+            ConfigCmd::AssignReplica {
+                node: slot_id(peer3),
+                slots: vec![0, 1],
+            },
+            // slot 2 is owned by self, so MIGRATING toward peer2 holds (gated on owns()).
+            ConfigCmd::SetSlotMigrating {
+                slot: 2,
+                dest: slot_id(peer2),
+            },
+        ];
+        for (i, cmd) in seq.iter().enumerate() {
+            let idx = i as u64 + 1;
+            sm.apply(&LogEntry {
+                term: 1,
+                index: idx,
+                payload: EntryPayload::Config(cmd.clone()),
+            });
+        }
+        let epoch_before = sm.config_epoch();
+        let snap = sm.snapshot();
+
+        // Restore into a fresh ConfigSm of the SAME node id.
+        let mut fresh = ConfigSm::seed(id);
+        fresh.restore(&snap);
+
+        // Identical SlotMap committed view (owns(), owner ids, replica, migration) + epoch.
+        assert_eq!(fresh.config_epoch(), epoch_before);
+        let a = sm.map();
+        let b = fresh.map();
+        assert!(b.owns(0) && b.owns(1) && b.owns(2));
+        assert!(!b.owns(100));
+        assert_eq!(
+            a.serialize_committed(),
+            b.serialize_committed(),
+            "the restored map's committed view must match the source's"
+        );
+        assert!(b.is_replica_of(0, &slot_id(peer3)) && b.is_replica_of(1, &slot_id(peer3)));
+        assert_eq!(
+            b.migration_state(2),
+            ironcache_cluster::MigrationState::Migrating
+        );
+        assert_eq!(
+            b.migration_peer_id(2).as_deref(),
+            Some(slot_id(peer2).as_str())
+        );
+        // The serialized form is a fixed point (deterministic function of the view).
+        assert_eq!(
+            fresh.map().serialize_committed(),
+            sm.map().serialize_committed()
+        );
+    }
+
+    // -- RaftStorage save/load + compact_to (MemStorage) --------------------
+
+    #[test]
+    fn mem_storage_save_load_snapshot_and_compact() {
+        // Build a log 1..=5, snapshot at 3, compact to 3, then assert: the prefix is
+        // gone, term_at(3) is answered from the snapshot meta, the tail (4,5) survives,
+        // load_snapshot returns what was saved, and log_start_index moved to 4.
+        let mut s = MemStorage::new();
+        for i in 1..=5u64 {
+            s.append(LogEntry {
+                term: if i <= 3 { 2 } else { 3 },
+                index: i,
+                payload: EntryPayload::Bytes(vec![i as u8]),
+            });
+        }
+        let meta = SnapshotMeta {
+            last_included_index: 3,
+            last_included_term: 2,
+        };
+        s.save_snapshot(meta, b"sm-state-at-3");
+        s.compact_to(3);
+
+        assert_eq!(s.log_start_index(), 4);
+        assert_eq!(s.entry_at(1), None, "compacted prefix is gone");
+        assert_eq!(
+            s.entry_at(3),
+            None,
+            "the last_included entry is compacted away"
+        );
+        assert_eq!(
+            s.term_at(3),
+            2,
+            "term_at(last_included_index) answered from the snapshot meta after compaction"
+        );
+        assert_eq!(s.entry_at(4).map(|e| e.index), Some(4), "the tail survives");
+        assert_eq!(s.last_log_index(), 5);
+        assert_eq!(
+            s.entries_from(4),
+            (4..=5)
+                .map(|i| LogEntry {
+                    term: 3,
+                    index: i,
+                    payload: EntryPayload::Bytes(vec![i as u8])
+                })
+                .collect::<Vec<_>>()
+        );
+        let (loaded_meta, loaded_data) = s.load_snapshot().expect("snapshot saved");
+        assert_eq!(loaded_meta, meta);
+        assert_eq!(loaded_data, b"sm-state-at-3");
+    }
+
+    #[test]
+    fn mem_storage_fully_compacted_log_reads_from_snapshot() {
+        // Compacting to the last index leaves an EMPTY log; last_log_index / last_log_term
+        // must then come from the snapshot meta (a fully-compacted log ends at the snapshot).
+        let mut s = MemStorage::new();
+        for i in 1..=3u64 {
+            s.append(noop(2, i));
+        }
+        s.save_snapshot(
+            SnapshotMeta {
+                last_included_index: 3,
+                last_included_term: 2,
+            },
+            b"x",
+        );
+        s.compact_to(3);
+        assert_eq!(
+            s.last_log_index(),
+            3,
+            "fully-compacted log ends at the snapshot"
+        );
+        assert_eq!(s.last_log_term(), 2);
+        assert_eq!(s.term_at(3), 2);
+        assert_eq!(s.log_start_index(), 4);
+        assert!(s.entries_from(4).is_empty());
+        // A new append lands at index 4 (just above the snapshot) and is readable.
+        s.append(noop(3, 4));
+        assert_eq!(s.entry_at(4), Some(noop(3, 4)));
+        assert_eq!(s.last_log_index(), 4);
+    }
+
+    // -- the DST snapshot gate (the merge-blocker) -------------------------
+
+    /// Propose a config entry at `leader` and settle it (run until the leader's commit
+    /// index advances past it). Deterministic, bounded; returns when committed.
+    fn config_propose_and_settle(cluster: &mut ConfigCluster, leader: NodeId, cmd: ConfigCmd) {
+        let before = cluster.commit_index(leader);
+        cluster.propose(leader, cmd);
+        for _ in 0..80 {
+            cluster.run_steps(500);
+            if cluster.commit_index(leader) > before {
+                return;
+            }
+        }
+        panic!("a config proposal did not commit at the leader");
+    }
+
+    /// Replay the HA-3c snapshot DST gate for one `seed`: an N=3 cluster where the leader
+    /// takes snapshots + compacts, and a follower PARTITIONED long enough that its needed
+    /// entries are compacted away is caught up via InstallSnapshot after heal, converging
+    /// to the IDENTICAL state machine as the leader. Throughout, the 3e safety checkers
+    /// (no-two-owners-per-epoch, epoch-monotonic) and the committed-prefix agreement hold.
+    /// Returns the final per-node (owner-by-slot, epoch) snapshot for the seed-sweep
+    /// convergence assertion.
+    #[allow(clippy::too_many_lines)]
+    fn run_snapshot_catchup_gate(seed: u64) -> Vec<(BTreeMap<u16, String>, u64)> {
+        // A small snapshot threshold so the leader compacts after a handful of entries.
+        let config = RaftConfig {
+            snapshot_threshold: 4,
+            ..RaftConfig::default()
+        };
+        let mut cluster = ConfigCluster::new(3, seed, config);
+        cluster
+            .net
+            .set_latency(Duration::from_millis(1), Duration::from_millis(15));
+        let mut epochs = EpochMonotonic::new();
+        let leader = elect_config_leader(&mut cluster);
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // Build the node table (committed before any slot reference).
+        for id in cluster.ids.clone() {
+            config_propose_and_settle(
+                &mut cluster,
+                leader,
+                ConfigCmd::AddNode {
+                    id: slot_id(id),
+                    host: slot_host(id),
+                    port: SLOT_PORT,
+                },
+            );
+        }
+        assert_3e_invariants(&cluster, &mut epochs);
+
+        // PARTITION one follower off (the laggard). The leader + the other follower are a
+        // 2-of-3 majority, so the leader keeps committing + compacting while the laggard is gone.
+        let laggard = *cluster
+            .ids
+            .iter()
+            .find(|&&id| id != leader)
+            .expect("a follower exists");
+        let majority: Vec<SimId> = cluster
+            .ids
+            .iter()
+            .copied()
+            .filter(|&id| id != laggard)
+            .map(to_sim)
+            .collect();
+        let minority = [to_sim(laggard)];
+        cluster.net.partition(&majority, &minority);
+
+        let laggard_log_start_before = cluster.log_start(laggard);
+
+        // Propose MANY ownership flips on the majority side: enough that the log grows well
+        // past the threshold and the leader snapshots + compacts past the laggard's last index.
+        let slots: [u16; 6] = [0, 3000, 6000, 9000, 12000, 16_000];
+        for round in 0..4u8 {
+            for &s in &slots {
+                // Alternate the owner so successive entries are distinct committed flips.
+                let owner = if (round + (s % 3) as u8) % 2 == 0 {
+                    leader
+                } else {
+                    cluster
+                        .ids
+                        .iter()
+                        .copied()
+                        .find(|&id| id != laggard && id != leader)
+                        .unwrap_or(leader)
+                };
+                config_propose_and_settle(
+                    &mut cluster,
+                    leader,
+                    ConfigCmd::SetSlotOwner {
+                        slot: s,
+                        node: slot_id(owner),
+                    },
+                );
+            }
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+
+        // The leader compacted: it holds a snapshot and its log no longer starts at 1.
+        assert!(
+            cluster.has_snapshot(leader),
+            "seed {seed}: the leader must have taken a snapshot after exceeding the threshold"
+        );
+        assert!(
+            cluster.log_start(leader) > 1,
+            "seed {seed}: the leader's log must be compacted (start > 1)"
+        );
+        // The laggard, partitioned off, has NOT advanced its compaction point: its needed
+        // entries are now BELOW the leader's log start, so only an InstallSnapshot can catch it up.
+        assert_eq!(
+            cluster.log_start(laggard),
+            laggard_log_start_before,
+            "seed {seed}: the partitioned laggard cannot have compacted while isolated"
+        );
+        assert!(
+            cluster.commit_index(laggard) < cluster.commit_index(leader),
+            "seed {seed}: the laggard must trail the leader's committed index while partitioned"
+        );
+
+        // HEAL. The leader, seeing the laggard's next_index below its log start, sends an
+        // InstallSnapshot; the laggard installs it and then catches up the tail via AppendEntries.
+        cluster.net.heal();
+        for _ in 0..60 {
+            cluster.run_steps(500);
+            assert_at_most_one_owner_per_slot(&cluster);
+            assert_3e_invariants(&cluster, &mut epochs);
+        }
+        cluster.run_until_idle(200_000);
+        assert_3e_invariants(&cluster, &mut epochs);
+        assert_exactly_one_owner_after_convergence(&cluster);
+
+        // The laggard was caught up VIA THE SNAPSHOT: it now holds a snapshot of its own and
+        // its committed prefix agrees with the leader's; its state machine is identical.
+        assert!(
+            cluster.has_snapshot(laggard),
+            "seed {seed}: the laggard must have installed a snapshot to catch up"
+        );
+        let final_leader = {
+            let ls = cluster.leaders();
+            assert_eq!(ls.len(), 1, "seed {seed}: exactly one leader after heal");
+            ls[0]
+        };
+        assert_committed_prefix_agrees(&cluster, final_leader);
+        // The laggard's converged ownership view + epoch equal the leader's (identical SM).
+        assert_eq!(
+            cluster.owner_by_slot(laggard),
+            cluster.owner_by_slot(final_leader),
+            "seed {seed}: the snapshot-caught-up follower must hold the IDENTICAL committed view"
+        );
+        assert_eq!(
+            cluster.current_epoch(laggard),
+            cluster.current_epoch(final_leader),
+            "seed {seed}: the snapshot-caught-up follower must agree on the config epoch"
+        );
+
+        cluster
+            .ids
+            .iter()
+            .map(|&id| (cluster.owner_by_slot(id), cluster.current_epoch(id)))
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_catchup_gate() {
+        // THE HA-3c MERGE-BLOCKER, across a seed sweep. For each seed: a leader snapshots +
+        // compacts while a follower is partitioned past the compaction point, then on heal the
+        // follower is caught up VIA InstallSnapshot and converges to the IDENTICAL state machine,
+        // with State-Machine-Safety (no two owners per slot per epoch), Log-Matching (committed
+        // prefix agreement), Election-Safety, and epoch monotonicity all held throughout.
+        for seed in 0..40u64 {
+            let snaps = run_snapshot_catchup_gate(seed);
+            let (ref_owner, ref_epoch) = &snaps[0];
+            for (owner, epoch) in &snaps {
+                assert_eq!(
+                    owner, ref_owner,
+                    "seed {seed}: all nodes converge to one slot->owner view after snapshot catch-up"
+                );
+                assert_eq!(
+                    epoch, ref_epoch,
+                    "seed {seed}: all nodes agree on the config epoch after snapshot catch-up"
+                );
+            }
+        }
+    }
+
+    // -- crash / restore-from-snapshot --------------------------------------
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn node_crash_restores_identical_applied_state_from_snapshot_and_tail() {
+        // A node that snapshots + compacts, then "crashes" (we extract its storage) and is rebuilt
+        // on that SAME storage, must recover the IDENTICAL applied state for the SNAPSHOTTED prefix
+        // (the snapshot restores the state machine, with NO double-apply of the compacted prefix),
+        // then RE-APPLY the surviving log tail once it commits again, reaching the full pre-crash
+        // view. (commit_index is VOLATILE in Raft: a restart trusts only the snapshot as committed
+        // and re-confirms the tail by re-replication; here a single-voter leader re-confirms it at
+        // once on the next propose.) We drive a single-voter leader, which commits + applies +
+        // compacts on its own.
+        let voters: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let config = RaftConfig {
+            snapshot_threshold: 3,
+            ..RaftConfig::default()
+        };
+        // A projection helper: a SlotMap's owner-by-slot view (node-independent).
+        let owners_of = |node: &RaftNode<MemStorage, ConfigSm>| -> BTreeMap<u16, String> {
+            let map = node.state_machine().map();
+            let nodes = map.nodes();
+            let mut out = BTreeMap::new();
+            for (start, end, idx) in map.ranges() {
+                let owner = nodes[idx].id.to_string();
+                for slot in start..=end {
+                    out.insert(slot, owner.clone());
+                }
+            }
+            out
+        };
+
+        let storage = MemStorage::new();
+        let mut node = RaftNode::with_state_machine(
+            NodeId(1),
+            voters.clone(),
+            storage,
+            config,
+            ConfigSm::seed(NodeId(1)),
+        );
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.start(now, &mut rng, &mut Effects::new());
+        // Become leader (single voter => instant majority).
+        node.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut Effects::new());
+        assert!(node.is_leader());
+
+        // Propose enough config entries to cross the threshold and trigger compaction.
+        node.propose(
+            EntryPayload::Config(ConfigCmd::AssignSlots {
+                node: slot_id(NodeId(1)),
+                slots: vec![0, 1, 2, 3],
+            }),
+            now,
+            &mut rng,
+            &mut Effects::new(),
+        );
+        for s in 4..12u16 {
+            node.propose(
+                EntryPayload::Config(ConfigCmd::SetSlotOwner {
+                    slot: s,
+                    node: slot_id(NodeId(1)),
+                }),
+                now,
+                &mut rng,
+                &mut Effects::new(),
+            );
+        }
+        // The single-voter leader committed + applied + compacted (the trigger ran in apply).
+        let (snap_meta, _) = node
+            .storage()
+            .load_snapshot()
+            .expect("the node must have snapshotted");
+        assert!(
+            node.storage().log_start_index() > 1,
+            "the log must be compacted"
+        );
+
+        // Capture the FULL pre-crash applied view (owner-by-slot + epoch) for the post-recovery
+        // re-confirmation, and the SNAPSHOT view (the prefix the snapshot subsumes) for the
+        // immediate-post-restart assertion.
+        let pre_owners = owners_of(&node);
+        let pre_epoch = node.state_machine().config_epoch();
+        // The state-machine view AT the snapshot boundary: rebuild a ConfigSm from the snapshot's
+        // bytes alone (this is exactly what restore does), so we know what the restored node should
+        // show BEFORE the tail re-applies.
+        let snapshot_only_owners = {
+            let mut sm = ConfigSm::seed(NodeId(1));
+            sm.restore(&node.storage().load_snapshot().expect("snapshot").1);
+            let map = sm.map();
+            let nodes = map.nodes();
+            let mut out = BTreeMap::new();
+            for (start, end, idx) in map.ranges() {
+                let owner = nodes[idx].id.to_string();
+                for slot in start..=end {
+                    out.insert(slot, owner.clone());
+                }
+            }
+            out
+        };
+
+        // CRASH + RESTART: extract the storage (the durable record) and rebuild a fresh node +
+        // fresh state machine on it. with_state_machine restores the SM from the snapshot and sets
+        // commit_index/last_applied to the snapshot index (NO double-apply of the compacted prefix).
+        let RaftNode { storage, .. } = node;
+        let mut restored = RaftNode::with_state_machine(
+            NodeId(1),
+            voters,
+            storage,
+            config,
+            ConfigSm::seed(NodeId(1)),
+        );
+
+        // Immediately post-restart: the applied watermarks equal the SNAPSHOT index, and the SM
+        // reflects exactly the snapshotted prefix (the tail above the snapshot is in the log but is
+        // not yet re-confirmed committed -- commit_index is volatile).
+        assert_eq!(
+            restored.commit_index(),
+            snap_meta.last_included_index,
+            "restored commit_index is the snapshot index (commit is volatile, re-confirmed later)"
+        );
+        assert_eq!(
+            restored.last_applied(),
+            snap_meta.last_included_index,
+            "last_applied set to the snapshot prefix (no double-apply of the compacted entries)"
+        );
+        assert_eq!(
+            owners_of(&restored),
+            snapshot_only_owners,
+            "the restored SM reflects exactly the snapshotted (committed+applied) prefix"
+        );
+
+        // RE-CONFIRM the tail: drive the restored node back to leadership; the single-voter leader
+        // re-commits its whole log (it appends a fresh no-op and advances commit), re-applying the
+        // surviving tail above the snapshot. The applied state then equals the FULL pre-crash view.
+        restored.start(now, &mut rng, &mut Effects::new());
+        restored.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut Effects::new());
+        assert!(
+            restored.is_leader(),
+            "the restored node re-elects (single voter)"
+        );
+        // A fresh proposal on the single-voter leader advances commit_index to the top of the log
+        // (the section-5.4.2 rule commits the current-term proposal, carrying the prior-term tail
+        // above the snapshot with it transitively), which drives apply over the surviving tail.
+        restored.propose(EntryPayload::Noop, now, &mut rng, &mut Effects::new());
+        assert_eq!(
+            owners_of(&restored),
+            pre_owners,
+            "after re-confirming the tail, the applied SlotMap view equals the full pre-crash view"
+        );
+        assert_eq!(
+            restored.state_machine().config_epoch(),
+            pre_epoch,
+            "the re-confirmed config epoch equals the full pre-crash epoch"
+        );
+    }
+
+    #[test]
+    fn install_snapshot_resp_does_not_over_advance_match_index_on_second_compaction() {
+        // FIX 2 (Figure 13): the leader advances a follower's match_index from the index
+        // the follower ECHOED in its InstallSnapshotResp, NOT from the leader's OWN current
+        // snapshot meta. So a SECOND compaction inside the in-flight InstallSnapshot window
+        // must NOT push match_index past what the follower actually installed (a
+        // match_index lie is a false-commit hazard).
+        //
+        // Setup: a 3-voter leader (term 4) that has snapshotted at index K and compacted.
+        // We send NodeId(2) an InstallSnapshot(K), then COMPACT AGAIN to K' > K (simulating
+        // the leader applying + compacting more committed entries while the install is in
+        // flight). When NodeId(2)'s reply arrives echoing K, the leader must set
+        // match_index[2] = K, NOT the newer K'.
+        let voters: BTreeSet<NodeId> = (1..=3).map(NodeId).collect();
+        let mut storage = MemStorage::new();
+        storage.set_current_term(4);
+        // A log 1..=8 at term 4, all committed-and-applied on the leader by construction.
+        for i in 1..=8u64 {
+            storage.append(LogEntry {
+                term: 4,
+                index: i,
+                payload: EntryPayload::Noop,
+            });
+        }
+        let mut leader = RaftNode::new(NodeId(1), voters, storage, RaftConfig::default());
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        leader.role = Role::Leader;
+        leader.commit_index = 8;
+        leader.last_applied = 8;
+        // Initialize peer markers as a fresh leader would (Figure 2): next_index = last+1,
+        // match_index = 0.
+        for peer in [NodeId(2), NodeId(3)] {
+            leader.next_index.insert(peer, 9);
+            leader.match_index.insert(peer, 0);
+        }
+
+        // The FIRST snapshot + compaction: K = 4. The follower's needed entries are below
+        // this, so a send to it would be an InstallSnapshot(K=4).
+        let first_k = 4u64;
+        leader.storage.save_snapshot(
+            SnapshotMeta {
+                last_included_index: first_k,
+                last_included_term: 4,
+            },
+            b"snap-at-4",
+        );
+        leader.storage.compact_to(first_k);
+        // Drive a fresh InstallSnapshot to the lagging follower (next_index 1 <= 4 forces
+        // the InstallSnapshot branch), and confirm that is what goes on the wire.
+        leader.next_index.insert(NodeId(2), 1);
+        let mut out = Effects::new();
+        leader.send_append_entries_to(NodeId(2), &mut out);
+        let sent_k = out.sends.iter().find_map(|(to, m)| match m {
+            RaftMsg::InstallSnapshot {
+                last_included_index,
+                ..
+            } if *to == NodeId(2) => Some(*last_included_index),
+            _ => None,
+        });
+        assert_eq!(
+            sent_k,
+            Some(first_k),
+            "the leader must ship InstallSnapshot at the FIRST snapshot index K=4"
+        );
+
+        // SECOND compaction inside the in-flight window: K' = 7 > K. The leader's CURRENT
+        // load_snapshot() now answers 7, the value the OLD (buggy) code would have read.
+        let second_k = 7u64;
+        leader.storage.save_snapshot(
+            SnapshotMeta {
+                last_included_index: second_k,
+                last_included_term: 4,
+            },
+            b"snap-at-7",
+        );
+        leader.storage.compact_to(second_k);
+        assert_eq!(
+            leader
+                .storage
+                .load_snapshot()
+                .map(|(m, _)| m.last_included_index),
+            Some(second_k),
+            "the leader has compacted AGAIN to K'=7 (the over-advance trap)"
+        );
+
+        // The follower's reply finally arrives, ECHOING the index it actually installed (K=4).
+        let mut out = Effects::new();
+        leader.on_message(
+            now,
+            &mut rng,
+            NodeId(2),
+            RaftMsg::InstallSnapshotResp {
+                term: 4,
+                last_included_index: first_k,
+            },
+            &mut out,
+        );
+
+        // THE FIX: match_index[2] is the ECHOED K=4, NOT the leader's current K'=7. Reading
+        // the leader's own meta (the bug) would have set it to 7, claiming the follower
+        // holds entries 5..=7 it never installed.
+        assert_eq!(
+            leader.match_index.get(&NodeId(2)).copied(),
+            Some(first_k),
+            "match_index advances from the ECHOED install index (4), never the newer K'=7"
+        );
+        assert_eq!(
+            leader.next_index.get(&NodeId(2)).copied(),
+            Some(first_k + 1),
+            "next_index follows the echoed index (5), so the leader re-ships entries 5.."
+        );
+
+        // A reordered OLDER reply (a smaller echoed index) must not REWIND the marker
+        // (the .max guard): deliver an echo of 2 and confirm match_index stays at 4.
+        let mut out = Effects::new();
+        leader.on_message(
+            now,
+            &mut rng,
+            NodeId(2),
+            RaftMsg::InstallSnapshotResp {
+                term: 4,
+                last_included_index: 2,
+            },
+            &mut out,
+        );
+        assert_eq!(
+            leader.match_index.get(&NodeId(2)).copied(),
+            Some(first_k),
+            "a reordered older echo (2) must not rewind match_index below 4 (.max guard)"
+        );
     }
 }
