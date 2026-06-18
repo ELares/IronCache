@@ -19,7 +19,103 @@
 //! [`Runtime::connect`]: ironcache_runtime::Runtime::connect
 
 use ironcache_runtime::Runtime;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
+
+/// A peer's ADVERTISED dial address held as `host` + `port`, NOT a pre-resolved
+/// [`SocketAddr`] (k8s StatefulSet support).
+///
+/// A Kubernetes StatefulSet addresses its pods by STABLE per-pod DNS names (e.g.
+/// `ironcache-0.ironcache.default.svc.cluster.local`), and a restarted pod keeps that
+/// hostname but gets a NEW pod IP. Storing a resolved `SocketAddr` would freeze the
+/// FIRST IP and dial a dead address forever after a restart; storing the host + port and
+/// calling [`resolve`](PeerEndpoint::resolve) FRESH on every connect attempt picks up the
+/// new IP on reconnect. An IP-literal host resolves to itself, so an IP-addressed cluster
+/// is byte-identical (the resolver returns the same `SocketAddr` `parse` would have).
+///
+/// The host string is whatever the topology advertised: a DNS name OR an IP literal. The
+/// resolution is REAL I/O (a name lookup), so it lives here in the dial/bus adapter, never
+/// in the pure deterministic engine (ADR-0027): the engine only ever sees an already-dialed
+/// connection, never a hostname.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerEndpoint {
+    /// The advertised host: a DNS hostname OR an IP literal (resolved fresh per dial).
+    pub host: String,
+    /// The advertised TCP port.
+    pub port: u16,
+}
+
+impl PeerEndpoint {
+    /// Build an endpoint from an advertised `host` (DNS name or IP literal) and `port`.
+    #[must_use]
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+        }
+    }
+
+    /// Resolve this endpoint to a [`SocketAddr`], accepting BOTH a DNS hostname AND an IP
+    /// literal, and return the FIRST resolved address.
+    ///
+    /// This is the single replacement for the old `format!("{host}:{port}").parse::<SocketAddr>()`,
+    /// which ONLY accepted an IP literal and SILENTLY dropped a DNS hostname. `(host, port)` fed to
+    /// [`ToSocketAddrs`] resolves a hostname through the OS resolver AND resolves an IP literal
+    /// trivially to itself (so an IP-addressed cluster is byte-identical). The FIRST address is taken
+    /// for a stable, deterministic choice (the resolver yields a consistent order for a given host);
+    /// a dual-stack host therefore dials its first advertised family, and the next dial re-resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ResolveError`] (naming the unresolvable `host:port`) when the OS resolver yields
+    /// NO address for the host, or the lookup itself fails. The caller MUST surface this loudly
+    /// (a boot error or a logged dial failure) and NEVER silently drop the peer: a dropped voter
+    /// breaks quorum with no diagnostic.
+    pub fn resolve(&self) -> Result<SocketAddr, ResolveError> {
+        // `(&str, u16)` implements ToSocketAddrs: an IP literal resolves to itself (byte-identical
+        // to the old parse), a DNS name goes through the OS resolver. Real I/O, so it belongs in
+        // this adapter, not the engine.
+        match (self.host.as_str(), self.port).to_socket_addrs() {
+            Ok(mut addrs) => addrs.next().ok_or_else(|| ResolveError {
+                host: self.host.clone(),
+                port: self.port,
+                cause: "the resolver returned no addresses".to_owned(),
+            }),
+            Err(e) => Err(ResolveError {
+                host: self.host.clone(),
+                port: self.port,
+                cause: e.to_string(),
+            }),
+        }
+    }
+}
+
+/// A peer-address RESOLUTION failure: the advertised `host:port` could not be turned into a
+/// dial-able [`SocketAddr`] (k8s StatefulSet support).
+///
+/// Carries the exact `host` + `port` and the underlying cause so the boot path / the dial path can
+/// surface a CLEAR, actionable diagnostic instead of the old SILENT `continue` that quietly omitted
+/// a voter (which breaks quorum with no error). Never swallow this: log it loudly or hard-fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveError {
+    /// The host that failed to resolve (a DNS name or a malformed literal).
+    pub host: String,
+    /// The port that was being resolved alongside the host.
+    pub port: u16,
+    /// The underlying resolver cause (the OS error text, or "no addresses").
+    pub cause: String,
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to resolve peer address {}:{} ({})",
+            self.host, self.port, self.cause
+        )
+    }
+}
+
+impl std::error::Error for ResolveError {}
 
 /// A RESP reply the bus understands. Enough for control-plane probes; the full
 /// RESP3 surface is the client codec's job, not the bus's.
@@ -46,6 +142,10 @@ pub enum BusError<E> {
     Protocol(&'static str),
     /// The peer answered with a RESP error reply (`-...`).
     Remote(String),
+    /// The peer's advertised `host:port` could not be RESOLVED to a dial-able address (k8s
+    /// StatefulSet support): a DNS name with no record, or a not-yet-up pod. Surfaced loudly by
+    /// the dial path (logged + reconnect) instead of the old silent peer drop.
+    Resolve(ResolveError),
 }
 
 /// An outbound RESP connection to a peer node, built on the [`Runtime`] seam.
@@ -72,6 +172,22 @@ where
             stream,
             pending: Vec::new(),
         })
+    }
+
+    /// Open a connection to a peer by its advertised [`PeerEndpoint`] (host + port), RESOLVING the
+    /// host FRESH on this call before dialing (k8s StatefulSet support).
+    ///
+    /// This is the reconnect-safe entry point: because the endpoint holds the HOSTNAME (not a
+    /// pre-resolved [`SocketAddr`]), every call re-runs DNS, so a restarted pod that kept its
+    /// hostname but got a NEW IP is dialed at its new address. A resolution failure is returned as a
+    /// [`BusError::Resolve`] (carrying the host:port), NEVER silently dropped. An IP-literal host
+    /// resolves to itself, so an IP-addressed peer dials byte-identically to [`PeerConn::connect`].
+    pub async fn connect_endpoint(
+        rt: &R,
+        endpoint: &PeerEndpoint,
+    ) -> Result<Self, BusError<R::Error>> {
+        let addr = endpoint.resolve().map_err(BusError::Resolve)?;
+        Self::connect(rt, addr).await
     }
 
     /// Send one command (an array of bulk-string args) and read exactly one reply.
@@ -276,5 +392,48 @@ mod tests {
     #[test]
     fn unsupported_kind_is_rejected() {
         assert!(parse_reply(b"*2\r\n").is_err());
+    }
+
+    /// An IP-LITERAL endpoint resolves to itself, byte-identical to the old
+    /// `format!("{host}:{port}").parse::<SocketAddr>()` (so an IP-addressed cluster is unchanged).
+    #[test]
+    fn resolve_accepts_ip_literal() {
+        let ep = PeerEndpoint::new("127.0.0.1", 7001);
+        let addr = ep.resolve().expect("an IP literal must resolve to itself");
+        assert_eq!(addr, "127.0.0.1:7001".parse::<SocketAddr>().unwrap());
+        assert_eq!(addr.port(), 7001);
+        assert!(addr.ip().is_loopback());
+    }
+
+    /// A resolvable DNS HOSTNAME (`localhost`) resolves to a loopback `SocketAddr` (127.0.0.1 or
+    /// ::1). This is the case the old IP-only `parse` SILENTLY dropped, so a StatefulSet (whose pods
+    /// are addressed by per-pod DNS names) could never form a cluster.
+    #[test]
+    fn resolve_accepts_dns_hostname() {
+        let ep = PeerEndpoint::new("localhost", 7001);
+        let addr = ep
+            .resolve()
+            .expect("localhost must resolve to a loopback address");
+        assert_eq!(addr.port(), 7001);
+        assert!(
+            addr.ip().is_loopback(),
+            "localhost should resolve to a loopback ip, got {addr}"
+        );
+    }
+
+    /// An UNRESOLVABLE host yields a CLEAR `Err` (not a silent `None` / dropped peer). The error
+    /// names the offending host:port so the boot / dial path can surface an actionable diagnostic.
+    #[test]
+    fn resolve_unresolvable_host_is_a_clear_error() {
+        // `.invalid` is reserved by RFC 6761 to never resolve, so this is hermetic (no real lookup
+        // can succeed) and deterministic across environments.
+        let ep = PeerEndpoint::new("nonexistent.invalid", 7001);
+        let err = ep
+            .resolve()
+            .expect_err("an unresolvable host must be a clear error, not a silent drop");
+        let msg = err.to_string();
+        assert!(msg.contains("nonexistent.invalid"), "got {msg:?}");
+        assert!(msg.contains("7001"), "got {msg:?}");
+        assert!(msg.contains("failed to resolve"), "got {msg:?}");
     }
 }

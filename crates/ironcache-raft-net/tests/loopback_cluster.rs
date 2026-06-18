@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use ironcache_clusterbus::PeerEndpoint;
 use ironcache_env::{Clock, SystemEnv};
 use ironcache_raft::{EntryPayload, LogEntry, MemStorage, NodeId, RaftConfig, RaftNode};
 use ironcache_raft_net::{NodeHandle, RaftClusterBusNode, RecordingSm, Status, run_listener};
@@ -88,7 +89,7 @@ impl Drop for RunningNode {
 /// `MemStorage` and a sink-backed `RecordingSm`, and run the listener + control loop
 /// on a `LocalSet` until the shutdown signal fires. Returns the `Send` handle, the
 /// applied-entry receiver, and the shutdown/thread handles.
-fn spawn_node(id: NodeId, addr: SocketAddr, peers: BTreeMap<NodeId, SocketAddr>) -> RunningNode {
+fn spawn_node(id: NodeId, addr: SocketAddr, peers: BTreeMap<NodeId, PeerEndpoint>) -> RunningNode {
     let (applied_tx, applied_rx) = mpsc::unbounded_channel::<LogEntry>();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (handle_tx, handle_rx) = std::sync::mpsc::channel::<NodeHandle>();
@@ -144,10 +145,13 @@ fn spawn_node(id: NodeId, addr: SocketAddr, peers: BTreeMap<NodeId, SocketAddr>)
     }
 }
 
-/// The full three-node peer wiring: every node maps the OTHER two ids to addresses.
+/// The full three-node peer wiring: every node maps the OTHER two ids to [`PeerEndpoint`]s
+/// (host + port). The loopback `SocketAddr`s carry an IP-literal host, so an endpoint built from
+/// one resolves byte-identically to the address it came from (the re-resolve path is exercised by
+/// the dedicated resolver unit tests; here it dials the same loopback ip every time).
 fn peer_maps(
     addrs: &BTreeMap<NodeId, SocketAddr>,
-) -> BTreeMap<NodeId, BTreeMap<NodeId, SocketAddr>> {
+) -> BTreeMap<NodeId, BTreeMap<NodeId, PeerEndpoint>> {
     let mut out = BTreeMap::new();
     for &id in addrs.keys() {
         out.insert(id, peers_excluding(addrs, id));
@@ -155,15 +159,16 @@ fn peer_maps(
     out
 }
 
-/// The peer map for `id`: every OTHER node's id mapped to its address.
+/// The peer map for `id`: every OTHER node's id mapped to its [`PeerEndpoint`] (the loopback
+/// `SocketAddr`'s ip + port, held as host + port so the dial path re-resolves per connect).
 fn peers_excluding(
     addrs: &BTreeMap<NodeId, SocketAddr>,
     id: NodeId,
-) -> BTreeMap<NodeId, SocketAddr> {
+) -> BTreeMap<NodeId, PeerEndpoint> {
     addrs
         .iter()
         .filter(|&(&other, _)| other != id)
-        .map(|(&other, &a)| (other, a))
+        .map(|(&other, &a)| (other, PeerEndpoint::new(a.ip().to_string(), a.port())))
         .collect()
 }
 
