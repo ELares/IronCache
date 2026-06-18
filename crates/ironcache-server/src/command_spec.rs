@@ -464,6 +464,43 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        // -- PERSISTENCE (#58 durable on-disk snapshot). SAVE/BGSAVE/LASTSAVE are admin
+        // commands with NO key: AlwaysHome (never key-routed), arity Exact(1) each (the bare
+        // token; src/commands.def gives SAVE/BGSAVE/LASTSAVE arity 1), not denyoom (they do not
+        // allocate keyspace), not a txn control verb, and NOT is_write (they do not mutate the
+        // keyspace -- they DUMP it; the replica-read gate must not treat SAVE as a write, and a
+        // snapshot is taken on the home shard then fanned out to dump every shard's partition).
+        // The cross-shard SAVE/BGSAVE fan-out + the manifest commit live in the binary's serve
+        // layer (it owns the per-shard stores + the data_dir + the env Clock for the timestamp).
+        b"SAVE" => &CommandSpec {
+            name: b"SAVE",
+            arity: Exact(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        b"BGSAVE" => &CommandSpec {
+            name: b"BGSAVE",
+            // Redis BGSAVE accepts an optional SCHEDULE arg (arity -1); we accept the bare form
+            // and ignore a trailing arg, so Min(1).
+            arity: Min(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        b"LASTSAVE" => &CommandSpec {
+            name: b"LASTSAVE",
+            arity: Exact(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
         // -- Transaction control (cmd_txn / dispatch). The 6 control verbs (control: true)
         // bypass MULTI queueing; WATCH/UNWATCH arities are -2 / 1 (src/commands.def). --
         b"MULTI" => &CommandSpec {

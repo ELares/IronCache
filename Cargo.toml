@@ -29,6 +29,7 @@ members = [
     "crates/ironcache-eviction",
     "crates/ironcache-expiry",
     "crates/ironcache-store",
+    "crates/ironcache-persist",
     "crates/ironcache-server",
     "crates/ironcache",
     "crates/ironcache-bench",
@@ -123,6 +124,7 @@ ironcache-storage = { path = "crates/ironcache-storage" }
 ironcache-eviction = { path = "crates/ironcache-eviction" }
 ironcache-expiry = { path = "crates/ironcache-expiry" }
 ironcache-store = { path = "crates/ironcache-store" }
+ironcache-persist = { path = "crates/ironcache-persist" }
 ironcache-server = { path = "crates/ironcache-server" }
 
 [profile.release]

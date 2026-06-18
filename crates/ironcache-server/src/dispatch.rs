@@ -625,6 +625,19 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // cluster-disabled reject for mutating subcommands. AlwaysHome, never key-routed; it
         // reads only ctx.info (node id, listen addr, cluster_enabled). No store/wheel/state.
         b"CLUSTER" => cmd_cluster::cmd_cluster(ctx, req),
+        // PERSISTENCE (#58): SAVE / BGSAVE / LASTSAVE. The REAL cross-shard save (dump every
+        // shard's partition + commit the manifest) + the LASTSAVE timestamp live in the binary's
+        // serve layer, which holds the concrete per-shard stores, the data_dir, and the env Clock
+        // (the generic dispatch here sees only the storage WAIST, not a concrete store to dump).
+        // The serve router INTERCEPTS these BEFORE the generic dispatch (exactly like the raft
+        // CLUSTER mutator + the WholeKeyspace fan-out), so these arms are the PERSISTENCE-DISABLED
+        // fallback (no data_dir / shards==1 generic path / any path that reaches dispatch
+        // directly): a Redis-faithful success reply that is a no-op (nothing to dump through the
+        // waist), so the command is never an unknown-command error. `LASTSAVE` with no committed
+        // save reports `:0`.
+        b"SAVE" => cmd_persist_save_fallback(req),
+        b"BGSAVE" => cmd_persist_bgsave_fallback(req),
+        b"LASTSAVE" => cmd_persist_lastsave_fallback(req),
         // Every OTHER command is a KEYED-DATA command (or an unknown token): it touches
         // only store/wheel/db/now (+ env for the RNG-drawing members), NO ConnState. The
         // bodies live in [`dispatch_keyed_data`], the SINGLE keyed-arm definition that
@@ -1286,6 +1299,40 @@ fn cmd_echo(req: &Request) -> Value {
         return Value::error(ErrorReply::wrong_arity("echo"));
     }
     Value::BulkString(Some(req.args[1].clone()))
+}
+
+/// `SAVE` PERSISTENCE-DISABLED fallback (#58): reached only when the serve layer did NOT
+/// intercept the command (no data_dir configured / a path that reaches dispatch directly), so
+/// there is nothing to dump through the storage waist. Redis replies `+OK` to a successful SAVE;
+/// with persistence off a SAVE is a no-op success (there is no on-disk target). The cross-shard
+/// dump + manifest commit is the binary serve layer's job (it holds the concrete stores).
+fn cmd_persist_save_fallback(req: &Request) -> Value {
+    if req.args.len() != 1 {
+        return Value::error(ErrorReply::wrong_arity("save"));
+    }
+    Value::ok()
+}
+
+/// `BGSAVE [SCHEDULE]` PERSISTENCE-DISABLED fallback (#58): the serve-layer non-intercept path.
+/// Redis replies `+Background saving started`; with persistence off there is no background save
+/// to start, but the reply is the Redis-faithful acknowledgement (a no-op success). Accepts the
+/// bare form and an optional trailing arg (Redis BGSAVE SCHEDULE), which is ignored here.
+fn cmd_persist_bgsave_fallback(req: &Request) -> Value {
+    if req.args.is_empty() {
+        return Value::error(ErrorReply::wrong_arity("bgsave"));
+    }
+    Value::SimpleString("Background saving started".to_owned())
+}
+
+/// `LASTSAVE` PERSISTENCE-DISABLED fallback (#58): the serve-layer non-intercept path. Redis
+/// returns the unix time of the last successful save as an integer; with no committed save (or
+/// persistence off) that is `0`. The real value (the committed manifest's `save_unix_secs`) is
+/// reported by the serve layer when persistence is configured.
+fn cmd_persist_lastsave_fallback(req: &Request) -> Value {
+    if req.args.len() != 1 {
+        return Value::error(ErrorReply::wrong_arity("lastsave"));
+    }
+    Value::Integer(0)
 }
 
 /// `HELLO [proto] [AUTH user pass] [SETNAME name]` (CONNECTION_LIFECYCLE.md).

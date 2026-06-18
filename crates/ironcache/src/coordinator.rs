@@ -138,7 +138,13 @@ pub fn build_inboxes(n: usize) -> (Inbox, Vec<mpsc::Receiver<ShardWork>>) {
 /// when the loop suspends on `recv()` nothing of this shard's state is borrowed and an
 /// interleaved connection task can borrow freely (the same contract the expiry timer
 /// follows). See the module docs.
-pub async fn run_drain_loop(mut rx: mpsc::Receiver<ShardWork>, ctx: ServerContext) {
+pub async fn run_drain_loop(
+    shard_index: usize,
+    mut rx: mpsc::Receiver<ShardWork>,
+    ctx: ServerContext,
+    inbox: Inbox,
+    persist: Option<Arc<crate::persist::PersistState>>,
+) {
     // Bring up THIS shard's background tasks AT SHARD BOOT (COORDINATOR.md #107): lazily
     // init the per-shard handles + spawn the active-expiry timer ONCE. The drain loop is
     // spawned on the shard's LocalSet, so this is the shard-boot hook a connectionless
@@ -150,6 +156,25 @@ pub async fn run_drain_loop(mut rx: mpsc::Receiver<ShardWork>, ctx: ServerContex
         ctx.info.maxmemory_policy,
         crate::serve::scan_reserved_bits(ctx.shards),
     );
+
+    // PERSISTENCE LOAD-ON-BOOT (#58): when a data_dir is configured, THIS shard loads ITS OWN
+    // committed snapshot file (`dump-shard-<shard_index>.icss`) into its store BEFORE the drain
+    // loop services any remote work and before the shard accepts connections (the drain loop is
+    // spawned ahead of the serve loop). A missing / torn / wrong-version file loads NOTHING (the
+    // shard starts empty, today's behavior). With persistence OFF (`None`) this whole block is
+    // skipped, so the boot path is byte-unchanged. The store borrow is taken + released inside the
+    // synchronous load (no `.await` held across it).
+    if let Some(persist) = persist.as_ref() {
+        load_shard_on_boot(&ctx, persist, shard_index);
+        // The PERIODIC SAVE timer (#58 save policy) is hosted on SHARD 0 only (one timer per node,
+        // not N): when the interval is non-zero it ticks every `interval_secs` and, if at least
+        // `min_changes` writes happened since the last save, triggers a full cross-shard save. With
+        // `interval_secs == 0` (the default) NO timer is spawned. Shard 0's executor (this drain
+        // loop) is the natural home-core host for the fan-out (it OWNS the inbox passed here).
+        if shard_index == 0 && persist.interval_secs > 0 {
+            spawn_periodic_save(ctx.clone(), inbox.clone(), Arc::clone(persist));
+        }
+    }
     // HA-7d LIVE replica attach: ONLY in raft-governance mode (`ctx.raft.is_some()`). The
     // DEFAULT static path and the raft-control-plane-WITHOUT-replicas path are byte-unchanged:
     // this is the SOLE invocation of `replica_attach`, gated here, and it does no work until an
@@ -200,6 +225,20 @@ fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
     if crate::serve::ascii_upper(request.command()) == ironcache_server::ICPUBLISH {
         return ShardReply {
             value: run_local_publish(request),
+            deltas: CounterDeltas::default(),
+        };
+    }
+
+    // INTERNAL `__ICSAVE <save_unix_secs> <shard_index> <dir>` (#58 persistence): the cross-shard
+    // SAVE fan-out. This shard DUMPS ITS OWN partition (the forkless, memory-neutral
+    // `snapshot_chunk` pull) to `<dir>/dump-shard-<shard_index>.icss` ATOMICALLY and returns its
+    // manifest entry encoded in the reply. It reads only the store (read-only SHARED borrow) + the
+    // Env clock for the lazy-expiry `now`, produces NO counter deltas (a save is not a keyed
+    // write), and is handled BEFORE any mutable store borrow. The home core (the SAVE/BGSAVE
+    // orchestrator) collects every shard's entry + commits the manifest LAST.
+    if crate::serve::ascii_upper(request.command()) == crate::persist::ICSAVE {
+        return ShardReply {
+            value: save_shard_local(ctx, request),
             deltas: CounterDeltas::default(),
         };
     }
@@ -753,6 +792,170 @@ pub fn run_local_publish(request: &Request) -> Value {
         ironcache_server::glob::glob_match,
     );
     Value::Integer(count)
+}
+
+/// Run ONE shard's `__ICSAVE <save_unix_secs> <shard_index> <dir>` against THIS shard's store
+/// (#58 persistence): DUMP this shard's whole partition to `<dir>/dump-shard-<shard_index>.icss`
+/// ATOMICALLY (the forkless, memory-neutral `snapshot_chunk` pull + tmp -> fsync -> rename) and
+/// return its manifest entry encoded as `*3 [:shard :keys :crc]` (see
+/// [`crate::persist::encode_save_reply`]). On an I/O error it returns a proto error the home core
+/// surfaces as a failed SAVE.
+///
+/// It reads `now` from THIS shard's Env clock (the determinism seam, ADR-0003: the lazy-expiry
+/// basis the dump skips dead keys at) via a SHORT shared borrow, and borrows the store READ-ONLY
+/// for the dump (the dump never mutates). Both borrows are taken + released inside this synchronous
+/// call (the no-borrow-across-await contract). NOTE (M4): this holds the store borrow across the
+/// ENTIRE `save_shard_to_dir` call -- the whole keyspace dump AND the file fsync -- so this shard is
+/// BLOCKED for its full dump + fsync latency (per-shard-consistent). The chunked `snapshot_chunk`
+/// bounds the dump's MEMORY to O(`DUMP_CHUNK`), but the borrow is NOT released between chunks here,
+/// so BGSAVE blocks this shard exactly as SAVE does (BGSAVE only frees the ISSUING connection).
+/// Produces NO counter deltas (a save is not a keyed write).
+#[must_use]
+fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
+    // Parse `__ICSAVE <save_unix_secs> <shard_index> <dir>`.
+    let (Some(secs_arg), Some(shard_arg), Some(dir_arg)) = (
+        request.args.get(1),
+        request.args.get(2),
+        request.args.get(3),
+    ) else {
+        return Value::error(ironcache_protocol::ErrorReply::err("malformed __ICSAVE"));
+    };
+    let parse_u64 = |b: &bytes::Bytes| {
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+    };
+    let (Some(_save_secs), Some(shard_index)) = (parse_u64(secs_arg), parse_u64(shard_arg)) else {
+        return Value::error(ironcache_protocol::ErrorReply::err("malformed __ICSAVE"));
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let shard_index = shard_index as u32;
+    let dir = std::path::PathBuf::from(String::from_utf8_lossy(dir_arg).into_owned());
+
+    let env = shard_env();
+    let store_rc = shard_store(
+        ctx.databases,
+        ctx.info.maxmemory_policy,
+        crate::serve::scan_reserved_bits(ctx.shards),
+    );
+    // `now` from THIS shard's wall clock (ADR-0003), a short borrow dropped before the store dump.
+    let now = UnixMillis(env.borrow().now_unix_millis());
+    // Read-only store borrow for the dump (the forkless snapshot pull). save_shard_to_dir runs the
+    // chunked snapshot_chunk + writes the file atomically.
+    let result = {
+        let store = store_rc.borrow();
+        ironcache_persist::save_shard_to_dir(&*store, shard_index, &dir, now)
+    };
+    match result {
+        Ok(entry) => crate::persist::encode_save_reply(&entry),
+        Err(e) => Value::error(ironcache_protocol::ErrorReply::err(format!(
+            "save failed: {e}"
+        ))),
+    }
+}
+
+/// Run the HOME shard's `__ICSAVE` partial LOCALLY + SYNCHRONOUSLY (#58 persistence), returning the
+/// home shard's [`ShardReply`]. This is the `local` closure [`fan_out_split`] runs for the home
+/// shard: the home core does NOT round-trip its OWN save through its channel; it dumps inline via
+/// the SAME [`save_shard_local`] every remote shard runs (so the home shard's file is byte-identical
+/// to a remote shard's). A save produces no counter deltas, so the reply carries default deltas.
+/// Every per-shard borrow is taken + released inside the synchronous `save_shard_local` (the
+/// no-borrow-across-await contract; the caller awaits remote replies AFTER this returns).
+#[must_use]
+pub fn run_local_save(ctx: &ServerContext, request: &Request) -> ShardReply {
+    ShardReply {
+        value: save_shard_local(ctx, request),
+        deltas: CounterDeltas::default(),
+    }
+}
+
+/// LOAD this shard's slice of the committed snapshot into its store at boot (#58 load-on-boot),
+/// RE-SHARDING across any shard-count change (the C1 fix). THIS shard reads EVERY manifest shard
+/// file and keeps only the keys it OWNS under the CURRENT shard count (`ctx.shards`), using the
+/// SAME `ironcache_server::owner_shard` hash the router routes a single-key command with. So a
+/// snapshot saved with N shards loads CORRECTLY into a node with M != N shards: with fewer shards
+/// no key is lost (every file is read), with more shards no GET misroutes (each key lands on its
+/// real owner). A missing manifest / a missing or torn shard file loads NOTHING for that file (the
+/// shard's keys from it are absent, never corrupt-loaded). Synchronous: the store borrow is taken +
+/// released here (no `.await` held across it), and `now` is read from THIS shard's Env clock (the
+/// determinism seam, ADR-0003: an already-expired key is dropped on load).
+fn load_shard_on_boot(
+    ctx: &ServerContext,
+    persist: &Arc<crate::persist::PersistState>,
+    shard_index: usize,
+) {
+    let env = shard_env();
+    let store_rc = shard_store(
+        ctx.databases,
+        ctx.info.maxmemory_policy,
+        crate::serve::scan_reserved_bits(ctx.shards),
+    );
+    let now = UnixMillis(env.borrow().now_unix_millis());
+    // The CURRENT shard count: the router computes owner_shard(key, shard_count), so re-shard with
+    // the SAME count + hash the live serve loop routes with.
+    let shard_count = ctx.shards.max(1);
+    let loaded = {
+        let mut store = store_rc.borrow_mut();
+        ironcache_persist::load_shard_resharded(
+            &mut store,
+            &persist.dir,
+            shard_index,
+            shard_count,
+            now,
+            ironcache_server::owner_shard,
+        )
+    };
+    if loaded > 0 {
+        eprintln!(
+            "ironcache: shard {shard_index} loaded {loaded} keys from {}",
+            persist.dir.display()
+        );
+    }
+}
+
+/// Spawn the PERIODIC SAVE timer (#58 save policy) on SHARD 0's executor (one timer per node). Every
+/// `persist.interval_secs` seconds it checks the dirty-write counter: if at least `min_changes`
+/// writes happened since the last save, it triggers a full cross-shard save (the SAME
+/// [`crate::persist::do_save_all`] SAVE/BGSAVE use). With `interval_secs == 0` this is never spawned
+/// (the caller gates on it), so the default posture has NO timer.
+///
+/// ## Borrow / determinism discipline
+///
+/// The loop awaits the interval through the [`Runtime`] timer SEAM (NOT `tokio::time`, ADR-0003) and
+/// holds NO RefCell borrow across the awaits (the save fan-out's per-shard `save_shard_local` is
+/// synchronous and runs on each shard's own executor, so this home-core task only awaits channel
+/// replies). The save id / timestamp come from the env Clock seam.
+fn spawn_periodic_save(
+    ctx: ServerContext,
+    inbox: Inbox,
+    persist: Arc<crate::persist::PersistState>,
+) {
+    use ironcache_runtime::Runtime;
+    let rt = ironcache_runtime::TokioRuntime::new();
+    let interval = std::time::Duration::from_secs(persist.interval_secs);
+    let home = ShardId {
+        index: 0,
+        total: inbox.len(),
+    };
+    rt.spawn_on_shard(async move {
+        loop {
+            rt.timer(interval).await;
+            // Skip this tick if too few writes happened since the last save (the `changes` half of
+            // the Redis `save <seconds> <changes>` policy). `min_changes == 0` always fires.
+            let dirty = persist.dirty.load(std::sync::atomic::Ordering::Relaxed);
+            if dirty < persist.min_changes {
+                continue;
+            }
+            // Serialize against a concurrent SAVE/BGSAVE; if one is already running, skip this tick.
+            // The RAII guard releases the latch on completion, panic, OR cancellation (H3).
+            let Some(_guard) = persist.try_begin_save() else {
+                continue;
+            };
+            // The save timestamp from shard 0's Env clock (the determinism seam, ADR-0003).
+            let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
+            let _ = crate::persist::do_save_all(&persist, &inbox, &ctx, home, 0, now_secs).await;
+        }
+    });
 }
 
 /// Fan a `PUBLISH <channel> <payload>` out to EVERY shard's LOCAL subscriber table and SUM the
