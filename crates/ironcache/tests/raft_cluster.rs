@@ -1567,6 +1567,177 @@ fn raft_mode_replica_read_staleness_bound_moves_when_link_drops() {
     clean_raft_logs(ports);
 }
 
+// `too_many_lines` allowed: ONE end-to-end UN-assign flow (formation, assign the whole space, then
+// DELSLOTSRANGE a sub-range on the leader), read in sequence, indexing parallel clients[i]/ports[i].
+//
+// Proves the slice-ha-unassign wiring END TO END over real sockets: `CLUSTER DELSLOTSRANGE` commits
+// an `UnassignSlots` ConfigCmd that EVERY node applies, so the cleared slots become owned by NOBODY
+// and `cluster_slots_assigned` drops by the range size on ALL THREE nodes (the slot map's
+// linearizable-ownership convergence, now extended to the UN-assign leg). The full slot space is
+// assigned first so the drop is unambiguous (16384 -> 16384 minus the range).
+#[test]
+#[allow(clippy::too_many_lines, clippy::needless_range_loop)]
+fn raft_mode_delslotsrange_unassigns_a_range_and_converges() {
+    // The sub-range UN-assigned below: 100 slots ([0, 99]), so the assigned count must drop from the
+    // full 16384 to 16284 on every node once the committed UnassignSlots applies.
+    const RANGE_SIZE: u32 = 100;
+    const REMAINING: u32 = 16_384 - RANGE_SIZE;
+
+    let timeout = Duration::from_secs(20);
+
+    let ports = [free_port(), free_port(), free_port()];
+    clean_raft_logs(ports);
+    let topo = three_node_topology(ports);
+
+    let ids = [ID0, ID1, ID2];
+    let _nodes: Vec<ShardSet> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| run_raft_node_for_test(ports[i], topo.clone(), id))
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let mut clients = Vec::new();
+        for p in ports {
+            clients.push(connect_retry(p).await);
+        }
+        let env = SystemEnv::new();
+
+        // ---- (1) FORMATION: discover the node that ACCEPTS a CLUSTER write (the committed owner,
+        // whether it is the physical leader or a follower forwarding). Probe with an idempotent MEET.
+        let leader_idx = {
+            let start = env.now();
+            let mut found = None;
+            'discover: loop {
+                for i in 0..3 {
+                    let peer = (i + 1) % 3;
+                    let reply = cmd(
+                        &mut clients[i],
+                        &["CLUSTER", "MEET", "127.0.0.1", &ports[peer].to_string()],
+                    )
+                    .await;
+                    if reply.starts_with("+OK") {
+                        found = Some(i);
+                        break 'discover;
+                    }
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            found.expect("a node must emerge that accepts a CLUSTER write")
+        };
+
+        // The leader MEETs BOTH peers (so they enter the committed node table), then claims the WHOLE
+        // slot space for itself, so the baseline is an unambiguous 16384 slots assigned.
+        for i in 0..3 {
+            if i == leader_idx {
+                continue;
+            }
+            let r = cmd(
+                &mut clients[leader_idx],
+                &["CLUSTER", "MEET", "127.0.0.1", &ports[i].to_string()],
+            )
+            .await;
+            assert!(r.starts_with("+OK"), "leader MEET should commit, got {r:?}");
+        }
+        let r = cmd(
+            &mut clients[leader_idx],
+            &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"],
+        )
+        .await;
+        assert!(
+            r.starts_with("+OK"),
+            "leader ADDSLOTSRANGE 0 16383 should commit, got {r:?}"
+        );
+
+        // Every node converges to the full assignment (state:ok + 16384 assigned).
+        let start = env.now();
+        let assigned_all = loop {
+            let mut all = true;
+            for i in 0..3 {
+                let info = cmd(&mut clients[i], &["CLUSTER", "INFO"]).await;
+                if !(info.contains("cluster_state:ok")
+                    && info.contains("cluster_slots_assigned:16384"))
+                {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                break true;
+            }
+            if deadline_passed(&env, start, timeout) {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            assigned_all,
+            "all three nodes must converge to 16384 slots assigned before the UN-assign"
+        );
+
+        // ---- (2) UN-ASSIGN: DELSLOTSRANGE a sub-range (100 slots: [0, 99]) on the leader. The
+        // committed `UnassignSlots` clears those slots on EVERY node, so cluster_slots_assigned drops
+        // by EXACTLY the range size (16384 - 100 = 16284) and cluster_state goes :fail (not all slots
+        // are assigned anymore). Poll until ALL THREE nodes converge to the new count.
+        let r = cmd(
+            &mut clients[leader_idx],
+            &["CLUSTER", "DELSLOTSRANGE", "0", "99"],
+        )
+        .await;
+        assert!(
+            r.starts_with("+OK"),
+            "leader DELSLOTSRANGE 0 99 should commit, got {r:?}"
+        );
+
+        let start = env.now();
+        let dropped_all = loop {
+            let mut all = true;
+            for i in 0..3 {
+                let info = cmd(&mut clients[i], &["CLUSTER", "INFO"]).await;
+                if !(info.contains(&format!("cluster_slots_assigned:{REMAINING}"))
+                    && info.contains("cluster_state:fail"))
+                {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                break true;
+            }
+            if deadline_passed(&env, start, timeout) {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            dropped_all,
+            "all three nodes must converge to cluster_slots_assigned:{REMAINING} (the {RANGE_SIZE}-slot \
+             range is now UN-assigned) + cluster_state:fail"
+        );
+
+        // The cleared slots are owned by NOBODY: a key in the unassigned range is no longer redirected
+        // to an owner (no MOVED), so it is NOT served by the old owner anymore. We assert the leader,
+        // which DID own the range, now serves the key locally (it owns nothing in that range) rather
+        // than MOVING it elsewhere -- i.e. the GET does NOT come back as a -MOVED to a stale owner.
+        let unassigned_key = key_in_range(0, 99);
+        let get = cmd(&mut clients[leader_idx], &["GET", &unassigned_key]).await;
+        assert!(
+            !get.starts_with("-MOVED"),
+            "a key in the UN-assigned range must NOT MOVED to a stale owner, got {get:?}"
+        );
+    });
+
+    clean_raft_logs(ports);
+}
+
 /// The deterministic 40-hex placeholder id a raft-mode `CLUSTER MEET <host> <port>` would
 /// synthesize for an UNREACHABLE peer (FNV-1a over `host:port`, hex-padded to 40). MUST match
 /// `serve.rs`'s `synth_meet_node_id`. Since the item-7 fix LEARNS a reachable peer's REAL announce

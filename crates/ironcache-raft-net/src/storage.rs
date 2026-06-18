@@ -101,6 +101,8 @@ const CFG_PROMOTE_REPLICA: u8 = 6;
 const CFG_SET_SLOT_MIGRATING: u8 = 7;
 const CFG_SET_SLOT_IMPORTING: u8 = 8;
 const CFG_SET_SLOT_STABLE: u8 = 9;
+// UNASSIGN slots (mirror the wire codec's discriminant, continuing from 9).
+const CFG_UNASSIGN_SLOTS: u8 = 10;
 
 // The fixed frame header: a u32 body length followed by a u32 CRC of the body.
 const FRAME_HEADER_LEN: usize = 8;
@@ -279,6 +281,15 @@ fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
         ConfigCmd::AssignSlots { node, slots } => {
             out.push(CFG_ASSIGN_SLOTS);
             put_str(out, node);
+            put_u64(out, slots.len() as u64);
+            for slot in slots {
+                put_u16(out, *slot);
+            }
+        }
+        ConfigCmd::UnassignSlots { slots } => {
+            // The inverse of AssignSlots; a length-prefixed slot list with NO node string. Must
+            // round-trip through the fsync log so a committed UNASSIGN survives a restart.
+            out.push(CFG_UNASSIGN_SLOTS);
             put_u64(out, slots.len() as u64);
             for slot in slots {
                 put_u16(out, *slot);
@@ -470,6 +481,14 @@ fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
             Some(ConfigCmd::AssignSlots { node, slots })
         }
         CFG_SET_CONFIG_EPOCH => Some(ConfigCmd::SetConfigEpoch(cur.u64()?)),
+        CFG_UNASSIGN_SLOTS => {
+            let count = usize::try_from(cur.u64()?).ok()?;
+            let mut slots = Vec::with_capacity(count.min(16384));
+            for _ in 0..count {
+                slots.push(cur.u16()?);
+            }
+            Some(ConfigCmd::UnassignSlots { slots })
+        }
         CFG_ASSIGN_REPLICA => {
             let node = cur.string()?;
             let count = usize::try_from(cur.u64()?).ok()?;
@@ -1459,6 +1478,48 @@ mod tests {
                 s.entry_at(e.index).as_ref(),
                 Some(e),
                 "the committed migration entry must replay byte-identical after a reopen"
+            );
+        }
+        assert_eq!(s.entries_from(1), entries);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unassign_slots_entry_survives_fsync_log_reopen() {
+        // A committed `UnassignSlots` (the CLUSTER DELSLOTS / DELSLOTSRANGE / FLUSHSLOTS analog) MUST
+        // round-trip through the fsync log codec so a node that crashes after committing an UN-assign
+        // replays it on restart and converges to the slot being unassigned (it must NOT resurrect the
+        // old owner). The fsync log is a SEPARATE codec from the wire codec, so it is proven
+        // separately here. Covers the empty-slots edge and a multi-slot batch (incl. the boundary
+        // slot 16383).
+        let path = fresh_path("unassign_slots_entry_survives_fsync_log_reopen");
+        let entries = vec![
+            LogEntry {
+                term: 6,
+                index: 1,
+                payload: EntryPayload::Config(ConfigCmd::UnassignSlots {
+                    slots: vec![0, 1, 16_383],
+                }),
+            },
+            LogEntry {
+                term: 6,
+                index: 2,
+                payload: EntryPayload::Config(ConfigCmd::UnassignSlots { slots: vec![] }),
+            },
+        ];
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            for e in &entries {
+                s.append(e.clone());
+            }
+        }
+        let s = FileStorage::open(&path).expect("reopen recovers");
+        assert_eq!(s.last_log_index(), 2);
+        for e in &entries {
+            assert_eq!(
+                s.entry_at(e.index).as_ref(),
+                Some(e),
+                "the committed UnassignSlots must replay byte-identical after a reopen"
             );
         }
         assert_eq!(s.entries_from(1), entries);

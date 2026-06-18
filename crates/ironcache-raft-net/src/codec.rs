@@ -76,6 +76,8 @@ const CFG_PROMOTE_REPLICA: u8 = 6;
 const CFG_SET_SLOT_MIGRATING: u8 = 7;
 const CFG_SET_SLOT_IMPORTING: u8 = 8;
 const CFG_SET_SLOT_STABLE: u8 = 9;
+// UNASSIGN slots (CLUSTER DELSLOTS / DELSLOTSRANGE / FLUSHSLOTS): the next free discriminant.
+const CFG_UNASSIGN_SLOTS: u8 = 10;
 
 // ---------------------------------------------------------------------------
 // Encoding.
@@ -282,6 +284,15 @@ fn put_config(out: &mut Vec<u8>, cmd: &ConfigCmd) {
         ConfigCmd::AssignSlots { node, slots } => {
             out.push(CFG_ASSIGN_SLOTS);
             put_str(out, node);
+            put_u64(out, slots.len() as u64);
+            for slot in slots {
+                put_u16(out, *slot);
+            }
+        }
+        ConfigCmd::UnassignSlots { slots } => {
+            // The inverse of AssignSlots; a length-prefixed slot list with NO node string (every
+            // node clears the same slots). A distinct discriminant keeps it unambiguous on the wire.
+            out.push(CFG_UNASSIGN_SLOTS);
             put_u64(out, slots.len() as u64);
             for slot in slots {
                 put_u16(out, *slot);
@@ -585,6 +596,14 @@ fn get_config(cur: &mut Cursor<'_>) -> Option<ConfigCmd> {
             Some(ConfigCmd::AssignSlots { node, slots })
         }
         CFG_SET_CONFIG_EPOCH => Some(ConfigCmd::SetConfigEpoch(cur.u64()?)),
+        CFG_UNASSIGN_SLOTS => {
+            let count = usize::try_from(cur.u64()?).ok()?;
+            let mut slots = Vec::with_capacity(count.min(16384));
+            for _ in 0..count {
+                slots.push(cur.u16()?);
+            }
+            Some(ConfigCmd::UnassignSlots { slots })
+        }
         CFG_ASSIGN_REPLICA => {
             let node = cur.string()?;
             let count = usize::try_from(cur.u64()?).ok()?;
