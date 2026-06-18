@@ -52,10 +52,9 @@
 
 use core::time::Duration;
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ironcache_clusterbus::{PeerConn, Reply};
+use ironcache_clusterbus::{PeerConn, PeerEndpoint, Reply};
 use ironcache_env::{Clock, Env, SystemEnv};
 use ironcache_raft::{
     Effects, EntryPayload, LogEntry, MembershipChange, NodeId, RaftMsg, RaftNode, RaftRng,
@@ -199,10 +198,12 @@ pub enum Event {
     Membership {
         /// The single-server change to apply.
         change: MembershipChange,
-        /// For a node being ADDED (`AddLearner` / `AddVoter`), its cluster-bus `SocketAddr` so the
-        /// leader can open a connection and replicate the log to it (a runtime-joined node is not in
-        /// the static topology peer map). `None` for a removal or when the address is already known.
-        addr: Option<SocketAddr>,
+        /// For a node being ADDED (`AddLearner` / `AddVoter`), its cluster-bus [`PeerEndpoint`]
+        /// (host + port) so the leader can open a connection and replicate the log to it (a
+        /// runtime-joined node is not in the static topology peer map). Held as host + port (NOT a
+        /// pre-resolved `SocketAddr`) so a hostname-addressed peer is RE-RESOLVED on each dial.
+        /// `None` for a removal or when the address is already known.
+        addr: Option<PeerEndpoint>,
         /// The one-shot the [`NodeHandle::propose_membership`] await parks on.
         ack: oneshot::Sender<MembershipOutcome>,
     },
@@ -307,12 +308,13 @@ pub struct NodeHandle {
     /// step (HA-prod-membership). On its own watch channel so the `Copy` [`Status`] stays cheap;
     /// readers observe membership lock-free without racing the single-writer run loop.
     config: watch::Receiver<ClusterConfig>,
-    /// Every voter id (including self) to the `SocketAddr` of its `RAFTMSG` cluster-bus listener
-    /// (HA-9). Shared so [`NodeHandle::leader_hint`] can resolve the watched `leader_id` to a
-    /// `host:port` for a redirect reply, without reaching into the run loop. `Arc` because the
-    /// handle is `Clone` (the listener task and the serve path each hold one) and the map is
-    /// immutable after boot.
-    addrs: Arc<BTreeMap<NodeId, SocketAddr>>,
+    /// Every voter id (including self) to the [`PeerEndpoint`] (host + port) of its `RAFTMSG`
+    /// cluster-bus listener (HA-9). Shared so [`NodeHandle::leader_hint`] can resolve the watched
+    /// `leader_id` to a `host:port` for a redirect reply, without reaching into the run loop. Held
+    /// as host + port (NOT a resolved `SocketAddr`) so the redirect advertises the operator-facing
+    /// hostname verbatim. `Arc` because the handle is `Clone` (the listener task and the serve path
+    /// each hold one) and the map is immutable after boot.
+    addrs: Arc<BTreeMap<NodeId, PeerEndpoint>>,
 }
 
 impl NodeHandle {
@@ -344,7 +346,9 @@ impl NodeHandle {
     #[must_use]
     pub fn leader_hint(&self) -> Option<String> {
         let leader = self.status().leader_id?;
-        self.addrs.get(&leader).map(SocketAddr::to_string)
+        self.addrs
+            .get(&leader)
+            .map(|ep| format!("{}:{}", ep.host, ep.port))
     }
 
     /// Submit a local proposal and await the assigned log index, or `None` if it could not land.
@@ -379,9 +383,10 @@ impl NodeHandle {
     }
 
     /// Propose a single-server [`MembershipChange`] through the control plane and await its outcome
-    /// (HA-prod-membership). `addr` is the new node's cluster-bus `SocketAddr` for an add
-    /// (`AddLearner` / `AddVoter`) so the leader can replicate to a runtime-joined node not in the
-    /// static peer map; pass `None` for a removal or an already-known peer.
+    /// (HA-prod-membership). `addr` is the new node's cluster-bus [`PeerEndpoint`] (host + port) for
+    /// an add (`AddLearner` / `AddVoter`) so the leader can replicate to a runtime-joined node not in
+    /// the static peer map; the host is RE-RESOLVED per dial (k8s). Pass `None` for a removal or an
+    /// already-known peer.
     ///
     /// Returns [`MembershipOutcome::Committed`] once the change commits on a majority (resolved on
     /// TRUE COMMIT), [`MembershipOutcome::NotLeader`] if this node is not the leader (a membership
@@ -393,7 +398,7 @@ impl NodeHandle {
     pub async fn propose_membership(
         &self,
         change: MembershipChange,
-        addr: Option<SocketAddr>,
+        addr: Option<PeerEndpoint>,
     ) -> MembershipOutcome {
         let (tx, rx) = oneshot::channel();
         if self
@@ -469,9 +474,12 @@ where
     /// The runtime seam: all socket I/O (outbound connect/send/recv) and every timer
     /// go through this, never raw tokio.
     rt: R,
-    /// The static peer-address map: every OTHER voter's id to the `SocketAddr` of its
-    /// `RAFTMSG` listener. Used to (lazily) open an outbound connection per peer.
-    peers: BTreeMap<NodeId, SocketAddr>,
+    /// The static peer-address map: every OTHER voter's id to the [`PeerEndpoint`] (host + port) of
+    /// its `RAFTMSG` listener. Held as host + port (NOT a pre-resolved `SocketAddr`) so a
+    /// hostname-addressed peer is RE-RESOLVED on every (re)dial -- a restarted k8s pod that kept its
+    /// stable DNS name but got a NEW IP is reached at its new address. Used to (lazily) open an
+    /// outbound connection per peer.
+    peers: BTreeMap<NodeId, PeerEndpoint>,
     /// Pending follower-side forwards (HA-9): the correlation id of each in-flight
     /// [`RaftMsg::ForwardPropose`] to the one-shot that the originating
     /// [`NodeHandle::propose`] await parks on. Fulfilled (and removed) when the matching
@@ -560,7 +568,7 @@ where
         raft: RaftNode<S, M>,
         env: SystemEnv,
         rt: R,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, PeerEndpoint>,
     ) -> (Self, NodeHandle) {
         let id = raft.id();
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
@@ -854,7 +862,7 @@ where
     fn on_membership(
         &mut self,
         change: MembershipChange,
-        addr: Option<SocketAddr>,
+        addr: Option<PeerEndpoint>,
         ack: oneshot::Sender<MembershipOutcome>,
         effects: &mut Effects,
     ) {
@@ -1287,17 +1295,33 @@ where
     /// logged-by-drop, not retried here. That is correct for Raft, which re-sends
     /// state via the next heartbeat / election; a dropped control message never breaks
     /// safety, only (briefly) liveness.
+    ///
+    /// RE-RESOLVE ON RECONNECT (k8s StatefulSet support): the peer is held as a [`PeerEndpoint`]
+    /// (host + port), NOT a pre-resolved `SocketAddr`, and a connection is opened via
+    /// [`PeerConn::connect_endpoint`], which resolves the host FRESH on each open. So when a peer's
+    /// connection drops (a restarted pod) the NEXT send re-runs DNS and dials the pod's NEW IP, never
+    /// a stale frozen address. A resolution failure (a DNS name not yet up) is LOGGED loudly and the
+    /// send is skipped (Raft re-sends on the next heartbeat); the peer is NEVER silently dropped from
+    /// the voter set.
     async fn send_to_peer(&mut self, to: NodeId, msg: &ironcache_raft::RaftMsg) {
-        let Some(&addr) = self.peers.get(&to) else {
+        let Some(endpoint) = self.peers.get(&to).cloned() else {
             // Not a configured peer (e.g. a stray id); nothing to do.
             return;
         };
 
-        // Open the connection lazily if we do not hold one for this peer.
+        // Open the connection lazily if we do not hold one for this peer. RESOLVE the host fresh
+        // here (per dial), so a restarted peer's new IP is picked up; a resolution failure is logged,
+        // not a silent drop, and the next heartbeat retries.
         if !self.conns.contains_key(&to) {
-            match PeerConn::connect(&self.rt, addr).await {
+            match PeerConn::connect_endpoint(&self.rt, &endpoint).await {
                 Ok(conn) => {
                     self.conns.insert(to, conn);
+                }
+                Err(ironcache_clusterbus::BusError::Resolve(e)) => {
+                    // LOUD, never silent: a peer whose DNS does not (yet) resolve is reported so an
+                    // operator can diagnose it, then skipped this round (Raft re-sends next heartbeat).
+                    eprintln!("raft cluster-bus: cannot resolve peer {}: {e}", to.0);
+                    return;
                 }
                 Err(_) => return, // reconnect on the next send
             }
@@ -2075,6 +2099,49 @@ mod tests {
         let rng: &mut dyn RaftRng = node.env.rng();
         node.raft.on_timer(now, rng, ELECTION_TIMEOUT, &mut effects);
         assert!(node.raft.is_leader(), "the lone voter must self-elect");
+    }
+
+    /// SEAM / RE-RESOLVE-ON-RECONNECT (k8s StatefulSet support): the adapter stores each peer as a
+    /// [`PeerEndpoint`] (HOST + PORT), NOT a pre-resolved `SocketAddr`. This is the structural
+    /// guarantee behind reconnect re-resolution: because `send_to_peer` dials via
+    /// [`PeerConn::connect_endpoint`], which resolves the stored host FRESH on each open, a restarted
+    /// pod that kept its DNS name but got a new IP is re-resolved on the next dial. A frozen
+    /// `SocketAddr` would dial the dead first IP forever. Here we assert the stored thing is the
+    /// HOSTNAME verbatim (so resolution provably happens at dial time, not once at boot).
+    #[test]
+    fn peer_endpoint_is_stored_as_hostname_for_per_dial_resolution() {
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        let raft = RaftNode::with_state_machine(
+            NodeId(1),
+            voters,
+            MemStorage::new(),
+            RaftConfig::default(),
+            RecordingSm::new(),
+        );
+        // A peer addressed by a DNS hostname (a StatefulSet per-pod name), NOT an IP literal.
+        let hostname = "ironcache-1.ironcache.default.svc.cluster.local";
+        let mut peers = BTreeMap::new();
+        peers.insert(NodeId(2), PeerEndpoint::new(hostname, 17_001));
+        let (node, _handle) =
+            RaftClusterBusNode::new(raft, SystemEnv::new(), TokioRuntime::new(), peers);
+
+        // The stored endpoint is the HOSTNAME + port verbatim -- not resolved to a SocketAddr at
+        // boot. So the dial path (connect_endpoint) is what resolves it, and it re-resolves per dial.
+        let stored = node
+            .peers
+            .get(&NodeId(2))
+            .expect("the peer endpoint must be stored");
+        assert_eq!(
+            stored.host, hostname,
+            "the HOST is stored verbatim (a DNS name)"
+        );
+        assert_eq!(stored.port, 17_001);
+        // The same endpoint is what leader_hint advertises (host:port), proving no boot-time freeze.
+        assert_eq!(
+            node.peers[&NodeId(2)],
+            PeerEndpoint::new(hostname, 17_001),
+            "the dial map holds host + port, never a pre-resolved address"
+        );
     }
 
     /// A propose on a 1-voter leader commits within the step, so the ack resolves

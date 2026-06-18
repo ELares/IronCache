@@ -762,6 +762,14 @@ pub fn validate_topology(topo: &ClusterTopology, announce_id: &str) -> Result<()
 /// This deliberately does NOT call `SlotMap::build` (which requires complete, non-overlapping
 /// slot coverage) because a raft-mode topology legitimately carries EMPTY slot ranges.
 ///
+/// HOST FORMAT (k8s StatefulSet support): a node's `host` may be a DNS HOSTNAME (e.g. a per-pod
+/// StatefulSet name `ironcache-0.ironcache.default.svc.cluster.local`) OR an IP literal. This
+/// validation deliberately does NOT require the host to be an IP, and does NOT resolve it (name
+/// resolution is real I/O that belongs in the boot / dial adapter, not in pure config validation):
+/// the peer address is RESOLVED LAZILY at dial time (`ironcache::raft_boot` holds host + port and
+/// the cluster-bus re-resolves per connect), so a peer whose DNS is not yet resolvable at config
+/// time does not fail validation. Only the node-IDENTITY rules below are enforced here.
+///
 /// DERIVED-NODE-ID UNIQUENESS (F2): the Raft engine's `NodeId` is derived from only the TOP 64
 /// BITS of the 40-hex announce id (the first 16 hex digits; see `raft_boot::node_id_from_announce`).
 /// Two DISTINCT announce ids that share their first 16 hex digits would pass the full-id-uniqueness
@@ -1659,6 +1667,33 @@ mod tests {
         };
         ok.validate()
             .expect("ids differing in their first 16 hex digits should validate");
+    }
+
+    /// k8s StatefulSet support: a raft-mode topology whose node `host`s are DNS HOSTNAMES (per-pod
+    /// StatefulSet names) validates -- `validate_raft_topology` enforces only node identity, never
+    /// that the host is an IP literal (resolution is deferred to the dial path). This is the
+    /// prerequisite for a hostname-addressed cluster to even pass config; the old peer-parsing then
+    /// silently dropped such hosts at boot, which the dial-path change fixes.
+    #[test]
+    fn raft_topology_accepts_dns_hostname_hosts() {
+        let topo = ClusterTopology {
+            nodes: vec![
+                ClusterNode {
+                    id: "0000000000000000000000000000000000000000".to_owned(),
+                    host: "ironcache-0.ironcache.default.svc.cluster.local".to_owned(),
+                    port: 6379,
+                    slots: vec![],
+                },
+                ClusterNode {
+                    id: "1111111111111111111111111111111111111111".to_owned(),
+                    host: "ironcache-1.ironcache.default.svc.cluster.local".to_owned(),
+                    port: 6379,
+                    slots: vec![],
+                },
+            ],
+        };
+        validate_raft_topology(&topo, "0000000000000000000000000000000000000000")
+            .expect("a raft-mode topology addressed by per-pod DNS hostnames must validate");
     }
 
     #[test]

@@ -2721,11 +2721,12 @@ enum MembershipIntent {
 /// MEET stages the node as a LEARNER ([`MembershipChange::AddLearner`]): a non-voting member that
 /// receives the log and catches up but is counted in NO quorum, so adding it can never stall
 /// consensus. The leader's auto-promote driver later promotes it to a voter once it has caught up.
-/// The new node's cluster-bus address (`host:bus_port(client_port)`, reconstructed from the MEET
-/// args) is passed so the leader can replicate to a runtime-joined node that is NOT in the static
-/// topology peer map; a host that does not parse to a `SocketAddr` (e.g. a DNS name) passes `None`,
-/// so the learner is still added but the leader can only reach it once the address is otherwise
-/// known (the same best-effort posture the boot peer map uses for a non-parsing host).
+/// The new node's cluster-bus endpoint (`host` + `bus_port(client_port)`, reconstructed from the
+/// MEET args) is passed as a [`PeerEndpoint`] so the leader can replicate to a runtime-joined node
+/// that is NOT in the static topology peer map. The endpoint holds the HOST + PORT (a DNS hostname
+/// OR an IP literal), resolved fresh on each dial -- so a hostname-addressed joiner (a k8s
+/// StatefulSet pod) is reachable and a restarted pod's new IP is picked up, instead of the old code
+/// which dropped a DNS-named joiner's address (`None`) because it only accepted an IP literal.
 async fn apply_membership_intent(
     handle: &ironcache_server::RaftHandle,
     intent: MembershipIntent,
@@ -2771,11 +2772,12 @@ async fn apply_membership_intent(
             {
                 return None;
             }
-            // The new node's cluster-bus endpoint: host:(client_port + BUS_PORT_OFFSET). Parse it so
-            // the leader can dial + replicate to this runtime-joined node; a non-parsing host yields
-            // None (the learner is still added, the address is just not pre-registered).
+            // The new node's cluster-bus endpoint: host + (client_port + BUS_PORT_OFFSET). Held as a
+            // PeerEndpoint (host + port, a DNS name OR an IP literal) so the leader can dial +
+            // replicate to this runtime-joined node, re-resolving the host per dial -- a
+            // hostname-addressed joiner is reachable (the old IP-only parse dropped it).
             let bus = crate::raft_boot::bus_port(client_port);
-            let addr = format!("{host}:{bus}").parse::<std::net::SocketAddr>().ok();
+            let addr = Some(ironcache_clusterbus::PeerEndpoint::new(host.clone(), bus));
             match handle
                 .propose_membership(MembershipChange::AddLearner(node), addr)
                 .await
@@ -3085,14 +3087,22 @@ async fn build_meet(
 /// can never poison the committed table with a junk id.
 async fn learn_or_synth_meet_id(host: &str, port: u16) -> String {
     let synth = || synth_meet_node_id(host, port);
-    // The advertised CLIENT endpoint (what a MOVED redirect / a client dials). A host that does
-    // not parse to a SocketAddr (e.g. a DNS name) cannot be dialed by the address-based bus helper
-    // here, so fall straight back to the synth id (the same best-effort posture raft_boot uses for
-    // a non-parsing peer host).
-    let Ok(addr) = format!("{host}:{port}").parse::<std::net::SocketAddr>() else {
+    let rt = TokioRuntime::new();
+    // The advertised CLIENT endpoint (what a MOVED redirect / a client dials). RESOLVE it accepting
+    // a DNS hostname OR an IP literal (k8s): a hostname-addressed peer can now be dialed to learn its
+    // real id, where the old IP-only parse fell straight back to the synth id for any DNS name. A
+    // host that does not resolve (a peer not yet up) still falls back to the synth id so the cluster
+    // forms; the id is reconciled later via the auto-promote / status path.
+    //
+    // H1: `resolve` is now ASYNC (getaddrinfo on tokio's blocking pool, bounded by RESOLVE_TIMEOUT
+    // via the Runtime timer seam), so a wedged resolver can never freeze THIS serve task; it is
+    // awaited with the same `rt` that bounds the id fetch below.
+    let Ok(addr) = ironcache_clusterbus::PeerEndpoint::new(host, port)
+        .resolve(&rt)
+        .await
+    else {
         return synth();
     };
-    let rt = TokioRuntime::new();
     // Bound the fetch: whichever of the fetch or the timer completes first wins. The timer is the
     // sanctioned time seam (no `std::time` / `tokio::time` directly), matching the adapter's
     // FORWARD_TIMEOUT shape.

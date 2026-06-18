@@ -45,6 +45,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ironcache_clusterbus::PeerEndpoint;
 use ironcache_config::Config;
 use ironcache_env::SystemEnv;
 use ironcache_raft::{NodeId, RaftConfig, RaftNode};
@@ -261,28 +262,79 @@ fn spawn_control_plane_inner(
         .filter(|&nid| !joining || nid != self_node_id)
         .collect();
 
-    // (1b) Peer cluster-bus addresses: every OTHER node id -> host:(port + BUS_PORT_OFFSET). (On a
-    // joining node this includes the existing voters, so it can receive/reply replication.)
-    let mut peers: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
-    let mut self_bus_addr: Option<SocketAddr> = None;
+    // (1b) Peer cluster-bus endpoints: every OTHER node id -> the [`PeerEndpoint`] (host +
+    // (port + BUS_PORT_OFFSET)). (On a joining node this includes the existing voters, so it can
+    // receive/reply replication.)
+    //
+    // K8S DNS / RESOLUTION POLICY: a peer endpoint is held as HOST + PORT, NOT a pre-resolved
+    // `SocketAddr`, and is RESOLVED LAZILY at DIAL TIME (in `send_to_peer`). This is deliberate:
+    //   * a peer whose DNS is not yet resolvable at boot (a sibling k8s pod still coming up) must
+    //     NOT abort THIS node's boot -- the adapter retries the dial every heartbeat, so the peer
+    //     joins as soon as its name resolves;
+    //   * a restarted pod that keeps its stable per-pod DNS name but gets a NEW IP is re-resolved
+    //     on the next dial, so we never freeze a dead first IP (the whole point of StatefulSet DNS);
+    //   * a resolution failure at dial time is LOGGED loudly (never a silent peer drop), so a
+    //     genuinely-misconfigured host is diagnosable instead of silently breaking quorum.
+    // The OLD code `format!(...).parse::<SocketAddr>()` only accepted an IP literal and SILENTLY
+    // `continue`d past a DNS hostname, quietly omitting that voter -- a hostname-addressed cluster
+    // never formed and gave no error. Holding the endpoint defers (and never drops) resolution.
+    let mut peers: BTreeMap<NodeId, PeerEndpoint> = BTreeMap::new();
+    let mut self_host: Option<(String, u16)> = None;
     for n in &topo.nodes {
         let nid = id_map[&n.id];
         let bus = bus_port(n.port);
-        // Parse the advertised host:bus_port. A bad address skips that peer (best-effort, like
-        // the adapter's send path); self's bus address is what THIS node binds its listener on.
-        let Ok(addr) = format!("{}:{}", n.host, bus).parse::<SocketAddr>() else {
-            continue;
-        };
         if nid == self_node_id {
-            self_bus_addr = Some(addr);
+            // Self's bus host+port is what THIS node binds its listener on (resolved below).
+            self_host = Some((n.host.clone(), bus));
         } else {
-            peers.insert(nid, addr);
+            // A peer: keep host + port; the dial path resolves it fresh (and never drops it).
+            peers.insert(nid, PeerEndpoint::new(n.host.clone(), bus));
         }
     }
-    // If self's advertised host did not parse (e.g. a DNS name), fall back to the bind address +
-    // bus port so the listener still comes up on a routable local interface.
-    let listen_addr =
-        self_bus_addr.unwrap_or_else(|| SocketAddr::new(config.bind, bus_port(config.port)));
+    // SELF's bind address MUST be a concrete `SocketAddr` now (the listener binds it at boot), so it
+    // is the one address resolved here. Resolve self's advertised bus host+port (accepting a DNS
+    // hostname OR an IP literal); if it does not resolve (e.g. a DNS name that resolves only inside
+    // the pod's own network, or a wildcard advertised host), fall back to the configured bind
+    // address + bus port so the listener still comes up on a routable local interface -- the
+    // byte-identical behavior an IP-literal `config.bind` already had. A non-resolving SELF host is
+    // logged so it is diagnosable, never silent.
+    //
+    // H1: `PeerEndpoint::resolve` is now ASYNC (it runs `getaddrinfo` on tokio's blocking pool,
+    // bounded by `RESOLVE_TIMEOUT`, so a wedged resolver cannot freeze the executor). This is the
+    // ONE boot-time, before-the-control-plane-thread resolution (it runs once on the boot thread,
+    // not on the single-threaded run loop), so drive the async resolve on a short-lived
+    // current-thread runtime here (boot is a plain sync `fn`, no ambient runtime), mirroring the
+    // CLI's `block_on` shape. An IP-literal host (the byte-identical default) completes immediately.
+    let listen_addr = self_host
+        .as_ref()
+        .and_then(|(host, port)| {
+            let endpoint = PeerEndpoint::new(host.clone(), *port);
+            let resolved = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .map(|boot_rt| {
+                    boot_rt.block_on(async { endpoint.resolve(&TokioRuntime::new()).await })
+                });
+            match resolved {
+                Some(Ok(addr)) => Some(addr),
+                Some(Err(e)) => {
+                    eprintln!(
+                        "raft control plane: self bus host {host}:{port} did not resolve ({e}); \
+                         binding the configured bind address instead"
+                    );
+                    None
+                }
+                None => {
+                    eprintln!(
+                        "raft control plane: could not build a runtime to resolve self bus host \
+                         {host}:{port}; binding the configured bind address instead"
+                    );
+                    None
+                }
+            }
+        })
+        .unwrap_or_else(|| SocketAddr::new(config.bind, bus_port(config.port)));
 
     // (3) The durable storage path: <data_dir>/ironcache-raft-<bus-port>.log when a `data_dir` is
     // configured (durable across a reboot that clears /tmp), else <temp>/ironcache-raft-<bus-port>.log
@@ -366,7 +418,7 @@ struct ControlPlaneParams {
 /// (`!Send`), matching the shared-nothing model (ADR-0002).
 fn run_control_plane_thread(
     params: ControlPlaneParams,
-    peers: BTreeMap<NodeId, SocketAddr>,
+    peers: BTreeMap<NodeId, PeerEndpoint>,
     listen_addr: SocketAddr,
     storage_path: std::path::PathBuf,
     cluster: Arc<ironcache_cluster::SlotMap>,

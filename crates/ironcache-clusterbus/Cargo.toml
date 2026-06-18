@@ -15,6 +15,12 @@ workspace = true
 
 [dependencies]
 ironcache-runtime = { workspace = true }
+# H1: peer-address resolution runs on tokio's BLOCKING pool via `tokio::net::lookup_host` so a
+# synchronous `getaddrinfo` never stalls the single-threaded raft control-plane / shard executor
+# (was `std::net::ToSocketAddrs::to_socket_addrs`, an inline blocking call = consensus freeze on a
+# DNS outage). Only the `net` feature is needed (the lookup); the timeout bound is read through the
+# Runtime timer seam, not tokio::time directly.
+tokio = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }

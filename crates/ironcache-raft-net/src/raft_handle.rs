@@ -13,8 +13,7 @@
 //! [`ProposeOutcome`] the mutator maps to `+OK` / `-CLUSTERDOWN`, and (c) the `is_leader()` /
 //! `leader_hint()` reads the redirect uses.
 
-use std::net::SocketAddr;
-
+use ironcache_clusterbus::PeerEndpoint;
 use ironcache_raft::{ConfigCmd, EntryPayload, MembershipChange, NodeId};
 
 use crate::{ClusterConfig, MembershipOutcome, NodeHandle};
@@ -126,8 +125,9 @@ impl RaftHandle {
     ///
     /// This is the OPERATOR PATH that grows / shrinks the Raft VOTER / LEARNER set at runtime, the
     /// quorum-affecting complement to [`propose`](RaftHandle::propose) (which moves the slot / node
-    /// TABLE). `addr` is a newly-added node's cluster-bus `SocketAddr` so the leader can replicate to
-    /// a runtime-joined node not in the static topology (pass `None` for a removal / known peer).
+    /// TABLE). `addr` is a newly-added node's cluster-bus [`PeerEndpoint`] (host + port) so the leader
+    /// can replicate to a runtime-joined node not in the static topology, re-resolving the host per
+    /// dial (k8s); pass `None` for a removal / known peer.
     ///
     /// Returns [`MembershipOutcome::Committed`] on true commit, [`MembershipOutcome::NotLeader`] when
     /// this node is not the leader (a membership change is NOT forwarded; it is issued on the leader),
@@ -137,7 +137,7 @@ impl RaftHandle {
     pub async fn propose_membership(
         &self,
         change: MembershipChange,
-        addr: Option<SocketAddr>,
+        addr: Option<PeerEndpoint>,
     ) -> MembershipOutcome {
         self.inner.propose_membership(change, addr).await
     }
