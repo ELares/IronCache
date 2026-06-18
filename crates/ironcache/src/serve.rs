@@ -389,11 +389,15 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     // save timer.
     let drain = {
         let inbox = inbox.clone();
-        move |index: usize, rx: tokio::sync::mpsc::Receiver<coordinator::ShardWork>| {
+        move |index: usize,
+              rx: tokio::sync::mpsc::Receiver<coordinator::ShardWork>,
+              shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>| {
             let ctx = drain_ctx.clone();
             let inbox = inbox.clone();
             let persist = persist.clone();
-            coordinator::run_drain_loop(index, rx, ctx, inbox, persist)
+            // The shutdown flag (the SAME one the signal handler flips) lets shard 0's drain loop
+            // drive the SAVE-ON-EXIT (#139) when a SIGTERM/SIGINT-triggered stop begins.
+            coordinator::run_drain_loop(index, rx, ctx, inbox, persist, shutdown)
         }
     };
 
@@ -1688,6 +1692,22 @@ async fn route_and_dispatch(
         return false;
     }
 
+    // -- GRACEFUL SHUTDOWN INTERCEPTION (#139, SHUTDOWN.md): SHUTDOWN [NOSAVE|SAVE]. The process
+    // exit + the save-on-exit live HERE in the serve layer (it owns the runtime, the per-shard
+    // stores, the data_dir, and the env Clock for the save timestamp); the generic dispatch sees
+    // only the storage waist and cannot exit the process, so it MUST be intercepted before it. This
+    // runs REGARDLESS of whether persistence is configured (NOSAVE / a bare SHUTDOWN with no save
+    // policy exits without saving even when `persist` is `None`), so it is OUTSIDE the persistence
+    // `Some` block below. Gated `!conn.in_multi` exactly like SAVE: a SHUTDOWN inside a MULTI falls
+    // through to the dispatch fallback at EXEC (a documented minor divergence). On a successful stop
+    // this NEVER returns (the process exits 0); on a refused save (a SAVE/policy save that fails) it
+    // replies an error and does NOT exit, so the connection keeps serving. A non-SHUTDOWN command
+    // never enters this block, so the hot path is byte-unchanged.
+    if !conn.in_multi && cmd_upper == b"SHUTDOWN" {
+        handle_shutdown_command(persist, ctx, conn, home, inbox, request, out).await;
+        return false;
+    }
+
     // -- PERSISTENCE INTERCEPTION (#58): SAVE / BGSAVE / LASTSAVE. When persistence is ENABLED (a
     // data_dir is configured -> `persist.is_some()`) and the command is NOT inside a MULTI (a SAVE
     // in MULTI is rare; it falls through to the persistence-disabled dispatch fallback inside EXEC,
@@ -2287,6 +2307,132 @@ async fn handle_persist_command(
             );
         }
     }
+}
+
+/// Handle the `SHUTDOWN [NOSAVE|SAVE]` graceful-shutdown command (#139, SHUTDOWN.md). This is the
+/// LIVE path for every non-MULTI SHUTDOWN (the serve router intercepts it before generic dispatch,
+/// which cannot exit the process). The sequence (Redis-faithful):
+///
+/// 1. AUTH GATE (mirrors the SAVE/BGSAVE/LASTSAVE H2 gate EXACTLY): an UNAUTHENTICATED client with
+///    `requirepass` set gets the IDENTICAL `-NOAUTH` reply and the server does NOT shut down -- so a
+///    public port cannot be killed by an anonymous SHUTDOWN.
+/// 2. PARSE the modifier ([`ironcache_server::parse_shutdown`], shared with the dispatch fallback so
+///    the grammar cannot diverge): a bad/extra modifier replies `-ERR syntax error` and does NOT
+///    exit.
+/// 3. RESOLVE the save decision [redis-shutdown-save-nosave-default]:
+///      * `SHUTDOWN SAVE`   -> save-on-exit ALWAYS. If persistence is NOT configured (no `data_dir`)
+///        there is nowhere to save, so it replies `-ERR ... no data_dir configured` and does NOT
+///        exit (Redis errors when it cannot honor a forced SAVE -- we surface the same fail rather
+///        than exit-0 over unwritten data).
+///      * `SHUTDOWN NOSAVE` -> exit 0 IMMEDIATELY without saving (even with a save policy).
+///      * bare `SHUTDOWN`   -> save IFF a save policy is configured (persistence on +
+///        `has_save_policy`), else exit without saving.
+/// 4. If saving was resolved, perform the SYNCHRONOUS cross-shard save reusing the SAME atomic
+///    persistence path SAVE uses ([`crate::persist::do_save_all`] -- forkless per-shard dump +
+///    manifest committed LAST via a tmp->rename, so there is never a half-written file). A save
+///    FAILURE replies `-ERR ...` and does NOT exit (fail-closed: an orchestrator must not record a
+///    clean stop that lost data).
+/// 5. On a resolved clean stop the process exits with code 0 (the orchestrator contract): SHUTDOWN
+///    does NOT reply on success (Redis: the process is gone). The committed manifest is durable
+///    BEFORE the exit, and the atomic rename means killed background tasks leave no torn file.
+///
+/// On any refused / failed save this returns normally (a reply is in `out`); on a clean stop it
+/// NEVER returns (`std::process::exit`).
+#[allow(clippy::too_many_arguments)]
+async fn handle_shutdown_command(
+    persist: Option<&Arc<crate::persist::PersistState>>,
+    ctx: &ServerContext,
+    conn: &ConnState,
+    home: ShardId,
+    inbox: &coordinator::Inbox,
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    use ironcache_server::{ShutdownMode, Value};
+    shard_state().borrow_mut().counters.on_command();
+
+    // 1. AUTH GATE (mirror the SAVE H2 gate exactly): an unauthenticated client with requirepass set
+    // gets the identical -NOAUTH reply and the server stays up.
+    if ctx.requires_auth() && !conn.authenticated {
+        encode_into(
+            out,
+            &Value::error(ironcache_protocol::ErrorReply::noauth()),
+            conn.proto,
+        );
+        return;
+    }
+
+    // 2. PARSE the modifier (shared grammar with the dispatch fallback). A bad modifier is a syntax
+    // error and does NOT shut down.
+    let mode = match ironcache_server::parse_shutdown(request) {
+        Ok(mode) => mode,
+        Err(e) => {
+            encode_into(out, &Value::error(e), conn.proto);
+            return;
+        }
+    };
+
+    // 3. RESOLVE whether this stop saves. SAVE forces it (and errors if it cannot); NOSAVE never
+    // saves; the bare form saves iff a save policy is configured.
+    let want_save = match mode {
+        ShutdownMode::NoSave => false,
+        ShutdownMode::Save => {
+            if persist.is_none() {
+                // A forced SAVE with no data_dir cannot be honored: error, do NOT exit (Redis errors
+                // when it cannot save rather than silently exiting over unwritten data).
+                encode_into(
+                    out,
+                    &Value::error(ironcache_protocol::ErrorReply::err(
+                        "Errors trying to SHUTDOWN. Check logs. (no data_dir configured for SAVE)",
+                    )),
+                    conn.proto,
+                );
+                return;
+            }
+            true
+        }
+        // Bare SHUTDOWN: save iff persistence is on AND a save policy (a periodic cadence) exists.
+        ShutdownMode::Default => persist.is_some_and(|p| p.has_save_policy()),
+    };
+
+    // 4. If saving was resolved, perform the SYNCHRONOUS atomic save reusing the SAVE path. A save
+    // FAILURE is fail-closed: reply the error and do NOT exit, so the connection keeps serving and
+    // the orchestrator does not see a clean stop over unwritten data.
+    if want_save {
+        // `want_save` is only ever true with persistence configured (the Save-with-no-data_dir case
+        // returned above, and Default gates on `persist.is_some()`), so this expect documents that
+        // invariant rather than guarding a reachable None.
+        let persist = persist.expect("want_save implies persistence is configured");
+        // The save timestamp from the home shard's Env clock (ADR-0003), in unix seconds.
+        let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
+        // Hold the save latch for the exit save (serializes against a racing periodic/BGSAVE; the
+        // RAII guard releases on the unlikely error-return path below). If a save is already running
+        // we still want the exit save to commit a fresh snapshot, but racing two manifest writes is
+        // unsafe; if the latch is busy we report the in-progress save as covering the data and exit
+        // (its bytes are being written), matching SAVE's busy-latch handling.
+        if let Some(_guard) = persist.try_begin_save() {
+            match crate::persist::do_save_all(persist, inbox, ctx, home, conn.db, now_secs).await {
+                Ok(()) => {} // committed; fall through to the clean exit.
+                Err(msg) => {
+                    encode_into(
+                        out,
+                        &Value::error(ironcache_protocol::ErrorReply::err(format!(
+                            "Errors trying to SHUTDOWN. Check logs. ({msg})"
+                        ))),
+                        conn.proto,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    // 5. CLEAN STOP. The resolved save (if any) is committed + durable; exit 0 (the orchestrator
+    // contract). SHUTDOWN does NOT reply on success (Redis: the process is gone). `process::exit`
+    // is faithful to Redis's own SHUTDOWN handler (it exits from the command path after the save);
+    // the committed manifest's atomic rename means the killed background tasks leave no torn file.
+    eprintln!("ironcache: SHUTDOWN ({mode:?}) -> exit 0");
+    std::process::exit(0);
 }
 
 /// Handle a raft-mode `CLUSTER` MUTATOR by proposing the matching [`ConfigCmd`](ironcache_raft::ConfigCmd)
@@ -3680,9 +3826,18 @@ pub fn install_shutdown(set: &ShardSet) -> Arc<std::sync::atomic::AtomicBool> {
     set.shutdown_flag()
 }
 
-/// Block the calling (main) thread until a termination signal arrives, flipping
-/// `flag` so the shard accept loops drain. Uses tokio's signal handling on a
-/// small dedicated current-thread runtime.
+/// Block the calling (main) thread until a termination signal (SIGINT/SIGTERM) arrives, then flip
+/// `flag` so the shard accept loops + the save-on-exit watch begin the GRACEFUL stop (#139,
+/// SHUTDOWN.md): the FIRST signal initiates the graceful shutdown (drain + save-on-exit, driven by
+/// the shard executors), and a SECOND signal arriving while that stop is in progress ESCALATES to an
+/// IMMEDIATE `exit(0)` so an operator can always force the issue (a stuck drain or a slow exit save
+/// can never trap the process). The signal handler itself does NOT terminate from inside the handler
+/// (Redis-faithful: a stop signal becomes a controlled shutdown, not an abrupt in-handler exit
+/// [redis-sigterm-sigint-graceful-shutdown]); it only records the request via `flag`, and the second
+/// signal's force-exit is the deliberate IronCache escalation.
+///
+/// Uses tokio's signal handling on a small dedicated current-thread runtime (signal handling lives
+/// in the binary only, CLI_BINARY.md, so the determinism boundary holds).
 pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3700,6 +3855,7 @@ pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) {
             let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
                 return;
             };
+            // FIRST signal: initiate the graceful stop (the caller drives the drain + join next).
             tokio::select! {
                 _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}
@@ -3710,7 +3866,44 @@ pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) {
             let _ = tokio::signal::ctrl_c().await;
         }
     });
+    // Record the stop request so the shards drain + the save-on-exit watch fires.
     flag.store(true, Ordering::SeqCst);
+
+    // SECOND-SIGNAL FORCE (#139, SHUTDOWN.md): arm a DEDICATED long-lived watcher thread for the
+    // ESCALATION. It must outlive this function (the graceful join the caller runs next can take up
+    // to the drain grace window), so it owns its OWN current-thread runtime on its OWN OS thread
+    // rather than a task on the short-lived runtime above (which is dropped when this fn returns). A
+    // second SIGINT/SIGTERM arriving while the graceful stop is in progress forces an immediate
+    // `exit(0)` so an operator can always force the issue. On unix only (the signal surface); a
+    // build-failure to install the watcher is non-fatal (the graceful path still completes).
+    #[cfg(unix)]
+    {
+        let _ = std::thread::Builder::new()
+            .name("ironcache-force-stop".to_string())
+            .spawn(|| {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let (Ok(mut sigint), Ok(mut sigterm)) = (
+                        signal(SignalKind::interrupt()),
+                        signal(SignalKind::terminate()),
+                    ) else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = sigint.recv() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                    eprintln!("ironcache: second stop signal -> forcing immediate exit");
+                    std::process::exit(0);
+                });
+            });
+    }
 }
 
 #[cfg(test)]

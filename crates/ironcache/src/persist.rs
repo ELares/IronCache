@@ -129,6 +129,19 @@ impl PersistState {
         self.last_save_unix_secs.load(Ordering::Relaxed)
     }
 
+    /// Whether a SAVE POLICY (a periodic save cadence) is configured (#139 graceful shutdown, the
+    /// SHUTDOWN "save iff a save point is configured" decision -- SHUTDOWN.md
+    /// [redis-shutdown-save-nosave-default]). In IronCache the analog of a Redis `save <secs>
+    /// <changes>` save point is a non-zero [`Self::interval_secs`]: a `data_dir` with a periodic
+    /// interval is the configured-cadence posture, whereas a `data_dir` with `interval_secs == 0`
+    /// persists ONLY on an explicit SAVE/BGSAVE (no save point), so a bare `SHUTDOWN` there exits
+    /// without saving -- the same branch as a default (persistence-off) deployment. This is a pure
+    /// read of the boot-resolved policy (no atomics, no I/O).
+    #[must_use]
+    pub fn has_save_policy(&self) -> bool {
+        self.interval_secs > 0
+    }
+
     /// Bump the dirty write counter (relaxed). Called by the serve loop after a successful write
     /// command when persistence is enabled. The single allowed hot-adjacent atomic increment.
     pub fn note_write(&self) {
@@ -356,6 +369,28 @@ mod tests {
             dirty: AtomicU64::new(0),
             saving: AtomicBool::new(false),
         })
+    }
+
+    /// `has_save_policy` (#139 the bare-SHUTDOWN / signal save-iff-configured decision): a periodic
+    /// interval is "a save point is configured"; `interval_secs == 0` (data_dir but explicit-SAVE-
+    /// only) is NOT, so a bare SHUTDOWN there exits without saving like a default deployment.
+    #[test]
+    fn has_save_policy_tracks_a_nonzero_interval() {
+        let mut p = PersistState {
+            dir: PathBuf::from("/nonexistent-test-dir"),
+            interval_secs: 0,
+            min_changes: 0,
+            last_save_unix_secs: AtomicU64::new(0),
+            save_id: AtomicU64::new(0),
+            dirty: AtomicU64::new(0),
+            saving: AtomicBool::new(false),
+        };
+        assert!(
+            !p.has_save_policy(),
+            "interval 0 -> no save point configured"
+        );
+        p.interval_secs = 900;
+        assert!(p.has_save_policy(), "a periodic interval IS a save point");
     }
 
     /// The RAII guard serializes: while it is held a second `try_begin_save` is denied, and dropping

@@ -144,7 +144,11 @@ pub async fn run_drain_loop(
     ctx: ServerContext,
     inbox: Inbox,
     persist: Option<Arc<crate::persist::PersistState>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    // The runtime TIMER seam (ADR-0003) the shutdown-flag poll below arms; imported at the top of
+    // the fn (not mid-body) so clippy's items-after-statements stays happy.
+    use ironcache_runtime::Runtime;
     // Bring up THIS shard's background tasks AT SHARD BOOT (COORDINATOR.md #107): lazily
     // init the per-shard handles + spawn the active-expiry timer ONCE. The drain loop is
     // spawned on the shard's LocalSet, so this is the shard-boot hook a connectionless
@@ -191,13 +195,91 @@ pub async fn run_drain_loop(
         );
         crate::replica_attach::spawn_on_shard(&ctx, store_rc, ctx.boot.bind, ctx.info.tcp_port);
     }
-    while let Some(work) = rx.recv().await {
-        // run_remote borrows + releases the shard thread-locals ENTIRELY within this
-        // synchronous call; nothing is borrowed when we loop back to `recv().await`.
-        let reply = run_remote(&ctx, &work.request, work.db);
-        // The home connection may have closed (oneshot receiver dropped); that is fine,
-        // the reply is simply discarded.
-        let _ = work.reply.send(reply);
+    // SAVE-ON-EXIT WATCH (#139, SHUTDOWN.md): EVERY shard's drain loop watches the shared shutdown
+    // flag concurrently with the cross-shard work recv so a SIGTERM/SIGINT-triggered graceful stop is
+    // observed promptly and the drain loop RETURNS (the bootstrap awaits this task before the shard
+    // thread joins, so a returned drain loop lets shutdown proceed quickly -- no 5s park). The flag
+    // load is a single relaxed atomic on a cold timer tick, so the steady-state hot recv path is
+    // unaffected (the default persistence-off posture also takes this loop, but the post-flag SAVE is
+    // gated on a save policy below, so it is a pure no-op there).
+    //
+    // SHARD 0 with a SAVE POLICY is the SAVE host: when the flag is set it performs ONE final save
+    // (reusing the SAME atomic save path SAVE/the periodic timer use) BEFORE it returns, while the
+    // OTHER shards' drain loops are STILL servicing the fan-out (they observe the flag too but keep a
+    // brief post-flag drain so shard 0's `__ICSAVE` reaches them). It then `exit(0)`s -- the
+    // orchestrator contract -- so the committed manifest is durable before exit and the atomic
+    // tmp->rename leaves no torn file even as sibling tasks are torn down. With NO save policy shard 0
+    // simply returns like any other shard and the binary's `shutdown_and_join` drives the clean exit.
+    let rt = ironcache_runtime::TokioRuntime::new();
+    // Poll the flag on a short cadence through the runtime timer SEAM (NOT tokio::time, ADR-0003),
+    // racing it against the work recv so live cross-shard work is still serviced until the stop.
+    let poll = std::time::Duration::from_millis(20);
+    let stop_requested = loop {
+        tokio::select! {
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(work) => {
+                        let reply = run_remote(&ctx, &work.request, work.db);
+                        let _ = work.reply.send(reply);
+                    }
+                    // All senders dropped (the process is already tearing down): stop the loop. Not a
+                    // flag-driven stop, so no save is attempted here.
+                    None => break false,
+                }
+            }
+            () = rt.timer(poll) => {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    break true;
+                }
+            }
+        }
+    };
+
+    if stop_requested {
+        let is_save_host =
+            shard_index == 0 && persist.as_ref().is_some_and(|p| p.has_save_policy());
+        if is_save_host {
+            // SHARD 0 SAVE HOST: run the final save (fan-out to the still-alive sibling drain loops),
+            // then exit 0. A save FAILURE is logged inside the helper; we still exit 0 (the prior
+            // committed snapshot stays valid; the design's non-zero-on-truncation exit-code map is
+            // #139's open follow-up).
+            let _ = save_on_exit_if_configured(persist.as_ref(), &ctx, &inbox).await;
+            eprintln!("ironcache: save-on-exit complete -> exit 0");
+            std::process::exit(0);
+        }
+        // A NON-save-host shard on a graceful stop: keep servicing the cross-shard fan-out (so shard
+        // 0's `__ICSAVE` is answered) for a BOUNDED post-flag window, then return. The window is
+        // bounded by an idle gap (return after a short stretch with no work) AND a hard tick cap, so
+        // it covers the fast save fan-out without ever parking shutdown. On a process the save host
+        // `exit(0)`s, this shard is simply torn down mid-window (harmless); on a no-save-policy stop
+        // it returns on the first idle gap, so non-persistence shutdown stays prompt.
+        let mut idle_ticks: u32 = 0;
+        // ~1s hard cap (50 * 20ms) -- generous for the save fan-out, far under any supervisor grace.
+        let hard_cap_ticks: u32 = 50;
+        // Return after ~120ms idle (6 * 20ms) with no fan-out work: the save has reached us already.
+        let idle_gap_ticks: u32 = 6;
+        let mut total_ticks: u32 = 0;
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(work) => {
+                            idle_ticks = 0;
+                            let reply = run_remote(&ctx, &work.request, work.db);
+                            let _ = work.reply.send(reply);
+                        }
+                        None => return,
+                    }
+                }
+                () = rt.timer(poll) => {
+                    idle_ticks = idle_ticks.saturating_add(1);
+                    total_ticks = total_ticks.saturating_add(1);
+                    if idle_ticks >= idle_gap_ticks || total_ticks >= hard_cap_ticks {
+                        return;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -956,6 +1038,58 @@ fn spawn_periodic_save(
             let _ = crate::persist::do_save_all(&persist, &inbox, &ctx, home, 0, now_secs).await;
         }
     });
+}
+
+/// SAVE-ON-EXIT for the SIGNAL-driven graceful shutdown (#139, SHUTDOWN.md): perform a final
+/// synchronous cross-shard save IFF a save POLICY is configured, reusing the SAME atomic save path
+/// SAVE/BGSAVE/the periodic timer use ([`crate::persist::do_save_all`] -- forkless per-shard dump +
+/// the manifest committed LAST via a tmp->rename, so a killed task never leaves a torn file). This
+/// is the save decision a bare `SHUTDOWN` (and thus a SIGTERM/SIGINT stop) resolves: save iff a save
+/// point is configured [redis-shutdown-save-nosave-default]. With persistence OFF (`persist` is
+/// `None`) or with persistence on but NO periodic policy ([`has_save_policy`](crate::persist::PersistState::has_save_policy)
+/// false, i.e. explicit-SAVE-only), this is a NO-OP -- so a default deployment exits without writing
+/// anything.
+///
+/// MUST run on SHARD 0's executor (it owns `home == shard 0` + the inbox the fan-out needs); the
+/// drain loop is that executor. Returns `true` iff a save was attempted-and-committed, `false` if no
+/// save was warranted or it was already running (the latch was busy -- the in-progress save covers
+/// the data). A save FAILURE is logged (the signal path has no client to reply to) and returns
+/// `false`; the process still exits (the prior committed manifest stays valid).
+///
+/// ## Borrow / determinism discipline
+///
+/// Holds NO RefCell borrow across the `.await` (the per-shard `save_shard_local` is synchronous on
+/// each shard's own executor); the save timestamp comes from shard 0's Env Clock seam (ADR-0003).
+pub async fn save_on_exit_if_configured(
+    persist: Option<&Arc<crate::persist::PersistState>>,
+    ctx: &ServerContext,
+    inbox: &Inbox,
+) -> bool {
+    // Save iff persistence is on AND a save policy (a periodic cadence) is configured -- the bare
+    // SHUTDOWN / signal-stop decision [redis-shutdown-save-nosave-default].
+    let Some(persist) = persist.filter(|p| p.has_save_policy()) else {
+        return false;
+    };
+    // Serialize against a racing periodic save / BGSAVE; if one is already running, the in-progress
+    // save covers the data, so skip (no double manifest write). The RAII guard releases on drop.
+    let Some(_guard) = persist.try_begin_save() else {
+        return false;
+    };
+    let home = ShardId {
+        index: 0,
+        total: inbox.len(),
+    };
+    // The save timestamp from shard 0's Env clock (the determinism seam, ADR-0003).
+    let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
+    match crate::persist::do_save_all(persist, inbox, ctx, home, 0, now_secs).await {
+        Ok(()) => true,
+        Err(msg) => {
+            eprintln!(
+                "ironcache: save-on-exit failed: {msg} (the prior committed snapshot stays valid)"
+            );
+            false
+        }
+    }
 }
 
 /// Fan a `PUBLISH <channel> <payload>` out to EVERY shard's LOCAL subscriber table and SUM the

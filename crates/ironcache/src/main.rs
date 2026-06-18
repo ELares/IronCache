@@ -117,6 +117,15 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     eprintln!("ironcache: ready (PING -> +PONG). Ctrl-C to stop.");
     serve::wait_for_signal(&flag);
     eprintln!("ironcache: shutting down");
+
+    // GRACEFUL STOP (#139, SHUTDOWN.md). `wait_for_signal` has set the shutdown flag (and armed the
+    // second-signal force-exit watcher). `shutdown_and_join` now drives the bounded per-shard drain
+    // AND the SIGNAL-DRIVEN SAVE-ON-EXIT: when a save policy is configured, shard 0's drain loop
+    // performs a final save (reusing the atomic SAVE path) then `exit(0)`s (the orchestrator
+    // contract); the bootstrap awaits each shard's drain task (bounded by the drain grace) before
+    // joining, so the join naturally waits for shard 0's save to commit rather than racing it. With
+    // NO save policy (the default / NOSAVE posture) no save runs and this is the unchanged clean stop
+    // -> the function returns Ok and `main` exits 0.
     if set.shutdown_and_join().is_err() {
         // A shard thread panicked; surface it as a non-zero exit rather than
         // pretending shutdown was clean.

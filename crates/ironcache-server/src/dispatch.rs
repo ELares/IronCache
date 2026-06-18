@@ -638,6 +638,15 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         b"SAVE" => cmd_persist_save_fallback(req),
         b"BGSAVE" => cmd_persist_bgsave_fallback(req),
         b"LASTSAVE" => cmd_persist_lastsave_fallback(req),
+        // GRACEFUL SHUTDOWN (#139, SHUTDOWN.md): the save-on-exit + the process exit-0 live in the
+        // binary's serve layer (which holds the per-shard stores, the data_dir, and the env Clock),
+        // and the serve router INTERCEPTS SHUTDOWN before this generic dispatch -- so this arm is
+        // ONLY the never-intercepted fallback (a SHUTDOWN reaching dispatch directly, e.g. inside an
+        // EXEC replay). It validates the NOSAVE/SAVE modifier grammar and returns a syntax error for
+        // a bad modifier; it never exits the process here (the process exit is the serve layer's job,
+        // which owns the runtime + the drain). A documented minor divergence from Redis, which would
+        // exit; the serve-layer interception is the live path for every non-MULTI SHUTDOWN.
+        b"SHUTDOWN" => cmd_shutdown_fallback(req),
         // Every OTHER command is a KEYED-DATA command (or an unknown token): it touches
         // only store/wheel/db/now (+ env for the RNG-drawing members), NO ConnState. The
         // bodies live in [`dispatch_keyed_data`], the SINGLE keyed-arm definition that
@@ -1333,6 +1342,64 @@ fn cmd_persist_lastsave_fallback(req: &Request) -> Value {
         return Value::error(ErrorReply::wrong_arity("lastsave"));
     }
     Value::Integer(0)
+}
+
+/// The resolved save decision a `SHUTDOWN [NOSAVE|SAVE]` carries (#139, SHUTDOWN.md). The serve
+/// layer resolves the modifier ONCE via [`parse_shutdown`], then drives the stop sequence: SAVE
+/// forces a save-on-exit even with no save policy, NOSAVE suppresses it even with one, and the bare
+/// form (`Default`) saves IFF a save policy is configured [redis-shutdown-save-nosave-default].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownMode {
+    /// Bare `SHUTDOWN`: save iff a save policy is configured, else exit without saving.
+    Default,
+    /// `SHUTDOWN SAVE`: force a save-on-exit even when no save policy is configured.
+    Save,
+    /// `SHUTDOWN NOSAVE`: suppress the save-on-exit even when a save policy is configured.
+    NoSave,
+}
+
+/// Parse a `SHUTDOWN [NOSAVE|SAVE]` request into its resolved [`ShutdownMode`], or an `-ERR syntax
+/// error` for a bad/extra modifier (#139). `SAVE` and `NOSAVE` are the ONLY two modifiers v1 honors
+/// (SHUTDOWN.md "the only two modifiers"); the Redis ABORT / FORCE / NOW grammar is deferred (#150).
+/// The token is matched case-insensitively (RESP command args are byte slices; Redis matches the
+/// SHUTDOWN modifier with a case-insensitive compare). Shared by the serve-layer interception and
+/// the [`cmd_shutdown_fallback`] dispatch arm so the two cannot disagree on the grammar.
+///
+/// # Errors
+///
+/// Returns an `-ERR syntax error` when there is more than one modifier or the single modifier is
+/// neither `SAVE` nor `NOSAVE`.
+pub fn parse_shutdown(req: &Request) -> Result<ShutdownMode, ErrorReply> {
+    match req.args.get(1..) {
+        // Bare `SHUTDOWN`: the default save-iff-policy-configured decision.
+        Some([]) | None => Ok(ShutdownMode::Default),
+        Some([modifier]) => {
+            if modifier.eq_ignore_ascii_case(b"SAVE") {
+                Ok(ShutdownMode::Save)
+            } else if modifier.eq_ignore_ascii_case(b"NOSAVE") {
+                Ok(ShutdownMode::NoSave)
+            } else {
+                Err(ErrorReply::syntax_error())
+            }
+        }
+        // More than one modifier (e.g. `SHUTDOWN SAVE NOSAVE`) is a syntax error.
+        Some(_) => Err(ErrorReply::syntax_error()),
+    }
+}
+
+/// `SHUTDOWN [NOSAVE|SAVE]` NEVER-INTERCEPTED fallback (#139, SHUTDOWN.md): reached ONLY when the
+/// serve layer did NOT intercept the command (a SHUTDOWN reaching dispatch directly, e.g. an EXEC
+/// replay inside a transaction). The actual stop sequence -- drain, save-on-exit, process exit-0 --
+/// lives in the binary's serve layer, which owns the runtime + the per-shard stores; this generic
+/// dispatch path has neither, so it does NOT exit the process here. It still VALIDATES the modifier
+/// grammar (so a bad modifier replies `-ERR syntax error` consistently) and otherwise returns `+OK`
+/// without acting. A documented minor divergence from Redis (which would exit); the serve-layer
+/// interception is the live path for every non-MULTI SHUTDOWN.
+fn cmd_shutdown_fallback(req: &Request) -> Value {
+    match parse_shutdown(req) {
+        Ok(_) => Value::ok(),
+        Err(e) => Value::error(e),
+    }
 }
 
 /// `HELLO [proto] [AUTH user pass] [SETNAME name]` (CONNECTION_LIFECYCLE.md).
@@ -7050,6 +7117,69 @@ mod tests {
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"EXEC"]),
             Value::Array(None)
+        );
+    }
+
+    // -- SHUTDOWN [NOSAVE|SAVE] grammar (#139, SHUTDOWN.md). The serve layer drives the actual stop;
+    // these cover the SHARED modifier parser + the never-intercepted dispatch fallback. --
+
+    #[test]
+    fn parse_shutdown_resolves_the_three_modes() {
+        // Bare SHUTDOWN -> Default (save iff a save policy is configured).
+        assert_eq!(
+            parse_shutdown(&req(&[b"SHUTDOWN"])),
+            Ok(ShutdownMode::Default)
+        );
+        // SAVE / NOSAVE, case-insensitive (RESP args are byte slices; Redis matches case-insensitive).
+        assert_eq!(
+            parse_shutdown(&req(&[b"SHUTDOWN", b"SAVE"])),
+            Ok(ShutdownMode::Save)
+        );
+        assert_eq!(
+            parse_shutdown(&req(&[b"SHUTDOWN", b"save"])),
+            Ok(ShutdownMode::Save)
+        );
+        assert_eq!(
+            parse_shutdown(&req(&[b"SHUTDOWN", b"NOSAVE"])),
+            Ok(ShutdownMode::NoSave)
+        );
+        assert_eq!(
+            parse_shutdown(&req(&[b"SHUTDOWN", b"NoSave"])),
+            Ok(ShutdownMode::NoSave)
+        );
+    }
+
+    #[test]
+    fn parse_shutdown_rejects_a_bad_or_extra_modifier() {
+        // An unknown modifier is a syntax error...
+        match parse_shutdown(&req(&[b"SHUTDOWN", b"FORCE"])) {
+            Err(e) => assert_eq!(e.line(), "-ERR syntax error"),
+            Ok(m) => panic!("unknown modifier must be a syntax error, got {m:?}"),
+        }
+        // ...and so is more than one modifier.
+        match parse_shutdown(&req(&[b"SHUTDOWN", b"SAVE", b"NOSAVE"])) {
+            Err(e) => assert_eq!(e.line(), "-ERR syntax error"),
+            Ok(m) => panic!("two modifiers must be a syntax error, got {m:?}"),
+        }
+    }
+
+    #[test]
+    fn shutdown_fallback_validates_grammar_without_exiting() {
+        // The never-intercepted fallback (e.g. a SHUTDOWN reaching dispatch directly) does NOT exit
+        // the process (the serve layer owns the exit); it replies +OK on a valid form and a syntax
+        // error on a bad modifier. The dispatch arm routes here, so run the real dispatch.
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"SHUTDOWN"]), Value::ok());
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SHUTDOWN", b"NOSAVE"]),
+            Value::ok()
+        );
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"SHUTDOWN", b"BOGUS"])),
+            "-ERR syntax error"
         );
     }
 }

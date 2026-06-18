@@ -169,11 +169,14 @@ mod tokio_bootstrap {
         S: Fn(TokioRuntime, tokio::net::TcpStream, ShardId) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = ()> + 'static,
         I: Send + 'static,
-        // The drain closure receives THIS shard's index (0-based) alongside its inbox, so a
-        // per-shard background task (the cross-shard drain loop, and #58 persistence load/save)
-        // can name its own shard (e.g. its `dump-shard-<index>.icss` snapshot file). The index is
-        // the same `ShardId.index` the serve closure sees, so the two agree.
-        D: Fn(usize, I) -> DFut + Clone + Send + 'static,
+        // The drain closure receives THIS shard's index (0-based), its inbox, AND the shared
+        // shutdown flag, so a per-shard background task (the cross-shard drain loop, and #58
+        // persistence load/save) can name its own shard (e.g. its `dump-shard-<index>.icss`
+        // snapshot file) AND observe a graceful stop. The shutdown flag is the SAME `Arc<AtomicBool>`
+        // [`ShardSet::shutdown_flag`] hands the signal handler, so shard 0's drain loop can drive the
+        // SAVE-ON-EXIT (#139, SHUTDOWN.md) when a signal flips it, before the shard threads join. The
+        // index is the same `ShardId.index` the serve closure sees, so the two agree.
+        D: Fn(usize, I, Arc<AtomicBool>) -> DFut + Clone + Send + 'static,
         DFut: Future<Output = ()> + 'static,
     {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -227,6 +230,9 @@ mod tokio_bootstrap {
         // vec is consumed (into_iter) so each `I` is owned by exactly one shard thread.
         for ((index, inbox), conn_rx) in inboxes.into_iter().enumerate().zip(conn_receivers) {
             let shutdown = Arc::clone(&shutdown);
+            // A second clone of the same flag for the drain loop: shard 0's drain loop watches it to
+            // drive the SAVE-ON-EXIT (#139) on a graceful stop, alongside the serve loop's own watch.
+            let drain_shutdown = Arc::clone(&shutdown);
             let serve = serve.clone();
             let drain = drain.clone();
             let shard = ShardId { index, total };
@@ -258,8 +264,31 @@ mod tokio_bootstrap {
                             // the shard's lifetime; the drain loop runs concurrently on
                             // the same single-threaded LocalSet (interleaved, never
                             // parallel, so the shard-local RefCells stay single-threaded).
-                            tokio::task::spawn_local(drain(index, inbox));
+                            let drain_task =
+                                tokio::task::spawn_local(drain(index, inbox, drain_shutdown));
                             serve_loop(conn_rx, &serve, shard, &shutdown).await;
+                            // GRACEFUL DRAIN-TASK JOIN (#139, SHUTDOWN.md): the serve loop has
+                            // returned, so the shard is stopping. AWAIT the drain task before this
+                            // `block_on` returns (which would otherwise DROP the fire-and-forget drain
+                            // task the instant the serve loop ends, cancelling a half-run save-on-exit
+                            // on shard 0). The drain loop now watches the shutdown flag and RETURNS
+                            // promptly on a graceful stop (shard 0 runs its save then `exit(0)`s, the
+                            // others finish a brief bounded post-flag drain), so this join adds no
+                            // steady-state shutdown latency. It is still BOUNDED by the SAME
+                            // [`DRAIN_GRACE`] as a final backstop: a wedged drain task can never trap
+                            // shutdown -- on the deadline we proceed and the drop cancels whatever is
+                            // left (the prior committed snapshot stays valid).
+                            let drain_grace = tokio::time::sleep(DRAIN_GRACE);
+                            tokio::pin!(drain_grace);
+                            tokio::select! {
+                                _ = drain_task => {}
+                                () = &mut drain_grace => {
+                                    eprintln!(
+                                        "shard {index}: drain task did not finish within the grace \
+                                         window; proceeding with shutdown"
+                                    );
+                                }
+                            }
                         });
                     }));
                     if let Err(panic) = result {
