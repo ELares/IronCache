@@ -23,13 +23,16 @@ use crate::NodeHandle;
 /// -> `+OK`, [`NotLeader`](ProposeOutcome::NotLeader) -> a `-CLUSTERDOWN` redirect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposeOutcome {
-    /// The proposal was ACCEPTED by the leader and appended to its log at the carried 1-based
-    /// index; it commits (durable on a majority, then applied by every node's `ConfigSm`) shortly
-    /// after, once a majority acknowledges. Today the ack resolves at leader-accept (append) time,
-    /// not on the commit advance, so on an immediate leadership loss the index could be overwritten;
-    /// because every `ConfigCmd` is idempotent under re-apply, a proposer that does not observe the
-    /// effect safely re-proposes (the self-promotion task does exactly this). Resolving this ack on
-    /// the actual commit-advance is a tracked follow-up.
+    /// The proposal is COMMITTED: the entry is durable on a MAJORITY at the carried 1-based log
+    /// index (and is therefore being applied by every node's `ConfigSm`). The ack resolves on the
+    /// COMMIT-ADVANCE, not at leader-accept (append) time (HA-prod-commit-ack): the run loop parks
+    /// the proposal's ack keyed by its assigned log index and fulfils it only once the engine's
+    /// [`Effects::committed_through`](ironcache_raft::Effects::committed_through) reaches that index
+    /// (a majority committed it), so `+OK` MEANS committed. If this node loses leadership before the
+    /// entry commits (a step-down), or the uncommitted entry is overwritten by a new leader, the
+    /// parked ack resolves [`NotLeader`](ProposeOutcome::NotLeader) instead and the idempotent
+    /// `ConfigCmd` is safely re-proposed. A single-voter cluster commits on append (the leader alone
+    /// is a majority), so the ack still resolves promptly there.
     Committed(u64),
     /// This node was NOT the leader (or the control plane had stopped), so nothing was
     /// proposed. The client should retry against the leader.
@@ -84,15 +87,17 @@ impl RaftHandle {
     }
 
     /// Propose `cmd` through the Raft log (forwarding to the leader if this node is a follower,
-    /// HA-9) and await the leader's accept.
+    /// HA-9) and await TRUE COMMIT.
     ///
     /// Returns [`ProposeOutcome::Committed`] with the leader-assigned log index once the entry is
-    /// accepted+appended by the leader (it commits on a majority shortly after; see the variant
-    /// docs for the accept-vs-commit timing and why idempotency makes that safe), or
-    /// [`ProposeOutcome::NotLeader`] when no leader was reachable (no leader recognized, or a
-    /// forward timed out, or the control plane has stopped). The await does NOT block the shard
-    /// executor: it parks on the proposal's one-shot ack channel, which the single control-plane
-    /// task fulfills (directly on the leader, or via the leader's forwarded reply on a follower).
+    /// COMMITTED on a majority (HA-prod-commit-ack: the ack resolves on the commit-advance, not at
+    /// append; see the variant docs), or [`ProposeOutcome::NotLeader`] when the entry could not be
+    /// committed here -- no leader was reachable (no leader recognized, a forward timed out, or the
+    /// control plane stopped), this node lost leadership before the entry committed, or a new leader
+    /// overwrote the still-uncommitted entry. In every `NotLeader` case the idempotent `ConfigCmd`
+    /// is safely re-proposed. The await does NOT block the shard executor: it parks on the
+    /// proposal's one-shot ack channel, which the single control-plane task fulfills when the entry
+    /// commits (directly on the leader, or via the leader's forwarded reply on a follower).
     pub async fn propose(&self, cmd: ConfigCmd) -> ProposeOutcome {
         match self.inner.propose(EntryPayload::Config(cmd)).await {
             Some(index) => ProposeOutcome::Committed(index),

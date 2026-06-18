@@ -263,6 +263,37 @@ impl NodeHandle {
     }
 }
 
+/// A LOCAL proposal parked awaiting TRUE COMMIT (HA-prod-commit-ack).
+///
+/// When this leader appends a local [`Event::Propose`] the run loop does NOT ack at
+/// append time; it parks this, keyed by the assigned log index, and resolves it on the
+/// commit-advance. `term` is the term of the appended entry: if `term_at(index)` ever
+/// reads a DIFFERENT term the entry was overwritten by a new leader before committing,
+/// so the ack fails [`None`] (NotLeader). `ack` is the originating [`NodeHandle::propose`]
+/// one-shot: `Some(index)` on commit, `None` on overwrite / step-down / shutdown.
+struct PendingCommit {
+    /// The term of the appended entry, to detect a new leader overwriting the index.
+    term: u64,
+    /// The originating local one-shot: `Some(index)` committed, `None` not-leader.
+    ack: oneshot::Sender<Option<u64>>,
+}
+
+/// A FORWARDED proposal (HA-9) parked awaiting TRUE COMMIT (HA-prod-commit-ack).
+///
+/// The leader-side analog of [`PendingCommit`] for a [`RaftMsg::ForwardPropose`]: rather
+/// than answering the origin with the index at append time, the leader parks this keyed by
+/// the assigned index and ships a [`RaftMsg::ForwardProposeResult`] only when the entry
+/// commits (`outcome = Some(index)`) or is overwritten / this node steps down
+/// (`outcome = None`), so a follower's forwarded `+OK` also means COMMITTED.
+struct PendingForwardResult {
+    /// The term of the appended entry, to detect a new leader overwriting the index.
+    term: u64,
+    /// The origin peer to send the [`RaftMsg::ForwardProposeResult`] back to.
+    origin: NodeId,
+    /// The forward's correlation id, echoed in the result so the origin matches it.
+    corr: u64,
+}
+
 /// The per-node production adapter: owns the pure [`RaftNode`] engine plus the
 /// real-world seams it is driven through, and runs the single control-plane task
 /// that feeds it events and performs the I/O its [`Effects`] describe.
@@ -298,6 +329,22 @@ where
     /// [`RaftMsg::ForwardProposeResult`] arrives or the forward's [`FORWARD_TIMEOUT`]
     /// elapses. Owned solely by the single run-loop task (no lock needed).
     pending_forwards: BTreeMap<u64, oneshot::Sender<Option<u64>>>,
+    /// LOCAL proposals appended on THIS leader but not yet COMMITTED (HA-prod-commit-ack):
+    /// the assigned log index to the [`PendingCommit`] (the parked ack + the entry's term).
+    /// Instead of fulfilling the [`Event::Propose`] ack at APPEND time, the run loop parks
+    /// it here and resolves it on the COMMIT-ADVANCE: when a step's
+    /// [`Effects::committed_through`](ironcache_raft::Effects::committed_through) reaches the
+    /// index it is answered `Some(index)` (committed), and if this node loses leadership or
+    /// the still-uncommitted entry is overwritten by a new leader it is answered `None`
+    /// (NotLeader, the idempotent caller retries). Owned solely by the run loop (no lock).
+    pending_commits: BTreeMap<u64, PendingCommit>,
+    /// FORWARDED proposals (HA-9) this leader accepted on a follower's behalf but has not
+    /// yet COMMITTED (HA-prod-commit-ack): the assigned log index to the
+    /// [`PendingForwardResult`] (the origin + correlation id to answer, plus the entry's
+    /// term). Like [`pending_commits`](RaftClusterBusNode::pending_commits) but the resolved
+    /// outcome is shipped back as a [`RaftMsg::ForwardProposeResult`] rather than a local
+    /// one-shot, so a follower's forwarded `+OK` also means COMMITTED. Owned by the run loop.
+    pending_forward_results: BTreeMap<u64, PendingForwardResult>,
     /// The next correlation id to assign a forward (HA-9). A monotonic run-loop counter,
     /// NEVER random (ADR-0003): it only needs to be unique among this node's in-flight
     /// forwards, and uniqueness from a counter is deterministic.
@@ -375,6 +422,8 @@ where
             rt,
             peers,
             pending_forwards: BTreeMap::new(),
+            pending_commits: BTreeMap::new(),
+            pending_forward_results: BTreeMap::new(),
             next_corr: 0,
             conns: BTreeMap::new(),
             timer_gen: BTreeMap::new(),
@@ -413,7 +462,9 @@ where
             let rng: &mut dyn RaftRng = self.env.rng();
             self.raft.start(now, rng, &mut effects);
         }
+        let committed_through = effects.committed_through;
         self.drain_effects(effects).await;
+        self.resolve_pending_commits(committed_through).await;
         self.publish_status();
 
         while let Some(event) = inbox.recv().await {
@@ -460,9 +511,22 @@ where
                     }
                 }
             }
+            // HA-prod-commit-ack: capture the commit high-water this step reached BEFORE
+            // the effects are drained (drain consumes them by value), then resolve any
+            // parked propose acks the advance (or a leadership change) settles.
+            let committed_through = effects.committed_through;
             self.drain_effects(effects).await;
+            self.resolve_pending_commits(committed_through).await;
             self.publish_status();
         }
+
+        // The inbox closed (every NodeHandle dropped): the node is going away. Drop every
+        // still-parked propose ack so its caller does not hang -- the dropped one-shot
+        // resolves the `NodeHandle::propose` await to `None` (NotLeader), and the dropped
+        // forward-result map simply stops answering forwards (their origins time out and
+        // retry). No leak: both maps are emptied as `self` is dropped.
+        self.pending_commits.clear();
+        self.pending_forward_results.clear();
     }
 
     /// Handle a LOCAL [`Event::Propose`] (HA-9 leader-forwarding). Three cases:
@@ -485,8 +549,26 @@ where
             let now = self.env.now();
             let rng: &mut dyn RaftRng = self.env.rng();
             let index = self.raft.propose(payload, now, rng, effects);
-            if let Some(ack) = ack {
-                let _ = ack.send(index);
+            // HA-prod-commit-ack: do NOT ack at append time. Park the ack keyed by the
+            // assigned index; the post-drain resolve pass fulfils it on the commit-advance
+            // (Some(index)) or fails it (None) if this node loses leadership / the entry is
+            // overwritten. A single-voter cluster commits within THIS step, so the very next
+            // resolve pass (committed_through >= index) answers it promptly, unchanged.
+            match (index, ack) {
+                (Some(index), Some(ack)) => {
+                    // Record the appended entry's term so an overwrite (a new leader putting
+                    // a different term at this index) is detectable before it commits.
+                    let term = self.raft.current_term();
+                    self.pending_commits
+                        .insert(index, PendingCommit { term, ack });
+                }
+                // propose() returned None (not leader after all -- a race the is_leader()
+                // guard makes unlikely, but handle it): nothing landed, so NotLeader now.
+                (None, Some(ack)) => {
+                    let _ = ack.send(None);
+                }
+                // No ack channel: a fire-and-forget propose, nothing to resolve.
+                (_, None) => {}
             }
             return;
         }
@@ -523,11 +605,13 @@ where
 
     /// Handle an inbound [`RaftMsg::ForwardPropose`] (HA-9): a peer `from` asked us to propose
     /// `payload` on its behalf. If we are the leader, propose locally (the same engine machinery a
-    /// local `Propose` uses) and reply [`RaftMsg::ForwardProposeResult`] with the assigned index.
-    /// If we are NOT the leader, reply `None` WITHOUT chaining the forward onward (the ONE-HOP rule:
-    /// the origin retries and by then knows the new leader, so a second hop would only add latency
-    /// and risk a loop). The local propose's `effects` (the replication AppendEntries it triggers)
-    /// are drained by the caller; the result reply is sent immediately so the origin is not blocked.
+    /// local `Propose` uses) and PARK the result keyed by the assigned index (HA-prod-commit-ack):
+    /// the [`RaftMsg::ForwardProposeResult`] is shipped only when the entry COMMITS (`Some(index)`)
+    /// or can no longer commit here (`None`), so the follower's forwarded `+OK` also means COMMITTED.
+    /// If we are NOT the leader (or the propose did not land), reply `None` AT ONCE WITHOUT chaining
+    /// the forward onward (the ONE-HOP rule: the origin retries and by then knows the new leader, so
+    /// a second hop would only add latency and risk a loop). The local propose's `effects` (the
+    /// replication AppendEntries it triggers) are drained by the caller.
     fn on_forward_propose(
         &mut self,
         from: NodeId,
@@ -535,20 +619,41 @@ where
         payload: EntryPayload,
         effects: &mut Effects,
     ) {
-        let outcome = if self.raft.is_leader() {
+        if self.raft.is_leader() {
             let now = self.env.now();
             let rng: &mut dyn RaftRng = self.env.rng();
             // propose() appends + replicates and returns the assigned index (Some) on a leader.
-            self.raft.propose(payload, now, rng, effects)
-        } else {
-            // One-hop only: we are not the leader, so we do not re-forward; the origin retries.
-            None
-        };
-        // Reply to the origin. Queue it as an engine SEND so it ships after this step's other
-        // effects, through the same encode + PeerConn path.
-        effects
-            .sends
-            .push((from, RaftMsg::ForwardProposeResult { corr, outcome }));
+            if let Some(index) = self.raft.propose(payload, now, rng, effects) {
+                // HA-prod-commit-ack: do NOT answer the forward at append time. Park the
+                // result keyed by the assigned index; the resolve pass ships a
+                // ForwardProposeResult { Some(index) } on commit, or { None } if this node
+                // steps down / the entry is overwritten, so the follower's forwarded +OK
+                // also means COMMITTED. (A single-voter leader commits within this step, so
+                // the very next resolve pass answers it at once.)
+                let term = self.raft.current_term();
+                self.pending_forward_results.insert(
+                    index,
+                    PendingForwardResult {
+                        term,
+                        origin: from,
+                        corr,
+                    },
+                );
+                return;
+            }
+            // propose() returned None despite being leader (e.g. a one-change-in-flight
+            // membership refusal): nothing landed, answer NotLeader now.
+        }
+        // Not the leader (one-hop only: we do not re-forward; the origin retries), or the
+        // propose did not land. Answer None immediately, queued as an engine SEND so it ships
+        // through the same encode + PeerConn path as any other effect.
+        effects.sends.push((
+            from,
+            RaftMsg::ForwardProposeResult {
+                corr,
+                outcome: None,
+            },
+        ));
     }
 
     /// Handle an inbound [`RaftMsg::ForwardProposeResult`] (HA-9): the leader answered a forward we
@@ -559,6 +664,87 @@ where
         if let Some(ack) = self.pending_forwards.remove(&corr) {
             let _ = ack.send(outcome);
         }
+    }
+
+    /// Resolve parked propose acks after a step (HA-prod-commit-ack). Called once per
+    /// event, AFTER the step's effects are drained, with the commit high-water this step
+    /// reached (`committed_through`, `None` if commit did not advance). Two passes:
+    ///
+    /// 1. COMMITTED: every parked entry whose index is `<= committed_through` is now on a
+    ///    majority. Fulfil its local ack with `Some(index)` (Committed) or ship its
+    ///    forwarded `ForwardProposeResult { Some(index) }`, and remove it.
+    /// 2. FAILED: a parked entry that did NOT commit but can no longer commit HERE is
+    ///    resolved `None` (NotLeader, the idempotent caller retries). That is true when
+    ///    this node is no longer the leader (a step-down: it can no longer drive the entry
+    ///    to commit), or the entry was OVERWRITTEN before committing (a different term now
+    ///    occupies the index, or the index was truncated below the log's end) -- exactly the
+    ///    overwrite the commit-on-append behaviour used to hide.
+    ///
+    /// Monotone + leak-free: an entry is removed the first time either pass settles it, so
+    /// each ack fires exactly once and the maps never retain a settled entry.
+    async fn resolve_pending_commits(&mut self, committed_through: Option<u64>) {
+        // Pass 1: COMMIT everything at-or-below the new high-water.
+        if let Some(hi) = committed_through {
+            // Local proposals: split off the committed prefix [..=hi] and ack each.
+            let mut committed = self.pending_commits.split_off(&(hi + 1));
+            core::mem::swap(&mut committed, &mut self.pending_commits);
+            for (index, pending) in committed {
+                let _ = pending.ack.send(Some(index));
+            }
+            // Forwarded proposals: same, but ship a ForwardProposeResult to the origin.
+            let mut committed_fwd = self.pending_forward_results.split_off(&(hi + 1));
+            core::mem::swap(&mut committed_fwd, &mut self.pending_forward_results);
+            for (index, pending) in committed_fwd {
+                let msg = RaftMsg::ForwardProposeResult {
+                    corr: pending.corr,
+                    outcome: Some(index),
+                };
+                self.send_to_peer(pending.origin, &msg).await;
+            }
+        }
+
+        // Pass 2: FAIL anything that can no longer commit here (step-down or overwrite).
+        let stepped_down = !self.raft.is_leader();
+        // Collect the indices to fail first (cannot mutate the maps while iterating, and
+        // the forward replies need an await outside the borrow).
+        let fail_local: Vec<u64> = self
+            .pending_commits
+            .iter()
+            .filter(|&(&index, p)| stepped_down || self.entry_overwritten(index, p.term))
+            .map(|(&index, _)| index)
+            .collect();
+        for index in fail_local {
+            if let Some(pending) = self.pending_commits.remove(&index) {
+                let _ = pending.ack.send(None);
+            }
+        }
+        let fail_fwd: Vec<u64> = self
+            .pending_forward_results
+            .iter()
+            .filter(|&(&index, p)| stepped_down || self.entry_overwritten(index, p.term))
+            .map(|(&index, _)| index)
+            .collect();
+        for index in fail_fwd {
+            if let Some(pending) = self.pending_forward_results.remove(&index) {
+                let msg = RaftMsg::ForwardProposeResult {
+                    corr: pending.corr,
+                    outcome: None,
+                };
+                self.send_to_peer(pending.origin, &msg).await;
+            }
+        }
+    }
+
+    /// Whether the parked entry at `index` (appended in term `parked_term`) has been
+    /// OVERWRITTEN before committing (HA-prod-commit-ack). True when the log no longer
+    /// holds `parked_term` at `index`: a NEW leader put a different term there (a
+    /// conflict truncation + re-append), or the index was truncated away entirely (the
+    /// engine's `term_at` returns 0 past the log end / for a compacted index). A
+    /// still-present entry reads back its own term, so this is false on the common path.
+    /// Only meaningful for an index strictly above `commit_index` (a committed entry is
+    /// resolved by pass 1 and removed, so it is never re-examined here).
+    fn entry_overwritten(&self, index: u64, parked_term: u64) -> bool {
+        self.raft.storage().term_at(index) != parked_term
     }
 
     /// Drain one step's [`Effects`]: arm/cancel timers first, then send messages
@@ -1322,5 +1508,195 @@ mod tests {
         assert_eq!(got_from, NodeId(2));
         assert_eq!(got_msg, msg);
         assert_eq!(consumed, frame.len());
+    }
+
+    // -- HA-prod-commit-ack: the adapter pending_commits resolution -----------
+    //
+    // These drive the adapter's PARK-then-RESOLVE logic directly (no run loop / real
+    // election needed), proving the propose ack resolves on TRUE COMMIT, fails NotLeader
+    // on overwrite / step-down, and never leaks. They exercise the engine through the same
+    // entry points the run loop uses (on_local_propose / resolve_pending_commits), with a
+    // throwaway tokio runtime to drive the (rarely-awaiting) resolve.
+
+    use ironcache_raft::{ELECTION_TIMEOUT, MemStorage, RaftConfig, RaftNode, Role};
+    use ironcache_runtime::TokioRuntime;
+
+    /// Build an adapter node over a 1-voter cluster (so it can self-elect deterministically
+    /// without peers), with a no-peer address map (no real I/O needed for the local-ack
+    /// path). Returns the node and its handle.
+    fn lone_voter_node() -> (
+        RaftClusterBusNode<TokioRuntime, MemStorage, RecordingSm>,
+        NodeHandle,
+    ) {
+        let voters: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let raft = RaftNode::with_state_machine(
+            NodeId(1),
+            voters,
+            MemStorage::new(),
+            RaftConfig::default(),
+            RecordingSm::new(),
+        );
+        RaftClusterBusNode::new(raft, SystemEnv::new(), TokioRuntime::new(), BTreeMap::new())
+    }
+
+    /// Drive the engine to LEADER (a lone voter self-elects on its election timeout).
+    fn drive_to_leader(node: &mut RaftClusterBusNode<TokioRuntime, MemStorage, RecordingSm>) {
+        let mut effects = Effects::new();
+        let now = node.env.now();
+        let rng: &mut dyn RaftRng = node.env.rng();
+        node.raft.on_timer(now, rng, ELECTION_TIMEOUT, &mut effects);
+        assert!(node.raft.is_leader(), "the lone voter must self-elect");
+    }
+
+    /// A propose on a 1-voter leader commits within the step, so the ack resolves
+    /// `Some(index)` (Committed) on the very next resolve pass -- the N=1 prompt path.
+    #[test]
+    fn local_propose_resolves_committed_on_commit_advance() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut node, _handle) = lone_voter_node();
+            drive_to_leader(&mut node);
+
+            // Propose locally with an ack parked. on_local_propose appends + (for N=1)
+            // commits within this step, recording committed_through.
+            let (tx, rx) = oneshot::channel();
+            let mut effects = Effects::new();
+            node.on_local_propose(EntryPayload::Noop, Some(tx), &mut effects)
+                .await;
+            let committed_through = effects.committed_through;
+            // The ack must be PARKED, not yet answered (resolution happens post-drain).
+            assert!(
+                !node.pending_commits.is_empty(),
+                "the ack must be parked awaiting commit, not answered at append"
+            );
+
+            // Resolve: the entry is committed (N=1), so the parked ack fires Some(index).
+            node.resolve_pending_commits(committed_through).await;
+            let index = rx
+                .await
+                .expect("the parked ack must resolve")
+                .expect("a committed entry resolves Some(index)");
+            assert!(index >= 1, "the committed index is 1-based");
+            assert!(
+                node.pending_commits.is_empty(),
+                "a resolved ack must be removed (no leak)"
+            );
+        });
+    }
+
+    /// A parked ack whose entry is OVERWRITTEN before committing (a different term now
+    /// occupies its index, or the index no longer exists) resolves `None` (NotLeader),
+    /// even while this node is still leader. We park an ack at an index the log does NOT
+    /// hold at the parked term, so `entry_overwritten` is true and pass 2 fails it.
+    #[test]
+    fn parked_ack_for_overwritten_index_resolves_not_leader() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut node, _handle) = lone_voter_node();
+            drive_to_leader(&mut node);
+
+            // Park an ack at index 999 with a term the log never held there: term_at(999)
+            // reads 0 (past the log end) != 7, so the entry is "overwritten" (never landed
+            // / truncated away). The node is STILL leader, so this isolates the overwrite
+            // predicate from the step-down path.
+            let (tx, rx) = oneshot::channel();
+            node.pending_commits
+                .insert(999, PendingCommit { term: 7, ack: tx });
+
+            // No commit advanced (committed_through None); pass 2 must FAIL the overwritten
+            // entry None.
+            node.resolve_pending_commits(None).await;
+            let outcome = rx.await.expect("the parked ack must resolve");
+            assert_eq!(
+                outcome, None,
+                "an overwritten (term-mismatched) parked index resolves NotLeader"
+            );
+            assert!(
+                node.pending_commits.is_empty(),
+                "the failed ack must be removed (no leak)"
+            );
+        });
+    }
+
+    /// A parked ack on a node that has STEPPED DOWN (no longer leader) resolves `None`
+    /// (NotLeader): a deposed leader can no longer drive its uncommitted entry to commit,
+    /// so the idempotent caller must retry. We park an ack, force the engine to Follower,
+    /// then resolve: pass 2's step-down branch fails every pending ack.
+    #[test]
+    fn parked_ack_on_step_down_resolves_not_leader() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut node, _handle) = lone_voter_node();
+            drive_to_leader(&mut node);
+
+            // Append a real entry so its index/term are genuine, parking its ack. For a
+            // 1-voter leader it commits within the step; resolve + drain that first ack
+            // (it resolves committed) so the maps are clean before we isolate step-down.
+            let (tx, rx) = oneshot::channel();
+            let mut effects = Effects::new();
+            node.on_local_propose(EntryPayload::Bytes(vec![1, 2, 3]), Some(tx), &mut effects)
+                .await;
+            node.resolve_pending_commits(effects.committed_through)
+                .await;
+            rx.await
+                .expect("the first ack resolves")
+                .expect("the 1-voter leader commits the first entry");
+
+            // Park a fresh ack at the REAL last log index with its REAL term, so the entry
+            // is genuinely present (entry_overwritten is FALSE for it) -- this isolates the
+            // STEP-DOWN branch as the sole reason the ack fails.
+            let (tx2, rx2) = oneshot::channel();
+            let idx = node.raft.storage().last_log_index();
+            let term = node.raft.storage().term_at(idx);
+            node.pending_commits
+                .insert(idx, PendingCommit { term, ack: tx2 });
+            // Force a step-down by observing a higher term via an AppendEntries from a peer.
+            let mut effects = Effects::new();
+            let now = node.env.now();
+            let rng: &mut dyn RaftRng = node.env.rng();
+            node.raft.on_message(
+                now,
+                rng,
+                NodeId(2),
+                RaftMsg::AppendEntries {
+                    term: node.raft.current_term() + 10,
+                    leader: NodeId(2),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![],
+                    leader_commit: 0,
+                },
+                &mut effects,
+            );
+            assert_eq!(
+                node.raft.role(),
+                Role::Follower,
+                "a higher term steps us down"
+            );
+
+            node.resolve_pending_commits(effects.committed_through)
+                .await;
+            let outcome = rx2.await.expect("the parked ack must resolve");
+            assert_eq!(
+                outcome, None,
+                "a parked ack on a stepped-down node resolves NotLeader"
+            );
+            assert!(
+                node.pending_commits.is_empty(),
+                "every pending ack is failed on step-down (no leak)"
+            );
+        });
     }
 }

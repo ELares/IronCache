@@ -1090,12 +1090,31 @@ pub enum TimerOp {
 /// is sent, and modeling it as a deferred effect would break that ordering).
 /// `sends` and `timer_ops` are in issue order; the caller drains them after the
 /// step returns (timer ops then sends, by the sim's convention).
+///
+/// [`committed_through`](Effects::committed_through) is a PURELY ADDITIVE NOTIFICATION
+/// (HA-prod-commit-ack): it records that this step raised `commit_index` to a new
+/// high-water, so an adapter can resolve a parked proposal ack on TRUE COMMIT (not at
+/// append) WITHOUT the engine doing any I/O. It is a function of the same inputs as
+/// every other field, drives NO vote / append / commit DECISION, and is IGNORED by the
+/// DST sim drain (which reads only `sends` + `timer_ops`), so every determinism /
+/// safety scenario replays byte-identically with it present.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Effects {
     /// Messages to send, as `(destination, message)`, in issue order.
     pub sends: Vec<(NodeId, RaftMsg)>,
     /// Timer arm / cancel operations, in issue order.
     pub timer_ops: Vec<TimerOp>,
+    /// The new committed high-water this step reached, if the step RAISED
+    /// `commit_index` (HA-prod-commit-ack). `Some(n)` means "every entry with index
+    /// `<= n` is now committed on a majority"; `None` means this step did not advance
+    /// commit. A PURE record of a decision the engine already made (it mirrors the
+    /// monotone `commit_index` after the step), emitting no I/O and changing no other
+    /// effect, so the production adapter can fulfil a parked propose ack when the
+    /// proposed index is at-or-below this value. The DST sim drain ignores this field
+    /// entirely, so the determinism sweep is byte-identical. Always either `None` or a
+    /// value strictly greater than the `commit_index` at step entry (commit is
+    /// monotone), so the adapter never sees a stale or rewound high-water.
+    pub committed_through: Option<u64>,
 }
 
 impl Effects {
@@ -1118,6 +1137,20 @@ impl Effects {
     #[inline]
     fn cancel_timer(&mut self, token: u64) {
         self.timer_ops.push(TimerOp::Cancel { token });
+    }
+
+    /// Record that this step raised `commit_index` to `index` (HA-prod-commit-ack).
+    /// Commit is monotone within a step, so a later raise in the same step always
+    /// dominates an earlier one; keep the MAX so a step that advances commit more than
+    /// once (which the engine never does today, but the record stays correct if it ever
+    /// did) reports the final high-water. Purely additive: it emits no I/O and changes
+    /// no decision, so the DST sweep is byte-identical (the sim drain ignores it).
+    #[inline]
+    fn note_committed_through(&mut self, index: u64) {
+        self.committed_through = Some(match self.committed_through {
+            Some(prev) => prev.max(index),
+            None => index,
+        });
     }
 }
 
@@ -1864,6 +1897,11 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             let new_commit = leader_commit.min(last_new_index);
             if new_commit > self.commit_index {
                 self.commit_index = new_commit;
+                // HA-prod-commit-ack: notify the adapter of the new committed high-water
+                // (additive, no I/O). A follower carries no parked LOCAL propose ack, but
+                // the record is emitted uniformly at every commit-advance site so the
+                // adapter's commit-drain logic is identical regardless of role.
+                out.note_committed_through(new_commit);
                 self.apply_committed();
             }
         }
@@ -2212,6 +2250,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
 
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
+            // HA-prod-commit-ack: notify the adapter that the committed high-water rose,
+            // so it can resolve a parked propose ack on TRUE COMMIT. Additive, no I/O.
+            out.note_committed_through(new_commit);
             self.apply_committed();
         }
 
@@ -2509,6 +2550,11 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // last_included_index > commit_index.
         self.commit_index = last_included_index;
         self.last_applied = last_included_index;
+        // HA-prod-commit-ack: the snapshot install raised the committed high-water, so
+        // record it for the adapter (additive, no I/O). Uniform with the other two
+        // commit-advance sites; a snapshot-installing follower holds no local propose
+        // ack, but the record is emitted at every site for a single drain path.
+        out.note_committed_through(last_included_index);
 
         // ECHO the installed index (Figure 13): the leader advances our markers from
         // exactly what we installed, never from its own (possibly newer) snapshot meta.
@@ -3931,18 +3977,31 @@ mod tests {
             "FIGURE 8: a prior-term entry (index2, term2) on a MAJORITY must NOT be \
              committed by replica count (section 5.4.2)"
         );
+        // HA-prod-commit-ack: no commit advanced, so NO committed-through is recorded.
+        assert_eq!(
+            out.committed_through, None,
+            "no commit advanced -> no committed-through record"
+        );
 
         // STEP 2: the leader replicates its CURRENT-term entry (index3, term4) to a
         // majority. The moment index3 is on a majority, commit jumps to index3 - and
         // index2 commits TRANSITIVELY (Log Matching: index2 precedes the now-committed
         // index3). This is the ONLY way the prior-term entry becomes committed.
-        leader.on_append_entries_resp(now, &mut rng, NodeId(2), 4, true, 3, &mut out);
-        leader.on_append_entries_resp(now, &mut rng, NodeId(3), 4, true, 3, &mut out);
+        let mut out2 = Effects::new();
+        leader.on_append_entries_resp(now, &mut rng, NodeId(2), 4, true, 3, &mut out2);
+        leader.on_append_entries_resp(now, &mut rng, NodeId(3), 4, true, 3, &mut out2);
         assert_eq!(
             leader.commit_index(),
             3,
             "once a CURRENT-term entry (index3, term4) is on a majority, commit \
              advances to it and carries index2 with it transitively"
+        );
+        // HA-prod-commit-ack: commit advanced to 3 exactly when commit_index did, so the
+        // step records committed_through == 3 (the adapter resolves a parked ack <= 3).
+        assert_eq!(
+            out2.committed_through,
+            Some(3),
+            "committed-through advances exactly when commit_index does"
         );
         assert_eq!(
             leader.last_applied(),
@@ -3965,6 +4024,204 @@ mod tests {
             &leader.storage().log()[..2],
             &committed_log[..2],
             "the committed prefix (index1, index2) is never overwritten"
+        );
+    }
+
+    // -- HA-prod-commit-ack: the committed-through Effects record ------------
+    //
+    // These prove the engine NOTIFICATION the production adapter uses to resolve a
+    // propose ack on TRUE COMMIT (not at append): an entry is NOT reported committed
+    // until a majority has appended it; the record advances exactly when commit_index
+    // does; a single voter commits on append; and an uncommitted entry overwritten by a
+    // new leader is detectable (so the adapter can fail its parked ack).
+
+    /// N=1: a single-voter leader is its own majority, so a proposed entry commits the
+    /// instant it is appended, and `propose` returns the assigned index with the same
+    /// step recording `committed_through == index` (the adapter resolves promptly, the
+    /// same observable timing as before this change).
+    #[test]
+    fn single_voter_commits_on_append() {
+        let voters: BTreeSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let storage = MemStorage::new();
+        let mut node = RaftNode::new(NodeId(1), voters, storage, RaftConfig::default());
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+
+        // Time out -> become candidate -> self-elect (a 1-voter majority is itself). The
+        // election appends a term no-op at index 1 but does NOT run the commit rule on the
+        // winning step (maybe_become_leader broadcasts + arms heartbeat only), so nothing
+        // is committed yet -- exactly the pre-existing engine behaviour, unchanged here.
+        let mut out = Effects::new();
+        node.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut out);
+        assert!(node.is_leader(), "the lone voter self-elects");
+        assert_eq!(
+            node.commit_index(),
+            0,
+            "the election step runs no commit rule"
+        );
+        assert_eq!(
+            out.committed_through, None,
+            "no commit advanced on the winning step"
+        );
+
+        // A client proposal commits ON APPEND: propose() runs maybe_advance_commit, and a
+        // single voter is its own majority, so the proposal (index 2) commits within THIS
+        // step -- carrying the index-1 no-op with it -- so commit jumps to 2 and the step
+        // records committed_through == 2. The parked ack therefore resolves promptly, the
+        // same observable timing as the old commit-on-append behaviour for N=1.
+        let mut out = Effects::new();
+        let index = node
+            .propose(payload(7), now, &mut rng, &mut out)
+            .expect("leader accepts the proposal");
+        assert_eq!(index, 2, "the proposal lands at index 2");
+        assert_eq!(
+            node.commit_index(),
+            2,
+            "N=1 commits the proposal (and the no-op below it) on append"
+        );
+        assert_eq!(
+            out.committed_through,
+            Some(2),
+            "N=1: propose's own step records the entry committed (resolves promptly)"
+        );
+    }
+
+    /// N=3: a proposed entry is NOT committed (no committed-through is recorded) until a
+    /// MAJORITY has appended it. The leader plus ONE follower is only 2 of 3 (a
+    /// majority), so the FIRST follower ack commits; before that ack arrives the entry is
+    /// uncommitted and `committed_through` stays `None`. This is exactly what lets the
+    /// adapter hold a parked ack until true commit.
+    #[test]
+    fn three_voter_commits_only_on_majority() {
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2), NodeId(3)].into_iter().collect();
+        let storage = MemStorage::new();
+        let mut leader = RaftNode::new(NodeId(1), voters, storage, RaftConfig::default());
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+
+        // Drive the leader to power via the engine (term 1 election, then a majority of
+        // granted votes), so next_index / match_index initialize the Figure-2 way.
+        let mut out = Effects::new();
+        leader.on_timer(now, &mut rng, ELECTION_TIMEOUT, &mut out);
+        assert_eq!(
+            leader.role(),
+            Role::Candidate,
+            "election timeout -> candidate"
+        );
+        let mut out = Effects::new();
+        leader.on_message(
+            now,
+            &mut rng,
+            NodeId(2),
+            RaftMsg::RequestVoteResp {
+                term: leader.current_term(),
+                vote_granted: true,
+            },
+            &mut out,
+        );
+        assert!(leader.is_leader(), "a 2/3 vote majority elects the leader");
+        // The election no-op is at the leader's last index, still uncommitted (no
+        // follower has acked it yet), so winning the election records nothing committed.
+        assert_eq!(leader.commit_index(), 0, "nothing committed before any ack");
+        assert_eq!(
+            out.committed_through, None,
+            "the no-op is appended but not yet on a majority"
+        );
+
+        // Propose a client entry. It is APPENDED at the next index but NOT committed (it
+        // is on only the leader, 1 of 3); propose's own step records NO commit.
+        let mut out = Effects::new();
+        let index = leader
+            .propose(payload(9), now, &mut rng, &mut out)
+            .expect("leader accepts the proposal");
+        assert!(index >= 2, "the proposal lands above the election no-op");
+        assert_eq!(
+            leader.commit_index(),
+            0,
+            "the proposed entry is on ONLY the leader (1/3): not committed on append"
+        );
+        assert_eq!(
+            out.committed_through, None,
+            "HA-prod-commit-ack: a 3-voter proposal does NOT commit at append time"
+        );
+
+        // ONE follower acks up to the proposal's index: leader + that follower = 2/3 = a
+        // majority. NOW commit advances to `index`, and the ack-step records it. (One
+        // follower acking is the moment the parked ack would resolve Committed.)
+        let mut out = Effects::new();
+        leader.on_append_entries_resp(
+            now,
+            &mut rng,
+            NodeId(2),
+            leader.current_term(),
+            true,
+            index,
+            &mut out,
+        );
+        assert_eq!(
+            leader.commit_index(),
+            index,
+            "the first follower ack puts the entry on a majority -> committed"
+        );
+        assert_eq!(
+            out.committed_through,
+            Some(index),
+            "committed-through is recorded exactly when commit_index reaches the entry"
+        );
+    }
+
+    /// An uncommitted entry that a NEW leader overwrites is DETECTABLE (the term at its
+    /// index changes), which is how the adapter fails a parked ack with NotLeader. We
+    /// build a follower holding an uncommitted term-1 entry at index 2, then deliver a
+    /// higher-term AppendEntries from a new leader that truncates it and replaces it with
+    /// a term-2 entry. The committed-through record never names the overwritten index, and
+    /// `term_at(2)` now reads the NEW term, exactly the signal the adapter inspects.
+    #[test]
+    fn overwritten_uncommitted_entry_is_detectable() {
+        // Follower at term 1 with an uncommitted log [ (t1,i1), (t1,i2) ]; nothing is
+        // committed (commit_index 0), so index 2 is overwrite-eligible.
+        let mut node = follower_with_log(2, 1, &[(1, 1), (1, 2)]);
+        let mut rng = ZeroRng;
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        assert_eq!(node.commit_index(), 0, "nothing committed at the follower");
+        assert_eq!(
+            node.storage().term_at(2),
+            1,
+            "index 2 holds the term-1 entry"
+        );
+
+        // A NEW leader in term 2 sends AppendEntries that keeps index 1 but replaces
+        // index 2 with a term-2 entry (a conflict at index 2 -> truncate + append). The
+        // leader has not committed index 2 either (leader_commit caps at index 1).
+        let mut out = Effects::new();
+        node.on_message(
+            now,
+            &mut rng,
+            NodeId(1),
+            RaftMsg::AppendEntries {
+                term: 2,
+                leader: NodeId(1),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![noop(2, 2)],
+                leader_commit: 1,
+            },
+            &mut out,
+        );
+        // The overwrite landed: index 2 now holds the NEW term. THIS is the signal the
+        // adapter reads (a parked ack at index 2 sees term_at(2) != its proposal's term).
+        assert_eq!(
+            node.storage().term_at(2),
+            2,
+            "the new leader OVERWROTE the uncommitted index-2 entry (term 1 -> 2)"
+        );
+        // Commit advanced only to index 1 (what the new leader vouched as committed), so
+        // the committed-through record NEVER names the overwritten index 2.
+        assert_eq!(node.commit_index(), 1, "only index 1 committed");
+        assert_eq!(
+            out.committed_through,
+            Some(1),
+            "committed-through names index 1, NEVER the overwritten index 2"
         );
     }
 
