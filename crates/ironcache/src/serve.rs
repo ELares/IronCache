@@ -228,11 +228,14 @@ pub fn run_server_inner(
         ));
         // A JOINING node (HA-prod-membership) boots as a non-voter that learns its membership from
         // the replicated log (after an operator CLUSTER MEET); the default boot makes every topology
-        // node an initial voter (byte-unchanged).
+        // node an initial voter (byte-unchanged). The F1 node-id-scheme guard can REFUSE boot here
+        // (an in-place upgrade onto persisted state written under the old NodeId scheme); propagate
+        // it as a fatal boot error so the operator gets the actionable message instead of a silent
+        // split brain.
         let boot = if config.cluster_raft_joining {
-            crate::raft_boot::spawn_control_plane_joining(config, cluster_node_id, shared)
+            crate::raft_boot::spawn_control_plane_joining(config, cluster_node_id, shared)?
         } else {
-            crate::raft_boot::spawn_control_plane(config, cluster_node_id, shared)
+            crate::raft_boot::spawn_control_plane(config, cluster_node_id, shared)?
         };
         // Install the SHARED map as ctx.cluster (replacing the static/empty map built above) so
         // every shard's routing + projection reads the SAME map the ConfigSm converges.
@@ -2635,7 +2638,17 @@ async fn try_raft_cluster_mutator(
     // NOTE appended to the reply rather than a hard error, keeping the byte-compatible `+OK` for the
     // success path while telling the operator when the membership step needs a retry.
     if let Some(intent) = membership_intent {
-        if let Some(note) = apply_membership_intent(handle, intent).await {
+        // F2: the EXISTING node table's announce ids (from the committed `ctx.cluster` map), so
+        // `apply_membership_intent` can REJECT a MEET whose derived NodeId collides with an existing
+        // node that has a DIFFERENT announce id (two physical nodes -> one Raft identity) rather than
+        // silently swallowing it. The list is the source of announce-id -> derived-NodeId truth that
+        // the raft config's `BTreeSet<NodeId>` alone cannot recover.
+        let known_announce_ids: Vec<String> = ctx
+            .cluster
+            .as_deref()
+            .map(|m| m.nodes().into_iter().map(|n| n.id.to_string()).collect())
+            .unwrap_or_default();
+        if let Some(note) = apply_membership_intent(handle, intent, &known_announce_ids).await {
             // A non-empty note means the membership step did not (yet) take effect; reply with a
             // -CLUSTERDOWN-style error carrying the reason so the operator retries the membership.
             encode_into(
@@ -2671,9 +2684,15 @@ enum MembershipIntent {
 /// Apply the [`MembershipIntent`] of a committed raft-mode MEET / FORGET to the Raft config
 /// (HA-prod-membership). Returns `None` on success (the membership change committed, or the FORGET
 /// found nothing to remove), or `Some(note)` with an operator-facing reason when the membership step
-/// did not take effect (not leader, a change already in flight, or a quorum-safety refusal) so the
-/// operator can retry. The node-table commit has already happened; this only governs consensus
+/// did not take effect (not leader, a change already in flight, a quorum-safety refusal, or -- F2 --
+/// a derived-NodeId collision with an existing different-announce-id node) so the operator can retry
+/// or fix the id. The node-table commit has already happened; this only governs consensus
 /// membership, which is idempotent and safely retryable.
+///
+/// `known_announce_ids` is the committed node table's announce ids (F2): a MEET whose derived NodeId
+/// collides with an EXISTING node that has a DIFFERENT announce id is REJECTED (rather than silently
+/// swallowed as an idempotent no-op), because two physical nodes mapping to one Raft identity is
+/// catastrophic.
 ///
 /// MEET stages the node as a LEARNER ([`MembershipChange::AddLearner`]): a non-voting member that
 /// receives the log and catches up but is counted in NO quorum, so adding it can never stall
@@ -2686,6 +2705,7 @@ enum MembershipIntent {
 async fn apply_membership_intent(
     handle: &ironcache_server::RaftHandle,
     intent: MembershipIntent,
+    known_announce_ids: &[String],
 ) -> Option<String> {
     use ironcache_raft::MembershipChange;
     match intent {
@@ -2695,13 +2715,31 @@ async fn apply_membership_intent(
             client_port,
         } => {
             let node = crate::raft_boot::node_id_from_announce(&id);
+            // F2 COLLISION REJECT: the engine keys nodes by the derived NodeId (the announce id's top
+            // 64 bits). If an EXISTING node with a DIFFERENT announce id derives the SAME NodeId, this
+            // MEET would map two physical nodes to ONE Raft identity (catastrophic). The previous
+            // guard below would SILENTLY swallow that (the colliding NodeId is already a voter/learner,
+            // so `cfg.*.contains(&node)` is true and it returns `None` == success). Detect it
+            // explicitly against the committed node table's announce ids and REJECT with a clear error
+            // so the operator fixes the id, rather than a confusing silent no-op (or a shadowed node).
+            if let Some(other) = known_announce_ids.iter().find(|known| {
+                known.as_str() != id && crate::raft_boot::node_id_from_announce(known) == node
+            }) {
+                return Some(format!(
+                    "MEET rejected: node id '{id}' derives the same raft NodeId as the existing node \
+                     '{other}' (the engine keys nodes by the top 64 bits / first 16 hex digits of the \
+                     announce id, which collide); use an id that differs within its first 16 hex digits"
+                ));
+            }
             // CRITICAL SAFETY: do NOT AddLearner a node that is ALREADY a voter (or this node
             // itself). The boot topology's voters MEET each other during formation, and a MEET is
             // idempotent on the node table; but `AddLearner` of an existing voter would DEMOTE it
             // out of the voter set (apply_membership_delta moves it voters -> learners), shrinking
             // quorum. So skip the learner-add when the named node is already a voter or is self --
             // the node table still records the MEET, the raft config is left correct. A node already
-            // a LEARNER is also skipped (idempotent; it is already staged and catching up).
+            // a LEARNER is also skipped (idempotent; it is already staged and catching up). (The F2
+            // reject above already excluded a DIFFERENT-announce-id collision, so reaching this guard
+            // with `contains(&node)` true means the SAME announce id is re-MEET'd -- a true no-op.)
             let cfg = handle.config();
             if node == handle.node_id()
                 || cfg.voters.contains(&node)

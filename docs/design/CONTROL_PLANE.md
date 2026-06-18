@@ -52,6 +52,27 @@ mechanics (#75).
   configured lag bound; promotion is a committed entry that flips the role and
   bumps the epoch atomically.
 
+### Node-id scheme and the fresh-cluster-only upgrade posture
+
+- A Raft `NodeId` is derived from the cluster announce id's top 64 bits, a value
+  stable independent of a node's position in the topology. This is what lets a
+  runtime `CLUSTER MEET` agree on a joining node's id from its announce id alone
+  (the leader proposing the add and the joiner stamping its own messages compute
+  the same id). An earlier build derived the id from the node's id-sorted position
+  in the topology instead; the two schemes are incompatible.
+- Raft-mode is therefore FRESH-CLUSTER-ONLY across that scheme change. A node
+  persists its committed configuration baseline plus log under
+  `<data_dir>/ironcache-raft-<bus-port>.log` (and its `.cfg` / `.snap` sidecars).
+  If a node that persisted committed state under the OLD scheme were upgraded
+  in place, it would, on restart, recompute ids that no longer match the persisted
+  committed config -- it would not be in its own committed voter set, causing
+  permanent quorum loss / a silent split brain. To make that impossible, boot
+  REFUSES when the recovered committed config is non-empty yet shares no id with
+  the topology-derived set (a disjointness check that never false-positives on a
+  legitimate MEET/FORGET, where surviving ids still overlap). The refusal carries
+  an actionable message: start a fresh cluster (remove the log + sidecars) or
+  migrate the persisted state.
+
 ### The SWIM-proposes / Raft-commits handshake (with #74)
 
 - The data-plane membership layer (#74) is a fast but unauthoritative suspicion

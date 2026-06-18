@@ -25,6 +25,20 @@
 //! The control-plane thread is `!Send` (the engine + `PeerConn`s are shard-local), exactly the
 //! shared-nothing shape the rest of the runtime uses (ADR-0002). All time / randomness it needs
 //! is read through the `SystemEnv` seam INSIDE the adapter (ADR-0003); this module reads none.
+//!
+//! NODE-ID SCHEME / FRESH-CLUSTER-ONLY POSTURE (F1): a `NodeId` is derived from the announce id's
+//! TOP 64 bits ([`node_id_from_announce`]), which is STABLE independent of a node's position in the
+//! topology -- a requirement for runtime `CLUSTER MEET` (a joiner and the leader must agree on the
+//! `NodeId` from the announce id alone). An EARLIER build derived the `NodeId` from a node's
+//! id-SORTED position instead. These two schemes are INCOMPATIBLE: an in-place upgrade onto a node
+//! that already persisted committed Raft state (`<data_dir>/ironcache-raft-<port>.log` + its `.cfg`
+//! baseline) under the old scheme would, on restart, recompute ids that no longer match the
+//! persisted committed config -- the node would not be in its OWN committed voter set, causing
+//! permanent quorum loss / a silent split brain. To make that impossible, raft-mode is
+//! FRESH-CLUSTER-ONLY across the scheme change: [`scheme_mismatch_error`] detects the mismatch at
+//! boot (the recovered committed config is non-empty yet DISJOINT from the topology-derived id set)
+//! and REFUSES to boot with an actionable error. An operator upgrading an existing cluster must
+//! start fresh (remove the log + sidecars) or migrate the persisted state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -88,6 +102,28 @@ pub struct RaftBoot {
     pub raft: RaftHandle,
 }
 
+/// A FATAL raft-mode boot error: a condition under which a node must REFUSE to boot rather than
+/// silently join (or split-brain) the cluster (F1, the node-id-scheme guard). The control-plane
+/// thread surfaces it back over the handle channel; `spawn_control_plane*` turn it into an
+/// `Err(BootError)` so `run_server` aborts boot with a clear, actionable operator message.
+#[derive(Debug)]
+pub struct BootError(pub String);
+
+impl std::fmt::Display for BootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BootError {}
+
+/// What the control-plane thread hands back to the spawning thread: either the live `NodeHandle`
+/// (boot proceeded) or a [`BootError`] (a fatal pre-flight refusal, e.g. the F1 node-id-scheme
+/// mismatch detected after recovering the persisted config). A bind / storage-open failure stays
+/// the pre-existing best-effort degradation (the thread logs and exits, the recv simply never
+/// arrives) and is NOT funneled through here; only a deterministic, must-refuse hazard is.
+type BootResult = Result<NodeHandle, BootError>;
+
 /// Derive a stable `NodeId(u64)` DETERMINISTICALLY from a node's 40-hex announce id
 /// (HA-prod-membership). The engine's `NodeId` is a `u64`; the cluster's node identity is the
 /// 40-hex string. This maps the latter to the former by parsing the FIRST 16 hex digits (the high
@@ -139,20 +175,29 @@ fn node_id_map(topo: &ironcache_config::ClusterTopology) -> BTreeMap<String, Nod
 /// `run_server`; `cluster` is the shared map the caller will ALSO install as `ctx.cluster`.
 ///
 /// `self_id` is this node's 40-hex announce id (already validated present in the topology by
-/// `Config::validate`). The boot is INFALLIBLE at this layer except for the listener bind, which
-/// happens on the control-plane thread (a bind failure there logs and the thread exits; the data
-/// path still runs, and Raft simply never forms, which is the safe degradation).
+/// `Config::validate`). The boot is INFALLIBLE at this layer except for the listener bind (which
+/// happens on the control-plane thread: a bind failure there logs and the thread exits; the data
+/// path still runs, and Raft simply never forms, which is the safe degradation) AND the F1
+/// node-id-scheme guard, which can RETURN a [`BootError`] so an in-place upgrade onto an
+/// incompatible persisted state refuses to boot rather than silently split-brain.
+///
+/// # Errors
+///
+/// Returns [`BootError`] when this node has persisted Raft state whose committed voter/learner set
+/// is DISJOINT from the voter set this build derives from `cluster_topology` (the F1 node-id-scheme
+/// mismatch: an in-place upgrade across the sorted-position -> announce-id-derived `NodeId` change).
+/// Raft-mode is FRESH-CLUSTER-ONLY across that change; the error tells the operator to start fresh
+/// or migrate.
 ///
 /// # Panics
 ///
 /// Panics if `self_id` is not in the topology (a wiring bug: `Config::validate` already proved it
 /// is present, so this is unreachable in the validated boot path).
-#[must_use]
 pub fn spawn_control_plane(
     config: &Config,
     self_id: &str,
     cluster: Arc<ironcache_cluster::SlotMap>,
-) -> RaftBoot {
+) -> Result<RaftBoot, BootError> {
     // The default boot: every topology node (including self) is an initial VOTER (`joining = false`).
     spawn_control_plane_inner(config, self_id, cluster, false)
 }
@@ -165,15 +210,19 @@ pub fn spawn_control_plane(
 /// here lists all nodes (so the joiner can derive every `NodeId` + bus address); only the initial
 /// voter-set membership of SELF differs from the normal boot.
 ///
+/// # Errors
+///
+/// Returns [`BootError`] under the same F1 node-id-scheme mismatch [`spawn_control_plane`]
+/// documents (a previously-persisted node restarting under the new id scheme).
+///
 /// # Panics
 ///
 /// Panics if `self_id` is not in the topology.
-#[must_use]
 pub fn spawn_control_plane_joining(
     config: &Config,
     self_id: &str,
     cluster: Arc<ironcache_cluster::SlotMap>,
-) -> RaftBoot {
+) -> Result<RaftBoot, BootError> {
     spawn_control_plane_inner(config, self_id, cluster, true)
 }
 
@@ -186,7 +235,7 @@ fn spawn_control_plane_inner(
     self_id: &str,
     cluster: Arc<ironcache_cluster::SlotMap>,
     joining: bool,
-) -> RaftBoot {
+) -> Result<RaftBoot, BootError> {
     let topo = config
         .cluster_topology
         .as_ref()
@@ -197,6 +246,13 @@ fn spawn_control_plane_inner(
     let self_node_id = *id_map
         .get(self_id)
         .expect("self announce id must be present in the topology (validated at boot)");
+    // The FULL set of node ids THIS BUILD derives from the topology under the CURRENT (announce-id)
+    // scheme -- every topology node, INCLUDING self, regardless of `joining`. This is the reference
+    // the F1 boot guard compares the persisted committed config against: a same-scheme restart keeps
+    // its surviving ids inside this set (they overlap), while a scheme CHANGE makes the persisted set
+    // fully disjoint from it. (The election VOTER set below may exclude self when joining; the guard
+    // uses the full topology set so a joiner's reference is still complete.)
+    let topology_node_ids: BTreeSet<NodeId> = id_map.values().copied().collect();
     // The initial VOTER set: every topology node by default; on a JOINING node, every node EXCEPT
     // self (self joins as a non-voter and learns its membership from the committed log).
     let voters: BTreeSet<NodeId> = id_map
@@ -247,9 +303,10 @@ fn spawn_control_plane_inner(
     };
 
     // Build the engine + adapter + handle on the spawned control-plane thread (the engine and its
-    // FileStorage / PeerConns are !Send, so they must be constructed where they live). Hand the
-    // Send NodeHandle back over a std mpsc, mirroring the HA-4a loopback proof's spawn pattern.
-    let (handle_tx, handle_rx) = std::sync::mpsc::channel::<NodeHandle>();
+    // FileStorage / PeerConns are !Send, so they must be constructed where they live). Hand a
+    // BootResult (the Send NodeHandle, or a fatal F1 BootError) back over a std mpsc, mirroring the
+    // HA-4a loopback proof's spawn pattern.
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel::<BootResult>();
     let cluster_for_sm = Arc::clone(&cluster);
     std::thread::Builder::new()
         .name("ironcache-raft".to_string())
@@ -258,6 +315,7 @@ fn spawn_control_plane_inner(
                 ControlPlaneParams {
                     self_node_id,
                     voters,
+                    topology_node_ids,
                     raft_config,
                 },
                 peers,
@@ -269,18 +327,19 @@ fn spawn_control_plane_inner(
         })
         .expect("spawn the raft control-plane thread");
 
-    // Wait for the thread to publish its handle (it does so as the first thing on the runtime).
-    // A failed recv means the thread died before binding; surface a handle-less degradation is
-    // not possible (ServerContext needs a handle in raft-mode), so this is an expect: the bind
-    // failure would have logged on the thread.
+    // Wait for the thread to publish its BootResult (it does so as the first thing on the runtime,
+    // right after recovering the persisted config and running the F1 scheme guard). A failed recv
+    // means the thread died before reporting (a bind / storage-open degradation that already logged
+    // on the thread); since ServerContext needs a handle in raft-mode, that stays an expect. A
+    // received Err is the F1 fatal refusal, surfaced to run_server so boot aborts cleanly.
     let handle = handle_rx
         .recv()
-        .expect("the raft control-plane thread must hand back its NodeHandle");
+        .expect("the raft control-plane thread must hand back its BootResult")?;
 
-    RaftBoot {
+    Ok(RaftBoot {
         cluster,
         raft: RaftHandle::new(handle),
-    }
+    })
 }
 
 /// The inputs the control-plane thread needs to STAND UP THE ENGINE: this node's id, the static
@@ -290,6 +349,11 @@ fn spawn_control_plane_inner(
 struct ControlPlaneParams {
     self_node_id: NodeId,
     voters: BTreeSet<NodeId>,
+    /// The FULL set of node ids the topology derives under the CURRENT id scheme (every topology
+    /// node, including self). The F1 boot guard compares the RECOVERED persisted committed config
+    /// against this: disjointness means the persisted state was written under a different node-id
+    /// scheme (an in-place upgrade hazard), so the node must refuse to boot.
+    topology_node_ids: BTreeSet<NodeId>,
     raft_config: RaftConfig,
 }
 
@@ -306,11 +370,12 @@ fn run_control_plane_thread(
     listen_addr: SocketAddr,
     storage_path: std::path::PathBuf,
     cluster: Arc<ironcache_cluster::SlotMap>,
-    handle_tx: &std::sync::mpsc::Sender<NodeHandle>,
+    handle_tx: &std::sync::mpsc::Sender<BootResult>,
 ) {
     let ControlPlaneParams {
         self_node_id,
         voters,
+        topology_node_ids,
         raft_config,
     } = params;
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -367,7 +432,10 @@ fn run_control_plane_thread(
 
         // The engine: this node's id, the static voter set, durable storage, the PRODUCTION
         // RaftConfig (default timing + the configured non-zero compaction threshold, HA-3c), and
-        // the PRODUCTION ConfigSm over the SHARED Arc<SlotMap> (also ctx.cluster).
+        // the PRODUCTION ConfigSm over the SHARED Arc<SlotMap> (also ctx.cluster). Constructing it
+        // RECOVERS the committed membership from the persisted baseline + the surviving log
+        // (`recompute_config_from_log`), so `voters()`/`learners()` below are the AUTHORITATIVE
+        // recovered config the F1 guard inspects.
         let raft = RaftNode::with_state_machine(
             self_node_id,
             voters,
@@ -375,12 +443,39 @@ fn run_control_plane_thread(
             raft_config,
             ConfigSm::new(cluster),
         );
+
+        // F1 NODE-ID-SCHEME GUARD: refuse to boot on an in-place upgrade onto state persisted under
+        // a DIFFERENT node-id scheme. This build derives a NodeId from the announce id's top 64 bits
+        // (stable for runtime MEET); an older build derived it from the node's sorted position in the
+        // topology. If a node restarts with persisted committed state from the OLD scheme, every
+        // recovered id refers to a node that NO LONGER EXISTS under the new scheme -- the node would
+        // not be in its own committed voter set -> permanent quorum loss / silent split brain. We
+        // detect that as DISJOINTNESS: if the RECOVERED committed config (voters + learners) is
+        // non-empty yet shares NO id with the set this build derives from the topology, the schemes
+        // differ. A legitimate same-scheme restart -- even after a MEET/FORGET churned membership --
+        // keeps the surviving nodes' derived ids inside the topology set, so they OVERLAP and this
+        // never false-positives. A fresh node (empty recovered config) is inert. Raft-mode is
+        // therefore FRESH-CLUSTER-ONLY across this id-scheme change (documented in the module header,
+        // CONTROL_PLANE.md, and SHUTDOWN.md): start fresh, or migrate the persisted state.
+        if let Some(err) = scheme_mismatch_error(
+            raft.voters(),
+            raft.learners(),
+            &topology_node_ids,
+            &storage_path,
+        ) {
+            // Report the fatal refusal back to the spawning thread (which turns it into an
+            // Err(BootError) so run_server aborts boot) and stop the control plane; do NOT proceed
+            // to form Raft on incompatible state.
+            let _ = handle_tx.send(Err(err));
+            return;
+        }
+
         let runtime = TokioRuntime::new();
         let (node, handle) = RaftClusterBusNode::new(raft, SystemEnv::new(), runtime, peers);
 
         // Hand the Send handle back to run_server's thread so it can install it in ServerContext.
         // A receive error means run_server already moved on; nothing to do.
-        let _ = handle_tx.send(handle.clone());
+        let _ = handle_tx.send(Ok(handle.clone()));
 
         // The listener feeds Event::Inbound into the run loop's inbox.
         let inbox = handle.inbox().clone();
@@ -394,6 +489,60 @@ fn run_control_plane_thread(
         // just await it so the LocalSet drives both tasks until then.
         node.run().await;
     });
+}
+
+/// The F1 node-id-scheme guard (PURE, so it is unit-tested directly): given the RECOVERED committed
+/// membership (`recovered_voters` + `recovered_learners`, what the persisted baseline + surviving log
+/// imply) and the set of node ids THIS BUILD derives from the topology (`topology_node_ids`), return
+/// `Some(BootError)` when they are INCOMPATIBLE and the node must refuse to boot, or `None` when boot
+/// is safe.
+///
+/// The check is DISJOINTNESS: a mismatch is flagged iff the recovered set is NON-EMPTY and shares NO
+/// id with the topology set. The rationale (F1):
+///   * A FRESH node recovers an empty config -> `None` (nothing persisted, no hazard).
+///   * A SAME-SCHEME restart keeps every surviving node's derived id inside the topology set, so the
+///     recovered set OVERLAPS it -> `None`. This holds even after a legitimate MEET/FORGET churn: the
+///     survivors keep their announce-id-derived ids, which the topology still lists, so there is
+///     always at least one shared id.
+///   * A SCHEME CHANGE (the in-place upgrade from sorted-position ids to announce-id-derived ids)
+///     makes EVERY recovered id refer to a node that does not exist under the new scheme, so the
+///     recovered set is fully DISJOINT from the topology set -> `Some(BootError)`. Booting anyway
+///     would leave the node out of its own committed voter set: permanent quorum loss / silent split
+///     brain. Refusing with a clear, actionable error is the safe outcome.
+///
+/// `storage_path` is only used to make the error message point the operator at the exact files to
+/// remove (or migrate) for a fresh start.
+fn scheme_mismatch_error(
+    recovered_voters: &BTreeSet<NodeId>,
+    recovered_learners: &BTreeSet<NodeId>,
+    topology_node_ids: &BTreeSet<NodeId>,
+    storage_path: &Path,
+) -> Option<BootError> {
+    // The recovered committed config is voters + learners; an empty union means nothing was
+    // persisted (a fresh node), which is always safe.
+    let recovered_nonempty = !recovered_voters.is_empty() || !recovered_learners.is_empty();
+    if !recovered_nonempty {
+        return None;
+    }
+    // Disjoint iff NO recovered id appears in the topology set. (Disjoint with an empty topology set
+    // would be vacuously true, but Config::validate guarantees a non-empty raft topology, so the
+    // topology set is non-empty here; the disjointness therefore genuinely means a scheme change.)
+    let overlaps = recovered_voters
+        .iter()
+        .chain(recovered_learners.iter())
+        .any(|id| topology_node_ids.contains(id));
+    if overlaps {
+        return None;
+    }
+    // The log path is `<dir>/ironcache-raft-<port>.log`; its sidecars are `<log>.cfg` (the
+    // config-baseline) and `<log>.snap` (the snapshot). Name all three so the operator knows
+    // precisely what to remove for a fresh start.
+    let log = storage_path.display();
+    Some(BootError(format!(
+        "persisted raft state at {log} uses an incompatible node-id scheme; this build derives \
+         node ids from cluster_announce_id. Start a FRESH cluster (remove {log}, {log}.cfg, and \
+         any {log}.snap) or migrate the persisted state."
+    )))
 }
 
 #[cfg(test)]
@@ -475,5 +624,170 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.ends_with("ironcache-raft-7000.log"));
         assert!(b.ends_with("ironcache-raft-7001.log"));
+    }
+
+    fn ids(vals: &[u64]) -> BTreeSet<NodeId> {
+        vals.iter().copied().map(NodeId).collect()
+    }
+
+    /// F1: the node-id-scheme guard PASSES (returns `None`) for a FRESH node. With nothing
+    /// persisted (an empty recovered config), there is no scheme to mismatch, so boot proceeds.
+    #[test]
+    fn scheme_guard_passes_when_recovered_config_is_empty() {
+        let topology = ids(&[0x1111, 0x2222, 0x3333]);
+        let path = Path::new("/var/lib/ironcache/ironcache-raft-17000.log");
+        assert!(
+            scheme_mismatch_error(&BTreeSet::new(), &BTreeSet::new(), &topology, path).is_none()
+        );
+    }
+
+    /// F1: the guard PASSES for a SAME-SCHEME restart -- the recovered committed config shares its
+    /// ids with the topology set (the survivors keep their announce-id-derived ids), so it overlaps
+    /// and boot proceeds. Holds even after a legitimate MEET/FORGET churn (the recovered set need
+    /// not equal the topology set; one shared id is enough to prove the same scheme).
+    #[test]
+    fn scheme_guard_passes_when_recovered_overlaps_topology() {
+        let topology = ids(&[0x1111, 0x2222, 0x3333]);
+        let path = Path::new("/var/lib/ironcache/ironcache-raft-17000.log");
+        // Exact match.
+        assert!(
+            scheme_mismatch_error(
+                &ids(&[0x1111, 0x2222, 0x3333]),
+                &BTreeSet::new(),
+                &topology,
+                path
+            )
+            .is_none()
+        );
+        // A subset (a node was FORGOTten since the snapshot): still overlaps.
+        assert!(
+            scheme_mismatch_error(&ids(&[0x1111]), &BTreeSet::new(), &topology, path).is_none()
+        );
+        // A recovered learner that overlaps the topology also proves the same scheme.
+        assert!(
+            scheme_mismatch_error(&BTreeSet::new(), &ids(&[0x2222]), &topology, path).is_none()
+        );
+        // A churned set that adds a not-yet-in-topology id (a MEET'd node) but still shares one id.
+        assert!(
+            scheme_mismatch_error(&ids(&[0x1111, 0x9999]), &BTreeSet::new(), &topology, path)
+                .is_none()
+        );
+    }
+
+    /// F1: the guard REFUSES (returns the actionable `BootError`) when the recovered committed
+    /// config is non-empty yet DISJOINT from the topology set -- the in-place-upgrade hazard (the
+    /// persisted ids were written under the OLD sorted-position scheme, so they refer to nodes that
+    /// do not exist under the new announce-id scheme). The error names the files to remove.
+    #[test]
+    fn scheme_guard_refuses_on_disjoint_old_scheme_ids() {
+        // The NEW scheme derives the announce-id-top-64-bit ids; an OLD-scheme persisted config used
+        // sorted-position ids 0/1/2, which share NOTHING with the new set.
+        let topology = ids(&[
+            0x1111_1111_1111_1111,
+            0x2222_2222_2222_2222,
+            0x3333_3333_3333_3333,
+        ]);
+        let old_scheme = ids(&[0, 1, 2]);
+        let path = Path::new("/var/lib/ironcache/ironcache-raft-17000.log");
+        let err = scheme_mismatch_error(&old_scheme, &BTreeSet::new(), &topology, path)
+            .expect("disjoint old-scheme ids must refuse boot");
+        let msg = err.to_string();
+        assert!(msg.contains("incompatible node-id scheme"), "got {msg:?}");
+        assert!(msg.contains("cluster_announce_id"), "got {msg:?}");
+        // The message points the operator at the exact files (log + .cfg + .snap sidecars).
+        assert!(msg.contains("ironcache-raft-17000.log"), "got {msg:?}");
+        assert!(msg.contains(".cfg"), "got {msg:?}");
+        assert!(msg.contains(".snap"), "got {msg:?}");
+
+        // A disjoint set held purely as LEARNERS is the same hazard and also refuses.
+        assert!(scheme_mismatch_error(&BTreeSet::new(), &old_scheme, &topology, path).is_some());
+    }
+
+    /// F1 END-TO-END: persist a config baseline of OLD-scheme ids via `FileStorage`, then recover it
+    /// through a real `RaftNode` (exactly the boot path), and confirm the recovered `voters()` feed
+    /// the guard to a REFUSAL -- proving the wiring (persisted baseline -> recovered config -> guard)
+    /// matches, not just the pure decision. A FRESH log over the same path then boots fine.
+    #[test]
+    fn scheme_guard_refuses_recovered_filestorage_baseline() {
+        use ironcache_raft::{RaftConfig, RaftStorage};
+        use ironcache_raft_net::FileStorage;
+
+        // A unique temp log path so the test is hermetic and does not collide with a real node.
+        let unique = format!(
+            "ironcache-raft-f1-test-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let log_path = std::env::temp_dir().join(unique);
+        let cfg_path = {
+            let mut p = log_path.clone().into_os_string();
+            p.push(".cfg");
+            PathBuf::from(p)
+        };
+        // Clean any leftover from a prior run.
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_file(&cfg_path);
+
+        // The NEW-scheme topology and the OLD-scheme persisted ids (disjoint).
+        let topology = ids(&[
+            0x1111_1111_1111_1111,
+            0x2222_2222_2222_2222,
+            0x3333_3333_3333_3333,
+        ]);
+        let old_scheme = ids(&[0, 1, 2]);
+
+        // (1) Persist an OLD-scheme config baseline to the `.cfg` sidecar.
+        {
+            let mut storage = FileStorage::open(&log_path).expect("open file storage");
+            storage.save_config_baseline(&old_scheme, &BTreeSet::new());
+        }
+
+        // (2) Recover it through a real RaftNode (the boot path). The constructor seeds its config
+        // from the persisted baseline (the constructor `voters` arg is only a fallback), so the
+        // recovered voters are the OLD-scheme ids.
+        let recovered = {
+            let storage = FileStorage::open(&log_path).expect("reopen file storage");
+            // The constructor voter set is a fresh placeholder; the baseline overrides it.
+            let node = ironcache_raft::RaftNode::new(
+                NodeId(0x1111_1111_1111_1111),
+                ids(&[0x1111_1111_1111_1111]),
+                storage,
+                RaftConfig::default(),
+            );
+            (node.voters().clone(), node.learners().clone())
+        };
+        assert_eq!(
+            recovered.0, old_scheme,
+            "the baseline must drive the recovered voters"
+        );
+
+        // (3) The guard refuses on the recovered (disjoint) config.
+        assert!(
+            scheme_mismatch_error(&recovered.0, &recovered.1, &topology, &log_path).is_some(),
+            "a recovered old-scheme baseline must refuse boot"
+        );
+
+        // (4) A FRESH log (baseline removed) recovers an empty config -> boot proceeds.
+        let _ = std::fs::remove_file(&cfg_path);
+        let _ = std::fs::remove_file(&log_path);
+        {
+            let storage = FileStorage::open(&log_path).expect("fresh file storage");
+            let node = ironcache_raft::RaftNode::new(
+                NodeId(0x1111_1111_1111_1111),
+                ids(&[0x1111_1111_1111_1111]),
+                storage,
+                RaftConfig::default(),
+            );
+            // A fresh node's recovered config is the constructor voter set (in-topology), which
+            // overlaps -> the guard passes.
+            assert!(
+                scheme_mismatch_error(node.voters(), node.learners(), &topology, &log_path)
+                    .is_none()
+            );
+        }
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_file(&cfg_path);
     }
 }

@@ -2776,9 +2776,18 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 voters.remove(&node);
             }
             MembershipChange::AddLearner(node) => {
-                // A learner is non-voting; if it was somehow a voter, it is not now.
-                voters.remove(&node);
-                learners.insert(node);
+                // ENGINE-AUTHORITATIVE NO-DEMOTE (F3): an AddLearner must NEVER demote a current
+                // VOTER to a non-voting learner (that would silently SHRINK the quorum). If `node`
+                // is already a voter, this is a NO-OP -- the voter stays a voter. Only a node that is
+                // neither a voter NOR already a learner is staged as a new learner. The production
+                // paths (the serve `apply_membership_intent` guard, the auto-promote driver) already
+                // never feed an existing voter here, so this is BYTE-IDENTICAL on every reachable
+                // input; it makes the no-demote invariant a property of the engine itself rather than
+                // resting solely on the callers. Still pure / total / idempotent (re-applying yields
+                // the same sets).
+                if !voters.contains(&node) {
+                    learners.insert(node);
+                }
             }
             MembershipChange::PromoteLearner(node) => {
                 // The catch-up phase is over: move it from learners into voters.
@@ -5178,6 +5187,49 @@ mod tests {
             &[NodeId(1)].into_iter().collect(),
             "RemoveLearner leaves the voter set untouched"
         );
+    }
+
+    /// F3 (engine-authoritative no-demote): `apply_membership_delta` must NEVER turn a current VOTER
+    /// into a learner via `AddLearner` (that would silently shrink the quorum). Tested directly on
+    /// the pure delta, the engine's single source of truth, so the invariant holds regardless of any
+    /// caller. A node that is neither a voter nor a learner is still staged as a new learner.
+    #[test]
+    fn add_learner_never_demotes_a_current_voter() {
+        // AddLearner of an EXISTING VOTER is a NO-OP: the voter stays a voter, no learner is created.
+        let mut voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        let mut learners: BTreeSet<NodeId> = BTreeSet::new();
+        RaftNode::<MemStorage>::apply_membership_delta(
+            &mut voters,
+            &mut learners,
+            MembershipChange::AddLearner(NodeId(2)),
+        );
+        assert_eq!(
+            voters,
+            [NodeId(1), NodeId(2)].into_iter().collect(),
+            "AddLearner of a current voter must NOT remove it from the voter set"
+        );
+        assert!(
+            learners.is_empty(),
+            "AddLearner of a current voter must NOT stage it as a learner"
+        );
+
+        // AddLearner of a NON-member stages it as a new learner (the normal MEET path).
+        RaftNode::<MemStorage>::apply_membership_delta(
+            &mut voters,
+            &mut learners,
+            MembershipChange::AddLearner(NodeId(3)),
+        );
+        assert_eq!(learners, [NodeId(3)].into_iter().collect());
+        assert_eq!(voters, [NodeId(1), NodeId(2)].into_iter().collect());
+
+        // AddLearner of an EXISTING LEARNER is idempotent (still one learner, no change).
+        RaftNode::<MemStorage>::apply_membership_delta(
+            &mut voters,
+            &mut learners,
+            MembershipChange::AddLearner(NodeId(3)),
+        );
+        assert_eq!(learners, [NodeId(3)].into_iter().collect());
+        assert_eq!(voters, [NodeId(1), NodeId(2)].into_iter().collect());
     }
 
     #[test]

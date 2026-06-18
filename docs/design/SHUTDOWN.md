@@ -122,6 +122,23 @@ there is no cross-core stop barrier:
   default replica count is are open questions; the v1 floor is that shutdown can
   refuse to exit-0 until either the replica floor or the grace timeout is reached.
 
+### Raft node-id scheme: fresh-cluster-only across the in-place upgrade
+
+- A graceful stop persists the Raft committed configuration baseline + log so the
+  NEXT boot recovers the cluster's committed membership. That recovery assumes the
+  same node-id derivation scheme: a `NodeId` is derived from the cluster announce
+  id (CONTROL_PLANE.md), which is stable independent of topology position. A build
+  that derived ids from the node's sorted position instead is INCOMPATIBLE with the
+  announce-id scheme.
+- Consequently a raft-mode node restart (a rollout, a `systemctl restart`, an
+  `ironcache upgrade` #83) ACROSS that scheme change is fresh-cluster-only: the
+  next boot refuses to start if the recovered committed config is non-empty yet
+  disjoint from the topology-derived id set (the in-place-upgrade hazard, which
+  would otherwise leave the node out of its own committed voter set -> silent split
+  brain). The refusal names the files to remove (`<data_dir>/ironcache-raft-*.log`
+  plus the `.cfg` / `.snap` sidecars) for a fresh start, or the operator migrates
+  the persisted state. A same-scheme restart (the common case) recovers normally.
+
 ### Exit-code and grace-timeout contract for orchestrators
 
 - The process exits `0` only on a fully completed graceful stop (drained, and the
