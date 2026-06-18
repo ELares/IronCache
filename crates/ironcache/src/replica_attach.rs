@@ -542,6 +542,15 @@ async fn run_replica_control(
     // attached). Reset to the current env time on the FIRST down observation after a healthy
     // contact, and cleared on a successful (re)attach, so the elapsed measures one unbroken outage.
     let mut down_since: Option<ironcache_env::Monotonic> = None;
+    // HA-8 fix: the in-sync verdict LATCHED at the last REAL master contact (the attach that just
+    // dropped), NOT recomputed each iteration. The promotion lag gate must use the in-sync state as
+    // of the last contact, because once the link is marked down a subsequent re-check reports
+    // not-in-sync (link down) and would wrongly refuse the promotion. Without the latch the two
+    // gate conditions (failover timeout elapsed AND in-sync) are never simultaneously true on a
+    // dead master: in-sync holds only on the first post-drop iteration (before the timeout elapses),
+    // and is false on every later dial-fail iteration (when the timeout has elapsed). Latched here,
+    // updated only on a real attach, reset when this node stops being a replica.
+    let mut last_contact_in_sync = false;
     loop {
         // Should THIS shard be a replica right now? (single-shard: replica of ANY slot.)
         if let Some(slot) = any_replica_of_self(&cluster) {
@@ -577,7 +586,12 @@ async fn run_replica_control(
                     // at the moment the link broke. A dial-fail (never attached this round) leaves
                     // the prior link state; in_sync is false then, which correctly withholds a
                     // promotion until a real in-sync contact has happened.
-                    let in_sync_at_last_contact = status.is_in_sync(failover.replica_max_lag);
+                    // The in-sync verdict AS OBSERVED right now: on a REAL attach-then-drop the
+                    // status still shows link UP here (set_master_link_down is called below), so this
+                    // reflects the lag at the moment the link broke; on a DIAL-FAIL (never attached
+                    // this round) the link is already down so this is false (and we keep the latch
+                    // instead).
+                    let observed_in_sync = status.is_in_sync(failover.replica_max_lag);
                     // Was the link actually UP this round (a real attach), vs a dial-fail that never
                     // connected? A real attach means THIS return starts a FRESH outage, so reset the
                     // outage clock; a dial-fail leaves the running outage clock intact (the master
@@ -595,13 +609,19 @@ async fn run_replica_control(
                     if was_attached {
                         down_since = Some(now);
                     }
+                    // LATCH the in-sync verdict: a real attach updates it from this contact; a
+                    // dial-fail keeps the prior value (so the gate, which fires several iterations
+                    // later once the timeout elapses, sees the last-contact state, not the now-down
+                    // state). See `latch_in_sync`.
+                    last_contact_in_sync =
+                        latch_in_sync(was_attached, observed_in_sync, last_contact_in_sync);
                     let started = *down_since.get_or_insert(now);
                     if now.saturating_duration_since(started) >= failover.failover_timeout {
                         maybe_propose_self_promotion(
                             &cluster,
                             raft.as_ref(),
                             &self_node_id,
-                            in_sync_at_last_contact,
+                            last_contact_in_sync,
                         )
                         .await;
                         // Whether or not the proposal landed (it may have been NotLeader, or the
@@ -622,8 +642,10 @@ async fn run_replica_control(
         } else {
             // Not a replica (the steady state until an AssignReplica commits, OR after a committed
             // promotion made THIS node the owner). The link is healthy-or-irrelevant: clear the
-            // outage clock so a future replica role starts a fresh failover-timeout window.
+            // outage clock + the latched in-sync verdict so a future replica role starts a fresh
+            // failover-timeout window with no stale latch.
             down_since = None;
+            last_contact_in_sync = false;
             rt.timer(POLL_INTERVAL).await;
         }
     }
@@ -667,6 +689,17 @@ async fn maybe_propose_self_promotion(
             new_primary: self_node_id.to_owned(),
         })
         .await;
+}
+
+/// The latched "in sync at last master contact" verdict (HA-8 fix). A REAL attach (`was_attached`)
+/// adopts the freshly `observed` verdict; a dial-fail (the master is unreachable, never attached
+/// this round) KEEPS the `prev` latch. This is what makes the promotion lag gate correct on a dead
+/// master: the gate fires only once the failover timeout elapses (several dial-fail iterations after
+/// the link broke), by which point a re-checked `observed` would be `false` (link down) and would
+/// wrongly veto the promotion. Latching at the last real contact preserves the true in-sync state.
+#[must_use]
+fn latch_in_sync(was_attached: bool, observed: bool, prev: bool) -> bool {
+    if was_attached { observed } else { prev }
 }
 
 /// The PURE HA-8 failover DECISION (the lag gate), split out from [`maybe_propose_self_promotion`]
@@ -1109,6 +1142,38 @@ mod tests {
         .expect("valid 2-node map");
         // In sync but replicates nothing -> no proposal.
         assert_eq!(promotion_proposal(&map, true), None);
+    }
+
+    /// THE HA-8 LATCH FIX (regression): the in-sync verdict the promotion gate uses is LATCHED at
+    /// the last real master contact, not recomputed each iteration. The load-bearing case is a
+    /// DIAL-FAIL after an in-sync contact (`was_attached=false`, `observed=false` because the link
+    /// is down): the latch MUST stay `true` so the gate -- which only fires several dial-fail
+    /// iterations later, once the failover timeout elapses -- still promotes. The pre-fix code used
+    /// `observed` directly, which is exactly this `false`, so it never promoted a dead master's
+    /// in-sync replica. This test pins the latch rule.
+    #[test]
+    fn latch_in_sync_keeps_last_contact_verdict_across_dial_fails() {
+        // A real attach adopts the observed verdict.
+        assert!(
+            latch_in_sync(true, true, false),
+            "in-sync attach latches true"
+        );
+        assert!(
+            !latch_in_sync(true, false, true),
+            "a lagging attach latches false (overrides a stale true)"
+        );
+        // THE FIX: a dial-fail (link down -> observed false) KEEPS the prior latch, so an in-sync
+        // replica of a now-dead master stays promotable until the timeout elapses.
+        assert!(
+            latch_in_sync(false, false, true),
+            "a dial-fail must NOT clear an in-sync latch (the bug the live AWS test caught)"
+        );
+        // A dial-fail with no prior in-sync contact stays not-in-sync (never promote a never-synced
+        // replica).
+        assert!(
+            !latch_in_sync(false, false, false),
+            "no prior contact stays not-in-sync"
+        );
     }
 
     /// END-TO-END over real loopback TCP: a primary shard with an installed [`ReplObserver`]

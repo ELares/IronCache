@@ -254,9 +254,11 @@ per epoch (the split-brain gate), a committed failover or migration flip is neve
 paths are exercised over real TCP loopback. The build also runs against a live
 multi-process cluster on AWS, where formation + leader election, consensus
 (`MEET`/`ADDSLOTS`), `MOVED` routing, replication + bounded-staleness replica reads, leader
-failover with re-election, and online migration (`ASK`/`ASKING`/flip) were all confirmed end
-to end. A per-PR performance gate (bytes-per-key and throughput ratcheted against the merge
-base) guards against any regression from the clustering work on the single-node hot path.
+failover with re-election, automatic replica promotion on owner death (an in-sync replica
+self-promoting from any node, via leader-forwarding), and online migration
+(`ASK`/`ASKING`/flip) were all confirmed end to end. A per-PR performance gate (bytes-per-key
+and throughput ratcheted against the merge base) guards against any regression from the
+clustering work on the single-node hot path.
 
 **Running a 3-node Raft cluster.** Each node gets a TOML config naming the full voter set
 (its cluster-bus port is `client_port + 10000`, its replication port `client_port + 20000`,
