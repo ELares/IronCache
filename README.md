@@ -167,7 +167,10 @@ We rank the tenets, and when two conflict we resolve in this order:
   not a legacy approximated LRU.
 - Persistable without a fork: a point-in-time snapshot with bounded, constant
   extra memory, so saving never doubles the resident set.
-- Single-node first, with a real multi-node cluster design on the roadmap.
+- Single-node first, with an opt-in multi-node cluster: a Raft-governed slot map,
+  asynchronous per-slot replication, automatic failover, and online slot migration
+  (see [Clustering and high availability](#clustering-and-high-availability)). The
+  default single-node path is byte-unchanged when clustering is off.
 - Both the server and the CLI in one binary, with a one-command install and a
   safe self-update.
 
@@ -190,6 +193,111 @@ We rank the tenets, and when two conflict we resolve in this order:
 
 These non-goals are traceable to a tenet or to a deferred milestone, and each is
 recorded in its own `non-goal` issue.
+
+---
+
+## Clustering and high availability
+
+IronCache scales from one node to a multi-node cluster without changing the client
+contract. Clustering is **opt-in**: the default single-node and static-topology paths
+are byte-unchanged, and a node compiled and run without `cluster_mode = "raft"` pays
+zero new cost on the hot path. When you turn it on, a Raft control plane governs the
+slot map and the data plane adds replication, failover, and online migration.
+
+**The control plane (Raft).** The 16384-slot ownership map, the config epoch, the node
+roster, and replica roles live in a replicated log owned by 3-5 voters. A
+`CLUSTER MEET / ADDSLOTS / SETSLOT / REPLICATE / FORGET` becomes a *proposal* the leader
+commits through the log; every node applies the same committed sequence into its shared
+slot map, so all nodes converge on one identical ownership view. **User data never enters
+the Raft log** (only the cluster's control state does). The Raft engine is hand-rolled to
+respect IronCache's determinism boundary (no foreign time or RNG on the engine path), so
+it can be verified in a deterministic simulation rather than trusted as a black box
+([ADR-0027](docs/adr/0027-hand-rolled-env-respecting-raft.md)).
+
+**The split-brain fence.** Slot ownership is transferred *only* through the committed
+Raft log, and every ownership change bumps a monotonic config epoch. Two nodes at the same
+epoch have applied the identical committed prefix, so they agree on every slot's single
+owner: there is never a committed state in which two nodes both own a slot. When a former
+owner rejoins and catches its log up, it applies the same committed entry, sees it no
+longer owns the slot, and serves `MOVED` to the new owner.
+
+**The data plane.**
+
+- **Routing.** Each key hashes to one of 16384 slots (CRC16, Redis-identical). A node that
+  does not own a key's slot replies `-MOVED <slot> <host:port>`, exactly like Redis Cluster.
+- **Replication.** `CLUSTER REPLICATE <node> <slot>` makes a node an asynchronous replica
+  of a slot: it full-syncs the slot's data (forklessly, with bounded extra memory), then
+  follows a steady-state mutation stream. Replica lag is tracked; a `READONLY` client may
+  read from a replica only while it is within the lag bound, otherwise the read `MOVED`s to
+  the owner (a bounded-staleness read, never a stale-unbounded one).
+- **Failover.** An in-sync replica is promoted to owner through a committed `PromoteReplica`
+  entry, gated on the replica having been in sync at last contact (a stale replica is never
+  promoted, so no data is lost beyond the asynchronous-replication window). The committed
+  apply is the fence: the old owner steps down on apply, so a promotion never creates two
+  owners.
+- **Online migration.** A slot moves from a source to a destination with zero downtime:
+  `SETSLOT MIGRATING` / `IMPORTING` mark the endpoints, the source `-ASK`s a key that has
+  already migrated, the destination serves it under the one-shot `ASKING` flag, and a single
+  committed `SETSLOT NODE` performs the atomic ownership flip. A crash at the flip boundary
+  leaves exactly one owner (the source if the flip did not commit, the destination if it did).
+
+**Consistency model.** Cluster *control state* (who owns which slot) is linearizable through
+Raft. *User data* replication is asynchronous, so a failover can lose writes that had not yet
+reached the promoted replica. This is the deliberate cache trade-off recorded in the design
+issues, not an unbounded promise; IronCache is a cache, not an ACID database.
+
+**Verification.** The failure-prone parts are proven in a deterministic simulation (DST)
+that drives an N-node cluster through partitions, crashes, and heals over *thousands of
+seeded timelines*, asserting the invariants on every quiescent step: no two owners per slot
+per epoch (the split-brain gate), a committed failover or migration flip is never lost
+(Raft's commit safety), and a not-in-sync replica is never promoted (the lag gate). The same
+paths are exercised over real TCP loopback. The build also runs against a live
+multi-process cluster on AWS, where formation + leader election, consensus
+(`MEET`/`ADDSLOTS`), `MOVED` routing, replication + bounded-staleness replica reads, leader
+failover with re-election, and online migration (`ASK`/`ASKING`/flip) were all confirmed end
+to end. A per-PR performance gate (bytes-per-key and throughput ratcheted against the merge
+base) guards against any regression from the clustering work on the single-node hot path.
+
+**Running a 3-node Raft cluster.** Each node gets a TOML config naming the full voter set
+(its cluster-bus port is `client_port + 10000`, its replication port `client_port + 20000`,
+both derived automatically) and its own announce id:
+
+```toml
+# node0.toml  (repeat for node1/node2 with their own port + cluster_announce_id)
+bind = "127.0.0.1"
+port = 7001
+cluster_enabled = true
+cluster_mode = "raft"
+cluster_announce_id = "0000000000000000000000000000000000000000"
+
+[[cluster_topology.nodes]]
+id = "0000000000000000000000000000000000000000"
+host = "127.0.0.1"
+port = 7001
+slots = []
+# ... one [[cluster_topology.nodes]] block per node (slots are empty in raft mode;
+#     ownership is established at runtime through committed proposals) ...
+```
+
+```sh
+ironcache --config node0.toml &   # repeat for node1, node2
+# on the elected leader: form the cluster and claim the slot space
+redis-cli -p 7002 CLUSTER MEET 127.0.0.1 7001
+redis-cli -p 7002 CLUSTER MEET 127.0.0.1 7003
+redis-cli -p 7002 CLUSTER ADDSLOTSRANGE 0 16383
+redis-cli -p 7001 CLUSTER INFO   # cluster_state:ok, cluster_slots_assigned:16384 on every node
+```
+
+**Known limitations (today).**
+
+- A cluster mutation commits only on the current Raft *leader*; a follower replies
+  `-CLUSTERDOWN` rather than forwarding. In particular, replica self-promotion fires only
+  when the in-sync replica is itself the leader. Leader-forwarding is a tracked follow-up;
+  failover *correctness* is fully proven by the DST gate regardless.
+- Raft-mode `CLUSTER MEET` synthesizes a peer's node id from its `host:port` (there is no
+  gossip), so a node can appear under both its announce id and a synthesized id; ownership
+  and routing match by endpoint, but `CLUSTER NODES` / `cluster_known_nodes` reflect those
+  extra entries.
 
 ---
 
