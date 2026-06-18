@@ -63,6 +63,7 @@ const MEMBER_ADD_VOTER: u8 = 0;
 const MEMBER_REMOVE_VOTER: u8 = 1;
 const MEMBER_ADD_LEARNER: u8 = 2;
 const MEMBER_PROMOTE_LEARNER: u8 = 3;
+const MEMBER_REMOVE_LEARNER: u8 = 4;
 
 // Config-command discriminants (the `ConfigCmd` variant tag).
 const CFG_ADD_NODE: u8 = 0;
@@ -249,6 +250,10 @@ fn put_membership(out: &mut Vec<u8>, change: MembershipChange) {
         }
         MembershipChange::PromoteLearner(node) => {
             out.push(MEMBER_PROMOTE_LEARNER);
+            put_node(out, node);
+        }
+        MembershipChange::RemoveLearner(node) => {
+            out.push(MEMBER_REMOVE_LEARNER);
             put_node(out, node);
         }
     }
@@ -556,6 +561,7 @@ fn get_membership(cur: &mut Cursor<'_>) -> Option<MembershipChange> {
         MEMBER_REMOVE_VOTER => Some(MembershipChange::RemoveVoter(cur.node()?)),
         MEMBER_ADD_LEARNER => Some(MembershipChange::AddLearner(cur.node()?)),
         MEMBER_PROMOTE_LEARNER => Some(MembershipChange::PromoteLearner(cur.node()?)),
+        MEMBER_REMOVE_LEARNER => Some(MembershipChange::RemoveLearner(cur.node()?)),
         _ => None,
     }
 }

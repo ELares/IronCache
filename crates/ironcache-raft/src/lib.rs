@@ -217,6 +217,14 @@ pub enum MembershipChange {
     /// `PromoteLearner` (so a far-behind learner is not promoted prematurely) is the
     /// (future) production driver's responsibility, not the engine's.
     PromoteLearner(NodeId),
+    /// Remove `0` from the LEARNER set (the symmetric complement of [`MembershipChange::AddLearner`]).
+    /// A learner is never counted in ANY majority (neither an election quorum nor a commit
+    /// quorum), so dropping one is ALWAYS safe: it cannot shrink any quorum or create disjoint
+    /// majorities. This is the membership change an operator's `CLUSTER FORGET <id>` proposes when
+    /// the named node is still a non-voting learner (catching up but not yet promoted): without it,
+    /// a learner could only be removed AFTER a `PromoteLearner` + `RemoveVoter` round-trip. Like
+    /// every variant it is a single-server change subject to the same one-change-in-flight rule.
+    RemoveLearner(NodeId),
 }
 
 /// A committed cluster-configuration command (CONTROL_PLANE.md #73): the deltas
@@ -2768,14 +2776,27 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 voters.remove(&node);
             }
             MembershipChange::AddLearner(node) => {
-                // A learner is non-voting; if it was somehow a voter, it is not now.
-                voters.remove(&node);
-                learners.insert(node);
+                // ENGINE-AUTHORITATIVE NO-DEMOTE (F3): an AddLearner must NEVER demote a current
+                // VOTER to a non-voting learner (that would silently SHRINK the quorum). If `node`
+                // is already a voter, this is a NO-OP -- the voter stays a voter. Only a node that is
+                // neither a voter NOR already a learner is staged as a new learner. The production
+                // paths (the serve `apply_membership_intent` guard, the auto-promote driver) already
+                // never feed an existing voter here, so this is BYTE-IDENTICAL on every reachable
+                // input; it makes the no-demote invariant a property of the engine itself rather than
+                // resting solely on the callers. Still pure / total / idempotent (re-applying yields
+                // the same sets).
+                if !voters.contains(&node) {
+                    learners.insert(node);
+                }
             }
             MembershipChange::PromoteLearner(node) => {
                 // The catch-up phase is over: move it from learners into voters.
                 learners.remove(&node);
                 voters.insert(node);
+            }
+            MembershipChange::RemoveLearner(node) => {
+                // Drop a non-voting learner. Never counted in a quorum, so always safe.
+                learners.remove(&node);
             }
         }
     }
@@ -2834,6 +2855,19 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     #[must_use]
     pub fn learners(&self) -> &BTreeSet<NodeId> {
         &self.learners
+    }
+
+    /// Whether a membership change is CURRENTLY IN FLIGHT (appended above the committed
+    /// watermark but not yet committed): the section-6 ONE-CHANGE-IN-FLIGHT predicate, exposed
+    /// READ-ONLY so the production driver can distinguish a one-change-in-flight refusal (retry
+    /// after the in-flight change commits) from a genuine not-leader refusal WITHOUT proposing a
+    /// doomed entry. Pure observation: it reads the log + commit watermark and changes NO state,
+    /// so consulting it cannot perturb consensus and the determinism sweep is byte-identical.
+    /// `propose_membership_change` enforces the rule itself regardless of whether the caller
+    /// consults this first (the safety guard is in the engine, not the driver).
+    #[must_use]
+    pub fn has_membership_change_in_flight(&self) -> bool {
+        self.membership_change_in_flight()
     }
 
     /// Propose a single-server membership change on a leader (HA-3d, Raft section 6).
@@ -5129,6 +5163,88 @@ mod tests {
         assert!(
             node.learners().is_empty(),
             "the promoted learner left the learner set"
+        );
+    }
+
+    #[test]
+    fn remove_learner_drops_it_from_the_learner_set() {
+        // RemoveLearner is the symmetric complement of AddLearner: it drops a non-voting learner
+        // and is ALWAYS safe (a learner is in no quorum). The voter set is untouched.
+        let mut node = leader_single_voter(NodeId(1));
+        propose_member(&mut node, MembershipChange::AddLearner(NodeId(2))).expect("AddLearner");
+        assert_eq!(node.learners(), &[NodeId(2)].into_iter().collect());
+        // A removal is a single-server change subject to one-change-in-flight; the AddLearner above
+        // committed at once (a learner never gates commit), so the next change is accepted.
+        assert!(!node.membership_change_in_flight());
+        propose_member(&mut node, MembershipChange::RemoveLearner(NodeId(2)))
+            .expect("RemoveLearner");
+        assert!(
+            node.learners().is_empty(),
+            "RemoveLearner drops the learner from the learner set"
+        );
+        assert_eq!(
+            node.voters(),
+            &[NodeId(1)].into_iter().collect(),
+            "RemoveLearner leaves the voter set untouched"
+        );
+    }
+
+    /// F3 (engine-authoritative no-demote): `apply_membership_delta` must NEVER turn a current VOTER
+    /// into a learner via `AddLearner` (that would silently shrink the quorum). Tested directly on
+    /// the pure delta, the engine's single source of truth, so the invariant holds regardless of any
+    /// caller. A node that is neither a voter nor a learner is still staged as a new learner.
+    #[test]
+    fn add_learner_never_demotes_a_current_voter() {
+        // AddLearner of an EXISTING VOTER is a NO-OP: the voter stays a voter, no learner is created.
+        let mut voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        let mut learners: BTreeSet<NodeId> = BTreeSet::new();
+        RaftNode::<MemStorage>::apply_membership_delta(
+            &mut voters,
+            &mut learners,
+            MembershipChange::AddLearner(NodeId(2)),
+        );
+        assert_eq!(
+            voters,
+            [NodeId(1), NodeId(2)].into_iter().collect(),
+            "AddLearner of a current voter must NOT remove it from the voter set"
+        );
+        assert!(
+            learners.is_empty(),
+            "AddLearner of a current voter must NOT stage it as a learner"
+        );
+
+        // AddLearner of a NON-member stages it as a new learner (the normal MEET path).
+        RaftNode::<MemStorage>::apply_membership_delta(
+            &mut voters,
+            &mut learners,
+            MembershipChange::AddLearner(NodeId(3)),
+        );
+        assert_eq!(learners, [NodeId(3)].into_iter().collect());
+        assert_eq!(voters, [NodeId(1), NodeId(2)].into_iter().collect());
+
+        // AddLearner of an EXISTING LEARNER is idempotent (still one learner, no change).
+        RaftNode::<MemStorage>::apply_membership_delta(
+            &mut voters,
+            &mut learners,
+            MembershipChange::AddLearner(NodeId(3)),
+        );
+        assert_eq!(learners, [NodeId(3)].into_iter().collect());
+        assert_eq!(voters, [NodeId(1), NodeId(2)].into_iter().collect());
+    }
+
+    #[test]
+    fn has_membership_change_in_flight_accessor_mirrors_the_internal_predicate() {
+        // The public read-only accessor the production driver consults to distinguish a
+        // one-change-in-flight refusal from not-leader. It must equal the internal predicate.
+        let mut node = leader_single_voter(NodeId(1));
+        assert!(!node.has_membership_change_in_flight());
+        // AddVoter(2) needs the new 2-voter majority (2 is unreachable), so it stays uncommitted.
+        propose_member(&mut node, MembershipChange::AddVoter(NodeId(2))).expect("AddVoter");
+        assert!(node.has_membership_change_in_flight());
+        assert_eq!(
+            node.has_membership_change_in_flight(),
+            node.membership_change_in_flight(),
+            "the public accessor mirrors the internal one-change-in-flight predicate"
         );
     }
 

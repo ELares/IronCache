@@ -88,6 +88,7 @@ const MEMBER_ADD_VOTER: u8 = 0;
 const MEMBER_REMOVE_VOTER: u8 = 1;
 const MEMBER_ADD_LEARNER: u8 = 2;
 const MEMBER_PROMOTE_LEARNER: u8 = 3;
+const MEMBER_REMOVE_LEARNER: u8 = 4;
 
 // ConfigCmd discriminants, again mirroring the wire codec.
 const CFG_ADD_NODE: u8 = 0;
@@ -255,6 +256,7 @@ fn put_membership(out: &mut Vec<u8>, change: MembershipChange) {
         MembershipChange::RemoveVoter(n) => (MEMBER_REMOVE_VOTER, n),
         MembershipChange::AddLearner(n) => (MEMBER_ADD_LEARNER, n),
         MembershipChange::PromoteLearner(n) => (MEMBER_PROMOTE_LEARNER, n),
+        MembershipChange::RemoveLearner(n) => (MEMBER_REMOVE_LEARNER, n),
     };
     out.push(tag);
     put_u64(out, node.0);
@@ -454,6 +456,7 @@ fn get_membership(cur: &mut Cursor<'_>) -> Option<MembershipChange> {
         MEMBER_REMOVE_VOTER => Some(MembershipChange::RemoveVoter(node)),
         MEMBER_ADD_LEARNER => Some(MembershipChange::AddLearner(node)),
         MEMBER_PROMOTE_LEARNER => Some(MembershipChange::PromoteLearner(node)),
+        MEMBER_REMOVE_LEARNER => Some(MembershipChange::RemoveLearner(node)),
         _ => None,
     }
 }

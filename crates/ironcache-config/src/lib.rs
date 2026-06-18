@@ -303,6 +303,13 @@ pub struct Config {
     /// [`ClusterMode::Raft`] opts the node into the Raft-governed control plane. TOML
     /// (`cluster_mode = "raft"`) + the `IRONCACHE_CLUSTER_MODE` env var.
     pub cluster_mode: ClusterMode,
+    /// Whether this node is JOINING an already-formed Raft cluster at runtime (HA-prod-membership),
+    /// rather than being one of the cluster's initial (boot-time) voters. When `true` (and
+    /// `cluster_mode = raft`), the node boots as a NON-VOTER: it does not campaign and is not in the
+    /// initial voter set; it learns it is a member only when the leader's committed `AddLearner`
+    /// (then auto-promote `PromoteLearner`) entry replicates to it after an operator `CLUSTER MEET`.
+    /// Defaults to `false` (a normal boot voter), so the established boot path is byte-unchanged.
+    pub cluster_raft_joining: bool,
     /// The replication-lag bound, in LOGICAL WRITES, that gates BOTH (a) HA-8 promotion
     /// eligibility (a replica is promotable only when its link is up AND its lag is
     /// `<= replica_max_lag`, ADR-0026, so a stale replica is never promoted -> no data
@@ -423,6 +430,7 @@ impl Default for Config {
             // is opt-in (CLUSTER_CONTRACT.md #70, slice 2).
             cluster_topology: None,
             cluster_announce_id: None,
+            cluster_raft_joining: false,
             // The slot map is STATICALLY governed by default (HA-4c): the pre-HA-4c
             // behavior, byte-unchanged. Raft governance is strictly opt-in.
             cluster_mode: ClusterMode::Static,
@@ -754,6 +762,16 @@ pub fn validate_topology(topo: &ClusterTopology, announce_id: &str) -> Result<()
 /// This deliberately does NOT call `SlotMap::build` (which requires complete, non-overlapping
 /// slot coverage) because a raft-mode topology legitimately carries EMPTY slot ranges.
 ///
+/// DERIVED-NODE-ID UNIQUENESS (F2): the Raft engine's `NodeId` is derived from only the TOP 64
+/// BITS of the 40-hex announce id (the first 16 hex digits; see `raft_boot::node_id_from_announce`).
+/// Two DISTINCT announce ids that share their first 16 hex digits would pass the full-id-uniqueness
+/// check yet COLLIDE to ONE `NodeId` -- two physical nodes mapping to a single Raft identity, which
+/// is catastrophic (one would silently shadow the other in every quorum). So this ALSO rejects a
+/// topology in which any two announce ids derive the same `NodeId`. The derivation is inlined (the
+/// config crate cannot depend on the `ironcache` crate where `node_id_from_announce` lives) but is
+/// the SAME top-64-bit parse; the ids are already proven 40-lowercase-hex first, so the parse is
+/// infallible here.
+///
 /// # Errors
 ///
 /// Returns [`ConfigError::Invalid`] with `field = "cluster_topology"` (or `"cluster-announce-id"`
@@ -770,6 +788,9 @@ pub fn validate_raft_topology(
         return Err(invalid("cluster topology has no nodes".to_owned()));
     }
     let mut seen: Vec<&str> = Vec::with_capacity(topo.nodes.len());
+    // F2: track the derived NodeId (top 64 bits) -> the FIRST announce id that produced it, so a
+    // collision error can name BOTH offending ids.
+    let mut derived: Vec<(u64, &str)> = Vec::with_capacity(topo.nodes.len());
     for n in &topo.nodes {
         let id = n.id.as_str();
         // 40 lowercase hex (the Redis node-id shape).
@@ -785,7 +806,20 @@ pub fn validate_raft_topology(
         if seen.contains(&id) {
             return Err(invalid(format!("duplicate node id '{id}'")));
         }
+        // F2: the derived NodeId is the top 64 bits (first 16 hex digits). The id is proven 40-hex
+        // above, so this parse cannot fail; it is the SAME derivation
+        // `raft_boot::node_id_from_announce` uses, so config and the engine agree on a collision.
+        let nid = u64::from_str_radix(&id[..16], 16)
+            .expect("a validated 40-hex id parses its first 16 hex digits as u64");
+        if let Some((_, other)) = derived.iter().find(|(d, _)| *d == nid) {
+            return Err(invalid(format!(
+                "node ids '{other}' and '{id}' derive the same raft NodeId (the engine keys nodes \
+                 by the top 64 bits / first 16 hex digits of the announce id, which collide); give \
+                 the nodes ids that differ within their first 16 hex digits"
+            )));
+        }
         seen.push(id);
+        derived.push((nid, id));
     }
     if !seen.contains(&announce_id) {
         return Err(ConfigError::Invalid {
@@ -1581,6 +1615,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// F2: a raft-mode topology with two DISTINCT announce ids that share their FIRST 16 hex digits
+    /// (so they pass the full-40-hex uniqueness check) is REJECTED, because the engine derives the
+    /// `NodeId` from only the top 64 bits / first 16 hex digits -- the two ids would COLLIDE to one
+    /// Raft identity. A topology whose ids differ within their first 16 hex digits validates.
+    #[test]
+    fn raft_topology_rejects_derived_node_id_collision() {
+        // Two ids identical in their first 16 hex ("aaaaaaaaaaaaaaaa", 16 chars) but different
+        // afterwards: the full 40-hex ids are distinct, yet both derive NodeId(0xaaaa_..._aaaa).
+        let empty_slots: &[[u16; 2]] = &[];
+        let collide_a = "aaaaaaaaaaaaaaaa000000000000000000000000"; // 16 a + 24 zeros = 40
+        let collide_b = "aaaaaaaaaaaaaaaa111111111111111111111111"; // 16 a + 24 ones = 40
+        let colliding = Config {
+            cluster_mode: ClusterMode::Raft,
+            ..topology_config(
+                true,
+                Some(collide_a),
+                &[(collide_a, empty_slots), (collide_b, empty_slots)],
+            )
+        };
+        let err = colliding
+            .validate()
+            .expect_err("two ids sharing their first 16 hex must be rejected");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field: "cluster_topology", reason }
+                if reason.contains("same raft NodeId")),
+            "got {err:?}"
+        );
+
+        // Ids that DIFFER within their first 16 hex digits validate (no collision): a shared SUFFIX
+        // is fine. Here the 16th hex char differs (0 vs 1).
+        let ok_a = "aaaaaaaaaaaaaaa0ffffffffffffffffffffffff"; // 15 a + 0 + 24 f = 40
+        let ok_b = "aaaaaaaaaaaaaaa1ffffffffffffffffffffffff"; // 15 a + 1 + 24 f = 40
+        let ok = Config {
+            cluster_mode: ClusterMode::Raft,
+            ..topology_config(
+                true,
+                Some(ok_a),
+                &[(ok_a, empty_slots), (ok_b, empty_slots)],
+            )
+        };
+        ok.validate()
+            .expect("ids differing in their first 16 hex digits should validate");
     }
 
     #[test]

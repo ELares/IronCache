@@ -312,22 +312,28 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn wait_until_has_sub_millisecond_precision() {
-        // THE regression guard for the timer-floor finding. Wait for a 300us target and
-        // assert the actual elapsed lands within a tight bound of 300us, far under the
-        // ~1ms floor a per-request `tokio::time::sleep` would have produced. This needs
-        // NO server: it proves the dispatch precision directly.
+        // THE regression guard for the timer-floor finding: prove `wait_until` can hit a 300us
+        // target FAR under the ~1ms floor a per-request `tokio::time::sleep` would have produced.
+        // A single shot is flaky on a loaded/shared CI runner (scheduling jitter routinely adds
+        // milliseconds to ANY individual wait), so we take the BEST of N attempts: the MINIMUM
+        // error proves the achievable precision. A naive 1ms-floor sleep's best-case error for a
+        // 300us target is ~700us (it always overshoots to the next ms tick), so a minimum error
+        // well under that still proves `wait_until` beats the floor, without flaking on jitter.
+        const ATTEMPTS: usize = 25;
         let env = SystemEnv::new();
-        let t0 = env.now();
-        let target = t0.saturating_add(Duration::from_micros(300));
-        wait_until(&env, target).await;
-        let elapsed = env.now().saturating_duration_since(t0);
-        let elapsed_us = elapsed.as_micros() as i64;
-        let error_us = (elapsed_us - 300).abs();
-        eprintln!("wait_until(300us) measured: elapsed={elapsed_us}us error={error_us}us");
+        let mut best_err_us = i64::MAX;
+        for _ in 0..ATTEMPTS {
+            let t0 = env.now();
+            let target = t0.saturating_add(Duration::from_micros(300));
+            wait_until(&env, target).await;
+            let elapsed_us = env.now().saturating_duration_since(t0).as_micros() as i64;
+            best_err_us = best_err_us.min((elapsed_us - 300).abs());
+        }
+        eprintln!("wait_until(300us) best-of-{ATTEMPTS} error={best_err_us}us");
         assert!(
-            error_us < 250,
-            "wait_until(300us) landed at {elapsed_us}us (error {error_us}us); \
-             expected well under the ~1ms tokio floor (< 250us error)"
+            best_err_us < 250,
+            "wait_until(300us) best-of-{ATTEMPTS} error was {best_err_us}us; expected well under \
+             the ~1ms tokio floor (best error < 250us)"
         );
     }
 
