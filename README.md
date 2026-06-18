@@ -275,6 +275,7 @@ port = 7001
 cluster_enabled = true
 cluster_mode = "raft"
 cluster_announce_id = "0000000000000000000000000000000000000000"
+# data_dir = "/var/lib/ironcache"   # durable Raft-log directory; unset (default) uses the OS temp dir
 
 [[cluster_topology.nodes]]
 id = "0000000000000000000000000000000000000000"
