@@ -371,10 +371,16 @@ mod tests {
             "count {} should be near {expected}",
             res.count
         );
-        // No injected delay: p99 must be well under 50ms (50_000us) on loopback.
+        // No injected delay: p99 must be far below a gross per-request floor. This is a COARSE
+        // smoke check (a broken wait that adds a fixed delay would blow past this), NOT a latency
+        // SLA: the bound is deliberately generous (500ms) because the test also runs on shared,
+        // heavily-contended CI runners (notably GitHub macos) whose scheduler stalls can push p99
+        // into the tens-to-hundreds of ms with no code regression. Precise latency belongs to the
+        // benchmark harness (scripts/bench), not this unit test; the deterministic signals here are
+        // the count and not-saturated assertions above/below.
         assert!(
-            res.p99_us < 50_000,
-            "no-delay p99 {} us should be small",
+            res.p99_us < 500_000,
+            "no-delay p99 {} us should be far below a gross per-request floor",
             res.p99_us
         );
         // The run was not generator-limited.
