@@ -363,6 +363,10 @@ struct Harness {
     applier: ReplicaApplier,
     link: Rc<RefCell<FaultyLink>>,
     counters: Counters,
+    /// C1: THIS connection's OWN send cursor (the ring keeps no shared one). The harness models
+    /// one primary->replica connection; its cursor is re-based to the cut on a full-resync and to
+    /// the replica's ack on a reconnect-resume.
+    send_cursor: ReplOffset,
 }
 
 impl Harness {
@@ -374,7 +378,8 @@ impl Harness {
         let ring = ReplRing::new(cap, ReplOffset::ZERO);
         let mut primary = ShardStore::new(DBS);
         primary.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
-        let (replica, _cut) = full_resync(&primary, ring.borrow().head());
+        let head = ring.borrow().head();
+        let (replica, _cut) = full_resync(&primary, head);
         Harness {
             primary,
             ring,
@@ -382,6 +387,7 @@ impl Harness {
             applier: ReplicaApplier::new(ReplOffset::ZERO),
             link: FaultyLink::new(),
             counters: Counters::default(),
+            send_cursor: head,
         }
     }
 
@@ -396,14 +402,18 @@ impl Harness {
         self.applier = ReplicaApplier::new(cut);
         self.ring.borrow_mut().take_resync();
         self.ring.borrow_mut().rebase(head);
+        // C1: re-base THIS connection's send cursor to the fresh cut (the tail resumes past it).
+        self.send_cursor = cut;
         self.link.borrow_mut().inflight.clear();
     }
 
     /// Ship a bounded batch from the ring into the link (a send fails if the link is down).
-    /// Returns the outcome so the caller can full-resync on overflow.
-    fn ship(&self, max: usize) -> ShipOutcome {
+    /// Returns the outcome so the caller can full-resync on overflow. Advances THIS connection's
+    /// own send cursor (C1: no shared ring cursor).
+    fn ship(&mut self, max: usize) -> ShipOutcome {
         let sink = Rc::clone(&self.link);
-        block_on(drain_and_ship(&self.ring, max, move |f| {
+        let cursor = &mut self.send_cursor;
+        block_on(drain_and_ship(&self.ring, cursor, max, move |f| {
             let l = Rc::clone(&sink);
             async move {
                 if l.borrow().up {
@@ -488,7 +498,8 @@ impl Harness {
     fn reconnect_or_resync(&mut self) {
         let resume_from = self.applier.applied();
         if self.ring.borrow().can_serve_from(resume_from) && !self.ring.borrow().needs_resync() {
-            self.ring.borrow_mut().rewind_send(resume_from);
+            // C1: re-base THIS connection's send cursor to the replica's ack (no shared cursor).
+            self.send_cursor = resume_from;
         } else {
             self.full_resync();
         }

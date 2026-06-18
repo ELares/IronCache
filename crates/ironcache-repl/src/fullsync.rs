@@ -223,7 +223,8 @@ where
             Frame::ReplConf { .. }
             | Frame::ReplPing { .. }
             | Frame::StreamPut { .. }
-            | Frame::StreamDel { .. } => {}
+            | Frame::StreamDel { .. }
+            | Frame::ImportReq { .. } => {}
         }
     }
 }

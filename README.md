@@ -12,8 +12,10 @@
 > cross-shard coordinator, backed by 800+ tests. A reproducible head-to-head (see
 > [Benchmarks](#benchmarks-how-it-compares)) shows it PARITY-OR-BETTER on memory and
 > FASTER per core than Redis 8.8.0, Valkey 8.1.8, KeyDB, DragonflyDB 1.39.0, and
-> Memcached on a pinned-core Linux runner. Persistence and clustering remain on the
-> [roadmap](docs/ROADMAP.md). The design record lives in the
+> Memcached on a pinned-core Linux runner. Clustering is built: an opt-in, Raft-governed
+> multi-node mode with replication, automatic failover, and online slot migration (see
+> [Clustering and high availability](#clustering-and-high-availability)); persistence remains
+> on the [roadmap](docs/ROADMAP.md). The design record lives in the
 > [GitHub issues](https://github.com/ELares/IronCache/issues) (start at the
 > [vision EPIC (#1)](https://github.com/ELares/IronCache/issues/1)), the
 > [prior-art survey](docs/PRIOR_ART.md), and the [research corpus](docs/research/).
@@ -236,10 +238,12 @@ longer owns the slot, and serves `MOVED` to the new owner.
   apply is the fence: the old owner steps down on apply, so a promotion never creates two
   owners.
 - **Online migration.** A slot moves from a source to a destination with zero downtime:
-  `SETSLOT MIGRATING` / `IMPORTING` mark the endpoints, the source `-ASK`s a key that has
-  already migrated, the destination serves it under the one-shot `ASKING` flag, and a single
-  committed `SETSLOT NODE` performs the atomic ownership flip. A crash at the flip boundary
-  leaves exactly one owner (the source if the flip did not commit, the destination if it did).
+  `SETSLOT MIGRATING` / `IMPORTING` mark the endpoints, the destination pulls the slot's
+  existing data as a scoped snapshot plus a live mutation stream (additively, while the source
+  keeps serving), the source `-ASK`s a key already redirected, the destination serves under the
+  one-shot `ASKING` flag, and a single committed `SETSLOT NODE` performs the atomic ownership
+  flip. A crash at the flip boundary leaves exactly one owner (the source if the flip did not
+  commit, the destination if it did).
 
 **Consistency model.** Cluster *control state* (who owns which slot) is linearizable through
 Raft. *User data* replication is asynchronous, so a failover can lose writes that had not yet
