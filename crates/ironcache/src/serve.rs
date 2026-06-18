@@ -313,23 +313,88 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
     // work; the per-connection serve closure clones the original per connection.
     let drain_ctx = ctx_template.clone();
 
+    // PERSISTENCE node-level state (#58): `Some` ONLY when a `data_dir` is configured (the single
+    // enable switch). With `None` (the default) the serve router never intercepts SAVE/BGSAVE/
+    // LASTSAVE (they fall through to the persistence-disabled dispatch fallback), the dirty counter
+    // is never bumped, no periodic save timer is spawned, and load-on-boot is a no-op -- so the
+    // default boot + hot path are byte-unchanged. Cloned (Arc) into the serve + drain closures.
+    let persist = crate::persist::PersistState::from_config(config);
+
+    // EMBEDDED TRANSPORT TLS for the CLIENT listener (#105, docs/design/TLS.md). Build the rustls
+    // acceptor ONCE at boot when `tls = on`, from the configured cert/key PEM, and clone the cheap
+    // (Arc-inside) handle into every connection's serve closure. When `tls = off` (the DEFAULT)
+    // this is `None` and the serve path returns a PLAIN TcpStream exactly as before -- no rustls,
+    // no per-byte cost, byte-unchanged. A build failure here (unreadable / unparseable cert or key)
+    // is a hard boot error: a TLS-only listener with no usable material would reject every client,
+    // so we refuse to start rather than silently serve nothing. `Config::validate` already proved
+    // the paths are present + readable, so this is the PEM-parse + rustls-acceptance step.
+    let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if config.tls
+        == ironcache_config::TlsMode::On
+    {
+        // validate() guaranteed both paths are Some + readable; expressing it as a clear error here
+        // keeps the boot failure precise if a future path reaches this without validation.
+        let cert = config.tls_cert_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("tls = on requires tls_cert_path (should have been caught by validate)")
+        })?;
+        let key = config.tls_key_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("tls = on requires tls_key_path (should have been caught by validate)")
+        })?;
+        let acceptor =
+            ironcache_runtime::build_acceptor(&cert.to_string_lossy(), &key.to_string_lossy())
+                .map_err(|e| anyhow::anyhow!("building the TLS listener: {e}"))?;
+        eprintln!(
+            "ironcache: TLS enabled (rustls, server-auth) on the client listener; cert={} key={}",
+            cert.display(),
+            key.display()
+        );
+        Some(acceptor)
+    } else {
+        None
+    };
+
     let serve = {
         let inbox = inbox.clone();
-        move |rt: TokioRuntime, stream: tokio::net::TcpStream, shard: ShardId| {
+        let persist = persist.clone();
+        // `run_shards` hands the shard's `TokioRuntime` backend; the per-connection serve loop
+        // drives data I/O through the `ClientStream` (plain or TLS), and the shard's background
+        // timer task constructs its own zero-sized backend, so this connection path no longer
+        // needs the handle directly (the underscore keeps the run_shards closure shape).
+        move |_rt: TokioRuntime, stream: tokio::net::TcpStream, shard: ShardId| {
             let ctx = ctx_template.clone();
             let inbox = inbox.clone();
+            // Clone the cheap acceptor handle (Arc inside) per connection; `None` when tls = off,
+            // in which case the serve loop takes the plaintext fast path.
+            let tls_acceptor = tls_acceptor.clone();
+            // The node-level persistence state (#58), `Some` only when a data_dir is configured.
+            let persist = persist.clone();
             async move {
-                serve_connection(rt, stream, shard, ctx, default_proto, inbox).await;
+                serve_connection(
+                    stream,
+                    shard,
+                    ctx,
+                    default_proto,
+                    inbox,
+                    tls_acceptor,
+                    persist,
+                )
+                .await;
             }
         }
     };
 
-    // The per-shard drain closure: turn a shard's receiver into its drain-loop future.
-    // run_shards spawns it on each shard's LocalSet alongside the accept loop, BEFORE
-    // accepting (a shard can own keys without ever accepting a connection).
-    let drain = move |rx: tokio::sync::mpsc::Receiver<coordinator::ShardWork>| {
-        let ctx = drain_ctx.clone();
-        coordinator::run_drain_loop(rx, ctx)
+    // The per-shard drain closure: turn a shard's (index, receiver) into its drain-loop future.
+    // run_shards spawns it on each shard's LocalSet alongside the accept loop, BEFORE accepting
+    // (a shard can own keys without ever accepting a connection). The shard INDEX is passed so the
+    // drain loop can LOAD this shard's snapshot file at boot (#58) and shard 0 can host the periodic
+    // save timer.
+    let drain = {
+        let inbox = inbox.clone();
+        move |index: usize, rx: tokio::sync::mpsc::Receiver<coordinator::ShardWork>| {
+            let ctx = drain_ctx.clone();
+            let inbox = inbox.clone();
+            let persist = persist.clone();
+            coordinator::run_drain_loop(index, rx, ctx, inbox, persist)
+        }
     };
 
     let set = ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?;
@@ -672,13 +737,33 @@ fn shard_started_at() -> ironcache_env::Monotonic {
 // flow across helpers that all need the same locals.
 #[allow(clippy::too_many_lines)]
 async fn serve_connection(
-    rt: TokioRuntime,
-    mut stream: tokio::net::TcpStream,
+    tcp: tokio::net::TcpStream,
     home: ShardId,
     mut ctx: ServerContext,
     default_proto: ProtoVersion,
     inbox: coordinator::Inbox,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    persist: Option<Arc<crate::persist::PersistState>>,
 ) {
+    // TLS HANDSHAKE (or plaintext passthrough), #105. When TLS is enabled the accepted TCP
+    // connection is upgraded RIGHT HERE, before any RESP byte is read: a rustls handshake runs
+    // and yields a `ClientStream::Tls` the serve loop reads/writes transparently. A plaintext
+    // client to a TLS port FAILS this handshake -> the connection is dropped (rejected, not hung).
+    // When TLS is OFF (the default) we wrap the same TcpStream in `ClientStream::Plain`, a thin
+    // passthrough to the identical TcpStream read/write code -- the plaintext hot path is
+    // byte-unchanged. The client stream's own recv/send carry the data bytes from here on.
+    let mut stream = match tls_acceptor {
+        Some(acceptor) => match ironcache_runtime::accept_tls(&acceptor, tcp).await {
+            Ok(s) => s,
+            Err(_e) => {
+                // A failed handshake (a non-TLS client, an unsupported version, a truncated
+                // ClientHello): close the connection. The bytes that arrived were never RESP and
+                // never reached the engine, so there is nothing to flush -- just return.
+                return;
+            }
+        },
+        None => ironcache_runtime::ClientStream::plain(tcp),
+    };
     let env = shard_env();
     let state_rc = shard_state();
     // The reserved-band width is derived from the configured TOTAL shard count so SCAN's
@@ -761,6 +846,7 @@ async fn serve_connection(
                         &store_rc,
                         &wheel_rc,
                         &state_rc,
+                        persist.as_ref(),
                         &request,
                         &mut out,
                     )
@@ -769,8 +855,10 @@ async fn serve_connection(
                     if close {
                         // Flush the QUIT reply then close. send returns the owned
                         // buffer (owned-buffer model); we are closing, so the
-                        // returned buffer is dropped rather than reclaimed.
-                        let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
+                        // returned buffer is dropped rather than reclaimed. Sent over the
+                        // CLIENT stream (plain or TLS); the plain arm is byte-identical to the
+                        // prior `rt.send` (it calls the same TcpStream write_all), #105.
+                        let _ = stream.send(std::mem::take(&mut out)).await;
                         break 'conn;
                     }
                 }
@@ -778,15 +866,17 @@ async fn serve_connection(
                 DecodeOutcome::Error(e) => {
                     // Protocol error: write it and close the connection (hardening).
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
-                    let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
+                    let _ = stream.send(std::mem::take(&mut out)).await;
                     break 'conn;
                 }
             }
         }
 
         if !out.is_empty() {
-            // Owned-buffer send: hand `out` over and take the returned buffer back.
-            match rt.send(&mut stream, std::mem::take(&mut out)).await {
+            // Owned-buffer send: hand `out` over and take the returned buffer back. Over the
+            // client stream (plain or TLS); the plain arm is the same TcpStream write the prior
+            // `rt.send` did (#105).
+            match stream.send(std::mem::take(&mut out)).await {
                 Ok(returned) => out = returned,
                 Err(_) => break,
             }
@@ -800,7 +890,6 @@ async fn serve_connection(
         // -- a push never precedes a command reply on the connection (SERVER_PUSH.md FIFO).
         if conn.is_subscriber() {
             if subscriber_idle_wait(
-                &rt,
                 &mut stream,
                 &mut push_rx,
                 &shed_flag,
@@ -813,8 +902,9 @@ async fn serve_connection(
                 break;
             }
         } else {
-            // Need more bytes: read.
-            let Ok(res) = rt.recv(&mut stream, std::mem::take(&mut read_buf)).await else {
+            // Need more bytes: read over the client stream (plain or TLS). The plain arm is the
+            // same TcpStream read the prior `rt.recv` did, so the plaintext hot path is unchanged.
+            let Ok(res) = stream.recv(std::mem::take(&mut read_buf)).await else {
                 break;
             };
             read_buf = res.buf;
@@ -875,8 +965,7 @@ async fn serve_connection(
 /// trigger; `wait()` parks on the signal's `Notify` (SPIN-FREE, no busy poll), so a healthy
 /// subscriber pays nothing for this arm.
 async fn subscriber_idle_wait(
-    rt: &TokioRuntime,
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut ironcache_runtime::ClientStream,
     push_rx: &mut tokio::sync::mpsc::Receiver<crate::pubsub::ServerPush>,
     shed: &std::sync::Arc<crate::pubsub::ShedSignal>,
     read_buf: &mut Vec<u8>,
@@ -902,7 +991,7 @@ async fn subscriber_idle_wait(
             while let Ok(next) = push_rx.try_recv() {
                 encode_into(out, &next.render(proto), proto);
             }
-            rt.send(stream, std::mem::take(out)).await.map_or(true, |returned| {
+            stream.send(std::mem::take(out)).await.map_or(true, |returned| {
                 *out = returned;
                 false
             })
@@ -912,7 +1001,7 @@ async fn subscriber_idle_wait(
             // bound): close the connection (its subscriptions are cleaned up on the close path).
             true
         }
-        res = rt.recv(stream, Vec::new()) => {
+        res = stream.recv(Vec::new()) => {
             let Ok(res) = res else { return true; };
             if res.n == 0 {
                 return true; // peer closed
@@ -1514,6 +1603,7 @@ async fn route_and_dispatch(
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     wheel_rc: &Rc<RefCell<TimingWheel>>,
     state_rc: &Rc<RefCell<ShardState>>,
+    persist: Option<&Arc<crate::persist::PersistState>>,
     request: &Request,
     out: &mut Vec<u8>,
 ) -> bool {
@@ -1580,6 +1670,12 @@ async fn route_and_dispatch(
         // already fall to the unknown-command home arm; rejecting it HERE keeps the contract
         // explicit and uniform with the other internal verbs.
         || cmd_upper == ironcache_server::ICEXISTS
+        // `__ICSAVE` is the INTERNAL cross-shard SAVE fan-out verb (#58 persistence): the same gate
+        // -- client-unreachable; only the home core issues it (via `do_save_all`'s `fan_out_split`
+        // to each shard's drain loop, which dumps that shard's partition). Like `__ICEXISTS` it is
+        // NOT in the `spec_of` registry (dispatched directly by the coordinator), so a client
+        // sending it would already get unknown-command; rejecting it HERE keeps the contract uniform.
+        || cmd_upper == crate::persist::ICSAVE
     {
         // FIX F: when a client issues an internal verb INSIDE a MULTI, dirty the transaction in
         // addition to replying the unknown-command error, so EXEC returns -EXECABORT exactly as
@@ -1590,6 +1686,31 @@ async fn route_and_dispatch(
             conn.dirty_exec = true;
         }
         return false;
+    }
+
+    // -- PERSISTENCE INTERCEPTION (#58): SAVE / BGSAVE / LASTSAVE. When persistence is ENABLED (a
+    // data_dir is configured -> `persist.is_some()`) and the command is NOT inside a MULTI (a SAVE
+    // in MULTI is rare; it falls through to the persistence-disabled dispatch fallback inside EXEC,
+    // a documented minor divergence), this router runs the REAL cross-shard save / reports the real
+    // LASTSAVE -- the generic dispatch sees only the storage waist, not the concrete stores to dump.
+    // With persistence OFF (`None`) this whole block is skipped and the commands fall through to the
+    // dispatch persistence-disabled fallback, so the default posture is byte-unchanged.
+    if let Some(persist) = persist {
+        if !conn.in_multi && matches!(cmd_upper.as_slice(), b"SAVE" | b"BGSAVE" | b"LASTSAVE") {
+            handle_persist_command(persist, ctx, conn, home, inbox, &cmd_upper, request, out).await;
+            return false;
+        }
+        // DIRTY-WRITE COUNTER (#58 save policy): bump the node-level dirty counter for a write
+        // command so the periodic save policy can decide whether enough changed since the last save.
+        // This is a SINGLE RELAXED ATOMIC increment, gated on persistence being ENABLED (so the
+        // default persistence-off path never touches it) AND on the command being a write
+        // (`is_write`, the registry flag; a read / admin command never bumps it). It is in the SERVE
+        // layer, NOT the store hot path, so the store primitives are byte-unchanged. It is
+        // intentionally approximate (a write that later errors still bumped it), exactly like Redis's
+        // `server.dirty` heuristic that drives its own `save` points.
+        if ironcache_server::is_write(&cmd_upper) {
+            persist.note_write();
+        }
     }
 
     // -- IN-MULTI PUB/SUB REJECT (SERVER_PUSH.md #20, FIX C). The pub/sub commands are handled in
@@ -2039,6 +2160,111 @@ async fn route_and_dispatch(
         handle_request(
             ctx, conn, env, store_rc, wheel_rc, state_rc, request, &cmd_upper, out,
         )
+    }
+}
+
+/// Handle SAVE / BGSAVE / LASTSAVE when persistence is ENABLED (#58). Bumps `commands_processed`
+/// (matching every other route), then:
+///
+/// - `SAVE`: BLOCKS until every shard has dumped its partition AND the manifest is committed (Redis
+///   parity), then replies `+OK` (or an `-ERR` on a shard / manifest failure). The fan-out is the
+///   forkless, borrow-releasing per-shard dump, so it never double-memories the keyspace.
+/// - `BGSAVE`: SPAWNS the SAME save off the request path on the home shard's executor and replies
+///   `+Background saving started` IMMEDIATELY. The dump runs on the shards' executors, yielding
+///   between chunks, so it does not block any shard's hot path materially.
+/// - `LASTSAVE`: replies `:<unix_secs>` of the last committed save (`:0` until the first save).
+///
+/// Concurrent saves are serialized by [`crate::persist::PersistState::try_begin_save`]: a SAVE /
+/// BGSAVE / periodic tick that finds a save already in progress is a no-op success (BGSAVE) or
+/// proceeds once the latch is free. The save TIMESTAMP is read from the home shard's Env Clock seam
+/// (the determinism boundary, ADR-0003).
+#[allow(clippy::too_many_arguments)]
+async fn handle_persist_command(
+    persist: &Arc<crate::persist::PersistState>,
+    ctx: &ServerContext,
+    conn: &ConnState,
+    home: ShardId,
+    inbox: &coordinator::Inbox,
+    cmd_upper: &[u8],
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    use ironcache_runtime::Runtime;
+    use ironcache_server::Value;
+    shard_state().borrow_mut().counters.on_command();
+
+    match cmd_upper {
+        b"LASTSAVE" => {
+            if request.args.len() != 1 {
+                encode_into(
+                    out,
+                    &Value::error(ironcache_protocol::ErrorReply::wrong_arity("lastsave")),
+                    conn.proto,
+                );
+                return;
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            let secs = persist.last_save() as i64;
+            encode_into(out, &Value::Integer(secs), conn.proto);
+        }
+        b"SAVE" => {
+            if request.args.len() != 1 {
+                encode_into(
+                    out,
+                    &Value::error(ironcache_protocol::ErrorReply::wrong_arity("save")),
+                    conn.proto,
+                );
+                return;
+            }
+            // The save timestamp from the home shard's Env clock (ADR-0003), in unix seconds.
+            let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
+            // Serialize against a concurrent save. If one is already running, wait for the latch by
+            // proceeding once free is overkill here; a SAVE that races a BGSAVE simply runs after the
+            // latch frees on the next attempt. Acquire-or-bail: if busy, report the in-progress save
+            // as a success (its data is being written), matching the "save is happening" intent.
+            if !persist.try_begin_save() {
+                encode_into(out, &Value::ok(), conn.proto);
+                return;
+            }
+            let result =
+                crate::persist::do_save_all(persist, inbox, ctx, home, conn.db, now_secs).await;
+            persist.release_save();
+            match result {
+                Ok(()) => encode_into(out, &Value::ok(), conn.proto),
+                Err(msg) => encode_into(
+                    out,
+                    &Value::error(ironcache_protocol::ErrorReply::err(msg)),
+                    conn.proto,
+                ),
+            }
+        }
+        // BGSAVE [SCHEDULE]: kick the save off the request path and reply immediately.
+        _ => {
+            // The save timestamp captured NOW (on the request path) so the background save records
+            // a faithful start time; the dump runs after, but LASTSAVE reporting the request time is
+            // Redis-faithful enough (Redis stamps lastsave at fork time).
+            let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
+            if persist.try_begin_save() {
+                // Spawn the save on THIS (home) shard's executor; it owns the borrow-free fan-out.
+                let persist = Arc::clone(persist);
+                let inbox = inbox.clone();
+                let ctx = ctx.clone();
+                let db = conn.db;
+                let rt = ironcache_runtime::TokioRuntime::new();
+                rt.spawn_on_shard(async move {
+                    let _ = crate::persist::do_save_all(&persist, &inbox, &ctx, home, db, now_secs)
+                        .await;
+                    persist.release_save();
+                });
+            }
+            // Whether we won the latch or a save was already running, the Redis-faithful reply is
+            // the same acknowledgement (a save is in progress).
+            encode_into(
+                out,
+                &Value::SimpleString("Background saving started".to_owned()),
+                conn.proto,
+            );
+        }
     }
 }
 

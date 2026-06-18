@@ -63,7 +63,9 @@ pub use cmd_hll::{
 };
 // The #89 single-source-of-truth command registry. `CommandClass` is also re-exported via
 // `route` (its legacy path) below; `Arity` is re-exported via `cmd_txn` (its legacy path).
-pub use command_spec::{Arity, CommandSpec, ICEXISTS, ICPUBLISH, ICPUBSUB, KeySpecKind, spec_of};
+pub use command_spec::{
+    Arity, CommandSpec, ICEXISTS, ICPUBLISH, ICPUBSUB, KeySpecKind, is_write, spec_of,
+};
 pub use conn::ConnState;
 pub use dispatch::{
     EXPIRE_CYCLE_INTERVAL, MAX_RECLAIM_PER_CALL, MAX_RECLAIM_PER_CYCLE, RollupFn, ServerContext,

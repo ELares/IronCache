@@ -16,9 +16,13 @@ workspace = true
 [features]
 # Exactly one backend is active per build (RUNTIME_ABSTRACTION.md). tokio+epoll
 # is the default and the only backend PR-1 ships; monoio/glommio are future
-# feature gates the seam is shaped for.
-default = ["tokio"]
+# feature gates the seam is shaped for. `tls` (default ON) adds the embedded
+# rustls CLIENT-listener stream variant (#105, docs/design/TLS.md); it layers on
+# the tokio backend so it implies `tokio`. With `tls` OFF the crate compiles with
+# NO rustls dep and exposes only the plaintext path (byte-unchanged).
+default = ["tokio", "tls"]
 tokio = ["dep:tokio", "dep:socket2"]
+tls = ["tokio", "dep:tokio-rustls", "dep:rustls-pemfile"]
 
 [dependencies]
 ironcache-env = { workspace = true }
@@ -31,6 +35,13 @@ tokio = { workspace = true, optional = true, features = [
     "sync",
 ] }
 socket2 = { workspace = true, optional = true }
+# Embedded transport TLS for the CLIENT listener (#105, docs/design/TLS.md), behind the
+# `tls` feature. tokio-rustls drives the rustls handshake over the accepted TcpStream; the
+# `ring` provider is pinned at the workspace level for a reproducible musl/aarch64 static
+# cross-build (no aws-lc-rs/cmake, no system OpenSSL). rustls-pemfile parses the configured
+# cert/key PEM. Both OPTIONAL: the plaintext build pulls neither.
+tokio-rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }

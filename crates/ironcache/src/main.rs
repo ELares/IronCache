@@ -203,6 +203,19 @@ fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
             "unset"
         }
     );
+    // Transport TLS posture (#105): report the client-listener mode + cert/key when on.
+    match cfg.tls {
+        ironcache_config::TlsMode::Off => println!("  tls         = off (plaintext)"),
+        ironcache_config::TlsMode::On => {
+            println!("  tls         = on (rustls, server-auth, client listener)");
+            if let Some(cert) = &cfg.tls_cert_path {
+                println!("  tls_cert    = {}", cert.display());
+            }
+            if let Some(key) = &cfg.tls_key_path {
+                println!("  tls_key     = {}", key.display());
+            }
+        }
+    }
     print_allocator_check();
     Ok(())
 }
