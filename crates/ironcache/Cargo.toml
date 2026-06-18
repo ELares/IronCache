@@ -55,6 +55,12 @@ ironcache-raft-net = { workspace = true }
 # owner to full-sync + tail (the replica side). The DEFAULT static path never reaches this
 # module, so the dependency adds no cost there. Mirrors the `ironcache-cluster` leaf line.
 ironcache-repl = { workspace = true }
+# The inter-node transport (HA-1). A raft-mode `CLUSTER MEET <host> <port>` LEARNS the MEET'd
+# peer's REAL announce id by dialing the peer's RESP client port and reading `CLUSTER MYID`
+# over a `PeerConn` (item-7 id-reconciliation), so the committed node table coincides with the
+# peer's self-added announce entry (no synth/announce duplicate). The DEFAULT static path never
+# reaches this, so it adds no cost there. A leaf on the Runtime seam (no extra third-party deps).
+ironcache-clusterbus = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
@@ -72,6 +78,6 @@ tikv-jemalloc-ctl = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
-# The inter-node transport (HA-1): the ha_transport integration test drives a real
-# node-to-node connection over the Runtime seam against two in-process nodes.
-ironcache-clusterbus = { workspace = true }
+# NOTE: `ironcache-clusterbus` is now a NORMAL dependency (above): the raft-mode MEET path uses
+# its `peer_node_id` to learn a MEET'd peer's real announce id. The `ha_transport` integration
+# test that drives a node-to-node connection over the Runtime seam still sees it through that.

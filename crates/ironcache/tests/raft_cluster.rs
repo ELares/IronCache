@@ -390,6 +390,58 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
             );
         }
 
+        // ---- (2b) NO NODE-TABLE INFLATION (item-7 id-reconciliation). The cluster formed via MEET
+        // (every node MEET'd the others over the wire). Because a raft-mode MEET now LEARNS the
+        // peer's REAL announce id (a bounded `CLUSTER MYID` fetch over the bus) instead of
+        // synthesizing one from host:port, the committed `AddNode` COINCIDES with the peer's own
+        // self-added announce entry -- so each physical node appears in the table EXACTLY ONCE.
+        //
+        // On the OLD synth-id code this FAILED: a MEET'd peer landed under BOTH a synth id AND its
+        // announce id, so `cluster_known_nodes` read 4-6 and `CLUSTER NODES` listed duplicate lines.
+        // Poll (apply is async): every node must converge to EXACTLY 3 known nodes, each listed once
+        // under its REAL announce id (ID0/ID1/ID2), with NO synth-id line.
+        let no_inflation = {
+            let start = env.now();
+            loop {
+                let mut all_ok = true;
+                'nodes: for i in 0..3 {
+                    let info = cmd(&mut clients[i], &["CLUSTER", "INFO"]).await;
+                    if !info.contains("cluster_known_nodes:3") {
+                        all_ok = false;
+                        break;
+                    }
+                    let nodes = cmd(&mut clients[i], &["CLUSTER", "NODES"]).await;
+                    // Each real announce id appears EXACTLY once; no synth id (host:port-derived)
+                    // for any node's endpoint is present.
+                    for id in [ID0, ID1, ID2] {
+                        if nodes.matches(id).count() != 1 {
+                            all_ok = false;
+                            break 'nodes;
+                        }
+                    }
+                    for p in ports {
+                        let synth = synth_meet_node_id("127.0.0.1", p);
+                        if nodes.contains(&synth) {
+                            all_ok = false;
+                            break 'nodes;
+                        }
+                    }
+                }
+                if all_ok {
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            no_inflation,
+            "item-7: after forming via MEET, every node must show EXACTLY cluster_known_nodes:3 and \
+             list each node ONCE under its real announce id (no synth/announce duplicate inflation)"
+        );
+
         // ---- (3) SERVE: the leader owns every slot, so a SET/GET on it is served locally.
         let owned_key = key_in_range(0, 16383);
         let set = cmd(&mut clients[leader_idx], &["SET", &owned_key, "v"]).await;
@@ -404,13 +456,12 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
         );
 
         // ---- (3b) MOVED: the leader SETSLOTs a single slot to a peer (committed), then a key in
-        // that slot returns -MOVED <slot> <peer host:port>. The peer's MEET'd entry carries the
-        // peer's advertised endpoint, so MOVED resolves to the right host:port (endpoint-based).
-        // Pick a peer + a target slot, and look up the synth id the leader's MEET assigned that
-        // peer (host:port-derived, the same derivation the boot uses).
+        // that slot returns -MOVED <slot> <peer host:port>. The peer's MEET'd entry now carries the
+        // peer's REAL announce id (learned over the bus, item-7), so the slot is flipped by naming
+        // that announce id; MOVED still resolves to the right host:port (endpoint-based).
         let peer_idx = (leader_idx + 1) % 3;
         let peer_port = ports[peer_idx];
-        let peer_synth_id = synth_meet_node_id("127.0.0.1", peer_port);
+        let peer_real_id = ids[peer_idx];
         let moved_key = key_in_range(100, 100); // slot 100 is arbitrary but fixed
         let target_slot = key_slot(moved_key.as_bytes());
         let r = cmd(
@@ -420,7 +471,7 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
                 "SETSLOT",
                 &target_slot.to_string(),
                 "NODE",
-                &peer_synth_id,
+                peer_real_id,
             ],
         )
         .await;
@@ -570,12 +621,12 @@ fn raft_mode_slot_migration_asks_serves_under_asking_and_flips_to_moved() {
 
         let dest_idx = (src_idx + 1) % 3;
         let dest_port = ports[dest_idx];
-        // DEST is named by the SYNTH id SRC's MEET committed for it (every node learns DEST under
-        // that id), so MIGRATING <dest> and the FLIP NODE <dest> resolve on all nodes.
-        let dest_synth_id = synth_meet_node_id("127.0.0.1", dest_port);
+        // DEST is named by its REAL announce id: SRC's MEET LEARNED it over the bus (item-7), so
+        // every node knows DEST under its announce id (NOT a synth id), and MIGRATING <dest> +
+        // the FLIP NODE <dest> resolve on all nodes.
+        let dest_real_id = ids[dest_idx];
         // SRC is named by its ANNOUNCE id: SRC's self-AddNode (prepended by ADDSLOTSRANGE) committed
-        // SRC under its announce id on every node, so IMPORTING <src> resolves (a synth id would be
-        // unknown -- SRC was never MEET'd, only self-added -- and the apply would silently no-op).
+        // SRC under its announce id on every node, so IMPORTING <src> resolves.
         let src_announce_id = ids[src_idx];
 
         // A key in a fixed slot SRC owns; this slot will migrate to DEST.
@@ -587,7 +638,7 @@ fn raft_mode_slot_migration_asks_serves_under_asking_and_flips_to_moved() {
         // ConfigCmd, so it applies on EVERY node's shared map.
         let r = cmd(
             &mut clients[src_idx],
-            &["CLUSTER", "SETSLOT", &slot.to_string(), "MIGRATING", &dest_synth_id],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "MIGRATING", dest_real_id],
         )
         .await;
         assert!(r.starts_with("+OK"), "SETSLOT MIGRATING should commit, got {r:?}");
@@ -693,7 +744,7 @@ fn raft_mode_slot_migration_asks_serves_under_asking_and_flips_to_moved() {
         // owns and the migration clears on every node. SRC then serves MOVED (NOT ASK) to DEST.
         let r = cmd(
             &mut clients[src_idx],
-            &["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", &dest_synth_id],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", dest_real_id],
         )
         .await;
         assert!(r.starts_with("+OK"), "the FLIP (SETSLOT NODE) should commit, got {r:?}");
@@ -831,7 +882,8 @@ fn raft_mode_slot_migration_live_copies_snapshot_and_stream_to_dest() {
 
         let dest_idx = (src_idx + 1) % 3;
         let dest_port = ports[dest_idx];
-        let dest_synth_id = synth_meet_node_id("127.0.0.1", dest_port);
+        // DEST under its REAL announce id (learned over the bus on MEET, item-7).
+        let dest_real_id = ids[dest_idx];
         let src_announce_id = ids[src_idx];
 
         // Several PRE-EXISTING keys in ONE fixed slot SRC owns (the snapshot's payload). They are
@@ -848,7 +900,7 @@ fn raft_mode_slot_migration_live_copies_snapshot_and_stream_to_dest() {
         // ---- (3a) MIGRATION HANDSHAKE, SOURCE LEG: SETSLOT <slot> MIGRATING <dest>.
         let r = cmd(
             &mut clients[src_idx],
-            &["CLUSTER", "SETSLOT", &slot.to_string(), "MIGRATING", &dest_synth_id],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "MIGRATING", dest_real_id],
         )
         .await;
         assert!(r.starts_with("+OK"), "SETSLOT MIGRATING should commit, got {r:?}");
@@ -949,7 +1001,7 @@ fn raft_mode_slot_migration_live_copies_snapshot_and_stream_to_dest() {
         // task sees IMPORTING cleared and stops. SRC serves MOVED.
         let r = cmd(
             &mut clients[src_idx],
-            &["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", &dest_synth_id],
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", dest_real_id],
         )
         .await;
         assert!(r.starts_with("+OK"), "the FLIP (SETSLOT NODE) should commit, got {r:?}");
@@ -1092,10 +1144,10 @@ fn raft_mode_replica_attaches_full_syncs_and_serves_readonly_reads() {
             "leader ADDSLOTSRANGE should commit, got {r:?}"
         );
 
-        // The replica node B = the leader's first peer; its committed synth id is host:port-derived.
+        // The replica node B = the leader's first peer; it is known under its REAL announce id
+        // (learned over the bus on MEET, item-7), so REPLICATE names that announce id.
         let replica_idx = (leader_idx + 1) % 3;
-        let replica_port = ports[replica_idx];
-        let replica_synth_id = synth_meet_node_id("127.0.0.1", replica_port);
+        let replica_real_id = ids[replica_idx];
 
         // A key in a fixed slot the leader owns; the leader writes it, B replicates that slot.
         let key = key_in_range(100, 100);
@@ -1104,7 +1156,7 @@ fn raft_mode_replica_attaches_full_syncs_and_serves_readonly_reads() {
         // Commit "B replicates this leader-owned slot".
         let r = cmd(
             &mut clients[leader_idx],
-            &["CLUSTER", "REPLICATE", &replica_synth_id, &slot.to_string()],
+            &["CLUSTER", "REPLICATE", replica_real_id, &slot.to_string()],
         )
         .await;
         assert!(
@@ -1292,10 +1344,12 @@ fn raft_mode_min_replicas_to_write_rejects_until_a_replica_is_in_sync() {
         // ---- (4) Commit "node B replicates this leader-owned slot" so B attaches + full-syncs and
         // becomes an IN-SYNC replica (the source-side in-sync count rises to 1).
         let replica_idx = (leader_idx + 1) % 3;
-        let replica_synth_id = synth_meet_node_id("127.0.0.1", ports[replica_idx]);
+        // The peer is known under its REAL announce id (learned over the bus on MEET, item-7), so
+        // REPLICATE names that announce id, not a synthesized one.
+        let replica_real_id = ids[replica_idx];
         let r = cmd(
             &mut clients[leader_idx],
-            &["CLUSTER", "REPLICATE", &replica_synth_id, &slot.to_string()],
+            &["CLUSTER", "REPLICATE", replica_real_id, &slot.to_string()],
         )
         .await;
         assert!(
@@ -1435,14 +1489,15 @@ fn raft_mode_replica_read_staleness_bound_moves_when_link_drops() {
 
         let replica_idx = (leader_idx + 1) % 3; // node B: the pure replica
         let replica_port = ports[replica_idx];
-        let replica_synth_id = synth_meet_node_id("127.0.0.1", replica_port);
+        // B is known under its REAL announce id (learned over the bus on MEET, item-7).
+        let replica_real_id = ids[replica_idx];
         let leader_port = ports[leader_idx];
         let key = key_in_range(100, 100);
         let slot = key_slot(key.as_bytes());
 
         let r = cmd(
             &mut clients[leader_idx],
-            &["CLUSTER", "REPLICATE", &replica_synth_id, &slot.to_string()],
+            &["CLUSTER", "REPLICATE", replica_real_id, &slot.to_string()],
         )
         .await;
         assert!(r.starts_with("+OK"), "leader CLUSTER REPLICATE should commit, got {r:?}");
@@ -1512,9 +1567,11 @@ fn raft_mode_replica_read_staleness_bound_moves_when_link_drops() {
     clean_raft_logs(ports);
 }
 
-/// The deterministic 40-hex placeholder id a raft-mode `CLUSTER MEET <host> <port>` synthesizes
-/// for the MEET'd peer (FNV-1a over `host:port`, hex-padded to 40). MUST match `serve.rs`'s
-/// `synth_meet_node_id` so the test can name the MEET'd peer in a SETSLOT.
+/// The deterministic 40-hex placeholder id a raft-mode `CLUSTER MEET <host> <port>` would
+/// synthesize for an UNREACHABLE peer (FNV-1a over `host:port`, hex-padded to 40). MUST match
+/// `serve.rs`'s `synth_meet_node_id`. Since the item-7 fix LEARNS a reachable peer's REAL announce
+/// id over the bus, this id is now the FALLBACK shape; the no-inflation assertion uses it to prove
+/// the committed table holds the real announce id and NO synth id for any reachable peer.
 fn synth_meet_node_id(host: &str, port: u16) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let endpoint = format!("{host}:{port}");
