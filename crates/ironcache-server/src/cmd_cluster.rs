@@ -1144,6 +1144,7 @@ mod tests {
             // raft-mode proposal interception lives in serve.rs, tested over real sockets).
             raft: None,
             repl_status: None,
+            in_sync_replicas: None,
             boot,
         }
     }

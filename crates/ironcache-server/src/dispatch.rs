@@ -161,6 +161,15 @@ pub struct ServerContext {
     /// `bytes_per_key` are unaffected. HA-8's promotion gate consumes `ReplNodeStatus::is_in_sync`
     /// off the same cell.
     pub repl_status: Option<Arc<ironcache_repl::ReplNodeStatus>>,
+    /// The SOURCE-SIDE in-sync-replica COUNT (ADR-0026, the WRITE-SIDE `min-replicas-to-write`
+    /// guardrail), present ONLY in raft-governance mode (the same gate as `repl_status`); `None`
+    /// for the DEFAULT static path. The primary's per-replica serve tasks maintain it with
+    /// lock-free per-connection deltas (in sync <-> out of sync, on attach / disconnect, behind the
+    /// `min_replicas_max_lag` lag gate); the WRITE path reads it with ONE relaxed atomic load, and
+    /// ONLY when `min_replicas_to_write > 0`, so the default-disabled guardrail leaves the write
+    /// hot path byte-unchanged. It is NODE-LEVEL cold state (one `AtomicUsize`), never touched per
+    /// stored key, so `bytes_per_key` is unaffected.
+    pub in_sync_replicas: Option<Arc<ironcache_repl::InSyncReplicas>>,
 }
 
 impl ServerContext {
@@ -1746,6 +1755,7 @@ mod tests {
             cluster: None,
             raft: None,
             repl_status: None,
+            in_sync_replicas: None,
             boot,
         }
     }

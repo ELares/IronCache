@@ -38,7 +38,7 @@
 //! occasional torn read across the two role halves is harmless for observability (each field is
 //! itself atomic, and the role + offsets are written by the one owning task).
 
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::cursor::ReplOffset;
 
@@ -192,11 +192,96 @@ pub fn replica_is_in_sync(link: LinkStatus, lag: ReplicaLag, max_lag: u64) -> bo
     link.is_up() && lag.in_sync(max_lag)
 }
 
-// HA-7e follow-up: the WRITE-SIDE guardrail (min-replicas-to-write / min-replicas-max-lag write
-// GATING -- rejecting a write on a master that lacks enough in-sync replicas, ADR-0026) is a
-// configurable, default-off guardrail and is intentionally NOT built here; HA-7e ships only the
-// lag SIGNAL above (what HA-8's promotion gate consumes). The bounded ring + full-resync-on
-// -overflow guardrail (HA-7c, [`crate::observer::ReplRing`]) already exists and needs no new work.
+/// The SOURCE-SIDE in-sync-replica COUNT (ADR-0026, the WRITE-SIDE guardrail `min-replicas-to
+/// -write`): a single CHEAP ATOMIC the primary's per-replica serve tasks maintain, and the WRITE
+/// hot path reads with ONE relaxed load when the guardrail is enabled.
+///
+/// ## What it counts, and how the repl tasks maintain it (single-delta-per-task, no lock)
+///
+/// Each attached replica connection has a per-connection serve task that is the SINGLE WRITER of
+/// its OWN contribution to this count. The task tracks whether IT is currently counted (a local
+/// bool), and on each step recomputes whether its replica is IN SYNC (link up AND lag = `head -
+/// shipped <= max_lag`, the same lag gate [`replica_is_in_sync`] uses for promotion). When that
+/// verdict CHANGES it nudges the shared counter by exactly one ([`Self::set_replica_in_sync`]):
+/// `fetch_add(1)` when it becomes in sync, `fetch_sub(1)` when it falls out (lag grew, or the link
+/// dropped). On task exit (the replica disconnected) it clears its contribution
+/// ([`Self::replica_gone`]). So the counter is the live number of in-sync replicas, maintained with
+/// only `fetch_add`/`fetch_sub` -- NO lock, NO per-key cost, off the data hot path.
+///
+/// ## Scope: per-node == per-slot in the single-shard-per-node topology (documented)
+///
+/// This count is NODE-LEVEL (one cell per node), not per-slot: it counts the node's attached
+/// in-sync replicas regardless of which slot a write targets. For the realistic single-shard-per
+/// -node topology the HA acceptance gate runs (`shards == 1`, one shard owning the node's slots),
+/// per-node IS per-slot -- a replica of the node is a replica of every slot the node owns -- so the
+/// write-path check `count >= min_replicas_to_write` is exact. The per-SLOT generalization (a write
+/// gated on the in-sync replicas of THAT slot's range specifically) mirrors the existing per-shard
+/// migration key-presence note: it needs per-slot replica accounting and lands with the multi-shard
+/// fan-out; here we count per-node and document the scope rather than build it speculatively.
+///
+/// ## The default path is byte-unchanged
+///
+/// This cell exists only in raft-governance mode (the same gate as [`ReplNodeStatus`]); the write
+/// path reads it ONLY when `min_replicas_to_write > 0` (a single `> 0` short-circuit guards the
+/// load), so with the guardrail at its default-disabled 0 the counter is never read and the hot
+/// path is byte-identical.
+#[derive(Debug, Default)]
+pub struct InSyncReplicas {
+    /// The live number of attached replicas currently in sync (link up AND lag <= the configured
+    /// `min_replicas_max_lag`). Maintained by per-connection deltas; read with one relaxed load.
+    count: AtomicUsize,
+}
+
+impl InSyncReplicas {
+    /// A fresh count of ZERO (no replicas attached): the standalone/no-replica posture. With the
+    /// guardrail enabled and no in-sync replica, every write is rejected `-NOREPLICAS`, which is
+    /// the intended safe default (an owner with no good replica must not silently accept writes
+    /// it cannot replicate).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current number of in-sync replicas (the WRITE hot-path read: ONE relaxed load). Relaxed
+    /// is sufficient -- the count is an advisory quorum gate, not an ordering anchor; a write that
+    /// races a just-attached replica's increment simply uses the value it observed, which is a
+    /// momentary, self-correcting skew (the same eventual-consistency the rest of the repl status
+    /// cell has).
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Transition THIS replica connection's in-sync contribution to `in_sync`, given whether it
+    /// `was_counted` before, and return the new `was_counted` state for the caller to carry. The
+    /// per-connection task is the SINGLE WRITER of its own contribution, so this is a lock-free
+    /// `fetch_add(1)` / `fetch_sub(1)` of exactly one on a CHANGE, and a no-op when unchanged.
+    /// `fetch_sub` is guarded by `was_counted` so the counter can never go negative.
+    pub fn set_replica_in_sync(&self, was_counted: bool, in_sync: bool) -> bool {
+        match (was_counted, in_sync) {
+            (false, true) => {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            (true, false) => {
+                self.count.fetch_sub(1, Ordering::Relaxed);
+                false
+            }
+            // No change (still in / still out): the counter already reflects this contribution.
+            (same, _) => same,
+        }
+    }
+
+    /// THIS replica connection went away (the serve task is exiting): drop its contribution if it
+    /// was counted, so a disconnected replica no longer counts toward the write quorum. Idempotent
+    /// via `was_counted` (a second call with `false` is a no-op), so a task that already fell out
+    /// of sync before disconnecting does not double-decrement.
+    pub fn replica_gone(&self, was_counted: bool) {
+        if was_counted {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// The NODE-LEVEL replication status cell (HA-7e): a small `Send + Sync` bag of ATOMICS the repl
 /// tasks publish to (single-writer per role half, NO lock) and the serve layer reads.
@@ -557,5 +642,48 @@ mod tests {
         // A master node is not a replica, so it is never `is_in_sync` (not a promotion candidate
         // of its own slots).
         assert!(!status.is_in_sync(u64::MAX));
+    }
+
+    #[test]
+    fn in_sync_replica_count_reflects_attach_lag_and_disconnect() {
+        // The WRITE-SIDE guardrail's source-side count (ADR-0026), maintained by per-connection
+        // deltas. Drive it the way the per-replica serve tasks do: each task carries a local
+        // `was_counted` and nudges the shared counter by exactly one on a verdict change.
+        let in_sync = InSyncReplicas::new();
+        // 0 replicas -> 0.
+        assert_eq!(in_sync.count(), 0);
+
+        // Replica A attaches IN SYNC (lag within the bound) -> counted, count 1.
+        let mut a_counted = false;
+        a_counted = in_sync.set_replica_in_sync(a_counted, true);
+        assert!(a_counted);
+        assert_eq!(in_sync.count(), 1);
+
+        // Idempotent: A stays in sync -> no double-count.
+        a_counted = in_sync.set_replica_in_sync(a_counted, true);
+        assert_eq!(in_sync.count(), 1);
+
+        // Replica B attaches but is LAGGING past max_lag -> NOT counted, count stays 1.
+        let mut b_counted = false;
+        b_counted = in_sync.set_replica_in_sync(b_counted, false);
+        assert!(!b_counted);
+        assert_eq!(in_sync.count(), 1);
+
+        // B catches up (now in sync) -> counted, count 2.
+        b_counted = in_sync.set_replica_in_sync(b_counted, true);
+        assert_eq!(in_sync.count(), 2);
+
+        // A falls out of sync (lag grew / link blipped) -> decremented, count 1.
+        a_counted = in_sync.set_replica_in_sync(a_counted, false);
+        assert!(!a_counted);
+        assert_eq!(in_sync.count(), 1);
+
+        // B disconnects while counted -> its contribution is dropped, count 0.
+        in_sync.replica_gone(b_counted);
+        assert_eq!(in_sync.count(), 0);
+
+        // A disconnects while NOT counted -> no underflow (no double-decrement).
+        in_sync.replica_gone(a_counted);
+        assert_eq!(in_sync.count(), 0);
     }
 }

@@ -76,7 +76,8 @@ pub use observer::{ReplObserver, ReplRing, StreamOp};
 
 pub mod lag;
 pub use lag::{
-    LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag, lag, replica_is_in_sync,
+    InSyncReplicas, LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag, lag,
+    replica_is_in_sync,
 };
 
 pub mod stream;

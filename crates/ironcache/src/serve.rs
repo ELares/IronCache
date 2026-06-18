@@ -237,6 +237,19 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
         None
     };
 
+    // The SOURCE-SIDE in-sync-replica COUNT (ADR-0026, the WRITE-SIDE `min-replicas-to-write`
+    // guardrail): one per node, shared by `Arc` onto every shard's context AND into the primary's
+    // per-replica serve tasks (which maintain it with lock-free per-connection deltas). `Some` ONLY
+    // in raft-governance mode (the same gate as `repl_status`), so the default static path carries
+    // `None` and the write path never even has a cell to read. It is a single `AtomicUsize` (no
+    // hot-path lock), node-level cold state, never touched per stored key. The WRITE path reads it
+    // ONLY when `min_replicas_to_write > 0`, so the default-disabled guardrail is byte-unchanged.
+    let in_sync_replicas: Option<Arc<ironcache_server::InSyncReplicas>> = if raft.is_some() {
+        Some(Arc::new(ironcache_server::InSyncReplicas::new()))
+    } else {
+        None
+    };
+
     // Static, cheaply-cloned server context shared by value onto each shard. The
     // mutable cross-shard state is ONLY the runtime cell (an Arc); the rest is
     // immutable, so cloning per shard does not violate shared-nothing.
@@ -273,6 +286,10 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
         // Arc onto every shard's context so any shard serving INFO / CLUSTER SHARDS reads the
         // same cell the repl tasks publish to.
         repl_status: repl_status.clone(),
+        // The source-side in-sync-replica count (ADR-0026 write-side guardrail), `Some` only in
+        // raft-mode. Cloned by Arc onto every shard's context (the write path reads it) AND handed
+        // to the per-replica serve tasks (which maintain it); the same cell, lock-free.
+        in_sync_replicas: in_sync_replicas.clone(),
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
@@ -1110,6 +1127,90 @@ where
     moved_if_unowned(map, first_slot, replica_serves)
 }
 
+/// THE WRITE-SIDE replication guardrail decision (ADR-0026, Redis `min-replicas-to-write`). Returns
+/// `Some(-NOREPLICAS)` when a WRITE to a slot THIS node owns must be REJECTED because fewer than
+/// `min_replicas_to_write` replicas are currently in sync, else `None` (the write proceeds).
+///
+/// The CALLER has already established `ctx.boot.min_replicas_to_write > 0` (the byte-unchanged
+/// short-circuit) and that the redirect returned `None` (so a keyed slot here is OWNED, not foreign
+/// / read-replica-served). This function applies the remaining gates and is otherwise a PURE
+/// decision over the context + the parsed request (it reads only the count atomic + the slot map +
+/// the registry `is_write` bit; no store, no time, no rand):
+///
+/// 1. ONLY WRITES: a read command is never blocked (`is_write` from the #89 registry). An unknown
+///    command is conservatively a write, but the redirect already passed it, so it is keyless/admin
+///    (gate 3 then exempts it).
+/// 2. ONLY in raft-mode with the count cell present (`ctx.in_sync_replicas` is `Some` iff raft-mode,
+///    the same gate the cell is created under). `None` -> no guardrail (defensive; the caller's
+///    `> 0` gate plus a static node having no cell already excludes this).
+/// 3. ONLY OWNED KEYED slots: a keyless / admin / whole-keyspace command carries no slot, so it is
+///    EXEMPT (Redis gates `min-replicas-to-write` on the per-command `is-write` + a key; a keyless
+///    admin write like FLUSHALL is not slot-replicated through this path). A keyed command's slot is
+///    resolved via the CLIENT-VISIBLE `key_slot`; the redirect guarantees this node OWNS it.
+/// 4. THE QUORUM: reject when the in-sync replica count (`InSyncReplicas::count`, ONE relaxed load)
+///    is BELOW `min_replicas_to_write`.
+fn write_guardrail(
+    ctx: &ServerContext,
+    route: route::CommandClass,
+    cmd_upper: &[u8],
+    request: &Request,
+) -> Option<ironcache_protocol::ErrorReply> {
+    // (1) ONLY WRITES. A read is never blocked.
+    if !ironcache_server::command_spec::is_write(cmd_upper) {
+        return None;
+    }
+    // (2) The count cell exists ONLY in raft-mode (the same gate it is created under). Without it
+    // there is no replication to gate on, so the guardrail does not apply.
+    let in_sync = ctx.in_sync_replicas.as_deref()?;
+
+    // (3) ONLY a KEYED slot this node OWNS. A keyless / admin / whole-keyspace command carries no
+    // routable slot, so it is exempt (mirrors `cluster_redirect`'s keyless exemption). For a keyed
+    // command we resolve its CLIENT-VISIBLE slot; the redirect already ensured this node owns it
+    // (a foreign slot returned MOVED above and never reaches here), so an owned keyed write is the
+    // only case that proceeds to the quorum check.
+    let has_owned_keyed_slot = match route {
+        route::CommandClass::KeyedSingle => route::single_key(request).is_some(),
+        route::CommandClass::KeyedMulti => {
+            // A multi-key write co-locates on one owned slot (CROSSSLOT was rejected by the redirect
+            // above), so the presence of any key means an owned keyed slot is being written.
+            !matches!(
+                route::command_keys(cmd_upper, request),
+                route::KeySpec::None
+            )
+        }
+        // No slot: keyless / admin / whole-keyspace writes are exempt (not slot-replicated here).
+        route::CommandClass::AlwaysHome | route::CommandClass::WholeKeyspace => false,
+    };
+    if !has_owned_keyed_slot {
+        return None;
+    }
+
+    // (4) THE QUORUM: reject when too few replicas are currently in sync. ONE relaxed atomic load,
+    // delegated to the pure decision so the gate is unit-testable without a ServerContext.
+    write_guardrail_decision(ctx.boot.min_replicas_to_write, in_sync.count())
+}
+
+/// THE PURE write-side quorum decision (ADR-0026), split out of [`write_guardrail`] so the
+/// reject/allow rule is unit-testable over plain values (no `ServerContext`, no atomics, no I/O).
+/// Returns `Some(-NOREPLICAS)` when the live `in_sync_count` is BELOW the required
+/// `min_replicas_to_write`, else `None` (the write proceeds). The CALLER has already applied the
+/// is-write / owned-keyed-slot / raft-mode gates; this is only the final count compare.
+///
+/// `min_required == 0` would never reach here (the hot-path caller short-circuits on `> 0` before
+/// touching the count), but it is handled correctly anyway: `count >= 0` always holds, so it
+/// returns `None` (allow), which is the byte-unchanged default.
+#[must_use]
+fn write_guardrail_decision(
+    min_required: u32,
+    in_sync_count: usize,
+) -> Option<ironcache_protocol::ErrorReply> {
+    if (in_sync_count as u64) < u64::from(min_required) {
+        Some(ironcache_protocol::ErrorReply::no_replicas())
+    } else {
+        None
+    }
+}
+
 /// The outcome of the HA-6 migration redirect decision for one slot's keys. Distinct from a bare
 /// `Option<ErrorReply>` so the "serve locally" outcome (None reply) is explicit and cannot be
 /// confused with "not migrating, fall through to the static decision".
@@ -1610,6 +1711,28 @@ async fn route_and_dispatch(
             encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
             // Short-circuit WITHOUT closing the connection (same as the WATCH guard above):
             // the client keeps the connection and retries at the redirect target.
+            return false;
+        }
+    }
+
+    // WRITE-SIDE REPLICATION GUARDRAIL (ADR-0026, Redis `min-replicas-to-write`). After the
+    // redirect above returned `None` (so this node OWNS the keyed slot, or the command is
+    // keyless/admin), an owned WRITE is REJECTED with `-NOREPLICAS Not enough good replicas to
+    // write.` when too few replicas are currently in sync -- so an ACKNOWLEDGED write is known to
+    // be on at least `min_replicas_to_write` replicas, bounding the failover loss window.
+    //
+    // BYTE-UNCHANGED at the default: the FIRST gate is `min_replicas_to_write > 0`. With the
+    // guardrail at its default-disabled 0 this whole block short-circuits BEFORE touching the
+    // count atomic, the map, or `is_write` -- the write hot path is byte-identical to before. The
+    // check applies ONLY to WRITES (`is_write`), ONLY to slots this node OWNS (the redirect already
+    // sent foreign / read-replica-served slots away), and ONLY in raft-mode (the count cell is
+    // `Some` only there). Reads are never blocked.
+    if ctx.boot.min_replicas_to_write > 0 {
+        if let Some(reply) = write_guardrail(ctx, route, &cmd_upper, request) {
+            state_rc.borrow_mut().counters.on_command();
+            encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
+            // Short-circuit WITHOUT closing the connection: the client may retry once enough
+            // replicas are back in sync (the same non-closing contract as the redirect above).
             return false;
         }
     }
@@ -3368,6 +3491,118 @@ mod tests {
             None,
             "an owned single-key command proceeds (no redirect)"
         );
+    }
+
+    // ----- WRITE-SIDE replication guardrail (ADR-0026, min-replicas-to-write) -----
+
+    /// The PURE quorum decision: reject `-NOREPLICAS` only when the in-sync count is BELOW the
+    /// required minimum; otherwise allow. This is the count-compare heart of `write_guardrail`.
+    #[test]
+    fn write_guardrail_decision_rejects_below_quorum() {
+        // min_replicas_to_write = 0 (disabled) ALWAYS allows, regardless of the count -- this is
+        // the byte-unchanged default (the hot-path caller never even reaches here at 0).
+        assert_eq!(write_guardrail_decision(0, 0), None);
+        assert_eq!(write_guardrail_decision(0, 5), None);
+
+        // min = 1: 0 in-sync replicas -> NOREPLICAS; 1 (or more) in sync -> allow.
+        let reply = write_guardrail_decision(1, 0).expect("0 in-sync < 1 required -> reject");
+        assert_eq!(
+            reply.line(),
+            "-NOREPLICAS Not enough good replicas to write."
+        );
+        assert_eq!(write_guardrail_decision(1, 1), None);
+        assert_eq!(write_guardrail_decision(1, 2), None);
+
+        // min = 2: 1 in sync is still below quorum (reject); 2 meets it (allow).
+        assert!(write_guardrail_decision(2, 1).is_some());
+        assert_eq!(write_guardrail_decision(2, 2), None);
+    }
+
+    /// The FULL `write_guardrail`: a WRITE to an OWNED slot below quorum is `-NOREPLICAS`; the
+    /// same write WITH the quorum met is allowed; a READ is NEVER blocked even below quorum; a
+    /// keyless/admin command is exempt. Drives the real function with a constructed context.
+    #[test]
+    fn write_guardrail_blocks_owned_writes_only() {
+        let key = key_in_slot_range(0, 8191); // owned by self (node A) in the redirect map.
+
+        // A context with the guardrail enabled (min_replicas_to_write = 1) and ZERO in-sync
+        // replicas: an owned WRITE must be rejected.
+        let ctx_no_replica = guardrail_ctx(1, 0);
+        let set_req = rreq(&[b"SET", key.as_bytes(), b"v"]);
+        let reply = write_guardrail(&ctx_no_replica, route::classify(b"SET"), b"SET", &set_req)
+            .expect("an owned write with 0 in-sync replicas is rejected");
+        assert_eq!(
+            reply.line(),
+            "-NOREPLICAS Not enough good replicas to write."
+        );
+
+        // A READ is never blocked, even with 0 in-sync replicas.
+        let get_req = rreq(&[b"GET", key.as_bytes()]);
+        assert_eq!(
+            write_guardrail(&ctx_no_replica, route::classify(b"GET"), b"GET", &get_req),
+            None,
+            "a read is never blocked by the write-side guardrail"
+        );
+
+        // A keyless / admin write (PING is AlwaysHome) carries no slot -> exempt.
+        let ping_req = rreq(&[b"PING"]);
+        assert_eq!(
+            write_guardrail(
+                &ctx_no_replica,
+                route::classify(b"PING"),
+                b"PING",
+                &ping_req
+            ),
+            None,
+            "a keyless command is exempt (no replicated slot)"
+        );
+
+        // With ONE in-sync replica, the SAME owned write is allowed (quorum met).
+        let ctx_one_replica = guardrail_ctx(1, 1);
+        assert_eq!(
+            write_guardrail(&ctx_one_replica, route::classify(b"SET"), b"SET", &set_req),
+            None,
+            "an owned write with the quorum met proceeds"
+        );
+    }
+
+    /// Build a minimal raft-mode `ServerContext` for the guardrail tests: the write-side knobs set
+    /// to `min_required`, the in-sync count cell seeded to `count`, and a cluster map where self
+    /// owns the low half (so a low-half key is OWNED). Only the fields the guardrail reads matter.
+    fn guardrail_ctx(min_required: u32, count: usize) -> ServerContext {
+        use std::sync::Arc;
+        let in_sync = Arc::new(ironcache_server::InSyncReplicas::new());
+        for _ in 0..count {
+            in_sync.set_replica_in_sync(false, true);
+        }
+        let boot = ironcache_config::Config {
+            cluster_enabled: true,
+            cluster_mode: ironcache_config::ClusterMode::Raft,
+            min_replicas_to_write: min_required,
+            min_replicas_max_lag: 10,
+            ..ironcache_config::Config::default()
+        };
+        ServerContext {
+            runtime: ironcache_config::RuntimeConfig::from_config(&boot),
+            databases: boot.databases,
+            shards: 1,
+            info: ServerInfo {
+                tcp_port: 7001,
+                shards: 1,
+                pid: 1,
+                started_at: ironcache_env::Monotonic::ZERO,
+                maxmemory: 0,
+                maxmemory_policy: "allkeys-lru",
+                mem_allocator: "test",
+                cluster_node_id: RID_A,
+                cluster_enabled: true,
+            },
+            cluster: Some(std::sync::Arc::new(redirect_map())),
+            raft: None,
+            repl_status: Some(Arc::new(ironcache_server::ReplNodeStatus::new())),
+            in_sync_replicas: Some(in_sync),
+            boot,
+        }
     }
 
     #[test]

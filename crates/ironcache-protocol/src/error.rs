@@ -73,6 +73,11 @@ pub enum ErrorCode {
     /// side, so the client is asked to retry shortly (the migration will converge). Verified against
     /// redis/redis `src/cluster.c` (`"-TRYAGAIN Multiple keys request during rehashing of slot"`).
     TryAgain,
+    /// `-NOREPLICAS Not enough good replicas to write.` (ADR-0026, the WRITE-SIDE replication
+    /// guardrail): a `min-replicas-to-write` owner rejects a write because fewer than the required
+    /// number of replicas are currently in sync. Verified against redis/redis `src/server.c`
+    /// (`shared.noreplicaserr`, `"-NOREPLICAS Not enough good replicas to write."`).
+    NoReplicas,
 }
 
 impl ErrorCode {
@@ -96,6 +101,7 @@ impl ErrorCode {
             ErrorCode::ClusterDown => "CLUSTERDOWN",
             ErrorCode::Ask => "ASK",
             ErrorCode::TryAgain => "TRYAGAIN",
+            ErrorCode::NoReplicas => "NOREPLICAS",
         }
     }
 }
@@ -1069,6 +1075,20 @@ impl ErrorReply {
     pub fn clusterdown(message: impl Into<String>) -> Self {
         ErrorReply::new(ErrorCode::ClusterDown, message)
     }
+
+    /// `-NOREPLICAS Not enough good replicas to write.` - the WRITE-SIDE replication guardrail
+    /// reply (Redis `min-replicas-to-write`, ADR-0026): an owner rejects a write because fewer
+    /// than `min-replicas-to-write` replicas are currently in sync (lag within
+    /// `min-replicas-max-lag`), so an acknowledged write is known to be on at least that many
+    /// replicas (bounding the failover loss window).
+    ///
+    /// Byte-exact to redis/redis `src/server.c` (`shared.noreplicaserr`,
+    /// `"-NOREPLICAS Not enough good replicas to write."`): the leading NOREPLICAS token and the
+    /// trailing period are part of the contract. Clients pattern-match the NOREPLICAS token.
+    #[must_use]
+    pub fn no_replicas() -> Self {
+        ErrorReply::new(ErrorCode::NoReplicas, "Not enough good replicas to write.")
+    }
 }
 
 /// Truncate a `&str` to at most `max` bytes without splitting a UTF-8 char (so
@@ -1331,6 +1351,17 @@ mod tests {
         assert_eq!(e.line(), "-CLUSTERDOWN Hash slot not served");
         assert_eq!(e.code(), ErrorCode::ClusterDown);
         assert_eq!(ErrorCode::ClusterDown.token(), "CLUSTERDOWN");
+    }
+
+    #[test]
+    fn no_replicas_is_byte_exact() {
+        // Verified against redis/redis src/server.c (shared.noreplicaserr): the write-side
+        // replication guardrail reply (min-replicas-to-write). The leading NOREPLICAS token and
+        // the trailing period are part of the contract; clients pattern-match the token.
+        let e = ErrorReply::no_replicas();
+        assert_eq!(e.line(), "-NOREPLICAS Not enough good replicas to write.");
+        assert_eq!(e.code(), ErrorCode::NoReplicas);
+        assert_eq!(ErrorCode::NoReplicas.token(), "NOREPLICAS");
     }
 
     #[test]
