@@ -63,7 +63,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use ironcache_raft::{ConfigCmd, EntryPayload, LogEntry, NodeId, RaftStorage};
+use ironcache_raft::{ConfigCmd, EntryPayload, LogEntry, NodeId, RaftStorage, SnapshotMeta};
 
 // Record-kind discriminants (the first body byte). Distinct value space from the wire
 // codec's message discriminants; these tag a PERSISTED MUTATION, not a wire message.
@@ -474,9 +474,43 @@ struct Mirror {
     current_term: u64,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
+    /// The 1-based index of `log[0]` once a compaction has dropped a prefix (Raft
+    /// section 7), mirroring [`MemStorage`](ironcache_raft::MemStorage)'s `log_start`.
+    /// `0` means "no compaction" (the log is whole, starting at index 1). Recovered on
+    /// reopen from the persisted snapshot's `last_included_index + 1`.
+    log_start: u64,
+    /// The most recent snapshot's metadata, if any. Its `last_included_term` is what
+    /// `term_at(last_included_index)` answers once the underlying entry is compacted.
+    snap_meta: Option<SnapshotMeta>,
+    /// The most recent snapshot's serialized state-machine bytes, if any.
+    snap_data: Vec<u8>,
 }
 
 impl Mirror {
+    /// The 1-based index of `log[0]` (Raft section 7 compaction). With no compaction
+    /// (`log_start == 0`) the log starts at index 1.
+    #[inline]
+    fn start(&self) -> u64 {
+        if self.log_start == 0 {
+            1
+        } else {
+            self.log_start
+        }
+    }
+
+    /// The vec position of 1-based `index`, or `None` if below the compacted start or
+    /// past the end.
+    #[inline]
+    fn pos_of(&self, index: u64) -> Option<usize> {
+        let start = self.start();
+        if index < start {
+            return None;
+        }
+        usize::try_from(index - start)
+            .ok()
+            .filter(|&p| p < self.log.len())
+    }
+
     /// Apply one record to the mirror, exactly as the corresponding mutating method
     /// does. This is the single place replay and the live mutators agree, so the
     /// rebuilt-from-disk mirror is byte-identical to the live one.
@@ -484,15 +518,32 @@ impl Mirror {
         match record {
             Record::SetTerm(term) => self.current_term = term,
             Record::SetVote(vote) => self.voted_for = vote,
-            Record::AppendEntry(entry) => self.log.push(entry),
+            // FIX 1 (snapshot-aware replay): DROP an entry that is BELOW the compacted
+            // start. After `save_snapshot` writes the `.snap` sidecar at index K but BEFORE
+            // `compact_log_to` physically rewrites the log, a crash leaves the sidecar PLUS
+            // the full pre-compaction log on disk. On reopen, `open` seeds `log_start = K+1`
+            // from the sidecar (BEFORE replay), so this guard skips the now-compacted prefix
+            // (entries 1..=K) and only pushes entries at-or-above `start()`. Without it, the
+            // prefix would land at `log[0]` while `log_start == K+1`, so `pos_of(K+1) == 0`
+            // would return the WRONG entry (index 1) and `apply_committed` would apply the
+            // wrong entry -- silent committed-state corruption. A live append (the only other
+            // `apply` caller) is always at-or-above `start()`, so the guard is inert there
+            // and the threshold-0 / no-sidecar path stays byte-identical (start() == 1, so
+            // nothing is ever dropped).
+            Record::AppendEntry(entry) => {
+                if entry.index >= self.start() {
+                    self.log.push(entry);
+                }
+            }
             Record::Truncate(index) => {
-                // Drop entries with entry.index >= index. index <= 1 clears the whole
-                // log (index 0 sentinel, index 1 first real entry); an index past the
-                // end truncates nothing. Same rule as MemStorage::truncate_from.
-                let keep = if index <= 1 {
+                // Drop entries with entry.index >= index. index at/below the compacted
+                // start clears the whole surviving log; an index past the end truncates
+                // nothing. Same rule as MemStorage::truncate_from over a compacted log.
+                let start = self.start();
+                let keep = if index <= start {
                     0
                 } else {
-                    usize::try_from(index - 1).unwrap_or(usize::MAX)
+                    usize::try_from(index - start).unwrap_or(usize::MAX)
                 };
                 if keep < self.log.len() {
                     self.log.truncate(keep);
@@ -524,6 +575,28 @@ pub struct FileStorage {
     mirror: Mirror,
 }
 
+/// The filesystem suffix for a node's snapshot sidecar file (Raft section 7). The
+/// snapshot lives BESIDE the record log (`<log>.snap`), so it can be written + fsync'd
+/// independently and the log can then be physically rewritten to drop the compacted
+/// prefix without losing the snapshot.
+///
+/// DATA_DIR CO-LOCATION (FIX 4): the sidecar path is derived purely from the record-log
+/// path (`<log>.snap`), and the log path is `raft_log_path(data_dir, port)` -- so when a
+/// `data_dir` is configured the sidecar lands at
+/// `<data_dir>/ironcache-raft-<port>.log.snap` (durable across a `/tmp`-clearing reboot,
+/// right next to its log), and when `data_dir` is unset it stays beside the temp-dir log
+/// (the byte-unchanged default). There is no separate temp-dir fallback for the sidecar.
+///
+/// STALE-SIDECAR CAVEAT (FIX 4): the "threshold-0 == byte-identical" property holds only
+/// when NO `.snap` sidecar pre-exists. A node that ran with compaction ON (a non-zero
+/// `snapshot_threshold`) leaves a sidecar on disk; if it then restarts at threshold 0, the
+/// sidecar is STILL loaded, so `load_snapshot()` is `Some` and the leader's
+/// `send_append_entries_to` can still take the InstallSnapshot branch for a far-behind
+/// peer. That is correct (the snapshot is a valid committed prefix), just not the
+/// pristine no-snapshot path. Removing the sidecar is what truly resets to the pre-3c
+/// shape.
+const SNAPSHOT_SUFFIX: &str = ".snap";
+
 impl FileStorage {
     /// Open (creating if absent) the record log at `path` and REPLAY it to recover the
     /// persisted Raft state.
@@ -549,7 +622,20 @@ impl FileStorage {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
 
-        let (mirror, good_len) = replay(&bytes);
+        // RECOVER THE SNAPSHOT FIRST (Raft section 7): if the sidecar holds a valid
+        // snapshot, seed the mirror's snapshot + `log_start` from it BEFORE replaying the
+        // log, so the surviving log tail (the records still in the file after the last
+        // compaction) is positioned just above `last_included_index`. A torn / absent
+        // sidecar yields no snapshot (the whole-log path, byte-identical to pre-3c).
+        let snapshot = load_snapshot_file(&snapshot_path(&path))?;
+        let mut seed = Mirror::default();
+        if let Some((meta, data)) = snapshot {
+            seed.log_start = meta.last_included_index + 1;
+            seed.snap_meta = Some(meta);
+            seed.snap_data = data;
+        }
+
+        let (mirror, good_len) = replay_into(seed, &bytes);
 
         // If a torn / partial tail was found, physically truncate the file to the last
         // good offset so future appends are clean and a re-open sees no torn record.
@@ -567,6 +653,101 @@ impl FileStorage {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Persist a snapshot (Raft section 7): write it to a sidecar `.snap` file
+    /// ATOMICALLY (write a `.snap.tmp`, fsync it, rename over the real path) and update
+    /// the mirror's in-memory snapshot. The atomic rename means a crash mid-write leaves
+    /// either the old snapshot or the new one, never a torn one, so a reopen always loads
+    /// a consistent snapshot. The log file is UNTOUCHED here; compaction
+    /// ([`compact_log_to`](FileStorage::compact_log_to)) drops the redundant log prefix
+    /// in a separate, idempotent step, so a crash between the two is safe (the worst case
+    /// is a snapshot plus a log that still holds the snapshotted prefix, which replay
+    /// reconciles).
+    fn persist_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) -> io::Result<()> {
+        let snap_path = snapshot_path(&self.path);
+        let tmp_path = {
+            let mut p = snap_path.clone().into_os_string();
+            p.push(".tmp");
+            PathBuf::from(p)
+        };
+        let frame = encode_snapshot_frame(meta, data);
+        {
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp.write_all(&frame)?;
+            tmp.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &snap_path)?;
+        // Mirror the snapshot in memory (reads serve from the mirror).
+        self.mirror.snap_meta = Some(meta);
+        self.mirror.snap_data = data.to_vec();
+        Ok(())
+    }
+
+    /// Compact the log to `index` (Raft section 7): drop every entry with index `<=
+    /// index` from the mirror, then PHYSICALLY REWRITE the on-disk log so it holds only
+    /// the surviving suffix (plus the term + vote, re-stated as records so a fresh reopen
+    /// recovers them). The rewrite goes through a `.tmp` + atomic rename, so a crash
+    /// leaves either the pre-compaction log or the compacted one. On reopen the snapshot
+    /// sidecar supplies `log_start`, so the rewritten suffix lines up just above
+    /// `last_included_index`. An `index` below the current start (a stale / duplicate
+    /// compaction) is a no-op. The caller persists the snapshot FIRST, so the dropped
+    /// prefix is always recoverable from it.
+    fn compact_log_to(&mut self, index: u64) -> io::Result<()> {
+        let start = self.mirror.start();
+        if index < start || index == 0 {
+            return Ok(());
+        }
+        // Drop the prefix from the mirror (entries with index in [start, index]).
+        let drop = usize::try_from(index - start + 1).unwrap_or(usize::MAX);
+        let drop = drop.min(self.mirror.log.len());
+        self.mirror.log.drain(..drop);
+        self.mirror.log_start = index + 1;
+
+        // Rebuild the on-disk log from the surviving mirror state: term, vote, then the
+        // surviving entries. This is the ONE place the append-only file is rewritten; it
+        // is safe because the snapshot already holds the dropped prefix and the rewrite
+        // is atomic (tmp + rename).
+        let mut records: Vec<Record> = Vec::with_capacity(self.mirror.log.len() + 2);
+        records.push(Record::SetTerm(self.mirror.current_term));
+        records.push(Record::SetVote(self.mirror.voted_for));
+        for entry in &self.mirror.log {
+            records.push(Record::AppendEntry(entry.clone()));
+        }
+        let mut buf = Vec::new();
+        for record in &records {
+            buf.extend_from_slice(&encode_frame(record));
+        }
+
+        let tmp_path = {
+            let mut p = self.path.clone().into_os_string();
+            p.push(".compact.tmp");
+            PathBuf::from(p)
+        };
+        {
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp.write_all(&buf)?;
+            tmp.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &self.path)?;
+        // Reopen the (now rewritten) log file for appends, positioned at the end.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)?;
+        file.seek(SeekFrom::End(0))?;
+        self.file = file;
+        Ok(())
     }
 
     /// Append one framed record to the file, fsync, then apply it to the mirror.
@@ -604,15 +785,26 @@ impl FileStorage {
     }
 }
 
-/// Replay raw file bytes into a [`Mirror`], returning the rebuilt mirror and the byte
-/// length of the VALID prefix (the offset just past the last good record).
+/// Replay raw file bytes into a fresh (default) [`Mirror`]. The no-snapshot entry
+/// point used by the frame round-trip test; the live [`FileStorage::open`] path uses
+/// [`replay_into`] with a snapshot-seeded mirror.
+#[cfg(test)]
+fn replay(bytes: &[u8]) -> (Mirror, usize) {
+    replay_into(Mirror::default(), bytes)
+}
+
+/// Replay raw log-file bytes into `seed` (a mirror pre-seeded with the recovered
+/// snapshot + `log_start`), returning the rebuilt mirror and the byte length of the
+/// VALID prefix (the offset just past the last good record).
 ///
 /// Stops at the first torn / invalid record: a header shorter than 8 bytes, a body
 /// shorter than its declared length, a CRC mismatch, or a body that does not decode to
 /// a known record. The returned length is where the file should be truncated so the
-/// torn tail is discarded.
-fn replay(bytes: &[u8]) -> (Mirror, usize) {
-    let mut mirror = Mirror::default();
+/// torn tail is discarded. Seeding (rather than starting from `Mirror::default`) is how
+/// a compacted log's surviving suffix lines up just above the snapshot's
+/// `last_included_index` (Raft section 7).
+fn replay_into(seed: Mirror, bytes: &[u8]) -> (Mirror, usize) {
+    let mut mirror = seed;
     let mut pos = 0usize;
     loop {
         // Need a full fixed header (u32 len + u32 crc) to even know the body length.
@@ -653,6 +845,79 @@ fn replay(bytes: &[u8]) -> (Mirror, usize) {
     (mirror, pos)
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot sidecar file (Raft section 7).
+// ---------------------------------------------------------------------------
+
+/// The snapshot sidecar path for a given log path (`<log>.snap`).
+fn snapshot_path(log_path: &Path) -> PathBuf {
+    let mut p = log_path.to_path_buf().into_os_string();
+    p.push(SNAPSHOT_SUFFIX);
+    PathBuf::from(p)
+}
+
+/// Frame a snapshot for the sidecar file: the SAME `[u32 body_len][u32 crc32(body)][body]`
+/// framing as a log record, where `body` is `[u64 last_included_index][u64
+/// last_included_term][blob data]`. The CRC lets a reopen reject a torn snapshot (a crash
+/// mid-write, though the atomic rename normally prevents that) and fall back to no
+/// snapshot rather than fabricating one.
+fn encode_snapshot_frame(meta: SnapshotMeta, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(16 + data.len());
+    put_u64(&mut body, meta.last_included_index);
+    put_u64(&mut body, meta.last_included_term);
+    put_blob(&mut body, data);
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
+    let body_len = u32::try_from(body.len()).expect("a snapshot body fits in u32");
+    frame.extend_from_slice(&body_len.to_le_bytes());
+    frame.extend_from_slice(&crc32(&body).to_le_bytes());
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Load the snapshot sidecar at `path`, returning its `(meta, data)` or `None` if the
+/// file is absent, empty, or torn (a CRC mismatch / short body / structurally invalid
+/// body). A torn snapshot recovers as "no snapshot" rather than an error, so a node
+/// boots from the log alone, exactly the pre-3c behaviour.
+fn load_snapshot_file(path: &Path) -> io::Result<Option<(SnapshotMeta, Vec<u8>)>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if bytes.len() < FRAME_HEADER_LEN {
+        return Ok(None);
+    }
+    let body_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let stored_crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let Some(body_end) = FRAME_HEADER_LEN.checked_add(body_len) else {
+        return Ok(None);
+    };
+    if body_end > bytes.len() {
+        return Ok(None);
+    }
+    let body = &bytes[FRAME_HEADER_LEN..body_end];
+    if crc32(body) != stored_crc {
+        return Ok(None);
+    }
+    let mut cur = Cursor::new(body);
+    let (Some(last_included_index), Some(last_included_term)) = (cur.u64(), cur.u64()) else {
+        return Ok(None);
+    };
+    let Some(data) = cur.blob() else {
+        return Ok(None);
+    };
+    if !cur.at_end() {
+        return Ok(None);
+    }
+    Ok(Some((
+        SnapshotMeta {
+            last_included_index,
+            last_included_term,
+        },
+        data,
+    )))
+}
+
 impl RaftStorage for FileStorage {
     fn current_term(&self) -> u64 {
         self.mirror.current_term
@@ -673,11 +938,17 @@ impl RaftStorage for FileStorage {
     }
 
     fn last_log_index(&self) -> u64 {
-        self.mirror.log.last().map_or(0, |e| e.index)
+        self.mirror.log.last().map_or_else(
+            || self.mirror.snap_meta.map_or(0, |m| m.last_included_index),
+            |e| e.index,
+        )
     }
 
     fn last_log_term(&self) -> u64 {
-        self.mirror.log.last().map_or(0, |e| e.term)
+        self.mirror.log.last().map_or_else(
+            || self.mirror.snap_meta.map_or(0, |m| m.last_included_term),
+            |e| e.term,
+        )
     }
 
     fn append(&mut self, entry: LogEntry) {
@@ -691,21 +962,27 @@ impl RaftStorage for FileStorage {
             // AppendEntries rule 2), same as MemStorage.
             return 0;
         }
-        usize::try_from(index - 1)
-            .ok()
-            .and_then(|pos| self.mirror.log.get(pos))
-            .map_or(0, |e| e.term)
+        // A snapshot answers the term at its last_included_index even after the entry
+        // was compacted away (Raft section 7).
+        if let Some(meta) = self.mirror.snap_meta {
+            if index == meta.last_included_index {
+                return meta.last_included_term;
+            }
+        }
+        self.mirror
+            .pos_of(index)
+            .map_or(0, |pos| self.mirror.log[pos].term)
     }
 
     fn entries_from(&self, index: u64) -> Vec<LogEntry> {
-        let start = if index <= 1 {
-            0
-        } else {
-            usize::try_from(index - 1).unwrap_or(usize::MAX)
+        let start = self.mirror.start();
+        let from = index.max(start);
+        let Ok(pos) = usize::try_from(from - start) else {
+            return Vec::new();
         };
         self.mirror
             .log
-            .get(start..)
+            .get(pos..)
             .map_or_else(Vec::new, <[LogEntry]>::to_vec)
     }
 
@@ -730,10 +1007,29 @@ impl RaftStorage for FileStorage {
         if index == 0 {
             return None;
         }
-        usize::try_from(index - 1)
-            .ok()
-            .and_then(|pos| self.mirror.log.get(pos))
-            .cloned()
+        self.mirror
+            .pos_of(index)
+            .map(|pos| self.mirror.log[pos].clone())
+    }
+
+    fn save_snapshot(&mut self, meta: SnapshotMeta, data: &[u8]) {
+        self.persist_snapshot(meta, data)
+            .expect("FileStorage: fsync snapshot to stable storage");
+    }
+
+    fn load_snapshot(&self) -> Option<(SnapshotMeta, Vec<u8>)> {
+        self.mirror
+            .snap_meta
+            .map(|meta| (meta, self.mirror.snap_data.clone()))
+    }
+
+    fn compact_to(&mut self, index: u64) {
+        self.compact_log_to(index)
+            .expect("FileStorage: rewrite compacted log to stable storage");
+    }
+
+    fn log_start_index(&self) -> u64 {
+        self.mirror.start()
     }
 }
 
@@ -1091,6 +1387,232 @@ mod tests {
         );
 
         cleanup(&path);
+    }
+
+    #[test]
+    fn snapshot_save_load_and_compaction_survive_reopen() {
+        // HA-3c: a FileStorage saves a snapshot, compacts the log below it, and on reopen
+        // recovers the snapshot + the surviving log tail with term_at(last_included_index)
+        // answered from the snapshot meta. Also clean up the sidecar.
+        let path = fresh_path("snapshot_save_load_and_compaction_survive_reopen");
+        let snap = snapshot_path(&path);
+        let _ = std::fs::remove_file(&snap);
+
+        let meta = SnapshotMeta {
+            last_included_index: 3,
+            last_included_term: 2,
+        };
+        let data = b"committed-config-snapshot-bytes".to_vec();
+        let tail = vec![
+            LogEntry {
+                term: 2,
+                index: 4,
+                payload: EntryPayload::Bytes(b"tail-4".to_vec()),
+            },
+            LogEntry {
+                term: 3,
+                index: 5,
+                payload: EntryPayload::Bytes(b"tail-5".to_vec()),
+            },
+        ];
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            s.set_current_term(3);
+            s.set_voted_for(Some(NodeId(2)));
+            // Append entries 1..=5, then snapshot at 3 and compact to 3. Entries 1..=3 are
+            // term 2 (subsumed by the snapshot), the tail (4,5) is what `tail` declares.
+            for i in 1..=3u64 {
+                s.append(LogEntry {
+                    term: 2,
+                    index: i,
+                    payload: EntryPayload::Noop,
+                });
+            }
+            for entry in &tail {
+                s.append(entry.clone());
+            }
+            s.save_snapshot(meta, &data);
+            s.compact_to(3);
+            // Post-compaction in-memory checks: the prefix is gone, the tail survives, and
+            // term_at(3) is answered by the snapshot meta even though entry 3 is compacted.
+            assert_eq!(s.log_start_index(), 4);
+            assert_eq!(s.entry_at(3), None, "compacted entry is gone");
+            assert_eq!(
+                s.term_at(3),
+                2,
+                "snapshot answers term at last_included_index"
+            );
+            assert_eq!(s.entries_from(4), tail);
+            assert_eq!(s.last_log_index(), 5);
+        }
+
+        // Reopen: the snapshot + the surviving tail recover; the compacted prefix stays gone.
+        let s = FileStorage::open(&path).expect("reopen recovers");
+        assert_eq!(s.current_term(), 3);
+        assert_eq!(s.voted_for(), Some(NodeId(2)));
+        let (loaded_meta, loaded_data) = s.load_snapshot().expect("snapshot recovered");
+        assert_eq!(loaded_meta, meta);
+        assert_eq!(loaded_data, data);
+        assert_eq!(
+            s.log_start_index(),
+            4,
+            "log starts above the snapshot after reopen"
+        );
+        assert_eq!(
+            s.entry_at(3),
+            None,
+            "the compacted prefix stays gone after reopen"
+        );
+        assert_eq!(
+            s.term_at(3),
+            2,
+            "term_at(last_included_index) survives reopen"
+        );
+        assert_eq!(s.entries_from(4), tail, "the surviving tail recovers");
+        assert_eq!(s.last_log_index(), 5);
+
+        cleanup(&path);
+        let _ = std::fs::remove_file(&snap);
+    }
+
+    #[test]
+    fn crash_in_save_compact_window_replays_without_log_start_desync() {
+        // FIX 1: `maybe_compact` does `save_snapshot` (writes the `.snap` sidecar) THEN
+        // `compact_to` (rewrites the log). A crash BETWEEN them leaves the sidecar at index
+        // K PLUS the FULL, un-rewritten pre-compaction log (entries 1..N) on disk. On reopen
+        // `open` seeds `log_start = K+1` from the sidecar, but a NON-snapshot-aware replay
+        // would push ALL of 1..N so `log[0].index == 1` while `log_start == K+1`, making
+        // `pos_of(K+1) == 0` return the WRONG entry (index 1) and corrupting the next apply.
+        //
+        // We reproduce the exact on-disk shape: a full log 1..=6 (NEVER compacted), then a
+        // hand-written `.snap` sidecar at K=3, then reopen and assert the surviving tail
+        // lines up correctly (no double-apply, no wrong entry at the boundary).
+        let path = fresh_path("crash_in_save_compact_window_replays_without_log_start_desync");
+        let snap = snapshot_path(&path);
+        let _ = std::fs::remove_file(&snap);
+
+        // Distinct payloads per index so a wrong-entry read is unambiguous.
+        let entry = |i: u64| LogEntry {
+            term: 2,
+            index: i,
+            payload: EntryPayload::Bytes(format!("entry-{i}").into_bytes()),
+        };
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            s.set_current_term(2);
+            s.set_voted_for(Some(NodeId(1)));
+            for i in 1..=6u64 {
+                s.append(entry(i));
+            }
+            // CRUCIALLY: do NOT call compact_to. The log on disk holds the FULL 1..=6.
+        }
+
+        // Write the `.snap` sidecar at K=3 directly (the save_snapshot half that survived a
+        // crash before the compact_to rewrite). Its bytes are irrelevant to the log desync.
+        {
+            let meta = SnapshotMeta {
+                last_included_index: 3,
+                last_included_term: 2,
+            };
+            let frame = encode_snapshot_frame(meta, b"committed-prefix-snapshot");
+            std::fs::write(&snap, frame).expect("write the surviving sidecar");
+        }
+
+        // Reopen: the sidecar seeds log_start = 4 BEFORE replay; the FIX 1 guard drops the
+        // now-compacted prefix (entries 1..=3) and keeps only the tail 4..=6.
+        let s = FileStorage::open(&path).expect("reopen reconciles the crash-window state");
+        assert_eq!(
+            s.log_start_index(),
+            4,
+            "log_start comes from the sidecar (K+1)"
+        );
+        // The boundary read is the CORRECT entry, not index 1 (the desync bug's symptom).
+        assert_eq!(
+            s.entry_at(4),
+            Some(entry(4)),
+            "entry_at(K+1=4) must return the RIGHT entry, not the compacted index-1 entry"
+        );
+        assert_eq!(s.entry_at(5), Some(entry(5)));
+        assert_eq!(s.entry_at(6), Some(entry(6)));
+        // The compacted prefix is gone; term_at(3) is answered from the snapshot meta.
+        assert_eq!(
+            s.entry_at(3),
+            None,
+            "the compacted prefix is dropped on replay"
+        );
+        assert_eq!(
+            s.term_at(3),
+            2,
+            "snapshot answers term at last_included_index"
+        );
+        assert_eq!(s.last_log_index(), 6);
+        // The surviving tail, fetched as a range, is exactly 4..=6 in order (log[0].index == 4).
+        assert_eq!(s.entries_from(4), vec![entry(4), entry(5), entry(6)]);
+        // The term + vote still recover from the surviving log records.
+        assert_eq!(s.current_term(), 2);
+        assert_eq!(s.voted_for(), Some(NodeId(1)));
+
+        // A SUBSEQUENT apply uses the right entry: simulate the apply pipeline reading the
+        // boundary index. entry_at(4) feeding StateMachine::apply would get "entry-4", not
+        // the corrupt "entry-1" the desync would have produced.
+        assert_eq!(
+            s.entry_at(4).map(|e| e.payload),
+            Some(EntryPayload::Bytes(b"entry-4".to_vec())),
+            "the apply pipeline reads the correct payload at the boundary (no corruption)"
+        );
+
+        cleanup(&path);
+        let _ = std::fs::remove_file(&snap);
+    }
+
+    #[test]
+    fn fully_compacted_log_recovers_from_snapshot_alone() {
+        // HA-3c edge: a snapshot whose last_included_index equals the last log index leaves an
+        // EMPTY surviving log. A reopen must still report last_log_index / last_log_term from the
+        // snapshot meta (a fully-compacted log ends at the snapshot), so the leader's prev-log
+        // bookkeeping is correct.
+        let path = fresh_path("fully_compacted_log_recovers_from_snapshot_alone");
+        let snap = snapshot_path(&path);
+        let _ = std::fs::remove_file(&snap);
+
+        let meta = SnapshotMeta {
+            last_included_index: 4,
+            last_included_term: 3,
+        };
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            s.set_current_term(3);
+            for i in 1..=4u64 {
+                s.append(LogEntry {
+                    term: 3,
+                    index: i,
+                    payload: EntryPayload::Noop,
+                });
+            }
+            s.save_snapshot(meta, b"snap-state");
+            s.compact_to(4);
+            assert_eq!(
+                s.last_log_index(),
+                4,
+                "fully-compacted log ends at the snapshot"
+            );
+            assert_eq!(s.last_log_term(), 3);
+            assert!(s.entries_from(5).is_empty());
+        }
+        let s = FileStorage::open(&path).expect("reopen recovers");
+        assert_eq!(
+            s.last_log_index(),
+            4,
+            "snapshot meta drives last_log_index after reopen"
+        );
+        assert_eq!(s.last_log_term(), 3);
+        assert_eq!(s.term_at(4), 3);
+        assert_eq!(s.log_start_index(), 5);
+        let (m, _) = s.load_snapshot().expect("snapshot recovered");
+        assert_eq!(m, meta);
+
+        cleanup(&path);
+        let _ = std::fs::remove_file(&snap);
     }
 
     #[test]

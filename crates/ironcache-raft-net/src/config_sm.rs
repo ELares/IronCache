@@ -194,6 +194,41 @@ impl StateMachine for ConfigSm {
             }
         }
     }
+
+    fn snapshot(&self) -> Vec<u8> {
+        // HA-3c (Raft section 7): serialize the applied config state -- the SHARED SlotMap's
+        // committed view (node table, owner / replica / migration per slot, epoch) plus this
+        // machine's log-driven epoch counter -- so a follower restored from it converges to the
+        // SAME committed view. The layout is [u64 epoch][SlotMap committed-config bytes]: the
+        // epoch counter leads, then the node-independent `serialize_committed` form. Both are a
+        // deterministic function of the applied prefix, so two nodes at the same prefix emit
+        // byte-identical snapshots.
+        let mut out = Vec::with_capacity(256);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.map.serialize_committed());
+        out
+    }
+
+    fn restore(&mut self, data: &[u8]) {
+        // HA-3c: the inverse of `snapshot`. Restore the log-driven epoch counter (the leading 8
+        // little-endian bytes), then rebuild the SHARED SlotMap's committed view from the
+        // remaining bytes IN PLACE (the serve path holds the same Arc<SlotMap>, so restore must
+        // mutate it, not replace it). A short / malformed buffer (never produced by `snapshot`)
+        // restores the epoch to 0 and leaves the map at the cleared baseline, keeping restore
+        // total. After this the machine is byte-identical to one that applied the same committed
+        // prefix entry-by-entry (forward-only: the engine only restores a committed prefix).
+        let (epoch_bytes, map_bytes) = data.split_at(data.len().min(8));
+        self.epoch = epoch_bytes
+            .get(..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map_or(0, u64::from_le_bytes);
+        self.map.restore_committed(map_bytes);
+        // Publish the restored log-driven epoch into the map's current_epoch (the same setter
+        // `apply` uses), so `CLUSTER INFO cluster_current_epoch` reflects the snapshot. (Restore
+        // also sets the committed epoch from its OWN serialized value; this re-asserts the
+        // ConfigSm counter as the source of truth, matching `apply`.)
+        self.map.set_committed_epoch(self.epoch);
+    }
 }
 
 #[cfg(test)]

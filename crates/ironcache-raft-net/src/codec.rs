@@ -45,6 +45,9 @@ const MSG_PROPOSE: u8 = 5;
 // HA-9 leader-forwarding: new transport-level message tags continue from 6 (the next free value).
 const MSG_FORWARD_PROPOSE: u8 = 6;
 const MSG_FORWARD_PROPOSE_RESULT: u8 = 7;
+// HA-3c snapshot install: new RPC message tags continue from 8 (the next free value).
+const MSG_INSTALL_SNAPSHOT: u8 = 8;
+const MSG_INSTALL_SNAPSHOT_RESP: u8 = 9;
 
 // Payload discriminants (the `EntryPayload` variant tag).
 const PAYLOAD_NOOP: u8 = 0;
@@ -149,6 +152,35 @@ pub fn encode_raft_msg(msg: &RaftMsg) -> Vec<u8> {
                 out.push(0);
                 put_u64(&mut out, 0);
             }
+        }
+        RaftMsg::InstallSnapshot {
+            term,
+            leader_id,
+            last_included_index,
+            last_included_term,
+            data,
+        } => {
+            // HA-3c: term, leader, the snapshot's (index, term), then the snapshot bytes
+            // as a length-prefixed blob (single chunk; chunking is a future extension).
+            out.push(MSG_INSTALL_SNAPSHOT);
+            put_u64(&mut out, *term);
+            put_node(&mut out, *leader_id);
+            put_u64(&mut out, *last_included_index);
+            put_u64(&mut out, *last_included_term);
+            put_blob(&mut out, data);
+        }
+        RaftMsg::InstallSnapshotResp {
+            term,
+            last_included_index,
+        } => {
+            // HA-3c: the follower's term (the leader steps down on a higher one) PLUS the
+            // ECHOED snapshot index the follower just installed. The leader advances
+            // match_index/next_index from THIS echoed value, NOT from its own current
+            // snapshot meta, so a second compaction inside the in-flight InstallSnapshot
+            // window can never over-advance the follower's match_index (Figure 13).
+            out.push(MSG_INSTALL_SNAPSHOT_RESP);
+            put_u64(&mut out, *term);
+            put_u64(&mut out, *last_included_index);
         }
     }
     out
@@ -408,6 +440,17 @@ pub fn decode_raft_msg(buf: &[u8]) -> Option<RaftMsg> {
                 outcome: if present { Some(index) } else { None },
             }
         }
+        MSG_INSTALL_SNAPSHOT => RaftMsg::InstallSnapshot {
+            term: cur.u64()?,
+            leader_id: cur.node()?,
+            last_included_index: cur.u64()?,
+            last_included_term: cur.u64()?,
+            data: cur.blob()?,
+        },
+        MSG_INSTALL_SNAPSHOT_RESP => RaftMsg::InstallSnapshotResp {
+            term: cur.u64()?,
+            last_included_index: cur.u64()?,
+        },
         _ => return None,
     };
     // Reject trailing bytes: a complete message must consume the whole frame.
