@@ -243,7 +243,21 @@ longer owns the slot, and serves `MOVED` to the new owner.
   keeps serving), the source `-ASK`s a key already redirected, the destination serves under the
   one-shot `ASKING` flag, and a single committed `SETSLOT NODE` performs the atomic ownership
   flip. A crash at the flip boundary leaves exactly one owner (the source if the flip did not
-  commit, the destination if it did).
+  commit, the destination if it did). The `ASK`/`ASKING` redirect also works for commands
+  queued inside a `MULTI`, and on a multi-shard node the key-presence check that drives `-ASK`
+  is routed to the key's owner shard, so it is exact (no spurious redirect).
+- **Un-assigning slots.** `DELSLOTS` / `DELSLOTSRANGE` / `FLUSHSLOTS` commit an `UnassignSlots`
+  entry through the log, so an operator can take slots out of service cluster-wide.
+- **Membership changes.** The voter set is reconfigurable at runtime via single-server Raft
+  changes (add/remove one voter at a time) plus non-voting **learners** that catch up before
+  promotion. A `CLUSTER MEET` learns the peer's real node id over the cluster bus (so the node
+  table has one entry per node, no synthesized-id duplicates).
+- **Write-side durability bound.** Optional `min-replicas-to-write` (with `min-replicas-max-lag`,
+  Redis-style, default off): an owner refuses a write (`-NOREPLICAS`) unless at least N replicas
+  are currently in sync, bounding the failover write-loss window from the write side.
+- **Log compaction.** The Raft log is snapshotted and compacted (configurable
+  `raft_snapshot_threshold`), with an `InstallSnapshot` path to catch up a far-behind or newly
+  added node; the durable log + snapshot live under a configurable `data_dir`.
 
 **Consistency model.** Cluster *control state* (who owns which slot) is linearizable through
 Raft. *User data* replication is asynchronous, so a failover can lose writes that had not yet
@@ -275,7 +289,10 @@ port = 7001
 cluster_enabled = true
 cluster_mode = "raft"
 cluster_announce_id = "0000000000000000000000000000000000000000"
-# data_dir = "/var/lib/ironcache"   # durable Raft-log directory; unset (default) uses the OS temp dir
+# data_dir = "/var/lib/ironcache"       # durable Raft-log + snapshot directory; unset (default) uses the OS temp dir
+# raft_snapshot_threshold = 1024        # compact the Raft log after this many entries (default 1024)
+# min_replicas_to_write = 0             # refuse a write (-NOREPLICAS) below this many in-sync replicas (default 0 = off)
+# min_replicas_max_lag = 10             # the in-sync lag bound for min_replicas_to_write
 
 [[cluster_topology.nodes]]
 id = "0000000000000000000000000000000000000000"
@@ -303,10 +320,6 @@ bus, awaits the commit, and relays the result, so a CLUSTER write to a follower 
 
 **Known limitations (today).**
 
-- Raft-mode `CLUSTER MEET` synthesizes a peer's node id from its `host:port` (there is no
-  gossip), so a node can appear under both its announce id and a synthesized id; ownership
-  and routing match by endpoint, but `CLUSTER NODES` / `cluster_known_nodes` reflect those
-  extra entries.
 - A `propose` ack resolves when the leader appends the entry (it commits on a majority
   immediately after); resolving the ack on the commit advance, and surfacing the leader's
   client endpoint (not its cluster-bus endpoint) in the rare redirect hint, are tracked
