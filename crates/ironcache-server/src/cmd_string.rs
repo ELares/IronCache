@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! String-type command handlers over the storage waist (COMMANDS.md strings,
 //! ENCODINGS.md, EXPIRATION.md). PR-2a: GET, SET (NX/XX/GET/EX/PX/EXAT/PXAT/
-//! KEEPTTL), SETNX, GETSET, STRLEN.
+//! KEEPTTL), SETNX, GETSET, STRLEN. Drop-in compatibility additions: GETRANGE /
+//! SUBSTR (signed-range substring), SETRANGE (zero-pad-extend overwrite), GETDEL
+//! (GET-then-DEL atomically), MSETNX (set all only if none exist, atomic).
 //!
 //! Every handler is a composition of the four storage primitives (STORAGE_API.md):
 //! GET/STRLEN use `read`; plain SET uses `upsert`; conditional SET / SETNX / GETSET
@@ -17,6 +19,230 @@ use ironcache_protocol::{ErrorReply, Request, Value, format_human_double};
 use ironcache_storage::{
     DataType, ExpireWrite, NewValue, NewValueOwned, RmwAction, RmwEntry, RmwStep, Store, UnixMillis,
 };
+
+/// Normalize a Redis-style signed range `[start, end]` against a string of `len` bytes
+/// into a HALF-OPEN `[lo, hi)` byte range (GETRANGE / SUBSTR semantics, src/t_string.c
+/// `getrangeCommand`). A negative index counts from the end (`-1` is the last byte);
+/// out-of-range ends are clamped to the string bounds. Returns `None` when the range is
+/// empty (start past end after clamping, or an empty string), which the caller maps to the
+/// empty bulk string. The arithmetic is done in `i64` so a huge negative index cannot
+/// underflow.
+fn clamp_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let len_i = len as i64;
+    // A negative index is relative to the end; then clamp to [0, len-1] for start and
+    // [0, len-1] for end (Redis clamps both ends into the string before comparing).
+    let mut s = if start < 0 { len_i + start } else { start };
+    let mut e = if end < 0 { len_i + end } else { end };
+    if s < 0 {
+        s = 0;
+    }
+    if e < 0 {
+        e = 0;
+    }
+    if e >= len_i {
+        e = len_i - 1;
+    }
+    // An empty result: start clamped past the (clamped) end, or start beyond the string.
+    if s > e || s >= len_i {
+        return None;
+    }
+    // s..=e is non-empty and in-bounds; return the half-open [s, e+1).
+    Some((s as usize, (e + 1) as usize))
+}
+
+/// `GETRANGE key start end` (and its deprecated alias `SUBSTR`) -> the substring of the
+/// value at `key` in the inclusive signed byte range `[start, end]`, or the empty bulk
+/// string when the key is missing, the value is empty, or the range is empty after
+/// clamping. Negative indices count from the end (`-1` is the last byte). WRONGTYPE on a
+/// non-string. `cmd_name` selects the arity-error spelling (`getrange` vs `substr`); the
+/// two are otherwise byte-identical (Redis `SUBSTR` is a literal alias of `GETRANGE`).
+fn getrange_generic<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    cmd_name: &str,
+) -> Value {
+    if req.args.len() != 4 {
+        return Value::error(ErrorReply::wrong_arity(cmd_name));
+    }
+    let (Some(start), Some(end)) = (parse_i64(&req.args[2]), parse_i64(&req.args[3])) else {
+        return Value::error(ErrorReply::not_an_integer());
+    };
+    match store.read(db, &req.args[1], now) {
+        Some(v) if v.data_type() == DataType::String => {
+            let bytes = v.as_bytes();
+            match clamp_range(start, end, bytes.len()) {
+                Some((lo, hi)) => Value::bulk(Bytes::copy_from_slice(&bytes[lo..hi])),
+                // An empty range / empty value -> the EMPTY bulk string (NOT nil), matching
+                // Redis (`getrangeCommand` replies an empty bulk for an empty result).
+                None => Value::bulk(Bytes::new()),
+            }
+        }
+        Some(_) => Value::error(ErrorReply::wrong_type()),
+        // A MISSING key -> the empty bulk string (Redis GETRANGE on a missing key is "").
+        None => Value::bulk(Bytes::new()),
+    }
+}
+
+/// `GETRANGE key start end` -> the inclusive signed-range substring (empty bulk on miss /
+/// empty range). Negative indices count from the end. WRONGTYPE on a non-string.
+pub fn cmd_getrange<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    getrange_generic(store, db, now, req, "getrange")
+}
+
+/// `SUBSTR key start end` -> the deprecated alias of [`cmd_getrange`] (Redis keeps SUBSTR
+/// as a literal alias, identical semantics; only the arity-error spelling differs).
+pub fn cmd_substr<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    getrange_generic(store, db, now, req, "substr")
+}
+
+/// `SETRANGE key offset value` -> the new string length after overwriting the bytes
+/// starting at `offset` with `value`, zero-padding the gap if `offset` is past the current
+/// end (Redis `setrangeCommand`).
+///
+/// - A non-integer or NEGATIVE offset is an error (`offset is out of range` for negative).
+/// - An empty `value` is a no-op that returns the CURRENT length (0 on a missing key),
+///   NEVER creating the key (Redis: SETRANGE with an empty string on a missing key returns
+///   0 and creates nothing).
+/// - Otherwise the value is created/extended (zero-padded up to `offset`), the bytes are
+///   overwritten, and the new length is returned. The TTL is preserved (Redis SETRANGE
+///   does not touch the expire). WRONGTYPE on a non-string. The result is capped at
+///   `proto-max-bulk-len` (512 MB), matching Redis `checkStringLength`.
+pub fn cmd_setrange<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 4 {
+        return Value::error(ErrorReply::wrong_arity("setrange"));
+    }
+    // The offset is a non-negative integer; a negative offset is the out-of-range error
+    // (Redis `setrangeCommand` rejects offset < 0 with "offset is out of range").
+    let Some(offset) = parse_i64(&req.args[2]) else {
+        return Value::error(ErrorReply::not_an_integer());
+    };
+    if offset < 0 {
+        return Value::error(ErrorReply::err("offset is out of range"));
+    }
+    let offset = offset as usize;
+    let value = req.args[3].clone();
+    store.rmw(db, &req.args[1], now, move |entry| {
+        // The current bytes (absent -> empty), with the WRONGTYPE check first.
+        let current: &[u8] = match &entry {
+            RmwEntry::Vacant => b"",
+            RmwEntry::Occupied(o) if o.data_type() != DataType::String => {
+                return keep_err(ErrorReply::wrong_type());
+            }
+            RmwEntry::Occupied(o) => o.as_bytes(),
+            RmwEntry::OccupiedMut(_) => unreachable!("cmd_setrange uses rmw, not rmw_mut"),
+        };
+        // An empty value is a no-op: return the CURRENT length, write nothing (Redis returns
+        // the existing length and does NOT create a missing key).
+        if value.is_empty() {
+            return RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::Integer(current.len() as i64),
+            };
+        }
+        // The result length is max(current_len, offset + value_len). Reject if it would
+        // exceed proto-max-bulk-len (Redis checkStringLength), before allocating.
+        let end = offset.saturating_add(value.len());
+        let new_len = current.len().max(end);
+        if new_len > PROTO_MAX_BULK_LEN {
+            return keep_err(ErrorReply::string_exceeds_max());
+        }
+        // Build the new value: the prefix (old bytes, zero-padded up to offset), then the
+        // overwrite, then any old tail beyond the overwrite (preserved).
+        let mut buf = vec![0u8; new_len];
+        buf[..current.len()].copy_from_slice(current);
+        buf[offset..end].copy_from_slice(&value);
+        RmwStep {
+            // The TTL is PRESERVED (Redis SETRANGE keeps the existing expire); a created
+            // key has no TTL, which Unchanged also yields on the Vacant path.
+            action: RmwAction::Replace(NewValueOwned::Bytes(Bytes::from(buf))),
+            expire: ExpireWrite::Unchanged,
+            reply: Value::Integer(new_len as i64),
+        }
+    })
+}
+
+/// `GETDEL key` -> the value at `key` (then atomically DELETES it), or nil if the key is
+/// missing (Redis `getdelCommand`). WRONGTYPE on a non-string (no delete). One atomic
+/// `rmw`: observe + delete together on the owning core.
+pub fn cmd_getdel<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 2 {
+        return Value::error(ErrorReply::wrong_arity("getdel"));
+    }
+    store.rmw(db, &req.args[1], now, move |entry| match entry {
+        RmwEntry::Vacant => RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Unchanged,
+            reply: Value::Null,
+        },
+        RmwEntry::Occupied(o) if o.data_type() != DataType::String => RmwStep {
+            action: RmwAction::Keep,
+            expire: ExpireWrite::Unchanged,
+            reply: Value::error(ErrorReply::wrong_type()),
+        },
+        RmwEntry::Occupied(o) => {
+            let val = Value::bulk(Bytes::copy_from_slice(o.as_bytes()));
+            RmwStep {
+                action: RmwAction::Delete,
+                expire: ExpireWrite::Unchanged,
+                reply: val,
+            }
+        }
+        RmwEntry::OccupiedMut(_) => unreachable!("cmd_getdel uses rmw, not rmw_mut"),
+    })
+}
+
+/// `MSETNX key value [key value ...]` -> 1 if EVERY key was set, 0 if NONE were set
+/// (Redis `msetnxCommand`: the set is all-or-nothing -- if ANY key already exists, NOTHING
+/// is written and the reply is 0). Every value clears any TTL on create (a created key has
+/// no TTL).
+///
+/// Arity is -3 (the token + >= 1 key/value pair) AND `argc - 1` must be EVEN; an odd count
+/// is the wrong-arity error (matching Redis `msetnxCommand`, which shares the MSET arity
+/// check). A DUPLICATE key listed twice in the same MSETNX does NOT by itself fail (Redis
+/// checks existence in the keyspace, not within the arg list; the second write wins), but if
+/// that key already exists the whole command is a no-op 0.
+///
+/// SINGLE-SHARD handler: this runs the all-or-nothing check + write against the connection's
+/// accept shard. A cross-shard SPANNING MSETNX needs a coordinator pre-check + write (the
+/// atomic all-or-nothing across shards is the documented Stage-3 follow-up, like cross-shard
+/// MULTI/EXEC); when the keys span shards the serve loop keeps the command HOME (the keys all
+/// live on the one store there), preserving the atomic semantics.
+pub fn cmd_msetnx<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    // Arity -3 (token + >= 1 pair) AND an EVEN number of key/value args.
+    if req.args.len() < 3 || (req.args.len() - 1) % 2 != 0 {
+        return Value::error(ErrorReply::wrong_arity("msetnx"));
+    }
+    // PASS 1: if ANY target key already exists (live), the whole command is a no-op 0.
+    // (Redis `msetnxCommand` first scans every key with lookupKeyWrite and aborts before
+    // writing anything if one is present.)
+    let mut i = 1;
+    while i + 1 < req.args.len() {
+        if store.contains(db, &req.args[i], now) {
+            return Value::Integer(0);
+        }
+        i += 2;
+    }
+    // PASS 2: none exist -> write them all (blind upsert per pair; a created key has no TTL).
+    // A key listed twice in the args is written twice (last wins), matching Redis.
+    let mut i = 1;
+    while i + 1 < req.args.len() {
+        store.upsert(
+            db,
+            &req.args[i],
+            NewValue::Bytes(&req.args[i + 1]),
+            ExpireWrite::Clear,
+            now,
+        );
+        i += 2;
+    }
+    Value::Integer(1)
+}
 
 /// `GET key` -> bulk value or null; WRONGTYPE if the key holds a non-string.
 pub fn cmd_get<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {

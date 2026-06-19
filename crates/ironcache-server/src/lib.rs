@@ -26,6 +26,7 @@ pub mod cmd_introspect;
 pub mod cmd_keyspace;
 pub mod cmd_list;
 pub mod cmd_set;
+pub mod cmd_sort;
 pub mod cmd_string;
 pub mod cmd_txn;
 pub mod cmd_util;

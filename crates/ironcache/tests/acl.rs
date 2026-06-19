@@ -252,6 +252,179 @@ fn dangerous_category_blocked_over_the_wire() {
     });
 }
 
+/// (12) SORT/SORT_RO BY/GET external-key dereference gate (redis#10106). A `BY pat` with `*` or a
+/// non-`#` `GET pat` reads keys that are NOT in the command key-spec, so the per-key ACL check
+/// cannot see them. Redis 7.0 denies such a SORT unless the user has FULL key-read (allkeys). A
+/// user scoped to `~ids*` (NOT allkeys): plain `SORT ids` / `SORT ids ALPHA` / `SORT ids BY nosort`
+/// (no `*`) / `SORT ids GET #` are ALLOWED (no external deref); `SORT ids BY weight_*` and
+/// `SORT ids GET data_*` are DENIED `-NOPERM ... access a key`. An allkeys (`~*`) user: all
+/// ALLOWED. Covers both SORT and SORT_RO.
+#[test]
+fn sort_by_get_external_key_deref_gated_on_allkeys() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // Seed a source list the scoped user is allowed to read (`ids` matches `~ids*`).
+        assert_eq!(cmd(&mut c, &["RPUSH", "ids", "1", "2"]).await, ":2\r\n");
+
+        // A user scoped to `~ids*` (NOT allkeys) with +sort +sort_ro.
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL", "SETUSER", "sorter", "on", ">pw", "~ids*", "+sort", "+sort_ro"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "sorter", "pw"]).await, "+OK\r\n");
+
+        // ALLOWED (no external-key deref): plain SORT, ALPHA, `BY nosort` (no `*`), `GET #`.
+        for ok in [
+            vec!["SORT", "ids"],
+            vec!["SORT", "ids", "ALPHA"],
+            vec!["SORT", "ids", "BY", "nosort"],
+            vec!["SORT", "ids", "GET", "#"],
+            vec!["SORT_RO", "ids"],
+            vec!["SORT_RO", "ids", "BY", "nosort"],
+            vec!["SORT_RO", "ids", "GET", "#"],
+        ] {
+            let reply = cmd(&mut a, &ok).await;
+            assert!(
+                reply.starts_with('*'),
+                "{ok:?} must be ALLOWED (no external deref), got {reply:?}"
+            );
+        }
+
+        // DENIED (BY/GET dereferences an external key the user is not allkeys for).
+        for deny in [
+            vec!["SORT", "ids", "BY", "weight_*"],
+            vec!["SORT", "ids", "GET", "data_*"],
+            vec!["SORT", "ids", "BY", "weight_*", "GET", "data_*->f"],
+            vec!["SORT_RO", "ids", "BY", "weight_*"],
+            vec!["SORT_RO", "ids", "GET", "data_*"],
+        ] {
+            let reply = cmd(&mut a, &deny).await;
+            assert!(
+                reply.starts_with("-NOPERM") && reply.contains("access a key"),
+                "{deny:?} must be NOPERM (external-key deref under non-allkeys), got {reply:?}"
+            );
+        }
+
+        // An ALLKEYS user (`~*`) may run the dereferencing forms (full key-read permission).
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL", "SETUSER", "all", "on", ">pw", "~*", "+sort", "+sort_ro"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+        let mut k = connect_retry(port).await;
+        assert_eq!(cmd(&mut k, &["AUTH", "all", "pw"]).await, "+OK\r\n");
+        for ok in [
+            vec!["SORT", "ids", "BY", "weight_*"],
+            vec!["SORT", "ids", "GET", "data_*"],
+            vec!["SORT_RO", "ids", "GET", "data_*"],
+        ] {
+            let reply = cmd(&mut k, &ok).await;
+            assert!(
+                reply.starts_with('*'),
+                "allkeys user must run {ok:?}, got {reply:?}"
+            );
+        }
+
+        drop(k);
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (13) ACL-OFF (no requirepass, no aclfile): the implicit default is allkeys, so SORT BY/GET runs
+/// unchanged -- the deref gate is byte-identical when ACL is inactive.
+#[test]
+fn sort_by_get_deref_acl_off_unaffected() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(cmd(&mut c, &["RPUSH", "ids", "1", "2"]).await, ":2\r\n");
+
+        // No ACL configured -> the default connection is allkeys: the dereferencing forms run.
+        for ok in [
+            vec!["SORT", "ids", "BY", "weight_*"],
+            vec!["SORT", "ids", "GET", "data_*"],
+            vec!["SORT_RO", "ids", "GET", "data_*"],
+        ] {
+            let reply = cmd(&mut c, &ok).await;
+            assert!(
+                reply.starts_with('*'),
+                "ACL-off (allkeys default) must run {ok:?}, got {reply:?}"
+            );
+        }
+
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (14) SORT_RO is `@dangerous` (parity with Redis, which marks both SORT and SORT_RO dangerous):
+/// a `+@all -@dangerous` user can GET/SET but is NOPERM on BOTH SORT and SORT_RO.
+#[test]
+fn sort_ro_is_dangerous() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL",
+                    "SETUSER",
+                    "ops",
+                    "on",
+                    "nopass",
+                    "~*",
+                    "+@all",
+                    "-@dangerous"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "ops", "x"]).await, "+OK\r\n");
+
+        // Both SORT and SORT_RO are @dangerous -> NOPERM (command denied).
+        for danger in [vec!["SORT", "k"], vec!["SORT_RO", "k"]] {
+            let reply = cmd(&mut a, &danger).await;
+            assert!(
+                reply.starts_with("-NOPERM") && reply.contains("command"),
+                "{danger:?} must be NOPERM (@dangerous), got {reply:?}"
+            );
+        }
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
 /// (5) A DISABLED (`off`) user cannot AUTH: the AUTH attempt is `-WRONGPASS` (never revealing the
 /// user is merely disabled). Re-enabling it (`on`) lets it AUTH.
 #[test]

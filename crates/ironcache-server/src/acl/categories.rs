@@ -199,6 +199,10 @@ fn type_category(cmd: &[u8]) -> Option<Category> {
         b"PSETEX",
         b"GETSET",
         b"GETEX",
+        b"GETDEL",
+        b"GETRANGE",
+        b"SUBSTR",
+        b"SETRANGE",
         b"STRLEN",
         b"APPEND",
         b"INCR",
@@ -208,6 +212,7 @@ fn type_category(cmd: &[u8]) -> Option<Category> {
         b"INCRBYFLOAT",
         b"MGET",
         b"MSET",
+        b"MSETNX",
     ];
     const LIST: &[&[u8]] = &[
         b"LPUSH",
@@ -226,6 +231,7 @@ fn type_category(cmd: &[u8]) -> Option<Category> {
         b"LMOVE",
         b"RPOPLPUSH",
         b"LPOS",
+        b"LMPOP",
     ];
     const HASH: &[&[u8]] = &[
         b"HSET",
@@ -284,6 +290,7 @@ fn type_category(cmd: &[u8]) -> Option<Category> {
         b"ZRANGESTORE",
         b"ZPOPMIN",
         b"ZPOPMAX",
+        b"ZMPOP",
         b"ZRANDMEMBER",
         b"ZREMRANGEBYRANK",
         b"ZREMRANGEBYSCORE",
@@ -366,6 +373,7 @@ fn is_dangerous(cmd: &[u8]) -> bool {
             | b"BGSAVE"
             | b"LASTSAVE"
             | b"SORT"
+            | b"SORT_RO"
             | b"MIGRATE"
             | b"RESTORE"
             | b"MOVE"
@@ -449,6 +457,9 @@ fn is_fast(cmd: &[u8]) -> bool {
             | b"PSETEX"
             | b"GETSET"
             | b"GETEX"
+            // GETDEL is O(1) (Redis flags it @fast). GETRANGE/SUBSTR/SETRANGE/MSETNX are
+            // O(N) -> @slow (the default for any command not listed here).
+            | b"GETDEL"
             | b"STRLEN"
             | b"APPEND"
             | b"INCR"

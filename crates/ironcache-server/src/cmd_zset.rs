@@ -1113,6 +1113,79 @@ pub fn cmd_zpopmax<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
 }
 
 // ===========================================================================
+// ZMPOP: pop min/max from the first non-empty zset among several keys (the
+// non-blocking multi-key pop, Redis 7). `ZMPOP numkeys key [key ...] MIN|MAX
+// [COUNT count]`.
+// ===========================================================================
+
+/// Build the ZMPOP element list: an ARRAY of `[member, score]` 2-element arrays (the score a
+/// bulk string in the Redis HUMAN spelling). Redis ZMPOP nests each (member, score) pair as
+/// its OWN 2-element array in BOTH protocols (unlike the WITHSCORES flat/nested split), so we
+/// build the explicit nested shape here rather than reuse the WITHSCORES `Value::Pairs`.
+fn zmpop_members(pairs: Vec<(Vec<u8>, f64)>) -> Value {
+    let out: Vec<Value> = pairs
+        .into_iter()
+        .map(|(m, s)| Value::Array(Some(vec![bulk(m), score_bulk(s)])))
+        .collect();
+    Value::Array(Some(out))
+}
+
+/// `ZMPOP numkeys key [key ...] MIN|MAX [COUNT count]` -> a two-element reply
+/// `[key, [[member, score], ...]]` for the FIRST key (in argument order) that holds a
+/// non-empty sorted set, popping up to `count` (default 1) members from the MIN (lowest
+/// scores) or MAX (highest scores) end; or nil if EVERY listed key is missing/empty (Redis
+/// `zmpopCommand` / `zmpopGenericCommand`).
+///
+/// Parsing reuses the shared `<numkeys> key... <DIR> [COUNT count]` grammar (here `DIR` is
+/// `MIN`/`MAX`). WRONGTYPE if the FIRST existing key holds a non-zset. SINGLE-SHARD handler:
+/// it scans the named keys on the connection's accept shard (a spanning ZMPOP is kept HOME
+/// by the serve loop), preserving the "first non-empty wins" order.
+pub fn cmd_zmpop<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    let parsed = match crate::cmd_list::parse_mpop_args(req, "ZMPOP", &[b"MIN", b"MAX"]) {
+        Ok(p) => p,
+        Err(e) => return Value::error(e),
+    };
+    let max = parsed.direction == b"MAX";
+    for key in &parsed.keys {
+        let key = Bytes::copy_from_slice(key);
+        let outcome = store.rmw_mut(db, &key, now, |entry| match entry {
+            // A missing key contributes nothing; keep scanning (the Null sentinel signals skip).
+            RmwEntry::Vacant => keep(Value::Null),
+            RmwEntry::OccupiedMut(mut o) => {
+                let Some(zset) = o.as_zset_mut() else {
+                    return wrong_type();
+                };
+                let popped = if max {
+                    zset.pop_max(parsed.count)
+                } else {
+                    zset.pop_min(parsed.count)
+                };
+                let reply = Value::Array(Some(vec![bulk(key.to_vec()), zmpop_members(popped)]));
+                let action = if zset.is_empty() {
+                    RmwAction::Delete
+                } else {
+                    RmwAction::Mutated
+                };
+                RmwStep {
+                    action,
+                    expire: ExpireWrite::Unchanged,
+                    reply,
+                }
+            }
+            RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+        });
+        match outcome {
+            // Skip a missing key and keep scanning; return any real reply / WRONGTYPE.
+            Value::Null => {}
+            other => return other,
+        }
+    }
+    // No key held a non-empty zset: the NULL ARRAY reply (Redis ZMPOP calls addReplyNullArray
+    // -> RESP2 `*-1`, RESP3 `_`). DISTINCT from a missing-key skip's `Value::Null` sentinel.
+    Value::Array(None)
+}
+
+// ===========================================================================
 // ZRANDMEMBER: random member selection (Env-rng seam). Does NOT remove.
 // ===========================================================================
 

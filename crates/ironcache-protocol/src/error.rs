@@ -894,6 +894,17 @@ impl ErrorReply {
         ErrorReply::new(ErrorCode::Err, "resulting score is not a number (NaN)")
     }
 
+    /// `ERR One or more scalars selected for the SORT operation are not numbers.` - the
+    /// reply Redis emits (src/sort.c `sortCommand`) when a NUMERIC (non-ALPHA) SORT
+    /// encounters an element (or BY weight) that does not parse as a double. Byte-exact.
+    #[must_use]
+    pub fn sort_not_numbers() -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            "One or more scalars selected for the SORT operation are not numbers.",
+        )
+    }
+
     /// `ERR bit offset is not an integer or out of range` - the reply Redis emits
     /// (src/bitops.c `getBitOffsetFromArgument`) when a SETBIT/GETBIT/BITFIELD bit
     /// offset is not a non-negative integer, or would grow the value past the

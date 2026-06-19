@@ -205,8 +205,13 @@ pub(crate) mod tests {
             b"DECRBY",
             b"INCRBYFLOAT",
             b"APPEND",
+            b"GETRANGE",
+            b"SUBSTR",
+            b"SETRANGE",
+            b"GETDEL",
             b"MGET",
             b"MSET",
+            b"MSETNX",
             // Keyspace
             b"DEL",
             b"EXISTS",
@@ -254,6 +259,7 @@ pub(crate) mod tests {
             b"LMOVE",
             b"RPOPLPUSH",
             b"LPOS",
+            b"LMPOP",
             // Hashes
             b"HSET",
             b"HMSET",
@@ -321,6 +327,7 @@ pub(crate) mod tests {
             b"ZINTERSTORE",
             b"ZDIFFSTORE",
             b"ZINTERCARD",
+            b"ZMPOP",
             // Bitmaps
             b"SETBIT",
             b"GETBIT",
@@ -333,6 +340,9 @@ pub(crate) mod tests {
             b"PFADD",
             b"PFCOUNT",
             b"PFMERGE",
+            // Generic: SORT / SORT_RO
+            b"SORT",
+            b"SORT_RO",
             // Introspection
             b"OBJECT",
             // Internal cross-shard verbs (client-unreachable; only the coordinator issues them)
@@ -483,9 +493,11 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            158,
-            "the dispatch-arm hand-list drifted from the 155 client commands (incl. SAVE/BGSAVE/\
-             LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown) + 3 internal verbs"
+            167,
+            "the dispatch-arm hand-list drifted from the 164 client commands (incl. SAVE/BGSAVE/\
+             LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown, + the drop-in\
+             compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO) \
+             + 3 internal verbs"
         );
     }
 
