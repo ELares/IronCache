@@ -40,6 +40,25 @@ pub const GLOBAL_ALLOCATOR_NAME: &str = "jemalloc";
 #[cfg(target_env = "msvc")]
 pub const GLOBAL_ALLOCATOR_NAME: &str = "libc";
 
+/// An RAII guard for one admitted slot in the process-global `maxclients` connection gate (L1,
+/// PROD-SAFETY #3). It is created ONLY on a successful `try_admit` and RELEASES the slot on
+/// [`Drop`] -- on the normal close path, on an early `return`, AND on a PANIC unwinding through the
+/// serve loop. The release used to be a plain statement at the end of `serve_connection`, which a
+/// panic after `try_admit` would skip, permanently leaking the slot (a progressive, false "max
+/// number of clients reached" as leaked slots accumulate). Mirrors the `SaveGuard` pattern in the
+/// persistence code. The REJECT path and the TLS-handshake-fail path return BEFORE `try_admit`, so
+/// they never construct this guard (a rejected/handshake-failed connection was never admitted and
+/// must not release).
+struct ConnGateGuard {
+    gate: Arc<ironcache_observe::ConnectionGate>,
+}
+
+impl Drop for ConnGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
 /// Format a 40-lowercase-hex cluster node id from the determinism seam's RNG
 /// (CLUSTER_CONTRACT.md #70). It draws THREE `u64`s (192 bits) and renders 160 of them as
 /// 40 lowercase hex chars: the full first two words plus the LOW 32 bits of the third
@@ -1037,8 +1056,9 @@ async fn serve_connection(
     // the node is already AT the cap, reject: write the byte-exact Redis `-ERR max number of clients
     // reached` reply, then close, WITHOUT counting this connection (it was never admitted) and
     // WITHOUT entering the serve loop. `maxclients == 0` disables the cap (the pre-fix behavior).
-    // This is a COLD accept-path check (once per connection, never per command). On admit, a
-    // matching `conn_gate.release()` on the close path below frees the slot.
+    // This is a COLD accept-path check (once per connection, never per command). On admit, the
+    // returned `ConnGateGuard` (L1) frees the slot on Drop -- on the normal close path, an early
+    // return, OR a panic unwinding through the serve loop -- so a panic can never leak the slot.
     if !ctx.conn_gate.try_admit(ctx.runtime.maxclients()) {
         let mut reject = Vec::with_capacity(64);
         encode_into(
@@ -1051,6 +1071,11 @@ async fn serve_connection(
         let _ = stream.send(reject).await;
         return;
     }
+    // Admitted: hold the slot in an RAII guard so it is released on EVERY exit path (the normal
+    // close below, any early return, or a panic). The guard lives for the rest of the function.
+    let _conn_gate_guard = ConnGateGuard {
+        gate: Arc::clone(&ctx.conn_gate),
+    };
 
     let addr = stream
         .peer_addr()
@@ -1268,11 +1293,11 @@ async fn serve_connection(
         conn.clear_watch();
     }
     state_rc.borrow_mut().counters.on_connection_close();
-    // Release this connection's slot in the process-GLOBAL connection gate (PROD-SAFETY #3). It was
-    // ADMITTED above (we only reach this close path for an admitted connection; a rejected one
-    // returned early WITHOUT counting), so the matching release keeps the live count accurate so the
-    // `maxclients` cap is enforced against a true figure over the node's lifetime.
-    ctx.conn_gate.release();
+    // This connection's slot in the process-GLOBAL connection gate (PROD-SAFETY #3) is released by
+    // the `_conn_gate_guard` RAII guard on Drop (L1) as this function returns, keeping the live count
+    // accurate so the `maxclients` cap is enforced against a true figure over the node's lifetime.
+    // The guard also covers any earlier return / panic, which the prior bare `release()` here did
+    // not (a panic would have leaked the slot permanently).
 }
 
 /// The SUBSCRIBE-mode idle wait (SERVER_PUSH.md #20, PR 91a): `select!` between draining the

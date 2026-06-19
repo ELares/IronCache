@@ -284,6 +284,34 @@ impl ServerContext {
         shard_logical_used > self.per_shard_budget()
     }
 
+    /// Whether this shard's LOGICAL bytes still exceed its even-split per-shard budget -- the
+    /// cache-mode POST-eviction -OOM decision (M1). Unlike [`Self::over_maxmemory`], this reads ONLY
+    /// the per-shard logical counter the shard just acted on; it does NOT consult the process-global
+    /// allocator gauge.
+    ///
+    /// ## Why the cache-mode decision must NOT use the global gauge (M1)
+    ///
+    /// The global allocator gauge is refreshed only on the ~100ms expiry tick (it advances the
+    /// jemalloc epoch). Eviction frees LOGICAL bytes immediately, but the gauge -- and the
+    /// allocator's resident pages, which it may hold after a free -- do NOT drop within the command.
+    /// If the cache-mode post-eviction re-check used [`Self::over_maxmemory`] (which ORs the
+    /// stale-high global gauge), a write that eviction LOGICALLY satisfied would still be spuriously
+    /// `-OOM`'d for up to ~100ms near the ceiling, diverging from Redis (an evicting policy clears
+    /// OOM WITHIN the command). So the cache-mode per-command -OOM decision is driven here, off the
+    /// fresh per-shard logical figure: a successful eviction (logical now <= budget) ALLOWS the
+    /// write. The global gauge still TRIGGERS eviction via [`Self::over_maxmemory`] (so the node
+    /// keeps evicting to work RSS down over ticks); it just must not -OOM a logically-satisfied
+    /// write. NOEVICTION keeps [`Self::over_maxmemory`]'s global gauge as the HARD CEILING (no
+    /// eviction can clear it, so a denyoom write -OOMs when global RSS > maxmemory -- correct).
+    ///
+    /// Strict `>` matches the trigger's getMaxmemoryState semantics (`used <= budget` is under
+    /// limit). `0` budget (maxmemory disabled) is never over.
+    #[must_use]
+    pub fn over_per_shard_budget(&self, shard_logical_used: u64) -> bool {
+        let budget = self.per_shard_budget();
+        budget > 0 && shard_logical_used > budget
+    }
+
     /// HOW the cluster's slot map is governed (HA-4c): the boot `cluster_mode`. The DEFAULT is
     /// [`ClusterMode::Static`] (the byte-unchanged pre-HA-4c path). Only [`ClusterMode::Raft`]
     /// routes a CLUSTER mutator through the control plane (and only then is [`Self::raft`] set).
@@ -811,19 +839,28 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         // are cheap relaxed loads, only on a `denyoom` write while the ceiling is on.
         if ctx.over_maxmemory(store.used_memory()) {
             if store.policy_evicts() {
-                // Cache mode: free space, then re-check the SAME global-aware trigger. The
-                // eviction TARGET is still this shard's even-split per-shard budget (the local
-                // eviction-locality: a shard can only evict its OWN keys, COORDINATOR.md #107), so
-                // the hot shard sheds its share; the over-limit DECISION above is global. If we are
-                // still over after evicting (the write outruns eviction, or only ineligible keys
-                // remain, or another shard holds the excess and this one is already lean), reject
-                // -OOM. The freed count is reported for INFO.
+                // CACHE / EVICTING MODE (M1). The global gauge TRIGGERED eviction above (so the node
+                // keeps shedding to work RSS down over ticks even when a hot shard's own even-split
+                // budget is not exceeded). The eviction TARGET is this shard's even-split per-shard
+                // budget (eviction-locality: a shard can only evict its OWN keys, COORDINATOR.md
+                // #107). The per-command -OOM DECISION, however, is driven off the FRESH per-shard
+                // LOGICAL figure (`over_per_shard_budget`), NOT the global gauge: the gauge is
+                // ~100ms-stale (refreshed on the expiry tick) and the allocator may hold freed pages,
+                // so re-checking the global gauge here would spuriously -OOM a write that eviction
+                // LOGICALLY satisfied -- diverging from Redis, where an evicting policy clears OOM
+                // within the command. So a successful eviction (logical now <= budget) ALLOWS the
+                // write; only when eviction could NOT free enough (the write outruns it, or only
+                // ineligible keys remain) does the shard remain logically over budget and -OOM. The
+                // freed count is reported for INFO.
                 deltas.evicted += store.evict_to_fit(ctx.per_shard_budget(), now);
-                if ctx.over_maxmemory(store.used_memory()) {
+                if ctx.over_per_shard_budget(store.used_memory()) {
                     return Value::error(ErrorReply::oom());
                 }
             } else {
-                // Strict datastore / noeviction: -OOM is the over-capacity behavior.
+                // STRICT DATASTORE / NOEVICTION MODE. No eviction can clear the pressure, so the
+                // global RSS gauge inside `over_maxmemory` stands as the HARD CEILING: a denyoom
+                // write -OOMs whenever the node is over (global RSS > maxmemory, or the per-shard
+                // logical fallback over budget). -OOM is the over-capacity behavior.
                 return Value::error(ErrorReply::oom());
             }
         }
@@ -3734,6 +3771,130 @@ mod tests {
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"GET", b"new"]),
             Value::BulkString(Some(Bytes::copy_from_slice(&val)))
+        );
+    }
+
+    #[test]
+    fn cache_mode_eviction_clears_oom_even_with_a_stale_high_global_gauge() {
+        // M1 REGRESSION GUARD: in cache/evicting mode, the per-command -OOM decision is driven off
+        // the FRESH per-shard LOGICAL figure after eviction, NOT the ~100ms-stale process-global
+        // allocator gauge. With the gauge pinned ABOVE maxmemory (the near-ceiling case where the
+        // gauge has not refreshed and the allocator may still hold freed pages), a denyoom write
+        // must STILL SUCCEED once eviction frees logical room -- matching Redis (an evicting policy
+        // clears OOM within the command). Pre-M1, the post-eviction re-check used `over_maxmemory`,
+        // which ORs the stale-high gauge, so this write was spuriously -OOM'd.
+        let c = ctx_with_budget(300);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::cache_default());
+        let t = UnixMillis(0);
+        let val = vec![b'v'; 100];
+        // Fill past the 300-byte budget so the next write must evict to fit.
+        for i in 0u32..5 {
+            run_admit(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("k{i}").as_bytes(), &val],
+            );
+        }
+        assert!(st.used_memory() >= 300, "over budget after the fills");
+        // Pin the GLOBAL gauge ABOVE maxmemory and keep it there: it never refreshes during this
+        // command (it would only move on the next ~100ms expiry tick). This is the stale-high
+        // near-ceiling condition that pre-M1 spuriously -OOM'd.
+        c.process_memory.publish(5000, 8192);
+        assert!(
+            c.over_maxmemory(st.used_memory()),
+            "the global gauge is over maxmemory (the stale-high trigger condition)"
+        );
+        // The denyoom write triggers eviction (off the global gauge) and -- the M1 fix -- is then
+        // ALLOWED because eviction got the per-shard LOGICAL figure under budget (the post-eviction
+        // -OOM decision now reads the FRESH per-shard logical figure, not the stale-high global
+        // gauge that still reads over). Pre-M1 this write was spuriously -OOM'd.
+        let (r, ev) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"new", &val]);
+        assert_eq!(
+            r,
+            Value::ok(),
+            "cache mode must serve the write after eviction frees logical room, despite the \
+             stale-high global gauge"
+        );
+        assert!(ev > 0, "eviction must have run to make room");
+        // The global gauge is STILL stale-high (it never moved during the command): proof the
+        // success was driven off the per-shard logical figure, not the global gauge.
+        assert!(
+            c.over_maxmemory(st.used_memory()),
+            "the global gauge is still over (it only refreshes on the next tick); the write \
+             succeeded off the per-shard logical figure, not this gauge"
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"new"]),
+            Value::BulkString(Some(Bytes::copy_from_slice(&val)))
+        );
+    }
+
+    #[test]
+    fn cache_mode_oom_when_eviction_cannot_free_enough_logical_room() {
+        // M1 companion: cache mode STILL -OOMs when eviction CANNOT get the per-shard logical figure
+        // under budget. Under `volatile-lru` ONLY TTL-bearing keys are evictable; with the store
+        // full of NON-TTL keys nothing is evictable, so a denyoom write over budget evicts nothing,
+        // the post-eviction per-shard-logical check stays over budget, and the write is correctly
+        // -OOM'd (Redis `volatile-*` with no expirable key). This is the "eviction could not free
+        // enough" branch, decided off the per-shard logical figure (not the global gauge).
+        let c = ctx_full(None, 300, "volatile-lru");
+        let mut s = state(&c);
+        let mut st = store_with(
+            c.databases,
+            map_policy_name("volatile-lru", 1).expect("volatile-lru maps"),
+        );
+        assert!(
+            st.policy_evicts(),
+            "volatile-lru is an evicting (cache) policy"
+        );
+        let t = UnixMillis(0);
+        let val = vec![b'v'; 100];
+        // Fill past the 300-byte budget with NON-TTL keys (no EX), so none are evictable.
+        for i in 0u32..5 {
+            run_admit(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("k{i}").as_bytes(), &val],
+            );
+        }
+        assert!(st.used_memory() >= 300, "over budget with non-TTL keys");
+        // A denyoom write triggers eviction, but nothing is evictable (no TTL keys), so the shard
+        // stays logically over budget and the write is -OOM'd.
+        let (r, ev) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"new", &val]);
+        assert_eq!(ev, 0, "no TTL-bearing key is evictable under volatile-lru");
+        assert_eq!(
+            err_of(r),
+            "-OOM command not allowed when used memory > 'maxmemory'.",
+            "cache mode -OOMs when eviction cannot bring the per-shard logical figure under budget"
+        );
+    }
+
+    #[test]
+    fn noeviction_global_rss_gauge_is_the_hard_ceiling() {
+        // M1 companion (the NOEVICTION half stays the global-RSS hard ceiling): with the shard
+        // logically UNDER its per-shard budget but the process-global allocator gauge OVER maxmemory,
+        // a denyoom write under `noeviction` is -OOM'd off the global gauge (no eviction can clear
+        // it). This is the host-OOM protection the global trigger exists for, and M1 leaves it
+        // intact (M1 only changed the CACHE-mode post-eviction decision).
+        let c = ctx_full(None, 1000, "noeviction");
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::NoEviction);
+        let t = UnixMillis(0);
+        let (r0, _) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v"]);
+        assert_eq!(r0, Value::ok());
+        assert!(st.used_memory() < 1000, "shard is logically under budget");
+        // Global gauge over maxmemory while the shard is logically lean: -OOM (hard ceiling).
+        c.process_memory.publish(5000, 8192);
+        let (r1, _) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k2", b"v2"]);
+        assert_eq!(
+            err_of(r1),
+            "-OOM command not allowed when used memory > 'maxmemory'.",
+            "noeviction keeps the global RSS gauge as the hard ceiling"
         );
     }
 
