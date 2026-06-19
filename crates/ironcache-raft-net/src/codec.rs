@@ -50,6 +50,12 @@ const MSG_FORWARD_PROPOSE_RESULT: u8 = 7;
 // HA-3c snapshot install: new RPC message tags continue from 8 (the next free value).
 const MSG_INSTALL_SNAPSHOT: u8 = 8;
 const MSG_INSTALL_SNAPSHOT_RESP: u8 = 9;
+// PROD-9 Pre-Vote (Ongaro section 9.6): additive RPC tags continue from 10 (the next free
+// value). A peer that predates pre-vote returns None on these unknown discriminants (a
+// dropped frame), so a mixed-version cluster mid-upgrade degrades to no-pre-vote rather than
+// misparsing -- the frames are strictly additive and never collide with an existing tag.
+const MSG_PRE_VOTE: u8 = 10;
+const MSG_PRE_VOTE_RESP: u8 = 11;
 
 // Payload discriminants (the `EntryPayload` variant tag).
 const PAYLOAD_NOOP: u8 = 0;
@@ -90,6 +96,10 @@ const CFG_UNASSIGN_SLOTS: u8 = 10;
 /// byte-for-byte (the codec round-trip test is the gate). The output is a fresh
 /// `Vec<u8>` the adapter hands to [`ironcache_clusterbus::PeerConn::request`] as a
 /// bulk-string argument.
+// One flat match arm per `RaftMsg` variant (PROD-9 added the two Pre-Vote arms), so the
+// function is long by construction; the per-variant layout is the clearest form and the
+// decode mirror is held in lockstep, so the length is intentional rather than refactorable.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn encode_raft_msg(msg: &RaftMsg) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
@@ -108,6 +118,25 @@ pub fn encode_raft_msg(msg: &RaftMsg) -> Vec<u8> {
         }
         RaftMsg::RequestVoteResp { term, vote_granted } => {
             out.push(MSG_REQUEST_VOTE_RESP);
+            put_u64(&mut out, *term);
+            out.push(u8::from(*vote_granted));
+        }
+        RaftMsg::PreVote {
+            term,
+            candidate,
+            last_log_index,
+            last_log_term,
+        } => {
+            // PROD-9 Pre-Vote: byte-identical layout to RequestVote (term, candidate, the
+            // two up-to-date fields), distinguished only by the MSG_PRE_VOTE tag.
+            out.push(MSG_PRE_VOTE);
+            put_u64(&mut out, *term);
+            put_node(&mut out, *candidate);
+            put_u64(&mut out, *last_log_index);
+            put_u64(&mut out, *last_log_term);
+        }
+        RaftMsg::PreVoteResp { term, vote_granted } => {
+            out.push(MSG_PRE_VOTE_RESP);
             put_u64(&mut out, *term);
             out.push(u8::from(*vote_granted));
         }
@@ -464,6 +493,16 @@ pub fn decode_raft_msg(buf: &[u8]) -> Option<RaftMsg> {
             last_log_term: cur.u64()?,
         },
         MSG_REQUEST_VOTE_RESP => RaftMsg::RequestVoteResp {
+            term: cur.u64()?,
+            vote_granted: cur.bool()?,
+        },
+        MSG_PRE_VOTE => RaftMsg::PreVote {
+            term: cur.u64()?,
+            candidate: cur.node()?,
+            last_log_index: cur.u64()?,
+            last_log_term: cur.u64()?,
+        },
+        MSG_PRE_VOTE_RESP => RaftMsg::PreVoteResp {
             term: cur.u64()?,
             vote_granted: cur.bool()?,
         },
