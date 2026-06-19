@@ -39,6 +39,7 @@ type Store = ShardStore<Policy, CountingAccounting>;
 fn ctx(runtime: Arc<RuntimeConfig>, boot: Config) -> ServerContext {
     ServerContext {
         runtime,
+        acl: ironcache_server::AclState::from_requirepass(boot.requirepass.as_deref()),
         databases: boot.databases,
         shards: boot.shards,
         info: ServerInfo {

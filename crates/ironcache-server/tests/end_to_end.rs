@@ -42,8 +42,10 @@ fn ctx_cfg(port: u16, pass: Option<&str>, cluster_enabled: bool) -> ServerContex
         ..ironcache_config::Config::default()
     };
     let runtime = ironcache_config::RuntimeConfig::from_config(&boot);
+    let acl = ironcache_server::AclState::from_requirepass(boot.requirepass.as_deref());
     ServerContext {
         runtime,
+        acl,
         databases: 16,
         shards: 1,
         info: ServerInfo {

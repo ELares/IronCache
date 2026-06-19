@@ -113,6 +113,14 @@ pub struct ServerContext {
     /// The process-wide runtime-config overlay (the highest-precedence layer). Shared
     /// across shards as an `Arc`; the per-command hot-path reads are atomic loads.
     pub runtime: Arc<RuntimeConfig>,
+    /// The process-wide ACL user registry (#106), shared across shards as an `Arc` exactly
+    /// like [`Self::runtime`]. Holds the named users + their per-command/key/channel
+    /// permissions; the serve layer reads it for `AUTH` (resolve + cache the connection's
+    /// `Arc<User>` once) and for the rare `ACL` admin verbs. The per-command ENFORCEMENT
+    /// reads the connection's cached `Arc<User>`, NOT this registry, so the data hot path
+    /// never locks. `AclState::is_acl_active()` is a single relaxed-atomic gate the
+    /// enforcement layer checks first, so the no-ACL default deployment is byte-identical.
+    pub acl: Arc<crate::acl::AclState>,
     /// The boot-resolved config (CLI > env > TOML > defaults), the lower-layer fold.
     /// `CONFIG GET` reads it for the restart-required params (bind/port/databases/...).
     pub boot: Config,
@@ -417,6 +425,178 @@ fn maybe_hot_swap_policy<E: Env, S: PolicySwap>(
 #[must_use]
 pub fn command_allowed_pre_auth(cmd: &[u8]) -> bool {
     matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
+}
+
+/// LIVE-REVOCATION RE-RESOLVE (F1): bring a connection's cached ACL identity up to date with the
+/// registry when a mutation has happened SINCE the identity was cached, run ONCE per command at
+/// the router chokepoint right BEFORE [`acl_enforce`]. This is what makes a mid-session `ACL
+/// SETUSER app -@all` / `ACL DELUSER app` (or an `ACL SETUSER default ...` narrowing the implicit
+/// default) take effect on the offending connection's VERY NEXT command, instead of being fail-open
+/// until that client re-AUTHs or disconnects (the F1 finding; Redis revokes live).
+///
+/// ## Hot path: one relaxed load + integer compare
+///
+/// The COMMON case is no mutation since the connection cached its user: the live registry
+/// `generation` equals `conn.acl_user_gen`, so this returns `true` after ONE relaxed atomic load
+/// and an integer compare -- no lock, no allocation, byte-identical on the no-ACL path (where the
+/// generation never moves at all). Only when the generation MOVED (rare: an `ACL` admin verb ran)
+/// does it take the registry lock to re-resolve the connection's user by `acl_user_name`:
+/// - user still present -> refresh `conn.acl_user` (`None` when all-permissive, so a back-to-
+///   permissive default re-collapses to the byte-identical fast path; `Some` when narrowed, so a
+///   fresh restriction is picked up) and update `conn.acl_user_gen`; returns `true`.
+/// - user DELETED (`ACL DELUSER`) -> DEAUTHENTICATE the connection (clear `authenticated` + drop
+///   the cached user back to the implicit default and reset the name) so its next command hits the
+///   NOAUTH gate, and return `false` so the caller CLOSES it -- mirroring Redis, which kills a
+///   deleted user's clients. Closing (vs silently reverting to the all-permissive default) is the
+///   safe choice: a no-requirepass deployment would otherwise leave the connection running as the
+///   permissive default after its narrowed user was deleted.
+///
+/// Returns `true` when the connection remains a valid identity (possibly refreshed), `false` when
+/// it was deauthenticated and the caller should close it.
+#[must_use]
+pub fn acl_resolve_if_stale(ctx: &ServerContext, conn: &mut ConnState) -> bool {
+    // HOT PATH: one relaxed load + compare. Unchanged generation -> nothing to do.
+    if ctx.acl.generation() == conn.acl_user_gen {
+        return true;
+    }
+    // COLD PATH (a mutation happened): re-resolve the connection's user by name under the lock.
+    match ctx.acl.resolve_if_stale(&conn.acl_user_name) {
+        crate::acl::AclResolution::Refresh { user, generation } => {
+            conn.acl_user = user;
+            conn.acl_user_gen = generation;
+            true
+        }
+        crate::acl::AclResolution::Deauth => {
+            // The user was DELUSER'd: this connection is no longer authenticated AS anyone. Drop
+            // it back to the unauthenticated implicit-default baseline so a NEXT command (if the
+            // caller did not close) hits NOAUTH, and signal the caller to close (Redis parity).
+            conn.authenticated = !ctx.requires_auth();
+            conn.acl_user = None;
+            // Reuse the existing allocation rather than reassign (clippy::assigning_clones).
+            conn.acl_user_name.clear();
+            conn.acl_user_name.push_str(crate::acl::DEFAULT_USER);
+            conn.acl_user_gen = ctx.acl.generation();
+            false
+        }
+    }
+}
+
+/// THE PER-COMMAND ACL ENFORCEMENT CHECK (#106). Given the connection's cached ACL identity
+/// (`acl_user`, `None` == the implicit all-permissive default), the command token, and the
+/// parsed request, decide whether the user may run it. Returns `None` when ALLOWED and
+/// `Some(ErrorReply)` (a `-NOPERM`) when DENIED. This is the value the ACL engine adds: it is
+/// wired at the router chokepoint right after the existing NOAUTH gate, so it covers EVERY
+/// command path (home, cross-shard, whole-keyspace, pubsub, MULTI-queue, CLUSTER mutators).
+///
+/// ## Hot-path discipline (cheap)
+///
+/// The COMMON case is the no-ACL deployment: `acl_active` is `false` (one relaxed atomic
+/// load) and/or the connection is the implicit default (`acl_user == None`), so this returns
+/// `None` after a single bool test -- byte-identical, O(1), no per-command allocation. Only
+/// an ACL-governed connection (a narrowed `Some(user)`) pays for the checks:
+/// 1. the COMMAND test: the user's compiled command-rule replay (`can_run_command`, O(rules)).
+/// 2. the KEY test: ONLY for a key-bearing command, a glob match over its FEW key args
+///    (extracted via the #89 command-spec key spec) against the user's key patterns.
+/// 3. the CHANNEL test: ONLY for a pub/sub command, over its channel args.
+///
+/// The pre-auth allow-list commands (AUTH/HELLO/QUIT/RESET) are NEVER denied here (they ran
+/// before the user was even resolved); they are short-circuited by `acl_user == None` for the
+/// default and explicitly exempted for a narrowed user so a locked-down user can still AUTH /
+/// switch users / RESET (Redis: these are always permitted).
+#[must_use]
+pub fn acl_enforce(
+    acl_active: bool,
+    acl_user: Option<&crate::acl::User>,
+    cmd_upper: &[u8],
+    req: &Request,
+) -> Option<ErrorReply> {
+    // FAST GATE: the no-ACL deployment (no narrowed user anywhere) skips everything. A
+    // connection with no cached narrowed user is the implicit all-permissive default and is
+    // never denied (the `?` returns `None` == ALLOWED); if ACL is globally inactive there is
+    // nothing to enforce either way.
+    let user = acl_user?;
+    if !acl_active {
+        return None;
+    }
+
+    // The connection-control / handshake commands are ALWAYS allowed (Redis: a user can
+    // always AUTH/HELLO/QUIT/RESET regardless of command perms, so it can re-authenticate or
+    // disconnect). This mirrors the pre-auth allow-list.
+    if command_allowed_pre_auth(cmd_upper) {
+        return None;
+    }
+
+    // (a) COMMAND permission.
+    if !user.can_run_command(cmd_upper) {
+        let cmd_lc = String::from_utf8_lossy(cmd_upper).to_ascii_lowercase();
+        return Some(ErrorReply::noperm_command(&user.name, &cmd_lc));
+    }
+
+    // (c) CHANNEL permission for pub/sub commands (the channel args are the message targets).
+    // SUBSCRIBE/UNSUBSCRIBE/PUBLISH take channel name(s) at args[1..]; PUBLISH's args[1] is the
+    // channel (args[2] is the message, not a channel, but it is harmless to also pattern-check
+    // a non-channel here -- Redis checks only the channel, so restrict to the right arg).
+    match cmd_upper {
+        b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" => {
+            if !user.channels.is_allchannels() {
+                for ch in req.args.iter().skip(1) {
+                    if !user.can_access_channel(ch) {
+                        return Some(ErrorReply::noperm_channel());
+                    }
+                }
+            }
+            return None;
+        }
+        b"PUBLISH" => {
+            if !user.channels.is_allchannels() {
+                if let Some(ch) = req.args.get(1) {
+                    if !user.can_access_channel(ch) {
+                        return Some(ErrorReply::noperm_channel());
+                    }
+                }
+            }
+            return None;
+        }
+        _ => {}
+    }
+
+    // (b) KEY permission for key-bearing commands. The all-keys fast path skips the whole
+    // extraction. Otherwise extract the command's keys via the #89 command-spec key spec and
+    // require EVERY touched key to be allowed by the user's key patterns.
+    //
+    // ONLY genuine KEYED commands (`KeyedSingle`/`KeyedMulti`) are key-checked. A
+    // `WholeKeyspace` command (KEYS/SCAN/FLUSHALL/FLUSHDB/DBSIZE/RANDOMKEY) owns no specific
+    // key -- its `key_spec` is the `Arg1` fallback that would return the GLOB PATTERN (KEYS
+    // <pattern>) as if it were a key -- so it is gated by COMMAND perms (it is @keyspace /
+    // @dangerous), NOT key perms, exactly like Redis. `AlwaysHome` commands have no key.
+    if !user.keys.is_allkeys() {
+        if let Some(spec) = crate::command_spec::spec_of(cmd_upper) {
+            if !matches!(
+                spec.class,
+                crate::command_spec::CommandClass::KeyedSingle
+                    | crate::command_spec::CommandClass::KeyedMulti
+            ) {
+                return None;
+            }
+            match crate::command_spec::extract_keys(spec.key_spec, req) {
+                crate::route::KeySpec::None => {}
+                crate::route::KeySpec::One(k) => {
+                    if !user.can_access_key(k) {
+                        return Some(ErrorReply::noperm_key());
+                    }
+                }
+                crate::route::KeySpec::Many(keys) => {
+                    for k in keys {
+                        if !user.can_access_key(k) {
+                            return Some(ErrorReply::noperm_key());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Dispatch one CLIENT command: the top-of-command work that must run ONCE per
@@ -1422,6 +1602,16 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
     // Redis (EXEC ends the transaction, then runs the batch).
     let queued = std::mem::take(&mut state.queued);
     state.clear_txn();
+    // F1 (live revocation, EXEC sub-case): bring the connection's cached ACL identity up to date
+    // BEFORE replaying the batch, then RE-CHECK ACL per queued command below. This closes the race
+    // where an EXTERNAL `ACL SETUSER` / `DELUSER` revokes a permission BETWEEN `MULTI` and `EXEC`:
+    // the commands were queued under the OLD permissions, but Redis re-checks ACL at EXEC time
+    // (per queued command), so a now-forbidden command must be denied at replay. `deauthed` is
+    // `true` when the connection's user was DELUSER'd mid-transaction: every queued command is then
+    // denied (the identity is gone). The HOT PATH (no mutation since MULTI opened) is the same one
+    // relaxed load + compare as the router, so a transaction that ran with no concurrent ACL change
+    // pays nothing here.
+    let deauthed = !acl_resolve_if_stale(ctx, state);
     let mut replies = Vec::with_capacity(queued.len());
     for q in &queued {
         // Re-derive the uppercased token per queued command (cheap; the request was
@@ -1429,9 +1619,22 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
         // no re-borrow of the thread-locals, no double-borrow. Counter deltas
         // ACCUMULATE across the batch (eviction / keyspace hits-misses use `+=`).
         let qcmd = ascii_upper(q.command());
-        let reply = dispatch_inner(
-            ctx, state, env, store, wheel, now, rollup, mem, deltas, q, &qcmd,
-        );
+        // F1: per-queued-command ACL re-check at EXEC. When the user was DELUSER'd mid-txn, deny
+        // every command (NOPERM on the now-nonexistent identity); otherwise run the same
+        // `acl_enforce` the router runs for a live command, so a permission revoked between MULTI
+        // and EXEC denies the affected command (the rest of the batch still runs, Redis parity).
+        let reply = if deauthed {
+            let cmd_lc = String::from_utf8_lossy(&qcmd).to_ascii_lowercase();
+            Value::error(ErrorReply::noperm_command(&state.acl_user_name, &cmd_lc))
+        } else if let Some(deny) =
+            acl_enforce(ctx.acl.is_acl_active(), state.acl_user.as_deref(), &qcmd, q)
+        {
+            Value::error(deny)
+        } else {
+            dispatch_inner(
+                ctx, state, env, store, wheel, now, rollup, mem, deltas, q, &qcmd,
+            )
+        };
         replies.push(reply);
     }
     Value::Array(Some(replies))
@@ -1603,7 +1806,7 @@ fn cmd_hello(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value
     // Apply AUTH if provided; a failed AUTH aborts HELLO without switching proto.
     if let Some((user, pass)) = pending_auth {
         match check_auth(ctx, &user, &pass) {
-            AuthResult::Ok => state.authenticated = true,
+            AuthResult::Ok(u) => apply_auth_success(ctx, state, u),
             AuthResult::NoPasswordSet => {
                 return Value::error(ErrorReply::auth_no_password_set());
             }
@@ -1652,6 +1855,10 @@ fn is_hello_option(arg: &[u8]) -> bool {
 }
 
 /// `AUTH [user] pass` (PROTOCOL.md Tier-0, ERRORS.md auth strings).
+///
+/// `AUTH <pass>` authenticates as `default` (the legacy single-password path); `AUTH <user>
+/// <pass>` authenticates as that ACL user (#106). On success the resolved `Arc<User>` is
+/// CACHED on the connection so the per-command authorization check reads it lock-free.
 fn cmd_auth(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value {
     let (user, pass): (&[u8], &[u8]) = match req.args.len() {
         2 => (b"default", &req.args[1]),
@@ -1659,8 +1866,8 @@ fn cmd_auth(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value 
         _ => return Value::error(ErrorReply::wrong_arity("auth")),
     };
     match check_auth(ctx, user, pass) {
-        AuthResult::Ok => {
-            state.authenticated = true;
+        AuthResult::Ok(u) => {
+            apply_auth_success(ctx, state, u);
             Value::ok()
         }
         AuthResult::NoPasswordSet => Value::error(ErrorReply::auth_no_password_set()),
@@ -1668,41 +1875,119 @@ fn cmd_auth(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value 
     }
 }
 
+/// Commit a successful authentication onto the connection: mark authenticated and CACHE the
+/// resolved ACL user (#106). When the resolved user is the all-permissive default, we cache
+/// `None` (the implicit-default fast path) so the per-command enforcement gate skips it and
+/// the no-ACL deployment stays byte-identical; a NARROWED user is cached as `Some(Arc<User>)`.
+///
+/// F1 (live revocation): also record the user's NAME and the registry GENERATION the user was
+/// resolved against. The per-command path re-resolves by `acl_user_name` when the generation
+/// moves, so a mid-session `ACL SETUSER`/`DELUSER` reaches this connection. The generation is
+/// read from the SAME registry the user came from; a concurrent mutation between resolve and
+/// this read only makes the cached generation conservatively stale (the next command re-checks).
+fn apply_auth_success(ctx: &ServerContext, state: &mut ConnState, user: Arc<crate::acl::User>) {
+    state.authenticated = true;
+    // Reuse the existing allocation rather than reassign (clippy::assigning_clones).
+    state.acl_user_name.clone_from(&user.name);
+    state.acl_user_gen = ctx.acl.generation();
+    state.acl_user = if user.is_all_permissive() {
+        None
+    } else {
+        Some(user)
+    };
+}
+
+/// The outcome of an authentication attempt: the resolved ACL user on success.
 enum AuthResult {
-    Ok,
+    /// Authenticated; carries the resolved `Arc<User>` to cache on the connection.
+    Ok(Arc<crate::acl::User>),
+    /// `AUTH` was issued but no password / ACL user is configured for the target.
     NoPasswordSet,
+    /// Wrong username/password pair, or the user is disabled.
     WrongPass,
 }
 
-/// Check credentials against the CURRENT configured password (read from the runtime
-/// overlay, so a `CONFIG SET requirepass` takes effect immediately, PR-4b). The single
-/// `requirepass`/default-user model (full ACL is later). The username must be `default`
-/// (or empty) when a password is set.
+/// Check credentials against the ACL registry (#106). `AUTH <pass>` targets `default`; `AUTH
+/// <user> <pass>` targets that user. The registry resolves the user, verifies the password
+/// in CONSTANT TIME against the stored SHA-256 digests (or accepts any for a `nopass` user),
+/// and gates on the user being enabled. The plaintext guess lives only as `pass` during
+/// hashing and is never stored or logged.
 ///
-/// The password is stored as a SHA-256 digest AT REST (#65): the runtime overlay holds
-/// only the SHA-256 HEX of the configured password, never the plaintext. Verification
-/// HASHES the provided guess with [`ironcache_config::sha256_hex`] and compares the two
-/// 64-char hex digests in CONSTANT TIME (see [`constant_time_eq`]), so the reply latency
-/// does not leak how many leading bytes of a guess matched the secret (the timing-leak
-/// finding). The plaintext guess lives only as the `pass` argument during hashing and is
-/// never stored or logged. The threat model (#142) accepts plain SHA-256 (not a KDF) for
-/// Redis behavioral equivalence (ADR-0009) and accepts the compare side-channel this
-/// milestone.
+/// Backward compatibility: with NO requirepass and NO ACL config, the registry holds the
+/// `default` `nopass` user, so a bare `AUTH <anything>` for `default` would succeed -- but
+/// Redis instead replies `ERR Client sent AUTH, but no password is set` in that posture. We
+/// preserve that by reporting [`AuthResult::NoPasswordSet`] when targeting `default` and no
+/// requirepass is configured AND no narrower ACL is active. Once an ACL is active (a real
+/// `default` password, or any other user), normal resolution applies.
 fn check_auth(ctx: &ServerContext, user: &[u8], pass: &[u8]) -> AuthResult {
-    match ctx.runtime.requirepass() {
-        None => AuthResult::NoPasswordSet,
-        Some(configured_hash) => {
-            let user_ok = user.is_empty() || user.eq_ignore_ascii_case(b"default");
-            // Hash the GUESS and compare digest-to-digest: the stored credential is the
-            // SHA-256 hex, so we never compare (or hold) the plaintext at rest. The
-            // compare is constant-time over the two fixed-width (64-char) hex digests.
-            let guess_hash = ironcache_config::sha256_hex(pass);
-            if user_ok && constant_time_eq(guess_hash.as_bytes(), configured_hash.as_bytes()) {
-                AuthResult::Ok
-            } else {
-                AuthResult::WrongPass
-            }
+    let name = if user.is_empty() {
+        crate::acl::DEFAULT_USER.to_owned()
+    } else {
+        String::from_utf8_lossy(user).into_owned()
+    };
+
+    let targets_default = name.eq_ignore_ascii_case(crate::acl::DEFAULT_USER);
+
+    // Redis parity: `AUTH <pass>` against the bare default with no password set is an ERR,
+    // not a silent success. This is true exactly when targeting `default`, no requirepass is
+    // configured, and the ACL registry is otherwise inactive (only the all-permissive
+    // default exists). Any active ACL (a default password, or another user) skips this.
+    if targets_default && ctx.runtime.requirepass().is_none() && !ctx.acl.is_acl_active() {
+        return AuthResult::NoPasswordSet;
+    }
+
+    // LEGACY requirepass compatibility for the `default` user (see [`check_default_requirepass`]).
+    // `Some(result)` = the requirepass path DECIDED the auth (matched -> Ok, or a nopass default
+    // mismatch -> WrongPass); `None` = fall through to the normal ACL verify below.
+    if targets_default {
+        if let Some(result) = check_default_requirepass(ctx, pass) {
+            return result;
         }
+    }
+
+    match ctx.acl.authenticate(&name, pass) {
+        Some(u) => AuthResult::Ok(u),
+        None => AuthResult::WrongPass,
+    }
+}
+
+/// The LEGACY `requirepass` path for the `default` user (#106 back-compat). `CONFIG SET
+/// requirepass` (and boot requirepass) live in the runtime overlay, NOT the ACL registry, so for
+/// `default` we ALSO accept the CURRENT runtime requirepass digest -- a `CONFIG SET requirepass`
+/// takes effect LIVE for `AUTH <pass>` alongside any ACL `>pass` digests the registry holds. The
+/// compare is constant-time over the fixed-width hex digests.
+///
+/// SECURITY: when a runtime requirepass IS configured it is AUTHORITATIVE. A `CONFIG SET
+/// requirepass` does not touch the registry, so the boot-default is still `nopass` (it would
+/// accept ANY password). We must NOT let that implicit `nopass` bypass the live requirepass: so a
+/// mismatch against the requirepass digest, when the default carries NO explicit ACL password, is
+/// `-WRONGPASS` here (not a fall-through to the nopass ACL verify).
+///
+/// Returns `Some(AuthResult)` when this path DECIDES the auth (digest match -> `Ok` with the live
+/// default user; or a nopass-default mismatch -> `WrongPass`); `None` when there is no requirepass,
+/// or the default carries explicit ACL passwords (let the caller's ACL verify run those).
+fn check_default_requirepass(ctx: &ServerContext, pass: &[u8]) -> Option<AuthResult> {
+    let configured_hash = ctx.runtime.requirepass()?;
+    let guess_hash = ironcache_config::sha256_hex(pass);
+    if constant_time_eq(guess_hash.as_bytes(), configured_hash.as_bytes()) {
+        // Resolve the live `default` user to cache (its perms apply); fall back to the all-
+        // permissive default if somehow absent (it cannot be deleted).
+        let u = ctx
+            .acl
+            .get_user(crate::acl::DEFAULT_USER)
+            .unwrap_or_else(|| Arc::new(crate::acl::User::default_nopass()));
+        return Some(AuthResult::Ok(u));
+    }
+    // Mismatch: only an EXPLICIT ACL password on the default may still authenticate; the implicit
+    // boot `nopass` must NOT (it would defeat the requirepass).
+    let default_is_nopass = ctx
+        .acl
+        .get_user(crate::acl::DEFAULT_USER)
+        .is_none_or(|u| u.nopass);
+    if default_is_nopass {
+        Some(AuthResult::WrongPass)
+    } else {
+        None
     }
 }
 
@@ -2030,8 +2315,10 @@ mod tests {
             ..ironcache_config::Config::default()
         };
         let runtime = RuntimeConfig::from_config(&boot);
+        let acl = crate::acl::AclState::from_requirepass(boot.requirepass.as_deref());
         ServerContext {
             runtime,
+            acl,
             databases: 16,
             shards: 1,
             info: ServerInfo {

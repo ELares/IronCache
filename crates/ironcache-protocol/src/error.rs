@@ -247,6 +247,35 @@ impl ErrorReply {
         )
     }
 
+    /// `NOPERM User <user> has no permissions to run the '<cmd>' command` - the reply Redis
+    /// emits (src/acl.c `ACLCheckAllPerm` -> `ACL_DENIED_CMD`) when an authenticated ACL
+    /// user runs a command its command permissions deny (#106). Byte-compatible with Redis
+    /// 7's wording. `user` and `cmd` are the authenticated username and the lowercased
+    /// command token; neither is a secret.
+    #[must_use]
+    pub fn noperm_command(user: &str, cmd: &str) -> Self {
+        ErrorReply::new(
+            ErrorCode::NoPerm,
+            format!("User {user} has no permissions to run the '{cmd}' command"),
+        )
+    }
+
+    /// `NOPERM No permissions to access a key` - the reply Redis emits (src/acl.c
+    /// `ACL_DENIED_KEY`) when an authenticated ACL user touches a key its key patterns do
+    /// not allow (#106). Byte-compatible with Redis 7's wording.
+    #[must_use]
+    pub fn noperm_key() -> Self {
+        ErrorReply::new(ErrorCode::NoPerm, "No permissions to access a key")
+    }
+
+    /// `NOPERM No permissions to access a channel` - the reply Redis emits (src/acl.c
+    /// `ACL_DENIED_CHANNEL`) when an authenticated ACL user (un)subscribes to / publishes
+    /// on a channel its channel patterns do not allow (#106).
+    #[must_use]
+    pub fn noperm_channel() -> Self {
+        ErrorReply::new(ErrorCode::NoPerm, "No permissions to access a channel")
+    }
+
     /// `EXECABORT Transaction discarded because of previous errors.`
     #[must_use]
     pub fn exec_abort() -> Self {

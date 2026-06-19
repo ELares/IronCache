@@ -218,6 +218,32 @@ pub fn run_server_observed(
     // itself moves into `ctx_template` below.
     let ctx_template_runtime = Arc::clone(&runtime);
 
+    // The process-wide ACL user registry (#106): ONE Arc shared (cloned) into every shard's
+    // context, exactly like `runtime`. Seeded from the boot-resolved requirepass digest (the
+    // legacy single-`default`-user posture); if an `aclfile` is configured its `user ...` lines
+    // are LOADED on top so ACL users survive a restart. With no requirepass and no aclfile the
+    // registry is the single all-permissive `default` user, so `is_acl_active()` is false and the
+    // per-command enforcement path is byte-identical (no ACL cost).
+    let acl = ironcache_server::AclState::from_requirepass(config.requirepass.as_deref());
+    if let Some(path) = config.aclfile.as_ref() {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match acl.load_users(&text) {
+                Ok(n) => {
+                    tracing::info!(users = n, path = %path.display(), "loaded ACL users from aclfile");
+                }
+                Err((lineno, e)) => {
+                    // A malformed aclfile is an operator error; fail boot loudly rather than run
+                    // with a surprising (or empty) ACL. The error NEVER includes a plaintext
+                    // password (the file holds only #digests / the redacted rule).
+                    panic!("aclfile {} line {lineno}: {}", path.display(), e.reason);
+                }
+            },
+            Err(e) => {
+                panic!("failed to read aclfile {}: {e}", path.display());
+            }
+        }
+    }
+
     // The cluster slot-ownership map (CLUSTER_CONTRACT.md #70), built ONCE here at boot and
     // threaded (Arc) into every shard's context. Slice 3: a cluster-ENABLED node ALWAYS gets a
     // `Some(map)`, in one of two shapes; a cluster-DISABLED standalone node gets `None` (and keeps
@@ -374,6 +400,7 @@ pub fn run_server_observed(
     // immutable, so cloning per shard does not violate shared-nothing.
     let ctx_template = ServerContext {
         runtime,
+        acl,
         boot: config.clone(),
         databases: config.databases,
         shards: config.shards,
@@ -2004,6 +2031,51 @@ async fn route_and_dispatch(
         return false;
     }
 
+    // -- LIVE-REVOCATION RE-RESOLVE (#106, F1). Run ONCE per command right BEFORE the ACL
+    // enforcement chokepoint, so a mid-session `ACL SETUSER` / `ACL DELUSER` / `ACL LOAD` reaches
+    // this already-AUTHed connection on its VERY NEXT command (was fail-open until reconnect,
+    // diverging from Redis which revokes live). HOT PATH: one relaxed atomic load + integer
+    // compare of the registry generation against the connection's cached generation; on the no-ACL
+    // path (and whenever no `ACL` admin verb has run since this connection cached its user) the
+    // generations match and this returns immediately -- byte-unchanged. ONLY when the generation
+    // MOVED (rare) does it take the registry lock to re-resolve the connection's user by name. A
+    // `false` return means the connection's user was DELUSER'd: it is now deauthenticated, so we
+    // reply NOAUTH and CLOSE it (Redis kills a deleted user's clients).
+    if !ironcache_server::acl_resolve_if_stale(ctx, conn) {
+        state_rc.borrow_mut().counters.on_command();
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::noauth()),
+            conn.proto,
+        );
+        return true;
+    }
+
+    // -- THE HOISTED ACL ENFORCEMENT CHOKEPOINT (#106). Immediately AFTER the NOAUTH gate and
+    // BEFORE any interception / cross-shard fan-out / CLUSTER-mutator / persistence / MULTI
+    // queueing / local dispatch, so per-command + per-key + per-channel authorization covers
+    // EVERY command path in ONE place (the same reason the NOAUTH gate is hoisted here). The
+    // connection's authenticated ACL identity (`conn.acl_user`, `None` == the implicit all-
+    // permissive default) was cached at AUTH time, so this check is LOCK-FREE: it reads the
+    // cached `Arc<User>`, never the ACL registry.
+    //
+    // DEFAULT (no ACL config) is BYTE-UNCHANGED + adds at most ~two bool tests: `acl_user` is
+    // `None` for every connection on the no-ACL path, so `acl_enforce` returns `None` after a
+    // single match, and `ctx.acl.is_acl_active()` is one relaxed atomic load that is `false`.
+    // Only an ACL-governed connection (a narrowed `Some(user)`) pays for the command/key/
+    // channel checks. A DENY short-circuits with the `-NOPERM` reply, exactly like the NOAUTH
+    // gate above, and never reaches routing / dispatch.
+    if let Some(deny) = ironcache_server::acl_enforce(
+        ctx.acl.is_acl_active(),
+        conn.acl_user.as_deref(),
+        &cmd_upper,
+        request,
+    ) {
+        state_rc.borrow_mut().counters.on_command();
+        encode_into(out, &ironcache_server::Value::error(deny), conn.proto);
+        return false;
+    }
+
     // HA-6: consume the one-shot ASKING EXACTLY ONCE PER COMMAND, BEFORE any early return
     // (pubsub interception / in_multi / WATCH cluster-redirect / WATCH cross-shard / the internal-
     // verb gate), so a set flag can NEVER leak into a later command. Previously the flag was
@@ -2095,6 +2167,20 @@ async fn route_and_dispatch(
     // never enters this block, so the hot path is byte-unchanged.
     if !conn.in_multi && cmd_upper == b"SHUTDOWN" {
         handle_shutdown_command(persist, ctx, conn, home, inbox, request, out).await;
+        return false;
+    }
+
+    // -- ACL COMMAND INTERCEPTION (#106). The `ACL` admin family (WHOAMI/LIST/USERS/GETUSER/
+    // SETUSER/DELUSER/CAT/GENPASS/SAVE/LOAD) is handled HERE in the serve layer (like CONFIG /
+    // persistence) because it mutates the shared `ctx.acl` registry and SAVE/LOAD do aclfile
+    // I/O the server crate (no std::fs by policy on the data path) does not own. It is gated
+    // `!conn.in_multi` exactly like SAVE/SHUTDOWN: an ACL inside a MULTI falls through to the
+    // generic dispatch (which has no ACL arm -> the standard unknown-command path), a tolerable
+    // minor divergence. The per-command ACL ENFORCEMENT above already ran, so a user without
+    // `+acl` cannot reach this; `default` (and any `+acl` user) can. A non-ACL command never
+    // enters this block, so the hot path is byte-unchanged.
+    if !conn.in_multi && cmd_upper == b"ACL" {
+        handle_acl_command(ctx, conn, env, request, out);
         return false;
     }
 
@@ -2688,6 +2774,81 @@ async fn handle_persist_command(
             );
         }
     }
+}
+
+/// Handle the `ACL` admin command family (#106) in the serve layer. Resolves the connection's
+/// WHOAMI (the cached ACL user's name, or `default` for the implicit all-permissive default),
+/// runs [`ironcache_server::dispatch_acl`] against the shared registry with the determinism-seam
+/// RNG (for GENPASS), then performs any aclfile SAVE/LOAD I/O the handler asks for (the server
+/// crate cannot touch `std::fs` on the data path, so the file I/O lives here, next to boot LOAD).
+///
+/// SAVE writes [`AclState::serialize_aclfile`] to the configured `aclfile`; LOAD reads it and
+/// calls [`AclState::load_users`]. With NO `aclfile` configured both reply the Redis-faithful
+/// `-ERR This Redis instance is not configured to use an ACL file...`. Passwords are persisted
+/// only as `#<sha256-hex>` digests; an I/O or parse error is surfaced (never a plaintext secret).
+fn handle_acl_command(
+    ctx: &ServerContext,
+    conn: &ConnState,
+    env: &Rc<RefCell<SystemEnv>>,
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    use ironcache_server::{AclSideEffect, Value};
+    shard_state().borrow_mut().counters.on_command();
+
+    // WHOAMI: the cached ACL identity's name, or `default` (the implicit all-permissive default
+    // / legacy-requirepass posture caches `None`). Resolved here, not on the data path.
+    let whoami: &str = conn
+        .acl_user
+        .as_deref()
+        .map_or(ironcache_server::DEFAULT_USER, |u| u.name.as_str());
+
+    // Run the pure ACL handler with the determinism-seam RNG (GENPASS draws from it, ADR-0003).
+    let (reply, effect) = {
+        let mut env_ref = env.borrow_mut();
+        ironcache_server::dispatch_acl(&ctx.acl, whoami, env_ref.rng(), request)
+    };
+
+    let reply = match effect {
+        AclSideEffect::None => reply,
+        AclSideEffect::Save(text) => match ctx.boot.aclfile.as_ref() {
+            None => Value::error(ironcache_protocol::ErrorReply::err(
+                "This Redis instance is not configured to use an ACL file. \
+                 You may want to specify users via the ACL SETUSER command and then issue a \
+                 CONFIG REWRITE (assuming you have a Redis configuration file set) in order to \
+                 store users in the Redis configuration.",
+            )),
+            Some(path) => match std::fs::write(path, text.as_bytes()) {
+                Ok(()) => reply,
+                Err(e) => Value::error(ironcache_protocol::ErrorReply::err(format!(
+                    "ACL SAVE failed writing the aclfile: {e}"
+                ))),
+            },
+        },
+        AclSideEffect::Load => match ctx.boot.aclfile.as_ref() {
+            None => Value::error(ironcache_protocol::ErrorReply::err(
+                "This Redis instance is not configured to use an ACL file. \
+                 You may want to specify users via the ACL SETUSER command and then issue a \
+                 CONFIG REWRITE (assuming you have a Redis configuration file set) in order to \
+                 store users in the Redis configuration.",
+            )),
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => match ctx.acl.load_users(&text) {
+                    Ok(_) => reply,
+                    // The error never includes a plaintext password (the file holds only
+                    // #digests / the redacted rule), so it is safe to surface verbatim.
+                    Err((lineno, e)) => Value::error(ironcache_protocol::ErrorReply::err(format!(
+                        "ACL LOAD failed at aclfile line {lineno}: {}",
+                        e.reason
+                    ))),
+                },
+                Err(e) => Value::error(ironcache_protocol::ErrorReply::err(format!(
+                    "ACL LOAD failed reading the aclfile: {e}"
+                ))),
+            },
+        },
+    };
+    encode_into(out, &reply, conn.proto);
 }
 
 /// Handle the `SHUTDOWN [NOSAVE|SAVE]` graceful-shutdown command (#139, SHUTDOWN.md). This is the
@@ -4928,6 +5089,7 @@ mod tests {
         };
         ServerContext {
             runtime: ironcache_config::RuntimeConfig::from_config(&boot),
+            acl: ironcache_server::AclState::from_requirepass(boot.requirepass.as_deref()),
             databases: boot.databases,
             shards: 1,
             info: ServerInfo {

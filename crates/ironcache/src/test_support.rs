@@ -140,6 +140,32 @@ pub fn run_server_with_auth_for_test(port: u16, shards: usize, password: &str) -
     run_server(&config).expect("test auth server failed to bind")
 }
 
+/// Boot a real server with an ACL FILE configured (#106) on `127.0.0.1:port` across `shards`
+/// shards, so an integration test can prove the aclfile boot-LOAD + `ACL SAVE`/`ACL LOAD` round
+/// trip over real sockets. `aclfile` is the path the server loads `user <name> <rules>...` lines
+/// from at boot and writes back on `ACL SAVE`. With no `requirepass` and the aclfile holding only
+/// an all-permissive `default`, the no-narrowed-user path stays byte-identical until a non-default
+/// user is added.
+///
+/// # Panics
+///
+/// Panics if the config fails to validate or the server fails to bind.
+#[must_use]
+pub fn run_server_with_aclfile_for_test(port: u16, shards: usize, aclfile: PathBuf) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        aclfile: Some(aclfile),
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test aclfile config must validate");
+    run_server(&config).expect("test aclfile server failed to bind")
+}
+
 /// Boot a real CLUSTER-mode server (static `topology`, this node's `announce_id`) WITH a
 /// `requirepass` across `shards` shards, so a test can prove the hoisted NOAUTH chokepoint gates the
 /// CLUSTER topology MUTATORS (MEET/FORGET/ADDSLOTS/SETSLOT/DELSLOTS/REPLICATE/SET-CONFIG-EPOCH)

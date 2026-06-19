@@ -1958,7 +1958,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bytes::Bytes;
 
