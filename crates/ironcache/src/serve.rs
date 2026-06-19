@@ -333,6 +333,23 @@ pub fn run_server_observed(
     // section and the gauges report 0.
     let persist_stats = persist.as_ref().map(|p| p.stats());
 
+    // The process-GLOBAL allocator-memory gauge (PROD-SAFETY #1/#2): ONE per node, shared by `Arc`
+    // onto every shard's context AND into each shard's periodic expiry tick (which reads the
+    // jemalloc mallctl OFF the command hot path and publishes here). The maxmemory admission gate
+    // reads it so the over-limit DECISION is driven off REAL process memory against the FULL
+    // `maxmemory` (protecting the HOST from OOM), with the per-shard logical counter as the
+    // byte-unchanged fallback when no allocator figure is available. Created unconditionally (it is
+    // two cheap atomics); when `maxmemory == 0` (the default) the gate is never consulted, so this
+    // adds nothing to the default hot path.
+    let process_memory = Arc::new(ironcache_observe::ProcessMemoryGauge::new());
+
+    // The process-GLOBAL live-connection gate (PROD-SAFETY #3, the `maxclients` connection-
+    // exhaustion DoS fix): ONE per node, shared by `Arc` onto every shard's accept path so the
+    // per-connection serve loop can reject a connection over the `maxclients` ceiling (read from the
+    // runtime overlay) and release the slot on close. Created unconditionally (a single atomic); the
+    // default ceiling is 10000 (Redis parity), so an unconfigured node is protected.
+    let conn_gate = Arc::new(ironcache_observe::ConnectionGate::new());
+
     // Static, cheaply-cloned server context shared by value onto each shard. The
     // mutable cross-shard state is ONLY the runtime cell (an Arc); the rest is
     // immutable, so cloning per shard does not violate shared-nothing.
@@ -383,6 +400,13 @@ pub fn run_server_observed(
         // same live atomics the persistence path writes (durability footgun fix #5). `None` on the
         // default persistence-off path -> INFO renders the honest persistence-disabled section.
         persist_stats: persist_stats.clone(),
+        // The process-global allocator-memory gauge (PROD-SAFETY #1/#2): the SAME `Arc` cloned onto
+        // every shard's context, so each shard's admission gate reads the figure the shards'
+        // periodic expiry ticks publish into it.
+        process_memory: process_memory.clone(),
+        // The process-global live-connection gate (PROD-SAFETY #3): the SAME `Arc` cloned onto every
+        // shard's context, so every shard's accept path enforces the one node-level `maxclients` cap.
+        conn_gate: conn_gate.clone(),
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
@@ -528,6 +552,15 @@ thread_local! {
     // threads. `None` on the DEFAULT path (no `--metrics-addr`): `shard_state` then builds a
     // standalone counter cell, byte-identical to before this feature.
     static METRICS_CELL: RefCell<Option<std::sync::Arc<ironcache_observe::ShardCountersCell>>> =
+        const { RefCell::new(None) };
+    // The process-GLOBAL allocator-memory gauge (PROD-SAFETY #1/#2): the SHARED node-level
+    // `Arc<ProcessMemoryGauge>` from the server context, ADOPTED per shard at boot so this shard's
+    // periodic expiry tick can PUBLISH the latest jemalloc figure into it OFF the command hot path.
+    // The admission gate reads the same gauge (via the context) to drive the over-limit trigger off
+    // REAL process memory. `None` until adopted (the first connection / drain-loop boot adopts it);
+    // when unadopted the tick simply does not publish (and the gate's fallback to the per-shard
+    // logical counter keeps the default path byte-unchanged).
+    static PROCESS_MEMORY_GAUGE: RefCell<Option<std::sync::Arc<ironcache_observe::ProcessMemoryGauge>>> =
         const { RefCell::new(None) };
     // The shard's per-shard store: the per-DB hashbrown kvobj map (ADR-0005) wired
     // with the configured eviction policy. Held as Rc<RefCell<..>> exactly like ENV,
@@ -750,6 +783,13 @@ fn expire_cycle_tick(
     // `store.len()` read (a sum over the per-DB lengths) and one relaxed atomic store do not touch
     // the command path.
     publish_keyspace_keys(store_rc.borrow().len() as u64);
+    // Refresh the PROCESS-GLOBAL allocator-memory gauge (PROD-SAFETY #1/#2) OFF the command hot
+    // path: read the jemalloc `(allocated, resident)` pair once and publish it so the maxmemory
+    // admission gate decides over-limit off REAL process memory (the figure that bounds RSS), not
+    // the logical counter that undercounts ~2x. A no-op when the gauge is unadopted. This runs on
+    // EVERY shard's tick (each shard publishes the same node-global figure), which is harmless: the
+    // last writer wins and the value is a fuzzy, eventually-consistent snapshot by design.
+    refresh_process_memory_gauge();
     reaped
 }
 
@@ -804,6 +844,38 @@ fn publish_keyspace_keys(keys: u64) {
     METRICS_CELL.with(|c| {
         if let Some(cell) = c.borrow().as_ref() {
             cell.set_keyspace_keys(keys);
+        }
+    });
+}
+
+/// Adopt THIS shard's reference to the SHARED process-global allocator-memory gauge (PROD-SAFETY
+/// #1/#2), so the shard's periodic expiry tick can publish the latest jemalloc figure into the
+/// SAME gauge the admission gate reads via the context. Idempotent (a no-op once adopted); MUST run
+/// before the first expiry tick. Both the drain-loop boot and the first connection call it with the
+/// node-level gauge from the context.
+pub(crate) fn adopt_process_memory_gauge(
+    gauge: &std::sync::Arc<ironcache_observe::ProcessMemoryGauge>,
+) {
+    PROCESS_MEMORY_GAUGE.with(|c| {
+        let mut b = c.borrow_mut();
+        if b.is_none() {
+            *b = Some(std::sync::Arc::clone(gauge));
+        }
+    });
+}
+
+/// Publish the latest PROCESS-GLOBAL allocator figure into the adopted gauge (PROD-SAFETY #1/#2),
+/// OFF the command hot path (called from the periodic active-expiry tick). Reads the jemalloc
+/// `(allocated, resident)` pair via the store's mallctl ONCE per cycle and stores it, so the
+/// maxmemory admission gate sees a live (eventually-consistent, bounded by the expiry cycle)
+/// process-memory figure without ever advancing the jemalloc epoch per command. A no-op when the
+/// gauge is unadopted (the default path before the first connection, or a build with no allocator
+/// to query, where `process_memory()` reports 0 and the gate falls back to the logical counter).
+fn refresh_process_memory_gauge() {
+    PROCESS_MEMORY_GAUGE.with(|c| {
+        if let Some(gauge) = c.borrow().as_ref() {
+            let (used_memory, used_memory_rss) = process_memory();
+            gauge.publish(used_memory, used_memory_rss);
         }
     });
 }
@@ -939,6 +1011,9 @@ async fn serve_connection(
     // drain-loop boot usually adopts first; this is the idempotent fallback for a connection that
     // races ahead of the drain loop's first poll. A no-op when `/metrics` is disabled.
     adopt_metrics_cell(ctx.metrics_registry.as_ref(), home.index);
+    // Adopt THIS shard's reference to the shared process-global allocator-memory gauge (PROD-SAFETY
+    // #1/#2) so this shard's expiry tick publishes the live jemalloc figure the admission gate reads.
+    adopt_process_memory_gauge(&ctx.process_memory);
     let state_rc = shard_state();
     // The reserved-band width is derived from the configured TOTAL shard count so SCAN's
     // composite cursor is band-aligned when shards > 1 (FIX 1); 0 keeps single-shard SCAN
@@ -955,6 +1030,27 @@ async fn serve_connection(
     ensure_shard_started(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
     // Correct the context's started_at to this shard's boot instant.
     ctx.info.started_at = shard_started_at();
+
+    // MAXCLIENTS gate (PROD-SAFETY #3, the connection-exhaustion DoS fix). Atomically admit this
+    // connection against the process-GLOBAL live-connection count vs the `maxclients` ceiling (read
+    // from the runtime overlay, so a `CONFIG SET maxclients` takes effect for new connections). When
+    // the node is already AT the cap, reject: write the byte-exact Redis `-ERR max number of clients
+    // reached` reply, then close, WITHOUT counting this connection (it was never admitted) and
+    // WITHOUT entering the serve loop. `maxclients == 0` disables the cap (the pre-fix behavior).
+    // This is a COLD accept-path check (once per connection, never per command). On admit, a
+    // matching `conn_gate.release()` on the close path below frees the slot.
+    if !ctx.conn_gate.try_admit(ctx.runtime.maxclients()) {
+        let mut reject = Vec::with_capacity(64);
+        encode_into(
+            &mut reject,
+            &ironcache_server::Value::Error(ironcache_server::ErrorReply::err(
+                "max number of clients reached",
+            )),
+            default_proto,
+        );
+        let _ = stream.send(reject).await;
+        return;
+    }
 
     let addr = stream
         .peer_addr()
@@ -997,6 +1093,26 @@ async fn serve_connection(
     let limits = Limits::default();
     let mut read_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
+
+    // The IDLE TIMEOUT (PROD-SAFETY #4): a connection that sits idle (no command) longer than
+    // `timeout_secs` is CLOSED, so idle connections cannot accumulate. `0` (the Redis default)
+    // DISABLES it -- the non-subscriber idle wait then stays a plain `recv` with no timer, the
+    // byte-unchanged hot path. The timeout is boot-config (Redis `timeout` is settable, but
+    // IronCache reads it once per connection here; a runtime change is a documented follow-up). It
+    // is measured via the Runtime timer SEAM (NOT wall-clock) and the deadline RE-ARMS on each loop
+    // iteration -- i.e. after each command batch is served -- which is the per-command deadline
+    // reset (an active connection is never closed). A zero-sized `TokioRuntime` backend supplies the
+    // timer (the shard's tasks live on the LocalSet; this carries no state). The OUTPUT-BUFFER cap
+    // (PROD-SAFETY #5) is read from the runtime overlay each flush (a `CONFIG SET` takes effect).
+    let idle_timeout: Option<core::time::Duration> = {
+        let secs = ctx.boot.timeout_secs;
+        if secs == 0 {
+            None
+        } else {
+            Some(core::time::Duration::from_secs(secs))
+        }
+    };
+    let timer_rt = TokioRuntime::new();
 
     'conn: loop {
         // Drain every complete request currently buffered (pipelining), building
@@ -1046,6 +1162,18 @@ async fn serve_connection(
             }
         }
 
+        // OUTPUT-BUFFER hard cap (PROD-SAFETY #5): before flushing, if the pending reply buffer has
+        // grown past the configured `output_buffer_limit`, CLOSE the connection rather than let a
+        // slow consumer / a huge reply / a pipelined flood drive unbounded server memory. `0`
+        // disables the cap (the pre-fix unbounded behavior); the default is a high ceiling so a
+        // legitimate large reply / deep pipeline is never affected. Read from the runtime overlay so
+        // a `CONFIG SET output-buffer-limit` takes effect for subsequent batches. We drop the
+        // oversized buffer unsent and close (matching Redis closing a client over the limit).
+        let obl = ctx.runtime.output_buffer_limit();
+        if obl > 0 && out.len() as u64 > obl {
+            break;
+        }
+
         if !out.is_empty() {
             // Owned-buffer send: hand `out` over and take the returned buffer back. Over the
             // client stream (plain or TLS); the plain arm is the same TcpStream write the prior
@@ -1057,11 +1185,12 @@ async fn serve_connection(
         }
 
         // IDLE WAIT. The NON-subscriber path (the common, hot path) is BYTE-IDENTICAL to before
-        // pub/sub: just await `rt.recv`, no select! overhead. Only a connection in SUBSCRIBE mode
-        // pays for the select! that ALSO drains the push channel (`subscriber_idle_wait`). FIFO
-        // ordering holds because `out` was already flushed above before we reach this idle wait,
-        // so a push is rendered and sent only AFTER the in-flight command batch's reply went out
-        // -- a push never precedes a command reply on the connection (SERVER_PUSH.md FIFO).
+        // pub/sub when no idle timeout is configured: just await `rt.recv`, no select! overhead.
+        // Only a connection in SUBSCRIBE mode pays for the select! that ALSO drains the push channel
+        // (`subscriber_idle_wait`). FIFO ordering holds because `out` was already flushed above
+        // before we reach this idle wait, so a push is rendered and sent only AFTER the in-flight
+        // command batch's reply went out -- a push never precedes a command reply on the connection
+        // (SERVER_PUSH.md FIFO).
         if conn.is_subscriber() {
             if subscriber_idle_wait(
                 &mut stream,
@@ -1075,9 +1204,34 @@ async fn serve_connection(
             {
                 break;
             }
+        } else if let Some(timeout) = idle_timeout {
+            // IDLE-TIMEOUT path (PROD-SAFETY #4): race the read against the Runtime timer seam. The
+            // deadline is fresh on each iteration (re-armed after the command batch above), so an
+            // active connection never trips it; only a connection idle for `timeout` seconds with no
+            // new bytes does, and is then closed. The read is into a FRESH buffer and the new bytes
+            // are APPENDED to `read_buf` (NOT moved into the recv): had the timer won, a `read_buf`
+            // moved into the cancelled recv future would be dropped along with any partial frame it
+            // held; reading into a temporary keeps `read_buf`'s partial bytes safe across
+            // cancellation (the same pattern the subscriber idle-wait uses).
+            tokio::select! {
+                res = stream.recv(Vec::new()) => {
+                    let Ok(res) = res else { break; };
+                    if res.n == 0 {
+                        break; // peer closed
+                    }
+                    read_buf.extend_from_slice(&res.buf[..res.n]);
+                }
+                () = timer_rt.timer(timeout) => {
+                    // Idle past the timeout with no new command bytes: close the connection
+                    // (PROD-SAFETY #4). `read_buf` (with any buffered partial frame) is simply
+                    // dropped on the close path below.
+                    break;
+                }
+            }
         } else {
             // Need more bytes: read over the client stream (plain or TLS). The plain arm is the
-            // same TcpStream read the prior `rt.recv` did, so the plaintext hot path is unchanged.
+            // same TcpStream read the prior `rt.recv` did, so the plaintext hot path is unchanged
+            // (no idle timeout configured -> no timer, byte-identical to before PROD-SAFETY #4).
             let Ok(res) = stream.recv(std::mem::take(&mut read_buf)).await else {
                 break;
             };
@@ -1114,6 +1268,11 @@ async fn serve_connection(
         conn.clear_watch();
     }
     state_rc.borrow_mut().counters.on_connection_close();
+    // Release this connection's slot in the process-GLOBAL connection gate (PROD-SAFETY #3). It was
+    // ADMITTED above (we only reach this close path for an admitted connection; a rejected one
+    // returned early WITHOUT counting), so the matching release keeps the live count accurate so the
+    // `maxclients` cap is enforced against a true figure over the node's lifetime.
+    ctx.conn_gate.release();
 }
 
 /// The SUBSCRIBE-mode idle wait (SERVER_PUSH.md #20, PR 91a): `select!` between draining the
@@ -4763,6 +4922,8 @@ mod tests {
             in_sync_replicas: Some(in_sync),
             metrics_registry: None,
             persist_stats: None,
+            process_memory: Arc::new(ironcache_observe::ProcessMemoryGauge::new()),
+            conn_gate: Arc::new(ironcache_observe::ConnectionGate::new()),
             boot,
         }
     }

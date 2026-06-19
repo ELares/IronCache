@@ -106,7 +106,9 @@ pub use ironcache_expiry::TimingWheel;
 
 // Re-export the protocol types callers need so the binary depends on one crate
 // for the server surface.
-pub use ironcache_protocol::{DecodeOutcome, Limits, ProtoVersion, Request, Value, decode, encode};
+pub use ironcache_protocol::{
+    DecodeOutcome, ErrorReply, Limits, ProtoVersion, Request, Value, decode, encode,
+};
 
 // Re-export the storage WAIST types the binary needs to construct/pass a store and
 // the `now` basis. The binary depends on ironcache-storage transitively through

@@ -114,6 +114,22 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "requirepass",
             kind: SetKind::Runtime,
         },
+        // The simultaneous-connection ceiling (Redis `maxclients`, PROD-SAFETY #3). RUNTIME-
+        // SETTABLE: `CONFIG SET maxclients <n>` updates the live ceiling the accept path reads,
+        // matching Redis (`maxclients` is a MODIFIABLE config). `0` disables the cap.
+        ParamSpec {
+            name: "maxclients",
+            kind: SetKind::Runtime,
+        },
+        // The per-connection output-buffer hard cap in bytes (PROD-SAFETY #5, the IronCache analog
+        // of Redis `client-output-buffer-limit`). RUNTIME-SETTABLE: `CONFIG SET output-buffer-limit
+        // <bytes>` updates the live cap the serve loop enforces; `0` disables it. Named with the
+        // simple scalar `output-buffer-limit` (IronCache uses a single hard byte cap, not Redis's
+        // per-class `<class> <hard> <soft> <secs>` grammar).
+        ParamSpec {
+            name: "output-buffer-limit",
+            kind: SetKind::Runtime,
+        },
         ParamSpec {
             name: "maxmemory-samples",
             kind: SetKind::AcceptedNoOp,
@@ -245,6 +261,11 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // client reads here is a hash and is NOT meant to be re-`SET` (CONFIG SET always
         // treats its value as plaintext; the ACL `#<hash>` pre-hashed form is #106).
         "requirepass" => runtime.requirepass().unwrap_or_default(),
+        // The connection / output-buffer safety ceilings (PROD-SAFETY #3/#5): read the overlay so a
+        // `CONFIG SET` is reflected. `maxclients` is a plain count; `output-buffer-limit` is a byte
+        // count (reported as bytes, the form CONFIG SET accepts back).
+        "maxclients" => runtime.maxclients().to_string(),
+        "output-buffer-limit" => runtime.output_buffer_limit().to_string(),
         // Accepted no-ops: fixed Redis-recognized defaults under the cache build.
         // `maxmemory-samples` defaults to 5 in Redis.
         "maxmemory-samples" => "5".to_owned(),
@@ -353,6 +374,26 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
             runtime.set_requirepass(value);
             SetOutcome::Applied
         }
+        // The simultaneous-connection ceiling (PROD-SAFETY #3): a plain non-negative integer
+        // count; `0` disables the cap. A malformed value is an invalid value (never a silent 0).
+        "maxclients" => match value.parse::<u64>() {
+            Ok(n) => {
+                runtime.set_maxclients(n);
+                SetOutcome::Applied
+            }
+            Err(_) => {
+                SetOutcome::InvalidValue(format!("'{value}' is not a valid maxclients count"))
+            }
+        },
+        // The per-connection output-buffer hard cap (PROD-SAFETY #5): a byte count accepted as a
+        // human size ("256mb") OR a plain integer; `0` disables it. A malformed value is rejected.
+        "output-buffer-limit" => match crate::parse_human_size(value) {
+            Ok(bytes) => {
+                runtime.set_output_buffer_limit(bytes);
+                SetOutcome::Applied
+            }
+            Err(e) => SetOutcome::InvalidValue(e.to_string()),
+        },
         "save" => {
             // `CONFIG SET save "<seconds> <changes> [...]"` (#58 durability footgun fix): parse the
             // Redis `save` directive into the live periodic-save policy the saver reads each tick.

@@ -1147,6 +1147,8 @@ mod tests {
             in_sync_replicas: None,
             metrics_registry: None,
             persist_stats: None,
+            process_memory: std::sync::Arc::new(ironcache_observe::ProcessMemoryGauge::new()),
+            conn_gate: std::sync::Arc::new(ironcache_observe::ConnectionGate::new()),
             boot,
         }
     }

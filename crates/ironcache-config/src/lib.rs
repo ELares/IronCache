@@ -282,6 +282,22 @@ pub struct Config {
     /// Idle timeout in seconds; `0` disables idle disconnection (Redis default 0,
     /// CONNECTION_LIFECYCLE.md).
     pub timeout_secs: u64,
+    /// The maximum number of simultaneous client connections (Redis `maxclients`,
+    /// default 10000). A new connection accepted while the process is AT this cap is
+    /// rejected with `-ERR max number of clients reached` (the error is written, then
+    /// the socket is closed), bounding the connection-exhaustion DoS (PROD-SAFETY #3).
+    /// Tracked against the process-global connected-clients gauge. `0` DISABLES the cap
+    /// (unlimited connections, the pre-fix behavior), but the default is the Redis
+    /// 10000 ceiling so an unconfigured node is protected.
+    pub maxclients: u64,
+    /// The per-connection OUTPUT-BUFFER hard cap in bytes (the IronCache analog of Redis
+    /// `client-output-buffer-limit`, PROD-SAFETY #5). A connection whose pending unflushed
+    /// reply buffer would exceed this is CLOSED rather than allowed to grow unbounded (a
+    /// slow consumer / a huge reply / a pub-sub flood would otherwise be a server-memory
+    /// DoS). `0` DISABLES the cap (the pre-fix unbounded behavior); the default is a high
+    /// ceiling ([`DEFAULT_OUTPUT_BUFFER_LIMIT`]) so a legitimate large pipeline/reply is
+    /// unaffected while a pathological accumulation is bounded.
+    pub output_buffer_limit: u64,
     /// Whether the server runs in cluster mode (Redis `cluster-enabled`,
     /// CLUSTER_CONTRACT.md #70). BOOT-ONLY (immutable at runtime, like Redis): it is
     /// reported by `CLUSTER INFO` (`cluster_enabled:0/1`) and the INFO `# Cluster`
@@ -480,6 +496,16 @@ impl Default for Config {
             maxmemory_policy: "allkeys-lru".to_owned(),
             requirepass: None,
             timeout_secs: 0,
+            // The Redis `maxclients` default (10000): an unconfigured node is protected
+            // from connection exhaustion without an operator opting in. A huge value (or
+            // 0) effectively disables the cap; the default still leaves vast headroom for
+            // a normal workload. (PROD-SAFETY #3.)
+            maxclients: DEFAULT_MAXCLIENTS,
+            // A high per-connection output-buffer ceiling by default (PROD-SAFETY #5): a
+            // legitimate large reply / deep pipeline is unaffected, but a pathological
+            // unbounded accumulation (slow consumer / pub-sub flood) is bounded so it
+            // cannot OOM the host. 0 disables it (unbounded, the pre-fix behavior).
+            output_buffer_limit: DEFAULT_OUTPUT_BUFFER_LIMIT,
             // Standalone by default (Redis `cluster-enabled no`). Slice 1 is
             // cluster-disabled-but-introspectable (CLUSTER_CONTRACT.md #70).
             cluster_enabled: false,
@@ -534,6 +560,22 @@ impl Default for Config {
         }
     }
 }
+
+/// Default `maxclients` (PROD-SAFETY #3): the simultaneous-connection ceiling, matching
+/// Redis's 10000 default. A new connection accepted at this cap is rejected with
+/// `-ERR max number of clients reached`, bounding the connection-exhaustion DoS. The
+/// default protects an unconfigured node while leaving ample headroom for a normal
+/// workload; `0` disables the cap (unlimited, the pre-fix behavior).
+pub const DEFAULT_MAXCLIENTS: u64 = 10_000;
+
+/// Default per-connection output-buffer hard cap in bytes (PROD-SAFETY #5): 1 GiB. A
+/// connection whose pending unflushed reply would exceed this is closed, bounding a
+/// slow-consumer / huge-reply / pub-sub-flood server-memory DoS. The default is high
+/// enough that a legitimate large reply or deep pipeline (a bulk-string value is itself
+/// capped at the 512 MB `proto-max-bulk-len`) is never affected, while a pathological
+/// unbounded accumulation is bounded; `0` disables the cap (unbounded, the pre-fix
+/// behavior).
+pub const DEFAULT_OUTPUT_BUFFER_LIMIT: u64 = 1024 * 1024 * 1024;
 
 /// Default HA-8 replication-lag bound (logical writes) for promotion eligibility + the
 /// replica-read staleness gate. A modest window: a replica more than this many writes
@@ -1064,6 +1106,14 @@ pub struct ConfigOverlay {
     pub requirepass: Option<String>,
     /// Idle timeout in seconds.
     pub timeout: Option<u64>,
+    /// The maximum simultaneous client connections (Redis `maxclients`, PROD-SAFETY #3).
+    /// TOML (`maxclients = 10000`) + the `IRONCACHE_MAXCLIENTS` env var. `None` leaves the
+    /// lower layer (default [`DEFAULT_MAXCLIENTS`] = 10000); `0` disables the cap.
+    pub maxclients: Option<u64>,
+    /// The per-connection output-buffer hard cap in bytes (PROD-SAFETY #5). TOML
+    /// (`output_buffer_limit = 1073741824`) + the `IRONCACHE_OUTPUT_BUFFER_LIMIT` env var.
+    /// `None` leaves the lower layer (default [`DEFAULT_OUTPUT_BUFFER_LIMIT`]); `0` disables it.
+    pub output_buffer_limit: Option<u64>,
     /// Whether to run in cluster mode (Redis `cluster-enabled`, CLUSTER_CONTRACT.md #70).
     /// Boot-only; `None` leaves the lower layer (default `false`) showing through.
     pub cluster_enabled: Option<bool>,
@@ -1196,6 +1246,30 @@ impl ConfigOverlay {
         }
         if let Ok(v) = std::env::var("IRONCACHE_REQUIREPASS") {
             o.requirepass = Some(v);
+        }
+        // Idle timeout (PROD-SAFETY #4): seconds a connection may sit idle before it is
+        // closed; 0 disables it (Redis default). Env-readable for parity with the other
+        // connection knobs (previously TOML-only).
+        if let Ok(v) = std::env::var("IRONCACHE_TIMEOUT") {
+            o.timeout = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "timeout",
+                reason: format!("not a number of seconds: {v}"),
+            })?);
+        }
+        // The simultaneous-connection ceiling (PROD-SAFETY #3, Redis `maxclients`); 0
+        // disables the cap.
+        if let Ok(v) = std::env::var("IRONCACHE_MAXCLIENTS") {
+            o.maxclients = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "maxclients",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        // The per-connection output-buffer hard cap in bytes (PROD-SAFETY #5); 0 disables it.
+        if let Ok(v) = std::env::var("IRONCACHE_OUTPUT_BUFFER_LIMIT") {
+            o.output_buffer_limit = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "output_buffer_limit",
+                reason: format!("not a number of bytes: {v}"),
+            })?);
         }
         if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_ENABLED") {
             o.cluster_enabled = Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
@@ -1367,6 +1441,12 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.timeout {
             cfg.timeout_secs = v;
+        }
+        if let Some(v) = self.maxclients {
+            cfg.maxclients = v;
+        }
+        if let Some(v) = self.output_buffer_limit {
+            cfg.output_buffer_limit = v;
         }
         if let Some(v) = self.cluster_enabled {
             cfg.cluster_enabled = v;
@@ -1632,6 +1712,17 @@ mod tests {
         // raft-mode node actually compacts (the engine's own default is 0 = disabled).
         assert_eq!(c.raft_snapshot_threshold, DEFAULT_RAFT_SNAPSHOT_THRESHOLD);
         assert_ne!(c.raft_snapshot_threshold, 0);
+        // CONNECTION SAFETY ceilings (PROD-SAFETY #3/#4/#5): the idle timeout is OFF by default
+        // (Redis default 0, byte-unchanged), `maxclients` defaults to the Redis 10000 ceiling (an
+        // unconfigured node is protected from connection exhaustion), and the output-buffer cap
+        // defaults to the high 1 GiB ceiling (a legitimate large reply is unaffected; a pathological
+        // accumulation is bounded). All are non-restrictive enough to leave the default hot path /
+        // legitimate workload unchanged while closing the DoS gaps.
+        assert_eq!(c.timeout_secs, 0);
+        assert_eq!(c.maxclients, DEFAULT_MAXCLIENTS);
+        assert_eq!(c.maxclients, 10_000);
+        assert_eq!(c.output_buffer_limit, DEFAULT_OUTPUT_BUFFER_LIMIT);
+        assert_eq!(c.output_buffer_limit, 1024 * 1024 * 1024);
         // No data directory by default: the Raft log lands under the OS temp dir (unchanged).
         assert!(c.data_dir.is_none());
         // PERSISTENCE save policy is OFF by default (#58): no periodic save timer in the default
@@ -2648,5 +2739,68 @@ mod tests {
             effective_value("maxmemory", &runtime, &reloaded_boot).as_deref(),
             Some((512 * 1024 * 1024).to_string().as_str())
         );
+    }
+
+    /// PROD-SAFETY #3/#4/#5: the connection-safety knobs (`maxclients`, `timeout`,
+    /// `output_buffer_limit`) parse from TOML + the overlay, override the defaults, and are
+    /// runtime-settable + readable via the CONFIG registry (`maxclients` / `output-buffer-limit`).
+    #[test]
+    fn connection_safety_knobs_parse_and_are_runtime_settable() {
+        use crate::registry::{SetOutcome, apply_set, effective_value, lookup};
+        use crate::runtime::RuntimeConfig;
+
+        // TOML overlay sets all three; the resolved Config carries them (overriding the defaults).
+        let toml = "maxclients = 250\ntimeout = 45\noutput_buffer_limit = 65536\n";
+        let overlay = ConfigOverlay::from_toml_str(toml).unwrap();
+        assert_eq!(overlay.maxclients, Some(250));
+        assert_eq!(overlay.timeout, Some(45));
+        assert_eq!(overlay.output_buffer_limit, Some(65536));
+        let cfg = Config::resolve(&[overlay]).unwrap();
+        assert_eq!(cfg.maxclients, 250);
+        assert_eq!(cfg.timeout_secs, 45);
+        assert_eq!(cfg.output_buffer_limit, 65536);
+        cfg.validate().unwrap();
+
+        // The CONFIG registry knows both runtime-settable names and reports the boot values.
+        assert!(lookup("maxclients").is_some());
+        assert!(lookup("output-buffer-limit").is_some());
+        let runtime = RuntimeConfig::from_config(&cfg);
+        assert_eq!(
+            effective_value("maxclients", &runtime, &cfg).as_deref(),
+            Some("250")
+        );
+        assert_eq!(
+            effective_value("output-buffer-limit", &runtime, &cfg).as_deref(),
+            Some("65536")
+        );
+        assert_eq!(runtime.maxclients(), 250);
+        assert_eq!(runtime.output_buffer_limit(), 65536);
+
+        // `CONFIG SET maxclients` updates the live ceiling the accept path reads; `0` disables it.
+        assert_eq!(apply_set("maxclients", "9", &runtime), SetOutcome::Applied);
+        assert_eq!(runtime.maxclients(), 9);
+        assert_eq!(apply_set("maxclients", "0", &runtime), SetOutcome::Applied);
+        assert_eq!(runtime.maxclients(), 0);
+        // A malformed value is rejected (never a silent accept).
+        assert!(matches!(
+            apply_set("maxclients", "lots", &runtime),
+            SetOutcome::InvalidValue(_)
+        ));
+
+        // `CONFIG SET output-buffer-limit` accepts a human size; `0` disables it.
+        assert_eq!(
+            apply_set("output-buffer-limit", "256mb", &runtime),
+            SetOutcome::Applied
+        );
+        assert_eq!(runtime.output_buffer_limit(), 256 * 1024 * 1024);
+        assert_eq!(
+            apply_set("output-buffer-limit", "0", &runtime),
+            SetOutcome::Applied
+        );
+        assert_eq!(runtime.output_buffer_limit(), 0);
+        assert!(matches!(
+            apply_set("output-buffer-limit", "1.5gb", &runtime),
+            SetOutcome::InvalidValue(_)
+        ));
     }
 }
