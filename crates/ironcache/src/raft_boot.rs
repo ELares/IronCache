@@ -215,14 +215,19 @@ fn build_cluster_security(config: &Config) -> Result<Option<ClusterSecurity>, Bo
         let acceptor =
             ironcache_runtime::build_acceptor(&cert.to_string_lossy(), &key.to_string_lossy())
                 .map_err(|e| BootError(format!("cluster TLS acceptor build failed: {e}")))?;
-        // The connector (dial side) verifies the peer cert against the optional cluster CA; with no
-        // CA it accepts the cert and relies on the shared secret for peer authentication.
+        // The connector (dial side) verifies the peer cert against the cluster CA (required when TLS
+        // is on -- Config::validate enforces it -- so the cluster secret is never exposed to a MITM).
+        // The accept-any path is reachable only via the explicit cluster_tls_insecure_skip_verify
+        // opt-out, which build_cluster_client_config gates + warns about loudly.
         let ca = config
             .cluster_ca_path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
-        let connector = ironcache_runtime::build_cluster_client_config(ca.as_deref())
-            .map_err(|e| BootError(format!("cluster TLS client config build failed: {e}")))?;
+        let connector = ironcache_runtime::build_cluster_client_config(
+            ca.as_deref(),
+            config.cluster_tls_insecure_skip_verify,
+        )
+        .map_err(|e| BootError(format!("cluster TLS client config build failed: {e}")))?;
         (Some(connector), Some(acceptor))
     } else {
         // Secret-only (plaintext-but-authenticated) cluster: no TLS configs, just the secret.

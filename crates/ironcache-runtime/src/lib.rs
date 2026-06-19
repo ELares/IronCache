@@ -173,8 +173,8 @@ pub use tls::{ClientStream, HANDSHAKE_TIMEOUT, TlsConfigError, accept_tls, build
 #[cfg(feature = "tls")]
 pub use tls::{
     CLUSTER_TLS_SERVER_NAME, MAX_SECRET_LEN, SecretError, SecureStream, accept_cluster_tls,
-    authenticate_peer, build_cluster_client_config, connect_tls, constant_time_eq,
-    read_peer_secret, send_secret,
+    authenticate_peer, authenticate_peer_bounded, build_cluster_client_config, connect_tls,
+    constant_time_eq, read_peer_secret, send_secret,
 };
 
 pub mod bootstrap;

@@ -124,9 +124,16 @@ impl ClusterSecurity {
     /// (send OUR secret, read + constant-time-verify the PEER's). A [`SecretError`] is mapped to a
     /// [`std::io::Error`] so the dial / accept paths surface one error type. When no secret is
     /// configured the handshake is skipped (TLS-only; not the v1 default but supported).
+    ///
+    /// BOUNDED by `HANDSHAKE_TIMEOUT` (SECURITY, PROD-3 slow-loris fix): the secret exchange runs
+    /// AFTER the (already bounded) TLS handshake but had NO timeout of its own, so a peer that
+    /// completed TLS then stalled sending its secret would pin this serve / dial task FOREVER. The
+    /// bound lives in [`ironcache_runtime::authenticate_peer_bounded`] (the runtime crate owns the
+    /// tokio time seam + the timeout const); it drops a stalled exchange (an
+    /// `io::ErrorKind::TimedOut`), freeing the task.
     async fn run_secret_handshake(&self, stream: &mut SecureStream) -> std::io::Result<()> {
         if let Some(secret) = &self.secret {
-            ironcache_runtime::authenticate_peer(stream, secret)
+            ironcache_runtime::authenticate_peer_bounded(stream, secret)
                 .await
                 .map_err(secret_error_to_io)?;
         }

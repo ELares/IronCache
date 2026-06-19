@@ -36,6 +36,11 @@ use tokio::sync::oneshot;
 
 const TEST_CERT: &str = include_str!("tls/cert.pem");
 const TEST_KEY: &str = include_str!("tls/key.pem");
+// A SECOND, distinct self-signed cluster cert (its own key, same CN/SAN). It is NOT signed by
+// TEST_CERT, so a dial that VERIFIES against TEST_CERT-as-CA must REJECT a server presenting it --
+// the active-MITM impersonation the PROD-3 fix blocks.
+const OTHER_CERT: &str = include_str!("tls/cert-other.pem");
+const OTHER_KEY: &str = include_str!("tls/key-other.pem");
 const CLUSTER_SECRET: &[u8] = b"the-shared-cluster-secret";
 
 const N1: NodeId = NodeId(1);
@@ -52,8 +57,11 @@ fn free_port() -> u16 {
 }
 
 /// Write the bundled test cert + key to temp files and build a [`ClusterSecurity`] with TLS (the
-/// acceptor presents the cert, the connector accepts the peer cert -- no CA, secret-authenticated)
-/// and the given `secret`. The temp files persist for the process; tests are short-lived.
+/// acceptor presents the cert, the connector VERIFIES the peer cert against the cluster CA -- here
+/// the shared self-signed cert serving as its OWN CA, the secure no-PKI deployment) and the given
+/// `secret`. Exercising the VERIFYING dial path (not accept-any) is the PROD-3 MITM fix: the secret
+/// is only sent to a peer whose cert is CA-signed. The temp files persist for the process; tests are
+/// short-lived.
 fn build_security(secret: &[u8]) -> ClusterSecurity {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
@@ -65,8 +73,78 @@ fn build_security(secret: &[u8]) -> ClusterSecurity {
     std::fs::write(&key, TEST_KEY).unwrap();
     let acceptor =
         ironcache_runtime::build_acceptor(&cert.to_string_lossy(), &key.to_string_lossy()).unwrap();
-    let connector = ironcache_runtime::build_cluster_client_config(None).unwrap();
+    // The shared self-signed cert is its OWN CA: the connector verifies the peer cert against it
+    // (the default secure posture), so a peer presenting a non-CA-signed cert (a MITM) is rejected
+    // BEFORE the secret is sent. insecure_skip_verify = false (verification ON).
+    let connector =
+        ironcache_runtime::build_cluster_client_config(Some(&cert.to_string_lossy()), false)
+            .unwrap();
     ClusterSecurity::new(Some(connector), Some(acceptor), Some(secret.to_vec()))
+}
+
+/// Write a cert + key pair to uniquely-named temp files and return their paths.
+fn write_cert_key(cert_pem: &str, key_pem: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let cert = dir.join(format!("ic-bustls-vc-cert-{}-{n}.pem", std::process::id()));
+    let key = dir.join(format!("ic-bustls-vc-key-{}-{n}.pem", std::process::id()));
+    std::fs::write(&cert, cert_pem).unwrap();
+    std::fs::write(&key, key_pem).unwrap();
+    (cert, key)
+}
+
+#[test]
+fn dial_verifying_against_a_ca_rejects_a_non_ca_signed_peer() {
+    // SECURITY (PROD-3 MITM fix): a dial that VERIFIES the peer cert against the cluster CA must
+    // REJECT a server presenting a cert NOT signed by that CA -- this is the active man-in-the-middle
+    // who terminates TLS with its own cert. The handshake must FAIL (so the cluster_secret is never
+    // sent), as opposed to the old accept-any verifier that would have admitted the impostor.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        // The CA the dialer trusts == the GOOD cluster cert (its own CA). The impostor server
+        // presents the OTHER cert (a different key, NOT signed by the trusted CA).
+        let (ca_cert, _ca_key) = write_cert_key(TEST_CERT, TEST_KEY);
+        let (other_cert, other_key) = write_cert_key(OTHER_CERT, OTHER_KEY);
+
+        let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // The impostor server accepts a TLS connection presenting the WRONG (non-CA-signed) cert.
+        let impostor_acceptor = ironcache_runtime::build_acceptor(
+            &other_cert.to_string_lossy(),
+            &other_key.to_string_lossy(),
+        )
+        .unwrap();
+        let server = tokio::task::spawn_local(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                // Drive the server handshake to completion (or failure) so the client side resolves.
+                let _ = ironcache_runtime::accept_cluster_tls(&impostor_acceptor, tcp).await;
+            }
+        });
+
+        // The dialer VERIFIES against the GOOD CA (insecure_skip_verify = false).
+        let connector =
+            ironcache_runtime::build_cluster_client_config(Some(&ca_cert.to_string_lossy()), false)
+                .unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let res = ironcache_runtime::connect_tls(&connector, tcp).await;
+        assert!(
+            res.is_err(),
+            "a verifying dial MUST reject a peer cert not signed by the configured CA (the MITM), \
+             but the handshake succeeded"
+        );
+
+        let _ = server.await;
+        let _ = std::fs::remove_file(&ca_cert);
+        let _ = std::fs::remove_file(&other_cert);
+        let _ = std::fs::remove_file(&other_key);
+    });
 }
 
 struct RunningNode {

@@ -331,34 +331,71 @@ pub const CLUSTER_TLS_SERVER_NAME: &str = "ironcache-cluster";
 /// Build the rustls CLIENT configuration the intra-cluster DIAL path uses to wrap a freshly
 /// connected `TcpStream` (the bus `send_to_peer` dial and the replica/importer dial).
 ///
-/// When `ca_path` is `Some`, the peer (server) certificate is verified against the cluster CA
-/// root loaded from that PEM: this is the standard rustls webpki verification, so a server
-/// presenting a cert NOT signed by the cluster CA fails the handshake. When `ca_path` is `None`,
-/// the client uses a verifier that ACCEPTS the peer cert (an intra-cluster self-signed cert with
-/// no shared CA): the link is still ENCRYPTED, and peer AUTHENTICATION is then provided by the
-/// shared-secret handshake performed right after the TLS handshake. The accept-any verifier is
-/// deliberately scoped to the cluster transport (never the public client listener) and is the
-/// pragmatic v1 for a self-signed cluster cert; configuring `ca_path` (a cluster CA) is the
-/// stronger posture and is preferred when available.
+/// When `ca_path` is `Some`, the peer (server) certificate is VERIFIED against the cluster CA root
+/// loaded from that PEM: this is the standard rustls webpki verification (the DEFAULT secure posture
+/// when cluster TLS is on), so a server presenting a cert NOT signed by the cluster CA fails the
+/// handshake. This DEFEATS an active man-in-the-middle: the attacker's cert is not CA-signed, so the
+/// handshake fails BEFORE the dialer ever sends the cluster secret, closing the secret-capture hole.
+/// A single shared self-signed cert pointed at by BOTH the cert path and `ca_path` verifies against
+/// itself -- the simple no-PKI-but-secure deployment.
+///
+/// When `ca_path` is `None` the configuration depends on `insecure_skip_verify`:
+/// * `false` (the default): this is REJECTED -- callers must supply a CA when TLS is on, enforced by
+///   `Config::validate`. This branch returns a [`TlsConfigError`] so a programmatic caller that
+///   bypasses validation still cannot silently build an unverified dialer.
+/// * `true` (the explicit, NOT-recommended opt-out): an accept-any-cert verifier is installed (the
+///   link is still ENCRYPTED but the TLS layer does NOT authenticate the peer, so an active MITM can
+///   capture the cluster secret) and a LOUD boot-time warning is emitted. Peer authentication then
+///   rests solely on the shared-secret handshake -- which itself leaks to the MITM.
+///
+/// The accept-any verifier is deliberately scoped to the cluster transport (never the public client
+/// listener) and only ever reachable through the explicit insecure opt-out.
 ///
 /// # Errors
 ///
-/// Returns [`TlsConfigError`] if the CA file cannot be read, its PEM holds no certificate, or
-/// rustls rejects the assembled root store.
+/// Returns [`TlsConfigError`] if the CA file cannot be read, its PEM holds no certificate, rustls
+/// rejects the assembled root store, or `ca_path` is `None` without the explicit
+/// `insecure_skip_verify` opt-out.
 pub fn build_cluster_client_config(
     ca_path: Option<&str>,
+    insecure_skip_verify: bool,
 ) -> Result<RustlsConnector, TlsConfigError> {
     let config = match ca_path {
         Some(ca) => {
+            // The DEFAULT secure path: verify the peer cert against the cluster CA (webpki). An
+            // attacker without a CA-signed cert cannot complete the handshake, so the secret is never
+            // exposed to a MITM.
             let roots = load_root_store(ca)?;
             ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth()
         }
-        None => ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-            .with_no_client_auth(),
+        None if insecure_skip_verify => {
+            // The EXPLICIT insecure opt-out only: encrypted but the peer cert is NOT verified, so an
+            // active MITM can capture the cluster secret. Warn loudly so an operator running this in
+            // production sees it.
+            eprintln!(
+                "WARNING: cluster TLS peer cert verification DISABLED \
+                 (cluster_tls_insecure_skip_verify); the cluster_secret is exposed to an active MITM"
+            );
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+                .with_no_client_auth()
+        }
+        None => {
+            // No CA and no explicit insecure opt-out: refuse to build an unverified dialer. This
+            // mirrors (and backstops) Config::validate so the accept-any verifier is NEVER installed
+            // silently.
+            return Err(TlsConfigError::Pem {
+                path: "<cluster_ca_path>".to_owned(),
+                reason: "a cluster CA is required to verify peer certs when cluster TLS is on; \
+                         set cluster_ca_path (a shared self-signed cert may be its own CA), or set \
+                         cluster_tls_insecure_skip_verify=true to run encrypted-but-unverified \
+                         (NOT recommended -- the cluster_secret is then exposed to an active MITM)"
+                    .to_owned(),
+            });
+        }
     };
     Ok(RustlsConnector::from(Arc::new(config)))
 }
@@ -637,6 +674,33 @@ pub async fn authenticate_peer(
     read_peer_secret(stream, secret).await
 }
 
+/// [`authenticate_peer`] BOUNDED by [`HANDSHAKE_TIMEOUT`] (SECURITY, the PROD-3 bus slow-loris fix).
+/// The secret exchange runs AFTER the (already bounded) TLS handshake but the secret read itself had
+/// NO timeout: a peer that completes TLS then STALLS sending its secret would otherwise pin the serve
+/// / dial task forever. Wrapping the WHOLE send-then-read in `tokio::time::timeout` (the same timer
+/// seam + const the accept / connect handshakes use) drops a stalled exchange after the bound,
+/// surfaced as a [`SecretError::Io`] of kind [`std::io::ErrorKind::TimedOut`] so the caller drops the
+/// connection. The runtime crate owns this (it is the only place `tokio::time` is pulled in), so the
+/// cluster-bus crate does not take a tokio-time dependency just for the bound.
+///
+/// # Errors
+///
+/// Propagates [`SecretError`] (I/O, malformed, or mismatch), or a [`SecretError::Io`] of kind
+/// `TimedOut` if the exchange does not complete within [`HANDSHAKE_TIMEOUT`].
+pub async fn authenticate_peer_bounded(
+    stream: &mut SecureStream,
+    secret: &[u8],
+) -> Result<(), SecretError> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate_peer(stream, secret))
+        .await
+        .map_err(|_| {
+            SecretError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cluster secret handshake timed out",
+            ))
+        })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,15 +823,44 @@ mod tests {
     }
 
     #[test]
-    fn build_cluster_client_config_with_and_without_ca() {
-        // No CA -> the accept-any verifier path (encrypted, secret-authenticated); a connector
-        // builds. With a CA pointing at the test cert -> the webpki-verified path; also builds.
-        let no_ca = build_cluster_client_config(None).map(|_| ());
-        assert!(no_ca.is_ok(), "no-CA connector should build: {no_ca:?}");
+    fn build_cluster_client_config_requires_ca_unless_insecure() {
+        // SECURITY (PROD-3 MITM fix): the DEFAULT (no CA, verification ON) is REJECTED so an
+        // unverified dialer is never built silently -- the cluster secret would otherwise be exposed
+        // to a MITM. With a CA pointing at the test cert -> the webpki-VERIFYING path builds (the
+        // RootCertStore is non-empty, accept-any is NOT used). Only the EXPLICIT insecure opt-out
+        // builds an accept-any connector.
+        let no_ca_default = build_cluster_client_config(None, false).map(|_| ());
+        assert!(
+            no_ca_default.is_err(),
+            "no-CA without the insecure flag MUST be rejected (the secret would leak to a MITM): \
+             {no_ca_default:?}"
+        );
+
+        // The verifying path: a CA is configured, so a (non-empty) RootCertStore is built and the
+        // standard webpki verifier is installed. Asserting the connector builds with a CA (and the
+        // accept-any-only no-CA-default path errors above) proves the verifying config is the one
+        // built when a CA is set.
         let ca = temp_pem("ca", TEST_CERT);
-        let with_ca = build_cluster_client_config(Some(&ca.to_string_lossy())).map(|_| ());
-        assert!(with_ca.is_ok(), "CA connector should build: {with_ca:?}");
+        let with_ca = build_cluster_client_config(Some(&ca.to_string_lossy()), false).map(|_| ());
+        assert!(
+            with_ca.is_ok(),
+            "a CA-configured (verifying) connector should build: {with_ca:?}"
+        );
+        // The CA PEM must hold a real cert: the RootCertStore is non-empty (load_root_store added
+        // the trust anchor), which is what makes the webpki verification meaningful.
+        let roots = load_root_store(&ca.to_string_lossy()).expect("CA loads");
+        assert!(
+            !roots.is_empty(),
+            "a configured CA must yield a non-empty RootCertStore (the verifying trust anchor)"
+        );
         let _ = std::fs::remove_file(&ca);
+
+        // The EXPLICIT insecure opt-out builds an accept-any connector (encrypted, NOT verified).
+        let no_ca_insecure = build_cluster_client_config(None, true).map(|_| ());
+        assert!(
+            no_ca_insecure.is_ok(),
+            "the explicit insecure opt-out should build an accept-any connector: {no_ca_insecure:?}"
+        );
     }
 
     #[test]
@@ -815,6 +908,43 @@ mod tests {
             assert!(
                 matches!(server_res, Err(SecretError::Mismatch)),
                 "the server must REJECT a peer presenting the wrong secret, got {server_res:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn authenticate_peer_bounded_drops_a_stalled_handshake() {
+        // SECURITY (PROD-3 slow-loris fix): a peer that connects (and would complete TLS) but then
+        // STALLS sending its secret must be dropped within HANDSHAKE_TIMEOUT, not pin the task
+        // forever. Over a loopback PLAIN SecureStream (hermetic; the secret read is the same code on
+        // any SecureStream variant), the client connects and sends NOTHING. With tokio's clock
+        // PAUSED (auto-advancing to the next timer when idle), the server's bounded handshake fires
+        // its timeout near-instantly in wall-clock and returns a TimedOut io error.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::task::spawn_local(async move {
+                let (tcp, _peer) = listener.accept().await.unwrap();
+                let mut s = SecureStream::plain(tcp);
+                authenticate_peer_bounded(&mut s, b"cluster-secret").await
+            });
+            // The client connects then STALLS: it holds the socket open and sends nothing, so the
+            // server's read never completes on its own. Keep the stream alive so the OS does not
+            // close it (which would surface as an EOF, not the timeout we are asserting).
+            let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let res = server.await.unwrap();
+            assert!(
+                matches!(
+                    &res,
+                    Err(SecretError::Io(e)) if e.kind() == io::ErrorKind::TimedOut
+                ),
+                "a stalled secret handshake must be dropped with a TimedOut error, got {res:?}"
             );
         });
     }

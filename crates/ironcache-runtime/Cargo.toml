@@ -44,5 +44,16 @@ socket2 = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 
+# `test-util` enables tokio's PAUSED-clock test harness (`start_paused`), used to fire the bounded
+# secret-handshake timeout near-instantly in the slow-loris test without a real 10s wall-clock wait.
+# A DEV-only dependency: it never enters the shipped static binary.
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
+tokio = { workspace = true, features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "sync",
+    "test-util",
+] }
