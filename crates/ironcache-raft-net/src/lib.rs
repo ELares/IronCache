@@ -1802,6 +1802,28 @@ mod tests {
             vote_granted: false,
         });
 
+        // PROD-9 Pre-Vote: PreVote (mirrors RequestVote) + PreVoteResp (both polarities).
+        assert_round_trips(&RaftMsg::PreVote {
+            term: 7,
+            candidate: NodeId(2),
+            last_log_index: 42,
+            last_log_term: 6,
+        });
+        assert_round_trips(&RaftMsg::PreVote {
+            term: u64::MAX,
+            candidate: NodeId(u64::MAX),
+            last_log_index: u64::MAX,
+            last_log_term: u64::MAX,
+        });
+        assert_round_trips(&RaftMsg::PreVoteResp {
+            term: 7,
+            vote_granted: true,
+        });
+        assert_round_trips(&RaftMsg::PreVoteResp {
+            term: u64::MAX,
+            vote_granted: false,
+        });
+
         // AppendEntriesResp, both polarities + a large match_index.
         assert_round_trips(&RaftMsg::AppendEntriesResp {
             term: 11,
