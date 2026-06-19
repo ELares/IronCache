@@ -1,0 +1,38 @@
+IronCache {{ .Chart.AppVersion }} deployed as StatefulSet {{ include "ironcache.fullname" . }} ({{ int .Values.replicas }} replica(s)).
+
+Pods get stable DNS via the headless Service:
+  {{ include "ironcache.fullname" . }}-0.{{ include "ironcache.headlessService" . }}.{{ .Release.Namespace }}.svc.cluster.local
+
+Client endpoint (in-cluster):
+  {{ include "ironcache.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ int .Values.service.clientPort }}
+
+Health / metrics (per pod, on the metrics port {{ int .Values.metrics.port }}):
+  GET /livez   -> liveness
+  GET /readyz  -> readiness (load-on-boot done; in raft mode a leader is known)
+  GET /metrics -> Prometheus exposition
+
+Quick checks:
+  kubectl -n {{ .Release.Namespace }} get statefulset,pod,pvc -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} exec -it {{ include "ironcache.fullname" . }}-0 -c ironcache -- /usr/local/bin/ironcache cli -p {{ int .Values.service.clientPort }}
+
+{{- if .Values.cluster.enabled }}
+
+Raft cluster mode is ON ({{ int .Values.replicas }} nodes, 16384 slots split evenly).
+{{- if not .Values.clusterSecret.existingSecret }}
+{{- if not .Values.clusterSecret.value }}
+
+WARNING: clusterSecret.value is empty -- a RANDOM secret was generated on install.
+A future `helm upgrade` would regenerate it and split the cluster. Set a stable
+clusterSecret.value (or clusterSecret.existingSecret) for production.
+{{- end }}
+{{- end }}
+{{- if not .Values.clusterTls.enabled }}
+
+NOTE: clusterTls is OFF -- the cluster_secret travels in cleartext on the pod
+network. Enable clusterTls for a zero-trust network.
+{{- end }}
+{{- end }}
+{{- if not .Values.auth.enabled }}
+
+NOTE: client auth is OFF (no requirepass). Enable auth.* for production.
+{{- end }}

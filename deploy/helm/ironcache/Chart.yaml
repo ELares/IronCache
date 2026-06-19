@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+apiVersion: v2
+name: ironcache
+description: >-
+  IronCache, the Redis-compatible cache in one static Rust binary, deployed as a
+  StatefulSet with stable per-pod identity for Raft cluster formation, durable
+  persistence, /livez + /readyz health probes, and a PodDisruptionBudget that
+  preserves Raft quorum.
+type: application
+# The chart version. Bump on chart changes (independent of the app version).
+version: 0.1.0
+# The default IronCache image tag this chart targets. Override via
+# image.tag in values.yaml. Quoted so a calendar version is not parsed as a float.
+appVersion: "latest"
+home: https://github.com/ELares/IronCache
+sources:
+  - https://github.com/ELares/IronCache
+keywords:
+  - cache
+  - redis
+  - raft
+  - statefulset
+maintainers:
+  - name: Zeke

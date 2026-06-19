@@ -1,0 +1,56 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- $fullname := include "ironcache.fullname" . -}}
+{{- $clientPort := int .Values.service.clientPort -}}
+{{- $busPort := add $clientPort 10000 -}}
+{{- $replPort := add $clientPort 20000 -}}
+{{- $metricsPort := int .Values.metrics.port -}}
+# Headless Service: gives every StatefulSet pod a STABLE DNS name
+#   <pod>.<headless-svc>.<ns>.svc.cluster.local
+# which is how Raft peers find each other (the topology in the ConfigMap points at
+# these names). clusterIP: None + publishNotReadyAddresses so a peer is resolvable
+# DURING boot (before it is /readyz), which Raft formation needs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ironcache.headlessService" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "ironcache.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ $clientPort }}
+      targetPort: client
+    - name: cluster-bus
+      port: {{ $busPort }}
+      targetPort: cluster-bus
+    - name: repl
+      port: {{ $replPort }}
+      targetPort: repl
+    - name: metrics
+      port: {{ $metricsPort }}
+      targetPort: metrics
+---
+# Client Service: a single stable endpoint for in-cluster clients. NOTE: with Raft
+# routing a node answers MOVED for slots it does not own, so a cluster-aware client
+# is recommended; a plain round-robin Service works for a single-node deploy or for
+# clients that follow MOVED. Only the client port is exposed here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "ironcache.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ $clientPort }}
+      targetPort: client

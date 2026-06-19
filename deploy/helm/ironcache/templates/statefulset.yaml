@@ -1,0 +1,232 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- $fullname := include "ironcache.fullname" . -}}
+{{- $clientPort := int .Values.service.clientPort -}}
+{{- $busPort := add $clientPort 10000 -}}
+{{- $replPort := add $clientPort 20000 -}}
+{{- $metricsPort := int .Values.metrics.port -}}
+{{- $clusterSecretName := .Values.clusterSecret.existingSecret | default (printf "%s-secret" $fullname) -}}
+{{- $authSecretName := .Values.auth.existingSecret | default (printf "%s-secret" $fullname) -}}
+{{- $clusterTlsSecretName := .Values.clusterTls.existingSecret | default (printf "%s-secret" $fullname) -}}
+{{- $tlsSecretName := .Values.tls.existingSecret | default (printf "%s-secret" $fullname) -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "ironcache.headlessService" . }}
+  replicas: {{ int .Values.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "ironcache.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ironcache.labels" . | nindent 8 }}
+      annotations:
+        # Roll the pods when the rendered config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        podAntiAffinity:
+          {{- if eq .Values.podAntiAffinity.type "hard" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "ironcache.selectorLabels" . | nindent 18 }}
+              topologyKey: {{ .Values.podAntiAffinity.topologyKey }}
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "ironcache.selectorLabels" . | nindent 20 }}
+                topologyKey: {{ .Values.podAntiAffinity.topologyKey }}
+          {{- end }}
+      initContainers:
+        # Stamp THIS pod's stable cluster_announce_id (from its StatefulSet
+        # ordinal) into /run/ironcache/ironcache.toml, which the main container
+        # then passes to --config. Keeps the runtime image distroless/shell-free.
+        - name: stamp-identity
+          image: "{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}"
+          imagePullPolicy: {{ .Values.initImage.pullPolicy }}
+          command: ["/bin/sh", "/scripts/stamp-identity.sh"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: config-scripts
+              mountPath: /scripts
+            - name: runtime-config
+              mountPath: /run/ironcache
+      containers:
+        - name: ironcache
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          args:
+            - server
+            - --config
+            - /run/ironcache/ironcache.toml
+            - --log-level
+            - {{ .Values.logLevel | quote }}
+            - --metrics-addr
+            - "0.0.0.0:{{ $metricsPort }}"
+          env:
+            {{- if .Values.cluster.enabled }}
+            - name: IRONCACHE_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $clusterSecretName }}
+                  key: cluster_secret
+            {{- end }}
+            {{- if .Values.auth.enabled }}
+            - name: IRONCACHE_REQUIREPASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecretName }}
+                  key: requirepass
+            {{- end }}
+            {{- if .Values.clusterTls.enabled }}
+            - name: IRONCACHE_CLUSTER_TLS
+              value: "on"
+            - name: IRONCACHE_CLUSTER_TLS_CERT_PATH
+              value: /etc/ironcache/cluster-tls/cluster.crt
+            - name: IRONCACHE_CLUSTER_TLS_KEY_PATH
+              value: /etc/ironcache/cluster-tls/cluster.key
+            - name: IRONCACHE_CLUSTER_CA_PATH
+              value: /etc/ironcache/cluster-tls/cluster.ca
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: IRONCACHE_TLS
+              value: "on"
+            - name: IRONCACHE_TLS_CERT_PATH
+              value: /etc/ironcache/tls/tls.crt
+            - name: IRONCACHE_TLS_KEY_PATH
+              value: /etc/ironcache/tls/tls.key
+            {{- end }}
+          ports:
+            - name: client
+              containerPort: {{ $clientPort }}
+            {{- if .Values.cluster.enabled }}
+            - name: cluster-bus
+              containerPort: {{ $busPort }}
+            - name: repl
+              containerPort: {{ $replPort }}
+            {{- end }}
+            - name: metrics
+              containerPort: {{ $metricsPort }}
+          # Liveness: the process is up and serving (/livez flips at end of boot).
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # Readiness: every shard finished load-on-boot AND (in raft mode) a leader
+          # is known. Gates traffic + the rolling update on a genuinely ready node.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: runtime-config
+              mountPath: /run/ironcache
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- if .Values.clusterTls.enabled }}
+            - name: cluster-tls
+              mountPath: /etc/ironcache/cluster-tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/ironcache/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}-config
+            items:
+              - key: ironcache.base.toml
+                path: ironcache.base.toml
+        - name: config-scripts
+          configMap:
+            name: {{ $fullname }}-config
+            items:
+              - key: stamp-identity.sh
+                path: stamp-identity.sh
+        - name: runtime-config
+          emptyDir: {}
+        {{- if .Values.clusterTls.enabled }}
+        - name: cluster-tls
+          secret:
+            secretName: {{ $clusterTlsSecretName }}
+            items:
+              - key: cluster.crt
+                path: cluster.crt
+              - key: cluster.key
+                path: cluster.key
+              - key: cluster.ca
+                path: cluster.ca
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ $tlsSecretName }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- end }}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "ironcache.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}

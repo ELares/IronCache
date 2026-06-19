@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Default values for the IronCache chart. PRODUCTION posture is documented inline;
+# the out-of-the-box defaults are safe (auth + TLS are OFF but flagged; persistence
+# is ON; a quorum-preserving PDB is set). Read the comments before going to prod.
+
+image:
+  repository: ghcr.io/elares/ironcache
+  # Pin to an immutable version tag in production (e.g. "v0.1.0"), NOT "latest".
+  tag: "latest"
+  pullPolicy: IfNotPresent
+# Image pull secrets for a private registry (GHCR private packages):
+imagePullSecrets: []
+
+# Number of IronCache nodes. For a Raft cluster keep this ODD (3, 5, 7) so a
+# majority quorum is unambiguous. 1 = a standalone (non-clustered) node.
+replicas: 3
+
+# --- Cluster / Raft -----------------------------------------------------------
+cluster:
+  # Turn on Raft-governed clustering (cluster_enabled + cluster_mode=raft). When
+  # false the chart deploys `replicas` INDEPENDENT standalone nodes (no peering),
+  # which is only sensible with replicas=1. Set true for a real cluster.
+  enabled: true
+  # The 16384 hash slots are split EVENLY across `replicas` nodes by the topology
+  # template (deploy/helm/ironcache/templates/configmap.yaml). No manual slot math.
+  #
+  # Per-node identity + the peer list are TOML-only (cluster_topology is an
+  # array-of-tables with no env form), so the chart renders the full topology into
+  # a ConfigMap and an init container stamps THIS pod's stable cluster_announce_id
+  # from its StatefulSet ordinal. Peers resolve by the headless-Service DNS
+  # `<pod>.<svc>.<ns>.svc.cluster.local`, lazily at Raft dial time.
+
+  # WRITE-SIDE durability guardrail (min_replicas_to_write): the minimum in-sync
+  # replicas an owner must have before it ACCEPTS a write, so an acknowledged write
+  # survives that many node losses. 0 = disabled (Redis default). 1 is a sane
+  # cluster default; do not set it >= the replica count or writes stall when one is down.
+  minReplicasToWrite: 1
+  # Raft-log compaction threshold (entries above the last snapshot). Bounds the
+  # on-disk log + restart replay.
+  raftSnapshotThreshold: 1024
+
+# --- Persistence (durable snapshot + Raft log under data_dir) -----------------
+persistence:
+  # data_dir is the SINGLE enable switch for durable persistence AND the durable
+  # Raft log. Strongly recommended for any cluster (the Raft log must survive a
+  # pod restart). When false the pod uses an emptyDir (data lost on reschedule).
+  enabled: true
+  # The PVC mount path == data_dir.
+  mountPath: /var/lib/ironcache
+  size: 10Gi
+  # storageClassName: "" leaves the cluster default; set an SSD class in prod.
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  # Periodic background save policy (#58): SAVE every `saveIntervalSecs` if at
+  # least `saveMinChanges` keyspace writes happened since the last save. 0 = only
+  # explicit SAVE/BGSAVE + save-on-shutdown persist. This bounds the RPO.
+  saveIntervalSecs: 900
+  saveMinChanges: 1
+
+# --- Authentication -----------------------------------------------------------
+auth:
+  # Client AUTH (requirepass). STRONGLY recommended in production. When enabled the
+  # password is read from a Secret (created by the chart from `auth.password`, or
+  # referenced via `auth.existingSecret`) and exposed to the pod as
+  # IRONCACHE_REQUIREPASS; the server hashes it at rest (SHA-256).
+  enabled: false
+  # Inline password (chart creates the Secret). Prefer existingSecret in prod so
+  # the secret is not in values/Helm release history.
+  password: ""
+  # Reference an existing Secret instead of creating one. The key must be `requirepass`.
+  existingSecret: ""
+
+# --- Intra-cluster transport security (bus + replication) ---------------------
+clusterSecret:
+  # The shared cluster secret (cluster_secret): every node presents it in a
+  # constant-time peer handshake on the bus + repl links, so a stranger cannot join
+  # the bus / forge RAFTMSG / pull replication. STRONGLY recommended when
+  # cluster.enabled. Auto-generated if left empty and not using an existing Secret.
+  value: ""
+  existingSecret: ""
+
+clusterTls:
+  # Encrypt the node-to-node bus + replication links (cluster_tls=on). Without TLS
+  # the cluster_secret travels in cleartext on the pod network; enable for a
+  # zero-trust network. Requires a cert + key (+ optionally a CA). A self-signed
+  # cluster cert that is ALSO used as the CA verifies against itself (no external PKI).
+  enabled: false
+  # Provide the PEM cert/key/CA inline (chart puts them in the Secret) or reference
+  # an existing Secret with keys cluster.crt / cluster.key / cluster.ca.
+  cert: ""
+  key: ""
+  ca: ""
+  existingSecret: ""
+
+tls:
+  # Put the PUBLIC client RESP listener on TLS (tls=on). Separate from clusterTls.
+  # Requires a public-facing cert + key (PEM).
+  enabled: false
+  cert: ""
+  key: ""
+  existingSecret: ""
+
+# --- Service ports ------------------------------------------------------------
+service:
+  # Client RESP port (Config.port). The cluster-bus (port+10000) and replication
+  # (port+20000) ports are derived from this and exposed only on the headless
+  # Service for intra-cluster traffic.
+  clientPort: 6379
+  # The client Service type. ClusterIP is correct for in-cluster clients; with Raft
+  # routing (MOVED redirects to a pod's advertised host) a single LB in front of all
+  # pods is NOT cluster-aware, so prefer cluster-aware clients hitting the headless
+  # Service or per-pod DNS.
+  type: ClusterIP
+
+# The HTTP port serving /metrics + /livez + /readyz (the --metrics-addr port). The
+# liveness/readiness probes hit /livez and /readyz here.
+metrics:
+  port: 9121
+  # Create a ServiceMonitor for the Prometheus Operator (requires the CRD).
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+
+# --- Resources ----------------------------------------------------------------
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    # No CPU limit by default (avoid CFS throttling of the per-core runtime); set
+    # one if your platform requires it. Memory limit should sit comfortably ABOVE
+    # the configured maxmemory so eviction, not the OOM killer, reclaims memory.
+    memory: "2Gi"
+
+# Extra IronCache config: any maxmemory / maxmemory-policy / log level overrides
+# flow in here and are appended to the rendered TOML verbatim. Keys are the REAL
+# TOML keys (maxmemory, maxmemory-policy, timeout, maxclients, output_buffer_limit,
+# databases, shards, log-level via the --log-level arg). Example:
+#   extraConfig: |
+#     maxmemory = 1610612736
+#     maxmemory-policy = "allkeys-lru"
+extraConfig: ""
+
+# Log level passed as --log-level (error|warn|info|debug|trace).
+logLevel: info
+
+# --- Scheduling ---------------------------------------------------------------
+# Spread pods across nodes so a single node failure cannot take down a quorum.
+podAntiAffinity:
+  # "soft" = preferred (best-effort spread, schedulable on small clusters);
+  # "hard" = required (one pod per node, needs >= replicas nodes).
+  type: soft
+  topologyKey: kubernetes.io/hostname
+
+nodeSelector: {}
+tolerations: []
+
+# --- Disruption budget --------------------------------------------------------
+# maxUnavailable=1 lets a voluntary disruption (drain/upgrade) take at most one pod
+# at a time, so a 3-node cluster keeps its 2-node majority quorum throughout a
+# rolling node maintenance. For replicas=5 you may raise this to 2 and still keep
+# quorum; never set it so high that a drain can break majority.
+pdb:
+  maxUnavailable: 1
+
+# --- Pod security -------------------------------------------------------------
+# The image already runs as nonroot (uid 65532); fsGroup makes the PVC writable by it.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# StatefulSet rolling-update + termination tuning. terminationGracePeriodSeconds
+# must cover the graceful drain + save-on-exit.
+terminationGracePeriodSeconds: 60
+
+# Optional init container image (BusyBox) used to stamp the per-pod
+# cluster_announce_id from the StatefulSet ordinal. Has a shell; never reaches the
+# main runtime path.
+initImage:
+  repository: busybox
+  tag: "1.36"
+  pullPolicy: IfNotPresent

@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Single-node IronCache for quick local use (docker-compose). A standalone cache:
+# no cluster, no Raft, just the RESP listener + persistence + the health/metrics
+# endpoint. For a 3-node Raft cluster on one host use docker-compose.cluster.yml.
+#
+# Ports:
+#   6379  client RESP        (published to the host)
+#   9121  metrics + /livez + /readyz  (published to the host for scraping/probes)
+#
+# Bring up:   docker compose up -d
+# Client:     redis-cli -p 6379
+# Health:     curl localhost:9121/readyz   (and /livez, /metrics)
+# Tear down:  docker compose down           (keeps the data volume)
+#             docker compose down -v        (drops the data volume)
+
+name: ironcache
+
+services:
+  ironcache:
+    image: ghcr.io/elares/ironcache:latest
+    command:
+      - server
+      - --bind
+      - 0.0.0.0
+      - --metrics-addr
+      - 0.0.0.0:9121
+    environment:
+      # Durable persistence: data_dir is the single enable switch (snapshot dump +
+      # manifest). Mounted on the named volume below.
+      IRONCACHE_DATA_DIR: /var/lib/ironcache
+      # Periodic background save: every 900s if >= 1 keyspace write happened.
+      IRONCACHE_SAVE_INTERVAL_SECS: "900"
+      IRONCACHE_SAVE_MIN_CHANGES: "1"
+      # Optional client AUTH (requirepass), hashed at rest by the server. Set it in
+      # a .env file (IRONCACHE_REQUIREPASS=...); empty leaves auth disabled.
+      IRONCACHE_REQUIREPASS: ${IRONCACHE_REQUIREPASS:-}
+    ports:
+      - "6379:6379"
+      - "9121:9121"
+    volumes:
+      - ironcache-data:/var/lib/ironcache
+    healthcheck:
+      # distroless image has no shell/curl, so probe via the binary's own TCP client.
+      test: ["CMD", "/usr/local/bin/ironcache", "cli", "-h", "127.0.0.1", "-p", "6379"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  ironcache-data:

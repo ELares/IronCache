@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The production image (Dockerfile) ONLY copies the prebuilt static binary staged
+# under dist/<arch>/ironcache. Nothing else from the repo belongs in the build
+# context, so this ignores everything except the dist/ staging tree. A tight
+# context keeps `docker build` fast and prevents leaking source / secrets into a
+# build layer.
+
+# Ignore everything by default...
+*
+
+# ...then re-include only the dist/ staging tree the Dockerfile copies from.
+!dist/
+!dist/**
+
+# Belt-and-suspenders: never include these even if a future Dockerfile widens the
+# context.
+.git
+.github
+target
+crates
+docs
+scripts
+bench-results
+deploy
+**/*.rs
+**/*.toml
+**/.DS_Store
+**/*.tmp
+**/*.bak

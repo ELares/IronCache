@@ -1,0 +1,22 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- /*
+PodDisruptionBudget that preserves Raft quorum through voluntary disruptions
+(node drain, rolling node upgrade). maxUnavailable bounds how many pods a drain
+can evict at once; with the default 1 a 3-node cluster always keeps its 2-node
+majority. Rendered only for a multi-node cluster (a single node has no quorum to
+protect, and a PDB on 1 replica would block its own drain).
+*/ -}}
+{{- if gt (int .Values.replicas) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ironcache.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "ironcache.selectorLabels" . | nindent 6 }}
+{{- end }}
