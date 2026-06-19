@@ -13,24 +13,38 @@
 //! - the shard's thread-local store handle ([`crate::serve::shard_store`]) and the passive
 //!   -replica guard ([`crate::serve::set_replica_passive`]).
 //!
-//! ## Transport security (PROD-3): frame-bounded; TLS + secret is a documented follow-up
+//! ## Transport security (PROD-3): frame-bounded AND TLS + shared-secret authenticated
 //!
-//! The replication wire frames ([`ironcache_repl::Frame`]) are now bounded against a forged
+//! The replication wire frames ([`ironcache_repl::Frame`]) are bounded against a forged
 //! per-argument length (the [`ironcache_runtime::MAX_CLUSTER_FRAME_LEN`] cap enforced in
 //! `ironcache_repl::frames`), closing the memory-DoS where a malicious `$<huge>\r\n` header could
 //! drive the recv buffer to grow unbounded -- the HIGHEST-severity vector on this transport, fixed
-//! here regardless of TLS.
+//! regardless of TLS.
 //!
-//! The replication LINK itself (the dial + the source listener) is still PLAINTEXT and
-//! UNAUTHENTICATED in this build: the Raft cluster-bus (`RAFTMSG`) got full TLS + a shared-secret
-//! peer-authentication handshake (PROD-3, via `ironcache_clusterbus::ClusterSecurity`), but wiring
-//! the SAME `SecureStream` + secret handshake end to end through the repl dial / source listener
-//! and the many stream-threading helpers (`next_frame`, `send_bytes_ok`, `drive_full_sync`,
-//! `drain_and_ship`, `serve_replica_conn`) is a larger change deferred as a documented follow-up.
-//! Until then, operators MUST restrict the repl data-plane port (`repl_port(client_port)`) to the
-//! trusted intra-cluster network (a security group / NetworkPolicy), exactly as the bus port should
-//! be. The building blocks the follow-up reuses already exist (the `ClusterSecurity::dial` /
-//! `::accept` + `SecureStream` in `ironcache_clusterbus::security`, built and proven by the bus).
+//! The replication LINK (the keyspace-bearing data plane: the full-sync snapshot + the committed
+//! -write tail + the HA-6 migration data-copy) is now ENCRYPTED + PEER-AUTHENTICATED, closing the
+//! keyspace-siphon vector. It reuses, byte for byte, the SAME building blocks the Raft cluster-bus
+//! (`RAFTMSG`) proved (PROD-3): the [`ironcache_clusterbus::ClusterSecurity`] handle built once at
+//! boot ([`crate::raft_boot::build_cluster_security`]) and the [`ironcache_runtime::SecureStream`]
+//! (`Plain | ClientTls | ServerTls`) the bus reads/writes through. Every repl stream is a
+//! `SecureStream`:
+//!
+//! * the SOURCE LISTENER ([`serve_replica_conn`] + the accept loop): when security is configured it
+//!   runs [`ClusterSecurity::accept`] (the `HANDSHAKE_TIMEOUT`-bounded TLS server handshake + the
+//!   constant-time shared-secret peer check) on the accepted `TcpStream` BEFORE the first
+//!   ReplConf/ImportReq; a TLS / secret failure drops the connection (logged) so an unauthenticated
+//!   party can never pull the keyspace, exactly like the bus listener.
+//! * the DIAL side (replica -> owner in [`attach_once`]; importer -> source in [`import_once`]):
+//!   [`ClusterSecurity::dial`] (the CA-verifying TLS client handshake + the secret) wraps the dialed
+//!   `TcpStream` BEFORE the ReplConf/ImportReq, so the dialer authenticates the owner AND presents
+//!   the secret.
+//!
+//! The SAME `cluster_tls` / `cluster_secret` / cert / key / CA config drives both transports (no new
+//! knobs). When cluster TLS + secret are OFF (the DEFAULT), the repl link is
+//! [`SecureStream::Plain`] -- a thin passthrough to the exact `TcpStream` read/write the runtime
+//! backend uses, so the plaintext path is BYTE-IDENTICAL to before this layer; the engine is
+//! untouched. An operator running the default plaintext repl still SHOULD restrict the data-plane
+//! port (`repl_port(client_port)`) to the trusted intra-cluster network.
 //!
 //! ## Gated to raft-mode ONLY (the default path is byte-unchanged)
 //!
@@ -88,6 +102,7 @@ use core::time::Duration;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
+use ironcache_clusterbus::ClusterSecurity;
 use ironcache_env::Clock;
 use ironcache_protocol::slot::key_slot;
 use ironcache_repl::{
@@ -96,7 +111,7 @@ use ironcache_repl::{
     receive_full_sync,
 };
 use ironcache_runtime::tokio_rt::bind_exclusive;
-use ironcache_runtime::{Runtime, TokioRuntime};
+use ironcache_runtime::{Runtime, SecureStream, TokioRuntime};
 use ironcache_server::dispatch::ServerContext;
 use ironcache_storage::UnixMillis;
 use ironcache_store::SnapshotCursor;
@@ -212,6 +227,24 @@ pub(crate) fn spawn_on_shard(
         return;
     };
 
+    // INTRA-CLUSTER TRANSPORT SECURITY (PROD-3) for the REPLICATION transport: build the SAME
+    // optional TLS + shared-secret handle the Raft cluster-bus uses, from the SAME config
+    // (`cluster_tls` / `cluster_secret` / cert / key / CA -- no new knobs). `None` (the default) is
+    // the plaintext repl link, byte-unchanged (the repl streams are `SecureStream::Plain`). Built
+    // ONCE per shard here (it loads the cert/key/CA PEMs); the rustls configs + secret live behind
+    // `Arc`s inside the handle, so it CLONES cheaply onto the source listener (accept side) and the
+    // replica / importer control tasks (dial side). A bad PEM that passed config validation but
+    // rustls rejects logs and degrades to NO repl security (the data path still runs); the bus boot
+    // already fails loudly on the same PEM, so this never silently mis-secures only repl.
+    let security = match crate::raft_boot::build_cluster_security(&ctx.boot) {
+        Ok(sec) => sec,
+        Err(e) => {
+            tracing::error!(error = %e, "replica-attach: failed to build repl transport security; \
+                 running the replication link WITHOUT TLS/secret");
+            None
+        }
+    };
+
     // The per-shard replication tail ring + the observer feeding it. Installing the observer
     // flips the store's `repl_active` gate (the HA-5a seam's intended raft-mode use): from now
     // on every local write on this shard is enqueued onto `ring` as a tail op. One Rc clone of
@@ -260,6 +293,7 @@ pub(crate) fn spawn_on_shard(
     let listener_store = Rc::clone(&store_rc);
     let listener_status = std::sync::Arc::clone(&status);
     let listener_in_sync = std::sync::Arc::clone(&in_sync);
+    let listener_security = security.clone();
     rt.spawn_on_shard(async move {
         run_primary_listener(
             TokioRuntime::new(),
@@ -270,6 +304,7 @@ pub(crate) fn spawn_on_shard(
             listener_status,
             listener_in_sync,
             min_replicas_max_lag,
+            listener_security,
         )
         .await;
     });
@@ -291,6 +326,7 @@ pub(crate) fn spawn_on_shard(
     let replica_cluster = std::sync::Arc::clone(&cluster);
     let replica_store = Rc::clone(&store_rc);
     let replica_status = std::sync::Arc::clone(&status);
+    let replica_security = security.clone();
     rt.spawn_on_shard(async move {
         run_replica_control(
             TokioRuntime::new(),
@@ -303,6 +339,7 @@ pub(crate) fn spawn_on_shard(
             raft,
             self_node_id,
             failover,
+            replica_security,
         )
         .await;
     });
@@ -313,7 +350,7 @@ pub(crate) fn spawn_on_shard(
     // ADDITIVE per-slot merge into the SAME live store, never a store swap and never passive. It
     // does nothing until a committed `SetSlotImporting` naming this node lands in the shared map.
     rt.spawn_on_shard(async move {
-        run_import_control(TokioRuntime::new(), cluster, store_rc).await;
+        run_import_control(TokioRuntime::new(), cluster, store_rc, security).await;
     });
 }
 
@@ -354,6 +391,7 @@ async fn run_primary_listener(
     status: std::sync::Arc<ReplNodeStatus>,
     in_sync: std::sync::Arc<InSyncReplicas>,
     min_replicas_max_lag: u64,
+    security: Option<ClusterSecurity>,
 ) {
     // EXCLUSIVE bind (NO SO_REUSEPORT): the repl listener is a single per-node socket that must
     // never SHARE a port with another service. A reuseport bind would let the kernel load-balance
@@ -371,7 +409,7 @@ async fn run_primary_listener(
     // INFO / CLUSTER SHARDS report the real master offset even before any replica attaches.
     status.set_master_head(ring.borrow().head());
     loop {
-        let Ok((stream, _peer)) = rt.accept(&listener).await else {
+        let Ok((stream, peer)) = rt.accept(&listener).await else {
             return; // listener failed; the primary is going away.
         };
         let rt2 = TokioRuntime::new();
@@ -379,10 +417,22 @@ async fn run_primary_listener(
         let ring = Rc::clone(&ring);
         let status = std::sync::Arc::clone(&status);
         let in_sync = std::sync::Arc::clone(&in_sync);
+        let security = security.clone();
         rt.spawn_on_shard(async move {
+            // SECURE THE ACCEPTED CONNECTION (PROD-3) BEFORE the first ReplConf/ImportReq byte:
+            // when `security` is `Some` this runs the bus-proven TLS server handshake + the
+            // constant-time shared-secret peer check ([`ClusterSecurity::accept`]); a TLS / secret
+            // failure (or a plaintext dialer to a TLS source) drops the connection here -- an
+            // unauthenticated party can never reach the keyspace transfer. `None` (the default)
+            // wraps the raw TcpStream as `SecureStream::Plain` (byte-identical plaintext).
+            let Some(secure) = secure_accept(security.as_ref(), stream).await else {
+                tracing::warn!(%peer, "replica-attach: repl source rejected a connection that \
+                     failed the TLS/secret handshake");
+                return;
+            };
             serve_replica_conn(
                 rt2,
-                stream,
+                secure,
                 replid,
                 store,
                 ring,
@@ -392,6 +442,51 @@ async fn run_primary_listener(
             )
             .await;
         });
+    }
+}
+
+/// SECURE a freshly ACCEPTED repl `TcpStream` for the SOURCE listener (PROD-3), mirroring the bus
+/// `run_listener_secure` accept path: with `security` `Some`, run [`ClusterSecurity::accept`] (the
+/// `HANDSHAKE_TIMEOUT`-bounded TLS server handshake + the shared-secret peer check) and return the
+/// [`SecureStream`] on success; on a TLS / secret failure return `None` so the caller drops the
+/// connection. With `None` (the default) wrap the raw stream as [`SecureStream::Plain`], which is a
+/// thin passthrough to the same `TcpStream` read/write the runtime backend uses -- byte-identical
+/// to the pre-PROD-3 plaintext repl path.
+async fn secure_accept(
+    security: Option<&ClusterSecurity>,
+    tcp: <TokioRuntime as Runtime>::Stream,
+) -> Option<SecureStream> {
+    let Some(sec) = security else {
+        return Some(SecureStream::plain(tcp));
+    };
+    match sec.accept(tcp).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "replica-attach: repl source TLS/secret handshake failed");
+            None
+        }
+    }
+}
+
+/// SECURE a freshly DIALED repl `TcpStream` for the replica / importer DIAL side (PROD-3), mirroring
+/// the bus `connect_endpoint_secure` dial path: with `security` `Some`, run [`ClusterSecurity::dial`]
+/// (the CA-verifying TLS client handshake + the shared-secret presentation) and return the
+/// [`SecureStream`]; on a TLS / secret failure return `None` so the caller backs off + re-dials.
+/// With `None` (the default) wrap the raw stream as [`SecureStream::Plain`] (byte-identical
+/// plaintext).
+async fn secure_dial(
+    security: Option<&ClusterSecurity>,
+    tcp: <TokioRuntime as Runtime>::Stream,
+) -> Option<SecureStream> {
+    let Some(sec) = security else {
+        return Some(SecureStream::plain(tcp));
+    };
+    match sec.dial(tcp).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "replica-attach: repl dial TLS/secret handshake failed");
+            None
+        }
     }
 }
 
@@ -420,7 +515,7 @@ async fn run_primary_listener(
 #[allow(clippy::too_many_arguments)]
 async fn serve_replica_conn(
     rt: TokioRuntime,
-    stream: <TokioRuntime as Runtime>::Stream,
+    stream: SecureStream,
     replid: ReplId,
     store_rc: Rc<RefCell<ShardStoreImpl>>,
     ring: Rc<RefCell<ReplRing>>,
@@ -601,7 +696,7 @@ fn update_in_sync(
 /// snapshot cut `end_offset` -- THIS connection's per-connection send-cursor START (C1).
 async fn drive_full_sync_chunked(
     rt: &TokioRuntime,
-    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    stream: &Rc<RefCell<Option<SecureStream>>>,
     replid: ReplId,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     ring: &Rc<RefCell<ReplRing>>,
@@ -666,8 +761,8 @@ async fn drive_full_sync_chunked(
 /// frame before the handshake is ignored (a stray heartbeat). `pending` carries the partial read
 /// buffer across reads. The `ack` is the master's view of the peer's resume offset (HA-7e INFO).
 async fn read_attach_handshake(
-    rt: &TokioRuntime,
-    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    _rt: &TokioRuntime,
+    stream: &Rc<RefCell<Option<SecureStream>>>,
     pending: &mut Vec<u8>,
 ) -> Option<(Option<u16>, ReplOffset)> {
     let mut slot_filter: Option<u16> = None;
@@ -693,10 +788,12 @@ async fn read_attach_handshake(
                 Err(FrameError) => return None, // malformed: drop the connection.
             }
         }
-        // Read another chunk (TAKE/put-back so no borrow crosses the await).
+        // Read another chunk (TAKE/put-back so no borrow crosses the await). The I/O is on the
+        // SecureStream (TLS-decrypted when the link is secured, plaintext when not), not the raw
+        // runtime seam, so the handshake + the whole transfer ride the same secure channel.
         let taken: Vec<u8> = core::mem::take(pending);
         let mut s = stream.borrow_mut().take().expect("stream present");
-        let res = rt.recv(&mut s, taken).await;
+        let res = s.recv(taken).await;
         *stream.borrow_mut() = Some(s);
         match res {
             Ok(r) => {
@@ -741,6 +838,7 @@ async fn run_replica_control(
     raft: Option<ironcache_server::RaftHandle>,
     self_node_id: String,
     failover: FailoverParams,
+    replica_security: Option<ClusterSecurity>,
 ) {
     // HA-8: how long the master link has been CONTINUOUSLY down (None == the link is up / never
     // attached). Reset to the current env time on the FIRST down observation after a healthy
@@ -811,6 +909,7 @@ async fn run_replica_control(
                         policy_name,
                         reserved_bits,
                         &status,
+                        replica_security.as_ref(),
                     )
                     .await;
                     // The attach returned: the link is down (drop / gap / dial fail). BEFORE we
@@ -1006,9 +1105,16 @@ async fn attach_once(
     policy_name: &'static str,
     reserved_bits: u32,
     status: &std::sync::Arc<ReplNodeStatus>,
+    security: Option<&ClusterSecurity>,
 ) {
     // Dial the owner's repl endpoint. A failed dial returns; the caller backs off + retries.
-    let Ok(stream) = rt.connect(owner_addr).await else {
+    let Ok(tcp) = rt.connect(owner_addr).await else {
+        return;
+    };
+    // PROD-3: TLS-secure the dialed link (CA-verify the owner + present the shared secret) when
+    // cluster security is on; `None` -> a plaintext `SecureStream::Plain` (byte-identical). A
+    // TLS/secret failure returns so the caller backs off + re-dials.
+    let Some(stream) = secure_dial(security, tcp).await else {
         return;
     };
     let stream = Rc::new(RefCell::new(Some(stream)));
@@ -1088,7 +1194,7 @@ async fn attach_once(
 /// drops before the next recv.
 async fn run_replica_tail(
     rt: &TokioRuntime,
-    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    stream: &Rc<RefCell<Option<SecureStream>>>,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     start: ReplOffset,
     status: &std::sync::Arc<ReplNodeStatus>,
@@ -1167,6 +1273,7 @@ async fn run_import_control(
     rt: TokioRuntime,
     cluster: std::sync::Arc<ironcache_cluster::SlotMap>,
     store_rc: Rc<RefCell<ShardStoreImpl>>,
+    security: Option<ClusterSecurity>,
 ) {
     loop {
         // H1 DUAL-ROLE GUARD (fail safe, never corrupt): the import role merges ADDITIVELY into
@@ -1212,7 +1319,15 @@ async fn run_import_control(
                         importing_cluster.migration_state(slot)
                             == ironcache_cluster::MigrationState::Importing
                     };
-                    import_once(&rt, src_addr, slot, &store_rc, &is_still_importing).await;
+                    import_once(
+                        &rt,
+                        src_addr,
+                        slot,
+                        &store_rc,
+                        &is_still_importing,
+                        security.as_ref(),
+                    )
+                    .await;
                     // M2 ABORT PURGE: the import returned (link drop / FLIP / abort). Purge the
                     // partially-merged slot ONLY when the import truly ENDED WITHOUT WINNING the
                     // slot: the IMPORTING tag has cleared (a committed FLIP or a STABLE abort) AND
@@ -1265,11 +1380,18 @@ async fn import_once<F>(
     slot: u16,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     is_still_importing: &F,
+    security: Option<&ClusterSecurity>,
 ) where
     F: Fn() -> bool,
 {
     // Dial the source's repl endpoint. A failed dial returns; the caller backs off + retries.
-    let Ok(stream) = rt.connect(src_addr).await else {
+    let Ok(tcp) = rt.connect(src_addr).await else {
+        return;
+    };
+    // PROD-3: TLS-secure the dialed link (CA-verify the source + present the shared secret) when
+    // cluster security is on; `None` -> plaintext `SecureStream::Plain` (byte-identical). A
+    // TLS/secret failure returns so the caller backs off + re-dials.
+    let Some(stream) = secure_dial(security, tcp).await else {
         return;
     };
     let stream = Rc::new(RefCell::new(Some(stream)));
@@ -1326,7 +1448,7 @@ async fn import_once<F>(
 /// store is borrowed only for the synchronous `insert_object`, THEN dropped before the next recv.
 async fn receive_scoped_snapshot(
     rt: &TokioRuntime,
-    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    stream: &Rc<RefCell<Option<SecureStream>>>,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     pending: &Rc<RefCell<Vec<u8>>>,
     queue: &Rc<RefCell<std::collections::VecDeque<Frame>>>,
@@ -1375,7 +1497,7 @@ async fn receive_scoped_snapshot(
 /// between frames (never the hot path).
 async fn run_import_tail<F>(
     rt: &TokioRuntime,
-    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    stream: &Rc<RefCell<Option<SecureStream>>>,
     slot: u16,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     pending: &Rc<RefCell<Vec<u8>>>,
@@ -1473,12 +1595,12 @@ fn frame_in_slot(frame: &Frame, slot_filter: Option<u16>) -> bool {
 /// repl primitives' `send` closure wants). The stream is taken out, the I/O awaited on the
 /// owned value, and put back, so no `RefCell` borrow crosses the await.
 async fn send_bytes(
-    rt: &TokioRuntime,
-    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    _rt: &TokioRuntime,
+    stream: &Rc<RefCell<Option<SecureStream>>>,
     bytes: Vec<u8>,
 ) -> Result<(), ()> {
     let mut s = stream.borrow_mut().take().expect("stream present");
-    let res = rt.send(&mut s, bytes).await;
+    let res = s.send(bytes).await;
     *stream.borrow_mut() = Some(s);
     res.map(|_| ()).map_err(|_| ())
 }
@@ -1487,7 +1609,7 @@ async fn send_bytes(
 /// `Result<(), ()>` is not the consumed shape.
 async fn send_bytes_ok(
     rt: &TokioRuntime,
-    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    stream: &Rc<RefCell<Option<SecureStream>>>,
     bytes: Vec<u8>,
 ) -> bool {
     send_bytes(rt, stream, bytes).await.is_ok()
@@ -1498,8 +1620,8 @@ async fn send_bytes_ok(
 /// several frames returns them one at a time). Returns `None` on a clean close / I/O error /
 /// malformed frame. No `RefCell` borrow crosses the recv await (the stream is taken out for it).
 async fn next_frame(
-    rt: &TokioRuntime,
-    stream: &Rc<RefCell<Option<<TokioRuntime as Runtime>::Stream>>>,
+    _rt: &TokioRuntime,
+    stream: &Rc<RefCell<Option<SecureStream>>>,
     pending: &Rc<RefCell<Vec<u8>>>,
     queue: &Rc<RefCell<std::collections::VecDeque<Frame>>>,
 ) -> Option<Frame> {
@@ -1527,7 +1649,7 @@ async fn next_frame(
         // Need more bytes: read a chunk (TAKE/put-back so no borrow crosses the await).
         let taken: Vec<u8> = core::mem::take(&mut *pending.borrow_mut());
         let mut s = stream.borrow_mut().take().expect("stream present");
-        let res = rt.recv(&mut s, taken).await;
+        let res = s.recv(taken).await;
         *stream.borrow_mut() = Some(s);
         match res {
             Ok(r) => {
@@ -1802,7 +1924,7 @@ mod tests {
             tokio::task::spawn_local(async move {
                 let rt = TokioRuntime::new();
                 let (stream, _peer) = rt.accept(&listener).await.expect("accept");
-                let stream = Rc::new(RefCell::new(Some(stream)));
+                let stream = Rc::new(RefCell::new(Some(SecureStream::plain(stream))));
                 let mut pending = Vec::new();
                 let attached = read_attach_handshake(&rt, &stream, &mut pending).await;
                 if attached.is_none() {
@@ -1824,7 +1946,7 @@ mod tests {
                         Err(_) => rt.timer(Duration::from_millis(10)).await,
                     }
                 };
-                let stream = Rc::new(RefCell::new(Some(stream)));
+                let stream = Rc::new(RefCell::new(Some(SecureStream::plain(stream))));
                 let handshake = Frame::ReplConf {
                     node: 7,
                     ack: ReplOffset::ZERO,
@@ -1874,7 +1996,7 @@ mod tests {
                 Err(_) => rt.timer(Duration::from_millis(10)).await,
             }
         };
-        let stream = Rc::new(RefCell::new(Some(stream)));
+        let stream = Rc::new(RefCell::new(Some(SecureStream::plain(stream))));
         send_bytes(
             &rt,
             &stream,
@@ -1972,7 +2094,7 @@ mod tests {
                     tokio::task::spawn_local(async move {
                         serve_replica_conn(
                             TokioRuntime::new(),
-                            stream,
+                            SecureStream::plain(stream),
                             replid,
                             store,
                             ring,
@@ -2083,7 +2205,7 @@ mod tests {
             tokio::task::spawn_local(async move {
                 let rt = TokioRuntime::new();
                 let (stream, _peer) = rt.accept(&listener).await.expect("accept");
-                let stream = Rc::new(RefCell::new(Some(stream)));
+                let stream = Rc::new(RefCell::new(Some(SecureStream::plain(stream))));
                 let mut pending = Vec::new();
                 let Some((slot_filter, _ack)) =
                     read_attach_handshake(&rt, &stream, &mut pending).await
@@ -2116,7 +2238,7 @@ mod tests {
                         Err(_) => rt.timer(Duration::from_millis(10)).await,
                     }
                 };
-                let stream = Rc::new(RefCell::new(Some(stream)));
+                let stream = Rc::new(RefCell::new(Some(SecureStream::plain(stream))));
                 send_bytes(
                     &rt,
                     &stream,

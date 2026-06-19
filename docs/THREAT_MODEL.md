@@ -23,6 +23,45 @@ bounds the security-acceptance target for the fuzz and fault-injection stack
 (#95/#100): a finding is in scope only if it maps to an asset and a modeled
 attacker here.
 
+## Implementation status (2026-06)
+
+This document originally described the INTENDED control set; the production-hardening
+pass made most of it real. Honest current state, so a reader does not over-trust a
+control that is not yet shipped:
+
+IMPLEMENTED on main:
+- AUTH: `requirepass` with the password stored as SHA-256 hex AT REST, constant-time
+  compared; `AUTH <pass>` and `AUTH <user> <pass>`.
+- ACL: per-user with per-command (`+@cat`/`-cmd`), per-key (`~pattern`), and
+  per-channel (`&pattern`) authorization; `aclfile` load/save (digests only); live
+  mid-session revocation (`ACL SETUSER`/`DELUSER` take effect immediately, a deleted
+  user's connection is closed). The `default` user maps to `requirepass` for back-compat.
+- THE AUTH/ACL CHOKEPOINT: the NOAUTH + permission check is hoisted to the single
+  router entry point, so cross-shard fan-out, whole-keyspace, and CLUSTER-mutator paths
+  are all gated (no bypass).
+- Client TLS: embedded rustls (ring backend, TLS 1.2/1.3 floor, SSLv3/1.0/1.1 refused),
+  opt-in (`tls = on` + cert/key), with a bounded handshake (slow-loris guard).
+- Cluster transport: TLS + a shared `cluster_secret` handshake (constant-time) on the
+  raft cluster-bus AND the replication link, with CA-verified peer certs required when
+  `cluster_tls = on` (an opt-out `cluster_tls_insecure_skip_verify` exists, loudly
+  warned). A bounded max frame length on the bus + repl parsers.
+- DoS bounds: `maxclients` (rejects excess connections), idle `timeout`,
+  per-connection output-buffer limit, and `maxmemory` enforced against the
+  allocator/RSS figure (not just logical bytes) so the ceiling protects the host.
+- Secrets in diagnostics: no password/secret/key material is written to logs; `CONFIG
+  GET requirepass` / `ACL LIST` emit digests, not plaintext.
+- Supply chain: `cargo-deny` (advisories + licenses + bans) runs as a per-PR gate.
+
+PLANNED / NOT YET (do not assume these):
+- In-memory secret ZEROIZATION and core-dump/swap hardening (#145): passwords are
+  hashed at rest but the plaintext is not yet zeroized on the heap.
+- AUTH attempt-rate-limiting / brute-force throttling.
+- `MONITOR` command (and therefore its argument redaction).
+- mTLS (mutual client-cert auth) as the DEFAULT posture: today the cluster transport
+  verifies the peer SERVER cert against the CA + authenticates via the shared secret;
+  per-node client certs are supported via the CA but not mandated.
+- Differential-compat fuzz/fault-injection acceptance gate (#95/#100).
+
 ## Design
 
 ### Assets
