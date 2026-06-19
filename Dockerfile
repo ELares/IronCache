@@ -79,4 +79,5 @@ EXPOSE 9121
 # IRONCACHE_* env vars or the mounted TOML. The binary reads /etc/ironcache/ironcache.toml
 # by default when present, so a ConfigMap mounted there needs no extra flag.
 ENTRYPOINT ["/usr/local/bin/ironcache"]
+ENV IRONCACHE_DATA_DIR=/var/lib/ironcache
 CMD ["server"]

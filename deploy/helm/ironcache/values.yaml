@@ -33,9 +33,9 @@ cluster:
 
   # WRITE-SIDE durability guardrail (min_replicas_to_write): the minimum in-sync
   # replicas an owner must have before it ACCEPTS a write, so an acknowledged write
-  # survives that many node losses. 0 = disabled (Redis default). 1 is a sane
-  # cluster default; do not set it >= the replica count or writes stall when one is down.
-  minReplicasToWrite: 1
+  # survives that many node losses. 0 = disabled (Redis default). Keep 0 with this chart:
+  # the static topology has no replicas (runtime-Raft only), so >= 1 fails writes -NOREPLICAS.
+  minReplicasToWrite: 0
   # Raft-log compaction threshold (entries above the last snapshot). Bounds the
   # on-disk log + restart replay.
   raftSnapshotThreshold: 1024

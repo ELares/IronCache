@@ -33,9 +33,9 @@ save_min_changes = 1
 
 # WRITE-SIDE durability guardrail: require at least 1 in-sync replica before an owner
 # accepts a write to a slot it owns (so an acknowledged write survives a single-node loss).
-# In a 3-node cluster each slot has replicas, so 1 is safe; raise toward (replicas) for
-# stronger durability at the cost of availability when a replica is down.
-min_replicas_to_write = 1
+# The static topology assigns only primary ownership (no replicas); slot replicas come only
+# from a runtime Raft proposal, so keep this 0 (any value >= 1 fails writes with -NOREPLICAS).
+min_replicas_to_write = 0
 
 # --- The full cluster topology (identical on every node) ----------------------
 # Each node's cluster-bus (RAFTMSG) port is host:(port + 10000) = 16379, and its

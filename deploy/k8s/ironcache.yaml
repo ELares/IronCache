@@ -62,7 +62,7 @@ data:
 
     cluster_enabled = true
     cluster_mode = "raft"
-    min_replicas_to_write = 1
+    min_replicas_to_write = 0
     raft_snapshot_threshold = 1024
 
     [[cluster_topology.nodes]]

@@ -17,7 +17,7 @@ data_dir = "/var/lib/ironcache"
 save_interval_secs = 900
 save_min_changes = 1
 
-min_replicas_to_write = 1
+min_replicas_to_write = 0
 
 [[cluster_topology.nodes]]
 id = "1111111111111111111111111111111111111111"
