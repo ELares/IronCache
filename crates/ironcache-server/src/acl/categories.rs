@@ -373,6 +373,7 @@ fn is_dangerous(cmd: &[u8]) -> bool {
             | b"BGSAVE"
             | b"LASTSAVE"
             | b"SORT"
+            | b"SORT_RO"
             | b"MIGRATE"
             | b"RESTORE"
             | b"MOVE"

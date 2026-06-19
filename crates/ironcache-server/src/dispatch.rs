@@ -481,6 +481,58 @@ pub fn acl_resolve_if_stale(ctx: &ServerContext, conn: &mut ConnState) -> bool {
     }
 }
 
+/// Does this `SORT` / `SORT_RO` request use a BY/GET option that DEREFERENCES external keys?
+///
+/// `SORT key ... [BY pat] ... [GET pat ...]` reads keys built by substituting the source
+/// element into `pat`. Those keys are NOT part of the command key-spec, so the ACL per-key
+/// check cannot see them. The dereferencing forms are:
+/// - `BY pat` where `pat` contains a `*` (a `BY` pattern with NO `*` is `nosort` -- it skips
+///   sorting and does NOT read any external key, so it is EXEMPT, matching `cmd_sort`);
+/// - any `GET pat` that is not exactly `#` (`GET #` projects the element ITSELF, not an
+///   external key, so it is EXEMPT).
+///
+/// This mirrors the option scan in [`crate::cmd_sort`] (BY/GET each consume the next arg) so
+/// the two never diverge. It runs ONLY for SORT/SORT_RO under an active, non-allkeys ACL --
+/// off the hot path for every other command and for allkeys / ACL-off connections.
+#[must_use]
+fn sort_derefs_external_keys(req: &Request) -> bool {
+    // The option tail begins after the command token and the source key (args[0], args[1]).
+    let Some(opts) = req.args.get(2..) else {
+        return false;
+    };
+    let mut i = 0;
+    while i < opts.len() {
+        let tok = &opts[i];
+        if tok.eq_ignore_ascii_case(b"BY") {
+            // BY consumes the next arg as its pattern. A `*` in the pattern means it
+            // dereferences an external key per element; no `*` is the exempt `nosort` form.
+            if let Some(pat) = opts.get(i + 1) {
+                if pat.contains(&b'*') {
+                    return true;
+                }
+            }
+            i += 2;
+        } else if tok.eq_ignore_ascii_case(b"GET") {
+            // GET consumes the next arg as its pattern. `GET #` is the element itself (exempt);
+            // ANY other GET pattern reads an external key.
+            if let Some(pat) = opts.get(i + 1) {
+                if pat.as_ref() != b"#" {
+                    return true;
+                }
+            }
+            i += 2;
+        } else if tok.eq_ignore_ascii_case(b"LIMIT") {
+            // LIMIT consumes two args (offset count); skip them so a numeric arg is never
+            // mistaken for an option token. (ASC/DESC/ALPHA/STORE consume only themselves;
+            // STORE's destination IS in the key-spec, so it is checked by the normal path.)
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// THE PER-COMMAND ACL ENFORCEMENT CHECK (#106). Given the connection's cached ACL identity
 /// (`acl_user`, `None` == the implicit all-permissive default), the command token, and the
 /// parsed request, decide whether the user may run it. Returns `None` when ALLOWED and
@@ -570,6 +622,18 @@ pub fn acl_enforce(
     // <pattern>) as if it were a key -- so it is gated by COMMAND perms (it is @keyspace /
     // @dangerous), NOT key perms, exactly like Redis. `AlwaysHome` commands have no key.
     if !user.keys.is_allkeys() {
+        // SORT / SORT_RO BY/GET external-key dereference gate (redis#10106 / redis 7.0).
+        // A `BY pattern` containing `*` or a non-`#` `GET pattern` DEREFERENCES external
+        // keys (`weight_*`, `data_*->field`) at runtime; those pattern-keys are NOT in the
+        // command key-spec, so the per-key check below never sees them. Redis closes this
+        // by denying such a SORT unless the user has FULL key-read permission (allkeys).
+        // We are already inside `!is_allkeys()`, so any dereferencing form is denied here.
+        // The non-dereferencing forms are EXEMPT: a `nosort` BY (no `*`, no deref) and
+        // `GET #` (the element itself, not an external key). When ACL is off / the user is
+        // allkeys, this block never runs -> default/allkeys/ACL-off byte-identical.
+        if matches!(cmd_upper, b"SORT" | b"SORT_RO") && sort_derefs_external_keys(req) {
+            return Some(ErrorReply::noperm_key());
+        }
         if let Some(spec) = crate::command_spec::spec_of(cmd_upper) {
             if !matches!(
                 spec.class,
