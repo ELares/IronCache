@@ -190,7 +190,14 @@ fn node_id_map(topo: &ironcache_config::ClusterTopology) -> BTreeMap<String, Nod
 /// (a corrupt PEM that passed the cheap readability pre-flight but rustls rejects). Mirrors the
 /// client-listener TLS boot, which also fails boot loudly on a bad cert rather than starting a
 /// listener that rejects every peer.
-fn build_cluster_security(config: &Config) -> Result<Option<ClusterSecurity>, BootError> {
+///
+/// `pub(crate)`: the replication transport (`crate::replica_attach`) reuses the SAME handle for its
+/// source listener (accept) + the replica/importer dials, so the repl link gets identical TLS +
+/// shared-secret peer authentication to the bus from the same `cluster_tls`/`cluster_secret`/cert/
+/// key/CA config (no new knobs).
+pub(crate) fn build_cluster_security(
+    config: &Config,
+) -> Result<Option<ClusterSecurity>, BootError> {
     let tls_on = config.cluster_tls == TlsMode::On;
     let secret = config
         .cluster_secret
