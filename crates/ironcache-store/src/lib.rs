@@ -732,6 +732,16 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 // command. This is the lazy-path signal that complements the active
                 // timing-wheel drain's count.
                 self.lazy_expired = self.lazy_expired.saturating_add(1);
+                // KEYSPACE NOTIFICATION (PROD-8): a LAZY TTL reap fires the `expired` event (class
+                // `x`), exactly like the active drain. `record` short-circuits on the disabled
+                // default BEFORE touching the key, so the lazy-expiry hot path is byte-identical
+                // when notifications are off. The key is the one just reaped.
+                ironcache_config::notify::record(
+                    ironcache_config::EventClass::Expired,
+                    "expired",
+                    key,
+                    db,
+                );
             }
             return false;
         }
@@ -1544,6 +1554,15 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
             }
             if self.remove_object(cand.db, db_idx, &cand.key) {
                 evicted += 1;
+                // KEYSPACE NOTIFICATION (PROD-8): a maxmemory EVICTION fires the `evicted` event
+                // (class `e`) on the victim key. `record` short-circuits on the disabled default,
+                // so the eviction hot path is byte-identical when notifications are off.
+                ironcache_config::notify::record(
+                    ironcache_config::EventClass::Evicted,
+                    "evicted",
+                    &cand.key,
+                    cand.db,
+                );
             }
         }
         evicted
@@ -1750,6 +1769,15 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
             }
             if self.remove_object(db, db_idx, &key) {
                 evicted += 1;
+                // KEYSPACE NOTIFICATION (PROD-8): the roster eviction path (Random / volatile-*)
+                // fires the same `evicted` event (class `e`) on the victim as the pooled path.
+                // Zero-cost when notifications are disabled.
+                ironcache_config::notify::record(
+                    ironcache_config::EventClass::Evicted,
+                    "evicted",
+                    &key,
+                    db,
+                );
                 // Forward progress: the keyspace shrank and budget was freed, so clear
                 // the skip set; a subsequent stretch of non-TTL skips is measured afresh
                 // against the (now smaller) keyspace.

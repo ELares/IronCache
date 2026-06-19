@@ -148,6 +148,14 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "slowlog-max-len",
             kind: SetKind::Runtime,
         },
+        // Keyspace notifications (PROD-8). RUNTIME-SETTABLE: `CONFIG SET notify-keyspace-events
+        // <flags>` parses the flag string (`KEA...`) into the live overlay the serve loop reads;
+        // `CONFIG GET notify-keyspace-events` renders the canonical flag string. The empty string
+        // disables notifications (the default).
+        ParamSpec {
+            name: "notify-keyspace-events",
+            kind: SetKind::Runtime,
+        },
         // `save` is RUNTIME-SETTABLE (#58 durability footgun fix): `CONFIG SET save "<seconds>
         // <changes>"` ACTUALLY updates the periodic save policy the saver reads, and `CONFIG GET
         // save` reports the REAL policy -- no longer a silent no-op that lies about durability.
@@ -283,6 +291,9 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // The SLOWLOG knobs (PROD-7): read the overlay so a `CONFIG SET slowlog-*` is reflected.
         "slowlog-log-slower-than" => runtime.slowlog_log_slower_than().to_string(),
         "slowlog-max-len" => runtime.slowlog_max_len().to_string(),
+        // Keyspace notifications (PROD-8): render the live overlay flags back to the canonical Redis
+        // flag string (the empty string when disabled, the default).
+        "notify-keyspace-events" => runtime.notify_flags().render(),
         // Accepted no-ops: fixed Redis-recognized defaults under the cache build.
         // `maxmemory-samples` defaults to 5 in Redis.
         "maxmemory-samples" => "5".to_owned(),
@@ -476,6 +487,18 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
             Err(_) => {
                 SetOutcome::InvalidValue("argument couldn't be parsed into an integer".to_owned())
             }
+        },
+        // Keyspace notifications (PROD-8): parse the flag string into the live overlay. An
+        // unrecognized flag character is rejected (Redis rejects a bad `notify-keyspace-events`);
+        // the empty string DISABLES notifications.
+        "notify-keyspace-events" => match crate::NotifyFlags::parse(value) {
+            Ok(flags) => {
+                runtime.set_notify_flags(flags);
+                SetOutcome::Applied
+            }
+            Err(bad) => SetOutcome::InvalidValue(format!(
+                "Invalid argument '{bad}' for CONFIG SET 'notify-keyspace-events'"
+            )),
         },
         // Defensive: any future Runtime param must add a branch here. An unhandled Runtime name is a
         // programming error, surfaced as an invalid value rather than a silent success.

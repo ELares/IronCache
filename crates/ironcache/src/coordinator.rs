@@ -256,6 +256,11 @@ pub async fn run_drain_loop(
                     Some(work) => {
                         let reply = run_remote(&ctx, &work.request, work.db);
                         let _ = work.reply.send(reply);
+                        // KEYSPACE NOTIFICATIONS (PROD-8): a cross-shard keyed write that ran on
+                        // THIS shard recorded its keyspace events into this shard's pending buffer;
+                        // drain + publish them AFTER the reply is sent. Short-circuits on an empty
+                        // buffer (the common case: a read, or notifications disabled).
+                        publish_pending_keyspace_events(&inbox, shard_index).await;
                     }
                     // All senders dropped (the process is already tearing down): stop the loop. Not a
                     // flag-driven stop, so no save is attempted here.
@@ -303,6 +308,10 @@ pub async fn run_drain_loop(
                             idle_ticks = 0;
                             let reply = run_remote(&ctx, &work.request, work.db);
                             let _ = work.reply.send(reply);
+                            // KEYSPACE NOTIFICATIONS (PROD-8): publish any events this cross-shard
+                            // write recorded, exactly as the steady-state arm above (the
+                            // post-shutdown window still services live cross-shard work).
+                            publish_pending_keyspace_events(&inbox, shard_index).await;
                         }
                         None => return,
                     }
@@ -1299,6 +1308,34 @@ pub async fn fan_out_publish(
         }
     }
     total
+}
+
+/// DRAIN this (owner) shard's pending keyspace events (PROD-8) and PUBLISH each through the
+/// existing Pub/Sub fan-out, from the SHARD's drain loop after a CROSS-SHARD keyed write recorded
+/// them (the home-path analog lives in `crate::serve::publish_pending_keyspace_events`). `home` is
+/// THIS shard's index, so `fan_out_publish` runs this shard's delivery LOCALLY (no self-channel
+/// hop) and fans out to the others -- no re-entrant send to our own inbox.
+///
+/// FAST PATH: the drain returns an empty Vec when nothing was recorded (a read, a cross-shard
+/// command that mutated nothing, or notifications disabled), so the common drain-loop turn pays a
+/// single thread-local `is_empty` check. Only an actually-recorded event builds a channel + fans
+/// out. The `__ICPUBLISH` delivery a fan-out enqueues to THIS shard later is handled BEFORE any
+/// store borrow + does NOT go through dispatch, so it records nothing -- no notification loop.
+async fn publish_pending_keyspace_events(inbox: &Inbox, home: usize) {
+    let events = ironcache_config::notify::drain();
+    if events.is_empty() {
+        return;
+    }
+    for ev in events {
+        if ev.keyspace {
+            let channel = ev.keyspace_channel();
+            fan_out_publish(inbox, &channel, ev.event.as_bytes(), ev.db, home).await;
+        }
+        if ev.keyevent {
+            let channel = ev.keyevent_channel();
+            fan_out_publish(inbox, &channel, &ev.key, ev.db, home).await;
+        }
+    }
 }
 
 /// Extract the integer receiver count a shard's `__ICPUBLISH` delivery returned. The pub/sub

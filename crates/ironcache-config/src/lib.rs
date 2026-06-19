@@ -23,10 +23,12 @@
 // whole crate forbids unsafe, matching every other workspace crate.
 #![forbid(unsafe_code)]
 
+pub mod notify;
 pub mod registry;
 pub mod runtime;
 pub mod sha256;
 
+pub use notify::{EventClass, KeyspaceEvent, NotifyFlags};
 pub use registry::{
     ParamSpec, SetKind, SetOutcome, apply_set, effective_value, lookup, param_specs,
 };
@@ -447,6 +449,14 @@ pub struct Config {
     /// ring drops the oldest past it). Default [`DEFAULT_SLOWLOG_MAX_LEN`] (128). Runtime-settable
     /// via `CONFIG SET slowlog-max-len`.
     pub slowlog_max_len: u64,
+    /// The `notify-keyspace-events` FLAG STRING (PROD-8, keyspace notifications). EMPTY by default
+    /// (notifications DISABLED, the Redis default + a byte-identical hot path). When non-empty it
+    /// selects the channels (`K` keyspace / `E` keyevent) + the event classes (`g$lshzxet...`, `A`
+    /// = `g$lshzxet`) that publish to `__keyspace@db__:<key>` / `__keyevent@db__:<event>`. Parsed
+    /// at boot (an invalid flag char fails validation) and runtime-settable via
+    /// `CONFIG SET notify-keyspace-events`. TOML (`notify_keyspace_events = "KEA"`) + the
+    /// `IRONCACHE_NOTIFY_KEYSPACE_EVENTS` env var.
+    pub notify_keyspace_events: String,
     /// The INTRA-CLUSTER transport-TLS posture (PROD-3): whether the node-to-node links (the Raft
     /// cluster-bus `RAFTMSG` control plane AND the replication stream) are TLS-encrypted. Defaults
     /// to [`TlsMode::Off`] (PLAINTEXT, byte-unchanged: no handshake, no secret check, exactly the
@@ -581,6 +591,9 @@ impl Default for Config {
             save_min_changes: 0,
             slowlog_log_slower_than: DEFAULT_SLOWLOG_LOG_SLOWER_THAN,
             slowlog_max_len: DEFAULT_SLOWLOG_MAX_LEN,
+            // Keyspace notifications are OFF by default (PROD-8, the Redis default): the empty flag
+            // string disables them and keeps the write hot path byte-identical.
+            notify_keyspace_events: String::new(),
             // INTRA-CLUSTER transport security is OFF by default (PROD-3): the bus + repl links are
             // plaintext and byte-unchanged (no handshake, no secret check). Turning it on is opt-in
             // and requires a cert + key (+ secret). The CA + secret default to None.
@@ -762,6 +775,19 @@ impl Config {
                     "'{}' is not a recognized policy (expected one of: {})",
                     self.maxmemory_policy,
                     MAXMEMORY_POLICY_NAMES.join(", ")
+                ),
+            });
+        }
+        // KEYSPACE NOTIFICATIONS (PROD-8). The `notify-keyspace-events` flag string must parse to a
+        // valid flag set: an unrecognized flag character hard-fails boot (an operator typo must be
+        // visible, matching how Redis rejects a bad `notify-keyspace-events`), rather than silently
+        // dropping the bad character. The empty default parses to the disabled set (a no-op).
+        if let Err(bad) = NotifyFlags::parse(&self.notify_keyspace_events) {
+            return Err(ConfigError::Invalid {
+                field: "notify-keyspace-events",
+                reason: format!(
+                    "'{bad}' is not a valid notify-keyspace-events flag \
+                     (expected a subset of KEg$lshzxetdmnA)"
                 ),
             });
         }
@@ -1229,6 +1255,11 @@ pub struct ConfigOverlay {
     /// (`save_min_changes = 1`) + the `IRONCACHE_SAVE_MIN_CHANGES` env var. `None` leaves the lower
     /// layer (default `0`).
     pub save_min_changes: Option<u64>,
+    /// The `notify-keyspace-events` flag string (PROD-8, keyspace notifications). TOML
+    /// (`notify_keyspace_events = "KEA"`) + the `IRONCACHE_NOTIFY_KEYSPACE_EVENTS` env var. `None`
+    /// leaves the lower layer (default `""` = DISABLED). The flag-string validity is checked in
+    /// [`Config::validate`].
+    pub notify_keyspace_events: Option<String>,
     /// The intra-cluster transport-TLS posture (PROD-3). TOML (`cluster_tls = "on"`) + the
     /// `IRONCACHE_CLUSTER_TLS` env var. `None` leaves the lower layer (default [`TlsMode::Off`],
     /// plaintext byte-unchanged).
@@ -1469,6 +1500,10 @@ impl ConfigOverlay {
                 reason: format!("not a number: {v}"),
             })?);
         }
+        if let Ok(v) = std::env::var("IRONCACHE_NOTIFY_KEYSPACE_EVENTS") {
+            // The flag-string validity is checked once on the resolved value in Config::validate.
+            o.notify_keyspace_events = Some(v);
+        }
         Ok(o)
     }
 
@@ -1479,6 +1514,9 @@ impl ConfigOverlay {
     /// Returns [`ConfigError::Size`] if this overlay's `maxmemory` is malformed or
     /// out of range. A bad ceiling propagates so the binary hard-fails at boot
     /// rather than silently going unlimited (honest-ceiling invariant #3).
+    ///
+    /// `too_many_lines` is allowed: this is a FLAT one-`if let` per overlay field (the
+    /// mechanical fold of every settable knob), the same shape + precedent as `from_env`.
     #[allow(clippy::too_many_lines)]
     fn apply_to(&self, cfg: &mut Config) -> Result<(), ConfigError> {
         if let Some(v) = self.bind {
@@ -1569,6 +1607,11 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.save_min_changes {
             cfg.save_min_changes = v;
+        }
+        if let Some(ref v) = self.notify_keyspace_events {
+            // Flag-string validity is checked in Config::validate (after all overlays fold), so an
+            // env/CLI override is validated once on the resolved value.
+            cfg.notify_keyspace_events.clone_from(v);
         }
         if let Some(v) = self.cluster_tls {
             cfg.cluster_tls = v;

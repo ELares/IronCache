@@ -90,6 +90,16 @@ pub fn drain_due_keys<S: Store + ActiveExpiry>(
     for (db, key) in wheel.advance(now, max) {
         if store.reap_if_expired(db, &key, now) {
             reaped += 1;
+            // KEYSPACE NOTIFICATION (PROD-8): an ACTIVE TTL reap fires the `expired` event (class
+            // `x`, Redis `NOTIFY_EXPIRED`). `notify::record` short-circuits on the disabled default before touching the
+            // key, so this is zero-cost when notifications are off. The key is the wheel entry's,
+            // exactly the reaped key.
+            ironcache_config::notify::record(
+                ironcache_config::EventClass::Expired,
+                "expired",
+                &key,
+                db,
+            );
         }
     }
     reaped
@@ -767,6 +777,15 @@ pub fn dispatch_with_cmd<
 ) -> Value {
     *deltas = CounterDeltas::default();
 
+    // KEYSPACE NOTIFICATIONS (PROD-8): snapshot the live `notify-keyspace-events` flags into THIS
+    // shard's emit gate ONCE per command (a single relaxed atomic load + a thread-local `Cell`
+    // write), so every `notify::record` the handlers + the expiry/eviction paths make during this
+    // command read the SAME flags without re-loading the atomic per event. On the default
+    // deployment the flags are `0` (DISABLED), so `record` short-circuits and the write hot path is
+    // byte-identical (no channel built, nothing published). The serve/coordinator loop DRAINS the
+    // recorded events and PUBLISHes them through the existing Pub/Sub fan-out after the reply.
+    ironcache_config::notify::set_command_flags(ctx.runtime.notify_flags());
+
     // maxmemory-policy HOT-SWAP reach (CONFIG.md, PR-4b): a single relaxed atomic load
     // + compare; the rebuild (rare) is factored into a helper to keep this fn small.
     maybe_hot_swap_policy(ctx, env, store, shard_generation, now);
@@ -864,9 +883,21 @@ pub fn dispatch_with_cmd<
         };
     }
 
-    dispatch_inner(
+    let reply = dispatch_inner(
         ctx, state, env, store, wheel, now, rollup, mem, deltas, req, cmd,
-    )
+    );
+
+    // KEYSPACE NOTIFICATIONS (PROD-8): map this just-executed command + its reply to the Redis
+    // keyspace/keyevent event(s) and RECORD them into the per-shard pending buffer (the serve loop
+    // drains + publishes them after the reply). The mapping helper's first action per recorded
+    // event is the disabled-flags short-circuit (the flags snapshot we set at the top of this fn),
+    // so on the default deployment this is a single `Cell` read for the few commands in the table
+    // and nothing for the rest -- byte-identical. DEL/UNLINK record their own per-deleted-key
+    // events inside the handler (the reply is a count, not which keys), so they are NOT in the
+    // table here; the active TTL drain above already recorded `expired` for reaped keys.
+    crate::notify::notify_for_command(cmd, req, &reply, state.db);
+
+    reply
 }
 
 /// The command body: the per-command `maxmemory` admission gate followed by the big
@@ -1494,6 +1525,12 @@ pub fn dispatch_remote_keyed<E: Env, S: Store + Admit + ActiveExpiry + Keyspace 
         ));
     }
 
+    // KEYSPACE NOTIFICATIONS (PROD-8): snapshot the live flags into THIS (owning) shard's emit
+    // gate, exactly like the home `dispatch_with_cmd`, so a CROSS-SHARD keyed write records its
+    // keyspace events on the OWNER shard (where the mutation runs). The owner shard's drain loop
+    // drains + publishes them. Disabled-default short-circuit keeps this byte-identical when off.
+    ironcache_config::notify::set_command_flags(ctx.runtime.notify_flags());
+
     // (1) maxmemory-policy HOT-SWAP reach on the owning shard (CONFIG.md, PR-4b): one
     // relaxed atomic load + compare; the rebuild (rare) is the shared helper.
     maybe_hot_swap_policy(ctx, env, store, shard_generation, now);
@@ -1502,11 +1539,21 @@ pub fn dispatch_remote_keyed<E: Env, S: Store + Admit + ActiveExpiry + Keyspace 
     // command body, exactly like the home `dispatch`: drain a BOUNDED batch of due keys
     // from THIS shard's wheel and reap the genuinely-expired ones (the SAME
     // `drain_due_keys` helper). Bounds resident memory for expired keys under traffic.
+    // `drain_due_keys` records an `expired` keyspace notification per reaped key (gated off
+    // by default).
     deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
 
     // (3) The keyed command body + the per-command admission gate, via the SINGLE shared
     // keyed-arm definition (so home and remote cannot diverge).
-    dispatch_keyed_data(ctx, env, store, wheel, db, now, deltas, req, &cmd)
+    let reply = dispatch_keyed_data(ctx, env, store, wheel, db, now, deltas, req, &cmd);
+
+    // KEYSPACE NOTIFICATIONS (PROD-8): map the just-executed cross-shard keyed command + its reply
+    // to the keyspace event(s) and RECORD them on THIS owner shard (the home `dispatch_with_cmd`
+    // does the same after `dispatch_inner`). DEL/UNLINK record their own per-key events inside the
+    // handler. The owner shard's drain loop drains + publishes the recorded events.
+    crate::notify::notify_for_command(&cmd, req, &reply, db);
+
+    reply
 }
 
 /// Run ONE shard's PARTIAL of a [`route::CommandClass::WholeKeyspace`](crate::route)
