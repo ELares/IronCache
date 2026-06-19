@@ -66,6 +66,20 @@ pub struct RuntimeConfig {
     /// value. Behind ONE `Mutex` that lives in this non-hot-path crate and is taken
     /// only on `CONFIG SET`/generation-change (the per-command hot path never locks).
     strings: Mutex<RuntimeStrings>,
+    /// The runtime SAVE POLICY (#58 / durability footgun fix): the periodic-save interval in
+    /// SECONDS and the minimum dirty writes a tick requires, BOTH runtime-settable via
+    /// `CONFIG SET save "<seconds> <changes> [...]"` (Redis `save` points). `interval_secs == 0`
+    /// DISABLES the periodic save (only an explicit SAVE/BGSAVE persists). Seeded from the boot
+    /// [`Config`](crate::Config) so a node booted with a configured cadence keeps it, and updated
+    /// in place by `CONFIG SET save` so the periodic saver (which reads these atomics each tick)
+    /// honors the new policy LIVE -- closing the false-durability footgun where `CONFIG SET save`
+    /// was a silent no-op. Two relaxed atomics, node-level cold state read once per (rare) tick,
+    /// never on the per-command hot path.
+    save_interval_secs: AtomicU64,
+    /// The minimum dirty writes a periodic-save tick requires before it fires (the `changes` half
+    /// of a Redis `save <seconds> <changes>` point). `0` fires unconditionally on each enabled
+    /// tick. Runtime-settable via `CONFIG SET save` (paired with [`Self::save_interval_secs`]).
+    save_min_changes: AtomicU64,
 }
 
 /// The string-valued runtime params guarded by [`RuntimeConfig`]'s lock. Grouped
@@ -99,6 +113,11 @@ impl RuntimeConfig {
                 maxmemory_policy: cfg.maxmemory_policy.clone(),
                 requirepass: cfg.requirepass.clone(),
             }),
+            // Seed the runtime save policy from the boot config so a node started with a
+            // configured cadence (`save_interval_secs`/`save_min_changes`) keeps it; a later
+            // `CONFIG SET save` then overrides these LIVE (the periodic saver reads them each tick).
+            save_interval_secs: AtomicU64::new(cfg.save_interval_secs),
+            save_min_changes: AtomicU64::new(cfg.save_min_changes),
         })
     }
 
@@ -206,6 +225,39 @@ impl RuntimeConfig {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.requirepass = hashed;
+    }
+
+    /// The CURRENT runtime save policy: `(interval_secs, min_changes)` (#58 durability footgun
+    /// fix). `interval_secs == 0` means the periodic save is DISABLED. The periodic saver reads
+    /// this each tick (two relaxed atomic loads) so a `CONFIG SET save` takes effect LIVE.
+    #[must_use]
+    pub fn save_policy(&self) -> (u64, u64) {
+        (
+            self.save_interval_secs.load(Ordering::Relaxed),
+            self.save_min_changes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Whether a periodic save CADENCE is currently configured (a non-zero interval). The analog
+    /// of a Redis `save <secs> <changes>` save point being set; read by the shutdown save-on-exit
+    /// decision and the INFO `# Persistence` `rdb_*` policy line.
+    #[must_use]
+    pub fn has_save_policy(&self) -> bool {
+        self.save_interval_secs.load(Ordering::Relaxed) > 0
+    }
+
+    /// `CONFIG SET save "<seconds> <changes> [...]"`: REPLACE the runtime save policy (#58
+    /// durability footgun fix -- previously a silent no-op that lied about durability). Stores the
+    /// SHORTEST (most aggressive) save point's `seconds`/`changes` as the live interval/min-changes
+    /// the periodic saver reads, mirroring how the cache collapses Redis's multiple save points to
+    /// one periodic cadence. An EMPTY string DISABLES the periodic save (interval 0), matching
+    /// `CONFIG SET save ""`. Two relaxed atomic stores (rare, off the hot path); the periodic saver
+    /// picks up the new policy on its next tick. The caller validated the points via
+    /// [`crate::parse_save_points`].
+    pub fn set_save_policy(&self, interval_secs: u64, min_changes: u64) {
+        self.save_interval_secs
+            .store(interval_secs, Ordering::Relaxed);
+        self.save_min_changes.store(min_changes, Ordering::Relaxed);
     }
 }
 

@@ -94,6 +94,31 @@ async fn read_one(client: &mut TcpStream) -> Vec<u8> {
     buf[..n].to_vec()
 }
 
+/// Send a command and read a COMPLETE single-line reply (`+...`/`-...`/`:...`), reading until the
+/// terminating CRLF so a long error line that arrives across multiple TCP segments is fully read
+/// (the fixed-size `read_one` could otherwise return a partial line and desync the stream).
+async fn cmd_line(client: &mut TcpStream, args: &[&str]) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let mut frame = format!("*{}\r\n", args.len());
+    for a in args {
+        write!(frame, "${}\r\n{}\r\n", a.len(), a).unwrap();
+    }
+    client.write_all(frame.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    loop {
+        let mut b = [0u8; 256];
+        let n = client.read(&mut b).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&b[..n]);
+        if out.ends_with(b"\r\n") {
+            break;
+        }
+    }
+    out
+}
+
 /// The expected bulk-string reply for `val`.
 fn bulk(val: &str) -> Vec<u8> {
     format!("${}\r\n{}\r\n", val.len(), val).into_bytes()
@@ -162,6 +187,25 @@ async fn save_restart_reloads_keyspace() {
     {
         let server = run_persist_server_for_test(port, 4, dir.clone(), 0, 0);
         let mut c = connect_retry(port).await;
+        // Durability footgun fix #2: LASTSAVE is SEEDED on boot from the loaded snapshot's manifest,
+        // so it is NON-ZERO immediately (before any in-process save) -- external "snapshot stale"
+        // monitoring does not misfire against a 0. The INFO `# Persistence` section reports the same
+        // seeded `rdb_last_save_time` (fix #5).
+        let ls = cmd1(&mut c, "LASTSAVE").await;
+        assert!(
+            ls.starts_with(b":") && ls != b":0\r\n",
+            "LASTSAVE seeded from the loaded manifest on boot (fix #2): {ls:?}"
+        );
+        let info_s =
+            String::from_utf8_lossy(&cmd(&mut c, &["INFO", "persistence"]).await).into_owned();
+        assert!(
+            info_s.contains("# Persistence\r\n"),
+            "INFO has a # Persistence section: {info_s}"
+        );
+        assert!(
+            !info_s.contains("rdb_last_save_time:0\r\n"),
+            "INFO rdb_last_save_time is seeded non-zero on boot (fix #2/#5): {info_s}"
+        );
         for i in 0..50 {
             assert_eq!(
                 get_raw(&mut c, &format!("key-{i}")).await,
@@ -393,5 +437,100 @@ async fn all_types_round_trip_through_save_restart() {
         server.shutdown_and_join().unwrap();
     }
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Durability footgun fixes #1 + #5 over the wire: `CONFIG SET save` ACTUALLY updates the runtime
+/// save policy (and `CONFIG GET save` reports the real policy), `CONFIG SET appendonly yes` is
+/// REFUSED with an error (no AOF), and the INFO `# Persistence` / `# Keyspace` sections render with
+/// the live policy + per-db key counts. A booted-with-policy-OFF node is used to prove the policy is
+/// no longer frozen at boot.
+#[tokio::test(flavor = "current_thread")]
+async fn config_save_appendonly_and_info_sections_over_the_wire() {
+    let dir = temp_data_dir("config-save-info");
+    let port = free_port();
+    // Boot with the periodic save policy OFF (0/0).
+    let server = run_persist_server_for_test(port, 2, dir.clone(), 0, 0);
+    let mut c = connect_retry(port).await;
+
+    // CONFIG GET save reports the REAL policy: empty when off (no longer a fixed empty stub lie).
+    let g = cmd(&mut c, &["CONFIG", "GET", "save"]).await;
+    let gs = String::from_utf8_lossy(&g);
+    assert!(
+        gs.contains("save"),
+        "CONFIG GET save returns the param: {gs}"
+    );
+
+    // CONFIG SET save "900 1" ACTUALLY updates the policy; CONFIG GET save reports it back.
+    assert_eq!(
+        cmd(&mut c, &["CONFIG", "SET", "save", "900 1"]).await,
+        b"+OK\r\n"
+    );
+    let g2 = cmd(&mut c, &["CONFIG", "GET", "save"]).await;
+    assert!(
+        String::from_utf8_lossy(&g2).contains("900 1"),
+        "CONFIG GET save reports the configured policy (fix #1): {:?}",
+        String::from_utf8_lossy(&g2)
+    );
+
+    // CONFIG SET appendonly yes is REFUSED with an explicit error (no AOF in this build, fix #1).
+    // The error line is ~140 bytes and can arrive across more than one TCP segment, so read the
+    // COMPLETE single-line reply (up to its terminating CRLF) rather than one socket read.
+    let ao = cmd_line(&mut c, &["CONFIG", "SET", "appendonly", "yes"]).await;
+    let aos = String::from_utf8_lossy(&ao);
+    assert!(
+        aos.starts_with("-ERR") && aos.contains("appendonly"),
+        "CONFIG SET appendonly yes is refused (fix #1): {aos}"
+    );
+    // CONFIG GET appendonly is always `no`.
+    assert!(
+        String::from_utf8_lossy(&cmd(&mut c, &["CONFIG", "GET", "appendonly"]).await)
+            .contains("no"),
+        "CONFIG GET appendonly is no"
+    );
+
+    // Populate some keys, then the FILTERED INFO sections reflect the live policy + changes-since-
+    // save (fix #5) and the per-db key counts. A filtered section reply is small (well under one
+    // socket read), so the simple `read_one`-based `cmd` reads it whole.
+    for i in 0..7 {
+        set(&mut c, &format!("k{i}"), "v").await;
+    }
+    let persistence_section =
+        String::from_utf8_lossy(&cmd(&mut c, &["INFO", "persistence"]).await).into_owned();
+    assert!(
+        persistence_section.contains("# Persistence\r\n"),
+        "{persistence_section}"
+    );
+    assert!(
+        persistence_section.contains("save:900 1\r\n"),
+        "INFO save policy reflects the live CONFIG SET save (fix #1/#5): {persistence_section}"
+    );
+    assert!(
+        persistence_section.contains("rdb_changes_since_last_save:"),
+        "INFO changes-since-save: {persistence_section}"
+    );
+    let keyspace_section =
+        String::from_utf8_lossy(&cmd(&mut c, &["INFO", "keyspace"]).await).into_owned();
+    assert!(
+        keyspace_section.contains("# Keyspace\r\n"),
+        "INFO keyspace section (fix #5): {keyspace_section}"
+    );
+    assert!(
+        keyspace_section.contains("db0:keys="),
+        "INFO keyspace db0 line: {keyspace_section}"
+    );
+
+    // Disable the periodic policy again before teardown: with a save policy ACTIVE, the graceful
+    // shutdown performs a save-on-exit and the save-host shard calls `std::process::exit(0)` (the
+    // orchestrator contract), which would terminate the TEST process. Setting `save ""` returns the
+    // node to the explicit-save-only posture so `shutdown_and_join` is a clean in-process stop. This
+    // is itself a check that `CONFIG SET save ""` disables the runtime policy.
+    assert_eq!(
+        cmd(&mut c, &["CONFIG", "SET", "save", ""]).await,
+        b"+OK\r\n"
+    );
+
+    drop(c);
+    server.shutdown_and_join().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }

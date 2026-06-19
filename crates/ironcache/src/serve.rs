@@ -320,6 +320,19 @@ pub fn run_server_observed(
         None
     };
 
+    // PERSISTENCE node-level state (#58): `Some` ONLY when a `data_dir` is configured (the single
+    // enable switch). Created BEFORE the server context so the context can carry the SHARED
+    // persistence-stats cell (last-save + dirty) the INFO `# Persistence` section + the `/metrics`
+    // gauges read -- all three see the same live atomics this state writes. With `None` (the
+    // default) the context's `persist_stats` is `None`, the serve router never intercepts
+    // SAVE/BGSAVE/LASTSAVE, no dirty counter is bumped, no periodic timer is spawned, and
+    // load-on-boot is a no-op -- so the default boot + hot path are byte-unchanged.
+    let persist = crate::persist::PersistState::from_config(config);
+    // The shared persistence-stats cell handed into the context (and below into the metrics
+    // handles); `None` when persistence is off so INFO renders the honest persistence-disabled
+    // section and the gauges report 0.
+    let persist_stats = persist.as_ref().map(|p| p.stats());
+
     // Static, cheaply-cloned server context shared by value onto each shard. The
     // mutable cross-shard state is ONLY the runtime cell (an Arc); the rest is
     // immutable, so cloning per shard does not violate shared-nothing.
@@ -365,6 +378,11 @@ pub fn run_server_observed(
         // shard via `ctx_template.clone()` so each shard adopts its cell by index at boot; `None`
         // on the default path (byte-identical). The caller keeps its own registry handle.
         metrics_registry,
+        // The shared persistence-stats cell (last-save + dirty), `Some` only when a data_dir is
+        // configured. Cloned by Arc onto every shard's context so any shard serving INFO reads the
+        // same live atomics the persistence path writes (durability footgun fix #5). `None` on the
+        // default persistence-off path -> INFO renders the honest persistence-disabled section.
+        persist_stats: persist_stats.clone(),
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
@@ -388,15 +406,10 @@ pub fn run_server_observed(
     // work; the per-connection serve closure clones the original per connection.
     let drain_ctx = ctx_template.clone();
 
-    // PERSISTENCE node-level state (#58): `Some` ONLY when a `data_dir` is configured (the single
-    // enable switch). With `None` (the default) the serve router never intercepts SAVE/BGSAVE/
-    // LASTSAVE (they fall through to the persistence-disabled dispatch fallback), the dirty counter
-    // is never bumped, no periodic save timer is spawned, and load-on-boot is a no-op -- so the
-    // default boot + hot path are byte-unchanged. Cloned (Arc) into the serve + drain closures.
-    let persist = crate::persist::PersistState::from_config(config);
-    // A clone of the persistence handle returned in `BootHandles` so the `/metrics` last-save +
-    // dirty gauges read the live persistence atomics. `None` when persistence is off (no data_dir),
-    // in which case those gauges report 0. `persist` itself is cloned into the serve/drain closures.
+    // A clone of the persistence handle (created above, before the context) returned in
+    // `BootHandles` so the `/metrics` last-save + dirty gauges read the live persistence atomics.
+    // `None` when persistence is off (no data_dir), in which case those gauges report 0. `persist`
+    // itself is cloned into the serve/drain closures below.
     let persist_for_handles = persist.clone();
 
     // EMBEDDED TRANSPORT TLS for the CLIENT listener (#105, docs/design/TLS.md). Build the rustls
@@ -2573,7 +2586,8 @@ async fn handle_shutdown_command(
             true
         }
         // Bare SHUTDOWN: save iff persistence is on AND a save policy (a periodic cadence) exists.
-        ShutdownMode::Default => persist.is_some_and(|p| p.has_save_policy()),
+        // The policy is the LIVE runtime one (`CONFIG SET save` may have changed it since boot).
+        ShutdownMode::Default => persist.is_some() && ctx.runtime.has_save_policy(),
     };
 
     // 4. If saving was resolved, perform the SYNCHRONOUS atomic save reusing the SAVE path. A save
@@ -4748,6 +4762,7 @@ mod tests {
             repl_status: Some(Arc::new(ironcache_server::ReplNodeStatus::new())),
             in_sync_replicas: Some(in_sync),
             metrics_registry: None,
+            persist_stats: None,
             boot,
         }
     }

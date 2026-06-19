@@ -19,8 +19,8 @@ use ironcache_config::{ClusterMode, Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
 use ironcache_expiry::TimingWheel;
 use ironcache_observe::{
-    CounterDeltas, CounterSnapshot, EffectiveMemoryConfig, MemoryInfo, ReplicaLine,
-    ReplicationInfo, ServerInfo, build_info,
+    CounterDeltas, CounterSnapshot, EffectiveMemoryConfig, KeyspaceDbLine, MemoryInfo,
+    PersistenceInfo, ReplicaLine, ReplicationInfo, ServerInfo, build_info,
 };
 use ironcache_protocol::{ErrorReply, ProtoVersion, Request, Value};
 use ironcache_storage::{ActiveExpiry, Admit, Keyspace, PolicySwap, Store, UnixMillis, Watch};
@@ -179,6 +179,16 @@ pub struct ServerContext {
     /// `/metrics` scrape) never touches the command hot path, and on the default path the field
     /// is `None` so the shard's counters use a standalone cell and boot is byte-identical.
     pub metrics_registry: Option<ironcache_observe::MetricsRegistry>,
+    /// The LIVE node-level persistence stats (last-save time + dirty counter), present ONLY when
+    /// durable persistence is enabled (a `data_dir` is configured); `None` on the persistence-OFF
+    /// default path. Shared by `Arc` with the binary's persistence state (which writes it) and the
+    /// `/metrics` gauges (which read it), so the INFO `# Persistence` section reports the SAME live
+    /// `rdb_last_save_time` / `rdb_changes_since_last_save` atomics (durability footgun fix #5). The
+    /// save POLICY itself is read from [`Self::runtime`] (the runtime overlay a `CONFIG SET save`
+    /// mutates); this cell carries only the last-save + dirty signal. Lives in `ironcache-observe`
+    /// so this crate holds it without depending on the binary above it. `None` renders the honest
+    /// persistence-disabled section (last-save 0, empty policy).
+    pub persist_stats: Option<Arc<ironcache_observe::PersistRuntime>>,
 }
 
 impl ServerContext {
@@ -646,8 +656,9 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         b"CLIENT" => cmd_client(state, req),
         b"COMMAND" => cmd_command(req),
         // INFO reads only the CLOCK half of the env seam (uptime); pass `env` as the
-        // `&C: Clock` it needs.
-        b"INFO" => cmd_info(ctx, env, rollup, mem, req),
+        // `&C: Clock` it needs. `store` is passed so the `# Keyspace` section can report each
+        // database's live key count (DBSIZE) via `Keyspace::db_len` (durability/operability fix #5).
+        b"INFO" => cmd_info(ctx, env, store, rollup, mem, req),
         // CONFIG GET/SET/RESETSTAT/REWRITE/HELP (PR-4b). RESETSTAT signals the serving
         // shard's counter reset via `deltas.reset_stats` (the serve loop honors it in
         // ShardCounters::apply); the serving-shard scope is documented in cmd_config.
@@ -1713,9 +1724,10 @@ fn cmd_command(req: &Request) -> Value {
 /// allocator snapshot (ADR-0006) the caller read once at the binary edge (the
 /// server crate has no access to the concrete store's mallctl readers, by the
 /// layering contract; the binary supplies the figure).
-fn cmd_info<C: Clock>(
+fn cmd_info<C: Clock, S: Keyspace>(
     ctx: &ServerContext,
     clock: &C,
+    store: &S,
     rollup: RollupFn<'_>,
     mem: MemoryInfo,
     req: &Request,
@@ -1737,6 +1749,38 @@ fn cmd_info<C: Clock>(
     // the observe POD. `None` (the default static path, no status cell) -> the byte-compatible
     // standalone master-at-offset-0 posture.
     let replication = replication_info(ctx);
+    // The `# Persistence` section facts (durability footgun fix #5): the last-save time + dirty
+    // counter from the shared persistence-stats cell (`None` -> the honest persistence-disabled
+    // section), and the LIVE save policy from the runtime overlay (so a `CONFIG SET save` is
+    // reflected). `rdb_last_save_time` is seeded on boot from the loaded manifest (fix #2).
+    let persistence = match ctx.persist_stats.as_ref() {
+        Some(stats) => {
+            let (interval_secs, min_changes) = ctx.runtime.save_policy();
+            PersistenceInfo {
+                enabled: true,
+                rdb_last_save_time: stats.last_save_unix_secs(),
+                rdb_changes_since_last_save: stats.dirty(),
+                save_interval_secs: interval_secs,
+                save_min_changes: min_changes,
+            }
+        }
+        None => PersistenceInfo::disabled(),
+    };
+    // The `# Keyspace` section facts (operability fix #5): one line per non-empty database with its
+    // live DBSIZE. SERVING-SHARD-SCOPED (this shard's partition of each db), consistent with how
+    // INFO's counters + the single-shard KEYS/SCAN/DBSIZE scope already report on the default path;
+    // a cross-shard sum is the documented coordinator follow-up. `expires` is 0 (per-db expiry
+    // counting is an O(n) scan, a follow-up); `keys` is the load-bearing field operators monitor.
+    let keyspace: Vec<KeyspaceDbLine> = (0..ctx.databases)
+        .filter_map(|db| {
+            let keys = store.db_len(db) as u64;
+            (keys > 0).then_some(KeyspaceDbLine {
+                db,
+                keys,
+                expires: 0,
+            })
+        })
+        .collect();
     let body = build_info(
         clock,
         &ctx.info,
@@ -1744,6 +1788,8 @@ fn cmd_info<C: Clock>(
         mem,
         effective,
         &replication,
+        &persistence,
+        &keyspace,
         section.as_deref(),
     );
     Value::bulk(body.into_bytes())
@@ -1903,6 +1949,7 @@ mod tests {
             repl_status: None,
             in_sync_replicas: None,
             metrics_registry: None,
+            persist_stats: None,
             boot,
         }
     }

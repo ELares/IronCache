@@ -95,25 +95,16 @@ const SHUTDOWN_SAVE_POLL: std::time::Duration = std::time::Duration::from_millis
 pub struct PersistState {
     /// The data directory: the snapshot location (`<dir>/dump-shard-<n>.icss` + `<dir>/dump.manifest`).
     pub dir: PathBuf,
-    /// The periodic save interval in seconds (`0` = the periodic policy is disabled; only explicit
-    /// SAVE/BGSAVE persist). From `Config::save_interval_secs`.
-    pub interval_secs: u64,
-    /// The minimum dirty writes the periodic policy requires before it fires on a tick (`0` =
-    /// fire unconditionally on each enabled tick). From `Config::save_min_changes`.
-    pub min_changes: u64,
-    /// The unix time (SECONDS) of the LAST successful save, what `LASTSAVE` returns. `0` until the
-    /// first successful save in this process (boot does NOT set it; Redis `lastsave` starts at the
-    /// process start time, but `0`-until-first-save is a faithful-enough integer for #58). Updated
-    /// (relaxed) on every committed save.
-    pub last_save_unix_secs: AtomicU64,
+    /// The LIVE node-level persistence stats (last-save time + dirty counter), shared by `Arc` with
+    /// `ServerContext` (the INFO `# Persistence` path) and the `/metrics` gauges so all three read
+    /// the SAME atomics. The last-save time is SEEDED ON BOOT from the loaded snapshot's
+    /// `dump.manifest` ([`seed_last_save_from_manifest`], durability fix #2) and stamped on every
+    /// committed save; the dirty counter is bumped per write while persistence is enabled and reset
+    /// on a committed save. Lives in `ironcache-observe` (below this binary) so the server crate's
+    /// `ServerContext` can hold it without an upward dependency.
+    pub stats: Arc<ironcache_observe::PersistRuntime>,
     /// A monotone SAVE ID, incremented per committed save (informational; recorded in the manifest).
     pub save_id: AtomicU64,
-    /// The DIRTY counter: keyspace writes since the last save. Bumped (relaxed) by the serve loop
-    /// AFTER a successful write command, ONLY when persistence is enabled (this `Arc` is `Some`).
-    /// The periodic policy reads it to decide whether a tick should save; a committed save resets
-    /// it. This is the single relaxed atomic the prompt allows; the store hot path is untouched
-    /// (the bump is in the serve layer, gated on `Some`, NOT in the store primitives).
-    pub dirty: AtomicU64,
     /// SERIALIZE concurrent saves: a save sets this `true` (compare-exchange) for its duration so a
     /// second concurrent SAVE/BGSAVE/periodic-tick does not race on the same files + manifest. A
     /// would-be concurrent save observes `true` and is a no-op (BGSAVE already running -> reply
@@ -130,38 +121,52 @@ impl PersistState {
         let dir = config.data_dir.clone()?;
         Some(Arc::new(PersistState {
             dir,
-            interval_secs: config.save_interval_secs,
-            min_changes: config.save_min_changes,
-            last_save_unix_secs: AtomicU64::new(0),
+            stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
-            dirty: AtomicU64::new(0),
             saving: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// The shared persistence-stats cell (last-save + dirty), for handing into `ServerContext` and
+    /// the `/metrics` gauges so they read the SAME live atomics this state writes.
+    #[must_use]
+    pub fn stats(&self) -> Arc<ironcache_observe::PersistRuntime> {
+        Arc::clone(&self.stats)
     }
 
     /// The unix-seconds of the last successful save (the `LASTSAVE` reply), relaxed read.
     #[must_use]
     pub fn last_save(&self) -> u64 {
-        self.last_save_unix_secs.load(Ordering::Relaxed)
+        self.stats.last_save_unix_secs()
     }
 
-    /// Whether a SAVE POLICY (a periodic save cadence) is configured (#139 graceful shutdown, the
-    /// SHUTDOWN "save iff a save point is configured" decision -- SHUTDOWN.md
-    /// [redis-shutdown-save-nosave-default]). In IronCache the analog of a Redis `save <secs>
-    /// <changes>` save point is a non-zero [`Self::interval_secs`]: a `data_dir` with a periodic
-    /// interval is the configured-cadence posture, whereas a `data_dir` with `interval_secs == 0`
-    /// persists ONLY on an explicit SAVE/BGSAVE (no save point), so a bare `SHUTDOWN` there exits
-    /// without saving -- the same branch as a default (persistence-off) deployment. This is a pure
-    /// read of the boot-resolved policy (no atomics, no I/O).
+    /// The dirty (changes-since-last-save) counter, relaxed read.
     #[must_use]
-    pub fn has_save_policy(&self) -> bool {
-        self.interval_secs > 0
+    pub fn dirty(&self) -> u64 {
+        self.stats.dirty()
+    }
+
+    /// SEED the last-save time from a loaded snapshot's `dump.manifest` save timestamp on boot
+    /// (durability footgun fix #2): after `load_on_boot` restores a snapshot, `LASTSAVE` /
+    /// INFO `rdb_last_save_time` must report the snapshot's save time, not `0` -- otherwise external
+    /// "snapshot stale" monitoring misfires the instant the node boots. Reads the committed manifest
+    /// in `self.dir`; a missing / torn manifest (nothing was loaded) leaves the seed at `0`, the
+    /// pre-fix posture. Idempotent + cheap (one manifest read); called ONCE at boot before serving.
+    /// Does NOT overwrite a value a real save already set (it only seeds when still `0`), so it
+    /// cannot clobber a fresher in-process save.
+    pub fn seed_last_save_from_manifest(&self) {
+        if self.stats.last_save_unix_secs() != 0 {
+            return;
+        }
+        if let Some(manifest) = ironcache_persist::read_manifest(&self.dir) {
+            self.stats.set_last_save_unix_secs(manifest.save_unix_secs);
+        }
     }
 
     /// Bump the dirty write counter (relaxed). Called by the serve loop after a successful write
     /// command when persistence is enabled. The single allowed hot-adjacent atomic increment.
     pub fn note_write(&self) {
-        self.dirty.fetch_add(1, Ordering::Relaxed);
+        self.stats.note_write();
     }
 
     /// Try to ACQUIRE the save latch, returning a [`SaveGuard`] RAII handle if this caller won it
@@ -196,10 +201,9 @@ impl PersistState {
     /// Record a COMMITTED save: stamp the last-save time, bump the save id, and reset the dirty
     /// counter to 0 (relaxed). Called on the home core after the manifest is written.
     pub fn record_committed(&self, save_unix_secs: u64) {
-        self.last_save_unix_secs
-            .store(save_unix_secs, Ordering::Relaxed);
+        self.stats.set_last_save_unix_secs(save_unix_secs);
         self.save_id.fetch_add(1, Ordering::Relaxed);
-        self.dirty.store(0, Ordering::Relaxed);
+        self.stats.reset_dirty();
     }
 
     /// The next monotone save id (the value the next save will record; read for the manifest).
@@ -453,35 +457,49 @@ mod tests {
     fn latch_state() -> Arc<PersistState> {
         Arc::new(PersistState {
             dir: PathBuf::from("/nonexistent-test-dir"),
-            interval_secs: 0,
-            min_changes: 0,
-            last_save_unix_secs: AtomicU64::new(0),
+            stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
-            dirty: AtomicU64::new(0),
             saving: AtomicBool::new(false),
         })
     }
 
-    /// `has_save_policy` (#139 the bare-SHUTDOWN / signal save-iff-configured decision): a periodic
-    /// interval is "a save point is configured"; `interval_secs == 0` (data_dir but explicit-SAVE-
-    /// only) is NOT, so a bare SHUTDOWN there exits without saving like a default deployment.
+    /// Durability footgun fix #2: `seed_last_save_from_manifest` seeds `LASTSAVE` from a loaded
+    /// snapshot's manifest save timestamp, so external "snapshot stale" monitoring does not misfire
+    /// the instant a node boots from a snapshot. A node with no manifest stays at `0`; after a
+    /// manifest is written with a save time, the seed reflects it; and the seed never clobbers a
+    /// fresher in-process save (it only seeds when still `0`).
     #[test]
-    fn has_save_policy_tracks_a_nonzero_interval() {
-        let mut p = PersistState {
-            dir: PathBuf::from("/nonexistent-test-dir"),
-            interval_secs: 0,
-            min_changes: 0,
-            last_save_unix_secs: AtomicU64::new(0),
+    fn seed_last_save_from_manifest_seeds_lastsave_on_boot() {
+        let dir = std::env::temp_dir().join(format!("ic-seed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let p = Arc::new(PersistState {
+            dir: dir.clone(),
+            stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
-            dirty: AtomicU64::new(0),
             saving: AtomicBool::new(false),
-        };
-        assert!(
-            !p.has_save_policy(),
-            "interval 0 -> no save point configured"
+        });
+        // No manifest yet -> the seed leaves LASTSAVE at 0 (the pre-snapshot posture).
+        p.seed_last_save_from_manifest();
+        assert_eq!(p.last_save(), 0, "no manifest -> LASTSAVE stays 0");
+        // Write a manifest carrying a save time, then seed: LASTSAVE reflects it.
+        ironcache_persist::write_manifest(&dir, 1, 1_700_000_000, Vec::new())
+            .expect("write manifest");
+        p.seed_last_save_from_manifest();
+        assert_eq!(
+            p.last_save(),
+            1_700_000_000,
+            "the seed reflects the loaded snapshot's manifest save time"
         );
-        p.interval_secs = 900;
-        assert!(p.has_save_policy(), "a periodic interval IS a save point");
+        // A fresher in-process save value is NOT clobbered by a (re-)seed.
+        p.record_committed(1_700_009_999);
+        p.seed_last_save_from_manifest();
+        assert_eq!(
+            p.last_save(),
+            1_700_009_999,
+            "the seed never overwrites a fresher in-process save"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The RAII guard serializes: while it is held a second `try_begin_save` is denied, and dropping
