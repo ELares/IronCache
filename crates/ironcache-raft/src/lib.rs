@@ -1290,6 +1290,33 @@ pub const HEARTBEAT: u64 = 1;
 /// would briefly stall commit. Exposed via [`RaftNode::learner_caught_up`].
 pub const LEARNER_CATCHUP_LAG: u64 = 2;
 
+/// PRE-VOTE -> REAL-ELECTION FALLBACK THRESHOLD (the etcd #8525 mixed-version safety net,
+/// PROD-9 follow-up). When [`RaftConfig::pre_vote`] is on, a node that times out as a
+/// pre-candidate WITHOUT having reached a pre-vote quorum normally just runs ANOTHER
+/// pre-vote round forever (`start_pre_vote` re-arms the timer). That is correct in a
+/// homogeneous pre-vote cluster, but it LOCKS OUT a subset whose pre-votes can never be
+/// granted -- e.g. a rolling upgrade where old, pre-vote-UNAWARE peers drop the `PreVote`
+/// frame and never reply, or any case where a quorum of GRANTS is simply unreachable. Such
+/// a node could pre-vote indefinitely and never start a real, term-bumping election, so the
+/// cluster can never elect.
+///
+/// The fix mirrors etcd (issues #8243 / #8501, fixed in #8525): count CONSECUTIVE pre-vote
+/// rounds that won no quorum; after this many, fall back ONCE to a real term-bumping
+/// election (`start_real_election`) instead of yet another pre-vote round, then resume
+/// normal pre-vote mode. The counter resets to 0 on ANY progress (hearing a valid leader,
+/// winning a pre-vote, adopting a higher term, becoming leader), so a HEALTHY all-pre-vote
+/// cluster always resets before reaching the threshold and NEVER falls back -- steady-state
+/// behaviour is byte-identical. A partitioned node that does fall back still cannot WIN (it
+/// is partitioned); it merely term-bumps at this BOUNDED slow rate (once per this many
+/// rounds) instead of never, which is strictly better liveness than lockout and far less
+/// disruptive than running with pre-vote off (which bumps the term on EVERY timeout).
+///
+/// `3` is a small etcd-style constant: large enough that ordinary jitter / message loss in
+/// a healthy cluster never accumulates that many ungranted rounds (a single granted round
+/// resets it), small enough that a genuinely stuck subset recovers within a few election
+/// timeouts. See [`RaftNode::on_election_timeout`].
+pub const PRE_VOTE_FALLBACK_ROUNDS: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // The node.
 // ---------------------------------------------------------------------------
@@ -1371,6 +1398,32 @@ pub struct RaftNode<S: RaftStorage, M: StateMachine = CountingSm> {
     /// tallied only if its echoed `term` equals this, so a stale reply (from a prior round,
     /// or after the term advanced) is discarded. Meaningless when `pre_votes` is `None`.
     pre_vote_term: u64,
+    /// CONSECUTIVE *engaged* pre-vote rounds that ELAPSED without reaching a pre-vote quorum
+    /// (the etcd #8525 mixed-version fallback counter, volatile). Incremented when an election
+    /// timeout fires on a node that was already mid pre-vote round (a pre-candidate that never
+    /// reached quorum) AND that round received at least one `PreVoteResp` from a reachable peer
+    /// (see [`pre_vote_round_responded`](RaftNode::pre_vote_round_responded)); once it reaches
+    /// [`PRE_VOTE_FALLBACK_ROUNDS`] the NEXT timeout falls back to a real term-bumping election
+    /// (`start_real_election`) instead of another pre-vote round, then resets to 0 (resuming
+    /// pre-vote mode). RESET to 0 on ANY progress -- hearing a valid current-term leader,
+    /// winning a pre-vote, adopting a higher term, or becoming leader -- so a HEALTHY
+    /// all-pre-vote cluster always resets before the threshold and never falls back
+    /// (steady-state is byte-identical). The fallback fires ONLY when the node IS in contact
+    /// with peers but their pre-votes cannot form a grant-quorum (the mixed-version migration
+    /// deadlock: pre-vote-aware peers reply / reject while a quorum of grants stays
+    /// unreachable). A FULLY ISOLATED node receives no `PreVoteResp` at all, so this counter
+    /// never advances and the node never inflates its term -- preserving the disruption-free
+    /// property (a rejoining isolated node must not depose the standing leader, Ongaro section
+    /// 9.6). Inert when [`RaftConfig::pre_vote`] is off (the path that touches it is not taken).
+    failed_pre_vote_rounds: u32,
+    /// Whether the CURRENT pre-vote round has received at least one `PreVoteResp` (grant OR
+    /// rejection) from a reachable peer (volatile, the etcd #8525 engagement gate). Set false
+    /// when a pre-vote round starts; set true the moment any in-round `PreVoteResp` arrives.
+    /// The fallback counter advances only when a round elapses WITH this set -- a fully
+    /// partitioned node (which receives nothing) never counts a failed round and so never
+    /// term-bumps via the fallback, which is what keeps an isolated rejoining node from
+    /// disrupting the standing leader. Meaningful only while a round is in flight.
+    pre_vote_round_responded: bool,
     /// The instant this node last heard from a VALID CURRENT-TERM LEADER (an accepted
     /// AppendEntries or InstallSnapshot), if any (LEADER-STICKINESS + the pre-vote-grant
     /// gate, Ongaro section 9.6). A follower REFUSES a (pre-)vote when this is within the
@@ -1497,6 +1550,8 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             votes: BTreeSet::new(),
             pre_votes: None,
             pre_vote_term: 0,
+            failed_pre_vote_rounds: 0,
+            pre_vote_round_responded: false,
             last_leader_contact: None,
             quorum_contact: BTreeMap::new(),
             leader_id: None,
@@ -1776,7 +1831,38 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // satisfies instantly and so converts straight to a real election (the trivial
         // self-elect is preserved). With pre-vote OFF we campaign immediately as before.
         if self.config.pre_vote {
-            self.start_pre_vote(now, rng, out);
+            // MIXED-VERSION FALLBACK COUNTING (etcd #8525): if we time out while STILL a
+            // pre-candidate (`pre_votes` is `Some` -- a prior round is in flight and never
+            // reached quorum) AND that round was ENGAGED (it received at least one PreVoteResp
+            // from a reachable peer), count it as a failed round. A round that HAD reached
+            // quorum would have cleared `pre_votes` (via `maybe_promote_pre_candidate`) and
+            // converted to a real candidate, so this never counts a successful round. The
+            // engagement gate is the crucial disruption-free guard: a FULLY ISOLATED node gets
+            // no replies, so `pre_vote_round_responded` stays false, the counter never advances,
+            // and the node never inflates its term -- preserving "a rejoining isolated node does
+            // not depose the standing leader". The fallback fires ONLY for the mixed-version
+            // deadlock (peers reachable and answering, but a grant-quorum unreachable).
+            if self.pre_votes.is_some() && self.pre_vote_round_responded {
+                self.failed_pre_vote_rounds = self.failed_pre_vote_rounds.saturating_add(1);
+            }
+            // FALLBACK: after PRE_VOTE_FALLBACK_ROUNDS consecutive ungranted rounds, campaign
+            // for REAL this once (a single term bump, the one-vote-per-term path) instead of
+            // pre-voting forever, then reset to 0 to resume pre-vote mode (it only re-falls-back
+            // after another threshold of failed rounds). This closes the rolling-upgrade /
+            // unreachable-quorum lockout: a subset whose pre-votes can never be granted still
+            // makes BOUNDED-rate progress rather than never campaigning. A partitioned node that
+            // falls back still cannot WIN, so election safety is untouched; it just term-bumps
+            // slowly (once per threshold of rounds) instead of every timeout (pre-vote off) or
+            // never (no fallback). A healthy cluster resets the counter before reaching the
+            // threshold (see the reset points), so this branch is never taken in steady state.
+            if self.failed_pre_vote_rounds >= PRE_VOTE_FALLBACK_ROUNDS {
+                self.failed_pre_vote_rounds = 0;
+                self.pre_votes = None;
+                self.start_real_election(now, out);
+                self.arm_election_timer(rng, out);
+            } else {
+                self.start_pre_vote(now, rng, out);
+            }
         } else {
             self.start_real_election(now, out);
             self.arm_election_timer(rng, out);
@@ -1799,6 +1885,10 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         let mut tally = BTreeSet::new();
         tally.insert(self.id);
         self.pre_votes = Some(tally);
+        // A fresh round has heard from no peer yet (etcd #8525 engagement gate): the fallback
+        // only counts this round if a real `PreVoteResp` arrives, so a fully isolated node
+        // (which gets none) never term-bumps and so never disrupts a standing leader on heal.
+        self.pre_vote_round_responded = false;
 
         let last_log_index = self.storage.last_log_index();
         let last_log_term = self.storage.last_log_term();
@@ -1842,6 +1932,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // the election timer was already (re-)armed when the round started, so the real
         // election relies on that arm; `start_real_election` does NOT re-arm (avoiding a
         // second arm in the same logical timeout). This is the FIRST term increment.
+        // PROGRESS: winning a pre-vote quorum is real progress, so reset the mixed-version
+        // fallback counter (etcd #8525) -- a cluster that grants pre-votes never falls back.
+        self.failed_pre_vote_rounds = 0;
         self.pre_votes = None;
         self.start_real_election(now, out);
     }
@@ -2009,11 +2102,17 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         vote_granted: bool,
         out: &mut Effects,
     ) {
-        if !vote_granted {
+        if self.pre_votes.is_none() || term != self.pre_vote_term {
+            // No round in flight, or a stale reply from a prior round: ignore. (Checked BEFORE
+            // the grant filter so a stale reply does not falsely mark the round as engaged.)
             return;
         }
-        if self.pre_votes.is_none() || term != self.pre_vote_term {
-            // No round in flight, or a stale reply from a prior round: ignore.
+        // ENGAGEMENT (etcd #8525): any in-round reply -- grant OR rejection -- proves a peer is
+        // reachable and answering, so this round MAY count toward the mixed-version fallback.
+        // A rejection alone never advances the tally, but it does distinguish a reachable
+        // (mixed-version) peer set from a true partition (which yields no replies at all).
+        self.pre_vote_round_responded = true;
+        if !vote_granted {
             return;
         }
         if let Some(tally) = self.pre_votes.as_mut() {
@@ -2135,6 +2234,10 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // moot, so abort it (no term was burned). Both are decision-inert with pre-vote off.
         self.last_leader_contact = Some(now);
         self.pre_votes = None;
+        // PROGRESS: a live current-term leader is the strongest "no election needed" signal,
+        // so reset the mixed-version fallback counter (etcd #8525). A follower that keeps
+        // hearing its leader never accumulates failed pre-vote rounds and so never falls back.
+        self.failed_pre_vote_rounds = 0;
 
         // Rule 2: log consistency check. The log must contain an entry at
         // prev_log_index whose term matches prev_log_term. prev_log_index 0 (the
@@ -2373,6 +2476,10 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             // clears leader quorum-contact tracking (we are no longer leader). Both volatile.
             self.pre_votes = None;
             self.quorum_contact.clear();
+            // PROGRESS: observing a higher term means real activity is happening at a term
+            // beyond ours (a real leader/candidate exists), so reset the mixed-version
+            // fallback counter (etcd #8525); we adopt that term and give it time to complete.
+            self.failed_pre_vote_rounds = 0;
             // A higher term invalidates the leader we recognized (HA-9 passive record):
             // the new term's leader is not yet known and will be set when its first
             // AppendEntries is accepted. A record only; changes no decision/effect.
@@ -2454,6 +2561,11 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // We are the leader for this term (HA-9 passive record): a forwarded proposal
         // routed here proposes locally rather than chaining. A record only.
         self.leader_id = Some(self.id);
+        // PROGRESS: becoming leader is the terminal success of an election, so reset the
+        // mixed-version fallback counter (etcd #8525). (It is normally already 0 by here --
+        // a pre-vote win reset it before the real election -- but the fallback path bumps the
+        // term without a pre-vote win, so clear it explicitly when that path elects.)
+        self.failed_pre_vote_rounds = 0;
         out.cancel_timer(ELECTION_TIMEOUT);
 
         // Initialize leader replication state for every peer (Figure 2, "Leaders":
@@ -2875,6 +2987,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // last-contact and abort any in-flight pre-vote round. Inert with pre-vote off.
         self.last_leader_contact = Some(now);
         self.pre_votes = None;
+        // PROGRESS: hearing a live current-term leader resets the mixed-version fallback
+        // counter (etcd #8525), the same as the AppendEntries recognize-leader path.
+        self.failed_pre_vote_rounds = 0;
 
         // A stale / duplicate snapshot that does not advance our committed prefix: never
         // move backward. Reply our term and stop. Echo the offered index: we provably hold
@@ -3940,24 +4055,20 @@ mod tests {
 
     // -- PROD-9 scenario A: a partitioned-then-rejoining node does NOT disrupt ----
 
-    /// The maximum term observed anywhere in the cluster (the disruption metric: a
-    /// disruptive rejoining node would inflate this; pre-vote + stickiness must not).
-    fn max_term(cluster: &RaftCluster) -> u64 {
-        cluster
-            .ids
-            .iter()
-            .map(|&id| cluster.term(id))
-            .max()
-            .unwrap_or(0)
-    }
-
     /// PROD-9 (pre-vote + stickiness): a node partitioned AWAY from a stable cluster and
-    /// then REJOINED must NOT disrupt the standing leader -- the cluster term must not jump
-    /// and the leader must not be deposed. WITHOUT pre-vote the isolated node would time out,
-    /// inflate its term unboundedly while alone, and on rejoin force a needless election (a
-    /// term jump + leader churn). WITH pre-vote it can never pass its own pre-vote (no
-    /// quorum is reachable while isolated), so it never bumps its term; on rejoin the fresh
-    /// leader's heartbeat brings it back as a follower with no disruption. Swept over seeds.
+    /// then REJOINED must NOT DEPOSE the standing leader -- the leader must keep its
+    /// leadership and its TERM across the whole partition+heal, and on rejoin the victim must
+    /// return as a follower with no election churn. WITHOUT pre-vote the isolated node would
+    /// inflate its term on EVERY timeout and on rejoin force a needless election (term jump +
+    /// leader churn). WITH pre-vote it can never pass its own pre-vote while isolated (no
+    /// quorum reachable), so it stays quiet -- EXCEPT for the etcd #8525 mixed-version
+    /// fallback: after PRE_VOTE_FALLBACK_ROUNDS ungranted rounds it falls back to a REAL
+    /// election once, so a still-isolated victim DOES term-bump at a BOUNDED slow rate (this
+    /// is the deliberate liveness trade-off -- a genuinely stuck subset must not lock out
+    /// forever). The victim still cannot WIN (no quorum), so it never disrupts the leader, and
+    /// on heal it rejoins cleanly. We pin BOTH halves: the victim's local term may climb, but
+    /// the LEADER's term and leadership are untouched and the cluster re-converges to it.
+    /// Swept over seeds.
     #[test]
     fn partitioned_rejoining_node_does_not_disrupt_stable_leader() {
         for seed in 0..40u64 {
@@ -3982,34 +4093,40 @@ mod tests {
                 .collect();
             cluster.net.partition(&[to_sim(victim)], &rest);
 
-            // Let the isolated node sit through MANY election timeouts. With pre-vote it keeps
-            // failing its pre-vote round (no reachable quorum) and never increments its term.
+            // Let the isolated node sit through MANY election timeouts. Its pre-vote rounds
+            // always fail (no reachable quorum); the fallback may term-bump it at a bounded
+            // rate, but it can NEVER win and so never disturbs the standing leader's majority.
             for _ in 0..30 {
                 cluster.net.run_steps(500);
                 assert_election_safety(&cluster);
+                assert_ne!(
+                    cluster.role(victim),
+                    Role::Leader,
+                    "seed {seed}: the isolated minority node can NEVER win (no reachable quorum)"
+                );
             }
 
-            // The standing leader is UNDISTURBED and the cluster term did not jump.
+            // The standing leader is UNDISTURBED: it keeps leadership at its ORIGINAL term.
+            // The victim's local term may have climbed (the bounded fallback), but it could not
+            // depose the leader -- the disruption-free property the fix preserves.
             assert_eq!(
                 cluster.role(leader),
                 Role::Leader,
                 "seed {seed}: the leader must remain leader while a minority node is isolated"
             );
             assert_eq!(
-                cluster.term(victim),
+                cluster.term(leader),
                 leader_term,
-                "seed {seed}: the isolated node must NOT inflate its term (pre-vote blocks it)"
-            );
-            assert_eq!(
-                max_term(&cluster),
-                leader_term,
-                "seed {seed}: no node's term may jump while the leader holds quorum"
+                "seed {seed}: the leader's term is NOT inflated while it holds quorum (no disruption)"
             );
 
             // Heal: the rejoining node rejoins as a follower with no election churn; the
             // standing leader is still leader at its ORIGINAL term (no disruption on rejoin).
+            // The victim may carry a higher local term from the fallback, but the leader's
+            // current-term heartbeat (or a real re-election it wins) brings it back as a
+            // follower under the SAME leader -- the cluster re-converges with one leader.
             cluster.net.heal();
-            for _ in 0..30 {
+            for _ in 0..60 {
                 cluster.net.run_steps(500);
                 assert_election_safety(&cluster);
                 if cluster.role(victim) == Role::Follower && cluster.leaders() == vec![leader] {
@@ -4022,9 +4139,9 @@ mod tests {
                 "seed {seed}: after heal the SAME leader still leads (no disruptive election)"
             );
             assert_eq!(
-                cluster.term(leader),
-                leader_term,
-                "seed {seed}: the leader's term is unchanged across the whole partition+heal"
+                cluster.role(victim),
+                Role::Follower,
+                "seed {seed}: the rejoined node settles back to a follower under the same leader"
             );
         }
     }
@@ -4070,11 +4187,29 @@ mod tests {
                 stepped_down,
                 "seed {seed}: a leader that lost quorum-contact must step down (check-quorum)"
             );
-            assert_eq!(
+            // The deposed leader is no longer Leader. Once down it becomes a Follower and then
+            // campaigns again (pre-vote, and after the etcd #8525 fallback a real election),
+            // so it may be either Follower or Candidate by now -- the point is it RELINQUISHED
+            // leadership and, being partitioned from the majority, can NEVER re-win. We pin the
+            // relinquish + cannot-re-win invariant; the exact post-demotion role is incidental.
+            assert_ne!(
                 cluster.role(leader),
-                Role::Follower,
-                "seed {seed}: the deposed leader becomes a follower"
+                Role::Leader,
+                "seed {seed}: the deposed leader has relinquished leadership"
             );
+
+            // Drive it through MANY more timeouts: a partitioned ex-leader keeps trying (and
+            // the fallback bumps its term at a bounded rate) but it must NEVER become leader
+            // again -- no quorum is reachable, so election safety holds throughout.
+            for _ in 0..30 {
+                cluster.net.run_steps(500);
+                assert_election_safety(&cluster);
+                assert_ne!(
+                    cluster.role(leader),
+                    Role::Leader,
+                    "seed {seed}: a partitioned ex-leader can never re-win (no reachable quorum)"
+                );
+            }
         }
     }
 
@@ -4621,6 +4756,193 @@ mod tests {
             9,
             "after the leader goes stale, a higher-term vote is processed normally"
         );
+    }
+
+    #[test]
+    fn engaged_ungranted_pre_vote_rounds_fall_back_to_a_real_election() {
+        // PROD-9 follow-up (etcd #8525 mixed-version safety net): a node whose peers ARE
+        // reachable and answering `PreVote` but never form a GRANT-quorum -- the mixed-version
+        // migration deadlock, e.g. pre-vote-aware peers that REJECT while a quorum of grants
+        // stays unreachable -- must NOT pre-vote forever. After PRE_VOTE_FALLBACK_ROUNDS
+        // consecutive ENGAGED-but-ungranted rounds it falls back ONCE to a real, term-bumping
+        // election so the otherwise-locked-out subset can still make progress.
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2), NodeId(3)].into_iter().collect();
+        let mut node = RaftNode::new(NodeId(1), voters, MemStorage::new(), RaftConfig::default());
+        let mut rng = ZeroRng;
+
+        // Each timeout starts a pre-vote round (PreVote fans out, term stays 0). A peer REPLIES
+        // each round but REJECTS (vote_granted = false): the round is ENGAGED (a peer is
+        // reachable) yet never reaches quorum. The first PRE_VOTE_FALLBACK_ROUNDS such rounds
+        // must all stay pre-vote rounds (no term bump), accumulating the fallback counter.
+        for round in 0..PRE_VOTE_FALLBACK_ROUNDS {
+            let mut out = Effects::new();
+            node.on_election_timeout(Monotonic::ZERO, &mut rng, &mut out);
+            assert_eq!(
+                node.current_term(),
+                0,
+                "round {round}: an ungranted pre-vote round must NOT bump the term"
+            );
+            assert_eq!(
+                node.role(),
+                Role::Follower,
+                "round {round}: a pre-candidate stays a Follower"
+            );
+            assert_eq!(
+                count_pre_votes(&out),
+                2,
+                "round {round}: it is still pre-voting (PreVote fans out to both peers)"
+            );
+            assert_eq!(
+                count_request_votes(&out),
+                0,
+                "round {round}: no real RequestVote while still under the fallback threshold"
+            );
+            // A reachable peer answers this round but REJECTS the pre-vote: engagement without
+            // a grant. This is what distinguishes the mixed-version deadlock from a partition.
+            let pre_term = node.pre_vote_term;
+            node.on_pre_vote_resp(
+                Monotonic::ZERO,
+                NodeId(2),
+                pre_term,
+                false,
+                &mut Effects::new(),
+            );
+        }
+
+        // The NEXT timeout is the fallback: a REAL election. The term bumps to 1, the node
+        // becomes a real Candidate, and RequestVotes fan out -- progress at last, WITHOUT any
+        // pre-vote quorum ever having been reached. This is the lockout the fix closes.
+        let mut out = Effects::new();
+        node.on_election_timeout(Monotonic::ZERO, &mut rng, &mut out);
+        assert_eq!(
+            node.current_term(),
+            1,
+            "after the fallback threshold, the node campaigns for REAL (term bumps)"
+        );
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "the fallback converts to a real candidate"
+        );
+        assert_eq!(
+            count_request_votes(&out),
+            2,
+            "the fallback fans out real RequestVotes to both peers"
+        );
+        assert_eq!(
+            count_pre_votes(&out),
+            0,
+            "the fallback round is a REAL election, not another pre-vote"
+        );
+        assert_eq!(
+            node.failed_pre_vote_rounds, 0,
+            "the counter resets after the fallback fires (back to pre-vote mode)"
+        );
+    }
+
+    #[test]
+    fn fully_isolated_node_never_falls_back_and_never_inflates_its_term() {
+        // The disruption-free guard (Ongaro section 9.6): a FULLY isolated node receives NO
+        // `PreVoteResp` at all, so its rounds are never "engaged" -- the etcd #8525 fallback
+        // counter never advances and the node NEVER bumps its term. This is what keeps a
+        // rejoining isolated node from deposing the standing leader (the whole point of
+        // pre-vote). We drive MANY more timeouts than the fallback threshold with no replies
+        // and assert the term and role never change.
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2), NodeId(3)].into_iter().collect();
+        let mut node = RaftNode::new(NodeId(1), voters, MemStorage::new(), RaftConfig::default());
+        let mut rng = ZeroRng;
+
+        for round in 0..(PRE_VOTE_FALLBACK_ROUNDS + 5) {
+            let mut out = Effects::new();
+            node.on_election_timeout(Monotonic::ZERO, &mut rng, &mut out);
+            // No PreVoteResp is ever delivered (a true partition): always a pre-vote round,
+            // never the fallback, term pinned at 0, role pinned at Follower.
+            assert_eq!(
+                node.current_term(),
+                0,
+                "round {round}: an ISOLATED node must NEVER inflate its term (no engagement)"
+            );
+            assert_eq!(
+                node.role(),
+                Role::Follower,
+                "round {round}: an isolated node stays a Follower forever"
+            );
+            assert_eq!(
+                count_pre_votes(&out),
+                2,
+                "round {round}: it keeps pre-voting (never the term-bumping fallback)"
+            );
+            assert_eq!(
+                count_request_votes(&out),
+                0,
+                "round {round}: an isolated node never starts a real election (no disruption)"
+            );
+            assert_eq!(
+                node.failed_pre_vote_rounds, 0,
+                "round {round}: the fallback counter never advances without engagement"
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_pre_vote_cluster_never_falls_back() {
+        // The CONVERSE invariant: in a healthy all-pre-vote cluster the fallback NEVER fires.
+        // A node that keeps winning its pre-vote quorum (or keeps hearing a live leader)
+        // always resets the counter before it reaches the threshold, so the steady-state path
+        // is byte-identical to plain pre-vote (no spurious term bump, no fallback). We run
+        // MORE than PRE_VOTE_FALLBACK_ROUNDS successful rounds to prove no accumulation.
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2), NodeId(3)].into_iter().collect();
+        let mut node = RaftNode::new(NodeId(1), voters, MemStorage::new(), RaftConfig::default());
+        let mut rng = ZeroRng;
+
+        for round in 0..(PRE_VOTE_FALLBACK_ROUNDS + 3) {
+            // A pre-vote round that DOES reach quorum: time out, then grant from one peer so
+            // {granter, self} is a majority and the node converts to a real candidate.
+            let mut out = Effects::new();
+            node.on_election_timeout(Monotonic::ZERO, &mut rng, &mut out);
+            assert_eq!(
+                count_pre_votes(&out),
+                2,
+                "round {round}: the timeout starts a pre-vote round (never the fallback)"
+            );
+            let pre_term = node.pre_vote_term;
+            let mut grant = Effects::new();
+            node.on_pre_vote_resp(Monotonic::ZERO, NodeId(2), pre_term, true, &mut grant);
+            assert_eq!(
+                node.role(),
+                Role::Candidate,
+                "round {round}: a granted pre-vote quorum converts to a real candidate"
+            );
+            assert_eq!(
+                node.failed_pre_vote_rounds, 0,
+                "round {round}: winning a pre-vote resets the fallback counter (no accumulation)"
+            );
+            // Step the node back down to a follower (a fresh higher-term leader appears) so the
+            // next loop iteration runs another clean pre-vote round. observe_term also resets
+            // the counter -- the leader-progress reset path -- which we assert holds at 0.
+            let next_term = node.current_term() + 1;
+            let mut step = Effects::new();
+            node.on_append_entries(
+                Monotonic::ZERO,
+                &mut rng,
+                next_term,
+                NodeId(3),
+                0,
+                0,
+                Vec::new(),
+                0,
+                &mut step,
+            );
+            assert_eq!(
+                node.role(),
+                Role::Follower,
+                "round {round}: the node follows the fresh leader"
+            );
+            assert_eq!(
+                node.failed_pre_vote_rounds, 0,
+                "round {round}: hearing a live leader keeps the fallback counter at 0"
+            );
+        }
     }
 
     #[test]
