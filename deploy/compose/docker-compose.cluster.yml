@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# A 3-node IronCache Raft cluster on ONE host (docker-compose). Each service uses
+# the compose service-name DNS (ironcache-1/2/3) for Raft peering: every node
+# mounts a per-node TOML config (config/nodeN.toml) carrying the FULL topology
+# with peer hosts set to those service names, plus its own stable
+# cluster_announce_id. The Raft adapter resolves peer DNS lazily at dial time, so
+# nodes can start in any order.
+#
+# Ports per node (all derived from the client port 6379):
+#   client RESP        6379  -> published on the host as 6379 / 6380 / 6381
+#   raft cluster-bus   16379 (6379 + 10000) -- internal only (compose network)
+#   replication        26379 (6379 + 20000) -- internal only (compose network)
+#   metrics/health     9121  (the --metrics-addr below) -- internal only
+#
+# Shared cluster secret: every node holds IRONCACHE_CLUSTER_SECRET and presents it
+# in a constant-time peer handshake on the bus + repl links, so a stranger that
+# reaches a port cannot join the bus, forge RAFTMSG, or pull replication. Set it in
+# a .env file beside this compose file (IRONCACHE_CLUSTER_SECRET=...) -- do NOT
+# commit a real secret. Without TLS the secret travels in cleartext on the (private)
+# compose network; for a hostile network enable cluster_tls (see the commented block).
+#
+# Bring up:   docker compose -f docker-compose.cluster.yml up -d
+# Client:     redis-cli -p 6379   (or -c for cluster mode following MOVED)
+# Tear down:  docker compose -f docker-compose.cluster.yml down        (keeps volumes)
+#             docker compose -f docker-compose.cluster.yml down -v      (drops data)
+
+name: ironcache-cluster
+
+services:
+  ironcache-1:
+    image: ghcr.io/elares/ironcache:latest
+    hostname: ironcache-1
+    command:
+      - server
+      - --config
+      - /etc/ironcache/ironcache.toml
+      - --metrics-addr
+      - 0.0.0.0:9121
+    environment:
+      # The shared cluster secret (peer authentication). Read from the host env /
+      # the .env file; the `:?` makes compose FAIL FAST if it is unset rather than
+      # booting an unauthenticated bus.
+      IRONCACHE_CLUSTER_SECRET: ${IRONCACHE_CLUSTER_SECRET:?set IRONCACHE_CLUSTER_SECRET in .env}
+      # Optional client AUTH password (requirepass). Hashed at rest by the server.
+      IRONCACHE_REQUIREPASS: ${IRONCACHE_REQUIREPASS:-}
+    ports:
+      - "6379:6379" # client RESP, published to the host
+    volumes:
+      - ./config/node1.toml:/etc/ironcache/ironcache.toml:ro
+      - ironcache-1-data:/var/lib/ironcache
+    healthcheck:
+      # The binary is distroless (no shell / curl), so probe the health endpoint
+      # by invoking the binary itself as a tiny TCP client against the RESP port.
+      test: ["CMD", "/usr/local/bin/ironcache", "cli", "-h", "127.0.0.1", "-p", "6379"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  ironcache-2:
+    image: ghcr.io/elares/ironcache:latest
+    hostname: ironcache-2
+    command:
+      - server
+      - --config
+      - /etc/ironcache/ironcache.toml
+      - --metrics-addr
+      - 0.0.0.0:9121
+    environment:
+      IRONCACHE_CLUSTER_SECRET: ${IRONCACHE_CLUSTER_SECRET:?set IRONCACHE_CLUSTER_SECRET in .env}
+      IRONCACHE_REQUIREPASS: ${IRONCACHE_REQUIREPASS:-}
+    ports:
+      - "6380:6379"
+    volumes:
+      - ./config/node2.toml:/etc/ironcache/ironcache.toml:ro
+      - ironcache-2-data:/var/lib/ironcache
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ironcache", "cli", "-h", "127.0.0.1", "-p", "6379"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  ironcache-3:
+    image: ghcr.io/elares/ironcache:latest
+    hostname: ironcache-3
+    command:
+      - server
+      - --config
+      - /etc/ironcache/ironcache.toml
+      - --metrics-addr
+      - 0.0.0.0:9121
+    environment:
+      IRONCACHE_CLUSTER_SECRET: ${IRONCACHE_CLUSTER_SECRET:?set IRONCACHE_CLUSTER_SECRET in .env}
+      IRONCACHE_REQUIREPASS: ${IRONCACHE_REQUIREPASS:-}
+    ports:
+      - "6381:6379"
+    volumes:
+      - ./config/node3.toml:/etc/ironcache/ironcache.toml:ro
+      - ironcache-3-data:/var/lib/ironcache
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ironcache", "cli", "-h", "127.0.0.1", "-p", "6379"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+# --- OPTIONAL: encrypt the intra-cluster bus + replication links (cluster_tls) --
+# The shared secret above authenticates peers but (without TLS) travels in
+# cleartext on the compose network. To ALSO encrypt the bus + repl links, add a
+# cluster cert/key to each node and set these env vars on EVERY service (the cert,
+# key, and CA pointed at the SAME self-signed cluster cert verify against
+# themselves, so no external PKI is needed):
+#
+#   environment:
+#     IRONCACHE_CLUSTER_TLS: "on"
+#     IRONCACHE_CLUSTER_TLS_CERT_PATH: /etc/ironcache/tls/cluster.crt
+#     IRONCACHE_CLUSTER_TLS_KEY_PATH:  /etc/ironcache/tls/cluster.key
+#     IRONCACHE_CLUSTER_CA_PATH:       /etc/ironcache/tls/cluster.crt
+#     IRONCACHE_CLUSTER_SECRET:        ${IRONCACHE_CLUSTER_SECRET:?...}
+#   volumes:
+#     - ./tls:/etc/ironcache/tls:ro
+#
+# To ALSO put the public CLIENT listener on TLS, set IRONCACHE_TLS=on +
+# IRONCACHE_TLS_CERT_PATH + IRONCACHE_TLS_KEY_PATH (a separate, public-facing cert).
+
+volumes:
+  ironcache-1-data:
+  ironcache-2-data:
+  ironcache-3-data:

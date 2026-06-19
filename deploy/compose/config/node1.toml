@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronCache node 1 of a 3-node Raft-governed cluster (docker-compose).
+#
+# The cluster topology (the peer list + slot ownership) is TOML-only: there is no
+# env/CLI form for the structured `[[cluster_topology.nodes]]` array-of-tables.
+# Each node mounts its own config with:
+#   - cluster_announce_id     = THIS node's stable 40-hex id (matches its entry below)
+#   - cluster_topology.nodes  = ALL three nodes, by their compose service-name DNS host
+# Peer hosts are resolved LAZILY at dial time, so a peer that is not up yet does not
+# abort this node's boot (the Raft adapter retries every heartbeat).
+#
+# 16384 slots are split three ways: node1 [0,5460], node2 [5461,10922], node3 [10923,16383].
+
+bind = "0.0.0.0"
+port = 6379
+
+# Raft governance: CLUSTER mutations go through the replicated log so all nodes
+# converge on one ownership view (no two owners per slot per epoch).
+cluster_enabled = true
+cluster_mode = "raft"
+
+# THIS node's stable identity. Must equal the matching topology entry's `id`.
+cluster_announce_id = "1111111111111111111111111111111111111111"
+
+# Durable persistence + durable Raft log live under data_dir (the single enable
+# switch). The compose file mounts a named volume here.
+data_dir = "/var/lib/ironcache"
+
+# Periodic background save policy (#58): every 900s if >= 1 keyspace write happened.
+save_interval_secs = 900
+save_min_changes = 1
+
+# WRITE-SIDE durability guardrail: require at least 1 in-sync replica before an owner
+# accepts a write to a slot it owns (so an acknowledged write survives a single-node loss).
+# The static topology assigns only primary ownership (no replicas); slot replicas come only
+# from a runtime Raft proposal, so keep this 0 (any value >= 1 fails writes with -NOREPLICAS).
+min_replicas_to_write = 0
+
+# --- The full cluster topology (identical on every node) ----------------------
+# Each node's cluster-bus (RAFTMSG) port is host:(port + 10000) = 16379, and its
+# replication port is host:(port + 20000) = 26379, both derived from `port` below.
+[[cluster_topology.nodes]]
+id = "1111111111111111111111111111111111111111"
+host = "ironcache-1"
+port = 6379
+slots = [[0, 5460]]
+
+[[cluster_topology.nodes]]
+id = "2222222222222222222222222222222222222222"
+host = "ironcache-2"
+port = 6379
+slots = [[5461, 10922]]
+
+[[cluster_topology.nodes]]
+id = "3333333333333333333333333333333333333333"
+host = "ironcache-3"
+port = 6379
+slots = [[10923, 16383]]

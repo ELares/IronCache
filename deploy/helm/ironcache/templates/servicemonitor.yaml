@@ -1,0 +1,20 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- if .Values.metrics.serviceMonitor.enabled }}
+# Prometheus Operator ServiceMonitor scraping /metrics on the headless Service.
+# Requires the monitoring.coreos.com CRD to be installed in the cluster.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "ironcache.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ironcache.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+{{- end }}

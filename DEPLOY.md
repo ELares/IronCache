@@ -1,0 +1,329 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+# Deploying IronCache (PROD-10)
+
+This guide covers the production deployment artifacts that ship in this repo:
+
+- A multi-stage, non-root container image (`Dockerfile`), published to GHCR by
+  `.github/workflows/image.yml`.
+- `deploy/compose/` -- single-node and 3-node Raft cluster docker-compose files.
+- `deploy/helm/ironcache/` -- a Helm chart deploying a StatefulSet.
+- `deploy/k8s/` -- the same StatefulSet as raw, Helm-free YAML.
+
+It maps every knob to the REAL config key, explains the ports, and is honest
+about what was validated offline versus what needs a live cluster to confirm.
+
+---
+
+## 1. The binary, the ports, and how it is configured
+
+IronCache is one static binary, `ironcache`. The default subcommand is `server`.
+Configuration is layered, highest precedence first:
+
+```
+runtime CONFIG SET  >  CLI flags  >  IRONCACHE_* env vars  >  TOML file  >  built-in defaults
+```
+
+The TOML file is `--config <path>` or, if unset, `/etc/ironcache/ironcache.toml`
+when present. The structured cluster topology (`[[cluster_topology.nodes]]`) is
+**TOML-only** -- it has no env/CLI form -- so cluster deployments mount a TOML
+file. Single scalars (the announce id, the secret, the TLS toggles, data_dir, the
+save policy) are settable by env, which is how the orchestrator injects per-pod
+values without rewriting the file.
+
+### Ports
+
+| Port (default) | Purpose | How it is set / derived |
+| --- | --- | --- |
+| `6379` | client RESP listener | `port` / `IRONCACHE_PORT` / `--port` |
+| `16379` | Raft cluster-bus (`RAFTMSG`) | `port + 10000` (raft mode only) |
+| `26379` | replication data plane | `port + 20000` (raft mode only) |
+| operator-chosen (e.g. `9121`) | HTTP `/metrics` + `/livez` + `/readyz` | `--metrics-addr <ip:port>` |
+
+The cluster-bus and replication ports are DERIVED from the client port in code
+(`BUS_PORT_OFFSET = 10000`, `REPL_PORT_OFFSET = 20000`); you do not configure them
+separately. They are only used in raft-governance mode. The health/metrics HTTP
+endpoint exists ONLY when `--metrics-addr` is passed (there is no env var for it);
+all deployment artifacts here pass `--metrics-addr 0.0.0.0:9121`.
+
+### The config keys you will actually set (REAL names)
+
+| Key (TOML) | Env var | Meaning |
+| --- | --- | --- |
+| `bind` | `IRONCACHE_BIND` | listen address (use `0.0.0.0` in a container) |
+| `port` | `IRONCACHE_PORT` | client RESP port (default 6379) |
+| `shards` | `IRONCACHE_SHARDS` | per-core runtimes (default = available parallelism) |
+| `maxmemory` | `IRONCACHE_MAXMEMORY` | memory ceiling ("512mb", "1gb", 0 = unlimited) |
+| `maxmemory-policy` | `IRONCACHE_MAXMEMORY_POLICY` | eviction policy (default `allkeys-lru`) |
+| `requirepass` | `IRONCACHE_REQUIREPASS` | client AUTH password (hashed at rest) |
+| `maxclients` | `IRONCACHE_MAXCLIENTS` | max connections (default 10000; 0 = unlimited) |
+| `data_dir` | `IRONCACHE_DATA_DIR` | durable snapshot + Raft log dir (enables persistence) |
+| `save_interval_secs` | `IRONCACHE_SAVE_INTERVAL_SECS` | periodic save cadence (0 = off) |
+| `save_min_changes` | `IRONCACHE_SAVE_MIN_CHANGES` | min writes before a periodic save fires |
+| `cluster_enabled` | `IRONCACHE_CLUSTER_ENABLED` | turn on cluster mode (boot-only) |
+| `cluster_mode` | `IRONCACHE_CLUSTER_MODE` | `static` (default) or `raft` |
+| `cluster_announce_id` | `IRONCACHE_CLUSTER_ANNOUNCE_ID` | this node's stable 40-hex id |
+| `cluster_topology.nodes` | (TOML only) | the peer list + slot ownership |
+| `min_replicas_to_write` | `IRONCACHE_MIN_REPLICAS_TO_WRITE` | write-side durability guardrail |
+| `min_replicas_max_lag` | `IRONCACHE_MIN_REPLICAS_MAX_LAG` | lag bound for the in-sync quorum |
+| `raft_snapshot_threshold` | `IRONCACHE_RAFT_SNAPSHOT_THRESHOLD` | Raft-log compaction threshold |
+| `cluster_secret` | `IRONCACHE_CLUSTER_SECRET` | shared peer-auth secret (bus + repl) |
+| `cluster_tls` | `IRONCACHE_CLUSTER_TLS` | `off` (default) / `on` -- encrypt bus + repl |
+| `cluster_tls_cert_path` | `IRONCACHE_CLUSTER_TLS_CERT_PATH` | cluster TLS cert (PEM chain) |
+| `cluster_tls_key_path` | `IRONCACHE_CLUSTER_TLS_KEY_PATH` | cluster TLS private key |
+| `cluster_ca_path` | `IRONCACHE_CLUSTER_CA_PATH` | cluster CA to verify peer certs |
+| `tls` | `IRONCACHE_TLS` | `off` (default) / `on` -- TLS on the public client port |
+| `tls_cert_path` | `IRONCACHE_TLS_CERT_PATH` | client TLS cert (PEM chain) |
+| `tls_key_path` | `IRONCACHE_TLS_KEY_PATH` | client TLS private key |
+
+Self-check any config without starting the server:
+
+```sh
+ironcache check --config /etc/ironcache/ironcache.toml
+```
+
+---
+
+## 2. The container image
+
+`Dockerfile` is a two-stage build:
+
+- **stage** (`alpine`, throwaway): stages the prebuilt **static musl** binary for
+  the target arch. The binary is the SAME one the release pipeline builds (the
+  `*-unknown-linux-musl` targets, `crt-static`, no libc dependency); the image CI
+  unpacks it into `dist/<arch>/ironcache`.
+- **final** (`gcr.io/distroless/static:nonroot`): just CA certs + the nonroot user
+  (uid 65532) + the binary. No shell, no package manager, no toolchain. Runs as
+  `USER 65532:65532`. `data_dir` is a `VOLUME`. The client / bus / repl / metrics
+  ports are `EXPOSE`d (metadata only).
+
+Because the image is distroless (no shell/curl), container health checks probe via
+the binary's own tiny TCP client (`ironcache cli -p 6379`); Kubernetes uses the
+HTTP `/livez` + `/readyz` endpoints directly.
+
+Publish: pushing a `v*` tag triggers `.github/workflows/image.yml`, which builds
+the musl binaries (same reproducible recipe as `release.yml`), then `docker buildx`
+builds a multi-arch (`linux/amd64` + `linux/arm64`) image and pushes
+`ghcr.io/elares/ironcache:<version>` + `:latest` with build provenance + an SBOM.
+It is a SEPARATE workflow from the binary release, so it cannot break or duplicate
+the binary-release jobs.
+
+---
+
+## 3. Single node
+
+### docker-compose
+
+```sh
+cd deploy/compose
+docker compose up -d
+redis-cli -p 6379 ping
+curl localhost:9121/readyz
+```
+
+### Plain docker
+
+```sh
+docker run -d --name ironcache \
+  -p 6379:6379 -p 9121:9121 \
+  -v ironcache-data:/var/lib/ironcache \
+  -e IRONCACHE_DATA_DIR=/var/lib/ironcache \
+  ghcr.io/elares/ironcache:latest \
+  server --bind 0.0.0.0 --metrics-addr 0.0.0.0:9121
+```
+
+---
+
+## 4. docker-compose 3-node Raft cluster
+
+See `deploy/compose/README.md`. In short: set a shared
+`IRONCACHE_CLUSTER_SECRET` in a `.env` file, then
+`docker compose -f docker-compose.cluster.yml up -d`. Each node mounts its own
+`config/nodeN.toml` (full topology + its stable `cluster_announce_id`); peers
+resolve by the compose service-name DNS.
+
+---
+
+## 5. Kubernetes
+
+Two equivalent paths: the Helm chart (`deploy/helm/ironcache`) and the raw
+manifests (`deploy/k8s/ironcache.yaml`). Both deploy a **StatefulSet** with:
+
+- a **headless Service** giving every pod stable DNS
+  `<pod>.<svc>.<ns>.svc.cluster.local`, which is how Raft peers find each other;
+  `publishNotReadyAddresses: true` so a peer is resolvable during boot (Raft
+  formation needs it before `/readyz`);
+- a **client Service** (a single in-cluster endpoint);
+- a **ConfigMap** with the base TOML (full topology) + an init-container script;
+- a **Secret** for `cluster_secret`, `requirepass`, and optional TLS material;
+- a **PodDisruptionBudget** (`maxUnavailable: 1`) so a node drain keeps the
+  Raft majority quorum;
+- a **PVC volumeClaimTemplate** mounting `data_dir`;
+- **livenessProbe `/livez`** and **readinessProbe `/readyz`** on the metrics port;
+- `podAntiAffinity` to spread pods across nodes;
+- a non-root, read-only-rootfs, all-capabilities-dropped security context.
+
+### Per-pod identity (how Raft forms)
+
+The topology is TOML-only and lists every node by its headless-Service DNS name
+with a deterministic 40-hex id `sha256("<name>-<ordinal>")[:40]`. Each pod must
+announce the id matching its own topology entry. A small **BusyBox init
+container** reads the pod's StatefulSet ordinal from its hostname, recomputes that
+same id (`sha256sum | cut -c1-40`), and writes the final config (the id PREPENDED,
+so it stays a top-level key and is not absorbed into the last topology table) into
+an `emptyDir` the main container reads via `--config`. The runtime container stays
+distroless / shell-free.
+
+### Helm
+
+```sh
+helm install ic deploy/helm/ironcache --namespace cache --create-namespace \
+  --set replicas=3 \
+  --set clusterSecret.value="$(openssl rand -hex 24)" \
+  --set auth.enabled=true --set auth.password="$(openssl rand -hex 24)" \
+  --set image.tag=v0.1.0 \
+  --set persistence.storageClassName=fast-ssd
+```
+
+Production guidance baked into `values.yaml`:
+
+- Set a STABLE `clusterSecret.value` (or `clusterSecret.existingSecret`). A blank
+  value auto-generates a RANDOM secret on install that a `helm upgrade` would
+  rotate -- which would split the cluster.
+- Enable `auth.*` and pin `image.tag` to an immutable version.
+- Consider `clusterTls.enabled=true` for a zero-trust pod network (without it the
+  `cluster_secret` travels in cleartext on the pod network).
+- Keep `replicas` ODD (3, 5, 7) for an unambiguous majority; the 16384 slots are
+  split evenly automatically.
+
+### Raw manifests
+
+```sh
+kubectl create namespace ironcache
+# Edit the Secret placeholders (cluster_secret / requirepass) first!
+kubectl -n ironcache apply -f deploy/k8s/ironcache.yaml
+```
+
+---
+
+## 6. Enabling auth and TLS
+
+### Client AUTH (requirepass)
+
+Set `requirepass` (TOML) or `IRONCACHE_REQUIREPASS` (env). The server hashes it at
+rest (SHA-256); the plaintext never persists past config load. In Helm,
+`auth.enabled=true` + `auth.password=...` (or `auth.existingSecret`). Richer ACL
+users are loaded from an `aclfile` (`IRONCACHE_ACLFILE`) if you provide one.
+
+### Client-port TLS (public listener)
+
+`tls=on` + `tls_cert_path` + `tls_key_path`. The client port becomes TLS-only
+(plaintext clients are rejected). In Helm, `tls.enabled=true` + the cert/key.
+
+### Cluster TLS + the shared secret (bus + replication)
+
+`cluster_secret` is a token every node presents in a constant-time peer handshake
+on the bus + repl links; a peer that does not present it is dropped, so a stranger
+who reaches the port cannot join the bus, forge `RAFTMSG`, or pull replication.
+
+`cluster_tls=on` additionally ENCRYPTS those links and REQUIRES
+`cluster_tls_cert_path` + `cluster_tls_key_path`. Point `cluster_ca_path` at the
+cluster CA so a dialed peer's cert is verified (this defeats an active MITM BEFORE
+the secret is sent). A single self-signed cluster cert used as BOTH the cert and
+the CA verifies against itself -- the simple no-PKI-but-secure setup. Without TLS
+the secret travels in cleartext, so TLS + secret is the recommended pairing.
+
+---
+
+## 7. Health, readiness, and metrics
+
+When `--metrics-addr` is set the server serves on that address:
+
+- `GET /livez` -> `200` once the process is up and serving (liveness). The
+  Kubernetes livenessProbe uses this -- it restarts a hung pod.
+- `GET /readyz` -> `200` only when EVERY shard has finished load-on-boot AND, in
+  raft mode, a leader is known; `503` otherwise. The readinessProbe uses this -- a
+  node with a large snapshot to load, or one that has not yet joined a quorum,
+  stays out of the client Service and pauses the rolling update until it is
+  genuinely ready.
+- `GET /metrics` -> Prometheus exposition (per-shard counter rollup + process and
+  raft gauges). Scrape it directly, or enable the chart's `metrics.serviceMonitor`.
+
+---
+
+## 8. Persistence, RPO, and the PVC
+
+`data_dir` is the SINGLE enable switch for durable persistence (the on-disk
+snapshot `dump-shard-<n>.icss` + `dump.manifest`) AND the durable Raft log
+(`ironcache-raft-<bus-port>.log`). With no `data_dir` the node is purely in-memory
+and the Raft log lands in the OS temp dir (lost on a `/tmp`-clearing reboot) -- so
+ALWAYS set `data_dir` (onto a PVC) for a cluster.
+
+RPO is governed by the save policy: `save_interval_secs` + `save_min_changes` (the
+Redis `save <seconds> <changes>` cadence). The defaults here (900s / >=1 change)
+mean up to ~15 minutes of writes can be lost on an ungraceful crash of a single
+node; tighten the interval for a smaller RPO at the cost of more I/O. A graceful
+shutdown performs a final save-on-exit, and the StatefulSet's
+`terminationGracePeriodSeconds` (60s) covers that drain. In a cluster,
+`min_replicas_to_write` bounds how many ACKNOWLEDGED writes a failover can lose to
+the async-replication window: an owner rejects a write unless it has that many
+in-sync replicas, so an acked write is known to be on that many nodes.
+
+Each pod gets its own PVC via the StatefulSet `volumeClaimTemplate`
+(`ReadWriteOnce`, default 10Gi); set `persistence.storageClassName` to an SSD class
+in production. PVCs are NOT deleted by `helm uninstall` / `kubectl delete sts` --
+remove them explicitly when you mean to discard data.
+
+---
+
+## 9. Raft cluster formation, quorum, and scaling
+
+- **Formation**: in raft mode every node boots from the SAME topology (the voter
+  set + the peer bus addresses, `host:(port+10000)`). It builds one shared slot
+  map seeded with its own id, then the Raft control plane elects a leader and
+  replicates the committed slot-ownership log so all nodes converge on one
+  ownership view (no two owners per slot per epoch). Peer DNS is resolved LAZILY at
+  dial time, so a peer that is not up yet does not abort another node's boot -- the
+  adapter retries each heartbeat.
+- **Quorum / PDB**: a Raft cluster needs a majority alive. Keep an ODD node count.
+  The PodDisruptionBudget (`maxUnavailable: 1`) ensures a voluntary disruption
+  (drain, rolling node upgrade) takes at most one pod at a time, so a 3-node
+  cluster always keeps its 2-node majority.
+- **Scaling / durability**: `min_replicas_to_write` is the write-side durability
+  knob -- raise it toward the replica count for stronger durability (an acked write
+  is on more nodes) at the cost of write availability when a replica is down. Slot
+  rebalancing onto newly added nodes is an online-migration operation (`CLUSTER
+  SETSLOT` proposals through the Raft log); changing `replicas` in the chart adds
+  pods + topology entries but the slot map is governed by Raft at runtime.
+
+---
+
+## 10. What is validated vs what needs a live cluster
+
+**Validated offline (in this repo, against the real artifacts):**
+
+- `cargo build --workspace` is green; NO Rust source was changed.
+- The docker-compose cluster + single-node TOML configs, the Helm-rendered cluster
+  config, and the raw-manifest embedded config were each fed through the REAL
+  `ironcache check --config ...` and pass -- this exercises the actual layered
+  config loader AND `SlotMap::build` (slot gap/overlap/dup-id/bad-id validation and
+  the announce-id-must-match-a-topology-entry rule).
+- The init-container identity math (`sha256sum | cut -c1-40`) was confirmed to
+  produce EXACTLY the topology ids the chart/manifests embed, for ordinals 0..2.
+- `helm lint` is clean; `helm template` renders for replicas 1/3/5 (even slot
+  split, contiguous, full 0..16383 coverage); `kubectl apply --dry-run=client`
+  accepts both the Helm output and the raw manifests.
+- `docker compose config` parses both compose files; `yamllint` is clean on the
+  compose / k8s / workflow YAML; both workflow YAMLs parse.
+
+**NOT run locally (the Docker daemon was unavailable on the authoring host) --
+verify in CI / a live environment:**
+
+- `docker build` / `docker buildx` of the image and the multi-arch GHCR push. The
+  Dockerfile is syntactically reviewed and reuses the proven packaging-scaffold
+  pattern, but it was not built here. The first `v*` tag exercises it.
+- Actual Raft cluster formation, leader election, replication, failover, and a
+  rolling upgrade under the PDB -- these need a real multi-node Kubernetes cluster
+  with working pod DNS and PVCs. The manifests are dry-run-valid and the config is
+  loader-valid, but live quorum behavior must be confirmed on a cluster.
+- The HTTP probes returning 200/503 against a running pod (the endpoints and paths
+  are taken from the server source; the probe wiring is dry-run-valid).

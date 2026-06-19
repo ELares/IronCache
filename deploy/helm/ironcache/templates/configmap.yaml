@@ -1,0 +1,89 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- $fullname := include "ironcache.fullname" . -}}
+{{- $headless := include "ironcache.headlessService" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $replicas := int .Values.replicas -}}
+{{- $clientPort := int .Values.service.clientPort -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-config
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ironcache.labels" . | nindent 4 }}
+data:
+  # The BASE config. It carries everything EXCEPT this pod's own
+  # cluster_announce_id, which the init container appends at startup from the
+  # pod's StatefulSet ordinal (so one ConfigMap serves every pod, and each pod
+  # gets its stable identity). The init writes the final file to an emptyDir that
+  # the main container passes to `--config`.
+  ironcache.base.toml: |
+    bind = "0.0.0.0"
+    port = {{ $clientPort }}
+    {{- if .Values.persistence.enabled }}
+    data_dir = "{{ .Values.persistence.mountPath }}"
+    save_interval_secs = {{ int .Values.persistence.saveIntervalSecs }}
+    save_min_changes = {{ int .Values.persistence.saveMinChanges }}
+    {{- else }}
+    data_dir = "{{ .Values.persistence.mountPath }}"
+    {{- end }}
+    {{- if .Values.cluster.enabled }}
+
+    cluster_enabled = true
+    cluster_mode = "raft"
+    min_replicas_to_write = {{ int .Values.cluster.minReplicasToWrite }}
+    raft_snapshot_threshold = {{ int .Values.cluster.raftSnapshotThreshold }}
+    {{- end }}
+    {{- with .Values.extraConfig }}
+
+    # --- extraConfig (verbatim) ---
+    {{ . | nindent 4 | trim }}
+    {{- end }}
+    {{- if .Values.cluster.enabled }}
+
+    # --- cluster topology: all {{ $replicas }} nodes, by stable pod DNS ---------
+    # 16384 slots split evenly across the nodes. Each peer host is the headless
+    # Service per-pod FQDN, resolved lazily at Raft dial time. Each node id is a
+    # deterministic sha256(fullname-ordinal)[:40]; the init container recomputes
+    # THIS pod's id the same way so its announce id matches its entry here.
+    {{- range $i := until $replicas }}
+    {{- $nodeId := include "ironcache.nodeId" (dict "ctx" $ "ordinal" $i) }}
+    {{- /* even slot split: node i owns [lo, hi] of the 16384 space */ -}}
+    {{- $lo := div (mul $i 16384) $replicas }}
+    {{- $hi := sub (div (mul (add $i 1) 16384) $replicas) 1 }}
+    [[cluster_topology.nodes]]
+    id = "{{ $nodeId }}"
+    host = "{{ $fullname }}-{{ $i }}.{{ $headless }}.{{ $ns }}.svc.cluster.local"
+    port = {{ $clientPort }}
+    slots = [[{{ $lo }}, {{ $hi }}]]
+    {{- end }}
+    {{- end }}
+
+  # The init script: derive THIS pod's ordinal from the hostname
+  # (<fullname>-<ordinal>), compute the SAME deterministic node id the topology
+  # uses (sha256 of "<fullname>-<ordinal>", first 40 hex chars), then write the
+  # final config with the cluster_announce_id line PREPENDED to the base.
+  #
+  # The announce id MUST go BEFORE the [[cluster_topology.nodes]] tables: in TOML,
+  # every key after an array-of-tables header belongs to that table, so a trailing
+  # `cluster_announce_id` would be absorbed into the LAST node instead of the
+  # top-level config (and the server would reject the boot: "cluster-announce-id is
+  # required when cluster_topology is set"). Prepending keeps it top-level. Runs in
+  # a BusyBox init container (it has a shell); the runtime container stays
+  # distroless/shell-free.
+  stamp-identity.sh: |
+    #!/bin/sh
+    set -eu
+    ordinal="${HOSTNAME##*-}"
+    seed="{{ $fullname }}-${ordinal}"
+    node_id="$(printf '%s' "$seed" | sha256sum | cut -c1-40)"
+    {{- if .Values.cluster.enabled }}
+    # Prepend the announce id (top-level), then the base (its top-level bind/port
+    # come first, before any [[...]] table, so the id stays top-level).
+    printf 'cluster_announce_id = "%s"\n' "$node_id" > /run/ironcache/ironcache.toml
+    cat /config/ironcache.base.toml >> /run/ironcache/ironcache.toml
+    echo "stamped cluster_announce_id=${node_id} for ordinal ${ordinal}"
+    {{- else }}
+    cp /config/ironcache.base.toml /run/ironcache/ironcache.toml
+    echo "standalone node (no cluster identity stamped)"
+    {{- end }}

@@ -1,0 +1,174 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Container image publish pipeline (PROD-10). On a `v*` tag (the SAME trigger as
+# the binary release in release.yml) this builds a multi-arch (linux/amd64 +
+# linux/arm64) image from the EXISTING release musl binaries and pushes it to
+# GHCR (ghcr.io/elares/ironcache) tagged with the version + `latest`.
+#
+# This is a SEPARATE workflow from release.yml so it cannot break or duplicate the
+# binary-release jobs. It REUSES the released artifacts rather than recompiling:
+# it builds + uploads the same cross-build matrix that release.yml builds (the
+# `*-linux-musl` targets, byte-identical config), unpacks the static binaries into
+# dist/<arch>/, and feeds them to `docker buildx` against the repo Dockerfile. The
+# Dockerfile has no toolchain stage, so the image is just the attested static
+# binary on a distroless/nonroot base.
+#
+# It guards on Cargo.toml/Cargo.lock the same way release.yml does, so it is inert
+# until the crate exists, and is a no-op on a docs-only checkout.
+name: image
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: guard (skip until a Cargo project exists)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_cargo: ${{ steps.check.outputs.has_cargo }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] && [ -f Cargo.lock ]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::repo is docs-only (no Cargo.toml/Cargo.lock); image publish is a no-op"
+          fi
+
+  # Build the static musl binaries with the SAME reproducible recipe release.yml
+  # uses (pinned cargo-zigbuild + zig, SOURCE_DATE_EPOCH, remap-path-prefix). We
+  # rebuild here (rather than reach across workflows for release.yml's artifacts)
+  # so this workflow is self-contained and the image cannot race the release job;
+  # the recipe is identical, so the binary in the image matches the released one.
+  build:
+    name: build ${{ matrix.target }}
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    env:
+      SOURCE_DATE_EPOCH: "1"
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build -C strip=symbols"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust + zig + cargo-zigbuild
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add "${TARGET%%.*}" || true
+          cargo install --locked cargo-zigbuild
+          python3 -m pip install --break-system-packages ziglang==0.14.1
+          python3 -m ziglang version
+      - name: Cross-build (locked, reproducible, version-stamped)
+        env:
+          IRONCACHE_BUILD_VERSION: ${{ github.ref_name }}
+        run: |
+          IRONCACHE_BUILD_VERSION="${IRONCACHE_BUILD_VERSION#v}"
+          export IRONCACHE_BUILD_VERSION
+          cargo zigbuild --release --locked --target "${{ matrix.target }}"
+      - name: Stage the static binary under dist/<arch>/
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-zigbuild writes to the BARE rustc target dir (no glibc suffix on
+          # the musl targets). Stage at dist/<arch>/ironcache, the layout the
+          # Dockerfile COPY expects (dist/${TARGETARCH}/ironcache).
+          tdir="target/${{ matrix.target }}/release"
+          mkdir -p "dist/${{ matrix.arch }}"
+          cp "$tdir/ironcache" "dist/${{ matrix.arch }}/ironcache"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/ironcache
+          if-no-files-found: error
+
+  publish:
+    name: build + push multi-arch image to GHCR
+    needs: [guard, build]
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io/<owner>/ironcache
+      id-token: write # keyless Sigstore image attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Pull both per-arch binaries back into dist/<arch>/ironcache for the buildx
+      # COPY. download-artifact restores each under its artifact-name dir, so move
+      # them into the dist/ layout the Dockerfile expects.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: downloaded
+      - name: Assemble the dist/ staging tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64 dist/arm64
+          cp downloaded/dist-amd64/ironcache dist/amd64/ironcache
+          cp downloaded/dist-arm64/ironcache dist/arm64/ironcache
+          chmod 0755 dist/amd64/ironcache dist/arm64/ironcache
+          ls -l dist/amd64 dist/arm64
+      - name: Compute the lowercase image ref + version
+        id: meta
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # GHCR requires a lowercase owner; the version is the tag minus the `v`.
+          owner_lc="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          ver="${TAG#v}"
+          echo "image=ghcr.io/${owner_lc}/ironcache" >> "$GITHUB_OUTPUT"
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push multi-arch image
+        id: push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
