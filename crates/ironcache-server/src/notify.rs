@@ -77,6 +77,14 @@ fn non_nil(reply: &Value) -> bool {
 /// it would scatter the single source of truth for the event names.
 #[allow(clippy::too_many_lines)]
 pub fn notify_for_command(cmd: &[u8], req: &Request, reply: &Value, db: u32) {
+    // ZERO-COST-WHEN-DISABLED GATE: on the default deployment (`notify-keyspace-events` empty) the
+    // per-command flags snapshot is the disabled set, so return BEFORE the command->event match is
+    // even entered. This is the single cheap check (a thread-local `Cell` read + the
+    // already-disabled `is_enabled`) that keeps the write hot path byte-identical when off -- the
+    // big match below never runs unless notifications are actually enabled.
+    if !ironcache_config::notify::flags_for_command().is_enabled() {
+        return;
+    }
     // The single-key commands all key on args[1]; bail if it is absent (a wrong-arity
     // command already errored, so this is just defensive).
     let key = match req.args.get(1) {
