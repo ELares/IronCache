@@ -6,10 +6,12 @@
 //! (ADR-0002). It holds the negotiated protocol version, the selected DB, the
 //! client name, the authenticated flag, and the per-connection client id.
 
+use crate::acl::User;
 use bytes::Bytes;
 use ironcache_protocol::{ProtoVersion, Request};
 use ironcache_storage::WatchEntry;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// The mutable state of a single client connection.
 ///
@@ -30,6 +32,15 @@ pub struct ConnState {
     /// Whether the connection has authenticated. When no password is configured
     /// the connection is authenticated from the start (Redis behavior).
     pub authenticated: bool,
+    /// The ACL user this connection is AUTHENTICATED AS (#106), cached at AUTH time so the
+    /// per-command authorization check reads it LOCK-FREE (no ACL-registry lock on the data
+    /// path). `None` means "the implicit all-permissive default user": a connection that is
+    /// authenticated without an explicit ACL user (the no-ACL / legacy-requirepass posture)
+    /// carries `None`, and the enforcement layer treats `None` as full access -- so the
+    /// default deployment is byte-identical (no per-command ACL cost). `AUTH <user> <pass>`
+    /// (or the requirepass `AUTH <pass>` resolving the narrowed `default`) caches the
+    /// resolved `Arc<User>` here; RESET / a re-AUTH replaces it.
+    pub acl_user: Option<Arc<User>>,
     /// Whether the connection asked to close (QUIT). The serve loop flushes the
     /// pending reply and then closes.
     pub should_close: bool,
@@ -129,6 +140,11 @@ impl ConnState {
             db: 0,
             name: String::new(),
             authenticated: !requires_auth,
+            // No explicit ACL user on a fresh connection: the implicit all-permissive default
+            // (full access) until an `AUTH <user> <pass>` caches a narrowed identity. On the
+            // no-ACL path this stays `None` for the connection's life, so enforcement is skipped
+            // and the default path is byte-identical (#106).
+            acl_user: None,
             should_close: false,
             addr,
             laddr,
@@ -157,6 +173,10 @@ impl ConnState {
         self.db = 0;
         self.name.clear();
         self.authenticated = !requires_auth;
+        // RESET drops the authenticated ACL identity back to the implicit default (#106):
+        // a post-RESET connection must re-AUTH to regain a narrowed user, matching Redis
+        // (RESET re-authenticates as the default user when auth is required).
+        self.acl_user = None;
         self.clear_txn();
         // RESET exits subscribe mode (Redis: RESET unsubscribes from all channels/patterns).
         // This clears the CONNECTION-side membership only; the serve layer deregisters the

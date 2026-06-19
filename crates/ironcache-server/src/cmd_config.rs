@@ -182,6 +182,7 @@ mod tests {
         let runtime = RuntimeConfig::from_config(&boot);
         ServerContext {
             runtime,
+            acl: crate::acl::AclState::from_requirepass(boot.requirepass.as_deref()),
             databases: boot.databases,
             shards: boot.shards,
             info: ServerInfo {

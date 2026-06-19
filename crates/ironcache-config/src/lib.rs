@@ -391,6 +391,14 @@ pub struct Config {
     /// byte-unchanged. (It is read by the PERSISTENCE path regardless of cluster mode; the Raft
     /// log use of it is the separate raft-governance concern above.)
     pub data_dir: Option<PathBuf>,
+    /// The ACL FILE path (#106, Redis `aclfile`). When set, the server LOADS the `user <name>
+    /// <rules>...` lines from it at boot (so ACL users survive a restart) and `ACL SAVE`
+    /// writes the live registry back to it. `None` (the default) means NO aclfile: the ACL
+    /// registry is the single all-permissive `default` user (plus any `requirepass`), so the
+    /// default deployment is byte-identical and `ACL SAVE`/`LOAD` report "no aclfile
+    /// configured". TOML (`aclfile = "/etc/ironcache/users.acl"`) + the `IRONCACHE_ACLFILE`
+    /// env var. The file holds passwords ONLY as `#<sha256-hex>` digests, never plaintext.
+    pub aclfile: Option<PathBuf>,
     /// The embedded transport-TLS posture for the CLIENT listener (#105, docs/design/TLS.md).
     /// Defaults to [`TlsMode::Off`] (plaintext, byte-unchanged). [`TlsMode::On`] makes the
     /// client port TLS-only and REQUIRES [`Self::tls_cert_path`] + [`Self::tls_key_path`]. TOML
@@ -535,6 +543,10 @@ impl Default for Config {
             // (byte-unchanged pre-existing behavior). Setting it makes the log durable
             // across a reboot that clears /tmp. Meaningful only in raft-governance mode.
             data_dir: None,
+            // No aclfile by default (#106): the ACL registry is the single all-permissive
+            // `default` user (plus any requirepass), so the default deployment is byte-identical.
+            // Setting it loads users at boot and makes ACL SAVE persistent.
+            aclfile: None,
             // TLS is OFF by default (#105): the client listener is plaintext and byte-unchanged.
             // No cert/key is loaded and the rustls layer is never touched. Turning it on is opt-in
             // and requires a cert + key.
@@ -1151,6 +1163,9 @@ pub struct ConfigOverlay {
     /// (`data_dir = "/var/lib/ironcache"`, a string path) + the `IRONCACHE_DATA_DIR` env var.
     /// `None` leaves the lower layer (default `None` = the OS temp dir, byte-unchanged).
     pub data_dir: Option<PathBuf>,
+    /// The ACL file path (#106). TOML (`aclfile = "..."`, a string path) + the
+    /// `IRONCACHE_ACLFILE` env var. `None` leaves the lower layer (default `None` = no aclfile).
+    pub aclfile: Option<PathBuf>,
     /// The transport-TLS posture for the client listener (#105). TOML (`tls = "on"`) + the
     /// `IRONCACHE_TLS` env var. `None` leaves the lower layer (default [`TlsMode::Off`],
     /// plaintext byte-unchanged).
@@ -1335,6 +1350,11 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_DATA_DIR") {
             o.data_dir = Some(PathBuf::from(v));
         }
+        // The ACL file path (#106) is a single scalar path, env-encodable for per-pod injection.
+        // Taken verbatim (no parse can fail); a missing/unreadable file hard-fails at boot LOAD.
+        if let Ok(v) = std::env::var("IRONCACHE_ACLFILE") {
+            o.aclfile = Some(PathBuf::from(v));
+        }
         // TRANSPORT TLS knobs (#105). The mode is a single scalar token (off/on, case-insensitive),
         // env-encodable for per-pod injection; an unrecognized token hard-fails boot rather than
         // silently picking a posture (mirrors `cluster_enabled` / `cluster_mode`). The cert/key are
@@ -1477,6 +1497,9 @@ impl ConfigOverlay {
         }
         if let Some(ref v) = self.data_dir {
             cfg.data_dir = Some(v.clone());
+        }
+        if let Some(ref v) = self.aclfile {
+            cfg.aclfile = Some(v.clone());
         }
         if let Some(v) = self.tls {
             cfg.tls = v;

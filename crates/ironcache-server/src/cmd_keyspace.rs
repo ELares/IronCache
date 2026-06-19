@@ -542,6 +542,7 @@ mod tests {
         let runtime = ironcache_config::RuntimeConfig::from_config(&boot);
         ServerContext {
             runtime,
+            acl: crate::acl::AclState::from_requirepass(boot.requirepass.as_deref()),
             databases,
             shards: 1,
             info: ServerInfo {
