@@ -37,6 +37,11 @@ pub enum SetOutcome {
     /// `maxmemory` size, or an unrecognized `maxmemory-policy` name). The string is the
     /// reason, surfaced in the caller's `CONFIG SET failed` error.
     InvalidValue(String),
+    /// The param is recognized but the underlying feature is NOT SUPPORTED by this build, so a
+    /// `CONFIG SET` is REFUSED with an explicit error rather than silently accepted (the
+    /// false-durability footgun fix for `appendonly`: IronCache has no AOF). The string is the
+    /// operator-facing reason the caller surfaces verbatim.
+    Unsupported(String),
 }
 
 /// How a registered parameter behaves under `CONFIG SET` (CONFIG.md hot-swappable vs
@@ -52,6 +57,12 @@ pub enum SetKind {
     /// getter returns a fixed Redis-recognized default), matching how Redis surfaces
     /// these under a non-persistence cache build.
     AcceptedNoOp,
+    /// Recognized but the underlying feature is NOT SUPPORTED by this build, so a `CONFIG SET`
+    /// is REFUSED with an explicit error (the false-durability footgun fix). Currently ONLY
+    /// `appendonly`: IronCache persists via SNAPSHOTS (SAVE/BGSAVE + the `save` cadence), it has
+    /// no AOF, so `CONFIG SET appendonly yes` must NOT be silently accepted (an operator would
+    /// believe AOF durability is on when it is not). `CONFIG GET appendonly` still reports `no`.
+    Unsupported,
     /// Restart-required: read-only at runtime (bind/port/databases/io-threads/shards).
     /// `CONFIG SET` returns the Redis-style can't-set-at-runtime error rather than
     /// silently ignoring it (CONFIG.md "reported as requiring a restart rather than
@@ -107,13 +118,19 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "maxmemory-samples",
             kind: SetKind::AcceptedNoOp,
         },
+        // `save` is RUNTIME-SETTABLE (#58 durability footgun fix): `CONFIG SET save "<seconds>
+        // <changes>"` ACTUALLY updates the periodic save policy the saver reads, and `CONFIG GET
+        // save` reports the REAL policy -- no longer a silent no-op that lies about durability.
         ParamSpec {
             name: "save",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
+        // `appendonly` is UNSUPPORTED (#58 durability footgun fix): IronCache has NO AOF (it
+        // persists via snapshots), so `CONFIG SET appendonly yes` is REFUSED with an explicit
+        // error instead of silently accepted; `CONFIG GET appendonly` reports `no`.
         ParamSpec {
             name: "appendonly",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Unsupported,
         },
         // The list listpack->quicklist threshold (PR-5, #40). Recognized + echoed for
         // compatibility; the store reads its own resolved byte-budget default, and a
@@ -229,9 +246,16 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // treats its value as plaintext; the ACL `#<hash>` pre-hashed form is #106).
         "requirepass" => runtime.requirepass().unwrap_or_default(),
         // Accepted no-ops: fixed Redis-recognized defaults under the cache build.
-        // `maxmemory-samples` defaults to 5 in Redis; save/appendonly default to off.
+        // `maxmemory-samples` defaults to 5 in Redis.
         "maxmemory-samples" => "5".to_owned(),
-        "save" => String::new(),
+        // `save` reports the REAL runtime save policy (#58 durability footgun fix): the configured
+        // interval/min-changes rendered as a Redis `save` point, or the empty string when the
+        // periodic save is OFF -- so an operator can see whether durability is actually on.
+        "save" => {
+            let (interval, changes) = runtime.save_policy();
+            crate::render_save_points(interval, changes)
+        }
+        // `appendonly` is always `no`: IronCache has no AOF (it persists via snapshots).
         "appendonly" => "no".to_owned(),
         // The list listpack->quicklist threshold: echo the Redis `-2` default
         // spelling ("8 KB per node"); the store works in the resolved byte budget.
@@ -277,6 +301,22 @@ pub fn apply_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOutcome
         // Accepted but inert: ack without changing anything (CONFIG.md no-op params).
         SetKind::AcceptedNoOp => SetOutcome::Applied,
         SetKind::Runtime => apply_runtime_set(spec.name, value, runtime),
+        // Recognized but unsupported (currently only `appendonly`): REFUSE with an explicit error
+        // rather than silently accept a durability claim this build cannot honor (#58 footgun fix).
+        SetKind::Unsupported => SetOutcome::Unsupported(unsupported_reason(spec.name)),
+    }
+}
+
+/// The operator-facing reason a recognized-but-unsupported param is refused. Currently only
+/// `appendonly` (no AOF in this build): point the operator at the snapshot durability path so the
+/// refusal is actionable, not just a flat "no".
+fn unsupported_reason(name: &str) -> String {
+    match name {
+        "appendonly" => "AOF/appendonly is not supported; this build persists via snapshots, \
+                          see save / SAVE/BGSAVE"
+            .to_owned(),
+        // Defensive: any future Unsupported param must add its own reason.
+        other => format!("'{other}' is not supported by this build"),
     }
 }
 
@@ -312,6 +352,23 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
             // CONFIG GET is not meant to be re-SET here. An empty value disables auth.
             runtime.set_requirepass(value);
             SetOutcome::Applied
+        }
+        "save" => {
+            // `CONFIG SET save "<seconds> <changes> [...]"` (#58 durability footgun fix): parse the
+            // Redis `save` directive into the live periodic-save policy the saver reads each tick.
+            // An empty string disables it; a malformed directive is an invalid value (never a
+            // silent accept). The periodic saver picks up the new policy on its next tick.
+            match crate::parse_save_points(value) {
+                Ok(Some((interval, changes))) => {
+                    runtime.set_save_policy(interval, changes);
+                    SetOutcome::Applied
+                }
+                Ok(None) => {
+                    runtime.set_save_policy(0, 0);
+                    SetOutcome::Applied
+                }
+                Err(reason) => SetOutcome::InvalidValue(reason),
+            }
         }
         // Defensive: the registry only marks these three Runtime; any future Runtime
         // param must add a branch here. An unhandled Runtime name is a programming
@@ -385,10 +442,13 @@ mod tests {
             effective_value("maxmemory-samples", &rc, &cfg).as_deref(),
             Some("5")
         );
+        // appendonly is always `no` (no AOF in this build).
         assert_eq!(
             effective_value("appendonly", &rc, &cfg).as_deref(),
             Some("no")
         );
+        // `save` reports the REAL runtime save policy (#58 footgun fix): empty when off.
+        assert_eq!(effective_value("save", &rc, &cfg).as_deref(), Some(""));
         // The list/hash collection thresholds echo their pinned defaults (PR-5/6).
         assert_eq!(
             effective_value("list-max-listpack-size", &rc, &cfg).as_deref(),
@@ -491,13 +551,59 @@ mod tests {
             SetOutcome::RestartRequired
         );
         assert_eq!(apply_set("shards", "4", &rc), SetOutcome::RestartRequired);
-        // accepted no-ops ack without changing anything.
-        assert_eq!(apply_set("save", "900 1", &rc), SetOutcome::Applied);
+        // `maxmemory-samples` is still an accepted no-op (acks without changing anything).
         assert_eq!(
             apply_set("maxmemory-samples", "10", &rc),
             SetOutcome::Applied
         );
         // unknown param.
         assert_eq!(apply_set("bogus", "1", &rc), SetOutcome::UnknownParam);
+    }
+
+    /// #58 durability footgun fix: `save` is RUNTIME-SETTABLE -- `apply_set` parses the Redis save
+    /// directive into the live policy `effective_value("save")` then reports back, and `""` disables
+    /// it. A malformed directive is an invalid value (never a silent accept).
+    #[test]
+    fn apply_set_save_updates_the_runtime_policy() {
+        let cfg = boot();
+        let rc = RuntimeConfig::from_config(&cfg);
+        // Default off -> empty.
+        assert_eq!(effective_value("save", &rc, &cfg).as_deref(), Some(""));
+        // SET save "900 1" updates the policy and is reported back.
+        assert_eq!(apply_set("save", "900 1", &rc), SetOutcome::Applied);
+        assert_eq!(rc.save_policy(), (900, 1));
+        assert_eq!(effective_value("save", &rc, &cfg).as_deref(), Some("900 1"));
+        // Multiple points collapse to the shortest interval.
+        assert_eq!(apply_set("save", "3600 1 60 100", &rc), SetOutcome::Applied);
+        assert_eq!(rc.save_policy(), (60, 100));
+        // "" disables it.
+        assert_eq!(apply_set("save", "", &rc), SetOutcome::Applied);
+        assert_eq!(rc.save_policy(), (0, 0));
+        assert_eq!(effective_value("save", &rc, &cfg).as_deref(), Some(""));
+        // A malformed directive (odd token count) is an invalid value.
+        assert!(matches!(
+            apply_set("save", "900", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        // A zero-second save point is rejected (use "" to disable).
+        assert!(matches!(
+            apply_set("save", "0 1", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+    }
+
+    /// #58 durability footgun fix: `appendonly` is UNSUPPORTED -- `CONFIG SET appendonly yes` is
+    /// refused (no AOF in this build), not silently accepted.
+    #[test]
+    fn apply_set_appendonly_is_unsupported() {
+        let cfg = boot();
+        let rc = RuntimeConfig::from_config(&cfg);
+        match apply_set("appendonly", "yes", &rc) {
+            SetOutcome::Unsupported(reason) => {
+                assert!(reason.contains("not supported"), "got {reason}");
+                assert!(reason.contains("snapshot"), "got {reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

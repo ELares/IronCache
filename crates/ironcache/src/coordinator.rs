@@ -32,10 +32,13 @@ use crate::serve::{ShardState, ShardStoreImpl, shard_env, shard_state, shard_sto
 use ironcache_env::Clock;
 use ironcache_runtime::bootstrap::ShardId;
 use ironcache_server::dispatch::ServerContext;
+// `Admit` (evict_to_fit) + `Store` (used_memory) are brought into scope for the load-on-boot
+// maxmemory enforcement (durability fix #4); the concrete shard store implements both.
 use ironcache_server::{
     CommandClass, CounterDeltas, ProtoVersion, Request, UnixMillis, Value, classify,
     dispatch_remote_keyed, dispatch_remote_whole_keyspace,
 };
+use ironcache_storage::{Admit, Store};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -175,12 +178,25 @@ pub async fn run_drain_loop(
     // synchronous load (no `.await` held across it).
     if let Some(persist) = persist.as_ref() {
         load_shard_on_boot(&ctx, persist, shard_index);
+        // LASTSAVE seed (durability footgun fix #2): once, on shard 0, seed the node-level last-save
+        // time from the LOADED snapshot's `dump.manifest` save timestamp, so `LASTSAVE` and the INFO
+        // `rdb_last_save_time` reflect the on-disk snapshot the node booted from instead of `0` (an
+        // operator's "snapshot stale" monitor would otherwise misfire the instant the node boots). A
+        // missing / torn manifest (nothing loaded) leaves it at `0`. Shard 0 is the single seed point
+        // (one manifest read), mirroring shard 0 hosting the periodic-save timer.
+        if shard_index == 0 {
+            persist.seed_last_save_from_manifest();
+        }
         // The PERIODIC SAVE timer (#58 save policy) is hosted on SHARD 0 only (one timer per node,
-        // not N): when the interval is non-zero it ticks every `interval_secs` and, if at least
-        // `min_changes` writes happened since the last save, triggers a full cross-shard save. With
-        // `interval_secs == 0` (the default) NO timer is spawned. Shard 0's executor (this drain
-        // loop) is the natural home-core host for the fan-out (it OWNS the inbox passed here).
-        if shard_index == 0 && persist.interval_secs > 0 {
+        // not N). It is spawned whenever PERSISTENCE is enabled (a data_dir exists) and reads the
+        // LIVE save policy from the runtime overlay (`ctx.runtime.save_policy()`) each tick, so a
+        // runtime `CONFIG SET save "900 1"` takes effect even on a node booted with the policy OFF
+        // (the durability footgun fix: the policy is no longer frozen at boot). While the policy is
+        // OFF (interval 0) the loop just idles on a coarse poll and never saves, so a default
+        // persistence-off node (no data_dir -> no PersistState) still has NO timer at all. Shard
+        // 0's executor (this drain loop) is the natural home-core host for the fan-out (it OWNS the
+        // inbox passed here).
+        if shard_index == 0 {
             spawn_periodic_save(ctx.clone(), inbox.clone(), Arc::clone(persist));
         }
     }
@@ -251,8 +267,9 @@ pub async fn run_drain_loop(
     };
 
     if stop_requested {
-        let is_save_host =
-            shard_index == 0 && persist.as_ref().is_some_and(|p| p.has_save_policy());
+        // A save policy is the LIVE runtime policy (a `CONFIG SET save` may have turned it on/off
+        // since boot), so read it from the runtime overlay, gated on persistence being enabled.
+        let is_save_host = shard_index == 0 && persist.is_some() && ctx.runtime.has_save_policy();
         if is_save_host {
             // SHARD 0 SAVE HOST: run the final save (fan-out to the still-alive sibling drain loops),
             // then exit 0. A save FAILURE is logged inside the helper; we still exit 0 (the prior
@@ -991,39 +1008,88 @@ fn load_shard_on_boot(
     // The CURRENT shard count: the router computes owner_shard(key, shard_count), so re-shard with
     // the SAME count + hash the live serve loop routes with.
     let shard_count = ctx.shards.max(1);
-    let loaded = {
+    let (loaded, evicted, over_budget) = {
         let mut store = store_rc.borrow_mut();
-        ironcache_persist::load_shard_resharded(
+        let loaded = ironcache_persist::load_shard_resharded(
             &mut store,
             &persist.dir,
             shard_index,
             shard_count,
             now,
             ironcache_server::owner_shard,
-        )
+        );
+        // MAXMEMORY ENFORCEMENT ON LOAD (durability footgun fix #4): a snapshot LARGER than
+        // `maxmemory` would otherwise load fully and boot the node ALREADY over the ceiling (an OOM
+        // risk the live admission path never gets a chance to prevent, since admission only runs on
+        // WRITES). After the load, if the ceiling is enabled and this shard is over its even-split
+        // per-shard budget, run the SAME `evict_to_fit` path the live admission gate uses so the
+        // loaded keyspace respects `maxmemory` from the first served command. With the ceiling OFF
+        // (`per_shard_budget() == 0`, the default) this is a no-op, so the default boot is
+        // byte-unchanged. The store borrow is held only across this synchronous evict (no `.await`).
+        let budget = ctx.per_shard_budget();
+        let (evicted, over_budget) = if budget > 0 && store.used_memory() > budget {
+            let evicted = store.evict_to_fit(budget, now);
+            // If eviction could not get under budget (e.g. a policy that protects every key), the
+            // node is still over the ceiling -> surface it loudly rather than silently OOM-risking.
+            (evicted, store.used_memory() > budget)
+        } else {
+            (0, false)
+        };
+        (loaded, evicted, over_budget)
     };
     if loaded > 0 {
         tracing::info!(
             shard = shard_index,
             loaded,
+            evicted,
             dir = %persist.dir.display(),
             "ironcache: shard loaded keys from snapshot"
         );
     }
+    if evicted > 0 {
+        tracing::warn!(
+            shard = shard_index,
+            evicted,
+            "ironcache: load-on-boot snapshot exceeded maxmemory; evicted to fit the ceiling"
+        );
+    }
+    if over_budget {
+        // Eviction ran but could not bring this shard under its budget (the loaded snapshot is
+        // larger than maxmemory and the policy cannot evict enough): LOUD warning so an operator
+        // sees the node booted over the ceiling rather than discovering an OOM later.
+        tracing::warn!(
+            shard = shard_index,
+            budget_bytes = ctx.per_shard_budget(),
+            used_bytes = store_rc.borrow().used_memory(),
+            "ironcache: load-on-boot left this shard OVER maxmemory (snapshot larger than the \
+             ceiling and the eviction policy could not free enough); the node is over budget"
+        );
+    }
 }
 
-/// Spawn the PERIODIC SAVE timer (#58 save policy) on SHARD 0's executor (one timer per node). Every
-/// `persist.interval_secs` seconds it checks the dirty-write counter: if at least `min_changes`
-/// writes happened since the last save, it triggers a full cross-shard save (the SAME
-/// [`crate::persist::do_save_all`] SAVE/BGSAVE use). With `interval_secs == 0` this is never spawned
-/// (the caller gates on it), so the default posture has NO timer.
+/// The coarse poll cadence the periodic-save loop ticks on while the save policy is OFF (or between
+/// the per-interval deadlines), so a runtime `CONFIG SET save` is noticed within a bounded delay
+/// even when the node booted with the policy disabled. A second is a fine granularity for a cadence
+/// expressed in seconds and is far off any hot path (this is a cold home-core timer). Driven through
+/// the Runtime timer seam (ADR-0003), never wall-clock.
+const PERIODIC_SAVE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Spawn the PERIODIC SAVE timer (#58 save policy) on SHARD 0's executor (one timer per node). It
+/// reads the LIVE save policy from the runtime overlay (`ctx.runtime.save_policy()`) so a runtime
+/// `CONFIG SET save "<seconds> <changes>"` takes effect even on a node booted with the policy OFF
+/// (the durability footgun fix). It ticks on a coarse poll and, once the configured `interval_secs`
+/// of wall-clock has elapsed AND at least `min_changes` writes happened since the last save, it
+/// triggers a full cross-shard save (the SAME [`crate::persist::do_save_all`] SAVE/BGSAVE use).
+/// While the policy is OFF (interval 0) it simply idles -- no save. This is spawned whenever
+/// persistence is enabled; a default persistence-off node has no [`crate::persist::PersistState`],
+/// so it gets no timer at all (byte-unchanged).
 ///
 /// ## Borrow / determinism discipline
 ///
-/// The loop awaits the interval through the [`Runtime`] timer SEAM (NOT `tokio::time`, ADR-0003) and
-/// holds NO RefCell borrow across the awaits (the save fan-out's per-shard `save_shard_local` is
-/// synchronous and runs on each shard's own executor, so this home-core task only awaits channel
-/// replies). The save id / timestamp come from the env Clock seam.
+/// The loop awaits through the [`Runtime`] timer SEAM (NOT `tokio::time`, ADR-0003) and holds NO
+/// RefCell borrow across the awaits (the save fan-out's per-shard `save_shard_local` is synchronous
+/// and runs on each shard's own executor, so this home-core task only awaits channel replies). The
+/// elapsed-interval accounting + the save timestamp come from the env Clock seam (no `Instant`).
 fn spawn_periodic_save(
     ctx: ServerContext,
     inbox: Inbox,
@@ -1031,18 +1097,36 @@ fn spawn_periodic_save(
 ) {
     use ironcache_runtime::Runtime;
     let rt = ironcache_runtime::TokioRuntime::new();
-    let interval = std::time::Duration::from_secs(persist.interval_secs);
     let home = ShardId {
         index: 0,
         total: inbox.len(),
     };
     rt.spawn_on_shard(async move {
+        // The unix-seconds at which the current interval started accumulating; reset whenever the
+        // policy changes or a save fires. Read from shard 0's Env clock (ADR-0003), never Instant.
+        let mut window_start = shard_env().borrow().now_unix_millis() / 1_000;
         loop {
-            rt.timer(interval).await;
-            // Skip this tick if too few writes happened since the last save (the `changes` half of
-            // the Redis `save <seconds> <changes>` policy). `min_changes == 0` always fires.
-            let dirty = persist.dirty.load(std::sync::atomic::Ordering::Relaxed);
-            if dirty < persist.min_changes {
+            rt.timer(PERIODIC_SAVE_POLL).await;
+            // Read the LIVE policy each tick so a `CONFIG SET save` is honored without a restart.
+            let (interval_secs, min_changes) = ctx.runtime.save_policy();
+            let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
+            if interval_secs == 0 {
+                // The periodic save is OFF: keep the window anchored at now so turning the policy
+                // ON later starts a fresh interval rather than firing immediately on stale elapsed.
+                window_start = now_secs;
+                continue;
+            }
+            // Not enough wall-clock has elapsed for this interval yet.
+            if now_secs.saturating_sub(window_start) < interval_secs {
+                continue;
+            }
+            // The interval elapsed: open a fresh window regardless of whether we save below, so a
+            // skipped (too-few-changes) tick does not re-fire every poll.
+            window_start = now_secs;
+            // Skip if too few writes happened since the last save (the `changes` half of the Redis
+            // `save <seconds> <changes>` policy). `min_changes == 0` always fires.
+            let dirty = persist.dirty();
+            if dirty < min_changes {
                 continue;
             }
             // Serialize against a concurrent SAVE/BGSAVE; if one is already running, skip this tick.
@@ -1051,7 +1135,6 @@ fn spawn_periodic_save(
                 continue;
             };
             // The save timestamp from shard 0's Env clock (the determinism seam, ADR-0003).
-            let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
             let _ = crate::persist::do_save_all(&persist, &inbox, &ctx, home, 0, now_secs).await;
         }
     });
@@ -1086,8 +1169,9 @@ pub async fn save_on_exit_if_configured(
     inbox: &Inbox,
 ) -> bool {
     // Save iff persistence is on AND a save policy (a periodic cadence) is configured -- the bare
-    // SHUTDOWN / signal-stop decision [redis-shutdown-save-nosave-default].
-    let Some(persist) = persist.filter(|p| p.has_save_policy()) else {
+    // SHUTDOWN / signal-stop decision [redis-shutdown-save-nosave-default]. The policy is the LIVE
+    // runtime one (`CONFIG SET save` may have changed it since boot), read from the runtime overlay.
+    let Some(persist) = persist.filter(|_| ctx.runtime.has_save_policy()) else {
         return false;
     };
     // H1 (data loss): the OLD code did `try_begin_save() else { return false }` and then the caller

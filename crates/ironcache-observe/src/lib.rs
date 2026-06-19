@@ -648,6 +648,123 @@ pub struct EffectiveMemoryConfig<'a> {
     pub maxmemory_policy: &'a str,
 }
 
+/// The facts the INFO `# Persistence` section renders (durability footgun fix #5), mirroring Redis
+/// `rdb_*` field names so dashboards / `redis_exporter` parse them. Filled by the caller from the
+/// node-level persistence state (last-save time + dirty counter) and the runtime save policy. A
+/// node with persistence OFF passes `enabled: false`, which still renders a HONEST section (a cache
+/// with no on-disk snapshot: `rdb_last_save_time:0`, an empty save policy) rather than omitting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistenceInfo {
+    /// Whether durable persistence is enabled (a `data_dir` is configured). When `false` the
+    /// section reports the no-snapshot posture (last-save 0, no changes, empty policy).
+    pub enabled: bool,
+    /// `rdb_last_save_time`: unix seconds of the last successful save (seeded on boot from the
+    /// loaded snapshot's manifest, durability fix #2). `0` when nothing has been saved/loaded.
+    pub rdb_last_save_time: u64,
+    /// `rdb_changes_since_last_save`: keyspace writes since the last save (the dirty counter).
+    pub rdb_changes_since_last_save: u64,
+    /// The SECONDS half of the active save point (the periodic cadence). `0` = the periodic save
+    /// is OFF (only an explicit SAVE/BGSAVE persists), rendered as an EMPTY `save` policy.
+    pub save_interval_secs: u64,
+    /// The CHANGES half of the active save point. Meaningful only when `save_interval_secs > 0`.
+    pub save_min_changes: u64,
+}
+
+/// The LIVE node-level persistence runtime stats shared into [`build_info`]'s INFO `# Persistence`
+/// section (and the `/metrics` gauges): the last-save unix time and the dirty (changes-since-save)
+/// counter, as two lock-free atomics. ONE per node, shared by `Arc`; the binary's persistence state
+/// owns the writes (it stamps the last-save time on a committed save / seeds it on boot, and bumps
+/// dirty per write), and the server crate's INFO path reads it lock-free. Defined HERE (not in the
+/// binary) so `ServerContext` -- which lives in the server crate, below the binary -- can hold it
+/// without an upward dependency. `None` on the persistence-OFF default path.
+#[derive(Debug)]
+pub struct PersistRuntime {
+    last_save_unix_secs: AtomicU64,
+    dirty: AtomicU64,
+}
+
+impl Default for PersistRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PersistRuntime {
+    /// A fresh persistence-runtime cell (last-save 0, dirty 0).
+    #[must_use]
+    pub fn new() -> Self {
+        PersistRuntime {
+            last_save_unix_secs: AtomicU64::new(0),
+            dirty: AtomicU64::new(0),
+        }
+    }
+
+    /// The last-save unix seconds (what INFO `rdb_last_save_time` / `LASTSAVE` report), relaxed.
+    #[must_use]
+    pub fn last_save_unix_secs(&self) -> u64 {
+        self.last_save_unix_secs.load(Ordering::Relaxed)
+    }
+
+    /// Store the last-save unix seconds (a committed save, or the boot seed from the manifest).
+    pub fn set_last_save_unix_secs(&self, secs: u64) {
+        self.last_save_unix_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// The dirty (changes-since-last-save) counter, relaxed.
+    #[must_use]
+    pub fn dirty(&self) -> u64 {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Bump the dirty counter by one (a successful write while persistence is enabled), relaxed.
+    pub fn note_write(&self) {
+        self.dirty.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reset the dirty counter to zero (a committed save), relaxed.
+    pub fn reset_dirty(&self) {
+        self.dirty.store(0, Ordering::Relaxed);
+    }
+}
+
+impl PersistenceInfo {
+    /// The persistence-OFF posture (the default cache deployment): no `data_dir`, so no snapshot is
+    /// ever written, `rdb_last_save_time` is 0, and the save policy is empty. INFO still renders a
+    /// `# Persistence` section with these honest zeros so monitoring sees a defined shape.
+    #[must_use]
+    pub fn disabled() -> Self {
+        PersistenceInfo {
+            enabled: false,
+            rdb_last_save_time: 0,
+            rdb_changes_since_last_save: 0,
+            save_interval_secs: 0,
+            save_min_changes: 0,
+        }
+    }
+}
+
+impl Default for PersistenceInfo {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+/// One database's line in the INFO `# Keyspace` section (durability/operability fix #5):
+/// `dbN:keys=<keys>,expires=<expires>,avg_ttl=0`, the Redis shape dashboards parse. Only DBs with
+/// at least one key are emitted (Redis omits empty DBs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyspaceDbLine {
+    /// The logical database index (the `N` in `dbN:`).
+    pub db: u32,
+    /// The number of keys in the database (DBSIZE).
+    pub keys: u64,
+    /// The number of keys with an expiry set. NOTE: per-db expiry counting is not tracked cheaply
+    /// today (it would be an O(n) scan), so the caller passes `0`; the `keys` field is the
+    /// load-bearing one operators monitor, and the `expires` field is present for shape parity. A
+    /// real per-db expires tally is a documented follow-up.
+    pub expires: u64,
+}
+
 /// Build the `INFO` reply body (OBSERVABILITY.md). `section` is the optional
 /// lowercased section filter (e.g. `server`); `None` or `"default"`/`"all"`
 /// renders all sections.
@@ -663,6 +780,7 @@ pub struct EffectiveMemoryConfig<'a> {
 /// string. Lines use `\r\n` and `field:value` exactly as Redis does so existing
 /// parsers work.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_info<C: Clock>(
     clock: &C,
     server: &ServerInfo,
@@ -670,6 +788,8 @@ pub fn build_info<C: Clock>(
     memory: MemoryInfo,
     effective: EffectiveMemoryConfig<'_>,
     replication: &ReplicationInfo,
+    persistence: &PersistenceInfo,
+    keyspace: &[KeyspaceDbLine],
     section: Option<&str>,
 ) -> String {
     // `write!` into a String never fails; the `let _ =` discards the Result.
@@ -742,6 +862,9 @@ pub fn build_info<C: Clock>(
         let _ = write!(out, "mem_allocator:{}\r\n", server.mem_allocator);
         out.push_str("\r\n");
     }
+    if want("persistence") {
+        push_persistence_section(&mut out, persistence);
+    }
     if want("stats") {
         out.push_str("# Stats\r\n");
         let _ = write!(
@@ -780,7 +903,63 @@ pub fn build_info<C: Clock>(
         );
         out.push_str("\r\n");
     }
+    if want("keyspace") {
+        push_keyspace_section(&mut out, keyspace);
+    }
     out
+}
+
+/// Append the INFO `# Persistence` section (durability footgun fix #5) to `out`, mirroring Redis
+/// `rdb_*` field names so dashboards / `redis_exporter` parse "snapshot stale" off
+/// `rdb_last_save_time` and `rdb_changes_since_last_save`. IronCache persists via SNAPSHOTS only (no
+/// AOF), so `aof_enabled` is always `0` and the `rdb_*` fields are the durability signal. The `save`
+/// line reports the REAL active save policy (the periodic cadence), or empty when off, so an
+/// operator can see whether durability is actually on. `loading:0` because the readiness gate holds
+/// traffic until load-on-boot completes (we never serve mid-load).
+fn push_persistence_section(out: &mut String, p: &PersistenceInfo) {
+    use core::fmt::Write as _;
+    out.push_str("# Persistence\r\n");
+    out.push_str("loading:0\r\n");
+    let _ = write!(
+        out,
+        "rdb_changes_since_last_save:{}\r\n",
+        p.rdb_changes_since_last_save
+    );
+    out.push_str("rdb_bgsave_in_progress:0\r\n");
+    let _ = write!(out, "rdb_last_save_time:{}\r\n", p.rdb_last_save_time);
+    out.push_str("aof_enabled:0\r\n");
+    let _ = write!(out, "persistence_enabled:{}\r\n", u8::from(p.enabled));
+    // The active save policy as the Redis `save` directive spelling: "<secs> <changes>" when a
+    // periodic cadence is configured, or empty when the periodic save is OFF.
+    let save = if p.save_interval_secs > 0 {
+        format!("{} {}", p.save_interval_secs, p.save_min_changes)
+    } else {
+        String::new()
+    };
+    let _ = write!(out, "save:{save}\r\n");
+    out.push_str("\r\n");
+}
+
+/// Append the INFO `# Keyspace` section (operability fix #5) to `out`: one
+/// `dbN:keys=<n>,expires=<m>,avg_ttl=0` line per NON-EMPTY database (Redis omits empty DBs), the
+/// shape dashboards parse. The `keys` count is the live DBSIZE the caller read per db;
+/// `expires`/`avg_ttl` are 0 today (per-db expiry counting is an O(n) scan, a documented follow-up),
+/// with `keys` the load-bearing field. The section header is emitted even with no databases so the
+/// section is always present for a section-filtered `INFO keyspace`.
+fn push_keyspace_section(out: &mut String, keyspace: &[KeyspaceDbLine]) {
+    use core::fmt::Write as _;
+    out.push_str("# Keyspace\r\n");
+    for line in keyspace {
+        if line.keys == 0 {
+            continue;
+        }
+        let _ = write!(
+            out,
+            "db{}:keys={},expires={},avg_ttl=0\r\n",
+            line.db, line.keys, line.expires
+        );
+    }
+    out.push_str("\r\n");
 }
 
 /// Append the INFO `# Replication` section (HA-7e) to `out`, matching Redis's field names + shape
@@ -911,11 +1090,14 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             None,
         );
         assert!(body.contains("# Server\r\n"));
         assert!(body.contains("# Clients\r\n"));
         assert!(body.contains("# Memory\r\n"));
+        assert!(body.contains("# Persistence\r\n"));
         assert!(body.contains("# Stats\r\n"));
         // The `# Cluster` section reports cluster_enabled:0 in the cluster-disabled
         // default (CLUSTER_CONTRACT.md #70).
@@ -925,6 +1107,97 @@ mod tests {
         assert!(body.contains("connected_clients:0\r\n"));
         assert!(body.contains("mem_allocator:jemalloc\r\n"));
         assert!(body.contains(&format!("ironcache_version:{SERVER_VERSION}\r\n")));
+    }
+
+    /// Durability footgun fix #5: INFO renders a `# Persistence` section with the Redis `rdb_*`
+    /// field names a dashboard parses, reflecting the live last-save time + dirty counter + save
+    /// policy when persistence is ENABLED, and the honest disabled posture otherwise.
+    #[test]
+    fn info_persistence_section_reports_rdb_fields_and_policy() {
+        let env = TestEnv::new(1);
+        // ENABLED: a loaded snapshot at t=1700000000 with 7 dirty writes and a 900s/1-change policy.
+        let persistence = PersistenceInfo {
+            enabled: true,
+            rdb_last_save_time: 1_700_000_000,
+            rdb_changes_since_last_save: 7,
+            save_interval_secs: 900,
+            save_min_changes: 1,
+        };
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl(),
+            &persistence,
+            &[],
+            Some("persistence"),
+        );
+        assert!(body.contains("# Persistence\r\n"), "{body}");
+        assert!(body.contains("loading:0\r\n"), "{body}");
+        assert!(body.contains("rdb_last_save_time:1700000000\r\n"), "{body}");
+        assert!(body.contains("rdb_changes_since_last_save:7\r\n"), "{body}");
+        assert!(body.contains("save:900 1\r\n"), "{body}");
+        assert!(body.contains("persistence_enabled:1\r\n"), "{body}");
+        assert!(body.contains("aof_enabled:0\r\n"), "{body}");
+        // DISABLED: the honest no-snapshot posture (last-save 0, empty policy).
+        let off = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
+            Some("persistence"),
+        );
+        assert!(off.contains("rdb_last_save_time:0\r\n"), "{off}");
+        assert!(off.contains("save:\r\n"), "{off}");
+        assert!(off.contains("persistence_enabled:0\r\n"), "{off}");
+    }
+
+    /// Operability fix #5: INFO renders a `# Keyspace` section with `dbN:keys=...` lines (Redis
+    /// shape) for non-empty databases, and omits empty ones.
+    #[test]
+    fn info_keyspace_section_reports_db_key_counts() {
+        let env = TestEnv::new(1);
+        let keyspace = [
+            KeyspaceDbLine {
+                db: 0,
+                keys: 42,
+                expires: 0,
+            },
+            KeyspaceDbLine {
+                db: 3,
+                keys: 5,
+                expires: 0,
+            },
+        ];
+        let body = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl(),
+            &PersistenceInfo::disabled(),
+            &keyspace,
+            Some("keyspace"),
+        );
+        assert!(body.contains("# Keyspace\r\n"), "{body}");
+        assert!(
+            body.contains("db0:keys=42,expires=0,avg_ttl=0\r\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("db3:keys=5,expires=0,avg_ttl=0\r\n"),
+            "{body}"
+        );
+        // An empty database is omitted (no db1/db2 line).
+        assert!(!body.contains("db1:"), "{body}");
+        assert!(!body.contains("db2:"), "{body}");
     }
 
     #[test]
@@ -945,6 +1218,8 @@ mod tests {
             MemoryInfo::default(),
             effective,
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("memory"),
         );
         assert!(
@@ -974,6 +1249,8 @@ mod tests {
             MemoryInfo::default(),
             effective,
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             None,
         );
         assert!(body.contains("maxmemory_policy:volatile-ttl\r\n"), "{body}");
@@ -997,6 +1274,8 @@ mod tests {
             mem,
             eff(),
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("memory"),
         );
         assert!(
@@ -1022,6 +1301,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("memory"),
         );
         assert!(body.contains("used_memory:0\r\n"), "{body}");
@@ -1049,12 +1330,17 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("server"),
         );
         assert!(only_server.contains("# Server\r\n"));
         assert!(!only_server.contains("# Memory\r\n"));
         // The `# Cluster` section is gated by the filter too: a server-only INFO omits it.
         assert!(!only_server.contains("# Cluster\r\n"));
+        // The new `# Persistence` / `# Keyspace` sections are gated by the filter too (fix #5).
+        assert!(!only_server.contains("# Persistence\r\n"));
+        assert!(!only_server.contains("# Keyspace\r\n"));
         // Asking for the cluster section yields it with the disabled flag.
         let only_cluster = build_info(
             &env,
@@ -1063,6 +1349,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("cluster"),
         );
         assert!(only_cluster.contains("# Cluster\r\n"));
@@ -1081,6 +1369,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("server"),
         );
         assert!(body.contains("uptime_in_seconds:90\r\n"), "{body}");
@@ -1098,6 +1388,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &ReplicationInfo::standalone(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("replication"),
         );
         assert!(body.contains("# Replication\r\n"), "{body}");
@@ -1135,6 +1427,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl,
+            &PersistenceInfo::disabled(),
+            &[],
             Some("replication"),
         );
         assert!(body.contains("role:master\r\n"), "{body}");
@@ -1166,6 +1460,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl,
+            &PersistenceInfo::disabled(),
+            &[],
             Some("replication"),
         );
         assert!(body.contains("role:replica\r\n"), "{body}");
@@ -1189,6 +1485,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &down,
+            &PersistenceInfo::disabled(),
+            &[],
             Some("replication"),
         );
         assert!(body.contains("master_link_status:down\r\n"), "{body}");
@@ -1206,6 +1504,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("server"),
         );
         assert!(!only_server.contains("# Replication\r\n"), "{only_server}");
@@ -1216,6 +1516,8 @@ mod tests {
             MemoryInfo::default(),
             eff(),
             &repl(),
+            &PersistenceInfo::disabled(),
+            &[],
             Some("replication"),
         );
         assert!(only_repl.contains("# Replication\r\n"), "{only_repl}");

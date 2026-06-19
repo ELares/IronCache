@@ -768,6 +768,9 @@ impl FileStorage {
             tmp.sync_all()?;
         }
         std::fs::rename(&tmp_path, &snap_path)?;
+        // Fsync the PARENT DIR so the rename's directory-entry update is durable (a crash right
+        // after a rename can otherwise lose it on some filesystems even though the bytes are synced).
+        fsync_dir(&snap_path);
         // Mirror the snapshot in memory (reads serve from the mirror).
         self.mirror.snap_meta = Some(meta);
         self.mirror.snap_data = data.to_vec();
@@ -804,6 +807,8 @@ impl FileStorage {
             tmp.sync_all()?;
         }
         std::fs::rename(&tmp_path, &cfg_path)?;
+        // Fsync the PARENT DIR so the rename's directory-entry update is durable.
+        fsync_dir(&cfg_path);
         // Mirror the baseline in memory (reads serve from the mirror).
         self.mirror.config_baseline = Some((voters.clone(), learners.clone()));
         Ok(())
@@ -859,6 +864,8 @@ impl FileStorage {
             tmp.sync_all()?;
         }
         std::fs::rename(&tmp_path, &self.path)?;
+        // Fsync the PARENT DIR so the compacted-log rename's directory-entry update is durable.
+        fsync_dir(&self.path);
         // Reopen the (now rewritten) log file for appends, positioned at the end.
         let mut file = OpenOptions::new()
             .read(true)
@@ -1037,6 +1044,26 @@ fn load_snapshot_file(path: &Path) -> io::Result<Option<(SnapshotMeta, Vec<u8>)>
         },
         data,
     )))
+}
+
+/// Best-effort fsync of `path`'s PARENT directory so a rename's directory-entry update is durable
+/// (production durability fix). The atomic `tmp -> fsync -> rename` writes here already fsync the
+/// FILE contents, but the rename itself only durably commits once the PARENT DIRECTORY is fsync'd:
+/// on some filesystems a crash right after a rename can otherwise lose the directory-entry update
+/// even though the file bytes are on disk, reverting to the old name (or losing the entry). Mirrors
+/// the snapshot-persist crate's `fsync_dir` helper (this crate is a leaf and does not depend on the
+/// snapshot crate, so the small helper is mirrored rather than imported). A failure here is
+/// NON-FATAL (some platforms refuse to open a directory for sync): the file contents are already
+/// durable and the rename is atomic, so the worst case is a slightly-less-durable directory entry,
+/// never corruption -- silently ignored.
+fn fsync_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
 }
 
 /// The config-baseline sidecar path for a record log (`<log>.cfg`), HA-3d.
@@ -1782,6 +1809,73 @@ mod tests {
             "the persisted config baseline recovers byte-for-byte across a reopen"
         );
         assert!(s.load_snapshot().is_some(), "the snapshot recovers too");
+
+        cleanup(&path);
+        let _ = std::fs::remove_file(&snap);
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    /// Production durability fix #3: the snapshot / config-baseline / compaction renames each fsync
+    /// the PARENT DIRECTORY, so a crash right after a rename cannot lose the directory-entry update.
+    /// We exercise all three rename paths (`persist_snapshot`, `persist_config_baseline`,
+    /// `compact_log_to`), then REOPEN the store and assert it is FULLY CONSISTENT -- the snapshot,
+    /// the baseline, and the surviving tail all recover. `fsync_dir` is best-effort (silent on a
+    /// platform that refuses to open a dir for sync), so the load-bearing assertion is the
+    /// post-rename consistency the dir-fsync protects, which holds on every platform.
+    #[test]
+    fn snapshot_and_compaction_renames_leave_a_consistent_reopen() {
+        let path = fresh_path("snapshot_and_compaction_renames_consistent_reopen");
+        let snap = snapshot_path(&path);
+        let cfg = config_baseline_path(&path);
+        let _ = std::fs::remove_file(&snap);
+        let _ = std::fs::remove_file(&cfg);
+
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2), NodeId(3)].into_iter().collect();
+        let learners: BTreeSet<NodeId> = [NodeId(4)].into_iter().collect();
+        let meta = SnapshotMeta {
+            last_included_index: 4,
+            last_included_term: 3,
+        };
+        let tail = vec![LogEntry {
+            term: 3,
+            index: 5,
+            payload: EntryPayload::Noop,
+        }];
+        {
+            let mut s = FileStorage::open(&path).expect("open fresh");
+            for i in 1..=5u64 {
+                s.append(LogEntry {
+                    term: 3,
+                    index: i,
+                    payload: EntryPayload::Noop,
+                });
+            }
+            // Drive all three dir-fsync'd rename paths: snapshot, baseline, compaction.
+            s.save_snapshot(meta, b"sm-bytes"); // persist_snapshot rename
+            s.save_config_baseline(&voters, &learners); // persist_config_baseline rename
+            s.compact_to(4); // compact_log_to rename (drops [1..=4])
+            // The parent dir of the log must be openable + syncable on this platform (the dir-fsync
+            // is a no-op otherwise, but here we assert the path the fix uses actually resolves).
+            assert!(
+                path.parent().is_some_and(|p| File::open(p).is_ok()),
+                "the storage parent directory is fsync-able"
+            );
+        }
+
+        // REOPEN: every renamed artifact recovers consistently (the property the dir-fsync protects).
+        let s = FileStorage::open(&path).expect("reopen recovers");
+        assert!(s.load_snapshot().is_some(), "the snapshot recovers");
+        assert_eq!(
+            s.load_config_baseline(),
+            Some((voters, learners)),
+            "the config baseline recovers across the renames"
+        );
+        assert_eq!(
+            s.entries_from(5),
+            tail,
+            "the surviving tail recovers after the compaction rename"
+        );
+        assert_eq!(s.last_log_index(), 5);
 
         cleanup(&path);
         let _ = std::fs::remove_file(&snap);

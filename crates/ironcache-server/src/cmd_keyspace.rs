@@ -560,6 +560,7 @@ mod tests {
             repl_status: None,
             in_sync_replicas: None,
             metrics_registry: None,
+            persist_stats: None,
             boot,
         }
     }

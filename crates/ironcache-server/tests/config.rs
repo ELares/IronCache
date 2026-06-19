@@ -57,6 +57,7 @@ fn ctx(runtime: Arc<RuntimeConfig>, boot: Config) -> ServerContext {
         repl_status: None,
         in_sync_replicas: None,
         metrics_registry: None,
+        persist_stats: None,
         boot,
     }
 }

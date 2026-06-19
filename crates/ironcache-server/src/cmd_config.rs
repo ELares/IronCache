@@ -112,7 +112,11 @@ fn config_set(ctx: &ServerContext, req: &Request) -> Value {
             SetOutcome::RestartRequired => {
                 return Value::error(ErrorReply::config_set_immutable(&name));
             }
-            SetOutcome::InvalidValue(reason) => {
+            // A rejected value (e.g. a malformed `save` directive) AND a recognized-but-unsupported
+            // param (e.g. `appendonly` -- the #58 durability footgun fix: REFUSE rather than silently
+            // accept a durability claim this build cannot honor) both surface the canonical
+            // Redis-shaped CONFIG SET failed error carrying the specific reason.
+            SetOutcome::InvalidValue(reason) | SetOutcome::Unsupported(reason) => {
                 return Value::error(ErrorReply::config_set_failed(&name, &reason));
             }
         }
@@ -196,6 +200,7 @@ mod tests {
             repl_status: None,
             in_sync_replicas: None,
             metrics_registry: None,
+            persist_stats: None,
             boot,
         }
     }
@@ -393,19 +398,75 @@ mod tests {
     #[test]
     fn config_set_noop_params_are_echoed() {
         let c = ctx_with(Config::default());
-        // Accepted no-ops ack +OK and are echoed by GET with a recognized value.
-        assert_eq!(
-            run(&c, &[b"CONFIG", b"SET", b"save", b"900 1"]).0,
-            Value::ok()
-        );
+        // `maxmemory-samples` is still an accepted no-op: ack +OK, echoed by GET.
         assert_eq!(
             run(&c, &[b"CONFIG", b"SET", b"maxmemory-samples", b"10"]).0,
             Value::ok()
         );
+        let (v, _) = run(&c, &[b"CONFIG", b"GET", b"maxmemory-samples"]);
         assert_eq!(
-            run(&c, &[b"CONFIG", b"SET", b"appendonly", b"yes"]).0,
+            get_pairs(&v),
+            vec![("maxmemory-samples".to_owned(), "5".to_owned())]
+        );
+    }
+
+    /// #58 durability footgun fix: `CONFIG SET save` ACTUALLY updates the runtime save policy and
+    /// `CONFIG GET save` reports the REAL policy (not a fixed empty stub). A booted-off node reports
+    /// empty; a `SET save "900 1"` reports back `900 1`; `SET save ""` disables it again.
+    #[test]
+    fn config_set_save_updates_and_reports_the_real_policy() {
+        let c = ctx_with(Config::default());
+        // Default boot: the periodic save is OFF, so GET save reports the empty string.
+        let (v, _) = run(&c, &[b"CONFIG", b"GET", b"save"]);
+        assert_eq!(get_pairs(&v), vec![("save".to_owned(), String::new())]);
+        // SET save "900 1" ACTUALLY updates the policy (no longer a silent no-op).
+        assert_eq!(
+            run(&c, &[b"CONFIG", b"SET", b"save", b"900 1"]).0,
             Value::ok()
         );
+        assert_eq!(c.runtime.save_policy(), (900, 1));
+        // GET save now reports the REAL configured policy.
+        let (v, _) = run(&c, &[b"CONFIG", b"GET", b"save"]);
+        assert_eq!(get_pairs(&v), vec![("save".to_owned(), "900 1".to_owned())]);
+        // Multiple save points collapse to the SHORTEST-interval (tightest-RPO) one.
+        assert_eq!(
+            run(
+                &c,
+                &[b"CONFIG", b"SET", b"save", b"3600 1 300 100 60 10000"]
+            )
+            .0,
+            Value::ok()
+        );
+        assert_eq!(c.runtime.save_policy(), (60, 10000));
+        // SET save "" DISABLES the periodic save.
+        assert_eq!(run(&c, &[b"CONFIG", b"SET", b"save", b""]).0, Value::ok());
+        assert_eq!(c.runtime.save_policy(), (0, 0));
+        let (v, _) = run(&c, &[b"CONFIG", b"GET", b"save"]);
+        assert_eq!(get_pairs(&v), vec![("save".to_owned(), String::new())]);
+        // A malformed directive is a CONFIG SET failed error (never a silent accept).
+        match run(&c, &[b"CONFIG", b"SET", b"save", b"900"]).0 {
+            Value::Error(e) => assert!(e.line().contains("CONFIG SET failed"), "got {}", e.line()),
+            other => panic!("expected CONFIG SET failed, got {other:?}"),
+        }
+    }
+
+    /// #58 durability footgun fix: `CONFIG SET appendonly yes` is REFUSED with an explicit error
+    /// (IronCache has no AOF) instead of being silently accepted, and `CONFIG GET appendonly` is
+    /// `no`. This closes the false-durability trap where an operator believed AOF was on.
+    #[test]
+    fn config_set_appendonly_is_refused_and_get_is_no() {
+        let c = ctx_with(Config::default());
+        match run(&c, &[b"CONFIG", b"SET", b"appendonly", b"yes"]).0 {
+            Value::Error(e) => {
+                assert!(e.line().contains("appendonly"), "got {}", e.line());
+                assert!(
+                    e.line().contains("not supported"),
+                    "the refusal must say it is unsupported, got {}",
+                    e.line()
+                );
+            }
+            other => panic!("expected an unsupported-appendonly error, got {other:?}"),
+        }
         let (v, _) = run(&c, &[b"CONFIG", b"GET", b"appendonly"]);
         assert_eq!(
             get_pairs(&v),

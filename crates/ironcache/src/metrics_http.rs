@@ -213,7 +213,7 @@ impl MetricsState {
         let (last_save_unix, dirty) = self
             .persist
             .as_ref()
-            .map_or((0, 0), |p| (p.last_save(), p.dirty.load(Ordering::Relaxed)));
+            .map_or((0, 0), |p| (p.last_save(), p.dirty()));
         let raft = self.raft.as_ref().map(|h| {
             let s = h.status();
             RaftGauges {

@@ -91,6 +91,36 @@ re-decide the durability stance (ADR-0014 owns that) or the cold-engine choice
   layout and the io_uring writer; the engine internals and the F2-vs-FASTER
   benchmark are ADR-0023 and #64.
 
+### Current implementation: snapshot-only durability and the RPO contract
+
+What ships today is **SNAPSHOT-ONLY** durability (Tier 0 + a partial Tier 1), and it
+is important to be honest about the data-loss window (RPO) so operators are not lulled
+into a false sense of durability:
+
+- **Durability is via SNAPSHOTS only.** There is **no AOF / append-only file** in this
+  build. Data is persisted by an explicit `SAVE` / `BGSAVE` (a forkless per-shard dump
+  committed via an fsync'd manifest), or by the periodic save policy when one is
+  configured. `CONFIG SET appendonly yes` is therefore **rejected** (it is not silently
+  accepted), and `CONFIG GET appendonly` is always `no`. The append-log / hybrid-log
+  tiers above remain the roadmap (#63/#64).
+- **The default save policy is OFF.** With no `data_dir` configured, persistence is
+  entirely off (the ephemeral default, ADR-0014): nothing is ever written and a crash
+  loses the whole dataset. Even with a `data_dir` set, the **periodic** save policy
+  (`save_interval_secs` / `save_min_changes`, also settable at runtime via
+  `CONFIG SET save "<seconds> <changes>"`) **defaults to disabled** -- so data persists
+  ONLY on an explicit `SAVE` / `BGSAVE` until an interval is configured.
+- **The RPO (data-loss window) equals the save interval.** Because the only durable
+  points are explicit saves and the periodic cadence, a crash loses every write since
+  the last committed snapshot. With the periodic policy enabled the worst-case RPO is
+  approximately the configured `save_interval_secs` (plus the tail of writes admitted
+  after the last tick); **with the default OFF policy and no explicit save, the RPO is
+  UNBOUNDED** (the entire keyspace can be lost). `CONFIG GET save` reports the real
+  active policy (empty when off), `LASTSAVE` / INFO `# Persistence` `rdb_last_save_time`
+  report the last committed save time (seeded on boot from the loaded snapshot), and
+  INFO `rdb_changes_since_last_save` reports how many writes are currently at risk -- so
+  the live loss window is observable rather than guessed. The zero-RPO strict tier
+  (Tier 2 above) is still roadmap.
+
 ## Open questions
 
 - Group-commit batching window for the strict tier (latency vs syscall amortization).

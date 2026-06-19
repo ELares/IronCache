@@ -1534,6 +1534,76 @@ pub fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// Parse a Redis `save` directive (`"<seconds> <changes> [<seconds> <changes> ...]"`) into the
+/// `(interval_secs, min_changes)` the periodic saver uses (#58 durability footgun fix). This makes
+/// `CONFIG SET save` ACTUALLY update the save policy instead of silently no-op'ing.
+///
+/// IronCache collapses Redis's multiple save points to ONE periodic cadence, so when several points
+/// are given this returns the SHORTEST-interval (most aggressive) one -- the point that fires first
+/// and bounds the data-loss window (RPO) tightest. An EMPTY / whitespace-only string returns
+/// `Ok(None)` (DISABLE the periodic save: only an explicit SAVE/BGSAVE persists, the Redis
+/// `save ""` semantics). A malformed directive (an odd token count, a non-integer, or a zero
+/// interval) returns `Err(reason)` the caller surfaces as a `CONFIG SET failed` error -- it never
+/// silently accepts a value it cannot honor.
+///
+/// # Errors
+///
+/// Returns an error string when the token count is odd, a token is not a non-negative integer, or a
+/// save point has a zero `seconds` (a 0-second interval is not a valid cadence; use `""` to disable).
+pub fn parse_save_points(s: &str) -> Result<Option<(u64, u64)>, String> {
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    if tokens.is_empty() {
+        // `save ""` (or all-whitespace): disable the periodic save.
+        return Ok(None);
+    }
+    if tokens.len() % 2 != 0 {
+        return Err(format!(
+            "invalid save directive '{s}': expected '<seconds> <changes> [<seconds> <changes> ...]'"
+        ));
+    }
+    let mut best: Option<(u64, u64)> = None;
+    for pair in tokens.chunks_exact(2) {
+        let seconds: u64 = pair[0].parse().map_err(|_| {
+            format!(
+                "invalid save directive '{s}': '{}' is not an integer",
+                pair[0]
+            )
+        })?;
+        let changes: u64 = pair[1].parse().map_err(|_| {
+            format!(
+                "invalid save directive '{s}': '{}' is not an integer",
+                pair[1]
+            )
+        })?;
+        if seconds == 0 {
+            return Err(format!(
+                "invalid save directive '{s}': a save point's seconds must be > 0 (use \"\" to disable)"
+            ));
+        }
+        // Keep the SHORTEST interval (the most aggressive / tightest-RPO point).
+        best = match best {
+            Some((bs, _)) if bs <= seconds => best,
+            _ => Some((seconds, changes)),
+        };
+    }
+    Ok(best)
+}
+
+/// Render the runtime save policy `(interval_secs, min_changes)` back to the Redis `save` directive
+/// spelling `CONFIG GET save` reports (#58 durability footgun fix). A non-zero interval renders as
+/// `"<interval_secs> <min_changes>"`; a zero interval (the periodic save disabled) renders as the
+/// EMPTY string, exactly how Redis reports `save` when no save points are configured. This makes
+/// `CONFIG GET save` report the REAL policy instead of a fixed empty stub, so an operator can see
+/// whether durability is actually on.
+#[must_use]
+pub fn render_save_points(interval_secs: u64, min_changes: u64) -> String {
+    if interval_secs == 0 {
+        String::new()
+    } else {
+        format!("{interval_secs} {min_changes}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
