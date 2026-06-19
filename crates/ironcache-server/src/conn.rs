@@ -6,7 +6,7 @@
 //! (ADR-0002). It holds the negotiated protocol version, the selected DB, the
 //! client name, the authenticated flag, and the per-connection client id.
 
-use crate::acl::User;
+use crate::acl::{DEFAULT_USER, User};
 use bytes::Bytes;
 use ironcache_protocol::{ProtoVersion, Request};
 use ironcache_storage::WatchEntry;
@@ -41,6 +41,20 @@ pub struct ConnState {
     /// (or the requirepass `AUTH <pass>` resolving the narrowed `default`) caches the
     /// resolved `Arc<User>` here; RESET / a re-AUTH replaces it.
     pub acl_user: Option<Arc<User>>,
+    /// The NAME of the ACL user this connection is authenticated as (#106, F1 live revocation).
+    /// `"default"` on a fresh connection (the implicit identity, even with `acl_user == None`),
+    /// updated to the resolved user's name at AUTH time and reset to `"default"` by RESET. The
+    /// per-command path needs the name to RE-RESOLVE the user by name when the registry
+    /// generation moves (`acl_user` alone, being `None` for an all-permissive default, does not
+    /// carry it). A mid-session `ACL SETUSER default ...` therefore reaches a never-AUTHed
+    /// no-requirepass connection too (it is still the `"default"` identity).
+    pub acl_user_name: String,
+    /// The ACL-registry GENERATION the cached `acl_user` was resolved against (#106, F1). The
+    /// per-command enforcement path does ONE relaxed load of the live registry generation and
+    /// compares it to this; on a MISMATCH (a mutation happened) it re-resolves `acl_user` by
+    /// `acl_user_name` and updates this. On the no-ACL path the generation never moves, so this
+    /// stays equal and the hot path is a single integer compare.
+    pub acl_user_gen: u64,
     /// Whether the connection asked to close (QUIT). The serve loop flushes the
     /// pending reply and then closes.
     pub should_close: bool,
@@ -145,6 +159,13 @@ impl ConnState {
             // no-ACL path this stays `None` for the connection's life, so enforcement is skipped
             // and the default path is byte-identical (#106).
             acl_user: None,
+            // A fresh connection is the implicit `default` identity (F1): the name is set even
+            // when `acl_user` is `None`, so a mid-session `ACL SETUSER default ...` re-resolves
+            // for it. AUTH overwrites it with the resolved user's name.
+            acl_user_name: DEFAULT_USER.to_owned(),
+            // Cached generation starts at 0 (the boot generation); the first command compares it
+            // against the live registry generation and re-resolves only if a mutation has moved it.
+            acl_user_gen: 0,
             should_close: false,
             addr,
             laddr,
@@ -175,8 +196,14 @@ impl ConnState {
         self.authenticated = !requires_auth;
         // RESET drops the authenticated ACL identity back to the implicit default (#106):
         // a post-RESET connection must re-AUTH to regain a narrowed user, matching Redis
-        // (RESET re-authenticates as the default user when auth is required).
+        // (RESET re-authenticates as the default user when auth is required). The name goes
+        // back to `"default"` (F1) so the post-RESET implicit-default identity re-resolves on a
+        // mid-session `ACL SETUSER default ...`; `acl_user_gen` is left as-is (the next command
+        // re-resolves the `default` user if the generation has since moved).
         self.acl_user = None;
+        // Reuse the existing allocation rather than reassign (clippy::assigning_clones).
+        self.acl_user_name.clear();
+        self.acl_user_name.push_str(DEFAULT_USER);
         self.clear_txn();
         // RESET exits subscribe mode (Redis: RESET unsubscribes from all channels/patterns).
         // This clears the CONNECTION-side membership only; the serve layer deregisters the

@@ -427,6 +427,60 @@ pub fn command_allowed_pre_auth(cmd: &[u8]) -> bool {
     matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
 }
 
+/// LIVE-REVOCATION RE-RESOLVE (F1): bring a connection's cached ACL identity up to date with the
+/// registry when a mutation has happened SINCE the identity was cached, run ONCE per command at
+/// the router chokepoint right BEFORE [`acl_enforce`]. This is what makes a mid-session `ACL
+/// SETUSER app -@all` / `ACL DELUSER app` (or an `ACL SETUSER default ...` narrowing the implicit
+/// default) take effect on the offending connection's VERY NEXT command, instead of being fail-open
+/// until that client re-AUTHs or disconnects (the F1 finding; Redis revokes live).
+///
+/// ## Hot path: one relaxed load + integer compare
+///
+/// The COMMON case is no mutation since the connection cached its user: the live registry
+/// `generation` equals `conn.acl_user_gen`, so this returns `true` after ONE relaxed atomic load
+/// and an integer compare -- no lock, no allocation, byte-identical on the no-ACL path (where the
+/// generation never moves at all). Only when the generation MOVED (rare: an `ACL` admin verb ran)
+/// does it take the registry lock to re-resolve the connection's user by `acl_user_name`:
+/// - user still present -> refresh `conn.acl_user` (`None` when all-permissive, so a back-to-
+///   permissive default re-collapses to the byte-identical fast path; `Some` when narrowed, so a
+///   fresh restriction is picked up) and update `conn.acl_user_gen`; returns `true`.
+/// - user DELETED (`ACL DELUSER`) -> DEAUTHENTICATE the connection (clear `authenticated` + drop
+///   the cached user back to the implicit default and reset the name) so its next command hits the
+///   NOAUTH gate, and return `false` so the caller CLOSES it -- mirroring Redis, which kills a
+///   deleted user's clients. Closing (vs silently reverting to the all-permissive default) is the
+///   safe choice: a no-requirepass deployment would otherwise leave the connection running as the
+///   permissive default after its narrowed user was deleted.
+///
+/// Returns `true` when the connection remains a valid identity (possibly refreshed), `false` when
+/// it was deauthenticated and the caller should close it.
+#[must_use]
+pub fn acl_resolve_if_stale(ctx: &ServerContext, conn: &mut ConnState) -> bool {
+    // HOT PATH: one relaxed load + compare. Unchanged generation -> nothing to do.
+    if ctx.acl.generation() == conn.acl_user_gen {
+        return true;
+    }
+    // COLD PATH (a mutation happened): re-resolve the connection's user by name under the lock.
+    match ctx.acl.resolve_if_stale(&conn.acl_user_name) {
+        crate::acl::AclResolution::Refresh { user, generation } => {
+            conn.acl_user = user;
+            conn.acl_user_gen = generation;
+            true
+        }
+        crate::acl::AclResolution::Deauth => {
+            // The user was DELUSER'd: this connection is no longer authenticated AS anyone. Drop
+            // it back to the unauthenticated implicit-default baseline so a NEXT command (if the
+            // caller did not close) hits NOAUTH, and signal the caller to close (Redis parity).
+            conn.authenticated = !ctx.requires_auth();
+            conn.acl_user = None;
+            // Reuse the existing allocation rather than reassign (clippy::assigning_clones).
+            conn.acl_user_name.clear();
+            conn.acl_user_name.push_str(crate::acl::DEFAULT_USER);
+            conn.acl_user_gen = ctx.acl.generation();
+            false
+        }
+    }
+}
+
 /// THE PER-COMMAND ACL ENFORCEMENT CHECK (#106). Given the connection's cached ACL identity
 /// (`acl_user`, `None` == the implicit all-permissive default), the command token, and the
 /// parsed request, decide whether the user may run it. Returns `None` when ALLOWED and
@@ -1548,6 +1602,16 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
     // Redis (EXEC ends the transaction, then runs the batch).
     let queued = std::mem::take(&mut state.queued);
     state.clear_txn();
+    // F1 (live revocation, EXEC sub-case): bring the connection's cached ACL identity up to date
+    // BEFORE replaying the batch, then RE-CHECK ACL per queued command below. This closes the race
+    // where an EXTERNAL `ACL SETUSER` / `DELUSER` revokes a permission BETWEEN `MULTI` and `EXEC`:
+    // the commands were queued under the OLD permissions, but Redis re-checks ACL at EXEC time
+    // (per queued command), so a now-forbidden command must be denied at replay. `deauthed` is
+    // `true` when the connection's user was DELUSER'd mid-transaction: every queued command is then
+    // denied (the identity is gone). The HOT PATH (no mutation since MULTI opened) is the same one
+    // relaxed load + compare as the router, so a transaction that ran with no concurrent ACL change
+    // pays nothing here.
+    let deauthed = !acl_resolve_if_stale(ctx, state);
     let mut replies = Vec::with_capacity(queued.len());
     for q in &queued {
         // Re-derive the uppercased token per queued command (cheap; the request was
@@ -1555,9 +1619,22 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
         // no re-borrow of the thread-locals, no double-borrow. Counter deltas
         // ACCUMULATE across the batch (eviction / keyspace hits-misses use `+=`).
         let qcmd = ascii_upper(q.command());
-        let reply = dispatch_inner(
-            ctx, state, env, store, wheel, now, rollup, mem, deltas, q, &qcmd,
-        );
+        // F1: per-queued-command ACL re-check at EXEC. When the user was DELUSER'd mid-txn, deny
+        // every command (NOPERM on the now-nonexistent identity); otherwise run the same
+        // `acl_enforce` the router runs for a live command, so a permission revoked between MULTI
+        // and EXEC denies the affected command (the rest of the batch still runs, Redis parity).
+        let reply = if deauthed {
+            let cmd_lc = String::from_utf8_lossy(&qcmd).to_ascii_lowercase();
+            Value::error(ErrorReply::noperm_command(&state.acl_user_name, &cmd_lc))
+        } else if let Some(deny) =
+            acl_enforce(ctx.acl.is_acl_active(), state.acl_user.as_deref(), &qcmd, q)
+        {
+            Value::error(deny)
+        } else {
+            dispatch_inner(
+                ctx, state, env, store, wheel, now, rollup, mem, deltas, q, &qcmd,
+            )
+        };
         replies.push(reply);
     }
     Value::Array(Some(replies))
@@ -1729,7 +1806,7 @@ fn cmd_hello(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value
     // Apply AUTH if provided; a failed AUTH aborts HELLO without switching proto.
     if let Some((user, pass)) = pending_auth {
         match check_auth(ctx, &user, &pass) {
-            AuthResult::Ok(u) => apply_auth_success(state, u),
+            AuthResult::Ok(u) => apply_auth_success(ctx, state, u),
             AuthResult::NoPasswordSet => {
                 return Value::error(ErrorReply::auth_no_password_set());
             }
@@ -1790,7 +1867,7 @@ fn cmd_auth(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value 
     };
     match check_auth(ctx, user, pass) {
         AuthResult::Ok(u) => {
-            apply_auth_success(state, u);
+            apply_auth_success(ctx, state, u);
             Value::ok()
         }
         AuthResult::NoPasswordSet => Value::error(ErrorReply::auth_no_password_set()),
@@ -1802,8 +1879,17 @@ fn cmd_auth(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value 
 /// resolved ACL user (#106). When the resolved user is the all-permissive default, we cache
 /// `None` (the implicit-default fast path) so the per-command enforcement gate skips it and
 /// the no-ACL deployment stays byte-identical; a NARROWED user is cached as `Some(Arc<User>)`.
-fn apply_auth_success(state: &mut ConnState, user: Arc<crate::acl::User>) {
+///
+/// F1 (live revocation): also record the user's NAME and the registry GENERATION the user was
+/// resolved against. The per-command path re-resolves by `acl_user_name` when the generation
+/// moves, so a mid-session `ACL SETUSER`/`DELUSER` reaches this connection. The generation is
+/// read from the SAME registry the user came from; a concurrent mutation between resolve and
+/// this read only makes the cached generation conservatively stale (the next command re-checks).
+fn apply_auth_success(ctx: &ServerContext, state: &mut ConnState, user: Arc<crate::acl::User>) {
     state.authenticated = true;
+    // Reuse the existing allocation rather than reassign (clippy::assigning_clones).
+    state.acl_user_name.clone_from(&user.name);
+    state.acl_user_gen = ctx.acl.generation();
     state.acl_user = if user.is_all_permissive() {
         None
     } else {

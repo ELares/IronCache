@@ -39,7 +39,7 @@ pub mod route;
 // The ACL engine (#106): the runtime-mutable user registry + the user model + the rule
 // parser + the per-command/key/channel category map. `AclState` is carried by
 // `ServerContext`; the serve layer reads it for AUTH + per-command enforcement.
-pub use acl::{AclParseError, AclState, Category, DEFAULT_USER, User};
+pub use acl::{AclParseError, AclResolution, AclState, Category, DEFAULT_USER, User};
 // The `ACL` command family (#106): the serve layer calls `dispatch_acl` to run the ACL
 // admin verbs (WHOAMI/LIST/USERS/GETUSER/SETUSER/DELUSER/CAT/GENPASS/SAVE/LOAD) and acts on
 // the returned `AclSideEffect` (the aclfile SAVE/LOAD I/O it owns).
@@ -80,8 +80,9 @@ pub use command_spec::{
 pub use conn::ConnState;
 pub use dispatch::{
     EXPIRE_CYCLE_INTERVAL, MAX_RECLAIM_PER_CALL, MAX_RECLAIM_PER_CYCLE, RollupFn, ServerContext,
-    ShutdownMode, acl_enforce, command_allowed_pre_auth, dispatch, dispatch_remote_keyed,
-    dispatch_remote_whole_keyspace, dispatch_with_cmd, drain_due_keys, parse_shutdown,
+    ShutdownMode, acl_enforce, acl_resolve_if_stale, command_allowed_pre_auth, dispatch,
+    dispatch_remote_keyed, dispatch_remote_whole_keyspace, dispatch_with_cmd, drain_due_keys,
+    parse_shutdown,
 };
 pub use route::{
     CommandClass, KeySpec, classify, command_keys, owner_shard, owner_shard_set, single_key,

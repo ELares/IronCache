@@ -547,7 +547,14 @@ pub fn category_bits(cmd_upper: &[u8]) -> CategorySet {
             spec.class,
             CommandClass::KeyedSingle | CommandClass::KeyedMulti
         );
-        if spec.is_write {
+        // F3 (PFCOUNT @write parity): real Redis marks PFCOUNT `@write` (its `write` command flag
+        // is set) because it MAY rewrite the cached cardinality on the key, even though IronCache's
+        // ROUTING keeps it `is_write == false` (so replica-read / denyoom / MOVED routing are
+        // unchanged -- the security review found those correct and not to touch). This per-command
+        // ACL-CATEGORY override (folded into the @write condition) is the smallest change that
+        // gives `+@read -@write` users the Redis-correct (deny) result without disturbing routing.
+        let acl_write = spec.is_write || cmd_upper == b"PFCOUNT";
+        if acl_write {
             set.insert(Category::Write);
         } else if keyed {
             set.insert(Category::Read);
@@ -604,6 +611,19 @@ mod tests {
         let s = category_bits(b"SET");
         assert!(s.contains(Category::Write));
         assert!(!s.contains(Category::Read));
+    }
+
+    #[test]
+    fn pfcount_is_write_for_acl_parity() {
+        // F3: PFCOUNT is @write (Redis parity -- it may rewrite the cached cardinality), even
+        // though it stays a non-write for ROUTING. So a `+@read -@write` user is denied PFCOUNT.
+        let pf = category_bits(b"PFCOUNT");
+        assert!(pf.contains(Category::Write), "PFCOUNT must be @write");
+        assert!(!pf.contains(Category::Read), "PFCOUNT must not be @read");
+        // It is still classified by type as @hyperloglog.
+        assert!(pf.contains(Category::Hyperloglog));
+        // The routing classification is UNCHANGED (PFCOUNT is not a write for routing).
+        assert!(!crate::command_spec::is_write(b"PFCOUNT"));
     }
 
     #[test]

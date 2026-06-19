@@ -423,3 +423,196 @@ fn aclfile_boot_load_save_reboot_round_trip() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// (8) F1 LIVE REVOCATION via `ACL SETUSER`: a connection authed as `app` (`+@all`) runs SET fine,
+/// then an EXTERNAL `ACL SETUSER app -set` REVOKES that command. The app connection's VERY NEXT SET
+/// must be `-NOPERM` immediately (the live revocation), where before the fix it stayed allowed until
+/// the connection re-AUTHed or disconnected (fail-open).
+#[test]
+fn mid_session_setuser_revokes_live() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(
+            cmd(
+                &mut c,
+                &["ACL", "SETUSER", "app", "on", ">pw", "~*", "+@all"]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "app", "pw"]).await, "+OK\r\n");
+        // SET works under +@all.
+        assert_eq!(cmd(&mut a, &["SET", "k", "v"]).await, "+OK\r\n");
+
+        // External revocation of SET on the control connection.
+        assert_eq!(
+            cmd(&mut c, &["ACL", "SETUSER", "app", "-set"]).await,
+            "+OK\r\n"
+        );
+
+        // The app connection's NEXT SET is now NOPERM (revocation took effect live, no reconnect).
+        let denied = cmd(&mut a, &["SET", "k", "v2"]).await;
+        assert!(
+            denied.starts_with("-NOPERM") && denied.contains("run the 'set' command"),
+            "mid-session SETUSER -set must revoke live, got {denied:?}"
+        );
+        // A still-granted command (GET) keeps working: only SET was revoked.
+        assert_eq!(cmd(&mut a, &["GET", "k"]).await, "$1\r\nv\r\n");
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (9) F1 LIVE REVOCATION via `ACL DELUSER`: a connection authed as `app`, then an external `ACL
+/// DELUSER app` deletes the identity. The app connection's next command is rejected (the server
+/// DEAUTHENTICATES + CLOSES the connection, mirroring Redis killing a deleted user's clients).
+#[test]
+fn mid_session_deluser_rejects_live() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(
+            cmd(
+                &mut c,
+                &["ACL", "SETUSER", "app", "on", ">pw", "~*", "+@all"]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "app", "pw"]).await, "+OK\r\n");
+        assert_eq!(cmd(&mut a, &["GET", "k"]).await, "$-1\r\n");
+
+        // External DELUSER on the control connection.
+        assert_eq!(cmd(&mut c, &["ACL", "DELUSER", "app"]).await, ":1\r\n");
+
+        // The app connection's next command is rejected: the server replies NOAUTH and closes, so
+        // the read returns the NOAUTH error then an EOF (an empty read) on the following attempt.
+        let rejected = cmd(&mut a, &["GET", "k"]).await;
+        assert!(
+            rejected.starts_with("-NOAUTH"),
+            "mid-session DELUSER must reject the connection's next command, got {rejected:?}"
+        );
+        // The connection was CLOSED: a follow-up read yields EOF (0 bytes).
+        let mut buf = [0u8; 64];
+        a.write_all(&encode_args(&["PING"])).await.ok();
+        let n = a.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "DELUSER'd connection must be closed (EOF), read {n} bytes"
+        );
+
+        // The server itself is still up (the control connection still serves).
+        assert_eq!(cmd(&mut c, &["PING"]).await, "+PONG\r\n");
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (10) F1 DEFAULT-USER restricted mid-session: a no-requirepass connection is the all-permissive
+/// implicit default (full access). An external `ACL SETUSER default -@dangerous` must take effect on
+/// it LIVE -- its next FLUSHALL is denied -- even though it never AUTHed (it is still the `default`
+/// identity, so the re-resolve picks up the new restriction). A still-permitted GET/SET keeps working.
+#[test]
+fn mid_session_default_restricted_live() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // The connection has full access as the implicit default (never AUTHed).
+        assert_eq!(cmd(&mut c, &["SET", "k", "v"]).await, "+OK\r\n");
+        assert_eq!(cmd(&mut c, &["FLUSHALL"]).await, "+OK\r\n");
+
+        // A SECOND connection narrows the default user (this could be the same admin in practice).
+        let mut admin = connect_retry(port).await;
+        assert_eq!(
+            cmd(&mut admin, &["ACL", "SETUSER", "default", "-@dangerous"]).await,
+            "+OK\r\n"
+        );
+
+        // The FIRST connection's next FLUSHALL is now denied live (it picked up the restriction by
+        // re-resolving the `default` identity), while GET/SET still work.
+        assert_eq!(cmd(&mut c, &["SET", "k", "v"]).await, "+OK\r\n");
+        let denied = cmd(&mut c, &["FLUSHALL"]).await;
+        assert!(
+            denied.starts_with("-NOPERM"),
+            "mid-session SETUSER default -@dangerous must restrict the live default, got {denied:?}"
+        );
+
+        drop(c);
+        drop(admin);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (11) F1 EXEC-TIME re-check: a permission revoked BETWEEN `MULTI` and `EXEC` (external `ACL
+/// SETUSER`) is enforced at EXEC replay -- the now-forbidden command in the queued batch comes back
+/// NOPERM in the EXEC array, while a still-permitted command in the same batch runs. Closes the
+/// MULTI/EXEC revocation race.
+#[test]
+fn mid_session_setuser_rechecked_at_exec() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(
+            cmd(
+                &mut c,
+                &["ACL", "SETUSER", "app", "on", ">pw", "~*", "+@all"]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "app", "pw"]).await, "+OK\r\n");
+
+        // Open a transaction and queue GET (read) + SET (write), both currently allowed.
+        assert_eq!(cmd(&mut a, &["MULTI"]).await, "+OK\r\n");
+        assert_eq!(cmd(&mut a, &["GET", "k"]).await, "+QUEUED\r\n");
+        assert_eq!(cmd(&mut a, &["SET", "k", "v"]).await, "+QUEUED\r\n");
+
+        // BETWEEN MULTI and EXEC, revoke SET externally.
+        assert_eq!(
+            cmd(&mut c, &["ACL", "SETUSER", "app", "-set"]).await,
+            "+OK\r\n"
+        );
+
+        // EXEC re-checks ACL per queued command: GET still returns (nil), SET is NOPERM.
+        let exec = cmd(&mut a, &["EXEC"]).await;
+        assert!(
+            exec.starts_with("*2\r\n"),
+            "EXEC must return a 2-element array, got {exec:?}"
+        );
+        assert!(
+            exec.contains("$-1\r\n"),
+            "the GET element must still return nil, got {exec:?}"
+        );
+        assert!(
+            exec.contains("-NOPERM") && exec.contains("run the 'set' command"),
+            "the SET element must be NOPERM (revoked between MULTI and EXEC), got {exec:?}"
+        );
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}

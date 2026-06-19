@@ -41,6 +41,7 @@ pub use parse::{AclParseError, apply_rules_to, build_user};
 pub use perms::{DEFAULT_USER, User};
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Compare two byte slices in CONSTANT TIME with respect to their CONTENTS (length is not
@@ -73,6 +74,20 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// `default` user has been narrowed. The enforcement layer reads this ONE relaxed atomic
 /// first; when `false` it skips ACL enforcement entirely, so the default path is byte-
 /// identical and adds a single bool load. It is recomputed under the lock on every mutation.
+///
+/// ## Live revocation (the `generation` counter, F1)
+///
+/// A connection caches its resolved [`Arc<User>`] at AUTH time (a FROZEN snapshot). Without
+/// a live link back to the registry, an `ACL SETUSER app -@all` / `ACL DELUSER app` to
+/// revoke a misbehaving client would have NO effect until that client re-AUTHs or
+/// disconnects (fail-open in the REVOCATION direction), diverging from Redis (which mutates
+/// in place / kills a deleted user's clients). To close that without re-locking on the hot
+/// path, every mutation (`set_user`, `del_user`, `put_user`, `load_users`) BUMPS a monotonic
+/// `generation`. A connection caches the generation alongside its user; the per-command path
+/// does ONE relaxed atomic load + integer compare, and RE-RESOLVES the connection's user BY
+/// NAME only when the generation MOVED (rare). So a mid-session restrict / delete takes
+/// effect on the connection's very next command, the unchanged-generation path stays a single
+/// compare, and the no-ACL default never moves the generation at all.
 #[derive(Debug)]
 pub struct AclState {
     /// The users, keyed by name. `BTreeMap` so `ACL LIST`/`USERS`/aclfile SAVE emit a
@@ -90,6 +105,32 @@ pub struct AclState {
     /// doc). Relaxed: the enforcement read tolerates a one-command staleness window exactly
     /// like the runtime-config overlay's `maxmemory` read.
     acl_active: std::sync::atomic::AtomicBool,
+    /// The monotonic mutation GENERATION (F1, live revocation). Starts at 0 and is bumped by
+    /// EVERY registry mutation (`set_user` / `del_user` / `put_user` / `load_users`). A
+    /// connection caches the generation it resolved its `Arc<User>` against; the per-command
+    /// enforcement path does one relaxed load + compare and re-resolves the connection's user
+    /// by name ONLY when this moved. Relaxed ordering: like `acl_active`, a one-command
+    /// staleness window is acceptable (the next command on the connection re-checks), and the
+    /// re-resolve itself takes the registry lock (which carries the real happens-before).
+    generation: AtomicU64,
+}
+
+/// The outcome of re-resolving a connection's cached ACL identity after the registry
+/// generation moved (F1, live revocation). See [`AclState::resolve_if_stale`].
+#[derive(Debug)]
+pub enum AclResolution {
+    /// The user still exists: cache `user` (`None` = the all-permissive implicit default) and
+    /// record `generation` as the connection's new cached generation.
+    Refresh {
+        /// The user to cache on the connection (`None` = all-permissive, the byte-identical
+        /// implicit-default posture; `Some` = a narrowed user whose new restrictions now apply).
+        user: Option<Arc<User>>,
+        /// The registry generation observed during this re-resolve, to cache on the connection.
+        generation: u64,
+    },
+    /// The user was DELETED (`ACL DELUSER`): the connection's identity is gone, so it must be
+    /// deauthenticated / closed (Redis kills a deleted user's clients).
+    Deauth,
 }
 
 impl AclState {
@@ -110,6 +151,7 @@ impl AclState {
         let state = AclState {
             users: Mutex::new(map),
             acl_active: std::sync::atomic::AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         };
         // A requirepass-only default is still all-permissive, so acl_active stays false.
         Arc::new(state)
@@ -123,6 +165,23 @@ impl AclState {
         self.acl_active.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The CURRENT mutation generation (F1, live revocation). A connection caches the value it
+    /// resolved its `Arc<User>` against and compares against this once per command (one relaxed
+    /// load + integer compare); it re-resolves by name only when this moved. Relaxed: a one-
+    /// command staleness window is acceptable (the next command re-checks), and the re-resolve
+    /// takes the registry lock, which carries the real happens-before for the user data.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Bump the mutation generation (called under the lock after every registry mutation, so a
+    /// connection's cached generation goes stale and the next command re-resolves its user).
+    /// Wrapping is harmless: it is only ever COMPARED for inequality, never ordered.
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Recompute `acl_active` from the current users map (called under the lock after every
     /// mutation). It is `true` unless the registry is EXACTLY `{ default }` with an all-
     /// permissive default user.
@@ -133,6 +192,40 @@ impl AclState {
             !only_default_all_permissive,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// RE-RESOLVE a connection's cached ACL identity against the CURRENT registry, used by the
+    /// per-command enforcement path ONLY when the connection's cached generation differs from
+    /// [`Self::generation`] (F1, live revocation). `name` is the connection's authenticated
+    /// username (the conn knows it, including `"default"`). Returns:
+    /// - [`AclResolution::Refresh`] with the user the connection should now cache: `None` when
+    ///   that user is all-permissive (the implicit-default fast path, so a back-to-permissive
+    ///   default re-collapses to the byte-identical `None` posture) or `Some(Arc<User>)` when it
+    ///   is narrowed (so a SETUSER that RESTRICTS a previously-`None` default is picked up). The
+    ///   caller also records [`Self::generation`] read here as the connection's new cached
+    ///   generation.
+    /// - [`AclResolution::Deauth`] when the user was DELETED (`ACL DELUSER`): the connection is
+    ///   no longer a valid identity, so the caller deauthenticates / closes it (Redis kills a
+    ///   deleted user's clients).
+    ///
+    /// This runs OFF the hot path (only on a generation move), so taking the registry lock here
+    /// is fine; the unchanged-generation path never calls it.
+    #[must_use]
+    pub fn resolve_if_stale(&self, name: &str) -> AclResolution {
+        match self.lock().get(name).cloned() {
+            Some(user) => {
+                let cached = if user.is_all_permissive() {
+                    None
+                } else {
+                    Some(user)
+                };
+                AclResolution::Refresh {
+                    user: cached,
+                    generation: self.generation(),
+                }
+            }
+            None => AclResolution::Deauth,
+        }
     }
 
     /// Resolve the user `name` to its current `Arc<User>` (a cheap Arc clone under the
@@ -173,6 +266,10 @@ impl AclState {
         apply_rules_to(&mut scratch, rules)?;
         map.insert(name.to_owned(), Arc::new(scratch));
         self.recompute_active(&map);
+        // F1: bump the generation so live connections re-resolve their cached user on the next
+        // command (a mid-session restrict / re-grant takes effect immediately). Done only on the
+        // SUCCESS path -- a parse error left the live user untouched, so nothing changed.
+        self.bump_generation();
         Ok(())
     }
 
@@ -182,6 +279,8 @@ impl AclState {
         let mut map = self.lock();
         map.insert(user.name.clone(), Arc::new(user));
         self.recompute_active(&map);
+        // F1: a replaced user must reach live connections on their next command.
+        self.bump_generation();
     }
 
     /// `ACL DELUSER <name>`: remove the user. The `default` user CANNOT be deleted (Redis
@@ -195,6 +294,9 @@ impl AclState {
         let removed = map.remove(name).is_some();
         if removed {
             self.recompute_active(&map);
+            // F1: bump so any connection still authed as the deleted user re-resolves on its
+            // next command and is DEAUTHENTICATED (Redis kills a deleted user's clients).
+            self.bump_generation();
         }
         removed
     }
@@ -275,6 +377,9 @@ impl AclState {
             map.insert(u.name.clone(), Arc::new(u));
         }
         self.recompute_active(&map);
+        // F1: ACL LOAD replaces the whole registry, so every live connection must re-resolve
+        // its cached user (it may have been narrowed, re-granted, or removed) on its next command.
+        self.bump_generation();
         Ok(count)
     }
 
@@ -375,6 +480,67 @@ mod tests {
         acl.set_user("app", &[b"off", b"nopass", b"+@all", b"~*"])
             .expect("ok");
         assert!(acl.authenticate("app", b"anything").is_none());
+    }
+
+    #[test]
+    fn generation_bumps_on_every_mutation() {
+        // F1: a fresh registry starts at generation 0; SETUSER / DELUSER / put_user / load each
+        // bump it, so a connection caching a stale generation re-resolves on its next command.
+        let acl = AclState::from_requirepass(None);
+        assert_eq!(acl.generation(), 0);
+        acl.set_user("app", &[b"on", b"nopass", b"+@all", b"~*"])
+            .expect("ok");
+        let g1 = acl.generation();
+        assert!(g1 > 0, "set_user bumps the generation");
+        // A SETUSER that FAILS to parse must NOT bump (the live user was untouched).
+        let _ = acl.set_user("app", &[b"+boguscmd"]);
+        assert_eq!(acl.generation(), g1, "a failed set_user does not bump");
+        acl.set_user("app", &[b"-set"]).expect("ok");
+        let g2 = acl.generation();
+        assert!(g2 > g1, "a successful set_user bumps again");
+        assert!(acl.del_user("app"), "removed");
+        let g3 = acl.generation();
+        assert!(g3 > g2, "del_user bumps");
+        // A DELUSER of an absent user does not bump.
+        assert!(!acl.del_user("nope"));
+        assert_eq!(acl.generation(), g3, "a no-op del_user does not bump");
+    }
+
+    #[test]
+    fn resolve_if_stale_refresh_narrowed_default_and_deauth() {
+        let acl = AclState::from_requirepass(None);
+        // (a) DEFAULT narrowed: a connection cached as the all-permissive default (name
+        // "default") must, after `SETUSER default -@dangerous`, re-resolve to a NARROWED user
+        // (Some, not None) so the restriction applies.
+        acl.set_user("default", &[b"-@dangerous"]).expect("ok");
+        match acl.resolve_if_stale("default") {
+            AclResolution::Refresh { user, generation } => {
+                let u = user.expect("narrowed default is Some, not the all-permissive None");
+                assert!(!u.can_run_command(b"FLUSHALL"));
+                assert!(u.can_run_command(b"GET"));
+                assert_eq!(generation, acl.generation());
+            }
+            AclResolution::Deauth => panic!("default still exists"),
+        }
+        // (b) A narrowed user re-granted back to all-permissive (`+@all ~* &*`) re-collapses to
+        // None. The user starts NARROWED (only `+get`), so re-resolve sees Some; then we re-grant
+        // everything and re-resolve must collapse to the byte-identical all-permissive None.
+        acl.set_user("app", &[b"on", b"nopass", b"+get", b"~*"])
+            .expect("ok");
+        match acl.resolve_if_stale("app") {
+            AclResolution::Refresh { user, .. } => assert!(user.is_some(), "narrowed -> Some"),
+            AclResolution::Deauth => panic!("app exists"),
+        }
+        acl.set_user("app", &[b"+@all", b"&*"]).expect("ok");
+        match acl.resolve_if_stale("app") {
+            AclResolution::Refresh { user, .. } => {
+                assert!(user.is_none(), "all-permissive re-collapses to None");
+            }
+            AclResolution::Deauth => panic!("app exists"),
+        }
+        // (c) DELUSER -> Deauth.
+        assert!(acl.del_user("app"));
+        assert!(matches!(acl.resolve_if_stale("app"), AclResolution::Deauth));
     }
 
     #[test]

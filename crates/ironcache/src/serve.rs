@@ -2031,6 +2031,26 @@ async fn route_and_dispatch(
         return false;
     }
 
+    // -- LIVE-REVOCATION RE-RESOLVE (#106, F1). Run ONCE per command right BEFORE the ACL
+    // enforcement chokepoint, so a mid-session `ACL SETUSER` / `ACL DELUSER` / `ACL LOAD` reaches
+    // this already-AUTHed connection on its VERY NEXT command (was fail-open until reconnect,
+    // diverging from Redis which revokes live). HOT PATH: one relaxed atomic load + integer
+    // compare of the registry generation against the connection's cached generation; on the no-ACL
+    // path (and whenever no `ACL` admin verb has run since this connection cached its user) the
+    // generations match and this returns immediately -- byte-unchanged. ONLY when the generation
+    // MOVED (rare) does it take the registry lock to re-resolve the connection's user by name. A
+    // `false` return means the connection's user was DELUSER'd: it is now deauthenticated, so we
+    // reply NOAUTH and CLOSE it (Redis kills a deleted user's clients).
+    if !ironcache_server::acl_resolve_if_stale(ctx, conn) {
+        state_rc.borrow_mut().counters.on_command();
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::noauth()),
+            conn.proto,
+        );
+        return true;
+    }
+
     // -- THE HOISTED ACL ENFORCEMENT CHOKEPOINT (#106). Immediately AFTER the NOAUTH gate and
     // BEFORE any interception / cross-shard fan-out / CLUSTER-mutator / persistence / MULTI
     // queueing / local dispatch, so per-command + per-key + per-channel authorization covers
