@@ -104,10 +104,45 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
 /// `RaftHandle::config`) without a new wire surface. `None` outside raft-governance mode. Boots
 /// exactly as `run_server` (which is `run_server_inner` discarding the handle); production never
 /// needs the handle out here (it lives in `ServerContext`).
-#[allow(clippy::too_many_lines)]
 pub fn run_server_inner(
     config: &Config,
 ) -> anyhow::Result<(ShardSet, Option<ironcache_server::RaftHandle>)> {
+    let handles = run_server_observed(config, None)?;
+    Ok((handles.set, handles.raft))
+}
+
+/// The full set of boot handles the binary needs to wire the out-of-band observability endpoint
+/// (OBSERVABILITY.md, #152) on top of a running server, returned by [`run_server_observed`].
+///
+/// Beyond the [`ShardSet`] (for shutdown/join) it carries the live `raft` handle (the
+/// `ironcache_raft_*` gauges + the `/readyz` leader gate), the `persist` state (the last-save +
+/// dirty gauges; `None` when persistence is off), and the `runtime` config cell (so the
+/// `maxmemory` gauge reflects a `CONFIG SET`). The metrics registry is the SAME one the caller
+/// passed in (the shards adopted its cells), so it is not echoed back.
+pub struct BootHandles {
+    /// The running shard set, for graceful shutdown + join.
+    pub set: ShardSet,
+    /// The raft control-plane handle, `Some` only in raft-governance mode.
+    pub raft: Option<ironcache_server::RaftHandle>,
+    /// The node-level persistence state, `Some` only when a `data_dir` is configured.
+    pub persist: Option<Arc<crate::persist::PersistState>>,
+    /// The process-wide runtime-config overlay (for the live `maxmemory` gauge).
+    pub runtime: Arc<ironcache_config::RuntimeConfig>,
+}
+
+/// Boot the server like [`run_server`], but thread an optional [`MetricsRegistry`] through every
+/// shard's [`ServerContext`] (so each shard ADOPTS its pre-allocated counter cell and the metrics
+/// HTTP task can read the cells across threads), and return the [`BootHandles`] the binary uses to
+/// stand up the `/metrics` + `/livez` + `/readyz` endpoint.
+///
+/// `metrics_registry` is `Some` ONLY when `--metrics-addr` is set; passing `None` (every test and
+/// the no-flag default) makes the shards use a standalone counter cell and is byte-identical to
+/// the pre-observability boot.
+#[allow(clippy::too_many_lines)]
+pub fn run_server_observed(
+    config: &Config,
+    metrics_registry: Option<ironcache_observe::MetricsRegistry>,
+) -> anyhow::Result<BootHandles> {
     let bind: SocketAddr = SocketAddr::new(config.bind, config.port);
     let shard_cfg = ShardConfig {
         shards: config.shards,
@@ -149,6 +184,10 @@ pub fn run_server_inner(
     // atomic loads (maxmemory/generation) with the string params behind a lock taken
     // only on CONFIG SET. Seeded from the boot-resolved config.
     let runtime = RuntimeConfig::from_config(config);
+    // A clone of the runtime-config handle returned in `BootHandles` so the `/metrics` maxmemory
+    // gauge reads the LIVE effective ceiling (a `CONFIG SET maxmemory` is reflected). `runtime`
+    // itself moves into `ctx_template` below.
+    let ctx_template_runtime = Arc::clone(&runtime);
 
     // The cluster slot-ownership map (CLUSTER_CONTRACT.md #70), built ONCE here at boot and
     // threaded (Arc) into every shard's context. Slice 3: a cluster-ENABLED node ALWAYS gets a
@@ -311,6 +350,11 @@ pub fn run_server_inner(
         // raft-mode. Cloned by Arc onto every shard's context (the write path reads it) AND handed
         // to the per-replica serve tasks (which maintain it); the same cell, lock-free.
         in_sync_replicas: in_sync_replicas.clone(),
+        // The per-shard metrics registry (OBSERVABILITY.md, #152), `Some` only when the `/metrics`
+        // endpoint is enabled. Moved into the template (a cheap `Arc<Vec<_>>`), then cloned per
+        // shard via `ctx_template.clone()` so each shard adopts its cell by index at boot; `None`
+        // on the default path (byte-identical). The caller keeps its own registry handle.
+        metrics_registry,
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
@@ -340,6 +384,10 @@ pub fn run_server_inner(
     // is never bumped, no periodic save timer is spawned, and load-on-boot is a no-op -- so the
     // default boot + hot path are byte-unchanged. Cloned (Arc) into the serve + drain closures.
     let persist = crate::persist::PersistState::from_config(config);
+    // A clone of the persistence handle returned in `BootHandles` so the `/metrics` last-save +
+    // dirty gauges read the live persistence atomics. `None` when persistence is off (no data_dir),
+    // in which case those gauges report 0. `persist` itself is cloned into the serve/drain closures.
+    let persist_for_handles = persist.clone();
 
     // EMBEDDED TRANSPORT TLS for the CLIENT listener (#105, docs/design/TLS.md). Build the rustls
     // acceptor ONCE at boot when `tls = on`, from the configured cert/key PEM, and clone the cheap
@@ -363,10 +411,10 @@ pub fn run_server_inner(
         let acceptor =
             ironcache_runtime::build_acceptor(&cert.to_string_lossy(), &key.to_string_lossy())
                 .map_err(|e| anyhow::anyhow!("building the TLS listener: {e}"))?;
-        eprintln!(
-            "ironcache: TLS enabled (rustls, server-auth) on the client listener; cert={} key={}",
-            cert.display(),
-            key.display()
+        tracing::info!(
+            cert = %cert.display(),
+            key = %key.display(),
+            "ironcache: TLS enabled (rustls, server-auth) on the client listener"
         );
         Some(acceptor)
     } else {
@@ -422,14 +470,35 @@ pub fn run_server_inner(
         }
     };
 
+    // Capture the runtime-config handle (for the live `maxmemory` metrics gauge) BEFORE
+    // `run_shards` consumes the serve/drain closures. `runtime` moved into `ctx_template`, so
+    // read the clone off the template's Arc; `persist` is cloned (it was cloned into the
+    // closures above, and `from_config` returns `None` when persistence is off).
+    let runtime_handle = ctx_template_runtime.clone();
+    let persist_handle = persist_for_handles;
+
     let set = ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?;
-    Ok((set, raft))
+    Ok(BootHandles {
+        set,
+        raft,
+        persist: persist_handle,
+        runtime: runtime_handle,
+    })
 }
 
 thread_local! {
     // The shard's core-local state. Created lazily on first use on each shard
     // thread; never shared across threads.
     static SHARD: RefCell<Option<Rc<RefCell<ShardState>>>> = const { RefCell::new(None) };
+    // This shard's PRE-ALLOCATED metrics counter cell (OBSERVABILITY.md, #152), adopted at shard
+    // boot from the process-wide `MetricsRegistry` by shard index. Set ONCE per shard thread by
+    // [`adopt_metrics_cell`] (called from the drain-loop boot AND the first connection, both of
+    // which know this shard's index) BEFORE [`shard_state`] first builds the `ShardState`, so the
+    // shard's `ShardCounters` mutate the SAME cell the out-of-band metrics task reads across
+    // threads. `None` on the DEFAULT path (no `--metrics-addr`): `shard_state` then builds a
+    // standalone counter cell, byte-identical to before this feature.
+    static METRICS_CELL: RefCell<Option<std::sync::Arc<ironcache_observe::ShardCountersCell>>> =
+        const { RefCell::new(None) };
     // The shard's per-shard store: the per-DB hashbrown kvobj map (ADR-0005) wired
     // with the configured eviction policy. Held as Rc<RefCell<..>> exactly like ENV,
     // so it is core-local and unsynchronized; created lazily per shard thread. The
@@ -644,6 +713,13 @@ fn expire_cycle_tick(
         };
         state_rc.borrow_mut().counters.apply(deltas);
     }
+    // Publish THIS shard's live key count into its metrics cell (OBSERVABILITY.md, #152), a GAUGE
+    // store OFF the command hot path (this is the periodic reaper, not a command). A no-op when
+    // `/metrics` is disabled (no adopted cell); when enabled the `/metrics` keyspace gauge is
+    // refreshed every expiry cycle (eventually-consistent, zero per-command cost). The brief
+    // `store.len()` read (a sum over the per-DB lengths) and one relaxed atomic store do not touch
+    // the command path.
+    publish_keyspace_keys(store_rc.borrow().len() as u64);
     reaped
 }
 
@@ -651,9 +727,17 @@ pub(crate) fn shard_state() -> Rc<RefCell<ShardState>> {
     SHARD.with(|cell| {
         let mut b = cell.borrow_mut();
         if b.is_none() {
+            // Build the shard's counters over its ADOPTED registry cell when the metrics endpoint
+            // is enabled (so the shard's mutations land in the cell the metrics task reads across
+            // threads), else over a fresh standalone cell (the default, byte-identical path).
+            let counters = METRICS_CELL.with(|c| {
+                c.borrow().as_ref().map_or_else(ShardCounters::new, |cell| {
+                    ShardCounters::with_cell(std::sync::Arc::clone(cell))
+                })
+            });
             *b = Some(Rc::new(RefCell::new(ShardState {
                 next_client_id: 1,
-                counters: ShardCounters::new(),
+                counters,
                 // Start at 0 (the RuntimeConfig generation also starts at 0): the first
                 // CONFIG SET maxmemory-policy bumps it, and this shard notices on its
                 // next command.
@@ -662,6 +746,36 @@ pub(crate) fn shard_state() -> Rc<RefCell<ShardState>> {
         }
         Rc::clone(b.as_ref().unwrap())
     })
+}
+
+/// Adopt THIS shard's pre-allocated metrics cell from the registry by index (OBSERVABILITY.md,
+/// #152), so the shard's [`ShardCounters`] mutate the SAME cell the out-of-band `/metrics` task
+/// reads across threads. Idempotent and a no-op when metrics are disabled (`registry` is `None`)
+/// or already adopted; MUST run BEFORE [`shard_state`] first builds the `ShardState` (the
+/// drain-loop boot and the first connection both call it with this shard's index).
+pub(crate) fn adopt_metrics_cell(
+    registry: Option<&ironcache_observe::MetricsRegistry>,
+    shard_index: usize,
+) {
+    let Some(registry) = registry else { return };
+    METRICS_CELL.with(|c| {
+        let mut b = c.borrow_mut();
+        if b.is_none() {
+            *b = Some(registry.shard_cell(shard_index));
+        }
+    });
+}
+
+/// Publish THIS shard's live key count into its adopted metrics cell (OBSERVABILITY.md, #152), a
+/// GAUGE store off the command hot path. Called from the periodic active-expiry tick, so the
+/// `/metrics` keyspace gauge is eventually-consistent (bounded by the expiry cycle) at zero
+/// per-command cost. A no-op when metrics are disabled (no adopted cell).
+fn publish_keyspace_keys(keys: u64) {
+    METRICS_CELL.with(|c| {
+        if let Some(cell) = c.borrow().as_ref() {
+            cell.set_keyspace_keys(keys);
+        }
+    });
 }
 
 /// The number of LOW `scan_hash` bits the cross-shard composite SCAN cursor must reserve
@@ -790,6 +904,11 @@ async fn serve_connection(
         None => ironcache_runtime::ClientStream::plain(tcp),
     };
     let env = shard_env();
+    // Adopt THIS shard's metrics cell (OBSERVABILITY.md, #152) BEFORE `shard_state()` first builds
+    // the `ShardState`, so its `ShardCounters` wrap the registry cell the metrics task reads. The
+    // drain-loop boot usually adopts first; this is the idempotent fallback for a connection that
+    // races ahead of the drain loop's first poll. A no-op when `/metrics` is disabled.
+    adopt_metrics_cell(ctx.metrics_registry.as_ref(), home.index);
     let state_rc = shard_state();
     // The reserved-band width is derived from the configured TOTAL shard count so SCAN's
     // composite cursor is band-aligned when shards > 1 (FIX 1); 0 keeps single-shard SCAN
@@ -2465,9 +2584,10 @@ async fn handle_shutdown_command(
             // The wait TIMED OUT: a genuinely wedged save never freed the latch (the LOW case). Do
             // NOT hang forever -- proceed to a BEST-EFFORT exit. The in-flight save MAY still commit
             // its prior-or-partial state; we cannot do better without unbounded waiting.
-            eprintln!(
-                "ironcache: SHUTDOWN ({mode:?}) -- a prior save did not finish within \
-                 SHUTDOWN_SAVE_WAIT; exiting best-effort (the in-flight save may still commit)"
+            tracing::warn!(
+                ?mode,
+                "ironcache: SHUTDOWN: a prior save did not finish within SHUTDOWN_SAVE_WAIT; \
+                 exiting best-effort (the in-flight save may still commit)"
             );
             std::process::exit(0);
         };
@@ -2504,7 +2624,7 @@ async fn handle_shutdown_command(
     // contract). SHUTDOWN does NOT reply on success (Redis: the process is gone). `process::exit`
     // is faithful to Redis's own SHUTDOWN handler (it exits from the command path after the save);
     // the committed manifest's atomic rename means the killed background tasks leave no torn file.
-    eprintln!("ironcache: SHUTDOWN ({mode:?}) -> exit 0");
+    tracing::info!(?mode, "ironcache: SHUTDOWN -> exit 0");
     std::process::exit(0);
 }
 
@@ -4164,7 +4284,7 @@ pub fn wait_for_signal(flag: &Arc<std::sync::atomic::AtomicBool>) {
                         _ = sigint.recv() => {}
                         _ = sigterm.recv() => {}
                     }
-                    eprintln!("ironcache: second stop signal -> forcing immediate exit");
+                    tracing::warn!("ironcache: second stop signal -> forcing immediate exit");
                     std::process::exit(0);
                 });
             });
@@ -4610,6 +4730,7 @@ mod tests {
             raft: None,
             repl_status: Some(Arc::new(ironcache_server::ReplNodeStatus::new())),
             in_sync_replicas: Some(in_sync),
+            metrics_registry: None,
             boot,
         }
     }

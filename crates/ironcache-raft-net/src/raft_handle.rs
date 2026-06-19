@@ -16,7 +16,7 @@
 use ironcache_clusterbus::PeerEndpoint;
 use ironcache_raft::{ConfigCmd, EntryPayload, MembershipChange, NodeId};
 
-use crate::{ClusterConfig, MembershipOutcome, NodeHandle};
+use crate::{ClusterConfig, MembershipOutcome, NodeHandle, Status};
 
 /// The outcome of proposing a [`ConfigCmd`] through the Raft control plane.
 ///
@@ -69,6 +69,15 @@ impl RaftHandle {
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.inner.status().is_leader()
+    }
+
+    /// The latest published [`Status`] snapshot (role / current term / commit index / leader),
+    /// a cheap non-blocking `Copy` read of the control plane's status watch. The `/metrics`
+    /// endpoint (OBSERVABILITY.md) reads this for the `ironcache_raft_*` gauges; the readiness
+    /// probe reads `leader_id` to gate `/readyz` on a recognized leader.
+    #[must_use]
+    pub fn status(&self) -> Status {
+        self.inner.status()
     }
 
     /// A best-effort leader HINT for a redirect reply, as a `host:port` string, or `None` when

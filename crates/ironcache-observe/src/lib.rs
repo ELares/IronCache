@@ -11,74 +11,158 @@
 //! Counters are per-shard (shared-nothing, ADR-0002) and rolled up for INFO by
 //! summing snapshots; there is no shared atomic on the hot path.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use ironcache_env::Clock;
+use std::sync::Arc;
 
 /// The IronCache server version reported in `INFO` and `HELLO`. Sourced from the
 /// crate version at build time.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Per-shard counters. Each shard owns one of these and mutates it with no
-/// synchronization (it is core-local). For INFO, the server collects a
-/// [`CounterSnapshot`] from each shard and sums them with [`CounterSnapshot::add`].
+/// The per-shard counter STORAGE: a flat bag of `AtomicU64`s, one cell per counter, owned
+/// by ONE shard and shared (by `Arc`) into the process-wide [`MetricsRegistry`] so the
+/// out-of-band metrics HTTP task can READ the live values from another thread WITHOUT a lock
+/// (it is the lock-free way to expose per-shard state from the shared-nothing model, exactly
+/// like the raft control plane's `Copy` status snapshot).
+///
+/// ## Why atomics, and why this is NOT new hot-path cost
+///
+/// A shard mutates only ITS OWN cell, so every store is UNCONTENDED: the cache line is owned
+/// by that core, and a `Relaxed` `fetch_add` on an uncontended line is the same single
+/// increment the prior plain `u64 += 1` compiled to, with no lock and no cross-core traffic.
+/// This is the canonical Prometheus-counter pattern (a per-core counter read by a scraper).
+/// `Relaxed` is correct: the counters are independent monotonic tallies with no
+/// happens-before relationship to publish, and the reader tolerates reading them at slightly
+/// different instants (a metrics scrape is inherently a fuzzy snapshot). `connected_clients`
+/// is a GAUGE (a `fetch_sub` on close), so it uses `saturating`-style guards via a CAS-free
+/// `fetch_sub` that never underflows in practice (open precedes close on the same shard).
 #[derive(Debug, Default)]
+pub struct ShardCountersCell {
+    connections_received: AtomicU64,
+    commands_processed: AtomicU64,
+    connected_clients: AtomicU64,
+    evicted_keys: AtomicU64,
+    expired_keys: AtomicU64,
+    keyspace_hits: AtomicU64,
+    keyspace_misses: AtomicU64,
+    /// This shard's live KEY COUNT (sum of its per-DB lengths), a GAUGE published OFF the
+    /// command hot path by the shard's periodic active-expiry tick (and on connection close), so
+    /// the `/metrics` keyspace gauge is eventually-consistent (bounded by the expiry cycle) at
+    /// ZERO per-command cost. The metrics task sums it across shards for the node-wide keyspace.
+    keyspace_keys: AtomicU64,
+}
+
+impl ShardCountersCell {
+    /// Read this shard's cell into an immutable, summable [`CounterSnapshot`]. Used by the
+    /// out-of-band metrics task (cross-thread) AND by the same-shard INFO rollup. Each load is
+    /// `Relaxed` (see the type docs); reading the cells at slightly different instants is fine
+    /// for a metrics scrape.
+    #[must_use]
+    pub fn snapshot(&self) -> CounterSnapshot {
+        CounterSnapshot {
+            connections_received: self.connections_received.load(Ordering::Relaxed),
+            commands_processed: self.commands_processed.load(Ordering::Relaxed),
+            connected_clients: self.connected_clients.load(Ordering::Relaxed),
+            evicted_keys: self.evicted_keys.load(Ordering::Relaxed),
+            expired_keys: self.expired_keys.load(Ordering::Relaxed),
+            keyspace_hits: self.keyspace_hits.load(Ordering::Relaxed),
+            keyspace_misses: self.keyspace_misses.load(Ordering::Relaxed),
+            keyspace_keys: self.keyspace_keys.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Publish this shard's live key count (a GAUGE store, `Relaxed`). Called off the command
+    /// hot path (the periodic expiry tick + connection close), so it adds no per-command cost.
+    pub fn set_keyspace_keys(&self, keys: u64) {
+        self.keyspace_keys.store(keys, Ordering::Relaxed);
+    }
+}
+
+/// Per-shard counters. Each shard owns one of these and mutates it with no LOCK (its single
+/// backing [`ShardCountersCell`] is touched only by that core; the stores are uncontended
+/// `Relaxed` atomics, the same single-increment the prior plain `u64` was, see the cell docs).
+/// For INFO the server reads this shard's [`CounterSnapshot`]; for the out-of-band `/metrics`
+/// endpoint the [`MetricsRegistry`] reads EVERY shard's cell across threads and sums them.
+#[derive(Debug, Default, Clone)]
 pub struct ShardCounters {
-    connections_received: u64,
-    commands_processed: u64,
-    connected_clients: u64,
-    evicted_keys: u64,
-    /// Keys reclaimed because their TTL passed (INFO `expired_keys`, PR-3b). Bumped by
-    /// the active timing-wheel drain AND the lazy expiry-on-read backstop.
-    expired_keys: u64,
-    /// Read commands that found a live key (INFO `keyspace_hits`, PR-3b).
-    keyspace_hits: u64,
-    /// Read commands that found no live key, including a lazily-expired one (INFO
-    /// `keyspace_misses`, PR-3b).
-    keyspace_misses: u64,
+    cell: Arc<ShardCountersCell>,
 }
 
 impl ShardCounters {
-    /// A fresh zeroed counter set.
+    /// A fresh zeroed counter set with its own backing cell.
     #[must_use]
     pub fn new() -> Self {
         ShardCounters::default()
     }
 
-    /// Record a newly accepted connection.
-    pub fn on_connection_open(&mut self) {
-        self.connections_received += 1;
-        self.connected_clients += 1;
+    /// Wrap an EXISTING backing cell (the one a [`MetricsRegistry`] pre-allocated for this
+    /// shard's index), so the shard mutates the SAME cell the metrics task reads. The shard
+    /// adopts its registry cell at boot via this constructor.
+    #[must_use]
+    pub fn with_cell(cell: Arc<ShardCountersCell>) -> Self {
+        ShardCounters { cell }
     }
 
-    /// Record a closed connection.
+    /// A clone of the backing cell, for registering this shard in the [`MetricsRegistry`].
+    #[must_use]
+    pub fn cell(&self) -> Arc<ShardCountersCell> {
+        Arc::clone(&self.cell)
+    }
+
+    /// Record a newly accepted connection.
+    pub fn on_connection_open(&mut self) {
+        self.cell
+            .connections_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.cell.connected_clients.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a closed connection. `connected_clients` is a gauge; a close always follows an
+    /// open on the same shard, so the count never underflows, but we guard against it anyway
+    /// with a CAS-free saturating decrement.
     pub fn on_connection_close(&mut self) {
-        self.connected_clients = self.connected_clients.saturating_sub(1);
+        // Saturating decrement without a lock: load, subtract-or-clamp, compare-exchange-retry.
+        // Uncontended (this shard owns the cell), so the loop runs once in practice.
+        let mut cur = self.cell.connected_clients.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self.cell.connected_clients.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Record a processed command.
     pub fn on_command(&mut self) {
-        self.commands_processed += 1;
+        self.cell.commands_processed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record `n` keys evicted to honor the memory ceiling (PR-3a; INFO
     /// `evicted_keys`). Called by the dispatch admission path after `evict_to_fit`.
     pub fn on_evicted(&mut self, n: u64) {
-        self.evicted_keys += n;
+        self.cell.evicted_keys.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Record `n` keys reclaimed due to TTL expiry (PR-3b; INFO `expired_keys`).
     /// Called by the serve loop after the active timing-wheel drain.
     pub fn on_expired(&mut self, n: u64) {
-        self.expired_keys += n;
+        self.cell.expired_keys.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Record `n` keyspace hits (a read found a live key, INFO `keyspace_hits`).
     pub fn on_keyspace_hits(&mut self, n: u64) {
-        self.keyspace_hits += n;
+        self.cell.keyspace_hits.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Record `n` keyspace misses (a read found no live key, INFO `keyspace_misses`).
     pub fn on_keyspace_misses(&mut self, n: u64) {
-        self.keyspace_misses += n;
+        self.cell.keyspace_misses.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Fold a batch of per-command counter deltas (PR-3b: the eviction / expiry /
@@ -94,32 +178,277 @@ impl ShardCounters {
     /// since-reset stat), matching Redis (RESETSTAT leaves connected_clients alone).
     pub fn apply(&mut self, d: CounterDeltas) {
         if d.reset_stats {
-            self.evicted_keys = 0;
-            self.expired_keys = 0;
-            self.keyspace_hits = 0;
-            self.keyspace_misses = 0;
-            self.commands_processed = 0;
-            self.connections_received = 0;
+            self.cell.evicted_keys.store(0, Ordering::Relaxed);
+            self.cell.expired_keys.store(0, Ordering::Relaxed);
+            self.cell.keyspace_hits.store(0, Ordering::Relaxed);
+            self.cell.keyspace_misses.store(0, Ordering::Relaxed);
+            self.cell.commands_processed.store(0, Ordering::Relaxed);
+            self.cell.connections_received.store(0, Ordering::Relaxed);
         }
-        self.evicted_keys += d.evicted;
-        self.expired_keys += d.expired;
-        self.keyspace_hits += d.keyspace_hits;
-        self.keyspace_misses += d.keyspace_misses;
+        if d.evicted != 0 {
+            self.cell
+                .evicted_keys
+                .fetch_add(d.evicted, Ordering::Relaxed);
+        }
+        if d.expired != 0 {
+            self.cell
+                .expired_keys
+                .fetch_add(d.expired, Ordering::Relaxed);
+        }
+        if d.keyspace_hits != 0 {
+            self.cell
+                .keyspace_hits
+                .fetch_add(d.keyspace_hits, Ordering::Relaxed);
+        }
+        if d.keyspace_misses != 0 {
+            self.cell
+                .keyspace_misses
+                .fetch_add(d.keyspace_misses, Ordering::Relaxed);
+        }
     }
 
-    /// Take an immutable snapshot for rollup.
+    /// Take an immutable snapshot for rollup (reads this shard's backing cell).
     #[must_use]
     pub fn snapshot(&self) -> CounterSnapshot {
-        CounterSnapshot {
-            connections_received: self.connections_received,
-            commands_processed: self.commands_processed,
-            connected_clients: self.connected_clients,
-            evicted_keys: self.evicted_keys,
-            expired_keys: self.expired_keys,
-            keyspace_hits: self.keyspace_hits,
-            keyspace_misses: self.keyspace_misses,
+        self.cell.snapshot()
+    }
+}
+
+/// The process-wide METRICS REGISTRY (OBSERVABILITY.md, #152): one [`ShardCountersCell`] per
+/// shard, pre-allocated at boot and shared (by `Arc`) into BOTH the shard (which mutates its
+/// own cell) AND the out-of-band `/metrics` HTTP task (which reads EVERY cell across threads
+/// and sums them into a node-wide [`CounterSnapshot`]).
+///
+/// It is a lock-free aggregation point: there is NO `Mutex` (this crate is a hot-path crate;
+/// shared-nothing ADR-0002), only an immutable `Vec` of `Arc<ShardCountersCell>` fixed at boot.
+/// A shard ADOPTS its pre-allocated cell at its index via [`MetricsRegistry::shard_cell`]
+/// (the registry pre-fills `shards` cells; the shard wraps cell `index` into its
+/// [`ShardCounters`]). The registry is `Some` ONLY when the metrics endpoint is enabled
+/// (`--metrics-addr` set); on the DEFAULT path it is never built and the shard's counters use a
+/// fresh standalone cell (byte-identical to the prior behavior).
+#[derive(Debug, Clone)]
+pub struct MetricsRegistry {
+    /// One backing cell per shard, in shard-index order (`cells[i]` belongs to shard `i`).
+    cells: Arc<Vec<Arc<ShardCountersCell>>>,
+}
+
+impl MetricsRegistry {
+    /// Pre-allocate one zeroed [`ShardCountersCell`] per shard. Called ONCE at boot when the
+    /// metrics endpoint is enabled; the cells outlive every shard (held by the `Arc<Vec<_>>`
+    /// the metrics task keeps).
+    #[must_use]
+    pub fn new(shards: usize) -> Self {
+        let cells = (0..shards.max(1))
+            .map(|_| Arc::new(ShardCountersCell::default()))
+            .collect();
+        MetricsRegistry {
+            cells: Arc::new(cells),
         }
     }
+
+    /// The pre-allocated backing cell for shard `index`, for the shard to adopt into its
+    /// [`ShardCounters`] at boot. A defensive modulo keeps an out-of-range index in bounds
+    /// (a wiring bug clamps rather than panicking the shard thread); the registry is always
+    /// sized to the shard count, so this is exact in practice.
+    #[must_use]
+    pub fn shard_cell(&self, index: usize) -> Arc<ShardCountersCell> {
+        let n = self.cells.len().max(1);
+        Arc::clone(&self.cells[index % n])
+    }
+
+    /// The number of registered shard cells.
+    #[must_use]
+    pub fn shards(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Sum every shard's cell into ONE node-wide [`CounterSnapshot`] (the cross-shard rollup the
+    /// `/metrics` endpoint and a future cross-shard INFO read). Lock-free: it loads each cell's
+    /// atomics and folds them with [`CounterSnapshot::merge`].
+    #[must_use]
+    pub fn aggregate(&self) -> CounterSnapshot {
+        self.cells
+            .iter()
+            .map(|c| c.snapshot())
+            .fold(CounterSnapshot::default(), CounterSnapshot::merge)
+    }
+}
+
+/// The raft-mode control-plane gauges the `/metrics` endpoint exposes (HA-4c), read by the
+/// binary's metrics task from its `RaftHandle` snapshot. `None` outside raft-governance mode
+/// (the DEFAULT static path), in which case the renderer omits the `ironcache_raft_*` series
+/// entirely (a standalone node has no raft state to report).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaftGauges {
+    /// `true` iff this node currently believes it is the Raft leader.
+    pub is_leader: bool,
+    /// The node's persisted current term.
+    pub current_term: u64,
+    /// The highest log index known committed.
+    pub commit_index: u64,
+    /// The size of the current VOTER set (counted in every election + commit quorum).
+    pub voters: u64,
+}
+
+/// The process-level GAUGES the `/metrics` endpoint exposes alongside the aggregated counters:
+/// the figures that are NOT per-shard counters (uptime, the process-global allocator memory, and
+/// the optional raft control-plane state). The binary reads each at scrape time (uptime via the
+/// Env clock seam, memory via the store's jemalloc mallctl, raft via the `RaftHandle` snapshot)
+/// and hands them to [`render_prometheus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsGauges {
+    /// Seconds since the process started serving (from the Env monotonic clock).
+    pub uptime_secs: u64,
+    /// The configured shard count.
+    pub shards: u64,
+    /// `used_memory`: the allocator-attributed live allocated total in bytes (ADR-0006).
+    pub used_memory: u64,
+    /// `used_memory_rss`: the resident set size in bytes.
+    pub used_memory_rss: u64,
+    /// The current effective `maxmemory` ceiling in bytes (`0` = unlimited).
+    pub maxmemory: u64,
+    /// Unix seconds of the last successful save (`0` when persistence is off / no save yet).
+    pub last_save_unix: u64,
+    /// The persistence DIRTY counter (changes since the last save; `0` when persistence off).
+    pub rdb_changes_since_save: u64,
+    /// The raft control-plane gauges, `Some` only in raft-governance mode.
+    pub raft: Option<RaftGauges>,
+}
+
+/// Render the Prometheus text exposition (version 0.0.4) for `GET /metrics`: `# HELP`/`# TYPE`
+/// headers followed by `name value` samples, one metric family at a time, using the stable
+/// `ironcache_<subsystem>_<name>` naming. `counters` is the node-wide rollup (summed across every
+/// shard via [`MetricsRegistry::aggregate`]); `gauges` carries the process-level figures.
+///
+/// The body is plain ASCII, deterministic, and self-consistent: each family emits its HELP/TYPE
+/// once then its sample(s). The raft families are emitted ONLY when `gauges.raft` is `Some`
+/// (a standalone node reports no `ironcache_raft_*` series). The caller serves this with
+/// `Content-Type: text/plain; version=0.0.4`.
+///
+/// `too_many_lines` is allowed: this is one flat list of metric families (each a HELP/TYPE +
+/// sample), the single place the exposition is rendered. Splitting it would scatter the metric
+/// catalog across helpers with no readability gain; the body is linear and obvious.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn render_prometheus(counters: CounterSnapshot, gauges: MetricsGauges) -> String {
+    use core::fmt::Write as _;
+    let mut o = String::with_capacity(2048);
+
+    // A counter family: HELP + TYPE counter + one sample.
+    let mut counter = |name: &str, help: &str, value: u64| {
+        let _ = write!(
+            o,
+            "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+        );
+    };
+    counter(
+        "ironcache_connections_received_total",
+        "Connections accepted since start.",
+        counters.connections_received,
+    );
+    counter(
+        "ironcache_commands_processed_total",
+        "Commands processed since start.",
+        counters.commands_processed,
+    );
+    counter(
+        "ironcache_evicted_keys_total",
+        "Keys evicted to honor the memory ceiling.",
+        counters.evicted_keys,
+    );
+    counter(
+        "ironcache_expired_keys_total",
+        "Keys reclaimed because their TTL passed.",
+        counters.expired_keys,
+    );
+    counter(
+        "ironcache_keyspace_hits_total",
+        "Read commands that found a live key.",
+        counters.keyspace_hits,
+    );
+    counter(
+        "ironcache_keyspace_misses_total",
+        "Read commands that found no live key.",
+        counters.keyspace_misses,
+    );
+
+    // A gauge family: HELP + TYPE gauge + one sample.
+    let mut gauge = |name: &str, help: &str, value: u64| {
+        let _ = write!(
+            o,
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+        );
+    };
+    gauge(
+        "ironcache_connected_clients",
+        "Currently-open client connections.",
+        counters.connected_clients,
+    );
+    gauge(
+        "ironcache_keyspace_keys",
+        "Live keys held across all shards and databases.",
+        counters.keyspace_keys,
+    );
+    gauge(
+        "ironcache_uptime_seconds",
+        "Seconds since the process started serving.",
+        gauges.uptime_secs,
+    );
+    gauge(
+        "ironcache_shards",
+        "Configured shard (thread-per-core) count.",
+        gauges.shards,
+    );
+    gauge(
+        "ironcache_used_memory_bytes",
+        "Allocator-attributed live allocated bytes (jemalloc stats.allocated).",
+        gauges.used_memory,
+    );
+    gauge(
+        "ironcache_used_memory_rss_bytes",
+        "Resident set size in bytes (jemalloc stats.resident).",
+        gauges.used_memory_rss,
+    );
+    gauge(
+        "ironcache_maxmemory_bytes",
+        "Effective maxmemory ceiling in bytes (0 means unlimited).",
+        gauges.maxmemory,
+    );
+    gauge(
+        "ironcache_persistence_last_save_unixtime",
+        "Unix seconds of the last successful save (0 when persistence is off).",
+        gauges.last_save_unix,
+    );
+    gauge(
+        "ironcache_persistence_rdb_changes_since_save",
+        "Changes since the last save (the dirty counter; 0 when persistence is off).",
+        gauges.rdb_changes_since_save,
+    );
+
+    if let Some(r) = gauges.raft {
+        gauge(
+            "ironcache_raft_is_leader",
+            "1 when this node currently believes it is the Raft leader, else 0.",
+            u64::from(r.is_leader),
+        );
+        gauge(
+            "ironcache_raft_current_term",
+            "The node's persisted current Raft term.",
+            r.current_term,
+        );
+        gauge(
+            "ironcache_raft_commit_index",
+            "The highest Raft log index known committed.",
+            r.commit_index,
+        );
+        gauge(
+            "ironcache_raft_voters",
+            "The size of the current Raft voter set.",
+            r.voters,
+        );
+    }
+
+    o
 }
 
 /// The per-command counter deltas dispatch (and the active drain) accumulate for ONE
@@ -164,6 +493,11 @@ pub struct CounterSnapshot {
     pub keyspace_hits: u64,
     /// Total read misses (absent/expired key) (INFO `keyspace_misses`, PR-3b).
     pub keyspace_misses: u64,
+    /// This shard's live KEY COUNT (a GAUGE, not a since-start total). Disjoint across shards
+    /// (each shard owns its own keyspace partition), so [`CounterSnapshot::merge`] SUMS it into
+    /// the node-wide key count for the `/metrics` keyspace gauge. Published off the command hot
+    /// path (the periodic expiry tick), so it is eventually-consistent.
+    pub keyspace_keys: u64,
 }
 
 impl CounterSnapshot {
@@ -178,6 +512,7 @@ impl CounterSnapshot {
             expired_keys: self.expired_keys + other.expired_keys,
             keyspace_hits: self.keyspace_hits + other.keyspace_hits,
             keyspace_misses: self.keyspace_misses + other.keyspace_misses,
+            keyspace_keys: self.keyspace_keys + other.keyspace_keys,
         }
     }
 }
@@ -901,5 +1236,121 @@ mod tests {
         assert_eq!(rolled.connections_received, 3);
         assert_eq!(rolled.commands_processed, 2);
         assert_eq!(rolled.connected_clients, 2); // a:1 + b:(2-1)
+    }
+
+    /// The registry pre-allocates one cell per shard, a shard adopts its cell by index, and
+    /// `aggregate` sums every shard's live cell into the node-wide rollup (the cross-thread
+    /// read the `/metrics` endpoint performs). After N commands across two shards the processed
+    /// counter shows N.
+    #[test]
+    fn registry_aggregates_across_shards() {
+        let reg = MetricsRegistry::new(2);
+        assert_eq!(reg.shards(), 2);
+        // Two shards, each wrapping its registry cell, mutate independently.
+        let mut s0 = ShardCounters::with_cell(reg.shard_cell(0));
+        let mut s1 = ShardCounters::with_cell(reg.shard_cell(1));
+        s0.on_connection_open();
+        s0.on_command();
+        s0.on_command(); // shard 0: 2 commands
+        s1.on_connection_open();
+        s1.on_connection_open();
+        s1.on_command(); // shard 1: 1 command, 2 conns
+        // The registry reads the SAME cells the shards mutated (cross-cell aggregation).
+        let rolled = reg.aggregate();
+        assert_eq!(rolled.commands_processed, 3, "2 + 1 across the two shards");
+        assert_eq!(
+            rolled.connections_received, 3,
+            "1 + 2 across the two shards"
+        );
+        assert_eq!(rolled.connected_clients, 3);
+        // The keyspace gauge is published off-band; sums across shards.
+        reg.shard_cell(0).set_keyspace_keys(10);
+        reg.shard_cell(1).set_keyspace_keys(7);
+        assert_eq!(reg.aggregate().keyspace_keys, 17);
+    }
+
+    /// `apply(reset_stats)` zeroes the resettable totals on the shard's cell (CONFIG RESETSTAT),
+    /// leaving the live `connected_clients` gauge alone, and the registry reads the reset values.
+    #[test]
+    fn registry_reflects_resetstat() {
+        let reg = MetricsRegistry::new(1);
+        let mut s = ShardCounters::with_cell(reg.shard_cell(0));
+        s.on_connection_open();
+        s.on_command();
+        s.on_evicted(5);
+        s.apply(CounterDeltas {
+            reset_stats: true,
+            ..Default::default()
+        });
+        let rolled = reg.aggregate();
+        assert_eq!(rolled.commands_processed, 0);
+        assert_eq!(rolled.evicted_keys, 0);
+        assert_eq!(
+            rolled.connected_clients, 1,
+            "the live gauge survives RESETSTAT"
+        );
+    }
+
+    /// The Prometheus renderer emits valid `# HELP`/`# TYPE` + `name value` lines for the
+    /// aggregated counters and gauges, and OMITS the raft families when not in raft mode.
+    #[test]
+    fn prometheus_render_standalone_has_no_raft() {
+        let counters = CounterSnapshot {
+            commands_processed: 42,
+            connected_clients: 3,
+            keyspace_keys: 100,
+            ..Default::default()
+        };
+        let gauges = MetricsGauges {
+            uptime_secs: 7,
+            shards: 4,
+            used_memory: 1024,
+            used_memory_rss: 2048,
+            maxmemory: 0,
+            last_save_unix: 0,
+            rdb_changes_since_save: 0,
+            raft: None,
+        };
+        let body = render_prometheus(counters, gauges);
+        assert!(body.contains("# TYPE ironcache_commands_processed_total counter\n"));
+        assert!(
+            body.contains("ironcache_commands_processed_total 42\n"),
+            "{body}"
+        );
+        assert!(body.contains("# TYPE ironcache_connected_clients gauge\n"));
+        assert!(body.contains("ironcache_connected_clients 3\n"), "{body}");
+        assert!(body.contains("ironcache_keyspace_keys 100\n"), "{body}");
+        assert!(body.contains("ironcache_uptime_seconds 7\n"), "{body}");
+        assert!(
+            body.contains("ironcache_used_memory_bytes 1024\n"),
+            "{body}"
+        );
+        // No raft series on a standalone node.
+        assert!(!body.contains("ironcache_raft_"), "{body}");
+    }
+
+    /// In raft mode the renderer adds the `ironcache_raft_*` gauges.
+    #[test]
+    fn prometheus_render_raft_emits_raft_series() {
+        let gauges = MetricsGauges {
+            uptime_secs: 1,
+            shards: 1,
+            used_memory: 0,
+            used_memory_rss: 0,
+            maxmemory: 0,
+            last_save_unix: 0,
+            rdb_changes_since_save: 0,
+            raft: Some(RaftGauges {
+                is_leader: true,
+                current_term: 9,
+                commit_index: 17,
+                voters: 3,
+            }),
+        };
+        let body = render_prometheus(CounterSnapshot::default(), gauges);
+        assert!(body.contains("ironcache_raft_is_leader 1\n"), "{body}");
+        assert!(body.contains("ironcache_raft_current_term 9\n"), "{body}");
+        assert!(body.contains("ironcache_raft_commit_index 17\n"), "{body}");
+        assert!(body.contains("ironcache_raft_voters 3\n"), "{body}");
     }
 }

@@ -383,16 +383,19 @@ fn spawn_control_plane_inner(
             match resolved {
                 Some(Ok(addr)) => Some(addr),
                 Some(Err(e)) => {
-                    eprintln!(
-                        "raft control plane: self bus host {host}:{port} did not resolve ({e}); \
-                         binding the configured bind address instead"
+                    tracing::warn!(
+                        host, port, error = %e,
+                        "raft control plane: self bus host did not resolve; binding the \
+                         configured bind address instead"
                     );
                     None
                 }
                 None => {
-                    eprintln!(
-                        "raft control plane: could not build a runtime to resolve self bus host \
-                         {host}:{port}; binding the configured bind address instead"
+                    tracing::warn!(
+                        host,
+                        port,
+                        "raft control plane: could not build a runtime to resolve self bus host; \
+                         binding the configured bind address instead"
                     );
                     None
                 }
@@ -512,7 +515,7 @@ fn run_control_plane_thread(
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("raft control plane: failed to build runtime: {e}");
+            tracing::error!(error = %e, "raft control plane: failed to build runtime");
             return;
         }
     };
@@ -522,7 +525,7 @@ fn run_control_plane_thread(
         let listener = match bind_reuseport(listen_addr) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("raft control plane: failed to bind {listen_addr}: {e}");
+                tracing::error!(%listen_addr, error = %e, "raft control plane: failed to bind");
                 return;
             }
         };
@@ -535,9 +538,9 @@ fn run_control_plane_thread(
         if let Some(parent) = storage_path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!(
-                        "raft control plane: failed to create data directory {}: {e}",
-                        parent.display()
+                    tracing::error!(
+                        dir = %parent.display(), error = %e,
+                        "raft control plane: failed to create data directory"
                     );
                     return;
                 }
@@ -550,9 +553,9 @@ fn run_control_plane_thread(
         let storage = match FileStorage::open(&storage_path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "raft control plane: failed to open storage {}: {e}",
-                    storage_path.display()
+                tracing::error!(
+                    path = %storage_path.display(), error = %e,
+                    "raft control plane: failed to open storage"
                 );
                 return;
             }

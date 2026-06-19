@@ -12,6 +12,10 @@
 #![forbid(unsafe_code)]
 
 pub mod coordinator;
+/// The out-of-band operations HTTP endpoint (OBSERVABILITY.md, #152): a bounded, hand-rolled
+/// tokio HTTP/1.1 responder on `--metrics-addr` serving Prometheus `/metrics`, `/livez`, and
+/// `/readyz`. Spawned ONLY when `--metrics-addr` is set; default-off boot is byte-identical.
+pub mod metrics_http;
 pub mod multikey;
 /// Durable on-disk SNAPSHOT persistence serve wiring (#58): the cross-shard SAVE/BGSAVE fan-out,
 /// the manifest commit, LASTSAVE, load-on-boot, and the periodic save policy. Default-off (only

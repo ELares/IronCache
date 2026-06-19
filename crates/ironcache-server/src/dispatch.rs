@@ -170,6 +170,15 @@ pub struct ServerContext {
     /// hot path byte-unchanged. It is NODE-LEVEL cold state (one `AtomicUsize`), never touched per
     /// stored key, so `bytes_per_key` is unaffected.
     pub in_sync_replicas: Option<Arc<ironcache_repl::InSyncReplicas>>,
+    /// The process-wide per-shard metrics registry (OBSERVABILITY.md, #152), present ONLY when
+    /// the out-of-band `/metrics` endpoint is enabled (`--metrics-addr` set); `None` on the
+    /// DEFAULT path. When `Some`, each shard ADOPTS its pre-allocated cell at boot (so its
+    /// counter mutations land in the same cell the metrics HTTP task reads across threads), and
+    /// the periodic active-expiry tick publishes the shard's live key count into it. It is a
+    /// lock-free aggregation point (one `Arc<Vec<Arc<cell>>>`, no `Mutex`); reading it (the
+    /// `/metrics` scrape) never touches the command hot path, and on the default path the field
+    /// is `None` so the shard's counters use a standalone cell and boot is byte-identical.
+    pub metrics_registry: Option<ironcache_observe::MetricsRegistry>,
 }
 
 impl ServerContext {
@@ -1893,6 +1902,7 @@ mod tests {
             raft: None,
             repl_status: None,
             in_sync_replicas: None,
+            metrics_registry: None,
             boot,
         }
     }

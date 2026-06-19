@@ -363,7 +363,7 @@ async fn run_primary_listener(
     let listener = match bind_exclusive(listen_addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("replica-attach: failed to bind repl listener {listen_addr}: {e}");
+            tracing::error!(%listen_addr, error = %e, "replica-attach: failed to bind repl listener");
             return;
         }
     };

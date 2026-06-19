@@ -24,6 +24,13 @@
 //! The per-connection serve logic is supplied by the caller as an async closure
 //! over the shard's [`crate::Runtime`], keeping this layer free of any protocol or
 //! command knowledge.
+//!
+//! LOGGING NOTE (OBSERVABILITY.md, #152): the binary crate's operational logs were migrated to
+//! the `tracing` facade (filtered by `--log-level`). The few `eprintln!` calls that remain in
+//! THIS module (acceptor / shard-thread spawn + drain-grace diagnostics) are intentionally left
+//! as `eprintln!` for now: `ironcache-runtime` is the pure I/O/runtime SEAM and does not yet take
+//! a `tracing` dependency edge. They are infrequent boot/shutdown-path diagnostics, not hot-path
+//! logs; routing them through `tracing` is a small follow-up that adds the dependency here.
 
 use core::time::Duration;
 use std::net::SocketAddr;
