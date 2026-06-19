@@ -480,6 +480,39 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        // -- Operability / admin introspection (PROD-7). All AlwaysHome admin containers (like
+        // CONFIG/CLIENT): they own no routable key (MEMORY USAGE reads its key on the HOME shard --
+        // a foreign-shard MEMORY USAGE is a documented single-shard-scope limitation, consistent
+        // with how the default deployment serves a key's owner). arity Min(2) (token + subcommand);
+        // none denyoom; none a txn control verb; none a write. The @admin/@dangerous/@slow ACL
+        // categories are assigned in acl/categories.rs. --
+        b"SLOWLOG" => &CommandSpec {
+            name: b"SLOWLOG",
+            arity: Min(2),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        b"MEMORY" => &CommandSpec {
+            name: b"MEMORY",
+            arity: Min(2),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        b"LATENCY" => &CommandSpec {
+            name: b"LATENCY",
+            arity: Min(2),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
         // CLUSTER (CLUSTER_CONTRACT.md #70, slice 1): the read-only/introspection CLUSTER
         // surface. Like CONFIG it is an admin container command: AlwaysHome (never
         // key-routed -- KEYSLOT computes the slot of an ARGUMENT but the command itself

@@ -137,6 +137,17 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "maxmemory-samples",
             kind: SetKind::AcceptedNoOp,
         },
+        // The SLOWLOG knobs (PROD-7). RUNTIME-SETTABLE: `CONFIG SET slowlog-log-slower-than <micros>`
+        // (`-1` disables the SLOWLOG; `0` logs everything) and `CONFIG SET slowlog-max-len <n>`
+        // update the live SLOWLOG the per-command timing hook + the SLOWLOG command read.
+        ParamSpec {
+            name: "slowlog-log-slower-than",
+            kind: SetKind::Runtime,
+        },
+        ParamSpec {
+            name: "slowlog-max-len",
+            kind: SetKind::Runtime,
+        },
         // `save` is RUNTIME-SETTABLE (#58 durability footgun fix): `CONFIG SET save "<seconds>
         // <changes>"` ACTUALLY updates the periodic save policy the saver reads, and `CONFIG GET
         // save` reports the REAL policy -- no longer a silent no-op that lies about durability.
@@ -269,6 +280,9 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // count (reported as bytes, the form CONFIG SET accepts back).
         "maxclients" => runtime.maxclients().to_string(),
         "output-buffer-limit" => runtime.output_buffer_limit().to_string(),
+        // The SLOWLOG knobs (PROD-7): read the overlay so a `CONFIG SET slowlog-*` is reflected.
+        "slowlog-log-slower-than" => runtime.slowlog_log_slower_than().to_string(),
+        "slowlog-max-len" => runtime.slowlog_max_len().to_string(),
         // Accepted no-ops: fixed Redis-recognized defaults under the cache build.
         // `maxmemory-samples` defaults to 5 in Redis.
         "maxmemory-samples" => "5".to_owned(),
@@ -440,9 +454,31 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
                 Err(reason) => SetOutcome::InvalidValue(reason),
             }
         }
-        // Defensive: the registry only marks these three Runtime; any future Runtime
-        // param must add a branch here. An unhandled Runtime name is a programming
-        // error, surfaced as an invalid value rather than a silent success.
+        // The SLOWLOG threshold (PROD-7): a SIGNED integer microsecond value. `-1` disables the
+        // SLOWLOG; `0` logs everything; a positive value is the minimum micros to log. A non-integer
+        // is rejected (never a silent default).
+        "slowlog-log-slower-than" => match value.parse::<i64>() {
+            Ok(micros) => {
+                runtime.set_slowlog_log_slower_than(micros);
+                SetOutcome::Applied
+            }
+            Err(_) => {
+                SetOutcome::InvalidValue("argument couldn't be parsed into an integer".to_owned())
+            }
+        },
+        // The SLOWLOG max length (PROD-7): a non-negative integer entry cap. A non-integer is
+        // rejected.
+        "slowlog-max-len" => match value.parse::<u64>() {
+            Ok(n) => {
+                runtime.set_slowlog_max_len(n);
+                SetOutcome::Applied
+            }
+            Err(_) => {
+                SetOutcome::InvalidValue("argument couldn't be parsed into an integer".to_owned())
+            }
+        },
+        // Defensive: any future Runtime param must add a branch here. An unhandled Runtime name is a
+        // programming error, surfaced as an invalid value rather than a silent success.
         other => SetOutcome::InvalidValue(format!("no runtime setter for '{other}'")),
     }
 }

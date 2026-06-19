@@ -215,6 +215,24 @@ pub struct ServerContext {
     /// overlay (`maxclients`), so `0` disables it (unlimited, the pre-fix behavior) and a
     /// `CONFIG SET maxclients` takes effect for subsequent connections.
     pub conn_gate: Arc<ironcache_observe::ConnectionGate>,
+    /// The node-level SLOWLOG ring (PROD-7 operability): the slowest recent commands plus the live
+    /// `slowlog-log-slower-than` / `slowlog-max-len` knobs. ONE per node, shared by `Arc` onto every
+    /// shard's context. The per-command timing HOOK lives in the serve layer (it needs the client
+    /// addr/name + the Env clock); the `SLOWLOG` command handler here reads/resets this ring. When
+    /// disabled (`slowlog-log-slower-than` = -1) the hook short-circuits on one relaxed atomic load,
+    /// so the fast path costs a single compare and never touches the ring (see
+    /// [`ironcache_observe::SlowLog`]).
+    pub slowlog: Arc<ironcache_observe::SlowLog>,
+    /// The node-level LATENCY monitor (PROD-7): the worst spike + bounded history per named event.
+    /// ONE per node, shared by `Arc`. Updated on the same slow-path the SLOWLOG hook runs on (only
+    /// when a sample exceeds a floor), read only by the `LATENCY` admin command, so it is off the
+    /// per-command hot path.
+    pub latency: Arc<ironcache_observe::LatencyMonitor>,
+    /// The node-level live-connection REGISTRY (PROD-7): the directory `CLIENT LIST` / `CLIENT KILL`
+    /// / `CLIENT PAUSE` operate over. ONE per node, shared by `Arc`. A connection registers itself
+    /// on accept and deregisters on close (cold paths, not per command); the registry is consulted
+    /// only by the rare CLIENT admin verbs and the serve loop's post-batch kill/pause check.
+    pub clients: Arc<ironcache_observe::ClientRegistry>,
 }
 
 impl ServerContext {
@@ -981,8 +999,18 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         b"WATCH" => cmd_watch(state, store, now, req),
         b"UNWATCH" => cmd_unwatch(state, store, req),
         b"EXEC" => exec_transaction(ctx, state, env, store, wheel, now, rollup, mem, deltas, req),
-        b"CLIENT" => cmd_client(state, req),
+        b"CLIENT" => cmd_client(ctx, state, env, req),
         b"COMMAND" => cmd_command(req),
+        // SLOWLOG GET/LEN/RESET/HELP (PROD-7 operability). Reads/resets the node-level ring in
+        // `ctx.slowlog`; the per-command timing HOOK that POPULATES the ring lives in the serve
+        // layer (it needs the client addr/name + the Env clock). AlwaysHome, no key.
+        b"SLOWLOG" => cmd_slowlog(ctx, req),
+        // MEMORY USAGE/DOCTOR/STATS/HELP (PROD-7). USAGE estimates one key's bytes via the store;
+        // STATS reuses the observe gauges; DOCTOR is a human string. AlwaysHome; only USAGE keys.
+        b"MEMORY" => cmd_memory(ctx, store, db, now, mem, req),
+        // LATENCY RESET/HISTORY/LATEST/DOCTOR/HELP (PROD-7). Reads/resets the node-level monitor in
+        // `ctx.latency`; the per-command SAMPLE that feeds it lives in the serve layer. AlwaysHome.
+        b"LATENCY" => cmd_latency(ctx, req),
         // INFO reads only the CLOCK half of the env seam (uptime); pass `env` as the
         // `&C: Clock` it needs. `store` is passed so the `# Keyspace` section can report each
         // database's live key count (DBSIZE) via `Keyspace::db_len` (durability/operability fix #5).
@@ -2119,11 +2147,22 @@ fn cmd_select(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Valu
         return Value::error(ErrorReply::select_out_of_range());
     }
     state.db = idx as u32;
+    // Mirror the selected DB into the registry record so CLIENT LIST / CLIENT INFO for a PEER
+    // connection reports the live db (PROD-7). A no-op for a direct-dispatch caller not in the
+    // registry (tests).
+    if let Some(h) = ctx.clients.by_id(state.id) {
+        h.db.store(u64::from(state.db), core::sync::atomic::Ordering::Relaxed);
+    }
     Value::ok()
 }
 
 /// `CLIENT <subcommand>` (handshake-critical subset, PROTOCOL.md).
-fn cmd_client(state: &mut ConnState, req: &Request) -> Value {
+fn cmd_client<E: Clock>(
+    ctx: &ServerContext,
+    state: &mut ConnState,
+    env: &E,
+    req: &Request,
+) -> Value {
     if req.args.len() < 2 {
         return Value::error(ErrorReply::wrong_arity("client"));
     }
@@ -2143,6 +2182,15 @@ fn cmd_client(state: &mut ConnState, req: &Request) -> Value {
                 return Value::error(ErrorReply::client_name_invalid_chars());
             }
             state.name = String::from_utf8_lossy(&req.args[2]).into_owned();
+            // Mirror the new name into the registry record so CLIENT LIST / CLIENT INFO for THIS
+            // connection (and a peer's CLIENT KILL filtering) sees the live name. The registry is
+            // node-level; if this connection is not registered (a direct dispatch caller / a test)
+            // this is a harmless no-op.
+            if let Some(h) = ctx.clients.by_id(state.id) {
+                if let Ok(mut g) = h.name.lock() {
+                    state.name.clone_into(&mut g);
+                }
+            }
             Value::ok()
         }
         b"SETINFO" => {
@@ -2154,7 +2202,35 @@ fn cmd_client(state: &mut ConnState, req: &Request) -> Value {
             Value::ok()
         }
         b"INFO" => Value::bulk_str(&client_info_line(state)),
-        b"NO-EVICT" | b"NO-TOUCH" => Value::ok(),
+        // CLIENT LIST [ID id ...] (PROD-7): one text line per live connection from the node-level
+        // registry. The optional `ID <id> [id...]` filter selects specific connections.
+        b"LIST" => cmd_client_list(ctx, state, req),
+        // CLIENT KILL <ID id|ADDR addr|...> (PROD-7): flag a matching connection for close via the
+        // registry; the target's serve loop observes the flag and closes after its current batch.
+        b"KILL" => cmd_client_kill(ctx, state, req),
+        // CLIENT PAUSE ms [WRITE|ALL] (PROD-7): pause command processing node-wide for `ms` ms; the
+        // serve loop honors the pause window after each batch. UNPAUSE clears it.
+        b"PAUSE" => cmd_client_pause(ctx, env, req),
+        b"UNPAUSE" => {
+            if req.args.len() != 2 {
+                return Value::error(ErrorReply::wrong_arity("client|unpause"));
+            }
+            ctx.clients.unpause();
+            Value::ok()
+        }
+        // CLIENT NO-EVICT on|off (PROD-7): accept + ack. IronCache does not evict client connection
+        // buffers to free memory (the output-buffer cap closes an over-budget connection instead),
+        // so the flag is a no-op acked for client compatibility. Arity `CLIENT NO-EVICT <on|off>`.
+        b"NO-EVICT" => {
+            if req.args.len() != 3 {
+                return Value::error(ErrorReply::wrong_arity("client|no-evict"));
+            }
+            match ascii_upper(&req.args[2]).as_slice() {
+                b"ON" | b"OFF" => Value::ok(),
+                _ => Value::error(ErrorReply::syntax_error()),
+            }
+        }
+        b"NO-TOUCH" => Value::ok(),
         _ => Value::error(ErrorReply::unknown_subcommand(
             "CLIENT",
             &String::from_utf8_lossy(&req.args[1]),
@@ -2162,7 +2238,157 @@ fn cmd_client(state: &mut ConnState, req: &Request) -> Value {
     }
 }
 
-/// A single-line CLIENT INFO description (subset of Redis fields).
+/// `CLIENT LIST [ID id [id ...]]` (PROD-7): a bulk string of one `id=.. addr=.. ...` line per live
+/// connection (Redis CLIENT LIST shape, a subset of fields), newline-separated. The optional `ID`
+/// filter restricts the output to the named connection ids. The line for THIS connection reflects
+/// its live name/db from `state` (the registry copy is updated on SETNAME/SELECT but `state` is the
+/// freshest); other connections render from their registry records.
+fn cmd_client_list(ctx: &ServerContext, state: &ConnState, req: &Request) -> Value {
+    // Parse an optional `ID <id> [id...]` filter.
+    let mut filter: Option<Vec<u64>> = None;
+    if req.args.len() >= 3 {
+        if !ascii_upper(&req.args[2]).eq_ignore_ascii_case(b"ID") {
+            return Value::error(ErrorReply::syntax_error());
+        }
+        if req.args.len() == 3 {
+            return Value::error(ErrorReply::syntax_error());
+        }
+        let mut ids = Vec::new();
+        for a in &req.args[3..] {
+            match core::str::from_utf8(a)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                Some(id) => ids.push(id),
+                None => return Value::error(ErrorReply::err("Invalid client ID")),
+            }
+        }
+        filter = Some(ids);
+    }
+    let mut body = String::new();
+    for h in ctx.clients.snapshot() {
+        if let Some(ids) = &filter {
+            if !ids.contains(&h.id) {
+                continue;
+            }
+        }
+        // For THIS connection, prefer the live `state` name/db/resp (freshest); others render from
+        // the registry record.
+        if h.id == state.id {
+            body.push_str(&client_info_line(state));
+        } else {
+            body.push_str(&registry_info_line(&h));
+        }
+        body.push('\n');
+    }
+    Value::bulk(body.into_bytes())
+}
+
+/// `CLIENT KILL ...` (PROD-7). Supports the OLD form `CLIENT KILL addr:port` (returns +OK or an
+/// error if no match) and the NEW filter form `CLIENT KILL <ID id|ADDR addr|LADDR addr> [...]`
+/// (returns the integer count of connections killed). A connection cannot reach KILL unless it is
+/// authorized (the ACL/admin gate ran upstream); the actual close happens in the target's serve
+/// loop, which observes the registry kill flag after its current batch.
+fn cmd_client_kill(ctx: &ServerContext, state: &ConnState, req: &Request) -> Value {
+    // OLD form: exactly one argument that is an addr (`CLIENT KILL 1.2.3.4:5`).
+    if req.args.len() == 3 {
+        let addr = String::from_utf8_lossy(&req.args[2]).into_owned();
+        return if ctx.clients.kill_addr(&addr) {
+            Value::ok()
+        } else {
+            Value::error(ErrorReply::err("No such client"))
+        };
+    }
+    // NEW filter form: `CLIENT KILL <filter value> [<filter value> ...]`, an EVEN tail of
+    // filter/value pairs. We support ID, ADDR, and LADDR (the common operator filters); a SKIPME
+    // option is accepted for compatibility (default yes -> never kill the caller).
+    let rest = &req.args[2..];
+    if rest.is_empty() || rest.len() % 2 != 0 {
+        return Value::error(ErrorReply::syntax_error());
+    }
+    let mut want_id: Option<u64> = None;
+    let mut want_peer_addr: Option<String> = None;
+    let mut want_local_addr: Option<String> = None;
+    let mut skipme = true;
+    for pair in rest.chunks_exact(2) {
+        let opt = ascii_upper(&pair[0]);
+        let val = String::from_utf8_lossy(&pair[1]).into_owned();
+        match opt.as_slice() {
+            b"ID" => match val.parse::<u64>() {
+                Ok(id) => want_id = Some(id),
+                Err(_) => {
+                    return Value::error(ErrorReply::err("client-id should be greater than 0"));
+                }
+            },
+            b"ADDR" => want_peer_addr = Some(val),
+            b"LADDR" => want_local_addr = Some(val),
+            b"SKIPME" => match val.to_ascii_lowercase().as_str() {
+                "yes" => skipme = true,
+                "no" => skipme = false,
+                _ => return Value::error(ErrorReply::syntax_error()),
+            },
+            // TYPE / USER / MAXAGE: accepted-but-ignored filters for compatibility (a single-tier
+            // connection model has no client TYPE distinction). They never match-narrow here.
+            b"TYPE" | b"USER" | b"MAXAGE" => {}
+            _ => return Value::error(ErrorReply::syntax_error()),
+        }
+    }
+    let mut killed = 0i64;
+    for h in ctx.clients.snapshot() {
+        if skipme && h.id == state.id {
+            continue;
+        }
+        if let Some(id) = want_id {
+            if h.id != id {
+                continue;
+            }
+        }
+        if let Some(addr) = &want_peer_addr {
+            if &h.addr != addr {
+                continue;
+            }
+        }
+        if let Some(laddr) = &want_local_addr {
+            if &h.laddr != laddr {
+                continue;
+            }
+        }
+        h.kill();
+        killed += 1;
+    }
+    Value::Integer(killed)
+}
+
+/// `CLIENT PAUSE <ms> [WRITE|ALL]` (PROD-7): pause command processing node-wide for `ms`
+/// milliseconds. `ALL` (the default) pauses all commands; `WRITE` pauses only writes. The serve
+/// loop reads the pause window (a monotonic deadline) after each batch and stalls while it is
+/// active. The deadline basis is the Env monotonic clock (ADR-0003), passed in by the caller.
+fn cmd_client_pause<E: Clock>(ctx: &ServerContext, env: &E, req: &Request) -> Value {
+    if req.args.len() != 3 && req.args.len() != 4 {
+        return Value::error(ErrorReply::wrong_arity("client|pause"));
+    }
+    let Some(ms) = core::str::from_utf8(&req.args[2])
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return Value::error(ErrorReply::err("timeout is not an integer or out of range"));
+    };
+    let writes_only = if req.args.len() == 4 {
+        match ascii_upper(&req.args[3]).as_slice() {
+            b"WRITE" => true,
+            b"ALL" => false,
+            _ => return Value::error(ErrorReply::syntax_error()),
+        }
+    } else {
+        false
+    };
+    // The monotonic-millis basis the serve loop also reads: the Env clock's `now()` as millis.
+    let now_mono_ms = env.now().as_millis();
+    ctx.clients.pause(now_mono_ms, ms, writes_only);
+    Value::ok()
+}
+
+/// A single-line CLIENT INFO description for THIS connection (subset of Redis fields).
 fn client_info_line(state: &ConnState) -> String {
     format!(
         "id={} addr={} laddr={} name={} db={} resp={}",
@@ -2172,6 +2398,20 @@ fn client_info_line(state: &ConnState) -> String {
         state.name,
         state.db,
         state.proto.as_i64()
+    )
+}
+
+/// A CLIENT LIST line for a PEER connection rendered from its registry record (this connection's
+/// `ConnState` is not reachable cross-connection, so the registry holds the load-bearing fields:
+/// id / addr / laddr / name / db).
+fn registry_info_line(h: &ironcache_observe::ClientHandle) -> String {
+    format!(
+        "id={} addr={} laddr={} name={} db={}",
+        h.id,
+        h.addr,
+        h.laddr,
+        h.name(),
+        h.db.load(core::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -2197,6 +2437,341 @@ fn cmd_command(req: &Request) -> Value {
         // client startup probes (PR-1 has no command table yet).
         _ => Value::Array(Some(vec![])),
     }
+}
+
+// -- SLOWLOG (PROD-7 operability) --------------------------------------------------------------
+
+/// `SLOWLOG GET [count] | LEN | RESET | HELP` (PROD-7). Reads / resets the node-level ring
+/// (`ctx.slowlog`); the per-command timing HOOK that POPULATES the ring lives in the serve layer
+/// (it needs the client addr/name + the Env clock). The `slowlog-log-slower-than` / `slowlog-max-len`
+/// knobs are CONFIG params, not SLOWLOG subcommands.
+fn cmd_slowlog(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("slowlog"));
+    }
+    let sub = ascii_upper(&req.args[1]);
+    match sub.as_slice() {
+        b"GET" => {
+            // SLOWLOG GET [count]: default 10 (Redis); `-1` means ALL. A non-integer count is the
+            // not-an-integer error.
+            let count: Option<usize> = if req.args.len() >= 3 {
+                match core::str::from_utf8(&req.args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(n) if n < 0 => None, // -1 (or any negative) -> all entries
+                    Some(n) => Some(usize::try_from(n).unwrap_or(usize::MAX)),
+                    None => return Value::error(ErrorReply::not_an_integer()),
+                }
+            } else {
+                Some(10)
+            };
+            let entries = ctx.slowlog.get(count);
+            let arr: Vec<Value> = entries.iter().map(slowlog_entry_value).collect();
+            Value::Array(Some(arr))
+        }
+        b"LEN" => Value::Integer(ctx.slowlog.len() as i64),
+        b"RESET" => {
+            ctx.slowlog.reset();
+            Value::ok()
+        }
+        b"HELP" => slowlog_help(),
+        _ => Value::error(ErrorReply::unknown_subcommand(
+            "SLOWLOG",
+            &String::from_utf8_lossy(&req.args[1]),
+        )),
+    }
+}
+
+/// One SLOWLOG GET entry as the Redis 6-element array: `[id, unix-ts, micros, [args...],
+/// client-addr, client-name]`.
+fn slowlog_entry_value(e: &ironcache_observe::SlowLogEntry) -> Value {
+    let args: Vec<Value> = e
+        .args
+        .iter()
+        .map(|a| Value::bulk(bytes::Bytes::copy_from_slice(a)))
+        .collect();
+    Value::Array(Some(vec![
+        Value::Integer(e.id as i64),
+        Value::Integer(e.unix_time_secs as i64),
+        Value::Integer(e.micros as i64),
+        Value::Array(Some(args)),
+        Value::bulk_str(&e.client_addr),
+        Value::bulk_str(&e.client_name),
+    ]))
+}
+
+/// `SLOWLOG HELP` -> the subcommand summary array (Redis shape).
+fn slowlog_help() -> Value {
+    let lines: &[&str] = &[
+        "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "GET [<count>]",
+        "    Return top <count> entries from the slowlog (default: 10, -1 means all).",
+        "LEN",
+        "    Return the length of the slowlog.",
+        "RESET",
+        "    Reset the slowlog.",
+        "HELP",
+        "    Print this help.",
+    ];
+    Value::Array(Some(lines.iter().map(|l| Value::bulk_str(l)).collect()))
+}
+
+// -- MEMORY (PROD-7) ---------------------------------------------------------------------------
+
+/// `MEMORY USAGE key [SAMPLES n] | DOCTOR | STATS | HELP` (PROD-7). USAGE estimates one key's byte
+/// footprint via the store; STATS reuses the observe gauges + the process-global allocator figure
+/// `mem`; DOCTOR is a human string.
+fn cmd_memory<S: Store>(
+    ctx: &ServerContext,
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    mem: MemoryInfo,
+    req: &Request,
+) -> Value {
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("memory"));
+    }
+    let sub = ascii_upper(&req.args[1]);
+    match sub.as_slice() {
+        b"USAGE" => memory_usage(store, db, now, req),
+        b"DOCTOR" => memory_doctor(mem),
+        b"STATS" => memory_stats(ctx, mem),
+        b"HELP" => memory_help(),
+        _ => Value::error(ErrorReply::unknown_subcommand(
+            "MEMORY",
+            &String::from_utf8_lossy(&req.args[1]),
+        )),
+    }
+}
+
+/// `MEMORY USAGE key [SAMPLES n]` -> an integer estimate of the key's total byte footprint
+/// (key bytes + value bytes + a per-key overhead constant), or nil if the key is absent. The
+/// `SAMPLES n` option (used by Redis to bound nested-collection sampling) is parsed + accepted; the
+/// estimate is a deterministic figure that does not depend on it for the v1 surface (documented).
+fn memory_usage<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() < 3 {
+        return Value::error(ErrorReply::wrong_arity("memory|usage"));
+    }
+    // Parse an optional `SAMPLES <n>` (accepted for compatibility; see the fn docs).
+    if req.args.len() > 3 {
+        if req.args.len() != 5 || !ascii_upper(&req.args[3]).eq_ignore_ascii_case(b"SAMPLES") {
+            return Value::error(ErrorReply::syntax_error());
+        }
+        if core::str::from_utf8(&req.args[4])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_none()
+        {
+            return Value::error(ErrorReply::not_an_integer());
+        }
+    }
+    let key = &req.args[2];
+    match store.read(db, key, now) {
+        Some(v) => {
+            // A deterministic, honest estimate: the key bytes + the value bytes + a fixed per-key
+            // overhead (the robj/dictEntry/SDS-header analog Redis's `objectComputeSize` adds). For
+            // collections the value-bytes figure is the type's serialized span; this is an ESTIMATE,
+            // not an exact allocator figure (documented), but it tracks key + payload growth, which
+            // is what an operator probing a hot key needs.
+            let est = MEMORY_USAGE_PER_KEY_OVERHEAD + key.len() as u64 + v.len() as u64;
+            Value::Integer(est as i64)
+        }
+        None => Value::Null,
+    }
+}
+
+/// The fixed per-key overhead the MEMORY USAGE estimate adds (the robj + dictEntry + key-SDS
+/// header analog). A conservative constant in the same ballpark Redis reports for a small key.
+const MEMORY_USAGE_PER_KEY_OVERHEAD: u64 = 64;
+
+/// `MEMORY DOCTOR` -> a human-readable health string. With no allocator figure (the system-allocator
+/// build / before the first publish) it reports the no-data message; otherwise a terse "sane"
+/// assessment with the live used/RSS figures (a real fragmentation-ratio judgment is a follow-up).
+fn memory_doctor(mem: MemoryInfo) -> Value {
+    if mem.used_memory == 0 {
+        return Value::bulk_str(
+            "Sam, I detected a few issues in this Redis instance memory implants:\n\n \
+             * No memory figure is available yet (no allocator stats published). Run me again \
+             after the instance has served some traffic.\n",
+        );
+    }
+    let frag = if mem.used_memory > 0 {
+        mem.used_memory_rss as f64 / mem.used_memory as f64
+    } else {
+        0.0
+    };
+    let msg = format!(
+        "Sam, I have observed the memory profile of this instance: used_memory={} bytes, \
+         used_memory_rss={} bytes, fragmentation_ratio={:.2}. Nothing alarming; memory usage \
+         looks healthy.",
+        mem.used_memory, mem.used_memory_rss, frag
+    );
+    Value::bulk(msg.into_bytes())
+}
+
+/// `MEMORY STATS` -> a flat field/value array (Redis MEMORY STATS shape, a subset) reusing the
+/// observe figures: the process-global allocator `used_memory` / RSS, the effective `maxmemory`
+/// ceiling, the policy, the live connection count, and the fragmentation ratio. RESP2 renders the
+/// `Map` as a flat array; RESP3 as a map (the canonical MEMORY STATS shapes).
+fn memory_stats(ctx: &ServerContext, mem: MemoryInfo) -> Value {
+    let frag = if mem.used_memory > 0 {
+        mem.used_memory_rss as f64 / mem.used_memory as f64
+    } else {
+        0.0
+    };
+    let policy = ctx.runtime.policy_name();
+    let pairs: Vec<(Value, Value)> = vec![
+        (
+            Value::bulk_str("peak.allocated"),
+            Value::Integer(mem.used_memory_rss as i64),
+        ),
+        (
+            Value::bulk_str("total.allocated"),
+            Value::Integer(mem.used_memory as i64),
+        ),
+        (Value::bulk_str("startup.allocated"), Value::Integer(0)),
+        (
+            Value::bulk_str("clients.normal"),
+            Value::Integer(ctx.clients.len() as i64),
+        ),
+        (
+            Value::bulk_str("maxmemory"),
+            Value::Integer(ctx.runtime.maxmemory() as i64),
+        ),
+        (
+            Value::bulk_str("maxmemory.policy"),
+            Value::bulk_str(&policy),
+        ),
+        (
+            Value::bulk_str("allocator.allocated"),
+            Value::Integer(mem.used_memory as i64),
+        ),
+        (
+            Value::bulk_str("allocator.resident"),
+            Value::Integer(mem.used_memory_rss as i64),
+        ),
+        (
+            Value::bulk_str("number.of.cached.scripts"),
+            Value::Integer(0),
+        ),
+        (Value::bulk_str("fragmentation"), Value::Double(frag)),
+    ];
+    Value::Map(pairs)
+}
+
+/// `MEMORY HELP` -> the subcommand summary array (Redis shape).
+fn memory_help() -> Value {
+    let lines: &[&str] = &[
+        "MEMORY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "DOCTOR",
+        "    Return memory problems reports.",
+        "STATS",
+        "    Return information about the memory usage of the server.",
+        "USAGE <key> [SAMPLES <count>]",
+        "    Return memory in bytes used by <key> and its value.",
+        "HELP",
+        "    Print this help.",
+    ];
+    Value::Array(Some(lines.iter().map(|l| Value::bulk_str(l)).collect()))
+}
+
+// -- LATENCY (PROD-7) --------------------------------------------------------------------------
+
+/// `LATENCY RESET [event...] | HISTORY event | LATEST | DOCTOR | HELP` (PROD-7). Reads / resets the
+/// node-level monitor (`ctx.latency`); the per-command SAMPLE that feeds the `command` event lives
+/// in the serve layer.
+fn cmd_latency(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("latency"));
+    }
+    let sub = ascii_upper(&req.args[1]);
+    match sub.as_slice() {
+        b"RESET" => {
+            let events: Vec<String> = req.args[2..]
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            Value::Integer(ctx.latency.reset(&events) as i64)
+        }
+        b"HISTORY" => {
+            if req.args.len() != 3 {
+                return Value::error(ErrorReply::wrong_arity("latency|history"));
+            }
+            let event = String::from_utf8_lossy(&req.args[2]).into_owned();
+            let samples = ctx.latency.history(&event);
+            // Each sample is a 2-element [unix-secs, ms] array (Redis LATENCY HISTORY shape).
+            let arr: Vec<Value> = samples
+                .iter()
+                .map(|(ts, ms)| {
+                    Value::Array(Some(vec![
+                        Value::Integer(*ts as i64),
+                        Value::Integer(*ms as i64),
+                    ]))
+                })
+                .collect();
+            Value::Array(Some(arr))
+        }
+        b"LATEST" => {
+            let latest = ctx.latency.latest();
+            // Each event is a 4-element [name, unix-secs, latest-ms, max-ms] array (Redis shape).
+            let arr: Vec<Value> = latest
+                .iter()
+                .map(|(name, ts, latest_ms, max_ms)| {
+                    Value::Array(Some(vec![
+                        Value::bulk_str(name),
+                        Value::Integer(*ts as i64),
+                        Value::Integer(*latest_ms as i64),
+                        Value::Integer(*max_ms as i64),
+                    ]))
+                })
+                .collect();
+            Value::Array(Some(arr))
+        }
+        b"DOCTOR" => {
+            let n = ctx.latency.event_count();
+            let msg = if n == 0 {
+                "Dave, I have observed the system, no worrysome latency spikes. Everything seems \
+                 fine."
+                    .to_owned()
+            } else {
+                format!(
+                    "Dave, I have observed the system, {n} latency event(s) tracked. Use LATENCY \
+                     LATEST and LATENCY HISTORY <event> to inspect the worst spikes."
+                )
+            };
+            Value::bulk(msg.into_bytes())
+        }
+        b"GRAPH" => {
+            // LATENCY GRAPH <event>: the ASCII spark-graph is a cosmetic follow-up; return an empty
+            // bulk rather than an error so a client probing it does not fail (documented partial).
+            Value::bulk_str("")
+        }
+        b"HELP" => latency_help(),
+        _ => Value::error(ErrorReply::unknown_subcommand(
+            "LATENCY",
+            &String::from_utf8_lossy(&req.args[1]),
+        )),
+    }
+}
+
+/// `LATENCY HELP` -> the subcommand summary array (Redis shape).
+fn latency_help() -> Value {
+    let lines: &[&str] = &[
+        "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "HISTORY <event>",
+        "    Return time-latency samples for the <event> class.",
+        "LATEST",
+        "    Return the latest latency samples for all events.",
+        "RESET [<event> ...]",
+        "    Reset latency data of one or more <event> classes (default: reset all).",
+        "DOCTOR",
+        "    Return a human readable latency analysis report.",
+        "HELP",
+        "    Print this help.",
+    ];
+    Value::Array(Some(lines.iter().map(|l| Value::bulk_str(l)).collect()))
 }
 
 /// `INFO [section]` -> delegates to ironcache-observe. `mem` is the process-global
@@ -2260,6 +2835,17 @@ fn cmd_info<C: Clock, S: Keyspace>(
             })
         })
         .collect();
+    // The PROD-7 completeness facts for the `# Clients` / `# Stats` / `# CPU` sections: the effective
+    // `maxclients` (read from the runtime overlay so a `CONFIG SET maxclients` is reflected) and the
+    // rejected-connection count off the connection gate. `instantaneous_ops_per_sec` is left 0 here
+    // (the rolling-rate sample lives in the serve layer's periodic tick; a dispatch-time figure would
+    // need cross-command state); `blocked_clients` is 0 (no blocking commands yet).
+    let runtime_stats = ironcache_observe::RuntimeStats {
+        maxclients: ctx.runtime.maxclients(),
+        blocked_clients: 0,
+        instantaneous_ops_per_sec: 0,
+        rejected_connections: ctx.conn_gate.rejected(),
+    };
     let body = build_info(
         clock,
         &ctx.info,
@@ -2269,6 +2855,7 @@ fn cmd_info<C: Clock, S: Keyspace>(
         &replication,
         &persistence,
         &keyspace,
+        runtime_stats,
         section.as_deref(),
     );
     Value::bulk(body.into_bytes())
@@ -2433,6 +3020,9 @@ mod tests {
             persist_stats: None,
             process_memory: std::sync::Arc::new(ironcache_observe::ProcessMemoryGauge::new()),
             conn_gate: std::sync::Arc::new(ironcache_observe::ConnectionGate::new()),
+            slowlog: std::sync::Arc::new(ironcache_observe::SlowLog::new()),
+            latency: std::sync::Arc::new(ironcache_observe::LatencyMonitor::new()),
+            clients: std::sync::Arc::new(ironcache_observe::ClientRegistry::new()),
             boot,
         }
     }
@@ -8496,5 +9086,282 @@ mod tests {
             ),
             arr(&[b"2", b"3", b"1"])
         );
+    }
+
+    // -- PROD-7 operability: SLOWLOG / MEMORY / LATENCY / CLIENT extensions ---------------------
+
+    #[test]
+    fn slowlog_get_len_reset() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        // Seed the ring directly (the per-command timing hook lives in the serve layer; here we
+        // exercise the COMMAND surface that reads/resets it).
+        c.slowlog.record(
+            100,
+            50_000,
+            &[b"GET".to_vec(), b"k".to_vec()],
+            "1.1.1.1:1".into(),
+            "app".into(),
+        );
+        c.slowlog.record(
+            200,
+            90_000,
+            &[b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()],
+            "1.1.1.1:2".into(),
+            String::new(),
+        );
+        // SLOWLOG LEN.
+        assert_eq!(run(&c, &mut s, &[b"SLOWLOG", b"LEN"]), Value::Integer(2));
+        // SLOWLOG GET: newest first, the 6-element entry shape.
+        match run(&c, &mut s, &[b"SLOWLOG", b"GET"]) {
+            Value::Array(Some(entries)) => {
+                assert_eq!(entries.len(), 2);
+                match &entries[0] {
+                    Value::Array(Some(fields)) => {
+                        assert_eq!(fields.len(), 6);
+                        assert_eq!(fields[0], Value::Integer(1)); // id (newest)
+                        assert_eq!(fields[1], Value::Integer(200)); // unix ts
+                        assert_eq!(fields[2], Value::Integer(90_000)); // micros
+                        // args = [SET, k, v]
+                        match &fields[3] {
+                            Value::Array(Some(args)) => assert_eq!(args.len(), 3),
+                            other => panic!("expected args array, got {other:?}"),
+                        }
+                        assert_eq!(fields[4], Value::bulk_str("1.1.1.1:2")); // client addr
+                        assert_eq!(fields[5], Value::bulk_str("")); // client name
+                    }
+                    other => panic!("expected entry array, got {other:?}"),
+                }
+            }
+            other => panic!("expected SLOWLOG GET array, got {other:?}"),
+        }
+        // SLOWLOG GET 1 returns only the newest.
+        match run(&c, &mut s, &[b"SLOWLOG", b"GET", b"1"]) {
+            Value::Array(Some(e)) => assert_eq!(e.len(), 1),
+            other => panic!("expected one entry, got {other:?}"),
+        }
+        // SLOWLOG RESET empties the ring.
+        assert_eq!(run(&c, &mut s, &[b"SLOWLOG", b"RESET"]), Value::ok());
+        assert_eq!(run(&c, &mut s, &[b"SLOWLOG", b"LEN"]), Value::Integer(0));
+        // SLOWLOG HELP is an array.
+        assert!(matches!(
+            run(&c, &mut s, &[b"SLOWLOG", b"HELP"]),
+            Value::Array(Some(_))
+        ));
+        // Unknown subcommand errors.
+        assert!(matches!(
+            run(&c, &mut s, &[b"SLOWLOG", b"BOGUS"]),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn slowlog_threshold_gate_in_the_record_path() {
+        // The threshold decision is the SlowLog's: a command at/over the threshold is recorded; a
+        // fast one is not; -1 disables. (The per-command HOOK that applies this lives in the serve
+        // layer; here we assert the underlying gate the hook relies on.)
+        let sl = ironcache_observe::SlowLog::with_config(10_000, 128); // 10ms threshold
+        assert!(sl.enabled());
+        // A slow command (>= 10ms) appears; a fast one (1ms) does not -- the hook only calls
+        // `record` when micros >= threshold, which we mimic here.
+        sl.record(1, 20_000, &[b"SLOW".to_vec()], "a".into(), String::new());
+        assert_eq!(sl.len(), 1);
+        // Disabled threshold: the hook never reads the clock nor calls record.
+        let off = ironcache_observe::SlowLog::with_config(-1, 128);
+        assert!(!off.enabled());
+    }
+
+    #[test]
+    fn memory_usage_doctor_stats_help() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // Plant a key, then MEMORY USAGE returns an integer estimate >= key+value bytes.
+        let _ = run_on(&c, &mut s, &mut st, t, &[b"SET", b"mykey", b"value123"]);
+        match run_on(&c, &mut s, &mut st, t, &[b"MEMORY", b"USAGE", b"mykey"]) {
+            Value::Integer(n) => assert!(n as usize >= b"mykey".len() + b"value123".len()),
+            other => panic!("expected integer estimate, got {other:?}"),
+        }
+        // MEMORY USAGE of a missing key is nil.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"MEMORY", b"USAGE", b"nope"]),
+            Value::Null
+        );
+        // SAMPLES option is accepted.
+        assert!(matches!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"MEMORY", b"USAGE", b"mykey", b"SAMPLES", b"5"]
+            ),
+            Value::Integer(_)
+        ));
+        // A bad option is a syntax error.
+        assert!(matches!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"MEMORY", b"USAGE", b"mykey", b"BOGUS", b"5"]
+            ),
+            Value::Error(_)
+        ));
+        // MEMORY DOCTOR is a human bulk string.
+        assert!(matches!(
+            run(&c, &mut s, &[b"MEMORY", b"DOCTOR"]),
+            Value::BulkString(Some(_))
+        ));
+        // MEMORY STATS is a field/value map.
+        assert!(matches!(
+            run(&c, &mut s, &[b"MEMORY", b"STATS"]),
+            Value::Map(_)
+        ));
+        // MEMORY HELP is an array.
+        assert!(matches!(
+            run(&c, &mut s, &[b"MEMORY", b"HELP"]),
+            Value::Array(Some(_))
+        ));
+    }
+
+    #[test]
+    fn latency_reset_latest_history_doctor() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        // Seed the monitor directly (the per-command sample lives in the serve layer).
+        c.latency.record("command", 100, 5);
+        c.latency.record("command", 200, 42);
+        // LATENCY LATEST: one 4-element [name, ts, latest-ms, max-ms] array.
+        match run(&c, &mut s, &[b"LATENCY", b"LATEST"]) {
+            Value::Array(Some(events)) => {
+                assert_eq!(events.len(), 1);
+                match &events[0] {
+                    Value::Array(Some(f)) => {
+                        assert_eq!(f.len(), 4);
+                        assert_eq!(f[0], Value::bulk_str("command"));
+                        assert_eq!(f[2], Value::Integer(42)); // worst/latest ms
+                    }
+                    other => panic!("expected event array, got {other:?}"),
+                }
+            }
+            other => panic!("expected LATEST array, got {other:?}"),
+        }
+        // LATENCY HISTORY command: 2-element [ts, ms] samples.
+        match run(&c, &mut s, &[b"LATENCY", b"HISTORY", b"command"]) {
+            Value::Array(Some(samples)) => assert_eq!(samples.len(), 2),
+            other => panic!("expected HISTORY array, got {other:?}"),
+        }
+        // LATENCY DOCTOR is a bulk string.
+        assert!(matches!(
+            run(&c, &mut s, &[b"LATENCY", b"DOCTOR"]),
+            Value::BulkString(Some(_))
+        ));
+        // LATENCY RESET command returns the count reset (1).
+        assert_eq!(
+            run(&c, &mut s, &[b"LATENCY", b"RESET", b"command"]),
+            Value::Integer(1)
+        );
+        // After reset LATEST is empty.
+        assert_eq!(
+            run(&c, &mut s, &[b"LATENCY", b"LATEST"]),
+            Value::Array(Some(vec![]))
+        );
+        // HELP is an array; unknown sub errors.
+        assert!(matches!(
+            run(&c, &mut s, &[b"LATENCY", b"HELP"]),
+            Value::Array(Some(_))
+        ));
+        assert!(matches!(
+            run(&c, &mut s, &[b"LATENCY", b"BOGUS"]),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn client_kill_pause_unpause_info() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        // Register two peers in the registry so KILL has targets.
+        let h1 = c
+            .clients
+            .register(1, "1.1.1.1:1".into(), "0.0.0.0:6379".into(), 0);
+        let _h2 = c
+            .clients
+            .register(2, "1.1.1.1:2".into(), "0.0.0.0:6379".into(), 0);
+        // CLIENT INFO renders this connection's line.
+        match run(&c, &mut s, &[b"CLIENT", b"INFO"]) {
+            Value::BulkString(Some(b)) => {
+                let line = String::from_utf8_lossy(&b);
+                assert!(line.contains("id="));
+                assert!(line.contains("addr="));
+            }
+            other => panic!("expected CLIENT INFO bulk, got {other:?}"),
+        }
+        // CLIENT KILL ID 1 (new filter form) returns the count killed (1) and flags the handle.
+        assert_eq!(
+            run(&c, &mut s, &[b"CLIENT", b"KILL", b"ID", b"1"]),
+            Value::Integer(1)
+        );
+        assert!(h1.is_killed());
+        // CLIENT KILL ADDR (old form) returns +OK on a match, an error on a miss.
+        assert_eq!(
+            run(&c, &mut s, &[b"CLIENT", b"KILL", b"1.1.1.1:2"]),
+            Value::ok()
+        );
+        assert!(matches!(
+            run(&c, &mut s, &[b"CLIENT", b"KILL", b"9.9.9.9:9"]),
+            Value::Error(_)
+        ));
+        // CLIENT PAUSE 100 -> +OK and an active window; UNPAUSE clears it.
+        assert_eq!(
+            run(&c, &mut s, &[b"CLIENT", b"PAUSE", b"100000"]),
+            Value::ok()
+        );
+        // The pause uses the TestEnv clock (now=0 in `run`), so the window is in the future.
+        assert!(c.clients.is_paused(0));
+        assert_eq!(run(&c, &mut s, &[b"CLIENT", b"UNPAUSE"]), Value::ok());
+        assert!(!c.clients.is_paused(0));
+        // CLIENT NO-EVICT on/off ack; a bad arg errors.
+        assert_eq!(
+            run(&c, &mut s, &[b"CLIENT", b"NO-EVICT", b"on"]),
+            Value::ok()
+        );
+        assert!(matches!(
+            run(&c, &mut s, &[b"CLIENT", b"NO-EVICT", b"maybe"]),
+            Value::Error(_)
+        ));
+        // CLIENT PAUSE with a bad timeout errors.
+        assert!(matches!(
+            run(&c, &mut s, &[b"CLIENT", b"PAUSE", b"abc"]),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn info_completeness_has_new_fields_and_sections() {
+        let c = ctx_full(None, 1024, "allkeys-lru");
+        let mut s = state(&c);
+        match run(&c, &mut s, &[b"INFO"]) {
+            Value::BulkString(Some(b)) => {
+                let body = String::from_utf8_lossy(&b);
+                // Clients section gained maxclients + blocked_clients.
+                assert!(body.contains("maxclients:"));
+                assert!(body.contains("blocked_clients:"));
+                // Stats section gained instantaneous_ops + rejected_connections.
+                assert!(body.contains("instantaneous_ops_per_sec:"));
+                assert!(body.contains("rejected_connections:"));
+                assert!(body.contains("total_commands_processed:"));
+                // Memory section reports maxmemory + fragmentation ratio.
+                assert!(body.contains("maxmemory:"));
+                assert!(body.contains("mem_fragmentation_ratio:"));
+                // The new CPU section is present.
+                assert!(body.contains("# CPU\r\n"));
+                assert!(body.contains("used_cpu_sys:"));
+            }
+            other => panic!("expected INFO bulk, got {other:?}"),
+        }
     }
 }

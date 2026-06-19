@@ -15,6 +15,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use ironcache_env::Clock;
 use std::sync::Arc;
 
+/// Operator-introspection state (PROD-7): the SLOWLOG ring, the LATENCY monitor, and the
+/// live-connection registry CLIENT KILL/PAUSE act through. Kept in its own module since each is a
+/// small node-level structure behind one justified lock (off the per-command hot path); see
+/// [`ops`] for the shared-nothing carve-out rationale.
+pub mod ops;
+
+pub use ops::{
+    ClientHandle, ClientRegistry, DEFAULT_SLOWLOG_LOG_SLOWER_THAN, DEFAULT_SLOWLOG_MAX_LEN,
+    LATENCY_COMMAND_FLOOR_MICROS, LatencyMonitor, SlowLog, SlowLogEntry,
+};
+
 /// The IronCache server version reported in `INFO` and `HELLO`. Sourced from the
 /// crate version at build time.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -648,6 +659,26 @@ pub struct EffectiveMemoryConfig<'a> {
     pub maxmemory_policy: &'a str,
 }
 
+/// The extra runtime facts the INFO `# Clients` / `# Stats` / `# CPU` sections render (PROD-7
+/// completeness), read by the caller from the runtime overlay + the connection gate so they
+/// reflect a live `CONFIG SET` and the real connection count. A PLAIN POD so `ironcache-observe`
+/// stays a leaf (the server crate fills it in). All zeros is a valid baseline (the default test
+/// path), so [`Default`] gives the byte-compatible "no extra facts" rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RuntimeStats {
+    /// `maxclients`: the effective simultaneous-connection ceiling (`0` = unlimited).
+    pub maxclients: u64,
+    /// `blocked_clients`: connections blocked on a blocking command. IronCache has no blocking
+    /// commands yet, so this is `0`, but it is sourced here so a future blocking subsystem wires
+    /// it without reshaping the section.
+    pub blocked_clients: u64,
+    /// `instantaneous_ops_per_sec`: a coarse commands-per-second estimate (the rolling delta the
+    /// caller computes off the per-shard `commands_processed` total); `0` before the first sample.
+    pub instantaneous_ops_per_sec: u64,
+    /// `rejected_connections`: connections refused by the `maxclients` gate since boot.
+    pub rejected_connections: u64,
+}
+
 /// The facts the INFO `# Persistence` section renders (durability footgun fix #5), mirroring Redis
 /// `rdb_*` field names so dashboards / `redis_exporter` parse them. Filled by the caller from the
 /// node-level persistence state (last-save time + dirty counter) and the runtime save policy. A
@@ -749,6 +780,9 @@ impl PersistRuntime {
 #[derive(Debug, Default)]
 pub struct ConnectionGate {
     live: AtomicU64,
+    /// Connections REFUSED by the cap since boot (INFO `rejected_connections`, PROD-7). A monotonic
+    /// counter bumped on each `try_admit` that returns `false`; read off the hot path (INFO render).
+    rejected: AtomicU64,
 }
 
 impl ConnectionGate {
@@ -777,6 +811,8 @@ impl ConnectionGate {
         let mut cur = self.live.load(Ordering::Relaxed);
         loop {
             if cur >= maxclients {
+                // Over the cap: count the refusal (INFO `rejected_connections`) and reject.
+                self.rejected.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             match self.live.compare_exchange_weak(
@@ -789,6 +825,13 @@ impl ConnectionGate {
                 Err(observed) => cur = observed,
             }
         }
+    }
+
+    /// The number of connections REFUSED by the cap since boot (INFO `rejected_connections`,
+    /// PROD-7). A single relaxed load, read off the hot path.
+    #[must_use]
+    pub fn rejected(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
     }
 
     /// Record a connection close: decrement the live count (a saturating relaxed `fetch_sub` that
@@ -933,7 +976,7 @@ pub struct KeyspaceDbLine {
 /// string. Lines use `\r\n` and `field:value` exactly as Redis does so existing
 /// parsers work.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn build_info<C: Clock>(
     clock: &C,
     server: &ServerInfo,
@@ -943,6 +986,7 @@ pub fn build_info<C: Clock>(
     replication: &ReplicationInfo,
     persistence: &PersistenceInfo,
     keyspace: &[KeyspaceDbLine],
+    runtime_stats: RuntimeStats,
     section: Option<&str>,
 ) -> String {
     // `write!` into a String never fails; the `let _ =` discards the Result.
@@ -981,7 +1025,12 @@ pub fn build_info<C: Clock>(
         out.push_str("# Clients\r\n");
         let _ = write!(out, "connected_clients:{}\r\n", rolled.connected_clients);
         out.push_str("cluster_connections:0\r\n");
-        out.push_str("blocked_clients:0\r\n");
+        // PROD-7: `maxclients` is the effective connection ceiling (read from the runtime overlay so
+        // a `CONFIG SET maxclients` is reflected); `blocked_clients` is the count blocked on a
+        // blocking command (0 -- no blocking commands yet). Dashboards monitor connection
+        // saturation off `connected_clients` / `maxclients`.
+        let _ = write!(out, "maxclients:{}\r\n", runtime_stats.maxclients);
+        let _ = write!(out, "blocked_clients:{}\r\n", runtime_stats.blocked_clients);
         out.push_str("\r\n");
     }
     if want("memory") {
@@ -1030,6 +1079,19 @@ pub fn build_info<C: Clock>(
             "total_commands_processed:{}\r\n",
             rolled.commands_processed
         );
+        // PROD-7: a coarse commands-per-second estimate (the caller's rolling delta off the
+        // per-shard `commands_processed`) and the count of connections refused by the `maxclients`
+        // gate. Both are operability signals dashboards graph.
+        let _ = write!(
+            out,
+            "instantaneous_ops_per_sec:{}\r\n",
+            runtime_stats.instantaneous_ops_per_sec
+        );
+        let _ = write!(
+            out,
+            "rejected_connections:{}\r\n",
+            runtime_stats.rejected_connections
+        );
         // PR-3b: expired_keys is the rolled-up TTL-reclamation total (active wheel
         // drain + lazy backstop). PR-3a: evicted_keys is the maxmemory-eviction total.
         let _ = write!(out, "expired_keys:{}\r\n", rolled.expired_keys);
@@ -1054,6 +1116,17 @@ pub fn build_info<C: Clock>(
             "cluster_enabled:{}\r\n",
             u8::from(server.cluster_enabled)
         );
+        out.push_str("\r\n");
+    }
+    if want("cpu") {
+        // The `# CPU` section (PROD-7 completeness). Redis reports `used_cpu_sys`/`used_cpu_user`
+        // from getrusage; IronCache does not read the OS clock outside the Env seam (ADR-0003) and
+        // has no rusage seam yet, so it emits the section with `0.0` placeholders -- the SHAPE
+        // dashboards / `redis_exporter` expect, without a false figure. A real CPU accounting seam
+        // is a documented follow-up.
+        out.push_str("# CPU\r\n");
+        out.push_str("used_cpu_sys:0.000000\r\n");
+        out.push_str("used_cpu_user:0.000000\r\n");
         out.push_str("\r\n");
     }
     if want("keyspace") {
@@ -1245,6 +1318,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             None,
         );
         assert!(body.contains("# Server\r\n"));
@@ -1285,6 +1359,7 @@ mod tests {
             &repl(),
             &persistence,
             &[],
+            RuntimeStats::default(),
             Some("persistence"),
         );
         assert!(body.contains("# Persistence\r\n"), "{body}");
@@ -1304,6 +1379,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("persistence"),
         );
         assert!(off.contains("rdb_last_save_time:0\r\n"), "{off}");
@@ -1337,6 +1413,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &keyspace,
+            RuntimeStats::default(),
             Some("keyspace"),
         );
         assert!(body.contains("# Keyspace\r\n"), "{body}");
@@ -1373,6 +1450,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("memory"),
         );
         assert!(
@@ -1404,6 +1482,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             None,
         );
         assert!(body.contains("maxmemory_policy:volatile-ttl\r\n"), "{body}");
@@ -1429,6 +1508,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("memory"),
         );
         assert!(
@@ -1456,6 +1536,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("memory"),
         );
         assert!(body.contains("used_memory:0\r\n"), "{body}");
@@ -1485,6 +1566,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("server"),
         );
         assert!(only_server.contains("# Server\r\n"));
@@ -1504,6 +1586,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("cluster"),
         );
         assert!(only_cluster.contains("# Cluster\r\n"));
@@ -1524,6 +1607,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("server"),
         );
         assert!(body.contains("uptime_in_seconds:90\r\n"), "{body}");
@@ -1543,6 +1627,7 @@ mod tests {
             &ReplicationInfo::standalone(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("replication"),
         );
         assert!(body.contains("# Replication\r\n"), "{body}");
@@ -1582,6 +1667,7 @@ mod tests {
             &repl,
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("replication"),
         );
         assert!(body.contains("role:master\r\n"), "{body}");
@@ -1615,6 +1701,7 @@ mod tests {
             &repl,
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("replication"),
         );
         assert!(body.contains("role:replica\r\n"), "{body}");
@@ -1640,6 +1727,7 @@ mod tests {
             &down,
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("replication"),
         );
         assert!(body.contains("master_link_status:down\r\n"), "{body}");
@@ -1659,6 +1747,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("server"),
         );
         assert!(!only_server.contains("# Replication\r\n"), "{only_server}");
@@ -1671,6 +1760,7 @@ mod tests {
             &repl(),
             &PersistenceInfo::disabled(),
             &[],
+            RuntimeStats::default(),
             Some("replication"),
         );
         assert!(only_repl.contains("# Replication\r\n"), "{only_repl}");

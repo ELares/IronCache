@@ -534,6 +534,35 @@ mod tests {
     }
 
     #[test]
+    fn deny_admin_denies_operability_commands() {
+        // PROD-7: a `+@all -@admin` user is denied the operability/introspection admin commands
+        // (SLOWLOG / MEMORY / LATENCY) and the existing CLIENT/CONFIG, but can still run data
+        // commands. The enforcement layer derives the deny from `category_bits` (tested separately);
+        // here we prove the compiled allow-set denies them.
+        let mut admin = CommandPerms::allcommands();
+        admin.deny_category(Category::Admin);
+        assert!(admin.allows(b"GET"));
+        for cmd in [
+            b"SLOWLOG".as_slice(),
+            b"MEMORY",
+            b"LATENCY",
+            b"CLIENT",
+            b"CONFIG",
+        ] {
+            assert!(!admin.allows(cmd), "{cmd:?} must be denied under -@admin");
+        }
+        // A `+@all -@dangerous` user is denied SLOWLOG (its RESET wipes the log) + CLIENT + CONFIG,
+        // but MEMORY / LATENCY (admin but NOT dangerous) remain allowed.
+        let mut dangerous = CommandPerms::allcommands();
+        dangerous.deny_category(Category::Dangerous);
+        assert!(!dangerous.allows(b"SLOWLOG"));
+        assert!(!dangerous.allows(b"CLIENT"));
+        assert!(!dangerous.allows(b"CONFIG"));
+        assert!(dangerous.allows(b"MEMORY"));
+        assert!(dangerous.allows(b"LATENCY"));
+    }
+
+    #[test]
     fn key_patterns_glob() {
         let mut k = KeyPerms::nokeys();
         k.add_pattern(b"k:*");
