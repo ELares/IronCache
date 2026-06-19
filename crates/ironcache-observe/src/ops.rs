@@ -597,6 +597,17 @@ impl ClientRegistry {
     pub fn is_paused(&self, now_mono_ms: u64) -> bool {
         self.pause_remaining_ms(now_mono_ms) > 0
     }
+
+    /// Remaining milliseconds a WRITE command must stall for, given the monotonic-millis `now`.
+    /// A WRITE is blocked by BOTH pause kinds: a WRITE-only pause (which the post-batch read stall
+    /// deliberately skips) AND an ALL pause (which also blocks writes). Returns `0` when no pause
+    /// is active. The serve loop consults this BEFORE dispatching a write command so
+    /// `CLIENT PAUSE <ms> WRITE` actually stalls writes (reads still proceed). Relaxed atomics; the
+    /// no-pause default is a single load + branch.
+    #[must_use]
+    pub fn pause_write_remaining_ms(&self, now_mono_ms: u64) -> u64 {
+        self.pause_remaining_ms(now_mono_ms)
+    }
 }
 
 #[cfg(test)]

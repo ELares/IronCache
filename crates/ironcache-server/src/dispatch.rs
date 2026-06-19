@@ -2570,11 +2570,13 @@ fn memory_usage<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
     let key = &req.args[2];
     match store.read(db, key, now) {
         Some(v) => {
-            // A deterministic, honest estimate: the key bytes + the value bytes + a fixed per-key
-            // overhead (the robj/dictEntry/SDS-header analog Redis's `objectComputeSize` adds). For
-            // collections the value-bytes figure is the type's serialized span; this is an ESTIMATE,
-            // not an exact allocator figure (documented), but it tracks key + payload growth, which
-            // is what an operator probing a hot key needs.
+            // A deterministic estimate: the key bytes + the string value bytes + a fixed per-key
+            // overhead (the robj/dictEntry/SDS-header analog Redis's `objectComputeSize` adds).
+            // LIMITATION (documented follow-up): for COLLECTION types (list/hash/set/zset) the
+            // value-bytes figure `v.len()` is currently 0 (the string-value view is empty for a
+            // collection), so the estimate reports only the per-key overhead + key bytes and
+            // UNDERCOUNTS collections. String values are counted exactly. Per-type element sizing
+            // (cardinality x element bytes) is tracked for a later pass.
             let est = MEMORY_USAGE_PER_KEY_OVERHEAD + key.len() as u64 + v.len() as u64;
             Value::Integer(est as i64)
         }

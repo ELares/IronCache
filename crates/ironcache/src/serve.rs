@@ -1312,16 +1312,19 @@ async fn serve_connection(
             break;
         }
 
-        // CLIENT PAUSE (PROD-7): if a `CLIENT PAUSE [ALL]` window is active, stall this connection's
+        // CLIENT PAUSE (PROD-7): if a `CLIENT PAUSE` window is active, stall this connection's
         // command processing until it elapses (or is UNPAUSEd). The deadline basis is the Env
-        // monotonic clock (the same basis CLIENT PAUSE recorded). A WRITE-only pause does NOT stall
-        // here (it gates writes elsewhere); only an ALL pause holds the loop. The default (no pause)
-        // reads one relaxed atomic and falls through, byte-unchanged. We re-check in a short timer
-        // loop so an UNPAUSE / a kill takes effect promptly.
+        // monotonic clock (the same basis CLIENT PAUSE recorded). Both ALL and WRITE-only pauses
+        // hold the loop here: a WRITE-only pause is enforced as a CONSERVATIVE SUPERSET (it stalls
+        // all command processing for the window, so it never silently fails to pause a write -- the
+        // operator's intent during a failover is honored), at the cost of also stalling reads.
+        // Precise per-command write-only gating that lets reads proceed is a documented follow-up.
+        // The default (no pause) reads one relaxed atomic and falls through, byte-unchanged. We
+        // re-check in a short timer loop so an UNPAUSE / a kill takes effect promptly.
         loop {
             let now_mono_ms = env.borrow().now().as_millis();
             let remaining = ctx.clients.pause_remaining_ms(now_mono_ms);
-            if remaining == 0 || ctx.clients.pause_is_writes_only() {
+            if remaining == 0 {
                 break;
             }
             if client_handle.is_killed() {
@@ -4154,6 +4157,12 @@ fn record_slow_command(
     // everything; a positive value logs only commands at/above it.
     if micros >= u64::try_from(threshold_micros).unwrap_or(0) {
         let raw_args: Vec<Vec<u8>> = request.args.iter().map(|a| a.to_vec()).collect();
+        // SECRET-LEAK FIX: SLOWLOG entries are readable by any @admin via `SLOWLOG GET`, and with
+        // `slowlog-log-slower-than 0` EVERY command (including auth) is logged. Redact the secret
+        // args of auth/password-setting commands BEFORE they enter the ring, so a password never
+        // sits in the slow log in cleartext (Redis applies the same per-command sensitive-arg rule).
+        let cmd_upper = ascii_upper(request.command());
+        let raw_args = redact_args_for_slowlog(&cmd_upper, raw_args);
         ctx.slowlog.record(
             unix_secs,
             micros,
@@ -4168,6 +4177,77 @@ fn record_slow_command(
     if micros >= ironcache_observe::LATENCY_COMMAND_FLOOR_MICROS {
         ctx.latency.record("command", unix_secs, micros / 1000);
     }
+}
+
+/// The placeholder a redacted SLOWLOG argument is replaced with (Redis convention).
+const SLOWLOG_REDACTED: &[u8] = b"(redacted)";
+
+/// Redact the secret arguments of `args` (the verbatim request, `args[0]` = command) for a
+/// SLOWLOG entry, based on the UPPERCASED command `cmd_upper`. Returns the (possibly rewritten)
+/// argument vector; non-sensitive commands are returned UNCHANGED.
+///
+/// This runs ONLY inside [`record_slow_command`], i.e. only for a command already deemed slow,
+/// so it is off the hot path. It mirrors the Redis per-command sensitive-arg rule:
+/// - `AUTH`: every arg after the verb is the credential (`AUTH pass` or `AUTH user pass`); redact
+///   all of them. (Redis only redacts the password; redacting every post-verb arg is a strict
+///   superset that can never leak the password and never reveals a username either.)
+/// - `HELLO`: redact the two args following an `AUTH` token (the username and password).
+/// - `CONFIG SET`: when the parameter (arg2, case-insensitive) is `requirepass` or `masterauth`,
+///   redact its value (arg3).
+/// - `ACL SETUSER`: redact every password/hash rule token (`>`/`<`/`#`/`!`) via the shared
+///   [`ironcache_server::acl::redacted_rule`] so the redaction matches the ACL error reply.
+fn redact_args_for_slowlog(cmd_upper: &[u8], mut args: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    match cmd_upper {
+        b"AUTH" => {
+            // Redact every arg after the verb (the credential(s)).
+            for a in args.iter_mut().skip(1) {
+                *a = SLOWLOG_REDACTED.to_vec();
+            }
+        }
+        b"HELLO" => {
+            // Redact the (user, pass) pair following an AUTH token, wherever it sits.
+            let mut i = 1;
+            while i < args.len() {
+                if args[i].eq_ignore_ascii_case(b"AUTH") {
+                    for a in args.iter_mut().skip(i + 1).take(2) {
+                        *a = SLOWLOG_REDACTED.to_vec();
+                    }
+                    break;
+                }
+                i += 1;
+            }
+        }
+        b"CONFIG" => {
+            // CONFIG SET <param> <value> [<param> <value> ...]: redact the value of every
+            // requirepass/masterauth pair (case-insensitive param match).
+            if args.len() >= 2 && args[1].eq_ignore_ascii_case(b"SET") {
+                let mut i = 2;
+                while i + 1 < args.len() {
+                    if args[i].eq_ignore_ascii_case(b"requirepass")
+                        || args[i].eq_ignore_ascii_case(b"masterauth")
+                    {
+                        args[i + 1] = SLOWLOG_REDACTED.to_vec();
+                    }
+                    i += 2;
+                }
+            }
+        }
+        b"ACL" => {
+            // ACL SETUSER <name> <rule>...: redact each password/hash rule token, reusing the
+            // canonical ACL redactor so SLOWLOG and the ACL error reply never drift.
+            if args.len() >= 3 && args[1].eq_ignore_ascii_case(b"SETUSER") {
+                for a in args.iter_mut().skip(3) {
+                    let token = String::from_utf8_lossy(a);
+                    let redacted = ironcache_server::acl::redacted_rule(&token);
+                    if redacted != token {
+                        *a = redacted.into_bytes();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    args
 }
 
 /// Encode `value` and append the bytes to `out`. PR-1 encodes into a fresh
