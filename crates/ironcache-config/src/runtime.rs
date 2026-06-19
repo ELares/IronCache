@@ -80,6 +80,16 @@ pub struct RuntimeConfig {
     /// of a Redis `save <seconds> <changes>` point). `0` fires unconditionally on each enabled
     /// tick. Runtime-settable via `CONFIG SET save` (paired with [`Self::save_interval_secs`]).
     save_min_changes: AtomicU64,
+    /// The simultaneous-connection ceiling (Redis `maxclients`, PROD-SAFETY #3). `0` disables the
+    /// cap. Runtime-settable via `CONFIG SET maxclients`; the accept path reads it (one relaxed
+    /// load) when deciding whether to reject a new connection, so a `CONFIG SET maxclients` takes
+    /// effect for subsequent connections without a restart. Seeded from the boot config.
+    maxclients: AtomicU64,
+    /// The per-connection output-buffer hard cap in bytes (PROD-SAFETY #5). `0` disables the cap.
+    /// Runtime-settable via `CONFIG SET output-buffer-limit`; the serve loop reads it (one relaxed
+    /// load) after each batch is rendered, so a `CONFIG SET` takes effect for subsequent batches.
+    /// Seeded from the boot config.
+    output_buffer_limit: AtomicU64,
 }
 
 /// The string-valued runtime params guarded by [`RuntimeConfig`]'s lock. Grouped
@@ -118,6 +128,11 @@ impl RuntimeConfig {
             // `CONFIG SET save` then overrides these LIVE (the periodic saver reads them each tick).
             save_interval_secs: AtomicU64::new(cfg.save_interval_secs),
             save_min_changes: AtomicU64::new(cfg.save_min_changes),
+            // The connection / output-buffer safety ceilings (PROD-SAFETY #3/#5), seeded from the
+            // boot config so a node started with a configured value keeps it; a later `CONFIG SET`
+            // overrides these live (the accept path / serve loop read them with a relaxed load).
+            maxclients: AtomicU64::new(cfg.maxclients),
+            output_buffer_limit: AtomicU64::new(cfg.output_buffer_limit),
         })
     }
 
@@ -244,6 +259,36 @@ impl RuntimeConfig {
     #[must_use]
     pub fn has_save_policy(&self) -> bool {
         self.save_interval_secs.load(Ordering::Relaxed) > 0
+    }
+
+    /// The current effective `maxclients` ceiling (PROD-SAFETY #3); `0` disables the cap. A
+    /// single relaxed atomic load: the per-connection ACCEPT path reads it once when deciding
+    /// whether to reject a new connection (a cold accept-path read, NOT per command).
+    #[must_use]
+    pub fn maxclients(&self) -> u64 {
+        self.maxclients.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET maxclients <n>`: store the new connection ceiling (a relaxed atomic store);
+    /// `0` disables the cap. The accept path reads `maxclients()` directly per new connection, so
+    /// the new value applies to subsequent connections without a restart (PROD-SAFETY #3).
+    pub fn set_maxclients(&self, n: u64) {
+        self.maxclients.store(n, Ordering::Relaxed);
+    }
+
+    /// The current effective per-connection output-buffer hard cap in bytes (PROD-SAFETY #5);
+    /// `0` disables the cap. A single relaxed atomic load: the serve loop reads it after each
+    /// rendered batch (off the per-command decode/dispatch hot path).
+    #[must_use]
+    pub fn output_buffer_limit(&self) -> u64 {
+        self.output_buffer_limit.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET output-buffer-limit <bytes>`: store the new per-connection output-buffer cap
+    /// (a relaxed atomic store); `0` disables it. The serve loop reads `output_buffer_limit()`
+    /// after each rendered batch, so the new value applies to subsequent batches (PROD-SAFETY #5).
+    pub fn set_output_buffer_limit(&self, bytes: u64) {
+        self.output_buffer_limit.store(bytes, Ordering::Relaxed);
     }
 
     /// `CONFIG SET save "<seconds> <changes> [...]"`: REPLACE the runtime save policy (#58

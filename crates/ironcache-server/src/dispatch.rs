@@ -189,6 +189,24 @@ pub struct ServerContext {
     /// so this crate holds it without depending on the binary above it. `None` renders the honest
     /// persistence-disabled section (last-save 0, empty policy).
     pub persist_stats: Option<Arc<ironcache_observe::PersistRuntime>>,
+    /// The process-GLOBAL allocator-memory gauge (PROD-SAFETY #1/#2): the latest jemalloc
+    /// `used_memory` / `used_memory_rss` figures, published OFF the hot path by the binary's
+    /// periodic expiry tick and read by the maxmemory admission gate so the over-limit DECISION
+    /// is driven off REAL process memory against the FULL `maxmemory` (protecting the HOST from
+    /// OOM, not a logical fiction that undercounts ~2x), rather than only the per-shard logical
+    /// counter against the even-split per-shard budget. Shared by `Arc` onto every shard's
+    /// context; one relaxed load on the eviction path, never per command. When the figure is `0`
+    /// (no allocator to query / nothing published yet) the gate falls back to the per-shard
+    /// logical counter, so the default and test paths are byte-unchanged.
+    pub process_memory: Arc<ironcache_observe::ProcessMemoryGauge>,
+    /// The process-GLOBAL live-connection gate (PROD-SAFETY #3, the `maxclients` connection-
+    /// exhaustion DoS fix): ONE per node, shared by `Arc` onto every shard's accept path. The
+    /// per-connection serve loop calls `try_admit(maxclients)` at the TOP of the connection (a cold
+    /// accept-path check, never per command) and rejects a connection over the cap with `-ERR max
+    /// number of clients reached`, releasing the slot on close. The cap is read from the runtime
+    /// overlay (`maxclients`), so `0` disables it (unlimited, the pre-fix behavior) and a
+    /// `CONFIG SET maxclients` takes effect for subsequent connections.
+    pub conn_gate: Arc<ironcache_observe::ConnectionGate>,
 }
 
 impl ServerContext {
@@ -226,6 +244,72 @@ impl ServerContext {
     #[must_use]
     pub fn ceiling_enabled(&self) -> bool {
         self.maxmemory() > 0
+    }
+
+    /// Whether the node is OVER its `maxmemory` ceiling, driving the admission decision off the
+    /// REAL allocator figure rather than only the per-shard LOGICAL counter (PROD-SAFETY #1/#2).
+    ///
+    /// The caller passes `shard_logical_used` (this shard's `store.used_memory()`). The decision is
+    /// the OR of two tests, so the ceiling protects the HOST:
+    ///
+    /// 1. PROCESS-GLOBAL allocator trigger (the host-OOM fix): if a live allocator `used_memory`
+    ///    figure has been published, compare it against the FULL `maxmemory`. This is the real
+    ///    process memory (the same figure INFO reports), which the logical counter undercounts by
+    ///    ~2x (slab slack, table overhead) -- so this is what actually bounds RSS. It is also
+    ///    PROCESS-GLOBAL (vs the even per-shard split), so a HOT shard sheds when the NODE is over
+    ///    the limit even if that shard's individual even-split budget is not exceeded
+    ///    (PROD-SAFETY #2 global trigger). Strict `>` matches Redis `getMaxmemoryState`
+    ///    (under-limit at `used <= maxmemory`).
+    /// 2. PER-SHARD logical fallback: the prior behavior (this shard's logical bytes vs its
+    ///    even-split per-shard budget). Retained so that when NO allocator figure is available
+    ///    (the system-allocator / MSVC build, or before the first publish, or in unit tests with a
+    ///    zeroed gauge) the gate behaves EXACTLY as before -- the default/test path is
+    ///    byte-unchanged -- and so a per-shard logical overshoot still triggers eviction even
+    ///    between allocator-figure refreshes.
+    ///
+    /// Either single relaxed atomic load is off the per-command path (only a `denyoom` write while
+    /// the ceiling is enabled reaches here), so this adds no steady-state per-command cost.
+    #[must_use]
+    pub fn over_maxmemory(&self, shard_logical_used: u64) -> bool {
+        let max = self.maxmemory();
+        if max == 0 {
+            return false;
+        }
+        // (1) the global allocator figure vs the FULL ceiling (the host-protecting trigger).
+        let allocator_used = self.process_memory.used_memory();
+        if allocator_used > 0 && allocator_used > max {
+            return true;
+        }
+        // (2) the per-shard logical fallback vs the even-split budget (the byte-unchanged path).
+        shard_logical_used > self.per_shard_budget()
+    }
+
+    /// Whether this shard's LOGICAL bytes still exceed its even-split per-shard budget -- the
+    /// cache-mode POST-eviction -OOM decision (M1). Unlike [`Self::over_maxmemory`], this reads ONLY
+    /// the per-shard logical counter the shard just acted on; it does NOT consult the process-global
+    /// allocator gauge.
+    ///
+    /// ## Why the cache-mode decision must NOT use the global gauge (M1)
+    ///
+    /// The global allocator gauge is refreshed only on the ~100ms expiry tick (it advances the
+    /// jemalloc epoch). Eviction frees LOGICAL bytes immediately, but the gauge -- and the
+    /// allocator's resident pages, which it may hold after a free -- do NOT drop within the command.
+    /// If the cache-mode post-eviction re-check used [`Self::over_maxmemory`] (which ORs the
+    /// stale-high global gauge), a write that eviction LOGICALLY satisfied would still be spuriously
+    /// `-OOM`'d for up to ~100ms near the ceiling, diverging from Redis (an evicting policy clears
+    /// OOM WITHIN the command). So the cache-mode per-command -OOM decision is driven here, off the
+    /// fresh per-shard logical figure: a successful eviction (logical now <= budget) ALLOWS the
+    /// write. The global gauge still TRIGGERS eviction via [`Self::over_maxmemory`] (so the node
+    /// keeps evicting to work RSS down over ticks); it just must not -OOM a logically-satisfied
+    /// write. NOEVICTION keeps [`Self::over_maxmemory`]'s global gauge as the HARD CEILING (no
+    /// eviction can clear it, so a denyoom write -OOMs when global RSS > maxmemory -- correct).
+    ///
+    /// Strict `>` matches the trigger's getMaxmemoryState semantics (`used <= budget` is under
+    /// limit). `0` budget (maxmemory disabled) is never over.
+    #[must_use]
+    pub fn over_per_shard_budget(&self, shard_logical_used: u64) -> bool {
+        let budget = self.per_shard_budget();
+        budget > 0 && shard_logical_used > budget
     }
 
     /// HOW the cluster's slot map is governed (HA-4c): the boot `cluster_mode`. The DEFAULT is
@@ -745,21 +829,38 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
     // cross-shard remote path the gate runs against the OWNING shard's budget (the shard
     // holding the key owns its share of the maxmemory ceiling).
     if ctx.ceiling_enabled() && is_denyoom(cmd) {
-        // The per-shard budget is recomputed from the CURRENT runtime maxmemory (a
-        // cheap atomic load divided by the shard count), so a `CONFIG SET maxmemory`
-        // tightens/loosens every shard's gate on its next denyoom write (PR-4b).
-        let budget = ctx.per_shard_budget();
-        if store.used_memory() > budget {
+        // OVER-LIMIT TRIGGER off the REAL allocator figure, not only the logical counter
+        // (PROD-SAFETY #1/#2). `over_maxmemory` ORs (a) the PROCESS-GLOBAL allocator `used_memory`
+        // vs the FULL `maxmemory` -- the figure that actually bounds RSS (the logical counter
+        // undercounts ~2x via slab slack / table overhead, so it could let the host OOM), and
+        // PROCESS-GLOBAL so a HOT shard sheds when the NODE is over even if its even-split budget
+        // is not -- with (b) the prior per-shard logical-vs-budget test as the byte-unchanged
+        // fallback when no allocator figure is available (system-allocator / MSVC / tests). Both
+        // are cheap relaxed loads, only on a `denyoom` write while the ceiling is on.
+        if ctx.over_maxmemory(store.used_memory()) {
             if store.policy_evicts() {
-                // Cache mode: try to free space, then re-check. If eviction cannot get
-                // us down to budget (write outruns eviction, or only ineligible keys
-                // remain), reject -OOM. The freed count is reported for INFO.
-                deltas.evicted += store.evict_to_fit(budget, now);
-                if store.used_memory() > budget {
+                // CACHE / EVICTING MODE (M1). The global gauge TRIGGERED eviction above (so the node
+                // keeps shedding to work RSS down over ticks even when a hot shard's own even-split
+                // budget is not exceeded). The eviction TARGET is this shard's even-split per-shard
+                // budget (eviction-locality: a shard can only evict its OWN keys, COORDINATOR.md
+                // #107). The per-command -OOM DECISION, however, is driven off the FRESH per-shard
+                // LOGICAL figure (`over_per_shard_budget`), NOT the global gauge: the gauge is
+                // ~100ms-stale (refreshed on the expiry tick) and the allocator may hold freed pages,
+                // so re-checking the global gauge here would spuriously -OOM a write that eviction
+                // LOGICALLY satisfied -- diverging from Redis, where an evicting policy clears OOM
+                // within the command. So a successful eviction (logical now <= budget) ALLOWS the
+                // write; only when eviction could NOT free enough (the write outruns it, or only
+                // ineligible keys remain) does the shard remain logically over budget and -OOM. The
+                // freed count is reported for INFO.
+                deltas.evicted += store.evict_to_fit(ctx.per_shard_budget(), now);
+                if ctx.over_per_shard_budget(store.used_memory()) {
                     return Value::error(ErrorReply::oom());
                 }
             } else {
-                // Strict datastore / noeviction: -OOM is the over-capacity behavior.
+                // STRICT DATASTORE / NOEVICTION MODE. No eviction can clear the pressure, so the
+                // global RSS gauge inside `over_maxmemory` stands as the HARD CEILING: a denyoom
+                // write -OOMs whenever the node is over (global RSS > maxmemory, or the per-shard
+                // logical fallback over budget). -OOM is the over-capacity behavior.
                 return Value::error(ErrorReply::oom());
             }
         }
@@ -1950,6 +2051,8 @@ mod tests {
             in_sync_replicas: None,
             metrics_registry: None,
             persist_stats: None,
+            process_memory: std::sync::Arc::new(ironcache_observe::ProcessMemoryGauge::new()),
+            conn_gate: std::sync::Arc::new(ironcache_observe::ConnectionGate::new()),
             boot,
         }
     }
@@ -3417,6 +3520,92 @@ mod tests {
         }
     }
 
+    /// PROD-SAFETY #1/#2: the over-limit DECISION is driven off the PROCESS-GLOBAL allocator figure
+    /// (the gauge), not only the per-shard logical counter. With the gauge reporting memory ABOVE
+    /// `maxmemory`, `over_maxmemory` is true EVEN when this shard's logical `used` is well below its
+    /// per-shard budget (the host-OOM / hot-shard fixes); with the gauge at or below `maxmemory`
+    /// (and the shard logically under budget) it is false; and with the gauge UNAVAILABLE (0) it
+    /// falls back to the per-shard logical-vs-budget test (byte-unchanged).
+    #[test]
+    fn over_maxmemory_uses_the_global_allocator_figure() {
+        // maxmemory == 1000 (single shard, so per_shard_budget == 1000).
+        let c = ctx_with_budget(1000);
+        assert_eq!(c.per_shard_budget(), 1000);
+
+        // (a) Gauge ABOVE maxmemory -> OVER, regardless of the shard's tiny logical figure. This is
+        // the host-protecting trigger: the real allocator figure (which undercounts ~2x as the
+        // logical counter, so the logical 10 here is a fiction vs a real 2000 bytes) drives the
+        // decision against the FULL maxmemory.
+        c.process_memory.publish(2000, 4096);
+        assert!(
+            c.over_maxmemory(10),
+            "global allocator figure over maxmemory must trigger even with tiny shard-logical bytes"
+        );
+
+        // (b) Gauge AT/under maxmemory AND shard under its per-shard budget -> NOT over.
+        c.process_memory.publish(500, 1024);
+        assert!(
+            !c.over_maxmemory(10),
+            "under the ceiling on both the global figure and the per-shard logical counter"
+        );
+        // ... but a per-shard logical OVERSHOOT still triggers (the fallback test still fires even
+        // when the global figure is calm, so a local overshoot between gauge refreshes is caught).
+        assert!(
+            c.over_maxmemory(1001),
+            "per-shard logical over budget still triggers regardless of the global figure"
+        );
+
+        // (c) Gauge UNAVAILABLE (0, the system-allocator / pre-publish / MSVC case) -> fall back to
+        // the per-shard logical-vs-budget test ONLY (byte-unchanged default behavior).
+        c.process_memory.publish(0, 0);
+        assert!(
+            !c.over_maxmemory(1000),
+            "used == budget is under-limit (strict >)"
+        );
+        assert!(
+            c.over_maxmemory(1001),
+            "used > budget triggers via the logical fallback"
+        );
+
+        // maxmemory == 0 (disabled) is never over, whatever the gauge says.
+        let off = ctx_with_budget(0);
+        off.process_memory.publish(9_999_999, 9_999_999);
+        assert!(!off.over_maxmemory(9_999_999));
+    }
+
+    /// PROD-SAFETY #1/#2: end-to-end through the admission gate -- with the allocator gauge over
+    /// `maxmemory`, a `denyoom` write triggers eviction (cache mode) off the GLOBAL figure even
+    /// though this shard's logical bytes are under its per-shard budget, and is OOM'd under
+    /// `noeviction`. The pre-fix code never looked at the allocator figure, so this write would
+    /// have sailed through and let the host OOM.
+    #[test]
+    fn admission_gate_triggers_off_global_allocator_figure() {
+        // Strict (noeviction) mode so the trigger surfaces as a clean -OOM (no eviction noise).
+        let c = ctx_full(None, 1000, "noeviction");
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::NoEviction);
+        let t = UnixMillis(0);
+        // The shard is logically near-empty (one tiny key, well under the 1000-byte budget), so the
+        // OLD per-shard-logical gate would NOT trigger.
+        let (r0, _) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v"]);
+        assert_eq!(r0, Value::ok());
+        assert!(st.used_memory() < 1000, "shard is logically under budget");
+        // But the PROCESS allocator figure is over maxmemory (the ~2x undercount the logical
+        // counter hides): a denyoom write is now rejected -OOM off the GLOBAL trigger.
+        c.process_memory.publish(5000, 8192);
+        let (r1, _) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k2", b"v2"]);
+        assert_eq!(
+            err_of(r1),
+            "-OOM command not allowed when used memory > 'maxmemory'.",
+            "the global allocator figure over maxmemory must OOM a denyoom write even when the \
+             shard is logically under its per-shard budget"
+        );
+        // Once the allocator figure drops back under the ceiling, writes are served again.
+        c.process_memory.publish(100, 512);
+        let (r2, _) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k3", b"v3"]);
+        assert_eq!(r2, Value::ok());
+    }
+
     #[test]
     fn noeviction_over_budget_rejects_denyoom_write_with_byte_exact_oom() {
         // Strict datastore mode: a denyoom write at/over the budget gets the exact
@@ -3582,6 +3771,130 @@ mod tests {
         assert_eq!(
             run_on(&c, &mut s, &mut st, t, &[b"GET", b"new"]),
             Value::BulkString(Some(Bytes::copy_from_slice(&val)))
+        );
+    }
+
+    #[test]
+    fn cache_mode_eviction_clears_oom_even_with_a_stale_high_global_gauge() {
+        // M1 REGRESSION GUARD: in cache/evicting mode, the per-command -OOM decision is driven off
+        // the FRESH per-shard LOGICAL figure after eviction, NOT the ~100ms-stale process-global
+        // allocator gauge. With the gauge pinned ABOVE maxmemory (the near-ceiling case where the
+        // gauge has not refreshed and the allocator may still hold freed pages), a denyoom write
+        // must STILL SUCCEED once eviction frees logical room -- matching Redis (an evicting policy
+        // clears OOM within the command). Pre-M1, the post-eviction re-check used `over_maxmemory`,
+        // which ORs the stale-high gauge, so this write was spuriously -OOM'd.
+        let c = ctx_with_budget(300);
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::cache_default());
+        let t = UnixMillis(0);
+        let val = vec![b'v'; 100];
+        // Fill past the 300-byte budget so the next write must evict to fit.
+        for i in 0u32..5 {
+            run_admit(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("k{i}").as_bytes(), &val],
+            );
+        }
+        assert!(st.used_memory() >= 300, "over budget after the fills");
+        // Pin the GLOBAL gauge ABOVE maxmemory and keep it there: it never refreshes during this
+        // command (it would only move on the next ~100ms expiry tick). This is the stale-high
+        // near-ceiling condition that pre-M1 spuriously -OOM'd.
+        c.process_memory.publish(5000, 8192);
+        assert!(
+            c.over_maxmemory(st.used_memory()),
+            "the global gauge is over maxmemory (the stale-high trigger condition)"
+        );
+        // The denyoom write triggers eviction (off the global gauge) and -- the M1 fix -- is then
+        // ALLOWED because eviction got the per-shard LOGICAL figure under budget (the post-eviction
+        // -OOM decision now reads the FRESH per-shard logical figure, not the stale-high global
+        // gauge that still reads over). Pre-M1 this write was spuriously -OOM'd.
+        let (r, ev) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"new", &val]);
+        assert_eq!(
+            r,
+            Value::ok(),
+            "cache mode must serve the write after eviction frees logical room, despite the \
+             stale-high global gauge"
+        );
+        assert!(ev > 0, "eviction must have run to make room");
+        // The global gauge is STILL stale-high (it never moved during the command): proof the
+        // success was driven off the per-shard logical figure, not the global gauge.
+        assert!(
+            c.over_maxmemory(st.used_memory()),
+            "the global gauge is still over (it only refreshes on the next tick); the write \
+             succeeded off the per-shard logical figure, not this gauge"
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"new"]),
+            Value::BulkString(Some(Bytes::copy_from_slice(&val)))
+        );
+    }
+
+    #[test]
+    fn cache_mode_oom_when_eviction_cannot_free_enough_logical_room() {
+        // M1 companion: cache mode STILL -OOMs when eviction CANNOT get the per-shard logical figure
+        // under budget. Under `volatile-lru` ONLY TTL-bearing keys are evictable; with the store
+        // full of NON-TTL keys nothing is evictable, so a denyoom write over budget evicts nothing,
+        // the post-eviction per-shard-logical check stays over budget, and the write is correctly
+        // -OOM'd (Redis `volatile-*` with no expirable key). This is the "eviction could not free
+        // enough" branch, decided off the per-shard logical figure (not the global gauge).
+        let c = ctx_full(None, 300, "volatile-lru");
+        let mut s = state(&c);
+        let mut st = store_with(
+            c.databases,
+            map_policy_name("volatile-lru", 1).expect("volatile-lru maps"),
+        );
+        assert!(
+            st.policy_evicts(),
+            "volatile-lru is an evicting (cache) policy"
+        );
+        let t = UnixMillis(0);
+        let val = vec![b'v'; 100];
+        // Fill past the 300-byte budget with NON-TTL keys (no EX), so none are evictable.
+        for i in 0u32..5 {
+            run_admit(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SET", format!("k{i}").as_bytes(), &val],
+            );
+        }
+        assert!(st.used_memory() >= 300, "over budget with non-TTL keys");
+        // A denyoom write triggers eviction, but nothing is evictable (no TTL keys), so the shard
+        // stays logically over budget and the write is -OOM'd.
+        let (r, ev) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"new", &val]);
+        assert_eq!(ev, 0, "no TTL-bearing key is evictable under volatile-lru");
+        assert_eq!(
+            err_of(r),
+            "-OOM command not allowed when used memory > 'maxmemory'.",
+            "cache mode -OOMs when eviction cannot bring the per-shard logical figure under budget"
+        );
+    }
+
+    #[test]
+    fn noeviction_global_rss_gauge_is_the_hard_ceiling() {
+        // M1 companion (the NOEVICTION half stays the global-RSS hard ceiling): with the shard
+        // logically UNDER its per-shard budget but the process-global allocator gauge OVER maxmemory,
+        // a denyoom write under `noeviction` is -OOM'd off the global gauge (no eviction can clear
+        // it). This is the host-OOM protection the global trigger exists for, and M1 leaves it
+        // intact (M1 only changed the CACHE-mode post-eviction decision).
+        let c = ctx_full(None, 1000, "noeviction");
+        let mut s = state(&c);
+        let mut st = store_with(c.databases, Policy::NoEviction);
+        let t = UnixMillis(0);
+        let (r0, _) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v"]);
+        assert_eq!(r0, Value::ok());
+        assert!(st.used_memory() < 1000, "shard is logically under budget");
+        // Global gauge over maxmemory while the shard is logically lean: -OOM (hard ceiling).
+        c.process_memory.publish(5000, 8192);
+        let (r1, _) = run_admit(&c, &mut s, &mut st, t, &[b"SET", b"k2", b"v2"]);
+        assert_eq!(
+            err_of(r1),
+            "-OOM command not allowed when used memory > 'maxmemory'.",
+            "noeviction keeps the global RSS gauge as the hard ceiling"
         );
     }
 

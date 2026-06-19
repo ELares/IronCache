@@ -163,6 +163,10 @@ pub async fn run_drain_loop(
     // builds the `ShardState` (whose `ShardCounters` must wrap the adopted cell). A no-op when
     // the `/metrics` endpoint is disabled (`metrics_registry` is `None`).
     crate::serve::adopt_metrics_cell(ctx.metrics_registry.as_ref(), shard_index);
+    // Adopt the shared process-global allocator-memory gauge (PROD-SAFETY #1/#2) at shard boot so a
+    // key-owning shard's expiry tick publishes the live jemalloc figure even if it never accepts a
+    // connection. A no-op once adopted; the figure feeds the maxmemory admission gate.
+    crate::serve::adopt_process_memory_gauge(&ctx.process_memory);
     crate::serve::ensure_shard_started(
         ctx.databases,
         ctx.info.maxmemory_policy,

@@ -727,6 +727,159 @@ impl PersistRuntime {
     }
 }
 
+/// A process-GLOBAL live-connection counter + ceiling (PROD-SAFETY #3, the `maxclients`
+/// connection-exhaustion DoS fix). ONE per node, shared by `Arc` onto every shard's accept path.
+///
+/// ## Why it exists
+///
+/// The accept loop previously NEVER rejected a connection, so an attacker (or a misbehaving
+/// client pool) could open unlimited connections and exhaust file descriptors / memory. This gate
+/// tracks the live connection count and lets the accept path REJECT a new connection once the
+/// count is at the configured `maxclients` ceiling, matching Redis's `-ERR max number of clients
+/// reached`. The per-shard `connected_clients` metric is a separate per-shard gauge (for INFO /
+/// `/metrics`); this is the ONE process-global count the cap is enforced against, because the cap
+/// is a NODE-level limit, not a per-shard one.
+///
+/// ## Cost
+///
+/// One relaxed atomic `fetch_add` on accept (a COLD path: once per connection, not per command)
+/// and one relaxed `fetch_sub` on close. The ceiling is read from the runtime overlay
+/// (`maxclients`) on accept; `0` disables the cap (unlimited, the pre-fix behavior). The count is
+/// shared-nothing-friendly: it is a single atomic, never a lock, and never touched per command.
+#[derive(Debug, Default)]
+pub struct ConnectionGate {
+    live: AtomicU64,
+}
+
+impl ConnectionGate {
+    /// A fresh gate with zero live connections.
+    #[must_use]
+    pub fn new() -> Self {
+        ConnectionGate::default()
+    }
+
+    /// Try to ADMIT a new connection against the `maxclients` ceiling (PROD-SAFETY #3). When
+    /// `maxclients == 0` the cap is disabled and this ALWAYS admits (incrementing the live count),
+    /// the pre-fix behavior. Otherwise it admits iff the current live count is BELOW `maxclients`:
+    /// on admit it increments and returns `true`; at/over the cap it returns `false` WITHOUT
+    /// incrementing (the caller writes `-ERR max number of clients reached` and closes the socket).
+    ///
+    /// The check + increment is a single CAS loop so two concurrent accepts (across shards) can
+    /// never both squeeze past the cap. Uncontended in practice (accepts are rare relative to
+    /// commands), so the loop runs once.
+    pub fn try_admit(&self, maxclients: u64) -> bool {
+        if maxclients == 0 {
+            // Cap disabled: admit unconditionally, but still track the live count so a later
+            // `CONFIG SET maxclients` enforces against an accurate number.
+            self.live.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        let mut cur = self.live.load(Ordering::Relaxed);
+        loop {
+            if cur >= maxclients {
+                return false;
+            }
+            match self.live.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Record a connection close: decrement the live count (a saturating relaxed `fetch_sub` that
+    /// never underflows). Called once per ADMITTED connection when it ends (a rejected connection
+    /// was never counted, so it is NOT released here).
+    pub fn release(&self) {
+        let mut cur = self.live.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self
+                .live
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// The current live connection count (a single relaxed load). For tests / introspection.
+    #[must_use]
+    pub fn live(&self) -> u64 {
+        self.live.load(Ordering::Relaxed)
+    }
+}
+
+/// A process-GLOBAL allocator-memory gauge (PROD-SAFETY #1/#2): the latest jemalloc
+/// `stats.allocated` (the `used_memory` analog) and `stats.resident` (RSS) figures, as two
+/// lock-free atomics. ONE per node, shared by `Arc` onto every shard's server context.
+///
+/// ## Why it exists (the host-OOM fix)
+///
+/// The maxmemory eviction trigger previously compared a per-shard LOGICAL key+value byte
+/// counter against the per-shard budget. The logical figure UNDERCOUNTS true process memory
+/// (slab slack, table overhead) by roughly 2x, so a node configured `maxmemory 4gb` could use
+/// ~8gb RSS and OOM-kill the host: the ceiling protected a fiction, not the host. This gauge
+/// carries the REAL allocator figure (the same one INFO `used_memory` / `used_memory_rss`
+/// report) into the admission gate so the over-limit DECISION is driven off actual process
+/// memory, and against the FULL `maxmemory` (a PROCESS-GLOBAL trigger, so a HOT shard sheds
+/// even when its even-split per-shard budget is not individually exceeded -- PROD-SAFETY #2).
+///
+/// ## Why this is NOT new per-command cost
+///
+/// The allocator figure is read by the binary (which can call the jemalloc mallctl) OFF the
+/// command hot path -- on the periodic active-expiry tick -- and PUBLISHED here with one
+/// relaxed atomic store. The admission gate then reads it with one relaxed atomic LOAD on the
+/// eviction path (only for a `denyoom` write while the ceiling is enabled), never advancing the
+/// jemalloc epoch per command. `0` (the seed, and the MSVC/system-allocator fallback) means
+/// "no allocator figure available", in which case the gate falls back to the per-shard logical
+/// counter so the default/test behavior is byte-unchanged.
+#[derive(Debug, Default)]
+pub struct ProcessMemoryGauge {
+    used_memory: AtomicU64,
+    used_memory_rss: AtomicU64,
+}
+
+impl ProcessMemoryGauge {
+    /// A fresh gauge seeded to 0 (no allocator figure read yet). Until the first publish the
+    /// admission gate falls back to the per-shard logical counter (byte-unchanged default).
+    #[must_use]
+    pub fn new() -> Self {
+        ProcessMemoryGauge::default()
+    }
+
+    /// Publish the latest allocator `(used_memory, used_memory_rss)` pair (two relaxed stores).
+    /// Called by the binary OFF the command hot path (the periodic expiry tick reads the jemalloc
+    /// mallctl once per cycle and stores here), so the per-command path never advances the epoch.
+    pub fn publish(&self, used_memory: u64, used_memory_rss: u64) {
+        self.used_memory.store(used_memory, Ordering::Relaxed);
+        self.used_memory_rss
+            .store(used_memory_rss, Ordering::Relaxed);
+    }
+
+    /// The latest published allocator `used_memory` (jemalloc `stats.allocated`) figure in bytes,
+    /// a single relaxed load. `0` means no figure has been published yet (or the build has no
+    /// allocator to query), and the admission gate treats `0` as "fall back to the logical counter".
+    #[must_use]
+    pub fn used_memory(&self) -> u64 {
+        self.used_memory.load(Ordering::Relaxed)
+    }
+
+    /// The latest published resident-set-size (jemalloc `stats.resident`) figure in bytes, a single
+    /// relaxed load. Surfaced for completeness; the over-limit trigger uses [`Self::used_memory`]
+    /// (the live-allocated analog of Redis `used_memory`), matching how Redis's `getMaxmemoryState`
+    /// compares `zmalloc_used_memory()` (allocated, not RSS) against `maxmemory`.
+    #[must_use]
+    pub fn used_memory_rss(&self) -> u64 {
+        self.used_memory_rss.load(Ordering::Relaxed)
+    }
+}
+
 impl PersistenceInfo {
     /// The persistence-OFF posture (the default cache deployment): no `data_dir`, so no snapshot is
     /// ever written, `rdb_last_save_time` is 0, and the save policy is empty. INFO still renders a
@@ -1654,5 +1807,62 @@ mod tests {
         assert!(body.contains("ironcache_raft_current_term 9\n"), "{body}");
         assert!(body.contains("ironcache_raft_commit_index 17\n"), "{body}");
         assert!(body.contains("ironcache_raft_voters 3\n"), "{body}");
+    }
+
+    /// PROD-SAFETY #3: the connection gate admits up to `maxclients`, REJECTS the connection over
+    /// the cap WITHOUT counting it, and a `release` frees a slot for the next connection.
+    #[test]
+    fn connection_gate_enforces_maxclients() {
+        let gate = ConnectionGate::new();
+        // Cap of 3: the first three admit, the fourth is rejected without bumping the count.
+        assert!(gate.try_admit(3));
+        assert!(gate.try_admit(3));
+        assert!(gate.try_admit(3));
+        assert_eq!(gate.live(), 3);
+        assert!(
+            !gate.try_admit(3),
+            "the 4th connection over the cap must be rejected"
+        );
+        // A rejected connection was NOT counted: the live count stays at the cap.
+        assert_eq!(gate.live(), 3);
+        // Releasing a slot lets the next connection in.
+        gate.release();
+        assert_eq!(gate.live(), 2);
+        assert!(gate.try_admit(3));
+        assert_eq!(gate.live(), 3);
+    }
+
+    /// PROD-SAFETY #3: `maxclients == 0` DISABLES the cap (unlimited connections, the pre-fix
+    /// behavior), while still tracking the live count so a later `CONFIG SET maxclients` enforces
+    /// against a true figure.
+    #[test]
+    fn connection_gate_zero_cap_is_unlimited() {
+        let gate = ConnectionGate::new();
+        for _ in 0..10_000 {
+            assert!(gate.try_admit(0), "a 0 cap never rejects");
+        }
+        assert_eq!(gate.live(), 10_000);
+        // release saturates at 0 (never underflows).
+        for _ in 0..10_001 {
+            gate.release();
+        }
+        assert_eq!(gate.live(), 0);
+    }
+
+    /// PROD-SAFETY #1/#2: the process-memory gauge publishes/reads the allocator figures, and a
+    /// fresh (un-published) gauge reads 0 so the admission gate falls back to the logical counter.
+    #[test]
+    fn process_memory_gauge_publishes_and_reads() {
+        let gauge = ProcessMemoryGauge::new();
+        // Fresh: 0 means "no allocator figure available" -> the gate falls back to the logical path.
+        assert_eq!(gauge.used_memory(), 0);
+        assert_eq!(gauge.used_memory_rss(), 0);
+        gauge.publish(4_000, 8_192);
+        assert_eq!(gauge.used_memory(), 4_000);
+        assert_eq!(gauge.used_memory_rss(), 8_192);
+        // A later publish overwrites (last writer wins; eventually-consistent by design).
+        gauge.publish(1_234, 5_678);
+        assert_eq!(gauge.used_memory(), 1_234);
+        assert_eq!(gauge.used_memory_rss(), 5_678);
     }
 }

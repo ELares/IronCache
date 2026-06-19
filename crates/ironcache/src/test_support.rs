@@ -82,6 +82,38 @@ pub fn run_server_for_test(port: u16, shards: usize) -> ShardSet {
     run_server(&config).expect("test server failed to bind")
 }
 
+/// Boot a real server on `127.0.0.1:port` across `shards` shards with the CONNECTION-SAFETY limits
+/// set (PROD-SAFETY #3/#4/#5): `maxclients` (the simultaneous-connection ceiling; `0` disables),
+/// `timeout_secs` (the idle timeout; `0` disables), and `output_buffer_limit` (the per-connection
+/// output-buffer hard cap in bytes; `0` disables). Lets an integration test prove each limit is
+/// enforced over real sockets (the Nth+1 connection rejected, an idle connection closed, an
+/// oversized output dropped) without reaching into private internals.
+///
+/// # Panics
+///
+/// Panics if the config fails to validate or the server fails to bind.
+#[must_use]
+pub fn run_server_with_limits_for_test(
+    port: u16,
+    shards: usize,
+    maxclients: u64,
+    timeout_secs: u64,
+    output_buffer_limit: u64,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        maxclients,
+        timeout_secs,
+        output_buffer_limit,
+        ..Config::default()
+    };
+    config.validate().expect("test limits config must validate");
+    run_server(&config).expect("test limits server failed to bind")
+}
+
 /// Boot a real server with a `requirepass` (#65) on `127.0.0.1:port` across `shards` shards (NO
 /// persistence), so a test can prove the HOISTED router NOAUTH chokepoint gates EVERY path: an
 /// UNAUTHENTICATED client must get `-NOAUTH` for a FOREIGN-shard keyed command (the cross-shard

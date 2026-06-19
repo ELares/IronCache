@@ -58,6 +58,8 @@ fn ctx(runtime: Arc<RuntimeConfig>, boot: Config) -> ServerContext {
         in_sync_replicas: None,
         metrics_registry: None,
         persist_stats: None,
+        process_memory: Arc::new(ironcache_observe::ProcessMemoryGauge::new()),
+        conn_gate: Arc::new(ironcache_observe::ConnectionGate::new()),
         boot,
     }
 }
