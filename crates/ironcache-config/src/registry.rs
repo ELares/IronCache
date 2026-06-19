@@ -57,11 +57,14 @@ pub enum SetKind {
     /// getter returns a fixed Redis-recognized default), matching how Redis surfaces
     /// these under a non-persistence cache build.
     AcceptedNoOp,
-    /// Recognized but the underlying feature is NOT SUPPORTED by this build, so a `CONFIG SET`
-    /// is REFUSED with an explicit error (the false-durability footgun fix). Currently ONLY
+    /// Recognized but the underlying feature is NOT SUPPORTED by this build, so turning the
+    /// feature ON via `CONFIG SET` is REFUSED with an explicit error (the false-durability
+    /// footgun fix). VALUE-SENSITIVE: turning the feature OFF is a no-op-OK. Currently ONLY
     /// `appendonly`: IronCache persists via SNAPSHOTS (SAVE/BGSAVE + the `save` cadence), it has
     /// no AOF, so `CONFIG SET appendonly yes` must NOT be silently accepted (an operator would
-    /// believe AOF durability is on when it is not). `CONFIG GET appendonly` still reports `no`.
+    /// believe AOF durability is on when it is not), but `CONFIG SET appendonly no` replies +OK
+    /// (the feature is already off; a client / ops tool that sets `appendonly no` at startup
+    /// expects success, matching Redis). `CONFIG GET appendonly` always reports `no`.
     Unsupported,
     /// Restart-required: read-only at runtime (bind/port/databases/io-threads/shards).
     /// `CONFIG SET` returns the Redis-style can't-set-at-runtime error rather than
@@ -322,9 +325,35 @@ pub fn apply_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOutcome
         // Accepted but inert: ack without changing anything (CONFIG.md no-op params).
         SetKind::AcceptedNoOp => SetOutcome::Applied,
         SetKind::Runtime => apply_runtime_set(spec.name, value, runtime),
-        // Recognized but unsupported (currently only `appendonly`): REFUSE with an explicit error
-        // rather than silently accept a durability claim this build cannot honor (#58 footgun fix).
-        SetKind::Unsupported => SetOutcome::Unsupported(unsupported_reason(spec.name)),
+        // Recognized but unsupported (currently only `appendonly`): VALUE-SENSITIVE. Turning the
+        // feature OFF is a no-op-OK (the feature is already off / has nothing to disable), so
+        // `CONFIG SET appendonly no` MUST reply +OK -- a client / ops tool that defensively sets
+        // `appendonly no` at startup expects success (Redis accepts it). Turning the feature ON
+        // (`appendonly yes`) is REFUSED with an explicit error rather than silently accepted (the
+        // false-durability footgun fix #58: IronCache has no AOF, so accepting `yes` would let an
+        // operator believe AOF durability is on when it is not). A non-boolean value is rejected as
+        // an invalid value (Redis: a bad boolean is "argument must be 'yes' or 'no'").
+        SetKind::Unsupported => apply_unsupported_set(spec.name, value),
+    }
+}
+
+/// Apply a `CONFIG SET` to a recognized-but-unsupported param. `appendonly` (the only one):
+/// `no`/`0`/`false` -> [`SetOutcome::Applied`] (a no-op-OK: the feature is already off);
+/// `yes`/`1`/`true` -> [`SetOutcome::Unsupported`] (refuse the false-durability claim);
+/// anything else -> [`SetOutcome::InvalidValue`] (a malformed boolean). The match is
+/// case-insensitive (Redis parses the boolean case-insensitively).
+fn apply_unsupported_set(name: &str, value: &str) -> SetOutcome {
+    match name {
+        "appendonly" => match value.to_ascii_lowercase().as_str() {
+            // OFF is a no-op-OK (there is nothing to disable; Redis accepts it).
+            "no" | "0" | "false" => SetOutcome::Applied,
+            // ON is refused: this build has no AOF (the #58 durability footgun fix).
+            "yes" | "1" | "true" => SetOutcome::Unsupported(unsupported_reason(name)),
+            // A non-boolean value is a malformed argument (Redis: "argument must be 'yes' or 'no'").
+            _ => SetOutcome::InvalidValue("argument must be 'yes' or 'no'".to_owned()),
+        },
+        // Defensive: any future Unsupported param must add its own value handling.
+        other => SetOutcome::Unsupported(unsupported_reason(other)),
     }
 }
 

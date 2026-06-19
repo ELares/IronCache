@@ -13,7 +13,7 @@ use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{
     cmd_bitmap, cmd_cluster, cmd_config, cmd_expire, cmd_hash, cmd_hll, cmd_introspect,
-    cmd_keyspace, cmd_list, cmd_set, cmd_string, cmd_txn, cmd_zset,
+    cmd_keyspace, cmd_list, cmd_set, cmd_sort, cmd_string, cmd_txn, cmd_zset,
 };
 use ironcache_config::{ClusterMode, Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
@@ -1072,6 +1072,20 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"DECRBY" => cmd_string::cmd_decrby(store, db, now, req),
         b"INCRBYFLOAT" => cmd_string::cmd_incrbyfloat(store, db, now, req),
         b"APPEND" => cmd_string::cmd_append(store, db, now, req),
+        // GETRANGE / SUBSTR (signed-range substring), SETRANGE (zero-pad-extend overwrite),
+        // GETDEL (GET-then-DEL). GETRANGE/SUBSTR are NOT keyspace-counted: their absent reply
+        // is the EMPTY bulk (indistinguishable from a real empty value), so a hit/miss signal
+        // would misclassify -- the same reason STRLEN is uncounted. GETDEL's reply IS an
+        // unambiguous found(bulk)/not-found(Null) signal, so it is counted (it is a real
+        // lookup, like GET).
+        b"GETRANGE" => cmd_string::cmd_getrange(store, db, now, req),
+        b"SUBSTR" => cmd_string::cmd_substr(store, db, now, req),
+        b"SETRANGE" => cmd_string::cmd_setrange(store, db, now, req),
+        b"GETDEL" => keyspace_counted(deltas, cmd_string::cmd_getdel(store, db, now, req)),
+        // MSETNX is a multi-key all-or-nothing set; like MSET it runs here on co-located /
+        // single-key invocations (a spanning MSETNX is kept home by the serve loop so the
+        // atomic all-or-nothing holds; cross-shard atomic MSETNX is the Stage-3 follow-up).
+        b"MSETNX" => cmd_string::cmd_msetnx(store, db, now, req),
         b"DEL" => cmd_keyspace::cmd_del(store, db, now, req),
         b"EXISTS" => cmd_keyspace::cmd_exists(store, db, now, req),
         b"TYPE" => cmd_keyspace::cmd_type(store, db, now, req),
@@ -1145,6 +1159,11 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"LMOVE" => cmd_list::cmd_lmove(store, db, now, req),
         b"RPOPLPUSH" => cmd_list::cmd_rpoplpush(store, db, now, req),
         b"LPOS" => cmd_list::cmd_lpos(store, db, now, req),
+        // LMPOP: pop from the FIRST non-empty list among the named keys (the non-blocking
+        // multi-key pop). Multi-key, but runs here on co-located / single-key invocations (a
+        // spanning LMPOP is kept home by the serve loop so the "first non-empty wins" order
+        // holds across the named keys on the one store).
+        b"LMPOP" => cmd_list::cmd_lmpop(store, db, now, req),
         // -- Hash commands (PR-6) over the in-place-mutation RMW extension. Mutating
         // commands route through `rmw_mut` (OccupiedMut/Mutated) or Insert (create) /
         // Delete (emptied); reads through `rmw_mut` with Keep. WRONGTYPE on a non-hash.
@@ -1249,6 +1268,10 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"ZINTERSTORE" => cmd_zset::cmd_zinterstore(store, db, now, req),
         b"ZDIFFSTORE" => cmd_zset::cmd_zdiffstore(store, db, now, req),
         b"ZINTERCARD" => cmd_zset::cmd_zintercard(store, db, now, req),
+        // ZMPOP: pop min/max from the FIRST non-empty zset among the named keys (the
+        // non-blocking multi-key pop). Multi-key, runs here on co-located / single-key
+        // invocations (a spanning ZMPOP is kept home by the serve loop).
+        b"ZMPOP" => cmd_zset::cmd_zmpop(store, db, now, req),
         // -- Bitmap commands (PR-9, BITMAPS.md) over the STRING type. A bitmap is the
         // string value addressed at bit granularity (TYPE=string, OBJECT ENCODING a
         // string encoding); these need no new type. Mutations (SETBIT, BITOP-dest,
@@ -1276,6 +1299,12 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"PFADD" => cmd_hll::cmd_pfadd(store, db, now, req),
         b"PFCOUNT" => cmd_hll::cmd_pfcount(store, db, now, req),
         b"PFMERGE" => cmd_hll::cmd_pfmerge(store, db, now, req),
+        // -- Generic SORT / SORT_RO (cmd_sort). SORT sorts the elements of a list/set/zset
+        // (numeric or ALPHA) with LIMIT/ASC/DESC/BY/GET/STORE; SORT_RO is the read-only form
+        // (no STORE). The BY/GET/STORE keys are dereferenced on this connection's accept shard
+        // (single-shard-per-connection, like the other multi-key commands). --
+        b"SORT" => cmd_sort::cmd_sort(store, db, now, req),
+        b"SORT_RO" => cmd_sort::cmd_sort_ro(store, db, now, req),
         // -- Introspection: OBJECT ENCODING/REFCOUNT/IDLETIME/FREQ/HELP (PR-4a, #40). --
         b"OBJECT" => cmd_introspect::cmd_object(store, db, now, req),
         // -- INTERNAL cross-shard *STORE dest-write verb (COORDINATOR.md #107, Stage 2b).
@@ -7860,6 +7889,548 @@ mod tests {
         assert_eq!(
             err_of(run_on(&c, &mut s, &mut st, t, &[b"SHUTDOWN", b"BOGUS"])),
             "-ERR syntax error"
+        );
+    }
+
+    // ===================================================================================
+    // Drop-in compatibility commands: GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX, LMPOP/ZMPOP,
+    // SORT/SORT_RO. Each exercises happy path + the edge cases (negative indices, empty/
+    // missing key, WRONGTYPE, arity, COUNT, all-or-nothing, numeric vs ALPHA, STORE).
+    // ===================================================================================
+
+    #[test]
+    fn getrange_signed_range_and_edges() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"Hello World"]);
+        // A basic in-bounds range.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETRANGE", b"k", b"0", b"4"]),
+            bulk(b"Hello")
+        );
+        // Negative indices count from the end.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETRANGE", b"k", b"-5", b"-1"]),
+            bulk(b"World")
+        );
+        // The whole string.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETRANGE", b"k", b"0", b"-1"]),
+            bulk(b"Hello World")
+        );
+        // An out-of-range end is clamped.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETRANGE", b"k", b"0", b"1000"]),
+            bulk(b"Hello World")
+        );
+        // start > end -> the empty bulk.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETRANGE", b"k", b"5", b"2"]),
+            bulk(b"")
+        );
+        // A MISSING key -> the empty bulk (NOT nil).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"GETRANGE", b"missing", b"0", b"-1"]
+            ),
+            bulk(b"")
+        );
+        // SUBSTR is byte-identical.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SUBSTR", b"k", b"0", b"4"]),
+            bulk(b"Hello")
+        );
+        // Arity + non-integer + WRONGTYPE.
+        assert_eq!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"GETRANGE", b"k", b"0"])),
+            "-ERR wrong number of arguments for 'getrange' command"
+        );
+        assert!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"GETRANGE", b"k", b"x", b"1"]
+            ))
+            .contains("not an integer")
+        );
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"lst", b"a"]);
+        assert!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"GETRANGE", b"lst", b"0", b"1"]
+            ))
+            .contains("WRONGTYPE")
+        );
+    }
+
+    #[test]
+    fn setrange_overwrite_zero_pad_and_edges() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // Overwrite in place: "Hello World" with "Redis" at offset 6 -> "Hello Redis", len 11.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"Hello World"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SETRANGE", b"k", b"6", b"Redis"]),
+            iv(11)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"k"]),
+            bulk(b"Hello Redis")
+        );
+        // Zero-pad-extend on a missing key: offset 5, "x" -> 5 NUL bytes + "x", len 6.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SETRANGE", b"pad", b"5", b"x"]),
+            iv(6)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GET", b"pad"]),
+            bulk(b"\x00\x00\x00\x00\x00x")
+        );
+        // An EMPTY value is a no-op returning the current length; it does NOT create a key.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SETRANGE", b"empty", b"0", b""]),
+            iv(0)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"empty"]),
+            iv(0)
+        );
+        // A negative offset is the out-of-range error.
+        assert!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SETRANGE", b"k", b"-1", b"x"]
+            ))
+            .contains("offset is out of range")
+        );
+        // WRONGTYPE.
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"lst", b"a"]);
+        assert!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SETRANGE", b"lst", b"0", b"x"]
+            ))
+            .contains("WRONGTYPE")
+        );
+    }
+
+    #[test]
+    fn getdel_gets_then_deletes() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"k", b"v"]);
+        // GETDEL returns the value AND removes the key.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETDEL", b"k"]),
+            bulk(b"v")
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"k"]), iv(0));
+        // A second GETDEL on the now-missing key -> nil.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"GETDEL", b"k"]),
+            Value::Null
+        );
+        // WRONGTYPE leaves the key intact (no delete).
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"lst", b"a"]);
+        assert!(err_of(run_on(&c, &mut s, &mut st, t, &[b"GETDEL", b"lst"])).contains("WRONGTYPE"));
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"lst"]), iv(1));
+    }
+
+    #[test]
+    fn msetnx_all_or_nothing() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // All absent -> set them all, reply 1.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"MSETNX", b"a", b"1", b"b", b"2"]),
+            iv(1)
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"a"]), bulk(b"1"));
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"b"]), bulk(b"2"));
+        // ONE already exists (a) -> NOTHING is written, reply 0 (c stays absent).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"MSETNX", b"c", b"3", b"a", b"X"]),
+            iv(0)
+        );
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"EXISTS", b"c"]), iv(0));
+        assert_eq!(run_on(&c, &mut s, &mut st, t, &[b"GET", b"a"]), bulk(b"1"));
+        // An odd arg count is the wrong-arity error.
+        assert!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"MSETNX", b"x", b"1", b"y"]
+            ))
+            .contains("wrong number of arguments")
+        );
+    }
+
+    #[test]
+    fn lmpop_first_non_empty_and_count() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // l2 = [a, b, c]; l1 missing. LMPOP picks the FIRST non-empty (l2), LEFT pops 'a'.
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"l2", b"a", b"b", b"c"]);
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LMPOP", b"2", b"l1", b"l2", b"LEFT"]
+            ),
+            Value::Array(Some(vec![bulk(b"l2"), arr(&[b"a"])]))
+        );
+        // COUNT pops several from the chosen end (RIGHT here: c then b).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LMPOP", b"2", b"l1", b"l2", b"RIGHT", b"COUNT", b"2"]
+            ),
+            Value::Array(Some(vec![bulk(b"l2"), arr(&[b"c", b"b"])]))
+        );
+        // All keys missing/empty -> the null ARRAY (Redis addReplyNullArray).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LMPOP", b"2", b"l1", b"l2", b"LEFT"]
+            ),
+            Value::Array(None)
+        );
+        // WRONGTYPE if the first EXISTING key is the wrong type.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"str", b"x"]);
+        assert!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LMPOP", b"1", b"str", b"LEFT"]
+            ))
+            .contains("WRONGTYPE")
+        );
+        // numkeys must be positive; a missing direction is a syntax error; arity.
+        assert!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LMPOP", b"0", b"k", b"LEFT"]
+            ))
+            .contains("numkeys")
+        );
+        assert_eq!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"LMPOP", b"1", b"k", b"SIDE"]
+            )),
+            "-ERR syntax error"
+        );
+        assert!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"LMPOP", b"1"]))
+                .contains("wrong number of arguments")
+        );
+    }
+
+    #[test]
+    fn zmpop_min_max_and_count() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // z2 = {a:1, b:2, c:3}. ZMPOP MIN pops the lowest (a, 1).
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"ZADD", b"z2", b"1", b"a", b"2", b"b", b"3", b"c"],
+        );
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"ZMPOP", b"2", b"z1", b"z2", b"MIN"]
+            ),
+            Value::Array(Some(vec![
+                bulk(b"z2"),
+                Value::Array(Some(vec![Value::Array(Some(vec![bulk(b"a"), bulk(b"1")]))])),
+            ]))
+        );
+        // MAX with COUNT 2 pops the two highest (c,3 then b,2).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"ZMPOP", b"2", b"z1", b"z2", b"MAX", b"COUNT", b"2"]
+            ),
+            Value::Array(Some(vec![
+                bulk(b"z2"),
+                Value::Array(Some(vec![
+                    Value::Array(Some(vec![bulk(b"c"), bulk(b"3")])),
+                    Value::Array(Some(vec![bulk(b"b"), bulk(b"2")])),
+                ])),
+            ]))
+        );
+        // All empty -> the null ARRAY (Redis addReplyNullArray).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"ZMPOP", b"2", b"z1", b"z2", b"MIN"]
+            ),
+            Value::Array(None)
+        );
+        // WRONGTYPE on the first existing non-zset key.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"str", b"x"]);
+        assert!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"ZMPOP", b"1", b"str", b"MIN"]
+            ))
+            .contains("WRONGTYPE")
+        );
+    }
+
+    #[test]
+    fn sort_numeric_alpha_limit_desc() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // A numeric list sorts ascending by default.
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"RPUSH", b"nums", b"3", b"1", b"2", b"10"],
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"nums"]),
+            arr(&[b"1", b"2", b"3", b"10"])
+        );
+        // DESC reverses.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"nums", b"DESC"]),
+            arr(&[b"10", b"3", b"2", b"1"])
+        );
+        // LIMIT offset count (after sort).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SORT", b"nums", b"LIMIT", b"1", b"2"]
+            ),
+            arr(&[b"2", b"3"])
+        );
+        // ALPHA sorts lexicographically (so "10" < "2").
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"nums", b"ALPHA"]),
+            arr(&[b"1", b"10", b"2", b"3"])
+        );
+        // A non-numeric element WITHOUT ALPHA is the SORT-not-numbers error.
+        run_on(&c, &mut s, &mut st, t, &[b"RPUSH", b"words", b"b", b"a"]);
+        assert!(
+            err_of(run_on(&c, &mut s, &mut st, t, &[b"SORT", b"words"])).contains("not numbers")
+        );
+        // ALPHA on those words works.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"words", b"ALPHA"]),
+            arr(&[b"a", b"b"])
+        );
+        // SORT of a missing key is an empty array.
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"missing"]),
+            Value::Array(Some(vec![]))
+        );
+        // SORT of a string is WRONGTYPE.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"str", b"x"]);
+        assert!(err_of(run_on(&c, &mut s, &mut st, t, &[b"SORT", b"str"])).contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn sort_sorts_sets_and_zsets() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        // A SET sorts by member value (numeric).
+        run_on(&c, &mut s, &mut st, t, &[b"SADD", b"set", b"3", b"1", b"2"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"set"]),
+            arr(&[b"1", b"2", b"3"])
+        );
+        // A ZSET sorts by MEMBER value (the zset's own scores are ignored without BY).
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"ZADD", b"z", b"100", b"3", b"200", b"1", b"300", b"2"],
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"z"]),
+            arr(&[b"1", b"2", b"3"])
+        );
+    }
+
+    #[test]
+    fn sort_by_get_and_store() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let mut st = test_store(c.databases);
+        let t = UnixMillis(0);
+        run_on(
+            &c,
+            &mut s,
+            &mut st,
+            t,
+            &[b"RPUSH", b"ids", b"1", b"2", b"3"],
+        );
+        // BY weight_* with external string keys: weight_1=30, weight_2=10, weight_3=20.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"weight_1", b"30"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"weight_2", b"10"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"weight_3", b"20"]);
+        // Sorted by external weight: 2(10), 3(20), 1(30).
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SORT", b"ids", b"BY", b"weight_*"]
+            ),
+            arr(&[b"2", b"3", b"1"])
+        );
+        // GET # returns the element; GET data_* dereferences a string key.
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"data_1", b"one"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"data_2", b"two"]);
+        run_on(&c, &mut s, &mut st, t, &[b"SET", b"data_3", b"three"]);
+        // Sorted by weight (2,3,1), projecting # then data_*: [2, two, 3, three, 1, one].
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[
+                    b"SORT",
+                    b"ids",
+                    b"BY",
+                    b"weight_*",
+                    b"GET",
+                    b"#",
+                    b"GET",
+                    b"data_*"
+                ]
+            ),
+            Value::Array(Some(vec![
+                bulk(b"2"),
+                bulk(b"two"),
+                bulk(b"3"),
+                bulk(b"three"),
+                bulk(b"1"),
+                bulk(b"one"),
+            ]))
+        );
+        // BY a hash field: h_1->w etc.
+        run_on(&c, &mut s, &mut st, t, &[b"HSET", b"h_1", b"w", b"3"]);
+        run_on(&c, &mut s, &mut st, t, &[b"HSET", b"h_2", b"w", b"1"]);
+        run_on(&c, &mut s, &mut st, t, &[b"HSET", b"h_3", b"w", b"2"]);
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"ids", b"BY", b"h_*->w"]),
+            arr(&[b"2", b"3", b"1"])
+        );
+        // BY a pattern with NO `*` is the nosort shortcut (preserve source order 1,2,3).
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"SORT", b"ids", b"BY", b"nosort"]),
+            arr(&[b"1", b"2", b"3"])
+        );
+        // STORE writes the result as a LIST and returns the count; SORT_RO has no STORE.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SORT", b"ids", b"BY", b"weight_*", b"STORE", b"dest"]
+            ),
+            iv(3)
+        );
+        assert_eq!(
+            run_on(&c, &mut s, &mut st, t, &[b"LRANGE", b"dest", b"0", b"-1"]),
+            arr(&[b"2", b"3", b"1"])
+        );
+        // SORT_RO rejects STORE as a syntax error.
+        assert_eq!(
+            err_of(run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SORT_RO", b"ids", b"STORE", b"dest"]
+            )),
+            "-ERR syntax error"
+        );
+        // SORT_RO without STORE works like SORT.
+        assert_eq!(
+            run_on(
+                &c,
+                &mut s,
+                &mut st,
+                t,
+                &[b"SORT_RO", b"ids", b"BY", b"weight_*"]
+            ),
+            arr(&[b"2", b"3", b"1"])
         );
     }
 }

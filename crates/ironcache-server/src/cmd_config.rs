@@ -477,6 +477,48 @@ mod tests {
         );
     }
 
+    /// CONFIG durability LOW fix: `CONFIG SET appendonly no` MUST reply +OK (it is a no-op-OK:
+    /// the feature is already off, and a client / ops tool that defensively sets `appendonly no`
+    /// at startup expects success, matching Redis). Only turning it ON (`yes`) is refused; a
+    /// non-boolean value is a CONFIG SET failed error. `CONFIG GET appendonly` stays `no`
+    /// throughout.
+    #[test]
+    fn config_set_appendonly_no_is_ok_noop() {
+        let c = ctx_with(Config::default());
+        // `appendonly no` -> +OK (the no-op-OK), case-insensitively, plus the `0`/`false` spellings.
+        for off in [b"no".as_slice(), b"NO", b"No", b"0", b"false"] {
+            assert_eq!(
+                run(&c, &[b"CONFIG", b"SET", b"appendonly", off]).0,
+                Value::ok(),
+                "appendonly {} must be +OK",
+                String::from_utf8_lossy(off)
+            );
+        }
+        // GET still reports `no` (nothing actually changed).
+        let (v, _) = run(&c, &[b"CONFIG", b"GET", b"appendonly"]);
+        assert_eq!(
+            get_pairs(&v),
+            vec![("appendonly".to_owned(), "no".to_owned())]
+        );
+        // A non-boolean value is a CONFIG SET failed error (never a silent accept).
+        match run(&c, &[b"CONFIG", b"SET", b"appendonly", b"maybe"]).0 {
+            Value::Error(e) => assert!(e.line().contains("CONFIG SET failed"), "got {}", e.line()),
+            other => panic!("expected CONFIG SET failed, got {other:?}"),
+        }
+    }
+
+    /// CONFIG durability LOW fix: `CONFIG GET save` reports the EMPTY string when the periodic
+    /// save policy is OFF (the default boot posture), matching Redis's "" for no save points --
+    /// NOT a bogus value. (The active-policy reporting is covered by
+    /// `config_set_save_updates_and_reports_the_real_policy`; this pins the OFF-reports-empty
+    /// contract explicitly.)
+    #[test]
+    fn config_get_save_is_empty_when_off() {
+        let c = ctx_with(Config::default());
+        let (v, _) = run(&c, &[b"CONFIG", b"GET", b"save"]);
+        assert_eq!(get_pairs(&v), vec![("save".to_owned(), String::new())]);
+    }
+
     #[test]
     fn config_set_requirepass_empty_clears_auth() {
         // CONFIG SET requirepass <pw> enables auth; CONFIG SET requirepass "" disables

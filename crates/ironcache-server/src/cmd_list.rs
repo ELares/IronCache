@@ -22,8 +22,9 @@
 //! backstop, plus the explicit `Delete` action where the handler can tell). So an
 //! empty list is never observable, matching Redis.
 //!
-//! Blocking variants (BLPOP/BRPOP/BLMOVE/LMPOP/BLMPOP) are DEFERRED (they need
-//! blocking infrastructure) and are NOT implemented here.
+//! The NON-blocking multi-key pop LMPOP IS implemented (it pops from the first
+//! non-empty list among the named keys). The BLOCKING variants (BLPOP/BRPOP/BLMOVE/
+//! BLMPOP) are DEFERRED (they need blocking infrastructure) and are NOT implemented here.
 
 use crate::cmd_util::{ascii_upper, parse_i64_strict};
 use bytes::Bytes;
@@ -790,6 +791,144 @@ pub fn cmd_rpoplpush<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Re
     let src = req.args[1].clone();
     let dst = req.args[2].clone();
     move_generic(store, db, now, &src, &dst, false, true)
+}
+
+// ---------------------------------------------------------------------------
+// LMPOP: pop from the first non-empty list among several keys (the non-blocking
+// multi-key pop, Redis 7). `LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]`.
+// ---------------------------------------------------------------------------
+
+/// `LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]` -> a two-element reply
+/// `[key, [elements...]]` for the FIRST key (in argument order) that holds a non-empty
+/// list, popping up to `count` (default 1) elements from the chosen end; or nil if EVERY
+/// listed key is missing/empty (Redis `lmpopCommand` / `lmpopGenericCommand`).
+///
+/// Parsing (Redis order): `numkeys` must be a positive integer matching the number of key
+/// args; then exactly `LEFT` or `RIGHT`; then an optional `COUNT count` (count must be a
+/// positive integer). A wrong `numkeys`, a missing/invalid direction, or a bad COUNT is a
+/// syntax / out-of-range error. WRONGTYPE if the FIRST non-empty matching key holds a
+/// non-list (Redis stops at the first key that exists and errors if it is the wrong type).
+///
+/// SINGLE-SHARD handler: it scans the named keys on the connection's accept shard. A
+/// SPANNING LMPOP is kept HOME by the serve loop (all keys live on the one store there),
+/// preserving the "first non-empty wins" order.
+pub fn cmd_lmpop<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    let parsed = match parse_mpop_args(req, "LMPOP", &[b"LEFT", b"RIGHT"]) {
+        Ok(p) => p,
+        Err(e) => return Value::error(e),
+    };
+    let left = parsed.direction == b"LEFT";
+    // Scan the keys in order; pop from the FIRST one that holds a non-empty list.
+    for key in &parsed.keys {
+        let key = Bytes::copy_from_slice(key);
+        let outcome = store.rmw_mut(db, &key, now, |entry| match entry {
+            // A missing key contributes nothing; keep scanning (reply None signals "skip").
+            RmwEntry::Vacant => keep(Value::Null),
+            RmwEntry::OccupiedMut(mut o) => {
+                let Some(list) = o.as_list_mut() else {
+                    // WRONGTYPE: the first EXISTING key is the wrong type -> error, no pop.
+                    return wrong_type();
+                };
+                let mut out: Vec<Value> = Vec::with_capacity(parsed.count.min(list.len()));
+                for _ in 0..parsed.count {
+                    let popped = if left {
+                        list.pop_front()
+                    } else {
+                        list.pop_back()
+                    };
+                    match popped {
+                        Some(e) => out.push(bulk(e)),
+                        None => break,
+                    }
+                }
+                // A two-element [key, [elements]] reply.
+                let reply = Value::Array(Some(vec![bulk(key.to_vec()), Value::Array(Some(out))]));
+                finish_pop(list, reply)
+            }
+            RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+        });
+        match outcome {
+            // Skip a missing key (Null sentinel) and keep scanning the rest.
+            Value::Null => {}
+            // A real reply (the pop result) OR a WRONGTYPE error: return it (first match wins).
+            other => return other,
+        }
+    }
+    // No key held a non-empty list: the NULL ARRAY reply (Redis LMPOP calls addReplyNullArray
+    // -> RESP2 `*-1`, RESP3 `_`). DISTINCT from a missing-key skip's `Value::Null` sentinel.
+    Value::Array(None)
+}
+
+/// The parsed form of an `LMPOP`/`ZMPOP`-style multi-key pop request (shared shape).
+pub(crate) struct MpopArgs {
+    /// The key names (already validated to equal `numkeys`).
+    pub keys: Vec<Vec<u8>>,
+    /// The chosen direction/order token (UPPERCASE), one of `allowed`.
+    pub direction: Vec<u8>,
+    /// The COUNT (default 1), already validated positive.
+    pub count: usize,
+}
+
+/// Parse the COMMON `<numkeys> key [key ...] <DIR> [COUNT count]` grammar LMPOP and ZMPOP
+/// share (Redis `lmpopGenericCommand` / `zmpopGenericCommand`). `cmd_name` is the
+/// arity-error spelling; `allowed` is the set of accepted direction tokens (`LEFT`/`RIGHT`
+/// for LMPOP, `MIN`/`MAX` for ZMPOP). The returned `direction` is whichever of `allowed`
+/// matched. Errors mirror Redis: wrong arity, a `numkeys` that is not a positive integer or
+/// does not match the key count, a missing/invalid direction, a malformed COUNT, or trailing
+/// junk are the matching syntax / out-of-range errors.
+pub(crate) fn parse_mpop_args(
+    req: &Request,
+    cmd_name: &str,
+    allowed: &[&[u8]],
+) -> Result<MpopArgs, ErrorReply> {
+    // Minimum: token + numkeys + 1 key + direction = 4 args.
+    if req.args.len() < 4 {
+        return Err(ErrorReply::wrong_arity(cmd_name));
+    }
+    // numkeys: a positive integer (Redis rejects <= 0 with "numkeys should be greater than 0").
+    let numkeys = match parse_i64_strict(&req.args[1]) {
+        Some(n) if n > 0 => n as usize,
+        Some(_) => {
+            return Err(ErrorReply::err("numkeys should be greater than 0"));
+        }
+        None => return Err(ErrorReply::not_an_integer()),
+    };
+    // The keys span args[2..2+numkeys]; the direction follows, then an optional COUNT count.
+    let dir_idx = 2usize.saturating_add(numkeys);
+    // There must be room for all keys + the direction token.
+    if dir_idx >= req.args.len() {
+        return Err(ErrorReply::syntax_error());
+    }
+    let keys: Vec<Vec<u8>> = req.args[2..dir_idx].iter().map(|b| b.to_vec()).collect();
+    // The direction token must be exactly one of `allowed` (case-insensitive).
+    let dir_up = ascii_upper(&req.args[dir_idx]);
+    let Some(direction) = allowed.iter().find(|d| **d == dir_up.as_slice()) else {
+        return Err(ErrorReply::syntax_error());
+    };
+    // The optional COUNT count tail (args after the direction).
+    let mut count = 1usize;
+    let tail = &req.args[dir_idx + 1..];
+    match tail {
+        [] => {}
+        [kw, cnt] if ascii_upper(kw) == b"COUNT" => {
+            count = match parse_i64_strict(cnt) {
+                Some(n) if n > 0 => n as usize,
+                // Redis: a count <= 0 is "count should be greater than 0".
+                Some(_) => {
+                    return Err(ErrorReply::err("count should be greater than 0"));
+                }
+                None => return Err(ErrorReply::not_an_integer()),
+            };
+        }
+        // Anything else after the direction (a lone COUNT, a bad keyword, extra tokens) is
+        // a syntax error.
+        _ => return Err(ErrorReply::syntax_error()),
+    }
+    Ok(MpopArgs {
+        keys,
+        direction: (*direction).to_vec(),
+        count,
+    })
 }
 
 #[cfg(test)]

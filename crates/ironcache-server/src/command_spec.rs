@@ -165,6 +165,12 @@ pub enum KeySpecKind {
     ZstoreDestNumkeysAtArg2,
     /// OBJECT `<subcommand> <key>`: the key is `args[2]` (the subcommand is `args[1]`).
     ObjectArg2,
+    /// SORT `<key> [...options... [STORE dest]]`: the source key is `args[1]`, PLUS the
+    /// STORE destination key (the arg after a `STORE` token) when present. The BY/GET
+    /// PATTERN keys are NOT extracted (Redis's SORT getkeys returns only the source + the
+    /// STORE dest; the BY/GET patterns are substituted at run time and are not key args).
+    /// `SORT_RO` has no STORE, so it always yields just the source key.
+    SortKeys,
 }
 
 /// The SINGLE per-command record: all the DATA attributes that used to live in separate
@@ -272,6 +278,30 @@ pub fn extract_keys(kind: KeySpecKind, req: &Request) -> KeySpec<'_> {
         }
         // OBJECT <subcommand> <key>: the key is args[2].
         KeySpecKind::ObjectArg2 => keys_at(req, &[2]),
+        // SORT <key> [...] [STORE dest]: the source key (args[1]) PLUS the STORE dest (the
+        // arg following a STORE token, case-insensitive), when present. The BY/GET pattern
+        // args are NOT keys. A SORT without STORE yields just the source (One).
+        KeySpecKind::SortKeys => {
+            let Some(src) = req.args.get(1) else {
+                return KeySpec::None;
+            };
+            // Scan the option tail for a STORE token; the NEXT arg is the dest key.
+            let mut dest: Option<&[u8]> = None;
+            let mut i = 2;
+            while i < req.args.len() {
+                if req.args[i].eq_ignore_ascii_case(b"STORE") {
+                    if let Some(d) = req.args.get(i + 1) {
+                        dest = Some(d.as_ref());
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            match dest {
+                Some(d) => KeySpec::Many(vec![src.as_ref(), d]),
+                None => KeySpec::One(src.as_ref()),
+            }
+        }
     }
 }
 
@@ -346,7 +376,7 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
     use CommandClass::{AlwaysHome, KeyedMulti, KeyedSingle, WholeKeyspace};
     use KeySpecKind::{
         AllFromArg1, Arg1, BitopDestArg2SourcesFrom3, MsetStrided, NumkeysAtArg1, ObjectArg2,
-        TwoKeysArg1Arg2, ZstoreDestNumkeysAtArg2,
+        SortKeys, TwoKeysArg1Arg2, ZstoreDestNumkeysAtArg2,
     };
     let spec: &'static CommandSpec = match cmd_upper {
         // -- Tier-0 / connection (dispatch.rs). --
@@ -699,6 +729,49 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: true,
         },
+        // GETRANGE / SUBSTR: the inclusive signed-range substring read (src/commands.def
+        // GETRANGE arity 4; SUBSTR is a literal alias with the same arity 4). KeyedSingle,
+        // args[1], a pure READ (not denyoom, not a write).
+        b"GETRANGE" => &CommandSpec {
+            name: b"GETRANGE",
+            arity: Exact(4),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        b"SUBSTR" => &CommandSpec {
+            name: b"SUBSTR",
+            arity: Exact(4),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        // SETRANGE: overwrite-with-zero-pad-extend (src/commands.def arity 4). KeyedSingle,
+        // args[1], a denyoom WRITE (it can grow the value, so the maxmemory ceiling gates it).
+        b"SETRANGE" => &CommandSpec {
+            name: b"SETRANGE",
+            arity: Exact(4),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: true,
+            control: false,
+            is_write: true,
+        },
+        // GETDEL: GET then DEL atomically (src/commands.def arity 2). KeyedSingle, args[1], a
+        // WRITE (it removes the key) but NOT denyoom (like DEL, it only frees memory).
+        b"GETDEL" => &CommandSpec {
+            name: b"GETDEL",
+            arity: Exact(2),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
         b"MGET" => &CommandSpec {
             name: b"MGET",
             arity: Min(2),
@@ -710,6 +783,18 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
         },
         b"MSET" => &CommandSpec {
             name: b"MSET",
+            arity: Min(3),
+            class: KeyedMulti,
+            key_spec: MsetStrided,
+            denyoom: true,
+            control: false,
+            is_write: true,
+        },
+        // MSETNX: set ALL keys only if NONE exist, atomic all-or-nothing (src/commands.def
+        // arity -3). KeyedMulti with the MSET stride key spec (keys at args[1], args[3], ...);
+        // the interleaved values are NOT keys. A denyoom WRITE.
+        b"MSETNX" => &CommandSpec {
+            name: b"MSETNX",
             arity: Min(3),
             class: KeyedMulti,
             key_spec: MsetStrided,
@@ -1117,6 +1202,18 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             denyoom: false,
             control: false,
             is_write: false,
+        },
+        // LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT n] (src/commands.def arity -4).
+        // KeyedMulti with the numkeys-at-args[1] key spec (keys at args[2..2+numkeys]); the
+        // direction + COUNT trail the keys. A WRITE (it pops), NOT denyoom (a pop frees memory).
+        b"LMPOP" => &CommandSpec {
+            name: b"LMPOP",
+            arity: Min(4),
+            class: KeyedMulti,
+            key_spec: NumkeysAtArg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
         },
         // -- Hashes (cmd_hash). --
         b"HSET" => &CommandSpec {
@@ -1697,6 +1794,18 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        // ZMPOP numkeys key [key ...] MIN|MAX [COUNT n] (src/commands.def arity -4).
+        // KeyedMulti with the numkeys-at-args[1] key spec (keys at args[2..2+numkeys]); the
+        // direction + COUNT trail the keys. A WRITE (it pops), NOT denyoom (a pop frees memory).
+        b"ZMPOP" => &CommandSpec {
+            name: b"ZMPOP",
+            arity: Min(4),
+            class: KeyedMulti,
+            key_spec: NumkeysAtArg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
         // -- Bitmaps (cmd_bitmap). --
         b"SETBIT" => &CommandSpec {
             name: b"SETBIT",
@@ -1788,6 +1897,34 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             denyoom: true,
             control: false,
             is_write: true,
+        },
+        // -- Generic: SORT / SORT_RO (cmd_sort). --
+        // SORT key [...] [STORE dest] (src/commands.def arity -2). KeyedMulti with the SortKeys
+        // spec (the source key args[1] PLUS the STORE dest when present, so the ACL per-key check
+        // and the cluster slot check see BOTH keys). A denyoom WRITE (the STORE form writes the
+        // dest; even the non-STORE form is conservatively a write since the registry has one
+        // is_write per command and SORT-with-STORE mutates). The BY/GET pattern keys are NOT
+        // extracted (Redis's SORT getkeys returns only the source + STORE dest).
+        b"SORT" => &CommandSpec {
+            name: b"SORT",
+            arity: Min(2),
+            class: KeyedMulti,
+            key_spec: SortKeys,
+            denyoom: true,
+            control: false,
+            is_write: true,
+        },
+        // SORT_RO key [...] (src/commands.def arity -2): the read-only SORT (NO STORE). The
+        // SortKeys spec yields just the source key here (SORT_RO has no STORE token). A pure
+        // READ: not denyoom, not a write (so a replica / a `+@read -@write` user can run it).
+        b"SORT_RO" => &CommandSpec {
+            name: b"SORT_RO",
+            arity: Min(2),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
         },
         // -- Introspection (cmd_introspect). --
         b"OBJECT" => &CommandSpec {
@@ -2106,7 +2243,9 @@ pub(crate) mod tests {
             b"EXPIRETIME",
             b"GET",
             b"GETBIT",
+            b"GETDEL",
             b"GETEX",
+            b"GETRANGE",
             b"GETSET",
             b"HDEL",
             b"HEXISTS",
@@ -2131,6 +2270,7 @@ pub(crate) mod tests {
             b"LINSERT",
             b"LLEN",
             b"LMOVE",
+            b"LMPOP",
             b"LPOP",
             b"LPOS",
             b"LPUSH",
@@ -2142,6 +2282,7 @@ pub(crate) mod tests {
             b"MGET",
             b"MOVE",
             b"MSET",
+            b"MSETNX",
             b"OBJECT",
             b"PERSIST",
             b"PEXPIRE",
@@ -2166,6 +2307,7 @@ pub(crate) mod tests {
             b"SETBIT",
             b"SETEX",
             b"SETNX",
+            b"SETRANGE",
             b"SINTER",
             b"SINTERCARD",
             b"SINTERSTORE",
@@ -2173,11 +2315,14 @@ pub(crate) mod tests {
             b"SMEMBERS",
             b"SMISMEMBER",
             b"SMOVE",
+            b"SORT",
+            b"SORT_RO",
             b"SPOP",
             b"SRANDMEMBER",
             b"SREM",
             b"SSCAN",
             b"STRLEN",
+            b"SUBSTR",
             b"SUNION",
             b"SUNIONSTORE",
             b"TOUCH",
@@ -2194,6 +2339,7 @@ pub(crate) mod tests {
             b"ZINTERCARD",
             b"ZINTERSTORE",
             b"ZLEXCOUNT",
+            b"ZMPOP",
             b"ZMSCORE",
             b"ZPOPMAX",
             b"ZPOPMIN",
