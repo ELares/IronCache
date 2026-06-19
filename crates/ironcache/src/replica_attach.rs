@@ -13,6 +13,25 @@
 //! - the shard's thread-local store handle ([`crate::serve::shard_store`]) and the passive
 //!   -replica guard ([`crate::serve::set_replica_passive`]).
 //!
+//! ## Transport security (PROD-3): frame-bounded; TLS + secret is a documented follow-up
+//!
+//! The replication wire frames ([`ironcache_repl::Frame`]) are now bounded against a forged
+//! per-argument length (the [`ironcache_runtime::MAX_CLUSTER_FRAME_LEN`] cap enforced in
+//! `ironcache_repl::frames`), closing the memory-DoS where a malicious `$<huge>\r\n` header could
+//! drive the recv buffer to grow unbounded -- the HIGHEST-severity vector on this transport, fixed
+//! here regardless of TLS.
+//!
+//! The replication LINK itself (the dial + the source listener) is still PLAINTEXT and
+//! UNAUTHENTICATED in this build: the Raft cluster-bus (`RAFTMSG`) got full TLS + a shared-secret
+//! peer-authentication handshake (PROD-3, via `ironcache_clusterbus::ClusterSecurity`), but wiring
+//! the SAME `SecureStream` + secret handshake end to end through the repl dial / source listener
+//! and the many stream-threading helpers (`next_frame`, `send_bytes_ok`, `drive_full_sync`,
+//! `drain_and_ship`, `serve_replica_conn`) is a larger change deferred as a documented follow-up.
+//! Until then, operators MUST restrict the repl data-plane port (`repl_port(client_port)`) to the
+//! trusted intra-cluster network (a security group / NetworkPolicy), exactly as the bus port should
+//! be. The building blocks the follow-up reuses already exist (the `ClusterSecurity::dial` /
+//! `::accept` + `SecureStream` in `ironcache_clusterbus::security`, built and proven by the bus).
+//!
 //! ## Gated to raft-mode ONLY (the default path is byte-unchanged)
 //!
 //! [`spawn_on_shard`] is the SOLE entry point, and the per-shard drain-loop setup calls it

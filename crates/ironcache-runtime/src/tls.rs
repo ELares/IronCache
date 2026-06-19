@@ -38,8 +38,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor as RustlsAcceptor;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::{self, ServerConfig};
+use tokio_rustls::TlsConnector as RustlsConnector;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::server::TlsStream;
 
 /// Errors building the TLS server configuration from the configured cert/key PEM.
@@ -279,6 +280,427 @@ impl ClientStream {
     }
 }
 
+// ===========================================================================
+// Intra-cluster transport security (PROD-3): TLS + shared-secret auth + frame bound
+// for the node-to-node links (the Raft cluster-bus RAFTMSG control plane and the
+// replication stream), which were plaintext, unauthenticated, and bound to the
+// operator interface (often 0.0.0.0). Reuses the building blocks above (the `ring`
+// provider pinning, the bounded handshake-timeout pattern, the PEM loaders) and adds
+// the CLIENT side rustls handshake the dial path needs, so a single static binary
+// (no C TLS library) secures both transports.
+//
+// Threat model addressed: an attacker on the network can FORGE consensus messages
+// (fake AppendEntries / RequestVote to hijack the cluster) or SIPHON the entire
+// keyspace off the replication stream. TLS encrypts + integrity-protects the link;
+// the shared cluster secret (a constant-time compare right after the handshake)
+// authenticates the PEER, so a party lacking the secret is dropped even if it can
+// reach the port and complete a TLS handshake. mTLS with a cluster CA (client-cert
+// verification) is a documented stronger follow-up; the shared secret is the v1.
+// ===========================================================================
+
+/// Compare two byte slices in CONSTANT TIME (no data-dependent early-out), for the
+/// shared-secret peer-authentication handshake on the intra-cluster links. A naive
+/// `==` leaks a timing side-channel (it returns on the first differing byte), letting a
+/// network attacker recover the secret prefix-by-prefix; this folds EVERY byte pair
+/// into an XOR accumulator and only tests it at the end, examining all bytes regardless
+/// of an early mismatch. A length difference short-circuits (the secret length is not
+/// itself secret, and the loop needs equal lengths); the accumulator is read through
+/// [`std::hint::black_box`] so the optimizer cannot prove the loop short-circuitable and
+/// re-introduce a data-dependent exit. Hand-rolled (no `subtle` dep) to keep the I/O
+/// seam dependency-light, mirroring `ironcache_server`'s `check_auth` compare.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    std::hint::black_box(acc) == 0
+}
+
+/// The SERVER name the cluster TLS CLIENT presents in its handshake SNI / verifies the
+/// peer cert against. Intra-cluster certs are operated as a single self-signed / cluster
+/// cert (not per-host public-CA certs), so a fixed logical name is used on both sides;
+/// peer IDENTITY is established by the shared secret (v1) or a cluster CA (mTLS follow-up),
+/// not by hostname matching against a public PKI. A stable constant keeps the client config
+/// buildable once and cloned onto every dial.
+pub const CLUSTER_TLS_SERVER_NAME: &str = "ironcache-cluster";
+
+/// Build the rustls CLIENT configuration the intra-cluster DIAL path uses to wrap a freshly
+/// connected `TcpStream` (the bus `send_to_peer` dial and the replica/importer dial).
+///
+/// When `ca_path` is `Some`, the peer (server) certificate is VERIFIED against the cluster CA root
+/// loaded from that PEM: this is the standard rustls webpki verification (the DEFAULT secure posture
+/// when cluster TLS is on), so a server presenting a cert NOT signed by the cluster CA fails the
+/// handshake. This DEFEATS an active man-in-the-middle: the attacker's cert is not CA-signed, so the
+/// handshake fails BEFORE the dialer ever sends the cluster secret, closing the secret-capture hole.
+/// A single shared self-signed cert pointed at by BOTH the cert path and `ca_path` verifies against
+/// itself -- the simple no-PKI-but-secure deployment.
+///
+/// When `ca_path` is `None` the configuration depends on `insecure_skip_verify`:
+/// * `false` (the default): this is REJECTED -- callers must supply a CA when TLS is on, enforced by
+///   `Config::validate`. This branch returns a [`TlsConfigError`] so a programmatic caller that
+///   bypasses validation still cannot silently build an unverified dialer.
+/// * `true` (the explicit, NOT-recommended opt-out): an accept-any-cert verifier is installed (the
+///   link is still ENCRYPTED but the TLS layer does NOT authenticate the peer, so an active MITM can
+///   capture the cluster secret) and a LOUD boot-time warning is emitted. Peer authentication then
+///   rests solely on the shared-secret handshake -- which itself leaks to the MITM.
+///
+/// The accept-any verifier is deliberately scoped to the cluster transport (never the public client
+/// listener) and only ever reachable through the explicit insecure opt-out.
+///
+/// # Errors
+///
+/// Returns [`TlsConfigError`] if the CA file cannot be read, its PEM holds no certificate, rustls
+/// rejects the assembled root store, or `ca_path` is `None` without the explicit
+/// `insecure_skip_verify` opt-out.
+pub fn build_cluster_client_config(
+    ca_path: Option<&str>,
+    insecure_skip_verify: bool,
+) -> Result<RustlsConnector, TlsConfigError> {
+    let config = match ca_path {
+        Some(ca) => {
+            // The DEFAULT secure path: verify the peer cert against the cluster CA (webpki). An
+            // attacker without a CA-signed cert cannot complete the handshake, so the secret is never
+            // exposed to a MITM.
+            let roots = load_root_store(ca)?;
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        None if insecure_skip_verify => {
+            // The EXPLICIT insecure opt-out only: encrypted but the peer cert is NOT verified, so an
+            // active MITM can capture the cluster secret. Warn loudly so an operator running this in
+            // production sees it.
+            eprintln!(
+                "WARNING: cluster TLS peer cert verification DISABLED \
+                 (cluster_tls_insecure_skip_verify); the cluster_secret is exposed to an active MITM"
+            );
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+                .with_no_client_auth()
+        }
+        None => {
+            // No CA and no explicit insecure opt-out: refuse to build an unverified dialer. This
+            // mirrors (and backstops) Config::validate so the accept-any verifier is NEVER installed
+            // silently.
+            return Err(TlsConfigError::Pem {
+                path: "<cluster_ca_path>".to_owned(),
+                reason: "a cluster CA is required to verify peer certs when cluster TLS is on; \
+                         set cluster_ca_path (a shared self-signed cert may be its own CA), or set \
+                         cluster_tls_insecure_skip_verify=true to run encrypted-but-unverified \
+                         (NOT recommended -- the cluster_secret is then exposed to an active MITM)"
+                    .to_owned(),
+            });
+        }
+    };
+    Ok(RustlsConnector::from(Arc::new(config)))
+}
+
+/// Load a CA cert PEM at `path` into a rustls [`RootCertStore`] (every `CERTIFICATE` block is
+/// added as a trust anchor), for verifying the intra-cluster peer cert against a cluster CA.
+fn load_root_store(path: &str) -> Result<RootCertStore, TlsConfigError> {
+    let certs = load_certs(path)?;
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).map_err(TlsConfigError::Rustls)?;
+    }
+    Ok(roots)
+}
+
+/// A rustls server-certificate verifier that ACCEPTS any presented certificate, used ONLY for the
+/// intra-cluster dial when no cluster CA is configured ([`build_cluster_client_config`] with
+/// `ca_path = None`). The link is still encrypted; peer authentication is delegated to the
+/// shared-secret handshake. This is NEVER used by the public client listener (which has no client
+/// side here) and never by a CA-configured cluster; it is the self-signed-cluster-cert v1 path.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        // Advertise the ring provider's full default scheme set so a tls12 or tls13 server cert is
+        // accepted regardless of its signature algorithm (we accept the cert anyway).
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Perform the rustls CLIENT handshake on a freshly DIALED [`TcpStream`] (the intra-cluster dial:
+/// the bus `send_to_peer` and the replica/importer dial), returning a [`SecureStream::ClientTls`]
+/// the caller reads/writes transparently. Bounded by [`HANDSHAKE_TIMEOUT`] (the same slow-loris
+/// bound the accept path uses) through tokio's timer: a server that completes the TCP connect but
+/// then stalls the TLS handshake cannot pin the dialing task forever.
+///
+/// # Errors
+///
+/// Returns the [`std::io::Error`] from a failed handshake (an untrusted peer cert when a cluster
+/// CA is configured, a plaintext / non-TLS server, an unsupported version), or a
+/// [`std::io::ErrorKind::TimedOut`] if the handshake does not complete within [`HANDSHAKE_TIMEOUT`].
+pub async fn connect_tls(connector: &RustlsConnector, tcp: TcpStream) -> io::Result<SecureStream> {
+    let server_name = ServerName::try_from(CLUSTER_TLS_SERVER_NAME)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+        .to_owned();
+    let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS client handshake timed out"))??;
+    Ok(SecureStream::ClientTls(Box::new(tls)))
+}
+
+/// Perform the rustls SERVER handshake on a freshly ACCEPTED [`TcpStream`] for the intra-cluster
+/// LISTENER (the bus `RAFTMSG` listener and the replication source listener), returning a
+/// [`SecureStream::ServerTls`]. Reuses [`accept_tls`]'s bounded-handshake machinery via the same
+/// [`HANDSHAKE_TIMEOUT`]; a plaintext dialer to a TLS cluster port fails the handshake here and is
+/// dropped (not hung).
+///
+/// # Errors
+///
+/// Returns the handshake [`std::io::Error`] or a [`std::io::ErrorKind::TimedOut`] on the bound.
+pub async fn accept_cluster_tls(
+    acceptor: &RustlsAcceptor,
+    tcp: TcpStream,
+) -> io::Result<SecureStream> {
+    let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS server handshake timed out"))??;
+    Ok(SecureStream::ServerTls(Box::new(tls)))
+}
+
+/// A node-to-node intra-cluster stream: either a plain TCP connection (the DEFAULT, cluster
+/// transport security OFF -- byte-identical to before this layer) or a rustls-terminated TLS
+/// connection (the CLIENT side from [`connect_tls`] on the dial, the SERVER side from
+/// [`accept_cluster_tls`] on the listener).
+///
+/// The bus + repl transports read/write THROUGH this type (its [`Self::recv`] / [`Self::send`])
+/// so a single code path serves both plaintext and TLS. The plaintext variant is a thin
+/// passthrough to the same `TcpStream` read/write the tokio backend uses (owned-buffer model), so
+/// the default-off path is byte-identical. The TLS variants are boxed (a `TlsStream` is large) to
+/// keep the enum small for the common plaintext case.
+#[derive(Debug)]
+pub enum SecureStream {
+    /// A plaintext node-to-node connection (the default, byte-identical to the pre-PROD-3 path).
+    Plain(TcpStream),
+    /// A rustls-terminated TLS connection from the CLIENT (dial) side.
+    ClientTls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// A rustls-terminated TLS connection from the SERVER (listener) side.
+    ServerTls(Box<TlsStream<TcpStream>>),
+}
+
+impl SecureStream {
+    /// Wrap a plain stream WITHOUT TLS (the cluster-transport-security-OFF default path).
+    #[must_use]
+    pub fn plain(tcp: TcpStream) -> Self {
+        SecureStream::Plain(tcp)
+    }
+
+    /// Read into the owned `buf` (owned-buffer model), appending to its existing contents, and
+    /// return the buffer plus the byte count (0 = peer closed). The plaintext arm is the SAME read
+    /// the tokio backend runs (byte-identical); the TLS arms read decrypted application bytes out
+    /// of the rustls record layer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying read error.
+    pub async fn recv(&mut self, mut buf: Vec<u8>) -> io::Result<RecvResult<Vec<u8>>> {
+        let start = IoBuf::len(&buf);
+        let want = 16 * 1024;
+        buf.resize(start + want, 0);
+        let n = match self {
+            SecureStream::Plain(s) => s.read(&mut buf[start..]).await?,
+            SecureStream::ClientTls(s) => s.read(&mut buf[start..]).await?,
+            SecureStream::ServerTls(s) => s.read(&mut buf[start..]).await?,
+        };
+        buf.truncate(start + n);
+        Ok(RecvResult { buf, n })
+    }
+
+    /// Write all of `buf`, then RETURN the buffer (owned-buffer model). The plaintext arm is the
+    /// SAME write the tokio backend runs; the TLS arms encrypt into rustls records.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying write error.
+    pub async fn send(&mut self, buf: Vec<u8>) -> io::Result<Vec<u8>> {
+        match self {
+            SecureStream::Plain(s) => s.write_all(buf.as_ref()).await?,
+            SecureStream::ClientTls(s) => s.write_all(buf.as_ref()).await?,
+            SecureStream::ServerTls(s) => s.write_all(buf.as_ref()).await?,
+        }
+        Ok(buf)
+    }
+
+    /// Read EXACTLY `n` bytes into a fresh buffer (used by the fixed-length shared-secret handshake
+    /// read). Errors with [`std::io::ErrorKind::UnexpectedEof`] if the peer closes early.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying read error, or `UnexpectedEof` on a short read.
+    async fn read_exact_n(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        match self {
+            SecureStream::Plain(s) => s.read_exact(&mut buf).await?,
+            SecureStream::ClientTls(s) => s.read_exact(&mut buf).await?,
+            SecureStream::ServerTls(s) => s.read_exact(&mut buf).await?,
+        };
+        Ok(buf)
+    }
+}
+
+/// The wire framing of the shared-secret AUTH handshake performed RIGHT AFTER the TLS handshake
+/// (and on a plaintext link when only a secret is configured), BEFORE any RAFTMSG / repl byte is
+/// exchanged: a fixed 4-byte big-endian length prefix followed by the secret bytes. Bounded by
+/// [`MAX_SECRET_LEN`] so a peer cannot claim a huge secret length to drive an allocation; the
+/// secret is compared in CONSTANT TIME ([`constant_time_eq`]). A length-prefixed frame (not a
+/// delimiter) keeps the secret opaque binary and lets either side detect a truncated handshake.
+const SECRET_LEN_PREFIX: usize = 4;
+
+/// Upper bound on the secret length accepted off the wire in [`read_peer_secret`], so the 4-byte
+/// length prefix cannot drive a large pre-handshake allocation. A cluster secret is a short
+/// shared token; 4 KiB is far above any sane secret yet a trivial allocation if forged.
+pub const MAX_SECRET_LEN: usize = 4096;
+
+/// Errors from the shared-secret peer-authentication handshake on an intra-cluster link.
+#[derive(Debug)]
+pub enum SecretError {
+    /// An I/O error sending or receiving the secret frame.
+    Io(io::Error),
+    /// The peer's secret frame was malformed (a length over [`MAX_SECRET_LEN`], or a short read).
+    Malformed,
+    /// The peer presented a secret that did NOT match (constant-time compared): it is NOT a
+    /// trusted cluster member and the connection MUST be dropped.
+    Mismatch,
+}
+
+impl std::fmt::Display for SecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretError::Io(e) => write!(f, "cluster secret handshake I/O error: {e}"),
+            SecretError::Malformed => write!(f, "cluster secret handshake frame malformed"),
+            SecretError::Mismatch => write!(f, "cluster peer presented an incorrect secret"),
+        }
+    }
+}
+
+impl std::error::Error for SecretError {}
+
+/// Send THIS node's cluster `secret` over `stream` as a length-prefixed frame (the first bytes
+/// after the TLS handshake, before any RAFTMSG / repl data). Both the dialer and the acceptor send
+/// their secret and verify the peer's, so authentication is MUTUAL.
+///
+/// # Errors
+///
+/// Returns [`SecretError::Io`] on a write failure.
+pub async fn send_secret(stream: &mut SecureStream, secret: &[u8]) -> Result<(), SecretError> {
+    let len = u32::try_from(secret.len()).map_err(|_| SecretError::Malformed)?;
+    let mut frame = Vec::with_capacity(SECRET_LEN_PREFIX + secret.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(secret);
+    stream.send(frame).await.map_err(SecretError::Io)?;
+    Ok(())
+}
+
+/// Read the PEER's secret frame off `stream` and verify it against the expected `secret` in
+/// CONSTANT TIME. A length over [`MAX_SECRET_LEN`] or a short read is [`SecretError::Malformed`];
+/// a non-matching secret is [`SecretError::Mismatch`] (the caller MUST drop the connection). On
+/// success the peer is an authenticated cluster member.
+///
+/// # Errors
+///
+/// Returns [`SecretError::Io`] on a read failure, [`SecretError::Malformed`] on a bad frame, or
+/// [`SecretError::Mismatch`] on a wrong secret.
+pub async fn read_peer_secret(stream: &mut SecureStream, secret: &[u8]) -> Result<(), SecretError> {
+    let prefix = stream
+        .read_exact_n(SECRET_LEN_PREFIX)
+        .await
+        .map_err(SecretError::Io)?;
+    let len = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+    if len > MAX_SECRET_LEN {
+        return Err(SecretError::Malformed);
+    }
+    let presented = stream.read_exact_n(len).await.map_err(SecretError::Io)?;
+    if constant_time_eq(&presented, secret) {
+        Ok(())
+    } else {
+        Err(SecretError::Mismatch)
+    }
+}
+
+/// Perform the full peer-authentication handshake on a freshly secured `stream` (after any TLS
+/// handshake): send OUR secret, then read + verify the PEER's, both bounded. Used identically by
+/// the bus dial / accept and the repl dial / accept so the order is symmetric (both sides send
+/// then read). A wrong / absent secret drops the connection: an attacker who reached the port but
+/// lacks the secret cannot join the bus, forge RAFTMSG, or pull the repl stream.
+///
+/// # Errors
+///
+/// Propagates [`SecretError`] (I/O, malformed, or mismatch).
+pub async fn authenticate_peer(
+    stream: &mut SecureStream,
+    secret: &[u8],
+) -> Result<(), SecretError> {
+    send_secret(stream, secret).await?;
+    read_peer_secret(stream, secret).await
+}
+
+/// [`authenticate_peer`] BOUNDED by [`HANDSHAKE_TIMEOUT`] (SECURITY, the PROD-3 bus slow-loris fix).
+/// The secret exchange runs AFTER the (already bounded) TLS handshake but the secret read itself had
+/// NO timeout: a peer that completes TLS then STALLS sending its secret would otherwise pin the serve
+/// / dial task forever. Wrapping the WHOLE send-then-read in `tokio::time::timeout` (the same timer
+/// seam + const the accept / connect handshakes use) drops a stalled exchange after the bound,
+/// surfaced as a [`SecretError::Io`] of kind [`std::io::ErrorKind::TimedOut`] so the caller drops the
+/// connection. The runtime crate owns this (it is the only place `tokio::time` is pulled in), so the
+/// cluster-bus crate does not take a tokio-time dependency just for the bound.
+///
+/// # Errors
+///
+/// Propagates [`SecretError`] (I/O, malformed, or mismatch), or a [`SecretError::Io`] of kind
+/// `TimedOut` if the exchange does not complete within [`HANDSHAKE_TIMEOUT`].
+pub async fn authenticate_peer_bounded(
+    stream: &mut SecureStream,
+    secret: &[u8],
+) -> Result<(), SecretError> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate_peer(stream, secret))
+        .await
+        .map_err(|_| {
+            SecretError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cluster secret handshake timed out",
+            ))
+        })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +807,180 @@ mod tests {
             assert_eq!(&reply, b"+PONG\r\n");
             server.await.unwrap();
         });
+    }
+
+    // --- Intra-cluster transport security (PROD-3) ---
+
+    #[test]
+    fn constant_time_eq_matches_naive_equality() {
+        // The constant-time secret compare must agree with `==` on the boolean RESULT (only the
+        // TIMING differs). Exercise equal, differing-byte, and differing-length pairs.
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn build_cluster_client_config_requires_ca_unless_insecure() {
+        // SECURITY (PROD-3 MITM fix): the DEFAULT (no CA, verification ON) is REJECTED so an
+        // unverified dialer is never built silently -- the cluster secret would otherwise be exposed
+        // to a MITM. With a CA pointing at the test cert -> the webpki-VERIFYING path builds (the
+        // RootCertStore is non-empty, accept-any is NOT used). Only the EXPLICIT insecure opt-out
+        // builds an accept-any connector.
+        let no_ca_default = build_cluster_client_config(None, false).map(|_| ());
+        assert!(
+            no_ca_default.is_err(),
+            "no-CA without the insecure flag MUST be rejected (the secret would leak to a MITM): \
+             {no_ca_default:?}"
+        );
+
+        // The verifying path: a CA is configured, so a (non-empty) RootCertStore is built and the
+        // standard webpki verifier is installed. Asserting the connector builds with a CA (and the
+        // accept-any-only no-CA-default path errors above) proves the verifying config is the one
+        // built when a CA is set.
+        let ca = temp_pem("ca", TEST_CERT);
+        let with_ca = build_cluster_client_config(Some(&ca.to_string_lossy()), false).map(|_| ());
+        assert!(
+            with_ca.is_ok(),
+            "a CA-configured (verifying) connector should build: {with_ca:?}"
+        );
+        // The CA PEM must hold a real cert: the RootCertStore is non-empty (load_root_store added
+        // the trust anchor), which is what makes the webpki verification meaningful.
+        let roots = load_root_store(&ca.to_string_lossy()).expect("CA loads");
+        assert!(
+            !roots.is_empty(),
+            "a configured CA must yield a non-empty RootCertStore (the verifying trust anchor)"
+        );
+        let _ = std::fs::remove_file(&ca);
+
+        // The EXPLICIT insecure opt-out builds an accept-any connector (encrypted, NOT verified).
+        let no_ca_insecure = build_cluster_client_config(None, true).map(|_| ());
+        assert!(
+            no_ca_insecure.is_ok(),
+            "the explicit insecure opt-out should build an accept-any connector: {no_ca_insecure:?}"
+        );
+    }
+
+    #[test]
+    fn secret_handshake_round_trip_and_mismatch_over_plaintext() {
+        // The shared-secret handshake is symmetric (both sides send then verify). Over a loopback
+        // PLAIN SecureStream (no TLS, so the test is hermetic + fast), a MATCHING secret authenticates
+        // both peers; a MISMATCH yields SecretError::Mismatch and the connection is rejected.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            // Case 1: matching secret on both ends -> both authenticate_peer return Ok.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::task::spawn_local(async move {
+                let (tcp, _peer) = listener.accept().await.unwrap();
+                let mut s = SecureStream::plain(tcp);
+                authenticate_peer(&mut s, b"cluster-secret").await
+            });
+            let client_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = SecureStream::plain(client_tcp);
+            let client_res = authenticate_peer(&mut client, b"cluster-secret").await;
+            assert!(client_res.is_ok(), "client auth: {client_res:?}");
+            assert!(server.await.unwrap().is_ok(), "server auth should succeed");
+
+            // Case 2: WRONG secret on the client -> the server's read_peer_secret rejects it.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::task::spawn_local(async move {
+                let (tcp, _peer) = listener.accept().await.unwrap();
+                let mut s = SecureStream::plain(tcp);
+                // The server presents the RIGHT secret and verifies the peer's (which is wrong).
+                authenticate_peer(&mut s, b"cluster-secret").await
+            });
+            let client_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = SecureStream::plain(client_tcp);
+            // The client presents the WRONG secret; it still verifies the server's (which matches
+            // the client's expectation? no -- the client expects "wrong-secret", server sends
+            // "cluster-secret", so the client ALSO sees a mismatch). Either way at least one side
+            // rejects; assert the SERVER (the listener admitting a peer) rejects the wrong secret.
+            let _ = authenticate_peer(&mut client, b"wrong-secret").await;
+            let server_res = server.await.unwrap();
+            assert!(
+                matches!(server_res, Err(SecretError::Mismatch)),
+                "the server must REJECT a peer presenting the wrong secret, got {server_res:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn authenticate_peer_bounded_drops_a_stalled_handshake() {
+        // SECURITY (PROD-3 slow-loris fix): a peer that connects (and would complete TLS) but then
+        // STALLS sending its secret must be dropped within HANDSHAKE_TIMEOUT, not pin the task
+        // forever. Over a loopback PLAIN SecureStream (hermetic; the secret read is the same code on
+        // any SecureStream variant), the client connects and sends NOTHING. With tokio's clock
+        // PAUSED (auto-advancing to the next timer when idle), the server's bounded handshake fires
+        // its timeout near-instantly in wall-clock and returns a TimedOut io error.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::task::spawn_local(async move {
+                let (tcp, _peer) = listener.accept().await.unwrap();
+                let mut s = SecureStream::plain(tcp);
+                authenticate_peer_bounded(&mut s, b"cluster-secret").await
+            });
+            // The client connects then STALLS: it holds the socket open and sends nothing, so the
+            // server's read never completes on its own. Keep the stream alive so the OS does not
+            // close it (which would surface as an EOF, not the timeout we are asserting).
+            let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let res = server.await.unwrap();
+            assert!(
+                matches!(
+                    &res,
+                    Err(SecretError::Io(e)) if e.kind() == io::ErrorKind::TimedOut
+                ),
+                "a stalled secret handshake must be dropped with a TimedOut error, got {res:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn read_peer_secret_rejects_oversized_length_prefix() {
+        // A forged length prefix over MAX_SECRET_LEN is rejected as Malformed BEFORE allocating the
+        // claimed body, bounding a pre-handshake allocation DoS.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            use tokio::io::AsyncWriteExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::task::spawn_local(async move {
+                let (tcp, _peer) = listener.accept().await.unwrap();
+                let mut s = SecureStream::plain(tcp);
+                read_peer_secret(&mut s, b"cluster-secret").await
+            });
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // A 4-byte big-endian length far over MAX_SECRET_LEN (0xFFFFFFFF), then nothing.
+            client.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+            let res = server.await.unwrap();
+            assert!(
+                matches!(res, Err(SecretError::Malformed)),
+                "an over-cap secret length must be rejected as Malformed, got {res:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn max_cluster_frame_len_is_the_documented_cap() {
+        // The frame bound is 512 MiB (Redis proto-max-bulk-len), enforced by the bus + repl parsers.
+        assert_eq!(crate::MAX_CLUSTER_FRAME_LEN, 512 * 1024 * 1024);
     }
 }

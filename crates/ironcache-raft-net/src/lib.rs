@@ -536,6 +536,11 @@ where
     /// because the resolved type differs (`MembershipOutcome`, not `Option<u64>`); owned solely by
     /// the run loop (no lock).
     pending_membership: BTreeMap<u64, PendingMembership>,
+    /// The optional intra-cluster transport SECURITY (PROD-3): the TLS connector + the shared
+    /// secret applied to every outbound `RAFTMSG` dial in [`Self::send_to_peer`]. `None` (the
+    /// default) is the plaintext bus, byte-unchanged. Cheap to clone onto each dial (the rustls
+    /// config + secret are behind `Arc`s).
+    security: Option<ironcache_clusterbus::ClusterSecurity>,
 }
 
 /// An OPERATOR membership change appended on this leader but not yet COMMITTED (HA-prod-membership).
@@ -553,6 +558,11 @@ impl<R, S, M> RaftClusterBusNode<R, S, M>
 where
     R: Runtime + Clone + 'static,
     R::Buf: From<Vec<u8>> + Into<Vec<u8>>,
+    // The secure dial (PROD-3) TLS-wraps a concrete tokio `TcpStream`; the production `TokioRuntime`
+    // satisfies this (its `Stream` IS `TcpStream`, reflexively `Into<TcpStream>`). The plaintext
+    // path never invokes the conversion, so a non-tokio runtime that ran the bus would only need
+    // this bound to be SATISFIABLE (it is, for `TcpStream`); the bus is only ever driven by tokio.
+    R::Stream: Into<tokio::net::TcpStream>,
     S: RaftStorage,
     M: StateMachine,
 {
@@ -569,6 +579,22 @@ where
         env: SystemEnv,
         rt: R,
         peers: BTreeMap<NodeId, PeerEndpoint>,
+    ) -> (Self, NodeHandle) {
+        Self::new_secure(raft, env, rt, peers, None)
+    }
+
+    /// Like [`Self::new`] but with the optional intra-cluster transport SECURITY (PROD-3): every
+    /// outbound `RAFTMSG` dial is then TLS-wrapped (if a connector is configured) and the shared
+    /// secret is presented + verified before any message is sent. `None` is the plaintext bus
+    /// (byte-unchanged). The boot wiring builds the [`ironcache_clusterbus::ClusterSecurity`] from
+    /// the configured cluster cert/key/CA + secret and passes the SAME handle to the listener.
+    #[must_use]
+    pub fn new_secure(
+        raft: RaftNode<S, M>,
+        env: SystemEnv,
+        rt: R,
+        peers: BTreeMap<NodeId, PeerEndpoint>,
+        security: Option<ironcache_clusterbus::ClusterSecurity>,
     ) -> (Self, NodeHandle) {
         let id = raft.id();
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
@@ -621,6 +647,7 @@ where
             status_tx,
             config_tx,
             pending_membership: BTreeMap::new(),
+            security,
         };
         (node, handle)
     }
@@ -1313,7 +1340,14 @@ where
         // here (per dial), so a restarted peer's new IP is picked up; a resolution failure is logged,
         // not a silent drop, and the next heartbeat retries.
         if !self.conns.contains_key(&to) {
-            match PeerConn::connect_endpoint(&self.rt, &endpoint).await {
+            // SECURITY (PROD-3): dial with the configured cluster security. When `self.security` is
+            // Some the dialed TcpStream is TLS-wrapped + the shared secret is presented/verified
+            // before any RAFTMSG is sent; when None this is the plaintext dial, byte-unchanged. A
+            // secure-handshake failure (untrusted peer, wrong secret) is logged + skipped (Raft
+            // re-sends next heartbeat), exactly like an I/O failure -- never a silent voter drop.
+            match PeerConn::connect_endpoint_secure(&self.rt, &endpoint, self.security.as_ref())
+                .await
+            {
                 Ok(conn) => {
                     self.conns.insert(to, conn);
                 }
@@ -1321,6 +1355,15 @@ where
                     // LOUD, never silent: a peer whose DNS does not (yet) resolve is reported so an
                     // operator can diagnose it, then skipped this round (Raft re-sends next heartbeat).
                     eprintln!("raft cluster-bus: cannot resolve peer {}: {e}", to.0);
+                    return;
+                }
+                Err(ironcache_clusterbus::BusError::Secure(e)) => {
+                    // A peer that failed the TLS / secret handshake is not a trusted cluster member
+                    // (or is misconfigured): logged loudly, skipped this round.
+                    eprintln!(
+                        "raft cluster-bus: peer {} failed secure handshake: {e}",
+                        to.0
+                    );
                     return;
                 }
                 Err(_) => return, // reconnect on the next send
@@ -1412,6 +1455,29 @@ pub async fn run_listener<R>(rt: R, listener: R::Listener, inbox: mpsc::Unbounde
 where
     R: Runtime + Clone + 'static,
     R::Buf: From<Vec<u8>> + Into<Vec<u8>>,
+    R::Stream: Into<tokio::net::TcpStream>,
+{
+    run_listener_secure::<R>(rt, listener, inbox, None).await;
+}
+
+/// Like [`run_listener`] but applies the optional intra-cluster transport SECURITY (PROD-3): when
+/// `security` is `Some`, every accepted connection is TLS-terminated (a rustls SERVER handshake) and
+/// the peer's shared secret is verified BEFORE any `RAFTMSG` is read; a plaintext dialer to a TLS
+/// port or a peer without the secret fails the handshake and is dropped. When `None`, this is
+/// byte-identical to the plaintext listener.
+///
+/// The secure path needs the accepted stream to be a tokio `TcpStream` (the production
+/// `TokioRuntime::Stream`), expressed by the `Into<TcpStream>` bound; the deterministic-simulation
+/// runtimes never carry security (they drive the pure engine, not this transport).
+pub async fn run_listener_secure<R>(
+    rt: R,
+    listener: R::Listener,
+    inbox: mpsc::UnboundedSender<Event>,
+    security: Option<ironcache_clusterbus::ClusterSecurity>,
+) where
+    R: Runtime + Clone + 'static,
+    R::Buf: From<Vec<u8>> + Into<Vec<u8>>,
+    R::Stream: Into<tokio::net::TcpStream>,
 {
     loop {
         let Ok((stream, _peer)) = rt.accept(&listener).await else {
@@ -1422,17 +1488,44 @@ where
         // peer cannot block accepting the others.
         let rt2 = rt.clone();
         let inbox2 = inbox.clone();
+        let security2 = security.clone();
         rt.spawn_on_shard(async move {
-            serve_conn::<R>(&rt2, stream, &inbox2).await;
+            // SECURITY (PROD-3): wrap the accepted stream. When configured, the rustls SERVER
+            // handshake + the shared-secret verification run here, BEFORE serve_conn reads a single
+            // RAFTMSG byte: a peer that cannot complete the secure handshake never reaches the
+            // command path (it cannot forge consensus). The wrap is bounded (handshake timeout); a
+            // failure drops the connection (the peer reconnects).
+            let bus = match security2 {
+                None => ironcache_clusterbus::BusStream::<R>::Runtime(stream),
+                #[cfg(feature = "tls")]
+                Some(sec) => match sec.accept(stream.into()).await {
+                    Ok(secure) => ironcache_clusterbus::BusStream::<R>::Secure(secure),
+                    Err(e) => {
+                        // A failed TLS / secret handshake: drop the connection. Logged loudly so an
+                        // operator sees a rejected (possibly hostile, or misconfigured) peer.
+                        eprintln!(
+                            "raft cluster-bus: rejected inbound peer (secure handshake): {e}"
+                        );
+                        return;
+                    }
+                },
+                #[cfg(not(feature = "tls"))]
+                Some(_) => ironcache_clusterbus::BusStream::<R>::Runtime(stream),
+            };
+            serve_conn::<R>(&rt2, bus, &inbox2).await;
         });
     }
 }
 
 /// Serve one accepted connection: decode `RAFTMSG` commands, feed [`Event::Inbound`]
 /// to the inbox, reply `+OK`. Returns when the peer closes or sends a malformed /
-/// undecodable frame.
-async fn serve_conn<R>(rt: &R, mut stream: R::Stream, inbox: &mpsc::UnboundedSender<Event>)
-where
+/// undecodable frame. Reads / writes through [`ironcache_clusterbus::BusStream`] so the
+/// plaintext and the secure (TLS / secret) transports share one serve loop.
+async fn serve_conn<R>(
+    rt: &R,
+    mut stream: ironcache_clusterbus::BusStream<R>,
+    inbox: &mpsc::UnboundedSender<Event>,
+) where
     R: Runtime,
     R::Buf: From<Vec<u8>> + Into<Vec<u8>>,
 {
@@ -1449,7 +1542,7 @@ where
                 // Acknowledge so the sender's `request` (which reads exactly one
                 // reply) completes and it can pipeline the next message.
                 let ok = b"+OK\r\n".to_vec();
-                if rt.send(&mut stream, ok.into()).await.is_err() {
+                if stream.send(rt, ok).await.is_err() {
                     return;
                 }
                 // Loop to parse any further buffered commands before reading again.
@@ -1460,13 +1553,13 @@ where
         }
 
         // Need more bytes: read another chunk, appending to `pending`.
-        let taken: R::Buf = core::mem::take(&mut pending).into();
-        match rt.recv(&mut stream, taken).await {
+        let taken = core::mem::take(&mut pending);
+        match stream.recv(rt, taken).await {
             Ok(res) => {
                 if res.n == 0 {
                     return; // peer closed
                 }
-                pending = res.buf.into();
+                pending = res.buf;
             }
             Err(_) => return,
         }
@@ -1537,6 +1630,16 @@ fn parse_command_array(buf: &[u8]) -> Result<Option<ParsedCommand>, ()> {
             return Ok(None);
         };
         let len = usize::try_from(len).map_err(|_| ())?;
+        // FRAME BOUND (PROD-3, memory-DoS fix): reject a per-arg length over the cluster frame cap
+        // BEFORE waiting for / allocating the body. The length is attacker-controlled (a forged
+        // RAFTMSG frame), and without this an over-cap `$<huge>\r\n` header drives `pending` to grow
+        // unboundedly as `serve_conn` keeps reading to satisfy the claimed body length, OOMing the
+        // node. A real RAFTMSG (an AppendEntries batch of small log entries) is far under the cap.
+        // Enforced on the (default) plaintext path too: it is a parser-correctness fix, not a TLS
+        // feature, so a plaintext cluster is hardened against the DoS as well.
+        if len > ironcache_runtime::MAX_CLUSTER_FRAME_LEN {
+            return Err(());
+        }
         let body_start = next;
         let body_end = body_start.checked_add(len).ok_or(())?;
         let crlf_end = body_end.checked_add(2).ok_or(())?;
@@ -2061,6 +2164,47 @@ mod tests {
         assert_eq!(got_from, NodeId(2));
         assert_eq!(got_msg, msg);
         assert_eq!(consumed, frame.len());
+    }
+
+    /// PROD-3 FRAME BOUND: a RAFTMSG frame whose per-arg length header claims MORE than
+    /// `MAX_CLUSTER_FRAME_LEN` is REJECTED (`Err`) at parse time, BEFORE the body is awaited /
+    /// allocated -- so a forged huge length cannot drive an unbounded buffer growth (memory DoS).
+    /// A length AT the cap is still accepted (so the bound never rejects a legitimate frame).
+    #[test]
+    fn raftmsg_frame_over_the_length_cap_is_rejected() {
+        let over = ironcache_runtime::MAX_CLUSTER_FRAME_LEN + 1;
+        // A well-formed array header, then a bulk-string arg claiming an over-cap body length. Only
+        // the HEADER bytes are present (no body): without the cap the parser would return Ok(None)
+        // "need more bytes" and the serve loop would keep reading to satisfy the huge length. With
+        // the cap it is rejected immediately as Err (the connection is dropped).
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"*3\r\n");
+        frame.extend_from_slice(format!("${}\r\n", RAFTMSG.len()).as_bytes());
+        frame.extend_from_slice(RAFTMSG);
+        frame.extend_from_slice(b"\r\n");
+        frame.extend_from_slice(b"$1\r\n2\r\n");
+        frame.extend_from_slice(format!("${over}\r\n").as_bytes());
+        assert_eq!(
+            parse_raftmsg_command(&frame),
+            Err(()),
+            "an over-cap per-arg length must be rejected, not awaited (memory DoS)"
+        );
+
+        // A length AT the cap (the body not yet present) is NOT rejected by the cap -- it is a
+        // legitimate (if large) frame, so the parser asks for more bytes rather than erroring.
+        let at = ironcache_runtime::MAX_CLUSTER_FRAME_LEN;
+        let mut ok_frame = Vec::new();
+        ok_frame.extend_from_slice(b"*3\r\n");
+        ok_frame.extend_from_slice(format!("${}\r\n", RAFTMSG.len()).as_bytes());
+        ok_frame.extend_from_slice(RAFTMSG);
+        ok_frame.extend_from_slice(b"\r\n");
+        ok_frame.extend_from_slice(b"$1\r\n2\r\n");
+        ok_frame.extend_from_slice(format!("${at}\r\n").as_bytes());
+        assert_eq!(
+            parse_raftmsg_command(&ok_frame),
+            Ok(None),
+            "a length AT the cap is legitimate; the parser must ask for more bytes, not reject"
+        );
     }
 
     // -- HA-prod-commit-ack: the adapter pending_commits resolution -----------

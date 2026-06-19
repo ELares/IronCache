@@ -13,6 +13,13 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# `tls` (default ON) forwards the intra-cluster transport security (PROD-3) to the clusterbus +
+# runtime crates: the secure listener wrap + the secure dial. With `tls` OFF the adapter compiles
+# plaintext-only (the ClusterSecurity argument is always None), byte-unchanged.
+default = ["tls"]
+tls = ["ironcache-clusterbus/tls", "ironcache-runtime/tls"]
+
 [dependencies]
 # The PURE step engine this crate drives. The adapter never reimplements consensus;
 # it feeds the engine events and drains its Effects (ADR-0027).

@@ -242,6 +242,11 @@ pub enum TlsMode {
 }
 
 /// The fully-resolved, effective configuration the server boots from.
+// This is a flat Redis-style config record: each bool is an INDEPENDENT operator knob
+// (`default_resp3`, `cluster_enabled`, `cluster_raft_joining`, `cluster_tls_insecure_skip_verify`),
+// not a hidden state machine. Folding them into enums would obscure, not clarify, the 1:1 mapping to
+// the documented TOML/env knobs, so the excessive-bools lint is allowed here by design.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Address to bind the RESP listener.
@@ -398,6 +403,59 @@ pub struct Config {
     /// Meaningful only when [`Self::save_interval_secs`] is non-zero. TOML (`save_min_changes = 1`)
     /// + the `IRONCACHE_SAVE_MIN_CHANGES` env var.
     pub save_min_changes: u64,
+    /// The INTRA-CLUSTER transport-TLS posture (PROD-3): whether the node-to-node links (the Raft
+    /// cluster-bus `RAFTMSG` control plane AND the replication stream) are TLS-encrypted. Defaults
+    /// to [`TlsMode::Off`] (PLAINTEXT, byte-unchanged: no handshake, no secret check, exactly the
+    /// pre-PROD-3 wire). [`TlsMode::On`] makes BOTH the bus + repl listeners perform a rustls SERVER
+    /// handshake on accept and the dials perform a rustls CLIENT handshake, REQUIRING
+    /// [`Self::cluster_tls_cert_path`] + [`Self::cluster_tls_key_path`]. SEPARATE from [`Self::tls`]
+    /// (the public CLIENT listener): a deployment can run a public TLS client port AND an internal
+    /// TLS cluster bus independently. TOML (`cluster_tls = "on"`) + the `IRONCACHE_CLUSTER_TLS` env
+    /// var. Meaningful only in raft-governance / replication deployments (a standalone node has no
+    /// peer links), but the knob is general.
+    pub cluster_tls: TlsMode,
+    /// Path to the PEM certificate CHAIN the intra-cluster TLS listener (bus + repl) presents
+    /// (PROD-3). REQUIRED + readable when [`Self::cluster_tls`] is [`TlsMode::On`]; ignored when off.
+    /// May reuse the public [`Self::tls_cert_path`] cert or be a dedicated cluster cert. TOML
+    /// (`cluster_tls_cert_path = "..."`) + the `IRONCACHE_CLUSTER_TLS_CERT_PATH` env var.
+    pub cluster_tls_cert_path: Option<PathBuf>,
+    /// Path to the PEM PRIVATE KEY (PKCS#8 / RSA / SEC1) matching [`Self::cluster_tls_cert_path`]
+    /// (PROD-3). REQUIRED + readable when [`Self::cluster_tls`] is [`TlsMode::On`]; ignored when off.
+    /// TOML (`cluster_tls_key_path = "..."`) + the `IRONCACHE_CLUSTER_TLS_KEY_PATH` env var.
+    pub cluster_tls_key_path: Option<PathBuf>,
+    /// OPTIONAL path to the PEM cluster CA the intra-cluster DIAL verifies the PEER cert against
+    /// (PROD-3, the stronger posture). When set, a dialed peer presenting a cert NOT signed by this
+    /// CA fails the TLS handshake (standard webpki verification). When `None` (the default), the
+    /// dial uses an accept-the-cert verifier (the link is still ENCRYPTED) and peer AUTHENTICATION
+    /// relies on the [`Self::cluster_secret`] shared-secret handshake -- the pragmatic v1 for a
+    /// self-signed cluster cert. mTLS (client-cert verification) is the documented stronger
+    /// follow-up. TOML (`cluster_ca_path = "..."`) + the `IRONCACHE_CLUSTER_CA_PATH` env var.
+    pub cluster_ca_path: Option<PathBuf>,
+    /// The SHARED CLUSTER SECRET (PROD-3): a token every node holds and presents in a constant-time
+    /// handshake right after the TLS handshake (or right after the TCP connect when only a secret is
+    /// configured), on BOTH the bus and the repl link. A peer that does not present the correct
+    /// secret is DROPPED, so an attacker who reaches the port cannot join the bus, forge `RAFTMSG`,
+    /// or pull the replication stream even if they complete a TLS handshake. REQUIRED when
+    /// [`Self::cluster_tls`] is on; MAY also be set WITHOUT TLS to add peer authentication to a
+    /// plaintext bus (the secret travels in cleartext then, so TLS+secret is the recommended pairing
+    /// -- documented). `None` (the default) means NO secret check (the pre-PROD-3 behavior). TOML
+    /// (`cluster_secret = "..."`) + the `IRONCACHE_CLUSTER_SECRET` env var. Held in cleartext in the
+    /// long-lived `Config` (it is compared against the peer's, not stored hashed).
+    pub cluster_secret: Option<String>,
+    /// EXPLICIT, NOT-RECOMMENDED opt-in to run the intra-cluster TLS dial WITHOUT verifying the peer
+    /// certificate (PROD-3 security fix). When `cluster_tls = on`, the dial verifies the peer cert
+    /// against [`Self::cluster_ca_path`] by default, which DEFEATS an active man-in-the-middle: an
+    /// attacker presenting its own cert is not signed by the cluster CA, so the TLS handshake fails
+    /// BEFORE the [`Self::cluster_secret`] is ever sent. Without a CA the secret would be exposed to
+    /// a MITM, so a CA is REQUIRED when TLS is on -- UNLESS this flag is `true`, which installs an
+    /// accept-any-cert verifier (the link is encrypted but UNAUTHENTICATED at the TLS layer, so an
+    /// active MITM can capture the `cluster_secret`). When `true` the server logs a LOUD boot-time
+    /// warning. A shared self-signed cert pointed at by BOTH `cluster_tls_cert_path` AND
+    /// `cluster_ca_path` verifies against itself, so this flag is NOT needed for the simple
+    /// no-PKI-but-secure deployment -- prefer that. Defaults to `false`. TOML
+    /// (`cluster_tls_insecure_skip_verify = true`) + the `IRONCACHE_CLUSTER_TLS_INSECURE_SKIP_VERIFY`
+    /// env var.
+    pub cluster_tls_insecure_skip_verify: bool,
 }
 
 impl Default for Config {
@@ -462,6 +520,17 @@ impl Default for Config {
             // when a data_dir is set). A non-zero interval + a data_dir enables the cadence.
             save_interval_secs: 0,
             save_min_changes: 0,
+            // INTRA-CLUSTER transport security is OFF by default (PROD-3): the bus + repl links are
+            // plaintext and byte-unchanged (no handshake, no secret check). Turning it on is opt-in
+            // and requires a cert + key (+ secret). The CA + secret default to None.
+            cluster_tls: TlsMode::Off,
+            cluster_tls_cert_path: None,
+            cluster_tls_key_path: None,
+            cluster_ca_path: None,
+            cluster_secret: None,
+            // Peer-cert verification is ON by default when cluster TLS is on (a CA is required, so
+            // the secret is never exposed to a MITM). This insecure escape hatch is opt-in only.
+            cluster_tls_insecure_skip_verify: false,
         }
     }
 }
@@ -620,6 +689,12 @@ impl Config {
         // into a helper so `validate` stays within the line budget and the TLS pre-flight lives in
         // one place.
         self.validate_tls()?;
+        // INTRA-CLUSTER TRANSPORT SECURITY (PROD-3). A no-op when `cluster_tls = off` AND no secret
+        // is set (the default), so the plaintext bus + repl path is byte-unchanged; otherwise it
+        // requires a readable cert + key (+ a secret) for a TLS cluster, or just a secret for a
+        // plaintext-but-authenticated cluster. Factored into a helper so `validate` stays within the
+        // line budget.
+        self.validate_cluster_transport()?;
         // CLUSTER TOPOLOGY (CLUSTER_CONTRACT.md #70, slice 2). When cluster mode is enabled
         // AND a static topology is configured, it must be a COMPLETE, non-overlapping,
         // well-formed map that includes THIS node (by announce id). A topology is opt-in: a
@@ -707,6 +782,131 @@ impl Config {
                 field: "tls_key_path",
                 reason: format!("cannot read private key at {}: {e}", key.display()),
             });
+        }
+        Ok(())
+    }
+
+    /// Validate the intra-cluster transport-security pre-flight (PROD-3). A NO-OP when
+    /// `cluster_tls = off` AND no `cluster_secret` is set (the default), so the plaintext bus + repl
+    /// path is byte-unchanged. The rules when configured:
+    ///
+    /// * `cluster_tls = on` REQUIRES a `cluster_tls_cert_path` + `cluster_tls_key_path` (both
+    ///   readable at boot, like the public TLS knobs) AND a `cluster_secret`: a TLS cluster bus with
+    ///   no peer secret would encrypt the link but NOT authenticate the peer (any party that can
+    ///   complete a TLS handshake to a self-signed cluster cert could still join), which defeats the
+    ///   forge-consensus / siphon-keyspace defense, so the secret is mandatory under TLS. A TLS
+    ///   cluster with no usable cert/key would reject every handshake, so a missing/unreadable
+    ///   cert/key is a LOUD boot error.
+    /// * `cluster_tls = on` ALSO REQUIRES a `cluster_ca_path` (the CA/cert that signs peer certs) so
+    ///   the dial VERIFIES the peer cert -- without it the dial would accept any cert and the
+    ///   `cluster_secret` would be sent to an active man-in-the-middle (the MITM secret-capture this
+    ///   fix closes). The one exception is the explicit `cluster_tls_insecure_skip_verify = true`
+    ///   opt-out (NOT recommended), which runs encrypted-but-unverified. A single shared self-signed
+    ///   cert may serve as its own CA (point `cluster_ca_path` at it).
+    /// * The optional `cluster_ca_path`, when set, must be readable (it is loaded into the dial's
+    ///   peer-cert verifier). Setting it WITHOUT `cluster_tls = on` is rejected (a CA is only used by
+    ///   the TLS dial, so it would silently do nothing).
+    /// * A `cluster_secret` MAY be set WITHOUT TLS (plaintext-but-authenticated bus). This is
+    ///   allowed but the secret then travels in cleartext, so TLS+secret is the recommended pairing
+    ///   (documented on [`Config::cluster_secret`]).
+    /// * An EMPTY `cluster_secret` is rejected (an operator who set the knob to "" almost certainly
+    ///   meant to disable it -- unset it instead -- and an empty shared secret is no authentication).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Invalid`] naming the offending field when a required value is missing,
+    /// empty, or unreadable.
+    fn validate_cluster_transport(&self) -> Result<(), ConfigError> {
+        let tls_on = self.cluster_tls == TlsMode::On;
+        // An empty secret is a misconfiguration regardless of TLS: it is no authentication and is
+        // almost certainly a typo for "unset". Reject it loudly.
+        if let Some(secret) = &self.cluster_secret {
+            if secret.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "cluster_secret",
+                    reason: "must not be empty when set (unset it to disable peer authentication)"
+                        .to_owned(),
+                });
+            }
+        }
+        // A CA without TLS would silently do nothing (the CA is only consulted by the TLS dial's
+        // peer-cert verifier); reject it so the operator's intent is not silently dropped.
+        if self.cluster_ca_path.is_some() && !tls_on {
+            return Err(ConfigError::Invalid {
+                field: "cluster_ca_path",
+                reason: "is only used by the TLS cluster dial; set cluster_tls = on to use it"
+                    .to_owned(),
+            });
+        }
+        if !tls_on {
+            // Plaintext cluster: nothing else to pre-flight (a bare secret is allowed and validated
+            // above; the default no-secret path is fully byte-unchanged).
+            return Ok(());
+        }
+        // TLS on: a cert + key + secret are required, and the cert/key/CA must be readable.
+        let cert = self
+            .cluster_tls_cert_path
+            .as_ref()
+            .ok_or_else(|| ConfigError::Invalid {
+                field: "cluster_tls_cert_path",
+                reason: "is required when cluster_tls = on (the cluster TLS listener needs a \
+                         certificate chain)"
+                    .to_owned(),
+            })?;
+        let key = self
+            .cluster_tls_key_path
+            .as_ref()
+            .ok_or_else(|| ConfigError::Invalid {
+                field: "cluster_tls_key_path",
+                reason: "is required when cluster_tls = on (the cluster TLS listener needs a \
+                         private key)"
+                    .to_owned(),
+            })?;
+        if self.cluster_secret.is_none() {
+            return Err(ConfigError::Invalid {
+                field: "cluster_secret",
+                reason: "is required when cluster_tls = on (TLS encrypts the link but the shared \
+                         secret authenticates the peer; without it any party reaching the port \
+                         could join the bus / pull the replication stream)"
+                    .to_owned(),
+            });
+        }
+        // SECURITY (PROD-3 MITM fix): a CA is REQUIRED when cluster_tls = on so the dial VERIFIES the
+        // peer cert. Without it the dial would accept ANY cert (an accept-any verifier) and then send
+        // the cluster_secret to whatever it connected to -- an active man-in-the-middle could present
+        // its own cert, pass the (non-)verification, and CAPTURE the secret (then forge RAFTMSG /
+        // hijack consensus). The ONLY way to run TLS-on without a CA is the explicit, loudly-warned
+        // cluster_tls_insecure_skip_verify opt-out.
+        if self.cluster_ca_path.is_none() && !self.cluster_tls_insecure_skip_verify {
+            return Err(ConfigError::Invalid {
+                field: "cluster_ca_path",
+                reason: "cluster_tls requires cluster_ca_path (the CA/cert that signs peer certs) \
+                         so peer certs are verified; without it the cluster_secret is exposed to an \
+                         active MITM. A single shared self-signed cert may serve as its own CA \
+                         (point cluster_ca_path at it). To run encrypted-but-unverified anyway set \
+                         cluster_tls_insecure_skip_verify=true (NOT recommended)."
+                    .to_owned(),
+            });
+        }
+        if let Err(e) = std::fs::File::open(cert) {
+            return Err(ConfigError::Invalid {
+                field: "cluster_tls_cert_path",
+                reason: format!("cannot read certificate at {}: {e}", cert.display()),
+            });
+        }
+        if let Err(e) = std::fs::File::open(key) {
+            return Err(ConfigError::Invalid {
+                field: "cluster_tls_key_path",
+                reason: format!("cannot read private key at {}: {e}", key.display()),
+            });
+        }
+        if let Some(ca) = &self.cluster_ca_path {
+            if let Err(e) = std::fs::File::open(ca) {
+                return Err(ConfigError::Invalid {
+                    field: "cluster_ca_path",
+                    reason: format!("cannot read cluster CA at {}: {e}", ca.display()),
+                });
+            }
         }
         Ok(())
     }
@@ -920,6 +1120,27 @@ pub struct ConfigOverlay {
     /// (`save_min_changes = 1`) + the `IRONCACHE_SAVE_MIN_CHANGES` env var. `None` leaves the lower
     /// layer (default `0`).
     pub save_min_changes: Option<u64>,
+    /// The intra-cluster transport-TLS posture (PROD-3). TOML (`cluster_tls = "on"`) + the
+    /// `IRONCACHE_CLUSTER_TLS` env var. `None` leaves the lower layer (default [`TlsMode::Off`],
+    /// plaintext byte-unchanged).
+    pub cluster_tls: Option<TlsMode>,
+    /// Path to the PEM cert chain the intra-cluster TLS listener presents (PROD-3). TOML
+    /// (`cluster_tls_cert_path = "..."`) + the `IRONCACHE_CLUSTER_TLS_CERT_PATH` env var.
+    pub cluster_tls_cert_path: Option<PathBuf>,
+    /// Path to the PEM private key for the intra-cluster TLS listener (PROD-3). TOML
+    /// (`cluster_tls_key_path = "..."`) + the `IRONCACHE_CLUSTER_TLS_KEY_PATH` env var.
+    pub cluster_tls_key_path: Option<PathBuf>,
+    /// Path to the PEM cluster CA the dial verifies the peer cert against (PROD-3, optional). TOML
+    /// (`cluster_ca_path = "..."`) + the `IRONCACHE_CLUSTER_CA_PATH` env var.
+    pub cluster_ca_path: Option<PathBuf>,
+    /// The shared cluster secret for peer authentication (PROD-3). TOML (`cluster_secret = "..."`)
+    /// and the `IRONCACHE_CLUSTER_SECRET` env var. `None` leaves the lower layer (default `None`,
+    /// no secret check).
+    pub cluster_secret: Option<String>,
+    /// EXPLICIT, NOT-RECOMMENDED opt-in to skip intra-cluster peer-cert verification (PROD-3). TOML
+    /// (`cluster_tls_insecure_skip_verify = true`) + the `IRONCACHE_CLUSTER_TLS_INSECURE_SKIP_VERIFY`
+    /// env var. `None` leaves the lower layer (default `false`, peer cert is verified against the CA).
+    pub cluster_tls_insecure_skip_verify: Option<bool>,
 }
 
 impl ConfigOverlay {
@@ -1057,6 +1278,38 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_TLS_KEY_PATH") {
             o.tls_key_path = Some(PathBuf::from(v));
         }
+        // INTRA-CLUSTER transport-security knobs (PROD-3). The mode is a single off/on token
+        // (case-insensitive), env-encodable for per-pod injection; an unrecognized token hard-fails
+        // boot (mirrors the public `tls` knob). The cert/key/CA are scalar paths taken verbatim
+        // (readability checked in Config::validate when cluster_tls = on); the secret is a scalar
+        // token taken verbatim.
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_TLS") {
+            o.cluster_tls = Some(parse_tls_mode(&v).ok_or_else(|| ConfigError::Invalid {
+                field: "cluster-tls",
+                reason: format!("not a TLS mode (expected off/on): {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_TLS_CERT_PATH") {
+            o.cluster_tls_cert_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_TLS_KEY_PATH") {
+            o.cluster_tls_key_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_CA_PATH") {
+            o.cluster_ca_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_SECRET") {
+            o.cluster_secret = Some(v);
+        }
+        // The insecure peer-cert-skip opt-out is a boolean (yes/no/true/false/1/0). An unrecognized
+        // token hard-fails boot rather than silently leaving verification on/off.
+        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_TLS_INSECURE_SKIP_VERIFY") {
+            o.cluster_tls_insecure_skip_verify =
+                Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
+                    field: "cluster-tls-insecure-skip-verify",
+                    reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
+                })?);
+        }
         // PERSISTENCE save-policy knobs (#58, single scalars, env-encodable for per-pod injection).
         // Both are meaningful only when a data_dir is set; a malformed value hard-fails boot rather
         // than silently picking a default (mirrors the other numeric knobs above).
@@ -1159,6 +1412,24 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.save_min_changes {
             cfg.save_min_changes = v;
+        }
+        if let Some(v) = self.cluster_tls {
+            cfg.cluster_tls = v;
+        }
+        if let Some(ref v) = self.cluster_tls_cert_path {
+            cfg.cluster_tls_cert_path = Some(v.clone());
+        }
+        if let Some(ref v) = self.cluster_tls_key_path {
+            cfg.cluster_tls_key_path = Some(v.clone());
+        }
+        if let Some(ref v) = self.cluster_ca_path {
+            cfg.cluster_ca_path = Some(v.clone());
+        }
+        if let Some(ref v) = self.cluster_secret {
+            cfg.cluster_secret = Some(v.clone());
+        }
+        if let Some(v) = self.cluster_tls_insecure_skip_verify {
+            cfg.cluster_tls_insecure_skip_verify = v;
         }
         Ok(())
     }
@@ -1297,7 +1568,158 @@ mod tests {
         // posture (only an explicit SAVE/BGSAVE, and only when a data_dir is set).
         assert_eq!(c.save_interval_secs, 0);
         assert_eq!(c.save_min_changes, 0);
+        // INTRA-CLUSTER transport security is OFF by default (PROD-3): plaintext bus + repl,
+        // byte-unchanged. No cert/key/CA, no secret.
+        assert_eq!(c.cluster_tls, TlsMode::Off);
+        assert!(c.cluster_tls_cert_path.is_none());
+        assert!(c.cluster_tls_key_path.is_none());
+        assert!(c.cluster_ca_path.is_none());
+        assert!(c.cluster_secret.is_none());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn cluster_transport_knobs_parse_and_validate() {
+        // cluster_tls = on REQUIRES a readable cert + key + a secret: a missing secret is a clear
+        // error (TLS encrypts but does not authenticate the peer without the shared secret).
+        let mut overlay = ConfigOverlay {
+            cluster_tls: Some(TlsMode::On),
+            cluster_tls_cert_path: Some(PathBuf::from("/nonexistent/cert.pem")),
+            cluster_tls_key_path: Some(PathBuf::from("/nonexistent/key.pem")),
+            ..Default::default()
+        };
+        // No secret -> error naming cluster_secret.
+        let err = Config::resolve(&[overlay.clone()])
+            .unwrap()
+            .validate()
+            .expect_err("cluster_tls = on without a secret must error");
+        assert!(format!("{err}").contains("cluster_secret"), "got {err}");
+
+        // With a secret but an UNREADABLE cert -> error naming the cert path (the readability
+        // pre-flight). The insecure flag is set so the CA-required check (PROD-3 MITM fix) does not
+        // pre-empt the cert-readability check we are exercising here.
+        overlay.cluster_secret = Some("supersecret".to_owned());
+        overlay.cluster_tls_insecure_skip_verify = Some(true);
+        let err = Config::resolve(&[overlay.clone()])
+            .unwrap()
+            .validate()
+            .expect_err("an unreadable cluster cert must error");
+        assert!(
+            format!("{err}").contains("cluster_tls_cert_path"),
+            "got {err}"
+        );
+
+        // An EMPTY secret is rejected regardless of TLS (no authentication; almost certainly a typo
+        // for unset).
+        let err = Config::resolve(&[ConfigOverlay {
+            cluster_secret: Some(String::new()),
+            ..Default::default()
+        }])
+        .unwrap()
+        .validate()
+        .expect_err("an empty cluster_secret must error");
+        assert!(format!("{err}").contains("cluster_secret"), "got {err}");
+
+        // A CA without TLS is rejected (it would silently do nothing).
+        let err = Config::resolve(&[ConfigOverlay {
+            cluster_ca_path: Some(PathBuf::from("/some/ca.pem")),
+            ..Default::default()
+        }])
+        .unwrap()
+        .validate()
+        .expect_err("a cluster_ca_path without cluster_tls = on must error");
+        assert!(format!("{err}").contains("cluster_ca_path"), "got {err}");
+
+        // A bare secret WITHOUT TLS is allowed (plaintext-but-authenticated bus): validate passes.
+        let c = Config::resolve(&[ConfigOverlay {
+            cluster_secret: Some("token".to_owned()),
+            ..Default::default()
+        }])
+        .unwrap();
+        c.validate()
+            .expect("a secret-only (no TLS) cluster is allowed");
+        assert_eq!(c.cluster_secret.as_deref(), Some("token"));
+        assert_eq!(c.cluster_tls, TlsMode::Off);
+    }
+
+    /// Write `contents` to a uniquely-named temp file (deterministic name from pid + counter, no
+    /// rand) and return the path, for the cluster-TLS validate tests (which only check that the
+    /// configured cert/key/CA paths are READABLE, not their PEM contents).
+    fn temp_file(tag: &str, contents: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ironcache-cfg-test-{tag}-{}-{n}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    #[test]
+    fn cluster_tls_requires_a_ca_unless_insecure_flag_is_set() {
+        // SECURITY (PROD-3 MITM fix): cluster_tls = on must REQUIRE a cluster_ca_path so the dial
+        // VERIFIES the peer cert (otherwise the cluster_secret leaks to an active MITM). The ONLY
+        // escape is the explicit cluster_tls_insecure_skip_verify = true.
+        let cert = temp_file("cert", "test-cert");
+        let key = temp_file("key", "test-key");
+        let ca = temp_file("ca", "test-ca");
+
+        let base = ConfigOverlay {
+            cluster_tls: Some(TlsMode::On),
+            cluster_tls_cert_path: Some(cert.clone()),
+            cluster_tls_key_path: Some(key.clone()),
+            cluster_secret: Some("supersecret".to_owned()),
+            ..Default::default()
+        };
+
+        // (i) tls-on, secret set, readable cert+key, but NO CA and NO insecure flag -> REJECTED,
+        // naming cluster_ca_path, with the MITM rationale in the message.
+        let err = Config::resolve(std::slice::from_ref(&base))
+            .unwrap()
+            .validate()
+            .expect_err("cluster_tls = on without a CA and without the insecure flag must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("cluster_ca_path"), "got {msg}");
+        assert!(
+            msg.contains("MITM"),
+            "the error must explain the MITM risk: {msg}"
+        );
+
+        // With a readable CA -> validate PASSES (the verifying posture is satisfied).
+        let with_ca = ConfigOverlay {
+            cluster_ca_path: Some(ca.clone()),
+            ..base.clone()
+        };
+        Config::resolve(&[with_ca])
+            .unwrap()
+            .validate()
+            .expect("cluster_tls = on WITH a readable CA must pass (the verifying posture)");
+
+        // (ii) the EXPLICIT insecure opt-out lets tls-on-without-CA pass (encrypted-but-unverified).
+        let insecure = ConfigOverlay {
+            cluster_tls_insecure_skip_verify: Some(true),
+            ..base.clone()
+        };
+        let c = Config::resolve(&[insecure]).unwrap();
+        c.validate()
+            .expect("the explicit insecure opt-out must allow tls-on without a CA");
+        assert!(c.cluster_tls_insecure_skip_verify);
+
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn cluster_tls_parses_from_env_token() {
+        // The IRONCACHE_CLUSTER_TLS env token is parsed off/on case-insensitively (mirrors the
+        // public `tls` knob); an unrecognized token hard-fails. Exercised through parse_tls_mode
+        // directly (env reads share global state across tests, so assert the parser, not getenv).
+        assert_eq!(parse_tls_mode("on"), Some(TlsMode::On));
+        assert_eq!(parse_tls_mode("OFF"), Some(TlsMode::Off));
+        assert_eq!(parse_tls_mode("garbage"), None);
     }
 
     #[test]
