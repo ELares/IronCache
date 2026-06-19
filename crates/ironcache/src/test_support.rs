@@ -34,9 +34,16 @@ pub fn run_server_with_metrics_for_test(port: u16, shards: usize, metrics_port: 
     };
     let registry = MetricsRegistry::new(shards);
     let live = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(ReadyState::default());
-    let handles = crate::serve::run_server_observed(&config, Some(registry.clone()))
-        .expect("test metrics server failed to bind");
+    // Readiness sized to the shard count: each shard signals its load-on-boot completion through the
+    // SAME state threaded into the server boot, so `/readyz` flips to 200 only after every shard has
+    // loaded (mirrors cmd_server, #152).
+    let ready = Arc::new(ReadyState::with_shards(shards));
+    let handles = crate::serve::run_server_observed(
+        &config,
+        Some(registry.clone()),
+        Some(Arc::clone(&ready)),
+    )
+    .expect("test metrics server failed to bind");
     let runtime = Arc::clone(&handles.runtime);
     let state = MetricsState::new(
         registry,
@@ -49,9 +56,9 @@ pub fn run_server_with_metrics_for_test(port: u16, shards: usize, metrics_port: 
     );
     let addr = format!("127.0.0.1:{metrics_port}");
     metrics_http::spawn_metrics_server(&addr, state).expect("metrics endpoint failed to bind");
-    // Boot complete: mark live + load-on-boot done (mirrors cmd_server).
+    // Boot complete: mark live (mirrors cmd_server). Readiness is NOT flipped here -- each shard
+    // signals it once its load-on-boot finishes.
     live.store(true, std::sync::atomic::Ordering::SeqCst);
-    ready.set_load_done();
     handles.set
 }
 

@@ -145,6 +145,7 @@ pub async fn run_drain_loop(
     inbox: Inbox,
     persist: Option<Arc<crate::persist::PersistState>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ready: Option<Arc<crate::metrics_http::ReadyState>>,
 ) {
     // The runtime TIMER seam (ADR-0003) the shutdown-flag poll below arms; imported at the top of
     // the fn (not mid-body) so clippy's items-after-statements stays happy.
@@ -182,6 +183,16 @@ pub async fn run_drain_loop(
         if shard_index == 0 && persist.interval_secs > 0 {
             spawn_periodic_save(ctx.clone(), inbox.clone(), Arc::clone(persist));
         }
+    }
+    // READINESS SIGNAL (OBSERVABILITY.md, #152): this shard has now finished its load-on-boot --
+    // either `load_shard_on_boot` restored its snapshot above (persistence on), or there was nothing
+    // to load (persistence off, the `if let` was skipped). Decrement the per-shard readiness
+    // countdown so `/readyz` reports 200 only AFTER every shard reaches this point, never while a
+    // snapshot restore is still in flight (k8s would otherwise route to an empty/partial keyspace).
+    // This MUST come after the load above and before the drain loop services any work. `None` when
+    // the metrics endpoint is off (a no-op).
+    if let Some(ready) = ready.as_ref() {
+        ready.signal_shard_loaded();
     }
     // HA-7d LIVE replica attach: ONLY in raft-governance mode (`ctx.raft.is_some()`). The
     // DEFAULT static path and the raft-control-plane-WITHOUT-replicas path are byte-unchanged:

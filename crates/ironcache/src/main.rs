@@ -184,21 +184,30 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     let metrics_enabled = cli.metrics_addr.is_some();
     let registry = metrics_enabled.then(|| MetricsRegistry::new(cfg.shards));
     let live = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(ReadyState::default());
+    // Readiness gates on ACTUAL per-shard load-on-boot completion (OBSERVABILITY.md, #152): sized to
+    // the shard count, it reports `/readyz` not-ready until EVERY shard's `load_shard_on_boot` has
+    // returned. Threaded into the server boot below so each shard signals one unit when it finishes
+    // loading; the flag is never flipped prematurely here. Built only when the endpoint is enabled.
+    let ready = metrics_enabled.then(|| Arc::new(ReadyState::with_shards(cfg.shards)));
 
-    let handles = serve::run_server_observed(&cfg, registry.clone()).context("starting server")?;
+    let handles = serve::run_server_observed(&cfg, registry.clone(), ready.clone())
+        .context("starting server")?;
     let set = handles.set;
 
     // The metrics endpoint reads the live boot handles (the raft status, persistence atomics, and
     // the runtime-config maxmemory). Spawn it AFTER the shards are up so a `/metrics` scrape sees a
     // live server. A bind failure here is a hard boot error (a misconfigured `--metrics-addr`
     // should fail fast, like the RESP listener), so propagate it before we mark the node live.
-    if let (Some(metrics_addr), Some(registry)) = (cli.metrics_addr.as_ref(), registry) {
+    // `registry` and `ready` are both `Some` exactly when `--metrics-addr` is set (built together
+    // under `metrics_enabled`); the metrics state SHARES the SAME `ready` the shards signal into.
+    if let (Some(metrics_addr), Some(registry), Some(ready)) =
+        (cli.metrics_addr.as_ref(), registry, ready.as_ref())
+    {
         let runtime = std::sync::Arc::clone(&handles.runtime);
         let state = MetricsState::new(
             registry,
             Arc::clone(&live),
-            Arc::clone(&ready),
+            Arc::clone(ready),
             cfg.shards,
             Arc::new(move || runtime.maxmemory()),
             handles.raft.clone(),
@@ -209,11 +218,11 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let flag = serve::install_shutdown(&set);
-    // Boot is complete: the process is serving (liveness) and, since the synchronous boot wiring
-    // (including each shard's load-on-boot kick) has run, mark load-on-boot done (readiness). The
-    // raft-leader gate, when applicable, is evaluated live by `/readyz` from the raft handle.
+    // Boot is complete: the process is SERVING (liveness). Readiness is NOT flipped here: the
+    // synchronous boot wiring only SPAWNS the shards, whose load-on-boot runs async afterward, so
+    // each shard signals the `/readyz` countdown itself once its `load_shard_on_boot` returns (#152).
+    // The raft-leader gate, when applicable, is evaluated live by `/readyz` from the raft handle.
     live.store(true, std::sync::atomic::Ordering::SeqCst);
-    ready.set_load_done();
     tracing::info!("ironcache: ready (PING -> +PONG). Ctrl-C to stop.");
     serve::wait_for_signal(&flag);
     tracing::info!("ironcache: shutting down");

@@ -116,8 +116,13 @@ async fn metrics_endpoint_serves_prometheus_and_reflects_commands() {
     set.shutdown_and_join().unwrap();
 }
 
-/// `/livez` is 200 once the node is up; `/readyz` is 200 once load-on-boot is done (standalone,
-/// no raft gate); an unknown path is 404.
+/// `/livez` is 200 once the node is up; `/readyz` becomes 200 once load-on-boot is done for EVERY
+/// shard (standalone, no raft gate); an unknown path is 404.
+///
+/// Readiness is now SIGNAL-DRIVEN (#152): each shard decrements the readiness countdown after its
+/// own load-on-boot completes, so `/readyz` flips to 200 only after BOTH shards have signalled
+/// rather than being set synchronously at boot. With persistence off each shard signals essentially
+/// immediately, so we poll `/readyz` briefly for the 200 (the same way a k8s readiness probe does).
 #[tokio::test]
 async fn livez_readyz_and_unknown_path() {
     let resp_port = free_port();
@@ -127,8 +132,22 @@ async fn livez_readyz_and_unknown_path() {
     let (live_code, _) = http_get(metrics_port, "/livez").await;
     assert_eq!(live_code, 200);
 
-    let (ready_code, ready_body) = http_get(metrics_port, "/readyz").await;
-    assert_eq!(ready_code, 200, "readyz body: {ready_body}");
+    // Poll for readiness: the per-shard signal drains the countdown to 0 shortly after boot.
+    let mut ready_code = 0;
+    let mut ready_body = String::new();
+    for _ in 0..100 {
+        let (code, body) = http_get(metrics_port, "/readyz").await;
+        ready_code = code;
+        ready_body = body;
+        if ready_code == 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        ready_code, 200,
+        "readyz never became ready; body: {ready_body}"
+    );
 
     let (nf_code, _) = http_get(metrics_port, "/does-not-exist").await;
     assert_eq!(nf_code, 404);

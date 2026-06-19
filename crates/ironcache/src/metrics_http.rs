@@ -13,10 +13,10 @@
 //!
 //! The surface is three fixed routes with no body parsing, no routing tree, and no middleware,
 //! so a full HTTP stack (hyper/axum) would be dead weight on the static musl/aarch64 build. A
-//! minimal tokio reader that bounds the request (a read timeout + a small header cap) and
-//! matches the request line is enough, adds NO new third-party crate, and keeps the dependency
-//! tree pure-Rust (ADR-0017). It is NOT a general HTTP server: anything malformed/oversized is
-//! answered with a fixed `400`/`413` and the connection is closed.
+//! minimal tokio reader that bounds the request (a whole-request deadline + a small header cap +
+//! a connection-concurrency cap) and matches the request line is enough, adds NO new third-party
+//! crate, and keeps the dependency tree pure-Rust (ADR-0017). It is NOT a general HTTP server:
+//! anything malformed/oversized is answered with a fixed `400`/`413` and the connection is closed.
 //!
 //! ## Default-off and the hot path
 //!
@@ -28,7 +28,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ironcache_env::{Clock, Monotonic, SystemEnv};
@@ -41,9 +41,19 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 /// buffer so the endpoint cannot be driven to allocate on a hostile client.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
-/// The per-connection read timeout: a slow-loris client that never completes a request line is
-/// dropped after this. Bounds how long one metrics connection can hold a task.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// The WHOLE-REQUEST deadline: the ENTIRE request-read phase (every `read` plus the parse) must
+/// complete within this window, else the connection is dropped. Unlike a per-`read` timeout (which a
+/// slow-drip client resets on every byte, holding the socket for hours up to the size cap), this is
+/// a single deadline over the whole read loop, so a slowloris dribble cannot extend the hold.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The maximum number of metrics connections served concurrently. The accept loop holds a
+/// [`tokio::sync::Semaphore`] of this many permits and acquires one (non-blocking) before spawning a
+/// `serve_conn` task, so a flood of connections cannot accumulate unbounded parked tasks (a task
+/// DoS). Small: the ops port serves scrapes + probes, never a high fan-in. At capacity the EXCESS
+/// connection is dropped/closed IMMEDIATELY (see [`accept_loop`]) rather than queued without bound or
+/// blocking the accept loop.
+const MAX_CONCURRENT_CONNS: usize = 128;
 
 /// The shared state the metrics HTTP handler reads at scrape time. Cloned (`Arc` inside) into the
 /// accept loop and each connection task. Every field is a cheap, lock-free read; the heavy
@@ -101,27 +111,71 @@ impl ClockState {
     }
 }
 
-/// Readiness flags, gated separately so `/readyz` can report WHY it is not ready. `load_done` is
-/// set once load-on-boot has finished for every shard (or immediately when persistence is off);
-/// the raft leader gate is evaluated live from the `RaftHandle` at scrape time (a node can lose
-/// its leader after boot), so it is not a stored flag.
-#[derive(Debug, Default)]
+/// Readiness flags, gated separately so `/readyz` can report WHY it is not ready. Load-on-boot is
+/// done once EVERY shard's load-on-boot (`coordinator::load_shard_on_boot`) has RETURNED -- whether
+/// it restored a snapshot or was a no-op because persistence is off; the raft leader gate is
+/// evaluated live from the `RaftHandle` at scrape time (a node can lose its leader after boot), so
+/// it is not a stored flag.
+///
+/// ## Why a per-shard countdown rather than a single flag
+///
+/// `coordinator::run_drain_loop` only SPAWNS the shard threads and returns; each shard's snapshot
+/// restore runs ASYNC on its own executor AFTER the boot wiring returns. A single boot-time flag
+/// flipped right after `run_server_observed` returns would therefore report READY while shards are
+/// still loading -- on a persistence node with a sizeable snapshot, `/readyz` would answer 200 over
+/// an EMPTY/PARTIAL keyspace and k8s would route traffic to it. So readiness AND-reduces a per-shard
+/// signal: `load_pending` starts at the shard count, each shard decrements it AFTER its
+/// `load_shard_on_boot` completes, and load-on-boot is "done" only when it reaches 0. With
+/// persistence OFF every shard's load is an immediate no-op, so the counter drains to 0 promptly and
+/// readiness flips fast (no behavior change vs the no-persistence case).
+#[derive(Debug)]
 pub struct ReadyState {
-    /// `true` once load-on-boot has completed (persistence finished restoring, or persistence is
-    /// disabled so there is nothing to load).
-    load_done: AtomicBool,
+    /// The number of shards that have NOT YET finished load-on-boot. Initialized to the shard count
+    /// (see [`ReadyState::with_shards`]); each shard decrements it once via [`signal_shard_loaded`]
+    /// after its `load_shard_on_boot` returns. Load-on-boot is complete when this reaches 0.
+    ///
+    /// [`signal_shard_loaded`]: ReadyState::signal_shard_loaded
+    load_pending: AtomicUsize,
+}
+
+impl Default for ReadyState {
+    /// A zero-shard [`ReadyState`]: load-on-boot reads as ALREADY done (nothing to wait for). Used
+    /// only by the unit tests / a degenerate no-shard boot; the real boot uses
+    /// [`ReadyState::with_shards`].
+    fn default() -> Self {
+        Self::with_shards(0)
+    }
 }
 
 impl ReadyState {
-    /// Mark load-on-boot complete. Called at the end of boot (idempotent).
-    pub fn set_load_done(&self) {
-        self.load_done.store(true, Ordering::SeqCst);
+    /// Build readiness for a node with `shards` shards: load-on-boot is NOT done until all `shards`
+    /// have signalled completion. `shards == 0` reads as already-done.
+    #[must_use]
+    pub fn with_shards(shards: usize) -> Self {
+        ReadyState {
+            load_pending: AtomicUsize::new(shards),
+        }
     }
 
-    /// Whether load-on-boot has completed.
+    /// Signal that ONE shard has finished its load-on-boot (its `load_shard_on_boot` returned, data
+    /// loaded or a persistence-off no-op). Decrements the pending count; the LAST shard's call makes
+    /// [`load_done`] flip to `true`. Saturating, so an over-signal (a wiring bug) cannot underflow.
+    ///
+    /// [`load_done`]: ReadyState::load_done
+    pub fn signal_shard_loaded(&self) {
+        // `fetch_update` with a saturating decrement: never wrap below 0 even if called more times
+        // than there are shards (a defensive guard; the wiring signals exactly once per shard).
+        let _ = self
+            .load_pending
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+
+    /// Whether load-on-boot has completed for EVERY shard (the pending count reached 0).
     #[must_use]
     pub fn load_done(&self) -> bool {
-        self.load_done.load(Ordering::SeqCst)
+        self.load_pending.load(Ordering::SeqCst) == 0
     }
 }
 
@@ -284,35 +338,60 @@ fn parse_request_line(buf: &[u8]) -> Option<(String, String)> {
     Some((method, path))
 }
 
-/// Serve ONE metrics connection: read (bounded by [`MAX_REQUEST_BYTES`] + [`READ_TIMEOUT`]) until
-/// the request line is complete, respond, flush, and close. Never reads a body. Any read error /
-/// timeout / oversize closes the connection (a fixed `413` for oversize, then close).
-async fn serve_conn(mut stream: tokio::net::TcpStream, state: MetricsState) {
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    let response: Vec<u8> = loop {
-        // Bound the wait so a client that opens a socket and never sends cannot pin the task.
-        let read = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
-            Ok(Ok(0)) => {
-                // EOF before a full request line: nothing to answer, just close.
-                return;
+/// Serve ONE metrics connection: read (bounded by [`MAX_REQUEST_BYTES`] + the whole-request
+/// [`REQUEST_DEADLINE`]) until the request line is complete, respond, flush, and close. Never reads
+/// a body. Any read error / deadline / oversize closes the connection (a fixed `413` for oversize,
+/// then close).
+///
+/// The ENTIRE request-read phase is wrapped in ONE [`REQUEST_DEADLINE`] timeout: a slow-drip client
+/// that sends one byte at a time cannot reset a per-read timer to hold the socket for hours -- the
+/// single deadline fires regardless of per-read progress and the connection is dropped. The write +
+/// flush run AFTER the deadline (a stalled WRITER is a separate, bounded concern: best-effort and
+/// the connection closes either way).
+async fn serve_conn(stream: tokio::net::TcpStream, state: MetricsState) {
+    serve_conn_with_deadline(stream, state, REQUEST_DEADLINE).await;
+}
+
+/// [`serve_conn`] with an explicit whole-request `deadline`, so a test can drive the slowloris-drop
+/// path on a SHORT deadline instead of the production [`REQUEST_DEADLINE`]. Production always calls
+/// it with the const; the deadline is the ONLY parameter.
+async fn serve_conn_with_deadline(
+    mut stream: tokio::net::TcpStream,
+    state: MetricsState,
+    deadline: Duration,
+) {
+    // The whole request-read phase under ONE deadline. `Err(_)` is the deadline elapsing; the inner
+    // `Option` is `None` on EOF/read-error before a full request line (just close, nothing to send).
+    let read_phase = tokio::time::timeout(deadline, async {
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = match stream.read(&mut chunk).await {
+                Ok(n) if n > 0 => n,
+                // EOF (0 bytes) before a full request line, or a read error: close, nothing to send.
+                Ok(_) | Err(_) => return None,
+            };
+            buf.extend_from_slice(&chunk[..read]);
+            if buf.len() > MAX_REQUEST_BYTES {
+                return Some(http_response(
+                    413,
+                    "Payload Too Large",
+                    "text/plain; charset=utf-8",
+                    b"request too large\n",
+                ));
             }
-            Ok(Ok(n)) => n,
-            Ok(Err(_)) | Err(_) => return, // read error or timeout: drop the connection.
-        };
-        buf.extend_from_slice(&chunk[..read]);
-        if buf.len() > MAX_REQUEST_BYTES {
-            break http_response(
-                413,
-                "Payload Too Large",
-                "text/plain; charset=utf-8",
-                b"request too large\n",
-            );
+            if let Some((method, path)) = parse_request_line(&buf) {
+                return Some(state.respond(&method, &path));
+            }
+            // Request line not complete yet; loop to read more (bounded by the size cap + deadline).
         }
-        if let Some((method, path)) = parse_request_line(&buf) {
-            break state.respond(&method, &path);
-        }
-        // Request line not complete yet; loop to read more (bounded by the size cap above).
+    })
+    .await;
+    // `Ok(Some(resp))` is a full request line (or the 413 oversize response) within the deadline.
+    // Anything else -- the deadline elapsing (a slowloris drip), or EOF/error before a request line
+    // -- drops the connection with no reply.
+    let Ok(Some(response)) = read_phase else {
+        return;
     };
     // Best-effort write + flush; ignore errors (the client may have gone away).
     let _ = stream.write_all(&response).await;
@@ -322,12 +401,31 @@ async fn serve_conn(mut stream: tokio::net::TcpStream, state: MetricsState) {
 /// The metrics ACCEPT loop: bind `addr`, then accept connections and spawn a bounded
 /// [`serve_conn`] per connection on the metrics runtime. Returns when the listener errors
 /// unrecoverably (a transient accept error backs off and continues).
+///
+/// CONCURRENCY CAP: at most [`MAX_CONCURRENT_CONNS`] connections are served at once. A
+/// [`tokio::sync::Semaphore`] of that many permits gates the spawn; a permit is acquired BEFORE the
+/// task spawns and held (moved into the task) for the connection's lifetime, so unbounded
+/// `serve_conn` tasks cannot accumulate under a connection flood (a task-accumulation DoS). When all
+/// permits are in use the EXCESS connection is dropped IMMEDIATELY (the accepted stream is closed by
+/// drop) rather than queued without bound -- the accept loop never blocks, so a slow/at-capacity
+/// endpoint cannot stall accepting (which would also delay observing other errors). The ops port is
+/// scrape + probe traffic, so the cap is generous headroom in practice.
 async fn accept_loop(listener: tokio::net::TcpListener, state: MetricsState) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNS));
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
+                // Acquire a permit WITHOUT awaiting: at capacity we drop (close) the excess
+                // connection instead of parking the accept loop or queueing tasks without bound.
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    // Over the concurrency cap: close this connection immediately (drop the stream).
+                    drop(stream);
+                    continue;
+                };
                 let state = state.clone();
                 tokio::spawn(async move {
+                    // Hold the permit for the whole connection; it is released on completion (drop).
+                    let _permit = permit;
                     serve_conn(stream, state).await;
                 });
             }
@@ -414,7 +512,8 @@ mod tests {
     ) {
         let registry = MetricsRegistry::new(2);
         let live = Arc::new(AtomicBool::new(false));
-        let ready = Arc::new(ReadyState::default());
+        // Two shards: load-on-boot is not done until BOTH have signalled.
+        let ready = Arc::new(ReadyState::with_shards(2));
         let state = MetricsState::new(
             registry.clone(),
             Arc::clone(&live),
@@ -474,9 +573,41 @@ mod tests {
         let before = String::from_utf8(state.respond("GET", "/readyz")).unwrap();
         assert!(before.starts_with("HTTP/1.1 503"), "{before}");
         assert!(before.contains("load-on-boot incomplete"), "{before}");
-        ready.set_load_done();
+        // Two shards: readiness flips to 200 only after BOTH have signalled their load complete.
+        ready.signal_shard_loaded();
+        let after_one = String::from_utf8(state.respond("GET", "/readyz")).unwrap();
+        assert!(
+            after_one.starts_with("HTTP/1.1 503"),
+            "one of two shards loaded: still not ready -- {after_one}"
+        );
+        ready.signal_shard_loaded();
         let after = String::from_utf8(state.respond("GET", "/readyz")).unwrap();
         assert!(after.starts_with("HTTP/1.1 200 OK"), "{after}");
+    }
+
+    #[test]
+    fn load_done_countdown_reaches_zero() {
+        // The per-shard countdown: load_done is false until every shard has signalled, and a
+        // defensive over-signal cannot underflow it back to "not done".
+        let ready = ReadyState::with_shards(3);
+        assert!(!ready.load_done(), "3 pending");
+        ready.signal_shard_loaded();
+        assert!(!ready.load_done(), "2 pending");
+        ready.signal_shard_loaded();
+        assert!(!ready.load_done(), "1 pending");
+        ready.signal_shard_loaded();
+        assert!(ready.load_done(), "0 pending -> done");
+        // Over-signal: saturating, so it stays done (never wraps to a huge pending count).
+        ready.signal_shard_loaded();
+        assert!(ready.load_done(), "over-signal stays done");
+    }
+
+    #[test]
+    fn zero_shard_ready_state_is_done() {
+        // A degenerate zero-shard node has nothing to load: load-on-boot reads as already done.
+        let ready = ReadyState::with_shards(0);
+        assert!(ready.load_done());
+        assert!(ReadyState::default().load_done());
     }
 
     #[test]
@@ -519,5 +650,70 @@ mod tests {
     fn resolve_addr_parses_socketaddr() {
         let sa = resolve_metrics_addr("127.0.0.1:9111").unwrap();
         assert_eq!(sa.port(), 9111);
+    }
+
+    /// F2 slowloris: a client that connects, sends a PARTIAL request line, then STALLS (never
+    /// sending the terminating newline and never closing) is dropped by the WHOLE-REQUEST deadline,
+    /// NOT held until the 8 KiB cap. We run `serve_conn_with_deadline` with a short deadline and
+    /// assert it RETURNS within ~the deadline (a per-read timeout would never fire here -- the
+    /// client makes one tiny write then goes idle, which under a per-read timer that resets on
+    /// progress would hold for hours).
+    #[tokio::test]
+    async fn slow_drip_request_is_dropped_within_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The CLIENT: connect, send a partial request line, then stall (hold the socket open,
+        // sending nothing more). Kept alive in this task so the server side cannot see EOF.
+        let client = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"GET /metr").await.unwrap(); // partial: no newline, far under the 8 KiB cap.
+            // Stall: never send the rest, never close, just park well past the server's deadline.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(c);
+        });
+
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let (state, _r, _l, _rd) = test_state();
+        // A SHORT whole-request deadline so the test is fast; production uses REQUEST_DEADLINE.
+        let short_deadline = Duration::from_millis(200);
+        // The server-side serve must RETURN by ~the deadline. Wrap in a generous outer timeout so a
+        // regression (a per-read timer that never fires on a stalled drip) FAILS the test instead of
+        // hanging it. The outer bound is far below the client's 30s stall, so completing under it
+        // proves the deadline -- not the client closing -- dropped the connection.
+        let served = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_conn_with_deadline(stream, state, short_deadline),
+        )
+        .await;
+        assert!(
+            served.is_ok(),
+            "serve_conn must drop a stalled slow-drip connection at the whole-request deadline, \
+             not hold it"
+        );
+        client.abort();
+    }
+
+    /// The deadline path still serves a COMPLETE request that arrives in time: a full request line
+    /// within the deadline gets the normal response (the deadline only drops the slow path).
+    #[tokio::test]
+    async fn complete_request_within_deadline_is_served() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"GET /livez HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut raw = Vec::new();
+            c.read_to_end(&mut raw).await.unwrap();
+            String::from_utf8_lossy(&raw).into_owned()
+        });
+
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let (state, _r, live, _rd) = test_state();
+        live.store(true, Ordering::SeqCst);
+        serve_conn_with_deadline(stream, state, Duration::from_secs(5)).await;
+        let body = client.await.unwrap();
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
     }
 }

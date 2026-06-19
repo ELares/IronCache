@@ -107,7 +107,8 @@ pub fn run_server(config: &Config) -> anyhow::Result<ShardSet> {
 pub fn run_server_inner(
     config: &Config,
 ) -> anyhow::Result<(ShardSet, Option<ironcache_server::RaftHandle>)> {
-    let handles = run_server_observed(config, None)?;
+    // No metrics endpoint on this boot path (tests / `run_server`), so no readiness state to thread.
+    let handles = run_server_observed(config, None, None)?;
     Ok((handles.set, handles.raft))
 }
 
@@ -138,10 +139,19 @@ pub struct BootHandles {
 /// `metrics_registry` is `Some` ONLY when `--metrics-addr` is set; passing `None` (every test and
 /// the no-flag default) makes the shards use a standalone counter cell and is byte-identical to
 /// the pre-observability boot.
+///
+/// `ready` is the `/readyz` readiness state (`Some` only when the metrics endpoint is enabled). It
+/// is threaded into the per-shard drain closure so each shard, AFTER its `load_shard_on_boot`
+/// completes, signals one unit of the readiness countdown -- so `/readyz` reports 200 only once
+/// EVERY shard has actually finished loading its snapshot, never while a restore is still in flight
+/// (the previous wiring flipped a single flag right after this function returned, before any shard
+/// had loaded). `None` (every test boot without metrics, the no-flag default) signals nothing and
+/// is byte-identical to before.
 #[allow(clippy::too_many_lines)]
 pub fn run_server_observed(
     config: &Config,
     metrics_registry: Option<ironcache_observe::MetricsRegistry>,
+    ready: Option<Arc<crate::metrics_http::ReadyState>>,
 ) -> anyhow::Result<BootHandles> {
     let bind: SocketAddr = SocketAddr::new(config.bind, config.port);
     let shard_cfg = ShardConfig {
@@ -458,15 +468,22 @@ pub fn run_server_observed(
     // save timer.
     let drain = {
         let inbox = inbox.clone();
+        // The readiness countdown (OBSERVABILITY.md, #152): MOVED into the drain closure (then cloned
+        // per shard via the closure's own `Clone`) so each shard signals one unit AFTER its
+        // load-on-boot completes. `None` when the metrics endpoint is off (byte-identical: the drain
+        // loop's signal is a no-op). `run_server_observed` does not use `ready` after this point.
         move |index: usize,
               rx: tokio::sync::mpsc::Receiver<coordinator::ShardWork>,
               shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>| {
             let ctx = drain_ctx.clone();
             let inbox = inbox.clone();
             let persist = persist.clone();
+            let ready = ready.clone();
             // The shutdown flag (the SAME one the signal handler flips) lets shard 0's drain loop
-            // drive the SAVE-ON-EXIT (#139) when a SIGTERM/SIGINT-triggered stop begins.
-            coordinator::run_drain_loop(index, rx, ctx, inbox, persist, shutdown)
+            // drive the SAVE-ON-EXIT (#139) when a SIGTERM/SIGINT-triggered stop begins. `ready`
+            // is the per-shard readiness countdown (#152): this shard decrements it once its
+            // load-on-boot has finished, so `/readyz` flips to 200 only after EVERY shard loaded.
+            coordinator::run_drain_loop(index, rx, ctx, inbox, persist, shutdown, ready)
         }
     };
 
