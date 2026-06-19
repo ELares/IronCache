@@ -31,7 +31,7 @@
 //! `maxmemory` (atomic) and `generation` (atomic) and only reach for the locked
 //! strings when the generation says a swap is pending.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The mutable, cross-shard runtime-config overlay (the highest-precedence layer,
@@ -90,6 +90,16 @@ pub struct RuntimeConfig {
     /// load) after each batch is rendered, so a `CONFIG SET` takes effect for subsequent batches.
     /// Seeded from the boot config.
     output_buffer_limit: AtomicU64,
+    /// The SLOWLOG threshold in MICROSECONDS (Redis `slowlog-log-slower-than`, PROD-7). `-1`
+    /// DISABLES the SLOWLOG (the per-command hook short-circuits on this single load); `0` logs
+    /// every command. Signed so `-1` round-trips. Runtime-settable via
+    /// `CONFIG SET slowlog-log-slower-than`; the per-command hook + the SLOWLOG command read it.
+    /// Seeded from [`crate::DEFAULT_SLOWLOG_LOG_SLOWER_THAN`].
+    slowlog_log_slower_than: AtomicI64,
+    /// The SLOWLOG max length (Redis `slowlog-max-len`, PROD-7): the maximum retained entries (the
+    /// ring drops the oldest past it). Runtime-settable via `CONFIG SET slowlog-max-len`. Seeded
+    /// from [`crate::DEFAULT_SLOWLOG_MAX_LEN`].
+    slowlog_max_len: AtomicU64,
 }
 
 /// The string-valued runtime params guarded by [`RuntimeConfig`]'s lock. Grouped
@@ -133,6 +143,10 @@ impl RuntimeConfig {
             // overrides these live (the accept path / serve loop read them with a relaxed load).
             maxclients: AtomicU64::new(cfg.maxclients),
             output_buffer_limit: AtomicU64::new(cfg.output_buffer_limit),
+            // The SLOWLOG knobs (PROD-7), seeded from the boot config so a node started with a
+            // configured threshold/length keeps it; a later `CONFIG SET slowlog-*` overrides live.
+            slowlog_log_slower_than: AtomicI64::new(cfg.slowlog_log_slower_than),
+            slowlog_max_len: AtomicU64::new(cfg.slowlog_max_len),
         })
     }
 
@@ -303,6 +317,35 @@ impl RuntimeConfig {
         self.save_interval_secs
             .store(interval_secs, Ordering::Relaxed);
         self.save_min_changes.store(min_changes, Ordering::Relaxed);
+    }
+
+    /// The current `slowlog-log-slower-than` threshold in MICROSECONDS (PROD-7); `-1` disables the
+    /// SLOWLOG, `0` logs everything. A single relaxed load: the per-command timing hook reads it
+    /// first and short-circuits when it is `-1`.
+    #[must_use]
+    pub fn slowlog_log_slower_than(&self) -> i64 {
+        self.slowlog_log_slower_than.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET slowlog-log-slower-than <micros>`: store the new threshold (a relaxed store).
+    /// `-1` disables the SLOWLOG. The per-command hook + the SLOWLOG command read it directly.
+    pub fn set_slowlog_log_slower_than(&self, micros: i64) {
+        self.slowlog_log_slower_than
+            .store(micros, Ordering::Relaxed);
+    }
+
+    /// The current `slowlog-max-len` (PROD-7): the maximum retained SLOWLOG entries. A single
+    /// relaxed load.
+    #[must_use]
+    pub fn slowlog_max_len(&self) -> u64 {
+        self.slowlog_max_len.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET slowlog-max-len <n>`: store the new max length (a relaxed store). The SLOWLOG
+    /// ring is trimmed to it on its next push (and immediately by the command layer, which mirrors
+    /// the value into the live `SlowLog`).
+    pub fn set_slowlog_max_len(&self, n: u64) {
+        self.slowlog_max_len.store(n, Ordering::Relaxed);
     }
 }
 

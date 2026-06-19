@@ -37,7 +37,7 @@ pub mod parse;
 pub mod perms;
 
 pub use categories::Category;
-pub use parse::{AclParseError, apply_rules_to, build_user};
+pub use parse::{AclParseError, apply_rules_to, build_user, redacted_rule};
 pub use perms::{DEFAULT_USER, User};
 
 use std::collections::BTreeMap;

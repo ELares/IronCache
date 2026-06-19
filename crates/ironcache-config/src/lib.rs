@@ -427,6 +427,15 @@ pub struct Config {
     /// Meaningful only when [`Self::save_interval_secs`] is non-zero. TOML (`save_min_changes = 1`)
     /// + the `IRONCACHE_SAVE_MIN_CHANGES` env var.
     pub save_min_changes: u64,
+    /// The SLOWLOG threshold in MICROSECONDS (Redis `slowlog-log-slower-than`, PROD-7). `-1`
+    /// DISABLES the SLOWLOG (the per-command hook short-circuits on a single atomic load); `0` logs
+    /// every command. Default [`DEFAULT_SLOWLOG_LOG_SLOWER_THAN`] (10ms, the Redis default).
+    /// Runtime-settable via `CONFIG SET slowlog-log-slower-than`.
+    pub slowlog_log_slower_than: i64,
+    /// The SLOWLOG max length (Redis `slowlog-max-len`, PROD-7): the maximum retained entries (the
+    /// ring drops the oldest past it). Default [`DEFAULT_SLOWLOG_MAX_LEN`] (128). Runtime-settable
+    /// via `CONFIG SET slowlog-max-len`.
+    pub slowlog_max_len: u64,
     /// The INTRA-CLUSTER transport-TLS posture (PROD-3): whether the node-to-node links (the Raft
     /// cluster-bus `RAFTMSG` control plane AND the replication stream) are TLS-encrypted. Defaults
     /// to [`TlsMode::Off`] (PLAINTEXT, byte-unchanged: no handshake, no secret check, exactly the
@@ -558,6 +567,8 @@ impl Default for Config {
             // when a data_dir is set). A non-zero interval + a data_dir enables the cadence.
             save_interval_secs: 0,
             save_min_changes: 0,
+            slowlog_log_slower_than: DEFAULT_SLOWLOG_LOG_SLOWER_THAN,
+            slowlog_max_len: DEFAULT_SLOWLOG_MAX_LEN,
             // INTRA-CLUSTER transport security is OFF by default (PROD-3): the bus + repl links are
             // plaintext and byte-unchanged (no handshake, no secret check). Turning it on is opt-in
             // and requires a cert + key (+ secret). The CA + secret default to None.
@@ -588,6 +599,14 @@ pub const DEFAULT_MAXCLIENTS: u64 = 10_000;
 /// unbounded accumulation is bounded; `0` disables the cap (unbounded, the pre-fix
 /// behavior).
 pub const DEFAULT_OUTPUT_BUFFER_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Default `slowlog-log-slower-than` threshold in MICROSECONDS (Redis default 10000us = 10ms,
+/// PROD-7). A command taking at least this long is recorded in the SLOWLOG. `-1` disables the
+/// SLOWLOG entirely; `0` logs every command.
+pub const DEFAULT_SLOWLOG_LOG_SLOWER_THAN: i64 = 10_000;
+
+/// Default `slowlog-max-len` (Redis default 128, PROD-7): the maximum SLOWLOG entries retained.
+pub const DEFAULT_SLOWLOG_MAX_LEN: u64 = 128;
 
 /// Default HA-8 replication-lag bound (logical writes) for promotion eligibility + the
 /// replica-read staleness gate. A modest window: a replica more than this many writes

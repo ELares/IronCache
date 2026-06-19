@@ -50,11 +50,24 @@ impl AclParseError {
     /// leaks its secret into an error string or log). Used to build the error reply.
     #[must_use]
     pub fn redacted_rule(&self) -> String {
-        match self.rule.as_bytes().first() {
-            Some(b'>') => ">(password)".to_owned(),
-            Some(b'<') => "<(password)".to_owned(),
-            _ => self.rule.clone(),
-        }
+        redacted_rule(&self.rule)
+    }
+}
+
+/// Redact a single `ACL SETUSER` rule token if it carries a secret: the password rules
+/// `>cleartext` / `<cleartext` and the digest rules `#hash` / `!hash` are replaced by their
+/// `<prefix>(password)` placeholder; any non-secret rule (`on`, `~k:*`, `+get`, ...) is
+/// returned verbatim. This is the canonical redaction reused both for the `ACL SETUSER`
+/// modifier-error reply ([`AclParseError::redacted_rule`]) and for SLOWLOG argument
+/// redaction, so the two never drift.
+#[must_use]
+pub fn redacted_rule(rule: &str) -> String {
+    match rule.as_bytes().first() {
+        Some(b'>') => ">(password)".to_owned(),
+        Some(b'<') => "<(password)".to_owned(),
+        Some(b'#') => "#(password)".to_owned(),
+        Some(b'!') => "!(password)".to_owned(),
+        _ => rule.to_owned(),
     }
 }
 

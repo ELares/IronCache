@@ -105,7 +105,15 @@ fn config_set(ctx: &ServerContext, req: &Request) -> Value {
         let name = String::from_utf8_lossy(&pair[0]).into_owned();
         let value = String::from_utf8_lossy(&pair[1]).into_owned();
         match apply_set(&name, &value, &ctx.runtime) {
-            SetOutcome::Applied => {}
+            SetOutcome::Applied => {
+                // PROD-7: mirror a SLOWLOG knob into the LIVE `ctx.slowlog` so the per-command
+                // hook + the SLOWLOG command see the new threshold / cap immediately (the runtime
+                // overlay is the canonical CONFIG source `CONFIG GET` reads; the SlowLog holds the
+                // hot-path copy the hook reads with a single relaxed load). The `apply_set` above
+                // already validated + stored into the runtime overlay, so we re-read the parsed
+                // value from it rather than re-parsing.
+                mirror_slowlog_param(ctx, &name);
+            }
             SetOutcome::UnknownParam => {
                 return Value::error(ErrorReply::config_set_unknown_param(&name));
             }
@@ -122,6 +130,20 @@ fn config_set(ctx: &ServerContext, req: &Request) -> Value {
         }
     }
     Value::ok()
+}
+
+/// Mirror a just-applied SLOWLOG `CONFIG SET` (`slowlog-log-slower-than` / `slowlog-max-len`) from
+/// the runtime overlay into the live [`ironcache_observe::SlowLog`] (PROD-7), so the per-command
+/// timing hook + the SLOWLOG command observe the change without a restart. A no-op for any other
+/// param. Lowering `slowlog-max-len` trims the ring immediately (via `set_max_len`).
+fn mirror_slowlog_param(ctx: &ServerContext, name: &str) {
+    match name.to_ascii_lowercase().as_str() {
+        "slowlog-log-slower-than" => ctx
+            .slowlog
+            .set_log_slower_than_micros(ctx.runtime.slowlog_log_slower_than()),
+        "slowlog-max-len" => ctx.slowlog.set_max_len(ctx.runtime.slowlog_max_len()),
+        _ => {}
+    }
 }
 
 /// `CONFIG RESETSTAT` -> `+OK`. Zeroes the SERVING shard's stat counters by signalling
@@ -204,6 +226,9 @@ mod tests {
             persist_stats: None,
             process_memory: std::sync::Arc::new(ironcache_observe::ProcessMemoryGauge::new()),
             conn_gate: std::sync::Arc::new(ironcache_observe::ConnectionGate::new()),
+            slowlog: std::sync::Arc::new(ironcache_observe::SlowLog::new()),
+            latency: std::sync::Arc::new(ironcache_observe::LatencyMonitor::new()),
+            clients: std::sync::Arc::new(ironcache_observe::ClientRegistry::new()),
             boot,
         }
     }

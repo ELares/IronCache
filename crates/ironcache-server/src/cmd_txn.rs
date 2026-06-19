@@ -177,6 +177,12 @@ pub(crate) mod tests {
             b"COMMAND",
             b"INFO",
             b"CONFIG",
+            // Operability / admin introspection (PROD-7): SLOWLOG / MEMORY / LATENCY. AlwaysHome
+            // admin containers dispatched in `dispatch_inner` (they need `ctx` for the SLOWLOG ring
+            // / LATENCY monitor / client registry).
+            b"SLOWLOG",
+            b"MEMORY",
+            b"LATENCY",
             b"CLUSTER",
             // Persistence (#58): SAVE / BGSAVE / LASTSAVE. The real cross-shard save lives in the
             // binary serve layer; these dispatch arms are the persistence-disabled fallback.
@@ -493,11 +499,11 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            167,
-            "the dispatch-arm hand-list drifted from the 164 client commands (incl. SAVE/BGSAVE/\
+            170,
+            "the dispatch-arm hand-list drifted from the 167 client commands (incl. SAVE/BGSAVE/\
              LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown, + the drop-in\
-             compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO) \
-             + 3 internal verbs"
+             compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO, \
+             + the PROD-7 operability trio SLOWLOG/MEMORY/LATENCY) + 3 internal verbs"
         );
     }
 

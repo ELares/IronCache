@@ -56,6 +56,16 @@ impl Monotonic {
         self.0
     }
 
+    /// The elapsed time since the clock origin as whole MILLISECONDS, truncated to `u64`. A
+    /// convenience for the monotonic-deadline callers (CLIENT PAUSE's pause window) that want a
+    /// single comparable millis value; relative differences are meaningful, the absolute origin
+    /// is not (the monotonic clock contract).
+    #[inline]
+    #[must_use]
+    pub fn as_millis(self) -> u64 {
+        u64::try_from(self.0.as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// The duration from `earlier` to `self`, saturating at zero if `earlier`
     /// is later (a monotonic clock should never produce that, but the saturating
     /// form keeps callers panic-free).

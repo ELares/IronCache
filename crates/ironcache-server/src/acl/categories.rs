@@ -350,6 +350,10 @@ fn is_admin(cmd: &[u8]) -> bool {
             | b"LASTSAVE"
             | b"SWAPDB"
             | b"COMMAND"
+            // PROD-7 operability / introspection containers.
+            | b"SLOWLOG"
+            | b"LATENCY"
+            | b"MEMORY"
     )
 }
 
@@ -377,6 +381,10 @@ fn is_dangerous(cmd: &[u8]) -> bool {
             | b"MIGRATE"
             | b"RESTORE"
             | b"MOVE"
+            // PROD-7: SLOWLOG (RESET wipes the log) and CLIENT (KILL closes connections) carry
+            // @dangerous in Redis; CLIENT is already @dangerous above. MEMORY/LATENCY are @admin but
+            // NOT @dangerous in Redis, so they are intentionally only in is_admin.
+            | b"SLOWLOG"
     )
 }
 
@@ -646,6 +654,22 @@ mod tests {
         // GET/SET are neither admin nor dangerous.
         assert!(!category_bits(b"GET").contains(Category::Dangerous));
         assert!(!category_bits(b"SET").contains(Category::Admin));
+    }
+
+    #[test]
+    fn operability_commands_are_admin_and_slow() {
+        // PROD-7: SLOWLOG / MEMORY / LATENCY are @admin + @slow; SLOWLOG (RESET wipes the log) is
+        // also @dangerous, so a `-@admin` or `-@dangerous` user is denied them. CLIENT is already
+        // @admin + @dangerous.
+        for &c in &[b"SLOWLOG".as_slice(), b"MEMORY", b"LATENCY"] {
+            let bits = category_bits(c);
+            assert!(bits.contains(Category::Admin), "{c:?} must be @admin");
+            assert!(bits.contains(Category::Slow), "{c:?} must be @slow");
+        }
+        assert!(category_bits(b"SLOWLOG").contains(Category::Dangerous));
+        // MEMORY / LATENCY are @admin but NOT @dangerous (Redis parity).
+        assert!(!category_bits(b"MEMORY").contains(Category::Dangerous));
+        assert!(!category_bits(b"LATENCY").contains(Category::Dangerous));
     }
 
     #[test]

@@ -59,6 +59,21 @@ impl Drop for ConnGateGuard {
     }
 }
 
+/// RAII deregistration of a connection from the node-level [`ironcache_observe::ClientRegistry`]
+/// (PROD-7). A connection REGISTERS itself on accept; this guard DEREGISTERS it on EVERY exit path
+/// (normal close, early return, panic), so a closed connection never lingers in CLIENT LIST and a
+/// CLIENT KILL targeting a now-dead id is a clean no-op. Mirrors [`ConnGateGuard`].
+struct ClientRegistryGuard {
+    registry: Arc<ironcache_observe::ClientRegistry>,
+    id: u64,
+}
+
+impl Drop for ClientRegistryGuard {
+    fn drop(&mut self) {
+        self.registry.deregister(self.id);
+    }
+}
+
 /// Format a 40-lowercase-hex cluster node id from the determinism seam's RNG
 /// (CLUSTER_CONTRACT.md #70). It draws THREE `u64`s (192 bits) and renders 160 of them as
 /// 40 lowercase hex chars: the full first two words plus the LOW 32 bits of the third
@@ -395,6 +410,20 @@ pub fn run_server_observed(
     // default ceiling is 10000 (Redis parity), so an unconfigured node is protected.
     let conn_gate = Arc::new(ironcache_observe::ConnectionGate::new());
 
+    // The node-level OPERABILITY state (PROD-7): the SLOWLOG ring, the LATENCY monitor, and the
+    // live-connection registry CLIENT KILL/PAUSE act through. ONE of each per node, shared by `Arc`
+    // onto every shard's context. The SLOWLOG ring is seeded from the boot config's
+    // `slowlog-log-slower-than` / `slowlog-max-len` so a node started with a configured threshold
+    // keeps it; a `CONFIG SET slowlog-*` later mirrors into it (cmd_config). When the threshold is
+    // -1 (disabled) the per-command hook short-circuits on one relaxed atomic load, so the default
+    // hot path is byte-unchanged.
+    let slowlog = Arc::new(ironcache_observe::SlowLog::with_config(
+        config.slowlog_log_slower_than,
+        config.slowlog_max_len,
+    ));
+    let latency = Arc::new(ironcache_observe::LatencyMonitor::new());
+    let clients = Arc::new(ironcache_observe::ClientRegistry::new());
+
     // Static, cheaply-cloned server context shared by value onto each shard. The
     // mutable cross-shard state is ONLY the runtime cell (an Arc); the rest is
     // immutable, so cloning per shard does not violate shared-nothing.
@@ -453,6 +482,13 @@ pub fn run_server_observed(
         // The process-global live-connection gate (PROD-SAFETY #3): the SAME `Arc` cloned onto every
         // shard's context, so every shard's accept path enforces the one node-level `maxclients` cap.
         conn_gate: conn_gate.clone(),
+        // The node-level operability state (PROD-7): the SAME `Arc`s cloned onto every shard's
+        // context, so the SLOWLOG command reads/resets the same ring the per-command timing hook
+        // populates, the LATENCY command reads the same monitor, and CLIENT KILL/PAUSE/LIST operate
+        // over the one node-wide connection registry every connection registers itself in.
+        slowlog: slowlog.clone(),
+        latency: latency.clone(),
+        clients: clients.clone(),
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
@@ -1121,6 +1157,19 @@ async fn serve_connection(
         id
     };
 
+    // Register this connection in the node-level client registry (PROD-7) so CLIENT LIST sees it
+    // and CLIENT KILL / CLIENT PAUSE can act on it. `client_handle` is THIS connection's record; the
+    // serve loop checks its `is_killed()` flag after each command batch (a cold relaxed load) and
+    // closes if set. The RAII guard deregisters on every exit path. A cold accept-path registration,
+    // never touched per command (except the post-batch kill/pause check, which is also cold).
+    let client_handle = ctx
+        .clients
+        .register(client_id, addr.clone(), laddr.clone(), 0);
+    let _client_registry_guard = ClientRegistryGuard {
+        registry: Arc::clone(&ctx.clients),
+        id: client_id,
+    };
+
     let mut conn = ConnState::new(client_id, default_proto, ctx.requires_auth(), addr, laddr);
 
     // The per-connection PUSH channel (SERVER_PUSH.md #20, PR 91a). `push_tx` is the `Send`
@@ -1173,6 +1222,18 @@ async fn serve_connection(
         loop {
             match decode(&read_buf, &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
+                    // SLOWLOG TIMING HOOK (PROD-7). When the SLOWLOG is ENABLED (threshold >= 0) read
+                    // the monotonic clock ONCE before dispatch; when DISABLED (-1, the default) this
+                    // is a single relaxed atomic load + branch and NOTHING else runs (no clock read,
+                    // no ring touch), so the hot path is byte-unchanged. The threshold is read from
+                    // the runtime overlay (the canonical CONFIG source); `ctx.slowlog` mirrors it for
+                    // the hot-path copy, but reading the overlay directly here keeps a single source.
+                    let slow_threshold = ctx.slowlog.log_slower_than_micros();
+                    let slow_start = if slow_threshold >= 0 {
+                        Some(env.borrow().now())
+                    } else {
+                        None
+                    };
                     // Route + dispatch one decoded request (COORDINATOR.md #107, Stage 1),
                     // appending its encoded reply to `out`; returns whether to close (QUIT).
                     // Factored out of the serve loop so the connection loop stays small.
@@ -1193,6 +1254,14 @@ async fn serve_connection(
                         &mut out,
                     )
                     .await;
+                    // SLOWLOG record (PROD-7): only reached when the SLOWLOG was enabled at the start
+                    // of this command. Measure elapsed micros through the SAME Env clock seam
+                    // (ADR-0003), and if it met the threshold, push the command (args + this
+                    // connection's addr/name) into the node-level ring and feed the LATENCY
+                    // `command` event. This whole block is skipped entirely when SLOWLOG is disabled.
+                    if let Some(start) = slow_start {
+                        record_slow_command(&ctx, &env, &conn, &request, start, slow_threshold);
+                    }
                     read_buf.drain(..consumed);
                     if close {
                         // Flush the QUIT reply then close. send returns the owned
@@ -1234,6 +1303,42 @@ async fn serve_connection(
                 Ok(returned) => out = returned,
                 Err(_) => break,
             }
+        }
+
+        // CLIENT KILL (PROD-7): if a peer's `CLIENT KILL` flagged THIS connection, close it now
+        // (after its in-flight batch's reply was flushed above). A single relaxed atomic load on a
+        // cold post-batch path; the default (never killed) is byte-unchanged.
+        if client_handle.is_killed() {
+            break;
+        }
+
+        // CLIENT PAUSE (PROD-7): if a `CLIENT PAUSE` window is active, stall this connection's
+        // command processing until it elapses (or is UNPAUSEd). The deadline basis is the Env
+        // monotonic clock (the same basis CLIENT PAUSE recorded). Both ALL and WRITE-only pauses
+        // hold the loop here: a WRITE-only pause is enforced as a CONSERVATIVE SUPERSET (it stalls
+        // all command processing for the window, so it never silently fails to pause a write -- the
+        // operator's intent during a failover is honored), at the cost of also stalling reads.
+        // Precise per-command write-only gating that lets reads proceed is a documented follow-up.
+        // The default (no pause) reads one relaxed atomic and falls through, byte-unchanged. We
+        // re-check in a short timer loop so an UNPAUSE / a kill takes effect promptly.
+        loop {
+            let now_mono_ms = env.borrow().now().as_millis();
+            let remaining = ctx.clients.pause_remaining_ms(now_mono_ms);
+            if remaining == 0 {
+                break;
+            }
+            if client_handle.is_killed() {
+                break;
+            }
+            // Wait the smaller of the remaining window and a short poll quantum, so UNPAUSE / KILL
+            // are observed within ~50ms. Via the Runtime timer SEAM (not wall-clock).
+            let wait = remaining.min(50);
+            timer_rt
+                .timer(core::time::Duration::from_millis(wait))
+                .await;
+        }
+        if client_handle.is_killed() {
+            break;
         }
 
         // IDLE WAIT. The NON-subscriber path (the common, hot path) is BYTE-IDENTICAL to before
@@ -4022,6 +4127,129 @@ fn handle_request(
     conn.should_close
 }
 
+/// Record a command into the SLOWLOG ring + the LATENCY `command` event IF it met the threshold
+/// (PROD-7). Called ONLY when the SLOWLOG was enabled at the start of the command (the hot-path hook
+/// short-circuits otherwise), so the elapsed-time read + the threshold compare are the only cost on
+/// a fast command, and the ring/monitor locks are touched ONLY for a genuinely slow command (rare).
+///
+/// `start` is the monotonic instant captured before dispatch; the elapsed micros are measured here
+/// through the SAME Env clock seam (ADR-0003). The unix TIMESTAMP for the entry is read from the Env
+/// wall clock. The args + this connection's addr/name are copied into the entry (capped by the ring
+/// builder). The LATENCY `command` event samples the same elapsed time in milliseconds, gated on a
+/// fixed floor so the monitor only records meaningful spikes.
+fn record_slow_command(
+    ctx: &ServerContext,
+    env: &Rc<RefCell<SystemEnv>>,
+    conn: &ConnState,
+    request: &Request,
+    start: ironcache_env::Monotonic,
+    threshold_micros: i64,
+) {
+    // Read the clock ONCE (monotonic now + wall unix) under a single short borrow.
+    let (elapsed, unix_secs) = {
+        let e = env.borrow();
+        let elapsed = e.now().saturating_duration_since(start);
+        let unix_secs = e.now_unix_millis() / 1000;
+        (elapsed, unix_secs)
+    };
+    let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    // Threshold compare: `threshold_micros` is >= 0 here (the caller gated on enabled). `0` logs
+    // everything; a positive value logs only commands at/above it.
+    if micros >= u64::try_from(threshold_micros).unwrap_or(0) {
+        let raw_args: Vec<Vec<u8>> = request.args.iter().map(|a| a.to_vec()).collect();
+        // SECRET-LEAK FIX: SLOWLOG entries are readable by any @admin via `SLOWLOG GET`, and with
+        // `slowlog-log-slower-than 0` EVERY command (including auth) is logged. Redact the secret
+        // args of auth/password-setting commands BEFORE they enter the ring, so a password never
+        // sits in the slow log in cleartext (Redis applies the same per-command sensitive-arg rule).
+        let cmd_upper = ascii_upper(request.command());
+        let raw_args = redact_args_for_slowlog(&cmd_upper, raw_args);
+        ctx.slowlog.record(
+            unix_secs,
+            micros,
+            &raw_args,
+            conn.addr.clone(),
+            conn.name.clone(),
+        );
+    }
+    // LATENCY `command` event (PROD-7): sample this command's elapsed time in MILLISECONDS, gated on
+    // a fixed floor so only meaningful spikes are recorded (a sub-millisecond command is never a
+    // latency event). This is the always-tracked event; subsystem events are a follow-up.
+    if micros >= ironcache_observe::LATENCY_COMMAND_FLOOR_MICROS {
+        ctx.latency.record("command", unix_secs, micros / 1000);
+    }
+}
+
+/// The placeholder a redacted SLOWLOG argument is replaced with (Redis convention).
+const SLOWLOG_REDACTED: &[u8] = b"(redacted)";
+
+/// Redact the secret arguments of `args` (the verbatim request, `args[0]` = command) for a
+/// SLOWLOG entry, based on the UPPERCASED command `cmd_upper`. Returns the (possibly rewritten)
+/// argument vector; non-sensitive commands are returned UNCHANGED.
+///
+/// This runs ONLY inside [`record_slow_command`], i.e. only for a command already deemed slow,
+/// so it is off the hot path. It mirrors the Redis per-command sensitive-arg rule:
+/// - `AUTH`: every arg after the verb is the credential (`AUTH pass` or `AUTH user pass`); redact
+///   all of them. (Redis only redacts the password; redacting every post-verb arg is a strict
+///   superset that can never leak the password and never reveals a username either.)
+/// - `HELLO`: redact the two args following an `AUTH` token (the username and password).
+/// - `CONFIG SET`: when the parameter (arg2, case-insensitive) is `requirepass` or `masterauth`,
+///   redact its value (arg3).
+/// - `ACL SETUSER`: redact every password/hash rule token (`>`/`<`/`#`/`!`) via the shared
+///   [`ironcache_server::acl::redacted_rule`] so the redaction matches the ACL error reply.
+fn redact_args_for_slowlog(cmd_upper: &[u8], mut args: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    match cmd_upper {
+        b"AUTH" => {
+            // Redact every arg after the verb (the credential(s)).
+            for a in args.iter_mut().skip(1) {
+                *a = SLOWLOG_REDACTED.to_vec();
+            }
+        }
+        b"HELLO" => {
+            // Redact the (user, pass) pair following an AUTH token, wherever it sits.
+            let mut i = 1;
+            while i < args.len() {
+                if args[i].eq_ignore_ascii_case(b"AUTH") {
+                    for a in args.iter_mut().skip(i + 1).take(2) {
+                        *a = SLOWLOG_REDACTED.to_vec();
+                    }
+                    break;
+                }
+                i += 1;
+            }
+        }
+        b"CONFIG" => {
+            // CONFIG SET <param> <value> [<param> <value> ...]: redact the value of every
+            // requirepass/masterauth pair (case-insensitive param match).
+            if args.len() >= 2 && args[1].eq_ignore_ascii_case(b"SET") {
+                let mut i = 2;
+                while i + 1 < args.len() {
+                    if args[i].eq_ignore_ascii_case(b"requirepass")
+                        || args[i].eq_ignore_ascii_case(b"masterauth")
+                    {
+                        args[i + 1] = SLOWLOG_REDACTED.to_vec();
+                    }
+                    i += 2;
+                }
+            }
+        }
+        b"ACL" => {
+            // ACL SETUSER <name> <rule>...: redact each password/hash rule token, reusing the
+            // canonical ACL redactor so SLOWLOG and the ACL error reply never drift.
+            if args.len() >= 3 && args[1].eq_ignore_ascii_case(b"SETUSER") {
+                for a in args.iter_mut().skip(3) {
+                    let token = String::from_utf8_lossy(a);
+                    let redacted = ironcache_server::acl::redacted_rule(&token);
+                    if redacted != token {
+                        *a = redacted.into_bytes();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    args
+}
+
 /// Encode `value` and append the bytes to `out`. PR-1 encodes into a fresh
 /// `BytesMut` per reply and appends; pooling is a later optimization behind this
 /// same call site (PROTOCOL.md notes zero-copy/pooling sit behind the interface).
@@ -5111,6 +5339,9 @@ mod tests {
             persist_stats: None,
             process_memory: Arc::new(ironcache_observe::ProcessMemoryGauge::new()),
             conn_gate: Arc::new(ironcache_observe::ConnectionGate::new()),
+            slowlog: Arc::new(ironcache_observe::SlowLog::new()),
+            latency: Arc::new(ironcache_observe::LatencyMonitor::new()),
+            clients: Arc::new(ironcache_observe::ClientRegistry::new()),
             boot,
         }
     }

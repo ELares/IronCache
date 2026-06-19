@@ -61,6 +61,9 @@ fn ctx(runtime: Arc<RuntimeConfig>, boot: Config) -> ServerContext {
         persist_stats: None,
         process_memory: Arc::new(ironcache_observe::ProcessMemoryGauge::new()),
         conn_gate: Arc::new(ironcache_observe::ConnectionGate::new()),
+        slowlog: Arc::new(ironcache_observe::SlowLog::new()),
+        latency: Arc::new(ironcache_observe::LatencyMonitor::new()),
+        clients: Arc::new(ironcache_observe::ClientRegistry::new()),
         boot,
     }
 }
