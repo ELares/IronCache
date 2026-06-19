@@ -107,6 +107,16 @@ memchr = "2.7"
 ryu = "1.0"
 # Signal handling in the binary only (graceful shutdown, CLI_BINARY.md).
 libc = "0.2"
+# Structured logging (OBSERVABILITY.md, #152). PURE RUST (no C lib), so the musl/aarch64 static
+# cross-build is unaffected. `tracing` is the facade the operational logs emit through; the binary
+# installs ONE `tracing-subscriber` fmt layer at boot, filtered by `--log-level` via the
+# `EnvFilter`-free `LevelFilter` reload-free path (we build a plain `Targets`/`LevelFilter` from the
+# flag). `default-features = false` keeps the dependency surface minimal: only the `fmt` writer +
+# the `std` env it needs, no ANSI/registry-extras pulled unless named. The stderr writer keeps logs
+# on the orchestrator-friendly stream. A level check short-circuits BEFORE argument formatting, so a
+# suppressed `debug!`/`trace!` on the hot path costs only an atomic level load (no allocation).
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 
 # Internal crates.
 ironcache-env = { path = "crates/ironcache-env" }

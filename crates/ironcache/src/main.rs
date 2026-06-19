@@ -14,9 +14,13 @@ use clap::Parser;
 use cli::{Cli, Command};
 // The server wiring lives in the crate's library half (`src/lib.rs`) so integration
 // tests can boot the real `run_server`; the binary consumes the same modules here.
+use ironcache::metrics_http::{self, MetricsState, ReadyState};
 use ironcache::serve;
 use ironcache_config::{Config, ConfigOverlay};
+use ironcache_observe::MetricsRegistry;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 // jemalloc as the global allocator (ADR-0006). Not available on MSVC; the static
 // release targets (musl, macos) all have it.
@@ -56,6 +60,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     let cli = Cli::parse();
+
+    // STRUCTURED LOGGING (OBSERVABILITY.md, #152): install ONE tracing subscriber at boot,
+    // filtered by `--log-level`, BEFORE any operational log fires. The operational `tracing::*`
+    // logs (boot banner, errors, the cluster-tls/dns/persistence/shutdown messages) are then
+    // FILTERED by this level (the previously-dead `--log-level` flag becomes live). The sink is
+    // stderr (orchestrator-friendly). Installed for EVERY mode so a `cli`/`check`/`config`
+    // invocation also honors the level; the default level preserves the prior effective
+    // verbosity (info). A failed install (a second subscriber in the same process, e.g. a test
+    // harness) is non-fatal: the existing subscriber stands.
+    install_tracing(&cli.log_level);
+
     let command = cli.command.as_ref();
 
     match command {
@@ -71,6 +86,52 @@ fn main() -> anyhow::Result<()> {
             cmd_upgrade();
             Ok(())
         }
+    }
+}
+
+/// Install the process-wide `tracing` subscriber filtered by `--log-level` (OBSERVABILITY.md,
+/// #152), writing to STDERR. Maps the level string (`error`/`warn`/`info`/`debug`/`trace`, the
+/// Redis `loglevel` vocabulary plus the standard extras) to a `LevelFilter`; an unrecognized
+/// value falls back to `info` (the prior default) with a one-line note, rather than failing boot.
+///
+/// A suppressed `debug!`/`trace!` short-circuits at the level check BEFORE its arguments are
+/// formatted, so the level gate adds no allocation on a quiet hot path. Installing is best-effort:
+/// a second install in the same process (a test that already set a global subscriber) is ignored,
+/// so this never panics a re-entrant harness.
+fn install_tracing(log_level: &str) {
+    use tracing_subscriber::fmt;
+
+    let (level, unknown) = parse_log_level(log_level);
+    let subscriber = fmt()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        // Compact, timestamp-free lines keep the orchestrator log clean (the platform adds its
+        // own timestamps); the target is the module path, which is plenty for ops triage.
+        .with_target(true)
+        .finish();
+    // `try_init`-style: ignore an "already set" error so a re-entrant test harness is safe.
+    if tracing::subscriber::set_global_default(subscriber).is_ok() && unknown {
+        tracing::warn!(
+            requested = log_level,
+            "unknown --log-level; defaulting to info"
+        );
+    }
+}
+
+/// Map a `--log-level` string to a `LevelFilter` (OBSERVABILITY.md, #152). Returns the filter and
+/// a `bool` that is `true` when the input was UNRECOGNIZED (the caller falls back to `info` and
+/// logs a note). The vocabulary is the Redis `loglevel` names plus the standard tracing extras;
+/// matching is case-insensitive. Pure, so the level mapping is unit-tested without installing a
+/// global subscriber.
+fn parse_log_level(log_level: &str) -> (tracing::level_filters::LevelFilter, bool) {
+    use tracing::level_filters::LevelFilter;
+    match log_level.to_ascii_lowercase().as_str() {
+        "error" => (LevelFilter::ERROR, false),
+        "warn" | "warning" => (LevelFilter::WARN, false),
+        "info" => (LevelFilter::INFO, false),
+        "debug" | "verbose" => (LevelFilter::DEBUG, false),
+        "trace" => (LevelFilter::TRACE, false),
+        _ => (LevelFilter::INFO, true),
     }
 }
 
@@ -105,18 +166,66 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
 
 fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     let cfg = load_config(cli)?;
-    eprintln!(
-        "ironcache {}: binding {}:{} across {} shard(s)",
-        cli::BUILD_VERSION,
-        cfg.bind,
-        cfg.port,
-        cfg.shards
+    tracing::info!(
+        version = cli::BUILD_VERSION,
+        bind = %cfg.bind,
+        port = cfg.port,
+        shards = cfg.shards,
+        "ironcache: binding"
     );
-    let set = serve::run_server(&cfg).context("starting server")?;
+
+    // OUT-OF-BAND METRICS / HEALTH (OBSERVABILITY.md, #152). Enabled ONLY when `--metrics-addr`
+    // is set: build the per-shard counter registry (sized to the shard count, adopted by each
+    // shard at boot) and the liveness / readiness flags, boot the server with the registry
+    // threaded through every shard's context, then spawn the HTTP endpoint. With NO `--metrics-addr`
+    // the registry is `None`, the shards use a standalone counter cell, and NO listener is spawned
+    // (byte-identical boot). The `live`/`ready` flags exist regardless (cheap atomics) but are only
+    // read by the endpoint.
+    let metrics_enabled = cli.metrics_addr.is_some();
+    let registry = metrics_enabled.then(|| MetricsRegistry::new(cfg.shards));
+    let live = Arc::new(AtomicBool::new(false));
+    // Readiness gates on ACTUAL per-shard load-on-boot completion (OBSERVABILITY.md, #152): sized to
+    // the shard count, it reports `/readyz` not-ready until EVERY shard's `load_shard_on_boot` has
+    // returned. Threaded into the server boot below so each shard signals one unit when it finishes
+    // loading; the flag is never flipped prematurely here. Built only when the endpoint is enabled.
+    let ready = metrics_enabled.then(|| Arc::new(ReadyState::with_shards(cfg.shards)));
+
+    let handles = serve::run_server_observed(&cfg, registry.clone(), ready.clone())
+        .context("starting server")?;
+    let set = handles.set;
+
+    // The metrics endpoint reads the live boot handles (the raft status, persistence atomics, and
+    // the runtime-config maxmemory). Spawn it AFTER the shards are up so a `/metrics` scrape sees a
+    // live server. A bind failure here is a hard boot error (a misconfigured `--metrics-addr`
+    // should fail fast, like the RESP listener), so propagate it before we mark the node live.
+    // `registry` and `ready` are both `Some` exactly when `--metrics-addr` is set (built together
+    // under `metrics_enabled`); the metrics state SHARES the SAME `ready` the shards signal into.
+    if let (Some(metrics_addr), Some(registry), Some(ready)) =
+        (cli.metrics_addr.as_ref(), registry, ready.as_ref())
+    {
+        let runtime = std::sync::Arc::clone(&handles.runtime);
+        let state = MetricsState::new(
+            registry,
+            Arc::clone(&live),
+            Arc::clone(ready),
+            cfg.shards,
+            Arc::new(move || runtime.maxmemory()),
+            handles.raft.clone(),
+            handles.persist.clone(),
+        );
+        metrics_http::spawn_metrics_server(metrics_addr, state)
+            .context("starting the metrics endpoint")?;
+    }
+
     let flag = serve::install_shutdown(&set);
-    eprintln!("ironcache: ready (PING -> +PONG). Ctrl-C to stop.");
+    // Boot is complete: the process is SERVING (liveness). Readiness is NOT flipped here: the
+    // synchronous boot wiring only SPAWNS the shards, whose load-on-boot runs async afterward, so
+    // each shard signals the `/readyz` countdown itself once its `load_shard_on_boot` returns (#152).
+    // The raft-leader gate, when applicable, is evaluated live by `/readyz` from the raft handle.
+    live.store(true, std::sync::atomic::Ordering::SeqCst);
+    tracing::info!("ironcache: ready (PING -> +PONG). Ctrl-C to stop.");
     serve::wait_for_signal(&flag);
-    eprintln!("ironcache: shutting down");
+    tracing::info!("ironcache: shutting down");
 
     // GRACEFUL STOP (#139, SHUTDOWN.md). `wait_for_signal` has set the shutdown flag (and armed the
     // second-signal force-exit watcher). `shutdown_and_join` now drives the bounded per-shard drain
@@ -137,7 +246,7 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
 fn cmd_cli(host: &str, port: u16) -> anyhow::Result<()> {
     // PR-1: the interactive REPL is a documented WIP. We provide a minimal,
     // non-interactive smoke client so the mode is real: connect, PING, print.
-    eprintln!("ironcache cli (WIP): connecting to {host}:{port}");
+    tracing::info!(host, port, "ironcache cli (WIP): connecting");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -183,7 +292,7 @@ fn run_cli_alias() -> anyhow::Result<()> {
 
 fn cmd_bench() {
     // Stub (CLI_BINARY.md): the benchmark harness is #8, a later PR.
-    eprintln!("ironcache bench: not yet implemented (tracked by #8)");
+    tracing::warn!("ironcache bench: not yet implemented (tracked by #8)");
 }
 
 fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
@@ -278,5 +387,56 @@ fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
 
 fn cmd_upgrade() {
     // Stub (CLI_BINARY.md / #83): verified self-update with rollback.
-    eprintln!("ironcache upgrade: not yet implemented (tracked by #83)");
+    tracing::warn!("ironcache upgrade: not yet implemented (tracked by #83)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::level_filters::LevelFilter;
+
+    #[test]
+    fn parse_log_level_maps_the_vocabulary() {
+        assert_eq!(parse_log_level("error"), (LevelFilter::ERROR, false));
+        assert_eq!(parse_log_level("warn"), (LevelFilter::WARN, false));
+        assert_eq!(parse_log_level("warning"), (LevelFilter::WARN, false));
+        assert_eq!(parse_log_level("info"), (LevelFilter::INFO, false));
+        assert_eq!(parse_log_level("debug"), (LevelFilter::DEBUG, false));
+        assert_eq!(parse_log_level("trace"), (LevelFilter::TRACE, false));
+        // Case-insensitive.
+        assert_eq!(parse_log_level("INFO"), (LevelFilter::INFO, false));
+        assert_eq!(parse_log_level("Debug"), (LevelFilter::DEBUG, false));
+    }
+
+    #[test]
+    fn parse_log_level_unknown_falls_back_to_info() {
+        let (level, unknown) = parse_log_level("loud");
+        assert_eq!(level, LevelFilter::INFO);
+        assert!(unknown, "an unrecognized level must flag the fallback");
+    }
+
+    #[test]
+    fn parse_log_level_filters_debug_at_info() {
+        // A debug-line is SUPPRESSED at info (info is less verbose) and VISIBLE at debug. We assert
+        // the relation on the LevelFilter the subscriber installs from the flag: DEBUG > INFO, so a
+        // DEBUG event passes the debug filter but not the info filter.
+        let (info, _) = parse_log_level("info");
+        let (debug, _) = parse_log_level("debug");
+        assert!(
+            tracing::Level::DEBUG <= debug,
+            "a debug event must pass the debug filter"
+        );
+        assert!(
+            tracing::Level::DEBUG > info,
+            "a debug event must be suppressed at info"
+        );
+    }
+
+    #[test]
+    fn install_tracing_does_not_panic() {
+        // Installing the subscriber from the flag must not panic (a second install in the same
+        // process is ignored). This also exercises the unknown-level branch.
+        install_tracing("info");
+        install_tracing("nonsense");
+    }
 }

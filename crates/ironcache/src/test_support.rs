@@ -8,6 +8,59 @@ use crate::serve::run_server;
 use ironcache_config::{ClusterMode, ClusterTopology, Config, TlsMode};
 use ironcache_runtime::bootstrap::ShardSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+/// Boot a real server on `127.0.0.1:port` across `shards` shards WITH the out-of-band metrics
+/// endpoint (OBSERVABILITY.md, #152) bound on `127.0.0.1:metrics_port`, returning the running
+/// [`ShardSet`]. Mirrors the binary's `cmd_server` metrics wiring (registry per shard, live/ready
+/// flags, `spawn_metrics_server`) so an integration test can scrape the live `/metrics`, `/livez`,
+/// `/readyz` over real sockets.
+///
+/// # Panics
+///
+/// Panics if the server or the metrics listener fails to bind.
+#[must_use]
+pub fn run_server_with_metrics_for_test(port: u16, shards: usize, metrics_port: u16) -> ShardSet {
+    use crate::metrics_http::{self, MetricsState, ReadyState};
+    use ironcache_observe::MetricsRegistry;
+
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        ..Config::default()
+    };
+    let registry = MetricsRegistry::new(shards);
+    let live = Arc::new(AtomicBool::new(false));
+    // Readiness sized to the shard count: each shard signals its load-on-boot completion through the
+    // SAME state threaded into the server boot, so `/readyz` flips to 200 only after every shard has
+    // loaded (mirrors cmd_server, #152).
+    let ready = Arc::new(ReadyState::with_shards(shards));
+    let handles = crate::serve::run_server_observed(
+        &config,
+        Some(registry.clone()),
+        Some(Arc::clone(&ready)),
+    )
+    .expect("test metrics server failed to bind");
+    let runtime = Arc::clone(&handles.runtime);
+    let state = MetricsState::new(
+        registry,
+        Arc::clone(&live),
+        Arc::clone(&ready),
+        shards,
+        Arc::new(move || runtime.maxmemory()),
+        handles.raft.clone(),
+        handles.persist.clone(),
+    );
+    let addr = format!("127.0.0.1:{metrics_port}");
+    metrics_http::spawn_metrics_server(&addr, state).expect("metrics endpoint failed to bind");
+    // Boot complete: mark live (mirrors cmd_server). Readiness is NOT flipped here -- each shard
+    // signals it once its load-on-boot finishes.
+    live.store(true, std::sync::atomic::Ordering::SeqCst);
+    handles.set
+}
 
 /// Boot a real server on `127.0.0.1:port` across `shards` shards and return the running
 /// [`ShardSet`]. The caller keeps the handle alive for the server's lifetime and calls

@@ -81,7 +81,9 @@ pub use route::{
 // dependency edge. `ProposeOutcome` is the typed result a raft-mode CLUSTER mutator maps to
 // `+OK` / `-CLUSTERDOWN`. `MembershipOutcome` + `ClusterConfig` carry the operator-driven dynamic
 // Raft membership path (HA-prod-membership): MEET -> AddLearner, auto-promote, FORGET -> RemoveVoter.
-pub use ironcache_raft_net::{ClusterConfig, MembershipOutcome, ProposeOutcome, RaftHandle};
+pub use ironcache_raft_net::{
+    ClusterConfig, MembershipOutcome, ProposeOutcome, RaftHandle, Status,
+};
 
 // Re-export the replication STATUS types (HA-7e) carried by `ServerContext::repl_status`, so the
 // serve layer (and the binary's repl tasks that publish to it) can name them via

@@ -145,6 +145,7 @@ pub async fn run_drain_loop(
     inbox: Inbox,
     persist: Option<Arc<crate::persist::PersistState>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ready: Option<Arc<crate::metrics_http::ReadyState>>,
 ) {
     // The runtime TIMER seam (ADR-0003) the shutdown-flag poll below arms; imported at the top of
     // the fn (not mid-body) so clippy's items-after-statements stays happy.
@@ -155,6 +156,10 @@ pub async fn run_drain_loop(
     // (but key-owning) shard needs -- a shard can now own keys without ever accepting a
     // connection, so its expiry timer must start here, not on first connection. Idempotent
     // (guarded), so the serve loop calling it again per connection is harmless.
+    // Adopt THIS shard's metrics cell (OBSERVABILITY.md, #152) BEFORE `ensure_shard_started`
+    // builds the `ShardState` (whose `ShardCounters` must wrap the adopted cell). A no-op when
+    // the `/metrics` endpoint is disabled (`metrics_registry` is `None`).
+    crate::serve::adopt_metrics_cell(ctx.metrics_registry.as_ref(), shard_index);
     crate::serve::ensure_shard_started(
         ctx.databases,
         ctx.info.maxmemory_policy,
@@ -178,6 +183,16 @@ pub async fn run_drain_loop(
         if shard_index == 0 && persist.interval_secs > 0 {
             spawn_periodic_save(ctx.clone(), inbox.clone(), Arc::clone(persist));
         }
+    }
+    // READINESS SIGNAL (OBSERVABILITY.md, #152): this shard has now finished its load-on-boot --
+    // either `load_shard_on_boot` restored its snapshot above (persistence on), or there was nothing
+    // to load (persistence off, the `if let` was skipped). Decrement the per-shard readiness
+    // countdown so `/readyz` reports 200 only AFTER every shard reaches this point, never while a
+    // snapshot restore is still in flight (k8s would otherwise route to an empty/partial keyspace).
+    // This MUST come after the load above and before the drain loop services any work. `None` when
+    // the metrics endpoint is off (a no-op).
+    if let Some(ready) = ready.as_ref() {
+        ready.signal_shard_loaded();
     }
     // HA-7d LIVE replica attach: ONLY in raft-governance mode (`ctx.raft.is_some()`). The
     // DEFAULT static path and the raft-control-plane-WITHOUT-replicas path are byte-unchanged:
@@ -244,7 +259,7 @@ pub async fn run_drain_loop(
             // committed snapshot stays valid; the design's non-zero-on-truncation exit-code map is
             // #139's open follow-up).
             let _ = save_on_exit_if_configured(persist.as_ref(), &ctx, &inbox).await;
-            eprintln!("ironcache: save-on-exit complete -> exit 0");
+            tracing::info!("ironcache: save-on-exit complete -> exit 0");
             std::process::exit(0);
         }
         // A NON-save-host shard on a graceful stop: keep servicing the cross-shard fan-out (so shard
@@ -988,9 +1003,11 @@ fn load_shard_on_boot(
         )
     };
     if loaded > 0 {
-        eprintln!(
-            "ironcache: shard {shard_index} loaded {loaded} keys from {}",
-            persist.dir.display()
+        tracing::info!(
+            shard = shard_index,
+            loaded,
+            dir = %persist.dir.display(),
+            "ironcache: shard loaded keys from snapshot"
         );
     }
 }
@@ -1087,8 +1104,8 @@ pub async fn save_on_exit_if_configured(
         // The wait TIMED OUT: a genuinely wedged save never freed the latch (the LOW case). Do NOT
         // hang the exit forever -- return false best-effort (the caller exits; the in-flight save MAY
         // still commit its prior-or-partial state, and the prior committed manifest stays valid).
-        eprintln!(
-            "ironcache: save-on-exit -- a prior save did not finish within SHUTDOWN_SAVE_WAIT; \
+        tracing::warn!(
+            "ironcache: save-on-exit: a prior save did not finish within SHUTDOWN_SAVE_WAIT; \
              exiting best-effort (the in-flight save may still commit)"
         );
         return false;
@@ -1115,8 +1132,9 @@ pub async fn save_on_exit_if_configured(
     {
         Ok(()) => true,
         Err(msg) => {
-            eprintln!(
-                "ironcache: save-on-exit failed: {msg} (the prior committed snapshot stays valid)"
+            tracing::error!(
+                error = %msg,
+                "ironcache: save-on-exit failed (the prior committed snapshot stays valid)"
             );
             false
         }

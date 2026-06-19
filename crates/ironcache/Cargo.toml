@@ -81,6 +81,12 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync", "signal"] }
 libc = { workspace = true }
+# Structured logging (OBSERVABILITY.md, #152). The binary installs ONE tracing-subscriber fmt
+# layer at boot, filtered by `--log-level`, and the operational logs (boot banner, errors, the
+# cluster-tls/dns/persistence/shutdown messages) emit through the `tracing` facade. Pure Rust, so
+# the static musl/aarch64 build is unaffected.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # jemalloc is the default allocator (ADR-0006, jemalloc 5.3.x). Not available on
 # MSVC Windows; gate it so the workspace still builds there (the static release

@@ -1145,6 +1145,7 @@ mod tests {
             raft: None,
             repl_status: None,
             in_sync_replicas: None,
+            metrics_registry: None,
             boot,
         }
     }
