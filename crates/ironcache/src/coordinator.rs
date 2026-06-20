@@ -230,6 +230,25 @@ pub async fn run_drain_loop(
         );
         crate::replica_attach::spawn_on_shard(&ctx, store_rc, ctx.boot.bind, ctx.info.tcp_port);
     }
+    // TURNKEY cluster formation (PROD-turnkey): on SHARD 0 only (one driver per node, mirroring the
+    // periodic-save host) in raft-mode WITH a static topology, spawn the bootstrap driver. Once this
+    // node is the leader AND the committed config is still FRESH (a truly fresh cluster), it proposes
+    // the topology's declared node table + slot ownership through the unchanged Raft propose path, so
+    // a deploy from the shipped static topology converges to cluster_state:ok + full slot coverage
+    // WITHOUT a manual CLUSTER MEET / ADDSLOTS. It is fresh-only + idempotent (the guard goes false
+    // the instant the bootstrap commits, and a restart recovers a non-empty committed config), so it
+    // NEVER re-bootstraps / clobbers a committed config / runtime migration. A topology that declares
+    // no slots (e.g. the existing acceptance tests) makes the driver a no-op, leaving their manual
+    // MEET/ADDSLOTS flow untouched. The store handle is the SAME shard-0 LocalSet the driver pins to.
+    if shard_index == 0 {
+        if let (Some(cluster), Some(raft), Some(topology)) = (
+            ctx.cluster.clone(),
+            ctx.raft.clone(),
+            ctx.boot.cluster_topology.as_ref(),
+        ) {
+            crate::turnkey_bootstrap::spawn_on_shard(cluster, raft, topology);
+        }
+    }
     // SAVE-ON-EXIT WATCH (#139, SHUTDOWN.md): EVERY shard's drain loop watches the shared shutdown
     // flag concurrently with the cross-shard work recv so a SIGTERM/SIGINT-triggered graceful stop is
     // observed promptly and the drain loop RETURNS (the bootstrap awaits this task before the shard

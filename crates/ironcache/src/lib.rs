@@ -42,4 +42,9 @@ pub mod spanning_combine;
 /// commands; spanning RENAME/RENAMENX/COPY/LMPOP/ZMPOP/SORT-STORE are FAIL-LOUD instead.
 pub mod spanning_move;
 pub mod test_support;
+/// TURNKEY cluster formation (PROD-turnkey): on a FRESH raft cluster the elected leader auto-applies
+/// the shipped static `cluster_topology`'s node table + slot ownership through the Raft log, so a
+/// deploy reaches `cluster_state:ok` with all slots assigned WITHOUT a manual `CLUSTER MEET` /
+/// `ADDSLOTS`. Idempotent + fresh-only (never re-bootstraps / clobbers a committed config).
+pub mod turnkey_bootstrap;
 pub mod whole_keyspace;

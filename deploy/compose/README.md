@@ -47,6 +47,14 @@ lazily at Raft dial time, so nodes can start in any order.
 Client ports are published as `6379` / `6380` / `6381` on the host. The 16384
 slots are split: node1 `[0,5460]`, node2 `[5461,10922]`, node3 `[10923,16383]`.
 
+Formation is TURNKEY: each `config/nodeN.toml` declares its `slots`, and on a
+fresh cluster the elected Raft leader auto-applies that declared node table + slot
+ownership through the replicated log, so the cluster reaches `cluster_state:ok`
+with all 16384 slots assigned on its own. You do NOT run `CLUSTER MEET` /
+`CLUSTER ADDSLOTS` by hand for the shipped topology -- those are reserved for
+RUNTIME changes (adding a node, rebalancing). Wait for `/readyz` (or poll
+`redis-cli -p 6379 CLUSTER INFO` for `cluster_state:ok`), then just use it:
+
 ```sh
 redis-cli -c -p 6379 set foo bar   # -c follows MOVED redirects across nodes
 redis-cli -c -p 6379 get foo
