@@ -124,6 +124,38 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - run: cargo build --release --target x86_64-unknown-linux-musl
 
+  io-uring:
+    name: io_uring datapath (Linux, default-off feature)
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    # The OPTIONAL Linux io_uring backend (PROD-10 / #28, docs/design/IOURING_DATAPATH.md) is
+    # default-OFF and Linux-only; this ubuntu job is the dedicated gate that BUILDS + TESTS it
+    # with `--features io_uring` (the default jobs above prove the byte-unchanged default build).
+    # The io_uring `Runtime` impl + the per-shard io_uring bootstrap + the owned-buffer recv/send
+    # round-trip test (`accept_recv_send_roundtrip_uring`) compile and run ONLY here (the code is
+    # `#[cfg(all(target_os = "linux", feature = "io_uring"))]`, so it is inert on the macOS test
+    # job even under that job's `--all-features`). GitHub's ubuntu runners run a kernel with
+    # io_uring, so the tokio-uring runtime starts and the round-trip exercises real submissions.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Clippy (pedantic, -D warnings) over the io_uring feature so the Linux-only path is held to
+      # the SAME lint bar as the default build (the macOS dev box cannot lint this cfg).
+      - name: clippy --features io_uring
+        run: cargo clippy -p ironcache-runtime -p ironcache --features io_uring --all-targets -- -D warnings
+      # Build the binary with the io_uring datapath compiled in.
+      - name: build --features io_uring
+        run: cargo build -p ironcache-runtime -p ironcache --features io_uring
+      # Run the runtime crate's tests with io_uring on: the existing suite plus the io_uring
+      # `Runtime` round-trip (accept/recv/send over a real ring) prove the owned-buffer append
+      # semantics map correctly onto tokio-uring.
+      - name: test --features io_uring
+        run: cargo test -p ironcache-runtime --features io_uring
+
   invariant-lints:
     name: invariant lints (INVARIANTS.md)
     needs: guard

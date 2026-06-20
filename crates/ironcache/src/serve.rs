@@ -518,6 +518,15 @@ pub fn run_server_observed(
     // itself is cloned into the serve/drain closures below.
     let persist_for_handles = persist.clone();
 
+    // Clones for the OPTIONAL io_uring serve closure (PROD-10 / #28), captured BEFORE the tokio
+    // `serve` closure moves `ctx_template` in. These feed the io_uring per-connection serve loop
+    // when (and only when) the io_uring backend is selected at the bootstrap-selection branch
+    // below; on the default / non-Linux / no-feature build they are an extra cheap clone bound to
+    // `_` there (no behavior change to the tokio path).
+    let ctx_template_for_uring = ctx_template.clone();
+    let inbox_for_uring = inbox.clone();
+    let persist_for_uring = persist.clone();
+
     // EMBEDDED TRANSPORT TLS for the CLIENT listener (#105, docs/design/TLS.md). Build the rustls
     // acceptor ONCE at boot when `tls = on`, from the configured cert/key PEM, and clone the cheap
     // (Arc-inside) handle into every connection's serve closure. When `tls = off` (the DEFAULT)
@@ -613,7 +622,76 @@ pub fn run_server_observed(
     let runtime_handle = ctx_template_runtime.clone();
     let persist_handle = persist_for_handles;
 
-    let set = ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?;
+    // RUNTIME BACKEND SELECTION (PROD-10 / #28). The DEFAULT (`runtime = tokio`, and the only
+    // option in the default no-feature build / off Linux) drives the per-shard bootstrap on the
+    // portable tokio backend, byte-unchanged. `runtime = io_uring` is honored ONLY when ALL of:
+    //   * the binary was built `--features io_uring`,
+    //   * the target is Linux, and
+    //   * TLS is OFF (rustls does not compose with io_uring in v1; see below),
+    // are true; in every other case we LOG a one-line fallback and use the tokio backend, so
+    // selecting io_uring can never fail to start a node. The io_uring path uses a dedicated,
+    // seam-driven plaintext serve loop ([`serve_connection_uring`]) that REUSES the same
+    // route+dispatch engine through the `Runtime` owned-buffer recv/send. The selection is inline
+    // (not a helper fn) so the concrete `serve` / `drain` closures keep their inferred opaque
+    // types and need no nameable trait alias.
+    let want_io_uring = config.runtime == ironcache_config::RuntimeBackend::IoUring;
+
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    let set = if want_io_uring && config.tls != ironcache_config::TlsMode::On {
+        tracing::info!(
+            "runtime = io_uring: using the Linux io_uring datapath (plaintext); the \
+             registered-buffer / multishot fast path and a perf benchmark are deferred to a \
+             Linux soak (no throughput claim made)"
+        );
+        let uring_serve = {
+            let ctx_template = ctx_template_for_uring;
+            let inbox = inbox_for_uring;
+            let persist = persist_for_uring;
+            move |rt: ironcache_runtime::IoUringRuntime,
+                  stream: tokio_uring::net::TcpStream,
+                  shard: ShardId| {
+                let ctx = ctx_template.clone();
+                let inbox = inbox.clone();
+                let persist = persist.clone();
+                async move {
+                    serve_connection_uring(rt, stream, shard, ctx, default_proto, inbox, persist)
+                        .await;
+                }
+            }
+        };
+        ironcache_runtime::run_shards_uring(&shard_cfg, uring_serve, rxs, drain)?
+    } else {
+        if want_io_uring {
+            // io_uring + TLS do not compose in v1 (rustls drives tokio AsyncRead/AsyncWrite, not
+            // io_uring submissions). Refusing would break a TLS deployment that asked for io_uring;
+            // FALL BACK to tokio (which serves TLS) and log it, never breaking TLS.
+            tracing::warn!(
+                "runtime = io_uring requested with TLS on; the io_uring datapath does not support \
+                 TLS in v1 -- falling back to the tokio backend for this node"
+            );
+        }
+        ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?
+    };
+
+    #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+    let set = {
+        if want_io_uring {
+            // Requested but this build/target cannot provide it: fall back to tokio with a clear
+            // one-line log (never a boot failure). The `_for_uring` captures are unused on this
+            // build; bind them to `_` so the no-feature build has no dead-code warning.
+            tracing::warn!(
+                "runtime = io_uring requested, but this build is not a Linux build with the \
+                 `io_uring` feature; falling back to the tokio backend"
+            );
+        }
+        let _ = (
+            &ctx_template_for_uring,
+            &inbox_for_uring,
+            &persist_for_uring,
+        );
+        ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?
+    };
+
     Ok(BootHandles {
         set,
         raft,
@@ -1503,6 +1581,216 @@ async fn serve_connection(
     // accurate so the `maxclients` cap is enforced against a true figure over the node's lifetime.
     // The guard also covers any earlier return / panic, which the prior bare `release()` here did
     // not (a panic would have leaked the slot permanently).
+}
+
+/// The per-connection serve loop for the OPTIONAL io_uring datapath (PROD-10 / #28,
+/// docs/design/IOURING_DATAPATH.md). Compiled ONLY on a Linux build with the `io_uring` feature;
+/// reached ONLY when `runtime = io_uring` is selected at boot AND TLS is off (the selection branch
+/// in [`run_server_observed`] falls back to the tokio [`serve_connection`] otherwise).
+///
+/// It drives the SAME engine the tokio path does: it REUSES [`route_and_dispatch`] (the route +
+/// dispatch core is stream-agnostic -- it works on a decoded `Request` and an output `Vec<u8>`),
+/// the same per-shard setup helpers ([`shard_env`] / [`shard_state`] / [`shard_store`] /
+/// [`shard_wheel`] / [`ensure_shard_started`]), the same `maxclients` admission gate + RAII
+/// guards, the same client-registry registration, and the same RESP `decode`. The ONLY difference
+/// is the transport: bytes flow through the io_uring [`ironcache_runtime::Runtime`] owned-buffer
+/// `recv`/`send` (one ring per shard) instead of a tokio `TcpStream` / `ClientStream`. The pure
+/// command engine (the determinism seam, the store, the coordinator) is UNTOUCHED.
+///
+/// ## v1 scope (honest, documented)
+///
+/// This v1 serves the CORE request/reply RESP datapath (pipelined decode -> dispatch -> single
+/// coalesced flush), which is the bulk of cache traffic and the path the io_uring throughput lever
+/// targets. Three tokio-serve-loop features that hang `tokio::select!` over the stream are NOT
+/// wired on the io_uring loop yet and are a documented Linux follow-up (they degrade gracefully,
+/// never incorrectly):
+///   * PUSH-WHILE-IDLE for PUB/SUB (SERVER_PUSH.md): a subscriber on the io_uring path receives a
+///     published message on its NEXT command round-trip rather than mid-idle. SUBSCRIBE/dispatch
+///     themselves work; only the idle select! that drains the push channel is deferred.
+///   * BLOCKING PARK (PROD-9, BLPOP/WAIT/...): the non-blocking attempt still runs and replies; the
+///     park-until-data select! is deferred, so a blocking command behaves like its immediate
+///     non-blocking form on this path.
+///   * The IDLE-TIMEOUT (PROD-SAFETY #4) timer race is deferred; the `maxclients` cap + peer-close
+///     detection still bound connections.
+/// The registered-buffer / multishot fast path (IOURING_DATAPATH.md) and a perf benchmark are
+/// likewise deferred to a Linux soak; no throughput claim is made here.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[allow(clippy::too_many_lines)]
+async fn serve_connection_uring(
+    rt: ironcache_runtime::IoUringRuntime,
+    mut stream: tokio_uring::net::TcpStream,
+    home: ShardId,
+    mut ctx: ServerContext,
+    default_proto: ProtoVersion,
+    inbox: coordinator::Inbox,
+    persist: Option<Arc<crate::persist::PersistState>>,
+) {
+    use ironcache_runtime::Runtime;
+    use std::os::fd::AsRawFd;
+
+    let env = shard_env();
+    adopt_metrics_cell(ctx.metrics_registry.as_ref(), home.index);
+    adopt_process_memory_gauge(&ctx.process_memory);
+    let state_rc = shard_state();
+    let reserved_bits = scan_reserved_bits(ctx.shards);
+    let store_rc = shard_store(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
+    let wheel_rc = shard_wheel();
+    ensure_shard_started(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
+    ctx.info.started_at = shard_started_at();
+
+    // MAXCLIENTS gate (PROD-SAFETY #3), identical to the tokio path: admit against the global
+    // live-connection count vs the `maxclients` ceiling, reject (byte-exact reply) + close when at
+    // the cap, hold the slot in a Drop-release guard otherwise.
+    if !ctx.conn_gate.try_admit(ctx.runtime.maxclients()) {
+        let mut reject = Vec::with_capacity(64);
+        encode_into(
+            &mut reject,
+            &ironcache_server::Value::Error(ironcache_server::ErrorReply::err(
+                "max number of clients reached",
+            )),
+            default_proto,
+        );
+        let _ = rt.send(&mut stream, reject).await;
+        return;
+    }
+    let _conn_gate_guard = ConnGateGuard {
+        gate: Arc::clone(&ctx.conn_gate),
+    };
+
+    // Peer/local addresses for CLIENT INFO. tokio-uring's TcpStream has no peer_addr/local_addr,
+    // so derive them from the borrowed fd via a std stream (without taking fd ownership, mirroring
+    // the io_uring backend's nodelay helper). A failure leaves the field empty (cosmetic only).
+    let (addr, laddr) = {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let raw = stream.as_raw_fd();
+        // SAFETY: `raw` is the valid open socket fd owned by `stream` for this borrow; we read
+        // peer/local addr through a temporary std stream and `into_raw_fd` to avoid closing it.
+        let s = unsafe { std::net::TcpStream::from_raw_fd(raw) };
+        let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+        let local = s.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        let _ = s.into_raw_fd();
+        (peer, local)
+    };
+
+    let client_id = {
+        let mut s = state_rc.borrow_mut();
+        let id = s.next_client_id;
+        s.next_client_id += 1;
+        s.counters.on_connection_open();
+        id
+    };
+    let client_handle = ctx
+        .clients
+        .register(client_id, addr.clone(), laddr.clone(), 0);
+    let _client_registry_guard = ClientRegistryGuard {
+        registry: Arc::clone(&ctx.clients),
+        id: client_id,
+    };
+
+    let mut conn = ConnState::new(client_id, default_proto, ctx.requires_auth(), addr, laddr);
+
+    // The per-connection PUSH channel + SHED signal are still created (route_and_dispatch needs
+    // the `push_tx`/`push_rx`/`shed_flag` handles for SUBSCRIBE bookkeeping), but the push-while-
+    // idle drain is deferred on this path (see the fn doc): pushes are delivered on the next
+    // command round-trip rather than mid-idle.
+    let (mut push_tx, mut push_rx) =
+        tokio::sync::mpsc::channel::<crate::pubsub::ServerPush>(crate::pubsub::PUSH_CHANNEL_BOUND);
+    let mut shed_flag = std::sync::Arc::new(crate::pubsub::ShedSignal::default());
+
+    let limits = Limits::default();
+    let mut read_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
+
+    'conn: loop {
+        out.clear();
+        loop {
+            match decode(&read_buf, &limits) {
+                DecodeOutcome::Complete { request, consumed } => {
+                    let slow_threshold = ctx.slowlog.log_slower_than_micros();
+                    let slow_start = if slow_threshold >= 0 {
+                        Some(env.borrow().now())
+                    } else {
+                        None
+                    };
+                    // PROD-9 blocking-park: created but NOT acted on this path (the non-blocking
+                    // attempt's reply is in `out`); see the fn doc.
+                    let mut block_request: Option<BlockPark> = None;
+                    let close = route_and_dispatch(
+                        &ctx,
+                        &mut conn,
+                        home,
+                        &inbox,
+                        &mut push_tx,
+                        &mut push_rx,
+                        &mut shed_flag,
+                        &env,
+                        &store_rc,
+                        &wheel_rc,
+                        &state_rc,
+                        persist.as_ref(),
+                        &request,
+                        &mut out,
+                        &mut block_request,
+                    )
+                    .await;
+                    if let Some(start) = slow_start {
+                        record_slow_command(&ctx, &env, &conn, &request, start, slow_threshold);
+                    }
+                    read_buf.drain(..consumed);
+                    if close {
+                        let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
+                        break 'conn;
+                    }
+                }
+                DecodeOutcome::Incomplete => break,
+                DecodeOutcome::Error(e) => {
+                    encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
+                    let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
+                    break 'conn;
+                }
+            }
+        }
+
+        // OUTPUT-BUFFER hard cap (PROD-SAFETY #5), identical to the tokio path.
+        let obl = ctx.runtime.output_buffer_limit();
+        if obl > 0 && out.len() as u64 > obl {
+            break;
+        }
+
+        if !out.is_empty() {
+            match rt.send(&mut stream, std::mem::take(&mut out)).await {
+                Ok(returned) => out = returned,
+                Err(_) => break,
+            }
+        }
+
+        // CLIENT KILL (PROD-7): close if a peer flagged this connection (cold relaxed load).
+        if client_handle.is_killed() {
+            break;
+        }
+
+        // Read the next command batch over the io_uring owned-buffer recv seam. A clean EOF
+        // (`n == 0`) or any error closes the connection.
+        let Ok(res) = rt.recv(&mut stream, std::mem::take(&mut read_buf)).await else {
+            break;
+        };
+        read_buf = res.buf;
+        if res.n == 0 {
+            break; // peer closed
+        }
+    }
+
+    // Connection close: same shard-local cleanup the tokio path performs (subscription table,
+    // dropped push_tx, watch deregistration, connection-close counter). The conn-gate + registry
+    // guards release on Drop as this function returns.
+    deregister_all_subscriptions(&conn);
+    drop(push_tx);
+    if !conn.watch.is_empty() {
+        use ironcache_storage::Watch;
+        store_rc.borrow_mut().unwatch(&conn.watch);
+        conn.clear_watch();
+    }
+    state_rc.borrow_mut().counters.on_connection_close();
 }
 
 /// The SUBSCRIBE-mode idle wait (SERVER_PUSH.md #20, PR 91a): `select!` between draining the

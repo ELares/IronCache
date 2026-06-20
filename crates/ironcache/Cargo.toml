@@ -88,6 +88,16 @@ libc = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# The OPTIONAL Linux io_uring datapath (PROD-10 / #28, docs/design/IOURING_DATAPATH.md): a
+# default-OFF, ADDITIVE feature that forwards to `ironcache-runtime/io_uring` (which gates the
+# backend `#[cfg(all(target_os = "linux", feature = "io_uring"))]`). With this feature OFF (the
+# default) the binary never pulls tokio-uring/io-uring and the boot always uses the tokio backend;
+# turning it ON adds the io_uring `Runtime` + the per-shard io_uring bootstrap, selected at boot
+# only when `runtime = io_uring` AND on Linux AND with TLS off (else it falls back to tokio).
+[features]
+default = []
+io_uring = ["ironcache-runtime/io_uring"]
+
 # jemalloc is the default allocator (ADR-0006, jemalloc 5.3.x). Not available on
 # MSVC Windows; gate it so the workspace still builds there (the static release
 # targets are musl/macos, where it is available). The background-purge thread,

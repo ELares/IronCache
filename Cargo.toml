@@ -98,6 +98,15 @@ socket2 = { version = "0.6", features = ["all"] }
 # engine's clock/RNG (ADR-0003), so it does not cross the determinism boundary.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pki-types = { version = "1.12", features = ["std"] }
+# The OPT-IN Linux io_uring backend (PROD-10 / #28, docs/design/IOURING_DATAPATH.md), behind the
+# default-OFF `io_uring` feature in ironcache-runtime and target-gated to Linux there. PURE-RUST: it
+# pulls `io-uring` (raw syscall bindings, NO liburing / C library), so it does not disturb the
+# static-musl default build (the feature is off by default and never enters the default artifact). It
+# gives ONE current-thread io_uring runtime per thread + an owned-buffer TcpStream, matching the
+# shared-nothing thread-per-core model (ADR-0002) and the owned-buffer Runtime seam
+# (RUNTIME_ABSTRACTION.md). Its license tree is MIT (cargo-deny clean: io-uring/libc/slab/socket2/
+# futures-util/tokio, all already in or compatible with the workspace allowlist).
+tokio-uring = { version = "0.5", features = ["bytes"] }
 # The per-shard SwissTable for the store index (ADR-0005, HASHTABLE.md #35). Stock
 # hashbrown, unsynchronized, owned by one core; MIT OR Apache-2.0 (cargo-deny clean).
 hashbrown = "0.16"

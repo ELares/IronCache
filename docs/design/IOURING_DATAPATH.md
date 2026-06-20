@@ -96,6 +96,35 @@ low-level binding is the `io-uring` crate [io-uring-crate-version].
 - A benchmark shows reduced syscalls/op versus the epoll baseline (#26 host
   sensitivity, runtime-bakeoff.md).
 
+## Implementation status (PROD-10 v1)
+
+The OPTIONAL io_uring backend has landed as an ADDITIVE, DEFAULT-OFF Linux path behind the
+`io_uring` Cargo feature (in `ironcache-runtime`, target-gated to Linux) plus a `runtime =
+"tokio" | "io_uring"` config knob (TOML / `IRONCACHE_RUNTIME` / `--runtime`, default `tokio`):
+
+- A new `Runtime` impl `ironcache_runtime::io_uring_rt::IoUringRuntime` over `tokio-uring`
+  (one current-thread io_uring per shard thread), satisfying the SAME `Runtime` trait the tokio
+  backend does. The owned-buffer `recv`/`send` map directly onto `tokio_uring`'s owned-buffer
+  `read`/`write_all`; `recv` APPENDS via `buf.slice(start..)` so it matches the tokio backend's
+  framing. The pure engine + the determinism Env seam + the DST are UNTOUCHED (io_uring is purely
+  a production `Runtime` impl).
+- A per-shard io_uring bootstrap `run_shards_uring` mirroring the tokio bootstrap's shared-nothing
+  topology (one userspace acceptor round-robins accepted sockets to per-shard channels; each shard
+  thread runs `tokio_uring::start` and adopts its connections onto its own ring).
+- Boot selection (in the binary's `run_server_observed`): `runtime = io_uring` is honored ONLY on
+  a Linux build with the feature AND with TLS off; in every other case the boot logs a one-line
+  fallback and uses the tokio backend, so the default build + non-Linux + TLS are byte-unchanged
+  and selecting io_uring can never fail to start a node.
+- The default (no-feature) build never pulls `tokio-uring`/`io-uring`; the pure-Rust `io-uring`
+  binding needs no liburing/C library, so the static-musl default artifact is unaffected.
+
+Deferred to a Linux soak (NOT in v1, no throughput claim made): the registered fixed-buffer slab +
+buffer groups, multishot accept/recv with the startup probe and one-shot fallback, the shared
+persistence write path, and the epoll-vs-io_uring benchmark. Also deferred on the io_uring serve
+loop: PUB/SUB push-while-idle, the blocking-command park, and the idle-timeout timer race (each
+degrades gracefully on that path; the core request/reply datapath is fully served). A CI job
+(`io-uring` in `.github/workflows/rust.yml`, ubuntu) builds + clippy-lints + tests the feature.
+
 ## References
 
 - ADR-0002, ADR-0003; issues #25, #27, #26, #67; docs/design/RUNTIME.md,

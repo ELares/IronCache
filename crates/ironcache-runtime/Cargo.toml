@@ -14,15 +14,27 @@ publish = false
 workspace = true
 
 [features]
-# Exactly one backend is active per build (RUNTIME_ABSTRACTION.md). tokio+epoll
-# is the default and the only backend PR-1 ships; monoio/glommio are future
-# feature gates the seam is shaped for. `tls` (default ON) adds the embedded
+# The tokio+epoll/kqueue backend is the default and the portable, cross-platform
+# release target (RUNTIME_ABSTRACTION.md). `tls` (default ON) adds the embedded
 # rustls CLIENT-listener stream variant (#105, docs/design/TLS.md); it layers on
 # the tokio backend so it implies `tokio`. With `tls` OFF the crate compiles with
 # NO rustls dep and exposes only the plaintext path (byte-unchanged).
+#
+# `io_uring` (default OFF, PROD-10 / #28, docs/design/IOURING_DATAPATH.md) adds an
+# ADDITIVE, OPT-IN Linux io_uring backend ([`io_uring_rt::IoUringRuntime`]) that
+# satisfies the SAME `Runtime` trait. It is gated `#[cfg(all(target_os = "linux",
+# feature = "io_uring"))]`, so the feature is INERT on macOS/Windows/BSD (the dep
+# still resolves there but the code is cfg'd out and the tokio backend runs). The
+# tokio backend stays the default + the non-Linux fallback + the fallback when the
+# feature is off; turning `io_uring` ON does NOT remove tokio (it is still the
+# fallback for TLS and for hosts whose kernel lacks io_uring). The low-level binding
+# is the pure-Rust `tokio-uring` (over `io-uring`), so the static-musl build needs
+# no liburing / C system library (the dep is opt-in and never enters the default
+# build).
 default = ["tokio", "tls"]
 tokio = ["dep:tokio", "dep:socket2"]
 tls = ["tokio", "dep:tokio-rustls", "dep:rustls-pki-types"]
+io_uring = ["tokio", "dep:tokio-uring"]
 
 [dependencies]
 ironcache-env = { workspace = true }
@@ -43,6 +55,16 @@ socket2 = { workspace = true, optional = true }
 # OPTIONAL: the plaintext build pulls neither.
 tokio-rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
+# The OPT-IN Linux io_uring backend (PROD-10 / #28), behind the default-OFF `io_uring`
+# feature. `tokio-uring` provides a per-thread, current-thread io_uring runtime (one ring
+# per shard thread, matching the shared-nothing thread-per-core model ADR-0002) plus an
+# owned-buffer `TcpStream` (its `read`/`write` take and RETURN the owned buffer, the exact
+# owned-buffer model the `Runtime` seam was shaped for, RUNTIME_ABSTRACTION.md). It pulls the
+# pure-Rust `io-uring` syscall bindings (NO liburing / C dependency), so the static-musl
+# default build is unaffected (this dep is opt-in and Linux-only at the cfg layer). Target-gated
+# to Linux so the dependency tree on macOS/Windows does not try to compile the Linux-only crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { workspace = true, optional = true }
 
 # `test-util` enables tokio's PAUSED-clock test harness (`start_paused`), used to fire the bounded
 # secret-handshake timeout near-instantly in the slow-loris test without a real 10s wall-clock wait.

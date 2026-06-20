@@ -149,10 +149,20 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     let env_overlay = ConfigOverlay::from_env().context("reading IRONCACHE_* env vars")?;
 
     // CLI flags overlay (highest of the startup layers).
+    // The `--runtime` flag (PROD-10 / #28): parse the token to a `RuntimeBackend` here so a typo
+    // is a clean boot error (mirrors the IRONCACHE_RUNTIME env parse), with the CLI as the highest
+    // non-runtime-CONFIG layer. `None` (the no-flag default) leaves the lower layers showing through.
+    let cli_runtime = match cli.runtime.as_deref() {
+        Some(tok) => Some(ironcache_config::parse_runtime_backend(tok).ok_or_else(|| {
+            anyhow::anyhow!("--runtime: not a runtime backend (expected tokio/io_uring): {tok}")
+        })?),
+        None => None,
+    };
     let cli_overlay = ConfigOverlay {
         bind: cli.bind,
         port: cli.port,
         shards: cli.shards,
+        runtime: cli_runtime,
         ..Default::default()
     };
 
@@ -302,6 +312,15 @@ fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
     println!("ironcache check: configuration OK");
     println!("  bind        = {}:{}", cfg.bind, cfg.port);
     println!("  shards      = {}", cfg.shards);
+    // The per-shard runtime backend (PROD-10 / #28). `io_uring` is honored only on a Linux build
+    // with the `io_uring` feature + TLS off; otherwise the boot falls back to tokio (logged then).
+    println!(
+        "  runtime     = {}",
+        match cfg.runtime {
+            ironcache_config::RuntimeBackend::Tokio => "tokio",
+            ironcache_config::RuntimeBackend::IoUring => "io_uring (Linux + feature + plaintext)",
+        }
+    );
     println!("  databases   = {}", cfg.databases);
     println!(
         "  maxmemory   = {} bytes{}",
@@ -370,6 +389,13 @@ fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
     println!("bind = \"{}\"", cfg.bind);
     println!("port = {}", cfg.port);
     println!("shards = {}", cfg.shards);
+    println!(
+        "runtime = \"{}\"",
+        match cfg.runtime {
+            ironcache_config::RuntimeBackend::Tokio => "tokio",
+            ironcache_config::RuntimeBackend::IoUring => "io_uring",
+        }
+    );
     println!("databases = {}", cfg.databases);
     println!("maxmemory = {}", cfg.maxmemory);
     println!("maxmemory-policy = \"{}\"", cfg.maxmemory_policy);

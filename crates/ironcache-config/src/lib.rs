@@ -243,6 +243,30 @@ pub enum TlsMode {
     On,
 }
 
+/// WHICH async I/O backend the per-shard runtime uses (PROD-10 / #28,
+/// docs/design/IOURING_DATAPATH.md). The default ([`RuntimeBackend::Tokio`]) is the portable
+/// epoll/kqueue backend that runs on every platform and is byte-unchanged.
+///
+/// * [`Tokio`](RuntimeBackend::Tokio) (DEFAULT): the cross-platform tokio current-thread,
+///   per-core-pinned backend (RUNTIME.md, ADR-0002). The only backend on macOS/Windows/BSD and
+///   the only one in the default build (the `io_uring` Cargo feature is off by default).
+/// * [`IoUring`](RuntimeBackend::IoUring) (OPT-IN, LINUX-ONLY): the io_uring datapath. It takes
+///   effect ONLY when the binary was built `--features io_uring` AND is running on Linux AND TLS
+///   is off; in EVERY other case the boot SILENTLY FALLS BACK to `Tokio` (with a one-line log),
+///   so requesting it can never fail to start a node. The full registered-buffer / multishot
+///   fast path is deferred to a Linux soak (no throughput claim is made at v1).
+///
+/// TOML (`runtime = "io_uring"`) + the `IRONCACHE_RUNTIME` env var + the `--runtime` CLI flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBackend {
+    /// The portable tokio epoll/kqueue backend (the default; every platform).
+    #[default]
+    Tokio,
+    /// The opt-in, Linux-only io_uring backend (falls back to tokio off-Linux / no-feature / TLS).
+    IoUring,
+}
+
 /// The fully-resolved, effective configuration the server boots from.
 // This is a flat Redis-style config record: each bool is an INDEPENDENT operator knob
 // (`default_resp3`, `cluster_enabled`, `cluster_raft_joining`, `cluster_tls_insecure_skip_verify`),
@@ -425,6 +449,12 @@ pub struct Config {
     /// REQUIRED + readable when [`Self::tls`] is [`TlsMode::On`]; ignored when off. TOML
     /// (`tls_key_path = "..."`) + the `IRONCACHE_TLS_KEY_PATH` env var.
     pub tls_key_path: Option<PathBuf>,
+    /// WHICH async I/O backend the per-shard runtime uses (PROD-10 / #28). Defaults to
+    /// [`RuntimeBackend::Tokio`] (the portable epoll/kqueue backend, byte-unchanged on every
+    /// platform). [`RuntimeBackend::IoUring`] is honored ONLY on a Linux build with the
+    /// `io_uring` Cargo feature AND TLS off; otherwise the boot falls back to `Tokio`. TOML
+    /// (`runtime = "io_uring"`) + the `IRONCACHE_RUNTIME` env var + the `--runtime` CLI flag.
+    pub runtime: RuntimeBackend,
     /// The PERIODIC SAVE INTERVAL in SECONDS (#58 persistence save policy): when non-zero AND a
     /// [`Self::data_dir`] is set, the server triggers a background save every `save_interval_secs`
     /// seconds PROVIDED at least [`Self::save_min_changes`] keyspace writes have happened since the
@@ -584,6 +614,10 @@ impl Default for Config {
             tls: TlsMode::Off,
             tls_cert_path: None,
             tls_key_path: None,
+            // The runtime backend is the portable TOKIO epoll/kqueue path by default (PROD-10):
+            // byte-unchanged on every platform, the only path in the default (no-feature) build.
+            // `io_uring` is opt-in and Linux/feature-gated (and falls back here otherwise).
+            runtime: RuntimeBackend::Tokio,
             // The PERIODIC SAVE policy is OFF by default (#58): 0 = no background save timer, so
             // the default posture is unchanged (only an explicit SAVE/BGSAVE persists, and only
             // when a data_dir is set). A non-zero interval + a data_dir enables the cadence.
@@ -1247,6 +1281,11 @@ pub struct ConfigOverlay {
     /// Path to the PEM private key for the TLS listener (#105). TOML (`tls_key_path = "..."`) +
     /// the `IRONCACHE_TLS_KEY_PATH` env var. `None` leaves the lower layer (default `None`).
     pub tls_key_path: Option<PathBuf>,
+    /// The per-shard runtime backend (PROD-10 / #28). TOML (`runtime = "io_uring"`) + the
+    /// `IRONCACHE_RUNTIME` env var + the `--runtime` CLI flag. `None` leaves the lower layer
+    /// (default [`RuntimeBackend::Tokio`]). `io_uring` is honored only on a Linux build with the
+    /// `io_uring` feature + TLS off; otherwise the boot falls back to tokio.
+    pub runtime: Option<RuntimeBackend>,
     /// The periodic save interval in seconds (#58 persistence save policy). TOML
     /// (`save_interval_secs = 900`) + the `IRONCACHE_SAVE_INTERVAL_SECS` env var. `None` leaves the
     /// lower layer (default `0` = no periodic save).
@@ -1453,6 +1492,18 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_TLS_KEY_PATH") {
             o.tls_key_path = Some(PathBuf::from(v));
         }
+        // The per-shard RUNTIME backend (PROD-10 / #28): a single tokio/io_uring token
+        // (case-insensitive), env-encodable for per-pod injection; an unrecognized token hard-fails
+        // boot (mirrors the `tls` / `cluster_mode` knobs). Requesting `io_uring` on a non-Linux /
+        // no-feature / TLS build is NOT an error here -- it falls back to tokio at boot.
+        if let Ok(v) = std::env::var("IRONCACHE_RUNTIME") {
+            o.runtime = Some(
+                parse_runtime_backend(&v).ok_or_else(|| ConfigError::Invalid {
+                    field: "runtime",
+                    reason: format!("not a runtime backend (expected tokio/io_uring): {v}"),
+                })?,
+            );
+        }
         // INTRA-CLUSTER transport-security knobs (PROD-3). The mode is a single off/on token
         // (case-insensitive), env-encodable for per-pod injection; an unrecognized token hard-fails
         // boot (mirrors the public `tls` knob). The cert/key/CA are scalar paths taken verbatim
@@ -1602,6 +1653,9 @@ impl ConfigOverlay {
         if let Some(ref v) = self.tls_key_path {
             cfg.tls_key_path = Some(v.clone());
         }
+        if let Some(v) = self.runtime {
+            cfg.runtime = v;
+        }
         if let Some(v) = self.save_interval_secs {
             cfg.save_interval_secs = v;
         }
@@ -1658,6 +1712,21 @@ pub fn parse_cluster_mode(s: &str) -> Option<ClusterMode> {
     match s.trim().to_ascii_lowercase().as_str() {
         "static" => Some(ClusterMode::Static),
         "raft" => Some(ClusterMode::Raft),
+        _ => None,
+    }
+}
+
+/// Parse a runtime-backend token (PROD-10 / #28), accepting `tokio` and `io_uring` (also
+/// `io-uring` / `iouring` / `uring` as friendly aliases) case-insensitively with surrounding
+/// whitespace trimmed. Returns `None` on any other token (the caller maps it to a config
+/// error). Used by the `IRONCACHE_RUNTIME` env var and the `--runtime` CLI flag; TOML
+/// deserializes [`RuntimeBackend`] directly (snake_case-renamed serde, so `runtime =
+/// "io_uring"`).
+#[must_use]
+pub fn parse_runtime_backend(s: &str) -> Option<RuntimeBackend> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "tokio" => Some(RuntimeBackend::Tokio),
+        "io_uring" | "io-uring" | "iouring" | "uring" => Some(RuntimeBackend::IoUring),
         _ => None,
     }
 }
@@ -2008,6 +2077,49 @@ mod tests {
         assert_eq!(parse_tls_mode("on"), Some(TlsMode::On));
         assert_eq!(parse_tls_mode("OFF"), Some(TlsMode::Off));
         assert_eq!(parse_tls_mode("garbage"), None);
+    }
+
+    #[test]
+    fn runtime_backend_parses_tokens_and_defaults() {
+        // The `--runtime` / IRONCACHE_RUNTIME token (PROD-10 / #28): tokio + io_uring (with the
+        // friendly aliases), case-insensitive + trimmed; an unrecognized token is None (the caller
+        // maps it to a boot error). Exercised through the parser directly (env reads share global
+        // state across tests, so assert the parser, not getenv -- mirrors the cluster-tls test).
+        assert_eq!(parse_runtime_backend("tokio"), Some(RuntimeBackend::Tokio));
+        assert_eq!(
+            parse_runtime_backend("  TOKIO "),
+            Some(RuntimeBackend::Tokio)
+        );
+        for t in ["io_uring", "io-uring", "iouring", "URING"] {
+            assert_eq!(
+                parse_runtime_backend(t),
+                Some(RuntimeBackend::IoUring),
+                "{t:?} -> io_uring"
+            );
+        }
+        assert_eq!(parse_runtime_backend("epoll"), None);
+        assert_eq!(parse_runtime_backend(""), None);
+        // The default backend is tokio (the portable, byte-unchanged path).
+        assert_eq!(Config::default().runtime, RuntimeBackend::Tokio);
+    }
+
+    #[test]
+    fn runtime_backend_resolves_from_overlay_and_toml() {
+        // An overlay that sets `runtime` folds into the resolved Config; an unset overlay leaves
+        // the tokio default showing through (so the default boot is byte-unchanged).
+        let c = Config::resolve(&[ConfigOverlay {
+            runtime: Some(RuntimeBackend::IoUring),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(c.runtime, RuntimeBackend::IoUring);
+        let d = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert_eq!(d.runtime, RuntimeBackend::Tokio);
+        // TOML deserializes `runtime = "io_uring"` directly (snake_case serde on RuntimeBackend).
+        let o = ConfigOverlay::from_toml_str("runtime = \"io_uring\"").unwrap();
+        assert_eq!(o.runtime, Some(RuntimeBackend::IoUring));
+        let o2 = ConfigOverlay::from_toml_str("runtime = \"tokio\"").unwrap();
+        assert_eq!(o2.runtime, Some(RuntimeBackend::Tokio));
     }
 
     #[test]
