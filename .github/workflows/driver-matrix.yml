@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# PROD-8 client-DRIVER compatibility gate (#158). Builds IronCache, boots a single-node server AND a
+# turnkey 3-node Raft cluster, and runs REAL Redis client LIBRARIES (redis-py, go-redis, ioredis)
+# against both via `tests/drivers/run.sh`, asserting core ops + pipelining + MULTI/EXEC + pub/sub +
+# RESP3 and -- the high-value part -- cluster-aware topology DISCOVERY (CLUSTER SLOTS) +
+# MOVED-routing end to end.
+#
+# WHY A SEPARATE WORKFLOW (not folded into rust.yml): like the differential gate, this has EXTERNAL
+# dependencies the rest of the workspace tests do not -- Python + the `redis` package, a Go module
+# fetch for go-redis, and an npm install of ioredis. Keeping it separate means a client-install or
+# registry hiccup cannot flake the main Rust gate. The harness is TEST-ONLY; the server change it
+# relies on (the real COMMAND table, #158) is gated by rust.yml's normal Rust tests.
+#
+# It runs only when the harness, the drivers crate sources, or the Rust sources change, and is
+# guarded by the same `has_cargo` idiom rust.yml / differential.yml use so a docs-only repo state is
+# a no-op.
+name: driver-matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "tests/drivers/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/driver-matrix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  guard:
+    name: guard (skip until a Cargo project exists)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_cargo: ${{ steps.check.outputs.has_cargo }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] && [ -f Cargo.lock ]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::repo is docs-only (no Cargo.toml/Cargo.lock); driver-matrix gate is a no-op"
+          fi
+
+  driver-matrix:
+    name: driver matrix (redis-py / go-redis / ioredis, single + cluster)
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2
+      # Client toolchains. Python + Go + Node are all installable on the runner; the harness
+      # installs the actual client packages itself (a venv `pip install redis`, `go mod tidy`,
+      # `npm install ioredis`), so a registry hiccup for one client only skips that client.
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5
+        with:
+          go-version: "1.23"
+      - uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b # v4
+        with:
+          node-version: "22"
+      - name: Install redis-tools (the readiness/convergence probe uses redis-cli)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-tools
+          redis-cli --version
+      - name: Build IronCache (release)
+        run: cargo build --release -p ironcache
+      - name: Run the driver matrix (single-node + turnkey cluster)
+        env:
+          IRONCACHE_BIN: ${{ github.workspace }}/target/release/ironcache
+        run: bash tests/drivers/run.sh

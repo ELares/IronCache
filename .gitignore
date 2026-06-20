@@ -13,6 +13,10 @@ proptest-regressions/
 *.tmp
 *.bak
 
+# Driver-matrix harness: the ioredis tree is fetched by run.sh at test time; commit only the
+# package.json + lockfile, never the installed node_modules.
+tests/drivers/node/node_modules/
+
 # Benchmark run artifacts (scripts/bench/run.sh writes JSON/histogram/manifest here).
 # Only the run script, the competitor matrix, and the README are committed; never the
 # per-run output.
