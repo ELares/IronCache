@@ -1077,6 +1077,26 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // which owns the runtime + the drain). A documented minor divergence from Redis, which would
         // exit; the serve-layer interception is the live path for every non-MULTI SHUTDOWN.
         b"SHUTDOWN" => cmd_shutdown_fallback(req),
+        // BLOCKING list/zset pops (PROD-9): BLPOP / BRPOP / BLMOVE / BRPOPLPUSH / BLMPOP /
+        // BZPOPMIN / BZPOPMAX / BZMPOP. The LIVE blocking path (the park-until-pushed-or-timeout)
+        // is handled in the BINARY's serve layer (it needs the per-connection waker + the runtime
+        // timer seam), which intercepts these BEFORE this generic dispatch -- exactly like the
+        // persistence / SHUTDOWN / pub/sub interceptions. This arm is the NON-BLOCKING fallback
+        // reached ONLY via an EXEC replay (a blocking command QUEUED inside a MULTI runs NON-
+        // blocking at EXEC, Redis parity: it returns nil at once if every key is empty) or any path
+        // that reaches dispatch directly. It ATTEMPTS the pop and replies the result / a parse or
+        // WRONGTYPE error / the nil-array (never parks). The pop reuses the keyed store mutation
+        // path, so keyspace notifications fire identically. `AlwaysHome`, so it is here (not in
+        // `dispatch_keyed_data`).
+        b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BRPOPLPUSH" | b"BLMPOP" | b"BZPOPMIN" | b"BZPOPMAX"
+        | b"BZMPOP" => crate::cmd_block::cmd_block_nonblocking(store, db, now, cmd, req),
+        // WAIT numreplicas timeout (PROD-9): the LIVE path (block until the replica ack quorum or
+        // the timeout) is handled in the serve layer (it reads the runtime in-sync replica count +
+        // the timer seam). This arm is the EXEC-replay / direct-dispatch fallback: it validates
+        // arity + the integer args and replies the CURRENT in-sync replica count IMMEDIATELY (no
+        // block), which on a single node / no replicas is `:0`. The serve-layer interception is the
+        // live path for every non-MULTI WAIT.
+        b"WAIT" => cmd_wait_fallback(ctx, req),
         // Every OTHER command is a KEYED-DATA command (or an unknown token): it touches
         // only store/wheel/db/now (+ env for the RNG-drawing members), NO ConnState. The
         // bodies live in [`dispatch_keyed_data`], the SINGLE keyed-arm definition that
@@ -1915,6 +1935,36 @@ fn cmd_shutdown_fallback(req: &Request) -> Value {
         Ok(_) => Value::ok(),
         Err(e) => Value::error(e),
     }
+}
+
+/// The CURRENT number of in-sync replicas (PROD-9 WAIT): the runtime quorum count the WAIT
+/// command reports + the serve layer blocks on. `ctx.in_sync_replicas` is `Some` only in
+/// raft-governance mode; on a single node / standalone (the default), it is `None`, so the
+/// count is `0` (no replica has acknowledged anything), exactly the value `WAIT N timeout`
+/// returns once it times out with no replicas.
+#[must_use]
+pub fn in_sync_replica_count(ctx: &ServerContext) -> i64 {
+    ctx.in_sync_replicas
+        .as_ref()
+        .map_or(0, |c| i64::try_from(c.count()).unwrap_or(i64::MAX))
+}
+
+/// `WAIT numreplicas timeout` NON-BLOCKING fallback (PROD-9): the EXEC-replay / direct-dispatch
+/// path. The LIVE blocking WAIT lives in the serve layer (it can park on the timer seam until the
+/// quorum is met); this arm validates the two integer args and replies the CURRENT in-sync replica
+/// count immediately. Inside an EXEC, Redis's WAIT does not block, so reporting the current count
+/// is the faithful non-blocking behavior.
+fn cmd_wait_fallback(ctx: &ServerContext, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("wait"));
+    }
+    // numreplicas + timeout must both be integers (Redis parses them as longs); a bad value is
+    // the not-an-integer error. The values themselves do not change the non-blocking reply (it is
+    // the current count), but they must validate.
+    if parse_int_arg(&req.args[1]).is_none() || parse_int_arg(&req.args[2]).is_none() {
+        return Value::error(ErrorReply::not_an_integer());
+    }
+    Value::Integer(in_sync_replica_count(ctx))
 }
 
 /// `HELLO [proto] [AUTH user pass] [SETNAME name]` (CONNECTION_LIFECYCLE.md).
