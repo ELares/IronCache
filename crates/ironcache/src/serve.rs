@@ -2804,6 +2804,49 @@ async fn route_and_dispatch(
                 && route::owner_shard_set(&spec, home.total).is_none()
         };
 
+    // A SHARD-SPANNING element-MOVE command -- SMOVE (set member), LMOVE / RPOPLPUSH (list
+    // element) -- whose two keys span shards routes to the ATOMIC cross-shard apply
+    // (COORDINATOR.md #107, the PROD-9 cross-shard atomicity slice): the spanning_move module
+    // gathers + validates the source (read-only), then COMMITS the dst write + the src
+    // mutation in a deadlock-free deterministic order, ending the prior SILENT home-subset
+    // partial-apply. Co-located invocations route via Stage 1 below (the single-shard
+    // handler); a malformed/short request stays home (the handler emits the proper error). The
+    // gate shape mirrors `multikey_fan_out` / `spanning_set_fan_out` (Many AND a None owner
+    // set = truly spanning); the command sets are disjoint, so the branches are exclusive.
+    let spanning_move_fan_out = matches!(route, route::CommandClass::KeyedMulti)
+        && is_fan_out_spanning_move(&cmd_upper)
+        && {
+            let spec = route::command_keys(&cmd_upper, request);
+            matches!(spec, route::KeySpec::Many(_))
+                && route::owner_shard_set(&spec, home.total).is_none()
+        };
+
+    // A SHARD-SPANNING all-or-nothing MSETNX (COORDINATOR.md #107): EXISTS-scan every key on
+    // its owner FIRST, then (iff none exist) fan a per-owner MSET out -- replacing the prior
+    // home-subset existence check + home-subset write (which set ONLY the home keys and
+    // MISREPORTED its 1/0). Co-located MSETNX routes via Stage 1; a malformed request stays
+    // home. MSETNX is NOT in `is_fan_out_multikey` (the Stage 2a fan-out deliberately deferred
+    // it), so this is its dedicated spanning gate.
+    let spanning_msetnx = cmd_upper == b"MSETNX" && {
+        let spec = route::command_keys(&cmd_upper, request);
+        matches!(spec, route::KeySpec::Many(_))
+            && route::owner_shard_set(&spec, home.total).is_none()
+    };
+
+    // A SHARD-SPANNING multi-key command this slice cannot apply atomically
+    // (RENAME/RENAMENX/COPY/LMPOP/ZMPOP/SORT...STORE) is REJECTED LOUDLY (a clear error naming
+    // the hash-tag remedy) rather than falling through to the home shard and SILENTLY
+    // operating on only the home subset (COORDINATOR.md #107). The gate is the same
+    // truly-spanning shape; co-located invocations (incl. a SORT without STORE -- one key)
+    // route via Stage 1 / the home path, unchanged.
+    let spanning_move_reject = matches!(route, route::CommandClass::KeyedMulti)
+        && is_spanning_move_reject(&cmd_upper)
+        && {
+            let spec = route::command_keys(&cmd_upper, request);
+            matches!(spec, route::KeySpec::Many(_))
+                && route::owner_shard_set(&spec, home.total).is_none()
+        };
+
     // The routing TARGET shard, if a KEYED command routes to exactly one NON-home shard
     // (else `None` -> the home path). The single-key case keeps the zero-alloc fast path
     // (one hash + compare); only the genuinely multi-key commands pay the `command_keys`
@@ -2874,6 +2917,40 @@ async fn route_and_dispatch(
         // dispatch is split out so this router stays small.
         state_rc.borrow_mut().counters.on_command();
         dispatch_spanning_combine(ctx, conn, home, inbox, &cmd_upper, request, out).await;
+        false
+    } else if spanning_move_fan_out {
+        // SHARD-SPANNING element MOVE (COORDINATOR.md #107, the PROD-9 cross-shard atomicity
+        // slice): SMOVE / LMOVE / RPOPLPUSH whose two keys span shards. The spanning_move
+        // module gathers + validates the source (read-only on its owner), then COMMITS the dst
+        // write + the src mutation across the owner shards in a deadlock-free deterministic
+        // order -- ENDING the prior SILENT home-subset partial-apply. Bump commands_processed
+        // here (matching the home / remote / whole-keyspace / multikey / spanning-combine
+        // paths); the owning shards fold their own data counters.
+        state_rc.borrow_mut().counters.on_command();
+        crate::spanning_move::fan_out_spanning_move(
+            inbox, ctx, &cmd_upper, request, conn.db, home, out, conn.proto,
+        )
+        .await;
+        false
+    } else if spanning_msetnx {
+        // SHARD-SPANNING all-or-nothing MSETNX (COORDINATOR.md #107): EXISTS-scan every key on
+        // its owner FIRST, then (iff none exist) fan a per-owner MSET out. Replaces the prior
+        // home-subset existence check + home-subset write (a SILENT partial that set only the
+        // home keys and misreported 1/0). Bump commands_processed here; the owning shards fold
+        // their own data counters.
+        state_rc.borrow_mut().counters.on_command();
+        crate::spanning_move::fan_out_spanning_msetnx(
+            inbox, ctx, request, conn.db, home, out, conn.proto,
+        )
+        .await;
+        false
+    } else if spanning_move_reject {
+        // SHARD-SPANNING RENAME/RENAMENX/COPY/LMPOP/ZMPOP/SORT...STORE: REJECT LOUDLY (a clear
+        // error naming the hash-tag remedy) rather than fall through to the home shard and
+        // SILENTLY operate on only the home subset (the cardinal safety bug). These need a
+        // value-object cross-shard transfer / multi-key pop the engine does not expose yet;
+        // the reject is the "correct, or explicitly aborted, never silently wrong" contract.
+        reject_spanning_move(conn, state_rc, &cmd_upper, out);
         false
     } else if let Some(target) = target {
         // REMOTE keyed hop: enqueue to the owning shard, await its reply, encode here. The
@@ -5433,6 +5510,66 @@ fn is_fan_out_spanning_zset(cmd_upper: &[u8]) -> bool {
             | b"ZDIFFSTORE"
             | b"ZRANGESTORE"
     )
+}
+
+/// Whether `cmd_upper` is one of the THREE element-move commands the coordinator applies
+/// ATOMICALLY across the two owner shards when its keys span shards (COORDINATOR.md #107, the
+/// PROD-9 cross-shard atomicity slice): SMOVE (set member move), LMOVE / RPOPLPUSH (list
+/// element move). The serve loop dispatches a spanning invocation of these to
+/// [`crate::spanning_move::fan_out_spanning_move`] (the gather-validate-then-commit), ending
+/// the prior SILENT home-subset partial-apply. A co-located invocation routes via Stage 1
+/// (the single-shard handler), unchanged. The set is DISJOINT from [`is_fan_out_multikey`] /
+/// [`is_fan_out_spanning_combine`] / [`is_spanning_move_reject`], so the branches are mutually
+/// exclusive.
+fn is_fan_out_spanning_move(cmd_upper: &[u8]) -> bool {
+    matches!(cmd_upper, b"SMOVE" | b"LMOVE" | b"RPOPLPUSH")
+}
+
+/// Whether `cmd_upper` is a spanning multi-key command this slice REJECTS LOUDLY (rather than
+/// silently home-subset partial-apply) when its keys span internal shards (COORDINATOR.md
+/// #107). These need more than a two-hop element move: RENAME / RENAMENX / COPY transfer an
+/// ARBITRARY-typed value object intact (no cross-shard serialize/restore primitive exists
+/// yet -- `Keyspace::move_object` is same-shard only by design); LMPOP / ZMPOP are
+/// first-non-empty multi-key pops; SORT ... STORE writes a sorted projection. A spanning
+/// invocation is rejected with a clear, descriptive error naming the co-location (hash-tag)
+/// remedy (see [`reject_spanning_move`]), the SAME "correct, or explicitly aborted, never
+/// silently wrong" contract the cross-shard MULTI/EXEC + WATCH guards follow. NOTE: SORT is
+/// only rejected when it carries a STORE dest on a DIFFERENT owner than the source (the gate
+/// caller checks `owner_shard_set == None`, which a SORT without STORE -- one key -- never
+/// triggers). The set is DISJOINT from the fan-out predicates.
+fn is_spanning_move_reject(cmd_upper: &[u8]) -> bool {
+    matches!(
+        cmd_upper,
+        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMPOP" | b"ZMPOP" | b"SORT"
+    )
+}
+
+/// REJECT a SHARD-SPANNING invocation of a multi-key command this slice cannot apply
+/// atomically (RENAME/RENAMENX/COPY/LMPOP/ZMPOP/SORT...STORE), encoding a clear LOUD error
+/// rather than letting it fall through to the home shard and SILENTLY operate on only the
+/// home subset (the cardinal safety bug). Bumps `commands_processed` like every reply path.
+/// The error names the co-location (hash-tag) remedy so a client can make the command
+/// single-shard. This is a plain `ERR` (not `-CROSSSLOT`): IronCache presents as a SINGLE
+/// NODE, matching the existing cross-shard MULTI/EXEC + WATCH guards' deliberate choice
+/// ([`ironcache_protocol::ErrorReply::txn_cross_shard_command`] et al). With `shards == 1`
+/// every key is home-owned, so this never fires (byte-identical single-shard parity).
+fn reject_spanning_move(
+    conn: &ConnState,
+    state_rc: &Rc<RefCell<ShardState>>,
+    cmd_upper: &[u8],
+    out: &mut Vec<u8>,
+) {
+    state_rc.borrow_mut().counters.on_command();
+    let name = String::from_utf8_lossy(cmd_upper).into_owned();
+    encode_into(
+        out,
+        &ironcache_server::Value::error(ironcache_protocol::ErrorReply::err(format!(
+            "{name} across internal shards is not supported yet; \
+             use a hash tag so the keys co-locate on one shard \
+             (e.g. {{tag}}key1 {{tag}}key2)"
+        ))),
+        conn.proto,
+    );
 }
 
 /// ASCII-uppercase the command token for routing classification (RESP command tokens are

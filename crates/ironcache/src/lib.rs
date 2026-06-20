@@ -36,5 +36,10 @@ pub mod raft_boot;
 pub(crate) mod replica_attach;
 pub mod serve;
 pub mod spanning_combine;
+/// Home-core ATOMIC apply for the SHARD-SPANNING src->dst move commands (SMOVE/LMOVE/
+/// RPOPLPUSH) + the spanning all-or-nothing MSETNX (COORDINATOR.md #107, the PROD-9
+/// cross-shard atomicity slice). Ends the prior SILENT home-subset partial-apply for these
+/// commands; spanning RENAME/RENAMENX/COPY/LMPOP/ZMPOP/SORT-STORE are FAIL-LOUD instead.
+pub mod spanning_move;
 pub mod test_support;
 pub mod whole_keyspace;
