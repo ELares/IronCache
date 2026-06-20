@@ -211,7 +211,7 @@ async fn smove_spanning(
     if let Value::Error(e) = add {
         return Value::Error(e);
     }
-    let _ = route_to_owner(
+    let rem = route_to_owner(
         inbox,
         ctx,
         home,
@@ -220,6 +220,24 @@ async fn smove_spanning(
         &subreq(&[b"SREM", &src, &member]),
     )
     .await;
+    if let Value::Error(e) = rem {
+        // The dst SADD committed but the src SREM hop failed (src owner unavailable): the member
+        // is transiently in BOTH src and dst. Compensate by removing it from dst (best-effort) so
+        // the visible state rolls back to the pre-move state (member still in src), then surface
+        // the error rather than falsely report a clean `:1` move over a duplicated state. A
+        // double-fault (dst now also unavailable) leaves a duplicate, which the returned error
+        // signals to the client.
+        let _ = route_to_owner(
+            inbox,
+            ctx,
+            home,
+            db,
+            &dst,
+            &subreq(&[b"SREM", &dst, &member]),
+        )
+        .await;
+        return Value::Error(e);
+    }
     Value::Integer(1)
 }
 

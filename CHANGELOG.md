@@ -116,5 +116,13 @@ release.
   silently partial-applying. Co-located (same-shard) and `shards == 1` invocations
   are byte-identical to the single-shard handler. Cross-shard MULTI/EXEC + WATCH
   were already fail-loud (the existing in-MULTI cross-shard + WATCH guards), so no
-  silent transaction partial remained.
+  silent transaction partial remained. Documented residual divergences from
+  single-node Redis (no data loss, narrower than the silent partial they replace):
+  a spanning move has a brief transient-visibility window (SMOVE: member momentarily
+  in both sets; LMOVE/RPOPLPUSH: element momentarily in neither) but never loses an
+  element; if the source-remove hop fails after the dest-add committed, SMOVE now
+  compensates (removes from dest) and surfaces the error rather than reporting a
+  clean move; and spanning MSETNX has a check-then-write window (a key created
+  concurrently between the existence scan and the writes is overwritten) -- use a
+  hash tag to co-locate keys for strict single-shard atomicity.
 - Removed or relinked broken citations in issue bodies (#83, #88, #97).
