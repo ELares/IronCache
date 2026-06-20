@@ -1959,8 +1959,17 @@ async fn subscriber_idle_wait(
 ///
 /// This is a SEPARATE function from the tokio [`subscriber_idle_wait`] because the io_uring transport
 /// is a distinct type ([`ironcache_runtime::UringTcpStream`] driven through the [`Runtime`] seam's
-/// owned-buffer `recv`/`send`), not the tokio `ClientStream`; the LOGIC is byte-for-byte the same.
-/// The fairness, coalescing, and FIFO reasoning of [`subscriber_idle_wait`] all apply verbatim:
+/// owned-buffer `recv`/`send`), not the tokio `ClientStream`. The fairness/coalescing/FIFO STRUCTURE
+/// mirrors [`subscriber_idle_wait`], but one io_uring-path semantic differs and is a documented
+/// limitation (a soak-time follow-up): tokio's `recv` is READINESS-based, so cancelling it (a push
+/// or shed arm winning the `select!`) consumes no socket bytes; io_uring's `recv` is COMPLETION-based,
+/// so a recv SQE that already consumed inbound client bytes into its buffer before the push/shed arm
+/// wins is dropped (the buffer is kept alive by tokio-uring's Ignored lifecycle until the kernel CQE,
+/// so this is memory-safe, but those consumed bytes are NOT re-read). In practice this can only lose
+/// inbound bytes for a subscriber that is ACTIVELY PIPELINING commands while simultaneously receiving
+/// a push (an uncommon pattern; an idle subscriber's cancelled recv consumed nothing). A true fix
+/// (an AsyncCancel + drain, or not racing recv against pushes mid-command) is deferred to the Linux
+/// soak where io_uring can be runtime-validated. The rest applies verbatim:
 ///   * NO `biased;`, so a fast-flooded subscriber never starves its command-read arm.
 ///   * a delivered push coalesces any further already-queued pushes (`try_recv`) into ONE write.
 ///   * the read arm reads into a FRESH `Vec::new()` and APPENDS to `read_buf`, so a partial frame
