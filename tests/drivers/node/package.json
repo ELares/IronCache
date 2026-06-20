@@ -1,0 +1,11 @@
+{
+  "name": "ironcache-driver-compat",
+  "version": "0.0.0",
+  "private": true,
+  "description": "PROD-8 ioredis compatibility driver for IronCache (issue #158)",
+  "license": "MIT OR Apache-2.0",
+  "type": "commonjs",
+  "dependencies": {
+    "ioredis": "^5.11.1"
+  }
+}

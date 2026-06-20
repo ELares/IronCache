@@ -2228,6 +2228,261 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
     Some(spec)
 }
 
+/// The CLIENT-VISIBLE command tokens this server implements, in a stable order, for the
+/// `COMMAND` / `COMMAND COUNT` / `COMMAND INFO` introspection (#158, PROD-8 driver matrix).
+///
+/// CLUSTER-AWARE CLIENT REQUIREMENT: a cluster client (redis-py `RedisCluster`, go-redis,
+/// ioredis) calls bare `COMMAND` at connect to build its command -> key-position table so it can
+/// compute the slot of each command's keys and route to the owning node. An EMPTY `COMMAND` reply
+/// (the prior PR-1 stub) makes redis-py raise `"<CMD> command doesn't exist in Redis commands"`
+/// and refuse to route ANY keyed op. Surfacing the real table from this single-source registry
+/// fixes that without touching the data path.
+///
+/// The internal cross-shard verbs (`__ICSTORE*`, `__ICPUBLISH`, `__ICPUBSUB`) are EXCLUDED: they
+/// are client-unreachable (the serve-loop router rejects a client that sends them), so they must
+/// not appear in the public command table a client builds its routing from. Every other registry
+/// entry is included. The list is asserted to match the registry (minus the internal verbs) by
+/// `tests::client_command_names_match_registry`, so it cannot drift.
+pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
+    // Tier-0 / connection / admin.
+    b"PING",
+    b"ECHO",
+    b"HELLO",
+    b"AUTH",
+    b"SELECT",
+    b"QUIT",
+    b"RESET",
+    b"READONLY",
+    b"READWRITE",
+    b"CLIENT",
+    b"COMMAND",
+    b"INFO",
+    b"CONFIG",
+    b"SLOWLOG",
+    b"MEMORY",
+    b"LATENCY",
+    b"CLUSTER",
+    b"SAVE",
+    b"BGSAVE",
+    b"LASTSAVE",
+    b"SHUTDOWN",
+    // Transaction control.
+    b"MULTI",
+    b"EXEC",
+    b"DISCARD",
+    b"WATCH",
+    b"UNWATCH",
+    // Strings.
+    b"GET",
+    b"SET",
+    b"SETNX",
+    b"GETSET",
+    b"STRLEN",
+    b"INCR",
+    b"DECR",
+    b"INCRBY",
+    b"DECRBY",
+    b"INCRBYFLOAT",
+    b"APPEND",
+    b"GETRANGE",
+    b"SUBSTR",
+    b"SETRANGE",
+    b"GETDEL",
+    b"MGET",
+    b"MSET",
+    b"MSETNX",
+    // Keyspace.
+    b"DEL",
+    b"EXISTS",
+    b"TYPE",
+    b"KEYS",
+    b"SCAN",
+    b"DBSIZE",
+    b"RANDOMKEY",
+    b"RENAME",
+    b"RENAMENX",
+    b"COPY",
+    b"MOVE",
+    b"SWAPDB",
+    b"TOUCH",
+    b"UNLINK",
+    b"FLUSHDB",
+    b"FLUSHALL",
+    // TTL / EXPIRE.
+    b"EXPIRE",
+    b"PEXPIRE",
+    b"EXPIREAT",
+    b"PEXPIREAT",
+    b"TTL",
+    b"PTTL",
+    b"EXPIRETIME",
+    b"PEXPIRETIME",
+    b"PERSIST",
+    b"GETEX",
+    b"SETEX",
+    b"PSETEX",
+    // Lists.
+    b"LPUSH",
+    b"RPUSH",
+    b"LPUSHX",
+    b"RPUSHX",
+    b"LPOP",
+    b"RPOP",
+    b"LLEN",
+    b"LRANGE",
+    b"LINDEX",
+    b"LSET",
+    b"LINSERT",
+    b"LREM",
+    b"LTRIM",
+    b"LMOVE",
+    b"RPOPLPUSH",
+    b"LPOS",
+    b"LMPOP",
+    b"BLPOP",
+    b"BRPOP",
+    b"BLMOVE",
+    b"BRPOPLPUSH",
+    b"BLMPOP",
+    // Hashes.
+    b"HSET",
+    b"HMSET",
+    b"HSETNX",
+    b"HGET",
+    b"HMGET",
+    b"HDEL",
+    b"HGETALL",
+    b"HKEYS",
+    b"HVALS",
+    b"HLEN",
+    b"HEXISTS",
+    b"HSTRLEN",
+    b"HINCRBY",
+    b"HINCRBYFLOAT",
+    b"HRANDFIELD",
+    b"HSCAN",
+    // Sets.
+    b"SADD",
+    b"SREM",
+    b"SMEMBERS",
+    b"SISMEMBER",
+    b"SMISMEMBER",
+    b"SCARD",
+    b"SPOP",
+    b"SRANDMEMBER",
+    b"SMOVE",
+    b"SINTER",
+    b"SUNION",
+    b"SDIFF",
+    b"SINTERCARD",
+    b"SINTERSTORE",
+    b"SUNIONSTORE",
+    b"SDIFFSTORE",
+    b"SSCAN",
+    // Sorted sets.
+    b"ZADD",
+    b"ZINCRBY",
+    b"ZREM",
+    b"ZSCORE",
+    b"ZMSCORE",
+    b"ZCARD",
+    b"ZRANK",
+    b"ZREVRANK",
+    b"ZCOUNT",
+    b"ZLEXCOUNT",
+    b"ZRANGE",
+    b"ZREVRANGE",
+    b"ZRANGEBYSCORE",
+    b"ZREVRANGEBYSCORE",
+    b"ZRANGEBYLEX",
+    b"ZREVRANGEBYLEX",
+    b"ZREMRANGEBYRANK",
+    b"ZREMRANGEBYSCORE",
+    b"ZREMRANGEBYLEX",
+    b"ZPOPMIN",
+    b"ZPOPMAX",
+    b"ZRANDMEMBER",
+    b"ZSCAN",
+    b"ZRANGESTORE",
+    b"ZUNION",
+    b"ZINTER",
+    b"ZDIFF",
+    b"ZUNIONSTORE",
+    b"ZINTERSTORE",
+    b"ZDIFFSTORE",
+    b"ZINTERCARD",
+    b"ZMPOP",
+    b"BZPOPMIN",
+    b"BZPOPMAX",
+    b"BZMPOP",
+    b"WAIT",
+    // Bitmaps.
+    b"SETBIT",
+    b"GETBIT",
+    b"BITCOUNT",
+    b"BITPOS",
+    b"BITOP",
+    b"BITFIELD",
+    b"BITFIELD_RO",
+    // HyperLogLog.
+    b"PFADD",
+    b"PFCOUNT",
+    b"PFMERGE",
+    // Generic.
+    b"SORT",
+    b"SORT_RO",
+    // Introspection.
+    b"OBJECT",
+];
+
+/// The Redis `COMMAND` key-position triple `(first_key, last_key, step)` plus a `movable` flag for
+/// a command's [`KeySpecKind`] (#158). These are the positions a cluster client reads to find a
+/// command's keys WITHOUT a server round-trip (the `begin_search index` / `find_keys range` spec).
+///
+/// * `first_key` / `last_key` are 1-based arg positions; a NEGATIVE `last_key` counts from the end
+///   (Redis: `-1` = the last arg). `step` is the stride between successive keys.
+/// * A command with NO key (an `AlwaysHome`/`WholeKeyspace` command whose `key_spec` is `Arg1` or
+///   `None`) is `(0, 0, 0)`, the Redis "no keys" marker.
+/// * `movable == true` flags a command whose key positions depend on a `numkeys` arg or an option
+///   scan (NumkeysAtArg1 / ZstoreDestNumkeysAtArg2 / SortKeys / ObjectArg2 / BitopDestArg2...): a
+///   cluster client then falls back to `COMMAND GETKEYS` (which calls [`extract_keys`]) instead of
+///   the static positions. For those we still report a best-effort `first_key` (Redis does too) so
+///   a client that ignores `movablekeys` at least starts at the right offset.
+// `match_same_arms` allowed: each `KeySpecKind` arm is kept SEPARATE (even when two arms share the
+// same positions) so the per-kind mapping stays one-line-per-kind self-documenting, mirroring the
+// `spec_of` registry's same allow. Merging same-valued arms would group unrelated key shapes.
+#[allow(clippy::match_same_arms)]
+#[must_use]
+pub fn command_key_positions(spec: &CommandSpec) -> (i64, i64, i64, bool) {
+    match spec.key_spec {
+        // No routable key, OR the single-key fallback: distinguish by class. A KeyedSingle's key
+        // is at arg 1; an AlwaysHome / WholeKeyspace command (PING/INFO/KEYS/SCAN/...) has none.
+        KeySpecKind::None => (0, 0, 0, false),
+        KeySpecKind::Arg1 => match spec.class {
+            CommandClass::KeyedSingle | CommandClass::KeyedMulti => (1, 1, 1, false),
+            CommandClass::AlwaysHome | CommandClass::WholeKeyspace => (0, 0, 0, false),
+        },
+        // DEL/EXISTS/MGET/... : keys are args[1..], step 1.
+        KeySpecKind::AllFromArg1 => (1, -1, 1, false),
+        // MSET key value [key value ...] : keys at 1,3,5,..., step 2.
+        KeySpecKind::MsetStrided => (1, -1, 2, false),
+        // RENAME/COPY/SMOVE/LMOVE/... : keys at args 1 and 2.
+        KeySpecKind::TwoKeysArg1Arg2 => (1, 2, 1, false),
+        // BITOP <op> <dest> <src...> : dest=2, sources=3.. -> first key is arg 2; movable (the op
+        // at arg 1 is not a key).
+        KeySpecKind::BitopDestArg2SourcesFrom3 => (2, -1, 1, true),
+        // numkeys at arg 1 -> movable; best-effort first key is arg 2.
+        KeySpecKind::NumkeysAtArg1 => (2, 2, 1, true),
+        // dest=1, numkeys at arg 2, sources from 3 -> movable; first key (the dest) is arg 1.
+        KeySpecKind::ZstoreDestNumkeysAtArg2 => (1, 1, 1, true),
+        // OBJECT <sub> <key> : the key is arg 2 -> movable (the subcommand at arg 1 is not a key).
+        KeySpecKind::ObjectArg2 => (2, 2, 1, true),
+        // SORT <key> [... STORE dest] : the source key is arg 1; the STORE dest is option-scanned
+        // -> movable, first key arg 1.
+        KeySpecKind::SortKeys => (1, 1, 1, true),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2237,6 +2492,67 @@ pub(crate) mod tests {
         Request {
             args: parts.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
         }
+    }
+
+    /// COMMAND-TABLE CONSISTENCY (#158): every name in [`CLIENT_COMMAND_NAMES`] is a real registry
+    /// command, the list has no duplicates, and it excludes the internal cross-shard verbs (which a
+    /// client must never see in the command table it routes from). A drift here would feed a cluster
+    /// client a wrong/empty table and break MOVED-routing, exactly the bug the driver matrix found.
+    #[test]
+    fn client_command_names_match_registry() {
+        use std::collections::BTreeSet;
+        let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
+        for name in CLIENT_COMMAND_NAMES {
+            assert!(
+                spec_of(name).is_some(),
+                "CLIENT_COMMAND_NAMES has {:?} which has no registry spec",
+                String::from_utf8_lossy(name)
+            );
+            assert!(
+                !name.starts_with(b"__IC"),
+                "internal verb {:?} must NOT be in the client command table",
+                String::from_utf8_lossy(name)
+            );
+            assert!(
+                seen.insert(name),
+                "duplicate command name {:?} in CLIENT_COMMAND_NAMES",
+                String::from_utf8_lossy(name)
+            );
+        }
+        // Sanity floor: the full data-command surface is well over 100 commands.
+        assert!(
+            CLIENT_COMMAND_NAMES.len() > 100,
+            "command table looks truncated: {} entries",
+            CLIENT_COMMAND_NAMES.len()
+        );
+    }
+
+    /// COMMAND key-position projection (#158): the `(first, last, step, movable)` a cluster client
+    /// reads to route must match each command's real key layout (cross-checked against the canonical
+    /// Redis COMMAND table positions).
+    #[test]
+    fn command_key_positions_match_redis() {
+        let pos = |c: &[u8]| command_key_positions(spec_of(c).unwrap());
+        // Single-key data commands: (1, 1, 1).
+        assert_eq!(pos(b"GET"), (1, 1, 1, false));
+        assert_eq!(pos(b"SET"), (1, 1, 1, false));
+        assert_eq!(pos(b"ZADD"), (1, 1, 1, false));
+        // No-key commands: (0, 0, 0).
+        assert_eq!(pos(b"PING"), (0, 0, 0, false));
+        assert_eq!(pos(b"INFO"), (0, 0, 0, false));
+        assert_eq!(pos(b"KEYS"), (0, 0, 0, false));
+        // Variadic all-from-arg1: (1, -1, 1).
+        assert_eq!(pos(b"MGET"), (1, -1, 1, false));
+        assert_eq!(pos(b"DEL"), (1, -1, 1, false));
+        // MSET stride 2: (1, -1, 2).
+        assert_eq!(pos(b"MSET"), (1, -1, 2, false));
+        // Two-key: (1, 2, 1).
+        assert_eq!(pos(b"RENAME"), (1, 2, 1, false));
+        // Movable (numkeys / option-scan) commands flag movablekeys.
+        assert!(pos(b"ZUNIONSTORE").3, "ZUNIONSTORE must be movablekeys");
+        assert!(pos(b"SORT").3, "SORT must be movablekeys");
+        assert!(pos(b"BITOP").3, "BITOP must be movablekeys");
+        assert!(pos(b"OBJECT").3, "OBJECT must be movablekeys");
     }
 
     /// REGISTRY-CONSISTENCY (#89): spot-check that `spec_of` returns the SAME attributes a

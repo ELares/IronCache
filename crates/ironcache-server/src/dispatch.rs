@@ -13,7 +13,7 @@ use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{
     cmd_bitmap, cmd_cluster, cmd_config, cmd_expire, cmd_hash, cmd_hll, cmd_introspect,
-    cmd_keyspace, cmd_list, cmd_set, cmd_sort, cmd_string, cmd_txn, cmd_zset,
+    cmd_keyspace, cmd_list, cmd_set, cmd_sort, cmd_string, cmd_txn, cmd_zset, command_spec,
 };
 use ironcache_config::{ClusterMode, Config, RuntimeConfig};
 use ironcache_env::{Clock, Env, Rng};
@@ -2512,27 +2512,134 @@ fn registry_info_line(h: &ironcache_observe::ClientHandle) -> String {
     )
 }
 
-/// `COMMAND [DOCS|COUNT|...]` (startup stubs, PROTOCOL.md).
+/// `COMMAND [COUNT|INFO|DOCS|LIST|GETKEYS|...]` command introspection (PROTOCOL.md, #158).
+///
+/// CLUSTER-AWARE CLIENTS need a REAL command table here: a `RedisCluster` (redis-py), go-redis, or
+/// ioredis calls bare `COMMAND` at connect to learn each command's key positions so it can compute
+/// the slot of a command's keys and route to the owning node. The prior PR-1 stub returned an EMPTY
+/// table, which made redis-py raise `"<CMD> command doesn't exist in Redis commands"` and refuse to
+/// route ANY keyed op against a cluster. We now project the real table from the single-source
+/// [`command_spec`] registry. The SINGLE-NODE path is functionally unaffected (a non-cluster client
+/// does not consult the command table to route), so this is purely additive correctness.
 fn cmd_command(req: &Request) -> Value {
     if req.args.len() == 1 {
-        // Bare COMMAND returns the (empty in PR-1) command table as an array.
-        return Value::Array(Some(vec![]));
+        // Bare COMMAND: the full command table, one flat entry per client-visible command.
+        let entries = command_spec::CLIENT_COMMAND_NAMES
+            .iter()
+            .filter_map(|name| command_spec::spec_of(name).map(command_table_entry))
+            .collect();
+        return Value::Array(Some(entries));
     }
     let sub = ascii_upper(&req.args[1]);
     match sub.as_slice() {
-        // COUNT: number of supported commands. PR-1 reports 0 (table not yet
-        // generated); clients that call COUNT tolerate any integer.
-        b"COUNT" => Value::Integer(0),
-        // DOCS: an empty map is well-formed and accepted by clients at startup.
+        // COUNT: the number of client-visible commands (the real count, not 0).
+        b"COUNT" => Value::Integer(command_spec::CLIENT_COMMAND_NAMES.len() as i64),
+        // LIST: a flat array of every command name (lowercased, as Redis renders names).
+        b"LIST" => Value::Array(Some(
+            command_spec::CLIENT_COMMAND_NAMES
+                .iter()
+                .map(|n| Value::bulk(n.to_ascii_lowercase()))
+                .collect(),
+        )),
+        // INFO [name ...]: one table entry per requested command (NULL array element for an
+        // unknown name, matching Redis). Bare `COMMAND INFO` (no names) returns the full table.
+        b"INFO" => {
+            if req.args.len() == 2 {
+                let entries = command_spec::CLIENT_COMMAND_NAMES
+                    .iter()
+                    .filter_map(|name| command_spec::spec_of(name).map(command_table_entry))
+                    .collect();
+                return Value::Array(Some(entries));
+            }
+            let entries = req.args[2..]
+                .iter()
+                .map(|name| {
+                    let upper = name.to_ascii_uppercase();
+                    command_spec::spec_of(&upper).map_or(Value::Array(None), command_table_entry)
+                })
+                .collect();
+            Value::Array(Some(entries))
+        }
+        // GETKEYS <command> [args ...]: extract the routable keys of the supplied command line via
+        // the registry's key-spec (the SAME extraction the router uses). This is what a cluster
+        // client falls back to for a `movablekeys` command. Errors match Redis's classes.
+        b"GETKEYS" => cmd_command_getkeys(req),
+        // DOCS: an empty map is well-formed and accepted by clients at startup. (A full DOCS body
+        // -- summaries/since/group -- is not needed for routing; clients tolerate an empty map.)
         b"DOCS" => Value::Map(vec![]),
-        b"GETKEYS" => Value::error(ErrorReply::command_no_key_args()),
-        // INFO and any other subcommand: an empty, well-formed array. DELIBERATE
-        // divergence from the sibling stubs (CLIENT/CONFIG return an
-        // unknown_subcommand error for an unknown sub): COMMAND is probed at client
-        // startup with assorted subcommands, and an empty array is more tolerant
-        // than an error. Do not "fix" this to unknown_subcommand without checking
-        // client startup probes (PR-1 has no command table yet).
+        // Any other subcommand: an empty, well-formed array (COMMAND is probed at client startup
+        // with assorted subcommands; an empty array is more tolerant than an error).
         _ => Value::Array(Some(vec![])),
+    }
+}
+
+/// One `COMMAND` table entry for a [`command_spec::CommandSpec`], as the Redis flat array
+/// `[name, arity, [flags], first_key, last_key, step, [acl-cats], [tips], [key-specs], [subcmds]]`
+/// (#158). A cluster client reads `name`/`arity`/`flags`/`first_key`/`last_key`/`step` to route;
+/// the trailing three (acl-cats/tips/key-specs/subcommands) are emitted EMPTY (well-formed and
+/// tolerated -- redis-py reads them only when present).
+///
+/// `arity` follows the Redis encoding: a POSITIVE n for `Exact(n)`, a NEGATIVE -n for `Min(n)`.
+/// `flags` carry the routing-relevant set: `write`/`readonly`, `denyoom`, and `movablekeys` for a
+/// command whose keys are option/numkeys-dependent (so the client falls back to `COMMAND GETKEYS`).
+fn command_table_entry(spec: &command_spec::CommandSpec) -> Value {
+    let arity = match spec.arity {
+        // Redis arity encoding: positive n = exactly n total args; negative -n = at least n.
+        command_spec::Arity::Exact(n) => i64::try_from(n).unwrap_or(i64::MAX),
+        command_spec::Arity::Min(n) => -i64::try_from(n).unwrap_or(i64::MAX),
+    };
+    let (first_key, last_key, step, movable) = command_spec::command_key_positions(spec);
+    let mut flags: Vec<Value> = Vec::new();
+    flags.push(Value::simple(if spec.is_write {
+        "write"
+    } else {
+        "readonly"
+    }));
+    if spec.denyoom {
+        flags.push(Value::simple("denyoom"));
+    }
+    if movable {
+        flags.push(Value::simple("movablekeys"));
+    }
+    Value::Array(Some(vec![
+        Value::bulk(spec.name.to_ascii_lowercase()),
+        Value::Integer(arity),
+        Value::Array(Some(flags)),
+        Value::Integer(first_key),
+        Value::Integer(last_key),
+        Value::Integer(step),
+        // acl-categories, tips, key-specs, subcommands: empty (well-formed; not needed for routing).
+        Value::Array(Some(vec![])),
+        Value::Array(Some(vec![])),
+        Value::Array(Some(vec![])),
+        Value::Array(Some(vec![])),
+    ]))
+}
+
+/// `COMMAND GETKEYS <command> [arg ...]` -> the routable keys of the supplied command line (#158).
+/// Reuses the registry's [`command_spec::extract_keys`] (the SAME key extraction the cluster router
+/// uses), so a cluster client's movable-key fallback agrees byte-for-byte with how the server would
+/// route. Redis error parity: a missing inner command line is `wrong_arity`; an unknown inner
+/// command is `Invalid command specified`; a known command with no key args is the
+/// `command_no_key_args` message.
+fn cmd_command_getkeys(req: &Request) -> Value {
+    if req.args.len() < 3 {
+        return Value::error(ErrorReply::wrong_arity("command|getkeys"));
+    }
+    // Build the inner request (the command + its args) the extraction operates on: args[2..].
+    let inner = Request {
+        args: req.args[2..].to_vec(),
+    };
+    let upper = ascii_upper(&inner.args[0]);
+    let Some(spec) = command_spec::spec_of(&upper) else {
+        return Value::error(ErrorReply::err("Invalid command specified"));
+    };
+    match command_spec::extract_keys(spec.key_spec, &inner) {
+        crate::route::KeySpec::None => Value::error(ErrorReply::command_no_key_args()),
+        crate::route::KeySpec::One(k) => Value::Array(Some(vec![Value::bulk(k.to_vec())])),
+        crate::route::KeySpec::Many(keys) => Value::Array(Some(
+            keys.into_iter().map(|k| Value::bulk(k.to_vec())).collect(),
+        )),
     }
 }
 
@@ -3524,15 +3631,93 @@ mod tests {
     fn command_stubs_well_formed() {
         let c = ctx(None);
         let mut s = state(&c);
-        assert!(matches!(
-            run(&c, &mut s, &[b"COMMAND"]),
-            Value::Array(Some(_))
-        ));
-        assert_eq!(run(&c, &mut s, &[b"COMMAND", b"COUNT"]), Value::Integer(0));
+        // Bare COMMAND now returns the REAL command table (one flat entry per client command), not
+        // an empty array (#158: cluster clients build their key-routing table from this).
+        let table = run(&c, &mut s, &[b"COMMAND"]);
+        let Value::Array(Some(entries)) = table else {
+            panic!("COMMAND must be a non-null array, got {table:?}");
+        };
+        assert!(
+            entries.len() > 100,
+            "COMMAND table looks truncated: {} entries",
+            entries.len()
+        );
+        // COUNT now reports the real count (matching the table length), not 0.
+        assert_eq!(
+            run(&c, &mut s, &[b"COMMAND", b"COUNT"]),
+            Value::Integer(crate::command_spec::CLIENT_COMMAND_NAMES.len() as i64)
+        );
+        // DOCS stays an empty (well-formed) map.
         assert!(matches!(
             run(&c, &mut s, &[b"COMMAND", b"DOCS"]),
             Value::Map(_)
         ));
+    }
+
+    /// #158: a COMMAND INFO entry carries the key positions a cluster client routes from. GET is a
+    /// single-key readonly command at (first=1, last=1, step=1); MGET is variadic (1, -1, 1); MSET
+    /// strides by 2 (1, -1, 2). A wrong shape here re-breaks cluster-client MOVED-routing.
+    #[test]
+    fn command_info_carries_key_positions_for_routing() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        // Helper: pull the (arity, first, last, step) ints from a COMMAND INFO <name> entry.
+        let probe = |conn: &mut ConnState, name: &[u8]| -> (i64, i64, i64, i64) {
+            let reply = run(&c, conn, &[b"COMMAND", b"INFO", name]);
+            let Value::Array(Some(items)) = reply else {
+                panic!("COMMAND INFO must be an array, got {reply:?}");
+            };
+            assert_eq!(items.len(), 1, "one requested name -> one entry");
+            let Value::Array(Some(entry)) = &items[0] else {
+                panic!("entry must be an array, got {:?}", items[0]);
+            };
+            let int = |idx: usize| match &entry[idx] {
+                Value::Integer(num) => *num,
+                other => panic!("field {idx} must be an integer, got {other:?}"),
+            };
+            // [name, arity, flags, first, last, step, ...]
+            (int(1), int(3), int(4), int(5))
+        };
+        assert_eq!(probe(&mut s, b"GET"), (2, 1, 1, 1));
+        assert_eq!(probe(&mut s, b"MGET"), (-2, 1, -1, 1));
+        assert_eq!(probe(&mut s, b"MSET"), (-3, 1, -1, 2));
+        // An unknown command -> a NULL array element (Redis parity).
+        let v = run(&c, &mut s, &[b"COMMAND", b"INFO", b"NOSUCHCMD"]);
+        assert!(
+            matches!(&v, Value::Array(Some(items)) if items.len() == 1 && matches!(items[0], Value::Array(None))),
+            "unknown COMMAND INFO name must be a null element, got {v:?}"
+        );
+    }
+
+    /// #158: COMMAND GETKEYS extracts the routable keys via the registry's key-spec (the cluster
+    /// client's movable-key fallback). MSET strides; ZUNIONSTORE resolves numkeys; GET yields one.
+    #[test]
+    fn command_getkeys_extracts_routable_keys() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        let keys = |s: &mut ConnState, args: &[&[u8]]| -> Vec<String> {
+            let mut full: Vec<&[u8]> = vec![b"COMMAND", b"GETKEYS"];
+            full.extend_from_slice(args);
+            match run(&c, s, &full) {
+                Value::Array(Some(items)) => items
+                    .iter()
+                    .map(|i| match i {
+                        Value::BulkString(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+                        other => panic!("key must be a bulk string, got {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("GETKEYS must be an array, got {other:?}"),
+            }
+        };
+        assert_eq!(keys(&mut s, &[b"GET", b"foo"]), vec!["foo"]);
+        assert_eq!(
+            keys(&mut s, &[b"MSET", b"k1", b"v1", b"k2", b"v2"]),
+            vec!["k1", "k2"]
+        );
+        assert_eq!(
+            keys(&mut s, &[b"ZUNIONSTORE", b"dst", b"2", b"a", b"b"]),
+            vec!["dst", "a", "b"]
+        );
     }
 
     #[test]
