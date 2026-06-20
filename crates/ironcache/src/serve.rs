@@ -2692,7 +2692,7 @@ async fn route_and_dispatch(
         route::CommandClass::AlwaysHome | route::CommandClass::WholeKeyspace => None,
     };
 
-    if matches!(route, route::CommandClass::WholeKeyspace) {
+    let close = if matches!(route, route::CommandClass::WholeKeyspace) {
         // WHOLE-KEYSPACE SCATTER-GATHER: cover EVERY shard's partition. SCAN walks one shard
         // per call (composite cursor); the rest broadcast + merge on the home core. The home
         // shard's partial runs LOCALLY + synchronously (no self-channel hop). These were
@@ -2750,6 +2750,9 @@ async fn route_and_dispatch(
     } else if let Some(target) = target {
         // REMOTE keyed hop: enqueue to the owning shard, await its reply, encode here. The
         // owning shard folded the data counters; here we only attribute commands_processed.
+        // KEYSPACE NOTIFICATIONS (PROD-8): the MUTATION runs on the OWNER shard, so it records its
+        // keyspace events into the OWNER shard's pending buffer; that shard's drain loop drains +
+        // publishes them (see `run_remote`). The home path here records nothing for a remote write.
         state_rc.borrow_mut().counters.on_command();
         coordinator::dispatch_via(inbox, target, request, conn.db, out, conn.proto).await;
         false
@@ -2761,6 +2764,48 @@ async fn route_and_dispatch(
         handle_request(
             ctx, conn, env, store_rc, wheel_rc, state_rc, request, &cmd_upper, out,
         )
+    };
+
+    // KEYSPACE NOTIFICATIONS (PROD-8): any HOME-shard mutation in the branches above (the home
+    // keyed path, the home SUBSET of a multikey / spanning fan-out, the active TTL drain) recorded
+    // its keyspace event(s) into THIS shard's pending buffer DURING dispatch. Drain + PUBLISH them
+    // now, AFTER the reply is encoded (per-connection FIFO, SERVER_PUSH.md), through the existing
+    // Pub/Sub fan-out. The drain short-circuits on an EMPTY buffer (the common case: a read, or
+    // notifications disabled), so on the default deployment this is a single thread-local
+    // `is_empty` check and the path is byte-identical. Events recorded on a REMOTE owner shard
+    // (a cross-shard write) are drained + published by THAT shard's drain loop (`run_remote`).
+    publish_pending_keyspace_events(inbox, home.index).await;
+    close
+}
+
+/// DRAIN this shard's pending keyspace events (PROD-8) and PUBLISH each through the EXISTING
+/// Pub/Sub fan-out ([`coordinator::fan_out_publish`]), so subscribers of `__keyspace@db__:<key>` /
+/// `__keyevent@db__:<event>` (and PSUBSCRIBE patterns + cross-shard subscribers) receive them
+/// exactly like a client PUBLISH. Called AFTER the command's reply is encoded (per-connection FIFO,
+/// SERVER_PUSH.md "a push arrives after that command's reply").
+///
+/// FAST PATH: when no event was recorded (a read, or `notify-keyspace-events` disabled -- the
+/// common case) the drain returns an empty Vec and this returns immediately, so it costs a single
+/// thread-local `is_empty` check and no fan-out. Only when an event was actually recorded does it
+/// build the channel name(s) + fan out. Each recorded event publishes the `K` keyspace message
+/// (channel `__keyspace@db__:<key>`, payload = the event name) and/or the `E` keyevent message
+/// (channel `__keyevent@db__:<event>`, payload = the key), per the channel selectors resolved at
+/// record time. The receiver COUNT each PUBLISH returns is ignored (a notification's value is the
+/// delivery, not a reply).
+async fn publish_pending_keyspace_events(inbox: &coordinator::Inbox, home: usize) {
+    let events = ironcache_config::notify::drain();
+    if events.is_empty() {
+        return;
+    }
+    for ev in events {
+        if ev.keyspace {
+            let channel = ev.keyspace_channel();
+            coordinator::fan_out_publish(inbox, &channel, ev.event.as_bytes(), ev.db, home).await;
+        }
+        if ev.keyevent {
+            let channel = ev.keyevent_channel();
+            coordinator::fan_out_publish(inbox, &channel, &ev.key, ev.db, home).await;
+        }
     }
 }
 

@@ -40,6 +40,11 @@ pub fn cmd_del<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request)
     for key in &req.args[1..] {
         if store.delete(db, key, now) {
             removed += 1;
+            // KEYSPACE NOTIFICATION (PROD-8): fire `del` (class g) PER actually-deleted key. DEL is
+            // recorded HERE rather than in the central reply-driven table because the reply is the
+            // removed COUNT, not WHICH keys existed; only this loop knows which deletes really
+            // happened. `record` short-circuits on the disabled default, so this is zero-cost off.
+            ironcache_config::notify::record(ironcache_config::EventClass::Generic, "del", key, db);
         }
     }
     Value::Integer(removed)
@@ -100,6 +105,9 @@ pub fn cmd_unlink<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
     for key in &req.args[1..] {
         if store.delete(db, key, now) {
             removed += 1;
+            // KEYSPACE NOTIFICATION (PROD-8): UNLINK fires the same `del` event as DEL (Redis emits
+            // `del` for both), per actually-deleted key. Zero-cost when notifications are disabled.
+            ironcache_config::notify::record(ironcache_config::EventClass::Generic, "del", key, db);
         }
     }
     Value::Integer(removed)

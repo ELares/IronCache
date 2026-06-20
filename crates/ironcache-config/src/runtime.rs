@@ -31,7 +31,8 @@
 //! `maxmemory` (atomic) and `generation` (atomic) and only reach for the locked
 //! strings when the generation says a swap is pending.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use crate::NotifyFlags;
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The mutable, cross-shard runtime-config overlay (the highest-precedence layer,
@@ -100,6 +101,13 @@ pub struct RuntimeConfig {
     /// ring drops the oldest past it). Runtime-settable via `CONFIG SET slowlog-max-len`. Seeded
     /// from [`crate::DEFAULT_SLOWLOG_MAX_LEN`].
     slowlog_max_len: AtomicU64,
+    /// The `notify-keyspace-events` FLAG BITS (PROD-8 keyspace notifications), stored as the
+    /// compact [`crate::NotifyFlags`] bitset. `0` (the default) DISABLES notifications, and the
+    /// per-command hot-path read is a single relaxed load the serve loop snapshots into the
+    /// shard-local emit gate -- so the default deployment is byte-identical and pays one atomic
+    /// load per command. Runtime-settable via `CONFIG SET notify-keyspace-events`; seeded from the
+    /// boot config's flag string (parsed + validated at boot).
+    notify_keyspace_events: AtomicU32,
 }
 
 /// The string-valued runtime params guarded by [`RuntimeConfig`]'s lock. Grouped
@@ -147,6 +155,15 @@ impl RuntimeConfig {
             // configured threshold/length keeps it; a later `CONFIG SET slowlog-*` overrides live.
             slowlog_log_slower_than: AtomicI64::new(cfg.slowlog_log_slower_than),
             slowlog_max_len: AtomicU64::new(cfg.slowlog_max_len),
+            // The keyspace-notification flags (PROD-8), seeded from the boot config's flag string.
+            // The string was validated in `Config::validate`, so the parse here cannot fail in
+            // practice; an EMPTY/invalid string seeds the DISABLED (0) set so the default boot is
+            // byte-identical.
+            notify_keyspace_events: AtomicU32::new(
+                NotifyFlags::parse(&cfg.notify_keyspace_events)
+                    .unwrap_or_else(|_| NotifyFlags::empty())
+                    .bits(),
+            ),
         })
     }
 
@@ -346,6 +363,24 @@ impl RuntimeConfig {
     /// the value into the live `SlowLog`).
     pub fn set_slowlog_max_len(&self, n: u64) {
         self.slowlog_max_len.store(n, Ordering::Relaxed);
+    }
+
+    /// The current `notify-keyspace-events` flag set (PROD-8). A single RELAXED atomic load: the
+    /// serve loop reads it once per command (snapshotting it into the shard-local emit gate). `0`
+    /// (the default) is the DISABLED set, so the emit gate short-circuits and the default
+    /// deployment is byte-identical.
+    #[must_use]
+    pub fn notify_flags(&self) -> NotifyFlags {
+        NotifyFlags::from_bits(self.notify_keyspace_events.load(Ordering::Relaxed))
+    }
+
+    /// `CONFIG SET notify-keyspace-events <flags>`: store the new flag set (a relaxed store). The
+    /// serve loop reads `notify_flags()` once per command, so the new flags take effect for
+    /// subsequent commands without a restart. The caller (the registry's runtime setter) parsed +
+    /// validated the flag string before calling this.
+    pub fn set_notify_flags(&self, flags: NotifyFlags) {
+        self.notify_keyspace_events
+            .store(flags.bits(), Ordering::Relaxed);
     }
 }
 

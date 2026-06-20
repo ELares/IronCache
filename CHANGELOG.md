@@ -9,6 +9,25 @@ release.
 
 ### Added
 
+- Keyspace notifications (PROD-8, Redis `notify-keyspace-events`). On a successful
+  mutation (and on a TTL expiry / a maxmemory eviction) the server PUBLISHes the
+  Redis keyspace + keyevent events to `__keyspace@<db>__:<key>` (payload = the
+  event name, e.g. `set`/`del`/`lpush`/`expire`/`expired`/`evicted`) and
+  `__keyevent@<db>__:<event>` (payload = the key), through the EXISTING Pub/Sub
+  fan-out, so SUBSCRIBE / PSUBSCRIBE (and cross-shard subscribers) receive them
+  exactly like a client PUBLISH. Gated by the `notify-keyspace-events` flag string
+  (`K` keyspace, `E` keyevent, the event-class letters `g$lshzxe...`, and `A` =
+  `g$lshzxet`), parsed to a compact bitset with the canonical Redis parse/render;
+  `CONFIG GET`/`SET notify-keyspace-events` round-trips the canonical flag string,
+  and TOML (`notify_keyspace_events`) / `IRONCACHE_NOTIFY_KEYSPACE_EVENTS` seed it
+  at boot. DISABLED by default (the empty flag string, the Redis default): the
+  emit helper short-circuits on the disabled set BEFORE any work, so the write hot
+  path is byte-identical and pays no cost until a non-empty flag is set. The
+  `expired`/`evicted` events are wired into the active + lazy TTL reap paths and
+  the maxmemory eviction paths. Stream (`t`) and module (`d`) classes are
+  recognized for parity but never fire (IronCache has no streams/modules); the
+  new-key (`n`) and key-miss (`m`) events are recognized in the flag string but
+  not emitted this pass.
 - The WRITE-SIDE replication guardrail (`min-replicas-to-write` /
   `min-replicas-max-lag`, ADR-0026): an owner REJECTS a write to a slot it owns
   with `-NOREPLICAS Not enough good replicas to write.` when fewer than
