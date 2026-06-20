@@ -66,6 +66,7 @@ all deployment artifacts here pass `--metrics-addr 0.0.0.0:9121`.
 | `min_replicas_to_write` | `IRONCACHE_MIN_REPLICAS_TO_WRITE` | write-side durability guardrail |
 | `min_replicas_max_lag` | `IRONCACHE_MIN_REPLICAS_MAX_LAG` | lag bound for the in-sync quorum |
 | `raft_snapshot_threshold` | `IRONCACHE_RAFT_SNAPSHOT_THRESHOLD` | Raft-log compaction threshold |
+| `raft_snapshot_chunk_bytes` | `IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES` | InstallSnapshot chunk size in bytes (default 256 KiB) |
 | `cluster_secret` | `IRONCACHE_CLUSTER_SECRET` | shared peer-auth secret (bus + repl) |
 | `cluster_tls` | `IRONCACHE_CLUSTER_TLS` | `off` (default) / `on` -- encrypt bus + repl |
 | `cluster_tls_cert_path` | `IRONCACHE_CLUSTER_TLS_CERT_PATH` | cluster TLS cert (PEM chain) |

@@ -200,36 +200,49 @@ pub fn encode_raft_msg(msg: &RaftMsg) -> Vec<u8> {
             leader_id,
             last_included_index,
             last_included_term,
+            offset,
             data,
+            done,
             voters,
             learners,
         } => {
-            // HA-3c: term, leader, the snapshot's (index, term), then the snapshot bytes
-            // as a length-prefixed blob (single chunk; chunking is a future extension).
-            // HA-3d: the config baseline (voter + learner node sets) the snapshot reflects,
-            // each a length-prefixed list of NodeIds, so an installing follower can rebuild
-            // its configuration (its log below the snapshot is gone).
+            // HA-3c: term, leader, the snapshot's (index, term). PROD-9: the chunk OFFSET,
+            // the chunk bytes as a length-prefixed blob, and the `done` last-chunk flag (a
+            // single byte). HA-3d: the config baseline (voter + learner node sets) the
+            // snapshot reflects, each a length-prefixed list of NodeIds, so an installing
+            // follower can rebuild its configuration (its log below the snapshot is gone).
+            // The new `offset` / `done` fields are positioned BETWEEN the meta and the config
+            // baseline; they extend the frame additively (an old peer that predates chunking
+            // returns None on decode rather than misparsing, see decode_raft_msg).
             out.push(MSG_INSTALL_SNAPSHOT);
             put_u64(&mut out, *term);
             put_node(&mut out, *leader_id);
             put_u64(&mut out, *last_included_index);
             put_u64(&mut out, *last_included_term);
+            put_u64(&mut out, *offset);
             put_blob(&mut out, data);
+            out.push(u8::from(*done));
             put_node_set(&mut out, voters);
             put_node_set(&mut out, learners);
         }
         RaftMsg::InstallSnapshotResp {
             term,
             last_included_index,
+            installed,
+            next_offset,
         } => {
             // HA-3c: the follower's term (the leader steps down on a higher one) PLUS the
-            // ECHOED snapshot index the follower just installed. The leader advances
-            // match_index/next_index from THIS echoed value, NOT from its own current
-            // snapshot meta, so a second compaction inside the in-flight InstallSnapshot
-            // window can never over-advance the follower's match_index (Figure 13).
+            // ECHOED snapshot index. PROD-9: the `installed` flag (the final chunk was
+            // applied) and the `next_offset` the follower next expects (for a buffered /
+            // rejected chunk). The leader advances match_index/next_index from the echoed
+            // index only on `installed`, NOT from its own current snapshot meta, so a second
+            // compaction inside the in-flight InstallSnapshot window can never over-advance
+            // the follower's match_index (Figure 13).
             out.push(MSG_INSTALL_SNAPSHOT_RESP);
             put_u64(&mut out, *term);
             put_u64(&mut out, *last_included_index);
+            out.push(u8::from(*installed));
+            put_u64(&mut out, *next_offset);
         }
     }
     out
@@ -549,20 +562,26 @@ pub fn decode_raft_msg(buf: &[u8]) -> Option<RaftMsg> {
             }
         }
         MSG_INSTALL_SNAPSHOT => RaftMsg::InstallSnapshot {
-            // Read in WIRE order: term, leader, (index, term), the data blob, then the
-            // HA-3d config baseline (voters then learners). Field order in this literal
-            // matches the encode order so the cursor reads sequentially correct.
+            // Read in WIRE order: term, leader, (index, term), PROD-9 (offset, data blob,
+            // done), then the HA-3d config baseline (voters then learners). Field order in
+            // this literal matches the encode order so the cursor reads sequentially correct;
+            // a truncated frame (e.g. an old encoder that omitted offset/done) returns None at
+            // the first missing field, dropping the frame rather than misparsing.
             term: cur.u64()?,
             leader_id: cur.node()?,
             last_included_index: cur.u64()?,
             last_included_term: cur.u64()?,
+            offset: cur.u64()?,
             data: cur.blob()?,
+            done: cur.bool()?,
             voters: get_node_set(&mut cur)?,
             learners: get_node_set(&mut cur)?,
         },
         MSG_INSTALL_SNAPSHOT_RESP => RaftMsg::InstallSnapshotResp {
             term: cur.u64()?,
             last_included_index: cur.u64()?,
+            installed: cur.bool()?,
+            next_offset: cur.u64()?,
         },
         _ => return None,
     };

@@ -543,20 +543,34 @@ pub enum RaftMsg {
         /// `Some(index)` if the leader accepted the forwarded proposal, else `None`.
         outcome: Option<u64>,
     },
-    /// The INSTALLSNAPSHOT RPC (Raft section 7 / Figure 13): a leader ships its whole
+    /// The INSTALLSNAPSHOT RPC (Raft section 7 / Figure 13): a leader ships its
     /// state-machine snapshot to a follower whose required log entries the leader has
     /// ALREADY COMPACTED away (the follower's `next_index` fell below the leader's
     /// `log_start_index`, so an AppendEntries can no longer carry the missing prefix).
-    /// This is a single-chunk install: the config snapshot the real workload carries is
-    /// small (the `SlotMap`'s committed state), so the whole snapshot fits in one message;
-    /// CHUNKING (`offset` / `done`, Figure 13) is a documented future extension and is
-    /// NOT needed for correctness at this size.
+    ///
+    /// PROD-9 CHUNKED transfer (Figure 13's `offset` / `done`): the snapshot is sent in
+    /// BOUNDED SEQUENTIAL chunks, each well under the cluster-bus max-frame length, rather
+    /// than as one giant frame (which risks the frame bound and a memory spike on both
+    /// ends). `data` is the chunk at byte `offset` of the snapshot; `offset == 0` is the
+    /// FIRST chunk (which (re)starts the follower's receive buffer), and `done == true`
+    /// marks the LAST chunk (the only chunk on which the follower validates + installs the
+    /// fully-received snapshot). The leader sends chunks one at a time and advances on each
+    /// ack (see [`InstallSnapshotResp`](RaftMsg::InstallSnapshotResp)); a SINGLE chunk
+    /// (`offset == 0`, `done == true`) carrying the whole snapshot is byte-equivalent to
+    /// the pre-PROD-9 whole-snapshot install. `last_included_index` /
+    /// `last_included_term` / `voters` / `learners` are the snapshot's metadata, repeated
+    /// on every chunk (they are tiny and let a fresh receive buffer be keyed by them); the
+    /// follower adopts them only when it installs on `done`.
     ///
     /// SAFETY (State-Machine-Safety): a leader snapshots ONLY its applied = committed
     /// prefix, so `last_included_index` is committed; installing it on a follower moves
     /// that follower FORWARD to a committed prefix and can never overwrite a different
     /// committed entry. The follower runs the standard [`observe_term`] higher-term
-    /// step-down FIRST, exactly like the other RPC handlers.
+    /// step-down FIRST, exactly like the other RPC handlers. A PARTIAL transfer (not all
+    /// chunks received) is NEVER installed: only a contiguous `0..len` sequence ending in
+    /// `done` installs, so a dropped / reordered / duplicated chunk cannot corrupt the
+    /// install (the follower rejects an out-of-order chunk and replies the offset it next
+    /// expects so the leader retries from there).
     InstallSnapshot {
         /// The leader's term.
         term: u64,
@@ -568,8 +582,18 @@ pub enum RaftMsg {
         /// The term of the snapshot's last included entry (the prev-log-term the entry
         /// FOLLOWING the snapshot is checked against).
         last_included_term: u64,
-        /// The [`StateMachine`]-serialized state at `last_included_index` (single chunk).
+        /// PROD-9: the byte OFFSET of this chunk within the full snapshot (Figure 13).
+        /// `0` is the first chunk and (re)starts the follower's receive buffer; a later
+        /// chunk must arrive at exactly the follower's accumulated length or it is rejected.
+        offset: u64,
+        /// The snapshot bytes for THIS chunk (Figure 13 `data`): the slice of the
+        /// [`StateMachine`]-serialized state at `[offset, offset + data.len())`. Bounded
+        /// by [`RaftConfig::snapshot_chunk_bytes`].
         data: Vec<u8>,
+        /// PROD-9: `true` on the LAST chunk (Figure 13 `done`). The follower validates +
+        /// installs the assembled snapshot ONLY on `done`; a non-`done` chunk is buffered
+        /// and acked so the leader sends the next one.
+        done: bool,
         /// HA-3d: the CONFIG BASELINE (the voter set) as of `last_included_index`. The
         /// snapshot subsumes the `ConfigChange` entries of the compacted prefix, so the
         /// follower cannot rebuild the configuration from its (now-truncated) log alone;
@@ -583,25 +607,48 @@ pub enum RaftMsg {
         learners: BTreeSet<NodeId>,
     },
     /// A follower's reply to a [`RaftMsg::InstallSnapshot`] (Raft Figure 13 results).
-    /// Carries the follower's `term` (so the leader can step down on a higher one) AND
-    /// the `last_included_index` of the snapshot the follower just installed, ECHOED back
-    /// from the request. (No success flag: a same-or-lower-term InstallSnapshot is always
-    /// installable, and a higher-term reply steps the leader down.)
+    /// Carries the follower's `term` (so the leader can step down on a higher one), the
+    /// `last_included_index` of the snapshot being transferred (ECHOED from the request),
+    /// and the PROD-9 CHUNK PROGRESS: `installed` (the final chunk was applied) plus
+    /// `next_offset` (the byte offset the follower next expects when the transfer is NOT
+    /// yet complete).
     ///
-    /// SAFETY (no false-commit): the leader advances the follower's
-    /// `match_index`/`next_index` from THIS echoed index, NOT from the leader's OWN
-    /// current `load_snapshot()` meta. The leader may compact AGAIN (to a higher index
-    /// `K'`) between sending `InstallSnapshot(K)` and receiving this reply; reading the
-    /// leader's current meta would set `match_index[from] = K' > K`, claiming the follower
-    /// replicated past what it actually installed and risking a commit on a non-majority
-    /// (Figure 13). Echoing `K` keeps `match_index` honest.
+    /// PROD-9 chunked acks (Figure 13):
+    /// - On a buffered non-final chunk the follower replies `installed == false` and
+    ///   `next_offset == ` its accumulated length, so the leader sends the next chunk from
+    ///   there.
+    /// - On the final chunk (`done`) the follower installs and replies `installed == true`;
+    ///   the leader then advances this follower's `match_index`/`next_index` from the
+    ///   echoed `last_included_index`.
+    /// - On a REJECTED chunk (a stale-term retransmit, or one that did not arrive at the
+    ///   expected offset) the follower replies `installed == false` and `next_offset == `
+    ///   the offset it actually expects (`0` for a not-yet-started transfer), so the leader
+    ///   restarts / continues from the right place rather than corrupting the buffer.
+    ///
+    /// SAFETY (no false-commit): on `installed` the leader advances the follower's
+    /// `match_index`/`next_index` from the echoed `last_included_index`, NOT from the
+    /// leader's OWN current `load_snapshot()` meta. The leader may compact AGAIN (to a
+    /// higher index `K'`) between sending `InstallSnapshot(K)` and receiving this reply;
+    /// reading the leader's current meta would set `match_index[from] = K' > K`, claiming
+    /// the follower replicated past what it actually installed and risking a commit on a
+    /// non-majority (Figure 13). Echoing `K` keeps `match_index` honest. A non-`installed`
+    /// reply advances NO marker -- it only steers the next chunk's offset.
     InstallSnapshotResp {
         /// The follower's current term, for the leader to update itself.
         term: u64,
-        /// The `last_included_index` of the snapshot the follower installed, echoed from
-        /// the [`RaftMsg::InstallSnapshot`] request so the leader advances this follower's
-        /// markers from exactly that index (and never past it).
+        /// The `last_included_index` of the snapshot being transferred, echoed from the
+        /// [`RaftMsg::InstallSnapshot`] request. On an `installed` reply the leader advances
+        /// this follower's markers from exactly that index (and never past it).
         last_included_index: u64,
+        /// PROD-9: `true` only on the reply to the FINAL (`done`) chunk, i.e. the snapshot
+        /// was fully received and installed. `false` for a buffered-but-incomplete chunk or
+        /// a rejected one (the leader advances no replication marker then).
+        installed: bool,
+        /// PROD-9: the byte offset the follower NEXT expects for this snapshot transfer
+        /// (its accumulated received length), so the leader sends the next chunk from
+        /// there. Meaningful only when `installed == false`; ignored on an `installed`
+        /// reply (the transfer is complete).
+        next_offset: u64,
     },
 }
 
@@ -1227,6 +1274,20 @@ pub struct RaftConfig {
     /// behaviour), which keeps every existing DST scenario byte-identical: they all use
     /// [`RaftConfig::default`], whose value is below.
     pub snapshot_threshold: u64,
+    /// PROD-9 CHUNKED InstallSnapshot: the MAXIMUM number of snapshot bytes a single
+    /// [`RaftMsg::InstallSnapshot`] chunk carries (Raft Figure 13's chunk size). The leader
+    /// slices the snapshot into sequential chunks of at most this many bytes so no install
+    /// frame approaches the cluster-bus max-frame length (a multi-hundred-MB snapshot would
+    /// otherwise be one giant frame + a memory spike on both ends). MUST be well under the
+    /// bus frame bound (`ironcache_runtime::MAX_CLUSTER_FRAME_LEN`); the default
+    /// [`DEFAULT_SNAPSHOT_CHUNK_BYTES`] is a few hundred KB, which is. A function of the
+    /// snapshot bytes + this constant only, so chunk boundaries are fully DETERMINISTIC (no
+    /// time / RNG) and replay identically. A value at or above the snapshot size sends the
+    /// whole snapshot in one chunk (byte-equivalent to the pre-PROD-9 path); `0` is treated
+    /// as a single chunk (never a zero-length-chunk loop). Because the same bytes are sliced
+    /// and reassembled, the chunk size NEVER changes the installed state -- only the
+    /// framing -- so a follower installs a byte-identical snapshot at any chunk size.
+    pub snapshot_chunk_bytes: usize,
     /// PRE-VOTE election hygiene (Ongaro dissertation section 9.6), default ON. When set,
     /// a follower whose election timer fires runs a PRE-VOTE round (a non-binding "would
     /// you grant me a vote at term+1?" poll) BEFORE incrementing its term and campaigning;
@@ -1255,6 +1316,16 @@ pub struct RaftConfig {
 /// (e.g. a few hundred) without the size of a snapshot being a concern.
 pub const DEFAULT_SNAPSHOT_THRESHOLD: u64 = 0;
 
+/// The default PROD-9 chunked-InstallSnapshot chunk size ([`RaftConfig::snapshot_chunk_bytes`]):
+/// 256 KiB. Comfortably under the cluster-bus max-frame length
+/// (`ironcache_runtime::MAX_CLUSTER_FRAME_LEN`, 512 MiB) with room for the chunk's framing
+/// overhead, while large enough that a typical config snapshot (the `SlotMap`'s committed
+/// state) ships in one or two chunks. It is a pure framing parameter -- the installed state
+/// is byte-identical at any value -- so the DST sweep, which exercises both the single-chunk
+/// (snapshot smaller than this) and multi-chunk (a small override) paths, converges to the
+/// same state machine regardless.
+pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
+
 impl Default for RaftConfig {
     fn default() -> Self {
         RaftConfig {
@@ -1262,6 +1333,7 @@ impl Default for RaftConfig {
             election_timeout_jitter: Duration::from_millis(150),
             heartbeat_interval: Duration::from_millis(50),
             snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
+            snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
             // Pre-Vote + check-quorum are strictly-better election hygiene (Ongaro
             // section 9.6); default them ON so production and the DST sweep both run the
             // hardened path. The disruptive-server regression-anchor tests opt OUT
@@ -1323,7 +1395,8 @@ pub const PRE_VOTE_FALLBACK_ROUNDS: u32 = 3;
 
 /// The decoded fields of a [`RaftMsg::InstallSnapshot`], bundled so
 /// [`RaftNode::on_install_snapshot`] stays under the argument cap (the message gained
-/// HA-3d config-baseline fields). Constructed in the `on_message` dispatch and moved in.
+/// HA-3d config-baseline fields and the PROD-9 `offset` / `done` chunk fields).
+/// Constructed in the `on_message` dispatch and moved in.
 struct InstallSnapshotArgs {
     /// The leader's term.
     term: u64,
@@ -1333,12 +1406,44 @@ struct InstallSnapshotArgs {
     last_included_index: u64,
     /// The term of the snapshot's last included entry.
     last_included_term: u64,
-    /// The state-machine-serialized state at `last_included_index`.
+    /// PROD-9: the byte offset of this chunk (`0` is the first chunk; restarts the buffer).
+    offset: u64,
+    /// The snapshot bytes for THIS chunk (`[offset, offset + data.len())`).
     data: Vec<u8>,
+    /// PROD-9: `true` on the last chunk (install on this chunk only).
+    done: bool,
     /// HA-3d: the config baseline voter set as of `last_included_index`.
     voters: BTreeSet<NodeId>,
     /// HA-3d: the config baseline learner set as of `last_included_index`.
     learners: BTreeSet<NodeId>,
+}
+
+/// PROD-9 chunked-InstallSnapshot RECEIVE BUFFER: a follower's in-progress reassembly of a
+/// leader's snapshot that is arriving in [`RaftMsg::InstallSnapshot`] chunks (Raft Figure
+/// 13). Held only WHILE a chunked transfer is in flight (`None` otherwise), it accumulates
+/// the chunk bytes contiguously from offset 0 and is consumed (validated + installed) only
+/// when the FINAL (`done`) chunk arrives. A fresh first chunk (`offset == 0`) REPLACES any
+/// prior buffer -- so a leader change, a restarted transfer, or a follower that fell out of
+/// sync simply starts over -- which is why a partial transfer can never be installed: the
+/// install runs exclusively on `done` after a contiguous `0..len` accumulation.
+///
+/// The buffer is keyed by the snapshot meta (`last_included_index` / `last_included_term`)
+/// the first chunk carried; a later chunk whose meta disagrees is treated as a NEW transfer
+/// and (because the offset will not match) is rejected, forcing the leader to restart from
+/// offset 0. This keeps the follower from splicing two different snapshots' bytes together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotRx {
+    /// The transferring snapshot's last included index (from the first chunk).
+    last_included_index: u64,
+    /// The transferring snapshot's last included term (from the first chunk).
+    last_included_term: u64,
+    /// The config baseline voter set the first chunk carried (HA-3d), adopted on install.
+    voters: BTreeSet<NodeId>,
+    /// The config baseline learner set the first chunk carried (HA-3d), adopted on install.
+    learners: BTreeSet<NodeId>,
+    /// The contiguously accumulated snapshot bytes so far (`data.len()` is the next
+    /// expected chunk offset).
+    data: Vec<u8>,
 }
 
 /// A single Raft node: the pure step engine.
@@ -1479,6 +1584,26 @@ pub struct RaftNode<S: RaftStorage, M: StateMachine = CountingSm> {
     /// that `last_applied` moved) and is kept in lockstep with the real
     /// [`StateMachine`] apply below. Exposed via [`RaftNode::applied_count`].
     applied_count: u64,
+    /// PROD-9 chunked InstallSnapshot, LEADER state: the per-peer byte OFFSET of the NEXT
+    /// snapshot chunk to send that peer (Raft Figure 13's per-follower snapshot progress).
+    /// Set to `0` when the leader first decides to snapshot a peer (a fresh transfer starts
+    /// at offset 0), advanced on each non-final ack to the offset the follower reported it
+    /// next expects, and REMOVED on the install ack (transfer complete) or whenever a peer
+    /// falls back to AppendEntries. Like [`next_index`](RaftNode::next_index) /
+    /// [`match_index`](RaftNode::match_index) it is leader-only volatile state, cleared on
+    /// step-down and reinitialized on election; a follower restart / term change makes the
+    /// follower reject mismatched offsets and reply `next_offset == 0`, which restarts the
+    /// transfer here. Empty unless a chunked install is in flight, so the non-snapshot path
+    /// is byte-unchanged.
+    snapshot_next_offset: BTreeMap<NodeId, u64>,
+    /// PROD-9 chunked InstallSnapshot, FOLLOWER state: the in-progress receive buffer for a
+    /// snapshot arriving in chunks (Raft Figure 13). `None` when no chunked transfer is in
+    /// flight; `Some` while one is being reassembled. Replaced by a fresh first chunk
+    /// (`offset == 0`) and consumed (validated + installed) only on the final (`done`)
+    /// chunk, so a partial transfer is NEVER installed. Volatile: a crash mid-transfer
+    /// drops it (the leader restarts the transfer from offset 0). Empty unless a chunked
+    /// install is in flight, so the non-snapshot path is byte-unchanged.
+    snapshot_rx: Option<SnapshotRx>,
     /// The replicated state machine (3e). Each committed entry is handed to
     /// [`StateMachine::apply`] exactly once, in index order, by
     /// [`RaftNode::apply_committed`]. With the default `M = CountingSm` this is the
@@ -1561,6 +1686,11 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             last_applied,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            // PROD-9: no chunked snapshot transfer is in flight on a fresh / restarted node.
+            // Leader per-peer offsets are seeded when a snapshot send first starts; the
+            // follower buffer is filled by the first chunk. Both empty here.
+            snapshot_next_offset: BTreeMap::new(),
+            snapshot_rx: None,
             // The apply witness counts entries applied THIS process; a restore from a
             // snapshot did not stream entries through `apply`, so it starts at 0 (it is
             // a per-run hook-ran witness, not a persisted count).
@@ -1672,7 +1802,7 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     // small (scalars plus an always-empty `entries`), but later sub-slices carry
     // real `entries` payloads that the engine moves into the log, so the by-value
     // signature is the stable one. Matching by value here, not by reference.
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn on_message(
         &mut self,
         now: Monotonic,
@@ -1752,7 +1882,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 leader_id,
                 last_included_index,
                 last_included_term,
+                offset,
                 data,
+                done,
                 voters,
                 learners,
             } => self.on_install_snapshot(
@@ -1763,7 +1895,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                     leader_id,
                     last_included_index,
                     last_included_term,
+                    offset,
                     data,
+                    done,
                     voters,
                     learners,
                 },
@@ -1772,8 +1906,18 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             RaftMsg::InstallSnapshotResp {
                 term,
                 last_included_index,
+                installed,
+                next_offset,
             } => {
-                self.on_install_snapshot_resp(rng, from, term, last_included_index, out);
+                self.on_install_snapshot_resp(
+                    rng,
+                    from,
+                    term,
+                    last_included_index,
+                    installed,
+                    next_offset,
+                    out,
+                );
             }
         }
     }
@@ -2487,6 +2631,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             // Drop leader-only volatile state (reinitialized on the next election).
             self.next_index.clear();
             self.match_index.clear();
+            // PROD-9: per-follower chunked-snapshot progress is leader-only; drop it so a
+            // future re-election restarts any transfer cleanly from offset 0.
+            self.snapshot_next_offset.clear();
             if was_leader {
                 out.cancel_timer(HEARTBEAT);
             }
@@ -2522,6 +2669,8 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // leader-only; drop it so a later re-election re-seeds it fresh.
         self.next_index.clear();
         self.match_index.clear();
+        // PROD-9: per-follower chunked-snapshot progress is leader-only; drop it too.
+        self.snapshot_next_offset.clear();
         self.quorum_contact.clear();
     }
 
@@ -2577,6 +2726,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         let next = self.storage.last_log_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
+        // PROD-9: a new leader has no in-flight chunked-snapshot transfers; clear any
+        // residue so the first time it must snapshot a lagging peer it starts at offset 0.
+        self.snapshot_next_offset.clear();
         for &peer in self.voters.iter().chain(self.learners.iter()) {
             if peer != self.id {
                 self.next_index.insert(peer, next);
@@ -2616,11 +2768,19 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     /// the entries it is missing. LEARNERS are replicated to exactly like voters (so they
     /// catch up); they simply never count toward a quorum. With no learners (the default)
     /// the iterated set is exactly the voter set, so the default path is byte-identical.
-    fn broadcast_heartbeat(&self, out: &mut Effects) {
-        for &peer in self.voters.iter().chain(self.learners.iter()) {
-            if peer != self.id {
-                self.send_append_entries_to(peer, out);
-            }
+    fn broadcast_heartbeat(&mut self, out: &mut Effects) {
+        // Collect the peer set first so the loop can take `&mut self` per send (PROD-9:
+        // a send may now update the per-peer chunked-snapshot offset). The set is the
+        // voters + learners minus self, in the same deterministic order as before.
+        let peers: Vec<NodeId> = self
+            .voters
+            .iter()
+            .chain(self.learners.iter())
+            .copied()
+            .filter(|&peer| peer != self.id)
+            .collect();
+        for peer in peers {
+            self.send_append_entries_to(peer, out);
         }
     }
 
@@ -2629,7 +2789,11 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     /// nextIndex). `prev_log_index = nextIndex - 1`, `prev_log_term =
     /// term_at(prev_log_index)`, `entries = entries_from(nextIndex)`, `leader_commit
     /// = commit_index`. Only meaningful while `role == Leader`.
-    fn send_append_entries_to(&self, peer: NodeId, out: &mut Effects) {
+    ///
+    /// PROD-9: when the peer's needed prefix is below this leader's snapshot, this starts
+    /// or resumes a CHUNKED [`RaftMsg::InstallSnapshot`] transfer (it is `&mut self` so it
+    /// can track the per-peer chunk offset) instead of an AppendEntries.
+    fn send_append_entries_to(&mut self, peer: NodeId, out: &mut Effects) {
         let term = self.storage.current_term();
         let next = self.next_index.get(&peer).copied().unwrap_or(1);
 
@@ -2643,30 +2807,21 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // `next - 1 < last_included_index`, equivalently `next <= last_included_index`.
         // When `prev_log_index == last_included_index` the snapshot still answers the
         // prev term, so a normal AppendEntries works.
-        if let Some((meta, data)) = self.storage.load_snapshot() {
+        if let Some((meta, _)) = self.storage.load_snapshot() {
             if next <= meta.last_included_index {
-                // HA-3d: ship the persisted CONFIG BASELINE the snapshot reflects so the
-                // installing follower can rebuild its configuration (its log below the
-                // snapshot is gone). Empty for a static cluster (config-inert there).
-                let (voters, learners) = self
-                    .storage
-                    .load_config_baseline()
-                    .unwrap_or_else(|| (BTreeSet::new(), BTreeSet::new()));
-                out.send(
-                    peer,
-                    RaftMsg::InstallSnapshot {
-                        term,
-                        leader_id: self.id,
-                        last_included_index: meta.last_included_index,
-                        last_included_term: meta.last_included_term,
-                        data,
-                        voters,
-                        learners,
-                    },
-                );
+                // PROD-9: start (or resume) a CHUNKED snapshot transfer. The first chunk
+                // for a peer is at offset 0; `snapshot_next_offset` tracks where the next
+                // chunk should pick up once acks come back. The actual byte slicing lives
+                // in `send_snapshot_chunk_to`.
+                let offset = self.snapshot_next_offset.get(&peer).copied().unwrap_or(0);
+                self.snapshot_next_offset.insert(peer, offset);
+                self.send_snapshot_chunk_to(peer, offset, out);
                 return;
             }
         }
+        // The peer's needed prefix is no longer below a snapshot, so any stale chunked
+        // transfer progress for it is moot; drop it so a future snapshot restarts at 0.
+        self.snapshot_next_offset.remove(&peer);
 
         let prev_log_index = next.saturating_sub(1);
         let prev_log_term = self.storage.term_at(prev_log_index);
@@ -2680,6 +2835,70 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 prev_log_term,
                 entries,
                 leader_commit: self.commit_index,
+            },
+        );
+    }
+
+    /// PROD-9: emit ONE [`RaftMsg::InstallSnapshot`] chunk for `peer` at byte `offset`
+    /// (Raft Figure 13). Reads the snapshot bytes from storage (the same bytes the
+    /// pre-PROD-9 path shipped whole), slices `[offset, offset + chunk_len)` where
+    /// `chunk_len = min(snapshot_chunk_bytes, remaining)`, and marks `done` when this chunk
+    /// reaches the end of the snapshot. The slicing is a pure function of the snapshot bytes
+    /// and the config chunk size, so chunk boundaries replay byte-identically. A snapshot
+    /// smaller than (or a chunk size at/above) the snapshot size sends the whole thing in
+    /// one `done` chunk, byte-equivalent to the old whole-snapshot install.
+    ///
+    /// `offset` is expected to be `<= data.len()` (the caller advances it only on the
+    /// follower-reported next offset, which is bounded by what was sent); an out-of-range
+    /// offset is clamped so the chunk is empty + `done`, which is inert (the follower
+    /// already holds that prefix). No-op if the leader holds no snapshot.
+    fn send_snapshot_chunk_to(&mut self, peer: NodeId, offset: u64, out: &mut Effects) {
+        let Some((meta, data)) = self.storage.load_snapshot() else {
+            // No snapshot to send (e.g. it was just dropped); a future tick re-evaluates.
+            self.snapshot_next_offset.remove(&peer);
+            return;
+        };
+        let term = self.storage.current_term();
+        // HA-3d: the persisted CONFIG BASELINE the snapshot reflects, so the installing
+        // follower can rebuild its configuration (its log below the snapshot is gone).
+        // Empty for a static cluster (config-inert there). Repeated on every chunk; the
+        // follower adopts it only on `done`.
+        let (voters, learners) = self
+            .storage
+            .load_config_baseline()
+            .unwrap_or_else(|| (BTreeSet::new(), BTreeSet::new()));
+
+        let total = data.len();
+        // Clamp the offset into range (a follower can never legitimately ask past the end,
+        // but stay total): an out-of-range start yields an empty, `done` chunk.
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
+        // A chunk is at most `snapshot_chunk_bytes`; treat 0 as "the whole remainder" so a
+        // misconfigured 0 never loops on empty chunks. The remainder bound keeps the last
+        // chunk short.
+        let chunk_cap = if self.config.snapshot_chunk_bytes == 0 {
+            total
+        } else {
+            self.config.snapshot_chunk_bytes
+        };
+        let end = start.saturating_add(chunk_cap).min(total);
+        let chunk = data[start..end].to_vec();
+        // `done` exactly when this chunk reaches the end of the snapshot (the empty
+        // end-of-stream case `start == end == total` is `done` too, so a zero-length
+        // snapshot installs in a single empty `done` chunk).
+        let done = end >= total;
+
+        out.send(
+            peer,
+            RaftMsg::InstallSnapshot {
+                term,
+                leader_id: self.id,
+                last_included_index: meta.last_included_index,
+                last_included_term: meta.last_included_term,
+                offset: start as u64,
+                data: chunk,
+                done,
+                voters,
+                learners,
             },
         );
     }
@@ -2917,9 +3136,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         self.storage.compact_to(last_included_index);
     }
 
-    /// INSTALLSNAPSHOT receiver (Raft section 7 / Figure 13). A leader is shipping its
-    /// snapshot because the entries this follower needs were already compacted on the
-    /// leader.
+    /// INSTALLSNAPSHOT receiver (Raft section 7 / Figure 13), PROD-9 CHUNKED. A leader is
+    /// shipping its snapshot in bounded chunks because the entries this follower needs were
+    /// already compacted on the leader.
     ///
     /// Order of operations (mirrors the other receivers):
     /// 1. "All Servers": adopt a strictly greater term (step down, clear vote), via
@@ -2928,19 +3147,29 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
     ///    higher term so the stale leader steps down; do NOT install or reset the timer.
     /// 3. `term == currentTerm`: a legitimate leader. Concede candidacy, reset the
     ///    election timer (we heard from the leader), record the leader.
-    /// 4. If the snapshot does not advance us (`last_included_index <= commit_index`),
-    ///    it is stale/duplicate: reply our term and stop (never move backward).
-    /// 5. Otherwise INSTALL: persist the snapshot, restore the state machine from it,
-    ///    discard the log up to `last_included_index` (keeping a longer VALID suffix per
-    ///    the paper - only if our entry at `last_included_index` matches the term), set
-    ///    `commit_index`/`last_applied` to `last_included_index`, and reply our term.
+    /// 4. CHUNK ASSEMBLY (Figure 13's `offset` / `done`): on `offset == 0` (re)start the
+    ///    receive buffer with the chunk's snapshot meta; on a later chunk, accept it ONLY if
+    ///    its `offset` equals our accumulated length AND its meta matches the buffer (else
+    ///    reject and reply the offset we next expect, so the leader restarts / continues).
+    ///    Append the chunk's bytes. If `done == false`, reply our accumulated length and
+    ///    stop (no install yet). Only on `done` do we proceed to install the assembled
+    ///    snapshot -- a PARTIAL transfer is NEVER installed.
+    /// 5. If the assembled snapshot does not advance us (`last_included_index <=
+    ///    commit_index`), it is stale/duplicate: discard the buffer, reply our term and stop
+    ///    (never move backward).
+    /// 6. Otherwise INSTALL ([`install_assembled_snapshot`](RaftNode::install_assembled_snapshot)):
+    ///    persist the snapshot, restore the state machine, discard the log up to
+    ///    `last_included_index` (keeping a longer VALID suffix per the paper), adopt the
+    ///    config baseline, set `commit_index`/`last_applied`, then reply `installed`.
     ///
     /// FORWARD-ONLY SAFETY: a leader snapshots only its applied = committed prefix, so
     /// `last_included_index` is COMMITTED. Installing it moves this follower FORWARD to a
     /// committed prefix and can never overwrite a different committed entry at the same
     /// index (State-Machine-Safety), because two leaders can never commit conflicting
-    /// entries at one index.
-    #[allow(clippy::needless_pass_by_value)]
+    /// entries at one index. The install is ATOMIC and happens ONLY on `done` after a
+    /// contiguous `0..len` accumulation, so a dropped / reordered / duplicated chunk cannot
+    /// install a half-received snapshot (the offset check rejects it).
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn on_install_snapshot(
         &mut self,
         now: Monotonic,
@@ -2953,7 +3182,9 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             leader_id,
             last_included_index,
             last_included_term,
+            offset,
             data,
+            done,
             voters,
             learners,
         } = args;
@@ -2961,14 +3192,16 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         let current = self.storage.current_term();
 
         if term < current {
-            // Stale leader: reply our higher term so it steps down; do not install. Echo
-            // the offered index anyway (Figure 13); the stale leader steps down on our
-            // higher term before it would advance any marker, so the value is inert here.
+            // Stale leader: reply our higher term so it steps down; do not install or buffer.
+            // A non-installed reply (the stale leader steps down on our higher term first, so
+            // the offset is inert); `next_offset == 0` since we kept no buffer for it.
             out.send(
                 leader_id,
                 RaftMsg::InstallSnapshotResp {
                     term: current,
                     last_included_index,
+                    installed: false,
+                    next_offset: 0,
                 },
             );
             return;
@@ -2991,20 +3224,139 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // counter (etcd #8525), the same as the AppendEntries recognize-leader path.
         self.failed_pre_vote_rounds = 0;
 
-        // A stale / duplicate snapshot that does not advance our committed prefix: never
-        // move backward. Reply our term and stop. Echo the offered index: we provably hold
-        // at least that prefix (it is `<= commit_index`), so the leader advancing our
-        // markers to it is honest.
-        if last_included_index <= self.commit_index {
+        // PROD-9 CHUNK ASSEMBLY (Figure 13). The first chunk (`offset == 0`) (re)starts a
+        // fresh buffer keyed by THIS snapshot's meta; a later chunk extends the buffer iff it
+        // arrives contiguously (its `offset` equals our accumulated length) AND its meta
+        // matches the buffer. A mismatch (a reordered / duplicated / stale-snapshot chunk) is
+        // rejected: we keep our buffer untouched and reply the offset we next expect so the
+        // leader retransmits from the right place. This is what makes a partial transfer
+        // unobservable -- the install runs only on the FINAL chunk of a contiguous run.
+        if offset == 0 {
+            // A fresh first chunk supersedes any prior partial buffer (a leader change or a
+            // restarted transfer). Seed the buffer from this chunk's meta + bytes.
+            self.snapshot_rx = Some(SnapshotRx {
+                last_included_index,
+                last_included_term,
+                voters,
+                learners,
+                data,
+            });
+        } else {
+            // A continuation chunk. It must match an in-flight buffer for the SAME snapshot
+            // and land exactly at the accumulated length; otherwise reject + steer the leader.
+            let accepted = match self.snapshot_rx.as_mut() {
+                Some(rx)
+                    if rx.last_included_index == last_included_index
+                        && rx.last_included_term == last_included_term
+                        && offset == rx.data.len() as u64 =>
+                {
+                    rx.data.extend_from_slice(&data);
+                    true
+                }
+                _ => false,
+            };
+            if !accepted {
+                // Reject: reply the offset we actually expect (the buffer's length, or 0 when
+                // we hold no buffer for this snapshot) so the leader restarts / continues
+                // correctly. No marker advances on a non-installed reply.
+                let expect = self
+                    .snapshot_rx
+                    .as_ref()
+                    .filter(|rx| {
+                        rx.last_included_index == last_included_index
+                            && rx.last_included_term == last_included_term
+                    })
+                    .map_or(0, |rx| rx.data.len() as u64);
+                out.send(
+                    leader_id,
+                    RaftMsg::InstallSnapshotResp {
+                        term: current,
+                        last_included_index,
+                        installed: false,
+                        next_offset: expect,
+                    },
+                );
+                return;
+            }
+        }
+
+        // The chunk was buffered. If this is NOT the final chunk, ack our accumulated length
+        // so the leader sends the next chunk from there; do NOT install yet.
+        if !done {
+            let received = self
+                .snapshot_rx
+                .as_ref()
+                .map_or(0, |rx| rx.data.len() as u64);
             out.send(
                 leader_id,
                 RaftMsg::InstallSnapshotResp {
                     term: current,
                     last_included_index,
+                    installed: false,
+                    next_offset: received,
                 },
             );
             return;
         }
+
+        // FINAL chunk: the whole snapshot is now assembled in the buffer. Take it out
+        // (consuming the buffer) and install atomically. A stale / duplicate complete
+        // snapshot that does not advance our committed prefix is discarded, not installed.
+        let rx = self
+            .snapshot_rx
+            .take()
+            .expect("the buffer was just seeded / extended for this chunk");
+
+        if rx.last_included_index <= self.commit_index {
+            // Stale / duplicate: never move backward. We provably hold at least that prefix
+            // (it is `<= commit_index`), so the leader advancing our markers to it is honest.
+            out.send(
+                leader_id,
+                RaftMsg::InstallSnapshotResp {
+                    term: current,
+                    last_included_index: rx.last_included_index,
+                    installed: true,
+                    next_offset: 0,
+                },
+            );
+            return;
+        }
+
+        // INSTALL the fully-received snapshot atomically (the same install the pre-PROD-9
+        // whole-snapshot path ran, now fed from the reassembled buffer).
+        self.install_assembled_snapshot(&rx, out);
+
+        // ECHO the installed index (Figure 13): the leader advances our markers from exactly
+        // what we installed, never from its own (possibly newer) snapshot meta.
+        out.send(
+            leader_id,
+            RaftMsg::InstallSnapshotResp {
+                term: current,
+                last_included_index: rx.last_included_index,
+                installed: true,
+                next_offset: 0,
+            },
+        );
+    }
+
+    /// PROD-9: ATOMICALLY install a fully-received snapshot (the body the pre-chunking
+    /// whole-snapshot path ran, now fed from a reassembled [`SnapshotRx`]). Called ONLY on
+    /// the final chunk of a contiguous transfer whose `last_included_index > commit_index`,
+    /// so it always moves the follower FORWARD. Persists the snapshot, restores the state
+    /// machine, compacts the log (keeping a longer valid suffix per Figure 13 step 6), adopts
+    /// the config baseline, and advances the committed / applied watermarks. Reassembling the
+    /// SAME bytes and installing them here is byte-identical to installing the whole snapshot
+    /// in one message, so chunk count never changes the installed state.
+    fn install_assembled_snapshot(&mut self, rx: &SnapshotRx, out: &mut Effects) {
+        let SnapshotRx {
+            last_included_index,
+            last_included_term,
+            voters,
+            learners,
+            data,
+        } = rx;
+        let last_included_index = *last_included_index;
+        let last_included_term = *last_included_term;
 
         // KEEP A VALID LONGER SUFFIX (Raft Figure 13 step 6): if our log already holds
         // an entry AT last_included_index whose term matches last_included_term, the
@@ -3031,10 +3383,10 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
                 last_included_index,
                 last_included_term,
             },
-            &data,
+            data,
         );
         self.storage.compact_to(last_included_index);
-        self.sm.restore(&data);
+        self.sm.restore(data);
 
         // HA-3d: ADOPT the config baseline the snapshot reflects. The snapshot subsumed the
         // compacted prefix's `ConfigChange` entries, so the follower's truncated log can no
@@ -3043,11 +3395,11 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // ConfigChange entries`. Empty sets (a static / pre-3d cluster) leave the config
         // governed by the constructor's voter set, so this is config-inert there.
         self.config_baseline = (voters.clone(), learners.clone());
-        self.storage.save_config_baseline(&voters, &learners);
+        self.storage.save_config_baseline(voters, learners);
         self.recompute_config_from_log();
 
         // Advance the committed / applied watermarks to the snapshot's index (it is a
-        // committed prefix). Forward-only: we entered this branch only because
+        // committed prefix). Forward-only: the caller entered this path only because
         // last_included_index > commit_index.
         self.commit_index = last_included_index;
         self.last_applied = last_included_index;
@@ -3056,42 +3408,41 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
         // commit-advance sites; a snapshot-installing follower holds no local propose
         // ack, but the record is emitted at every site for a single drain path.
         out.note_committed_through(last_included_index);
-
-        // ECHO the installed index (Figure 13): the leader advances our markers from
-        // exactly what we installed, never from its own (possibly newer) snapshot meta.
-        out.send(
-            leader_id,
-            RaftMsg::InstallSnapshotResp {
-                term: current,
-                last_included_index,
-            },
-        );
     }
 
-    /// INSTALLSNAPSHOT response handler (Raft section 7 / Figure 13). Mirrors the
-    /// AppendEntries response handler's leader bookkeeping for the install case.
+    /// INSTALLSNAPSHOT response handler (Raft section 7 / Figure 13), PROD-9 CHUNKED.
+    /// Mirrors the AppendEntries response handler's leader bookkeeping, now also driving the
+    /// per-follower chunk progress.
     ///
     /// 1. "All Servers": a higher-term reply steps the leader down (return then).
     /// 2. Only a `Leader` in the SAME term cares (a stale reply is ignored).
-    /// 3. The follower has now installed the snapshot, so it holds everything up to the
-    ///    index it ECHOED (`installed_index`): advance `match_index`/`next_index` past it
-    ///    (taking the MAX so a reordered older reply cannot rewind), then immediately send
-    ///    the next AppendEntries to continue replicating the post-snapshot tail, and try
-    ///    to advance commit.
+    /// 3. CHUNK PROGRESS (`installed == false`): the follower buffered a non-final chunk (or
+    ///    rejected one). It reported the byte offset it next expects (`next_offset`); record
+    ///    it and send the NEXT chunk from there. No replication marker advances (the follower
+    ///    has not yet installed anything).
+    /// 4. INSTALL (`installed == true`): the follower has now installed the snapshot, so it
+    ///    holds everything up to the index it ECHOED (`installed_index`): advance
+    ///    `match_index`/`next_index` past it (MAX-guarded so a reordered older reply cannot
+    ///    rewind), drop the per-follower chunk progress (the transfer is done), then resume
+    ///    AppendEntries for the post-snapshot tail and try to advance commit.
     ///
-    /// FALSE-COMMIT SAFETY (Figure 13): the marker advance reads the follower's ECHOED
-    /// `installed_index`, NOT this leader's CURRENT `load_snapshot()` meta. If the leader
-    /// compacted AGAIN (to a higher `K'`) while this `InstallSnapshot(K)` was in flight,
-    /// reading the current meta would set `match_index[from] = K' > K` -- claiming the
-    /// follower holds entries it never installed -- and `maybe_advance_commit` could then
-    /// commit an index that is NOT on a majority (a lost-committed-entry hazard on a
-    /// later leader change). Echoing `K` keeps the marker honest.
+    /// FALSE-COMMIT SAFETY (Figure 13): on install the marker advance reads the follower's
+    /// ECHOED `installed_index`, NOT this leader's CURRENT `load_snapshot()` meta. If the
+    /// leader compacted AGAIN (to a higher `K'`) while this `InstallSnapshot(K)` was in
+    /// flight, reading the current meta would set `match_index[from] = K' > K` -- claiming
+    /// the follower holds entries it never installed -- and `maybe_advance_commit` could then
+    /// commit an index that is NOT on a majority (a lost-committed-entry hazard on a later
+    /// leader change). Echoing `K` keeps the marker honest. A non-`installed` chunk reply
+    /// advances NO marker, so it can never over-commit.
+    #[allow(clippy::too_many_arguments)]
     fn on_install_snapshot_resp(
         &mut self,
         rng: &mut dyn RaftRng,
         from: NodeId,
         term: u64,
         installed_index: u64,
+        installed: bool,
+        next_offset: u64,
         out: &mut Effects,
     ) {
         if self.observe_term(term, rng, out) {
@@ -3102,11 +3453,25 @@ impl<S: RaftStorage, M: StateMachine> RaftNode<S, M> {
             // Stale reply (old term) or we are not leader: ignore.
             return;
         }
-        // The follower installed the snapshot at `installed_index` (the value it echoed
-        // from our request), so it now holds the prefix up to there - and ONLY up to
-        // there, regardless of any LATER compaction on this leader. Advance its markers to
-        // that echoed index (MAX-guarded against a reordered older reply), then continue
-        // with the tail above it.
+        if !installed {
+            // PROD-9: a buffered-but-incomplete (or rejected) chunk. The follower told us the
+            // offset it next expects; advance our per-follower progress to it and ship the
+            // next chunk from there. Advance NO replication marker (nothing is installed yet).
+            // Only track if a chunked transfer is actually in flight for this peer (a leader
+            // that no longer needs to snapshot this peer has no entry); the `entry` API would
+            // otherwise resurrect a stale one, so guard on presence.
+            if let Some(slot) = self.snapshot_next_offset.get_mut(&from) {
+                *slot = next_offset;
+                self.send_snapshot_chunk_to(from, next_offset, out);
+            }
+            return;
+        }
+        // INSTALLED: the follower installed the snapshot at `installed_index` (the value it
+        // echoed from our request), so it now holds the prefix up to there - and ONLY up to
+        // there, regardless of any LATER compaction on this leader. The chunked transfer is
+        // complete, so drop its per-follower progress. Advance its markers to the echoed
+        // index (MAX-guarded against a reordered older reply), then continue with the tail.
+        self.snapshot_next_offset.remove(&from);
         let m = self.match_index.entry(from).or_insert(0);
         *m = (*m).max(installed_index);
         let mi = *m;
@@ -7227,6 +7592,31 @@ mod tests {
             &self.net.node(to_sim(id)).expect("node exists").engine
         }
 
+        /// Mutable engine access, for a test driver that must reach INTO a node between
+        /// steps (PROD-9: simulating a follower restart that drops its volatile
+        /// chunked-snapshot receive buffer).
+        fn engine_mut(&mut self, id: NodeId) -> &mut RaftNode<MemStorage, ConfigSm> {
+            &mut self.net.node_mut(to_sim(id)).expect("node exists").engine
+        }
+
+        /// PROD-9: drop a follower's IN-PROGRESS chunked-snapshot receive buffer, modeling a
+        /// node restart mid-transfer (the buffer is VOLATILE, lost on a crash). The leader
+        /// then restarts the transfer from offset 0 (the follower rejects the next non-zero
+        /// chunk and replies `next_offset == 0`). Persistent storage is untouched, as a real
+        /// restart keeps it.
+        fn drop_snapshot_rx(&mut self, id: NodeId) {
+            self.engine_mut(id).snapshot_rx = None;
+        }
+
+        /// PROD-9: the byte length of `id`'s persisted snapshot (0 if none). Used to assert
+        /// a multi-chunk transfer actually spanned several chunks (snapshot len > chunk size).
+        fn snapshot_len(&self, id: NodeId) -> usize {
+            self.engine(id)
+                .storage()
+                .load_snapshot()
+                .map_or(0, |(_, data)| data.len())
+        }
+
         fn role(&self, id: NodeId) -> Role {
             self.engine(id).role()
         }
@@ -8832,11 +9222,55 @@ mod tests {
     /// (no-two-owners-per-epoch, epoch-monotonic) and the committed-prefix agreement hold.
     /// Returns the final per-node (owner-by-slot, epoch) snapshot for the seed-sweep
     /// convergence assertion.
-    #[allow(clippy::too_many_lines)]
     fn run_snapshot_catchup_gate(seed: u64) -> Vec<(BTreeMap<u16, String>, u64)> {
+        // The original gate: the ENGINE-default chunk size (so the small config snapshot ships
+        // in a SINGLE `done` chunk, byte-equivalent to the pre-PROD-9 whole-snapshot install),
+        // no extra chunk loss, no mid-transfer restart.
+        run_snapshot_catchup_gate_with(seed, SnapshotCatchupOpts::default())
+    }
+
+    /// PROD-9: knobs for the chunked-InstallSnapshot DST gate, so one parameterized scenario
+    /// drives the single-chunk (original), MULTI-CHUNK, DROPPED-CHUNK, and RESTART-MID-TRANSFER
+    /// variants. All variants must converge to the SAME byte-identical state machine.
+    #[derive(Clone, Copy)]
+    struct SnapshotCatchupOpts {
+        /// The InstallSnapshot chunk size. The engine default ships the small config snapshot in
+        /// one chunk; a tiny value (e.g. 1) forces a MULTI-chunk transfer.
+        chunk_bytes: usize,
+        /// When true, assert the leader's snapshot exceeds the chunk size (so the catch-up
+        /// genuinely spans several chunks). Set by the multi-chunk variants; the default
+        /// single-chunk run (chunk size 256 KiB > the tiny config snapshot) leaves it false.
+        expect_multi_chunk: bool,
+        /// When true, the laggard's link is repeatedly RE-PARTITIONED during the catch-up so
+        /// chunks in flight to it are DROPPED and the leader must resume the transfer from the
+        /// last acked offset; then healed for good. Tests dropped / retried chunk handling.
+        lossy_catchup: bool,
+        /// When true, the laggard's volatile receive buffer is DROPPED partway through the
+        /// catch-up (a restart mid-transfer); the leader must restart the transfer from offset 0.
+        restart_mid_transfer: bool,
+    }
+
+    impl Default for SnapshotCatchupOpts {
+        fn default() -> Self {
+            SnapshotCatchupOpts {
+                chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
+                expect_multi_chunk: false,
+                lossy_catchup: false,
+                restart_mid_transfer: false,
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_snapshot_catchup_gate_with(
+        seed: u64,
+        opts: SnapshotCatchupOpts,
+    ) -> Vec<(BTreeMap<u16, String>, u64)> {
         // A small snapshot threshold so the leader compacts after a handful of entries.
+        // PROD-9: the chunk size comes from the opts so the multi-chunk path is exercised.
         let config = RaftConfig {
             snapshot_threshold: 4,
+            snapshot_chunk_bytes: opts.chunk_bytes,
             ..RaftConfig::default()
         };
         let mut cluster = ConfigCluster::new(3, seed, config);
@@ -8929,15 +9363,82 @@ mod tests {
             "seed {seed}: the laggard must trail the leader's committed index while partitioned"
         );
 
-        // HEAL. The leader, seeing the laggard's next_index below its log start, sends an
-        // InstallSnapshot; the laggard installs it and then catches up the tail via AppendEntries.
+        // PROD-9: when a multi-chunk transfer is requested, the leader's snapshot MUST be larger
+        // than the chunk size, so catching up the laggard genuinely takes several chunks (the
+        // multi-chunk path is actually exercised, not just configured). The default single-chunk
+        // run uses a 256 KiB chunk that dwarfs the tiny config snapshot, so it does NOT assert this.
+        if opts.expect_multi_chunk {
+            let snap_len = cluster.snapshot_len(leader);
+            assert!(
+                snap_len > opts.chunk_bytes,
+                "seed {seed}: the leader's snapshot ({snap_len} B) must exceed the chunk size \
+                 ({} B) so the catch-up spans several chunks",
+                opts.chunk_bytes
+            );
+        }
+
+        // HEAL. The leader, seeing the laggard's next_index below its log start, ships its
+        // snapshot in bounded chunks (PROD-9); the laggard reassembles + installs on the final
+        // chunk and then catches up the tail via AppendEntries.
         cluster.net.heal();
+        // PROD-9 DROPPED-CHUNK resilience: apply a per-message loss during the catch-up window.
+        // A lost chunk gets no ack, so the leader retransmits from the last acked offset on its
+        // next heartbeat; a lost ack likewise re-drives the chunk. The follower NEVER installs a
+        // partial (install is gated on the final `done` chunk of a contiguous run), so the only
+        // observable effect of loss is a slower catch-up.
+        if opts.lossy_catchup {
+            // PROD-9 DROPPED-CHUNK resilience, modeled by RE-PARTITIONING the laggard mid-transfer
+            // (rather than a global message drop, which would churn the 3-node election term and
+            // confound the test). Each re-partition DROPS the chunks in flight to the laggard; on
+            // heal the leader RESUMES the transfer from the last acked offset (heartbeat-driven),
+            // re-sending the lost chunk. The leader + the other follower stay a stable quorum
+            // throughout (no election churn), so this isolates the chunk-loss behaviour. The
+            // follower NEVER installs a partial (install is gated on the final `done` chunk of a
+            // contiguous run), which the safety checkers + final convergence pin.
+            for cycle in 0..6 {
+                // Let some chunks flow to the laggard, then yank the link (drop in-flight chunks).
+                cluster.net.heal();
+                cluster.run_steps(700);
+                assert_at_most_one_owner_per_slot(&cluster);
+                assert_3e_invariants(&cluster, &mut epochs);
+                // SAFETY: the laggard never commits past the cluster-wide committed high-water
+                // (a half-received snapshot would jump it past a real committed index).
+                let max_commit = cluster
+                    .ids
+                    .iter()
+                    .map(|&id| cluster.commit_index(id))
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    cluster.commit_index(laggard) <= max_commit,
+                    "seed {seed} cycle {cycle}: the laggard must never commit past the cluster \
+                     high-water (a partial snapshot must never be installed)"
+                );
+                cluster.net.partition(&majority, &minority);
+                cluster.run_steps(700);
+            }
+            // Heal for good so the transfer can finish + the cluster converges.
+            cluster.net.heal();
+        }
+        // PROD-9 RESTART-MID-TRANSFER: drop the laggard's volatile receive buffer partway
+        // through, modeling a crash that loses the in-progress reassembly. The leader's next
+        // non-zero-offset chunk is rejected (the follower replies next_offset == 0), so the
+        // transfer restarts cleanly from offset 0 -- and still converges.
+        if opts.restart_mid_transfer {
+            // Drive a few steps so a transfer is genuinely in flight, then yank the buffer.
+            cluster.run_steps(2_000);
+            cluster.drop_snapshot_rx(laggard);
+        }
         for _ in 0..60 {
             cluster.run_steps(500);
             assert_at_most_one_owner_per_slot(&cluster);
             assert_3e_invariants(&cluster, &mut epochs);
         }
-        cluster.run_until_idle(200_000);
+        // A generous idle budget: a multi-chunk catch-up (tiny chunks) after a lossy / restarted
+        // window takes many round-trips, and a lossy window may have churned the term, so allow
+        // ample steps to settle. Convergence (not just a step count) is what the assertions below
+        // require.
+        cluster.run_until_idle(2_000_000);
         assert_3e_invariants(&cluster, &mut epochs);
         assert_exactly_one_owner_after_convergence(&cluster);
 
@@ -8972,6 +9473,23 @@ mod tests {
             .collect()
     }
 
+    /// Assert every node in a catch-up gate's per-node `(owner-by-slot, epoch)` snapshots
+    /// converged to one identical view (the headline byte-identical-install property). Shared
+    /// by the original gate and the PROD-9 chunked variants.
+    fn assert_catchup_converged(seed: u64, snaps: &[(BTreeMap<u16, String>, u64)]) {
+        let (ref_owner, ref_epoch) = &snaps[0];
+        for (owner, epoch) in snaps {
+            assert_eq!(
+                owner, ref_owner,
+                "seed {seed}: all nodes converge to one slot->owner view after snapshot catch-up"
+            );
+            assert_eq!(
+                epoch, ref_epoch,
+                "seed {seed}: all nodes agree on the config epoch after snapshot catch-up"
+            );
+        }
+    }
+
     #[test]
     fn snapshot_catchup_gate() {
         // THE HA-3c MERGE-BLOCKER, across a seed sweep. For each seed: a leader snapshots +
@@ -8980,18 +9498,63 @@ mod tests {
         // with State-Machine-Safety (no two owners per slot per epoch), Log-Matching (committed
         // prefix agreement), Election-Safety, and epoch monotonicity all held throughout.
         for seed in 0..40u64 {
-            let snaps = run_snapshot_catchup_gate(seed);
-            let (ref_owner, ref_epoch) = &snaps[0];
-            for (owner, epoch) in &snaps {
-                assert_eq!(
-                    owner, ref_owner,
-                    "seed {seed}: all nodes converge to one slot->owner view after snapshot catch-up"
-                );
-                assert_eq!(
-                    epoch, ref_epoch,
-                    "seed {seed}: all nodes agree on the config epoch after snapshot catch-up"
-                );
-            }
+            assert_catchup_converged(seed, &run_snapshot_catchup_gate(seed));
+        }
+    }
+
+    #[test]
+    fn snapshot_catchup_gate_multi_chunk() {
+        // PROD-9: the SAME catch-up, but with a TINY chunk size (1 byte) so the config snapshot
+        // is shipped in MANY bounded InstallSnapshot chunks. The follower reassembles them
+        // contiguously and installs on the final `done` chunk, ending BYTE-IDENTICAL to the
+        // single-chunk install (the gate asserts the snapshot len exceeds the chunk size, so the
+        // multi-chunk path is genuinely exercised). Convergence + every safety checker still hold.
+        for seed in 0..24u64 {
+            let opts = SnapshotCatchupOpts {
+                chunk_bytes: 1,
+                expect_multi_chunk: true,
+                ..SnapshotCatchupOpts::default()
+            };
+            assert_catchup_converged(seed, &run_snapshot_catchup_gate_with(seed, opts));
+        }
+    }
+
+    #[test]
+    fn snapshot_catchup_gate_dropped_chunks() {
+        // PROD-9: a MULTI-chunk catch-up under CHUNK LOSS. The laggard's link is repeatedly
+        // re-partitioned mid-transfer, so chunks in flight to it are DROPPED and the leader must
+        // RESUME the transfer from the last acked offset (heartbeat-driven) -- exercising
+        // retransmit + the duplicate / reordered first-chunk reset paths. The laggard never
+        // installs a partial (install is gated on the final `done` chunk of a contiguous run),
+        // and once the link heals for good the cluster converges to the IDENTICAL state. The
+        // small chunk size keeps the transfer many-chunked so loss genuinely interrupts it.
+        // Asserted over a seed sweep.
+        for seed in 0..24u64 {
+            let opts = SnapshotCatchupOpts {
+                chunk_bytes: 4,
+                expect_multi_chunk: true,
+                lossy_catchup: true,
+                ..SnapshotCatchupOpts::default()
+            };
+            assert_catchup_converged(seed, &run_snapshot_catchup_gate_with(seed, opts));
+        }
+    }
+
+    #[test]
+    fn snapshot_catchup_gate_restart_mid_transfer() {
+        // PROD-9: a MULTI-chunk catch-up where the laggard RESTARTS mid-transfer -- its volatile
+        // receive buffer is dropped partway through. The leader's next non-zero-offset chunk is
+        // rejected (the follower replies next_offset == 0 because it holds no buffer), so the
+        // transfer cleanly RESTARTS from offset 0. No partial is ever installed, and the cluster
+        // still converges to the IDENTICAL state. Asserted across a seed sweep.
+        for seed in 0..24u64 {
+            let opts = SnapshotCatchupOpts {
+                chunk_bytes: 4,
+                expect_multi_chunk: true,
+                restart_mid_transfer: true,
+                ..SnapshotCatchupOpts::default()
+            };
+            assert_catchup_converged(seed, &run_snapshot_catchup_gate_with(seed, opts));
         }
     }
 
@@ -9153,6 +9716,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn install_snapshot_resp_does_not_over_advance_match_index_on_second_compaction() {
         // FIX 2 (Figure 13): the leader advances a follower's match_index from the index
         // the follower ECHOED in its InstallSnapshotResp, NOT from the leader's OWN current
@@ -9247,6 +9811,10 @@ mod tests {
             RaftMsg::InstallSnapshotResp {
                 term: 4,
                 last_included_index: first_k,
+                // PROD-9: the follower INSTALLED the (single-chunk) snapshot, so the leader
+                // advances its markers from the echoed index.
+                installed: true,
+                next_offset: 0,
             },
             &mut out,
         );
@@ -9275,6 +9843,8 @@ mod tests {
             RaftMsg::InstallSnapshotResp {
                 term: 4,
                 last_included_index: 2,
+                installed: true,
+                next_offset: 0,
             },
             &mut out,
         );
@@ -9282,6 +9852,273 @@ mod tests {
             leader.match_index.get(&NodeId(2)).copied(),
             Some(first_k),
             "a reordered older echo (2) must not rewind match_index below 4 (.max guard)"
+        );
+    }
+
+    // -- PROD-9: chunked InstallSnapshot offset/done state machine ---------------
+
+    /// Build a fresh FOLLOWER (NodeId(2)) in a {1,2} cluster at `term`, ready to receive an
+    /// InstallSnapshot from leader NodeId(1). A bare `CountingSm`-backed node: the chunk
+    /// assembly + offset/done logic under test is state-machine-agnostic.
+    fn chunk_rx_follower(term: u64) -> (RaftNode<MemStorage>, Monotonic) {
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        let mut storage = MemStorage::new();
+        storage.set_current_term(term);
+        let mut node = RaftNode::new(NodeId(2), voters, storage, RaftConfig::default());
+        let now = Monotonic::from_since_origin(Duration::ZERO);
+        node.start(now, &mut ZeroRng, &mut Effects::new());
+        (node, now)
+    }
+
+    /// Deliver one InstallSnapshot chunk to a follower and return the single resp it emits
+    /// (term, echoed last_included_index, installed, next_offset). A CountingSm snapshot is an
+    /// opaque blob, so any bytes serve as the snapshot payload.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_chunk(
+        node: &mut RaftNode<MemStorage>,
+        now: Monotonic,
+        term: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+        offset: u64,
+        data: Vec<u8>,
+        done: bool,
+    ) -> (u64, u64, bool, u64) {
+        let mut out = Effects::new();
+        node.on_message(
+            now,
+            &mut ZeroRng,
+            NodeId(1),
+            RaftMsg::InstallSnapshot {
+                term,
+                leader_id: NodeId(1),
+                last_included_index,
+                last_included_term,
+                offset,
+                data,
+                done,
+                voters: BTreeSet::new(),
+                learners: BTreeSet::new(),
+            },
+            &mut out,
+        );
+        out.sends
+            .iter()
+            .find_map(|(_, m)| match m {
+                RaftMsg::InstallSnapshotResp {
+                    term,
+                    last_included_index,
+                    installed,
+                    next_offset,
+                } => Some((*term, *last_included_index, *installed, *next_offset)),
+                _ => None,
+            })
+            .expect("the follower must reply InstallSnapshotResp to a chunk")
+    }
+
+    #[test]
+    fn chunked_install_first_chunk_resets_then_appends_then_installs_on_done() {
+        // A 3-chunk snapshot transfer (bytes [A][B][C], chunk size 1): the first chunk
+        // (offset 0) seeds the buffer, the middle chunk appends at offset 1, and the final
+        // chunk (offset 2, done) installs. Only the LAST reply is `installed`; the earlier two
+        // are progress acks reporting the next expected offset. The installed snapshot is the
+        // concatenation [A][B][C], byte-identical to a single whole-snapshot install.
+        let (mut node, now) = chunk_rx_follower(5);
+        assert!(node.storage().load_snapshot().is_none());
+
+        // offset 0: first chunk, buffer reset + seeded. Not done -> ack next_offset == 1.
+        let (t0, idx0, inst0, next0) = deliver_chunk(&mut node, now, 5, 9, 5, 0, vec![b'A'], false);
+        assert_eq!((t0, idx0, inst0, next0), (5, 9, false, 1));
+        assert!(
+            node.storage().load_snapshot().is_none(),
+            "no install before done"
+        );
+
+        // offset 1: append. Not done -> ack next_offset == 2.
+        let (_, _, inst1, next1) = deliver_chunk(&mut node, now, 5, 9, 5, 1, vec![b'B'], false);
+        assert_eq!((inst1, next1), (false, 2));
+        assert!(node.storage().load_snapshot().is_none(), "still no install");
+
+        // offset 2: final chunk -> install. Reply installed == true, echoing index 9.
+        let (_, idx2, inst2, _) = deliver_chunk(&mut node, now, 5, 9, 5, 2, vec![b'C'], true);
+        assert_eq!((idx2, inst2), (9, true));
+        let (meta, data) = node
+            .storage()
+            .load_snapshot()
+            .expect("the snapshot must be installed on the done chunk");
+        assert_eq!(meta.last_included_index, 9);
+        assert_eq!(meta.last_included_term, 5);
+        assert_eq!(
+            data, b"ABC",
+            "the reassembled bytes are the contiguous concatenation"
+        );
+        assert_eq!(
+            node.commit_index(),
+            9,
+            "commit advances to the installed index"
+        );
+    }
+
+    #[test]
+    fn chunked_install_single_chunk_equals_whole_snapshot() {
+        // FORWARD-COMPAT: a single chunk at offset 0 with done == true installs the whole
+        // snapshot in one message (byte-equivalent to the pre-PROD-9 whole-snapshot install).
+        let (mut node, now) = chunk_rx_follower(7);
+        let (_, idx, installed, _) =
+            deliver_chunk(&mut node, now, 7, 3, 7, 0, b"whole-snapshot".to_vec(), true);
+        assert_eq!((idx, installed), (3, true));
+        let (meta, data) = node
+            .storage()
+            .load_snapshot()
+            .expect("installed in one chunk");
+        assert_eq!(meta.last_included_index, 3);
+        assert_eq!(data, b"whole-snapshot");
+    }
+
+    #[test]
+    fn chunked_install_out_of_order_chunk_is_rejected_and_steers_offset() {
+        // After offset 0 is buffered (length 1), a chunk arriving at the WRONG offset (offset 5,
+        // a gap) is REJECTED: no install, the buffer is untouched, and the reply steers the
+        // leader back to the offset actually expected (1). A DUPLICATE of offset 0 (re-seed) is
+        // accepted (a fresh first chunk always restarts), but a stale GAP never corrupts the
+        // buffer.
+        let (mut node, now) = chunk_rx_follower(5);
+        let (_, _, _, next0) = deliver_chunk(&mut node, now, 5, 9, 5, 0, vec![b'A'], false);
+        assert_eq!(next0, 1);
+
+        // A gap chunk at offset 5 (we only hold 1 byte): rejected, steer back to 1.
+        let (_, _, inst_gap, next_gap) =
+            deliver_chunk(&mut node, now, 5, 9, 5, 5, vec![b'Z'], false);
+        assert_eq!(
+            (inst_gap, next_gap),
+            (false, 1),
+            "an out-of-order chunk is rejected and the reply asks for the expected offset"
+        );
+        assert!(node.storage().load_snapshot().is_none());
+
+        // The correct offset-1 chunk now resumes cleanly to a done install.
+        let (_, _, _, next1) = deliver_chunk(&mut node, now, 5, 9, 5, 1, vec![b'B'], false);
+        assert_eq!(next1, 2);
+        let (_, _, inst2, _) = deliver_chunk(&mut node, now, 5, 9, 5, 2, vec![b'C'], true);
+        assert!(
+            inst2,
+            "the transfer completes after the gap was rejected + retried"
+        );
+        assert_eq!(node.storage().load_snapshot().unwrap().1, b"ABC");
+    }
+
+    #[test]
+    fn chunked_install_duplicate_first_chunk_restarts_cleanly() {
+        // A DUPLICATED / re-sent first chunk (offset 0) always restarts the buffer, so a
+        // retransmit after a lost ack does not splice bytes. Send offset 0 twice, then finish.
+        let (mut node, now) = chunk_rx_follower(5);
+        deliver_chunk(&mut node, now, 5, 9, 5, 0, vec![b'A'], false);
+        // A second offset-0 chunk (a retransmit) resets the buffer to just [A] again.
+        let (_, _, _, next_dup) = deliver_chunk(&mut node, now, 5, 9, 5, 0, vec![b'A'], false);
+        assert_eq!(
+            next_dup, 1,
+            "the re-sent first chunk restarts at length 1, not 2"
+        );
+        let (_, _, _, _) = deliver_chunk(&mut node, now, 5, 9, 5, 1, vec![b'B'], true);
+        assert_eq!(
+            node.storage().load_snapshot().unwrap().1,
+            b"AB",
+            "the duplicate did not double the first chunk's bytes"
+        );
+    }
+
+    #[test]
+    fn chunked_install_stale_term_chunk_is_rejected_without_buffering() {
+        // A chunk from a STALE-TERM leader (term below ours) is rejected: no install, no buffer,
+        // and the reply carries OUR higher term (so the stale leader steps down) + installed
+        // false. We never start a transfer for a leader we have already moved past.
+        let (mut node, now) = chunk_rx_follower(9);
+        let (resp_term, _, installed, next) =
+            deliver_chunk(&mut node, now, 4, 100, 4, 0, vec![b'X'], true);
+        assert_eq!(resp_term, 9, "the reply carries our higher term");
+        assert!(!installed, "a stale-term snapshot is never installed");
+        assert_eq!(next, 0);
+        assert!(
+            node.storage().load_snapshot().is_none(),
+            "no snapshot is persisted from a stale-term leader"
+        );
+    }
+
+    #[test]
+    fn leader_slices_snapshot_into_bounded_chunks() {
+        // PROD-9 LEADER SLICING: a single-voter leader with a snapshot larger than the chunk
+        // size, asked to catch up a lagging peer, emits the FIRST bounded chunk (offset 0,
+        // data.len() == chunk size, done == false). The chunk is strictly under the bus frame
+        // bound, and a follow-up resp advances to the next chunk.
+        let voters: BTreeSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+        let mut storage = MemStorage::new();
+        storage.set_current_term(3);
+        // A snapshot of 10 bytes; chunk size 4 -> chunks of [4,4,2].
+        storage.save_snapshot(
+            SnapshotMeta {
+                last_included_index: 6,
+                last_included_term: 3,
+            },
+            b"0123456789",
+        );
+        storage.compact_to(6);
+        let config = RaftConfig {
+            snapshot_chunk_bytes: 4,
+            ..RaftConfig::default()
+        };
+        let mut leader = RaftNode::new(NodeId(1), voters, storage, config);
+        leader.role = Role::Leader;
+        leader.next_index.insert(NodeId(2), 1); // below the snapshot -> InstallSnapshot path
+        leader.match_index.insert(NodeId(2), 0);
+
+        let mut out = Effects::new();
+        leader.send_append_entries_to(NodeId(2), &mut out);
+        let (offset, len, done) = out
+            .sends
+            .iter()
+            .find_map(|(to, m)| match m {
+                RaftMsg::InstallSnapshot {
+                    offset, data, done, ..
+                } if *to == NodeId(2) => Some((*offset, data.len(), *done)),
+                _ => None,
+            })
+            .expect("the leader must ship a chunked InstallSnapshot");
+        assert_eq!(offset, 0, "the first chunk starts at offset 0");
+        assert_eq!(len, 4, "the chunk is bounded by snapshot_chunk_bytes (4)");
+        assert!(
+            !done,
+            "a 10-byte snapshot at chunk size 4 is not done on the first chunk"
+        );
+        // The chunk size (and thus every chunk) is bounded by the config knob, which production
+        // sets well under the cluster-bus frame bound; the adapter codec asserts the frame-bound
+        // relationship directly (the engine stays pure and never imports the runtime constant).
+        assert!(
+            len <= config.snapshot_chunk_bytes,
+            "each chunk is bounded by the chunk size"
+        );
+
+        // The leader tracks per-follower progress; an ack at offset 4 ships the next chunk.
+        let mut out2 = Effects::new();
+        leader.on_message(
+            Monotonic::from_since_origin(Duration::ZERO),
+            &mut ZeroRng,
+            NodeId(2),
+            RaftMsg::InstallSnapshotResp {
+                term: 3,
+                last_included_index: 6,
+                installed: false,
+                next_offset: 4,
+            },
+            &mut out2,
+        );
+        let next_offset = out2.sends.iter().find_map(|(to, m)| match m {
+            RaftMsg::InstallSnapshot { offset, .. } if *to == NodeId(2) => Some(*offset),
+            _ => None,
+        });
+        assert_eq!(
+            next_offset,
+            Some(4),
+            "the next chunk continues from the acked offset"
         );
     }
 }

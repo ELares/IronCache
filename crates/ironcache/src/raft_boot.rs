@@ -422,9 +422,12 @@ fn spawn_control_plane_inner(
     // The PRODUCTION RaftConfig: the engine's own default `snapshot_threshold` is 0 (compaction
     // OFF, so the determinism sweep + direct-`RaftConfig` tests stay byte-identical), but a real
     // raft-mode deployment must compact (HA-3c), so override it with the configured
-    // `raft_snapshot_threshold` (default 1024, non-zero). Everything else stays the engine default.
+    // `raft_snapshot_threshold` (default 1024, non-zero). PROD-9: the chunked-InstallSnapshot
+    // chunk size comes from `raft_snapshot_chunk_bytes` (default 256 KiB, well under the bus
+    // frame bound). Everything else stays the engine default.
     let raft_config = RaftConfig {
         snapshot_threshold: config.raft_snapshot_threshold,
+        snapshot_chunk_bytes: config.raft_snapshot_chunk_bytes,
         ..RaftConfig::default()
     };
 
