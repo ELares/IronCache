@@ -3530,20 +3530,27 @@ async fn try_raft_cluster_mutator(
         ) {
             // No leader reachable (no leader recognized, or a forward to the leader timed out;
             // with HA-9 forwarding a follower normally COMMITS transparently, so this is the
-            // genuine no-leader / timeout case). Include the leader hint when known. NOTE the hint
-            // is the leader's CLUSTER-BUS endpoint (host:port+10000), not its client port, so the
-            // message labels it as such rather than presenting it as a dial-able client target;
-            // resolving the leader's client endpoint here is a tracked follow-up.
-            let msg = match handle.leader_hint() {
-                Some(addr) => {
-                    format!(
-                        "the raft leader's cluster-bus endpoint is {addr}; retry the CLUSTER write against the leader"
-                    )
-                }
-                None => {
-                    "this node is not the raft leader; retry the CLUSTER write against the leader"
+            // genuine no-leader / timeout case). PROD-9: resolve the leader's ADVERTISED CLIENT
+            // endpoint (the SAME host:port `CLUSTER SHARDS` reports, dial-able by an operator) from
+            // the raft `leader_id` via the committed slot map, so the redirect NAMES where to reissue
+            // -- not the cluster-bus port (which is not a client target). Distinct messages for the
+            // resolvable-client, unresolvable-but-known-id (degrade), and no-leader-elected cases.
+            let msg = match ironcache_server::resolve_leader_hint(ctx) {
+                // SelfIsLeader is unreachable here (a self-leader commits rather than redirecting),
+                // but fold it into the no-leader retry text rather than panicking on an impossible
+                // state: if we somehow got NotLeader while believing we are the leader, a retry is
+                // the safe answer.
+                ironcache_server::LeaderHint::SelfIsLeader
+                | ironcache_server::LeaderHint::NoLeader => {
+                    "NOTLEADER no leader is currently elected; retry the CLUSTER write once a leader is elected"
                         .to_owned()
                 }
+                ironcache_server::LeaderHint::Client(addr) => format!(
+                    "NOTLEADER the current raft leader is {addr}; reissue the CLUSTER write there"
+                ),
+                ironcache_server::LeaderHint::NodeId(id) => format!(
+                    "NOTLEADER this node is not the raft leader; the leader is raft node {id} (its client address is not yet known here); retry the CLUSTER write against the leader"
+                ),
             };
             encode_into(out, &Value::error(ErrorReply::clusterdown(msg)), conn.proto);
             return Some(false);

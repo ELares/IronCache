@@ -124,6 +124,90 @@ pub fn cmd_cluster(ctx: &ServerContext, req: &Request) -> Value {
     }
 }
 
+/// The resolved leadership picture for a raft-LEADER-only operation issued on this node
+/// (PROD-9 leader-hint). The serve-layer CLUSTER mutator (a raft propose) renders this into a
+/// NOTLEADER error so an operator who hit a FOLLOWER knows WHERE to retry; the CLUSTER
+/// introspection projections use the resolved leader to mark the leader / role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaderHint {
+    /// THIS node is the recognized leader, so a leader-only op proceeds here (no redirect). The
+    /// single-node / no-raft case also resolves here: there is exactly one node, its own leader.
+    SelfIsLeader,
+    /// A PEER is the leader and its advertised CLIENT `host:port` resolved from the committed slot
+    /// map (the SAME advertised endpoint `CLUSTER SHARDS` / `CLUSTER SLOTS` report). The operator
+    /// reissues the leader-only op there.
+    Client(String),
+    /// A peer is the leader but its advertised client endpoint is NOT resolvable from the slot map
+    /// (a leader known to raft but not yet present in this node's committed node table). Degrade to
+    /// naming the leader's 40-hex announce node-id so the operator can still identify it.
+    NodeId(String),
+    /// NO leader is currently recognized (a forming cluster / an in-progress election). The operator
+    /// retries after one is elected.
+    NoLeader,
+}
+
+/// Resolve which node is the raft LEADER for a leader-only op issued here (PROD-9). Reads the
+/// leader the raft handle recognizes (the watched `leader_id`, a cheap non-blocking status read --
+/// no new cross-shard race, the determinism seam is respected: the pure engine stays pure and this
+/// resolution lives in the adapter layer) and maps it to the leader's ADVERTISED CLIENT endpoint
+/// via the committed slot map (`ctx.cluster`), the SAME announce-id -> client host:port mapping
+/// `CLUSTER SHARDS` projects.
+///
+/// * NO raft handle (single-node / non-raft mode) -> [`LeaderHint::SelfIsLeader`]: there is exactly
+///   one node, its own leader, so a leader-only op just succeeds (byte-identical default).
+/// * the handle recognizes SELF as leader -> [`LeaderHint::SelfIsLeader`].
+/// * a PEER is leader and its announce id is in the committed node table -> [`LeaderHint::Client`]
+///   with that node's advertised `host:port`.
+/// * a peer is leader but NOT in the committed table -> [`LeaderHint::NodeId`] (degrade to the
+///   leader's announce id).
+/// * no leader recognized -> [`LeaderHint::NoLeader`].
+#[must_use]
+pub fn resolve_leader_hint(ctx: &ServerContext) -> LeaderHint {
+    // No raft control plane (single-node / static mode): this node is its own leader.
+    let Some(raft) = ctx.raft.as_ref() else {
+        return LeaderHint::SelfIsLeader;
+    };
+    // The leader the engine recognizes; `None` is a forming cluster / in-progress election.
+    let Some(leader) = raft.leader_id() else {
+        return LeaderHint::NoLeader;
+    };
+    // This node IS the leader -> the leader-only op proceeds here.
+    if leader == raft.node_id() {
+        return LeaderHint::SelfIsLeader;
+    }
+    // A PEER is the leader: resolve its ADVERTISED CLIENT endpoint from the committed slot map,
+    // matching the leader's announce id back to its `NodeId` with the SAME derivation the boot
+    // wiring used (`ironcache_raft_net::node_id_from_announce`), so the leader_id always maps to the
+    // node whose first 16 hex announce digits equal it. This is the exact host:port `CLUSTER SHARDS`
+    // would report for that node.
+    if let Some(map) = ctx.cluster.as_deref() {
+        for n in map.nodes() {
+            if ironcache_raft_net::node_id_from_announce(&n.id) == leader {
+                return LeaderHint::Client(format!("{}:{}", n.host, n.port));
+            }
+        }
+    }
+    // The leader is known to raft but its client endpoint is not resolvable (it is not yet in this
+    // node's committed table): degrade to naming the leader's announce node-id.
+    LeaderHint::NodeId(format!("{}", leader.0))
+}
+
+/// The 40-hex announce id of the node THIS node recognizes as the raft leader, resolved from the
+/// committed slot map (PROD-9), or `None` when there is no raft handle / no leader recognized / the
+/// leader is not in the committed node table. Used by the CLUSTER introspection projections to mark
+/// which table entry is the raft leader WITHOUT a trial-and-error redirect. Self-as-leader resolves
+/// to self's announce id (the introspection then flags self as the leader).
+#[must_use]
+fn leader_announce_id(ctx: &ServerContext) -> Option<String> {
+    let raft = ctx.raft.as_ref()?;
+    let leader = raft.leader_id()?;
+    let map = ctx.cluster.as_deref()?;
+    map.nodes()
+        .into_iter()
+        .find(|n| ironcache_raft_net::node_id_from_announce(&n.id) == leader)
+        .map(|n| n.id.to_string())
+}
+
 /// The `Some(map)` slot map for a mutator subcommand, or the documented not-supported error
 /// when there is no map (a defensive fallback; the slice-3 boot wiring always supplies a map
 /// for a cluster-enabled node).
@@ -542,6 +626,11 @@ fn cluster_myid(ctx: &ServerContext, req: &Request) -> Value {
 /// `current_epoch()` / `my_epoch()`. Message counters are zero (no gossip yet). Redis replies
 /// CLUSTER INFO via `addReplyVerbatim(..., "txt")`, so this is a `VerbatimString` (it degrades to a
 /// bulk string under RESP2 automatically).
+///
+/// PROD-9: in RAFT mode an EXTRA `cluster_raft_leader:<announce-id>` line is appended naming the node
+/// THIS node recognizes as the raft leader (or `cluster_raft_leader:none` while an election is in
+/// progress), so a client can DISCOVER the leader from INFO. The line is added ONLY when a raft
+/// handle is present; the single-node / static paths keep the byte-identical Redis-parity body.
 fn cluster_info(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("cluster|info"));
@@ -568,7 +657,19 @@ fn cluster_info(ctx: &ServerContext, req: &Request) -> Value {
             my_epoch: 0,
         },
     };
-    verbatim_txt(cluster_info_body(&info).as_bytes())
+    let mut body = cluster_info_body(&info);
+    // PROD-9 raft-leader indicator: only in raft mode (a raft handle is present). The leader's
+    // announce id is resolved from the committed slot map; when the leader is recognized by raft but
+    // not yet in the table (or no leader is elected) the value degrades to `none`.
+    if ctx.raft.is_some() {
+        use std::fmt::Write as _;
+        let leader = leader_announce_id(ctx);
+        let leader_field = leader.as_deref().unwrap_or("none");
+        // `write!` to a String is infallible; ignore the Result (clippy: avoid the extra alloc a
+        // `push_str(&format!(..))` makes).
+        let _ = write!(body, "cluster_raft_leader:{leader_field}\r\n");
+    }
+    verbatim_txt(body.as_bytes())
 }
 
 /// The `CLUSTER INFO` fields that vary between the map-driven and single-node paths.
@@ -583,7 +684,9 @@ struct ClusterInfoFields {
 
 /// Build the `CLUSTER INFO` `field:value` body (each line `\r\n`-terminated) from the resolved
 /// fields, shared by the map-driven and single-node paths. The message counters are zero (no
-/// gossip yet); `cluster_state` is `ok` iff every slot is assigned.
+/// gossip yet); `cluster_state` is `ok` iff every slot is assigned. The optional PROD-9
+/// `cluster_raft_leader` line (raft mode only) is appended by the caller AFTER this Redis-parity
+/// body, so this function stays byte-exact to Redis.
 fn cluster_info_body(f: &ClusterInfoFields) -> String {
     let state = if f.state_ok { "ok" } else { "fail" };
     let slots_assigned = f.slots_assigned;
@@ -928,6 +1031,11 @@ fn shard_node_map(host: &str, port: u16, id: &str) -> Value {
 /// self is `myself,master`, `connected`, owning the whole slot space (single-node cluster,
 /// slice-1 simplification). Redis replies CLUSTER NODES via `addReplyVerbatim(..., "txt")`,
 /// so this is a `VerbatimString` (it degrades to a bulk string under RESP2 automatically).
+///
+/// PROD-9: in RAFT mode, the node THIS node recognizes as the raft LEADER gets an extra `,leader`
+/// flag (e.g. `myself,master,leader` / `master,leader`) so a client can DISCOVER the leader from the
+/// introspection without trial-and-error. The flag is ADDED only when a raft leader is recognized
+/// and resolves to a table node; the single-node / static / no-leader paths are byte-identical.
 fn cluster_nodes(ctx: &ServerContext, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("cluster|nodes"));
@@ -942,12 +1050,18 @@ fn cluster_nodes(ctx: &ServerContext, req: &Request) -> Value {
     let ranges = map.ranges();
     let nodes = map.nodes();
     let self_id = map.me().id;
+    // The raft leader's announce id (PROD-9), if a leader is recognized and is in the table; the
+    // node with this id gets the extra `,leader` flag. `None` outside raft mode / when no leader is
+    // recognized, so those paths keep the byte-identical flags.
+    let leader_id = leader_announce_id(ctx);
     let mut text = String::new();
     for (node_idx, n) in nodes.iter().enumerate() {
-        let flags = if n.id == self_id {
-            "myself,master"
-        } else {
-            "master"
+        let is_leader = leader_id.as_deref() == Some(n.id.as_ref());
+        let flags = match (n.id == self_id, is_leader) {
+            (true, true) => "myself,master,leader",
+            (true, false) => "myself,master",
+            (false, true) => "master,leader",
+            (false, false) => "master",
         };
         let owned: Vec<String> = ranges
             .iter()
@@ -2379,5 +2493,159 @@ mod tests {
             "node1 sees ONLY its own range, not node2's (no sync in slice 3a)"
         );
         // SLICE 3b will flip this to a positive assertion (both ranges visible on each node).
+    }
+
+    // ----- PROD-9: leader-hint resolution + CLUSTER introspection leader marking -----
+
+    use ironcache_raft_net::{NodeId, RaftHandle};
+
+    /// The derived raft `NodeId` for each test announce id (the top 16 hex digits as a u64).
+    const NODE_ID0: NodeId = NodeId(0x0000_0000_0000_0000);
+    const NODE_ID1: NodeId = NodeId(0x1111_1111_1111_1111);
+    const NODE_ID2: NodeId = NodeId(0x2222_2222_2222_2222);
+
+    /// The 3-node map ctx (self = ID1) WITH a raft handle whose self id is ID1 and whose recognized
+    /// leader is `leader`. Used to exercise the leader-hint resolution + the introspection marking.
+    fn ctx_map_with_raft(leader: Option<NodeId>) -> ServerContext {
+        let mut ctx = ctx_with_map();
+        ctx.raft = Some(RaftHandle::for_test(NODE_ID1, leader));
+        ctx
+    }
+
+    #[test]
+    fn leader_hint_resolves_a_peer_leaders_client_endpoint() {
+        // Self is ID1; the leader is the PEER ID2 -> the hint NAMES ID2's advertised CLIENT
+        // endpoint (10.0.0.12:7002), the SAME host:port CLUSTER SHARDS/SLOTS report -- NOT the
+        // cluster-bus port.
+        let ctx = ctx_map_with_raft(Some(NODE_ID2));
+        assert_eq!(
+            resolve_leader_hint(&ctx),
+            LeaderHint::Client("10.0.0.12:7002".to_owned())
+        );
+    }
+
+    #[test]
+    fn leader_hint_self_is_leader_when_this_node_leads() {
+        // Self (ID1) is the recognized leader -> the leader-only op proceeds here (no redirect).
+        let ctx = ctx_map_with_raft(Some(NODE_ID1));
+        assert_eq!(resolve_leader_hint(&ctx), LeaderHint::SelfIsLeader);
+    }
+
+    #[test]
+    fn leader_hint_no_leader_when_none_recognized() {
+        // No leader recognized (an in-progress election) -> the distinct no-leader case.
+        let ctx = ctx_map_with_raft(None);
+        assert_eq!(resolve_leader_hint(&ctx), LeaderHint::NoLeader);
+    }
+
+    #[test]
+    fn leader_hint_degrades_to_node_id_when_client_endpoint_unresolvable() {
+        // The leader is a raft node NOT present in this node's committed slot map (e.g. a runtime
+        // joiner whose table entry has not yet committed here) -> degrade to naming the leader's
+        // raft node id rather than inventing an address.
+        let unknown = NodeId(0x9999_9999_9999_9999);
+        let ctx = ctx_map_with_raft(Some(unknown));
+        assert_eq!(
+            resolve_leader_hint(&ctx),
+            LeaderHint::NodeId(format!("{}", unknown.0))
+        );
+    }
+
+    #[test]
+    fn leader_hint_single_node_no_raft_is_self_leader() {
+        // No raft handle (single-node / static mode): this node is its own leader, so a leader-only
+        // op just succeeds (no hint). Byte-identical default path.
+        let ctx = enabled(7000);
+        assert_eq!(resolve_leader_hint(&ctx), LeaderHint::SelfIsLeader);
+    }
+
+    #[test]
+    fn nodes_marks_the_raft_leader_with_the_leader_flag() {
+        // The PEER ID0 is the leader -> its NODES line carries `master,leader`; self (ID1) stays
+        // `myself,master` (it is not the leader); ID2 stays plain `master`.
+        let ctx = ctx_map_with_raft(Some(NODE_ID0));
+        let body = text_body(&run(&ctx, &[b"CLUSTER", b"NODES"]));
+        let line0 = body
+            .lines()
+            .find(|l| l.starts_with(MAP_ID0))
+            .expect("the ID0 line");
+        assert!(line0.contains(" master,leader "), "got {line0}");
+        let self_line = body
+            .lines()
+            .find(|l| l.starts_with(MAP_ID1))
+            .expect("the self line");
+        assert!(self_line.contains("myself,master"), "got {self_line}");
+        assert!(
+            !self_line.contains("leader"),
+            "self is not leader: {self_line}"
+        );
+        let line2 = body
+            .lines()
+            .find(|l| l.starts_with(MAP_ID2))
+            .expect("the ID2 line");
+        assert!(line2.contains(" master - "), "got {line2}");
+        assert!(!line2.contains("leader"), "ID2 is not leader: {line2}");
+    }
+
+    #[test]
+    fn nodes_marks_self_as_leader_when_this_node_leads() {
+        // Self (ID1) is the leader -> its line is `myself,master,leader`.
+        let ctx = ctx_map_with_raft(Some(NODE_ID1));
+        let body = text_body(&run(&ctx, &[b"CLUSTER", b"NODES"]));
+        let self_line = body
+            .lines()
+            .find(|l| l.starts_with(MAP_ID1))
+            .expect("the self line");
+        assert!(
+            self_line.contains("myself,master,leader"),
+            "got {self_line}"
+        );
+    }
+
+    #[test]
+    fn nodes_is_byte_identical_without_a_raft_handle() {
+        // No raft handle: the `,leader` flag is NEVER added (byte-identical to the pre-PROD-9 map
+        // projection); no line carries `leader`.
+        let ctx = ctx_with_map();
+        let body = text_body(&run(&ctx, &[b"CLUSTER", b"NODES"]));
+        assert!(
+            !body.contains("leader"),
+            "no leader flag without raft: {body:?}"
+        );
+    }
+
+    #[test]
+    fn info_reports_the_raft_leader_in_raft_mode() {
+        // In raft mode CLUSTER INFO appends `cluster_raft_leader:<announce-id>` naming the leader
+        // (ID2 here), so a client can DISCOVER the leader from INFO.
+        let ctx = ctx_map_with_raft(Some(NODE_ID2));
+        let body = text_body(&run(&ctx, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            body.contains(&format!("cluster_raft_leader:{MAP_ID2}\r\n")),
+            "got {body:?}"
+        );
+    }
+
+    #[test]
+    fn info_reports_none_when_no_leader_elected_in_raft_mode() {
+        // Raft mode, no leader recognized -> `cluster_raft_leader:none`.
+        let ctx = ctx_map_with_raft(None);
+        let body = text_body(&run(&ctx, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            body.contains("cluster_raft_leader:none\r\n"),
+            "got {body:?}"
+        );
+    }
+
+    #[test]
+    fn info_is_byte_identical_without_a_raft_handle() {
+        // No raft handle: the `cluster_raft_leader` line is NEVER added (byte-identical Redis-parity
+        // body).
+        let ctx = ctx_with_map();
+        let body = text_body(&run(&ctx, &[b"CLUSTER", b"INFO"]));
+        assert!(
+            !body.contains("cluster_raft_leader"),
+            "no raft-leader line without raft: {body:?}"
+        );
     }
 }

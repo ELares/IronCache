@@ -138,22 +138,10 @@ type BootResult = Result<NodeHandle, BootError>;
 /// salted hash so it is still deterministic and total.
 #[must_use]
 pub fn node_id_from_announce(id: &str) -> NodeId {
-    // The common, validated case: a 40-lowercase-hex id. Use the first 16 hex chars as the high
-    // u64. (Using a stable PREFIX rather than a hash keeps the mapping trivially reproducible and,
-    // for the deterministic test ids "0000.."/"1111.."/.., yields the obvious 0x0000.. / 0x1111..)
-    if id.len() >= 16 {
-        if let Ok(v) = u64::from_str_radix(&id[..16], 16) {
-            return NodeId(v);
-        }
-    }
-    // Defensive fallback for a non-hex id: a simple deterministic FNV-1a over the bytes (no time /
-    // entropy, so determinism is preserved). Unreachable for a validated announce id.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in id.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    NodeId(h)
+    // DELEGATE to the single source of truth in `ironcache-raft-net` (the `NodeId` owner): the same
+    // mapping the leader-hint resolution re-derives over the slot-map's announce ids, so a leader
+    // recognized as `NodeId(v)` resolves back to the announce id whose first 16 hex digits are `v`.
+    ironcache_raft_net::node_id_from_announce(id)
 }
 
 /// Map the topology's string ids to stable `NodeId(u64)`s via [`node_id_from_announce`] (HA-4c +

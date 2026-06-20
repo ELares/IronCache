@@ -63,6 +63,15 @@ impl RaftHandle {
         RaftHandle { inner }
     }
 
+    /// Construct a handle with a FIXED node id + recognized leader, for TESTS only (PROD-9): it lets
+    /// a caller unit-test the leader-hint resolution and the CLUSTER introspection leader marking
+    /// without standing up a real raft cluster. Wraps [`NodeHandle::for_test`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(id: NodeId, leader_id: Option<NodeId>) -> Self {
+        RaftHandle::new(NodeHandle::for_test(id, leader_id))
+    }
+
     /// Whether THIS node currently believes it is the Raft leader (a cheap, non-blocking read
     /// of the published status snapshot). A mutator proposes only when this is true; a follower
     /// redirects instead of proposing a doomed entry.
@@ -78,6 +87,18 @@ impl RaftHandle {
     #[must_use]
     pub fn status(&self) -> Status {
         self.inner.status()
+    }
+
+    /// The [`NodeId`] this node currently recognizes as the Raft leader for its term, or `None`
+    /// when no leader is recognized (a forming cluster / in-progress election), a cheap
+    /// non-blocking read of the published status. `Some(self)` on a leader. The serve layer uses
+    /// this to resolve the leader's ADVERTISED CLIENT endpoint (via the slot-map's announce ids) for
+    /// a NOTLEADER hint and to mark the leader in the CLUSTER introspection projections; unlike
+    /// [`leader_hint`](RaftHandle::leader_hint) (the cluster-bus endpoint via the static peer map),
+    /// this exposes the id so the resolution can name the dial-able CLIENT address an operator uses.
+    #[must_use]
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.inner.status().leader_id
     }
 
     /// A best-effort leader HINT for a redirect reply, as a `host:port` string, or `None` when
