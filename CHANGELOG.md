@@ -97,4 +97,32 @@ release.
 
 ### Fixed
 
+- Cross-shard atomicity for spanning multi-key + move commands (PROD-9): a SILENT
+  partial-apply safety bug. On a multi-shard node (the default; shards == cores) a
+  2-key src/dst command (RENAME/RENAMENX/COPY/SMOVE/LMOVE/RPOPLPUSH) or a strided
+  multi-key command (MSETNX/LMPOP/ZMPOP) whose keys hashed to DIFFERENT internal
+  shards used to fall through to the HOME shard and operate on ONLY the home-owned
+  subset of the keys, applying a PARTIAL result SILENTLY (a spanning RENAME saw a
+  sibling-shard `src` as absent and errored, or wrote `dst` onto the wrong shard --
+  a silent lost write; a spanning MSETNX checked + set only the home keys and
+  misreported its 1/0). The fix ends every silent partial: SMOVE / LMOVE /
+  RPOPLPUSH and MSETNX now apply ATOMICALLY across the owner shards (a home-core
+  gather + validate-then-commit, each sub-op a single deadlock-free deterministic
+  hop -- the element/member is held on the home core between the source read and
+  the dest write so it can never be lost, and MSETNX scans every key's existence
+  before any write); RENAME / RENAMENX / COPY / LMPOP / ZMPOP / SORT...STORE (which
+  need a value-object cross-shard transfer the engine does not expose yet) now
+  FAIL-LOUD with a clear error naming the hash-tag co-location remedy instead of
+  silently partial-applying. Co-located (same-shard) and `shards == 1` invocations
+  are byte-identical to the single-shard handler. Cross-shard MULTI/EXEC + WATCH
+  were already fail-loud (the existing in-MULTI cross-shard + WATCH guards), so no
+  silent transaction partial remained. Documented residual divergences from
+  single-node Redis (no data loss, narrower than the silent partial they replace):
+  a spanning move has a brief transient-visibility window (SMOVE: member momentarily
+  in both sets; LMOVE/RPOPLPUSH: element momentarily in neither) but never loses an
+  element; if the source-remove hop fails after the dest-add committed, SMOVE now
+  compensates (removes from dest) and surfaces the error rather than reporting a
+  clean move; and spanning MSETNX has a check-then-write window (a key created
+  concurrently between the existence scan and the writes is overwritten) -- use a
+  hash tag to co-locate keys for strict single-shard atomicity.
 - Removed or relinked broken citations in issue bodies (#83, #88, #97).
