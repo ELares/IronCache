@@ -17,6 +17,7 @@ pub mod acl;
 pub mod admission;
 pub mod cmd_acl;
 pub mod cmd_bitmap;
+pub mod cmd_block;
 pub mod cmd_cluster;
 pub mod cmd_config;
 pub mod cmd_expire;
@@ -48,6 +49,16 @@ pub use acl::{AclParseError, AclResolution, AclState, Category, DEFAULT_USER, Us
 pub use cmd_acl::{AclSideEffect, dispatch_acl};
 
 pub use admission::is_denyoom;
+// The BLOCKING command family (PROD-9): the serve layer parses a blocking command into a
+// [`cmd_block::BlockSpec`] (timeout + keys + op), ATTEMPTS the non-blocking op via
+// [`cmd_block::try_block_op`], and PARKS the connection on a per-shard FIFO waiter registry
+// when every key is empty. `is_blocking_command` is the router's interception gate;
+// `wake_keys_for_write` tells the serve layer which destination key(s) a write may have made
+// ready (so it wakes a parked waiter); `block_timeout_reply` is the nil-array timeout reply.
+pub use cmd_block::{
+    BlockOp, BlockSpec, BlockTimeoutMs, block_timeout_reply, cmd_block_nonblocking,
+    is_blocking_command, parse_block, try_block_op, wake_keys_for_write,
+};
 // The PURE set-algebra combiner + its op enum (the single source of truth shared by the
 // single-shard set handlers and the cross-shard coordinator's gather-combine, COORDINATOR.md
 // #107, Stage 2b), and the INTERNAL `__ICSTORESET` dest-write verb token (client-unreachable;
@@ -84,7 +95,7 @@ pub use dispatch::{
     EXPIRE_CYCLE_INTERVAL, MAX_RECLAIM_PER_CALL, MAX_RECLAIM_PER_CYCLE, RollupFn, ServerContext,
     ShutdownMode, acl_enforce, acl_resolve_if_stale, command_allowed_pre_auth, dispatch,
     dispatch_remote_keyed, dispatch_remote_whole_keyspace, dispatch_with_cmd, drain_due_keys,
-    parse_shutdown,
+    in_sync_replica_count, parse_shutdown,
 };
 pub use route::{
     CommandClass, KeySpec, classify, command_keys, owner_shard, owner_shard_set, single_key,

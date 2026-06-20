@@ -1248,6 +1248,61 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: true,
         },
+        // -- BLOCKING list pops (PROD-9). These are SERVE-LAYER routed (intercepted in
+        // `route_and_dispatch` like SUBSCRIBE): they need the per-connection waker + the runtime
+        // timer seam to PARK, which `dispatch_inner` cannot reach, so they have NO dispatch arm and
+        // are ABSENT from `dispatch_arm_names`. They are `AlwaysHome` (the serve layer attempts the
+        // pop on the home shard; the co-located/single-key case is fully supported, multi-shard-
+        // spanning blocking is documented), so they do NOT enter the keyed cluster cross-check. The
+        // registry entry gives them arity validation (queue-time + the serve-layer arity gate) and
+        // `classify` -> AlwaysHome. A WRITE (the pop removes an element); NOT denyoom (a pop frees
+        // memory). The arity mirrors src/commands.def (BLPOP/BRPOP -3, BLMOVE 6, BRPOPLPUSH 4,
+        // BLMPOP -5).
+        b"BLPOP" => &CommandSpec {
+            name: b"BLPOP",
+            arity: Min(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        b"BRPOP" => &CommandSpec {
+            name: b"BRPOP",
+            arity: Min(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        b"BLMOVE" => &CommandSpec {
+            name: b"BLMOVE",
+            arity: Exact(6),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        b"BRPOPLPUSH" => &CommandSpec {
+            name: b"BRPOPLPUSH",
+            arity: Exact(4),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        b"BLMPOP" => &CommandSpec {
+            name: b"BLMPOP",
+            arity: Min(5),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
         // -- Hashes (cmd_hash). --
         b"HSET" => &CommandSpec {
             name: b"HSET",
@@ -1838,6 +1893,52 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             denyoom: false,
             control: false,
             is_write: true,
+        },
+        // -- BLOCKING zset pops (PROD-9). SERVE-LAYER routed exactly like the blocking list pops
+        // above (AlwaysHome, no dispatch arm, absent from `dispatch_arm_names`): the serve layer
+        // attempts the pop on the home shard and PARKS on the per-shard FIFO waiter registry when
+        // every key is empty. A WRITE; NOT denyoom. Arity mirrors src/commands.def (BZPOPMIN/
+        // BZPOPMAX -3, BZMPOP -5).
+        b"BZPOPMIN" => &CommandSpec {
+            name: b"BZPOPMIN",
+            arity: Min(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        b"BZPOPMAX" => &CommandSpec {
+            name: b"BZPOPMAX",
+            arity: Min(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        b"BZMPOP" => &CommandSpec {
+            name: b"BZMPOP",
+            arity: Min(5),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        // WAIT numreplicas timeout (PROD-9): block until at least `numreplicas` replicas have
+        // acknowledged this connection's writes, or `timeout` ms elapse; reply the integer count
+        // of acked replicas. SERVE-LAYER routed (it reads the runtime in-sync replica ack count +
+        // the timer seam, neither in `dispatch_inner`): AlwaysHome, no dispatch arm, no keys (it
+        // touches no keyspace, so NOT a write). Arity 3 (src/commands.def).
+        b"WAIT" => &CommandSpec {
+            name: b"WAIT",
+            arity: Exact(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
         },
         // -- Bitmaps (cmd_bitmap). --
         b"SETBIT" => &CommandSpec {

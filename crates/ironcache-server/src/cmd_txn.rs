@@ -266,6 +266,13 @@ pub(crate) mod tests {
             b"RPOPLPUSH",
             b"LPOS",
             b"LMPOP",
+            // Blocking list pops (PROD-9): the NON-BLOCKING dispatch arm (EXEC-replay / direct
+            // fallback). The LIVE blocking path is intercepted in the serve layer.
+            b"BLPOP",
+            b"BRPOP",
+            b"BLMOVE",
+            b"BRPOPLPUSH",
+            b"BLMPOP",
             // Hashes
             b"HSET",
             b"HMSET",
@@ -334,6 +341,13 @@ pub(crate) mod tests {
             b"ZDIFFSTORE",
             b"ZINTERCARD",
             b"ZMPOP",
+            // Blocking zset pops (PROD-9): the NON-BLOCKING dispatch arm; the LIVE blocking path is
+            // intercepted in the serve layer. WAIT (the replica-ack wait) also lands here -- it has
+            // no key, so it sits with the blocking family rather than a data section.
+            b"BZPOPMIN",
+            b"BZPOPMAX",
+            b"BZMPOP",
+            b"WAIT",
             // Bitmaps
             b"SETBIT",
             b"GETBIT",
@@ -483,6 +497,35 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(cmd)
             );
         }
+        // BLOCKING commands (PROD-9): BLPOP / BRPOP / BLMOVE / BRPOPLPUSH / BLMPOP / BZPOPMIN /
+        // BZPOPMAX / BZMPOP / WAIT have a NON-BLOCKING dispatch arm (the EXEC-replay / direct
+        // fallback that returns nil at once if empty), UNLIKE the pub/sub commands which have NONE.
+        // So they ARE in `dispatch_arm_names` (covered by the set-equality above). The serve layer
+        // ADDITIONALLY intercepts them on the LIVE path (to PARK), but the dispatch arm is the
+        // EXEC-time / fallback semantics. Assert that contract directly: registry-present AND a
+        // dispatch arm.
+        for cmd in [
+            b"BLPOP".as_slice(),
+            b"BRPOP",
+            b"BLMOVE",
+            b"BRPOPLPUSH",
+            b"BLMPOP",
+            b"BZPOPMIN",
+            b"BZPOPMAX",
+            b"BZMPOP",
+            b"WAIT",
+        ] {
+            assert!(
+                crate::command_spec::spec_of(cmd).is_some(),
+                "blocking command {:?} must be in the registry (arity validation)",
+                String::from_utf8_lossy(cmd)
+            );
+            assert!(
+                dispatch_set.contains(cmd),
+                "blocking command {:?} must have a (non-blocking) dispatch arm (EXEC-replay fallback)",
+                String::from_utf8_lossy(cmd)
+            );
+        }
     }
 
     /// SAFETY-NET COUNT GUARD: the single hand-list [`dispatch_arm_names`] still has the
@@ -499,11 +542,13 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            170,
+            179,
             "the dispatch-arm hand-list drifted from the 167 client commands (incl. SAVE/BGSAVE/\
              LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown, + the drop-in\
              compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO, \
-             + the PROD-7 operability trio SLOWLOG/MEMORY/LATENCY) + 3 internal verbs"
+             + the PROD-7 operability trio SLOWLOG/MEMORY/LATENCY, + the PROD-9 blocking family \
+             BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/BZPOPMIN/BZPOPMAX/BZMPOP/WAIT, 9 non-blocking \
+             EXEC-replay arms) + 3 internal verbs"
         );
     }
 

@@ -695,6 +695,31 @@ thread_local! {
     // to every shard, so each shard renders to its own connections from its own table).
     static PUBSUB: RefCell<Option<Rc<RefCell<crate::pubsub::ShardPubSub>>>> =
         const { RefCell::new(None) };
+    // The shard's PER-SHARD BLOCKING-WAITER registry (PROD-9): `(db, key)` -> a FIFO queue of
+    // parked connections. Core-local (per shard, shared-nothing ADR-0002) with NO lock; held as
+    // Rc<RefCell<..>> exactly like PUBSUB/STORE/WHEEL so a connection that PARKS, a pusher that
+    // WAKES a waiter, and the RAII deregister all reach the SAME table on this shard. Created
+    // lazily per shard thread. The only cross-core handle it stores is a `Send` `Arc<Notify>` per
+    // waiter (the connection lives on this shard; the notify is shared so a wake from this shard's
+    // pusher resumes it spin-free).
+    static BLOCKING: RefCell<Option<Rc<RefCell<crate::blocking::ShardBlocking>>>> =
+        const { RefCell::new(None) };
+}
+
+/// The shard's per-shard blocking-waiter registry handle (PROD-9), lazily created on first use
+/// on this shard thread (mirrors [`shard_pubsub`]). A connection PARKS a [`crate::blocking::Waiter`]
+/// here when a blocking pop finds every key empty; a push on this shard WAKES the longest-waiting
+/// waiter. `pub(crate)` so the serve loop's wake path reaches the SAME table connections park into.
+pub(crate) fn shard_blocking() -> Rc<RefCell<crate::blocking::ShardBlocking>> {
+    BLOCKING.with(|cell| {
+        let mut b = cell.borrow_mut();
+        if b.is_none() {
+            *b = Some(Rc::new(RefCell::new(
+                crate::blocking::ShardBlocking::default(),
+            )));
+        }
+        Rc::clone(b.as_ref().unwrap())
+    })
 }
 
 /// Mark THIS shard as a PASSIVE REPLICA (HA-7d, CARRY-FORWARD 2), or clear the mark.
@@ -1237,6 +1262,10 @@ async fn serve_connection(
                     // Route + dispatch one decoded request (COORDINATOR.md #107, Stage 1),
                     // appending its encoded reply to `out`; returns whether to close (QUIT).
                     // Factored out of the serve loop so the connection loop stays small.
+                    // `block_request` (PROD-9) is set by the blocking-command interception when the
+                    // command must PARK; it stays `None` for every non-blocking command (the hot
+                    // path), so this is a single stack `Option` write per command.
+                    let mut block_request: Option<BlockPark> = None;
                     let close = route_and_dispatch(
                         &ctx,
                         &mut conn,
@@ -1252,6 +1281,7 @@ async fn serve_connection(
                         persist.as_ref(),
                         &request,
                         &mut out,
+                        &mut block_request,
                     )
                     .await;
                     // SLOWLOG record (PROD-7): only reached when the SLOWLOG was enabled at the start
@@ -1263,6 +1293,49 @@ async fn serve_connection(
                         record_slow_command(&ctx, &env, &conn, &request, start, slow_threshold);
                     }
                     read_buf.drain(..consumed);
+                    // -- BLOCKING PARK (PROD-9). The blocking-command interception in
+                    // `route_and_dispatch` set `block_request`: the command's non-blocking attempt
+                    // found every key empty (or WAIT's quorum not yet met), so PARK this connection
+                    // here, where the serve loop owns the stream (to observe a peer close), the
+                    // runtime timer (the timeout), and the read buffer (to keep pipelined bytes). The
+                    // park loop FLUSHES any pending pipelined replies in `out` FIRST (FIFO), then
+                    // registers a per-shard FIFO waiter and `select!`s on (the wake / the timeout /
+                    // a peer close), re-attempting the pop on a wake. It returns the close flag.
+                    // `block_request == None` on the hot path (every non-blocking command), so this
+                    // is a single `is_some` check then skipped.
+                    if let Some(park) = block_request {
+                        // Flush the pipelined replies that preceded the blocking command, so a
+                        // blocked client still receives the earlier commands' replies before it
+                        // parks (FIFO, never a blocking command holding up prior replies).
+                        if !out.is_empty() {
+                            match stream.send(std::mem::take(&mut out)).await {
+                                Ok(returned) => out = returned,
+                                Err(_) => break 'conn,
+                            }
+                        }
+                        let park_close = run_block_park(
+                            &mut stream,
+                            &timer_rt,
+                            &ctx,
+                            &conn,
+                            &client_handle,
+                            &env,
+                            &store_rc,
+                            &inbox,
+                            home,
+                            &mut read_buf,
+                            &mut out,
+                            park,
+                        )
+                        .await;
+                        if park_close {
+                            break 'conn;
+                        }
+                        // The park completed (a pop succeeded, or the timeout / quorum reply was
+                        // sent). `out` was flushed inside the park loop, so continue the decode loop
+                        // to process any bytes that arrived while parked (re-decode `read_buf`).
+                        continue;
+                    }
                     if close {
                         // Flush the QUIT reply then close. send returns the owned
                         // buffer (owned-buffer model); we are closing, so the
@@ -2080,6 +2153,19 @@ fn consume_one_shot_asking(cmd_upper: &[u8], conn: &mut ConnState) -> bool {
     }
 }
 
+/// A request to PARK a connection on a blocking command (PROD-9). When [`route_and_dispatch`]
+/// finds a blocking pop's keys all empty (and the connection is NOT in MULTI), it sets the
+/// serve loop's `block_request` out-param to this instead of replying, so the OWNING serve loop
+/// (which holds the stream + the timer + the read buffer) runs the park loop: it registers a
+/// waiter, `select!`s on (the wake / the timeout / a peer close), and on a wake re-attempts the
+/// pop. The spec + db are everything the re-attempt needs; the home shard owns the keys.
+pub(crate) struct BlockPark {
+    /// The parsed blocking command (timeout + keys + op): the re-attempt reuses it.
+    spec: ironcache_server::BlockSpec,
+    /// The connection's selected DB at park time (the re-attempt + the waiter key are db-scoped).
+    db: u32,
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn route_and_dispatch(
     ctx: &ServerContext,
@@ -2096,6 +2182,7 @@ async fn route_and_dispatch(
     persist: Option<&Arc<crate::persist::PersistState>>,
     request: &Request,
     out: &mut Vec<u8>,
+    block_request: &mut Option<BlockPark>,
 ) -> bool {
     let cmd_upper = ascii_upper(request.command());
     let route = route::classify(&cmd_upper);
@@ -2395,6 +2482,47 @@ async fn route_and_dispatch(
     )
     .await
     {
+        return close;
+    }
+
+    // -- BLOCKING-COMMAND SERVE-LAYER INTERCEPTION (PROD-9). BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/
+    // BZPOPMIN/BZPOPMAX/BZMPOP/WAIT are handled HERE (not in `dispatch_inner`) on the LIVE path
+    // because PARKING needs the per-connection waker + the runtime timer seam + the connection's
+    // stream (to observe a peer close while parked), which the serve loop owns. It fires ONLY when
+    // NOT in a MULTI: inside a transaction a blocking command must NOT block (Redis: it QUEUES and
+    // runs NON-BLOCKING at EXEC, returning nil at once if empty), so an in-MULTI blocking command
+    // FALLS THROUGH to `route_in_multi` below -> the dispatch queue gate stages it (+QUEUED), and
+    // EXEC replays it through its NON-BLOCKING dispatch arm. On the live path:
+    //
+    //   * a parse error is replied immediately (no park);
+    //   * a non-blocking ATTEMPT that finds data replies it immediately (the fast path: NO park);
+    //   * an attempt that finds every key empty sets `block_request` and returns -- the OWNING
+    //     serve loop then runs the park loop (register a FIFO waiter, `select!` on wake/timeout/
+    //     close, re-attempt on wake). WAIT sets a `block_request` too (it parks on the replica-ack
+    //     quorum), with NO keys (it touches no keyspace).
+    //
+    // A non-blocking command never enters this block (a single `is_blocking_command` predicate),
+    // so the hot path is byte-unchanged.
+    if !conn.in_multi && ironcache_server::is_blocking_command(&cmd_upper) {
+        let close = handle_blocking_live(
+            ctx,
+            conn,
+            env,
+            store_rc,
+            state_rc,
+            &cmd_upper,
+            request,
+            out,
+            block_request,
+        );
+        // A blocking pop that found data on the FAST path recorded keyspace event(s) (the same
+        // lpop/rpop/zpopmin emit as the non-blocking pop); drain + publish them now, AFTER the
+        // reply is encoded (per-connection FIFO), through the EXISTING Pub/Sub fan-out -- exactly
+        // like the normal home dispatch path. On the PARK path the store was not mutated (no pop),
+        // so the drain is a no-op; the re-attempt in the serve loop's park loop publishes its own
+        // events on a successful wake. The drain short-circuits on an empty buffer, so this is a
+        // single thread-local `is_empty` check when notifications are off.
+        publish_pending_keyspace_events(inbox, home.index).await;
         return close;
     }
 
@@ -2766,6 +2894,21 @@ async fn route_and_dispatch(
         )
     };
 
+    // BLOCKING WAKE (PROD-9): a HOME-shard WRITE that may have ADDED an element to a list/zset
+    // (a push / move-dest / zadd / store-into) WAKES the longest-waiting parked waiter on that
+    // destination key, so a BLPOP/BZPOPMIN/... blocked on the key re-attempts its pop and gets the
+    // pushed element (Redis "serve the longest-waiting blocked client first"). It runs on the
+    // HOME (key-owner) shard, the same shard a co-located blocked client parked on, so the wake +
+    // the park share the one per-shard registry with no cross-shard coordination -- the common
+    // co-located/single-key case is fully covered. A REMOTE write (a cross-shard push to a sibling
+    // shard) wakes a waiter parked on THAT shard via its own drain loop (`run_remote`); a blocking
+    // command whose keys SPAN shards is documented as not awaited cross-shard this pass. The wake
+    // is a single registry probe gated on the command being an element-adding write
+    // (`wake_keys_for_write` returns empty for every read / non-adding command), so the hot path is
+    // a single match + an empty-Vec check. An over-broad wake is SAFE: the woken waiter re-checks
+    // and re-parks if the key is still empty.
+    wake_blocking_waiters_home(conn.db, &cmd_upper, request);
+
     // KEYSPACE NOTIFICATIONS (PROD-8): any HOME-shard mutation in the branches above (the home
     // keyed path, the home SUBSET of a multikey / spanning fan-out, the active TTL drain) recorded
     // its keyspace event(s) into THIS shard's pending buffer DURING dispatch. Drain + PUBLISH them
@@ -2776,6 +2919,34 @@ async fn route_and_dispatch(
     // (a cross-shard write) are drained + published by THAT shard's drain loop (`run_remote`).
     publish_pending_keyspace_events(inbox, home.index).await;
     close
+}
+
+/// WAKE any blocking waiter parked on a key this HOME-shard WRITE may have made ready (PROD-9).
+/// `wake_keys_for_write` returns the destination key(s) of an element-adding command (push / move
+/// dest / zadd / store-into), or an EMPTY vec for every other command -- so on the hot path (reads,
+/// non-adding writes) this is one match + an `is_empty` check and the registry is never touched.
+/// For each ready key it wakes the FRONT (longest-waiting) waiter (Redis fairness); the woken
+/// connection re-attempts its pop. The registry handle is taken + dropped here (cold path).
+fn wake_blocking_waiters_home(db: u32, cmd_upper: &[u8], request: &Request) {
+    let keys = ironcache_server::wake_keys_for_write(cmd_upper, request);
+    if keys.is_empty() {
+        return;
+    }
+    let registry = shard_blocking();
+    let mut reg = registry.borrow_mut();
+    for key in keys {
+        reg.wake_one(db, &key);
+    }
+}
+
+/// WAKE blocking waiters parked on THIS shard for a CROSS-SHARD write that ran here (PROD-9), called
+/// from the coordinator drain loop's `run_remote` path. It uppercases the command itself (the
+/// coordinator carries the raw request) and delegates to the same wake logic as the home path, so a
+/// push that lands on this shard from a writer homed elsewhere still wakes a co-located blocked
+/// client. `pub(crate)` so `crate::coordinator` reaches it on the owner shard thread.
+pub(crate) fn wake_blocking_waiters_for_shard(db: u32, request: &Request) {
+    let cmd_upper = ascii_upper(request.command());
+    wake_blocking_waiters_home(db, &cmd_upper, request);
 }
 
 /// DRAIN this shard's pending keyspace events (PROD-8) and PUBLISH each through the EXISTING
@@ -4067,6 +4238,386 @@ fn route_in_multi(
     handle_request(
         ctx, conn, env, store_rc, wheel_rc, state_rc, request, cmd_upper, out,
     )
+}
+
+/// The LIVE (non-MULTI) blocking-command handler (PROD-9): the FIRST attempt + the park
+/// decision. WAIT is handled inline (it touches no keys); the pop family parses + attempts the
+/// non-blocking op. Returns the connection-close flag (always `false` here -- a blocking command
+/// never closes the connection) and, when the command must PARK, sets `*block_request` to the
+/// [`BlockPark`] the serve loop's park loop consumes.
+///
+/// On the FAST path (data present, or a parse / WRONGTYPE error) it replies immediately and
+/// leaves `block_request` `None`. On the PARK path it leaves `out` EMPTY and sets
+/// `block_request`. The `commands_processed` counter is bumped exactly once (on the immediate
+/// reply OR when the park is set up), matching every other reply path.
+#[allow(clippy::too_many_arguments)]
+fn handle_blocking_live(
+    ctx: &ServerContext,
+    conn: &mut ConnState,
+    env: &Rc<RefCell<SystemEnv>>,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    state_rc: &Rc<RefCell<ShardState>>,
+    cmd_upper: &[u8],
+    request: &Request,
+    out: &mut Vec<u8>,
+    block_request: &mut Option<BlockPark>,
+) -> bool {
+    // WAIT numreplicas timeout (PROD-9): block until at least `numreplicas` replicas have acked,
+    // or `timeout` ms elapse; reply the integer count of in-sync replicas. It touches NO keyspace,
+    // so it has no pop attempt / waiter key. If the quorum is ALREADY met (or numreplicas == 0),
+    // reply the current count immediately; else PARK on the replica-ack count (the serve loop polls
+    // the count under the timer seam).
+    if cmd_upper == b"WAIT" {
+        return handle_wait_live(ctx, conn, state_rc, request, out, block_request);
+    }
+
+    // Parse + ATTEMPT the blocking pop. A parse error replies immediately (no park).
+    let spec = match ironcache_server::parse_block(cmd_upper, request) {
+        Ok(s) => s,
+        Err(e) => {
+            state_rc.borrow_mut().counters.on_command();
+            encode_into(out, &ironcache_server::Value::error(e), conn.proto);
+            return false;
+        }
+    };
+    state_rc.borrow_mut().counters.on_command();
+    let now = UnixMillis(env.borrow().now_unix_millis());
+    let attempt = {
+        let mut store = store_rc.borrow_mut();
+        ironcache_server::try_block_op(&mut *store, conn.db, now, &spec)
+    };
+    // Data present (or a WRONGTYPE error): reply immediately. The store mutation recorded any
+    // keyspace event(s); the caller (`route_and_dispatch`) drains + publishes them right after this
+    // returns (via `publish_pending_keyspace_events`), so a blocking pop fires the same lpop/rpop/
+    // zpopmin notification as the non-blocking pop. Every key empty/absent (`None`): PARK -- leave
+    // `out` empty and set `block_request`; the serve loop runs the park loop (re-attempt on a wake,
+    // or the nil-array on timeout).
+    if let Some(reply) = attempt {
+        encode_into(out, &reply, conn.proto);
+    } else {
+        *block_request = Some(BlockPark { spec, db: conn.db });
+    }
+    false
+}
+
+/// WAIT's LIVE handler (PROD-9): parse `numreplicas` + `timeout`, and either reply the current
+/// in-sync replica count immediately (the quorum is already met, or numreplicas == 0) or PARK on
+/// it. Parking is represented by a `BlockPark` with NO keys and the WAIT op carried via the spec's
+/// `keys`/`op` being unused; the serve loop's WAIT park loop polls the count under the timer seam.
+fn handle_wait_live(
+    ctx: &ServerContext,
+    conn: &mut ConnState,
+    state_rc: &Rc<RefCell<ShardState>>,
+    request: &Request,
+    out: &mut Vec<u8>,
+    block_request: &mut Option<BlockPark>,
+) -> bool {
+    state_rc.borrow_mut().counters.on_command();
+    if request.args.len() != 3 {
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_arity("wait")),
+            conn.proto,
+        );
+        return false;
+    }
+    let (Some(numreplicas), Some(timeout_ms)) = (
+        parse_wait_int(&request.args[1]),
+        parse_wait_int(&request.args[2]),
+    ) else {
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::not_an_integer()),
+            conn.proto,
+        );
+        return false;
+    };
+    if timeout_ms < 0 {
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::err(
+                "timeout is negative",
+            )),
+            conn.proto,
+        );
+        return false;
+    }
+    let current = ironcache_server::in_sync_replica_count(ctx);
+    // The quorum is already met (or 0 requested): reply the count now, no park.
+    if numreplicas <= current {
+        encode_into(out, &ironcache_server::Value::Integer(current), conn.proto);
+        return false;
+    }
+    // PARK: carry the WAIT parameters in a BlockPark. The op + keys are a WAIT marker (no keys);
+    // the serve loop polls the in-sync count vs `numreplicas` under the timer.
+    *block_request = Some(BlockPark {
+        spec: ironcache_server::BlockSpec {
+            timeout_ms: if timeout_ms == 0 {
+                None
+            } else {
+                Some(timeout_ms as u64)
+            },
+            keys: Vec::new(),
+            op: ironcache_server::BlockOp::Wait {
+                numreplicas: numreplicas.max(0) as u64,
+            },
+        },
+        db: conn.db,
+    });
+    false
+}
+
+/// Parse a WAIT integer arg (numreplicas / timeout) the strict Redis way.
+fn parse_wait_int(arg: &[u8]) -> Option<i64> {
+    core::str::from_utf8(arg).ok()?.parse::<i64>().ok()
+}
+
+/// The poll quantum for a WAIT park (PROD-9): how often to re-check the in-sync replica count + a
+/// kill while parked, so an UNPAUSE / a newly-attached replica / a CLIENT KILL is observed
+/// promptly. The pop-park path does NOT poll (it parks spin-free on the waiter `Notify`); only
+/// WAIT polls (its quorum is published by the repl tasks, not via the waiter registry).
+const WAIT_POLL_QUANTUM: core::time::Duration = core::time::Duration::from_millis(50);
+
+/// Run the BLOCKING PARK loop (PROD-9): park this connection until a wake (a push to a waited key
+/// makes it ready), the timeout elapses, the connection is closed/killed, or (for WAIT) the
+/// replica-ack quorum is met. Returns the connection-CLOSE flag (`true` to tear the connection
+/// down: a peer close or an I/O error while parked).
+///
+/// ## Mechanism (the core of PROD-9)
+///
+/// POP PARK (BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/BZPOPMIN/BZPOPMAX/BZMPOP):
+/// 1. Register a per-shard FIFO [`crate::blocking::Waiter`] on EVERY key (the RAII
+///    [`crate::blocking::WaiterGuard`] deregisters on EVERY exit -- success, timeout, close, kill,
+///    or a panic -- so a parked connection never leaks a registry entry and a push never wakes a
+///    gone connection).
+/// 2. `select!` on (the waiter's `Notify` wake / the runtime timer to the deadline / a stream read,
+///    which detects a PEER CLOSE while parked). NO busy-wait: the wake arm parks on the `Notify`.
+/// 3. On a WAKE re-attempt the pop. Success -> encode + flush the reply, drop the guard, return.
+///    Still empty (another waiter raced it, or a spurious wake) -> loop and re-park on the SAME
+///    `Notify` (the guard is held the whole time, so the waiter keeps its FIFO position).
+/// 4. On TIMEOUT -> encode + flush the nil-array reply, drop the guard, return.
+///
+/// WAIT PARK: no waiter (it touches no keys); POLL the in-sync replica count vs `numreplicas` under
+/// a short timer quantum until the quorum is met or the timeout elapses, then reply the count.
+///
+/// A KILL (CLIENT KILL flagged this connection) or a peer close ends the park early.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_block_park(
+    stream: &mut ironcache_runtime::ClientStream,
+    timer_rt: &TokioRuntime,
+    ctx: &ServerContext,
+    conn: &ConnState,
+    client_handle: &std::sync::Arc<ironcache_observe::ClientHandle>,
+    env: &Rc<RefCell<SystemEnv>>,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    inbox: &coordinator::Inbox,
+    home: ShardId,
+    read_buf: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+    park: BlockPark,
+) -> bool {
+    // The absolute DEADLINE (a monotonic instant), or None for "block forever". Computed ONCE from
+    // the Env clock seam (ADR-0003, NOT wall clock) so a re-park after a spurious wake counts the
+    // already-elapsed time toward the same deadline (the timer re-arms with the REMAINING duration).
+    let start = env.borrow().now();
+    let deadline: Option<ironcache_env::Monotonic> = park
+        .spec
+        .timeout_ms
+        .map(|ms| start.saturating_add(core::time::Duration::from_millis(ms)));
+
+    // WAIT parks on the replica-ack quorum, not a key waiter.
+    if let ironcache_server::BlockOp::Wait { numreplicas } = park.spec.op {
+        return wait_park(
+            stream,
+            timer_rt,
+            ctx,
+            conn,
+            client_handle,
+            env,
+            out,
+            numreplicas,
+            deadline,
+        )
+        .await;
+    }
+
+    // POP PARK. Register a FIFO waiter on every key; the guard deregisters on EVERY exit (RAII).
+    let registry = shard_blocking();
+    let (_guard, wake) =
+        crate::blocking::WaiterGuard::park(&registry, park.db, &park.spec.keys, conn.id);
+
+    loop {
+        // A kill observed between iterations ends the park (the reply is abandoned; the connection
+        // is torn down). Cold relaxed load.
+        if client_handle.is_killed() {
+            return true;
+        }
+        // Compute the REMAINING time to the deadline; if already past, treat as a timeout now.
+        let remaining: Option<core::time::Duration> = match deadline {
+            None => None,
+            Some(dl) => {
+                let now = env.borrow().now();
+                if now >= dl {
+                    // Timed out: reply the nil-array and finish.
+                    return flush_block_reply(stream, out, conn.proto, block_timeout_value()).await;
+                }
+                Some(dl.saturating_duration_since(now))
+            }
+        };
+
+        // PARK: select on the wake, the timeout (if any), and a stream read (peer-close detection).
+        // The read is into a FRESH buffer and APPENDED to `read_buf` so a partial frame already in
+        // `read_buf` survives a cancelled read (the same pattern the idle wait uses). NO RefCell
+        // borrow is held across the await.
+        let woken = if let Some(dur) = remaining {
+            tokio::select! {
+                () = wake.notified() => WakeOutcome::Wake,
+                () = timer_rt.timer(dur) => WakeOutcome::Timeout,
+                res = stream.recv(Vec::new()) => match res {
+                    Ok(r) if r.n == 0 => return true, // peer closed while parked
+                    Ok(r) => { read_buf.extend_from_slice(&r.buf[..r.n]); WakeOutcome::Bytes }
+                    Err(_) => return true,
+                },
+            }
+        } else {
+            tokio::select! {
+                () = wake.notified() => WakeOutcome::Wake,
+                res = stream.recv(Vec::new()) => match res {
+                    Ok(r) if r.n == 0 => return true,
+                    Ok(r) => { read_buf.extend_from_slice(&r.buf[..r.n]); WakeOutcome::Bytes }
+                    Err(_) => return true,
+                },
+            }
+        };
+
+        match woken {
+            WakeOutcome::Timeout => {
+                return flush_block_reply(stream, out, conn.proto, block_timeout_value()).await;
+            }
+            // A wake OR new pipelined bytes: RE-ATTEMPT the pop (a push may have made a key ready,
+            // and re-checking on new bytes is harmless -- it just re-reads the store). On success,
+            // reply + publish the keyspace event; on still-empty, loop and re-park.
+            WakeOutcome::Wake | WakeOutcome::Bytes => {
+                let now = UnixMillis(env.borrow().now_unix_millis());
+                let attempt = {
+                    let mut store = store_rc.borrow_mut();
+                    ironcache_server::try_block_op(&mut *store, park.db, now, &park.spec)
+                };
+                if let Some(reply) = attempt {
+                    // A successful blocked pop fires the SAME lpop/rpop/zpopmin keyspace event as a
+                    // non-blocking pop; publish it AFTER the reply is flushed (per-connection FIFO).
+                    let closed = flush_block_reply(stream, out, conn.proto, reply).await;
+                    publish_pending_keyspace_events(inbox, home.index).await;
+                    return closed;
+                }
+                // Still empty: another waiter won the race (or a spurious wake / unrelated bytes).
+                // Loop and re-park on the SAME `Notify` (the guard is held, so the waiter keeps its
+                // FIFO position -- the longest-waiting client is served first on the next push).
+            }
+        }
+    }
+}
+
+/// The outcome of a single park `select!` (PROD-9): which arm fired.
+enum WakeOutcome {
+    /// The waiter `Notify` fired (a push to a waited key): re-attempt the pop.
+    Wake,
+    /// The timeout elapsed: reply the nil-array.
+    Timeout,
+    /// New bytes arrived while parked (a pipelined command): re-attempt (harmless) and keep the
+    /// bytes in `read_buf` for the decode loop to process after the park ends.
+    Bytes,
+}
+
+/// The WAIT park (PROD-9): poll the in-sync replica count vs `numreplicas` under a short timer
+/// quantum until the quorum is met or the deadline elapses, then reply the CURRENT count. A peer
+/// close or a kill ends it early. WAIT touches no keys, so there is no waiter registry entry; the
+/// quorum is published by the repl tasks (a relaxed atomic load), so a poll is the right model.
+#[allow(clippy::too_many_arguments)]
+async fn wait_park(
+    stream: &mut ironcache_runtime::ClientStream,
+    timer_rt: &TokioRuntime,
+    ctx: &ServerContext,
+    conn: &ConnState,
+    client_handle: &std::sync::Arc<ironcache_observe::ClientHandle>,
+    env: &Rc<RefCell<SystemEnv>>,
+    out: &mut Vec<u8>,
+    numreplicas: u64,
+    deadline: Option<ironcache_env::Monotonic>,
+) -> bool {
+    loop {
+        if client_handle.is_killed() {
+            return true;
+        }
+        let current = ironcache_server::in_sync_replica_count(ctx);
+        // Quorum met: reply the count.
+        if current >= 0 && (current as u64) >= numreplicas {
+            return flush_block_reply(
+                stream,
+                out,
+                conn.proto,
+                ironcache_server::Value::Integer(current),
+            )
+            .await;
+        }
+        // Remaining time to the deadline; if past, reply the current count (Redis: WAIT returns the
+        // count it achieved on timeout, typically below `numreplicas`).
+        let wait = match deadline {
+            None => WAIT_POLL_QUANTUM,
+            Some(dl) => {
+                let now = env.borrow().now();
+                if now >= dl {
+                    return flush_block_reply(
+                        stream,
+                        out,
+                        conn.proto,
+                        ironcache_server::Value::Integer(current),
+                    )
+                    .await;
+                }
+                dl.saturating_duration_since(now).min(WAIT_POLL_QUANTUM)
+            }
+        };
+        // Race a short poll quantum against a peer close (so a disconnect ends the wait promptly).
+        tokio::select! {
+            () = timer_rt.timer(wait) => {}
+            res = stream.recv(Vec::new()) => {
+                match res {
+                    Ok(r) if r.n == 0 => return true, // peer closed
+                    // Bytes while parked in WAIT: Redis would not process a new command until WAIT
+                    // returns; we drop them (a rare edge -- a client pipelining behind WAIT). The
+                    // poll loop continues. (Buffering them safely is a documented follow-up.)
+                    Ok(_) => {}
+                    Err(_) => return true,
+                }
+            }
+        }
+    }
+}
+
+/// Encode `reply` into a FRESH `out` and flush it over the stream, returning the connection-CLOSE
+/// flag (`true` on an I/O error). `out` is cleared first (any pipelined replies were already
+/// flushed before the park), so this writes exactly the blocking command's reply.
+async fn flush_block_reply(
+    stream: &mut ironcache_runtime::ClientStream,
+    out: &mut Vec<u8>,
+    proto: ProtoVersion,
+    reply: ironcache_server::Value,
+) -> bool {
+    out.clear();
+    encode_into(out, &reply, proto);
+    match stream.send(std::mem::take(out)).await {
+        Ok(returned) => {
+            *out = returned;
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// The nil-array a blocking pop replies on timeout (Redis NULL ARRAY: RESP2 `*-1`, RESP3 `_`).
+fn block_timeout_value() -> ironcache_server::Value {
+    ironcache_server::block_timeout_reply()
 }
 
 /// Dispatch one request and append its encoded reply to `out`. Returns whether

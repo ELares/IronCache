@@ -256,6 +256,13 @@ pub async fn run_drain_loop(
                     Some(work) => {
                         let reply = run_remote(&ctx, &work.request, work.db);
                         let _ = work.reply.send(reply);
+                        // BLOCKING WAKE (PROD-9): a cross-shard WRITE that ran on THIS shard and may
+                        // have ADDED an element to a list/zset wakes a blocking waiter parked on
+                        // THIS shard's registry (a BLPOP/BZPOPMIN/... blocked on a key whose owner
+                        // is this shard, while the WRITER issued the push from a connection homed on
+                        // a different shard). Cheap: a single match + an empty-Vec check off the hot
+                        // path (`wake_keys_for_write` is empty for every read / non-adding command).
+                        crate::serve::wake_blocking_waiters_for_shard(work.db, &work.request);
                         // KEYSPACE NOTIFICATIONS (PROD-8): a cross-shard keyed write that ran on
                         // THIS shard recorded its keyspace events into this shard's pending buffer;
                         // drain + publish them AFTER the reply is sent. Short-circuits on an empty

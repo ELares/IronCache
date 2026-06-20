@@ -11,6 +11,13 @@
 
 #![forbid(unsafe_code)]
 
+/// BLOCKING-command parking (PROD-9): the per-shard FIFO WAITER REGISTRY a connection parks on
+/// when a blocking list/zset pop (BLPOP/BRPOP/BLMOVE/BLMPOP/BZPOPMIN/BZPOPMAX/BZMPOP) finds every
+/// key empty. A push to a waited key WAKES the longest-waiting waiter (Redis fairness); the woken
+/// connection re-attempts the pop and either succeeds or re-parks. The parse + the non-blocking
+/// ATTEMPT live in `ironcache-server::cmd_block` (runtime-agnostic); the parking + the timer arm +
+/// the registry (which need tokio's `Notify` + the runtime timer seam) live here.
+pub mod blocking;
 pub mod coordinator;
 /// The out-of-band operations HTTP endpoint (OBSERVABILITY.md, #152): a bounded, hand-rolled
 /// tokio HTTP/1.1 responder on `--metrics-addr` serving Prometheus `/metrics`, `/livez`, and
