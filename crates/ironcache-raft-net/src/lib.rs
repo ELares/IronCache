@@ -354,6 +354,16 @@ pub struct NodeHandle {
     /// hostname verbatim. `Arc` because the handle is `Clone` (the listener task and the serve path
     /// each hold one) and the map is immutable after boot.
     addrs: Arc<BTreeMap<NodeId, PeerEndpoint>>,
+    /// The engine's RECOVERED persisted-log last index, sampled ONCE at construction (PROD-turnkey).
+    /// This is a CONSTRUCTION-TIME FACT, NOT the live (growing) log index: a truly fresh node boots
+    /// with an empty persisted log (`0`); a node that RESTARTED onto persisted state recovers a
+    /// non-empty log (`> 0`) even with NO snapshot (the no-snapshot recovery path replays only the
+    /// raft membership, NOT the `ConfigSm` slots/epoch/nodes, so the shared `SlotMap` is transiently
+    /// pristine while the committed config tail is still un-applied). The turnkey driver consults
+    /// THIS immutable fact -- not the volatile shared-map projection -- to decide freshness, so a
+    /// restarted node NEVER re-bootstraps / clobbers runtime slot ownership. Immutable after boot
+    /// (every handle clone reads the same boot-time value).
+    recovered_last_log_index: u64,
 }
 
 impl NodeHandle {
@@ -386,6 +396,21 @@ impl NodeHandle {
     #[doc(hidden)]
     #[must_use]
     pub fn for_test(id: NodeId, leader_id: Option<NodeId>) -> Self {
+        // A fresh test node: an empty recovered persisted log (`0`), matching a truly fresh boot.
+        Self::for_test_recovered(id, leader_id, 0)
+    }
+
+    /// Like [`for_test`](NodeHandle::for_test) but with an explicit RECOVERED persisted-log last
+    /// index (PROD-turnkey), so a test can model a node that RESTARTED onto persisted state (a
+    /// non-zero `recovered_last_log_index`) and assert the turnkey driver refuses to re-bootstrap
+    /// it. `0` is a truly fresh node (the [`for_test`](NodeHandle::for_test) default).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test_recovered(
+        id: NodeId,
+        leader_id: Option<NodeId>,
+        recovered_last_log_index: u64,
+    ) -> Self {
         let (inbox, _inbox_rx) = mpsc::unbounded_channel();
         let status = Status {
             role: if leader_id == Some(id) {
@@ -411,7 +436,19 @@ impl NodeHandle {
             status: status_rx,
             config: config_rx,
             addrs: Arc::new(BTreeMap::new()),
+            recovered_last_log_index,
         }
+    }
+
+    /// The engine's RECOVERED persisted-log last index, sampled ONCE at construction (PROD-turnkey).
+    /// A CONSTRUCTION-TIME FACT (not the live, growing index): `0` for a truly fresh node (empty
+    /// persisted log), `> 0` for a node that RESTARTED onto persisted state -- even with NO snapshot,
+    /// where the no-snapshot recovery path recovers raft membership but does NOT replay the
+    /// `ConfigSm` slots/epoch/nodes, leaving the shared `SlotMap` transiently pristine. The turnkey
+    /// driver reads this to refuse re-bootstrapping a restarted node.
+    #[must_use]
+    pub fn recovered_last_log_index(&self) -> u64 {
+        self.recovered_last_log_index
     }
 
     /// The current leader's cluster-bus `host:port`, resolved from the watched
@@ -700,12 +737,21 @@ where
         // self-leader never redirects. Immutable after boot, shared by Arc with every handle clone.
         let addrs = Arc::new(peers.clone());
 
+        // The engine's RECOVERED persisted-log last index, captured ONCE here at construction
+        // (PROD-turnkey). A read-only call on the recovered engine -- no engine logic / no
+        // determinism change. A truly fresh node has `0` (empty log); a node that RESTARTED onto
+        // persisted state has `> 0` even with NO snapshot. The turnkey driver reads THIS immutable
+        // boot-time fact (not the volatile shared-map projection a no-snapshot restart leaves
+        // pristine) to refuse re-bootstrapping a restarted node.
+        let recovered_last_log_index = raft.storage().last_log_index();
+
         let handle = NodeHandle {
             id,
             inbox: inbox_tx.clone(),
             status: status_rx,
             config: config_rx,
             addrs,
+            recovered_last_log_index,
         };
         let node = RaftClusterBusNode {
             raft,

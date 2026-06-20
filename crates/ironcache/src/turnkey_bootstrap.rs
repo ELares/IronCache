@@ -39,17 +39,35 @@
 //! ## The idempotent + fresh-only guard (CRITICAL)
 //!
 //! A re-bootstrap on a node RESTART would be catastrophic (it would clobber runtime
-//! migrations/rebalances). The guard is therefore HARD: the leader proposes the bootstrap ONLY when
-//! the committed config is EMPTY -- concretely [`is_fresh_committed_config`] requires
-//! `slots_assigned() == 0` AND `known_nodes() <= 1` (only this node's `empty_self` entry) AND
-//! `current_epoch() == 0` (the `ConfigSm` bumps the log-driven epoch once per applied config entry,
-//! and a snapshot RESTORE re-publishes it, so a node that recovered ANY committed config has a
-//! non-zero epoch). The committed bootstrap itself assigns slots + adds nodes + bumps the epoch, so
-//! the guard goes FALSE the instant the bootstrap commits -- the task then exits and never proposes
-//! again. A node that restarts onto persisted committed state recovers a NON-empty config (non-zero
-//! epoch / assigned slots / a full node table), so the guard is false and NO bootstrap is attempted.
-//! This is checked twice: once to keep polling, and again right before proposing (so a peer's
-//! bootstrap that landed between the poll and the propose makes this node stand down).
+//! migrations/rebalances). The guard is therefore HARD and rests on a PERSISTED FACT, not a
+//! volatile projection: the leader proposes the bootstrap ONLY when this node booted with an EMPTY
+//! persisted Raft log AND the committed config it can observe is still empty.
+//!
+//! The persisted-log gate ([`RaftHandle::has_persisted_log`](ironcache_server::RaftHandle::has_persisted_log))
+//! is the load-bearing one. The earlier guard rested SOLELY on the shared-`SlotMap` projection
+//! (`slots_assigned()` / `known_nodes()` / `current_epoch()`), which a node REPUBLISHES only when
+//! its `ConfigSm` applies / restores. On the COMMON no-snapshot restart (the default
+//! `raft_snapshot_threshold` is 1024, and a normally-sized cluster has a handful of log entries, so
+//! it NEVER snapshots), the engine's recovery replays only the raft VOTER/learner membership; it
+//! does NOT replay the committed `Config(ConfigCmd)` tail, so the shared map stays at its pristine
+//! `empty_self` baseline (epoch 0, slots 0, known_nodes 1) until the run loop's `apply_committed`
+//! catches up -- which happens AFTER the handle is returned and AFTER `is_leader()` can become true.
+//! The driver thus had a window where a restarted, previously-migrated node sampled the projection
+//! as FRESH and re-proposed the STATIC topology ABOVE the unapplied recovered tail, silently
+//! reverting every runtime migration / failover when the tail later applied. The persisted-log fact
+//! closes that window: a node that RESTARTED has a non-empty persisted log (`last_log_index > 0`)
+//! captured at construction (BEFORE any apply races), so [`is_fresh_for_bootstrap`] returns false
+//! regardless of the transient projection. A TRULY fresh node boots with an empty persisted log, so
+//! it still bootstraps turnkey.
+//!
+//! The shared-map projection ([`is_fresh_committed_config`]) is kept as a SECONDARY belt: it makes a
+//! node stand down the instant a PEER's bootstrap (or a runtime config) commits into the shared map
+//! WITHIN this process's lifetime (where the persisted-log fact, frozen at boot, would not yet
+//! reflect it). Both must hold to start: empty persisted log AND a fresh projection. The committed
+//! bootstrap itself bumps the epoch / assigns slots, so the projection goes FALSE the instant the
+//! bootstrap commits -- the task then exits and never proposes again. Freshness is RE-SAMPLED every
+//! poll iteration (and again right before proposing), so a config committed by ANOTHER node between
+//! iterations aborts this node's bootstrap.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,6 +102,27 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 #[must_use]
 pub fn is_fresh_committed_config(cluster: &SlotMap) -> bool {
     cluster.slots_assigned() == 0 && cluster.known_nodes() <= 1 && cluster.current_epoch() == 0
+}
+
+/// The ROBUST fresh-only gate the bootstrap driver actually uses (PROD-turnkey): this node may
+/// auto-apply the static topology ONLY when BOTH
+///   * it booted with an EMPTY persisted Raft log (`!raft.has_persisted_log()`) -- the PERSISTED
+///     FACT, captured at construction, that distinguishes a TRULY FRESH node from one that RESTARTED
+///     onto persisted state. Crucially this holds EVEN on the COMMON no-snapshot restart, where the
+///     engine recovers raft membership but does NOT replay the committed `ConfigSm` tail, so the
+///     shared `SlotMap` is transiently pristine and the projection ([`is_fresh_committed_config`])
+///     would FALSE-POSITIVE as fresh; AND
+///   * the shared-map projection is still fresh ([`is_fresh_committed_config`]) -- the SECONDARY
+///     belt that makes this node stand down the instant a PEER's bootstrap (or any runtime config)
+///     commits into the shared map within THIS process's lifetime (which the boot-frozen persisted-
+///     log fact alone would not reflect).
+///
+/// A restarted node has a non-empty persisted log, so it is NEVER fresh here and NEVER re-bootstraps
+/// -- it cannot clobber runtime slot ownership / a migration / a failover. A truly fresh node (empty
+/// log, pristine projection) still bootstraps turnkey.
+#[must_use]
+fn is_fresh_for_bootstrap(cluster: &SlotMap, raft: &RaftHandle) -> bool {
+    !raft.has_persisted_log() && is_fresh_committed_config(cluster)
 }
 
 /// Build the committed-log batch that auto-applies the static `topology` on a fresh cluster: for
@@ -147,14 +186,15 @@ fn expand_ranges(ranges: &[[u16; 2]]) -> Vec<u16> {
 /// host), with the shared committed `cluster` map (== `ctx.cluster`), the `raft` handle, and the
 /// shipped `topology`.
 ///
-/// The task POLLS on a coarse cadence: each tick, if this node is the leader AND the committed
-/// config is still [`fresh`](is_fresh_committed_config), it proposes the
-/// [`topology_bootstrap_cmds`] batch through the unchanged propose path, driving to COMPLETION (all
-/// declared slots assigned). It RETURNS without proposing when the committed config is non-fresh from
-/// the START (a peer leader already bootstrapped, OR this node restarted onto committed state), and
-/// RETURNS once the declared slots are fully assigned. A follower tick is a cheap no-op. The whole
-/// task short-circuits to a no-op when the topology declares no slots at all (nothing to bootstrap).
-/// See [`run_bootstrap_driver`] for the exact two-phase (fresh-start guard, then drive-to-completion)
+/// The task POLLS on a coarse cadence: each tick, if this node is the leader AND it is still
+/// [`fresh-for-bootstrap`](is_fresh_for_bootstrap) (an EMPTY persisted Raft log AND a fresh
+/// shared-map projection), it proposes the [`topology_bootstrap_cmds`] batch through the unchanged
+/// propose path, driving to COMPLETION (all declared slots assigned). It RETURNS without proposing
+/// when the node is non-fresh from the START (this node RESTARTED onto persisted committed state --
+/// including the common no-snapshot restart -- OR a peer leader already bootstrapped), and RETURNS
+/// once the declared slots are fully assigned. A follower tick is a cheap no-op. The whole task
+/// short-circuits to a no-op when the topology declares no slots at all (nothing to bootstrap). See
+/// [`run_bootstrap_driver`] for the exact two-phase (fresh-start guard, then drive-to-completion)
 /// logic and the idempotent + fresh-only guarantees.
 ///
 /// Idempotent + fresh-only by construction: the fresh-start guard is re-checked immediately before
@@ -194,11 +234,13 @@ pub fn spawn_on_shard(cluster: Arc<SlotMap>, raft: RaftHandle, topology: &Cluste
 ///
 /// The loop has two phases, divided by `started_bootstrap`:
 ///
-///   * BEFORE starting: poll while the committed config is still
-///     [`fresh`](is_fresh_committed_config). The instant it is NON-fresh from the START (a peer
-///     leader already bootstrapped, OR this node RESTARTED onto persisted committed state), return
-///     WITHOUT proposing -- this is the fresh-only guard that makes a restart never re-bootstrap /
-///     clobber a committed config / runtime migration.
+///   * BEFORE starting: poll while this node is still [`fresh-for-bootstrap`](is_fresh_for_bootstrap)
+///     -- an EMPTY persisted Raft log (the construction-time fact: not a restarted node) AND a fresh
+///     shared-map projection. The instant it is NON-fresh from the START (this node RESTARTED onto
+///     persisted committed state -- non-empty log, INCLUDING the common no-snapshot restart where
+///     the projection is transiently pristine -- OR a peer leader already bootstrapped into the
+///     shared map), return WITHOUT proposing. This is the fresh-only guard that makes a restart
+///     never re-bootstrap / clobber a committed config / runtime migration / failover.
 ///   * AFTER this driver has STARTED proposing (`started_bootstrap = true`): drive to COMPLETION,
 ///     re-proposing the FULL idempotent batch on each leader tick until `slots_assigned()` reaches
 ///     `declared_slot_total`. Once this driver itself has committed PARTIAL progress (e.g. some
@@ -211,16 +253,18 @@ pub fn spawn_on_shard(cluster: Arc<SlotMap>, raft: RaftHandle, topology: &Cluste
 ///     no double-assignment.
 ///
 /// NOTE on the partial-AddNode-then-this-node-dies case: if THIS leader committed some `AddNode`s but
-/// no `AssignSlots` and then the process restarts, the recovered committed config has
-/// `slots_assigned() == 0` but a non-zero epoch / `known_nodes() > 1`, so the strict fresh guard is
-/// FALSE and this restarted node will NOT resume. The cluster's NEW leader runs its OWN driver, which
-/// also sees the strict guard false (epoch / known_nodes advanced) and stands down -- so the
-/// bootstrap would NOT auto-resume. That window (committed AddNode, zero committed AssignSlots, then a
-/// full-leader-loss restart) is vanishingly small (the batch proposes all AddNodes then immediately
-/// the AssignSlots, all on one leader, committing in milliseconds), and the safe fallback is the
-/// unchanged manual `CLUSTER ADDSLOTS` -- never an incorrect or clobbered state. The common path
-/// (one leader commits the whole batch) and the in-session leadership-flap path (this driver resumes
-/// to completion) are both fully covered.
+/// no `AssignSlots` and then the process restarts, the restarted node booted with a NON-EMPTY
+/// persisted log (those committed `AddNode` entries are on disk), so [`is_fresh_for_bootstrap`] is
+/// FALSE on the construction-time persisted-log fact ALONE -- it does NOT depend on whether the
+/// no-snapshot recovery republished the projection (the very gap this gate closes). The restarted
+/// node will NOT resume; a NEW leader's own driver, if it too restarted, likewise stands down on its
+/// non-empty log -- so the bootstrap would NOT auto-resume from this rare window (committed AddNode,
+/// zero committed AssignSlots, then a full-leader-loss restart). It is vanishingly small (the batch
+/// proposes all AddNodes then immediately the AssignSlots, all on one leader, committing in
+/// milliseconds), and the safe fallback is the unchanged manual `CLUSTER ADDSLOTS` -- never an
+/// incorrect or clobbered state. The common path (one leader commits the whole batch) and the
+/// in-session leadership-flap path (this driver, still on its original empty-log boot, resumes to
+/// completion via the slot-coverage gate) are both fully covered.
 async fn run_bootstrap_driver<R: Runtime>(
     rt: &R,
     cluster: &SlotMap,
@@ -236,20 +280,25 @@ async fn run_bootstrap_driver<R: Runtime>(
         if cluster.slots_assigned() >= declared_slot_total {
             return;
         }
-        // FRESH-ONLY START GUARD: until THIS driver has begun proposing, only start on a config that
-        // is still fresh. A non-fresh config we have NOT touched means a peer bootstrapped or this
-        // node restarted onto committed state -> stand down (never clobber). Once we HAVE started,
-        // skip this guard: our own partial commits make the config non-fresh, but the slot-coverage
-        // check above is the real completion gate, so we drive to finish.
-        if !started_bootstrap && !is_fresh_committed_config(cluster) {
+        // FRESH-ONLY START GUARD: until THIS driver has begun proposing, only start on a node that
+        // is fresh for bootstrap -- an EMPTY persisted Raft log (the construction-time fact: this is
+        // NOT a restarted node) AND a still-fresh shared-map projection. A non-fresh node we have NOT
+        // touched means it RESTARTED onto persisted committed state (non-empty log, INCLUDING the
+        // common no-snapshot restart where the projection is transiently pristine), or a peer
+        // bootstrapped into the shared map -> stand down (never clobber a committed config / runtime
+        // migration / failover). Re-sampled every iteration. Once we HAVE started, skip this guard:
+        // our own partial commits make the projection non-fresh, but the slot-coverage check above
+        // is the real completion gate, so we drive to finish.
+        if !started_bootstrap && !is_fresh_for_bootstrap(cluster, raft) {
             return;
         }
         // Only the LEADER proposes the bootstrap (a single proposer); a follower waits. `is_leader`
         // is a cheap non-blocking status read.
         if raft.is_leader() {
             // Re-check the START guard right before proposing so a peer's bootstrap that landed since
-            // the loop top makes this (not-yet-started) node stand down on the next iteration.
-            if started_bootstrap || is_fresh_committed_config(cluster) {
+            // the loop top (or this node's now-observable restarted state) makes this (not-yet-
+            // started) node stand down on the next iteration.
+            if started_bootstrap || is_fresh_for_bootstrap(cluster, raft) {
                 started_bootstrap = true;
                 // Propose each cmd in order, awaiting TRUE COMMIT. A NotLeader mid-batch (we lost
                 // leadership) breaks out to re-poll; the idempotent batch is safely re-proposed when
@@ -541,6 +590,108 @@ mod tests {
                  NEVER re-bootstrapping / clobbering it"
             );
         });
+    }
+
+    /// THE NO-SNAPSHOT-RESTART HAZARD (the bug this fix closes). A node that RESTARTED onto persisted
+    /// state but took the NO-SNAPSHOT recovery path leaves the shared `SlotMap` TRANSIENTLY PRISTINE
+    /// (epoch 0, zero slots, only self) -- so the old shared-map-only guard FALSE-POSITIVED as fresh
+    /// and, while this node was already the LEADER, re-proposed the static topology above the
+    /// unapplied committed tail, clobbering runtime ownership. Now the driver consults the engine's
+    /// RECOVERED PERSISTED-LOG fact: a non-empty log (`recovered_last_log_index > 0`) means RESTARTED,
+    /// so [`is_fresh_for_bootstrap`] is false and the driver STANDS DOWN even though it IS the leader
+    /// and the projection looks pristine. This is the regression guard for the data-loss race.
+    #[test]
+    fn driver_stands_down_on_no_snapshot_restart_even_with_pristine_projection_and_leadership() {
+        use ironcache_raft::NodeId;
+        // The shared map as a no-snapshot restart leaves it: PRISTINE (the ConfigSm has not yet
+        // replayed the committed tail), so the shared-map projection alone reads FRESH.
+        let map = SlotMap::empty_self(ID0, "127.0.0.1", 7000);
+        assert!(
+            is_fresh_committed_config(&map),
+            "the no-snapshot restart leaves the projection transiently pristine (looks fresh)"
+        );
+        assert!(map.slots_assigned() < 16_384);
+
+        // This node IS the leader (a quorum round-trip can win leadership before apply_committed
+        // replays the tail) AND it RESTARTED: its engine recovered a NON-EMPTY persisted log
+        // (recovered_last_log_index > 0). The old code would have re-bootstrapped here; the fix must
+        // stand down on the persisted-log fact ALONE.
+        let raft = RaftHandle::for_test_recovered(NodeId(0), Some(NodeId(0)), 7);
+        assert!(
+            raft.is_leader(),
+            "the restarted node has already won leadership"
+        );
+        assert!(
+            raft.has_persisted_log(),
+            "a restarted node has a non-empty persisted log"
+        );
+        assert!(
+            !is_fresh_for_bootstrap(&map, &raft),
+            "a restarted node (non-empty persisted log) is NEVER fresh-for-bootstrap, even with a \
+             transiently-pristine projection and leadership"
+        );
+
+        let rt = TokioRuntime::new();
+        let cmds = topology_bootstrap_cmds(&shipped_topology());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let res = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_bootstrap_driver(&rt, &map, &raft, cmds, 16_384),
+            )
+            .await;
+            assert!(
+                res.is_ok(),
+                "driver must STAND DOWN (return without proposing) on a no-snapshot restart even \
+                 though it is the leader and the shared-map projection is transiently pristine; it \
+                 must NEVER re-bootstrap / clobber the (still-unapplied) recovered runtime ownership"
+            );
+            // The map was NOT mutated by a re-bootstrap (still pristine; no slots clobbered in).
+            assert_eq!(
+                map.slots_assigned(),
+                0,
+                "the driver must not have proposed/applied any slot assignment on a restarted node"
+            );
+        });
+    }
+
+    /// A TRULY FRESH node (empty persisted log) with a pristine projection IS fresh-for-bootstrap, so
+    /// turnkey still forms on a genuinely fresh cluster (the persisted-log gate does not over-block).
+    #[test]
+    fn is_fresh_for_bootstrap_is_true_only_on_a_truly_fresh_node() {
+        use ironcache_raft::NodeId;
+        let map = SlotMap::empty_self(ID0, "127.0.0.1", 7000);
+
+        // Truly fresh: empty persisted log AND pristine projection -> fresh-for-bootstrap.
+        let fresh = RaftHandle::for_test_recovered(NodeId(0), Some(NodeId(0)), 0);
+        assert!(!fresh.has_persisted_log());
+        assert!(
+            is_fresh_for_bootstrap(&map, &fresh),
+            "a truly fresh node (empty log, pristine projection) is fresh-for-bootstrap"
+        );
+
+        // A non-empty persisted log alone (restart) flips it false, regardless of the projection.
+        let restarted = RaftHandle::for_test_recovered(NodeId(0), Some(NodeId(0)), 1);
+        assert!(restarted.has_persisted_log());
+        assert!(
+            !is_fresh_for_bootstrap(&map, &restarted),
+            "a non-empty persisted log (a restart) is NOT fresh-for-bootstrap"
+        );
+
+        // A non-fresh projection (a peer landed in-process) also flips it false on a fresh-log node.
+        let with_peer = SlotMap::empty_self(ID0, "127.0.0.1", 7000);
+        with_peer.meet(ironcache_cluster::NodeEntry {
+            id: ID1.into(),
+            host: "127.0.0.1".into(),
+            port: 7001,
+        });
+        assert!(
+            !is_fresh_for_bootstrap(&with_peer, &fresh),
+            "a peer committed into the shared map (in-process) is NOT fresh-for-bootstrap"
+        );
     }
 
     /// The fresh-only guard: a freshly-seeded `empty_self` map (zero slots, only self in the table,

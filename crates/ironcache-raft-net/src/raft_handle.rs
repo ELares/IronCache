@@ -72,6 +72,25 @@ impl RaftHandle {
         RaftHandle::new(NodeHandle::for_test(id, leader_id))
     }
 
+    /// Like [`for_test`](RaftHandle::for_test) but with an explicit RECOVERED persisted-log last
+    /// index (PROD-turnkey), so a test can model a node that RESTARTED onto persisted state and
+    /// assert the turnkey driver refuses to re-bootstrap it. `0` is a truly fresh node (the
+    /// [`for_test`](RaftHandle::for_test) default). Wraps
+    /// [`NodeHandle::for_test_recovered`](crate::NodeHandle::for_test_recovered).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test_recovered(
+        id: NodeId,
+        leader_id: Option<NodeId>,
+        recovered_last_log_index: u64,
+    ) -> Self {
+        RaftHandle::new(NodeHandle::for_test_recovered(
+            id,
+            leader_id,
+            recovered_last_log_index,
+        ))
+    }
+
     /// Whether THIS node currently believes it is the Raft leader (a cheap, non-blocking read
     /// of the published status snapshot). A mutator proposes only when this is true; a follower
     /// redirects instead of proposing a doomed entry.
@@ -141,6 +160,30 @@ impl RaftHandle {
     #[must_use]
     pub fn node_id(&self) -> NodeId {
         self.inner.id()
+    }
+
+    /// The engine's RECOVERED persisted-log last index, sampled ONCE at construction (PROD-turnkey).
+    /// A CONSTRUCTION-TIME FACT (not the live, growing index): `0` for a truly fresh node, `> 0` for
+    /// a node that RESTARTED onto persisted state -- including the COMMON no-snapshot restart, where
+    /// the recovery path recovers raft membership but does NOT replay the `ConfigSm` slots/epoch/
+    /// nodes, leaving the shared `SlotMap` transiently pristine while the committed config tail is
+    /// un-applied. The turnkey bootstrap driver reads this -- not that racy shared-map projection --
+    /// to decide freshness.
+    #[must_use]
+    pub fn recovered_last_log_index(&self) -> u64 {
+        self.inner.recovered_last_log_index()
+    }
+
+    /// Whether this node booted with a NON-EMPTY persisted Raft log (PROD-turnkey): `true` for a
+    /// node that RESTARTED onto persisted state (any committed bootstrap / runtime migration /
+    /// failover left a log entry), `false` for a TRULY FRESH node (empty persisted log). This is the
+    /// robust freshness gate the turnkey driver uses: a fresh cluster (empty log) still bootstraps
+    /// turnkey; a restarted node (non-empty log) NEVER re-bootstraps, EVEN on the common no-snapshot
+    /// restart path where the shared-map projection is transiently pristine. A construction-time
+    /// fact, immutable for the life of the handle.
+    #[must_use]
+    pub fn has_persisted_log(&self) -> bool {
+        self.inner.recovered_last_log_index() > 0
     }
 
     /// The live cluster CONFIGURATION (voter + learner sets) this node has adopted (HA-prod-membership).
