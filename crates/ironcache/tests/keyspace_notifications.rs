@@ -341,6 +341,18 @@ fn ttl_expiry_fires_expired_event() {
             .expect("keyspace subscriber must receive the set event");
         assert_pmessage(&set_ev, b"__keyspace@0__:*", b"__keyspace@0__:t", b"set");
 
+        // SET ... PX also fires the secondary `expire` event (the key was given a TTL), matching
+        // Redis which fires both `set` and `expire` for a SET with an expiration option.
+        let set_expire = read_with_timeout(&mut ks, &mut ksb, 1000)
+            .await
+            .expect("SET PX must also fire the secondary expire event");
+        assert_pmessage(
+            &set_expire,
+            b"__keyspace@0__:*",
+            b"__keyspace@0__:t",
+            b"expire",
+        );
+
         // Let the TTL pass, then trigger a lazy access (a GET on the now-expired key reaps it).
         tokio::time::sleep(Duration::from_millis(60)).await;
         let g = send_and_read(&mut m, &mut mb, &[b"GET", b"t"]).await;

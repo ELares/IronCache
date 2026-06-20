@@ -33,6 +33,11 @@
 //! - Blocking list ops (`BLPOP` etc.), `SORT ... STORE`, `BITOP`, `GEO*`, `PF*`: not in
 //!   the table this pass (they are lower-traffic and several are absent or partial); they
 //!   record nothing. The core string/list/set/hash/zset/generic/expiry surface IS mapped.
+//! - The SECONDARY `del` Redis fires when a collection command (LPOP/RPOP/SPOP/LREM/LTRIM/
+//!   SREM/HDEL/ZPOPMIN/ZPOPMAX/...) removes the LAST element and the key is deleted is NOT
+//!   emitted; only the primary type event fires. Likewise `EXPIRE`/`PEXPIREAT` with an
+//!   already-past time emits `expire` (reply 1) rather than the `del` Redis fires on the
+//!   immediate delete. Both are documented follow-ups (need post-mutation existence checks).
 
 use ironcache_config::notify::{EventClass, record};
 use ironcache_protocol::{Request, Value};
@@ -108,11 +113,19 @@ pub fn notify_for_command(cmd: &[u8], req: &Request, reply: &Value, db: u32) {
             // the options for the NX/XX tokens.
             if is_ok_reply(reply) && !has_conditional_set_option(req) {
                 record(EventClass::String, "set", key, db);
+                // SET with an EX/PX/EXAT/PXAT option also sets a TTL, so Redis fires `expire`
+                // (generic) in addition to `set`.
+                if set_has_expire_option(req) {
+                    record(EventClass::Generic, "expire", key, db);
+                }
             }
         }
         b"SETEX" | b"PSETEX" => {
+            // SETEX/PSETEX always set a TTL, so Redis fires BOTH `set` (string) and `expire`
+            // (generic), in that order.
             if is_ok_reply(reply) {
                 record(EventClass::String, "set", key, db);
+                record(EventClass::Generic, "expire", key, db);
             }
         }
         b"GETSET" => {
@@ -141,15 +154,11 @@ pub fn notify_for_command(cmd: &[u8], req: &Request, reply: &Value, db: u32) {
             }
         }
         b"INCR" | b"INCRBY" | b"DECR" | b"DECRBY" => {
-            // The integer counters always write on a non-error integer reply; Redis names
-            // the event `incrby` for INCR/INCRBY and `decrby` for DECR/DECRBY.
+            // The integer counters always write on a non-error integer reply. Redis routes all
+            // four (INCR/INCRBY/DECR/DECRBY) through one shared body that fires `incrby` -- so
+            // DECR/DECRBY ALSO emit `incrby`, not `decrby` (a channel no real client subscribes).
             if matches!(reply, Value::Integer(_)) {
-                let ev = if matches!(cmd, b"DECR" | b"DECRBY") {
-                    "decrby"
-                } else {
-                    "incrby"
-                };
-                record(EventClass::String, ev, key, db);
+                record(EventClass::String, "incrby", key, db);
             }
         }
         b"INCRBYFLOAT" => {
@@ -372,6 +381,16 @@ fn has_conditional_set_option(req: &Request) -> bool {
         .iter()
         .skip(3)
         .any(|a| a.eq_ignore_ascii_case(b"NX") || a.eq_ignore_ascii_case(b"XX"))
+}
+
+/// True if a `SET` carries an EX/PX/EXAT/PXAT expiration option (so it also fires `expire`).
+fn set_has_expire_option(req: &Request) -> bool {
+    req.args.iter().skip(3).any(|a| {
+        a.eq_ignore_ascii_case(b"EX")
+            || a.eq_ignore_ascii_case(b"PX")
+            || a.eq_ignore_ascii_case(b"EXAT")
+            || a.eq_ignore_ascii_case(b"PXAT")
+    })
 }
 
 /// Parse a DB index argument (MOVE / COPY DB) as a `u32`, returning `None` on a malformed
