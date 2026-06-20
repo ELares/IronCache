@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# PROD-8 DIFFERENTIAL wire-compatibility gate. Runs `tests/differential.rs`, which boots the REAL
+# IronCache server and a REAL `redis-server` side by side and replays a curated, deterministic
+# command corpus against both, asserting the RESP2 replies match (with a documented allowlist for
+# the correct-by-design differences: OBJECT ENCODING names, SCAN cursor/order, error-prefix-not-text,
+# random-element commands).
+#
+# WHY A SEPARATE WORKFLOW (not folded into rust.yml's test matrix): this gate has an EXTERNAL
+# dependency, a real `redis-server` binary on PATH, that the rest of the workspace tests do not. The
+# differential test SKIPS itself cleanly when redis is absent (so `cargo test --workspace` in rust.yml
+# stays green on a runner without redis, and a developer without redis is not blocked); this job is
+# the one place that INSTALLS redis and then runs the test EXPLICITLY, so a skip here would be a
+# wiring bug, not a pass. Keeping it separate means a redis-install or redis-version hiccup cannot
+# flake the main test gate.
+#
+# It installs `redis-server` from the Ubuntu archive (the binary the test spawns on an ephemeral
+# port), guarded by the same `has_cargo` idiom rust.yml/perf-gate.yml use so a docs-only repo state
+# is a no-op, and runs only when Rust sources / the test / the workflow change.
+name: differential
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/differential.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  guard:
+    name: guard (skip until a Cargo project exists)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_cargo: ${{ steps.check.outputs.has_cargo }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] && [ -f Cargo.lock ]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::repo is docs-only (no Cargo.toml/Cargo.lock); differential gate is a no-op"
+          fi
+
+  differential:
+    name: differential (vs real redis-server)
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2
+      - name: Install redis-server (the binary the test spawns)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+          # The Ubuntu package autostarts a system redis; the test spawns its OWN instance on an
+          # ephemeral port, so stop the autostarted one to avoid any port/resource surprise. It is
+          # only the redis-server BINARY on PATH that the test needs.
+          sudo systemctl stop redis-server || true
+          redis-server --version
+      - name: Run the differential corpus
+        # Explicitly target the one test; `--nocapture` surfaces the run summary + any divergence
+        # report in the job log. With redis installed the test RUNS (it does not skip).
+        run: cargo test -p ironcache --test differential -- --nocapture
