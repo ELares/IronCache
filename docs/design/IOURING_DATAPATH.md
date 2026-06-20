@@ -120,10 +120,32 @@ The OPTIONAL io_uring backend has landed as an ADDITIVE, DEFAULT-OFF Linux path 
 
 Deferred to a Linux soak (NOT in v1, no throughput claim made): the registered fixed-buffer slab +
 buffer groups, multishot accept/recv with the startup probe and one-shot fallback, the shared
-persistence write path, and the epoll-vs-io_uring benchmark. Also deferred on the io_uring serve
-loop: PUB/SUB push-while-idle, the blocking-command park, and the idle-timeout timer race (each
-degrades gracefully on that path; the core request/reply datapath is fully served). A CI job
-(`io-uring` in `.github/workflows/rust.yml`, ubuntu) builds + clippy-lints + tests the feature.
+persistence write path, and the epoll-vs-io_uring benchmark.
+
+The io_uring serve loop's per-connection behavior is now at parity with the tokio loop except where
+explicitly noted, and every path is SAFE (a defined reply, no hang, no silent drop, close-on-shed):
+
+- PUB/SUB push-while-idle: FULLY WIRED. A subscriber's idle wait `select!`s the per-connection push
+  channel alongside the io_uring `recv`, so a published message is delivered PROMPTLY mid-idle (not
+  silently dropped, not deferred to the next command). Queued pushes coalesce into one write; the
+  publisher's SHED back-pressure signal is observed both in the idle `select!` and at the post-batch
+  top of the loop, so a flooded subscriber is CLOSED rather than accumulating forever.
+- Blocking commands (BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/BZPOPMIN/BZPOPMAX/BZMPOP/WAIT): the
+  io_uring loop replies IMMEDIATELY rather than parking. The non-blocking attempt runs; if it would
+  block (every key empty / WAIT quorum not yet met) the loop writes the command's immediate
+  non-blocking reply (the BLPOP-family nil-array, WAIT's current in-sync replica count) instead of
+  leaving the output empty -- so the client never hangs. LIMITATION: true block-until-data (parking
+  past the first attempt) is NOT yet supported on the io_uring path; it is a documented follow-up
+  (it needs a `select!` over the io_uring `recv` future whose cancel-on-drop semantics want a Linux
+  soak to validate). The tokio path keeps the full `run_block_park` implementation.
+- CLIENT PAUSE: enforced (the same conservative-superset stall the tokio loop applies, re-checked
+  via the Runtime timer seam so UNPAUSE / CLIENT KILL take effect promptly).
+- The idle-timeout (PROD-SAFETY #4) timer race remains deferred on the io_uring loop; the
+  `maxclients` cap + peer-close detection still bound connections.
+
+A CI job (`io-uring` in `.github/workflows/rust.yml`, ubuntu) builds + clippy-lints + tests the
+feature; the io_uring serve loop additionally cross-compile-checks against an aarch64-linux target
+during development since it cannot run on macOS.
 
 ## References
 

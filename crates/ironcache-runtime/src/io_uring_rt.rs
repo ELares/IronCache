@@ -177,6 +177,31 @@ fn set_nodelay(stream: &TcpStream) {
     let _ = std_stream.into_raw_fd();
 }
 
+/// Read the `(peer, local)` socket addresses of a `tokio_uring` stream as display strings,
+/// WITHOUT taking ownership of its fd. `tokio_uring::net::TcpStream` exposes no `peer_addr` /
+/// `local_addr`, so borrow the fd through a temporary std stream (the same no-ownership-transfer
+/// dance [`set_nodelay`] uses) and `into_raw_fd` it back so the descriptor the io_uring stream
+/// still owns is not closed. A failure yields an empty string (the addresses are cosmetic, used
+/// only for `CLIENT INFO`).
+///
+/// This lives in the runtime crate because the borrowed-fd construction needs `unsafe`, which the
+/// `ironcache` crate FORBIDS (`#![forbid(unsafe_code)]`); the io_uring serve loop calls this so the
+/// forbidden `unsafe` stays out of `ironcache`.
+#[must_use]
+pub fn peer_local_addrs(stream: &TcpStream) -> (String, String) {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    let raw = stream.as_raw_fd();
+    // SAFETY: `raw` is the valid, open TCP socket fd owned by `stream` for the duration of this
+    // borrow. We construct a std `TcpStream` over it ONLY to read peer/local addr, then
+    // immediately `into_raw_fd` to relinquish ownership WITHOUT closing the fd, so the io_uring
+    // stream remains the sole owner and closes it exactly once on its own drop.
+    let s = unsafe { std::net::TcpStream::from_raw_fd(raw) };
+    let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let local = s.local_addr().map(|a| a.to_string()).unwrap_or_default();
+    let _ = s.into_raw_fd();
+    (peer, local)
+}
+
 // ---------------------------------------------------------------------------
 // Per-shard io_uring bootstrap (the shared-nothing thread-per-core boot, ADR-0002).
 // ---------------------------------------------------------------------------

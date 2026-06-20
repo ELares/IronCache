@@ -648,7 +648,7 @@ pub fn run_server_observed(
             let inbox = inbox_for_uring;
             let persist = persist_for_uring;
             move |rt: ironcache_runtime::IoUringRuntime,
-                  stream: tokio_uring::net::TcpStream,
+                  stream: ironcache_runtime::UringTcpStream,
                   shard: ShardId| {
                 let ctx = ctx_template.clone();
                 let inbox = inbox.clone();
@@ -1597,28 +1597,43 @@ async fn serve_connection(
 /// `recv`/`send` (one ring per shard) instead of a tokio `TcpStream` / `ClientStream`. The pure
 /// command engine (the determinism seam, the store, the coordinator) is UNTOUCHED.
 ///
-/// ## v1 scope (honest, documented)
+/// ## v1 scope and the io_uring-path behavior (honest, documented)
 ///
 /// This v1 serves the CORE request/reply RESP datapath (pipelined decode -> dispatch -> single
 /// coalesced flush), which is the bulk of cache traffic and the path the io_uring throughput lever
-/// targets. Three tokio-serve-loop features that hang `tokio::select!` over the stream are NOT
-/// wired on the io_uring loop yet and are a documented Linux follow-up (they degrade gracefully,
-/// never incorrectly):
-///   * PUSH-WHILE-IDLE for PUB/SUB (SERVER_PUSH.md): a subscriber on the io_uring path receives a
-///     published message on its NEXT command round-trip rather than mid-idle. SUBSCRIBE/dispatch
-///     themselves work; only the idle select! that drains the push channel is deferred.
-///   * BLOCKING PARK (PROD-9, BLPOP/WAIT/...): the non-blocking attempt still runs and replies; the
-///     park-until-data select! is deferred, so a blocking command behaves like its immediate
-///     non-blocking form on this path.
+/// targets. The serve-loop features that the tokio path drives via `tokio::select!` over the stream
+/// behave as follows on the io_uring loop (each is SAFE -- a defined reply, no hang, no silent drop,
+/// close-on-shed):
+///   * PUB/SUB (SERVER_PUSH.md) -- FULLY WIRED. A subscriber's idle wait runs
+///     [`subscriber_idle_wait_uring`], which `select!`s the per-connection push channel alongside
+///     the io_uring `recv`, so a PUSH-while-idle is delivered PROMPTLY (not silently dropped, not
+///     deferred to the next command). Queued pushes coalesce into one write; the SHED kill-signal
+///     is observed in the select! AND re-checked at the post-batch top of the loop, so a flooded
+///     subscriber is CLOSED rather than accumulating forever.
+///   * BLOCKING (PROD-9, BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/BZPOPMIN/BZPOPMAX/BZMPOP/WAIT) --
+///     IMMEDIATE-REPLY (NOT a true park). The non-blocking attempt runs in `route_and_dispatch`; if
+///     it would PARK (every key empty / WAIT quorum not yet met), the io_uring loop writes the
+///     command's IMMEDIATE non-blocking reply instead of leaving `out` empty: the BLPOP-family pops
+///     reply the nil-array (the zero-timeout result), WAIT replies the CURRENT in-sync replica
+///     count. So a blocking command on this path RETURNS AT ONCE and never hangs. LIMITATION: true
+///     block-until-data (parking past the first attempt) is NOT yet supported on the io_uring path
+///     (it needs a `select!` over the io_uring `recv` future whose cancel-on-drop semantics are
+///     unvalidated here); that is a documented Linux follow-up. The tokio path's `run_block_park`
+///     remains the full implementation.
 ///   * The IDLE-TIMEOUT (PROD-SAFETY #4) timer race is deferred; the `maxclients` cap + peer-close
 ///     detection still bound connections.
+///
+/// CLIENT PAUSE (PROD-7) IS enforced: a pause window stalls this connection's command processing
+/// (the same conservative-superset stall the tokio loop applies, re-checking via the Runtime timer
+/// seam so UNPAUSE / CLIENT KILL take effect promptly).
+///
 /// The registered-buffer / multishot fast path (IOURING_DATAPATH.md) and a perf benchmark are
-/// likewise deferred to a Linux soak; no throughput claim is made here.
+/// deferred to a Linux soak; no throughput claim is made here.
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 #[allow(clippy::too_many_lines)]
 async fn serve_connection_uring(
     rt: ironcache_runtime::IoUringRuntime,
-    mut stream: tokio_uring::net::TcpStream,
+    mut stream: ironcache_runtime::UringTcpStream,
     home: ShardId,
     mut ctx: ServerContext,
     default_proto: ProtoVersion,
@@ -1626,7 +1641,6 @@ async fn serve_connection_uring(
     persist: Option<Arc<crate::persist::PersistState>>,
 ) {
     use ironcache_runtime::Runtime;
-    use std::os::fd::AsRawFd;
 
     let env = shard_env();
     adopt_metrics_cell(ctx.metrics_registry.as_ref(), home.index);
@@ -1658,19 +1672,11 @@ async fn serve_connection_uring(
     };
 
     // Peer/local addresses for CLIENT INFO. tokio-uring's TcpStream has no peer_addr/local_addr,
-    // so derive them from the borrowed fd via a std stream (without taking fd ownership, mirroring
-    // the io_uring backend's nodelay helper). A failure leaves the field empty (cosmetic only).
-    let (addr, laddr) = {
-        use std::os::fd::{FromRawFd, IntoRawFd};
-        let raw = stream.as_raw_fd();
-        // SAFETY: `raw` is the valid open socket fd owned by `stream` for this borrow; we read
-        // peer/local addr through a temporary std stream and `into_raw_fd` to avoid closing it.
-        let s = unsafe { std::net::TcpStream::from_raw_fd(raw) };
-        let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-        let local = s.local_addr().map(|a| a.to_string()).unwrap_or_default();
-        let _ = s.into_raw_fd();
-        (peer, local)
-    };
+    // so derive them from the borrowed fd (without taking fd ownership). The borrowed-fd dance
+    // needs `unsafe`, which THIS crate FORBIDS (`#![forbid(unsafe_code)]`), so it lives in the
+    // runtime crate's `peer_local_addrs` helper (mirroring the io_uring backend's nodelay helper).
+    // A failure leaves the field empty (cosmetic only).
+    let (addr, laddr) = ironcache_runtime::peer_local_addrs(&stream);
 
     let client_id = {
         let mut s = state_rc.borrow_mut();
@@ -1700,6 +1706,11 @@ async fn serve_connection_uring(
     let limits = Limits::default();
     let mut read_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
+    // The Runtime timer seam for the CLIENT PAUSE stall (FIX3). Under `tokio_uring::start` the
+    // canonical tokio time driver is enabled (the io_uring backend's `timer` is `tokio::time::sleep`),
+    // so the SAME zero-sized `TokioRuntime` timer the tokio serve loop uses drives the pause poll
+    // here too -- no io_uring timeout op needed for the timer abstraction.
+    let timer_rt = TokioRuntime::new();
 
     'conn: loop {
         out.clear();
@@ -1712,8 +1723,14 @@ async fn serve_connection_uring(
                     } else {
                         None
                     };
-                    // PROD-9 blocking-park: created but NOT acted on this path (the non-blocking
-                    // attempt's reply is in `out`); see the fn doc.
+                    // PROD-9 blocking-park (FIX1): a blocking command (BLPOP/.../WAIT) whose
+                    // non-blocking attempt found no data sets `block_request` and leaves `out`
+                    // EMPTY, expecting the OWNING serve loop to PARK (the tokio loop runs
+                    // `run_block_park`). The io_uring loop does NOT support a true park yet, so we
+                    // write the IMMEDIATE non-blocking reply below instead of leaving `out` empty
+                    // (which would HANG the client and desync later replies). See the fn doc: true
+                    // blocking is a documented io_uring-path limitation; the reply is the same one
+                    // the command would have produced on a zero timeout.
                     let mut block_request: Option<BlockPark> = None;
                     let close = route_and_dispatch(
                         &ctx,
@@ -1737,6 +1754,24 @@ async fn serve_connection_uring(
                         record_slow_command(&ctx, &env, &conn, &request, start, slow_threshold);
                     }
                     read_buf.drain(..consumed);
+                    // FIX1: the blocking command parked (`out` is empty). Write its IMMEDIATE
+                    // non-blocking reply so it returns at once rather than hanging: the BLPOP-family
+                    // pops get the nil-array timeout reply; WAIT gets the CURRENT in-sync replica
+                    // count. The command counter was already bumped inside `handle_blocking_live` /
+                    // `handle_wait_live` when the park was set up, so we ONLY encode here (no double
+                    // count). `block_request == None` for every non-blocking command (the hot path),
+                    // so this is a single `is_some` check then skipped.
+                    if let Some(park) = block_request {
+                        let reply = match park.spec.op {
+                            ironcache_server::BlockOp::Wait { .. } => {
+                                ironcache_server::Value::Integer(
+                                    ironcache_server::in_sync_replica_count(&ctx),
+                                )
+                            }
+                            _ => block_timeout_value(),
+                        };
+                        encode_into(&mut out, &reply, conn.proto);
+                    }
                     if close {
                         let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
                         break 'conn;
@@ -1764,19 +1799,72 @@ async fn serve_connection_uring(
             }
         }
 
-        // CLIENT KILL (PROD-7): close if a peer flagged this connection (cold relaxed load).
+        // CLIENT KILL (PROD-7): close if a peer flagged this connection (cold relaxed load). FIX2:
+        // also close if the publisher SHED this connection (its bounded push channel overflowed):
+        // a flooded subscriber must be torn down rather than accumulate forever. For a
+        // non-subscriber `shed_flag` is never tripped (no table sender registered), so this is a
+        // single relaxed atomic load on the cold post-batch path.
+        if client_handle.is_killed() || shed_flag.is_tripped() {
+            break;
+        }
+
+        // CLIENT PAUSE (PROD-7, FIX3): if a `CLIENT PAUSE` window is active, stall this
+        // connection's command processing until it elapses (or is UNPAUSEd), identical to the tokio
+        // serve loop. The deadline basis is the Env monotonic clock (the same basis CLIENT PAUSE
+        // recorded); both ALL and WRITE-only pauses hold here (the conservative superset). The
+        // default (no pause) reads one relaxed atomic and falls through, byte-unchanged. We re-check
+        // in a short timer loop so an UNPAUSE / a kill takes effect promptly (via the Runtime timer
+        // seam, which `tokio_uring::start`'s tokio time driver backs).
+        loop {
+            let now_mono_ms = env.borrow().now().as_millis();
+            let remaining = ctx.clients.pause_remaining_ms(now_mono_ms);
+            if remaining == 0 {
+                break;
+            }
+            if client_handle.is_killed() {
+                break;
+            }
+            let wait = remaining.min(50);
+            timer_rt
+                .timer(core::time::Duration::from_millis(wait))
+                .await;
+        }
         if client_handle.is_killed() {
             break;
         }
 
-        // Read the next command batch over the io_uring owned-buffer recv seam. A clean EOF
-        // (`n == 0`) or any error closes the connection.
-        let Ok(res) = rt.recv(&mut stream, std::mem::take(&mut read_buf)).await else {
-            break;
-        };
-        read_buf = res.buf;
-        if res.n == 0 {
-            break; // peer closed
+        // IDLE WAIT. The NON-subscriber path is the plain io_uring `recv` (byte-unchanged from
+        // before this fix). A connection in SUBSCRIBE mode instead takes the `select!`-based
+        // `subscriber_idle_wait_uring` (FIX2), which delivers a PUSH-while-idle promptly (it selects
+        // on the push channel alongside the recv), coalesces queued pushes into one write, observes
+        // the SHED kill-signal, and detects a peer close -- so pub/sub messages are no longer
+        // silently dropped on the io_uring path. FIFO holds because `out` was flushed above before
+        // this idle wait, so a push is rendered + sent only AFTER the in-flight command batch's
+        // reply went out.
+        if conn.is_subscriber() {
+            if subscriber_idle_wait_uring(
+                &rt,
+                &mut stream,
+                &mut push_rx,
+                &shed_flag,
+                &mut read_buf,
+                &mut out,
+                conn.proto,
+            )
+            .await
+            {
+                break;
+            }
+        } else {
+            // Read the next command batch over the io_uring owned-buffer recv seam. A clean EOF
+            // (`n == 0`) or any error closes the connection.
+            let Ok(res) = rt.recv(&mut stream, std::mem::take(&mut read_buf)).await else {
+                break;
+            };
+            read_buf = res.buf;
+            if res.n == 0 {
+                break; // peer closed
+            }
         }
     }
 
@@ -1858,6 +1946,78 @@ async fn subscriber_idle_wait(
                 return true; // peer closed
             }
             read_buf.extend_from_slice(&res.buf);
+            false
+        }
+    }
+}
+
+/// The io_uring-path SUBSCRIBE-mode idle wait (FIX2, the io_uring analog of [`subscriber_idle_wait`]).
+/// `select!`s between draining this connection's per-connection push channel, observing the SHED
+/// kill-signal, and reading the next command over the io_uring owned-buffer `recv` seam. Returns
+/// `true` when the connection should CLOSE (the push consumer was SHED for back-pressure, a peer
+/// close, or an I/O error), `false` to keep looping.
+///
+/// This is a SEPARATE function from the tokio [`subscriber_idle_wait`] because the io_uring transport
+/// is a distinct type ([`ironcache_runtime::UringTcpStream`] driven through the [`Runtime`] seam's
+/// owned-buffer `recv`/`send`), not the tokio `ClientStream`; the LOGIC is byte-for-byte the same.
+/// The fairness, coalescing, and FIFO reasoning of [`subscriber_idle_wait`] all apply verbatim:
+///   * NO `biased;`, so a fast-flooded subscriber never starves its command-read arm.
+///   * a delivered push coalesces any further already-queued pushes (`try_recv`) into ONE write.
+///   * the read arm reads into a FRESH `Vec::new()` and APPENDS to `read_buf`, so a partial frame
+///     already in `read_buf` survives the recv future being cancelled when another arm wins. The
+///     io_uring `recv` future keeps its OWN throwaway buffer alive until the kernel completes/cancels
+///     the op (tokio-uring's cancel-on-drop contract) -- `read_buf` is never moved into it, so no
+///     buffered bytes are at risk.
+///
+/// The SHED arm parks on the signal's `Notify` (spin-free); the fast pre-check closes promptly when
+/// the publisher already shed this connection between iterations.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+async fn subscriber_idle_wait_uring(
+    rt: &ironcache_runtime::IoUringRuntime,
+    stream: &mut ironcache_runtime::UringTcpStream,
+    push_rx: &mut tokio::sync::mpsc::Receiver<crate::pubsub::ServerPush>,
+    shed: &std::sync::Arc<crate::pubsub::ShedSignal>,
+    read_buf: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+    proto: ProtoVersion,
+) -> bool {
+    use ironcache_runtime::Runtime;
+    // Fast pre-check: if the publisher already shed this connection between iterations, close now
+    // without entering the select! (the table sender is gone; nothing more will arrive). This is
+    // ALSO the close-on-shed for a pure-idle flooded subscriber (FIX2 non-negotiable).
+    if shed.is_tripped() {
+        return true;
+    }
+    tokio::select! {
+        maybe_push = push_rx.recv() => {
+            let Some(push) = maybe_push else {
+                // Both the table sender(s) AND the serve loop's own push_tx are gone: the
+                // channel is fully closed. Treat as a disconnect and close.
+                return true;
+            };
+            // `out` was flushed before the idle wait, so it is empty here; rendering into it
+            // preserves the flush-before-idle FIFO ordering.
+            out.clear();
+            encode_into(out, &push.render(proto), proto);
+            while let Ok(next) = push_rx.try_recv() {
+                encode_into(out, &next.render(proto), proto);
+            }
+            rt.send(stream, std::mem::take(out)).await.map_or(true, |returned| {
+                *out = returned;
+                false
+            })
+        }
+        () = shed.wait() => {
+            // The publisher SHED this slow consumer (its push channel overflowed past the bound):
+            // close the connection (its subscriptions are cleaned up on the close path).
+            true
+        }
+        res = rt.recv(stream, Vec::new()) => {
+            let Ok(res) = res else { return true; };
+            if res.n == 0 {
+                return true; // peer closed
+            }
+            read_buf.extend_from_slice(&res.buf[..res.n]);
             false
         }
     }

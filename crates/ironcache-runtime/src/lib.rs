@@ -166,7 +166,13 @@ pub use tokio_rt::TokioRuntime;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 pub mod io_uring_rt;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
-pub use io_uring_rt::{IoUringRuntime, run_shards_uring};
+pub use io_uring_rt::{IoUringRuntime, peer_local_addrs, run_shards_uring};
+// Re-export the io_uring transport stream type so the `ironcache` serve loop can name it
+// (`ironcache_runtime::UringTcpStream`) WITHOUT taking a direct dependency on `tokio-uring`: the
+// low-level binding stays an implementation detail of this runtime crate, mirroring how
+// `IoUringRuntime` is the public handle. Linux + `io_uring`-feature only, same as the backend.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+pub use tokio_uring::net::TcpStream as UringTcpStream;
 
 // The embedded rustls CLIENT-listener TLS layer (#105, docs/design/TLS.md): the
 // `ClientStream` enum the serve loop reads/writes (plain TcpStream OR a rustls
