@@ -57,9 +57,14 @@ use std::sync::Arc;
 use ironcache_clusterbus::{PeerConn, PeerEndpoint, Reply};
 use ironcache_env::{Clock, Env, SystemEnv};
 use ironcache_raft::{
-    Effects, EntryPayload, LogEntry, MembershipChange, NodeId, RaftMsg, RaftNode, RaftRng,
-    RaftStorage, Role, StateMachine, TimerOp,
+    Effects, EntryPayload, LogEntry, MembershipChange, RaftMsg, RaftNode, RaftRng, RaftStorage,
+    Role, StateMachine, TimerOp,
 };
+// `NodeId` is part of this adapter's PUBLIC surface (`Status::leader_id`, `RaftHandle::node_id` /
+// `leader_id`, `node_id_from_announce`), so re-export it for downstream crates (the serve layer's
+// PROD-9 leader-hint resolution) that hold a `RaftHandle` but do not depend on `ironcache-raft`
+// directly.
+pub use ironcache_raft::NodeId;
 use ironcache_runtime::Runtime;
 use std::collections::BTreeSet;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -106,6 +111,40 @@ pub use config_sm::ConfigSm;
 
 pub mod raft_handle;
 pub use raft_handle::{ProposeOutcome, RaftHandle};
+
+/// Derive a stable engine [`NodeId`] (`u64`) from a node's 40-hex announce id (the cluster's
+/// string node identity). The engine keys nodes by `NodeId`; the cluster's identity is the 40-hex
+/// announce id (the same id `CLUSTER MYID` / `CLUSTER NODES` report). This maps the latter to the
+/// former by parsing the FIRST 16 hex digits (the high 64 bits) of the id as a `u64`.
+///
+/// This is the SINGLE source of truth for the mapping: the boot wiring derives every topology
+/// node's id with it, and the leader-hint resolution (turning the watched `leader_id` back into a
+/// node's advertised client endpoint via the slot-map's announce ids) re-derives it the same way,
+/// so the two ALWAYS agree. The mapping is a PURE function of the id alone (no membership list, no
+/// clock / entropy), which is exactly what a runtime join needs: the leader proposing
+/// `AddLearner(id)` and the joining node stamping its own id both compute the SAME `NodeId`.
+///
+/// A non-hex / short id (defensive: `Config::validate` already rejects a malformed announce id)
+/// falls back to a deterministic FNV-1a over the bytes so the result is still total and stable.
+#[must_use]
+pub fn node_id_from_announce(id: &str) -> NodeId {
+    // The common, validated case: a 40-lowercase-hex id. Use the first 16 hex chars as the high
+    // u64 (a stable PREFIX, trivially reproducible: the test ids "0000.."/"1111.." map to the
+    // obvious 0x0000.. / 0x1111..).
+    if id.len() >= 16 {
+        if let Ok(v) = u64::from_str_radix(&id[..16], 16) {
+            return NodeId(v);
+        }
+    }
+    // Defensive fallback for a non-hex id: a deterministic FNV-1a over the bytes (no time / entropy,
+    // so determinism is preserved). Unreachable for a validated announce id.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    NodeId(h)
+}
 
 /// The cluster-bus command verb that carries an encoded [`RaftMsg`].
 ///
@@ -336,6 +375,43 @@ impl NodeHandle {
     #[must_use]
     pub fn status(&self) -> Status {
         *self.status.borrow()
+    }
+
+    /// Construct a STANDALONE handle with a FIXED status, for TESTS only (PROD-9). It is wired to
+    /// no running control plane: `id` and the published `leader_id` are fixed so a caller can unit-
+    /// test the leader-hint resolution + the CLUSTER introspection leader marking WITHOUT spinning up
+    /// a multi-node raft cluster. The inbox / config are inert (an `propose` here lands `None`); the
+    /// status watch's sender is dropped after the initial send, but a `watch::Receiver` keeps
+    /// returning the last sent value, so `status()` / `leader_id()` read the fixed snapshot.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(id: NodeId, leader_id: Option<NodeId>) -> Self {
+        let (inbox, _inbox_rx) = mpsc::unbounded_channel();
+        let status = Status {
+            role: if leader_id == Some(id) {
+                Role::Leader
+            } else {
+                Role::Follower
+            },
+            current_term: 1,
+            commit_index: 0,
+            last_applied: 0,
+            applied_count: 0,
+            leader_id,
+        };
+        let (status_tx, status_rx) = watch::channel(status);
+        // Keep the published value readable: leak the sender so the receiver never observes a closed
+        // channel (a dropped sender would still return the last value, but leaking is unambiguous).
+        std::mem::forget(status_tx);
+        let (config_tx, config_rx) = watch::channel(ClusterConfig::default());
+        std::mem::forget(config_tx);
+        NodeHandle {
+            id,
+            inbox,
+            status: status_rx,
+            config: config_rx,
+            addrs: Arc::new(BTreeMap::new()),
+        }
     }
 
     /// The current leader's cluster-bus `host:port`, resolved from the watched

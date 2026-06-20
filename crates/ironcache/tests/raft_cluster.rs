@@ -442,6 +442,47 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
              list each node ONCE under its real announce id (no synth/announce duplicate inflation)"
         );
 
+        // ---- (2c) PROD-9 LEADER MARKING IN INTROSPECTION (over the wire). With the cluster formed,
+        // EVERY node recognizes one raft leader, so a CLIENT can DISCOVER the leader without trial-
+        // and-error: CLUSTER INFO carries a `cluster_raft_leader:<announce-id>` line naming a REAL
+        // node id (ID0/ID1/ID2, not `none`), and CLUSTER NODES marks EXACTLY ONE node with the
+        // `,leader` flag. Poll (leader recognition + the table commit are async on each node).
+        let leader_marked = {
+            let start = env.now();
+            loop {
+                let mut all_ok = true;
+                'mark: for i in 0..3 {
+                    let info = cmd(&mut clients[i], &["CLUSTER", "INFO"]).await;
+                    // INFO names a real leader (one of the three announce ids), not `none`.
+                    let names_leader = [ID0, ID1, ID2]
+                        .iter()
+                        .any(|id| info.contains(&format!("cluster_raft_leader:{id}")));
+                    if !names_leader {
+                        all_ok = false;
+                        break;
+                    }
+                    // NODES marks EXACTLY ONE node as the raft leader (the `,leader` flag).
+                    let nodes = cmd(&mut clients[i], &["CLUSTER", "NODES"]).await;
+                    if nodes.matches(",leader").count() != 1 {
+                        all_ok = false;
+                        break 'mark;
+                    }
+                }
+                if all_ok {
+                    break true;
+                }
+                if deadline_passed(&env, start, timeout) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        assert!(
+            leader_marked,
+            "PROD-9: every node must report the raft leader in CLUSTER INFO (cluster_raft_leader:\
+             <real-id>) and mark EXACTLY ONE node with the `,leader` flag in CLUSTER NODES"
+        );
+
         // ---- (3) SERVE: the leader owns every slot, so a SET/GET on it is served locally.
         let owned_key = key_in_range(0, 16383);
         let set = cmd(&mut clients[leader_idx], &["SET", &owned_key, "v"]).await;

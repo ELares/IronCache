@@ -48,6 +48,12 @@ pub use acl::{AclParseError, AclResolution, AclState, Category, DEFAULT_USER, Us
 // the returned `AclSideEffect` (the aclfile SAVE/LOAD I/O it owns).
 pub use cmd_acl::{AclSideEffect, dispatch_acl};
 
+// PROD-9 leader-hint: the serve-layer raft-mode CLUSTER mutator resolves which node is the raft
+// LEADER (and its advertised CLIENT endpoint) for a NOTLEADER redirect, so an operator who hit a
+// FOLLOWER knows where to reissue. `resolve_leader_hint` reads the leader the `RaftHandle`
+// recognizes and maps it to the leader's client `host:port` via the committed slot map.
+pub use cmd_cluster::{LeaderHint, resolve_leader_hint};
+
 pub use admission::is_denyoom;
 // The BLOCKING command family (PROD-9): the serve layer parses a blocking command into a
 // [`cmd_block::BlockSpec`] (timeout + keys + op), ATTEMPTS the non-blocking op via
