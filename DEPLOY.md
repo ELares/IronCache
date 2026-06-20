@@ -278,13 +278,22 @@ remove them explicitly when you mean to discard data.
 
 ## 9. Raft cluster formation, quorum, and scaling
 
-- **Formation**: in raft mode every node boots from the SAME topology (the voter
-  set + the peer bus addresses, `host:(port+10000)`). It builds one shared slot
-  map seeded with its own id, then the Raft control plane elects a leader and
-  replicates the committed slot-ownership log so all nodes converge on one
-  ownership view (no two owners per slot per epoch). Peer DNS is resolved LAZILY at
-  dial time, so a peer that is not up yet does not abort another node's boot -- the
-  adapter retries each heartbeat.
+- **Formation (TURNKEY)**: in raft mode every node boots from the SAME topology
+  (the voter set + the peer bus addresses, `host:(port+10000)`, AND each node's
+  declared `slots`). It builds one shared slot map seeded with its own id, then the
+  Raft control plane elects a leader. On a FRESH cluster (an empty committed
+  config) the elected leader AUTO-APPLIES the topology's declared node table + slot
+  ownership through the replicated log, so all nodes converge on one ownership view
+  -- `cluster_state:ok` with all 16384 slots assigned -- with NO operator action.
+  You do NOT hand-run `CLUSTER MEET` / `CLUSTER ADDSLOTS` for the shipped static
+  topology; those commands are reserved for RUNTIME changes (adding a node,
+  rebalancing). The auto-apply is fresh-only and idempotent: it fires once on a
+  pristine cluster and never re-runs, so a node RESTART (which recovers its
+  persisted committed config) does NOT re-bootstrap or clobber any runtime change /
+  migration. Peer DNS is resolved LAZILY at dial time, so a peer that is not up yet
+  does not abort another node's boot -- the adapter retries each heartbeat. (If a
+  topology declares NO slots at all, no auto-apply happens and slot ownership is
+  established entirely by runtime `CLUSTER ADDSLOTS` / `SETSLOT` proposals.)
 - **Quorum / PDB**: a Raft cluster needs a majority alive. Keep an ODD node count.
   The PodDisruptionBudget (`maxUnavailable: 1`) ensures a voluntary disruption
   (drain, rolling node upgrade) takes at most one pod at a time, so a 3-node
@@ -302,7 +311,15 @@ remove them explicitly when you mean to discard data.
 
 **Validated offline (in this repo, against the real artifacts):**
 
-- `cargo build --workspace` is green; NO Rust source was changed.
+- `cargo build --workspace` is green.
+- TURNKEY formation has an automated integration test (`crates/ironcache/tests/
+  turnkey_cluster.rs`): a fresh 3-node raft cluster booted from the shipped static
+  topology reaches `cluster_state:ok` + all 16384 slots assigned + 3 known nodes
+  with NO manual `CLUSTER MEET` / `ADDSLOTS`, the committed config is stable
+  afterward (no re-bootstrap churn), and a runtime `SETSLOT` is not clobbered. It
+  was also validated by hand with three local processes (fresh boot -> auto-ok,
+  then a leader restart that recovered its committed config WITHOUT re-bootstrapping
+  -- the config epoch stayed put).
 - The docker-compose cluster + single-node TOML configs, the Helm-rendered cluster
   config, and the raw-manifest embedded config were each fed through the REAL
   `ironcache check --config ...` and pass -- this exercises the actual layered
