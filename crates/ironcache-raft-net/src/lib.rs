@@ -1902,16 +1902,20 @@ mod tests {
             leader_commit: 11,
         });
 
-        // HA-3c InstallSnapshot: empty data, a typical config-snapshot blob (arbitrary
-        // bytes incl. zero / CRLF / 0xFF), and the zero/large index/term edges, all
-        // round-trip byte-for-byte (the snapshot data is the field most likely to be
-        // mis-framed, so cover the length-prefixed blob edges).
+        // HA-3c / PROD-9 InstallSnapshot: empty data, a typical config-snapshot blob
+        // (arbitrary bytes incl. zero / CRLF / 0xFF), and the zero/large index/term edges,
+        // plus the PROD-9 chunk fields (offset, done at both true/false), all round-trip
+        // byte-for-byte (the snapshot data is the field most likely to be mis-framed, so
+        // cover the length-prefixed blob edges).
         assert_round_trips(&RaftMsg::InstallSnapshot {
             term: 0,
             leader_id: NodeId(0),
             last_included_index: 0,
             last_included_term: 0,
+            offset: 0,
             data: vec![],
+            // A zero-length snapshot installs in one empty `done` chunk.
+            done: true,
             // HA-3d: empty config baseline (a static / pre-membership cluster).
             voters: BTreeSet::new(),
             learners: BTreeSet::new(),
@@ -1921,7 +1925,10 @@ mod tests {
             leader_id: NodeId(4),
             last_included_index: 9_001,
             last_included_term: 11,
+            // A NON-final chunk at a non-zero offset (done == false).
+            offset: 256 * 1024,
             data: vec![0, 1, 2, 255, 254, 13, 10, 0, 42],
+            done: false,
             // HA-3d: a populated config baseline (voters + a learner) round-trips too.
             voters: [NodeId(1), NodeId(4), NodeId(7)].into_iter().collect(),
             learners: [NodeId(9)].into_iter().collect(),
@@ -1931,24 +1938,33 @@ mod tests {
             leader_id: NodeId(u64::MAX),
             last_included_index: u64::MAX,
             last_included_term: u64::MAX,
+            offset: u64::MAX,
             data: vec![7; 128],
+            done: true,
             voters: [NodeId(0), NodeId(u64::MAX)].into_iter().collect(),
             learners: BTreeSet::new(),
         });
 
-        // HA-3c InstallSnapshotResp: the term PLUS the echoed last_included_index (Figure
-        // 13), at the zero and large edges of both fields.
+        // HA-3c / PROD-9 InstallSnapshotResp: the term, the echoed last_included_index
+        // (Figure 13), the `installed` flag, and the `next_offset`, at the zero and large
+        // edges and both installed states.
         assert_round_trips(&RaftMsg::InstallSnapshotResp {
             term: 0,
             last_included_index: 0,
+            installed: false,
+            next_offset: 0,
         });
         assert_round_trips(&RaftMsg::InstallSnapshotResp {
             term: u64::MAX,
             last_included_index: u64::MAX,
+            installed: true,
+            next_offset: u64::MAX,
         });
         assert_round_trips(&RaftMsg::InstallSnapshotResp {
             term: 7,
             last_included_index: 9_001,
+            installed: false,
+            next_offset: 256 * 1024,
         });
     }
 
@@ -2226,6 +2242,52 @@ mod tests {
             parse_raftmsg_command(&ok_frame),
             Ok(None),
             "a length AT the cap is legitimate; the parser must ask for more bytes, not reject"
+        );
+    }
+
+    /// PROD-9: every chunked InstallSnapshot frame is WELL UNDER the cluster-bus max-frame
+    /// length. The default chunk size is the snapshot-byte budget per frame; the encoded frame
+    /// adds only fixed scalar/blob framing on top, so a worst-case full chunk frame is the chunk
+    /// size plus a tiny constant -- many orders of magnitude below the bound. This is the whole
+    /// point of chunking: a multi-hundred-MB snapshot ships as many small frames, never one giant
+    /// one that approaches (or exceeds) the bound.
+    #[test]
+    fn chunked_install_snapshot_chunk_is_well_under_the_frame_bound() {
+        use std::collections::BTreeSet;
+
+        use ironcache_raft::{DEFAULT_SNAPSHOT_CHUNK_BYTES, NodeId, RaftMsg};
+
+        // The default chunk size is comfortably below the bound (with vast headroom). A
+        // compile-time check (both sides are consts): the chunk budget is well under the frame cap.
+        const {
+            assert!(
+                DEFAULT_SNAPSHOT_CHUNK_BYTES < ironcache_runtime::MAX_CLUSTER_FRAME_LEN / 1024,
+                "the default chunk size must leave huge headroom under the bus frame bound"
+            );
+        }
+
+        // A worst-case full-size chunk frame: a max-size data payload plus the (tiny) fixed
+        // framing. The encoded bytes must be a small constant over the chunk size, and far below
+        // the frame bound.
+        let chunk = vec![0xABu8; DEFAULT_SNAPSHOT_CHUNK_BYTES];
+        let encoded = encode_raft_msg(&RaftMsg::InstallSnapshot {
+            term: u64::MAX,
+            leader_id: NodeId(u64::MAX),
+            last_included_index: u64::MAX,
+            last_included_term: u64::MAX,
+            offset: u64::MAX,
+            data: chunk,
+            done: false,
+            voters: [NodeId(1), NodeId(2), NodeId(3)].into_iter().collect(),
+            learners: BTreeSet::new(),
+        });
+        assert!(
+            encoded.len() < DEFAULT_SNAPSHOT_CHUNK_BYTES + 1024,
+            "the encoded chunk frame is the chunk size plus only a small fixed framing overhead"
+        );
+        assert!(
+            encoded.len() < ironcache_runtime::MAX_CLUSTER_FRAME_LEN,
+            "every chunked InstallSnapshot frame is under the cluster-bus max-frame length"
         );
     }
 

@@ -375,6 +375,17 @@ pub struct Config {
     /// mode (the default static path never builds a `RaftConfig`). TOML
     /// (`raft_snapshot_threshold = N`) + the `IRONCACHE_RAFT_SNAPSHOT_THRESHOLD` env var.
     pub raft_snapshot_threshold: u64,
+    /// The PROD-9 chunked-InstallSnapshot chunk size (in BYTES): when a leader catches up a
+    /// lagging follower by shipping its Raft snapshot, it sends the snapshot in bounded
+    /// SEQUENTIAL chunks of at most this many bytes (Raft Figure 13) instead of one giant
+    /// frame, so no install frame approaches the cluster-bus max-frame length and neither end
+    /// spikes memory. Passed straight into `RaftConfig.snapshot_chunk_bytes`. Defaults to
+    /// [`DEFAULT_RAFT_SNAPSHOT_CHUNK_BYTES`] (256 KiB), comfortably under the bus frame bound;
+    /// it is a pure framing parameter, so any value installs a byte-identical snapshot. `0` is
+    /// treated as "the whole snapshot in one chunk" (no zero-length-chunk loop). Meaningful
+    /// ONLY in raft-governance mode. TOML (`raft_snapshot_chunk_bytes = N`) + the
+    /// `IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES` env var.
+    pub raft_snapshot_chunk_bytes: usize,
     /// The durable data directory for the Raft log (and future on-disk state). When set, a
     /// raft-mode node persists its committed Raft log at `<data_dir>/ironcache-raft-<bus-port>.log`,
     /// so the control-plane state survives a reboot that clears the OS temp dir. When `None`
@@ -548,6 +559,7 @@ impl Default for Config {
             // disabled, to keep the determinism sweep byte-identical); a real raft-mode
             // node compacts once its log grows this far past the last snapshot.
             raft_snapshot_threshold: DEFAULT_RAFT_SNAPSHOT_THRESHOLD,
+            raft_snapshot_chunk_bytes: DEFAULT_RAFT_SNAPSHOT_CHUNK_BYTES,
             // No data directory by default: the Raft log lands under the OS temp dir
             // (byte-unchanged pre-existing behavior). Setting it makes the log durable
             // across a reboot that clears /tmp. Meaningful only in raft-governance mode.
@@ -636,6 +648,15 @@ pub const DEFAULT_MIN_REPLICAS_MAX_LAG: u64 = 10;
 /// comfortable, cheap cadence. Only the raft-governance boot path reads this; the default
 /// static path never does.
 pub const DEFAULT_RAFT_SNAPSHOT_THRESHOLD: u64 = 1024;
+
+/// The default PROD-9 chunked-InstallSnapshot chunk size in BYTES (256 KiB). Mirrors the
+/// pure engine's [`ironcache_raft::DEFAULT_SNAPSHOT_CHUNK_BYTES`]: comfortably under the
+/// cluster-bus max-frame length (`ironcache_runtime::MAX_CLUSTER_FRAME_LEN`, 512 MiB) so a
+/// large snapshot is shipped in many small frames rather than one giant one, while large
+/// enough that a typical config snapshot is one or two chunks. A pure framing knob -- the
+/// installed snapshot is byte-identical at any value. Only the raft-governance boot path
+/// reads it.
+pub const DEFAULT_RAFT_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 
 /// The eight Redis `maxmemory-policy` names IronCache accepts (EVICTION.md #50).
 /// Inlined here (rather than depending on `ironcache-eviction`) to keep the config
@@ -1178,6 +1199,10 @@ pub struct ConfigOverlay {
     /// `None` leaves the lower layer (default [`DEFAULT_RAFT_SNAPSHOT_THRESHOLD`]); `0`
     /// disables compaction.
     pub raft_snapshot_threshold: Option<u64>,
+    /// PROD-9 chunked-InstallSnapshot chunk size (bytes). TOML (`raft_snapshot_chunk_bytes = N`)
+    /// plus the `IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES` env var. `None` leaves the lower layer
+    /// (default [`DEFAULT_RAFT_SNAPSHOT_CHUNK_BYTES`]); `0` sends the whole snapshot in one chunk.
+    pub raft_snapshot_chunk_bytes: Option<usize>,
     /// The durable data directory for the Raft log (and future on-disk state). TOML
     /// (`data_dir = "/var/lib/ironcache"`, a string path) + the `IRONCACHE_DATA_DIR` env var.
     /// `None` leaves the lower layer (default `None` = the OS temp dir, byte-unchanged).
@@ -1363,6 +1388,12 @@ impl ConfigOverlay {
                 reason: format!("not a number: {v}"),
             })?);
         }
+        if let Ok(v) = std::env::var("IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES") {
+            o.raft_snapshot_chunk_bytes = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "raft-snapshot-chunk-bytes",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
         // The durable data directory is a single scalar path, so it is env-encodable (useful
         // for per-pod injection in a stateful set alongside the announce id). A path is taken
         // verbatim (no parse can fail); an empty value is rejected by Config::validate.
@@ -1448,6 +1479,7 @@ impl ConfigOverlay {
     /// Returns [`ConfigError::Size`] if this overlay's `maxmemory` is malformed or
     /// out of range. A bad ceiling propagates so the binary hard-fails at boot
     /// rather than silently going unlimited (honest-ceiling invariant #3).
+    #[allow(clippy::too_many_lines)]
     fn apply_to(&self, cfg: &mut Config) -> Result<(), ConfigError> {
         if let Some(v) = self.bind {
             cfg.bind = v;
@@ -1513,6 +1545,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.raft_snapshot_threshold {
             cfg.raft_snapshot_threshold = v;
+        }
+        if let Some(v) = self.raft_snapshot_chunk_bytes {
+            cfg.raft_snapshot_chunk_bytes = v;
         }
         if let Some(ref v) = self.data_dir {
             cfg.data_dir = Some(v.clone());
@@ -1754,6 +1789,13 @@ mod tests {
         // raft-mode node actually compacts (the engine's own default is 0 = disabled).
         assert_eq!(c.raft_snapshot_threshold, DEFAULT_RAFT_SNAPSHOT_THRESHOLD);
         assert_ne!(c.raft_snapshot_threshold, 0);
+        // PROD-9 chunked InstallSnapshot: the chunk size defaults to 256 KiB, well under the bus
+        // frame bound (a pure framing knob; any value installs a byte-identical snapshot).
+        assert_eq!(
+            c.raft_snapshot_chunk_bytes,
+            DEFAULT_RAFT_SNAPSHOT_CHUNK_BYTES
+        );
+        assert_eq!(c.raft_snapshot_chunk_bytes, 256 * 1024);
         // CONNECTION SAFETY ceilings (PROD-SAFETY #3/#4/#5): the idle timeout is OFF by default
         // (Redis default 0, byte-unchanged), `maxclients` defaults to the Redis 10000 ceiling (an
         // unconfigured node is protected from connection exhaustion), and the output-buffer cap
@@ -1995,18 +2037,24 @@ mod tests {
             replica_max_lag: Some(1024),
             failover_timeout_secs: Some(12),
             raft_snapshot_threshold: Some(256),
+            raft_snapshot_chunk_bytes: Some(64 * 1024),
             ..Default::default()
         }])
         .unwrap();
         assert_eq!(c.replica_max_lag, 1024);
         assert_eq!(c.failover_timeout_secs, 12);
         assert_eq!(c.raft_snapshot_threshold, 256);
+        assert_eq!(c.raft_snapshot_chunk_bytes, 64 * 1024);
         let unset = Config::resolve(&[ConfigOverlay::default()]).unwrap();
         assert_eq!(unset.replica_max_lag, DEFAULT_REPLICA_MAX_LAG);
         assert_eq!(unset.failover_timeout_secs, DEFAULT_FAILOVER_TIMEOUT_SECS);
         assert_eq!(
             unset.raft_snapshot_threshold,
             DEFAULT_RAFT_SNAPSHOT_THRESHOLD
+        );
+        assert_eq!(
+            unset.raft_snapshot_chunk_bytes,
+            DEFAULT_RAFT_SNAPSHOT_CHUNK_BYTES
         );
         // An explicit 0 disables compaction (the pre-3c unbounded-log behaviour).
         let disabled = Config::resolve(&[ConfigOverlay {
@@ -2017,12 +2065,14 @@ mod tests {
         assert_eq!(disabled.raft_snapshot_threshold, 0);
         // TOML form.
         let o = ConfigOverlay::from_toml_str(
-            "replica_max_lag = 64\nfailover_timeout_secs = 3\nraft_snapshot_threshold = 2048\n",
+            "replica_max_lag = 64\nfailover_timeout_secs = 3\nraft_snapshot_threshold = 2048\n\
+             raft_snapshot_chunk_bytes = 131072\n",
         )
         .unwrap();
         assert_eq!(o.replica_max_lag, Some(64));
         assert_eq!(o.failover_timeout_secs, Some(3));
         assert_eq!(o.raft_snapshot_threshold, Some(2048));
+        assert_eq!(o.raft_snapshot_chunk_bytes, Some(131_072));
     }
 
     #[test]

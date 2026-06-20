@@ -256,8 +256,11 @@ longer owns the slot, and serves `MOVED` to the new owner.
   Redis-style, default off): an owner refuses a write (`-NOREPLICAS`) unless at least N replicas
   are currently in sync, bounding the failover write-loss window from the write side.
 - **Log compaction.** The Raft log is snapshotted and compacted (configurable
-  `raft_snapshot_threshold`), with an `InstallSnapshot` path to catch up a far-behind or newly
-  added node; the durable log + snapshot live under a configurable `data_dir`.
+  `raft_snapshot_threshold`), with a *chunked* `InstallSnapshot` path to catch up a far-behind
+  or newly added node: the leader ships the snapshot in bounded sequential chunks (size
+  `raft_snapshot_chunk_bytes`, default 256 KiB, well under the cluster-bus frame bound) so a
+  large snapshot never becomes one giant frame or a memory spike on either end; the durable log
+  + snapshot live under a configurable `data_dir`.
 
 **Consistency model.** Cluster *control state* (who owns which slot) is linearizable through
 Raft. *User data* replication is asynchronous, so a failover can lose writes that had not yet
@@ -291,6 +294,7 @@ cluster_mode = "raft"
 cluster_announce_id = "0000000000000000000000000000000000000000"
 # data_dir = "/var/lib/ironcache"       # durable Raft-log + snapshot directory; unset (default) uses the OS temp dir
 # raft_snapshot_threshold = 1024        # compact the Raft log after this many entries (default 1024)
+# raft_snapshot_chunk_bytes = 262144    # InstallSnapshot chunk size in bytes (default 262144 = 256 KiB; 0 = one chunk)
 # min_replicas_to_write = 0             # refuse a write (-NOREPLICAS) below this many in-sync replicas (default 0 = off)
 # min_replicas_max_lag = 10             # the in-sync lag bound for min_replicas_to_write
 
