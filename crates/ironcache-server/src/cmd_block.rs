@@ -119,6 +119,26 @@ pub struct BlockSpec {
     pub op: BlockOp,
 }
 
+impl BlockSpec {
+    /// The keys the serve layer should register a blocking WAITER on (a subset of [`Self::keys`]).
+    /// For the pop families this is every key (any key gaining an element makes the command ready).
+    /// For BLMOVE / BRPOPLPUSH ([`BlockOp::Move`]) it is ONLY the SOURCE key (`keys[0]`): a Move
+    /// blocks waiting for the source to become non-empty, so a push to the DESTINATION must NOT wake
+    /// it (that would be a spurious re-park that also perturbs the destination key's waiter FIFO).
+    /// The full [`Self::keys`] is still used by [`try_block_op`] (the move needs both src and dst);
+    /// only the WAITER REGISTRATION is narrowed here. PROD-9 FIX3.
+    #[must_use]
+    pub fn wait_keys(&self) -> &[Vec<u8>] {
+        match self.op {
+            // A Move blocks only on the source; register on `keys[0]` alone. (`keys` always holds
+            // [src, dst] for a Move, so the slice is non-empty; guard defensively all the same.)
+            BlockOp::Move { .. } => &self.keys[..self.keys.len().min(1)],
+            // Pop families: every key can make the command ready.
+            _ => &self.keys,
+        }
+    }
+}
+
 /// The blocking OPERATION, carrying the per-command parsed parameters [`try_block_op`] needs.
 #[derive(Debug, Clone)]
 pub enum BlockOp {
@@ -867,6 +887,25 @@ mod tests {
             vec![b"z".to_vec()]
         );
         assert!(wake_keys_for_write(b"GET", &req(&[b"GET", b"k"])).is_empty());
+    }
+
+    #[test]
+    fn wait_keys_pop_registers_on_every_key_move_only_on_src() {
+        // BLPOP registers a waiter on EVERY key.
+        let bpop = parse_block(b"BLPOP", &req(&[b"BLPOP", b"k1", b"k2", b"0"])).unwrap();
+        assert_eq!(bpop.wait_keys(), &[b"k1".to_vec(), b"k2".to_vec()]);
+        // BLMOVE registers a waiter ONLY on the SOURCE (keys[0]), not the destination (FIX3).
+        let blmove = parse_block(
+            b"BLMOVE",
+            &req(&[b"BLMOVE", b"src", b"dst", b"LEFT", b"RIGHT", b"0"]),
+        )
+        .unwrap();
+        assert_eq!(blmove.keys, vec![b"src".to_vec(), b"dst".to_vec()]);
+        assert_eq!(blmove.wait_keys(), &[b"src".to_vec()]);
+        // BRPOPLPUSH is a Move too: source-only waiter.
+        let brpoplpush =
+            parse_block(b"BRPOPLPUSH", &req(&[b"BRPOPLPUSH", b"src", b"dst", b"0"])).unwrap();
+        assert_eq!(brpoplpush.wait_keys(), &[b"src".to_vec()]);
     }
 
     #[test]

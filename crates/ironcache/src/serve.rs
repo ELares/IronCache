@@ -4374,9 +4374,20 @@ fn parse_wait_int(arg: &[u8]) -> Option<i64> {
 
 /// The poll quantum for a WAIT park (PROD-9): how often to re-check the in-sync replica count + a
 /// kill while parked, so an UNPAUSE / a newly-attached replica / a CLIENT KILL is observed
-/// promptly. The pop-park path does NOT poll (it parks spin-free on the waiter `Notify`); only
-/// WAIT polls (its quorum is published by the repl tasks, not via the waiter registry).
+/// promptly. WAIT polls because its quorum is published by the repl tasks, not via a waiter
+/// registry.
 const WAIT_POLL_QUANTUM: core::time::Duration = core::time::Duration::from_millis(50);
+
+/// The kill-poll quantum for a POP park (PROD-9 FIX2): the UPPER BOUND on a pop park's timer arm,
+/// so a forever-parked (no timeout) blocked client on an idle key still reaches its loop-top
+/// `is_killed()` check within ~50ms of a `CLIENT KILL` and is torn down promptly. The pop park is
+/// otherwise spin-free (it parks on the waiter `Notify` for the wake); this bounded re-check exists
+/// ONLY so a kill of an idle-key forever-park is not deferred until the next push / pipelined bytes
+/// / peer close. `ClientHandle` is deliberately runtime-agnostic (it depends only on
+/// `ironcache-env`, no tokio), so it carries no wake handle of its own; a bounded poll -- mirroring
+/// WAIT's existing quantum -- is the runtime-coupling-free way to make a kill prompt. A push still
+/// wakes the park immediately via the `Notify` (no added latency on the data path).
+const KILL_POLL_QUANTUM: core::time::Duration = core::time::Duration::from_millis(50);
 
 /// Run the BLOCKING PARK loop (PROD-9): park this connection until a wake (a push to a waited key
 /// makes it ready), the timeout elapses, the connection is closed/killed, or (for WAIT) the
@@ -4441,18 +4452,64 @@ async fn run_block_park(
         .await;
     }
 
-    // POP PARK. Register a FIFO waiter on every key; the guard deregisters on EVERY exit (RAII).
+    // POP PARK. Register a FIFO waiter on every key BEFORE the first attempt; the guard deregisters
+    // on EVERY exit (RAII). Registering first is what makes the loop below an ATTEMPT-THEN-PARK
+    // (register-then-recheck) rather than a park-then-attempt: see the re-attempt at the top of the
+    // loop and the lost-wakeup note there.
     let registry = shard_blocking();
     let (_guard, wake) =
-        crate::blocking::WaiterGuard::park(&registry, park.db, &park.spec.keys, conn.id);
+        crate::blocking::WaiterGuard::park(&registry, park.db, park.spec.wait_keys(), conn.id);
+
+    // Whether to PROBE the store this iteration. Set on the FIRST iteration (the register-then-
+    // recheck) and after a WAKE / pipelined BYTES (a push may have made a key ready). NOT set after a
+    // bare kill-poll timer tick: a periodic tick must only re-check `is_killed()`, NEVER re-probe the
+    // store -- otherwise a NON-front waiter could grab a pushed element off its own poll tick,
+    // breaking FIFO fairness. The pop is driven by the WAKE path (FIFO: a push wakes only the FRONT
+    // waiter); the poll exists solely for prompt kill detection on a forever-park.
+    let mut attempt_pop = true;
 
     loop {
         // A kill observed between iterations ends the park (the reply is abandoned; the connection
-        // is torn down). Cold relaxed load.
+        // is torn down). Cold relaxed load. With the bounded KILL_POLL_QUANTUM arm in the select!
+        // below, a forever-park (no timeout) on an idle key still reaches this check within ~50ms
+        // of a `CLIENT KILL`, so a killed blocked client is torn down promptly (PROD-9 FIX2) rather
+        // than only on the next push / pipelined bytes / peer close.
         if client_handle.is_killed() {
             return true;
         }
-        // Compute the REMAINING time to the deadline; if already past, treat as a timeout now.
+
+        // RE-ATTEMPT THE POP (register-then-recheck, PROD-9 FIX1), but ONLY when `attempt_pop` is set
+        // (the first iteration, or after a wake / pipelined bytes -- never on a bare kill-poll tick).
+        // The waiter is ALREADY registered (above, on the first iteration; the same guard is held on
+        // every later iteration), so the FIRST-iteration probe closes the LOST-WAKEUP window: when
+        // this blocking command is pipelined behind a reply-producing command, the serve loop FLUSHES
+        // that earlier reply (an `await` that can yield) BEFORE calling this function. A concurrent
+        // push during that pre-registration flush would have called `wake_one` and found NO waiter
+        // (ours not yet registered) -> woken nobody. Because the waiter is registered before this
+        // recheck, that push's element is observed HERE on the first iteration instead of being lost
+        // until timeout. The recheck also covers the cross-shard wake path (a sibling-shard push that
+        // ran here through `run_remote`) and any number of awaits that preceded registration. Cost:
+        // one extra store probe per park (a COLD path, never the hot per-command path). On a WAKE this
+        // is the same re-attempt the prior park-then-attempt loop did, so the keep-FIFO-position
+        // behavior is unchanged (the guard is held the whole time).
+        if attempt_pop {
+            let now = UnixMillis(env.borrow().now_unix_millis());
+            let attempt = {
+                let mut store = store_rc.borrow_mut();
+                ironcache_server::try_block_op(&mut *store, park.db, now, &park.spec)
+            };
+            if let Some(reply) = attempt {
+                // A successful blocked pop fires the SAME lpop/rpop/zpopmin keyspace event as a
+                // non-blocking pop; publish it AFTER the reply is flushed (per-connection FIFO).
+                let closed = flush_block_reply(stream, out, conn.proto, reply).await;
+                publish_pending_keyspace_events(inbox, home.index).await;
+                return closed;
+            }
+        }
+
+        // Compute the REMAINING time to the deadline; if already past, reply the nil-array (timeout).
+        // This is evaluated EVERY iteration (including after a kill-poll tick) so a real timeout still
+        // fires even though the poll tick itself does not re-probe the store.
         let remaining: Option<core::time::Duration> = match deadline {
             None => None,
             Some(dl) => {
@@ -4465,56 +4522,37 @@ async fn run_block_park(
             }
         };
 
-        // PARK: select on the wake, the timeout (if any), and a stream read (peer-close detection).
-        // The read is into a FRESH buffer and APPENDED to `read_buf` so a partial frame already in
-        // `read_buf` survives a cancelled read (the same pattern the idle wait uses). NO RefCell
-        // borrow is held across the await.
-        let woken = if let Some(dur) = remaining {
-            tokio::select! {
-                () = wake.notified() => WakeOutcome::Wake,
-                () = timer_rt.timer(dur) => WakeOutcome::Timeout,
-                res = stream.recv(Vec::new()) => match res {
-                    Ok(r) if r.n == 0 => return true, // peer closed while parked
-                    Ok(r) => { read_buf.extend_from_slice(&r.buf[..r.n]); WakeOutcome::Bytes }
-                    Err(_) => return true,
-                },
-            }
-        } else {
-            tokio::select! {
-                () = wake.notified() => WakeOutcome::Wake,
-                res = stream.recv(Vec::new()) => match res {
-                    Ok(r) if r.n == 0 => return true,
-                    Ok(r) => { read_buf.extend_from_slice(&r.buf[..r.n]); WakeOutcome::Bytes }
-                    Err(_) => return true,
-                },
-            }
+        // PARK: select on the wake, the timer, and a stream read (peer-close detection). The read is
+        // into a FRESH buffer and APPENDED to `read_buf` so a partial frame already in `read_buf`
+        // survives a cancelled read (the same pattern the idle wait uses). NO RefCell borrow is held
+        // across the await.
+        //
+        // The timer duration is the remaining time CAPPED at KILL_POLL_QUANTUM (for a finite
+        // deadline) or exactly KILL_POLL_QUANTUM (for a forever-park), so a killed forever-parked
+        // client notices within ~50ms (mirrors the WAIT poll's bounded quantum). The timer arm fires
+        // either at the real deadline (-> the next iteration's remaining-time check replies the
+        // nil-array) OR at the bounded poll quantum before the deadline (-> loop, re-check
+        // `is_killed()` ONLY, no store probe). The two are distinguished by re-reading the clock at
+        // the top of the loop.
+        let timer_dur = match remaining {
+            Some(dur) => dur.min(KILL_POLL_QUANTUM),
+            None => KILL_POLL_QUANTUM,
+        };
+        let woken = tokio::select! {
+            () = wake.notified() => WakeOutcome::Wake,
+            () = timer_rt.timer(timer_dur) => WakeOutcome::Timer,
+            res = stream.recv(Vec::new()) => match res {
+                Ok(r) if r.n == 0 => return true, // peer closed while parked
+                Ok(r) => { read_buf.extend_from_slice(&r.buf[..r.n]); WakeOutcome::Bytes }
+                Err(_) => return true,
+            },
         };
 
-        match woken {
-            WakeOutcome::Timeout => {
-                return flush_block_reply(stream, out, conn.proto, block_timeout_value()).await;
-            }
-            // A wake OR new pipelined bytes: RE-ATTEMPT the pop (a push may have made a key ready,
-            // and re-checking on new bytes is harmless -- it just re-reads the store). On success,
-            // reply + publish the keyspace event; on still-empty, loop and re-park.
-            WakeOutcome::Wake | WakeOutcome::Bytes => {
-                let now = UnixMillis(env.borrow().now_unix_millis());
-                let attempt = {
-                    let mut store = store_rc.borrow_mut();
-                    ironcache_server::try_block_op(&mut *store, park.db, now, &park.spec)
-                };
-                if let Some(reply) = attempt {
-                    // A successful blocked pop fires the SAME lpop/rpop/zpopmin keyspace event as a
-                    // non-blocking pop; publish it AFTER the reply is flushed (per-connection FIFO).
-                    let closed = flush_block_reply(stream, out, conn.proto, reply).await;
-                    publish_pending_keyspace_events(inbox, home.index).await;
-                    return closed;
-                }
-                // Still empty: another waiter won the race (or a spurious wake / unrelated bytes).
-                // Loop and re-park on the SAME `Notify` (the guard is held, so the waiter keeps its
-                // FIFO position -- the longest-waiting client is served first on the next push).
-            }
-        }
+        // Decide whether the NEXT iteration probes the store. A WAKE (a push woke THIS front waiter)
+        // or pipelined BYTES drive a re-attempt; a bare kill-poll TIMER tick does NOT (it only loops
+        // to re-check `is_killed()` + the deadline, preserving FIFO -- only the woken front waiter
+        // races for the element).
+        attempt_pop = matches!(woken, WakeOutcome::Wake | WakeOutcome::Bytes);
     }
 }
 
@@ -4522,8 +4560,12 @@ async fn run_block_park(
 enum WakeOutcome {
     /// The waiter `Notify` fired (a push to a waited key): re-attempt the pop.
     Wake,
-    /// The timeout elapsed: reply the nil-array.
-    Timeout,
+    /// The park timer elapsed: either the real deadline (the next loop iteration replies the
+    /// nil-array once it confirms the deadline is past) OR a bounded kill-poll tick (the next
+    /// iteration re-checks `is_killed()` ONLY -- it does NOT re-probe the store, so a poll tick
+    /// never lets a non-front waiter steal a pushed element, preserving FIFO fairness). The two are
+    /// distinguished by re-reading the clock at the top of the loop.
+    Timer,
     /// New bytes arrived while parked (a pipelined command): re-attempt (harmless) and keep the
     /// bytes in `read_buf` for the decode loop to process after the park ends.
     Bytes,
