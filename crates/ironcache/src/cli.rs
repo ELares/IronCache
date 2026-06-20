@@ -60,6 +60,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub shards: Option<usize>,
 
+    /// Per-shard async I/O backend: `tokio` (default, portable) or `io_uring` (PROD-10 / #28,
+    /// Linux-only + requires the `io_uring` build feature; falls back to tokio otherwise).
+    #[arg(long, global = true, value_name = "BACKEND")]
+    pub runtime: Option<String>,
+
     /// The subcommand. Absent means `server`.
     #[command(subcommand)]
     pub command: Option<Command>,

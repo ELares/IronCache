@@ -157,6 +157,23 @@ pub mod tokio_rt;
 #[cfg(feature = "tokio")]
 pub use tokio_rt::TokioRuntime;
 
+// The OPTIONAL Linux io_uring backend (PROD-10 / #28, docs/design/IOURING_DATAPATH.md): a
+// SECOND `Runtime` impl behind the default-OFF `io_uring` feature, gated to Linux so the
+// feature is inert on macOS/Windows/BSD (the tokio backend always serves those). The default
+// build (no `io_uring` feature) never compiles this module, never pulls tokio-uring/io-uring,
+// and is byte-unchanged; tokio remains the default + the non-Linux/TLS fallback. See the
+// module docs for the shared-nothing fit and the v1 scope.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+pub mod io_uring_rt;
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+pub use io_uring_rt::{IoUringRuntime, peer_local_addrs, run_shards_uring};
+// Re-export the io_uring transport stream type so the `ironcache` serve loop can name it
+// (`ironcache_runtime::UringTcpStream`) WITHOUT taking a direct dependency on `tokio-uring`: the
+// low-level binding stays an implementation detail of this runtime crate, mirroring how
+// `IoUringRuntime` is the public handle. Linux + `io_uring`-feature only, same as the backend.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+pub use tokio_uring::net::TcpStream as UringTcpStream;
+
 // The embedded rustls CLIENT-listener TLS layer (#105, docs/design/TLS.md): the
 // `ClientStream` enum the serve loop reads/writes (plain TcpStream OR a rustls
 // TlsStream) plus the cert/key acceptor builder. Behind the `tls` feature (default

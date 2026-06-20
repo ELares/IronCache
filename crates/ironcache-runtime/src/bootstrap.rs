@@ -72,6 +72,20 @@ pub struct ShardSet {
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 impl ShardSet {
+    /// Construct a [`ShardSet`] from its shared shutdown flag and the spawned thread
+    /// handles. Used by an alternate per-shard bootstrap (the io_uring boot,
+    /// [`crate::io_uring_rt::run_shards_uring`]) that builds the same shutdown-flag +
+    /// acceptor + per-shard-thread shape as [`run_shards`] but on a different per-thread
+    /// runtime, so it can return the SAME `ShardSet` the binary joins on shutdown. The
+    /// fields stay private; this is the one sanctioned constructor outside `run_shards`.
+    #[must_use]
+    pub fn from_parts(
+        shutdown: Arc<AtomicBool>,
+        handles: Vec<std::thread::JoinHandle<()>>,
+    ) -> Self {
+        ShardSet { shutdown, handles }
+    }
+
     /// Signal all shards to stop accepting and drain, then wait for their threads.
     ///
     /// Each shard performs a BOUNDED drain (see [`DRAIN_GRACE`]): it stops
