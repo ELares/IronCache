@@ -48,6 +48,7 @@ use core::cell::RefCell;
 use ironcache_store::{Entry, WriteObserver};
 
 use crate::cursor::ReplOffset;
+use crate::disk_backlog::DiskBacklog;
 use crate::kvcodec::encode_kvobj;
 
 /// One steady-state replication operation in the tail (HA-7c): a put or a delete, tagged with
@@ -139,10 +140,21 @@ pub struct ReplRing {
     /// The highest offset the replica has ACKED; ops at or below it are pruned (the replica
     /// has them durably). Monotonic.
     acked: ReplOffset,
-    /// Latched when an UN-ACKED op was evicted (the retained window overflowed `cap`). Once
-    /// set, the primary has lost part of the resume window, so the replica that needs it must
-    /// drop to a fresh HA-7b full re-sync. Cleared by [`Self::take_resync`].
+    /// Latched when an UN-ACKED op was evicted AND could not be spilled to disk (no disk backlog,
+    /// or a spill failed / staging overflowed) -- the resume window has a gap the incremental path
+    /// cannot fill, so the replica that needs it must drop to a fresh HA-7b full re-sync. Cleared
+    /// by [`Self::take_resync`].
     must_resync: bool,
+    /// HA-7e: the optional DISK-BACKED spill of evicted ops, widening the incremental-resync
+    /// window. `None` (the DEFAULT) = in-memory-only, byte-identical to pre-HA-7e: `push` then
+    /// latches `must_resync` on eviction exactly as before. `Some` = an evicted op is STAGED for a
+    /// disk spill (see `spill_stage`) instead of latching resync.
+    disk: Option<DiskBacklog>,
+    /// HA-7e: ops EVICTED from the in-memory window awaiting a disk flush, oldest first. `push`
+    /// (running INLINE in the write funnel, ADR-0002) only moves an evicted op here -- an O(1),
+    /// non-blocking step, NO fsync -- and the off-funnel stream task drains it to a disk segment via
+    /// [`Self::flush_spill`]. Empty + unused when `disk` is `None`.
+    spill_stage: VecDeque<StreamOp>,
 }
 
 impl ReplRing {
@@ -153,12 +165,29 @@ impl ReplRing {
     /// lock; ADR-0002).
     #[must_use]
     pub fn new(cap: usize, start: ReplOffset) -> Rc<RefCell<Self>> {
+        Self::with_disk(cap, start, None)
+    }
+
+    /// A fresh ring bounded at `cap` from offset `start`, with an OPTIONAL disk-backed spill
+    /// (HA-7e). `disk == None` is byte-identical to [`Self::new`] (the in-memory-only path);
+    /// `disk == Some(..)` makes `push` STAGE an evicted op for a disk spill (widening the
+    /// incremental-resync window) instead of latching `must_resync`. The disk backlog is built by
+    /// the serve layer ([`DiskBacklog::open`], `None` when the size knob is 0 / no data_dir), so
+    /// the default deployment passes `None` and nothing changes.
+    #[must_use]
+    pub fn with_disk(
+        cap: usize,
+        start: ReplOffset,
+        disk: Option<DiskBacklog>,
+    ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(ReplRing {
             ops: VecDeque::new(),
             cap: cap.max(1),
             head: start,
             acked: start,
             must_resync: false,
+            disk,
+            spill_stage: VecDeque::new(),
         }))
     }
 
@@ -205,21 +234,60 @@ impl ReplRing {
     }
 
     /// Whether the primary can still serve a replica resuming from acked offset `from`: i.e.
-    /// the next op it needs (`from + 1`) is still retained (or there is nothing past `from`).
-    /// False once the buffer has evicted the op at `from + 1` (a resume gap -> full-resync).
+    /// the next op it needs (`from + 1`) is recoverable from EITHER the in-memory window OR (HA-7e)
+    /// the disk-backed spill (or there is nothing past `from`). False only once the op at `from + 1`
+    /// predates even the DISK range (a resume gap the incremental path cannot fill -> full-resync).
+    ///
+    /// With no disk backlog (the DEFAULT) this is exactly the pre-HA-7e check: `from + 1 >=
+    /// oldest_retained`. With a disk backlog the recoverable floor drops to the disk's oldest spilled
+    /// offset, widening the incremental window; the disk + staging + memory ranges are contiguous, so
+    /// any `from + 1` at or above the disk floor (up to `head`) can be served gap-free.
     #[must_use]
     pub fn can_serve_from(&self, from: ReplOffset) -> bool {
         if from.0 >= self.head.0 {
             return true; // caught up: nothing to serve
         }
-        // The first op the replica still needs is from+1; it must be >= the oldest retained.
-        from.next().0 >= self.oldest_retained().0
+        // The first op the replica still needs is from+1; it must be >= the lowest recoverable
+        // offset (the disk floor when a disk backlog holds spilled ops, else the in-memory oldest).
+        from.next().0 >= self.oldest_recoverable().0
+    }
+
+    /// The lowest offset still RECOVERABLE incrementally (HA-7e): the oldest disk-spilled offset
+    /// when a disk backlog holds any (the wider window), else the oldest in-memory retained offset
+    /// (or `head` when nothing is buffered). This is the floor [`Self::can_serve_from`] compares
+    /// against. The disk, staging, and in-memory ranges are CONTIGUOUS, so the recoverable run is
+    /// `[oldest_recoverable, head]` with no holes.
+    #[must_use]
+    pub fn oldest_recoverable(&self) -> ReplOffset {
+        // Prefer the disk floor (it is below the in-memory + staging ranges). A staged-but-not-yet
+        // -flushed op also lowers the floor; account for it so a replica is not told to full-resync
+        // for an op that is still recoverable (it is in staging or about to be on disk).
+        if let Some(disk) = &self.disk {
+            if let Some(oldest) = disk.oldest_offset() {
+                return oldest;
+            }
+        }
+        if let Some(staged) = self.spill_stage.front() {
+            return staged.offset();
+        }
+        self.oldest_retained()
     }
 
     /// Assign `op` the NEXT offset and retain it. Advances `head` unconditionally (the write
-    /// happened). If the retained window is at `cap`, EVICT the oldest retained op and latch
-    /// `must_resync` (the primary lost part of the resume window). NEVER blocks. The op's
-    /// offset field is overwritten with the freshly-assigned offset.
+    /// happened). If the retained window is at `cap`, EVICT the oldest retained op. NEVER blocks
+    /// (runs INLINE in the write funnel, ADR-0002). The op's offset field is overwritten with the
+    /// freshly-assigned offset.
+    ///
+    /// ## HA-7e: spill-on-evict (when a disk backlog is configured)
+    ///
+    /// The evicted op leaves the in-memory window. With NO disk backlog (the DEFAULT) this latches
+    /// `must_resync` (a resume gap -> the replica full-re-syncs), byte-identical to pre-HA-7e. With
+    /// a disk backlog the evicted op is instead STAGED ([`Self::spill_stage`]) for an off-funnel
+    /// disk flush ([`Self::flush_spill`]) -- an O(1), NON-BLOCKING move, NO fsync on the funnel --
+    /// so the off-funnel stream task can durably append it to a segment and a behind replica can
+    /// catch up incrementally from disk. Only if the staging buffer itself overflows its defensive
+    /// bound (the flusher has not kept up) does this fall back to latching `must_resync`, so the
+    /// funnel can never be back-pressured by disk I/O.
     ///
     /// Returns the offset assigned.
     fn push(&mut self, mut op: StreamOp) -> ReplOffset {
@@ -229,14 +297,36 @@ impl ReplRing {
             StreamOp::Put { offset, .. } | StreamOp::Del { offset, .. } => *offset = assigned,
         }
         if self.ops.len() >= self.cap {
-            // The retained window is full: evict the oldest un-acked op to make room and latch
-            // the resume gap. The evicted op is below where any consumer could now resume from;
-            // a per-connection cursor below it will fall-behind-resync (see `can_serve_from`).
-            self.ops.pop_front();
-            self.must_resync = true;
+            // The retained window is full: evict the oldest un-acked op to make room.
+            let evicted = self.ops.pop_front();
+            if self.disk.is_some() {
+                // HA-7e: stage the evicted op for an off-funnel disk spill instead of latching a
+                // resume gap. Strictly-increasing eviction order keeps the staging (and thus the
+                // disk run) contiguous. A defensive bound stops unbounded growth if the flusher
+                // stalls: past it, drop the latch (full-resync) rather than back-pressure the funnel.
+                if let Some(ev) = evicted {
+                    self.spill_stage.push_back(ev);
+                }
+                if self.spill_stage.len() > self.spill_stage_bound() {
+                    // The flusher fell too far behind: drop the oldest staged op (it is lost from
+                    // the disk window) and latch resync -- the safe fallback, never a funnel stall.
+                    self.spill_stage.pop_front();
+                    self.must_resync = true;
+                }
+            } else {
+                // The in-memory-only path (DEFAULT): latch the resume gap, byte-identical to before.
+                self.must_resync = true;
+            }
         }
         self.ops.push_back(op);
         assigned
+    }
+
+    /// The defensive bound on the [`Self::spill_stage`] depth: the off-funnel flusher drains it on
+    /// every stream pass, so it stays near-empty in practice; this caps it at `cap` so a stalled
+    /// flusher cannot grow it without limit (past it `push` drops + latches resync, never blocks).
+    fn spill_stage_bound(&self) -> usize {
+        self.cap
     }
 
     /// READ-ONLY: copy up to `max` retained ops with offset strictly greater than `cursor`, in
@@ -263,6 +353,104 @@ impl ReplRing {
         out
     }
 
+    /// Whether this ring has a disk-backed backlog configured (HA-7e). `false` is the DEFAULT
+    /// in-memory-only path.
+    #[must_use]
+    pub fn has_disk(&self) -> bool {
+        self.disk.is_some()
+    }
+
+    /// FLUSH any staged-but-not-yet-spilled evicted ops ([`Self::spill_stage`]) into the disk
+    /// backlog as a sealed segment (HA-7e). Called OFF the write funnel by the stream task (e.g. at
+    /// the top of each serve pass), so the fsync never blocks a write. A no-op when there is no disk
+    /// backlog or nothing is staged.
+    ///
+    /// After a successful flush the disk run extends contiguously up to `oldest_retained - 1`, so the
+    /// recoverable range is exactly disk `[disk_oldest, oldest_retained-1]` THEN memory
+    /// `[oldest_retained, head]` -- the read path ([`Self::recover_ops_after`]) replays disk then
+    /// hands off to memory with NO gap and NO duplicate.
+    ///
+    /// On a SPILL ERROR (I/O failure, or a contiguity refusal that should never happen given the
+    /// in-order staging) the staged ops are dropped and `must_resync` is latched: the disk window
+    /// could not be extended, so a replica that needed those ops full-re-syncs (the safe fallback,
+    /// exactly today's behavior). NEVER serves a hole.
+    pub fn flush_spill(&mut self) {
+        if self.spill_stage.is_empty() {
+            return;
+        }
+        let Some(disk) = self.disk.as_mut() else {
+            // Disk disappeared (cannot happen once set, defensive): the staged ops are unrecoverable.
+            self.spill_stage.clear();
+            self.must_resync = true;
+            return;
+        };
+        let batch: Vec<StreamOp> = self.spill_stage.drain(..).collect();
+        if disk.spill(&batch).is_err() {
+            // The disk window could not be extended (I/O error or an unexpected contiguity refusal):
+            // latch a resume gap so a replica that needed those ops full-re-syncs (the safe fallback,
+            // exactly today's behavior). The error is surfaced as the narrowed window, not logged
+            // here (this low-level crate carries no logger; the safe degradation is the contract).
+            self.must_resync = true;
+        }
+    }
+
+    /// READ-ONLY recovery read for a resuming replica (HA-7e): copy up to `max` ops with offset
+    /// strictly greater than `cursor`, in offset order, drawing from the DISK backlog FIRST (for the
+    /// part of the range that has spilled out of memory) and then the in-memory window, with a
+    /// GAP-FREE, DUPLICATE-FREE handoff at the boundary.
+    ///
+    /// The caller MUST [`Self::flush_spill`] before relying on this so the staging buffer is empty
+    /// and the disk run is contiguous up to `oldest_retained - 1`. Then:
+    /// - if `cursor + 1` is below the in-memory `oldest_retained`, disk ops are read first; the disk
+    ///   read stops at `oldest_retained - 1` (its newest) and the in-memory read picks up exactly at
+    ///   `oldest_retained` -- one unbroken sequence (the CONTINUITY CRUX, asserted in debug);
+    /// - if `cursor + 1` is already within the in-memory window, this is exactly [`Self::ops_after`]
+    ///   (disk contributes nothing), byte-identical to the non-disk path.
+    ///
+    /// A disk-side BACKLOG MISS (a torn / missing segment) yields a SHORT read: the returned ops are
+    /// a gap-free prefix above `cursor` but may not reach the in-memory window. The caller's apply
+    /// then sees the next needed offset still missing and full-re-syncs -- a corrupt segment is never
+    /// served as data, and never bridged over a hole.
+    #[must_use]
+    pub fn recover_ops_after(&self, cursor: ReplOffset, max: usize) -> Vec<StreamOp> {
+        if max == 0 {
+            return Vec::new();
+        }
+        // No disk backlog (the DEFAULT): exactly the in-memory `ops_after`, byte-identical.
+        let Some(disk) = &self.disk else {
+            return self.ops_after(cursor, max);
+        };
+        let mem_oldest = self.oldest_retained();
+        // If the next needed op is already in the in-memory window, the disk contributes nothing:
+        // identical to ops_after (the default-path read).
+        if cursor.next().0 >= mem_oldest.0 {
+            return self.ops_after(cursor, max);
+        }
+        // Otherwise read from disk first (the part below the in-memory window).
+        let mut out = disk.ops_after(cursor, max);
+        // The disk read is a gap-free prefix above `cursor`. Continue into memory ONLY if the disk
+        // read reached right up to the in-memory boundary (its last offset is mem_oldest - 1); a
+        // short / torn disk read stops here, and the caller full-re-syncs on the resulting gap.
+        let reached_boundary = out
+            .last()
+            .is_some_and(|op| op.offset().0 + 1 == mem_oldest.0);
+        if reached_boundary && out.len() < max {
+            let remaining = max - out.len();
+            // Hand off to memory at exactly mem_oldest (no gap, no dup): read ops_after(mem_oldest-1).
+            let from = ReplOffset(mem_oldest.0.saturating_sub(1));
+            let mem = self.ops_after(from, remaining);
+            // CONTINUITY ASSERT (the correctness crux): the first memory op must be exactly one past
+            // the last disk op -- no gap, no overlap. Debug-only so release stays branch-light.
+            debug_assert!(
+                mem.first()
+                    .is_none_or(|m| out.last().is_none_or(|d| m.offset().0 == d.offset().0 + 1)),
+                "disk->memory handoff must be contiguous (no gap / dup)"
+            );
+            out.extend(mem);
+        }
+        out
+    }
+
     /// Record the replica's ACK of `offset`: prune every retained op at or below it (the
     /// replica has them durably) and advance `acked` monotonically. A stale ack never lowers
     /// it. Called by the stream task when a `REPLCONF`/apply-ack arrives.
@@ -284,6 +472,14 @@ impl ReplRing {
             .is_some_and(|op| op.offset().0 <= self.acked.0)
         {
             self.ops.pop_front();
+        }
+        // HA-7e: prune whole disk segments fully below the ack too (the replica has them durably).
+        // Partial segments stay so the disk run remains contiguous; their below-resume ops are
+        // harmless (the recovery read's `cursor` filter skips them). NOTE: with multiple replicas a
+        // single `acked` is the slowest-consumer bound the in-memory window already uses, so pruning
+        // disk to it never drops an op a still-attached replica can resume from.
+        if let Some(disk) = self.disk.as_mut() {
+            disk.prune_through(self.acked);
         }
     }
 
@@ -307,6 +503,20 @@ impl ReplRing {
         self.acked = self.acked.max_with(cut);
         while self.ops.front().is_some_and(|op| op.offset().0 <= cut.0) {
             self.ops.pop_front();
+        }
+        // HA-7e: discard the disk-spilled + staged ops at or below the cut too -- a fresh full-sync
+        // re-bases every replica at `cut`, so anything below it is redundant. The staging buffer is
+        // cleared of below-cut ops; the disk backlog drops whole below-cut segments (partials stay,
+        // their stale ops harmless under the recovery read's cursor filter).
+        while self
+            .spill_stage
+            .front()
+            .is_some_and(|op| op.offset().0 <= cut.0)
+        {
+            self.spill_stage.pop_front();
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            disk.prune_through(cut);
         }
         self.must_resync = false;
     }
@@ -551,5 +761,234 @@ mod tests {
         assert!(!store.write_observer_active());
         assert!(ring.borrow().is_empty());
         assert_eq!(ring.borrow().head(), ReplOffset::ZERO);
+    }
+
+    // ===== HA-7e: disk-backed (spillable) backlog integration =====
+
+    use crate::disk_backlog::DiskBacklog;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "icrepl-ring-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// DEFAULT-OFF is byte-identical: with NO disk backlog, an overflowing ring evicts + latches
+    /// `must_resync` exactly as pre-HA-7e (the in-memory-only path), and `recover_ops_after` equals
+    /// `ops_after`. Nothing is ever spilled.
+    #[test]
+    fn disk_off_is_byte_identical_to_in_memory_only() {
+        let ring = ReplRing::new(2, ReplOffset::ZERO);
+        let mut store: ShardStore = ShardStore::new(4);
+        store.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        // cap-2; three writes overflow -> evict offset 1, latch resync (today's behavior).
+        for (k, v) in [
+            (b"a".as_slice(), b"1".as_slice()),
+            (b"b", b"2"),
+            (b"c", b"3"),
+        ] {
+            store.upsert(0, k, NewValue::Bytes(v), ExpireWrite::Clear, NOW);
+        }
+        let r = ring.borrow();
+        assert!(!r.has_disk(), "no disk backlog by default");
+        assert!(r.needs_resync(), "eviction latches resync (in-memory-only)");
+        assert_eq!(
+            r.oldest_recoverable(),
+            ReplOffset(2),
+            "floor is the in-memory oldest"
+        );
+        // recover_ops_after == ops_after when there is no disk.
+        assert_eq!(
+            r.recover_ops_after(ReplOffset::ZERO, usize::MAX),
+            r.ops_after(ReplOffset::ZERO, usize::MAX)
+        );
+    }
+
+    /// THE CRUX: a replica behind the IN-MEMORY ring but within the ON-DISK backlog catches up
+    /// INCREMENTALLY (disk replay then in-memory handoff) with NO full-resync latch, NO gap, NO dup.
+    #[test]
+    fn behind_memory_within_disk_catches_up_incrementally_no_gap_no_dup() {
+        let dir = temp_dir("incr");
+        let disk = DiskBacklog::open(&dir, 1 << 20).expect("disk backlog enabled");
+        // A small in-memory cap so the older ops spill to disk.
+        let ring = ReplRing::with_disk(2, ReplOffset::ZERO, Some(disk));
+        let mut store: ShardStore = ShardStore::new(4);
+        store.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+
+        // 6 writes: offsets 1..=6. With cap 2, offsets 1..=4 evict (spill to disk), 5..=6 stay in
+        // memory. Flush after EACH write (the off-funnel flusher's real cadence is every drain pass),
+        // so staging stays small and the spilled ops land on disk segment by segment.
+        for i in 1..=6u8 {
+            let k = [b'k', i];
+            let v = [b'v', i];
+            store.upsert(0, &k, NewValue::Bytes(&v), ExpireWrite::Clear, NOW);
+            ring.borrow_mut().flush_spill();
+        }
+
+        let r = ring.borrow();
+        // The eviction did NOT latch a resume gap (the ops went to disk, not dropped).
+        assert!(
+            !r.needs_resync(),
+            "spilling to disk avoids the full-resync latch"
+        );
+        assert_eq!(
+            r.oldest_retained(),
+            ReplOffset(5),
+            "memory holds the last 2 (5,6)"
+        );
+        assert_eq!(
+            r.oldest_recoverable(),
+            ReplOffset(1),
+            "disk widens the floor to offset 1"
+        );
+
+        // A replica resuming from offset 0 (behind memory's oldest=5, within disk's oldest=1) CAN be
+        // served, and the recovery read yields the WHOLE contiguous run 1..=6, gap-free, dup-free.
+        assert!(r.can_serve_from(ReplOffset::ZERO));
+        let ops = r.recover_ops_after(ReplOffset::ZERO, usize::MAX);
+        let offsets: Vec<_> = ops.iter().map(|o| o.offset().0).collect();
+        assert_eq!(
+            offsets,
+            vec![1, 2, 3, 4, 5, 6],
+            "disk->memory handoff is one unbroken run"
+        );
+        // Each offset appears EXACTLY once (no dup at the boundary), and there is no hole.
+        for w in offsets.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "strictly +1 contiguous: no gap, no overlap");
+        }
+
+        // A bounded read crossing the disk->memory boundary also hands off cleanly (read 5 ops: the
+        // 4 disk + the first memory, no gap/dup at the seam).
+        let five = r.recover_ops_after(ReplOffset::ZERO, 5);
+        assert_eq!(
+            five.iter().map(|o| o.offset().0).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "a bounded read hands off disk->memory with no gap/dup"
+        );
+        drop(r);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A replica behind even the ON-DISK range falls back to a full snapshot (today's behavior): the
+    /// disk backlog is bounded, so once the oldest segments are evicted, a too-far-behind cursor
+    /// `can_serve_from == false` -> the caller full-re-syncs.
+    #[test]
+    fn behind_disk_range_falls_back_to_full_snapshot() {
+        let dir = temp_dir("over");
+        // A tiny disk bound so the oldest spilled ops are evicted off disk.
+        let disk = DiskBacklog::open(&dir, 48).expect("enabled");
+        let ring = ReplRing::with_disk(1, ReplOffset::ZERO, Some(disk));
+        let mut store: ShardStore = ShardStore::new(4);
+        store.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        // Many writes: cap-1 memory spills almost everything; the tiny disk bound evicts the oldest
+        // disk segments, so the disk floor rises well above offset 1.
+        for i in 0..40u32 {
+            let k = i.to_le_bytes();
+            store.upsert(0, &k, NewValue::Bytes(b"x"), ExpireWrite::Clear, NOW);
+            ring.borrow_mut().flush_spill();
+        }
+        let r = ring.borrow();
+        let floor = r.oldest_recoverable();
+        assert!(
+            floor.0 > 1,
+            "the disk bound evicted the oldest spilled ops (floor rose)"
+        );
+        // A replica at offset 0 needs op 1, which predates even the disk floor -> cannot serve.
+        assert!(
+            !r.can_serve_from(ReplOffset::ZERO),
+            "behind even the disk range -> full-snapshot fallback (today's behavior)"
+        );
+        // A replica at the floor-1 CAN still be served incrementally (the wider window still works).
+        assert!(r.can_serve_from(ReplOffset(floor.0 - 1)));
+        drop(r);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A corrupt disk segment makes the recovery read SHORT (a gap-free prefix that does NOT reach
+    /// the in-memory window), so the replica sees the next needed offset still missing and full-re
+    /// -syncs -- a torn segment is never served as data nor bridged over a hole.
+    #[test]
+    fn corrupt_disk_segment_yields_short_read_forcing_resync() {
+        let dir = temp_dir("torn");
+        let disk = DiskBacklog::open(&dir, 1 << 20).expect("enabled");
+        let ring = ReplRing::with_disk(1, ReplOffset::ZERO, Some(disk));
+        let mut store: ShardStore = ShardStore::new(4);
+        store.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        for i in 1..=6u8 {
+            store.upsert(
+                0,
+                &[b'k', i],
+                NewValue::Bytes(&[b'v', i]),
+                ExpireWrite::Clear,
+                NOW,
+            );
+            ring.borrow_mut().flush_spill();
+        }
+        // Corrupt the SECOND disk segment file (offsets in the middle of the spilled run).
+        let backlog_dir = dir.join(DiskBacklog::DIR_NAME);
+        let mut files: Vec<_> = std::fs::read_dir(&backlog_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "icrb"))
+            .collect();
+        files.sort();
+        assert!(files.len() >= 2, "several spilled segments exist");
+        let mut bytes = std::fs::read(&files[1]).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF; // flip a body byte; the CRC no longer matches.
+        std::fs::write(&files[1], &bytes).unwrap();
+
+        let r = ring.borrow();
+        let ops = r.recover_ops_after(ReplOffset::ZERO, usize::MAX);
+        let offsets: Vec<_> = ops.iter().map(|o| o.offset().0).collect();
+        // The read stops at the corrupt segment: a gap-free prefix that does NOT reach the in-memory
+        // window (offset 6), so the apply path's next-expected check fails -> full-resync.
+        assert!(
+            !offsets.contains(&6) || offsets.last() != Some(&6),
+            "a corrupt segment is never bridged: the read is short of the in-memory tail"
+        );
+        // Whatever WAS returned is still gap-free above the cursor (never garbage / never a hole).
+        for w in offsets.windows(2) {
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "the served prefix is contiguous (no served corruption)"
+            );
+        }
+        drop(r);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Acking through a spilled offset prunes whole disk segments below the ack (the replica has
+    /// them durably), keeping the disk backlog from retaining ops no replica can still resume from.
+    #[test]
+    fn ack_prunes_disk_segments_below_it() {
+        let dir = temp_dir("ackprune");
+        let disk = DiskBacklog::open(&dir, 1 << 20).expect("enabled");
+        let ring = ReplRing::with_disk(1, ReplOffset::ZERO, Some(disk));
+        let mut store: ShardStore = ShardStore::new(4);
+        store.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+        for i in 1..=6u8 {
+            store.upsert(
+                0,
+                &[b'k', i],
+                NewValue::Bytes(&[b'v', i]),
+                ExpireWrite::Clear,
+                NOW,
+            );
+            ring.borrow_mut().flush_spill();
+        }
+        assert_eq!(ring.borrow().oldest_recoverable(), ReplOffset(1));
+        // The replica acks through offset 4: whole disk segments at/below 4 are pruned.
+        ring.borrow_mut().ack(ReplOffset(4));
+        let floor = ring.borrow().oldest_recoverable();
+        assert!(floor.0 > 4, "disk segments fully below the ack were pruned");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

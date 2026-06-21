@@ -74,6 +74,9 @@ pub use fullsync::{FullSyncError, drive_full_sync, receive_full_sync};
 pub mod observer;
 pub use observer::{ReplObserver, ReplRing, StreamOp};
 
+pub mod disk_backlog;
+pub use disk_backlog::{DiskBacklog, SpillError};
+
 pub mod lag;
 pub use lag::{
     InSyncReplicas, LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag, lag,
