@@ -9,6 +9,16 @@ release.
 
 ### Added
 
+- IronCache Console: a new `ironcache-console` crate and binary (epic #352,
+  issue #353), a SEPARATE server from the data-plane that will discover an
+  IronCache deployment, aggregate a cluster-wide view, and serve a monitoring
+  dashboard while staying out of the data path. This first slice is the skeleton:
+  layered config (TOML plus `IRONCACHE_CONSOLE_*` env plus CLI), structured
+  tracing, and a bounded hand-rolled HTTP responder serving `/livez`, `/readyz`,
+  and the console's own `/metrics` (so the monitor can be monitored: poll
+  success/failure counters and a last-successful-poll age gauge). Node
+  acquisition, the single-node topology view, aggregation, the REST API, the UI,
+  and TLS land in later PRs (#355, #366, #356, #358, #359).
 - Keyspace notifications (PROD-8, Redis `notify-keyspace-events`). On a successful
   mutation (and on a TTL expiry / a maxmemory eviction) the server PUBLISHes the
   Redis keyspace + keyevent events to `__keyspace@<db>__:<key>` (payload = the

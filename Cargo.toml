@@ -33,6 +33,7 @@ members = [
     "crates/ironcache-server",
     "crates/ironcache",
     "crates/ironcache-bench",
+    "crates/ironcache-console",
 ]
 
 [workspace.package]
