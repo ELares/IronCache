@@ -46,6 +46,13 @@ ironcache-storage = { workspace = true }
 # remains the correctness guarantee; the wheel is the active-reclamation optimization.
 ironcache-expiry = { workspace = true }
 bytes = { workspace = true }
+# In-memory zeroization of the TRANSIENT plaintext password copy a `CONFIG SET requirepass`
+# materializes (#145, docs/design/SECRETS.md): the handler copies the value out of the request into
+# an owned `String` to apply it; wrapping that copy in `Zeroizing<String>` scrubs it the moment the
+# loop iteration drops it (right after the runtime overlay has hashed it to a digest at rest), so the
+# cleartext password does not linger on the heap. CONFIG SET is an admin command, NOT the hot data
+# path. No new crate enters the lock (zeroize is already present transitively via rustls).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # The concrete store is a TEST-ONLY dependency here: the dispatch tests and the

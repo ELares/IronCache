@@ -96,6 +96,63 @@ of snapshot/tier files (a separate threat-model line item, #142).
   sub-question is not yet settled); this spec records the requirement that
   whichever transport is chosen, no secret-valued series is ever registered.
 
+## Implementation status (2026-06): secret material in memory
+
+The sections above describe the INTENDED control set. This section is the HONEST
+current state of the in-memory secret-lifetime work (#145), so a reader does not
+over-trust a control that is not shipped. The diagnostic-redaction row (above) is
+real on main (SLOWLOG/MONITOR/logs scrub `AUTH`/`HELLO AUTH`/`CONFIG SET
+requirepass`/`ACL SETUSER >pass` argument positions); this status note covers only
+the IN-MEMORY zeroization and the swap/coredump hardening.
+
+WHAT IS PROTECTED today:
+
+- Secrets AT REST in long-lived state are HASHES, not plaintext: `requirepass` and
+  every ACL `>pass` are stored as a SHA-256 hex digest [acl-default-user], and the
+  AUTH compare is constant-time. There is no long-lived plaintext PASSWORD to
+  zeroize: by the time it lands in the overlay it is already a digest.
+- The long-lived plaintext `cluster_secret` (the one secret that is NOT reducible
+  to a hash, because the peer handshake compares the literal bytes) is held in a
+  `Zeroizing<Vec<u8>>` inside `ClusterSecurity`, so its bytes are scrubbed (a
+  volatile write the optimizer may not elide [zeroize-crate-on-drop]) when the last
+  reference drops at node teardown. The dial/accept handshake reads it by slice, so
+  the secure-transport path is byte-unchanged.
+- The TRANSIENT plaintext copy a `CONFIG SET requirepass <pw>` materializes (the
+  handler copies the value out of the request to apply it) is a `Zeroizing<String>`,
+  scrubbed the instant the apply loop drops it, right after the value has been
+  hashed to a digest at rest.
+- TLS private-key bytes are managed by rustls/rustls-pki-types, which already wrap
+  their key material in `zeroize` internally [zeroize-crate-on-drop]; IronCache does
+  NOT copy the raw key out of that path, so there is nothing for IronCache to
+  double-handle. (rustls-pki-types is the `zeroize` user already in our lock.)
+
+WHAT IS NOT protected, and WHY (the deliberate scope boundary):
+
+- The TRANSIENT plaintext of `AUTH <pass>` / `HELLO ... AUTH ... <pass>` /
+  `ACL SETUSER ... >pass` is NOT explicitly scrubbed. The decoder copies each
+  argument into an owned `bytes::Bytes` (PROTOCOL.md: copy-on-decode, not yet the
+  zero-copy borrow), and the AUTH path then HASHES that argument by reference
+  (`verify_password` takes a `&[u8]`, never copying the plaintext out). So the only
+  plaintext lives in (a) the immutable, refcount-shared `Bytes` arg and (b) the
+  reused connection read buffer, neither of which is cleanly scrubbable: `Bytes` is
+  shared/immutable and exposes no in-place wipe, and the read buffer is `drain`-ed
+  forward (not zeroed) to preserve PIPELINED bytes after it. Scrubbing the shared
+  read buffer would risk pipelining correctness and add a wipe to a near-hot path
+  for a marginal gain. This is an ACCEPTED residual, bounded by the swap/coredump
+  measures below and the fact that an attacker with live-process-memory access is
+  already past the at-rest protections.
+- The swap (`mlock`/`mlockall`) and coredump (`MADV_DONTDUMP`/`PR_SET_DUMPABLE`/
+  `RLIMIT_CORE`) hardening knobs are NOT yet wired. Until they ship, an operator who
+  wants the host-local-memory residual minimized should disable core dumps and swap
+  at the OS level (e.g. `ulimit -c 0`, no swap / encrypted swap) as the THREAT_MODEL
+  "Process memory (host-local)" row already assumes against a malicious root.
+
+The primary controls remain Rust memory safety (no use-after-free leaking a stale
+secret), hashes-not-plaintext at rest, and no-secrets-in-logs/SLOWLOG/MONITOR. The
+zeroize-on-drop above is DEFENSE IN DEPTH on top of those, not a substitute, and is
+deliberately kept OFF the hot data path (only the long-lived `cluster_secret` and
+the admin-command `CONFIG SET` copy are wrapped).
+
 ## Open questions
 
 - Page-scoped locking of just the secret allocations versus `mlockall` of the
