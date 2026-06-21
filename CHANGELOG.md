@@ -19,6 +19,44 @@ release.
   success/failure counters and a last-successful-poll age gauge). Node
   acquisition, the single-node topology view, aggregation, the REST API, the UI,
   and TLS land in later PRs (#355, #366, #356, #358, #359).
+- IronCache Console node acquisition and the single-node snapshot (issues #355,
+  #366). The console now polls a seed node on an interval and publishes a
+  topology view. New modules: a minimal RESP2 reply parser (`resp`); an async
+  RESP `NodeClient` (`node`) that connects with `TCP_NODELAY`, optionally `AUTH`s
+  as a least-privilege ACL user with the password read from `node_password_file`
+  at connect time (never logged), and issues admin commands, with EVERY connect
+  and EVERY read bounded by an explicit timeout so a down or never-replying node
+  can never hang the poller (the regression guard for a prior production hang); an
+  `INFO` parser (`info`) that extracts the dashboard fields plus a total key count
+  and keeps the full raw map for version skew; an `acquire` / `snapshot` model
+  (`snapshot`) that folds connect plus PING plus INFO into a `NodeSnapshot` (a
+  down node yields `reachable=false` with an error, never a panic) and a
+  single-node `Topology` (Standalone, with room for a clustered mode); and a poll
+  loop (`poll`) that records the success/failure self-metrics, holds the latest
+  topology in a shared cell readable by the HTTP surface, and flips `/readyz` to
+  ready only after the FIRST successful poll (so the console reads not-ready until
+  it has real data). New config fields `connect_timeout_secs` and
+  `op_timeout_secs` (TOML, `IRONCACHE_CONSOLE_*` env, both default 5). Optional
+  node TLS is wired through the runtime crate's cluster TLS client (verified
+  against a configured CA); it uses a fixed SNI today, so full per-host SNI and
+  mTLS for the console-to-node link are deferred to #369, and the plaintext path
+  is the fully supported v1 path. A minimal `/debug/topology` JSON route exposes
+  the current view; the public REST API lands in #358.
+- IronCache Console security and correctness hardening. The RESP reply parser now
+  caps nesting depth, declared array element count, and declared bulk length (with
+  checked arithmetic) so a hostile or compromised node cannot stack-overflow the
+  process or amplify work / overflow with an absurd count or length. Node TLS now
+  REQUIRES peer verification by default: with TLS on and no CA the console refuses
+  to boot unless the operator EXPLICITLY sets the new
+  `node_tls_insecure_skip_verify` (TOML, `IRONCACHE_CONSOLE_*` env, default false),
+  which then runs encrypted-but-unverified with a loud warning, closing the prior
+  silent accept-any-certificate path. The node password is held in a zeroized
+  buffer (scrubbed on drop) with a redacted Debug so it is never logged or placed
+  in an error. The unauthenticated `/debug/topology` recon route is now gated OFF
+  by default behind the new `enable_debug_routes` flag (TOML,
+  `IRONCACHE_CONSOLE_*` env), to move behind the privileged/auth tier (#360/#369)
+  before exposure. PING now verifies the reply is PONG (or OK) rather than
+  accepting any reply.
 - Keyspace notifications (PROD-8, Redis `notify-keyspace-events`). On a successful
   mutation (and on a TTL expiry / a maxmemory eviction) the server PUBLISHes the
   Redis keyspace + keyevent events to `__keyspace@<db>__:<key>` (payload = the

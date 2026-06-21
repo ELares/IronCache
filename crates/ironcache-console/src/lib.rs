@@ -20,13 +20,19 @@
 pub mod cli;
 pub mod config;
 pub mod http;
+pub mod info;
 pub mod logging;
 pub mod metrics;
+pub mod node;
+pub mod poll;
+pub mod resp;
+pub mod snapshot;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use ironcache_env::SystemEnv;
 
 use crate::config::{ConsoleConfig, ConsoleConfigOverlay};
 
@@ -94,18 +100,43 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         .context("building the tokio runtime")?;
     rt.block_on(async {
         let metrics = Arc::new(metrics::ConsoleMetrics::new());
-        let state = http::ConsoleHttpState::new(metrics);
+        // The shared topology cell: the poll loop writes it, the HTTP surface
+        // (and the future REST API, #358) reads it.
+        let topology = poll::new_topology_holder();
+        // `enable_debug_routes` gates the unauthenticated `/debug/topology` recon
+        // route (default OFF); pass it explicitly so the route is only served when
+        // the operator opted in.
+        let state = http::ConsoleHttpState::with_options(
+            metrics.clone(),
+            topology.clone(),
+            cfg.enable_debug_routes,
+        );
         let listener = tokio::net::TcpListener::bind(&cfg.http_addr)
             .await
             .with_context(|| format!("binding the console HTTP address {}", cfg.http_addr))?;
-        // The process is up: liveness flips and never flips back.
+        // The process is up: liveness flips and never flips back. Readiness is
+        // NOT set here: the poll loop flips it on the FIRST successful node poll
+        // (#355/#366), so `/readyz` is 503 until the console has real data.
         state.set_live(true);
-        // PR-1: readiness flips as soon as the server is serving. PR-2 (#355/#366)
-        // will gate `/readyz` on the FIRST successful node poll (a topology
-        // snapshot exists), so a console with no reachable nodes reads not-ready.
-        state.set_ready(true);
         log_boot(cfg);
-        tokio::select! {
+
+        // Resolve auth/TLS ONCE at startup (read the password file here, not every
+        // tick), then spawn the bounded poll loop. The env clock is the snapshot
+        // freshness seam (ADR-0003).
+        let clock = Arc::new(SystemEnv::new());
+        let auth = poll::resolve_auth(cfg).context("reading the node password file")?;
+        let tls = poll::resolve_tls(cfg);
+        let poller = tokio::spawn(poll::run_poll_loop(
+            clock,
+            cfg.clone(),
+            metrics.clone(),
+            state.clone(),
+            topology,
+            auth,
+            tls,
+        ));
+
+        let result = tokio::select! {
             () = http::accept_loop(listener, state.clone()) => {
                 // The accept loop only returns on an unrecoverable listener error.
                 Ok(())
@@ -115,7 +146,10 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
                 tracing::info!("console: shutdown signal received; exiting");
                 Ok(())
             }
-        }
+        };
+        // Stop the poll loop on the way out.
+        poller.abort();
+        result
     })
 }
 
@@ -126,12 +160,13 @@ fn log_boot(cfg: &ConsoleConfig) {
         version = cli::BUILD_VERSION,
         addr = %cfg.http_addr,
         seeds = cfg.seeds.len(),
-        "console: serving /livez, /readyz, /metrics"
+        poll_interval_secs = cfg.poll_interval_secs,
+        "console: serving /livez, /readyz, /metrics; polling the seed node"
     );
     if cfg.seeds.is_empty() {
         tracing::warn!(
-            "console: no seed nodes configured (IRONCACHE_CONSOLE_SEEDS / [seeds]); node \
-             polling lands in #355"
+            "console: no seed nodes configured (IRONCACHE_CONSOLE_SEEDS / [seeds]); the poll loop \
+             is idle and /readyz stays not-ready until a seed is set"
         );
     }
     if binds_all_interfaces(&cfg.http_addr) {

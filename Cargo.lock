@@ -463,12 +463,14 @@ dependencies = [
  "anyhow",
  "clap",
  "ironcache-env",
+ "ironcache-runtime",
  "serde",
  "thiserror",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

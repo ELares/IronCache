@@ -19,6 +19,13 @@ use std::path::{Path, PathBuf};
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:9180";
 /// Default node-poll interval, used once polling lands in #355.
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 10;
+/// Default TCP/TLS connect timeout to a node, in seconds (#355). A node that
+/// accepts the SYN but never finishes the handshake must not pin the poll loop.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
+/// Default per-operation (write + read one reply) timeout to a node, in seconds
+/// (#355). A node that accepts a command but never replies must not hang the
+/// poller: this is the bound a missing read timeout once lacked in production.
+const DEFAULT_OP_TIMEOUT_SECS: u64 = 5;
 /// Default log level.
 const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -56,10 +63,25 @@ pub struct ConsoleConfigOverlay {
     pub node_tls: Option<bool>,
     /// CA bundle (PEM) to verify node TLS certificates.
     pub node_tls_ca: Option<PathBuf>,
+    /// Accept ANY node TLS certificate without verifying it against a CA. Default
+    /// FALSE: with `node_tls` on and no CA the dial is REJECTED, so the operator
+    /// must opt in EXPLICITLY to run encrypted-but-unverified (which is exposed to
+    /// an active MITM). Never silently enabled.
+    pub node_tls_insecure_skip_verify: Option<bool>,
     /// Node poll interval in seconds (#355).
     pub poll_interval_secs: Option<u64>,
+    /// TCP/TLS connect timeout to a node, in seconds (#355).
+    pub connect_timeout_secs: Option<u64>,
+    /// Per-operation (write + read one reply) timeout to a node, in seconds
+    /// (#355). The hard bound that prevents a never-replying node from hanging
+    /// the poller.
+    pub op_timeout_secs: Option<u64>,
     /// Log level (the CLI `--log-level` is the usual source).
     pub log_level: Option<String>,
+    /// Serve the unauthenticated `/debug/topology` recon route. Default FALSE: it
+    /// exposes node addresses / version / key counts with no auth, so it must stay
+    /// off until the route moves behind the privileged/auth tier (#360/#369).
+    pub enable_debug_routes: Option<bool>,
 }
 
 impl ConsoleConfigOverlay {
@@ -103,6 +125,12 @@ impl ConsoleConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_NODE_TLS_CA") {
             overlay.node_tls_ca = Some(PathBuf::from(v));
         }
+        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_NODE_TLS_INSECURE_SKIP_VERIFY") {
+            overlay.node_tls_insecure_skip_verify = Some(parse_bool(
+                "IRONCACHE_CONSOLE_NODE_TLS_INSECURE_SKIP_VERIFY",
+                &v,
+            )?);
+        }
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_POLL_INTERVAL_SECS") {
             let n = v
                 .trim()
@@ -113,8 +141,18 @@ impl ConsoleConfigOverlay {
                 })?;
             overlay.poll_interval_secs = Some(n);
         }
+        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_CONNECT_TIMEOUT_SECS") {
+            overlay.connect_timeout_secs = Some(parse_u64("connect_timeout_secs", &v)?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_OP_TIMEOUT_SECS") {
+            overlay.op_timeout_secs = Some(parse_u64("op_timeout_secs", &v)?);
+        }
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_LOG_LEVEL") {
             overlay.log_level = Some(v);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_ENABLE_DEBUG_ROUTES") {
+            overlay.enable_debug_routes =
+                Some(parse_bool("IRONCACHE_CONSOLE_ENABLE_DEBUG_ROUTES", &v)?);
         }
         Ok(overlay)
     }
@@ -130,8 +168,12 @@ pub struct ConsoleConfig {
     pub node_password_file: Option<PathBuf>,
     pub node_tls: bool,
     pub node_tls_ca: Option<PathBuf>,
+    pub node_tls_insecure_skip_verify: bool,
     pub poll_interval_secs: u64,
+    pub connect_timeout_secs: u64,
+    pub op_timeout_secs: u64,
     pub log_level: String,
+    pub enable_debug_routes: bool,
 }
 
 impl Default for ConsoleConfig {
@@ -144,8 +186,12 @@ impl Default for ConsoleConfig {
             node_password_file: None,
             node_tls: false,
             node_tls_ca: None,
+            node_tls_insecure_skip_verify: false,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            op_timeout_secs: DEFAULT_OP_TIMEOUT_SECS,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
+            enable_debug_routes: false,
         }
     }
 }
@@ -178,11 +224,23 @@ impl ConsoleConfig {
             if let Some(v) = &o.node_tls_ca {
                 cfg.node_tls_ca = Some(v.clone());
             }
+            if let Some(v) = o.node_tls_insecure_skip_verify {
+                cfg.node_tls_insecure_skip_verify = v;
+            }
             if let Some(v) = o.poll_interval_secs {
                 cfg.poll_interval_secs = v;
             }
+            if let Some(v) = o.connect_timeout_secs {
+                cfg.connect_timeout_secs = v;
+            }
+            if let Some(v) = o.op_timeout_secs {
+                cfg.op_timeout_secs = v;
+            }
             if let Some(v) = &o.log_level {
                 cfg.log_level.clone_from(v);
+            }
+            if let Some(v) = o.enable_debug_routes {
+                cfg.enable_debug_routes = v;
             }
         }
         cfg
@@ -209,6 +267,37 @@ impl ConsoleConfig {
                 field: "poll_interval_secs",
                 reason: "must be at least 1".to_owned(),
             });
+        }
+        if self.connect_timeout_secs == 0 {
+            return Err(ConsoleConfigError::Invalid {
+                field: "connect_timeout_secs",
+                reason: "must be at least 1 (a connect must be bounded)".to_owned(),
+            });
+        }
+        if self.op_timeout_secs == 0 {
+            return Err(ConsoleConfigError::Invalid {
+                field: "op_timeout_secs",
+                reason: "must be at least 1 (every node read must be bounded)".to_owned(),
+            });
+        }
+        // TLS must AUTHENTICATE the peer by default: with TLS on and no CA, refuse
+        // to boot unless the operator EXPLICITLY opted into accept-any-cert. This
+        // closes the silent accept-any path (a MITM could otherwise impersonate a
+        // node and capture the AUTH credential).
+        if self.node_tls && self.node_tls_ca.is_none() && !self.node_tls_insecure_skip_verify {
+            return Err(ConsoleConfigError::Invalid {
+                field: "node_tls",
+                reason: "node_tls requires node_tls_ca to verify the peer, or set \
+                         node_tls_insecure_skip_verify=true to accept any cert (INSECURE, \
+                         MITM-exposed)"
+                    .to_owned(),
+            });
+        }
+        if self.node_tls && self.node_tls_insecure_skip_verify {
+            tracing::warn!(
+                "node_tls_insecure_skip_verify is set: node TLS certificates are NOT verified; the \
+                 link is encrypted but exposed to an active MITM. Supply node_tls_ca instead."
+            );
         }
         if self.node_tls_ca.is_some() && !self.node_tls {
             tracing::warn!("node_tls_ca is set but node_tls is false; the CA bundle is unused");
@@ -243,8 +332,12 @@ impl ConsoleConfig {
              node_password_file = {}\n\
              node_tls           = {}\n\
              node_tls_ca        = {}\n\
+             node_tls_insecure_skip_verify = {}\n\
              poll_interval_secs = {}\n\
-             log_level          = {}\n",
+             connect_timeout_secs = {}\n\
+             op_timeout_secs    = {}\n\
+             log_level          = {}\n\
+             enable_debug_routes = {}\n",
             self.http_addr,
             seeds,
             opt(&self.prometheus_url),
@@ -252,8 +345,12 @@ impl ConsoleConfig {
             optp(&self.node_password_file),
             self.node_tls,
             optp(&self.node_tls_ca),
+            self.node_tls_insecure_skip_verify,
             self.poll_interval_secs,
+            self.connect_timeout_secs,
+            self.op_timeout_secs,
             self.log_level,
+            self.enable_debug_routes,
         )
     }
 }
@@ -265,6 +362,17 @@ fn parse_seed_list(v: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+/// Parse a non-negative integer config field, mapping a failure to the typed
+/// [`ConsoleConfigError::Invalid`] with the field name.
+fn parse_u64(field: &'static str, v: &str) -> Result<u64, ConsoleConfigError> {
+    v.trim()
+        .parse::<u64>()
+        .map_err(|e| ConsoleConfigError::Invalid {
+            field,
+            reason: format!("not a valid non-negative integer: {e}"),
+        })
 }
 
 /// Parse a permissive boolean (`true/false/1/0/yes/no/on/off`, case-insensitive).
@@ -290,6 +398,8 @@ mod tests {
         assert!(cfg.seeds.is_empty());
         assert!(!cfg.node_tls);
         assert_eq!(cfg.poll_interval_secs, 10);
+        assert_eq!(cfg.connect_timeout_secs, 5);
+        assert_eq!(cfg.op_timeout_secs, 5);
         cfg.validate().unwrap();
     }
 
@@ -304,6 +414,8 @@ mod tests {
             node_tls = true
             node_tls_ca = "/etc/ssl/ca.pem"
             poll_interval_secs = 5
+            connect_timeout_secs = 3
+            op_timeout_secs = 7
         "#;
         let overlay = ConsoleConfigOverlay::from_toml_str(toml).unwrap();
         let cfg = ConsoleConfig::resolve(&[overlay]);
@@ -313,7 +425,35 @@ mod tests {
         assert_eq!(cfg.node_user.as_deref(), Some("console_monitor"));
         assert!(cfg.node_tls);
         assert_eq!(cfg.poll_interval_secs, 5);
+        assert_eq!(cfg.connect_timeout_secs, 3);
+        assert_eq!(cfg.op_timeout_secs, 7);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeouts() {
+        let cfg = ConsoleConfig {
+            connect_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConsoleConfigError::Invalid {
+                field: "connect_timeout_secs",
+                ..
+            })
+        ));
+        let cfg = ConsoleConfig {
+            op_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConsoleConfigError::Invalid {
+                field: "op_timeout_secs",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -389,5 +529,59 @@ mod tests {
         assert!(text.contains("http_addr"));
         assert!(text.contains("seeds              = (none)"));
         assert!(text.contains("node_tls           = false"));
+        assert!(text.contains("node_tls_insecure_skip_verify = false"));
+        assert!(text.contains("enable_debug_routes = false"));
+    }
+
+    #[test]
+    fn validate_rejects_node_tls_without_ca_or_insecure_optout() {
+        // TLS on, no CA, no explicit insecure opt-out -> hard error (the silent
+        // accept-any path is closed).
+        let cfg = ConsoleConfig {
+            node_tls: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConsoleConfigError::Invalid {
+                field: "node_tls",
+                ..
+            })
+        ));
+        // TLS on WITH a CA -> ok (verified link).
+        let cfg = ConsoleConfig {
+            node_tls: true,
+            node_tls_ca: Some(PathBuf::from("/etc/ca.pem")),
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        // TLS on, no CA, but the EXPLICIT insecure opt-out -> ok (encrypted but
+        // unverified; the operator accepted the MITM exposure).
+        let cfg = ConsoleConfig {
+            node_tls: true,
+            node_tls_insecure_skip_verify: true,
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn insecure_skip_verify_resolves_from_overlay_and_env_name() {
+        let toml = r"
+            node_tls = true
+            node_tls_insecure_skip_verify = true
+        ";
+        let overlay = ConsoleConfigOverlay::from_toml_str(toml).unwrap();
+        let cfg = ConsoleConfig::resolve(&[overlay]);
+        assert!(cfg.node_tls_insecure_skip_verify);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn enable_debug_routes_defaults_off_and_resolves() {
+        assert!(!ConsoleConfig::default().enable_debug_routes);
+        let overlay = ConsoleConfigOverlay::from_toml_str("enable_debug_routes = true").unwrap();
+        let cfg = ConsoleConfig::resolve(&[overlay]);
+        assert!(cfg.enable_debug_routes);
     }
 }
