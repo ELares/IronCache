@@ -188,6 +188,19 @@ pub struct ServerContext {
     /// hot path byte-unchanged. It is NODE-LEVEL cold state (one `AtomicUsize`), never touched per
     /// stored key, so `bytes_per_key` is unaffected.
     pub in_sync_replicas: Option<Arc<ironcache_repl::InSyncReplicas>>,
+    /// The PER-BOOT replication HISTORY token (the resume identity, distinct from the STABLE
+    /// [`crate::ServerInfo::cluster_node_id`]). Generated ONCE at boot through the determinism seam
+    /// (ADR-0003: drawn from the binary's `SystemEnv` RNG in `serve::run_server`), so it is a NEW
+    /// value on every process restart while the cluster identity stays the same. The primary
+    /// advertises it in the `FullSync` frame; a reconnecting replica REMEMBERS the exact token it
+    /// last synced under and re-advertises it, and the primary RESUMES the incremental tail ONLY on
+    /// an EXACT token match (else a full re-sync). This is the fence against silent divergence: a
+    /// restarted primary resets its offset space to 0 yet kept the stable cluster id, so without a
+    /// per-boot token a replica would resume against a DIFFERENT history and silently keep stale
+    /// data. `None` outside raft-governance mode (the default static path never serves the live
+    /// resume) and in tests that do not exercise the resume gate, where a first-connect replica
+    /// always full-syncs. NODE-LEVEL cold state, never touched per stored key.
+    pub repl_history_id: Option<ironcache_repl::ReplId>,
     /// The process-wide per-shard metrics registry (OBSERVABILITY.md, #152), present ONLY when
     /// the out-of-band `/metrics` endpoint is enabled (`--metrics-addr` set); `None` on the
     /// DEFAULT path. When `Some`, each shard ADOPTS its pre-allocated cell at boot (so its
@@ -3222,6 +3235,7 @@ mod tests {
             raft: None,
             repl_status: None,
             in_sync_replicas: None,
+            repl_history_id: None,
             metrics_registry: None,
             persist_stats: None,
             process_memory: std::sync::Arc::new(ironcache_observe::ProcessMemoryGauge::new()),

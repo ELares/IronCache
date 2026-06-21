@@ -294,6 +294,7 @@ async fn run_replica_session(
         Frame::ReplConf {
             node: 1,
             ack: applier.applied(),
+            resume_token: None,
         },
     )
     .await
@@ -335,6 +336,7 @@ async fn run_replica_session(
             Frame::ReplConf {
                 node: 1,
                 ack: applier.applied(),
+                resume_token: None,
             },
         )
         .await;

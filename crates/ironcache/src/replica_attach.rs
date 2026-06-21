@@ -106,9 +106,9 @@ use ironcache_clusterbus::ClusterSecurity;
 use ironcache_env::Clock;
 use ironcache_protocol::slot::key_slot;
 use ironcache_repl::{
-    ApplyOutcome, Frame, FrameError, InSyncReplicas, ReplId, ReplNodeStatus, ReplObserver,
-    ReplOffset, ReplRing, ReplicaApplier, ShipOutcome, decode_kvobj, drain_and_ship, encode_kvobj,
-    receive_full_sync,
+    ApplyOutcome, DiskBacklog, Frame, FrameError, InSyncReplicas, ReplId, ReplNodeStatus,
+    ReplObserver, ReplOffset, ReplRing, ReplicaApplier, ShipOutcome, decode_kvobj, drain_and_ship,
+    encode_kvobj, receive_full_sync,
 };
 use ironcache_runtime::tokio_rt::bind_exclusive;
 use ironcache_runtime::{Runtime, SecureStream, TokioRuntime};
@@ -119,10 +119,12 @@ use ironcache_store::SnapshotCursor;
 use crate::serve::ShardStoreImpl;
 
 /// The bounded depth of a primary shard's replication tail ring (HA-7c [`ReplRing`] cap). A
-/// generous window so a momentarily-behind replica resumes from the tail rather than forcing a
-/// full re-sync; if it overflows (the replica fell too far behind) [`drain_and_ship`] reports
-/// [`ShipOutcome::ResyncNeeded`] and the replica re-full-syncs (the MVP full-resync-on-gap
-/// policy, correct though not optimal; a disk-backed backlog is HA-7e, deferred).
+/// generous window so a momentarily-behind replica resumes from the in-memory tail rather than
+/// forcing a full re-sync. When it overflows (the replica fell behind the in-memory window) the op
+/// either SPILLS to the HA-7e disk-backed backlog (when `repl_backlog_disk_bytes > 0` + a data_dir,
+/// so the replica still resumes incrementally from disk) or, with no disk backlog (the DEFAULT),
+/// [`drain_and_ship`] reports [`ShipOutcome::ResyncNeeded`] and the replica re-full-syncs (the MVP
+/// full-resync-on-gap policy, correct though not optimal).
 const TAIL_RING_CAP: usize = 65_536;
 
 /// How many tail ops to ship per [`drain_and_ship`] pass (a bounded batch so a borrow is held
@@ -198,6 +200,22 @@ fn any_importing_slot(map: &ironcache_cluster::SlotMap) -> Option<u16> {
         .find(|&slot| map.migration_state(slot) == ironcache_cluster::MigrationState::Importing)
 }
 
+/// Build THIS shard's OPTIONAL HA-7e disk-backed replication backlog from the boot config. Returns
+/// `Some(DiskBacklog)` only when `repl_backlog_disk_bytes > 0` AND a `data_dir` is configured (the
+/// spill lives under `<data_dir>/repl-backlog-shard-<n>`, per shard so segments never collide);
+/// `None` (the DEFAULT, or no data_dir) leaves the in-memory-only tail, byte-identical to pre-HA-7e.
+/// A directory-creation failure inside `DiskBacklog::open` also yields `None` (the safe degradation:
+/// replication still runs, just without the wider window).
+fn build_disk_backlog(ctx: &ServerContext, shard_index: usize) -> Option<DiskBacklog> {
+    let max_bytes = ctx.boot.repl_backlog_disk_bytes;
+    if max_bytes == 0 {
+        return None; // disabled: in-memory-only, byte-identical.
+    }
+    let data_dir = ctx.boot.data_dir.as_ref()?; // no data_dir -> the knob is inert.
+    let shard_dir = data_dir.join(format!("repl-backlog-shard-{shard_index}"));
+    DiskBacklog::open(&shard_dir, max_bytes)
+}
+
 /// Spawn the HA-7d replica-attach machinery on THIS shard's `LocalSet` (the per-shard
 /// `spawn_on_shard` executor): the PRIMARY repl listener + observer and the REPLICA control
 /// task. Called from the per-shard drain-loop setup ONLY in raft-mode (the caller gates on
@@ -216,6 +234,7 @@ pub(crate) fn spawn_on_shard(
     store_rc: Rc<RefCell<ShardStoreImpl>>,
     bind: std::net::IpAddr,
     client_port: u16,
+    shard_index: usize,
 ) {
     if PRIMARY_STARTED.with(std::cell::Cell::get) {
         return; // already wired on this shard (idempotent).
@@ -245,23 +264,42 @@ pub(crate) fn spawn_on_shard(
         }
     };
 
+    // HA-7e: an OPTIONAL per-shard DISK-BACKED backlog spilling the in-memory tail past `cap`, so a
+    // replica behind the in-memory ring catches up INCREMENTALLY from disk instead of a full
+    // snapshot re-sync. Engaged ONLY when `repl_backlog_disk_bytes > 0` AND a `data_dir` is
+    // configured; otherwise `None` -> the in-memory-only tail, byte-identical to before HA-7e. The
+    // spill is PER SHARD (under `<data_dir>/repl-backlog-shard-<n>`) so shards never share segments.
+    let disk_backlog = build_disk_backlog(ctx, shard_index);
+
     // The per-shard replication tail ring + the observer feeding it. Installing the observer
     // flips the store's `repl_active` gate (the HA-5a seam's intended raft-mode use): from now
     // on every local write on this shard is enqueued onto `ring` as a tail op. One Rc clone of
     // the ring stays here for the listener's `drain_and_ship`; the other lives in the boxed
     // observer the store owns.
-    let ring = ReplRing::new(TAIL_RING_CAP, ReplOffset::ZERO);
+    let ring = ReplRing::with_disk(TAIL_RING_CAP, ReplOffset::ZERO, disk_backlog);
     store_rc
         .borrow_mut()
         .set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
 
-    // The replication id this primary advertises: derived from this node's stable 40-hex
-    // cluster node id (`from_hex` reads exactly 40 hex chars into the 20-byte ReplId), so it is
-    // stable across the process lifetime and distinct per node. A replica that sees a CHANGED
-    // replid would full-resync (HA-7b); here it is fixed for the node, which is the intended
-    // single-stream-per-primary identity.
-    let replid = ReplId::from_hex(ctx.info.cluster_node_id.as_bytes())
-        .unwrap_or_else(|| ReplId::from_bytes([0u8; 20]));
+    // The replication id this primary advertises in `FullSync` AND the resume HISTORY token the
+    // resume gate verifies against. It MUST identify the replication HISTORY (which restarts on every
+    // primary boot, because the offset space restarts at `ReplOffset::ZERO` and the disk backlog
+    // purges prior segments), NOT the STABLE cluster identity. So we use the PER-BOOT history token
+    // (`ctx.repl_history_id`, freshly drawn from the boot RNG seam) when present (raft-governance
+    // mode, the only mode that serves the live resume). A NEW token on every restart is the fence
+    // against silent divergence: a reconnecting replica that last synced under the OLD token will
+    // mismatch and full-resync (the correct, safe behavior) rather than blindly resume against a
+    // primary whose history was reset.
+    //
+    // FALLBACK (no per-boot token, e.g. a defensive non-raft path that somehow reaches here): keep
+    // the prior stable-cluster-id-derived value. That value is UNCHANGED across restarts, so a
+    // replica would never see a token change -- but in that fallback the resume gate ALSO never
+    // matches a remembered token unless the cluster id round-trips, and the ack<=head guard plus the
+    // first-connect-full-sync rule still hold, so the conservative outcome is a full re-sync.
+    let replid = ctx.repl_history_id.unwrap_or_else(|| {
+        ReplId::from_hex(ctx.info.cluster_node_id.as_bytes())
+            .unwrap_or_else(|| ReplId::from_bytes([0u8; 20]))
+    });
 
     // The NODE-LEVEL replication status cell (HA-7e): the repl tasks publish role / offsets / link
     // state here for INFO / CLUSTER SHARDS + the HA-8 promotion gate. Raft-mode always installs
@@ -539,7 +577,7 @@ async fn serve_replica_conn(
     // we always full-sync from scratch in this MVP, so the ack is read-and-acknowledged but the
     // sync starts at the snapshot cut regardless.
     let mut pending: Vec<u8> = Vec::new();
-    let Some((slot_filter, handshake_ack)) =
+    let Some((slot_filter, handshake_ack, handshake_token)) =
         read_attach_handshake(&rt, &stream, &mut pending).await
     else {
         return; // the peer closed / sent garbage before attaching.
@@ -548,18 +586,61 @@ async fn serve_replica_conn(
     // replica's resume offset. INFO renders the `slaveN:` line + the master-side lag from this.
     status.set_replica_connected(handshake_ack);
 
-    // (2) Drive the full sync. CARRY-FORWARD 1 (ATOMIC end_offset capture) is satisfied inside
-    // `drive_full_sync_chunked` (see its doc + the cited code point): the cut is the ring head
-    // captured with NO `.await` between the head read and the first snapshot chunk pull. When
-    // `slot_filter` is `Some(slot)`, only that slot's keys are shipped (a scoped snapshot). The
-    // returned cut is THIS connection's per-connection send-cursor START (C1): the tail ships
-    // ops with offset strictly greater than it, from this connection's OWN cursor.
-    let Ok(cut) =
-        drive_full_sync_chunked(&rt, &stream, replid, &store_rc, &ring, slot_filter).await
-    else {
-        status.set_replica_disconnected(); // the link dropped mid-sync; the replica re-syncs.
-        in_sync.replica_gone(counted); // no-op (never counted pre-sync), kept for uniform cleanup.
-        return;
+    // (2) INCREMENTAL RESUME vs FULL SYNC (HA-7e). A RECONNECTING plain replica advertises its real
+    // applied offset (`handshake_ack > 0`, it kept its store) AND the replication HISTORY token it
+    // last full-synced under. We RESUME -- skip the full snapshot and stream the tail from
+    // `handshake_ack` -- ONLY when ALL of these hold; otherwise we full-sync from scratch (today's
+    // behavior, the SAFE fallback):
+    //
+    //   * HISTORY-TOKEN MATCH (the silent-divergence fence): the replica's remembered token EXACTLY
+    //     equals THIS primary's current history token (`replid`, freshly minted on every boot). A
+    //     primary RESTART mints a NEW token while the offset space resets to `ZERO`, so a replica
+    //     that resumes against a different history (the primary lost/reset its writes) is forced to
+    //     full-resync rather than blindly keep its now-stale store. A first-connect replica carries
+    //     NO token (`None`) and so always full-syncs, as before.
+    //   * ACK NOT AHEAD OF HEAD (`handshake_ack <= head`): the replica must not claim MORE than this
+    //     primary actually has. If it does, the primary lost/reset history (a restart back to a
+    //     SMALLER store), so the offset-window check's "caught up, nothing to serve" verdict
+    //     (`can_serve_from(ack)` returns true for `ack >= head`) would WRONGLY treat the replica as
+    //     in sync and ship nothing, leaving it silently diverged. Guard it explicitly -> full-sync.
+    //   * the offset is genuinely SERVEABLE from the RECOVERABLE window (the in-memory ring OR the
+    //     HA-7e disk-backed spill) and no resync is latched -- the original window check.
+    //
+    // A SCOPED import (`slot_filter` Some) NEVER resumes -- it is an additive slot-migration
+    // data-copy that always re-snapshots the slot. The resume decision is taken under one synchronous
+    // borrow (flush staged spill first so the disk run is complete).
+    let token_matches = handshake_token == Some(replid);
+    let can_resume = slot_filter.is_none() && token_matches && {
+        let mut r = ring.borrow_mut();
+        if r.has_disk() {
+            r.flush_spill();
+        }
+        let head = r.head();
+        handshake_ack.0 > 0
+            && handshake_ack.0 <= head.0
+            && !r.needs_resync()
+            && r.can_serve_from(handshake_ack)
+    };
+
+    let cut = if can_resume {
+        // RESUME: do NOT send a FullSync; the replica keeps its store and continues applying from
+        // `handshake_ack`. The tail loop below ships ops with offset strictly greater than it
+        // (drawing from disk then memory, gap-free). The send cursor starts at the replica's ack.
+        handshake_ack
+    } else {
+        // FULL SYNC. CARRY-FORWARD 1 (ATOMIC end_offset capture) is satisfied inside
+        // `drive_full_sync_chunked` (see its doc + the cited code point): the cut is the ring head
+        // captured with NO `.await` between the head read and the first snapshot chunk pull. When
+        // `slot_filter` is `Some(slot)`, only that slot's keys are shipped (a scoped snapshot). The
+        // returned cut is THIS connection's per-connection send-cursor START (C1).
+        let Ok(cut) =
+            drive_full_sync_chunked(&rt, &stream, replid, &store_rc, &ring, slot_filter).await
+        else {
+            status.set_replica_disconnected(); // the link dropped mid-sync; the replica re-syncs.
+            in_sync.replica_gone(counted); // no-op (never counted pre-sync), kept for uniform cleanup.
+            return;
+        };
+        cut
     };
     // The full sync completed: this replica is now caught up to the snapshot cut (send_cursor ==
     // cut), so it is IN SYNC. Count it toward the write-side quorum (ADR-0026). An IMPORT scope
@@ -751,8 +832,9 @@ async fn drive_full_sync_chunked(
     Ok(end_offset)
 }
 
-/// Read inbound bytes until the attach `REPLCONF` arrives, returning `Some((slot_filter, ack))`
-/// once it does (the handshake), or `None` if the socket closes / sends a malformed frame first.
+/// Read inbound bytes until the attach `REPLCONF` arrives, returning
+/// `Some((slot_filter, ack, resume_token))` once it does (the handshake), or `None` if the socket
+/// closes / sends a malformed frame first.
 ///
 /// A leading [`Frame::ImportReq`] (sent by an IMPORTING destination, HA-6 data-copy) BEFORE the
 /// REPLCONF scopes the attach to one slot: its slot is captured into `slot_filter` and returned
@@ -760,11 +842,16 @@ async fn drive_full_sync_chunked(
 /// transfer is the unfiltered whole-store HA-7d attach (byte-identical). Any OTHER non-REPLCONF
 /// frame before the handshake is ignored (a stray heartbeat). `pending` carries the partial read
 /// buffer across reads. The `ack` is the master's view of the peer's resume offset (HA-7e INFO).
+/// `resume_token` is the per-boot replication HISTORY token the replica last full-synced under
+/// (`Some` only for a reconnecting replica with a prior store); the resume gate accepts an
+/// incremental tail ONLY when it EXACTLY matches the primary's CURRENT history token (else a full
+/// re-sync), so a primary restart -- which mints a new token -- can never let a replica silently
+/// resume against a reset history.
 async fn read_attach_handshake(
     _rt: &TokioRuntime,
     stream: &Rc<RefCell<Option<SecureStream>>>,
     pending: &mut Vec<u8>,
-) -> Option<(Option<u16>, ReplOffset)> {
+) -> Option<(Option<u16>, ReplOffset, Option<ReplId>)> {
     let mut slot_filter: Option<u16> = None;
     loop {
         // Drain any complete frames already buffered.
@@ -773,9 +860,13 @@ async fn read_attach_handshake(
                 Ok(Some((frame, consumed))) => {
                     pending.drain(..consumed);
                     match frame {
-                        Frame::ReplConf { ack, .. } => {
-                            // Attached; carry the scope (if any) + the peer's resume offset.
-                            return Some((slot_filter, ack));
+                        Frame::ReplConf {
+                            ack, resume_token, ..
+                        } => {
+                            // Attached; carry the scope (if any), the peer's resume offset, AND the
+                            // resume history token it last synced under (`None` for a first-connect
+                            // replica). The token gates whether the primary may RESUME (HA-7e safety).
+                            return Some((slot_filter, ack, resume_token));
                         }
                         // A leading IMPORTREQ scopes this attach to one slot (HA-6 data-copy).
                         // Record it and keep reading for the REPLCONF that follows.
@@ -853,6 +944,15 @@ async fn run_replica_control(
     // and is false on every later dial-fail iteration (when the timeout has elapsed). Latched here,
     // updated only on a real attach, reset when this node stops being a replica.
     let mut last_contact_in_sync = false;
+    // HA-7e: the replica's CARRY-FORWARD resume state -- the highest offset it has DURABLY APPLIED
+    // AND the per-boot history token it last full-synced under -- carried ACROSS reconnects so a
+    // re-dial can RESUME incrementally (from the owner's in-memory ring or its disk-backed backlog)
+    // instead of always full-syncing. `FRESH` (offset ZERO, token None) means "no store yet" (a fresh
+    // attach full-syncs); `attach_once` returns the new state to carry forward. It is RESET to `FRESH`
+    // whenever this node stops being a replica (a future replica role starts fresh). The token is the
+    // silent-divergence fence: a primary restart mints a NEW token, so the remembered token mismatches
+    // and the primary forces a full re-sync (instead of resuming against a reset history).
+    let mut resume = ResumeState::FRESH;
     loop {
         // Should THIS shard be a replica right now? (single-shard: replica of ANY slot.)
         //
@@ -869,6 +969,7 @@ async fn run_replica_control(
         if any_importing_slot(&cluster).is_some() {
             down_since = None;
             last_contact_in_sync = false;
+            resume = ResumeState::FRESH; // not attaching as a replica: a later attach is fresh.
             rt.timer(POLL_INTERVAL).await;
             continue;
         }
@@ -899,7 +1000,7 @@ async fn run_replica_control(
                     // (role / link / offsets) into `status` for INFO / CLUSTER SHARDS + the HA-8
                     // gate; the master ENDPOINT reported is the owner's advertised CLIENT
                     // host:port (what an operator dials), not the internal repl port.
-                    attach_once(
+                    resume = attach_once(
                         &rt,
                         owner_addr,
                         &host,
@@ -910,6 +1011,7 @@ async fn run_replica_control(
                         reserved_bits,
                         &status,
                         replica_security.as_ref(),
+                        resume,
                     )
                     .await;
                     // The attach returned: the link is down (drop / gap / dial fail). BEFORE we
@@ -979,6 +1081,7 @@ async fn run_replica_control(
             // failover-timeout window with no stale latch.
             down_since = None;
             last_contact_in_sync = false;
+            resume = ResumeState::FRESH; // no longer a replica: a future attach is fresh.
             rt.timer(POLL_INTERVAL).await;
         }
     }
@@ -1081,18 +1184,54 @@ fn now_monotonic() -> ironcache_env::Monotonic {
     crate::serve::shard_env().borrow().now()
 }
 
-/// Attach ONCE to the owner at `owner_addr`: dial, [`receive_full_sync`] into a FRESH
-/// [`ShardStoreImpl`], ATOMICALLY swap it into the live `store_rc`, mark the shard passive
-/// (CARRY-FORWARD 2), then run the tail until the link drops / a Gap forces a re-sync. Returns
-/// on any terminal condition (dial fail, sync fail, link drop, gap) so the caller re-attaches.
+/// The replica's CARRY-FORWARD resume state (HA-7e): the highest offset it has durably applied AND
+/// the per-boot replication HISTORY token it last full-synced under. Carried across reconnects by
+/// `run_replica_control` so a re-dial can advertise both and the primary can decide RESUME vs
+/// FULL-SYNC. `token == None` means "no store yet / never synced" (a fresh attach always full-syncs);
+/// after a full sync the token is set to the `FullSync.replid` the primary advertised, so the next
+/// reconnect re-advertises it and the primary's gate verifies the histories match before resuming.
+#[derive(Debug, Clone, Copy)]
+struct ResumeState {
+    /// The highest offset durably applied (the resume point), `ZERO` when there is no store.
+    offset: ReplOffset,
+    /// The history token last synced under (`None` until the first full sync completes).
+    token: Option<ReplId>,
+}
+
+impl ResumeState {
+    /// The fresh state: no store, no history token -> the primary always full-syncs.
+    const FRESH: ResumeState = ResumeState {
+        offset: ReplOffset::ZERO,
+        token: None,
+    };
+}
+
+/// Attach ONCE to the owner at `owner_addr`: dial, advertise the replica's resume offset AND its
+/// remembered history token, then EITHER resume the tail incrementally (HA-7e, keeping the live
+/// store) OR [`receive_full_sync`] into a FRESH [`ShardStoreImpl`] + ATOMICALLY swap it in, mark the
+/// shard passive (CARRY-FORWARD 2), then run the tail until the link drops / a Gap forces a re-sync.
+/// Returns the [`ResumeState`] at the end of the session (the highest applied offset + the token the
+/// store was synced under), which the caller carries forward to the next dial (so a re-dial resumes
+/// incrementally instead of full-syncing). On a terminal condition that left the store untouched
+/// (dial fail, sync fail, dial/handshake error) it returns the INCOMING `resume` UNCHANGED -- a
+/// no-op for the caller's carry-forward.
 ///
-/// On a FAILED / interrupted sync the partial temp store is DISCARDED (it is dropped on the
-/// error return inside `receive_full_sync`, never swapped) and we return WITHOUT having
-/// perturbed the live store: a half-loaded store is NEVER swapped in.
+/// ## Incremental resume vs full sync (HA-7e), decided by the PRIMARY + the first frame
+///
+/// The replica sends `resume.offset` as its REPLCONF ack AND `resume.token` as the REPLCONF resume
+/// token. The PRIMARY decides (see `serve_replica_conn`): if the token EXACTLY matches its current
+/// per-boot history token AND the offset is within its recoverable window (in-memory ring OR the
+/// disk-backed backlog, and not ahead of head) it RESUMES -- it sends NO `FullSync`, just the tail
+/// from the ack. The replica detects this by PEEKING the first inbound frame: a `FullSync` means a
+/// full re-sync (the fresh-store path; the replica adopts the NEW token from `FullSync.replid`); a
+/// stream/heartbeat frame means a RESUME (keep the live store + the existing token, continue the
+/// applier from `resume.offset`). A fresh replica (`token == None`, no store) always full-syncs. On
+/// a FAILED / interrupted full sync the partial temp store is DISCARDED (never swapped) and the live
+/// store is UNTOUCHED.
 ///
 /// The over-7-args lint is allowed: each argument is a distinct, orthogonal seam (the runtime,
 /// the owner's repl dial address vs its advertised CLIENT endpoint for the status report, the
-/// live store handle, the store-construction facts, and the node status cell to publish into);
+/// live store handle, the store-construction facts, the node status cell, and the resume state);
 /// bundling them would just move the same fields behind one name.
 #[allow(clippy::too_many_arguments)]
 async fn attach_once(
@@ -1106,105 +1245,160 @@ async fn attach_once(
     reserved_bits: u32,
     status: &std::sync::Arc<ReplNodeStatus>,
     security: Option<&ClusterSecurity>,
-) {
-    // Dial the owner's repl endpoint. A failed dial returns; the caller backs off + retries.
+    resume: ResumeState,
+) -> ResumeState {
+    let resume_from = resume.offset;
+    // Dial the owner's repl endpoint. A failed dial returns the unchanged resume state; the caller
+    // backs off + retries (and carries `resume` forward to the next dial).
     let Ok(tcp) = rt.connect(owner_addr).await else {
-        return;
+        return resume;
     };
     // PROD-3: TLS-secure the dialed link (CA-verify the owner + present the shared secret) when
     // cluster security is on; `None` -> a plaintext `SecureStream::Plain` (byte-identical). A
     // TLS/secret failure returns so the caller backs off + re-dials.
     let Some(stream) = secure_dial(security, tcp).await else {
-        return;
+        return resume;
     };
     let stream = Rc::new(RefCell::new(Some(stream)));
 
-    // Send the attach REPLCONF handshake (this node names itself; ack 0 -> full sync from
-    // scratch in this MVP). `node`/`ack` are advisory to the primary's link bookkeeping; the
-    // sync is driven by the primary regardless.
+    // Send the attach REPLCONF handshake advertising `resume.offset` AND the remembered history
+    // token (HA-7e). A fresh replica sends `ZERO` + `None` (no store, no token) so the primary
+    // full-syncs; a reconnecting replica sends its real applied offset + the token it last synced
+    // under, so the primary can RESUME incrementally ONLY IF the token matches its current history
+    // (the silent-divergence fence) AND the offset is within the recoverable (memory + disk) window.
+    // `node` is advisory to the primary's link bookkeeping.
     let handshake = Frame::ReplConf {
         node: 0,
-        ack: ReplOffset::ZERO,
+        ack: resume_from,
+        resume_token: resume.token,
     }
     .encode();
     if !send_bytes_ok(rt, &stream, handshake).await {
-        return;
+        return resume;
     }
 
-    // Receive the full sync into a FRESH store built EXACTLY like `shard_store` builds the live
-    // one (same Policy from the configured name, same accounting, same scan-band bits), so the
-    // swapped-in store is the SAME concrete `ShardStoreImpl` type and behaves identically.
     let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
     let queue = Rc::new(RefCell::new(std::collections::VecDeque::<Frame>::new()));
-    let make_store = move || crate::serve::fresh_shard_store(databases, policy_name, reserved_bits);
-    let loaded = {
-        let recv_rt = *rt;
-        let recv_stream = Rc::clone(&stream);
-        let pending = Rc::clone(&pending);
-        let queue = Rc::clone(&queue);
-        receive_full_sync(make_store, move || {
+
+    // PEEK the first inbound frame to learn whether the primary chose FULL SYNC or RESUME. A
+    // `FullSync` first frame -> full-sync path; ANY other first frame (a tail StreamPut/StreamDel,
+    // or a heartbeat) -> resume path. A fresh replica (resume_from ZERO) is ALWAYS full-synced by
+    // the primary, so the peek there is a `FullSync`. The peeked frame is pushed back onto the recv
+    // queue so the chosen path's recv loop consumes it (next_frame drains the queue first).
+    let Some(first) = next_frame(rt, &stream, &pending, &queue).await else {
+        return resume; // link dropped before the first frame; nothing applied.
+    };
+    // On a FULL SYNC the `FullSync.replid` IS the primary's per-boot history token: REMEMBER it so a
+    // later reconnect re-advertises it and the primary's resume gate can verify the histories match.
+    let full_sync_token = match &first {
+        Frame::FullSync { replid, .. } => Some(*replid),
+        _ => None,
+    };
+    let is_full_sync = full_sync_token.is_some();
+    queue.borrow_mut().push_front(first); // put it back for the path below.
+
+    if is_full_sync {
+        // ---- FULL SYNC (today's behavior): receive into a FRESH store + atomic swap. ----
+        // The fresh store is built EXACTLY like `shard_store` builds the live one (same Policy,
+        // accounting, scan-band bits), so the swapped-in store is the SAME concrete type.
+        let make_store =
+            move || crate::serve::fresh_shard_store(databases, policy_name, reserved_bits);
+        let loaded = {
+            let recv_rt = *rt;
+            let recv_stream = Rc::clone(&stream);
             let pending = Rc::clone(&pending);
             let queue = Rc::clone(&queue);
-            let stream = Rc::clone(&recv_stream);
-            async move { next_frame(&recv_rt, &stream, &pending, &queue).await }
-        })
-        .await
-    };
-    let Ok(loaded) = loaded else {
-        // The sync did not complete: the partial temp store was discarded inside
-        // receive_full_sync. The live store is UNTOUCHED. Return so the caller re-attaches.
-        return;
-    };
+            receive_full_sync(make_store, move || {
+                let pending = Rc::clone(&pending);
+                let queue = Rc::clone(&queue);
+                let stream = Rc::clone(&recv_stream);
+                async move { next_frame(&recv_rt, &stream, &pending, &queue).await }
+            })
+            .await
+        };
+        let Ok(loaded) = loaded else {
+            // The sync did not complete: the partial temp store was discarded inside
+            // receive_full_sync. The live store is UNTOUCHED. Return the unchanged resume state
+            // (no store this round); the caller re-attaches (and will full-sync again).
+            return resume;
+        };
 
-    // ATOMIC STORE SWAP (HA-7d): replace the RefCell contents with the fully-loaded fresh
-    // store in ONE statement. The `Rc` handle stays shared with the serve loop, so reads
-    // immediately start hitting the synced data; the OLD store is dropped at end of statement.
-    // This is the only place the live store is replaced, and it happens ONLY after a COMPLETE
-    // sync (a half-loaded store is never reachable here). Marking the shard passive BEFORE the
-    // swap is published is unnecessary on a single-threaded shard (no other task runs during
-    // this synchronous block), but we set passive immediately after so the reaper -- if it
-    // fires on the very next tick -- sees the replica state.
-    *store_rc.borrow_mut() = loaded.store; // <-- the atomic store swap.
-    // CARRY-FORWARD 2: the replica store is now passive. Two complementary guards: the
-    // serve-loop flag stops the background reaper tick, and the STORE-level flag makes the
-    // lazy-on-read expiry path report a due key as absent WITHOUT physically removing it
-    // (so a READONLY read can never self-remove a key the primary still holds; removal comes
-    // only from the primary's StreamDel). Both together make the replica removal-passive
-    // end to end.
-    store_rc.borrow_mut().set_passive(true);
-    crate::serve::set_replica_passive(true);
+        // ATOMIC STORE SWAP (HA-7d): replace the RefCell contents with the fully-loaded fresh store
+        // in ONE statement; reads immediately hit the synced data, the OLD store drops. This is the
+        // only place the live store is replaced, ONLY after a COMPLETE sync.
+        *store_rc.borrow_mut() = loaded.store; // <-- the atomic store swap.
+        // CARRY-FORWARD 2: the replica store is now passive (the reaper-stop flag + the store-level
+        // lazy-expiry-passive flag), so a READONLY read never self-removes a key the primary holds.
+        store_rc.borrow_mut().set_passive(true);
+        crate::serve::set_replica_passive(true);
 
-    // Publish the REPLICA-side status (HA-7e): this node is now a replica of `owner_host:port`,
-    // link UP, with the snapshot cut as its initial applied + observed-master offset. INFO renders
-    // `role:replica`/`master_host`/`master_link_status:up`/the offsets, and the HA-8 gate reads
-    // `is_in_sync` off this. The endpoint is the owner's advertised CLIENT host:port (what
-    // operators see), not the internal repl port the replica dials.
-    status.set_replica_attached(owner_host, owner_client_port, loaded.end_offset);
+        // Publish the REPLICA-side status (HA-7e): role replica, link UP, the snapshot cut as the
+        // initial applied + observed-master offset.
+        status.set_replica_attached(owner_host, owner_client_port, loaded.end_offset);
 
-    // Run the steady-state tail from the snapshot cut. On a Gap (a missing offset / corrupt
-    // frame) the replica fell behind the primary's bounded buffer; tear down + re-attach (the
-    // caller's loop re-dials, which full-syncs from a fresh cut).
-    run_replica_tail(rt, &stream, store_rc, loaded.end_offset, status).await;
+        // Run the steady-state tail from the snapshot cut; returns the highest applied offset. On a
+        // Gap the replica re-attaches (and the carried-forward offset lets it resume if possible).
+        // The carried-forward TOKEN is the one the primary advertised in THIS `FullSync` (the new
+        // history), so the next reconnect re-advertises it and the resume gate can verify a match.
+        let applied = run_replica_tail(
+            rt,
+            &stream,
+            store_rc,
+            loaded.end_offset,
+            status,
+            &pending,
+            &queue,
+        )
+        .await;
+        ResumeState {
+            offset: applied,
+            token: full_sync_token,
+        }
+    } else {
+        // ---- RESUME (HA-7e): the primary is streaming the tail from `resume_from`; KEEP the live
+        // store (it already holds the keyspace from the prior session) and continue the applier from
+        // `resume_from`. NO fresh store, NO swap. The store is already passive from the prior attach
+        // (it was never un-marked), but set it again defensively (idempotent) so a resume after any
+        // path leaves the replica removal-passive. ----
+        store_rc.borrow_mut().set_passive(true);
+        crate::serve::set_replica_passive(true);
+        status.set_replica_attached(owner_host, owner_client_port, resume_from);
+        // Continue the tail from `resume_from`: the first applied stream frame must be
+        // `resume_from.next()`. A Gap (the primary could not actually serve a contiguous tail) tears
+        // down + re-attaches; the carried-forward offset is whatever was applied (possibly resume_from).
+        // The TOKEN is UNCHANGED on a resume (the same history the prior full-sync established): carry
+        // `resume.token` forward so the next reconnect still presents it.
+        let applied =
+            run_replica_tail(rt, &stream, store_rc, resume_from, status, &pending, &queue).await;
+        ResumeState {
+            offset: applied,
+            token: resume.token,
+        }
+    }
 }
 
 /// The replica STEADY-STATE TAIL (HA-7c apply): recv stream frames and apply them in offset
-/// order via [`ReplicaApplier`], returning when the link drops or a [`ApplyOutcome::Gap`]
-/// forces a full re-sync. No `RefCell` borrow crosses an `.await`: each frame is recv'd (store
-/// borrow not held), THEN the store is borrowed for the synchronous `apply`, THEN the borrow
-/// drops before the next recv.
+/// order via [`ReplicaApplier`], returning the HIGHEST APPLIED OFFSET when the link drops or a
+/// [`ApplyOutcome::Gap`] forces a full re-sync. The returned offset is the caller's next
+/// `resume_from` (HA-7e), so a re-dial resumes incrementally. No `RefCell` borrow crosses an
+/// `.await`: each frame is recv'd (store borrow not held), THEN the store is borrowed for the
+/// synchronous `apply`, THEN the borrow drops before the next recv.
+///
+/// `pending`/`queue` are the recv buffers SHARED with the attach (so the first peeked-then-pushed
+/// -back frame, and any bytes already buffered, are consumed here with NO gap).
 async fn run_replica_tail(
     rt: &TokioRuntime,
     stream: &Rc<RefCell<Option<SecureStream>>>,
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     start: ReplOffset,
     status: &std::sync::Arc<ReplNodeStatus>,
-) {
+    pending: &Rc<RefCell<Vec<u8>>>,
+    queue: &Rc<RefCell<std::collections::VecDeque<Frame>>>,
+) -> ReplOffset {
     let mut applier = ReplicaApplier::new(start);
-    let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let queue = Rc::new(RefCell::new(std::collections::VecDeque::<Frame>::new()));
     loop {
-        let Some(frame) = next_frame(rt, stream, &pending, &queue).await else {
-            return; // link dropped / peer closed: the caller re-attaches.
+        let Some(frame) = next_frame(rt, stream, pending, queue).await else {
+            return applier.applied(); // link dropped / peer closed: the caller re-attaches.
         };
         // The master's head as observed on the link (HA-7e): a stream put/del carries the offset
         // of a write the master produced, so it is a lower bound on the master head. Publishing it
@@ -1226,8 +1420,9 @@ async fn run_replica_tail(
                 status.set_replica_applied(applier.applied());
             }
             // A gap (a missing offset or a corrupt post-image): the safe recovery is a full
-            // re-sync. Return so the caller re-dials + full-syncs from a fresh cut.
-            ApplyOutcome::Gap => return,
+            // re-sync. Return the applied offset; the caller re-dials. With the disk backlog the
+            // carried-forward offset may still let the re-dial resume; otherwise it full-syncs.
+            ApplyOutcome::Gap => return applier.applied(),
         }
     }
 }
@@ -1405,6 +1600,9 @@ async fn import_once<F>(
     let handshake = Frame::ReplConf {
         node: 0,
         ack: ReplOffset::ZERO,
+        // A scoped import NEVER resumes (it always re-snapshots the slot), so it carries no history
+        // token; the source's resume gate sees `slot_filter` Some and never resumes regardless.
+        resume_token: None,
     }
     .encode();
     if !send_bytes_ok(rt, &stream, handshake).await {
@@ -1868,6 +2066,7 @@ mod tests {
     /// AND adopts the captured cut offset. This exercises the load-bearing wired logic (the
     /// chunked snapshot driver + the cut capture) the live serve path runs, end to end.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn drive_full_sync_chunked_loopback_matches_primary() {
         use ironcache_storage::{ExpireWrite, NewValue, Store};
         use std::collections::VecDeque;
@@ -1950,6 +2149,7 @@ mod tests {
                 let handshake = Frame::ReplConf {
                     node: 7,
                     ack: ReplOffset::ZERO,
+                    resume_token: None,
                 }
                 .encode();
                 send_bytes(&rt, &stream, handshake)
@@ -2003,6 +2203,7 @@ mod tests {
             Frame::ReplConf {
                 node: 0,
                 ack: ReplOffset::ZERO,
+                resume_token: None,
             }
             .encode(),
         )
@@ -2207,7 +2408,7 @@ mod tests {
                 let (stream, _peer) = rt.accept(&listener).await.expect("accept");
                 let stream = Rc::new(RefCell::new(Some(SecureStream::plain(stream))));
                 let mut pending = Vec::new();
-                let Some((slot_filter, _ack)) =
+                let Some((slot_filter, _ack, _token)) =
                     read_attach_handshake(&rt, &stream, &mut pending).await
                 else {
                     return;
@@ -2252,6 +2453,7 @@ mod tests {
                     Frame::ReplConf {
                         node: 0,
                         ack: ReplOffset::ZERO,
+                        resume_token: None,
                     }
                     .encode(),
                 )
@@ -2472,6 +2674,150 @@ mod tests {
             },
             Some(slot)
         ));
+    }
+
+    /// THE PRODUCTION RESUME GATE (`serve_replica_conn`) over real loopback: a reconnecting replica
+    /// is RESUMED only on an EXACT history-token match (else FULL-SYNC), AND a token-match alone does
+    /// not let an ack AHEAD of head be treated as "caught up". This is the live counterpart of the
+    /// repl-crate restart loopback test, exercising the actual serve gate (not a mirror):
+    ///
+    ///   * connection A: ack > 0 but a MISMATCHED token (a restarted-primary scenario: the replica
+    ///     last synced under a DIFFERENT history) -> the primary sends a `FullSync` (the fence; pre-fix
+    ///     it would have resumed and shipped nothing -> silent divergence);
+    ///   * connection B: ack > 0 with the MATCHING token and a SERVEABLE offset (within the in-memory
+    ///     window) -> the primary RESUMES (the first inbound frame is NOT a `FullSync`);
+    ///   * connection C: the MATCHING token but ack AHEAD of head (`ack > head`) -> `FullSync` (the
+    ///     ack-ahead guard: a replica claiming more than the primary has must not be called in sync).
+    #[test]
+    fn resume_gate_requires_matching_history_token_and_ack_not_ahead_of_head() {
+        use ironcache_storage::{ExpireWrite, NewValue, Store};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener = bind_exclusive(addr).unwrap();
+
+            // The PRIMARY shard + observer/ring, with a few writes so head > 0 and the in-memory
+            // window can serve a resume from a low offset.
+            let store_rc: Rc<RefCell<ShardStoreImpl>> = Rc::new(RefCell::new(
+                crate::serve::fresh_shard_store(2, "noeviction", 0),
+            ));
+            let ring = ReplRing::new(TAIL_RING_CAP, ReplOffset::ZERO);
+            store_rc
+                .borrow_mut()
+                .set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+            {
+                let now = now_from_env();
+                let mut s = store_rc.borrow_mut();
+                for i in 0..5u32 {
+                    s.upsert(
+                        0,
+                        format!("k{i}").as_bytes(),
+                        NewValue::Bytes(b"v"),
+                        ExpireWrite::Clear,
+                        now,
+                    );
+                }
+            }
+            let head = ring.borrow().head();
+            assert_eq!(head, ReplOffset(5), "5 writes advanced the head");
+
+            // The primary's per-boot history token (what `serve_replica_conn` gates against).
+            let primary_token = ReplId::from_bytes([0xA1; 20]);
+
+            // The SOURCE: serve THREE connections with the production `serve_replica_conn`.
+            let src_store = Rc::clone(&store_rc);
+            let src_ring = Rc::clone(&ring);
+            tokio::task::spawn_local(async move {
+                let rt = TokioRuntime::new();
+                for _ in 0..3 {
+                    let (stream, _peer) = rt.accept(&listener).await.expect("accept");
+                    let store = Rc::clone(&src_store);
+                    let ring = Rc::clone(&src_ring);
+                    let status = std::sync::Arc::new(ReplNodeStatus::new());
+                    let in_sync = std::sync::Arc::new(InSyncReplicas::new());
+                    tokio::task::spawn_local(async move {
+                        serve_replica_conn(
+                            TokioRuntime::new(),
+                            SecureStream::plain(stream),
+                            primary_token,
+                            store,
+                            ring,
+                            status,
+                            in_sync,
+                            u64::MAX,
+                        )
+                        .await;
+                    });
+                }
+                rt.timer(Duration::from_secs(5)).await;
+            });
+
+            // A: ack within window but a MISMATCHED token -> FULL SYNC (the silent-divergence fence).
+            let wrong_token = ReplId::from_bytes([0xB2; 20]);
+            assert!(
+                attach_first_frame_is_full_sync(addr, ReplOffset(2), Some(wrong_token)).await,
+                "a mismatched history token must force a FULL sync, never a blind resume"
+            );
+
+            // B: ack within window AND the MATCHING token -> RESUME (first frame is NOT a FullSync).
+            assert!(
+                !attach_first_frame_is_full_sync(addr, ReplOffset(2), Some(primary_token)).await,
+                "a matching token + serveable offset resumes incrementally (no FullSync)"
+            );
+
+            // C: the MATCHING token but ack AHEAD of head -> FULL SYNC (the ack-ahead guard).
+            assert!(
+                attach_first_frame_is_full_sync(addr, ReplOffset(head.0 + 10), Some(primary_token))
+                    .await,
+                "an ack ahead of head must full-sync, never be treated as caught up"
+            );
+        });
+    }
+
+    /// Helper for `resume_gate_requires_matching_history_token_and_ack_not_ahead_of_head`: dial the
+    /// source, send a `REPLCONF` attach advertising `(ack, token)`, and return whether the FIRST
+    /// inbound frame is a `FullSync` (i.e. the primary chose a full re-sync over an incremental
+    /// resume). A module-level helper (not a nested fn) so the test body stays small + lint-clean.
+    async fn attach_first_frame_is_full_sync(
+        addr: SocketAddr,
+        ack: ReplOffset,
+        token: Option<ReplId>,
+    ) -> bool {
+        let rt = TokioRuntime::new();
+        let stream = loop {
+            match rt.connect(addr).await {
+                Ok(s) => break s,
+                Err(_) => rt.timer(Duration::from_millis(5)).await,
+            }
+        };
+        let stream = Rc::new(RefCell::new(Some(SecureStream::plain(stream))));
+        send_bytes(
+            &rt,
+            &stream,
+            Frame::ReplConf {
+                node: 1,
+                ack,
+                resume_token: token,
+            }
+            .encode(),
+        )
+        .await
+        .expect("replconf");
+        let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let queue = Rc::new(RefCell::new(std::collections::VecDeque::<Frame>::new()));
+        matches!(
+            next_frame(&rt, &stream, &pending, &queue).await,
+            Some(Frame::FullSync { .. })
+        )
     }
 
     /// A comparable `(db, key, encode_kvobj-bytes)` fingerprint of every live key, sorted; two

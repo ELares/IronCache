@@ -57,6 +57,7 @@ fn ctx(runtime: Arc<RuntimeConfig>, boot: Config) -> ServerContext {
         raft: None,
         repl_status: None,
         in_sync_replicas: None,
+        repl_history_id: None,
         metrics_registry: None,
         persist_stats: None,
         process_memory: Arc::new(ironcache_observe::ProcessMemoryGauge::new()),

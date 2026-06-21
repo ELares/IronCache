@@ -412,6 +412,17 @@ pub struct Config {
     /// ONLY in raft-governance mode. TOML (`raft_snapshot_chunk_bytes = N`) + the
     /// `IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES` env var.
     pub raft_snapshot_chunk_bytes: usize,
+    /// The HA-7e DISK-BACKED replication backlog size, in BYTES: the bound on the on-disk spill of
+    /// the per-shard replication tail. When a replica falls behind the IN-MEMORY backlog ring, a
+    /// non-zero value lets it catch up INCREMENTALLY from disk (a wider resume window) instead of
+    /// forcing a full snapshot re-sync; the oldest on-disk segments are evicted past this bound.
+    ///
+    /// DEFAULT 0 = DISABLED: the replication path is BYTE-IDENTICAL to the in-memory-only backlog
+    /// (nothing is spilled, the hot path is unchanged). REQUIRES a [`Self::data_dir`] (the spill
+    /// lives under `<data_dir>/repl-backlog`); with no `data_dir` the knob is inert even if set.
+    /// Meaningful ONLY in raft-governance mode (the default static path runs no replication tail).
+    /// TOML (`repl_backlog_disk_bytes = 268435456`) + the `IRONCACHE_REPL_BACKLOG_DISK_BYTES` env var.
+    pub repl_backlog_disk_bytes: u64,
     /// The durable data directory for the Raft log (and future on-disk state). When set, a
     /// raft-mode node persists its committed Raft log at `<data_dir>/ironcache-raft-<bus-port>.log`,
     /// so the control-plane state survives a reboot that clears the OS temp dir. When `None`
@@ -600,6 +611,10 @@ impl Default for Config {
             // node compacts once its log grows this far past the last snapshot.
             raft_snapshot_threshold: DEFAULT_RAFT_SNAPSHOT_THRESHOLD,
             raft_snapshot_chunk_bytes: DEFAULT_RAFT_SNAPSHOT_CHUNK_BYTES,
+            // HA-7e disk-backed replication backlog: DISABLED by default (0), so replication is
+            // byte-identical to the in-memory-only backlog -- nothing spills to disk. A non-zero
+            // value (with a data_dir) widens the incremental-resync window. Opt-in.
+            repl_backlog_disk_bytes: 0,
             // No data directory by default: the Raft log lands under the OS temp dir
             // (byte-unchanged pre-existing behavior). Setting it makes the log durable
             // across a reboot that clears /tmp. Meaningful only in raft-governance mode.
@@ -1263,6 +1278,10 @@ pub struct ConfigOverlay {
     /// plus the `IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES` env var. `None` leaves the lower layer
     /// (default [`DEFAULT_RAFT_SNAPSHOT_CHUNK_BYTES`]); `0` sends the whole snapshot in one chunk.
     pub raft_snapshot_chunk_bytes: Option<usize>,
+    /// HA-7e disk-backed replication backlog size (bytes). TOML (`repl_backlog_disk_bytes = N`)
+    /// plus the `IRONCACHE_REPL_BACKLOG_DISK_BYTES` env var. `None` leaves the lower layer (default
+    /// `0` = DISABLED, byte-identical in-memory-only backlog).
+    pub repl_backlog_disk_bytes: Option<u64>,
     /// The durable data directory for the Raft log (and future on-disk state). TOML
     /// (`data_dir = "/var/lib/ironcache"`, a string path) + the `IRONCACHE_DATA_DIR` env var.
     /// `None` leaves the lower layer (default `None` = the OS temp dir, byte-unchanged).
@@ -1464,6 +1483,13 @@ impl ConfigOverlay {
                 reason: format!("not a number: {v}"),
             })?);
         }
+        // HA-7e disk-backed replication backlog size (bytes); a single scalar, env-encodable.
+        if let Ok(v) = std::env::var("IRONCACHE_REPL_BACKLOG_DISK_BYTES") {
+            o.repl_backlog_disk_bytes = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "repl-backlog-disk-bytes",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
         // The durable data directory is a single scalar path, so it is env-encodable (useful
         // for per-pod injection in a stateful set alongside the announce id). A path is taken
         // verbatim (no parse can fail); an empty value is rejected by Config::validate.
@@ -1637,6 +1663,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.raft_snapshot_chunk_bytes {
             cfg.raft_snapshot_chunk_bytes = v;
+        }
+        if let Some(v) = self.repl_backlog_disk_bytes {
+            cfg.repl_backlog_disk_bytes = v;
         }
         if let Some(ref v) = self.data_dir {
             cfg.data_dir = Some(v.clone());

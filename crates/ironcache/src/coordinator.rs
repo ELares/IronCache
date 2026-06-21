@@ -228,7 +228,8 @@ pub async fn run_drain_loop(
             ctx.info.maxmemory_policy,
             crate::serve::scan_reserved_bits(ctx.shards),
         );
-        crate::replica_attach::spawn_on_shard(&ctx, store_rc, ctx.boot.bind, ctx.info.tcp_port);
+        let (bind, port) = (ctx.boot.bind, ctx.info.tcp_port);
+        crate::replica_attach::spawn_on_shard(&ctx, store_rc, bind, port, shard_index);
     }
     // TURNKEY cluster formation (PROD-turnkey): on SHARD 0 only (one driver per node, mirroring the
     // periodic-save host) in raft-mode WITH a static topology, spawn the bootstrap driver. Once this

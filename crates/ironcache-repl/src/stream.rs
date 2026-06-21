@@ -111,23 +111,38 @@ where
     S: FnMut(Frame) -> Fut,
     Fut: Future<Output = Result<(), ()>>,
 {
-    // --- Borrow the ring: check the gap / fall-behind, else copy a bounded batch out. RELEASE. ---
+    // --- Borrow the ring: flush any staged spill, check the gap / fall-behind, else copy a bounded
+    //     batch out (memory + HA-7e disk). RELEASE before any await. ---
     let batch: Vec<StreamOp> = {
-        let r = ring.borrow();
+        // HA-7e: FLUSH staged-but-not-yet-spilled evicted ops to disk FIRST (a synchronous fsync,
+        // OFF the write funnel -- this task is the off-funnel consumer), so the disk run is
+        // contiguous up to `oldest_retained - 1` and the recovery read below sees one unbroken
+        // disk->memory sequence. A no-op (zero cost) when there is no disk backlog (the DEFAULT) or
+        // nothing is staged, so the default hot path is byte-unchanged.
+        let mut r = ring.borrow_mut();
+        if r.has_disk() {
+            r.flush_spill();
+        }
         if r.needs_resync() {
-            // A resume-window gap (the ring evicted an un-acked op): signal the caller to
-            // full-resync. The latch + the ring re-base are left to the caller's resync path
-            // (it full-syncs, re-bases `cursor` to the cut, then `rebase`s the ring), so this
-            // call ships nothing and does not mutate the ring.
+            // A resume-window gap the incremental path cannot fill (the in-memory ring overflowed
+            // with no disk backlog, or a spill failed / staging overflowed): signal the caller to
+            // full-resync. The latch + the ring re-base are left to the caller's resync path (it
+            // full-syncs, re-bases `cursor` to the cut, then `rebase`s the ring), so this call ships
+            // nothing and does not further mutate the ring.
             return ShipOutcome::ResyncNeeded;
         }
-        // THIS connection fell behind the retained window: the next op it needs (cursor+1) is no
-        // longer retained, so it cannot be served forward -> full-resync THIS connection (the
-        // ring is untouched; other consumers that are still within the window keep streaming).
+        // THIS connection fell behind the RECOVERABLE window: the next op it needs (cursor+1) is no
+        // longer in memory NOR (HA-7e) on disk, so it cannot be served forward -> full-resync THIS
+        // connection (other consumers still within the window keep streaming). With a disk backlog
+        // the recoverable floor is the disk's oldest spilled offset, so a connection behind the
+        // in-memory ring but within the disk range is served INCREMENTALLY here instead.
         if !r.can_serve_from(*cursor) {
             return ShipOutcome::ResyncNeeded;
         }
-        r.ops_after(*cursor, max)
+        // Read forward of `cursor`: disk first (for the part below the in-memory window) then memory,
+        // with a gap-free / dup-free handoff (HA-7e). With no disk backlog this is exactly
+        // `ops_after` (the memory-only read), byte-identical to the default path.
+        r.recover_ops_after(*cursor, max)
     }; // the ring borrow ends here, before any await below.
 
     // Advance THIS connection's cursor before the awaits (the ops are about to be shipped; a
