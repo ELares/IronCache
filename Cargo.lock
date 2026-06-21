@@ -457,6 +457,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironcache-console"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ironcache-env",
+ "serde",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ironcache-env"
 version = "0.0.0"
 
