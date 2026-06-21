@@ -50,11 +50,22 @@ IMPLEMENTED on main:
   allocator/RSS figure (not just logical bytes) so the ceiling protects the host.
 - Secrets in diagnostics: no password/secret/key material is written to logs; `CONFIG
   GET requirepass` / `ACL LIST` emit digests, not plaintext.
+- In-memory secret ZEROIZATION, partial (#145, SECRETS.md "Implementation status"):
+  passwords/ACL are SHA-256 hashes at rest (no long-lived plaintext password to scrub);
+  the one long-lived plaintext secret (`cluster_secret`, compared literally at the peer
+  handshake) is `Zeroizing`-on-drop; the transient `CONFIG SET requirepass` plaintext
+  copy is `Zeroizing` and scrubbed right after hashing. TLS keys are zeroized by rustls
+  itself. NOT scrubbed: the transient `AUTH`/`HELLO AUTH`/`ACL SETUSER >pass` plaintext
+  in the shared/immutable decoded `Bytes` arg + the reused codec read buffer (clearing
+  the read buffer risks pipelining for marginal gain) -- an accepted residual bounded by
+  the swap/coredump posture below, since memory-disclosure access is already past at-rest.
 - Supply chain: `cargo-deny` (advisories + licenses + bans) runs as a per-PR gate.
 
 PLANNED / NOT YET (do not assume these):
-- In-memory secret ZEROIZATION and core-dump/swap hardening (#145): passwords are
-  hashed at rest but the plaintext is not yet zeroized on the heap.
+- Core-dump/swap hardening knobs (#145, SECRETS.md): `mlock`/`mlockall` and
+  `MADV_DONTDUMP`/`PR_SET_DUMPABLE`/`RLIMIT_CORE` are NOT yet wired. Until they ship,
+  the paranoid operator disables core dumps + swap at the OS level (`ulimit -c 0`, no
+  swap). The in-memory zeroize-on-drop above is the shipped part of #145.
 - AUTH attempt-rate-limiting / brute-force throttling.
 - `MONITOR` command (and therefore its argument redaction).
 - mTLS (mutual client-cert auth) as the DEFAULT posture: today the cluster transport

@@ -126,6 +126,15 @@ libc = "0.2"
 # suppressed `debug!`/`trace!` on the hot path costs only an atomic level load (no allocation).
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+# In-memory secret zeroization (#145, docs/design/SECRETS.md, THREAT_MODEL.md "Process memory"
+# row). The RustCrypto `zeroize` crate's `Zeroizing<T>` wrapper scrubs a buffer on drop via a
+# volatile write the optimizer may not elide, a defense-in-depth so a core dump / memory
+# disclosure does not trivially yield a plaintext secret. PURE RUST, no C lib, MIT OR Apache-2.0
+# (already on the deny.toml license allowlist), and ALREADY in the lock transitively via rustls /
+# rustls-pki-types (no new crate enters the graph). Used ONLY off the hot path: the long-lived
+# `cluster_secret` and the transient `CONFIG SET requirepass` plaintext copy. `default-features =
+# false` drops the optional `derive` macro we do not use, keeping the surface minimal.
+zeroize = { version = "1.9", default-features = false }
 
 # Internal crates.
 ironcache-env = { path = "crates/ironcache-env" }

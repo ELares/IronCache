@@ -19,7 +19,7 @@ workspace = true
 # handshake (security.rs). With `tls` OFF the crate compiles plaintext-only (the BusStream::Secure
 # variant + ClusterSecurity disappear), byte-unchanged. It layers on ironcache-runtime's `tls`.
 default = ["tls"]
-tls = ["ironcache-runtime/tls", "dep:tokio-rustls"]
+tls = ["ironcache-runtime/tls", "dep:tokio-rustls", "dep:zeroize"]
 
 [dependencies]
 ironcache-runtime = { workspace = true }
@@ -33,6 +33,11 @@ tokio = { workspace = true, features = ["net"] }
 # ClusterSecurity handle holds. OPTIONAL behind `tls`; the plaintext build pulls none of it. The
 # `ring` provider + version floor are pinned at the workspace level (reused from the client-TLS infra).
 tokio-rustls = { workspace = true, optional = true }
+# In-memory zeroization of the LONG-LIVED plaintext `cluster_secret` (#145): wrap the held secret in
+# `Zeroizing<Vec<u8>>` so it is scrubbed when the last `Arc` to the `ClusterSecurity` drops. OPTIONAL
+# behind `tls` (the `ClusterSecurity` handle only exists in the `tls` build). No new crate enters the
+# lock (rustls already pulls zeroize). Off the hot data path (the secret is read only at handshake).
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }

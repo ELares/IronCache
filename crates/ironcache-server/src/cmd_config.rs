@@ -21,6 +21,7 @@ use crate::glob::glob_match;
 use ironcache_config::{SetOutcome, apply_set, effective_value, param_specs};
 use ironcache_observe::CounterDeltas;
 use ironcache_protocol::{ErrorReply, Request, Value};
+use zeroize::Zeroizing;
 
 /// `CONFIG <subcommand> [args]` (CONFIG.md / ADMIN_COMMANDS.md). `deltas` carries the
 /// per-command counter signal the serve loop folds in; `CONFIG RESETSTAT` sets
@@ -103,7 +104,14 @@ fn config_set(ctx: &ServerContext, req: &Request) -> Value {
 
     for pair in rest.chunks_exact(2) {
         let name = String::from_utf8_lossy(&pair[0]).into_owned();
-        let value = String::from_utf8_lossy(&pair[1]).into_owned();
+        // ZEROIZE-ON-DROP (#145): this owned copy of the SET value may be a PLAINTEXT secret (a
+        // `CONFIG SET requirepass <pw>`). Wrapping it in `Zeroizing<String>` scrubs the backing
+        // bytes the moment this loop iteration drops it, right after `apply_set` has hashed it to a
+        // SHA-256 digest at rest in the runtime overlay, so the cleartext password does not linger on
+        // the heap for a later core dump / memory disclosure. `Zeroizing` derefs to `str`, so
+        // `apply_set` (and the unknown-param / invalid-value error paths, which name only the param)
+        // are byte-unchanged. Off the hot data path: this is the admin CONFIG SET command.
+        let value = Zeroizing::new(String::from_utf8_lossy(&pair[1]).into_owned());
         match apply_set(&name, &value, &ctx.runtime) {
             SetOutcome::Applied => {
                 // PROD-7: mirror a SLOWLOG knob into the LIVE `ctx.slowlog` so the per-command

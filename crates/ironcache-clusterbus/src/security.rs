@@ -37,6 +37,8 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+#[cfg(feature = "tls")]
+use zeroize::Zeroizing;
 
 /// The configured intra-cluster transport security a node holds (PROD-3), shared by the bus dial,
 /// the bus listener, and the replication transport. Cheap to clone (the rustls configs and the
@@ -58,7 +60,15 @@ pub struct ClusterSecurity {
     /// The shared cluster secret, sent + verified (constant-time) right after the TLS handshake on
     /// BOTH sides. `None` is permitted only when TLS is on with mTLS-style CA verification in a
     /// future follow-up; in v1 the secret is always present when a `ClusterSecurity` exists.
-    secret: Option<Arc<Vec<u8>>>,
+    ///
+    /// ZEROIZE-ON-DROP (#145, the in-memory secret-lifetime defense-in-depth): the plaintext secret
+    /// is held for the PROCESS LIFETIME (the handshake compares it against the peer's, so unlike a
+    /// password it cannot be reduced to a hash at rest). It is wrapped in a [`Zeroizing<Vec<u8>>`] so
+    /// the backing bytes are scrubbed (a volatile write the optimizer may not elide) when the LAST
+    /// `Arc` to the [`ClusterSecurity`] drops, so a core dump / memory disclosure of a torn-down node
+    /// does not trivially yield the plaintext. `Zeroizing` derefs to `[u8]`, so the handshake read
+    /// site is byte-unchanged; the wrap touches only construction + drop, never the hot data path.
+    secret: Option<Arc<Zeroizing<Vec<u8>>>>,
 }
 
 #[cfg(feature = "tls")]
@@ -75,7 +85,9 @@ impl ClusterSecurity {
         Self {
             connector,
             acceptor,
-            secret: secret.map(Arc::new),
+            // Take ownership of the plaintext secret into a `Zeroizing` buffer so it is scrubbed on
+            // the final drop (#145). The caller's source `Vec` is MOVED in here (no extra copy).
+            secret: secret.map(|s| Arc::new(Zeroizing::new(s))),
         }
     }
 
@@ -133,7 +145,9 @@ impl ClusterSecurity {
     /// `io::ErrorKind::TimedOut`), freeing the task.
     async fn run_secret_handshake(&self, stream: &mut SecureStream) -> std::io::Result<()> {
         if let Some(secret) = &self.secret {
-            ironcache_runtime::authenticate_peer_bounded(stream, secret)
+            // `Zeroizing<Vec<u8>>` derefs to `[u8]`; pass the bytes by slice so the handshake read is
+            // byte-identical to the pre-zeroize `Arc<Vec<u8>>` path (no copy, no behavior change).
+            ironcache_runtime::authenticate_peer_bounded(stream, secret.as_slice())
                 .await
                 .map_err(secret_error_to_io)?;
         }

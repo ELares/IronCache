@@ -90,6 +90,25 @@ release.
   verdict comment, 5 prior-art claims re-verified and corrected, 27 split
   sub-issues filed from 9 decomposed parents, and 36 coverage-gap issues filed.
 
+### Security
+
+- In-memory zeroization of plaintext secrets, defense-in-depth (#145, the last
+  production-readiness follow-up). The long-lived `cluster_secret` (the one secret
+  that cannot be reduced to a hash, since the peer handshake compares its literal
+  bytes) is now held in a `Zeroizing<Vec<u8>>` inside `ClusterSecurity`, so it is
+  scrubbed from the heap when the node tears down; and the transient plaintext copy
+  a `CONFIG SET requirepass` materializes is a `Zeroizing<String>`, scrubbed the
+  instant it is hashed to a digest at rest. TLS private keys are already zeroized by
+  rustls itself (not double-handled). The `AUTH`/`HELLO AUTH`/`ACL SETUSER >pass`
+  transient plaintext is documented as an accepted residual (it lives only in the
+  shared/immutable decoded argument and the reused codec read buffer, which is
+  `drain`-ed forward to preserve pipelined bytes; scrubbing it risks pipelining for
+  marginal gain). The scope decision (what is and is not protected, and why) is in
+  `SECURITY.md`, `docs/design/SECRETS.md`, and `docs/THREAT_MODEL.md`. Off the hot
+  data path; the auth logic, the wire protocol, and the non-auth hot path are
+  byte-unchanged. The `zeroize` crate was already in the lock transitively (rustls),
+  so no new crate enters the supply chain.
+
 ### Changed
 
 - Corrected 5 prior-art claims in `docs/prior-art/claims.yaml` after

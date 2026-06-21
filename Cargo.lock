@@ -442,6 +442,7 @@ dependencies = [
  "ironcache-runtime",
  "tokio",
  "tokio-rustls",
+ "zeroize",
 ]
 
 [[package]]
@@ -565,6 +566,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
