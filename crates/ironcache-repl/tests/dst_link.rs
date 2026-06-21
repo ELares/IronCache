@@ -77,7 +77,7 @@ impl SimNode for ReplNode {
     fn on_message(&mut self, _from: NodeId, msg: Frame, ctx: &mut SimCtx<'_, Frame>) {
         match self {
             ReplNode::Primary(p) => {
-                if let Frame::ReplConf { node, ack } = msg {
+                if let Frame::ReplConf { node, ack, .. } = msg {
                     // A replica attached/resumed: record its ack and (re)arm heartbeat.
                     let fx = p.link.step(LinkEvent::GotReplconf { node, ack }, p.offset);
                     apply(ctx, REPLICA, fx, TOK_HEARTBEAT);
@@ -198,6 +198,7 @@ fn boot_kick() -> Frame {
     Frame::ReplConf {
         node: 0,
         ack: ReplOffset::ZERO,
+        resume_token: None,
     }
 }
 

@@ -234,7 +234,7 @@ where
             match Frame::decode(&pending) {
                 Ok(Some((frame, consumed))) => {
                     pending.drain(..consumed);
-                    if let Frame::ReplConf { node, ack } = frame {
+                    if let Frame::ReplConf { node, ack, .. } = frame {
                         link.step(LinkEvent::GotReplconf { node, ack }, current_offset());
                         attached = true;
                         break;

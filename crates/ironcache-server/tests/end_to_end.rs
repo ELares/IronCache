@@ -66,6 +66,7 @@ fn ctx_cfg(port: u16, pass: Option<&str>, cluster_enabled: bool) -> ServerContex
         raft: None,
         repl_status: None,
         in_sync_replicas: None,
+        repl_history_id: None,
         metrics_registry: None,
         persist_stats: None,
         process_memory: std::sync::Arc::new(ironcache_observe::ProcessMemoryGauge::new()),

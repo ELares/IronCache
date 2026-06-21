@@ -122,7 +122,7 @@ pub use ironcache_raft_net::{
 // INFO `# Replication` section + CLUSTER SHARDS render from a `ReplStatusSnapshot`; HA-8 consumes
 // `replica_is_in_sync` / `ReplNodeStatus::is_in_sync` as the promotion gate.
 pub use ironcache_repl::{
-    InSyncReplicas, LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag,
+    InSyncReplicas, LinkStatus, ReplId, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag,
     replica_is_in_sync,
 };
 

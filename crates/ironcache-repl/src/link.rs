@@ -185,10 +185,14 @@ impl ReplicaLink {
         match event {
             LinkEvent::Connected => {
                 self.state = ReplState::Connecting;
-                // Attach / resume: announce our id and the offset to resume FROM.
+                // Attach / resume: announce our id and the offset to resume FROM. The HA-7a link is
+                // the heartbeat-only demonstrator (no full-sync / history-token gating lives here, so
+                // no resume token is carried); the live HA-7d/7e attach path (`replica_attach`) is
+                // where the per-boot history token is advertised.
                 fx.send = Some(Frame::ReplConf {
                     node: self.node,
                     ack: self.acked,
+                    resume_token: None,
                 });
                 // Arm the heartbeat-deadline timer; a Tick before the next ping means
                 // the link is dead.
@@ -344,7 +348,8 @@ mod tests {
             fx.send,
             Some(Frame::ReplConf {
                 node: 9,
-                ack: ReplOffset(0)
+                ack: ReplOffset(0),
+                resume_token: None,
             })
         );
         assert_eq!(fx.arm_timer, Some(DEFAULT_HEARTBEAT));
@@ -412,7 +417,8 @@ mod tests {
             fx.send,
             Some(Frame::ReplConf {
                 node: 2,
-                ack: ReplOffset(11)
+                ack: ReplOffset(11),
+                resume_token: None,
             }),
             "reconnect must resume from the last-acked offset"
         );

@@ -94,6 +94,26 @@ fn node_id_hex(rng: &mut impl Rng) -> String {
     format!("{a:016x}{b:016x}{:08x}", c as u32)
 }
 
+/// Draw a PER-BOOT replication HISTORY token: 20 random bytes (a [`ReplId`]) from the determinism
+/// seam, NEW on every process boot. This is the RESUME identity, distinct from the STABLE
+/// `cluster_node_id` (the cluster-mode replid was the announce id, UNCHANGED across restarts), so a
+/// primary restart yields a fresh token and a reconnecting replica's remembered (old) token
+/// mismatches -> a full re-sync (the fence against silent divergence: a restarted primary resets its
+/// offset space to 0 yet kept the stable cluster id). Like [`node_id_hex`] it is PURE: the only
+/// entropy comes through the `ironcache-env` RNG the caller owns (ADR-0003, no `rand` outside
+/// `ironcache-env`), drawn ONCE at boot. 160 bits = 20 bytes = the full [`ReplId`] width.
+fn repl_history_token(rng: &mut impl Rng) -> ironcache_server::ReplId {
+    let a = rng.next_u64().to_be_bytes();
+    let b = rng.next_u64().to_be_bytes();
+    let c = rng.next_u64().to_be_bytes();
+    let mut raw = [0u8; 20];
+    raw[0..8].copy_from_slice(&a);
+    raw[8..16].copy_from_slice(&b);
+    // 64 + 64 + 32 = 160 bits; take the low 4 bytes of the third draw for the final 32 bits.
+    raw[16..20].copy_from_slice(&c[4..8]);
+    ironcache_server::ReplId::from_bytes(raw)
+}
+
 /// The concrete per-shard store the binary wires: the `ShardStore` over the
 /// configured eviction [`Policy`] and the logical-byte accounting hook. The generic
 /// dispatch runs against this through the `Store` + `Admit` waist traits.
@@ -380,6 +400,20 @@ pub fn run_server_observed(
         None
     };
 
+    // The PER-BOOT replication HISTORY token (the resume identity): drawn ONCE here from the SAME
+    // boot RNG seam `cluster_node_id` used (ADR-0003), so it is a NEW value on every restart while
+    // the stable cluster id is unchanged. `Some` ONLY in raft-governance mode (the only mode that
+    // serves the live incremental resume, the same gate as `repl_status`/`in_sync_replicas`); the
+    // default static path carries `None` (it never serves the resume, so a first-connect replica
+    // always full-syncs and the path is byte-unchanged). Carried in the `ServerContext` to the repl
+    // tasks: the primary advertises it in `FullSync`, the replica remembers + re-advertises it, and
+    // a resume happens ONLY on an exact match (a restart -> a NEW token -> a full re-sync).
+    let repl_history_id: Option<ironcache_server::ReplId> = if raft.is_some() {
+        Some(repl_history_token(boot_env.rng()))
+    } else {
+        None
+    };
+
     // PERSISTENCE node-level state (#58): `Some` ONLY when a `data_dir` is configured (the single
     // enable switch). Created BEFORE the server context so the context can carry the SHARED
     // persistence-stats cell (last-save + dirty) the INFO `# Persistence` section + the `/metrics`
@@ -465,6 +499,14 @@ pub fn run_server_observed(
         // raft-mode. Cloned by Arc onto every shard's context (the write path reads it) AND handed
         // to the per-replica serve tasks (which maintain it); the same cell, lock-free.
         in_sync_replicas: in_sync_replicas.clone(),
+        // The PER-BOOT replication history token (the resume identity), `Some` only in raft-mode (the
+        // only mode that serves the live incremental resume). Generated ONCE at boot through the
+        // determinism seam (drawn from `boot_env`'s RNG, ADR-0003), so it is a NEW value on every
+        // restart while `cluster_node_id` (the stable identity) is unchanged. The primary advertises
+        // it in `FullSync`; a reconnecting replica re-advertises the token it last synced under, and
+        // the primary resumes ONLY on an exact match -> a restart forces a full re-sync (no silent
+        // divergence). `None` on the default static path (it never serves the live resume).
+        repl_history_id,
         // The per-shard metrics registry (OBSERVABILITY.md, #152), `Some` only when the `/metrics`
         // endpoint is enabled. Moved into the template (a cheap `Arc<Vec<_>>`), then cloned per
         // shard via `ctx_template.clone()` so each shard adopts its cell by index at boot; `None`
@@ -6574,6 +6616,7 @@ mod tests {
             raft: None,
             repl_status: Some(Arc::new(ironcache_server::ReplNodeStatus::new())),
             in_sync_replicas: Some(in_sync),
+            repl_history_id: None,
             metrics_registry: None,
             persist_stats: None,
             process_memory: Arc::new(ironcache_observe::ProcessMemoryGauge::new()),

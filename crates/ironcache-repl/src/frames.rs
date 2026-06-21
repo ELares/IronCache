@@ -66,16 +66,34 @@ pub struct FrameError;
 /// forward-extensible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// `["REPLCONF", <replica-node-id>, <ack-offset>]` (replica -> primary).
+    /// `["REPLCONF", <replica-node-id>, <ack-offset>]` (3 args, no token) OR
+    /// `["REPLCONF", <replica-node-id>, <ack-offset>, <resume-token-hex>]` (4 args, with the resume
+    /// history token), replica -> primary.
     ///
     /// The attach handshake and the steady-state ack in one frame: `node` is the
     /// replica's id and `ack` is the highest offset it has durably tracked (its
     /// resume point on reconnect).
+    ///
+    /// `resume_token` is the PER-BOOT replication HISTORY token the replica last full-synced under
+    /// (HA-7e safety): `Some(replid)` on the ATTACH handshake of a replica that holds a prior store
+    /// (so the primary can verify the replica is resuming against the SAME replication history before
+    /// it ships an incremental tail instead of a full re-sync); `None` on a first-connect replica (no
+    /// store yet) and on the steady-state acks (the token only matters at attach). The token is
+    /// distinct from `node` (the replica's stable identity) and from the primary's stable cluster id:
+    /// it identifies the primary's replication HISTORY, which restarts on every primary boot, so a
+    /// remembered token that no longer matches the primary's current token forces a full re-sync (the
+    /// fence against silent divergence when a primary restarts with its offset space reset to 0). The
+    /// 3-arg wire form (no token) round-trips to `resume_token: None`, so the HA-7a heartbeat link
+    /// and any pre-token peer stay byte-compatible.
     ReplConf {
         /// The replica's node id (its identity to the primary).
         node: u64,
         /// The highest [`ReplOffset`] the replica has durably tracked.
         ack: ReplOffset,
+        /// The PER-BOOT replication history token the replica last synced under, carried on the
+        /// attach handshake so the primary can gate a resume on an exact history match. `None` for a
+        /// first-connect replica and for steady-state acks (encoded as the 3-arg wire form).
+        resume_token: Option<ReplId>,
     },
     /// `["REPLPING", <replid>, <offset>]` (primary -> replica).
     ///
@@ -181,11 +199,27 @@ impl Frame {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Frame::ReplConf { node, ack } => encode_command(&[
-                REPLCONF,
-                node.to_string().as_bytes(),
-                ack.0.to_string().as_bytes(),
-            ]),
+            Frame::ReplConf {
+                node,
+                ack,
+                resume_token,
+            } => match resume_token {
+                // 4-arg form: carry the resume history token (the attach handshake of a replica with
+                // a prior store). The hex is exactly `ReplId::HEX_LEN` chars.
+                Some(token) => encode_command(&[
+                    REPLCONF,
+                    node.to_string().as_bytes(),
+                    ack.0.to_string().as_bytes(),
+                    token.as_hex().as_bytes(),
+                ]),
+                // 3-arg form (no token): a first-connect attach or a steady-state ack. Byte-identical
+                // to the pre-token wire form, so the HA-7a link + any pre-token peer round-trip.
+                None => encode_command(&[
+                    REPLCONF,
+                    node.to_string().as_bytes(),
+                    ack.0.to_string().as_bytes(),
+                ]),
+            },
             Frame::ReplPing { replid, offset } => encode_command(&[
                 REPLPING,
                 replid.as_hex().as_bytes(),
@@ -247,12 +281,25 @@ impl Frame {
 fn decode_args(args: &[Vec<u8>]) -> Result<Frame, FrameError> {
     let verb = args.first().ok_or(FrameError)?;
     if verb.eq_ignore_ascii_case(REPLCONF) {
-        if args.len() != 3 {
+        // 3 args = no resume token (a first-connect attach or a steady-state ack, the pre-token wire
+        // form); 4 args = the resume history token follows (a reconnecting replica's attach). Any
+        // other arity is malformed.
+        if args.len() != 3 && args.len() != 4 {
             return Err(FrameError);
         }
         let node = parse_u64(&args[1])?;
         let ack = ReplOffset(parse_u64(&args[2])?);
-        Ok(Frame::ReplConf { node, ack })
+        let resume_token = match args.get(3) {
+            // A 4th arg present: it MUST be a valid 40-hex replid (a corrupt token is a framing
+            // error, never a fabricated history identity), exactly like the FULLSYNC/REPLPING replid.
+            Some(hex) => Some(ReplId::from_hex(hex).ok_or(FrameError)?),
+            None => None,
+        };
+        Ok(Frame::ReplConf {
+            node,
+            ack,
+            resume_token,
+        })
     } else if verb.eq_ignore_ascii_case(REPLPING) {
         if args.len() != 3 {
             return Err(FrameError);
@@ -470,19 +517,31 @@ mod tests {
     /// the edge offsets (0 and u64::MAX) and the node-id / replid extremes.
     #[test]
     fn frame_round_trips() {
-        // REPLCONF at a typical attach.
+        // REPLCONF at a typical attach (3-arg form, no resume token).
         assert_round_trips(&Frame::ReplConf {
             node: 7,
             ack: ReplOffset(42),
+            resume_token: None,
         });
         // REPLCONF at the zero edge (fresh replica, never acked) and the max edge.
         assert_round_trips(&Frame::ReplConf {
             node: 0,
             ack: ReplOffset(0),
+            resume_token: None,
         });
         assert_round_trips(&Frame::ReplConf {
             node: u64::MAX,
             ack: ReplOffset(u64::MAX),
+            resume_token: None,
+        });
+        // REPLCONF carrying the resume history token (the 4-arg attach form): the token survives the
+        // round-trip, and the 4-arg/3-arg forms are distinct on the wire.
+        assert_round_trips(&Frame::ReplConf {
+            node: 3,
+            ack: ReplOffset(99),
+            resume_token: Some(
+                ReplId::from_hex(b"00112233445566778899aabbccddeeff00112233").unwrap(),
+            ),
         });
 
         // REPLPING with a real-shaped replid and edge offsets.
@@ -602,6 +661,7 @@ mod tests {
         let full = Frame::ReplConf {
             node: 1,
             ack: ReplOffset(2),
+            resume_token: None,
         }
         .encode();
         assert_eq!(Frame::decode(&full[..full.len() - 2]), Ok(None));
@@ -616,6 +676,7 @@ mod tests {
         let f1 = Frame::ReplConf {
             node: 3,
             ack: ReplOffset(10),
+            resume_token: None,
         };
         let f2 = Frame::ReplPing {
             replid: ReplId::from_hex(b"2222222222222222222222222222222222222222").unwrap(),
