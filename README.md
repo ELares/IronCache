@@ -4,434 +4,344 @@
 
 # IronCache
 
-**The most efficient Redis-compatible cache, in one static Rust binary.**
+**A Redis-compatible cache in one static Rust binary: thread-per-core, replicated, clustered.**
 
-> Status: the engine is FUNCTIONAL and under active, measured optimization. IronCache
-> speaks RESP2 and RESP3 with 150+ commands across all core types (strings, lists,
-> hashes, sets, sorted sets, bitmaps, HyperLogLog), plus transactions, pub/sub, and a
-> cross-shard coordinator, backed by 800+ tests. A reproducible head-to-head (see
-> [Benchmarks](#benchmarks-how-it-compares)) shows it PARITY-OR-BETTER on memory and
-> FASTER per core than Redis 8.8.0, Valkey 8.1.8, KeyDB, DragonflyDB 1.39.0, and
-> Memcached on a pinned-core Linux runner. Clustering is built: an opt-in, Raft-governed
-> multi-node mode with replication, automatic failover, and online slot migration (see
-> [Clustering and high availability](#clustering-and-high-availability)); persistence remains
-> on the [roadmap](docs/ROADMAP.md). The design record lives in the
-> [GitHub issues](https://github.com/ELares/IronCache/issues) (start at the
-> [vision EPIC (#1)](https://github.com/ELares/IronCache/issues/1)), the
-> [prior-art survey](docs/PRIOR_ART.md), and the [research corpus](docs/research/).
+IronCache speaks the Redis wire protocol (RESP2 and RESP3) and keeps the observable
+Redis contract for the commands it implements, so existing Redis clients, libraries,
+and `redis-cli` work against it unchanged. It is a shared-nothing, thread-per-core
+engine: the keyspace is sharded so each shard is owned and mutated by exactly one
+core, with no hot-path locks. It ships as a single static binary that is both the
+server and the CLI.
 
-IronCache is a cache that speaks the Redis wire protocol, keeps the Redis
-contract for the commands it supports, and is built from the first commit to be
-the most efficient cache in the world: maximal throughput per core, minimal
-memory per item, smart compression, and a clean path from a single node to a
-cluster. It ships as one static binary that is both the server and the CLI. It
-takes the best ideas from Redis, Valkey, KeyDB, DragonflyDB, Memcached, and
-Garnet, and from the academic caching literature, and leaves behind the
-single-threaded command core, the fork-based memory spikes, and the managed
-runtimes that hold the incumbents back.
+The engine is functional and broad: 176 client-facing commands across all the core
+data types, transactions, pub/sub with keyspace notifications, blocking commands,
+on-disk persistence, and an opt-in Raft-governed multi-node cluster with replication,
+automatic failover, and online slot migration. It is exercised by 1,500+ in-tree
+tests, a differential harness that proves byte-for-byte RESP parity against
+`redis-server`, and a real client-driver matrix (redis-py, go-redis, ioredis) in both
+single-node and cluster mode.
 
-This project is also an experiment in method: it uses AI to mine the world's
-prior art, propose new approaches, and adversarially verify every load-bearing
-claim before trusting it. The [research corpus](docs/research/) and the
-version-pinned [`claims.yaml`](docs/prior-art/claims.yaml) are the output of
-that process.
+This project is also an experiment in method: it uses AI to mine prior art, propose
+approaches, and adversarially verify every load-bearing claim before trusting it. The
+[research corpus](docs/research/) and the version-pinned
+[`claims.yaml`](docs/prior-art/claims.yaml) are the output of that process.
 
 ---
 
-## Why IronCache exists
+## Features
 
-Every existing cache is wrong for "the most efficient Redis-compatible cache" in
-a different way, and each wrongness maps to one of our tenets.
+### Wire protocol and data types
 
-- **Redis (OSS)** executes every command on a single thread. Even with
-  `io-threads`, the I/O threads only read, parse, and write sockets; the keyspace
-  is still mutated by one thread, so most of a modern CPU sits idle. Its
-  fork-based `BGSAVE` can use up to about twice the resident memory under write
-  load, it ships no transparent value compression, and in 2024 its core was
-  relicensed away from open source. That fails **Efficient**.
-- **Valkey** is the open (BSD-3) Linux Foundation fork of Redis, and its
-  asynchronous I/O threading is a real step up in throughput. But it is an
-  evolution of the Redis core, not a rethink: command execution and the data
-  structures are inherited, so the ceiling is the inherited architecture, not a
-  shared-nothing one. Closer on **Efficient**, still bounded by it.
-- **KeyDB** multi-threads the shared keyspace behind locks and reports several
-  times Redis's throughput, but a mutated keyspace under spinlocks has a
-  contention ceiling, and the project has been effectively dormant since 2024.
-  That fails **Efficient** at the top end, and bets on an unmaintained base.
-- **DragonflyDB** is the state of the art for vertical efficiency: shared-nothing
-  thread-per-core over io_uring, an extendible-hashing Dashtable with far less
-  per-item metadata than the Redis dict, and a forkless point-in-time snapshot
-  with constant memory overhead. We borrow that architecture wholesale. But its
-  headline wins are vertical scaling plus metadata reduction, not raw single-core
-  speed (on one core it is roughly at parity with Redis), its cluster mode began
-  as single-process emulation, and it is a C++ and Boost.Fibers stack. IronCache
-  targets per-core speed and a real multi-node design on top of the same shape.
-- **Memcached** is multi-threaded from the start, with a slab allocator and a
-  scan-resistant segmented LRU worth studying. But it does not speak the Redis
-  contract, has no rich data types, no persistence, and no server-side
-  clustering. That fails **Compatible** and **Scalable**.
-- **Garnet** is RESP-compatible, scales well across cores, and has an excellent
-  log-structured store underneath. But it is a .NET and C# product with a managed
-  runtime and a garbage collector, not a single static binary you drop onto a box
-  with a kernel-only dependency. That fails **Simple**.
+- **RESP2 and RESP3**, negotiated by `HELLO`, with the verbatim Redis error catalog.
+- **Strings and numerics**: GET/SET (with the full option set), GETSET, GETDEL,
+  GETEX, SETEX/PSETEX/SETNX, APPEND, STRLEN, GETRANGE/SETRANGE/SUBSTR,
+  INCR/DECR/INCRBY/DECRBY/INCRBYFLOAT, MGET/MSET/MSETNX.
+- **TTL / expiry**: EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT, TTL/PTTL,
+  EXPIRETIME/PEXPIRETIME, PERSIST, with active and lazy reaping.
+- **Lists**: LPUSH/RPUSH(/X), LPOP/RPOP, LRANGE, LINDEX, LSET, LINSERT, LREM, LTRIM,
+  LPOS, LMOVE/RPOPLPUSH, LMPOP.
+- **Hashes**: HSET/HMSET/HSETNX, HGET/HMGET/HGETALL/HKEYS/HVALS, HDEL, HLEN, HEXISTS,
+  HSTRLEN, HINCRBY/HINCRBYFLOAT, HRANDFIELD, HSCAN.
+- **Sets**: SADD/SREM, SMEMBERS, SISMEMBER/SMISMEMBER, SCARD, SPOP, SRANDMEMBER,
+  SMOVE, SINTER/SUNION/SDIFF (and the STORE + CARD variants), SSCAN.
+- **Sorted sets**: ZADD, ZREM, ZSCORE/ZMSCORE, ZRANK/ZREVRANK, ZINCRBY, ZCARD,
+  ZCOUNT/ZLEXCOUNT, the full ZRANGE family (by index/score/lex, plus ZRANGESTORE),
+  ZPOPMIN/ZPOPMAX, ZMPOP, ZRANDMEMBER, ZUNION/ZINTER/ZDIFF (and the STORE / CARD
+  variants), ZREMRANGEBY*, ZSCAN.
+- **Bitmaps**: SETBIT/GETBIT, BITCOUNT, BITPOS, BITOP, BITFIELD/BITFIELD_RO.
+- **HyperLogLog**: PFADD, PFCOUNT, PFMERGE (Redis-compatible dense representation).
+- **Generic keyspace**: DEL/UNLINK, EXISTS, TYPE, KEYS, SCAN, DBSIZE, RANDOMKEY,
+  RENAME/RENAMENX, COPY, MOVE, SWAPDB, TOUCH, FLUSHDB/FLUSHALL, OBJECT, SORT/SORT_RO.
 
-None of them is a single static binary that keeps the Redis contract, scales
-across every core with a shared-nothing core, is frugal with memory, and grows
-from one node to many. IronCache exists to be exactly that intersection.
+### Transactions, pub/sub, and blocking
 
----
+- **Transactions**: MULTI/EXEC/DISCARD with WATCH/UNWATCH dirty-CAS.
+- **Pub/Sub**: SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE, PUBLISH, PUBSUB
+  introspection, fanned out across shards by a cross-shard coordinator.
+- **Keyspace notifications**: the Redis `notify-keyspace-events` keyspace and
+  keyevent events (including `expired` / `evicted`), delivered through the same
+  Pub/Sub fan-out. Disabled by default; the write hot path pays nothing until a flag
+  is set.
+- **Blocking commands**: BLPOP/BRPOP, BLMOVE/BRPOPLPUSH, BLMPOP, BZPOPMIN/BZPOPMAX,
+  BZMPOP, and WAIT.
 
-## Benchmarks: how it compares
+### Architecture
 
-IronCache is built to be measured, not asserted. The numbers below are a reproducible
-head-to-head ([`scripts/bench/headtohead.sh`](scripts/bench/headtohead.sh), run via the
-`headtohead` GitHub Actions workflow) against every cache this project benchmarks
-against, on identical hardware.
+- **Thread-per-core, shared-nothing**: each shard is owned by one pinned core and
+  mutated by it alone, so there are no hot-path locks. Rust ownership makes the "one
+  core owns one shard" rule a compile-time guarantee.
+- **Per-shard accept** via `SO_REUSEPORT`, with a cross-shard coordinator for
+  multi-key, whole-keyspace, and pub/sub commands.
+- **A swappable Runtime seam**: the data path is written against a `Runtime` trait,
+  with a portable tokio (epoll/kqueue) implementation and an **optional io_uring
+  datapath** on Linux (default-off, opt-in) behind the same seam.
+- **Eviction**: a `maxmemory` ceiling with a configurable policy (default
+  `allkeys-lru`).
 
-**Setup.** GitHub-hosted `ubuntu-latest` (a shared 4-vCPU VM). The server and the load
-generator are pinned to DISJOINT cores with `taskset` (server on cores 0-1, client on
-cores 2-3) so they never contend for a core. Workload: a YCSB-style Zipfian (theta 0.99)
-mix, 90% GET / 10% SET, 1,000,000 distinct keys, 128-byte values. IronCache runs 2
-shards (one per pinned core). Each competitor is installed at the leanest version that
-installs on the runner (the latest memory-optimized line where it matters).
+### Durability and persistence
 
-- **Memory** is the `INFO used_memory` delta over a deterministic 1M-key populate,
-  divided by the key count (bytes per key). It is deterministic and reliable on any box,
-  and is the metric we ratchet hardest.
-- **Throughput** is closed-loop peak QPS divided by the 2 pinned server cores (QPS per
-  core).
-- **Latency** is an open-loop, coordinated-omission-free p50/p99 at a 50k ops/s target.
+- **On-disk snapshot**: SAVE / BGSAVE / LASTSAVE write a per-shard snapshot
+  (`dump-shard-<n>.icss`) plus a manifest under `data_dir`.
+- **Load on boot**: a node with a `data_dir` restores its keyspace at startup;
+  `/readyz` does not report ready until every shard has finished loading.
+- **Save policy**: `save_interval_secs` + `save_min_changes` (the Redis
+  `save <seconds> <changes>` cadence), with a final save on graceful shutdown.
+- **Write-side durability bound** in a cluster: `min-replicas-to-write` /
+  `min-replicas-max-lag` (Redis-style, default off) refuses a write (`-NOREPLICAS`)
+  unless enough replicas are in sync, bounding the failover loss window.
 
-| Competitor (measured version) | Memory IC / comp B/key | Throughput IC / comp QPS/core | p50 us (IC / comp) | p99 us (IC / comp) |
-| --- | --- | --- | --- | --- |
-| **Redis 8.8.0** (kvobj) | **180.3 / 206.2 = 0.87x** (IC 13% lighter) | **72,903 / 47,809 = 1.52x** | 8,175 / 7,907 | 63,679 / 52,735 |
-| **Valkey 8.1.8** (embedded key) | **180.3 / 209.6 = 0.86x** (IC 14% lighter) | **74,115 / 45,939 = 1.61x** | 8,199 / 8,131 | **53,471 / 150,911** |
-| **DragonflyDB 1.39.0** | 180.3 / 178.6 = 1.01x (parity) | **72,564 / 71,549 = 1.01x** | **8,119 / 10,607** | **94,015 / 108,415** |
-| **KeyDB 6.3.4** | **180.3 / 240.4 = 0.75x** (IC 25% lighter) | **72,514 / 59,474 = 1.22x** | 9,231 / 5,951 | 77,439 / 25,295 |
-| **Memcached 1.6.24** | **180.3 / 194.9 = 0.93x** (IC 7% lighter) | n/a (non-RESP) | n/a | n/a |
+### Clustering and high availability (opt-in)
 
-A memory ratio below 1.0 means IronCache stores the same data in fewer bytes per key; a
-throughput ratio above 1.0 means it does more work per core. **IronCache is
-parity-or-better on memory against all five, and faster per core than every
-Redis-protocol competitor.** It is roughly tied with DragonflyDB (the vertical-efficiency
-state of the art) on both axes, and beats Redis, Valkey, and KeyDB on both. Even against
-the latest memory-optimized Redis (the 8.2+ kvobj) and Valkey (the 8.0 embedded key +
-8.1 hashtable redesign), the 8-byte tagged-pointer slot and the single-allocation
-key+value+TTL blob keep IronCache lighter.
+- **Raft-governed control plane**: the 16384-slot ownership map, the config epoch,
+  the node roster, and replica roles live in a replicated log. User data never enters
+  the Raft log; only the cluster control state does.
+- **Slot routing**: CRC16 slot hashing (Redis-identical), with `-MOVED` and `-ASK`
+  redirects exactly like Redis Cluster.
+- **Replication**: asynchronous per-slot replication with a forkless full-sync, plus
+  bounded-staleness **read-replicas** (a `READONLY` client reads a replica only while
+  it is within the lag bound, otherwise the read `MOVED`s to the owner).
+- **Automatic failover**: an in-sync replica is promoted through a committed
+  `PromoteReplica` entry (a stale replica is never promoted); the committed apply is
+  the fence, so a promotion never creates two owners.
+- **Online slot migration**: `MIGRATING` / `IMPORTING` + `ASK` / `ASKING` + a single
+  committed ownership flip, with zero downtime and exactly one owner at the flip
+  boundary.
+- **Turnkey formation**: in raft mode a fresh cluster auto-applies its static
+  topology (node table + slot ownership) through the log and reaches
+  `cluster_state:ok` with no operator `CLUSTER MEET` / `ADDSLOTS`; the auto-apply is
+  fresh-only and idempotent, so a restart never re-bootstraps.
+- **Robustness**: Pre-Vote and check-quorum, a chunked `InstallSnapshot` path to
+  catch up a far-behind or newly added node, a disk-backed (spillable) replication
+  backlog with incremental resume, runtime voter-set reconfiguration with learners,
+  and leader-hint forwarding (a follower forwards a cluster proposal to the leader and
+  relays the commit).
+- **Split-brain fence**: slot ownership moves only through the committed Raft log, and
+  every change bumps a monotonic config epoch, so there is never a committed state
+  with two owners of a slot. The failure-prone paths are proven in a deterministic
+  simulation over thousands of seeded partition/crash/heal timelines, exercised over
+  real TCP loopback, and validated end to end on a live multi-process AWS cluster.
 
-**Honesty notes.** A GitHub-hosted shared 4-vCPU VM is INDICATIVE, not publishable; the
-authoritative verdict needs dedicated bare metal. Memory (bytes per key) is deterministic
-and the most trustworthy figure; QPS, and especially p99 latency, carry meaningful
-runner-to-runner variance (the p99 column is noisy on a shared box, which is why it goes
-both ways). Memcached does not speak the Redis wire protocol, so only its memory is
-compared (populated over the memcached text protocol, read from its own `stats`); a
-throughput comparison would be cross-protocol and is out of scope. Memory is value-size
-and key-count sensitive (both engines' hash tables have fill-state effects), so the win
-margin moves with the workload; the full sweep and the round-by-round optimization
-history are in [docs/bench/OPTIMIZATION_LOG.md](docs/bench/OPTIMIZATION_LOG.md), and the
-version-pinned competitor matrix is in
-[docs/bench/COMPETITORS.md](docs/bench/COMPETITORS.md). Reproduce any row with
-`gh workflow run headtohead.yml -f competitor=<redis|valkey|dragonfly|keydb|memcached>`.
+The default single-node and static-topology paths are **byte-unchanged** when
+clustering is off; a node run without `cluster_mode = "raft"` pays zero new hot-path
+cost. See [Clustering and high availability](docs/design/) and `DEPLOY.md` for the
+full contract.
 
----
+### Security
 
-## The five tenets
+- **AUTH / requirepass**, stored as a SHA-256 digest **at rest** (never plaintext)
+  and compared in constant time.
+- **Full ACL**: per-user enable/disable, password rules, command and category rules
+  (`+@read`, `-@dangerous`, ...), key patterns, and channel patterns, via
+  `ACL SETUSER/GETUSER/DELUSER/LIST/USERS/CAT/WHOAMI/GENPASS/LOAD/SAVE`, with an
+  optional `aclfile`. ACL passwords are SHA-256 at rest.
+- **TLS** on three planes: the public client port (`tls`), the **cluster bus**, and
+  the **replication** link (`cluster_tls`, with peer-cert verification against a CA).
+- **Cluster peer auth**: a shared `cluster_secret` presented in a constant-time
+  handshake on the bus and replication links.
+- **Secret hygiene**: secret arguments are redacted from SLOWLOG, MONITOR, INFO, and
+  logs; the long-lived `cluster_secret` and transient plaintext are held in
+  `Zeroizing` and scrubbed from the heap. The scope (what is and is not protected, and
+  why) is documented in `SECURITY.md` and `docs/THREAT_MODEL.md`.
 
-We rank the tenets, and when two conflict we resolve in this order:
-**Compatible > Efficient > Simple > Scalable > AI-Driven.**
+### Operability
 
-| Tenet | What it means in practice |
-| --- | --- |
-| **Compatible** | IronCache speaks RESP2 and RESP3 and honors the observable Redis contract for every command it claims to support, so existing Redis clients, libraries, and `redis-cli` work unchanged against the supported surface. Compatibility is tiered and explicit: a command is either supported with Redis-identical semantics, or it is documented as unsupported. We never bend the wire protocol or a command's observable behavior to win a benchmark. |
-| **Efficient** | The reason to exist. Maximal throughput per core via a shared-nothing, thread-per-core architecture with no hot-path locks, the lowest-overhead I/O path available (io_uring with a portable fallback), compact in-memory encodings, optional transparent value compression, and a modern eviction policy. Efficiency is measured honestly: per-core throughput, tail latency (p99 and p999), and memory at a fixed hit ratio, not just a headline ops-per-second number at maximum pipelining. |
-| **Simple** | One static binary that is both the server and the CLI, one config file with safe defaults, install to first `GET` in under a minute, and a self-update path with rollback. No JVM, no .NET, no external dependencies, kernel-only at runtime. The single binary can introspect and operate itself. |
-| **Scalable** | Vertical first: one process uses every core. Then horizontal: a clean path from a single node to a multi-node cluster that keeps the client contract, designed from the architecture spec rather than bolted on. |
-| **AI-Driven** | The project uses AI to analyze prior art, propose and benchmark new approaches, and adversarially verify claims before trusting them (this repository is the proof). In the engine, learned and adaptive policies (eviction, admission, autotuning) are allowed only off the hot path and only when they never compromise the contract, determinism, or tail latency. |
+- **HTTP health and metrics** (when `--metrics-addr` is set): `/livez` (liveness),
+  `/readyz` (ready only when every shard has loaded and, in raft mode, a leader is
+  known), and `/metrics` (Prometheus exposition: per-shard counters plus process and
+  raft gauges).
+- **Introspection**: INFO, CLIENT, COMMAND (a real command table for cluster-aware
+  clients), CLUSTER, OBJECT, SLOWLOG, MEMORY, LATENCY.
+- **DoS guards**: `maxmemory` with eviction, `maxclients`, an idle-connection
+  timeout, and a per-connection output-buffer bound.
 
----
+### Deployment
 
-## What IronCache is, and is not
+- A multi-stage, non-root, distroless container image (`Dockerfile`) published to
+  GHCR.
+- A **Helm chart** (`deploy/helm/ironcache`) and equivalent raw **Kubernetes**
+  manifests (`deploy/k8s/`), deploying a StatefulSet with headless + client Services,
+  a PDB, a PVC for `data_dir`, and `/livez` + `/readyz` probes.
+- **docker-compose** for a single node and a 3-node Raft cluster (`deploy/compose/`).
+- **CalVer rolling releases** on every push to `main` plus formal `v*` releases:
+  reproducible `musl` + `glibc` tarballs for **amd64 and arm64**, a consolidated
+  `SHA256SUMS`, a CycloneDX SBOM, and a keyless Sigstore build-provenance attestation.
 
-**IronCache v1 IS:**
-
-- A single static Rust binary that speaks RESP2 and RESP3 and keeps the Redis
-  contract for a defined, documented command surface.
-- A shared-nothing, thread-per-core engine: the keyspace is sharded so each
-  shard is owned and mutated by exactly one core, eliminating hot-path locks and
-  using every core in the box.
-- Memory-frugal: compact encodings and a low-metadata hash table (an 8-byte
-  tagged-pointer slot over a single-allocation key+value+TTL blob), with optional
-  transparent compression for large or cold values. Measured (see
-  [Benchmarks](#benchmarks-how-it-compares)): lighter per key than Redis, Valkey, KeyDB,
-  and Memcached, and at parity with Dragonfly, on the 128-byte head-to-head.
-- Smart about eviction: a modern, concurrency-friendly policy (the
-  TinyLFU, S3-FIFO, and SIEVE family) chosen by measured hit ratio per byte,
-  not a legacy approximated LRU.
-- Persistable without a fork: a point-in-time snapshot with bounded, constant
-  extra memory, so saving never doubles the resident set.
-- Single-node first, with an opt-in multi-node cluster: a Raft-governed slot map,
-  asynchronous per-slot replication, automatic failover, and online slot migration
-  (see [Clustering and high availability](#clustering-and-high-availability)). The
-  default single-node path is byte-unchanged when clustering is off.
-- Both the server and the CLI in one binary, with a one-command install and a
-  safe self-update.
-
-**IronCache v1 is explicitly NOT (committed non-goals):**
-
-- Not a 100 percent drop-in for every Redis command and every Redis module on
-  day one. Compatibility is tiered, and the unsupported surface is documented,
-  not silently wrong.
-- Not a durable system of record or a primary database. IronCache is a cache.
-  Durability options exist, but the contract is a cache contract, not an ACID
-  database contract.
-- Not an exactly-once, strongly-consistent distributed database. Multi-node
-  consistency is a deliberate, documented trade-off, resolved in its design
-  issue, not an unbounded promise.
-- Not a managed runtime. No JVM, no .NET, no garbage collector in the hot path.
-- Not willing to break the wire protocol or a command's observable semantics to
-  improve a benchmark. Compatible outranks Efficient.
-- Not running AI inference on the hot path. Learned policies advise the engine
-  off the critical path; they never sit between a client and its reply.
-
-These non-goals are traceable to a tenet or to a deferred milestone, and each is
-recorded in its own `non-goal` issue.
+See [`DEPLOY.md`](DEPLOY.md) for the full deployment guide, every config key, the
+ports, and what was validated offline versus on a live cluster.
 
 ---
 
-## Clustering and high availability
+## Compatibility
 
-IronCache scales from one node to a multi-node cluster without changing the client
-contract. Clustering is **opt-in**: the default single-node and static-topology paths
-are byte-unchanged, and a node compiled and run without `cluster_mode = "raft"` pays
-zero new cost on the hot path. When you turn it on, a Raft control plane governs the
-slot map and the data plane adds replication, failover, and online migration.
+IronCache speaks RESP2 and RESP3 and honors the observable Redis contract for the
+commands it implements. Compatibility is tiered and explicit: a command is either
+supported with Redis-identical semantics, or it is documented as unsupported. We do
+not bend the wire protocol or a command's observable behavior to win a benchmark.
 
-**The control plane (Raft).** The 16384-slot ownership map, the config epoch, the node
-roster, and replica roles live in a replicated log owned by 3-5 voters. A
-`CLUSTER MEET / ADDSLOTS / SETSLOT / REPLICATE / FORGET` becomes a *proposal* the leader
-commits through the log; every node applies the same committed sequence into its shared
-slot map, so all nodes converge on one identical ownership view. **User data never enters
-the Raft log** (only the cluster's control state does). The Raft engine is hand-rolled to
-respect IronCache's determinism boundary (no foreign time or RNG on the engine path), so
-it can be verified in a deterministic simulation rather than trusted as a black box
-([ADR-0027](docs/adr/0027-hand-rolled-env-respecting-raft.md)).
+- **Differential-tested**: a harness drives identical command streams at IronCache and
+  a real `redis-server` and asserts byte-for-byte RESP equality, so a divergence
+  surfaces as a reviewable failure (see
+  [docs/design/DIFFERENTIAL_TESTING.md](docs/design/DIFFERENTIAL_TESTING.md)).
+- **Real client drivers validated** in both single-node and cluster mode (54 checks,
+  all passing): **redis-py 6.4.0**, **go-redis v9.7.0**, and **ioredis 5.11.1**. The
+  cluster checks confirm topology discovery via `CLUSTER SLOTS` and `MOVED`-routing
+  end to end. The one documented gap is a client limitation, not an IronCache defect:
+  ioredis is RESP2-only and cannot decode the RESP3 map byte (redis-py and go-redis
+  negotiate RESP3 against the same server cleanly). The full matrix is in
+  [tests/drivers/DRIVER_MATRIX.md](tests/drivers/DRIVER_MATRIX.md).
 
-**The split-brain fence.** Slot ownership is transferred *only* through the committed
-Raft log, and every ownership change bumps a monotonic config epoch. Two nodes at the same
-epoch have applied the identical committed prefix, so they agree on every slot's single
-owner: there is never a committed state in which two nodes both own a slot. When a former
-owner rejoins and catches its log up, it applies the same committed entry, sees it no
-longer owns the slot, and serves `MOVED` to the new owner.
-
-**The data plane.**
-
-- **Routing.** Each key hashes to one of 16384 slots (CRC16, Redis-identical). A node that
-  does not own a key's slot replies `-MOVED <slot> <host:port>`, exactly like Redis Cluster.
-- **Replication.** `CLUSTER REPLICATE <node> <slot>` makes a node an asynchronous replica
-  of a slot: it full-syncs the slot's data (forklessly, with bounded extra memory), then
-  follows a steady-state mutation stream. Replica lag is tracked; a `READONLY` client may
-  read from a replica only while it is within the lag bound, otherwise the read `MOVED`s to
-  the owner (a bounded-staleness read, never a stale-unbounded one).
-- **Failover.** An in-sync replica is promoted to owner through a committed `PromoteReplica`
-  entry, gated on the replica having been in sync at last contact (a stale replica is never
-  promoted, so no data is lost beyond the asynchronous-replication window). The committed
-  apply is the fence: the old owner steps down on apply, so a promotion never creates two
-  owners.
-- **Online migration.** A slot moves from a source to a destination with zero downtime:
-  `SETSLOT MIGRATING` / `IMPORTING` mark the endpoints, the destination pulls the slot's
-  existing data as a scoped snapshot plus a live mutation stream (additively, while the source
-  keeps serving), the source `-ASK`s a key already redirected, the destination serves under the
-  one-shot `ASKING` flag, and a single committed `SETSLOT NODE` performs the atomic ownership
-  flip. A crash at the flip boundary leaves exactly one owner (the source if the flip did not
-  commit, the destination if it did). The `ASK`/`ASKING` redirect also works for commands
-  queued inside a `MULTI`, and on a multi-shard node the key-presence check that drives `-ASK`
-  is routed to the key's owner shard, so it is exact (no spurious redirect).
-- **Un-assigning slots.** `DELSLOTS` / `DELSLOTSRANGE` / `FLUSHSLOTS` commit an `UnassignSlots`
-  entry through the log, so an operator can take slots out of service cluster-wide.
-- **Membership changes.** The voter set is reconfigurable at runtime via single-server Raft
-  changes (add/remove one voter at a time) plus non-voting **learners** that catch up before
-  promotion. A `CLUSTER MEET` learns the peer's real node id over the cluster bus (so the node
-  table has one entry per node, no synthesized-id duplicates).
-- **Write-side durability bound.** Optional `min-replicas-to-write` (with `min-replicas-max-lag`,
-  Redis-style, default off): an owner refuses a write (`-NOREPLICAS`) unless at least N replicas
-  are currently in sync, bounding the failover write-loss window from the write side.
-- **Log compaction.** The Raft log is snapshotted and compacted (configurable
-  `raft_snapshot_threshold`), with a *chunked* `InstallSnapshot` path to catch up a far-behind
-  or newly added node: the leader ships the snapshot in bounded sequential chunks (size
-  `raft_snapshot_chunk_bytes`, default 256 KiB, well under the cluster-bus frame bound) so a
-  large snapshot never becomes one giant frame or a memory spike on either end; the durable log
-  + snapshot live under a configurable `data_dir`.
-
-**Consistency model.** Cluster *control state* (who owns which slot) is linearizable through
-Raft. *User data* replication is asynchronous, so a failover can lose writes that had not yet
-reached the promoted replica. This is the deliberate cache trade-off recorded in the design
-issues, not an unbounded promise; IronCache is a cache, not an ACID database.
-
-**Verification.** The failure-prone parts are proven in a deterministic simulation (DST)
-that drives an N-node cluster through partitions, crashes, and heals over *thousands of
-seeded timelines*, asserting the invariants on every quiescent step: no two owners per slot
-per epoch (the split-brain gate), a committed failover or migration flip is never lost
-(Raft's commit safety), and a not-in-sync replica is never promoted (the lag gate). The same
-paths are exercised over real TCP loopback. The build also runs against a live
-multi-process cluster on AWS, where formation + leader election, consensus
-(`MEET`/`ADDSLOTS`), `MOVED` routing, replication + bounded-staleness replica reads, leader
-failover with re-election, automatic replica promotion on owner death (an in-sync replica
-self-promoting from any node, via leader-forwarding), and online migration
-(`ASK`/`ASKING`/flip) were all confirmed end to end. A per-PR performance gate (bytes-per-key
-and throughput ratcheted against the merge base) guards against any regression from the
-clustering work on the single-node hot path.
-
-**Running a 3-node Raft cluster.** Each node gets a TOML config naming the full voter set
-(its cluster-bus port is `client_port + 10000`, its replication port `client_port + 20000`,
-both derived automatically) and its own announce id:
-
-```toml
-# node0.toml  (repeat for node1/node2 with their own port + cluster_announce_id)
-bind = "127.0.0.1"
-port = 7001
-cluster_enabled = true
-cluster_mode = "raft"
-cluster_announce_id = "0000000000000000000000000000000000000000"
-# data_dir = "/var/lib/ironcache"       # durable Raft-log + snapshot directory; unset (default) uses the OS temp dir
-# raft_snapshot_threshold = 1024        # compact the Raft log after this many entries (default 1024)
-# raft_snapshot_chunk_bytes = 262144    # InstallSnapshot chunk size in bytes (default 262144 = 256 KiB; 0 = one chunk)
-# min_replicas_to_write = 0             # refuse a write (-NOREPLICAS) below this many in-sync replicas (default 0 = off)
-# min_replicas_max_lag = 10             # the in-sync lag bound for min_replicas_to_write
-
-[[cluster_topology.nodes]]
-id = "0000000000000000000000000000000000000000"
-host = "127.0.0.1"
-port = 7001
-slots = []
-# ... one [[cluster_topology.nodes]] block per node (slots are empty in raft mode;
-#     ownership is established at runtime through committed proposals) ...
-```
-
-```sh
-ironcache --config node0.toml &   # repeat for node1, node2
-# on the elected leader: form the cluster and claim the slot space
-redis-cli -p 7002 CLUSTER MEET 127.0.0.1 7001
-redis-cli -p 7002 CLUSTER MEET 127.0.0.1 7003
-redis-cli -p 7002 CLUSTER ADDSLOTSRANGE 0 16383
-redis-cli -p 7001 CLUSTER INFO   # cluster_state:ok, cluster_slots_assigned:16384 on every node
-```
-
-A cluster mutation, or a replica self-promotion, can be issued to **any** node: a
-follower transparently FORWARDS the proposal to the current Raft leader over the cluster
-bus, awaits the commit, and relays the result, so a CLUSTER write to a follower returns
-`+OK` and an in-sync replica self-promotes regardless of which node holds leadership. (A
-`-CLUSTERDOWN` redirect remains only for the genuine no-leader / forward-timeout case.)
-
-**Known limitations (today).**
-
-- A `propose` ack resolves when the leader appends the entry (it commits on a majority
-  immediately after); resolving the ack on the commit advance, and surfacing the leader's
-  client endpoint (not its cluster-bus endpoint) in the rare redirect hint, are tracked
-  follow-ups. Every cluster `ConfigCmd` is idempotent, so a re-proposal after a missed
-  commit is safe.
+A few deliberate model differences from single-node Redis are documented rather than
+silently wrong: a single-node MULTI/EXEC (and a cross-shard multi-key move) requires
+the keys to share a shard, mirroring the cluster contract that a transaction's keys
+must share a slot (co-locate them with a `{hash tag}`).
 
 ---
 
-## Prior art
+## Quick start
 
-IronCache is built on a deep, version-pinned reading of the field. The full
-survey is in [docs/PRIOR_ART.md](docs/PRIOR_ART.md), every numeric claim is
-pinned in [docs/prior-art/claims.yaml](docs/prior-art/claims.yaml), and the
-per-dimension research lives in [docs/research/](docs/research/). In short:
+### Build and run from source
 
-- **Architecture** comes from DragonflyDB: shared-nothing thread-per-core over
-  io_uring, with Rust ownership making the "one core owns one shard" rule a
-  compile-time guarantee rather than a convention.
-- **Memory** comes from Dragonfly's Dashtable (extendible hashing, far less
-  per-item metadata than the Redis dict) and from Memcached's slab discipline,
-  pushed further with compact encodings and optional compression.
-- **Eviction** comes from the modern literature: W-TinyLFU (Caffeine), S3-FIFO,
-  and SIEVE, which beat approximated LRU on hit ratio and are far friendlier to a
-  lock-light, per-core design.
-- **Persistence** comes from Dragonfly's forkless versioned snapshot and from
-  the FASTER and Tsavorite hybrid-log lineage behind Garnet.
-- **The contract** comes from Redis and Valkey: RESP2, RESP3, and the observable
-  semantics of the supported commands.
-- **Operability** comes from the single-binary, self-updating tradition, with
-  the server and CLI in one artifact.
-
----
-
-## Quick start (planned, illustrative only)
-
-The CLI surface is being designed in its own issue and is not final. The intended
-experience:
-
-```sh
-# install (one static binary, server and CLI in one)
-curl --proto '=https' --tlsv1.2 -LsSf https://ironcache.dev/install.sh | sh
-
-# run with safe defaults: every core, sensible memory limit, snapshot on
-ironcache serve
-
-# talk to it with any Redis client, including redis-cli
-redis-cli -p 6379 SET hello world
-redis-cli -p 6379 GET hello
-
-# or the built-in CLI
-ironcache cli GET hello
-
-# update in place, with rollback if the new version fails to come up
-ironcache upgrade
-```
-
----
-
-## Building
-
-The engine is functional: a shared-nothing, thread-per-core server speaking RESP2/RESP3
-with 150+ commands across all core types (strings, lists, hashes, sets, sorted sets,
-bitmaps, HyperLogLog), transactions (MULTI/EXEC/WATCH), pub/sub, AUTH, a maxmemory
-ceiling with eviction, and a cross-shard coordinator. To build and run from source you
-need a stable Rust toolchain (MSRV 1.85, edition 2024):
+You need a stable Rust toolchain (MSRV 1.85, edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 800+ tests
+cargo test --workspace          # 1,500+ tests
 
 # boot the server on every core (sharded, thread-per-core) and talk to it with any
-# Redis client; GET/SET/DEL, the collection types, TTLs, and the maxmemory ceiling work
+# Redis client
 cargo run -p ironcache -- server
 redis-cli -p 6379 SET hello world   # -> OK
 redis-cli -p 6379 GET hello         # -> "world"
 
-# other modes: print the effective config, or run a config self-check
+# other modes: the built-in CLI, the effective config, or a config self-check
+cargo run -p ironcache -- cli GET hello
 cargo run -p ironcache -- config
 cargo run -p ironcache -- check
 ```
 
-Persistence (a forkless snapshot) and the multi-node cluster are the remaining v1
-milestones; see [docs/ROADMAP.md](docs/ROADMAP.md) for the slice order, and
-[docs/bench/OPTIMIZATION_LOG.md](docs/bench/OPTIMIZATION_LOG.md) for the efficiency
-campaign that produced the [Benchmarks](#benchmarks-how-it-compares) above.
+### Run the container
+
+```sh
+docker run -d --name ironcache \
+  -p 6379:6379 -p 9121:9121 \
+  -v ironcache-data:/var/lib/ironcache \
+  -e IRONCACHE_DATA_DIR=/var/lib/ironcache \
+  ghcr.io/elares/ironcache:latest \
+  server --bind 0.0.0.0 --metrics-addr 0.0.0.0:9121
+
+redis-cli -p 6379 ping
+curl localhost:9121/readyz
+```
+
+### Configuration
+
+Configuration is layered, highest precedence first:
+
+```
+runtime CONFIG SET  >  CLI flags  >  IRONCACHE_* env vars  >  TOML file  >  built-in defaults
+```
+
+The most common knobs (every key, with its env var, is in
+[`DEPLOY.md`](DEPLOY.md)):
+
+| Key (TOML) | Env var | Meaning |
+| --- | --- | --- |
+| `bind` / `port` | `IRONCACHE_BIND` / `IRONCACHE_PORT` | listen address and client port (default 6379) |
+| `shards` | `IRONCACHE_SHARDS` | per-core runtimes (default = available parallelism) |
+| `maxmemory` / `maxmemory-policy` | `IRONCACHE_MAXMEMORY` / `..._POLICY` | memory ceiling + eviction policy |
+| `maxclients` | `IRONCACHE_MAXCLIENTS` | max connections (default 10000) |
+| `requirepass` | `IRONCACHE_REQUIREPASS` | client AUTH password (hashed at rest) |
+| `aclfile` | `IRONCACHE_ACLFILE` | ACL users loaded at boot |
+| `data_dir` | `IRONCACHE_DATA_DIR` | durable snapshot + Raft-log dir (enables persistence) |
+| `save_interval_secs` / `save_min_changes` | `IRONCACHE_SAVE_*` | periodic save cadence |
+| `tls` + `tls_cert_path` + `tls_key_path` | `IRONCACHE_TLS*` | TLS on the client port |
+| `cluster_enabled` / `cluster_mode` | `IRONCACHE_CLUSTER_*` | turn on clustering; `static` or `raft` |
+| `cluster_secret` / `cluster_tls` | `IRONCACHE_CLUSTER_SECRET` / `_TLS` | peer auth + bus/repl encryption |
+| `min_replicas_to_write` | `IRONCACHE_MIN_REPLICAS_TO_WRITE` | write-side durability guardrail |
+
+In raft mode the cluster-bus port is `port + 10000` and the replication port is
+`port + 20000`, both derived automatically.
 
 ---
 
-## How this repository is organized
+## Benchmarks
 
-- [README.md](README.md): the canonical vision, tenets, and committed non-goals.
-- [docs/PRIOR_ART.md](docs/PRIOR_ART.md): the version-pinned comparative survey.
-- [docs/prior-art/claims.yaml](docs/prior-art/claims.yaml): the single source of
-  truth for every numeric or version-specific prior-art claim, with sources,
-  pinned versions, confidence, and an independent verification verdict.
-- [docs/research/](docs/research/): the per-dimension research corpus and the
-  machine-readable [`corpus.json`](docs/research/corpus.json).
-- The [GitHub issues](https://github.com/ELares/IronCache/issues): the
-  authoritative design record, grouped by milestone, indexed from the
-  [vision EPIC (#1)](https://github.com/ELares/IronCache/issues/1).
+IronCache is built to be measured, not asserted. The run below is a multi-engine
+head-to-head on AWS Graviton, dated 2026-06-21.
+
+**Setup.** Server nodes are **t4g.medium** (2 vCPU / 4 GB, arm64, AL2023); the load
+generator is a separate **t4g.2xlarge**. The tool is `memtier_benchmark` against
+32-byte values over a 1,000,000-key space, pipeline 16 for throughput and pipeline 1
+for latency, peak across a connection sweep, persistence off. Each engine is given
+both cores (Redis `io-threads 2`, KeyDB `server-threads 2`, Dragonfly
+`proactor_threads 2`, IronCache `shards 2`). Versions: Redis 7.4.1, KeyDB 6.3.4,
+Dragonfly v1.39.0, IronCache (this build).
+
+### Single node, peak ops/sec
+
+| Workload | Redis 7.4 | KeyDB 6.3 | Dragonfly 1.39 | IronCache |
+| --- | ---: | ---: | ---: | ---: |
+| SET | 570,912 | 361,198 | 517,079 | **596,495** |
+| GET | 610,241 | 347,058 | 529,331 | **642,425** |
+| MIX 1:10 | **574,344** | 346,011 | 453,481 | 562,124 |
+| INCR | **924,908** | 541,577 | 548,804 | 663,373 |
+| GET p99 ms (pipeline 1) | 0.447 | 0.455 | 0.431 | **0.407** |
+
+### 3-node cluster, peak ops/sec
+
+| Workload | Redis 7.4 | KeyDB 6.3 | Dragonfly 1.39 | IronCache |
+| --- | ---: | ---: | ---: | ---: |
+| SET | **1,223,353** | 665,630 | 1,026,420 | 1,067,433 |
+| GET | 1,298,207 | 1,011,979 | 1,104,863 | **1,298,452** |
+| MIX 1:10 | **1,222,915** | 969,486 | 936,071 | 1,057,888 |
+
+### How to read this (honestly)
+
+These are small (2-vCPU) nodes, chosen deliberately. On only two cores the
+multi-threaded engines have very limited headroom, so single-threaded Redis stays
+extremely competitive and in fact **wins the tiny-payload commands** (INCR
+single-node, SET and MIX on the cluster) where its hand-tuned single-thread core has
+the least overhead to amortize.
+
+Where IronCache leads: it **tops SET and GET throughput and GET tail latency
+single-node**, and it **ties Redis on cluster GET (about 1.30M ops/sec)** while
+staying clearly ahead of KeyDB and Dragonfly across the board. The picture is honest
+in both directions: Redis wins the small-op rows, IronCache wins the bulk SET/GET and
+latency rows, and the two multi-threaded incumbents (KeyDB, Dragonfly) trail on these
+nodes.
+
+Higher-core nodes would widen the multi-threaded engines' lead over single-threaded
+Redis; this run intentionally used small nodes to show the worst case for a
+thread-per-core design, not its best. Reproduce a row with `memtier_benchmark` (32-byte
+values, 1M keyspace, `--pipeline 16` for throughput / `--pipeline 1` for latency, both
+cores per engine), sweeping connections for the peak.
+
+---
+
+## Repository layout
+
+- [README.md](README.md): this overview.
+- [DEPLOY.md](DEPLOY.md): the production deployment guide (container, Helm, k8s,
+  compose) and every config key.
+- [SECURITY.md](SECURITY.md) and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md): the
+  security policy and threat model.
+- [CHANGELOG.md](CHANGELOG.md): notable changes.
+- [docs/design/](docs/design/): the per-subsystem design records (protocol, runtime,
+  persistence, ACL, TLS, clustering, observability, ...).
+- [docs/adr/](docs/adr/): the architecture decision records.
+- [docs/PRIOR_ART.md](docs/PRIOR_ART.md) and
+  [docs/prior-art/claims.yaml](docs/prior-art/claims.yaml): the version-pinned
+  comparative survey and the single source of truth for every numeric prior-art claim.
+- [docs/bench/](docs/bench/): the competitor matrix and the optimization log.
+- The [GitHub issues](https://github.com/ELares/IronCache/issues): the design record,
+  indexed from the [vision EPIC (#1)](https://github.com/ELares/IronCache/issues/1).
+
+---
 
 ## Contributing
 
-IronCache is documentation-first and currently in its research phase. The best
-way to help today is to challenge a prior-art claim, add a source, or sharpen a
-design decision on its issue. See [CONTRIBUTING.md](CONTRIBUTING.md) and
-[GOVERNANCE.md](GOVERNANCE.md). Prose in this project uses no em dashes or en
-dashes.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [GOVERNANCE.md](GOVERNANCE.md). Prose in
+this project uses no em dashes or en dashes.
 
 ## License
 

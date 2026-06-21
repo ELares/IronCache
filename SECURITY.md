@@ -1,8 +1,9 @@
 # Security Policy
 
-IronCache is in its research and specification phase and has no shipping code
-yet. There is therefore no released artifact to report a vulnerability against.
-This policy is published early so the reporting path exists from day one.
+IronCache has a functional engine (a Redis-compatible server with persistence,
+clustering, AUTH/ACL, and TLS) and publishes rolling and tagged release artifacts.
+Until a stable 1.0, treat the latest release as the supported version. This policy
+describes how to report a suspected vulnerability privately.
 
 ## Reporting a vulnerability
 
