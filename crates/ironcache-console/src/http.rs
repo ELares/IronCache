@@ -27,6 +27,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::api::{self, ApiContext};
+use crate::history::HistorySource;
 use crate::metrics::ConsoleMetrics;
 use crate::poll::{TopologyHolder, new_topology_holder};
 
@@ -55,6 +56,11 @@ pub struct ConsoleHttpState {
     /// The latest polled topology, shared with the poll loop (#355/#366). The
     /// REST API (#358) reads it to render the `/api/*` responses.
     topology: TopologyHolder,
+    /// The configured history source (#356), shared into each request. `None` when
+    /// no `prometheus_url` is configured, in which case `/api/timeseries` is 503.
+    /// SECURITY: this carries the SERVER-configured Prometheus base URL; the
+    /// request never supplies it (the SSRF boundary).
+    history: Option<Arc<dyn HistorySource>>,
 }
 
 impl ConsoleHttpState {
@@ -65,7 +71,7 @@ impl ConsoleHttpState {
 
     /// Construct with an EXISTING topology holder, so the poll loop and the HTTP
     /// surface share one cell (the loop writes, the handler reads through the REST
-    /// API).
+    /// API). No history source (the unconfigured case).
     #[must_use]
     pub fn with_topology(metrics: Arc<ConsoleMetrics>, topology: TopologyHolder) -> Self {
         ConsoleHttpState {
@@ -73,7 +79,17 @@ impl ConsoleHttpState {
             live: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
             topology,
+            history: None,
         }
+    }
+
+    /// Attach a history source (the Prometheus adapter, #356), consuming and
+    /// returning `self` (builder style) so `lib.rs` can wire it after constructing
+    /// the state with the shared topology holder.
+    #[must_use]
+    pub fn with_history(mut self, history: Option<Arc<dyn HistorySource>>) -> Self {
+        self.history = history;
+        self
     }
 
     /// The shared topology holder (so `lib.rs` can hand the same cell to the poll
@@ -124,9 +140,22 @@ impl ConsoleHttpState {
                 live: self.live.load(Ordering::SeqCst),
                 ready: self.ready.load(Ordering::SeqCst),
                 uptime_seconds: self.metrics.uptime_seconds(),
+                // "now" via the same env clock seam the metrics use (#356), never
+                // SystemTime::now directly.
+                now_unix: self.metrics.now_unix_seconds(),
             };
-            let guard = self.topology.read().await;
-            let resp = api::handle(bare, guard.as_ref(), &ctx);
+            // The history route does I/O (a Prometheus query) and does NOT need the
+            // topology, so handle it WITHOUT holding the topology read lock: holding
+            // it across a slow upstream query would block the poll loop's write for
+            // up to the request deadline. Every OTHER route is pure over the
+            // topology, so the guard is held only for those and is dropped promptly.
+            let resp = if bare == "/api/timeseries" {
+                let query = path.split_once('?').map_or("", |(_, q)| q);
+                api::handle_timeseries(query, self.history.as_deref(), &ctx).await
+            } else {
+                let guard = self.topology.read().await;
+                api::handle(bare, guard.as_ref(), &ctx)
+            };
             return http_response(
                 resp.status,
                 status_reason(resp.status),
@@ -203,9 +232,11 @@ impl ConsoleHttpState {
 /// (`200 OK`) covers the success case and any unexpected code defensively.
 fn status_reason(code: u16) -> &'static str {
     match code {
+        400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "OK",
     }
