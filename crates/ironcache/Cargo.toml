@@ -78,6 +78,11 @@ ironcache-clusterbus = { workspace = true }
 tokio-rustls = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+# Typed errors for the `ironcache upgrade` self-updater (#387): the Verifier/Source/Swap/Service/
+# HealthProbe/Save seams each carry a `thiserror`-derived error enum (no stringly-typed errors,
+# ERRORS.md). Already a workspace dependency used pervasively in the library crates, so this adds NO
+# new crate to the graph (it is already in Cargo.lock); the binary crate just declares it.
+thiserror = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync", "signal"] }
 libc = { workspace = true }

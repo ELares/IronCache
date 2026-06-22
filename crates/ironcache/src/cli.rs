@@ -97,8 +97,70 @@ pub enum Command {
     Check,
     /// Print the effective configuration.
     Config,
-    /// Self-update with verified rollback (stub in PR-1).
-    Upgrade,
+    /// Self-update: swap the on-disk binary to a new version and restart the systemd-managed
+    /// server onto it, DATA-SAFELY (SAVE-first) and SAFELY (sha256-verify + health-gate +
+    /// auto-rollback). Operator-run + privileged; NOT a RESP surface. The signature anchor (#386),
+    /// HTTPS auto-fetch, and the lossless write-freeze (#388) are explicit follow-ups (#387).
+    Upgrade(UpgradeArgs),
+}
+
+/// Arguments for `ironcache upgrade` (the #387 mechanism). `--binary` + `--sha256sums` are the v1
+/// local source + integrity manifest; the swap target, unit, health, auth, and rollback knobs all
+/// have safe defaults.
+#[derive(Debug, clap::Args)]
+pub struct UpgradeArgs {
+    /// Path to the NEW ironcache binary to install (the local source for v1). Its sha256 must match
+    /// its entry in `--sha256sums`, and it must run + report a version.
+    #[arg(long, value_name = "PATH")]
+    pub binary: PathBuf,
+
+    /// Path to the release `SHA256SUMS` to verify `--binary` against (its sha256 must equal the
+    /// entry whose file name matches `--binary`'s basename).
+    #[arg(long, value_name = "PATH")]
+    pub sha256sums: PathBuf,
+
+    /// The live binary path to swap onto (the `.new`/`.old` slots live alongside it on the SAME
+    /// filesystem). Defaults to the systemd unit's `ExecStart` path.
+    #[arg(long, value_name = "PATH", default_value = "/usr/local/bin/ironcache")]
+    pub target: PathBuf,
+
+    /// The systemd unit to restart onto the new binary.
+    #[arg(long, value_name = "NAME", default_value = "ironcache")]
+    pub unit: String,
+
+    /// The ops endpoint serving `/readyz` to health-probe after the restart.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:9121")]
+    pub readyz_addr: String,
+
+    /// The RESP `host:port` for the SAVE-first connection and the `PING` health probe.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:6379")]
+    pub resp_addr: String,
+
+    /// Path to a file holding the `requirepass` password for the loopback SAVE / PING connections
+    /// (kept out of argv/logs; the password is read from this FILE, never passed on the command
+    /// line).
+    #[arg(long, value_name = "PATH")]
+    pub auth_file: Option<PathBuf>,
+
+    /// How long (seconds) to wait for the restarted server to come back ready + on the expected
+    /// version before failing the upgrade (and, by default, auto-rolling-back).
+    #[arg(long, value_name = "SECS", default_value_t = 30)]
+    pub health_timeout: u64,
+
+    /// Skip auto-rollback on a failed health gate: leave the new binary in place and report failure
+    /// (for an operator who wants to debug the new binary in situ).
+    #[arg(long)]
+    pub no_rollback: bool,
+
+    /// Skip the confirm prompt. ALSO permits proceeding when persistence is not configured
+    /// (accepting the in-memory data loss across the restart) and with a same-version target.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Permit upgrading to the SAME version already installed (a re-install / repair) without
+    /// `--yes`. Off by default, since a same-version upgrade is usually a mistake.
+    #[arg(long)]
+    pub allow_same: bool,
 }
 
 /// Returns true when the binary was invoked under a `redis-cli` basename, in

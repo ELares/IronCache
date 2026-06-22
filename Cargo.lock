@@ -400,6 +400,7 @@ dependencies = [
  "ironcache-storage",
  "ironcache-store",
  "libc",
+ "thiserror",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
