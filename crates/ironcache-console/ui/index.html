@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<!--
+  SPDX-License-Identifier: MIT OR Apache-2.0
+  IronCache Console dashboard shell (issue #359). A static, framework-free SPA
+  served by the console's own HTTP responder. CSS and JS are in SEPARATE files
+  so a strict Content-Security-Policy (default-src 'self') needs no
+  'unsafe-inline'. The script renders the panels from the /api/* JSON, escaping
+  every server string into the DOM via textContent (no innerHTML interpolation).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>IronCache Console</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <noscript>
+      <p class="banner banner-error">
+        This dashboard needs JavaScript to render the live cluster view.
+      </p>
+    </noscript>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">IronCache</span>
+        <span class="subtitle">Console</span>
+      </div>
+      <dl class="status">
+        <div class="status-item">
+          <dt>Mode</dt>
+          <dd id="hdr-mode">-</dd>
+        </div>
+        <div class="status-item">
+          <dt>Nodes</dt>
+          <dd id="hdr-nodes">-</dd>
+        </div>
+        <div class="status-item">
+          <dt>Last poll</dt>
+          <dd id="hdr-poll">-</dd>
+        </div>
+        <div class="status-item">
+          <dt>Version</dt>
+          <dd id="hdr-version">-</dd>
+        </div>
+      </dl>
+    </header>
+
+    <div id="banner" class="banner" hidden></div>
+    <div id="waiting" class="banner banner-wait" hidden>
+      Waiting for the first node poll...
+    </div>
+
+    <main>
+      <section class="panel" aria-labelledby="totals-title">
+        <h2 id="totals-title">Cluster totals</h2>
+        <div class="cards" id="totals-cards">
+          <div class="card"><span class="card-label">Keys</span><span class="card-value" id="t-keys">-</span></div>
+          <div class="card"><span class="card-label">Used memory</span><span class="card-value" id="t-mem">-</span></div>
+          <div class="card"><span class="card-label">Connected clients</span><span class="card-value" id="t-clients">-</span></div>
+          <div class="card"><span class="card-label">Hit ratio</span><span class="card-value" id="t-hit">-</span></div>
+          <div class="card"><span class="card-label">Evictions</span><span class="card-value" id="t-evict">-</span></div>
+          <div class="card"><span class="card-label">Expirations</span><span class="card-value" id="t-expire">-</span></div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="nodes-title">
+        <h2 id="nodes-title">Nodes</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Address</th>
+                <th>Reachable</th>
+                <th>Version</th>
+                <th>Memory</th>
+                <th>Keys</th>
+                <th>Clients</th>
+                <th>Hit ratio</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody id="nodes-body">
+              <tr><td colspan="8" class="empty">No data yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="slowlog-title">
+        <h2 id="slowlog-title">Slowlog</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Node</th>
+                <th>Timestamp</th>
+                <th>Micros</th>
+                <th>Command</th>
+                <th>Client</th>
+              </tr>
+            </thead>
+            <tbody id="slowlog-body">
+              <tr><td colspan="5" class="empty">No data yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="clients-title">
+        <h2 id="clients-title">Clients</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Node</th>
+                <th>Address</th>
+                <th>Name</th>
+                <th>Age</th>
+                <th>Idle</th>
+                <th>Cmd</th>
+                <th>DB</th>
+              </tr>
+            </thead>
+            <tbody id="clients-body">
+              <tr><td colspan="7" class="empty">No data yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="keyspace-title">
+        <h2 id="keyspace-title">Keyspace</h2>
+        <p class="keyspace-total">Total keys: <span id="ks-total">-</span></p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Node</th>
+                <th>DB</th>
+                <th>Keys</th>
+                <th>Expires</th>
+              </tr>
+            </thead>
+            <tbody id="keyspace-body">
+              <tr><td colspan="4" class="empty">No data yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>
+        IronCache Console - unauthenticated today; to be placed behind the
+        auth tier (#360) and VPN-locked exposure (#369) before exposure.
+      </span>
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

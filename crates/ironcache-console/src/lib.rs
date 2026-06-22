@@ -18,8 +18,11 @@
 //! `/api/keyspace`, and a static `/api/openapi.json`. Node acquisition now also
 //! fetches `SLOWLOG GET` and `CLIENT LIST` per node (each resilient: a per-section
 //! failure or ACL denial records that section's error and yields a degraded
-//! snapshot, never failing the whole acquire). The aggregation-from-Prometheus
-//! layer, the UI, and TLS hardening land in later PRs (#356, #359, #369).
+//! snapshot, never failing the whole acquire). The dashboard SPA (#359) hangs off
+//! the same responder at `/`, `/app.css`, and `/app.js` (static assets embedded
+//! with `include_str!`, served with strict security headers and a CSP that needs
+//! no inline script/style). The aggregation-from-Prometheus layer and TLS
+//! hardening land in later PRs (#356, #369).
 //!
 //! SECURITY: the `/api/*` surface exposes node internals (addresses, slowlog argv
 //! = key names, client IPs) and is UNAUTHENTICATED today; it relies on the
@@ -28,10 +31,13 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
+pub mod assets;
 pub mod auth;
 pub mod cli;
 pub mod config;
+pub mod history;
 pub mod http;
+pub mod httpclient;
 pub mod info;
 pub mod logging;
 pub mod metrics;
@@ -126,13 +132,21 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         // Resolve the auth/RBAC policy (#360) from the configured tokens and the
         // bind classification: a token => ENFORCE; no token + loopback => dev
         // (serve all); no token + non-loopback => OPEN only.
-        let auth = auth::AuthPolicy::resolve(
+        let auth_policy = auth::AuthPolicy::resolve(
             cfg.read_token.as_deref(),
             cfg.admin_token.as_deref(),
             binds_loopback(&cfg.http_addr),
         );
-        let state =
-            http::ConsoleHttpState::with_topology_and_auth(metrics.clone(), topology.clone(), auth);
+        // The history source (#356): a Prometheus adapter when a `prometheus_url`
+        // is configured, else `None` (so `/api/timeseries` answers 503). SECURITY:
+        // the base URL comes ONLY from server config here, never from a request.
+        let history = build_history_source(cfg);
+        let state = http::ConsoleHttpState::with_topology_and_auth(
+            metrics.clone(),
+            topology.clone(),
+            auth_policy,
+        )
+        .with_history(history);
         let listener = tokio::net::TcpListener::bind(&cfg.http_addr)
             .await
             .with_context(|| format!("binding the console HTTP address {}", cfg.http_addr))?;
@@ -173,6 +187,21 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         poller.abort();
         result
     })
+}
+
+/// Build the history source (#356) from config: a [`history::PrometheusSource`]
+/// (boxed behind the `HistorySource` trait object) when `prometheus_url` is set,
+/// else `None`. The query timeouts reuse the node connect/op timeout bounds, so a
+/// down Prometheus times out promptly with the same discipline as the node poller.
+///
+/// SECURITY: the base URL is taken ONLY from server config; a request never
+/// supplies it (the SSRF boundary).
+fn build_history_source(cfg: &ConsoleConfig) -> Option<Arc<dyn history::HistorySource>> {
+    let url = cfg.prometheus_url.as_ref()?;
+    let connect_timeout = std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1));
+    let read_timeout = std::time::Duration::from_secs(cfg.op_timeout_secs.max(1));
+    let source = history::PrometheusSource::new(url, connect_timeout, read_timeout);
+    Some(Arc::new(source))
 }
 
 /// Emit the one-line boot banner (and a warning if the console has no seed nodes
