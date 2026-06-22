@@ -18,8 +18,11 @@
 //! `/api/keyspace`, and a static `/api/openapi.json`. Node acquisition now also
 //! fetches `SLOWLOG GET` and `CLIENT LIST` per node (each resilient: a per-section
 //! failure or ACL denial records that section's error and yields a degraded
-//! snapshot, never failing the whole acquire). The aggregation-from-Prometheus
-//! layer, the UI, and TLS hardening land in later PRs (#356, #359, #369).
+//! snapshot, never failing the whole acquire). The dashboard SPA (#359) hangs off
+//! the same responder at `/`, `/app.css`, and `/app.js` (static assets embedded
+//! with `include_str!`, served with strict security headers and a CSP that needs
+//! no inline script/style). The aggregation-from-Prometheus layer and TLS
+//! hardening land in later PRs (#356, #369).
 //!
 //! SECURITY: the `/api/*` surface exposes node internals (addresses, slowlog argv
 //! = key names, client IPs) and is UNAUTHENTICATED today; it relies on the
@@ -28,6 +31,7 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
+pub mod assets;
 pub mod cli;
 pub mod config;
 pub mod http;
