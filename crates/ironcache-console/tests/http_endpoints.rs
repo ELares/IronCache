@@ -337,11 +337,61 @@ async fn serves_dashboard_assets_over_tcp() {
         "app.js must avoid innerHTML"
     );
 
-    // GET /app.css -> the dashboard stylesheet.
+    // GET /app.css -> the dashboard stylesheet, which imports the self-hosted
+    // fonts (no CDN) for the strict CSP.
     let css = http_get(addr, "/app.css").await;
     assert!(css.starts_with("HTTP/1.1 200 OK"), "{css}");
     assert!(
         css.contains("Content-Type: text/css; charset=utf-8"),
         "{css}"
     );
+    let (_h, cssbody) = split_body(&css);
+    assert!(
+        cssbody.contains("@import url('/assets/fonts.css')"),
+        "app.css must import the self-hosted fonts"
+    );
+}
+
+/// The self-hosted fonts (#359 re-skin) over a real TCP socket: `/assets/fonts.css`
+/// serves as `text/css` with the @font-face declarations, and each woff2 serves
+/// as `font/woff2` raw bytes with the strict UI security headers. Exercises the
+/// SAME bounded responder.
+#[tokio::test]
+async fn serves_self_hosted_fonts_over_tcp() {
+    let state = ConsoleHttpState::new(Arc::new(ConsoleMetrics::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    state.set_live(true);
+    let serving = state.clone();
+    tokio::spawn(async move {
+        accept_loop(listener, serving).await;
+    });
+
+    // The @font-face stylesheet.
+    let fonts_css = http_get(addr, "/assets/fonts.css").await;
+    assert!(fonts_css.starts_with("HTTP/1.1 200 OK"), "{fonts_css}");
+    assert!(
+        fonts_css.contains("Content-Type: text/css; charset=utf-8"),
+        "{fonts_css}"
+    );
+    assert!(
+        fonts_css.contains("Content-Security-Policy: default-src 'self'"),
+        "{fonts_css}"
+    );
+    let (_h, body) = split_body(&fonts_css);
+    assert!(body.contains("@font-face"), "{body}");
+
+    // Each woff2 serves as font/woff2 with the security headers and a 200.
+    for path in [
+        "/assets/fonts/hanken-grotesk.woff2",
+        "/assets/fonts/jetbrains-mono.woff2",
+    ] {
+        let resp = http_get(addr, path).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{path}: {resp}");
+        assert!(resp.contains("Content-Type: font/woff2"), "{path}: {resp}");
+        assert!(
+            resp.contains("X-Content-Type-Options: nosniff"),
+            "{path}: {resp}"
+        );
+    }
 }

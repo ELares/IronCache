@@ -22,7 +22,41 @@ release.
   hardening (VPN-locked load balancer, the least-privilege node ACL user #367)
   remains infra follow-up.
 
+### Changed
+
+- IronCache Console dashboard re-skin to the bespoke Butlr design system (issue
+  #359). The generic dark dashboard is replaced with the real design language: a
+  full-height sidebar (brand chip plus grouped nav) and topbar (page title, a
+  cluster-state pill, a node selector, a Live toggle, refresh and theme-toggle
+  icon buttons, an avatar), light and dark themes built from Butlr color tokens
+  (the page/card surfaces, the ink primary text, the sparingly used red CTA, the
+  lime accent), 16px rounded cards with a soft shadow, and a tabbed single-page
+  layout. The real-data views are fully wired from the `/api/*` JSON: an Overview
+  with five metric cards (throughput, hit rate, memory, keys, clients), an inline
+  ops/second sparkline over a rolling 60-second buffer, and a per-node summary;
+  plus the Nodes, Slowlog, Clients, and Keyspace tables. The not-yet-built views
+  (Cluster, Replication, Shards, Console, Pub/Sub, Config, ACL) appear in the nav
+  to match the design but show an honest empty-state card explaining why each is
+  unavailable on a standalone node, with NO fabricated data. The fonts are
+  self-hosted (SIL Open Font License 1.1; Hanken Grotesk and JetBrains Mono),
+  embedded and served from `/assets/`, so the strict UI Content-Security-Policy
+  (`default-src 'self'`) needs no CDN. All styling lives in `app.css` as classes
+  with no inline style attributes or handlers, dynamic values (the per-node
+  memory bars, the sparkline geometry, the theme) are driven through CSS custom
+  properties and inline-SVG element nodes, and every server string still reaches
+  the DOM only via textContent, so the strict CSP and the XSS-safe posture are
+  unchanged. The token-based auth flow (sessionStorage, the privileged-401 sign-in
+  reveal) is preserved. The icon set is a small hand-drawn inline-SVG family (no
+  icon CDN).
+
 ### Added
+
+- IronCache Console: the cluster overview totals now include
+  `commands_processed` and `connections_received`, summed across the reachable
+  nodes from each node's INFO Stats counters, so the dashboard can derive a true
+  throughput (operations per second) client-side by differencing the cumulative
+  counter between polls. The OpenAPI document is updated to match. These are
+  aggregate counts, so they stay in the OPEN tier with the other cluster totals.
 
 - IronCache Console: a new `ironcache-console` crate and binary (epic #352,
   issue #353), a SEPARATE server from the data-plane that will discover an

@@ -1,0 +1,20 @@
+/* SPDX-License-Identifier: OFL-1.1 */
+/* Self-hosted variable fonts (SIL Open Font License 1.1), bundled (no CDN) to
+   satisfy the console's strict Content-Security-Policy (default-src 'self').
+   Hanken Grotesk is the design system's stated open substitute for Aeonik;
+   JetBrains Mono is the monospace face. Each is a single variable woff2 covering
+   the weight axis used by the dashboard (400-700). */
+@font-face {
+  font-family: 'Hanken Grotesk';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./fonts/hanken-grotesk.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./fonts/jetbrains-mono.woff2') format('woff2');
+}

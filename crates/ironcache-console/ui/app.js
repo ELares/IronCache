@@ -1,30 +1,36 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// IronCache Console dashboard logic (issue #359). Vanilla JS, no framework, no
-// build step, no external fetch (a strict CSP default-src 'self' must run this
-// with no 'unsafe-inline' and no CDN).
+// IronCache Console dashboard logic (issue #359), re-skinned to the bespoke
+// Butlr design system. Vanilla JS, no framework, no build step, no external
+// fetch (a strict CSP default-src 'self' must run this with no 'unsafe-inline'
+// and no CDN).
 //
 // SECURITY: every server-supplied string is written to the DOM via textContent
-// or document.createTextNode ONLY. There is NO innerHTML with interpolation
-// anywhere, because the slowlog argv and the client fields are attacker-
-// influenceable through a compromised node, so any HTML sink would be an XSS
-// vector. The static panel markup lives in index.html; this script only fills
-// text and builds elements.
+// or document.createTextNode ONLY, and every element (including the inline-SVG
+// sparkline) is built with document.createElement / createElementNS. None of the
+// raw-HTML sinks (the inner/outer-HTML setters, the insert-adjacent-HTML method,
+// or the document writer) is used anywhere, because the slowlog argv and the
+// client fields are attacker-influenceable through a compromised node, so any
+// HTML sink would be an XSS vector.
+//
+// CSP-CLEAN DYNAMIC STYLING: no inline style="" attribute is ever written.
+// Dynamic values (the per-node memory-bar fraction, the sparkline geometry) are
+// driven through CSS custom properties via element.style.setProperty('--x', v)
+// (CSSOM, which the CSP allows) referenced by app.css, or through classList
+// toggling, or via SVG element nodes built with createElementNS. The theme is a
+// data-theme attribute on <html>.
 //
 // AUTH (follow-up to #360): when the console is exposed/authenticated the
 // PRIVILEGED_READ endpoints (/api/nodes, /api/slowlog, /api/clients,
 // /api/keyspace) return 401 without a Bearer token. This script reads an
-// operator token from sessionStorage (tab-scoped, so it clears on tab close;
-// never the persistent web-storage area) and sends it as 'Authorization:
-// Bearer <token>' on EVERY /api/* fetch.
-// The OPEN endpoints (/api/health, /api/cluster) need no token and always
-// render, so the header and cluster overview show even when signed out. A 401
-// on a privileged panel reveals the sign-in affordance and marks that panel
-// "sign in to view"; a 403 marks it "insufficient privileges". The token is
-// held only in sessionStorage and is sent only as a request header: it is
-// NEVER inserted into the DOM/HTML, never put in a URL/query, and never logged.
-// On the loopback dev default (no token configured) the privileged routes
-// return 200 with no token, so everything renders without signing in.
+// operator token from sessionStorage (tab-scoped; never the persistent
+// web-storage area) and sends it as 'Authorization: Bearer <token>' on EVERY
+// /api/* fetch. The OPEN endpoints (/api/health, /api/cluster) need no token and
+// always render. A 401 on a privileged view reveals the sign-in affordance and
+// marks that view "sign in to view"; a 403 marks it "insufficient privileges".
+// The token is held only in sessionStorage and is sent only as a request
+// header: it is NEVER inserted into the DOM/HTML, never put in a URL/query, and
+// never logged.
 
 "use strict";
 
@@ -32,15 +38,21 @@
   // Poll every 5 seconds (the task's cadence).
   var POLL_MS = 5000;
 
-  // sessionStorage key for the operator token. sessionStorage (the tab-scoped
-  // web-storage area, NOT the persistent one) so the token is cleared when the
-  // tab closes. The token is read back only to build the Authorization header;
-  // it is never written to the DOM and never logged.
+  // sessionStorage key for the operator token (tab-scoped; cleared on tab
+  // close). Read back only to build the Authorization header; never DOM'd or
+  // logged.
   var TOKEN_KEY = "ic_console_token";
 
+  // sessionStorage key for the chosen theme ("light" / "dark"). A non-secret UI
+  // preference; kept in the tab-scoped web-storage area (the same one the token
+  // uses, never the persistent area) to keep the served script free of the
+  // persistent web-storage API.
+  var THEME_KEY = "ic_console_theme";
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
   // The endpoints that need a Bearer token when the console is exposed
-  // (PRIVILEGED_READ in auth.rs). Used to decide which panels show a "sign in
-  // to view" / "insufficient privileges" placeholder on 401 / 403.
+  // (PRIVILEGED_READ in auth.rs).
   var PRIVILEGED_KEYS = {
     nodes: true,
     slowlog: true,
@@ -48,9 +60,23 @@
     keyspace: true,
   };
 
-  // Read the operator token from sessionStorage, or "" when none is stored.
-  // sessionStorage access can throw (e.g. a privacy mode that disables it), so
-  // it is guarded; a failure just means "no token" (the dev path still works).
+  // The per-section page title + subtitle shown in the topbar.
+  var SECTION_META = {
+    overview: { title: "Overview", subtitle: "Live cluster metrics" },
+    nodes: { title: "Nodes", subtitle: "Per-node health and capacity" },
+    slowlog: { title: "Slowlog", subtitle: "Slowest recent commands" },
+    clients: { title: "Clients", subtitle: "Connected clients" },
+    keyspace: { title: "Keyspace", subtitle: "Keys per database" },
+    cluster: { title: "Cluster", subtitle: "Slot map and roster" },
+    replication: { title: "Replication", subtitle: "Replica streams" },
+    shards: { title: "Shards", subtitle: "Per-shard breakdown" },
+    console: { title: "Console", subtitle: "Interactive commands" },
+    pubsub: { title: "Pub/Sub", subtitle: "Channels and subscribers" },
+    config: { title: "Config", subtitle: "Runtime configuration" },
+    acl: { title: "ACL", subtitle: "Users and permissions" },
+  };
+
+  // ----- token storage (auth) ----------------------------------------------
   function getToken() {
     try {
       return window.sessionStorage.getItem(TOKEN_KEY) || "";
@@ -59,9 +85,6 @@
     }
   }
 
-  // Persist the operator token in sessionStorage. The raw value is never
-  // logged. A storage failure is swallowed (the fetch path then runs as if
-  // signed out).
   function setToken(token) {
     try {
       window.sessionStorage.setItem(TOKEN_KEY, token);
@@ -70,7 +93,6 @@
     }
   }
 
-  // Remove the operator token from sessionStorage (sign out).
   function clearToken() {
     try {
       window.sessionStorage.removeItem(TOKEN_KEY);
@@ -79,8 +101,7 @@
     }
   }
 
-  // The last-good rendered data, kept so a transient fetch error shows a banner
-  // but does NOT blank the dashboard.
+  // ----- runtime state ------------------------------------------------------
   var lastGood = {
     cluster: null,
     nodes: null,
@@ -90,21 +111,85 @@
     health: null,
   };
 
-  // The most recent cluster last_poll_unixtime, used to tick the "last poll age"
-  // against the browser clock between fetches.
-  var lastPollUnixtime = null;
-  var ageTimer = null;
+  // The currently selected section (client-side nav).
+  var activeSection = "overview";
+
+  // Whether live polling is on (the Live toggle). When off, the interval still
+  // exists but skips the network work.
+  var liveOn = true;
+  var pollTimer = null;
+
+  // The rolling ops/second buffer for the sparkline (last ~60s => 12 samples at
+  // the 5s cadence). Each entry is a derived ops/s rate.
+  var SPARK_MAX = 12;
+  var opsBuffer = [];
+  // The previous commands_processed counter + the wall-clock ms it was read, so
+  // the next poll can difference them into an ops/s rate (the honest derivation
+  // the task calls for; the counter itself is the new backend field).
+  var prevCommands = null;
+  var prevCommandsAt = null;
 
   function byId(id) {
     return document.getElementById(id);
   }
 
-  // Replace all children of a node with a single text node. Safe: textContent
-  // assignment never parses HTML.
   function setText(el, text) {
     if (el) {
       el.textContent = text;
     }
+  }
+
+  // ----- formatting (pure number/text; no server string is interpreted) -----
+  function fmtBytes(n) {
+    if (n == null || isNaN(n)) {
+      return { value: "-", unit: "" };
+    }
+    var units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    var v = Number(n);
+    var i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i += 1;
+    }
+    var s = i === 0 ? String(v) : v.toFixed(1);
+    return { value: s, unit: units[i] };
+  }
+
+  function fmtBytesShort(n) {
+    var b = fmtBytes(n);
+    if (b.unit === "") {
+      return b.value;
+    }
+    return b.value + " " + b.unit;
+  }
+
+  function fmtNum(n) {
+    if (n == null || isNaN(n)) {
+      return "-";
+    }
+    return Number(n).toLocaleString();
+  }
+
+  function fmtRatioPct(r) {
+    if (r == null || isNaN(r)) {
+      return "-";
+    }
+    return (Number(r) * 100).toFixed(1);
+  }
+
+  function fmtRatio(r) {
+    if (r == null || isNaN(r)) {
+      return "-";
+    }
+    return (Number(r) * 100).toFixed(1) + "%";
+  }
+
+  function fmtTime(unixSeconds) {
+    if (unixSeconds == null || isNaN(unixSeconds)) {
+      return "-";
+    }
+    var d = new Date(Number(unixSeconds) * 1000);
+    return d.toLocaleString();
   }
 
   // Build a <td> whose text is `text` (a string), optionally with a class. The
@@ -118,18 +203,16 @@
     return cell;
   }
 
-  // A <td> carrying a status pill (reachable / unreachable).
+  // A <td> carrying a reachable/unreachable status pill.
   function pillCell(ok) {
     var cell = document.createElement("td");
     var span = document.createElement("span");
     span.className = ok ? "pill pill-ok" : "pill pill-bad";
-    span.appendChild(document.createTextNode(ok ? "yes" : "no"));
+    span.appendChild(document.createTextNode(ok ? "reachable" : "down"));
     cell.appendChild(span);
     return cell;
   }
 
-  // Replace a <tbody>'s rows with the given row elements, or a single "empty"
-  // placeholder row when there are none.
   function fillBody(tbody, rows, colspan, emptyText) {
     if (!tbody) {
       return;
@@ -150,84 +233,7 @@
     }
   }
 
-  // Format a byte count into a short human string. Pure number formatting; no
-  // server string is interpreted.
-  function fmtBytes(n) {
-    if (n == null || isNaN(n)) {
-      return "-";
-    }
-    var units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    var v = Number(n);
-    var i = 0;
-    while (v >= 1024 && i < units.length - 1) {
-      v /= 1024;
-      i += 1;
-    }
-    var s = i === 0 ? String(v) : v.toFixed(1);
-    return s + " " + units[i];
-  }
-
-  function fmtNum(n) {
-    if (n == null || isNaN(n)) {
-      return "-";
-    }
-    return Number(n).toLocaleString();
-  }
-
-  function fmtRatio(r) {
-    if (r == null || isNaN(r)) {
-      return "-";
-    }
-    return (Number(r) * 100).toFixed(1) + "%";
-  }
-
-  // Format a unix-seconds timestamp via the browser locale. The value is a
-  // number; the result is plain text inserted with textContent.
-  function fmtTime(unixSeconds) {
-    if (unixSeconds == null || isNaN(unixSeconds)) {
-      return "-";
-    }
-    var d = new Date(Number(unixSeconds) * 1000);
-    return d.toLocaleString();
-  }
-
-  // Compute the "last poll N seconds ago" string from the server's
-  // last_poll_unixtime against the browser clock.
-  function pollAgeText() {
-    if (lastPollUnixtime == null) {
-      return "-";
-    }
-    var nowSec = Math.floor(Date.now() / 1000);
-    var age = nowSec - lastPollUnixtime;
-    if (age < 0) {
-      age = 0;
-    }
-    if (age < 60) {
-      return age + "s ago";
-    }
-    if (age < 3600) {
-      return Math.floor(age / 60) + "m ago";
-    }
-    return Math.floor(age / 3600) + "h ago";
-  }
-
-  function updatePollAge() {
-    var el = byId("hdr-poll");
-    if (!el) {
-      return;
-    }
-    setText(el, pollAgeText());
-    // A poll older than 3x the interval is visibly stale.
-    if (lastPollUnixtime != null) {
-      var age = Math.floor(Date.now() / 1000) - lastPollUnixtime;
-      if (age > (POLL_MS / 1000) * 3) {
-        el.classList.add("stale");
-      } else {
-        el.classList.remove("stale");
-      }
-    }
-  }
-
+  // ----- banners / waiting / login -----------------------------------------
   function showBanner(message) {
     var b = byId("banner");
     if (!b) {
@@ -253,10 +259,6 @@
     }
   }
 
-  // Reveal or hide the sign-in panel. Revealed when a privileged fetch 401s; the
-  // operator can also keep it open to sign out. `statusText` is an optional
-  // short, NON-secret message (e.g. "insufficient privileges") shown in the
-  // panel; it never contains the token.
   function showLogin(on, statusText) {
     var panel = byId("login-panel");
     if (panel) {
@@ -274,9 +276,6 @@
     }
   }
 
-  // The tbody id and column count for each privileged panel, so a 401/403 can
-  // render a single-row placeholder ("sign in to view" / "insufficient
-  // privileges") instead of an error banner.
   var PRIVILEGED_PANELS = {
     nodes: { body: "nodes-body", cols: 8 },
     slowlog: { body: "slowlog-body", cols: 5 },
@@ -284,9 +283,6 @@
     keyspace: { body: "keyspace-body", cols: 4 },
   };
 
-  // Render a privileged panel's placeholder row with a fixed, NON-secret message.
-  // Used when a privileged fetch returns 401 (sign in) or 403 (insufficient
-  // privileges) so the panel reads as a prompt, not an error.
   function renderPanelPlaceholder(key, message) {
     var panel = PRIVILEGED_PANELS[key];
     if (!panel) {
@@ -298,32 +294,245 @@
     fillBody(byId(panel.body), [], panel.cols, message);
   }
 
-  // Render the cluster overview header + totals cards.
-  function renderCluster(data) {
-    setText(byId("hdr-mode"), data.mode || "-");
-    setText(
-      byId("hdr-nodes"),
-      (data.nodes_reachable != null ? data.nodes_reachable : "-") +
-        " / " +
-        (data.nodes_total != null ? data.nodes_total : "-")
+  // ----- overview: metric cards + nodes summary + sparkline -----------------
+  function deriveOps(commands) {
+    // Difference the cumulative commands_processed counter against the previous
+    // poll to get an ops/second rate (the honest derivation: a per-second rate
+    // from two cumulative samples and the elapsed wall time).
+    if (commands == null || isNaN(commands)) {
+      return null;
+    }
+    var nowMs = Date.now();
+    var ops = null;
+    if (prevCommands != null && prevCommandsAt != null) {
+      var dt = (nowMs - prevCommandsAt) / 1000;
+      var dc = Number(commands) - prevCommands;
+      if (dt > 0 && dc >= 0) {
+        ops = dc / dt;
+      }
+    }
+    prevCommands = Number(commands);
+    prevCommandsAt = nowMs;
+    return ops;
+  }
+
+  function pushOps(ops) {
+    if (ops == null || isNaN(ops)) {
+      return;
+    }
+    opsBuffer.push(ops);
+    while (opsBuffer.length > SPARK_MAX) {
+      opsBuffer.shift();
+    }
+  }
+
+  // Render the sparkline as inline SVG built with createElementNS (element nodes,
+  // never a raw-HTML sink). The viewBox is 600x160 (from index.html); geometry
+  // is computed in those units. A path is built only with two or more samples.
+  function renderSparkline() {
+    var svg = byId("spark");
+    var empty = byId("spark-empty");
+    if (!svg) {
+      return;
+    }
+    while (svg.firstChild) {
+      svg.removeChild(svg.firstChild);
+    }
+    if (opsBuffer.length < 2) {
+      if (empty) {
+        empty.hidden = false;
+      }
+      return;
+    }
+    if (empty) {
+      empty.hidden = true;
+    }
+    var W = 600;
+    var H = 160;
+    var pad = 8;
+    var max = 0;
+    for (var i = 0; i < opsBuffer.length; i++) {
+      if (opsBuffer[i] > max) {
+        max = opsBuffer[i];
+      }
+    }
+    if (max <= 0) {
+      max = 1;
+    }
+    var n = opsBuffer.length;
+    var stepX = (W - pad * 2) / (n - 1);
+    var coords = [];
+    for (var j = 0; j < n; j++) {
+      var x = pad + stepX * j;
+      var y = H - pad - (opsBuffer[j] / max) * (H - pad * 2);
+      coords.push([x, y]);
+    }
+    var line = "";
+    var fill = "M " + coords[0][0].toFixed(1) + " " + (H - pad).toFixed(1);
+    for (var k = 0; k < coords.length; k++) {
+      var cmd = k === 0 ? "M" : "L";
+      line += (k === 0 ? "" : " ") + cmd + " " + coords[k][0].toFixed(1) + " " + coords[k][1].toFixed(1);
+      fill += " L " + coords[k][0].toFixed(1) + " " + coords[k][1].toFixed(1);
+    }
+    fill += " L " + coords[coords.length - 1][0].toFixed(1) + " " + (H - pad).toFixed(1) + " Z";
+
+    var fillPath = document.createElementNS(SVG_NS, "path");
+    fillPath.setAttribute("d", fill);
+    fillPath.setAttribute("class", "spark-fill");
+    svg.appendChild(fillPath);
+
+    var linePath = document.createElementNS(SVG_NS, "path");
+    linePath.setAttribute("d", line);
+    linePath.setAttribute("class", "spark-line");
+    svg.appendChild(linePath);
+  }
+
+  // Build one node-summary row for the overview "Nodes" card. `maxMem` is the
+  // largest used_memory across nodes, so the bar is relative within the cluster.
+  function nodeSummaryRow(node, maxMem) {
+    var row = document.createElement("div");
+    row.className = "node-row";
+
+    var chip = document.createElement("span");
+    chip.className = "node-chip";
+    if (!node.reachable) {
+      chip.classList.add("node-chip-down");
+    }
+    row.appendChild(chip);
+
+    var main = document.createElement("div");
+    main.className = "node-row-main";
+    var idLine = document.createElement("span");
+    idLine.className = "node-row-id mono";
+    idLine.appendChild(document.createTextNode(node.addr == null ? "-" : node.addr));
+    main.appendChild(idLine);
+
+    var meta = document.createElement("div");
+    meta.className = "node-row-meta";
+    var role = document.createElement("span");
+    // Standalone today; the role is honest (no fabricated leader/replica).
+    role.className = "role-pill role-standalone";
+    role.appendChild(document.createTextNode("standalone"));
+    meta.appendChild(role);
+
+    var bar = document.createElement("span");
+    bar.className = "mem-bar";
+    var barFill = document.createElement("span");
+    barFill.className = "mem-bar-fill";
+    var frac = 0;
+    if (maxMem > 0 && node.used_memory != null) {
+      frac = Math.max(0, Math.min(1, Number(node.used_memory) / maxMem));
+    }
+    // CSP-clean dynamic styling: set the fraction as a CSS custom property; the
+    // width is computed from it in app.css (no inline style attribute).
+    barFill.style.setProperty("--mem-frac", String(frac));
+    bar.appendChild(barFill);
+    meta.appendChild(bar);
+    main.appendChild(meta);
+    row.appendChild(main);
+
+    var side = document.createElement("div");
+    side.className = "node-row-side";
+    var status = document.createElement("span");
+    status.className = node.reachable ? "pill pill-ok" : "pill pill-bad";
+    status.appendChild(document.createTextNode(node.reachable ? "up" : "down"));
+    side.appendChild(status);
+    var memText = document.createElement("span");
+    memText.className = "node-row-ops";
+    memText.appendChild(
+      document.createTextNode(node.used_memory == null ? "-" : fmtBytesShort(node.used_memory))
     );
-    lastPollUnixtime = data.last_poll_unixtime != null ? data.last_poll_unixtime : null;
-    updatePollAge();
+    side.appendChild(memText);
+    row.appendChild(side);
+    return row;
+  }
+
+  function renderNodeSummary(nodes) {
+    var container = byId("node-rows");
+    if (!container) {
+      return;
+    }
+    while (container.firstChild) {
+      container.removeChild(container.firstChild);
+    }
+    setText(byId("nodes-summary-count"), nodes.length + (nodes.length === 1 ? " node" : " nodes"));
+    if (!nodes || nodes.length === 0) {
+      var p = document.createElement("p");
+      p.className = "placeholder";
+      p.appendChild(document.createTextNode("No nodes."));
+      container.appendChild(p);
+      return;
+    }
+    var maxMem = 0;
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].used_memory != null && Number(nodes[i].used_memory) > maxMem) {
+        maxMem = Number(nodes[i].used_memory);
+      }
+    }
+    for (var j = 0; j < nodes.length; j++) {
+      container.appendChild(nodeSummaryRow(nodes[j], maxMem));
+    }
+  }
+
+  // ----- cluster pill + topbar state ---------------------------------------
+  function renderClusterPill(data) {
+    var dot = byId("cluster-dot");
+    var label = byId("cluster-pill-label");
+    var count = byId("cluster-pill-count");
+    var reachable = data.nodes_reachable != null ? data.nodes_reachable : 0;
+    var total = data.nodes_total != null ? data.nodes_total : 0;
+    if (dot) {
+      dot.className = "dot " + (reachable > 0 ? "dot-ok" : "dot-bad");
+    }
+    if (label) {
+      setText(label, data.mode === "clustered" ? "Clustered" : "Standalone");
+    }
+    if (count) {
+      setText(count, reachable + "/" + total);
+    }
+  }
+
+  // ----- renderers (one per /api/* endpoint) -------------------------------
+  function renderCluster(data) {
+    renderClusterPill(data);
 
     var t = data.totals || {};
-    setText(byId("t-keys"), fmtNum(t.keys));
-    setText(byId("t-mem"), fmtBytes(t.used_memory));
-    setText(byId("t-clients"), fmtNum(t.connected_clients));
+
+    // Throughput: derive ops/s from the cumulative commands_processed counter.
+    // The first poll has no previous sample to difference, so it shows 0 until
+    // the second poll establishes a rate.
+    var ops = deriveOps(t.commands_processed);
+    var throughputEl = byId("m-throughput");
+    if (throughputEl) {
+      if (ops != null) {
+        setText(throughputEl, Math.round(ops).toLocaleString());
+      } else if (throughputEl.textContent === "-") {
+        setText(throughputEl, "0");
+      }
+    }
+    pushOps(ops == null ? 0 : ops);
+    renderSparkline();
+
+    // Hit rate.
     var hits = Number(t.keyspace_hits || 0);
     var misses = Number(t.keyspace_misses || 0);
     var ratio = hits + misses > 0 ? hits / (hits + misses) : null;
-    setText(byId("t-hit"), fmtRatio(ratio));
-    setText(byId("t-evict"), fmtNum(t.evicted_keys));
-    setText(byId("t-expire"), fmtNum(t.expired_keys));
+    setText(byId("m-hitrate"), fmtRatioPct(ratio));
+
+    // Memory.
+    var mem = fmtBytes(t.used_memory);
+    setText(byId("m-memory"), mem.value);
+    setText(byId("m-memory-unit"), mem.unit);
+
+    // Keys + clients.
+    setText(byId("m-keys"), fmtNum(t.keys));
+    setText(byId("m-clients"), fmtNum(t.connected_clients));
   }
 
-  // Render the per-node table from the /api/nodes array.
   function renderNodes(nodes) {
+    // The overview's node-summary card + the Nodes table both come from here.
+    renderNodeSummary(nodes);
+
     var rows = [];
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i];
@@ -331,7 +540,7 @@
       tr.appendChild(td(n.addr, "mono"));
       tr.appendChild(pillCell(!!n.reachable));
       tr.appendChild(td(n.version == null ? "-" : n.version));
-      tr.appendChild(td(fmtBytes(n.used_memory), "num"));
+      tr.appendChild(td(n.used_memory == null ? "-" : fmtBytesShort(n.used_memory), "num"));
       tr.appendChild(td(fmtNum(n.keys), "num"));
       tr.appendChild(td(fmtNum(n.connected_clients), "num"));
       tr.appendChild(td(fmtRatio(n.hit_ratio), "num"));
@@ -339,11 +548,9 @@
       rows.push(tr);
     }
     fillBody(byId("nodes-body"), rows, 8, "No nodes.");
+    populateNodeSelect(nodes);
   }
 
-  // Render the slowlog table from the /api/slowlog per-node shape. The argv
-  // contains KEY NAMES from a possibly-compromised node, so it is joined into a
-  // plain string and inserted via textContent only.
   function renderSlowlog(payload) {
     var rows = [];
     var nodes = (payload && payload.nodes) || [];
@@ -379,7 +586,6 @@
     fillBody(byId("slowlog-body"), rows, 5, "No slow commands.");
   }
 
-  // Render the clients table from the /api/clients per-node shape.
   function renderClients(payload) {
     var rows = [];
     var nodes = (payload && payload.nodes) || [];
@@ -412,7 +618,6 @@
     fillBody(byId("clients-body"), rows, 7, "No clients.");
   }
 
-  // Render the keyspace panel from /api/keyspace.
   function renderKeyspace(data) {
     setText(byId("ks-total"), fmtNum(data.total_keys));
     var rows = [];
@@ -431,16 +636,44 @@
 
   function renderHealth(data) {
     if (data && data.version) {
-      setText(byId("hdr-version"), data.version);
+      setText(byId("sidebar-version"), data.version);
     }
   }
 
-  // Fetch one endpoint, returning { status, body } where body is the parsed JSON
-  // (or null). Network failures reject so the caller can keep last-good data.
-  //
-  // When an operator token is stored, it is sent as 'Authorization: Bearer
-  // <token>' on EVERY /api/* request. The token goes into a request header only:
-  // it is never appended to `path` (no token in a URL/query) and never logged.
+  // Populate the topbar node selector from the live node list (the addresses are
+  // server strings, so each option's text is set via textContent through the
+  // Option constructor's first arg, which is a text label, not markup).
+  function populateNodeSelect(nodes) {
+    var sel = byId("node-select");
+    if (!sel) {
+      return;
+    }
+    var current = sel.value;
+    while (sel.firstChild) {
+      sel.removeChild(sel.firstChild);
+    }
+    var all = document.createElement("option");
+    all.value = "all";
+    all.appendChild(document.createTextNode("All nodes"));
+    sel.appendChild(all);
+    for (var i = 0; i < nodes.length; i++) {
+      var opt = document.createElement("option");
+      opt.value = nodes[i].addr == null ? "" : nodes[i].addr;
+      opt.appendChild(document.createTextNode(nodes[i].addr == null ? "-" : nodes[i].addr));
+      sel.appendChild(opt);
+    }
+    // Keep the prior selection if it still exists.
+    var keep = false;
+    for (var j = 0; j < sel.options.length; j++) {
+      if (sel.options[j].value === current) {
+        keep = true;
+        break;
+      }
+    }
+    sel.value = keep ? current : "all";
+  }
+
+  // ----- fetch --------------------------------------------------------------
   function fetchJson(path) {
     var headers = { Accept: "application/json" };
     var token = getToken();
@@ -462,10 +695,10 @@
     });
   }
 
-  // One full refresh cycle. Health does not depend on a poll; the data
-  // endpoints return 503 until the first node poll completes, which is rendered
-  // as the "waiting" state (and the last-good data is kept).
   function refresh() {
+    if (!liveOn) {
+      return;
+    }
     fetchJson("/api/health")
       .then(function (r) {
         if (r.status === 200 && r.body) {
@@ -477,9 +710,6 @@
         // Health failing is reported by the data-endpoint banner below.
       });
 
-    // `/api/cluster` is OPEN (no token needed), so it renders in every posture.
-    // The other four are PRIVILEGED_READ: on an exposed/authed console they 401
-    // without a token and 403 with an under-privileged one.
     var endpoints = [
       { path: "/api/cluster", key: "cluster", render: renderCluster },
       { path: "/api/nodes", key: "nodes", render: renderNodes },
@@ -502,8 +732,8 @@
       var anyNetworkError = false;
       var anyWaiting = false;
       var anyOk = false;
-      var anyUnauthorized = false; // a privileged route returned 401
-      var anyForbidden = false; // a privileged route returned 403
+      var anyUnauthorized = false;
+      var anyForbidden = false;
 
       for (var i = 0; i < results.length; i++) {
         var res = results[i];
@@ -514,14 +744,11 @@
           continue;
         }
         if (res.status === 401 && privileged) {
-          // Exposed/authed console, no usable token: prompt for sign-in and
-          // render the panel as "sign in to view" rather than an error.
           anyUnauthorized = true;
           renderPanelPlaceholder(key, "Sign in to view.");
           continue;
         }
         if (res.status === 403 && privileged) {
-          // A valid token of an insufficient tier.
           anyForbidden = true;
           renderPanelPlaceholder(key, "Insufficient privileges.");
           continue;
@@ -537,30 +764,20 @@
         }
       }
 
-      // Reveal the sign-in panel whenever a privileged route 401'd. A 403 (token
-      // present but under-privileged) also keeps it open so the operator can
-      // sign out and try another token; show a short, non-secret reason.
       if (anyUnauthorized) {
         showLogin(true, getToken() ? "The stored token was not accepted." : "");
       } else if (anyForbidden) {
         showLogin(true, "The token does not grant the required tier.");
       } else if (anyOk) {
-        // A privileged route succeeded, so the current credential works (or the
-        // dev loopback path needs none): hide the sign-in prompt.
         showLogin(false);
       }
 
-      // The "waiting for the first poll" state: data endpoints are 503 and we
-      // have nothing good yet. Keep retrying (the interval timer continues).
       if (anyWaiting && !anyOk) {
         showWaiting(true);
       } else {
         showWaiting(false);
       }
 
-      // A network error shows a banner but keeps the last-good panels intact. An
-      // auth challenge (401/403) is NOT an error banner: it is surfaced through
-      // the sign-in panel and the per-panel placeholders above.
       if (anyNetworkError) {
         showBanner(
           "Could not reach the console API; showing the last known data. Retrying every " +
@@ -573,11 +790,127 @@
     });
   }
 
-  // Wire the sign-in / sign-out controls. The handlers are attached with
-  // addEventListener (CSP forbids inline event-handler attributes), never log
-  // the token, and never write it to the DOM. After updating sessionStorage they
-  // trigger a refresh so the privileged panels re-fetch with (or without) the
-  // credential.
+  // ----- navigation (client-side section switch) ---------------------------
+  function setActiveSection(section) {
+    if (!SECTION_META[section]) {
+      section = "overview";
+    }
+    activeSection = section;
+
+    var items = document.getElementsByClassName("nav-item");
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].getAttribute("data-section") === section) {
+        items[i].classList.add("active");
+      } else {
+        items[i].classList.remove("active");
+      }
+    }
+
+    var panels = document.querySelectorAll("[data-section-panel]");
+    for (var j = 0; j < panels.length; j++) {
+      panels[j].hidden = panels[j].getAttribute("data-section-panel") !== section;
+    }
+
+    var meta = SECTION_META[section];
+    setText(byId("page-title"), meta.title);
+    setText(byId("page-subtitle"), meta.subtitle);
+  }
+
+  function wireNav() {
+    var items = document.getElementsByClassName("nav-item");
+    for (var i = 0; i < items.length; i++) {
+      (function (el) {
+        el.addEventListener("click", function () {
+          setActiveSection(el.getAttribute("data-section"));
+        });
+      })(items[i]);
+    }
+  }
+
+  // ----- theme --------------------------------------------------------------
+  function applyTheme(theme) {
+    var root = document.documentElement;
+    if (theme === "dark") {
+      root.setAttribute("data-theme", "dark");
+    } else {
+      root.removeAttribute("data-theme");
+    }
+  }
+
+  function storedTheme() {
+    try {
+      return window.sessionStorage.getItem(THEME_KEY) || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function storeTheme(theme) {
+    try {
+      window.sessionStorage.setItem(THEME_KEY, theme);
+    } catch (e) {
+      // No-op: a privacy mode may disable storage; the theme stays for the page
+      // lifetime via the data-theme attribute regardless.
+    }
+  }
+
+  function initTheme() {
+    var theme = storedTheme();
+    if (theme !== "dark" && theme !== "light") {
+      // Default to the OS preference on first load.
+      theme =
+        window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+          ? "dark"
+          : "light";
+    }
+    applyTheme(theme);
+  }
+
+  function wireThemeToggle() {
+    var btn = byId("theme-toggle");
+    if (!btn) {
+      return;
+    }
+    btn.addEventListener("click", function () {
+      var isDark = document.documentElement.getAttribute("data-theme") === "dark";
+      var next = isDark ? "light" : "dark";
+      applyTheme(next);
+      storeTheme(next);
+      // Re-stroke the sparkline so its theme-conditional color refreshes.
+      renderSparkline();
+    });
+  }
+
+  // ----- live toggle + manual refresh --------------------------------------
+  function wireLiveToggle() {
+    var btn = byId("live-toggle");
+    if (!btn) {
+      return;
+    }
+    btn.addEventListener("click", function () {
+      liveOn = !liveOn;
+      btn.setAttribute("aria-pressed", liveOn ? "true" : "false");
+      if (liveOn) {
+        refresh();
+      }
+    });
+  }
+
+  function wireRefresh() {
+    var btn = byId("refresh-btn");
+    if (!btn) {
+      return;
+    }
+    btn.addEventListener("click", function () {
+      // A manual refresh runs even when live is paused (a one-shot poll).
+      var wasLive = liveOn;
+      liveOn = true;
+      refresh();
+      liveOn = wasLive;
+    });
+  }
+
+  // ----- auth controls ------------------------------------------------------
   function wireAuthControls() {
     var form = byId("login-form");
     var input = byId("login-token");
@@ -590,13 +923,11 @@
           return;
         }
         var token = (input.value || "").trim();
-        // Clear the input immediately so the token does not linger in the field.
         input.value = "";
         if (token) {
           setToken(token);
           showLogin(false);
         } else {
-          // An empty submit signs out (treat as "no token").
           clearToken();
         }
         refresh();
@@ -609,8 +940,6 @@
         if (input) {
           input.value = "";
         }
-        // Keep the panel open with a confirmation; the next privileged 401 will
-        // already be reflected by the panel placeholders on the coming refresh.
         showLogin(true, "Signed out.");
         refresh();
       });
@@ -618,14 +947,15 @@
   }
 
   function start() {
-    // Wire the sign-in / sign-out controls before the first fetch.
+    initTheme();
+    wireNav();
+    wireThemeToggle();
+    wireLiveToggle();
+    wireRefresh();
     wireAuthControls();
-    // Tick the poll-age display every second so it counts up between fetches.
-    if (ageTimer == null) {
-      ageTimer = setInterval(updatePollAge, 1000);
-    }
+    setActiveSection("overview");
     refresh();
-    setInterval(refresh, POLL_MS);
+    pollTimer = setInterval(refresh, POLL_MS);
   }
 
   if (document.readyState === "loading") {
