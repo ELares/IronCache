@@ -47,4 +47,9 @@ pub mod test_support;
 /// deploy reaches `cluster_state:ok` with all slots assigned WITHOUT a manual `CLUSTER MEET` /
 /// `ADDSLOTS`. Idempotent + fresh-only (never re-bootstraps / clobbers a committed config).
 pub mod turnkey_bootstrap;
+/// `ironcache upgrade`: the operator-run, verified (sha256), data-safe (SAVE-first), health-gated,
+/// auto-rolling-back binary self-updater (#387 mechanism). The signature anchor (#386), HTTPS
+/// auto-fetch, and the lossless write-freeze (#388) are explicit follow-ups with seams left here
+/// (the `Verifier`/`BinarySource` traits). Operator-run + privileged; NEVER a RESP surface.
+pub mod upgrade;
 pub mod whole_keyspace;

@@ -108,6 +108,34 @@ release.
 
 ### Added
 
+- `ironcache upgrade` now performs a verified (sha256), data-safe (SAVE-first),
+  health-gated, auto-rolling-back binary self-update (issue #387). The operator
+  supplies a new binary with `--binary` and a release `--sha256sums`; the command
+  verifies the binary's SHA-256 against its manifest entry, sanity-checks the new
+  binary runs and reports its version (under a subprocess timeout, since the new
+  binary is untrusted), triggers a synchronous fsync'd `SAVE` and confirms
+  `LASTSAVE` advanced so the in-memory working set survives the restart (warning
+  loudly and requiring `--yes` when no persistence is configured), pre-flights the
+  `/readyz` health endpoint before touching disk, swaps the on-disk binary with a
+  NEVER-ABSENT single-rename idiom (stage `.new`, hard-link/copy the current binary
+  to the one retained `.old` rollback slot, then one atomic rename onto the target,
+  so the `ExecStart` path is never momentarily missing and the live executable is
+  never opened for write -- no ETXTBSY; a symlink target is refused, not clobbered),
+  restarts the systemd unit, then health-gates the restarted server: it confirms
+  the process actually RESTARTED and STABILIZED (the scraped
+  `ironcache_uptime_seconds` reset below the pre-restart baseline and then crossed a
+  5s stabilization window, so a no-op restart / stale process / crash-loop cannot
+  pass), plus `/readyz` 200, `PING`/PONG, and the exact target version. On any
+  health-gate miss it auto-rolls-back to the prior binary while PRESERVING the
+  `.old` slot (so a subsequent failed upgrade can still roll back), unless
+  `--no-rollback`. It is operator-run and privileged, never a RESP surface.
+  OPERATOR NOTE: a non-interactive invocation (piped/cron, no TTY) MUST pass
+  `--yes` -- with no TTY the confirm prompt reads as a decline and the upgrade
+  aborts. The cryptographic signature anchor (#386), HTTPS/GitHub auto-fetch, and
+  the lossless write-freeze (#388) are explicit follow-ups, with the `Verifier`,
+  `BinarySource`, and `Saver` trait seams left in place for them. The packaged
+  systemd unit's `ExecStart` now passes `--metrics-addr 127.0.0.1:9121` so the
+  upgrade health gate's `/readyz` + `/metrics` endpoint is served.
 - IronCache Console node-level MANAGEMENT layer (issue #361, single-node subset):
   the console becomes a bounded WRITE surface against one node, not just a monitor.
   New admin-tier write endpoints (`CONFIG SET`, key CRUD over `POST`/`DELETE

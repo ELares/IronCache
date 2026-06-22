@@ -82,10 +82,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Check) => cmd_check(&cli),
         Some(Command::Config) => cmd_config(&cli),
-        Some(Command::Upgrade) => {
-            cmd_upgrade();
-            Ok(())
-        }
+        Some(Command::Upgrade(args)) => cmd_upgrade(args),
     }
 }
 
@@ -411,9 +408,58 @@ fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_upgrade() {
-    // Stub (CLI_BINARY.md / #83): verified self-update with rollback.
-    tracing::warn!("ironcache upgrade: not yet implemented (tracked by #83)");
+/// `ironcache upgrade` (#387): the verified, data-safe, health-gated, auto-rolling-back binary
+/// self-updater. Translates the clap [`cli::UpgradeArgs`] into the module's resolved
+/// [`ironcache::upgrade::UpgradeArgs`] (reading the auth password from its FILE so it never lands in
+/// argv/logs), then drives the orchestrator. A failure is surfaced as a nonzero exit via the
+/// returned `anyhow::Result`; the structured per-step logging lives in the module.
+fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
+    use ironcache::upgrade;
+
+    // Read the optional auth password from its file (keeps the secret out of argv/logs).
+    let auth = upgrade::read_auth_file(args.auth_file.as_deref())
+        .context("reading the --auth-file password")?;
+
+    let resolved = upgrade::UpgradeArgs {
+        binary: args.binary.clone(),
+        sha256sums: args.sha256sums.clone(),
+        target: args.target.clone(),
+        unit: args.unit.clone(),
+        readyz_addr: args.readyz_addr.clone(),
+        resp_addr: args.resp_addr.clone(),
+        auth,
+        health_timeout: std::time::Duration::from_secs(args.health_timeout),
+        no_rollback: args.no_rollback,
+        yes: args.yes,
+        allow_same: args.allow_same,
+    };
+
+    match upgrade::run(&resolved) {
+        Ok(outcome) => {
+            tracing::info!(
+                version = %outcome.installed_version,
+                previous = outcome.previous_version.as_deref().unwrap_or("(unknown)"),
+                save_confirmed = outcome.save_confirmed,
+                "ironcache upgrade: SUCCESS"
+            );
+            println!(
+                "upgrade succeeded: now running {} (was {}){}",
+                outcome.installed_version,
+                outcome.previous_version.as_deref().unwrap_or("unknown"),
+                if outcome.save_confirmed {
+                    ""
+                } else {
+                    " [WARNING: no persisted snapshot was confirmed; in-memory data was not saved]"
+                },
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "ironcache upgrade: FAILED");
+            // Propagate as a nonzero exit; anyhow prints the full error chain.
+            Err(anyhow::Error::new(e).context("ironcache upgrade failed"))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -21,7 +21,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/ironcache server
+# `--metrics-addr` exposes /metrics, /livez, /readyz on loopback. This is REQUIRED for
+# `ironcache upgrade`: its health gate probes /readyz + scrapes /metrics (ironcache_uptime_seconds)
+# at 127.0.0.1:9121 by default, and pre-flights that endpoint before swapping. Without it every
+# upgrade's health gate would be connection-refused and would auto-roll-back a healthy binary.
+ExecStart=/usr/local/bin/ironcache server --metrics-addr 127.0.0.1:9121
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s

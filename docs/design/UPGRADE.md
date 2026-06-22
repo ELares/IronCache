@@ -60,20 +60,36 @@ directory (the same filesystem, so `rename(2)` is atomic), then swapped onto the
 live `ironcache` path. We borrow the self-update atomic-rename pattern from #81:
 the new file is placed next to the current executable and an atomic rename swap
 is performed, which on Unix you can do even though you cannot write into a
-running executable [self-replace-atomic-rename]. Rename is crash-safe, so an
-interrupted upgrade always leaves a runnable binary, never a torn one. The
-self-update crate ecosystem replaces the running binary via this same atomic
-rename but ships no built-in rollback
-[self-update-crate-version-backends]; the rollback contract below is the part
-IronCache adds on top.
+running executable [self-replace-atomic-rename]. The self-update crate ecosystem
+replaces the running binary via this same atomic rename but ships no built-in
+rollback [self-update-crate-version-backends]; the rollback contract below is the
+part IronCache adds on top.
+
+The swap uses a NEVER-ABSENT single-rename idiom so the `ironcache` path is never
+momentarily missing (a crash / power-loss in an absent window would leave systemd
+with no `ExecStart` binary and no auto-recovery). The earlier two-rename sequence
+(`rename(ironcache -> ironcache.old)` then `rename(ironcache.new -> ironcache)`)
+had exactly that absent window between the two renames and is rejected. Instead:
+(1) stage the verified new bytes to `ironcache.new` on the same filesystem,
+fsync'd; (2) while `ironcache` STILL exists, create the `ironcache.old` rollback
+slot by hard-linking the current `ironcache` inode into it (falling back to a
+durable byte copy when hard-linking is unavailable, e.g. `EXDEV`/`EMLINK`); (3)
+ONE atomic `rename(ironcache.new -> ironcache)`, which replaces the destination
+atomically, so `ironcache` transitions directly from the old inode to the new one
+with no absent window, and the old inode survives because `ironcache.old` still
+names it. An interruption therefore always leaves `ironcache` pointing at either
+the old inode or the new one, never absent and never torn. A symlink `ironcache`
+is refused (it would be clobbered into a real file and `.old` would dangle); the
+operator points the swap at the real binary.
 
 Exactly one prior binary is retained, as `ironcache.old`, alongside the live
 binary, not in the state directory. One slot is the Simple choice (ADR-0017),
 bounds disk to a single extra copy, and keeps rollback independent of
-state-directory health. The swap sequence is: move the current `ironcache` to
-`ironcache.old` (replacing any previous `.old`), then rename the verified temp
-file onto `ironcache`. A versioned archive of old binaries is explicitly
-rejected; one recoverable predecessor is the whole contract.
+state-directory health. A versioned archive of old binaries is explicitly
+rejected; one recoverable predecessor is the whole contract. Rollback restores
+`ironcache.old` onto `ironcache` while PRESERVING the `.old` slot (a fresh
+hard-link/copy + atomic rename), so `.old` always still holds the
+last-known-good binary and a subsequent failed upgrade can still roll back.
 
 ### Post-swap stabilization probe
 
@@ -156,8 +172,10 @@ called out as an open decision in #62). This is what makes the readiness check's
   pinned public key and refuses (nonzero exit, no on-disk change) on a mismatch,
   a missing signature, or an SBOM mismatch
   [minisign-offline-ed25519-detached-verify][cargo-auditable-version-reproducible].
-- The swap is atomic: an upgrade interrupted at any point leaves a runnable
-  binary, never a torn one [self-replace-atomic-rename].
+- The swap is atomic AND never-absent: an upgrade interrupted at any point leaves
+  the `ironcache` path pointing at a runnable binary (the old inode before the
+  single final rename, the new one after it), never absent and never torn
+  [self-replace-atomic-rename].
 - Exactly one `ironcache.old` is retained alongside the binary across an
   upgrade; a second upgrade replaces it (no versioned archive accumulates).
 - A failed health probe (process down, `--version` not exactly the target, or
