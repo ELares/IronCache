@@ -32,6 +32,7 @@
 
 pub mod api;
 pub mod assets;
+pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod history;
@@ -52,6 +53,14 @@ use anyhow::Context as _;
 use ironcache_env::SystemEnv;
 
 use crate::config::{ConsoleConfig, ConsoleConfigOverlay};
+
+/// Whether a token is configured (any non-blank read or admin token). Mirrors the
+/// auth policy's enforce decision so `log_boot` can describe the posture without
+/// holding the resolved policy.
+fn has_token(cfg: &ConsoleConfig) -> bool {
+    let set = |o: &Option<String>| o.as_ref().is_some_and(|t| !t.trim().is_empty());
+    set(&cfg.read_token) || set(&cfg.admin_token)
+}
 
 /// The conventional config path checked when `--config` is not given. An absent
 /// file is fine (defaults plus env apply), matching the engine's posture.
@@ -120,12 +129,24 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         // The shared topology cell: the poll loop writes it, the HTTP surface
         // (the REST API, #358) reads it.
         let topology = poll::new_topology_holder();
+        // Resolve the auth/RBAC policy (#360) from the configured tokens and the
+        // bind classification: a token => ENFORCE; no token + loopback => dev
+        // (serve all); no token + non-loopback => OPEN only.
+        let auth_policy = auth::AuthPolicy::resolve(
+            cfg.read_token.as_deref(),
+            cfg.admin_token.as_deref(),
+            binds_loopback(&cfg.http_addr),
+        );
         // The history source (#356): a Prometheus adapter when a `prometheus_url`
         // is configured, else `None` (so `/api/timeseries` answers 503). SECURITY:
         // the base URL comes ONLY from server config here, never from a request.
         let history = build_history_source(cfg);
-        let state = http::ConsoleHttpState::with_topology(metrics.clone(), topology.clone())
-            .with_history(history);
+        let state = http::ConsoleHttpState::with_topology_and_auth(
+            metrics.clone(),
+            topology.clone(),
+            auth_policy,
+        )
+        .with_history(history);
         let listener = tokio::net::TcpListener::bind(&cfg.http_addr)
             .await
             .with_context(|| format!("binding the console HTTP address {}", cfg.http_addr))?;
@@ -206,20 +227,85 @@ fn log_boot(cfg: &ConsoleConfig) {
              VPN-locked load balancer (see #369), not world-reachable"
         );
     }
+    log_auth_posture(cfg);
+}
+
+/// Emit the one-time auth/RBAC posture banner (#360), so the operator sees at
+/// boot exactly how the `/api/*` surface is protected. NEVER logs a token value.
+///
+///   * a token configured           -> ENFORCE (Bearer-token RBAC across tiers).
+///   * no token + loopback bind      -> DEV mode: unauthenticated, loopback-trusted
+///     (a prominent one-time warning).
+///   * no token + non-loopback bind  -> EXPOSED: OPEN tier only; privileged routes
+///     return 401 until a token is configured (a prominent boot warning).
+fn log_auth_posture(cfg: &ConsoleConfig) {
+    if has_token(cfg) {
+        tracing::info!(
+            "console: API auth ENFORCED (#360); privileged routes require an Authorization: \
+             Bearer token. The UI login flow that sends the token from the browser is a \
+             follow-up; on the loopback dev default the dashboard works unauthenticated"
+        );
+    } else if binds_loopback(&cfg.http_addr) {
+        tracing::warn!(
+            addr = %cfg.http_addr,
+            "console: API is UNAUTHENTICATED (#360); no read_token/admin_token configured and the \
+             bind is loopback, so all tiers are served (loopback-trusted dev mode). Configure a \
+             token before exposing the console"
+        );
+    } else {
+        tracing::warn!(
+            addr = %cfg.http_addr,
+            "console: API auth is UNCONFIGURED on a NON-loopback bind (#360); only the OPEN tier \
+             is served and privileged routes (node addresses, slowlog key names, client IPs) \
+             return 401. Configure read_token or admin_token to enable them"
+        );
+    }
 }
 
 /// Whether `addr` (a `host:port`) binds all interfaces (`0.0.0.0`, `::`, or an
 /// empty host). Used to warn at boot since the console is an admin/monitoring
 /// plane that should not be world-reachable.
 fn binds_all_interfaces(addr: &str) -> bool {
-    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host_of(addr);
     host.is_empty() || host == "0.0.0.0" || host == "::"
+}
+
+/// Whether `addr` (a `host:port`) binds a LOOPBACK address (the IPv4 `127.0.0.0/8`
+/// block or the IPv6 `::1`). Used by the auth/RBAC safe-default posture (#360): a
+/// no-token loopback bind is dev-trusted (serve all tiers), while a no-token
+/// non-loopback bind serves only the OPEN tier. A wildcard or empty host is NOT
+/// loopback (it accepts connections from any interface). Conservative: anything it
+/// cannot parse as a loopback literal is treated as NON-loopback (fail closed, so
+/// the privileged tiers are gated rather than silently exposed).
+fn binds_loopback(addr: &str) -> bool {
+    let host = host_of(addr);
+    if host.is_empty() {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // A hostname (not an IP literal): only the conventional `localhost` is
+        // treated as loopback; any other name is NOT (fail closed).
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// The host portion of a `host:port` (stripping `[..]` IPv6 brackets). For a
+/// bracketed IPv6 the split is on the LAST colon after the bracket; for a bare
+/// host:port it is the last colon.
+fn host_of(addr: &str) -> &str {
+    let host = if let Some(rest) = addr.strip_prefix('[') {
+        // Bracketed IPv6: the host is up to the closing bracket.
+        rest.split_once(']').map_or(rest, |(h, _)| h)
+    } else {
+        addr.rsplit_once(':').map_or(addr, |(h, _)| h)
+    };
+    host.trim_start_matches('[').trim_end_matches(']')
 }
 
 #[cfg(test)]
 mod tests {
-    use super::binds_all_interfaces;
+    use super::{binds_all_interfaces, binds_loopback};
 
     #[test]
     fn wildcard_host_detection() {
@@ -229,5 +315,39 @@ mod tests {
         assert!(!binds_all_interfaces("127.0.0.1:9180"));
         assert!(!binds_all_interfaces("[::1]:9180"));
         assert!(!binds_all_interfaces("10.2.0.5:9180"));
+    }
+
+    #[test]
+    fn loopback_host_detection() {
+        // IPv4 loopback block (the default bind and the rest of 127.0.0.0/8).
+        assert!(binds_loopback("127.0.0.1:9180"));
+        assert!(binds_loopback("127.5.6.7:9180"));
+        // IPv6 loopback, bracketed.
+        assert!(binds_loopback("[::1]:9180"));
+        // localhost name.
+        assert!(binds_loopback("localhost:9180"));
+        assert!(binds_loopback("LOCALHOST:9180"));
+        // NON-loopback: wildcard, routable, empty, and unknown hostnames fail
+        // closed (treated as non-loopback so privileged tiers are gated).
+        assert!(!binds_loopback("0.0.0.0:9180"));
+        assert!(!binds_loopback("[::]:9180"));
+        assert!(!binds_loopback(":9180"));
+        assert!(!binds_loopback("10.2.0.5:9180"));
+        assert!(!binds_loopback("console.internal:9180"));
+    }
+
+    #[test]
+    fn has_token_treats_blank_as_unset() {
+        use super::has_token;
+        use crate::config::ConsoleConfig;
+        assert!(!has_token(&ConsoleConfig::default()));
+        assert!(has_token(&ConsoleConfig {
+            read_token: Some("t".to_owned()),
+            ..Default::default()
+        }));
+        assert!(!has_token(&ConsoleConfig {
+            admin_token: Some("   ".to_owned()),
+            ..Default::default()
+        }));
     }
 }

@@ -618,6 +618,14 @@ fn field_in(value: &str, name: &str) -> Option<u64> {
         .and_then(|n| n.trim().parse::<u64>().ok())
 }
 
+/// A JSON `{"error":"<message>"}` body for callers OUTSIDE this module (the HTTP
+/// auth/RBAC gate in [`crate::http`], #360, builds its 401/403 bodies with the
+/// same escaped shape every other API error uses).
+#[must_use]
+pub fn error_json(message: &str) -> String {
+    error_body(message)
+}
+
 /// A JSON `{"error":"<message>"}` body. The message is escaped via `serde_json`
 /// (no hand-rolled escaping) so a message with quotes / control chars stays valid
 /// JSON.

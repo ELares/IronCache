@@ -78,6 +78,14 @@ pub struct ConsoleConfigOverlay {
     pub op_timeout_secs: Option<u64>,
     /// Log level (the CLI `--log-level` is the usual source).
     pub log_level: Option<String>,
+    /// Console API read token (#360). Grants the OPEN + PRIVILEGED_READ tiers via
+    /// `Authorization: Bearer <token>`. A secret; never logged or shown in the
+    /// `config` dump. Configuring it puts the console into ENFORCE mode.
+    pub read_token: Option<String>,
+    /// Console API admin token (#360). Grants every tier (OPEN + PRIVILEGED_READ +
+    /// ADMIN). A secret; never logged or shown in the `config` dump. Configuring it
+    /// puts the console into ENFORCE mode.
+    pub admin_token: Option<String>,
 }
 
 impl ConsoleConfigOverlay {
@@ -146,6 +154,12 @@ impl ConsoleConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_LOG_LEVEL") {
             overlay.log_level = Some(v);
         }
+        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_READ_TOKEN") {
+            overlay.read_token = Some(v);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_ADMIN_TOKEN") {
+            overlay.admin_token = Some(v);
+        }
         Ok(overlay)
     }
 }
@@ -165,6 +179,10 @@ pub struct ConsoleConfig {
     pub connect_timeout_secs: u64,
     pub op_timeout_secs: u64,
     pub log_level: String,
+    /// Console API read token (#360); see the overlay field. A secret.
+    pub read_token: Option<String>,
+    /// Console API admin token (#360); see the overlay field. A secret.
+    pub admin_token: Option<String>,
 }
 
 impl Default for ConsoleConfig {
@@ -182,6 +200,8 @@ impl Default for ConsoleConfig {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             op_timeout_secs: DEFAULT_OP_TIMEOUT_SECS,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
+            read_token: None,
+            admin_token: None,
         }
     }
 }
@@ -228,6 +248,12 @@ impl ConsoleConfig {
             }
             if let Some(v) = &o.log_level {
                 cfg.log_level.clone_from(v);
+            }
+            if let Some(v) = &o.read_token {
+                cfg.read_token = Some(v.clone());
+            }
+            if let Some(v) = &o.admin_token {
+                cfg.admin_token = Some(v.clone());
             }
         }
         cfg
@@ -294,6 +320,27 @@ impl ConsoleConfig {
                 "node_user is set but node_password_file is not; node AUTH will have no password"
             );
         }
+        // A token configured as whitespace-only is treated as UNSET by the auth
+        // policy (a blank token must not silently authenticate everyone); warn so
+        // the operator is not surprised that enforcement did not turn on.
+        if self
+            .read_token
+            .as_ref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            tracing::warn!(
+                "read_token is set but blank; it is ignored (the console will not enforce on it)"
+            );
+        }
+        if self
+            .admin_token
+            .as_ref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            tracing::warn!(
+                "admin_token is set but blank; it is ignored (the console will not enforce on it)"
+            );
+        }
         Ok(())
     }
 
@@ -311,6 +358,15 @@ impl ConsoleConfig {
         } else {
             self.seeds.join(", ")
         };
+        // A token is a SECRET: show only whether it is set, never the value. A
+        // whitespace-only token is reported as not set (the auth policy ignores it).
+        let token_state = |o: &Option<String>| -> &'static str {
+            if o.as_ref().is_some_and(|t| !t.trim().is_empty()) {
+                "(set)"
+            } else {
+                "(none)"
+            }
+        };
         format!(
             "http_addr          = {}\n\
              seeds              = {}\n\
@@ -323,7 +379,9 @@ impl ConsoleConfig {
              poll_interval_secs = {}\n\
              connect_timeout_secs = {}\n\
              op_timeout_secs    = {}\n\
-             log_level          = {}\n",
+             log_level          = {}\n\
+             read_token         = {}\n\
+             admin_token        = {}\n",
             self.http_addr,
             seeds,
             opt(&self.prometheus_url),
@@ -336,6 +394,8 @@ impl ConsoleConfig {
             self.connect_timeout_secs,
             self.op_timeout_secs,
             self.log_level,
+            token_state(&self.read_token),
+            token_state(&self.admin_token),
         )
     }
 }
@@ -547,6 +607,37 @@ mod tests {
             ..Default::default()
         };
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn tokens_resolve_from_toml_and_describe_redacts_the_value() {
+        let toml = r#"
+            read_token = "super-secret-read"
+            admin_token = "super-secret-admin"
+        "#;
+        let overlay = ConsoleConfigOverlay::from_toml_str(toml).unwrap();
+        let cfg = ConsoleConfig::resolve(&[overlay]);
+        assert_eq!(cfg.read_token.as_deref(), Some("super-secret-read"));
+        assert_eq!(cfg.admin_token.as_deref(), Some("super-secret-admin"));
+        // The describe dump shows ONLY whether a token is set, never the value.
+        let text = cfg.describe();
+        assert!(text.contains("read_token         = (set)"), "{text}");
+        assert!(text.contains("admin_token        = (set)"), "{text}");
+        assert!(!text.contains("super-secret-read"), "{text}");
+        assert!(!text.contains("super-secret-admin"), "{text}");
+    }
+
+    #[test]
+    fn describe_reports_unset_and_blank_tokens_as_none() {
+        let cfg = ConsoleConfig::default();
+        assert!(cfg.describe().contains("read_token         = (none)"));
+        assert!(cfg.describe().contains("admin_token        = (none)"));
+        // A blank token is reported as (none): the auth policy ignores it.
+        let cfg = ConsoleConfig {
+            read_token: Some("   ".to_owned()),
+            ..Default::default()
+        };
+        assert!(cfg.describe().contains("read_token         = (none)"));
     }
 
     #[test]
