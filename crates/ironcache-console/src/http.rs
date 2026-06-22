@@ -20,6 +20,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::metrics::ConsoleMetrics;
+use crate::poll::{TopologyHolder, new_topology_holder};
+use crate::snapshot::TopologyMode;
 
 /// Max request bytes before a `413` (probes send only a request line + a few
 /// headers, never a body); bounds the per-connection buffer.
@@ -40,19 +42,59 @@ pub struct ConsoleHttpState {
     metrics: Arc<ConsoleMetrics>,
     /// Liveness: set `true` at the end of boot; never flips back.
     live: Arc<AtomicBool>,
-    /// Readiness: set `true` when the console can serve. PR-1 sets it at boot;
-    /// #355 will gate it on the first successful node poll.
+    /// Readiness: set `true` on the FIRST successful node poll (#355). The poll
+    /// loop owns this flip, so `/readyz` is 503 until the console has real data.
     ready: Arc<AtomicBool>,
+    /// The latest polled topology, shared with the poll loop (#355/#366). The
+    /// REST API (#358) reads it; this PR also exposes it at `/debug/topology`.
+    topology: TopologyHolder,
+    /// Whether the unauthenticated `/debug/topology` recon route is served.
+    /// Default FALSE: it exposes node addresses / version / key counts with no
+    /// auth, so it stays off until it moves behind the privileged/auth tier.
+    // SECURITY: `/debug/topology` is unauthenticated recon (node addresses,
+    // version, key counts). It MUST move behind the privileged/auth tier
+    // (#360/#369) before the console is exposed; until then it is gated OFF by
+    // default and only served when this flag is explicitly enabled.
+    enable_debug_routes: bool,
 }
 
 impl ConsoleHttpState {
     #[must_use]
     pub fn new(metrics: Arc<ConsoleMetrics>) -> Self {
+        Self::with_topology(metrics, new_topology_holder())
+    }
+
+    /// Construct with an EXISTING topology holder, so the poll loop and the HTTP
+    /// surface share one cell (the loop writes, the handler reads). The debug
+    /// route is OFF (the safe default); use [`Self::with_options`] to enable it.
+    #[must_use]
+    pub fn with_topology(metrics: Arc<ConsoleMetrics>, topology: TopologyHolder) -> Self {
+        Self::with_options(metrics, topology, false)
+    }
+
+    /// Construct with an existing topology holder and the explicit
+    /// `enable_debug_routes` gate. The gate controls whether the unauthenticated
+    /// `/debug/topology` recon route is served (default OFF in the other ctors).
+    #[must_use]
+    pub fn with_options(
+        metrics: Arc<ConsoleMetrics>,
+        topology: TopologyHolder,
+        enable_debug_routes: bool,
+    ) -> Self {
         ConsoleHttpState {
             metrics,
             live: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
+            topology,
+            enable_debug_routes,
         }
+    }
+
+    /// The shared topology holder (so `lib.rs` can hand the same cell to the poll
+    /// loop it handed the HTTP state).
+    #[must_use]
+    pub fn topology(&self) -> TopologyHolder {
+        self.topology.clone()
     }
 
     /// Flip liveness (called once at end of boot).
@@ -65,9 +107,33 @@ impl ConsoleHttpState {
         self.ready.store(v, Ordering::SeqCst);
     }
 
-    /// Render the response bytes for a parsed `(method, path)`. Pure: reads the
-    /// live state and returns the bytes; the connection handler writes them.
-    /// Exposed for tests.
+    /// Render the response bytes for a parsed `(method, path)`. Reads the live /
+    /// ready state and the latest topology and returns the bytes; the connection
+    /// handler writes them. Async because `/debug/topology` reads the shared
+    /// topology behind an async `RwLock`. Exposed for tests.
+    pub async fn respond_async(&self, method: &str, path: &str) -> Vec<u8> {
+        let head = method == "HEAD";
+        let bare = path.split('?').next().unwrap_or(path);
+        // SECURITY: only serve the unauthenticated `/debug/topology` recon route
+        // when explicitly enabled; otherwise fall through to the normal 404 so its
+        // existence is not even disclosed. It must move behind the privileged/auth
+        // tier (#360/#369) before the console is exposed.
+        if self.enable_debug_routes && (method == "GET" || head) && bare == "/debug/topology" {
+            let body = self.render_topology_json().await;
+            return http_response(
+                200,
+                "OK",
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+                head,
+            );
+        }
+        self.respond(method, path)
+    }
+
+    /// Render the response bytes for the FIXED routes (`/metrics`, `/livez`,
+    /// `/readyz`, and the 404/405 fallbacks). Pure: reads only the atomic flags.
+    /// Exposed for tests; `/debug/topology` goes through [`Self::respond_async`].
     #[must_use]
     pub fn respond(&self, method: &str, path: &str) -> Vec<u8> {
         let head = method == "HEAD";
@@ -124,6 +190,82 @@ impl ConsoleHttpState {
             ),
         }
     }
+
+    /// Render the latest topology as a small JSON object for `/debug/topology`.
+    /// `{"polled":false}` before the first poll; otherwise the mode, fetch time,
+    /// and a per-node summary. Hand-rolled (no serde_json dep) to keep the HTTP
+    /// surface dependency-light; the full REST API with proper serialization is
+    /// #358. NEVER includes a secret (it only carries INFO-derived numbers).
+    async fn render_topology_json(&self) -> String {
+        let guard = self.topology.read().await;
+        let Some(topo) = guard.as_ref() else {
+            return "{\"polled\":false}".to_owned();
+        };
+        let mut out = String::with_capacity(256);
+        out.push_str("{\"polled\":true,\"mode\":\"");
+        out.push_str(topology_mode_str(topo.mode));
+        out.push_str("\",\"fetched_unixtime\":");
+        out.push_str(&topo.fetched_unixtime.to_string());
+        out.push_str(",\"nodes\":[");
+        for (i, node) in topo.nodes.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"addr\":\"");
+            out.push_str(&json_escape(&node.addr));
+            out.push_str("\",\"reachable\":");
+            out.push_str(if node.reachable { "true" } else { "false" });
+            if let Some(err) = &node.error {
+                out.push_str(",\"error\":\"");
+                out.push_str(&json_escape(err));
+                out.push('"');
+            }
+            if let Some(info) = &node.info {
+                if let Some(v) = &info.redis_version {
+                    out.push_str(",\"redis_version\":\"");
+                    out.push_str(&json_escape(v));
+                    out.push('"');
+                }
+                if let Some(keys) = info.total_keys {
+                    out.push_str(",\"total_keys\":");
+                    out.push_str(&keys.to_string());
+                }
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
+}
+
+/// The lowercase string form of a topology mode for JSON.
+fn topology_mode_str(mode: TopologyMode) -> &'static str {
+    match mode {
+        TopologyMode::Standalone => "standalone",
+        TopologyMode::Clustered => "clustered",
+    }
+}
+
+/// Escape a string for embedding in a JSON double-quoted value (the minimal set:
+/// backslash, quote, and control chars). Node addresses and error strings are the
+/// only inputs, so this small escaper suffices for the debug route.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Build a complete HTTP/1.1 response (status line, content headers,
@@ -189,7 +331,7 @@ async fn serve_conn_with_deadline(
                 ));
             }
             if let Some((method, path)) = parse_request_line(&buf) {
-                return Some(state.respond(&method, &path));
+                return Some(state.respond_async(&method, &path).await);
             }
         }
     })
@@ -234,6 +376,11 @@ mod tests {
 
     fn test_state() -> ConsoleHttpState {
         ConsoleHttpState::new(Arc::new(ConsoleMetrics::new()))
+    }
+
+    /// A state with the debug route ENABLED (for the `/debug/topology` tests).
+    fn debug_state() -> ConsoleHttpState {
+        ConsoleHttpState::with_options(Arc::new(ConsoleMetrics::new()), new_topology_holder(), true)
     }
 
     #[test]
@@ -299,6 +446,52 @@ mod tests {
     fn unknown_path_is_404() {
         let resp = String::from_utf8(test_state().respond("GET", "/nope")).unwrap();
         assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn debug_topology_is_404_when_disabled() {
+        // Default-OFF: the recon route is not served and not even disclosed (404,
+        // identical to any unknown path).
+        let state = test_state();
+        let resp = String::from_utf8(state.respond_async("GET", "/debug/topology").await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn debug_topology_reports_unpolled_then_polled() {
+        use crate::snapshot::{NodeSnapshot, Topology, TopologyMode};
+        let state = debug_state();
+        // Before any poll: polled=false.
+        let before =
+            String::from_utf8(state.respond_async("GET", "/debug/topology").await).unwrap();
+        assert!(before.starts_with("HTTP/1.1 200 OK"), "{before}");
+        assert!(before.contains("application/json"), "{before}");
+        assert!(before.contains("{\"polled\":false}"), "{before}");
+
+        // Publish a topology into the shared holder, then it appears in the JSON.
+        let topo = Topology {
+            mode: TopologyMode::Standalone,
+            nodes: vec![NodeSnapshot {
+                addr: "10.0.0.1:6379".to_owned(),
+                reachable: true,
+                error: None,
+                info: None,
+                fetched_unixtime: 42,
+            }],
+            fetched_unixtime: 42,
+        };
+        *state.topology().write().await = Some(topo);
+        let after = String::from_utf8(state.respond_async("GET", "/debug/topology").await).unwrap();
+        assert!(after.contains("\"polled\":true"), "{after}");
+        assert!(after.contains("\"mode\":\"standalone\""), "{after}");
+        assert!(after.contains("10.0.0.1:6379"), "{after}");
+        assert!(after.contains("\"reachable\":true"), "{after}");
+    }
+
+    #[test]
+    fn json_escape_handles_quotes_and_controls() {
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(json_escape("line\nbreak"), "line\\nbreak");
     }
 
     #[test]

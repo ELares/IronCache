@@ -36,4 +36,6 @@ tokio = { workspace = true, features = [
     "sync",
     "signal",
 ] }
+zeroize = { workspace = true }
 ironcache-env = { workspace = true }
+ironcache-runtime = { workspace = true }
