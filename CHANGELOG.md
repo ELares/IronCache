@@ -9,6 +9,16 @@ release.
 
 ### Security
 
+- IronCache Console security sign-off (issue #364): a threat model + control
+  inventory at `crates/ironcache-console/SECURITY.md`. It records the trust
+  boundary, the assets/adversaries, the code-side controls in place (three-tier
+  RBAC + constant-time Bearer auth, PII tiering, SSRF/injection defense,
+  credential hygiene, hostile-peer bounds, the XSS-safe UI + CSP + security
+  headers), and the sign-off gates. Verdict: the code-side controls are
+  implemented and reviewed; the console is safe on its loopback default and on a
+  trusted network with tokens configured, but is NOT cleared for public exposure
+  until the deployment gate (the least-privilege node ACL user #367 and the
+  VPN-locked exposure #369) is satisfied in the infrastructure repo.
 - IronCache Console web hardening (issue #369): defense-in-depth on the Prometheus
   HTTP client and the API surface. The history HTTP client no longer follows
   redirects (a 3xx can no longer pivot the console to a different host), and it
