@@ -254,3 +254,100 @@ td.err {
 .stale {
   color: var(--warn);
 }
+
+/*
+ * Sign-in panel (UI auth, follow-up to #360). Hidden by default via the [hidden]
+ * attribute; app.js reveals it when a privileged fetch returns 401. Themed to
+ * match the existing panels.
+ */
+.login-panel {
+  margin: 12px 24px 0;
+  padding: 18px;
+  background: var(--bg-panel);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+}
+
+.login-panel h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.login-note {
+  margin: 0 0 14px;
+  max-width: 70ch;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.login-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.login-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+
+.login-input {
+  width: 320px;
+  max-width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.login-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.login-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn {
+  padding: 8px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn:hover {
+  border-color: var(--text-dim);
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1a1206;
+}
+
+.btn-primary:hover {
+  border-color: var(--accent);
+  filter: brightness(1.05);
+}
+
+.login-status {
+  margin: 12px 0 0;
+  color: var(--warn);
+  font-size: 13px;
+}

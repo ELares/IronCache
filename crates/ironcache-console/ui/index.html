@@ -6,6 +6,14 @@
   so a strict Content-Security-Policy (default-src 'self') needs no
   'unsafe-inline'. The script renders the panels from the /api/* JSON, escaping
   every server string into the DOM via textContent (no innerHTML interpolation).
+
+  UI auth (follow-up to #360): the OPEN panels (header + cluster totals) always
+  render with no token. The PRIVILEGED_READ panels (nodes, slowlog, clients,
+  keyspace) need a Bearer token when the console is exposed/authenticated; the
+  sign-in panel below is hidden by default and revealed by app.js only when a
+  privileged fetch returns 401. On the loopback dev default (no token) every
+  panel renders without signing in. The token lives in sessionStorage and is
+  sent ONLY as an Authorization header; it is never written to the DOM/markup.
 -->
 <html lang="en">
   <head>
@@ -51,6 +59,46 @@
     <div id="waiting" class="banner banner-wait" hidden>
       Waiting for the first node poll...
     </div>
+
+    <section
+      id="login-panel"
+      class="login-panel"
+      aria-labelledby="login-title"
+      hidden
+    >
+      <h2 id="login-title">Sign in</h2>
+      <p class="login-note">
+        This console is exposed/authenticated, so the nodes, slowlog, clients,
+        and keyspace panels need an operator token. Paste a read or admin token
+        to view them. On the loopback dev default (no token configured) every
+        panel renders without signing in. The token is kept only for this tab
+        and is sent only as an Authorization header; it is never stored in the
+        page.
+      </p>
+      <form id="login-form" class="login-form" autocomplete="off">
+        <label class="login-label" for="login-token">Operator token</label>
+        <input
+          id="login-token"
+          class="login-input"
+          type="password"
+          name="token"
+          autocomplete="off"
+          autocapitalize="off"
+          autocorrect="off"
+          spellcheck="false"
+          placeholder="read or admin token"
+        />
+        <div class="login-actions">
+          <button id="login-submit" class="btn btn-primary" type="submit">
+            Sign in
+          </button>
+          <button id="logout-submit" class="btn" type="button">
+            Sign out
+          </button>
+        </div>
+      </form>
+      <p id="login-status" class="login-status" hidden></p>
+    </section>
 
     <main>
       <section class="panel" aria-labelledby="totals-title">
@@ -153,8 +201,9 @@
 
     <footer class="footer">
       <span>
-        IronCache Console - unauthenticated today; to be placed behind the
-        auth tier (#360) and VPN-locked exposure (#369) before exposure.
+        IronCache Console - the privileged panels are behind the auth tier
+        (#360); sign in with an operator token when the console is exposed.
+        VPN-locked exposure (#369) still applies before exposure.
       </span>
     </footer>
 

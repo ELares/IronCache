@@ -71,4 +71,93 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn index_carries_the_login_panel_elements() {
+        // The sign-in affordance (UI auth, follow-up to #360) is STATIC markup in
+        // index.html (app.js only wires it). Assert the element ids app.js drives
+        // are present and the token field is a password input.
+        for id in [
+            "id=\"login-panel\"",
+            "id=\"login-form\"",
+            "id=\"login-token\"",
+            "id=\"login-submit\"",
+            "id=\"logout-submit\"",
+            "id=\"login-status\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(id),
+                "index.html must contain the login element {id}"
+            );
+        }
+        assert!(
+            INDEX_HTML.contains("type=\"password\""),
+            "the token field must be a password input"
+        );
+        // The panel is hidden by default (revealed by app.js on a 401).
+        assert!(
+            INDEX_HTML.contains("id=\"login-panel\"")
+                && INDEX_HTML.contains("class=\"login-panel\""),
+            "the login panel must be present"
+        );
+    }
+
+    #[test]
+    fn index_has_no_inline_handlers() {
+        // CSP forbids inline event handlers: index.html must wire NOTHING via
+        // onclick/onsubmit/etc.; app.js attaches the handlers via addEventListener.
+        for attr in ["onclick", "onsubmit", "onload", "onerror", "javascript:"] {
+            assert!(
+                !INDEX_HTML.contains(attr),
+                "index.html must not contain the inline handler `{attr}` (CSP)"
+            );
+        }
+    }
+
+    #[test]
+    fn app_js_is_auth_aware() {
+        // The auth integration: the script sends the Bearer token (read from
+        // sessionStorage, NOT localStorage) and wires the controls via
+        // addEventListener (NOT inline onclick).
+        for needle in [
+            "Authorization",
+            "Bearer ",
+            "sessionStorage",
+            "addEventListener",
+            "ic_console_token",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js must reference `{needle}` for the auth flow"
+            );
+        }
+        // The token must live in sessionStorage (tab-scoped), never localStorage.
+        assert!(
+            !APP_JS.contains("localStorage"),
+            "app.js must use sessionStorage, never localStorage"
+        );
+        // No inline onclick handlers in the script (CSP-safety / convention).
+        assert!(
+            !APP_JS.contains("onclick"),
+            "app.js must wire events via addEventListener, not onclick"
+        );
+    }
+
+    #[test]
+    fn app_js_never_logs_or_urls_the_token() {
+        // Defense-in-depth: the token is sent ONLY as a header. It must not be
+        // console.log'd and must not be concatenated into a query string. We
+        // assert the obvious leak shapes are absent.
+        for leak in [
+            "console.log(token",
+            "console.log(getToken",
+            "?token=",
+            "&token=",
+        ] {
+            assert!(
+                !APP_JS.contains(leak),
+                "app.js must not leak the token via `{leak}`"
+            );
+        }
+    }
 }
