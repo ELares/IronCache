@@ -21,7 +21,7 @@ use std::collections::HashMap;
 /// Every typed field is optional: a node that omits it (an older/newer server, a
 /// disabled subsystem) leaves it `None` rather than forcing a default that would
 /// read as a real value on the dashboard.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct NodeInfo {
     /// `redis_version` (the server-reported version string).
     pub redis_version: Option<String>,

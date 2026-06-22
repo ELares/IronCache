@@ -465,6 +465,7 @@ dependencies = [
  "ironcache-env",
  "ironcache-runtime",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "toml",

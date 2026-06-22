@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The console's bounded, hand-rolled tokio HTTP/1.1 responder (issue #353).
 //!
-//! In PR-1 it serves three fixed routes:
+//! It serves the fixed probe/metrics routes:
 //!   * `GET /metrics` -> the console's OWN Prometheus self-metrics,
 //!   * `GET /livez`   -> `200` once the process is up (a liveness probe), and
-//!   * `GET /readyz`  -> `200` when the console is ready to serve (a readiness probe).
+//!   * `GET /readyz`  -> `200` when the console is ready to serve (a readiness probe),
 //!
-//! Later PRs hang the `/api/*` surface (#358) and the SPA (#359) off this same
-//! server. It is hand-rolled (no hyper/axum) for the same reason the engine's
-//! metrics endpoint is: a tiny fixed-route surface keeps the static musl build
-//! pure-Rust and adds no new dependency. It bounds each request (a whole-request
-//! deadline, a small header cap, a connection-concurrency cap) and is NOT a
-//! general HTTP server: anything malformed/oversized gets a fixed error + close.
+//! plus the JSON REST API at `/api/*` (#358, handled in [`crate::api`]). The SPA
+//! (#359) hangs off this same server later. It is hand-rolled (no hyper/axum) for
+//! the same reason the engine's metrics endpoint is: a tiny route surface keeps
+//! the static musl build pure-Rust and adds no new HTTP-server dependency. It
+//! bounds each request (a whole-request deadline, a small header cap, a
+//! connection-concurrency cap) and is NOT a general HTTP server: anything
+//! malformed/oversized gets a fixed error + close. The `/api/*` routes go through
+//! that SAME bounded responder, so the deadline/size-cap/permit still apply.
+//!
+//! SECURITY: the `/api/*` surface exposes node internals (node addresses, slowlog
+//! argv = key names, client IPs). It is UNAUTHENTICATED today and relies on the
+//! loopback default bind; it MUST move behind the auth/RBAC tier (#360) and the
+//! VPN-locked exposure (#369) before the console is exposed. See [`crate::api`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,9 +26,9 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+use crate::api::{self, ApiContext};
 use crate::metrics::ConsoleMetrics;
 use crate::poll::{TopologyHolder, new_topology_holder};
-use crate::snapshot::TopologyMode;
 
 /// Max request bytes before a `413` (probes send only a request line + a few
 /// headers, never a body); bounds the per-connection buffer.
@@ -46,16 +53,8 @@ pub struct ConsoleHttpState {
     /// loop owns this flip, so `/readyz` is 503 until the console has real data.
     ready: Arc<AtomicBool>,
     /// The latest polled topology, shared with the poll loop (#355/#366). The
-    /// REST API (#358) reads it; this PR also exposes it at `/debug/topology`.
+    /// REST API (#358) reads it to render the `/api/*` responses.
     topology: TopologyHolder,
-    /// Whether the unauthenticated `/debug/topology` recon route is served.
-    /// Default FALSE: it exposes node addresses / version / key counts with no
-    /// auth, so it stays off until it moves behind the privileged/auth tier.
-    // SECURITY: `/debug/topology` is unauthenticated recon (node addresses,
-    // version, key counts). It MUST move behind the privileged/auth tier
-    // (#360/#369) before the console is exposed; until then it is gated OFF by
-    // default and only served when this flag is explicitly enabled.
-    enable_debug_routes: bool,
 }
 
 impl ConsoleHttpState {
@@ -65,28 +64,15 @@ impl ConsoleHttpState {
     }
 
     /// Construct with an EXISTING topology holder, so the poll loop and the HTTP
-    /// surface share one cell (the loop writes, the handler reads). The debug
-    /// route is OFF (the safe default); use [`Self::with_options`] to enable it.
+    /// surface share one cell (the loop writes, the handler reads through the REST
+    /// API).
     #[must_use]
     pub fn with_topology(metrics: Arc<ConsoleMetrics>, topology: TopologyHolder) -> Self {
-        Self::with_options(metrics, topology, false)
-    }
-
-    /// Construct with an existing topology holder and the explicit
-    /// `enable_debug_routes` gate. The gate controls whether the unauthenticated
-    /// `/debug/topology` recon route is served (default OFF in the other ctors).
-    #[must_use]
-    pub fn with_options(
-        metrics: Arc<ConsoleMetrics>,
-        topology: TopologyHolder,
-        enable_debug_routes: bool,
-    ) -> Self {
         ConsoleHttpState {
             metrics,
             live: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
             topology,
-            enable_debug_routes,
         }
     }
 
@@ -109,22 +95,43 @@ impl ConsoleHttpState {
 
     /// Render the response bytes for a parsed `(method, path)`. Reads the live /
     /// ready state and the latest topology and returns the bytes; the connection
-    /// handler writes them. Async because `/debug/topology` reads the shared
+    /// handler writes them. Async because the `/api/*` routes read the shared
     /// topology behind an async `RwLock`. Exposed for tests.
+    ///
+    /// The `/api/*` namespace (#358) is dispatched to [`crate::api`] here; all
+    /// other paths fall through to the fixed-route [`Self::respond`]. The API goes
+    /// through this SAME bounded responder, so the whole-request deadline, the
+    /// size cap, and the concurrency permit still apply.
     pub async fn respond_async(&self, method: &str, path: &str) -> Vec<u8> {
         let head = method == "HEAD";
         let bare = path.split('?').next().unwrap_or(path);
-        // SECURITY: only serve the unauthenticated `/debug/topology` recon route
-        // when explicitly enabled; otherwise fall through to the normal 404 so its
-        // existence is not even disclosed. It must move behind the privileged/auth
-        // tier (#360/#369) before the console is exposed.
-        if self.enable_debug_routes && (method == "GET" || head) && bare == "/debug/topology" {
-            let body = self.render_topology_json().await;
+        if api::is_api_path(bare) {
+            // SECURITY: the `/api/*` surface is unauthenticated recon today (node
+            // addresses, slowlog argv = key names, client IPs). It MUST move behind
+            // the auth/RBAC tier (#360) and VPN-locked exposure (#369) before the
+            // console is exposed; until then it relies on the loopback default bind.
+            if method != "GET" && !head {
+                return http_response(
+                    405,
+                    "Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    b"",
+                    head,
+                );
+            }
+            let ctx = ApiContext {
+                version: crate::cli::BUILD_VERSION,
+                live: self.live.load(Ordering::SeqCst),
+                ready: self.ready.load(Ordering::SeqCst),
+                uptime_seconds: self.metrics.uptime_seconds(),
+            };
+            let guard = self.topology.read().await;
+            let resp = api::handle(bare, guard.as_ref(), &ctx);
             return http_response(
-                200,
-                "OK",
-                "application/json; charset=utf-8",
-                body.as_bytes(),
+                resp.status,
+                status_reason(resp.status),
+                api::CONTENT_TYPE,
+                resp.body.as_bytes(),
                 head,
             );
         }
@@ -190,82 +197,18 @@ impl ConsoleHttpState {
             ),
         }
     }
-
-    /// Render the latest topology as a small JSON object for `/debug/topology`.
-    /// `{"polled":false}` before the first poll; otherwise the mode, fetch time,
-    /// and a per-node summary. Hand-rolled (no serde_json dep) to keep the HTTP
-    /// surface dependency-light; the full REST API with proper serialization is
-    /// #358. NEVER includes a secret (it only carries INFO-derived numbers).
-    async fn render_topology_json(&self) -> String {
-        let guard = self.topology.read().await;
-        let Some(topo) = guard.as_ref() else {
-            return "{\"polled\":false}".to_owned();
-        };
-        let mut out = String::with_capacity(256);
-        out.push_str("{\"polled\":true,\"mode\":\"");
-        out.push_str(topology_mode_str(topo.mode));
-        out.push_str("\",\"fetched_unixtime\":");
-        out.push_str(&topo.fetched_unixtime.to_string());
-        out.push_str(",\"nodes\":[");
-        for (i, node) in topo.nodes.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"addr\":\"");
-            out.push_str(&json_escape(&node.addr));
-            out.push_str("\",\"reachable\":");
-            out.push_str(if node.reachable { "true" } else { "false" });
-            if let Some(err) = &node.error {
-                out.push_str(",\"error\":\"");
-                out.push_str(&json_escape(err));
-                out.push('"');
-            }
-            if let Some(info) = &node.info {
-                if let Some(v) = &info.redis_version {
-                    out.push_str(",\"redis_version\":\"");
-                    out.push_str(&json_escape(v));
-                    out.push('"');
-                }
-                if let Some(keys) = info.total_keys {
-                    out.push_str(",\"total_keys\":");
-                    out.push_str(&keys.to_string());
-                }
-            }
-            out.push('}');
-        }
-        out.push_str("]}");
-        out
-    }
 }
 
-/// The lowercase string form of a topology mode for JSON.
-fn topology_mode_str(mode: TopologyMode) -> &'static str {
-    match mode {
-        TopologyMode::Standalone => "standalone",
-        TopologyMode::Clustered => "clustered",
+/// The HTTP reason phrase for the status codes the console emits. The default
+/// (`200 OK`) covers the success case and any unexpected code defensively.
+fn status_reason(code: u16) -> &'static str {
+    match code {
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "OK",
     }
-}
-
-/// Escape a string for embedding in a JSON double-quoted value (the minimal set:
-/// backslash, quote, and control chars). Node addresses and error strings are the
-/// only inputs, so this small escaper suffices for the debug route.
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// Build a complete HTTP/1.1 response (status line, content headers,
@@ -378,11 +321,6 @@ mod tests {
         ConsoleHttpState::new(Arc::new(ConsoleMetrics::new()))
     }
 
-    /// A state with the debug route ENABLED (for the `/debug/topology` tests).
-    fn debug_state() -> ConsoleHttpState {
-        ConsoleHttpState::with_options(Arc::new(ConsoleMetrics::new()), new_topology_holder(), true)
-    }
-
     #[test]
     fn metrics_route_returns_console_prometheus_text() {
         let state = test_state();
@@ -448,27 +386,34 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "{resp}");
     }
 
+    /// `/api/health` is served through the bounded responder, returns JSON, and
+    /// does not require a polled topology.
     #[tokio::test]
-    async fn debug_topology_is_404_when_disabled() {
-        // Default-OFF: the recon route is not served and not even disclosed (404,
-        // identical to any unknown path).
+    async fn api_health_is_json_without_a_poll() {
         let state = test_state();
-        let resp = String::from_utf8(state.respond_async("GET", "/debug/topology").await).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "{resp}");
+        state.set_live(true);
+        let resp = String::from_utf8(state.respond_async("GET", "/api/health").await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(resp.contains("Content-Type: application/json"), "{resp}");
+        let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["live"], true);
+        assert_eq!(v["ready"], false);
     }
 
+    /// A data route is `503` JSON before the first poll, then `200` after a
+    /// topology is published into the shared holder.
     #[tokio::test]
-    async fn debug_topology_reports_unpolled_then_polled() {
+    async fn api_cluster_is_503_before_poll_then_200_after() {
         use crate::snapshot::{NodeSnapshot, Topology, TopologyMode};
-        let state = debug_state();
-        // Before any poll: polled=false.
-        let before =
-            String::from_utf8(state.respond_async("GET", "/debug/topology").await).unwrap();
-        assert!(before.starts_with("HTTP/1.1 200 OK"), "{before}");
+        let state = test_state();
+        let before = String::from_utf8(state.respond_async("GET", "/api/cluster").await).unwrap();
+        assert!(before.starts_with("HTTP/1.1 503"), "{before}");
         assert!(before.contains("application/json"), "{before}");
-        assert!(before.contains("{\"polled\":false}"), "{before}");
+        let (_h, body) = before.split_once("\r\n\r\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(v["error"].is_string(), "{body}");
 
-        // Publish a topology into the shared holder, then it appears in the JSON.
         let topo = Topology {
             mode: TopologyMode::Standalone,
             nodes: vec![NodeSnapshot {
@@ -476,22 +421,51 @@ mod tests {
                 reachable: true,
                 error: None,
                 info: None,
+                slowlog: Vec::new(),
+                slowlog_error: None,
+                clients: Vec::new(),
+                clients_error: None,
                 fetched_unixtime: 42,
             }],
             fetched_unixtime: 42,
         };
         *state.topology().write().await = Some(topo);
-        let after = String::from_utf8(state.respond_async("GET", "/debug/topology").await).unwrap();
-        assert!(after.contains("\"polled\":true"), "{after}");
-        assert!(after.contains("\"mode\":\"standalone\""), "{after}");
-        assert!(after.contains("10.0.0.1:6379"), "{after}");
-        assert!(after.contains("\"reachable\":true"), "{after}");
+        let after = String::from_utf8(state.respond_async("GET", "/api/cluster").await).unwrap();
+        assert!(after.starts_with("HTTP/1.1 200 OK"), "{after}");
+        let (_h, body) = after.split_once("\r\n\r\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["mode"], "standalone");
+        assert_eq!(v["nodes_total"], 1);
     }
 
-    #[test]
-    fn json_escape_handles_quotes_and_controls() {
-        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
-        assert_eq!(json_escape("line\nbreak"), "line\\nbreak");
+    /// An unknown `/api/*` endpoint is `404` JSON, and a non-GET to `/api/*` is
+    /// `405`.
+    #[tokio::test]
+    async fn api_unknown_is_404_and_post_is_405() {
+        let state = test_state();
+        // A topology so we are past the 503-before-poll gate.
+        *state.topology().write().await = Some(crate::snapshot::Topology {
+            mode: crate::snapshot::TopologyMode::Standalone,
+            nodes: Vec::new(),
+            fetched_unixtime: 1,
+        });
+        let nf = String::from_utf8(state.respond_async("GET", "/api/bogus").await).unwrap();
+        assert!(nf.starts_with("HTTP/1.1 404 Not Found"), "{nf}");
+        assert!(nf.contains("application/json"), "{nf}");
+        let post = String::from_utf8(state.respond_async("POST", "/api/cluster").await).unwrap();
+        assert!(post.starts_with("HTTP/1.1 405"), "{post}");
+    }
+
+    /// `/api/openapi.json` is served and parses as JSON.
+    #[tokio::test]
+    async fn api_openapi_is_valid_json() {
+        let state = test_state();
+        let resp =
+            String::from_utf8(state.respond_async("GET", "/api/openapi.json").await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["openapi"], "3.0.3");
     }
 
     #[test]

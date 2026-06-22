@@ -78,10 +78,6 @@ pub struct ConsoleConfigOverlay {
     pub op_timeout_secs: Option<u64>,
     /// Log level (the CLI `--log-level` is the usual source).
     pub log_level: Option<String>,
-    /// Serve the unauthenticated `/debug/topology` recon route. Default FALSE: it
-    /// exposes node addresses / version / key counts with no auth, so it must stay
-    /// off until the route moves behind the privileged/auth tier (#360/#369).
-    pub enable_debug_routes: Option<bool>,
 }
 
 impl ConsoleConfigOverlay {
@@ -150,10 +146,6 @@ impl ConsoleConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_LOG_LEVEL") {
             overlay.log_level = Some(v);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_ENABLE_DEBUG_ROUTES") {
-            overlay.enable_debug_routes =
-                Some(parse_bool("IRONCACHE_CONSOLE_ENABLE_DEBUG_ROUTES", &v)?);
-        }
         Ok(overlay)
     }
 }
@@ -173,7 +165,6 @@ pub struct ConsoleConfig {
     pub connect_timeout_secs: u64,
     pub op_timeout_secs: u64,
     pub log_level: String,
-    pub enable_debug_routes: bool,
 }
 
 impl Default for ConsoleConfig {
@@ -191,7 +182,6 @@ impl Default for ConsoleConfig {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             op_timeout_secs: DEFAULT_OP_TIMEOUT_SECS,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
-            enable_debug_routes: false,
         }
     }
 }
@@ -238,9 +228,6 @@ impl ConsoleConfig {
             }
             if let Some(v) = &o.log_level {
                 cfg.log_level.clone_from(v);
-            }
-            if let Some(v) = o.enable_debug_routes {
-                cfg.enable_debug_routes = v;
             }
         }
         cfg
@@ -336,8 +323,7 @@ impl ConsoleConfig {
              poll_interval_secs = {}\n\
              connect_timeout_secs = {}\n\
              op_timeout_secs    = {}\n\
-             log_level          = {}\n\
-             enable_debug_routes = {}\n",
+             log_level          = {}\n",
             self.http_addr,
             seeds,
             opt(&self.prometheus_url),
@@ -350,7 +336,6 @@ impl ConsoleConfig {
             self.connect_timeout_secs,
             self.op_timeout_secs,
             self.log_level,
-            self.enable_debug_routes,
         )
     }
 }
@@ -530,7 +515,6 @@ mod tests {
         assert!(text.contains("seeds              = (none)"));
         assert!(text.contains("node_tls           = false"));
         assert!(text.contains("node_tls_insecure_skip_verify = false"));
-        assert!(text.contains("enable_debug_routes = false"));
     }
 
     #[test]
@@ -575,13 +559,5 @@ mod tests {
         let cfg = ConsoleConfig::resolve(&[overlay]);
         assert!(cfg.node_tls_insecure_skip_verify);
         cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn enable_debug_routes_defaults_off_and_resolves() {
-        assert!(!ConsoleConfig::default().enable_debug_routes);
-        let overlay = ConsoleConfigOverlay::from_toml_str("enable_debug_routes = true").unwrap();
-        let cfg = ConsoleConfig::resolve(&[overlay]);
-        assert!(cfg.enable_debug_routes);
     }
 }
