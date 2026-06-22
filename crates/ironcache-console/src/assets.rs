@@ -263,6 +263,114 @@ mod tests {
     }
 
     #[test]
+    fn index_carries_the_management_page_elements() {
+        // The node-level management pages (#361) are now FUNCTIONAL markup (not the
+        // gated empty-states). Assert the element ids app.js drives are present.
+        for id in [
+            // Config.
+            "id=\"config-rows\"",
+            "id=\"config-filter\"",
+            // Keyspace browser + inspector + actions + new-key form.
+            "id=\"ks-scan-form\"",
+            "id=\"ks-key-list\"",
+            "id=\"ks-inspector\"",
+            "id=\"ks-detail-value\"",
+            "id=\"ks-expire-form\"",
+            "id=\"ks-del-btn\"",
+            "id=\"ks-new-form\"",
+            // Console.
+            "id=\"console-form\"",
+            "id=\"console-input\"",
+            "id=\"console-scrollback\"",
+            "id=\"console-chips\"",
+            // Pub/Sub.
+            "id=\"pubsub-body\"",
+            "id=\"pubsub-form\"",
+            // ACL.
+            "id=\"acl-users\"",
+            "id=\"acl-form\"",
+            // Persistence (new page + nav).
+            "id=\"section-persistence\"",
+            "id=\"persistence-save\"",
+            "data-section=\"persistence\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(id),
+                "index.html must contain the management element {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_replication_shards_stay_gated_empty_states() {
+        // The genuinely-cluster-only views keep their honest empty-state (NO
+        // fabricated data); they must NOT have been turned into functional pages.
+        for marker in [
+            "id=\"section-cluster\"",
+            "id=\"section-replication\"",
+            "id=\"section-shards\"",
+        ] {
+            assert!(INDEX_HTML.contains(marker), "{marker} must still exist");
+        }
+        // The empty-state card text for these is still present.
+        assert!(
+            INDEX_HTML.contains("This node is standalone."),
+            "the gated cluster/shards empty-states must remain"
+        );
+    }
+
+    #[test]
+    fn app_js_wires_the_management_mutations() {
+        // The management write path: app.js issues POST/DELETE to the new endpoints
+        // through a method-aware fetch that sends the Bearer token in the header.
+        for needle in [
+            "/api/config",
+            "/api/keys/",
+            "/api/command",
+            "/api/pubsub/publish",
+            "/api/acl/user",
+            "/api/persistence/save",
+            "fetchMethod",
+            "tokenizeCommand",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js must reference `{needle}` for the management layer"
+            );
+        }
+        // The mutation fetch still carries the token ONLY as a header (no token in a
+        // URL/query), and still avoids the innerHTML sink.
+        assert!(
+            APP_JS.contains("Authorization"),
+            "mutations carry the auth header"
+        );
+        assert!(!APP_JS.contains(".innerHTML"), "no innerHTML sink");
+        assert!(!APP_JS.contains("?token="), "no token in a query");
+        assert!(!APP_JS.contains("&token="), "no token in a query");
+    }
+
+    #[test]
+    fn index_management_markup_stays_csp_clean() {
+        // The new management markup must keep the strict-CSP posture: no inline
+        // style= attribute and no inline on*= handler (the existing whole-file
+        // guards also cover this; this is an explicit management-focused check).
+        assert!(
+            !INDEX_HTML.contains(" style="),
+            "management markup must not carry an inline style="
+        );
+        assert!(
+            !has_inline_handler(INDEX_HTML),
+            "management markup must not carry an inline on*= handler"
+        );
+        // The console suggestion chips carry a data-cmd attribute (NOT an on*=
+        // handler); app.js wires them via addEventListener.
+        assert!(
+            INDEX_HTML.contains("data-cmd=\"PING\""),
+            "console chips use data-cmd, wired in app.js"
+        );
+    }
+
+    #[test]
     fn app_js_never_logs_or_urls_the_token() {
         // Defense-in-depth: the token is sent ONLY as a header. It must not be
         // console.log'd and must not be concatenated into a query string. We

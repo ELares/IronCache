@@ -68,7 +68,9 @@ impl ApiResponse {
     /// A `200 OK` with `value` serialized to JSON. Serialization of our own
     /// response types is infallible in practice; a defensive failure degrades to a
     /// `500` JSON error rather than panicking (no `unwrap` in non-test code).
-    fn ok<T: Serialize>(value: &T) -> Self {
+    /// Public so the management layer (#361) builds its JSON responses the same way.
+    #[must_use]
+    pub fn ok<T: Serialize>(value: &T) -> Self {
         match serde_json::to_string(value) {
             Ok(body) => ApiResponse { status: 200, body },
             Err(e) => ApiResponse {
@@ -88,7 +90,8 @@ impl ApiResponse {
     }
 
     /// A `404 Not Found` JSON error with `message`.
-    fn not_found(message: &str) -> Self {
+    #[must_use]
+    pub fn not_found(message: &str) -> Self {
         ApiResponse {
             status: 404,
             body: error_body(message),
@@ -96,8 +99,9 @@ impl ApiResponse {
     }
 
     /// A `400 Bad Request` JSON error with `message` (a malformed / disallowed
-    /// query parameter).
-    fn bad_request(message: &str) -> Self {
+    /// query parameter or request body).
+    #[must_use]
+    pub fn bad_request(message: &str) -> Self {
         ApiResponse {
             status: 400,
             body: error_body(message),
@@ -105,8 +109,9 @@ impl ApiResponse {
     }
 
     /// A JSON error with an explicit status code (for the history paths that map a
-    /// typed error to 400/502/503).
-    fn error(status: u16, message: &str) -> Self {
+    /// typed error to 400/502/503, and the management layer's 502/503).
+    #[must_use]
+    pub fn error(status: u16, message: &str) -> Self {
         ApiResponse {
             status,
             body: error_body(message),
@@ -574,8 +579,10 @@ fn resolve_window(now: u64, range: u64, step: u64) -> (u64, u64, u64) {
 
 /// A tiny URL query-string parser (`a=b&c=d`), percent-decoding keys and values.
 /// Hand-rolled (no url crate) to keep the dependency posture; sufficient for the
-/// console's flat, small query strings.
-struct QueryParams {
+/// console's flat, small query strings. Public so the management layer (#361) can
+/// parse the SCAN browser's `?pattern=&cursor=&count=` query through the same
+/// decoder the history route uses.
+pub struct QueryParams {
     pairs: Vec<(String, String)>,
 }
 
@@ -583,7 +590,8 @@ impl QueryParams {
     /// Parse `a=b&c=d`. A pair without `=` is recorded with an empty value; an
     /// empty segment is skipped. `+` is decoded to a space (form-encoding), then
     /// `%XX` escapes are decoded.
-    fn parse(query: &str) -> Self {
+    #[must_use]
+    pub fn parse(query: &str) -> Self {
         let mut pairs = Vec::new();
         for seg in query.split('&') {
             if seg.is_empty() {
@@ -599,7 +607,8 @@ impl QueryParams {
     }
 
     /// The first value for `key`, if present.
-    fn get(&self, key: &str) -> Option<String> {
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<String> {
         self.pairs
             .iter()
             .find(|(k, _)| k == key)
@@ -608,7 +617,8 @@ impl QueryParams {
 
     /// Parse the value for `key` as a `u64`. `Ok(None)` when absent; `Err(())` when
     /// present but not a valid integer (so the caller returns a `400`).
-    fn get_u64(&self, key: &str) -> Result<Option<u64>, ()> {
+    #[allow(clippy::result_unit_err)]
+    pub fn get_u64(&self, key: &str) -> Result<Option<u64>, ()> {
         match self.get(key) {
             None => Ok(None),
             Some(s) => s.trim().parse::<u64>().map(Some).map_err(|_| ()),
@@ -654,6 +664,15 @@ fn error_body(message: &str) -> String {
     // impossible error path, fall back to a fixed valid JSON string.
     serde_json::to_string(&ErrorBody { error: message })
         .unwrap_or_else(|_| "{\"error\":\"internal error\"}".to_owned())
+}
+
+/// Public percent-decoder for a URL path segment (#361): the management layer
+/// URL-decodes the `{k}` key and the `{name}` ACL user out of the path with the
+/// same tolerant decoder the node-addr route uses (`%3A` -> `:`, a malformed `%`
+/// left verbatim).
+#[must_use]
+pub fn percent_decode_path(s: &str) -> String {
+    percent_decode(s)
 }
 
 /// Minimal percent-decoding for a path segment: turns `%3A` into `:` etc. The
@@ -705,8 +724,8 @@ const OPENAPI_JSON: &str = r##"{
   "openapi": "3.0.3",
   "info": {
     "title": "IronCache Console API",
-    "version": "1.0.0",
-    "description": "Read-only monitoring API over a polled IronCache deployment. Unauthenticated today; to be placed behind the auth/RBAC tier (#360) and VPN-locked exposure (#369)."
+    "version": "1.1.0",
+    "description": "Monitoring + node-level management API over a polled IronCache deployment. The read surface is gated by a three-tier RBAC (#360); the management writes (#361, CONFIG SET, key CRUD, the command console, pub/sub publish, ACL user management, persistence save) are ADMIN-tier and enforced server-side. To be placed behind the VPN-locked exposure (#369)."
   },
   "paths": {
     "/api/health": {
@@ -952,6 +971,175 @@ const OPENAPI_JSON: &str = r##"{
           }
         }
       }
+    },
+    "/api/config": {
+      "get": {
+        "summary": "All CONFIG GET parameters (PRIVILEGED_READ).",
+        "responses": {
+          "200": {
+            "description": "Sorted parameter list.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConfigResponse" } } }
+          },
+          "401": { "description": "Auth required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "Node error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "503": { "description": "No seed node configured.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "post": {
+        "summary": "CONFIG SET a parameter (ADMIN).",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConfigSetBody" } } } },
+        "responses": {
+          "200": { "description": "Applied.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Invalid param or body.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Auth required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "Node rejected the set.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/keys": {
+      "get": {
+        "summary": "SCAN the keyspace, one bounded page (PRIVILEGED_READ).",
+        "parameters": [
+          { "name": "pattern", "in": "query", "required": false, "description": "MATCH glob (default *).", "schema": { "type": "string" } },
+          { "name": "cursor", "in": "query", "required": false, "description": "SCAN cursor (default 0).", "schema": { "type": "string" } },
+          { "name": "count", "in": "query", "required": false, "description": "COUNT hint (default 100, clamped).", "schema": { "type": "integer", "format": "int64" } }
+        ],
+        "responses": {
+          "200": { "description": "A SCAN page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScanResponse" } } } },
+          "400": { "description": "Pattern too long.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "Node error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/keys/{k}": {
+      "parameters": [ { "name": "k", "in": "path", "required": true, "description": "URL-encoded key name.", "schema": { "type": "string" } } ],
+      "get": {
+        "summary": "Inspect one key: type, TTL, and a bounded value (PRIVILEGED_READ).",
+        "responses": {
+          "200": { "description": "Key detail.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/KeyDetail" } } } },
+          "404": { "description": "No such key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "Node error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "post": {
+        "summary": "SET a string value on the key (ADMIN). Typed writes are a string SET in v1.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/KeySetBody" } } } },
+        "responses": {
+          "200": { "description": "Set.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Bad key or value.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "delete": {
+        "summary": "DEL the key (ADMIN).",
+        "responses": {
+          "200": { "description": "Deleted count.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Deleted" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/keys/{k}/expire": {
+      "parameters": [ { "name": "k", "in": "path", "required": true, "schema": { "type": "string" } } ],
+      "post": {
+        "summary": "EXPIRE the key in N seconds (ADMIN).",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ExpireBody" } } } },
+        "responses": {
+          "200": { "description": "Whether the timeout was set.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Negative seconds.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/keys/{k}/persist": {
+      "parameters": [ { "name": "k", "in": "path", "required": true, "schema": { "type": "string" } } ],
+      "post": {
+        "summary": "PERSIST the key (remove its TTL) (ADMIN).",
+        "responses": {
+          "200": { "description": "Whether a TTL was removed.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } }
+        }
+      }
+    },
+    "/api/command": {
+      "post": {
+        "summary": "Run an arbitrary command over the node RESP connection (ADMIN). Bounded argv; the node ACL is the bound.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CommandBody" } } } },
+        "responses": {
+          "200": { "description": "The rendered reply (a node -ERR is reply.kind=error).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CommandResponse" } } } },
+          "400": { "description": "Empty / over-bounds argv.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/pubsub/channels": {
+      "get": {
+        "summary": "Active pub/sub channels and subscriber counts (PRIVILEGED_READ).",
+        "responses": {
+          "200": { "description": "Channel list.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelsResponse" } } } },
+          "502": { "description": "Node error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/pubsub/publish": {
+      "post": {
+        "summary": "PUBLISH a message to a channel (ADMIN).",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PublishBody" } } } },
+        "responses": {
+          "200": { "description": "Receiver count.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PublishResponse" } } } },
+          "400": { "description": "Empty channel / over-long message.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/acl": {
+      "get": {
+        "summary": "ACL WHOAMI + LIST + CAT (ADMIN: the full user/permission set).",
+        "responses": {
+          "200": { "description": "ACL state.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AclResponse" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "Node error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/acl/user": {
+      "post": {
+        "summary": "ACL SETUSER username rules... (ADMIN).",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AclUserBody" } } } },
+        "responses": {
+          "200": { "description": "Set.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Bad username / rule.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/acl/user/{name}": {
+      "parameters": [ { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } } ],
+      "delete": {
+        "summary": "ACL DELUSER name (ADMIN).",
+        "responses": {
+          "200": { "description": "Deleted count.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Deleted" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/persistence": {
+      "get": {
+        "summary": "Persistence facts from INFO persistence (PRIVILEGED_READ).",
+        "responses": {
+          "200": { "description": "Persistence state.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersistenceResponse" } } } },
+          "502": { "description": "Node error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/persistence/save": {
+      "post": {
+        "summary": "BGSAVE (default) or SAVE (ADMIN).",
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SaveBody" } } } },
+        "responses": {
+          "200": { "description": "Save started.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "Node error.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
     }
   },
   "components": {
@@ -1135,6 +1323,155 @@ const OPENAPI_JSON: &str = r##"{
             "items": { "$ref": "#/components/schemas/TimeSeries" }
           }
         }
+      },
+      "Ok": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" } },
+        "required": ["ok"]
+      },
+      "Deleted": {
+        "type": "object",
+        "properties": { "deleted": { "type": "integer", "format": "int64" } },
+        "required": ["deleted"]
+      },
+      "ConfigSetBody": {
+        "type": "object",
+        "properties": {
+          "param": { "type": "string", "description": "A config parameter token (no whitespace/CRLF)." },
+          "value": { "type": "string" }
+        },
+        "required": ["param", "value"]
+      },
+      "ConfigResponse": {
+        "type": "object",
+        "properties": {
+          "params": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": { "param": { "type": "string" }, "value": { "type": "string" } }
+            }
+          }
+        }
+      },
+      "ScanKey": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" },
+          "type": { "type": "string" },
+          "ttl": { "type": "integer", "format": "int64", "description": "-1 no expiry, -2 missing." }
+        }
+      },
+      "ScanResponse": {
+        "type": "object",
+        "properties": {
+          "cursor": { "type": "string", "description": "Next SCAN cursor (0 when complete)." },
+          "keys": { "type": "array", "items": { "$ref": "#/components/schemas/ScanKey" } }
+        }
+      },
+      "KeyValue": {
+        "type": "object",
+        "description": "Tagged by kind: string|elements|pairs|none.",
+        "properties": {
+          "kind": { "type": "string", "enum": ["string", "elements", "pairs", "none"] },
+          "data": { "type": "string" },
+          "items": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["kind"]
+      },
+      "KeyDetail": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" },
+          "type": { "type": "string" },
+          "ttl": { "type": "integer", "format": "int64" },
+          "value": { "$ref": "#/components/schemas/KeyValue" },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "KeySetBody": {
+        "type": "object",
+        "properties": { "value": { "type": "string" } },
+        "required": ["value"]
+      },
+      "ExpireBody": {
+        "type": "object",
+        "properties": { "seconds": { "type": "integer", "format": "int64", "description": "A non-negative TTL." } },
+        "required": ["seconds"]
+      },
+      "CommandBody": {
+        "type": "object",
+        "properties": { "args": { "type": "array", "items": { "type": "string" }, "description": "Non-empty argv; each arg and the total are bounded." } },
+        "required": ["args"]
+      },
+      "RenderedReply": {
+        "type": "object",
+        "description": "Tagged by kind: simple|error|integer|bulk|array.",
+        "properties": {
+          "kind": { "type": "string", "enum": ["simple", "error", "integer", "bulk", "array"] },
+          "value": {},
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/RenderedReply" } }
+        },
+        "required": ["kind"]
+      },
+      "CommandResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "command": { "type": "string" },
+          "reply": { "$ref": "#/components/schemas/RenderedReply" }
+        }
+      },
+      "ChannelsResponse": {
+        "type": "object",
+        "properties": {
+          "channels": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": { "channel": { "type": "string" }, "subs": { "type": "integer", "format": "int64" } }
+            }
+          }
+        }
+      },
+      "PublishBody": {
+        "type": "object",
+        "properties": { "channel": { "type": "string" }, "message": { "type": "string" } },
+        "required": ["channel", "message"]
+      },
+      "PublishResponse": {
+        "type": "object",
+        "properties": { "receivers": { "type": "integer", "format": "int64" } }
+      },
+      "AclResponse": {
+        "type": "object",
+        "properties": {
+          "whoami": { "type": "string" },
+          "users": { "type": "array", "items": { "type": "string" } },
+          "categories": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "AclUserBody": {
+        "type": "object",
+        "properties": {
+          "username": { "type": "string" },
+          "rules": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["username"]
+      },
+      "PersistenceResponse": {
+        "type": "object",
+        "properties": {
+          "last_save_unixtime": { "type": "integer", "format": "int64", "nullable": true },
+          "changes_since_save": { "type": "integer", "format": "int64", "nullable": true },
+          "rdb_enabled": { "type": "boolean" },
+          "aof_enabled": { "type": "boolean" },
+          "last_bgsave_status": { "type": "string", "nullable": true }
+        }
+      },
+      "SaveBody": {
+        "type": "object",
+        "properties": { "background": { "type": "boolean", "description": "BGSAVE (true) vs blocking SAVE (false)." } }
       }
     }
   }
@@ -1359,9 +1696,31 @@ mod tests {
             "/api/keyspace",
             "/api/timeseries",
             "/api/openapi.json",
+            // The node-level management surface (#361).
+            "/api/config",
+            "/api/keys",
+            "/api/keys/{k}",
+            "/api/keys/{k}/expire",
+            "/api/keys/{k}/persist",
+            "/api/command",
+            "/api/pubsub/channels",
+            "/api/pubsub/publish",
+            "/api/acl",
+            "/api/acl/user",
+            "/api/acl/user/{name}",
+            "/api/persistence",
+            "/api/persistence/save",
         ] {
             assert!(paths.contains_key(p), "openapi missing path {p}");
         }
+        // The management write paths document their mutating verb.
+        assert!(paths["/api/config"].get("post").is_some(), "config POST");
+        assert!(paths["/api/keys/{k}"].get("delete").is_some(), "key DELETE");
+        assert!(paths["/api/command"].get("post").is_some(), "command POST");
+        assert!(
+            paths["/api/acl/user/{name}"].get("delete").is_some(),
+            "acl deluser DELETE"
+        );
     }
 
     #[test]

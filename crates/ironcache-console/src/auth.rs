@@ -13,9 +13,24 @@
 //!     and node up/down counts, the OpenAPI document). Safe to serve unauthed.
 //!   * [`Tier::PrivilegedRead`]: anything that exposes addresses, key names, or
 //!     client IPs (`/api/nodes`, `/api/nodes/{addr}`, `/api/slowlog`,
-//!     `/api/clients`, `/api/keyspace`).
-//!   * [`Tier::Admin`]: reserved for phase-2 management verbs (#371); none today,
-//!     but the tier exists so the gate already understands it.
+//!     `/api/clients`, `/api/keyspace`), plus the sensitive management READS
+//!     (`/api/config`, `/api/keys`, `/api/keys/{k}`, `/api/pubsub/channels`,
+//!     `/api/persistence`).
+//!   * [`Tier::Admin`]: the node-level MANAGEMENT WRITES (#361): `CONFIG SET`, key
+//!     CRUD (`POST`/`DELETE /api/keys/...`, expire/persist), the arbitrary command
+//!     console (`POST /api/command`), pub/sub publish, ACL user management, and the
+//!     persistence save. Every mutation requires the admin token, enforced
+//!     SERVER-SIDE in the request path BEFORE the handler runs. The `/api/acl`
+//!     READ is Admin too (it discloses the node's full user/permission set).
+//!
+//! ## Method matters for the tier (#361)
+//!
+//! A route's tier now depends on the HTTP METHOD as well as the path: a `GET
+//! /api/config` is a `PrivilegedRead`, but a `POST /api/config` is `Admin`. The
+//! gate consults [`route_tier_for_method`] (the method-aware mapping) so a write
+//! verb can never inherit a read route's lower tier. The default is still FAIL
+//! CLOSED: an unknown route is `PrivilegedRead`, and a non-GET on an unknown route
+//! is `Admin` (a mutation must never default below the admin bar).
 //!
 //! ## Token model
 //!
@@ -60,7 +75,8 @@ pub enum Tier {
     Open,
     /// Exposes addresses, key names, or client IPs; needs the read or admin token.
     PrivilegedRead,
-    /// Reserved for phase-2 management verbs (#371); needs the admin token.
+    /// The node-level management WRITES (#361) and the ACL read; needs the admin
+    /// token. Every mutation the console can issue maps here.
     Admin,
 }
 
@@ -103,7 +119,15 @@ const KNOWN_PRIVILEGED_ROUTES: [&str; 5] = [
     "/api/keyspace",
 ];
 
-/// Map an `/api/*` request path (already query-stripped) to the tier it requires.
+/// The ADMIN read routes: management reads that disclose the node's FULL config or
+/// user/permission set, sensitive enough to require the admin token even to read.
+/// `/api/acl` lists every ACL user and their rules. (Mutations are handled by the
+/// method-aware [`route_tier_for_method`], not this list.)
+const ADMIN_READ_ROUTES: [&str; 1] = ["/api/acl"];
+
+/// Map an `/api/*` request path (already query-stripped) to the tier a GET of it
+/// requires. Equivalent to `route_tier_for_method("GET", path)`; kept for the
+/// callers and tests that reason about the read tier of a path.
 ///
 /// OPEN is the explicit allow-list [`OPEN_ROUTES`]; the DEFAULT for anything else
 /// under `/api/` is `PrivilegedRead` (FAIL CLOSED): a new or unknown endpoint,
@@ -111,8 +135,32 @@ const KNOWN_PRIVILEGED_ROUTES: [&str; 5] = [
 /// treated as sensitive, so none can land in the Open path and evade the gate.
 #[must_use]
 pub fn route_tier(path: &str) -> Tier {
+    route_tier_for_method("GET", path)
+}
+
+/// Map an `/api/*` request (METHOD + already-query-stripped PATH) to the tier it
+/// requires. This is the live mapping the gate uses (#361).
+///
+/// The rules, in order:
+///   * Any NON-GET, NON-HEAD method (`POST`, `DELETE`, `PUT`, ...) is a MUTATION
+///     and requires `Admin`. This is the fail-closed default for writes: a write
+///     verb can never inherit a read route's lower tier, even on an unknown path,
+///     a trailing-slash variant, or a dynamic sub-path.
+///   * A `GET`/`HEAD` of an [`OPEN_ROUTES`] path is `Open`.
+///   * A `GET`/`HEAD` of an [`ADMIN_READ_ROUTES`] path is `Admin` (it discloses the
+///     full config / ACL).
+///   * Every OTHER `GET`/`HEAD` under `/api/` is `PrivilegedRead` (FAIL CLOSED).
+#[must_use]
+pub fn route_tier_for_method(method: &str, path: &str) -> Tier {
+    let is_read = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+    if !is_read {
+        // Any mutation verb is Admin, regardless of path (fail closed for writes).
+        return Tier::Admin;
+    }
     if OPEN_ROUTES.contains(&path) {
         Tier::Open
+    } else if ADMIN_READ_ROUTES.contains(&path) {
+        Tier::Admin
     } else {
         Tier::PrivilegedRead
     }
@@ -345,6 +393,59 @@ mod tests {
             "/api",
         ] {
             assert_eq!(route_tier(p), Tier::PrivilegedRead, "{p} must fail closed");
+        }
+    }
+
+    #[test]
+    fn mutations_require_admin_on_every_path() {
+        // Any non-GET/HEAD verb is Admin, even on Open / unknown / trailing-slash
+        // paths: a write can never inherit a read route's lower tier (#361).
+        for method in ["POST", "DELETE", "PUT", "PATCH", "post", "delete"] {
+            for path in [
+                "/api/config",
+                "/api/keys/foo",
+                "/api/command",
+                "/api/health",  // Open as a GET, but a write here is Admin.
+                "/api/cluster", // ditto.
+                "/api/acl/user/bob",
+                "/api/persistence/save",
+                "/api/bogus",     // unknown -> still Admin for a write.
+                "/api/keys/foo/", // trailing slash -> still Admin.
+            ] {
+                assert_eq!(
+                    route_tier_for_method(method, path),
+                    Tier::Admin,
+                    "{method} {path} must require Admin"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn management_reads_map_to_their_read_tier() {
+        // Sensitive management reads are PrivilegedRead; the ACL read is Admin.
+        for path in [
+            "/api/config",
+            "/api/keys",
+            "/api/keys/foo",
+            "/api/pubsub/channels",
+            "/api/persistence",
+        ] {
+            assert_eq!(
+                route_tier_for_method("GET", path),
+                Tier::PrivilegedRead,
+                "GET {path} must be PrivilegedRead"
+            );
+        }
+        assert_eq!(route_tier_for_method("GET", "/api/acl"), Tier::Admin);
+        // A HEAD is treated like a GET for the tier.
+        assert_eq!(
+            route_tier_for_method("HEAD", "/api/config"),
+            Tier::PrivilegedRead
+        );
+        // The Open routes stay Open as a GET.
+        for p in OPEN_ROUTES {
+            assert_eq!(route_tier_for_method("GET", p), Tier::Open, "{p}");
         }
     }
 

@@ -20,6 +20,65 @@ async fn http_get(addr: SocketAddr, path: &str) -> String {
     String::from_utf8_lossy(&raw).into_owned()
 }
 
+/// Send an arbitrary METHOD + body with an optional Bearer token and read the full
+/// response. Used by the management (#361) write tests.
+async fn http_send(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &str,
+) -> String {
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let auth = token.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: x\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    c.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    c.read_to_end(&mut raw).await.unwrap();
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// Spawn a stub RESP node that answers a scripted reply per command it reads, then
+/// idles. Returns its `host:port`. Used to drive the management dispatch end to end
+/// without a real IronCache.
+async fn spawn_stub_node(replies: Vec<&'static [u8]>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let (mut sock, _peer) = listener.accept().await.unwrap();
+        let mut chunk = [0u8; 4096];
+        for reply in replies {
+            let _ = sock.read(&mut chunk).await;
+            let _ = sock.write_all(reply).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    });
+    addr
+}
+
+/// Build a console HTTP state whose management connections target `node_addr`, with
+/// an explicit auth policy.
+fn state_with_node(auth: ironcache_console::auth::AuthPolicy, node_addr: &str) -> ConsoleHttpState {
+    let access = ironcache_console::node::NodeAccess {
+        addr: node_addr.to_owned(),
+        tls: None,
+        auth: None,
+        connect_timeout: std::time::Duration::from_secs(2),
+        op_timeout: std::time::Duration::from_secs(2),
+    };
+    let s = ConsoleHttpState::with_topology_and_auth(
+        Arc::new(ConsoleMetrics::new()),
+        ironcache_console::poll::new_topology_holder(),
+        auth,
+    )
+    .with_node_access(Some(Arc::new(access)));
+    s.set_live(true);
+    s
+}
+
 #[tokio::test]
 async fn serves_livez_readyz_metrics_and_404_over_tcp() {
     let state = ConsoleHttpState::new(Arc::new(ConsoleMetrics::new()));
@@ -394,4 +453,91 @@ async fn serves_self_hosted_fonts_over_tcp() {
             "{path}: {resp}"
         );
     }
+}
+
+/// The node-level MANAGEMENT layer (#361) end to end over a real TCP socket: the
+/// admin-gated write surface reaches a stub RESP node, the tier gate blocks a
+/// no-token mutation BEFORE the node, the SCAN browser returns the right shape, and
+/// a DELETE requires admin. Exercises the SAME bounded responder + the body read
+/// path.
+#[tokio::test]
+async fn management_surface_over_tcp() {
+    use ironcache_console::auth::AuthPolicy;
+
+    // POST /api/config (CONFIG SET) with the admin token -> {ok}. The stub answers
+    // +OK to the one CONFIG SET command.
+    let node = spawn_stub_node(vec![b"+OK\r\n"]).await;
+    let state = state_with_node(AuthPolicy::resolve(None, Some("admin-tok"), true), &node);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = state.clone();
+    tokio::spawn(async move {
+        accept_loop(listener, serving).await;
+    });
+    let ok = http_send(
+        addr,
+        "POST",
+        "/api/config",
+        Some("admin-tok"),
+        "{\"param\":\"maxmemory\",\"value\":\"128mb\"}",
+    )
+    .await;
+    assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok}");
+    assert!(ok.contains("X-Content-Type-Options: nosniff"), "{ok}");
+    let (_h, body) = split_body(&ok);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["ok"], true);
+
+    // A mutation with NO token is blocked at the gate (401) and never reaches the
+    // node (a fresh state pointed at a dead addr so a 502 would prove a gate leak).
+    let dead = state_with_node(
+        AuthPolicy::resolve(Some("read-tok"), Some("admin-tok"), true),
+        "127.0.0.1:1",
+    );
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    let serving2 = dead.clone();
+    tokio::spawn(async move {
+        accept_loop(listener2, serving2).await;
+    });
+    let unauth = http_send(addr2, "POST", "/api/config", None, "{}").await;
+    assert!(
+        unauth.starts_with("HTTP/1.1 401"),
+        "no token must be 401: {unauth}"
+    );
+    // A read token on a write is 403 (insufficient tier).
+    let forbidden = http_send(addr2, "POST", "/api/config", Some("read-tok"), "{}").await;
+    assert!(
+        forbidden.starts_with("HTTP/1.1 403"),
+        "read token on a write must be 403: {forbidden}"
+    );
+    // A DELETE on a key with the read token is 403 too.
+    let del_denied = http_send(addr2, "DELETE", "/api/keys/foo", Some("read-tok"), "").await;
+    assert!(del_denied.starts_with("HTTP/1.1 403"), "{del_denied}");
+
+    // GET /api/keys (SCAN) returns the {cursor, keys} shape; the stub answers SCAN
+    // then TYPE + TTL for the one key.
+    let scan_node = spawn_stub_node(vec![
+        b"*2\r\n$1\r\n0\r\n*1\r\n$6\r\nuser:1\r\n",
+        b"+string\r\n",
+        b":-1\r\n",
+    ])
+    .await;
+    let scan_state = state_with_node(
+        AuthPolicy::resolve(Some("read-tok"), None, true),
+        &scan_node,
+    );
+    let listener3 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr3 = listener3.local_addr().unwrap();
+    let serving3 = scan_state.clone();
+    tokio::spawn(async move {
+        accept_loop(listener3, serving3).await;
+    });
+    let scan = http_send(addr3, "GET", "/api/keys?pattern=*", Some("read-tok"), "").await;
+    assert!(scan.starts_with("HTTP/1.1 200 OK"), "{scan}");
+    let (_h, body) = split_body(&scan);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["cursor"], "0");
+    assert_eq!(v["keys"][0]["key"], "user:1");
+    assert_eq!(v["keys"][0]["type"], "string");
 }
