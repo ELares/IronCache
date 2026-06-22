@@ -62,3 +62,97 @@ async fn livez_503_before_live_flag_is_set() {
     let livez = http_get(addr, "/livez").await;
     assert!(livez.starts_with("HTTP/1.1 503"), "{livez}");
 }
+
+/// Split a raw HTTP response into the header block and the body.
+fn split_body(resp: &str) -> (&str, &str) {
+    resp.split_once("\r\n\r\n").expect("response has a body")
+}
+
+/// The REST API over a real TCP socket: `/api/cluster` and `/api/nodes` are
+/// `503` JSON before any poll, then return valid JSON of the right shape once a
+/// topology is published into the shared holder. Exercises the SAME bounded
+/// responder the probes use.
+#[tokio::test]
+async fn api_cluster_and_nodes_over_tcp() {
+    use ironcache_console::info::NodeInfo;
+    use ironcache_console::snapshot::{NodeSnapshot, Topology, TopologyMode};
+
+    let state = ConsoleHttpState::new(Arc::new(ConsoleMetrics::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    state.set_live(true);
+    let serving = state.clone();
+    tokio::spawn(async move {
+        accept_loop(listener, serving).await;
+    });
+
+    // Before any poll: 503 JSON with an error field.
+    let before = http_get(addr, "/api/cluster").await;
+    assert!(before.starts_with("HTTP/1.1 503"), "{before}");
+    assert!(before.contains("application/json"), "{before}");
+    let (_h, body) = split_body(&before);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert!(v["error"].is_string(), "{body}");
+
+    // Publish a single-node topology into the shared holder.
+    let info = NodeInfo {
+        redis_version: Some("7.2.4".to_owned()),
+        connected_clients: Some(2),
+        used_memory: Some(4096),
+        total_keys: Some(11),
+        ..Default::default()
+    };
+    let topo = Topology {
+        mode: TopologyMode::Standalone,
+        nodes: vec![NodeSnapshot {
+            addr: "10.0.0.1:6379".to_owned(),
+            reachable: true,
+            error: None,
+            info: Some(info),
+            slowlog: Vec::new(),
+            slowlog_error: None,
+            clients: Vec::new(),
+            clients_error: None,
+            fetched_unixtime: 100,
+        }],
+        fetched_unixtime: 100,
+    };
+    *state.topology().write().await = Some(topo);
+
+    // /api/cluster: 200 JSON overview.
+    let cluster = http_get(addr, "/api/cluster").await;
+    assert!(cluster.starts_with("HTTP/1.1 200 OK"), "{cluster}");
+    let (_h, body) = split_body(&cluster);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["mode"], "standalone");
+    assert_eq!(v["nodes_total"], 1);
+    assert_eq!(v["nodes_reachable"], 1);
+    assert_eq!(v["totals"]["keys"], 11);
+
+    // /api/nodes: 200 JSON array of summaries.
+    let nodes = http_get(addr, "/api/nodes").await;
+    assert!(nodes.starts_with("HTTP/1.1 200 OK"), "{nodes}");
+    let (_h, body) = split_body(&nodes);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert!(v.is_array(), "{body}");
+    assert_eq!(v[0]["addr"], "10.0.0.1:6379");
+    assert_eq!(v[0]["keys"], 11);
+    assert_eq!(v[0]["version"], "7.2.4");
+
+    // /api/nodes/{addr}: 200 for the known node, 404 for an unknown one.
+    let one = http_get(addr, "/api/nodes/10.0.0.1:6379").await;
+    assert!(one.starts_with("HTTP/1.1 200 OK"), "{one}");
+    let (_h, body) = split_body(&one);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["addr"], "10.0.0.1:6379");
+
+    let missing = http_get(addr, "/api/nodes/9.9.9.9:1").await;
+    assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "{missing}");
+
+    // /api/openapi.json: 200 valid JSON.
+    let openapi = http_get(addr, "/api/openapi.json").await;
+    assert!(openapi.starts_with("HTTP/1.1 200 OK"), "{openapi}");
+    let (_h, body) = split_body(&openapi);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["openapi"], "3.0.3");
+}

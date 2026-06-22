@@ -57,6 +57,27 @@ release.
   `IRONCACHE_CONSOLE_*` env), to move behind the privileged/auth tier (#360/#369)
   before exposure. PING now verifies the reply is PONG (or OK) rather than
   accepting any reply.
+- IronCache Console REST API (issue #358) and richer per-node acquisition
+  (finishing #355). Node acquisition now also fetches `SLOWLOG GET 128` and
+  `CLIENT LIST` per node, parsed into typed `SlowlogEntry` and `ClientInfo`
+  values (the client info keeps a raw map for unmodeled fields). Each rich
+  section is RESILIENT: a per-section timeout, parse fault, or ACL denial records
+  that section's error and yields a degraded snapshot, never failing the whole
+  acquire or flipping the node to unreachable. A new JSON REST API hangs off the
+  existing bounded HTTP responder (the whole-request deadline, the size cap, and
+  the concurrency permit all still apply): `GET /api/health`, `/api/cluster`,
+  `/api/nodes`, `/api/nodes/{addr}` (the addr is URL-decoded; 404 on an unknown
+  node), `/api/slowlog`, `/api/clients`, `/api/keyspace`, and a hand-written,
+  valid `/api/openapi.json` (OpenAPI 3.0). Data endpoints return 503 with a JSON
+  error before the first successful poll. Responses are rendered with the new
+  `serde_json` dependency (pure-Rust, on the existing license allowlist), and the
+  response types derive `serde::Serialize`. The `/api/*` surface exposes node
+  internals (addresses, slowlog argv = key names, client IPs); it is
+  unauthenticated today and relies on the loopback default bind, and an inline
+  SECURITY note marks that it must move behind the auth/RBAC tier (#360) and
+  VPN-locked exposure (#369) before the console is exposed. The interim
+  hand-rolled `/debug/topology` JSON route and its `enable_debug_routes` config
+  flag are REMOVED, superseded by the real `/api/*` surface.
 - Keyspace notifications (PROD-8, Redis `notify-keyspace-events`). On a successful
   mutation (and on a TTL expiry / a maxmemory eviction) the server PUBLISHes the
   Redis keyspace + keyevent events to `__keyspace@<db>__:<key>` (payload = the

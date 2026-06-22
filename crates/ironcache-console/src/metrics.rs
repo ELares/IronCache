@@ -79,6 +79,14 @@ impl ConsoleMetrics {
         self.poll_failure_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Console process uptime in seconds, through the env clock seam. Used by the
+    /// REST API `/api/health` (#358) so the API reads time through the same
+    /// determinism boundary the metrics do, never `Instant::now` directly.
+    #[must_use]
+    pub fn uptime_seconds(&self) -> u64 {
+        self.clock.uptime_secs()
+    }
+
     /// Unix time (seconds) of the last successful poll; `0` means "never polled".
     /// An ALWAYS-present series (the engine's `*_last_save_unixtime` idiom): an
     /// operator alerts on staleness with `time() - metric > N`, and on a console

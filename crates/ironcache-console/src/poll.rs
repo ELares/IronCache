@@ -252,20 +252,34 @@ mod tests {
     async fn healthy_seed_flips_ready_after_first_poll() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        // A stub that answers a SINGLE poll (PING + INFO) then idles.
+        // A stub that answers a SINGLE poll (PING + INFO + SLOWLOG + CLIENT LIST)
+        // then idles. The acquire now fetches the rich sections too, so the stub
+        // must reply to all four or the poll's first tick would block on them.
         let server = tokio::spawn(async move {
             let (mut sock, _peer) = listener.accept().await.unwrap();
             let mut chunk = [0u8; 1024];
+            // PING
             let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut chunk)
                 .await
                 .unwrap();
             sock.write_all(b"+PONG\r\n").await.unwrap();
+            // INFO
             let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut chunk)
                 .await
                 .unwrap();
             let body = "redis_version:7.2.0\r\ncluster_enabled:0\r\n";
             let bulk = format!("${}\r\n{body}\r\n", body.len());
             sock.write_all(bulk.as_bytes()).await.unwrap();
+            // SLOWLOG GET -> empty array.
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut chunk)
+                .await
+                .unwrap();
+            sock.write_all(b"*0\r\n").await.unwrap();
+            // CLIENT LIST -> empty bulk.
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut chunk)
+                .await
+                .unwrap();
+            sock.write_all(b"$0\r\n\r\n").await.unwrap();
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 

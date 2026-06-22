@@ -9,14 +9,25 @@
 //! integration tests under `tests/` can drive the real server; `main.rs` is a
 //! thin entry point over [`run_cli`].
 //!
-//! PR-1 scope (this crate today): boot plus wire. A standalone HTTP server with
-//! `/livez`, `/readyz`, and the console's OWN `/metrics` (so the monitor can be
-//! monitored), layered config (TOML plus `IRONCACHE_CONSOLE_*` env), and
-//! structured tracing. Node acquisition, the single-node topology view, the
-//! aggregation/REST/UI layers, and TLS land in later PRs (#355, #366, #356,
-//! #358, #359).
+//! Scope so far: boot plus wire (a standalone HTTP server with `/livez`,
+//! `/readyz`, and the console's OWN `/metrics` so the monitor can be monitored,
+//! layered config, structured tracing); node acquisition + the single-node
+//! topology view (#355, #366); and now the REST API (#358). The `/api/*` surface
+//! serves stable JSON over the polled topology: `/api/health`, `/api/cluster`,
+//! `/api/nodes`, `/api/nodes/{addr}`, `/api/slowlog`, `/api/clients`,
+//! `/api/keyspace`, and a static `/api/openapi.json`. Node acquisition now also
+//! fetches `SLOWLOG GET` and `CLIENT LIST` per node (each resilient: a per-section
+//! failure or ACL denial records that section's error and yields a degraded
+//! snapshot, never failing the whole acquire). The aggregation-from-Prometheus
+//! layer, the UI, and TLS hardening land in later PRs (#356, #359, #369).
+//!
+//! SECURITY: the `/api/*` surface exposes node internals (addresses, slowlog argv
+//! = key names, client IPs) and is UNAUTHENTICATED today; it relies on the
+//! loopback default bind and MUST move behind the auth/RBAC tier (#360) and the
+//! VPN-locked exposure (#369) before the console is exposed.
 #![forbid(unsafe_code)]
 
+pub mod api;
 pub mod cli;
 pub mod config;
 pub mod http;
@@ -101,16 +112,9 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
     rt.block_on(async {
         let metrics = Arc::new(metrics::ConsoleMetrics::new());
         // The shared topology cell: the poll loop writes it, the HTTP surface
-        // (and the future REST API, #358) reads it.
+        // (the REST API, #358) reads it.
         let topology = poll::new_topology_holder();
-        // `enable_debug_routes` gates the unauthenticated `/debug/topology` recon
-        // route (default OFF); pass it explicitly so the route is only served when
-        // the operator opted in.
-        let state = http::ConsoleHttpState::with_options(
-            metrics.clone(),
-            topology.clone(),
-            cfg.enable_debug_routes,
-        );
+        let state = http::ConsoleHttpState::with_topology(metrics.clone(), topology.clone());
         let listener = tokio::net::TcpListener::bind(&cfg.http_addr)
             .await
             .with_context(|| format!("binding the console HTTP address {}", cfg.http_addr))?;

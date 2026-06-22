@@ -74,6 +74,11 @@ clap = { version = "4.5", features = ["derive"] }
 # Config and serde stack (CONFIG.md).
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
+# JSON serialization for the console REST API (#358). PURE RUST (no C lib), so the
+# musl/aarch64 static cross-build is unaffected, and MIT OR Apache-2.0 (already on
+# the deny.toml license allowlist). Used ONLY by the console crate to render the
+# `/api/*` response bodies; the engine data plane does not depend on it.
+serde_json = "1.0"
 # Typed errors (no stringly-typed errors per ERRORS.md internal-mapping rule).
 thiserror = "2.0"
 anyhow = "1.0"

@@ -338,6 +338,190 @@ impl NodeClient {
             ))),
         }
     }
+
+    /// `SLOWLOG GET <count>` and parse the reply array into [`SlowlogEntry`]
+    /// values. The reply is a RESP array of 6-field entries; a non-array reply is
+    /// a protocol error. Individual malformed entries are skipped (parsed
+    /// defensively) rather than failing the whole call, so one odd entry does not
+    /// blind the dashboard to the rest.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`NodeError`]; returns [`NodeError::Protocol`] if SLOWLOG did not
+    /// reply with an array (and [`NodeError::Command`] on a `-ERR` / ACL denial).
+    pub async fn slowlog(&mut self, count: u64) -> Result<Vec<SlowlogEntry>, NodeError> {
+        let count = count.to_string();
+        let reply = self
+            .command(&[b"SLOWLOG", b"GET", count.as_bytes()])
+            .await?;
+        match reply {
+            RespValue::Array(items) => Ok(parse_slowlog(&items)),
+            other => Err(NodeError::Protocol(format!(
+                "unexpected SLOWLOG reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// `CLIENT LIST` and parse the bulk-string reply (one client per line) into
+    /// [`ClientInfo`] values. A non-text reply is a protocol error; an empty body
+    /// yields an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`NodeError`]; returns [`NodeError::Protocol`] if CLIENT LIST did
+    /// not reply with a bulk/simple string (and [`NodeError::Command`] on a `-ERR`
+    /// / ACL denial).
+    pub async fn client_list(&mut self) -> Result<Vec<ClientInfo>, NodeError> {
+        let reply = self.command(&[b"CLIENT", b"LIST"]).await?;
+        match reply.as_text_bytes() {
+            Some(bytes) => Ok(parse_client_list(&String::from_utf8_lossy(bytes))),
+            None => Err(NodeError::Protocol(format!(
+                "unexpected CLIENT LIST reply: {reply:?}"
+            ))),
+        }
+    }
+}
+
+/// One entry from `SLOWLOG GET`: a command the node logged as slow. The canonical
+/// Redis entry is a 6-element array `[id, timestamp, micros, [argv...],
+/// client_addr, client_name]`; older servers omit the trailing client fields,
+/// which are left empty here. The `argv` is decoded lossily (a key/value may be
+/// non-UTF-8) and is the recon-sensitive part (it can contain key names).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SlowlogEntry {
+    /// The unique, monotonically increasing entry id.
+    pub id: i64,
+    /// Unix time (seconds) the slow command ran.
+    pub timestamp: i64,
+    /// The command's execution time in microseconds.
+    pub micros: i64,
+    /// The command and its arguments, each decoded lossily from the bulk reply.
+    pub argv: Vec<String>,
+    /// The client `addr:port` (RESP-array form, server 4.0+); empty if absent.
+    pub client_addr: String,
+    /// The client connection name (`CLIENT SETNAME`); empty if absent / unset.
+    pub client_name: String,
+}
+
+/// One client from `CLIENT LIST`: the dashboard-relevant fields plus the full raw
+/// `field=value` map for anything not modeled. Every typed field is optional so a
+/// server that omits one (version skew) leaves it `None` rather than defaulting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ClientInfo {
+    /// `id` (the unique client connection id).
+    pub id: Option<u64>,
+    /// `addr` (the client `peer:port`).
+    pub addr: Option<String>,
+    /// `name` (the `CLIENT SETNAME` value; empty string in the reply if unset).
+    pub name: Option<String>,
+    /// `age` (seconds the connection has been open).
+    pub age: Option<u64>,
+    /// `idle` (seconds since the last command on this connection).
+    pub idle: Option<u64>,
+    /// `db` (the selected database index).
+    pub db: Option<u64>,
+    /// `cmd` (the last command, e.g. `get` or `client|list`).
+    pub cmd: Option<String>,
+    /// The full `field=value` map (every parsed field), for fields not modeled.
+    pub raw: std::collections::HashMap<String, String>,
+}
+
+/// Parse a `SLOWLOG GET` reply array (already extracted from the RESP frame) into
+/// [`SlowlogEntry`] values. Each element should itself be a 6-field array; an
+/// element with too few fields or the wrong shape is SKIPPED (defensive), never a
+/// panic. The argv sub-array is decoded element by element (lossy UTF-8).
+fn parse_slowlog(items: &[RespValue]) -> Vec<SlowlogEntry> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let RespValue::Array(fields) = item else {
+            continue;
+        };
+        // Need at least id, timestamp, micros, argv. The two client fields are
+        // optional (older servers omit them).
+        if fields.len() < 4 {
+            continue;
+        }
+        let (Some(id), Some(timestamp), Some(micros)) = (
+            resp_int(&fields[0]),
+            resp_int(&fields[1]),
+            resp_int(&fields[2]),
+        ) else {
+            continue;
+        };
+        let argv = match &fields[3] {
+            RespValue::Array(args) => args.iter().filter_map(resp_text).collect(),
+            _ => Vec::new(),
+        };
+        let client_addr = fields.get(4).and_then(resp_text).unwrap_or_default();
+        let client_name = fields.get(5).and_then(resp_text).unwrap_or_default();
+        out.push(SlowlogEntry {
+            id,
+            timestamp,
+            micros,
+            argv,
+            client_addr,
+            client_name,
+        });
+    }
+    out
+}
+
+/// Parse a `CLIENT LIST` bulk body (one client per line, space-separated
+/// `field=value` pairs) into [`ClientInfo`] values. Tolerant: a blank line is
+/// skipped, a token without `=` is ignored, every `field=value` is recorded in
+/// `raw`, and the typed fields are read out of that map (a missing or
+/// unparseable numeric field becomes `None`).
+fn parse_client_list(body: &str) -> Vec<ClientInfo> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut raw: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for token in line.split(' ') {
+            if let Some((k, v)) = token.split_once('=') {
+                if !k.is_empty() {
+                    raw.insert(k.to_owned(), v.to_owned());
+                }
+            }
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        let u = |k: &str| raw.get(k).and_then(|v| v.parse::<u64>().ok());
+        let s = |k: &str| raw.get(k).map(ToOwned::to_owned);
+        out.push(ClientInfo {
+            id: u("id"),
+            addr: s("addr"),
+            name: s("name"),
+            age: u("age"),
+            idle: u("idle"),
+            db: u("db"),
+            cmd: s("cmd"),
+            raw,
+        });
+    }
+    out
+}
+
+/// Borrow an integer from a [`RespValue::Integer`], or a [`RespValue`] text body
+/// that parses as an i64 (some servers return SLOWLOG numeric fields as bulk).
+fn resp_int(v: &RespValue) -> Option<i64> {
+    match v {
+        RespValue::Integer(n) => Some(*n),
+        other => other
+            .as_text_bytes()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|s| s.trim().parse().ok()),
+    }
+}
+
+/// Decode a [`RespValue`] text body (simple or bulk) to a lossy `String`, or
+/// `None` for a non-text value.
+fn resp_text(v: &RespValue) -> Option<String> {
+    v.as_text_bytes()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
 /// Read the node password from `path`, trimming a single trailing newline (the
@@ -427,6 +611,119 @@ mod tests {
     fn encodes_a_command_as_resp_bulk_array() {
         let bytes = encode_command(&[b"AUTH", b"user", b"pw"]);
         assert_eq!(bytes, b"*3\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n$2\r\npw\r\n");
+    }
+
+    #[test]
+    fn parse_slowlog_parses_realistic_entries() {
+        // A realistic SLOWLOG GET reply: two 6-field entries. Entry 0 is a
+        // `GET foo` that took 15000us; entry 1 is a `SET bar baz`. The argv
+        // bulks carry KEY NAMES (the recon-sensitive part). Server 4.0+ adds the
+        // client addr + name trailing fields.
+        let items = vec![
+            RespValue::Array(vec![
+                RespValue::Integer(1),
+                RespValue::Integer(1_700_000_000),
+                RespValue::Integer(15_000),
+                RespValue::Array(vec![
+                    RespValue::Bulk(Some(b"GET".to_vec())),
+                    RespValue::Bulk(Some(b"foo".to_vec())),
+                ]),
+                RespValue::Bulk(Some(b"10.0.0.7:54321".to_vec())),
+                RespValue::Bulk(Some(b"worker-1".to_vec())),
+            ]),
+            RespValue::Array(vec![
+                RespValue::Integer(0),
+                RespValue::Integer(1_699_999_900),
+                RespValue::Integer(8_200),
+                RespValue::Array(vec![
+                    RespValue::Bulk(Some(b"SET".to_vec())),
+                    RespValue::Bulk(Some(b"bar".to_vec())),
+                    RespValue::Bulk(Some(b"baz".to_vec())),
+                ]),
+                RespValue::Bulk(Some(b"10.0.0.8:40000".to_vec())),
+                RespValue::Bulk(Some(b"".to_vec())),
+            ]),
+        ];
+        let entries = parse_slowlog(&items);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, 1);
+        assert_eq!(entries[0].timestamp, 1_700_000_000);
+        assert_eq!(entries[0].micros, 15_000);
+        assert_eq!(entries[0].argv, vec!["GET", "foo"]);
+        assert_eq!(entries[0].client_addr, "10.0.0.7:54321");
+        assert_eq!(entries[0].client_name, "worker-1");
+        assert_eq!(entries[1].argv, vec!["SET", "bar", "baz"]);
+        assert_eq!(entries[1].client_name, "");
+    }
+
+    #[test]
+    fn parse_slowlog_tolerates_old_servers_and_bad_entries() {
+        let items = vec![
+            // Old server: only the first 4 fields, no client addr/name.
+            RespValue::Array(vec![
+                RespValue::Integer(5),
+                RespValue::Integer(123),
+                RespValue::Integer(99),
+                RespValue::Array(vec![RespValue::Bulk(Some(b"PING".to_vec()))]),
+            ]),
+            // Too few fields: skipped, not a panic.
+            RespValue::Array(vec![RespValue::Integer(6)]),
+            // Wrong shape (not an array): skipped.
+            RespValue::Integer(7),
+        ];
+        let entries = parse_slowlog(&items);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 5);
+        assert_eq!(entries[0].argv, vec!["PING"]);
+        assert_eq!(entries[0].client_addr, "");
+        assert_eq!(entries[0].client_name, "");
+    }
+
+    #[test]
+    fn parse_client_list_parses_realistic_lines() {
+        // A realistic two-client CLIENT LIST body. The first line is the querying
+        // client itself (cmd=client|list); the second is a worker. The fields are
+        // space-separated `field=value`; `tot-net-in` is an UNMODELED field that
+        // must survive in `raw`.
+        let body = "id=7 addr=127.0.0.1:6379 name=console age=42 idle=0 db=0 cmd=client|list tot-net-in=120\n\
+                    id=8 addr=10.0.0.9:5050 name= age=3600 idle=12 db=2 cmd=get\n";
+        let clients = parse_client_list(body);
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].id, Some(7));
+        assert_eq!(clients[0].addr.as_deref(), Some("127.0.0.1:6379"));
+        assert_eq!(clients[0].name.as_deref(), Some("console"));
+        assert_eq!(clients[0].age, Some(42));
+        assert_eq!(clients[0].idle, Some(0));
+        assert_eq!(clients[0].db, Some(0));
+        assert_eq!(clients[0].cmd.as_deref(), Some("client|list"));
+        // The unmodeled field survives in raw.
+        assert_eq!(
+            clients[0].raw.get("tot-net-in").map(String::as_str),
+            Some("120")
+        );
+        // The worker: an empty name parses to Some("") (the field WAS present).
+        assert_eq!(clients[1].id, Some(8));
+        assert_eq!(clients[1].name.as_deref(), Some(""));
+        assert_eq!(clients[1].db, Some(2));
+        assert_eq!(clients[1].cmd.as_deref(), Some("get"));
+    }
+
+    #[test]
+    fn parse_client_list_tolerates_blanks_and_missing_fields() {
+        // A blank line, a line with a tokenless field, and a line missing the
+        // numeric fields (so they parse to None, not a default).
+        let body = "\n   \nid=1 addr=1.2.3.4:9 cmd=ping bogus noeq\n";
+        let clients = parse_client_list(body);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].id, Some(1));
+        assert_eq!(clients[0].addr.as_deref(), Some("1.2.3.4:9"));
+        assert_eq!(clients[0].cmd.as_deref(), Some("ping"));
+        // Unset numeric fields are None, not 0.
+        assert_eq!(clients[0].age, None);
+        assert_eq!(clients[0].idle, None);
+        assert_eq!(clients[0].db, None);
+        // A non-key=value token is ignored, not recorded.
+        assert!(!clients[0].raw.contains_key("bogus"));
     }
 
     #[test]
