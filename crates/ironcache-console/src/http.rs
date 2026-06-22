@@ -184,6 +184,33 @@ impl ConsoleHttpState {
         }
         let path = path.split('?').next().unwrap_or(path);
         match path {
+            // The dashboard SPA (#359): static assets embedded with `include_str!`
+            // and served off this same responder. They need no topology, so they
+            // live here in the sync `respond`. Each carries the strict UI security
+            // headers (CSP, nosniff, frame-deny, no-referrer): CSS and JS are
+            // SEPARATE files so the CSP `default-src 'self'` needs no
+            // 'unsafe-inline'.
+            //
+            // SECURITY: the dashboard reads the unauthenticated `/api/*` recon
+            // surface (node addresses, slowlog argv = key names, client IPs). The
+            // UI is UNAUTHENTICATED today and relies on the loopback default bind;
+            // it MUST move behind the auth/RBAC tier (#360) and VPN-locked
+            // exposure (#369) before the console is exposed. See [`crate::api`].
+            "/" => ui_response(
+                "text/html; charset=utf-8",
+                crate::assets::INDEX_HTML.as_bytes(),
+                head,
+            ),
+            "/app.css" => ui_response(
+                "text/css; charset=utf-8",
+                crate::assets::APP_CSS.as_bytes(),
+                head,
+            ),
+            "/app.js" => ui_response(
+                "application/javascript; charset=utf-8",
+                crate::assets::APP_JS.as_bytes(),
+                head,
+            ),
             "/metrics" => http_response(
                 200,
                 "OK",
@@ -242,14 +269,52 @@ fn status_reason(code: u16) -> &'static str {
     }
 }
 
+/// The extra response headers carried by the UI assets (the dashboard SPA,
+/// #359). A strict CSP that allows ONLY same-origin resources (so the separate
+/// `app.css` / `app.js` load while inline script/style and any external/CDN
+/// fetch are blocked), plus `X-Content-Type-Options: nosniff`, `X-Frame-Options:
+/// DENY`, and `Referrer-Policy: no-referrer`. Each line is `Name: value\r\n`;
+/// the builder inserts the block before the blank-line terminator.
+const UI_SECURITY_HEADERS: &str = concat!(
+    "Content-Security-Policy: default-src 'self'; base-uri 'none'; ",
+    "frame-ancestors 'none'; object-src 'none'\r\n",
+    "X-Content-Type-Options: nosniff\r\n",
+    "X-Frame-Options: DENY\r\n",
+    "Referrer-Policy: no-referrer\r\n",
+);
+
 /// Build a complete HTTP/1.1 response (status line, content headers,
 /// `Connection: close`, body). One request per connection. When `head` is true
 /// the `Content-Length` reflects what a GET would return but NO body bytes are
 /// written (RFC 9110: a HEAD response must not carry a message body).
 fn http_response(code: u16, reason: &str, content_type: &str, body: &[u8], head: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 128);
+    http_response_with_headers(code, reason, content_type, body, head, "")
+}
+
+/// A `200 OK` for a static UI asset, carrying the strict [`UI_SECURITY_HEADERS`]
+/// in addition to the normal content headers. A HEAD still returns the headers
+/// with the correct `Content-Length` but no body.
+fn ui_response(content_type: &str, body: &[u8], head: bool) -> Vec<u8> {
+    http_response_with_headers(200, "OK", content_type, body, head, UI_SECURITY_HEADERS)
+}
+
+/// [`http_response`] with an OPTIONAL block of `extra_headers` (each a complete
+/// `Name: value\r\n` line, or empty for none) inserted before the blank-line
+/// terminator. The status line, `Content-Type`, `Content-Length`, and
+/// `Connection: close` are always emitted (so the existing probe/metrics/api
+/// responses are byte-for-byte unchanged when `extra_headers` is empty), and a
+/// HEAD still writes no body.
+fn http_response_with_headers(
+    code: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+    head: bool,
+    extra_headers: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 256);
     let header = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n",
         body.len()
     );
     out.extend_from_slice(header.as_bytes());
@@ -415,6 +480,101 @@ mod tests {
     fn unknown_path_is_404() {
         let resp = String::from_utf8(test_state().respond("GET", "/nope")).unwrap();
         assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "{resp}");
+    }
+
+    #[test]
+    fn root_serves_html_with_the_security_headers() {
+        let resp = String::from_utf8(test_state().respond("GET", "/")).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(
+            resp.contains("Content-Type: text/html; charset=utf-8"),
+            "{resp}"
+        );
+        // The strict UI security headers are present.
+        assert!(
+            resp.contains("Content-Security-Policy: default-src 'self'"),
+            "missing CSP: {resp}"
+        );
+        assert!(resp.contains("X-Content-Type-Options: nosniff"), "{resp}");
+        assert!(resp.contains("X-Frame-Options: DENY"), "{resp}");
+        assert!(resp.contains("Referrer-Policy: no-referrer"), "{resp}");
+        // The existing Connection: close is still emitted.
+        assert!(resp.contains("Connection: close"), "{resp}");
+        // A known marker from the dashboard shell is in the body, and it links
+        // the SEPARATE css/js (so the CSP needs no 'unsafe-inline').
+        let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(body.contains("IronCache Console"), "{body}");
+        assert!(body.contains("/app.css"), "{body}");
+        assert!(body.contains("/app.js"), "{body}");
+    }
+
+    #[test]
+    fn app_js_is_served_as_javascript() {
+        let resp = String::from_utf8(test_state().respond("GET", "/app.js")).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(
+            resp.contains("Content-Type: application/javascript; charset=utf-8"),
+            "{resp}"
+        );
+        assert!(
+            resp.contains("Content-Security-Policy: default-src 'self'"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn app_css_is_served_as_css() {
+        let resp = String::from_utf8(test_state().respond("GET", "/app.css")).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(
+            resp.contains("Content-Type: text/css; charset=utf-8"),
+            "{resp}"
+        );
+        assert!(
+            resp.contains("Content-Security-Policy: default-src 'self'"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn head_on_root_has_the_headers_but_no_body() {
+        let resp = String::from_utf8(test_state().respond("HEAD", "/")).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        // The headers (incl. CSP and a non-zero Content-Length) are present.
+        assert!(
+            resp.contains("Content-Security-Policy: default-src 'self'"),
+            "{resp}"
+        );
+        let (header, body) = resp.split_once("\r\n\r\n").unwrap();
+        let cl: usize = header
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            cl > 0,
+            "HEAD Content-Length should match the GET body length"
+        );
+        // ...but no body bytes follow (RFC 9110).
+        assert!(body.is_empty(), "HEAD must not return a body, got {body:?}");
+        // The GET on `/` returns a body of exactly that length.
+        let get = String::from_utf8(test_state().respond("GET", "/")).unwrap();
+        let (_gh, gbody) = get.split_once("\r\n\r\n").unwrap();
+        assert_eq!(gbody.len(), cl);
+    }
+
+    #[test]
+    fn metrics_response_is_unchanged_by_the_header_extension() {
+        // The probe/metrics responses must NOT carry the UI security headers (the
+        // header-block extension is opt-in via `ui_response`), and the existing
+        // headers are intact.
+        let resp = String::from_utf8(test_state().respond("GET", "/metrics")).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+        assert!(!resp.contains("Content-Security-Policy"), "{resp}");
+        assert!(!resp.contains("X-Frame-Options"), "{resp}");
+        assert!(resp.contains("Connection: close"), "{resp}");
     }
 
     /// `/api/health` is served through the bounded responder, returns JSON, and

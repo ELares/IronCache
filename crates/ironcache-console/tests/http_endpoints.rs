@@ -247,3 +247,63 @@ async fn api_timeseries_over_tcp() {
     let bad = http_get(addr2, "/api/timeseries?metric=rate(up%5B5m%5D)").await;
     assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
 }
+
+/// The dashboard SPA (#359) over a real TCP socket: `GET /` returns the HTML
+/// shell with the strict security headers and references the SEPARATE app.css /
+/// app.js, and `GET /app.js` returns the JavaScript. The UI needs no topology,
+/// so it serves even before the first poll. Exercises the SAME bounded responder
+/// the probes use.
+#[tokio::test]
+async fn serves_dashboard_assets_over_tcp() {
+    let state = ConsoleHttpState::new(Arc::new(ConsoleMetrics::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    state.set_live(true);
+    let serving = state.clone();
+    tokio::spawn(async move {
+        accept_loop(listener, serving).await;
+    });
+
+    // GET / -> the HTML shell with the security headers and the asset links.
+    let index = http_get(addr, "/").await;
+    assert!(index.starts_with("HTTP/1.1 200 OK"), "{index}");
+    assert!(
+        index.contains("Content-Type: text/html; charset=utf-8"),
+        "{index}"
+    );
+    assert!(
+        index.contains("Content-Security-Policy: default-src 'self'"),
+        "missing CSP: {index}"
+    );
+    assert!(index.contains("X-Content-Type-Options: nosniff"), "{index}");
+    assert!(index.contains("X-Frame-Options: DENY"), "{index}");
+    assert!(index.contains("Referrer-Policy: no-referrer"), "{index}");
+    let (_h, body) = split_body(&index);
+    assert!(body.contains("IronCache Console"), "{body}");
+    // The HTML references the separate CSS/JS (so the CSP needs no inline).
+    assert!(body.contains("/app.css"), "{body}");
+    assert!(body.contains("/app.js"), "{body}");
+
+    // GET /app.js -> the dashboard JavaScript.
+    let js = http_get(addr, "/app.js").await;
+    assert!(js.starts_with("HTTP/1.1 200 OK"), "{js}");
+    assert!(
+        js.contains("Content-Type: application/javascript; charset=utf-8"),
+        "{js}"
+    );
+    let (_h, jsbody) = split_body(&js);
+    // It fetches the /api/* surface and avoids the innerHTML XSS sink.
+    assert!(jsbody.contains("/api/cluster"), "{jsbody}");
+    assert!(
+        !jsbody.contains(".innerHTML"),
+        "app.js must avoid innerHTML"
+    );
+
+    // GET /app.css -> the dashboard stylesheet.
+    let css = http_get(addr, "/app.css").await;
+    assert!(css.starts_with("HTTP/1.1 200 OK"), "{css}");
+    assert!(
+        css.contains("Content-Type: text/css; charset=utf-8"),
+        "{css}"
+    );
+}

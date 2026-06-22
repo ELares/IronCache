@@ -107,6 +107,32 @@ release.
   numeric parameter, 502 on a source/transport failure, and 200 with the series
   otherwise. The window's "now" is read through the `ironcache-env` clock seam, not
   the system clock directly.
+- IronCache Console dashboard SPA (issue #359). A functional, API-driven
+  monitoring dashboard served by the console's OWN HTTP responder at `GET /`,
+  with the stylesheet and script at `GET /app.css` and `GET /app.js`. The UI is
+  plain HTML plus CSS plus vanilla JavaScript: no npm, no framework, no build
+  step, and no external CDN, keeping the static-musl pure-Rust posture. The three
+  assets are embedded in the binary with `include_str!` (a new `assets` module)
+  and served off the same bounded responder the probes and the `/api/*` surface
+  use (the whole-request deadline, the size cap, and the concurrency permit still
+  apply). CSS and JS are SEPARATE files (never inline) so the served pages run
+  under a strict `Content-Security-Policy: default-src 'self'` with NO
+  `unsafe-inline`; the HTML, CSS, and JS responses also carry
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and
+  `Referrer-Policy: no-referrer`. The dashboard polls `/api/cluster`,
+  `/api/nodes`, `/api/slowlog`, `/api/clients`, `/api/keyspace`, and `/api/health`
+  on load and every 5 seconds, rendering the cluster totals, a per-node table, a
+  slowlog table, a clients table, and a keyspace panel, plus a header with the
+  deployment mode, nodes reachable / total, the last-poll age (computed from
+  `last_poll_unixtime` against the browser clock), and the console version. It
+  handles the pre-first-poll 503 gracefully (a "waiting for the first node poll"
+  state that keeps retrying) and a fetch error (a banner while keeping the last
+  good data on screen). Every server-supplied string (the slowlog argv and the
+  client fields are attacker-influenceable via a compromised node) reaches the
+  DOM only through `textContent` / `createTextNode`, never `innerHTML`, so there
+  is no XSS sink. An inline SECURITY note marks that the UI is unauthenticated
+  today behind the loopback default bind and must move behind the auth/RBAC tier
+  (#360) and VPN-locked exposure (#369) before exposure.
 - Keyspace notifications (PROD-8, Redis `notify-keyspace-events`). On a successful
   mutation (and on a TTL expiry / a maxmemory eviction) the server PUBLISHes the
   Redis keyspace + keyevent events to `__keyspace@<db>__:<key>` (payload = the
