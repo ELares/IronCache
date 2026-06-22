@@ -86,6 +86,13 @@ pub struct RuntimeConfig {
     /// load) when deciding whether to reject a new connection, so a `CONFIG SET maxclients` takes
     /// effect for subsequent connections without a restart. Seeded from the boot config.
     maxclients: AtomicU64,
+    /// The idle client timeout in SECONDS (Redis `timeout`, PROD-SAFETY #4). `0` (the Redis
+    /// default) DISABLES idle disconnection (a connection is never closed for being idle).
+    /// Runtime-settable via `CONFIG SET timeout`; the serve loop RE-READS it (one relaxed load) at
+    /// the top of each connection-loop iteration before the idle wait, so a `CONFIG SET timeout`
+    /// takes effect LIVE for already-connected clients (was boot-only -- a change used to require a
+    /// restart, dropping every client). Seeded from the boot config.
+    timeout_secs: AtomicU64,
     /// The per-connection output-buffer hard cap in bytes (PROD-SAFETY #5). `0` disables the cap.
     /// Runtime-settable via `CONFIG SET output-buffer-limit`; the serve loop reads it (one relaxed
     /// load) after each batch is rendered, so a `CONFIG SET` takes effect for subsequent batches.
@@ -150,6 +157,10 @@ impl RuntimeConfig {
             // boot config so a node started with a configured value keeps it; a later `CONFIG SET`
             // overrides these live (the accept path / serve loop read them with a relaxed load).
             maxclients: AtomicU64::new(cfg.maxclients),
+            // The idle client timeout (PROD-SAFETY #4), seeded from the boot config so a node
+            // started with a configured timeout keeps it; a later `CONFIG SET timeout` overrides it
+            // live (the serve loop re-reads it each connection-loop iteration).
+            timeout_secs: AtomicU64::new(cfg.timeout_secs),
             output_buffer_limit: AtomicU64::new(cfg.output_buffer_limit),
             // The SLOWLOG knobs (PROD-7), seeded from the boot config so a node started with a
             // configured threshold/length keeps it; a later `CONFIG SET slowlog-*` overrides live.
@@ -307,6 +318,23 @@ impl RuntimeConfig {
         self.maxclients.store(n, Ordering::Relaxed);
     }
 
+    /// The current effective idle client timeout in SECONDS (Redis `timeout`, PROD-SAFETY #4); `0`
+    /// disables idle disconnection. A single relaxed atomic load: the serve loop re-reads it at the
+    /// top of each connection-loop iteration (a cold, post-batch read, NOT per command) to compute
+    /// the fresh idle deadline.
+    #[must_use]
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET timeout <secs>`: store the new idle timeout (a relaxed atomic store); `0`
+    /// disables idle disconnection. The serve loop reads `timeout_secs()` each connection-loop
+    /// iteration, so the new value applies LIVE to already-connected clients on their next idle wait
+    /// (a non-zero<->0 change switches between the timer-select arm and the plain-recv arm).
+    pub fn set_timeout_secs(&self, secs: u64) {
+        self.timeout_secs.store(secs, Ordering::Relaxed);
+    }
+
     /// The current effective per-connection output-buffer hard cap in bytes (PROD-SAFETY #5);
     /// `0` disables the cap. A single relaxed atomic load: the serve loop reads it after each
     /// rendered batch (off the per-command decode/dispatch hot path).
@@ -432,6 +460,28 @@ mod tests {
         let g2 = rc.set_policy_name("volatile-ttl");
         assert_eq!(g2, g1 + 1);
         assert_eq!(rc.policy_name(), "volatile-ttl");
+    }
+
+    #[test]
+    fn set_timeout_secs_round_trips() {
+        // The idle timeout (PROD-SAFETY #4) is runtime-settable: it seeds from the boot config and
+        // a setter overrides it live (the serve loop re-reads it each iteration). `0` disables it.
+        let cfg = Config {
+            timeout_secs: 45,
+            ..Config::default()
+        };
+        let rc = RuntimeConfig::from_config(&cfg);
+        // Seeded from the boot config.
+        assert_eq!(rc.timeout_secs(), 45);
+        // A setter overrides it.
+        rc.set_timeout_secs(30);
+        assert_eq!(rc.timeout_secs(), 30);
+        // `0` disables idle disconnection.
+        rc.set_timeout_secs(0);
+        assert_eq!(rc.timeout_secs(), 0);
+        // The default boot config seeds `0` (Redis default: idle disconnection off).
+        let rc_default = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(rc_default.timeout_secs(), 0);
     }
 
     #[test]

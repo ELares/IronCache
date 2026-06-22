@@ -34,6 +34,15 @@ release.
 
 ### Changed
 
+- The `timeout` idle-client directive is now runtime-settable via `CONFIG SET
+  timeout <secs>` / `CONFIG GET timeout` (it was boot-only, so changing it used to
+  require a full server restart that dropped every connected client). The serve
+  loop re-reads the live value from the runtime-config overlay at the top of each
+  connection-loop iteration before its idle wait, so a `CONFIG SET timeout` takes
+  effect immediately for already-connected clients on their next idle wait; `0`
+  disables idle disconnection, and a negative or non-numeric value is rejected
+  rather than silently coerced. This matches Redis, where `timeout` is a modifiable
+  config.
 - IronCache Console dashboard re-skin to the bespoke Butlr design system (issue
   #359). The generic dark dashboard is replaced with the real design language: a
   full-height sidebar (brand chip plus grouped nav) and topbar (page title, a

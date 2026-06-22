@@ -103,6 +103,7 @@ pub struct ParamSpec {
 /// shard count under the Redis-recognized `io-threads` name plus the native
 /// `shards`). New params are added here as their subsystems land.
 #[must_use]
+#[allow(clippy::too_many_lines)] // the registered-parameter table is intentionally long and grows by design as subsystems land.
 pub fn param_specs() -> &'static [ParamSpec] {
     &[
         ParamSpec {
@@ -122,6 +123,14 @@ pub fn param_specs() -> &'static [ParamSpec] {
         // matching Redis (`maxclients` is a MODIFIABLE config). `0` disables the cap.
         ParamSpec {
             name: "maxclients",
+            kind: SetKind::Runtime,
+        },
+        // The idle client timeout in seconds (Redis `timeout`, PROD-SAFETY #4). RUNTIME-SETTABLE:
+        // `CONFIG SET timeout <secs>` updates the live idle timeout the serve loop re-reads each
+        // connection-loop iteration (was boot-only -- a change used to require a restart), matching
+        // Redis (`timeout` is a MODIFIABLE config). `0` disables idle disconnection.
+        ParamSpec {
+            name: "timeout",
             kind: SetKind::Runtime,
         },
         // The per-connection output-buffer hard cap in bytes (PROD-SAFETY #5, the IronCache analog
@@ -287,6 +296,9 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // `CONFIG SET` is reflected. `maxclients` is a plain count; `output-buffer-limit` is a byte
         // count (reported as bytes, the form CONFIG SET accepts back).
         "maxclients" => runtime.maxclients().to_string(),
+        // The idle client timeout in seconds (PROD-SAFETY #4): read the overlay so a `CONFIG SET
+        // timeout` is reflected. `0` means idle disconnection is disabled.
+        "timeout" => runtime.timeout_secs().to_string(),
         "output-buffer-limit" => runtime.output_buffer_limit().to_string(),
         // The SLOWLOG knobs (PROD-7): read the overlay so a `CONFIG SET slowlog-*` is reflected.
         "slowlog-log-slower-than" => runtime.slowlog_log_slower_than().to_string(),
@@ -438,6 +450,16 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
             Err(_) => {
                 SetOutcome::InvalidValue(format!("'{value}' is not a valid maxclients count"))
             }
+        },
+        // The idle client timeout in seconds (PROD-SAFETY #4): a plain non-negative integer; `0`
+        // disables idle disconnection (Redis default). A negative / non-numeric / garbage value is
+        // an invalid value (never a silent 0), matching the neighboring numeric setters.
+        "timeout" => match value.parse::<u64>() {
+            Ok(secs) => {
+                runtime.set_timeout_secs(secs);
+                SetOutcome::Applied
+            }
+            Err(_) => SetOutcome::InvalidValue(format!("'{value}' is not a valid timeout")),
         },
         // The per-connection output-buffer hard cap (PROD-SAFETY #5): a byte count accepted as a
         // human size ("256mb") OR a plain integer; `0` disables it. A malformed value is rejected.
@@ -719,6 +741,45 @@ mod tests {
             apply_set("save", "0 1", &rc),
             SetOutcome::InvalidValue(_)
         ));
+    }
+
+    /// PROD-SAFETY #4: `timeout` is RUNTIME-SETTABLE (was boot-only). `CONFIG GET timeout` reports
+    /// the live value; `CONFIG SET timeout <n>` updates it; `0` is accepted (disables idle close); a
+    /// negative / non-numeric value is rejected as an invalid value (never a panic, never a silent
+    /// 0).
+    #[test]
+    fn apply_set_timeout_is_runtime_settable() {
+        // Seed the boot config with a non-zero timeout so the initial GET is meaningful (not the 0
+        // default), proving the overlay seeds from boot.
+        let cfg = Config {
+            timeout_secs: 60,
+            ..boot()
+        };
+        let rc = RuntimeConfig::from_config(&cfg);
+        // `CONFIG GET timeout` reports the seeded boot value.
+        assert_eq!(effective_value("timeout", &rc, &cfg).as_deref(), Some("60"));
+        // `CONFIG SET timeout 30` then GET returns 30.
+        assert_eq!(apply_set("timeout", "30", &rc), SetOutcome::Applied);
+        assert_eq!(rc.timeout_secs(), 30);
+        assert_eq!(effective_value("timeout", &rc, &cfg).as_deref(), Some("30"));
+        // `CONFIG SET timeout 0` is accepted (disables idle disconnection).
+        assert_eq!(apply_set("timeout", "0", &rc), SetOutcome::Applied);
+        assert_eq!(rc.timeout_secs(), 0);
+        assert_eq!(effective_value("timeout", &rc, &cfg).as_deref(), Some("0"));
+        // Case-insensitive lookup (Redis parity).
+        assert!(lookup("TIMEOUT").is_some());
+        // A negative value is rejected as an invalid value (not a panic, not a silent 0).
+        assert!(matches!(
+            apply_set("timeout", "-1", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        // A non-numeric / garbage value is rejected likewise.
+        assert!(matches!(
+            apply_set("timeout", "abc", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        // A rejected SET leaves the prior value untouched (the last accepted SET was 0).
+        assert_eq!(rc.timeout_secs(), 0);
     }
 
     /// #58 durability footgun fix: `appendonly` is UNSUPPORTED -- `CONFIG SET appendonly yes` is
