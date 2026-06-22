@@ -29,11 +29,31 @@
 //! deferral the node-to-console link carries, #369). An `https://` URL is
 //! rejected here rather than silently downgraded.
 //!
+//! ## SSRF defense-in-depth (#369)
+//!
+//! The Prometheus URL is server-config-only (the request never supplies it, and
+//! the metric name is allowlisted to a bare `ironcache_*` name in
+//! [`crate::history`]), so SSRF is already structurally bounded. This client adds
+//! two belt-and-suspenders defenses so a compromised/misconfigured upstream still
+//! cannot be used as a pivot:
+//!
+//! * NO redirect following. A 3xx response is surfaced as
+//!   [`HttpError::RedirectNotFollowed`]; the client never auto-connects to a
+//!   `Location`-supplied host (that would be an SSRF pivot).
+//! * Link-local / cloud-metadata block. After the host is RESOLVED, every
+//!   candidate address is screened ([`is_blocked_ip`]): `169.254.0.0/16` (which
+//!   includes the `169.254.169.254` instance-metadata IP) and `fe80::/10` are
+//!   rejected with [`HttpError::BlockedAddress`] BEFORE a socket opens. The check
+//!   is on the PARSED [`IpAddr`], not the host string, so the decimal/octal/hex
+//!   IPv4 forms and the IPv4-mapped-IPv6 form cannot bypass it. Normal private
+//!   ranges (RFC 1918, the in-VPC Prometheus) are deliberately NOT blocked.
+//!
 //! ## Determinism (ADR-0003)
 //!
 //! No clock and no RNG: this is pure I/O plus the runtime timer bound (the only
 //! `tokio::time` use, the sanctioned timer seam the determinism lint allows).
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -84,6 +104,25 @@ pub enum HttpError {
     /// The response (head + body) exceeded [`MAX_RESPONSE_BYTES`].
     #[error("HTTP response exceeded {0} bytes")]
     TooLarge(usize),
+    /// The server answered with a 3xx redirect. SSRF DEFENSE-IN-DEPTH: the client
+    /// does NOT follow redirects (a `Location` to an attacker-chosen host would be
+    /// an SSRF pivot from the server-config-only Prometheus URL). The status is
+    /// surfaced as this typed error instead of auto-connecting onward.
+    #[error("HTTP redirect ({status}) not followed (SSRF defense): Location {location}")]
+    RedirectNotFollowed {
+        /// The 3xx status code returned.
+        status: u16,
+        /// The `Location` header value, or `<none>` when the redirect carried no
+        /// `Location`. Surfaced for diagnostics only; never dialed.
+        location: String,
+    },
+    /// The resolved address is a link-local / cloud-metadata address
+    /// (`169.254.0.0/16`, which includes the `169.254.169.254` metadata IP, or
+    /// `fe80::/10`). SSRF DEFENSE-IN-DEPTH: dialing such an address could read
+    /// instance credentials, so it is rejected after resolution, BEFORE connecting.
+    /// Normal private ranges (RFC 1918, e.g. the in-VPC Prometheus) are NOT blocked.
+    #[error("refusing to connect to link-local/metadata address {0} (SSRF defense)")]
+    BlockedAddress(std::net::IpAddr),
 }
 
 /// A parsed HTTP response: the status code and the body bytes. Headers are parsed
@@ -198,10 +237,13 @@ fn parse_optional_port(after_colon: Option<&str>, remainder: &str) -> Result<u16
 ///
 /// # Errors
 ///
-/// Returns [`HttpError::InvalidUrl`] on a bad URL, [`HttpError::Connect`] /
-/// [`HttpError::Timeout`] on a failed or slow dial, [`HttpError::Io`] /
-/// [`HttpError::Protocol`] on a transport / parse fault, or [`HttpError::TooLarge`]
-/// when the response exceeds the cap.
+/// Returns [`HttpError::InvalidUrl`] on a bad URL, [`HttpError::BlockedAddress`]
+/// when the host resolves to a link-local/metadata address (SSRF defense),
+/// [`HttpError::Connect`] / [`HttpError::Timeout`] on a failed or slow dial,
+/// [`HttpError::RedirectNotFollowed`] on a 3xx (the client never follows
+/// redirects, SSRF defense), [`HttpError::Io`] / [`HttpError::Protocol`] on a
+/// transport / parse fault, or [`HttpError::TooLarge`] when the response exceeds
+/// the cap.
 pub async fn get(
     url: &str,
     connect_timeout: Duration,
@@ -218,16 +260,89 @@ pub async fn get(
 
 /// Connect to the parsed host/port and set `TCP_NODELAY`. Not itself bounded (the
 /// caller wraps it in `connect_timeout`).
+///
+/// SSRF DEFENSE-IN-DEPTH: the host is RESOLVED first, then every candidate
+/// [`IpAddr`] is screened against the link-local / cloud-metadata block
+/// ([`is_blocked_ip`]) BEFORE a socket is opened, and the connect targets the
+/// vetted [`std::net::SocketAddr`] (not the original host string). Screening the
+/// PARSED ip, not the textual host, defeats the decimal / octal / hex IPv4 forms
+/// and the IPv4-mapped-IPv6 form, all of which `to_socket_addrs` normalizes to the
+/// same `IpAddr` we inspect. A host that resolves to no usable (non-blocked)
+/// address yields [`HttpError::BlockedAddress`] / [`HttpError::Connect`] without a
+/// dial. Normal private ranges (RFC 1918) are deliberately NOT blocked.
 async fn dial(url: &ParsedUrl) -> Result<TcpStream, HttpError> {
-    let stream = TcpStream::connect((url.host.as_str(), url.port))
+    // Resolve every candidate address for host:port. `lookup_host` parses a bare
+    // IP literal directly and resolves a DNS name (no socket opened yet).
+    let addrs = tokio::net::lookup_host((url.host.as_str(), url.port))
         .await
         .map_err(|source| HttpError::Connect {
             host: url.host.clone(),
             port: url.port,
             source,
         })?;
-    stream.set_nodelay(true)?;
-    Ok(stream)
+
+    // Screen, then try to connect to the first vetted address. ANY blocked
+    // candidate aborts the whole dial (fail closed): a name that resolves to a mix
+    // of public and metadata addresses must not be reachable via the public one.
+    let mut last_err: Option<HttpError> = None;
+    let mut any_candidate = false;
+    for addr in addrs {
+        any_candidate = true;
+        let ip = addr.ip();
+        if is_blocked_ip(ip) {
+            return Err(HttpError::BlockedAddress(ip));
+        }
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Err(source) => {
+                last_err = Some(HttpError::Connect {
+                    host: url.host.clone(),
+                    port: url.port,
+                    source,
+                });
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| HttpError::Connect {
+        host: url.host.clone(),
+        port: url.port,
+        source: std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            if any_candidate {
+                "no address could be connected"
+            } else {
+                "host resolved to no addresses"
+            },
+        ),
+    }))
+}
+
+/// Whether `ip` is a link-local / cloud-metadata address the client refuses to
+/// dial (SSRF defense): IPv4 `169.254.0.0/16` (which includes the cloud metadata
+/// IP `169.254.169.254`) or IPv6 `fe80::/10` link-local. An IPv4-mapped IPv6
+/// address (`::ffff:a.b.c.d`) is unwrapped to its IPv4 form first, so the mapped
+/// form of a link-local v4 address is caught too. Normal private ranges (RFC 1918:
+/// `10/8`, `172.16/12`, `192.168/16`) are intentionally NOT blocked: the in-VPC
+/// Prometheus is RFC 1918, and only the link-local/metadata range is the SSRF risk
+/// this guard targets.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            // Unwrap an IPv4-mapped/compatible address to its v4 form and re-check,
+            // so `::ffff:169.254.169.254` is caught as a link-local v4 address.
+            if let Some(mapped) = v6.to_ipv4() {
+                return mapped.is_link_local();
+            }
+            // fe80::/10 link-local: the top 10 bits are 1111111010.
+            let seg0 = v6.segments()[0];
+            (seg0 & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 /// Write the GET request and read + frame one response. The caller bounds this in
@@ -284,8 +399,19 @@ where
 
     // header_end is the index just past the blank line; everything after is body.
     let head = &buf[..header_end];
-    let (status, framing) = parse_head(head)?;
+    let (status, framing, location) = parse_head(head)?;
     let body_start = header_end;
+
+    // SSRF DEFENSE-IN-DEPTH: do NOT follow a 3xx redirect. Auto-connecting to a
+    // `Location`-supplied host would be an SSRF pivot from the server-config-only
+    // Prometheus URL. Surface the status as a typed error and stop here (the body
+    // is not even drained); the caller never dials the redirect target.
+    if (300..400).contains(&status) {
+        return Err(HttpError::RedirectNotFollowed {
+            status,
+            location: location.unwrap_or_else(|| "<none>".to_owned()),
+        });
+    }
 
     let body = match framing {
         BodyFraming::ContentLength(len) => {
@@ -334,10 +460,12 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Parse the status line and the headers (the byte slice up to and including the
-/// blank line). Returns the status code and the body framing. Header names are
-/// matched case-insensitively. A `chunked` Transfer-Encoding takes precedence over
-/// a Content-Length (per RFC 9112).
-fn parse_head(head: &[u8]) -> Result<(u16, BodyFraming), HttpError> {
+/// blank line). Returns the status code, the body framing, and the `Location`
+/// header value when present (surfaced so a 3xx can report where it would have
+/// redirected, WITHOUT following it). Header names are matched case-insensitively.
+/// A `chunked` Transfer-Encoding takes precedence over a Content-Length (per
+/// RFC 9112).
+fn parse_head(head: &[u8]) -> Result<(u16, BodyFraming, Option<String>), HttpError> {
     let text = String::from_utf8_lossy(head);
     let mut lines = text.split("\r\n").flat_map(|l| l.split('\n'));
     let status_line = lines
@@ -347,6 +475,7 @@ fn parse_head(head: &[u8]) -> Result<(u16, BodyFraming), HttpError> {
 
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
+    let mut location: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -375,6 +504,9 @@ fn parse_head(head: &[u8]) -> Result<(u16, BodyFraming), HttpError> {
             {
                 chunked = true;
             }
+        } else if name.eq_ignore_ascii_case("location") && location.is_none() {
+            // Captured for the 3xx diagnostic only; the client never dials it.
+            location = Some(value.to_owned());
         }
     }
 
@@ -386,7 +518,7 @@ fn parse_head(head: &[u8]) -> Result<(u16, BodyFraming), HttpError> {
     } else {
         BodyFraming::CloseDelimited
     };
-    Ok((status, framing))
+    Ok((status, framing, location))
 }
 
 /// Parse the `HTTP/1.x <code> <reason>` status line into the numeric code.
@@ -682,15 +814,16 @@ mod tests {
     fn parse_head_reads_status_and_content_length() {
         let head =
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 42\r\n\r\n";
-        let (status, framing) = parse_head(head).unwrap();
+        let (status, framing, location) = parse_head(head).unwrap();
         assert_eq!(status, 200);
         assert_eq!(framing, BodyFraming::ContentLength(42));
+        assert_eq!(location, None);
     }
 
     #[test]
     fn parse_head_detects_chunked_case_insensitively_over_length() {
         let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: CHUNKED\r\n\r\n";
-        let (status, framing) = parse_head(head).unwrap();
+        let (status, framing, _location) = parse_head(head).unwrap();
         assert_eq!(status, 200);
         // chunked takes precedence over Content-Length.
         assert_eq!(framing, BodyFraming::Chunked);
@@ -699,7 +832,7 @@ mod tests {
     #[test]
     fn parse_head_defaults_to_close_delimited() {
         let head = b"HTTP/1.0 200 OK\r\n\r\n";
-        let (_status, framing) = parse_head(head).unwrap();
+        let (_status, framing, _location) = parse_head(head).unwrap();
         assert_eq!(framing, BodyFraming::CloseDelimited);
     }
 
@@ -1006,5 +1139,156 @@ mod tests {
         let mut reader = ChunkedReader::new(&raw, 64 * 1024);
         let err = read_response(&mut reader).await.unwrap_err();
         assert!(matches!(err, HttpError::TooLarge(_)), "{err}");
+    }
+
+    // ---- SSRF defense-in-depth (#369) ----
+
+    /// SSRF: `parse_head` reports a 3xx status and surfaces the `Location` value
+    /// (so the caller can refuse to follow it) without trying to follow it itself.
+    #[test]
+    fn parse_head_reports_redirect_status_and_location() {
+        let head =
+            b"HTTP/1.1 302 Found\r\nLocation: http://evil.example/\r\nContent-Length: 0\r\n\r\n";
+        let (status, _framing, location) = parse_head(head).unwrap();
+        assert_eq!(status, 302);
+        assert_eq!(location.as_deref(), Some("http://evil.example/"));
+    }
+
+    /// SSRF: a 3xx response is turned into a typed `RedirectNotFollowed` error by
+    /// `read_response`; the body is NOT consumed and no onward connection happens.
+    #[tokio::test]
+    async fn read_response_does_not_follow_a_redirect() {
+        let raw = b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\n\
+                    Content-Length: 0\r\n\r\n";
+        let mut reader = ChunkedReader::new(raw, 7);
+        let err = read_response(&mut reader).await.unwrap_err();
+        match err {
+            HttpError::RedirectNotFollowed { status, location } => {
+                assert_eq!(status, 302);
+                assert_eq!(location, "http://169.254.169.254/latest/meta-data/");
+            }
+            other => panic!("expected RedirectNotFollowed, got {other:?}"),
+        }
+    }
+
+    /// SSRF END-TO-END: a stub server that answers 302 (an SSRF pivot attempt) must
+    /// NOT cause the client to connect onward. `get` returns RedirectNotFollowed.
+    #[tokio::test]
+    async fn get_does_not_follow_redirect_over_tcp() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _peer) = listener.accept().await.unwrap();
+            let mut sink = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut sink)
+                .await
+                .unwrap();
+            // A redirect to the cloud-metadata IP: the classic SSRF pivot. The
+            // client must surface it, never chase it.
+            let resp = "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/iam/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let url = format!("http://{addr}/api/v1/query_range?query=x");
+        let result = get(&url, Duration::from_secs(2), Duration::from_secs(2)).await;
+        assert!(
+            matches!(
+                result,
+                Err(HttpError::RedirectNotFollowed { status: 302, .. })
+            ),
+            "a 302 must not be followed; expected RedirectNotFollowed, got {result:?}"
+        );
+        server.abort();
+    }
+
+    /// SSRF: the link-local / metadata block screens the PARSED ip. The cloud
+    /// metadata IP and the wider 169.254.0.0/16 are blocked; fe80::/10 is blocked;
+    /// the IPv4-mapped form of a link-local v4 address is blocked; normal private
+    /// ranges and public addresses are NOT blocked.
+    #[test]
+    fn is_blocked_ip_blocks_link_local_and_metadata_only() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // Blocked: the metadata IP and the rest of 169.254.0.0/16.
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1))));
+        // Blocked: fe80::/10 link-local v6 (boundary segments).
+        assert!(is_blocked_ip(IpAddr::V6(
+            "fe80::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_blocked_ip(IpAddr::V6(
+            "febf::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        // Blocked: IPv4-mapped form of the metadata IP (::ffff:169.254.169.254).
+        assert!(is_blocked_ip(IpAddr::V6(
+            "::ffff:169.254.169.254".parse::<Ipv6Addr>().unwrap()
+        )));
+        // NOT blocked: RFC 1918 private ranges (the in-VPC Prometheus).
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        // NOT blocked: loopback and a public address.
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        // NOT blocked: an fec0::/10 site-local-ish or a public v6 (just outside fe80::/10).
+        assert!(!is_blocked_ip(IpAddr::V6(
+            "fe00::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(!is_blocked_ip(IpAddr::V6(
+            "2606:4700::1".parse::<Ipv6Addr>().unwrap()
+        )));
+    }
+
+    /// SSRF END-TO-END: a request to the cloud-metadata IP literal is rejected with
+    /// BlockedAddress BEFORE any socket is opened (the screen runs on the resolved
+    /// ip in `dial`, so no connection is attempted to 169.254.169.254).
+    #[tokio::test]
+    async fn get_blocks_metadata_ip_literal() {
+        let result = get(
+            "http://169.254.169.254/latest/meta-data/",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(HttpError::BlockedAddress(_))),
+            "the metadata IP must be blocked, got {result:?}"
+        );
+    }
+
+    /// SSRF: the IPv4-mapped-IPv6 form of the metadata IP is ALSO blocked at dial
+    /// time (the screen unwraps `::ffff:a.b.c.d` to the v4 address before the
+    /// check), so the mapped form cannot bypass the block.
+    #[tokio::test]
+    async fn get_blocks_ipv4_mapped_metadata_literal() {
+        let result = get(
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(HttpError::BlockedAddress(_))),
+            "the IPv4-mapped metadata IP must be blocked, got {result:?}"
+        );
+    }
+
+    /// A loopback target is NOT blocked: `dial` screens only link-local/metadata,
+    /// so a normal (here, refused) loopback dial proceeds to the connect attempt.
+    #[tokio::test]
+    async fn get_does_not_block_loopback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{addr}/api");
+        let result = get(&url, Duration::from_secs(2), Duration::from_secs(2)).await;
+        // It reaches the connect attempt (refused), proving the screen did not
+        // wrongly block a non-link-local address.
+        assert!(
+            matches!(
+                result,
+                Err(HttpError::Connect { .. } | HttpError::Timeout(_))
+            ),
+            "loopback must not be blocked; expected a Connect/Timeout, got {result:?}"
+        );
     }
 }
