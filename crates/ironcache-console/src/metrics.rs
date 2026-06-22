@@ -87,6 +87,15 @@ impl ConsoleMetrics {
         self.clock.uptime_secs()
     }
 
+    /// Current wall-clock Unix time in SECONDS, through the env clock seam. Used by
+    /// the REST API `/api/timeseries` (#356) to compute the default history window
+    /// (`now - range .. now`), so the API reads "now" through the same determinism
+    /// boundary, never `SystemTime::now` directly.
+    #[must_use]
+    pub fn now_unix_seconds(&self) -> u64 {
+        self.clock.now_unix_millis() / 1000
+    }
+
     /// Unix time (seconds) of the last successful poll; `0` means "never polled".
     /// An ALWAYS-present series (the engine's `*_last_save_unixtime` idiom): an
     /// operator alerts on staleness with `time() - metric > N`, and on a console

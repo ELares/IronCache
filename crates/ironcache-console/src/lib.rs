@@ -34,7 +34,9 @@ pub mod api;
 pub mod assets;
 pub mod cli;
 pub mod config;
+pub mod history;
 pub mod http;
+pub mod httpclient;
 pub mod info;
 pub mod logging;
 pub mod metrics;
@@ -118,7 +120,12 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         // The shared topology cell: the poll loop writes it, the HTTP surface
         // (the REST API, #358) reads it.
         let topology = poll::new_topology_holder();
-        let state = http::ConsoleHttpState::with_topology(metrics.clone(), topology.clone());
+        // The history source (#356): a Prometheus adapter when a `prometheus_url`
+        // is configured, else `None` (so `/api/timeseries` answers 503). SECURITY:
+        // the base URL comes ONLY from server config here, never from a request.
+        let history = build_history_source(cfg);
+        let state = http::ConsoleHttpState::with_topology(metrics.clone(), topology.clone())
+            .with_history(history);
         let listener = tokio::net::TcpListener::bind(&cfg.http_addr)
             .await
             .with_context(|| format!("binding the console HTTP address {}", cfg.http_addr))?;
@@ -159,6 +166,21 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         poller.abort();
         result
     })
+}
+
+/// Build the history source (#356) from config: a [`history::PrometheusSource`]
+/// (boxed behind the `HistorySource` trait object) when `prometheus_url` is set,
+/// else `None`. The query timeouts reuse the node connect/op timeout bounds, so a
+/// down Prometheus times out promptly with the same discipline as the node poller.
+///
+/// SECURITY: the base URL is taken ONLY from server config; a request never
+/// supplies it (the SSRF boundary).
+fn build_history_source(cfg: &ConsoleConfig) -> Option<Arc<dyn history::HistorySource>> {
+    let url = cfg.prometheus_url.as_ref()?;
+    let connect_timeout = std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1));
+    let read_timeout = std::time::Duration::from_secs(cfg.op_timeout_secs.max(1));
+    let source = history::PrometheusSource::new(url, connect_timeout, read_timeout);
+    Some(Arc::new(source))
 }
 
 /// Emit the one-line boot banner (and a warning if the console has no seed nodes

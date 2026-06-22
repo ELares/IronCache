@@ -78,6 +78,35 @@ release.
   VPN-locked exposure (#369) before the console is exposed. The interim
   hand-rolled `/debug/topology` JSON route and its `enable_debug_routes` config
   flag are REMOVED, superseded by the real `/api/*` surface.
+- IronCache Console history layer (issue #356): historical time series behind a
+  pluggable source. A new `GET /api/timeseries?metric=<name>&range=<seconds>&step=<seconds>`
+  endpoint serves a metric's samples over a time window as JSON. The source sits
+  behind a new async `HistorySource` trait (the seam an embedded ring-buffer
+  source, #370, can implement later) with a `PrometheusSource` adapter that queries
+  Prometheus's `query_range` HTTP API and maps the `matrix` result into a
+  `TimeSeries` (label set plus `(unix_ts, value)` points). The adapter uses a new
+  minimal, hand-rolled HTTP/1.1 GET client (`httpclient`), built in the same style
+  as the RESP node client and the metrics HTTP server (a tokio `TcpStream`, no
+  hyper/reqwest), so the static musl build stays pure-Rust and NO new dependency is
+  added. The client is HARD bounded: the connect has a connect timeout and the
+  response read has a read timeout, so a down or never-replying Prometheus TIMES
+  OUT promptly rather than hanging (the same discipline as the node client); it
+  handles both `Content-Length` and chunked `Transfer-Encoding` bodies and enforces
+  a hard response-size cap so a hostile or huge reply cannot drive an unbounded
+  allocation. HTTPS to Prometheus is deferred (the in-VPC Prometheus is reached
+  over plaintext, and the runtime crate's TLS client presents a fixed cluster SNI
+  unsuitable for an arbitrary host); an `https://` URL is rejected rather than
+  downgraded. SECURITY (SSRF / PromQL injection): the Prometheus base URL comes
+  ONLY from server config (`prometheus_url`), never from request input, and the
+  `metric` parameter is allowlisted to a bare `ironcache_*` / `ironcache_console_*`
+  name (raw PromQL, label matchers, function calls, and `&query=` injection are
+  rejected with 400); the console builds the PromQL itself from that bare name and
+  URL-encodes it. The `range`/`step` are parsed and clamped to bounds so a request
+  cannot demand an unbounded series. The endpoint returns 503 when no
+  `prometheus_url` is configured, 400 on a missing or disallowed metric or a bad
+  numeric parameter, 502 on a source/transport failure, and 200 with the series
+  otherwise. The window's "now" is read through the `ironcache-env` clock seam, not
+  the system clock directly.
 - IronCache Console dashboard SPA (issue #359). A functional, API-driven
   monitoring dashboard served by the console's OWN HTTP responder at `GET /`,
   with the stylesheet and script at `GET /app.css` and `GET /app.js`. The UI is

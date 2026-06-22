@@ -32,7 +32,24 @@
 
 use serde::Serialize;
 
+use crate::history::{self, HistoryError, HistorySource, TimeSeries};
 use crate::snapshot::{NodeSnapshot, Topology, TopologyMode};
+
+/// The default history window (seconds) when `?range=` is omitted: one hour.
+const DEFAULT_RANGE_SECS: u64 = 3600;
+/// The maximum history window (seconds) a request may ask for: 7 days. A larger
+/// `range` is CLAMPED (not rejected) so an over-eager client cannot ask the
+/// console to pull an unbounded series from Prometheus.
+const MAX_RANGE_SECS: u64 = 7 * 24 * 3600;
+/// The default resolution (seconds) when `?step=` is omitted.
+const DEFAULT_STEP_SECS: u64 = 15;
+/// The minimum step (seconds): Prometheus rejects step 0, and a tiny step over a
+/// wide range explodes the point count. Clamped up to this floor.
+const MIN_STEP_SECS: u64 = 1;
+/// A cap on the number of points per series (range/step). Prometheus itself caps
+/// at 11000; we clamp the EFFECTIVE step up so range/step never exceeds this, so a
+/// `range=7d&step=1` request cannot demand a 600k-point series.
+const MAX_POINTS_PER_SERIES: u64 = 11_000;
 
 /// The content type every API response carries.
 pub const CONTENT_TYPE: &str = "application/json; charset=utf-8";
@@ -77,6 +94,24 @@ impl ApiResponse {
             body: error_body(message),
         }
     }
+
+    /// A `400 Bad Request` JSON error with `message` (a malformed / disallowed
+    /// query parameter).
+    fn bad_request(message: &str) -> Self {
+        ApiResponse {
+            status: 400,
+            body: error_body(message),
+        }
+    }
+
+    /// A JSON error with an explicit status code (for the history paths that map a
+    /// typed error to 400/502/503).
+    fn error(status: u16, message: &str) -> Self {
+        ApiResponse {
+            status,
+            body: error_body(message),
+        }
+    }
 }
 
 /// The inputs the API needs that are NOT in the topology: process-level facts the
@@ -91,6 +126,9 @@ pub struct ApiContext<'a> {
     pub ready: bool,
     /// Console process uptime in seconds (read through the env seam by the caller).
     pub uptime_seconds: u64,
+    /// Current wall-clock Unix time in seconds (read through the env seam by the
+    /// caller). Used to compute the default `/api/timeseries` window (#356).
+    pub now_unix: u64,
 }
 
 /// `GET /api/health` body: liveness/readiness and process facts. Served even
@@ -188,11 +226,48 @@ struct DbKeyspace {
     expires: u64,
 }
 
+/// `GET /api/timeseries` body (#356): the queried metric, the resolved window, and
+/// the series. The window is echoed back so the client knows what was actually
+/// served after the server's bounds clamping.
+#[derive(Debug, Clone, Serialize)]
+struct TimeseriesResponse {
+    metric: String,
+    start_unix: u64,
+    end_unix: u64,
+    step_secs: u64,
+    series: Vec<TimeSeries>,
+}
+
 /// Whether `path` (already query-stripped) is in the `/api/` namespace, so the
 /// HTTP layer can route it here. `/api/openapi.json` is included.
 #[must_use]
 pub fn is_api_path(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
+}
+
+/// Handle one API request, async-aware. `raw_path` is the request target WITH its
+/// query string (e.g. `/api/timeseries?metric=...`); `topology` is the latest
+/// polled topology; `history` is the configured history source (`None` when no
+/// `prometheus_url` is set). The history route (`/api/timeseries`) needs async I/O
+/// and the query string, so it is handled here; every OTHER route is pure and
+/// delegates to [`handle`] on the query-stripped path.
+///
+/// This is the entry point the HTTP layer calls; [`handle`] remains the pure,
+/// synchronous core for the topology-only routes (and for unit tests).
+pub async fn handle_async(
+    raw_path: &str,
+    topology: Option<&Topology>,
+    history: Option<&(dyn HistorySource + '_)>,
+    ctx: &ApiContext<'_>,
+) -> ApiResponse {
+    let (bare, query) = match raw_path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (raw_path, ""),
+    };
+    if bare == "/api/timeseries" {
+        return handle_timeseries(query, history, ctx).await;
+    }
+    handle(bare, topology, ctx)
 }
 
 /// Handle one API request. `path` is the query-stripped request path; `topology`
@@ -201,10 +276,12 @@ pub fn is_api_path(path: &str) -> bool {
 ///
 /// Routing:
 /// * `/api/health` and `/api/openapi.json` do not need a topology.
+/// * `/api/timeseries` is async (history I/O) and is routed via [`handle_async`];
+///   reaching it here (the sync path) returns `503` (no history wired).
 /// * every OTHER `/api/*` data route returns `503` before the first poll.
 #[must_use]
 pub fn handle(path: &str, topology: Option<&Topology>, ctx: &ApiContext<'_>) -> ApiResponse {
-    // These two do not depend on a polled topology.
+    // These do not depend on a polled topology.
     match path {
         "/api/health" => return health(ctx),
         "/api/openapi.json" => {
@@ -212,6 +289,12 @@ pub fn handle(path: &str, topology: Option<&Topology>, ctx: &ApiContext<'_>) -> 
                 status: 200,
                 body: openapi_document().to_owned(),
             };
+        }
+        // The history route is async (handled by `handle_async`); reaching it on
+        // the sync path means no history source was wired, so report it as the
+        // unconfigured case rather than a generic 503/404.
+        "/api/timeseries" => {
+            return ApiResponse::error(503, &HistoryError::NotConfigured.to_string());
         }
         _ => {}
     }
@@ -376,6 +459,153 @@ fn keyspace(topo: &Topology) -> ApiResponse {
         }
     }
     ApiResponse::ok(&KeyspaceResponse { total_keys, per_db })
+}
+
+/// `GET /api/timeseries?metric=<name>&range=<seconds>&step=<seconds>` (#356).
+///
+/// SECURITY: this is the SSRF / PromQL-injection boundary. The Prometheus base URL
+/// is NEVER taken from the request (it comes only from server config, captured in
+/// `history`). The `metric` param is ALLOWLISTED to a bare `ironcache_*` /
+/// `ironcache_console_*` name ([`crate::history::is_allowed_metric`]); a name with
+/// PromQL syntax (functions, label matchers, `&query=` injection) is rejected with
+/// `400`. The console builds the PromQL itself from that bare name; raw PromQL
+/// never crosses the boundary. The `range`/`step` are parsed and CLAMPED to bounds
+/// so a request cannot demand an unbounded series.
+///
+/// Status codes: `503` when no source is configured; `400` for a missing /
+/// disallowed `metric` or an unparseable numeric param; `502` for a source /
+/// transport error; `200` with the series otherwise.
+///
+/// `query` is the RAW query string (the part after `?`, e.g.
+/// `metric=ironcache_x&range=600`). The HTTP layer calls this directly (without
+/// holding the topology lock, since the history I/O must not block the poll loop);
+/// [`handle_async`] also routes here.
+pub async fn handle_timeseries(
+    query: &str,
+    history: Option<&(dyn HistorySource + '_)>,
+    ctx: &ApiContext<'_>,
+) -> ApiResponse {
+    // No history source configured (no prometheus_url) -> 503.
+    let Some(source) = history else {
+        return ApiResponse::error(503, &HistoryError::NotConfigured.to_string());
+    };
+
+    // Parse the query parameters.
+    let params = QueryParams::parse(query);
+    let Some(metric) = params.get("metric") else {
+        return ApiResponse::bad_request("missing required query parameter 'metric'");
+    };
+    // SECURITY: allowlist the metric to a bare ironcache_* name BEFORE it is used.
+    if !history::is_allowed_metric(&metric) {
+        return ApiResponse::bad_request(&format!(
+            "metric '{metric}' is not an allowed ironcache_* / ironcache_console_* metric name"
+        ));
+    }
+    // range / step: parse (a present-but-unparseable value is a 400), default, and
+    // clamp to the bounds.
+    let range = match params.get_u64("range") {
+        Ok(v) => v.unwrap_or(DEFAULT_RANGE_SECS),
+        Err(()) => return ApiResponse::bad_request("query parameter 'range' must be an integer"),
+    };
+    let step = match params.get_u64("step") {
+        Ok(v) => v.unwrap_or(DEFAULT_STEP_SECS),
+        Err(()) => return ApiResponse::bad_request("query parameter 'step' must be an integer"),
+    };
+    let (start_unix, end_unix, step_secs) = resolve_window(ctx.now_unix, range, step);
+
+    match source
+        .query_range(&metric, start_unix, end_unix, step_secs)
+        .await
+    {
+        Ok(series) => ApiResponse::ok(&TimeseriesResponse {
+            metric,
+            start_unix,
+            end_unix,
+            step_secs,
+            series,
+        }),
+        Err(e) => match e {
+            // Defense in depth: the source re-checks the allowlist; map to 400.
+            HistoryError::DisallowedMetric(_) => ApiResponse::bad_request(&e.to_string()),
+            HistoryError::NotConfigured => ApiResponse::error(503, &e.to_string()),
+            // A transport / source failure is an upstream (bad gateway) condition.
+            HistoryError::Transport(_) | HistoryError::Source(_) | HistoryError::Parse(_) => {
+                ApiResponse::error(502, &e.to_string())
+            }
+        },
+    }
+}
+
+/// Resolve and CLAMP the history window from `now`, the requested `range`, and the
+/// requested `step`. Returns `(start_unix, end_unix, step_secs)`. The window is
+/// `now - range .. now`; `range` is clamped to [`MAX_RANGE_SECS`], `step` to a
+/// floor of [`MIN_STEP_SECS`], and then `step` is raised further if needed so the
+/// point count (`range / step`) does not exceed [`MAX_POINTS_PER_SERIES`].
+fn resolve_window(now: u64, range: u64, step: u64) -> (u64, u64, u64) {
+    let range = range.clamp(1, MAX_RANGE_SECS);
+    let mut step = step.max(MIN_STEP_SECS);
+    // Cap the resulting point count by raising the step if the client asked for a
+    // tiny step over a wide range (range/step would otherwise be enormous).
+    let max_points = MAX_POINTS_PER_SERIES.max(1);
+    if range / step > max_points {
+        // ceil(range / max_points), at least MIN_STEP_SECS.
+        step = range.div_ceil(max_points).max(MIN_STEP_SECS);
+    }
+    let end_unix = now;
+    let start_unix = now.saturating_sub(range);
+    (start_unix, end_unix, step)
+}
+
+/// A tiny URL query-string parser (`a=b&c=d`), percent-decoding keys and values.
+/// Hand-rolled (no url crate) to keep the dependency posture; sufficient for the
+/// console's flat, small query strings.
+struct QueryParams {
+    pairs: Vec<(String, String)>,
+}
+
+impl QueryParams {
+    /// Parse `a=b&c=d`. A pair without `=` is recorded with an empty value; an
+    /// empty segment is skipped. `+` is decoded to a space (form-encoding), then
+    /// `%XX` escapes are decoded.
+    fn parse(query: &str) -> Self {
+        let mut pairs = Vec::new();
+        for seg in query.split('&') {
+            if seg.is_empty() {
+                continue;
+            }
+            let (k, v) = match seg.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (seg, ""),
+            };
+            pairs.push((query_decode(k), query_decode(v)));
+        }
+        QueryParams { pairs }
+    }
+
+    /// The first value for `key`, if present.
+    fn get(&self, key: &str) -> Option<String> {
+        self.pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Parse the value for `key` as a `u64`. `Ok(None)` when absent; `Err(())` when
+    /// present but not a valid integer (so the caller returns a `400`).
+    fn get_u64(&self, key: &str) -> Result<Option<u64>, ()> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(s) => s.trim().parse::<u64>().map(Some).map_err(|_| ()),
+        }
+    }
+}
+
+/// Decode a URL query component: `+` -> space, then `%XX` escapes. A malformed `%`
+/// escape is left verbatim (tolerant). Reuses the path percent-decoder for the
+/// `%XX` pass.
+fn query_decode(s: &str) -> String {
+    let with_spaces = s.replace('+', " ");
+    percent_decode(&with_spaces)
 }
 
 /// Extract a `name=<u64>` field from a comma-separated keyspace value
@@ -627,6 +857,68 @@ const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/api/timeseries": {
+      "get": {
+        "summary": "Historical time series for an allowlisted ironcache_* metric (via Prometheus).",
+        "parameters": [
+          {
+            "name": "metric",
+            "in": "query",
+            "required": true,
+            "description": "A bare ironcache_* / ironcache_console_* metric name (allowlisted; raw PromQL is rejected).",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "range",
+            "in": "query",
+            "required": false,
+            "description": "Window length in seconds back from now (default 3600, clamped to 7 days).",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "step",
+            "in": "query",
+            "required": false,
+            "description": "Resolution in seconds (default 15, raised if range/step would exceed 11000 points).",
+            "schema": { "type": "integer", "format": "int64" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The series.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TimeseriesResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or disallowed metric, or a bad numeric parameter.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "502": {
+            "description": "The history source (Prometheus) failed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "503": {
+            "description": "No history source configured.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/openapi.json": {
       "get": {
         "summary": "This OpenAPI document.",
@@ -785,6 +1077,38 @@ const OPENAPI_JSON: &str = r##"{
             }
           }
         }
+      },
+      "TimeSeries": {
+        "type": "object",
+        "properties": {
+          "labels": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "points": {
+            "type": "array",
+            "description": "Samples as [unix_ts_seconds, value] pairs in time order.",
+            "items": {
+              "type": "array",
+              "items": { "type": "number" },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          }
+        }
+      },
+      "TimeseriesResponse": {
+        "type": "object",
+        "properties": {
+          "metric": { "type": "string" },
+          "start_unix": { "type": "integer", "format": "int64" },
+          "end_unix": { "type": "integer", "format": "int64" },
+          "step_secs": { "type": "integer", "format": "int64" },
+          "series": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TimeSeries" }
+          }
+        }
       }
     }
   }
@@ -803,6 +1127,7 @@ mod tests {
             live: true,
             ready: true,
             uptime_seconds: 7,
+            now_unix: 1_700_000_000,
         }
     }
 
@@ -1002,6 +1327,7 @@ mod tests {
             "/api/slowlog",
             "/api/clients",
             "/api/keyspace",
+            "/api/timeseries",
             "/api/openapi.json",
         ] {
             assert!(paths.contains_key(p), "openapi missing path {p}");
@@ -1046,5 +1372,230 @@ mod tests {
         assert_eq!(v["slowlog"][0]["argv"][1], "foo");
         assert_eq!(v["clients"][0]["addr"], "127.0.0.1:6379");
         assert!(v["slowlog_error"].is_null());
+    }
+
+    // ---- /api/timeseries (#356) -------------------------------------------
+
+    /// A stub [`HistorySource`] that records the args it was called with and
+    /// returns a canned series, so the endpoint can be tested without a network.
+    struct StubSource {
+        calls: std::sync::Mutex<Vec<(String, u64, u64, u64)>>,
+        result: Result<Vec<TimeSeries>, String>,
+    }
+
+    impl StubSource {
+        fn ok(series: Vec<TimeSeries>) -> Self {
+            StubSource {
+                calls: std::sync::Mutex::new(Vec::new()),
+                result: Ok(series),
+            }
+        }
+
+        fn err(message: &str) -> Self {
+            StubSource {
+                calls: std::sync::Mutex::new(Vec::new()),
+                result: Err(message.to_owned()),
+            }
+        }
+    }
+
+    impl HistorySource for StubSource {
+        fn query_range<'a>(
+            &'a self,
+            metric: &'a str,
+            start_unix: u64,
+            end_unix: u64,
+            step_secs: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<TimeSeries>, HistoryError>> + Send + 'a,
+            >,
+        > {
+            // Defensive re-check mirrors the real adapter (the API edge should have
+            // already rejected a disallowed metric before we are called).
+            let metric = metric.to_owned();
+            Box::pin(async move {
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.push((metric.clone(), start_unix, end_unix, step_secs));
+                }
+                match &self.result {
+                    Ok(series) => Ok(series.clone()),
+                    Err(msg) => Err(HistoryError::Source(msg.clone())),
+                }
+            })
+        }
+    }
+
+    fn sample_series() -> Vec<TimeSeries> {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert(
+            "__name__".to_owned(),
+            "ironcache_used_memory_bytes".to_owned(),
+        );
+        vec![TimeSeries {
+            labels,
+            points: vec![(1000, 1.0), (1015, 2.0)],
+        }]
+    }
+
+    #[tokio::test]
+    async fn timeseries_503_when_no_source_configured() {
+        let resp = handle_async("/api/timeseries?metric=ironcache_x", None, None, &ctx()).await;
+        assert_eq!(resp.status, 503);
+        let v = parse(&resp);
+        assert!(v["error"].as_str().unwrap().contains("no history source"));
+    }
+
+    #[tokio::test]
+    async fn timeseries_503_via_sync_handle_when_unwired() {
+        // The sync handle (used by unit tests / when no source is threaded) also
+        // reports the unconfigured case for the history route.
+        let resp = handle("/api/timeseries", None, &ctx());
+        assert_eq!(resp.status, 503);
+    }
+
+    #[tokio::test]
+    async fn timeseries_200_shape_with_a_wired_source() {
+        let src = StubSource::ok(sample_series());
+        let resp = handle_async(
+            "/api/timeseries?metric=ironcache_used_memory_bytes&range=600&step=30",
+            None,
+            Some(&src),
+            &ctx(),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let v = parse(&resp);
+        assert_eq!(v["metric"], "ironcache_used_memory_bytes");
+        assert_eq!(v["step_secs"], 30);
+        // now_unix (1_700_000_000) minus range 600.
+        assert_eq!(v["start_unix"], 1_699_999_400u64);
+        assert_eq!(v["end_unix"], 1_700_000_000u64);
+        assert_eq!(v["series"][0]["points"][0][0], 1000);
+        assert_eq!(v["series"][0]["points"][0][1], 1.0);
+        // The source was called with the resolved window.
+        let calls = src.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            (
+                "ironcache_used_memory_bytes".to_owned(),
+                1_699_999_400,
+                1_700_000_000,
+                30
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn timeseries_400_on_missing_metric() {
+        let src = StubSource::ok(Vec::new());
+        let resp = handle_async("/api/timeseries", None, Some(&src), &ctx()).await;
+        assert_eq!(resp.status, 400);
+        assert!(parse(&resp)["error"].as_str().unwrap().contains("metric"));
+        // The disallowed/missing metric never reached the source.
+        assert!(src.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeseries_400_on_disallowed_metric_injection() {
+        let src = StubSource::ok(Vec::new());
+        // A PromQL injection attempt via the metric param.
+        let resp = handle_async(
+            "/api/timeseries?metric=rate(up%5B5m%5D)",
+            None,
+            Some(&src),
+            &ctx(),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+        let v = parse(&resp);
+        assert!(v["error"].as_str().unwrap().contains("not an allowed"));
+        // SSRF/injection guard: the source was NOT called.
+        assert!(src.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeseries_400_on_non_ironcache_metric() {
+        let src = StubSource::ok(Vec::new());
+        let resp = handle_async(
+            "/api/timeseries?metric=node_cpu_seconds_total",
+            None,
+            Some(&src),
+            &ctx(),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+        assert!(src.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeseries_400_on_bad_numeric_param() {
+        let src = StubSource::ok(Vec::new());
+        let resp = handle_async(
+            "/api/timeseries?metric=ironcache_x&range=abc",
+            None,
+            Some(&src),
+            &ctx(),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+        assert!(parse(&resp)["error"].as_str().unwrap().contains("range"));
+    }
+
+    #[tokio::test]
+    async fn timeseries_502_on_source_error() {
+        let src = StubSource::err("Prometheus is down");
+        let resp = handle_async(
+            "/api/timeseries?metric=ironcache_x",
+            None,
+            Some(&src),
+            &ctx(),
+        )
+        .await;
+        assert_eq!(resp.status, 502);
+        assert!(
+            parse(&resp)["error"]
+                .as_str()
+                .unwrap()
+                .contains("Prometheus is down")
+        );
+    }
+
+    #[test]
+    fn resolve_window_defaults_and_clamps() {
+        // Default range/step over a fixed now.
+        let (s, e, step) = resolve_window(10_000, DEFAULT_RANGE_SECS, DEFAULT_STEP_SECS);
+        assert_eq!(e, 10_000);
+        assert_eq!(s, 10_000 - DEFAULT_RANGE_SECS);
+        assert_eq!(step, DEFAULT_STEP_SECS);
+        // A range over the cap is clamped.
+        let (s, _e, _step) = resolve_window(MAX_RANGE_SECS * 2, MAX_RANGE_SECS * 2, 60);
+        assert_eq!(s, MAX_RANGE_SECS); // now - MAX_RANGE
+        // A tiny step over a wide range raises the step so points <= the cap.
+        let (_s, _e, step) = resolve_window(MAX_RANGE_SECS, MAX_RANGE_SECS, 1);
+        assert!(
+            MAX_RANGE_SECS / step <= MAX_POINTS_PER_SERIES,
+            "step={step}"
+        );
+        // step floor of MIN_STEP_SECS (a zero step is raised).
+        let (_s, _e, step) = resolve_window(100, 50, 0);
+        assert!(step >= MIN_STEP_SECS);
+    }
+
+    #[test]
+    fn query_params_parse_and_decode() {
+        let q = QueryParams::parse("metric=ironcache_x&range=600&step=30");
+        assert_eq!(q.get("metric").as_deref(), Some("ironcache_x"));
+        assert_eq!(q.get_u64("range").unwrap(), Some(600));
+        assert_eq!(q.get_u64("step").unwrap(), Some(30));
+        assert_eq!(q.get("absent"), None);
+        assert_eq!(q.get_u64("absent").unwrap(), None);
+        // A bad integer is an Err (mapped to 400 by the caller).
+        let q = QueryParams::parse("range=notanumber");
+        assert!(q.get_u64("range").is_err());
+        // Percent + plus decoding.
+        let q = QueryParams::parse("metric=ironcache_x&note=a%20b+c");
+        assert_eq!(q.get("note").as_deref(), Some("a b c"));
     }
 }
