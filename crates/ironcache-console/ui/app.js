@@ -57,7 +57,6 @@
     nodes: true,
     slowlog: true,
     clients: true,
-    keyspace: true,
   };
 
   // The per-section page title + subtitle shown in the topbar.
@@ -74,6 +73,19 @@
     pubsub: { title: "Pub/Sub", subtitle: "Channels and subscribers" },
     config: { title: "Config", subtitle: "Runtime configuration" },
     acl: { title: "ACL", subtitle: "Users and permissions" },
+    persistence: { title: "Persistence", subtitle: "Snapshots and saves" },
+  };
+
+  // The management sections (#361): loaded on demand when navigated to (not on the
+  // 5s live poll), since each one opens an on-demand node connection. The active
+  // management section is also refreshed by the manual Refresh button.
+  var MANAGEMENT_SECTIONS = {
+    config: true,
+    keyspace: true,
+    console: true,
+    pubsub: true,
+    acl: true,
+    persistence: true,
   };
 
   // ----- token storage (auth) ----------------------------------------------
@@ -99,6 +111,15 @@
     } catch (e) {
       // No-op.
     }
+  }
+
+  // Whether ANY token is held this tab. The console cannot tell read vs admin
+  // client-side (the token is opaque), so admin-gated controls are revealed
+  // optimistically when a token is present, and a 401/403 from a mutation surfaces
+  // the precise reason (and the sign-in) afterward. With NO token on the loopback
+  // dev default the server still serves every tier, so the controls work too.
+  function haveToken() {
+    return getToken().length > 0;
   }
 
   // ----- runtime state ------------------------------------------------------
@@ -280,16 +301,12 @@
     nodes: { body: "nodes-body", cols: 8 },
     slowlog: { body: "slowlog-body", cols: 5 },
     clients: { body: "clients-body", cols: 7 },
-    keyspace: { body: "keyspace-body", cols: 4 },
   };
 
   function renderPanelPlaceholder(key, message) {
     var panel = PRIVILEGED_PANELS[key];
     if (!panel) {
       return;
-    }
-    if (key === "keyspace") {
-      setText(byId("ks-total"), "-");
     }
     fillBody(byId(panel.body), [], panel.cols, message);
   }
@@ -618,22 +635,6 @@
     fillBody(byId("clients-body"), rows, 7, "No clients.");
   }
 
-  function renderKeyspace(data) {
-    setText(byId("ks-total"), fmtNum(data.total_keys));
-    var rows = [];
-    var perDb = data.per_db || [];
-    for (var i = 0; i < perDb.length; i++) {
-      var r = perDb[i];
-      var tr = document.createElement("tr");
-      tr.appendChild(td(r.node, "mono"));
-      tr.appendChild(td(r.db));
-      tr.appendChild(td(fmtNum(r.keys), "num"));
-      tr.appendChild(td(fmtNum(r.expires), "num"));
-      rows.push(tr);
-    }
-    fillBody(byId("keyspace-body"), rows, 4, "No keyspace data.");
-  }
-
   function renderHealth(data) {
     if (data && data.version) {
       setText(byId("sidebar-version"), data.version);
@@ -673,6 +674,882 @@
     sel.value = keep ? current : "all";
   }
 
+  // ======================================================================
+  // Node-level MANAGEMENT (#361). Each page loads on demand when navigated to
+  // (loadManagement), and the admin write controls post through fetchMethod.
+  // Every server string reaches the DOM via textContent / createTextNode only.
+  // ======================================================================
+
+  // ----- Config -------------------------------------------------------------
+  var configParams = [];
+
+  function loadConfig() {
+    fetchJson("/api/config").then(function (r) {
+      if (r.status === 401 || r.status === 403) {
+        renderConfigRows([], r.status === 401 ? "Sign in to view configuration." : "Insufficient privileges.");
+        return;
+      }
+      if (r.status === 200 && r.body && Array.isArray(r.body.params)) {
+        configParams = r.body.params;
+        setText(byId("config-count"), configParams.length + " parameters");
+        renderConfigRows(configParams, null);
+      } else {
+        renderConfigRows([], "Could not load configuration.");
+      }
+    });
+  }
+
+  function renderConfigRows(params, message) {
+    var host = byId("config-rows");
+    if (!host) {
+      return;
+    }
+    while (host.firstChild) {
+      host.removeChild(host.firstChild);
+    }
+    var filterEl = byId("config-filter");
+    var filter = filterEl ? (filterEl.value || "").toLowerCase() : "";
+    if (message) {
+      var p = document.createElement("p");
+      p.className = "placeholder";
+      p.appendChild(document.createTextNode(message));
+      host.appendChild(p);
+      return;
+    }
+    var shown = 0;
+    for (var i = 0; i < params.length; i++) {
+      var param = params[i];
+      var name = param.param == null ? "" : String(param.param);
+      if (filter && name.toLowerCase().indexOf(filter) === -1) {
+        continue;
+      }
+      host.appendChild(configRow(name, param.value == null ? "" : String(param.value)));
+      shown += 1;
+    }
+    if (shown === 0) {
+      var none = document.createElement("p");
+      none.className = "placeholder";
+      none.appendChild(document.createTextNode("No matching parameters."));
+      host.appendChild(none);
+    }
+  }
+
+  function configRow(name, value) {
+    var row = document.createElement("div");
+    row.className = "config-row";
+    var label = document.createElement("span");
+    label.className = "config-param mono";
+    label.appendChild(document.createTextNode(name));
+    row.appendChild(label);
+    var input = document.createElement("input");
+    input.className = "ks-input mono config-value-input";
+    input.type = "text";
+    input.value = value;
+    input.setAttribute("aria-label", name);
+    row.appendChild(input);
+    var apply = document.createElement("button");
+    apply.className = "btn config-apply";
+    apply.type = "button";
+    apply.appendChild(document.createTextNode("Apply"));
+    apply.addEventListener("click", function () {
+      applyConfig(name, input.value);
+    });
+    row.appendChild(apply);
+    return row;
+  }
+
+  function applyConfig(param, value) {
+    setStatus("config-status", "Applying " + param + "...", "ok");
+    fetchMethod("POST", "/api/config", { param: param, value: value }).then(function (r) {
+      if (handleAuthFailure("config-status", r.status)) {
+        return;
+      }
+      if (r.status === 200 && r.body && r.body.ok) {
+        setStatus("config-status", "Applied " + param + ".", "ok");
+      } else {
+        setStatus("config-status", apiError(r, "Could not apply " + param + "."), "err");
+      }
+    });
+  }
+
+  // ----- Keyspace (browser + inspector + actions) ---------------------------
+  var ksCursor = "0";
+  var ksPattern = "*";
+  var ksSelectedKey = null;
+
+  function runScan(reset) {
+    var patternEl = byId("ks-pattern");
+    if (reset) {
+      ksPattern = patternEl && patternEl.value ? patternEl.value : "*";
+      ksCursor = "0";
+      clearKeyList();
+    }
+    var url =
+      "/api/keys?pattern=" +
+      encodeURIComponent(ksPattern) +
+      "&cursor=" +
+      encodeURIComponent(ksCursor) +
+      "&count=100";
+    fetchJson(url).then(function (r) {
+      if (r.status === 401 || r.status === 403) {
+        setStatus("ks-browse-status", r.status === 401 ? "Sign in to browse keys." : "Insufficient privileges.", "err");
+        return;
+      }
+      if (r.status === 200 && r.body && Array.isArray(r.body.keys)) {
+        setStatus("ks-browse-status", null);
+        appendKeys(r.body.keys);
+        ksCursor = r.body.cursor == null ? "0" : String(r.body.cursor);
+        var more = byId("ks-scan-more");
+        if (more) {
+          more.hidden = ksCursor === "0";
+        }
+      } else {
+        setStatus("ks-browse-status", apiError(r, "Scan failed."), "err");
+      }
+    });
+  }
+
+  function clearKeyList() {
+    var host = byId("ks-key-list");
+    if (host) {
+      while (host.firstChild) {
+        host.removeChild(host.firstChild);
+      }
+    }
+  }
+
+  function appendKeys(keys) {
+    var host = byId("ks-key-list");
+    if (!host) {
+      return;
+    }
+    // Drop a leading placeholder if present.
+    var placeholder = host.querySelector(".placeholder");
+    if (placeholder) {
+      host.removeChild(placeholder);
+    }
+    var count = host.getElementsByClassName("ks-key-item").length + keys.length;
+    setText(byId("ks-scan-count"), count + (count === 1 ? " key" : " keys"));
+    if (keys.length === 0 && host.children.length === 0) {
+      var none = document.createElement("p");
+      none.className = "placeholder";
+      none.appendChild(document.createTextNode("No matching keys."));
+      host.appendChild(none);
+      return;
+    }
+    for (var i = 0; i < keys.length; i++) {
+      host.appendChild(keyListItem(keys[i]));
+    }
+  }
+
+  function keyListItem(key) {
+    var item = document.createElement("button");
+    item.type = "button";
+    item.className = "ks-key-item";
+    var name = key.key == null ? "" : String(key.key);
+    var typePill = document.createElement("span");
+    typePill.className = "type-pill type-" + (key.type == null ? "unknown" : String(key.type));
+    typePill.appendChild(document.createTextNode(key.type == null ? "?" : String(key.type)));
+    item.appendChild(typePill);
+    var label = document.createElement("span");
+    label.className = "ks-key-name mono";
+    label.appendChild(document.createTextNode(name));
+    item.appendChild(label);
+    var ttl = document.createElement("span");
+    ttl.className = "ks-key-ttl mono";
+    ttl.appendChild(document.createTextNode(fmtTtl(key.ttl)));
+    item.appendChild(ttl);
+    item.addEventListener("click", function () {
+      selectKey(name);
+    });
+    return item;
+  }
+
+  function fmtTtl(ttl) {
+    if (ttl == null) {
+      return "-";
+    }
+    var n = Number(ttl);
+    if (n === -1) {
+      return "no ttl";
+    }
+    if (n === -2) {
+      return "gone";
+    }
+    return n + "s";
+  }
+
+  function selectKey(name) {
+    ksSelectedKey = name;
+    setStatus("ks-action-status", null);
+    fetchJson("/api/keys/" + encodeURIComponent(name)).then(function (r) {
+      if (r.status === 404) {
+        showInspector(false);
+        setStatus("ks-action-status", "Key no longer exists.", "err");
+        return;
+      }
+      if (r.status === 401 || r.status === 403) {
+        setStatus("ks-action-status", "Sign in to inspect keys.", "err");
+        return;
+      }
+      if (r.status === 200 && r.body) {
+        renderInspector(r.body);
+      } else {
+        setStatus("ks-action-status", apiError(r, "Could not load the key."), "err");
+      }
+    });
+  }
+
+  function showInspector(on) {
+    var empty = byId("ks-inspector-empty");
+    var panel = byId("ks-inspector");
+    var actions = byId("ks-actions");
+    if (empty) {
+      empty.hidden = on;
+    }
+    if (panel) {
+      panel.hidden = !on;
+    }
+    if (actions) {
+      actions.hidden = !on || !haveToken();
+    }
+  }
+
+  function renderInspector(detail) {
+    showInspector(true);
+    setText(byId("ks-detail-key"), detail.key == null ? "-" : String(detail.key));
+    setText(byId("ks-detail-type"), detail.type == null ? "-" : String(detail.type));
+    setText(byId("ks-inspector-type"), detail.type == null ? "" : String(detail.type));
+    setText(byId("ks-detail-ttl"), fmtTtl(detail.ttl));
+    var trunc = byId("ks-detail-truncated");
+    if (trunc) {
+      trunc.hidden = !detail.truncated;
+    }
+    renderKeyValue(detail.value);
+  }
+
+  function renderKeyValue(value) {
+    var block = byId("ks-detail-value");
+    if (!block) {
+      return;
+    }
+    var text = "";
+    if (value && value.kind === "string") {
+      text = value.data == null ? "" : String(value.data);
+    } else if (value && (value.kind === "elements" || value.kind === "pairs")) {
+      var items = Array.isArray(value.items) ? value.items : [];
+      text = items.join("\n");
+    } else {
+      text = "(no value)";
+    }
+    setText(block, text);
+  }
+
+  function deleteSelectedKey() {
+    if (!ksSelectedKey) {
+      return;
+    }
+    var key = ksSelectedKey;
+    fetchMethod("DELETE", "/api/keys/" + encodeURIComponent(key)).then(function (r) {
+      if (handleAuthFailure("ks-action-status", r.status)) {
+        return;
+      }
+      if (r.status === 200) {
+        setStatus("ks-action-status", "Deleted " + key + ".", "ok");
+        showInspector(false);
+        ksSelectedKey = null;
+      } else {
+        setStatus("ks-action-status", apiError(r, "Delete failed."), "err");
+      }
+    });
+  }
+
+  function expireSelectedKey() {
+    if (!ksSelectedKey) {
+      return;
+    }
+    var secsEl = byId("ks-expire-secs");
+    var seconds = secsEl ? parseInt(secsEl.value, 10) : NaN;
+    if (isNaN(seconds) || seconds < 0) {
+      setStatus("ks-action-status", "Enter a non-negative number of seconds.", "err");
+      return;
+    }
+    fetchMethod("POST", "/api/keys/" + encodeURIComponent(ksSelectedKey) + "/expire", {
+      seconds: seconds,
+    }).then(function (r) {
+      if (handleAuthFailure("ks-action-status", r.status)) {
+        return;
+      }
+      if (r.status === 200) {
+        setStatus("ks-action-status", "TTL set.", "ok");
+        selectKey(ksSelectedKey);
+      } else {
+        setStatus("ks-action-status", apiError(r, "Expire failed."), "err");
+      }
+    });
+  }
+
+  function persistSelectedKey() {
+    if (!ksSelectedKey) {
+      return;
+    }
+    fetchMethod("POST", "/api/keys/" + encodeURIComponent(ksSelectedKey) + "/persist").then(function (r) {
+      if (handleAuthFailure("ks-action-status", r.status)) {
+        return;
+      }
+      if (r.status === 200) {
+        setStatus("ks-action-status", "TTL cleared.", "ok");
+        selectKey(ksSelectedKey);
+      } else {
+        setStatus("ks-action-status", apiError(r, "Persist failed."), "err");
+      }
+    });
+  }
+
+  function createKey() {
+    var keyEl = byId("ks-new-key");
+    var valEl = byId("ks-new-value");
+    var key = keyEl ? (keyEl.value || "").trim() : "";
+    var value = valEl ? valEl.value || "" : "";
+    if (!key) {
+      setStatus("ks-action-status", "Enter a key name.", "err");
+      return;
+    }
+    fetchMethod("POST", "/api/keys/" + encodeURIComponent(key), { value: value }).then(function (r) {
+      if (handleAuthFailure("ks-action-status", r.status)) {
+        return;
+      }
+      if (r.status === 200) {
+        setStatus("ks-action-status", "Set " + key + ".", "ok");
+        if (keyEl) keyEl.value = "";
+        if (valEl) valEl.value = "";
+        selectKey(key);
+      } else {
+        setStatus("ks-action-status", apiError(r, "Set failed."), "err");
+      }
+    });
+  }
+
+  // ----- Console (arbitrary command runner) ---------------------------------
+  function appendScrollback(prefix, text) {
+    var block = byId("console-scrollback");
+    if (!block) {
+      return;
+    }
+    var line = document.createElement("div");
+    line.className = "console-line";
+    var pre = document.createElement("span");
+    pre.className = "console-line-prefix mono";
+    pre.appendChild(document.createTextNode(prefix));
+    line.appendChild(pre);
+    var body = document.createElement("span");
+    body.className = "console-line-body mono";
+    body.appendChild(document.createTextNode(text));
+    line.appendChild(body);
+    block.appendChild(line);
+    block.scrollTop = block.scrollHeight;
+  }
+
+  // Tokenize a command line respecting single and double quotes. Returns an array
+  // of arg strings. Unterminated quotes consume to end of line.
+  function tokenizeCommand(input) {
+    var args = [];
+    var cur = "";
+    var inSingle = false;
+    var inDouble = false;
+    var started = false;
+    for (var i = 0; i < input.length; i++) {
+      var ch = input.charAt(i);
+      if (inSingle) {
+        if (ch === "'") {
+          inSingle = false;
+        } else {
+          cur += ch;
+        }
+        continue;
+      }
+      if (inDouble) {
+        if (ch === '"') {
+          inDouble = false;
+        } else {
+          cur += ch;
+        }
+        continue;
+      }
+      if (ch === "'") {
+        inSingle = true;
+        started = true;
+        continue;
+      }
+      if (ch === '"') {
+        inDouble = true;
+        started = true;
+        continue;
+      }
+      if (ch === " " || ch === "\t") {
+        if (started) {
+          args.push(cur);
+          cur = "";
+          started = false;
+        }
+        continue;
+      }
+      cur += ch;
+      started = true;
+    }
+    if (started) {
+      args.push(cur);
+    }
+    return args;
+  }
+
+  // Flatten a rendered reply (the {kind, value, items} shape) into a text string
+  // for the scrollback. Recursive for arrays; pure text (no markup).
+  function renderReplyText(reply, depth) {
+    if (!reply || !reply.kind) {
+      return "(empty)";
+    }
+    if (reply.kind === "simple") {
+      return reply.value == null ? "" : String(reply.value);
+    }
+    if (reply.kind === "error") {
+      return "(error) " + (reply.value == null ? "" : String(reply.value));
+    }
+    if (reply.kind === "integer") {
+      return "(integer) " + String(reply.value);
+    }
+    if (reply.kind === "bulk") {
+      return reply.value == null ? "(nil)" : String(reply.value);
+    }
+    if (reply.kind === "array") {
+      var items = Array.isArray(reply.items) ? reply.items : [];
+      if (items.length === 0) {
+        return "(empty array)";
+      }
+      var lines = [];
+      for (var i = 0; i < items.length; i++) {
+        lines.push(i + 1 + ") " + renderReplyText(items[i], (depth || 0) + 1));
+      }
+      return lines.join("\n");
+    }
+    return "(unknown)";
+  }
+
+  function runConsoleCommand() {
+    var input = byId("console-input");
+    if (!input) {
+      return;
+    }
+    var raw = (input.value || "").trim();
+    if (!raw) {
+      return;
+    }
+    var args = tokenizeCommand(raw);
+    appendScrollback("> ", raw);
+    input.value = "";
+    if (args.length === 0) {
+      return;
+    }
+    fetchMethod("POST", "/api/command", { args: args }).then(function (r) {
+      if (r.status === 401) {
+        appendScrollback("! ", "sign in as admin to run commands");
+        showLogin(true, "");
+        return;
+      }
+      if (r.status === 403) {
+        appendScrollback("! ", "the token does not grant admin");
+        showLogin(true, "The token does not grant the required tier.");
+        return;
+      }
+      if (r.status === 200 && r.body && r.body.reply) {
+        appendScrollback("  ", renderReplyText(r.body.reply, 0));
+      } else {
+        appendScrollback("! ", apiError(r, "command failed"));
+      }
+    });
+  }
+
+  function updateConsoleGate() {
+    var gate = byId("console-gate");
+    var input = byId("console-input");
+    var run = byId("console-run");
+    var enabled = haveToken();
+    // On the loopback dev default (no token configured) the server still serves
+    // every tier, so do NOT hard-disable the input when no token is present; the
+    // gate note is advisory and a 401/403 (when enforcing) shows the precise need.
+    if (gate) {
+      gate.hidden = enabled;
+    }
+    if (input) {
+      input.setAttribute("placeholder", "type a command, e.g. GET mykey");
+    }
+    if (run) {
+      run.disabled = false;
+    }
+  }
+
+  // ----- Pub/Sub ------------------------------------------------------------
+  var pubsubRecent = [];
+
+  function loadPubsub() {
+    fetchJson("/api/pubsub/channels").then(function (r) {
+      if (r.status === 401 || r.status === 403) {
+        renderChannels([], r.status === 401 ? "Sign in to view channels." : "Insufficient privileges.");
+        return;
+      }
+      if (r.status === 200 && r.body && Array.isArray(r.body.channels)) {
+        renderChannels(r.body.channels, null);
+      } else {
+        renderChannels([], "Could not load channels.");
+      }
+    });
+    // The notify-keyspace-events config (best-effort; needs a config read tier).
+    fetchJson("/api/config").then(function (r) {
+      var note = byId("pubsub-notify-config");
+      if (r.status === 200 && r.body && Array.isArray(r.body.params)) {
+        var found = "";
+        for (var i = 0; i < r.body.params.length; i++) {
+          if (r.body.params[i].param === "notify-keyspace-events") {
+            found = r.body.params[i].value == null ? "" : String(r.body.params[i].value);
+            break;
+          }
+        }
+        setText(note, found === "" ? "(disabled)" : found);
+      } else {
+        setText(note, "-");
+      }
+    });
+    var gate = byId("pubsub-gate");
+    if (gate) {
+      gate.hidden = haveToken();
+    }
+  }
+
+  function renderChannels(channels, message) {
+    var rows = [];
+    for (var i = 0; i < channels.length; i++) {
+      var c = channels[i];
+      var tr = document.createElement("tr");
+      tr.appendChild(td(c.channel == null ? "-" : c.channel, "mono"));
+      tr.appendChild(td(c.subs == null ? "-" : fmtNum(c.subs), "num"));
+      rows.push(tr);
+    }
+    fillBody(byId("pubsub-body"), rows, 2, message || "No active channels.");
+    setText(byId("pubsub-channel-count"), channels.length + (channels.length === 1 ? " channel" : " channels"));
+  }
+
+  function publishMessage() {
+    var chEl = byId("pubsub-channel");
+    var msgEl = byId("pubsub-message");
+    var channel = chEl ? (chEl.value || "").trim() : "";
+    var message = msgEl ? msgEl.value || "" : "";
+    if (!channel) {
+      setStatus("pubsub-status", "Enter a channel.", "err");
+      return;
+    }
+    fetchMethod("POST", "/api/pubsub/publish", { channel: channel, message: message }).then(function (r) {
+      if (handleAuthFailure("pubsub-status", r.status)) {
+        return;
+      }
+      if (r.status === 200 && r.body) {
+        var n = r.body.receivers == null ? 0 : r.body.receivers;
+        setStatus("pubsub-status", "Published to " + n + (n === 1 ? " receiver." : " receivers."), "ok");
+        addRecentPublish(channel, message);
+        if (msgEl) {
+          msgEl.value = "";
+        }
+        loadPubsub();
+      } else {
+        setStatus("pubsub-status", apiError(r, "Publish failed."), "err");
+      }
+    });
+  }
+
+  function addRecentPublish(channel, message) {
+    pubsubRecent.unshift({ channel: channel, message: message });
+    while (pubsubRecent.length > 10) {
+      pubsubRecent.pop();
+    }
+    var wrap = byId("pubsub-recent");
+    var list = byId("pubsub-recent-list");
+    if (!list) {
+      return;
+    }
+    if (wrap) {
+      wrap.hidden = false;
+    }
+    while (list.firstChild) {
+      list.removeChild(list.firstChild);
+    }
+    for (var i = 0; i < pubsubRecent.length; i++) {
+      var li = document.createElement("li");
+      li.appendChild(document.createTextNode(pubsubRecent[i].channel + ": " + pubsubRecent[i].message));
+      list.appendChild(li);
+    }
+  }
+
+  // ----- ACL ----------------------------------------------------------------
+  function loadAcl() {
+    fetchJson("/api/acl").then(function (r) {
+      var gate = byId("acl-gate");
+      if (r.status === 401 || r.status === 403) {
+        if (gate) {
+          gate.hidden = false;
+        }
+        renderAclUsers([], "(sign in as admin)");
+        return;
+      }
+      if (gate) {
+        gate.hidden = true;
+      }
+      if (r.status === 200 && r.body) {
+        setText(byId("acl-whoami"), r.body.whoami == null ? "-" : String(r.body.whoami));
+        renderAclUsers(Array.isArray(r.body.users) ? r.body.users : [], null);
+      } else {
+        renderAclUsers([], "Could not load users.");
+      }
+    });
+  }
+
+  // Parse an ACL LIST line ("user alice on >... ~* +@all") into a username + the
+  // remaining rule tokens, for display chips.
+  function parseAclLine(line) {
+    var parts = String(line).split(/\s+/);
+    var name = "(unknown)";
+    var rules = [];
+    var enabled = false;
+    var start = 0;
+    if (parts[0] === "user" && parts.length > 1) {
+      name = parts[1];
+      start = 2;
+    } else if (parts.length > 0) {
+      name = parts[0];
+      start = 1;
+    }
+    for (var i = start; i < parts.length; i++) {
+      if (parts[i] === "on") {
+        enabled = true;
+      }
+      if (parts[i] === "off") {
+        enabled = false;
+      }
+      if (parts[i].length > 0) {
+        rules.push(parts[i]);
+      }
+    }
+    return { name: name, rules: rules, enabled: enabled };
+  }
+
+  function renderAclUsers(users, message) {
+    var host = byId("acl-users");
+    if (!host) {
+      return;
+    }
+    while (host.firstChild) {
+      host.removeChild(host.firstChild);
+    }
+    if (message) {
+      var p = document.createElement("p");
+      p.className = "placeholder";
+      p.appendChild(document.createTextNode(message));
+      host.appendChild(p);
+      return;
+    }
+    if (users.length === 0) {
+      var none = document.createElement("p");
+      none.className = "placeholder";
+      none.appendChild(document.createTextNode("No users."));
+      host.appendChild(none);
+      return;
+    }
+    for (var i = 0; i < users.length; i++) {
+      host.appendChild(aclUserRow(parseAclLine(users[i])));
+    }
+  }
+
+  function aclUserRow(user) {
+    var row = document.createElement("div");
+    row.className = "acl-user-row";
+    var avatar = document.createElement("span");
+    avatar.className = "acl-avatar";
+    var initial = user.name && user.name.length > 0 ? user.name.charAt(0).toUpperCase() : "?";
+    avatar.appendChild(document.createTextNode(initial));
+    row.appendChild(avatar);
+
+    var main = document.createElement("div");
+    main.className = "acl-user-main";
+    var nameLine = document.createElement("div");
+    nameLine.className = "acl-user-name mono";
+    nameLine.appendChild(document.createTextNode(user.name));
+    var status = document.createElement("span");
+    status.className = user.enabled ? "pill pill-ok" : "pill pill-bad";
+    status.appendChild(document.createTextNode(user.enabled ? "on" : "off"));
+    nameLine.appendChild(status);
+    main.appendChild(nameLine);
+
+    var chips = document.createElement("div");
+    chips.className = "acl-chips";
+    for (var i = 0; i < user.rules.length && i < 24; i++) {
+      var chip = document.createElement("span");
+      chip.className = "acl-chip mono";
+      chip.appendChild(document.createTextNode(user.rules[i]));
+      chips.appendChild(chip);
+    }
+    main.appendChild(chips);
+    row.appendChild(main);
+
+    var del = document.createElement("button");
+    del.type = "button";
+    del.className = "btn btn-danger acl-del";
+    del.appendChild(document.createTextNode("Delete"));
+    var uname = user.name;
+    del.addEventListener("click", function () {
+      deleteAclUser(uname);
+    });
+    row.appendChild(del);
+    return row;
+  }
+
+  function addAclUser() {
+    var nameEl = byId("acl-username");
+    var rulesEl = byId("acl-rules");
+    var username = nameEl ? (nameEl.value || "").trim() : "";
+    var rulesRaw = rulesEl ? (rulesEl.value || "").trim() : "";
+    if (!username) {
+      setStatus("acl-status", "Enter a username.", "err");
+      return;
+    }
+    var rules = rulesRaw.length > 0 ? rulesRaw.split(/\s+/) : [];
+    fetchMethod("POST", "/api/acl/user", { username: username, rules: rules }).then(function (r) {
+      if (handleAuthFailure("acl-status", r.status)) {
+        return;
+      }
+      if (r.status === 200) {
+        setStatus("acl-status", "Saved user " + username + ".", "ok");
+        if (nameEl) nameEl.value = "";
+        if (rulesEl) rulesEl.value = "";
+        loadAcl();
+      } else {
+        setStatus("acl-status", apiError(r, "Could not save user."), "err");
+      }
+    });
+  }
+
+  function deleteAclUser(name) {
+    fetchMethod("DELETE", "/api/acl/user/" + encodeURIComponent(name)).then(function (r) {
+      if (handleAuthFailure("acl-status", r.status)) {
+        return;
+      }
+      if (r.status === 200) {
+        setStatus("acl-status", "Deleted " + name + ".", "ok");
+        loadAcl();
+      } else {
+        setStatus("acl-status", apiError(r, "Could not delete " + name + "."), "err");
+      }
+    });
+  }
+
+  // ----- Persistence --------------------------------------------------------
+  function loadPersistence() {
+    fetchJson("/api/persistence").then(function (r) {
+      if (r.status === 401 || r.status === 403) {
+        setText(byId("p-lastsave"), "-");
+        setStatus("persistence-status", r.status === 401 ? "Sign in to view persistence." : "Insufficient privileges.", "err");
+        return;
+      }
+      if (r.status === 200 && r.body) {
+        renderPersistence(r.body);
+      } else {
+        setStatus("persistence-status", apiError(r, "Could not load persistence."), "err");
+      }
+    });
+    var gate = byId("persistence-gate");
+    if (gate) {
+      gate.hidden = haveToken();
+    }
+  }
+
+  function renderPersistence(p) {
+    if (p.last_save_unixtime != null) {
+      var ago = Math.max(0, Math.floor(Date.now() / 1000 - Number(p.last_save_unixtime)));
+      setText(byId("p-lastsave"), fmtDuration(ago));
+      setText(byId("p-lastsave-delta"), "at " + fmtTime(p.last_save_unixtime));
+    } else {
+      setText(byId("p-lastsave"), "never");
+    }
+    setText(byId("p-changes"), p.changes_since_save == null ? "-" : fmtNum(p.changes_since_save));
+    setText(byId("p-rdb"), p.rdb_enabled ? "on" : "off");
+    setText(byId("p-aof"), p.aof_enabled ? "on" : "off");
+    if (p.last_bgsave_status) {
+      setText(byId("p-bgsave-status"), "last bgsave: " + p.last_bgsave_status);
+    }
+  }
+
+  function fmtDuration(secs) {
+    var s = Number(secs);
+    if (isNaN(s)) {
+      return "-";
+    }
+    if (s < 60) {
+      return s + "s ago";
+    }
+    if (s < 3600) {
+      return Math.floor(s / 60) + "m ago";
+    }
+    if (s < 86400) {
+      return Math.floor(s / 3600) + "h ago";
+    }
+    return Math.floor(s / 86400) + "d ago";
+  }
+
+  function saveNow() {
+    setStatus("persistence-status", "Requesting BGSAVE...", "ok");
+    fetchMethod("POST", "/api/persistence/save", { background: true }).then(function (r) {
+      if (handleAuthFailure("persistence-status", r.status)) {
+        return;
+      }
+      if (r.status === 200) {
+        setStatus("persistence-status", "Background save started.", "ok");
+        loadPersistence();
+      } else {
+        setStatus("persistence-status", apiError(r, "Save failed."), "err");
+      }
+    });
+  }
+
+  // Extract an error message from a non-200 management response, falling back to a
+  // default. The server error body is {"error":"..."} (a string), so it is safe to
+  // surface as text.
+  function apiError(r, fallback) {
+    if (r && r.body && typeof r.body.error === "string") {
+      return r.body.error;
+    }
+    return fallback + " (HTTP " + (r ? r.status : "?") + ")";
+  }
+
+  // Load the data for a management section on demand (when navigated to / on a
+  // manual refresh). The OPEN/PRIVILEGED monitoring sections keep using the 5s
+  // poll in refresh().
+  function loadManagement(section) {
+    if (section === "config") {
+      loadConfig();
+    } else if (section === "keyspace") {
+      // The keyspace browser is driven by the Scan button; nothing auto-loads.
+      var actions = byId("ks-actions");
+      if (actions && ksSelectedKey) {
+        actions.hidden = !haveToken();
+      }
+    } else if (section === "console") {
+      updateConsoleGate();
+    } else if (section === "pubsub") {
+      loadPubsub();
+    } else if (section === "acl") {
+      loadAcl();
+    } else if (section === "persistence") {
+      loadPersistence();
+    }
+  }
+
   // ----- fetch --------------------------------------------------------------
   function fetchJson(path) {
     var headers = { Accept: "application/json" };
@@ -695,6 +1572,66 @@
     });
   }
 
+  // Issue a non-GET request (POST/DELETE) with a JSON body and the Bearer token.
+  // Returns { status, body } like fetchJson. The body is sent as JSON; the token
+  // (if any) rides ONLY in the Authorization header, never the URL or the body.
+  function fetchMethod(method, path, payload) {
+    var headers = { Accept: "application/json" };
+    var token = getToken();
+    if (token) {
+      headers.Authorization = "Bearer " + token;
+    }
+    var init = { method: method, headers: headers, cache: "no-store" };
+    if (payload !== undefined && payload !== null) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(payload);
+    }
+    return fetch(path, init).then(function (resp) {
+      return resp
+        .json()
+        .catch(function () {
+          return null;
+        })
+        .then(function (body) {
+          return { status: resp.status, body: body };
+        });
+    });
+  }
+
+  // Show a transient status line on a management form. `kind` is "ok" or "err".
+  function setStatus(id, message, kind) {
+    var el = byId(id);
+    if (!el) {
+      return;
+    }
+    if (!message) {
+      el.hidden = true;
+      setText(el, "");
+      el.classList.remove("status-ok", "status-err");
+      return;
+    }
+    setText(el, message);
+    el.hidden = false;
+    el.classList.remove("status-ok", "status-err");
+    el.classList.add(kind === "ok" ? "status-ok" : "status-err");
+  }
+
+  // Map a non-200 management response to a human status string + reveal sign-in on
+  // an auth failure. Returns true if it was an auth failure (so the caller stops).
+  function handleAuthFailure(statusId, status) {
+    if (status === 401) {
+      setStatus(statusId, "Admin token required. Sign in below.", "err");
+      showLogin(true, "");
+      return true;
+    }
+    if (status === 403) {
+      setStatus(statusId, "The token does not grant admin. Sign in with an admin token.", "err");
+      showLogin(true, "The token does not grant the required tier.");
+      return true;
+    }
+    return false;
+  }
+
   function refresh() {
     if (!liveOn) {
       return;
@@ -715,7 +1652,6 @@
       { path: "/api/nodes", key: "nodes", render: renderNodes },
       { path: "/api/slowlog", key: "slowlog", render: renderSlowlog },
       { path: "/api/clients", key: "clients", render: renderClients },
-      { path: "/api/keyspace", key: "keyspace", render: renderKeyspace },
     ];
 
     Promise.all(
@@ -814,6 +1750,12 @@
     var meta = SECTION_META[section];
     setText(byId("page-title"), meta.title);
     setText(byId("page-subtitle"), meta.subtitle);
+
+    // Management sections load on demand (each opens an on-demand node connection),
+    // so fetch their data when navigated to rather than on the 5s monitoring poll.
+    if (MANAGEMENT_SECTIONS[section]) {
+      loadManagement(section);
+    }
   }
 
   function wireNav() {
@@ -907,6 +1849,10 @@
       liveOn = true;
       refresh();
       liveOn = wasLive;
+      // Also reload the active management section (it is not on the live poll).
+      if (MANAGEMENT_SECTIONS[activeSection]) {
+        loadManagement(activeSection);
+      }
     });
   }
 
@@ -931,6 +1877,10 @@
           clearToken();
         }
         refresh();
+        // Re-evaluate the active management section's gates/data with the new token.
+        if (MANAGEMENT_SECTIONS[activeSection]) {
+          loadManagement(activeSection);
+        }
       });
     }
 
@@ -942,7 +1892,104 @@
         }
         showLogin(true, "Signed out.");
         refresh();
+        if (MANAGEMENT_SECTIONS[activeSection]) {
+          loadManagement(activeSection);
+        }
       });
+    }
+  }
+
+  // ----- management form wiring (#361) --------------------------------------
+  function wireManagement() {
+    // Config: filter + apply (per-row Apply wired in configRow).
+    var configFilter = byId("config-filter");
+    if (configFilter) {
+      configFilter.addEventListener("input", function () {
+        renderConfigRows(configParams, null);
+      });
+    }
+
+    // Keyspace: scan, more, inspector actions, new key.
+    var scanForm = byId("ks-scan-form");
+    if (scanForm) {
+      scanForm.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        runScan(true);
+      });
+    }
+    var scanMore = byId("ks-scan-more");
+    if (scanMore) {
+      scanMore.addEventListener("click", function () {
+        runScan(false);
+      });
+    }
+    var expireForm = byId("ks-expire-form");
+    if (expireForm) {
+      expireForm.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        expireSelectedKey();
+      });
+    }
+    wireClick("ks-persist-btn", persistSelectedKey);
+    wireClick("ks-del-btn", deleteSelectedKey);
+    var newForm = byId("ks-new-form");
+    if (newForm) {
+      newForm.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        createKey();
+      });
+    }
+
+    // Console: form submit + suggestion chips.
+    var consoleForm = byId("console-form");
+    if (consoleForm) {
+      consoleForm.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        runConsoleCommand();
+      });
+    }
+    var chips = byId("console-chips");
+    if (chips) {
+      var chipBtns = chips.getElementsByClassName("chip");
+      for (var i = 0; i < chipBtns.length; i++) {
+        (function (btn) {
+          btn.addEventListener("click", function () {
+            var input = byId("console-input");
+            if (input) {
+              input.value = btn.getAttribute("data-cmd") || "";
+              input.focus();
+            }
+          });
+        })(chipBtns[i]);
+      }
+    }
+
+    // Pub/Sub: publish form.
+    var pubForm = byId("pubsub-form");
+    if (pubForm) {
+      pubForm.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        publishMessage();
+      });
+    }
+
+    // ACL: add-user form (delete wired per-row in aclUserRow).
+    var aclForm = byId("acl-form");
+    if (aclForm) {
+      aclForm.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        addAclUser();
+      });
+    }
+
+    // Persistence: save now.
+    wireClick("persistence-save", saveNow);
+  }
+
+  function wireClick(id, fn) {
+    var el = byId(id);
+    if (el) {
+      el.addEventListener("click", fn);
     }
   }
 
@@ -953,6 +2000,7 @@
     wireLiveToggle();
     wireRefresh();
     wireAuthControls();
+    wireManagement();
     setActiveSection("overview");
     refresh();
     pollTimer = setInterval(refresh, POLL_MS);

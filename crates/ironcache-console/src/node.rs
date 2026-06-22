@@ -178,6 +178,50 @@ impl Transport {
     }
 }
 
+/// The connection parameters for opening an ON-DEMAND [`NodeClient`] to the seed
+/// node (issue #361). The poll loop opens a fresh connection per tick and drops
+/// it; the management layer needs the same ability to open a SHORT-LIVED
+/// connection per request (run the command, then drop), so this captures the
+/// addr, the resolved TLS, the resolved AUTH (with the zeroized password), and the
+/// connect/op timeout bounds in one cloneable unit shared into the HTTP state.
+///
+/// SECURITY: the password is held in [`NodeAuth`]'s zeroized buffer and is never
+/// logged (the manual `Debug` redacts it); a clone keeps that redaction.
+#[derive(Debug, Clone)]
+pub struct NodeAccess {
+    /// The seed node address (`host:port`) to connect to.
+    pub addr: String,
+    /// The resolved TLS settings, or `None` for plaintext.
+    pub tls: Option<NodeTls>,
+    /// The resolved AUTH (user + zeroized password), or `None` for no auth.
+    pub auth: Option<NodeAuth>,
+    /// The TCP/TLS connect timeout.
+    pub connect_timeout: Duration,
+    /// The per-operation (write + read one reply) timeout.
+    pub op_timeout: Duration,
+}
+
+impl NodeAccess {
+    /// Open a fresh, AUTH'd [`NodeClient`] to the seed node with the captured
+    /// bounds. The caller runs one (or a few bounded) commands then drops it; a
+    /// short-lived connection per management request keeps the model simple and
+    /// avoids sharing a single mutable client across concurrent requests.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`NodeError`] from [`NodeClient::connect`] (connect/timeout/auth).
+    pub async fn connect(&self) -> Result<NodeClient, NodeError> {
+        NodeClient::connect(
+            &self.addr,
+            self.tls.as_ref(),
+            self.auth.as_ref(),
+            self.connect_timeout,
+            self.op_timeout,
+        )
+        .await
+    }
+}
+
 /// An async RESP connection to one node, with per-operation timeout bounds.
 #[derive(Debug)]
 pub struct NodeClient {

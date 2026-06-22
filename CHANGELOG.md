@@ -61,6 +61,39 @@ release.
 
 ### Added
 
+- IronCache Console node-level MANAGEMENT layer (issue #361, single-node subset):
+  the console becomes a bounded WRITE surface against one node, not just a monitor.
+  New admin-tier write endpoints (`CONFIG SET`, key CRUD over `POST`/`DELETE
+  /api/keys/{k}` plus expire/persist, an arbitrary-command Console at `POST
+  /api/command`, pub/sub publish, ACL user management `SETUSER`/`DELUSER`, and a
+  persistence `SAVE`/`BGSAVE`) plus the sensitive management reads (`CONFIG GET`,
+  a `SCAN` key browser and key inspector, the pub/sub channel list, the ACL list,
+  and the `INFO persistence` status). The HTTP responder, previously GET/HEAD-only,
+  now reads a request body bounded by the existing request-size cap (an oversized
+  body is a 413, malformed JSON a 400, never a panic) and routes POST/DELETE
+  through the SAME tier gate that protects GET. Every mutation is ADMIN-tier,
+  enforced server-side BEFORE the handler runs (a write verb maps to Admin
+  regardless of path, so a trailing-slash / casing / method trick cannot drop it
+  below the admin bar), and is audit-logged via tracing (action + target + result
+  + the authenticated tier; never a value or secret). The console executes every
+  command over its existing RESP connection AUTHed as the least-privilege node ACL
+  user, so the node ACL is the ultimate bound (defense in depth) even for the
+  arbitrary-command Console. The arbitrary command is bounded (a non-empty argv, a
+  per-arg cap, and a total-bytes cap); the SCAN browser caps the page size and the
+  pattern length and uses SCAN, never KEYS; the Bearer-header auth is CSRF-safe (no
+  cookie). The dashboard Config, Keyspace, Console, Pub/Sub, ACL, and a new
+  Persistence page are now FUNCTIONAL (read plus write) in the bespoke Butlr design
+  language, replacing their gated empty-states; a mutation without an admin token
+  surfaces "admin required" and reveals the sign-in rather than a raw error. The
+  strict CSP (`default-src 'self'`, no inline style/script/handlers) and the
+  XSS-safe posture (every server string via textContent, never innerHTML) are
+  preserved: dynamic values go through CSSOM / classList and handlers via
+  addEventListener. The genuinely-cluster-only views (Cluster, Replication,
+  Shards) stay gated with their honest empty-states (no fabricated data). The
+  OpenAPI document is updated to describe every new path, method, and schema.
+  Typed-value writes are limited to a string SET in v1 (typed collection writes
+  are a follow-up).
+
 - IronCache Console: the cluster overview totals now include
   `commands_processed` and `connections_received`, summed across the reachable
   nodes from each node's INFO Stats counters, so the dashboard can derive a true

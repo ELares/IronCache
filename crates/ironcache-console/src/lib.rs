@@ -91,6 +91,7 @@ pub mod http;
 pub mod httpclient;
 pub mod info;
 pub mod logging;
+pub mod manage;
 pub mod metrics;
 pub mod node;
 pub mod poll;
@@ -192,12 +193,21 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         // is configured, else `None` (so `/api/timeseries` answers 503). SECURITY:
         // the base URL comes ONLY from server config here, never from a request.
         let history = build_history_source(cfg);
+        // Resolve auth/TLS ONCE at startup (read the password file here, not every
+        // tick), shared by the poll loop AND the on-demand management connections.
+        let node_auth = poll::resolve_auth(cfg).context("reading the node password file")?;
+        let node_tls = poll::resolve_tls(cfg);
+        // The on-demand node-connection factory (#361): the management endpoints
+        // open a short-lived NodeClient to the FIRST seed per request. `None` when
+        // no seed is configured, so the management endpoints answer 503.
+        let node_access = build_node_access(cfg, node_auth.clone(), node_tls.clone());
         let state = http::ConsoleHttpState::with_topology_and_auth(
             metrics.clone(),
             topology.clone(),
             auth_policy,
         )
-        .with_history(history);
+        .with_history(history)
+        .with_node_access(node_access);
         let listener = tokio::net::TcpListener::bind(&cfg.http_addr)
             .await
             .with_context(|| format!("binding the console HTTP address {}", cfg.http_addr))?;
@@ -207,20 +217,18 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         state.set_live(true);
         log_boot(cfg);
 
-        // Resolve auth/TLS ONCE at startup (read the password file here, not every
-        // tick), then spawn the bounded poll loop. The env clock is the snapshot
-        // freshness seam (ADR-0003).
+        // Spawn the bounded poll loop with the auth/TLS resolved above (the password
+        // file is read once at startup, not every tick). The env clock is the
+        // snapshot freshness seam (ADR-0003).
         let clock = Arc::new(SystemEnv::new());
-        let auth = poll::resolve_auth(cfg).context("reading the node password file")?;
-        let tls = poll::resolve_tls(cfg);
         let poller = tokio::spawn(poll::run_poll_loop(
             clock,
             cfg.clone(),
             metrics.clone(),
             state.clone(),
             topology,
-            auth,
-            tls,
+            node_auth,
+            node_tls,
         ));
 
         let result = tokio::select! {
@@ -253,6 +261,29 @@ fn build_history_source(cfg: &ConsoleConfig) -> Option<Arc<dyn history::HistoryS
     let read_timeout = std::time::Duration::from_secs(cfg.op_timeout_secs.max(1));
     let source = history::PrometheusSource::new(url, connect_timeout, read_timeout);
     Some(Arc::new(source))
+}
+
+/// Build the on-demand node-connection factory (#361) from config: the FIRST seed
+/// plus the resolved auth/tls and the connect/op timeout bounds, wrapped in an
+/// `Arc` for cheap sharing into the HTTP state. `None` when no seed is configured,
+/// so the management endpoints answer `503` rather than dialing nothing.
+///
+/// SECURITY: the management connections AUTH with the SAME least-privilege node
+/// ACL user the poller uses, so the node ACL bounds every management command
+/// (defense in depth). The password is held in the zeroized `NodeAuth` buffer.
+fn build_node_access(
+    cfg: &ConsoleConfig,
+    auth: Option<crate::node::NodeAuth>,
+    tls: Option<crate::node::NodeTls>,
+) -> Option<Arc<crate::node::NodeAccess>> {
+    let addr = cfg.seeds.first()?.clone();
+    Some(Arc::new(crate::node::NodeAccess {
+        addr,
+        tls,
+        auth,
+        connect_timeout: std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1)),
+        op_timeout: std::time::Duration::from_secs(cfg.op_timeout_secs.max(1)),
+    }))
 }
 
 /// Emit the one-line boot banner (and a warning if the console has no seed nodes

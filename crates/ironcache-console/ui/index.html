@@ -159,6 +159,14 @@
               </svg>
               <span class="nav-label">ACL</span>
             </button>
+            <button type="button" class="nav-item" data-section="persistence">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <ellipse cx="12" cy="6" rx="7" ry="3"></ellipse>
+                <path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"></path>
+                <path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"></path>
+              </svg>
+              <span class="nav-label">Persistence</span>
+            </button>
           </div>
         </nav>
 
@@ -451,26 +459,105 @@
             </div>
           </section>
 
-          <!-- Keyspace (real data, privileged) -->
+          <!-- Keyspace (real data, privileged read + admin actions) -->
           <section class="section" id="section-keyspace" data-section-panel="keyspace" hidden>
-            <div class="card table-card">
-              <p class="keyspace-total">
-                Total keys: <span class="mono" id="ks-total">-</span>
-              </p>
-              <div class="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Node</th>
-                      <th>DB</th>
-                      <th>Keys</th>
-                      <th>Expires</th>
-                    </tr>
-                  </thead>
-                  <tbody id="keyspace-body">
-                    <tr><td colspan="4" class="empty">No data yet.</td></tr>
-                  </tbody>
-                </table>
+            <div class="keyspace-layout">
+              <div class="card keyspace-browser">
+                <div class="card-head">
+                  <h2 class="card-title">Browse</h2>
+                  <span class="card-sub" id="ks-scan-count">-</span>
+                </div>
+                <form id="ks-scan-form" class="ks-scan-form" autocomplete="off">
+                  <label class="visually-hidden" for="ks-pattern">SCAN pattern</label>
+                  <input
+                    id="ks-pattern"
+                    class="ks-input mono"
+                    type="text"
+                    name="pattern"
+                    placeholder="match pattern, e.g. user:*"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                  <button id="ks-scan-btn" class="btn btn-primary" type="submit">Scan</button>
+                  <button id="ks-scan-more" class="btn" type="button" hidden>More</button>
+                </form>
+                <p id="ks-browse-status" class="ks-status" hidden></p>
+                <div class="ks-key-list" id="ks-key-list">
+                  <p class="placeholder">Run a scan to list keys.</p>
+                </div>
+              </div>
+
+              <div class="card keyspace-inspector">
+                <div class="card-head">
+                  <h2 class="card-title">Inspector</h2>
+                  <span class="card-sub" id="ks-inspector-type"></span>
+                </div>
+                <div id="ks-inspector-empty" class="empty-state empty-state-inline">
+                  <p class="empty-sub">Select a key to inspect.</p>
+                </div>
+                <div id="ks-inspector" hidden>
+                  <dl class="kv-list">
+                    <dt>Key</dt>
+                    <dd class="mono" id="ks-detail-key">-</dd>
+                    <dt>Type</dt>
+                    <dd class="mono" id="ks-detail-type">-</dd>
+                    <dt>Encoding</dt>
+                    <dd class="mono" id="ks-detail-encoding">N/A</dd>
+                    <dt>Slot</dt>
+                    <dd class="mono" id="ks-detail-slot">N/A (standalone)</dd>
+                    <dt>TTL</dt>
+                    <dd class="mono" id="ks-detail-ttl">-</dd>
+                  </dl>
+                  <p id="ks-detail-truncated" class="ks-truncated" hidden>
+                    Value truncated to the inspection cap.
+                  </p>
+                  <pre class="value-block mono" id="ks-detail-value"></pre>
+
+                  <div class="ks-actions" id="ks-actions" hidden>
+                    <form id="ks-expire-form" class="ks-action-row" autocomplete="off">
+                      <label class="visually-hidden" for="ks-expire-secs">TTL seconds</label>
+                      <input
+                        id="ks-expire-secs"
+                        class="ks-input ks-input-narrow mono"
+                        type="number"
+                        min="0"
+                        step="1"
+                        name="seconds"
+                        placeholder="seconds"
+                      />
+                      <button id="ks-expire-btn" class="btn" type="submit">Expire</button>
+                      <button id="ks-persist-btn" class="btn" type="button">Persist</button>
+                      <button id="ks-del-btn" class="btn btn-danger" type="button">Delete</button>
+                    </form>
+                  </div>
+                </div>
+
+                <div class="ks-new" id="ks-new">
+                  <h3 class="card-subtitle">New string key</h3>
+                  <form id="ks-new-form" class="ks-new-form" autocomplete="off">
+                    <label class="visually-hidden" for="ks-new-key">Key</label>
+                    <input
+                      id="ks-new-key"
+                      class="ks-input mono"
+                      type="text"
+                      name="key"
+                      placeholder="key"
+                      autocomplete="off"
+                      spellcheck="false"
+                    />
+                    <label class="visually-hidden" for="ks-new-value">Value</label>
+                    <input
+                      id="ks-new-value"
+                      class="ks-input mono"
+                      type="text"
+                      name="value"
+                      placeholder="value (string SET)"
+                      autocomplete="off"
+                    />
+                    <button id="ks-new-btn" class="btn btn-primary" type="submit">Set</button>
+                  </form>
+                </div>
+                <p id="ks-action-status" class="ks-status" hidden></p>
               </div>
             </div>
           </section>
@@ -528,66 +615,193 @@
             </div>
           </section>
 
+          <!-- Console (real: arbitrary command runner, admin) -->
           <section class="section" id="section-console" data-section-panel="console" hidden>
-            <div class="card empty-state">
-              <span class="empty-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3" y="4" width="18" height="16" rx="2"></rect>
-                  <path d="M7 9l3 3-3 3M13 15h4"></path>
-                </svg>
-              </span>
-              <h2 class="empty-title">Console</h2>
-              <p class="empty-sub">
-                Management actions land in a later phase (#361/#371).
+            <div class="card console-card">
+              <div class="card-head">
+                <h2 class="card-title">Command console</h2>
+                <span class="card-sub">runs over the node ACL user</span>
+              </div>
+              <p id="console-gate" class="ks-status" hidden>
+                Sign in as admin to run commands.
               </p>
+              <div class="console-chips" id="console-chips">
+                <button type="button" class="chip" data-cmd="PING">PING</button>
+                <button type="button" class="chip" data-cmd="INFO server">INFO server</button>
+                <button type="button" class="chip" data-cmd="DBSIZE">DBSIZE</button>
+                <button type="button" class="chip" data-cmd="CLIENT LIST">CLIENT LIST</button>
+                <button type="button" class="chip" data-cmd="CONFIG GET maxmemory">CONFIG GET maxmemory</button>
+              </div>
+              <pre class="console-scrollback mono" id="console-scrollback" aria-live="polite"></pre>
+              <form id="console-form" class="console-form" autocomplete="off">
+                <span class="console-prompt mono" aria-hidden="true">&gt;</span>
+                <label class="visually-hidden" for="console-input">Command</label>
+                <input
+                  id="console-input"
+                  class="console-input mono"
+                  type="text"
+                  name="command"
+                  placeholder="type a command, e.g. GET mykey"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  autocorrect="off"
+                  spellcheck="false"
+                />
+                <button id="console-run" class="btn btn-primary" type="submit">Run</button>
+              </form>
             </div>
           </section>
 
+          <!-- Pub/Sub (real: channels + publish, admin) -->
           <section class="section" id="section-pubsub" data-section-panel="pubsub" hidden>
-            <div class="card empty-state">
-              <span class="empty-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 11a8 8 0 0 1 8-8M4 7a12 12 0 0 1 12-3"></path>
-                  <circle cx="5" cy="18" r="2"></circle>
-                  <path d="M9 19h11M16 16l4 3-4 3"></path>
-                </svg>
-              </span>
-              <h2 class="empty-title">Pub/Sub</h2>
-              <p class="empty-sub">
-                Management actions land in a later phase (#361/#371).
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Keyspace notifications</h2>
+                <span class="card-sub mono" id="pubsub-notify-config">-</span>
+              </div>
+              <p class="card-note" id="pubsub-notify-note">
+                The notify-keyspace-events config controls keyspace notifications.
               </p>
+            </div>
+
+            <div class="card table-card">
+              <div class="card-head">
+                <h2 class="card-title">Active channels</h2>
+                <span class="card-sub" id="pubsub-channel-count">-</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Channel</th>
+                      <th>Subscribers</th>
+                    </tr>
+                  </thead>
+                  <tbody id="pubsub-body">
+                    <tr><td colspan="2" class="empty">No data yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Publish</h2>
+                <span class="card-sub">admin</span>
+              </div>
+              <p id="pubsub-gate" class="ks-status" hidden>Admin token required to publish.</p>
+              <form id="pubsub-form" class="pubsub-form" autocomplete="off">
+                <label class="visually-hidden" for="pubsub-channel">Channel</label>
+                <input id="pubsub-channel" class="ks-input mono" type="text" name="channel" placeholder="channel" autocomplete="off" spellcheck="false" />
+                <label class="visually-hidden" for="pubsub-message">Message</label>
+                <input id="pubsub-message" class="ks-input mono" type="text" name="message" placeholder="message" autocomplete="off" />
+                <button id="pubsub-publish" class="btn btn-primary" type="submit">Publish</button>
+              </form>
+              <p id="pubsub-status" class="ks-status" hidden></p>
+              <div class="pubsub-recent" id="pubsub-recent" hidden>
+                <h3 class="card-subtitle">Recently published (this tab)</h3>
+                <ul class="pubsub-recent-list mono" id="pubsub-recent-list"></ul>
+                <p class="card-note">
+                  A live subscribe tail is not shown: the console does not stream.
+                </p>
+              </div>
             </div>
           </section>
 
+          <!-- Config (real: CONFIG GET list + CONFIG SET, admin) -->
           <section class="section" id="section-config" data-section-panel="config" hidden>
-            <div class="card empty-state">
-              <span class="empty-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <line x1="4" y1="7" x2="20" y2="7"></line>
-                  <line x1="4" y1="17" x2="20" y2="17"></line>
-                  <circle cx="9" cy="7" r="2.2"></circle>
-                  <circle cx="15" cy="17" r="2.2"></circle>
-                </svg>
-              </span>
-              <h2 class="empty-title">Config</h2>
-              <p class="empty-sub">
-                Management actions land in a later phase (#361/#371).
+            <div class="card config-card">
+              <div class="card-head">
+                <h2 class="card-title">Runtime configuration</h2>
+                <span class="card-sub" id="config-count">-</span>
+              </div>
+              <p class="card-note">
+                Precedence: CONFIG SET &gt; CLI &gt; env &gt; TOML &gt; default.
               </p>
+              <div class="config-toolbar">
+                <label class="visually-hidden" for="config-filter">Filter</label>
+                <input id="config-filter" class="ks-input mono" type="text" placeholder="filter parameters" autocomplete="off" spellcheck="false" />
+              </div>
+              <p id="config-gate" class="ks-status" hidden>Admin token required to apply changes.</p>
+              <p id="config-status" class="ks-status" hidden></p>
+              <div class="config-rows" id="config-rows">
+                <p class="placeholder">No data yet.</p>
+              </div>
             </div>
           </section>
 
+          <!-- ACL (real: users + add/delete, admin) -->
           <section class="section" id="section-acl" data-section-panel="acl" hidden>
-            <div class="card empty-state">
-              <span class="empty-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path>
-                  <path d="M9 12l2 2 4-4"></path>
-                </svg>
-              </span>
-              <h2 class="empty-title">ACL</h2>
-              <p class="empty-sub">
-                Management actions land in a later phase (#361/#371).
-              </p>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Users</h2>
+                <span class="card-sub mono" id="acl-whoami">-</span>
+              </div>
+              <p id="acl-gate" class="ks-status" hidden>Admin token required to view and manage ACL users.</p>
+              <div class="acl-users" id="acl-users">
+                <p class="placeholder">No data yet.</p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Add user</h2>
+                <span class="card-sub">admin</span>
+              </div>
+              <form id="acl-form" class="acl-form" autocomplete="off">
+                <label class="visually-hidden" for="acl-username">Username</label>
+                <input id="acl-username" class="ks-input mono" type="text" name="username" placeholder="username" autocomplete="off" spellcheck="false" />
+                <label class="visually-hidden" for="acl-rules">Rules</label>
+                <input id="acl-rules" class="ks-input mono" type="text" name="rules" placeholder="rules, space-separated e.g. on >pass ~* +@read" autocomplete="off" spellcheck="false" />
+                <button id="acl-add" class="btn btn-primary" type="submit">Add</button>
+              </form>
+              <p id="acl-status" class="ks-status" hidden></p>
+            </div>
+          </section>
+
+          <!-- Persistence (real: status cards + save, admin) -->
+          <section class="section" id="section-persistence" data-section-panel="persistence" hidden>
+            <div class="metric-grid">
+              <div class="card metric-card">
+                <div class="metric-head"><span class="metric-label">Last save</span></div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="p-lastsave">-</span>
+                </div>
+                <p class="metric-delta" id="p-lastsave-delta">time since the last RDB save</p>
+              </div>
+              <div class="card metric-card">
+                <div class="metric-head"><span class="metric-label">Changes since save</span></div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="p-changes">-</span>
+                </div>
+                <p class="metric-delta">writes not yet persisted</p>
+              </div>
+              <div class="card metric-card">
+                <div class="metric-head"><span class="metric-label">RDB</span></div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="p-rdb">-</span>
+                </div>
+                <p class="metric-delta" id="p-bgsave-status">snapshot persistence</p>
+              </div>
+              <div class="card metric-card">
+                <div class="metric-head"><span class="metric-label">AOF</span></div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="p-aof">-</span>
+                </div>
+                <p class="metric-delta">append-only file</p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Save</h2>
+                <span class="card-sub">admin</span>
+              </div>
+              <p id="persistence-gate" class="ks-status" hidden>Admin token required to trigger a save.</p>
+              <div class="ks-action-row">
+                <button id="persistence-save" class="btn btn-primary" type="button">Save now (BGSAVE)</button>
+              </div>
+              <p id="persistence-status" class="ks-status" hidden></p>
             </div>
           </section>
         </main>
