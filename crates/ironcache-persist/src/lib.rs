@@ -390,7 +390,9 @@ fn load_records_into<E: EvictionHook, A: AccountingHook, K: Fn(&[u8]) -> bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironcache_storage::{CountingAccounting, NewValueOwned, NullEviction, Store, UnixMillis};
+    use ironcache_storage::{
+        CountingAccounting, EncodingThresholds, NewValueOwned, NullEviction, Store, UnixMillis,
+    };
     use ironcache_store::{KvObj, ShardStore};
 
     type TestStore = ShardStore<NullEviction, CountingAccounting>;
@@ -460,6 +462,7 @@ mod tests {
                     (b"f2".to_vec(), b"v2".to_vec()),
                 ]),
                 None,
+                &EncodingThresholds::defaults(),
             ),
         );
         store.insert_object(1, KvObj::from_bytes(b"db1-str", b"hello db1", None));

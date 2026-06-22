@@ -177,6 +177,38 @@ fn set_nodelay(stream: &TcpStream) {
     let _ = std_stream.into_raw_fd();
 }
 
+/// Apply `SO_KEEPALIVE` with `secs` idle time to a `tokio_uring` stream at ACCEPT (Redis
+/// `tcp-keepalive`), WITHOUT taking ownership of its fd. `secs == 0` DISABLES keepalive. The
+/// io_uring stream type exposes no socket-option setter, so borrow the fd through a temporary std
+/// stream wrapped in a [`socket2::SockRef`] (the same no-ownership-transfer dance [`set_nodelay`]
+/// uses) and `into_raw_fd` it back so the descriptor the io_uring stream still owns is not closed.
+/// Errors are ignored to match `set_nodelay` (a connection still functions without the probe).
+///
+/// This lives in the runtime crate because the borrowed-fd construction needs `unsafe`, which the
+/// `ironcache` crate FORBIDS (`#![forbid(unsafe_code)]`); the io_uring serve loop calls it so the
+/// forbidden `unsafe` stays out of `ironcache`.
+pub fn set_keepalive_uring(stream: &TcpStream, secs: u64) {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    let raw = stream.as_raw_fd();
+    // SAFETY: `raw` is the valid, open TCP socket fd owned by `stream` for the duration of this
+    // borrow. We construct a std `TcpStream` over it ONLY to apply the keepalive option (via a
+    // borrowing `SockRef`), then immediately `into_raw_fd` to relinquish ownership WITHOUT closing
+    // the fd, so the io_uring stream remains the sole owner and closes it exactly once on its drop.
+    let s = unsafe { std::net::TcpStream::from_raw_fd(raw) };
+    {
+        let sock = socket2::SockRef::from(&s);
+        if secs == 0 {
+            let _ = sock.set_keepalive(false);
+        } else {
+            let _ = sock.set_keepalive(true);
+            let _ = sock.set_tcp_keepalive(
+                &socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(secs)),
+            );
+        }
+    }
+    let _ = s.into_raw_fd();
+}
+
 /// Read the `(peer, local)` socket addresses of a `tokio_uring` stream as display strings,
 /// WITHOUT taking ownership of its fd. `tokio_uring::net::TcpStream` exposes no `peer_addr` /
 /// `local_addr`, so borrow the fd through a temporary std stream (the same no-ownership-transfer

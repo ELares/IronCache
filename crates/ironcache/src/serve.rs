@@ -1217,6 +1217,15 @@ async fn serve_connection(
     // connection is upgraded RIGHT HERE, before any RESP byte is read: a rustls handshake runs
     // and yields a `ClientStream::Tls` the serve loop reads/writes transparently. A plaintext
     // client to a TLS port FAILS this handshake -> the connection is dropped (rejected, not hung).
+    // TCP KEEPALIVE (Area C, Redis `tcp-keepalive`): apply SO_KEEPALIVE with the LIVE keepalive
+    // idle interval at ACCEPT, on the raw accepted TcpStream BEFORE the TLS wrap (the option lives
+    // on the kernel socket, beneath any TLS layering). Read from the runtime overlay so a
+    // `CONFIG SET tcp-keepalive` applies to NEWLY-accepted connections (an established connection
+    // keeps the option it was accepted with, matching Redis). `0` disables keepalive. A single cold
+    // accept-path call; the helper ignores socket errors (a connection still functions without the
+    // probe), and lives in the runtime crate so the socket2 borrow (no `unsafe` here) stays out of
+    // this `#![forbid(unsafe_code)]` crate.
+    ironcache_runtime::set_keepalive(&tcp, ctx.runtime.tcp_keepalive_secs());
     // When TLS is OFF (the default) we wrap the same TcpStream in `ClientStream::Plain`, a thin
     // passthrough to the identical TcpStream read/write code -- the plaintext hot path is
     // byte-unchanged. The client stream's own recv/send carry the data bytes from here on.
@@ -1247,6 +1256,14 @@ async fn serve_connection(
     // byte-identical.
     let reserved_bits = scan_reserved_bits(ctx.shards);
     let store_rc = shard_store(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
+    // Seed this shard store's collection-encoding thresholds (#40) from the runtime overlay (which
+    // was itself seeded from the boot config). The store is built lazily with the COMPILED defaults;
+    // this idempotent per-connection field write installs the BOOT-configured thresholds so a node
+    // started with a non-default `*-max-listpack-*` (via TOML/env) honors it from the first command
+    // (a later `CONFIG SET` then refreshes via the generation-change check in `maybe_hot_swap_policy`).
+    store_rc
+        .borrow_mut()
+        .set_encoding_thresholds(ctx.runtime.encoding_thresholds());
     let wheel_rc = shard_wheel();
     // Ensure this shard's background active-expiry timer is up (PR-3c, idempotent). The
     // canonical spawn point is now SHARD BOOT (the coordinator drain loop calls
@@ -1336,7 +1353,15 @@ async fn serve_connection(
     // a `Notify` for a spin-free wake).
     let mut shed_flag = std::sync::Arc::new(crate::pubsub::ShedSignal::default());
 
-    let limits = Limits::default();
+    // The decoder hardening Limits (#138): the `proto-max-bulk-len` ceiling is RUNTIME-SETTABLE, so
+    // build the Limits from the live overlay at connection setup (a single cold relaxed load) rather
+    // than the compiled default. A `CONFIG SET proto-max-bulk-len` then applies to NEWLY-accepted
+    // connections; an established connection keeps the ceiling it was built with (re-reading per
+    // decode would add a hot-path load for a knob that effectively never changes mid-connection).
+    let limits = Limits {
+        max_bulk_len: i64::try_from(ctx.runtime.proto_max_bulk_len()).unwrap_or(i64::MAX),
+        ..Limits::default()
+    };
     let mut read_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
 
@@ -1700,6 +1725,10 @@ async fn serve_connection_uring(
     let state_rc = shard_state();
     let reserved_bits = scan_reserved_bits(ctx.shards);
     let store_rc = shard_store(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
+    // Seed the encoding thresholds (#40) from the runtime overlay, same as the tokio serve path.
+    store_rc
+        .borrow_mut()
+        .set_encoding_thresholds(ctx.runtime.encoding_thresholds());
     let wheel_rc = shard_wheel();
     ensure_shard_started(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
     ctx.info.started_at = shard_started_at();
@@ -1730,6 +1759,12 @@ async fn serve_connection_uring(
     // A failure leaves the field empty (cosmetic only).
     let (addr, laddr) = ironcache_runtime::peer_local_addrs(&stream);
 
+    // TCP KEEPALIVE (Area C), the io_uring analog of the tokio accept path: apply SO_KEEPALIVE with
+    // the live `tcp-keepalive` idle interval at accept (the borrowed-fd helper lives in the runtime
+    // crate so the `unsafe` fd dance stays out of this crate). `0` disables it; a `CONFIG SET`
+    // applies to newly-accepted connections.
+    ironcache_runtime::set_keepalive_uring(&stream, ctx.runtime.tcp_keepalive_secs());
+
     let client_id = {
         let mut s = state_rc.borrow_mut();
         let id = s.next_client_id;
@@ -1755,7 +1790,12 @@ async fn serve_connection_uring(
         tokio::sync::mpsc::channel::<crate::pubsub::ServerPush>(crate::pubsub::PUSH_CHANNEL_BOUND);
     let mut shed_flag = std::sync::Arc::new(crate::pubsub::ShedSignal::default());
 
-    let limits = Limits::default();
+    // Build the decoder Limits from the live `proto-max-bulk-len` overlay (Area B), same as the
+    // tokio serve path: a single cold load at connection setup; the value applies to new connections.
+    let limits = Limits {
+        max_bulk_len: i64::try_from(ctx.runtime.proto_max_bulk_len()).unwrap_or(i64::MAX),
+        ..Limits::default()
+    };
     let mut read_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
     // The Runtime timer seam for the CLIENT PAUSE stall (FIX3). Under `tokio_uring::start` the

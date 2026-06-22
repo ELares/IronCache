@@ -189,6 +189,112 @@ impl Encoding {
     }
 }
 
+/// The 8 collection-encoding listpack/intset thresholds the store reads AT the encoding-transition
+/// decision point (#40, `*-max-listpack-*` / `set-max-intset-entries`). A plain `Copy` snapshot of
+/// resolved scalars so the per-edit decision is a single field read (no atomic per edit): the store
+/// holds the latest snapshot and refreshes it (cold) only when the runtime config generation moves.
+///
+/// This lives in the storage waist (alongside the `*Value` traits + `Encoding` that consume it)
+/// rather than in `ironcache-config`, because `ironcache-config` ALREADY depends on this crate
+/// (a config-side type would be a dependency cycle). `ironcache-config` builds an
+/// [`EncodingThresholds`] from its `Config`/`RuntimeConfig` (the boot defaults + the runtime
+/// overlay) and the store reads it; the registry validates `CONFIG SET` against the same shape.
+///
+/// `list_max_listpack_size` is the SIGNED Redis form (`-2` etc.); [`Self::list_budget`] resolves it
+/// to the store's `(byte_budget, entry_cap)` transition pair. The remaining fields are positive
+/// counts / per-element byte caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodingThresholds {
+    /// HASH listpack->hashtable entry-count cap (`hash-max-listpack-entries`).
+    pub hash_max_listpack_entries: usize,
+    /// HASH listpack per-field/value byte cap (`hash-max-listpack-value`).
+    pub hash_max_listpack_value: usize,
+    /// LIST listpack->quicklist size, SIGNED Redis form (`list-max-listpack-size`).
+    pub list_max_listpack_size: i64,
+    /// SET intset entry-count cap (`set-max-intset-entries`).
+    pub set_max_intset_entries: usize,
+    /// SET listpack->hashtable entry-count cap (`set-max-listpack-entries`).
+    pub set_max_listpack_entries: usize,
+    /// SET listpack per-member byte cap (`set-max-listpack-value`).
+    pub set_max_listpack_value: usize,
+    /// ZSET listpack->skiplist entry-count cap (`zset-max-listpack-entries`).
+    pub zset_max_listpack_entries: usize,
+    /// ZSET listpack per-member byte cap (`zset-max-listpack-value`).
+    pub zset_max_listpack_value: usize,
+}
+
+/// The DEFAULT list listpack byte budget (`list-max-listpack-size -2` = "8 KB per node"). Kept here
+/// so [`EncodingThresholds::list_budget`] (the store's resolved transition pair) does not depend on
+/// `ironcache-config` (which would be a cycle). Matches `ironcache_config::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES`.
+const DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES: usize = 8 * 1024;
+
+impl EncodingThresholds {
+    /// The thresholds seeded from the compiled Redis defaults (the byte-identical default
+    /// deployment). The store's initial snapshot before the overlay is wired in, and the value every
+    /// existing test fixture sees, so a store built without an explicit overlay behaves exactly as it
+    /// did when the thresholds were compiled-in constants. The literals MUST match the
+    /// `ironcache_config::DEFAULT_*` constants (a config-side test cross-checks the agreement).
+    #[must_use]
+    pub const fn defaults() -> Self {
+        EncodingThresholds {
+            hash_max_listpack_entries: 512,
+            hash_max_listpack_value: 64,
+            list_max_listpack_size: -2,
+            set_max_intset_entries: 512,
+            set_max_listpack_entries: 128,
+            set_max_listpack_value: 64,
+            zset_max_listpack_entries: 128,
+            zset_max_listpack_value: 64,
+        }
+    }
+
+    /// The UNLIMITED thresholds: every cap is `usize::MAX` and the list size is the `-5` (64 KB)
+    /// largest byte tier, so NO encoding transition ever fires during a build. The
+    /// reconstruction/replication path builds with this and then FORCES the recorded encoding, so a
+    /// replicated/persisted object reproduces its SOURCE encoding regardless of the local runtime
+    /// thresholds (a replica/restore set to a smaller threshold must not over-convert a streamed
+    /// object). This is what keeps the faithful-reconstruction invariant (HA-7b) intact while the
+    /// live command path honors the live thresholds.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        EncodingThresholds {
+            hash_max_listpack_entries: usize::MAX,
+            hash_max_listpack_value: usize::MAX,
+            list_max_listpack_size: -5,
+            set_max_intset_entries: usize::MAX,
+            set_max_listpack_entries: usize::MAX,
+            set_max_listpack_value: usize::MAX,
+            zset_max_listpack_entries: usize::MAX,
+            zset_max_listpack_value: usize::MAX,
+        }
+    }
+
+    /// Resolve the LIST `(byte_budget, entry_cap)` transition pair from the signed
+    /// `list_max_listpack_size`: a list stays `listpack` while BOTH `total_bytes <= byte_budget` AND
+    /// `entries <= entry_cap`. A NEGATIVE value selects a fixed per-node byte budget (Redis size
+    /// tiers `-1`=4 KB .. `-5`=64 KB) with NO entry cap (`usize::MAX`); a POSITIVE value is a max
+    /// element COUNT per node paired with the default 8 KB byte budget (so a list of large elements
+    /// still converts on bytes). `0` / out-of-range negatives clamp to the `-2` default (8 KB).
+    #[must_use]
+    pub fn list_budget(&self) -> (usize, usize) {
+        match self.list_max_listpack_size {
+            -1 => (4 * 1024, usize::MAX),
+            -2 => (8 * 1024, usize::MAX),
+            -3 => (16 * 1024, usize::MAX),
+            -4 => (32 * 1024, usize::MAX),
+            -5 => (64 * 1024, usize::MAX),
+            n if n > 0 => (DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES, n as usize),
+            _ => (DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES, usize::MAX),
+        }
+    }
+}
+
+impl Default for EncodingThresholds {
+    fn default() -> Self {
+        EncodingThresholds::defaults()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The read borrow (STORAGE_API.md "Read can hand out a borrow ... zero-copy to
 // the serializer"). Valid for the duration of one command on the owning core.
@@ -497,11 +603,14 @@ impl core::fmt::Debug for RmwEntry<'_> {
 /// indices read as absent (the command layer maps that to nil / the index-out-of
 /// -range error as the command dictates).
 pub trait ListValue {
-    /// Prepend one element (LPUSH). After this the new element is at index 0.
-    fn push_front(&mut self, elem: &[u8]);
+    /// Prepend one element (LPUSH). After this the new element is at index 0. `thresholds` carries
+    /// the LIVE `list-max-listpack-size` so the listpack->quicklist transition (re)evaluates against
+    /// the current budget (#40); a change affects this and future pushes, never resident encoding.
+    fn push_front(&mut self, elem: &[u8], thresholds: &EncodingThresholds);
 
-    /// Append one element (RPUSH). After this the new element is the last.
-    fn push_back(&mut self, elem: &[u8]);
+    /// Append one element (RPUSH). After this the new element is the last. See [`Self::push_front`]
+    /// for the `thresholds` contract.
+    fn push_back(&mut self, elem: &[u8], thresholds: &EncodingThresholds);
 
     /// Remove and return the head element (LPOP), or `None` if the list is empty.
     fn pop_front(&mut self) -> Option<Vec<u8>>;
@@ -525,17 +634,29 @@ pub trait ListValue {
 
     /// Overwrite the element at signed Redis `index` with `elem` (LSET). Returns
     /// `true` on success, `false` if the index is out of range (the command layer
-    /// maps `false` to the index-out-of-range error).
-    fn set(&mut self, index: i64, elem: &[u8]) -> bool;
+    /// maps `false` to the index-out-of-range error). `thresholds`: see [`Self::push_front`]
+    /// (an overwrite that grows the element bytes can cross the listpack budget).
+    fn set(&mut self, index: i64, elem: &[u8], thresholds: &EncodingThresholds) -> bool;
 
     /// Insert `elem` immediately BEFORE the first element equal to `pivot` (LINSERT
     /// BEFORE). Returns the new length, or `None` if `pivot` is not present (the
-    /// command layer maps `None` to the `-1` reply).
-    fn insert_before(&mut self, pivot: &[u8], elem: &[u8]) -> Option<usize>;
+    /// command layer maps `None` to the `-1` reply). `thresholds`: see [`Self::push_front`].
+    fn insert_before(
+        &mut self,
+        pivot: &[u8],
+        elem: &[u8],
+        thresholds: &EncodingThresholds,
+    ) -> Option<usize>;
 
     /// Insert `elem` immediately AFTER the first element equal to `pivot` (LINSERT
-    /// AFTER). Returns the new length, or `None` if `pivot` is not present.
-    fn insert_after(&mut self, pivot: &[u8], elem: &[u8]) -> Option<usize>;
+    /// AFTER). Returns the new length, or `None` if `pivot` is not present. `thresholds`:
+    /// see [`Self::push_front`].
+    fn insert_after(
+        &mut self,
+        pivot: &[u8],
+        elem: &[u8],
+        thresholds: &EncodingThresholds,
+    ) -> Option<usize>;
 
     /// Remove up to `count` elements equal to `elem` (LREM). `count > 0` removes
     /// from head to tail, `count < 0` from tail to head, `count == 0` removes all
@@ -583,13 +704,16 @@ pub trait ListValue {
 /// observable, matching Redis.
 pub trait HashValue {
     /// Set `field` to `value` (HSET). Returns `true` if the field was NEW (the hash
-    /// grew), `false` if an existing field's value was overwritten in place.
-    fn set(&mut self, field: &[u8], value: &[u8]) -> bool;
+    /// grew), `false` if an existing field's value was overwritten in place. `thresholds`
+    /// carries the LIVE `hash-max-listpack-entries`/`-value` so the listpack->hashtable
+    /// transition (re)evaluates against the current caps (#40); a change affects this and
+    /// future sets only, never resident encoding.
+    fn set(&mut self, field: &[u8], value: &[u8], thresholds: &EncodingThresholds) -> bool;
 
     /// Set `field` to `value` ONLY if the field does not already exist (HSETNX).
     /// Returns `true` if the field was set (was absent), `false` if it already existed
-    /// (no change).
-    fn set_nx(&mut self, field: &[u8], value: &[u8]) -> bool;
+    /// (no change). `thresholds`: see [`Self::set`].
+    fn set_nx(&mut self, field: &[u8], value: &[u8], thresholds: &EncodingThresholds) -> bool;
 
     /// The value of `field` (HGET / HMGET), or `None` if the field is absent.
     fn get(&self, field: &[u8]) -> Option<&[u8]>;
@@ -669,8 +793,11 @@ pub trait HashValue {
 /// observable, matching Redis.
 pub trait SetValue {
     /// Add `member` (SADD). Returns `true` if the member was NEW (the set grew),
-    /// `false` if it was already present (no change).
-    fn add(&mut self, member: &[u8]) -> bool;
+    /// `false` if it was already present (no change). `thresholds` carries the LIVE
+    /// `set-max-intset-entries`/`set-max-listpack-entries`/`-value` so the
+    /// intset->listpack->hashtable ladder (re)evaluates against the current caps (#40); a
+    /// change affects this and future adds only, never resident encoding.
+    fn add(&mut self, member: &[u8], thresholds: &EncodingThresholds) -> bool;
 
     /// Remove `member` (SREM). Returns `true` if it existed and was removed.
     fn remove(&mut self, member: &[u8]) -> bool;
@@ -894,7 +1021,16 @@ pub trait ZSetValue {
     /// flag matrix atomically: NX suppresses an update of an existing member; XX
     /// suppresses adding a new member; GT/LT suppress an update unless the new score is
     /// strictly greater/less than the current. The member ordering is maintained.
-    fn add(&mut self, member: &[u8], score: f64, flags: ZAddFlags) -> ZAddOutcome;
+    /// `thresholds` carries the LIVE `zset-max-listpack-entries`/`-value` so the
+    /// listpack->skiplist transition (re)evaluates against the current caps (#40); a change
+    /// affects this and future adds only, never resident encoding.
+    fn add(
+        &mut self,
+        member: &[u8],
+        score: f64,
+        flags: ZAddFlags,
+        thresholds: &EncodingThresholds,
+    ) -> ZAddOutcome;
 
     /// ZINCRBY / ZADD INCR: add `delta` to `member`'s score (creating it at `delta` if
     /// absent, UNLESS suppressed by `flags`), returning an [`IncrOutcome`]:
@@ -903,8 +1039,14 @@ pub trait ZSetValue {
     /// the resulting score is NaN (`+inf + -inf`). The store NEVER stores a NaN: on the Nan
     /// outcome the member is left UNCHANGED so the command layer can return the
     /// resulting-score-is-NaN error over an unmutated value. The member ordering is
-    /// maintained.
-    fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> IncrOutcome;
+    /// maintained. `thresholds`: see [`Self::add`] (a create can cross the listpack caps).
+    fn incr(
+        &mut self,
+        member: &[u8],
+        delta: f64,
+        flags: ZAddFlags,
+        thresholds: &EncodingThresholds,
+    ) -> IncrOutcome;
 
     /// The score of `member` (ZSCORE / ZMSCORE), or `None` if absent.
     fn score(&self, member: &[u8]) -> Option<f64>;
@@ -1023,6 +1165,14 @@ pub struct OccupiedEntryMut<'a> {
     /// The typed mutable view of the stored value. PR-5 carries only the list arm;
     /// the other collection arms are added in their PRs.
     value: ValueMut<'a>,
+    /// The LIVE collection-encoding thresholds (#40), set by the store from its cached snapshot when
+    /// it builds this view. A mutating collection handler reads them via [`Self::thresholds`] and
+    /// passes them into the conversion-deciding `*Value` methods (`set`/`add`/`push_*`/...), so the
+    /// listpack/intset->larger transition honors a live `CONFIG SET *-max-listpack-*`. A `Copy`
+    /// snapshot (not a per-edit atomic load); the store refreshes its snapshot only when the runtime
+    /// generation moves. Defaults to [`EncodingThresholds::defaults`] so a view built without an
+    /// explicit threshold (older constructor path / tests) behaves as the compiled defaults did.
+    thresholds: EncodingThresholds,
 }
 
 /// The typed mutable value view behind an [`OccupiedEntryMut`]. PR-5 has the list
@@ -1063,6 +1213,7 @@ impl<'a> OccupiedEntryMut<'a> {
             encoding,
             expire_at,
             value: ValueMut::List(list),
+            thresholds: EncodingThresholds::defaults(),
         }
     }
 
@@ -1079,6 +1230,7 @@ impl<'a> OccupiedEntryMut<'a> {
             encoding,
             expire_at,
             value: ValueMut::Hash(hash),
+            thresholds: EncodingThresholds::defaults(),
         }
     }
 
@@ -1095,6 +1247,7 @@ impl<'a> OccupiedEntryMut<'a> {
             encoding,
             expire_at,
             value: ValueMut::Set(set),
+            thresholds: EncodingThresholds::defaults(),
         }
     }
 
@@ -1112,6 +1265,7 @@ impl<'a> OccupiedEntryMut<'a> {
             encoding,
             expire_at,
             value: ValueMut::ZSet(zset),
+            thresholds: EncodingThresholds::defaults(),
         }
     }
 
@@ -1129,7 +1283,19 @@ impl<'a> OccupiedEntryMut<'a> {
             encoding,
             expire_at,
             value: ValueMut::NonCollection,
+            thresholds: EncodingThresholds::defaults(),
         }
+    }
+
+    /// Attach the LIVE collection-encoding thresholds (#40) to this view (a CONSUMING builder the
+    /// store chains after a `list`/`hash`/`set`/`zset` constructor). The default constructors seed
+    /// the compiled defaults so a caller that does not set them (older path / tests) is unchanged;
+    /// the store calls this with its cached runtime snapshot so a `CONFIG SET *-max-listpack-*`
+    /// reaches the conversion decision.
+    #[must_use]
+    pub fn with_thresholds(mut self, thresholds: EncodingThresholds) -> Self {
+        self.thresholds = thresholds;
+        self
     }
 
     /// The logical data type (for WRONGTYPE checks inside the closure).
@@ -1143,6 +1309,16 @@ impl<'a> OccupiedEntryMut<'a> {
     #[must_use]
     pub fn encoding(&self) -> Encoding {
         self.encoding
+    }
+
+    /// The LIVE collection-encoding thresholds (#40) for this view. A mutating collection handler
+    /// reads this (a `Copy` of the snapshot) BEFORE taking the typed `as_*_mut` borrow, then passes
+    /// it into the conversion-deciding `*Value` method, so the listpack/intset->larger transition
+    /// honors a live `CONFIG SET`. A change affects FUTURE inserts only (existing keys keep their
+    /// encoding -- this is read at the next insert, never to re-encode resident data).
+    #[must_use]
+    pub fn thresholds(&self) -> EncodingThresholds {
+        self.thresholds
     }
 
     /// The TTL deadline, if any.
@@ -1676,6 +1852,13 @@ pub trait PolicySwap {
     /// so `select_victim` has candidates immediately and eviction does not falsely OOM.
     /// `now` is the lazy-expiry boundary used to skip entries past their deadline.
     fn set_policy_by_name(&mut self, name: &str, rng_seed: u64, now: UnixMillis) -> bool;
+
+    /// Refresh this shard's cached collection-encoding thresholds (#40) from the runtime overlay.
+    /// Called on the SAME per-command generation-change check as the policy hot-swap (a
+    /// `CONFIG SET *-max-listpack-*` / `set-max-intset-entries` / `list-max-listpack-size` bumps the
+    /// generation), so a threshold change reaches every shard's encoding-transition decision for
+    /// FUTURE inserts. A plain field write off the hot path; existing keys are NOT re-encoded.
+    fn apply_encoding_thresholds(&mut self, thresholds: EncodingThresholds);
 }
 
 // ---------------------------------------------------------------------------

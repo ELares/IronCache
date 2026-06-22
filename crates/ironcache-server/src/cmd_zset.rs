@@ -261,6 +261,7 @@ pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
                 }
             }
             RmwEntry::OccupiedMut(mut o) => {
+                let th = o.thresholds();
                 let Some(zset) = o.as_zset_mut() else {
                     return wrong_type();
                 };
@@ -269,7 +270,7 @@ pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
                     // A NaN RESULT (existing +inf incremented by -inf) returns the
                     // resulting-score-is-NaN error WITHOUT mutating (RmwAction::Keep, so the
                     // store records no delta and the member keeps its prior score).
-                    return match zset.incr(member, *delta, flags) {
+                    return match zset.incr(member, *delta, flags, &th) {
                         IncrOutcome::Updated(new) => RmwStep {
                             action: RmwAction::Mutated,
                             expire: ExpireWrite::Unchanged,
@@ -286,7 +287,7 @@ pub fn cmd_zadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
                 let mut added: i64 = 0;
                 let mut changed: i64 = 0;
                 for (score, member) in &pairs {
-                    let out = zset.add(member, *score, flags);
+                    let out = zset.add(member, *score, flags, &th);
                     if out.added {
                         added += 1;
                     }
@@ -387,13 +388,14 @@ pub fn cmd_zincrby<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
             reply: score_double(delta),
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(zset) = o.as_zset_mut() else {
                 return wrong_type();
             };
             // ZINCRBY has no NX/XX/GT/LT, so it never suppresses; a NaN RESULT (an existing
             // +inf incremented by -inf) returns the resulting-score-is-NaN error WITHOUT
             // mutating (Keep, no accounting delta, member keeps its prior score).
-            match zset.incr(&member, delta, ZAddFlags::default()) {
+            match zset.incr(&member, delta, ZAddFlags::default(), &th) {
                 IncrOutcome::Updated(new) => RmwStep {
                     action: RmwAction::Mutated,
                     expire: ExpireWrite::Unchanged,

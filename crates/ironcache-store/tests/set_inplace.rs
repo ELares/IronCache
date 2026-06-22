@@ -58,8 +58,9 @@ fn sadd(store: &mut ShardStore, key: &[u8], member: &[u8]) -> bool {
             reply: true,
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let set = o.as_set_mut().expect("set");
-            let was_new = set.add(&m);
+            let was_new = set.add(&m, &th);
             RmwStep {
                 action: RmwAction::Mutated,
                 expire: ExpireWrite::Unchanged,

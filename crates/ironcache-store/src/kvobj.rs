@@ -29,6 +29,10 @@ use crate::scan_hash;
 use bytes::Bytes;
 use hashbrown::HashMap;
 use hashbrown::HashSet;
+// The compiled Redis default thresholds are now sourced through `EncodingThresholds` (the live
+// snapshot the store reads); the bare config constants are referenced ONLY by the unit tests below
+// (to pin the default boundaries), so the import is test-gated to keep the non-test build clean.
+#[cfg(test)]
 use ironcache_config::{
     DEFAULT_HASH_MAX_LISTPACK_ENTRIES, DEFAULT_HASH_MAX_LISTPACK_VALUE,
     DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES, DEFAULT_SET_MAX_INTSET_ENTRIES,
@@ -36,8 +40,8 @@ use ironcache_config::{
     DEFAULT_ZSET_MAX_LISTPACK_ENTRIES, DEFAULT_ZSET_MAX_LISTPACK_VALUE,
 };
 use ironcache_storage::{
-    DataType, Encoding, HashValue, IncrOutcome, LexBound, ListValue, NewValueOwned, ScoreBound,
-    SetValue, UnixMillis, ZAddFlags, ZAddOutcome, ZSetValue,
+    DataType, Encoding, EncodingThresholds, HashValue, IncrOutcome, LexBound, ListValue,
+    NewValueOwned, ScoreBound, SetValue, UnixMillis, ZAddFlags, ZAddOutcome, ZSetValue,
 };
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::collections::{BTreeSet, VecDeque};
@@ -223,6 +227,15 @@ pub struct ListVal {
     /// The running sum of element byte lengths (kept in lockstep with `elems` so the
     /// accounting weight and the encoding transition are O(1)).
     total_bytes: usize,
+    /// The one-way `quicklist` ENCODING RATCHET (#40, runtime `list-max-listpack-size`): latched
+    /// `true` once an edit crosses the LIVE `list-max-listpack-size` budget (byte tier and/or the
+    /// positive element-count cap), and NEVER reset (Redis's quicklist does not demote, and this
+    /// matches the one-way ratchet of the hash/set/zset types). Before this change the encoding was
+    /// recomputed byte-purely against the COMPILED 8 KB default on every read; the ratchet is what
+    /// makes a runtime `CONFIG SET list-max-listpack-size` affect FUTURE inserts only -- an existing
+    /// list keeps the encoding it had (its flag does not move until the next edit re-evaluates the
+    /// live budget). `force_quicklist` sets it for faithful reconstruction.
+    quicklisted: bool,
 }
 
 impl ListVal {
@@ -232,6 +245,7 @@ impl ListVal {
         ListVal {
             elems: VecDeque::new(),
             total_bytes: 0,
+            quicklisted: false,
         }
     }
 
@@ -243,20 +257,42 @@ impl ListVal {
         self.total_bytes
     }
 
-    /// The encoding this list reports, a PURE FUNCTION of the active repr (#40):
-    /// `listpack` while the total element bytes stay at or below the byte budget,
-    /// `quicklist` once over it. There is NO element-count cap for lists: Redis's
-    /// default `list-max-listpack-size -2` is a negative fill, which sizes the listpack
-    /// node by BYTES (8 KB) with the element count left unlimited (quicklist.c
-    /// `quicklistNodeLimit` sets `count = UINT_MAX` for a negative fill). The 128-entry
-    /// cap is the HASH/ZSET default, NOT the list default. See the type docs.
+    /// The encoding this list reports (#40): `quicklist` once the one-way [`Self::quicklisted`]
+    /// ratchet has latched, else `listpack`. The ratchet latches in a mutation when the edit crosses
+    /// the LIVE `list-max-listpack-size` budget, so the reported encoding is stable for an existing
+    /// list across a `CONFIG SET` (it only moves on the NEXT edit), matching Redis (existing keys
+    /// keep their encoding) and the hash/set/zset one-way ratchet.
     #[must_use]
     pub fn encoding(&self) -> Encoding {
-        if self.total_bytes > DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES {
+        if self.quicklisted {
             Encoding::QuickList
         } else {
             Encoding::ListPack
         }
+    }
+
+    /// Re-evaluate the one-way `quicklist` ratchet against the LIVE `list-max-listpack-size` after a
+    /// mutation: latch [`Self::quicklisted`] if the current `(total_bytes, len)` exceeds EITHER the
+    /// resolved byte budget OR (for the positive element-count form) the entry cap. Once latched it
+    /// never resets. At the default `-2` (8 KB byte budget, no count cap) this is the same single
+    /// byte compare it was before, now reading the live resolved budget.
+    fn maybe_ratchet_quicklist(&mut self, thresholds: &EncodingThresholds) {
+        if self.quicklisted {
+            return;
+        }
+        let (byte_budget, entry_cap) = thresholds.list_budget();
+        if self.total_bytes > byte_budget || self.elems.len() > entry_cap {
+            self.quicklisted = true;
+        }
+    }
+
+    /// Force the one-way `quicklist` form regardless of the current size (the faithful-reconstruction
+    /// seam, HA-7b): a wire/persist codec that rebuilds a list under the UNLIMITED thresholds (so no
+    /// transition fires during the rebuild) calls this when the recorded encoding was `quicklist`, so
+    /// the rebuilt object reproduces the source's encoding. `OBJECT ENCODING` is a pure function of
+    /// this flag. No effect on contents.
+    pub fn force_quicklist(&mut self) {
+        self.quicklisted = true;
     }
 
     /// Normalize a signed Redis index against the current length into a `usize`
@@ -298,14 +334,16 @@ impl ListVal {
 }
 
 impl ListValue for ListVal {
-    fn push_front(&mut self, elem: &[u8]) {
+    fn push_front(&mut self, elem: &[u8], thresholds: &EncodingThresholds) {
         self.total_bytes += elem.len();
         self.elems.push_front(elem.to_vec().into_boxed_slice());
+        self.maybe_ratchet_quicklist(thresholds);
     }
 
-    fn push_back(&mut self, elem: &[u8]) {
+    fn push_back(&mut self, elem: &[u8], thresholds: &EncodingThresholds) {
         self.total_bytes += elem.len();
         self.elems.push_back(elem.to_vec().into_boxed_slice());
+        self.maybe_ratchet_quicklist(thresholds);
     }
 
     fn pop_front(&mut self) -> Option<Vec<u8>> {
@@ -329,7 +367,7 @@ impl ListValue for ListVal {
         self.elems.get(i).map(|e| e.to_vec())
     }
 
-    fn set(&mut self, index: i64, elem: &[u8]) -> bool {
+    fn set(&mut self, index: i64, elem: &[u8], thresholds: &EncodingThresholds) -> bool {
         let Some(i) = self.resolve_index(index) else {
             return false;
         };
@@ -338,22 +376,36 @@ impl ListValue for ListVal {
         self.total_bytes -= slot.len();
         self.total_bytes += elem.len();
         *slot = elem.to_vec().into_boxed_slice();
+        // An overwrite that grew the bytes can cross the budget.
+        self.maybe_ratchet_quicklist(thresholds);
         true
     }
 
-    fn insert_before(&mut self, pivot: &[u8], elem: &[u8]) -> Option<usize> {
+    fn insert_before(
+        &mut self,
+        pivot: &[u8],
+        elem: &[u8],
+        thresholds: &EncodingThresholds,
+    ) -> Option<usize> {
         let at = self.elems.iter().position(|e| e.as_ref() == pivot)?;
         // VecDeque::insert shifts the shorter side once (one tail memmove, no
         // predecessor rewrite), satisfying the cascade-free contract.
         self.elems.insert(at, elem.to_vec().into_boxed_slice());
         self.total_bytes += elem.len();
+        self.maybe_ratchet_quicklist(thresholds);
         Some(self.elems.len())
     }
 
-    fn insert_after(&mut self, pivot: &[u8], elem: &[u8]) -> Option<usize> {
+    fn insert_after(
+        &mut self,
+        pivot: &[u8],
+        elem: &[u8],
+        thresholds: &EncodingThresholds,
+    ) -> Option<usize> {
         let at = self.elems.iter().position(|e| e.as_ref() == pivot)?;
         self.elems.insert(at + 1, elem.to_vec().into_boxed_slice());
         self.total_bytes += elem.len();
+        self.maybe_ratchet_quicklist(thresholds);
         Some(self.elems.len())
     }
 
@@ -563,14 +615,21 @@ impl HashVal {
 
     /// Whether the small listpack form should convert to the hashtable form after an
     /// edit that left `entries` entries with a new `field`/`value` (the #40 transition):
-    /// convert once `entries > hash-max-listpack-entries` (the HASH cap, 512, NOT the 128
-    /// ZSET/SET cap) OR either the new field or value byte length exceeds
-    /// `hash-max-listpack-value` (64). Reads the HASH entry constant
-    /// ([`DEFAULT_HASH_MAX_LISTPACK_ENTRIES`]).
-    fn should_convert(entries: usize, field_len: usize, value_len: usize) -> bool {
-        entries > DEFAULT_HASH_MAX_LISTPACK_ENTRIES
-            || field_len > DEFAULT_HASH_MAX_LISTPACK_VALUE
-            || value_len > DEFAULT_HASH_MAX_LISTPACK_VALUE
+    /// convert once `entries > hash-max-listpack-entries` (the HASH cap, default 512, NOT the
+    /// 128 ZSET/SET cap) OR either the new field or value byte length exceeds
+    /// `hash-max-listpack-value` (default 64). Reads the LIVE caps from `t` so a
+    /// `CONFIG SET hash-max-listpack-*` changes WHEN a future insert converts (existing keys
+    /// keep their encoding). At the default this is the same two compares it was before, just
+    /// reading `t` fields (seeded to the compiled defaults) instead of constants.
+    fn should_convert(
+        entries: usize,
+        field_len: usize,
+        value_len: usize,
+        t: &EncodingThresholds,
+    ) -> bool {
+        entries > t.hash_max_listpack_entries
+            || field_len > t.hash_max_listpack_value
+            || value_len > t.hash_max_listpack_value
     }
 
     /// Promote the small listpack form to the large hashtable form (one-way). A no-op if
@@ -604,7 +663,7 @@ impl HashVal {
 }
 
 impl HashValue for HashVal {
-    fn set(&mut self, field: &[u8], value: &[u8]) -> bool {
+    fn set(&mut self, field: &[u8], value: &[u8], thresholds: &EncodingThresholds) -> bool {
         // Overwrite-in-place if present (no growth); else insert (growth). After an
         // insert into the small form, re-check the listpack -> hashtable transition.
         match self {
@@ -612,7 +671,7 @@ impl HashValue for HashVal {
                 if let Some(i) = HashVal::listpack_pos(v, field) {
                     v[i].1 = value.to_vec().into_boxed_slice();
                     // An overwrite can still cross the per-element value-byte cap.
-                    if HashVal::should_convert(v.len(), field.len(), value.len()) {
+                    if HashVal::should_convert(v.len(), field.len(), value.len(), thresholds) {
                         self.convert_to_hashtable();
                     }
                     false
@@ -621,7 +680,7 @@ impl HashValue for HashVal {
                         field.to_vec().into_boxed_slice(),
                         value.to_vec().into_boxed_slice(),
                     ));
-                    if HashVal::should_convert(v.len(), field.len(), value.len()) {
+                    if HashVal::should_convert(v.len(), field.len(), value.len(), thresholds) {
                         self.convert_to_hashtable();
                     }
                     true
@@ -636,14 +695,14 @@ impl HashValue for HashVal {
         }
     }
 
-    fn set_nx(&mut self, field: &[u8], value: &[u8]) -> bool {
+    fn set_nx(&mut self, field: &[u8], value: &[u8], thresholds: &EncodingThresholds) -> bool {
         // DEFERRED #8 follow-up (efficiency papercut, correctness-neutral): this does a
         // double linear scan on the listpack form (contains then set both scan); a single
         // entry-API pass would avoid the second scan.
         if self.contains(field) {
             return false;
         }
-        self.set(field, value);
+        self.set(field, value, thresholds);
         true
     }
 
@@ -853,12 +912,12 @@ impl SetVal {
     }
 
     /// Build a set from members in insertion order (the create-on-missing path), applying
-    /// the encoding ladder. Deduplicates. All-integer + small -> intset; else the
-    /// listpack/hashtable choice per the thresholds.
-    fn from_members(members: &[Vec<u8>]) -> Self {
+    /// the encoding ladder against the LIVE `t` caps. Deduplicates. All-integer + small ->
+    /// intset; else the listpack/hashtable choice per the thresholds.
+    fn from_members(members: &[Vec<u8>], t: &EncodingThresholds) -> Self {
         let mut set = SetVal::new();
         for m in members {
-            set.add(m);
+            set.add(m, t);
         }
         set
     }
@@ -899,17 +958,17 @@ impl SetVal {
 
     /// Whether a listpack/intset-derived set of `entries` members where the LARGEST
     /// member byte length is `max_member_len` must convert to `hashtable` (the #40
-    /// listpack thresholds): convert once `entries > set-max-listpack-entries` (128) OR
-    /// any member byte length exceeds `set-max-listpack-value` (64).
-    fn listpack_overflows(entries: usize, max_member_len: usize) -> bool {
-        entries > DEFAULT_SET_MAX_LISTPACK_ENTRIES
-            || max_member_len > DEFAULT_SET_MAX_LISTPACK_VALUE
+    /// listpack thresholds): convert once `entries > set-max-listpack-entries` (default 128)
+    /// OR any member byte length exceeds `set-max-listpack-value` (default 64). Reads the LIVE
+    /// caps from `t` so a `CONFIG SET set-max-listpack-*` changes WHEN a future add converts.
+    fn listpack_overflows(entries: usize, max_member_len: usize, t: &EncodingThresholds) -> bool {
+        entries > t.set_max_listpack_entries || max_member_len > t.set_max_listpack_value
     }
 
     /// Add a member to the intset form, applying the intset thresholds. Returns whether
     /// the member was new. The caller guarantees `self` is the intset form and `n` is the
-    /// canonical integer for `member`.
-    fn add_int(&mut self, n: i64, member: &[u8]) -> bool {
+    /// canonical integer for `member`. Reads the LIVE caps from `t`.
+    fn add_int(&mut self, n: i64, member: &[u8], t: &EncodingThresholds) -> bool {
         let SetVal::IntSet(v) = self else {
             unreachable!("add_int called on a non-intset form");
         };
@@ -917,17 +976,14 @@ impl SetVal {
             Ok(_) => false, // already present
             Err(pos) => {
                 v.insert(pos, n);
-                // Growth past set-max-intset-entries converts away from intset. Because
-                // 512 > 128 (the listpack entry cap), an integer set that exceeds 512
-                // members cannot fit a listpack and goes straight to hashtable. We re-use
+                // Growth past set-max-intset-entries converts away from intset. We re-use
                 // the listpack-overflow check after a tentative listpack conversion: if
-                // it would overflow the listpack, go hashtable instead.
-                if v.len() > DEFAULT_SET_MAX_INTSET_ENTRIES {
+                // it would overflow the listpack, go hashtable instead. With the DEFAULT caps
+                // (intset 512 > listpack 128) an integer set past 512 always goes straight to
+                // hashtable; with a runtime-raised listpack cap it may fit a listpack instead.
+                if v.len() > t.set_max_intset_entries {
                     let entries = v.len();
-                    // The largest integer member's decimal length (<= 20 < 64), so the
-                    // per-member byte cap never fires for integers; only the entry count
-                    // matters. 513 > 128 always, so this always promotes to hashtable.
-                    if SetVal::listpack_overflows(entries, member.len()) {
+                    if SetVal::listpack_overflows(entries, member.len(), t) {
                         self.convert_to_hashtable();
                     } else {
                         self.convert_intset_to_listpack();
@@ -961,17 +1017,17 @@ impl SetVal {
 }
 
 impl SetValue for SetVal {
-    fn add(&mut self, member: &[u8]) -> bool {
+    fn add(&mut self, member: &[u8], thresholds: &EncodingThresholds) -> bool {
         match self {
             SetVal::IntSet(_) => {
                 if let Some(n) = SetVal::parse_canonical_int(member) {
-                    self.add_int(n, member)
+                    self.add_int(n, member, thresholds)
                 } else {
                     // A non-integer member leaves intset: convert to listpack (or
                     // hashtable if the resulting set would overflow the listpack), then
                     // add the member.
                     self.convert_intset_to_listpack();
-                    self.add(member)
+                    self.add(member, thresholds)
                 }
             }
             SetVal::ListPack(v) => {
@@ -980,7 +1036,7 @@ impl SetValue for SetVal {
                 }
                 v.push(member.to_vec().into_boxed_slice());
                 // Re-check the listpack thresholds after the insert.
-                if SetVal::listpack_overflows(v.len(), member.len()) {
+                if SetVal::listpack_overflows(v.len(), member.len(), thresholds) {
                     self.convert_to_hashtable();
                 }
                 true
@@ -1219,10 +1275,10 @@ impl ZSetVal {
 
     /// Whether a listpack zset of `entries` members where a new/updated member byte length
     /// is `member_len` must convert to `skiplist` (the #40 listpack thresholds): convert
-    /// once `entries > zset-max-listpack-entries` (128) OR any member byte length exceeds
-    /// `zset-max-listpack-value` (64).
-    fn listpack_overflows(entries: usize, member_len: usize) -> bool {
-        entries > DEFAULT_ZSET_MAX_LISTPACK_ENTRIES || member_len > DEFAULT_ZSET_MAX_LISTPACK_VALUE
+    /// once `entries > zset-max-listpack-entries` (default 128) OR any member byte length
+    /// exceeds `zset-max-listpack-value` (default 64). Reads the LIVE caps from `t`.
+    fn listpack_overflows(entries: usize, member_len: usize, t: &EncodingThresholds) -> bool {
+        entries > t.zset_max_listpack_entries || member_len > t.zset_max_listpack_value
     }
 
     /// Promote the small listpack form to the large skiplist form (one-way). A no-op if
@@ -1267,8 +1323,8 @@ impl ZSetVal {
     /// Set `member` to `score` UNCONDITIONALLY (used by `add`/`incr` after the flag
     /// decision is made). Adds if absent, rewrites the score if present (re-sorting in the
     /// listpack form, remove-then-reinsert in the skiplist index), and re-checks the
-    /// listpack->skiplist transition. Returns whether the member was NEW.
-    fn put(&mut self, member: &[u8], score: f64) -> bool {
+    /// listpack->skiplist transition against the LIVE `t` caps. Returns whether the member was NEW.
+    fn put(&mut self, member: &[u8], score: f64, t: &EncodingThresholds) -> bool {
         match &mut self.0 {
             ZSetRepr::ListPack(v) => {
                 let was_new = if let Some(i) = ZSetVal::listpack_pos(v, member) {
@@ -1280,7 +1336,7 @@ impl ZSetVal {
                     ZSetVal::listpack_insert_sorted(v, member, score);
                     true
                 };
-                if ZSetVal::listpack_overflows(v.len(), member.len()) {
+                if ZSetVal::listpack_overflows(v.len(), member.len(), t) {
                     self.convert_to_skiplist();
                 }
                 was_new
@@ -1316,10 +1372,10 @@ impl ZSetVal {
     /// Construct a zset from `(member, score)` pairs in arbitrary order (the
     /// create-on-missing / *STORE path), deduplicating by member (the LAST score wins, as
     /// the caller already resolved aggregation) and applying the encoding ladder.
-    fn from_pairs(pairs: &[(Vec<u8>, f64)]) -> Self {
+    fn from_pairs(pairs: &[(Vec<u8>, f64)], t: &EncodingThresholds) -> Self {
         let mut z = ZSetVal::new();
         for (m, s) in pairs {
-            z.put(m, *s);
+            z.put(m, *s, t);
         }
         z
     }
@@ -1385,7 +1441,13 @@ fn gate_passes(cur: f64, new: f64, flags: ZAddFlags) -> bool {
 
 impl ZSetValue for ZSetVal {
     #[allow(clippy::float_cmp)] // `score != cur` is the exact Redis CH "changed" check.
-    fn add(&mut self, member: &[u8], score: f64, flags: ZAddFlags) -> ZAddOutcome {
+    fn add(
+        &mut self,
+        member: &[u8],
+        score: f64,
+        flags: ZAddFlags,
+        thresholds: &EncodingThresholds,
+    ) -> ZAddOutcome {
         let Some(cur) = self.score(member) else {
             // The member is absent: XX suppresses adding it; GT/LT alone DO add new members
             // (per Redis they only gate UPDATES), so they fall through to the add.
@@ -1396,7 +1458,7 @@ impl ZSetValue for ZSetVal {
                     new_score: None,
                 };
             }
-            self.put(member, score);
+            self.put(member, score, thresholds);
             return ZAddOutcome {
                 added: true,
                 changed: true,
@@ -1415,7 +1477,7 @@ impl ZSetValue for ZSetVal {
         // counts a member as changed only if the score actually differs).
         let changed = score != cur;
         if changed {
-            self.put(member, score);
+            self.put(member, score, thresholds);
         }
         ZAddOutcome {
             added: false,
@@ -1424,7 +1486,13 @@ impl ZSetValue for ZSetVal {
         }
     }
 
-    fn incr(&mut self, member: &[u8], delta: f64, flags: ZAddFlags) -> IncrOutcome {
+    fn incr(
+        &mut self,
+        member: &[u8],
+        delta: f64,
+        flags: ZAddFlags,
+        thresholds: &EncodingThresholds,
+    ) -> IncrOutcome {
         let Some(cur) = self.score(member) else {
             if flags.xx {
                 return IncrOutcome::Suppressed; // XX on a missing member: INCR -> nil.
@@ -1435,7 +1503,7 @@ impl ZSetValue for ZSetVal {
             if delta.is_nan() {
                 return IncrOutcome::Nan;
             }
-            self.put(member, delta);
+            self.put(member, delta, thresholds);
             return IncrOutcome::Updated(delta);
         };
         if flags.nx {
@@ -1452,7 +1520,7 @@ impl ZSetValue for ZSetVal {
         if !gate_passes(cur, new, flags) {
             return IncrOutcome::Suppressed; // GT/LT gate failed: INCR -> nil.
         }
-        self.put(member, new);
+        self.put(member, new, thresholds);
         IncrOutcome::Updated(new)
     }
 
@@ -1776,9 +1844,20 @@ impl KvObj {
 
     /// Build a `KvObj` from a key and an owned write value (the rmw write path).
     /// An `Int` variant is stored int-encoded directly; a `Bytes` variant is
-    /// classified (so a numeric string written via rmw still becomes int).
+    /// classified (so a numeric string written via rmw still becomes int). `thresholds`
+    /// carries the LIVE collection-encoding caps (#40) the freshly-built collection's
+    /// transition is evaluated against: the store passes its live snapshot (so a new
+    /// collection respects a `CONFIG SET *-max-listpack-*`); a RECONSTRUCTION caller
+    /// (kvcodec/persist) passes [`EncodingThresholds::unlimited`] so NO transition fires
+    /// during the rebuild and the recorded encoding is then FORCED, reproducing the source
+    /// encoding regardless of the local thresholds.
     #[must_use]
-    pub fn from_new_owned(key: &[u8], value: NewValueOwned, expire_at: Option<UnixMillis>) -> Self {
+    pub fn from_new_owned(
+        key: &[u8],
+        value: NewValueOwned,
+        expire_at: Option<UnixMillis>,
+        thresholds: &EncodingThresholds,
+    ) -> Self {
         match value {
             NewValueOwned::Int(n) => KvObj::from_int(key, n, expire_at),
             NewValueOwned::Bytes(b) => KvObj::from_bytes(key, &b, expire_at),
@@ -1788,7 +1867,7 @@ impl KvObj {
             NewValueOwned::List(elems) => {
                 let mut list = ListVal::new();
                 for e in &elems {
-                    list.push_back(e);
+                    list.push_back(e, thresholds);
                 }
                 KvObj::from_list(key, list, expire_at)
             }
@@ -1798,7 +1877,7 @@ impl KvObj {
             NewValueOwned::Hash(pairs) => {
                 let mut hash = HashVal::new();
                 for (f, v) in &pairs {
-                    hash.set(f, v);
+                    hash.set(f, v, thresholds);
                 }
                 KvObj::from_hash(key, hash, expire_at)
             }
@@ -1806,7 +1885,7 @@ impl KvObj {
             // (deduped + ladder-applied by `SetVal::from_members`). Subsequent edits go
             // through the in-place RmwAction::Mutated path, not this rebuild.
             NewValueOwned::Set(members) => {
-                let set = SetVal::from_members(&members);
+                let set = SetVal::from_members(&members, thresholds);
                 KvObj::from_set(key, set, expire_at)
             }
             // The PR-8 create-on-missing ZSET path: build the zset value from the
@@ -1814,7 +1893,7 @@ impl KvObj {
             // applied by `ZSetVal::from_pairs`). Subsequent edits go through the in-place
             // RmwAction::Mutated path, not this rebuild.
             NewValueOwned::ZSet(pairs) => {
-                let zset = ZSetVal::from_pairs(&pairs);
+                let zset = ZSetVal::from_pairs(&pairs, thresholds);
                 KvObj::from_zset(key, zset, expire_at)
             }
         }
@@ -2606,32 +2685,45 @@ impl Entry {
         }))
     }
 
-    /// Build an entry from a key and an owned RMW write value ([`NewValueOwned`]).
+    /// Build an entry from a key and an owned RMW write value ([`NewValueOwned`]). `thresholds`
+    /// carries the LIVE collection-encoding caps (#40) a freshly-built collection's transition is
+    /// evaluated against (the store passes its live snapshot; a reconstruction path passes
+    /// [`EncodingThresholds::unlimited`] and forces the recorded encoding). See
+    /// [`KvObj::from_new_owned`].
     #[must_use]
-    pub fn from_new_owned(key: &[u8], value: NewValueOwned, expire_at: Option<UnixMillis>) -> Self {
+    pub fn from_new_owned(
+        key: &[u8],
+        value: NewValueOwned,
+        expire_at: Option<UnixMillis>,
+        thresholds: &EncodingThresholds,
+    ) -> Self {
         match value {
             NewValueOwned::Int(n) => Entry::str_from_int(key, n, expire_at),
             NewValueOwned::Bytes(b) => Entry::str_from_bytes(key, &b, expire_at),
             NewValueOwned::List(elems) => {
                 let mut list = ListVal::new();
                 for e in &elems {
-                    list.push_back(e);
+                    list.push_back(e, thresholds);
                 }
                 Entry::coll(key, CollVal::List(list), expire_at)
             }
             NewValueOwned::Hash(pairs) => {
                 let mut hash = HashVal::new();
                 for (f, v) in &pairs {
-                    hash.set(f, v);
+                    hash.set(f, v, thresholds);
                 }
                 Entry::coll(key, CollVal::Hash(hash), expire_at)
             }
-            NewValueOwned::Set(members) => {
-                Entry::coll(key, CollVal::Set(SetVal::from_members(&members)), expire_at)
-            }
-            NewValueOwned::ZSet(pairs) => {
-                Entry::coll(key, CollVal::ZSet(ZSetVal::from_pairs(&pairs)), expire_at)
-            }
+            NewValueOwned::Set(members) => Entry::coll(
+                key,
+                CollVal::Set(SetVal::from_members(&members, thresholds)),
+                expire_at,
+            ),
+            NewValueOwned::ZSet(pairs) => Entry::coll(
+                key,
+                CollVal::ZSet(ZSetVal::from_pairs(&pairs, thresholds)),
+                expire_at,
+            ),
         }
     }
 
@@ -3127,6 +3219,12 @@ impl std::fmt::Debug for Entry {
 mod tests {
     use super::*;
 
+    /// The DEFAULT collection-encoding thresholds (the compiled Redis defaults) the unit tests
+    /// exercise the conversion ladder against. The runtime-settable behavior (a LOWERED threshold
+    /// converting a NEW collection sooner) is covered by the dedicated `encoding_threshold_*` tests
+    /// at the end of this module + the registry/runtime tests in `ironcache-config`.
+    const TH: &EncodingThresholds = &EncodingThresholds::defaults();
+
     #[test]
     fn int_value_has_no_alloc_and_reports_int() {
         let o = KvObj::from_bytes(b"k", b"12345", None);
@@ -3259,7 +3357,7 @@ mod tests {
     #[test]
     fn coll_entry_freq_uses_eviction_rank() {
         let mut list = ListVal::new();
-        list.push_back(b"a");
+        list.push_back(b"a", TH);
         let mut e = Entry::coll(b"mylist", CollVal::List(list), None);
         assert!(e.is_collection());
         assert_eq!(e.freq(), 0);
@@ -3296,9 +3394,9 @@ mod tests {
     #[test]
     fn listval_push_pop_order() {
         let mut l = ListVal::new();
-        l.push_back(b"a");
-        l.push_back(b"b");
-        l.push_front(b"z");
+        l.push_back(b"a", TH);
+        l.push_back(b"b", TH);
+        l.push_front(b"z", TH);
         // [z, a, b]
         assert_eq!(l.len(), 3);
         assert_eq!(l.get(0), Some(b"z".to_vec()));
@@ -3314,14 +3412,14 @@ mod tests {
     #[test]
     fn listval_set_and_index_out_of_range() {
         let mut l = ListVal::new();
-        l.push_back(b"a");
-        l.push_back(b"b");
-        assert!(l.set(1, b"B"));
-        assert!(l.set(-2, b"A"));
+        l.push_back(b"a", TH);
+        l.push_back(b"b", TH);
+        assert!(l.set(1, b"B", TH));
+        assert!(l.set(-2, b"A", TH));
         assert_eq!(l.range(0, -1), vec![b"A".to_vec(), b"B".to_vec()]);
         // Out of range -> false, no change.
-        assert!(!l.set(5, b"x"));
-        assert!(!l.set(-5, b"x"));
+        assert!(!l.set(5, b"x", TH));
+        assert!(!l.set(-5, b"x", TH));
         assert_eq!(l.get(9), None);
     }
 
@@ -3329,12 +3427,12 @@ mod tests {
     fn listval_insert_remove_trim_range() {
         let mut l = ListVal::new();
         for e in [b"a", b"b", b"c", b"a"] {
-            l.push_back(e);
+            l.push_back(e, TH);
         }
         // insert_before/after by pivot.
-        assert_eq!(l.insert_before(b"b", b"X"), Some(5)); // [a, X, b, c, a]
-        assert_eq!(l.insert_after(b"c", b"Y"), Some(6)); // [a, X, b, c, Y, a]
-        assert_eq!(l.insert_before(b"zzz", b"q"), None); // pivot absent
+        assert_eq!(l.insert_before(b"b", b"X", TH), Some(5)); // [a, X, b, c, a]
+        assert_eq!(l.insert_after(b"c", b"Y", TH), Some(6)); // [a, X, b, c, Y, a]
+        assert_eq!(l.insert_before(b"zzz", b"q", TH), None); // pivot absent
         assert_eq!(
             l.range(0, -1),
             vec![
@@ -3361,7 +3459,7 @@ mod tests {
     fn listval_pos_rank_count_maxlen() {
         let mut l = ListVal::new();
         for e in [b"a", b"b", b"a", b"c", b"a"] {
-            l.push_back(e);
+            l.push_back(e, TH);
         }
         // First match.
         assert_eq!(l.pos(b"a", 1, None, 0), vec![0]);
@@ -3380,15 +3478,17 @@ mod tests {
     #[test]
     fn listval_encoding_transition_is_byte_driven_only() {
         let mut l = ListVal::new();
-        l.push_back(b"a");
+        l.push_back(b"a", TH);
         assert_eq!(l.encoding(), Encoding::ListPack);
         // Over the byte budget -> quicklist.
-        let big = vec![b'q'; super::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES + 1];
-        l.push_back(&big);
+        let big = vec![b'q'; DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES + 1];
+        l.push_back(&big, TH);
         assert_eq!(l.encoding(), Encoding::QuickList);
-        // Pop it back off -> listpack again (a pure function of the active repr).
+        // The transition is ONE-WAY (#40 runtime-threshold ratchet, matching Redis's quicklist
+        // and the hash/set/zset types): popping the big element back off does NOT demote -- the
+        // list STAYS `quicklist` (the ratchet latched on the push that crossed the budget).
         assert_eq!(l.pop_back(), Some(big));
-        assert_eq!(l.encoding(), Encoding::ListPack);
+        assert_eq!(l.encoding(), Encoding::QuickList);
 
         // There is NO element-count cap for lists (Redis -2 negative fill: count
         // unlimited). MANY small elements that stay UNDER the byte budget remain
@@ -3397,7 +3497,7 @@ mod tests {
         // budget).
         let mut l2 = ListVal::new();
         for _ in 0..200 {
-            l2.push_back(b"z");
+            l2.push_back(b"z", TH);
         }
         assert_eq!(l2.elems.len(), 200);
         assert_eq!(
@@ -3409,12 +3509,12 @@ mod tests {
         // Crossing the 8 KB byte budget with many small elements flips to quicklist.
         // Each push of 100 bytes; after enough pushes the total exceeds 8 KB.
         let chunk = vec![b'y'; 100];
-        let pushes = (super::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES / chunk.len()) + 2;
+        let pushes = (DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES / chunk.len()) + 2;
         let mut l3 = ListVal::new();
         for _ in 0..pushes {
-            l3.push_back(&chunk);
+            l3.push_back(&chunk, TH);
         }
-        assert!(l3.element_bytes() > super::DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES);
+        assert!(l3.element_bytes() > DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES);
         assert_eq!(
             l3.encoding(),
             Encoding::QuickList,
@@ -3425,10 +3525,10 @@ mod tests {
     #[test]
     fn listval_element_bytes_tracks_edits() {
         let mut l = ListVal::new();
-        l.push_back(b"abc"); // 3
-        l.push_front(b"de"); // 2
+        l.push_back(b"abc", TH); // 3
+        l.push_front(b"de", TH); // 2
         assert_eq!(l.element_bytes(), 5);
-        l.set(0, b"DEFG"); // de(2) -> DEFG(4): +2
+        l.set(0, b"DEFG", TH); // de(2) -> DEFG(4): +2
         assert_eq!(l.element_bytes(), 7);
         l.pop_back(); // -3
         assert_eq!(l.element_bytes(), 4);
@@ -3449,30 +3549,89 @@ mod tests {
         assert_eq!(DEFAULT_HASH_MAX_LISTPACK_VALUE, 64);
 
         // Entry-count boundary: 512 small entries stay listpack; 513 flips to hashtable.
-        // `should_convert(entries, ..)` is called AFTER the edit, with the post-edit count.
+        // `should_convert(entries, .., TH)` is called AFTER the edit, with the post-edit count.
         assert!(
-            !HashVal::should_convert(512, 1, 1),
+            !HashVal::should_convert(512, 1, 1, TH),
             "exactly 512 entries (small field/value) stays listpack"
         );
         assert!(
-            HashVal::should_convert(513, 1, 1),
+            HashVal::should_convert(513, 1, 1, TH),
             "513 entries flips to hashtable (over the 512 HASH cap)"
         );
 
         // Per-element byte boundary (independent of entry count): a field or value of 64
         // bytes stays listpack; 65 bytes flips. Few entries, so only the byte cap fires.
         assert!(
-            !HashVal::should_convert(2, 64, 64),
+            !HashVal::should_convert(2, 64, 64, TH),
             "a 64-byte field AND a 64-byte value (at the cap) stays listpack"
         );
         assert!(
-            HashVal::should_convert(2, 65, 1),
+            HashVal::should_convert(2, 65, 1, TH),
             "a 65-byte field (over the 64 cap) flips to hashtable"
         );
         assert!(
-            HashVal::should_convert(2, 1, 65),
+            HashVal::should_convert(2, 1, 65, TH),
             "a 65-byte value (over the 64 cap) flips to hashtable"
         );
+    }
+
+    /// Area A (#40): a LOWERED runtime `hash-max-listpack-entries` makes a NEW hash promote to
+    /// `hashtable` past the new (smaller) cap, while an EXISTING hash built under the default cap is
+    /// untouched. Proves the conversion reads the LIVE thresholds, and that a change is FUTURE-only.
+    #[test]
+    fn hash_encoding_honors_a_lowered_runtime_threshold_and_does_not_reencode_existing() {
+        // A LOWERED cap of 4 entries.
+        let low = EncodingThresholds {
+            hash_max_listpack_entries: 4,
+            ..EncodingThresholds::defaults()
+        };
+        // A NEW hash with 5 fields under the lowered cap -> hashtable (5 > 4).
+        let mut h = HashVal::new();
+        for i in 0..5 {
+            h.set(format!("f{i}").as_bytes(), b"v", &low);
+        }
+        assert_eq!(
+            h.encoding(),
+            Encoding::HashTable,
+            "a NEW hash past the lowered cap is hashtable"
+        );
+        // An EXISTING small hash built under the DEFAULT (512) cap stays listpack: lowering the cap
+        // afterward does NOT re-encode it (no further edits re-evaluate it).
+        let mut existing = HashVal::new();
+        for i in 0..5 {
+            existing.set(format!("f{i}").as_bytes(), b"v", TH);
+        }
+        assert_eq!(
+            existing.encoding(),
+            Encoding::ListPack,
+            "an EXISTING hash built under the default cap is untouched by a later lower cap"
+        );
+    }
+
+    /// Area A (#40): a RAISED runtime `set-max-listpack-entries` keeps a NEW set in the listpack
+    /// form past the default 128 cap (proving the live threshold widens, not just narrows).
+    #[test]
+    fn set_encoding_honors_a_raised_runtime_listpack_threshold() {
+        let high = EncodingThresholds {
+            set_max_listpack_entries: 1000,
+            ..EncodingThresholds::defaults()
+        };
+        let mut s = SetVal::new();
+        // 200 non-integer members: over the DEFAULT 128 listpack cap but under the raised 1000.
+        for i in 0..200 {
+            s.add(format!("m{i}").as_bytes(), &high);
+        }
+        assert_eq!(
+            s.encoding(),
+            Encoding::ListPack,
+            "a raised set-max-listpack-entries keeps a 200-member set in listpack"
+        );
+        // Under the DEFAULT cap the same 200 members would be a hashtable.
+        let mut s_default = SetVal::new();
+        for i in 0..200 {
+            s_default.add(format!("m{i}").as_bytes(), TH);
+        }
+        assert_eq!(s_default.encoding(), Encoding::HashTable);
     }
 
     // -- SetVal unit tests (PR-7): the abstract set-op vocabulary + the
@@ -3481,11 +3640,11 @@ mod tests {
     #[test]
     fn setval_intset_stays_intset_for_all_integer_members() {
         let mut s = SetVal::new();
-        assert!(s.add(b"3"));
-        assert!(s.add(b"1"));
-        assert!(s.add(b"2"));
+        assert!(s.add(b"3", TH));
+        assert!(s.add(b"1", TH));
+        assert!(s.add(b"2", TH));
         // Re-adding is a no-op.
-        assert!(!s.add(b"2"));
+        assert!(!s.add(b"2", TH));
         assert_eq!(s.encoding(), Encoding::IntSet);
         assert_eq!(s.len(), 3);
         // Members are in ASCENDING integer order (the intset sort).
@@ -3505,9 +3664,9 @@ mod tests {
         // "007" parses as 7 but is NOT canonical (leading zeros), so it leaves intset for
         // listpack (Redis keeps it as a listpack member).
         let mut s = SetVal::new();
-        assert!(s.add(b"7"));
+        assert!(s.add(b"7", TH));
         assert_eq!(s.encoding(), Encoding::IntSet);
-        assert!(s.add(b"007"));
+        assert!(s.add(b"007", TH));
         assert_eq!(
             s.encoding(),
             Encoding::ListPack,
@@ -3522,11 +3681,11 @@ mod tests {
     #[test]
     fn setval_non_integer_member_converts_intset_to_listpack() {
         let mut s = SetVal::new();
-        s.add(b"1");
-        s.add(b"2");
+        s.add(b"1", TH);
+        s.add(b"2", TH);
         assert_eq!(s.encoding(), Encoding::IntSet);
         // A non-integer member converts to listpack (still small).
-        assert!(s.add(b"hello"));
+        assert!(s.add(b"hello", TH));
         assert_eq!(s.encoding(), Encoding::ListPack);
         assert_eq!(s.len(), 3);
         // The previously-integer members are preserved as their decimal bytes.
@@ -3541,7 +3700,7 @@ mod tests {
         // hashtable (512 > the 128 listpack cap, so it cannot fit a listpack).
         let mut s = SetVal::new();
         for i in 0..=DEFAULT_SET_MAX_INTSET_ENTRIES {
-            s.add(i.to_string().as_bytes());
+            s.add(i.to_string().as_bytes(), TH);
         }
         // 513 members.
         assert_eq!(s.len(), DEFAULT_SET_MAX_INTSET_ENTRIES + 1);
@@ -3553,7 +3712,7 @@ mod tests {
         // Exactly 512 stays intset.
         let mut s512 = SetVal::new();
         for i in 0..DEFAULT_SET_MAX_INTSET_ENTRIES {
-            s512.add(i.to_string().as_bytes());
+            s512.add(i.to_string().as_bytes(), TH);
         }
         assert_eq!(s512.len(), DEFAULT_SET_MAX_INTSET_ENTRIES);
         assert_eq!(
@@ -3568,10 +3727,10 @@ mod tests {
         // A listpack set (a non-integer member forced it) that grows past
         // set-max-listpack-entries (128) converts to hashtable.
         let mut s = SetVal::new();
-        s.add(b"x"); // non-integer -> listpack
+        s.add(b"x", TH); // non-integer -> listpack
         assert_eq!(s.encoding(), Encoding::ListPack);
         for i in 0..DEFAULT_SET_MAX_LISTPACK_ENTRIES {
-            s.add(format!("m{i}").as_bytes());
+            s.add(format!("m{i}").as_bytes(), TH);
         }
         assert!(s.len() > DEFAULT_SET_MAX_LISTPACK_ENTRIES);
         assert_eq!(s.encoding(), Encoding::HashTable);
@@ -3582,16 +3741,16 @@ mod tests {
         // A listpack set with a member exceeding set-max-listpack-value (64 bytes)
         // converts to hashtable, even with few members.
         let mut s = SetVal::new();
-        s.add(b"x"); // non-integer -> listpack
+        s.add(b"x", TH); // non-integer -> listpack
         assert_eq!(s.encoding(), Encoding::ListPack);
         let big = vec![b'q'; DEFAULT_SET_MAX_LISTPACK_VALUE + 1];
-        s.add(&big);
+        s.add(&big, TH);
         assert_eq!(s.encoding(), Encoding::HashTable);
         // A 64-byte member (at the cap) stays listpack.
         let mut s2 = SetVal::new();
-        s2.add(b"y");
+        s2.add(b"y", TH);
         let at_cap = vec![b'q'; DEFAULT_SET_MAX_LISTPACK_VALUE];
-        s2.add(&at_cap);
+        s2.add(&at_cap, TH);
         assert_eq!(s2.encoding(), Encoding::ListPack);
     }
 
@@ -3600,9 +3759,9 @@ mod tests {
         // Once a set is hashtable, removing members back down to a tiny size keeps it
         // hashtable (Redis one-way ratchet).
         let mut s = SetVal::new();
-        s.add(b"x"); // listpack
+        s.add(b"x", TH); // listpack
         let big = vec![b'q'; DEFAULT_SET_MAX_LISTPACK_VALUE + 1];
-        s.add(&big); // -> hashtable
+        s.add(&big, TH); // -> hashtable
         assert_eq!(s.encoding(), Encoding::HashTable);
         assert!(s.remove(&big));
         assert_eq!(s.len(), 1);
@@ -3613,8 +3772,8 @@ mod tests {
         );
         // Likewise an intset that converted to listpack stays listpack on shrink.
         let mut s2 = SetVal::new();
-        s2.add(b"1");
-        s2.add(b"nonint"); // -> listpack
+        s2.add(b"1", TH);
+        s2.add(b"nonint", TH); // -> listpack
         assert_eq!(s2.encoding(), Encoding::ListPack);
         assert!(s2.remove(b"nonint"));
         assert_eq!(
@@ -3627,12 +3786,12 @@ mod tests {
     #[test]
     fn setval_element_bytes_tracks_edits_across_forms() {
         let mut s = SetVal::new();
-        s.add(b"10"); // intset, decimal len 2
-        s.add(b"200"); // intset, decimal len 3
+        s.add(b"10", TH); // intset, decimal len 2
+        s.add(b"200", TH); // intset, decimal len 3
         assert_eq!(s.element_bytes(), 5);
         // Convert to listpack with a non-integer member; the integer members keep their
         // decimal byte weight (continuous across the conversion).
-        s.add(b"ab"); // +2 -> listpack
+        s.add(b"ab", TH); // +2 -> listpack
         assert_eq!(s.element_bytes(), 7);
         s.remove(b"200"); // -3
         assert_eq!(s.element_bytes(), 4);
@@ -3641,7 +3800,7 @@ mod tests {
     #[test]
     fn kvobj_from_set_reports_set_type_and_encoding() {
         let mut set = SetVal::new();
-        set.add(b"1");
+        set.add(b"1", TH);
         let o = KvObj::from_set(b"k", set, None);
         assert_eq!(o.header.data_type, DataType::Set);
         assert_eq!(o.header.encoding, Encoding::IntSet);
@@ -3659,6 +3818,7 @@ mod tests {
             b"k",
             NewValueOwned::set(vec![b"1".to_vec(), b"2".to_vec(), b"1".to_vec()]),
             None,
+            TH,
         );
         assert_eq!(o.collection_len(), Some(2), "duplicate member deduped");
         assert_eq!(o.header.encoding, Encoding::IntSet);
@@ -3667,6 +3827,7 @@ mod tests {
             b"k",
             NewValueOwned::set(vec![b"1".to_vec(), b"x".to_vec()]),
             None,
+            TH,
         );
         assert_eq!(o2.header.encoding, Encoding::ListPack);
         assert_eq!(o2.collection_len(), Some(2));
@@ -3675,7 +3836,7 @@ mod tests {
     #[test]
     fn kvobj_from_list_reports_list_type_and_encoding() {
         let mut l = ListVal::new();
-        l.push_back(b"x");
+        l.push_back(b"x", TH);
         let o = KvObj::from_list(b"k", l, None);
         assert_eq!(o.header.data_type, DataType::List);
         assert_eq!(o.header.encoding, Encoding::ListPack);
@@ -3696,10 +3857,10 @@ mod tests {
     fn zsetval_orders_by_score_then_member_lex() {
         let mut z = ZSetVal::new();
         // Insert out of order; the (score, member) order must come out sorted.
-        z.add(b"b", 2.0, no_flags());
-        z.add(b"a", 1.0, no_flags());
-        z.add(b"c", 2.0, no_flags()); // equal score to b -> member lex tiebreak (b before c)
-        z.add(b"d", 1.0, no_flags()); // equal score to a -> a before d
+        z.add(b"b", 2.0, no_flags(), TH);
+        z.add(b"a", 1.0, no_flags(), TH);
+        z.add(b"c", 2.0, no_flags(), TH); // equal score to b -> member lex tiebreak (b before c)
+        z.add(b"d", 1.0, no_flags(), TH); // equal score to a -> a before d
         let order: Vec<Vec<u8>> = z
             .members_with_scores()
             .into_iter()
@@ -3715,9 +3876,9 @@ mod tests {
     #[test]
     fn zsetval_inf_scores_order_at_the_extremes() {
         let mut z = ZSetVal::new();
-        z.add(b"mid", 0.0, no_flags());
-        z.add(b"hi", f64::INFINITY, no_flags());
-        z.add(b"lo", f64::NEG_INFINITY, no_flags());
+        z.add(b"mid", 0.0, no_flags(), TH);
+        z.add(b"hi", f64::INFINITY, no_flags(), TH);
+        z.add(b"lo", f64::NEG_INFINITY, no_flags(), TH);
         let order: Vec<Vec<u8>> = z
             .members_with_scores()
             .into_iter()
@@ -3731,10 +3892,10 @@ mod tests {
     #[test]
     fn zsetval_score_update_reorders_and_does_not_grow() {
         let mut z = ZSetVal::new();
-        assert!(z.add(b"a", 1.0, no_flags()).added);
-        assert!(z.add(b"b", 2.0, no_flags()).added);
+        assert!(z.add(b"a", 1.0, no_flags(), TH).added);
+        assert!(z.add(b"b", 2.0, no_flags(), TH).added);
         // Update a's score above b: it must reorder and NOT be a new member.
-        let out = z.add(b"a", 9.0, no_flags());
+        let out = z.add(b"a", 9.0, no_flags(), TH);
         assert!(!out.added);
         assert!(out.changed);
         assert_eq!(out.new_score, Some(9.0));
@@ -3752,7 +3913,7 @@ mod tests {
         // Entry-count threshold: 128 entries stays listpack; 129 flips to skiplist.
         let mut z = ZSetVal::new();
         for i in 0..DEFAULT_ZSET_MAX_LISTPACK_ENTRIES {
-            z.add(format!("m{i:04}").as_bytes(), i as f64, no_flags());
+            z.add(format!("m{i:04}").as_bytes(), i as f64, no_flags(), TH);
         }
         assert_eq!(z.len(), DEFAULT_ZSET_MAX_LISTPACK_ENTRIES);
         assert_eq!(
@@ -3760,7 +3921,7 @@ mod tests {
             Encoding::ListPack,
             "exactly 128 stays listpack"
         );
-        z.add(b"overflow", 999.0, no_flags());
+        z.add(b"overflow", 999.0, no_flags(), TH);
         assert_eq!(
             z.encoding(),
             Encoding::SkipList,
@@ -3779,16 +3940,16 @@ mod tests {
 
         // Per-member byte threshold: a 64-byte member stays listpack; 65 flips.
         let mut z2 = ZSetVal::new();
-        z2.add(b"x", 1.0, no_flags());
+        z2.add(b"x", 1.0, no_flags(), TH);
         let at_cap = vec![b'q'; DEFAULT_ZSET_MAX_LISTPACK_VALUE];
-        z2.add(&at_cap, 2.0, no_flags());
+        z2.add(&at_cap, 2.0, no_flags(), TH);
         assert_eq!(
             z2.encoding(),
             Encoding::ListPack,
             "64-byte member at the cap"
         );
         let over_cap = vec![b'q'; DEFAULT_ZSET_MAX_LISTPACK_VALUE + 1];
-        z2.add(&over_cap, 3.0, no_flags());
+        z2.add(&over_cap, 3.0, no_flags(), TH);
         assert_eq!(
             z2.encoding(),
             Encoding::SkipList,
@@ -3799,7 +3960,7 @@ mod tests {
     #[test]
     fn zsetval_add_matrix_nx_xx_gt_lt() {
         let mut z = ZSetVal::new();
-        z.add(b"a", 5.0, no_flags());
+        z.add(b"a", 5.0, no_flags(), TH);
         // NX on an existing member: suppressed (no change), new_score reflects current.
         let nx = z.add(
             b"a",
@@ -3808,6 +3969,7 @@ mod tests {
                 nx: true,
                 ..no_flags()
             },
+            TH,
         );
         assert!(!nx.added && !nx.changed && nx.new_score == Some(5.0));
         // XX on a missing member: suppressed, new_score None.
@@ -3818,6 +3980,7 @@ mod tests {
                 xx: true,
                 ..no_flags()
             },
+            TH,
         );
         assert!(!xx.added && !xx.changed && xx.new_score.is_none());
         // GT updates only if greater: 3 < 5 -> suppressed.
@@ -3828,6 +3991,7 @@ mod tests {
                 gt: true,
                 ..no_flags()
             },
+            TH,
         );
         assert!(!gt_lo.changed && z.score(b"a") == Some(5.0));
         // GT updates if greater: 9 > 5 -> applied.
@@ -3838,6 +4002,7 @@ mod tests {
                 gt: true,
                 ..no_flags()
             },
+            TH,
         );
         assert!(gt_hi.changed && z.score(b"a") == Some(9.0));
         // GT/LT alone still ADD a new member (Redis: GT/LT do not prevent adds).
@@ -3848,6 +4013,7 @@ mod tests {
                 gt: true,
                 ..no_flags()
             },
+            TH,
         );
         assert!(added.added && z.score(b"fresh") == Some(7.0));
     }
@@ -3856,8 +4022,8 @@ mod tests {
     fn zsetval_incr_and_suppression() {
         let mut z = ZSetVal::new();
         // INCR on a missing member starts from delta.
-        assert_eq!(z.incr(b"a", 2.5, no_flags()), IncrOutcome::Updated(2.5));
-        assert_eq!(z.incr(b"a", 2.5, no_flags()), IncrOutcome::Updated(5.0));
+        assert_eq!(z.incr(b"a", 2.5, no_flags(), TH), IncrOutcome::Updated(2.5));
+        assert_eq!(z.incr(b"a", 2.5, no_flags(), TH), IncrOutcome::Updated(5.0));
         // NX INCR on an existing member: suppressed (nil).
         assert_eq!(
             z.incr(
@@ -3866,7 +4032,8 @@ mod tests {
                 ZAddFlags {
                     nx: true,
                     ..no_flags()
-                }
+                },
+                TH
             ),
             IncrOutcome::Suppressed
         );
@@ -3878,7 +4045,8 @@ mod tests {
                 ZAddFlags {
                     xx: true,
                     ..no_flags()
-                }
+                },
+                TH
             ),
             IncrOutcome::Suppressed
         );
@@ -3889,11 +4057,11 @@ mod tests {
         // An existing +inf incremented by -inf yields NaN: the store must NOT store it.
         let mut z = ZSetVal::new();
         assert_eq!(
-            z.incr(b"m", f64::INFINITY, no_flags()),
+            z.incr(b"m", f64::INFINITY, no_flags(), TH),
             IncrOutcome::Updated(f64::INFINITY)
         );
         assert_eq!(
-            z.incr(b"m", f64::NEG_INFINITY, no_flags()),
+            z.incr(b"m", f64::NEG_INFINITY, no_flags(), TH),
             IncrOutcome::Nan
         );
         // The member is UNCHANGED at +inf (no NaN stored, the order is untouched).
@@ -3902,10 +4070,13 @@ mod tests {
         // The symmetric case: an existing -inf incremented by +inf.
         let mut z2 = ZSetVal::new();
         assert_eq!(
-            z2.incr(b"m", f64::NEG_INFINITY, no_flags()),
+            z2.incr(b"m", f64::NEG_INFINITY, no_flags(), TH),
             IncrOutcome::Updated(f64::NEG_INFINITY)
         );
-        assert_eq!(z2.incr(b"m", f64::INFINITY, no_flags()), IncrOutcome::Nan);
+        assert_eq!(
+            z2.incr(b"m", f64::INFINITY, no_flags(), TH),
+            IncrOutcome::Nan
+        );
         assert_eq!(z2.score(b"m"), Some(f64::NEG_INFINITY));
     }
 
@@ -3913,7 +4084,7 @@ mod tests {
     fn zsetval_range_by_score_rank_lex_and_pops() {
         let mut z = ZSetVal::new();
         for (m, s) in [(b"a", 1.0), (b"b", 2.0), (b"c", 3.0), (b"d", 4.0)] {
-            z.add(m, s, no_flags());
+            z.add(m, s, no_flags(), TH);
         }
         // range_by_score inclusive [2,3].
         let by_score = z.range_by_score(
@@ -3954,7 +4125,7 @@ mod tests {
     fn zsetval_lex_range_equal_scores() {
         let mut z = ZSetVal::new();
         for m in [b"a".as_slice(), b"b", b"c", b"d"] {
-            z.add(m, 0.0, no_flags());
+            z.add(m, 0.0, no_flags(), TH);
         }
         // [b, (d -> b, c.
         let lex = z.range_by_lex(
@@ -3973,7 +4144,7 @@ mod tests {
     #[test]
     fn kvobj_from_zset_reports_zset_type_and_encoding_and_accounting() {
         let mut z = ZSetVal::new();
-        z.add(b"m", 1.0, no_flags());
+        z.add(b"m", 1.0, no_flags(), TH);
         let o = KvObj::from_zset(b"k", z, None);
         assert_eq!(o.header.data_type, DataType::ZSet);
         assert_eq!(o.header.encoding, Encoding::ListPack);
@@ -3994,6 +4165,7 @@ mod tests {
                 (b"a".to_vec(), 9.0),
             ]),
             None,
+            TH,
         );
         assert_eq!(o.collection_len(), Some(2), "duplicate member deduped");
         if let ValueRepr::ZSet(z) = &o.value {
@@ -4093,8 +4265,8 @@ mod tests {
         // A Coll entry: the low tag bit marks it; access masks it off. Build a list,
         // read it, mutate in place through `as_list_mut`, clone, and drop.
         let mut list = ListVal::new();
-        list.push_back(b"a");
-        list.push_back(b"b");
+        list.push_back(b"a", TH);
+        list.push_back(b"b", TH);
         let mut e = Entry::coll(b"mykey", CollVal::List(list), Some(UnixMillis(5)));
         assert!(e.is_collection());
         assert_eq!(e.key(), b"mykey");
@@ -4107,7 +4279,7 @@ mod tests {
         // Mutate through the tagged pointer (`coll_mut` masks the tag).
         {
             let l = e.as_list_mut().expect("list arm");
-            l.push_back(b"c");
+            l.push_back(b"c", TH);
         }
         assert_eq!(e.collection_len(), Some(3));
 
@@ -4132,7 +4304,7 @@ mod tests {
     #[test]
     fn entry_coll_set_expire_at_is_a_field_write() {
         let mut set = SetVal::new();
-        set.add(b"1");
+        set.add(b"1", TH);
         let mut e = Entry::coll(b"s", CollVal::Set(set), None);
         assert_eq!(e.expire_at(), None);
         e.set_expire_at(Some(UnixMillis(100)));

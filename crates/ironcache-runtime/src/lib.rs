@@ -156,6 +156,12 @@ pub trait Runtime {
 pub mod tokio_rt;
 #[cfg(feature = "tokio")]
 pub use tokio_rt::TokioRuntime;
+// `tcp-keepalive` (Area B/C): apply SO_KEEPALIVE at accept on a tokio stream via socket2 (no fd
+// dance / `unsafe`, which the `ironcache` crate forbids). The serve loop calls this on the raw
+// accepted stream before the TLS wrap, reading the live overlay so a `CONFIG SET tcp-keepalive`
+// applies to newly-accepted connections.
+#[cfg(feature = "tokio")]
+pub use tokio_rt::set_keepalive;
 
 // The OPTIONAL Linux io_uring backend (PROD-10 / #28, docs/design/IOURING_DATAPATH.md): a
 // SECOND `Runtime` impl behind the default-OFF `io_uring` feature, gated to Linux so the
@@ -166,7 +172,7 @@ pub use tokio_rt::TokioRuntime;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 pub mod io_uring_rt;
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
-pub use io_uring_rt::{IoUringRuntime, peer_local_addrs, run_shards_uring};
+pub use io_uring_rt::{IoUringRuntime, peer_local_addrs, run_shards_uring, set_keepalive_uring};
 // Re-export the io_uring transport stream type so the `ironcache` serve loop can name it
 // (`ironcache_runtime::UringTcpStream`) WITHOUT taking a direct dependency on `tokio-uring`: the
 // low-level binding stays an implementation detail of this runtime crate, mirroring how

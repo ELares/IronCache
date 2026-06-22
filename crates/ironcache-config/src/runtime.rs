@@ -115,6 +115,55 @@ pub struct RuntimeConfig {
     /// load per command. Runtime-settable via `CONFIG SET notify-keyspace-events`; seeded from the
     /// boot config's flag string (parsed + validated at boot).
     notify_keyspace_events: AtomicU32,
+    /// The inbound bulk-string + string-value-growth ceiling in bytes (Redis `proto-max-bulk-len`).
+    /// Runtime-settable via `CONFIG SET proto-max-bulk-len`; the serve loop builds the decoder
+    /// `Limits` from this per connection, and the string/bitmap growth ceilings read it. A single
+    /// relaxed load on the (cold) connection-setup / value-growth path, never per command at the
+    /// default. Seeded from the boot config (default 512 MB).
+    proto_max_bulk_len: AtomicU64,
+    /// The TCP keepalive idle interval in SECONDS applied at connection ACCEPT (Redis
+    /// `tcp-keepalive`). `0` disables keepalive. Runtime-settable via `CONFIG SET tcp-keepalive`;
+    /// the accept path reads it (one relaxed load) so a change applies to newly-accepted
+    /// connections. Seeded from the boot config (default 300).
+    tcp_keepalive_secs: AtomicU64,
+    /// The 8 collection-encoding listpack/intset thresholds (`hash-max-listpack-entries`, ...). The
+    /// store reads the live value AT the encoding-transition decision (already a size branch), so
+    /// at the compiled default this is one extra relaxed load on the (cold) transition check and
+    /// the default encoding behavior is byte-identical. A `CONFIG SET` affects FUTURE inserts only.
+    /// `list_max_listpack_size` is the SIGNED Redis form (`-2` etc.); the rest are positive
+    /// counts/byte caps. All seeded from the boot config.
+    hash_max_listpack_entries: AtomicU64,
+    hash_max_listpack_value: AtomicU64,
+    list_max_listpack_size: AtomicI64,
+    set_max_intset_entries: AtomicU64,
+    set_max_listpack_entries: AtomicU64,
+    set_max_listpack_value: AtomicU64,
+    zset_max_listpack_entries: AtomicU64,
+    zset_max_listpack_value: AtomicU64,
+}
+
+/// The 8 collection-encoding thresholds the store reads at the encoding-transition decision (#40).
+/// Defined in the storage waist (`ironcache-storage`) because that crate -- which holds the
+/// `*Value` traits + `Encoding` that consume it -- cannot depend on THIS crate (config already
+/// depends on storage; the reverse would be a cycle). Re-exported here so `CONFIG`-side callers can
+/// name it through `ironcache_config`. Built from the boot [`Config`] / runtime overlay below.
+pub use ironcache_storage::EncodingThresholds;
+
+/// Build the [`EncodingThresholds`] snapshot a boot [`Config`](crate::Config) resolves to (the
+/// compiled Redis defaults unless overridden by TOML/env/CLI). The runtime overlay seeds its
+/// per-threshold atomics from these; the store seeds its initial snapshot from here too.
+#[must_use]
+pub fn encoding_thresholds_from_config(cfg: &crate::Config) -> EncodingThresholds {
+    EncodingThresholds {
+        hash_max_listpack_entries: cfg.hash_max_listpack_entries,
+        hash_max_listpack_value: cfg.hash_max_listpack_value,
+        list_max_listpack_size: cfg.list_max_listpack_size,
+        set_max_intset_entries: cfg.set_max_intset_entries,
+        set_max_listpack_entries: cfg.set_max_listpack_entries,
+        set_max_listpack_value: cfg.set_max_listpack_value,
+        zset_max_listpack_entries: cfg.zset_max_listpack_entries,
+        zset_max_listpack_value: cfg.zset_max_listpack_value,
+    }
 }
 
 /// The string-valued runtime params guarded by [`RuntimeConfig`]'s lock. Grouped
@@ -175,6 +224,20 @@ impl RuntimeConfig {
                     .unwrap_or_else(|_| NotifyFlags::empty())
                     .bits(),
             ),
+            // The protocol / keepalive ceilings, seeded from the boot config so a configured node
+            // keeps its value; a later `CONFIG SET` overrides live (the serve/accept path reads it).
+            proto_max_bulk_len: AtomicU64::new(cfg.proto_max_bulk_len),
+            tcp_keepalive_secs: AtomicU64::new(cfg.tcp_keepalive_secs),
+            // The 8 collection-encoding thresholds, seeded from the boot config (the compiled Redis
+            // defaults unless overridden). The store reads these at the encoding-transition decision.
+            hash_max_listpack_entries: AtomicU64::new(cfg.hash_max_listpack_entries as u64),
+            hash_max_listpack_value: AtomicU64::new(cfg.hash_max_listpack_value as u64),
+            list_max_listpack_size: AtomicI64::new(cfg.list_max_listpack_size),
+            set_max_intset_entries: AtomicU64::new(cfg.set_max_intset_entries as u64),
+            set_max_listpack_entries: AtomicU64::new(cfg.set_max_listpack_entries as u64),
+            set_max_listpack_value: AtomicU64::new(cfg.set_max_listpack_value as u64),
+            zset_max_listpack_entries: AtomicU64::new(cfg.zset_max_listpack_entries as u64),
+            zset_max_listpack_value: AtomicU64::new(cfg.zset_max_listpack_value as u64),
         })
     }
 
@@ -410,6 +473,109 @@ impl RuntimeConfig {
         self.notify_keyspace_events
             .store(flags.bits(), Ordering::Relaxed);
     }
+
+    /// The current effective `proto-max-bulk-len` in bytes (default 512 MB). A single relaxed
+    /// atomic load: the serve loop reads it when building the per-connection decoder `Limits`, and
+    /// the string/bitmap growth ceilings read it when checking a value-growth edit (both cold paths
+    /// relative to the per-command decode/dispatch).
+    #[must_use]
+    pub fn proto_max_bulk_len(&self) -> u64 {
+        self.proto_max_bulk_len.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET proto-max-bulk-len <bytes>`: store the new ceiling (a relaxed store). The serve
+    /// loop reads it when (re)building a connection's decoder `Limits`, and the string/bitmap
+    /// ceilings read it directly, so a change applies to subsequent connections + subsequent
+    /// value-growth edits. The caller validated the byte size (non-zero).
+    pub fn set_proto_max_bulk_len(&self, bytes: u64) {
+        self.proto_max_bulk_len.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The current effective `tcp-keepalive` idle interval in SECONDS (default 300); `0` disables
+    /// keepalive. A single relaxed load the accept path reads per new connection.
+    #[must_use]
+    pub fn tcp_keepalive_secs(&self) -> u64 {
+        self.tcp_keepalive_secs.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET tcp-keepalive <secs>`: store the new keepalive idle interval (a relaxed store);
+    /// `0` disables it. The accept path reads it directly, so a change applies to NEWLY-accepted
+    /// connections (existing connections keep the option set at their own accept time, matching
+    /// Redis).
+    pub fn set_tcp_keepalive_secs(&self, secs: u64) {
+        self.tcp_keepalive_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// A SNAPSHOT of the 8 collection-encoding thresholds (the value the store reads at the
+    /// encoding-transition decision). Taken off the hot path: the store refreshes its own cached
+    /// snapshot only when the runtime [`generation`](Self::generation) moves (the SAME per-command
+    /// generation check the policy hot-swap uses), so the per-edit decision is a plain field read on
+    /// the store's cached copy, never an atomic per edit.
+    #[must_use]
+    pub fn encoding_thresholds(&self) -> EncodingThresholds {
+        EncodingThresholds {
+            hash_max_listpack_entries: self.hash_max_listpack_entries.load(Ordering::Relaxed)
+                as usize,
+            hash_max_listpack_value: self.hash_max_listpack_value.load(Ordering::Relaxed) as usize,
+            list_max_listpack_size: self.list_max_listpack_size.load(Ordering::Relaxed),
+            set_max_intset_entries: self.set_max_intset_entries.load(Ordering::Relaxed) as usize,
+            set_max_listpack_entries: self.set_max_listpack_entries.load(Ordering::Relaxed)
+                as usize,
+            set_max_listpack_value: self.set_max_listpack_value.load(Ordering::Relaxed) as usize,
+            zset_max_listpack_entries: self.zset_max_listpack_entries.load(Ordering::Relaxed)
+                as usize,
+            zset_max_listpack_value: self.zset_max_listpack_value.load(Ordering::Relaxed) as usize,
+        }
+    }
+
+    /// Store ONE collection-encoding threshold by its registered param name and BUMP the generation
+    /// (a Release store) so every shard refreshes its cached [`EncodingThresholds`] snapshot on its
+    /// next command -- the SAME generation funnel the policy hot-swap rides, so no new per-command
+    /// read is added. Returns `true` if `name` is a recognized threshold (the caller validated the
+    /// numeric value first), `false` otherwise (a programming error the registry surfaces). The
+    /// generation bump pairs with the per-command Acquire load in [`Self::generation`], so a shard
+    /// that observes the new generation is guaranteed to see the new threshold value written here.
+    pub fn set_encoding_threshold(&self, name: &str, value: i64) -> bool {
+        match name {
+            "hash-max-listpack-entries" => {
+                self.hash_max_listpack_entries
+                    .store(value as u64, Ordering::Relaxed);
+            }
+            "hash-max-listpack-value" => {
+                self.hash_max_listpack_value
+                    .store(value as u64, Ordering::Relaxed);
+            }
+            "list-max-listpack-size" => {
+                self.list_max_listpack_size.store(value, Ordering::Relaxed);
+            }
+            "set-max-intset-entries" => {
+                self.set_max_intset_entries
+                    .store(value as u64, Ordering::Relaxed);
+            }
+            "set-max-listpack-entries" => {
+                self.set_max_listpack_entries
+                    .store(value as u64, Ordering::Relaxed);
+            }
+            "set-max-listpack-value" => {
+                self.set_max_listpack_value
+                    .store(value as u64, Ordering::Relaxed);
+            }
+            "zset-max-listpack-entries" => {
+                self.zset_max_listpack_entries
+                    .store(value as u64, Ordering::Relaxed);
+            }
+            "zset-max-listpack-value" => {
+                self.zset_max_listpack_value
+                    .store(value as u64, Ordering::Relaxed);
+            }
+            _ => return false,
+        }
+        // Publish the new threshold via a Release generation bump (pairs with the per-command
+        // Acquire load): a shard observing the new generation refreshes its cached snapshot and is
+        // guaranteed to see the value stored above.
+        self.generation.fetch_add(1, Ordering::Release);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +648,82 @@ mod tests {
         // The default boot config seeds `0` (Redis default: idle disconnection off).
         let rc_default = RuntimeConfig::from_config(&Config::default());
         assert_eq!(rc_default.timeout_secs(), 0);
+    }
+
+    #[test]
+    fn set_proto_max_bulk_len_round_trips() {
+        let cfg = Config {
+            proto_max_bulk_len: 1024,
+            ..Config::default()
+        };
+        let rc = RuntimeConfig::from_config(&cfg);
+        assert_eq!(rc.proto_max_bulk_len(), 1024);
+        rc.set_proto_max_bulk_len(2048);
+        assert_eq!(rc.proto_max_bulk_len(), 2048);
+        // The default seeds the Redis 512 MB ceiling.
+        let rc_default = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(
+            rc_default.proto_max_bulk_len(),
+            crate::DEFAULT_PROTO_MAX_BULK_LEN
+        );
+    }
+
+    #[test]
+    fn set_tcp_keepalive_round_trips() {
+        let cfg = Config {
+            tcp_keepalive_secs: 120,
+            ..Config::default()
+        };
+        let rc = RuntimeConfig::from_config(&cfg);
+        assert_eq!(rc.tcp_keepalive_secs(), 120);
+        rc.set_tcp_keepalive_secs(0);
+        assert_eq!(rc.tcp_keepalive_secs(), 0);
+        // The default seeds the Redis 300 s interval.
+        let rc_default = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(
+            rc_default.tcp_keepalive_secs(),
+            crate::DEFAULT_TCP_KEEPALIVE
+        );
+    }
+
+    #[test]
+    fn encoding_thresholds_seed_and_bump_generation() {
+        let rc = RuntimeConfig::from_config(&Config::default());
+        // Seeded from the compiled defaults (the byte-identical default deployment).
+        let t = rc.encoding_thresholds();
+        assert_eq!(t, EncodingThresholds::defaults());
+        // Setting a threshold bumps the generation so shards refresh their snapshot.
+        let g0 = rc.generation();
+        assert!(rc.set_encoding_threshold("hash-max-listpack-entries", 4));
+        assert_eq!(rc.generation(), g0 + 1);
+        assert_eq!(rc.encoding_thresholds().hash_max_listpack_entries, 4);
+        // The signed list form round-trips.
+        assert!(rc.set_encoding_threshold("list-max-listpack-size", -5));
+        assert_eq!(rc.encoding_thresholds().list_max_listpack_size, -5);
+        // An unrecognized threshold name does not bump the generation.
+        let g1 = rc.generation();
+        assert!(!rc.set_encoding_threshold("nonsense", 1));
+        assert_eq!(rc.generation(), g1);
+    }
+
+    #[test]
+    fn storage_defaults_match_config_defaults() {
+        // The storage waist's `EncodingThresholds::defaults()` uses literals (it cannot reference
+        // the config constants without a dependency cycle); assert they agree with the values a
+        // default `Config` resolves to, so the two single-sources can never silently drift.
+        assert_eq!(
+            EncodingThresholds::defaults(),
+            encoding_thresholds_from_config(&Config::default())
+        );
+    }
+
+    #[test]
+    fn encoding_thresholds_unlimited_never_converts() {
+        let u = EncodingThresholds::unlimited();
+        assert_eq!(u.hash_max_listpack_entries, usize::MAX);
+        assert_eq!(u.set_max_intset_entries, usize::MAX);
+        // The list budget resolves to the 64 KB tier with no entry cap.
+        assert_eq!(u.list_budget(), (64 * 1024, usize::MAX));
     }
 
     #[test]

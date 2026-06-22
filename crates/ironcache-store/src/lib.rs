@@ -56,9 +56,9 @@ use hashbrown::hash_map::Entry as WatchMapEntry;
 use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
 use ironcache_eviction::{EvictionPolicy, Policy, VictimStrategy, map_policy_name};
 use ironcache_storage::{
-    AccountingHook, CountingAccounting, DataType, EvictionHook, ExpireWrite, Keyspace, MoveMode,
-    MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut, RmwAction, RmwEntry,
-    RmwStep, ScanCursor, Store, UnixMillis, ValueRef, VictimFreq, WatchEntry,
+    AccountingHook, CountingAccounting, DataType, EncodingThresholds, EvictionHook, ExpireWrite,
+    Keyspace, MoveMode, MoveOutcome, NewValue, NullEviction, OccupiedEntry, OccupiedEntryMut,
+    RmwAction, RmwEntry, RmwStep, ScanCursor, Store, UnixMillis, ValueRef, VictimFreq, WatchEntry,
 };
 use std::hash::BuildHasher;
 
@@ -319,6 +319,17 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// primary and does not pre-empt the primary's expiry or double-count `expired_keys`.
     /// Default `false`; the only mutator is [`Self::set_passive`].
     passive: bool,
+    /// The LIVE collection-encoding thresholds snapshot (#40, the runtime `*-max-listpack-*` /
+    /// `set-max-intset-entries`). The store reads these at the encoding-transition decision (via the
+    /// typed `OccupiedEntryMut` it hands the closure, and when materializing a `RmwAction::Insert`
+    /// create-on-missing collection), so a `CONFIG SET` of a threshold reaches FUTURE inserts. A
+    /// plain `Copy` field (the shard is single-threaded, ADR-0002/0005: no lock/atomic per edit);
+    /// the dispatch refreshes it via [`Self::set_encoding_thresholds`] only when the runtime config
+    /// generation moves (the same per-command generation check the eviction-policy hot-swap rides),
+    /// so the per-edit cost at the default is a single `Copy` read, byte-identical to the prior
+    /// compiled-constant behavior. Default [`EncodingThresholds::defaults`] so a store built without
+    /// an explicit snapshot (every existing test fixture) behaves exactly as the compiled defaults.
+    encoding_thresholds: EncodingThresholds,
 }
 
 /// The data-plane WRITE OBSERVER (HA-5a): a background sink the per-shard store calls on
@@ -493,6 +504,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             repl_observer: None,
             repl_active: false,
             passive: false,
+            // The collection-encoding thresholds default to the compiled Redis defaults (#40), so a
+            // store built without an explicit snapshot is byte-identical to the pre-runtime-threshold
+            // behavior. The boot/serve path installs the live snapshot via `set_encoding_thresholds`.
+            encoding_thresholds: EncodingThresholds::defaults(),
         }
     }
 
@@ -1079,7 +1094,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                     ExpireWrite::Unchanged => old_deadline,
                     other => resolve_expire(other, old_deadline),
                 };
-                let obj = Entry::from_new_owned(key, v, new_deadline);
+                // Materialize the new value against the LIVE encoding thresholds (#40): a
+                // create-on-missing collection (e.g. RPUSH on a fresh key) respects a runtime
+                // `CONFIG SET *-max-listpack-*`. A `Copy` snapshot read; non-collection values ignore
+                // it. NOT a reconstruction (that path goes through KvObj::from_new_owned with the
+                // unlimited thresholds + a forced encoding), so the live thresholds are correct here.
+                let obj = Entry::from_new_owned(key, v, new_deadline, &self.encoding_thresholds);
                 // put_object fires the write observer (on_put post-image).
                 self.put_object(db, db_idx, key, obj);
             }
@@ -1141,6 +1161,11 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             0
         };
 
+        // Snapshot the LIVE encoding thresholds (#40) BEFORE the mutable entry borrow (a `Copy` of a
+        // disjoint field), so the typed collection view carries them into the conversion-deciding
+        // `*Value` methods the closure calls. Read once per rmw (cold relative to decode/dispatch);
+        // at the default this is the same compiled-default values the constants held.
+        let thresholds = self.encoding_thresholds;
         let step = if live {
             let obj = self.dbs[db_idx]
                 .find_mut(key_h, |e| e.key() == key)
@@ -1159,24 +1184,27 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // a Mutated return uses `Entry::is_empty_collection`, defined over the SAME
             // `collection_len` mapping (kvobj.rs), so the two sites cannot drift.
             //
+            // Each collection view also carries the live encoding thresholds (`with_thresholds`)
+            // so a mutating handler's conversion decision honors a `CONFIG SET *-max-listpack-*`.
+            //
             // The repr is matched ONCE (not via sequential `as_*_mut` borrows, which would
             // each take and drop a fresh `&mut` and obscure the dispatch) so each
             // collection type maps to exactly one arm.
             let entry = match obj.as_coll_val_mut() {
-                Some(kvobj::CollVal::List(l)) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::list(encoding, expire_at, l))
-                }
-                Some(kvobj::CollVal::Hash(h)) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::hash(encoding, expire_at, h))
-                }
-                Some(kvobj::CollVal::Set(s)) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::set(encoding, expire_at, s))
-                }
-                Some(kvobj::CollVal::ZSet(z)) => {
-                    RmwEntry::OccupiedMut(OccupiedEntryMut::zset(encoding, expire_at, z))
-                }
+                Some(kvobj::CollVal::List(l)) => RmwEntry::OccupiedMut(
+                    OccupiedEntryMut::list(encoding, expire_at, l).with_thresholds(thresholds),
+                ),
+                Some(kvobj::CollVal::Hash(h)) => RmwEntry::OccupiedMut(
+                    OccupiedEntryMut::hash(encoding, expire_at, h).with_thresholds(thresholds),
+                ),
+                Some(kvobj::CollVal::Set(s)) => RmwEntry::OccupiedMut(
+                    OccupiedEntryMut::set(encoding, expire_at, s).with_thresholds(thresholds),
+                ),
+                Some(kvobj::CollVal::ZSet(z)) => RmwEntry::OccupiedMut(
+                    OccupiedEntryMut::zset(encoding, expire_at, z).with_thresholds(thresholds),
+                ),
                 // A Str entry yields the non-collection arm (the handler's `as_*_mut`
-                // then returns None -> WRONGTYPE).
+                // then returns None -> WRONGTYPE). No conversion applies, so no thresholds.
                 None => RmwEntry::OccupiedMut(OccupiedEntryMut::non_collection(
                     data_type, encoding, expire_at,
                 )),
@@ -1220,7 +1248,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                     ExpireWrite::Unchanged => old_deadline,
                     other => resolve_expire(other, old_deadline),
                 };
-                let obj = Entry::from_new_owned(key, v, new_deadline);
+                // Materialize the new value against the LIVE encoding thresholds (#40): a
+                // create-on-missing collection (e.g. RPUSH on a fresh key) respects a runtime
+                // `CONFIG SET *-max-listpack-*`. A `Copy` snapshot read; non-collection values ignore
+                // it. NOT a reconstruction (that path goes through KvObj::from_new_owned with the
+                // unlimited thresholds + a forced encoding), so the live thresholds are correct here.
+                let obj = Entry::from_new_owned(key, v, new_deadline, &self.encoding_thresholds);
                 // put_object fires the write observer (on_put post-image).
                 self.put_object(db, db_idx, key, obj);
             }
@@ -1859,6 +1892,12 @@ impl<A: AccountingHook> ironcache_storage::PolicySwap for ShardStore<Policy, A> 
         }
         true
     }
+
+    fn apply_encoding_thresholds(&mut self, thresholds: EncodingThresholds) {
+        // Refresh the cached snapshot the encoding-transition decision reads (#40). A plain field
+        // write; existing keys keep their encoding (this only changes WHEN a future insert converts).
+        self.set_encoding_thresholds(thresholds);
+    }
 }
 
 impl<E: EvictionHook, A: AccountingHook> ironcache_storage::ActiveExpiry for ShardStore<E, A> {
@@ -2303,6 +2342,23 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     #[must_use]
     pub fn is_passive(&self) -> bool {
         self.passive
+    }
+
+    /// Install the LIVE collection-encoding thresholds snapshot (#40). The serve/dispatch layer
+    /// calls this with the runtime overlay's current [`EncodingThresholds`] when the runtime config
+    /// generation moves (the SAME per-command generation check the eviction-policy hot-swap rides),
+    /// so a `CONFIG SET *-max-listpack-*` reaches this shard's encoding-transition decision for
+    /// FUTURE inserts. A plain `&mut` field write on the single-threaded shard (ADR-0002/0005), off
+    /// the per-command hot path (only on a generation change). Existing keys are NOT re-encoded.
+    pub fn set_encoding_thresholds(&mut self, thresholds: EncodingThresholds) {
+        self.encoding_thresholds = thresholds;
+    }
+
+    /// The store's CURRENT collection-encoding thresholds snapshot (#40). Test/introspection helper;
+    /// the encoding-transition decision reads this `Copy` field directly.
+    #[must_use]
+    pub fn encoding_thresholds(&self) -> EncodingThresholds {
+        self.encoding_thresholds
     }
 
     /// Insert a fully-formed [`KvObj`] under `db`, bypassing the string-only

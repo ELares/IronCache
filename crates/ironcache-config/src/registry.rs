@@ -142,6 +142,23 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "output-buffer-limit",
             kind: SetKind::Runtime,
         },
+        // The inbound bulk-string + string-value-growth ceiling in bytes (Redis
+        // `proto-max-bulk-len`). RUNTIME-SETTABLE: `CONFIG SET proto-max-bulk-len <bytes>` updates
+        // the live ceiling the serve loop builds its decoder `Limits` from + the string/bitmap
+        // growth checks read; a human size ("512mb") or a plain byte count is accepted. `0` is
+        // rejected (a zero ceiling would reject every value).
+        ParamSpec {
+            name: "proto-max-bulk-len",
+            kind: SetKind::Runtime,
+        },
+        // The TCP keepalive idle interval in seconds applied at ACCEPT (Redis `tcp-keepalive`).
+        // RUNTIME-SETTABLE: `CONFIG SET tcp-keepalive <secs>` updates the live value the accept path
+        // reads, so it applies to NEWLY-accepted connections (existing connections keep the option
+        // set at their own accept time, matching Redis). `0` disables keepalive.
+        ParamSpec {
+            name: "tcp-keepalive",
+            kind: SetKind::Runtime,
+        },
         ParamSpec {
             name: "maxmemory-samples",
             kind: SetKind::AcceptedNoOp,
@@ -179,53 +196,43 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "appendonly",
             kind: SetKind::Unsupported,
         },
-        // The list listpack->quicklist threshold (PR-5, #40). Recognized + echoed for
-        // compatibility; the store reads its own resolved byte-budget default, and a
-        // runtime change is a follow-up (CONFIG.md "accepted and echoed").
+        // The 8 collection-encoding thresholds (#40). NOW RUNTIME-SETTABLE (were accepted-but-
+        // ignored no-ops that echoed the compiled default -- a lie): `CONFIG SET` updates the live
+        // value the store reads at the encoding-transition decision, and `CONFIG GET` reports the
+        // live value. A change affects FUTURE inserts only (existing keys keep their encoding,
+        // matching Redis). `list-max-listpack-size` takes the SIGNED Redis form (`-2` etc.); the
+        // rest are positive counts/byte caps.
         ParamSpec {
             name: "list-max-listpack-size",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
-        // The hash listpack->hashtable thresholds (PR-6, #40): entry-count cap (512)
-        // and per-element byte cap (64). Recognized + echoed for compatibility; the
-        // store reads its own resolved defaults, and a runtime change is a follow-up
-        // (CONFIG.md "accepted and echoed").
         ParamSpec {
             name: "hash-max-listpack-entries",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
         ParamSpec {
             name: "hash-max-listpack-value",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
-        // The set intset->listpack->hashtable thresholds (PR-7, #40): the all-integer
-        // intset entry cap (512), the listpack entry cap (128), and the listpack
-        // per-member byte cap (64). Recognized + echoed for compatibility; the store
-        // reads its own resolved defaults, and a runtime change is a follow-up
-        // (CONFIG.md "accepted and echoed").
         ParamSpec {
             name: "set-max-intset-entries",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
         ParamSpec {
             name: "set-max-listpack-entries",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
         ParamSpec {
             name: "set-max-listpack-value",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
-        // The zset listpack->skiplist thresholds (PR-8, #40): the listpack entry cap
-        // (128) and the listpack per-member byte cap (64). Recognized + echoed for
-        // compatibility; the store reads its own resolved defaults, and a runtime change
-        // is a follow-up (CONFIG.md "accepted and echoed").
         ParamSpec {
             name: "zset-max-listpack-entries",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
         ParamSpec {
             name: "zset-max-listpack-value",
-            kind: SetKind::AcceptedNoOp,
+            kind: SetKind::Runtime,
         },
         // bind/port are MODIFIABLE_CONFIG in Redis (accepted at runtime), but IronCache
         // reports them restart-required as a DELIBERATE DIVERGENCE: the thread-per-core
@@ -300,6 +307,11 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // timeout` is reflected. `0` means idle disconnection is disabled.
         "timeout" => runtime.timeout_secs().to_string(),
         "output-buffer-limit" => runtime.output_buffer_limit().to_string(),
+        // The protocol / keepalive ceilings: read the overlay so a `CONFIG SET` is reflected.
+        // `proto-max-bulk-len` is reported as a byte count (the form CONFIG SET accepts back);
+        // `tcp-keepalive` is seconds (`0` = disabled).
+        "proto-max-bulk-len" => runtime.proto_max_bulk_len().to_string(),
+        "tcp-keepalive" => runtime.tcp_keepalive_secs().to_string(),
         // The SLOWLOG knobs (PROD-7): read the overlay so a `CONFIG SET slowlog-*` is reflected.
         "slowlog-log-slower-than" => runtime.slowlog_log_slower_than().to_string(),
         "slowlog-max-len" => runtime.slowlog_max_len().to_string(),
@@ -318,23 +330,42 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         }
         // `appendonly` is always `no`: IronCache has no AOF (it persists via snapshots).
         "appendonly" => "no".to_owned(),
-        // The list listpack->quicklist threshold: echo the Redis `-2` default
-        // spelling ("8 KB per node"); the store works in the resolved byte budget.
-        "list-max-listpack-size" => crate::LIST_MAX_LISTPACK_SIZE_REDIS_DEFAULT.to_owned(),
-        // The hash listpack->hashtable thresholds: echo the pinned defaults (512
-        // entries, 64 bytes per element); the store reads these resolved defaults.
-        "hash-max-listpack-entries" => crate::DEFAULT_HASH_MAX_LISTPACK_ENTRIES.to_string(),
-        "hash-max-listpack-value" => crate::DEFAULT_HASH_MAX_LISTPACK_VALUE.to_string(),
-        // The set encoding-ladder thresholds: echo the pinned defaults (intset 512,
-        // listpack 128 entries, 64 bytes per member); the store reads these resolved
-        // defaults.
-        "set-max-intset-entries" => crate::DEFAULT_SET_MAX_INTSET_ENTRIES.to_string(),
-        "set-max-listpack-entries" => crate::DEFAULT_SET_MAX_LISTPACK_ENTRIES.to_string(),
-        "set-max-listpack-value" => crate::DEFAULT_SET_MAX_LISTPACK_VALUE.to_string(),
-        // The zset listpack->skiplist thresholds: echo the pinned defaults (128 entries,
-        // 64 bytes per member); the store reads these resolved defaults (PR-8).
-        "zset-max-listpack-entries" => crate::DEFAULT_ZSET_MAX_LISTPACK_ENTRIES.to_string(),
-        "zset-max-listpack-value" => crate::DEFAULT_ZSET_MAX_LISTPACK_VALUE.to_string(),
+        // The 8 collection-encoding thresholds: read the LIVE overlay so a `CONFIG SET` is
+        // reflected (was a lie -- the compiled default was echoed regardless of any set). The store
+        // reads the SAME live values at the encoding-transition decision. `list-max-listpack-size`
+        // reports the SIGNED Redis form (`-2` etc.).
+        "list-max-listpack-size" => runtime
+            .encoding_thresholds()
+            .list_max_listpack_size
+            .to_string(),
+        "hash-max-listpack-entries" => runtime
+            .encoding_thresholds()
+            .hash_max_listpack_entries
+            .to_string(),
+        "hash-max-listpack-value" => runtime
+            .encoding_thresholds()
+            .hash_max_listpack_value
+            .to_string(),
+        "set-max-intset-entries" => runtime
+            .encoding_thresholds()
+            .set_max_intset_entries
+            .to_string(),
+        "set-max-listpack-entries" => runtime
+            .encoding_thresholds()
+            .set_max_listpack_entries
+            .to_string(),
+        "set-max-listpack-value" => runtime
+            .encoding_thresholds()
+            .set_max_listpack_value
+            .to_string(),
+        "zset-max-listpack-entries" => runtime
+            .encoding_thresholds()
+            .zset_max_listpack_entries
+            .to_string(),
+        "zset-max-listpack-value" => runtime
+            .encoding_thresholds()
+            .zset_max_listpack_value
+            .to_string(),
         // Restart-required: read the boot config (these never change at runtime).
         "bind" => boot.bind.to_string(),
         "port" => boot.port.to_string(),
@@ -409,6 +440,7 @@ fn unsupported_reason(name: &str) -> String {
 
 /// Apply a runtime-settable param to the overlay. Split out so the per-param
 /// validation + overlay mutation lives in one place.
+#[allow(clippy::too_many_lines)] // one match arm per runtime-settable param; grows by design as params land.
 fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOutcome {
     match name {
         "maxmemory" => match parse_human_size(value) {
@@ -522,9 +554,98 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
                 "Invalid argument '{bad}' for CONFIG SET 'notify-keyspace-events'"
             )),
         },
+        // The protocol bulk-string + string-growth ceiling (Redis `proto-max-bulk-len`): a byte
+        // count accepted as a human size ("512mb") OR a plain integer. `0` is rejected (a zero
+        // ceiling would reject every value); a malformed value is rejected.
+        "proto-max-bulk-len" => match crate::parse_human_size(value) {
+            Ok(0) => {
+                SetOutcome::InvalidValue("proto-max-bulk-len must be greater than 0".to_owned())
+            }
+            Ok(bytes) => {
+                runtime.set_proto_max_bulk_len(bytes);
+                SetOutcome::Applied
+            }
+            Err(e) => SetOutcome::InvalidValue(e.to_string()),
+        },
+        // The TCP keepalive idle interval in seconds (Redis `tcp-keepalive`): a plain non-negative
+        // integer; `0` disables keepalive. A negative / non-numeric value is rejected.
+        "tcp-keepalive" => match value.parse::<u64>() {
+            Ok(secs) => {
+                runtime.set_tcp_keepalive_secs(secs);
+                SetOutcome::Applied
+            }
+            Err(_) => SetOutcome::InvalidValue(format!("'{value}' is not a valid tcp-keepalive")),
+        },
+        // The 8 collection-encoding thresholds (#40): NOW live (were accepted-but-ignored). A change
+        // affects FUTURE inserts only; existing keys keep their encoding (Redis parity). The
+        // `list-max-listpack-size` directive takes the SIGNED Redis form (a negative `-1..-5` byte
+        // tier OR a positive element count); the rest are POSITIVE integers (entry counts / byte
+        // caps). A garbage / out-of-range value is rejected as an invalid value, never silently
+        // ignored.
+        "list-max-listpack-size" => apply_encoding_threshold(name, value, runtime, true),
+        "hash-max-listpack-entries"
+        | "hash-max-listpack-value"
+        | "set-max-intset-entries"
+        | "set-max-listpack-entries"
+        | "set-max-listpack-value"
+        | "zset-max-listpack-entries"
+        | "zset-max-listpack-value" => apply_encoding_threshold(name, value, runtime, false),
         // Defensive: any future Runtime param must add a branch here. An unhandled Runtime name is a
         // programming error, surfaced as an invalid value rather than a silent success.
         other => SetOutcome::InvalidValue(format!("no runtime setter for '{other}'")),
+    }
+}
+
+/// Apply a `CONFIG SET` to one of the 8 collection-encoding thresholds (#40). `allow_signed` is
+/// `true` ONLY for `list-max-listpack-size`, which takes the signed Redis form (a `-1..-5` byte
+/// tier OR a positive element count); every other threshold is a POSITIVE integer (a zero or
+/// negative count/byte cap is meaningless and rejected, matching Redis's per-param bounds). On a
+/// valid value it stores the threshold and bumps the runtime generation (so each shard refreshes
+/// its cached snapshot on its next command); an unrecognized name is a programming error surfaced
+/// as an invalid value.
+fn apply_encoding_threshold(
+    name: &str,
+    value: &str,
+    runtime: &RuntimeConfig,
+    allow_signed: bool,
+) -> SetOutcome {
+    let parsed = if allow_signed {
+        // `list-max-listpack-size`: the documented Redis domain only. A negative is a byte tier
+        // (`-1..-5`, i.e. 4KB..64KB); a non-negative is an element count (`0` falls back to the
+        // `-2` default at the store, as Redis does). An out-of-tier negative (`-6` and below) is
+        // rejected to match Redis, rather than silently clamping to the default. Non-integer is
+        // garbage.
+        match value.parse::<i64>() {
+            Ok(n) if n >= 0 || (-5..=-1).contains(&n) => n,
+            Ok(_) => {
+                return SetOutcome::InvalidValue(format!(
+                    "'{value}' is not a valid {name} (a positive element count, or a -1..-5 size tier)"
+                ));
+            }
+            Err(_) => {
+                return SetOutcome::InvalidValue(format!("'{value}' is not a valid {name}"));
+            }
+        }
+    } else {
+        // A positive integer threshold: `0`/negative is rejected (a zero cap would convert every
+        // collection immediately on the first element, which Redis does not do; its minimum is 1).
+        match value.parse::<i64>() {
+            Ok(n) if n >= 1 => n,
+            Ok(_) => {
+                return SetOutcome::InvalidValue(format!(
+                    "'{value}' is not a valid {name} (must be a positive integer)"
+                ));
+            }
+            Err(_) => {
+                return SetOutcome::InvalidValue(format!("'{value}' is not a valid {name}"));
+            }
+        }
+    };
+    if runtime.set_encoding_threshold(name, parsed) {
+        SetOutcome::Applied
+    } else {
+        // Defensive: the dispatch above only routes the 8 known names here.
+        SetOutcome::InvalidValue(format!("no encoding-threshold setter for '{name}'"))
     }
 }
 
@@ -780,6 +901,154 @@ mod tests {
         ));
         // A rejected SET leaves the prior value untouched (the last accepted SET was 0).
         assert_eq!(rc.timeout_secs(), 0);
+    }
+
+    /// Area B: `proto-max-bulk-len` is RUNTIME-SETTABLE. GET reports the live value; SET accepts a
+    /// human size or a plain byte count; `0` and garbage are rejected (never a silent accept).
+    #[test]
+    fn apply_set_proto_max_bulk_len_is_runtime_settable() {
+        let cfg = boot();
+        let rc = RuntimeConfig::from_config(&cfg);
+        // GET reports the seeded default (512 MB).
+        assert_eq!(
+            effective_value("proto-max-bulk-len", &rc, &cfg).as_deref(),
+            Some((512 * 1024 * 1024).to_string().as_str())
+        );
+        // SET a human size, GET reflects it as bytes.
+        assert_eq!(
+            apply_set("proto-max-bulk-len", "1mb", &rc),
+            SetOutcome::Applied
+        );
+        assert_eq!(rc.proto_max_bulk_len(), 1024 * 1024);
+        assert_eq!(
+            effective_value("proto-max-bulk-len", &rc, &cfg).as_deref(),
+            Some((1024 * 1024).to_string().as_str())
+        );
+        // SET a plain byte count.
+        assert_eq!(
+            apply_set("proto-max-bulk-len", "4096", &rc),
+            SetOutcome::Applied
+        );
+        assert_eq!(rc.proto_max_bulk_len(), 4096);
+        // `0` is rejected (a zero ceiling would reject every value).
+        assert!(matches!(
+            apply_set("proto-max-bulk-len", "0", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        // Garbage is rejected; the prior value is untouched.
+        assert!(matches!(
+            apply_set("proto-max-bulk-len", "huge", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        assert_eq!(rc.proto_max_bulk_len(), 4096);
+        assert!(lookup("PROTO-MAX-BULK-LEN").is_some());
+    }
+
+    /// Area C: `tcp-keepalive` is RUNTIME-SETTABLE. GET reports the live value; SET accepts a
+    /// non-negative integer (`0` disables); negative / non-numeric is rejected.
+    #[test]
+    fn apply_set_tcp_keepalive_is_runtime_settable() {
+        let cfg = boot();
+        let rc = RuntimeConfig::from_config(&cfg);
+        // GET reports the seeded default (300 s).
+        assert_eq!(
+            effective_value("tcp-keepalive", &rc, &cfg).as_deref(),
+            Some("300")
+        );
+        assert_eq!(apply_set("tcp-keepalive", "60", &rc), SetOutcome::Applied);
+        assert_eq!(rc.tcp_keepalive_secs(), 60);
+        assert_eq!(
+            effective_value("tcp-keepalive", &rc, &cfg).as_deref(),
+            Some("60")
+        );
+        // `0` disables keepalive (accepted).
+        assert_eq!(apply_set("tcp-keepalive", "0", &rc), SetOutcome::Applied);
+        assert_eq!(rc.tcp_keepalive_secs(), 0);
+        // Negative / non-numeric is rejected.
+        assert!(matches!(
+            apply_set("tcp-keepalive", "-1", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        assert!(matches!(
+            apply_set("tcp-keepalive", "abc", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        assert_eq!(rc.tcp_keepalive_secs(), 0);
+    }
+
+    /// Area A: the 8 collection-encoding thresholds are RUNTIME-SETTABLE (were accepted-but-ignored
+    /// no-ops). GET reports the LIVE value; SET valid updates it (and the store snapshot via the
+    /// generation bump); SET invalid (zero/negative for a count cap, garbage) is rejected.
+    #[test]
+    fn apply_set_encoding_thresholds_are_runtime_settable() {
+        let cfg = boot();
+        let rc = RuntimeConfig::from_config(&cfg);
+        // The positive count/byte-cap thresholds: GET the default, SET lower, GET reflects it.
+        for (name, default) in [
+            ("hash-max-listpack-entries", "512"),
+            ("hash-max-listpack-value", "64"),
+            ("set-max-intset-entries", "512"),
+            ("set-max-listpack-entries", "128"),
+            ("set-max-listpack-value", "64"),
+            ("zset-max-listpack-entries", "128"),
+            ("zset-max-listpack-value", "64"),
+        ] {
+            assert_eq!(
+                effective_value(name, &rc, &cfg).as_deref(),
+                Some(default),
+                "GET {name} should report the seeded default"
+            );
+            assert_eq!(apply_set(name, "7", &rc), SetOutcome::Applied, "SET {name}");
+            assert_eq!(
+                effective_value(name, &rc, &cfg).as_deref(),
+                Some("7"),
+                "GET {name} should reflect the SET value"
+            );
+            // Zero is rejected for a count/byte cap (Redis minimum is 1).
+            assert!(
+                matches!(apply_set(name, "0", &rc), SetOutcome::InvalidValue(_)),
+                "SET {name} 0 should be rejected"
+            );
+            // Negative is rejected.
+            assert!(
+                matches!(apply_set(name, "-3", &rc), SetOutcome::InvalidValue(_)),
+                "SET {name} -3 should be rejected"
+            );
+            // Garbage is rejected.
+            assert!(
+                matches!(apply_set(name, "x", &rc), SetOutcome::InvalidValue(_)),
+                "SET {name} x should be rejected"
+            );
+            // The prior accepted value (7) survives the rejected sets.
+            assert_eq!(effective_value(name, &rc, &cfg).as_deref(), Some("7"));
+        }
+        // `list-max-listpack-size` takes the SIGNED Redis form: default `-2`, a negative tier or a
+        // positive count is accepted, garbage rejected.
+        assert_eq!(
+            effective_value("list-max-listpack-size", &rc, &cfg).as_deref(),
+            Some("-2")
+        );
+        assert_eq!(
+            apply_set("list-max-listpack-size", "-5", &rc),
+            SetOutcome::Applied
+        );
+        assert_eq!(
+            effective_value("list-max-listpack-size", &rc, &cfg).as_deref(),
+            Some("-5")
+        );
+        assert_eq!(
+            apply_set("list-max-listpack-size", "128", &rc),
+            SetOutcome::Applied
+        );
+        assert_eq!(
+            effective_value("list-max-listpack-size", &rc, &cfg).as_deref(),
+            Some("128")
+        );
+        assert!(matches!(
+            apply_set("list-max-listpack-size", "junk", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        assert!(lookup("HASH-MAX-LISTPACK-ENTRIES").is_some());
     }
 
     /// #58 durability footgun fix: `appendonly` is UNSUPPORTED -- `CONFIG SET appendonly yes` is

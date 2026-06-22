@@ -121,6 +121,30 @@ pub fn bind_reuseport_std(addr: SocketAddr) -> io::Result<std::net::TcpListener>
     Ok(socket.into())
 }
 
+/// Apply `SO_KEEPALIVE` with `secs` idle time to a tokio [`TcpStream`] at ACCEPT (Redis
+/// `tcp-keepalive`). `secs == 0` DISABLES keepalive (the option is left off). This borrows the
+/// stream's fd via [`socket2::SockRef`] WITHOUT taking ownership (no fd dance / `unsafe`), so the
+/// tokio stream remains the sole owner. Errors are ignored to match the `set_nodelay` posture (a
+/// connection still functions without the keepalive probe); a failure is non-fatal and merely means
+/// a dead peer is not actively reaped on this connection.
+///
+/// The keepalive RETRY count / interval are left at the OS defaults (Redis sets only the idle time
+/// portably; the retry tuning is platform-specific). This is read from the runtime overlay AT
+/// ACCEPT, so a `CONFIG SET tcp-keepalive` applies to newly-accepted connections (an established
+/// connection keeps the option it was accepted with, matching Redis).
+pub fn set_keepalive(stream: &TcpStream, secs: u64) {
+    let sock = socket2::SockRef::from(stream);
+    if secs == 0 {
+        let _ = sock.set_keepalive(false);
+        return;
+    }
+    let _ = sock.set_keepalive(true);
+    // The idle time before the first keepalive probe. socket2 handles any platform-specific
+    // clamping of the duration; best-effort (errors are ignored, like the other socket opts).
+    let idle = Duration::from_secs(secs);
+    let _ = sock.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(idle));
+}
+
 /// Bind a tokio TCP listener with `SO_REUSEPORT` so every shard can bind the same
 /// address and the kernel load-balances accepts across them (RUNTIME.md
 /// per-shard accept). MUST be called inside a tokio runtime (it registers the
@@ -166,6 +190,37 @@ mod tests {
             // Binding the same concrete addr again must succeed under SO_REUSEPORT.
             let l2 = bind_reuseport(addr);
             assert!(l2.is_ok(), "SO_REUSEPORT second bind failed: {l2:?}");
+        });
+    }
+
+    /// Area C: `set_keepalive` enables SO_KEEPALIVE with a non-zero idle time and DISABLES it with
+    /// `0`, applied on an accepted loopback stream. Asserts the kernel option state via the same
+    /// `socket2::SockRef` borrow (non-flaky, no timing). Mirrors how the serve loop applies it at
+    /// accept; the per-platform retry/interval tuning is left at OS defaults so only the on/off +
+    /// idle-time portion is asserted.
+    #[test]
+    fn set_keepalive_enables_and_disables_on_accepted_stream() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let _client = TcpStream::connect(addr).await.unwrap();
+            let (server, _peer) = listener.accept().await.unwrap();
+            // A non-zero interval turns keepalive ON.
+            set_keepalive(&server, 120);
+            let sock = socket2::SockRef::from(&server);
+            assert_eq!(sock.keepalive().ok(), Some(true), "keepalive should be ON");
+            // `0` turns it OFF.
+            set_keepalive(&server, 0);
+            let sock = socket2::SockRef::from(&server);
+            assert_eq!(
+                sock.keepalive().ok(),
+                Some(false),
+                "keepalive should be OFF"
+            );
         });
     }
 }

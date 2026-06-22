@@ -109,14 +109,15 @@ fn push_generic<S: Store>(
             }
         }
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(list) = o.as_list_mut() else {
                 return wrong_type();
             };
             for e in &elems {
                 if front {
-                    list.push_front(e);
+                    list.push_front(e, &th);
                 } else {
-                    list.push_back(e);
+                    list.push_back(e, &th);
                 }
             }
             let len = list.len() as i64;
@@ -441,10 +442,11 @@ pub fn cmd_lset<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
         // LSET on a missing key is `-ERR no such key` (NOT a create).
         RmwEntry::Vacant => keep(Value::error(ErrorReply::no_such_key())),
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(list) = o.as_list_mut() else {
                 return wrong_type();
             };
-            if list.set(index, &element) {
+            if list.set(index, &element, &th) {
                 RmwStep {
                     action: RmwAction::Mutated,
                     expire: ExpireWrite::Unchanged,
@@ -476,13 +478,14 @@ pub fn cmd_linsert<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         // LINSERT on a missing key returns 0 (no create).
         RmwEntry::Vacant => keep(Value::Integer(0)),
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(list) = o.as_list_mut() else {
                 return wrong_type();
             };
             let result = if before {
-                list.insert_before(&pivot, &element)
+                list.insert_before(&pivot, &element, &th)
             } else {
-                list.insert_after(&pivot, &element)
+                list.insert_after(&pivot, &element, &th)
             };
             match result {
                 Some(len) => RmwStep {
@@ -646,6 +649,7 @@ fn rotate_in_place<S: Store>(
     store.rmw_mut(db, key, now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Null),
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(list) = o.as_list_mut() else {
                 return wrong_type();
             };
@@ -660,9 +664,9 @@ fn rotate_in_place<S: Store>(
                 return keep(Value::Null);
             };
             if to_left {
-                list.push_front(&elem);
+                list.push_front(&elem, &th);
             } else {
-                list.push_back(&elem);
+                list.push_back(&elem, &th);
             }
             RmwStep {
                 action: RmwAction::Mutated,
@@ -743,11 +747,12 @@ fn push_one_to_end<S: Store>(
             reply: (),
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             if let Some(list) = o.as_list_mut() {
                 if to_left {
-                    list.push_front(&push_elem);
+                    list.push_front(&push_elem, &th);
                 } else {
-                    list.push_back(&push_elem);
+                    list.push_back(&push_elem, &th);
                 }
             }
             RmwStep {

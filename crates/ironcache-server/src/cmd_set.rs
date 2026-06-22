@@ -135,12 +135,13 @@ pub fn cmd_sadd<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
             }
         }
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(set) = o.as_set_mut() else {
                 return wrong_type();
             };
             let mut added: i64 = 0;
             for m in &members {
-                if set.add(m) {
+                if set.add(m, &th) {
                     added += 1;
                 }
             }
@@ -536,8 +537,9 @@ pub fn cmd_smove<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
             reply: (),
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             if let Some(set) = o.as_set_mut() {
-                set.add(&m2);
+                set.add(&m2, &th);
             }
             RmwStep {
                 action: RmwAction::Mutated,
