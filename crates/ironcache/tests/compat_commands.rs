@@ -273,3 +273,118 @@ fn config_set_get_timeout_round_trips_over_the_wire() {
         );
     });
 }
+
+/// Area C: `CONFIG SET tcp-keepalive` / `CONFIG GET tcp-keepalive` over the wire. Proves the
+/// registry plumbing + wire round-trip (the LIVE accept-path SO_KEEPALIVE application is covered by
+/// the runtime-crate `set_keepalive` unit test + the serve-loop self-review). `0` disables it; a
+/// negative / non-numeric value is rejected.
+#[test]
+fn config_set_get_tcp_keepalive_round_trips_over_the_wire() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+        // Default boot value is the Redis 300 s.
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "tcp-keepalive"]).await,
+            "*2\r\n$13\r\ntcp-keepalive\r\n$3\r\n300\r\n"
+        );
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "SET", "tcp-keepalive", "60"]).await,
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "tcp-keepalive"]).await,
+            "*2\r\n$13\r\ntcp-keepalive\r\n$2\r\n60\r\n"
+        );
+        // `0` disables keepalive (accepted).
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "SET", "tcp-keepalive", "0"]).await,
+            "+OK\r\n"
+        );
+        let neg = cmd(&mut c, &["CONFIG", "SET", "tcp-keepalive", "-1"]).await;
+        assert!(neg.starts_with("-ERR"), "expected error, got {neg}");
+        let bad = cmd(&mut c, &["CONFIG", "SET", "tcp-keepalive", "x"]).await;
+        assert!(bad.starts_with("-ERR"), "expected error, got {bad}");
+    });
+}
+
+/// Area B: `CONFIG SET proto-max-bulk-len` / `CONFIG GET proto-max-bulk-len` over the wire. Reports
+/// the live byte count; accepts a human size or a plain integer; `0` and garbage are rejected.
+#[test]
+fn config_set_get_proto_max_bulk_len_round_trips_over_the_wire() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+        // Default boot value is the Redis 512 MB (536870912 bytes).
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "proto-max-bulk-len"]).await,
+            "*2\r\n$18\r\nproto-max-bulk-len\r\n$9\r\n536870912\r\n"
+        );
+        // SET a human size, GET reflects it as bytes.
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "SET", "proto-max-bulk-len", "1mb"]).await,
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "proto-max-bulk-len"]).await,
+            "*2\r\n$18\r\nproto-max-bulk-len\r\n$7\r\n1048576\r\n"
+        );
+        // `0` is rejected (a zero ceiling would reject every value); garbage is rejected.
+        let zero = cmd(&mut c, &["CONFIG", "SET", "proto-max-bulk-len", "0"]).await;
+        assert!(zero.starts_with("-ERR"), "expected error, got {zero}");
+        let bad = cmd(&mut c, &["CONFIG", "SET", "proto-max-bulk-len", "huge"]).await;
+        assert!(bad.starts_with("-ERR"), "expected error, got {bad}");
+    });
+}
+
+/// Area A (the headline behavior): `CONFIG SET hash-max-listpack-entries 4` then creating a NEW
+/// hash with five fields stores it as `hashtable` (verified via `OBJECT ENCODING`), while a hash
+/// created BEFORE the change keeps its `listpack` encoding (a CONFIG SET is future-only -- existing
+/// keys are never re-encoded). This is the end-to-end proof that the threshold is now LIVE (was an
+/// accepted-but-ignored no-op).
+#[test]
+fn config_set_hash_listpack_entries_changes_new_hash_encoding_over_the_wire() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // An EXISTING small hash under the default 512-entry cap: listpack.
+        for i in 0..5 {
+            cmd(&mut c, &["HSET", "existing", &format!("f{i}"), "v"]).await;
+        }
+        assert_eq!(
+            cmd(&mut c, &["OBJECT", "ENCODING", "existing"]).await,
+            "$8\r\nlistpack\r\n"
+        );
+
+        // Lower the live cap to 4 entries.
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "SET", "hash-max-listpack-entries", "4"]).await,
+            "+OK\r\n"
+        );
+        // GET reflects the live value (was a lie before: it echoed the compiled 512).
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "hash-max-listpack-entries"]).await,
+            "*2\r\n$25\r\nhash-max-listpack-entries\r\n$1\r\n4\r\n"
+        );
+        // The EXISTING hash is NOT re-encoded by the CONFIG SET (future-only).
+        assert_eq!(
+            cmd(&mut c, &["OBJECT", "ENCODING", "existing"]).await,
+            "$8\r\nlistpack\r\n"
+        );
+        // A NEW hash with 5 fields under the lowered cap -> hashtable (5 > 4).
+        for i in 0..5 {
+            cmd(&mut c, &["HSET", "fresh", &format!("f{i}"), "v"]).await;
+        }
+        assert_eq!(
+            cmd(&mut c, &["OBJECT", "ENCODING", "fresh"]).await,
+            "$9\r\nhashtable\r\n"
+        );
+    });
+}

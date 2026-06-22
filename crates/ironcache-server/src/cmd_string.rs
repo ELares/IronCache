@@ -110,9 +110,16 @@ pub fn cmd_substr<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
 ///   0 and creates nothing).
 /// - Otherwise the value is created/extended (zero-padded up to `offset`), the bytes are
 ///   overwritten, and the new length is returned. The TTL is preserved (Redis SETRANGE
-///   does not touch the expire). WRONGTYPE on a non-string. The result is capped at
-///   `proto-max-bulk-len` (512 MB), matching Redis `checkStringLength`.
-pub fn cmd_setrange<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+///   does not touch the expire). WRONGTYPE on a non-string. The result is capped at the LIVE
+///   `proto-max-bulk-len` (`max_bulk_len`, default 512 MB, runtime-settable), matching Redis
+///   `checkStringLength`.
+pub fn cmd_setrange<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    max_bulk_len: usize,
+) -> Value {
     if req.args.len() != 4 {
         return Value::error(ErrorReply::wrong_arity("setrange"));
     }
@@ -149,7 +156,7 @@ pub fn cmd_setrange<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Req
         // exceed proto-max-bulk-len (Redis checkStringLength), before allocating.
         let end = offset.saturating_add(value.len());
         let new_len = current.len().max(end);
-        if new_len > PROTO_MAX_BULK_LEN {
+        if new_len > max_bulk_len {
             return keep_err(ErrorReply::string_exceeds_max());
         }
         // Build the new value: the prefix (old bytes, zero-padded up to offset), then the
@@ -850,26 +857,42 @@ pub fn cmd_incrbyfloat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &
 /// documented value-internal-mutation extension to the waist (STORAGE_API.md notes
 /// the "APPEND/SETRANGE efficiency path" as the additive `RmwAction` follow-up); it
 /// is intentionally NOT done here.
-/// The `proto-max-bulk-len` string ceiling (512 MB, the Redis default). A single
-/// string value may not exceed this; the only command that can grow a value
-/// unboundedly is APPEND, which is capped here exactly like Redis `checkStringLength`
-/// (src/t_string.c). This ALSO keeps every value below 4 GiB, which the store's manual
-/// Str-blob allocator depends on (its u32 length prefix must not truncate). Mirrors the
-/// bitmap module's `PROTO_MAX_BIT_OFFSET`, which derives the same 512 MB ceiling.
+/// The DEFAULT `proto-max-bulk-len` string ceiling (512 MB, the Redis default). A single
+/// string value may not exceed this; the only commands that can grow a value are APPEND /
+/// SETRANGE, capped exactly like Redis `checkStringLength` (src/t_string.c). The LIVE
+/// ceiling is RUNTIME-SETTABLE (`CONFIG SET proto-max-bulk-len`): the dispatch reads
+/// `ctx.runtime.proto_max_bulk_len()` and threads it into the handlers as `max_bulk_len`.
+/// This default keeps every value below 4 GiB, which the store's manual Str-blob allocator
+/// depends on (its u32 length prefix must not truncate); a `CONFIG SET` cannot exceed the
+/// decoder Limits the same connection was built with, which is itself bounded. Mirrors the
+/// bitmap module's `PROTO_MAX_BIT_OFFSET`, which derives the same 512 MB default ceiling.
+/// Kept as the test-side pin of the default (the live value is sourced from
+/// `ironcache_config::DEFAULT_PROTO_MAX_BULK_LEN`, threaded in as `max_bulk_len`).
+#[cfg(test)]
 pub(crate) const PROTO_MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 
 /// Whether an APPEND of `suffix_len` bytes onto an `old_len`-byte string would exceed
-/// the `proto-max-bulk-len` ceiling (Redis `checkStringLength`: reject when the RESULT
-/// would be larger). `checked_add` treats a `usize` overflow as "exceeds" (defensive;
-/// unreachable for real values bounded by the per-bulk decode limit).
+/// the LIVE `proto-max-bulk-len` ceiling `max_bulk_len` (Redis `checkStringLength`: reject
+/// when the RESULT would be larger). `checked_add` treats a `usize` overflow as "exceeds"
+/// (defensive; unreachable for real values bounded by the per-bulk decode limit).
 #[must_use]
-pub(crate) fn append_would_exceed_max(old_len: usize, suffix_len: usize) -> bool {
+pub(crate) fn append_would_exceed_max(
+    old_len: usize,
+    suffix_len: usize,
+    max_bulk_len: usize,
+) -> bool {
     old_len
         .checked_add(suffix_len)
-        .is_none_or(|total| total > PROTO_MAX_BULK_LEN)
+        .is_none_or(|total| total > max_bulk_len)
 }
 
-pub fn cmd_append<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+pub fn cmd_append<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    max_bulk_len: usize,
+) -> Value {
     if req.args.len() != 3 {
         return Value::error(ErrorReply::wrong_arity("append"));
     }
@@ -898,7 +921,7 @@ pub fn cmd_append<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
             // exceed proto-max-bulk-len, exactly like Redis checkStringLength. This
             // both matches Redis and keeps the value below the store's 4 GiB blob
             // limit; no write occurs.
-            if append_would_exceed_max(old.len(), suffix.len()) {
+            if append_would_exceed_max(old.len(), suffix.len(), max_bulk_len) {
                 return keep_err(ErrorReply::string_exceeds_max());
             }
             let mut combined = Vec::with_capacity(old.len() + suffix.len());
@@ -924,14 +947,34 @@ mod tests {
     fn append_ceiling_matches_proto_max_bulk_len() {
         // Exactly at the ceiling is allowed; one byte over is rejected (Redis
         // checkStringLength rejects when the RESULT would EXCEED the limit).
-        assert!(!append_would_exceed_max(PROTO_MAX_BULK_LEN, 0));
-        assert!(!append_would_exceed_max(PROTO_MAX_BULK_LEN - 1, 1));
-        assert!(append_would_exceed_max(PROTO_MAX_BULK_LEN, 1));
-        assert!(append_would_exceed_max(PROTO_MAX_BULK_LEN - 1, 2));
-        // A small append onto a small value is never rejected.
-        assert!(!append_would_exceed_max(0, 0));
-        assert!(!append_would_exceed_max(10, 10));
+        assert!(!append_would_exceed_max(
+            PROTO_MAX_BULK_LEN,
+            0,
+            PROTO_MAX_BULK_LEN
+        ));
+        assert!(!append_would_exceed_max(
+            PROTO_MAX_BULK_LEN - 1,
+            1,
+            PROTO_MAX_BULK_LEN
+        ));
+        assert!(append_would_exceed_max(
+            PROTO_MAX_BULK_LEN,
+            1,
+            PROTO_MAX_BULK_LEN
+        ));
+        assert!(append_would_exceed_max(
+            PROTO_MAX_BULK_LEN - 1,
+            2,
+            PROTO_MAX_BULK_LEN
+        ));
+        // A small append onto a small value is never rejected (under the default ceiling).
+        assert!(!append_would_exceed_max(0, 0, PROTO_MAX_BULK_LEN));
+        assert!(!append_would_exceed_max(10, 10, PROTO_MAX_BULK_LEN));
         // A usize-overflowing pair is treated as "exceeds" (defensive, unreachable).
-        assert!(append_would_exceed_max(usize::MAX, 1));
+        assert!(append_would_exceed_max(usize::MAX, 1, PROTO_MAX_BULK_LEN));
+        // A LOWERED ceiling (Area B `CONFIG SET proto-max-bulk-len`) rejects past the new bound:
+        // an append that fit under 512 MB now fails under a 16-byte ceiling.
+        assert!(!append_would_exceed_max(8, 8, 16));
+        assert!(append_would_exceed_max(8, 9, 16));
     }
 }

@@ -50,8 +50,9 @@ fn hset(store: &mut ShardStore, key: &[u8], field: &[u8], value: &[u8]) -> bool 
             reply: true,
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let hash = o.as_hash_mut().expect("hash");
-            let was_new = hash.set(&f, &v);
+            let was_new = hash.set(&f, &v, &th);
             RmwStep {
                 action: RmwAction::Mutated,
                 expire: ExpireWrite::Unchanged,
@@ -356,5 +357,44 @@ fn seeded_hash_workload_replays_identically() {
     assert_eq!(
         a.2, b.2,
         "hash contents (in deterministic pairs() order) replay identically"
+    );
+}
+
+/// Area A (#40): `set_encoding_thresholds` on the STORE makes a NEW hash promote to `hashtable`
+/// past a LOWERED `hash-max-listpack-entries`, exercised end-to-end through `rmw_mut` (the same
+/// path the command layer + the create-on-missing Insert use). An EXISTING hash built before the
+/// lowering keeps its encoding (a CONFIG SET is future-only; resident data is never re-encoded).
+#[test]
+fn store_runtime_threshold_promotes_new_hash_and_leaves_existing_untouched() {
+    use ironcache_storage::EncodingThresholds;
+    let mut store = ShardStore::new(1);
+
+    // An EXISTING hash built under the DEFAULT (512-entry) cap with 5 small fields: listpack.
+    for i in 0..5 {
+        hset(&mut store, b"existing", format!("f{i}").as_bytes(), b"v");
+    }
+    assert_eq!(encoding_of(&mut store, b"existing"), "listpack");
+
+    // Lower the live cap to 4 entries (a `CONFIG SET hash-max-listpack-entries 4` analog).
+    store.set_encoding_thresholds(EncodingThresholds {
+        hash_max_listpack_entries: 4,
+        ..EncodingThresholds::defaults()
+    });
+
+    // The EXISTING hash is NOT re-encoded just because the cap dropped (no edit re-evaluates it).
+    assert_eq!(
+        encoding_of(&mut store, b"existing"),
+        "listpack",
+        "an existing hash keeps its encoding after a CONFIG SET (future-only)"
+    );
+
+    // A NEW hash with 5 fields under the lowered cap promotes to hashtable (5 > 4).
+    for i in 0..5 {
+        hset(&mut store, b"fresh", format!("f{i}").as_bytes(), b"v");
+    }
+    assert_eq!(
+        encoding_of(&mut store, b"fresh"),
+        "hashtable",
+        "a new hash past the lowered cap is hashtable"
     );
 }

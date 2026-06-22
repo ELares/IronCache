@@ -47,8 +47,9 @@ fn lpush(store: &mut ShardStore, key: &[u8], elem: &[u8]) {
             reply: (),
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let list = o.as_list_mut().expect("list");
-            list.push_front(&e);
+            list.push_front(&e, &th);
             RmwStep {
                 action: RmwAction::Mutated,
                 expire: ExpireWrite::Unchanged,
@@ -69,8 +70,9 @@ fn rpush(store: &mut ShardStore, key: &[u8], elem: &[u8]) {
             reply: (),
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let list = o.as_list_mut().expect("list");
-            list.push_back(&e);
+            list.push_back(&e, &th);
             RmwStep {
                 action: RmwAction::Mutated,
                 expire: ExpireWrite::Unchanged,
@@ -144,8 +146,9 @@ fn lset(store: &mut ShardStore, key: &[u8], index: i64, elem: &[u8]) -> bool {
             reply: false,
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let list = o.as_list_mut().expect("list");
-            let ok = list.set(index, &e);
+            let ok = list.set(index, &e, &th);
             RmwStep {
                 action: if ok {
                     RmwAction::Mutated
@@ -471,11 +474,12 @@ fn seeded_list_workload_replays_identically() {
 }
 
 #[test]
-fn quicklist_to_listpack_transition_is_a_pure_function_of_the_repr() {
-    // Build a list that is quicklist (over the BYTE budget), then shrink it back below
-    // the budget and confirm it reports listpack again -- the NAME is a pure function of
-    // the active repr (#40), not a sticky flag. The transition is byte-driven only (no
-    // element-count cap for lists).
+fn list_quicklist_transition_is_one_way_and_does_not_demote() {
+    // Build a list that crosses the BYTE budget (-> quicklist), then shrink it well below the
+    // budget and confirm it STAYS quicklist. The #40 runtime-`list-max-listpack-size` ratchet is
+    // ONE-WAY (it latches on the edit that crosses the budget and never resets), matching Redis's
+    // quicklist (which does not demote) and the hash/set/zset encoding ratchets. The budget is read
+    // LIVE at each growing edit, so a `CONFIG SET list-max-listpack-size` affects FUTURE inserts.
     let key = b"t";
     let mut store = ShardStore::new(1);
     let chunk = vec![b'y'; 100];
@@ -487,15 +491,14 @@ fn quicklist_to_listpack_transition_is_a_pure_function_of_the_repr() {
     }
     assert_eq!(encoding_of(&mut store, key), "quicklist");
 
-    // Pop chunks until well under the byte budget (~half the budget worth remaining):
-    // pop (pushes - budget_chunks/2) chunks. The remaining bytes are then below 8 KB.
+    // Pop chunks until well under the byte budget (~half the budget worth remaining).
     let pops = pushes - budget_chunks / 2;
     for _ in 0..pops {
         lpop(&mut store, key);
     }
     assert_eq!(
         encoding_of(&mut store, key),
-        "listpack",
-        "shrinking below the byte budget reports listpack again (pure function of repr)"
+        "quicklist",
+        "the quicklist ratchet is one-way: shrinking below the budget does NOT demote (Redis parity)"
     );
 }

@@ -446,8 +446,26 @@ fn maybe_hot_swap_policy<E: Env, S: PolicySwap>(
         // (IC-1: the new policy is re-seeded from the live keyspace so eviction works
         // immediately after the swap).
         let _ = store.set_policy_by_name(&new_name, seed, now);
+        // The generation also rises on a `CONFIG SET *-max-listpack-*` (#40): refresh this shard's
+        // cached encoding-threshold snapshot on the SAME generation-change check, so a threshold
+        // change reaches the encoding-transition decision for FUTURE inserts (existing keys keep
+        // their encoding). A plain field write off the hot path; the common no-change path skips it
+        // (the generation did not move).
+        store.apply_encoding_thresholds(ctx.runtime.encoding_thresholds());
         *shard_generation = current_generation;
     }
+}
+
+/// The LIVE `proto-max-bulk-len` ceiling as a `usize`, read from the runtime overlay (Area B). The
+/// growth-capable string/bitmap handlers (APPEND/SETRANGE/SETBIT/BITFIELD) read it so a
+/// `CONFIG SET proto-max-bulk-len` takes effect for subsequent commands. A single relaxed atomic
+/// load on the (already write-side) command path; `0` (rejected at set time) is unreachable, and a
+/// value past `usize::MAX` on a 32-bit target saturates (the decoder Limits already bound the
+/// inbound size). The default 512 MB keeps the prior compiled-constant behavior byte-identical.
+#[inline]
+#[must_use]
+fn max_bulk_len(ctx: &ServerContext) -> usize {
+    usize::try_from(ctx.runtime.proto_max_bulk_len()).unwrap_or(usize::MAX)
 }
 
 /// The PRE-AUTH ALLOW-LIST (Redis: `HELLO`, `AUTH`, `QUIT`, `RESET`). With `requirepass`
@@ -1227,7 +1245,7 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"INCRBY" => cmd_string::cmd_incrby(store, db, now, req),
         b"DECRBY" => cmd_string::cmd_decrby(store, db, now, req),
         b"INCRBYFLOAT" => cmd_string::cmd_incrbyfloat(store, db, now, req),
-        b"APPEND" => cmd_string::cmd_append(store, db, now, req),
+        b"APPEND" => cmd_string::cmd_append(store, db, now, req, max_bulk_len(ctx)),
         // GETRANGE / SUBSTR (signed-range substring), SETRANGE (zero-pad-extend overwrite),
         // GETDEL (GET-then-DEL). GETRANGE/SUBSTR are NOT keyspace-counted: their absent reply
         // is the EMPTY bulk (indistinguishable from a real empty value), so a hit/miss signal
@@ -1236,7 +1254,7 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         // lookup, like GET).
         b"GETRANGE" => cmd_string::cmd_getrange(store, db, now, req),
         b"SUBSTR" => cmd_string::cmd_substr(store, db, now, req),
-        b"SETRANGE" => cmd_string::cmd_setrange(store, db, now, req),
+        b"SETRANGE" => cmd_string::cmd_setrange(store, db, now, req, max_bulk_len(ctx)),
         b"GETDEL" => keyspace_counted(deltas, cmd_string::cmd_getdel(store, db, now, req)),
         // MSETNX is a multi-key all-or-nothing set; like MSET it runs here on co-located /
         // single-key invocations (a spanning MSETNX is kept home by the serve loop so the
@@ -1436,13 +1454,13 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         // WRONGTYPE on a non-string. BITOP is multi-key (reads sources + writes dest on
         // this connection's accept shard, single-shard-per-connection like the other
         // multi-key commands; an empty result deletes dest). --
-        b"SETBIT" => cmd_bitmap::cmd_setbit(store, db, now, req),
-        b"GETBIT" => cmd_bitmap::cmd_getbit(store, db, now, req),
+        b"SETBIT" => cmd_bitmap::cmd_setbit(store, db, now, req, max_bulk_len(ctx)),
+        b"GETBIT" => cmd_bitmap::cmd_getbit(store, db, now, req, max_bulk_len(ctx)),
         b"BITCOUNT" => cmd_bitmap::cmd_bitcount(store, db, now, req),
         b"BITPOS" => cmd_bitmap::cmd_bitpos(store, db, now, req),
         b"BITOP" => cmd_bitmap::cmd_bitop(store, db, now, req),
-        b"BITFIELD" => cmd_bitmap::cmd_bitfield(store, db, now, req),
-        b"BITFIELD_RO" => cmd_bitmap::cmd_bitfield_ro(store, db, now, req),
+        b"BITFIELD" => cmd_bitmap::cmd_bitfield(store, db, now, req, max_bulk_len(ctx)),
+        b"BITFIELD_RO" => cmd_bitmap::cmd_bitfield_ro(store, db, now, req, max_bulk_len(ctx)),
         // -- HyperLogLog commands (PR-11, COMMANDS.md HLL) over the STRING type. An HLL
         // is the dense (12304-byte) string object addressed opaquely (TYPE=string); these
         // need no new type. PFADD writes through the string `rmw` path (Insert on a new

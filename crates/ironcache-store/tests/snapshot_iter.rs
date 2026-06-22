@@ -79,8 +79,9 @@ fn sadd(s: &mut ShardStore, db: u32, key: &[u8], member: &[u8]) {
     let m = member.to_vec();
     s.rmw_mut(db, key, NOW, move |entry| match entry {
         RmwEntry::OccupiedMut(mut h) => {
+            let th = h.thresholds();
             let set = h.as_set_mut().expect("a set");
-            set.add(&m);
+            set.add(&m, &th);
             RmwStep {
                 action: RmwAction::Mutated,
                 expire: ExpireWrite::Keep,

@@ -139,12 +139,13 @@ fn hset_generic<S: Store>(
             }
         }
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(hash) = o.as_hash_mut() else {
                 return wrong_type();
             };
             let mut added: i64 = 0;
             for (f, v) in &pairs {
-                if hash.set(f, v) {
+                if hash.set(f, v, &th) {
                     added += 1;
                 }
             }
@@ -200,10 +201,11 @@ pub fn cmd_hsetnx<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
             reply: Value::Integer(1),
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(hash) = o.as_hash_mut() else {
                 return wrong_type();
             };
-            if hash.set_nx(&field, &value) {
+            if hash.set_nx(&field, &value, &th) {
                 RmwStep {
                     action: RmwAction::Mutated,
                     expire: ExpireWrite::Unchanged,
@@ -451,6 +453,7 @@ pub fn cmd_hincrby<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
                 }
             }
             RmwEntry::OccupiedMut(mut o) => {
+                let th = o.thresholds();
                 let Some(hash) = o.as_hash_mut() else {
                     return wrong_type();
                 };
@@ -466,7 +469,7 @@ pub fn cmd_hincrby<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
                 let Some(next) = current.checked_add(incr) else {
                     return keep(Value::error(ErrorReply::increment_overflow()));
                 };
-                hash.set(&field, next.to_string().as_bytes());
+                hash.set(&field, next.to_string().as_bytes(), &th);
                 RmwStep {
                     action: RmwAction::Mutated,
                     expire: ExpireWrite::Unchanged,
@@ -509,6 +512,7 @@ pub fn cmd_hincrbyfloat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: 
             }
         }
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let Some(hash) = o.as_hash_mut() else {
                 return wrong_type();
             };
@@ -524,7 +528,7 @@ pub fn cmd_hincrbyfloat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: 
                 return keep(Value::error(ErrorReply::increment_nan_or_inf()));
             }
             let formatted = format_human_double(result);
-            hash.set(&field, formatted.as_bytes());
+            hash.set(&field, formatted.as_bytes(), &th);
             RmwStep {
                 action: RmwAction::Mutated,
                 expire: ExpireWrite::Unchanged,

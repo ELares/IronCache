@@ -129,12 +129,33 @@ pub const DEFAULT_SET_MAX_LISTPACK_ENTRIES: usize = 128;
 pub const DEFAULT_SET_MAX_LISTPACK_VALUE: usize = 64;
 
 /// The Redis `list-max-listpack-size` default SPELLING (`-2` = "8 KB per node"). This
-/// is what `CONFIG GET list-max-listpack-size` echoes (the configured Redis form),
-/// while the store works in the resolved byte budget
-/// ([`DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES`]). Reported as an accepted, recognized
-/// parameter (CONFIG.md "accepted and echoed for compatibility"); changing it at
-/// runtime is a follow-up.
+/// is what `CONFIG GET list-max-listpack-size` echoes BY DEFAULT (the configured Redis
+/// form), while the store works in the resolved byte budget
+/// ([`DEFAULT_LIST_MAX_LISTPACK_SIZE_BYTES`]). The default integer form is
+/// [`DEFAULT_LIST_MAX_LISTPACK_SIZE`] (`-2`); a `CONFIG SET list-max-listpack-size`
+/// overrides the live value (see [`runtime::RuntimeConfig::list_max_listpack_size`]).
 pub const LIST_MAX_LISTPACK_SIZE_REDIS_DEFAULT: &str = "-2";
+
+/// The default `list-max-listpack-size` in the RAW Redis integer form (`-2` = the 8 KB
+/// negative size-tier). A NEGATIVE value `-1..-5` selects a fixed per-node BYTE budget
+/// (Redis `quicklist` size tiers: `-1`=4 KB, `-2`=8 KB, `-3`=16 KB, `-4`=32 KB,
+/// `-5`=64 KB); a POSITIVE value is a max element COUNT per listpack node. The store
+/// resolves this to its transition predicate via
+/// [`EncodingThresholds::list_budget`](ironcache_storage::EncodingThresholds::list_budget).
+/// Stored signed so the negative form round-trips through `CONFIG GET`.
+pub const DEFAULT_LIST_MAX_LISTPACK_SIZE: i64 = -2;
+
+/// The default `proto-max-bulk-len` in bytes (Redis default 512 MB): the maximum size of
+/// a single inbound bulk string the RESP decoder accepts, and the ceiling a string
+/// value (APPEND/SETRANGE/SETBIT) may grow to. Runtime-settable via
+/// `CONFIG SET proto-max-bulk-len` (see [`runtime::RuntimeConfig::proto_max_bulk_len`]).
+pub const DEFAULT_PROTO_MAX_BULK_LEN: u64 = 512 * 1024 * 1024;
+
+/// The default `tcp-keepalive` in SECONDS (Redis default 300): the SO_KEEPALIVE idle
+/// interval applied to a newly-accepted client connection. `0` DISABLES keepalive.
+/// Runtime-settable via `CONFIG SET tcp-keepalive` (affects newly-accepted connections;
+/// see [`runtime::RuntimeConfig::tcp_keepalive_secs`]).
+pub const DEFAULT_TCP_KEEPALIVE: u64 = 300;
 
 /// The default shard count: the host's available parallelism via
 /// [`std::thread::available_parallelism`] (CONFIG.md), which honors cgroup CPU
@@ -324,6 +345,52 @@ pub struct Config {
     /// ceiling ([`DEFAULT_OUTPUT_BUFFER_LIMIT`]) so a legitimate large pipeline/reply is
     /// unaffected while a pathological accumulation is bounded.
     pub output_buffer_limit: u64,
+    /// The maximum size in bytes of a single inbound bulk string the RESP decoder accepts,
+    /// AND the ceiling a string value may grow to (Redis `proto-max-bulk-len`, default
+    /// [`DEFAULT_PROTO_MAX_BULK_LEN`] = 512 MB). A bulk string larger than this is a
+    /// protocol error; an APPEND/SETRANGE/SETBIT/BITFIELD that would grow a value past it
+    /// is rejected (Redis `checkStringLength`). Runtime-settable: the serve loop builds the
+    /// decoder [`Limits`](crate) from the live overlay per connection, and the string /
+    /// bitmap ceilings read the live value, so a `CONFIG SET proto-max-bulk-len` takes
+    /// effect without a restart. `0` is rejected at set time (a zero ceiling would reject
+    /// every value).
+    pub proto_max_bulk_len: u64,
+    /// The TCP keepalive idle interval in SECONDS applied to a newly-accepted client
+    /// connection (Redis `tcp-keepalive`, default [`DEFAULT_TCP_KEEPALIVE`] = 300). `0`
+    /// DISABLES keepalive. The accept path enables SO_KEEPALIVE with this idle time so a
+    /// dead peer (a half-open connection behind a NAT/firewall that dropped state) is
+    /// detected and the connection reaped. Runtime-settable: the accept path reads the live
+    /// overlay, so a `CONFIG SET tcp-keepalive` applies to NEWLY-accepted connections
+    /// (existing connections keep the option set at their own accept time, matching Redis).
+    pub tcp_keepalive_secs: u64,
+    /// The HASH listpack->hashtable entry-count cap (Redis `hash-max-listpack-entries`,
+    /// default [`DEFAULT_HASH_MAX_LISTPACK_ENTRIES`]). The store reads the live runtime
+    /// value at the hash encoding-transition decision; a `CONFIG SET` affects FUTURE
+    /// inserts only (existing keys keep their encoding).
+    pub hash_max_listpack_entries: usize,
+    /// The HASH listpack->hashtable per-field/value byte cap (Redis `hash-max-listpack-value`,
+    /// default [`DEFAULT_HASH_MAX_LISTPACK_VALUE`]).
+    pub hash_max_listpack_value: usize,
+    /// The LIST listpack->quicklist size in the SIGNED Redis form (`list-max-listpack-size`,
+    /// default [`DEFAULT_LIST_MAX_LISTPACK_SIZE`] = `-2`). Negative selects a byte tier;
+    /// positive is a max element count per node (see
+    /// [`EncodingThresholds::list_budget`](ironcache_storage::EncodingThresholds::list_budget)).
+    pub list_max_listpack_size: i64,
+    /// The SET intset entry-count cap (Redis `set-max-intset-entries`, default
+    /// [`DEFAULT_SET_MAX_INTSET_ENTRIES`]).
+    pub set_max_intset_entries: usize,
+    /// The SET listpack->hashtable entry-count cap (Redis `set-max-listpack-entries`, default
+    /// [`DEFAULT_SET_MAX_LISTPACK_ENTRIES`]).
+    pub set_max_listpack_entries: usize,
+    /// The SET listpack per-member byte cap (Redis `set-max-listpack-value`, default
+    /// [`DEFAULT_SET_MAX_LISTPACK_VALUE`]).
+    pub set_max_listpack_value: usize,
+    /// The ZSET listpack->skiplist entry-count cap (Redis `zset-max-listpack-entries`, default
+    /// [`DEFAULT_ZSET_MAX_LISTPACK_ENTRIES`]).
+    pub zset_max_listpack_entries: usize,
+    /// The ZSET listpack per-member byte cap (Redis `zset-max-listpack-value`, default
+    /// [`DEFAULT_ZSET_MAX_LISTPACK_VALUE`]).
+    pub zset_max_listpack_value: usize,
     /// Whether the server runs in cluster mode (Redis `cluster-enabled`,
     /// CLUSTER_CONTRACT.md #70). BOOT-ONLY (immutable at runtime, like Redis): it is
     /// reported by `CLUSTER INFO` (`cluster_enabled:0/1`) and the INFO `# Cluster`
@@ -585,6 +652,24 @@ impl Default for Config {
             // unbounded accumulation (slow consumer / pub-sub flood) is bounded so it
             // cannot OOM the host. 0 disables it (unbounded, the pre-fix behavior).
             output_buffer_limit: DEFAULT_OUTPUT_BUFFER_LIMIT,
+            // The Redis `proto-max-bulk-len` default (512 MB): the inbound bulk-string ceiling and
+            // the string-value growth ceiling. Runtime-settable; the default keeps the decoder
+            // Limits + the string/bitmap ceilings byte-identical to the pre-fix compiled constant.
+            proto_max_bulk_len: DEFAULT_PROTO_MAX_BULK_LEN,
+            // The Redis `tcp-keepalive` default (300 s): SO_KEEPALIVE idle interval on accepted
+            // connections so a dead peer is reaped. Runtime-settable; `0` disables keepalive.
+            tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE,
+            // The 8 collection-encoding thresholds, seeded from the compiled Redis defaults so the
+            // default deployment's encoding transitions are byte-identical. Runtime-settable via
+            // `CONFIG SET`; a change affects FUTURE inserts only (existing keys keep their encoding).
+            hash_max_listpack_entries: DEFAULT_HASH_MAX_LISTPACK_ENTRIES,
+            hash_max_listpack_value: DEFAULT_HASH_MAX_LISTPACK_VALUE,
+            list_max_listpack_size: DEFAULT_LIST_MAX_LISTPACK_SIZE,
+            set_max_intset_entries: DEFAULT_SET_MAX_INTSET_ENTRIES,
+            set_max_listpack_entries: DEFAULT_SET_MAX_LISTPACK_ENTRIES,
+            set_max_listpack_value: DEFAULT_SET_MAX_LISTPACK_VALUE,
+            zset_max_listpack_entries: DEFAULT_ZSET_MAX_LISTPACK_ENTRIES,
+            zset_max_listpack_value: DEFAULT_ZSET_MAX_LISTPACK_VALUE,
             // Standalone by default (Redis `cluster-enabled no`). Slice 1 is
             // cluster-disabled-but-introspectable (CLUSTER_CONTRACT.md #70).
             cluster_enabled: false,
@@ -1241,6 +1326,37 @@ pub struct ConfigOverlay {
     /// (`output_buffer_limit = 1073741824`) + the `IRONCACHE_OUTPUT_BUFFER_LIMIT` env var.
     /// `None` leaves the lower layer (default [`DEFAULT_OUTPUT_BUFFER_LIMIT`]); `0` disables it.
     pub output_buffer_limit: Option<u64>,
+    /// The inbound bulk-string + string-value-growth ceiling in bytes (Redis
+    /// `proto-max-bulk-len`). TOML (`proto_max_bulk_len = 536870912`) + the
+    /// `IRONCACHE_PROTO_MAX_BULK_LEN` env var. `None` leaves the lower layer (default
+    /// [`DEFAULT_PROTO_MAX_BULK_LEN`] = 512 MB).
+    pub proto_max_bulk_len: Option<u64>,
+    /// The TCP keepalive idle interval in seconds applied at accept (Redis `tcp-keepalive`).
+    /// TOML (`tcp_keepalive_secs = 300`) + the `IRONCACHE_TCP_KEEPALIVE` env var. `None`
+    /// leaves the lower layer (default [`DEFAULT_TCP_KEEPALIVE`] = 300); `0` disables it.
+    pub tcp_keepalive_secs: Option<u64>,
+    /// The 8 collection-encoding listpack/intset thresholds (`hash-max-listpack-entries`,
+    /// `hash-max-listpack-value`, `list-max-listpack-size`, `set-max-intset-entries`,
+    /// `set-max-listpack-entries`, `set-max-listpack-value`, `zset-max-listpack-entries`,
+    /// `zset-max-listpack-value`). TOML (`hash_max_listpack_entries = 128`, ...) + the
+    /// matching `IRONCACHE_*` env vars. `None` leaves the compiled default; the store reads
+    /// the resolved value at the encoding-transition decision. `list_max_listpack_size` is
+    /// the SIGNED Redis form (`-2` etc.); the rest are positive counts/byte caps.
+    pub hash_max_listpack_entries: Option<usize>,
+    /// See [`Self::hash_max_listpack_entries`].
+    pub hash_max_listpack_value: Option<usize>,
+    /// See [`Self::hash_max_listpack_entries`]. SIGNED Redis size form (`-2` etc.).
+    pub list_max_listpack_size: Option<i64>,
+    /// See [`Self::hash_max_listpack_entries`].
+    pub set_max_intset_entries: Option<usize>,
+    /// See [`Self::hash_max_listpack_entries`].
+    pub set_max_listpack_entries: Option<usize>,
+    /// See [`Self::hash_max_listpack_entries`].
+    pub set_max_listpack_value: Option<usize>,
+    /// See [`Self::hash_max_listpack_entries`].
+    pub zset_max_listpack_entries: Option<usize>,
+    /// See [`Self::hash_max_listpack_entries`].
+    pub zset_max_listpack_value: Option<usize>,
     /// Whether to run in cluster mode (Redis `cluster-enabled`, CLUSTER_CONTRACT.md #70).
     /// Boot-only; `None` leaves the lower layer (default `false`) showing through.
     pub cluster_enabled: Option<bool>,
@@ -1417,6 +1533,73 @@ impl ConfigOverlay {
             o.output_buffer_limit = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "output_buffer_limit",
                 reason: format!("not a number of bytes: {v}"),
+            })?);
+        }
+        // The inbound bulk-string + string-value-growth ceiling (Redis `proto-max-bulk-len`).
+        // Accepts a human size ("512mb") OR a plain byte count for env parity with maxmemory.
+        if let Ok(v) = std::env::var("IRONCACHE_PROTO_MAX_BULK_LEN") {
+            o.proto_max_bulk_len =
+                Some(parse_human_size(&v).map_err(|_| ConfigError::Invalid {
+                    field: "proto_max_bulk_len",
+                    reason: format!("not a number of bytes: {v}"),
+                })?);
+        }
+        // The TCP keepalive idle interval in seconds applied at accept (Redis `tcp-keepalive`); 0
+        // disables keepalive.
+        if let Ok(v) = std::env::var("IRONCACHE_TCP_KEEPALIVE") {
+            o.tcp_keepalive_secs = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "tcp_keepalive_secs",
+                reason: format!("not a number of seconds: {v}"),
+            })?);
+        }
+        // The 8 collection-encoding thresholds (Redis `*-max-listpack-*` / `set-max-intset-entries`).
+        // Single scalars, so env-encodable; `list-max-listpack-size` is the signed Redis form.
+        if let Ok(v) = std::env::var("IRONCACHE_HASH_MAX_LISTPACK_ENTRIES") {
+            o.hash_max_listpack_entries = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "hash_max_listpack_entries",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_HASH_MAX_LISTPACK_VALUE") {
+            o.hash_max_listpack_value = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "hash_max_listpack_value",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_LIST_MAX_LISTPACK_SIZE") {
+            o.list_max_listpack_size = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "list_max_listpack_size",
+                reason: format!("not a signed number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_SET_MAX_INTSET_ENTRIES") {
+            o.set_max_intset_entries = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "set_max_intset_entries",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_SET_MAX_LISTPACK_ENTRIES") {
+            o.set_max_listpack_entries = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "set_max_listpack_entries",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_SET_MAX_LISTPACK_VALUE") {
+            o.set_max_listpack_value = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "set_max_listpack_value",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_ZSET_MAX_LISTPACK_ENTRIES") {
+            o.zset_max_listpack_entries = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "zset_max_listpack_entries",
+                reason: format!("not a number: {v}"),
+            })?);
+        }
+        if let Ok(v) = std::env::var("IRONCACHE_ZSET_MAX_LISTPACK_VALUE") {
+            o.zset_max_listpack_value = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "zset_max_listpack_value",
+                reason: format!("not a number: {v}"),
             })?);
         }
         if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_ENABLED") {
@@ -1633,6 +1816,36 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.output_buffer_limit {
             cfg.output_buffer_limit = v;
+        }
+        if let Some(v) = self.proto_max_bulk_len {
+            cfg.proto_max_bulk_len = v;
+        }
+        if let Some(v) = self.tcp_keepalive_secs {
+            cfg.tcp_keepalive_secs = v;
+        }
+        if let Some(v) = self.hash_max_listpack_entries {
+            cfg.hash_max_listpack_entries = v;
+        }
+        if let Some(v) = self.hash_max_listpack_value {
+            cfg.hash_max_listpack_value = v;
+        }
+        if let Some(v) = self.list_max_listpack_size {
+            cfg.list_max_listpack_size = v;
+        }
+        if let Some(v) = self.set_max_intset_entries {
+            cfg.set_max_intset_entries = v;
+        }
+        if let Some(v) = self.set_max_listpack_entries {
+            cfg.set_max_listpack_entries = v;
+        }
+        if let Some(v) = self.set_max_listpack_value {
+            cfg.set_max_listpack_value = v;
+        }
+        if let Some(v) = self.zset_max_listpack_entries {
+            cfg.zset_max_listpack_entries = v;
+        }
+        if let Some(v) = self.zset_max_listpack_value {
+            cfg.zset_max_listpack_value = v;
         }
         if let Some(v) = self.cluster_enabled {
             cfg.cluster_enabled = v;

@@ -43,6 +43,44 @@ release.
   disables idle disconnection, and a negative or non-numeric value is rejected
   rather than silently coerced. This matches Redis, where `timeout` is a modifiable
   config.
+- The eight collection-encoding thresholds (`hash-max-listpack-entries`,
+  `hash-max-listpack-value`, `list-max-listpack-size`, `set-max-intset-entries`,
+  `set-max-listpack-entries`, `set-max-listpack-value`, `zset-max-listpack-entries`,
+  `zset-max-listpack-value`) are now LIVE via `CONFIG SET`/`CONFIG GET` (#40). They
+  were previously accepted-but-IGNORED no-ops: `CONFIG SET` replied `+OK` while the
+  store kept using the compiled defaults, and `CONFIG GET` echoed the compiled
+  default rather than the value that was set (a lie). Now `CONFIG GET` reports the
+  live value and the store reads the live threshold at the encoding-transition
+  decision, so e.g. `CONFIG SET hash-max-listpack-entries 4` then creating a NEW
+  hash with five fields stores it as a hashtable. A change affects FUTURE
+  operations only, matching Redis: existing keys keep their encoding until the next
+  rewrite (resident data is never re-encoded). `list-max-listpack-size` takes the
+  signed Redis form (a negative `-1..-5` byte tier or a positive element count);
+  the rest are positive counts / per-element byte caps, and an invalid value (zero
+  or negative where not allowed, non-numeric) is rejected rather than silently
+  ignored. The list listpack/quicklist transition is now a one-way ratchet (it no
+  longer demotes when a list shrinks below the budget), matching Redis's quicklist
+  and the hash/set/zset encoding ratchets. When a threshold is at its default the
+  encoding behavior is byte-identical to before.
+- `proto-max-bulk-len` is now runtime-settable via `CONFIG SET proto-max-bulk-len
+  <bytes>` / `CONFIG GET proto-max-bulk-len` (it was a hardcoded 512 MB constant).
+  The serve loop builds each connection's RESP decoder bulk-string limit from the
+  live overlay, and the string-value-growth ceilings (APPEND / SETRANGE) and the
+  bitmap bit-offset ceiling (SETBIT / GETBIT / BITFIELD) read the live value too,
+  so the whole 512 MB-derived family of limits moves together. A change applies to
+  newly-accepted connections and to subsequent value-growth edits; a human size
+  (`512mb`) or a plain byte count is accepted, and `0` (which would reject every
+  value) or a malformed value is rejected. The default keeps the prior 512 MB
+  behavior byte-identical.
+- `tcp-keepalive` is now supported and runtime-settable via `CONFIG SET
+  tcp-keepalive <secs>` / `CONFIG GET tcp-keepalive` (it was absent: connections
+  only had `TCP_NODELAY` set at accept). The accept path now enables `SO_KEEPALIVE`
+  with the configured idle interval (Redis default 300 seconds; `0` disables it),
+  so a dead peer behind a NAT/firewall that dropped state is detected and the
+  half-open connection reaped. Read from the runtime overlay at accept, so a
+  `CONFIG SET tcp-keepalive` applies to newly-accepted connections; an established
+  connection keeps the option it was accepted with, matching Redis. Configurable at
+  boot via TOML (`tcp_keepalive_secs`) and the `IRONCACHE_TCP_KEEPALIVE` env var.
 - IronCache Console dashboard re-skin to the bespoke Butlr design system (issue
   #359). The generic dark dashboard is replaced with the real design language: a
   full-height sidebar (brand chip plus grouped nav) and topbar (page title, a

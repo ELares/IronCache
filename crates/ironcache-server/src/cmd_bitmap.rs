@@ -64,13 +64,26 @@ use ironcache_storage::{
 // The bit-offset ceiling (Redis proto-max-bit-offset, BITMAPS.md size ceiling).
 // ---------------------------------------------------------------------------
 
-/// The maximum addressable bit offset: `4*1024*1024*1024 - 1`. A SETBIT/BITFIELD
-/// offset must satisfy `0 <= offset <= PROTO_MAX_BIT_OFFSET`; a byte length is bounded
-/// by `(PROTO_MAX_BIT_OFFSET >> 3) + 1 == 512 MB`. This matches Redis's
-/// proto-max-bit-offset (derived from the default `proto-max-bulk-len` of 512 MB), so
-/// growing a bitmap past the ceiling is rejected rather than allocating 512 MB
-/// unboundedly (BITMAPS.md "rejected with the Redis-recognized error, not truncated").
+/// The DEFAULT maximum addressable bit offset: `4*1024*1024*1024 - 1` (derived from the
+/// default `proto-max-bulk-len` of 512 MB). A SETBIT/BITFIELD offset must satisfy
+/// `0 <= offset <= ceiling`; a byte length is bounded by `(ceiling >> 3) + 1`. This matches
+/// Redis's proto-max-bit-offset, so growing a bitmap past the ceiling is rejected rather
+/// than allocating unboundedly (BITMAPS.md "rejected with the Redis-recognized error, not
+/// truncated"). The LIVE ceiling is RUNTIME-SETTABLE (`CONFIG SET proto-max-bulk-len`): the
+/// dispatch threads `ctx.runtime.proto_max_bulk_len()` into the handlers, which derive the
+/// live bit ceiling via [`bit_offset_ceiling`]. Kept as the test-side pin of the default
+/// (the live value is sourced from `ironcache_config::DEFAULT_PROTO_MAX_BULK_LEN`).
+#[cfg(test)]
 const PROTO_MAX_BIT_OFFSET: u64 = 4 * 1024 * 1024 * 1024 - 1;
+
+/// Derive the live bit-offset ceiling from the live `proto-max-bulk-len` byte ceiling
+/// `max_bulk_len` (Redis: `(max_bulk_len * 8) - 1`, the highest addressable bit). Saturating
+/// so a pathological huge ceiling cannot overflow; a `0` byte ceiling (never reached -- the
+/// registry rejects `proto-max-bulk-len 0`) would yield `0`, addressing only bit 0.
+#[must_use]
+fn bit_offset_ceiling(max_bulk_len: usize) -> u64 {
+    (max_bulk_len as u64).saturating_mul(8).saturating_sub(1)
+}
 
 // ---------------------------------------------------------------------------
 // The bit-manipulation helper (get/set a bit MSB-first, popcount over byte/bit
@@ -195,12 +208,18 @@ fn parse_i64(arg: &[u8]) -> Option<i64> {
 /// range" otherwise); `value` must be 0 or 1 ("bit is not an integer or out of range"
 /// otherwise). WRONGTYPE on a non-string key. Mutation via the rmw rebuild-Replace
 /// path. `denyoom` (it grows memory).
-pub fn cmd_setbit<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+pub fn cmd_setbit<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    max_bulk_len: usize,
+) -> Value {
     if req.args.len() != 4 {
         return Value::error(ErrorReply::wrong_arity("setbit"));
     }
-    // The offset: a non-negative integer within the proto-max-bit-offset ceiling.
-    let Some(offset) = parse_bit_offset(&req.args[2]) else {
+    // The offset: a non-negative integer within the LIVE proto-max-bit-offset ceiling.
+    let Some(offset) = parse_bit_offset(&req.args[2], bit_offset_ceiling(max_bulk_len)) else {
         return Value::error(ErrorReply::bit_offset_out_of_range());
     };
     // The value: exactly 0 or 1.
@@ -242,11 +261,17 @@ pub fn cmd_setbit<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
 
 /// `GETBIT key offset` -> the bit value (0/1); 0 if `offset` is at/beyond the string
 /// or the key is missing. WRONGTYPE on a non-string. Read-only (via `read`).
-pub fn cmd_getbit<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+pub fn cmd_getbit<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    max_bulk_len: usize,
+) -> Value {
     if req.args.len() != 3 {
         return Value::error(ErrorReply::wrong_arity("getbit"));
     }
-    let Some(offset) = parse_bit_offset(&req.args[2]) else {
+    let Some(offset) = parse_bit_offset(&req.args[2], bit_offset_ceiling(max_bulk_len)) else {
         return Value::error(ErrorReply::bit_offset_out_of_range());
     };
     match store.read(db, &req.args[1], now) {
@@ -262,13 +287,13 @@ pub fn cmd_getbit<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
 /// proto-max-bit-offset ceiling. Returns `None` for a non-integer, a negative offset,
 /// or one past the ceiling (the caller maps `None` to the bit-offset-out-of-range
 /// error, which is what guards against a huge allocation).
-fn parse_bit_offset(arg: &[u8]) -> Option<u64> {
+fn parse_bit_offset(arg: &[u8], ceiling: u64) -> Option<u64> {
     let n = parse_i64(arg)?;
     if n < 0 {
         return None;
     }
     let n = n as u64;
-    if n > PROTO_MAX_BIT_OFFSET {
+    if n > ceiling {
         return None;
     }
     Some(n)
@@ -704,14 +729,26 @@ enum BitfieldOp {
 /// returns the OLD value; INCRBY the new value (or nil under OVERFLOW FAIL). Mutations
 /// use the rmw rebuild-Replace path. `denyoom` when it has any write op. WRONGTYPE on a
 /// non-string.
-pub fn cmd_bitfield<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
-    bitfield_generic(store, db, now, req, false)
+pub fn cmd_bitfield<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    max_bulk_len: usize,
+) -> Value {
+    bitfield_generic(store, db, now, req, false, max_bulk_len)
 }
 
 /// `BITFIELD_RO key [GET type offset]...` -> the read-only variant: only GET is
 /// allowed; SET/INCRBY are an error. Always uses `read` (no write).
-pub fn cmd_bitfield_ro<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
-    bitfield_generic(store, db, now, req, true)
+pub fn cmd_bitfield_ro<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    max_bulk_len: usize,
+) -> Value {
+    bitfield_generic(store, db, now, req, true, max_bulk_len)
 }
 
 /// Shared body for BITFIELD / BITFIELD_RO. `read_only` rejects SET/INCRBY with the
@@ -724,12 +761,14 @@ fn bitfield_generic<S: Store>(
     now: UnixMillis,
     req: &Request,
     read_only: bool,
+    max_bulk_len: usize,
 ) -> Value {
     let cmd_name = if read_only { "bitfield_ro" } else { "bitfield" };
     if req.args.len() < 2 {
         return Value::error(ErrorReply::wrong_arity(cmd_name));
     }
-    let ops = match parse_bitfield_ops(&req.args[2..], read_only) {
+    let ops = match parse_bitfield_ops(&req.args[2..], read_only, bit_offset_ceiling(max_bulk_len))
+    {
         Ok(ops) => ops,
         Err(e) => return Value::error(e),
     };
@@ -790,7 +829,11 @@ fn bitfield_generic<S: Store>(
 /// writes), and only AFTER the full parse loop, if any WRITE op (SET/INCRBY) was
 /// present, is the BITFIELD_RO error returned. So a bad type under a RO write op
 /// returns the TYPE error (validated first), not the RO error.
-fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>, ErrorReply> {
+fn parse_bitfield_ops(
+    args: &[Bytes],
+    read_only: bool,
+    ceiling: u64,
+) -> Result<Vec<BitfieldOp>, ErrorReply> {
     let mut ops = Vec::new();
     let mut overflow = Overflow::Wrap;
     // Whether any SET/INCRBY (write) op appeared; gates the post-loop BITFIELD_RO error.
@@ -805,7 +848,7 @@ fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>
                 }
                 let ty =
                     FieldType::parse(&args[i + 1]).ok_or_else(ErrorReply::invalid_bitfield_type)?;
-                let offset = parse_field_offset(&args[i + 2], ty)?;
+                let offset = parse_field_offset(&args[i + 2], ty, ceiling)?;
                 ops.push(BitfieldOp::Get { ty, offset });
                 i += 3;
             }
@@ -816,7 +859,7 @@ fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>
                 }
                 let ty =
                     FieldType::parse(&args[i + 1]).ok_or_else(ErrorReply::invalid_bitfield_type)?;
-                let offset = parse_field_offset(&args[i + 2], ty)?;
+                let offset = parse_field_offset(&args[i + 2], ty, ceiling)?;
                 let value =
                     i128::from(parse_i64(&args[i + 3]).ok_or_else(ErrorReply::not_an_integer)?);
                 ops.push(BitfieldOp::Set {
@@ -834,7 +877,7 @@ fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>
                 }
                 let ty =
                     FieldType::parse(&args[i + 1]).ok_or_else(ErrorReply::invalid_bitfield_type)?;
-                let offset = parse_field_offset(&args[i + 2], ty)?;
+                let offset = parse_field_offset(&args[i + 2], ty, ceiling)?;
                 let incr =
                     i128::from(parse_i64(&args[i + 3]).ok_or_else(ErrorReply::not_an_integer)?);
                 ops.push(BitfieldOp::Incrby {
@@ -879,7 +922,7 @@ fn parse_bitfield_ops(args: &[Bytes], read_only: bool) -> Result<Vec<BitfieldOp>
 /// the value is returned. A SET/INCRBY may grow the backing string a few bytes past
 /// 512 MB to `ceil((offset + width) / 8)` bytes (bounded, matching Redis), so a huge
 /// start offset is the bit-offset-out-of-range error rather than a huge allocation.
-fn parse_field_offset(arg: &[u8], ty: FieldType) -> Result<u64, ErrorReply> {
+fn parse_field_offset(arg: &[u8], ty: FieldType, ceiling: u64) -> Result<u64, ErrorReply> {
     let bits = if let Some(rest) = arg.strip_prefix(b"#") {
         // `#n` means n * type-width bits.
         let n = parse_i64(rest).ok_or_else(ErrorReply::bit_offset_out_of_range)?;
@@ -895,11 +938,11 @@ fn parse_field_offset(arg: &[u8], ty: FieldType) -> Result<u64, ErrorReply> {
         Some(n as u64)
     };
     let bits = bits.ok_or_else(ErrorReply::bit_offset_out_of_range)?;
-    // The START offset must fit the ceiling (Redis checks the start only, NOT the
+    // The START offset must fit the LIVE ceiling (Redis checks the start only, NOT the
     // field's highest bit). A field that extends past the end is allowed: a GET reads
     // the missing bits as 0; a SET/INCRBY grows the string a bounded few bytes past the
     // ceiling.
-    if bits > PROTO_MAX_BIT_OFFSET {
+    if bits > ceiling {
         return Err(ErrorReply::bit_offset_out_of_range());
     }
     Ok(bits)
@@ -1042,6 +1085,27 @@ mod tests {
     use super::*;
     use ironcache_storage::{CountingAccounting, Encoding, Store};
     use ironcache_store::ShardStore;
+
+    // The DEFAULT `proto-max-bulk-len` ceiling (512 MB) the test wrappers pin. Equals
+    // `ironcache_config::DEFAULT_PROTO_MAX_BULK_LEN`; the default bit ceiling is `PROTO_MAX_BIT_OFFSET`.
+    const TEST_MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+
+    // Test-only thin wrappers that pin the DEFAULT `proto-max-bulk-len` ceiling, so the existing
+    // bitmap command tests exercise the handlers at their default bound (the runtime-settable
+    // ceiling is covered by dedicated registry/runtime tests + the over-the-wire compat test).
+    // These SHADOW the glob-imported handlers above for the test bodies below.
+    fn cmd_setbit<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+        super::cmd_setbit(store, db, now, req, TEST_MAX_BULK_LEN)
+    }
+    fn cmd_getbit<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+        super::cmd_getbit(store, db, now, req, TEST_MAX_BULK_LEN)
+    }
+    fn cmd_bitfield<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+        super::cmd_bitfield(store, db, now, req, TEST_MAX_BULK_LEN)
+    }
+    fn cmd_bitfield_ro<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+        super::cmd_bitfield_ro(store, db, now, req, TEST_MAX_BULK_LEN)
+    }
 
     type TestStore = ShardStore<ironcache_eviction::Policy, CountingAccounting>;
 

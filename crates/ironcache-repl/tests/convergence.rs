@@ -254,8 +254,9 @@ fn apply_collection_write(
                 key,
                 move || NewValueOwned::list(vec![elem.clone()]),
                 move |m| {
+                    let th = m.thresholds();
                     m.as_list_mut().is_some_and(|l| {
-                        l.push_back(&e2);
+                        l.push_back(&e2, &th);
                         true
                     })
                 },
@@ -271,8 +272,9 @@ fn apply_collection_write(
                 key,
                 move || NewValueOwned::hash(vec![(f.clone(), v.clone())]),
                 move |m| {
+                    let th = m.thresholds();
                     m.as_hash_mut().is_some_and(|h| {
-                        h.set(&f2, &v2);
+                        h.set(&f2, &v2, &th);
                         true
                     })
                 },
@@ -287,8 +289,9 @@ fn apply_collection_write(
                 key,
                 move || NewValueOwned::set(vec![mem.clone()]),
                 move |m| {
+                    let th = m.thresholds();
                     m.as_set_mut().is_some_and(|s| {
-                        s.add(&m2);
+                        s.add(&m2, &th);
                         true
                     })
                 },
@@ -304,8 +307,9 @@ fn apply_collection_write(
                 key,
                 move || NewValueOwned::zset(vec![(mem.clone(), zscore)]),
                 move |m| {
+                    let th = m.thresholds();
                     m.as_zset_mut().is_some_and(|z| {
-                        z.add(&m2, zscore, ZAddFlags::default());
+                        z.add(&m2, zscore, ZAddFlags::default(), &th);
                         true
                     })
                 },

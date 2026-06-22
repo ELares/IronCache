@@ -41,7 +41,8 @@
 //! TOTAL -- any truncated, over-long, or unknown-tag input yields `None`, never a panic.
 
 use ironcache_storage::{
-    DataType, Encoding, HashValue, ListValue, NewValueOwned, SetValue, UnixMillis, ZSetValue,
+    DataType, Encoding, EncodingThresholds, HashValue, ListValue, NewValueOwned, SetValue,
+    UnixMillis, ZSetValue,
 };
 use ironcache_store::KvObj;
 use ironcache_store::kvobj::ValueRepr;
@@ -262,6 +263,7 @@ impl<'a> Reader<'a> {
 /// active repr. The result is ready for
 /// [`ironcache_store::ShardStore::insert_object`](ironcache_store::ShardStore::insert_object).
 #[must_use]
+#[allow(clippy::too_many_lines)] // one decode arm per data type, each rebuilding-then-forcing the recorded encoding.
 pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
     let mut r = Reader::new(buf);
     let type_tag = r.u8()?;
@@ -298,9 +300,24 @@ pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
             if !r.is_done() {
                 return None;
             }
-            // The list encoding is a pure function of the element-byte total (reversible),
-            // so rebuilding reproduces it; no force needed.
-            KvObj::from_new_owned(&key, NewValueOwned::list(elems), expire_at)
+            // RECONSTRUCTION: rebuild under the UNLIMITED thresholds (so NO transition fires during
+            // the rebuild regardless of the LOCAL runtime `list-max-listpack-size`), then FORCE the
+            // recorded encoding -- the rebuilt object reproduces the SOURCE's encoding, never the
+            // local replica's threshold. The list encoding is now a one-way ratchet (#40), so a
+            // `quicklist` source must be forced (it would otherwise rebuild as `listpack`).
+            let mut obj = KvObj::from_new_owned(
+                &key,
+                NewValueOwned::list(elems),
+                expire_at,
+                &EncodingThresholds::unlimited(),
+            );
+            if encoding == Encoding::QuickList {
+                if let Some(l) = obj.as_list_mut() {
+                    l.force_quicklist();
+                }
+            }
+            obj.recompute_encoding();
+            obj
         }
         type_tag::HASH => {
             let count = r.u32()? as usize;
@@ -313,7 +330,13 @@ pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
             if !r.is_done() {
                 return None;
             }
-            let mut obj = KvObj::from_new_owned(&key, NewValueOwned::hash(pairs), expire_at);
+            // RECONSTRUCTION: build under unlimited thresholds, then force the recorded large form.
+            let mut obj = KvObj::from_new_owned(
+                &key,
+                NewValueOwned::hash(pairs),
+                expire_at,
+                &EncodingThresholds::unlimited(),
+            );
             // Force the one-way large form if the source was a hashtable but the rebuilt
             // contents fit a listpack (a promoted-then-shrunk hash).
             if encoding == Encoding::HashTable {
@@ -329,7 +352,12 @@ pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
             if !r.is_done() {
                 return None;
             }
-            let mut obj = KvObj::from_new_owned(&key, NewValueOwned::set(members), expire_at);
+            let mut obj = KvObj::from_new_owned(
+                &key,
+                NewValueOwned::set(members),
+                expire_at,
+                &EncodingThresholds::unlimited(),
+            );
             // Force the recorded form for the one-way ratchet: a hashtable set whose members
             // now fit a smaller form, or a listpack set of all-integer members that would
             // otherwise rebuild as an intset.
@@ -354,7 +382,12 @@ pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
             if !r.is_done() {
                 return None;
             }
-            let mut obj = KvObj::from_new_owned(&key, NewValueOwned::zset(pairs), expire_at);
+            let mut obj = KvObj::from_new_owned(
+                &key,
+                NewValueOwned::zset(pairs),
+                expire_at,
+                &EncodingThresholds::unlimited(),
+            );
             if encoding == Encoding::SkipList {
                 if let Some(z) = obj.as_zset_mut() {
                     z.force_large_encoding();
@@ -409,6 +442,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // exhaustive round-trip over every type x encoding x TTL combination.
     fn kvobj_codec_round_trips_every_type() {
         // -- STRINGS: int, embstr, raw; with and without a TTL. --
         assert_round_trips(&KvObj::from_bytes(b"k-int", b"12345", None));
@@ -441,6 +475,7 @@ mod tests {
             b"l-small",
             NewValueOwned::list(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]),
             None,
+            &EncodingThresholds::defaults(),
         );
         assert_eq!(small_list.header.data_type, DataType::List);
         assert_eq!(small_list.header.encoding, Encoding::ListPack);
@@ -451,6 +486,7 @@ mod tests {
             b"l-big",
             NewValueOwned::list(vec![big_elem.clone(), big_elem]),
             Some(UnixMillis(9)),
+            &EncodingThresholds::defaults(),
         );
         assert_eq!(big_list.header.encoding, Encoding::QuickList);
         assert_round_trips(&big_list);
@@ -460,6 +496,7 @@ mod tests {
             b"s-int",
             NewValueOwned::set(vec![b"3".to_vec(), b"1".to_vec(), b"2".to_vec()]),
             None,
+            &EncodingThresholds::defaults(),
         );
         assert_eq!(intset.header.encoding, Encoding::IntSet);
         assert_round_trips(&intset);
@@ -468,6 +505,7 @@ mod tests {
             b"s-lp",
             NewValueOwned::set(vec![b"alpha".to_vec(), b"beta".to_vec()]),
             None,
+            &EncodingThresholds::defaults(),
         );
         assert_eq!(lp_set.header.encoding, Encoding::ListPack);
         assert_round_trips(&lp_set);
@@ -475,7 +513,12 @@ mod tests {
         let big_members: Vec<Vec<u8>> = (0..200u32)
             .map(|i| format!("member-{i:04}").into_bytes())
             .collect();
-        let ht_set = KvObj::from_new_owned(b"s-ht", NewValueOwned::set(big_members), None);
+        let ht_set = KvObj::from_new_owned(
+            b"s-ht",
+            NewValueOwned::set(big_members),
+            None,
+            &EncodingThresholds::defaults(),
+        );
         assert_eq!(ht_set.header.encoding, Encoding::HashTable);
         assert_round_trips(&ht_set);
 
@@ -487,6 +530,7 @@ mod tests {
                 (b"f2".to_vec(), b"v2".to_vec()),
             ]),
             Some(UnixMillis(7)),
+            &EncodingThresholds::defaults(),
         );
         assert_eq!(lp_hash.header.encoding, Encoding::ListPack);
         assert_round_trips(&lp_hash);
@@ -499,7 +543,12 @@ mod tests {
                 )
             })
             .collect();
-        let ht_hash = KvObj::from_new_owned(b"h-ht", NewValueOwned::hash(big_pairs), None);
+        let ht_hash = KvObj::from_new_owned(
+            b"h-ht",
+            NewValueOwned::hash(big_pairs),
+            None,
+            &EncodingThresholds::defaults(),
+        );
         assert_eq!(ht_hash.header.encoding, Encoding::HashTable);
         assert_round_trips(&ht_hash);
 
@@ -512,6 +561,7 @@ mod tests {
                 (b"c".to_vec(), 3.0),
             ]),
             None,
+            &EncodingThresholds::defaults(),
         );
         assert_eq!(lp_zset.header.encoding, Encoding::ListPack);
         assert_round_trips(&lp_zset);
@@ -519,8 +569,12 @@ mod tests {
         let big_z: Vec<(Vec<u8>, f64)> = (0..200u32)
             .map(|i| (format!("m{i:04}").into_bytes(), f64::from(i)))
             .collect();
-        let sl_zset =
-            KvObj::from_new_owned(b"z-sl", NewValueOwned::zset(big_z), Some(UnixMillis(1)));
+        let sl_zset = KvObj::from_new_owned(
+            b"z-sl",
+            NewValueOwned::zset(big_z),
+            Some(UnixMillis(1)),
+            &EncodingThresholds::defaults(),
+        );
         assert_eq!(sl_zset.header.encoding, Encoding::SkipList);
         assert_round_trips(&sl_zset);
     }
@@ -563,7 +617,12 @@ mod tests {
         let big_pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..600u32)
             .map(|i| (format!("f{i:04}").into_bytes(), b"v".to_vec()))
             .collect();
-        let mut obj = KvObj::from_new_owned(b"h", NewValueOwned::hash(big_pairs), None);
+        let mut obj = KvObj::from_new_owned(
+            b"h",
+            NewValueOwned::hash(big_pairs),
+            None,
+            &EncodingThresholds::defaults(),
+        );
         {
             let h = obj.as_hash_mut().expect("a hash");
             for i in 2..600u32 {

@@ -71,8 +71,9 @@ fn zadd(store: &mut ShardStore, key: &[u8], member: &[u8], score: f64) {
             reply: (),
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let zset = o.as_zset_mut().expect("zset");
-            zset.add(&m, score, ZAddFlags::default());
+            zset.add(&m, score, ZAddFlags::default(), &th);
             RmwStep {
                 action: RmwAction::Mutated,
                 expire: ExpireWrite::Unchanged,
@@ -93,8 +94,9 @@ fn zincrby(store: &mut ShardStore, key: &[u8], member: &[u8], delta: f64) {
             reply: (),
         },
         RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
             let zset = o.as_zset_mut().expect("zset");
-            zset.incr(&m, delta, ZAddFlags::default());
+            zset.incr(&m, delta, ZAddFlags::default(), &th);
             RmwStep {
                 action: RmwAction::Mutated,
                 expire: ExpireWrite::Unchanged,
