@@ -29,6 +29,24 @@ pub const APP_CSS: &str = include_str!("../ui/app.css");
 /// fields are not an XSS sink).
 pub const APP_JS: &str = include_str!("../ui/app.js");
 
+/// The self-hosted `@font-face` declarations (SIL Open Font License 1.1). Served
+/// at `/assets/fonts.css` and imported from `app.css` so the bespoke type faces
+/// load with NO CDN under the strict CSP (`default-src 'self'`). It references the
+/// two woff2 files below by relative URL (`./fonts/<name>.woff2`).
+pub const FONTS_CSS: &str = include_str!("../ui/assets/fonts.css");
+
+/// The Hanken Grotesk variable font (the design system's open substitute for
+/// Aeonik), embedded as raw bytes and served at
+/// `/assets/fonts/hanken-grotesk.woff2` with `Content-Type: font/woff2`.
+pub const FONT_HANKEN_GROTESK_WOFF2: &[u8] =
+    include_bytes!("../ui/assets/fonts/hanken-grotesk.woff2");
+
+/// The JetBrains Mono variable font (the monospace face), embedded as raw bytes
+/// and served at `/assets/fonts/jetbrains-mono.woff2` with `Content-Type:
+/// font/woff2`.
+pub const FONT_JETBRAINS_MONO_WOFF2: &[u8] =
+    include_bytes!("../ui/assets/fonts/jetbrains-mono.woff2");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +63,56 @@ mod tests {
             !INDEX_HTML.contains("<style"),
             "index must not carry an inline <style> block (CSP)"
         );
+        // The bespoke re-skin still carries the IronCache name (the <title>) and
+        // links the SEPARATE stylesheet that imports the self-hosted fonts.
+        assert!(
+            INDEX_HTML.contains("IronCache"),
+            "index must carry the IronCache name"
+        );
+    }
+
+    #[test]
+    fn index_is_csp_clean_no_inline_style_or_handlers() {
+        // The bespoke re-skin must stay CSP-clean: no inline `style="..."`
+        // attribute (all styling is by class in app.css; dynamic values are
+        // CSSOM custom properties set from app.js), and no inline `on*=`
+        // event-handler attribute (all behavior is wired with addEventListener).
+        assert!(
+            !INDEX_HTML.contains(" style="),
+            "index.html must not carry an inline style= attribute (CSP)"
+        );
+        // No inline event handler: an ` on...="` shape (e.g. ` onclick="`).
+        // Scan for ` on` immediately followed (after the event name) by `=`.
+        assert!(
+            !has_inline_handler(INDEX_HTML),
+            "index.html must not carry an inline on*= handler (CSP)"
+        );
+    }
+
+    /// Whether the markup carries an inline event-handler attribute: a whitespace
+    /// then `on`, an alphabetic event name, then `=` (e.g. ` onclick=`). SVG
+    /// presentation attributes and ordinary attributes never match this shape.
+    fn has_inline_handler(html: &str) -> bool {
+        let bytes = html.as_bytes();
+        let mut i = 0;
+        while i + 3 < bytes.len() {
+            // A whitespace boundary before `on`.
+            if bytes[i].is_ascii_whitespace()
+                && bytes[i + 1] == b'o'
+                && bytes[i + 2] == b'n'
+                && bytes[i + 3].is_ascii_alphabetic()
+            {
+                let mut j = i + 3;
+                while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'=' {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
     }
 
     #[test]
@@ -94,12 +162,63 @@ mod tests {
             INDEX_HTML.contains("type=\"password\""),
             "the token field must be a password input"
         );
-        // The panel is hidden by default (revealed by app.js on a 401).
+        // The panel is hidden by default (revealed by app.js on a 401). It now
+        // carries the `login-panel` class among others (the bespoke card style),
+        // so assert the class token is present rather than an exact attribute.
         assert!(
-            INDEX_HTML.contains("id=\"login-panel\"")
-                && INDEX_HTML.contains("class=\"login-panel\""),
+            INDEX_HTML.contains("id=\"login-panel\"") && INDEX_HTML.contains("login-panel"),
             "the login panel must be present"
         );
+    }
+
+    #[test]
+    fn font_assets_are_embedded_non_empty() {
+        // The self-hosted fonts (OFL-1.1) are embedded for the strict CSP (no CDN):
+        // the @font-face stylesheet plus the two woff2 binaries. The stylesheet
+        // references the two relative font URLs that the HTTP layer serves.
+        assert!(!FONTS_CSS.is_empty(), "fonts.css must be embedded");
+        assert!(
+            FONTS_CSS.contains("@font-face"),
+            "fonts.css must declare faces"
+        );
+        assert!(
+            FONTS_CSS.contains("hanken-grotesk.woff2"),
+            "fonts.css must reference the sans woff2"
+        );
+        assert!(
+            FONTS_CSS.contains("jetbrains-mono.woff2"),
+            "fonts.css must reference the mono woff2"
+        );
+        // The woff2 are binary; check they embedded and start with the wOF2 magic.
+        assert!(
+            FONT_HANKEN_GROTESK_WOFF2.starts_with(b"wOF2"),
+            "the sans font must be a woff2 (wOF2 magic)"
+        );
+        assert!(
+            FONT_JETBRAINS_MONO_WOFF2.starts_with(b"wOF2"),
+            "the mono font must be a woff2 (wOF2 magic)"
+        );
+    }
+
+    #[test]
+    fn app_css_imports_self_hosted_fonts() {
+        // app.css must @import the self-hosted fonts at the same origin (no CDN),
+        // and must NOT reference any external font host (Google Fonts etc.).
+        assert!(
+            APP_CSS.contains("@import url('/assets/fonts.css')"),
+            "app.css must import the self-hosted fonts.css"
+        );
+        for cdn in [
+            "fonts.googleapis.com",
+            "fonts.gstatic.com",
+            "https://",
+            "http://",
+        ] {
+            assert!(
+                !APP_CSS.contains(cdn),
+                "app.css must not reference an external host `{cdn}` (CSP/no-CDN)"
+            );
+        }
     }
 
     #[test]

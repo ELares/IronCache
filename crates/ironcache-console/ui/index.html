@@ -1,19 +1,29 @@
 <!DOCTYPE html>
 <!--
   SPDX-License-Identifier: MIT OR Apache-2.0
-  IronCache Console dashboard shell (issue #359). A static, framework-free SPA
-  served by the console's own HTTP responder. CSS and JS are in SEPARATE files
-  so a strict Content-Security-Policy (default-src 'self') needs no
-  'unsafe-inline'. The script renders the panels from the /api/* JSON, escaping
-  every server string into the DOM via textContent (no innerHTML interpolation).
+  IronCache Console dashboard shell (issue #359), re-skinned to the bespoke Butlr
+  design system. A static, framework-free SPA served by the console's own HTTP
+  responder. CSS and JS are in SEPARATE files and the fonts are self-hosted, so a
+  strict Content-Security-Policy (default-src 'self') needs no 'unsafe-inline'
+  and no CDN. There are NO inline style attributes, NO inline stylesheet or
+  script blocks, and NO inline event-handler attributes anywhere in this file:
+  all styling lives in app.css as classes, all behavior is wired in app.js via
+  addEventListener, and any dynamic value (bar widths, sparkline, theme) is
+  driven from app.js through CSS custom properties (CSSOM) or classList toggling.
 
-  UI auth (follow-up to #360): the OPEN panels (header + cluster totals) always
-  render with no token. The PRIVILEGED_READ panels (nodes, slowlog, clients,
+  The script renders the panels from the /api/* JSON, escaping every server
+  string into the DOM via textContent / createTextNode / createElementNS only
+  (no innerHTML interpolation).
+
+  UI auth (follow-up to #360): the OPEN views (overview + cluster totals) always
+  render with no token. The PRIVILEGED_READ views (nodes, slowlog, clients,
   keyspace) need a Bearer token when the console is exposed/authenticated; the
-  sign-in panel below is hidden by default and revealed by app.js only when a
-  privileged fetch returns 401. On the loopback dev default (no token) every
-  panel renders without signing in. The token lives in sessionStorage and is
-  sent ONLY as an Authorization header; it is never written to the DOM/markup.
+  sign-in panel is hidden by default and revealed by app.js only when a
+  privileged fetch returns 401. The token lives in sessionStorage and is sent
+  ONLY as an Authorization header; it is never written to the DOM/markup.
+
+  The inline <svg> icons are STATIC markup (SVG element nodes, not innerHTML), so
+  they are CSP-safe and need no icon CDN (no Material Symbols fetch).
 -->
 <html lang="en">
   <head>
@@ -30,182 +40,559 @@
       </p>
     </noscript>
 
-    <header class="topbar">
-      <div class="brand">
-        <span class="logo">IronCache</span>
-        <span class="subtitle">Console</span>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-word">ironcache</span>
+        </div>
+
+        <nav class="nav" aria-label="Primary">
+          <div class="nav-group">
+            <p class="nav-group-label">Monitor</p>
+            <button type="button" class="nav-item" data-section="overview">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="7" height="9"></rect>
+                <rect x="14" y="3" width="7" height="5"></rect>
+                <rect x="14" y="12" width="7" height="9"></rect>
+                <rect x="3" y="16" width="7" height="5"></rect>
+              </svg>
+              <span class="nav-label">Overview</span>
+            </button>
+            <button type="button" class="nav-item" data-section="nodes">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="5" rx="1"></rect>
+                <rect x="3" y="15" width="18" height="5" rx="1"></rect>
+                <path d="M7 9v6M17 9v6"></path>
+                <circle cx="6.5" cy="6.5" r=".6"></circle>
+                <circle cx="6.5" cy="17.5" r=".6"></circle>
+              </svg>
+              <span class="nav-label">Nodes</span>
+            </button>
+            <button type="button" class="nav-item" data-section="slowlog">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="8" y1="6" x2="20" y2="6"></line>
+                <line x1="8" y1="12" x2="20" y2="12"></line>
+                <line x1="8" y1="18" x2="20" y2="18"></line>
+                <circle cx="4" cy="6" r="1"></circle>
+                <circle cx="4" cy="12" r="1"></circle>
+                <circle cx="4" cy="18" r="1"></circle>
+              </svg>
+              <span class="nav-label">Slowlog</span>
+            </button>
+            <button type="button" class="nav-item" data-section="clients">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2" y="9" width="6" height="6" rx="1"></rect>
+                <rect x="16" y="9" width="6" height="6" rx="1"></rect>
+                <path d="M8 12h3M13 12h3"></path>
+              </svg>
+              <span class="nav-label">Clients</span>
+            </button>
+            <button type="button" class="nav-item" data-section="keyspace">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="8" cy="8" r="4"></circle>
+                <path d="M11 11l8 8M16 16l2-2M18 18l2-2"></path>
+              </svg>
+              <span class="nav-label">Keyspace</span>
+            </button>
+          </div>
+
+          <div class="nav-group">
+            <p class="nav-group-label">Topology</p>
+            <button type="button" class="nav-item" data-section="cluster">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="5" r="2.2"></circle>
+                <circle cx="5" cy="18" r="2.2"></circle>
+                <circle cx="19" cy="18" r="2.2"></circle>
+                <path d="M12 7.2v4M10.2 12.6 6.4 16M13.8 12.6 17.6 16"></path>
+              </svg>
+              <span class="nav-label">Cluster</span>
+            </button>
+            <button type="button" class="nav-item" data-section="replication">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M4 9a8 8 0 0 1 13-3l3 3"></path>
+                <path d="M20 15a8 8 0 0 1-13 3l-3-3"></path>
+                <path d="M20 4v5h-5M4 20v-5h5"></path>
+              </svg>
+              <span class="nav-label">Replication</span>
+            </button>
+            <button type="button" class="nav-item" data-section="shards">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="7" height="7"></rect>
+                <rect x="14" y="3" width="7" height="7"></rect>
+                <rect x="3" y="14" width="7" height="7"></rect>
+                <rect x="14" y="14" width="7" height="7"></rect>
+              </svg>
+              <span class="nav-label">Shards</span>
+            </button>
+          </div>
+
+          <div class="nav-group">
+            <p class="nav-group-label">Manage</p>
+            <button type="button" class="nav-item" data-section="console">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+                <path d="M7 9l3 3-3 3M13 15h4"></path>
+              </svg>
+              <span class="nav-label">Console</span>
+            </button>
+            <button type="button" class="nav-item" data-section="pubsub">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M4 11a8 8 0 0 1 8-8M4 7a12 12 0 0 1 12-3"></path>
+                <circle cx="5" cy="18" r="2"></circle>
+                <path d="M9 19h11M16 16l4 3-4 3"></path>
+              </svg>
+              <span class="nav-label">Pub/Sub</span>
+            </button>
+            <button type="button" class="nav-item" data-section="config">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="4" y1="7" x2="20" y2="7"></line>
+                <line x1="4" y1="17" x2="20" y2="17"></line>
+                <circle cx="9" cy="7" r="2.2"></circle>
+                <circle cx="15" cy="17" r="2.2"></circle>
+              </svg>
+              <span class="nav-label">Config</span>
+            </button>
+            <button type="button" class="nav-item" data-section="acl">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path>
+                <path d="M9 12l2 2 4-4"></path>
+              </svg>
+              <span class="nav-label">ACL</span>
+            </button>
+          </div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span class="sidebar-footer-name">IronCache</span>
+          <span class="sidebar-footer-version mono" id="sidebar-version">-</span>
+        </div>
+      </aside>
+
+      <div class="content">
+        <header class="topbar">
+          <div class="topbar-titles">
+            <h1 class="topbar-title" id="page-title">Overview</h1>
+            <p class="topbar-subtitle" id="page-subtitle">
+              Live cluster metrics
+            </p>
+          </div>
+
+          <div class="topbar-controls">
+            <div class="cluster-pill" id="cluster-pill">
+              <span class="dot" id="cluster-dot" aria-hidden="true"></span>
+              <span class="cluster-pill-label" id="cluster-pill-label">Cluster</span>
+              <span class="cluster-pill-count mono" id="cluster-pill-count">-</span>
+            </div>
+
+            <label class="node-select-wrap" for="node-select">
+              <span class="visually-hidden">Node</span>
+              <select id="node-select" class="node-select">
+                <option value="all">All nodes</option>
+              </select>
+            </label>
+
+            <button type="button" class="live-pill" id="live-toggle" aria-pressed="true">
+              <span class="dot dot-live" aria-hidden="true"></span>
+              <span class="live-pill-label">Live</span>
+              <span class="toggle" aria-hidden="true"><span class="toggle-knob"></span></span>
+            </button>
+
+            <button type="button" class="icon-btn" id="refresh-btn" aria-label="Refresh now">
+              <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M4 11a8 8 0 0 1 13.7-5.3L20 8"></path>
+                <path d="M20 4v4h-4"></path>
+                <path d="M20 13a8 8 0 0 1-13.7 5.3L4 16"></path>
+                <path d="M4 20v-4h4"></path>
+              </svg>
+            </button>
+
+            <button type="button" class="icon-btn" id="theme-toggle" aria-label="Toggle theme">
+              <svg viewBox="0 0 24 24" class="icon icon-sun" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="4"></circle>
+                <path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"></path>
+              </svg>
+              <svg viewBox="0 0 24 24" class="icon icon-moon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 14.5A8 8 0 0 1 9.5 4 7 7 0 1 0 20 14.5z"></path>
+              </svg>
+            </button>
+
+            <span class="avatar" aria-hidden="true">AO</span>
+          </div>
+        </header>
+
+        <main class="main">
+          <div id="banner" class="banner" hidden></div>
+          <div id="waiting" class="banner banner-wait" hidden>
+            Waiting for the first node poll...
+          </div>
+
+          <section
+            id="login-panel"
+            class="login-panel card"
+            aria-labelledby="login-title"
+            hidden
+          >
+            <h2 id="login-title" class="card-title">Sign in</h2>
+            <p class="login-note">
+              This console is exposed/authenticated, so the nodes, slowlog,
+              clients, and keyspace views need an operator token. Paste a read or
+              admin token to view them. On the loopback dev default (no token
+              configured) every view renders without signing in. The token is
+              kept only for this tab and is sent only as an Authorization header;
+              it is never stored in the page.
+            </p>
+            <form id="login-form" class="login-form" autocomplete="off">
+              <label class="login-label" for="login-token">Operator token</label>
+              <input
+                id="login-token"
+                class="login-input mono"
+                type="password"
+                name="token"
+                autocomplete="off"
+                autocapitalize="off"
+                autocorrect="off"
+                spellcheck="false"
+                placeholder="read or admin token"
+              />
+              <div class="login-actions">
+                <button id="login-submit" class="btn btn-primary" type="submit">
+                  Sign in
+                </button>
+                <button id="logout-submit" class="btn" type="button">
+                  Sign out
+                </button>
+              </div>
+            </form>
+            <p id="login-status" class="login-status" hidden></p>
+          </section>
+
+          <!-- Overview (real data) -->
+          <section class="section" id="section-overview" data-section-panel="overview">
+            <div class="metric-grid">
+              <div class="card metric-card">
+                <div class="metric-head">
+                  <span class="metric-label">Throughput</span>
+                  <span class="metric-chip" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M13 2 4 14h7l-1 8 9-12h-7z"></path>
+                    </svg>
+                  </span>
+                </div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="m-throughput">-</span>
+                  <span class="metric-unit">ops/s</span>
+                </div>
+                <p class="metric-delta" id="m-throughput-delta">over the last poll</p>
+              </div>
+
+              <div class="card metric-card">
+                <div class="metric-head">
+                  <span class="metric-label">Hit rate</span>
+                  <span class="metric-chip" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="12" cy="12" r="9"></circle>
+                      <circle cx="12" cy="12" r="4.5"></circle>
+                      <circle cx="12" cy="12" r=".6"></circle>
+                    </svg>
+                  </span>
+                </div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="m-hitrate">-</span>
+                  <span class="metric-unit">%</span>
+                </div>
+                <p class="metric-delta" id="m-hitrate-delta">hits / (hits + misses)</p>
+              </div>
+
+              <div class="card metric-card">
+                <div class="metric-head">
+                  <span class="metric-label">Memory</span>
+                  <span class="metric-chip" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="3" y="7" width="18" height="10" rx="1"></rect>
+                      <path d="M7 7V4M12 7V4M17 7V4M7 17v3M12 17v3M17 17v3"></path>
+                    </svg>
+                  </span>
+                </div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="m-memory">-</span>
+                  <span class="metric-unit" id="m-memory-unit"></span>
+                </div>
+                <p class="metric-delta" id="m-memory-delta">used by the cache</p>
+              </div>
+
+              <div class="card metric-card">
+                <div class="metric-head">
+                  <span class="metric-label">Keys</span>
+                  <span class="metric-chip" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="8" cy="8" r="4"></circle>
+                      <path d="M11 11l8 8M16 16l2-2M18 18l2-2"></path>
+                    </svg>
+                  </span>
+                </div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="m-keys">-</span>
+                  <span class="metric-unit">keys</span>
+                </div>
+                <p class="metric-delta" id="m-keys-delta">across all databases</p>
+              </div>
+
+              <div class="card metric-card">
+                <div class="metric-head">
+                  <span class="metric-label">Clients</span>
+                  <span class="metric-chip" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="9" cy="8" r="3"></circle>
+                      <path d="M3 20a6 6 0 0 1 12 0"></path>
+                      <path d="M16 5.5a3 3 0 0 1 0 5M21 20a6 6 0 0 0-5-5.9"></path>
+                    </svg>
+                  </span>
+                </div>
+                <div class="metric-value-row">
+                  <span class="metric-value" id="m-clients">-</span>
+                  <span class="metric-unit">connected</span>
+                </div>
+                <p class="metric-delta" id="m-clients-delta">live connections</p>
+              </div>
+            </div>
+
+            <div class="overview-row">
+              <div class="card chart-card">
+                <div class="card-head">
+                  <h2 class="card-title">Operations / second</h2>
+                  <span class="card-sub">last 60s</span>
+                </div>
+                <div class="spark-wrap" id="spark-wrap">
+                  <svg class="spark" id="spark" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg>
+                  <p class="spark-empty" id="spark-empty">Collecting samples...</p>
+                </div>
+              </div>
+
+              <div class="card nodes-summary-card">
+                <div class="card-head">
+                  <h2 class="card-title">Nodes</h2>
+                  <span class="card-sub" id="nodes-summary-count">-</span>
+                </div>
+                <div class="node-rows" id="node-rows">
+                  <p class="placeholder">No data yet.</p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Nodes (real data) -->
+          <section class="section" id="section-nodes" data-section-panel="nodes" hidden>
+            <div class="card table-card">
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Address</th>
+                      <th>Reachable</th>
+                      <th>Version</th>
+                      <th>Memory</th>
+                      <th>Keys</th>
+                      <th>Clients</th>
+                      <th>Hit ratio</th>
+                      <th>Error</th>
+                    </tr>
+                  </thead>
+                  <tbody id="nodes-body">
+                    <tr><td colspan="8" class="empty">No data yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- Slowlog (real data, privileged) -->
+          <section class="section" id="section-slowlog" data-section-panel="slowlog" hidden>
+            <div class="card table-card">
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Node</th>
+                      <th>Timestamp</th>
+                      <th>Micros</th>
+                      <th>Command</th>
+                      <th>Client</th>
+                    </tr>
+                  </thead>
+                  <tbody id="slowlog-body">
+                    <tr><td colspan="5" class="empty">No data yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- Clients (real data, privileged) -->
+          <section class="section" id="section-clients" data-section-panel="clients" hidden>
+            <div class="card table-card">
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Node</th>
+                      <th>Address</th>
+                      <th>Name</th>
+                      <th>Age</th>
+                      <th>Idle</th>
+                      <th>Cmd</th>
+                      <th>DB</th>
+                    </tr>
+                  </thead>
+                  <tbody id="clients-body">
+                    <tr><td colspan="7" class="empty">No data yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- Keyspace (real data, privileged) -->
+          <section class="section" id="section-keyspace" data-section-panel="keyspace" hidden>
+            <div class="card table-card">
+              <p class="keyspace-total">
+                Total keys: <span class="mono" id="ks-total">-</span>
+              </p>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Node</th>
+                      <th>DB</th>
+                      <th>Keys</th>
+                      <th>Expires</th>
+                    </tr>
+                  </thead>
+                  <tbody id="keyspace-body">
+                    <tr><td colspan="4" class="empty">No data yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- Gated views: honest empty states, NO fabricated data. -->
+          <section class="section" id="section-cluster" data-section-panel="cluster" hidden>
+            <div class="card empty-state">
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="5" r="2.2"></circle>
+                  <circle cx="5" cy="18" r="2.2"></circle>
+                  <circle cx="19" cy="18" r="2.2"></circle>
+                  <path d="M12 7.2v4M10.2 12.6 6.4 16M13.8 12.6 17.6 16"></path>
+                </svg>
+              </span>
+              <h2 class="empty-title">Cluster topology</h2>
+              <p class="empty-sub">
+                Cluster topology is available when the deployment runs in raft
+                cluster mode. This node is standalone.
+              </p>
+            </div>
+          </section>
+
+          <section class="section" id="section-replication" data-section-panel="replication" hidden>
+            <div class="card empty-state">
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 9a8 8 0 0 1 13-3l3 3"></path>
+                  <path d="M20 15a8 8 0 0 1-13 3l-3-3"></path>
+                  <path d="M20 4v5h-5M4 20v-5h5"></path>
+                </svg>
+              </span>
+              <h2 class="empty-title">Replication</h2>
+              <p class="empty-sub">
+                Replication view appears when replicas are attached.
+              </p>
+            </div>
+          </section>
+
+          <section class="section" id="section-shards" data-section-panel="shards" hidden>
+            <div class="card empty-state">
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="7" height="7"></rect>
+                  <rect x="14" y="3" width="7" height="7"></rect>
+                  <rect x="3" y="14" width="7" height="7"></rect>
+                  <rect x="14" y="14" width="7" height="7"></rect>
+                </svg>
+              </span>
+              <h2 class="empty-title">Shards</h2>
+              <p class="empty-sub">
+                Per-shard breakdown requires per-shard metric labels (engine
+                issue #362). This node is standalone.
+              </p>
+            </div>
+          </section>
+
+          <section class="section" id="section-console" data-section-panel="console" hidden>
+            <div class="card empty-state">
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+                  <path d="M7 9l3 3-3 3M13 15h4"></path>
+                </svg>
+              </span>
+              <h2 class="empty-title">Console</h2>
+              <p class="empty-sub">
+                Management actions land in a later phase (#361/#371).
+              </p>
+            </div>
+          </section>
+
+          <section class="section" id="section-pubsub" data-section-panel="pubsub" hidden>
+            <div class="card empty-state">
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 11a8 8 0 0 1 8-8M4 7a12 12 0 0 1 12-3"></path>
+                  <circle cx="5" cy="18" r="2"></circle>
+                  <path d="M9 19h11M16 16l4 3-4 3"></path>
+                </svg>
+              </span>
+              <h2 class="empty-title">Pub/Sub</h2>
+              <p class="empty-sub">
+                Management actions land in a later phase (#361/#371).
+              </p>
+            </div>
+          </section>
+
+          <section class="section" id="section-config" data-section-panel="config" hidden>
+            <div class="card empty-state">
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="4" y1="7" x2="20" y2="7"></line>
+                  <line x1="4" y1="17" x2="20" y2="17"></line>
+                  <circle cx="9" cy="7" r="2.2"></circle>
+                  <circle cx="15" cy="17" r="2.2"></circle>
+                </svg>
+              </span>
+              <h2 class="empty-title">Config</h2>
+              <p class="empty-sub">
+                Management actions land in a later phase (#361/#371).
+              </p>
+            </div>
+          </section>
+
+          <section class="section" id="section-acl" data-section-panel="acl" hidden>
+            <div class="card empty-state">
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path>
+                  <path d="M9 12l2 2 4-4"></path>
+                </svg>
+              </span>
+              <h2 class="empty-title">ACL</h2>
+              <p class="empty-sub">
+                Management actions land in a later phase (#361/#371).
+              </p>
+            </div>
+          </section>
+        </main>
       </div>
-      <dl class="status">
-        <div class="status-item">
-          <dt>Mode</dt>
-          <dd id="hdr-mode">-</dd>
-        </div>
-        <div class="status-item">
-          <dt>Nodes</dt>
-          <dd id="hdr-nodes">-</dd>
-        </div>
-        <div class="status-item">
-          <dt>Last poll</dt>
-          <dd id="hdr-poll">-</dd>
-        </div>
-        <div class="status-item">
-          <dt>Version</dt>
-          <dd id="hdr-version">-</dd>
-        </div>
-      </dl>
-    </header>
-
-    <div id="banner" class="banner" hidden></div>
-    <div id="waiting" class="banner banner-wait" hidden>
-      Waiting for the first node poll...
     </div>
-
-    <section
-      id="login-panel"
-      class="login-panel"
-      aria-labelledby="login-title"
-      hidden
-    >
-      <h2 id="login-title">Sign in</h2>
-      <p class="login-note">
-        This console is exposed/authenticated, so the nodes, slowlog, clients,
-        and keyspace panels need an operator token. Paste a read or admin token
-        to view them. On the loopback dev default (no token configured) every
-        panel renders without signing in. The token is kept only for this tab
-        and is sent only as an Authorization header; it is never stored in the
-        page.
-      </p>
-      <form id="login-form" class="login-form" autocomplete="off">
-        <label class="login-label" for="login-token">Operator token</label>
-        <input
-          id="login-token"
-          class="login-input"
-          type="password"
-          name="token"
-          autocomplete="off"
-          autocapitalize="off"
-          autocorrect="off"
-          spellcheck="false"
-          placeholder="read or admin token"
-        />
-        <div class="login-actions">
-          <button id="login-submit" class="btn btn-primary" type="submit">
-            Sign in
-          </button>
-          <button id="logout-submit" class="btn" type="button">
-            Sign out
-          </button>
-        </div>
-      </form>
-      <p id="login-status" class="login-status" hidden></p>
-    </section>
-
-    <main>
-      <section class="panel" aria-labelledby="totals-title">
-        <h2 id="totals-title">Cluster totals</h2>
-        <div class="cards" id="totals-cards">
-          <div class="card"><span class="card-label">Keys</span><span class="card-value" id="t-keys">-</span></div>
-          <div class="card"><span class="card-label">Used memory</span><span class="card-value" id="t-mem">-</span></div>
-          <div class="card"><span class="card-label">Connected clients</span><span class="card-value" id="t-clients">-</span></div>
-          <div class="card"><span class="card-label">Hit ratio</span><span class="card-value" id="t-hit">-</span></div>
-          <div class="card"><span class="card-label">Evictions</span><span class="card-value" id="t-evict">-</span></div>
-          <div class="card"><span class="card-label">Expirations</span><span class="card-value" id="t-expire">-</span></div>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="nodes-title">
-        <h2 id="nodes-title">Nodes</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Address</th>
-                <th>Reachable</th>
-                <th>Version</th>
-                <th>Memory</th>
-                <th>Keys</th>
-                <th>Clients</th>
-                <th>Hit ratio</th>
-                <th>Error</th>
-              </tr>
-            </thead>
-            <tbody id="nodes-body">
-              <tr><td colspan="8" class="empty">No data yet.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="slowlog-title">
-        <h2 id="slowlog-title">Slowlog</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Node</th>
-                <th>Timestamp</th>
-                <th>Micros</th>
-                <th>Command</th>
-                <th>Client</th>
-              </tr>
-            </thead>
-            <tbody id="slowlog-body">
-              <tr><td colspan="5" class="empty">No data yet.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="clients-title">
-        <h2 id="clients-title">Clients</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Node</th>
-                <th>Address</th>
-                <th>Name</th>
-                <th>Age</th>
-                <th>Idle</th>
-                <th>Cmd</th>
-                <th>DB</th>
-              </tr>
-            </thead>
-            <tbody id="clients-body">
-              <tr><td colspan="7" class="empty">No data yet.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="keyspace-title">
-        <h2 id="keyspace-title">Keyspace</h2>
-        <p class="keyspace-total">Total keys: <span id="ks-total">-</span></p>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Node</th>
-                <th>DB</th>
-                <th>Keys</th>
-                <th>Expires</th>
-              </tr>
-            </thead>
-            <tbody id="keyspace-body">
-              <tr><td colspan="4" class="empty">No data yet.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </main>
-
-    <footer class="footer">
-      <span>
-        IronCache Console - the privileged panels are behind the auth tier
-        (#360); sign in with an operator token when the console is exposed.
-        VPN-locked exposure (#369) still applies before exposure.
-      </span>
-    </footer>
 
     <script src="/app.js"></script>
   </body>

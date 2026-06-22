@@ -259,6 +259,21 @@ impl ConsoleHttpState {
                 crate::assets::APP_JS.as_bytes(),
                 head,
             ),
+            // The self-hosted fonts (no CDN, for the strict CSP). The stylesheet
+            // is `@import`ed by `app.css` and references the two woff2 by relative
+            // URL; each carries the same strict UI security headers. The woff2 are
+            // BINARY: served as raw bytes with `Content-Type: font/woff2`.
+            "/assets/fonts.css" => ui_response(
+                "text/css; charset=utf-8",
+                crate::assets::FONTS_CSS.as_bytes(),
+                head,
+            ),
+            "/assets/fonts/hanken-grotesk.woff2" => {
+                ui_response("font/woff2", crate::assets::FONT_HANKEN_GROTESK_WOFF2, head)
+            }
+            "/assets/fonts/jetbrains-mono.woff2" => {
+                ui_response("font/woff2", crate::assets::FONT_JETBRAINS_MONO_WOFF2, head)
+            }
             "/metrics" => http_response(
                 200,
                 "OK",
@@ -699,6 +714,94 @@ mod tests {
             resp.contains("Content-Security-Policy: default-src 'self'"),
             "{resp}"
         );
+    }
+
+    #[test]
+    fn fonts_css_is_served_as_css_with_the_security_headers() {
+        let resp = String::from_utf8(test_state().respond("GET", "/assets/fonts.css")).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(
+            resp.contains("Content-Type: text/css; charset=utf-8"),
+            "{resp}"
+        );
+        // The self-hosted fonts carry the SAME strict UI security headers.
+        assert!(
+            resp.contains("Content-Security-Policy: default-src 'self'"),
+            "{resp}"
+        );
+        assert!(resp.contains("X-Content-Type-Options: nosniff"), "{resp}");
+        let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(body.contains("@font-face"), "{body}");
+    }
+
+    #[test]
+    fn woff2_fonts_serve_as_binary_with_font_woff2_type() {
+        for path in [
+            "/assets/fonts/hanken-grotesk.woff2",
+            "/assets/fonts/jetbrains-mono.woff2",
+        ] {
+            let resp = String::from_utf8_lossy(&test_state().respond("GET", path)).into_owned();
+            assert!(resp.starts_with("HTTP/1.1 200 OK"), "{path}: {resp}");
+            assert!(resp.contains("Content-Type: font/woff2"), "{path}: {resp}");
+            // The strict UI security headers apply to the font binaries too.
+            assert!(
+                resp.contains("Content-Security-Policy: default-src 'self'"),
+                "{path}: {resp}"
+            );
+            // The body is the raw woff2 (wOF2 magic), not re-encoded.
+            let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+            assert!(body.starts_with("wOF2"), "{path}: body must be raw woff2");
+        }
+    }
+
+    #[test]
+    fn head_on_a_woff2_has_headers_and_correct_length_but_no_body() {
+        let raw = test_state().respond("HEAD", "/assets/fonts/hanken-grotesk.woff2");
+        let resp = String::from_utf8_lossy(&raw).into_owned();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(resp.contains("Content-Type: font/woff2"), "{resp}");
+        let (header, body) = resp.split_once("\r\n\r\n").unwrap();
+        let cl: usize = header
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // HEAD: the Content-Length reflects the GET body, but no body bytes follow.
+        assert_eq!(cl, crate::assets::FONT_HANKEN_GROTESK_WOFF2.len());
+        assert!(body.is_empty(), "HEAD must not return a body");
+    }
+
+    #[test]
+    fn index_served_bytes_are_csp_clean() {
+        // The served HTML must be CSP-clean: no inline style= attribute and no
+        // inline on*= event handler (all styling is by class, all behavior is
+        // wired with addEventListener). It also still links the separate assets.
+        let resp = String::from_utf8(test_state().respond("GET", "/")).unwrap();
+        let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(
+            !body.contains(" style="),
+            "served index must have no inline style="
+        );
+        assert!(
+            !body.contains(" onclick"),
+            "served index must have no onclick"
+        );
+        assert!(
+            !body.contains(" onsubmit"),
+            "served index must have no onsubmit"
+        );
+        assert!(
+            !body.contains(" onload"),
+            "served index must have no onload"
+        );
+        assert!(
+            !body.contains(" onerror"),
+            "served index must have no onerror"
+        );
+        assert!(body.contains("/app.css"), "{body}");
+        assert!(body.contains("/app.js"), "{body}");
     }
 
     #[test]

@@ -165,6 +165,16 @@ struct ClusterTotals {
     keyspace_misses: u64,
     evicted_keys: u64,
     expired_keys: u64,
+    /// `total_commands_processed` summed across the reachable nodes (the standard
+    /// INFO Stats counter). The dashboard derives ops/second client-side by
+    /// differencing this counter between two polls, which is why the console
+    /// exposes the raw aggregate rather than a rate. Aggregate-only, so it stays
+    /// in the OPEN tier with the other cluster totals.
+    commands_processed: u64,
+    /// `total_connections_received` summed across the reachable nodes (the
+    /// standard INFO Stats counter), exposed for the same client-side rate
+    /// derivation as `commands_processed`.
+    connections_received: u64,
 }
 
 /// `GET /api/nodes` element: a compact per-node summary for the node list. The
@@ -360,6 +370,12 @@ fn cluster(topo: &Topology) -> ApiResponse {
         totals.expired_keys = totals
             .expired_keys
             .saturating_add(info.expired_keys.unwrap_or(0));
+        totals.commands_processed = totals
+            .commands_processed
+            .saturating_add(info.total_commands_processed.unwrap_or(0));
+        totals.connections_received = totals
+            .connections_received
+            .saturating_add(info.total_connections_received.unwrap_or(0));
     }
     ApiResponse::ok(&ClusterOverview {
         mode: topo.mode,
@@ -965,7 +981,9 @@ const OPENAPI_JSON: &str = r##"{
           "keyspace_hits": { "type": "integer", "format": "int64" },
           "keyspace_misses": { "type": "integer", "format": "int64" },
           "evicted_keys": { "type": "integer", "format": "int64" },
-          "expired_keys": { "type": "integer", "format": "int64" }
+          "expired_keys": { "type": "integer", "format": "int64" },
+          "commands_processed": { "type": "integer", "format": "int64" },
+          "connections_received": { "type": "integer", "format": "int64" }
         }
       },
       "ClusterOverview": {
@@ -1152,6 +1170,8 @@ mod tests {
             keyspace_misses: Some(20),
             evicted_keys: Some(1),
             expired_keys: Some(4),
+            total_commands_processed: Some(5000),
+            total_connections_received: Some(120),
             total_keys: Some(15),
             cluster_enabled: false,
             raw,
@@ -1236,6 +1256,8 @@ mod tests {
         assert_eq!(v["totals"]["used_memory"], 1024);
         assert_eq!(v["totals"]["connected_clients"], 3);
         assert_eq!(v["totals"]["keyspace_hits"], 80);
+        assert_eq!(v["totals"]["commands_processed"], 5000);
+        assert_eq!(v["totals"]["connections_received"], 120);
     }
 
     #[test]

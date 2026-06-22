@@ -41,6 +41,8 @@ pub struct NodeInfo {
     pub keyspace_misses: Option<u64>,
     /// `total_commands_processed`.
     pub total_commands_processed: Option<u64>,
+    /// `total_connections_received`.
+    pub total_connections_received: Option<u64>,
     /// `evicted_keys`.
     pub evicted_keys: Option<u64>,
     /// `expired_keys`.
@@ -120,6 +122,7 @@ pub fn parse_info(body: &str) -> NodeInfo {
         keyspace_hits: u("keyspace_hits"),
         keyspace_misses: u("keyspace_misses"),
         total_commands_processed: u("total_commands_processed"),
+        total_connections_received: u("total_connections_received"),
         evicted_keys: u("evicted_keys"),
         expired_keys: u("expired_keys"),
         rdb_last_save_time: u("rdb_last_save_time"),
@@ -164,6 +167,7 @@ mod tests {
         \r\n\
         # Stats\r\n\
         total_commands_processed:9999\r\n\
+        total_connections_received:321\r\n\
         expired_keys:13\r\n\
         evicted_keys:5\r\n\
         keyspace_hits:800\r\n\
@@ -188,6 +192,7 @@ mod tests {
         assert_eq!(info.keyspace_hits, Some(800));
         assert_eq!(info.keyspace_misses, Some(200));
         assert_eq!(info.total_commands_processed, Some(9999));
+        assert_eq!(info.total_connections_received, Some(321));
         assert_eq!(info.evicted_keys, Some(5));
         assert_eq!(info.expired_keys, Some(13));
         assert_eq!(info.rdb_last_save_time, Some(1_700_000_000));
