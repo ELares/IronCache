@@ -157,6 +157,44 @@ async fn api_cluster_and_nodes_over_tcp() {
     assert_eq!(v["openapi"], "3.0.3");
 }
 
+/// SECURITY (#369): the `/api/*` JSON responses carry `X-Content-Type-Options:
+/// nosniff` and `Cache-Control: no-store` over a real socket, while the probe and
+/// metrics responses do NOT carry `Cache-Control` (the headers are scoped to the
+/// API surface only). Exercises the SAME bounded responder end to end.
+#[tokio::test]
+async fn api_responses_carry_security_headers_over_tcp() {
+    let state = ConsoleHttpState::new(Arc::new(ConsoleMetrics::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    state.set_live(true);
+    let serving = state.clone();
+    tokio::spawn(async move {
+        accept_loop(listener, serving).await;
+    });
+
+    // An /api/* response (health, no poll needed) carries nosniff + no-store.
+    let health = http_get(addr, "/api/health").await;
+    assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
+    assert!(
+        health.contains("Content-Type: application/json"),
+        "{health}"
+    );
+    assert!(
+        health.contains("X-Content-Type-Options: nosniff"),
+        "{health}"
+    );
+    assert!(health.contains("Cache-Control: no-store"), "{health}");
+
+    // The probes/metrics do NOT carry Cache-Control (scoped to /api/* only).
+    for path in ["/livez", "/readyz", "/metrics"] {
+        let resp = http_get(addr, path).await;
+        assert!(
+            !resp.contains("Cache-Control"),
+            "{path} must not carry Cache-Control: {resp}"
+        );
+    }
+}
+
 /// A stub history source for the integration test: returns a canned series for any
 /// allowed metric, so the `/api/timeseries` 200 path can be exercised end to end
 /// over a real socket without a Prometheus.

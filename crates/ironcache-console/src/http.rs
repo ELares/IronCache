@@ -151,13 +151,9 @@ impl ConsoleHttpState {
         let bare = path.split('?').next().unwrap_or(path);
         if api::is_api_path(bare) {
             if method != "GET" && !head {
-                return http_response(
-                    405,
-                    "Method Not Allowed",
-                    "text/plain; charset=utf-8",
-                    b"",
-                    head,
-                );
+                // An `/api/*` response: carry the API security headers (nosniff +
+                // no-store) like every other API outcome.
+                return api_response(405, status_reason(405), b"", head);
             }
             // AUTH/RBAC GATE (#360): every `/api/*` route maps to a tier; the
             // policy decides allow / 401 / 403 from the (bind, token) posture and
@@ -172,19 +168,17 @@ impl ConsoleHttpState {
             match auth::authorize(&self.auth, required, auth_header) {
                 Decision::Allow => {}
                 Decision::Unauthorized(reason) => {
-                    return http_response(
+                    return api_response(
                         401,
                         status_reason(401),
-                        api::CONTENT_TYPE,
                         api::error_json(reason).as_bytes(),
                         head,
                     );
                 }
                 Decision::Forbidden(reason) => {
-                    return http_response(
+                    return api_response(
                         403,
                         status_reason(403),
-                        api::CONTENT_TYPE,
                         api::error_json(reason).as_bytes(),
                         head,
                     );
@@ -211,10 +205,9 @@ impl ConsoleHttpState {
                 let guard = self.topology.read().await;
                 api::handle(bare, guard.as_ref(), &ctx)
             };
-            return http_response(
+            return api_response(
                 resp.status,
                 status_reason(resp.status),
-                api::CONTENT_TYPE,
                 resp.body.as_bytes(),
                 head,
             );
@@ -340,6 +333,20 @@ const UI_SECURITY_HEADERS: &str = concat!(
     "Referrer-Policy: no-referrer\r\n",
 );
 
+/// The extra response headers carried by EVERY `/api/*` JSON response (#369). The
+/// API data is sensitive (node addresses, slowlog argv = key names, client IPs)
+/// and must NOT be content-sniffed or cached: `X-Content-Type-Options: nosniff`
+/// stops a browser from re-typing the `application/json` body, and `Cache-Control:
+/// no-store` keeps the privileged data out of any shared/disk cache. These are
+/// applied ONLY to `/api/*` (success, 401, 403, 405); the probe routes
+/// (`/livez`/`/readyz`/`/metrics`), the UI assets, and their byte-for-byte tests
+/// are untouched. Each line is `Name: value\r\n`; the builder inserts the block
+/// before the blank-line terminator.
+const API_SECURITY_HEADERS: &str = concat!(
+    "X-Content-Type-Options: nosniff\r\n",
+    "Cache-Control: no-store\r\n",
+);
+
 /// Build a complete HTTP/1.1 response (status line, content headers,
 /// `Connection: close`, body). One request per connection. When `head` is true
 /// the `Content-Length` reflects what a GET would return but NO body bytes are
@@ -353,6 +360,21 @@ fn http_response(code: u16, reason: &str, content_type: &str, body: &[u8], head:
 /// with the correct `Content-Length` but no body.
 fn ui_response(content_type: &str, body: &[u8], head: bool) -> Vec<u8> {
     http_response_with_headers(200, "OK", content_type, body, head, UI_SECURITY_HEADERS)
+}
+
+/// An `/api/*` JSON response carrying the [`API_SECURITY_HEADERS`] (`nosniff` +
+/// `no-store`) on top of the normal content headers (#369). Used for every
+/// `/api/*` outcome (success, 401, 403, 405) so the sensitive data is never
+/// sniffed or cached; the probe/metrics/UI responses do NOT go through here.
+fn api_response(code: u16, reason: &str, body: &[u8], head: bool) -> Vec<u8> {
+    http_response_with_headers(
+        code,
+        reason,
+        api::CONTENT_TYPE,
+        body,
+        head,
+        API_SECURITY_HEADERS,
+    )
 }
 
 /// [`http_response`] with an OPTIONAL block of `extra_headers` (each a complete
@@ -706,6 +728,79 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(v["live"], true);
         assert_eq!(v["ready"], false);
+    }
+
+    /// SECURITY (#369): every `/api/*` JSON response carries `nosniff` +
+    /// `no-store`, so the sensitive data is neither content-sniffed nor cached.
+    /// Checked across success, 503-before-poll, 401, and 405.
+    #[tokio::test]
+    async fn api_responses_carry_nosniff_and_no_store() {
+        // 200 (health, no poll needed).
+        let state = test_state();
+        state.set_live(true);
+        let ok = String::from_utf8(state.respond_async("GET", "/api/health", None).await).unwrap();
+        assert!(ok.contains("X-Content-Type-Options: nosniff"), "{ok}");
+        assert!(ok.contains("Cache-Control: no-store"), "{ok}");
+
+        // 503 (a data route before the first poll) still carries them.
+        let unavailable =
+            String::from_utf8(state.respond_async("GET", "/api/cluster", None).await).unwrap();
+        assert!(unavailable.starts_with("HTTP/1.1 503"), "{unavailable}");
+        assert!(
+            unavailable.contains("X-Content-Type-Options: nosniff"),
+            "{unavailable}"
+        );
+        assert!(
+            unavailable.contains("Cache-Control: no-store"),
+            "{unavailable}"
+        );
+
+        // 401 (a privileged route, enforcing, no token) carries them.
+        let enforced = state_with_auth(AuthPolicy::resolve(Some("read-tok"), None, true));
+        publish_empty_topology(&enforced).await;
+        let unauthorized =
+            String::from_utf8(enforced.respond_async("GET", "/api/nodes", None).await).unwrap();
+        assert!(unauthorized.starts_with("HTTP/1.1 401"), "{unauthorized}");
+        assert!(
+            unauthorized.contains("X-Content-Type-Options: nosniff"),
+            "{unauthorized}"
+        );
+        assert!(
+            unauthorized.contains("Cache-Control: no-store"),
+            "{unauthorized}"
+        );
+
+        // 405 (a non-GET to an /api/* route) carries them too.
+        let method_not_allowed =
+            String::from_utf8(state.respond_async("POST", "/api/cluster", None).await).unwrap();
+        assert!(
+            method_not_allowed.starts_with("HTTP/1.1 405"),
+            "{method_not_allowed}"
+        );
+        assert!(
+            method_not_allowed.contains("X-Content-Type-Options: nosniff"),
+            "{method_not_allowed}"
+        );
+        assert!(
+            method_not_allowed.contains("Cache-Control: no-store"),
+            "{method_not_allowed}"
+        );
+    }
+
+    /// SECURITY (#369): the API headers are scoped to `/api/*` ONLY. The probe and
+    /// metrics responses must NOT carry `Cache-Control: no-store` (the header
+    /// extension is opt-in via `api_response` / `ui_response`).
+    #[test]
+    fn probe_and_metrics_responses_have_no_cache_control() {
+        let state = test_state();
+        state.set_live(true);
+        for path in ["/livez", "/readyz", "/metrics"] {
+            let resp = String::from_utf8(state.respond("GET", path)).unwrap();
+            assert!(
+                !resp.contains("Cache-Control"),
+                "{path} must not carry Cache-Control: {resp}"
+            );
+        }
     }
 
     /// A data route is `503` JSON before the first poll, then `200` after a

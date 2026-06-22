@@ -7,6 +7,21 @@ release.
 
 ## [Unreleased]
 
+### Security
+
+- IronCache Console web hardening (issue #369): defense-in-depth on the Prometheus
+  HTTP client and the API surface. The history HTTP client no longer follows
+  redirects (a 3xx can no longer pivot the console to a different host), and it
+  rejects connecting to link-local / cloud-metadata addresses (169.254.0.0/16
+  incl. 169.254.169.254, fe80::/10, and the IPv4-mapped-IPv6 forms) by checking
+  the RESOLVED IP, while still allowing the in-VPC RFC1918 Prometheus. The JSON
+  `/api/*` responses now carry `X-Content-Type-Options: nosniff` and
+  `Cache-Control: no-store` so the sensitive data is not MIME-sniffed or cached.
+  These complement the existing controls (server-config-only Prometheus URL, the
+  metric allowlist, the three-tier RBAC, and the strict UI CSP). The deployment
+  hardening (VPN-locked load balancer, the least-privilege node ACL user #367)
+  remains infra follow-up.
+
 ### Added
 
 - IronCache Console: a new `ironcache-console` crate and binary (epic #352,
