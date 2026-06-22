@@ -1341,23 +1341,19 @@ async fn serve_connection(
     let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
 
     // The IDLE TIMEOUT (PROD-SAFETY #4): a connection that sits idle (no command) longer than
-    // `timeout_secs` is CLOSED, so idle connections cannot accumulate. `0` (the Redis default)
+    // `timeout` seconds is CLOSED, so idle connections cannot accumulate. `0` (the Redis default)
     // DISABLES it -- the non-subscriber idle wait then stays a plain `recv` with no timer, the
-    // byte-unchanged hot path. The timeout is boot-config (Redis `timeout` is settable, but
-    // IronCache reads it once per connection here; a runtime change is a documented follow-up). It
-    // is measured via the Runtime timer SEAM (NOT wall-clock) and the deadline RE-ARMS on each loop
-    // iteration -- i.e. after each command batch is served -- which is the per-command deadline
-    // reset (an active connection is never closed). A zero-sized `TokioRuntime` backend supplies the
-    // timer (the shard's tasks live on the LocalSet; this carries no state). The OUTPUT-BUFFER cap
-    // (PROD-SAFETY #5) is read from the runtime overlay each flush (a `CONFIG SET` takes effect).
-    let idle_timeout: Option<core::time::Duration> = {
-        let secs = ctx.boot.timeout_secs;
-        if secs == 0 {
-            None
-        } else {
-            Some(core::time::Duration::from_secs(secs))
-        }
-    };
+    // byte-unchanged hot path. The timeout is RUNTIME-SETTABLE (Redis `timeout` is a MODIFIABLE
+    // config): the serve loop RE-READS `ctx.runtime.timeout_secs()` at the top of each connection-
+    // loop iteration (just below, before the idle wait), so a `CONFIG SET timeout` takes effect LIVE
+    // for an already-connected client on its next idle wait -- a non-zero<->0 change switches between
+    // the timer-select arm and the plain-recv arm. One relaxed atomic load per (cold, post-batch)
+    // iteration. It is measured via the Runtime timer SEAM (NOT wall-clock) and the deadline RE-ARMS
+    // on each loop iteration -- i.e. after each command batch is served -- which is the per-command
+    // deadline reset (an active connection is never closed). A zero-sized `TokioRuntime` backend
+    // supplies the timer (the shard's tasks live on the LocalSet; this carries no state). The
+    // OUTPUT-BUFFER cap (PROD-SAFETY #5) is likewise read from the runtime overlay each flush (a
+    // `CONFIG SET` takes effect).
     let timer_rt = TokioRuntime::new();
 
     'conn: loop {
@@ -1533,6 +1529,20 @@ async fn serve_connection(
         if client_handle.is_killed() {
             break;
         }
+
+        // The LIVE idle timeout (PROD-SAFETY #4): re-read the runtime overlay (one relaxed atomic
+        // load) so a `CONFIG SET timeout` takes effect for this already-connected client on THIS
+        // idle wait. `0` (the default) is `None` -> the plain-recv arm below (byte-unchanged hot
+        // path); a non-zero value is `Some(Duration)` -> the timer-select arm. Because this is
+        // recomputed each iteration, a runtime non-zero<->0 change correctly switches arms.
+        let idle_timeout: Option<core::time::Duration> = {
+            let secs = ctx.runtime.timeout_secs();
+            if secs == 0 {
+                None
+            } else {
+                Some(core::time::Duration::from_secs(secs))
+            }
+        };
 
         // IDLE WAIT. The NON-subscriber path (the common, hot path) is BYTE-IDENTICAL to before
         // pub/sub when no idle timeout is configured: just await `rt.recv`, no select! overhead.

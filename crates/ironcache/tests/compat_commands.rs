@@ -222,3 +222,54 @@ fn config_durability_fixes_over_the_wire() {
         );
     });
 }
+
+/// `CONFIG SET timeout` / `CONFIG GET timeout` over the wire (PROD-SAFETY #4: `timeout` is now
+/// runtime-settable, was boot-only). Proves the registry plumbing + the wire encoding round-trip;
+/// the LIVE serve-loop effect (idle disconnection honoring the runtime change) is covered by the
+/// serve-loop self-review + the runtime/registry unit tests -- a timed idle-close behavioral test
+/// would need a multi-second sleep, which we deliberately avoid (flaky).
+#[test]
+fn config_set_get_timeout_round_trips_over_the_wire() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // The default boot timeout is 0 (Redis default: idle disconnection off).
+        // The reply is a 2-element array [timeout, "0"] (RESP2 CONFIG GET map).
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "timeout"]).await,
+            "*2\r\n$7\r\ntimeout\r\n$1\r\n0\r\n"
+        );
+        // `CONFIG SET timeout 30` -> +OK.
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "SET", "timeout", "30"]).await,
+            "+OK\r\n"
+        );
+        // `CONFIG GET timeout` now reflects the runtime change (the overlay wins over boot).
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "timeout"]).await,
+            "*2\r\n$7\r\ntimeout\r\n$2\r\n30\r\n"
+        );
+        // `CONFIG SET timeout 0` -> +OK (disables idle disconnection again).
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "SET", "timeout", "0"]).await,
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "timeout"]).await,
+            "*2\r\n$7\r\ntimeout\r\n$1\r\n0\r\n"
+        );
+        // A negative / non-numeric value is REJECTED with an error (not a panic, not a silent 0).
+        let neg = cmd(&mut c, &["CONFIG", "SET", "timeout", "-1"]).await;
+        assert!(neg.starts_with("-ERR"), "expected error, got {neg}");
+        let bad = cmd(&mut c, &["CONFIG", "SET", "timeout", "abc"]).await;
+        assert!(bad.starts_with("-ERR"), "expected error, got {bad}");
+        // The rejected SETs left the value at the last accepted value (0).
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "GET", "timeout"]).await,
+            "*2\r\n$7\r\ntimeout\r\n$1\r\n0\r\n"
+        );
+    });
+}
