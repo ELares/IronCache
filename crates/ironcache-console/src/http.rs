@@ -646,6 +646,23 @@ mod tests {
     }
 
     #[test]
+    fn root_serves_the_login_panel_markup() {
+        // The sign-in affordance (UI auth, follow-up to #360) is served as part
+        // of the static shell. Assert the served bytes carry the login element
+        // ids and the password field (no browser, so we check the served body).
+        let resp = String::from_utf8(test_state().respond("GET", "/")).unwrap();
+        let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(body.contains("id=\"login-panel\""), "{body}");
+        assert!(body.contains("id=\"login-token\""), "{body}");
+        assert!(body.contains("id=\"login-submit\""), "{body}");
+        assert!(body.contains("id=\"logout-submit\""), "{body}");
+        assert!(body.contains("type=\"password\""), "{body}");
+        // No inline event handlers in the served markup (CSP forbids them).
+        assert!(!body.contains("onclick"), "{body}");
+        assert!(!body.contains("onsubmit"), "{body}");
+    }
+
+    #[test]
     fn app_js_is_served_as_javascript() {
         let resp = String::from_utf8(test_state().respond("GET", "/app.js")).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
@@ -657,6 +674,17 @@ mod tests {
             resp.contains("Content-Security-Policy: default-src 'self'"),
             "{resp}"
         );
+        // The served script is auth-aware: it sends a Bearer token from
+        // sessionStorage and wires the controls via addEventListener (no inline
+        // onclick / no localStorage), and still uses no innerHTML sink.
+        let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(body.contains("Authorization"), "{body}");
+        assert!(body.contains("Bearer "), "{body}");
+        assert!(body.contains("sessionStorage"), "{body}");
+        assert!(body.contains("addEventListener"), "{body}");
+        assert!(!body.contains("localStorage"), "{body}");
+        assert!(!body.contains(".innerHTML"), "{body}");
+        assert!(!body.contains("onclick"), "{body}");
     }
 
     #[test]

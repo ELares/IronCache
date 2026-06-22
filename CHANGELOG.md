@@ -188,6 +188,27 @@ release.
   is no XSS sink. An inline SECURITY note marks that the UI is unauthenticated
   today behind the loopback default bind and must move behind the auth/RBAC tier
   (#360) and VPN-locked exposure (#369) before exposure.
+- IronCache Console dashboard UI auth (the UI follow-up to #360 / #359). The
+  dashboard is now auth-aware: it reads an operator token from `sessionStorage`
+  (NOT `localStorage`, so it clears when the tab closes) and, when present, sends
+  it as `Authorization: Bearer <token>` on EVERY `/api/*` fetch. The OPEN routes
+  (`/api/health`, `/api/cluster`) need no token, so the header and the cluster
+  overview always render even when signed out. When a PRIVILEGED_READ route
+  (`/api/nodes`, `/api/slowlog`, `/api/clients`, `/api/keyspace`) returns 401 the
+  UI reveals a hidden sign-in panel and renders those panels as "sign in to view"
+  instead of an error banner; a 403 (a token of an insufficient tier) renders
+  "insufficient privileges". The sign-in panel is static markup (a password input
+  plus Sign in / Sign out buttons) wired with `addEventListener` (no inline
+  `onclick`, so the strict `Content-Security-Policy: default-src 'self'` still
+  needs no `unsafe-inline`); the same-origin `/api/*` fetch is allowed by the
+  policy's `default-src` fallback. The token is sent ONLY as a request header: it
+  is never written to the DOM/markup, never placed in a URL or query string, and
+  never logged. On the loopback dev default (no token configured) the privileged
+  routes still return 200 with no token, so every panel renders without signing
+  in. Served-bytes tests assert the login element ids and the password field are
+  present and that `app.js` references `Authorization` / `Bearer` /
+  `sessionStorage` / `addEventListener` while still carrying no `innerHTML` sink,
+  no inline `onclick`, and no `localStorage`.
 - Keyspace notifications (PROD-8, Redis `notify-keyspace-events`). On a successful
   mutation (and on a TTL expiry / a maxmemory eviction) the server PUBLISHes the
   Redis keyspace + keyevent events to `__keyspace@<db>__:<key>` (payload = the
