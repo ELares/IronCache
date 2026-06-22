@@ -24,10 +24,61 @@
 //! no inline script/style). The aggregation-from-Prometheus layer and TLS
 //! hardening land in later PRs (#356, #369).
 //!
-//! SECURITY: the `/api/*` surface exposes node internals (addresses, slowlog argv
-//! = key names, client IPs) and is UNAUTHENTICATED today; it relies on the
-//! loopback default bind and MUST move behind the auth/RBAC tier (#360) and the
-//! VPN-locked exposure (#369) before the console is exposed.
+//! # SECURITY POSTURE (#369)
+//!
+//! The console is a recon-heavy surface. This section is the single statement of
+//! what it exposes, who may see it, and the boundaries that keep it contained.
+//!
+//! ## Credential blast radius
+//!
+//! The console holds ONE secret: the node password (a least-privilege ACL user),
+//! read from `node_password_file` at connect time and never logged (and held in a
+//! `zeroize`-backed buffer). It is read-only/observability-scoped, NOT the cache's
+//! data-plane credential, so a console compromise does not yield write access to
+//! the cache. The Prometheus URL is server-config, not a credential. What the
+//! `/api/*` surface DISCLOSES is the real sensitivity: node addresses, the SLOWLOG
+//! argv (which contains KEY NAMES), and connected client IPs. Treat the API output,
+//! not just the secret, as the asset to protect.
+//!
+//! ## The three access tiers (RBAC, #360, see [`crate::auth`])
+//!
+//! Every `/api/*` route maps to a tier; routing FAILS CLOSED (an unknown or
+//! trailing-slash route is treated as privileged):
+//!
+//! * `Open`: aggregate, non-identifying facts (health, cluster up/down counts, the
+//!   OpenAPI doc). Public in every posture.
+//! * `PrivilegedRead`: anything exposing addresses, key names, or client IPs.
+//!   Requires the read (or admin) token when a token is configured; on a
+//!   non-loopback bind with no token it is refused (401).
+//! * `Admin`: reserved for phase-2 management verbs (none today).
+//!
+//! ## The SSRF boundary (the history/Prometheus path)
+//!
+//! The `/api/timeseries` route queries Prometheus. The boundary that stops it from
+//! becoming a server-side request forgery pivot is layered:
+//!
+//! * The Prometheus base URL is SERVER-CONFIG ONLY; the request never supplies it.
+//! * The `metric` parameter is ALLOWLISTED to a bare `ironcache_*` name
+//!   ([`crate::history::is_allowed_metric`]); the console builds the PromQL itself,
+//!   so raw PromQL / label matchers / `&query=` injection never cross the boundary.
+//! * The HTTP client does NOT follow redirects: a 3xx is a typed error, never an
+//!   auto-connect to a `Location`-chosen host ([`crate::httpclient`]).
+//! * The HTTP client BLOCKS link-local / cloud-metadata addresses after resolution
+//!   (`169.254.0.0/16` incl. `169.254.169.254`, and `fe80::/10`), screening the
+//!   PARSED IP so the decimal/octal/IPv4-mapped forms cannot bypass it.
+//!
+//! ## Defense-in-depth on every API response
+//!
+//! Each `/api/*` response carries `X-Content-Type-Options: nosniff` and
+//! `Cache-Control: no-store` (the sensitive JSON must not be content-sniffed or
+//! cached); the UI assets carry a strict same-origin CSP. See [`crate::http`].
+//!
+//! ## Exposure requires BOTH a tier and a locked LB
+//!
+//! Serving this beyond loopback requires the auth tier (above) AND a VPN-locked
+//! load balancer. The deployment hardening (the locked LB, #369) and the
+//! least-privilege node ACL user (#367) are the INFRA follow-ups that finish the
+//! posture; this crate implements the CODE-side controls.
 #![forbid(unsafe_code)]
 
 pub mod api;
