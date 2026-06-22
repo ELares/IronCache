@@ -78,6 +78,36 @@ release.
   VPN-locked exposure (#369) before the console is exposed. The interim
   hand-rolled `/debug/topology` JSON route and its `enable_debug_routes` config
   flag are REMOVED, superseded by the real `/api/*` surface.
+- IronCache Console authentication and three-tier RBAC, enforced in the BACKEND
+  (issue #360). The `/api/*` surface is split into three tiers because read-only
+  is NOT safe: the slowlog argv carries KEY NAMES, the client list carries client
+  IPs (PII), and the node list carries node addresses. OPEN (`/api/health`,
+  `/api/cluster` aggregate totals + node up/down counts, `/api/openapi.json`) is
+  safe to serve unauthenticated; PRIVILEGED_READ (`/api/nodes`,
+  `/api/nodes/{addr}`, `/api/slowlog`, `/api/clients`, `/api/keyspace`) exposes
+  addresses, key names, and client IPs; ADMIN is reserved for phase-2 management
+  verbs (#371, none today). Tokens are presented in the
+  `Authorization: Bearer <token>` HEADER (CSRF-safe by construction, no cookie):
+  two new config fields `read_token` (grants OPEN + PRIVILEGED_READ) and
+  `admin_token` (grants every tier), each via TOML, `IRONCACHE_CONSOLE_READ_TOKEN`
+  / `IRONCACHE_CONSOLE_ADMIN_TOKEN` env, NEVER logged and shown only as `(set)` /
+  `(none)` in the `config` dump. A presented token is compared in CONSTANT TIME
+  (reusing `ironcache-runtime`'s `constant_time_eq`, never `==` on a secret) and a
+  wrong token is treated as anonymous (401, not 403, so the response does not
+  confirm a valid-but-insufficient token format). The SAFE-BY-DEFAULT posture is
+  keyed off the bind: a token configured ENFORCES the tier check; no token on a
+  LOOPBACK bind serves all tiers (the historical dev mode) with a one-time boot
+  warning; no token on a NON-loopback (exposed) bind serves OPEN only and returns
+  401 on privileged routes (never silently leaks PII), with a prominent boot
+  warning. The gate runs in the request path around the API handler, so the
+  privileged data is never produced for an unauthorized request, and the route
+  classification FAILS CLOSED: anything not on the explicit OPEN allow-list
+  (including `/api/nodes/{addr}`, an unknown endpoint, or a trailing-slash variant
+  of an OPEN route) is PRIVILEGED_READ, so no path can evade the gate. The UI and
+  probe routes (`/livez`, `/readyz`, `/metrics`) are not gated (the SPA is static
+  and itself calls the gated API). FOLLOW-UP: the UI login flow that sends the
+  token from the browser is deferred; on the loopback dev default the existing
+  dashboard keeps working.
 - Keyspace notifications (PROD-8, Redis `notify-keyspace-events`). On a successful
   mutation (and on a TTL expiry / a maxmemory eviction) the server PUBLISHes the
   Redis keyspace + keyevent events to `__keyspace@<db>__:<key>` (payload = the

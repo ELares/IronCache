@@ -27,6 +27,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::api::{self, ApiContext};
+use crate::auth::{self, AuthPolicy, Decision};
 use crate::metrics::ConsoleMetrics;
 use crate::poll::{TopologyHolder, new_topology_holder};
 
@@ -55,24 +56,44 @@ pub struct ConsoleHttpState {
     /// The latest polled topology, shared with the poll loop (#355/#366). The
     /// REST API (#358) reads it to render the `/api/*` responses.
     topology: TopologyHolder,
+    /// The resolved authentication/RBAC policy (#360). The `/api/*` gate consults
+    /// it before dispatching to [`crate::api::handle`]. Cheap to clone (`Arc`).
+    auth: Arc<AuthPolicy>,
 }
 
 impl ConsoleHttpState {
+    /// Construct with the DEV-DEFAULT auth policy (no token, loopback-trusted), so
+    /// existing callers and unit tests keep the historical "serve everything"
+    /// behavior. Production boot wires the real policy with
+    /// [`Self::with_topology_and_auth`].
     #[must_use]
     pub fn new(metrics: Arc<ConsoleMetrics>) -> Self {
         Self::with_topology(metrics, new_topology_holder())
     }
 
-    /// Construct with an EXISTING topology holder, so the poll loop and the HTTP
-    /// surface share one cell (the loop writes, the handler reads through the REST
-    /// API).
+    /// Construct with an EXISTING topology holder and the DEV-DEFAULT auth policy
+    /// (no token, loopback), so the poll loop and the HTTP surface share one cell
+    /// (the loop writes, the handler reads through the REST API).
     #[must_use]
     pub fn with_topology(metrics: Arc<ConsoleMetrics>, topology: TopologyHolder) -> Self {
+        Self::with_topology_and_auth(metrics, topology, AuthPolicy::resolve(None, None, true))
+    }
+
+    /// Construct with an existing topology holder AND an explicit auth policy
+    /// (#360). Production boot uses this with the policy resolved from the config
+    /// tokens and the bind classification.
+    #[must_use]
+    pub fn with_topology_and_auth(
+        metrics: Arc<ConsoleMetrics>,
+        topology: TopologyHolder,
+        auth: AuthPolicy,
+    ) -> Self {
         ConsoleHttpState {
             metrics,
             live: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
             topology,
+            auth: Arc::new(auth),
         }
     }
 
@@ -102,14 +123,15 @@ impl ConsoleHttpState {
     /// other paths fall through to the fixed-route [`Self::respond`]. The API goes
     /// through this SAME bounded responder, so the whole-request deadline, the
     /// size cap, and the concurrency permit still apply.
-    pub async fn respond_async(&self, method: &str, path: &str) -> Vec<u8> {
+    pub async fn respond_async(
+        &self,
+        method: &str,
+        path: &str,
+        auth_header: Option<&str>,
+    ) -> Vec<u8> {
         let head = method == "HEAD";
         let bare = path.split('?').next().unwrap_or(path);
         if api::is_api_path(bare) {
-            // SECURITY: the `/api/*` surface is unauthenticated recon today (node
-            // addresses, slowlog argv = key names, client IPs). It MUST move behind
-            // the auth/RBAC tier (#360) and VPN-locked exposure (#369) before the
-            // console is exposed; until then it relies on the loopback default bind.
             if method != "GET" && !head {
                 return http_response(
                     405,
@@ -118,6 +140,37 @@ impl ConsoleHttpState {
                     b"",
                     head,
                 );
+            }
+            // AUTH/RBAC GATE (#360): every `/api/*` route maps to a tier; the
+            // policy decides allow / 401 / 403 from the (bind, token) posture and
+            // the presented Bearer token. This runs BEFORE `api::handle`, so the
+            // privileged data (node addresses, slowlog argv = key names, client
+            // IPs) is never produced for a request that is not authorized. The UI
+            // routes and probes are NOT gated (the SPA is static; it calls this
+            // gated API). The dynamic `/api/nodes/{addr}` route is privileged via
+            // the `/api/nodes/` prefix in `route_tier`, so a trailing slash or a
+            // deeper path cannot evade the gate.
+            let required = auth::route_tier(bare);
+            match auth::authorize(&self.auth, required, auth_header) {
+                Decision::Allow => {}
+                Decision::Unauthorized(reason) => {
+                    return http_response(
+                        401,
+                        status_reason(401),
+                        api::CONTENT_TYPE,
+                        api::error_json(reason).as_bytes(),
+                        head,
+                    );
+                }
+                Decision::Forbidden(reason) => {
+                    return http_response(
+                        403,
+                        status_reason(403),
+                        api::CONTENT_TYPE,
+                        api::error_json(reason).as_bytes(),
+                        head,
+                    );
+                }
             }
             let ctx = ApiContext {
                 version: crate::cli::BUILD_VERSION,
@@ -203,6 +256,8 @@ impl ConsoleHttpState {
 /// (`200 OK`) covers the success case and any unexpected code defensively.
 fn status_reason(code: u16) -> &'static str {
     match code {
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
@@ -243,6 +298,34 @@ fn parse_request_line(buf: &[u8]) -> Option<(String, String)> {
     Some((method, path))
 }
 
+/// Whether the buffer holds the END of the request header block (a blank line:
+/// `\r\n\r\n` or a bare `\n\n` for tolerance). The responder reads the WHOLE head
+/// before answering so the `Authorization` header (after the request line) is
+/// available to the auth/RBAC gate (#360). The body, if any, is ignored.
+fn header_block_complete(buf: &[u8]) -> bool {
+    buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.windows(2).any(|w| w == b"\n\n")
+}
+
+/// Extract the FIRST `Authorization` header value from the request head, or
+/// `None`. The field name is case-insensitive (RFC 9110); the value is the text
+/// after the first colon, trimmed. Parsing is tolerant and never panics: a header
+/// line without a colon is skipped, and a non-UTF-8 byte sequence is lossily
+/// decoded. Only the header block (up to the first blank line) is scanned.
+fn authorization_header(buf: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(buf);
+    // Stop at the blank line that ends the header block (ignore any body).
+    let head = text.split_once("\r\n\r\n").map_or_else(
+        || text.split_once("\n\n").map_or(&*text, |(h, _)| h),
+        |(h, _)| h,
+    );
+    // Skip the request line (the first line); scan the remaining header lines.
+    head.split('\n')
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.trim().to_owned())
+}
+
 /// Serve ONE connection with the production whole-request deadline.
 async fn serve_conn(stream: tokio::net::TcpStream, state: ConsoleHttpState) {
     serve_conn_with_deadline(stream, state, REQUEST_DEADLINE).await;
@@ -273,8 +356,17 @@ async fn serve_conn_with_deadline(
                     false,
                 ));
             }
-            if let Some((method, path)) = parse_request_line(&buf) {
-                return Some(state.respond_async(&method, &path).await);
+            // Read the WHOLE request head (request line + headers) before
+            // answering, so the `Authorization` header is available to the
+            // auth/RBAC gate (#360). The header block ends at the first blank line.
+            if header_block_complete(&buf) {
+                if let Some((method, path)) = parse_request_line(&buf) {
+                    let auth = authorization_header(&buf);
+                    return Some(state.respond_async(&method, &path, auth.as_deref()).await);
+                }
+                // The terminator arrived but no parseable request line: 400-ish.
+                // Treat as not found via the fixed responder (never panic).
+                return Some(state.respond("GET", "/"));
             }
         }
     })
@@ -319,6 +411,27 @@ mod tests {
 
     fn test_state() -> ConsoleHttpState {
         ConsoleHttpState::new(Arc::new(ConsoleMetrics::new()))
+    }
+
+    /// A state with an EXPLICIT auth policy and a published (empty-node) topology,
+    /// so data routes are past the 503-before-poll gate and the auth gate is the
+    /// only thing under test.
+    fn state_with_auth(auth: AuthPolicy) -> ConsoleHttpState {
+        let s = ConsoleHttpState::with_topology_and_auth(
+            Arc::new(ConsoleMetrics::new()),
+            new_topology_holder(),
+            auth,
+        );
+        s.set_live(true);
+        s
+    }
+
+    async fn publish_empty_topology(state: &ConsoleHttpState) {
+        *state.topology().write().await = Some(crate::snapshot::Topology {
+            mode: crate::snapshot::TopologyMode::Standalone,
+            nodes: Vec::new(),
+            fetched_unixtime: 1,
+        });
     }
 
     #[test]
@@ -392,7 +505,8 @@ mod tests {
     async fn api_health_is_json_without_a_poll() {
         let state = test_state();
         state.set_live(true);
-        let resp = String::from_utf8(state.respond_async("GET", "/api/health").await).unwrap();
+        let resp =
+            String::from_utf8(state.respond_async("GET", "/api/health", None).await).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
         assert!(resp.contains("Content-Type: application/json"), "{resp}");
         let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
@@ -407,7 +521,8 @@ mod tests {
     async fn api_cluster_is_503_before_poll_then_200_after() {
         use crate::snapshot::{NodeSnapshot, Topology, TopologyMode};
         let state = test_state();
-        let before = String::from_utf8(state.respond_async("GET", "/api/cluster").await).unwrap();
+        let before =
+            String::from_utf8(state.respond_async("GET", "/api/cluster", None).await).unwrap();
         assert!(before.starts_with("HTTP/1.1 503"), "{before}");
         assert!(before.contains("application/json"), "{before}");
         let (_h, body) = before.split_once("\r\n\r\n").unwrap();
@@ -430,7 +545,8 @@ mod tests {
             fetched_unixtime: 42,
         };
         *state.topology().write().await = Some(topo);
-        let after = String::from_utf8(state.respond_async("GET", "/api/cluster").await).unwrap();
+        let after =
+            String::from_utf8(state.respond_async("GET", "/api/cluster", None).await).unwrap();
         assert!(after.starts_with("HTTP/1.1 200 OK"), "{after}");
         let (_h, body) = after.split_once("\r\n\r\n").unwrap();
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -449,10 +565,11 @@ mod tests {
             nodes: Vec::new(),
             fetched_unixtime: 1,
         });
-        let nf = String::from_utf8(state.respond_async("GET", "/api/bogus").await).unwrap();
+        let nf = String::from_utf8(state.respond_async("GET", "/api/bogus", None).await).unwrap();
         assert!(nf.starts_with("HTTP/1.1 404 Not Found"), "{nf}");
         assert!(nf.contains("application/json"), "{nf}");
-        let post = String::from_utf8(state.respond_async("POST", "/api/cluster").await).unwrap();
+        let post =
+            String::from_utf8(state.respond_async("POST", "/api/cluster", None).await).unwrap();
         assert!(post.starts_with("HTTP/1.1 405"), "{post}");
     }
 
@@ -461,7 +578,7 @@ mod tests {
     async fn api_openapi_is_valid_json() {
         let state = test_state();
         let resp =
-            String::from_utf8(state.respond_async("GET", "/api/openapi.json").await).unwrap();
+            String::from_utf8(state.respond_async("GET", "/api/openapi.json", None).await).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
         let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -538,5 +655,163 @@ mod tests {
         serve_conn_with_deadline(stream, state, Duration::from_secs(5)).await;
         let body = client.await.unwrap();
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+    }
+
+    /// The auth/RBAC gate (#360), exercised through `respond_async` so the routing,
+    /// the tier map, and the posture all run together.
+
+    #[tokio::test]
+    async fn enforce_privileged_route_without_token_is_401_json() {
+        let state = state_with_auth(AuthPolicy::resolve(Some("read-tok"), None, true));
+        publish_empty_topology(&state).await;
+        let resp = String::from_utf8(state.respond_async("GET", "/api/nodes", None).await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 401 Unauthorized"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        let (_h, body) = resp.split_once("\r\n\r\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(v["error"].is_string(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn enforce_open_route_needs_no_token() {
+        let state = state_with_auth(AuthPolicy::resolve(Some("read-tok"), None, true));
+        publish_empty_topology(&state).await;
+        // /api/cluster is OPEN: served even with no token while enforcing.
+        let resp =
+            String::from_utf8(state.respond_async("GET", "/api/cluster", None).await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        // /api/health is OPEN too (and needs no topology).
+        let resp =
+            String::from_utf8(state.respond_async("GET", "/api/health", None).await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn enforce_read_token_grants_privileged() {
+        let state = state_with_auth(AuthPolicy::resolve(
+            Some("read-tok"),
+            Some("admin-tok"),
+            true,
+        ));
+        publish_empty_topology(&state).await;
+        let resp = String::from_utf8(
+            state
+                .respond_async("GET", "/api/nodes", Some("Bearer read-tok"))
+                .await,
+        )
+        .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn enforce_wrong_token_is_401() {
+        let state = state_with_auth(AuthPolicy::resolve(
+            Some("read-tok"),
+            Some("admin-tok"),
+            true,
+        ));
+        publish_empty_topology(&state).await;
+        let resp = String::from_utf8(
+            state
+                .respond_async("GET", "/api/slowlog", Some("Bearer WRONG"))
+                .await,
+        )
+        .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 401 Unauthorized"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn exposed_no_token_serves_open_blocks_privileged() {
+        // Non-loopback bind, no token: OPEN served, privileged 401.
+        let state = state_with_auth(AuthPolicy::resolve(None, None, false));
+        publish_empty_topology(&state).await;
+        let open =
+            String::from_utf8(state.respond_async("GET", "/api/cluster", None).await).unwrap();
+        assert!(open.starts_with("HTTP/1.1 200 OK"), "{open}");
+        let priv_resp =
+            String::from_utf8(state.respond_async("GET", "/api/clients", None).await).unwrap();
+        assert!(
+            priv_resp.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{priv_resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_on_privileged_route_is_not_open_bypass() {
+        // `/api/nodes/` (trailing slash) must be gated like the privileged node
+        // routes, not slip into the Open default. With no token on an exposed
+        // bind it is 401, never served.
+        let state = state_with_auth(AuthPolicy::resolve(None, None, false));
+        publish_empty_topology(&state).await;
+        for p in ["/api/nodes/", "/api/cluster/", "/api/bogus"] {
+            let resp = String::from_utf8(state.respond_async("GET", p, None).await).unwrap();
+            assert!(
+                resp.starts_with("HTTP/1.1 401 Unauthorized"),
+                "{p} must be gated: {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_header_is_extracted_case_insensitively() {
+        let req = b"GET /api/nodes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n";
+        assert_eq!(authorization_header(req).as_deref(), Some("Bearer tok"));
+        // Case-insensitive field name; value trimmed.
+        let req = b"GET /api/nodes HTTP/1.1\r\nauthorization:   Bearer tok2  \r\n\r\n";
+        assert_eq!(authorization_header(req).as_deref(), Some("Bearer tok2"));
+        // Absent header.
+        let req = b"GET /api/nodes HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(authorization_header(req), None);
+        // A header-looking line in the BODY is not picked up (only the head is
+        // scanned).
+        let req = b"GET /api/nodes HTTP/1.1\r\nHost: x\r\n\r\nAuthorization: Bearer body\r\n";
+        assert_eq!(authorization_header(req), None);
+    }
+
+    #[test]
+    fn header_block_complete_detects_terminator() {
+        assert!(!header_block_complete(
+            b"GET /api/nodes HTTP/1.1\r\nHost: x\r\n"
+        ));
+        assert!(header_block_complete(
+            b"GET /api/nodes HTTP/1.1\r\nHost: x\r\n\r\n"
+        ));
+        assert!(header_block_complete(b"GET / HTTP/1.1\n\n"));
+    }
+
+    /// End-to-end over a real socket: an enforcing console returns 401 without a
+    /// token and 200 with the right Bearer token on a privileged route.
+    #[tokio::test]
+    async fn enforce_over_tcp_401_then_200_with_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = state_with_auth(AuthPolicy::resolve(Some("the-tok"), None, true));
+        publish_empty_topology(&state).await;
+        let serving = state.clone();
+        tokio::spawn(async move {
+            accept_loop(listener, serving).await;
+        });
+
+        // No token -> 401.
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"GET /api/nodes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        c.read_to_end(&mut raw).await.unwrap();
+        let resp = String::from_utf8_lossy(&raw);
+        assert!(resp.starts_with("HTTP/1.1 401 Unauthorized"), "{resp}");
+
+        // Right token -> 200.
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(
+            b"GET /api/nodes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer the-tok\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut raw = Vec::new();
+        c.read_to_end(&mut raw).await.unwrap();
+        let resp = String::from_utf8_lossy(&raw);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
     }
 }
