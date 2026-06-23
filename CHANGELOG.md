@@ -34,6 +34,25 @@ release.
 
 ### Changed
 
+- `ironcache upgrade` now write-freezes (`CLIENT PAUSE WRITE`) before the final
+  save so no acknowledged write is lost across the upgrade (#388). Previously the
+  upgrade was SAVE-first only, leaving a small window: between the SAVE completing
+  and the old process dying at the restart, the still-living old process could
+  acknowledge writes that were not in the snapshot, losing them on restart. The
+  orchestrator now issues a node-wide `CLIENT PAUSE <ms> WRITE`, lets in-flight
+  writes drain, then SAVEs (so the snapshot captures a state after which nothing
+  acked exists outside it), then swaps and restarts; the old process dies at the
+  restart so the freeze needs no explicit unpause, and the new process boots
+  unpaused from the complete snapshot. An upgrade that aborts at ANY point while the
+  freeze is active and the old process is still alive (a failed SAVE, a failed
+  preflight, a failed binary swap, or a failed restart) issues a best-effort
+  `CLIENT UNPAUSE` so production is never left write-frozen. The pause window is
+  derived from
+  `--health-timeout` plus a margin. The freeze is on by default; `--no-freeze`
+  opts out and restores the prior SAVE-first-only behavior (for a read-mostly or
+  rebuildable cache that accepts the tiny window). With no persistence configured
+  the freeze is skipped (the restart loses data regardless, still gated on
+  `--yes`).
 - The `timeout` idle-client directive is now runtime-settable via `CONFIG SET
   timeout <secs>` / `CONFIG GET timeout` (it was boot-only, so changing it used to
   require a full server restart that dropped every connected client). The serve

@@ -21,3 +21,4 @@ tests/drivers/node/node_modules/
 # Only the run script, the competitor matrix, and the README are committed; never the
 # per-run output.
 bench-results/
+/rust_out
