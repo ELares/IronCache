@@ -34,6 +34,20 @@ release.
 
 ### Changed
 
+- `CLIENT PAUSE <ms> WRITE` is now genuinely write-only (reads + admin like SAVE,
+  INFO and PING proceed; only writes are paused), matching Redis and fixing the
+  ironcache-upgrade write-freeze that deadlocked its own SAVE (#388). The serve
+  loop previously stalled on a write-flag-agnostic post-batch pause check, so a
+  WRITE pause conservatively held the entire connection for the window, including
+  reads, PING, INFO and SAVE. Because the upgrade issues `CLIENT PAUSE WRITE`
+  then `SAVE`, the SAVE was held by the very pause it had set, timed out, and the
+  upgrade safe-aborted. The pause stall is now per-command, applied right before
+  each command is dispatched: an ALL pause holds every command (unchanged), a
+  WRITE pause holds only writes (including EXEC of a write-containing transaction
+  and any unknown command, conservatively), and `CLIENT UNPAUSE` is never held so
+  a pause is always recoverable from the connection that set it. The default
+  (no pause) path is unchanged: a single relaxed atomic load per command, with no
+  clock read or command classification unless a pause is active.
 - `ironcache upgrade` now write-freezes (`CLIENT PAUSE WRITE`) before the final
   save so no acknowledged write is lost across the upgrade (#388). Previously the
   upgrade was SAVE-first only, leaving a small window: between the SAVE completing

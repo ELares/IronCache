@@ -564,7 +564,9 @@ impl ClientRegistry {
     }
 
     /// CLIENT PAUSE <ms> [WRITE|ALL]: pause command processing until `now_mono_ms + ms`. The serve
-    /// loop reads [`Self::pause_remaining_ms`] after each batch and stalls while it is non-zero.
+    /// loop gates each command before dispatch: a WRITE pause holds only write commands (reads and
+    /// admin like SAVE/INFO/PING proceed); an ALL pause holds every command. See
+    /// [`Self::pause_write_remaining_ms`] / [`Self::pause_all_remaining_ms`].
     pub fn pause(&self, now_mono_ms: u64, ms: u64, writes_only: bool) {
         self.pause_until_mono_ms
             .store(now_mono_ms.saturating_add(ms), Ordering::Relaxed);
@@ -578,17 +580,30 @@ impl ClientRegistry {
 
     /// The remaining milliseconds of the active pause window given the monotonic-millis `now`
     /// (`0` when none). This is AGNOSTIC to the pause KIND: it returns the same non-zero remaining
-    /// for a WRITE-only pause as for an ALL pause, because the serve loop's POST-BATCH STALL reads
-    /// THIS value and holds the connection for BOTH kinds (a WRITE pause is enforced as a conservative
-    /// SUPERSET that stalls all command processing for the window -- see `serve.rs`). That superset
-    /// stall is what makes `CLIENT PAUSE WRITE` the load-bearing primitive of the lossless upgrade
-    /// write-freeze (#388): while paused, NO further command -- hence no write -- is acked. (A precise
-    /// write-only gate that lets reads proceed mid-pause is a documented follow-up; it must preserve
-    /// the no-ack-on-write guarantee.)
+    /// for a WRITE-only pause as for an ALL pause. It is the raw window the kind-aware helpers
+    /// ([`Self::pause_all_remaining_ms`] for the post-batch stall, [`Self::pause_write_remaining_ms`]
+    /// for the per-write-command stall) build on. A WRITE-only pause now lets reads + admin proceed:
+    /// the serve loop's POST-BATCH stall consults `pause_all_remaining_ms` (which is `0` for a
+    /// WRITE-only pause, so reads/PING/INFO/SAVE flow through), while a WRITE command is gated
+    /// per-command on `pause_write_remaining_ms`. This is what makes `CLIENT PAUSE WRITE` genuinely
+    /// write-only, matching Redis, while keeping the load-bearing no-write-ack guarantee for the
+    /// lossless upgrade write-freeze (#388): a write is never acked while WRITE-paused.
     #[must_use]
     pub fn pause_remaining_ms(&self, now_mono_ms: u64) -> u64 {
         let until = self.pause_until_mono_ms.load(Ordering::Relaxed);
         until.saturating_sub(now_mono_ms)
+    }
+
+    /// Whether a pause of ANY kind is ARMED, without reading the clock. `true` iff a pause deadline
+    /// has been recorded and not cleared by UNPAUSE; it may already have ELAPSED (the kind-aware
+    /// remaining-ms helpers, which take `now`, return `0` past the deadline). This is the cheap
+    /// per-command GUARD the serve loop reads BEFORE touching the monotonic clock or classifying the
+    /// command: a single relaxed atomic load + compare. On the default (never-paused) path it is
+    /// `false` and the per-command write-pause check falls through doing nothing, so the hot path
+    /// adds no clock read and no command-classification work.
+    #[must_use]
+    pub fn is_pause_armed(&self) -> bool {
+        self.pause_until_mono_ms.load(Ordering::Relaxed) != 0
     }
 
     /// Whether the active pause (if any) is WRITE-only.
@@ -603,12 +618,25 @@ impl ClientRegistry {
         self.pause_remaining_ms(now_mono_ms) > 0
     }
 
+    /// Remaining milliseconds the POST-BATCH serve-loop stall must hold for, given the
+    /// monotonic-millis `now`. This is the ALL-pause window ONLY: it returns the remaining ms for an
+    /// `ALL` pause (which stalls every command, reads included), and `0` for a WRITE-only pause (so a
+    /// WRITE-only pause does NOT hold the whole serve loop -- reads, PING, INFO and SAVE proceed) and
+    /// `0` when no pause is active. The serve loop reads THIS in its post-batch stall; a WRITE
+    /// command is instead gated per-command on [`Self::pause_write_remaining_ms`]. Relaxed atomics.
+    #[must_use]
+    pub fn pause_all_remaining_ms(&self, now_mono_ms: u64) -> u64 {
+        if self.pause_writes_only.load(Ordering::Relaxed) {
+            return 0;
+        }
+        self.pause_remaining_ms(now_mono_ms)
+    }
+
     /// Remaining milliseconds a WRITE command must stall for, given the monotonic-millis `now`.
-    /// A WRITE is blocked by BOTH pause kinds: a WRITE-only pause (which the post-batch read stall
-    /// deliberately skips) AND an ALL pause (which also blocks writes). Returns `0` when no pause
-    /// is active. The serve loop consults this BEFORE dispatching a write command so
-    /// `CLIENT PAUSE <ms> WRITE` actually stalls writes (reads still proceed). Relaxed atomics; the
-    /// no-pause default is a single load + branch.
+    /// A WRITE is blocked by BOTH pause kinds: a WRITE-only pause AND an ALL pause (which also blocks
+    /// writes). Returns `0` when no pause is active. The serve loop consults this PER WRITE COMMAND
+    /// (after the cheap [`Self::is_pause_armed`] guard) BEFORE dispatching it, so `CLIENT PAUSE <ms>
+    /// WRITE` actually stalls writes while reads proceed. Relaxed atomics.
     #[must_use]
     pub fn pause_write_remaining_ms(&self, now_mono_ms: u64) -> u64 {
         self.pause_remaining_ms(now_mono_ms)
@@ -762,42 +790,88 @@ mod tests {
         assert!(!reg.is_paused(1100));
     }
 
-    /// THE LOSSLESS-FREEZE NO-ACK PROOF (#388). A `CLIENT PAUSE <ms> WRITE` (writes_only = true) sets
-    /// the SAME `pause_until_mono_ms` deadline an ALL pause does, and `pause_remaining_ms` -- the
-    /// value the serve loop reads in its POST-BATCH STALL (`serve.rs`, the `pause_remaining_ms`
-    /// loop) -- is non-zero for the window. The serve loop stalls the connection there BEFORE reading
-    /// or dispatching the next command, so while WRITE-paused NO further write is executed or
-    /// acknowledged (the stall is a conservative superset that also holds reads, but the load-bearing
-    /// guarantee for the upgrade write-freeze is that a write is never ACKED while paused). The window
-    /// expires on its own, and `CLIENT UNPAUSE` clears it immediately.
+    /// THE LOSSLESS-FREEZE NO-WRITE-ACK PROOF (#388), now WRITE-AWARE. A `CLIENT PAUSE <ms> WRITE`
+    /// (writes_only = true) sets the SAME `pause_until_mono_ms` deadline an ALL pause does. The
+    /// load-bearing guarantee for the upgrade write-freeze is that a WRITE is never ACKED while
+    /// paused: the serve loop gates a write command on `pause_write_remaining_ms`, which is non-zero
+    /// IN-window for BOTH pause kinds, so no write is dispatched until it elapses. Crucially the
+    /// POST-BATCH stall now reads `pause_all_remaining_ms`, which is `0` for a WRITE-only pause -- so
+    /// reads + admin (PING/INFO/SAVE) flow through and only writes hold (Redis semantics). The
+    /// window expires on its own, and `CLIENT UNPAUSE` clears it immediately.
     #[test]
-    fn write_pause_holds_the_serve_loop_stall() {
+    fn write_pause_holds_only_writes() {
         let reg = ClientRegistry::new();
         // CLIENT PAUSE 500 WRITE at t=1000.
         reg.pause(1000, 500, true);
         assert!(reg.pause_is_writes_only(), "the pause is WRITE-only");
-        // The serve loop's post-batch stall reads pause_remaining_ms; it is non-zero IN-window, so
-        // the connection stalls there and acks no further command (write or otherwise) until it
-        // elapses. This is the no-ack guarantee the lossless upgrade relies on.
+        assert!(reg.is_pause_armed(), "a recorded pause is armed");
+        // A WRITE command stalls IN-window: pause_write_remaining_ms is non-zero, so no write is
+        // dispatched (hence never acked) until it elapses -- the upgrade write-freeze guarantee.
         assert!(
-            reg.pause_remaining_ms(1200) > 0,
-            "a WRITE pause holds the serve-loop post-batch stall in-window"
+            reg.pause_write_remaining_ms(1200) > 0,
+            "a WRITE pause holds writes in-window"
+        );
+        // The POST-BATCH stall reads pause_all_remaining_ms; for a WRITE-only pause it is ZERO, so
+        // reads + admin (PING/INFO/SAVE) are NOT held -- this is the read-allowed semantics.
+        assert_eq!(
+            reg.pause_all_remaining_ms(1200),
+            0,
+            "a WRITE-only pause does NOT hold the post-batch stall (reads + SAVE proceed)"
         );
         assert!(
             reg.is_paused(1200),
             "is_paused is true for a WRITE pause too"
         );
-        // Once the window elapses the stall releases and writes resume (the new process boots here).
-        assert_eq!(reg.pause_remaining_ms(1600), 0, "the window self-expires");
+        // Once the window elapses, writes resume (the new process boots here).
+        assert_eq!(
+            reg.pause_write_remaining_ms(1600),
+            0,
+            "the write window self-expires"
+        );
         assert!(!reg.is_paused(1600));
         // CLIENT UNPAUSE (the abort-after-freeze un-wedge) clears it immediately, mid-window.
         reg.pause(2000, 500, true);
         assert!(reg.is_paused(2100));
         reg.unpause();
+        assert!(!reg.is_pause_armed(), "UNPAUSE disarms the pause");
         assert_eq!(
-            reg.pause_remaining_ms(2100),
+            reg.pause_write_remaining_ms(2100),
             0,
-            "CLIENT UNPAUSE releases the stall immediately (un-wedge on an aborted upgrade)"
+            "CLIENT UNPAUSE releases the write stall immediately (un-wedge on an aborted upgrade)"
         );
+    }
+
+    /// An ALL pause (writes_only = false) holds EVERYTHING via the post-batch stall: both
+    /// `pause_all_remaining_ms` (the post-batch read stall, so even a read waits) and
+    /// `pause_write_remaining_ms` (writes) are non-zero in-window. This is the unchanged ALL
+    /// behavior -- the regression guard that ALL still stalls reads too.
+    #[test]
+    fn all_pause_holds_reads_and_writes() {
+        let reg = ClientRegistry::new();
+        reg.pause(1000, 500, false);
+        assert!(!reg.pause_is_writes_only(), "the pause is ALL");
+        assert!(reg.is_pause_armed());
+        assert!(
+            reg.pause_all_remaining_ms(1200) > 0,
+            "an ALL pause holds the post-batch stall (reads wait too)"
+        );
+        assert!(
+            reg.pause_write_remaining_ms(1200) > 0,
+            "an ALL pause also holds writes"
+        );
+        // Self-expiry.
+        assert_eq!(reg.pause_all_remaining_ms(1600), 0);
+        assert_eq!(reg.pause_write_remaining_ms(1600), 0);
+    }
+
+    /// No pause armed: every kind-aware helper is `0`/`false` and `is_pause_armed` is the single
+    /// cheap guard that lets the serve loop's per-command write-pause check fall through for free.
+    #[test]
+    fn no_pause_is_disarmed_and_zero() {
+        let reg = ClientRegistry::new();
+        assert!(!reg.is_pause_armed());
+        assert_eq!(reg.pause_all_remaining_ms(1234), 0);
+        assert_eq!(reg.pause_write_remaining_ms(1234), 0);
+        assert!(!reg.is_paused(1234));
     }
 }
