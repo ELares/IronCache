@@ -1,12 +1,19 @@
 # Implementation-readiness roadmap
 
-IronCache has no engine code yet by design. This roadmap prioritizes and
-sequences the issue tree (163 issues) into the order they should be resolved
+This roadmap was authored before the engine existed, to prioritize and
+sequence the issue tree (163 issues) into the order they should be resolved
 and built, derived from the dependency graph and the ranked tenets
 (Compatible > Efficient > Simple > Scalable > AI-Driven). The live tracker
 reflects it via the **Implementation Readiness** milestone (the critical-path
 gate), the `wave:0..3` labels (sequence), and the `critical-path` label (the
 thin first slice). The tracking issue is the EPIC-linked companion to this doc.
+
+**Status:** the thin vertical slice and Waves 1 to 3 below are now implemented
+(the engine and all core data types, transactions, pub/sub, persistence, security,
+and the opt-in Raft cluster), along with later tooling (a separate monitoring
+console and a verified data-safe `ironcache upgrade`). This document is retained
+as the planning and sequencing record; see the top-level
+[README](../README.md) for the current feature set.
 
 ## The thin vertical slice (first running binary)
 
