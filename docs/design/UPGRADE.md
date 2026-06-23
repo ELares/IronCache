@@ -198,3 +198,5 @@ called out as an open decision in #62). This is what makes the readiness check's
 - Claims: [minisign-offline-ed25519-detached-verify],
   [self-replace-atomic-rename], [self-update-crate-version-backends],
   [cargo-auditable-version-reproducible].
+
+<!-- Mechanism + lossless write-freeze implemented in #393 / #395 (epic #385). -->
