@@ -200,3 +200,5 @@ called out as an open decision in #62). This is what makes the readiness check's
   [cargo-auditable-version-reproducible].
 
 <!-- Mechanism + lossless write-freeze implemented in #393 / #395 (epic #385). -->
+
+<!-- Freeze-path validated on a live box after the write-only CLIENT PAUSE fix (#397). -->
