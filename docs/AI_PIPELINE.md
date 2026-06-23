@@ -119,19 +119,19 @@ unsourced numbers are never merged.
 The #94 design also specifies a stronger bar than citation hygiene: a mechanism
 should enter the design tree only after its numbers are **reproduced** by
 deterministic trace replay on N independent traces, banded
-[lrb-model-and-traffic-reduction]. That bar is **deferred** today because it is
-harness-blocked: IronCache has no engine code and no built benchmark, test, or
-oracle harness yet. The harness is *designed* (the benchmark and memory-model
-harness in #8; the conformance/differential/DST stack in #95 and the Valkey
-differential oracle in #96), but not *built*, and the Belady oracle that the
-reproduction bar needs is still open work (#93). There is nothing to replay
-traces against yet.
+[lrb-model-and-traffic-reduction]. That bar was originally **deferred** as
+harness-blocked. The engine and most of that harness are now built (the
+benchmark and memory-model harness from #8; the conformance/differential/DST
+stack from #95 and the Valkey differential oracle from #96), so the bar is no
+longer blocked on a missing engine or oracle stack. The remaining piece is the
+Belady oracle and the deterministic trace-replay reproduction that the strongest
+form of this bar needs (#93).
 
-Until that harness is built, the live pipeline enforces the two gates it *can*
-enforce offline: version-pinned sourcing plus the independent adversarial
-re-check (steps 2 and 3 above). Numeric claims are admitted as **cited and
-adversarially verified**, explicitly **not** as **reproduced**. When the harness
-lands, the reproduction bar attaches as an additional, blocking gate on numeric
+Until that trace-replay reproduction lands, the live pipeline enforces the two
+gates it *can* enforce offline: version-pinned sourcing plus the independent
+adversarial re-check (steps 2 and 3 above). Numeric claims are admitted as
+**cited and adversarially verified**, explicitly **not** as **reproduced**. When
+it lands, the reproduction bar attaches as an additional, blocking gate on numeric
 claims (a `verification.reproduced` verdict over the trace corpus), and this
 runbook will be updated to make trace replay a merge requirement rather than a
 deferred goal. The harness-blocked experiments are catalogued with the rest of

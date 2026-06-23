@@ -1,8 +1,10 @@
 # IronCache docs
 
-This is the design record for IronCache while it is in its research and
-specification phase. No engine code exists yet; these documents and the GitHub
-issues are the specification.
+This is the design record for IronCache. It began as the research and
+specification phase that preceded the engine; the engine is now built and broad
+(see the top-level [README](../README.md) for the implemented feature set), and
+these documents plus the GitHub issues remain the design rationale and the
+historical record of how each decision was reached.
 
 - [PRIOR_ART.md](PRIOR_ART.md): the version-pinned comparative survey of Redis,
   Valkey, KeyDB, DragonflyDB, Memcached, Garnet, and the academic caching

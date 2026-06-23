@@ -154,6 +154,24 @@ full contract.
 - **DoS guards**: `maxmemory` with eviction, `maxclients`, an idle-connection
   timeout, and a per-connection output-buffer bound.
 
+### Seamless upgrades
+
+- **`ironcache upgrade`**: a verified, data-safe, self-rolling-back binary self-update
+  that swaps a running node to a new version. It verifies the new artifact (SHA-256
+  against `SHA256SUMS`, behind a pluggable verifier seam for signature anchors), takes
+  an fsync'd snapshot first, swaps the binary atomically while keeping exactly one
+  rollback slot (the live path is never absent, even if the process is killed
+  mid-swap), restarts the node, and health-gates the result: `/readyz`, a real
+  process-restart proof (the `ironcache_uptime_seconds` reset, so a no-op restart or a
+  stale process cannot false-pass), a version match, and a stabilization window. Any
+  miss auto-rolls-back to the previous binary.
+- **Lossless across the restart**: before the snapshot it issues a node-wide
+  `CLIENT PAUSE WRITE` (writes hold; reads and admin like SAVE keep serving) so no
+  acknowledged write is lost in the save-to-reload window; `--no-freeze` opts out. A
+  failed upgrade unpauses and leaves the node untouched.
+- Validated end to end on a live AWS node: an upgrade under continuous concurrent
+  writes preserved every acknowledged write, the full keyspace, and the ACL users.
+
 ### Deployment
 
 - A multi-stage, non-root, distroless container image (`Dockerfile`) published to
@@ -213,10 +231,12 @@ cargo run -p ironcache -- server
 redis-cli -p 6379 SET hello world   # -> OK
 redis-cli -p 6379 GET hello         # -> "world"
 
-# other modes: the built-in CLI, the effective config, or a config self-check
+# other modes: the built-in CLI, the effective config, a config self-check, or a
+# verified data-safe binary self-upgrade (see "Seamless upgrades")
 cargo run -p ironcache -- cli GET hello
 cargo run -p ironcache -- config
 cargo run -p ironcache -- check
+cargo run -p ironcache -- upgrade --binary ./ironcache --sha256sums ./SHA256SUMS
 ```
 
 ### Run the container
