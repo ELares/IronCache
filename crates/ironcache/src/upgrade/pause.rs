@@ -9,8 +9,9 @@
 //! This module closes that window using the engine primitive `CLIENT PAUSE <ms> WRITE` (PROD-7). The
 //! orchestrator (see [`super::run_with`]) issues the freeze BEFORE the final `SAVE`, in this order:
 //!
-//! 1. `CLIENT PAUSE <ms> WRITE` -- node-wide, the serve loop stalls every connection at its
-//!    post-batch boundary so no FURTHER command (hence no further write) is executed or acked.
+//! 1. `CLIENT PAUSE <ms> WRITE` -- node-wide; the serve loop holds every WRITE command before it is
+//!    dispatched (reads and admin like `SAVE`/`INFO`/`PING` still proceed), so no further write is
+//!    executed or acked while the freeze is active.
 //! 2. let in-flight writes DRAIN -- a short fixed pause so any command already buffered on a
 //!    connection at the instant the freeze landed finishes and is reflected in the snapshot.
 //! 3. `SAVE` (confirm `LASTSAVE` advanced) -- captures a state AFTER which no write is acked.
@@ -19,15 +20,15 @@
 //!
 //! ## Why this is lossless (the engine no-ack proof)
 //!
-//! The serve loop consults the pause window ONLY at the POST-BATCH boundary (`serve.rs`, the
-//! `pause_remaining_ms` stall), AFTER a batch's commands have been dispatched and their replies
-//! flushed, and BEFORE it reads the next batch. While the window is active the connection BLOCKS
-//! there (it does not reject/error) -- so once stalled, no further command on that connection is
-//! executed or acknowledged. The stall holds for a `WRITE` pause too (it is a conservative superset
-//! that stalls all command processing for the window), so a WRITE-paused connection acks nothing. The
-//! only writes that can still be acked after the freeze are those ALREADY buffered on a connection
-//! when the freeze landed; the DRAIN pause in step 2 lets those finish and land in the snapshot. So
-//! the `SAVE` in step 3 captures a state after which NO acknowledged write exists outside it.
+//! The serve loop gates each command against the pause window BEFORE it is dispatched. Under a
+//! `WRITE` pause a write command BLOCKS there (it does not reject/error) while reads and admin
+//! commands (`SAVE`, `INFO`, `PING`) pass through -- so once the freeze is active no further WRITE on
+//! any connection is executed or acknowledged, yet the orchestrator's own `SAVE` (step 3) still runs.
+//! The only writes that can still be acked after the freeze are those ALREADY buffered on a
+//! connection when the freeze landed; the DRAIN pause in step 2 lets those finish and land in the
+//! snapshot. So the `SAVE` in step 3 captures a state after which NO acknowledged write exists
+//! outside it. (A `WRITE` pause that also stalled reads/`SAVE` would deadlock this very save; the
+//! engine pause is genuinely write-only for exactly this reason.)
 //!
 //! ## No unpause on the happy path; UNPAUSE on an abort
 //!

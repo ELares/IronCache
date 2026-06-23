@@ -1407,6 +1407,14 @@ async fn serve_connection(
                     // command must PARK; it stays `None` for every non-blocking command (the hot
                     // path), so this is a single stack `Option` write per command.
                     let mut block_request: Option<BlockPark> = None;
+                    // CLIENT PAUSE (#388, write-aware): hold this command HERE while a pause that
+                    // applies to it is active -- an ALL pause holds every command, a WRITE pause
+                    // holds only writes (reads + admin like SAVE proceed). This is the single point
+                    // both kinds are honored, so it is correct under pipelining and holds the very
+                    // next command after a pause begins. Default (no pause): a single relaxed atomic
+                    // load returns immediately, so the hot path is byte-unchanged (no clock read, no
+                    // classify).
+                    pause_stall(&ctx, &conn, &request, &env, &timer_rt, &client_handle).await;
                     let close = route_and_dispatch(
                         &ctx,
                         &mut conn,
@@ -1526,34 +1534,12 @@ async fn serve_connection(
             break;
         }
 
-        // CLIENT PAUSE (PROD-7): if a `CLIENT PAUSE` window is active, stall this connection's
-        // command processing until it elapses (or is UNPAUSEd). The deadline basis is the Env
-        // monotonic clock (the same basis CLIENT PAUSE recorded). Both ALL and WRITE-only pauses
-        // hold the loop here: a WRITE-only pause is enforced as a CONSERVATIVE SUPERSET (it stalls
-        // all command processing for the window, so it never silently fails to pause a write -- the
-        // operator's intent during a failover is honored), at the cost of also stalling reads.
-        // Precise per-command write-only gating that lets reads proceed is a documented follow-up.
-        // The default (no pause) reads one relaxed atomic and falls through, byte-unchanged. We
-        // re-check in a short timer loop so an UNPAUSE / a kill takes effect promptly.
-        loop {
-            let now_mono_ms = env.borrow().now().as_millis();
-            let remaining = ctx.clients.pause_remaining_ms(now_mono_ms);
-            if remaining == 0 {
-                break;
-            }
-            if client_handle.is_killed() {
-                break;
-            }
-            // Wait the smaller of the remaining window and a short poll quantum, so UNPAUSE / KILL
-            // are observed within ~50ms. Via the Runtime timer SEAM (not wall-clock).
-            let wait = remaining.min(50);
-            timer_rt
-                .timer(core::time::Duration::from_millis(wait))
-                .await;
-        }
-        if client_handle.is_killed() {
-            break;
-        }
+        // CLIENT PAUSE (PROD-7, #388): the pause stall is now PER-COMMAND, done in the decode loop
+        // above (`pause_stall`) right before each command is dispatched, so a WRITE pause holds only
+        // writes (reads + admin like SAVE proceed) and an ALL pause holds every command -- and the
+        // VERY NEXT command after a pause begins is held (a post-batch stall here would only hold the
+        // command AFTER the current batch was already served). The default (no pause) cost is a single
+        // relaxed atomic load per command at that gate; there is no post-batch pause work.
 
         // The LIVE idle timeout (PROD-SAFETY #4): re-read the runtime overlay (one relaxed atomic
         // load) so a `CONFIG SET timeout` takes effect for this already-connected client on THIS
@@ -1824,6 +1810,12 @@ async fn serve_connection_uring(
                     // blocking is a documented io_uring-path limitation; the reply is the same one
                     // the command would have produced on a zero timeout.
                     let mut block_request: Option<BlockPark> = None;
+                    // CLIENT PAUSE (#388, write-aware), identical to the tokio path: hold this
+                    // command while a pause that applies to it is active -- an ALL pause holds
+                    // everything, a WRITE pause holds only writes (reads + admin like SAVE proceed).
+                    // Default (no pause): one relaxed atomic load returns immediately -- the
+                    // byte-unchanged hot path.
+                    pause_stall(&ctx, &conn, &request, &env, &timer_rt, &client_handle).await;
                     let close = route_and_dispatch(
                         &ctx,
                         &mut conn,
@@ -1900,30 +1892,12 @@ async fn serve_connection_uring(
             break;
         }
 
-        // CLIENT PAUSE (PROD-7, FIX3): if a `CLIENT PAUSE` window is active, stall this
-        // connection's command processing until it elapses (or is UNPAUSEd), identical to the tokio
-        // serve loop. The deadline basis is the Env monotonic clock (the same basis CLIENT PAUSE
-        // recorded); both ALL and WRITE-only pauses hold here (the conservative superset). The
-        // default (no pause) reads one relaxed atomic and falls through, byte-unchanged. We re-check
-        // in a short timer loop so an UNPAUSE / a kill takes effect promptly (via the Runtime timer
-        // seam, which `tokio_uring::start`'s tokio time driver backs).
-        loop {
-            let now_mono_ms = env.borrow().now().as_millis();
-            let remaining = ctx.clients.pause_remaining_ms(now_mono_ms);
-            if remaining == 0 {
-                break;
-            }
-            if client_handle.is_killed() {
-                break;
-            }
-            let wait = remaining.min(50);
-            timer_rt
-                .timer(core::time::Duration::from_millis(wait))
-                .await;
-        }
-        if client_handle.is_killed() {
-            break;
-        }
+        // CLIENT PAUSE (PROD-7, FIX3, #388): the pause stall is now PER-COMMAND, done in the decode
+        // loop above (`pause_stall`) right before each command is dispatched, identical to the tokio
+        // serve loop -- a WRITE pause holds only writes (reads + admin like SAVE proceed), an ALL
+        // pause holds every command, and the very next command after a pause begins is held. There is
+        // no post-batch pause work; the default (no pause) cost is the single relaxed atomic load per
+        // command at that gate.
 
         // IDLE WAIT. The NON-subscriber path is the plain io_uring `recv` (byte-unchanged from
         // before this fix). A connection in SUBSCRIBE mode instead takes the `select!`-based
@@ -2699,6 +2673,96 @@ fn consume_one_shot_asking(cmd_upper: &[u8], conn: &mut ConnState) -> bool {
         let a = conn.asking;
         conn.asking = false;
         a
+    }
+}
+
+/// Whether `request` is `CLIENT UNPAUSE` (case-insensitive), the pause-RECOVERY command that
+/// [`pause_stall`] must never hold. Cheap and short-circuiting: it checks the `CLIENT` token first
+/// (so a non-CLIENT command bails after one compare) and only then the `UNPAUSE` subcommand. Reached
+/// ONLY when a pause is armed, never on the default hot path.
+fn request_is_client_unpause(request: &Request) -> bool {
+    request.args.len() == 2
+        && request.args[0].eq_ignore_ascii_case(b"CLIENT")
+        && request.args[1].eq_ignore_ascii_case(b"UNPAUSE")
+}
+
+/// The PER-COMMAND `CLIENT PAUSE` gate (#388, write-aware). Called in the serve loop's decode loop
+/// for EACH decoded command, right BEFORE it is dispatched, so the command is HELD while a pause
+/// that applies to it is active and released the instant the window clears or `CLIENT UNPAUSE` runs.
+/// This is the SINGLE point where both pause kinds are honored, which is why it is correct under
+/// PIPELINING (in a batch of mixed reads + writes under a WRITE pause, each read passes here and
+/// each write holds here) and why it holds the VERY NEXT command after a pause begins (the old
+/// post-batch stall let the first command after a pause slip through, since it stalled only AFTER
+/// replying to the current batch):
+///
+/// * an ALL pause holds EVERY command (reads included), matching the prior ALL behavior;
+/// * a WRITE-only pause holds ONLY writes -- reads + admin (PING/INFO/SAVE/...) flow straight
+///   through -- making `CLIENT PAUSE WRITE` genuinely write-only (Redis semantics). This is the fix
+///   for the ironcache-upgrade write-freeze, where the upgrade issues `CLIENT PAUSE WRITE` then
+///   `SAVE`: the old superset stall held the SAVE too, deadlocking the upgrade's own snapshot.
+///
+/// HOT PATH (no pause): a SINGLE relaxed atomic load via [`ClientRegistry::is_pause_armed`] returns
+/// `false`, so this returns immediately -- NO clock read, NO command uppercasing, NO classification,
+/// NO further work. The default (never-paused) connection therefore pays only that one load per
+/// command, and the rest of this function is never entered (the byte-identical hot path).
+///
+/// When a pause IS armed it reads the kind once. For a WRITE-only pause it classifies the command
+/// via [`request_is_write_for_pause`] (which also covers `EXEC` of a write-containing transaction
+/// and does NOT hold a command merely being queued inside a `MULTI`); a non-write proceeds at once.
+/// A held command stalls in a short poll loop (a ~50ms quantum + an Env-monotonic deadline + the
+/// Runtime timer seam) until the relevant remaining-ms reaches `0` (window expiry or `CLIENT
+/// UNPAUSE`) or the connection is `CLIENT KILL`ed. It does NOT itself close the connection: the
+/// caller re-checks `client_handle.is_killed()` after dispatch.
+async fn pause_stall<T: Runtime>(
+    ctx: &ServerContext,
+    conn: &ConnState,
+    request: &Request,
+    env: &Rc<RefCell<SystemEnv>>,
+    timer_rt: &T,
+    client_handle: &ironcache_observe::ClientHandle,
+) {
+    // The single cheap guard: nothing recorded -> return without touching the clock, UPPERCASING the
+    // command token, or classifying it. This keeps the default (no pause) hot path to one relaxed
+    // atomic load per command.
+    if !ctx.clients.is_pause_armed() {
+        return;
+    }
+    // RECOVERY EXEMPTION: `CLIENT UNPAUSE` is NEVER held by a pause -- it is the command that LIFTS
+    // the pause, so an ALL pause (which otherwise holds every command) would be UNRECOVERABLE from
+    // the very connection that set it if its own UNPAUSE were stalled. This is the un-wedge the
+    // ironcache-upgrade safe-abort relies on. (Under a WRITE pause, CLIENT is already a non-write and
+    // passes the classifier below; the exemption is only load-bearing for an ALL pause.) Cheap: only
+    // reached when a pause is armed, and short-circuits on the `CLIENT` token before the subcommand
+    // compare.
+    if request_is_client_unpause(request) {
+        return;
+    }
+    // A pause is armed. A WRITE-only pause holds ONLY writes; an ALL pause holds everything. For a
+    // WRITE pause, classify the command (uppercasing is only paid on this cold, paused path) and let
+    // a non-write through. For an ALL pause every command is held.
+    if ctx.clients.pause_is_writes_only() {
+        let cmd_upper = ascii_upper(request.command());
+        if !ironcache_server::request_is_write_for_pause(&cmd_upper, conn.in_multi, &conn.queued) {
+            return;
+        }
+    }
+    // Hold this command until the applicable pause window clears (a write is blocked by BOTH kinds;
+    // a non-write reaches here only under an ALL pause), an UNPAUSE clears it, or the connection is
+    // killed. `pause_write_remaining_ms` is the raw window for either kind, so it is the correct
+    // remaining for both the write-under-any-pause case and the any-command-under-ALL case.
+    loop {
+        let now_mono_ms = env.borrow().now().as_millis();
+        let remaining = ctx.clients.pause_write_remaining_ms(now_mono_ms);
+        if remaining == 0 {
+            break;
+        }
+        if client_handle.is_killed() {
+            break;
+        }
+        let wait = remaining.min(50);
+        timer_rt
+            .timer(core::time::Duration::from_millis(wait))
+            .await;
     }
 }
 
@@ -6530,6 +6594,28 @@ mod tests {
                 .map(|p| bytes::Bytes::copy_from_slice(p))
                 .collect(),
         }
+    }
+
+    /// `CLIENT UNPAUSE` (case-insensitive, exactly 2 args) is the pause-recovery command the pause
+    /// stall must never hold; everything else (incl. other CLIENT subcommands and a malformed UNPAUSE
+    /// with extra args) is NOT exempt and is gated normally.
+    #[test]
+    fn client_unpause_is_recognized_for_the_pause_exemption() {
+        assert!(request_is_client_unpause(&rreq(&[b"CLIENT", b"UNPAUSE"])));
+        assert!(request_is_client_unpause(&rreq(&[b"client", b"unpause"])));
+        assert!(request_is_client_unpause(&rreq(&[b"Client", b"UnPause"])));
+        // NOT an exempt UNPAUSE: other subcommands, PAUSE itself, a bare CLIENT, or trailing args.
+        assert!(!request_is_client_unpause(&rreq(&[
+            b"CLIENT", b"PAUSE", b"100"
+        ])));
+        assert!(!request_is_client_unpause(&rreq(&[
+            b"CLIENT", b"KILL", b"ID", b"1"
+        ])));
+        assert!(!request_is_client_unpause(&rreq(&[b"CLIENT"])));
+        assert!(!request_is_client_unpause(&rreq(&[b"GET", b"UNPAUSE"])));
+        assert!(!request_is_client_unpause(&rreq(&[
+            b"CLIENT", b"UNPAUSE", b"extra"
+        ])));
     }
 
     /// Find a short key whose `key_slot` is in `[lo, hi]` (the slot space is dense).

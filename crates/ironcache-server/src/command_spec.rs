@@ -218,6 +218,42 @@ pub fn is_write(cmd_upper: &[u8]) -> bool {
     spec_of(cmd_upper).is_none_or(|s| s.is_write)
 }
 
+/// Whether the command `cmd_upper` (UPPERCASE token) counts as a WRITE for the purpose of
+/// `CLIENT PAUSE WRITE` -- i.e. whether the serve loop must HOLD it while a write-pause is active so
+/// that a write is never executed (or acked) during the lossless upgrade write-freeze. This is the
+/// per-command write classifier used by the serve-loop pause gate; it is consulted ONLY when a pause
+/// is already armed (never on the default hot path).
+///
+/// It extends [`is_write`] with the two transaction cases the bare command token does not capture:
+///
+/// * `EXEC` is a write iff the staged transaction (`queued`) contains ANY write command -- an `EXEC`
+///   that runs a write must be held under a WRITE pause (otherwise a `MULTI; SET; EXEC` would slip a
+///   write through). An EXEC of a read-only / empty transaction is NOT a write, so it proceeds.
+/// * `in_multi` (a command being QUEUED inside an open `MULTI`, other than the control verbs) does
+///   NOT execute now -- it only stages -- so it is NOT held here; the write is held at its `EXEC`.
+///   The control verbs (MULTI/EXEC/DISCARD/WATCH/...) are handled by their own arms; EXEC is gated
+///   above, and the rest are non-writes.
+///
+/// CONSERVATIVE by construction: an UNKNOWN command is a write via [`is_write`], and EXEC is treated
+/// as a write whenever its queue holds even one write, so no write slips past a WRITE pause.
+#[must_use]
+pub fn request_is_write_for_pause(cmd_upper: &[u8], in_multi: bool, queued: &[Request]) -> bool {
+    // EXEC: a write iff the staged batch holds any write. spec_of(EXEC).control == true, so EXEC is
+    // reached here even while `in_multi`.
+    if cmd_upper == b"EXEC" {
+        return queued
+            .iter()
+            .any(|q| is_write(&q.command().to_ascii_uppercase()));
+    }
+    // A command being QUEUED inside an open MULTI does not execute now (only EXEC runs the batch), so
+    // it is not held here. The transaction-control verbs (which bypass queueing) are non-writes and
+    // fall through to `is_write` below as false.
+    if in_multi {
+        return false;
+    }
+    is_write(cmd_upper)
+}
+
 /// Extract the routing KEY(s) of a command from `req` per its [`KeySpecKind`]
 /// (COORDINATOR.md #107, Stage 1). This is the GENERIC extraction keyed by pattern: it
 /// preserves EXACTLY the per-pattern logic the legacy `command_keys` match used (the
@@ -2492,6 +2528,38 @@ pub(crate) mod tests {
         Request {
             args: parts.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
         }
+    }
+
+    /// The per-command WRITE classifier the `CLIENT PAUSE WRITE` serve-loop gate uses. A plain write
+    /// (SET) is a write; a read (GET) / admin (PING/INFO/SAVE/CLIENT/AUTH) is not. EXEC is a write
+    /// IFF its staged batch holds a write, and a command being queued inside an open MULTI is not
+    /// held (only its EXEC is). An unknown command is conservatively a write.
+    #[test]
+    fn write_for_pause_classifies_reads_admin_writes_and_exec() {
+        // Plain write vs read vs admin (NOT in a MULTI).
+        assert!(request_is_write_for_pause(b"SET", false, &[]));
+        assert!(request_is_write_for_pause(b"DEL", false, &[]));
+        assert!(!request_is_write_for_pause(b"GET", false, &[]));
+        assert!(!request_is_write_for_pause(b"PING", false, &[]));
+        assert!(!request_is_write_for_pause(b"INFO", false, &[]));
+        assert!(!request_is_write_for_pause(b"SAVE", false, &[]));
+        assert!(!request_is_write_for_pause(b"CLIENT", false, &[]));
+        assert!(!request_is_write_for_pause(b"AUTH", false, &[]));
+        // Unknown command: conservatively a write.
+        assert!(request_is_write_for_pause(b"NOTACOMMAND", false, &[]));
+        // Queued inside an open MULTI: the command does not execute now, so it is NOT held here
+        // (even a SET) -- only the EXEC that runs the batch is.
+        assert!(!request_is_write_for_pause(b"SET", true, &[]));
+        assert!(!request_is_write_for_pause(b"GET", true, &[]));
+        // EXEC of a batch with a write -> a write. spec_of(EXEC).control is true, so this is reached
+        // even while in_multi.
+        let write_batch = [req(&[b"SET", b"k", b"v"]), req(&[b"GET", b"k"])];
+        assert!(request_is_write_for_pause(b"EXEC", true, &write_batch));
+        // EXEC of a read-only batch -> not a write (reads proceed under a WRITE pause).
+        let read_batch = [req(&[b"GET", b"k"]), req(&[b"TTL", b"k"])];
+        assert!(!request_is_write_for_pause(b"EXEC", true, &read_batch));
+        // EXEC of an empty transaction -> not a write.
+        assert!(!request_is_write_for_pause(b"EXEC", true, &[]));
     }
 
     /// COMMAND-TABLE CONSISTENCY (#158): every name in [`CLIENT_COMMAND_NAMES`] is a real registry
