@@ -576,10 +576,15 @@ impl ClientRegistry {
         self.pause_until_mono_ms.store(0, Ordering::Relaxed);
     }
 
-    /// Whether an ALL-command pause is currently active given the monotonic-millis `now`, and the
-    /// remaining milliseconds. A WRITE-only pause returns `(false, _)` here (it does not stall the
-    /// read hot path); the write-gating is consulted separately. Used by the serve loop's
-    /// post-batch stall.
+    /// The remaining milliseconds of the active pause window given the monotonic-millis `now`
+    /// (`0` when none). This is AGNOSTIC to the pause KIND: it returns the same non-zero remaining
+    /// for a WRITE-only pause as for an ALL pause, because the serve loop's POST-BATCH STALL reads
+    /// THIS value and holds the connection for BOTH kinds (a WRITE pause is enforced as a conservative
+    /// SUPERSET that stalls all command processing for the window -- see `serve.rs`). That superset
+    /// stall is what makes `CLIENT PAUSE WRITE` the load-bearing primitive of the lossless upgrade
+    /// write-freeze (#388): while paused, NO further command -- hence no write -- is acked. (A precise
+    /// write-only gate that lets reads proceed mid-pause is a documented follow-up; it must preserve
+    /// the no-ack-on-write guarantee.)
     #[must_use]
     pub fn pause_remaining_ms(&self, now_mono_ms: u64) -> u64 {
         let until = self.pause_until_mono_ms.load(Ordering::Relaxed);
@@ -755,5 +760,44 @@ mod tests {
         assert!(!reg.is_paused(1600));
         reg.unpause();
         assert!(!reg.is_paused(1100));
+    }
+
+    /// THE LOSSLESS-FREEZE NO-ACK PROOF (#388). A `CLIENT PAUSE <ms> WRITE` (writes_only = true) sets
+    /// the SAME `pause_until_mono_ms` deadline an ALL pause does, and `pause_remaining_ms` -- the
+    /// value the serve loop reads in its POST-BATCH STALL (`serve.rs`, the `pause_remaining_ms`
+    /// loop) -- is non-zero for the window. The serve loop stalls the connection there BEFORE reading
+    /// or dispatching the next command, so while WRITE-paused NO further write is executed or
+    /// acknowledged (the stall is a conservative superset that also holds reads, but the load-bearing
+    /// guarantee for the upgrade write-freeze is that a write is never ACKED while paused). The window
+    /// expires on its own, and `CLIENT UNPAUSE` clears it immediately.
+    #[test]
+    fn write_pause_holds_the_serve_loop_stall() {
+        let reg = ClientRegistry::new();
+        // CLIENT PAUSE 500 WRITE at t=1000.
+        reg.pause(1000, 500, true);
+        assert!(reg.pause_is_writes_only(), "the pause is WRITE-only");
+        // The serve loop's post-batch stall reads pause_remaining_ms; it is non-zero IN-window, so
+        // the connection stalls there and acks no further command (write or otherwise) until it
+        // elapses. This is the no-ack guarantee the lossless upgrade relies on.
+        assert!(
+            reg.pause_remaining_ms(1200) > 0,
+            "a WRITE pause holds the serve-loop post-batch stall in-window"
+        );
+        assert!(
+            reg.is_paused(1200),
+            "is_paused is true for a WRITE pause too"
+        );
+        // Once the window elapses the stall releases and writes resume (the new process boots here).
+        assert_eq!(reg.pause_remaining_ms(1600), 0, "the window self-expires");
+        assert!(!reg.is_paused(1600));
+        // CLIENT UNPAUSE (the abort-after-freeze un-wedge) clears it immediately, mid-window.
+        reg.pause(2000, 500, true);
+        assert!(reg.is_paused(2100));
+        reg.unpause();
+        assert_eq!(
+            reg.pause_remaining_ms(2100),
+            0,
+            "CLIENT UNPAUSE releases the stall immediately (un-wedge on an aborted upgrade)"
+        );
     }
 }

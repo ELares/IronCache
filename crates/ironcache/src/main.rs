@@ -432,6 +432,7 @@ fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
         no_rollback: args.no_rollback,
         yes: args.yes,
         allow_same: args.allow_same,
+        no_freeze: args.no_freeze,
     };
 
     match upgrade::run(&resolved) {

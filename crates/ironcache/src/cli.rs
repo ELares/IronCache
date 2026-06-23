@@ -107,6 +107,10 @@ pub enum Command {
 /// Arguments for `ironcache upgrade` (the #387 mechanism). `--binary` + `--sha256sums` are the v1
 /// local source + integrity manifest; the swap target, unit, health, auth, and rollback knobs all
 /// have safe defaults.
+// The four flag fields (`--no-rollback`, `--yes`, `--allow-same`, `--no-freeze`) are independent
+// operator toggles on a clap argument bag, not a state machine; the bool-per-flag shape is the clap
+// idiom and the clearest surface here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, clap::Args)]
 pub struct UpgradeArgs {
     /// Path to the NEW ironcache binary to install (the local source for v1). Its sha256 must match
@@ -161,6 +165,14 @@ pub struct UpgradeArgs {
     /// `--yes`. Off by default, since a same-version upgrade is usually a mistake.
     #[arg(long)]
     pub allow_same: bool,
+
+    /// Opt OUT of the lossless write-freeze (#388). By default `ironcache upgrade` issues a node-wide
+    /// `CLIENT PAUSE WRITE` before the final SAVE so NO acknowledged write is lost across the upgrade.
+    /// `--no-freeze` skips that and behaves exactly as before (SAVE-first only), accepting the tiny
+    /// window where the old process can ack a write that is not in the snapshot -- for a read-mostly
+    /// or rebuildable cache where availability matters more than that window.
+    #[arg(long)]
+    pub no_freeze: bool,
 }
 
 /// Returns true when the binary was invoked under a `redis-cli` basename, in

@@ -23,6 +23,19 @@ use std::time::Duration;
 /// the child finishes, large enough not to busy-spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The back-off between ETXTBSY spawn retries (see [`spawn_with_etxtbsy_retry`]). ETXTBSY clears the
+/// instant the writer closes its fd, so a short wait suffices.
+const ETXTBSY_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How many times to RETRY a spawn that fails with `ETXTBSY` ("Text file busy") before giving up.
+/// `execve()` returns `ETXTBSY` when the target file still has a writer fd open -- which is exactly
+/// the case for a binary we (or a downstream auto-fetch, #394) JUST wrote/downloaded and are about to
+/// run, when the writer's `close()` races the `exec()`. It is TRANSIENT (it clears as soon as the
+/// writer closes), so a brief retry loop makes the version probe robust for a freshly written binary.
+/// ~10 attempts over ~1s (`ETXTBSY_RETRY_BACKOFF * 10`) is generous; other spawn errors are NOT
+/// retried (they are not transient).
+const ETXTBSY_MAX_RETRIES: u32 = 10;
+
 /// A bounded-run failure: the child could not be spawned, an IO error occurred reading its output, or
 /// it did not exit within the deadline (and was killed).
 #[derive(Debug, thiserror::Error)]
@@ -65,43 +78,61 @@ pub fn run_bounded(
     args: &[&str],
     timeout: Duration,
 ) -> Result<Output, BoundedError> {
-    use std::process::Stdio;
+    // Run the whole runtime-driven body on a DEDICATED OS thread. `run_bounded` is a SYNC function
+    // that internally `block_on`s a throwaway current-thread runtime, but it is reachable from WITHIN
+    // a caller's tokio runtime (the health gate `block_on`s `poll_until_healthy`, which calls the
+    // version probe). `block_on` panics ("Cannot start a runtime from within a runtime") if the
+    // current thread is already driving a runtime, so we isolate it onto its own thread, where no
+    // ambient runtime exists. `std::thread::scope` lets the closure borrow `program`/`args` without
+    // `'static` bounds and joins before returning. (This is the short-lived operator CLI; one extra
+    // thread per bounded subprocess is immaterial, and it is NOT a `fork` syscall, invariant 4.)
     let prog_name = program.display().to_string();
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| BoundedError::Spawn {
-            program: prog_name.clone(),
-            detail: e.to_string(),
-        })?;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| run_bounded_on_this_thread(program, args, timeout, &prog_name))
+            .join()
+            .unwrap_or_else(|_| {
+                // The worker thread panicked (it should not -- the body returns typed errors); surface
+                // it as a Wait error rather than propagating the panic across the scope boundary.
+                Err(BoundedError::Wait {
+                    program: prog_name.clone(),
+                    detail: "the bounded-run worker thread panicked".to_owned(),
+                })
+            })
+    })
+}
 
-    // Poll for exit under a monotonic deadline. The wait/sleep runs on a throwaway current-thread
-    // runtime so the inter-poll delay goes through the Runtime timer seam (not std::time).
-    let rt = match tokio::runtime::Builder::new_current_thread()
+/// The runtime-driven body of [`run_bounded`], always invoked on a dedicated thread with NO ambient
+/// tokio runtime, so its `block_on` calls never nest. Builds one throwaway current-thread runtime,
+/// spawns the child (with the ETXTBSY retry), and waits for it under the deadline.
+fn run_bounded_on_this_thread(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+    prog_name: &str,
+) -> Result<Output, BoundedError> {
+    // Build the throwaway current-thread runtime FIRST: it backs both the ETXTBSY spawn-retry back-off
+    // and the exit-poll wait, so both inter-attempt delays go through the Runtime timer seam (not
+    // std::time). Built before the spawn so a spawn that needs to retry already has its timer.
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            // We already spawned; kill it so we do not leak a child, then surface the error.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(BoundedError::Wait {
-                program: prog_name,
-                detail: format!("could not build the wait runtime: {e}"),
-            });
-        }
-    };
+        .map_err(|e| BoundedError::Wait {
+            program: prog_name.to_owned(),
+            detail: format!("could not build the wait runtime: {e}"),
+        })?;
 
-    let exited = rt.block_on(wait_with_deadline(&mut child, timeout, &prog_name));
+    // SPAWN with a bounded ETXTBSY retry: a binary we (or #394's auto-fetch) just wrote can still have
+    // a writer fd open, so execve() races into ETXTBSY ("Text file busy"); it clears the instant the
+    // writer closes. Only ETXTBSY is retried; any other spawn error fails immediately.
+    let mut child = rt.block_on(spawn_with_etxtbsy_retry(program, args, prog_name))?;
+
+    let exited = rt.block_on(wait_with_deadline(&mut child, timeout, prog_name));
     match exited {
         Ok(true) => {
             // The child has exited; collect its output (status + captured streams).
             child.wait_with_output().map_err(|e| BoundedError::Wait {
-                program: prog_name,
+                program: prog_name.to_owned(),
                 detail: e.to_string(),
             })
         }
@@ -110,7 +141,7 @@ pub fn run_bounded(
             let _ = child.kill();
             let _ = child.wait();
             Err(BoundedError::Timeout {
-                program: prog_name,
+                program: prog_name.to_owned(),
                 timeout,
             })
         }
@@ -118,11 +149,59 @@ pub fn run_bounded(
             let _ = child.kill();
             let _ = child.wait();
             Err(BoundedError::Wait {
-                program: prog_name,
+                program: prog_name.to_owned(),
                 detail,
             })
         }
     }
+}
+
+/// Spawn `program` with piped stdio, RETRYING on `ETXTBSY` ("Text file busy") up to
+/// [`ETXTBSY_MAX_RETRIES`] times with a [`ETXTBSY_RETRY_BACKOFF`] back-off between attempts (via the
+/// Runtime timer seam). `ETXTBSY` is the transient race where a binary still has a writer fd open at
+/// the moment of `execve()` (a just-written / just-downloaded binary whose writer's `close()` has not
+/// yet landed); it clears as soon as the writer closes, so a brief retry loop makes the exec robust.
+/// Any OTHER spawn error fails immediately (it is not transient). On exhausting the budget the LAST
+/// `ETXTBSY` error is returned as a typed [`BoundedError::Spawn`].
+async fn spawn_with_etxtbsy_retry(
+    program: &Path,
+    args: &[&str],
+    prog_name: &str,
+) -> Result<std::process::Child, BoundedError> {
+    use ironcache_runtime::Runtime as _;
+    use std::process::Stdio;
+    let rt = ironcache_runtime::TokioRuntime::new();
+    let mut attempt: u32 = 0;
+    loop {
+        match Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(e) if is_etxtbsy(&e) && attempt < ETXTBSY_MAX_RETRIES => {
+                // Transient: the writer fd is still open. Back off (through the timer seam) and retry.
+                attempt += 1;
+                rt.timer(ETXTBSY_RETRY_BACKOFF).await;
+            }
+            Err(e) => {
+                return Err(BoundedError::Spawn {
+                    program: prog_name.to_owned(),
+                    detail: e.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Whether a spawn IO error is `ETXTBSY` ("Text file busy", `execve` against a file with an open
+/// writer fd). Matches the dedicated `ErrorKind::ExecutableFileBusy` (stable since Rust 1.83) AND the
+/// raw OS number (`libc::ETXTBSY`) as a belt-and-suspenders fallback in case the kind is not mapped on
+/// some target.
+fn is_etxtbsy(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::ExecutableFileBusy || e.raw_os_error() == Some(libc::ETXTBSY)
 }
 
 /// Poll `child.try_wait()` until it reports an exit (`Ok(true)`) or the monotonic `timeout` elapses
@@ -221,5 +300,73 @@ mod tests {
             Some(7),
             "the nonzero status is surfaced in Output"
         );
+    }
+
+    /// `is_etxtbsy` recognizes the ETXTBSY error by BOTH the dedicated `ExecutableFileBusy` kind and
+    /// the raw OS number, and does NOT match an unrelated error.
+    #[test]
+    fn is_etxtbsy_detects_text_file_busy() {
+        // The dedicated kind (stable since 1.83).
+        let by_kind = std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy);
+        assert!(is_etxtbsy(&by_kind), "ExecutableFileBusy kind is ETXTBSY");
+        // The raw OS number (the belt-and-suspenders fallback).
+        let by_raw = std::io::Error::from_raw_os_error(libc::ETXTBSY);
+        assert!(
+            is_etxtbsy(&by_raw),
+            "raw os error {} is ETXTBSY",
+            libc::ETXTBSY
+        );
+        // An unrelated error is NOT ETXTBSY (so it is never retried).
+        let other = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!is_etxtbsy(&other), "NotFound is not ETXTBSY");
+    }
+
+    /// THE ETXTBSY-ROBUSTNESS PROOF (#388 flake fix): a binary EXEC'd immediately after it was
+    /// written + chmod'd must still run. Spawning right after the write is exactly the window where
+    /// `execve()` can race a still-open writer fd into `ETXTBSY`; the bounded retry inside `run_bounded`
+    /// must absorb that. Repeated in a tight loop so a transient ETXTBSY under parallel load is hit and
+    /// recovered (rather than failing the test the way the original probe did at mod.rs:1251).
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_succeeds_on_a_freshly_written_binary() {
+        let dir = temp_dir("freshexec");
+        for i in 0..25 {
+            let script = dir.join(format!("fresh-{i}"));
+            // Write + chmod, then IMMEDIATELY run (no intervening delay) -- the ETXTBSY window.
+            write_script(&script, "#!/bin/sh\necho 'ironcache 9.9.9'\nexit 0\n");
+            let out = run_bounded(&script, &["--version"], Duration::from_secs(5))
+                .expect("a freshly written binary runs (ETXTBSY retry absorbs the race)");
+            assert!(out.status.success(), "iter {i}: exited cleanly");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("9.9.9"),
+                "iter {i}: version printed"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD: `run_bounded` is reachable from WITHIN a tokio runtime (the health gate
+    /// `block_on`s `poll_until_healthy`, which calls the version probe on a SUCCESSFULLY-spawning
+    /// binary). Its internal `block_on` must not panic with "Cannot start a runtime from within a
+    /// runtime" -- it runs on a dedicated thread to avoid nesting. This asserts a SUCCESSFUL run works
+    /// from inside a current-thread runtime (the exact prod gate path, and the path the ETXTBSY change
+    /// first tripped on the spawn-failure case).
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_works_from_within_a_tokio_runtime() {
+        let dir = temp_dir("inruntime");
+        let script = dir.join("ver");
+        write_script(&script, "#!/bin/sh\necho 'ironcache 4.5.6'\nexit 0\n");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(async {
+            // Calling the SYNC run_bounded from inside an async block on this runtime: the old inline
+            // block_on would panic here; the dedicated-thread isolation makes it work.
+            run_bounded(&script, &["--version"], Duration::from_secs(5))
+        });
+        let out = out.expect("run_bounded works from within a runtime");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("4.5.6"));
     }
 }
