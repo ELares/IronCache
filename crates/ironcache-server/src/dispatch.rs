@@ -2311,6 +2311,17 @@ fn cmd_client<E: Clock>(
     if req.args.len() < 2 {
         return Value::error(ErrorReply::wrong_arity("client"));
     }
+    // ===================== CO-EDIT CONTRACT with the PER-SUBCOMMAND ACL =====================
+    // These match arms are the AUTHORITATIVE list of CLIENT subcommands and the privileged-vs-plain
+    // split. Per-subcommand ACL (`+client|info`) mirrors them in `command_spec::CLIENT_SUBCOMMANDS`
+    // (the @admin/@dangerous flags) and pins them in
+    // `command_spec::tests::client_subcommand_table_matches_dispatch_arms`. If you ADD, REMOVE, or
+    // RECLASSIFY an arm, you MUST update BOTH in the same change. SECURITY: LIST/KILL/PAUSE/UNPAUSE/
+    // NO-EVICT are @admin+@dangerous (denied by -@dangerous); ID/GETNAME/SETNAME/SETINFO/INFO/
+    // NO-TOUCH are @slow @connection (NOT dangerous). A privileged arm mistagged as a plain read in
+    // CLIENT_SUBCOMMANDS would let a -@dangerous user run it -- an escalation the pin test cannot
+    // catch (it cannot read these arms at runtime).
+    // =======================================================================================
     let sub = ascii_upper(&req.args[1]);
     match sub.as_slice() {
         b"ID" => Value::Integer(state.id as i64),

@@ -1010,3 +1010,288 @@ fn cluster_subcommand_aclfile_round_trip() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// (17) PER-SUBCOMMAND ACL for CONFIG + CLIENT (read-only monitoring user). A user
+/// `-@dangerous +config|get +client|info +client|list` (dangerous denied FIRST, the read halves
+/// re-granted -- last-match-wins) can run CONFIG GET, CLIENT INFO, and CLIENT LIST, but is `-NOPERM`
+/// on CONFIG SET and on CLIENT KILL / PAUSE, with the NOPERM naming the `cmd|sub` pair. CLIENT LIST
+/// is informational yet `@dangerous` in Redis (it leaks every client), so the EXPLICIT `+client|list`
+/// is what re-allows it. Case-insensitive.
+#[test]
+fn config_client_subcommand_acl_allows_reads_denies_mutators() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL",
+                    "SETUSER",
+                    "mon",
+                    "on",
+                    "nopass",
+                    "resetchannels",
+                    "-@dangerous",
+                    "+config|get",
+                    "+client|info",
+                    "+client|list",
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "mon", "x"]).await, "+OK\r\n");
+
+        // Granted reads are NOT denied by ACL (the handler runs; cluster mode is irrelevant here).
+        // Case-insensitive: `config get` / `CONFIG Get` enforce identically.
+        for read in [
+            vec!["CONFIG", "GET", "maxmemory"],
+            vec!["config", "get", "maxmemory"],
+            vec!["CONFIG", "Get", "maxmemory"],
+            vec!["CLIENT", "INFO"],
+            vec!["CLIENT", "LIST"],
+            vec!["client", "list"],
+        ] {
+            let reply = cmd(&mut a, &read).await;
+            assert!(
+                !reply.starts_with("-NOPERM"),
+                "{read:?} must be allowed by ACL (not NOPERM), got {reply:?}"
+            );
+        }
+
+        // Mutators / ungranted subs are NOPERM, naming `cmd|sub`.
+        for (op, token) in [
+            (vec!["CONFIG", "SET", "maxmemory", "100mb"], "config|set"),
+            (vec!["CONFIG", "REWRITE"], "config|rewrite"),
+            (vec!["CLIENT", "KILL", "ID", "999999"], "client|kill"),
+            (vec!["CLIENT", "PAUSE", "1"], "client|pause"),
+        ] {
+            let reply = cmd(&mut a, &op).await;
+            assert!(
+                reply.starts_with("-NOPERM") && reply.contains(token),
+                "{op:?} must be NOPERM naming {token:?}, got {reply:?}"
+            );
+        }
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (18) `+@all -@dangerous` CONFIG/CLIENT parity (Redis 7), proving each container's split is per
+/// Redis tags. CONFIG: EVERY operative subcommand is `@dangerous`, so CONFIG GET *and* SET are
+/// NOPERM, while CONFIG HELP (`@slow` only) is allowed. CLIENT: the reads (INFO/ID, not dangerous)
+/// are allowed while the privileged controls (LIST/KILL, `@admin`+`@dangerous`) are NOPERM.
+#[test]
+fn config_client_all_minus_dangerous_split() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL",
+                    "SETUSER",
+                    "ops",
+                    "on",
+                    "nopass",
+                    "~*",
+                    "+@all",
+                    "-@dangerous"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "ops", "x"]).await, "+OK\r\n");
+
+        // CONFIG: GET is @dangerous -> NOPERM even though it is "a read"; HELP (@slow) is allowed.
+        let cfg_get = cmd(&mut a, &["CONFIG", "GET", "maxmemory"]).await;
+        assert!(
+            cfg_get.starts_with("-NOPERM") && cfg_get.contains("config|get"),
+            "+@all -@dangerous must deny CONFIG GET (it is @dangerous), got {cfg_get:?}"
+        );
+        assert!(
+            !cmd(&mut a, &["CONFIG", "HELP"])
+                .await
+                .starts_with("-NOPERM"),
+            "CONFIG HELP (@slow only) must be allowed under -@dangerous"
+        );
+
+        // CLIENT: the reads survive, the privileged controls are denied.
+        assert!(
+            !cmd(&mut a, &["CLIENT", "INFO"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        assert!(!cmd(&mut a, &["CLIENT", "ID"]).await.starts_with("-NOPERM"));
+        let cl_list = cmd(&mut a, &["CLIENT", "LIST"]).await;
+        assert!(
+            cl_list.starts_with("-NOPERM") && cl_list.contains("client|list"),
+            "+@all -@dangerous must deny CLIENT LIST (@dangerous), got {cl_list:?}"
+        );
+        let cl_kill = cmd(&mut a, &["CLIENT", "KILL", "ID", "1"]).await;
+        assert!(
+            cl_kill.starts_with("-NOPERM") && cl_kill.contains("client|kill"),
+            "+@all -@dangerous must deny CLIENT KILL, got {cl_kill:?}"
+        );
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (19) Bare `+config` / `+client` whole-command grants cover EVERY subcommand (Redis parity): a
+/// `-@all +config` user runs CONFIG GET *and* CONFIG SET; a `-@all +client` user runs CLIENT INFO
+/// *and* CLIENT KILL. (None is `-NOPERM`; a container grant is not narrowed by the subcommand table.)
+#[test]
+fn config_client_bare_grant_allows_all_subcommands() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL", "SETUSER", "cfg", "on", "nopass", "~*", "-@all", "+config"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL", "SETUSER", "cli", "on", "nopass", "~*", "-@all", "+client"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "cfg", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut a, &["CONFIG", "GET", "maxmemory"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        assert!(
+            !cmd(&mut a, &["CONFIG", "SET", "maxmemory-samples", "10"])
+                .await
+                .starts_with("-NOPERM"),
+            "a bare +config grant must allow CONFIG SET too"
+        );
+
+        let mut b = connect_retry(port).await;
+        assert_eq!(cmd(&mut b, &["AUTH", "cli", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut b, &["CLIENT", "INFO"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        assert!(
+            !cmd(&mut b, &["CLIENT", "KILL", "ID", "999999"])
+                .await
+                .starts_with("-NOPERM"),
+            "a bare +client grant must allow CLIENT KILL too"
+        );
+
+        drop(a);
+        drop(b);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (20) ACLFILE round trip with `+config|get` / `+client|info` rules: boot with the aclfile, prove
+/// enforcement (CONFIG GET / CLIENT INFO allowed, CONFIG SET / CLIENT KILL NOPERM), `ACL SAVE`,
+/// REBOOT on the same file, and prove the subcommand rules survived.
+#[test]
+fn config_client_subcommand_aclfile_round_trip() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let dir = std::env::temp_dir().join(format!("ironcache-aclcc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aclfile = dir.join("users.acl");
+        std::fs::write(
+            &aclfile,
+            "user default on nopass ~* &* +@all\n\
+             user mon on nopass resetchannels -@dangerous +config|get +client|info\n",
+        )
+        .unwrap();
+
+        let port = free_port();
+        let server = run_server_with_aclfile_for_test(port, 1, aclfile.clone());
+        let mut c = connect_retry(port).await;
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "mon", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut a, &["CONFIG", "GET", "maxmemory"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        assert!(
+            !cmd(&mut a, &["CLIENT", "INFO"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        let denied = cmd(&mut a, &["CONFIG", "SET", "maxmemory", "100mb"]).await;
+        assert!(
+            denied.starts_with("-NOPERM") && denied.contains("config|set"),
+            "loaded mon must be NOPERM on CONFIG SET, got {denied:?}"
+        );
+        let denied_kill = cmd(&mut a, &["CLIENT", "KILL", "ID", "1"]).await;
+        assert!(
+            denied_kill.starts_with("-NOPERM") && denied_kill.contains("client|kill"),
+            "loaded mon must be NOPERM on CLIENT KILL, got {denied_kill:?}"
+        );
+        drop(a);
+
+        assert_eq!(cmd(&mut c, &["ACL", "SAVE"]).await, "+OK\r\n");
+        drop(c);
+        server.shutdown_and_join().unwrap();
+
+        let saved = std::fs::read_to_string(&aclfile).unwrap();
+        assert!(
+            saved.contains("+config|get") && saved.contains("+client|info"),
+            "SAVE must persist the subcommand rules, got {saved:?}"
+        );
+
+        let port2 = free_port();
+        let server2 = run_server_with_aclfile_for_test(port2, 1, aclfile.clone());
+        let mut a2 = connect_retry(port2).await;
+        assert_eq!(cmd(&mut a2, &["AUTH", "mon", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut a2, &["CONFIG", "GET", "maxmemory"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        let denied2 = cmd(&mut a2, &["CONFIG", "SET", "maxmemory", "100mb"]).await;
+        assert!(
+            denied2.starts_with("-NOPERM") && denied2.contains("config|set"),
+            "reloaded mon must still be NOPERM on CONFIG SET, got {denied2:?}"
+        );
+
+        drop(a2);
+        server2.shutdown_and_join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}

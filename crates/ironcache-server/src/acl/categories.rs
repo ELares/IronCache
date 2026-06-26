@@ -797,4 +797,71 @@ mod tests {
         assert!(cluster.contains(Category::Dangerous));
         assert!(cluster.contains(Category::Slow));
     }
+
+    #[test]
+    fn config_client_subcommand_categories_match_redis() {
+        // CONFIG: all four operative subcommands are @admin + @dangerous + @slow; HELP is @slow only.
+        for sub in [b"GET".as_slice(), b"SET", b"REWRITE", b"RESETSTAT"] {
+            let bits = subcommand_category_bits(b"CONFIG", sub);
+            assert!(bits.contains(Category::Admin), "config|{sub:?} @admin");
+            assert!(
+                bits.contains(Category::Dangerous),
+                "config|{sub:?} @dangerous"
+            );
+            assert!(bits.contains(Category::Slow), "config|{sub:?} @slow");
+            assert!(!bits.contains(Category::Write), "config|{sub:?} not @write");
+        }
+        let help = subcommand_category_bits(b"CONFIG", b"HELP");
+        assert!(help.contains(Category::Slow));
+        assert!(!help.contains(Category::Admin));
+        assert!(!help.contains(Category::Dangerous));
+
+        // CLIENT reads (@slow, non-dangerous): a `-@dangerous` user keeps them when granted.
+        for sub in [
+            b"ID".as_slice(),
+            b"GETNAME",
+            b"SETNAME",
+            b"SETINFO",
+            b"INFO",
+            b"NO-TOUCH",
+        ] {
+            let bits = subcommand_category_bits(b"CLIENT", sub);
+            assert!(bits.contains(Category::Slow), "client|{sub:?} @slow");
+            assert!(!bits.contains(Category::Admin), "client|{sub:?} not @admin");
+            assert!(
+                !bits.contains(Category::Dangerous),
+                "client|{sub:?} not @dangerous"
+            );
+        }
+        // CLIENT privileged (@admin + @dangerous): denied by `-@dangerous`. NO-EVICT IS dangerous,
+        // while its look-alike NO-TOUCH (above) is NOT -- the non-obvious Redis split.
+        for sub in [
+            b"LIST".as_slice(),
+            b"KILL",
+            b"PAUSE",
+            b"UNPAUSE",
+            b"NO-EVICT",
+        ] {
+            let bits = subcommand_category_bits(b"CLIENT", sub);
+            assert!(bits.contains(Category::Admin), "client|{sub:?} @admin");
+            assert!(
+                bits.contains(Category::Dangerous),
+                "client|{sub:?} @dangerous"
+            );
+            assert!(!bits.contains(Category::Fast), "client|{sub:?} not @fast");
+        }
+
+        // CRITICAL INVARIANT: the bare-CONFIG / bare-CLIENT whole-command categories are UNCHANGED
+        // (the no-subcommand path + every existing aclfile stay byte-identical).
+        let config = category_bits(b"CONFIG");
+        assert!(config.contains(Category::Admin));
+        assert!(config.contains(Category::Dangerous));
+        assert!(config.contains(Category::Slow));
+        assert!(!config.contains(Category::Connection)); // CONFIG is not @connection in Redis
+        let client = category_bits(b"CLIENT");
+        assert!(client.contains(Category::Admin));
+        assert!(client.contains(Category::Dangerous));
+        assert!(client.contains(Category::Connection));
+        assert!(client.contains(Category::Slow));
+    }
 }

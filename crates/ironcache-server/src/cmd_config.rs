@@ -30,6 +30,14 @@ pub fn cmd_config(ctx: &ServerContext, deltas: &mut CounterDeltas, req: &Request
     if req.args.len() < 2 {
         return Value::error(ErrorReply::wrong_arity("config"));
     }
+    // ===================== CO-EDIT CONTRACT with the PER-SUBCOMMAND ACL =====================
+    // These match arms are the AUTHORITATIVE list of CONFIG subcommands. Per-subcommand ACL
+    // (`+config|get`) mirrors them in `command_spec::CONFIG_SUBCOMMANDS` (the @admin/@dangerous
+    // flags) and pins them in `command_spec::tests::config_subcommand_table_matches_dispatch_arms`.
+    // If you ADD or REMOVE an arm here, you MUST update BOTH in the same change. SECURITY: GET/SET/
+    // REWRITE/RESETSTAT are @admin+@dangerous (denied by -@dangerous); HELP is @slow only. An arm
+    // mistagged in CONFIG_SUBCOMMANDS would mis-gate the ACL; the pin test cannot read these arms.
+    // =======================================================================================
     let sub = ascii_upper(&req.args[1]);
     match sub.as_slice() {
         b"GET" => config_get(ctx, req),
