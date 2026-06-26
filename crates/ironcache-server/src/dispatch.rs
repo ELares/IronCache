@@ -637,8 +637,25 @@ pub fn acl_enforce(
         return None;
     }
 
-    // (a) COMMAND permission.
-    if !user.can_run_command(cmd_upper) {
+    // (a) COMMAND permission. For a CONTAINER command (CLUSTER today) that carries a SUBCOMMAND,
+    // the PER-SUBCOMMAND grant decides (so CLUSTER SLOTS, tagged @slow only, is allowed for a
+    // `-@dangerous` user while CLUSTER ADDSLOTS, tagged @admin+@dangerous, is NOPERM). The
+    // subcommand is uppercased with the SAME `ascii_upper` cmd_cluster.rs uses to dispatch, so ACL
+    // and dispatch agree on case. Every other command keeps the whole-command check unchanged --
+    // this is the only behavioral change, and it fires only for a narrowed (non-None) user (the
+    // acl_user==None default short-circuited above).
+    if crate::command_spec::subcommands_of(cmd_upper).is_some() && req.args.len() >= 2 {
+        let sub = ascii_upper(&req.args[1]);
+        if !user.can_run_command_sub(cmd_upper, Some(&sub)) {
+            // NOPERM names the `cmd|sub` pair (lowercased, pipe), Redis 7 parity.
+            let cmd_lc = String::from_utf8_lossy(cmd_upper).to_ascii_lowercase();
+            let sub_lc = String::from_utf8_lossy(&sub).to_ascii_lowercase();
+            return Some(ErrorReply::noperm_command(
+                &user.name,
+                &format!("{cmd_lc}|{sub_lc}"),
+            ));
+        }
+    } else if !user.can_run_command(cmd_upper) {
         let cmd_lc = String::from_utf8_lossy(cmd_upper).to_ascii_lowercase();
         return Some(ErrorReply::noperm_command(&user.name, &cmd_lc));
     }

@@ -36,11 +36,13 @@ async function check(mode, group, fn) {
 }
 
 function parseArgs() {
-  const args = { singlePort: 0, cluster: "" };
+  const args = { singlePort: 0, cluster: "", aclUser: "", aclPass: "" };
   const a = process.argv.slice(2);
   for (let i = 0; i < a.length; i++) {
     if (a[i] === "--single-port") args.singlePort = parseInt(a[++i], 10);
     else if (a[i] === "--cluster") args.cluster = a[++i];
+    else if (a[i] === "--acl-user") args.aclUser = a[++i];
+    else if (a[i] === "--acl-pass") args.aclPass = a[++i];
   }
   return args;
 }
@@ -267,11 +269,82 @@ async function runCluster(seeds) {
   cluster.disconnect();
 }
 
+async function runRestricted(seeds, user, pass) {
+  // #405 per-subcommand-ACL leg: drive the cluster as the LOCKED-DOWN `svc` user
+  // (`+@read +@write +@connection +@transaction -@dangerous +cluster|slots|shards|nodes|info`).
+  // Proves (a) a scoped user can DISCOVER + do a routed SET/GET round-trip and (b) every CLUSTER
+  // MUTATOR is NOPERM (CLUSTER ADDSLOTS denied -> the group PASSES). NOTE: ioredis's default
+  // enableReadyCheck issues `CLUSTER INFO`, which is WHY the svc grant includes `+cluster|info`
+  // (go-redis / redis-py discover via CLUSTER SLOTS alone) -- the documented #405 finding.
+  const mode = "restricted";
+  const pfx = `jsr:${Date.now() % 1000000}:`;
+  const nodes = seeds.map((s) => {
+    const [host, port] = s.split(":");
+    return { host, port: parseInt(port, 10) };
+  });
+
+  const cluster = new Redis.Cluster(nodes, {
+    redisOptions: { username: user, password: pass },
+    clusterRetryStrategy: (times) => (times > 5 ? null : 200),
+  });
+
+  let discovered = false;
+  await check(mode, "discovery", async () => {
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("cluster ready timeout")), 15000);
+      cluster.on("ready", () => {
+        clearTimeout(t);
+        resolve();
+      });
+      cluster.on("error", () => {}); // transient connect errors during discovery are expected
+    });
+    const pong = await cluster.ping();
+    const nodeCount = cluster.nodes("master").length;
+    discovered = pong === "PONG" && nodeCount >= 1;
+    return [discovered, `masters_discovered=${nodeCount} as ${user}`];
+  });
+
+  if (!discovered) {
+    for (const g of ["rw-roundtrip", "addslots-denied"]) {
+      result(mode, g, false, "discovery failed");
+    }
+    cluster.disconnect();
+    return;
+  }
+
+  await check(mode, "rw-roundtrip", async () => {
+    for (let i = 0; i < 30; i++) await cluster.set(`${pfx}k${i}`, String(i));
+    for (let i = 0; i < 30; i++) {
+      const v = await cluster.get(`${pfx}k${i}`);
+      if (v !== String(i)) return [false, `mismatch k${i}=${v}`];
+    }
+    return [true, "set+get 30 keys across slots as svc"];
+  });
+
+  // SECURITY BOUNDARY: a CLUSTER MUTATOR must be NOPERM for svc. Use a DIRECT (non-cluster)
+  // connection to node[0] as svc for a deterministic target; PASS iff ADDSLOTS is denied NOPERM.
+  await check(mode, "addslots-denied", async () => {
+    const one = new Redis({ host: nodes[0].host, port: nodes[0].port, username: user, password: pass });
+    try {
+      await one.call("CLUSTER", "ADDSLOTS", "0");
+      return [false, "CLUSTER ADDSLOTS was ACCEPTED for a -@dangerous user (escalation!)"];
+    } catch (err) {
+      const msg = (err && err.message ? err.message : String(err)).toUpperCase();
+      return [msg.includes("NOPERM"), `denied: ${err && err.message ? err.message : err}`];
+    } finally {
+      one.disconnect();
+    }
+  });
+
+  cluster.disconnect();
+}
+
 async function main() {
   const args = parseArgs();
   console.log(`# ioredis ${require("ioredis/package.json").version}`);
   if (args.singlePort > 0) await runSingle(args.singlePort);
   if (args.cluster) await runCluster(args.cluster.split(","));
+  if (args.cluster && args.aclUser) await runRestricted(args.cluster.split(","), args.aclUser, args.aclPass);
   process.exit(failed > 0 ? 1 : 0);
 }
 

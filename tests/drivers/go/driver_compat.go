@@ -295,9 +295,72 @@ func runCluster(addrs []string) {
 	})
 }
 
+// runRestricted drives the cluster as a LOCKED-DOWN per-subcommand-ACL user (#405): the `svc` user
+// granted `+@read +@write +@connection +@transaction -@dangerous +cluster|slots|shards|nodes|info`.
+// It proves (a) a scoped user can still do cluster DISCOVERY + a routed SET/GET round-trip, and
+// (b) every CLUSTER MUTATOR is denied -- CLUSTER ADDSLOTS must come back NOPERM (the test PASSES
+// when it is denied). go-redis applies Username/Password to every node connection, so MOVED-routed
+// ops re-AUTH as `svc` transparently.
+func runRestricted(addrs []string, user, pass string) {
+	mode := "restricted"
+	pfx := fmt.Sprintf("gor:%d:", time.Now().UnixNano()%1_000_000)
+	rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs, Username: user, Password: pass})
+	defer rdb.Close()
+
+	// DISCOVERY under the scoped user: go-redis loads the slot map via CLUSTER SLOTS (granted),
+	// then PING routes through it. A NOPERM on any discovery subcommand would surface here.
+	check(mode, "discovery", func() (bool, string, error) {
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			return false, "", err
+		}
+		n := 0
+		err := rdb.ForEachMaster(ctx, func(ctx context.Context, m *redis.Client) error {
+			n++
+			return nil
+		})
+		return n >= 1, fmt.Sprintf("masters_discovered=%d", n), err
+	})
+
+	// A routed SET/GET round-trip across slots: proves @read/@write + MOVED-routing work for `svc`.
+	check(mode, "rw-roundtrip", func() (bool, string, error) {
+		for i := 0; i < 30; i++ {
+			if err := rdb.Set(ctx, fmt.Sprintf("%sk%d", pfx, i), fmt.Sprintf("%d", i), 0).Err(); err != nil {
+				return false, fmt.Sprintf("set k%d failed", i), err
+			}
+		}
+		for i := 0; i < 30; i++ {
+			v, err := rdb.Get(ctx, fmt.Sprintf("%sk%d", pfx, i)).Result()
+			if err != nil {
+				return false, fmt.Sprintf("get k%d failed", i), err
+			}
+			if v != fmt.Sprintf("%d", i) {
+				return false, fmt.Sprintf("k%d=%q", i, v), nil
+			}
+		}
+		return true, "set+get 30 keys across slots as svc", nil
+	})
+
+	// SECURITY BOUNDARY: a CLUSTER MUTATOR must be NOPERM for `svc`. Use a DIRECT connection to the
+	// first node (deterministic; no cluster routing) authenticated as svc, and assert ADDSLOTS is
+	// denied. The check PASSES when denied.
+	check(mode, "addslots-denied", func() (bool, string, error) {
+		one := redis.NewClient(&redis.Options{Addr: addrs[0], Username: user, Password: pass})
+		defer one.Close()
+		err := one.Do(ctx, "CLUSTER", "ADDSLOTS", 0).Err()
+		if err == nil {
+			return false, "CLUSTER ADDSLOTS was ACCEPTED for a -@dangerous user (escalation!)", nil
+		}
+		msg := strings.ToUpper(err.Error())
+		ok := strings.Contains(msg, "NOPERM")
+		return ok, fmt.Sprintf("denied: %v", err), nil
+	})
+}
+
 func main() {
 	singlePort := flag.Int("single-port", 0, "single-node RESP port")
 	clusterCSV := flag.String("cluster", "", "comma list of host:port cluster seeds")
+	aclUser := flag.String("acl-user", "", "restricted (scoped-ACL) username for the #405 leg")
+	aclPass := flag.String("acl-pass", "", "restricted (scoped-ACL) password for the #405 leg")
 	flag.Parse()
 
 	fmt.Println("# go-redis v9")
@@ -306,6 +369,9 @@ func main() {
 	}
 	if *clusterCSV != "" {
 		runCluster(strings.Split(*clusterCSV, ","))
+		if *aclUser != "" {
+			runRestricted(strings.Split(*clusterCSV, ","), *aclUser, *aclPass)
+		}
 	}
 	if failed > 0 {
 		os.Exit(1)

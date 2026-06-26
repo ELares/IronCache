@@ -254,6 +254,221 @@ pub fn request_is_write_for_pause(cmd_upper: &[u8], in_multi: bool, queued: &[Re
     is_write(cmd_upper)
 }
 
+/// One SUBCOMMAND record of a CONTAINER command (CLUSTER today; CONFIG / CLIENT / ACL /
+/// COMMAND can be added later) for PER-SUBCOMMAND ACL (Redis 7 `+cluster|slots`). It carries
+/// only the attributes the ACL layer needs to grant a subcommand independently of its
+/// container: the @write flag (whether the subcommand mutates the keyspace) and the
+/// @admin / @dangerous flags. The category derivation that reads these lives in
+/// [`crate::acl::categories::subcommand_category_bits`].
+///
+/// This is DELIBERATELY separate from [`CommandSpec`]: a container's bare-command categories
+/// (e.g. `category_bits(b"CLUSTER")` = `{Admin, Dangerous, Slow}`) are UNCHANGED, so the
+/// no-subcommand path stays byte-identical; only an explicit `cmd|sub` rule or a narrowed
+/// user invoking a recognized subcommand consults this table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubcommandSpec {
+    /// The UPPERCASE subcommand token, e.g. `b"SLOTS"`.
+    pub name: &'static [u8],
+    /// `true` iff this subcommand MUTATES the keyspace (the @write derivation). Every CLUSTER
+    /// subcommand touches NO key, so all are `false`; the field exists for a future container
+    /// whose subcommand writes (so the ACL @write/@read derivation has a single source).
+    pub is_write: bool,
+    /// `true` iff this subcommand carries the `@admin` category.
+    pub admin: bool,
+    /// `true` iff this subcommand carries the `@dangerous` category.
+    pub dangerous: bool,
+}
+
+/// The CLUSTER subcommand table, TRANSCRIBED from the authoritative dispatch arms in
+/// [`crate::cmd_cluster::cmd_cluster`] (the read / mutate / deferred split) so ACL and dispatch
+/// can never disagree on which token is which.
+///
+/// ============================ CO-EDIT CONTRACT (READ THIS) ============================
+/// THREE artifacts encode the SAME CLUSTER subcommand split and MUST be edited together:
+/// (A) the `match sub` arms in [`crate::cmd_cluster::cmd_cluster`] (cmd_cluster.rs), which decide
+/// whether a subcommand EXISTS and whether it READS or MUTATES; (B) THIS table, the ACL view that
+/// carries each entry's `admin` / `dangerous` flags; (C) the `expected_reads` /
+/// `expected_mutators` hand-lists in the `cluster_subcommand_table_matches_dispatch_arms` pin
+/// test (the tests module below). The pin test asserts (B) == (C); it CANNOT parse the dispatch
+/// arms (A) at runtime, so keeping (A) in sync with (B) and (C) is a HUMAN obligation enforced by
+/// this contract, not by the compiler.
+///
+/// SECURITY BOUNDARY: the read-vs-mutator classification here IS the ACL escalation boundary. A
+/// subcommand tagged `admin: false, dangerous: false` (a "read") whose cmd_cluster dispatch
+/// ACTUALLY MUTATES the slot map / node table would let a `-@dangerous +cluster|<x>` user reshape
+/// the cluster -- a silent privilege escalation. When you add or reclassify a CLUSTER subcommand,
+/// re-confirm against the cmd_cluster.rs arm that every `admin/dangerous: false` entry only READS.
+/// =====================================================================================
+///
+/// * Reads / introspection (`admin: false, dangerous: false`): KEYSLOT, MYID, INFO, SLOTS,
+///   SHARDS, NODES, COUNTKEYSINSLOT, GETKEYSINSLOT, HELP.
+/// * Mutators + deferred (`admin: true, dangerous: true`): ADDSLOTS, DELSLOTS, ADDSLOTSRANGE,
+///   DELSLOTSRANGE, SETSLOT, FLUSHSLOTS, MEET, FORGET, BUMPEPOCH, SET-CONFIG-EPOCH, REPLICATE,
+///   FAILOVER, RESET.
+///
+/// `is_write` is `false` for all (a CLUSTER subcommand touches no key; it mutates only the
+/// cluster topology, which the @admin / @dangerous flags govern).
+const CLUSTER_SUBCOMMANDS: &[SubcommandSpec] = &[
+    // -- Read / introspection subcommands: NOT @admin, NOT @dangerous (a cluster-mode client
+    // needs these to route, so they can be granted without the mutators).
+    SubcommandSpec {
+        name: b"KEYSLOT",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"MYID",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"INFO",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"SLOTS",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"SHARDS",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"NODES",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"COUNTKEYSINSLOT",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"GETKEYSINSLOT",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"HELP",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    // -- Mutator + deferred subcommands: @admin + @dangerous (they reshape the slot map / the
+    // node table, or are the deferred replication / failover / reset verbs). A `-@dangerous`
+    // user is NOPERM on every one of these even with `+@all`.
+    SubcommandSpec {
+        name: b"ADDSLOTS",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"DELSLOTS",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"ADDSLOTSRANGE",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"DELSLOTSRANGE",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"SETSLOT",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"FLUSHSLOTS",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"MEET",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"FORGET",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"BUMPEPOCH",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"SET-CONFIG-EPOCH",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"REPLICATE",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"FAILOVER",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"RESET",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+];
+
+/// The per-subcommand table for a CONTAINER command `cmd_upper` (UPPERCASE), or `None` for a
+/// command that has no per-subcommand ACL surface. Today only CLUSTER has one; CONFIG / CLIENT /
+/// ACL / COMMAND would each add an arm here (and a `const` table above) when their subcommands
+/// are split. PURE function of the bytes.
+#[must_use]
+pub fn subcommands_of(cmd_upper: &[u8]) -> Option<&'static [SubcommandSpec]> {
+    match cmd_upper {
+        b"CLUSTER" => Some(CLUSTER_SUBCOMMANDS),
+        _ => None,
+    }
+}
+
+/// The [`SubcommandSpec`] for `(cmd_upper, sub_upper)` (both UPPERCASE), or `None` when `cmd` is
+/// not a container OR `sub` is not one of its recognized subcommands. PURE function of the bytes.
+#[must_use]
+pub fn subcommand_spec(cmd_upper: &[u8], sub_upper: &[u8]) -> Option<&'static SubcommandSpec> {
+    subcommands_of(cmd_upper)?
+        .iter()
+        .find(|s| s.name == sub_upper)
+}
+
 /// Extract the routing KEY(s) of a command from `req` per its [`KeySpecKind`]
 /// (COORDINATOR.md #107, Stage 1). This is the GENERIC extraction keyed by pattern: it
 /// preserves EXACTLY the per-pattern logic the legacy `command_keys` match used (the
@@ -2889,6 +3104,116 @@ pub(crate) mod tests {
              or reclassified. Update the pinned list AND verify the new command's KeySpecKind \
              extracts the correct keys so the cluster slot check (CROSSSLOT/MOVED) is correct."
         );
+    }
+
+    /// CLUSTER SUBCOMMAND-TABLE PIN (per-subcommand ACL). The [`CLUSTER_SUBCOMMANDS`] table is the
+    /// ACL view of the CLUSTER container, and the `(admin, dangerous)` flags on its entries ARE the
+    /// privilege boundary `+cluster|<sub>` enforces.
+    ///
+    /// WHAT THIS TEST CHECKS, PRECISELY (no over-claiming): it asserts the TABLE equals the
+    /// `expected_reads` / `expected_mutators` HAND-LISTS below, that each entry carries the flags
+    /// its bucket implies, and a few structural invariants (non-empty, unique, reads and mutators
+    /// disjoint, their union == the whole table). It DOES NOT (cannot, without a running engine)
+    /// parse the `match sub` arms in [`crate::cmd_cluster::cmd_cluster`] -- so it catches
+    /// table-vs-hand-list drift, NOT table-vs-dispatch drift directly. Keeping the dispatch arms,
+    /// this table, and these hand-lists in agreement is the HUMAN co-edit obligation documented on
+    /// all three (see the CO-EDIT CONTRACT comment on `CLUSTER_SUBCOMMANDS` and on the cmd_cluster
+    /// match). SECURITY: a dispatch arm that mutates but is hand-listed/tagged as a "read" would be
+    /// an ACL escalation this test cannot see; that is why the read bucket must be re-confirmed by
+    /// eye against cmd_cluster.rs whenever it changes.
+    ///
+    /// (NOTE: `LINKS` is intentionally absent -- the dispatch has no LINKS arm, so the ACL table
+    /// must not list it either, or the two would disagree.)
+    #[test]
+    fn cluster_subcommand_table_matches_dispatch_arms() {
+        use std::collections::BTreeSet;
+
+        // The READ / introspection subcommands cmd_cluster dispatches (admin=false, dangerous=false).
+        let expected_reads: &[&[u8]] = &[
+            b"KEYSLOT",
+            b"MYID",
+            b"INFO",
+            b"SLOTS",
+            b"SHARDS",
+            b"NODES",
+            b"COUNTKEYSINSLOT",
+            b"GETKEYSINSLOT",
+            b"HELP",
+        ];
+        // The MUTATOR + deferred subcommands cmd_cluster dispatches (admin=true, dangerous=true).
+        let expected_mutators: &[&[u8]] = &[
+            b"ADDSLOTS",
+            b"DELSLOTS",
+            b"ADDSLOTSRANGE",
+            b"DELSLOTSRANGE",
+            b"SETSLOT",
+            b"FLUSHSLOTS",
+            b"MEET",
+            b"FORGET",
+            b"BUMPEPOCH",
+            b"SET-CONFIG-EPOCH",
+            b"REPLICATE",
+            b"FAILOVER",
+            b"RESET",
+        ];
+
+        let table = subcommands_of(b"CLUSTER").expect("CLUSTER has a subcommand table");
+
+        // Structural invariants on the table itself (cheap, catch a duplicated / empty entry):
+        // every name is non-empty, and the names are UNIQUE (a duplicate would let one entry's
+        // flags silently shadow another via `subcommand_spec`'s first-match `find`).
+        let table_names: BTreeSet<&[u8]> = table.iter().map(|s| s.name).collect();
+        assert!(
+            table.iter().all(|s| !s.name.is_empty()),
+            "every CLUSTER subcommand name must be non-empty"
+        );
+        assert_eq!(
+            table_names.len(),
+            table.len(),
+            "CLUSTER subcommand names must be unique (a duplicate shadows another entry's flags)"
+        );
+
+        // The two hand-list buckets are DISJOINT and their UNION is the whole table (no subcommand
+        // is both a read and a mutator; none is left unclassified).
+        let read_set: BTreeSet<&[u8]> = expected_reads.iter().copied().collect();
+        let mutator_set: BTreeSet<&[u8]> = expected_mutators.iter().copied().collect();
+        assert!(
+            read_set.is_disjoint(&mutator_set),
+            "a CLUSTER subcommand is listed as BOTH a read and a mutator (classification conflict)"
+        );
+        let expected_names: BTreeSet<&[u8]> = read_set.union(&mutator_set).copied().collect();
+        // The table's full name-set equals reads + mutators (no extra, none missing).
+        assert_eq!(
+            table_names, expected_names,
+            "the CLUSTER subcommand table drifted from the cmd_cluster dispatch arms: update the \
+             table in command_spec.rs, the cmd_cluster match arms, AND this pin's hand-lists \
+             together (see the CO-EDIT CONTRACT) so ACL and dispatch agree."
+        );
+
+        // Every read subcommand is NOT @admin / NOT @dangerous, and is in the table (the name-set
+        // equality above guarantees the lookup is Some).
+        for name in expected_reads {
+            let spec = subcommand_spec(b"CLUSTER", name).expect("read sub in CLUSTER table");
+            assert!(
+                !spec.admin && !spec.dangerous && !spec.is_write,
+                "{:?} must be a read (not admin/dangerous/write)",
+                String::from_utf8_lossy(name)
+            );
+        }
+        // Every mutator subcommand is @admin + @dangerous (and writes no key).
+        for name in expected_mutators {
+            let spec = subcommand_spec(b"CLUSTER", name).expect("mutator sub in CLUSTER table");
+            assert!(
+                spec.admin && spec.dangerous && !spec.is_write,
+                "{:?} must be a mutator (admin + dangerous, no key write)",
+                String::from_utf8_lossy(name)
+            );
+        }
+
+        // A non-container command and an unknown subcommand both resolve to None.
+        assert!(subcommands_of(b"GET").is_none());
+        assert!(subcommand_spec(b"CLUSTER", b"BOGUS").is_none());
+        assert!(subcommand_spec(b"GET", b"SLOTS").is_none());
     }
 
     /// `extract_keys` is byte-identical to the legacy `command_keys` per-pattern logic. A

@@ -789,3 +789,224 @@ fn mid_session_setuser_rechecked_at_exec() {
         server.shutdown_and_join().unwrap();
     });
 }
+
+/// (14) PER-SUBCOMMAND ACL for CLUSTER (Redis 7 `+cluster|slots`): a user granted the read-only
+/// cluster-introspection subcommands but `-@dangerous` can run CLUSTER SLOTS / SHARDS / NODES (the
+/// ACL layer allows them -- NOT `-NOPERM`) yet is `-NOPERM` on every CLUSTER mutator (ADDSLOTS /
+/// MEET / SETSLOT), and the NOPERM names the `cluster|<sub>` pair. The ACL check fires BEFORE the
+/// handler, so the allowed reads need not succeed at the handler (this single node has cluster
+/// support disabled); the assertion is purely "the ACL did/didn't deny".
+#[test]
+fn cluster_subcommand_acl_allows_reads_denies_mutators() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // svc: the exact rule string from the feature spec.
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL",
+                    "SETUSER",
+                    "svc",
+                    "on",
+                    "nopass",
+                    "~*",
+                    "resetchannels",
+                    "+@read",
+                    "+@write",
+                    "+@connection",
+                    "+@transaction",
+                    "-@dangerous",
+                    "+cluster|slots",
+                    "+cluster|shards",
+                    "+cluster|nodes",
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "svc", "x"]).await, "+OK\r\n");
+
+        // The granted read subcommands are NOT denied by ACL (reply is whatever the handler gives,
+        // never `-NOPERM`). Case-insensitive: `cluster slots`, `CLUSTER Slots` enforce identically.
+        for read in [
+            vec!["CLUSTER", "SLOTS"],
+            vec!["CLUSTER", "SHARDS"],
+            vec!["CLUSTER", "NODES"],
+            vec!["cluster", "slots"],
+            vec!["CLUSTER", "Slots"],
+        ] {
+            let reply = cmd(&mut a, &read).await;
+            assert!(
+                !reply.starts_with("-NOPERM"),
+                "{read:?} must be allowed by ACL (not NOPERM), got {reply:?}"
+            );
+        }
+
+        // Every CLUSTER mutator is NOPERM, and the message names `cluster|<sub>`.
+        for (mutator, token) in [
+            (vec!["CLUSTER", "ADDSLOTS", "0"], "cluster|addslots"),
+            (vec!["CLUSTER", "MEET", "127.0.0.1", "7000"], "cluster|meet"),
+            (vec!["CLUSTER", "SETSLOT", "0", "STABLE"], "cluster|setslot"),
+        ] {
+            let reply = cmd(&mut a, &mutator).await;
+            assert!(
+                reply.starts_with("-NOPERM") && reply.contains(token),
+                "{mutator:?} must be NOPERM naming {token:?}, got {reply:?}"
+            );
+        }
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (15) `+@all -@dangerous` CLUSTER parity (Redis 7): the carve-out leaves the read subcommand
+/// (CLUSTER SLOTS, `@slow` only) RUNNABLE but denies the mutator (CLUSTER ADDSLOTS, `@admin` +
+/// `@dangerous`). A bare `+cluster` user, by contrast, can run BOTH (a whole-command grant covers
+/// every subcommand, Redis parity).
+#[test]
+fn cluster_all_minus_dangerous_and_bare_grant() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // ops: +@all -@dangerous.
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL",
+                    "SETUSER",
+                    "ops",
+                    "on",
+                    "nopass",
+                    "~*",
+                    "+@all",
+                    "-@dangerous"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "ops", "x"]).await, "+OK\r\n");
+        // CLUSTER SLOTS allowed (not NOPERM); CLUSTER ADDSLOTS denied.
+        assert!(
+            !cmd(&mut a, &["CLUSTER", "SLOTS"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        let denied = cmd(&mut a, &["CLUSTER", "ADDSLOTS", "0"]).await;
+        assert!(
+            denied.starts_with("-NOPERM") && denied.contains("cluster|addslots"),
+            "+@all -@dangerous must be NOPERM on CLUSTER ADDSLOTS, got {denied:?}"
+        );
+
+        // svc: a bare `+cluster` whole-command grant -> reads AND mutators both pass ACL.
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL", "SETUSER", "svc", "on", "nopass", "~*", "-@all", "+cluster"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+        let mut b = connect_retry(port).await;
+        assert_eq!(cmd(&mut b, &["AUTH", "svc", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut b, &["CLUSTER", "SLOTS"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        assert!(
+            !cmd(&mut b, &["CLUSTER", "ADDSLOTS", "0"])
+                .await
+                .starts_with("-NOPERM"),
+            "a bare +cluster grant must allow the mutator too (Redis parity)"
+        );
+
+        drop(a);
+        drop(b);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (16) ACLFILE round trip with a `+cluster|slots` rule: boot with an aclfile that grants the
+/// subcommand, prove it is enforced (CLUSTER SLOTS allowed, CLUSTER ADDSLOTS NOPERM), `ACL SAVE`,
+/// REBOOT on the same file, and prove the rule survived (the `+cluster|slots` line persisted and
+/// re-loaded with identical enforcement).
+#[test]
+fn cluster_subcommand_aclfile_round_trip() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let dir = std::env::temp_dir().join(format!("ironcache-aclsub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aclfile = dir.join("users.acl");
+        std::fs::write(
+            &aclfile,
+            "user default on nopass ~* &* +@all\n\
+             user svc on nopass ~* resetchannels -@all +@connection +cluster|slots\n",
+        )
+        .unwrap();
+
+        let port = free_port();
+        let server = run_server_with_aclfile_for_test(port, 1, aclfile.clone());
+        let mut c = connect_retry(port).await;
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "svc", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut a, &["CLUSTER", "SLOTS"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        let denied = cmd(&mut a, &["CLUSTER", "ADDSLOTS", "0"]).await;
+        assert!(
+            denied.starts_with("-NOPERM") && denied.contains("cluster|addslots"),
+            "loaded svc must be NOPERM on CLUSTER ADDSLOTS, got {denied:?}"
+        );
+        drop(a);
+
+        // SAVE, reboot on the same file.
+        assert_eq!(cmd(&mut c, &["ACL", "SAVE"]).await, "+OK\r\n");
+        drop(c);
+        server.shutdown_and_join().unwrap();
+
+        let saved = std::fs::read_to_string(&aclfile).unwrap();
+        assert!(
+            saved.contains("+cluster|slots"),
+            "SAVE must persist the subcommand rule, got {saved:?}"
+        );
+
+        let port2 = free_port();
+        let server2 = run_server_with_aclfile_for_test(port2, 1, aclfile.clone());
+        let mut a2 = connect_retry(port2).await;
+        assert_eq!(cmd(&mut a2, &["AUTH", "svc", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut a2, &["CLUSTER", "SLOTS"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        let denied2 = cmd(&mut a2, &["CLUSTER", "ADDSLOTS", "0"]).await;
+        assert!(
+            denied2.starts_with("-NOPERM") && denied2.contains("cluster|addslots"),
+            "reloaded svc must still be NOPERM on CLUSTER ADDSLOTS, got {denied2:?}"
+        );
+
+        drop(a2);
+        server2.shutdown_and_join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}

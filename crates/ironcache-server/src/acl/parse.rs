@@ -182,15 +182,33 @@ fn apply_command_rule(
         }
         return Ok(());
     }
-    // Single command rule: validate the command is one the server implements (Redis
-    // rejects an unknown command in a +cmd rule). A command SUBcommand (`+config|get`)
-    // is not supported in this version: reject the `|` form loudly.
-    if body.contains(&b'|') {
-        return Err(AclParseError::new(
-            rule_str,
-            "first-arg / subcommand command rules (cmd|sub) are not supported in this version",
-        ));
+    // PER-SUBCOMMAND rule (`+cluster|slots` / `-cluster|addslots`): a container command plus one
+    // of its subcommands. Split on the FIRST `|`, uppercase both halves, validate the container is
+    // a known command AND the subcommand is one the container's command-spec table recognizes,
+    // then record an allow/deny on the exact `(cmd, sub)` pair. (The `(...)` command-SELECTOR form
+    // stays rejected, above, in `apply_rule`.)
+    if let Some(pipe) = body.iter().position(|&b| b == b'|') {
+        let cmd_upper = body[..pipe].to_ascii_uppercase();
+        let sub_upper = body[pipe + 1..].to_ascii_uppercase();
+        // The container must be a real command (registry or serve-layer extra), and the subcommand
+        // must be in the container's spec table; either miss is the Redis-style ACL error.
+        let cmd_known = crate::command_spec::spec_of(&cmd_upper).is_some()
+            || is_known_extra_command(&cmd_upper);
+        if !cmd_known || crate::command_spec::subcommand_spec(&cmd_upper, &sub_upper).is_none() {
+            return Err(AclParseError::new(
+                rule_str,
+                "Unknown command or category name in ACL",
+            ));
+        }
+        if allow {
+            user.commands.allow_subcommand(&cmd_upper, &sub_upper);
+        } else {
+            user.commands.deny_subcommand(&cmd_upper, &sub_upper);
+        }
+        return Ok(());
     }
+    // Single command rule: validate the command is one the server implements (Redis
+    // rejects an unknown command in a +cmd rule).
     let cmd_upper = body.to_ascii_uppercase();
     if crate::command_spec::spec_of(&cmd_upper).is_none() && !is_known_extra_command(&cmd_upper) {
         return Err(AclParseError::new(
@@ -377,5 +395,54 @@ mod tests {
         // A `>` rule never fails parse (it always hashes), but redaction is exercised here.
         let e = AclParseError::new(">supersecret", "x");
         assert_eq!(e.redacted_rule(), ">(password)");
+    }
+
+    #[test]
+    fn subcommand_rule_parses_and_enforces() {
+        // `+cluster|slots` parses, grants CLUSTER SLOTS, and does NOT grant CLUSTER ADDSLOTS or any
+        // other command. Case-insensitive (the body is uppercased).
+        let u = build_user(
+            "svc",
+            &[b"on", b"~*", b"+cluster|slots", b"+CLUSTER|Shards"],
+        )
+        .expect("valid subcommand rules");
+        assert!(u.can_run_command_sub(b"CLUSTER", Some(b"SLOTS")));
+        assert!(u.can_run_command_sub(b"CLUSTER", Some(b"SHARDS")));
+        assert!(!u.can_run_command_sub(b"CLUSTER", Some(b"ADDSLOTS")));
+        // The grant does not leak to the whole CLUSTER command or to other commands.
+        assert!(!u.can_run_command(b"CLUSTER"));
+        assert!(!u.can_run_command(b"GET"));
+    }
+
+    #[test]
+    fn unknown_subcommand_and_unknown_container_rejected() {
+        // An unknown subcommand of a real container is rejected with the Redis-style wording.
+        let err = build_user("svc", &[b"+cluster|bogus"]).unwrap_err();
+        assert!(
+            err.reason
+                .contains("Unknown command or category name in ACL"),
+            "got {:?}",
+            err.reason
+        );
+        // An unknown CONTAINER command is likewise rejected.
+        assert!(build_user("svc", &[b"+nosuch|x"]).is_err());
+        // A real command with NO subcommand table (`+get|foo`) is rejected too.
+        assert!(build_user("svc", &[b"+get|foo"]).is_err());
+        // The `(...)` command-SELECTOR form (a rule starting with `(`) stays rejected.
+        assert!(build_user("svc", &[b"(+get ~k:*)"]).is_err());
+    }
+
+    #[test]
+    fn subcommand_rule_round_trips_through_describe_and_reparse() {
+        // describe() emits `+cluster|slots`; re-parsing that line reproduces the same enforcement.
+        let u = build_user("svc", &[b"on", b"~*", b"+cluster|slots"]).expect("ok");
+        let line = u.commands.describe();
+        assert!(line.contains("+cluster|slots"), "got {line:?}");
+        // Re-parse the rendered command rules onto a fresh user.
+        let rules: Vec<&[u8]> = line.split(' ').map(str::as_bytes).collect();
+        let mut u2 = User::new("svc");
+        apply_rules_to(&mut u2, &rules).expect("describe output must re-parse");
+        assert!(u2.can_run_command_sub(b"CLUSTER", Some(b"SLOTS")));
+        assert!(!u2.can_run_command_sub(b"CLUSTER", Some(b"ADDSLOTS")));
     }
 }
