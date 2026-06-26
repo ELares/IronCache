@@ -448,14 +448,174 @@ const CLUSTER_SUBCOMMANDS: &[SubcommandSpec] = &[
     },
 ];
 
+/// The CONFIG subcommand table, TRANSCRIBED from the authoritative dispatch arms in
+/// [`crate::cmd_config::cmd_config`] (cmd_config.rs).
+///
+/// ============================ CO-EDIT CONTRACT (READ THIS) ============================
+/// THREE artifacts encode the SAME CONFIG subcommand set and MUST be edited together:
+/// (A) the `match sub` arms in [`crate::cmd_config::cmd_config`] (cmd_config.rs), which decide
+/// which subcommands EXIST; (B) THIS table, the ACL view that carries each entry's `admin` /
+/// `dangerous` flags; (C) the `non_dangerous` / `dangerous` hand-lists in the
+/// `config_subcommand_table_matches_dispatch_arms` pin test. The pin test asserts (B) == (C); it
+/// CANNOT parse the dispatch arms (A) at runtime, so keeping (A) in sync with (B) and (C) is a
+/// HUMAN obligation enforced by this contract, not by the compiler.
+///
+/// SECURITY BOUNDARY: in Redis 7 the four operative CONFIG subcommands GET / SET / REWRITE /
+/// RESETSTAT are ALL `@admin @slow @dangerous` (verified against `redis-server`
+/// `COMMAND INFO config|<sub>`); CONFIG HELP alone is `@slow` (NOT admin/dangerous). So the
+/// per-subcommand VALUE is granularity, NOT a read/mutate split among the operative four:
+/// `-@dangerous` denies every operative CONFIG subcommand, and `+config|get` then re-allows ONLY
+/// `CONFIG GET` (the read half) while `CONFIG SET` (the mutate half) stays denied. `is_write` is
+/// `false` for all (CONFIG touches no key; Redis models it `@admin`, not `@write`).
+const CONFIG_SUBCOMMANDS: &[SubcommandSpec] = &[
+    // GET / SET / REWRITE / RESETSTAT: @admin @slow @dangerous (operative; all denied by -@dangerous).
+    SubcommandSpec {
+        name: b"GET",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"SET",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"REWRITE",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"RESETSTAT",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    // HELP: @slow only (NOT @admin/@dangerous), so it survives a -@dangerous carve-out.
+    SubcommandSpec {
+        name: b"HELP",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+];
+
+/// The CLIENT subcommand table, TRANSCRIBED from the authoritative dispatch arms in
+/// [`crate::dispatch::cmd_client`] (dispatch.rs).
+///
+/// ============================ CO-EDIT CONTRACT (READ THIS) ============================
+/// THREE artifacts encode the SAME CLIENT subcommand split and MUST be edited together:
+/// (A) the `match sub` arms in `cmd_client` (dispatch.rs), which decide which subcommands EXIST and
+/// whether each is a privileged control; (B) THIS table, the ACL view that carries each entry's
+/// `admin` / `dangerous` flags; (C) the `non_dangerous` / `dangerous` hand-lists in the
+/// `client_subcommand_table_matches_dispatch_arms` pin test. The pin test asserts (B) == (C); it
+/// CANNOT parse the dispatch arms (A) at runtime, so keeping (A) in sync with (B) and (C) is a
+/// HUMAN obligation enforced by this contract, not by the compiler.
+///
+/// SECURITY BOUNDARY: the `@admin`/`@dangerous` tags below are TRANSCRIBED FROM REDIS (verified
+/// against `redis-server` `COMMAND INFO client|<sub>`); a privileged CLIENT control mistagged as a
+/// plain read would let a `-@dangerous` user run it -- an escalation. Two non-obvious calls:
+///   * `CLIENT LIST` is informational ("a read") but is `@admin @dangerous` in Redis because it
+///     LEAKS every connection's address/name to the caller, so it is tagged dangerous here.
+///   * `CLIENT NO-EVICT` and `CLIENT NO-TOUCH` look alike (both per-connection on/off toggles) but
+///     Redis tags them DIFFERENTLY: `NO-EVICT` is `@admin @dangerous` (it exempts the connection
+///     from client-eviction, a privileged operability control), while `NO-TOUCH` is `@slow
+///     @connection`, NOT dangerous (it only changes whether the caller's OWN reads bump key
+///     idle-time). They are classified accordingly.
+///
+/// `is_write` is `false` for all (CLIENT touches no key; Redis models it `@admin`/`@connection`,
+/// not `@write`). NOTE: the Redis `@connection` category these subcommands also carry is NOT
+/// modeled at subcommand granularity (the effective set is `{@slow}` for the reads, `{@admin,
+/// @dangerous, @slow}` for the privileged ones, mirroring CLUSTER); this is fail-closed -- a
+/// `+@connection`-only user without an explicit `+client|<sub>` is DENIED the CLIENT reads (more
+/// restrictive than Redis, never an escalation), and the read-only monitoring pattern grants the
+/// reads EXPLICITLY (`+client|info +client|list`).
+const CLIENT_SUBCOMMANDS: &[SubcommandSpec] = &[
+    // -- Non-dangerous subcommands (`@slow @connection` in Redis; admin=false, dangerous=false):
+    // per-connection introspection / naming the caller manages for itself.
+    SubcommandSpec {
+        name: b"ID",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"GETNAME",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"SETNAME",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"SETINFO",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"INFO",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    SubcommandSpec {
+        name: b"NO-TOUCH",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+    // -- Privileged subcommands (`@admin @slow @dangerous` in Redis; admin=true, dangerous=true):
+    // they inspect/kill/pause OTHER connections (LIST/KILL/PAUSE/UNPAUSE) or exempt this one from
+    // eviction (NO-EVICT). A `-@dangerous` user is NOPERM on all of these.
+    SubcommandSpec {
+        name: b"LIST",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"KILL",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"PAUSE",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"UNPAUSE",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"NO-EVICT",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+];
+
 /// The per-subcommand table for a CONTAINER command `cmd_upper` (UPPERCASE), or `None` for a
-/// command that has no per-subcommand ACL surface. Today only CLUSTER has one; CONFIG / CLIENT /
-/// ACL / COMMAND would each add an arm here (and a `const` table above) when their subcommands
-/// are split. PURE function of the bytes.
+/// command that has no per-subcommand ACL surface. CLUSTER / CONFIG / CLIENT have one today; ACL /
+/// COMMAND would each add an arm here (and a `const` table above) when their subcommands are split.
+/// PURE function of the bytes.
 #[must_use]
 pub fn subcommands_of(cmd_upper: &[u8]) -> Option<&'static [SubcommandSpec]> {
     match cmd_upper {
         b"CLUSTER" => Some(CLUSTER_SUBCOMMANDS),
+        b"CONFIG" => Some(CONFIG_SUBCOMMANDS),
+        b"CLIENT" => Some(CLIENT_SUBCOMMANDS),
         _ => None,
     }
 }
@@ -3214,6 +3374,127 @@ pub(crate) mod tests {
         assert!(subcommands_of(b"GET").is_none());
         assert!(subcommand_spec(b"CLUSTER", b"BOGUS").is_none());
         assert!(subcommand_spec(b"GET", b"SLOTS").is_none());
+    }
+
+    /// Shared pin assertion for a per-subcommand ACL table (used by the CONFIG and CLIENT pins;
+    /// CLUSTER keeps its own inline test as the reference). Asserts the
+    /// `subcommands_of(container)` table equals the `non_dangerous` + `dangerous` HAND-LISTS, that
+    /// each entry carries the flags its bucket implies (`is_write == false` for all three
+    /// containers -- none is a keyspace write), and the structural invariants the CLUSTER pin uses
+    /// (non-empty names, UNIQUE names, the two buckets DISJOINT, their UNION == the table). It does
+    /// NOT parse the dispatch `match` arms (it cannot at runtime) -- so it catches table-vs-hand-list
+    /// drift; keeping the dispatch arms in sync is the HUMAN co-edit obligation documented on each
+    /// table + its dispatch match (the CO-EDIT CONTRACT). SECURITY: a privileged subcommand
+    /// mis-bucketed as non-dangerous would be an ACL escalation this test cannot see, so the
+    /// non-dangerous bucket must be re-confirmed by eye against the dispatch + Redis tags.
+    fn assert_subcommand_table_pin(container: &[u8], non_dangerous: &[&[u8]], dangerous: &[&[u8]]) {
+        use std::collections::BTreeSet;
+        let label = String::from_utf8_lossy(container).into_owned();
+        let table = subcommands_of(container).expect("container has a subcommand table");
+
+        let table_names: BTreeSet<&[u8]> = table.iter().map(|s| s.name).collect();
+        assert!(
+            table.iter().all(|s| !s.name.is_empty()),
+            "{label}: every subcommand name must be non-empty"
+        );
+        assert_eq!(
+            table_names.len(),
+            table.len(),
+            "{label}: subcommand names must be unique (a duplicate shadows another entry's flags)"
+        );
+
+        let nd: BTreeSet<&[u8]> = non_dangerous.iter().copied().collect();
+        let dg: BTreeSet<&[u8]> = dangerous.iter().copied().collect();
+        assert!(
+            nd.is_disjoint(&dg),
+            "{label}: a subcommand is BOTH non-dangerous and dangerous (classification conflict)"
+        );
+        let expected_names: BTreeSet<&[u8]> = nd.union(&dg).copied().collect();
+        assert_eq!(
+            table_names, expected_names,
+            "{label}: subcommand table drifted from the dispatch arms -- update the table, the \
+             dispatch match arms, AND this pin's hand-lists together (see the CO-EDIT CONTRACT)."
+        );
+
+        for name in non_dangerous {
+            let spec = subcommand_spec(container, name).expect("non-dangerous sub in table");
+            assert!(
+                !spec.admin && !spec.dangerous && !spec.is_write,
+                "{label} {:?} must be non-admin/non-dangerous/non-write",
+                String::from_utf8_lossy(name)
+            );
+        }
+        for name in dangerous {
+            let spec = subcommand_spec(container, name).expect("dangerous sub in table");
+            assert!(
+                spec.admin && spec.dangerous && !spec.is_write,
+                "{label} {:?} must be @admin + @dangerous (no key write)",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// CONFIG SUBCOMMAND-TABLE PIN (per-subcommand ACL). Same contract as the CLUSTER pin: it
+    /// asserts [`CONFIG_SUBCOMMANDS`] equals the hand-lists transcribed from the `cmd_config`
+    /// dispatch arms and that each carries the right Redis-7 flags. The dispatch arms, the table,
+    /// and these hand-lists are the THREE artifacts the CO-EDIT CONTRACT binds together.
+    #[test]
+    fn config_subcommand_table_matches_dispatch_arms() {
+        // @slow only (non-dangerous): HELP. @admin+@slow+@dangerous (operative): the other four.
+        let non_dangerous: &[&[u8]] = &[b"HELP"];
+        let dangerous: &[&[u8]] = &[b"GET", b"SET", b"REWRITE", b"RESETSTAT"];
+        assert_subcommand_table_pin(b"CONFIG", non_dangerous, dangerous);
+
+        // The granularity boundary directly: GET is dangerous (so -@dangerous denies it until
+        // +config|get re-allows it), HELP is not; an unknown subcommand resolves to None.
+        assert!(
+            subcommand_spec(b"CONFIG", b"GET")
+                .expect("config|get")
+                .dangerous
+        );
+        assert!(
+            !subcommand_spec(b"CONFIG", b"HELP")
+                .expect("config|help")
+                .dangerous
+        );
+        assert!(subcommand_spec(b"CONFIG", b"BOGUS").is_none());
+    }
+
+    /// CLIENT SUBCOMMAND-TABLE PIN (per-subcommand ACL). Same contract as the CLUSTER pin, over the
+    /// `cmd_client` (dispatch.rs) arms. The flags are TRANSCRIBED FROM REDIS (`COMMAND INFO
+    /// client|<sub>`): the reads are `@slow @connection`, the privileged controls `@admin
+    /// @dangerous`.
+    #[test]
+    fn client_subcommand_table_matches_dispatch_arms() {
+        // Non-dangerous (@slow @connection): per-connection introspection / naming.
+        let non_dangerous: &[&[u8]] = &[
+            b"ID",
+            b"GETNAME",
+            b"SETNAME",
+            b"SETINFO",
+            b"INFO",
+            b"NO-TOUCH",
+        ];
+        // Privileged (@admin @dangerous): inspect/kill/pause OTHER connections, or exempt this one
+        // from eviction. NOTE: LIST is informational but @dangerous (it leaks every client's
+        // addr/name); NO-EVICT is @dangerous while its look-alike NO-TOUCH is not (Redis ground
+        // truth) -- a mutator mistagged as a read would be an escalation.
+        let dangerous: &[&[u8]] = &[b"LIST", b"KILL", b"PAUSE", b"UNPAUSE", b"NO-EVICT"];
+        assert_subcommand_table_pin(b"CLIENT", non_dangerous, dangerous);
+
+        // The two look-alike toggles are tagged DIFFERENTLY (the non-obvious call).
+        assert!(
+            subcommand_spec(b"CLIENT", b"NO-EVICT")
+                .expect("client|no-evict")
+                .dangerous
+        );
+        assert!(
+            !subcommand_spec(b"CLIENT", b"NO-TOUCH")
+                .expect("client|no-touch")
+                .dangerous
+        );
+        // CLIENT has NO `HELP` dispatch arm, so it must NOT be in the table (don't invent one).
+        assert!(subcommand_spec(b"CLIENT", b"HELP").is_none());
     }
 
     /// `extract_keys` is byte-identical to the legacy `command_keys` per-pattern logic. A
