@@ -304,6 +304,77 @@ def run_cluster(nodes: list[tuple[str, int]]) -> None:
         pass
 
 
+# --------------------------------------------------------------------------- restricted-user groups
+def run_restricted(nodes: list[tuple[str, int]], user: str, password: str) -> None:
+    """#405 per-subcommand-ACL leg: drive the cluster as the LOCKED-DOWN `svc` user
+    (`+@read +@write +@connection +@transaction -@dangerous +cluster|slots|shards|nodes|info`).
+
+    Proves (a) a scoped user can still DISCOVER topology + do a routed SET/GET round-trip, and
+    (b) every CLUSTER MUTATOR is NOPERM -- CLUSTER ADDSLOTS must be denied (the group PASSES when it
+    is). redis-py applies username/password to every node connection, so MOVED-routing re-AUTHs as
+    `svc` transparently.
+    """
+    mode = "restricted"
+    from redis.cluster import ClusterNode, RedisCluster
+    from redis.exceptions import ResponseError
+
+    pfx = f"pyr:{uuid.uuid4().hex[:8]}:"
+    startup = [ClusterNode(h, p) for (h, p) in nodes]
+
+    # DISCOVERY as svc: construction issues CLUSTER SLOTS (granted). A NOPERM would raise here.
+    try:
+        rc = RedisCluster(
+            startup_nodes=startup,
+            decode_responses=True,
+            require_full_coverage=True,
+            username=user,
+            password=password,
+        )
+        rc.ping()
+        result(mode, "discovery", True, f"nodes_discovered={len(rc.get_nodes())} as {user}")
+    except Exception as exc:
+        result(mode, "discovery", False, f"exception: {type(exc).__name__}: {exc}")
+        for g in ("rw-roundtrip", "addslots-denied"):
+            result(mode, g, False, "discovery failed")
+        return
+
+    def g_rw_roundtrip():
+        for i in range(30):
+            rc.set(f"{pfx}k{i}", str(i))
+        for i in range(30):
+            v = rc.get(f"{pfx}k{i}")
+            if v != str(i):
+                return False, f"mismatch k{i}={v!r}"
+        return True, "set+get 30 keys across slots as svc"
+
+    def g_addslots_denied():
+        # A CLUSTER MUTATOR must be NOPERM for svc. Use a DIRECT (non-cluster) connection to node[0]
+        # authenticated as svc for a deterministic target; PASS iff ADDSLOTS is denied NOPERM.
+        host, port = nodes[0]
+        one = redis.Redis(host=host, port=port, decode_responses=True, username=user, password=password)
+        try:
+            one.execute_command("CLUSTER", "ADDSLOTS", 0)
+            return False, "CLUSTER ADDSLOTS was ACCEPTED for a -@dangerous user (escalation!)"
+        except ResponseError as exc:
+            # redis-py raises NoPermissionError and STRIPS the NOPERM error-code
+            # prefix, so its message is "... has no permissions ..." without the
+            # literal token (go-redis / ioredis surface the raw NOPERM). Accept
+            # either form: the command was denied as long as it is a permissions
+            # error and not some unrelated ResponseError.
+            msg = str(exc)
+            denied = "NOPERM" in msg.upper() or "NO PERMISSIONS" in msg.upper()
+            return denied, f"denied: {msg[:90]}"
+        finally:
+            one.close()
+
+    check(mode, "rw-roundtrip", g_rw_roundtrip)
+    check(mode, "addslots-denied", g_addslots_denied)
+    try:
+        rc.close()
+    except Exception:
+        pass
+
+
 def parse_nodes(csv: str) -> list[tuple[str, int]]:
     out = []
     for part in csv.split(","):
@@ -316,11 +387,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--single-port", type=int, required=True)
     ap.add_argument("--cluster", type=str, required=True, help="comma list of host:port seeds")
+    ap.add_argument("--acl-user", type=str, default="", help="restricted (scoped-ACL) username, #405 leg")
+    ap.add_argument("--acl-pass", type=str, default="", help="restricted (scoped-ACL) password, #405 leg")
     args = ap.parse_args()
 
     print(f"# redis-py {redis.__version__}", flush=True)
     run_single(args.single_port)
     run_cluster(parse_nodes(args.cluster))
+    if args.acl_user:
+        run_restricted(parse_nodes(args.cluster), args.acl_user, args.acl_pass)
     return 1 if FAILED else 0
 
 

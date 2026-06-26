@@ -22,3 +22,7 @@ tests/drivers/node/node_modules/
 # per-run output.
 bench-results/
 /rust_out
+
+# Python bytecode cache (driver-matrix harness)
+__pycache__/
+*.pyc

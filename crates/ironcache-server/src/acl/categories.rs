@@ -618,6 +618,47 @@ pub fn category_bits(cmd_upper: &[u8]) -> CategorySet {
     set
 }
 
+/// Compute the EFFECTIVE [`CategorySet`] for a recognized `(cmd_upper, sub_upper)` SUBCOMMAND
+/// pair (per-subcommand ACL, Redis 7 `+cluster|slots`). Unlike [`category_bits`], which returns
+/// the CONTAINER's whole-command categories (e.g. `CLUSTER` = `{Admin, Dangerous, Slow}`), this
+/// reads the per-subcommand tags off the [`command_spec::SubcommandSpec`] so a read subcommand
+/// (CLUSTER SLOTS) is `{Slow}` while a mutator (CLUSTER ADDSLOTS) is `{Admin, Dangerous, Slow}`.
+///
+/// Derivation:
+/// * @write iff [`command_spec::SubcommandSpec::is_write`] (a CLUSTER subcommand touches no key,
+///   so neither @write nor @read applies today; the field is here for a future writing
+///   subcommand). There is no @read for a subcommand: a non-write CLUSTER subcommand owns no key.
+/// * @admin / @dangerous straight from the spec flags.
+/// * @slow ALWAYS (none of the CLUSTER subcommands are O(1) `@fast`); this preserves the
+///   fast XOR slow totality the `category_bits` partition guarantees, so a `-@slow` rule reaches
+///   them exactly as it would the container.
+///
+/// Returns the EMPTY set for an unrecognized pair (the caller falls back to [`category_bits`] of
+/// the container in that case, so an unknown subcommand inherits the container's @dangerous tag).
+/// PURE; called only at authorization time for a container command carrying a subcommand.
+#[must_use]
+pub fn subcommand_category_bits(cmd_upper: &[u8], sub_upper: &[u8]) -> CategorySet {
+    let mut set = CategorySet::empty();
+    let Some(spec) = command_spec::subcommand_spec(cmd_upper, sub_upper) else {
+        return set;
+    };
+    // @write iff the subcommand mutates the keyspace; CLUSTER subcommands never do, so this stays
+    // unset for them and they are neither @read nor @write (they own no key).
+    if spec.is_write {
+        set.insert(Category::Write);
+    }
+    if spec.admin {
+        set.insert(Category::Admin);
+    }
+    if spec.dangerous {
+        set.insert(Category::Dangerous);
+    }
+    // No CLUSTER subcommand is @fast, so each is @slow (totality preserved: exactly one of
+    // fast/slow, matching the per-command partition).
+    set.insert(Category::Slow);
+    set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +748,53 @@ mod tests {
             assert_eq!(Category::from_name(c.name()), Some(c));
         }
         assert_eq!(Category::from_name("nope"), None);
+    }
+
+    #[test]
+    fn subcommand_categories_split_reads_from_mutators() {
+        // A read subcommand (CLUSTER SLOTS): @slow only -- NOT @admin / @dangerous / @write, so it
+        // survives a `-@dangerous` carve-out.
+        let slots = subcommand_category_bits(b"CLUSTER", b"SLOTS");
+        assert!(slots.contains(Category::Slow));
+        assert!(!slots.contains(Category::Admin));
+        assert!(!slots.contains(Category::Dangerous));
+        assert!(!slots.contains(Category::Write));
+        assert!(!slots.contains(Category::Read));
+
+        // A mutator subcommand (CLUSTER ADDSLOTS): @admin + @dangerous + @slow, so `-@dangerous`
+        // denies it. Same for MEET / SETSLOT.
+        for sub in [
+            b"ADDSLOTS".as_slice(),
+            b"MEET",
+            b"SETSLOT",
+            b"FAILOVER",
+            b"RESET",
+        ] {
+            let bits = subcommand_category_bits(b"CLUSTER", sub);
+            assert!(bits.contains(Category::Admin), "{sub:?} must be @admin");
+            assert!(
+                bits.contains(Category::Dangerous),
+                "{sub:?} must be @dangerous"
+            );
+            assert!(bits.contains(Category::Slow), "{sub:?} must be @slow");
+            // Exactly one of fast/slow (totality preserved): never @fast.
+            assert!(!bits.contains(Category::Fast), "{sub:?} must not be @fast");
+        }
+
+        // An unrecognized pair yields the EMPTY set (caller falls back to category_bits).
+        assert_eq!(
+            subcommand_category_bits(b"CLUSTER", b"BOGUS"),
+            CategorySet::empty()
+        );
+        assert_eq!(
+            subcommand_category_bits(b"GET", b"SLOTS"),
+            CategorySet::empty()
+        );
+
+        // CRITICAL INVARIANT: the bare-CLUSTER whole-command categories are UNCHANGED.
+        let cluster = category_bits(b"CLUSTER");
+        assert!(cluster.contains(Category::Admin));
+        assert!(cluster.contains(Category::Dangerous));
+        assert!(cluster.contains(Category::Slow));
     }
 }

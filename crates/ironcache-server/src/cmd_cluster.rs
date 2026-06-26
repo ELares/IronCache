@@ -84,8 +84,21 @@ pub fn cmd_cluster(ctx: &ServerContext, req: &Request) -> Value {
     }
 
     // 3. Cluster-ENABLED: the introspection subcommands reply with single-node values.
+    //
+    // ===================== CO-EDIT CONTRACT with the PER-SUBCOMMAND ACL =====================
+    // These match arms are the AUTHORITATIVE list of CLUSTER subcommands and the READ-vs-MUTATE
+    // split. Per-subcommand ACL (`+cluster|slots`) mirrors this split in
+    // `command_spec::CLUSTER_SUBCOMMANDS` (the @admin/@dangerous flags) and pins it in the
+    // `command_spec::tests::cluster_subcommand_table_matches_dispatch_arms` test. If you ADD,
+    // REMOVE, or RECLASSIFY (read <-> mutator) an arm here, you MUST update BOTH of those in the
+    // same change. SECURITY: an arm that MUTATES the slot map / node table but is tagged
+    // `admin/dangerous: false` (a "read") in CLUSTER_SUBCOMMANDS would let a `-@dangerous`
+    // user run it -- a silent ACL escalation. The pin test cannot read these arms at runtime,
+    // so this co-edit is a human obligation.
+    // =======================================================================================
     let sub = ascii_upper(&req.args[1]);
     match sub.as_slice() {
+        // -- READ / introspection arms (CLUSTER_SUBCOMMANDS: admin=false, dangerous=false).
         b"KEYSLOT" => cluster_keyslot(req),
         b"MYID" => cluster_myid(ctx, req),
         b"INFO" => cluster_info(ctx, req),
@@ -95,6 +108,7 @@ pub fn cmd_cluster(ctx: &ServerContext, req: &Request) -> Value {
         b"COUNTKEYSINSLOT" => cluster_countkeysinslot(req),
         b"GETKEYSINSLOT" => cluster_getkeysinslot(req),
         b"HELP" => cluster_help(),
+        // -- MUTATOR + deferred arms (CLUSTER_SUBCOMMANDS: admin=true, dangerous=true).
         // Slice-3 topology-mutation subcommands: each drives a `SlotMap` mutator (the real
         // local self-formation surface). Inter-node SYNC of these is slice 3b; here a node
         // mutates only its OWN view. Cluster mode is enabled (the gate above), so `ctx.cluster`

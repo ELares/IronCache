@@ -87,6 +87,30 @@ The cluster-aware result is the high-value one: every client **discovers** the t
 `CLUSTER SLOTS`, **routes** keyed ops to the owning node by following `MOVED`, reads the values
 back correctly, and rejects/splits a cross-slot multi-key op as expected.
 
+### Cluster restricted-user (per-subcommand ACL, #405)
+
+Each cluster node also loads a shared aclfile with a **locked-down `svc` user**:
+
+```
+user svc on >svcpw ~* resetchannels +@read +@write +@connection +@transaction \
+  -@dangerous +cluster|slots +cluster|shards +cluster|nodes +cluster|info
+```
+
+The `restricted` leg connects each client as `svc` and proves the per-subcommand ACL grant is
+exactly what a real cluster client needs: introspection reads are allowed, every mutator is denied.
+(`default` stays all-permissive so the orchestrator's unauthenticated `PING` / `CLUSTER INFO`
+health probes and the existing legs are byte-identical; the restricted user is layered on top.)
+
+| op-group | redis-py | go-redis | ioredis |
+|----------|:--------:|:--------:|:-------:|
+| discovery (CLUSTER SLOTS/INFO as `svc`) | PASS | PASS | PASS |
+| rw-roundtrip (30 keys SET+GET, routed) | PASS | PASS | PASS |
+| addslots-denied (`CLUSTER ADDSLOTS` -> NOPERM) | PASS | PASS | PASS |
+
+The `addslots-denied` group PASSES *when the mutator is denied* (`-NOPERM User svc has no
+permissions to run the 'cluster|addslots' command`) -- the ACL fires before the handler, so this
+holds even where a single-node mutator would otherwise be inert. See finding **F4**.
+
 ## Findings
 
 ### F1 (server defect, FIXED) -- empty `COMMAND` broke cluster-aware redis-py
@@ -134,6 +158,23 @@ back correctly, and rejects/splits a cross-slot multi-key op as expected.
 * The harness therefore boots the single node with `--shards 1` so MULTI/EXEC is deterministic for
   the driver tests; every other op-group is shard-count-agnostic. This mirrors the cluster contract
   (a transaction's keys must share a slot, enforced there with a `{hash tag}`).
+
+### F4 (infra grant note, #405) -- ioredis cluster bootstrap also needs `CLUSTER INFO`
+
+* **Client / op:** ioredis 5.11.x `Redis.Cluster`, bootstrap under the scoped `svc` user.
+* **Observed:** ioredis's default `enableReadyCheck` issues **`CLUSTER INFO`** (it waits for
+  `cluster_state:ok`) *in addition* to `CLUSTER SLOTS`. go-redis (`CLUSTER SLOTS`) and redis-py
+  (`CLUSTER SLOTS` + bare `COMMAND`, see F1) do **not** need `CLUSTER INFO`.
+* **Implication (the grant set):** the minimal per-subcommand read grant for the three mainstream
+  cluster clients is **`+cluster|slots +cluster|shards +cluster|nodes +cluster|info`**, not just
+  `slots`/`shards`/`nodes`. `CLUSTER INFO` is a **read** (no slot-map / node-table mutation), so
+  granting it carries no escalation -- the security boundary (every `@dangerous` CLUSTER mutator
+  denied) is unchanged. The shipped `svc` aclfile line includes `+cluster|info` for this reason.
+* **Also confirmed safe under `svc`:** `COMMAND` / `COMMAND DOCS` (redis-py's connect-time routing
+  table, F1) is `@admin`+`@connection` but **not** `@dangerous`, so `+@connection` grants it under
+  `-@dangerous`; and `CLIENT SETINFO` (go-redis / redis-py lib-name handshake) is `@dangerous` and
+  therefore NOPERM, but both clients treat a `SETINFO` failure as non-fatal -- so the connection
+  still succeeds. No further grant was required.
 
 ## What is NOT covered (follow-ups)
 

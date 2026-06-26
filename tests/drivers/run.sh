@@ -51,6 +51,15 @@ NODE_IDS=(
 # node2 [10923,16383] -- all 16384 slots covered.
 SLOT_RANGES=("[[0, 5460]]" "[[5461, 10922]]" "[[10923, 16383]]")
 
+# RESTRICTED-USER (per-subcommand ACL, #405) leg: the cluster nodes load a shared aclfile so a
+# real client can connect as a LOCKED-DOWN `svc` user (`-@dangerous +cluster|slots|shards|nodes`)
+# and prove (a) cluster discovery + a routed SET/GET round-trip still work, (b) every CLUSTER
+# MUTATOR (ADDSLOTS) is denied NOPERM. See write_cluster_aclfile for the grant + why `default`
+# stays all-permissive.
+CLUSTER_ACLFILE="$WORK_DIR/cluster-users.acl"
+SVC_USER="svc"
+SVC_PASS="svcpw"
+
 PIDS=()
 
 # ---------------------------------------------------------------------------- logging helpers
@@ -151,6 +160,35 @@ boot_single() {
 }
 
 # ---------------------------------------------------------------------------- boot: turnkey cluster
+# Write the shared aclfile every cluster node loads (#405, per-subcommand ACL leg).
+#
+# WHY `default` STAYS ALL-PERMISSIVE (deliberate deviation from a `default off` posture): this
+# orchestrator's OWN health gates -- `wait_for_ping` (bare PING) and `cluster_state_ok` (bare
+# CLUSTER INFO), both over an UNAUTHENTICATED redis-cli -- plus every EXISTING driver leg connect
+# as the implicit default with no AUTH. Turning `default off` would make those probes return
+# `-NOAUTH` and break turnkey-convergence detection AND all current scenarios. So we keep `default`
+# all-permissive (byte-identical for the existing legs + the harness probes) and LAYER the scoped
+# `svc` user on top -- the restricted leg AUTHs as `svc`, which proves the locked-down per-subcommand
+# ACL end-to-end regardless of `default`'s posture. `butlr_admin` is the all-powers identity (the
+# turnkey cluster issues no CLUSTER mutators itself, so it is unused here, present for parity with
+# prod where an operator runs mutators as the admin user, never as `svc`).
+#
+# `svc` GRANT: `+@read +@write +@connection +@transaction -@dangerous` (data + handshake, no
+# dangerous ops) PLUS the introspection subcommands a cluster client needs to discover topology:
+# `+cluster|slots +cluster|shards +cluster|nodes +cluster|info`. The `+cluster|info` is included
+# because ioredis's default `enableReadyCheck` issues `CLUSTER INFO` during bootstrap (go-redis /
+# redis-py discover via CLUSTER SLOTS alone) -- see DRIVER_MATRIX.md / the report: the practical
+# minimal cluster-client read grant is slots+shards+nodes+info. Every CLUSTER MUTATOR
+# (ADDSLOTS/SETSLOT/MEET/...) stays @admin+@dangerous and is therefore NOPERM for `svc`.
+write_cluster_aclfile() {
+  cat > "$CLUSTER_ACLFILE" <<EOF
+user default on nopass ~* &* +@all
+user butlr_admin on >adminpw ~* &* +@all
+user $SVC_USER on >$SVC_PASS ~* resetchannels +@read +@write +@connection +@transaction -@dangerous +cluster|slots +cluster|shards +cluster|nodes +cluster|info
+EOF
+  info "wrote cluster aclfile: $CLUSTER_ACLFILE (default all-permissive; scoped svc user added)"
+}
+
 write_cluster_config() { # write_cluster_config <idx>
   local i="$1" cfg="$WORK_DIR/node$i.toml" n
   {
@@ -161,6 +199,7 @@ write_cluster_config() { # write_cluster_config <idx>
     echo 'cluster_mode = "raft"'
     echo "cluster_announce_id = \"${NODE_IDS[$i]}\""
     echo "data_dir = \"$WORK_DIR/node$i-data\""
+    echo "aclfile = \"$CLUSTER_ACLFILE\""
     echo 'min_replicas_to_write = 0'
     for n in 0 1 2; do
       echo '[[cluster_topology.nodes]]'
@@ -187,6 +226,9 @@ cluster_state_ok() { # all three report cluster_state:ok + 16384 assigned + 3 kn
 
 boot_cluster() {
   local i cfg
+  # The shared aclfile every node loads (#405 restricted-user leg); written before the configs
+  # that reference it.
+  write_cluster_aclfile
   # Clean any stale raft logs for these bus ports (temp-dir convention <temp>/ironcache-raft-<bus>.log).
   for i in 0 1 2; do
     local bus=$(( CLUSTER_PORTS[i] + 10000 ))
@@ -228,7 +270,8 @@ CLUSTER_CSV="127.0.0.1:${CLUSTER_PORTS[0]},127.0.0.1:${CLUSTER_PORTS[1]},127.0.0
 run_client_go() {
   info "=== running client: go ==="
   ( cd "$SCRIPT_DIR/go" && GOFLAGS=-mod=mod go run . \
-      -single-port "$SINGLE_PORT" -cluster "$CLUSTER_CSV" ) \
+      -single-port "$SINGLE_PORT" -cluster "$CLUSTER_CSV" \
+      -acl-user "$SVC_USER" -acl-pass "$SVC_PASS" ) \
       > "$WORK_DIR/go.out" 2> "$WORK_DIR/go.err"
   cat "$WORK_DIR/go.out"
   grep '^RESULT' "$WORK_DIR/go.out" 2>/dev/null | while IFS=' ' read -r _ c m g s d; do
@@ -317,11 +360,14 @@ main() {
   boot_single  || { err "single-node boot failed"; exit 1; }
   boot_cluster || { err "cluster boot failed";    exit 1; }
 
-  # Setup + run each requested + available client.
+  # Setup + run each requested + available client. Each driver also gets the scoped-ACL creds
+  # (`--acl-user`/`--acl-pass`) so it runs the #405 RESTRICTED leg against the cluster: discovery +
+  # SET/GET as `svc`, and a CLUSTER ADDSLOTS that must come back NOPERM.
   if want python; then
     if setup_python; then
       run_client python "$PY" "$SCRIPT_DIR/python/driver_compat.py" \
-        --single-port "$SINGLE_PORT" --cluster "$CLUSTER_CSV"
+        --single-port "$SINGLE_PORT" --cluster "$CLUSTER_CSV" \
+        --acl-user "$SVC_USER" --acl-pass "$SVC_PASS"
     else
       record redis-py single all SKIP "python/redis-py unavailable"
       record redis-py cluster all SKIP "python/redis-py unavailable"
@@ -340,7 +386,8 @@ main() {
   if want node; then
     if setup_node; then
       run_client node node "$SCRIPT_DIR/node/driver_compat.js" \
-        --single-port "$SINGLE_PORT" --cluster "$CLUSTER_CSV"
+        --single-port "$SINGLE_PORT" --cluster "$CLUSTER_CSV" \
+        --acl-user "$SVC_USER" --acl-pass "$SVC_PASS"
     else
       record ioredis single all SKIP "node/ioredis unavailable"
       record ioredis cluster all SKIP "node/ioredis unavailable"

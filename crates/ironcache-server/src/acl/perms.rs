@@ -29,7 +29,7 @@
 //! authenticates with any password (or none); a user with no passwords and not `nopass`
 //! can never authenticate. None of these structs ever hold or log a plaintext password.
 
-use super::categories::{Category, CategorySet, category_bits};
+use super::categories::{Category, CategorySet, category_bits, subcommand_category_bits};
 use crate::glob::glob_match;
 
 /// One command-permission RULE, in the order the operator wrote it. Authorization replays
@@ -50,6 +50,13 @@ enum CmdRule {
     AllowCmd(Vec<u8>),
     /// `-<cmd>`: deny a single command (UPPERCASE token).
     DenyCmd(Vec<u8>),
+    /// `+<cmd>|<sub>`: allow a single SUBCOMMAND of a container command (both tokens UPPERCASE),
+    /// e.g. `+cluster|slots`. Matches ONLY the exact `(container, subcommand)` pair; a bare
+    /// `+<cmd>` ([`Self::AllowCmd`]) still grants ALL subcommands (Redis parity).
+    AllowSub(Vec<u8>, Vec<u8>),
+    /// `-<cmd>|<sub>`: deny a single SUBCOMMAND of a container command (both tokens UPPERCASE),
+    /// e.g. `-cluster|addslots`. Matches ONLY the exact `(container, subcommand)` pair.
+    DenySub(Vec<u8>, Vec<u8>),
 }
 
 /// A user's command permissions: the ordered rule list. Compiled once on `ACL SETUSER`;
@@ -112,6 +119,20 @@ impl CommandPerms {
         self.rules.push(CmdRule::DenyCmd(cmd_upper.to_vec()));
     }
 
+    /// Append `+<cmd>|<sub>` (both tokens stored UPPERCASE): allow a single subcommand of a
+    /// container command.
+    pub fn allow_subcommand(&mut self, cmd_upper: &[u8], sub_upper: &[u8]) {
+        self.rules
+            .push(CmdRule::AllowSub(cmd_upper.to_vec(), sub_upper.to_vec()));
+    }
+
+    /// Append `-<cmd>|<sub>` (both tokens stored UPPERCASE): deny a single subcommand of a
+    /// container command.
+    pub fn deny_subcommand(&mut self, cmd_upper: &[u8], sub_upper: &[u8]) {
+        self.rules
+            .push(CmdRule::DenySub(cmd_upper.to_vec(), sub_upper.to_vec()));
+    }
+
     /// Whether the permission is EXACTLY `+@all` (the all-permissive shortcut), so the
     /// enforcement layer can skip the per-command replay entirely for the default user.
     #[must_use]
@@ -119,25 +140,35 @@ impl CommandPerms {
         self.rules == [CmdRule::AllowAll]
     }
 
-    /// Whether `cmd_upper` is allowed under these permissions. Replays the rule list in
-    /// order; the LAST matching rule wins (Redis "last match wins"). The default (no rule
-    /// matches) is DENY, matching Redis's `-@all` baseline. `cmd_cat` is the command's
-    /// precomputed [`CategorySet`] (the caller passes it so the hot path computes the
-    /// command's categories at most once).
+    /// Replay the rule list for `(cmd_upper, sub_upper)` against the precomputed EFFECTIVE
+    /// category set `eff_cat`, last-match-wins (Redis "last match wins"). The default (no rule
+    /// matches) is DENY, matching Redis's `-@all` baseline.
+    ///
+    /// * `AllowCat`/`DenyCat` test `eff_cat` (the subcommand's effective categories when a
+    ///   recognized subcommand is being checked, else the whole-command categories).
+    /// * `AllowCmd`/`DenyCmd` match the CONTAINER token only, so a bare `+cluster` grants EVERY
+    ///   subcommand and `-cluster` denies EVERY subcommand (Redis parity), regardless of `sub`.
+    /// * `AllowSub`/`DenySub` match the exact `(cmd, sub)` pair; they are INERT when `sub_upper`
+    ///   is `None` (a no-subcommand caller), so the whole-command path is byte-identical.
     #[must_use]
-    fn allows_with(&self, cmd_upper: &[u8], cmd_cat: CategorySet) -> bool {
+    fn allows_replay(
+        &self,
+        cmd_upper: &[u8],
+        sub_upper: Option<&[u8]>,
+        eff_cat: CategorySet,
+    ) -> bool {
         let mut allowed = false;
         for rule in &self.rules {
             match rule {
                 CmdRule::AllowAll => allowed = true,
                 CmdRule::DenyAll => allowed = false,
                 CmdRule::AllowCat(c) => {
-                    if cmd_cat.contains(*c) {
+                    if eff_cat.contains(*c) {
                         allowed = true;
                     }
                 }
                 CmdRule::DenyCat(c) => {
-                    if cmd_cat.contains(*c) {
+                    if eff_cat.contains(*c) {
                         allowed = false;
                     }
                 }
@@ -151,16 +182,45 @@ impl CommandPerms {
                         allowed = false;
                     }
                 }
+                CmdRule::AllowSub(name, sub) => {
+                    if name.as_slice() == cmd_upper && Some(sub.as_slice()) == sub_upper {
+                        allowed = true;
+                    }
+                }
+                CmdRule::DenySub(name, sub) => {
+                    if name.as_slice() == cmd_upper && Some(sub.as_slice()) == sub_upper {
+                        allowed = false;
+                    }
+                }
             }
         }
         allowed
     }
 
     /// Whether `cmd_upper` is allowed (computes the command's categories then replays the
-    /// rules). The per-command entry point used by enforcement.
+    /// rules). The per-command entry point used by enforcement. Delegates to [`Self::allows_sub`]
+    /// with no subcommand, so the no-subcommand path is exactly the original behavior.
     #[must_use]
     pub fn allows(&self, cmd_upper: &[u8]) -> bool {
-        self.allows_with(cmd_upper, category_bits(cmd_upper))
+        self.allows_sub(cmd_upper, None)
+    }
+
+    /// Whether `(cmd_upper, sub_upper)` is allowed. When `sub_upper` is `Some` AND the
+    /// `(cmd, sub)` pair is a recognized subcommand (in the command-spec table), the EFFECTIVE
+    /// category set is the SUBCOMMAND's tags ([`subcommand_category_bits`]) so a read subcommand
+    /// (CLUSTER SLOTS = `@slow`) is judged independently of its container's `@admin`/`@dangerous`;
+    /// otherwise the effective set is the whole-command's [`category_bits`] (so an unknown
+    /// subcommand inherits the container's categories, and a `None` caller is unchanged). Then the
+    /// rule list is replayed last-match-wins.
+    #[must_use]
+    pub fn allows_sub(&self, cmd_upper: &[u8], sub_upper: Option<&[u8]>) -> bool {
+        let eff_cat = match sub_upper {
+            Some(sub) if crate::command_spec::subcommand_spec(cmd_upper, sub).is_some() => {
+                subcommand_category_bits(cmd_upper, sub)
+            }
+            _ => category_bits(cmd_upper),
+        };
+        self.allows_replay(cmd_upper, sub_upper, eff_cat)
     }
 
     /// Render the command perms back to the Redis ACL rule string (`+@all`, `-@all +get`,
@@ -190,6 +250,16 @@ impl CommandPerms {
                 CmdRule::DenyCmd(n) => {
                     format!("-{}", String::from_utf8_lossy(n).to_ascii_lowercase())
                 }
+                CmdRule::AllowSub(c, s) => format!(
+                    "+{}|{}",
+                    String::from_utf8_lossy(c).to_ascii_lowercase(),
+                    String::from_utf8_lossy(s).to_ascii_lowercase()
+                ),
+                CmdRule::DenySub(c, s) => format!(
+                    "-{}|{}",
+                    String::from_utf8_lossy(c).to_ascii_lowercase(),
+                    String::from_utf8_lossy(s).to_ascii_lowercase()
+                ),
             });
         }
         parts.join(" ")
@@ -454,6 +524,17 @@ impl User {
         self.commands.is_allcommands() || self.commands.allows(cmd_upper)
     }
 
+    /// Whether `(cmd_upper, sub_upper)` is allowed for this user (the per-SUBCOMMAND authorization
+    /// test for a container command like CLUSTER). `sub_upper` is `Some(<UPPERCASE subcommand>)`
+    /// when the request carries one; `None` falls back to whole-command semantics
+    /// ([`Self::can_run_command`]). The `+@all` shortcut still allows everything; otherwise the
+    /// compiled rule replay decides on the subcommand's EFFECTIVE categories so a read subcommand
+    /// can be granted without the container's `@dangerous` mutators (Redis 7 `+cluster|slots`).
+    #[must_use]
+    pub fn can_run_command_sub(&self, cmd_upper: &[u8], sub_upper: Option<&[u8]>) -> bool {
+        self.commands.is_allcommands() || self.commands.allows_sub(cmd_upper, sub_upper)
+    }
+
     /// Whether `key` is allowed for this user (the per-key authorization test).
     #[must_use]
     pub fn can_access_key(&self, key: &[u8]) -> bool {
@@ -614,5 +695,92 @@ mod tests {
         assert!(line.contains("~k:*"));
         assert!(line.contains("+get"));
         assert!(line.contains("resetchannels"));
+    }
+
+    #[test]
+    fn subcommand_grant_allows_read_denies_mutator() {
+        // `+@read +@write +@connection +@transaction -@dangerous +cluster|slots +cluster|shards
+        // +cluster|nodes`: the three read subcommands are allowed; every CLUSTER mutator is NOPERM.
+        let mut p = CommandPerms::nocommands();
+        p.allow_category(Category::Read);
+        p.allow_category(Category::Write);
+        p.allow_category(Category::Connection);
+        p.allow_category(Category::Transaction);
+        p.deny_category(Category::Dangerous);
+        p.allow_subcommand(b"CLUSTER", b"SLOTS");
+        p.allow_subcommand(b"CLUSTER", b"SHARDS");
+        p.allow_subcommand(b"CLUSTER", b"NODES");
+
+        for sub in [b"SLOTS".as_slice(), b"SHARDS", b"NODES"] {
+            assert!(
+                p.allows_sub(b"CLUSTER", Some(sub)),
+                "CLUSTER {} must be allowed",
+                String::from_utf8_lossy(sub)
+            );
+        }
+        for sub in [
+            b"ADDSLOTS".as_slice(),
+            b"MEET",
+            b"SETSLOT",
+            b"DELSLOTS",
+            b"FORGET",
+        ] {
+            assert!(
+                !p.allows_sub(b"CLUSTER", Some(sub)),
+                "CLUSTER {} must be NOPERM (mutator under -@dangerous)",
+                String::from_utf8_lossy(sub)
+            );
+        }
+    }
+
+    #[test]
+    fn all_minus_dangerous_allows_read_subcommand_denies_mutator() {
+        // Redis 7 parity: `+@all -@dangerous` runs CLUSTER SLOTS but is NOPERM on CLUSTER ADDSLOTS.
+        let mut p = CommandPerms::allcommands();
+        p.deny_category(Category::Dangerous);
+        assert!(p.allows_sub(b"CLUSTER", Some(b"SLOTS")));
+        assert!(!p.allows_sub(b"CLUSTER", Some(b"ADDSLOTS")));
+        // An unrecognized subcommand inherits the container's @dangerous tag -> denied.
+        assert!(!p.allows_sub(b"CLUSTER", Some(b"BOGUS")));
+    }
+
+    #[test]
+    fn bare_cluster_grant_allows_all_subcommands() {
+        // A bare `+cluster` grants EVERY subcommand (reads AND mutators); `-cluster` denies all.
+        let mut grant = CommandPerms::nocommands();
+        grant.allow_command(b"CLUSTER");
+        assert!(grant.allows_sub(b"CLUSTER", Some(b"SLOTS")));
+        assert!(grant.allows_sub(b"CLUSTER", Some(b"ADDSLOTS")));
+        assert!(grant.allows(b"CLUSTER"));
+
+        let mut deny = CommandPerms::allcommands();
+        deny.deny_command(b"CLUSTER");
+        assert!(!deny.allows_sub(b"CLUSTER", Some(b"SLOTS")));
+        assert!(!deny.allows_sub(b"CLUSTER", Some(b"ADDSLOTS")));
+    }
+
+    #[test]
+    fn subcommand_rules_are_inert_for_other_commands_and_no_sub() {
+        // A `+cluster|slots` rule must not leak to other commands or to the no-subcommand path.
+        let mut p = CommandPerms::nocommands();
+        p.allow_subcommand(b"CLUSTER", b"SLOTS");
+        // Other commands unaffected (still denied by the -@all baseline).
+        assert!(!p.allows(b"GET"));
+        assert!(!p.allows_sub(b"GET", Some(b"SLOTS")));
+        // Bare CLUSTER (no subcommand) is NOT granted by a `+cluster|slots` rule.
+        assert!(!p.allows(b"CLUSTER"));
+        assert!(!p.allows_sub(b"CLUSTER", None));
+    }
+
+    #[test]
+    fn describe_round_trips_subcommand_rule() {
+        // A subcommand rule renders as `+cluster|slots` (lowercased pipe form) with the implicit
+        // `-@all` baseline, so an aclfile SAVE -> LOAD reproduces it.
+        let mut u = User::new("svc");
+        u.enabled = true;
+        u.commands.allow_subcommand(b"CLUSTER", b"SLOTS");
+        u.commands.deny_subcommand(b"CLUSTER", b"ADDSLOTS");
+        let desc = u.commands.describe();
+        assert_eq!(desc, "-@all +cluster|slots -cluster|addslots");
     }
 }
