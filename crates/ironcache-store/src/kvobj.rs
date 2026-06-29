@@ -1987,6 +1987,20 @@ impl KvObj {
                 }
                 KvObj::from_hash(key, hash, expire_at)
             }
+            // The HSETEX create-on-missing path (#408): build the hash, then attach each
+            // field's TTL so a brand-new key is created already carrying field expirations.
+            NewValueOwned::HashEx(pairs, ttls) => {
+                let mut hash = HashVal::new();
+                for (f, v) in &pairs {
+                    hash.set(f, v, thresholds);
+                }
+                for (f, deadline) in &ttls {
+                    if hash.contains(f) {
+                        hash.set_field_ttl(f, *deadline);
+                    }
+                }
+                KvObj::from_hash(key, hash, expire_at)
+            }
             // The PR-7 create-on-missing SET path: build the set value from the members
             // (deduped + ladder-applied by `SetVal::from_members`). Subsequent edits go
             // through the in-place RmwAction::Mutated path, not this rebuild.
@@ -2819,6 +2833,20 @@ impl Entry {
                 let mut hash = HashVal::new();
                 for (f, v) in &pairs {
                     hash.set(f, v, thresholds);
+                }
+                Entry::coll(key, CollVal::Hash(hash), expire_at)
+            }
+            // The HSETEX create-on-missing path (#408): build the hash, then attach each field's
+            // TTL so a brand-new key is created already carrying field expirations.
+            NewValueOwned::HashEx(pairs, ttls) => {
+                let mut hash = HashVal::new();
+                for (f, v) in &pairs {
+                    hash.set(f, v, thresholds);
+                }
+                for (f, deadline) in &ttls {
+                    if hash.contains(f) {
+                        hash.set_field_ttl(f, *deadline);
+                    }
                 }
                 Entry::coll(key, CollVal::Hash(hash), expire_at)
             }

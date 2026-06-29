@@ -1955,6 +1955,16 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: true,
         },
+        // HSETEX (#408) sets field values + TTLs; denyoom (it grows the dataset). arity -6.
+        b"HSETEX" => &CommandSpec {
+            name: b"HSETEX",
+            arity: Min(6),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: true,
+            control: false,
+            is_write: true,
+        },
         b"HRANDFIELD" => &CommandSpec {
             name: b"HRANDFIELD",
             arity: Min(2),
@@ -2898,6 +2908,7 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     b"HPERSIST",
     b"HGETDEL",
     b"HGETEX",
+    b"HSETEX",
     // Sets.
     b"SADD",
     b"SREM",
@@ -3289,6 +3300,7 @@ pub(crate) mod tests {
             b"HRANDFIELD",
             b"HSCAN",
             b"HSET",
+            b"HSETEX",
             b"HSETNX",
             b"HSTRLEN",
             b"HTTL",
