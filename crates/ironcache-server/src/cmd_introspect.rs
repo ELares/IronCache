@@ -199,6 +199,149 @@ fn encoding_name_static(enc: Encoding) -> &'static [u8] {
     enc.encoding_name().as_bytes()
 }
 
+// ---------------------------------------------------------------------------
+// DEBUG: the conformance subcommand subset (#411). The Redis/Valkey TCL suites drive a
+// large fraction of their assertions through DEBUG (assert_encoding -> DEBUG OBJECT,
+// `debug set-active-expire 0` for deterministic expiry, `debug sleep`, `debug
+// stringmatch-len`, ...). Implementing the test-relevant subset lets those suites run
+// unmodified. Scoped STRICTLY to what the suites need, OFF the hot path, NOT a general
+// extensibility surface (ADR-0009: no DEBUG RELOAD / JMAP-style internals).
+// ---------------------------------------------------------------------------
+
+/// `DEBUG <subcommand> [args]` (#411): the conformance subset. ACL-gated under @admin +
+/// @dangerous (registered in the command spec). An unimplemented subcommand returns the
+/// standard unknown-subcommand error (NOT a silent OK), so a suite relying on a real DEBUG
+/// behavior we do not model fails loudly rather than misleadingly passing.
+pub fn cmd_debug<S: Store>(
+    runtime: &ironcache_config::RuntimeConfig,
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+) -> Value {
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("debug"));
+    }
+    let sub = crate::cmd_util::ascii_upper(&req.args[1]);
+    match sub.as_slice() {
+        b"OBJECT" => debug_object(store, db, now, req),
+        // JMAP is a JVM-heap hint with no engine meaning here; a no-op OK (Redis returns OK).
+        b"JMAP" => Value::ok(),
+        b"SLEEP" => debug_sleep(req),
+        b"SET-ACTIVE-EXPIRE" => debug_set_active_expire(runtime, req),
+        b"STRINGMATCH-LEN" => debug_stringmatch_len(req),
+        // IronCache's list encoding does not use Redis quicklist packed nodes, so this tuning
+        // knob has no effect; accept the threshold arg and return OK (a no-op, like JMAP), so a
+        // suite that sets it before building a list runs unmodified.
+        b"QUICKLIST-PACKED-THRESHOLD" => debug_quicklist_packed_threshold(req),
+        b"HELP" => debug_help(),
+        _ => Value::error(ErrorReply::unknown_subcommand(
+            "DEBUG",
+            &String::from_utf8_lossy(&req.args[1]),
+        )),
+    }
+}
+
+/// `DEBUG OBJECT key` -> a status line carrying the object's internal `encoding` (aligned
+/// with the OBJECT ENCODING mapping, #40), plus the standard `refcount` / `serializedlength`
+/// / `lru` fields the TCL `assert_encoding` helper and friends parse. `-ERR no such key` for
+/// a missing key (Redis wording). `serializedlength` is the value's logical byte length (a
+/// best-effort proxy for the RDB-serialized size; the suites assert on `encoding`).
+fn debug_object<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("debug"));
+    }
+    match store.read(db, &req.args[2], now) {
+        Some(v) => {
+            let encoding = String::from_utf8_lossy(encoding_name_static(v.encoding())).into_owned();
+            let serializedlength = v.len();
+            Value::simple(&format!(
+                "Value at:0x0 refcount:1 encoding:{encoding} serializedlength:{serializedlength} lru:0 lru_seconds_idle:0"
+            ))
+        }
+        None => Value::error(ErrorReply::err("no such key")),
+    }
+}
+
+/// `DEBUG SLEEP seconds` -> blocks the serving shard for `seconds` (a float), then `+OK`.
+/// Matches Redis (a real, whole-shard block: the TCL latency/timeout tests depend on it).
+/// `std::time::Duration` / `std::thread::sleep` are not clock reads, so the determinism seam
+/// is untouched.
+fn debug_sleep(req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("debug"));
+    }
+    let Some(secs) = crate::cmd_util::parse_f64(&req.args[2]) else {
+        return Value::error(ErrorReply::not_a_valid_float());
+    };
+    if secs.is_sign_negative() || !secs.is_finite() {
+        return Value::error(ErrorReply::err("Invalid sleep time"));
+    }
+    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    Value::ok()
+}
+
+/// `DEBUG SET-ACTIVE-EXPIRE 0|1` -> toggle the node's background active-expiry cycle (#411),
+/// then `+OK`. `0` disables it (only LAZY reap-on-access removes keys, so an expired-but
+/// -untouched key stays resident for inspection -- the conformance contract); any non-zero
+/// integer enables it (Redis: `active_expire_enabled = atoi(arg) ? 1 : 0`). The flag lives in
+/// the per-node runtime overlay, so the toggle reaches every shard's drain.
+fn debug_set_active_expire(runtime: &ironcache_config::RuntimeConfig, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("debug"));
+    }
+    let Some(n) = crate::cmd_util::parse_i64(&req.args[2]) else {
+        return Value::error(ErrorReply::not_an_integer());
+    };
+    runtime.set_active_expire(n != 0);
+    Value::ok()
+}
+
+/// `DEBUG STRINGMATCH-LEN pattern string` -> run the glob matcher over `(pattern, string)`
+/// and reply the integer result (1 match / 0 no match). The TCL pattern-matching tests drive
+/// the matcher through this to prove it neither mis-matches nor stack-overflows on adversarial
+/// patterns. Reuses the SAME `glob_match` the keyspace SCAN/KEYS commands use, so it cannot
+/// drift from real matching behavior.
+fn debug_stringmatch_len(req: &Request) -> Value {
+    if req.args.len() != 4 {
+        return Value::error(ErrorReply::wrong_arity("debug"));
+    }
+    let matched = crate::glob::glob_match(&req.args[2], &req.args[3]);
+    Value::Integer(i64::from(matched))
+}
+
+/// `DEBUG QUICKLIST-PACKED-THRESHOLD <size>` -> a no-op `+OK` (IronCache lists do not use Redis
+/// quicklist packed nodes; the knob has no engine effect). Accepts the threshold arg so a suite
+/// that sets it before building a list runs unmodified.
+fn debug_quicklist_packed_threshold(req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("debug"));
+    }
+    Value::ok()
+}
+
+/// `DEBUG HELP` -> the help text array (the implemented-subcommand summaries, like Redis).
+fn debug_help() -> Value {
+    let lines: &[&str] = &[
+        "DEBUG <subcommand> [<arg> ...]. The implemented conformance subset is:",
+        "OBJECT <key>",
+        "    Show low-level info about `key` (its internal encoding, refcount, serializedlength).",
+        "JMAP",
+        "    No-op (JVM-heap hint); returns OK.",
+        "SLEEP <seconds>",
+        "    Block the serving shard for `seconds` (a float), then return OK.",
+        "SET-ACTIVE-EXPIRE <0|1>",
+        "    Enable (1) or disable (0) the background active-expiry cycle for this node.",
+        "STRINGMATCH-LEN <pattern> <string>",
+        "    Run the glob matcher over (pattern, string) and return 1 (match) or 0.",
+        "QUICKLIST-PACKED-THRESHOLD <size>",
+        "    No-op (IronCache lists do not use quicklist packed nodes); returns OK.",
+        "HELP",
+        "    Print this help.",
+    ];
+    Value::Array(Some(lines.iter().map(|l| Value::bulk_str(l)).collect()))
+}
+
 /// `OBJECT HELP` -> the help text array (the subcommand summaries, like Redis).
 fn object_help() -> Value {
     let lines: &[&str] = &[

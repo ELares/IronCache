@@ -957,6 +957,21 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        // DEBUG conformance subset (#411): an AlwaysHome admin container (token + subcommand,
+        // arity Min(2)), like CONFIG/SLOWLOG. NOT key-routed (Redis DEBUG carries no key spec --
+        // DEBUG OBJECT reads its key on the LOCAL shard, the same node-local scope Redis cluster
+        // gives DEBUG; the conformance suites are single-node so every key is home). NOT a
+        // keyspace write (SET-ACTIVE-EXPIRE toggles a node flag, not a key), so `is_write: false`.
+        // The @admin/@dangerous ACL categories are assigned in acl/categories.rs.
+        b"DEBUG" => &CommandSpec {
+            name: b"DEBUG",
+            arity: Min(2),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
         // CLUSTER (CLUSTER_CONTRACT.md #70, slice 1): the read-only/introspection CLUSTER
         // surface. Like CONFIG it is an admin container command: AlwaysHome (never
         // key-routed -- KEYSLOT computes the slot of an ARGUMENT but the command itself
@@ -2845,6 +2860,7 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     b"SLOWLOG",
     b"MEMORY",
     b"LATENCY",
+    b"DEBUG",
     b"CLUSTER",
     b"SAVE",
     b"BGSAVE",

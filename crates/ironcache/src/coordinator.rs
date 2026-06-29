@@ -171,6 +171,7 @@ pub async fn run_drain_loop(
         ctx.databases,
         ctx.info.maxmemory_policy,
         crate::serve::scan_reserved_bits(ctx.shards),
+        ctx.runtime.clone(),
     );
 
     // PERSISTENCE LOAD-ON-BOOT (#58): when a data_dir is configured, THIS shard loads ITS OWN

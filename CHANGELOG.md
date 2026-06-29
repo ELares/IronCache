@@ -141,6 +141,23 @@ release.
 
 ### Added
 
+- DEBUG conformance subcommand subset (issue #411): the `DEBUG` container, scoped
+  strictly to what the upstream Redis/Valkey TCL conformance suites drive their
+  assertions through, so those suites can run against IronCache unmodified (which
+  strengthens the byte-for-byte differential claim far more than the command's
+  end-user value). `DEBUG OBJECT <key>` reports a status line carrying the value's
+  internal `encoding` (aligned with the OBJECT ENCODING mapping, so it cannot drift
+  from `OBJECT ENCODING`), plus `refcount` / `serializedlength` / `lru` fields; a
+  missing key is `-ERR no such key`. `DEBUG SET-ACTIVE-EXPIRE 0|1` toggles the
+  node's background active-expiry cycle (the `0` state makes the active reaper inert
+  so only lazy reap-on-access removes a key, the deterministic-expiry contract the
+  suites rely on); the flag lives in the per-node runtime overlay so the toggle
+  reaches every shard's drain. `DEBUG SLEEP <seconds>` blocks the serving shard then
+  returns OK; `DEBUG STRINGMATCH-LEN <pattern> <string>` runs the same glob matcher
+  KEYS/SCAN use and returns 1/0; `DEBUG JMAP` and `DEBUG QUICKLIST-PACKED-THRESHOLD`
+  are accepted no-ops (IronCache has no JVM heap or quicklist packed nodes). DEBUG is
+  ACL-gated under `@admin` + `@dangerous`; an unimplemented subcommand fails loudly
+  (unknown subcommand), never a silent OK.
 - Native compare-and-set and bulk-TTL primitives (issue #412): the atomic
   operations that previously forced a Lua script or a `WATCH`/`MULTI`/`EXEC` round
   trip, now as single server-side verbs (no scripting runtime, reinforcing the

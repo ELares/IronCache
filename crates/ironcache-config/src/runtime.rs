@@ -32,7 +32,7 @@
 //! strings when the generation says a swap is pending.
 
 use crate::NotifyFlags;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The mutable, cross-shard runtime-config overlay (the highest-precedence layer,
@@ -81,6 +81,15 @@ pub struct RuntimeConfig {
     /// of a Redis `save <seconds> <changes>` point). `0` fires unconditionally on each enabled
     /// tick. Runtime-settable via `CONFIG SET save` (paired with [`Self::save_interval_secs`]).
     save_min_changes: AtomicU64,
+    /// Whether the BACKGROUND active-expiry cycle is enabled (Redis `DEBUG SET-ACTIVE-EXPIRE`,
+    /// #411). `true` (the default) runs the active drain (per-command + the periodic tick);
+    /// `false` makes the active reaper INERT so only LAZY expiry (reap-on-access) removes a key,
+    /// which the conformance suites rely on to keep an expired-but-untouched key physically
+    /// resident for inspection. Node-level cold state read once per drain (one relaxed load),
+    /// never per stored key; lives here (not a process-global) so each server instance toggles
+    /// independently and a `DEBUG SET-ACTIVE-EXPIRE` on one connection reaches every shard of THAT
+    /// node via the shared `Arc`, exactly like `CONFIG SET maxmemory`.
+    active_expire: AtomicBool,
     /// The simultaneous-connection ceiling (Redis `maxclients`, PROD-SAFETY #3). `0` disables the
     /// cap. Runtime-settable via `CONFIG SET maxclients`; the accept path reads it (one relaxed
     /// load) when deciding whether to reject a new connection, so a `CONFIG SET maxclients` takes
@@ -213,6 +222,7 @@ impl RuntimeConfig {
             output_buffer_limit: AtomicU64::new(cfg.output_buffer_limit),
             // The SLOWLOG knobs (PROD-7), seeded from the boot config so a node started with a
             // configured threshold/length keeps it; a later `CONFIG SET slowlog-*` overrides live.
+            active_expire: AtomicBool::new(true),
             slowlog_log_slower_than: AtomicI64::new(cfg.slowlog_log_slower_than),
             slowlog_max_len: AtomicU64::new(cfg.slowlog_max_len),
             // The keyspace-notification flags (PROD-8), seeded from the boot config's flag string.
@@ -379,6 +389,20 @@ impl RuntimeConfig {
     /// the new value applies to subsequent connections without a restart (PROD-SAFETY #3).
     pub fn set_maxclients(&self, n: u64) {
         self.maxclients.store(n, Ordering::Relaxed);
+    }
+
+    /// Whether the BACKGROUND active-expiry cycle is enabled (`DEBUG SET-ACTIVE-EXPIRE`, #411).
+    /// `true` by default; the active drain (per-command + periodic tick) reads this once and
+    /// skips reaping when it is `false` (lazy reap-on-access still applies). One relaxed load.
+    #[must_use]
+    pub fn active_expire_enabled(&self) -> bool {
+        self.active_expire.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable the background active-expiry cycle (`DEBUG SET-ACTIVE-EXPIRE 1|0`, #411).
+    /// Reaches every shard of this node via the shared `Arc` (one relaxed store).
+    pub fn set_active_expire(&self, on: bool) {
+        self.active_expire.store(on, Ordering::Relaxed);
     }
 
     /// The current effective idle client timeout in SECONDS (Redis `timeout`, PROD-SAFETY #4); `0`

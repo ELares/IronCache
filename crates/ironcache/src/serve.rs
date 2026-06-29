@@ -926,12 +926,24 @@ pub(crate) fn shard_pubsub() -> Rc<RefCell<crate::pubsub::ShardPubSub>> {
 ///
 /// The [`TokioRuntime`] backend is zero-sized (it carries no state; the shard's tasks
 /// live on the LocalSet), so it is constructed here rather than threaded in.
-pub(crate) fn ensure_shard_started(databases: u32, policy_name: &str, reserved_bits: u32) {
+pub(crate) fn ensure_shard_started(
+    databases: u32,
+    policy_name: &str,
+    reserved_bits: u32,
+    runtime: Arc<ironcache_config::RuntimeConfig>,
+) {
     let env = shard_env();
     let store_rc = shard_store(databases, policy_name, reserved_bits);
     let wheel_rc = shard_wheel();
     let state_rc = shard_state();
-    spawn_expire_task(TokioRuntime::new(), env, store_rc, wheel_rc, state_rc);
+    spawn_expire_task(
+        TokioRuntime::new(),
+        env,
+        store_rc,
+        wheel_rc,
+        state_rc,
+        runtime,
+    );
 }
 
 fn spawn_expire_task(
@@ -940,6 +952,7 @@ fn spawn_expire_task(
     store_rc: Rc<RefCell<ShardStoreImpl>>,
     wheel_rc: Rc<RefCell<TimingWheel>>,
     state_rc: Rc<RefCell<ShardState>>,
+    runtime: Arc<ironcache_config::RuntimeConfig>,
 ) {
     if EXPIRE_TASK_SPAWNED.with(std::cell::Cell::get) {
         return;
@@ -951,8 +964,10 @@ fn spawn_expire_task(
             // directly). No RefCell borrow is held across this await.
             rt.timer(EXPIRE_CYCLE_INTERVAL).await;
             // One tick: take + release all borrows inside this call, returning a u64.
-            // Nothing borrowed survives to the next await iteration.
-            expire_cycle_tick(&env, &store_rc, &wheel_rc, &state_rc);
+            // Nothing borrowed survives to the next await iteration. The runtime `Arc` is
+            // read for the DEBUG SET-ACTIVE-EXPIRE gate (#411); the clone is one shard-local
+            // owned handle, never re-cloned per tick.
+            expire_cycle_tick(&env, &store_rc, &wheel_rc, &state_rc, &runtime);
         }
     });
 }
@@ -971,6 +986,7 @@ fn expire_cycle_tick(
     store_rc: &Rc<RefCell<ShardStoreImpl>>,
     wheel_rc: &Rc<RefCell<TimingWheel>>,
     state_rc: &Rc<RefCell<ShardState>>,
+    runtime: &ironcache_config::RuntimeConfig,
 ) -> u64 {
     // CARRY-FORWARD 2 (PASSIVE replica, HA-7d): a replica shard must NOT run its own active
     // expiry -- it would independently reap keys the slot OWNER still holds and DIVERGE. When
@@ -979,6 +995,14 @@ fn expire_cycle_tick(
     // replication stream (`ReplicaApplier`). DEFAULTS `false`, so the non-replica path is
     // byte-unchanged (one bool test, then the identical reap below). See `set_replica_passive`.
     if is_replica_passive() {
+        return 0;
+    }
+    // DEBUG SET-ACTIVE-EXPIRE (#411): when the node disabled the active-expiry cycle, this
+    // background reaper is INERT too (return 0 before any borrow), so only LAZY reap-on-access
+    // removes a key -- the conformance contract. One relaxed load, default-true so the common
+    // path is byte-unchanged. The flag lives in the per-node runtime `Arc`, so a toggle on any
+    // connection reaches every shard's tick.
+    if !runtime.active_expire_enabled() {
         return 0;
     }
     // The WORK (which keys are due) is decided by the Env clock (ADR-0003), so a DST
@@ -1271,7 +1295,12 @@ async fn serve_connection(
     // must reclaim even with no connection). This call is the same idempotent helper, so a
     // connection arriving before the drain loop's first poll still gets the timer started;
     // the EXPIRE_TASK_SPAWNED guard makes the duplicate call a no-op.
-    ensure_shard_started(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
+    ensure_shard_started(
+        ctx.databases,
+        ctx.info.maxmemory_policy,
+        reserved_bits,
+        ctx.runtime.clone(),
+    );
     // Correct the context's started_at to this shard's boot instant.
     ctx.info.started_at = shard_started_at();
 
@@ -1716,7 +1745,12 @@ async fn serve_connection_uring(
         .borrow_mut()
         .set_encoding_thresholds(ctx.runtime.encoding_thresholds());
     let wheel_rc = shard_wheel();
-    ensure_shard_started(ctx.databases, ctx.info.maxmemory_policy, reserved_bits);
+    ensure_shard_started(
+        ctx.databases,
+        ctx.info.maxmemory_policy,
+        reserved_bits,
+        ctx.runtime.clone(),
+    );
     ctx.info.started_at = shard_started_at();
 
     // MAXCLIENTS gate (PROD-SAFETY #3), identical to the tokio path: admit against the global
@@ -6363,7 +6397,9 @@ mod tests {
         plant_expired(&store, &wheel, b"k2");
         assert_eq!(store.borrow().len(), 2);
 
-        let reaped = expire_cycle_tick(&env, &store, &wheel, &state);
+        let rt_cfg =
+            ironcache_config::RuntimeConfig::from_config(&ironcache_config::Config::default());
+        let reaped = expire_cycle_tick(&env, &store, &wheel, &state, &rt_cfg);
         assert_eq!(
             reaped, 2,
             "the cycle reaped both expired keys with no command"
@@ -6377,12 +6413,42 @@ mod tests {
     }
 
     #[test]
+    fn expire_cycle_tick_is_inert_when_active_expire_disabled() {
+        // DEBUG SET-ACTIVE-EXPIRE 0 (#411): with the runtime active-expire flag off, the
+        // background reaper does NOTHING (the expired keys stay resident for inspection); the
+        // SAME fixture reaps them once the flag is re-enabled.
+        let (env, store, wheel, state) = timer_fixtures();
+        wheel.borrow_mut().advance(UnixMillis(0), 0);
+        plant_expired(&store, &wheel, b"k1");
+        plant_expired(&store, &wheel, b"k2");
+        let rt_cfg =
+            ironcache_config::RuntimeConfig::from_config(&ironcache_config::Config::default());
+        rt_cfg.set_active_expire(false);
+        assert_eq!(
+            expire_cycle_tick(&env, &store, &wheel, &state, &rt_cfg),
+            0,
+            "active-expire disabled -> the cycle reaps nothing"
+        );
+        assert_eq!(
+            store.borrow().len(),
+            2,
+            "expired keys stay resident when disabled"
+        );
+        // Re-enable -> the same cycle now reaps them.
+        rt_cfg.set_active_expire(true);
+        assert_eq!(expire_cycle_tick(&env, &store, &wheel, &state, &rt_cfg), 2);
+        assert_eq!(store.borrow().len(), 0);
+    }
+
+    #[test]
     fn expire_cycle_tick_is_a_noop_when_nothing_due() {
         // A cycle with nothing due reaps nothing and leaves the counter untouched (the
         // common idle case: an empty wheel fast-forwards in O(1)).
         let (env, store, wheel, state) = timer_fixtures();
         wheel.borrow_mut().advance(UnixMillis(0), 0);
-        let reaped = expire_cycle_tick(&env, &store, &wheel, &state);
+        let rt_cfg =
+            ironcache_config::RuntimeConfig::from_config(&ironcache_config::Config::default());
+        let reaped = expire_cycle_tick(&env, &store, &wheel, &state, &rt_cfg);
         assert_eq!(reaped, 0);
         assert_eq!(state.borrow().counters.snapshot().expired_keys, 0);
     }
@@ -6406,6 +6472,8 @@ mod tests {
             assert_eq!(store.borrow().len(), 1);
 
             let runtime = TokioRuntime::new();
+            let rt_cfg =
+                ironcache_config::RuntimeConfig::from_config(&ironcache_config::Config::default());
             // EXPIRE_TASK_SPAWNED is thread-local; this test thread spawns exactly once.
             spawn_expire_task(
                 runtime,
@@ -6413,6 +6481,7 @@ mod tests {
                 Rc::clone(&store),
                 Rc::clone(&wheel),
                 Rc::clone(&state),
+                rt_cfg,
             );
 
             // Drive the LocalSet: the timer task awaits EXPIRE_CYCLE_INTERVAL (100ms) then
