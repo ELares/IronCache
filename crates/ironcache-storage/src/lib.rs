@@ -450,6 +450,12 @@ pub enum NewValueOwned {
     /// create case only; SUBSEQUENT edits go through the in-place [`RmwAction::Mutated`]
     /// path, not a rebuild.
     Hash(Vec<(Vec<u8>, Vec<u8>)>),
+    /// A new HASH value WITH per-field TTLs (#408, the HSETEX create-on-missing path). The
+    /// `(field, value)` pairs are built as for [`NewValueOwned::Hash`], then each
+    /// `(field, deadline)` in the second list is applied as a per-field TTL, so a brand-new key
+    /// can be created already carrying field expirations (the in-place rmw path cannot run on a
+    /// vacant key). A field in the TTL list that is not among the pairs is ignored.
+    HashEx(Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, UnixMillis)>),
     /// A new SET value (PR-7 create-on-missing path: SADD/SMOVE-into-dst/*STORE on a
     /// vacant key). The members are in insertion order (deduplicated by the store as it
     /// builds the concrete set value, applying the intset/listpack/hashtable ladder). As
@@ -482,6 +488,12 @@ impl NewValueOwned {
     #[must_use]
     pub fn hash(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
         NewValueOwned::Hash(pairs)
+    }
+
+    /// Convenience constructor for a new HASH value with per-field TTLs (HSETEX create path).
+    #[must_use]
+    pub fn hash_ex(pairs: Vec<(Vec<u8>, Vec<u8>)>, ttls: Vec<(Vec<u8>, UnixMillis)>) -> Self {
+        NewValueOwned::HashEx(pairs, ttls)
     }
 
     /// Convenience constructor for a new SET value from members in insertion order

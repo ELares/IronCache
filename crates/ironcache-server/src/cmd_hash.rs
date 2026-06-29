@@ -1454,6 +1454,161 @@ pub fn cmd_hgetex<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reque
     })
 }
 
+/// `HSETEX key [FNX|FXX] [EX sec | PX ms | EXAT unix-sec | PXAT unix-ms | KEEPTTL] FIELDS
+/// numfields field value [field value ...]` -> `1` if the fields were set, `0` if the FNX/FXX
+/// condition was not met. FNX sets only when EVERY field is absent; FXX only when EVERY field
+/// already exists. The TTL option sets the new fields' deadline (a deadline at or before now
+/// creates-then-expires, persisting nothing); KEEPTTL preserves each field's existing TTL; with
+/// no option the fields are written WITHOUT a TTL, like HSET.
+#[allow(clippy::too_many_lines)] // one cohesive command: parse, the FNX/FXX gate, and the set.
+pub fn cmd_hsetex<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() < 6 {
+        return Value::error(ErrorReply::wrong_arity("hsetex"));
+    }
+    let mut idx = 2;
+    // Optional FNX/FXX existence condition over the whole field set.
+    let (fnx, fxx) = match ascii_upper(&req.args[idx]).as_slice() {
+        b"FNX" => {
+            idx += 1;
+            (true, false)
+        }
+        b"FXX" => {
+            idx += 1;
+            (false, true)
+        }
+        _ => (false, false),
+    };
+    // Optional TTL directive: EX/PX/EXAT/PXAT <value>, or KEEPTTL, or none.
+    let kind = match ascii_upper(&req.args[idx]).as_slice() {
+        b"EX" => Some(ExpireKind::Seconds),
+        b"PX" => Some(ExpireKind::Millis),
+        b"EXAT" => Some(ExpireKind::SecondsAt),
+        b"PXAT" => Some(ExpireKind::MillisAt),
+        _ => None,
+    };
+    let mut keep_ttl = false;
+    let deadline_ms: Option<i64> = if let Some(kind) = kind {
+        let Some(n) = req.args.get(idx + 1).and_then(|a| parse_i64(a)) else {
+            return Value::error(ErrorReply::not_an_integer());
+        };
+        idx += 2;
+        let Ok(d) = resolve_expire_at(kind, n, now) else {
+            return Value::error(ErrorReply::invalid_expire_time("hsetex"));
+        };
+        Some(d)
+    } else if req.args[idx].eq_ignore_ascii_case(b"KEEPTTL") {
+        idx += 1;
+        keep_ttl = true;
+        None
+    } else {
+        None
+    };
+    // The FIELDS block for HSETEX carries field-VALUE pairs (2*numfields args).
+    if idx >= req.args.len() || !req.args[idx].eq_ignore_ascii_case(b"FIELDS") {
+        return Value::error(ErrorReply::err(
+            "Mandatory keyword FIELDS is missing or not at the right position",
+        ));
+    }
+    let Some(n) = req.args.get(idx + 1).and_then(|a| parse_i64(a)) else {
+        return Value::error(ErrorReply::err(
+            "Parameter `numFields` should be greater than 0",
+        ));
+    };
+    if n <= 0 {
+        return Value::error(ErrorReply::err(
+            "Parameter `numFields` should be greater than 0",
+        ));
+    }
+    let rest = &req.args[idx + 2..];
+    if rest.len() != (n as usize) * 2 {
+        return Value::error(ErrorReply::err(
+            "Parameter `numFields` is more than number of arguments",
+        ));
+    }
+    let pairs: Vec<(Bytes, Bytes)> = rest
+        .chunks_exact(2)
+        .map(|c| (c[0].clone(), c[1].clone()))
+        .collect();
+
+    store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
+        RmwEntry::Vacant => {
+            // FXX over a missing key: no field exists, so set nothing -> 0.
+            if fxx {
+                return keep(Value::Integer(0));
+            }
+            let owned: Vec<(Vec<u8>, Vec<u8>)> = pairs
+                .iter()
+                .map(|(f, v)| (f.to_vec(), v.to_vec()))
+                .collect();
+            match deadline_ms {
+                // A deadline at or before now would create-then-immediately-expire every field,
+                // so nothing persists: reply 1 (set), create no key.
+                Some(d) if d <= now.0 as i64 => keep(Value::Integer(1)),
+                // Create the hash WITH each field's future deadline (the in-place TTL path
+                // cannot run on a vacant key, so the deadlines ride the create value).
+                Some(d) => {
+                    let ttls: Vec<(Vec<u8>, UnixMillis)> = owned
+                        .iter()
+                        .map(|(f, _)| (f.clone(), UnixMillis(d as u64)))
+                        .collect();
+                    RmwStep {
+                        action: RmwAction::Insert(NewValueOwned::hash_ex(owned, ttls)),
+                        expire: ExpireWrite::Clear,
+                        reply: Value::Integer(1),
+                    }
+                }
+                // No TTL or KEEPTTL: a brand-new field carries no TTL either way.
+                None => RmwStep {
+                    action: RmwAction::Insert(new_hash(owned)),
+                    expire: ExpireWrite::Clear,
+                    reply: Value::Integer(1),
+                },
+            }
+        }
+        RmwEntry::OccupiedMut(mut o) => {
+            let th = o.thresholds();
+            let Some(hash) = o.as_hash_mut() else {
+                return wrong_type();
+            };
+            hash.reap_expired_fields(now);
+            // Evaluate the FNX/FXX gate over ALL fields BEFORE any write.
+            if fnx && pairs.iter().any(|(f, _)| hash.contains(f)) {
+                return keep(Value::Integer(0));
+            }
+            if fxx && !pairs.iter().all(|(f, _)| hash.contains(f)) {
+                return keep(Value::Integer(0));
+            }
+            for (f, v) in &pairs {
+                hash.set(f, v, &th);
+                match deadline_ms {
+                    Some(d) if d <= now.0 as i64 => {
+                        hash.del(f);
+                    }
+                    Some(d) => hash.set_field_ttl(f, UnixMillis(d as u64)),
+                    // KEEPTTL leaves the field's existing TTL (set() does not touch it); with no
+                    // option HSETEX clears it, like HSET.
+                    None => {
+                        if !keep_ttl {
+                            hash.persist_field(f);
+                        }
+                    }
+                }
+            }
+            let action = if hash.is_empty() {
+                RmwAction::Delete
+            } else {
+                RmwAction::Mutated
+            };
+            RmwStep {
+                action,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::Integer(1),
+            }
+        }
+        RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,6 +2092,150 @@ mod tests {
             Value::Array(Some(items)) => assert_eq!(bulk_bytes(&items[0]), Some(b"v".to_vec())),
             other => panic!("expected array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hsetex_sets_values_with_ttl_and_honors_conditions() {
+        let mut s = test_store();
+        // Create a NEW key with EX 100: fields set, each carrying the 100s TTL (the create path).
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[
+                    b"HSETEX", b"h", b"EX", b"100", b"FIELDS", b"2", b"a", b"1", b"b", b"2"
+                ])
+            )),
+            1
+        );
+        assert_eq!(
+            bulk_bytes(&cmd_hget(&mut s, 0, NOW, &req(&[b"HGET", b"h", b"a"]))),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"2", b"a", b"b"])
+            )),
+            vec![100, 100]
+        );
+        // FNX with an existing field -> 0 (set nothing).
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"h", b"FNX", b"FIELDS", b"1", b"a", b"9"])
+            )),
+            0
+        );
+        assert_eq!(
+            bulk_bytes(&cmd_hget(&mut s, 0, NOW, &req(&[b"HGET", b"h", b"a"]))),
+            Some(b"1".to_vec())
+        );
+        // FXX with all present -> set; a plain (no-option) HSETEX clears the field TTLs (like HSET).
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"h", b"FXX", b"FIELDS", b"1", b"a", b"2"])
+            )),
+            1
+        );
+        assert_eq!(
+            bulk_bytes(&cmd_hget(&mut s, 0, NOW, &req(&[b"HGET", b"h", b"a"]))),
+            Some(b"2".to_vec())
+        );
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"])
+            )),
+            vec![-1]
+        );
+        // FXX with a missing field -> 0.
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"h", b"FXX", b"FIELDS", b"1", b"z", b"1"])
+            )),
+            0
+        );
+        // KEEPTTL preserves an existing field TTL across an overwrite.
+        cmd_hexpire(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HEXPIRE", b"h", b"50", b"FIELDS", b"1", b"b"]),
+        );
+        cmd_hsetex(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HSETEX", b"h", b"KEEPTTL", b"FIELDS", b"1", b"b", b"9"]),
+        );
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"b"])
+            )),
+            vec![50]
+        );
+        assert_eq!(
+            bulk_bytes(&cmd_hget(&mut s, 0, NOW, &req(&[b"HGET", b"h", b"b"]))),
+            Some(b"9".to_vec())
+        );
+    }
+
+    #[test]
+    fn hsetex_vacant_and_past_deadline_branches() {
+        let mut s = test_store();
+        // FXX on a fully-missing key -> 0, and no key is created.
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"miss", b"FXX", b"FIELDS", b"1", b"a", b"1"])
+            )),
+            0
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"miss"]))), 0);
+
+        // A past absolute deadline on a NEW key: reply 1 (set), but nothing persists.
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"h", b"PXAT", b"0", b"FIELDS", b"1", b"a", b"1"])
+            )),
+            1
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"h"]))), 0);
+
+        // A past deadline on an UPDATE deletes the field, removing the now-empty key.
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h2", b"a", b"1"]));
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"h2", b"PXAT", b"0", b"FIELDS", b"1", b"a", b"2"])
+            )),
+            1
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"h2"]))), 0);
     }
 
     // ---- HSET: new-vs-update count, HMSET alias. ----

@@ -302,6 +302,7 @@ pub(crate) mod tests {
             b"HPERSIST",
             b"HGETDEL",
             b"HGETEX",
+            b"HSETEX",
             // Sets
             b"SADD",
             b"SREM",
@@ -554,11 +555,11 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            191,
-            "the dispatch-arm hand-list drifted from the 179 client commands (incl. LOLWUT, \
-             #414 command-surface completeness, + the 11 hash-field-TTL commands HEXPIRE/\
+            192,
+            "the dispatch-arm hand-list drifted from the 180 client commands (incl. LOLWUT, \
+             #414 command-surface completeness, + the 12 hash-field-TTL commands HEXPIRE/\
              HPEXPIRE/HEXPIREAT/HPEXPIREAT/HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME/HPERSIST + the \
-             HGETDEL/HGETEX accessors, #408, \
+             HGETDEL/HGETEX/HSETEX accessors, #408, \
              + SAVE/BGSAVE/\
              LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown, + the drop-in\
              compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO, \
