@@ -1250,6 +1250,9 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         // #107, Stage 2a). MGET is read-only; MSET is a denyoom write (admission above).
         b"MGET" => cmd_string::cmd_mget(store, db, now, req),
         b"MSET" => cmd_string::cmd_mset(store, wheel, db, now, req),
+        // MSETEX: atomic multi-key set with a shared expiration (Redis 8.4, #412). Takes the
+        // wheel like MSET/SET (it registers each key's deadline when an expire is set).
+        b"MSETEX" => cmd_string::cmd_msetex(store, wheel, db, now, req),
         b"SET" => cmd_string::cmd_set(store, wheel, db, now, req),
         b"SETNX" => cmd_string::cmd_setnx(store, db, now, req),
         b"GETSET" => cmd_string::cmd_getset(store, db, now, req),
@@ -1278,6 +1281,9 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         // single-key invocations (a spanning MSETNX is kept home by the serve loop so the
         // atomic all-or-nothing holds; cross-shard atomic MSETNX is the Stage-3 follow-up).
         b"MSETNX" => cmd_string::cmd_msetnx(store, db, now, req),
+        // DELIFEQ: compare-and-delete a string (Valkey 9.0, #412). NOT keyspace-counted (its
+        // 0/1 reply conflates a missing key with a value mismatch, so it is no hit/miss signal).
+        b"DELIFEQ" => cmd_string::cmd_delifeq(store, db, now, req),
         b"DEL" => cmd_keyspace::cmd_del(store, db, now, req),
         b"EXISTS" => cmd_keyspace::cmd_exists(store, db, now, req),
         b"TYPE" => cmd_keyspace::cmd_type(store, db, now, req),

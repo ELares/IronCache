@@ -59,8 +59,9 @@ mod tests {
             b"INCRBYFLOAT",
             b"SETEX",
             b"PSETEX",
-            // MSET is a denyoom multi-key write.
+            // MSET / MSETEX are denyoom multi-key writes.
             b"MSET",
+            b"MSETEX",
             b"RENAME",
             b"RENAMENX",
             b"COPY",

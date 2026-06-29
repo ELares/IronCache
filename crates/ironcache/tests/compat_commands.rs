@@ -388,3 +388,206 @@ fn config_set_hash_listpack_entries_changes_new_hash_encoding_over_the_wire() {
         );
     });
 }
+
+/// SET IFEQ / IFNE compare-and-set over the wire (Redis 8.4, #412): the happy match, the
+/// mismatch (no write, nil reply), the missing-key behavior (IFEQ does NOT create, IFNE
+/// DOES), GET composition (returns the OLD value regardless), the EX composition, the
+/// mutual-exclusivity / missing-value syntax errors, and WRONGTYPE on a non-string.
+#[test]
+fn set_ifeq_ifne_compare_and_set_over_the_wire() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(cmd(&mut c, &["SET", "k", "v1"]).await, "+OK\r\n");
+        // IFEQ match -> writes; mismatch -> nil, no write.
+        assert_eq!(
+            cmd(&mut c, &["SET", "k", "v2", "IFEQ", "v1"]).await,
+            "+OK\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "k"]).await, "$2\r\nv2\r\n");
+        assert_eq!(
+            cmd(&mut c, &["SET", "k", "v3", "IFEQ", "v1"]).await,
+            "$-1\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "k"]).await, "$2\r\nv2\r\n");
+        // IFEQ on a MISSING key fails and does NOT create it (Redis 8.4 wording).
+        assert_eq!(
+            cmd(&mut c, &["SET", "miss", "x", "IFEQ", "v1"]).await,
+            "$-1\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["EXISTS", "miss"]).await, ":0\r\n");
+        // GET composition: returns the OLD value whether or not the write fires.
+        assert_eq!(
+            cmd(&mut c, &["SET", "k", "v4", "IFEQ", "v2", "GET"]).await,
+            "$2\r\nv2\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "k"]).await, "$2\r\nv4\r\n");
+        assert_eq!(
+            cmd(&mut c, &["SET", "k", "v5", "IFEQ", "wrong", "GET"]).await,
+            "$2\r\nv4\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "k"]).await, "$2\r\nv4\r\n");
+        // IFNE: write when the current value DIFFERS from the comparison (here k is v4, so
+        // comparing against "zz" fires); nil when it is EQUAL; a missing key IS created.
+        assert_eq!(
+            cmd(&mut c, &["SET", "k", "v6", "IFNE", "zz"]).await,
+            "+OK\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "k"]).await, "$2\r\nv6\r\n");
+        assert_eq!(
+            cmd(&mut c, &["SET", "k", "v7", "IFNE", "v6"]).await,
+            "$-1\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "k"]).await, "$2\r\nv6\r\n");
+        assert_eq!(
+            cmd(&mut c, &["SET", "fresh", "vY", "IFNE", "z"]).await,
+            "+OK\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "fresh"]).await, "$2\r\nvY\r\n");
+        // EX composes with IFEQ: a matching CAS that also sets a TTL.
+        assert_eq!(
+            cmd(&mut c, &["SET", "k", "v8", "IFEQ", "v6", "EX", "100"]).await,
+            "+OK\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["TTL", "k"]).await, ":100\r\n");
+        // The condition options are mutually exclusive; a missing IFEQ value is a syntax error.
+        for bad in [
+            ["SET", "k", "v", "NX", "IFEQ"].as_slice(),
+            ["SET", "k", "v", "IFEQ", "x", "XX"].as_slice(),
+            ["SET", "k", "v", "IFEQ", "a", "IFNE"].as_slice(),
+            ["SET", "k", "v", "IFEQ"].as_slice(),
+        ] {
+            let reply = cmd(&mut c, bad).await;
+            assert!(
+                reply.starts_with("-ERR syntax error"),
+                "{bad:?} must be a syntax error, got {reply:?}"
+            );
+        }
+        // WRONGTYPE: IFEQ cannot compare a non-string value.
+        assert_eq!(cmd(&mut c, &["RPUSH", "lst", "a"]).await, ":1\r\n");
+        let wt = cmd(&mut c, &["SET", "lst", "v", "IFEQ", "x"]).await;
+        assert!(wt.starts_with("-WRONGTYPE"), "got {wt:?}");
+    });
+}
+
+/// DELIFEQ compare-and-delete over the wire (Valkey 9.0, #412): delete only on an exact
+/// string match (reply 1), no delete on a mismatch or a missing key (reply 0), WRONGTYPE on
+/// a non-string, and the arity error.
+#[test]
+fn delifeq_compare_and_delete_over_the_wire() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        assert_eq!(cmd(&mut c, &["SET", "lock", "token1"]).await, "+OK\r\n");
+        // Mismatch -> 0, the key survives.
+        assert_eq!(cmd(&mut c, &["DELIFEQ", "lock", "wrong"]).await, ":0\r\n");
+        assert_eq!(cmd(&mut c, &["EXISTS", "lock"]).await, ":1\r\n");
+        // Exact match -> 1, the key is gone.
+        assert_eq!(cmd(&mut c, &["DELIFEQ", "lock", "token1"]).await, ":1\r\n");
+        assert_eq!(cmd(&mut c, &["EXISTS", "lock"]).await, ":0\r\n");
+        // A now-missing key, and an always-missing key -> 0.
+        assert_eq!(cmd(&mut c, &["DELIFEQ", "lock", "token1"]).await, ":0\r\n");
+        assert_eq!(cmd(&mut c, &["DELIFEQ", "miss", "x"]).await, ":0\r\n");
+        // WRONGTYPE on a non-string; the value is untouched.
+        assert_eq!(cmd(&mut c, &["RPUSH", "lst", "a"]).await, ":1\r\n");
+        let wt = cmd(&mut c, &["DELIFEQ", "lst", "x"]).await;
+        assert!(wt.starts_with("-WRONGTYPE"), "got {wt:?}");
+        assert_eq!(cmd(&mut c, &["EXISTS", "lst"]).await, ":1\r\n");
+        // Arity: DELIFEQ needs exactly key + value.
+        let ar = cmd(&mut c, &["DELIFEQ", "lock"]).await;
+        assert!(
+            ar.starts_with("-ERR") && ar.contains("delifeq"),
+            "got {ar:?}"
+        );
+    });
+}
+
+/// MSETEX atomic multi-key set with a shared expiration over the wire (Redis 8.4, #412): the
+/// unconditional set-all (reply 1), the NX gate (all-or-nothing on a single existing key),
+/// the XX gate (fails if any key is missing), the shared EX, KEEPTTL preservation, and the
+/// numkeys / syntax / expire errors.
+#[test]
+fn msetex_atomic_multikey_over_the_wire() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // Unconditional: set every key, reply 1, no TTL (MSET default clears).
+        assert_eq!(
+            cmd(&mut c, &["MSETEX", "2", "a", "1", "b", "2"]).await,
+            ":1\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "a"]).await, "$1\r\n1\r\n");
+        assert_eq!(cmd(&mut c, &["GET", "b"]).await, "$1\r\n2\r\n");
+        assert_eq!(cmd(&mut c, &["TTL", "a"]).await, ":-1\r\n");
+        // Shared EX applies the SAME deadline to every key.
+        assert_eq!(
+            cmd(&mut c, &["MSETEX", "2", "c", "3", "d", "4", "EX", "100"]).await,
+            ":1\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["TTL", "c"]).await, ":100\r\n");
+        assert_eq!(cmd(&mut c, &["TTL", "d"]).await, ":100\r\n");
+        // NX gate: `a` already exists, so the whole op is rejected (reply 0) and `e` is NOT
+        // created (all-or-nothing).
+        assert_eq!(
+            cmd(&mut c, &["MSETEX", "2", "a", "X", "e", "5", "NX"]).await,
+            ":0\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["EXISTS", "e"]).await, ":0\r\n");
+        assert_eq!(cmd(&mut c, &["GET", "a"]).await, "$1\r\n1\r\n");
+        // NX gate passes when none of the keys exist.
+        assert_eq!(
+            cmd(&mut c, &["MSETEX", "2", "f", "6", "g", "7", "NX"]).await,
+            ":1\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "f"]).await, "$1\r\n6\r\n");
+        // XX gate passes when ALL keys exist (a, b were set above).
+        assert_eq!(
+            cmd(&mut c, &["MSETEX", "2", "a", "10", "b", "20", "XX"]).await,
+            ":1\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "a"]).await, "$2\r\n10\r\n");
+        // XX gate fails if any key is missing -> 0, nothing written.
+        assert_eq!(
+            cmd(&mut c, &["MSETEX", "2", "a", "99", "zzz", "0", "XX"]).await,
+            ":0\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["EXISTS", "zzz"]).await, ":0\r\n");
+        assert_eq!(cmd(&mut c, &["GET", "a"]).await, "$2\r\n10\r\n");
+        // KEEPTTL preserves each key's existing TTL across the overwrite (c still ~100s).
+        assert_eq!(
+            cmd(&mut c, &["MSETEX", "1", "c", "30", "KEEPTTL"]).await,
+            ":1\r\n"
+        );
+        assert_eq!(cmd(&mut c, &["GET", "c"]).await, "$2\r\n30\r\n");
+        assert_eq!(cmd(&mut c, &["TTL", "c"]).await, ":100\r\n");
+        // Errors: numkeys must be positive; too few pairs for numkeys; NX+XX; bad/zero expire.
+        let zero = cmd(&mut c, &["MSETEX", "0", "a", "1"]).await;
+        assert!(zero.starts_with("-ERR"), "numkeys 0 -> error, got {zero:?}");
+        let short = cmd(&mut c, &["MSETEX", "2", "a", "1"]).await;
+        assert!(
+            short.starts_with("-ERR"),
+            "too few pairs -> error, got {short:?}"
+        );
+        let both = cmd(&mut c, &["MSETEX", "1", "a", "1", "NX", "XX"]).await;
+        assert!(
+            both.starts_with("-ERR syntax error"),
+            "NX+XX -> syntax, got {both:?}"
+        );
+        let badex = cmd(&mut c, &["MSETEX", "1", "a", "1", "EX", "notanum"]).await;
+        assert!(badex.starts_with("-ERR"), "bad EX -> error, got {badex:?}");
+        let zeroex = cmd(&mut c, &["MSETEX", "1", "a", "1", "EX", "0"]).await;
+        assert!(
+            zeroex.starts_with("-ERR") && zeroex.contains("expire"),
+            "EX 0 -> invalid expire, got {zeroex:?}"
+        );
+    });
+}

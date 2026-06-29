@@ -219,6 +219,8 @@ pub(crate) mod tests {
             b"MGET",
             b"MSET",
             b"MSETNX",
+            b"MSETEX",
+            b"DELIFEQ",
             // Keyspace
             b"DEL",
             b"EXISTS",
@@ -555,11 +557,12 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            192,
-            "the dispatch-arm hand-list drifted from the 180 client commands (incl. LOLWUT, \
+            194,
+            "the dispatch-arm hand-list drifted from the 182 client commands (incl. LOLWUT, \
              #414 command-surface completeness, + the 12 hash-field-TTL commands HEXPIRE/\
              HPEXPIRE/HEXPIREAT/HPEXPIREAT/HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME/HPERSIST + the \
-             HGETDEL/HGETEX/HSETEX accessors, #408, \
+             HGETDEL/HGETEX/HSETEX accessors, #408, + the native CAS + bulk-TTL primitives \
+             MSETEX/DELIFEQ (SET IFEQ/IFNE is an option, not an arm), #412, \
              + SAVE/BGSAVE/\
              LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown, + the drop-in\
              compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO, \

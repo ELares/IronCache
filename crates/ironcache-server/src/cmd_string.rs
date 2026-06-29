@@ -311,12 +311,33 @@ pub fn cmd_mget<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
 /// The parsed SET option set (COMMANDS.md cross-cutting flags). Conflicting
 /// options (`NX`+`XX`, more than one of `EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`) are a
 /// syntax error.
+///
+/// The condition options (`NX`, `XX`, `IFEQ`, `IFNE`) are MUTUALLY EXCLUSIVE (Redis
+/// 8.4 compare-and-set, #412): at most one may appear. `IFEQ`/`IFNE` each carry their
+/// comparison value (the arg after the keyword). The digest variants `IFDEQ`/`IFDNE`
+/// are NOT implemented (they hash the value with Redis's internal digest, which we do
+/// not reproduce byte-for-byte; left as a documented follow-up).
 #[derive(Debug, Default)]
 struct SetOptions {
     nx: bool,
     xx: bool,
+    /// `IFEQ value`: write ONLY if the current value equals this. A missing key fails
+    /// the condition (Redis: "if the key doesn't exist, it won't be created").
+    ifeq: Option<Bytes>,
+    /// `IFNE value`: write ONLY if the current value does NOT equal this. A missing key
+    /// SATISFIES the condition (Redis: the key "will be created").
+    ifne: Option<Bytes>,
     get: bool,
     ttl: TtlOption,
+}
+
+impl SetOptions {
+    /// Whether any mutually-exclusive write condition (`NX`/`XX`/`IFEQ`/`IFNE`) is set.
+    /// A second condition keyword is a syntax error (Redis 8.4: the condition options are
+    /// mutually exclusive).
+    fn has_condition(&self) -> bool {
+        self.nx || self.xx || self.ifeq.is_some() || self.ifne.is_some()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -362,18 +383,36 @@ fn parse_set_options(args: &[Bytes], now: UnixMillis) -> Result<SetOptions, SetP
         let up = ascii_upper(&args[i]);
         match up.as_slice() {
             b"NX" => {
-                if opts.nx || opts.xx {
+                if opts.has_condition() {
                     return Err(SetParseError::Syntax);
                 }
                 opts.nx = true;
                 i += 1;
             }
             b"XX" => {
-                if opts.nx || opts.xx {
+                if opts.has_condition() {
                     return Err(SetParseError::Syntax);
                 }
                 opts.xx = true;
                 i += 1;
+            }
+            // IFEQ/IFNE (Redis 8.4 compare-and-set, #412): each consumes the NEXT arg as
+            // its comparison value POSITIONALLY, so a comparison value that looks like an
+            // option (e.g. `IFEQ NX`) is taken literally, never re-parsed. A second
+            // condition keyword or a missing value is a syntax error.
+            b"IFEQ" => {
+                if opts.has_condition() || i + 1 >= args.len() {
+                    return Err(SetParseError::Syntax);
+                }
+                opts.ifeq = Some(args[i + 1].clone());
+                i += 2;
+            }
+            b"IFNE" => {
+                if opts.has_condition() || i + 1 >= args.len() {
+                    return Err(SetParseError::Syntax);
+                }
+                opts.ifne = Some(args[i + 1].clone());
+                i += 2;
             }
             b"GET" => {
                 if opts.get {
@@ -447,11 +486,45 @@ fn now_plus(now: UnixMillis, delta_millis: i64) -> Result<i64, SetParseError> {
         .ok_or(SetParseError::InvalidExpire)
 }
 
-/// `SET key value [NX|XX] [GET] [EX s|PX ms|EXAT ts|PXAT tms|KEEPTTL]`.
+/// A no-write rmw step returning `reply` (value and TTL untouched): the SET abort path
+/// (a WRONGTYPE old value, or a write condition that did not fire).
+fn keep_reply(reply: Value) -> RmwStep<Value> {
+    RmwStep {
+        action: RmwAction::Keep,
+        expire: ExpireWrite::Unchanged,
+        reply,
+    }
+}
+
+/// Evaluate the SET write condition against the observed old value. `old` is the current
+/// STRING value (`Some`) for an occupied string key, or `None` for a vacant key OR a plain
+/// NX/XX SET that did not observe the value (there `occupied` carries presence). The
+/// condition options are mutually exclusive (the parser enforces it), so at most one branch
+/// applies; a SET with no condition (the fast path) never reaches here.
 ///
-/// Plain SET is a blind `upsert`. Any conditional (NX/XX) or observing (GET) form,
-/// or KEEPTTL, goes through `rmw` so the observe-then-write is atomic. Reply is
+/// - **IFEQ** (Redis 8.4): write only if present AND equal; a missing key FAILS (never
+///   created).
+/// - **IFNE**: write only if absent OR (present AND not equal); a missing key is created.
+/// - **NX** (only if absent) / **XX** (only if present).
+fn write_condition(opts: &SetOptions, old: Option<&[u8]>, occupied: bool) -> bool {
+    if let Some(expected) = &opts.ifeq {
+        old == Some(expected.as_ref())
+    } else if let Some(expected) = &opts.ifne {
+        old != Some(expected.as_ref())
+    } else {
+        (!opts.nx || !occupied) && (!opts.xx || occupied)
+    }
+}
+
+/// `SET key value [NX|XX|IFEQ cmp|IFNE cmp] [GET] [EX s|PX ms|EXAT ts|PXAT tms|KEEPTTL]`.
+///
+/// Plain SET is a blind `upsert`. Any conditional (NX/XX/IFEQ/IFNE) or observing (GET)
+/// form, or KEEPTTL, goes through `rmw` so the observe-then-write is atomic. Reply is
 /// `+OK`/null per Redis, or (with GET) the old value / WRONGTYPE.
+///
+/// IFEQ/IFNE are the Redis 8.4 native compare-and-set options (#412): the write fires only
+/// when the current string value equals (IFEQ) or differs from (IFNE) the comparison value,
+/// collapsing the WATCH/MULTI/EXEC CAS round trip into one server-side step.
 ///
 /// `wheel` registers the resolved deadline after a SET that actually wrote a TTL
 /// (EX/PX/EXAT/PXAT), so the active drain can reclaim it; the lazy backstop in the
@@ -487,8 +560,8 @@ pub fn cmd_set<S: Store>(
         None
     };
 
-    // The fast path: plain SET with no NX/XX/GET is a blind upsert.
-    if !opts.nx && !opts.xx && !opts.get {
+    // The fast path: plain SET with no NX/XX/IFEQ/IFNE/GET is a blind upsert.
+    if !opts.has_condition() && !opts.get {
         store.upsert(db, &req.args[1], NewValue::Bytes(&req.args[2]), expire, now);
         if let Some(at) = set_deadline {
             wheel.register(db, &req.args[1], at);
@@ -497,49 +570,52 @@ pub fn cmd_set<S: Store>(
     }
 
     // The conditional / observing path: one atomic rmw observes the old value,
-    // applies NX/XX, captures GET's old value, and writes.
+    // applies the write condition (NX/XX/IFEQ/IFNE), captures GET's old value, and writes.
     let key = req.args[1].clone();
     let new_val = req.args[2].clone();
     // Tracks whether the rmw actually performed the write (so the deadline is
-    // registered only when a TTL was really set, not on an NX/XX no-op or WRONGTYPE).
+    // registered only when a TTL was really set, not on a condition no-op or WRONGTYPE).
     let mut wrote = false;
     let reply = store.rmw(db, &key, now, |entry| {
         let occupied = matches!(entry, RmwEntry::Occupied(_));
+        // We must observe the old value only when GET returns it or IFEQ/IFNE compares it.
+        // A plain NX/XX SET skips the read (presence alone gates it).
+        let need_old = opts.get || opts.ifeq.is_some() || opts.ifne.is_some();
 
-        // GET (and the WRONGTYPE check it forces) observes the old value first.
-        let mut get_reply: Option<Value> = None;
-        if opts.get {
+        // Observe ONCE: compute the write condition and GET's reply together. A non-string
+        // old value is WRONGTYPE for GET or an IFEQ/IFNE compare (aborts with no write).
+        // IFEQ/IFNE compare the value IN PLACE (no copy on the CAS hot path); only GET
+        // copies it out for the reply.
+        let (allowed, get_reply) = if need_old {
             match &entry {
                 RmwEntry::Occupied(o) if o.data_type() == DataType::String => {
-                    get_reply = Some(Value::BulkString(Some(Bytes::copy_from_slice(
-                        o.as_bytes(),
-                    ))));
+                    let cur = o.as_bytes();
+                    (
+                        write_condition(&opts, Some(cur), occupied),
+                        opts.get
+                            .then(|| Value::BulkString(Some(Bytes::copy_from_slice(cur)))),
+                    )
                 }
                 RmwEntry::Occupied(_) => {
                     // WRONGTYPE on the old value aborts the SET with no write.
-                    return RmwStep {
-                        action: RmwAction::Keep,
-                        expire: ExpireWrite::Unchanged,
-                        reply: Value::error(ErrorReply::wrong_type()),
-                    };
+                    return keep_reply(Value::error(ErrorReply::wrong_type()));
                 }
-                RmwEntry::Vacant => get_reply = Some(Value::Null),
+                RmwEntry::Vacant => (
+                    write_condition(&opts, None, occupied),
+                    opts.get.then_some(Value::Null),
+                ),
                 // The read-only `rmw` primitive never yields the in-place-mutation
                 // arm (that comes only from `rmw_mut`); this is unreachable here.
                 RmwEntry::OccupiedMut(_) => unreachable!("cmd_set uses rmw, not rmw_mut"),
             }
-        }
+        } else {
+            (write_condition(&opts, None, occupied), None)
+        };
 
-        // NX (only if absent) / XX (only if present) gate the write.
-        let allowed = (!opts.nx || !occupied) && (!opts.xx || occupied);
         if !allowed {
-            // Condition not met: no write. Reply is the GET old value if GET was
-            // given, else null (Redis: SET ... NX/XX that does not fire -> nil).
-            return RmwStep {
-                action: RmwAction::Keep,
-                expire: ExpireWrite::Unchanged,
-                reply: get_reply.unwrap_or(Value::Null),
-            };
+            // Condition not met: no write. Reply is the GET old value if GET was given,
+            // else null (Redis: a SET condition that does not fire -> nil).
+            return keep_reply(get_reply.unwrap_or(Value::Null));
         }
 
         // Write the new value with the resolved TTL effect.
@@ -659,6 +735,181 @@ pub fn cmd_mset<S: Store>(
         i += 2;
     }
     Value::ok()
+}
+
+/// `DELIFEQ key value` -> `1` if the key was deleted (it held a STRING exactly equal to
+/// `value`), `0` if it was not (the key is missing, or its value differs). WRONGTYPE if the
+/// key holds a non-string value (Valkey 9.0 compare-and-delete, #412).
+///
+/// The lock-release / leader-key pattern: a holder deletes its key ONLY if the value is
+/// still its own token, atomically, instead of GET-then-DEL (which can delete another
+/// holder's freshly-written token after a TTL flip). One atomic `rmw`: observe the value,
+/// compare IN PLACE (no copy), and delete on a match. NOT denyoom (a delete only frees
+/// memory, like DEL/GETDEL).
+pub fn cmd_delifeq<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("delifeq"));
+    }
+    let expected = req.args[2].clone();
+    store.rmw(db, &req.args[1], now, move |entry| match entry {
+        RmwEntry::Vacant => keep_reply(Value::Integer(0)),
+        RmwEntry::Occupied(o) if o.data_type() != DataType::String => {
+            keep_reply(Value::error(ErrorReply::wrong_type()))
+        }
+        RmwEntry::Occupied(o) => {
+            if o.as_bytes() == expected.as_ref() {
+                RmwStep {
+                    action: RmwAction::Delete,
+                    expire: ExpireWrite::Unchanged,
+                    reply: Value::Integer(1),
+                }
+            } else {
+                keep_reply(Value::Integer(0))
+            }
+        }
+        // Unreachable: DELIFEQ uses the read-only `rmw`, never `rmw_mut`.
+        RmwEntry::OccupiedMut(_) => unreachable!("cmd_delifeq uses rmw, not rmw_mut"),
+    })
+}
+
+/// `MSETEX numkeys key value [key value ...] [NX | XX] [EX s | PX ms | EXAT ts | PXAT tms |
+/// KEEPTTL]` -> `1` if all keys were set, `0` if the NX/XX condition was not met (Redis 8.4
+/// atomic multi-key set with a shared expiration, #412; extends MSET/MSETNX with the SET
+/// expiration options).
+///
+/// - **No NX/XX**: always sets every key (reply `1`).
+/// - **NX**: sets all only if NONE of the keys exist; **XX**: only if ALL exist. The gate is
+///   evaluated over every key BEFORE any write, so it is all-or-nothing (reply `0` on a miss,
+///   nothing written). An expired key counts as absent.
+/// - The expiration option applies the SAME deadline to every key; with KEEPTTL each key
+///   keeps its existing TTL; with NO option the keys are written WITHOUT a TTL (MSET default,
+///   clearing any prior TTL). A `denyoom` write.
+///
+/// `numkeys` is the COUNT of key/value PAIRS; the keys sit at `args[2]`, `args[4]`, ... (the
+/// strided `MsetexNumkeysStrided` key spec extracts exactly these for the ACL key-pattern
+/// check, so no key bypasses it). This is the SINGLE-SHARD handler (all keys on the accept
+/// shard, like MSETNX); a cross-shard spanning form is deferred to the coordinator.
+#[allow(clippy::too_many_lines)]
+pub fn cmd_msetex<S: Store>(
+    store: &mut S,
+    wheel: &mut TimingWheel,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+) -> Value {
+    // MSETEX numkeys key value [...] [options]: at least the token + numkeys + one pair.
+    if req.args.len() < 4 {
+        return Value::error(ErrorReply::wrong_arity("msetex"));
+    }
+    // numkeys: a positive integer (the count of key/value pairs).
+    let Some(numkeys) = parse_i64(&req.args[1]) else {
+        return Value::error(ErrorReply::not_an_integer());
+    };
+    if numkeys <= 0 {
+        return Value::error(ErrorReply::numkeys_should_be_positive());
+    }
+    let numkeys = numkeys as usize;
+    // The pairs occupy args[2 .. pairs_end]; reject an overflow or too-few-args-for-numkeys.
+    let Some(pairs_end) = numkeys.checked_mul(2).and_then(|n| n.checked_add(2)) else {
+        return Value::error(ErrorReply::wrong_arity("msetex"));
+    };
+    if pairs_end > req.args.len() {
+        return Value::error(ErrorReply::wrong_arity("msetex"));
+    }
+
+    // Parse the option tail (after the pairs): NX|XX (mutually exclusive) and at most one
+    // expiration option. GET is NOT an MSETEX option (unlike SET).
+    let mut nx = false;
+    let mut xx = false;
+    let mut ttl = TtlOption::None;
+    let mut ttl_seen = false;
+    let mut i = pairs_end;
+    while i < req.args.len() {
+        let up = ascii_upper(&req.args[i]);
+        match up.as_slice() {
+            b"NX" => {
+                if nx || xx {
+                    return Value::error(ErrorReply::syntax_error());
+                }
+                nx = true;
+                i += 1;
+            }
+            b"XX" => {
+                if nx || xx {
+                    return Value::error(ErrorReply::syntax_error());
+                }
+                xx = true;
+                i += 1;
+            }
+            b"KEEPTTL" => {
+                if ttl_seen {
+                    return Value::error(ErrorReply::syntax_error());
+                }
+                ttl_seen = true;
+                ttl = TtlOption::Keep;
+                i += 1;
+            }
+            kw @ (b"EX" | b"PX" | b"EXAT" | b"PXAT") => {
+                if ttl_seen || i + 1 >= req.args.len() {
+                    return Value::error(ErrorReply::syntax_error());
+                }
+                ttl_seen = true;
+                let Some(n) = parse_i64(&req.args[i + 1]) else {
+                    return Value::error(ErrorReply::not_an_integer());
+                };
+                match resolve_ttl(kw, n, now) {
+                    Ok(at) => ttl = TtlOption::Set(at),
+                    Err(_) => return Value::error(ErrorReply::invalid_expire_time("msetex")),
+                }
+                i += 2;
+            }
+            _ => return Value::error(ErrorReply::syntax_error()),
+        }
+    }
+
+    let expire = match ttl {
+        TtlOption::None => ExpireWrite::Clear,
+        TtlOption::Keep => ExpireWrite::Keep,
+        TtlOption::Set(at) => ExpireWrite::Set(at),
+    };
+    let set_deadline = if let TtlOption::Set(at) = ttl {
+        Some(at)
+    } else {
+        None
+    };
+
+    // The NX/XX gate over EVERY key first (atomic all-or-nothing): NX requires every key
+    // absent, XX requires every key present. An expired key counts as absent (lazy expiry via
+    // `contains(now)`). On a miss, nothing is written and the reply is 0. There is no
+    // concurrency within this single-shard handler, so the gather-then-write is atomic.
+    if nx || xx {
+        let mut j = 2;
+        while j < pairs_end {
+            let exists = store.contains(db, &req.args[j], now);
+            if (nx && exists) || (xx && !exists) {
+                return Value::Integer(0);
+            }
+            j += 2;
+        }
+    }
+
+    // Gate passed (or unconditional): blind-upsert every pair with the shared expire effect,
+    // registering each key's deadline in the wheel when a TTL was set.
+    let mut j = 2;
+    while j < pairs_end {
+        store.upsert(
+            db,
+            &req.args[j],
+            NewValue::Bytes(&req.args[j + 1]),
+            expire,
+            now,
+        );
+        if let Some(at) = set_deadline {
+            wheel.register(db, &req.args[j], at);
+        }
+        j += 2;
+    }
+    Value::Integer(1)
 }
 
 // ---------------------------------------------------------------------------

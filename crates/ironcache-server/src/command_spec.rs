@@ -160,6 +160,13 @@ pub enum KeySpecKind {
     /// `numkeys` at `args[1]`, keys=`args[2..2+numkeys]` (ZUNION/ZINTER/ZDIFF/ZINTERCARD/
     /// SINTERCARD; any trailing LIMIT/WEIGHTS option is after the keys).
     NumkeysAtArg1,
+    /// MSETEX: `numkeys` at `args[1]`, then `numkeys` key/value PAIRS, so the keys are
+    /// STRIDED at `args[2]`, `args[4]`, ... (the interleaved values are NOT keys); trailing
+    /// NX/XX/expire options follow the pairs. Distinct from [`KeySpecKind::NumkeysAtArg1`]
+    /// (contiguous keys) and [`KeySpecKind::MsetStrided`] (no `numkeys` prefix, whole tail).
+    /// Extracting EXACTLY these keys is what gates every MSETEX key through the ACL
+    /// key-pattern check (the Redis 8.6 MSETEX ACL-bypass fix, #412).
+    MsetexNumkeysStrided,
     /// dest=`args[1]`, `numkeys` at `args[2]`, source keys=`args[3..3+numkeys]`; the dest
     /// joins the routed set (ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE).
     ZstoreDestNumkeysAtArg2,
@@ -674,6 +681,22 @@ pub fn extract_keys(kind: KeySpecKind, req: &Request) -> KeySpec<'_> {
             }
             keys_range(req, 2, 2 + numkeys)
         }
+        // MSETEX numkeys key value [key value ...]: keys STRIDED at args[2], args[4], ...
+        // (numkeys of them); the interleaved values and the trailing options are NOT keys. A
+        // malformed/short request (bad numkeys, or fewer than numkeys pairs) -> None (home).
+        KeySpecKind::MsetexNumkeysStrided => {
+            let Some(numkeys) = req.args.get(1).and_then(|a| parse_count(a)) else {
+                return KeySpec::None;
+            };
+            let Some(pairs_end) = numkeys.checked_mul(2).and_then(|n| n.checked_add(2)) else {
+                return KeySpec::None;
+            };
+            if numkeys == 0 || pairs_end > req.args.len() {
+                return KeySpec::None;
+            }
+            let idxs: Vec<usize> = (2..pairs_end).step_by(2).collect();
+            keys_at(req, &idxs)
+        }
         // dest=args[1], numkeys=args[2], keys=args[3..3+numkeys]; dest joins the set.
         KeySpecKind::ZstoreDestNumkeysAtArg2 => {
             let Some(numkeys) = req.args.get(2).and_then(|a| parse_count(a)) else {
@@ -786,8 +809,8 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
     use Arity::{Exact, Min};
     use CommandClass::{AlwaysHome, KeyedMulti, KeyedSingle, WholeKeyspace};
     use KeySpecKind::{
-        AllFromArg1, Arg1, BitopDestArg2SourcesFrom3, MsetStrided, NumkeysAtArg1, ObjectArg2,
-        SortKeys, TwoKeysArg1Arg2, ZstoreDestNumkeysAtArg2,
+        AllFromArg1, Arg1, BitopDestArg2SourcesFrom3, MsetStrided, MsetexNumkeysStrided,
+        NumkeysAtArg1, ObjectArg2, SortKeys, TwoKeysArg1Arg2, ZstoreDestNumkeysAtArg2,
     };
     let spec: &'static CommandSpec = match cmd_upper {
         // -- Tier-0 / connection (dispatch.rs). --
@@ -1256,12 +1279,37 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: true,
         },
+        // MSETEX numkeys key value [...] [NX|XX] [EX|PX|EXAT|PXAT|KEEPTTL]: atomic multi-key
+        // set with a shared expiration (Redis 8.4, #412). Arity -4 (token + numkeys + >= 1
+        // pair). KeyedMulti with the numkeys-strided key spec (keys at args[2], args[4], ...;
+        // values + options are NOT keys), so every key is gated through the ACL key-pattern
+        // check (the Redis 8.6 ACL-bypass fix). A denyoom WRITE.
+        b"MSETEX" => &CommandSpec {
+            name: b"MSETEX",
+            arity: Min(4),
+            class: KeyedMulti,
+            key_spec: MsetexNumkeysStrided,
+            denyoom: true,
+            control: false,
+            is_write: true,
+        },
         // -- Generic keyspace (cmd_keyspace). --
         b"DEL" => &CommandSpec {
             name: b"DEL",
             arity: Min(2),
             class: KeyedMulti,
             key_spec: AllFromArg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        // DELIFEQ key value: compare-and-delete (Valkey 9.0, #412). Arity 3, KeyedSingle on
+        // args[1]. A WRITE but NOT denyoom (a delete only frees memory, like DEL/GETDEL).
+        b"DELIFEQ" => &CommandSpec {
+            name: b"DELIFEQ",
+            arity: Exact(3),
+            class: KeyedSingle,
+            key_spec: Arg1,
             denyoom: false,
             control: false,
             is_write: true,
@@ -2827,6 +2875,8 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     b"MGET",
     b"MSET",
     b"MSETNX",
+    b"MSETEX",
+    b"DELIFEQ",
     // Keyspace.
     b"DEL",
     b"EXISTS",
@@ -3021,6 +3071,8 @@ pub fn command_key_positions(spec: &CommandSpec) -> (i64, i64, i64, bool) {
         KeySpecKind::BitopDestArg2SourcesFrom3 => (2, -1, 1, true),
         // numkeys at arg 1 -> movable; best-effort first key is arg 2.
         KeySpecKind::NumkeysAtArg1 => (2, 2, 1, true),
+        // MSETEX numkeys at arg 1 -> movable; best-effort first key is arg 2, stride 2.
+        KeySpecKind::MsetexNumkeysStrided => (2, 2, 2, true),
         // dest=1, numkeys at arg 2, sources from 3 -> movable; first key (the dest) is arg 1.
         KeySpecKind::ZstoreDestNumkeysAtArg2 => (1, 1, 1, true),
         // OBJECT <sub> <key> : the key is arg 2 -> movable (the subcommand at arg 1 is not a key).
@@ -3267,6 +3319,7 @@ pub(crate) mod tests {
             b"DECR",
             b"DECRBY",
             b"DEL",
+            b"DELIFEQ",
             b"EXISTS",
             b"EXPIRE",
             b"EXPIREAT",
@@ -3324,6 +3377,7 @@ pub(crate) mod tests {
             b"MGET",
             b"MOVE",
             b"MSET",
+            b"MSETEX",
             b"MSETNX",
             b"OBJECT",
             b"PERSIST",
