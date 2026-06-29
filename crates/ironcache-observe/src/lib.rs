@@ -387,6 +387,14 @@ impl MetricsRegistry {
             .map(|c| c.snapshot())
             .fold(CounterSnapshot::default(), CounterSnapshot::merge)
     }
+
+    /// One [`CounterSnapshot`] per shard, in shard-index order (`[i]` is shard `i`), for the
+    /// per-shard labeled `/metrics` series (#362). Lock-free: each cell is loaded independently. The
+    /// node rollup ([`Self::aggregate`]) is the sum of these.
+    #[must_use]
+    pub fn per_shard_snapshots(&self) -> Vec<CounterSnapshot> {
+        self.cells.iter().map(|c| c.snapshot()).collect()
+    }
 }
 
 /// The raft-mode control-plane gauges the `/metrics` endpoint exposes (HA-4c), read by the
@@ -563,6 +571,102 @@ pub fn render_prometheus(counters: CounterSnapshot, gauges: MetricsGauges) -> St
         );
     }
 
+    o
+}
+
+/// Emit ONE per-shard metric family into `o`: the `# HELP`/`# TYPE` headers once, then one
+/// `{shard="i"}`-labeled sample per shard (the value picked from each shard's snapshot by `pick`).
+fn shard_family(
+    o: &mut String,
+    name: &str,
+    help: &str,
+    kind: &str,
+    per_shard: &[CounterSnapshot],
+    pick: impl Fn(&CounterSnapshot) -> u64,
+) {
+    use core::fmt::Write as _;
+    let _ = write!(o, "# HELP {name} {help}\n# TYPE {name} {kind}\n");
+    for (i, s) in per_shard.iter().enumerate() {
+        let _ = writeln!(o, "{name}{{shard=\"{i}\"}} {}", pick(s));
+    }
+}
+
+/// Render the PER-SHARD labeled `/metrics` series (#362): for each per-shard counter/gauge, an
+/// `ironcache_shard_<name>{shard="i"}` family carrying that shard's value, so the console can render
+/// shard-level (thread-per-core) views in addition to the node rollup.
+///
+/// This is ADDITIVE and uses a DISTINCT `ironcache_shard_*` namespace, so the node-rollup families
+/// from [`render_prometheus`] are byte-unchanged and there is no mixed-label double-count within a
+/// family. Only the counters/gauges with genuine per-shard meaning are labeled; process-global
+/// gauges (uptime, allocator memory, raft) stay node-level in [`render_prometheus`]. The caller
+/// appends this to the rollup body; with one shard each family carries a single `shard="0"` sample.
+#[must_use]
+pub fn render_prometheus_shards(per_shard: &[CounterSnapshot]) -> String {
+    let mut o = String::with_capacity(per_shard.len() * 256 + 256);
+    shard_family(
+        &mut o,
+        "ironcache_shard_connections_received_total",
+        "Connections accepted since start, per shard.",
+        "counter",
+        per_shard,
+        |s| s.connections_received,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_commands_processed_total",
+        "Commands processed since start, per shard.",
+        "counter",
+        per_shard,
+        |s| s.commands_processed,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_evicted_keys_total",
+        "Keys evicted to honor the memory ceiling, per shard.",
+        "counter",
+        per_shard,
+        |s| s.evicted_keys,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_expired_keys_total",
+        "Keys reclaimed because their TTL passed, per shard.",
+        "counter",
+        per_shard,
+        |s| s.expired_keys,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_keyspace_hits_total",
+        "Read commands that found a live key, per shard.",
+        "counter",
+        per_shard,
+        |s| s.keyspace_hits,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_keyspace_misses_total",
+        "Read commands that found no live key, per shard.",
+        "counter",
+        per_shard,
+        |s| s.keyspace_misses,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_connected_clients",
+        "Currently-open client connections, per shard.",
+        "gauge",
+        per_shard,
+        |s| s.connected_clients,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_keyspace_keys",
+        "Live keys held, per shard.",
+        "gauge",
+        per_shard,
+        |s| s.keyspace_keys,
+    );
     o
 }
 
@@ -1382,6 +1486,48 @@ mod tests {
     use super::*;
     use ironcache_env::{Monotonic, TestEnv};
     use std::time::Duration;
+
+    #[test]
+    fn per_shard_render_labels_each_shard_in_a_distinct_namespace() {
+        // Two shards with distinct values: each per-shard family carries one labeled sample per
+        // shard, in the additive `ironcache_shard_*` namespace (#362).
+        let per_shard = vec![
+            CounterSnapshot {
+                commands_processed: 10,
+                keyspace_hits: 3,
+                keyspace_keys: 100,
+                ..CounterSnapshot::default()
+            },
+            CounterSnapshot {
+                commands_processed: 20,
+                keyspace_hits: 7,
+                keyspace_keys: 200,
+                ..CounterSnapshot::default()
+            },
+        ];
+        let out = render_prometheus_shards(&per_shard);
+        assert!(out.contains("# TYPE ironcache_shard_commands_processed_total counter\n"));
+        assert!(out.contains("ironcache_shard_commands_processed_total{shard=\"0\"} 10\n"));
+        assert!(out.contains("ironcache_shard_commands_processed_total{shard=\"1\"} 20\n"));
+        assert!(out.contains("ironcache_shard_keyspace_hits_total{shard=\"0\"} 3\n"));
+        assert!(out.contains("ironcache_shard_keyspace_hits_total{shard=\"1\"} 7\n"));
+        // Gauges with per-shard meaning are labeled too.
+        assert!(out.contains("# TYPE ironcache_shard_keyspace_keys gauge\n"));
+        assert!(out.contains("ironcache_shard_keyspace_keys{shard=\"1\"} 200\n"));
+        // Additive: the per-shard block does NOT re-emit the unlabeled node-rollup series (no
+        // mixed-label double-count within a family).
+        assert!(!out.contains("\nironcache_commands_processed_total "));
+        assert!(!out.contains("ironcache_commands_processed_total{"));
+    }
+
+    #[test]
+    fn per_shard_snapshots_yields_one_per_registered_shard() {
+        let reg = MetricsRegistry::new(3);
+        assert_eq!(reg.shards(), 3);
+        assert_eq!(reg.per_shard_snapshots().len(), 3);
+        // A single-shard registry still yields exactly one snapshot (one `shard="0"` sample).
+        assert_eq!(MetricsRegistry::new(1).per_shard_snapshots().len(), 1);
+    }
 
     fn server() -> ServerInfo {
         ServerInfo {

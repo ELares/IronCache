@@ -266,8 +266,13 @@ impl MetricsState {
         let path = path.split('?').next().unwrap_or(path);
         match path {
             "/metrics" => {
-                let body =
+                // The node rollup (unchanged), then the additive per-shard labeled detail (#362):
+                // `ironcache_shard_*{shard="i"}` series so the console can render shard-level views.
+                let mut body =
                     ironcache_observe::render_prometheus(self.registry.aggregate(), self.gauges());
+                body.push_str(&ironcache_observe::render_prometheus_shards(
+                    &self.registry.per_shard_snapshots(),
+                ));
                 http_response(
                     200,
                     "OK",
@@ -552,6 +557,16 @@ mod tests {
         // 5 + 3 commands aggregated across the two shards.
         assert!(
             text.contains("ironcache_commands_processed_total 8\n"),
+            "{text}"
+        );
+        // Per-shard labeled detail (#362): the SAME scrape carries the additive
+        // `ironcache_shard_*{shard="i"}` series, here 5 on shard 0 and 3 on shard 1.
+        assert!(
+            text.contains("ironcache_shard_commands_processed_total{shard=\"0\"} 5\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ironcache_shard_commands_processed_total{shard=\"1\"} 3\n"),
             "{text}"
         );
         assert!(text.contains("ironcache_uptime_seconds"), "{text}");
