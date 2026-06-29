@@ -2481,6 +2481,8 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
         _ => return Value::error(ErrorReply::syntax_error()),
     };
     let mut noloop = false;
+    let mut bcast = false;
+    let mut prefixes: Vec<bytes::Bytes> = Vec::new();
     let mut i = 3;
     while i < req.args.len() {
         let opt = ascii_upper(&req.args[i]);
@@ -2489,14 +2491,45 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
                 noloop = true;
                 i += 1;
             }
-            b"BCAST" | b"OPTIN" | b"OPTOUT" | b"REDIRECT" | b"PREFIX" => {
+            b"BCAST" => {
+                bcast = true;
+                i += 1;
+            }
+            b"PREFIX" => {
+                if i + 1 >= req.args.len() {
+                    return Value::error(ErrorReply::syntax_error());
+                }
+                prefixes.push(req.args[i + 1].clone());
+                i += 2;
+            }
+            // Stages 3-4: rejected loudly so a client is never silently given the wrong mode.
+            b"OPTIN" | b"OPTOUT" | b"REDIRECT" => {
                 return Value::error(ErrorReply::err(format!(
-                    "CLIENT TRACKING {} is not supported yet (this build implements ON/OFF/NOLOOP; \
-                     BCAST/OPTIN/OPTOUT/REDIRECT/PREFIX are tracked follow-ups)",
+                    "CLIENT TRACKING {} is not supported yet (this build implements \
+                     ON/OFF/NOLOOP/BCAST/PREFIX; OPTIN/OPTOUT/REDIRECT are tracked follow-ups)",
                     String::from_utf8_lossy(&opt)
                 )));
             }
             _ => return Value::error(ErrorReply::syntax_error()),
+        }
+    }
+    // PREFIX requires BCAST (Redis), and the prefixes must not overlap (one being a prefix of
+    // another would double-deliver an invalidation).
+    if !prefixes.is_empty() && !bcast {
+        return Value::error(ErrorReply::err(
+            "PREFIX option requires BCAST mode to be enabled",
+        ));
+    }
+    for a in 0..prefixes.len() {
+        for b in 0..prefixes.len() {
+            if a != b && prefixes[a].starts_with(prefixes[b].as_ref()) {
+                return Value::error(ErrorReply::err(format!(
+                    "Prefix '{}' overlaps with an existing prefix '{}'. Prefixes for a single \
+                     client must not overlap.",
+                    String::from_utf8_lossy(&prefixes[a]),
+                    String::from_utf8_lossy(&prefixes[b])
+                )));
+            }
         }
     }
     if on {
@@ -2508,9 +2541,13 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
         }
         state.tracking_on = true;
         state.tracking_noloop = noloop;
+        state.tracking_bcast = bcast;
+        state.tracking_prefixes = prefixes;
     } else {
         state.tracking_on = false;
         state.tracking_noloop = false;
+        state.tracking_bcast = false;
+        state.tracking_prefixes.clear();
     }
     Value::ok()
 }
@@ -2525,6 +2562,9 @@ fn cmd_client_trackinginfo(state: &ConnState, req: &Request) -> Value {
     }
     let flags = if state.tracking_on {
         let mut f = vec![Value::bulk_str("on")];
+        if state.tracking_bcast {
+            f.push(Value::bulk_str("bcast"));
+        }
         if state.tracking_noloop {
             f.push(Value::bulk_str("noloop"));
         }
@@ -2533,10 +2573,16 @@ fn cmd_client_trackinginfo(state: &ConnState, req: &Request) -> Value {
         vec![Value::bulk_str("off")]
     };
     let redirect = if state.tracking_on { 0 } else { -1 };
+    // In BCAST mode the prefixes are reported (an empty list means the EMPTY prefix = all keys).
+    let prefixes: Vec<Value> = state
+        .tracking_prefixes
+        .iter()
+        .map(|p| Value::bulk(p.clone()))
+        .collect();
     Value::Map(vec![
         (Value::bulk_str("flags"), Value::Array(Some(flags))),
         (Value::bulk_str("redirect"), Value::Integer(redirect)),
-        (Value::bulk_str("prefixes"), Value::Array(Some(Vec::new()))),
+        (Value::bulk_str("prefixes"), Value::Array(Some(prefixes))),
     ])
 }
 

@@ -304,11 +304,12 @@ fn tracking_resp2_gate_and_trackinginfo_and_off() {
             b"off"
         ));
 
-        // An unsupported option is rejected loudly (not silently mis-moded).
-        let bcast = cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKING", b"ON", b"BCAST"]).await;
+        // A still-unsupported option (OPTIN, stage 3) is rejected loudly, not silently mis-moded.
+        // (BCAST is supported as of stage 2; it has its own tests.)
+        let optin = cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKING", b"ON", b"OPTIN"]).await;
         assert!(
-            matches!(&bcast, Resp::Error(_)),
-            "BCAST must be a loud not-yet-supported error"
+            matches!(&optin, Resp::Error(_)),
+            "OPTIN must be a loud not-yet-supported error"
         );
     });
 }
@@ -334,5 +335,129 @@ fn tracking_flushall_invalidates_everything() {
             .await
             .expect("FLUSHALL must invalidate everything");
         assert_invalidate(&inv, None);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// BCAST mode (#409 stage 2): prefix-based broadcast tracking. A BCAST client does NOT
+// register reads; its PREFIX subscriptions invalidate on every matching changed key (sticky).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tracking_bcast_prefix_only_invalidates_matching_keys() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut a = connect_retry(port).await;
+        let mut b = connect_retry(port).await;
+        let (mut ab, mut bb) = (Vec::new(), Vec::new());
+
+        hello3(&mut a, &mut ab).await;
+        // BCAST with a prefix: A tracks "user:*" WITHOUT reading anything.
+        assert_eq!(
+            cmd(
+                &mut a,
+                &mut ab,
+                &[b"CLIENT", b"TRACKING", b"ON", b"BCAST", b"PREFIX", b"user:"]
+            )
+            .await,
+            Resp::Simple(b"OK".to_vec())
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // A matching key change -> A is invalidated with the changed key.
+        cmd(&mut b, &mut bb, &[b"SET", b"user:1", b"v"]).await;
+        let inv = read_timeout(&mut a, &mut ab, 1000)
+            .await
+            .expect("matching prefix must invalidate");
+        assert_invalidate(&inv, Some(&[b"user:1"]));
+
+        // BCAST is STICKY: a SECOND matching key still invalidates (no re-subscribe needed).
+        cmd(&mut b, &mut bb, &[b"SET", b"user:2", b"v"]).await;
+        let inv2 = read_timeout(&mut a, &mut ab, 1000)
+            .await
+            .expect("BCAST is sticky");
+        assert_invalidate(&inv2, Some(&[b"user:2"]));
+
+        // A NON-matching key change -> A receives NOTHING.
+        cmd(&mut b, &mut bb, &[b"SET", b"other:1", b"v"]).await;
+        assert!(
+            read_timeout(&mut a, &mut ab, 300).await.is_none(),
+            "a key outside the prefix must NOT invalidate a BCAST client"
+        );
+    });
+}
+
+#[test]
+fn tracking_bcast_empty_prefix_tracks_all_keys() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut a = connect_retry(port).await;
+        let mut b = connect_retry(port).await;
+        let (mut ab, mut bb) = (Vec::new(), Vec::new());
+
+        hello3(&mut a, &mut ab).await;
+        // BCAST with NO prefix = the empty prefix = track ALL keys.
+        cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKING", b"ON", b"BCAST"]).await;
+        // TRACKINGINFO reports the bcast flag.
+        assert!(trackinginfo_flag(
+            &cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKINGINFO"]).await,
+            b"bcast"
+        ));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        cmd(&mut b, &mut bb, &[b"SET", b"anything", b"v"]).await;
+        let inv = read_timeout(&mut a, &mut ab, 1000)
+            .await
+            .expect("empty-prefix BCAST tracks all");
+        assert_invalidate(&inv, Some(&[b"anything"]));
+    });
+}
+
+#[test]
+fn tracking_bcast_prefix_validation() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut a = connect_retry(port).await;
+        let mut ab = Vec::new();
+        hello3(&mut a, &mut ab).await;
+
+        // PREFIX without BCAST is rejected.
+        let no_bcast = cmd(
+            &mut a,
+            &mut ab,
+            &[b"CLIENT", b"TRACKING", b"ON", b"PREFIX", b"x"],
+        )
+        .await;
+        assert!(
+            matches!(&no_bcast, Resp::Error(e) if String::from_utf8_lossy(e).contains("BCAST")),
+            "PREFIX without BCAST must error, got {no_bcast:?}"
+        );
+
+        // Overlapping prefixes are rejected (foo is a prefix of foobar).
+        let overlap = cmd(
+            &mut a,
+            &mut ab,
+            &[
+                b"CLIENT",
+                b"TRACKING",
+                b"ON",
+                b"BCAST",
+                b"PREFIX",
+                b"foo",
+                b"PREFIX",
+                b"foobar",
+            ],
+        )
+        .await;
+        assert!(
+            matches!(&overlap, Resp::Error(e) if String::from_utf8_lossy(e).contains("overlaps")),
+            "overlapping prefixes must error, got {overlap:?}"
+        );
     });
 }
