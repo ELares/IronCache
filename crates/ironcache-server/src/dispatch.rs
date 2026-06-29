@@ -1376,6 +1376,15 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"HSTRLEN" => cmd_hash::cmd_hstrlen(store, db, now, req),
         b"HINCRBY" => cmd_hash::cmd_hincrby(store, db, now, req),
         b"HINCRBYFLOAT" => cmd_hash::cmd_hincrbyfloat(store, db, now, req),
+        b"HEXPIRE" => cmd_hash::cmd_hexpire(store, db, now, req),
+        b"HPEXPIRE" => cmd_hash::cmd_hpexpire(store, db, now, req),
+        b"HEXPIREAT" => cmd_hash::cmd_hexpireat(store, db, now, req),
+        b"HPEXPIREAT" => cmd_hash::cmd_hpexpireat(store, db, now, req),
+        b"HTTL" => cmd_hash::cmd_httl(store, db, now, req),
+        b"HPTTL" => cmd_hash::cmd_hpttl(store, db, now, req),
+        b"HEXPIRETIME" => cmd_hash::cmd_hexpiretime(store, db, now, req),
+        b"HPEXPIRETIME" => cmd_hash::cmd_hpexpiretime(store, db, now, req),
+        b"HPERSIST" => cmd_hash::cmd_hpersist(store, db, now, req),
         b"HRANDFIELD" => {
             // HRANDFIELD's randomness enters through the Env RNG seam (ADR-0003,
             // KEYSPACE.md): the CALLER draws the seed here and passes it in; the store +

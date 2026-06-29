@@ -568,14 +568,36 @@ type HashEntry = (Box<[u8]>, Box<[u8]>);
 /// any field-or-value byte length exceeds the per-element byte cap (64). A running
 /// field+value byte total is kept for O(1) accounting. The reported
 /// encoding is a pure function of the active form (`listpack` vs `hashtable`).
+/// The field/value storage form of a hash, independent of any per-field TTL state. The
+/// listpack/hashtable ratchet (#40) lives here; the per-field TTL side-map lives on the
+/// wrapping [`HashVal`] so a hash without field TTLs pays nothing for them.
 #[derive(Debug, Clone)]
-pub enum HashVal {
+enum HashData {
     /// The small listpack-equivalent form: `(field, value)` pairs in insertion order,
     /// linear-scanned. Reports [`Encoding::ListPack`].
     ListPack(Vec<HashEntry>),
     /// The large hashtable form: a `hashbrown::HashMap`. Reports [`Encoding::HashTable`].
     /// One-way: a hash never converts back to the listpack form (Redis parity).
     HashTable(HashMap<Box<[u8]>, Box<[u8]>>),
+}
+
+/// Per-field expiry deadlines (Redis 7.4 HEXPIRE family). A field present in this map
+/// expires at its absolute deadline; a field absent from it never expires. Kept separate
+/// from the field/value [`HashData`] so the no-TTL hash (the overwhelming common case) holds
+/// no TTL allocation at all.
+type FieldTtls = HashMap<Box<[u8]>, UnixMillis>;
+
+/// A HASH value (PR-6). The field/value pairs live in [`HashData`] (a small listpack-like
+/// form that promotes one-way to a `hashbrown::HashMap`); an OPTIONAL per-field TTL side-map
+/// (#408, Redis 7.4 HEXPIRE) is `None` until the first field TTL is set, so a hash without
+/// field TTLs is byte-identical in memory and on the wire to before this feature. The
+/// reported encoding is a pure function of the active form and whether any field TTL exists
+/// (`listpack` vs `listpackex` for the small form, `hashtable` for the large form).
+#[derive(Debug, Clone)]
+pub struct HashVal {
+    data: HashData,
+    /// `None` while no field carries a TTL (zero cost); `Some` once a field TTL is set.
+    ttls: Option<Box<FieldTtls>>,
 }
 
 impl Default for HashVal {
@@ -589,7 +611,10 @@ impl HashVal {
     /// small listpack form.
     #[must_use]
     pub fn new() -> Self {
-        HashVal::ListPack(Vec::new())
+        HashVal {
+            data: HashData::ListPack(Vec::new()),
+            ttls: None,
+        }
     }
 
     /// The sum of field+value byte lengths (the value-bytes side of accounting and the
@@ -597,20 +622,42 @@ impl HashVal {
     /// or per-entry bookkeeping (the FAM/packing is a #8 follow-up).
     #[must_use]
     pub fn element_bytes(&self) -> usize {
-        match self {
-            HashVal::ListPack(v) => v.iter().map(|(f, val)| f.len() + val.len()).sum(),
-            HashVal::HashTable(m) => m.iter().map(|(f, val)| f.len() + val.len()).sum(),
+        match &self.data {
+            HashData::ListPack(v) => v.iter().map(|(f, val)| f.len() + val.len()).sum(),
+            HashData::HashTable(m) => m.iter().map(|(f, val)| f.len() + val.len()).sum(),
         }
     }
 
-    /// The encoding this hash reports, a PURE FUNCTION of the active form (#40):
-    /// `listpack` for the small form, `hashtable` for the large form.
+    /// The encoding this hash reports, a PURE FUNCTION of the active form (#40) and whether
+    /// any field carries a TTL: `listpack` for the small form with no field TTL, `listpackex`
+    /// for the small form once a field TTL is set (#408, Redis 7.4), and `hashtable` for the
+    /// large form (Redis has no `hashtableex` name).
     #[must_use]
     pub fn encoding(&self) -> Encoding {
-        match self {
-            HashVal::ListPack(_) => Encoding::ListPack,
-            HashVal::HashTable(_) => Encoding::HashTable,
+        match &self.data {
+            HashData::ListPack(_) => {
+                if self.ttls.is_some() {
+                    Encoding::ListPackEx
+                } else {
+                    Encoding::ListPack
+                }
+            }
+            HashData::HashTable(_) => Encoding::HashTable,
         }
+    }
+
+    /// Remove `field`'s per-field expiry deadline if present, freeing the side-map once it is
+    /// empty so a hash that loses its last field TTL returns to the zero-overhead form.
+    /// Returns whether a deadline was removed.
+    fn clear_field_ttl(&mut self, field: &[u8]) -> bool {
+        let Some(ttls) = self.ttls.as_mut() else {
+            return false;
+        };
+        let removed = ttls.remove(field).is_some();
+        if ttls.is_empty() {
+            self.ttls = None;
+        }
+        removed
     }
 
     /// Whether the small listpack form should convert to the hashtable form after an
@@ -635,12 +682,12 @@ impl HashVal {
     /// Promote the small listpack form to the large hashtable form (one-way). A no-op if
     /// already a hashtable.
     fn convert_to_hashtable(&mut self) {
-        if let HashVal::ListPack(v) = self {
+        if let HashData::ListPack(v) = &mut self.data {
             let mut m: HashMap<Box<[u8]>, Box<[u8]>> = HashMap::with_capacity(v.len());
             for (f, val) in v.drain(..) {
                 m.insert(f, val);
             }
-            *self = HashVal::HashTable(m);
+            self.data = HashData::HashTable(m);
         }
     }
 
@@ -666,8 +713,8 @@ impl HashValue for HashVal {
     fn set(&mut self, field: &[u8], value: &[u8], thresholds: &EncodingThresholds) -> bool {
         // Overwrite-in-place if present (no growth); else insert (growth). After an
         // insert into the small form, re-check the listpack -> hashtable transition.
-        match self {
-            HashVal::ListPack(v) => {
+        match &mut self.data {
+            HashData::ListPack(v) => {
                 if let Some(i) = HashVal::listpack_pos(v, field) {
                     v[i].1 = value.to_vec().into_boxed_slice();
                     // An overwrite can still cross the per-element value-byte cap.
@@ -686,7 +733,7 @@ impl HashValue for HashVal {
                     true
                 }
             }
-            HashVal::HashTable(m) => m
+            HashData::HashTable(m) => m
                 .insert(
                     field.to_vec().into_boxed_slice(),
                     value.to_vec().into_boxed_slice(),
@@ -707,15 +754,17 @@ impl HashValue for HashVal {
     }
 
     fn get(&self, field: &[u8]) -> Option<&[u8]> {
-        match self {
-            HashVal::ListPack(v) => HashVal::listpack_pos(v, field).map(|i| v[i].1.as_ref()),
-            HashVal::HashTable(m) => m.get(field).map(std::convert::AsRef::as_ref),
+        match &self.data {
+            HashData::ListPack(v) => HashVal::listpack_pos(v, field).map(|i| v[i].1.as_ref()),
+            HashData::HashTable(m) => m.get(field).map(std::convert::AsRef::as_ref),
         }
     }
 
     fn del(&mut self, field: &[u8]) -> bool {
-        match self {
-            HashVal::ListPack(v) => {
+        // Drop any per-field TTL for the removed field too (and free the side-map if it
+        // becomes empty), so a deleted field leaves no orphan deadline behind.
+        let removed = match &mut self.data {
+            HashData::ListPack(v) => {
                 if let Some(i) = HashVal::listpack_pos(v, field) {
                     v.remove(i);
                     true
@@ -725,21 +774,25 @@ impl HashValue for HashVal {
             }
             // One-way ratchet: a hashtable hash stays a hashtable even as it shrinks
             // (Redis parity), so we do NOT demote back to listpack on removal.
-            HashVal::HashTable(m) => m.remove(field).is_some(),
+            HashData::HashTable(m) => m.remove(field).is_some(),
+        };
+        if removed {
+            self.clear_field_ttl(field);
         }
+        removed
     }
 
     fn contains(&self, field: &[u8]) -> bool {
-        match self {
-            HashVal::ListPack(v) => HashVal::listpack_pos(v, field).is_some(),
-            HashVal::HashTable(m) => m.contains_key(field),
+        match &self.data {
+            HashData::ListPack(v) => HashVal::listpack_pos(v, field).is_some(),
+            HashData::HashTable(m) => m.contains_key(field),
         }
     }
 
     fn len(&self) -> usize {
-        match self {
-            HashVal::ListPack(v) => v.len(),
-            HashVal::HashTable(m) => m.len(),
+        match &self.data {
+            HashData::ListPack(v) => v.len(),
+            HashData::HashTable(m) => m.len(),
         }
     }
 
@@ -755,20 +808,20 @@ impl HashValue for HashVal {
     }
 
     fn is_listpack(&self) -> bool {
-        matches!(self, HashVal::ListPack(_))
+        matches!(self.data, HashData::ListPack(_))
     }
 
     fn pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        match self {
+        match &self.data {
             // The listpack form is already in deterministic INSERTION order.
-            HashVal::ListPack(v) => v
+            HashData::ListPack(v) => v
                 .iter()
                 .map(|(f, val)| (f.to_vec(), val.to_vec()))
                 .collect(),
             // The hashtable form's `hashbrown` iteration order varies run-to-run, so
             // SORT by the fixed-seed stable field hash (then raw bytes) for a
             // deterministic, resize-invariant order (the same order SCAN uses, ADR-0003).
-            HashVal::HashTable(m) => {
+            HashData::HashTable(m) => {
                 let mut out: Vec<(Vec<u8>, Vec<u8>)> = m
                     .iter()
                     .map(|(f, val)| (f.to_vec(), val.to_vec()))
@@ -779,6 +832,59 @@ impl HashValue for HashVal {
                 out
             }
         }
+    }
+
+    // --- Per-field TTL (#408, Redis 7.4 HEXPIRE family). The side-map is allocated only
+    // when a field TTL is set and freed when the last one is cleared/reaped. ---
+
+    fn field_ttl(&self, field: &[u8]) -> Option<UnixMillis> {
+        self.ttls.as_ref().and_then(|t| t.get(field).copied())
+    }
+
+    fn set_field_ttl(&mut self, field: &[u8], deadline: UnixMillis) {
+        self.ttls
+            .get_or_insert_with(|| Box::new(FieldTtls::default()))
+            .insert(field.to_vec().into_boxed_slice(), deadline);
+    }
+
+    fn persist_field(&mut self, field: &[u8]) -> bool {
+        self.clear_field_ttl(field)
+    }
+
+    fn min_field_ttl(&self) -> Option<UnixMillis> {
+        self.ttls.as_ref().and_then(|t| t.values().copied().min())
+    }
+
+    fn has_field_ttls(&self) -> bool {
+        self.ttls.is_some()
+    }
+
+    fn field_ttl_pairs(&self) -> Vec<(Vec<u8>, UnixMillis)> {
+        self.ttls.as_ref().map_or_else(Vec::new, |t| {
+            let mut v: Vec<(Vec<u8>, UnixMillis)> =
+                t.iter().map(|(f, d)| (f.to_vec(), *d)).collect();
+            // Sort by field so the wire/snapshot codec is CANONICAL (the side-map is a HashMap
+            // with run-to-run iteration order; a stable order keeps encode -> decode -> encode
+            // byte-identical, the property the codec round-trip test asserts).
+            v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            v
+        })
+    }
+
+    fn reap_expired_fields(&mut self, now: UnixMillis) -> Vec<Vec<u8>> {
+        let expired: Vec<Vec<u8>> = match self.ttls.as_ref() {
+            Some(ttls) => ttls
+                .iter()
+                .filter(|&(_, &d)| d <= now)
+                .map(|(f, _)| f.to_vec())
+                .collect(),
+            None => return Vec::new(),
+        };
+        for f in &expired {
+            // del() removes the field/value AND its deadline, freeing the side-map when empty.
+            self.del(f);
+        }
+        expired
     }
 }
 
@@ -2217,6 +2323,7 @@ fn encoding_to_u8(e: Encoding) -> u8 {
         Encoding::IntSet => 5,
         Encoding::HashTable => 6,
         Encoding::SkipList => 7,
+        Encoding::ListPackEx => 8,
     }
 }
 
@@ -2230,6 +2337,7 @@ fn encoding_from_u8(b: u8) -> Encoding {
         5 => Encoding::IntSet,
         6 => Encoding::HashTable,
         7 => Encoding::SkipList,
+        8 => Encoding::ListPackEx,
         // 1 (and any unexpected byte, defensively) is EmbStr.
         _ => Encoding::EmbStr,
     }
@@ -3224,6 +3332,52 @@ mod tests {
     /// converting a NEW collection sooner) is covered by the dedicated `encoding_threshold_*` tests
     /// at the end of this module + the registry/runtime tests in `ironcache-config`.
     const TH: &EncodingThresholds = &EncodingThresholds::defaults();
+
+    #[test]
+    fn hash_field_ttl_set_read_persist_and_reap() {
+        let mut h = HashVal::new();
+        h.set(b"a", b"1", TH);
+        h.set(b"b", b"2", TH);
+        h.set(b"c", b"3", TH);
+        // No field TTLs yet: zero-overhead form, encoding unchanged.
+        assert!(!h.has_field_ttls());
+        assert_eq!(h.field_ttl(b"a"), None);
+        assert_eq!(h.min_field_ttl(), None);
+        assert_eq!(h.encoding(), Encoding::ListPack);
+
+        // Set deadlines on two fields.
+        h.set_field_ttl(b"a", UnixMillis(100));
+        h.set_field_ttl(b"b", UnixMillis(50));
+        assert!(h.has_field_ttls());
+        assert_eq!(h.field_ttl(b"a"), Some(UnixMillis(100)));
+        assert_eq!(h.field_ttl(b"b"), Some(UnixMillis(50)));
+        assert_eq!(h.field_ttl(b"c"), None);
+        // The nearest deadline drives the wheel registration.
+        assert_eq!(h.min_field_ttl(), Some(UnixMillis(50)));
+
+        // PERSIST removes one deadline; the field stays.
+        assert!(h.persist_field(b"a"));
+        assert_eq!(h.field_ttl(b"a"), None);
+        assert!(h.contains(b"a"));
+        assert_eq!(h.min_field_ttl(), Some(UnixMillis(50)));
+
+        // Reaping at now=49 removes nothing (b's deadline 50 is still future under `<= now`).
+        assert!(h.reap_expired_fields(UnixMillis(49)).is_empty());
+        // At now=50, b is reaped (deadline <= now): the field AND its deadline are gone.
+        let reaped = h.reap_expired_fields(UnixMillis(50));
+        assert_eq!(reaped, vec![b"b".to_vec()]);
+        assert!(!h.contains(b"b"));
+        assert_eq!(h.field_ttl(b"b"), None);
+        // The last TTL is gone, so the side-map is freed back to the zero-overhead form.
+        assert!(!h.has_field_ttls());
+        assert_eq!(h.min_field_ttl(), None);
+
+        // del() also drops a field's deadline (no orphan deadline survives).
+        h.set_field_ttl(b"a", UnixMillis(200));
+        assert!(h.has_field_ttls());
+        assert!(h.del(b"a"));
+        assert!(!h.has_field_ttls());
+    }
 
     #[test]
     fn int_value_has_no_alloc_and_reports_int() {

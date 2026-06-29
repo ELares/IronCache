@@ -986,6 +986,12 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             .map(Self::view_of)
     }
 
+    // The Store-trait view of the passive-replica flag (HA-7d), so generic command handlers
+    // can gate their lazy field reaping on it exactly as the key-level path gates `expire_if_due`.
+    fn is_passive(&self) -> bool {
+        self.passive
+    }
+
     fn upsert(
         &mut self,
         db: u32,

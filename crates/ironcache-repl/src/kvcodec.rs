@@ -68,6 +68,14 @@ mod enc_tag {
     pub const INTSET: u8 = 5;
     pub const HASHTABLE: u8 = 6;
     pub const SKIPLIST: u8 = 7;
+    // Hash with per-field TTLs (#408). These codec-internal tags signal that a trailing
+    // field-TTL section follows the field/value pairs; OBJECT ENCODING stays listpackex (small)
+    // or hashtable (large). An old decoder that lacks these tags rejects the whole record at the
+    // enc-tag step (`tag_to_enc` returns None for 8/9), so the extension is backward-safe (a
+    // clean decode failure, never a misparse), at the cost of forward-incompatibility (an old
+    // replica/binary cannot read a new field-TTL hash).
+    pub const LISTPACKEX: u8 = 8;
+    pub const HASHTABLEEX: u8 = 9;
 }
 
 /// Map an in-memory [`DataType`] to its wire tag.
@@ -90,6 +98,9 @@ fn enc_to_tag(e: Encoding) -> u8 {
         Encoding::EmbStr => enc_tag::EMBSTR,
         Encoding::Raw => enc_tag::RAW,
         Encoding::ListPack => enc_tag::LISTPACK,
+        // A small hash with field TTLs. The large-with-TTL case has Encoding::HashTable and is
+        // tagged HASHTABLEEX directly in the encoder (it cannot be reached through this map).
+        Encoding::ListPackEx => enc_tag::LISTPACKEX,
         Encoding::QuickList => enc_tag::QUICKLIST,
         Encoding::IntSet => enc_tag::INTSET,
         Encoding::HashTable => enc_tag::HASHTABLE,
@@ -106,8 +117,12 @@ fn tag_to_enc(tag: u8) -> Option<Encoding> {
         enc_tag::LISTPACK => Encoding::ListPack,
         enc_tag::QUICKLIST => Encoding::QuickList,
         enc_tag::INTSET => Encoding::IntSet,
-        enc_tag::HASHTABLE => Encoding::HashTable,
         enc_tag::SKIPLIST => Encoding::SkipList,
+        // Hash-with-field-TTL tags map to the OBJECT ENCODING they report: listpackex (small),
+        // and hashtable for both the plain and the field-TTL (HASHTABLEEX) large forms. The
+        // trailing TTL section is read by the HASH decode arm off the raw tag byte.
+        enc_tag::LISTPACKEX => Encoding::ListPackEx,
+        enc_tag::HASHTABLE | enc_tag::HASHTABLEEX => Encoding::HashTable,
         _ => return None,
     })
 }
@@ -141,7 +156,15 @@ fn put_count(out: &mut Vec<u8>, n: usize) {
 pub fn encode_kvobj(obj: &KvObj) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + obj.key.len());
     out.push(type_to_tag(obj.header.data_type));
-    out.push(enc_to_tag(obj.header.encoding));
+    // The encoding tag normally mirrors OBJECT ENCODING. A LARGE hash with per-field TTLs
+    // reports `hashtable` but needs the distinct HASHTABLEEX codec tag so the decoder reads the
+    // trailing TTL section; the small case already maps to LISTPACKEX through its ListPackEx
+    // encoding. (#408)
+    let enc_byte = match &obj.value {
+        ValueRepr::Hash(h) if h.has_field_ttls() && !h.is_listpack() => enc_tag::HASHTABLEEX,
+        _ => enc_to_tag(obj.header.encoding),
+    };
+    out.push(enc_byte);
     match obj.expire_at {
         Some(UnixMillis(ms)) => {
             out.push(1);
@@ -164,13 +187,24 @@ pub fn encode_kvobj(obj: &KvObj) -> Vec<u8> {
                 put_bytes(&mut out, e);
             }
         }
-        // A HASH: its (field, value) pairs in the store's deterministic order.
+        // A HASH: its (field, value) pairs in the store's deterministic order, followed by a
+        // per-field TTL section IFF the hash carries field TTLs (#408). The section is
+        // `[ttl_count u32][field bytes, deadline-ms u64 LE]*`; it is present only under the
+        // LISTPACKEX/HASHTABLEEX enc tags, so a TTL-free hash round-trips byte-identically.
         ValueRepr::Hash(h) => {
             let pairs = h.pairs();
             put_count(&mut out, pairs.len());
             for (f, v) in &pairs {
                 put_bytes(&mut out, f);
                 put_bytes(&mut out, v);
+            }
+            if h.has_field_ttls() {
+                let ttls = h.field_ttl_pairs();
+                put_count(&mut out, ttls.len());
+                for (f, d) in &ttls {
+                    put_bytes(&mut out, f);
+                    out.extend_from_slice(&d.0.to_le_bytes());
+                }
             }
         }
         // A SET: its members in the store's deterministic order.
@@ -267,8 +301,8 @@ impl<'a> Reader<'a> {
 pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
     let mut r = Reader::new(buf);
     let type_tag = r.u8()?;
-    let enc_tag = r.u8()?;
-    let encoding = tag_to_enc(enc_tag)?;
+    let enc_byte = r.u8()?;
+    let encoding = tag_to_enc(enc_byte)?;
     let expire_at = match r.u8()? {
         0 => None,
         1 => Some(UnixMillis(r.u64()?)),
@@ -327,6 +361,22 @@ pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
                 let v = r.bytes()?;
                 pairs.push((f, v));
             }
+            // A LISTPACKEX/HASHTABLEEX hash carries a trailing per-field TTL section (#408):
+            // `[ttl_count u32][field, deadline-ms u64 LE]*`. Plain LISTPACK/HASHTABLE hashes
+            // have none (and the `is_done` check below rejects a stray section).
+            let field_ttls: Vec<(Vec<u8>, UnixMillis)> =
+                if enc_byte == enc_tag::LISTPACKEX || enc_byte == enc_tag::HASHTABLEEX {
+                    let ttl_count = r.u32()? as usize;
+                    let mut ttls = Vec::with_capacity(ttl_count.min(1024));
+                    for _ in 0..ttl_count {
+                        let field = r.bytes()?;
+                        let deadline = r.u64()?;
+                        ttls.push((field, UnixMillis(deadline)));
+                    }
+                    ttls
+                } else {
+                    Vec::new()
+                };
             if !r.is_done() {
                 return None;
             }
@@ -337,11 +387,19 @@ pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
                 expire_at,
                 &EncodingThresholds::unlimited(),
             );
-            // Force the one-way large form if the source was a hashtable but the rebuilt
-            // contents fit a listpack (a promoted-then-shrunk hash).
+            // Force the one-way large form if the source was a hashtable (incl. HASHTABLEEX,
+            // whose encoding maps to HashTable) but the rebuilt contents fit a listpack.
             if encoding == Encoding::HashTable {
                 if let Some(h) = obj.as_hash_mut() {
                     h.force_large_encoding();
+                }
+            }
+            // Re-apply the per-field deadlines onto the rebuilt hash.
+            if !field_ttls.is_empty() {
+                if let Some(h) = obj.as_hash_mut() {
+                    for (f, d) in &field_ttls {
+                        h.set_field_ttl(f, *d);
+                    }
                 }
             }
             obj.recompute_encoding();
@@ -551,6 +609,45 @@ mod tests {
         );
         assert_eq!(ht_hash.header.encoding, Encoding::HashTable);
         assert_round_trips(&ht_hash);
+
+        // -- HASH with per-field TTLs (#408): listpackex (small) and a large hashtable form. --
+        let mut lpex = KvObj::from_new_owned(
+            b"h-lpex",
+            NewValueOwned::hash(vec![
+                (b"f1".to_vec(), b"v1".to_vec()),
+                (b"f2".to_vec(), b"v2".to_vec()),
+            ]),
+            Some(UnixMillis(9)),
+            &EncodingThresholds::defaults(),
+        );
+        if let Some(h) = lpex.as_hash_mut() {
+            h.set_field_ttl(b"f1", UnixMillis(123_456));
+        }
+        lpex.recompute_encoding();
+        assert_eq!(lpex.header.encoding, Encoding::ListPackEx);
+        assert_round_trips(&lpex);
+        // A LARGE hash with field TTLs stays `hashtable` (HASHTABLEEX on the wire).
+        let big2: Vec<(Vec<u8>, Vec<u8>)> = (0..600u32)
+            .map(|i| {
+                (
+                    format!("f{i:04}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let mut htex = KvObj::from_new_owned(
+            b"h-htex",
+            NewValueOwned::hash(big2),
+            None,
+            &EncodingThresholds::defaults(),
+        );
+        if let Some(h) = htex.as_hash_mut() {
+            h.set_field_ttl(b"f0001", UnixMillis(999));
+            h.set_field_ttl(b"f0002", UnixMillis(1_000));
+        }
+        htex.recompute_encoding();
+        assert_eq!(htex.header.encoding, Encoding::HashTable);
+        assert_round_trips(&htex);
 
         // -- ZSET: listpack and skiplist. --
         let lp_zset = KvObj::from_new_owned(

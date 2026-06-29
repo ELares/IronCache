@@ -250,6 +250,15 @@ fn type_category(cmd: &[u8]) -> Option<Category> {
         b"HINCRBYFLOAT",
         b"HRANDFIELD",
         b"HSCAN",
+        b"HEXPIRE",
+        b"HPEXPIRE",
+        b"HEXPIREAT",
+        b"HPEXPIREAT",
+        b"HTTL",
+        b"HPTTL",
+        b"HEXPIRETIME",
+        b"HPEXPIRETIME",
+        b"HPERSIST",
     ];
     const SET: &[&[u8]] = &[
         b"SADD",
@@ -511,6 +520,16 @@ fn is_fast(cmd: &[u8]) -> bool {
             | b"HSTRLEN"
             | b"HINCRBY"
             | b"HINCRBYFLOAT"
+            // Hash field TTL (#408): O(N) over the FIELDS count, like HDEL/HMGET (Redis @fast).
+            | b"HEXPIRE"
+            | b"HPEXPIRE"
+            | b"HEXPIREAT"
+            | b"HPEXPIREAT"
+            | b"HTTL"
+            | b"HPTTL"
+            | b"HEXPIRETIME"
+            | b"HPEXPIRETIME"
+            | b"HPERSIST"
             // O(1) set.
             | b"SADD"
             | b"SREM"

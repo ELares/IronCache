@@ -164,6 +164,11 @@ pub enum Encoding {
     /// `list-max-listpack-size` byte budget or the per-node element cap (#40,
     /// LIST_LARGE.md). The reported NAME is a pure function of the active repr.
     QuickList,
+    /// A small hash with per-field TTLs, stored in the listpack-equivalent form
+    /// (`OBJECT ENCODING` -> listpackex). Produced once a small hash carries a field TTL
+    /// (#408, Redis 7.4); a large hash with field TTLs stays `hashtable` (there is no
+    /// `hashtableex` name in Redis).
+    ListPackEx,
     /// Reserved (intset).
     IntSet,
     /// Reserved (hashtable for large hashes/sets).
@@ -181,6 +186,7 @@ impl Encoding {
             Encoding::EmbStr => "embstr",
             Encoding::Raw => "raw",
             Encoding::ListPack => "listpack",
+            Encoding::ListPackEx => "listpackex",
             Encoding::QuickList => "quicklist",
             Encoding::IntSet => "intset",
             Encoding::HashTable => "hashtable",
@@ -769,6 +775,51 @@ pub trait HashValue {
     /// [`encoding`]: crate::Encoding
     fn is_listpack(&self) -> bool {
         true
+    }
+
+    // --- Per-field TTL (HEXPIRE family, Redis 7.4, #408). The defaults model a hash type
+    // that carries no field TTLs; the concrete hash value overrides them. ---
+
+    /// `field`'s absolute expiry deadline (HTTL / HEXPIRETIME family), or `None` if the field
+    /// has no TTL (or does not exist; the caller distinguishes existence separately).
+    fn field_ttl(&self, _field: &[u8]) -> Option<UnixMillis> {
+        None
+    }
+
+    /// Set `field`'s absolute expiry `deadline` (HEXPIRE family). The caller has confirmed the
+    /// field exists; this records (or overwrites) its deadline.
+    fn set_field_ttl(&mut self, _field: &[u8], _deadline: UnixMillis) {}
+
+    /// Remove `field`'s expiry deadline (HPERSIST / HGETEX PERSIST). Returns whether one was
+    /// removed (false if the field had no TTL).
+    fn persist_field(&mut self, _field: &[u8]) -> bool {
+        false
+    }
+
+    /// The nearest field deadline across the hash, or `None` if no field has a TTL. Drives the
+    /// per-shard timing-wheel registration for proactive field reaping.
+    fn min_field_ttl(&self) -> Option<UnixMillis> {
+        None
+    }
+
+    /// Whether any field carries a TTL. The hash reports `listpackex` and the wire codec
+    /// carries the per-field deadlines only when this is true.
+    fn has_field_ttls(&self) -> bool {
+        false
+    }
+
+    /// The raw `(field, deadline)` pairs for the wire/snapshot codec. Empty when no field has
+    /// a TTL; order is unspecified (the codec re-pairs by field name on decode).
+    fn field_ttl_pairs(&self) -> Vec<(Vec<u8>, UnixMillis)> {
+        Vec::new()
+    }
+
+    /// Remove every field whose deadline is at or before `now` (matching Redis
+    /// `hashTypeIsExpired`), dropping each field's value and deadline, and return the reaped
+    /// field names (for the `hexpired` keyspace event). Does NOT delete the key when the hash
+    /// empties; the caller checks [`Self::is_empty`] and deletes the key, as Redis does.
+    fn reap_expired_fields(&mut self, _now: UnixMillis) -> Vec<Vec<u8>> {
+        Vec::new()
     }
 }
 
@@ -1671,6 +1722,16 @@ pub trait Store {
     /// boundary; alive at `now == expire_at`) is removed and reported as `None`
     /// (the lazy backstop, EXPIRATION.md).
     fn read(&mut self, db: u32, key: &[u8], now: UnixMillis) -> Option<ValueRef<'_>>;
+
+    /// Whether this store is a PASSIVE replica (HA-7d): it serves reads but must NEVER
+    /// expire data on its own (key-level and hash-field-level), because the authoritative
+    /// removal arrives only through the replication stream. The default is `false` (an active
+    /// primary / standalone). A command that lazily reaps must consult this before physically
+    /// removing anything, so a replica never pre-empts the primary's expiry or diverges its
+    /// local accounting. See [`ironcache_store::ShardStore::is_passive`] for the concrete flag.
+    fn is_passive(&self) -> bool {
+        false
+    }
 
     /// Blind set: store `value` for `key` with the `expire` TTL effect, replacing
     /// any existing value. Returns whether a LIVE key existed before the write (so

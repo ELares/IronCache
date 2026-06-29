@@ -35,7 +35,7 @@ use ironcache_storage::{
 
 /// Which absolute-deadline basis an EXPIRE-family command uses.
 #[derive(Debug, Clone, Copy)]
-enum ExpireKind {
+pub(crate) enum ExpireKind {
     /// EXPIRE: argument is seconds RELATIVE to `now`.
     Seconds,
     /// PEXPIRE: argument is milliseconds RELATIVE to `now`.
@@ -124,7 +124,7 @@ fn parse_expire_cond(args: &[Bytes]) -> Result<ExpireCond, ExpireCondError> {
 /// the key, it is NOT an "invalid expire time"). Overflow of the seconds->ms or the
 /// now+delta computation is the only true invalid-expire failure here. Returns
 /// `Err(())` on overflow.
-fn resolve_expire_at(kind: ExpireKind, n: i64, now: UnixMillis) -> Result<i64, ()> {
+pub(crate) fn resolve_expire_at(kind: ExpireKind, n: i64, now: UnixMillis) -> Result<i64, ()> {
     let now_ms = i64::try_from(now.0).map_err(|_| ())?;
     match kind {
         ExpireKind::Seconds => n
