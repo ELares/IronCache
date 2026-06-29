@@ -654,6 +654,69 @@ impl HashVal {
         removed
     }
 
+    /// Set `field`'s absolute expiry `deadline` (HEXPIRE family), allocating the side-map on
+    /// first use. The caller has already confirmed the field exists; this only records the
+    /// deadline (overwriting any prior one for that field).
+    pub fn set_field_ttl(&mut self, field: &[u8], deadline: UnixMillis) {
+        self.ttls
+            .get_or_insert_with(|| Box::new(FieldTtls::default()))
+            .insert(field.to_vec().into_boxed_slice(), deadline);
+    }
+
+    /// Remove `field`'s deadline (HPERSIST / HGETEX PERSIST). Returns whether one was removed.
+    pub fn persist_field(&mut self, field: &[u8]) -> bool {
+        self.clear_field_ttl(field)
+    }
+
+    /// `field`'s absolute expiry deadline, or `None` if the field has no TTL.
+    #[must_use]
+    pub fn field_ttl(&self, field: &[u8]) -> Option<UnixMillis> {
+        self.ttls.as_ref().and_then(|t| t.get(field).copied())
+    }
+
+    /// The nearest field deadline across the whole hash, or `None` if no field has a TTL.
+    /// Used to (re)register the key in the per-shard timing wheel at its soonest field expiry.
+    #[must_use]
+    pub fn min_field_ttl(&self) -> Option<UnixMillis> {
+        self.ttls.as_ref().and_then(|t| t.values().copied().min())
+    }
+
+    /// Whether any field carries a TTL. The hash reports `listpackex` and the wire codec
+    /// carries the TTL map only when this is true.
+    #[must_use]
+    pub fn has_field_ttls(&self) -> bool {
+        self.ttls.is_some()
+    }
+
+    /// The raw `(field, deadline)` pairs, for the wire/snapshot codec. Empty when no field
+    /// has a TTL. Order is unspecified (the codec pairs them with fields by name on decode).
+    #[must_use]
+    pub fn field_ttl_pairs(&self) -> Vec<(Vec<u8>, UnixMillis)> {
+        self.ttls.as_ref().map_or_else(Vec::new, |t| {
+            t.iter().map(|(f, d)| (f.to_vec(), *d)).collect()
+        })
+    }
+
+    /// Remove every field whose deadline is at or before `now`, dropping both its value and
+    /// its deadline, and return the reaped field names (for the `hexpired` keyspace event).
+    /// Does NOT delete the key when the hash empties; the caller checks [`HashValue::is_empty`]
+    /// and deletes the key, matching Redis (an empty hash is removed).
+    pub fn reap_expired_fields(&mut self, now: UnixMillis) -> Vec<Vec<u8>> {
+        let expired: Vec<Vec<u8>> = match self.ttls.as_ref() {
+            Some(ttls) => ttls
+                .iter()
+                .filter(|&(_, &d)| d <= now)
+                .map(|(f, _)| f.to_vec())
+                .collect(),
+            None => return Vec::new(),
+        };
+        for f in &expired {
+            // del() removes the field/value AND its deadline, freeing the side-map when empty.
+            self.del(f);
+        }
+        expired
+    }
+
     /// Whether the small listpack form should convert to the hashtable form after an
     /// edit that left `entries` entries with a new `field`/`value` (the #40 transition):
     /// convert once `entries > hash-max-listpack-entries` (the HASH cap, default 512, NOT the
@@ -3271,6 +3334,52 @@ mod tests {
     /// converting a NEW collection sooner) is covered by the dedicated `encoding_threshold_*` tests
     /// at the end of this module + the registry/runtime tests in `ironcache-config`.
     const TH: &EncodingThresholds = &EncodingThresholds::defaults();
+
+    #[test]
+    fn hash_field_ttl_set_read_persist_and_reap() {
+        let mut h = HashVal::new();
+        h.set(b"a", b"1", TH);
+        h.set(b"b", b"2", TH);
+        h.set(b"c", b"3", TH);
+        // No field TTLs yet: zero-overhead form, encoding unchanged.
+        assert!(!h.has_field_ttls());
+        assert_eq!(h.field_ttl(b"a"), None);
+        assert_eq!(h.min_field_ttl(), None);
+        assert_eq!(h.encoding(), Encoding::ListPack);
+
+        // Set deadlines on two fields.
+        h.set_field_ttl(b"a", UnixMillis(100));
+        h.set_field_ttl(b"b", UnixMillis(50));
+        assert!(h.has_field_ttls());
+        assert_eq!(h.field_ttl(b"a"), Some(UnixMillis(100)));
+        assert_eq!(h.field_ttl(b"b"), Some(UnixMillis(50)));
+        assert_eq!(h.field_ttl(b"c"), None);
+        // The nearest deadline drives the wheel registration.
+        assert_eq!(h.min_field_ttl(), Some(UnixMillis(50)));
+
+        // PERSIST removes one deadline; the field stays.
+        assert!(h.persist_field(b"a"));
+        assert_eq!(h.field_ttl(b"a"), None);
+        assert!(h.contains(b"a"));
+        assert_eq!(h.min_field_ttl(), Some(UnixMillis(50)));
+
+        // Reaping at now=49 removes nothing (b's deadline 50 is still future under `<= now`).
+        assert!(h.reap_expired_fields(UnixMillis(49)).is_empty());
+        // At now=50, b is reaped (deadline <= now): the field AND its deadline are gone.
+        let reaped = h.reap_expired_fields(UnixMillis(50));
+        assert_eq!(reaped, vec![b"b".to_vec()]);
+        assert!(!h.contains(b"b"));
+        assert_eq!(h.field_ttl(b"b"), None);
+        // The last TTL is gone, so the side-map is freed back to the zero-overhead form.
+        assert!(!h.has_field_ttls());
+        assert_eq!(h.min_field_ttl(), None);
+
+        // del() also drops a field's deadline (no orphan deadline survives).
+        h.set_field_ttl(b"a", UnixMillis(200));
+        assert!(h.has_field_ttls());
+        assert!(h.del(b"a"));
+        assert!(!h.has_field_ttls());
+    }
 
     #[test]
     fn int_value_has_no_alloc_and_reports_int() {
