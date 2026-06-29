@@ -952,6 +952,20 @@ impl ErrorReply {
         )
     }
 
+    /// `ERR BITOP <OP> must be called with at least two source keys.` - the reply Redis
+    /// emits (src/bitops.c `bitopCommand`, Redis 8.2) when BITOP DIFF, DIFF1, or ANDOR is
+    /// given fewer than two source keys. The uppercased op token is substituted into the
+    /// message, byte-exact to Redis's `addReplyErrorFormat` template. These three set-algebra
+    /// ops combine the first source against the disjunction of the rest, so a single source is
+    /// degenerate and rejected (unlike AND/OR/XOR/ONE, which accept one source).
+    #[must_use]
+    pub fn bitop_min_two_sources(op: &str) -> Self {
+        ErrorReply::new(
+            ErrorCode::Err,
+            format!("BITOP {op} must be called with at least two source keys."),
+        )
+    }
+
     /// `ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not
     /// supported but i64 is.` - the reply Redis emits (src/bitops.c
     /// `getBitfieldTypeFromArgument`) for a malformed or out-of-range BITFIELD `i<N>` /

@@ -809,6 +809,16 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        b"LOLWUT" => &CommandSpec {
+            name: b"LOLWUT",
+            // LOLWUT [VERSION version]: the bare form plus the optional VERSION option.
+            arity: Min(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
         b"HELLO" => &CommandSpec {
             name: b"HELLO",
             arity: Min(1),
@@ -2658,6 +2668,7 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     // Tier-0 / connection / admin.
     b"PING",
     b"ECHO",
+    b"LOLWUT",
     b"HELLO",
     b"AUTH",
     b"SELECT",

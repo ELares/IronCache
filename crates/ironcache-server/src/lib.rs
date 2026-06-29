@@ -81,7 +81,7 @@ pub use cmd_zset::{AggOp, Aggregate, ICSTOREZSET, ScoredMember, WeightedSource, 
 // 2b-3). The cross-shard BITOP reuses a plain routed `SET dest <bytes>` for its dest write
 // (SET clears the dest TTL by default, matching BITOP's blind-overwrite-clear-TTL), so
 // there is NO internal BITOP write verb.
-pub use cmd_bitmap::bitop_compute;
+pub use cmd_bitmap::{bitop_compute, bitop_validate_op};
 // The PURE HyperLogLog union + estimator primitives (the single source of truth shared by
 // the single-shard PFCOUNT/PFMERGE handlers and the cross-shard coordinator's
 // gather-union-estimate, COORDINATOR.md #107, Stage 2b-3), plus the INTERNAL `__ICSTOREHLL`

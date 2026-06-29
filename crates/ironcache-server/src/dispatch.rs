@@ -982,6 +982,7 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
     match cmd {
         b"PING" => cmd_ping(req),
         b"ECHO" => cmd_echo(req),
+        b"LOLWUT" => cmd_lolwut(req),
         b"HELLO" => cmd_hello(ctx, state, req),
         b"AUTH" => cmd_auth(ctx, state, req),
         b"SELECT" => cmd_select(ctx, state, req),
@@ -1891,6 +1892,25 @@ fn cmd_echo(req: &Request) -> Value {
         return Value::error(ErrorReply::wrong_arity("echo"));
     }
     Value::BulkString(Some(req.args[1].clone()))
+}
+
+/// `LOLWUT [VERSION version]` -> a bulk string naming the server and its version. Redis
+/// renders generative ASCII art selected by the optional VERSION argument; IronCache returns
+/// a small, stable banner so clients and health probes that call LOLWUT get a non-error bulk
+/// reply (the observable contract here is a bulk string, never an error, for any probe form).
+/// Redis is lenient about the arguments: it draws art for any argument shape and errors ONLY
+/// when the VERSION option is given a non-integer value (it parses argv[2] as a long). This
+/// matches that leniency, so the only error path is `LOLWUT VERSION <non-integer>`. The art
+/// bytes themselves are server-specific and never asserted by clients.
+fn cmd_lolwut(req: &Request) -> Value {
+    if req.args.len() >= 3
+        && req.args[1].eq_ignore_ascii_case(b"VERSION")
+        && crate::cmd_util::parse_i64(&req.args[2]).is_none()
+    {
+        return Value::error(ErrorReply::not_an_integer());
+    }
+    let banner = format!("IronCache ver. {}\n", ironcache_observe::SERVER_VERSION);
+    Value::bulk(banner)
 }
 
 /// `SAVE` PERSISTENCE-DISABLED fallback (#58): reached only when the serve layer did NOT
@@ -3400,6 +3420,35 @@ mod tests {
             Value::BulkString(Some(Bytes::from_static(b"hi")))
         );
         assert_eq!(run(&c, &mut s, &[b"PinG"]), Value::simple("PONG")); // case-insensitive
+    }
+
+    #[test]
+    fn lolwut_returns_version_banner() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        // Bare form: a non-error bulk string naming the server (health probes rely on this).
+        match run(&c, &mut s, &[b"LOLWUT"]) {
+            Value::BulkString(Some(b)) => {
+                assert!(b.starts_with(b"IronCache ver. "), "got {b:?}");
+            }
+            other => panic!("expected bulk, got {other:?}"),
+        }
+        // VERSION option with an integer: banner. Command name is case-insensitive.
+        match run(&c, &mut s, &[b"lolwut", b"version", b"5"]) {
+            Value::BulkString(Some(b)) => assert!(b.starts_with(b"IronCache ver. ")),
+            other => panic!("expected bulk, got {other:?}"),
+        }
+        // Redis is lenient: any non-VERSION trailing args still draw the banner (no error),
+        // so a health probe never fails.
+        match run(&c, &mut s, &[b"LOLWUT", b"NOPE"]) {
+            Value::BulkString(Some(b)) => assert!(b.starts_with(b"IronCache ver. ")),
+            other => panic!("expected bulk, got {other:?}"),
+        }
+        // The ONE error path, byte-faithful to Redis: VERSION with a non-integer value.
+        match run(&c, &mut s, &[b"LOLWUT", b"VERSION", b"notanint"]) {
+            Value::Error(e) => assert_eq!(e.line(), "-ERR value is not an integer or out of range"),
+            other => panic!("expected error, got {other:?}"),
+        }
     }
 
     #[test]

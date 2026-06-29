@@ -52,8 +52,8 @@ use ironcache_runtime::bootstrap::ShardId;
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
     AggOp, Aggregate, HLL_REGISTERS, ProtoVersion, Request, ScoredMember, SetOp, Value,
-    WeightedSource, bitop_compute, dense_from_regs, estimate_reply, is_valid_dense, merge_into,
-    owner_shard, regs_reghisto, set_combine, zset_combine,
+    WeightedSource, bitop_compute, bitop_validate_op, dense_from_regs, estimate_reply,
+    is_valid_dense, merge_into, owner_shard, regs_reghisto, set_combine, zset_combine,
 };
 
 /// GATHER one source key's set members from its OWNER shard (COORDINATOR.md #107, Stage 2b):
@@ -1083,10 +1083,11 @@ async fn gather_string_bytes(
 /// `out`. The serve loop calls this when BITOP's keys (dest + sources) span shards; the
 /// co-located case routes via Stage 1.
 ///
-/// MIRRORS the single-shard `cmd_bitop` EXACTLY: AND/OR/XOR take >= 1 source, NOT takes
-/// EXACTLY one (else the bitop-not-single-source error); a bad op is a syntax error; every
-/// source is read + type-validated FIRST (a non-string aborts with WRONGTYPE, dest
-/// untouched); the result is [`bitop_compute`] (the SHARED combiner, zero-extending to the
+/// MIRRORS the single-shard `cmd_bitop` EXACTLY: it validates the op + per-op source count
+/// through the SHARED `bitop_validate_op` (AND/OR/XOR/ONE take >= 1 source, NOT takes exactly
+/// one, DIFF/DIFF1/ANDOR take at least two, an unknown op is a syntax error); every source is
+/// read + type-validated FIRST (a non-string aborts with WRONGTYPE, dest untouched); the
+/// result is [`bitop_compute`] (the SHARED combiner, zero-extending to the
 /// longest source); an EMPTY result routes `DEL dest` and replies 0 (BITOP deletes dest on
 /// empty); a non-empty result routes `SET dest <bytes>` (a blind overwrite CLEARING the dest
 /// TTL, exactly BITOP's dest write) and replies the result length in BYTES.
@@ -1107,13 +1108,11 @@ pub async fn fan_out_bitop(
             break 'reply Value::error(ErrorReply::wrong_arity("bitop"));
         }
         let op = request.args[1].to_ascii_uppercase();
-        if !matches!(op.as_slice(), b"AND" | b"OR" | b"XOR" | b"NOT") {
-            break 'reply Value::error(ErrorReply::syntax_error());
-        }
-        // NOT takes EXACTLY one source key (BITOP NOT dest src). The arity check runs on the
-        // home core BEFORE any gather, matching cmd_bitop.
-        if op.as_slice() == b"NOT" && request.args.len() != 4 {
-            break 'reply Value::error(ErrorReply::bitop_not_single_source());
+        // The op allow-list and per-op source-count rule come from the SHARED validator in
+        // `cmd_bitop`, so this spanning path cannot drift from the single-shard one (#414
+        // review). The arity check runs on the home core BEFORE any gather, matching cmd_bitop.
+        if let Err(e) = bitop_validate_op(op.as_slice(), request.args.len() - 3) {
+            break 'reply Value::error(e);
         }
         let dest = request.args[2].clone();
         let src_keys: Vec<bytes::Bytes> = request.args[3..].to_vec();
