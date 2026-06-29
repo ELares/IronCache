@@ -384,6 +384,18 @@ fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
         };
     }
 
+    // INTERNAL `__ICSPUBLISH <channel> <payload>` (#410): the cross-shard SHARDED PUBLISH
+    // fan-out, the SPUBLISH analog of `__ICPUBLISH`. Delivers to THIS shard's LOCAL shard-channel
+    // subscribers (NO pattern delivery) and returns the local receiver count; the home core SUMS
+    // the per-shard counts into the SPUBLISH integer reply. Same no-store / no-deltas /
+    // no-borrow-across-await contract as `__ICPUBLISH`.
+    if crate::serve::ascii_upper(request.command()) == ironcache_server::ICSPUBLISH {
+        return ShardReply {
+            value: run_local_spublish(request),
+            deltas: CounterDeltas::default(),
+        };
+    }
+
     // INTERNAL `__ICSAVE <save_unix_secs> <shard_index> <dir>` (#58 persistence): the cross-shard
     // SAVE fan-out. This shard DUMPS ITS OWN partition (the forkless, memory-neutral
     // `snapshot_chunk` pull) to `<dir>/dump-shard-<shard_index>.icss` ATOMICALLY and returns its
@@ -949,6 +961,26 @@ pub fn run_local_publish(request: &Request) -> Value {
     Value::Integer(count)
 }
 
+/// Deliver an `__ICSPUBLISH <channel> <payload>` to THIS shard's LOCAL SHARD-channel subscribers
+/// and return the count (#410), the SPUBLISH analog of [`run_local_publish`]. UNLIKE the regular
+/// publish there is NO pattern delivery (sharded Pub/Sub has no PSSUBSCRIBE) and the SHARD-channel
+/// table (`shard_channels`) is consulted, NOT `channels` -- so an SPUBLISH never reaches a regular
+/// SUBSCRIBE subscriber. The table borrow is held only across the synchronous `try_send`s (no
+/// `.await` between borrow and release). A malformed verb delivers to nobody and returns 0.
+#[must_use]
+pub fn run_local_spublish(request: &Request) -> Value {
+    let (Some(channel), Some(payload)) = (request.args.get(1), request.args.get(2)) else {
+        return Value::Integer(0);
+    };
+    let push = crate::pubsub::ServerPush::SMessage {
+        channel: channel.clone(),
+        payload: payload.clone(),
+    };
+    let pubsub = crate::serve::shard_pubsub();
+    let count = pubsub.borrow_mut().deliver_shard(channel.as_ref(), &push);
+    Value::Integer(count)
+}
+
 /// Run ONE shard's `__ICSAVE <save_unix_secs> <shard_index> <dir>` against THIS shard's store
 /// (#58 persistence): DUMP this shard's whole partition to `<dir>/dump-shard-<shard_index>.icss`
 /// ATOMICALLY (the forkless, memory-neutral `snapshot_chunk` pull + tmp -> fsync -> rename) and
@@ -1338,6 +1370,53 @@ pub async fn fan_out_publish(
     total
 }
 
+/// Fan a SHARDED publish (`SPUBLISH channel payload`) out to every shard's LOCAL shard-channel
+/// table and SUM the per-shard receiver counts (#410), the SPUBLISH analog of [`fan_out_publish`].
+/// Broadcasts the internal `__ICSPUBLISH <channel> <payload>` (whose [`run_remote`] branch calls
+/// [`run_local_spublish`], delivering to `shard_channels` with NO pattern delivery); the home
+/// shard delivers its own subset LOCALLY + synchronously. Because IronCache Pub/Sub is node-local
+/// (no cross-node bus), an SPUBLISH is already confined to this node, which is the sharded-Pub/Sub
+/// "no cluster-bus amplification" property at the node boundary.
+pub async fn fan_out_spublish(
+    inbox: &Inbox,
+    channel: &[u8],
+    payload: &[u8],
+    db: u32,
+    home: usize,
+) -> i64 {
+    let n_shards = inbox.len();
+    let request = Request {
+        args: vec![
+            bytes::Bytes::from_static(ironcache_server::ICSPUBLISH),
+            bytes::Bytes::copy_from_slice(channel),
+            bytes::Bytes::copy_from_slice(payload),
+        ],
+    };
+    let mut pending: Vec<oneshot::Receiver<ShardReply>> = Vec::with_capacity(n_shards);
+    let mut total: i64 = 0;
+    for target in 0..n_shards {
+        if target == home {
+            continue;
+        }
+        let (tx, rx) = oneshot::channel::<ShardReply>();
+        let work = ShardWork {
+            request: request.clone(),
+            db,
+            reply: tx,
+        };
+        if inbox[target].send(work).await.is_ok() {
+            pending.push(rx);
+        }
+    }
+    total += publish_count(&run_local_spublish(&request));
+    for rx in pending {
+        if let Ok(reply) = rx.await {
+            total += publish_count(&reply.value);
+        }
+    }
+    total
+}
+
 /// DRAIN this (owner) shard's pending keyspace events (PROD-8) and PUBLISH each through the
 /// existing Pub/Sub fan-out, from the SHARD's drain loop after a CROSS-SHARD keyed write recorded
 /// them (the home-path analog lives in `crate::serve::publish_pending_keyspace_events`). `home` is
@@ -1420,6 +1499,22 @@ pub fn run_local_pubsub(request: &Request) -> Value {
             let names = table.local_patterns();
             Value::Array(Some(names.into_iter().map(Value::bulk).collect()))
         }
+        // SHARDCHANNELS / SHARDNUMSUB (#410): the sharded analogs of CHANNELS / NUMSUB over the
+        // SHARD-channel table. Same wire-shape so the home core reuses the CHANNELS / NUMSUB
+        // merges (union+dedup / sum-per-channel).
+        b"SHARDCHANNELS" => {
+            let pat = request.args.get(2).map(bytes::Bytes::as_ref);
+            let names = table.local_shard_channels(pat, ironcache_server::glob::glob_match);
+            Value::Array(Some(names.into_iter().map(Value::bulk).collect()))
+        }
+        b"SHARDNUMSUB" => {
+            let mut flat: Vec<Value> = Vec::with_capacity((request.args.len() - 2) * 2);
+            for ch in &request.args[2..] {
+                flat.push(Value::bulk(ch.clone()));
+                flat.push(Value::Integer(table.local_shard_numsub(ch.as_ref())));
+            }
+            Value::Array(Some(flat))
+        }
         // An unknown subcommand never reaches the coordinator (the serve layer validates it
         // before fanning out); contribute an empty array defensively.
         _ => Value::Array(Some(Vec::new())),
@@ -1466,9 +1561,11 @@ pub async fn fan_out_pubsub(inbox: &Inbox, request: &Request, home: usize) -> Va
     match crate::serve::ascii_upper(request.args.get(1).map_or(&b""[..], bytes::Bytes::as_ref))
         .as_slice()
     {
-        b"NUMSUB" => merge_pubsub_numsub(&request.args[2..], &replies),
+        // NUMSUB and the sharded SHARDNUMSUB (#410) both SUM per channel across shards.
+        b"NUMSUB" | b"SHARDNUMSUB" => merge_pubsub_numsub(&request.args[2..], &replies),
         b"NUMPAT" => merge_pubsub_numpat(replies),
-        // CHANNELS (or any other token, which cannot reach here post-validation).
+        // CHANNELS and the sharded SHARDCHANNELS (#410) both UNION+dedup across shards (the
+        // fall-through); any other token cannot reach here post-validation.
         _ => merge_pubsub_channels(replies),
     }
 }

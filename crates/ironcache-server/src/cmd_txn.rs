@@ -501,6 +501,12 @@ pub(crate) mod tests {
             b"PUBSUB",
             b"__ICPUBLISH",
             b"__ICPUBSUB",
+            // Sharded Pub/Sub (#410): the same serve-routed, registry-present, dispatch-absent
+            // contract as the regular pub/sub commands.
+            b"SSUBSCRIBE",
+            b"SUNSUBSCRIBE",
+            b"SPUBLISH",
+            b"__ICSPUBLISH",
         ] {
             assert!(
                 crate::command_spec::spec_of(cmd).is_some(),

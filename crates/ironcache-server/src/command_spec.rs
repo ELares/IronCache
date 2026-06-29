@@ -49,6 +49,15 @@ use ironcache_protocol::Request;
 /// keyed branches).
 pub const ICPUBLISH: &[u8] = b"__ICPUBLISH";
 
+/// The INTERNAL token the cross-shard coordinator uses to deliver a SHARDED publish (#410), the
+/// SPUBLISH analog of [`ICPUBLISH`]. NOT a client command (the serve-loop router gates it like
+/// `__ICPUBLISH`): the coordinator broadcasts `__ICSPUBLISH <channel> <payload>` to every shard,
+/// each of which delivers to its LOCAL SHARD-channel subscribers (the `shard_channels` table,
+/// NOT `channels`, and with NO pattern delivery) and returns its local receiver count. In the
+/// [`spec_of`] registry (`AlwaysHome`, no routable key) so the registry-vs-dispatch cross-check
+/// stays exact.
+pub const ICSPUBLISH: &[u8] = b"__ICSPUBLISH";
+
 /// The INTERNAL token the cross-shard coordinator uses to gather PUBSUB introspection from every
 /// shard's LOCAL subscription table (SERVER_PUSH.md #20 / COORDINATOR.md #107, PR 91b). NOT a
 /// client command: the serve-loop router gates it (like `__ICPUBLISH` / the `__ICSTORE*` verbs)
@@ -2780,6 +2789,56 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
         },
         b"PUBLISH" => &CommandSpec {
             name: b"PUBLISH",
+            arity: Exact(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        // -- Sharded Pub/Sub (#410; also SERVE-layer routed, NOT `dispatch_inner`). SSUBSCRIBE
+        // (arity Min 2) / SUNSUBSCRIBE (arity Min 1, zero-channel unsubscribe-all) register the
+        // per-shard `shard_channels` table; SPUBLISH (arity Exact 3) fans out via the coordinator.
+        // AlwaysHome on a single node (the channel-slot -> owner-node routing is a cluster-mode
+        // follow-up; node-local delivery is already confined since pub/sub does not cross nodes).
+        // In the registry so arity validates + `classify` returns AlwaysHome; intercepted in the
+        // serve loop, so NO `dispatch_inner` arm + NOT in `dispatch_arm_names`. --
+        b"SSUBSCRIBE" => &CommandSpec {
+            name: b"SSUBSCRIBE",
+            arity: Min(2),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        b"SUNSUBSCRIBE" => &CommandSpec {
+            name: b"SUNSUBSCRIBE",
+            arity: Min(1),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        b"SPUBLISH" => &CommandSpec {
+            name: b"SPUBLISH",
+            arity: Exact(3),
+            class: AlwaysHome,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        // -- INTERNAL cross-shard SHARDED pub/sub fan-out verb (#410), the SPUBLISH analog of
+        // `__ICPUBLISH`. `__ICSPUBLISH <channel> <payload>` delivers to a shard's LOCAL
+        // shard-channel subscribers and returns the local receiver count. AlwaysHome; in the
+        // registry so the cross-check stays exact, but CLIENT-UNREACHABLE (the serve-loop router
+        // rejects a client `__ICSPUBLISH` like `__ICPUBLISH`); only the coordinator issues it.
+        // Arity Exact(3); handled by the coordinator's run_remote pub/sub branch, so absent from
+        // `dispatch_arm_names`. --
+        b"__ICSPUBLISH" => &CommandSpec {
+            name: b"__ICSPUBLISH",
             arity: Exact(3),
             class: AlwaysHome,
             key_spec: Arg1,

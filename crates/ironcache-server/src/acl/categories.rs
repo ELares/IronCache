@@ -457,11 +457,20 @@ fn is_connection(cmd: &[u8]) -> bool {
     )
 }
 
-/// The PUBSUB command set (Redis ACL `@pubsub`).
+/// The PUBSUB command set (Redis ACL `@pubsub`), including the sharded forms (#410).
 fn is_pubsub(cmd: &[u8]) -> bool {
     matches!(
         cmd,
-        b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH" | b"PUBSUB"
+        b"SUBSCRIBE"
+            | b"UNSUBSCRIBE"
+            | b"PSUBSCRIBE"
+            | b"PUNSUBSCRIBE"
+            | b"PUBLISH"
+            | b"PUBSUB"
+            // Sharded Pub/Sub (#410): SSUBSCRIBE / SUNSUBSCRIBE / SPUBLISH are @pubsub like the rest.
+            | b"SSUBSCRIBE"
+            | b"SUNSUBSCRIBE"
+            | b"SPUBLISH"
     )
 }
 
