@@ -770,6 +770,51 @@ pub trait HashValue {
     fn is_listpack(&self) -> bool {
         true
     }
+
+    // --- Per-field TTL (HEXPIRE family, Redis 7.4, #408). The defaults model a hash type
+    // that carries no field TTLs; the concrete hash value overrides them. ---
+
+    /// `field`'s absolute expiry deadline (HTTL / HEXPIRETIME family), or `None` if the field
+    /// has no TTL (or does not exist; the caller distinguishes existence separately).
+    fn field_ttl(&self, _field: &[u8]) -> Option<UnixMillis> {
+        None
+    }
+
+    /// Set `field`'s absolute expiry `deadline` (HEXPIRE family). The caller has confirmed the
+    /// field exists; this records (or overwrites) its deadline.
+    fn set_field_ttl(&mut self, _field: &[u8], _deadline: UnixMillis) {}
+
+    /// Remove `field`'s expiry deadline (HPERSIST / HGETEX PERSIST). Returns whether one was
+    /// removed (false if the field had no TTL).
+    fn persist_field(&mut self, _field: &[u8]) -> bool {
+        false
+    }
+
+    /// The nearest field deadline across the hash, or `None` if no field has a TTL. Drives the
+    /// per-shard timing-wheel registration for proactive field reaping.
+    fn min_field_ttl(&self) -> Option<UnixMillis> {
+        None
+    }
+
+    /// Whether any field carries a TTL. The hash reports `listpackex` and the wire codec
+    /// carries the per-field deadlines only when this is true.
+    fn has_field_ttls(&self) -> bool {
+        false
+    }
+
+    /// The raw `(field, deadline)` pairs for the wire/snapshot codec. Empty when no field has
+    /// a TTL; order is unspecified (the codec re-pairs by field name on decode).
+    fn field_ttl_pairs(&self) -> Vec<(Vec<u8>, UnixMillis)> {
+        Vec::new()
+    }
+
+    /// Remove every field whose deadline is at or before `now` (matching Redis
+    /// `hashTypeIsExpired`), dropping each field's value and deadline, and return the reaped
+    /// field names (for the `hexpired` keyspace event). Does NOT delete the key when the hash
+    /// empties; the caller checks [`Self::is_empty`] and deletes the key, as Redis does.
+    fn reap_expired_fields(&mut self, _now: UnixMillis) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
 }
 
 /// The abstract SET mutation + read vocabulary the command layer calls through the
