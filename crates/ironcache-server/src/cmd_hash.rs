@@ -618,7 +618,7 @@ pub fn cmd_hrandfield<S: Store>(
     // 4 args for WITHVALUES, so a count is always present here.
 
     store.rmw_mut(db, &req.args[1], now, move |entry| {
-        let hash = match entry {
+        let (changed, hash) = match entry {
             RmwEntry::Vacant => {
                 // Missing key: nil (no count) or empty array (with count).
                 let reply = match count {
@@ -628,14 +628,18 @@ pub fn cmd_hrandfield<S: Store>(
                 return keep(reply);
             }
             RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
-                // Take the deterministic (field, value) order out of the view so the
-                // selection logic below can index it (the borrow of `o` ends here).
-                Some(hash) => hash.pairs(),
+                // Reap expired fields first, then take the deterministic (field, value) order
+                // out of the view so the selection logic below can index it (the borrow of `o`
+                // ends here).
+                Some(hash) => {
+                    let changed = !hash.reap_expired_fields(now).is_empty();
+                    (changed, hash.pairs())
+                }
                 None => return wrong_type(),
             },
             RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
         };
-        keep(hrandfield_reply(&hash, count, with_values, seed))
+        reaped_read(changed, hrandfield_reply(&hash, count, with_values, seed))
     })
 }
 
@@ -788,19 +792,22 @@ pub fn cmd_hscan<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
     }
 
     store.rmw_mut(db, &req.args[1], now, move |entry| {
-        let (pairs, is_listpack) = match entry {
+        let (changed, pairs, is_listpack) = match entry {
             // Missing key: complete (cursor 0) with an empty field list.
             RmwEntry::Vacant => {
                 return keep(hscan_reply(ScanCursor::START, Vec::new(), novalues));
             }
             RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
-                Some(hash) => (hash.pairs(), hash.is_listpack()),
+                Some(hash) => {
+                    let changed = !hash.reap_expired_fields(now).is_empty();
+                    (changed, hash.pairs(), hash.is_listpack())
+                }
                 None => return wrong_type(),
             },
             RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
         };
         let (next, batch) = hscan_step(&pairs, cursor, count, pattern.as_deref(), is_listpack);
-        keep(hscan_reply(next, batch, novalues))
+        reaped_read(changed, hscan_reply(next, batch, novalues))
     })
 }
 
