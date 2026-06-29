@@ -2197,6 +2197,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hsetex_vacant_and_past_deadline_branches() {
+        let mut s = test_store();
+        // FXX on a fully-missing key -> 0, and no key is created.
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"miss", b"FXX", b"FIELDS", b"1", b"a", b"1"])
+            )),
+            0
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"miss"]))), 0);
+
+        // A past absolute deadline on a NEW key: reply 1 (set), but nothing persists.
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"h", b"PXAT", b"0", b"FIELDS", b"1", b"a", b"1"])
+            )),
+            1
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"h"]))), 0);
+
+        // A past deadline on an UPDATE deletes the field, removing the now-empty key.
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h2", b"a", b"1"]));
+        assert_eq!(
+            int(&cmd_hsetex(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HSETEX", b"h2", b"PXAT", b"0", b"FIELDS", b"1", b"a", b"2"])
+            )),
+            1
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"h2"]))), 0);
+    }
+
     // ---- HSET: new-vs-update count, HMSET alias. ----
 
     #[test]
