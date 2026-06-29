@@ -146,6 +146,16 @@ pub enum ServerPush {
         /// The published payload.
         payload: Bytes,
     },
+    /// A CLIENT TRACKING invalidation (#409, server-assisted client-side caching): the
+    /// `["invalidate", [key ...]]` RESP3 push that tells a tracking client to drop its local
+    /// cache of those keys. `keys = None` is the FLUSH form (`["invalidate", nil]`), telling the
+    /// client to drop EVERYTHING (FLUSHALL/FLUSHDB). Delivered on the same per-connection push
+    /// channel Pub/Sub uses; for a RESP2 `REDIRECT` target it rides the `__redis__:invalidate`
+    /// channel (a later stage).
+    Invalidate {
+        /// The invalidated keys, or `None` for a flush-everything invalidation.
+        keys: Option<Vec<Bytes>>,
+    },
 }
 
 impl ServerPush {
@@ -182,6 +192,16 @@ impl ServerPush {
                 Value::bulk_str("smessage"),
                 Value::bulk(channel.clone()),
                 Value::bulk(payload.clone()),
+            ]),
+            // Tracking invalidation (#409): `["invalidate", [key ...]]`, or `["invalidate", nil]`
+            // for a flush (drop everything). The second element is an ARRAY of keys (even one),
+            // matching Redis's `trackingSendInvalidationMessages`.
+            ServerPush::Invalidate { keys } => Value::Push(vec![
+                Value::bulk_str("invalidate"),
+                match keys {
+                    Some(ks) => Value::Array(Some(ks.iter().cloned().map(Value::bulk).collect())),
+                    None => Value::Null,
+                },
             ]),
         }
     }
@@ -497,6 +517,101 @@ impl ShardPubSub {
         self.shard_channels
             .get(channel)
             .map_or(0, |subs| i64::try_from(subs.len()).unwrap_or(i64::MAX))
+    }
+}
+
+/// The per-shard CLIENT TRACKING invalidation table (#409, server-assisted client-side caching):
+/// which connections READ each key and want an `invalidate` push when it changes. Core-local (a
+/// serve thread-local), NO lock, exactly like [`ShardPubSub`]. The [`Subscriber`] is the SAME
+/// `Send` push handle Pub/Sub stores, so a writer on the key's OWNER shard pushes the invalidation
+/// to the tracking client's connection wherever that connection lives.
+///
+/// Both halves live on the key's OWNER shard: a tracking client's READ routes to the key's owner
+/// and registers there ([`Self::track`]); a WRITE to that key runs on the SAME owner shard and
+/// invalidates there ([`Self::invalidate`]). So no cross-shard table coordination is needed.
+///
+/// Default-mode this stage: `tracked` maps key -> {client_id -> Subscriber}. An invalidation is
+/// ONE-SHOT (Redis `trackingInvalidateKey`): sending it DROPS the key's entries, so a client must
+/// re-read to be re-tracked. BCAST (prefix) tracking is a later stage.
+#[derive(Debug, Default)]
+pub struct ShardTracking {
+    tracked: HashMap<Bytes, HashMap<u64, Subscriber>>,
+}
+
+impl ShardTracking {
+    /// Register `conn_id` (with its push handle) as a tracker of `key` on THIS shard: it READ the
+    /// key and wants an invalidation when the key changes. Idempotent (a re-read refreshes the
+    /// handle). `is_tracking` is empty until a tracking client reads, so the non-tracking hot path
+    /// never touches this table.
+    pub fn track(&mut self, key: Bytes, conn_id: u64, subscriber: Subscriber) {
+        self.tracked
+            .entry(key)
+            .or_default()
+            .insert(conn_id, subscriber);
+    }
+
+    /// Whether the table holds NO trackers (the common case): lets the write path skip the
+    /// invalidation pass with a single `is_empty` check when nobody is tracking.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tracked.is_empty()
+    }
+
+    /// Invalidate `key`: deliver an `["invalidate", [key]]` push to every tracking connection
+    /// EXCEPT `skip` (NOLOOP: the connection that caused the change), then DROP the key's tracker
+    /// set (one-shot, Redis semantics). Returns the count delivered. A shed (Full/Closed) push
+    /// trips the consumer's shed signal; the entry is dropped regardless (the whole set is removed).
+    pub fn invalidate(&mut self, key: &[u8], skip: Option<u64>) -> i64 {
+        let Some(subs) = self.tracked.remove(key) else {
+            return 0;
+        };
+        let push = ServerPush::Invalidate {
+            keys: Some(vec![Bytes::copy_from_slice(key)]),
+        };
+        let mut delivered: i64 = 0;
+        for (conn_id, sub) in &subs {
+            if Some(*conn_id) == skip {
+                continue;
+            }
+            match sub.sender.try_send(push.clone()) {
+                Ok(()) => delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+                    sub.shed.trip();
+                }
+            }
+        }
+        delivered
+    }
+
+    /// Invalidate EVERYTHING (FLUSHALL/FLUSHDB): send the flush form `["invalidate", nil]` ONCE to
+    /// every DISTINCT tracking connection EXCEPT `skip`, then clear the table (every cached key is
+    /// gone). Deduped across keys so a connection tracking many keys gets one flush push.
+    pub fn invalidate_all(&mut self, skip: Option<u64>) {
+        let mut conns: HashMap<u64, Subscriber> = HashMap::new();
+        for subs in self.tracked.values() {
+            for (id, sub) in subs {
+                conns.entry(*id).or_insert_with(|| sub.clone());
+            }
+        }
+        let push = ServerPush::Invalidate { keys: None };
+        for (id, sub) in &conns {
+            if Some(*id) == skip {
+                continue;
+            }
+            if sub.sender.try_send(push.clone()).is_err() {
+                sub.shed.trip();
+            }
+        }
+        self.tracked.clear();
+    }
+
+    /// Remove `conn_id` from EVERY key's tracker set (disconnect / `CLIENT TRACKING OFF` / RESET),
+    /// pruning keys whose set goes empty. O(tracked keys); the cold cleanup path.
+    pub fn forget_conn(&mut self, conn_id: u64) {
+        self.tracked.retain(|_, subs| {
+            subs.remove(&conn_id);
+            !subs.is_empty()
+        });
     }
 }
 

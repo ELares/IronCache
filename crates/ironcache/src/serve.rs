@@ -820,6 +820,14 @@ thread_local! {
     // to every shard, so each shard renders to its own connections from its own table).
     static PUBSUB: RefCell<Option<Rc<RefCell<crate::pubsub::ShardPubSub>>>> =
         const { RefCell::new(None) };
+    // The shard's PER-SHARD CLIENT TRACKING invalidation table (#409): key -> {conn id -> push
+    // handle}, the keys tracking clients READ on this (owner) shard. Core-local (per shard,
+    // shared-nothing ADR-0002), NO lock, held as Rc<RefCell<..>> exactly like PUBSUB: a tracking
+    // client's read registers here, a write to the key on the SAME owner shard invalidates here,
+    // and the stored `Send` push sender delivers the invalidation cross-core to the client's conn.
+    // Created lazily per shard thread; empty until a tracking client reads (zero non-tracking cost).
+    static TRACKING: RefCell<Option<Rc<RefCell<crate::pubsub::ShardTracking>>>> =
+        const { RefCell::new(None) };
     // The shard's PER-SHARD BLOCKING-WAITER registry (PROD-9): `(db, key)` -> a FIFO queue of
     // parked connections. Core-local (per shard, shared-nothing ADR-0002) with NO lock; held as
     // Rc<RefCell<..>> exactly like PUBSUB/STORE/WHEEL so a connection that PARKS, a pusher that
@@ -894,6 +902,21 @@ pub(crate) fn shard_pubsub() -> Rc<RefCell<crate::pubsub::ShardPubSub>> {
         let mut b = cell.borrow_mut();
         if b.is_none() {
             *b = Some(Rc::new(RefCell::new(crate::pubsub::ShardPubSub::default())));
+        }
+        Rc::clone(b.as_ref().unwrap())
+    })
+}
+
+/// This shard's CLIENT TRACKING invalidation table (#409), lazily created on first use on this
+/// shard thread (mirrors [`shard_pubsub`]). `pub(crate)` so the read-registration hook, the
+/// write-invalidation hook, and the disconnect cleanup all reach the SAME per-shard table.
+pub(crate) fn shard_tracking() -> Rc<RefCell<crate::pubsub::ShardTracking>> {
+    TRACKING.with(|cell| {
+        let mut b = cell.borrow_mut();
+        if b.is_none() {
+            *b = Some(Rc::new(RefCell::new(
+                crate::pubsub::ShardTracking::default(),
+            )));
         }
         Rc::clone(b.as_ref().unwrap())
     })
@@ -1437,6 +1460,10 @@ async fn serve_connection(
                     // The offset where THIS command's reply will be appended, so the commandstats
                     // hook can tell an error reply (leading `-`) from a success without re-parsing.
                     let out_before = out.len();
+                    // CLIENT TRACKING (#409): snapshot whether this connection was tracking BEFORE
+                    // dispatch, so the hook can detect a CLIENT TRACKING OFF / RESET transition and
+                    // purge the connection from the table.
+                    let was_tracking = conn.tracking_on;
                     // Route + dispatch one decoded request (COORDINATOR.md #107, Stage 1),
                     // appending its encoded reply to `out`; returns whether to close (QUIT).
                     // Factored out of the serve loop so the connection loop stays small.
@@ -1486,6 +1513,10 @@ async fn serve_connection(
                     )
                     .unwrap_or(u64::MAX);
                     record_command_stats(&state_rc, &request, out_before, &out, cmd_elapsed_us);
+                    // CLIENT TRACKING (#409): register this command's read keys for a tracking
+                    // connection, or invalidate a write's keys for every tracking client. The
+                    // common no-tracking path is one cheap gate inside (see `apply_client_tracking`).
+                    apply_client_tracking(&conn, &push_tx, &shed_flag, &request, was_tracking);
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
@@ -1609,8 +1640,10 @@ async fn serve_connection(
         // (`subscriber_idle_wait`). FIFO ordering holds because `out` was already flushed above
         // before we reach this idle wait, so a push is rendered and sent only AFTER the in-flight
         // command batch's reply went out -- a push never precedes a command reply on the connection
-        // (SERVER_PUSH.md FIFO).
-        if conn.is_subscriber() {
+        // (SERVER_PUSH.md FIFO). A CLIENT TRACKING connection (#409) drains the push channel the
+        // SAME way (its `invalidate` pushes ride the same channel), without entering subscribe MODE
+        // (the RESP2 command gate stays `is_subscriber()`-only, so a tracking client runs any command).
+        if conn.is_subscriber() || conn.tracking_on {
             if subscriber_idle_wait(
                 &mut stream,
                 &mut push_rx,
@@ -1856,6 +1889,10 @@ async fn serve_connection_uring(
                     // The offset where THIS command's reply will be appended, so the commandstats
                     // hook can tell an error reply (leading `-`) from a success without re-parsing.
                     let out_before = out.len();
+                    // CLIENT TRACKING (#409): snapshot whether this connection was tracking BEFORE
+                    // dispatch, so the hook can detect a CLIENT TRACKING OFF / RESET transition and
+                    // purge the connection from the table.
+                    let was_tracking = conn.tracking_on;
                     // PROD-9 blocking-park (FIX1): a blocking command (BLPOP/.../WAIT) whose
                     // non-blocking attempt found no data sets `block_request` and leaves `out`
                     // EMPTY, expecting the OWNING serve loop to PARK (the tokio loop runs
@@ -1900,6 +1937,10 @@ async fn serve_connection_uring(
                     )
                     .unwrap_or(u64::MAX);
                     record_command_stats(&state_rc, &request, out_before, &out, cmd_elapsed_us);
+                    // CLIENT TRACKING (#409): register this command's read keys for a tracking
+                    // connection, or invalidate a write's keys for every tracking client. The
+                    // common no-tracking path is one cheap gate inside (see `apply_client_tracking`).
+                    apply_client_tracking(&conn, &push_tx, &shed_flag, &request, was_tracking);
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
@@ -1973,7 +2014,7 @@ async fn serve_connection_uring(
         // silently dropped on the io_uring path. FIFO holds because `out` was flushed above before
         // this idle wait, so a push is rendered + sent only AFTER the in-flight command batch's
         // reply went out.
-        if conn.is_subscriber() {
+        if conn.is_subscriber() || conn.tracking_on {
             if subscriber_idle_wait_uring(
                 &rt,
                 &mut stream,
@@ -5601,6 +5642,98 @@ fn record_command_stats(
     }
 }
 
+/// CLIENT TRACKING read-register / write-invalidate hook (#409), run after each command. A READ by
+/// a tracking connection registers its read keys in THIS shard's tracking table; ANY write (by any
+/// connection) invalidates its keys for every tracking client (NOLOOP skips the writer's own
+/// connection); FLUSHALL/FLUSHDB invalidate everything.
+///
+/// PERF: the common no-tracking path is gated to a single bool + one thread-local borrow + `is_none`
+/// (the table is never created until a tracking client reads), so a server with no tracking clients
+/// pays one cheap check per command and allocates nothing. Only when tracking is active does it
+/// uppercase the command + consult the key spec.
+///
+/// SCOPE (this stage): SINGLE-SHARD-correct. A tracking client's read and the matching write both
+/// run on the key's owner shard, which IS this shard when `shards == 1` (the default + the
+/// differential bar). The cross-shard case (a read routed to a remote owner shard) is a documented
+/// follow-up; a stale foreign-shard entry self-heals when its key next changes (the push to a gone
+/// connection fails and is shed).
+fn apply_client_tracking(
+    conn: &ConnState,
+    push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
+    request: &Request,
+    was_tracking: bool,
+) {
+    // CLIENT TRACKING OFF / RESET transition: the connection WAS tracking and now is not. Purge it
+    // from this shard's table so a later write does not push to a connection that opted out.
+    if was_tracking && !conn.tracking_on {
+        purge_conn_tracking(conn.id);
+        return;
+    }
+
+    // The cheap gate: skip entirely unless THIS connection is tracking (it may need to register a
+    // read) OR the per-shard table already holds trackers (a write may need to invalidate).
+    let table_has_trackers = TRACKING.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|t| !t.borrow().is_empty())
+    });
+    if !conn.tracking_on && !table_has_trackers {
+        return;
+    }
+
+    let cmd_upper = ascii_upper(request.command());
+    if ironcache_server::is_write(&cmd_upper) {
+        if !table_has_trackers {
+            return;
+        }
+        let tbl = shard_tracking();
+        let mut t = tbl.borrow_mut();
+        // NOLOOP: a tracking writer does not get the echo for its OWN change.
+        let skip = conn.tracking_noloop.then_some(conn.id);
+        if cmd_upper == b"FLUSHALL" || cmd_upper == b"FLUSHDB" {
+            t.invalidate_all(skip);
+            return;
+        }
+        // Conservative: invalidate every key the write NAMED (a no-op write over-invalidates, which
+        // is safe -- the client just re-reads; it never MISSES a real change).
+        match ironcache_server::command_keys(&cmd_upper, request) {
+            ironcache_server::KeySpec::One(k) => {
+                t.invalidate(k, skip);
+            }
+            ironcache_server::KeySpec::Many(ks) => {
+                for k in ks {
+                    t.invalidate(k, skip);
+                }
+            }
+            ironcache_server::KeySpec::None => {}
+        }
+    } else if conn.tracking_on {
+        // A READ by a tracking connection: register every key it read so a later change pushes an
+        // invalidation. A non-keyed read (PING/INFO/...) registers nothing.
+        let keys: Vec<bytes::Bytes> = match ironcache_server::command_keys(&cmd_upper, request) {
+            ironcache_server::KeySpec::One(k) => vec![bytes::Bytes::copy_from_slice(k)],
+            ironcache_server::KeySpec::Many(ks) => ks
+                .iter()
+                .map(|k| bytes::Bytes::copy_from_slice(k))
+                .collect(),
+            ironcache_server::KeySpec::None => Vec::new(),
+        };
+        if keys.is_empty() {
+            return;
+        }
+        let sub = crate::pubsub::Subscriber {
+            sender: push_tx.clone(),
+            shed: std::sync::Arc::clone(shed_flag),
+        };
+        let tbl = shard_tracking();
+        let mut t = tbl.borrow_mut();
+        for k in keys {
+            t.track(k, conn.id, sub.clone());
+        }
+    }
+}
+
 fn record_slow_command(
     ctx: &ServerContext,
     env: &Rc<RefCell<SystemEnv>>,
@@ -6351,6 +6484,11 @@ fn ping_subscribed_reply(request: &Request) -> ironcache_server::Value {
 /// the connection's subscriptions are home-shard-local, so this runs on the connection's home
 /// shard. A no-op when not subscribed.
 fn deregister_all_subscriptions(conn: &ConnState) {
+    // CLIENT TRACKING (#409): purge this connection from the per-shard tracking table on close, so a
+    // later write never pushes an invalidation to a gone connection. A no-op (no alloc) when no
+    // tracking client ever used this shard; runs regardless of the pub/sub state below.
+    purge_conn_tracking(conn.id);
+
     if conn.sub_channels.is_empty()
         && conn.sub_patterns.is_empty()
         && conn.sub_shard_channels.is_empty()
@@ -6372,6 +6510,17 @@ fn deregister_all_subscriptions(conn: &ConnState) {
         // `shard_channels` table so a close leaves no shard-channel leak.
         table.unsubscribe_shard(channel.as_ref(), conn.id);
     }
+}
+
+/// Purge a connection from this shard's CLIENT TRACKING table (#409): `CLIENT TRACKING OFF` /
+/// RESET / disconnect. Accesses the table only if it EXISTS (no tracking client ever -> no-op, no
+/// allocation), so the common no-tracking close path is one thread-local borrow + `is_none`.
+fn purge_conn_tracking(conn_id: u64) {
+    TRACKING.with(|cell| {
+        if let Some(t) = cell.borrow().as_ref() {
+            t.borrow_mut().forget_conn(conn_id);
+        }
+    });
 }
 
 /// Whether `cmd_upper` is one of the set-algebra OR sorted-set-algebra commands the
