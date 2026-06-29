@@ -306,7 +306,12 @@ fn tracking_resp2_gate_and_trackinginfo_and_off() {
 
         // The one still-unsupported option (REDIRECT, stage 4) is rejected loudly, not silently
         // mis-moded. (BCAST is stage 2; OPTIN/OPTOUT are stage 3, each with their own tests.)
-        let redirect = cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKING", b"ON", b"REDIRECT", b"5"]).await;
+        let redirect = cmd(
+            &mut a,
+            &mut ab,
+            &[b"CLIENT", b"TRACKING", b"ON", b"REDIRECT", b"5"],
+        )
+        .await;
         assert!(
             matches!(&redirect, Resp::Error(_)),
             "REDIRECT must be a loud not-yet-supported error"
