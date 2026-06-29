@@ -368,6 +368,8 @@ fn is_admin(cmd: &[u8]) -> bool {
             | b"SLOWLOG"
             | b"LATENCY"
             | b"MEMORY"
+            // HOTKEYS (#428): the Redis 8.6 hot-key tracker, @admin/@slow/@dangerous like Redis.
+            | b"HOTKEYS"
             // DEBUG conformance subset (#411): an operator/internals command, @admin like Redis.
             | b"DEBUG"
     )
@@ -401,6 +403,8 @@ fn is_dangerous(cmd: &[u8]) -> bool {
             // @dangerous in Redis; CLIENT is already @dangerous above. MEMORY/LATENCY are @admin but
             // NOT @dangerous in Redis, so they are intentionally only in is_admin.
             | b"SLOWLOG"
+            // HOTKEYS (#428): @dangerous in Redis (it instruments the server + RESET wipes data).
+            | b"HOTKEYS"
             // DEBUG (#411): @dangerous in Redis (it exposes internals + can block the server).
             | b"DEBUG"
     )

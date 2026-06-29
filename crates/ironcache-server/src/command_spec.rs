@@ -948,6 +948,20 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        // HOTKEYS (#428): the faithful Redis 8.6 hot-key tracking container (START/STOP/GET/RESET).
+        // An AlwaysHome admin container (token + subcommand, arity Min(2)). `key_spec: None` (the
+        // genuinely-no-key case) so the per-command hot-key recording hook never attributes the
+        // HOTKEYS verb itself to a fake key (e.g. its subcommand token). @admin/@slow/@dangerous are
+        // assigned in acl/categories.rs.
+        b"HOTKEYS" => &CommandSpec {
+            name: b"HOTKEYS",
+            arity: Min(2),
+            class: AlwaysHome,
+            key_spec: KeySpecKind::None,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
         b"MEMORY" => &CommandSpec {
             name: b"MEMORY",
             arity: Min(2),
@@ -2919,6 +2933,7 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     b"SLOWLOG",
     b"MEMORY",
     b"LATENCY",
+    b"HOTKEYS",
     b"DEBUG",
     b"CLUSTER",
     b"SAVE",

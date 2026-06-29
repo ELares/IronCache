@@ -141,6 +141,20 @@ release.
 
 ### Added
 
+- HOTKEYS: the faithful Redis 8.6 hot-key tracking container (issue #428).
+  `HOTKEYS START METRICS <count> [CPU] [NET] [COUNT k] [DURATION s] [SAMPLE ratio]
+  [SLOTS ...]` begins a session that attributes per-command CPU microseconds and
+  network bytes to the command's keys; `HOTKEYS GET` returns the session totals plus
+  the top-K `by-cpu-time-us` / `by-net-bytes` lists (RESP3 map, RESP2 flat array, null
+  when no session); `HOTKEYS STOP` halts but keeps the data; `HOTKEYS RESET` frees it.
+  The top-K uses a bounded Space-Saving sketch (Metwally/Agrawal/El Abbadi 2005): O(1)
+  amortized weighted update, O(cap) memory, no false negatives for a true heavy hitter.
+  ACL `@admin`/`@slow`/`@dangerous`. The tracker is a node-level structure gated by ONE
+  relaxed atomic when inactive, so the default deployment and the per-PR perf-gate
+  (which run with tracking off) never touch the lock or the sketch; `SAMPLE ratio`
+  further bounds the active cost via systematic sampling. CPU is measured as monotonic
+  command-execution time (the same clock SLOWLOG/COMMANDSTATS use; no user/sys getrusage
+  split). Single-shard-correct node-wide aggregation.
 - CLIENT TRACKING REDIRECT, stage 4 (issue #409): `CLIENT TRACKING ON REDIRECT
   <client-id>` routes this connection's invalidations to a SECOND connection (the
   redirect target) instead of to itself. The target receives them as a Pub/Sub

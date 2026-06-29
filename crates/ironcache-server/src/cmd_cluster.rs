@@ -1282,6 +1282,7 @@ mod tests {
             slowlog: std::sync::Arc::new(ironcache_observe::SlowLog::new()),
             latency: std::sync::Arc::new(ironcache_observe::LatencyMonitor::new()),
             clients: std::sync::Arc::new(ironcache_observe::ClientRegistry::new()),
+            hotkeys: std::sync::Arc::new(ironcache_observe::Hotkeys::new()),
             boot,
         }
     }

@@ -462,6 +462,7 @@ pub fn run_server_observed(
     ));
     let latency = Arc::new(ironcache_observe::LatencyMonitor::new());
     let clients = Arc::new(ironcache_observe::ClientRegistry::new());
+    let hotkeys = Arc::new(ironcache_observe::Hotkeys::new());
 
     // Static, cheaply-cloned server context shared by value onto each shard. The
     // mutable cross-shard state is ONLY the runtime cell (an Arc); the rest is
@@ -536,6 +537,7 @@ pub fn run_server_observed(
         slowlog: slowlog.clone(),
         latency: latency.clone(),
         clients: clients.clone(),
+        hotkeys: hotkeys.clone(),
     };
     let default_proto = if config.default_resp3 {
         ProtoVersion::Resp3
@@ -1514,6 +1516,14 @@ async fn serve_connection(
                     )
                     .unwrap_or(u64::MAX);
                     record_command_stats(&state_rc, &request, out_before, &out, cmd_elapsed_us);
+                    // HOTKEYS (#428): attribute this command's CPU micros + net bytes to its keys
+                    // when a tracking session is active. The gate is ONE relaxed atomic load, so the
+                    // default (no session) path -- and the perf-gate -- never reach the recorder.
+                    if ctx.hotkeys.is_active() {
+                        let reply_bytes =
+                            u64::try_from(out.len().saturating_sub(out_before)).unwrap_or(u64::MAX);
+                        record_hotkeys(&ctx, &env, &request, cmd_elapsed_us, reply_bytes);
+                    }
                     // CLIENT TRACKING (#409): register this command's read keys for a tracking
                     // connection, or invalidate a write's keys for every tracking client. The
                     // common no-tracking path is one cheap gate inside (see `apply_client_tracking`).
@@ -1949,6 +1959,14 @@ async fn serve_connection_uring(
                     )
                     .unwrap_or(u64::MAX);
                     record_command_stats(&state_rc, &request, out_before, &out, cmd_elapsed_us);
+                    // HOTKEYS (#428): attribute this command's CPU micros + net bytes to its keys
+                    // when a tracking session is active. The gate is ONE relaxed atomic load, so the
+                    // default (no session) path -- and the perf-gate -- never reach the recorder.
+                    if ctx.hotkeys.is_active() {
+                        let reply_bytes =
+                            u64::try_from(out.len().saturating_sub(out_before)).unwrap_or(u64::MAX);
+                        record_hotkeys(&ctx, &env, &request, cmd_elapsed_us, reply_bytes);
+                    }
                     // CLIENT TRACKING (#409): register this command's read keys for a tracking
                     // connection, or invalidate a write's keys for every tracking client. The
                     // common no-tracking path is one cheap gate inside (see `apply_client_tracking`).
@@ -5857,6 +5875,31 @@ fn resolve_redirect_target(target_id: u64) -> Option<crate::pubsub::Subscriber> 
         .cloned()
 }
 
+/// HOTKEYS recording hook (#428): attribute one command's resource use to its keys while a tracking
+/// session is active. The CALLER gates this on `ctx.hotkeys.is_active()` (one relaxed atomic), so the
+/// default (no session) path never reaches here. Piggybacks the already-measured `cmd_elapsed_us`
+/// (the CPU metric) and the reply byte delta; the request payload bytes are summed here. A command
+/// with no routable key (HOTKEYS itself, PING, ...) attributes nothing to any key, only to the
+/// session totals.
+fn record_hotkeys(
+    ctx: &ServerContext,
+    env: &Rc<RefCell<SystemEnv>>,
+    request: &Request,
+    cmd_elapsed_us: u64,
+    reply_bytes: u64,
+) {
+    let cmd_upper = ascii_upper(request.command());
+    let req_bytes: u64 = request.args.iter().map(|a| a.len() as u64).sum();
+    let net_bytes = req_bytes.saturating_add(reply_bytes);
+    let now_ms = env.borrow().now_unix_millis();
+    let keys: Vec<&[u8]> = match ironcache_server::command_keys(&cmd_upper, request) {
+        ironcache_server::KeySpec::One(k) => vec![k],
+        ironcache_server::KeySpec::Many(ks) => ks,
+        ironcache_server::KeySpec::None => Vec::new(),
+    };
+    ctx.hotkeys.record(&keys, cmd_elapsed_us, net_bytes, now_ms);
+}
+
 fn record_slow_command(
     ctx: &ServerContext,
     env: &Rc<RefCell<SystemEnv>>,
@@ -7368,6 +7411,7 @@ mod tests {
             slowlog: Arc::new(ironcache_observe::SlowLog::new()),
             latency: Arc::new(ironcache_observe::LatencyMonitor::new()),
             clients: Arc::new(ironcache_observe::ClientRegistry::new()),
+            hotkeys: Arc::new(ironcache_observe::Hotkeys::new()),
             boot,
         }
     }

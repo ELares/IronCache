@@ -256,6 +256,13 @@ pub struct ServerContext {
     /// on accept and deregisters on close (cold paths, not per command); the registry is consulted
     /// only by the rare CLIENT admin verbs and the serve loop's post-batch kill/pause check.
     pub clients: Arc<ironcache_observe::ClientRegistry>,
+    /// The node-level HOTKEYS tracking container (#428): the faithful Redis 8.6 hot-key tracker the
+    /// `HOTKEYS START`/`STOP`/`GET`/`RESET` verbs drive. ONE per node, shared by `Arc`. The
+    /// per-command recording HOOK lives in the serve layer (it needs the command's elapsed micros +
+    /// keys); when no session is active the hook short-circuits on ONE relaxed atomic
+    /// ([`ironcache_observe::Hotkeys::is_active`]), so the default deployment and the per-PR perf-gate
+    /// (which run with tracking off) are byte-unchanged and never touch the lock or the sketch.
+    pub hotkeys: Arc<ironcache_observe::Hotkeys>,
 }
 
 impl ServerContext {
@@ -1105,6 +1112,11 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // `ctx.slowlog`; the per-command timing HOOK that POPULATES the ring lives in the serve
         // layer (it needs the client addr/name + the Env clock). AlwaysHome, no key.
         b"SLOWLOG" => cmd_slowlog(ctx, req),
+        // HOTKEYS START/STOP/GET/RESET (#428): the faithful Redis 8.6 hot-key tracker. Drives the
+        // node-level container in `ctx.hotkeys`; the per-command recording HOOK that POPULATES it
+        // lives in the serve layer (it needs the command's elapsed micros + keys). `now` supplies the
+        // Env-clock unix-ms for the session timestamps. AlwaysHome, no key.
+        b"HOTKEYS" => cmd_hotkeys(ctx, now, req),
         // MEMORY USAGE/DOCTOR/STATS/HELP (PROD-7). USAGE estimates one key's bytes via the store;
         // STATS reuses the observe gauges; DOCTOR is a human string. AlwaysHome; only USAGE keys.
         b"MEMORY" => cmd_memory(ctx, store, db, now, mem, req),
@@ -3093,6 +3105,240 @@ fn slowlog_help() -> Value {
     Value::Array(Some(lines.iter().map(|l| Value::bulk_str(l)).collect()))
 }
 
+// -- HOTKEYS (#428): the faithful Redis 8.6 hot-key tracking container -------------------------
+
+/// `HOTKEYS START METRICS count [CPU] [NET] [COUNT k] [DURATION s] [SAMPLE ratio] [SLOTS count
+/// slot...] | STOP | GET | RESET | HELP` (#428): drive the node-level [`ironcache_observe::Hotkeys`]
+/// tracker in `ctx.hotkeys`. `now` carries the Env-clock unix-ms used for the session timestamps; the
+/// per-command RECORDING hook that POPULATES the sketches lives in the serve layer (it needs each
+/// command's elapsed micros + keys).
+fn cmd_hotkeys(ctx: &ServerContext, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() < 2 {
+        return Value::error(ErrorReply::wrong_arity("hotkeys"));
+    }
+    match ascii_upper(&req.args[1]).as_slice() {
+        b"START" => match parse_hotkeys_start(req) {
+            Ok(cfg) => match ctx.hotkeys.start(cfg, now.0) {
+                Ok(()) => Value::ok(),
+                Err(e) => Value::error(ErrorReply::err(e)),
+            },
+            Err(e) => e,
+        },
+        b"STOP" => {
+            if req.args.len() != 2 {
+                return Value::error(ErrorReply::syntax_error());
+            }
+            match ctx.hotkeys.stop(now.0) {
+                Ok(()) => Value::ok(),
+                Err(e) => Value::error(ErrorReply::err(e)),
+            }
+        }
+        b"RESET" => {
+            if req.args.len() != 2 {
+                return Value::error(ErrorReply::syntax_error());
+            }
+            match ctx.hotkeys.reset() {
+                Ok(()) => Value::ok(),
+                Err(e) => Value::error(ErrorReply::err(e)),
+            }
+        }
+        b"GET" => {
+            if req.args.len() != 2 {
+                return Value::error(ErrorReply::syntax_error());
+            }
+            // Null when no session exists (never started / after RESET), matching Redis.
+            ctx.hotkeys
+                .snapshot(now.0)
+                .map_or(Value::Null, |snap| hotkeys_get_value(&snap))
+        }
+        b"HELP" => hotkeys_help(),
+        _ => Value::error(ErrorReply::unknown_subcommand(
+            "HOTKEYS",
+            &String::from_utf8_lossy(&req.args[1]),
+        )),
+    }
+}
+
+/// Parse `HOTKEYS START` options into a [`ironcache_observe::HotkeysConfig`], or return the error
+/// `Value` to reply. `METRICS count [CPU] [NET]` is required (at least one metric); `COUNT`,
+/// `DURATION` (seconds), `SAMPLE` (ratio), and `SLOTS` (parsed + validated; a single node owns all
+/// slots so the selection is informational) are optional.
+fn parse_hotkeys_start(req: &Request) -> Result<ironcache_observe::HotkeysConfig, Value> {
+    // args: [0]=HOTKEYS [1]=START [2]=METRICS [3]=count [4..4+count]=CPU/NET tokens, then options.
+    if req.args.len() < 4 || !ascii_upper(&req.args[2]).eq_ignore_ascii_case(b"METRICS") {
+        return Err(Value::error(ErrorReply::err(
+            "HOTKEYS START requires METRICS <count> [CPU] [NET]",
+        )));
+    }
+    let metric_count = parse_u64_arg(&req.args[3]).ok_or_else(syntax_err)? as usize;
+    if metric_count == 0 || metric_count > 2 || 4 + metric_count > req.args.len() {
+        return Err(Value::error(ErrorReply::syntax_error()));
+    }
+    let (mut cpu, mut net) = (false, false);
+    for tok in &req.args[4..4 + metric_count] {
+        match ascii_upper(tok).as_slice() {
+            b"CPU" => cpu = true,
+            b"NET" => net = true,
+            _ => return Err(Value::error(ErrorReply::syntax_error())),
+        }
+    }
+    if !cpu && !net {
+        return Err(Value::error(ErrorReply::err(
+            "HOTKEYS START requires at least one of CPU or NET",
+        )));
+    }
+    let mut count = ironcache_observe::DEFAULT_HOTKEYS_COUNT;
+    let mut sample_ratio: u64 = 1;
+    let mut duration_ms: u64 = 0;
+    let mut i = 4 + metric_count;
+    while i < req.args.len() {
+        match ascii_upper(&req.args[i]).as_slice() {
+            b"COUNT" => {
+                let k = parse_u64_arg(req.args.get(i + 1).ok_or_else(syntax_err)?)
+                    .filter(|&k| k >= 1)
+                    .ok_or_else(syntax_err)?;
+                count = usize::try_from(k).unwrap_or(usize::MAX);
+                i += 2;
+            }
+            b"DURATION" => {
+                let secs = parse_u64_arg(req.args.get(i + 1).ok_or_else(syntax_err)?)
+                    .ok_or_else(syntax_err)?;
+                duration_ms = secs.saturating_mul(1000);
+                i += 2;
+            }
+            b"SAMPLE" => {
+                sample_ratio = parse_u64_arg(req.args.get(i + 1).ok_or_else(syntax_err)?)
+                    .filter(|&r| r >= 1)
+                    .ok_or_else(syntax_err)?;
+                i += 2;
+            }
+            b"SLOTS" => {
+                // `SLOTS count slot [slot ...]`: validate the shape (a single node owns all slots, so
+                // the selection is accepted but informational; selected-slots reports the full range).
+                let n = parse_u64_arg(req.args.get(i + 1).ok_or_else(syntax_err)?)
+                    .ok_or_else(syntax_err)? as usize;
+                let end = i + 2 + n;
+                if n == 0 || end > req.args.len() {
+                    return Err(Value::error(ErrorReply::syntax_error()));
+                }
+                for s in &req.args[i + 2..end] {
+                    if parse_u64_arg(s).is_none_or(|s| s > 16383) {
+                        return Err(Value::error(ErrorReply::err("Invalid slot")));
+                    }
+                }
+                i = end;
+            }
+            _ => return Err(Value::error(ErrorReply::syntax_error())),
+        }
+    }
+    Ok(ironcache_observe::HotkeysConfig {
+        cpu,
+        net,
+        count,
+        sample_ratio,
+        duration_ms,
+    })
+}
+
+/// Parse a non-negative decimal integer argument, or `None` if it is not a valid `u64`.
+fn parse_u64_arg(arg: &[u8]) -> Option<u64> {
+    core::str::from_utf8(arg).ok().and_then(|s| s.parse().ok())
+}
+
+/// A zero-arg closure that yields the standard syntax error `Value` (for `ok_or_else`).
+fn syntax_err() -> Value {
+    Value::error(ErrorReply::syntax_error())
+}
+
+/// Build the `HOTKEYS GET` reply from a snapshot (the Redis 8.6 field set). Rendered as a
+/// [`Value::Map`] so RESP3 emits a `%` map and RESP2 degrades to the flat `[k, v, ...]` array.
+fn hotkeys_get_value(snap: &ironcache_observe::HotkeysSnapshot) -> Value {
+    let mut fields: Vec<(Value, Value)> = vec![
+        (
+            Value::bulk_str("tracking-active"),
+            Value::Integer(i64::from(snap.active)),
+        ),
+        (
+            Value::bulk_str("sample-ratio"),
+            Value::Integer(i64::try_from(snap.sample_ratio).unwrap_or(i64::MAX)),
+        ),
+        // A single node owns the whole slot range; report it as one [start, end] pair.
+        (
+            Value::bulk_str("selected-slots"),
+            Value::Array(Some(vec![Value::Array(Some(vec![
+                Value::Integer(0),
+                Value::Integer(16383),
+            ]))])),
+        ),
+        (
+            Value::bulk_str("all-commands-all-slots-us"),
+            Value::Integer(i64::try_from(snap.all_us).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::bulk_str("net-bytes-all-commands-all-slots"),
+            Value::Integer(i64::try_from(snap.all_net_bytes).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::bulk_str("collection-start-time-unix-ms"),
+            Value::Integer(i64::try_from(snap.start_unix_ms).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::bulk_str("collection-duration-ms"),
+            Value::Integer(i64::try_from(snap.duration_ms).unwrap_or(i64::MAX)),
+        ),
+    ];
+    if let Some(by_cpu) = &snap.cpu {
+        // IronCache attributes monotonic command-execution time as the CPU metric (the same clock
+        // SLOWLOG/COMMANDSTATS use); it does not split user/sys via getrusage, so user carries the
+        // measured time and sys is 0.
+        fields.push((
+            Value::bulk_str("total-cpu-time-user-ms"),
+            Value::Integer(i64::try_from(snap.all_us / 1000).unwrap_or(i64::MAX)),
+        ));
+        fields.push((Value::bulk_str("total-cpu-time-sys-ms"), Value::Integer(0)));
+        fields.push((
+            Value::bulk_str("by-cpu-time-us"),
+            hotkeys_pairs_array(by_cpu),
+        ));
+    }
+    if let Some(by_net) = &snap.net {
+        fields.push((
+            Value::bulk_str("total-net-bytes"),
+            Value::Integer(i64::try_from(snap.all_net_bytes).unwrap_or(i64::MAX)),
+        ));
+        fields.push((Value::bulk_str("by-net-bytes"), hotkeys_pairs_array(by_net)));
+    }
+    Value::Map(fields)
+}
+
+/// Render a top-K list as the Redis flat `[key, value, key, value, ...]` array.
+fn hotkeys_pairs_array(pairs: &[(bytes::Bytes, u64)]) -> Value {
+    let mut out = Vec::with_capacity(pairs.len() * 2);
+    for (key, val) in pairs {
+        out.push(Value::bulk(key.clone()));
+        out.push(Value::Integer(i64::try_from(*val).unwrap_or(i64::MAX)));
+    }
+    Value::Array(Some(out))
+}
+
+/// `HOTKEYS HELP` -> the subcommand summary array (Redis shape).
+fn hotkeys_help() -> Value {
+    let lines: &[&str] = &[
+        "HOTKEYS <subcommand> [<arg> ...]. Subcommands are:",
+        "START METRICS <count> [CPU] [NET] [COUNT <k>] [DURATION <s>] [SAMPLE <ratio>] [SLOTS ...]",
+        "    Begin tracking the top hot keys by the chosen metric(s).",
+        "STOP",
+        "    Stop tracking but keep the collected data.",
+        "GET",
+        "    Return the tracking results and metadata (null if no session).",
+        "RESET",
+        "    Release the tracking resources (only when stopped).",
+        "HELP",
+        "    Print this help.",
+    ];
+    Value::Array(Some(lines.iter().map(|l| Value::bulk_str(l)).collect()))
+}
+
 // -- MEMORY (PROD-7) ---------------------------------------------------------------------------
 
 /// `MEMORY USAGE key [SAMPLES n] | DOCTOR | STATS | HELP` (PROD-7). USAGE estimates one key's byte
@@ -3624,6 +3870,7 @@ mod tests {
             slowlog: std::sync::Arc::new(ironcache_observe::SlowLog::new()),
             latency: std::sync::Arc::new(ironcache_observe::LatencyMonitor::new()),
             clients: std::sync::Arc::new(ironcache_observe::ClientRegistry::new()),
+            hotkeys: std::sync::Arc::new(ironcache_observe::Hotkeys::new()),
             boot,
         }
     }
@@ -9798,6 +10045,141 @@ mod tests {
             ),
             arr(&[b"2", b"3", b"1"])
         );
+    }
+
+    // -- HOTKEYS (#428): the faithful Redis 8.6 hot-key tracking container ----------------------
+
+    /// Pull a field's value out of a HOTKEYS GET map reply by name.
+    fn hk_field<'a>(reply: &'a Value, name: &str) -> &'a Value {
+        let Value::Map(pairs) = reply else {
+            panic!("HOTKEYS GET must be a Map, got {reply:?}");
+        };
+        for (k, v) in pairs {
+            if *k == Value::bulk_str(name) {
+                return v;
+            }
+        }
+        panic!("HOTKEYS GET missing field {name}");
+    }
+
+    #[test]
+    fn hotkeys_lifecycle_and_get_shape() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        // No session yet: GET is null.
+        assert_eq!(run(&c, &mut s, &[b"HOTKEYS", b"GET"]), Value::Null);
+        // START with both metrics.
+        assert_eq!(
+            run(
+                &c,
+                &mut s,
+                &[b"HOTKEYS", b"START", b"METRICS", b"2", b"CPU", b"NET"]
+            ),
+            Value::ok()
+        );
+        // Seed the sketch directly (the per-command recording hook lives in the serve layer; here we
+        // exercise the COMMAND surface that reads it), mirroring the SLOWLOG test.
+        c.hotkeys.record(&[b"hot"], 100, 40, 0);
+        c.hotkeys.record(&[b"hot"], 100, 40, 0);
+        c.hotkeys.record(&[b"cold"], 1, 1, 0);
+        let g = run(&c, &mut s, &[b"HOTKEYS", b"GET"]);
+        assert_eq!(*hk_field(&g, "tracking-active"), Value::Integer(1));
+        assert_eq!(*hk_field(&g, "sample-ratio"), Value::Integer(1));
+        assert_eq!(
+            *hk_field(&g, "all-commands-all-slots-us"),
+            Value::Integer(201)
+        );
+        // by-cpu-time-us is a flat [key, val, ...] array with `hot` ranked first (200).
+        match hk_field(&g, "by-cpu-time-us") {
+            Value::Array(Some(items)) => {
+                assert_eq!(items[0], Value::bulk(bytes::Bytes::from_static(b"hot")));
+                assert_eq!(items[1], Value::Integer(200));
+            }
+            other => panic!("by-cpu-time-us must be an array, got {other:?}"),
+        }
+        // Double START errors.
+        assert!(matches!(
+            run(
+                &c,
+                &mut s,
+                &[b"HOTKEYS", b"START", b"METRICS", b"1", b"CPU"]
+            ),
+            Value::Error(_)
+        ));
+        // RESET while active errors.
+        assert!(matches!(
+            run(&c, &mut s, &[b"HOTKEYS", b"RESET"]),
+            Value::Error(_)
+        ));
+        // STOP preserves data; GET now reports inactive but keeps the totals.
+        assert_eq!(run(&c, &mut s, &[b"HOTKEYS", b"STOP"]), Value::ok());
+        let g2 = run(&c, &mut s, &[b"HOTKEYS", b"GET"]);
+        assert_eq!(*hk_field(&g2, "tracking-active"), Value::Integer(0));
+        assert_eq!(
+            *hk_field(&g2, "all-commands-all-slots-us"),
+            Value::Integer(201)
+        );
+        // RESET when stopped -> GET null again.
+        assert_eq!(run(&c, &mut s, &[b"HOTKEYS", b"RESET"]), Value::ok());
+        assert_eq!(run(&c, &mut s, &[b"HOTKEYS", b"GET"]), Value::Null);
+    }
+
+    #[test]
+    fn hotkeys_only_selected_metric_appears() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        run(
+            &c,
+            &mut s,
+            &[b"HOTKEYS", b"START", b"METRICS", b"1", b"CPU"],
+        );
+        let g = run(&c, &mut s, &[b"HOTKEYS", b"GET"]);
+        // CPU selected -> its fields present; NET not selected -> its fields absent.
+        let present = matches!(g, Value::Map(ref p) if p.iter().any(|(k, _)| *k == Value::bulk_str("by-cpu-time-us")));
+        let net_absent = matches!(g, Value::Map(ref p) if !p.iter().any(|(k, _)| *k == Value::bulk_str("by-net-bytes")));
+        assert!(present, "by-cpu-time-us present");
+        assert!(net_absent, "by-net-bytes absent when NET not selected");
+    }
+
+    #[test]
+    fn hotkeys_start_validation() {
+        let c = ctx(None);
+        let mut s = state(&c);
+        // Missing METRICS.
+        assert!(matches!(
+            run(&c, &mut s, &[b"HOTKEYS", b"START"]),
+            Value::Error(_)
+        ));
+        // METRICS count mismatch / no real metric.
+        assert!(matches!(
+            run(
+                &c,
+                &mut s,
+                &[b"HOTKEYS", b"START", b"METRICS", b"1", b"BOGUS"]
+            ),
+            Value::Error(_)
+        ));
+        // SAMPLE 0 is invalid (ratio must be >= 1).
+        assert!(matches!(
+            run(
+                &c,
+                &mut s,
+                &[
+                    b"HOTKEYS", b"START", b"METRICS", b"1", b"CPU", b"SAMPLE", b"0"
+                ]
+            ),
+            Value::Error(_)
+        ));
+        // STOP with no active session errors.
+        assert!(matches!(
+            run(&c, &mut s, &[b"HOTKEYS", b"STOP"]),
+            Value::Error(_)
+        ));
+        // Unknown subcommand errors.
+        assert!(matches!(
+            run(&c, &mut s, &[b"HOTKEYS", b"BOGUS"]),
+            Value::Error(_)
+        ));
     }
 
     // -- PROD-7 operability: SLOWLOG / MEMORY / LATENCY / CLIENT extensions ---------------------

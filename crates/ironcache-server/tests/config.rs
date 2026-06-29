@@ -65,6 +65,7 @@ fn ctx(runtime: Arc<RuntimeConfig>, boot: Config) -> ServerContext {
         slowlog: Arc::new(ironcache_observe::SlowLog::new()),
         latency: Arc::new(ironcache_observe::LatencyMonitor::new()),
         clients: Arc::new(ironcache_observe::ClientRegistry::new()),
+        hotkeys: Arc::new(ironcache_observe::Hotkeys::new()),
         boot,
     }
 }
