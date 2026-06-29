@@ -77,9 +77,33 @@ AI-Driven.
     backing radix index are out of scope for M0 through M2. Recording the absence
     keeps the compatibility surface honest (#16 parks Streams in Tier 3); if ever
     built, they would reuse a generic ordered map, not a bespoke rax. (Compatible
-    honesty; deferred.)
+    honesty; deferred.) Re-evaluated post-v1 in ADR-0028 (#418): Streams stays
+    deferred, now with an explicit reversal bar (demonstrated cache demand, built
+    against a generic ordered map and the current XDELEX/XACKDEL surface).
 
-Each numbered entry corresponds to a closed `[NON-GOAL]` issue. Observability
+## Post-v1 data-type decisions (#415, #416, #417)
+
+These are reversible scope calls made after v1 shipped, recorded as ADRs rather
+than as hard non-goals (they are permitted to land later, unlike the runtime
+non-goals above):
+
+13. **No native vector-set type in the core binary for now (ADR-0029, #415).**
+    The charter permits off-path similarity search over client-supplied vectors
+    (non-goal 10 allows search, 11 bans on-engine embedding generation); a graph
+    ANN index is declined now on Simple and the tenet order, gated by a future
+    design issue and a recall-versus-QPS proof.
+14. **No native JSON document type in the core binary for now (ADR-0031, #417).**
+    A JSONPath engine and document representation are an opt-in subsystem clients
+    do not treat as baseline compatibility; declined for the lean default
+    artifact, a candidate for a future optional module seam alongside vector sets.
+15. **Probabilistic analytics types deferred, Bloom accepted (ADR-0030, #416).**
+    Bloom filters are accepted as the next probabilistic type (Efficient-aligned,
+    cache-shaped) behind a design issue, so they are a goal, not a non-goal; the
+    analytics members (Count-Min Sketch, Top-K, t-digest) are the deferred part,
+    pending demonstrated demand.
+
+Each numbered entry corresponds to a closed `[NON-GOAL]` or `[DECISION]` issue.
+Observability
 note: IronCache will, unlike Redis [redis-no-builtin-prometheus], expose native
 metrics; that is a goal, recorded here only to contrast with the runtime
 non-goals above.
