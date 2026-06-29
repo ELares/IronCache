@@ -99,10 +99,10 @@ pub use command_spec::{
 };
 pub use conn::ConnState;
 pub use dispatch::{
-    EXPIRE_CYCLE_INTERVAL, MAX_RECLAIM_PER_CALL, MAX_RECLAIM_PER_CYCLE, RollupFn, ServerContext,
-    ShutdownMode, acl_enforce, acl_resolve_if_stale, command_allowed_pre_auth, dispatch,
-    dispatch_remote_keyed, dispatch_remote_whole_keyspace, dispatch_with_cmd, drain_due_keys,
-    in_sync_replica_count, parse_shutdown,
+    CmdStatsFn, EXPIRE_CYCLE_INTERVAL, MAX_RECLAIM_PER_CALL, MAX_RECLAIM_PER_CYCLE, RollupFn,
+    ServerContext, ShutdownMode, acl_enforce, acl_resolve_if_stale, command_allowed_pre_auth,
+    dispatch, dispatch_remote_keyed, dispatch_remote_whole_keyspace, dispatch_with_cmd,
+    drain_due_keys, in_sync_replica_count, parse_shutdown,
 };
 pub use route::{
     CommandClass, KeySpec, classify, command_keys, owner_shard, owner_shard_set, single_key,

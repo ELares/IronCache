@@ -141,6 +141,15 @@ release.
 
 ### Added
 
+- Observability command parity, part 1 (issue #413): `INFO COMMANDSTATS` and
+  `INFO ERRORSTATS`. `INFO commandstats` (and `INFO all` / `everything`) now reports
+  one `cmdstat_<cmd>:calls=N,usec=N,usec_per_call=N.NN,rejected_calls=N,failed_calls=N`
+  line per command, and `INFO errorstats` one `errorstat_<CODE>:count=N` line per error
+  reply code, matching the Redis field shapes go-redis / redis-py parse. The per-command
+  tally is recorded on the serving shard off the already-encoded reply (no second
+  dispatch); the timing read is shared with the SLOWLOG hook, and `CONFIG RESETSTAT`
+  clears both tables. The default `INFO` omits these sections (Redis keeps the default
+  reply small). `HOTKEYS` is the part-2 follow-up.
 - Sharded Pub/Sub (issue #410): `SSUBSCRIBE` / `SUNSUBSCRIBE` / `SPUBLISH` plus the
   `PUBSUB SHARDCHANNELS` / `PUBSUB SHARDNUMSUB` introspection (Redis 7.0). Shard
   channels live in a namespace SEPARATE from regular channels: an `SPUBLISH` delivers
