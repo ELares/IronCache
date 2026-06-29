@@ -1295,3 +1295,55 @@ fn config_client_subcommand_aclfile_round_trip() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// (21) MSETEX gates EVERY key through the key-pattern check, not just the first (#412; the
+/// Redis 8.6 MSETEX ACL-bypass fix). A user `+msetex ~k:*` can MSETEX when ALL the strided
+/// keys (args[2], args[4], ...) match `~k:*`, but is `-NOPERM ... access a key` when ANY key
+/// (including a non-first one) falls outside the pattern -- which only holds if the
+/// `MsetexNumkeysStrided` key spec extracts the keys past the `numkeys` prefix. The denied
+/// op writes NOTHING.
+#[test]
+fn msetex_acl_key_pattern_gates_every_strided_key() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // A user scoped to `~k:*` with +msetex (and +exists/+get to observe the effect).
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL", "SETUSER", "app", "on", ">pw", "~k:*", "+msetex", "+exists", "+get"
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "app", "pw"]).await, "+OK\r\n");
+
+        // ALL keys inside ~k:* -> allowed (reply 1).
+        assert_eq!(
+            cmd(&mut a, &["MSETEX", "2", "k:1", "v1", "k:2", "v2"]).await,
+            ":1\r\n"
+        );
+        assert_eq!(cmd(&mut a, &["GET", "k:1"]).await, "$2\r\nv1\r\n");
+
+        // The SECOND key is OUTSIDE ~k:* -> NOPERM key (proves the non-first key is checked),
+        // and NOTHING is written (the foreign key never appears).
+        let denied = cmd(&mut a, &["MSETEX", "2", "k:3", "v3", "other:1", "v4"]).await;
+        assert!(
+            denied.starts_with("-NOPERM") && denied.contains("access a key"),
+            "a foreign non-first MSETEX key must be NOPERM, got {denied:?}"
+        );
+        // The default (admin) connection confirms neither key was set by the denied op.
+        assert_eq!(cmd(&mut c, &["EXISTS", "k:3"]).await, ":0\r\n");
+        assert_eq!(cmd(&mut c, &["EXISTS", "other:1"]).await, ":0\r\n");
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}

@@ -213,6 +213,8 @@ fn type_category(cmd: &[u8]) -> Option<Category> {
         b"MGET",
         b"MSET",
         b"MSETNX",
+        b"MSETEX",
+        b"DELIFEQ",
     ];
     const LIST: &[&[u8]] = &[
         b"LPUSH",
@@ -477,9 +479,11 @@ fn is_fast(cmd: &[u8]) -> bool {
             | b"PSETEX"
             | b"GETSET"
             | b"GETEX"
-            // GETDEL is O(1) (Redis flags it @fast). GETRANGE/SUBSTR/SETRANGE/MSETNX are
-            // O(N) -> @slow (the default for any command not listed here).
+            // GETDEL is O(1) (Redis flags it @fast). GETRANGE/SUBSTR/SETRANGE/MSETNX/MSETEX
+            // are O(N) -> @slow (the default for any command not listed here).
             | b"GETDEL"
+            // DELIFEQ is O(1) compare-and-delete (#412), @fast like GETDEL.
+            | b"DELIFEQ"
             | b"STRLEN"
             | b"APPEND"
             | b"INCR"

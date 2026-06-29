@@ -141,6 +141,25 @@ release.
 
 ### Added
 
+- Native compare-and-set and bulk-TTL primitives (issue #412): the atomic
+  operations that previously forced a Lua script or a `WATCH`/`MULTI`/`EXEC` round
+  trip, now as single server-side verbs (no scripting runtime, reinforcing the
+  Tier-4 Lua non-goal). `SET` gains the Redis 8.4 compare-and-set options `IFEQ
+  value` (write only if the current value equals `value`; a missing key is NOT
+  created) and `IFNE value` (write only if it differs; a missing key IS created),
+  mutually exclusive with `NX`/`XX` and composing with `GET` and the expiration
+  options; the compare reads the value in place (no copy on the CAS hot path).
+  `DELIFEQ key value` is the Valkey 9.0 compare-and-delete (the lock-release /
+  leader-key pattern: delete only if the value is still our own token), returning
+  `1` on a match, `0` otherwise, `WRONGTYPE` on a non-string. `MSETEX numkeys key
+  value [...] [NX|XX] [EX|PX|EXAT|PXAT|KEEPTTL]` is the Redis 8.4 atomic multi-key
+  set with a shared expiration (it extends `MSET`/`MSETNX`): the `NX`/`XX` gate is
+  evaluated over every key before any write (all-or-nothing, reply `1`/`0`). The
+  `MSETEX` key spec extracts exactly the strided keys after the `numkeys` prefix,
+  so every key is gated through the ACL key-pattern check (the Redis 8.6 MSETEX
+  ACL-bypass fix) with a restricted-user test. The digest-compare `SET` options
+  `IFDEQ`/`IFDNE` are a documented follow-up (they need Redis's internal value
+  digest, not reproduced here).
 - Command-surface completeness (issue #414): `LOLWUT` now returns a non-error
   bulk string with the server version (so health probes and clients that call it
   succeed), and `BITOP` gains the Redis 8.2 set-algebra operators `DIFF`, `DIFF1`,

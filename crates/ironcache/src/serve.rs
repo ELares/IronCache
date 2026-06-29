@@ -6157,10 +6157,17 @@ fn is_fan_out_spanning_move(cmd_upper: &[u8]) -> bool {
 /// only rejected when it carries a STORE dest on a DIFFERENT owner than the source (the gate
 /// caller checks `owner_shard_set == None`, which a SORT without STORE -- one key -- never
 /// triggers). The set is DISJOINT from the fan-out predicates.
+///
+/// MSETEX (#412) joins this set: it is an ATOMIC all-or-nothing multi-key set (the NX/XX gate
+/// must see every key before any write, and a shared TTL applies to all), so a naive per-shard
+/// fan-out (like MSET) would break the gate's atomicity. A spanning MSETEX is therefore
+/// rejected loudly rather than partial-applied; the cross-shard atomic MSETEX (the gather-then
+/// -conditional-fan-out that `spanning_msetnx` does for MSETNX) is a deferred follow-up. On a
+/// single-node deployment (every key home-owned) MSETEX never spans, so this never fires there.
 fn is_spanning_move_reject(cmd_upper: &[u8]) -> bool {
     matches!(
         cmd_upper,
-        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMPOP" | b"ZMPOP" | b"SORT"
+        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMPOP" | b"ZMPOP" | b"SORT" | b"MSETEX"
     )
 }
 

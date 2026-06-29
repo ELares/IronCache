@@ -15,7 +15,9 @@
 //!   WRONGTYPE with src unchanged (the element restored);
 //! - a spanning MSETNX is ALL-OR-NOTHING (sets ALL keys across shards and replies :1 when none
 //!   exist; sets NONE and replies :0 when ANY exists), NOT a home subset;
-//! - a spanning RENAME / COPY / LMPOP is FAIL-LOUD (a clear error), never a silent partial;
+//! - a spanning RENAME / COPY / LMPOP / MSETEX is FAIL-LOUD (a clear error), never a silent
+//!   partial (the spanning atomic MSETEX, #412, is deferred like RENAME/COPY; co-located
+//!   MSETEX works);
 //! - co-located (same-shard) invocations are byte-identical to the single-shard handler.
 
 use ironcache::test_support::run_server_for_test;
@@ -494,6 +496,84 @@ fn spanning_rename_copy_lmpop_are_fail_loud_not_silent() {
             matches!(lmpop, Resp::Error(_)),
             "spanning LMPOP must be a loud error, got {lmpop:?}"
         );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// A SHARD-SPANNING MSETEX (#412) is rejected LOUDLY, never silently applied to the
+/// home-subset (which would break its atomic all-or-nothing set and misreport 1). Neither key
+/// is written. The co-located case (every key on one shard) still works -- see
+/// `colocated_msetex_works`.
+#[test]
+fn spanning_msetex_is_fail_loud_not_silent() {
+    let r = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&r, async {
+        let (server, port) = boot(SHARDS);
+        let mut c = connect_retry(port).await;
+        let mut b = Vec::new();
+
+        let (src, dst) = spanning_pair();
+        // MSETEX over two keys that span shards -> a loud error, not a silent partial.
+        let mx = roundtrip(
+            &mut c,
+            &mut b,
+            &[
+                b"MSETEX",
+                b"2",
+                src.as_bytes(),
+                b"vA",
+                dst.as_bytes(),
+                b"vB",
+            ],
+        )
+        .await;
+        assert!(
+            matches!(mx, Resp::Error(_)),
+            "spanning MSETEX must be a loud error, got {mx:?}"
+        );
+        // Neither key was created by the rejected MSETEX.
+        let src_ex = roundtrip(&mut c, &mut b, &[b"EXISTS", src.as_bytes()]).await;
+        assert_eq!(
+            src_ex,
+            Resp::Integer(0),
+            "src not created by a rejected MSETEX"
+        );
+        let dst_ex = roundtrip(&mut c, &mut b, &[b"EXISTS", dst.as_bytes()]).await;
+        assert_eq!(
+            dst_ex,
+            Resp::Integer(0),
+            "dst not created by a rejected MSETEX"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// Co-located MSETEX (every key home-owned on one shard, the single-node-equivalent case)
+/// behaves like the single-shard handler: it sets all keys and replies 1 (#412).
+#[test]
+fn colocated_msetex_works() {
+    let r = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&r, async {
+        let (server, port) = boot(SHARDS);
+        let mut c = connect_retry(port).await;
+        let mut b = Vec::new();
+
+        let (a, b2) = colocated_pair();
+        let mx = roundtrip(
+            &mut c,
+            &mut b,
+            &[b"MSETEX", b"2", a.as_bytes(), b"vA", b2.as_bytes(), b"vB"],
+        )
+        .await;
+        assert_eq!(mx, Resp::Integer(1), "co-located MSETEX :1");
+        let av = roundtrip(&mut c, &mut b, &[b"GET", a.as_bytes()]).await;
+        assert_eq!(av, Resp::Bulk(Some(b"vA".to_vec())));
+        let bv = roundtrip(&mut c, &mut b, &[b"GET", b2.as_bytes()]).await;
+        assert_eq!(bv, Resp::Bulk(Some(b"vB".to_vec())));
 
         server.shutdown_and_join().unwrap();
     });
