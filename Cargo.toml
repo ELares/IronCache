@@ -26,6 +26,7 @@ members = [
     "crates/ironcache-repl",
     "crates/ironcache-observe",
     "crates/ironcache-storage",
+    "crates/ironcache-dashtable",
     "crates/ironcache-eviction",
     "crates/ironcache-expiry",
     "crates/ironcache-store",

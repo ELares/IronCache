@@ -476,6 +476,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironcache-dashtable"
+version = "0.0.0"
+
+[[package]]
 name = "ironcache-env"
 version = "0.0.0"
 

@@ -151,6 +151,19 @@ release.
 
 ### Added
 
+- `ironcache-dashtable` crate: the standalone Dash-style extendible-hashing table,
+  stage 1 of the #285 table rewrite (the algorithm core, validated in isolation
+  with zero `unsafe` so `miri` is trivial). It implements the extendible directory
+  (top-bit index, per-segment local depth), incremental segment SPLIT on overflow,
+  directory DOUBLING when a split would exceed the global depth (a pointer-array
+  copy, never a record rehash, so there is no power-of-two doubling trough), and the
+  1-byte fingerprint that gates a lookup to skip non-matching slots. Pinned by a
+  HashMap-oracle property test over a 30k-op deterministic insert/get/remove stream
+  (forcing many splits + doublings) plus a 5k-key structural-growth test. The dense
+  `unsafe` cache-line-packed layout, the bucketized/stash probing, and the
+  feature-flagged store wiring + freq-in-object segment-local eviction are the
+  later stages in `docs/design/DASHTABLE.md`; this crate is not yet wired into the
+  store.
 - HOTKEYS: the faithful Redis 8.6 hot-key tracking container (issue #428).
   `HOTKEYS START METRICS <count> [CPU] [NET] [COUNT k] [DURATION s] [SAMPLE ratio]
   [SLOTS ...]` begins a session that attributes per-command CPU microseconds and
