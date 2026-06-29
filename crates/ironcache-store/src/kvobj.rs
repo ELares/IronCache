@@ -568,14 +568,36 @@ type HashEntry = (Box<[u8]>, Box<[u8]>);
 /// any field-or-value byte length exceeds the per-element byte cap (64). A running
 /// field+value byte total is kept for O(1) accounting. The reported
 /// encoding is a pure function of the active form (`listpack` vs `hashtable`).
+/// The field/value storage form of a hash, independent of any per-field TTL state. The
+/// listpack/hashtable ratchet (#40) lives here; the per-field TTL side-map lives on the
+/// wrapping [`HashVal`] so a hash without field TTLs pays nothing for them.
 #[derive(Debug, Clone)]
-pub enum HashVal {
+enum HashData {
     /// The small listpack-equivalent form: `(field, value)` pairs in insertion order,
     /// linear-scanned. Reports [`Encoding::ListPack`].
     ListPack(Vec<HashEntry>),
     /// The large hashtable form: a `hashbrown::HashMap`. Reports [`Encoding::HashTable`].
     /// One-way: a hash never converts back to the listpack form (Redis parity).
     HashTable(HashMap<Box<[u8]>, Box<[u8]>>),
+}
+
+/// Per-field expiry deadlines (Redis 7.4 HEXPIRE family). A field present in this map
+/// expires at its absolute deadline; a field absent from it never expires. Kept separate
+/// from the field/value [`HashData`] so the no-TTL hash (the overwhelming common case) holds
+/// no TTL allocation at all.
+type FieldTtls = HashMap<Box<[u8]>, UnixMillis>;
+
+/// A HASH value (PR-6). The field/value pairs live in [`HashData`] (a small listpack-like
+/// form that promotes one-way to a `hashbrown::HashMap`); an OPTIONAL per-field TTL side-map
+/// (#408, Redis 7.4 HEXPIRE) is `None` until the first field TTL is set, so a hash without
+/// field TTLs is byte-identical in memory and on the wire to before this feature. The
+/// reported encoding is a pure function of the active form and whether any field TTL exists
+/// (`listpack` vs `listpackex` for the small form, `hashtable` for the large form).
+#[derive(Debug, Clone)]
+pub struct HashVal {
+    data: HashData,
+    /// `None` while no field carries a TTL (zero cost); `Some` once a field TTL is set.
+    ttls: Option<Box<FieldTtls>>,
 }
 
 impl Default for HashVal {
@@ -589,7 +611,10 @@ impl HashVal {
     /// small listpack form.
     #[must_use]
     pub fn new() -> Self {
-        HashVal::ListPack(Vec::new())
+        HashVal {
+            data: HashData::ListPack(Vec::new()),
+            ttls: None,
+        }
     }
 
     /// The sum of field+value byte lengths (the value-bytes side of accounting and the
@@ -597,20 +622,36 @@ impl HashVal {
     /// or per-entry bookkeeping (the FAM/packing is a #8 follow-up).
     #[must_use]
     pub fn element_bytes(&self) -> usize {
-        match self {
-            HashVal::ListPack(v) => v.iter().map(|(f, val)| f.len() + val.len()).sum(),
-            HashVal::HashTable(m) => m.iter().map(|(f, val)| f.len() + val.len()).sum(),
+        match &self.data {
+            HashData::ListPack(v) => v.iter().map(|(f, val)| f.len() + val.len()).sum(),
+            HashData::HashTable(m) => m.iter().map(|(f, val)| f.len() + val.len()).sum(),
         }
     }
 
     /// The encoding this hash reports, a PURE FUNCTION of the active form (#40):
-    /// `listpack` for the small form, `hashtable` for the large form.
+    /// `listpack` for the small form, `hashtable` for the large form. (The `listpackex`
+    /// reporting for the small form with field TTLs is wired with the #408 feature, where
+    /// `ttls` first becomes non-`None`.)
     #[must_use]
     pub fn encoding(&self) -> Encoding {
-        match self {
-            HashVal::ListPack(_) => Encoding::ListPack,
-            HashVal::HashTable(_) => Encoding::HashTable,
+        match &self.data {
+            HashData::ListPack(_) => Encoding::ListPack,
+            HashData::HashTable(_) => Encoding::HashTable,
         }
+    }
+
+    /// Remove `field`'s per-field expiry deadline if present, freeing the side-map once it is
+    /// empty so a hash that loses its last field TTL returns to the zero-overhead form.
+    /// Returns whether a deadline was removed.
+    fn clear_field_ttl(&mut self, field: &[u8]) -> bool {
+        let Some(ttls) = self.ttls.as_mut() else {
+            return false;
+        };
+        let removed = ttls.remove(field).is_some();
+        if ttls.is_empty() {
+            self.ttls = None;
+        }
+        removed
     }
 
     /// Whether the small listpack form should convert to the hashtable form after an
@@ -635,12 +676,12 @@ impl HashVal {
     /// Promote the small listpack form to the large hashtable form (one-way). A no-op if
     /// already a hashtable.
     fn convert_to_hashtable(&mut self) {
-        if let HashVal::ListPack(v) = self {
+        if let HashData::ListPack(v) = &mut self.data {
             let mut m: HashMap<Box<[u8]>, Box<[u8]>> = HashMap::with_capacity(v.len());
             for (f, val) in v.drain(..) {
                 m.insert(f, val);
             }
-            *self = HashVal::HashTable(m);
+            self.data = HashData::HashTable(m);
         }
     }
 
@@ -666,8 +707,8 @@ impl HashValue for HashVal {
     fn set(&mut self, field: &[u8], value: &[u8], thresholds: &EncodingThresholds) -> bool {
         // Overwrite-in-place if present (no growth); else insert (growth). After an
         // insert into the small form, re-check the listpack -> hashtable transition.
-        match self {
-            HashVal::ListPack(v) => {
+        match &mut self.data {
+            HashData::ListPack(v) => {
                 if let Some(i) = HashVal::listpack_pos(v, field) {
                     v[i].1 = value.to_vec().into_boxed_slice();
                     // An overwrite can still cross the per-element value-byte cap.
@@ -686,7 +727,7 @@ impl HashValue for HashVal {
                     true
                 }
             }
-            HashVal::HashTable(m) => m
+            HashData::HashTable(m) => m
                 .insert(
                     field.to_vec().into_boxed_slice(),
                     value.to_vec().into_boxed_slice(),
@@ -707,15 +748,17 @@ impl HashValue for HashVal {
     }
 
     fn get(&self, field: &[u8]) -> Option<&[u8]> {
-        match self {
-            HashVal::ListPack(v) => HashVal::listpack_pos(v, field).map(|i| v[i].1.as_ref()),
-            HashVal::HashTable(m) => m.get(field).map(std::convert::AsRef::as_ref),
+        match &self.data {
+            HashData::ListPack(v) => HashVal::listpack_pos(v, field).map(|i| v[i].1.as_ref()),
+            HashData::HashTable(m) => m.get(field).map(std::convert::AsRef::as_ref),
         }
     }
 
     fn del(&mut self, field: &[u8]) -> bool {
-        match self {
-            HashVal::ListPack(v) => {
+        // Drop any per-field TTL for the removed field too (and free the side-map if it
+        // becomes empty), so a deleted field leaves no orphan deadline behind.
+        let removed = match &mut self.data {
+            HashData::ListPack(v) => {
                 if let Some(i) = HashVal::listpack_pos(v, field) {
                     v.remove(i);
                     true
@@ -725,21 +768,25 @@ impl HashValue for HashVal {
             }
             // One-way ratchet: a hashtable hash stays a hashtable even as it shrinks
             // (Redis parity), so we do NOT demote back to listpack on removal.
-            HashVal::HashTable(m) => m.remove(field).is_some(),
+            HashData::HashTable(m) => m.remove(field).is_some(),
+        };
+        if removed {
+            self.clear_field_ttl(field);
         }
+        removed
     }
 
     fn contains(&self, field: &[u8]) -> bool {
-        match self {
-            HashVal::ListPack(v) => HashVal::listpack_pos(v, field).is_some(),
-            HashVal::HashTable(m) => m.contains_key(field),
+        match &self.data {
+            HashData::ListPack(v) => HashVal::listpack_pos(v, field).is_some(),
+            HashData::HashTable(m) => m.contains_key(field),
         }
     }
 
     fn len(&self) -> usize {
-        match self {
-            HashVal::ListPack(v) => v.len(),
-            HashVal::HashTable(m) => m.len(),
+        match &self.data {
+            HashData::ListPack(v) => v.len(),
+            HashData::HashTable(m) => m.len(),
         }
     }
 
@@ -755,20 +802,20 @@ impl HashValue for HashVal {
     }
 
     fn is_listpack(&self) -> bool {
-        matches!(self, HashVal::ListPack(_))
+        matches!(self.data, HashData::ListPack(_))
     }
 
     fn pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        match self {
+        match &self.data {
             // The listpack form is already in deterministic INSERTION order.
-            HashVal::ListPack(v) => v
+            HashData::ListPack(v) => v
                 .iter()
                 .map(|(f, val)| (f.to_vec(), val.to_vec()))
                 .collect(),
             // The hashtable form's `hashbrown` iteration order varies run-to-run, so
             // SORT by the fixed-seed stable field hash (then raw bytes) for a
             // deterministic, resize-invariant order (the same order SCAN uses, ADR-0003).
-            HashVal::HashTable(m) => {
+            HashData::HashTable(m) => {
                 let mut out: Vec<(Vec<u8>, Vec<u8>)> = m
                     .iter()
                     .map(|(f, val)| (f.to_vec(), val.to_vec()))
