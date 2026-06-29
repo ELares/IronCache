@@ -15,3 +15,4 @@ workspace = true
 
 [dependencies]
 ironcache-env = { workspace = true }
+bytes = { workspace = true }

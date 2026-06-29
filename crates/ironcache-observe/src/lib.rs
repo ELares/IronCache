@@ -26,6 +26,13 @@ pub use ops::{
     LATENCY_COMMAND_FLOOR_MICROS, LatencyMonitor, SlowLog, SlowLogEntry,
 };
 
+/// HOTKEYS: the faithful Redis 8.6 hot-key tracking container (#428). A node-level structure gated
+/// by one atomic when inactive, so the default (tracking-off) hot path and the perf-gate are
+/// unaffected; see [`hotkeys`] for the full rationale.
+pub mod hotkeys;
+
+pub use hotkeys::{DEFAULT_HOTKEYS_COUNT, Hotkeys, HotkeysConfig, HotkeysSnapshot};
+
 /// The IronCache server version reported in `INFO` and `HELLO`. Sourced from the
 /// crate version at build time.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");

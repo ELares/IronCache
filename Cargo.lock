@@ -499,6 +499,7 @@ dependencies = [
 name = "ironcache-observe"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "ironcache-env",
 ]
 
