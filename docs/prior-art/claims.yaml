@@ -1898,6 +1898,25 @@ claims:
     note: 'docs/dashtable.md: ''a dashtable has 60 buckets per segment (compile-time parameter)'' and
       ''each segment has 56 regular buckets, 4 stash buckets and each bucket contains 14 slots. Overall,
       each dashtable segment has capacity to host 840 records.'' 56+4=60, 60x14=840. Verbatim.'
+- id: dash-load-factor
+  dimension: dragonfly
+  system: Dash (Scalable Hashing on Persistent Memory)
+  version: PVLDB 13(8) 1147-1161, 2020 (Lu, Hao, Wang, Lo)
+  claim: Dash-EH steady-state load factor and the fingerprint plus stash mechanisms that enable it
+  value: 'over 90% load factor; 1-byte per-slot fingerprints gate probes (touch only matching slots);
+    stash buckets absorb bucket overflow before a segment split'
+  source_url: http://www.vldb.org/pvldb/vol13/p1147-lu.pdf
+  accessed_date: '2026-06-29'
+  confidence: high
+  confidence_reason: Stated in the paper abstract and the design section (fingerprinting, stashing, segmentation)
+  load_bearing: true
+  verification:
+    verdict: self-verified
+    best_source_url: http://www.vldb.org/pvldb/vol13/p1147-lu.pdf
+    note: 'Dash paper abstract: Dash-enabled extendible and linear hashing achieves over 90% load factor
+      with high performance via fingerprinting (probe only fingerprint-matching slots) and stash buckets
+      (overflow absorption before a split). Segment geometry corroborated by Dragonfly dashtable.md
+      [dashtable-segment-geometry]. Self-verified against the VLDB PDF abstract.'
 - id: dragonfly-25x-throughput-claim
   dimension: dragonfly
   system: DragonflyDB
