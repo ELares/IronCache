@@ -5734,17 +5734,18 @@ fn apply_client_tracking(
         purge_conn_tracking(conn.id);
     }
     if conn.tracking_bcast && !was_bcast {
-        let sub = crate::pubsub::Subscriber {
-            sender: push_tx.clone(),
-            shed: std::sync::Arc::clone(shed_flag),
-        };
-        let tbl = shard_tracking();
-        let mut t = tbl.borrow_mut();
-        if conn.tracking_prefixes.is_empty() {
-            t.track_prefix(bytes::Bytes::new(), conn.id, sub);
-        } else {
-            for p in &conn.tracking_prefixes {
-                t.track_prefix(p.clone(), conn.id, sub.clone());
+        // A REDIRECT client (stage 4) whose target is not (yet) subscribed registers nothing; for
+        // BCAST that means the target must SUBSCRIBE `__redis__:invalidate` BEFORE enabling tracking
+        // (BCAST registers once here, not per read, so it does not self-heal on a later read).
+        if let Some(entry) = make_track_entry(conn, push_tx, shed_flag) {
+            let tbl = shard_tracking();
+            let mut t = tbl.borrow_mut();
+            if conn.tracking_prefixes.is_empty() {
+                t.track_prefix(bytes::Bytes::new(), conn.id, entry);
+            } else {
+                for p in &conn.tracking_prefixes {
+                    t.track_prefix(p.clone(), conn.id, entry.clone());
+                }
             }
         }
     }
@@ -5802,16 +5803,58 @@ fn apply_client_tracking(
         if keys.is_empty() {
             return;
         }
-        let sub = crate::pubsub::Subscriber {
-            sender: push_tx.clone(),
-            shed: std::sync::Arc::clone(shed_flag),
+        // A REDIRECT client (stage 4) registers the TARGET's handle; if the target is not currently
+        // subscribed to `__redis__:invalidate`, skip (it self-heals when the client next reads).
+        let Some(entry) = make_track_entry(conn, push_tx, shed_flag) else {
+            return;
         };
         let tbl = shard_tracking();
         let mut t = tbl.borrow_mut();
         for k in keys {
-            t.track(k, conn.id, sub.clone());
+            t.track(k, conn.id, entry.clone());
         }
     }
+}
+
+/// Build the tracking-table entry for THIS connection's registration (#409). A REDIRECT client
+/// (stage 4, `tracking_redirect != 0`) registers the redirect TARGET's push handle with
+/// `redirect = true` (the target must be SUBSCRIBEd to `__redis__:invalidate`); a non-redirect
+/// client registers its OWN push handle. Returns `None` for a redirect client whose target is not
+/// currently subscribed there, so the caller skips registration (it self-heals on a later read).
+fn make_track_entry(
+    conn: &ConnState,
+    push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
+) -> Option<crate::pubsub::TrackEntry> {
+    if conn.tracking_redirect != 0 {
+        let sub = resolve_redirect_target(conn.tracking_redirect)?;
+        Some(crate::pubsub::TrackEntry {
+            sub,
+            redirect: true,
+        })
+    } else {
+        Some(crate::pubsub::TrackEntry {
+            sub: crate::pubsub::Subscriber {
+                sender: push_tx.clone(),
+                shed: std::sync::Arc::clone(shed_flag),
+            },
+            redirect: false,
+        })
+    }
+}
+
+/// Resolve the push handle of a CLIENT TRACKING REDIRECT target (#409 stage 4): the target must have
+/// SUBSCRIBEd `__redis__:invalidate`, so its [`crate::pubsub::Subscriber`] lives in THIS shard's
+/// Pub/Sub channel table. Returns `None` when the target is not (currently) subscribed there. SCOPE:
+/// single-shard-correct, exactly like the rest of tracking (the redirect target's SUBSCRIBE and the
+/// key's owner shard coincide when `shards == 1`).
+fn resolve_redirect_target(target_id: u64) -> Option<crate::pubsub::Subscriber> {
+    let tbl = shard_pubsub();
+    let t = tbl.borrow();
+    t.channels
+        .get(crate::pubsub::REDIRECT_INVALIDATE_CHANNEL)
+        .and_then(|subs| subs.get(&target_id))
+        .cloned()
 }
 
 fn record_slow_command(
