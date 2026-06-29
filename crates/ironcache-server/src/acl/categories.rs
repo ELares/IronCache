@@ -531,6 +531,7 @@ fn is_fast(cmd: &[u8]) -> bool {
             // O(1) connection / control.
             | b"PING"
             | b"ECHO"
+            | b"LOLWUT"
             | b"HELLO"
             | b"AUTH"
             | b"SELECT"

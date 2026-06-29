@@ -166,6 +166,7 @@ pub(crate) mod tests {
             // Tier-0
             b"PING",
             b"ECHO",
+            b"LOLWUT",
             b"HELLO",
             b"AUTH",
             b"SELECT",
@@ -542,8 +543,9 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            179,
-            "the dispatch-arm hand-list drifted from the 167 client commands (incl. SAVE/BGSAVE/\
+            180,
+            "the dispatch-arm hand-list drifted from the 168 client commands (incl. LOLWUT, \
+             #414 command-surface completeness, + SAVE/BGSAVE/\
              LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown, + the drop-in\
              compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO, \
              + the PROD-7 operability trio SLOWLOG/MEMORY/LATENCY, + the PROD-9 blocking family \

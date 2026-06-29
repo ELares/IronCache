@@ -1433,6 +1433,87 @@ fn spanning_bitop_and_or_xor_matches_single_shard_with_zero_extend() {
 }
 
 #[test]
+fn spanning_bitop_setalgebra_matches_single_shard() {
+    // The Redis 8.2 set-algebra ops (DIFF/DIFF1/ANDOR/ONE) over sources that SPAN shards must
+    // produce the byte-identical result the single-shard handler does (#414 review: the
+    // spanning op allow-list previously rejected them). 5-shard vs 1-shard parity + the
+    // hand-computed expected bytes over (a, b) zero-extended to the longest.
+    #[derive(Debug, PartialEq, Eq)]
+    struct BitopRun {
+        op: String,
+        reply: Resp,
+        dest_bytes: Option<Vec<u8>>,
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        // a = 0xFF 0x0F 0xAA (3 bytes); b = 0xF0 0xFF (2 bytes, zero-padded to [0xF0,0xFF,0x00]).
+        let a: &[u8] = &[0xFF, 0x0F, 0xAA];
+        let b: &[u8] = &[0xF0, 0xFF];
+        let mut results: Vec<Vec<BitopRun>> = Vec::new();
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+            set_str(&mut c, &mut buf, "bs:a", a).await;
+            set_str(&mut c, &mut buf, "bs:b", b).await;
+
+            let mut got = Vec::new();
+            for (op, dest) in [
+                ("DIFF", "bs:diff"),
+                ("DIFF1", "bs:diff1"),
+                ("ANDOR", "bs:andor"),
+                ("ONE", "bs:one"),
+            ] {
+                let reply = roundtrip(
+                    &mut c,
+                    &mut buf,
+                    &[b"BITOP", op.as_bytes(), dest.as_bytes(), b"bs:a", b"bs:b"],
+                )
+                .await;
+                let dest_bytes = get_bulk(&mut c, &mut buf, dest).await;
+                got.push(BitopRun {
+                    op: op.to_string(),
+                    reply,
+                    dest_bytes,
+                });
+            }
+            results.push(got);
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+        let n5 = &results[0];
+        let n1 = &results[1];
+        assert_eq!(n5, n1, "BITOP set-algebra parity (5 vs 1 shard)");
+        // DIFF = a & !b = [0x0F,0x00,0xAA]; DIFF1 = !a & b = [0x00,0xF0,0x00];
+        // ANDOR = a & b = [0xF0,0x0F,0x00]; ONE (two sources) = a ^ b = [0x0F,0xF0,0xAA].
+        let expect = [
+            ("DIFF", vec![0x0Fu8, 0x00, 0xAA]),
+            ("DIFF1", vec![0x00, 0xF0, 0x00]),
+            ("ANDOR", vec![0xF0, 0x0F, 0x00]),
+            ("ONE", vec![0x0F, 0xF0, 0xAA]),
+        ];
+        for (run, (eop, ebytes)) in n5.iter().zip(expect.iter()) {
+            assert_eq!(&run.op, eop);
+            assert_eq!(
+                run.reply,
+                Resp::Integer(3),
+                "{eop} byte length is max(3,2)=3"
+            );
+            assert_eq!(
+                run.dest_bytes.as_deref(),
+                Some(ebytes.as_slice()),
+                "{eop} dest bytes"
+            );
+        }
+    });
+}
+
+#[test]
 fn spanning_bitop_not_single_source_and_arity() {
     // BITOP NOT takes EXACTLY one source. The spanning NOT inverts the single (spanning) src
     // byte-for-byte; NOT with >1 source is the arity error (on the home core, before gather).

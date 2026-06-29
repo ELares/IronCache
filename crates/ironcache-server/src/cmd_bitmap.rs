@@ -532,10 +532,40 @@ fn bitpos(data: &[u8], target: u8, start: Option<i64>, end: Option<i64>, unit: R
 // BITOP.
 // ---------------------------------------------------------------------------
 
-/// `BITOP AND|OR|XOR|NOT destkey srckey [srckey ...]` -> the byte length of the
-/// result. The op is applied across the source strings (shorter strings zero-padded to
-/// the longest), stored in `destkey`; an empty result DELETES `destkey`. NOT takes
-/// exactly one source. WRONGTYPE if any source is a non-string. SAME-SHARD only
+/// Validate a BITOP operator token (already ASCII-uppercased) against `nsrc`, the number of
+/// source keys (BITOP op dest src...). SHARED by the single-shard [`cmd_bitop`] and the
+/// cross-shard `fan_out_bitop` so the op allow-list and the per-op minimum-source rule cannot
+/// drift between the two paths. Mirrors Redis 8.2 `bitopCommand`: an unknown op is a syntax
+/// error; NOT takes exactly one source; DIFF/DIFF1/ANDOR take at least two; AND/OR/XOR/ONE
+/// take one or more (the caller still enforces the command-level Min(4) arity, so `nsrc >= 1`).
+///
+/// # Errors
+/// Returns the Redis-faithful [`ErrorReply`] for an unknown operator or a per-op source-count
+/// violation; `Ok(())` when the operator and source count are valid.
+pub fn bitop_validate_op(op: &[u8], nsrc: usize) -> Result<(), ErrorReply> {
+    if !matches!(
+        op,
+        b"AND" | b"OR" | b"XOR" | b"NOT" | b"DIFF" | b"DIFF1" | b"ANDOR" | b"ONE"
+    ) {
+        return Err(ErrorReply::syntax_error());
+    }
+    if op == b"NOT" && nsrc != 1 {
+        return Err(ErrorReply::bitop_not_single_source());
+    }
+    if matches!(op, b"DIFF" | b"DIFF1" | b"ANDOR") && nsrc < 2 {
+        // SAFETY: `op` is an ASCII command token, so the lossy decode is exact.
+        return Err(ErrorReply::bitop_min_two_sources(&String::from_utf8_lossy(
+            op,
+        )));
+    }
+    Ok(())
+}
+
+/// `BITOP AND|OR|XOR|NOT|DIFF|DIFF1|ANDOR|ONE destkey srckey [srckey ...]` -> the byte
+/// length of the result. The op is applied across the source strings (shorter strings
+/// zero-padded to the longest), stored in `destkey`; an empty result DELETES `destkey`.
+/// NOT takes exactly one source; DIFF/DIFF1/ANDOR (Redis 8.2 set-algebra) take at least
+/// two; AND/OR/XOR/ONE take one or more. WRONGTYPE if any source is a non-string. SAME-SHARD only
 /// (single-shard-per-connection, like the other multi-key commands: sources are read
 /// on the accept shard and dest is written there). `denyoom` (it materializes a value
 /// at the destination).
@@ -545,13 +575,11 @@ pub fn cmd_bitop<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
         return Value::error(ErrorReply::wrong_arity("bitop"));
     }
     let op = ascii_upper(&req.args[1]);
-    let is_not = op.as_slice() == b"NOT";
-    if !matches!(op.as_slice(), b"AND" | b"OR" | b"XOR" | b"NOT") {
-        return Value::error(ErrorReply::syntax_error());
-    }
-    // NOT takes EXACTLY one source key (BITOP NOT destkey srckey).
-    if is_not && req.args.len() != 4 {
-        return Value::error(ErrorReply::bitop_not_single_source());
+    // Validate the operator and its per-op source-key count through the SHARED helper so the
+    // single-shard and cross-shard (`fan_out_bitop`) paths cannot drift (#414 review). nsrc is
+    // the source-key count; the `len < 4` guard above keeps it at least 1.
+    if let Err(e) = bitop_validate_op(op.as_slice(), req.args.len() - 3) {
+        return Value::error(e);
     }
     let dest = req.args[1 + 1].clone();
     let src_keys: Vec<Bytes> = req.args[3..].to_vec();
@@ -590,15 +618,49 @@ pub fn cmd_bitop<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
 
 /// Compute the BITOP result bytes over `sources` (already materialized, missing keys
 /// as empty vecs). The result length equals the LONGEST source (shorter sources
-/// zero-padded); NOT inverts the single source to an equal-length result. Factored out
-/// for unit testing AND so the cross-shard coordinator's spanning BITOP shares the EXACT
-/// SAME combine as the single-shard handler (COORDINATOR.md #107, Stage 2b-3); the
-/// coordinator gathers each source's bytes from its owner shard (a missing key as an empty
-/// vec, a non-string as a WRONGTYPE abort) and passes them here, so a spanning BITOP can
-/// NOT drift from the single-shard one.
+/// zero-padded); NOT inverts the single source to an equal-length result. The Redis 8.2
+/// set-algebra ops combine the FIRST source against the disjunction (bitwise OR) of the
+/// rest: DIFF = `first & !disjunction`, DIFF1 = `!first & disjunction`, ANDOR =
+/// `first & disjunction`, and ONE keeps a bit set only where it appears in exactly one
+/// source. Factored out for unit testing AND so the cross-shard coordinator's spanning
+/// BITOP shares the EXACT SAME combine as the single-shard handler (COORDINATOR.md #107,
+/// Stage 2b-3); the coordinator gathers each source's bytes from its owner shard (a missing
+/// key as an empty vec, a non-string as a WRONGTYPE abort) and passes them here, so a
+/// spanning BITOP can NOT drift from the single-shard one.
+///
+/// Complexity: O(L * k) for a result of length L over k sources, optimal because every op
+/// must read each source bit at least once; working memory is the O(L) output buffer alone
+/// (no per-source scratch). This matches Redis's `bitopCommand` cost. The operator is decoded
+/// ONCE into an enum so the per-byte hot loop branches on a cheap discriminant rather than
+/// re-comparing the op byte-slice for every byte. (A word-at-a-time SIMD pass is the next
+/// lever and is tracked with the other bit-kernel SIMD work, not here.)
 #[must_use]
 pub fn bitop_compute(op: &[u8], sources: &[Vec<u8>]) -> Vec<u8> {
-    if op == b"NOT" {
+    #[derive(Clone, Copy)]
+    enum Op {
+        And,
+        Or,
+        Xor,
+        Not,
+        Diff,
+        Diff1,
+        AndOr,
+        One,
+    }
+    let op = match op {
+        b"AND" => Op::And,
+        b"OR" => Op::Or,
+        b"XOR" => Op::Xor,
+        b"NOT" => Op::Not,
+        b"DIFF" => Op::Diff,
+        b"DIFF1" => Op::Diff1,
+        b"ANDOR" => Op::AndOr,
+        b"ONE" => Op::One,
+        // Unreachable: callers validate the op via `bitop_validate_op` first. An empty result
+        // is the safe no-panic default (it deletes the dest, like an empty combine).
+        _ => return Vec::new(),
+    };
+    if let Op::Not = op {
         // NOT: exactly one source (the caller enforced arity); invert every byte.
         let src = sources.first().map_or(&[][..], Vec::as_slice);
         return src.iter().map(|b| !b).collect();
@@ -607,21 +669,43 @@ pub fn bitop_compute(op: &[u8], sources: &[Vec<u8>]) -> Vec<u8> {
     if max_len == 0 {
         return Vec::new();
     }
+    // `byte_at(s, i)` reads source `s`'s byte `i`, zero-padding past its end.
+    let byte_at = |s: &[Vec<u8>], idx: usize, i: usize| s[idx].get(i).copied().unwrap_or(0);
     let mut out = vec![0u8; max_len];
     for (i, byte) in out.iter_mut().enumerate() {
-        // Seed from the FIRST source (zero-padded), then fold the rest.
-        let mut acc = sources.first().and_then(|s| s.get(i)).copied().unwrap_or(0);
-        for src in &sources[1..] {
-            let b = src.get(i).copied().unwrap_or(0);
-            acc = match op {
-                b"AND" => acc & b,
-                b"OR" => acc | b,
-                b"XOR" => acc ^ b,
-                // Unreachable: the caller validated op as AND/OR/XOR/NOT and handled NOT.
-                _ => acc,
-            };
-        }
-        *byte = acc;
+        // The first source seeds the byte; the rest fold in. Each source byte is read once.
+        let first = sources.first().and_then(|s| s.get(i)).copied().unwrap_or(0);
+        *byte = match op {
+            Op::And => (1..sources.len()).fold(first, |acc, k| acc & byte_at(sources, k, i)),
+            Op::Or => (1..sources.len()).fold(first, |acc, k| acc | byte_at(sources, k, i)),
+            Op::Xor => (1..sources.len()).fold(first, |acc, k| acc ^ byte_at(sources, k, i)),
+            // DIFF/DIFF1/ANDOR combine `first` against the disjunction (OR) of sources[1..].
+            Op::Diff | Op::Diff1 | Op::AndOr => {
+                let disjunction =
+                    (1..sources.len()).fold(0u8, |acc, k| acc | byte_at(sources, k, i));
+                match op {
+                    Op::Diff => first & !disjunction,
+                    Op::Diff1 => !first & disjunction,
+                    _ => first & disjunction, // ANDOR (the only remaining arm)
+                }
+            }
+            // ONE: a bit survives only where it is set in EXACTLY one source. `common`
+            // accumulates bits already seen in two or more sources; `output` carries the
+            // seen-once bits and is cleared wherever a bit becomes common.
+            Op::One => {
+                let mut output = first;
+                let mut common = 0u8;
+                for k in 1..sources.len() {
+                    let b = byte_at(sources, k, i);
+                    common |= output & b;
+                    output ^= b;
+                    output &= !common;
+                }
+                output
+            }
+            // Unreachable: NOT is handled above before the per-byte loop.
+            Op::Not => first,
+        };
     }
     out
 }
@@ -1706,6 +1790,120 @@ mod tests {
             1
         );
         assert_eq!(get_bytes(&mut s, b"d2"), Some(vec![0x00]));
+    }
+
+    // ---- BITOP DIFF / DIFF1 / ANDOR / ONE (Redis 8.2 set-algebra operators). ----
+
+    #[test]
+    fn bitop_diff_first_minus_disjunction() {
+        let mut s = test_store();
+        store_string(&mut s, b"a", &[0b1111_0000]);
+        store_string(&mut s, b"b", &[0b1010_0000]);
+        store_string(&mut s, b"c", &[0b0000_1010]);
+        // DIFF = a & !(b | c) = 0xF0 & !(0xAA) = 0xF0 & 0x55 = 0x50.
+        assert_eq!(
+            int(&cmd_bitop(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITOP", b"DIFF", b"d", b"a", b"b", b"c"])
+            )),
+            1
+        );
+        assert_eq!(get_bytes(&mut s, b"d"), Some(vec![0b0101_0000]));
+        // Two sources, with the second shorter than the first (zero-padded). DIFF zero-pads
+        // the missing trailing byte of b, so a's second byte passes through unmasked.
+        store_string(&mut s, b"a2", &[0xFF, 0xFF]);
+        store_string(&mut s, b"b2", &[0x0F]);
+        cmd_bitop(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"BITOP", b"DIFF", b"d", b"a2", b"b2"]),
+        );
+        assert_eq!(get_bytes(&mut s, b"d"), Some(vec![0xF0, 0xFF]));
+    }
+
+    #[test]
+    fn bitop_diff1_disjunction_minus_first() {
+        let mut s = test_store();
+        store_string(&mut s, b"a", &[0b1111_0000]);
+        store_string(&mut s, b"b", &[0b1010_1010]);
+        // DIFF1 = !a & b = 0x0F & 0xAA = 0x0A.
+        cmd_bitop(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"BITOP", b"DIFF1", b"d", b"a", b"b"]),
+        );
+        assert_eq!(get_bytes(&mut s, b"d"), Some(vec![0b0000_1010]));
+    }
+
+    #[test]
+    fn bitop_andor_first_and_disjunction() {
+        let mut s = test_store();
+        store_string(&mut s, b"a", &[0b1111_0000]);
+        store_string(&mut s, b"b", &[0b1010_0000]);
+        store_string(&mut s, b"c", &[0b0000_1010]);
+        // ANDOR = a & (b | c) = 0xF0 & 0xAA = 0xA0.
+        cmd_bitop(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"BITOP", b"ANDOR", b"d", b"a", b"b", b"c"]),
+        );
+        assert_eq!(get_bytes(&mut s, b"d"), Some(vec![0b1010_0000]));
+    }
+
+    #[test]
+    fn bitop_one_keeps_bits_in_exactly_one_source() {
+        let mut s = test_store();
+        store_string(&mut s, b"a", &[0b1110_0000]);
+        store_string(&mut s, b"b", &[0b0011_0000]);
+        store_string(&mut s, b"c", &[0b0000_1000]);
+        // Per bit: bit7 (a only), bit6 (a only), bit5 (a+b -> dropped), bit4 (b only),
+        // bit3 (c only). Result = 1101_1000 = 0xD8.
+        cmd_bitop(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"BITOP", b"ONE", b"d", b"a", b"b", b"c"]),
+        );
+        assert_eq!(get_bytes(&mut s, b"d"), Some(vec![0b1101_1000]));
+        // ONE accepts a SINGLE source (unlike DIFF/DIFF1/ANDOR): every set bit is then in
+        // exactly one source, so the result equals the source.
+        cmd_bitop(&mut s, 0, NOW, &req(&[b"BITOP", b"ONE", b"d", b"a"]));
+        assert_eq!(get_bytes(&mut s, b"d"), Some(vec![0b1110_0000]));
+    }
+
+    #[test]
+    fn bitop_setalgebra_arity_and_unknown_op() {
+        let mut s = test_store();
+        store_string(&mut s, b"a", &[0xFF]);
+        // DIFF/DIFF1/ANDOR need at least two source keys; one source is an error.
+        for op in [&b"DIFF"[..], b"DIFF1", b"ANDOR"] {
+            let line = err_line(&cmd_bitop(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITOP", op, b"d", b"a"]),
+            ));
+            let want = format!(
+                "-ERR BITOP {} must be called with at least two source keys.",
+                String::from_utf8_lossy(op)
+            );
+            assert_eq!(line, want);
+        }
+        // An unknown operator is still a syntax error (the allow-list rejects it).
+        assert_eq!(
+            err_line(&cmd_bitop(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"BITOP", b"NAND", b"d", b"a", b"a"])
+            )),
+            "-ERR syntax error"
+        );
     }
 
     // ---- BITFIELD: multi-op array + OVERFLOW + #offset + bad-type. ----

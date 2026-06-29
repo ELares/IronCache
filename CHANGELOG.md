@@ -141,6 +141,15 @@ release.
 
 ### Added
 
+- Command-surface completeness (issue #414): `LOLWUT` now returns a non-error
+  bulk string with the server version (so health probes and clients that call it
+  succeed), and `BITOP` gains the Redis 8.2 set-algebra operators `DIFF`, `DIFF1`,
+  `ANDOR`, and `ONE` alongside the existing `AND`/`OR`/`XOR`/`NOT`. `DIFF`/`DIFF1`/
+  `ANDOR` combine the first source against the bitwise OR of the rest (and require
+  at least two source keys); `ONE` keeps a bit set only where it appears in exactly
+  one source. The combine is O(L*k) for a result of length L over k sources, the
+  same lower bound Redis pays, and is shared byte-for-byte with the cross-shard
+  spanning path.
 - `ironcache upgrade` now performs a verified (sha256), data-safe (SAVE-first),
   health-gated, auto-rolling-back binary self-update (issue #387). The operator
   supplies a new binary with `--binary` and a release `--sha256sums`; the command
