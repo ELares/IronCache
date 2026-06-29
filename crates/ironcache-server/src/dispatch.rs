@@ -2459,6 +2459,8 @@ fn cmd_client<E: Clock>(
         b"TRACKING" => cmd_client_tracking(state, req),
         // CLIENT TRACKINGINFO (#409): the current tracking state (flags / redirect / prefixes).
         b"TRACKINGINFO" => cmd_client_trackinginfo(state, req),
+        // CLIENT CACHING YES|NO (#409 stage 3): the one-shot OPTIN/OPTOUT caching gate.
+        b"CACHING" => cmd_client_caching(state, req),
         _ => Value::error(ErrorReply::unknown_subcommand(
             "CLIENT",
             &String::from_utf8_lossy(&req.args[1]),
@@ -2482,6 +2484,8 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
     };
     let mut noloop = false;
     let mut bcast = false;
+    let mut optin = false;
+    let mut optout = false;
     let mut prefixes: Vec<bytes::Bytes> = Vec::new();
     let mut i = 3;
     while i < req.args.len() {
@@ -2495,6 +2499,14 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
                 bcast = true;
                 i += 1;
             }
+            b"OPTIN" => {
+                optin = true;
+                i += 1;
+            }
+            b"OPTOUT" => {
+                optout = true;
+                i += 1;
+            }
             b"PREFIX" => {
                 if i + 1 >= req.args.len() {
                     return Value::error(ErrorReply::syntax_error());
@@ -2502,16 +2514,26 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
                 prefixes.push(req.args[i + 1].clone());
                 i += 2;
             }
-            // Stages 3-4: rejected loudly so a client is never silently given the wrong mode.
-            b"OPTIN" | b"OPTOUT" | b"REDIRECT" => {
-                return Value::error(ErrorReply::err(format!(
-                    "CLIENT TRACKING {} is not supported yet (this build implements \
-                     ON/OFF/NOLOOP/BCAST/PREFIX; OPTIN/OPTOUT/REDIRECT are tracked follow-ups)",
-                    String::from_utf8_lossy(&opt)
-                )));
+            // Stage 4: rejected loudly so a client is never silently given the wrong mode.
+            b"REDIRECT" => {
+                return Value::error(ErrorReply::err(
+                    "CLIENT TRACKING REDIRECT is not supported yet (this build implements \
+                     ON/OFF/NOLOOP/BCAST/PREFIX/OPTIN/OPTOUT; REDIRECT is a tracked follow-up)",
+                ));
             }
             _ => return Value::error(ErrorReply::syntax_error()),
         }
+    }
+    // OPTIN and OPTOUT are mutually exclusive, and neither combines with BCAST (Redis).
+    if optin && optout {
+        return Value::error(ErrorReply::err(
+            "You can't specify both OPTIN mode and OPTOUT mode",
+        ));
+    }
+    if (optin || optout) && bcast {
+        return Value::error(ErrorReply::err(
+            "OPTIN and OPTOUT are not compatible with BCAST",
+        ));
     }
     // PREFIX requires BCAST (Redis), and the prefixes must not overlap (one being a prefix of
     // another would double-deliver an invalidation).
@@ -2543,12 +2565,42 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
         state.tracking_noloop = noloop;
         state.tracking_bcast = bcast;
         state.tracking_prefixes = prefixes;
+        state.tracking_optin = optin;
+        state.tracking_optout = optout;
+        // A fresh CLIENT TRACKING ON drops any dangling one-shot CACHING flag.
+        state.caching_next = None;
     } else {
         state.tracking_on = false;
         state.tracking_noloop = false;
         state.tracking_bcast = false;
         state.tracking_prefixes.clear();
+        state.tracking_optin = false;
+        state.tracking_optout = false;
+        state.caching_next = None;
     }
+    Value::ok()
+}
+
+/// `CLIENT CACHING YES|NO` (#409 stage 3): set the ONE-SHOT caching flag that the NEXT command's
+/// track decision consumes. Valid ONLY when the connection is tracking in OPTIN or OPTOUT mode
+/// (Redis errors otherwise). In OPTIN, `YES` opts the next read's keys IN; in OPTOUT, `NO` opts
+/// them OUT.
+fn cmd_client_caching(state: &mut ConnState, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("client|caching"));
+    }
+    let yes = match ascii_upper(&req.args[2]).as_slice() {
+        b"YES" => true,
+        b"NO" => false,
+        _ => return Value::error(ErrorReply::syntax_error()),
+    };
+    if !(state.tracking_optin || state.tracking_optout) {
+        return Value::error(ErrorReply::err(
+            "CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or \
+             OPTOUT mode enabled",
+        ));
+    }
+    state.caching_next = Some(yes);
     Value::ok()
 }
 
@@ -2565,8 +2617,20 @@ fn cmd_client_trackinginfo(state: &ConnState, req: &Request) -> Value {
         if state.tracking_bcast {
             f.push(Value::bulk_str("bcast"));
         }
+        if state.tracking_optin {
+            f.push(Value::bulk_str("optin"));
+        }
+        if state.tracking_optout {
+            f.push(Value::bulk_str("optout"));
+        }
         if state.tracking_noloop {
             f.push(Value::bulk_str("noloop"));
+        }
+        // The pending one-shot CLIENT CACHING decision, if set (Redis exposes caching-yes/-no).
+        match state.caching_next {
+            Some(true) => f.push(Value::bulk_str("caching-yes")),
+            Some(false) => f.push(Value::bulk_str("caching-no")),
+            None => {}
         }
         f
     } else {

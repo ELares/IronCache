@@ -141,6 +141,16 @@ release.
 
 ### Added
 
+- CLIENT TRACKING OPTIN/OPTOUT + CLIENT CACHING, stage 3 (issue #409):
+  `CLIENT TRACKING ON OPTIN|OPTOUT` and `CLIENT CACHING YES|NO`. In OPTIN mode a
+  read's keys are tracked only when the connection ran `CLIENT CACHING YES`
+  immediately before; in OPTOUT mode every read is tracked except after
+  `CLIENT CACHING NO`. The CACHING flag is one-shot (consumed by the next command).
+  `CLIENT CACHING` is valid only in OPTIN/OPTOUT mode; OPTIN and OPTOUT are mutually
+  exclusive and neither combines with BCAST. `CLIENT TRACKINGINFO` reports the
+  `optin`/`optout` flags and the pending `caching-yes`/`caching-no` state. The
+  no-tracking hot path is unchanged (the one-shot consume is a single `is_some`
+  check when no flag is pending). `REDIRECT` remains the final staged follow-up.
 - CLIENT TRACKING BCAST mode, stage 2 (issue #409): `CLIENT TRACKING ON BCAST
   [PREFIX prefix ...]` broadcast tracking. A BCAST connection does NOT register the
   keys it reads; instead its prefixes are registered once and EVERY changed key

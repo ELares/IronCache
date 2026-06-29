@@ -126,6 +126,18 @@ pub struct ConnState {
     /// means the EMPTY prefix (track ALL keys). The serve layer registers these in the per-shard
     /// tracking table on the BCAST-enter transition and purges them on OFF/RESET/disconnect.
     pub tracking_prefixes: Vec<Bytes>,
+    /// CLIENT TRACKING `OPTIN` mode (#409 stage 3): in default (per-read) tracking, register a
+    /// read's keys ONLY when the connection ran `CLIENT CACHING YES` immediately before. Mutually
+    /// exclusive with [`Self::tracking_optout`] and with BCAST. Default `false`.
+    pub tracking_optin: bool,
+    /// CLIENT TRACKING `OPTOUT` mode (#409 stage 3): register every read's keys EXCEPT when the
+    /// connection ran `CLIENT CACHING NO` immediately before. Mutually exclusive with `OPTIN` and
+    /// with BCAST. Default `false`.
+    pub tracking_optout: bool,
+    /// The ONE-SHOT `CLIENT CACHING YES|NO` flag (#409 stage 3): `Some(true)` after `CACHING YES`,
+    /// `Some(false)` after `CACHING NO`, consumed by the NEXT command's track decision (then
+    /// cleared). Only meaningful in OPTIN/OPTOUT mode. `None` otherwise.
+    pub caching_next: Option<bool>,
     /// The per-connection CLUSTER read-only bit (REPLICA_READ.md #147, HA-7d). `false` (read
     /// -write) by default; `READONLY` sets it, `READWRITE` clears it. On a REPLICA node, a keyed
     /// READ for a slot this node replicates is served LOCALLY only when this bit is set; otherwise
@@ -205,6 +217,9 @@ impl ConnState {
             tracking_noloop: false,
             tracking_bcast: false,
             tracking_prefixes: Vec::new(),
+            tracking_optin: false,
+            tracking_optout: false,
+            caching_next: None,
             // Read-write by default (the strong-read behavior unmodified clients expect); a client
             // opts into replica reads with READONLY (REPLICA_READ.md #147).
             readonly: false,
@@ -249,6 +264,9 @@ impl ConnState {
         self.tracking_noloop = false;
         self.tracking_bcast = false;
         self.tracking_prefixes.clear();
+        self.tracking_optin = false;
+        self.tracking_optout = false;
+        self.caching_next = None;
         // RESET clears the CLUSTER read-only bit back to read-write (Redis parity).
         self.readonly = false;
         // RESET clears any pending one-shot ASKING (HA-6): a fresh baseline never carries a stale
