@@ -51,7 +51,8 @@ use crate::cmd_util::{ascii_upper, parse_f64, parse_i64, parse_i64_strict};
 use bytes::Bytes;
 use ironcache_protocol::{ErrorReply, Request, Value, format_human_double};
 use ironcache_storage::{
-    ExpireWrite, NewValueOwned, RmwAction, RmwEntry, RmwStep, ScanCursor, Store, UnixMillis,
+    ExpireWrite, HashValue, NewValueOwned, RmwAction, RmwEntry, RmwStep, ScanCursor, Store,
+    UnixMillis,
 };
 
 /// One owned `(field, value)` byte pair, the shape [`HashValue::pairs`] returns and the
@@ -91,6 +92,21 @@ fn reaped_read(changed: bool, reply: Value) -> RmwStep<Value> {
         expire: ExpireWrite::Unchanged,
         reply,
     }
+}
+
+/// Lazily reap fields expired at `now`, UNLESS the store is a PASSIVE replica (HA-7d). A
+/// passive replica must NEVER expire on its own (key- or field-level): the authoritative
+/// removal arrives only through the replication stream, so a replica that reaped here would
+/// pre-empt the primary's expiry and diverge its local accounting (exactly what the key-level
+/// `expire_if_due` guards against). On a passive replica this is a no-op returning `false` (no
+/// physical removal, no change); on a primary/standalone it removes the expired fields and
+/// returns whether any were removed. `passive` is read from [`Store::is_passive`] before the
+/// `rmw` (the store is borrowed by the closure) and captured in. (#408)
+fn reap_on_read(hash: &mut dyn HashValue, now: UnixMillis, passive: bool) -> bool {
+    if passive {
+        return false;
+    }
+    !hash.reap_expired_fields(now).is_empty()
 }
 
 /// A bulk reply from owned bytes.
@@ -166,6 +182,11 @@ fn hset_generic<S: Store>(
                 if hash.set(f, v, &th) {
                     added += 1;
                 }
+                // A plain HSET/HMSET write removes the field's TTL (Redis hashTypeSet without
+                // HASH_SET_KEEP_TTL): an overwritten field becomes persistent. A no-op on a
+                // field that had no TTL (incl. every newly created field). HSETNX (only-if-
+                // absent) and HINCRBY/HINCRBYFLOAT (which keep the TTL) do not go through here.
+                hash.persist_field(f);
             }
             RmwStep {
                 action: RmwAction::Mutated,
@@ -249,12 +270,13 @@ pub fn cmd_hget<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
     if req.args.len() != 3 {
         return Value::error(ErrorReply::wrong_arity("hget"));
     }
+    let passive = store.is_passive();
     let field = req.args[2].clone();
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Null),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
-                let changed = !hash.reap_expired_fields(now).is_empty();
+                let changed = reap_on_read(hash, now, passive);
                 let reply = hash.get(&field).map_or(Value::Null, |v| bulk(v.to_vec()));
                 reaped_read(changed, reply)
             }
@@ -271,6 +293,7 @@ pub fn cmd_hmget<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
     if req.args.len() < 3 {
         return Value::error(ErrorReply::wrong_arity("hmget"));
     }
+    let passive = store.is_passive();
     let fields: Vec<Bytes> = req.args[2..].to_vec();
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         // Missing key: a nil per requested field (Redis HMGET on a missing key).
@@ -279,7 +302,7 @@ pub fn cmd_hmget<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
         ))),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
-                let changed = !hash.reap_expired_fields(now).is_empty();
+                let changed = reap_on_read(hash, now, passive);
                 let out: Vec<Value> = fields
                     .iter()
                     .map(|f| hash.get(f).map_or(Value::Null, |v| bulk(v.to_vec())))
@@ -299,11 +322,12 @@ pub fn cmd_hgetall<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("hgetall"));
     }
+    let passive = store.is_passive();
     store.rmw_mut(db, &req.args[1], now, |entry| match entry {
         RmwEntry::Vacant => keep(Value::Map(Vec::new())),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
-                let changed = !hash.reap_expired_fields(now).is_empty();
+                let changed = reap_on_read(hash, now, passive);
                 let pairs: Vec<(Value, Value)> = hash
                     .pairs()
                     .into_iter()
@@ -322,11 +346,12 @@ pub fn cmd_hkeys<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("hkeys"));
     }
+    let passive = store.is_passive();
     store.rmw_mut(db, &req.args[1], now, |entry| match entry {
         RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
-                let changed = !hash.reap_expired_fields(now).is_empty();
+                let changed = reap_on_read(hash, now, passive);
                 let out = hash.fields().into_iter().map(bulk).collect();
                 reaped_read(changed, Value::Array(Some(out)))
             }
@@ -341,11 +366,12 @@ pub fn cmd_hvals<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("hvals"));
     }
+    let passive = store.is_passive();
     store.rmw_mut(db, &req.args[1], now, |entry| match entry {
         RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
-                let changed = !hash.reap_expired_fields(now).is_empty();
+                let changed = reap_on_read(hash, now, passive);
                 let out = hash.values().into_iter().map(bulk).collect();
                 reaped_read(changed, Value::Array(Some(out)))
             }
@@ -360,11 +386,12 @@ pub fn cmd_hlen<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("hlen"));
     }
+    let passive = store.is_passive();
     store.rmw_mut(db, &req.args[1], now, |entry| match entry {
         RmwEntry::Vacant => keep(Value::Integer(0)),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
-                let changed = !hash.reap_expired_fields(now).is_empty();
+                let changed = reap_on_read(hash, now, passive);
                 reaped_read(changed, Value::Integer(hash.len() as i64))
             }
             None => wrong_type(),
@@ -379,12 +406,13 @@ pub fn cmd_hexists<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
     if req.args.len() != 3 {
         return Value::error(ErrorReply::wrong_arity("hexists"));
     }
+    let passive = store.is_passive();
     let field = req.args[2].clone();
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Integer(0)),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
-                let changed = !hash.reap_expired_fields(now).is_empty();
+                let changed = reap_on_read(hash, now, passive);
                 reaped_read(changed, Value::Integer(i64::from(hash.contains(&field))))
             }
             None => wrong_type(),
@@ -399,12 +427,13 @@ pub fn cmd_hstrlen<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
     if req.args.len() != 3 {
         return Value::error(ErrorReply::wrong_arity("hstrlen"));
     }
+    let passive = store.is_passive();
     let field = req.args[2].clone();
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Integer(0)),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
-                let changed = !hash.reap_expired_fields(now).is_empty();
+                let changed = reap_on_read(hash, now, passive);
                 reaped_read(changed, Value::Integer(hash.strlen(&field) as i64))
             }
             None => wrong_type(),
@@ -595,6 +624,7 @@ pub fn cmd_hrandfield<S: Store>(
     if req.args.len() < 2 || req.args.len() > 4 {
         return Value::error(ErrorReply::wrong_arity("hrandfield"));
     }
+    let passive = store.is_passive();
     // Parse the optional count + WITHVALUES.
     let count: Option<i64> = if req.args.len() >= 3 {
         match parse_i64(&req.args[2]) {
@@ -632,7 +662,7 @@ pub fn cmd_hrandfield<S: Store>(
                 // out of the view so the selection logic below can index it (the borrow of `o`
                 // ends here).
                 Some(hash) => {
-                    let changed = !hash.reap_expired_fields(now).is_empty();
+                    let changed = reap_on_read(hash, now, passive);
                     (changed, hash.pairs())
                 }
                 None => return wrong_type(),
@@ -755,6 +785,7 @@ pub fn cmd_hscan<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
     if req.args.len() < 3 {
         return Value::error(ErrorReply::wrong_arity("hscan"));
     }
+    let passive = store.is_passive();
     let Some(cursor) = ScanCursor::from_token(&req.args[2]) else {
         return Value::error(ErrorReply::invalid_cursor());
     };
@@ -799,7 +830,7 @@ pub fn cmd_hscan<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
             }
             RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
                 Some(hash) => {
-                    let changed = !hash.reap_expired_fields(now).is_empty();
+                    let changed = reap_on_read(hash, now, passive);
                     (changed, hash.pairs(), hash.is_listpack())
                 }
                 None => return wrong_type(),
@@ -1051,8 +1082,11 @@ fn hexpire_generic<S: Store>(
             let Some(hash) = o.as_hash_mut() else {
                 return wrong_type();
             };
-            // Lazy reap first so an already-expired field reads as absent (code -2).
-            hash.reap_expired_fields(now);
+            // Lazy reap first so an already-expired field reads as absent (code -2). HEXPIRE is
+            // a write (primary-only), so it always reaps; `changed` tracks whether anything was
+            // actually set/deleted/reaped, so a pure no-op (e.g. an XX miss) stays a Keep and
+            // does not dirty a WATCH or emit a replication post-image.
+            let mut changed = !hash.reap_expired_fields(now).is_empty();
             let mut out: Vec<Value> = Vec::with_capacity(fields.len());
             for f in &fields {
                 if !hash.contains(f) {
@@ -1078,15 +1112,19 @@ fn hexpire_generic<S: Store>(
                     // A deadline at or before now deletes the field (Redis code 2).
                     hash.del(f);
                     out.push(Value::Integer(2));
+                    changed = true;
                 } else {
                     hash.set_field_ttl(f, UnixMillis(deadline_ms as u64));
                     out.push(Value::Integer(1));
+                    changed = true;
                 }
             }
             let action = if hash.is_empty() {
                 RmwAction::Delete
-            } else {
+            } else if changed {
                 RmwAction::Mutated
+            } else {
+                RmwAction::Keep
             };
             RmwStep {
                 action,
@@ -1150,13 +1188,14 @@ fn httl_generic<S: Store>(
         Ok(f) => f.to_vec(),
         Err(e) => return Value::error(e),
     };
+    let passive = store.is_passive();
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
         RmwEntry::OccupiedMut(mut o) => {
             let Some(hash) = o.as_hash_mut() else {
                 return wrong_type();
             };
-            let reaped = hash.reap_expired_fields(now);
+            let changed = reap_on_read(hash, now, passive);
             let mut out: Vec<Value> = Vec::with_capacity(fields.len());
             for f in &fields {
                 if !hash.contains(f) {
@@ -1182,10 +1221,10 @@ fn httl_generic<S: Store>(
             // read (Keep), so it does not dirty the change counter.
             let action = if hash.is_empty() {
                 RmwAction::Delete
-            } else if reaped.is_empty() {
-                RmwAction::Keep
-            } else {
+            } else if changed {
                 RmwAction::Mutated
+            } else {
+                RmwAction::Keep
             };
             RmwStep {
                 action,
@@ -1536,6 +1575,73 @@ mod tests {
             None
         );
         assert_eq!(int(&cmd_hlen(&mut s, 0, later, &req(&[b"HLEN", b"h"]))), 0);
+    }
+
+    #[test]
+    fn passive_replica_does_not_reap_expired_fields_on_read() {
+        let mut s = test_store();
+        cmd_hset(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]),
+        );
+        cmd_hexpire(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HEXPIRE", b"h", b"10", b"FIELDS", b"1", b"a"]),
+        );
+        // Mark the store a PASSIVE replica (HA-7d): it must never expire on its own, since the
+        // authoritative removal arrives only via the replication stream. So a read at a later
+        // time must NOT physically drop the expired field (no independent expiry, no divergence).
+        s.set_passive(true);
+        let later = UnixMillis(20_000);
+        assert_eq!(int(&cmd_hlen(&mut s, 0, later, &req(&[b"HLEN", b"h"]))), 2);
+        assert_eq!(
+            int(&cmd_hexists(
+                &mut s,
+                0,
+                later,
+                &req(&[b"HEXISTS", b"h", b"a"])
+            )),
+            1
+        );
+        // Back as a primary, a read reaps the expired field (HLEN drops to 1).
+        s.set_passive(false);
+        assert_eq!(int(&cmd_hlen(&mut s, 0, later, &req(&[b"HLEN", b"h"]))), 1);
+    }
+
+    #[test]
+    fn hset_overwrite_clears_a_field_ttl() {
+        let mut s = test_store();
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h", b"a", b"1"]));
+        cmd_hexpire(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"1", b"a"]),
+        );
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"])
+            )),
+            vec![100]
+        );
+        // A plain HSET overwrite removes the field's TTL (Redis hashTypeSet) -> -1 (no TTL).
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h", b"a", b"2"]));
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"])
+            )),
+            vec![-1]
+        );
     }
 
     // ---- HSET: new-vs-update count, HMSET alias. ----

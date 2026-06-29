@@ -1723,6 +1723,16 @@ pub trait Store {
     /// (the lazy backstop, EXPIRATION.md).
     fn read(&mut self, db: u32, key: &[u8], now: UnixMillis) -> Option<ValueRef<'_>>;
 
+    /// Whether this store is a PASSIVE replica (HA-7d): it serves reads but must NEVER
+    /// expire data on its own (key-level and hash-field-level), because the authoritative
+    /// removal arrives only through the replication stream. The default is `false` (an active
+    /// primary / standalone). A command that lazily reaps must consult this before physically
+    /// removing anything, so a replica never pre-empts the primary's expiry or diverges its
+    /// local accounting. See [`ironcache_store::ShardStore::is_passive`] for the concrete flag.
+    fn is_passive(&self) -> bool {
+        false
+    }
+
     /// Blind set: store `value` for `key` with the `expire` TTL effect, replacing
     /// any existing value. Returns whether a LIVE key existed before the write (so
     /// a caller can distinguish create from overwrite; a lazily-expired prior

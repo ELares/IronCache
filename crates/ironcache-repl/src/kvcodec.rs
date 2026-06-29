@@ -70,8 +70,10 @@ mod enc_tag {
     pub const SKIPLIST: u8 = 7;
     // Hash with per-field TTLs (#408). These codec-internal tags signal that a trailing
     // field-TTL section follows the field/value pairs; OBJECT ENCODING stays listpackex (small)
-    // or hashtable (large). An old reader that lacks these tags rejects the buffer (its
-    // `is_done` check fails on the extra section), so the extension is backward-safe.
+    // or hashtable (large). An old decoder that lacks these tags rejects the whole record at the
+    // enc-tag step (`tag_to_enc` returns None for 8/9), so the extension is backward-safe (a
+    // clean decode failure, never a misparse), at the cost of forward-incompatibility (an old
+    // replica/binary cannot read a new field-TTL hash).
     pub const LISTPACKEX: u8 = 8;
     pub const HASHTABLEEX: u8 = 9;
 }
