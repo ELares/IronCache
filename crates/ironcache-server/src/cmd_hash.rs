@@ -1898,6 +1898,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hgetdel_hgetex_edge_cases() {
+        let mut s = test_store();
+        // HGETDEL of every field removes the key.
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h", b"a", b"1"]));
+        cmd_hgetdel(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HGETDEL", b"h", b"FIELDS", b"1", b"a"]),
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"h"]))), 0);
+
+        // HGETEX with a past absolute deadline (PXAT 0 at NOW=0) returns the value, then deletes
+        // the field (and the key, since it was the last one).
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h2", b"b", b"2"]));
+        match cmd_hgetex(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HGETEX", b"h2", b"PXAT", b"0", b"FIELDS", b"1", b"b"]),
+        ) {
+            Value::Array(Some(items)) => assert_eq!(bulk_bytes(&items[0]), Some(b"2".to_vec())),
+            other => panic!("expected array, got {other:?}"),
+        }
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"h2"]))), 0);
+
+        // A field literally named "EX" is read from the FIELDS block, not consumed as the TTL
+        // option (which is only recognized at the fixed position right after the key).
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h3", b"EX", b"v"]));
+        match cmd_hgetex(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HGETEX", b"h3", b"FIELDS", b"1", b"EX"]),
+        ) {
+            Value::Array(Some(items)) => assert_eq!(bulk_bytes(&items[0]), Some(b"v".to_vec())),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
     // ---- HSET: new-vs-update count, HMSET alias. ----
 
     #[test]
