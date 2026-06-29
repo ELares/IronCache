@@ -141,6 +141,22 @@ release.
 
 ### Added
 
+- CLIENT TRACKING / server-assisted client-side caching, stage 1 (issue #409):
+  `CLIENT TRACKING ON|OFF [NOLOOP]` and `CLIENT TRACKINGINFO` (RESP3). A tracking
+  connection's reads register their keys in the serving shard's tracking table;
+  when another connection changes a tracked key, the tracking client receives a
+  RESP3 `["invalidate", [key]]` push so it can drop its local cache, and
+  `FLUSHALL`/`FLUSHDB` push the flush form (`["invalidate", nil]`, drop
+  everything). `NOLOOP` suppresses the echo for a connection's own writes; an
+  invalidation is one-shot (the client re-reads to be re-tracked). `ON` requires
+  RESP3 (the `REDIRECT` target for RESP2 is a later stage); `OFF`/`RESET`/
+  disconnect purge the connection from the table. The common no-tracking path is a
+  single cheap gate per command (the table is never created until a tracking
+  client reads), so a server with no tracking clients pays nothing. The
+  `BCAST`/`OPTIN`/`OPTOUT`/`REDIRECT`/`PREFIX` options are rejected with a clear
+  not-yet-supported error (staged follow-ups) rather than silently mis-moded, and
+  this stage is single-shard-correct (the default deployment; cross-shard tracking
+  is a documented follow-up).
 - Observability command parity, part 1 (issue #413): `INFO COMMANDSTATS` and
   `INFO ERRORSTATS`. `INFO commandstats` (and `INFO all` / `everything`) now reports
   one `cmdstat_<cmd>:calls=N,usec=N,usec_per_call=N.NN,rejected_calls=N,failed_calls=N`

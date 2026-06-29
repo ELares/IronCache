@@ -107,6 +107,16 @@ pub struct ConnState {
     /// Drives the disconnect-cleanup deregistration from the serve layer's `shard_channels` table.
     /// A connection holding any shard subscription is "in subscribe mode" ([`Self::is_subscriber`]).
     pub sub_shard_channels: HashSet<Bytes>,
+    /// CLIENT TRACKING: server-assisted client-side caching is ON for this connection (#409). When
+    /// set, a READ registers the read keys in the per-shard tracking table, and a later change to
+    /// one of them pushes an `invalidate` to this connection. Default `false`, so the non-tracking
+    /// hot path is a single bool test. `CLIENT TRACKING OFF` and RESET clear it (which also purges
+    /// this connection from every shard's tracking table). BCAST/OPTIN/OPTOUT/REDIRECT are later
+    /// stages.
+    pub tracking_on: bool,
+    /// CLIENT TRACKING `NOLOOP` (#409): suppress invalidation pushes caused by THIS connection's
+    /// OWN writes (a client that already updated its cache does not need the echo). Default `false`.
+    pub tracking_noloop: bool,
     /// The per-connection CLUSTER read-only bit (REPLICA_READ.md #147, HA-7d). `false` (read
     /// -write) by default; `READONLY` sets it, `READWRITE` clears it. On a REPLICA node, a keyed
     /// READ for a slot this node replicates is served LOCALLY only when this bit is set; otherwise
@@ -182,6 +192,8 @@ impl ConnState {
             sub_channels: HashSet::new(),
             sub_patterns: HashSet::new(),
             sub_shard_channels: HashSet::new(),
+            tracking_on: false,
+            tracking_noloop: false,
             // Read-write by default (the strong-read behavior unmodified clients expect); a client
             // opts into replica reads with READONLY (REPLICA_READ.md #147).
             readonly: false,
@@ -219,6 +231,11 @@ impl ConnState {
         self.sub_channels.clear();
         self.sub_patterns.clear();
         self.sub_shard_channels.clear();
+        // RESET turns CLIENT TRACKING OFF (Redis parity); the serve layer observes the connection
+        // leave tracking mode and purges it from every shard's tracking table (the same split as
+        // the subscribe-mode cleanup).
+        self.tracking_on = false;
+        self.tracking_noloop = false;
         // RESET clears the CLUSTER read-only bit back to read-write (Redis parity).
         self.readonly = false;
         // RESET clears any pending one-shot ASKING (HA-6): a fresh baseline never carries a stale
