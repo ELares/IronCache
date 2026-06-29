@@ -291,6 +291,15 @@ pub(crate) mod tests {
             b"HINCRBYFLOAT",
             b"HRANDFIELD",
             b"HSCAN",
+            b"HEXPIRE",
+            b"HPEXPIRE",
+            b"HEXPIREAT",
+            b"HPEXPIREAT",
+            b"HTTL",
+            b"HPTTL",
+            b"HEXPIRETIME",
+            b"HPEXPIRETIME",
+            b"HPERSIST",
             // Sets
             b"SADD",
             b"SREM",
@@ -543,9 +552,11 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            180,
-            "the dispatch-arm hand-list drifted from the 168 client commands (incl. LOLWUT, \
-             #414 command-surface completeness, + SAVE/BGSAVE/\
+            189,
+            "the dispatch-arm hand-list drifted from the 177 client commands (incl. LOLWUT, \
+             #414 command-surface completeness, + the 9 hash-field-TTL commands HEXPIRE/\
+             HPEXPIRE/HEXPIREAT/HPEXPIREAT/HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME/HPERSIST, #408, \
+             + SAVE/BGSAVE/\
              LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown, + the drop-in\
              compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO, \
              + the PROD-7 operability trio SLOWLOG/MEMORY/LATENCY, + the PROD-9 blocking family \

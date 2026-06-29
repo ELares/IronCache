@@ -46,6 +46,7 @@
 //!
 //! [`HashValue::is_listpack`]: ironcache_storage::HashValue::is_listpack
 
+use crate::cmd_expire::{ExpireKind, resolve_expire_at};
 use crate::cmd_util::{ascii_upper, parse_f64, parse_i64, parse_i64_strict};
 use bytes::Bytes;
 use ironcache_protocol::{ErrorReply, Request, Value, format_human_double};
@@ -895,6 +896,332 @@ fn field_scan_hash(field: &[u8]) -> u64 {
     h ^ (h >> 31)
 }
 
+// ---------------------------------------------------------------------------
+// Hash field TTL (HEXPIRE family, Redis 7.4, #408).
+//
+// Per-field expiry: HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT set a TTL on individual hash
+// fields, HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME read them, and HPERSIST removes them. The
+// deadlines live in an optional side-map on the hash value (zero cost for a hash with no
+// field TTLs). Expiry is LAZY: every access reaps fields whose deadline is at or before now
+// (matching Redis hashTypeIsExpired); when reaping empties the hash the key is deleted, as
+// Redis does. Proactive (timing-wheel) reaping is the tracked fast-follow.
+// ---------------------------------------------------------------------------
+
+/// The Redis 7 per-field conditional flags (NX/XX/GT/LT), applied against each field's
+/// CURRENT deadline (None = no TTL = +infinity for the ordering gate). Mirrors the key-level
+/// EXPIRE flag semantics in cmd_expire, evaluated per field here. The four bools mirror the
+/// four INDEPENDENT Redis option bits exactly (the existence and ordering gates are evaluated
+/// separately), so collapsing them into enums would re-couple them; the lint is allowed with
+/// that rationale, as in cmd_expire's ExpireCond.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Default, Clone, Copy)]
+struct HCond {
+    nx: bool,
+    xx: bool,
+    gt: bool,
+    lt: bool,
+}
+
+/// Parse the trailing `FIELDS numfields field [field ...]` block (the slice STARTING at the
+/// FIELDS keyword) shared by every HEXPIRE-family command, returning the field arguments.
+/// The error strings are byte-faithful to Redis (src/t_hash.c).
+fn parse_hash_fields_block(tail: &[Bytes]) -> Result<&[Bytes], ErrorReply> {
+    if tail
+        .first()
+        .is_none_or(|t| !t.eq_ignore_ascii_case(b"FIELDS"))
+    {
+        return Err(ErrorReply::err(
+            "Mandatory keyword FIELDS is missing or not at the right position",
+        ));
+    }
+    let Some(n) = tail.get(1).and_then(|a| parse_i64(a)) else {
+        return Err(ErrorReply::err(
+            "Parameter `numFields` should be greater than 0",
+        ));
+    };
+    if n <= 0 {
+        return Err(ErrorReply::err(
+            "Parameter `numFields` should be greater than 0",
+        ));
+    }
+    let fields = &tail[2..];
+    if (n as usize) != fields.len() {
+        return Err(ErrorReply::err(
+            "Parameter `numFields` is more than number of arguments",
+        ));
+    }
+    Ok(fields)
+}
+
+/// The shared body of HEXPIRE / HPEXPIRE / HEXPIREAT / HPEXPIREAT. Returns a per-field array
+/// of codes (-2 no field, 0 condition not met, 1 set, 2 field deleted because the deadline is
+/// in the past), or an empty array if the key is missing (Redis returns an empty array, not an
+/// error). One atomic rmw_mut over the hash.
+fn hexpire_generic<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    kind: ExpireKind,
+    cmd_name: &str,
+) -> Value {
+    // HEXPIRE key ttl [NX|XX|GT|LT] FIELDS numfields field [field ...]: arity >= 6.
+    if req.args.len() < 6 {
+        return Value::error(ErrorReply::wrong_arity(cmd_name));
+    }
+    let Some(ttl) = parse_i64(&req.args[2]) else {
+        return Value::error(ErrorReply::not_an_integer());
+    };
+    // An OPTIONAL single condition token precedes the FIELDS block.
+    let mut idx = 3;
+    let mut cond = HCond::default();
+    match ascii_upper(&req.args[idx]).as_slice() {
+        b"NX" => {
+            cond.nx = true;
+            idx += 1;
+        }
+        b"XX" => {
+            cond.xx = true;
+            idx += 1;
+        }
+        b"GT" => {
+            cond.gt = true;
+            idx += 1;
+        }
+        b"LT" => {
+            cond.lt = true;
+            idx += 1;
+        }
+        // No condition: the FIELDS-block parser validates the next token.
+        _ => {}
+    }
+    let fields: Vec<Bytes> = match parse_hash_fields_block(&req.args[idx..]) {
+        Ok(f) => f.to_vec(),
+        Err(e) => return Value::error(e),
+    };
+    let Ok(deadline_ms) = resolve_expire_at(kind, ttl, now) else {
+        return Value::error(ErrorReply::invalid_expire_time(cmd_name));
+    };
+
+    store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
+        // Missing key: Redis replies an empty array (NOT an error).
+        RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
+        RmwEntry::OccupiedMut(mut o) => {
+            let Some(hash) = o.as_hash_mut() else {
+                return wrong_type();
+            };
+            // Lazy reap first so an already-expired field reads as absent (code -2).
+            hash.reap_expired_fields(now);
+            let mut out: Vec<Value> = Vec::with_capacity(fields.len());
+            for f in &fields {
+                if !hash.contains(f) {
+                    out.push(Value::Integer(-2));
+                    continue;
+                }
+                let cur = hash.field_ttl(f);
+                // Existence (NX/XX) and ordering (GT/LT) gates are independent; both must
+                // pass (Redis src/expire.c). A field with no current TTL is +infinity.
+                let existence_ok = (!cond.nx || cur.is_none()) && (!cond.xx || cur.is_some());
+                let ordering_ok = match cur {
+                    None => !cond.gt,
+                    Some(c) => {
+                        (!cond.gt || deadline_ms > c.0 as i64)
+                            && (!cond.lt || deadline_ms < c.0 as i64)
+                    }
+                };
+                if !(existence_ok && ordering_ok) {
+                    out.push(Value::Integer(0));
+                    continue;
+                }
+                if deadline_ms <= now.0 as i64 {
+                    // A deadline at or before now deletes the field (Redis code 2).
+                    hash.del(f);
+                    out.push(Value::Integer(2));
+                } else {
+                    hash.set_field_ttl(f, UnixMillis(deadline_ms as u64));
+                    out.push(Value::Integer(1));
+                }
+            }
+            let action = if hash.is_empty() {
+                RmwAction::Delete
+            } else {
+                RmwAction::Mutated
+            };
+            RmwStep {
+                action,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::Array(Some(out)),
+            }
+        }
+        RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+    })
+}
+
+/// `HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field [field ...]`.
+pub fn cmd_hexpire<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    hexpire_generic(store, db, now, req, ExpireKind::Seconds, "hexpire")
+}
+
+/// `HPEXPIRE key milliseconds [NX|XX|GT|LT] FIELDS numfields field [field ...]`.
+pub fn cmd_hpexpire<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    hexpire_generic(store, db, now, req, ExpireKind::Millis, "hpexpire")
+}
+
+/// `HEXPIREAT key unix-time-seconds [NX|XX|GT|LT] FIELDS numfields field [field ...]`.
+pub fn cmd_hexpireat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    hexpire_generic(store, db, now, req, ExpireKind::SecondsAt, "hexpireat")
+}
+
+/// `HPEXPIREAT key unix-time-milliseconds [NX|XX|GT|LT] FIELDS numfields field [field ...]`.
+pub fn cmd_hpexpireat<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    hexpire_generic(store, db, now, req, ExpireKind::MillisAt, "hpexpireat")
+}
+
+/// How an HTTL-family reader maps a field's absolute deadline to its reply value.
+#[derive(Clone, Copy)]
+enum HTtlKind {
+    /// HTTL: remaining seconds, Redis rounding `(ms + 500) / 1000`.
+    TtlSeconds,
+    /// HPTTL: remaining milliseconds.
+    TtlMillis,
+    /// HEXPIRETIME: absolute deadline in seconds, `(ms + 500) / 1000`.
+    ExpireSeconds,
+    /// HPEXPIRETIME: absolute deadline in milliseconds.
+    ExpireMillis,
+}
+
+/// The shared body of HTTL / HPTTL / HEXPIRETIME / HPEXPIRETIME. Returns a per-field array:
+/// -2 (no such field), -1 (field has no TTL), or the TTL/timestamp value. Empty array if the
+/// key is missing.
+fn httl_generic<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    req: &Request,
+    kind: HTtlKind,
+    cmd_name: &str,
+) -> Value {
+    // HTTL key FIELDS numfields field [field ...]: arity >= 5.
+    if req.args.len() < 5 {
+        return Value::error(ErrorReply::wrong_arity(cmd_name));
+    }
+    let fields: Vec<Bytes> = match parse_hash_fields_block(&req.args[2..]) {
+        Ok(f) => f.to_vec(),
+        Err(e) => return Value::error(e),
+    };
+    store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
+        RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
+        RmwEntry::OccupiedMut(mut o) => {
+            let Some(hash) = o.as_hash_mut() else {
+                return wrong_type();
+            };
+            let reaped = hash.reap_expired_fields(now);
+            let mut out: Vec<Value> = Vec::with_capacity(fields.len());
+            for f in &fields {
+                if !hash.contains(f) {
+                    out.push(Value::Integer(-2));
+                    continue;
+                }
+                match hash.field_ttl(f) {
+                    None => out.push(Value::Integer(-1)),
+                    Some(at) => {
+                        let v = match kind {
+                            HTtlKind::TtlSeconds => {
+                                (at.0.saturating_sub(now.0) as i64 + 500) / 1_000
+                            }
+                            HTtlKind::TtlMillis => at.0.saturating_sub(now.0) as i64,
+                            HTtlKind::ExpireSeconds => (at.0 as i64 + 500) / 1_000,
+                            HTtlKind::ExpireMillis => at.0 as i64,
+                        };
+                        out.push(Value::Integer(v));
+                    }
+                }
+            }
+            // A reader only mutates if the lazy reap removed a field; otherwise it is a pure
+            // read (Keep), so it does not dirty the change counter.
+            let action = if hash.is_empty() {
+                RmwAction::Delete
+            } else if reaped.is_empty() {
+                RmwAction::Keep
+            } else {
+                RmwAction::Mutated
+            };
+            RmwStep {
+                action,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::Array(Some(out)),
+            }
+        }
+        RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+    })
+}
+
+/// `HTTL key FIELDS numfields field [field ...]`.
+pub fn cmd_httl<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    httl_generic(store, db, now, req, HTtlKind::TtlSeconds, "httl")
+}
+
+/// `HPTTL key FIELDS numfields field [field ...]`.
+pub fn cmd_hpttl<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    httl_generic(store, db, now, req, HTtlKind::TtlMillis, "hpttl")
+}
+
+/// `HEXPIRETIME key FIELDS numfields field [field ...]`.
+pub fn cmd_hexpiretime<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    httl_generic(store, db, now, req, HTtlKind::ExpireSeconds, "hexpiretime")
+}
+
+/// `HPEXPIRETIME key FIELDS numfields field [field ...]`.
+pub fn cmd_hpexpiretime<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    httl_generic(store, db, now, req, HTtlKind::ExpireMillis, "hpexpiretime")
+}
+
+/// `HPERSIST key FIELDS numfields field [field ...]` -> per-field: -2 (no field), -1 (no TTL
+/// to remove), 1 (TTL removed).
+pub fn cmd_hpersist<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() < 5 {
+        return Value::error(ErrorReply::wrong_arity("hpersist"));
+    }
+    let fields: Vec<Bytes> = match parse_hash_fields_block(&req.args[2..]) {
+        Ok(f) => f.to_vec(),
+        Err(e) => return Value::error(e),
+    };
+    store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
+        RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
+        RmwEntry::OccupiedMut(mut o) => {
+            let Some(hash) = o.as_hash_mut() else {
+                return wrong_type();
+            };
+            let reaped = hash.reap_expired_fields(now);
+            let mut changed = !reaped.is_empty();
+            let mut out: Vec<Value> = Vec::with_capacity(fields.len());
+            for f in &fields {
+                if !hash.contains(f) {
+                    out.push(Value::Integer(-2));
+                } else if hash.persist_field(f) {
+                    changed = true;
+                    out.push(Value::Integer(1));
+                } else {
+                    out.push(Value::Integer(-1));
+                }
+            }
+            let action = if hash.is_empty() {
+                RmwAction::Delete
+            } else if changed {
+                RmwAction::Mutated
+            } else {
+                RmwAction::Keep
+            };
+            RmwStep {
+                action,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::Array(Some(out)),
+            }
+        }
+        RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +1267,176 @@ mod tests {
             Value::Null => None,
             other => panic!("expected a bulk or nil, got {other:?}"),
         }
+    }
+
+    fn ints(v: &Value) -> Vec<i64> {
+        match v {
+            Value::Array(Some(items)) => items.iter().map(int).collect(),
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    // ---- HEXPIRE family (#408): per-field TTL set/read/persist/expire + errors. ----
+
+    #[test]
+    fn hexpire_family_set_read_persist_and_expire() {
+        let mut s = test_store();
+        cmd_hset(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HSET", b"h", b"a", b"1", b"b", b"2", b"c", b"3"]),
+        );
+        // HEXPIRE 100s on a,b (NOW=0 -> deadline 100000ms); missing field z -> -2.
+        assert_eq!(
+            ints(&cmd_hexpire(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"3", b"a", b"b", b"z"]),
+            )),
+            vec![1, 1, -2]
+        );
+        // HTTL: a,b -> 100s; c -> -1 (no TTL); z -> -2 (no field).
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"4", b"a", b"b", b"c", b"z"]),
+            )),
+            vec![100, 100, -1, -2]
+        );
+        // HPTTL a -> 100000 ms; HEXPIRETIME a -> 100 (absolute seconds).
+        assert_eq!(
+            ints(&cmd_hpttl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HPTTL", b"h", b"FIELDS", b"1", b"a"])
+            )),
+            vec![100_000]
+        );
+        assert_eq!(
+            ints(&cmd_hexpiretime(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HEXPIRETIME", b"h", b"FIELDS", b"1", b"a"]),
+            )),
+            vec![100]
+        );
+        // GT: a new 50s deadline is NOT greater than the current 100s -> 0 (not set).
+        assert_eq!(
+            ints(&cmd_hexpire(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HEXPIRE", b"h", b"50", b"GT", b"FIELDS", b"1", b"a"]),
+            )),
+            vec![0]
+        );
+        // HPERSIST a -> 1 (removed), c -> -1 (no TTL), z -> -2 (no field).
+        assert_eq!(
+            ints(&cmd_hpersist(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HPERSIST", b"h", b"FIELDS", b"3", b"a", b"c", b"z"]),
+            )),
+            vec![1, -1, -2]
+        );
+        // A past absolute deadline (HPEXPIREAT 0, with NOW=0) deletes the field (code 2).
+        assert_eq!(
+            ints(&cmd_hpexpireat(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HPEXPIREAT", b"h", b"0", b"FIELDS", b"1", b"b"]),
+            )),
+            vec![2]
+        );
+        // b is gone now (the field was deleted).
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"b"])
+            )),
+            vec![-2]
+        );
+        // Missing key -> empty array (NOT an error).
+        assert_eq!(
+            ints(&cmd_hexpire(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HEXPIRE", b"nope", b"100", b"FIELDS", b"1", b"a"]),
+            )),
+            Vec::<i64>::new()
+        );
+        // A bare 4-arg form fails arity first (HEXPIRE is -6, like Redis).
+        assert_eq!(
+            err_line(&cmd_hexpire(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HEXPIRE", b"h", b"100", b"a"])
+            )),
+            "-ERR wrong number of arguments for 'hexpire' command"
+        );
+        // With enough args but FIELDS misplaced -> the Redis-faithful keyword error.
+        assert_eq!(
+            err_line(&cmd_hexpire(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HEXPIRE", b"h", b"100", b"NOPE", b"x", b"y"]),
+            )),
+            "-ERR Mandatory keyword FIELDS is missing or not at the right position"
+        );
+        // numFields that does not match the provided field count -> the Redis-faithful error.
+        assert_eq!(
+            err_line(&cmd_hexpire(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"2", b"a"]),
+            )),
+            "-ERR Parameter `numFields` is more than number of arguments"
+        );
+    }
+
+    #[test]
+    fn hexpire_lazy_reaps_an_expired_field_on_access() {
+        let mut s = test_store();
+        cmd_hset(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]),
+        );
+        // 10s TTL on a (deadline 10000ms at NOW=0).
+        cmd_hexpire(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HEXPIRE", b"h", b"10", b"FIELDS", b"1", b"a"]),
+        );
+        let later = UnixMillis(20_000);
+        // At a later time, a is past its deadline: a TTL-family access lazily reaps it -> -2.
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                later,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"])
+            )),
+            vec![-2]
+        );
+        // The reap removed a from the hash; only b remains.
+        assert_eq!(int(&cmd_hlen(&mut s, 0, later, &req(&[b"HLEN", b"h"]))), 1);
     }
 
     // ---- HSET: new-vs-update count, HMSET alias. ----
