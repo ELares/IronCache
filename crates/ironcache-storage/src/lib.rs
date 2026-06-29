@@ -164,6 +164,11 @@ pub enum Encoding {
     /// `list-max-listpack-size` byte budget or the per-node element cap (#40,
     /// LIST_LARGE.md). The reported NAME is a pure function of the active repr.
     QuickList,
+    /// A small hash with per-field TTLs, stored in the listpack-equivalent form
+    /// (`OBJECT ENCODING` -> listpackex). Produced once a small hash carries a field TTL
+    /// (#408, Redis 7.4); a large hash with field TTLs stays `hashtable` (there is no
+    /// `hashtableex` name in Redis).
+    ListPackEx,
     /// Reserved (intset).
     IntSet,
     /// Reserved (hashtable for large hashes/sets).
@@ -181,6 +186,7 @@ impl Encoding {
             Encoding::EmbStr => "embstr",
             Encoding::Raw => "raw",
             Encoding::ListPack => "listpack",
+            Encoding::ListPackEx => "listpackex",
             Encoding::QuickList => "quicklist",
             Encoding::IntSet => "intset",
             Encoding::HashTable => "hashtable",

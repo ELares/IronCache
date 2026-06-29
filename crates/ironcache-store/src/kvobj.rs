@@ -628,14 +628,20 @@ impl HashVal {
         }
     }
 
-    /// The encoding this hash reports, a PURE FUNCTION of the active form (#40):
-    /// `listpack` for the small form, `hashtable` for the large form. (The `listpackex`
-    /// reporting for the small form with field TTLs is wired with the #408 feature, where
-    /// `ttls` first becomes non-`None`.)
+    /// The encoding this hash reports, a PURE FUNCTION of the active form (#40) and whether
+    /// any field carries a TTL: `listpack` for the small form with no field TTL, `listpackex`
+    /// for the small form once a field TTL is set (#408, Redis 7.4), and `hashtable` for the
+    /// large form (Redis has no `hashtableex` name).
     #[must_use]
     pub fn encoding(&self) -> Encoding {
         match &self.data {
-            HashData::ListPack(_) => Encoding::ListPack,
+            HashData::ListPack(_) => {
+                if self.ttls.is_some() {
+                    Encoding::ListPackEx
+                } else {
+                    Encoding::ListPack
+                }
+            }
             HashData::HashTable(_) => Encoding::HashTable,
         }
     }
@@ -855,7 +861,13 @@ impl HashValue for HashVal {
 
     fn field_ttl_pairs(&self) -> Vec<(Vec<u8>, UnixMillis)> {
         self.ttls.as_ref().map_or_else(Vec::new, |t| {
-            t.iter().map(|(f, d)| (f.to_vec(), *d)).collect()
+            let mut v: Vec<(Vec<u8>, UnixMillis)> =
+                t.iter().map(|(f, d)| (f.to_vec(), *d)).collect();
+            // Sort by field so the wire/snapshot codec is CANONICAL (the side-map is a HashMap
+            // with run-to-run iteration order; a stable order keeps encode -> decode -> encode
+            // byte-identical, the property the codec round-trip test asserts).
+            v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            v
         })
     }
 
@@ -2311,6 +2323,7 @@ fn encoding_to_u8(e: Encoding) -> u8 {
         Encoding::IntSet => 5,
         Encoding::HashTable => 6,
         Encoding::SkipList => 7,
+        Encoding::ListPackEx => 8,
     }
 }
 
@@ -2324,6 +2337,7 @@ fn encoding_from_u8(b: u8) -> Encoding {
         5 => Encoding::IntSet,
         6 => Encoding::HashTable,
         7 => Encoding::SkipList,
+        8 => Encoding::ListPackEx,
         // 1 (and any unexpected byte, defensively) is EmbStr.
         _ => Encoding::EmbStr,
     }
