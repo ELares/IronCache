@@ -2456,7 +2456,7 @@ fn cmd_client<E: Clock>(
         // CLIENT TRACKING ON|OFF [NOLOOP] (#409): toggle server-assisted client-side caching for
         // this connection. Sets the per-connection flags; the serve layer's read/write hooks do the
         // registration + invalidation, and the OFF/RESET/disconnect transition purges the table.
-        b"TRACKING" => cmd_client_tracking(state, req),
+        b"TRACKING" => cmd_client_tracking(ctx, state, req),
         // CLIENT TRACKINGINFO (#409): the current tracking state (flags / redirect / prefixes).
         b"TRACKINGINFO" => cmd_client_trackinginfo(state, req),
         // CLIENT CACHING YES|NO (#409 stage 3): the one-shot OPTIN/OPTOUT caching gate.
@@ -2468,12 +2468,82 @@ fn cmd_client<E: Clock>(
     }
 }
 
-/// `CLIENT TRACKING <ON|OFF> [NOLOOP]` (#409): enable/disable server-assisted client-side caching
-/// for this connection. Stage 1 supports `ON`/`OFF` + `NOLOOP`; the `BCAST`/`OPTIN`/`OPTOUT`/
-/// `REDIRECT`/`PREFIX` options are rejected with a clear not-yet-supported error (later stages) so
-/// a client using them is never silently given the wrong mode. `ON` requires RESP3 (there is no
-/// `REDIRECT` target this stage), matching Redis's RESP3-or-REDIRECT rule.
-fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
+/// The parsed option tail of `CLIENT TRACKING` (everything after `ON`/`OFF`), produced by
+/// [`parse_tracking_options`]. Kept separate so the command handler stays short.
+// lint-allow: the four flags are independent Redis TRACKING toggles (NOLOOP/BCAST/OPTIN/OPTOUT),
+// each a distinct protocol option mirrored 1:1 onto `ConnState`; a state machine would not model
+// them more faithfully (OPTIN/OPTOUT exclusivity is validated separately, not encoded in the type).
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Default)]
+struct TrackingOpts {
+    noloop: bool,
+    bcast: bool,
+    optin: bool,
+    optout: bool,
+    /// The `REDIRECT` target id (stage 4); `0` means no redirection.
+    redirect: u64,
+    /// The `BCAST` `PREFIX` list (stage 2).
+    prefixes: Vec<bytes::Bytes>,
+}
+
+/// Parse the option tail of `CLIENT TRACKING` (`req.args[3..]`): NOLOOP/BCAST/OPTIN/OPTOUT/PREFIX/
+/// REDIRECT (#409). Returns the parsed [`TrackingOpts`] or, on a malformed option, the error `Value`
+/// to return to the client.
+fn parse_tracking_options(req: &Request) -> Result<TrackingOpts, Value> {
+    let mut o = TrackingOpts::default();
+    let mut i = 3;
+    while i < req.args.len() {
+        match ascii_upper(&req.args[i]).as_slice() {
+            b"NOLOOP" => {
+                o.noloop = true;
+                i += 1;
+            }
+            b"BCAST" => {
+                o.bcast = true;
+                i += 1;
+            }
+            b"OPTIN" => {
+                o.optin = true;
+                i += 1;
+            }
+            b"OPTOUT" => {
+                o.optout = true;
+                i += 1;
+            }
+            b"PREFIX" => {
+                if i + 1 >= req.args.len() {
+                    return Err(Value::error(ErrorReply::syntax_error()));
+                }
+                o.prefixes.push(req.args[i + 1].clone());
+                i += 2;
+            }
+            // Stage 4: REDIRECT <id> routes invalidations to another connection (id 0 = no redirect).
+            b"REDIRECT" => {
+                if i + 1 >= req.args.len() {
+                    return Err(Value::error(ErrorReply::syntax_error()));
+                }
+                o.redirect = match core::str::from_utf8(&req.args[i + 1])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    Some(id) => id,
+                    None => return Err(Value::error(ErrorReply::err("Invalid client ID"))),
+                };
+                i += 2;
+            }
+            _ => return Err(Value::error(ErrorReply::syntax_error())),
+        }
+    }
+    Ok(o)
+}
+
+/// `CLIENT TRACKING <ON|OFF> [REDIRECT id] [PREFIX p [PREFIX p ...]] [BCAST] [OPTIN] [OPTOUT]
+/// [NOLOOP]` (#409): enable/disable server-assisted client-side caching for this connection. `ON`
+/// requires RESP3 mode OR a `REDIRECT` target (stage 4): a RESP2 client has no push type, so its
+/// invalidations are routed to a SECOND connection (the redirect target, which `SUBSCRIBE`d
+/// `__redis__:invalidate`) as a Pub/Sub `message`. `REDIRECT 0` means no redirection. The redirect
+/// target must be a live connection (looked up in the client registry), matching Redis.
+fn cmd_client_tracking(ctx: &ServerContext, state: &mut ConnState, req: &Request) -> Value {
     if req.args.len() < 3 {
         return Value::error(ErrorReply::wrong_arity("client|tracking"));
     }
@@ -2482,48 +2552,17 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
         b"OFF" => false,
         _ => return Value::error(ErrorReply::syntax_error()),
     };
-    let mut noloop = false;
-    let mut bcast = false;
-    let mut optin = false;
-    let mut optout = false;
-    let mut prefixes: Vec<bytes::Bytes> = Vec::new();
-    let mut i = 3;
-    while i < req.args.len() {
-        let opt = ascii_upper(&req.args[i]);
-        match opt.as_slice() {
-            b"NOLOOP" => {
-                noloop = true;
-                i += 1;
-            }
-            b"BCAST" => {
-                bcast = true;
-                i += 1;
-            }
-            b"OPTIN" => {
-                optin = true;
-                i += 1;
-            }
-            b"OPTOUT" => {
-                optout = true;
-                i += 1;
-            }
-            b"PREFIX" => {
-                if i + 1 >= req.args.len() {
-                    return Value::error(ErrorReply::syntax_error());
-                }
-                prefixes.push(req.args[i + 1].clone());
-                i += 2;
-            }
-            // Stage 4: rejected loudly so a client is never silently given the wrong mode.
-            b"REDIRECT" => {
-                return Value::error(ErrorReply::err(
-                    "CLIENT TRACKING REDIRECT is not supported yet (this build implements \
-                     ON/OFF/NOLOOP/BCAST/PREFIX/OPTIN/OPTOUT; REDIRECT is a tracked follow-up)",
-                ));
-            }
-            _ => return Value::error(ErrorReply::syntax_error()),
-        }
-    }
+    let TrackingOpts {
+        noloop,
+        bcast,
+        optin,
+        optout,
+        redirect,
+        prefixes,
+    } = match parse_tracking_options(req) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
     // OPTIN and OPTOUT are mutually exclusive, and neither combines with BCAST (Redis).
     if optin && optout {
         return Value::error(ErrorReply::err(
@@ -2554,8 +2593,17 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
             }
         }
     }
+    // A non-zero REDIRECT target must be a LIVE connection (Redis looks it up in the client table).
+    // Checked only when enabling: `OFF` ignores any REDIRECT, and `REDIRECT 0` means no redirect.
+    if on && redirect != 0 && ctx.clients.by_id(redirect).is_none() {
+        return Value::error(ErrorReply::err(
+            "The client ID you want redirect to does not exist",
+        ));
+    }
     if on {
-        if state.proto != ProtoVersion::Resp3 {
+        // RESP3 is required UNLESS a redirect target is given: a RESP2 client cannot receive bare
+        // `invalidate` pushes, but it CAN route them to a redirect target's SUBSCRIBE.
+        if state.proto != ProtoVersion::Resp3 && redirect == 0 {
             return Value::error(ErrorReply::err(
                 "Client tracking can be enabled only in RESP3 mode or when a redirection client is \
                  specified via the 'REDIRECT' option",
@@ -2567,6 +2615,7 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
         state.tracking_prefixes = prefixes;
         state.tracking_optin = optin;
         state.tracking_optout = optout;
+        state.tracking_redirect = redirect;
         // A fresh CLIENT TRACKING ON drops any dangling one-shot CACHING flag.
         state.caching_next = None;
     } else {
@@ -2576,6 +2625,7 @@ fn cmd_client_tracking(state: &mut ConnState, req: &Request) -> Value {
         state.tracking_prefixes.clear();
         state.tracking_optin = false;
         state.tracking_optout = false;
+        state.tracking_redirect = 0;
         state.caching_next = None;
     }
     Value::ok()
@@ -2605,9 +2655,10 @@ fn cmd_client_caching(state: &mut ConnState, req: &Request) -> Value {
 }
 
 /// `CLIENT TRACKINGINFO` (#409): a map of this connection's tracking state. `flags` is `[off]` or
-/// `[on]` (plus `noloop`); `redirect` is `-1` when tracking is off, `0` when on with no redirect
-/// (stage 1 has no REDIRECT); `prefixes` is empty (BCAST is a later stage). Rendered as a
-/// [`Value::Map`] (RESP3 `%`, degrading to a flat array under RESP2).
+/// `[on]` (plus `bcast`/`optin`/`optout`/`noloop`/`caching-yes`/`caching-no` as set); `redirect` is
+/// `-1` when tracking is off, `0` when on with no redirect, or the REDIRECT target id (stage 4);
+/// `prefixes` lists the BCAST prefixes. Rendered as a [`Value::Map`] (RESP3 `%`, degrading to a flat
+/// array under RESP2).
 fn cmd_client_trackinginfo(state: &ConnState, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("client|trackinginfo"));
@@ -2636,7 +2687,13 @@ fn cmd_client_trackinginfo(state: &ConnState, req: &Request) -> Value {
     } else {
         vec![Value::bulk_str("off")]
     };
-    let redirect = if state.tracking_on { 0 } else { -1 };
+    // `redirect`: -1 when tracking is off, the REDIRECT target id when on with a redirect (stage 4),
+    // 0 when on with no redirect.
+    let redirect = if state.tracking_on {
+        i64::try_from(state.tracking_redirect).unwrap_or(i64::MAX)
+    } else {
+        -1
+    };
     // In BCAST mode the prefixes are reported (an empty list means the EMPTY prefix = all keys).
     let prefixes: Vec<Value> = state
         .tracking_prefixes

@@ -141,6 +141,19 @@ release.
 
 ### Added
 
+- CLIENT TRACKING REDIRECT, stage 4 (issue #409): `CLIENT TRACKING ON REDIRECT
+  <client-id>` routes this connection's invalidations to a SECOND connection (the
+  redirect target) instead of to itself. The target receives them as a Pub/Sub
+  `message` on the well-known `__redis__:invalidate` channel (which it must
+  `SUBSCRIBE`), so a RESP2 client (which has no push type) can be tracked: with a
+  REDIRECT target, `CLIENT TRACKING ON` no longer requires RESP3. `REDIRECT 0` means
+  no redirection; a non-zero target must be a live connection (else
+  `The client ID you want redirect to does not exist`). `CLIENT TRACKINGINFO` reports
+  the target id in its `redirect` field. NOLOOP still keys on the tracking client
+  (the registrant), not the target. This completes CLIENT TRACKING (#409): default /
+  BCAST / OPTIN / OPTOUT / REDIRECT are all supported. Single-shard-correct scope, as
+  with the rest of tracking (the redirect target's subscription and the key's owner
+  shard coincide when `shards == 1`).
 - CLIENT TRACKING OPTIN/OPTOUT + CLIENT CACHING, stage 3 (issue #409):
   `CLIENT TRACKING ON OPTIN|OPTOUT` and `CLIENT CACHING YES|NO`. In OPTIN mode a
   read's keys are tracked only when the connection ran `CLIENT CACHING YES`

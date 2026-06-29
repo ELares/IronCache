@@ -138,6 +138,12 @@ pub struct ConnState {
     /// `Some(false)` after `CACHING NO`, consumed by the NEXT command's track decision (then
     /// cleared). Only meaningful in OPTIN/OPTOUT mode. `None` otherwise.
     pub caching_next: Option<bool>,
+    /// The CLIENT TRACKING REDIRECT target connection id (#409 stage 4): `0` means NO redirect (the
+    /// tracking client receives its own `invalidate` pushes, RESP3 only); a non-zero id routes this
+    /// connection's invalidations to that OTHER connection as a `message __redis__:invalidate [keys]`
+    /// on the `__redis__:invalidate` channel (the target must `SUBSCRIBE` it), so a RESP2 client can
+    /// be tracked. Set by `CLIENT TRACKING ON REDIRECT <id>`; cleared on `OFF`/RESET. Default `0`.
+    pub tracking_redirect: u64,
     /// The per-connection CLUSTER read-only bit (REPLICA_READ.md #147, HA-7d). `false` (read
     /// -write) by default; `READONLY` sets it, `READWRITE` clears it. On a REPLICA node, a keyed
     /// READ for a slot this node replicates is served LOCALLY only when this bit is set; otherwise
@@ -220,6 +226,7 @@ impl ConnState {
             tracking_optin: false,
             tracking_optout: false,
             caching_next: None,
+            tracking_redirect: 0,
             // Read-write by default (the strong-read behavior unmodified clients expect); a client
             // opts into replica reads with READONLY (REPLICA_READ.md #147).
             readonly: false,
@@ -267,6 +274,7 @@ impl ConnState {
         self.tracking_optin = false;
         self.tracking_optout = false;
         self.caching_next = None;
+        self.tracking_redirect = 0;
         // RESET clears the CLUSTER read-only bit back to read-write (Redis parity).
         self.readonly = false;
         // RESET clears any pending one-shot ASKING (HA-6): a fresh baseline never carries a stale

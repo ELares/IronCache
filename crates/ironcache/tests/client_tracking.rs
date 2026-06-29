@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! End-to-end tests for CLIENT TRACKING / server-assisted client-side caching (#409, stage 1):
-//! a RESP3 tracking client reads a key, a second connection changes it, and the tracking client
-//! receives the `["invalidate", [key]]` push. Plus NOLOOP, the RESP2 gate, TRACKINGINFO, OFF, and
-//! the FLUSH (invalidate-everything) form.
+//! End-to-end tests for CLIENT TRACKING / server-assisted client-side caching (#409): a RESP3
+//! tracking client reads a key, a second connection changes it, and the tracking client receives
+//! the `["invalidate", [key]]` push. Covers NOLOOP, the RESP2 gate, TRACKINGINFO, OFF, the FLUSH
+//! (invalidate-everything) form, BCAST prefixes (stage 2), OPTIN/OPTOUT + CLIENT CACHING (stage 3),
+//! and REDIRECT routing to a RESP2 target's `__redis__:invalidate` subscription (stage 4).
 
 use ironcache::test_support::run_server_for_test;
 use std::time::Duration;
@@ -304,17 +305,18 @@ fn tracking_resp2_gate_and_trackinginfo_and_off() {
             b"off"
         ));
 
-        // The one still-unsupported option (REDIRECT, stage 4) is rejected loudly, not silently
-        // mis-moded. (BCAST is stage 2; OPTIN/OPTOUT are stage 3, each with their own tests.)
-        let redirect = cmd(
+        // REDIRECT to a NON-EXISTENT client id is a loud error (stage 4): the target must be a live
+        // connection, matching Redis. (The happy path has its own test below.)
+        let bad_redirect = cmd(
             &mut a,
             &mut ab,
-            &[b"CLIENT", b"TRACKING", b"ON", b"REDIRECT", b"5"],
+            &[b"CLIENT", b"TRACKING", b"ON", b"REDIRECT", b"999999999"],
         )
         .await;
         assert!(
-            matches!(&redirect, Resp::Error(_)),
-            "REDIRECT must be a loud not-yet-supported error"
+            matches!(&bad_redirect, Resp::Error(e)
+                if String::from_utf8_lossy(e).contains("does not exist")),
+            "REDIRECT to a missing client must error, got {bad_redirect:?}"
         );
     });
 }
@@ -590,5 +592,162 @@ fn tracking_caching_and_mode_validation() {
             &cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKINGINFO"]).await,
             b"optin"
         ));
+    });
+}
+
+/// This connection's CLIENT ID (an integer reply).
+async fn client_id(c: &mut TcpStream, buf: &mut Vec<u8>) -> u64 {
+    match cmd(c, buf, &[b"CLIENT", b"ID"]).await {
+        Resp::Integer(n) => u64::try_from(n).unwrap(),
+        other => panic!("CLIENT ID must be an integer, got {other:?}"),
+    }
+}
+
+/// Assert a REDIRECT invalidation: a Pub/Sub `message` on `__redis__:invalidate` whose third element
+/// is the key array (`["message", "__redis__:invalidate", [keys...]]`, #409 stage 4).
+fn assert_redirect_message(reply: &Resp, expect_keys: &[&[u8]]) {
+    let Resp::Agg { items, .. } = reply else {
+        panic!("redirect invalidation must be an aggregate, got {reply:?}");
+    };
+    assert_eq!(
+        items.len(),
+        3,
+        "redirect message has 3 elements, got {items:?}"
+    );
+    assert_eq!(items[0], Resp::Bulk(Some(b"message".to_vec())));
+    assert_eq!(
+        items[1],
+        Resp::Bulk(Some(b"__redis__:invalidate".to_vec())),
+        "redirect rides the __redis__:invalidate channel"
+    );
+    let Resp::Agg { items: ks, .. } = &items[2] else {
+        panic!("redirect keys must be an array, got {:?}", items[2]);
+    };
+    let got: Vec<Vec<u8>> = ks
+        .iter()
+        .map(|k| match k {
+            Resp::Bulk(Some(b)) => b.clone(),
+            other => panic!("key must be a bulk, got {other:?}"),
+        })
+        .collect();
+    for k in expect_keys {
+        assert!(
+            got.iter().any(|g| g.as_slice() == *k),
+            "expected key {k:?} in {got:?}"
+        );
+    }
+}
+
+/// The integer `redirect` field of a CLIENT TRACKINGINFO reply (a flattened `[k, v, ...]` map).
+fn trackinginfo_redirect(reply: &Resp) -> i64 {
+    let Resp::Agg { items, .. } = reply else {
+        panic!("TRACKINGINFO must be a map, got {reply:?}");
+    };
+    let v = items
+        .chunks(2)
+        .find(|c| c[0] == Resp::Bulk(Some(b"redirect".to_vec())))
+        .map(|c| &c[1])
+        .expect("TRACKINGINFO must have a redirect field");
+    match v {
+        Resp::Integer(n) => *n,
+        other => panic!("redirect must be an integer, got {other:?}"),
+    }
+}
+
+#[test]
+fn tracking_redirect_routes_invalidation_to_a_resp2_target() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        // The TRACKING client is RESP2 (no HELLO 3): it has no push type, so it relies on REDIRECT.
+        let mut a = connect_retry(port).await;
+        // The REDIRECT TARGET subscribes __redis__:invalidate; it receives the invalidations.
+        let mut t = connect_retry(port).await;
+        // A third connection performs the foreign write.
+        let mut w = connect_retry(port).await;
+        let (mut ab, mut tb, mut wb) = (Vec::new(), Vec::new(), Vec::new());
+
+        // The target learns its id, then SUBSCRIBEs the invalidation channel.
+        let tid = client_id(&mut t, &mut tb).await;
+        let sub = cmd(&mut t, &mut tb, &[b"SUBSCRIBE", b"__redis__:invalidate"]).await;
+        assert!(
+            matches!(sub, Resp::Agg { .. }),
+            "SUBSCRIBE confirm, got {sub:?}"
+        );
+
+        // RESP2 CLIENT TRACKING ON is allowed WHEN a REDIRECT target is given (no RESP3 needed).
+        let on = cmd(
+            &mut a,
+            &mut ab,
+            &[
+                b"CLIENT",
+                b"TRACKING",
+                b"ON",
+                b"REDIRECT",
+                tid.to_string().as_bytes(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            on,
+            Resp::Simple(b"OK".to_vec()),
+            "RESP2 + REDIRECT must be OK"
+        );
+
+        // A reads foo (registers it); the registration stores the TARGET's push handle.
+        cmd(&mut a, &mut ab, &[b"GET", b"foo"]).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // A foreign write of foo invalidates it; the push goes to the TARGET, not to A.
+        cmd(&mut w, &mut wb, &[b"SET", b"foo", b"bar"]).await;
+        let msg = read_timeout(&mut t, &mut tb, 1000)
+            .await
+            .expect("the redirect target must receive the invalidation");
+        assert_redirect_message(&msg, &[b"foo"]);
+
+        // The tracking client itself receives NOTHING (everything was redirected).
+        assert!(
+            read_timeout(&mut a, &mut ab, 200).await.is_none(),
+            "a REDIRECT tracking client receives no direct push"
+        );
+    });
+}
+
+#[test]
+fn tracking_redirect_trackinginfo_reports_target_id() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut a = connect_retry(port).await;
+        let mut t = connect_retry(port).await;
+        let (mut ab, mut tb) = (Vec::new(), Vec::new());
+
+        let tid = client_id(&mut t, &mut tb).await;
+        cmd(&mut t, &mut tb, &[b"SUBSCRIBE", b"__redis__:invalidate"]).await;
+
+        cmd(
+            &mut a,
+            &mut ab,
+            &[
+                b"CLIENT",
+                b"TRACKING",
+                b"ON",
+                b"REDIRECT",
+                tid.to_string().as_bytes(),
+            ],
+        )
+        .await;
+        // TRACKINGINFO reports the target id; OFF resets it to -1.
+        let info = cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKINGINFO"]).await;
+        assert_eq!(
+            trackinginfo_redirect(&info),
+            i64::try_from(tid).unwrap(),
+            "redirect field reports the target id"
+        );
+        cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKING", b"OFF"]).await;
+        let off = cmd(&mut a, &mut ab, &[b"CLIENT", b"TRACKINGINFO"]).await;
+        assert_eq!(trackinginfo_redirect(&off), -1, "off resets redirect to -1");
     });
 }

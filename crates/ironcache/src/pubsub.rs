@@ -110,6 +110,12 @@ impl ShedSignal {
 /// a burst coalesces, shallow enough to bound memory.
 pub const PUSH_CHANNEL_BOUND: usize = 1024;
 
+/// The well-known Pub/Sub channel CLIENT TRACKING REDIRECT invalidations ride (#409 stage 4): a
+/// `CLIENT TRACKING ON REDIRECT <id>` routes its invalidations to the connection with that id, which
+/// receives them as a Pub/Sub `message` on THIS channel (so a RESP2 client, which has no push type,
+/// gets invalidations on a connection it merely `SUBSCRIBE`d). Matches Redis's `__redis__:invalidate`.
+pub const REDIRECT_INVALIDATE_CHANNEL: &[u8] = b"__redis__:invalidate";
+
 /// One internal server-push value (SERVER_PUSH.md). It carries every out-of-band frame so
 /// framing is written ONCE by [`render`]: [`ServerPush::Message`] (classic Pub/Sub) and
 /// [`ServerPush::PMessage`] (PSUBSCRIBE pattern Pub/Sub, PR 91b).
@@ -150,9 +156,19 @@ pub enum ServerPush {
     /// `["invalidate", [key ...]]` RESP3 push that tells a tracking client to drop its local
     /// cache of those keys. `keys = None` is the FLUSH form (`["invalidate", nil]`), telling the
     /// client to drop EVERYTHING (FLUSHALL/FLUSHDB). Delivered on the same per-connection push
-    /// channel Pub/Sub uses; for a RESP2 `REDIRECT` target it rides the `__redis__:invalidate`
-    /// channel (a later stage).
+    /// channel Pub/Sub uses, direct to the tracking client; a `REDIRECT` target instead receives the
+    /// [`ServerPush::RedirectInvalidate`] form on `__redis__:invalidate`.
     Invalidate {
+        /// The invalidated keys, or `None` for a flush-everything invalidation.
+        keys: Option<Vec<Bytes>>,
+    },
+    /// A CLIENT TRACKING invalidation routed to a REDIRECT target (#409 stage 4): the same key set
+    /// as [`ServerPush::Invalidate`], but delivered to a SECOND connection (the `CLIENT TRACKING ON
+    /// REDIRECT <id>` target) as a Pub/Sub `message` on the well-known [`REDIRECT_INVALIDATE_CHANNEL`]
+    /// rather than as a bare `invalidate` push. This lets a RESP2 client (which has no push type)
+    /// receive invalidations on a connection it merely `SUBSCRIBE`d, matching Redis. `keys = None` is
+    /// the FLUSH form (the `message`'s payload is nil), telling the client to drop EVERYTHING.
+    RedirectInvalidate {
         /// The invalidated keys, or `None` for a flush-everything invalidation.
         keys: Option<Vec<Bytes>>,
     },
@@ -198,6 +214,18 @@ impl ServerPush {
             // matching Redis's `trackingSendInvalidationMessages`.
             ServerPush::Invalidate { keys } => Value::Push(vec![
                 Value::bulk_str("invalidate"),
+                match keys {
+                    Some(ks) => Value::Array(Some(ks.iter().cloned().map(Value::bulk).collect())),
+                    None => Value::Null,
+                },
+            ]),
+            // Redirected invalidation (#409 stage 4): a Pub/Sub `message` on the well-known
+            // `__redis__:invalidate` channel whose third element is the key ARRAY (or nil for a
+            // flush), so a redirect target that merely SUBSCRIBEd that channel (RESP2 or RESP3)
+            // receives it. Matches Redis's `["message", "__redis__:invalidate", [key ...]]`.
+            ServerPush::RedirectInvalidate { keys } => Value::Push(vec![
+                Value::bulk_str("message"),
+                Value::bulk(Bytes::from_static(REDIRECT_INVALIDATE_CHANNEL)),
                 match keys {
                     Some(ks) => Value::Array(Some(ks.iter().cloned().map(Value::bulk).collect())),
                     None => Value::Null,
@@ -535,30 +563,59 @@ impl ShardPubSub {
 /// re-read to be re-tracked. BCAST (prefix) tracking is a later stage.
 #[derive(Debug, Default)]
 pub struct ShardTracking {
-    /// DEFAULT mode (per-read keys): key -> {conn -> handle}. One-shot (an invalidation drops it).
-    tracked: HashMap<Bytes, HashMap<u64, Subscriber>>,
-    /// BCAST mode (#409 stage 2): prefix -> {conn -> handle}. STICKY (never dropped on invalidate);
+    /// DEFAULT mode (per-read keys): key -> {conn -> entry}. One-shot (an invalidation drops it).
+    tracked: HashMap<Bytes, HashMap<u64, TrackEntry>>,
+    /// BCAST mode (#409 stage 2): prefix -> {conn -> entry}. STICKY (never dropped on invalidate);
     /// a changed key invalidates every prefix it starts with. The EMPTY prefix matches every key.
-    prefixes: HashMap<Bytes, HashMap<u64, Subscriber>>,
+    prefixes: HashMap<Bytes, HashMap<u64, TrackEntry>>,
 }
 
-/// Deliver an invalidation `push` to each subscriber in `subs` except `skip`, returning the count
-/// delivered; a Full/Closed sender is shed (its kill signal tripped). Shared by the default and
-/// BCAST invalidation paths so the back-pressure handling cannot drift.
+/// One tracking-table entry (#409): the push handle to deliver an invalidation to, plus whether it
+/// is a REDIRECT entry (stage 4). A DIRECT entry (`redirect == false`) delivers a bare `invalidate`
+/// push to the TRACKING client's own connection; a REDIRECT entry (`redirect == true`) delivers a
+/// `message __redis__:invalidate [keys]` to the REDIRECT TARGET's connection instead, so `sub` is the
+/// TARGET's handle. The table KEY (conn id) is ALWAYS the tracking client's id, so NOLOOP skip and
+/// disconnect cleanup ([`ShardTracking::forget_conn`]) key on the client that registered the read,
+/// not the redirect target.
+#[derive(Debug, Clone)]
+pub struct TrackEntry {
+    /// The push handle to deliver to (the redirect TARGET's for a redirect entry, else the tracking
+    /// client's own).
+    pub sub: Subscriber,
+    /// Whether to render the invalidation as a redirect `message __redis__:invalidate` frame
+    /// ([`ServerPush::RedirectInvalidate`], stage 4) rather than a bare `invalidate` push.
+    pub redirect: bool,
+}
+
+/// Deliver an invalidation of `keys` (`None` = flush) to each entry in `subs` except `skip`,
+/// returning the count delivered; a Full/Closed sender is shed (its kill signal tripped). The frame
+/// is chosen PER ENTRY from its [`TrackEntry::redirect`] flag: a redirect entry rides the
+/// `__redis__:invalidate` Pub/Sub channel as a `message` (stage 4), a direct entry is a bare
+/// `invalidate` push to the tracking client. Shared by the default and BCAST invalidation paths so
+/// the back-pressure handling cannot drift.
 fn deliver_invalidations(
-    subs: &HashMap<u64, Subscriber>,
-    push: &ServerPush,
+    subs: &HashMap<u64, TrackEntry>,
+    keys: Option<&[Bytes]>,
     skip: Option<u64>,
 ) -> i64 {
     let mut delivered: i64 = 0;
-    for (conn_id, sub) in subs {
+    for (conn_id, entry) in subs {
         if Some(*conn_id) == skip {
             continue;
         }
-        match sub.sender.try_send(push.clone()) {
+        let push = if entry.redirect {
+            ServerPush::RedirectInvalidate {
+                keys: keys.map(<[Bytes]>::to_vec),
+            }
+        } else {
+            ServerPush::Invalidate {
+                keys: keys.map(<[Bytes]>::to_vec),
+            }
+        };
+        match entry.sub.sender.try_send(push) {
             Ok(()) => delivered += 1,
             Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
-                sub.shed.trip();
+                entry.sub.shed.trip();
             }
         }
     }
@@ -566,23 +623,20 @@ fn deliver_invalidations(
 }
 
 impl ShardTracking {
-    /// Register `conn_id` (with its push handle) as a DEFAULT-mode tracker of `key` on THIS shard:
-    /// it READ the key and wants an invalidation when the key changes. Idempotent. The table is
-    /// empty until a tracking client reads, so the non-tracking hot path never touches it.
-    pub fn track(&mut self, key: Bytes, conn_id: u64, subscriber: Subscriber) {
-        self.tracked
-            .entry(key)
-            .or_default()
-            .insert(conn_id, subscriber);
+    /// Register `conn_id` (with its tracking `entry`) as a DEFAULT-mode tracker of `key` on THIS
+    /// shard: it READ the key and wants an invalidation when the key changes. Idempotent. The table
+    /// is empty until a tracking client reads, so the non-tracking hot path never touches it.
+    pub fn track(&mut self, key: Bytes, conn_id: u64, entry: TrackEntry) {
+        self.tracked.entry(key).or_default().insert(conn_id, entry);
     }
 
     /// Register `conn_id` as a BCAST tracker of `prefix` (#409 stage 2): every changed key starting
     /// with `prefix` invalidates it (sticky). The EMPTY prefix tracks ALL keys. Idempotent.
-    pub fn track_prefix(&mut self, prefix: Bytes, conn_id: u64, subscriber: Subscriber) {
+    pub fn track_prefix(&mut self, prefix: Bytes, conn_id: u64, entry: TrackEntry) {
         self.prefixes
             .entry(prefix)
             .or_default()
-            .insert(conn_id, subscriber);
+            .insert(conn_id, entry);
     }
 
     /// Whether NO trackers exist in EITHER table (the common case): the write path skips the
@@ -597,18 +651,16 @@ impl ShardTracking {
     /// trackers whose prefix is a prefix of `key` are notified but KEPT (sticky). Returns the count
     /// delivered. The BCAST scan is O(distinct prefixes) (a radix tree is the documented refinement).
     pub fn invalidate(&mut self, key: &[u8], skip: Option<u64>) -> i64 {
-        let push = ServerPush::Invalidate {
-            keys: Some(vec![Bytes::copy_from_slice(key)]),
-        };
+        let keys = [Bytes::copy_from_slice(key)];
         let mut delivered: i64 = 0;
         // DEFAULT mode: one-shot, remove the key's set.
         if let Some(subs) = self.tracked.remove(key) {
-            delivered += deliver_invalidations(&subs, &push, skip);
+            delivered += deliver_invalidations(&subs, Some(&keys), skip);
         }
         // BCAST mode: sticky, every prefix that `key` starts with (the empty prefix matches all).
         for (prefix, subs) in &self.prefixes {
             if key.starts_with(prefix.as_ref()) {
-                delivered += deliver_invalidations(subs, &push, skip);
+                delivered += deliver_invalidations(subs, Some(&keys), skip);
             }
         }
         delivered
@@ -619,14 +671,14 @@ impl ShardTracking {
     /// table. BCAST prefix subscriptions are KEPT (sticky: the client stays subscribed for future
     /// keys), but its cache is flushed by the nil push.
     pub fn invalidate_all(&mut self, skip: Option<u64>) {
-        let mut conns: HashMap<u64, Subscriber> = HashMap::new();
+        let mut conns: HashMap<u64, TrackEntry> = HashMap::new();
         for subs in self.tracked.values().chain(self.prefixes.values()) {
-            for (id, sub) in subs {
-                conns.entry(*id).or_insert_with(|| sub.clone());
+            for (id, entry) in subs {
+                conns.entry(*id).or_insert_with(|| entry.clone());
             }
         }
-        let push = ServerPush::Invalidate { keys: None };
-        deliver_invalidations(&conns, &push, skip);
+        // `None` is the flush form; each entry still picks its own direct/redirect frame.
+        deliver_invalidations(&conns, None, skip);
         self.tracked.clear();
     }
 
@@ -713,6 +765,94 @@ mod tests {
         assert!(shed.is_tripped(), "shed signal is tripped on Full");
         // The one queued message is still readable (shedding only drops the SENDER).
         assert_eq!(rx.try_recv().unwrap(), msg(b"ch", b"a"));
+    }
+
+    #[test]
+    fn render_redirect_invalidate_is_a_message_on_the_well_known_channel() {
+        // A redirect invalidation renders as a Pub/Sub `message` on `__redis__:invalidate` whose
+        // third element is the key ARRAY (stage 4), so a RESP2 redirect target's SUBSCRIBE receives
+        // it; the flush form carries nil.
+        let keyed = ServerPush::RedirectInvalidate {
+            keys: Some(vec![Bytes::from_static(b"k1")]),
+        }
+        .render(ProtoVersion::Resp3);
+        assert_eq!(
+            keyed,
+            Value::Push(vec![
+                Value::bulk_str("message"),
+                Value::bulk(Bytes::from_static(b"__redis__:invalidate")),
+                Value::Array(Some(vec![Value::bulk(Bytes::from_static(b"k1"))])),
+            ])
+        );
+        let flush = ServerPush::RedirectInvalidate { keys: None }.render(ProtoVersion::Resp3);
+        assert_eq!(
+            flush,
+            Value::Push(vec![
+                Value::bulk_str("message"),
+                Value::bulk(Bytes::from_static(b"__redis__:invalidate")),
+                Value::Null,
+            ])
+        );
+    }
+
+    #[test]
+    fn tracking_redirect_entry_delivers_message_to_the_target() {
+        // A redirect entry (the tracking client keyed at conn 1, but the push handle is the TARGET's)
+        // delivers a `RedirectInvalidate` to the target on invalidation; a direct entry delivers a
+        // bare `Invalidate`. Both ride the same one-shot default table.
+        let mut t = ShardTracking::default();
+        let (target_tx, mut target_rx) = mpsc::channel::<ServerPush>(4);
+        let (direct_tx, mut direct_rx) = mpsc::channel::<ServerPush>(4);
+        t.track(
+            Bytes::from_static(b"k"),
+            1,
+            TrackEntry {
+                sub: sub(target_tx),
+                redirect: true,
+            },
+        );
+        t.track(
+            Bytes::from_static(b"k"),
+            2,
+            TrackEntry {
+                sub: sub(direct_tx),
+                redirect: false,
+            },
+        );
+        assert_eq!(t.invalidate(b"k", None), 2);
+        assert_eq!(
+            target_rx.try_recv().unwrap(),
+            ServerPush::RedirectInvalidate {
+                keys: Some(vec![Bytes::from_static(b"k")]),
+            }
+        );
+        assert_eq!(
+            direct_rx.try_recv().unwrap(),
+            ServerPush::Invalidate {
+                keys: Some(vec![Bytes::from_static(b"k")]),
+            }
+        );
+        // One-shot: the key's set is dropped after the invalidation.
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn tracking_redirect_noloop_skips_the_tracking_client_id() {
+        // NOLOOP keys on the TRACKING client's id (the table key), not the redirect target: a write
+        // by the tracking client (conn 1) with skip=1 delivers nothing even though the push handle is
+        // the target's.
+        let mut t = ShardTracking::default();
+        let (target_tx, mut target_rx) = mpsc::channel::<ServerPush>(4);
+        t.track(
+            Bytes::from_static(b"k"),
+            1,
+            TrackEntry {
+                sub: sub(target_tx),
+                redirect: true,
+            },
+        );
+        assert_eq!(t.invalidate(b"k", Some(1)), 0);
+        assert!(target_rx.try_recv().is_err());
     }
 
     #[test]
