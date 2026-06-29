@@ -34,6 +34,16 @@ release.
 
 ### Changed
 
+- Cache-mode eviction-pool refill (`refill_evict_pool`) now selects the coldest
+  candidates with a bounded max-heap of size `EVICT_POOL_CAP` instead of cloning
+  every resident key into a vector and full-sorting it (the #285 "do first"
+  follow-up). The per-refill cost drops from O(N) key allocations + O(N log N) sort
+  to O(N log CAP) comparisons + O(CAP) memory, and a candidate warmer than the
+  warmest kept is skipped without allocating its key, so refill no longer scales its
+  allocations with the resident count N. This makes maxmemory eviction feasible at
+  large resident sets without touching the table itself; the selected victim set is
+  byte-identical to the prior full sort (same deterministic `(freq, scan_hash, key,
+  db)` order, ADR-0003), pinned by a new N-greater-than-CAP equivalence test.
 - `CLIENT PAUSE <ms> WRITE` is now genuinely write-only (reads + admin like SAVE,
   INFO and PING proceed; only writes are paused), matching Redis and fixing the
   ironcache-upgrade write-freeze that deadlocked its own SAVE (#388). The serve

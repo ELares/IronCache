@@ -1608,80 +1608,106 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
     }
 
     /// Refill the cache-mode eviction pool with one BOUNDED scan (the amortized-scan core
-    /// of [`Self::evict_to_fit_pooled`]). This is essentially the prior full-scan eviction
-    /// pass, but instead of evicting it (a) reaps already-expired entries inline (the free
+    /// of [`Self::evict_to_fit_pooled`]). It (a) reaps already-expired entries inline (the free
     /// lazy backstop, NOT an eviction) and (b) FILLS [`ShardStore::evict_pool`] with the
     /// coldest [`EVICT_POOL_CAP`] live eligible candidates, in the deterministic
     /// `(freq, scan_hash, key, db)` total order (ADR-0003).
+    ///
+    /// The coldest-CAP selection is a BOUNDED MAX-HEAP, not a clone-all + full sort: it is
+    /// O(N log CAP) time and O(CAP) memory, and a candidate warmer than the warmest kept is
+    /// skipped without allocating its key. So the per-refill cost no longer scales its
+    /// allocations with the resident count N (the #285 follow-up), which is what makes eviction
+    /// feasible at large resident sets; the selected victim set is byte-identical to the prior
+    /// full sort.
     ///
     /// The pool is left sorted HOTTEST-LAST (coldest at the back) so the consumer takes the
     /// coldest with an O(1) `pop`. It holds at most `EVICT_POOL_CAP` entries, so it is
     /// BOUNDED and never per-key state.
     fn refill_evict_pool(&mut self, now: UnixMillis) {
-        // A scanned eviction candidate (declared before any statement to satisfy
-        // clippy::items_after_statements). `scan_h` is the deterministic scan-order
-        // tie-break (ADR-0003); `expired` marks an entry the scan reaps for free.
-        struct Scanned {
+        use std::collections::BinaryHeap;
+        // A live eviction candidate, ordered COLDEST-FIRST by the deterministic total order
+        // (freq, scan_hash, key, db) (ADR-0003). Declared before any statement to satisfy
+        // clippy::items_after_statements. The DERIVED `Ord` compares the fields top-to-bottom,
+        // which IS that exact order, so a max-heap of these keeps the WARMEST of the kept set on
+        // top -- the candidate to drop when a colder one arrives. `db` is the FINAL tie-break so
+        // the order is TOTAL: the same key bytes can be resident in two dbs at the same freq (each
+        // db is its own table; `scan_hash` is key-only), and without `db` those two would compare
+        // Equal and two shards with identical state could evict different keys.
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        struct ColdEntry {
             freq: u8,
             scan_h: u64,
             key: Box<[u8]>,
             db: u32,
-            expired: bool,
         }
         let volatile_only = self.eviction.volatile_only();
-        // ONE pass over every db's table, collecting eligible candidates as
-        // (freq, scan_hash, key, db). The 2-bit freq is read straight off the object, so no
-        // per-key policy lookup is needed. Under volatile-only only TTL-bearing live entries
-        // are eligible; an already-expired entry is collected only to reap it for free below.
-        let mut scanned: Vec<Scanned> = Vec::new();
+        // ONE pass over every db's table. Rather than clone EVERY resident key into a Vec and
+        // sort all N (the prior O(N) allocations + O(N log N) sort), keep ONLY the coldest
+        // EVICT_POOL_CAP candidates in a bounded max-heap: O(N log CAP) comparisons, O(CAP)
+        // memory, and -- the real win at large resident counts -- a candidate strictly WARMER than
+        // the warmest kept is skipped WITHOUT cloning its key (only the coldest CAP, plus the
+        // heap's transient pushes, ever allocate a key). The selected victim SET is byte-identical
+        // to the prior full sort (same total order, exact key tie-break). Already-expired entries
+        // are stashed (db, key) to reap AFTER the scan, since reaping mutates the table this loop
+        // borrows immutably. The 2-bit freq is read straight off the object (no policy lookup).
+        let mut heap: BinaryHeap<ColdEntry> = BinaryHeap::with_capacity(EVICT_POOL_CAP + 1);
+        let mut expired: Vec<(u32, Box<[u8]>)> = Vec::new();
         for (db_idx, table) in self.dbs.iter().enumerate() {
             let db = db_idx as u32;
             for obj in table {
-                let expired = obj.is_expired(now);
-                if !expired && volatile_only && obj.expire_at().is_none() {
+                if obj.is_expired(now) {
+                    // Collected only to reap it for free below (NOT an eviction candidate).
+                    expired.push((db, obj.key().to_vec().into_boxed_slice()));
+                    continue;
+                }
+                if volatile_only && obj.expire_at().is_none() {
                     // Volatile-only spares a live non-TTL entry: it is NOT a candidate.
                     continue;
                 }
-                let key = obj.key().to_vec().into_boxed_slice();
-                scanned.push(Scanned {
-                    freq: obj.freq(),
-                    scan_h: scan_hash(&key),
-                    key,
+                let freq = obj.freq();
+                let scan_h = scan_hash(obj.key());
+                // Bounded selection: once the heap holds CAP, a candidate that is NOT strictly
+                // colder than the warmest kept (the heap top) cannot be among the coldest CAP, so
+                // skip it with NO key clone. (Two distinct keys never compare Equal, so the only
+                // keep case is strictly colder.)
+                if heap.len() >= EVICT_POOL_CAP {
+                    let top = heap
+                        .peek()
+                        .expect("len >= CAP (> 0) so the heap is non-empty");
+                    let colder = freq
+                        .cmp(&top.freq)
+                        .then_with(|| scan_h.cmp(&top.scan_h))
+                        .then_with(|| obj.key().cmp(top.key.as_ref()))
+                        .then_with(|| db.cmp(&top.db))
+                        == core::cmp::Ordering::Less;
+                    if !colder {
+                        continue;
+                    }
+                }
+                heap.push(ColdEntry {
+                    freq,
+                    scan_h,
+                    key: obj.key().to_vec().into_boxed_slice(),
                     db,
-                    expired,
                 });
+                if heap.len() > EVICT_POOL_CAP {
+                    heap.pop(); // drop the warmest, keeping the coldest CAP
+                }
             }
         }
-        // Reap already-expired candidates FIRST: they are dead weight the lazy/active
-        // backstops would reap anyway, so freeing them is free budget and counts as forward
-        // progress (NOT an eviction). This shrinks what the LFU eviction must then free and
-        // may by itself bring `used` under budget (the caller re-checks after this returns).
-        for c in scanned.iter().filter(|c| c.expired) {
-            let db_idx = self.db_index(c.db);
-            self.expire_if_due(c.db, db_idx, &c.key, now);
+        // Reap already-expired candidates: dead weight the lazy/active backstops would reap
+        // anyway, so freeing them is free budget and counts as forward progress (NOT an eviction).
+        // May by itself bring `used` under budget (the caller re-checks after this returns).
+        for (db, key) in &expired {
+            let db_idx = self.db_index(*db);
+            self.expire_if_due(*db, db_idx, key, now);
         }
-        // Order the LIVE candidates by ascending (freq, scan_hash, key, db) -- the SAME
-        // total order the prior full scan used. `db` is the FINAL tie-break so the order is
-        // TOTAL: the same key bytes can be resident in two dbs at the same freq (each db is
-        // its own table; `scan_hash` is key-only), and without the `db` key those two
-        // candidates compare Equal, leaving `sort_unstable` free to order them by
-        // hashbrown's per-table randomized iteration order, which would make two shards with
-        // identical state evict different keys.
-        let mut live: Vec<Scanned> = scanned.into_iter().filter(|c| !c.expired).collect();
-        live.sort_unstable_by(|a, b| {
-            a.freq
-                .cmp(&b.freq)
-                .then_with(|| a.scan_h.cmp(&b.scan_h))
-                .then_with(|| a.key.cmp(&b.key))
-                .then_with(|| a.db.cmp(&b.db))
-        });
-        // Keep only the coldest EVICT_POOL_CAP candidates (the pool bound: the amortization
-        // factor and the reason the pool is never per-key state). `live` is sorted
-        // COLDEST-FIRST; we want the pool stored HOTTEST-LAST so the consumer `pop`s the
-        // coldest, so truncate to the coldest CAP then REVERSE once (O(CAP)).
-        live.truncate(EVICT_POOL_CAP);
-        live.reverse();
-        self.evict_pool = live
+        // The heap holds the coldest EVICT_POOL_CAP. `into_sorted_vec` yields them COLDEST-FIRST;
+        // the pool is stored HOTTEST-FIRST / COLDEST-LAST so the consumer `pop`s the coldest in
+        // O(1), so reverse once (O(CAP)).
+        let mut coldest = heap.into_sorted_vec();
+        coldest.reverse();
+        self.evict_pool = coldest
             .into_iter()
             .map(|c| PoolCandidate {
                 db: c.db,
@@ -2968,6 +2994,52 @@ mod policy_swap_tests {
     fn store_with(name: &str) -> TestStore {
         let policy = map_policy_name(name, 1).expect("known policy name");
         ShardStore::with_hooks(4, policy, CountingAccounting::new())
+    }
+
+    #[test]
+    fn refill_pool_selects_the_globally_coldest_cap_in_deterministic_order() {
+        // N >> CAP exercises the bounded-heap selection (the #285 follow-up): inserting 200
+        // identical-freq keys and refilling must harvest EXACTLY the coldest EVICT_POOL_CAP under
+        // the deterministic (freq, scan_hash, key, db) order, byte-identical to a reference full
+        // sort. "allkeys-lru" is the S3-FIFO engine, which uses the TableScanLowestFreq pooled
+        // path (refill_evict_pool).
+        let mut store = store_with("allkeys-lru");
+        let n = 200usize;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..n {
+            let key = format!("key{i:04}").into_bytes();
+            store.upsert(
+                0,
+                &key,
+                NewValue::Bytes(b"v"),
+                ExpireWrite::Clear,
+                UnixMillis(0),
+            );
+            keys.push(key);
+        }
+        assert_eq!(store.len(), n);
+
+        store.refill_evict_pool(UnixMillis(0));
+        assert_eq!(
+            store.evict_pool.len(),
+            EVICT_POOL_CAP,
+            "the pool holds exactly the coldest CAP when N > CAP"
+        );
+
+        // Reference: all keys share one freq (identical inserts, no reads), so the deterministic
+        // order reduces to (scan_hash, key). Sort ascending = coldest-first; the pool stores the
+        // coldest CAP COLDEST-LAST (the consumer pops the coldest), so it equals the coldest CAP
+        // reversed.
+        let mut by_order: Vec<&Vec<u8>> = keys.iter().collect();
+        by_order.sort_by(|a, b| scan_hash(a).cmp(&scan_hash(b)).then_with(|| a.cmp(b)));
+        let mut expected: Vec<Vec<u8>> =
+            by_order.into_iter().take(EVICT_POOL_CAP).cloned().collect();
+        expected.reverse();
+        let pool_keys: Vec<Vec<u8>> = store.evict_pool.iter().map(|c| c.key.to_vec()).collect();
+        assert_eq!(
+            pool_keys, expected,
+            "bounded-heap selection must match the full-sort coldest CAP, coldest-last"
+        );
     }
 
     #[test]
