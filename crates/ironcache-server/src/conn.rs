@@ -117,6 +117,15 @@ pub struct ConnState {
     /// CLIENT TRACKING `NOLOOP` (#409): suppress invalidation pushes caused by THIS connection's
     /// OWN writes (a client that already updated its cache does not need the echo). Default `false`.
     pub tracking_noloop: bool,
+    /// CLIENT TRACKING `BCAST` mode (#409 stage 2): broadcast tracking by key PREFIX instead of by
+    /// individual read keys. When set, the connection does NOT register the keys it reads; instead
+    /// its [`Self::tracking_prefixes`] are registered once, and EVERY changed key matching a prefix
+    /// pushes an invalidation (sticky, not one-shot). Default `false` (the per-read default mode).
+    pub tracking_bcast: bool,
+    /// The BCAST key prefixes this connection tracks (#409 stage 2). Empty with `tracking_bcast`
+    /// means the EMPTY prefix (track ALL keys). The serve layer registers these in the per-shard
+    /// tracking table on the BCAST-enter transition and purges them on OFF/RESET/disconnect.
+    pub tracking_prefixes: Vec<Bytes>,
     /// The per-connection CLUSTER read-only bit (REPLICA_READ.md #147, HA-7d). `false` (read
     /// -write) by default; `READONLY` sets it, `READWRITE` clears it. On a REPLICA node, a keyed
     /// READ for a slot this node replicates is served LOCALLY only when this bit is set; otherwise
@@ -194,6 +203,8 @@ impl ConnState {
             sub_shard_channels: HashSet::new(),
             tracking_on: false,
             tracking_noloop: false,
+            tracking_bcast: false,
+            tracking_prefixes: Vec::new(),
             // Read-write by default (the strong-read behavior unmodified clients expect); a client
             // opts into replica reads with READONLY (REPLICA_READ.md #147).
             readonly: false,
@@ -236,6 +247,8 @@ impl ConnState {
         // the subscribe-mode cleanup).
         self.tracking_on = false;
         self.tracking_noloop = false;
+        self.tracking_bcast = false;
+        self.tracking_prefixes.clear();
         // RESET clears the CLUSTER read-only bit back to read-write (Redis parity).
         self.readonly = false;
         // RESET clears any pending one-shot ASKING (HA-6): a fresh baseline never carries a stale

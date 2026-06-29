@@ -535,14 +535,40 @@ impl ShardPubSub {
 /// re-read to be re-tracked. BCAST (prefix) tracking is a later stage.
 #[derive(Debug, Default)]
 pub struct ShardTracking {
+    /// DEFAULT mode (per-read keys): key -> {conn -> handle}. One-shot (an invalidation drops it).
     tracked: HashMap<Bytes, HashMap<u64, Subscriber>>,
+    /// BCAST mode (#409 stage 2): prefix -> {conn -> handle}. STICKY (never dropped on invalidate);
+    /// a changed key invalidates every prefix it starts with. The EMPTY prefix matches every key.
+    prefixes: HashMap<Bytes, HashMap<u64, Subscriber>>,
+}
+
+/// Deliver an invalidation `push` to each subscriber in `subs` except `skip`, returning the count
+/// delivered; a Full/Closed sender is shed (its kill signal tripped). Shared by the default and
+/// BCAST invalidation paths so the back-pressure handling cannot drift.
+fn deliver_invalidations(
+    subs: &HashMap<u64, Subscriber>,
+    push: &ServerPush,
+    skip: Option<u64>,
+) -> i64 {
+    let mut delivered: i64 = 0;
+    for (conn_id, sub) in subs {
+        if Some(*conn_id) == skip {
+            continue;
+        }
+        match sub.sender.try_send(push.clone()) {
+            Ok(()) => delivered += 1,
+            Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+                sub.shed.trip();
+            }
+        }
+    }
+    delivered
 }
 
 impl ShardTracking {
-    /// Register `conn_id` (with its push handle) as a tracker of `key` on THIS shard: it READ the
-    /// key and wants an invalidation when the key changes. Idempotent (a re-read refreshes the
-    /// handle). `is_tracking` is empty until a tracking client reads, so the non-tracking hot path
-    /// never touches this table.
+    /// Register `conn_id` (with its push handle) as a DEFAULT-mode tracker of `key` on THIS shard:
+    /// it READ the key and wants an invalidation when the key changes. Idempotent. The table is
+    /// empty until a tracking client reads, so the non-tracking hot path never touches it.
     pub fn track(&mut self, key: Bytes, conn_id: u64, subscriber: Subscriber) {
         self.tracked
             .entry(key)
@@ -550,65 +576,68 @@ impl ShardTracking {
             .insert(conn_id, subscriber);
     }
 
-    /// Whether the table holds NO trackers (the common case): lets the write path skip the
-    /// invalidation pass with a single `is_empty` check when nobody is tracking.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.tracked.is_empty()
+    /// Register `conn_id` as a BCAST tracker of `prefix` (#409 stage 2): every changed key starting
+    /// with `prefix` invalidates it (sticky). The EMPTY prefix tracks ALL keys. Idempotent.
+    pub fn track_prefix(&mut self, prefix: Bytes, conn_id: u64, subscriber: Subscriber) {
+        self.prefixes
+            .entry(prefix)
+            .or_default()
+            .insert(conn_id, subscriber);
     }
 
-    /// Invalidate `key`: deliver an `["invalidate", [key]]` push to every tracking connection
-    /// EXCEPT `skip` (NOLOOP: the connection that caused the change), then DROP the key's tracker
-    /// set (one-shot, Redis semantics). Returns the count delivered. A shed (Full/Closed) push
-    /// trips the consumer's shed signal; the entry is dropped regardless (the whole set is removed).
+    /// Whether NO trackers exist in EITHER table (the common case): the write path skips the
+    /// invalidation pass on this single check when nobody is tracking.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tracked.is_empty() && self.prefixes.is_empty()
+    }
+
+    /// Invalidate `key`: push `["invalidate", [key]]` to every tracking connection except `skip`
+    /// (NOLOOP). DEFAULT-mode trackers of `key` are notified and DROPPED (one-shot, Redis); BCAST
+    /// trackers whose prefix is a prefix of `key` are notified but KEPT (sticky). Returns the count
+    /// delivered. The BCAST scan is O(distinct prefixes) (a radix tree is the documented refinement).
     pub fn invalidate(&mut self, key: &[u8], skip: Option<u64>) -> i64 {
-        let Some(subs) = self.tracked.remove(key) else {
-            return 0;
-        };
         let push = ServerPush::Invalidate {
             keys: Some(vec![Bytes::copy_from_slice(key)]),
         };
         let mut delivered: i64 = 0;
-        for (conn_id, sub) in &subs {
-            if Some(*conn_id) == skip {
-                continue;
-            }
-            match sub.sender.try_send(push.clone()) {
-                Ok(()) => delivered += 1,
-                Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
-                    sub.shed.trip();
-                }
+        // DEFAULT mode: one-shot, remove the key's set.
+        if let Some(subs) = self.tracked.remove(key) {
+            delivered += deliver_invalidations(&subs, &push, skip);
+        }
+        // BCAST mode: sticky, every prefix that `key` starts with (the empty prefix matches all).
+        for (prefix, subs) in &self.prefixes {
+            if key.starts_with(prefix.as_ref()) {
+                delivered += deliver_invalidations(subs, &push, skip);
             }
         }
         delivered
     }
 
     /// Invalidate EVERYTHING (FLUSHALL/FLUSHDB): send the flush form `["invalidate", nil]` ONCE to
-    /// every DISTINCT tracking connection EXCEPT `skip`, then clear the table (every cached key is
-    /// gone). Deduped across keys so a connection tracking many keys gets one flush push.
+    /// every DISTINCT tracking connection (DEFAULT + BCAST) except `skip`, then clear the per-key
+    /// table. BCAST prefix subscriptions are KEPT (sticky: the client stays subscribed for future
+    /// keys), but its cache is flushed by the nil push.
     pub fn invalidate_all(&mut self, skip: Option<u64>) {
         let mut conns: HashMap<u64, Subscriber> = HashMap::new();
-        for subs in self.tracked.values() {
+        for subs in self.tracked.values().chain(self.prefixes.values()) {
             for (id, sub) in subs {
                 conns.entry(*id).or_insert_with(|| sub.clone());
             }
         }
         let push = ServerPush::Invalidate { keys: None };
-        for (id, sub) in &conns {
-            if Some(*id) == skip {
-                continue;
-            }
-            if sub.sender.try_send(push.clone()).is_err() {
-                sub.shed.trip();
-            }
-        }
+        deliver_invalidations(&conns, &push, skip);
         self.tracked.clear();
     }
 
-    /// Remove `conn_id` from EVERY key's tracker set (disconnect / `CLIENT TRACKING OFF` / RESET),
-    /// pruning keys whose set goes empty. O(tracked keys); the cold cleanup path.
+    /// Remove `conn_id` from EVERY default key set AND every BCAST prefix set (disconnect / `CLIENT
+    /// TRACKING OFF` / RESET / leaving BCAST), pruning emptied entries. O(tracked keys + prefixes).
     pub fn forget_conn(&mut self, conn_id: u64) {
         self.tracked.retain(|_, subs| {
+            subs.remove(&conn_id);
+            !subs.is_empty()
+        });
+        self.prefixes.retain(|_, subs| {
             subs.remove(&conn_id);
             !subs.is_empty()
         });

@@ -1460,10 +1460,11 @@ async fn serve_connection(
                     // The offset where THIS command's reply will be appended, so the commandstats
                     // hook can tell an error reply (leading `-`) from a success without re-parsing.
                     let out_before = out.len();
-                    // CLIENT TRACKING (#409): snapshot whether this connection was tracking BEFORE
-                    // dispatch, so the hook can detect a CLIENT TRACKING OFF / RESET transition and
-                    // purge the connection from the table.
+                    // CLIENT TRACKING (#409): snapshot whether this connection was tracking / in
+                    // BCAST mode BEFORE dispatch, so the hook can detect the ON->OFF / RESET and the
+                    // BCAST enter/leave transitions (purge or register prefixes accordingly).
                     let was_tracking = conn.tracking_on;
+                    let was_bcast = conn.tracking_bcast;
                     // Route + dispatch one decoded request (COORDINATOR.md #107, Stage 1),
                     // appending its encoded reply to `out`; returns whether to close (QUIT).
                     // Factored out of the serve loop so the connection loop stays small.
@@ -1516,7 +1517,14 @@ async fn serve_connection(
                     // CLIENT TRACKING (#409): register this command's read keys for a tracking
                     // connection, or invalidate a write's keys for every tracking client. The
                     // common no-tracking path is one cheap gate inside (see `apply_client_tracking`).
-                    apply_client_tracking(&conn, &push_tx, &shed_flag, &request, was_tracking);
+                    apply_client_tracking(
+                        &conn,
+                        &push_tx,
+                        &shed_flag,
+                        &request,
+                        was_tracking,
+                        was_bcast,
+                    );
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
@@ -1889,10 +1897,11 @@ async fn serve_connection_uring(
                     // The offset where THIS command's reply will be appended, so the commandstats
                     // hook can tell an error reply (leading `-`) from a success without re-parsing.
                     let out_before = out.len();
-                    // CLIENT TRACKING (#409): snapshot whether this connection was tracking BEFORE
-                    // dispatch, so the hook can detect a CLIENT TRACKING OFF / RESET transition and
-                    // purge the connection from the table.
+                    // CLIENT TRACKING (#409): snapshot whether this connection was tracking / in
+                    // BCAST mode BEFORE dispatch, so the hook can detect the ON->OFF / RESET and the
+                    // BCAST enter/leave transitions (purge or register prefixes accordingly).
                     let was_tracking = conn.tracking_on;
+                    let was_bcast = conn.tracking_bcast;
                     // PROD-9 blocking-park (FIX1): a blocking command (BLPOP/.../WAIT) whose
                     // non-blocking attempt found no data sets `block_request` and leaves `out`
                     // EMPTY, expecting the OWNING serve loop to PARK (the tokio loop runs
@@ -1940,7 +1949,14 @@ async fn serve_connection_uring(
                     // CLIENT TRACKING (#409): register this command's read keys for a tracking
                     // connection, or invalidate a write's keys for every tracking client. The
                     // common no-tracking path is one cheap gate inside (see `apply_client_tracking`).
-                    apply_client_tracking(&conn, &push_tx, &shed_flag, &request, was_tracking);
+                    apply_client_tracking(
+                        &conn,
+                        &push_tx,
+                        &shed_flag,
+                        &request,
+                        was_tracking,
+                        was_bcast,
+                    );
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
@@ -5663,12 +5679,37 @@ fn apply_client_tracking(
     shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
     request: &Request,
     was_tracking: bool,
+    was_bcast: bool,
 ) {
     // CLIENT TRACKING OFF / RESET transition: the connection WAS tracking and now is not. Purge it
-    // from this shard's table so a later write does not push to a connection that opted out.
+    // from this shard's table (both the per-key and the BCAST prefix sets) so a later write does
+    // not push to a connection that opted out.
     if was_tracking && !conn.tracking_on {
         purge_conn_tracking(conn.id);
         return;
+    }
+
+    // BCAST mode transitions (#409 stage 2). Entering BCAST registers the connection's prefixes
+    // (the EMPTY prefix when none were given = track all keys); leaving BCAST (a re-issue of
+    // TRACKING ON without BCAST) purges the stale prefix entries. Both happen on the CLIENT TRACKING
+    // command itself (it registers no read and writes no key), so we fall through after.
+    if was_bcast && !conn.tracking_bcast {
+        purge_conn_tracking(conn.id);
+    }
+    if conn.tracking_bcast && !was_bcast {
+        let sub = crate::pubsub::Subscriber {
+            sender: push_tx.clone(),
+            shed: std::sync::Arc::clone(shed_flag),
+        };
+        let tbl = shard_tracking();
+        let mut t = tbl.borrow_mut();
+        if conn.tracking_prefixes.is_empty() {
+            t.track_prefix(bytes::Bytes::new(), conn.id, sub);
+        } else {
+            for p in &conn.tracking_prefixes {
+                t.track_prefix(p.clone(), conn.id, sub.clone());
+            }
+        }
     }
 
     // The cheap gate: skip entirely unless THIS connection is tracking (it may need to register a
@@ -5708,9 +5749,10 @@ fn apply_client_tracking(
             }
             ironcache_server::KeySpec::None => {}
         }
-    } else if conn.tracking_on {
-        // A READ by a tracking connection: register every key it read so a later change pushes an
-        // invalidation. A non-keyed read (PING/INFO/...) registers nothing.
+    } else if conn.tracking_on && !conn.tracking_bcast {
+        // A READ by a DEFAULT-mode tracking connection: register every key it read so a later change
+        // pushes an invalidation. (A BCAST connection tracks PREFIXES, not reads, so it skips this.)
+        // A non-keyed read (PING/INFO/...) registers nothing.
         let keys: Vec<bytes::Bytes> = match ironcache_server::command_keys(&cmd_upper, request) {
             ironcache_server::KeySpec::One(k) => vec![bytes::Bytes::copy_from_slice(k)],
             ironcache_server::KeySpec::Many(ks) => ks

@@ -141,6 +141,17 @@ release.
 
 ### Added
 
+- CLIENT TRACKING BCAST mode, stage 2 (issue #409): `CLIENT TRACKING ON BCAST
+  [PREFIX prefix ...]` broadcast tracking. A BCAST connection does NOT register the
+  keys it reads; instead its prefixes are registered once and EVERY changed key
+  matching a prefix pushes an `["invalidate", [key]]` (sticky, not one-shot, unlike
+  default mode). No `PREFIX` means the empty prefix (track all keys). `PREFIX`
+  requires `BCAST`, and a client's prefixes may not overlap (one being a prefix of
+  another is rejected). `CLIENT TRACKINGINFO` now reports the `bcast` flag and the
+  prefix list; `FLUSHALL`/`FLUSHDB` flush BCAST clients too (keeping their prefix
+  subscriptions). The prefix match is a linear scan over the registered prefixes
+  (a radix tree is a documented refinement); the no-tracking hot path is unchanged.
+  `OPTIN`/`OPTOUT`/`REDIRECT` remain staged follow-ups.
 - CLIENT TRACKING / server-assisted client-side caching, stage 1 (issue #409):
   `CLIENT TRACKING ON|OFF [NOLOOP]` and `CLIENT TRACKINGINFO` (RESP3). A tracking
   connection's reads register their keys in the serving shard's tracking table;
