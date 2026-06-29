@@ -1359,6 +1359,7 @@ mod tests {
     // ---- HEXPIRE family (#408): per-field TTL set/read/persist/expire + errors. ----
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one end-to-end table covering all the per-field codes.
     fn hexpire_family_set_read_persist_and_expire() {
         let mut s = test_store();
         cmd_hset(

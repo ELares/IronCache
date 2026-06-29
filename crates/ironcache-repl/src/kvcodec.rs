@@ -117,12 +117,12 @@ fn tag_to_enc(tag: u8) -> Option<Encoding> {
         enc_tag::LISTPACK => Encoding::ListPack,
         enc_tag::QUICKLIST => Encoding::QuickList,
         enc_tag::INTSET => Encoding::IntSet,
-        enc_tag::HASHTABLE => Encoding::HashTable,
         enc_tag::SKIPLIST => Encoding::SkipList,
-        // Hash-with-field-TTL tags map to the OBJECT ENCODING they report: listpackex (small)
-        // and hashtable (large). The trailing TTL section is read by the HASH decode arm.
+        // Hash-with-field-TTL tags map to the OBJECT ENCODING they report: listpackex (small),
+        // and hashtable for both the plain and the field-TTL (HASHTABLEEX) large forms. The
+        // trailing TTL section is read by the HASH decode arm off the raw tag byte.
         enc_tag::LISTPACKEX => Encoding::ListPackEx,
-        enc_tag::HASHTABLEEX => Encoding::HashTable,
+        enc_tag::HASHTABLE | enc_tag::HASHTABLEEX => Encoding::HashTable,
         _ => return None,
     })
 }
@@ -366,14 +366,14 @@ pub fn decode_kvobj(buf: &[u8]) -> Option<KvObj> {
             // have none (and the `is_done` check below rejects a stray section).
             let field_ttls: Vec<(Vec<u8>, UnixMillis)> =
                 if enc_byte == enc_tag::LISTPACKEX || enc_byte == enc_tag::HASHTABLEEX {
-                    let n = r.u32()? as usize;
-                    let mut t = Vec::with_capacity(n.min(1024));
-                    for _ in 0..n {
-                        let f = r.bytes()?;
-                        let d = r.u64()?;
-                        t.push((f, UnixMillis(d)));
+                    let ttl_count = r.u32()? as usize;
+                    let mut ttls = Vec::with_capacity(ttl_count.min(1024));
+                    for _ in 0..ttl_count {
+                        let field = r.bytes()?;
+                        let deadline = r.u64()?;
+                        ttls.push((field, UnixMillis(deadline)));
                     }
-                    t
+                    ttls
                 } else {
                     Vec::new()
                 };
