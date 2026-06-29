@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironcache-dashtable"
+description = "Standalone Dash-style extendible-hashing table (directory + segments + split/doubling + fingerprint probe), the #285 stage-1 algorithm core. Not yet wired into the store."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
