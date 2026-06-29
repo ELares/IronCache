@@ -130,6 +130,11 @@ pub(crate) type ShardStoreImpl = ShardStore<Policy, CountingAccounting>;
 pub(crate) struct ShardState {
     pub(crate) next_client_id: u64,
     pub(crate) counters: ShardCounters,
+    /// Per-shard command + error execution stats for INFO COMMANDSTATS / ERRORSTATS (#413).
+    /// Home-shard-local (INFO reads the serving shard's table, the same scope the other INFO
+    /// counters use); the serve loop records each executed command here, `CONFIG RESETSTAT`
+    /// clears it.
+    pub(crate) command_stats: ironcache_observe::CommandStats,
     /// The last runtime-config GENERATION this shard observed (PR-4b). Dispatch compares
     /// the shared `RuntimeConfig::generation()` against this once per command (a relaxed
     /// atomic load + integer compare, NO lock when unchanged) and, on a change, rebuilds
@@ -1059,6 +1064,7 @@ pub(crate) fn shard_state() -> Rc<RefCell<ShardState>> {
             *b = Some(Rc::new(RefCell::new(ShardState {
                 next_client_id: 1,
                 counters,
+                command_stats: ironcache_observe::CommandStats::default(),
                 // Start at 0 (the RuntimeConfig generation also starts at 0): the first
                 // CONFIG SET maxmemory-policy bumps it, and this shard notices on its
                 // next command.
@@ -1424,11 +1430,13 @@ async fn serve_connection(
                     // the runtime overlay (the canonical CONFIG source); `ctx.slowlog` mirrors it for
                     // the hot-path copy, but reading the overlay directly here keeps a single source.
                     let slow_threshold = ctx.slowlog.log_slower_than_micros();
-                    let slow_start = if slow_threshold >= 0 {
-                        Some(env.borrow().now())
-                    } else {
-                        None
-                    };
+                    // COMMANDSTATS timing (#413): capture the monotonic start ALWAYS (one read),
+                    // SHARED with the SLOWLOG hook below so the slowlog-enabled path adds no start
+                    // read. The end is read once after dispatch to record this command's usec.
+                    let cmd_start = env.borrow().now();
+                    // The offset where THIS command's reply will be appended, so the commandstats
+                    // hook can tell an error reply (leading `-`) from a success without re-parsing.
+                    let out_before = out.len();
                     // Route + dispatch one decoded request (COORDINATOR.md #107, Stage 1),
                     // appending its encoded reply to `out`; returns whether to close (QUIT).
                     // Factored out of the serve loop so the connection loop stays small.
@@ -1467,8 +1475,19 @@ async fn serve_connection(
                     // (ADR-0003), and if it met the threshold, push the command (args + this
                     // connection's addr/name) into the node-level ring and feed the LATENCY
                     // `command` event. This whole block is skipped entirely when SLOWLOG is disabled.
-                    if let Some(start) = slow_start {
-                        record_slow_command(&ctx, &env, &conn, &request, start, slow_threshold);
+                    // COMMANDSTATS / ERRORSTATS (#413): record this command's elapsed micros +
+                    // outcome on the serving shard (ALWAYS, the call/usec/failed tally INFO reads).
+                    // The end clock read is shared with the slowlog hook (same `cmd_start`).
+                    let cmd_elapsed_us = u64::try_from(
+                        env.borrow()
+                            .now()
+                            .saturating_duration_since(cmd_start)
+                            .as_micros(),
+                    )
+                    .unwrap_or(u64::MAX);
+                    record_command_stats(&state_rc, &request, out_before, &out, cmd_elapsed_us);
+                    if slow_threshold >= 0 {
+                        record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
                     read_buf.drain(..consumed);
                     // -- BLOCKING PARK (PROD-9). The blocking-command interception in
@@ -1830,11 +1849,13 @@ async fn serve_connection_uring(
             match decode(&read_buf, &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
                     let slow_threshold = ctx.slowlog.log_slower_than_micros();
-                    let slow_start = if slow_threshold >= 0 {
-                        Some(env.borrow().now())
-                    } else {
-                        None
-                    };
+                    // COMMANDSTATS timing (#413): capture the monotonic start ALWAYS (one read),
+                    // SHARED with the SLOWLOG hook below so the slowlog-enabled path adds no start
+                    // read. The end is read once after dispatch to record this command's usec.
+                    let cmd_start = env.borrow().now();
+                    // The offset where THIS command's reply will be appended, so the commandstats
+                    // hook can tell an error reply (leading `-`) from a success without re-parsing.
+                    let out_before = out.len();
                     // PROD-9 blocking-park (FIX1): a blocking command (BLPOP/.../WAIT) whose
                     // non-blocking attempt found no data sets `block_request` and leaves `out`
                     // EMPTY, expecting the OWNING serve loop to PARK (the tokio loop runs
@@ -1868,8 +1889,19 @@ async fn serve_connection_uring(
                         &mut block_request,
                     )
                     .await;
-                    if let Some(start) = slow_start {
-                        record_slow_command(&ctx, &env, &conn, &request, start, slow_threshold);
+                    // COMMANDSTATS / ERRORSTATS (#413): record this command's elapsed micros +
+                    // outcome on the serving shard (ALWAYS, the call/usec/failed tally INFO reads).
+                    // The end clock read is shared with the slowlog hook (same `cmd_start`).
+                    let cmd_elapsed_us = u64::try_from(
+                        env.borrow()
+                            .now()
+                            .saturating_duration_since(cmd_start)
+                            .as_micros(),
+                    )
+                    .unwrap_or(u64::MAX);
+                    record_command_stats(&state_rc, &request, out_before, &out, cmd_elapsed_us);
+                    if slow_threshold >= 0 {
+                        record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
                     read_buf.drain(..consumed);
                     // FIX1: the blocking command parked (`out` is empty). Write its IMMEDIATE
@@ -5425,6 +5457,18 @@ fn handle_request(
     state_rc.borrow_mut().counters.on_command();
     let snapshot_fn = || state_rc.borrow().counters.snapshot();
     let rollup: &dyn Fn() -> CounterSnapshot = &snapshot_fn;
+    // COMMANDSTATS / ERRORSTATS render (#413): render the serving shard's per-command + per-error
+    // tables into the INFO section bodies. Invoked ONLY when INFO asks for those sections (the
+    // closure is not called otherwise), and it borrows `state_rc` immutably like `rollup` does
+    // (sequentially, never aliasing dispatch's later mutable borrow).
+    let cmdstats_fn = || {
+        let st = state_rc.borrow();
+        let (mut cs, mut es) = (String::new(), String::new());
+        st.command_stats.render_commandstats(&mut cs);
+        st.command_stats.render_errorstats(&mut es);
+        (cs, es)
+    };
+    let cmdstats: ironcache_server::CmdStatsFn<'_> = &cmdstats_fn;
     // Compute `now` once per command from the shard's wall clock, then run dispatch
     // against the per-shard store. `env` and `store` are SEPARATE RefCells, so the
     // env clock read at the dispatch call site can overlap the held store
@@ -5478,6 +5522,7 @@ fn handle_request(
             now,
             &mut shard_generation,
             rollup,
+            cmdstats,
             mem,
             &mut deltas,
             request,
@@ -5495,9 +5540,15 @@ fn handle_request(
     // common hot path (no deltas, no generation change).
     {
         deltas.expired += lazy_expired;
+        let reset_stats = deltas.reset_stats;
         let mut st = state_rc.borrow_mut();
         if deltas != CounterDeltas::default() {
             st.counters.apply(deltas);
+        }
+        // CONFIG RESETSTAT (#413): the same signal that zeroes the counter cell also clears the
+        // per-command + per-error stats tables (Redis `resetServerStats` resets both).
+        if reset_stats {
+            st.command_stats.reset();
         }
         st.last_policy_generation = shard_generation;
     }
@@ -5515,6 +5566,41 @@ fn handle_request(
 /// wall clock. The args + this connection's addr/name are copied into the entry (capped by the ring
 /// builder). The LATENCY `command` event samples the same elapsed time in milliseconds, gated on a
 /// fixed floor so the monitor only records meaningful spikes.
+/// Record one command into the serving shard's INFO COMMANDSTATS / ERRORSTATS tables (#413),
+/// driven off the already-encoded reply so there is no second dispatch. `out_before` is the
+/// offset where THIS command's reply began in `out`; an error reply starts with `-`, and its
+/// CODE is the first token after the `-` (up to a space or CR). Only REGISTRY commands are
+/// tracked (an unknown command has no canonical name and was rejected); the name key is the
+/// registry `&'static`, so a record allocates nothing. `elapsed_us` is this command's measured
+/// micros (shared with the slowlog timing read). Off the per-key hot path; one map update.
+fn record_command_stats(
+    state_rc: &Rc<RefCell<ShardState>>,
+    request: &Request,
+    out_before: usize,
+    out: &[u8],
+    elapsed_us: u64,
+) {
+    let cmd_upper = ascii_upper(request.command());
+    let Some(spec) = ironcache_server::spec_of(&cmd_upper) else {
+        return;
+    };
+    // The reply for THIS command begins at `out_before`; a leading `-` is an error reply (the
+    // command ran but failed). A push/array/status/integer/bulk lead byte is a success.
+    let failed = out.get(out_before) == Some(&b'-');
+    let mut st = state_rc.borrow_mut();
+    st.command_stats.record(spec.name, elapsed_us, failed);
+    if failed {
+        // The error CODE: the first whitespace/CR-delimited token after the `-`.
+        let code_start = out_before + 1;
+        let rest = &out[code_start..];
+        let code_len = rest
+            .iter()
+            .position(|&b| b == b' ' || b == b'\r')
+            .unwrap_or(rest.len());
+        st.command_stats.record_error(&rest[..code_len]);
+    }
+}
+
 fn record_slow_command(
     ctx: &ServerContext,
     env: &Rc<RefCell<SystemEnv>>,
@@ -6532,6 +6618,7 @@ mod tests {
         let state = Rc::new(RefCell::new(ShardState {
             next_client_id: 1,
             counters: ShardCounters::new(),
+            command_stats: ironcache_observe::CommandStats::default(),
             last_policy_generation: 0,
         }));
         (env, store, wheel, state)

@@ -30,6 +30,103 @@ pub use ops::{
 /// crate version at build time.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// One command's execution tally for INFO `COMMANDSTATS` (#413): the Redis `cmdstat_<cmd>`
+/// fields. `calls`/`usec` accumulate over every execution; `usec_per_call` is derived at render.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CmdStat {
+    /// Total executions (Redis `calls`).
+    pub calls: u64,
+    /// Total microseconds spent across those executions (Redis `usec`).
+    pub usec: u64,
+    /// Executions REJECTED before the command body ran (Redis `rejected_calls`). IronCache does
+    /// not yet split pre-execution rejections from in-command failures at this layer, so this is
+    /// reported as 0 (a documented approximation; the field shape is exact so parsers are happy).
+    pub rejected_calls: u64,
+    /// Executions that ran but returned an ERROR reply (Redis `failed_calls`).
+    pub failed_calls: u64,
+}
+
+/// Per-shard command + error execution stats for INFO `COMMANDSTATS` / `ERRORSTATS` (#413).
+/// PER-SHARD and home-shard-local for INFO (the same scope the other INFO counters use): the
+/// serve loop records each executed command's elapsed micros + whether its reply was an error,
+/// and INFO renders the serving shard's table. Read only on the owning shard (NOT cross-thread
+/// like [`ShardCountersCell`]), so a plain map with no atomics. `CONFIG RESETSTAT` clears it.
+///
+/// The command key is the registry's `&'static` canonical name, so a record allocates nothing;
+/// the error key is the error CODE (the first whitespace-delimited token, e.g. `ERR` /
+/// `WRONGTYPE` / `NOPERM`), owned because it is parsed from the reply.
+#[derive(Debug, Default)]
+pub struct CommandStats {
+    cmds: std::collections::HashMap<&'static [u8], CmdStat>,
+    errors: std::collections::HashMap<Box<[u8]>, u64>,
+}
+
+impl CommandStats {
+    /// Record one EXECUTED command: `name` is the registry canonical name (a `&'static`, so the
+    /// key allocates nothing), `usec` its elapsed micros, `failed` whether its reply was an error.
+    pub fn record(&mut self, name: &'static [u8], usec: u64, failed: bool) {
+        let e = self.cmds.entry(name).or_default();
+        e.calls = e.calls.saturating_add(1);
+        e.usec = e.usec.saturating_add(usec);
+        if failed {
+            e.failed_calls = e.failed_calls.saturating_add(1);
+        }
+    }
+
+    /// Record one error reply by its CODE (the first token of the error line, uppercase by Redis
+    /// convention), for INFO ERRORSTATS.
+    pub fn record_error(&mut self, code: &[u8]) {
+        *self.errors.entry(code.into()).or_insert(0) += 1;
+    }
+
+    /// Clear every command + error tally (`CONFIG RESETSTAT`).
+    pub fn reset(&mut self) {
+        self.cmds.clear();
+        self.errors.clear();
+    }
+
+    /// Append the `# Commandstats` section BODY (no header) to `out`: one
+    /// `cmdstat_<lowercased name>:calls=N,usec=N,usec_per_call=N.NN,rejected_calls=N,failed_calls=N`
+    /// line per command, matching the Redis field shape go-redis / redis-py parse. Sorted by name
+    /// so the output is deterministic.
+    pub fn render_commandstats(&self, out: &mut String) {
+        use core::fmt::Write;
+        let mut names: Vec<&&'static [u8]> = self.cmds.keys().collect();
+        names.sort_unstable();
+        for name in names {
+            let s = self.cmds[*name];
+            let lname = String::from_utf8_lossy(name).to_ascii_lowercase();
+            #[allow(clippy::cast_precision_loss)]
+            let per_call = if s.calls == 0 {
+                0.0
+            } else {
+                s.usec as f64 / s.calls as f64
+            };
+            let _ = write!(
+                out,
+                "cmdstat_{lname}:calls={},usec={},usec_per_call={per_call:.2},rejected_calls={},failed_calls={}\r\n",
+                s.calls, s.usec, s.rejected_calls, s.failed_calls
+            );
+        }
+    }
+
+    /// Append the `# Errorstats` section BODY (no header) to `out`: one `errorstat_<CODE>:count=N`
+    /// line per error code (Redis shape). Sorted by code for determinism.
+    pub fn render_errorstats(&self, out: &mut String) {
+        use core::fmt::Write;
+        let mut codes: Vec<&Box<[u8]>> = self.errors.keys().collect();
+        codes.sort_unstable();
+        for code in codes {
+            let c = String::from_utf8_lossy(code);
+            let _ = write!(
+                out,
+                "errorstat_{c}:count={}\r\n",
+                self.errors[code.as_ref()]
+            );
+        }
+    }
+}
+
 /// The per-shard counter STORAGE: a flat bag of `AtomicU64`s, one cell per counter, owned
 /// by ONE shard and shared (by `Arc`) into the process-wide [`MetricsRegistry`] so the
 /// out-of-band metrics HTTP task can READ the live values from another thread WITHOUT a lock

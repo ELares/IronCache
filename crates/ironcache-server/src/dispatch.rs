@@ -376,6 +376,14 @@ impl ServerContext {
 /// cross-shard rollup wires in with the coordinator later).
 pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 
+/// Yields the INFO `COMMANDSTATS` + `ERRORSTATS` section BODIES (#413) as
+/// `(commandstats_body, errorstats_body)`, rendered by the serve layer from the SERVING shard's
+/// `CommandStats` table (home-shard-local, the same scope [`RollupFn`] uses). `INFO` invokes it
+/// ONLY for the `commandstats` / `errorstats` / `everything` sections, so it costs nothing on the
+/// common INFO path; a caller that does not track per-command stats (tests) passes a closure
+/// yielding two empty strings.
+pub type CmdStatsFn<'a> = &'a dyn Fn() -> (String, String);
+
 /// Dispatch one request to its handler, returning the reply [`Value`].
 ///
 /// `env` is the per-shard determinism seam (ADR-0003): its CLOCK half provides INFO
@@ -773,6 +781,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap 
     now: UnixMillis,
     shard_generation: &mut u64,
     rollup: RollupFn<'_>,
+    cmdstats: CmdStatsFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
     req: &Request,
@@ -791,6 +800,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap 
         now,
         shard_generation,
         rollup,
+        cmdstats,
         mem,
         deltas,
         req,
@@ -818,6 +828,7 @@ pub fn dispatch_with_cmd<
     now: UnixMillis,
     shard_generation: &mut u64,
     rollup: RollupFn<'_>,
+    cmdstats: CmdStatsFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
     req: &Request,
@@ -938,7 +949,7 @@ pub fn dispatch_with_cmd<
     }
 
     let reply = dispatch_inner(
-        ctx, state, env, store, wheel, now, rollup, mem, deltas, req, cmd,
+        ctx, state, env, store, wheel, now, rollup, cmdstats, mem, deltas, req, cmd,
     );
 
     // KEYSPACE NOTIFICATIONS (PROD-8): map this just-executed command + its reply to the Redis
@@ -972,6 +983,7 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
     wheel: &mut TimingWheel,
     now: UnixMillis,
     rollup: RollupFn<'_>,
+    cmdstats: CmdStatsFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
     req: &Request,
@@ -1084,7 +1096,9 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         }
         b"WATCH" => cmd_watch(state, store, now, req),
         b"UNWATCH" => cmd_unwatch(state, store, req),
-        b"EXEC" => exec_transaction(ctx, state, env, store, wheel, now, rollup, mem, deltas, req),
+        b"EXEC" => exec_transaction(
+            ctx, state, env, store, wheel, now, rollup, cmdstats, mem, deltas, req,
+        ),
         b"CLIENT" => cmd_client(ctx, state, env, req),
         b"COMMAND" => cmd_command(req),
         // SLOWLOG GET/LEN/RESET/HELP (PROD-7 operability). Reads/resets the node-level ring in
@@ -1104,7 +1118,7 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // INFO reads only the CLOCK half of the env seam (uptime); pass `env` as the
         // `&C: Clock` it needs. `store` is passed so the `# Keyspace` section can report each
         // database's live key count (DBSIZE) via `Keyspace::db_len` (durability/operability fix #5).
-        b"INFO" => cmd_info(ctx, env, store, rollup, mem, req),
+        b"INFO" => cmd_info(ctx, env, store, rollup, cmdstats, mem, req),
         // CONFIG GET/SET/RESETSTAT/REWRITE/HELP (PR-4b). RESETSTAT signals the serving
         // shard's counter reset via `deltas.reset_stats` (the serve loop honors it in
         // ShardCounters::apply); the serving-shard scope is documented in cmd_config.
@@ -1815,6 +1829,7 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
     wheel: &mut TimingWheel,
     now: UnixMillis,
     rollup: RollupFn<'_>,
+    cmdstats: CmdStatsFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
     req: &Request,
@@ -1900,7 +1915,7 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
             Value::error(deny)
         } else {
             dispatch_inner(
-                ctx, state, env, store, wheel, now, rollup, mem, deltas, q, &qcmd,
+                ctx, state, env, store, wheel, now, rollup, cmdstats, mem, deltas, q, &qcmd,
             )
         };
         replies.push(reply);
@@ -3099,6 +3114,7 @@ fn cmd_info<C: Clock, S: Keyspace>(
     clock: &C,
     store: &S,
     rollup: RollupFn<'_>,
+    cmdstats: CmdStatsFn<'_>,
     mem: MemoryInfo,
     req: &Request,
 ) -> Value {
@@ -3162,7 +3178,7 @@ fn cmd_info<C: Clock, S: Keyspace>(
         instantaneous_ops_per_sec: 0,
         rejected_connections: ctx.conn_gate.rejected(),
     };
-    let body = build_info(
+    let mut body = build_info(
         clock,
         &ctx.info,
         rollup(),
@@ -3174,6 +3190,27 @@ fn cmd_info<C: Clock, S: Keyspace>(
         runtime_stats,
         section.as_deref(),
     );
+    // COMMANDSTATS / ERRORSTATS (#413): appended for an EXPLICIT `commandstats` / `errorstats`
+    // request OR `INFO all` / `INFO everything`, NOT the default `INFO` (Redis excludes them from
+    // default to keep the reply small). Rendered by the serve layer from the SERVING shard's
+    // `CommandStats` via the `cmdstats` closure, invoked ONLY here (zero cost on the common path).
+    if let Some(sec) = section.as_deref() {
+        let sl = sec.to_ascii_lowercase();
+        let all = sl == "all" || sl == "everything";
+        if all || sl == "commandstats" || sl == "errorstats" {
+            let (commandstats, errorstats) = cmdstats();
+            if (all || sl == "commandstats") && !commandstats.is_empty() {
+                body.push_str("# Commandstats\r\n");
+                body.push_str(&commandstats);
+                body.push_str("\r\n");
+            }
+            if (all || sl == "errorstats") && !errorstats.is_empty() {
+                body.push_str("# Errorstats\r\n");
+                body.push_str(&errorstats);
+                body.push_str("\r\n");
+            }
+        }
+    }
     Value::bulk(body.into_bytes())
 }
 
@@ -3376,6 +3413,7 @@ mod tests {
             UnixMillis(0),
             &mut shard_gen,
             &zero,
+            &|| (String::new(), String::new()),
             MemoryInfo::default(),
             &mut deltas,
             &req(parts),
@@ -3434,6 +3472,7 @@ mod tests {
             now,
             &mut shard_gen,
             &zero,
+            &|| (String::new(), String::new()),
             MemoryInfo::default(),
             &mut deltas,
             &req(parts),
@@ -4893,6 +4932,7 @@ mod tests {
             now,
             &mut shard_gen,
             &zero,
+            &|| (String::new(), String::new()),
             MemoryInfo::default(),
             &mut deltas,
             &req(parts),
@@ -7421,6 +7461,7 @@ mod tests {
             UnixMillis(0),
             shard_gen,
             &zero,
+            &|| (String::new(), String::new()),
             MemoryInfo::default(),
             &mut deltas,
             &req(parts),
