@@ -1935,6 +1935,26 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: true,
         },
+        // Hash field-TTL accessors (#408). Both are writes: HGETDEL deletes the fields, and
+        // HGETEX can mutate the field TTLs (so both MOVED on a replica).
+        b"HGETDEL" => &CommandSpec {
+            name: b"HGETDEL",
+            arity: Min(5),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
+        b"HGETEX" => &CommandSpec {
+            name: b"HGETEX",
+            arity: Min(5),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: true,
+        },
         b"HRANDFIELD" => &CommandSpec {
             name: b"HRANDFIELD",
             arity: Min(2),
@@ -2876,6 +2896,8 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     b"HEXPIRETIME",
     b"HPEXPIRETIME",
     b"HPERSIST",
+    b"HGETDEL",
+    b"HGETEX",
     // Sets.
     b"SADD",
     b"SREM",
@@ -3251,6 +3273,8 @@ pub(crate) mod tests {
             b"HEXPIRETIME",
             b"HGET",
             b"HGETALL",
+            b"HGETDEL",
+            b"HGETEX",
             b"HINCRBY",
             b"HINCRBYFLOAT",
             b"HKEYS",
