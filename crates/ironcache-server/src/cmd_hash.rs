@@ -76,6 +76,23 @@ fn wrong_type() -> RmwStep<Value> {
     keep(Value::error(ErrorReply::wrong_type()))
 }
 
+/// The rmw step for a hash READ that lazily reaped expired fields first (#408). When the reap
+/// removed a field the value CHANGED, so the step must be `Mutated` (the store re-measures the
+/// size, recomputes the encoding, and deletes the key if the reap emptied the hash); with no
+/// reap it is a pure `Keep`. `reply` is computed by the caller AFTER the reap, so it never
+/// observes an expired field.
+fn reaped_read(changed: bool, reply: Value) -> RmwStep<Value> {
+    RmwStep {
+        action: if changed {
+            RmwAction::Mutated
+        } else {
+            RmwAction::Keep
+        },
+        expire: ExpireWrite::Unchanged,
+        reply,
+    }
+}
+
 /// A bulk reply from owned bytes.
 fn bulk(bytes: Vec<u8>) -> Value {
     Value::BulkString(Some(Bytes::from(bytes)))
@@ -236,7 +253,11 @@ pub fn cmd_hget<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Null),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
-            Some(hash) => keep(hash.get(&field).map_or(Value::Null, |v| bulk(v.to_vec()))),
+            Some(hash) => {
+                let changed = !hash.reap_expired_fields(now).is_empty();
+                let reply = hash.get(&field).map_or(Value::Null, |v| bulk(v.to_vec()));
+                reaped_read(changed, reply)
+            }
             None => wrong_type(),
         },
         RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
@@ -258,11 +279,12 @@ pub fn cmd_hmget<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
         ))),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
+                let changed = !hash.reap_expired_fields(now).is_empty();
                 let out: Vec<Value> = fields
                     .iter()
                     .map(|f| hash.get(f).map_or(Value::Null, |v| bulk(v.to_vec())))
                     .collect();
-                keep(Value::Array(Some(out)))
+                reaped_read(changed, Value::Array(Some(out)))
             }
             None => wrong_type(),
         },
@@ -281,12 +303,13 @@ pub fn cmd_hgetall<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         RmwEntry::Vacant => keep(Value::Map(Vec::new())),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
+                let changed = !hash.reap_expired_fields(now).is_empty();
                 let pairs: Vec<(Value, Value)> = hash
                     .pairs()
                     .into_iter()
                     .map(|(f, v)| (bulk(f), bulk(v)))
                     .collect();
-                keep(Value::Map(pairs))
+                reaped_read(changed, Value::Map(pairs))
             }
             None => wrong_type(),
         },
@@ -303,8 +326,9 @@ pub fn cmd_hkeys<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
         RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
+                let changed = !hash.reap_expired_fields(now).is_empty();
                 let out = hash.fields().into_iter().map(bulk).collect();
-                keep(Value::Array(Some(out)))
+                reaped_read(changed, Value::Array(Some(out)))
             }
             None => wrong_type(),
         },
@@ -321,8 +345,9 @@ pub fn cmd_hvals<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Reques
         RmwEntry::Vacant => keep(Value::Array(Some(Vec::new()))),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
             Some(hash) => {
+                let changed = !hash.reap_expired_fields(now).is_empty();
                 let out = hash.values().into_iter().map(bulk).collect();
-                keep(Value::Array(Some(out)))
+                reaped_read(changed, Value::Array(Some(out)))
             }
             None => wrong_type(),
         },
@@ -338,7 +363,10 @@ pub fn cmd_hlen<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
     store.rmw_mut(db, &req.args[1], now, |entry| match entry {
         RmwEntry::Vacant => keep(Value::Integer(0)),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
-            Some(hash) => keep(Value::Integer(hash.len() as i64)),
+            Some(hash) => {
+                let changed = !hash.reap_expired_fields(now).is_empty();
+                reaped_read(changed, Value::Integer(hash.len() as i64))
+            }
             None => wrong_type(),
         },
         RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
@@ -355,7 +383,10 @@ pub fn cmd_hexists<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Integer(0)),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
-            Some(hash) => keep(Value::Integer(i64::from(hash.contains(&field)))),
+            Some(hash) => {
+                let changed = !hash.reap_expired_fields(now).is_empty();
+                reaped_read(changed, Value::Integer(i64::from(hash.contains(&field))))
+            }
             None => wrong_type(),
         },
         RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
@@ -372,7 +403,10 @@ pub fn cmd_hstrlen<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
     store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
         RmwEntry::Vacant => keep(Value::Integer(0)),
         RmwEntry::OccupiedMut(mut o) => match o.as_hash_mut() {
-            Some(hash) => keep(Value::Integer(hash.strlen(&field) as i64)),
+            Some(hash) => {
+                let changed = !hash.reap_expired_fields(now).is_empty();
+                reaped_read(changed, Value::Integer(hash.strlen(&field) as i64))
+            }
             None => wrong_type(),
         },
         RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
@@ -1437,6 +1471,64 @@ mod tests {
         );
         // The reap removed a from the hash; only b remains.
         assert_eq!(int(&cmd_hlen(&mut s, 0, later, &req(&[b"HLEN", b"h"]))), 1);
+    }
+
+    #[test]
+    fn expired_field_is_invisible_to_regular_hash_reads() {
+        let mut s = test_store();
+        cmd_hset(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]),
+        );
+        cmd_hexpire(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HEXPIRE", b"h", b"10", b"FIELDS", b"1", b"a"]),
+        );
+        let later = UnixMillis(20_000);
+        // After expiry the regular reads no longer see a (the read reaps it): HGET nil,
+        // HEXISTS 0, HSTRLEN 0; b is untouched, and HLEN drops to 1.
+        assert_eq!(
+            bulk_bytes(&cmd_hget(&mut s, 0, later, &req(&[b"HGET", b"h", b"a"]))),
+            None
+        );
+        assert_eq!(
+            int(&cmd_hexists(
+                &mut s,
+                0,
+                later,
+                &req(&[b"HEXISTS", b"h", b"a"])
+            )),
+            0
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, later, &req(&[b"HLEN", b"h"]))), 1);
+        assert_eq!(
+            bulk_bytes(&cmd_hget(&mut s, 0, later, &req(&[b"HGET", b"h", b"b"]))),
+            Some(b"2".to_vec())
+        );
+    }
+
+    #[test]
+    fn reaping_the_last_field_on_a_read_deletes_the_key() {
+        let mut s = test_store();
+        cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h", b"a", b"1"]));
+        cmd_hexpire(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HEXPIRE", b"h", b"10", b"FIELDS", b"1", b"a"]),
+        );
+        let later = UnixMillis(20_000);
+        // HGET reaps a, which empties the hash; the empty-collection-deletes-key backstop
+        // removes the key, so a subsequent HLEN sees a missing key (0).
+        assert_eq!(
+            bulk_bytes(&cmd_hget(&mut s, 0, later, &req(&[b"HGET", b"h", b"a"]))),
+            None
+        );
+        assert_eq!(int(&cmd_hlen(&mut s, 0, later, &req(&[b"HLEN", b"h"]))), 0);
     }
 
     // ---- HSET: new-vs-update count, HMSET alias. ----
