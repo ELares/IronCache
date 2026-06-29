@@ -141,6 +141,21 @@ release.
 
 ### Added
 
+- Sharded Pub/Sub (issue #410): `SSUBSCRIBE` / `SUNSUBSCRIBE` / `SPUBLISH` plus the
+  `PUBSUB SHARDCHANNELS` / `PUBSUB SHARDNUMSUB` introspection (Redis 7.0). Shard
+  channels live in a namespace SEPARATE from regular channels: an `SPUBLISH` delivers
+  only to `SSUBSCRIBE` subscribers (a `smessage` push) and never to a `SUBSCRIBE`
+  subscriber, and vice versa, with each command's receiver count and `PUBSUB`
+  introspection scoped to its own namespace. A RESP2 subscriber may issue the shard
+  (un)subscribe control commands in subscribe mode (not `SPUBLISH`, like `PUBLISH`),
+  and the `ssubscribe`/`sunsubscribe` confirmation count is the shard-channel count
+  only (independent of the channels+patterns total). Because IronCache Pub/Sub is
+  node-local (no cross-node bus), an `SPUBLISH` is already confined to the node, which
+  is the sharded "no cluster-bus fan-out amplification" property at the node boundary;
+  the cluster-mode channel-slot to owner-node redirect is a documented follow-up. The
+  commands are `@pubsub` and serve-routed (no scripting/keyspace change). The full
+  cross-shard delivery + introspection reuses the existing per-shard subscription
+  substrate.
 - DEBUG conformance subcommand subset (issue #411): the `DEBUG` container, scoped
   strictly to what the upstream Redis/Valkey TCL conformance suites drive their
   assertions through, so those suites can run against IronCache unmodified (which

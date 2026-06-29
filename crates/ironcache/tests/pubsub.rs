@@ -1303,3 +1303,195 @@ fn fix_h_pubsub_channels_and_numpat_reject_extra_args() {
         server.shutdown_and_join().unwrap();
     });
 }
+
+// ---------------------------------------------------------------------------
+// Sharded Pub/Sub (#410): SSUBSCRIBE / SUNSUBSCRIBE / SPUBLISH + PUBSUB SHARDCHANNELS /
+// SHARDNUMSUB. The shard-channel namespace is SEPARATE from the regular channel namespace.
+// ---------------------------------------------------------------------------
+
+/// Assert a delivered sharded-message frame is `["smessage", channel, payload]` and return
+/// whether it was a RESP3 push (`>`) vs a RESP2 array (`*`).
+fn assert_smessage(reply: &Resp, channel: &[u8], payload: &[u8]) -> bool {
+    let Resp::Agg { is_push, items } = reply else {
+        panic!("sharded delivery must be an aggregate, got {reply:?}");
+    };
+    assert_eq!(items.len(), 3, "smessage has 3 elements");
+    assert_eq!(items[0], Resp::Bulk(Some(b"smessage".to_vec())));
+    assert_eq!(items[1], Resp::Bulk(Some(channel.to_vec())));
+    assert_eq!(items[2], Resp::Bulk(Some(payload.to_vec())));
+    *is_push
+}
+
+#[test]
+fn sharded_ssubscribe_spublish_delivery_and_count() {
+    // Conn A SSUBSCRIBE sch; conn B SPUBLISH sch payload across shards=4. A receives the
+    // ["smessage", sch, payload] frame; B's SPUBLISH returns 1.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut a = connect_retry(port).await;
+        let mut b = connect_retry(port).await;
+        let mut abuf = Vec::new();
+        let mut bbuf = Vec::new();
+
+        // SSUBSCRIBE confirmation is ["ssubscribe", sch, 1] (the SHARD-channel count).
+        let sub = send_and_read(&mut a, &mut abuf, &[b"SSUBSCRIBE", b"sch"]).await;
+        let items = agg_items(&sub);
+        assert_eq!(items[0], Resp::Bulk(Some(b"ssubscribe".to_vec())));
+        assert_eq!(items[1], Resp::Bulk(Some(b"sch".to_vec())));
+        assert_eq!(items[2], Resp::Integer(1));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let pubr = send_and_read(&mut b, &mut bbuf, &[b"SPUBLISH", b"sch", b"hello"]).await;
+        assert_eq!(pubr, Resp::Integer(1), "SPUBLISH must report 1 receiver");
+
+        let msg = read_with_timeout(&mut a, &mut abuf, 1000)
+            .await
+            .expect("A must receive the sharded message");
+        assert_smessage(&msg, b"sch", b"hello");
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn sharded_and_regular_namespaces_are_separate() {
+    // A regular SUBSCRIBEr and a SSUBSCRIBEr to the SAME name receive ONLY their own publish
+    // kind: SPUBLISH reaches the SSUBSCRIBEr (smessage) but NOT the SUBSCRIBEr, and PUBLISH the
+    // reverse. The SPUBLISH/PUBLISH receiver counts reflect only their own namespace.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut reg = connect_retry(port).await; // SUBSCRIBE x
+        let mut shd = connect_retry(port).await; // SSUBSCRIBE x
+        let mut pubr = connect_retry(port).await; // publisher
+        let mut rbuf = Vec::new();
+        let mut sbuf = Vec::new();
+        let mut pbuf = Vec::new();
+
+        send_and_read(&mut reg, &mut rbuf, &[b"SUBSCRIBE", b"x"]).await;
+        send_and_read(&mut shd, &mut sbuf, &[b"SSUBSCRIBE", b"x"]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // SPUBLISH x -> reaches ONLY the shard subscriber (count 1).
+        let sp = send_and_read(&mut pubr, &mut pbuf, &[b"SPUBLISH", b"x", b"sharded"]).await;
+        assert_eq!(
+            sp,
+            Resp::Integer(1),
+            "SPUBLISH counts only shard subscribers"
+        );
+        let smsg = read_with_timeout(&mut shd, &mut sbuf, 1000)
+            .await
+            .expect("the SSUBSCRIBEr must receive the sharded message");
+        assert_smessage(&smsg, b"x", b"sharded");
+        // The regular SUBSCRIBEr receives NOTHING from an SPUBLISH.
+        assert!(
+            read_with_timeout(&mut reg, &mut rbuf, 300).await.is_none(),
+            "a SUBSCRIBEr must NOT receive an SPUBLISH"
+        );
+
+        // PUBLISH x -> reaches ONLY the regular subscriber (count 1).
+        let pp = send_and_read(&mut pubr, &mut pbuf, &[b"PUBLISH", b"x", b"classic"]).await;
+        assert_eq!(
+            pp,
+            Resp::Integer(1),
+            "PUBLISH counts only regular subscribers"
+        );
+        let cmsg = read_with_timeout(&mut reg, &mut rbuf, 1000)
+            .await
+            .expect("the SUBSCRIBEr must receive the classic message");
+        assert_message(&cmsg, b"x", b"classic");
+        assert!(
+            read_with_timeout(&mut shd, &mut sbuf, 300).await.is_none(),
+            "a SSUBSCRIBEr must NOT receive a PUBLISH"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn pubsub_shardchannels_and_shardnumsub() {
+    // SHARDCHANNELS lists shard channels with >=1 subscriber (separate from CHANNELS);
+    // SHARDNUMSUB sums per shard channel.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut a = connect_retry(port).await;
+        let mut q = connect_retry(port).await;
+        let mut abuf = Vec::new();
+        let mut qbuf = Vec::new();
+
+        send_and_read(&mut a, &mut abuf, &[b"SSUBSCRIBE", b"sc1", b"sc2"]).await;
+        // Drain the second ssubscribe confirmation.
+        let _ = read_with_timeout(&mut a, &mut abuf, 200).await;
+        // A regular SUBSCRIBE must NOT show up in SHARDCHANNELS.
+        send_and_read(&mut a, &mut abuf, &[b"SUBSCRIBE", b"reg"]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let chans = send_and_read(&mut q, &mut qbuf, &[b"PUBSUB", b"SHARDCHANNELS"]).await;
+        assert_eq!(
+            sorted_channel_names(&chans),
+            vec![b"sc1".to_vec(), b"sc2".to_vec()],
+            "SHARDCHANNELS lists only shard channels"
+        );
+        // Regular CHANNELS lists only the regular subscription, not the shard channels.
+        let regch = send_and_read(&mut q, &mut qbuf, &[b"PUBSUB", b"CHANNELS"]).await;
+        assert_eq!(sorted_channel_names(&regch), vec![b"reg".to_vec()]);
+
+        let numsub = send_and_read(
+            &mut q,
+            &mut qbuf,
+            &[b"PUBSUB", b"SHARDNUMSUB", b"sc1", b"absent"],
+        )
+        .await;
+        let items = agg_items(&numsub);
+        assert_eq!(items[0], Resp::Bulk(Some(b"sc1".to_vec())));
+        assert_eq!(items[1], Resp::Integer(1));
+        assert_eq!(items[2], Resp::Bulk(Some(b"absent".to_vec())));
+        assert_eq!(items[3], Resp::Integer(0));
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+#[test]
+fn sunsubscribe_stops_delivery_and_subscribe_mode_allows_ssubscribe() {
+    // SUNSUBSCRIBE removes the shard subscription (a later SPUBLISH reaches 0). And a RESP2
+    // connection already in subscribe mode (via SUBSCRIBE) may still issue SSUBSCRIBE (the
+    // gate allows the shard control commands) but NOT a data command like GET.
+    let runtime = rt();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let (server, port) = boot(4);
+        let mut a = connect_retry(port).await;
+        let mut b = connect_retry(port).await;
+        let mut abuf = Vec::new();
+        let mut bbuf = Vec::new();
+
+        // A enters subscribe mode via a regular SUBSCRIBE, then SSUBSCRIBEs (allowed in the gate).
+        send_and_read(&mut a, &mut abuf, &[b"SUBSCRIBE", b"plain"]).await;
+        let ssub = send_and_read(&mut a, &mut abuf, &[b"SSUBSCRIBE", b"sch"]).await;
+        assert_eq!(agg_items(&ssub)[0], Resp::Bulk(Some(b"ssubscribe".to_vec())));
+        // A data command in subscribe mode is rejected (RESP2 subscribe-mode gate).
+        let denied = send_and_read(&mut a, &mut abuf, &[b"GET", b"k"]).await;
+        assert!(
+            matches!(&denied, Resp::Error(e) if String::from_utf8_lossy(e).contains("Can't execute")),
+            "GET in subscribe mode must be the subscribe-mode error, got {denied:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // SUNSUBSCRIBE the shard channel; a later SPUBLISH then reaches 0 subscribers.
+        let unsub = send_and_read(&mut a, &mut abuf, &[b"SUNSUBSCRIBE", b"sch"]).await;
+        assert_eq!(agg_items(&unsub)[0], Resp::Bulk(Some(b"sunsubscribe".to_vec())));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sp = send_and_read(&mut b, &mut bbuf, &[b"SPUBLISH", b"sch", b"x"]).await;
+        assert_eq!(sp, Resp::Integer(0), "after SUNSUBSCRIBE, SPUBLISH reaches nobody");
+
+        server.shutdown_and_join().unwrap();
+    });
+}

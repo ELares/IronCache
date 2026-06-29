@@ -135,6 +135,17 @@ pub enum ServerPush {
         /// The published payload.
         payload: Bytes,
     },
+    /// A SHARDED Pub/Sub message (#410): `channel` + `payload`, delivered to SSUBSCRIBE
+    /// subscribers of a SHARD channel. Distinct from [`ServerPush::Message`] so a client can
+    /// tell a sharded delivery (`smessage`) apart from a regular one (`message`); the shard
+    /// channel namespace is separate from the regular channel namespace (an SPUBLISH never
+    /// reaches a SUBSCRIBE subscriber and vice versa).
+    SMessage {
+        /// The shard channel the message was published to.
+        channel: Bytes,
+        /// The published payload.
+        payload: Bytes,
+    },
 }
 
 impl ServerPush {
@@ -163,6 +174,12 @@ impl ServerPush {
             } => Value::Push(vec![
                 Value::bulk_str("pmessage"),
                 Value::bulk(pattern.clone()),
+                Value::bulk(channel.clone()),
+                Value::bulk(payload.clone()),
+            ]),
+            // Sharded delivery (#410): the canonical Redis shape `["smessage", channel, payload]`.
+            ServerPush::SMessage { channel, payload } => Value::Push(vec![
+                Value::bulk_str("smessage"),
                 Value::bulk(channel.clone()),
                 Value::bulk(payload.clone()),
             ]),
@@ -210,6 +227,11 @@ pub struct ShardPubSub {
     /// is absent (the last PUNSUBSCRIBE / disconnect removes the empty inner map). A PUBLISH
     /// iterates these and `glob_match`es each pattern against the published channel.
     pub patterns: HashMap<Bytes, HashMap<u64, Subscriber>>,
+    /// shard channel -> {conn id -> subscriber} (SSUBSCRIBE, #410). A SEPARATE namespace from
+    /// `channels`: an SPUBLISH delivers ONLY to this table, a PUBLISH only to `channels`, so the
+    /// two never cross. Sharded Pub/Sub has NO pattern form (Redis: no PSSUBSCRIBE), so there is
+    /// no shard analog of `patterns`. A shard channel with no subscribers is absent.
+    pub shard_channels: HashMap<Bytes, HashMap<u64, Subscriber>>,
 }
 
 impl ShardPubSub {
@@ -396,6 +418,85 @@ impl ShardPubSub {
             self.channels.remove(channel);
         }
         delivered
+    }
+
+    // ------------------------------------------------------------------------
+    // Sharded Pub/Sub (#410): the SHARD-channel namespace. Mirrors the regular-channel
+    // methods above but over `shard_channels`, so SSUBSCRIBE/SPUBLISH never cross SUBSCRIBE/
+    // PUBLISH. There is no pattern form (Redis has no PSSUBSCRIBE).
+    // ------------------------------------------------------------------------
+
+    /// Register `conn_id`'s `subscriber` as an SSUBSCRIBE subscriber of the SHARD `channel` on
+    /// THIS shard (the sharded analog of [`Self::subscribe`]). Idempotent on the table.
+    pub fn subscribe_shard(&mut self, channel: Bytes, conn_id: u64, subscriber: Subscriber) {
+        self.shard_channels
+            .entry(channel)
+            .or_default()
+            .insert(conn_id, subscriber);
+    }
+
+    /// Deregister `conn_id` from the SHARD `channel` on THIS shard, pruning the empty entry
+    /// (the sharded analog of [`Self::unsubscribe`]).
+    pub fn unsubscribe_shard(&mut self, channel: &[u8], conn_id: u64) {
+        if let Some(subs) = self.shard_channels.get_mut(channel) {
+            subs.remove(&conn_id);
+            if subs.is_empty() {
+                self.shard_channels.remove(channel);
+            }
+        }
+    }
+
+    /// Deliver `push` to every LOCAL SSUBSCRIBE subscriber of the SHARD `channel` on THIS shard,
+    /// returning the count delivered (the sharded analog of [`Self::deliver`], same non-blocking
+    /// `try_send` + slow-consumer SHED). Used by the SPUBLISH fan-out.
+    pub fn deliver_shard(&mut self, channel: &[u8], push: &ServerPush) -> i64 {
+        let Some(subs) = self.shard_channels.get_mut(channel) else {
+            return 0;
+        };
+        let mut delivered: i64 = 0;
+        let mut shed: Vec<u64> = Vec::new();
+        for (&conn_id, sub) in subs.iter() {
+            match sub.sender.try_send(push.clone()) {
+                Ok(()) => delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+                    sub.shed.trip();
+                    shed.push(conn_id);
+                }
+            }
+        }
+        for conn_id in shed {
+            subs.remove(&conn_id);
+        }
+        if subs.is_empty() {
+            self.shard_channels.remove(channel);
+        }
+        delivered
+    }
+
+    /// The LOCAL shard-channel names with at least one subscriber on THIS shard (PUBSUB
+    /// SHARDCHANNELS, #410), optionally filtered by `pat`. The home core UNIONS + dedups across
+    /// shards. The sharded analog of [`Self::local_channels`].
+    #[must_use]
+    pub fn local_shard_channels(
+        &self,
+        pat: Option<&[u8]>,
+        glob: impl Fn(&[u8], &[u8]) -> bool,
+    ) -> Vec<Bytes> {
+        self.shard_channels
+            .keys()
+            .filter(|ch| pat.is_none_or(|p| glob(p, ch.as_ref())))
+            .cloned()
+            .collect()
+    }
+
+    /// The LOCAL subscriber count of the SHARD `channel` on THIS shard (PUBSUB SHARDNUMSUB,
+    /// #410). The home core SUMS these per channel across shards. The sharded analog of
+    /// [`Self::local_numsub`].
+    #[must_use]
+    pub fn local_shard_numsub(&self, channel: &[u8]) -> i64 {
+        self.shard_channels
+            .get(channel)
+            .map_or(0, |subs| i64::try_from(subs.len()).unwrap_or(i64::MAX))
     }
 }
 

@@ -101,6 +101,12 @@ pub struct ConnState {
     /// for PR 91b; always empty this pass. Designed in now so [`Self::is_subscriber`] and the
     /// disconnect cleanup already account for patterns without reshaping the struct.
     pub sub_patterns: HashSet<Bytes>,
+    /// The SHARD channels this connection is SSUBSCRIBEd to (sharded Pub/Sub, #410). A SEPARATE
+    /// namespace from [`Self::sub_channels`]; the SSUBSCRIBE confirmation count is the size of
+    /// THIS set only (Redis reports the shard-channel count, not the channels+patterns total).
+    /// Drives the disconnect-cleanup deregistration from the serve layer's `shard_channels` table.
+    /// A connection holding any shard subscription is "in subscribe mode" ([`Self::is_subscriber`]).
+    pub sub_shard_channels: HashSet<Bytes>,
     /// The per-connection CLUSTER read-only bit (REPLICA_READ.md #147, HA-7d). `false` (read
     /// -write) by default; `READONLY` sets it, `READWRITE` clears it. On a REPLICA node, a keyed
     /// READ for a slot this node replicates is served LOCALLY only when this bit is set; otherwise
@@ -175,6 +181,7 @@ impl ConnState {
             watch: Vec::new(),
             sub_channels: HashSet::new(),
             sub_patterns: HashSet::new(),
+            sub_shard_channels: HashSet::new(),
             // Read-write by default (the strong-read behavior unmodified clients expect); a client
             // opts into replica reads with READONLY (REPLICA_READ.md #147).
             readonly: false,
@@ -211,6 +218,7 @@ impl ConnState {
         // connection leave subscribe mode, the same split as the disconnect-cleanup path.
         self.sub_channels.clear();
         self.sub_patterns.clear();
+        self.sub_shard_channels.clear();
         // RESET clears the CLUSTER read-only bit back to read-write (Redis parity).
         self.readonly = false;
         // RESET clears any pending one-shot ASKING (HA-6): a fresh baseline never carries a stale
@@ -227,7 +235,9 @@ impl ConnState {
     /// the PING reply shape, so the non-subscriber hot path stays untouched.
     #[must_use]
     pub fn is_subscriber(&self) -> bool {
-        !self.sub_channels.is_empty() || !self.sub_patterns.is_empty()
+        !self.sub_channels.is_empty()
+            || !self.sub_patterns.is_empty()
+            || !self.sub_shard_channels.is_empty()
     }
 
     /// Enter the transaction (queueing) state for a fresh `MULTI`: mark `in_multi`

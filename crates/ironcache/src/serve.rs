@@ -2160,6 +2160,11 @@ fn subscriber_gate_blocks(
                 | b"UNSUBSCRIBE"
                 | b"PSUBSCRIBE"
                 | b"PUNSUBSCRIBE"
+                // Sharded Pub/Sub (#410): a RESP2 subscriber may also run the SHARD (un)subscribe
+                // control commands (Redis allows SSUBSCRIBE/SUNSUBSCRIBE in subscribe mode). SPUBLISH
+                // is NOT allowed (it is a publish, like PUBLISH, which the gate blocks).
+                | b"SSUBSCRIBE"
+                | b"SUNSUBSCRIBE"
                 | b"PING"
                 | b"QUIT"
                 | b"RESET"
@@ -2964,6 +2969,10 @@ async fn route_and_dispatch(
         // the coordinator issues it (via the inbox). Reject a CLIENT `__ICPUBLISH` here with the
         // same unknown-command reply as the *STORE verbs.
         || cmd_upper == ironcache_server::ICPUBLISH
+        // `__ICSPUBLISH` is the INTERNAL cross-shard SHARDED-PUBLISH fan-out verb (#410): the same
+        // gate as `__ICPUBLISH` -- registry-present (cross-check exact) but client-unreachable; only
+        // the coordinator issues it.
+        || cmd_upper == ironcache_server::ICSPUBLISH
         // `__ICPUBSUB` is the INTERNAL cross-shard PUBSUB-introspection gather verb (SERVER_PUSH.md
         // #20, PR 91b): the same gate -- registry-present (cross-check exact) but client-
         // unreachable; only the coordinator issues it (via the inbox per shard).
@@ -5667,7 +5676,16 @@ fn all_keys_home_owned(cmd_upper: &[u8], request: &Request, home: ShardId) -> bo
 fn is_serve_pubsub_command(cmd_upper: &[u8]) -> bool {
     matches!(
         cmd_upper,
-        b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH" | b"PUBSUB"
+        b"SUBSCRIBE"
+            | b"UNSUBSCRIBE"
+            | b"PSUBSCRIBE"
+            | b"PUNSUBSCRIBE"
+            | b"PUBLISH"
+            | b"PUBSUB"
+            // Sharded Pub/Sub (#410): SSUBSCRIBE / SUNSUBSCRIBE / SPUBLISH are serve-routed too.
+            | b"SSUBSCRIBE"
+            | b"SUNSUBSCRIBE"
+            | b"SPUBLISH"
     )
 }
 
@@ -5728,7 +5746,11 @@ fn reject_internal_verb(
 /// (unsubscribe-all); PUBSUB validates its subcommand inline. PING is intercepted ONLY when the
 /// connection is a RESP2 subscriber (the `["pong", ...]` array shape); a non-subscriber / RESP3
 /// PING returns `None` so the normal `cmd_ping` arm handles it unchanged.
-#[allow(clippy::too_many_arguments)]
+// `too_many_lines` allowed: this is the pub/sub command DISPATCH (one arm per SUBSCRIBE /
+// UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBLISH / PUBSUB / the #410 sharded trio / subscribed
+// PING), each a thin arity-check + handler call. Splitting it would scatter the single
+// pub/sub interception point that mirrors the serve router's one entry.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn try_handle_pubsub(
     conn: &mut ConnState,
     home: ShardId,
@@ -5802,6 +5824,43 @@ async fn try_handle_pubsub(
                     out,
                     &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_arity(
                         "publish",
+                    )),
+                    conn.proto,
+                );
+            }
+            Some(false)
+        }
+        // -- Sharded Pub/Sub (#410): the SSUBSCRIBE / SUNSUBSCRIBE / SPUBLISH analogs of
+        // SUBSCRIBE / UNSUBSCRIBE / PUBLISH, over the separate SHARD-channel namespace. --
+        b"SSUBSCRIBE" => {
+            state_rc.borrow_mut().counters.on_command();
+            if request.args.len() >= 2 {
+                handle_ssubscribe(conn, push_tx, shed_flag, request, out);
+            } else {
+                encode_into(
+                    out,
+                    &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_arity(
+                        "ssubscribe",
+                    )),
+                    conn.proto,
+                );
+            }
+            Some(false)
+        }
+        b"SUNSUBSCRIBE" => {
+            state_rc.borrow_mut().counters.on_command();
+            handle_sunsubscribe(conn, request, out);
+            Some(false)
+        }
+        b"SPUBLISH" => {
+            state_rc.borrow_mut().counters.on_command();
+            if request.args.len() == 3 {
+                handle_spublish(conn, inbox, home, request, out).await;
+            } else {
+                encode_into(
+                    out,
+                    &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_arity(
+                        "spublish",
                     )),
                     conn.proto,
                 );
@@ -5913,6 +5972,109 @@ fn handle_unsubscribe(conn: &mut ConnState, request: &Request, out: &mut Vec<u8>
             conn.proto,
         );
     }
+}
+
+/// The running SHARD-channel subscription count (#410), the integer in each
+/// ssubscribe/sunsubscribe confirmation. Redis reports the SHARD-channel count ONLY here (NOT
+/// the channels+patterns total `running_count` uses), so a client tracks its sharded
+/// subscriptions independently of its regular ones.
+fn running_shard_count(conn: &ConnState) -> i64 {
+    i64::try_from(conn.sub_shard_channels.len()).unwrap_or(i64::MAX)
+}
+
+/// `SSUBSCRIBE shardchannel [shardchannel ...]` (#410, the sharded analog of SUBSCRIBE). For EACH
+/// channel: insert it into `conn.sub_shard_channels` and register the subscriber into THIS shard's
+/// `shard_channels` table, then append a `["ssubscribe", channel, running_shard_count]`
+/// confirmation. Idempotent (a re-subscribe does not bump the count), matching Redis. The
+/// SHARD-channel namespace is separate from SUBSCRIBE's, so an SPUBLISH (not a PUBLISH) delivers
+/// here.
+fn handle_ssubscribe(
+    conn: &mut ConnState,
+    push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    let pubsub = shard_pubsub();
+    for channel in &request.args[1..] {
+        conn.sub_shard_channels.insert(channel.clone());
+        pubsub.borrow_mut().subscribe_shard(
+            channel.clone(),
+            conn.id,
+            crate::pubsub::Subscriber {
+                sender: push_tx.clone(),
+                shed: std::sync::Arc::clone(shed_flag),
+            },
+        );
+        let count = running_shard_count(conn);
+        encode_into(
+            out,
+            &push_confirm("ssubscribe", channel.as_ref(), count),
+            conn.proto,
+        );
+    }
+}
+
+/// `SUNSUBSCRIBE [shardchannel ...]` (#410, the sharded analog of UNSUBSCRIBE). With args,
+/// unsubscribe each named shard channel; with NO args, unsubscribe ALL currently-held shard
+/// channels. Reply one `["sunsubscribe", channel, running_shard_count]` per affected channel; the
+/// no-args-and-none-subscribed edge replies a single `["sunsubscribe", nil, 0]` (matching Redis).
+fn handle_sunsubscribe(conn: &mut ConnState, request: &Request, out: &mut Vec<u8>) {
+    let pubsub = shard_pubsub();
+    let targets: Vec<bytes::Bytes> = if request.args.len() > 1 {
+        request.args[1..].to_vec()
+    } else {
+        conn.sub_shard_channels.iter().cloned().collect()
+    };
+
+    if targets.is_empty() {
+        encode_into(
+            out,
+            &ironcache_server::Value::Push(vec![
+                ironcache_server::Value::bulk_str("sunsubscribe"),
+                ironcache_server::Value::Null,
+                ironcache_server::Value::Integer(0),
+            ]),
+            conn.proto,
+        );
+        return;
+    }
+
+    for channel in targets {
+        conn.sub_shard_channels.remove(&channel);
+        pubsub
+            .borrow_mut()
+            .unsubscribe_shard(channel.as_ref(), conn.id);
+        let count = running_shard_count(conn);
+        encode_into(
+            out,
+            &push_confirm("sunsubscribe", channel.as_ref(), count),
+            conn.proto,
+        );
+    }
+}
+
+/// `SPUBLISH shardchannel message` (#410, the sharded analog of PUBLISH). Fan the message out to
+/// every shard's LOCAL `shard_channels` table via the coordinator (node-local; an SPUBLISH never
+/// reaches a SUBSCRIBE subscriber), replying the integer total receiver count.
+async fn handle_spublish(
+    conn: &ConnState,
+    inbox: &coordinator::Inbox,
+    home: ShardId,
+    request: &Request,
+    out: &mut Vec<u8>,
+) {
+    let channel = request.args[1].clone();
+    let payload = request.args[2].clone();
+    let total = coordinator::fan_out_spublish(
+        inbox,
+        channel.as_ref(),
+        payload.as_ref(),
+        conn.db,
+        home.index,
+    )
+    .await;
+    encode_into(out, &ironcache_server::Value::Integer(total), conn.proto);
 }
 
 /// `PSUBSCRIBE pattern [pattern ...]` (SERVER_PUSH.md #20, PR 91b). For EACH pattern: insert it
@@ -6031,10 +6193,12 @@ async fn handle_pubsub(
     // pubsubCommand. A present-but-unrecognized subcommand OR a recognized subcommand with a bad
     // arg count both fall to the same subcommand-syntax error (Redis's addReplySubcommandSyntaxError).
     let valid = match sub_upper.as_slice() {
-        // CHANNELS [pattern]: at most one pattern -> argc 2 or 3.
-        b"CHANNELS" => argc == 2 || argc == 3,
-        // NUMSUB [channel ...]: any number of channels -> argc >= 2 (no upper bound).
-        b"NUMSUB" => argc >= 2,
+        // CHANNELS [pattern] / the sharded SHARDCHANNELS [pattern] (#410): at most one pattern
+        // -> argc 2 or 3.
+        b"CHANNELS" | b"SHARDCHANNELS" => argc == 2 || argc == 3,
+        // NUMSUB [channel ...] / the sharded SHARDNUMSUB [channel ...] (#410): any number of
+        // channels -> argc >= 2 (no upper bound).
+        b"NUMSUB" | b"SHARDNUMSUB" => argc >= 2,
         // NUMPAT: takes NO args -> argc exactly 2.
         b"NUMPAT" => argc == 2,
         _ => false,
@@ -6096,11 +6260,15 @@ fn ping_subscribed_reply(request: &Request) -> ironcache_server::Value {
 }
 
 /// Deregister EVERY subscription a connection holds from THIS shard's subscription table
-/// (SERVER_PUSH.md #20, PR 91a), driven off `conn.sub_channels` / `conn.sub_patterns` (O(subs)).
-/// Called on connection close (and could be reused on RESET): the connection's subscriptions are
-/// home-shard-local, so this runs on the connection's home shard. A no-op when not subscribed.
+/// (SERVER_PUSH.md #20, PR 91a), driven off `conn.sub_channels` / `conn.sub_patterns` /
+/// `conn.sub_shard_channels` (O(subs)). Called on connection close (and could be reused on RESET):
+/// the connection's subscriptions are home-shard-local, so this runs on the connection's home
+/// shard. A no-op when not subscribed.
 fn deregister_all_subscriptions(conn: &ConnState) {
-    if conn.sub_channels.is_empty() && conn.sub_patterns.is_empty() {
+    if conn.sub_channels.is_empty()
+        && conn.sub_patterns.is_empty()
+        && conn.sub_shard_channels.is_empty()
+    {
         return;
     }
     let pubsub = shard_pubsub();
@@ -6112,6 +6280,11 @@ fn deregister_all_subscriptions(conn: &ConnState) {
         // PSUBSCRIBE pattern subscriptions (PR 91b): deregister each from this shard's
         // `patterns` table so a QUIT / error close / peer close leaves no pattern leak.
         table.unsubscribe_pattern(pattern.as_ref(), conn.id);
+    }
+    for channel in &conn.sub_shard_channels {
+        // SSUBSCRIBE shard subscriptions (#410): deregister each from this shard's
+        // `shard_channels` table so a close leaves no shard-channel leak.
+        table.unsubscribe_shard(channel.as_ref(), conn.id);
     }
 }
 
