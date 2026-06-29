@@ -259,6 +259,8 @@ fn type_category(cmd: &[u8]) -> Option<Category> {
         b"HEXPIRETIME",
         b"HPEXPIRETIME",
         b"HPERSIST",
+        b"HGETDEL",
+        b"HGETEX",
     ];
     const SET: &[&[u8]] = &[
         b"SADD",
@@ -530,6 +532,8 @@ fn is_fast(cmd: &[u8]) -> bool {
             | b"HEXPIRETIME"
             | b"HPEXPIRETIME"
             | b"HPERSIST"
+            | b"HGETDEL"
+            | b"HGETEX"
             // O(1) set.
             | b"SADD"
             | b"SREM"

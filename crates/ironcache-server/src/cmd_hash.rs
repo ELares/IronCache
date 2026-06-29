@@ -1302,6 +1302,158 @@ pub fn cmd_hpersist<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Req
     })
 }
 
+// ---------------------------------------------------------------------------
+// Hash field-TTL accessors (Redis 8.0, #408): HGETEX / HGETDEL / HSETEX.
+// ---------------------------------------------------------------------------
+
+/// `HGETDEL key FIELDS numfields field [field ...]` -> an array with each field's value (nil
+/// if absent), DELETING the present fields (an atomic get-and-delete). A missing key replies
+/// an array of nils. Deleting the last field removes the key.
+pub fn cmd_hgetdel<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() < 5 {
+        return Value::error(ErrorReply::wrong_arity("hgetdel"));
+    }
+    let fields: Vec<Bytes> = match parse_hash_fields_block(&req.args[2..]) {
+        Ok(f) => f.to_vec(),
+        Err(e) => return Value::error(e),
+    };
+    store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
+        RmwEntry::Vacant => keep(Value::Array(Some(
+            fields.iter().map(|_| Value::Null).collect(),
+        ))),
+        RmwEntry::OccupiedMut(mut o) => {
+            let Some(hash) = o.as_hash_mut() else {
+                return wrong_type();
+            };
+            // HGETDEL is a write (primary-only via the replica gate), so it reaps directly.
+            let mut changed = !hash.reap_expired_fields(now).is_empty();
+            let mut out: Vec<Value> = Vec::with_capacity(fields.len());
+            for f in &fields {
+                // Clone the value out first so the immutable borrow ends before the delete.
+                match hash.get(f).map(<[u8]>::to_vec) {
+                    Some(v) => {
+                        out.push(bulk(v));
+                        hash.del(f);
+                        changed = true;
+                    }
+                    None => out.push(Value::Null),
+                }
+            }
+            let action = if hash.is_empty() {
+                RmwAction::Delete
+            } else if changed {
+                RmwAction::Mutated
+            } else {
+                RmwAction::Keep
+            };
+            RmwStep {
+                action,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::Array(Some(out)),
+            }
+        }
+        RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+    })
+}
+
+/// The optional TTL directive an HGETEX carries before its FIELDS block.
+enum HGetexTtl {
+    /// No TTL option: a pure read (HMGET-shaped), leaving each field's TTL untouched.
+    Leave,
+    /// EX/PX/EXAT/PXAT: set each returned field's deadline (a deadline at or before now
+    /// deletes the field, after its value is returned).
+    SetAt(i64),
+    /// PERSIST: clear each returned field's TTL.
+    Persist,
+}
+
+/// `HGETEX key [EX sec | PX ms | EXAT unix-sec | PXAT unix-ms | PERSIST] FIELDS numfields
+/// field [field ...]` -> an array with each field's value (nil if absent), optionally
+/// adjusting the TTL of the present fields. A bare HGETEX is HMGET; with a TTL option it also
+/// sets/clears the field deadlines. A missing key replies an array of nils.
+pub fn cmd_hgetex<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() < 5 {
+        return Value::error(ErrorReply::wrong_arity("hgetex"));
+    }
+    // Parse the OPTIONAL TTL directive that precedes the FIELDS block.
+    let mut idx = 2;
+    let kind = match ascii_upper(&req.args[idx]).as_slice() {
+        b"EX" => Some(ExpireKind::Seconds),
+        b"PX" => Some(ExpireKind::Millis),
+        b"EXAT" => Some(ExpireKind::SecondsAt),
+        b"PXAT" => Some(ExpireKind::MillisAt),
+        _ => None,
+    };
+    let ttl = if let Some(kind) = kind {
+        let Some(n) = req.args.get(idx + 1).and_then(|a| parse_i64(a)) else {
+            return Value::error(ErrorReply::not_an_integer());
+        };
+        idx += 2;
+        let Ok(deadline_ms) = resolve_expire_at(kind, n, now) else {
+            return Value::error(ErrorReply::invalid_expire_time("hgetex"));
+        };
+        HGetexTtl::SetAt(deadline_ms)
+    } else if req.args[idx].eq_ignore_ascii_case(b"PERSIST") {
+        idx += 1;
+        HGetexTtl::Persist
+    } else {
+        HGetexTtl::Leave
+    };
+    let fields: Vec<Bytes> = match parse_hash_fields_block(&req.args[idx..]) {
+        Ok(f) => f.to_vec(),
+        Err(e) => return Value::error(e),
+    };
+    store.rmw_mut(db, &req.args[1], now, move |entry| match entry {
+        RmwEntry::Vacant => keep(Value::Array(Some(
+            fields.iter().map(|_| Value::Null).collect(),
+        ))),
+        RmwEntry::OccupiedMut(mut o) => {
+            let Some(hash) = o.as_hash_mut() else {
+                return wrong_type();
+            };
+            // HGETEX is flagged a write (it can mutate TTL), so it is primary-only and reaps.
+            let mut changed = !hash.reap_expired_fields(now).is_empty();
+            let mut out: Vec<Value> = Vec::with_capacity(fields.len());
+            for f in &fields {
+                let Some(v) = hash.get(f).map(<[u8]>::to_vec) else {
+                    out.push(Value::Null);
+                    continue;
+                };
+                out.push(bulk(v));
+                match ttl {
+                    HGetexTtl::Leave => {}
+                    HGetexTtl::SetAt(deadline_ms) => {
+                        if deadline_ms <= now.0 as i64 {
+                            hash.del(f);
+                        } else {
+                            hash.set_field_ttl(f, UnixMillis(deadline_ms as u64));
+                        }
+                        changed = true;
+                    }
+                    HGetexTtl::Persist => {
+                        if hash.persist_field(f) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            let action = if hash.is_empty() {
+                RmwAction::Delete
+            } else if changed {
+                RmwAction::Mutated
+            } else {
+                RmwAction::Keep
+            };
+            RmwStep {
+                action,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::Array(Some(out)),
+            }
+        }
+        RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1634,6 +1786,107 @@ mod tests {
         );
         // A plain HSET overwrite removes the field's TTL (Redis hashTypeSet) -> -1 (no TTL).
         cmd_hset(&mut s, 0, NOW, &req(&[b"HSET", b"h", b"a", b"2"]));
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"])
+            )),
+            vec![-1]
+        );
+    }
+
+    #[test]
+    fn hgetdel_returns_values_and_deletes_fields() {
+        let mut s = test_store();
+        cmd_hset(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HSET", b"h", b"a", b"1", b"b", b"2", b"c", b"3"]),
+        );
+        // a present, z missing, b present -> [1, nil, 2]; a and b are deleted.
+        match cmd_hgetdel(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HGETDEL", b"h", b"FIELDS", b"3", b"a", b"z", b"b"]),
+        ) {
+            Value::Array(Some(items)) => {
+                assert_eq!(bulk_bytes(&items[0]), Some(b"1".to_vec()));
+                assert!(matches!(items[1], Value::Null));
+                assert_eq!(bulk_bytes(&items[2]), Some(b"2".to_vec()));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+        assert_eq!(int(&cmd_hlen(&mut s, 0, NOW, &req(&[b"HLEN", b"h"]))), 1); // only c remains
+        // Missing key -> an array of nils, one per requested field.
+        match cmd_hgetdel(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HGETDEL", b"nope", b"FIELDS", b"1", b"a"]),
+        ) {
+            Value::Array(Some(items)) => assert!(matches!(items[0], Value::Null)),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hgetex_reads_and_adjusts_field_ttl() {
+        let mut s = test_store();
+        cmd_hset(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]),
+        );
+        // Bare HGETEX is HMGET (no TTL change): a -> 1, x -> nil.
+        match cmd_hgetex(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HGETEX", b"h", b"FIELDS", b"2", b"a", b"x"]),
+        ) {
+            Value::Array(Some(items)) => {
+                assert_eq!(bulk_bytes(&items[0]), Some(b"1".to_vec()));
+                assert!(matches!(items[1], Value::Null));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"])
+            )),
+            vec![-1]
+        );
+        // HGETEX EX 100 returns the value AND sets a's TTL to 100s.
+        cmd_hgetex(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HGETEX", b"h", b"EX", b"100", b"FIELDS", b"1", b"a"]),
+        );
+        assert_eq!(
+            ints(&cmd_httl(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"])
+            )),
+            vec![100]
+        );
+        // HGETEX PERSIST clears it.
+        cmd_hgetex(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HGETEX", b"h", b"PERSIST", b"FIELDS", b"1", b"a"]),
+        );
         assert_eq!(
             ints(&cmd_httl(
                 &mut s,
