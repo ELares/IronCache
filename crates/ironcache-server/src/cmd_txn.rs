@@ -184,6 +184,7 @@ pub(crate) mod tests {
             b"SLOWLOG",
             b"MEMORY",
             b"LATENCY",
+            b"DEBUG",
             b"CLUSTER",
             // Persistence (#58): SAVE / BGSAVE / LASTSAVE. The real cross-shard save lives in the
             // binary serve layer; these dispatch arms are the persistence-disabled fallback.
@@ -557,12 +558,13 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            194,
-            "the dispatch-arm hand-list drifted from the 182 client commands (incl. LOLWUT, \
+            195,
+            "the dispatch-arm hand-list drifted from the 183 client commands (incl. LOLWUT, \
              #414 command-surface completeness, + the 12 hash-field-TTL commands HEXPIRE/\
              HPEXPIRE/HEXPIREAT/HPEXPIREAT/HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME/HPERSIST + the \
              HGETDEL/HGETEX/HSETEX accessors, #408, + the native CAS + bulk-TTL primitives \
-             MSETEX/DELIFEQ (SET IFEQ/IFNE is an option, not an arm), #412, \
+             MSETEX/DELIFEQ (SET IFEQ/IFNE is an option, not an arm), #412, + the DEBUG \
+             conformance subset container, #411, \
              + SAVE/BGSAVE/\
              LASTSAVE, #58 persistence, + SHUTDOWN, #139 graceful shutdown, + the drop-in\
              compatibility set GETRANGE/SUBSTR/SETRANGE/GETDEL/MSETNX/LMPOP/ZMPOP/SORT/SORT_RO, \

@@ -847,7 +847,13 @@ pub fn dispatch_with_cmd<
     // drain never stalls the command path. The SAME [`drain_due_keys`] helper backs the
     // PR-3c background timer task for idle shards (no duplicate drain logic). It runs
     // ONCE per client command (here), not per queued command at EXEC time.
-    deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
+    //
+    // GATED on the runtime active-expire flag (`DEBUG SET-ACTIVE-EXPIRE`, #411): when disabled
+    // the active reaper is inert (one relaxed load, default-true so the common path is
+    // unchanged) and only LAZY reap-on-access removes a key -- the conformance contract.
+    if ctx.runtime.active_expire_enabled() {
+        deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
+    }
 
     // Auth gate (DEFENSE IN DEPTH): before authenticating, only the pre-auth allow-list
     // (Redis: HELLO, AUTH, QUIT, RESET) is allowed; everything else is NOAUTH. The PRIMARY
@@ -1091,6 +1097,10 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // LATENCY RESET/HISTORY/LATEST/DOCTOR/HELP (PROD-7). Reads/resets the node-level monitor in
         // `ctx.latency`; the per-command SAMPLE that feeds it lives in the serve layer. AlwaysHome.
         b"LATENCY" => cmd_latency(ctx, req),
+        // DEBUG conformance subset (#411): OBJECT/JMAP/SLEEP/SET-ACTIVE-EXPIRE/STRINGMATCH-LEN/
+        // QUICKLIST-PACKED-THRESHOLD. AlwaysHome admin container; OBJECT reads its key on this
+        // shard; SET-ACTIVE-EXPIRE toggles the node's active-expiry flag via `ctx.runtime`.
+        b"DEBUG" => cmd_introspect::cmd_debug(&ctx.runtime, store, db, now, req),
         // INFO reads only the CLOCK half of the env seam (uptime); pass `env` as the
         // `&C: Clock` it needs. `store` is passed so the `# Keyspace` section can report each
         // database's live key count (DBSIZE) via `Keyspace::db_len` (durability/operability fix #5).
@@ -1627,8 +1637,11 @@ pub fn dispatch_remote_keyed<E: Env, S: Store + Admit + ActiveExpiry + Keyspace 
     // from THIS shard's wheel and reap the genuinely-expired ones (the SAME
     // `drain_due_keys` helper). Bounds resident memory for expired keys under traffic.
     // `drain_due_keys` records an `expired` keyspace notification per reaped key (gated off
-    // by default).
-    deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
+    // by default). GATED on the runtime active-expire flag (`DEBUG SET-ACTIVE-EXPIRE`, #411)
+    // exactly like the home `dispatch`, so a node-wide toggle reaches the owner shard too.
+    if ctx.runtime.active_expire_enabled() {
+        deltas.expired += drain_due_keys(wheel, store, now, MAX_RECLAIM_PER_CALL);
+    }
 
     // (3) The keyed command body + the per-command admission gate, via the SINGLE shared
     // keyed-arm definition (so home and remote cannot diverge).
