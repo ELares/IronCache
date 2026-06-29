@@ -1525,6 +1525,9 @@ async fn serve_connection(
                         was_tracking,
                         was_bcast,
                     );
+                    // OPTIN/OPTOUT (#409 stage 3): consume the one-shot CLIENT CACHING flag now that
+                    // this command's track decision has used it (cleared except on CLIENT CACHING).
+                    consume_caching_flag(&mut conn, &request);
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
@@ -1957,6 +1960,9 @@ async fn serve_connection_uring(
                         was_tracking,
                         was_bcast,
                     );
+                    // OPTIN/OPTOUT (#409 stage 3): consume the one-shot CLIENT CACHING flag now that
+                    // this command's track decision has used it (cleared except on CLIENT CACHING).
+                    consume_caching_flag(&mut conn, &request);
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
@@ -5673,6 +5679,37 @@ fn record_command_stats(
 /// differential bar). The cross-shard case (a read routed to a remote owner shard) is a documented
 /// follow-up; a stale foreign-shard entry self-heals when its key next changes (the push to a gone
 /// connection fails and is shed).
+/// Whether a DEFAULT-mode tracking read should register its keys, given the OPTIN/OPTOUT mode and
+/// the one-shot `CLIENT CACHING` flag (#409 stage 3). Default mode (neither OPTIN nor OPTOUT) tracks
+/// every read; OPTIN tracks only after `CACHING YES`; OPTOUT tracks unless `CACHING NO`.
+fn tracking_should_register_read(conn: &ConnState) -> bool {
+    if conn.tracking_optin {
+        conn.caching_next == Some(true)
+    } else if conn.tracking_optout {
+        conn.caching_next != Some(false)
+    } else {
+        true
+    }
+}
+
+/// Consume the one-shot `CLIENT CACHING` flag (#409 stage 3): it is cleared after the command that
+/// FOLLOWS `CLIENT CACHING` (i.e. every command except `CLIENT CACHING` itself, which sets it), so
+/// the OPTIN/OPTOUT decision applies to exactly one command. A single `is_some` check when no flag
+/// is pending (the common case), so the non-OPTIN hot path is unaffected.
+fn consume_caching_flag(conn: &mut ConnState, request: &Request) {
+    if conn.caching_next.is_none() {
+        return;
+    }
+    let is_caching_cmd = request.command().eq_ignore_ascii_case(b"CLIENT")
+        && request
+            .args
+            .get(1)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"CACHING"));
+    if !is_caching_cmd {
+        conn.caching_next = None;
+    }
+}
+
 fn apply_client_tracking(
     conn: &ConnState,
     push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
@@ -5749,10 +5786,11 @@ fn apply_client_tracking(
             }
             ironcache_server::KeySpec::None => {}
         }
-    } else if conn.tracking_on && !conn.tracking_bcast {
-        // A READ by a DEFAULT-mode tracking connection: register every key it read so a later change
-        // pushes an invalidation. (A BCAST connection tracks PREFIXES, not reads, so it skips this.)
-        // A non-keyed read (PING/INFO/...) registers nothing.
+    } else if conn.tracking_on && !conn.tracking_bcast && tracking_should_register_read(conn) {
+        // A READ by a DEFAULT-mode tracking connection (and, in OPTIN/OPTOUT, one the one-shot
+        // CLIENT CACHING gate admits): register every key it read so a later change pushes an
+        // invalidation. (A BCAST connection tracks PREFIXES, not reads, so it skips this.) A
+        // non-keyed read (PING/INFO/...) registers nothing.
         let keys: Vec<bytes::Bytes> = match ironcache_server::command_keys(&cmd_upper, request) {
             ironcache_server::KeySpec::One(k) => vec![bytes::Bytes::copy_from_slice(k)],
             ironcache_server::KeySpec::Many(ks) => ks
