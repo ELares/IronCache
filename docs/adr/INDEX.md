@@ -33,6 +33,10 @@ in [OPEN.md](OPEN.md); research questions in [QUESTIONS.md](QUESTIONS.md).
 | [0025](0025-cluster-partition-count.md) | Cluster keyspace partition count (16384 dual-purpose unit) | Accepted | #72 |
 | [0026](0026-replication-consistency-model.md) | Default replication and consistency model (async primary/replica plus WAIT) | Accepted | #76 |
 | [0027](0027-hand-rolled-env-respecting-raft.md) | Hand-rolled, Env-respecting Raft, verified in deterministic simulation | Accepted | #73 |
+| [0028](0028-streams-non-goal-reevaluation.md) | Re-evaluate the Streams non-goal after v1 (stay deferred) | Accepted | #418 |
+| [0029](0029-vector-similarity-search-scope.md) | Off-path vector similarity search scope (decline a native type for now) | Accepted | #415 |
+| [0030](0030-probabilistic-membership-types.md) | Probabilistic membership types beyond HLL (adopt Bloom-first, staged) | Accepted | #416 |
+| [0031](0031-native-json-document-type.md) | Native JSON document type scope (decline in the core binary for now) | Accepted | #417 |
 
 As `[DECISION]` issues close, each adds its row here and its `NNNN-*.md` record.
 The numbering is monotonic and never reused, even after supersession.
