@@ -151,6 +151,18 @@ release.
 
 ### Added
 
+- Console cluster overview now rolls up the replication topology (issue #357): the `/api/cluster`
+  `cluster_topology` object gained a `replication` summary derived from the polled node's parsed
+  `/topology` view (#354) -- `role`, one `{host, port, offset, lag}` entry per connected replica
+  (N-replica, #365), `connected_replicas`, the worst-case `max_replica_lag` (the replication-health
+  headline), the replica-side `master_host`/`master_port`/`master_link`, and `migrations_in_progress`
+  (the count of slots actively migrating in/out of this node, the migration-progress view). This is
+  the cache-specific replication picture Grafana cannot express, and it became real once the engine
+  reported real per-replica endpoints + lag + N replicas (#365); before that the rollup would have
+  been hardcoded placeholders. It is the polled node's authoritative view (a node knows its own
+  replicas, not other nodes' replica sets); cross-node fan-out stays a multi-seed follow-up. The
+  per-shard breakdown remains deferred (#362, multi-shard-only and near-useless on the `shards=1`
+  prod box).
 - Console consumes the full `/topology` replication + migration fidelity (issue #354): the
   topology parser was role-only and ignored the per-replica endpoints and the in-flight slot
   migrations the engine now reports (#365 N-replica, #354 migrations array). It now parses one
