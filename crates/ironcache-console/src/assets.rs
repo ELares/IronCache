@@ -366,6 +366,22 @@ mod tests {
     }
 
     #[test]
+    fn app_js_wires_the_topology_staleness_banner() {
+        // #354: app.js reads the server-reported topology age and raises the shared
+        // banner past a threshold (so a stuck poll is not shown as live data).
+        for needle in [
+            "topology_age_seconds",
+            "lastTopologyAgeSeconds",
+            "STALE_AFTER_S",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js must reference `{needle}` for the staleness banner"
+            );
+        }
+    }
+
+    #[test]
     fn app_js_wires_the_rebalance_plan_read() {
         // The cluster rebalance dry-run (#361) is an admin READ wired on the button:
         // app.js fetches the endpoint via the token-aware fetchJson and renders it.
