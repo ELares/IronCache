@@ -151,6 +151,19 @@ release.
 
 ### Added
 
+- Console rebalance dry-run plan (issue #361, the management dry-run rail over
+  engine #444): `GET /api/cluster/rebalance-plan` issues `CLUSTER REBALANCE DRYRUN`
+  to the configured node and renders the per-node slot-balance plan as typed JSON
+  (`{ok, dry_run, balanced, total_slots_to_move, targets:[{node, current_slots,
+  target_slots, slots_to_move}]}`), so an operator sees the slot diff BEFORE any
+  apply. READ-ONLY (it is a GET, the engine mutates nothing and refuses APPLY) but
+  Admin-tier (a privileged cluster-management action, gated server-side via
+  `ADMIN_READ_ROUTES`). The reply parser is pure and total: a non-array reply or a
+  row missing a field maps to a `502`, and per-node fields are read by key (no field
+  order assumed). `total_slots_to_move` counts the slots that change owner (the sum
+  of the positive deltas, equal to the absolute negative sum by conservation).
+  Documented in the OpenAPI (`RebalancePlanResponse`). The SPA panel and the
+  mutating apply/failover actions remain.
 - `CLUSTER REBALANCE [DRYRUN]` slot-balance planner (issue #371, the rebalance
   half): reports, for every known node, the slots it owns now, the balanced target
   (the assigned slots spread as evenly as possible across the members), and the

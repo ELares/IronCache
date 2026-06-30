@@ -121,9 +121,12 @@ const KNOWN_PRIVILEGED_ROUTES: [&str; 5] = [
 
 /// The ADMIN read routes: management reads that disclose the node's FULL config or
 /// user/permission set, sensitive enough to require the admin token even to read.
-/// `/api/acl` lists every ACL user and their rules. (Mutations are handled by the
-/// method-aware [`route_tier_for_method`], not this list.)
-const ADMIN_READ_ROUTES: [&str; 1] = ["/api/acl"];
+/// `/api/acl` lists every ACL user and their rules. `/api/cluster/rebalance-plan`
+/// (#361) is a cluster-management dry-run: read-only, but a privileged operator
+/// action (the slot-move plan precedes an apply), so it sits at the admin bar.
+/// (Mutations are handled by the method-aware [`route_tier_for_method`], not this
+/// list.)
+const ADMIN_READ_ROUTES: [&str; 2] = ["/api/acl", "/api/cluster/rebalance-plan"];
 
 /// Map an `/api/*` request path (already query-stripped) to the tier a GET of it
 /// requires. Equivalent to `route_tier_for_method("GET", path)`; kept for the
@@ -438,6 +441,12 @@ mod tests {
             );
         }
         assert_eq!(route_tier_for_method("GET", "/api/acl"), Tier::Admin);
+        // The rebalance dry-run plan (#361) is a read, but a privileged cluster-management
+        // action, so it sits at the admin bar even as a GET.
+        assert_eq!(
+            route_tier_for_method("GET", "/api/cluster/rebalance-plan"),
+            Tier::Admin
+        );
         // A HEAD is treated like a GET for the tier.
         assert_eq!(
             route_tier_for_method("HEAD", "/api/config"),

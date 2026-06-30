@@ -1174,6 +1174,16 @@ const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/api/cluster/rebalance-plan": {
+      "get": {
+        "summary": "Cluster rebalance DRY-RUN plan: per-node current vs balanced target slots + signed move (ADMIN, read-only). #361 over engine CLUSTER REBALANCE DRYRUN.",
+        "responses": {
+          "200": { "description": "The per-node plan + rollup (dry_run is always true; the engine refuses APPLY).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RebalancePlanResponse" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "Node error, cluster support disabled, or an unexpected reply.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/acl": {
       "get": {
         "summary": "ACL WHOAMI + LIST + CAT (ADMIN: the full user/permission set).",
@@ -1504,6 +1514,27 @@ const OPENAPI_JSON: &str = r##"{
           "ok": { "type": "boolean" },
           "command": { "type": "string" },
           "reply": { "$ref": "#/components/schemas/RenderedReply" }
+        }
+      },
+      "RebalancePlanResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "dry_run": { "type": "boolean" },
+          "balanced": { "type": "boolean" },
+          "total_slots_to_move": { "type": "integer", "format": "int64" },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "node": { "type": "string" },
+                "current_slots": { "type": "integer", "format": "int64" },
+                "target_slots": { "type": "integer", "format": "int64" },
+                "slots_to_move": { "type": "integer", "format": "int64" }
+              }
+            }
+          }
         }
       },
       "ChannelsResponse": {
@@ -1870,6 +1901,7 @@ mod tests {
             "/api/acl/user/{name}",
             "/api/persistence",
             "/api/persistence/save",
+            "/api/cluster/rebalance-plan",
         ] {
             assert!(paths.contains_key(p), "openapi missing path {p}");
         }
