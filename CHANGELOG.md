@@ -151,6 +151,15 @@ release.
 
 ### Added
 
+- Console multi-seed poll failover (issue #354): the node poll loop now tries the
+  configured seeds IN ORDER each tick and publishes the first one that yields a
+  reachable node, instead of only ever polling `seeds.first()`. It short-circuits
+  (a healthy first seed still costs exactly one acquire), and if every seed is
+  unreachable it keeps the last attempt's degraded view so the UI still shows an
+  error topology and `/readyz` stays not-ready. The publish policy is a pure,
+  unit-tested `pick_published_seed` (first reachable, else last, `None` only with no
+  seeds), which the loop calls so behaviour and spec cannot drift. A single-seed
+  deployment is unchanged. The staleness banner and migration-aware refresh remain.
 - Console rebalance-plan SPA panel (issue #361, the UI over the #445 endpoint):
   the Cluster view now carries an admin "Rebalance plan" card with a "Load plan"
   button that fetches `GET /api/cluster/rebalance-plan` and renders the per-node

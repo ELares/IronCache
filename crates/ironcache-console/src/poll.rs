@@ -3,8 +3,10 @@
 //! node into a [`Topology`], publish it to a shared holder, record the
 //! success/failure self-metric, and flip readiness on the FIRST success.
 //!
-//! The MVP polls ONE node (the first configured seed); cluster discovery across
-//! all seeds lands later. A poll is a SUCCESS when the assembled topology has at
+//! Multi-seed failover (#354): each tick tries the configured seeds IN ORDER and
+//! publishes the FIRST one that yields a reachable node (short-circuiting, so a
+//! healthy first seed costs one acquire); if every seed is down, the LAST attempt's
+//! degraded view is kept. A poll is a SUCCESS when the assembled topology has at
 //! least one reachable node; an all-unreachable topology is a FAILURE (the
 //! failure counter advances and `/readyz` stays not-ready) yet is still published
 //! so the REST/UI layers can show the degraded view with its error strings.
@@ -116,7 +118,13 @@ pub async fn run_poll_loop<C: Clock>(
     }
 
     loop {
-        if let Some(seed) = cfg.seeds.first() {
+        // Multi-seed failover (#354): try the configured seeds IN ORDER, stopping at the
+        // first reachable one (short-circuit, so a healthy first seed costs exactly one
+        // acquire), then let [`pick_published_seed`] choose which attempt to publish (the
+        // first reachable, or the last attempt if every seed is down so a degraded view
+        // still shows). A single-seed config behaves as before.
+        let mut attempts: Vec<(Topology, &str)> = Vec::new();
+        for seed in &cfg.seeds {
             let snapshot = acquire_node(
                 clock.as_ref(),
                 seed,
@@ -126,7 +134,20 @@ pub async fn run_poll_loop<C: Clock>(
                 op_timeout,
             )
             .await;
-            let mut topology = single_node_topology(clock.as_ref(), snapshot);
+            let topology = single_node_topology(clock.as_ref(), snapshot);
+            let reachable = topology.any_reachable();
+            attempts.push((topology, seed));
+            if reachable {
+                break;
+            }
+            tracing::warn!(
+                seed = %seed,
+                "console poll: seed node unreachable; trying the next seed"
+            );
+        }
+        let flags: Vec<bool> = attempts.iter().map(|(t, _)| t.any_reachable()).collect();
+        let chosen = pick_published_seed(&flags).and_then(|idx| attempts.into_iter().nth(idx));
+        if let Some((mut topology, seed)) = chosen {
             // Cluster topology discovery (#354): when the seed's HTTP admin URL is configured, fetch
             // the structured `/topology` (#365) and fold the membership/slots/epoch/raft view in.
             // BEST-EFFORT: a fetch/parse miss leaves `cluster: None` and never affects node
@@ -169,11 +190,30 @@ pub async fn run_poll_loop<C: Clock>(
                 tracing::debug!(seed = %seed, "console poll: node reachable; topology refreshed");
             } else {
                 metrics.record_poll_failure();
-                tracing::warn!(seed = %seed, "console poll: seed node unreachable");
+                tracing::warn!(
+                    seeds = cfg.seeds.len(),
+                    "console poll: ALL seed nodes unreachable"
+                );
             }
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+/// The seed-failover publish policy (#354): given each configured seed's reachability
+/// in seed order, which one's topology do we publish? The FIRST reachable seed, or (if
+/// none is reachable) the LAST seed, so a degraded-but-informative view is still shown.
+/// `None` only when there are no seeds. Pure, so the run-loop's short-circuit failover
+/// is checked against this spec without spinning up nodes.
+#[must_use]
+fn pick_published_seed(reachable: &[bool]) -> Option<usize> {
+    if reachable.is_empty() {
+        return None;
+    }
+    reachable
+        .iter()
+        .position(|&r| r)
+        .or(Some(reachable.len() - 1))
 }
 
 #[cfg(test)]
@@ -190,6 +230,27 @@ mod tests {
     #[test]
     fn resolve_tls_off_by_default() {
         assert!(resolve_tls(&base_cfg()).is_none());
+    }
+
+    #[test]
+    fn pick_published_seed_prefers_the_first_reachable() {
+        // No seeds -> nothing to publish.
+        assert_eq!(pick_published_seed(&[]), None);
+        // A single reachable / single degraded seed -> that one (index 0).
+        assert_eq!(pick_published_seed(&[true]), Some(0));
+        assert_eq!(pick_published_seed(&[false]), Some(0));
+        // The FIRST reachable wins even when a later seed is also up (short-circuit).
+        assert_eq!(pick_published_seed(&[true, true]), Some(0));
+        assert_eq!(pick_published_seed(&[false, true]), Some(1));
+        assert_eq!(pick_published_seed(&[false, false, true]), Some(2));
+        assert_eq!(pick_published_seed(&[false, true, true]), Some(1));
+    }
+
+    #[test]
+    fn pick_published_seed_falls_back_to_the_last_when_all_down() {
+        // All seeds unreachable -> keep the LAST attempt's degraded view.
+        assert_eq!(pick_published_seed(&[false, false]), Some(1));
+        assert_eq!(pick_published_seed(&[false, false, false]), Some(2));
     }
 
     #[test]
