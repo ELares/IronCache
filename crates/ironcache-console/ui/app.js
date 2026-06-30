@@ -874,6 +874,48 @@
     });
   }
 
+  // ----- Cluster: migrate slot (admin, destructive) ------------------------
+  // POST /api/cluster/setslot (#361): the online-migration / FLIP control. The operator
+  // entering the EXACT slot IS the confirmation; the UI echoes it as confirm.
+
+  function updateSetslotGate() {
+    var gate = byId("setslot-gate");
+    if (gate) {
+      gate.hidden = haveToken();
+    }
+  }
+
+  function applySetslot() {
+    var slotEl = byId("setslot-slot");
+    var actionEl = byId("setslot-action");
+    var nodeEl = byId("setslot-node-id");
+    var status = byId("setslot-status");
+    var slot = slotEl ? parseInt(slotEl.value, 10) : NaN;
+    var valid = slot >= 0 && slot <= 16383;
+    var action = actionEl ? actionEl.value || "" : "";
+    var nodeId = nodeEl ? (nodeEl.value || "").trim() : "";
+    if (status) {
+      status.hidden = false;
+      setText(status, "Applying slot transition...");
+    }
+    // An invalid slot is sent as null (a server 400); a valid one echoes itself as confirm.
+    var body = { slot: valid ? slot : null, action: action, confirm: valid ? String(slot) : "" };
+    if (action !== "STABLE") {
+      body.node_id = nodeId;
+    }
+    fetchMethod("POST", "/api/cluster/setslot", body).then(function (r) {
+      if (!status) {
+        return;
+      }
+      status.hidden = false;
+      if (r.status === 200) {
+        setText(status, "Slot transition applied.");
+      } else {
+        setText(status, apiError(r, "Slot transition failed."));
+      }
+    });
+  }
+
   // ----- Config -------------------------------------------------------------
   var configParams = [];
 
@@ -1732,6 +1774,7 @@
       updateRebalanceGate();
       updateFailoverGate();
       updateMembershipGates();
+      updateSetslotGate();
     } else if (section === "config") {
       loadConfig();
     } else if (section === "keyspace") {
@@ -2116,6 +2159,7 @@
     wireClick("failover-trigger", triggerFailover);
     wireClick("meet-add", addNode);
     wireClick("forget-remove", removeNode);
+    wireClick("setslot-apply", applySetslot);
 
     // Config: filter + apply (per-row Apply wired in configRow).
     var configFilter = byId("config-filter");
