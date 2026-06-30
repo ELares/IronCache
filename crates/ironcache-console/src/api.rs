@@ -191,6 +191,9 @@ struct ClusterTopologySummary {
     slot_owners: usize,
     /// The raft consensus snapshot, `None` outside raft-governance mode.
     raft: Option<RaftSummary>,
+    /// The replication-topology rollup (#357): the polled node's role + its replicas/master + lag,
+    /// and the count of in-flight slot migrations.
+    replication: ReplicationSummary,
 }
 
 /// The raft consensus rollup for the cluster overview (mirrors the `/topology` raft object).
@@ -201,6 +204,47 @@ struct RaftSummary {
     term: u64,
     commit_index: u64,
     voters: u64,
+}
+
+/// The replication-topology rollup for the cluster overview (#357): the polled node's role plus its
+/// view of replication (a master's connected replicas + their lag, or a replica's master endpoint),
+/// and the count of slots actively migrating in/out of it. This is the cache-specific replication
+/// picture Grafana cannot express; it became real once the engine reported per-replica endpoints/lag
+/// and N replicas (#365) and the console parsed them (#354). It is the POLLED NODE's authoritative
+/// view (a node knows its own replicas, not other nodes' replica sets); cross-node fan-out is a
+/// multi-seed follow-up, not this rollup.
+#[derive(Debug, Clone, Serialize)]
+struct ReplicationSummary {
+    /// `master` or `replica`.
+    role: String,
+    /// MASTER side: one entry per connected replica, with its resolved endpoint + offset + lag.
+    replicas: Vec<ReplicaSummary>,
+    /// MASTER side: `replicas.len()`, surfaced directly so a dashboard need not count the array.
+    connected_replicas: usize,
+    /// MASTER side: the WORST lag across the connected replicas (the replication-health headline an
+    /// operator watches), or `None` when there are no replicas.
+    max_replica_lag: Option<u64>,
+    /// REPLICA side: the master's advertised host, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    master_host: Option<String>,
+    /// REPLICA side: the master's advertised port, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    master_port: Option<u16>,
+    /// REPLICA side: the replication link state (`up` / `down` / ...), when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    master_link: Option<String>,
+    /// The number of slots actively migrating in/out of this node (the migration-progress headline,
+    /// #357/#354). `0` in steady state.
+    migrations_in_progress: usize,
+}
+
+/// One connected replica in the [`ReplicationSummary`] (mirrors the `/topology` replica object).
+#[derive(Debug, Clone, Serialize)]
+struct ReplicaSummary {
+    host: String,
+    port: u16,
+    offset: u64,
+    lag: u64,
 }
 
 /// Aggregate numbers across the reachable nodes (the cluster-wide totals the
@@ -479,6 +523,36 @@ fn topology_summary(ct: &crate::cluster::ClusterTopology) -> ClusterTopologySumm
             commit_index: r.commit_index,
             voters: r.voters,
         }),
+        replication: replication_summary(ct),
+    }
+}
+
+/// Roll the polled node's replication view up into the [`ReplicationSummary`] (#357): its role, the
+/// connected replicas with their lag (worst-case surfaced), the master endpoint for a replica, and
+/// the count of in-flight slot migrations. Pure: reads the parsed topology, allocates the small
+/// summary.
+fn replication_summary(ct: &crate::cluster::ClusterTopology) -> ReplicationSummary {
+    let repl = &ct.replication;
+    let replicas: Vec<ReplicaSummary> = repl
+        .replicas
+        .iter()
+        .map(|r| ReplicaSummary {
+            host: r.host.clone(),
+            port: r.port,
+            offset: r.offset,
+            lag: r.lag,
+        })
+        .collect();
+    let max_replica_lag = replicas.iter().map(|r| r.lag).max();
+    ReplicationSummary {
+        role: repl.role.clone(),
+        connected_replicas: replicas.len(),
+        max_replica_lag,
+        replicas,
+        master_host: repl.master_host.clone(),
+        master_port: repl.master_port,
+        master_link: repl.master_link.clone(),
+        migrations_in_progress: ct.cluster.migrations.len(),
     }
 }
 
@@ -1826,8 +1900,8 @@ mod tests {
     #[test]
     fn cluster_overview_includes_the_discovered_topology_summary() {
         use crate::cluster::{
-            ClusterTopology, TopoClusterView, TopoMember, TopoNode, TopoRaft, TopoReplication,
-            TopoSlotRange,
+            ClusterTopology, TopoClusterView, TopoMember, TopoMigration, TopoNode, TopoRaft,
+            TopoReplica, TopoReplication, TopoSlotRange,
         };
         let mut t = topo();
         // Attach a discovered 2-node raft topology with the slot space split between the owners.
@@ -1867,7 +1941,14 @@ mod tests {
                         owner_id: Some("n2".into()),
                     },
                 ],
-                migrations: vec![],
+                // Slot 42 is migrating out toward n2 (still owned by n1 in `slots` until it commits).
+                migrations: vec![TopoMigration {
+                    slot: 42,
+                    state: "migrating".into(),
+                    peer_id: Some("n2".into()),
+                    peer_host: Some("10.0.0.2".into()),
+                    peer_port: Some(7000),
+                }],
             },
             raft: Some(TopoRaft {
                 is_leader: true,
@@ -1876,12 +1957,26 @@ mod tests {
                 commit_index: 42,
                 voters: 3,
             }),
+            // This node is a master with two connected replicas at different lags.
             replication: TopoReplication {
                 role: "master".into(),
                 master_host: None,
                 master_port: None,
                 master_link: None,
-                replicas: vec![],
+                replicas: vec![
+                    TopoReplica {
+                        host: "10.0.0.2".into(),
+                        port: 7000,
+                        offset: 1000,
+                        lag: 0,
+                    },
+                    TopoReplica {
+                        host: "10.0.0.3".into(),
+                        port: 7000,
+                        offset: 950,
+                        lag: 50,
+                    },
+                ],
             },
         });
         let resp = handle("/api/cluster", Some(&t), &ctx());
@@ -1897,6 +1992,77 @@ mod tests {
         assert_eq!(ct["raft"]["is_leader"], true);
         assert_eq!(ct["raft"]["term"], 3);
         assert_eq!(ct["raft"]["voters"], 3);
+        // The replication rollup (#357): role + the two replicas, worst-case lag, and the in-flight
+        // migration count.
+        let repl = &ct["replication"];
+        assert_eq!(repl["role"], "master");
+        assert_eq!(repl["connected_replicas"], 2);
+        assert_eq!(repl["max_replica_lag"], 50);
+        assert_eq!(repl["replicas"][0]["host"], "10.0.0.2");
+        assert_eq!(repl["replicas"][1]["lag"], 50);
+        assert_eq!(repl["migrations_in_progress"], 1);
+        // A master omits the replica-side master endpoint fields entirely.
+        assert!(repl["master_host"].is_null());
+    }
+
+    #[test]
+    fn cluster_overview_replication_rollup_reports_the_replica_side() {
+        use crate::cluster::{
+            ClusterTopology, TopoClusterView, TopoMember, TopoNode, TopoRaft, TopoReplication,
+            TopoSlotRange,
+        };
+        let mut t = topo();
+        // This node is a REPLICA: it reports its master endpoint + link, no replicas of its own,
+        // and no migrations.
+        t.cluster = Some(ClusterTopology {
+            schema_version: 1,
+            node: TopoNode {
+                id: "r1".into(),
+                engine_version: "v".into(),
+                tcp_port: 7001,
+                shards: 1,
+            },
+            cluster: TopoClusterView {
+                mode: "raft".into(),
+                enabled: true,
+                committed_epoch: 9,
+                members: vec![TopoMember {
+                    id: "n1".into(),
+                    host: "10.0.0.1".into(),
+                    port: 7000,
+                }],
+                slots: vec![TopoSlotRange {
+                    start: 0,
+                    end: 16383,
+                    owner_id: Some("n1".into()),
+                }],
+                migrations: vec![],
+            },
+            raft: Some(TopoRaft {
+                is_leader: false,
+                leader_id: Some(1),
+                term: 3,
+                commit_index: 42,
+                voters: 3,
+            }),
+            replication: TopoReplication {
+                role: "replica".into(),
+                master_host: Some("10.0.0.1".into()),
+                master_port: Some(7000),
+                master_link: Some("up".into()),
+                replicas: vec![],
+            },
+        });
+        let v = parse(&handle("/api/cluster", Some(&t), &ctx()));
+        let repl = &v["cluster_topology"]["replication"];
+        assert_eq!(repl["role"], "replica");
+        assert_eq!(repl["connected_replicas"], 0);
+        // No replicas -> no worst-case lag.
+        assert!(repl["max_replica_lag"].is_null());
+        assert_eq!(repl["master_host"], "10.0.0.1");
+        assert_eq!(repl["master_port"], 7000);
+        assert_eq!(repl["master_link"], "up");
+        assert_eq!(repl["migrations_in_progress"], 0);
     }
 
     #[test]
