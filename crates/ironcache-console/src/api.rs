@@ -451,8 +451,10 @@ fn topology_summary(ct: &crate::cluster::ClusterTopology) -> ClusterTopologySumm
     let mut owners: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for range in &ct.cluster.slots {
         if let Some(owner) = &range.owner_id {
-            // An inclusive `[start, end]` range covers `end - start + 1` slots.
-            slots_assigned = slots_assigned.saturating_add(u32::from(range.end - range.start) + 1);
+            // An inclusive `[start, end]` range covers `end - start + 1` slots. `saturating_sub`
+            // guards a malformed (end < start) range in the parsed JSON from underflow-panicking.
+            slots_assigned =
+                slots_assigned.saturating_add(u32::from(range.end.saturating_sub(range.start)) + 1);
             owners.insert(owner.as_str());
         }
     }
