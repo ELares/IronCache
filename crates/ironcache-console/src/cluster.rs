@@ -13,8 +13,8 @@
 //! the engine's COMMITTED epoch (`committed_epoch`), the IronCache fence against two owners per slot.
 //!
 //! Unknown JSON fields are TOLERATED (the document carries a `schema_version`), so a newer engine
-//! that adds fields, e.g. the per-replica endpoint/lag fidelity that is #365's follow-up, does not
-//! break an older console; the console upgrades its parser when it wants the new fields.
+//! that adds fields (e.g. a future cross-node replica rollup in `CLUSTER SHARDS`) does not break an
+//! older console; the console upgrades its parser when it wants the new fields.
 
 use std::time::Duration;
 
@@ -30,7 +30,8 @@ pub struct ClusterTopology {
     pub cluster: TopoClusterView,
     /// The raft consensus state, `None` outside raft-governance mode.
     pub raft: Option<TopoRaft>,
-    /// The node's replication role (first cut: role only; per-replica fidelity is #365's follow-up).
+    /// The node's replication role plus the per-replica/master fidelity (#365): role, the master's
+    /// connected replicas with endpoint + offset + lag, or a replica's master endpoint + link.
     pub replication: TopoReplication,
 }
 
@@ -549,6 +550,74 @@ mod tests {
             !slot_ranges_are_disjoint(&t.cluster.slots),
             "the overlap (slot 8192 owned twice) must be detectable"
         );
+    }
+
+    // Slot 4096 is MIGRATING from aaa toward bbb at epoch 7: the COMMITTED slot map is unchanged
+    // (aaa still owns the whole [0, 8191] band until the move commits), and the `migrations` array
+    // signals the in-flight move. So the view is coherent (disjoint) AND a migration is detectable.
+    const FRAME_MIGRATING_EPOCH7: &str = r#"{"schema_version":1,
+        "node":{"id":"aaa","engine_version":"2026.6.29","tcp_port":7000,"shards":4},
+        "cluster":{"mode":"raft","enabled":true,"committed_epoch":7,
+            "members":[{"id":"aaa","host":"10.0.0.1","port":7000},{"id":"bbb","host":"10.0.0.2","port":7001}],
+            "slots":[{"start":0,"end":8191,"owner_id":"aaa"},{"start":8192,"end":16383,"owner_id":"bbb"}],
+            "migrations":[{"slot":4096,"state":"migrating","peer_id":"bbb","peer_host":"10.0.0.2","peer_port":7001}]},
+        "raft":{"is_leader":true,"leader_id":1,"term":3,"commit_index":50,"voters":3},
+        "replication":{"role":"master"}}"#;
+
+    #[tokio::test]
+    async fn a_slot_migration_is_detected_and_stays_coherent_through_to_commit() {
+        // The #368 slot-migration scenario (now expressible via the engine `migrations` array #462 +
+        // the console parser #354): stable -> mid-migration -> committed remap. Across the whole
+        // sequence the slot map stays coherent and the epoch never regresses; the migration flag
+        // tracks false -> true -> false as the move starts and commits.
+        let frames: [(&str, &str, bool); 3] = [
+            ("stable-epoch7", FRAME_TWO_NODE_EPOCH7, false),
+            ("migrating-epoch7", FRAME_MIGRATING_EPOCH7, true),
+            ("committed-epoch8", FRAME_TWO_NODE_EPOCH8_REMAP, false),
+        ];
+        let mut last_epoch = 0u64;
+        let mut saw_migration = false;
+        for (name, body, want_migrating) in frames {
+            let (base, server) = stub_topology_server(200, body).await;
+            let t = fetch_cluster_topology(&base, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|e| panic!("frame {name} should fetch: {e}"));
+            server.abort();
+            // INVARIANT: the view is coherent even MID-migration (the source still owns the slot
+            // until the move commits, so there is never a split-ownership window).
+            assert!(
+                slot_ranges_are_disjoint(&t.cluster.slots),
+                "frame {name}: a migration must not produce a split-ownership slot map"
+            );
+            // INVARIANT: the committed epoch never regresses across the resharding.
+            assert!(
+                t.cluster.committed_epoch >= last_epoch,
+                "frame {name}: committed epoch regressed {last_epoch} -> {}",
+                t.cluster.committed_epoch
+            );
+            last_epoch = t.cluster.committed_epoch;
+            // The console detects the in-flight migration exactly when one is reported.
+            assert_eq!(
+                t.migration_in_progress(),
+                want_migrating,
+                "frame {name}: migration_in_progress should be {want_migrating}"
+            );
+            if t.migration_in_progress() {
+                saw_migration = true;
+                // The migrating slot carries its resolved peer so the console can target the move.
+                let m = &t.cluster.migrations[0];
+                assert_eq!(m.slot, 4096);
+                assert_eq!(m.state, "migrating");
+                assert_eq!(m.peer_id.as_deref(), Some("bbb"));
+                assert_eq!(m.peer_port, Some(7001));
+            }
+        }
+        // The sequence really did pass THROUGH an in-flight migration and out the other side.
+        assert!(
+            saw_migration,
+            "the sequence exercised an in-flight migration"
+        );
+        assert_eq!(last_epoch, 8, "the resharding committed at epoch 8");
     }
 
     #[tokio::test]

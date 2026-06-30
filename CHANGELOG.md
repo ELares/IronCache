@@ -151,6 +151,15 @@ release.
 
 ### Added
 
+- Console topology-churn harness now covers the slot-migration scenario (issue #368): a
+  deterministic stable -> mid-migration -> committed-remap sequence over stub `/topology` servers
+  asserts the console DETECTS an in-flight migration (`migration_in_progress` tracks
+  false -> true -> false), the slot map stays coherent THROUGH the migration (the source still owns
+  the slot until the move commits, so there is never a split-ownership window), the committed epoch
+  never regresses, and the migrating slot carries its resolved peer. This was the one acceptance
+  scenario the harness could not express until the engine reported migrations (#462) and the parser
+  read them (#354); leader-change, epoch-bump, and node-down (graceful degradation) were already
+  covered, so #368's churn matrix is now complete (and still does not depend on `ironcache-sim`).
 - Console cluster overview now rolls up the replication topology (issue #357): the `/api/cluster`
   `cluster_topology` object gained a `replication` summary derived from the polled node's parsed
   `/topology` view (#354) -- `role`, one `{host, port, offset, lag}` entry per connected replica
