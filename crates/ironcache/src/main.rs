@@ -219,6 +219,7 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
             Arc::new(move || runtime.maxmemory()),
             handles.raft.clone(),
             handles.persist.clone(),
+            handles.topology.clone(),
         );
         metrics_http::spawn_metrics_server(metrics_addr, state)
             .context("starting the metrics endpoint")?;

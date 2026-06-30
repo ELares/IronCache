@@ -151,6 +151,18 @@ release.
 
 ### Added
 
+- Structured topology read endpoint `GET /topology` (issue #365, core): a versioned
+  JSON document on the admin HTTP listener (alongside `/metrics` `/livez` `/readyz`)
+  the console reads authoritative topology from (node identity + engine version,
+  `cluster_mode`/`enabled`, membership, slot-to-owner map, committed epoch, and raft
+  leader/term/commit/voters) WITHOUT parsing human-readable `CLUSTER NODES`/`SHARDS`
+  text. It returns a COHERENT single-node answer in standalone mode (the node owns
+  all 16384 slots at epoch 0 with itself as the only member), never an error, so the
+  `cluster_enabled=false` production deployment still has a real topology read path.
+  Read-only by construction (it only reads the live `SlotMap`/`RaftHandle` snapshots)
+  and JSON is hand-rolled (no new dependency). The per-replica endpoint/offset/lag
+  fidelity (#365 parts 3-4, which need the replication handshake + lag-model changes)
+  is the documented follow-up; the `replication` object reports the node role for now.
 - Per-shard `/metrics` labels (issue #362, the additive engine change for the
   console): the `/metrics` scrape now carries an `ironcache_shard_<name>{shard="i"}`
   series for every counter/gauge with per-shard (thread-per-core) meaning

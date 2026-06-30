@@ -53,6 +53,7 @@ pub fn run_server_with_metrics_for_test(port: u16, shards: usize, metrics_port: 
         Arc::new(move || runtime.maxmemory()),
         handles.raft.clone(),
         handles.persist.clone(),
+        handles.topology.clone(),
     );
     let addr = format!("127.0.0.1:{metrics_port}");
     metrics_http::spawn_metrics_server(&addr, state).expect("metrics endpoint failed to bind");

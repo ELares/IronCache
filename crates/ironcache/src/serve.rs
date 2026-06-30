@@ -188,6 +188,9 @@ pub struct BootHandles {
     pub persist: Option<Arc<crate::persist::PersistState>>,
     /// The process-wide runtime-config overlay (for the live `maxmemory` gauge).
     pub runtime: Arc<ironcache_config::RuntimeConfig>,
+    /// The structured-topology read state (#365): node identity + the (optional) cluster slot map,
+    /// for the `/topology` admin endpoint. Coherent in standalone mode (no cluster map).
+    pub topology: crate::topology::TopologyHandle,
 }
 
 /// Boot the server like [`run_server`], but thread an optional [`MetricsRegistry`] through every
@@ -741,11 +744,23 @@ pub fn run_server_observed(
         ironcache_runtime::bootstrap::run_shards(&shard_cfg, serve, rxs, drain)?
     };
 
+    // The structured-topology read state (#365), captured from the finalized cluster map + node
+    // identity (raft_mode read before `raft` is moved into the handles below).
+    let topology = crate::topology::TopologyHandle {
+        node_id: cluster_node_id,
+        cluster_enabled: config.cluster_enabled,
+        raft_mode: raft.is_some(),
+        tcp_port: config.port,
+        shards: config.shards,
+        cluster: cluster.clone(),
+    };
+
     Ok(BootHandles {
         set,
         raft,
         persist: persist_handle,
         runtime: runtime_handle,
+        topology,
     })
 }
 
