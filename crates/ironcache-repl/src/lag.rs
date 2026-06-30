@@ -319,6 +319,11 @@ pub struct ReplNodeStatus {
     /// PRIMARY: the attached replica's last-acked offset (raw `u64`); meaningful when
     /// `connected_slaves > 0`.
     slave_offset: AtomicU64,
+    /// PRIMARY: the attached replica's advertised `NodeId` (from its `REPLCONF`, #365 stage 2);
+    /// meaningful when `connected_slaves > 0`. `0` until a (plain, non-import) replica attaches.
+    /// INFO resolves it to the replica's real endpoint via the slot-map reverse lookup. A lock-free
+    /// `AtomicU64` like the offsets, set by the per-replica serve task (the single writer).
+    slave_id: AtomicU64,
     /// REPLICA: the link to the master tag ([`LinkStatus`]). Default 0 = down (not attached).
     master_link: AtomicU8,
     /// REPLICA: the master's head offset as last observed on the link (raw `u64`), for the
@@ -339,6 +344,7 @@ impl Default for ReplNodeStatus {
             node_offset: AtomicU64::new(0),
             connected_slaves: AtomicU64::new(0),
             slave_offset: AtomicU64::new(0),
+            slave_id: AtomicU64::new(0),
             master_link: AtomicU8::new(LINK_DOWN),
             master_offset: AtomicU64::new(0),
             master_endpoint: std::sync::Mutex::new(None),
@@ -372,10 +378,20 @@ impl ReplNodeStatus {
         Self::store_monotonic(&self.slave_offset, acked.0);
     }
 
+    /// Publish the connected replica's advertised `NodeId` (PRIMARY side, #365 stage 2), from its
+    /// `REPLCONF` handshake. Paired with [`Self::set_replica_connected`] at a PLAIN attach (not a
+    /// scoped import) so INFO can resolve the replica's real endpoint via the slot-map. Lock-free,
+    /// like the offset publishers.
+    pub fn set_replica_id(&self, node_id: u64) {
+        self.slave_id.store(node_id, Ordering::Relaxed);
+    }
+
     /// Publish that the (single) connected replica went away (PRIMARY side): `connected_slaves`
-    /// drops to 0. The replica's last offset is left as-is (it is only read when connected).
+    /// drops to 0 and its advertised id is cleared. The replica's last offset is left as-is (it is
+    /// only read when connected).
     pub fn set_replica_disconnected(&self) {
         self.connected_slaves.store(0, Ordering::Relaxed);
+        self.slave_id.store(0, Ordering::Relaxed);
     }
 
     // --- REPLICA-side publishers (the control/tail task is the single writer) ---
@@ -426,6 +442,7 @@ impl ReplNodeStatus {
             node_offset: ReplOffset(self.node_offset.load(Ordering::Relaxed)),
             connected_slaves: self.connected_slaves.load(Ordering::Relaxed),
             slave_offset: ReplOffset(self.slave_offset.load(Ordering::Relaxed)),
+            slave_id: self.slave_id.load(Ordering::Relaxed),
             master_link: LinkStatus::from_tag(self.master_link.load(Ordering::Relaxed)),
             master_offset: ReplOffset(self.master_offset.load(Ordering::Relaxed)),
             master_endpoint,
@@ -479,6 +496,9 @@ pub struct ReplStatusSnapshot {
     pub connected_slaves: u64,
     /// PRIMARY: the connected replica's last-acked offset (meaningful when `connected_slaves > 0`).
     pub slave_offset: ReplOffset,
+    /// PRIMARY: the connected replica's advertised `NodeId` (raw `u64`, #365 stage 2; meaningful
+    /// when `connected_slaves > 0`). `0` for an import or a pre-stage-1 replica.
+    pub slave_id: u64,
     /// REPLICA: the link to the master.
     pub master_link: LinkStatus,
     /// REPLICA: the master's head offset as last observed on the link (for the replica's lag).
@@ -581,19 +601,26 @@ mod tests {
         let status = ReplNodeStatus::new();
         status.set_master_head(ReplOffset(100));
         status.set_replica_connected(ReplOffset(95));
+        // #365 stage 2: the primary also records the replica's advertised NodeId at attach.
+        status.set_replica_id(0xABCD);
         let s = status.snapshot();
         assert_eq!(s.role, ReplRole::Master);
         assert_eq!(s.node_offset, ReplOffset(100));
         assert_eq!(s.connected_slaves, 1);
         assert_eq!(s.slave_offset, ReplOffset(95));
+        assert_eq!(
+            s.slave_id, 0xABCD,
+            "the connected replica's advertised id is captured"
+        );
         // The master's view of its replica's lag: 100 - 95 = 5.
         assert_eq!(s.slave_lag().and_then(ReplicaLag::lag), Some(5));
 
-        // The replica disconnects: connected_slaves drops, no slave lag.
+        // The replica disconnects: connected_slaves drops, no slave lag, and the id is cleared.
         status.set_replica_disconnected();
         let s = status.snapshot();
         assert_eq!(s.connected_slaves, 0);
         assert_eq!(s.slave_lag(), None);
+        assert_eq!(s.slave_id, 0, "the advertised id is cleared on disconnect");
     }
 
     #[test]
