@@ -151,6 +151,20 @@ release.
 
 ### Added
 
+- Multi-replica status model (issue #365, the N-replica structural piece): the primary's
+  replication status cell tracked ONE replica (single `connected_slaves`/`slave_offset`/
+  `slave_id` atomics), so when the transport served two replicas concurrently (one task
+  each) they CLOBBERED each other to one. The cell now holds a per-`NodeId` list of
+  `ReplicaState { node_id, acked }` behind the same cold-path lock as `master_endpoint`;
+  each replica's serve task UPSERTs its own entry at attach + ack (monotonic) and removes
+  it on disconnect, so N replicas are tracked independently. `INFO # Replication`,
+  `/topology`, and `connected_slaves` now render one `slaveN:` line per real replica with
+  its own resolved endpoint + offset + lag, instead of one clobbered line. Scoped HA-6
+  imports are no longer counted as connected replicas (more correct). DATA-SAFETY: the
+  list is REPORTING-only; the ADR-0026 in-sync quorum is the separate `InSyncReplicas`
+  counter, untouched, and the full-sync/resume decision is unchanged. The lock is taken
+  only on the repl cadence + the rare INFO/topology read, off the data hot path (no
+  `bytes_per_key`/qps impact).
 - The structured `/topology` read now reports real replication (issue #365, extending
   stages 1-3 to the console-facing surface): the `replication` object was a hardcoded
   `{"role":"master"}` and is now built from the live status cell, threaded into
