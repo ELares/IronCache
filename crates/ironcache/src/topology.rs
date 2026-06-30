@@ -14,11 +14,12 @@
 //! posture); the shape is small, fixed, and read-only by construction (it only reads the live
 //! `SlotMap` / `RaftHandle` snapshots, mutating nothing).
 //!
-//! SCOPE (first cut, the primary #365 acceptance): node identity + `cluster_mode`/`enabled` +
-//! membership + slot-to-owner + committed epoch + raft state, in BOTH static and raft modes. The
-//! per-replica endpoint/offset/lag fidelity (#365 parts 3-4) needs the replication handshake +
-//! lag-model changes and is the documented follow-up; the `replication` object here reports the node
-//! role only.
+//! SCOPE: node identity + `cluster_mode`/`enabled` + membership + slot-to-owner + committed epoch +
+//! raft state, in BOTH static and raft modes. The `replication` object reports the node role plus
+//! this node's view of replication (#365 stages 1-3, REPL_FIDELITY.md): a REPLICA carries its master
+//! endpoint + link; a MASTER carries its connected replica's RESOLVED endpoint + offset + lag (0 or 1
+//! in the single-replica model today). The cross-node replica state in CLUSTER SHARDS and the
+//! N-replica model are the remaining #365 follow-ups.
 
 use std::sync::Arc;
 
@@ -44,6 +45,10 @@ pub struct TopologyHandle {
     /// The slot-ownership map, `Some` only when a cluster topology is configured; `None` is
     /// standalone, where a coherent single-node answer is synthesized.
     pub cluster: Option<Arc<ironcache_cluster::SlotMap>>,
+    /// The live node-level replication status cell (`Some` in raft-governance mode). Snapshotted at
+    /// render time for the real `replication` object (role + per-replica/master endpoint, #365);
+    /// `None` renders the standalone `role:master` default.
+    pub repl_status: Option<Arc<ironcache_server::ReplNodeStatus>>,
 }
 
 impl TopologyHandle {
@@ -58,6 +63,7 @@ impl TopologyHandle {
             tcp_port,
             shards,
             cluster: None,
+            repl_status: None,
         }
     }
 }
@@ -180,10 +186,71 @@ pub fn render_topology_json(handle: &TopologyHandle, raft: Option<&RaftHandle>) 
         o.push_str("null");
     }
 
-    // replication: first cut reports the node role only; per-replica endpoint/offset/lag is the
-    // documented #365 follow-up (parts 3-4 need the replication handshake + lag-model changes).
-    o.push_str(",\"replication\":{\"role\":\"master\"}}");
+    // replication (#365): the real role, plus the master endpoint/link for a replica or the
+    // connected replica's resolved endpoint/offset/lag for a master. Standalone (no status cell)
+    // keeps the byte-compatible `{"role":"master"}`.
+    o.push_str(",\"replication\":");
+    render_replication(&mut o, handle);
+    o.push('}'); // close the top-level topology object.
     o
+}
+
+/// Render the `replication` object (#365). With no status cell (standalone) it is the
+/// byte-compatible `{"role":"master"}`. A REPLICA reports its master endpoint + link; a MASTER
+/// reports its connected replicas (0 or 1 in the single-replica model today) with each replica's
+/// resolved endpoint + offset + lag. Pure: reads the status snapshot + the slot map, mutates nothing.
+fn render_replication(o: &mut String, h: &TopologyHandle) {
+    use core::fmt::Write as _;
+    let Some(status) = h.repl_status.as_ref() else {
+        o.push_str("{\"role\":\"master\"}");
+        return;
+    };
+    let snap = status.snapshot();
+    match snap.role {
+        ironcache_repl::ReplRole::Replica => {
+            o.push_str("{\"role\":\"replica\"");
+            if let Some((host, port)) = &snap.master_endpoint {
+                o.push_str(",\"master_host\":");
+                json_str(o, host);
+                let _ = write!(o, ",\"master_port\":{port}");
+            }
+            let _ = write!(o, ",\"master_link\":\"{}\"}}", snap.master_link.as_str());
+        }
+        ironcache_repl::ReplRole::Master => {
+            o.push_str("{\"role\":\"master\",\"replicas\":[");
+            if snap.connected_slaves > 0 {
+                let lag = snap
+                    .slave_lag()
+                    .and_then(ironcache_repl::ReplicaLag::lag)
+                    .unwrap_or(0);
+                let (host, port) =
+                    resolve_replica_endpoint(h, snap.slave_id).unwrap_or((String::new(), 0));
+                o.push_str("{\"host\":");
+                json_str(o, &host);
+                let _ = write!(
+                    o,
+                    ",\"port\":{},\"offset\":{},\"lag\":{}}}",
+                    port, snap.slave_offset.0, lag
+                );
+            }
+            o.push_str("]}");
+        }
+    }
+}
+
+/// Resolve a connected replica's endpoint from its captured `NodeId` via the slot map (#365): find
+/// the member whose announce id derives to the `NodeId` (`node_id_from_announce`, the same reverse
+/// lookup `dispatch.rs` uses for INFO). `None` when the id is unset (`0`), there is no cluster, or no
+/// member matches. O(members) on the rare `/topology` read.
+fn resolve_replica_endpoint(h: &TopologyHandle, slave_id: u64) -> Option<(String, u16)> {
+    if slave_id == 0 {
+        return None;
+    }
+    let map = h.cluster.as_ref()?;
+    map.nodes().into_iter().find_map(|n| {
+        (crate::raft_boot::node_id_from_announce(&n.id).0 == slave_id)
+            .then(|| (n.host.to_string(), n.port))
+    })
 }
 
 #[cfg(test)]
@@ -222,6 +289,106 @@ mod tests {
         );
     }
 
+    /// #365: a MASTER with a connected replica reports the replica's REAL resolved endpoint +
+    /// offset + lag in the `replication.replicas` array (not a placeholder).
+    #[test]
+    fn topology_replication_resolves_a_connected_replica() {
+        let replica_id = "aaaaaaaaaaaaaaaa000000000000000000000000";
+        let node_id = crate::raft_boot::node_id_from_announce(replica_id).0;
+        let self_id = "1111111111111111111111111111111111111111";
+        let map = ironcache_cluster::SlotMap::build(
+            vec![
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: self_id.into(),
+                        host: "10.0.0.1".into(),
+                        port: 7001,
+                    },
+                    vec![[0, 16383]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: replica_id.into(),
+                        host: "10.0.0.5".into(),
+                        port: 7005,
+                    },
+                    vec![],
+                ),
+            ],
+            self_id,
+        )
+        .unwrap();
+        let status = Arc::new(ironcache_server::ReplNodeStatus::new());
+        status.set_master_head(ironcache_repl::ReplOffset(200));
+        status.set_replica_connected(ironcache_repl::ReplOffset(190)); // lag 10
+        status.set_replica_id(node_id);
+        let h = TopologyHandle {
+            node_id: self_id,
+            cluster_enabled: true,
+            raft_mode: false,
+            tcp_port: 7001,
+            shards: 1,
+            cluster: Some(Arc::new(map)),
+            repl_status: Some(status),
+        };
+        let json = render_topology_json(&h, None);
+        assert!(
+            json.contains(
+                "\"replication\":{\"role\":\"master\",\"replicas\":[{\"host\":\"10.0.0.5\",\"port\":7005,\"offset\":190,\"lag\":10}]}"
+            ),
+            "{json}"
+        );
+        assert_eq!(
+            json.matches('{').count(),
+            json.matches('}').count(),
+            "{json}"
+        );
+    }
+
+    /// #365: a REPLICA reports its master endpoint + link in the `replication` object.
+    #[test]
+    fn topology_replication_reports_the_master_for_a_replica() {
+        let status = Arc::new(ironcache_server::ReplNodeStatus::new());
+        status.set_replica_attached("10.0.0.9", 6400, ironcache_repl::ReplOffset(50));
+        let h = TopologyHandle {
+            node_id: "nodeB",
+            cluster_enabled: false,
+            raft_mode: false,
+            tcp_port: 6379,
+            shards: 1,
+            cluster: None,
+            repl_status: Some(status),
+        };
+        let json = render_topology_json(&h, None);
+        assert!(
+            json.contains(
+                "\"replication\":{\"role\":\"replica\",\"master_host\":\"10.0.0.9\",\"master_port\":6400,\"master_link\":\"up\"}"
+            ),
+            "{json}"
+        );
+    }
+
+    /// #365: a MASTER with NO connected replica reports an empty `replicas` array.
+    #[test]
+    fn topology_replication_master_with_no_replica_is_empty_array() {
+        let status = Arc::new(ironcache_server::ReplNodeStatus::new());
+        status.set_master_head(ironcache_repl::ReplOffset(5));
+        let h = TopologyHandle {
+            node_id: "nodeC",
+            cluster_enabled: false,
+            raft_mode: false,
+            tcp_port: 6379,
+            shards: 1,
+            cluster: None,
+            repl_status: Some(status),
+        };
+        let json = render_topology_json(&h, None);
+        assert!(
+            json.contains("\"replication\":{\"role\":\"master\",\"replicas\":[]}"),
+            "{json}"
+        );
+    }
+
     #[test]
     fn json_string_escaping_is_applied() {
         let mut s = String::new();
@@ -252,6 +419,7 @@ mod tests {
             tcp_port: 7000,
             shards: 1,
             cluster: Some(map),
+            repl_status: None,
         };
         let json = render_topology_json(&h, None);
         assert!(json.contains("\"mode\":\"static\""), "{json}");

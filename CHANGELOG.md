@@ -151,6 +151,17 @@ release.
 
 ### Added
 
+- The structured `/topology` read now reports real replication (issue #365, extending
+  stages 1-3 to the console-facing surface): the `replication` object was a hardcoded
+  `{"role":"master"}` and is now built from the live status cell, threaded into
+  `TopologyHandle`. A REPLICA reports `{"role":"replica","master_host","master_port",
+  "master_link"}`; a MASTER reports `{"role":"master","replicas":[...]}` with each
+  connected replica's RESOLVED endpoint + offset + lag (0 or 1 in the single-replica
+  model today, resolved by the same `node_id_from_announce` slot-map reverse lookup as
+  INFO). Standalone keeps the byte-compatible `{"role":"master"}`. Additive +
+  backward-compatible: the console's `/topology` parser tolerates unknown fields, so it
+  keeps working until its parser is extended to consume them. CLUSTER SHARDS cross-node
+  replica state and the N-replica model remain.
 - `INFO # Replication` now reports the replica's REAL endpoint (issue #365, stage 3,
   the visible payoff over stages 1-2 #457/#458): the `slaveN:` line resolves
   `ip`/`port` from the replica's captured `NodeId` via the slot map
