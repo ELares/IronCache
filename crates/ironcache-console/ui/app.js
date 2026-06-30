@@ -80,6 +80,7 @@
   // 5s live poll), since each one opens an on-demand node connection. The active
   // management section is also refreshed by the manual Refresh button.
   var MANAGEMENT_SECTIONS = {
+    cluster: true,
     config: true,
     keyspace: true,
     console: true,
@@ -679,6 +680,75 @@
   // (loadManagement), and the admin write controls post through fetchMethod.
   // Every server string reaches the DOM via textContent / createTextNode only.
   // ======================================================================
+
+  // ----- Cluster: rebalance plan (admin, on-demand) ------------------------
+  // GET /api/cluster/rebalance-plan returns the engine CLUSTER REBALANCE DRYRUN
+  // (#361/#444): per-node current vs balanced-target slots + signed move. READ-ONLY
+  // (no slots move) and Admin-tier, loaded explicitly on the button.
+
+  function updateRebalanceGate() {
+    var gate = byId("rebalance-gate");
+    if (gate) {
+      gate.hidden = haveToken();
+    }
+  }
+
+  function loadRebalancePlan() {
+    var status = byId("rebalance-status");
+    if (status) {
+      status.hidden = false;
+      setText(status, "Loading plan...");
+    }
+    fetchJson("/api/cluster/rebalance-plan").then(function (r) {
+      if (status) {
+        status.hidden = true;
+      }
+      if (r.status === 401 || r.status === 403) {
+        renderRebalancePlan(
+          null,
+          r.status === 401 ? "Sign in to load the rebalance plan." : "Insufficient privileges."
+        );
+        return;
+      }
+      if (r.status === 200 && r.body && Array.isArray(r.body.targets)) {
+        renderRebalancePlan(r.body, null);
+      } else {
+        renderRebalancePlan(null, apiError(r, "Could not load the rebalance plan."));
+      }
+    });
+  }
+
+  function renderRebalancePlan(data, message) {
+    var summary = byId("rebalance-summary");
+    if (message) {
+      setText(summary, "-");
+      fillBody(byId("rebalance-body"), [], 4, message);
+      return;
+    }
+    var targets = (data && data.targets) || [];
+    if (data && data.balanced) {
+      setText(summary, "Balanced (nothing to move)");
+    } else {
+      setText(summary, fmtNum(data ? data.total_slots_to_move : 0) + " slots to move");
+    }
+    var rows = [];
+    for (var i = 0; i < targets.length; i++) {
+      var tgt = targets[i];
+      var tr = document.createElement("tr");
+      tr.appendChild(td(tgt.node == null ? "" : String(tgt.node), "mono"));
+      tr.appendChild(td(fmtNum(tgt.current_slots), "num"));
+      tr.appendChild(td(fmtNum(tgt.target_slots), "num"));
+      tr.appendChild(td(fmtMove(tgt.slots_to_move), "num"));
+      rows.push(tr);
+    }
+    fillBody(byId("rebalance-body"), rows, 4, "No nodes.");
+  }
+
+  // Format a signed slot-move count: "+N" receives, "-N" sheds, "0" settled.
+  function fmtMove(n) {
+    var v = Number(n || 0);
+    return (v > 0 ? "+" : "") + v.toLocaleString();
+  }
 
   // ----- Config -------------------------------------------------------------
   var configParams = [];
@@ -1531,7 +1601,12 @@
   // manual refresh). The OPEN/PRIVILEGED monitoring sections keep using the 5s
   // poll in refresh().
   function loadManagement(section) {
-    if (section === "config") {
+    if (section === "cluster") {
+      // The rebalance plan is an explicit operator action (a CLUSTER command per
+      // click), so it loads on the button, NOT on every Cluster-tab visit; here we
+      // only refresh the admin-gate note.
+      updateRebalanceGate();
+    } else if (section === "config") {
       loadConfig();
     } else if (section === "keyspace") {
       // The keyspace browser is driven by the Scan button; nothing auto-loads.
@@ -1901,6 +1976,9 @@
 
   // ----- management form wiring (#361) --------------------------------------
   function wireManagement() {
+    // Cluster: load the rebalance dry-run plan on demand (admin).
+    wireClick("rebalance-load", loadRebalancePlan);
+
     // Config: filter + apply (per-row Apply wired in configRow).
     var configFilter = byId("config-filter");
     if (configFilter) {

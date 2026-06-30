@@ -293,6 +293,10 @@ mod tests {
             "id=\"section-persistence\"",
             "id=\"persistence-save\"",
             "data-section=\"persistence\"",
+            // Cluster rebalance dry-run card (#361).
+            "id=\"rebalance-load\"",
+            "id=\"rebalance-body\"",
+            "id=\"rebalance-summary\"",
         ] {
             assert!(
                 INDEX_HTML.contains(id),
@@ -303,8 +307,10 @@ mod tests {
 
     #[test]
     fn cluster_replication_shards_stay_gated_empty_states() {
-        // The genuinely-cluster-only views keep their honest empty-state (NO
-        // fabricated data); they must NOT have been turned into functional pages.
+        // Replication and shards stay honest empty-states (NO fabricated data): they
+        // must NOT have been turned into functional pages. The cluster view keeps its
+        // topology empty-state too, but now ALSO carries the real, admin-gated
+        // rebalance dry-run card (#361, a genuine engine endpoint, not fabricated).
         for marker in [
             "id=\"section-cluster\"",
             "id=\"section-replication\"",
@@ -312,10 +318,20 @@ mod tests {
         ] {
             assert!(INDEX_HTML.contains(marker), "{marker} must still exist");
         }
-        // The empty-state card text for these is still present.
+        // The gated empty-state card text is still present (cluster topology + shards).
         assert!(
             INDEX_HTML.contains("This node is standalone."),
             "the gated cluster/shards empty-states must remain"
+        );
+        assert!(
+            INDEX_HTML.contains("Replication view appears when replicas are attached."),
+            "the replication view stays a gated empty-state"
+        );
+        // The cluster view's rebalance card is the one functional addition there.
+        assert!(
+            INDEX_HTML.contains("id=\"rebalance-load\"")
+                && INDEX_HTML.contains("id=\"rebalance-body\""),
+            "the cluster view carries the rebalance dry-run card"
         );
     }
 
@@ -347,6 +363,22 @@ mod tests {
         assert!(!APP_JS.contains(".innerHTML"), "no innerHTML sink");
         assert!(!APP_JS.contains("?token="), "no token in a query");
         assert!(!APP_JS.contains("&token="), "no token in a query");
+    }
+
+    #[test]
+    fn app_js_wires_the_rebalance_plan_read() {
+        // The cluster rebalance dry-run (#361) is an admin READ wired on the button:
+        // app.js fetches the endpoint via the token-aware fetchJson and renders it.
+        for needle in [
+            "/api/cluster/rebalance-plan",
+            "loadRebalancePlan",
+            "renderRebalancePlan",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "app.js must reference `{needle}` for the rebalance plan read"
+            );
+        }
     }
 
     #[test]
