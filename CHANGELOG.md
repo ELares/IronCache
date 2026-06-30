@@ -151,6 +151,17 @@ release.
 
 ### Added
 
+- Console consumes the full `/topology` replication + migration fidelity (issue #354): the
+  topology parser was role-only and ignored the per-replica endpoints and the in-flight slot
+  migrations the engine now reports (#365 N-replica, #354 migrations array). It now parses one
+  `TopoReplica {host, port, offset, lag}` per connected replica, a replica's `master_host`/
+  `master_port`/`master_link`, and one `TopoMigration {slot, state, peer_id, peer_host,
+  peer_port}` per migrating slot, all additively (`#[serde(default)]`), so an OLDER engine that
+  omits them still parses cleanly. The poll loop reads `ClusterTopology::migration_in_progress()`
+  and refreshes topology FASTER while a resharding is in flight (`min(poll_interval, 1s)`,
+  floored so it never hammers the engine), reverting to the steady cadence once the migration
+  drains, so the console adopts the new slot owner promptly instead of waiting a full interval.
+  The new fields flow through the `/api/cluster` REST surface automatically (serde-derived).
 - The structured `/topology` read now reports in-flight slot migrations (issue #354 enabler):
   a new `migrations` array inside the `cluster` object, one entry per slot currently MIGRATING
   out of or IMPORTING into this node, each carrying `{slot, state, peer_id, peer_host,

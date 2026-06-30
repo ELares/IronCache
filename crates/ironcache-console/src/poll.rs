@@ -34,6 +34,25 @@ use crate::metrics::ConsoleMetrics;
 use crate::node::{self, NodeAuth, NodeTls};
 use crate::snapshot::{Topology, acquire_node, single_node_topology};
 
+/// The floor on the refresh cadence used while a slot migration is in flight (#354): the console
+/// never polls FASTER than this even mid-resharding, so it cannot hammer the engine.
+const MIGRATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The delay before the next poll given the steady `interval` and whether a slot migration is in
+/// flight (#354). A migration is the one window where the slot map's ownership is moving, so a
+/// console on a slow steady cadence would show a stale owner until the next tick; during one, refresh
+/// at `min(interval, MIGRATION_POLL_INTERVAL)` so the new owner is adopted promptly. A steady cadence
+/// already faster than the floor is NEVER slowed (the `min`), and the floor stops a fast resharding
+/// from turning into an engine-hammering busy-poll. Pure, so the cadence policy is unit-tested.
+#[must_use]
+fn migration_aware_delay(interval: Duration, migrating: bool) -> Duration {
+    if migrating {
+        interval.min(MIGRATION_POLL_INTERVAL)
+    } else {
+        interval
+    }
+}
+
 /// The shared, swappable latest-topology holder. The poll loop writes it; the
 /// REST/UI layers (and `ConsoleHttpState`) read it. `None` until the first poll
 /// publishes a topology (reachable or degraded).
@@ -118,6 +137,8 @@ pub async fn run_poll_loop<C: Clock>(
     }
 
     loop {
+        // Default to the steady cadence; an in-flight migration shortens it for the next tick.
+        let mut next_sleep = interval;
         // Multi-seed failover (#354): one acquisition pass over the configured seeds,
         // returning the topology to publish (the first reachable, or the last attempt if
         // every seed is down). Extracted into [`acquire_failover_topology`] so the
@@ -164,14 +185,26 @@ pub async fn run_poll_loop<C: Clock>(
                 }
             }
             let reachable = topology.any_reachable();
+            // (#354) Is a slot migration in flight in the view we are about to publish? Capture it
+            // BEFORE the move so we can shorten the next refresh while ownership is moving.
+            let migrating = topology
+                .cluster
+                .as_ref()
+                .is_some_and(crate::cluster::ClusterTopology::migration_in_progress);
             // Publish the topology (even a degraded one) so readers see the
             // latest view + its error strings.
             *holder.write().await = Some(topology);
+            next_sleep = migration_aware_delay(interval, migrating);
             if reachable {
                 metrics.record_poll_success();
                 // Readiness flips on the FIRST successful poll and never flips back.
                 http_state.set_ready(true);
-                tracing::debug!(seed = %seed, "console poll: node reachable; topology refreshed");
+                tracing::debug!(
+                    seed = %seed,
+                    migrating,
+                    next_refresh_secs = next_sleep.as_secs(),
+                    "console poll: node reachable; topology refreshed"
+                );
             } else {
                 metrics.record_poll_failure();
                 tracing::warn!(
@@ -180,7 +213,7 @@ pub async fn run_poll_loop<C: Clock>(
                 );
             }
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(next_sleep).await;
     }
 }
 
@@ -249,6 +282,19 @@ mod tests {
     #[test]
     fn resolve_tls_off_by_default() {
         assert!(resolve_tls(&base_cfg()).is_none());
+    }
+
+    #[test]
+    fn migration_aware_delay_speeds_up_only_during_a_migration() {
+        let steady = Duration::from_secs(15);
+        // No migration: the steady cadence is used unchanged.
+        assert_eq!(migration_aware_delay(steady, false), steady);
+        // Mid-migration: drop to the 1s floor so the new owner is adopted promptly.
+        assert_eq!(migration_aware_delay(steady, true), MIGRATION_POLL_INTERVAL);
+        // A steady cadence already at/under the floor is NEVER slowed by the migration path.
+        let fast = Duration::from_secs(1);
+        assert_eq!(migration_aware_delay(fast, true), fast);
+        assert_eq!(migration_aware_delay(fast, false), fast);
     }
 
     #[test]
