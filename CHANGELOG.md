@@ -151,6 +151,17 @@ release.
 
 ### Added
 
+- Console cluster aggregation: cache-specific cluster snapshot (issue #357, core):
+  `GET /api/cluster` now carries the cluster-wide `hit_ratio` over the aggregate
+  totals plus a `cluster_topology` object rolled up from the discovered structured
+  topology (#354/#365): the committed config epoch, member count, the
+  slot-ownership rollup (assigned-slot total + distinct owner count), and the raft
+  consensus state. This is the cache-specific cluster view the console exists for
+  (the non-goal fence: Grafana cannot express the committed-epoch slot map or the
+  raft topology), distinct from the generic INFO totals. Coherent single-node values
+  in standalone mode; `cluster_topology` is null when `/topology` discovery is not
+  configured. The per-shard breakdown (multi-shard-only) and the cluster-wide
+  replication-lag rollup (needs the #365 repl-fidelity follow-up) remain.
 - Console embedded ring-buffer history (issue #370): in-memory trend history
   WITHOUT an external Prometheus, behind the SAME pluggable `HistorySource`
   interface as the Prometheus adapter (so it is swappable with no API change). The

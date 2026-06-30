@@ -156,6 +156,46 @@ struct ClusterOverview {
     nodes_reachable: usize,
     last_poll_unixtime: u64,
     totals: ClusterTotals,
+    /// The cluster-wide cache hit ratio `hits / (hits + misses)` over the aggregate totals, or
+    /// `None` when no reads have been served (avoids a 0/0). The cache-specific headline (#357).
+    hit_ratio: Option<f64>,
+    /// The cache-specific cluster topology snapshot from the structured `/topology` discovery
+    /// (#354/#365): committed-epoch slot map + raft state. `None` when discovery is not configured
+    /// (`node_http_url` unset); coherent single-node values in standalone mode. This is the view the
+    /// console exists for (the non-goal fence: Grafana cannot express the committed-epoch slot map
+    /// or raft/replica topology), distinct from the generic INFO totals above.
+    cluster_topology: Option<ClusterTopologySummary>,
+}
+
+/// A curated cache-specific cluster snapshot derived from the discovered [`crate::cluster::
+/// ClusterTopology`] (#354): the committed epoch, membership size, the slot-ownership rollup, and
+/// the raft consensus state. Distinct from the generic INFO `ClusterTotals`.
+#[derive(Debug, Clone, Serialize)]
+struct ClusterTopologySummary {
+    /// `none` (standalone), `static`, or `raft`.
+    mode: String,
+    /// Whether the node booted in cluster mode.
+    enabled: bool,
+    /// The committed config epoch (the fence: never two owners per slot per epoch).
+    committed_epoch: u64,
+    /// The number of known members.
+    members: usize,
+    /// The total slots that have an owner (standalone is the full 16384).
+    slots_assigned: u32,
+    /// The number of distinct owning nodes across the slot map.
+    slot_owners: usize,
+    /// The raft consensus snapshot, `None` outside raft-governance mode.
+    raft: Option<RaftSummary>,
+}
+
+/// The raft consensus rollup for the cluster overview (mirrors the `/topology` raft object).
+#[derive(Debug, Clone, Serialize)]
+struct RaftSummary {
+    is_leader: bool,
+    leader_id: Option<u64>,
+    term: u64,
+    commit_index: u64,
+    voters: u64,
 }
 
 /// Aggregate numbers across the reachable nodes (the cluster-wide totals the
@@ -382,13 +422,55 @@ fn cluster(topo: &Topology) -> ApiResponse {
             .connections_received
             .saturating_add(info.total_connections_received.unwrap_or(0));
     }
+    // Cluster hit ratio over the aggregate totals (None when no reads, to avoid 0/0).
+    let total_reads = totals.keyspace_hits.saturating_add(totals.keyspace_misses);
+    let hit_ratio = (total_reads > 0).then(|| hit_ratio_of(totals.keyspace_hits, total_reads));
+    // The cache-specific cluster snapshot from the discovered topology (#354/#357).
+    let cluster_topology = topo.cluster.as_ref().map(topology_summary);
     ApiResponse::ok(&ClusterOverview {
         mode: topo.mode,
         nodes_total,
         nodes_reachable,
         last_poll_unixtime: topo.fetched_unixtime,
         totals,
+        hit_ratio,
+        cluster_topology,
     })
+}
+
+/// `hits / total_reads` as a ratio in `[0, 1]`. `total_reads` is `> 0` at the call site.
+#[allow(clippy::cast_precision_loss)] // counts; f64 covers the practical hit/miss range.
+fn hit_ratio_of(hits: u64, total_reads: u64) -> f64 {
+    hits as f64 / total_reads as f64
+}
+
+/// Roll a discovered [`crate::cluster::ClusterTopology`] up into the curated cache-specific summary
+/// (committed epoch, membership, slot-ownership rollup, raft state) for `/api/cluster`.
+fn topology_summary(ct: &crate::cluster::ClusterTopology) -> ClusterTopologySummary {
+    let mut slots_assigned: u32 = 0;
+    let mut owners: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for range in &ct.cluster.slots {
+        if let Some(owner) = &range.owner_id {
+            // An inclusive `[start, end]` range covers `end - start + 1` slots.
+            slots_assigned = slots_assigned.saturating_add(u32::from(range.end - range.start) + 1);
+            owners.insert(owner.as_str());
+        }
+    }
+    ClusterTopologySummary {
+        mode: ct.cluster.mode.clone(),
+        enabled: ct.cluster.enabled,
+        committed_epoch: ct.cluster.committed_epoch,
+        members: ct.cluster.members.len(),
+        slots_assigned,
+        slot_owners: owners.len(),
+        raft: ct.raft.as_ref().map(|r| RaftSummary {
+            is_leader: r.is_leader,
+            leader_id: r.leader_id,
+            term: r.term,
+            commit_index: r.commit_index,
+            voters: r.voters,
+        }),
+    }
 }
 
 /// `GET /api/nodes`.
@@ -1596,6 +1678,81 @@ mod tests {
         assert_eq!(v["totals"]["keyspace_hits"], 80);
         assert_eq!(v["totals"]["commands_processed"], 5000);
         assert_eq!(v["totals"]["connections_received"], 120);
+        // Cluster hit ratio over the totals: 80 / (80 + 20) = 0.8 (#357).
+        assert!((v["hit_ratio"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+        // No /topology discovery configured in this fixture, so the cache-specific summary is null.
+        assert!(v["cluster_topology"].is_null());
+    }
+
+    #[test]
+    fn cluster_overview_includes_the_discovered_topology_summary() {
+        use crate::cluster::{
+            ClusterTopology, TopoClusterView, TopoMember, TopoNode, TopoRaft, TopoReplication,
+            TopoSlotRange,
+        };
+        let mut t = topo();
+        // Attach a discovered 2-node raft topology with the slot space split between the owners.
+        t.cluster = Some(ClusterTopology {
+            schema_version: 1,
+            node: TopoNode {
+                id: "n1".into(),
+                engine_version: "v".into(),
+                tcp_port: 7000,
+                shards: 1,
+            },
+            cluster: TopoClusterView {
+                mode: "raft".into(),
+                enabled: true,
+                committed_epoch: 9,
+                members: vec![
+                    TopoMember {
+                        id: "n1".into(),
+                        host: "10.0.0.1".into(),
+                        port: 7000,
+                    },
+                    TopoMember {
+                        id: "n2".into(),
+                        host: "10.0.0.2".into(),
+                        port: 7000,
+                    },
+                ],
+                slots: vec![
+                    TopoSlotRange {
+                        start: 0,
+                        end: 8191,
+                        owner_id: Some("n1".into()),
+                    },
+                    TopoSlotRange {
+                        start: 8192,
+                        end: 16383,
+                        owner_id: Some("n2".into()),
+                    },
+                ],
+            },
+            raft: Some(TopoRaft {
+                is_leader: true,
+                leader_id: Some(1),
+                term: 3,
+                commit_index: 42,
+                voters: 3,
+            }),
+            replication: TopoReplication {
+                role: "master".into(),
+            },
+        });
+        let resp = handle("/api/cluster", Some(&t), &ctx());
+        let v = parse(&resp);
+        let ct = &v["cluster_topology"];
+        assert_eq!(ct["mode"], "raft");
+        assert_eq!(ct["enabled"], true);
+        assert_eq!(ct["committed_epoch"], 9);
+        assert_eq!(ct["members"], 2);
+        // The two ranges cover the whole 16384-slot space, owned by 2 distinct nodes.
+        assert_eq!(ct["slots_assigned"], 16384);
+        assert_eq!(ct["slot_owners"], 2);
+        assert_eq!(ct["raft"]["is_leader"], true);
+        assert_eq!(ct["raft"]["term"], 3);
+        assert_eq!(ct["raft"]["voters"], 3);
     }
 
     #[test]
