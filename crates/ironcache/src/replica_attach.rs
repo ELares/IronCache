@@ -1011,6 +1011,7 @@ async fn run_replica_control(
                         reserved_bits,
                         &status,
                         replica_security.as_ref(),
+                        &self_node_id,
                         resume,
                     )
                     .await;
@@ -1234,6 +1235,20 @@ impl ResumeState {
 /// live store handle, the store-construction facts, the node status cell, and the resume state);
 /// bundling them would just move the same fields behind one name.
 #[allow(clippy::too_many_arguments)]
+/// The `NodeId` (as a raw `u64`) a replica advertises in its `REPLCONF` handshake (#365
+/// stage 1, REPL_FIDELITY.md): `node_id_from_announce` of its OWN 40-hex announce id, i.e.
+/// the first 16 hex chars as a `u64`. This is the SAME mapping the leader-hint resolution
+/// and the slot-map use, so a primary can later resolve it back to the replica's advertised
+/// endpoint by the reverse lookup over its slot-map members. Sending it is
+/// backward-compatible: `node` is advisory today, so an older primary simply ignores the
+/// value, and the replica's sync behaviour is unchanged (it keys off `ack` / `resume_token`,
+/// never `node`). In standalone replication the value is harmless and unused (no membership
+/// to resolve against). PURE: unit-tested without a node.
+fn replica_handshake_node_id(self_announce_id: &str) -> u64 {
+    crate::raft_boot::node_id_from_announce(self_announce_id).0
+}
+
+#[allow(clippy::too_many_arguments)] // a repl-attach driver threading the resolved attach inputs.
 async fn attach_once(
     rt: &TokioRuntime,
     owner_addr: SocketAddr,
@@ -1245,6 +1260,7 @@ async fn attach_once(
     reserved_bits: u32,
     status: &std::sync::Arc<ReplNodeStatus>,
     security: Option<&ClusterSecurity>,
+    self_announce_id: &str,
     resume: ResumeState,
 ) -> ResumeState {
     let resume_from = resume.offset;
@@ -1266,9 +1282,12 @@ async fn attach_once(
     // full-syncs; a reconnecting replica sends its real applied offset + the token it last synced
     // under, so the primary can RESUME incrementally ONLY IF the token matches its current history
     // (the silent-divergence fence) AND the offset is within the recoverable (memory + disk) window.
-    // `node` is advisory to the primary's link bookkeeping.
+    // `node` advertises THIS replica's identity (#365 stage 1): `node_id_from_announce` of our
+    // own announce id, which a primary can resolve back to our advertised endpoint. It is advisory
+    // (an older primary ignores it; our sync keys off `ack` / `resume_token`), so this is
+    // backward-compatible.
     let handshake = Frame::ReplConf {
-        node: 0,
+        node: replica_handshake_node_id(self_announce_id),
         ack: resume_from,
         resume_token: resume.token,
     }
@@ -1880,6 +1899,30 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #365 stage 1: the id a replica advertises in `REPLCONF` is `node_id_from_announce` of its
+    /// own announce id (the first 16 hex chars as a `u64`), and it MUST equal what the primary
+    /// re-derives for the SAME announce id (the resolution invariant). Sending the prior `0` would
+    /// have left the primary unable to identify the replica.
+    #[test]
+    fn replica_handshake_node_id_is_the_announce_prefix_and_round_trips() {
+        // First 16 hex of the 40-hex id, as a u64.
+        assert_eq!(replica_handshake_node_id(&"0".repeat(40)), 0);
+        assert_eq!(
+            replica_handshake_node_id(&"1".repeat(40)),
+            0x1111_1111_1111_1111
+        );
+        // "00000000000000ff...." -> first 16 = "00000000000000ff" = 0xff.
+        let id = "00000000000000ff1234567890abcdef00000000";
+        assert_eq!(replica_handshake_node_id(id), 0xff);
+        // The resolution invariant: it is exactly what the primary derives for the same id.
+        assert_eq!(
+            replica_handshake_node_id(id),
+            crate::raft_boot::node_id_from_announce(id).0
+        );
+        // And it is no longer the old placeholder for a non-trivial id.
+        assert_ne!(replica_handshake_node_id(id), 0);
+    }
 
     /// `repl_port` is the documented client-port + offset, overflow-safe (a high port falls
     /// back to `port - offset`), and a bijection on distinct client ports (so co-located nodes

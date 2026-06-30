@@ -151,6 +151,18 @@ release.
 
 ### Added
 
+- Replicas now advertise their identity in the replication handshake (issue #365,
+  stage 1 of REPL_FIDELITY.md): the attach `REPLCONF` carries
+  `node_id_from_announce(self_announce_id)` (the replica's own `NodeId`, the first 16
+  hex of its 40-hex id) instead of the prior `0` placeholder. This is the
+  backward-compatible foundation that lets a primary later resolve a replica's REAL
+  advertised endpoint (today INFO reports `ip=,port=0` because the primary never
+  learned the replica's identity). DATA-SAFETY: `node` is advisory, so an older
+  primary ignores it and the replica's sync keys off `ack`/`resume_token`, never
+  `node`; the full-sync/resume and the ADR-0026 in-sync gate are byte-unchanged. The
+  computation is a pure, unit-tested `replica_handshake_node_id` (verified to equal
+  what the primary re-derives for the same id, the resolution invariant). The
+  primary-side capture + per-replica reporting are stages 2-3.
 - Design doc `docs/design/REPL_FIDELITY.md` scoping the per-replica replication
   fidelity remainder of issue #365 (the structured `/topology` read core landed in
   #439). Fact-checked against the source: the production replica handshake sends
