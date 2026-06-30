@@ -4251,6 +4251,10 @@ async fn try_raft_cluster_mutator(
         // prior MEET / AddNode); the committed log order guarantees that, and the replica node
         // then attaches to each slot OWNER's primary (full-sync + tail) and serves READONLY reads.
         b"REPLICATE" => Some(build_replicate(request).map(|c| vec![c])),
+        // HA-8 / #371: `CLUSTER FAILOVER` promotes THIS in-sync replica to owner of the slots it
+        // replicates via a committed `PromoteReplica` (the operator entry point to the same path the
+        // automatic failover uses). The in-sync gate (the data-safety crux) lives in `build_failover`.
+        b"FAILOVER" => Some(build_failover(ctx, request)),
         // DELSLOTS / DELSLOTSRANGE UN-assign the parsed / range-expanded slots (the inverse of
         // ADDSLOTS / ADDSLOTSRANGE; the SAME slot-parse helpers). FLUSHSLOTS UN-assigns every slot
         // THIS node owns in the committed map. Each commits an `UnassignSlots` ConfigCmd, so the
@@ -4525,6 +4529,61 @@ fn build_self_assign(
         },
         ironcache_raft::ConfigCmd::AssignSlots { node: id, slots },
     ])
+}
+
+/// Build the committed `ConfigCmd` for a manual `CLUSTER FAILOVER` (#371): promote THIS node from
+/// replica to OWNER of the slots it replicates, proposed + committed through the leader (the same
+/// raft path every other `ConfigCmd` mutator uses).
+///
+/// DATA-SAFETY (the crux): refuse unless this node is an IN-SYNC replica, reusing the EXACT gate the
+/// AUTOMATIC promotion and the replica-read path use ([`replica_read_in_sync`]: `is_in_sync` within
+/// `replica_max_lag`, ADR-0026). So a manual failover can NEVER promote a node the automatic path
+/// would not, and a stale replica is never promoted (which would lose committed writes). The
+/// committed `PromoteReplica` then atomically transfers ownership + bumps the config epoch (the
+/// split-brain fence: at most one owner per slot per epoch), and the OLD owner steps down on apply.
+/// There is a small check-to-commit window (the replica could fall behind before the entry commits),
+/// identical to the automatic path's; the epoch fence still guarantees no two committed owners.
+///
+/// `FORCE` / `TAKEOVER` (which in Redis bypass the in-sync and committed-consensus safety) are
+/// REFUSED: the only supported form is the safe, gated, committed failover.
+fn build_failover(
+    ctx: &ServerContext,
+    request: &Request,
+) -> Result<Vec<ironcache_raft::ConfigCmd>, ironcache_protocol::ErrorReply> {
+    // FORCE / TAKEOVER would bypass the safety gates; not supported (do not bypass, per #371).
+    if request.args.len() > 2 {
+        return Err(ironcache_protocol::ErrorReply::err(
+            "CLUSTER FAILOVER FORCE/TAKEOVER is not supported (it would bypass the in-sync + \
+             committed-consensus safety gates); use a bare CLUSTER FAILOVER",
+        ));
+    }
+    // THE DATA-SAFETY GATE: only an in-sync replica may take over (the SAME gate the automatic
+    // promotion uses). A non-replica / link-down / lagging node is refused here, never promoted.
+    if !replica_read_in_sync(ctx) {
+        return Err(ironcache_protocol::ErrorReply::err(
+            "CLUSTER FAILOVER refused: this node is not an in-sync replica (not a replica, link \
+             down, or lagging past replica_max_lag); promoting it would risk losing committed writes",
+        ));
+    }
+    let Some(map) = ctx.cluster.as_ref() else {
+        return Err(ironcache_protocol::ErrorReply::err(
+            "CLUSTER FAILOVER requires cluster mode with a slot map",
+        ));
+    };
+    // The slots this node currently replicates are exactly the slots it would take ownership of.
+    let slots: Vec<u16> = (0..ironcache_cluster::CLUSTER_SLOTS)
+        .filter(|&s| map.is_replica_of_self(s))
+        .collect();
+    if slots.is_empty() {
+        return Err(ironcache_protocol::ErrorReply::err(
+            "CLUSTER FAILOVER refused: this node replicates no slots to take over",
+        ));
+    }
+    let (id, _host, _port) = self_node_endpoint(ctx);
+    Ok(vec![ironcache_raft::ConfigCmd::PromoteReplica {
+        slots,
+        new_primary: id,
+    }])
 }
 
 /// Build the `UnassignSlots { slots }` ConfigCmd for raft-mode `CLUSTER DELSLOTS` / `DELSLOTSRANGE`
@@ -7691,6 +7750,56 @@ mod tests {
         map.set_slot_replica(slot, RID_A)
             .expect("RID_A is a known node");
         (map, key)
+    }
+
+    #[test]
+    fn cluster_failover_refuses_force_and_takeover() {
+        // FORCE / TAKEOVER bypass the in-sync + committed-consensus safety gates: refuse them (#371).
+        let ctx = guardrail_ctx(0, 1);
+        assert!(
+            build_failover(&ctx, &rreq(&[b"CLUSTER", b"FAILOVER", b"FORCE"])).is_err(),
+            "FAILOVER FORCE must be refused"
+        );
+        assert!(
+            build_failover(&ctx, &rreq(&[b"CLUSTER", b"FAILOVER", b"TAKEOVER"])).is_err(),
+            "FAILOVER TAKEOVER must be refused"
+        );
+    }
+
+    #[test]
+    fn cluster_failover_refuses_a_node_that_is_not_an_in_sync_replica() {
+        // THE DATA-SAFETY GATE: guardrail_ctx's fresh ReplNodeStatus is NOT a replica (role !=
+        // Replica), so replica_read_in_sync is false and the failover is refused. A non-in-sync
+        // node must never be promotable (promoting it would lose committed writes).
+        let ctx = guardrail_ctx(0, 1);
+        assert!(
+            build_failover(&ctx, &rreq(&[b"CLUSTER", b"FAILOVER"])).is_err(),
+            "a non-in-sync node must not be promotable"
+        );
+    }
+
+    #[test]
+    fn cluster_failover_of_an_in_sync_replica_proposes_promote_replica_for_its_slots() {
+        // The positive path: an IN-SYNC replica of some slots may take them over. `set_replica_attached`
+        // sets role=Replica + link up + node_offset == master_offset (lag 0, so is_in_sync is true),
+        // and `redirect_map_with_self_replica` makes RID_A (self) the replica of a slot.
+        let mut ctx = guardrail_ctx(0, 1);
+        ctx.cluster = Some(std::sync::Arc::new(redirect_map_with_self_replica().0));
+        ctx.repl_status.as_ref().unwrap().set_replica_attached(
+            "127.0.0.1",
+            7000,
+            ironcache_repl::ReplOffset(0),
+        );
+        let cmds = build_failover(&ctx, &rreq(&[b"CLUSTER", b"FAILOVER"]))
+            .expect("an in-sync replica may fail over");
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            ironcache_raft::ConfigCmd::PromoteReplica { slots, new_primary } => {
+                assert!(!slots.is_empty(), "promotes the replicated slots");
+                assert_eq!(new_primary, RID_A, "names self as the new primary");
+            }
+            other => panic!("expected a PromoteReplica proposal, got {other:?}"),
+        }
     }
 
     #[test]

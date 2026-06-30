@@ -151,6 +151,19 @@ release.
 
 ### Added
 
+- Operator-triggered `CLUSTER FAILOVER` (issue #371, the failover half): a bare
+  `CLUSTER FAILOVER` on an IN-SYNC replica now proposes a committed
+  `ConfigCmd::PromoteReplica` through the leader (the same raft path every other
+  cluster mutator uses), promoting this node to owner of the slots it replicates;
+  the committed promotion atomically transfers ownership and bumps the config epoch
+  (the split-brain fence). DATA-SAFETY: it is refused unless this node passes the
+  EXACT in-sync gate the automatic promotion uses (`is_in_sync` within
+  `replica_max_lag`, ADR-0026), so a manual failover can never promote a node the
+  automatic path would not, and a stale replica is never promoted (which would lose
+  committed writes). `FORCE` / `TAKEOVER` (which would bypass the in-sync and
+  consensus safety) are refused. On a non-raft single node `CLUSTER FAILOVER` stays
+  not-supported (no replicas). The `CLUSTER REBALANCE` controller (the slot-move
+  planner + dry-run, the other half of #371) remains.
 - Console cluster aggregation: cache-specific cluster snapshot (issue #357, core):
   `GET /api/cluster` now carries the cluster-wide `hit_ratio` over the aggregate
   totals plus a `cluster_topology` object rolled up from the discovered structured
