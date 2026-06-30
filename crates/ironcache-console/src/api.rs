@@ -1867,6 +1867,7 @@ mod tests {
                         owner_id: Some("n2".into()),
                     },
                 ],
+                migrations: vec![],
             },
             raft: Some(TopoRaft {
                 is_leader: true,
@@ -1877,6 +1878,10 @@ mod tests {
             }),
             replication: TopoReplication {
                 role: "master".into(),
+                master_host: None,
+                master_port: None,
+                master_link: None,
+                replicas: vec![],
             },
         });
         let resp = handle("/api/cluster", Some(&t), &ctx());

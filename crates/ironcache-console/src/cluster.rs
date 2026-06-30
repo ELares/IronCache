@@ -60,6 +60,10 @@ pub struct TopoClusterView {
     pub members: Vec<TopoMember>,
     /// The slot-to-owner ranges; standalone is one `[0, 16383]` owned by the node.
     pub slots: Vec<TopoSlotRange>,
+    /// The slots actively migrating in/out of the polled node (#354). Empty when nothing is
+    /// migrating, in standalone, or against an older engine that did not report the array yet.
+    #[serde(default)]
+    pub migrations: Vec<TopoMigration>,
 }
 
 /// One cluster member's advertised endpoint.
@@ -99,11 +103,74 @@ pub struct TopoRaft {
     pub voters: u64,
 }
 
-/// The node's replication role.
+/// The node's replication role plus this node's view of replication (#365): a REPLICA carries its
+/// master endpoint + link, a MASTER carries one entry per connected replica with each replica's
+/// resolved endpoint + offset + lag. Every field past `role` is OPTIONAL: an older engine (or the
+/// standalone `{"role":"master"}` default) simply omits them, and `Option`/`#[serde(default)]` make
+/// that a clean parse, not an error (forward-compat via `schema_version`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TopoReplication {
     /// `master` or `replica`.
     pub role: String,
+    /// REPLICA only: the master's advertised host, when known.
+    #[serde(default)]
+    pub master_host: Option<String>,
+    /// REPLICA only: the master's advertised port, when known.
+    #[serde(default)]
+    pub master_port: Option<u16>,
+    /// REPLICA only: the replication link state (`up` / `down` / `connecting` ...), when reported.
+    #[serde(default)]
+    pub master_link: Option<String>,
+    /// MASTER only: one entry per connected replica (N-replica, #365). Empty for a replica, a
+    /// master with no replicas attached, or an older engine that did not report them.
+    #[serde(default)]
+    pub replicas: Vec<TopoReplica>,
+}
+
+/// One connected replica's resolved endpoint + replication progress, as a master reports it (#365).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TopoReplica {
+    /// The replica's resolved advertised host (empty when the master could not resolve its id yet).
+    pub host: String,
+    /// The replica's resolved advertised port (`0` when unresolved).
+    pub port: u16,
+    /// The replica's last acknowledged replication offset.
+    pub offset: u64,
+    /// The replica's lag behind the master's stream, in offset units.
+    pub lag: u64,
+}
+
+/// One slot actively migrating in/out of the polled node (#354): the console reads this to detect a
+/// resharding in progress and refresh topology faster. `state` is `migrating` (this node is the
+/// source, slots leaving) or `importing` (this node is the destination, slots arriving); the `peer_*`
+/// fields name the other side of the move and are present only when the engine resolved them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TopoMigration {
+    /// The migrating slot (`0..=16383`).
+    pub slot: u16,
+    /// `migrating` (leaving this node) or `importing` (arriving at this node).
+    pub state: String,
+    /// The migration peer's 40-hex node id, when resolved.
+    #[serde(default)]
+    pub peer_id: Option<String>,
+    /// The migration peer's advertised host, when resolved.
+    #[serde(default)]
+    pub peer_host: Option<String>,
+    /// The migration peer's advertised port, when resolved.
+    #[serde(default)]
+    pub peer_port: Option<u16>,
+}
+
+impl ClusterTopology {
+    /// Whether the polled node reports a slot migration in progress (#354): any `migrating` or
+    /// `importing` slot. The poll loop reads this to refresh topology FASTER while slots are moving
+    /// (a resharding is the window where a stale slot map lies about ownership), reverting to the
+    /// steady cadence once the array drains. O(1): the engine only lists actively-migrating slots, so
+    /// the array is empty in steady state and tiny during a resharding.
+    #[must_use]
+    pub fn migration_in_progress(&self) -> bool {
+        !self.cluster.migrations.is_empty()
+    }
 }
 
 /// Parse a `/topology` JSON document into the typed model. A malformed body is a typed `Err`
@@ -219,16 +286,85 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_future_fields() {
-        // A newer engine adds a `replication.replicas` array + a top-level field; the older console
-        // parser must ignore them (forward-compat via schema_version), not error.
+        // A still-newer engine adds fields this console does not know yet (a top-level key, a per-node
+        // key, a per-replica key, a per-migration key); the parser must ignore them, not error, while
+        // still reading the fields it DOES know. Forward-compat via `schema_version`.
         let json = r#"{"schema_version":1,"future_top":42,
-            "node":{"id":"x","engine_version":"v","tcp_port":1,"shards":1,"extra":true},
-            "cluster":{"mode":"none","enabled":false,"committed_epoch":0,"members":[],"slots":[]},
+            "node":{"id":"x","engine_version":"v","tcp_port":1,"shards":1,"future_node":true},
+            "cluster":{"mode":"raft","enabled":true,"committed_epoch":3,"members":[],"slots":[],
+                "migrations":[{"slot":7,"state":"importing","future_mig":1}]},
             "raft":null,
-            "replication":{"role":"master","replicas":[{"id":"r1"}]}}"#;
+            "replication":{"role":"master","future_repl":9,
+                "replicas":[{"host":"10.0.0.9","port":7002,"offset":11,"lag":0,"future_rep":true}]}}"#;
         let t = parse_cluster_topology(json).expect("unknown fields tolerated");
         assert_eq!(t.node.id, "x");
         assert_eq!(t.replication.role, "master");
+        // The known fields alongside the unknown ones still parse.
+        assert_eq!(t.replication.replicas.len(), 1);
+        assert_eq!(t.replication.replicas[0].port, 7002);
+        assert_eq!(t.cluster.migrations.len(), 1);
+        assert_eq!(t.cluster.migrations[0].slot, 7);
+    }
+
+    #[test]
+    fn parses_per_replica_fidelity_and_active_migrations() {
+        // A master mid-resharding: two connected replicas with resolved endpoints + offset/lag, and
+        // slot 42 migrating out toward a peer. The console reads both (#354/#365).
+        let json = r#"{"schema_version":1,
+            "node":{"id":"n1","engine_version":"v","tcp_port":7000,"shards":1},
+            "cluster":{"mode":"raft","enabled":true,"committed_epoch":9,
+                "members":[{"id":"n1","host":"10.0.0.1","port":7000},
+                           {"id":"n2","host":"10.0.0.2","port":7000}],
+                "slots":[{"start":0,"end":16383,"owner_id":"n1"}],
+                "migrations":[{"slot":42,"state":"migrating","peer_id":"n2",
+                    "peer_host":"10.0.0.2","peer_port":7000}]},
+            "raft":{"is_leader":true,"leader_id":1,"term":3,"commit_index":42,"voters":3},
+            "replication":{"role":"master","replicas":[
+                {"host":"10.0.0.2","port":7000,"offset":1000,"lag":0},
+                {"host":"10.0.0.3","port":7000,"offset":950,"lag":50}]}}"#;
+        let t = parse_cluster_topology(json).expect("valid fidelity doc");
+        assert_eq!(t.replication.role, "master");
+        assert_eq!(t.replication.replicas.len(), 2);
+        assert_eq!(t.replication.replicas[0].host, "10.0.0.2");
+        assert_eq!(t.replication.replicas[0].offset, 1000);
+        assert_eq!(t.replication.replicas[1].lag, 50);
+        assert_eq!(t.cluster.migrations.len(), 1);
+        assert_eq!(t.cluster.migrations[0].slot, 42);
+        assert_eq!(t.cluster.migrations[0].state, "migrating");
+        assert_eq!(t.cluster.migrations[0].peer_id.as_deref(), Some("n2"));
+        assert_eq!(t.cluster.migrations[0].peer_port, Some(7000));
+        assert!(t.migration_in_progress(), "an active migration is detected");
+    }
+
+    #[test]
+    fn parses_a_replica_role_with_its_master_endpoint() {
+        // A replica reports its master endpoint + link, and lists no replicas of its own.
+        let json = r#"{"schema_version":1,
+            "node":{"id":"r1","engine_version":"v","tcp_port":7001,"shards":1},
+            "cluster":{"mode":"raft","enabled":true,"committed_epoch":9,
+                "members":[{"id":"n1","host":"10.0.0.1","port":7000}],
+                "slots":[{"start":0,"end":16383,"owner_id":"n1"}]},
+            "raft":{"is_leader":false,"leader_id":1,"term":3,"commit_index":42,"voters":3},
+            "replication":{"role":"replica","master_host":"10.0.0.1","master_port":7000,
+                "master_link":"up"}}"#;
+        let t = parse_cluster_topology(json).expect("valid replica doc");
+        assert_eq!(t.replication.role, "replica");
+        assert_eq!(t.replication.master_host.as_deref(), Some("10.0.0.1"));
+        assert_eq!(t.replication.master_port, Some(7000));
+        assert_eq!(t.replication.master_link.as_deref(), Some("up"));
+        assert!(t.replication.replicas.is_empty());
+        // No migrations array present -> defaults empty -> no migration in progress.
+        assert!(!t.migration_in_progress());
+    }
+
+    #[test]
+    fn standalone_has_no_replicas_and_no_migration() {
+        // The single-node default: role master, no replicas, no migrations array. The new fields all
+        // default cleanly (no parse error), and no migration is reported.
+        let t = parse_cluster_topology(STANDALONE).expect("valid standalone doc");
+        assert!(t.replication.replicas.is_empty());
+        assert!(t.cluster.migrations.is_empty());
+        assert!(!t.migration_in_progress());
     }
 
     #[test]
