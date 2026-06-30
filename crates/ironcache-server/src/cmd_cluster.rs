@@ -123,8 +123,11 @@ pub fn cmd_cluster(ctx: &ServerContext, req: &Request) -> Value {
         b"FORGET" => cluster_forget(ctx, req),
         b"BUMPEPOCH" => cluster_bumpepoch(ctx, req),
         b"SET-CONFIG-EPOCH" => cluster_set_config_epoch(ctx, req),
-        // Replication / failover / reset are deferred to a later slice (slice 4): IronCache has
-        // no replicas yet. They keep the documented not-supported reply.
+        // In RAFT-governance mode, REPLICATE and FAILOVER (#371) are handled BEFORE this point by
+        // the serve-layer raft mutator (`try_raft_cluster_mutator` proposes the committed
+        // `AssignReplica` / `PromoteReplica`), so they only reach here on a NON-raft single node,
+        // where there are no replicas / no consensus path: keep the not-supported reply. RESET is
+        // still deferred.
         b"REPLICATE" | b"FAILOVER" | b"RESET" => Value::error(ErrorReply::err(format!(
             "{} is not supported on a single-node cluster",
             String::from_utf8_lossy(&sub)
