@@ -151,6 +151,14 @@ release.
 
 ### Added
 
+- Per-shard slot-enumeration partials `count_keys_in_slot` / `keys_in_slot` (issue #371, slice 1 of
+  SLOT_KEY_ENUMERATION.md): pure helpers over the `Keyspace` SCAN seam that count / collect (up to a
+  bound) the live keys in one shard whose client cluster slot (`CRC16(hash_tag(key)) % 16384`, the
+  `{hashtag}` rule) matches a target. On-demand scans (no write-path index), so they add ZERO cost to
+  the data hot path and the standalone deployment; lazily-expired keys are skipped (matching what a
+  client could read), and `keys_in_slot` is deterministic + short-circuits at the limit. These are
+  the per-shard half of an honest `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT`; the cross-shard
+  coordinator wiring that sums/concatenates them is slice 2.
 - Design doc `docs/design/SLOT_KEY_ENUMERATION.md` (issue #371, design-first): how to make
   `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` honest (they are placeholders returning `0`/empty
   today) as the read-side foundation for the rebalance-APPLY driver. Records WHY a slot's keys span

@@ -25,7 +25,7 @@
 use crate::cmd_util::parse_i64;
 use crate::dispatch::ServerContext;
 use crate::glob::glob_match;
-use ironcache_protocol::{ErrorReply, Request, Value};
+use ironcache_protocol::{ErrorReply, Request, Value, key_slot};
 use ironcache_storage::{DataType, Keyspace, MoveMode, MoveOutcome, ScanCursor, Store, UnixMillis};
 
 /// The default COUNT hint for SCAN when none is given (Redis SCAN default is 10).
@@ -278,6 +278,74 @@ pub fn cmd_dbsize<S: Store + Keyspace>(store: &mut S, db: u32, req: &Request) ->
         return Value::error(ErrorReply::wrong_arity("dbsize"));
     }
     Value::Integer(store.db_len(db) as i64)
+}
+
+/// The per-`scan_step` examine batch for the slot-filter scans (the same large hint `KEYS` uses, so
+/// the loop count stays low over a big keyspace; `count`/`limit` bounds the RESULT, this bounds work
+/// per step).
+const KEYS_SCAN_BATCH: usize = 256;
+
+/// One shard's partial of `CLUSTER COUNTKEYSINSLOT <slot>` (#371, SLOT_KEY_ENUMERATION.md): the
+/// number of LIVE keys in `db` on THIS shard whose client cluster slot (`CRC16(hash_tag(key)) %
+/// 16384`, the `{hashtag}` rule) equals `slot`. The cross-shard coordinator SUMS the per-shard
+/// integers, exactly as it does for [`cmd_dbsize`].
+///
+/// Implemented as an on-demand scan over the [`Keyspace`] seam (NOT a maintained write-path index):
+/// it taxes only this cold admin call, never the write path or the standalone deployment (the
+/// command is cluster-mode-only). Lazily-expired keys are skipped by `scan_step`, so the count is
+/// what a client could actually read. O(keys in this shard's `db`).
+#[must_use]
+pub fn count_keys_in_slot<S: Keyspace>(store: &mut S, db: u32, slot: u16, now: UnixMillis) -> u64 {
+    let mut total: u64 = 0;
+    let mut cursor = ScanCursor::START;
+    loop {
+        let (next, batch) = store.scan_step(db, cursor, KEYS_SCAN_BATCH, now, |key, _ty| {
+            key_slot(key) == slot
+        });
+        total += batch.len() as u64;
+        if next.is_start() {
+            break;
+        }
+        cursor = next;
+    }
+    total
+}
+
+/// One shard's partial of `CLUSTER GETKEYSINSLOT <slot> <count>` (#371, SLOT_KEY_ENUMERATION.md): up
+/// to `limit` LIVE keys in `db` on THIS shard whose client cluster slot equals `slot`, in the stable
+/// `scan_step` order (ADR-0003 determinism). The cross-shard coordinator CONCATENATES the per-shard
+/// vecs and truncates to the global `count`, exactly as it does for [`cmd_keys`]; a shard never needs
+/// to return more than `limit`, so it short-circuits once it has that many. O(keys examined until
+/// `limit` matches in this shard's `db`).
+#[must_use]
+pub fn keys_in_slot<S: Keyspace>(
+    store: &mut S,
+    db: u32,
+    slot: u16,
+    limit: usize,
+    now: UnixMillis,
+) -> Vec<Box<[u8]>> {
+    let mut out: Vec<Box<[u8]>> = Vec::new();
+    if limit == 0 {
+        return out;
+    }
+    let mut cursor = ScanCursor::START;
+    loop {
+        let (next, batch) = store.scan_step(db, cursor, KEYS_SCAN_BATCH, now, |key, _ty| {
+            key_slot(key) == slot
+        });
+        for k in batch {
+            out.push(k);
+            if out.len() >= limit {
+                return out;
+            }
+        }
+        if next.is_start() {
+            break;
+        }
+        cursor = next;
+    }
+    out
 }
 
 /// `RANDOMKEY` -> a pseudo-random live key, or null if the DB is empty. `pick` is the
@@ -588,6 +656,98 @@ mod tests {
                 .map(|p| bytes::Bytes::copy_from_slice(p))
                 .collect(),
         }
+    }
+
+    /// A slot guaranteed to hold NO seeded key: the first slot index that is neither `a` nor `b`.
+    fn an_empty_slot(a: u16, b: u16) -> u16 {
+        (0..ironcache_protocol::CLUSTER_SLOTS)
+            .find(|&s| s != a && s != b)
+            .expect("16384 slots, at most 2 excluded")
+    }
+
+    #[test]
+    fn count_keys_in_slot_counts_only_the_matching_slot() {
+        let mut store = test_store(1);
+        let now = UnixMillis(0);
+        // The `{hashtag}` rule routes `{tag}x` to `key_slot("tag")`, so these are deterministic.
+        let s1 = key_slot(b"tag1");
+        let s2 = key_slot(b"tag2");
+        assert_ne!(
+            s1, s2,
+            "the two tags must occupy distinct slots for the test"
+        );
+        for k in [b"{tag1}a".as_ref(), b"{tag1}b", b"{tag1}c"] {
+            store.insert_object(0, KvObj::from_bytes(k, b"v", None));
+        }
+        store.insert_object(0, KvObj::from_bytes(b"{tag2}x", b"v", None));
+
+        assert_eq!(count_keys_in_slot(&mut store, 0, s1, now), 3);
+        assert_eq!(count_keys_in_slot(&mut store, 0, s2, now), 1);
+        // A slot with no keys is 0, not an error.
+        assert_eq!(
+            count_keys_in_slot(&mut store, 0, an_empty_slot(s1, s2), now),
+            0
+        );
+        // The per-slot counts sum to the whole db (conservation: every key lands in exactly one slot).
+        assert_eq!(u64::from(store.db_len(0) as u32), 4);
+    }
+
+    #[test]
+    fn keys_in_slot_returns_the_matching_keys_bounded_and_deterministic() {
+        let mut store = test_store(1);
+        let now = UnixMillis(0);
+        let s1 = key_slot(b"tag1");
+        let s2 = key_slot(b"tag2");
+        for k in [b"{tag1}a".as_ref(), b"{tag1}b", b"{tag1}c"] {
+            store.insert_object(0, KvObj::from_bytes(k, b"v", None));
+        }
+        store.insert_object(0, KvObj::from_bytes(b"{tag2}x", b"v", None));
+
+        // A generous limit returns exactly the 3 keys in s1, and ONLY those (not the s2 key).
+        let mut got: Vec<Vec<u8>> = keys_in_slot(&mut store, 0, s1, 10, now)
+            .into_iter()
+            .map(Vec::from)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                b"{tag1}a".to_vec(),
+                b"{tag1}b".to_vec(),
+                b"{tag1}c".to_vec()
+            ]
+        );
+
+        // The limit bounds the result; a 0 limit returns nothing.
+        assert_eq!(keys_in_slot(&mut store, 0, s1, 1, now).len(), 1);
+        assert!(keys_in_slot(&mut store, 0, s1, 0, now).is_empty());
+
+        // Deterministic (ADR-0003): the same store state yields the same bounded prefix every call.
+        assert_eq!(
+            keys_in_slot(&mut store, 0, s1, 2, now),
+            keys_in_slot(&mut store, 0, s1, 2, now)
+        );
+
+        // An empty slot yields no keys.
+        assert!(keys_in_slot(&mut store, 0, an_empty_slot(s1, s2), 10, now).is_empty());
+    }
+
+    #[test]
+    fn slot_partials_skip_lazily_expired_keys() {
+        let mut store = test_store(1);
+        let s = key_slot(b"tag");
+        // A key with a deadline in the past is lazily expired: scan_step skips it, so the slot
+        // count/keys exclude it (it matches what a client could read).
+        store.insert_object(0, KvObj::from_bytes(b"{tag}live", b"v", None));
+        store.insert_object(
+            0,
+            KvObj::from_bytes(b"{tag}dead", b"v", Some(UnixMillis(10))),
+        );
+        let now = UnixMillis(1000); // past the dead key's deadline.
+        assert_eq!(count_keys_in_slot(&mut store, 0, s, now), 1);
+        let keys = keys_in_slot(&mut store, 0, s, 10, now);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(&*keys[0], b"{tag}live");
     }
 
     /// Drive SCAN to completion and return every key seen (as owned byte vecs).
