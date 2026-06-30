@@ -15,11 +15,11 @@
 //! `SlotMap` / `RaftHandle` snapshots, mutating nothing).
 //!
 //! SCOPE: node identity + `cluster_mode`/`enabled` + membership + slot-to-owner + committed epoch +
-//! raft state, in BOTH static and raft modes. The `replication` object reports the node role plus
-//! this node's view of replication (#365 stages 1-3, REPL_FIDELITY.md): a REPLICA carries its master
-//! endpoint + link; a MASTER carries its connected replica's RESOLVED endpoint + offset + lag (0 or 1
-//! in the single-replica model today). The cross-node replica state in CLUSTER SHARDS and the
-//! N-replica model are the remaining #365 follow-ups.
+//! raft state, in BOTH static and raft modes, plus the `migrations` array (the slots actively
+//! migrating in/out of this node, #354). The `replication` object reports the node role plus this
+//! node's view of replication (#365, REPL_FIDELITY.md): a REPLICA carries its master endpoint + link;
+//! a MASTER carries one entry per connected replica (N-replica) with each replica's RESOLVED endpoint
+//! + offset + lag. The cross-node replica state in CLUSTER SHARDS is the remaining #365 follow-up.
 
 use std::sync::Arc;
 
@@ -162,6 +162,9 @@ pub fn render_topology_json(handle: &TopologyHandle, raft: Option<&RaftHandle>) 
         json_str(&mut o, handle.node_id);
         o.push_str("}]");
     }
+    // migrations (#354): the slots actively migrating IN/OUT of THIS node, so the console can
+    // detect a migration in progress and re-poll faster. Empty in standalone / when idle.
+    render_migrations(&mut o, handle);
     o.push_str("},");
 
     // raft: the consensus state (null outside raft-governance mode).
@@ -195,10 +198,49 @@ pub fn render_topology_json(handle: &TopologyHandle, raft: Option<&RaftHandle>) 
     o
 }
 
+/// Render the `,"migrations":[...]` array into the cluster object (#354): one entry per slot that is
+/// currently MIGRATING out of or IMPORTING into this node, with its peer id + endpoint, so the
+/// console can detect a migration and refresh faster. Empty in standalone / when nothing is
+/// migrating. O(slots) on the rare `/topology` read: the per-slot `migration_state` pre-check is a
+/// relaxed atomic load (the node lock is taken ONLY for the few actively-migrating slots), so the hot
+/// `owns()` path and the default static answer are untouched.
+fn render_migrations(o: &mut String, h: &TopologyHandle) {
+    use core::fmt::Write as _;
+    o.push_str(",\"migrations\":[");
+    let Some(map) = h.cluster.as_ref() else {
+        o.push(']');
+        return;
+    };
+    let mut first = true;
+    for slot in 0..=CLUSTER_SLOTS_MAX {
+        let state = match map.migration_state(slot) {
+            ironcache_cluster::MigrationState::Migrating => "migrating",
+            ironcache_cluster::MigrationState::Importing => "importing",
+            ironcache_cluster::MigrationState::None => continue,
+        };
+        if !first {
+            o.push(',');
+        }
+        first = false;
+        let _ = write!(o, "{{\"slot\":{slot},\"state\":\"{state}\"");
+        if let Some(id) = map.migration_peer_id(slot) {
+            o.push_str(",\"peer_id\":");
+            json_str(o, &id);
+        }
+        if let Some((host, port)) = map.migration_peer_endpoint(slot) {
+            o.push_str(",\"peer_host\":");
+            json_str(o, &host);
+            let _ = write!(o, ",\"peer_port\":{port}");
+        }
+        o.push('}');
+    }
+    o.push(']');
+}
+
 /// Render the `replication` object (#365). With no status cell (standalone) it is the
 /// byte-compatible `{"role":"master"}`. A REPLICA reports its master endpoint + link; a MASTER
-/// reports its connected replicas (0 or 1 in the single-replica model today) with each replica's
-/// resolved endpoint + offset + lag. Pure: reads the status snapshot + the slot map, mutates nothing.
+/// reports one entry per connected replica (N-replica), each with its resolved endpoint + offset +
+/// lag. Pure: reads the status snapshot + the slot map, mutates nothing.
 fn render_replication(o: &mut String, h: &TopologyHandle) {
     use core::fmt::Write as _;
     let Some(status) = h.repl_status.as_ref() else {
@@ -386,6 +428,89 @@ mod tests {
         let json = render_topology_json(&h, None);
         assert!(
             json.contains("\"replication\":{\"role\":\"master\",\"replicas\":[]}"),
+            "{json}"
+        );
+    }
+
+    /// #354: a slot actively migrating out of this node appears in the `migrations` array with its
+    /// state + peer, so the console can detect the migration. A non-migrating cluster reports `[]`.
+    #[test]
+    fn topology_reports_actively_migrating_slots() {
+        let self_id = "1111111111111111111111111111111111111111";
+        let dest_id = "2222222222222222222222222222222222222222";
+        let map = ironcache_cluster::SlotMap::build(
+            vec![
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: self_id.into(),
+                        host: "10.0.0.1".into(),
+                        port: 7001,
+                    },
+                    vec![[0, 16383]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: dest_id.into(),
+                        host: "10.0.0.2".into(),
+                        port: 7002,
+                    },
+                    vec![],
+                ),
+            ],
+            self_id,
+        )
+        .unwrap();
+        // Idle: the migrations array is empty.
+        let h0 = TopologyHandle {
+            node_id: self_id,
+            cluster_enabled: true,
+            raft_mode: false,
+            tcp_port: 7001,
+            shards: 1,
+            cluster: Some(Arc::new(
+                ironcache_cluster::SlotMap::build(
+                    vec![(
+                        ironcache_cluster::NodeEntry {
+                            id: self_id.into(),
+                            host: "10.0.0.1".into(),
+                            port: 7001,
+                        },
+                        vec![[0, 16383]],
+                    )],
+                    self_id,
+                )
+                .unwrap(),
+            )),
+            repl_status: None,
+        };
+        assert!(
+            render_topology_json(&h0, None).contains("\"migrations\":[]"),
+            "an idle cluster reports no migrations"
+        );
+
+        // Mark slot 42 MIGRATING toward dest, then it shows up.
+        map.set_migrating(42, dest_id).expect("set_migrating");
+        let h = TopologyHandle {
+            node_id: self_id,
+            cluster_enabled: true,
+            raft_mode: false,
+            tcp_port: 7001,
+            shards: 1,
+            cluster: Some(Arc::new(map)),
+            repl_status: None,
+        };
+        let json = render_topology_json(&h, None);
+        assert!(
+            json.contains("\"migrations\":[{\"slot\":42,\"state\":\"migrating\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"peer_id\":\"2222222222222222222222222222222222222222\""),
+            "{json}"
+        );
+        assert_eq!(
+            json.matches('{').count(),
+            json.matches('}').count(),
             "{json}"
         );
     }

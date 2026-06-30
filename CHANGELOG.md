@@ -151,6 +151,16 @@ release.
 
 ### Added
 
+- The structured `/topology` read now reports in-flight slot migrations (issue #354 enabler):
+  a new `migrations` array inside the `cluster` object, one entry per slot currently MIGRATING
+  out of or IMPORTING into this node, each carrying `{slot, state, peer_id, peer_host,
+  peer_port}` (the `-ASK`/`-MOVED` peer endpoint resolved from the slot map). The console can
+  now detect a resharding in progress and refresh topology faster instead of polling on a fixed
+  cadence. Empty (`[]`) in standalone and whenever nothing is migrating, so the steady-state
+  document is byte-unchanged. PERF: the renderer scans the 16384 slots with a relaxed-acquire
+  atomic load per slot (the same `migration_state` pre-check the hot `owns()` path uses) and
+  takes the node lock ONLY for the few actively-migrating slots, on the rare cold `/topology`
+  read; the data hot path and the all-static default answer are untouched.
 - Multi-replica status model (issue #365, the N-replica structural piece): the primary's
   replication status cell tracked ONE replica (single `connected_slaves`/`slave_offset`/
   `slave_id` atomics), so when the transport served two replicas concurrently (one task
