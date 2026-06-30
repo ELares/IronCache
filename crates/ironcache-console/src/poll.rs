@@ -118,35 +118,19 @@ pub async fn run_poll_loop<C: Clock>(
     }
 
     loop {
-        // Multi-seed failover (#354): try the configured seeds IN ORDER, stopping at the
-        // first reachable one (short-circuit, so a healthy first seed costs exactly one
-        // acquire), then let [`pick_published_seed`] choose which attempt to publish (the
-        // first reachable, or the last attempt if every seed is down so a degraded view
-        // still shows). A single-seed config behaves as before.
-        let mut attempts: Vec<(Topology, &str)> = Vec::new();
-        for seed in &cfg.seeds {
-            let snapshot = acquire_node(
-                clock.as_ref(),
-                seed,
-                tls.as_ref(),
-                auth.as_ref(),
-                connect_timeout,
-                op_timeout,
-            )
-            .await;
-            let topology = single_node_topology(clock.as_ref(), snapshot);
-            let reachable = topology.any_reachable();
-            attempts.push((topology, seed));
-            if reachable {
-                break;
-            }
-            tracing::warn!(
-                seed = %seed,
-                "console poll: seed node unreachable; trying the next seed"
-            );
-        }
-        let flags: Vec<bool> = attempts.iter().map(|(t, _)| t.any_reachable()).collect();
-        let chosen = pick_published_seed(&flags).and_then(|idx| attempts.into_iter().nth(idx));
+        // Multi-seed failover (#354): one acquisition pass over the configured seeds,
+        // returning the topology to publish (the first reachable, or the last attempt if
+        // every seed is down). Extracted into [`acquire_failover_topology`] so the
+        // failover is integration-tested against fake nodes (#368) without this loop.
+        let chosen = acquire_failover_topology(
+            clock.as_ref(),
+            &cfg.seeds,
+            tls.as_ref(),
+            auth.as_ref(),
+            connect_timeout,
+            op_timeout,
+        )
+        .await;
         if let Some((mut topology, seed)) = chosen {
             // Cluster topology discovery (#354): when the seed's HTTP admin URL is configured, fetch
             // the structured `/topology` (#365) and fold the membership/slots/epoch/raft view in.
@@ -200,6 +184,41 @@ pub async fn run_poll_loop<C: Clock>(
     }
 }
 
+/// One failover acquisition pass (#354/#447): try `seeds` IN ORDER, acquiring each into
+/// a single-node [`Topology`] and stopping at the first reachable one (short-circuit, so
+/// a healthy first seed costs exactly one acquire). Returns the topology to PUBLISH per
+/// [`pick_published_seed`] (the first reachable, or the last attempt if every seed is
+/// down so a degraded view still shows) and the seed it came from; `None` only when there
+/// are no seeds. This is the testable core of the poll loop: it is driven against fake
+/// nodes (#368) over real sockets without running the infinite [`run_poll_loop`].
+async fn acquire_failover_topology<C: Clock>(
+    clock: &C,
+    seeds: &[String],
+    tls: Option<&NodeTls>,
+    auth: Option<&NodeAuth>,
+    connect_timeout: Duration,
+    op_timeout: Duration,
+) -> Option<(Topology, String)> {
+    let mut attempts: Vec<(Topology, &str)> = Vec::new();
+    for seed in seeds {
+        let snapshot = acquire_node(clock, seed, tls, auth, connect_timeout, op_timeout).await;
+        let topology = single_node_topology(clock, snapshot);
+        let reachable = topology.any_reachable();
+        attempts.push((topology, seed.as_str()));
+        if reachable {
+            break;
+        }
+        tracing::warn!(
+            seed = %seed,
+            "console poll: seed node unreachable; trying the next seed"
+        );
+    }
+    let flags: Vec<bool> = attempts.iter().map(|(t, _)| t.any_reachable()).collect();
+    pick_published_seed(&flags)
+        .and_then(|idx| attempts.into_iter().nth(idx))
+        .map(|(t, s)| (t, s.to_owned()))
+}
+
 /// The seed-failover publish policy (#354): given each configured seed's reachability
 /// in seed order, which one's topology do we publish? The FIRST reachable seed, or (if
 /// none is reachable) the LAST seed, so a degraded-but-informative view is still shown.
@@ -251,6 +270,134 @@ mod tests {
         // All seeds unreachable -> keep the LAST attempt's degraded view.
         assert_eq!(pick_published_seed(&[false, false]), Some(1));
         assert_eq!(pick_published_seed(&[false, false, false]), Some(2));
+    }
+
+    // ===================== #368: multi-seed failover over real sockets =====================
+    // A controllable fake RESP node drives the REAL acquire path (acquire_node ->
+    // single_node_topology -> the failover selection) end to end, so the resilience #447
+    // added is integration-tested, not only its pure policy fn.
+
+    /// A single-connection fake RESP node: it answers the EXACT acquire_node sequence
+    /// (PING -> `+PONG`, INFO -> the bulk body, SLOWLOG GET -> empty array, CLIENT LIST ->
+    /// empty bulk) on ONE connection, then closes. The client awaits each reply before the
+    /// next command, so a fixed-order reply sequence matches the sequence. Returns its
+    /// loopback address + the server task (abort it at the end of the test).
+    async fn spawn_up_node(info_body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let Ok((mut sock, _peer)) = listener.accept().await else {
+                return;
+            };
+            let info = format!("${}\r\n{info_body}\r\n", info_body.len());
+            let replies: [&[u8]; 4] = [b"+PONG\r\n", info.as_bytes(), b"*0\r\n", b"$0\r\n\r\n"];
+            let mut buf = [0u8; 2048];
+            for reply in replies {
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if sock.write_all(reply).await.is_err() {
+                    return;
+                }
+            }
+            // Brief grace so the client reads the last reply cleanly before the close.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        (addr, server)
+    }
+
+    /// A loopback address with NO acceptor (bind then DROP the listener), so a connect is
+    /// refused: a "down" seed.
+    async fn closed_addr() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().to_string()
+        // listener dropped here -> the port has no acceptor.
+    }
+
+    #[tokio::test]
+    async fn failover_skips_a_down_first_seed_and_publishes_the_reachable_one() {
+        let env = SystemEnv::new();
+        let down = closed_addr().await;
+        let (up, server) = spawn_up_node("redis_version:9.9.9\r\nconnected_clients:2\r\n").await;
+        let seeds = vec![down, up.clone()];
+        let (topo, seed) = acquire_failover_topology(
+            &env,
+            &seeds,
+            None,
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("a non-empty seed list yields a topology");
+        assert!(
+            topo.any_reachable(),
+            "failed over to the reachable second seed"
+        );
+        assert_eq!(seed, up, "published the up seed, not the down first one");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failover_with_all_seeds_down_publishes_a_degraded_view_not_nothing() {
+        let env = SystemEnv::new();
+        let seeds = vec![closed_addr().await, closed_addr().await];
+        let (topo, _seed) = acquire_failover_topology(
+            &env,
+            &seeds,
+            None,
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("a degraded view is still published when every seed is down");
+        assert!(
+            !topo.any_reachable(),
+            "all seeds down -> an unreachable (degraded) view, not a fabricated reachable one"
+        );
+        assert!(
+            !topo.nodes.is_empty(),
+            "the degraded view still lists the node + its error for the UI"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_with_no_seeds_is_none() {
+        let env = SystemEnv::new();
+        let none = acquire_failover_topology(
+            &env,
+            &[],
+            None,
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(none.is_none(), "no seeds -> nothing to publish");
+    }
+
+    #[tokio::test]
+    async fn a_single_healthy_seed_is_reachable_with_parsed_info() {
+        let env = SystemEnv::new();
+        let (up, server) = spawn_up_node("redis_version:7.7.7\r\nconnected_clients:5\r\n").await;
+        let (topo, seed) = acquire_failover_topology(
+            &env,
+            std::slice::from_ref(&up),
+            None,
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("one healthy seed yields a topology");
+        assert!(topo.any_reachable());
+        assert_eq!(seed, up);
+        // The INFO the fake served was parsed into the node view.
+        let node = topo.nodes.first().expect("the reachable node is listed");
+        assert!(node.reachable);
+        server.abort();
     }
 
     #[test]

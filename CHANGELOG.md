@@ -151,6 +151,17 @@ release.
 
 ### Added
 
+- Console multi-seed failover socket harness (issue #368, extending #354/#447): the
+  poll loop's per-tick failover acquisition is extracted into a testable
+  `acquire_failover_topology` (the run loop is now a thin driver over it), and a
+  controllable fake RESP node (it answers the exact `acquire_node` sequence
+  PING/INFO/SLOWLOG/CLIENT-LIST on one connection; "down" is a bound-then-dropped
+  loopback port) drives the REAL acquire path over real sockets. New integration tests
+  assert the resilience #447 added end to end: failover skips a down first seed and
+  publishes the reachable one, all-seeds-down publishes a degraded (unreachable but
+  node-listed) view rather than nothing, no seeds yields `None`, and a single healthy
+  seed parses its INFO. Previously only the pure `pick_published_seed` policy was
+  unit-tested. The RESP-node fault scenarios round out #368's `/topology` churn slice.
 - Console slot-migration / FLIP action (issue #361, the online-migration control):
   `POST /api/cluster/setslot` drives `CLUSTER SETSLOT <slot> {NODE|MIGRATING|IMPORTING}
   <node-id>` or `<slot> STABLE`, with a "Migrate slot" card (slot + action select +
