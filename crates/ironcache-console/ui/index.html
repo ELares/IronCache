@@ -613,6 +613,28 @@
                 </table>
               </div>
             </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Failover</h2>
+                <span class="card-sub">admin, destructive</span>
+              </div>
+              <p class="card-note">
+                Promote THIS node to primary for the slots it replicates. The engine
+                refuses it unless this node is an in-sync replica, so it cannot lose
+                committed writes; FORCE / TAKEOVER are not offered. Type FAILOVER to
+                confirm.
+              </p>
+              <p id="failover-gate" class="ks-status" hidden>
+                Admin token required to trigger a failover.
+              </p>
+              <div class="config-toolbar">
+                <label class="visually-hidden" for="failover-confirm">Type FAILOVER to confirm</label>
+                <input id="failover-confirm" class="ks-input mono" type="text" placeholder="type FAILOVER to confirm" autocomplete="off" spellcheck="false" />
+                <button id="failover-trigger" class="btn btn-primary" type="button">Trigger failover</button>
+              </div>
+              <p id="failover-status" class="ks-status" hidden></p>
+            </div>
           </section>
 
           <section class="section" id="section-replication" data-section-panel="replication" hidden>

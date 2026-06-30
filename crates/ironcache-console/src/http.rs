@@ -467,7 +467,8 @@ fn is_management_write(method: &str, path: &str) -> bool {
             | "/api/command"
             | "/api/pubsub/publish"
             | "/api/acl/user"
-            | "/api/persistence/save",
+            | "/api/persistence/save"
+            | "/api/cluster/failover",
         ) => true,
         // The dynamic key family: a bare `/api/keys` POST is NOT a write (SET needs
         // a key), but `/api/keys/{k}` POST (SET) and DELETE (DEL) are.
@@ -503,6 +504,12 @@ async fn dispatch_manage(
         // Read-only rebalance dry-run plan (the slot diff before any apply). Admin-tier
         // via ADMIN_READ_ROUTES; the engine refuses APPLY, so this never mutates.
         ("GET", "/api/cluster/rebalance-plan") => manage::cluster_rebalance_plan(client).await,
+        // MUTATING: trigger a bare CLUSTER FAILOVER (engine-gated to in-sync replicas).
+        // Admin-tier (a write) + a typed destructive-confirmation in the body.
+        ("POST", "/api/cluster/failover") => match parse_body::<manage::FailoverBody>(body) {
+            Ok(b) => manage::cluster_failover(client, &b).await,
+            Err(resp) => resp,
+        },
         // ---- config ----
         ("GET", "/api/config") => manage::config_get(client).await,
         ("POST", "/api/config") => match parse_body::<manage::ConfigSetBody>(body) {

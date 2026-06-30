@@ -1191,6 +1191,18 @@ const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/api/cluster/failover": {
+      "post": {
+        "summary": "Trigger a bare CLUSTER FAILOVER (ADMIN, MUTATING). Engine-gated to an in-sync replica; FORCE/TAKEOVER not offered. Requires confirm=FAILOVER. #361.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FailoverBody" } } } },
+        "responses": {
+          "200": { "description": "The failover was proposed/accepted by the node.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Missing / wrong confirmation token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "The node refused the failover (e.g. not an in-sync replica) or is unreachable.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/acl": {
       "get": {
         "summary": "ACL WHOAMI + LIST + CAT (ADMIN: the full user/permission set).",
@@ -1523,6 +1535,11 @@ const OPENAPI_JSON: &str = r##"{
           "command": { "type": "string" },
           "reply": { "$ref": "#/components/schemas/RenderedReply" }
         }
+      },
+      "FailoverBody": {
+        "type": "object",
+        "properties": { "confirm": { "type": "string", "description": "Must equal \"FAILOVER\"." } },
+        "required": ["confirm"]
       },
       "RebalancePlanResponse": {
         "type": "object",
@@ -1929,11 +1946,16 @@ mod tests {
             "/api/persistence",
             "/api/persistence/save",
             "/api/cluster/rebalance-plan",
+            "/api/cluster/failover",
         ] {
             assert!(paths.contains_key(p), "openapi missing path {p}");
         }
         // The management write paths document their mutating verb.
         assert!(paths["/api/config"].get("post").is_some(), "config POST");
+        assert!(
+            paths["/api/cluster/failover"].get("post").is_some(),
+            "failover POST"
+        );
         assert!(paths["/api/keys/{k}"].get("delete").is_some(), "key DELETE");
         assert!(paths["/api/command"].get("post").is_some(), "command POST");
         assert!(
