@@ -134,7 +134,35 @@ pub async fn fetch_cluster_topology(
     if !(200..300).contains(&resp.status) {
         return Err(format!("/topology returned HTTP {}", resp.status));
     }
-    parse_cluster_topology(&resp.body_string())
+    let topology = parse_cluster_topology(&resp.body_string())?;
+    // The central hazard (#368): a split-ownership slot map (one slot under two owners). The
+    // engine's committed-epoch fence is supposed to make this impossible, so if it ever appears
+    // surface it LOUDLY rather than silently rendering a lie. The view is still returned (do not
+    // hide engine state from the operator), but the warning flags the incoherence.
+    if !slot_ranges_are_disjoint(&topology.cluster.slots) {
+        tracing::warn!(
+            url = %url,
+            epoch = topology.cluster.committed_epoch,
+            "/topology slot ranges OVERLAP (a split-ownership view the epoch fence should prevent); \
+             the slot map is not coherent"
+        );
+    }
+    Ok(topology)
+}
+
+/// Whether the slot ranges are pairwise DISJOINT, i.e. no slot falls in two ranges (so no slot can
+/// have two owners). This is the console-side guard for the epic's central hazard (#368): the engine
+/// coalesces same-owner ranges and the committed-epoch fence forbids two owners per slot, so a
+/// well-formed `/topology` is always disjoint; a violation means the slot map is incoherent.
+/// O(n log n): sort the ranges by start, then check each starts strictly after the previous one ends.
+#[must_use]
+pub fn slot_ranges_are_disjoint(slots: &[TopoSlotRange]) -> bool {
+    let mut ranges: Vec<(u16, u16)> = slots.iter().map(|s| (s.start, s.end)).collect();
+    ranges.sort_unstable();
+    ranges
+        .windows(2)
+        // Overlap when the next range starts at or before the previous range ends.
+        .all(|w| w[1].0 > w[0].1)
 }
 
 #[cfg(test)]
@@ -266,5 +294,145 @@ mod tests {
             .expect_err("a 503 is an error, not a parse attempt");
         assert!(err.contains("HTTP 503"), "{err}");
         server.abort();
+    }
+
+    // ===================== #368: topology-correctness-under-churn =====================
+    // A deterministic harness that drives the REAL fetch+parse path against controllable stub
+    // `/topology` servers through a churn sequence, asserting the console never adopts an
+    // incoherent (split-ownership) slot map and never regresses the committed epoch (the fence).
+
+    fn slot(start: u16, end: u16, owner: &str) -> TopoSlotRange {
+        TopoSlotRange {
+            start,
+            end,
+            owner_id: Some(owner.to_owned()),
+        }
+    }
+
+    #[test]
+    fn slot_ranges_disjoint_accepts_coherent_maps_and_rejects_overlap() {
+        // Empty + single are trivially disjoint.
+        assert!(slot_ranges_are_disjoint(&[]));
+        assert!(slot_ranges_are_disjoint(&[slot(0, 16383, "a")]));
+        // A coherent two-owner split, in order AND shuffled (the fn sorts first).
+        assert!(slot_ranges_are_disjoint(&[
+            slot(0, 8191, "a"),
+            slot(8192, 16383, "b")
+        ]));
+        assert!(slot_ranges_are_disjoint(&[
+            slot(8192, 16383, "b"),
+            slot(0, 8191, "a")
+        ]));
+        // Slot 8192 falls in BOTH ranges -> a split-ownership view.
+        assert!(!slot_ranges_are_disjoint(&[
+            slot(0, 8192, "a"),
+            slot(8192, 16383, "b")
+        ]));
+        // A range fully inside another also overlaps.
+        assert!(!slot_ranges_are_disjoint(&[
+            slot(0, 16383, "a"),
+            slot(100, 200, "b")
+        ]));
+        // Two ranges starting on the same slot overlap.
+        assert!(!slot_ranges_are_disjoint(&[
+            slot(0, 10, "a"),
+            slot(0, 5, "b")
+        ]));
+    }
+
+    // Churn frames: snapshots the engine might serve mid-migration / mid-failover. All are
+    // COHERENT (disjoint slots), with a non-decreasing committed epoch and an evolving leader.
+    const FRAME_TWO_NODE_EPOCH7: &str = r#"{"schema_version":1,
+        "node":{"id":"aaa","engine_version":"2026.6.29","tcp_port":7000,"shards":4},
+        "cluster":{"mode":"raft","enabled":true,"committed_epoch":7,
+            "members":[{"id":"aaa","host":"10.0.0.1","port":7000},{"id":"bbb","host":"10.0.0.2","port":7001}],
+            "slots":[{"start":0,"end":8191,"owner_id":"aaa"},{"start":8192,"end":16383,"owner_id":"bbb"}]},
+        "raft":{"is_leader":true,"leader_id":1,"term":3,"commit_index":42,"voters":3},
+        "replication":{"role":"master"}}"#;
+    // Epoch bumped 7 -> 8, slots remapped (aaa sheds the 4096..8191 band to bbb), leader 1 -> 2.
+    const FRAME_TWO_NODE_EPOCH8_REMAP: &str = r#"{"schema_version":1,
+        "node":{"id":"aaa","engine_version":"2026.6.29","tcp_port":7000,"shards":4},
+        "cluster":{"mode":"raft","enabled":true,"committed_epoch":8,
+            "members":[{"id":"aaa","host":"10.0.0.1","port":7000},{"id":"bbb","host":"10.0.0.2","port":7001}],
+            "slots":[{"start":0,"end":4095,"owner_id":"aaa"},{"start":4096,"end":16383,"owner_id":"bbb"}]},
+        "raft":{"is_leader":false,"leader_id":2,"term":4,"commit_index":58,"voters":3},
+        "replication":{"role":"master"}}"#;
+
+    #[tokio::test]
+    async fn churn_sequence_never_yields_a_split_view_or_regressed_epoch() {
+        // standalone (epoch 0) -> two-node split (epoch 7, leader 1) -> remap (epoch 8, leader 2).
+        let frames: [(&str, &str); 3] = [
+            ("standalone", STANDALONE),
+            ("split-epoch7", FRAME_TWO_NODE_EPOCH7),
+            ("remap-epoch8", FRAME_TWO_NODE_EPOCH8_REMAP),
+        ];
+        let mut last_epoch = 0u64;
+        let mut last_leader: Option<u64> = None;
+        for (name, body) in frames {
+            let (base, server) = stub_topology_server(200, body).await;
+            let t = fetch_cluster_topology(&base, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|e| panic!("frame {name} should fetch: {e}"));
+            server.abort();
+            // INVARIANT 1: never a split-ownership view.
+            assert!(
+                slot_ranges_are_disjoint(&t.cluster.slots),
+                "frame {name}: the console adopted a split-ownership slot map"
+            );
+            // INVARIANT 2: the committed epoch (the fence) never goes backward across the churn.
+            assert!(
+                t.cluster.committed_epoch >= last_epoch,
+                "frame {name}: committed epoch regressed {last_epoch} -> {}",
+                t.cluster.committed_epoch
+            );
+            last_epoch = t.cluster.committed_epoch;
+            last_leader = t.raft.as_ref().and_then(|r| r.leader_id).or(last_leader);
+        }
+        // The sequence really did advance the epoch and move the leader (the churn happened).
+        assert_eq!(last_epoch, 8, "the epoch advanced to 8");
+        assert_eq!(last_leader, Some(2), "the leader moved to node 2");
+    }
+
+    #[tokio::test]
+    async fn a_split_ownership_topology_is_returned_but_flagged_incoherent() {
+        // A malformed engine answer where slot 8192 has TWO owners. The fetch still returns it
+        // (we do not hide engine state), but the coherence guard reports the overlap so the
+        // discovery layer can warn. This is the defensive path for the central hazard.
+        const SPLIT: &str = r#"{"schema_version":1,
+            "node":{"id":"aaa","engine_version":"2026.6.29","tcp_port":7000,"shards":4},
+            "cluster":{"mode":"raft","enabled":true,"committed_epoch":9,
+                "members":[{"id":"aaa","host":"10.0.0.1","port":7000},{"id":"bbb","host":"10.0.0.2","port":7001}],
+                "slots":[{"start":0,"end":8192,"owner_id":"aaa"},{"start":8192,"end":16383,"owner_id":"bbb"}]},
+            "raft":null,"replication":{"role":"master"}}"#;
+        let (base, server) = stub_topology_server(200, SPLIT).await;
+        let t = fetch_cluster_topology(&base, Duration::from_secs(2), Duration::from_secs(2))
+            .await
+            .expect("a parseable body is returned even when incoherent");
+        server.abort();
+        assert!(
+            !slot_ranges_are_disjoint(&t.cluster.slots),
+            "the overlap (slot 8192 owned twice) must be detectable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_down_node_degrades_gracefully_not_fatally() {
+        // Bind then DROP the listener so the port has no acceptor (connection refused / times
+        // out): discovery must surface a typed Err (a best-effort miss), never panic.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let base = format!("http://{addr}");
+        let result = fetch_cluster_topology(
+            &base,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a down node is a best-effort Err, not a panic or a fabricated topology"
+        );
     }
 }
