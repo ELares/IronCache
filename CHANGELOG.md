@@ -151,6 +151,19 @@ release.
 
 ### Added
 
+- Design doc `docs/design/REPL_FIDELITY.md` scoping the per-replica replication
+  fidelity remainder of issue #365 (the structured `/topology` read core landed in
+  #439). Fact-checked against the source: the production replica handshake sends
+  `Frame::ReplConf { node: 0 }` (an advisory placeholder, `replica_attach.rs:1270`),
+  so the primary never learns a replica's identity or endpoint, and `ReplNodeStatus`
+  models a single replica, which is why INFO reports `ip=,port=0` and a hardcoded
+  peer offset. The doc establishes that resolution is clean once the id is real
+  (`slot_id(NodeId) = format!("{:040x}", id.0)` is exactly reversible, so a real
+  `NodeId` resolves to a `SlotMap` endpoint in O(members)), and stages the work as
+  three observability-only PRs (advertise identity, capture per replica, report per
+  replica) with an explicit data-safety boundary: it must not touch the
+  full-sync/resume or the ADR-0026 in-sync gate. Design-first per the project's big
+  engine-change discipline.
 - Console multi-seed failover socket harness (issue #368, extending #354/#447): the
   poll loop's per-tick failover acquisition is extracted into a testable
   `acquire_failover_topology` (the run loop is now a thin driver over it), and a
