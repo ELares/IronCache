@@ -44,39 +44,58 @@ Fact-checked against the source on 2026-06-30:
    queried node's own link from the real status cell, but other nodes' replica rows
    are hardcoded (`role master, replication-offset 0, health online`).
 
-## The id-space (why resolution is possible once the id is real)
+## The id-space (the canonical mapping, fact-checked against the source)
 
-The cluster node-id STRING is derived from the u64 raft `NodeId`:
+There are TWO id forms in the tree; getting them straight is essential, because a
+naive `slot_id` round-trip is WRONG for production ids.
 
-```rust
-// raft/src/lib.rs
-fn slot_id(id: NodeId) -> String { format!("{:040x}", id.0) }
-```
+1. **The cluster announce id** is a 40-lowercase-hex STRING. In production it is a
+   RANDOM 160-bit id, `serve.rs::node_id_hex` = `format!("{a:016x}{b:016x}{c:08x}")`
+   over three RNG draws. It is NOT derived from a `u64`.
 
-So the 40-hex string is just the u64 zero-padded, and the mapping is exact in both
-directions:
+2. **The transport `NodeId(u64)`** is DERIVED FROM the announce id by
+   `ironcache_raft_net::node_id_from_announce`, which takes the FIRST 16 hex chars of
+   the announce id as the `u64`:
 
-- u64 -> string: `format!("{:040x}", id)`.
-- string -> u64: `u64::from_str_radix(id, 16)`.
-- string -> endpoint: `SlotMap::nodes()` carries each member's `(id, host, port)`;
-  look the id up.
+   ```rust
+   // raft-net/src/lib.rs
+   pub fn node_id_from_announce(id: &str) -> NodeId {
+       if id.len() >= 16 {
+           if let Ok(v) = u64::from_str_radix(&id[..16], 16) { return NodeId(v); }
+       }
+       /* deterministic FNV-1a fallback for a non-hex id (unreachable for a valid id) */
+   }
+   ```
 
-So GIVEN the replica's real `NodeId`, the primary resolves its advertised
-`(host, port)` with a forward `slot_id` plus a `SlotMap` membership lookup,
-O(members), on the rare `INFO` read. NO new id mapping is needed. The blocker is
-purely that the replica sends `0`.
+   This is the SINGLE source of truth, reused by the leader-hint resolution and the
+   slot-map; the system keeps the first-16-hex prefixes unique across members.
+
+`slot_id(NodeId) = format!("{:040x}", id.0)` (`raft/src/lib.rs`) is a SEPARATE,
+raft-INTERNAL synthesis used only to mint a cluster id FROM a `NodeId` in the
+sim / internal path (leading-24-zeros form). It is NOT the production announce id and
+is NOT the inverse of `node_id_from_announce`; do not use it to resolve a production
+replica.
+
+**Resolution (the correct mechanism).** Given the replica's `NodeId(v)` (from its
+`REPLCONF`), the primary finds the `SlotMap` member `m` whose
+`node_id_from_announce(m.id) == NodeId(v)`, then uses `m`'s `(host, port)`. This is
+exactly the reverse lookup the leader-hint resolution already performs, O(members) on
+the rare `INFO` read. The blocker is purely that the replica advertises `0` today.
 
 ## Design
 
 ### 1. The replica advertises its real identity (the unblocking change)
 
-Populate `Frame::ReplConf.node` with the replica's real raft `NodeId` (the replica
-already holds it in its cluster config) instead of `0`. The frame field ALREADY
-EXISTS and round-trips (`frames.rs`), so this is wire-backward-compatible: an older
-primary ignores it (it is advisory today), a newer primary resolves it. In
-STANDALONE replication (no cluster config, hence no `NodeId`) the replica keeps
-sending `0` and the primary keeps the placeholder endpoint, which is coherent
-because standalone has no membership table to resolve against.
+Populate `Frame::ReplConf.node` with `node_id_from_announce(self_announce_id).0` (the
+replica's own announce id is `ctx.info.cluster_node_id`, already threaded into
+`replica_attach.rs` as `self_node_id`) instead of `0`. The frame field ALREADY EXISTS
+and round-trips (`frames.rs`), so this is wire-backward-compatible: an older primary
+ignores it (it is advisory today), a newer primary resolves it. Use
+`node_id_from_announce` (NOT `u64::from_str_radix` over the whole 40-hex string, which
+overflows a `u64` for a random 160-bit id) so the value is the SAME `NodeId` the rest
+of the system derives. In STANDALONE replication there is no cluster membership to
+resolve against, so the populated id is simply unused and the primary keeps the
+placeholder endpoint, which is coherent.
 
 A stronger variant carries the replica's advertised `host:port` as additional
 `REPLCONF` args, so standalone replication also gets real endpoints. That is a
@@ -106,17 +125,21 @@ state. The in-sync gate keys off the ack/token, never off `node`.
 
 ### 3. INFO / CLUSTER SHARDS / topology report per replica
 
-- `INFO # Replication`: one `slaveN:` line PER entry, `ip` / `port` resolved via
-  `slot_id` + `SlotMap`, `offset` from the entry's real acked, `state = online`
-  while the link is up, `lag` = `head - acked`.
+- `INFO # Replication`: one `slaveN:` line PER entry, `ip` / `port` resolved by the
+  `node_id_from_announce(member.id) == NodeId` reverse lookup over `SlotMap` members,
+  `offset` from the entry's real acked, `state = online` while the link is up, `lag` =
+  `head - acked`.
 - `CLUSTER SHARDS`: each replica node rendered with its real offset / health.
 - `/topology` (#439): the `replication` object gains a `replicas` array of
   `{ id, host, port, offset, lag, link }`.
 
 ## Big-O / cost
 
-- Per `INFO` read: O(R + M), R = connected replicas, M = members (resolve each
-  replica's endpoint). `INFO` is not the data path; this is rare.
+- Per `INFO` read: O(R + M), R = connected replicas, M = members. Build a
+  `NodeId -> (host, port)` map from the members once (O(M), each via
+  `node_id_from_announce`), then resolve each replica in O(1) (O(R) total). `INFO` is
+  not the data path; this is rare. (A naive per-replica scan would be O(R * M); the
+  one-pass map keeps it linear.)
 - Per ack: O(1) atomic update of the replica's own entry. The map is sized at
   attach, not per ack.
 - ZERO data-hot-path / `bytes_per_key` impact: the status cell is node-level cold
