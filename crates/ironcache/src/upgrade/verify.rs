@@ -4,8 +4,9 @@
 //! v1 ships ONE [`Verifier`]: [`Sha256Verifier`], which confirms the new binary's SHA-256 matches
 //! its entry in a release `SHA256SUMS`. This is INTEGRITY (the bytes are the published ones), NOT
 //! AUTHENTICITY (that the publisher is trusted). The cryptographic SIGNATURE ANCHOR is the explicit
-//! #386 follow-up: a `MinisignVerifier` (or a sigstore one) implementing this SAME trait drops in
-//! with NO change to the orchestrator. The trait is the only thing the orchestrator depends on.
+//! #386 follow-up: #386 finalized the anchor as MINISIGN (over cosign/sigstore; ADR-0020 amendment
+//! 2026-06-29), so a `MinisignVerifier` implementing this SAME trait drops in with NO change to the
+//! orchestrator. The trait is the only thing the orchestrator depends on.
 //!
 //! SHA-256 is computed with the workspace's hand-rolled FIPS 180-4 implementation
 //! ([`ironcache_config::sha256_hex`], already used for AUTH-at-rest) -- NO new crypto crate, keeping
@@ -92,10 +93,12 @@ pub trait Verifier {
 /// The v1 verifier: the binary's SHA-256 must equal its `SHA256SUMS` entry. Integrity only;
 /// authenticity is #386.
 ///
-/// TODO(#386): a `MinisignVerifier` implementing [`Verifier`] verifies a detached minisign
-/// signature over the binary against an in-repo/in-docs Ed25519 public key (offline, no PKI), per
-/// docs/design/UPGRADE.md "Verify before swap". It composes with this one (verify the sums entry
-/// AND the signature); the orchestrator is unchanged because it only names the trait.
+/// TODO(#386): #386 finalized the anchor as MINISIGN (ADR-0020 amendment 2026-06-29). A
+/// `MinisignVerifier` implementing [`Verifier`] verifies a detached minisign signature over the
+/// binary (or over `SHA256SUMS`) against an in-repo/in-docs Ed25519 public key (offline, no PKI),
+/// per docs/design/UPGRADE.md "Verify before swap". It composes with this one (verify the sums entry
+/// AND the signature); the orchestrator is unchanged because it only names the trait. The remaining
+/// blockers are operational (release-side per-binary minisign signing + a committed pubkey).
 pub struct Sha256Verifier;
 
 impl Verifier for Sha256Verifier {
