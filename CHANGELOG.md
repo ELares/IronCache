@@ -821,6 +821,14 @@ release.
 
 ### Fixed
 
+- Flaky `ironcache-bench` open-loop unit test on contended CI runners: the
+  `open_loop_no_delay_has_small_latency_and_right_count` test asserted `!res.saturated`,
+  which inherits the strict 0.95 production `SATURATION_FRACTION`, so a shared/heavily
+  contended runner that starved the load generator to right around 95% (a real macOS CI
+  run hit 4742.9/5000 = 94.86%) tripped the flag by ~7 ops/s with no code regression.
+  The test now asserts a generous achieved-rate floor (>= 80% of target), the same
+  CI-noise tolerance its p99 assertion already documents; the production `saturated`
+  flag and its loud CLI warning keep the strict 0.95 cutoff unchanged.
 - Cross-shard atomicity for spanning multi-key + move commands (PROD-9): a SILENT
   partial-apply safety bug. On a multi-shard node (the default; shards == cores) a
   2-key src/dst command (RENAME/RENAMENX/COPY/SMOVE/LMOVE/RPOPLPUSH) or a strided
