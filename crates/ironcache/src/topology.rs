@@ -218,19 +218,21 @@ fn render_replication(o: &mut String, h: &TopologyHandle) {
         }
         ironcache_repl::ReplRole::Master => {
             o.push_str("{\"role\":\"master\",\"replicas\":[");
-            if snap.connected_slaves > 0 {
-                let lag = snap
-                    .slave_lag()
-                    .and_then(ironcache_repl::ReplicaLag::lag)
-                    .unwrap_or(0);
+            // One entry per connected replica (#365 N-replica), each with its resolved endpoint +
+            // offset + lag.
+            for (i, r) in snap.replicas.iter().enumerate() {
+                if i > 0 {
+                    o.push(',');
+                }
+                let lag = snap.slave_lag_of(r.acked).lag().unwrap_or(0);
                 let (host, port) =
-                    resolve_replica_endpoint(h, snap.slave_id).unwrap_or((String::new(), 0));
+                    resolve_replica_endpoint(h, r.node_id).unwrap_or((String::new(), 0));
                 o.push_str("{\"host\":");
                 json_str(o, &host);
                 let _ = write!(
                     o,
                     ",\"port\":{},\"offset\":{},\"lag\":{}}}",
-                    port, snap.slave_offset.0, lag
+                    port, r.acked.0, lag
                 );
             }
             o.push_str("]}");
@@ -320,8 +322,7 @@ mod tests {
         .unwrap();
         let status = Arc::new(ironcache_server::ReplNodeStatus::new());
         status.set_master_head(ironcache_repl::ReplOffset(200));
-        status.set_replica_connected(ironcache_repl::ReplOffset(190)); // lag 10
-        status.set_replica_id(node_id);
+        status.set_replica(node_id, ironcache_repl::ReplOffset(190)); // lag 10
         let h = TopologyHandle {
             node_id: self_id,
             cluster_enabled: true,

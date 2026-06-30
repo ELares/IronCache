@@ -3739,24 +3739,20 @@ fn replication_info(ctx: &ServerContext) -> ReplicationInfo {
     let snap = status.snapshot();
     match snap.role {
         ironcache_repl::ReplRole::Master => {
-            // One `slaveN:` line per connected replica (0 or 1 in the single-shard HA-7d wiring).
-            // The lag is the master's view (`head - replica_acked`), known while connected.
-            let mut slaves = Vec::new();
-            if snap.connected_slaves > 0 {
-                let lag = snap
-                    .slave_lag()
-                    .and_then(ironcache_repl::ReplicaLag::lag)
-                    .unwrap_or(0);
-                // Resolve the replica's REAL advertised endpoint from the `NodeId` it advertised in
-                // its handshake (#365 stages 1-3), via the cluster slot map. `("", 0)` when there is
-                // no cluster (standalone), the id is unset, or the replica is not (yet) a member; the
-                // offset + lag (the load-bearing fields HA-8 + operators read) are always real.
+            // One `slaveN:` line PER connected replica (#365 N-replica): the transport serves N
+            // replicas, each its own entry. The lag is the master's view (`head - replica_acked`),
+            // known while connected; the endpoint is resolved from the replica's advertised `NodeId`
+            // via the cluster slot map (`("", 0)` when standalone / id unset / not yet a member; the
+            // offset + lag, the load-bearing fields, are always real).
+            let mut slaves = Vec::with_capacity(snap.replicas.len());
+            for r in &snap.replicas {
+                let lag = snap.slave_lag_of(r.acked).lag().unwrap_or(0);
                 let (ip, port) =
-                    resolve_replica_endpoint(ctx, snap.slave_id).unwrap_or((String::new(), 0));
+                    resolve_replica_endpoint(ctx, r.node_id).unwrap_or((String::new(), 0));
                 slaves.push(ReplicaLine {
                     ip,
                     port,
-                    offset: snap.slave_offset.0,
+                    offset: r.acked.0,
                     lag,
                 });
             }
@@ -4457,7 +4453,7 @@ mod tests {
         let mut c = ctx(None);
         let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
         status.set_master_head(ironcache_repl::ReplOffset(200));
-        status.set_replica_connected(ironcache_repl::ReplOffset(190)); // lag 10
+        status.set_replica(0, ironcache_repl::ReplOffset(190)); // lag 10, no advertised id
         c.repl_status = Some(status);
         let mut s = state(&c);
         let body = info_text(&c, &mut s, &[b"replication"]);
@@ -4508,8 +4504,7 @@ mod tests {
         c.cluster = Some(std::sync::Arc::new(map));
         let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
         status.set_master_head(ironcache_repl::ReplOffset(200));
-        status.set_replica_connected(ironcache_repl::ReplOffset(190)); // lag 10
-        status.set_replica_id(node_id); // captured at attach (stage 2)
+        status.set_replica(node_id, ironcache_repl::ReplOffset(190)); // lag 10, captured at attach
         c.repl_status = Some(status);
 
         let mut s = state(&c);
@@ -4527,8 +4522,7 @@ mod tests {
         let mut c = ctx(None); // no cluster set
         let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
         status.set_master_head(ironcache_repl::ReplOffset(200));
-        status.set_replica_connected(ironcache_repl::ReplOffset(190));
-        status.set_replica_id(0xABCD); // an id, but no cluster to resolve it against
+        status.set_replica(0xABCD, ironcache_repl::ReplOffset(190)); // an id, but no cluster to resolve it
         c.repl_status = Some(status);
         let mut s = state(&c);
         let body = info_text(&c, &mut s, &[b"replication"]);

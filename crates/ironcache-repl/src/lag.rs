@@ -26,17 +26,18 @@
 //! eligible. HA-7e wires the SIGNAL; the actual promotion (picking the most-caught-up eligible
 //! replica and assigning it the slots) is HA-8.
 //!
-//! ## The node-level status cell (single-writer, no hot-path lock)
+//! ## The node-level status cell (no hot-path lock)
 //!
-//! [`ReplNodeStatus`] is a small `Send + Sync` cell of ATOMICS (no `Mutex`, no hot-path lock):
-//! the repl tasks (the primary per-replica serve task and the replica control/tail task, each a
-//! SINGLE WRITER for its half) publish the current offsets + link state after every step, and
-//! the serve layer reads a [`ReplStatusSnapshot`] of it to render INFO / CLUSTER SHARDS. It is
-//! NODE-LEVEL cold state (one cell per node, updated on the repl cadence, never per stored key),
-//! so it does not touch the data hot path or `bytes_per_key`. The atomics let a reader on any
-//! shard observe a consistent-enough view without taking the writer's executor offline; an
-//! occasional torn read across the two role halves is harmless for observability (each field is
-//! itself atomic, and the role + offsets are written by the one owning task).
+//! [`ReplNodeStatus`] is a small `Send + Sync` cell: the node-level offsets / link / role are
+//! lock-free ATOMICS, and the two COLD collections (the replica-side `master_endpoint` and the
+//! primary-side per-replica [`ReplicaState`] list, #365 N-replica) sit behind a `std::sync::Mutex`
+//! taken ONLY on the repl cadence (attach / ack / detach) + the rare INFO/topology read, NEVER on
+//! the data hot path or per stored key. It is NODE-LEVEL cold state (one cell per node), so it does
+//! not touch `bytes_per_key`. The repl tasks publish after every step (the replica-side control/tail
+//! task writes its half; each primary serve task upserts ITS replica's entry, so N concurrent
+//! replicas no longer clobber a single cell); the serve layer reads a [`ReplStatusSnapshot`] to
+//! render INFO / CLUSTER SHARDS / topology. REPORTING-ONLY: the ADR-0026 in-sync quorum lives in the
+//! separate `InSyncReplicas` counter, not this cell.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
@@ -294,9 +295,9 @@ impl InSyncReplicas {
 /// - `node_offset`: the node's own replication offset (the master's `head`, or the replica's
 ///   applied offset). The CLUSTER SHARDS `replication-offset` + INFO `master_repl_offset` /
 ///   `slave_repl_offset`.
-/// - PRIMARY side: `connected_slaves`, and for the (single, HA-7d) attached replica its
-///   `slave_offset` + whether it is connected (`slave_connected`). INFO's `slaveN:` line + the
-///   per-replica lag (`head - slave_offset`).
+/// - PRIMARY side: the `replicas` list (one [`ReplicaState`] per connected replica, #365
+///   N-replica), each with its advertised `NodeId` + last-acked offset. INFO's `slaveN:` lines +
+///   the per-replica lag (`head - acked`); `connected_slaves` is the list length.
 /// - REPLICA side: `master_link` (up/down), `master_host`/`master_port` (the master endpoint),
 ///   and `master_offset` (the master's head as last seen on the link, for the replica's own lag).
 ///
@@ -308,22 +309,32 @@ impl InSyncReplicas {
 /// written across two cadence steps (a benign torn read for OBSERVABILITY only); the promotion
 /// gate reads the same atomics but is itself driven on the control task, so it sees its own
 /// writes coherently.
+/// One connected replica's primary-side REPORTING state (#365 N-replica): its advertised `NodeId`
+/// (the map key; `0` if it did not advertise) and its last-acked offset (the primary's view). A
+/// renderer resolves the id to the replica's endpoint via the slot map and computes the lag as
+/// `head - acked`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaState {
+    /// The replica's advertised `NodeId` (`0` if it did not advertise an id).
+    pub node_id: u64,
+    /// The replica's last-acked offset, as the primary last recorded it.
+    pub acked: ReplOffset,
+}
+
 #[derive(Debug)]
 pub struct ReplNodeStatus {
     /// The node's replication role tag ([`ReplRole`]). Default 0 = master (standalone posture).
     role: AtomicU8,
     /// The node's own replication offset (master head or replica applied), as a raw `u64`.
     node_offset: AtomicU64,
-    /// PRIMARY: the number of connected replicas (0 or 1 in the single-shard HA-7d wiring).
-    connected_slaves: AtomicU64,
-    /// PRIMARY: the attached replica's last-acked offset (raw `u64`); meaningful when
-    /// `connected_slaves > 0`.
-    slave_offset: AtomicU64,
-    /// PRIMARY: the attached replica's advertised `NodeId` (from its `REPLCONF`, #365 stage 2);
-    /// meaningful when `connected_slaves > 0`. `0` until a (plain, non-import) replica attaches.
-    /// INFO resolves it to the replica's real endpoint via the slot-map reverse lookup. A lock-free
-    /// `AtomicU64` like the offsets, set by the per-replica serve task (the single writer).
-    slave_id: AtomicU64,
+    /// PRIMARY: the connected replicas, one [`ReplicaState`] per attached (plain, non-import) replica
+    /// keyed by its advertised `NodeId` (#365 N-replica). The transport serves N replicas
+    /// concurrently (one task each); each task upserts its own entry on attach + ack and removes it
+    /// on disconnect, so concurrent replicas no longer clobber a single cell. Behind the SAME
+    /// cold-path `std::sync::Mutex` posture as `master_endpoint` (taken on the repl cadence + the rare
+    /// INFO read, never on the data hot path / per stored key). REPORTING-ONLY: the ADR-0026 in-sync
+    /// quorum is the separate `InSyncReplicas` counter, NOT this.
+    replicas: std::sync::Mutex<Vec<ReplicaState>>,
     /// REPLICA: the link to the master tag ([`LinkStatus`]). Default 0 = down (not attached).
     master_link: AtomicU8,
     /// REPLICA: the master's head offset as last observed on the link (raw `u64`), for the
@@ -342,9 +353,7 @@ impl Default for ReplNodeStatus {
         ReplNodeStatus {
             role: AtomicU8::new(ROLE_MASTER),
             node_offset: AtomicU64::new(0),
-            connected_slaves: AtomicU64::new(0),
-            slave_offset: AtomicU64::new(0),
-            slave_id: AtomicU64::new(0),
+            replicas: std::sync::Mutex::new(Vec::new()),
             master_link: AtomicU8::new(LINK_DOWN),
             master_offset: AtomicU64::new(0),
             master_endpoint: std::sync::Mutex::new(None),
@@ -370,28 +379,29 @@ impl ReplNodeStatus {
         Self::store_monotonic(&self.node_offset, head.0);
     }
 
-    /// Publish that a replica is connected with its last-acked offset `acked` (PRIMARY side). The
-    /// single-shard HA-7d wiring tracks one replica; `connected_slaves` is set to 1 and the
-    /// replica's offset advanced monotonically.
-    pub fn set_replica_connected(&self, acked: ReplOffset) {
-        self.connected_slaves.store(1, Ordering::Relaxed);
-        Self::store_monotonic(&self.slave_offset, acked.0);
+    /// Upsert one connected replica's state (PRIMARY side, #365 N-replica): set or advance the entry
+    /// for `node_id` with its last-acked offset (monotonically; a stale lower ack is ignored). Called
+    /// by THAT replica's serve task at its plain attach + each steady ack. A replica that did not
+    /// advertise an id uses `node_id == 0` (it still counts as connected; INFO just cannot resolve its
+    /// endpoint). Cold-path lock (repl cadence + the rare INFO read).
+    pub fn set_replica(&self, node_id: u64, acked: ReplOffset) {
+        if let Ok(mut v) = self.replicas.lock() {
+            if let Some(e) = v.iter_mut().find(|e| e.node_id == node_id) {
+                if acked.0 > e.acked.0 {
+                    e.acked = acked;
+                }
+            } else {
+                v.push(ReplicaState { node_id, acked });
+            }
+        }
     }
 
-    /// Publish the connected replica's advertised `NodeId` (PRIMARY side, #365 stage 2), from its
-    /// `REPLCONF` handshake. Paired with [`Self::set_replica_connected`] at a PLAIN attach (not a
-    /// scoped import) so INFO can resolve the replica's real endpoint via the slot-map. Lock-free,
-    /// like the offset publishers.
-    pub fn set_replica_id(&self, node_id: u64) {
-        self.slave_id.store(node_id, Ordering::Relaxed);
-    }
-
-    /// Publish that the (single) connected replica went away (PRIMARY side): `connected_slaves`
-    /// drops to 0 and its advertised id is cleared. The replica's last offset is left as-is (it is
-    /// only read when connected).
-    pub fn set_replica_disconnected(&self) {
-        self.connected_slaves.store(0, Ordering::Relaxed);
-        self.slave_id.store(0, Ordering::Relaxed);
+    /// Remove one connected replica (PRIMARY side): its link dropped, so it stops being reported.
+    /// Removing an id that is not present is a no-op (e.g. a scoped import that was never recorded).
+    pub fn remove_replica(&self, node_id: u64) {
+        if let Ok(mut v) = self.replicas.lock() {
+            v.retain(|e| e.node_id != node_id);
+        }
     }
 
     // --- REPLICA-side publishers (the control/tail task is the single writer) ---
@@ -437,12 +447,11 @@ impl ReplNodeStatus {
     pub fn snapshot(&self) -> ReplStatusSnapshot {
         let role = ReplRole::from_tag(self.role.load(Ordering::Relaxed));
         let master_endpoint = self.master_endpoint.lock().ok().and_then(|ep| ep.clone());
+        let replicas = self.replicas.lock().map(|v| v.clone()).unwrap_or_default();
         ReplStatusSnapshot {
             role,
             node_offset: ReplOffset(self.node_offset.load(Ordering::Relaxed)),
-            connected_slaves: self.connected_slaves.load(Ordering::Relaxed),
-            slave_offset: ReplOffset(self.slave_offset.load(Ordering::Relaxed)),
-            slave_id: self.slave_id.load(Ordering::Relaxed),
+            replicas,
             master_link: LinkStatus::from_tag(self.master_link.load(Ordering::Relaxed)),
             master_offset: ReplOffset(self.master_offset.load(Ordering::Relaxed)),
             master_endpoint,
@@ -492,13 +501,9 @@ pub struct ReplStatusSnapshot {
     pub role: ReplRole,
     /// The node's own replication offset (master head or replica applied).
     pub node_offset: ReplOffset,
-    /// PRIMARY: the number of connected replicas.
-    pub connected_slaves: u64,
-    /// PRIMARY: the connected replica's last-acked offset (meaningful when `connected_slaves > 0`).
-    pub slave_offset: ReplOffset,
-    /// PRIMARY: the connected replica's advertised `NodeId` (raw `u64`, #365 stage 2; meaningful
-    /// when `connected_slaves > 0`). `0` for an import or a pre-stage-1 replica.
-    pub slave_id: u64,
+    /// PRIMARY: the connected replicas, one per attached replica (#365 N-replica). Empty when none,
+    /// and when this node is itself a replica. Render one `slaveN:` line per entry.
+    pub replicas: Vec<ReplicaState>,
     /// REPLICA: the link to the master.
     pub master_link: LinkStatus,
     /// REPLICA: the master's head offset as last observed on the link (for the replica's lag).
@@ -508,17 +513,18 @@ pub struct ReplStatusSnapshot {
 }
 
 impl ReplStatusSnapshot {
-    /// PRIMARY: the connected replica's lag (`node_offset - slave_offset`) when one is connected,
-    /// else `None`. The replica is treated as up while connected (the primary's serve loop only
-    /// advertises a connected replica), so this is the master's view of how far behind its
-    /// replica is.
+    /// PRIMARY: the number of connected replicas (the `connected_slaves` INFO field).
     #[must_use]
-    pub fn slave_lag(&self) -> Option<ReplicaLag> {
-        if self.connected_slaves == 0 {
-            None
-        } else {
-            Some(ReplicaLag::compute(self.node_offset, self.slave_offset))
-        }
+    pub fn connected_slaves(&self) -> u64 {
+        self.replicas.len() as u64
+    }
+
+    /// PRIMARY: the master's view of one connected replica's lag (`node_offset - acked`), treating
+    /// it as up while connected (the primary's serve loop only records a connected replica). The
+    /// per-replica analog of the old single-replica `slave_lag`.
+    #[must_use]
+    pub fn slave_lag_of(&self, acked: ReplOffset) -> ReplicaLag {
+        ReplicaLag::compute(self.node_offset, acked)
     }
 
     /// REPLICA: this node's own lag relative to its master (`master_offset - node_offset`) when
@@ -589,38 +595,58 @@ mod tests {
         let s = ReplNodeStatus::new().snapshot();
         assert_eq!(s.role, ReplRole::Master);
         assert_eq!(s.node_offset, ReplOffset::ZERO);
-        assert_eq!(s.connected_slaves, 0);
+        assert_eq!(s.connected_slaves(), 0);
+        assert!(s.replicas.is_empty());
         assert_eq!(s.master_link, LinkStatus::Down);
         assert_eq!(s.master_endpoint, None);
-        // A master with no slave -> no slave lag; a (non-attached) replica view is unknown.
-        assert_eq!(s.slave_lag(), None);
     }
 
     #[test]
-    fn primary_publishes_head_and_connected_slave_with_lag() {
+    fn primary_tracks_n_replicas_by_id_with_lag() {
         let status = ReplNodeStatus::new();
         status.set_master_head(ReplOffset(100));
-        status.set_replica_connected(ReplOffset(95));
-        // #365 stage 2: the primary also records the replica's advertised NodeId at attach.
-        status.set_replica_id(0xABCD);
+        // #365 N-replica: two distinct replicas attach, keyed by their advertised NodeId.
+        status.set_replica(0xABCD, ReplOffset(95)); // lag 5
+        status.set_replica(0x1234, ReplOffset(90)); // lag 10
         let s = status.snapshot();
         assert_eq!(s.role, ReplRole::Master);
         assert_eq!(s.node_offset, ReplOffset(100));
-        assert_eq!(s.connected_slaves, 1);
-        assert_eq!(s.slave_offset, ReplOffset(95));
         assert_eq!(
-            s.slave_id, 0xABCD,
-            "the connected replica's advertised id is captured"
+            s.connected_slaves(),
+            2,
+            "both replicas are tracked, not clobbered"
         );
-        // The master's view of its replica's lag: 100 - 95 = 5.
-        assert_eq!(s.slave_lag().and_then(ReplicaLag::lag), Some(5));
+        // Each replica keeps its OWN id + offset; the master's per-replica lag is head - acked.
+        let a = s.replicas.iter().find(|r| r.node_id == 0xABCD).unwrap();
+        assert_eq!(a.acked, ReplOffset(95));
+        assert_eq!(s.slave_lag_of(a.acked).lag(), Some(5));
+        let b = s.replicas.iter().find(|r| r.node_id == 0x1234).unwrap();
+        assert_eq!(s.slave_lag_of(b.acked).lag(), Some(10));
 
-        // The replica disconnects: connected_slaves drops, no slave lag, and the id is cleared.
-        status.set_replica_disconnected();
+        // A re-ack ADVANCES that replica's offset monotonically (a stale lower ack is ignored).
+        status.set_replica(0xABCD, ReplOffset(99));
+        status.set_replica(0xABCD, ReplOffset(40)); // stale, ignored
         let s = status.snapshot();
-        assert_eq!(s.connected_slaves, 0);
-        assert_eq!(s.slave_lag(), None);
-        assert_eq!(s.slave_id, 0, "the advertised id is cleared on disconnect");
+        assert_eq!(
+            s.connected_slaves(),
+            2,
+            "a re-ack updates, does not duplicate"
+        );
+        assert_eq!(
+            s.replicas
+                .iter()
+                .find(|r| r.node_id == 0xABCD)
+                .unwrap()
+                .acked,
+            ReplOffset(99)
+        );
+
+        // One replica disconnects: only its entry is removed.
+        status.remove_replica(0x1234);
+        let s = status.snapshot();
+        assert_eq!(s.connected_slaves(), 1);
+        assert!(s.replicas.iter().all(|r| r.node_id != 0x1234));
+        assert!(s.replicas.iter().any(|r| r.node_id == 0xABCD));
     }
 
     #[test]

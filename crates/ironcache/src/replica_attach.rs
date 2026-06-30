@@ -582,14 +582,13 @@ async fn serve_replica_conn(
     else {
         return; // the peer closed / sent garbage before attaching.
     };
-    // Publish that a replica is connected (PRIMARY side, HA-7e): connected_slaves -> 1 with the
-    // replica's resume offset. INFO renders the `slaveN:` line + the master-side lag from this.
-    status.set_replica_connected(handshake_ack);
-    // #365 stage 2: record the replica's advertised NodeId ONLY for a PLAIN attach (a steady
-    // replica), not a scoped import (`slot_filter` Some, a transient HA-6 slot data-copy that is
-    // not an INFO `slaveN`). Reporting-only: it never affects the sync below.
+    // Publish that THIS replica is connected (PRIMARY side, #365 N-replica): record its entry keyed
+    // by its advertised NodeId + its resume offset, ONLY for a PLAIN attach (a steady replica), not a
+    // scoped import (`slot_filter` Some, a transient HA-6 slot data-copy that is not an INFO
+    // `slaveN`). INFO/topology render one `slaveN:` line per entry. Reporting-only: it never affects
+    // the sync below.
     if slot_filter.is_none() {
-        status.set_replica_id(replica_node_id);
+        status.set_replica(replica_node_id, handshake_ack);
     }
 
     // (2) INCREMENTAL RESUME vs FULL SYNC (HA-7e). A RECONNECTING plain replica advertises its real
@@ -642,7 +641,11 @@ async fn serve_replica_conn(
         let Ok(cut) =
             drive_full_sync_chunked(&rt, &stream, replid, &store_rc, &ring, slot_filter).await
         else {
-            status.set_replica_disconnected(); // the link dropped mid-sync; the replica re-syncs.
+            // The link dropped mid-sync; the replica re-syncs (#365 N-replica: remove only THIS
+            // replica's entry, and only if it was a plain attach we recorded).
+            if slot_filter.is_none() {
+                status.remove_replica(replica_node_id);
+            }
             in_sync.replica_gone(counted); // no-op (never counted pre-sync), kept for uniform cleanup.
             return;
         };
@@ -719,7 +722,10 @@ async fn serve_replica_conn(
             // connection. The replica reconnects and re-attaches, which full-syncs from a fresh
             // cut; the ring's resync latch is cleared by the next attach's rebase-at-head.
             ShipOutcome::ResyncNeeded | ShipOutcome::LinkDown => {
-                status.set_replica_disconnected();
+                // This replica is gone (#365 N-replica: remove only its entry, plain attaches only).
+                if slot_filter.is_none() {
+                    status.remove_replica(replica_node_id);
+                }
                 in_sync.replica_gone(counted); // this replica is gone: drop its quorum contribution.
                 return;
             }
