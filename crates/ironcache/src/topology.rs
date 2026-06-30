@@ -235,4 +235,41 @@ mod tests {
         let json = render_topology_json(&h, None);
         assert!(json.starts_with("{\"schema_version\":1,"), "{json}");
     }
+
+    #[test]
+    fn cluster_mode_renders_members_and_slot_ranges() {
+        // A real SlotMap (self owning a claimed range) exercises the cluster-populated path: the
+        // member's advertised endpoint and the slot-to-owner range must both render.
+        let map = Arc::new(ironcache_cluster::SlotMap::empty_self(
+            "nodeA", "10.0.0.1", 7000,
+        ));
+        map.add_slots(&[0, 1, 2, 3])
+            .expect("claim slots 0..=3 for self");
+        let h = TopologyHandle {
+            node_id: "nodeA",
+            cluster_enabled: true,
+            raft_mode: false,
+            tcp_port: 7000,
+            shards: 1,
+            cluster: Some(map),
+        };
+        let json = render_topology_json(&h, None);
+        assert!(json.contains("\"mode\":\"static\""), "{json}");
+        assert!(json.contains("\"enabled\":true"), "{json}");
+        // The member renders its advertised endpoint from the SlotMap, not a placeholder.
+        assert!(
+            json.contains("\"id\":\"nodeA\",\"host\":\"10.0.0.1\",\"port\":7000"),
+            "member endpoint: {json}"
+        );
+        // The claimed contiguous range 0..=3 is owned by nodeA.
+        assert!(
+            json.contains("\"start\":0,\"end\":3,\"owner_id\":\"nodeA\""),
+            "slot range: {json}"
+        );
+        assert_eq!(
+            json.matches('{').count(),
+            json.matches('}').count(),
+            "balanced braces: {json}"
+        );
+    }
 }
