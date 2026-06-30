@@ -93,6 +93,7 @@ pub fn resolve_tls(cfg: &ConsoleConfig) -> Option<NodeTls> {
 /// `clock` is the env clock seam (snapshot stamps). `cfg` carries the seeds,
 /// interval, and timeouts; `auth`/`tls` are pre-resolved (so the password file is
 /// read once at startup, not every tick).
+#[allow(clippy::too_many_arguments)] // a boot-wiring spawn that threads the resolved poll inputs.
 pub async fn run_poll_loop<C: Clock>(
     clock: Arc<C>,
     cfg: ConsoleConfig,
@@ -101,6 +102,7 @@ pub async fn run_poll_loop<C: Clock>(
     holder: TopologyHolder,
     auth: Option<NodeAuth>,
     tls: Option<NodeTls>,
+    embedded_history: Option<Arc<crate::history_embedded::EmbeddedHistory>>,
 ) {
     let interval = Duration::from_secs(cfg.poll_interval_secs.max(1));
     let connect_timeout = Duration::from_secs(cfg.connect_timeout_secs.max(1));
@@ -140,6 +142,20 @@ pub async fn run_poll_loop<C: Clock>(
                         error = %e,
                         "console poll: /topology discovery failed (best-effort; RESP view kept)"
                     ),
+                }
+            }
+            // Embedded history (#370): record each reachable node's headline INFO figures into the
+            // ring buffer this tick, so the trend panels have samples without an external Prometheus.
+            if let Some(eh) = &embedded_history {
+                for node in &topology.nodes {
+                    if let Some(info) = &node.info {
+                        crate::history_embedded::record_node_samples(
+                            eh,
+                            &node.addr,
+                            info,
+                            node.fetched_unixtime,
+                        );
+                    }
                 }
             }
             let reachable = topology.any_reachable();
@@ -251,6 +267,7 @@ mod tests {
             holder.clone(),
             None,
             None,
+            None,
         ));
         // Give the loop a moment to take its first (no-op) tick.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -319,6 +336,7 @@ mod tests {
             holder.clone(),
             None,
             None,
+            None,
         ));
 
         // Poll for readiness to flip (the first tick completes quickly).
@@ -372,6 +390,7 @@ mod tests {
             metrics.clone(),
             state.clone(),
             holder.clone(),
+            None,
             None,
             None,
         ));

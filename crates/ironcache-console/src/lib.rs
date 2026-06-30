@@ -90,6 +90,9 @@ pub mod cli;
 pub mod cluster;
 pub mod config;
 pub mod history;
+/// The embedded ring-buffer history source (#370): in-memory trend history without an external
+/// Prometheus, behind the same [`history::HistorySource`] interface.
+pub mod history_embedded;
 pub mod http;
 pub mod httpclient;
 pub mod info;
@@ -195,7 +198,7 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
         // The history source (#356): a Prometheus adapter when a `prometheus_url`
         // is configured, else `None` (so `/api/timeseries` answers 503). SECURITY:
         // the base URL comes ONLY from server config here, never from a request.
-        let history = build_history_source(cfg);
+        let (history, embedded_store) = build_history(cfg);
         // Resolve auth/TLS ONCE at startup (read the password file here, not every
         // tick), shared by the poll loop AND the on-demand management connections.
         let node_auth = poll::resolve_auth(cfg).context("reading the node password file")?;
@@ -232,6 +235,7 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
             topology,
             node_auth,
             node_tls,
+            embedded_store,
         ));
 
         let result = tokio::select! {
@@ -251,19 +255,35 @@ fn serve(cfg: &ConsoleConfig) -> anyhow::Result<()> {
     })
 }
 
-/// Build the history source (#356) from config: a [`history::PrometheusSource`]
-/// (boxed behind the `HistorySource` trait object) when `prometheus_url` is set,
-/// else `None`. The query timeouts reuse the node connect/op timeout bounds, so a
-/// down Prometheus times out promptly with the same discipline as the node poller.
+/// Build the history source (#356/#370) from config, returning `(source, embedded_store)`:
+/// - a [`history::PrometheusSource`] when `prometheus_url` is set (Prometheus wins when both are
+///   configured); the `embedded_store` is then `None`;
+/// - else, when `history_embedded_hours` is set, an embedded ring-buffer source (#370) plus the
+///   shared `Arc<EmbeddedHistory>` the POLL LOOP records into (so the query side and the record side
+///   share one buffer);
+/// - else `(None, None)` (so `/api/timeseries` answers 503).
 ///
-/// SECURITY: the base URL is taken ONLY from server config; a request never
-/// supplies it (the SSRF boundary).
-fn build_history_source(cfg: &ConsoleConfig) -> Option<Arc<dyn history::HistorySource>> {
-    let url = cfg.prometheus_url.as_ref()?;
-    let connect_timeout = std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1));
-    let read_timeout = std::time::Duration::from_secs(cfg.op_timeout_secs.max(1));
-    let source = history::PrometheusSource::new(url, connect_timeout, read_timeout);
-    Some(Arc::new(source))
+/// SECURITY: the Prometheus base URL is taken ONLY from server config; a request never supplies it
+/// (the SSRF boundary). The query timeouts reuse the node connect/op timeout bounds.
+fn build_history(
+    cfg: &ConsoleConfig,
+) -> (
+    Option<Arc<dyn history::HistorySource>>,
+    Option<Arc<history_embedded::EmbeddedHistory>>,
+) {
+    if let Some(url) = cfg.prometheus_url.as_ref() {
+        let connect_timeout = std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1));
+        let read_timeout = std::time::Duration::from_secs(cfg.op_timeout_secs.max(1));
+        let source = history::PrometheusSource::new(url, connect_timeout, read_timeout);
+        return (Some(Arc::new(source)), None);
+    }
+    if let Some(hours) = cfg.history_embedded_hours {
+        let retention = std::time::Duration::from_secs(hours.max(1).saturating_mul(3600));
+        let store = Arc::new(history_embedded::EmbeddedHistory::new(retention));
+        let source = history_embedded::EmbeddedSource::new(Arc::clone(&store));
+        return (Some(Arc::new(source)), Some(store));
+    }
+    (None, None)
 }
 
 /// Build the on-demand node-connection factory (#361) from config: the FIRST seed

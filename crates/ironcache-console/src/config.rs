@@ -59,6 +59,10 @@ pub struct ConsoleConfigOverlay {
     pub node_http_url: Option<String>,
     /// Base URL of the Prometheus the console queries for history (#356).
     pub prometheus_url: Option<String>,
+    /// Enable the embedded ring-buffer history (#370) with this retention in HOURS, for a
+    /// standalone deploy with no external Prometheus. Used only when `prometheus_url` is unset
+    /// (Prometheus wins when both are configured). `None` disables it (empty trend panels).
+    pub history_embedded_hours: Option<u64>,
     /// ACL user the console authenticates to nodes as (least-privilege, #367).
     pub node_user: Option<String>,
     /// Path to a file holding the node password (a secret reference, never the
@@ -125,6 +129,11 @@ impl ConsoleConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_PROMETHEUS_URL") {
             overlay.prometheus_url = Some(v);
         }
+        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_HISTORY_EMBEDDED_HOURS") {
+            if let Ok(h) = v.parse::<u64>() {
+                overlay.history_embedded_hours = Some(h);
+            }
+        }
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_NODE_USER") {
             overlay.node_user = Some(v);
         }
@@ -181,6 +190,9 @@ pub struct ConsoleConfig {
     /// cluster-topology discovery (only the RESP INFO view is published).
     pub node_http_url: Option<String>,
     pub prometheus_url: Option<String>,
+    /// Embedded ring-buffer history retention in hours (#370); `None` disables it. Used only when
+    /// `prometheus_url` is unset.
+    pub history_embedded_hours: Option<u64>,
     pub node_user: Option<String>,
     pub node_password_file: Option<PathBuf>,
     pub node_tls: bool,
@@ -203,6 +215,7 @@ impl Default for ConsoleConfig {
             seeds: Vec::new(),
             node_http_url: None,
             prometheus_url: None,
+            history_embedded_hours: None,
             node_user: None,
             node_password_file: None,
             node_tls: false,
@@ -236,6 +249,9 @@ impl ConsoleConfig {
             }
             if let Some(v) = &o.prometheus_url {
                 cfg.prometheus_url = Some(v.clone());
+            }
+            if let Some(v) = o.history_embedded_hours {
+                cfg.history_embedded_hours = Some(v);
             }
             if let Some(v) = &o.node_user {
                 cfg.node_user = Some(v.clone());
