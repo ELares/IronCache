@@ -1542,6 +1542,7 @@ mod tests {
         Topology {
             mode: TopologyMode::Standalone,
             nodes: vec![sample_node()],
+            cluster: None,
             fetched_unixtime: 1_700_000_001,
         }
     }

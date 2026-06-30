@@ -174,6 +174,7 @@ async fn api_cluster_and_nodes_over_tcp() {
             clients_error: None,
             fetched_unixtime: 100,
         }],
+        cluster: None,
         fetched_unixtime: 100,
     };
     *state.topology().write().await = Some(topo);

@@ -151,6 +151,19 @@ release.
 
 ### Added
 
+- Console cluster discovery via the structured `/topology` endpoint (issue #354,
+  core): the console now fetches the engine's `GET /topology` (#365) from a
+  configured per-node HTTP admin URL (`node_http_url` /
+  `IRONCACHE_CONSOLE_NODE_HTTP_URL`) and folds the typed cluster view (membership,
+  slot-to-owner ranges bound to the committed epoch, raft leader/term/commit/voters)
+  into the polled `Topology`, instead of parsing human-readable `CLUSTER NODES`/
+  `SHARDS` text. Discovery is BEST-EFFORT (a fetch/parse miss leaves the cluster view
+  absent and never affects node reachability) and works in STANDALONE mode (the
+  engine's `/topology` returns a coherent single-node answer, so the console never
+  blocks on a leader/epoch/slot-map that does not exist). The parser tolerates
+  unknown future fields (the document is `schema_version`ed), so the per-replica
+  endpoint/lag fidelity (#365 parts 3-4) and the multi-seed-failover / staleness-
+  banner refinements are non-breaking follow-ups.
 - Structured topology read endpoint `GET /topology` (issue #365, core): a versioned
   JSON document on the admin HTTP listener (alongside `/metrics` `/livez` `/readyz`)
   the console reads authoritative topology from (node identity + engine version,

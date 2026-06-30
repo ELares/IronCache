@@ -124,7 +124,24 @@ pub async fn run_poll_loop<C: Clock>(
                 op_timeout,
             )
             .await;
-            let topology = single_node_topology(clock.as_ref(), snapshot);
+            let mut topology = single_node_topology(clock.as_ref(), snapshot);
+            // Cluster topology discovery (#354): when the seed's HTTP admin URL is configured, fetch
+            // the structured `/topology` (#365) and fold the membership/slots/epoch/raft view in.
+            // BEST-EFFORT: a fetch/parse miss leaves `cluster: None` and never affects node
+            // reachability (the RESP view stands on its own). `/topology` is coherent even in
+            // standalone mode, so this also enriches the single-node deployment.
+            if let Some(http_url) = &cfg.node_http_url {
+                match crate::cluster::fetch_cluster_topology(http_url, connect_timeout, op_timeout)
+                    .await
+                {
+                    Ok(ct) => topology.cluster = Some(ct),
+                    Err(e) => tracing::debug!(
+                        url = %http_url,
+                        error = %e,
+                        "console poll: /topology discovery failed (best-effort; RESP view kept)"
+                    ),
+                }
+            }
             let reachable = topology.any_reachable();
             // Publish the topology (even a degraded one) so readers see the
             // latest view + its error strings.
