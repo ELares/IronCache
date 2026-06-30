@@ -151,6 +151,17 @@ pub struct SaveBody {
     pub background: bool,
 }
 
+/// `POST /api/cluster/failover` body (#361): the typed destructive-confirmation. The
+/// operator must echo the literal token [`FAILOVER_CONFIRM`] (`"FAILOVER"`) so a stray
+/// or replayed POST cannot trigger a promotion. No options are accepted: the console
+/// only ever issues a BARE `CLUSTER FAILOVER` (the safe, in-sync-gated form), never
+/// `FORCE`/`TAKEOVER`, which the engine refuses anyway.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailoverBody {
+    /// Must equal [`FAILOVER_CONFIRM`] or the request is a `400`.
+    pub confirm: String,
+}
+
 // ---- response bodies --------------------------------------------------------
 
 /// `{ "ok": true }` for a mutation that the node answered `+OK` to.
@@ -532,6 +543,47 @@ pub async fn cluster_rebalance_plan(client: &mut NodeClient) -> ApiResponse {
             "unexpected CLUSTER REBALANCE reply (not a per-node plan array)",
         ),
     }
+}
+
+/// The literal token a [`FailoverBody`] must carry to authorize a failover.
+pub const FAILOVER_CONFIRM: &str = "FAILOVER";
+
+/// `POST /api/cluster/failover` (#361, the first MUTATING cluster action): issue a BARE
+/// `CLUSTER FAILOVER` to the configured node. In raft mode the engine proposes a
+/// committed `PromoteReplica` of this node's slots through the leader (#443).
+///
+/// SAFE BY ENGINE CONSTRUCTION: the engine refuses the failover unless THIS node is an
+/// in-sync replica (the exact promotion gate the automatic path uses, ADR-0026) and
+/// rejects `FORCE`/`TAKEOVER`, so the console cannot bypass the data-safety gate; a
+/// rejected failover comes back as the node's verbatim `-ERR` (a `502`).
+///
+/// DESTRUCTIVE-CONFIRMATION: the body must carry `{"confirm":"FAILOVER"}` ([`FAILOVER_CONFIRM`])
+/// or it is a `400`, so a stray / replayed POST cannot trigger a promotion. The route is
+/// Admin-tier (mutation) and audit-logged by the HTTP layer.
+///
+/// # Errors
+///
+/// Returns a `400` when the confirmation token is absent/wrong, or a `502` when the node
+/// rejects the failover (e.g. this node is not an in-sync replica) or is unreachable.
+pub async fn cluster_failover(client: &mut NodeClient, body: &FailoverBody) -> ApiResponse {
+    if !failover_confirmed(body) {
+        return ApiResponse::bad_request(
+            "destructive action: re-send with {\"confirm\":\"FAILOVER\"} to trigger a failover",
+        );
+    }
+    let reply = match client.command(&[b"CLUSTER", b"FAILOVER"]).await {
+        Ok(r) => r,
+        Err(e) => return node_error_response(&e),
+    };
+    ok_or_node_text(&reply)
+}
+
+/// Whether a [`FailoverBody`] carries the EXACT confirmation token (trailing form
+/// whitespace tolerated, but the match is otherwise exact + case-sensitive so the
+/// operator must type the deliberate token, not a near-miss). Pure, so the
+/// destructive-confirmation rail is unit-tested without a node.
+fn failover_confirmed(body: &FailoverBody) -> bool {
+    body.confirm.trim() == FAILOVER_CONFIRM
 }
 
 /// Parse a RESP2 `CLUSTER REBALANCE DRYRUN` reply into a [`RebalancePlanResponse`].
@@ -1350,6 +1402,25 @@ mod tests {
             Some("hello")
         );
         assert_eq!(text_of(&RespValue::Integer(1)), None);
+    }
+
+    // ---- CLUSTER FAILOVER destructive-confirmation (#361) ----
+
+    #[test]
+    fn failover_requires_the_exact_confirmation_token() {
+        let body = |c: &str| FailoverBody {
+            confirm: c.to_owned(),
+        };
+        // The exact token (with tolerated surrounding whitespace) confirms.
+        assert!(failover_confirmed(&body("FAILOVER")));
+        assert!(failover_confirmed(&body("  FAILOVER  ")));
+        // A near-miss does NOT: wrong case, empty, partial, or an extra char. A stray /
+        // replayed POST without the deliberate token can never trigger a promotion.
+        assert!(!failover_confirmed(&body("failover")));
+        assert!(!failover_confirmed(&body("")));
+        assert!(!failover_confirmed(&body("FAIL")));
+        assert!(!failover_confirmed(&body("FAILOVER!")));
+        assert!(!failover_confirmed(&body("yes")));
     }
 
     // ---- CLUSTER REBALANCE DRYRUN plan parsing (#361) ----

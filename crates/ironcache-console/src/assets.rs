@@ -297,6 +297,9 @@ mod tests {
             "id=\"rebalance-load\"",
             "id=\"rebalance-body\"",
             "id=\"rebalance-summary\"",
+            // Cluster failover card (#361, destructive: a typed confirmation input).
+            "id=\"failover-confirm\"",
+            "id=\"failover-trigger\"",
         ] {
             assert!(
                 INDEX_HTML.contains(id),
@@ -346,6 +349,8 @@ mod tests {
             "/api/pubsub/publish",
             "/api/acl/user",
             "/api/persistence/save",
+            "/api/cluster/failover",
+            "triggerFailover",
             "fetchMethod",
             "tokenizeCommand",
         ] {

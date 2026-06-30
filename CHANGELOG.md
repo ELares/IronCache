@@ -151,6 +151,20 @@ release.
 
 ### Added
 
+- Console cluster FAILOVER action (issue #361, the first MUTATING cluster action):
+  `POST /api/cluster/failover` issues a bare `CLUSTER FAILOVER` to the configured
+  node (in raft mode the engine proposes a committed `PromoteReplica` of this node's
+  slots through the leader, #443), with a Cluster-view "Failover" card. SAFE BY
+  ENGINE CONSTRUCTION: the engine refuses it unless this node is an in-sync replica
+  (the exact promotion gate the automatic path uses, ADR-0026) and rejects
+  `FORCE`/`TAKEOVER`, so the console cannot bypass the data-safety gate; a refused
+  failover surfaces the node's verbatim reason as a `502`. DESTRUCTIVE-CONFIRMATION:
+  the request body must carry `{"confirm":"FAILOVER"}` (and the SPA makes the operator
+  type the token) or it is a `400`, so a stray / replayed POST can never trigger a
+  promotion. Admin-tier (a write, fail-closed) and audit-logged by the HTTP layer.
+  The CSP posture holds (button wired with `addEventListener`, no inline handler, the
+  token sent only as the `Authorization` header). The rebalance-apply driver,
+  add/remove-node, and migration FLIP actions remain.
 - Console topology-correctness-under-churn harness + coherence guard (issue #368):
   a new `slot_ranges_are_disjoint` checks that a discovered `/topology` slot map has
   no slot under two owners (the epic's "central hazard"); `fetch_cluster_topology`

@@ -763,6 +763,43 @@
     return (v > 0 ? "+" : "") + v.toLocaleString();
   }
 
+  // ----- Cluster: failover (admin, destructive) ----------------------------
+  // POST /api/cluster/failover (#361): trigger a bare CLUSTER FAILOVER, gated by a
+  // typed confirmation. The engine refuses it unless this node is an in-sync replica,
+  // so a 502 carries the node's reason; we surface it verbatim.
+
+  function updateFailoverGate() {
+    var gate = byId("failover-gate");
+    if (gate) {
+      gate.hidden = haveToken();
+    }
+  }
+
+  function triggerFailover() {
+    var input = byId("failover-confirm");
+    var status = byId("failover-status");
+    var confirm = input ? (input.value || "").trim() : "";
+    if (status) {
+      status.hidden = false;
+      setText(status, "Requesting failover...");
+    }
+    fetchMethod("POST", "/api/cluster/failover", { confirm: confirm }).then(function (r) {
+      if (input) {
+        input.value = "";
+      }
+      if (!status) {
+        return;
+      }
+      status.hidden = false;
+      if (r.status === 200) {
+        setText(status, "Failover proposed.");
+      } else {
+        // 400 = missing/wrong confirmation; 502 = the node refused (e.g. not in-sync).
+        setText(status, apiError(r, "Failover failed."));
+      }
+    });
+  }
+
   // ----- Config -------------------------------------------------------------
   var configParams = [];
 
@@ -1615,10 +1652,11 @@
   // poll in refresh().
   function loadManagement(section) {
     if (section === "cluster") {
-      // The rebalance plan is an explicit operator action (a CLUSTER command per
-      // click), so it loads on the button, NOT on every Cluster-tab visit; here we
-      // only refresh the admin-gate note.
+      // The rebalance plan + failover are explicit operator actions (a CLUSTER command
+      // per click), so they fire on their buttons, NOT on every Cluster-tab visit; here
+      // we only refresh the admin-gate notes.
       updateRebalanceGate();
+      updateFailoverGate();
     } else if (section === "config") {
       loadConfig();
     } else if (section === "keyspace") {
@@ -1997,8 +2035,9 @@
 
   // ----- management form wiring (#361) --------------------------------------
   function wireManagement() {
-    // Cluster: load the rebalance dry-run plan on demand (admin).
+    // Cluster: load the rebalance dry-run plan on demand (admin); trigger a failover.
     wireClick("rebalance-load", loadRebalancePlan);
+    wireClick("failover-trigger", triggerFailover);
 
     // Config: filter + apply (per-row Apply wired in configRow).
     var configFilter = byId("config-filter");
