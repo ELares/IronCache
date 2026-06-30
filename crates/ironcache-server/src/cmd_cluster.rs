@@ -123,6 +123,10 @@ pub fn cmd_cluster(ctx: &ServerContext, req: &Request) -> Value {
         b"FORGET" => cluster_forget(ctx, req),
         b"BUMPEPOCH" => cluster_bumpepoch(ctx, req),
         b"SET-CONFIG-EPOCH" => cluster_set_config_epoch(ctx, req),
+        // REBALANCE (#371) is a READ-ONLY planner here: it computes the balanced slot target per
+        // node and reports the per-node move count for an operator to inspect. It mutates nothing;
+        // the slot-moving APPLY driver is a tracked follow-up and is rejected below.
+        b"REBALANCE" => cluster_rebalance(ctx, req),
         // In RAFT-governance mode, REPLICATE and FAILOVER (#371) are handled BEFORE this point by
         // the serve-layer raft mutator (`try_raft_cluster_mutator` proposes the committed
         // `AssignReplica` / `PromoteReplica`), so they only reach here on a NON-raft single node,
@@ -728,6 +732,74 @@ fn cluster_info_body(f: &ClusterInfoFields) -> String {
     )
 }
 
+/// `CLUSTER REBALANCE [DRYRUN]` (#371) -> a READ-ONLY plan: for every known node, the slots it owns
+/// now, the balanced target, and the signed move count (`target - current`; negative sheds, positive
+/// receives). The plan mutates nothing. The slot-moving APPLY driver is a tracked follow-up, so
+/// `APPLY` is rejected here rather than silently dry-running (an operator who asked to apply must
+/// learn it did not, not assume it did).
+///
+/// Output is an array of one map per node: `{node, current_slots, target_slots, slots_to_move}`.
+/// A single-node cluster (cluster enabled, the cluster-disabled gate runs upstream, but no
+/// multi-node `SlotMap` installed) auto-owns the whole space and is trivially balanced (one entry,
+/// zero moves), matching the other single-node CLUSTER projections.
+fn cluster_rebalance(ctx: &ServerContext, req: &Request) -> Value {
+    // Arity: CLUSTER REBALANCE [DRYRUN|APPLY]. DRYRUN is the default and the only supported mode.
+    match req.args.get(2).map(|a| ascii_upper(a)) {
+        None => {}
+        Some(mode) if mode.as_slice() == b"DRYRUN" => {}
+        Some(mode) if mode.as_slice() == b"APPLY" => {
+            return Value::error(ErrorReply::err(
+                "CLUSTER REBALANCE supports only DRYRUN; the slot-moving APPLY driver is a tracked follow-up",
+            ));
+        }
+        Some(_) => {
+            return Value::error(ErrorReply::syntax_error());
+        }
+    }
+    if req.args.len() > 3 {
+        return Value::error(ErrorReply::wrong_arity("cluster|rebalance"));
+    }
+    if let Some(map) = &ctx.cluster {
+        let plan = map
+            .rebalance_plan()
+            .into_iter()
+            .map(|t| rebalance_target_map(&t.node_id, t.current_slots, t.target_slots))
+            .collect();
+        Value::Array(Some(plan))
+    } else {
+        // Single-node cluster: auto-owns every slot and has nowhere to move them (trivially
+        // balanced). Reachable only with cluster ENABLED (the disabled gate ran upstream).
+        let me = rebalance_target_map(
+            ctx.info.cluster_node_id,
+            u32::from(CLUSTER_SLOTS),
+            u32::from(CLUSTER_SLOTS),
+        );
+        Value::Array(Some(vec![me]))
+    }
+}
+
+/// One `CLUSTER REBALANCE` per-node entry: `{node, current_slots, target_slots, slots_to_move}`,
+/// where `slots_to_move = target - current` (signed: negative sheds, positive receives, zero
+/// settled). Counts fit `u32` (<= 16384 slots), so the `i64` delta cannot overflow.
+fn rebalance_target_map(node_id: &str, current: u32, target: u32) -> Value {
+    let to_move = i64::from(target) - i64::from(current);
+    Value::Map(vec![
+        (
+            Value::bulk_str("node"),
+            Value::bulk(node_id.as_bytes().to_vec()),
+        ),
+        (
+            Value::bulk_str("current_slots"),
+            Value::Integer(i64::from(current)),
+        ),
+        (
+            Value::bulk_str("target_slots"),
+            Value::Integer(i64::from(target)),
+        ),
+        (Value::bulk_str("slots_to_move"), Value::Integer(to_move)),
+    ])
+}
+
 /// `CLUSTER SLOTS` -> an array with ONE slot range, `[0, 16383, [ip, port, node_id]]`,
 /// because the single-node cluster owns the entire slot space (slice-1 simplification).
 /// Arity exactly 2.
@@ -1205,6 +1277,8 @@ fn cluster_help() -> Value {
         "    Return the number of keys in <slot>.",
         "GETKEYSINSLOT <slot> <count>",
         "    Return key names stored by current node in a slot.",
+        "REBALANCE [DRYRUN]",
+        "    Report the per-node balanced-slot plan (current, target, slots-to-move). DRYRUN only.",
         "HELP",
         "    Print this help.",
     ];
@@ -1808,6 +1882,104 @@ mod tests {
             .iter()
             .find(|(k, _)| *k == Value::bulk_str(name))
             .map(|(_, v)| v.clone())
+    }
+
+    /// #371: CLUSTER REBALANCE (default / explicit DRYRUN) on a balanced 3-way split proposes no
+    /// real moves: each node's `slots_to_move` is within one slot of zero, the targets sum to the
+    /// whole slot space, and every entry carries the four documented fields.
+    #[test]
+    fn rebalance_dryrun_of_a_balanced_map_proposes_no_real_moves() {
+        let c = ctx_with_map();
+        let check = |plan_val: Value| {
+            let Value::Array(Some(plan)) = plan_val else {
+                panic!("expected an array plan");
+            };
+            assert_eq!(plan.len(), 3, "one entry per known node");
+            let mut total_current = 0i64;
+            let mut total_target = 0i64;
+            for entry in &plan {
+                let Some(Value::Integer(cur)) = node_field(entry, "current_slots") else {
+                    panic!("missing current_slots");
+                };
+                let Some(Value::Integer(tgt)) = node_field(entry, "target_slots") else {
+                    panic!("missing target_slots");
+                };
+                let Some(Value::Integer(mv)) = node_field(entry, "slots_to_move") else {
+                    panic!("missing slots_to_move");
+                };
+                assert!(node_field(entry, "node").is_some(), "missing node id");
+                assert_eq!(mv, tgt - cur, "slots_to_move is the signed delta");
+                assert!(mv.abs() <= 1, "a balanced node barely moves: {mv}");
+                total_current += cur;
+                total_target += tgt;
+            }
+            assert_eq!(
+                total_current,
+                i64::from(CLUSTER_SLOTS),
+                "counts cover the space"
+            );
+            assert_eq!(
+                total_target,
+                i64::from(CLUSTER_SLOTS),
+                "targets conserve the space"
+            );
+        };
+        // The default (no mode) and the explicit DRYRUN render the same plan.
+        check(run(&c, &[b"CLUSTER", b"REBALANCE"]));
+        check(run(&c, &[b"CLUSTER", b"REBALANCE", b"DRYRUN"]));
+    }
+
+    /// #371: a single-node / non-cluster node owns every slot and has nowhere to move them, so its
+    /// plan is one trivially balanced entry with zero moves.
+    #[test]
+    fn rebalance_on_a_single_node_is_trivially_balanced() {
+        let c = enabled(7000);
+        let Value::Array(Some(plan)) = run(&c, &[b"CLUSTER", b"REBALANCE"]) else {
+            panic!("expected an array plan");
+        };
+        assert_eq!(plan.len(), 1, "a single node is the whole cluster");
+        assert_eq!(
+            node_field(&plan[0], "current_slots"),
+            Some(Value::Integer(i64::from(CLUSTER_SLOTS)))
+        );
+        assert_eq!(
+            node_field(&plan[0], "target_slots"),
+            Some(Value::Integer(i64::from(CLUSTER_SLOTS)))
+        );
+        assert_eq!(
+            node_field(&plan[0], "slots_to_move"),
+            Some(Value::Integer(0))
+        );
+    }
+
+    /// #371: APPLY is rejected (the slot-moving driver is a tracked follow-up) so an operator who
+    /// asked to apply learns it did NOT, rather than silently getting a dry-run.
+    #[test]
+    fn rebalance_apply_is_rejected_as_a_tracked_followup() {
+        let c = ctx_with_map();
+        match run(&c, &[b"CLUSTER", b"REBALANCE", b"APPLY"]) {
+            Value::Error(e) => assert!(
+                e.line().contains("APPLY") && e.line().contains("DRYRUN"),
+                "APPLY rejection should name the supported mode: {:?}",
+                e.line()
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// #371: an unrecognized mode is the canonical syntax error (not a silent dry-run).
+    #[test]
+    fn rebalance_rejects_an_unknown_mode() {
+        let c = ctx_with_map();
+        assert!(matches!(
+            run(&c, &[b"CLUSTER", b"REBALANCE", b"SIDEWAYS"]),
+            Value::Error(_)
+        ));
+        // Too many arguments is a wrong-arity error.
+        assert!(matches!(
+            run(&c, &[b"CLUSTER", b"REBALANCE", b"DRYRUN", b"EXTRA"]),
+            Value::Error(_)
+        ));
     }
 
     /// HA-7e: with a node-level repl status cell present and THIS node (ID1) advertising a real

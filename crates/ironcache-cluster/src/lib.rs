@@ -481,6 +481,21 @@ fn new_mig_array(init: u8) -> Box<[AtomicU8; CLUSTER_SLOTS as usize]> {
         .expect("the vec is exactly CLUSTER_SLOTS long")
 }
 
+/// One node's slot-balance position in a [`SlotMap::rebalance_plan`] (#371): how many slots it owns
+/// now versus the balanced target. `target_slots - current_slots` is the signed move count (positive
+/// = the node should RECEIVE that many slots, negative = it should give that many up). The plan is a
+/// DRY-RUN summary; applying it (driving committed `SETSLOT` migrations) is a separate step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebalanceTarget {
+    /// The node id (40-hex announce id).
+    pub node_id: String,
+    /// How many slots the node owns in the committed map now.
+    pub current_slots: u32,
+    /// The balanced target slot count (the assigned slots spread as evenly as possible across the
+    /// known nodes; the first `total % nodes` nodes get one extra so the targets sum to `total`).
+    pub target_slots: u32,
+}
+
 impl SlotMap {
     /// Build and validate a STATIC slot map from the resolved topology and THIS node's announce
     /// id (the slice-2 boot path, byte-for-byte unchanged in behaviour).
@@ -1225,6 +1240,45 @@ impl SlotMap {
         out
     }
 
+    /// Compute a slot-balance plan (#371, the rebalance DRY-RUN): for every known node, how many
+    /// slots it owns now versus a balanced target (the assigned slots spread as evenly as possible
+    /// across the known nodes). PURE + read-only (it mutates nothing); the caller renders it for the
+    /// operator to inspect BEFORE any apply. Applying it (driving committed `SETSLOT` migrations) is
+    /// a separate, gated step.
+    ///
+    /// O(slots + nodes): one pass over the coalesced ranges to count, then one pass over the nodes
+    /// to assign targets. The targets sum to the total assigned slots (the first `total % nodes`
+    /// nodes get one extra), so the plan is conservation-preserving: balancing moves slots, never
+    /// creates or drops them.
+    #[must_use]
+    pub fn rebalance_plan(&self) -> Vec<RebalanceTarget> {
+        let nodes = self.nodes();
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        // Count the slots each node owns now (by its index in `nodes`).
+        let mut current = vec![0u32; nodes.len()];
+        for (start, end, owner_idx) in self.ranges() {
+            if let Some(slot) = current.get_mut(owner_idx) {
+                *slot += u32::from(end.saturating_sub(start)) + 1;
+            }
+        }
+        let total: u32 = current.iter().sum();
+        let n = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+        let base = total / n;
+        let extra = total % n;
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| RebalanceTarget {
+                node_id: node.id.to_string(),
+                current_slots: current[i],
+                // The first `extra` nodes get one extra slot so the targets sum to `total`.
+                target_slots: base + u32::from(u32::try_from(i).unwrap_or(u32::MAX) < extra),
+            })
+            .collect()
+    }
+
     // ----- MUTATORS (slice 3; validate-the-whole-batch-first, then mutate; all-or-nothing) -----
 
     /// `CLUSTER ADDSLOTS / ADDSLOTSRANGE`: claim each slot for THIS node. ALL of `slots` must be
@@ -1770,6 +1824,64 @@ mod tests {
         assert!(map.owns(10922));
         assert!(!map.owns(10923));
         assert_eq!(map.me().id.as_ref(), ID1);
+    }
+
+    #[test]
+    fn rebalance_plan_of_a_balanced_map_proposes_no_moves() {
+        let plan = three_node().rebalance_plan();
+        assert_eq!(plan.len(), 3);
+        // A 16384/3 split is 5461 + 5462 + 5461 (CLUSTER_SLOTS is not divisible by 3), so the
+        // targets are within one slot of the current counts: a balanced map asks for no real moves.
+        for t in &plan {
+            let delta = i64::from(t.target_slots) - i64::from(t.current_slots);
+            assert!(
+                delta.abs() <= 1,
+                "balanced node {} moves {delta}",
+                t.node_id
+            );
+        }
+        let total: u32 = plan.iter().map(|t| t.target_slots).sum();
+        assert_eq!(
+            total,
+            u32::from(CLUSTER_SLOTS),
+            "targets conserve every slot"
+        );
+    }
+
+    #[test]
+    fn rebalance_plan_of_a_skewed_map_levels_the_owners() {
+        // ID0 owns the whole space; ID1 and ID2 are known but empty.
+        let map = SlotMap::build(
+            vec![
+                (node(ID0, "h0", 1), vec![[0, 16383]]),
+                (node(ID1, "h1", 2), vec![]),
+                (node(ID2, "h2", 3), vec![]),
+            ],
+            ID0,
+        )
+        .unwrap();
+        let plan = map.rebalance_plan();
+        assert_eq!(plan[0].current_slots, u32::from(CLUSTER_SLOTS));
+        assert_eq!(plan[1].current_slots, 0);
+        assert_eq!(plan[2].current_slots, 0);
+        // Targets even out (5462 + 5461 + 5461) and still sum to the whole space, so the overloaded
+        // owner sheds ~2/3 of its slots while conservation holds.
+        let total: u32 = plan.iter().map(|t| t.target_slots).sum();
+        assert_eq!(total, u32::from(CLUSTER_SLOTS));
+        assert!(
+            plan[0].target_slots < plan[0].current_slots,
+            "ID0 sheds slots"
+        );
+        assert!(
+            plan[1].target_slots > 0 && plan[2].target_slots > 0,
+            "empty nodes gain slots"
+        );
+        assert!(
+            plan.iter().map(|t| t.target_slots).max().unwrap()
+                - plan.iter().map(|t| t.target_slots).min().unwrap()
+                <= 1,
+            "targets differ by at most one slot"
+        );
     }
 
     #[test]
