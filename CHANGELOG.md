@@ -151,6 +151,18 @@ release.
 
 ### Added
 
+- `CLUSTER REBALANCE [DRYRUN]` slot-balance planner (issue #371, the rebalance
+  half): reports, for every known node, the slots it owns now, the balanced target
+  (the assigned slots spread as evenly as possible across the members), and the
+  signed `slots_to_move` (negative sheds, positive receives). The planner is PURE
+  and READ-ONLY (it mutates nothing); `SlotMap::rebalance_plan` runs in O(slots +
+  nodes) and its targets sum to the total assigned slots, so balancing moves slots
+  without ever creating or dropping one (conservation-preserving). The slot-moving
+  APPLY driver is a tracked follow-up, so `APPLY` is refused (rather than silently
+  dry-running) and an unknown mode is the canonical syntax error. A single-node /
+  non-cluster node reports one trivially balanced entry (zero moves), matching the
+  other single-node `CLUSTER` projections. ACL: admin/dangerous-tier now, so the
+  future APPLY needs no reclassification.
 - Operator-triggered `CLUSTER FAILOVER` (issue #371, the failover half): a bare
   `CLUSTER FAILOVER` on an IN-SYNC replica now proposes a committed
   `ConfigCmd::PromoteReplica` through the leader (the same raft path every other
@@ -162,8 +174,8 @@ release.
   automatic path would not, and a stale replica is never promoted (which would lose
   committed writes). `FORCE` / `TAKEOVER` (which would bypass the in-sync and
   consensus safety) are refused. On a non-raft single node `CLUSTER FAILOVER` stays
-  not-supported (no replicas). The `CLUSTER REBALANCE` controller (the slot-move
-  planner + dry-run, the other half of #371) remains.
+  not-supported (no replicas). With the `CLUSTER REBALANCE` dry-run planner (above)
+  now landed, the remaining #371 piece is the slot-moving APPLY driver.
 - Console cluster aggregation: cache-specific cluster snapshot (issue #357, core):
   `GET /api/cluster` now carries the cluster-wide `hit_ratio` over the aggregate
   totals plus a `cluster_topology` object rolled up from the discovered structured

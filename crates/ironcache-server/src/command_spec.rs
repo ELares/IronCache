@@ -462,6 +462,15 @@ const CLUSTER_SUBCOMMANDS: &[SubcommandSpec] = &[
         admin: true,
         dangerous: true,
     },
+    // REBALANCE (#371) is a DRY-RUN planner today (it mutates nothing), but it is the entry point
+    // to a future slot-moving APPLY, so it is admin/dangerous-tier now to avoid an ACL
+    // reclassification when APPLY lands.
+    SubcommandSpec {
+        name: b"REBALANCE",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
 ];
 
 /// The CONFIG subcommand table, TRANSCRIBED from the authoritative dispatch arms in
@@ -3608,6 +3617,7 @@ pub(crate) mod tests {
             b"REPLICATE",
             b"FAILOVER",
             b"RESET",
+            b"REBALANCE",
         ];
 
         let table = subcommands_of(b"CLUSTER").expect("CLUSTER has a subcommand table");
