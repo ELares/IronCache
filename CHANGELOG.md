@@ -151,6 +151,18 @@ release.
 
 ### Added
 
+- Console embedded ring-buffer history (issue #370): in-memory trend history
+  WITHOUT an external Prometheus, behind the SAME pluggable `HistorySource`
+  interface as the Prometheus adapter (so it is swappable with no API change). The
+  poll loop records each reachable node's headline `INFO` figures (memory, keys,
+  clients, hits/misses, commands, evictions/expirations, mapped to the engine's
+  `ironcache_*` metric names) into a bounded `(metric, node)` ring buffer each tick;
+  `/api/timeseries` then serves trend panels from it. Memory is bounded TWO ways (a
+  retention window in hours + a per-series point cap), the same `is_allowed_metric`
+  allowlist guards queries, and a standalone/OSS deploy with no Prometheus now gets
+  real short-window trends instead of empty panels. Enabled with
+  `history_embedded_hours` / `IRONCACHE_CONSOLE_HISTORY_EMBEDDED_HOURS` (used only
+  when `prometheus_url` is unset; Prometheus wins when both are configured).
 - Console cluster discovery via the structured `/topology` endpoint (issue #354,
   core): the console now fetches the engine's `GET /topology` (#365) from a
   configured per-node HTTP admin URL (`node_http_url` /
