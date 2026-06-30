@@ -151,6 +151,18 @@ release.
 
 ### Added
 
+- Console topology-correctness-under-churn harness + coherence guard (issue #368):
+  a new `slot_ranges_are_disjoint` checks that a discovered `/topology` slot map has
+  no slot under two owners (the epic's "central hazard"); `fetch_cluster_topology`
+  now runs it and logs a loud warning if the engine ever serves a split-ownership
+  map (the committed-epoch fence should make that impossible), surfacing the
+  incoherence instead of silently rendering a lie. A deterministic harness drives the
+  real fetch+parse path against controllable stub `/topology` servers through a churn
+  sequence (standalone, a two-node split at epoch 7 with leader 1, an epoch-8 remap
+  with leader 2) and asserts the console never adopts a split-ownership map and never
+  regresses the committed epoch; plus a node-down case (a closed port degrades to a
+  typed error, never a panic or a fabricated topology) and a split-map case (returned
+  but flagged incoherent).
 - Console topology-staleness banner (issue #354): `GET /api/cluster` now reports
   `topology_age_seconds` (`now - last_poll_unixtime`, computed server-side and
   saturating so a poll stamped a hair ahead of the request clock reads `0`), and the
