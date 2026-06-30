@@ -86,6 +86,9 @@ pub struct MetricsState {
     /// The persistence state, `Some` only when a `data_dir` is configured; read for the
     /// last-save + dirty gauges.
     persist: Option<Arc<crate::persist::PersistState>>,
+    /// The structured-topology read state (#365): membership/slots/epoch + node identity, served as
+    /// JSON at `/topology` (coherent single-node answer in standalone mode). Read-only.
+    topology: crate::topology::TopologyHandle,
 }
 
 /// The boot-anchored clock for uptime. One [`SystemEnv`] whose monotonic `origin` is captured at
@@ -182,7 +185,11 @@ impl ReadyState {
 impl MetricsState {
     /// Build the shared metrics state. `maxmemory` is a closure over the runtime-config cell so a
     /// `CONFIG SET maxmemory` is reflected in the gauge; `raft`/`persist` are the same handles the
-    /// serve layer shares (`None` outside raft-mode / with persistence off).
+    /// serve layer shares (`None` outside raft-mode / with persistence off); `topology` is the
+    /// `/topology` read state (#365).
+    // lint-allow: a boot-wiring constructor that threads the live handles the admin HTTP endpoints
+    // read; bundling these distinct boot products into a struct would just relocate the list.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         registry: MetricsRegistry,
@@ -192,6 +199,7 @@ impl MetricsState {
         maxmemory: Arc<dyn Fn() -> u64 + Send + Sync>,
         raft: Option<ironcache_server::RaftHandle>,
         persist: Option<Arc<crate::persist::PersistState>>,
+        topology: crate::topology::TopologyHandle,
     ) -> Self {
         MetricsState {
             registry,
@@ -202,6 +210,7 @@ impl MetricsState {
             maxmemory,
             raft,
             persist,
+            topology,
         }
     }
 
@@ -277,6 +286,19 @@ impl MetricsState {
                     200,
                     "OK",
                     "text/plain; version=0.0.4; charset=utf-8",
+                    body.as_bytes(),
+                )
+            }
+            "/topology" => {
+                // Structured topology read (#365): the console reads membership/slots/epoch/raft
+                // state from this JSON instead of parsing human-readable CLUSTER text. Read-only by
+                // construction (it only reads the live SlotMap/RaftHandle snapshots).
+                let body =
+                    crate::topology::render_topology_json(&self.topology, self.raft.as_ref());
+                http_response(
+                    200,
+                    "OK",
+                    "application/json; charset=utf-8",
                     body.as_bytes(),
                 )
             }
@@ -527,6 +549,7 @@ mod tests {
             Arc::new(|| 0),
             None,
             None,
+            crate::topology::TopologyHandle::standalone("test-node-id", 6379, 2),
         );
         (state, registry, live, ready)
     }
@@ -570,6 +593,27 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ironcache_uptime_seconds"), "{text}");
+    }
+
+    #[test]
+    fn topology_endpoint_serves_json_with_a_coherent_standalone_answer() {
+        let (state, _registry, _live, _ready) = test_state();
+        let resp = String::from_utf8(state.respond("GET", "/topology")).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+        assert!(
+            resp.contains("Content-Type: application/json"),
+            "topology is served as JSON: {resp}"
+        );
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        // Standalone (test_state has no cluster map): node identity + a single-node slot answer.
+        assert!(body.starts_with("{\"schema_version\":1,"), "{body}");
+        assert!(body.contains("\"id\":\"test-node-id\""), "{body}");
+        assert!(body.contains("\"mode\":\"none\""), "{body}");
+        assert!(
+            body.contains("\"start\":0,\"end\":16383,\"owner_id\":\"test-node-id\""),
+            "self owns all slots: {body}"
+        );
+        assert!(body.contains("\"raft\":null"), "{body}");
     }
 
     #[test]

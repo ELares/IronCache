@@ -42,6 +42,9 @@ pub mod spanning_combine;
 /// commands; spanning RENAME/RENAMENX/COPY/LMPOP/ZMPOP/SORT-STORE are FAIL-LOUD instead.
 pub mod spanning_move;
 pub mod test_support;
+/// The structured topology read endpoint (#365): the versioned JSON `/topology` document the
+/// console reads membership/slots/epoch/raft state from, coherent in standalone mode.
+pub mod topology;
 /// TURNKEY cluster formation (PROD-turnkey): on a FRESH raft cluster the elected leader auto-applies
 /// the shipped static `cluster_topology`'s node table + slot ownership through the Raft log, so a
 /// deploy reaches `cluster_state:ok` with all slots assigned WITHOUT a manual `CLUSTER MEET` /
