@@ -917,6 +917,7 @@ mod tests {
         *state.topology().write().await = Some(crate::snapshot::Topology {
             mode: crate::snapshot::TopologyMode::Standalone,
             nodes: Vec::new(),
+            cluster: None,
             fetched_unixtime: 1,
         });
     }
@@ -1313,6 +1314,7 @@ mod tests {
                 clients_error: None,
                 fetched_unixtime: 42,
             }],
+            cluster: None,
             fetched_unixtime: 42,
         };
         *state.topology().write().await = Some(topo);
@@ -1334,6 +1336,7 @@ mod tests {
         *state.topology().write().await = Some(crate::snapshot::Topology {
             mode: crate::snapshot::TopologyMode::Standalone,
             nodes: Vec::new(),
+            cluster: None,
             fetched_unixtime: 1,
         });
         let nf = String::from_utf8(state.respond_async("GET", "/api/bogus", None).await).unwrap();

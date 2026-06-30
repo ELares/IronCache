@@ -77,6 +77,10 @@ pub struct Topology {
     pub mode: TopologyMode,
     /// The acquired node snapshots. The MVP has exactly one (the first seed).
     pub nodes: Vec<NodeSnapshot>,
+    /// The cluster topology discovered from the seed's structured `/topology` endpoint (#354/#365):
+    /// membership + slot-to-owner + committed epoch + raft state. `None` when no node HTTP URL is
+    /// configured or the discovery fetch missed (best-effort; the RESP `nodes` view is unaffected).
+    pub cluster: Option<crate::cluster::ClusterTopology>,
     /// Unix time (seconds) this topology was assembled.
     pub fetched_unixtime: u64,
 }
@@ -185,6 +189,7 @@ pub fn single_node_topology<C: Clock>(clock: &C, snapshot: NodeSnapshot) -> Topo
     Topology {
         mode,
         nodes: vec![snapshot],
+        cluster: None,
         fetched_unixtime,
     }
 }

@@ -52,6 +52,11 @@ pub struct ConsoleConfigOverlay {
     pub http_addr: Option<String>,
     /// Seed IronCache node addresses (`host:port`) to discover the deployment.
     pub seeds: Option<Vec<String>>,
+    /// Base URL of the seed node's HTTP admin listener (`--metrics-addr`), e.g.
+    /// `http://10.0.0.1:9100`, where the structured `/topology` endpoint lives (#354/#365). When
+    /// set, the poll loop discovers cluster topology (membership/slots/epoch/raft) from it; when
+    /// absent, only the RESP INFO view is published.
+    pub node_http_url: Option<String>,
     /// Base URL of the Prometheus the console queries for history (#356).
     pub prometheus_url: Option<String>,
     /// ACL user the console authenticates to nodes as (least-privilege, #367).
@@ -114,6 +119,9 @@ impl ConsoleConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_SEEDS") {
             overlay.seeds = Some(parse_seed_list(&v));
         }
+        if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_NODE_HTTP_URL") {
+            overlay.node_http_url = Some(v);
+        }
         if let Ok(v) = std::env::var("IRONCACHE_CONSOLE_PROMETHEUS_URL") {
             overlay.prometheus_url = Some(v);
         }
@@ -169,6 +177,9 @@ impl ConsoleConfigOverlay {
 pub struct ConsoleConfig {
     pub http_addr: String,
     pub seeds: Vec<String>,
+    /// The seed node's HTTP admin base URL where `/topology` lives (#354/#365); `None` disables
+    /// cluster-topology discovery (only the RESP INFO view is published).
+    pub node_http_url: Option<String>,
     pub prometheus_url: Option<String>,
     pub node_user: Option<String>,
     pub node_password_file: Option<PathBuf>,
@@ -190,6 +201,7 @@ impl Default for ConsoleConfig {
         ConsoleConfig {
             http_addr: DEFAULT_HTTP_ADDR.to_owned(),
             seeds: Vec::new(),
+            node_http_url: None,
             prometheus_url: None,
             node_user: None,
             node_password_file: None,
@@ -218,6 +230,9 @@ impl ConsoleConfig {
             }
             if let Some(v) = &o.seeds {
                 cfg.seeds.clone_from(v);
+            }
+            if let Some(v) = &o.node_http_url {
+                cfg.node_http_url = Some(v.clone());
             }
             if let Some(v) = &o.prometheus_url {
                 cfg.prometheus_url = Some(v.clone());

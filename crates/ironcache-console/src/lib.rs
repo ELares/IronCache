@@ -85,6 +85,9 @@ pub mod api;
 pub mod assets;
 pub mod auth;
 pub mod cli;
+/// Cluster topology discovery (#354): fetch + parse the engine's structured `/topology` endpoint
+/// (#365) into a typed model, coherent in standalone mode.
+pub mod cluster;
 pub mod config;
 pub mod history;
 pub mod http;
