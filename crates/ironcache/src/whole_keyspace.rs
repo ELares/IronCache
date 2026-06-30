@@ -85,6 +85,35 @@ pub fn merge_keys(replies: Vec<(usize, ShardReply)>) -> Value {
     Value::Array(Some(out))
 }
 
+/// MERGE the per-shard `__ICGETKEYSINSLOT <slot> <count>` partials (#371, the cross-shard half of
+/// `CLUSTER GETKEYSINSLOT`): CONCATENATE the per-shard key arrays (each already bounded to `limit`)
+/// and TRUNCATE the union to `limit`, so the client never receives more than it asked for even though
+/// every shard could supply up to `limit`. Order across shards is irrelevant (Redis promises no
+/// `GETKEYSINSLOT` order); within a shard it is the stable scan order, so the result is deterministic.
+/// A genuine per-shard command Error is surfaced; shard-unavailable contributes no keys.
+#[must_use]
+pub fn merge_getkeysinslot(replies: Vec<(usize, ShardReply)>, limit: usize) -> Value {
+    let mut out: Vec<Value> = Vec::new();
+    for (_, r) in replies {
+        match r.value {
+            Value::Array(Some(keys)) => {
+                for k in keys {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(k);
+                }
+            }
+            Value::Error(e) if !coordinator::is_shard_unavailable(&e) => {
+                return Value::error(e);
+            }
+            _ => {}
+        }
+    }
+    out.truncate(limit);
+    Value::Array(Some(out))
+}
+
 /// MERGE the per-shard `FLUSHDB`/`FLUSHALL` partials: `+OK` IFF EVERY shard succeeded; any
 /// shard error (a syntax error on a bad option, identical on every shard, OR a
 /// shard-unavailable) is surfaced. A flush must be all-or-surfaced so a client never
@@ -132,6 +161,21 @@ pub fn merge_randomkey(replies: Vec<(usize, ShardReply)>, pick: u64) -> Value {
     candidates.swap_remove(idx)
 }
 
+/// The `<count>` limit of an `__ICGETKEYSINSLOT <slot> <count>` internal request: `args[2]` as a
+/// non-negative count. The serve loop only routes a VALIDATED command here (the slot + count already
+/// parsed by `parse_slot_scan`), so this re-read is defensive and falls back to `0` (an empty result,
+/// never a panic) if the arg is somehow missing or malformed.
+fn getkeysinslot_limit(request: &Request) -> usize {
+    request
+        .args
+        .get(2)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&n| n >= 0)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0)
+}
+
 /// The home-core SCATTER-GATHER for a broadcast whole-keyspace command (DBSIZE / KEYS /
 /// FLUSHDB / FLUSHALL / RANDOMKEY): [`fan_out_all`] then the per-command merge, encoding
 /// the merged [`Value`] into `out` with the home connection's `proto`.
@@ -165,10 +209,14 @@ pub async fn fan_out_and_merge(
     .await;
 
     let merged = match cmd_upper {
-        b"DBSIZE" => merge_dbsize(replies),
+        // `__ICCOUNTKEYSINSLOT` (#371) SUMS the per-shard counts exactly like DBSIZE: same merge.
+        b"DBSIZE" | b"__ICCOUNTKEYSINSLOT" => merge_dbsize(replies),
         b"KEYS" => merge_keys(replies),
         b"FLUSHDB" | b"FLUSHALL" => merge_flush(&replies),
         b"RANDOMKEY" => merge_randomkey(replies, randomkey_pick),
+        // `__ICGETKEYSINSLOT` (#371) concatenates the per-shard key arrays and truncates the union
+        // to the `<count>` arg (the cross-shard half of CLUSTER GETKEYSINSLOT).
+        b"__ICGETKEYSINSLOT" => merge_getkeysinslot(replies, getkeysinslot_limit(request)),
         // SCAN is routed to `scan_cross_shard`, never here; any other token cannot reach
         // here (the serve loop only sends WholeKeyspace commands to the fan-out path).
         _ => Value::error(ironcache_protocol::ErrorReply::err(
@@ -366,6 +414,66 @@ mod tests {
             (2, reply(Value::Integer(0))),
         ];
         assert_eq!(merge_dbsize(replies), Value::Integer(8));
+    }
+
+    #[test]
+    fn getkeysinslot_merge_concatenates_then_truncates_to_the_limit() {
+        // A generous limit returns the whole cross-shard union.
+        let replies = vec![
+            (0, reply(Value::Array(Some(vec![bulk("a"), bulk("b")])))),
+            (1, reply(Value::Array(Some(vec![bulk("c")])))),
+            (2, reply(Value::Array(Some(vec![bulk("d"), bulk("e")])))),
+        ];
+        assert_eq!(
+            merge_getkeysinslot(replies, 10),
+            Value::Array(Some(vec![
+                bulk("a"),
+                bulk("b"),
+                bulk("c"),
+                bulk("d"),
+                bulk("e")
+            ]))
+        );
+        // The limit BOUNDS the union even though each shard supplied at most `limit` (so the union
+        // could be `n_shards * limit`): 3 of the 4 keys.
+        let replies = vec![
+            (0, reply(Value::Array(Some(vec![bulk("a"), bulk("b")])))),
+            (1, reply(Value::Array(Some(vec![bulk("c"), bulk("d")])))),
+        ];
+        assert_eq!(
+            merge_getkeysinslot(replies, 3),
+            Value::Array(Some(vec![bulk("a"), bulk("b"), bulk("c")]))
+        );
+        // A 0 limit yields the empty array.
+        let replies = vec![(0, reply(Value::Array(Some(vec![bulk("a")]))))];
+        assert_eq!(
+            merge_getkeysinslot(replies, 0),
+            Value::Array(Some(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn getkeysinslot_merge_surfaces_a_real_error_not_unavailable() {
+        // A genuine command error (identical on every shard) is surfaced.
+        let replies = vec![
+            (0, reply(Value::Array(Some(vec![bulk("a")])))),
+            (1, reply(Value::error(ErrorReply::err("Invalid slot")))),
+        ];
+        assert!(matches!(merge_getkeysinslot(replies, 10), Value::Error(_)));
+        // A shard-unavailable degradation contributes nothing (not surfaced).
+        let replies = vec![
+            (0, reply(Value::Array(Some(vec![bulk("a")])))),
+            (
+                1,
+                reply(Value::error(ErrorReply::err(
+                    coordinator::SHARD_UNAVAILABLE_MSG,
+                ))),
+            ),
+        ];
+        assert_eq!(
+            merge_getkeysinslot(replies, 10),
+            Value::Array(Some(vec![bulk("a")]))
+        );
     }
 
     #[test]

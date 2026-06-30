@@ -3119,6 +3119,13 @@ async fn route_and_dispatch(
         // NOT in the `spec_of` registry (dispatched directly by the coordinator), so a client
         // sending it would already get unknown-command; rejecting it HERE keeps the contract uniform.
         || cmd_upper == crate::persist::ICSAVE
+        // `__ICCOUNTKEYSINSLOT` / `__ICGETKEYSINSLOT` are the INTERNAL #371 slot-scan whole-keyspace
+        // verbs the serve loop rewrites a cluster-mode `CLUSTER COUNTKEYSINSLOT`/`GETKEYSINSLOT` into;
+        // a client must never reach them directly. Like `__ICEXISTS`/`__ICSAVE` they are not in
+        // `spec_of` (a client sending one already gets unknown-command via the home arm), but gating
+        // them here keeps the contract explicit and uniform.
+        || cmd_upper == ironcache_server::ICCOUNTKEYSINSLOT
+        || cmd_upper == ironcache_server::ICGETKEYSINSLOT
     {
         // FIX F: when a client issues an internal verb INSIDE a MULTI, dirty the transaction in
         // addition to replying the unknown-command error, so EXEC returns -EXECABORT exactly as
@@ -3632,6 +3639,17 @@ async fn route_and_dispatch(
                 && route::owner_shard_set(&spec, home.total).is_none()
         };
 
+    // CLUSTER COUNTKEYSINSLOT / GETKEYSINSLOT in cluster mode (#371): a slot's keys span EVERY
+    // shard (the client CRC16 slot vs the FNV owner-shard are independent), so an honest count /
+    // key list must aggregate cross-shard. This fires ONLY for a fully-valid slot-scan AND only
+    // when cluster mode is on; a malformed one (or standalone) falls to the home `CLUSTER` path,
+    // which returns the exact error (or `-ERR cluster support disabled`). The `args[1]` peek runs
+    // only for the CLUSTER command, never on the GET/SET hot path.
+    let cluster_slot_scan: Option<ironcache_server::SlotScan> = (cmd_upper == b"CLUSTER"
+        && ctx.info.cluster_enabled)
+        .then(|| ironcache_server::parse_slot_scan(request))
+        .flatten();
+
     // The routing TARGET shard, if a KEYED command routes to exactly one NON-home shard
     // (else `None` -> the home path). The single-key case keeps the zero-alloc fast path
     // (one hash + compare); only the genuinely multi-key commands pay the `command_keys`
@@ -3736,6 +3754,40 @@ async fn route_and_dispatch(
         // value-object cross-shard transfer / multi-key pop the engine does not expose yet;
         // the reject is the "correct, or explicitly aborted, never silently wrong" contract.
         reject_spanning_move(conn, state_rc, &cmd_upper, out);
+        false
+    } else if let Some(scan) = cluster_slot_scan {
+        // CLUSTER COUNTKEYSINSLOT/GETKEYSINSLOT CROSS-SHARD FAN-OUT (#371): rewrite the validated
+        // slot-scan into its internal whole-keyspace verb and broadcast + merge across EVERY shard,
+        // exactly like DBSIZE (sum) / KEYS (concat). The home shard's partial runs locally + sync;
+        // the rest via their drain loops. Attribute commands_processed like the other fan-out paths
+        // (the per-shard slot-scan partials fold no data counters). `pick = 0`: only RANDOMKEY draws
+        // from the Env RNG seam, so this never perturbs the per-shard SplitMix64 stream (ADR-0003).
+        state_rc.borrow_mut().counters.on_command();
+        let (verb, internal): (&'static [u8], Request) = match scan {
+            ironcache_server::SlotScan::Count { slot } => (
+                ironcache_server::ICCOUNTKEYSINSLOT,
+                Request {
+                    args: vec![
+                        bytes::Bytes::from_static(ironcache_server::ICCOUNTKEYSINSLOT),
+                        bytes::Bytes::from(slot.to_string()),
+                    ],
+                },
+            ),
+            ironcache_server::SlotScan::Get { slot, count } => (
+                ironcache_server::ICGETKEYSINSLOT,
+                Request {
+                    args: vec![
+                        bytes::Bytes::from_static(ironcache_server::ICGETKEYSINSLOT),
+                        bytes::Bytes::from(slot.to_string()),
+                        bytes::Bytes::from(count.to_string()),
+                    ],
+                },
+            ),
+        };
+        crate::whole_keyspace::fan_out_and_merge(
+            inbox, ctx, verb, &internal, conn.db, home.index, 0, out, conn.proto,
+        )
+        .await;
         false
     } else if let Some(target) = target {
         // REMOTE keyed hop: enqueue to the owning shard, await its reply, encode here. The

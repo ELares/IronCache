@@ -1302,6 +1302,41 @@ fn parse_slot(arg: &[u8]) -> Result<u16, ErrorReply> {
     }
 }
 
+/// A FULLY-VALID cross-shard slot-scan `CLUSTER` subcommand the serve loop fans out (#371): the slot,
+/// plus `GETKEYSINSLOT`'s `<count>` bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotScan {
+    /// `CLUSTER COUNTKEYSINSLOT <slot>`.
+    Count { slot: u16 },
+    /// `CLUSTER GETKEYSINSLOT <slot> <count>`.
+    Get { slot: u16, count: usize },
+}
+
+/// Classify `req` as a fully-valid `CLUSTER COUNTKEYSINSLOT`/`GETKEYSINSLOT`, or `None`.
+///
+/// `None` covers anything that is NOT one of those two well-formed (correct arity, valid slot, and
+/// for GET a non-negative count) -- including the wrong subcommand. The serve loop uses this to
+/// decide whether to fan the command out across shards (Some, in cluster mode) or leave it on the
+/// normal `CLUSTER` home path (None), which returns the EXACT Redis error for a malformed one. The
+/// valid set is identical to what [`cluster_countkeysinslot`] / [`cluster_getkeysinslot`] accept, so
+/// a fanned-out command is exactly one those handlers would have answered (vs the placeholder).
+#[must_use]
+pub fn parse_slot_scan(req: &Request) -> Option<SlotScan> {
+    let sub = ascii_upper(req.args.get(1)?);
+    match sub.as_slice() {
+        b"COUNTKEYSINSLOT" if req.args.len() == 3 => Some(SlotScan::Count {
+            slot: parse_slot(&req.args[2]).ok()?,
+        }),
+        b"GETKEYSINSLOT" if req.args.len() == 4 => {
+            let slot = parse_slot(&req.args[2]).ok()?;
+            let count = parse_i64(&req.args[3])?;
+            let count = usize::try_from(count).ok()?; // rejects a negative count.
+            Some(SlotScan::Get { slot, count })
+        }
+        _ => None,
+    }
+}
+
 /// Parse and bounds-check a slot the way Redis's `getSlotOrReply` does for the MUTATOR paths
 /// (ADDSLOTS / DELSLOTS / SETSLOT / ADDSLOTSRANGE / DELSLOTSRANGE). Unlike [`parse_slot`] (the
 /// COUNTKEYSINSLOT / GETKEYSINSLOT path), Redis's `getSlotOrReply` returns the SINGLE message
