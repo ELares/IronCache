@@ -151,6 +151,17 @@ release.
 
 ### Added
 
+- Primary captures the connected replica's advertised id (issue #365, stage 2 of
+  REPL_FIDELITY.md, building on stage 1's #457): `read_attach_handshake` now returns
+  the replica's `NodeId` from its `REPLCONF`, and the primary records it in the status
+  cell (`ReplNodeStatus::set_replica_id`, a lock-free `AtomicU64` like the offsets;
+  surfaced in `ReplStatusSnapshot::slave_id`, cleared on disconnect) ONLY for a PLAIN
+  attach, never a scoped HA-6 import (`slot_filter` is `Some`), since an importer is a
+  transient slot data-copy, not an INFO `slaveN`. DATA-SAFETY: reporting-only; the
+  captured id never affects the full-sync/resume decision or the ADR-0026 in-sync gate
+  (those key off `ack`/`resume_token`/`slot_filter`, never the id). Stage 3 (resolve
+  the id to the replica's real `ip`/`port` + report per-replica offset/lag in INFO /
+  CLUSTER SHARDS / `/topology`) remains.
 - Replicas now advertise their identity in the replication handshake (issue #365,
   stage 1 of REPL_FIDELITY.md): the attach `REPLCONF` carries
   `node_id_from_announce(self_announce_id)` (the replica's own `NodeId`, the first 16

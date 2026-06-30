@@ -577,7 +577,7 @@ async fn serve_replica_conn(
     // we always full-sync from scratch in this MVP, so the ack is read-and-acknowledged but the
     // sync starts at the snapshot cut regardless.
     let mut pending: Vec<u8> = Vec::new();
-    let Some((slot_filter, handshake_ack, handshake_token)) =
+    let Some((slot_filter, handshake_ack, handshake_token, replica_node_id)) =
         read_attach_handshake(&rt, &stream, &mut pending).await
     else {
         return; // the peer closed / sent garbage before attaching.
@@ -585,6 +585,12 @@ async fn serve_replica_conn(
     // Publish that a replica is connected (PRIMARY side, HA-7e): connected_slaves -> 1 with the
     // replica's resume offset. INFO renders the `slaveN:` line + the master-side lag from this.
     status.set_replica_connected(handshake_ack);
+    // #365 stage 2: record the replica's advertised NodeId ONLY for a PLAIN attach (a steady
+    // replica), not a scoped import (`slot_filter` Some, a transient HA-6 slot data-copy that is
+    // not an INFO `slaveN`). Reporting-only: it never affects the sync below.
+    if slot_filter.is_none() {
+        status.set_replica_id(replica_node_id);
+    }
 
     // (2) INCREMENTAL RESUME vs FULL SYNC (HA-7e). A RECONNECTING plain replica advertises its real
     // applied offset (`handshake_ack > 0`, it kept its store) AND the replication HISTORY token it
@@ -851,7 +857,7 @@ async fn read_attach_handshake(
     _rt: &TokioRuntime,
     stream: &Rc<RefCell<Option<SecureStream>>>,
     pending: &mut Vec<u8>,
-) -> Option<(Option<u16>, ReplOffset, Option<ReplId>)> {
+) -> Option<(Option<u16>, ReplOffset, Option<ReplId>, u64)> {
     let mut slot_filter: Option<u16> = None;
     loop {
         // Drain any complete frames already buffered.
@@ -861,12 +867,16 @@ async fn read_attach_handshake(
                     pending.drain(..consumed);
                     match frame {
                         Frame::ReplConf {
-                            ack, resume_token, ..
+                            node,
+                            ack,
+                            resume_token,
                         } => {
-                            // Attached; carry the scope (if any), the peer's resume offset, AND the
+                            // Attached; carry the scope (if any), the peer's resume offset, the
                             // resume history token it last synced under (`None` for a first-connect
-                            // replica). The token gates whether the primary may RESUME (HA-7e safety).
-                            return Some((slot_filter, ack, resume_token));
+                            // replica; gates whether the primary may RESUME, HA-7e safety), AND the
+                            // replica's advertised `NodeId` (#365 stage 2; `0` if it did not
+                            // advertise). The token gates resume; the node id is reporting-only.
+                            return Some((slot_filter, ack, resume_token, node));
                         }
                         // A leading IMPORTREQ scopes this attach to one slot (HA-6 data-copy).
                         // Record it and keep reading for the REPLCONF that follows.
@@ -2451,7 +2461,7 @@ mod tests {
                 let (stream, _peer) = rt.accept(&listener).await.expect("accept");
                 let stream = Rc::new(RefCell::new(Some(SecureStream::plain(stream))));
                 let mut pending = Vec::new();
-                let Some((slot_filter, _ack, _token)) =
+                let Some((slot_filter, _ack, _token, _node)) =
                     read_attach_handshake(&rt, &stream, &mut pending).await
                 else {
                     return;
