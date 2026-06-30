@@ -151,6 +151,14 @@ release.
 
 ### Added
 
+- Design doc `docs/design/SLOT_KEY_ENUMERATION.md` (issue #371, design-first): how to make
+  `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` honest (they are placeholders returning `0`/empty
+  today) as the read-side foundation for the rebalance-APPLY driver. Records WHY a slot's keys span
+  every internal shard (the client CRC16 slot vs the FNV `owner_shard` are independent hashes), and
+  chooses an on-demand cross-shard SCAN over the existing whole-keyspace fan-out instead of a
+  write-path per-slot index, so the standalone hot path the perf gate measures stays byte-for-byte
+  unchanged (the commands are cluster-mode-only, so the scan is unreachable in standalone). Stages
+  the implementation and the #371 APPLY consumer (paginated `GETKEYSINSLOT` + per-key move).
 - Console topology-churn harness now covers the slot-migration scenario (issue #368): a
   deterministic stable -> mid-migration -> committed-remap sequence over stub `/topology` servers
   asserts the console DETECTS an in-flight migration (`migration_in_progress` tracks
