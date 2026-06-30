@@ -151,6 +151,18 @@ release.
 
 ### Added
 
+- Console rebalance-plan SPA panel (issue #361, the UI over the #445 endpoint):
+  the Cluster view now carries an admin "Rebalance plan" card with a "Load plan"
+  button that fetches `GET /api/cluster/rebalance-plan` and renders the per-node
+  table (node, current, target, signed move) plus a rollup summary
+  (`N slots to move`, or `Balanced`). Loaded on the button (an explicit operator
+  action, one `CLUSTER` command per click), NOT on every Cluster-tab visit. The
+  panel keeps the strict-CSP posture: every value reaches the DOM via
+  `textContent`/`createElement` (no `innerHTML`), the button is wired with
+  `addEventListener` (no inline handler), and the admin token is sent only as the
+  `Authorization` header (a 401/403 renders a sign-in/insufficient-privileges note).
+  Replication and shards stay honest gated empty-states. The mutating apply/failover
+  actions remain.
 - Console rebalance dry-run plan (issue #361, the management dry-run rail over
   engine #444): `GET /api/cluster/rebalance-plan` issues `CLUSTER REBALANCE DRYRUN`
   to the configured node and renders the per-node slot-balance plan as typed JSON

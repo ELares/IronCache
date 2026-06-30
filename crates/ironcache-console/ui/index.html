@@ -579,6 +579,40 @@
                 cluster mode. This node is standalone.
               </p>
             </div>
+
+            <div class="card table-card">
+              <div class="card-head">
+                <h2 class="card-title">Rebalance plan</h2>
+                <span class="card-sub" id="rebalance-summary">-</span>
+              </div>
+              <p class="card-note">
+                A read-only dry run (admin): the slots each node owns now versus the
+                balanced target, and the signed move count (negative sheds, positive
+                receives). No slots move here; the apply driver is separate.
+              </p>
+              <p id="rebalance-gate" class="ks-status" hidden>
+                Admin token required to load the rebalance plan.
+              </p>
+              <div class="config-toolbar">
+                <button id="rebalance-load" class="btn btn-primary" type="button">Load plan</button>
+              </div>
+              <p id="rebalance-status" class="ks-status" hidden></p>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Node</th>
+                      <th>Current</th>
+                      <th>Target</th>
+                      <th>Move</th>
+                    </tr>
+                  </thead>
+                  <tbody id="rebalance-body">
+                    <tr><td colspan="4" class="placeholder">No data yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </section>
 
           <section class="section" id="section-replication" data-section-panel="replication" hidden>
