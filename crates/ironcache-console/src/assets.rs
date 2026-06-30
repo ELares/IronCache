@@ -306,6 +306,11 @@ mod tests {
             "id=\"meet-add\"",
             "id=\"forget-node-id\"",
             "id=\"forget-remove\"",
+            // Cluster slot migration / FLIP (#361, CLUSTER SETSLOT).
+            "id=\"setslot-slot\"",
+            "id=\"setslot-action\"",
+            "id=\"setslot-node-id\"",
+            "id=\"setslot-apply\"",
         ] {
             assert!(
                 INDEX_HTML.contains(id),
@@ -359,8 +364,10 @@ mod tests {
             "triggerFailover",
             "/api/cluster/meet",
             "/api/cluster/forget",
+            "/api/cluster/setslot",
             "addNode",
             "removeNode",
+            "applySetslot",
             "fetchMethod",
             "tokenizeCommand",
         ] {

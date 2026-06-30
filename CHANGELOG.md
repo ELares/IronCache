@@ -151,6 +151,17 @@ release.
 
 ### Added
 
+- Console slot-migration / FLIP action (issue #361, the online-migration control):
+  `POST /api/cluster/setslot` drives `CLUSTER SETSLOT <slot> {NODE|MIGRATING|IMPORTING}
+  <node-id>` or `<slot> STABLE`, with a "Migrate slot" card (slot + action select +
+  node-id) in the Cluster view. DESTRUCTIVE: a pure `build_setslot_args` validates the
+  whole rail (slot in 0..=16383, the action allow-list, a `node_id` required for every
+  action except STABLE, and `confirm` echoing the slot number) into the RESP argv before
+  any node call, so an out-of-range slot / unknown action / missing target / stray POST
+  is a clean `400`; the engine commits the transition through the leader and is the
+  authority on node existence. Admin-tier write + audit-logged; CSP posture preserved.
+  This rounds out #361's cluster-management actions (failover + add/remove node +
+  migration FLIP); step-up re-auth, off-box audit, and the rebalance-apply driver remain.
 - Console add/remove node actions (issue #361, completing the "add/remove a node from
   the UI" acceptance): `POST /api/cluster/meet` (`CLUSTER MEET host port`, additive, no
   confirmation per the issue's scope) and `POST /api/cluster/forget` (`CLUSTER FORGET

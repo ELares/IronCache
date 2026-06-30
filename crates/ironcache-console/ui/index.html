@@ -674,6 +674,34 @@
               </div>
               <p id="forget-status" class="ks-status" hidden></p>
             </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Migrate slot</h2>
+                <span class="card-sub">admin, destructive</span>
+              </div>
+              <p class="card-note">
+                CLUSTER SETSLOT: drive an online slot migration. MIGRATING / IMPORTING
+                tag the source / destination, NODE commits the FLIP (final ownership),
+                and STABLE clears the state. Enter the slot to confirm.
+              </p>
+              <p id="setslot-gate" class="ks-status" hidden>Admin token required to migrate a slot.</p>
+              <div class="config-toolbar">
+                <label class="visually-hidden" for="setslot-slot">Slot</label>
+                <input id="setslot-slot" class="ks-input mono" type="number" min="0" max="16383" placeholder="slot (0-16383)" autocomplete="off" />
+                <label class="visually-hidden" for="setslot-action">Action</label>
+                <select id="setslot-action" class="ks-input mono">
+                  <option value="NODE">NODE (flip)</option>
+                  <option value="MIGRATING">MIGRATING</option>
+                  <option value="IMPORTING">IMPORTING</option>
+                  <option value="STABLE">STABLE</option>
+                </select>
+                <label class="visually-hidden" for="setslot-node-id">Node id</label>
+                <input id="setslot-node-id" class="ks-input mono" type="text" placeholder="node id (not for STABLE)" autocomplete="off" spellcheck="false" />
+                <button id="setslot-apply" class="btn btn-primary" type="button">Apply</button>
+              </div>
+              <p id="setslot-status" class="ks-status" hidden></p>
+            </div>
           </section>
 
           <section class="section" id="section-replication" data-section-panel="replication" hidden>

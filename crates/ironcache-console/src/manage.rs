@@ -187,6 +187,28 @@ pub struct ForgetBody {
     pub confirm: String,
 }
 
+/// `POST /api/cluster/setslot` body (#361): the online-migration / slot-FLIP control
+/// (`CLUSTER SETSLOT <slot> {NODE|MIGRATING|IMPORTING} <node-id>` or `<slot> STABLE`).
+/// DESTRUCTIVE (it changes slot ownership / migration state), so `confirm` must ECHO the
+/// `slot` number. `node_id` is required for every action EXCEPT `STABLE`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetslotBody {
+    /// The slot to act on (`0..=16383`).
+    pub slot: u16,
+    /// `NODE` (the committed FLIP), `MIGRATING`, `IMPORTING`, or `STABLE`
+    /// (case-insensitive).
+    pub action: String,
+    /// The target / source node id (required for NODE / MIGRATING / IMPORTING; ignored
+    /// for STABLE).
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Must equal the `slot` number (as text) or the request is a `400`.
+    pub confirm: String,
+}
+
+/// The highest valid cluster slot (`CLUSTER_SLOTS - 1`; the engine uses 16384 slots).
+const MAX_SLOT: u16 = 16383;
+
 // ---- response bodies --------------------------------------------------------
 
 /// `{ "ok": true }` for a mutation that the node answered `+OK` to.
@@ -676,6 +698,64 @@ pub async fn cluster_forget(client: &mut NodeClient, body: &ForgetBody) -> ApiRe
 fn forget_confirmed(body: &ForgetBody) -> bool {
     let id = body.node_id.trim();
     !id.is_empty() && body.confirm.trim() == id
+}
+
+/// `POST /api/cluster/setslot` (#361): the online-migration / slot-FLIP control. In raft
+/// mode each transition is a committed `SETSLOT` through the leader. DESTRUCTIVE, so
+/// `confirm` must echo the slot number; `node_id` is required for every action except
+/// `STABLE`. Admin-tier + audit-logged.
+///
+/// # Errors
+///
+/// Returns a `400` for an out-of-range slot, an unknown action, a missing node_id, or a
+/// confirmation that does not echo the slot; a `502` when the node rejects it.
+pub async fn cluster_setslot(client: &mut NodeClient, body: &SetslotBody) -> ApiResponse {
+    let owned = match build_setslot_args(body) {
+        Ok(a) => a,
+        Err(msg) => return ApiResponse::bad_request(msg),
+    };
+    let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    let reply = match client.command(&argv).await {
+        Ok(r) => r,
+        Err(e) => return node_error_response(&e),
+    };
+    ok_or_node_text(&reply)
+}
+
+/// Validate a [`SetslotBody`] into the RESP argv, or a `400` message. PURE (no node), so
+/// the whole rail (slot bound, echoed-slot confirm, the per-action node_id requirement,
+/// the action allow-list) is unit-tested directly. The action is upper-cased so the wire
+/// form is canonical regardless of the caller's casing.
+fn build_setslot_args(body: &SetslotBody) -> Result<Vec<Vec<u8>>, &'static str> {
+    if body.slot > MAX_SLOT {
+        return Err("slot must be in 0..=16383");
+    }
+    if body.confirm.trim() != body.slot.to_string() {
+        return Err("destructive action: set confirm to the exact slot number");
+    }
+    let action = body.action.trim().to_ascii_uppercase();
+    let slot = body.slot.to_string().into_bytes();
+    let base = || vec![b"CLUSTER".to_vec(), b"SETSLOT".to_vec(), slot.clone()];
+    match action.as_str() {
+        "STABLE" => {
+            let mut argv = base();
+            argv.push(b"STABLE".to_vec());
+            Ok(argv)
+        }
+        "NODE" | "MIGRATING" | "IMPORTING" => {
+            let id = body.node_id.as_deref().unwrap_or("").trim();
+            if id.is_empty() || has_crlf(id) {
+                return Err(
+                    "node_id is required (non-empty, no CR/LF) for NODE / MIGRATING / IMPORTING",
+                );
+            }
+            let mut argv = base();
+            argv.push(action.into_bytes());
+            argv.push(id.as_bytes().to_vec());
+            Ok(argv)
+        }
+        _ => Err("action must be one of NODE, MIGRATING, IMPORTING, STABLE"),
+    }
 }
 
 /// Parse a RESP2 `CLUSTER REBALANCE DRYRUN` reply into a [`RebalancePlanResponse`].
@@ -1535,6 +1615,53 @@ mod tests {
         assert!(!forget_confirmed(&body(id, "")));
         // An empty node_id never confirms (even if confirm is also empty).
         assert!(!forget_confirmed(&body("", "")));
+    }
+
+    #[test]
+    fn setslot_builds_the_argv_and_enforces_its_rails() {
+        let body = |slot: u16, action: &str, node: Option<&str>, confirm: &str| SetslotBody {
+            slot,
+            action: action.to_owned(),
+            node_id: node.map(str::to_owned),
+            confirm: confirm.to_owned(),
+        };
+        let id = "2222222222222222222222222222222222222222";
+        // NODE (the FLIP): confirm echoes the slot, node_id present; action upper-cased.
+        assert_eq!(
+            build_setslot_args(&body(42, "node", Some(id), "42")).unwrap(),
+            vec![
+                b"CLUSTER".to_vec(),
+                b"SETSLOT".to_vec(),
+                b"42".to_vec(),
+                b"NODE".to_vec(),
+                id.as_bytes().to_vec(),
+            ]
+        );
+        // STABLE takes NO node_id (4-arg form).
+        assert_eq!(
+            build_setslot_args(&body(7, "STABLE", None, "7")).unwrap(),
+            vec![
+                b"CLUSTER".to_vec(),
+                b"SETSLOT".to_vec(),
+                b"7".to_vec(),
+                b"STABLE".to_vec(),
+            ]
+        );
+        // MIGRATING / IMPORTING also carry the node id.
+        assert!(build_setslot_args(&body(1, "migrating", Some(id), "1")).is_ok());
+        assert!(build_setslot_args(&body(1, "importing", Some(id), "1")).is_ok());
+
+        // Rails (each a 400):
+        // - confirm must echo the slot.
+        assert!(build_setslot_args(&body(42, "NODE", Some(id), "41")).is_err());
+        // - slot out of range (> 16383).
+        assert!(build_setslot_args(&body(16384, "STABLE", None, "16384")).is_err());
+        // - unknown action.
+        assert!(build_setslot_args(&body(1, "FLIP", Some(id), "1")).is_err());
+        // - node_id required (and non-empty / no CRLF) for non-STABLE actions.
+        assert!(build_setslot_args(&body(1, "NODE", None, "1")).is_err());
+        assert!(build_setslot_args(&body(1, "NODE", Some(""), "1")).is_err());
+        assert!(build_setslot_args(&body(1, "NODE", Some("a\r\nb"), "1")).is_err());
     }
 
     // ---- CLUSTER REBALANCE DRYRUN plan parsing (#361) ----

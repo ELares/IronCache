@@ -470,7 +470,8 @@ fn is_management_write(method: &str, path: &str) -> bool {
             | "/api/persistence/save"
             | "/api/cluster/failover"
             | "/api/cluster/meet"
-            | "/api/cluster/forget",
+            | "/api/cluster/forget"
+            | "/api/cluster/setslot",
         ) => true,
         // The dynamic key family: a bare `/api/keys` POST is NOT a write (SET needs
         // a key), but `/api/keys/{k}` POST (SET) and DELETE (DEL) are.
@@ -520,6 +521,12 @@ async fn dispatch_manage(
         },
         ("POST", "/api/cluster/forget") => match parse_body::<manage::ForgetBody>(body) {
             Ok(b) => manage::cluster_forget(client, &b).await,
+            Err(resp) => resp,
+        },
+        // MUTATING: the online-migration / slot-FLIP control (CLUSTER SETSLOT). Destructive:
+        // confirm must echo the slot. Admin-tier write.
+        ("POST", "/api/cluster/setslot") => match parse_body::<manage::SetslotBody>(body) {
+            Ok(b) => manage::cluster_setslot(client, &b).await,
             Err(resp) => resp,
         },
         // ---- config ----

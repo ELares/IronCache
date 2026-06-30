@@ -1227,6 +1227,18 @@ const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/api/cluster/setslot": {
+      "post": {
+        "summary": "Online-migration / slot FLIP: CLUSTER SETSLOT slot {NODE|MIGRATING|IMPORTING} node-id, or slot STABLE (ADMIN, DESTRUCTIVE). confirm must echo the slot. #361.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SetslotBody" } } } },
+        "responses": {
+          "200": { "description": "The slot transition was applied.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Out-of-range slot, unknown action, missing node_id, or confirm does not echo the slot.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "The node refused the transition (unknown node, etc.) or is unreachable.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/acl": {
       "get": {
         "summary": "ACL WHOAMI + LIST + CAT (ADMIN: the full user/permission set).",
@@ -1580,6 +1592,16 @@ const OPENAPI_JSON: &str = r##"{
           "confirm": { "type": "string", "description": "Must echo node_id." }
         },
         "required": ["node_id", "confirm"]
+      },
+      "SetslotBody": {
+        "type": "object",
+        "properties": {
+          "slot": { "type": "integer", "format": "int32", "minimum": 0, "maximum": 16383 },
+          "action": { "type": "string", "enum": ["NODE", "MIGRATING", "IMPORTING", "STABLE"] },
+          "node_id": { "type": "string", "nullable": true, "description": "Required except for STABLE." },
+          "confirm": { "type": "string", "description": "Must echo the slot number." }
+        },
+        "required": ["slot", "action", "confirm"]
       },
       "RebalancePlanResponse": {
         "type": "object",
@@ -1989,6 +2011,7 @@ mod tests {
             "/api/cluster/failover",
             "/api/cluster/meet",
             "/api/cluster/forget",
+            "/api/cluster/setslot",
         ] {
             assert!(paths.contains_key(p), "openapi missing path {p}");
         }
