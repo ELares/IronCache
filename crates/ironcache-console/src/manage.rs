@@ -296,6 +296,33 @@ struct CommandResponse {
     reply: RenderedReply,
 }
 
+/// One node's row in a `GET /api/cluster/rebalance-plan` response (#361, the dry-run
+/// rail over engine #371/#444): its current vs balanced-target slot count and the
+/// signed move (negative sheds, positive receives). Mirrors the engine `CLUSTER
+/// REBALANCE DRYRUN` per-node map.
+#[derive(Debug, Clone, Serialize)]
+struct RebalanceTargetView {
+    node: String,
+    current_slots: i64,
+    target_slots: i64,
+    slots_to_move: i64,
+}
+
+/// `GET /api/cluster/rebalance-plan` response: the per-node plan the operator inspects
+/// BEFORE any apply, plus a rollup. `total_slots_to_move` is the number of slots that
+/// would change owner (the sum of the positive deltas, which equals the absolute sum
+/// of the negative ones because rebalancing conserves slots); `balanced` is true when
+/// the cluster already needs no moves. `dry_run` is always true: this endpoint never
+/// mutates (the engine refuses APPLY).
+#[derive(Debug, Clone, Serialize)]
+struct RebalancePlanResponse {
+    ok: bool,
+    dry_run: bool,
+    balanced: bool,
+    total_slots_to_move: i64,
+    targets: Vec<RebalanceTargetView>,
+}
+
 // ---- validation -------------------------------------------------------------
 
 /// Whether `s` carries a CR or LF (a RESP-inline-injection / log-injection
@@ -480,6 +507,93 @@ pub async fn config_set(client: &mut NodeClient, body: &ConfigSetBody) -> ApiRes
         Err(e) => return node_error_response(&e),
     };
     ok_or_node_text(&reply)
+}
+
+/// `GET /api/cluster/rebalance-plan` (#361, the rebalance dry-run rail over engine
+/// #444): issue `CLUSTER REBALANCE DRYRUN` and render the per-node slot-balance plan
+/// so an operator sees the slot diff BEFORE any apply. READ-ONLY: the engine mutates
+/// nothing and refuses APPLY, and this is a GET. Admin-tier (the HTTP gate enforces
+/// the privileged role); routed through the configured node, which re-checks the
+/// committed epoch in raft mode.
+///
+/// # Errors
+///
+/// Returns a `502` when the node rejects the command or replies with an unexpected
+/// shape (e.g. cluster support disabled, or a non-plan reply).
+pub async fn cluster_rebalance_plan(client: &mut NodeClient) -> ApiResponse {
+    let reply = match client.command(&[b"CLUSTER", b"REBALANCE", b"DRYRUN"]).await {
+        Ok(r) => r,
+        Err(e) => return node_error_response(&e),
+    };
+    match parse_rebalance_plan(&reply) {
+        Some(plan) => ApiResponse::ok(&plan),
+        None => ApiResponse::error(
+            502,
+            "unexpected CLUSTER REBALANCE reply (not a per-node plan array)",
+        ),
+    }
+}
+
+/// Parse a RESP2 `CLUSTER REBALANCE DRYRUN` reply into a [`RebalancePlanResponse`].
+/// The reply is an array of per-node maps; over the console's RESP2 link each map is a
+/// FLAT `[key, value, ...]` array (the engine degrades RESP3 maps to a flat RESP2
+/// array, [`ironcache_protocol`] encode.rs). PURE + total: a non-array reply, or a row
+/// missing a field, yields `None` (the caller maps that to a `502`). Unit-tested
+/// without a node.
+fn parse_rebalance_plan(reply: &RespValue) -> Option<RebalancePlanResponse> {
+    let RespValue::Array(rows) = reply else {
+        return None;
+    };
+    let mut targets = Vec::with_capacity(rows.len());
+    let mut total_slots_to_move = 0i64;
+    for row in rows {
+        let target = parse_rebalance_row(row)?;
+        // Conservation: the positive deltas equal the absolute negative deltas, so
+        // summing the positives counts each relocating slot exactly once.
+        if target.slots_to_move > 0 {
+            total_slots_to_move = total_slots_to_move.saturating_add(target.slots_to_move);
+        }
+        targets.push(target);
+    }
+    Some(RebalancePlanResponse {
+        ok: true,
+        dry_run: true,
+        balanced: total_slots_to_move == 0,
+        total_slots_to_move,
+        targets,
+    })
+}
+
+/// Parse ONE node row (a RESP2 flat `[key, value, ...]` map) into a
+/// [`RebalanceTargetView`]. Field order is NOT assumed: each value is looked up by its
+/// key, so a future engine reorder cannot misread it. Returns `None` if any of the
+/// four fields is absent or the wrong type.
+fn parse_rebalance_row(row: &RespValue) -> Option<RebalanceTargetView> {
+    let RespValue::Array(kvs) = row else {
+        return None;
+    };
+    let mut node = None;
+    let mut current_slots = None;
+    let mut target_slots = None;
+    let mut slots_to_move = None;
+    for pair in kvs.chunks_exact(2) {
+        let Some(key) = text_of(&pair[0]) else {
+            continue;
+        };
+        match key.as_str() {
+            "node" => node = text_of(&pair[1]),
+            "current_slots" => current_slots = int_of(&pair[1]),
+            "target_slots" => target_slots = int_of(&pair[1]),
+            "slots_to_move" => slots_to_move = int_of(&pair[1]),
+            _ => {}
+        }
+    }
+    Some(RebalanceTargetView {
+        node: node?,
+        current_slots: current_slots?,
+        target_slots: target_slots?,
+        slots_to_move: slots_to_move?,
+    })
 }
 
 /// `GET /api/keys?pattern=&cursor=&count=`: `SCAN cursor MATCH pattern COUNT count`,
@@ -1236,5 +1350,107 @@ mod tests {
             Some("hello")
         );
         assert_eq!(text_of(&RespValue::Integer(1)), None);
+    }
+
+    // ---- CLUSTER REBALANCE DRYRUN plan parsing (#361) ----
+
+    /// Build ONE node row the way the engine sends it over the console's RESP2 link: a
+    /// FLAT `[key, value, ...]` array (the RESP2 degrade of a RESP3 map). `slots_to_move`
+    /// is the signed `target - current` the engine computes.
+    fn node_row(id: &str, current: i64, target: i64) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::Bulk(Some(b"node".to_vec())),
+            RespValue::Bulk(Some(id.as_bytes().to_vec())),
+            RespValue::Bulk(Some(b"current_slots".to_vec())),
+            RespValue::Integer(current),
+            RespValue::Bulk(Some(b"target_slots".to_vec())),
+            RespValue::Integer(target),
+            RespValue::Bulk(Some(b"slots_to_move".to_vec())),
+            RespValue::Integer(target - current),
+        ])
+    }
+
+    #[test]
+    fn rebalance_plan_parses_a_skewed_three_node_reply() {
+        // ID0 owns the whole space; ID1/ID2 are empty. Balanced targets even out.
+        let reply = RespValue::Array(vec![
+            node_row("id0", 16384, 5462),
+            node_row("id1", 0, 5461),
+            node_row("id2", 0, 5461),
+        ]);
+        let plan = parse_rebalance_plan(&reply).expect("a well-formed reply parses");
+        assert!(
+            plan.ok && plan.dry_run,
+            "the plan is always a read-only dry-run"
+        );
+        assert!(!plan.balanced, "a skewed cluster is not balanced");
+        assert_eq!(plan.targets.len(), 3);
+        assert_eq!(plan.targets[0].node, "id0");
+        assert_eq!(
+            plan.targets[0].slots_to_move,
+            5462 - 16384,
+            "id0 sheds (negative)"
+        );
+        assert_eq!(
+            plan.targets[1].slots_to_move, 5461,
+            "id1 receives (positive)"
+        );
+        // total = sum of POSITIVE deltas = 5461 + 5461 = 10922, which equals |id0 delta|
+        // (16384 - 5462) by conservation: each relocating slot counted exactly once.
+        assert_eq!(plan.total_slots_to_move, 10922);
+    }
+
+    #[test]
+    fn rebalance_plan_of_a_balanced_reply_reports_no_moves() {
+        let reply = RespValue::Array(vec![
+            node_row("id0", 5461, 5461),
+            node_row("id1", 5462, 5462),
+            node_row("id2", 5461, 5461),
+        ]);
+        let plan = parse_rebalance_plan(&reply).expect("parses");
+        assert!(plan.balanced, "all-zero moves is balanced");
+        assert_eq!(plan.total_slots_to_move, 0);
+    }
+
+    #[test]
+    fn rebalance_plan_field_order_is_not_assumed() {
+        // The engine could reorder the map fields; lookup is by key, so it still reads.
+        let row = RespValue::Array(vec![
+            RespValue::Bulk(Some(b"slots_to_move".to_vec())),
+            RespValue::Integer(-3),
+            RespValue::Bulk(Some(b"target_slots".to_vec())),
+            RespValue::Integer(7),
+            RespValue::Bulk(Some(b"current_slots".to_vec())),
+            RespValue::Integer(10),
+            RespValue::Bulk(Some(b"node".to_vec())),
+            RespValue::Bulk(Some(b"zed".to_vec())),
+        ]);
+        let plan = parse_rebalance_plan(&RespValue::Array(vec![row])).expect("parses");
+        assert_eq!(plan.targets[0].node, "zed");
+        assert_eq!(plan.targets[0].current_slots, 10);
+        assert_eq!(plan.targets[0].target_slots, 7);
+        assert_eq!(plan.targets[0].slots_to_move, -3);
+    }
+
+    #[test]
+    fn rebalance_plan_rejects_non_array_and_incomplete_rows() {
+        // Defensive totality: a real node `-ERR` (e.g. cluster support disabled) is
+        // intercepted UPSTREAM as a `NodeError::Command` (a 502 with the node's text) and
+        // never reaches the parser, but the parser must still be total, so a stray Error
+        // variant safely yields `None` rather than panicking.
+        assert!(
+            parse_rebalance_plan(&RespValue::Error(b"ERR cluster support disabled".to_vec()))
+                .is_none()
+        );
+        // A row MISSING `target_slots` fails the WHOLE parse (None), never a partial row.
+        let bad_row = RespValue::Array(vec![
+            RespValue::Bulk(Some(b"node".to_vec())),
+            RespValue::Bulk(Some(b"x".to_vec())),
+            RespValue::Bulk(Some(b"current_slots".to_vec())),
+            RespValue::Integer(1),
+            RespValue::Bulk(Some(b"slots_to_move".to_vec())),
+            RespValue::Integer(0),
+        ]);
+        assert!(parse_rebalance_plan(&RespValue::Array(vec![bad_row])).is_none());
     }
 }

@@ -444,7 +444,12 @@ impl ConsoleHttpState {
 fn is_management_read(path: &str) -> bool {
     matches!(
         path,
-        "/api/config" | "/api/keys" | "/api/pubsub/channels" | "/api/acl" | "/api/persistence"
+        "/api/config"
+            | "/api/keys"
+            | "/api/pubsub/channels"
+            | "/api/acl"
+            | "/api/persistence"
+            | "/api/cluster/rebalance-plan"
     ) || path.starts_with("/api/keys/")
 }
 
@@ -494,6 +499,10 @@ async fn dispatch_manage(
 ) -> ApiResponse {
     use crate::manage;
     match (method, bare) {
+        // ---- cluster management (#361) ----
+        // Read-only rebalance dry-run plan (the slot diff before any apply). Admin-tier
+        // via ADMIN_READ_ROUTES; the engine refuses APPLY, so this never mutates.
+        ("GET", "/api/cluster/rebalance-plan") => manage::cluster_rebalance_plan(client).await,
         // ---- config ----
         ("GET", "/api/config") => manage::config_get(client).await,
         ("POST", "/api/config") => match parse_body::<manage::ConfigSetBody>(body) {
