@@ -3713,6 +3713,25 @@ fn cmd_info<C: Clock, S: Keyspace>(
 /// standalone Redis. In raft-mode it reads a [`ReplStatusSnapshot`] and maps it to Redis's field
 /// shape: a master reports its head + a `slaveN:` line (with the per-replica lag) per connected
 /// replica; a replica reports its master endpoint, link status, and applied offset.
+/// Resolve a connected replica's advertised endpoint from the `NodeId` it captured at attach
+/// (#365 stage 3): find the cluster slot-map member whose announce id DERIVES to that `NodeId`
+/// (`node_id_from_announce`, the SAME mapping the leader-hint resolution and the slot-map use), and
+/// return its advertised `(host, port)`. `None` when there is no cluster (standalone), the id is
+/// unset (`0`, no replica advertised), or no member matches (a replica not yet in this node's map).
+///
+/// O(M) over the members on the rare INFO read (off the data path). With a single modeled replica
+/// today this is one scan; the N-replica follow-up should derive each member's id once into a map.
+fn resolve_replica_endpoint(ctx: &ServerContext, slave_id: u64) -> Option<(String, u16)> {
+    if slave_id == 0 {
+        return None;
+    }
+    let map = ctx.cluster.as_ref()?;
+    map.nodes().into_iter().find_map(|n| {
+        (ironcache_raft_net::node_id_from_announce(&n.id).0 == slave_id)
+            .then(|| (n.host.to_string(), n.port))
+    })
+}
+
 fn replication_info(ctx: &ServerContext) -> ReplicationInfo {
     let Some(status) = ctx.repl_status.as_ref() else {
         return ReplicationInfo::standalone();
@@ -3728,13 +3747,15 @@ fn replication_info(ctx: &ServerContext) -> ReplicationInfo {
                     .slave_lag()
                     .and_then(ironcache_repl::ReplicaLag::lag)
                     .unwrap_or(0);
-                // The master does not learn the replica's advertised client endpoint over the
-                // current handshake (HA-7d sends node id + ack only), so report a placeholder
-                // endpoint; the offset + lag (the load-bearing fields HA-8 + operators read) are
-                // real. A follow-up can carry the replica's advertised endpoint in the handshake.
+                // Resolve the replica's REAL advertised endpoint from the `NodeId` it advertised in
+                // its handshake (#365 stages 1-3), via the cluster slot map. `("", 0)` when there is
+                // no cluster (standalone), the id is unset, or the replica is not (yet) a member; the
+                // offset + lag (the load-bearing fields HA-8 + operators read) are always real.
+                let (ip, port) =
+                    resolve_replica_endpoint(ctx, snap.slave_id).unwrap_or((String::new(), 0));
                 slaves.push(ReplicaLine {
-                    ip: String::new(),
-                    port: 0,
+                    ip,
+                    port,
                     offset: snap.slave_offset.0,
                     lag,
                 });
@@ -4449,6 +4470,72 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("master_repl_offset:200\r\n"), "{body}");
+    }
+
+    /// #365 stage 3: with the replica's advertised id captured (stage 2) AND the cluster slot map
+    /// holding that member, the `slaveN` line reports the replica's REAL advertised endpoint,
+    /// resolved via `node_id_from_announce`, not the `ip=,port=0` placeholder.
+    #[test]
+    fn info_replication_resolves_the_replica_endpoint_from_the_slot_map() {
+        // The replica advertised this 40-hex announce id; its NodeId is the first 16 hex.
+        let replica_id = "aaaaaaaaaaaaaaaa000000000000000000000000";
+        let node_id = ironcache_raft_net::node_id_from_announce(replica_id).0;
+        let self_id = "1111111111111111111111111111111111111111";
+        let map = ironcache_cluster::SlotMap::build(
+            vec![
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: self_id.into(),
+                        host: "10.0.0.1".into(),
+                        port: 7001,
+                    },
+                    vec![[0, 16383]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: replica_id.into(),
+                        host: "10.0.0.5".into(),
+                        port: 7005,
+                    },
+                    vec![],
+                ),
+            ],
+            self_id,
+        )
+        .expect("a full map with the replica as a no-slot member is valid");
+
+        let mut c = ctx(None);
+        c.cluster = Some(std::sync::Arc::new(map));
+        let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
+        status.set_master_head(ironcache_repl::ReplOffset(200));
+        status.set_replica_connected(ironcache_repl::ReplOffset(190)); // lag 10
+        status.set_replica_id(node_id); // captured at attach (stage 2)
+        c.repl_status = Some(status);
+
+        let mut s = state(&c);
+        let body = info_text(&c, &mut s, &[b"replication"]);
+        assert!(
+            body.contains("slave0:ip=10.0.0.5,port=7005,state=online,offset=190,lag=10\r\n"),
+            "the slaveN line resolves the replica's real endpoint: {body}"
+        );
+    }
+
+    /// #365 stage 3 fallback: without a cluster (standalone) the endpoint stays the `ip=,port=0`
+    /// placeholder; the offset/lag are still real, so an operator loses nothing load-bearing.
+    #[test]
+    fn info_replication_replica_endpoint_is_a_placeholder_without_a_cluster() {
+        let mut c = ctx(None); // no cluster set
+        let status = std::sync::Arc::new(ironcache_repl::ReplNodeStatus::new());
+        status.set_master_head(ironcache_repl::ReplOffset(200));
+        status.set_replica_connected(ironcache_repl::ReplOffset(190));
+        status.set_replica_id(0xABCD); // an id, but no cluster to resolve it against
+        c.repl_status = Some(status);
+        let mut s = state(&c);
+        let body = info_text(&c, &mut s, &[b"replication"]);
+        assert!(
+            body.contains("slave0:ip=,port=0,state=online,offset=190,lag=10\r\n"),
+            "{body}"
+        );
     }
 
     /// HA-7e: a replica reports role:replica, its master endpoint, master_link_status, the offsets,

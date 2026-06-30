@@ -151,6 +151,15 @@ release.
 
 ### Added
 
+- `INFO # Replication` now reports the replica's REAL endpoint (issue #365, stage 3,
+  the visible payoff over stages 1-2 #457/#458): the `slaveN:` line resolves
+  `ip`/`port` from the replica's captured `NodeId` via the slot map
+  (`node_id_from_announce(member.id) == NodeId`, the same reverse lookup the
+  leader-hint resolution uses) instead of the long-standing `ip=,port=0` placeholder.
+  Resolution is O(members) on the rare INFO read (off the data path). Falls back to
+  the placeholder when standalone (no cluster), the id is unset, or the replica is not
+  yet a member; the offset and lag (the load-bearing fields) were already real.
+  CLUSTER SHARDS / `/topology` per-replica detail and the multi-replica model remain.
 - Primary captures the connected replica's advertised id (issue #365, stage 2 of
   REPL_FIDELITY.md, building on stage 1's #457): `read_attach_handshake` now returns
   the replica's `NodeId` from its `REPLCONF`, and the primary records it in the status
