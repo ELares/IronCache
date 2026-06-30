@@ -151,6 +151,16 @@ release.
 
 ### Added
 
+- Per-shard `/metrics` labels (issue #362, the additive engine change for the
+  console): the `/metrics` scrape now carries an `ironcache_shard_<name>{shard="i"}`
+  series for every counter/gauge with per-shard (thread-per-core) meaning
+  (connections, commands, evictions, expirations, keyspace hits/misses, connected
+  clients, keyspace keys), so a console can render shard-level views. It is purely
+  additive in a DISTINCT `ironcache_shard_*` namespace: the node-rollup families are
+  byte-unchanged (no mixed-label double-count within a family), and the default path
+  (no `--metrics-addr`) is byte-identical (the per-shard cells are read only at
+  scrape time, off every command). Process-global gauges (uptime, allocator memory,
+  raft) stay node-level, since they have no per-shard meaning.
 - `ironcache-dashtable` crate: the standalone Dash-style extendible-hashing table,
   stage 1 of the #285 table rewrite (the algorithm core, validated in isolation
   with zero `unsafe` so `miri` is trivial). It implements the extendible directory
