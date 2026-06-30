@@ -300,6 +300,12 @@ mod tests {
             // Cluster failover card (#361, destructive: a typed confirmation input).
             "id=\"failover-confirm\"",
             "id=\"failover-trigger\"",
+            // Cluster node membership (#361): add (MEET) + remove (FORGET).
+            "id=\"meet-host\"",
+            "id=\"meet-port\"",
+            "id=\"meet-add\"",
+            "id=\"forget-node-id\"",
+            "id=\"forget-remove\"",
         ] {
             assert!(
                 INDEX_HTML.contains(id),
@@ -351,6 +357,10 @@ mod tests {
             "/api/persistence/save",
             "/api/cluster/failover",
             "triggerFailover",
+            "/api/cluster/meet",
+            "/api/cluster/forget",
+            "addNode",
+            "removeNode",
             "fetchMethod",
             "tokenizeCommand",
         ] {

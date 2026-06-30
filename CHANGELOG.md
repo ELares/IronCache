@@ -151,6 +151,17 @@ release.
 
 ### Added
 
+- Console add/remove node actions (issue #361, completing the "add/remove a node from
+  the UI" acceptance): `POST /api/cluster/meet` (`CLUSTER MEET host port`, additive, no
+  confirmation per the issue's scope) and `POST /api/cluster/forget` (`CLUSTER FORGET
+  node-id`, DESTRUCTIVE), with "Add node" and "Remove node" cards in the Cluster view.
+  FORGET uses the "type the target to confirm" rail: `confirm` must ECHO the exact
+  `node_id` (the SPA makes the operator type the id), so a stray POST cannot forget the
+  wrong node; the engine still refuses forgetting self / an unknown id. MEET validates a
+  non-empty CRLF-free host and a non-zero port client-side, then lets the engine be the
+  address authority. Both are Admin-tier writes (fail-closed) routed through the leader
+  in raft mode and audit-logged; the CSP posture holds. The migration FLIP (`SETSLOT`)
+  and the rebalance-apply driver remain.
 - Console cluster FAILOVER action (issue #361, the first MUTATING cluster action):
   `POST /api/cluster/failover` issues a bare `CLUSTER FAILOVER` to the configured
   node (in raft mode the engine proposes a committed `PromoteReplica` of this node's

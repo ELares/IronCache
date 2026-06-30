@@ -800,6 +800,80 @@
     });
   }
 
+  // ----- Cluster: node membership (admin) ----------------------------------
+  // POST /api/cluster/meet (add, additive) and /api/cluster/forget (remove,
+  // destructive: the operator types the EXACT node id, which the UI echoes as confirm).
+
+  function updateMembershipGates() {
+    var have = haveToken();
+    var mg = byId("meet-gate");
+    if (mg) {
+      mg.hidden = have;
+    }
+    var fg = byId("forget-gate");
+    if (fg) {
+      fg.hidden = have;
+    }
+  }
+
+  function addNode() {
+    var host = byId("meet-host");
+    var port = byId("meet-port");
+    var status = byId("meet-status");
+    var h = host ? (host.value || "").trim() : "";
+    var p = port ? parseInt(port.value, 10) : 0;
+    if (!(p >= 1 && p <= 65535)) {
+      p = 0; // an empty / out-of-range port -> 0, which the server answers with a 400
+    }
+    if (status) {
+      status.hidden = false;
+      setText(status, "Adding node...");
+    }
+    fetchMethod("POST", "/api/cluster/meet", { host: h, port: p }).then(function (r) {
+      if (!status) {
+        return;
+      }
+      status.hidden = false;
+      if (r.status === 200) {
+        setText(status, "Node added.");
+        if (host) {
+          host.value = "";
+        }
+        if (port) {
+          port.value = "";
+        }
+      } else {
+        setText(status, apiError(r, "Add node failed."));
+      }
+    });
+  }
+
+  function removeNode() {
+    var input = byId("forget-node-id");
+    var status = byId("forget-status");
+    var id = input ? (input.value || "").trim() : "";
+    if (status) {
+      status.hidden = false;
+      setText(status, "Removing node...");
+    }
+    // Typing the EXACT node id IS the human confirmation; echo it as confirm so the
+    // server's "confirm must match node_id" rail passes for a deliberate UI action.
+    fetchMethod("POST", "/api/cluster/forget", { node_id: id, confirm: id }).then(function (r) {
+      if (input) {
+        input.value = "";
+      }
+      if (!status) {
+        return;
+      }
+      status.hidden = false;
+      if (r.status === 200) {
+        setText(status, "Node forgotten.");
+      } else {
+        setText(status, apiError(r, "Remove node failed."));
+      }
+    });
+  }
+
   // ----- Config -------------------------------------------------------------
   var configParams = [];
 
@@ -1657,6 +1731,7 @@
       // we only refresh the admin-gate notes.
       updateRebalanceGate();
       updateFailoverGate();
+      updateMembershipGates();
     } else if (section === "config") {
       loadConfig();
     } else if (section === "keyspace") {
@@ -2035,9 +2110,12 @@
 
   // ----- management form wiring (#361) --------------------------------------
   function wireManagement() {
-    // Cluster: load the rebalance dry-run plan on demand (admin); trigger a failover.
+    // Cluster: load the rebalance dry-run plan on demand (admin); trigger a failover;
+    // add/remove a node.
     wireClick("rebalance-load", loadRebalancePlan);
     wireClick("failover-trigger", triggerFailover);
+    wireClick("meet-add", addNode);
+    wireClick("forget-remove", removeNode);
 
     // Config: filter + apply (per-row Apply wired in configRow).
     var configFilter = byId("config-filter");
