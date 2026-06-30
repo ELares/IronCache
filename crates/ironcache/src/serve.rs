@@ -753,6 +753,7 @@ pub fn run_server_observed(
         tcp_port: config.port,
         shards: config.shards,
         cluster: cluster.clone(),
+        repl_status: repl_status.clone(),
     };
 
     Ok(BootHandles {
