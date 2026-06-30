@@ -468,7 +468,9 @@ fn is_management_write(method: &str, path: &str) -> bool {
             | "/api/pubsub/publish"
             | "/api/acl/user"
             | "/api/persistence/save"
-            | "/api/cluster/failover",
+            | "/api/cluster/failover"
+            | "/api/cluster/meet"
+            | "/api/cluster/forget",
         ) => true,
         // The dynamic key family: a bare `/api/keys` POST is NOT a write (SET needs
         // a key), but `/api/keys/{k}` POST (SET) and DELETE (DEL) are.
@@ -508,6 +510,16 @@ async fn dispatch_manage(
         // Admin-tier (a write) + a typed destructive-confirmation in the body.
         ("POST", "/api/cluster/failover") => match parse_body::<manage::FailoverBody>(body) {
             Ok(b) => manage::cluster_failover(client, &b).await,
+            Err(resp) => resp,
+        },
+        // MUTATING: add a node (CLUSTER MEET, additive) / remove a node (CLUSTER FORGET,
+        // destructive: confirm must echo the node id). Both Admin-tier writes.
+        ("POST", "/api/cluster/meet") => match parse_body::<manage::MeetBody>(body) {
+            Ok(b) => manage::cluster_meet(client, &b).await,
+            Err(resp) => resp,
+        },
+        ("POST", "/api/cluster/forget") => match parse_body::<manage::ForgetBody>(body) {
+            Ok(b) => manage::cluster_forget(client, &b).await,
             Err(resp) => resp,
         },
         // ---- config ----

@@ -1203,6 +1203,30 @@ const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/api/cluster/meet": {
+      "post": {
+        "summary": "Add a node to the cluster: CLUSTER MEET host port (ADMIN, additive). #361.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MeetBody" } } } },
+        "responses": {
+          "200": { "description": "The node was added / the handshake was accepted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Empty/CRLF host or a zero port.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "The node rejected the address or is unreachable.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/cluster/forget": {
+      "post": {
+        "summary": "Remove a node: CLUSTER FORGET node-id (ADMIN, DESTRUCTIVE). confirm must echo node_id. #361.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ForgetBody" } } } },
+        "responses": {
+          "200": { "description": "The node was forgotten.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Empty/CRLF node_id or confirm does not echo it.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "The node refused the forget (unknown id / self) or is unreachable.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/acl": {
       "get": {
         "summary": "ACL WHOAMI + LIST + CAT (ADMIN: the full user/permission set).",
@@ -1540,6 +1564,22 @@ const OPENAPI_JSON: &str = r##"{
         "type": "object",
         "properties": { "confirm": { "type": "string", "description": "Must equal \"FAILOVER\"." } },
         "required": ["confirm"]
+      },
+      "MeetBody": {
+        "type": "object",
+        "properties": {
+          "host": { "type": "string" },
+          "port": { "type": "integer", "format": "int32", "minimum": 1, "maximum": 65535 }
+        },
+        "required": ["host", "port"]
+      },
+      "ForgetBody": {
+        "type": "object",
+        "properties": {
+          "node_id": { "type": "string" },
+          "confirm": { "type": "string", "description": "Must echo node_id." }
+        },
+        "required": ["node_id", "confirm"]
       },
       "RebalancePlanResponse": {
         "type": "object",
@@ -1947,6 +1987,8 @@ mod tests {
             "/api/persistence/save",
             "/api/cluster/rebalance-plan",
             "/api/cluster/failover",
+            "/api/cluster/meet",
+            "/api/cluster/forget",
         ] {
             assert!(paths.contains_key(p), "openapi missing path {p}");
         }
@@ -1955,6 +1997,14 @@ mod tests {
         assert!(
             paths["/api/cluster/failover"].get("post").is_some(),
             "failover POST"
+        );
+        assert!(
+            paths["/api/cluster/meet"].get("post").is_some(),
+            "meet POST"
+        );
+        assert!(
+            paths["/api/cluster/forget"].get("post").is_some(),
+            "forget POST"
         );
         assert!(paths["/api/keys/{k}"].get("delete").is_some(), "key DELETE");
         assert!(paths["/api/command"].get("post").is_some(), "command POST");

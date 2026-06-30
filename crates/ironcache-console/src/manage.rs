@@ -162,6 +162,31 @@ pub struct FailoverBody {
     pub confirm: String,
 }
 
+/// `POST /api/cluster/meet` body (#361): add a node to the cluster (`CLUSTER MEET host
+/// port`). Additive, so NO destructive-confirmation is required (the issue scopes typed
+/// confirmation to FORGET/SETSLOT/FLUSH-class actions); the engine validates the
+/// address and the leader path commits it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeetBody {
+    /// The advertised host of the node to add (a single bare token, no CR/LF).
+    pub host: String,
+    /// The advertised RESP port (1..=65535; `0` is rejected).
+    pub port: u16,
+}
+
+/// `POST /api/cluster/forget` body (#361): remove a node from the cluster view
+/// (`CLUSTER FORGET node-id`). DESTRUCTIVE, so `confirm` must ECHO the exact `node_id`
+/// being forgotten (the "type the target to confirm" pattern): an operator cannot
+/// forget the wrong node by a stray POST, and the engine still validates that the id
+/// exists / is not self.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForgetBody {
+    /// The 40-hex node id to forget (no CR/LF).
+    pub node_id: String,
+    /// Must equal `node_id` (trimmed) or the request is a `400`.
+    pub confirm: String,
+}
+
 // ---- response bodies --------------------------------------------------------
 
 /// `{ "ok": true }` for a mutation that the node answered `+OK` to.
@@ -584,6 +609,73 @@ pub async fn cluster_failover(client: &mut NodeClient, body: &FailoverBody) -> A
 /// destructive-confirmation rail is unit-tested without a node.
 fn failover_confirmed(body: &FailoverBody) -> bool {
     body.confirm.trim() == FAILOVER_CONFIRM
+}
+
+/// `POST /api/cluster/meet` (#361): add a node via `CLUSTER MEET host port`. In raft
+/// mode the engine forwards the committed membership add through the leader. Additive,
+/// so no destructive-confirmation; the engine is the authority on address validity.
+/// Admin-tier + audit-logged by the HTTP layer.
+///
+/// # Errors
+///
+/// Returns a `400` for an empty / CRLF-bearing host or a `0` port, or a `502` when the
+/// node rejects the address or is unreachable.
+pub async fn cluster_meet(client: &mut NodeClient, body: &MeetBody) -> ApiResponse {
+    let host = body.host.trim();
+    if host.is_empty() || has_crlf(&body.host) {
+        return ApiResponse::bad_request("host must be a non-empty token without CR or LF");
+    }
+    if body.port == 0 {
+        return ApiResponse::bad_request("port must be in 1..=65535");
+    }
+    let port = body.port.to_string();
+    // Send the TRIMMED host (we validated on the trim), so a stray space does not reach
+    // the engine as part of the address and earn a confusing rejection.
+    let reply = match client
+        .command(&[b"CLUSTER", b"MEET", host.as_bytes(), port.as_bytes()])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return node_error_response(&e),
+    };
+    ok_or_node_text(&reply)
+}
+
+/// `POST /api/cluster/forget` (#361): remove a node via `CLUSTER FORGET node-id`.
+/// DESTRUCTIVE: `confirm` must ECHO the `node_id` (so a stray POST cannot forget the
+/// wrong node); the engine still rejects forgetting self / an unknown id. Admin-tier +
+/// audit-logged.
+///
+/// # Errors
+///
+/// Returns a `400` for an empty / CRLF-bearing id or a confirmation that does not match
+/// the id, or a `502` when the node rejects the forget or is unreachable.
+pub async fn cluster_forget(client: &mut NodeClient, body: &ForgetBody) -> ApiResponse {
+    let node_id = body.node_id.trim();
+    if node_id.is_empty() || has_crlf(&body.node_id) {
+        return ApiResponse::bad_request("node_id must be a non-empty token without CR or LF");
+    }
+    if !forget_confirmed(body) {
+        return ApiResponse::bad_request(
+            "destructive action: set confirm to the exact node_id being forgotten",
+        );
+    }
+    let reply = match client
+        .command(&[b"CLUSTER", b"FORGET", node_id.as_bytes()])
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return node_error_response(&e),
+    };
+    ok_or_node_text(&reply)
+}
+
+/// Whether a [`ForgetBody`]'s `confirm` ECHOES its `node_id` (both trimmed) and the id
+/// is non-empty: the "type the target to confirm" rail. Pure, so the forget guard is
+/// unit-tested without a node.
+fn forget_confirmed(body: &ForgetBody) -> bool {
+    let id = body.node_id.trim();
+    !id.is_empty() && body.confirm.trim() == id
 }
 
 /// Parse a RESP2 `CLUSTER REBALANCE DRYRUN` reply into a [`RebalancePlanResponse`].
@@ -1421,6 +1513,28 @@ mod tests {
         assert!(!failover_confirmed(&body("FAIL")));
         assert!(!failover_confirmed(&body("FAILOVER!")));
         assert!(!failover_confirmed(&body("yes")));
+    }
+
+    #[test]
+    fn forget_requires_confirm_to_echo_the_node_id() {
+        let body = |id: &str, confirm: &str| ForgetBody {
+            node_id: id.to_owned(),
+            confirm: confirm.to_owned(),
+        };
+        let id = "1111111111111111111111111111111111111111";
+        // confirm echoes the id (surrounding whitespace tolerated on both sides).
+        assert!(forget_confirmed(&body(id, id)));
+        assert!(forget_confirmed(&body(id, &format!("  {id}  "))));
+        // A mismatched confirm (a DIFFERENT id, a prefix, or empty) does NOT confirm, so
+        // a stray POST can never forget the wrong node.
+        assert!(!forget_confirmed(&body(
+            id,
+            "2222222222222222222222222222222222222222"
+        )));
+        assert!(!forget_confirmed(&body(id, "1111")));
+        assert!(!forget_confirmed(&body(id, "")));
+        // An empty node_id never confirms (even if confirm is also empty).
+        assert!(!forget_confirmed(&body("", "")));
     }
 
     // ---- CLUSTER REBALANCE DRYRUN plan parsing (#361) ----

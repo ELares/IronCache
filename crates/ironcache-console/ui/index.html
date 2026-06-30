@@ -635,6 +635,45 @@
               </div>
               <p id="failover-status" class="ks-status" hidden></p>
             </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Add node</h2>
+                <span class="card-sub">admin</span>
+              </div>
+              <p class="card-note">
+                CLUSTER MEET: introduce a node at host:port to the cluster. The engine
+                validates the address and the leader commits the membership.
+              </p>
+              <p id="meet-gate" class="ks-status" hidden>Admin token required to add a node.</p>
+              <div class="config-toolbar">
+                <label class="visually-hidden" for="meet-host">Host</label>
+                <input id="meet-host" class="ks-input mono" type="text" placeholder="host (e.g. 10.0.0.5)" autocomplete="off" spellcheck="false" />
+                <label class="visually-hidden" for="meet-port">Port</label>
+                <input id="meet-port" class="ks-input mono" type="number" min="1" max="65535" placeholder="port" autocomplete="off" />
+                <button id="meet-add" class="btn btn-primary" type="button">Add node</button>
+              </div>
+              <p id="meet-status" class="ks-status" hidden></p>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">Remove node</h2>
+                <span class="card-sub">admin, destructive</span>
+              </div>
+              <p class="card-note">
+                CLUSTER FORGET: remove a node from the cluster view. Enter the EXACT
+                node id to remove it (the engine refuses forgetting this node itself or
+                an unknown id).
+              </p>
+              <p id="forget-gate" class="ks-status" hidden>Admin token required to remove a node.</p>
+              <div class="config-toolbar">
+                <label class="visually-hidden" for="forget-node-id">Node id</label>
+                <input id="forget-node-id" class="ks-input mono" type="text" placeholder="exact node id to forget" autocomplete="off" spellcheck="false" />
+                <button id="forget-remove" class="btn btn-primary" type="button">Remove node</button>
+              </div>
+              <p id="forget-status" class="ks-status" hidden></p>
+            </div>
           </section>
 
           <section class="section" id="section-replication" data-section-panel="replication" hidden>
