@@ -38,6 +38,15 @@
   // Poll every 5 seconds (the task's cadence).
   var POLL_MS = 5000;
 
+  // Raise the staleness banner once the server-reported topology age exceeds this
+  // many seconds (#354): the console's own poll loop refreshes every ~5s, so 4 missed
+  // cycles means it is likely stuck and the view should NOT be trusted as live. Tuned
+  // for the default 5s server poll; a much slower configured poll could trip it.
+  var STALE_AFTER_S = (POLL_MS / 1000) * 4;
+  // The latest server-reported topology age, captured by renderCluster and consulted
+  // by the banner decision in refresh().
+  var lastTopologyAgeSeconds = 0;
+
   // sessionStorage key for the operator token (tab-scoped; cleared on tab
   // close). Read back only to build the Authorization header; never DOM'd or
   // logged.
@@ -513,6 +522,10 @@
   // ----- renderers (one per /api/* endpoint) -------------------------------
   function renderCluster(data) {
     renderClusterPill(data);
+
+    // Capture the server-reported topology age for the staleness banner (#354). The
+    // banner itself is raised in refresh() so it shows on EVERY tab, not just Cluster.
+    lastTopologyAgeSeconds = Number((data && data.topology_age_seconds) || 0);
 
     var t = data.totals || {};
 
@@ -1794,6 +1807,14 @@
           "Could not reach the console API; showing the last known data. Retrying every " +
             POLL_MS / 1000 +
             "s."
+        );
+      } else if (lastTopologyAgeSeconds > STALE_AFTER_S) {
+        // The console API is reachable, but its node poll has not refreshed in a
+        // while: warn that the topology may be stale before an operator trusts it.
+        showBanner(
+          "Topology data is " +
+            lastTopologyAgeSeconds +
+            "s old; the console poll may be stuck. Do not treat this view as live."
         );
       } else {
         clearBanner();

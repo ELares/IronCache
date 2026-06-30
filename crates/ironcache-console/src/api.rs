@@ -155,6 +155,11 @@ struct ClusterOverview {
     nodes_total: usize,
     nodes_reachable: usize,
     last_poll_unixtime: u64,
+    /// How many seconds ago the published topology was assembled (`now - last_poll`,
+    /// saturating so a poll stamped slightly ahead of the request clock reads `0`).
+    /// The UI raises a staleness banner past a threshold so an operator never acts on
+    /// a view the poll loop stopped refreshing (#354).
+    topology_age_seconds: u64,
     totals: ClusterTotals,
     /// The cluster-wide cache hit ratio `hits / (hits + misses)` over the aggregate totals, or
     /// `None` when no reads have been served (avoids a 0/0). The cache-specific headline (#357).
@@ -360,7 +365,7 @@ pub fn handle(path: &str, topology: Option<&Topology>, ctx: &ApiContext<'_>) -> 
     };
 
     match path {
-        "/api/cluster" => cluster(topo),
+        "/api/cluster" => cluster(topo, ctx),
         "/api/nodes" => nodes(topo),
         "/api/slowlog" => slowlog(topo),
         "/api/clients" => clients(topo),
@@ -387,7 +392,7 @@ fn health(ctx: &ApiContext<'_>) -> ApiResponse {
 }
 
 /// `GET /api/cluster`.
-fn cluster(topo: &Topology) -> ApiResponse {
+fn cluster(topo: &Topology, ctx: &ApiContext<'_>) -> ApiResponse {
     let nodes_total = topo.nodes.len();
     let nodes_reachable = topo.nodes.iter().filter(|n| n.reachable).count();
     let mut totals = ClusterTotals::default();
@@ -432,6 +437,8 @@ fn cluster(topo: &Topology) -> ApiResponse {
         nodes_total,
         nodes_reachable,
         last_poll_unixtime: topo.fetched_unixtime,
+        // Saturating: a poll stamped a hair ahead of the request clock reads age 0, never wraps.
+        topology_age_seconds: ctx.now_unix.saturating_sub(topo.fetched_unixtime),
         totals,
         hit_ratio,
         cluster_topology,
@@ -1275,6 +1282,7 @@ const OPENAPI_JSON: &str = r##"{
           "nodes_total": { "type": "integer" },
           "nodes_reachable": { "type": "integer" },
           "last_poll_unixtime": { "type": "integer", "format": "int64" },
+          "topology_age_seconds": { "type": "integer", "format": "int64" },
           "totals": { "$ref": "#/components/schemas/ClusterTotals" }
         }
       },
@@ -1705,6 +1713,9 @@ mod tests {
         assert_eq!(v["nodes_total"], 1);
         assert_eq!(v["nodes_reachable"], 1);
         assert_eq!(v["last_poll_unixtime"], 1_700_000_001u64);
+        // The fixture stamps the poll 1s AHEAD of ctx.now_unix, so the saturating age is 0
+        // (a poll can never read as "negative age" / a huge wrapped value).
+        assert_eq!(v["topology_age_seconds"], 0u64);
         assert_eq!(v["totals"]["keys"], 15);
         assert_eq!(v["totals"]["used_memory"], 1024);
         assert_eq!(v["totals"]["connected_clients"], 3);
@@ -1715,6 +1726,22 @@ mod tests {
         assert!((v["hit_ratio"].as_f64().unwrap() - 0.8).abs() < 1e-9);
         // No /topology discovery configured in this fixture, so the cache-specific summary is null.
         assert!(v["cluster_topology"].is_null());
+    }
+
+    #[test]
+    fn cluster_overview_reports_topology_age_when_now_is_ahead_of_the_poll() {
+        // A request whose now_unix is 30s after the topology was stamped: age is 30.
+        let t = topo(); // fetched_unixtime = 1_700_000_001
+        let aged_ctx = ApiContext {
+            now_unix: 1_700_000_031,
+            ..ctx()
+        };
+        let resp = handle("/api/cluster", Some(&t), &aged_ctx);
+        let v = parse(&resp);
+        assert_eq!(
+            v["topology_age_seconds"], 30u64,
+            "age is now_unix - last_poll_unixtime"
+        );
     }
 
     #[test]

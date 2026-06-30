@@ -151,6 +151,15 @@ release.
 
 ### Added
 
+- Console topology-staleness banner (issue #354): `GET /api/cluster` now reports
+  `topology_age_seconds` (`now - last_poll_unixtime`, computed server-side and
+  saturating so a poll stamped a hair ahead of the request clock reads `0`), and the
+  dashboard raises a global banner ("Topology data is Ns old; the console poll may be
+  stuck. Do not treat this view as live.") once the age exceeds four poll cycles. The
+  banner is global (shows on every tab, so an operator sees it before acting on the
+  Cluster view) and yields to the existing "could not reach the console API" banner
+  (a browser-to-console outage is the more severe signal). This closes the gap where
+  a stuck poll loop would show old topology as if it were live.
 - Console multi-seed poll failover (issue #354): the node poll loop now tries the
   configured seeds IN ORDER each tick and publishes the first one that yields a
   reachable node, instead of only ever polling `seeds.first()`. It short-circuits
