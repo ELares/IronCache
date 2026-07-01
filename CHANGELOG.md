@@ -151,6 +151,14 @@ release.
 
 ### Added
 
+- `resharding::drain_slot_batch` (issue #371, REBALANCE_APPLY.md): the source-side slot drain the
+  rebalance-APPLY driver ships from. It composes the honest cross-shard `GETKEYSINSLOT` enumeration
+  (`keys_in_slot`) + `ShardStore::get_object` + the self-consistent `ironcache_repl::encode_kvobj`
+  codec into bounded `(key, encoded-bytes)` batches the destination will `decode_kvobj` + reinsert.
+  A key concurrently deleted or lazily expired between enumeration and read is skipped (never ships a
+  dead key); the batch is bounded by the caller's `limit`. Cold resharding path only (it reuses the
+  same codec persistence + replication use, so it round-trips every value type without the
+  oracle-gated Redis `DUMP`/`RESTORE`); the data hot path and standalone are untouched.
 - `ShardStore::get_object` (issue #371, REBALANCE_APPLY.md): the READ counterpart to `insert_object`,
   returning a live key's full owned `KvObj` (type + TTL + value) or `None` if absent or lazily
   expired. It is the source-side drain primitive the rebalance-APPLY driver needs to encode + ship a

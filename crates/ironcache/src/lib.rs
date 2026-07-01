@@ -34,6 +34,7 @@ pub mod raft_boot;
 /// naming this node is committed; the default static path never touches it. `pub(crate)`:
 /// internal serve wiring, not a client surface.
 pub(crate) mod replica_attach;
+pub mod resharding;
 pub mod serve;
 pub mod spanning_combine;
 /// Home-core ATOMIC apply for the SHARD-SPANNING src->dst move commands (SMOVE/LMOVE/
