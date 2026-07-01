@@ -22,12 +22,15 @@
 //! ## The verify chain (what is trusted, and why)
 //!
 //! The release publishes `SHA256SUMS` over the TARBALLS (`sha256sum ironcache-*.tar.gz`, release.yml),
-//! so the authenticity-relevant check is the TARBALL's sha256 against that manifest -- done HERE with
-//! the SAME [`super::verify::Sha256Verifier`] the local flow uses. Once the tarball is verified, the
-//! binary is extracted deterministically and its trust FORWARDED to the downstream flow as a derived
-//! single-entry sums (its own sha256), so the standard verify -> probe -> swap runs unchanged. When the
-//! minisign anchor lands (#386) the signature over `SHA256SUMS` will gate this fetch too -- the
-//! signature is verified alongside the tarball sha256 here, behind the same [`super::verify::Verifier`].
+//! so the check HERE is the TARBALL's sha256 against that manifest -- done with the SAME
+//! [`super::verify::Sha256Verifier`] the local flow uses. This is INTEGRITY (the bytes match the
+//! published manifest), NOT publisher AUTHENTICITY: `SHA256SUMS` is fetched over the same TLS channel
+//! as the tarball, so TLS authenticates the SERVER, not the signer. The cryptographic AUTHENTICITY
+//! anchor is the #386 minisign signature over `SHA256SUMS` (verify.rs), which will gate this fetch too
+//! once it lands, behind the same [`super::verify::Verifier`]. Once the tarball's integrity is
+//! checked, the binary is extracted deterministically and that verified state FORWARDED to the
+//! downstream flow as a derived single-entry sums (its own sha256), so `verify -> probe -> swap` runs
+//! unchanged.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -123,7 +126,7 @@ pub enum FetchError {
         /// The offending URL.
         url: String,
     },
-    /// The downloaded tarball did not verify against its `SHA256SUMS` entry (integrity / authenticity).
+    /// The downloaded tarball's sha256 did not match its `SHA256SUMS` entry (integrity).
     #[error("verifying the downloaded tarball: {0}")]
     Verify(#[from] VerifyError),
     /// The extracted tarball did not contain the expected `ironcache` binary.
@@ -191,8 +194,8 @@ pub struct Fetched {
     /// The extracted `ironcache` binary on disk.
     pub binary: PathBuf,
     /// A derived `<sha256>  ironcache` manifest for [`binary`], so the downstream `Sha256Verifier`
-    /// (which keys on the binary basename) passes -- the AUTHENTICITY check already happened against
-    /// the published tarball manifest in [`fetch_release`].
+    /// (which keys on the binary basename) passes -- the tarball INTEGRITY check against its published
+    /// `SHA256SUMS` already happened in [`fetch_release`] (publisher authenticity is the #386 anchor).
     pub sha256sums: PathBuf,
     /// The owning temp dir; dropping it deletes `binary` + `sha256sums`, so hold the whole
     /// [`Fetched`] until the upgrade run completes. Private (a drop guard, not read directly).
@@ -227,8 +230,9 @@ pub fn fetch_release(
     let sums = dir.path().join("SHA256SUMS");
     fetch_url(sums_url, &sums, bounds)?;
 
-    // 2. Verify the TARBALL against the published manifest -- the authenticity-relevant check (the
-    //    manifest lists the tarballs). An `ok` here means the bytes are the published release bytes.
+    // 2. Verify the TARBALL against the published manifest -- an INTEGRITY check (the manifest lists
+    //    the tarballs; publisher authenticity is the #386 minisign signature over SHA256SUMS, not this
+    //    same-channel comparison). An `ok` here means the bytes match the published SHA256SUMS.
     Sha256Verifier.verify(&tarball, &asset_name, &sums)?;
 
     // 3. Extract the binary from the (now-verified) tarball.
@@ -244,8 +248,8 @@ pub fn fetch_release(
             tarball: tarball.display().to_string(),
         })?;
 
-    // 4. FORWARD the trust: write a single-entry manifest over the extracted binary so the downstream
-    //    verify -> probe -> swap flow runs unchanged (the real authenticity was step 2).
+    // 4. FORWARD the verified state: write a single-entry manifest over the extracted binary so the
+    //    downstream verify -> probe -> swap flow runs unchanged (the tarball INTEGRITY check was step 2).
     let bin_bytes = std::fs::read(&binary).map_err(|e| FetchError::Io {
         what: format!("reading the extracted binary {}", binary.display()),
         detail: e.to_string(),
@@ -350,8 +354,17 @@ fn build_curl_argv(
     a
 }
 
-/// Extract `tarball` (a `.tar.gz`) into `dest` with the system `tar`, bounded. A tar failure is a
-/// typed [`FetchError`].
+/// The ceiling on total EXTRACTED bytes (defense in depth vs a gzip decompression bomb). A real
+/// release tarball extracts to a ~tens-of-MB binary; 1 GiB is far above any legitimate release and
+/// well below a bomb's target. The tarball is ALREADY verified against the published `SHA256SUMS`
+/// before extraction, so its contents are exactly the published release (a bomb would require a
+/// COMPROMISED release, which the #386 signature anchor defends against, not this layer) -- this cap
+/// is a belt-and-suspenders bound against an anomalously large archive.
+const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Extract `tarball` (a `.tar.gz`) into `dest` with the system `tar`, bounded in time (`run_bounded`)
+/// and, after the fact, in total extracted size ([`MAX_EXTRACTED_BYTES`]). A tar failure or an
+/// over-cap extraction is a typed [`FetchError`].
 fn extract_tarball(tarball: &Path, dest: &Path, bounds: FetchBounds) -> Result<(), FetchError> {
     let tarball_str = tarball.to_string_lossy().into_owned();
     let dest_str = dest.to_string_lossy().into_owned();
@@ -371,18 +384,62 @@ fn extract_tarball(tarball: &Path, dest: &Path, bounds: FetchBounds) -> Result<(
             ),
         });
     }
+    // Defense in depth: refuse an archive that extracted to more than the ceiling (the caller's temp
+    // dir is dropped on this error, cleaning up the partial extraction).
+    let extracted = dir_size(dest);
+    if extracted > MAX_EXTRACTED_BYTES {
+        return Err(FetchError::TooLarge {
+            url: tarball_str,
+            max_bytes: MAX_EXTRACTED_BYTES,
+            actual: extracted,
+        });
+    }
     Ok(())
+}
+
+/// The total size in bytes of all regular files under `root` (best-effort: an unreadable dir/entry is
+/// skipped, so the cap check errs toward under-counting rather than aborting). Used to bound extraction.
+fn dir_size(root: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ty) = entry.file_type() else {
+                continue;
+            };
+            if ty.is_dir() {
+                stack.push(entry.path());
+            } else if ty.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    total
 }
 
 /// Recursively find a regular file named `name` under `root` (the release tarball may place the
 /// binary at the archive root or in a versioned subdir, so search rather than assume the layout).
+/// A single unreadable directory or entry is SKIPPED (not fatal): otherwise one odd permission on a
+/// sibling path would abort the whole search and mask a binary that is actually present, misreported
+/// downstream as [`FetchError::NoBinary`]. Returns the first match, or `None` if none is found.
 fn find_binary(root: &Path, name: &str) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).ok()?;
+        // Skip a directory we cannot read rather than aborting the entire search.
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            let ty = entry.file_type().ok()?;
+            // Skip an entry whose type we cannot stat rather than aborting.
+            let Ok(ty) = entry.file_type() else {
+                continue;
+            };
             if ty.is_dir() {
                 stack.push(path);
             } else if ty.is_file() && entry.file_name().to_str() == Some(name) {
@@ -866,6 +923,18 @@ mod tests {
             "{err:?}"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn dir_size_sums_regular_files_recursively() {
+        // The extraction size-cap helper: sums file bytes across nested dirs (a bomb would blow past
+        // MAX_EXTRACTED_BYTES; a real release stays tiny).
+        let dir = TempDir::new("dirsize").unwrap();
+        std::fs::write(dir.path().join("a"), b"12345").unwrap(); // 5
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("b"), b"6789").unwrap(); // 4
+        assert_eq!(dir_size(dir.path()), 9, "5 + 4 across the tree");
     }
 
     #[test]
