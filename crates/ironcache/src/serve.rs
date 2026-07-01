@@ -4315,6 +4315,12 @@ async fn try_raft_cluster_mutator(
         b"DELSLOTS" => Some(build_unassign(request, parse_addslots_slots)),
         b"DELSLOTSRANGE" => Some(build_unassign(request, parse_addslotsrange_slots)),
         b"FLUSHSLOTS" => Some(build_flushslots(ctx, request)),
+        // #371: `CLUSTER REBALANCE APPLY` ARMS the planned slot migrations (a committed
+        // MIGRATING + IMPORTING per move, driving HA-6's auto-copy); the DRYRUN / default form is a
+        // read-only plan handled by the home dispatch (falls through the `_ => None` arm below).
+        b"REBALANCE" if request.args.len() >= 3 && ascii_upper(&request.args[2]) == b"APPLY" => {
+            Some(build_rebalance_apply(ctx))
+        }
         // Any other subcommand (the introspection set, BUMPEPOCH, HELP, unknown, ...) is NOT a
         // mutator: fall through to the unchanged home dispatch.
         _ => None,
@@ -4800,6 +4806,67 @@ fn build_setslot(
         // Unknown action, or a known action at the wrong argc.
         _ => Err(setslot_err()),
     }
+}
+
+/// The MAX slot moves one `CLUSTER REBALANCE APPLY` ARMS per call. The command proposes + awaits each
+/// `ConfigCmd` synchronously, so this bounds the command's latency; a large rebalance is armed over
+/// several calls (re-running arms the next batch of not-yet-migrating moves). `* 2` because each move
+/// is a MIGRATING + an IMPORTING proposal.
+const MAX_REBALANCE_APPLY_MOVES: usize = 128;
+
+/// Build the committed `ConfigCmd` batch for `CLUSTER REBALANCE APPLY` (#371, REBALANCE_APPLY.md).
+///
+/// For each planned move ([`SlotMap::rebalance_moves`]) whose slot is NOT already migrating (up to the
+/// per-call cap), it tags the SOURCE `MIGRATING <dest>` and the DESTINATION `IMPORTING <src>` -- which
+/// ARMS HA-6's `run_import_control` to auto-copy the slot's keys + tail to the destination. It does
+/// NOT propose the ownership FLIP (`SETSLOT NODE`): the operator finalizes each slot with
+/// `CLUSTER SETSLOT <slot> NODE <dest>` once `CLUSTER COUNTKEYSINSLOT` shows the destination caught up
+/// (a background auto-flip controller is a tracked follow-up). Leaving the flip out is the SAFE choice
+/// -- APPLY never races a last-moment source write against the flip.
+///
+/// Idempotent + resumable: every `SetSlot*` apply is idempotent, and re-running APPLY skips slots
+/// already migrating and arms the NEXT batch, so a big rebalance is driven over repeated calls (the
+/// operator flips caught-up slots in between, which lets `rebalance_moves` recompute). An empty batch
+/// (already balanced, or every move already in flight) commits nothing and replies `+OK`.
+fn build_rebalance_apply(
+    ctx: &ServerContext,
+) -> Result<Vec<ironcache_raft::ConfigCmd>, ironcache_protocol::ErrorReply> {
+    use ironcache_protocol::ErrorReply;
+    let map = ctx
+        .cluster
+        .as_deref()
+        .ok_or_else(|| ErrorReply::err("This instance has cluster support disabled"))?;
+    Ok(rebalance_apply_cmds(map, MAX_REBALANCE_APPLY_MOVES))
+}
+
+/// The PURE core of [`build_rebalance_apply`] (#371): the `MIGRATING` + `IMPORTING` `ConfigCmd`s for
+/// up to `max_moves` of `map`'s planned moves whose slot is not already migrating. Pure over the slot
+/// map, so the batch is unit-tested without a raft quorum. Deterministic (it walks
+/// [`SlotMap::rebalance_moves`]'s deterministic order).
+fn rebalance_apply_cmds(
+    map: &ironcache_cluster::SlotMap,
+    max_moves: usize,
+) -> Vec<ironcache_raft::ConfigCmd> {
+    let mut cmds = Vec::new();
+    for mv in map.rebalance_moves() {
+        if cmds.len() >= max_moves * 2 {
+            break;
+        }
+        // Skip slots already migrating (armed by a prior APPLY): re-running arms the NEXT batch.
+        if map.migration_state(mv.slot) != ironcache_cluster::MigrationState::None {
+            continue;
+        }
+        cmds.push(ironcache_raft::ConfigCmd::SetSlotMigrating {
+            slot: mv.slot,
+            dest: mv.dst_node_id.clone(),
+        });
+        cmds.push(ironcache_raft::ConfigCmd::SetSlotImporting {
+            slot: mv.slot,
+            src: mv.src_node_id,
+            dest: mv.dst_node_id,
+        });
+    }
+    cmds
 }
 
 /// The bound on the MEET id-learning fetch: how long a raft-mode `CLUSTER MEET` will wait for the
@@ -7363,6 +7430,76 @@ mod tests {
             RID_A,
         )
         .expect("a two-way split is valid")
+    }
+
+    #[test]
+    fn rebalance_apply_cmds_arms_migrating_and_importing_pairs_capped() {
+        // Node A owns everything, node B is empty: the plan moves ~half of A's slots to B.
+        let map = ironcache_cluster::SlotMap::build(
+            vec![
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: RID_A.into(),
+                        host: "10.0.0.1".into(),
+                        port: 7001,
+                    },
+                    vec![[0, 16383]],
+                ),
+                (
+                    ironcache_cluster::NodeEntry {
+                        id: RID_B.into(),
+                        host: "10.0.0.2".into(),
+                        port: 7002,
+                    },
+                    vec![],
+                ),
+            ],
+            RID_A,
+        )
+        .unwrap();
+
+        // Cap of 3 moves -> 6 cmds, each a MIGRATING(dest=B) then IMPORTING(src=A, dest=B) pair.
+        let cmds = super::rebalance_apply_cmds(&map, 3);
+        assert_eq!(cmds.len(), 6, "3 moves, capped, is 6 config cmds");
+        for pair in cmds.chunks(2) {
+            match (&pair[0], &pair[1]) {
+                (
+                    ironcache_raft::ConfigCmd::SetSlotMigrating { slot: ms, dest },
+                    ironcache_raft::ConfigCmd::SetSlotImporting {
+                        slot: is,
+                        src,
+                        dest: idest,
+                    },
+                ) => {
+                    assert_eq!(ms, is, "the MIGRATING + IMPORTING are for the same slot");
+                    assert_eq!(dest, RID_B, "MIGRATING toward B");
+                    assert_eq!(src, RID_A, "IMPORTING from A");
+                    assert_eq!(idest, RID_B, "IMPORTING onto B");
+                }
+                other => panic!("expected a MIGRATING+IMPORTING pair, got {other:?}"),
+            }
+        }
+
+        // Re-running skips a slot already MIGRATING (idempotent progress): arm one, re-plan.
+        let armed = match &cmds[0] {
+            ironcache_raft::ConfigCmd::SetSlotMigrating { slot, .. } => *slot,
+            _ => unreachable!("cmds[0] is a MIGRATING"),
+        };
+        map.set_migrating(armed, RID_B).unwrap();
+        let after = super::rebalance_apply_cmds(&map, 3);
+        assert!(
+            after.iter().all(|c| !matches!(
+                c,
+                ironcache_raft::ConfigCmd::SetSlotMigrating { slot, .. } if *slot == armed
+            )),
+            "an already-migrating slot is not re-armed"
+        );
+    }
+
+    #[test]
+    fn rebalance_apply_cmds_of_a_balanced_map_is_empty() {
+        // A balanced two-way split (8192 / 8192) proposes no moves, so no cmds are armed.
+        assert!(super::rebalance_apply_cmds(&redirect_map(), 128).is_empty());
     }
 
     fn rreq(parts: &[&[u8]]) -> Request {
