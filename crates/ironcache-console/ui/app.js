@@ -800,6 +800,34 @@
     });
   }
 
+  // POST /api/cluster/rebalance (#361 over engine #371): arm a planned rebalance
+  // (CLUSTER REBALANCE APPLY), gated by a typed confirmation. It arms MIGRATING/IMPORTING
+  // (the engine auto-copies via HA-6) but does NOT flip ownership, so it cannot lose a write.
+  function triggerRebalanceApply() {
+    var input = byId("rebalance-confirm");
+    var status = byId("rebalance-status");
+    var confirm = input ? (input.value || "").trim() : "";
+    if (status) {
+      status.hidden = false;
+      setText(status, "Arming rebalance...");
+    }
+    fetchMethod("POST", "/api/cluster/rebalance", { confirm: confirm }).then(function (r) {
+      if (input) {
+        input.value = "";
+      }
+      if (!status) {
+        return;
+      }
+      status.hidden = false;
+      if (r.status === 200) {
+        setText(status, "Rebalance armed. Finalize each slot with SETSLOT NODE once caught up.");
+      } else {
+        // 400 = missing/wrong confirmation; 502 = the node refused (e.g. cluster disabled).
+        setText(status, apiError(r, "Rebalance failed."));
+      }
+    });
+  }
+
   // ----- Cluster: node membership (admin) ----------------------------------
   // POST /api/cluster/meet (add, additive) and /api/cluster/forget (remove,
   // destructive: the operator types the EXACT node id, which the UI echoes as confirm).
@@ -2156,6 +2184,7 @@
     // Cluster: load the rebalance dry-run plan on demand (admin); trigger a failover;
     // add/remove a node.
     wireClick("rebalance-load", loadRebalancePlan);
+    wireClick("rebalance-apply", triggerRebalanceApply);
     wireClick("failover-trigger", triggerFailover);
     wireClick("meet-add", addNode);
     wireClick("forget-remove", removeNode);

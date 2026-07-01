@@ -469,6 +469,7 @@ fn is_management_write(method: &str, path: &str) -> bool {
             | "/api/acl/user"
             | "/api/persistence/save"
             | "/api/cluster/failover"
+            | "/api/cluster/rebalance"
             | "/api/cluster/meet"
             | "/api/cluster/forget"
             | "/api/cluster/setslot",
@@ -513,6 +514,14 @@ async fn dispatch_manage(
             Ok(b) => manage::cluster_failover(client, &b).await,
             Err(resp) => resp,
         },
+        // MUTATING: arm a planned rebalance (CLUSTER REBALANCE APPLY, #371). Destructive-confirm
+        // (`{"confirm":"REBALANCE"}`); the engine caps the moves + does not flip ownership. Admin-tier.
+        ("POST", "/api/cluster/rebalance") => {
+            match parse_body::<manage::RebalanceApplyBody>(body) {
+                Ok(b) => manage::cluster_rebalance_apply(client, &b).await,
+                Err(resp) => resp,
+            }
+        }
         // MUTATING: add a node (CLUSTER MEET, additive) / remove a node (CLUSTER FORGET,
         // destructive: confirm must echo the node id). Both Admin-tier writes.
         ("POST", "/api/cluster/meet") => match parse_body::<manage::MeetBody>(body) {
