@@ -151,6 +151,13 @@ release.
 
 ### Added
 
+- `SlotMap::rebalance_moves` (issue #371, REBALANCE_APPLY.md slice 1): the pure planner that turns
+  `rebalance_plan`'s per-node targets into a concrete ordered `{slot, src, dst}` move list the APPLY
+  driver will drive one at a time. Donors (over target) shed their lowest-numbered surplus slots to
+  receivers (under target) in node order; conservation-preserving (it relocates surplus, never creates
+  or drops a slot), deterministic (same map -> same moves), O(slots + nodes). Empty for a single node
+  or a map already at the plan's exact targets. Pure + read-only; no cross-node dependency (the key
+  transfer + controller are later slices).
 - Design doc `docs/design/REBALANCE_APPLY.md` (issue #371, design-first): how to build the
   slot-moving `CLUSTER REBALANCE APPLY` driver that #444 deferred, now that the read side
   (`COUNTKEYSINSLOT` / `GETKEYSINSLOT`) is honest. Scopes the pure move planner (per-node deltas to
