@@ -52,7 +52,7 @@ pub use cmd_acl::{AclSideEffect, dispatch_acl};
 // LEADER (and its advertised CLIENT endpoint) for a NOTLEADER redirect, so an operator who hit a
 // FOLLOWER knows where to reissue. `resolve_leader_hint` reads the leader the `RaftHandle`
 // recognizes and maps it to the leader's client `host:port` via the committed slot map.
-pub use cmd_cluster::{LeaderHint, resolve_leader_hint};
+pub use cmd_cluster::{LeaderHint, SlotScan, parse_slot_scan, resolve_leader_hint};
 
 pub use admission::is_denyoom;
 // The BLOCKING command family (PROD-9): the serve layer parses a blocking command into a
@@ -94,8 +94,8 @@ pub use cmd_hll::{
 // The #89 single-source-of-truth command registry. `CommandClass` is also re-exported via
 // `route` (its legacy path) below; `Arity` is re-exported via `cmd_txn` (its legacy path).
 pub use command_spec::{
-    Arity, CommandSpec, ICEXISTS, ICPUBLISH, ICPUBSUB, ICSPUBLISH, KeySpecKind, is_write,
-    request_is_write_for_pause, spec_of,
+    Arity, CommandSpec, ICCOUNTKEYSINSLOT, ICEXISTS, ICGETKEYSINSLOT, ICPUBLISH, ICPUBSUB,
+    ICSPUBLISH, KeySpecKind, is_write, request_is_write_for_pause, spec_of,
 };
 pub use conn::ConnState;
 pub use dispatch::{

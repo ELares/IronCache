@@ -1715,11 +1715,18 @@ pub fn dispatch_remote_whole_keyspace<E: Env, S: Store + Keyspace>(
     let cmd = ascii_upper(req.command());
 
     // Defense in depth: only WholeKeyspace commands are fanned out here. Anything else is
-    // a coordinator classification bug; refuse it rather than run it on a wrong path.
-    if !matches!(
-        crate::route::classify(&cmd),
-        crate::route::CommandClass::WholeKeyspace
-    ) {
+    // a coordinator classification bug; refuse it rather than run it on a wrong path. The two
+    // #371 slot-scan internal verbs are allow-listed: they are NOT in `spec_of` (so `classify`
+    // returns `AlwaysHome`), but the serve loop only ever rewrites a cluster-mode CLUSTER slot-scan
+    // into them, exactly the whole-keyspace broadcast shape.
+    let is_slot_scan = cmd == crate::command_spec::ICCOUNTKEYSINSLOT
+        || cmd == crate::command_spec::ICGETKEYSINSLOT;
+    if !is_slot_scan
+        && !matches!(
+            crate::route::classify(&cmd),
+            crate::route::CommandClass::WholeKeyspace
+        )
+    {
         return Value::error(ErrorReply::err(
             "command fanned out cross-shard is not whole-keyspace",
         ));
@@ -1744,11 +1751,53 @@ pub fn dispatch_remote_whole_keyspace<E: Env, S: Store + Keyspace>(
             };
             cmd_keyspace::cmd_randomkey(store, db, pick, now, req)
         }
+        // #371: the per-shard partials of CLUSTER COUNTKEYSINSLOT / GETKEYSINSLOT, which the serve
+        // loop rewrites into these internal whole-keyspace verbs. `args[1]` is the (pre-validated)
+        // slot; for GET `args[2]` is the count. The slot/count parses are defensive (the serve loop
+        // only routes a validated command here), falling back to an empty answer, never a panic.
+        b"__ICCOUNTKEYSINSLOT" => match whole_keyspace_slot_arg(req) {
+            Some(slot) => {
+                Value::Integer(cmd_keyspace::count_keys_in_slot(store, db, slot, now) as i64)
+            }
+            None => Value::Integer(0),
+        },
+        b"__ICGETKEYSINSLOT" => match whole_keyspace_slot_arg(req) {
+            Some(slot) => {
+                let limit = whole_keyspace_count_arg(req);
+                let keys = cmd_keyspace::keys_in_slot(store, db, slot, limit, now);
+                Value::Array(Some(
+                    keys.into_iter()
+                        .map(|k| Value::bulk(k.into_vec()))
+                        .collect(),
+                ))
+            }
+            None => Value::Array(Some(Vec::new())),
+        },
         // The classify gate above already excludes everything else.
         _ => Value::error(ErrorReply::err(
             "command fanned out cross-shard is not whole-keyspace",
         )),
     }
+}
+
+/// Parse the slot argument (`args[1]`) of an `__ICCOUNTKEYSINSLOT`/`__ICGETKEYSINSLOT` internal
+/// request into an in-range slot, or `None` if absent / not an integer / out of `[0, 16384)`.
+fn whole_keyspace_slot_arg(req: &Request) -> Option<u16> {
+    let raw = req.args.get(1)?;
+    let n: u16 = std::str::from_utf8(raw).ok()?.parse().ok()?;
+    (n < ironcache_protocol::CLUSTER_SLOTS).then_some(n)
+}
+
+/// Parse the count argument (`args[2]`) of an `__ICGETKEYSINSLOT` internal request into a
+/// non-negative limit, or `0` if absent / malformed (an empty result, never a panic).
+fn whole_keyspace_count_arg(req: &Request) -> usize {
+    req.args
+        .get(2)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&n| n >= 0)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0)
 }
 
 /// `WATCH key [key ...]` (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Marks each key

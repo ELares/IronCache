@@ -84,6 +84,16 @@ pub const ICPUBSUB: &[u8] = b"__ICPUBSUB";
 /// string, so the registry-vs-dispatch cross-check is untouched.
 pub const ICEXISTS: &[u8] = b"__ICEXISTS";
 
+/// The INTERNAL whole-keyspace verbs the cross-shard coordinator uses for the per-shard halves of
+/// `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` (#371, SLOT_KEY_ENUMERATION.md). NOT client commands:
+/// the serve-loop router rewrites a CLUSTER slot-scan into one of these and fans it out, and the
+/// internal-verb client gate rejects a client that sends them directly. Like [`ICEXISTS`] they are
+/// DELIBERATELY ABSENT from the [`spec_of`] registry (dispatched only via the whole-keyspace fan-out,
+/// which allow-lists them in its defense check), so the registry-vs-dispatch cross-check is untouched.
+pub const ICCOUNTKEYSINSLOT: &[u8] = b"__ICCOUNTKEYSINSLOT";
+/// See [`ICCOUNTKEYSINSLOT`]; this is the `GETKEYSINSLOT` (collect up to `<count>` keys) half.
+pub const ICGETKEYSINSLOT: &[u8] = b"__ICGETKEYSINSLOT";
+
 /// The queue-time arity rule for a known command, mirroring the `arity` field of the
 /// Redis command table (src/commands.def). Redis encodes arity as a single signed int:
 /// a POSITIVE `n` means EXACTLY `n` total arguments (command token included); a NEGATIVE

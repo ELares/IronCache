@@ -151,6 +151,19 @@ release.
 
 ### Added
 
+- `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` are now HONEST in cluster mode (issue #371, slice 2 of
+  SLOT_KEY_ENUMERATION.md): they were documented placeholders returning `0` / empty because a slot's
+  keys span every internal shard (the client CRC16 slot and the FNV `owner_shard` are independent
+  hashes). The serve loop now rewrites a cluster-mode slot-scan into an internal whole-keyspace verb
+  and broadcasts it across all shards, summing the per-shard counts (like `DBSIZE`) or concatenating +
+  truncating the per-shard key lists to `<count>` (like `KEYS`), reusing the tested
+  `dispatch_remote_whole_keyspace` fan-out. The data hot path and the standalone deployment are
+  untouched: the commands stay cluster-mode-only (standalone still returns `-ERR cluster support
+  disabled`), there is no write-path index, and a malformed slot-scan falls through to the existing
+  `CLUSTER` validation for the exact Redis error. This is the read-side foundation for the #371
+  rebalance-APPLY driver (which drains a slot via paginated `GETKEYSINSLOT` + per-key move). An
+  integration test over a real 4-shard cluster node proves the count/keys aggregate across shards (a
+  home-shard-only answer would undercount).
 - Per-shard slot-enumeration partials `count_keys_in_slot` / `keys_in_slot` (issue #371, slice 1 of
   SLOT_KEY_ENUMERATION.md): pure helpers over the `Keyspace` SCAN seam that count / collect (up to a
   bound) the live keys in one shard whose client cluster slot (`CRC16(hash_tag(key)) % 16384`, the
