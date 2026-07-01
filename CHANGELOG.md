@@ -151,6 +151,17 @@ release.
 
 ### Added
 
+- `CLUSTER REBALANCE APPLY` (issue #371, REBALANCE_APPLY.md): the operator command that ARMS a planned
+  rebalance. In raft mode it proposes, per planned move (`SlotMap::rebalance_moves`, up to a per-call
+  cap), a committed `SETSLOT MIGRATING <dest>` on the source + `SETSLOT IMPORTING <src>` on the
+  destination -- which drives HA-6's `run_import_control` to auto-copy the slot's keys + tail to the
+  destination. It does NOT propose the ownership flip: the operator finalizes each slot with
+  `CLUSTER SETSLOT <slot> NODE <dest>` once `CLUSTER COUNTKEYSINSLOT` shows the destination caught up
+  (an automatic flip, gated on the destination being safely in-sync, is a tracked follow-up), so APPLY
+  never races a last-moment source write against the flip. Idempotent + resumable: each `SETSLOT`
+  apply is idempotent, re-running skips already-migrating slots and arms the next batch, and an
+  already-balanced cluster arms nothing. `REBALANCE` is admin + dangerous-tier (pre-gated in #444), so
+  a non-admin cannot trigger it; the `DRYRUN` / default form stays the read-only planner.
 - `apply_actions` + `SetSlotAction` (issue #371, REBALANCE_APPLY.md): the pure mapping from an
   `ApplyStep` decision to the concrete committed `CLUSTER SETSLOT` proposals the rebalance-APPLY driver
   issues through the raft path. `StartMigration` -> both the source-side `MIGRATING <dest>` and the
