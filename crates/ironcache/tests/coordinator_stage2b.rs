@@ -1867,8 +1867,8 @@ fn spanning_pfmerge_matches_single_shard_and_preserves_dest_ttl() {
 
 #[test]
 fn spanning_pfmerge_empty_creates_dest() {
-    // PFMERGE with only missing sources still ENSURES the dest exists as a (possibly empty)
-    // dense HLL -- it never deletes. PFCOUNT of the freshly-created dest is 0.
+    // PFMERGE with only missing sources still ENSURES the dest exists as a (possibly empty,
+    // hence sparse) HLL -- it never deletes. PFCOUNT of the freshly-created dest is 0.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
