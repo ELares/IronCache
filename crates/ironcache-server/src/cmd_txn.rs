@@ -376,6 +376,7 @@ pub(crate) mod tests {
             b"PFADD",
             b"PFCOUNT",
             b"PFMERGE",
+            b"PFDEBUG",
             // Generic: SORT / SORT_RO
             b"SORT",
             b"SORT_RO",
@@ -564,8 +565,9 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            195,
-            "the dispatch-arm hand-list drifted from the 183 client commands (incl. LOLWUT, \
+            196,
+            "the dispatch-arm hand-list drifted from the 184 client commands (incl. PFDEBUG, \
+             #242 part 3 HLL introspection, + LOLWUT, \
              #414 command-surface completeness, + the 12 hash-field-TTL commands HEXPIRE/\
              HPEXPIRE/HEXPIREAT/HPEXPIREAT/HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME/HPERSIST + the \
              HGETDEL/HGETEX/HSETEX accessors, #408, + the native CAS + bulk-TTL primitives \

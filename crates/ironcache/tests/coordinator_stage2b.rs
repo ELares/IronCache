@@ -1904,6 +1904,73 @@ fn spanning_pfmerge_empty_creates_dest() {
 }
 
 #[test]
+fn pfdebug_routes_to_the_key_owner_in_both_topologies() {
+    // PFDEBUG is a single-key command whose key is args[2] (routed like OBJECT via ObjectArg2).
+    // Verify it reaches the key's OWNER shard in a 5-shard cluster (not just the accept shard):
+    // ENCODING reports sparse, TODENSE (a WRITE routed to the owner) flips it, and a follow-up
+    // ENCODING reports dense -- so the remote write actually landed on the owner. GETREG returns
+    // the full 16384-register array from that owner.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        for &shards in &[5usize, 1usize] {
+            let (server, port) = boot(shards);
+            let mut c = connect_retry(port).await;
+            let mut buf = Vec::new();
+
+            // A low-cardinality HLL -> sparse.
+            let add = roundtrip(
+                &mut c,
+                &mut buf,
+                &[b"PFADD", b"pd:k", b"a", b"b", b"c", b"d", b"e"],
+            )
+            .await;
+            assert_eq!(add, Resp::Integer(1), "PFADD creates the HLL (shards={shards})");
+            assert!(
+                matches!(&roundtrip(&mut c, &mut buf, &[b"PFDEBUG", b"ENCODING", b"pd:k"]).await,
+                    Resp::Simple(s) if s == b"sparse"),
+                "a fresh low-cardinality HLL is sparse (shards={shards})"
+            );
+
+            // GETREG returns all 16384 registers as an integer array, from the owner shard.
+            let regs = roundtrip(&mut c, &mut buf, &[b"PFDEBUG", b"GETREG", b"pd:k"]).await;
+            match regs {
+                Resp::Array(Some(items)) => assert_eq!(
+                    items.len(),
+                    16384,
+                    "GETREG returns 16384 registers (shards={shards})"
+                ),
+                other => panic!("GETREG should be an array, got {other:?} (shards={shards})"),
+            }
+
+            // TODENSE is a WRITE that must route to the OWNER: after it, ENCODING flips to dense.
+            assert!(
+                matches!(&roundtrip(&mut c, &mut buf, &[b"PFDEBUG", b"TODENSE", b"pd:k"]).await,
+                    Resp::Simple(s) if s == b"OK"),
+                "TODENSE replies +OK (shards={shards})"
+            );
+            assert!(
+                matches!(&roundtrip(&mut c, &mut buf, &[b"PFDEBUG", b"ENCODING", b"pd:k"]).await,
+                    Resp::Simple(s) if s == b"dense"),
+                "the remote TODENSE write landed on the owner: ENCODING is now dense (shards={shards})"
+            );
+            // The cardinality is unchanged by the encoding conversion.
+            assert_eq!(
+                roundtrip(&mut c, &mut buf, &[b"PFCOUNT", b"pd:k"]).await,
+                Resp::Integer(5),
+                "TODENSE preserves the cardinality (shards={shards})"
+            );
+
+            drop(c);
+            server.shutdown_and_join().unwrap();
+        }
+    });
+}
+
+#[test]
 fn spanning_pfmerge_wrongtype_source_aborts_before_any_write() {
     // A non-string PFMERGE source -> WRONGTYPE, and the dest is left UNTOUCHED (validate all
     // inputs before the dest write -- no partial merge).

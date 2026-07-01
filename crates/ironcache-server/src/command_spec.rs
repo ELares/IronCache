@@ -2672,6 +2672,21 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: true,
         },
+        // PFDEBUG <sub> <key> (#242 part 3): the HLL introspection verbs (GETREG / ENCODING /
+        // TODENSE). The key is args[2], so it routes like OBJECT (KeyedMulti + ObjectArg2 --
+        // KeyedSingle would misroute on args[1], the subcommand). A single key never spans
+        // shards, so it always takes the co-located path to that one owner. is_write + denyoom
+        // because TODENSE mutates in place and can allocate the 12304-byte dense object; Redis
+        // likewise flags PFDEBUG as a write.
+        b"PFDEBUG" => &CommandSpec {
+            name: b"PFDEBUG",
+            arity: Min(3),
+            class: KeyedMulti,
+            key_spec: ObjectArg2,
+            denyoom: true,
+            control: false,
+            is_write: true,
+        },
         // -- Generic: SORT / SORT_RO (cmd_sort). --
         // SORT key [...] [STORE dest] (src/commands.def arity -2). KeyedMulti with the SortKeys
         // spec (the source key args[1] PLUS the STORE dest when present, so the ACL per-key check
@@ -3135,6 +3150,7 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     b"PFADD",
     b"PFCOUNT",
     b"PFMERGE",
+    b"PFDEBUG",
     // Generic.
     b"SORT",
     b"SORT_RO",
@@ -3495,6 +3511,7 @@ pub(crate) mod tests {
             b"PEXPIRETIME",
             b"PFADD",
             b"PFCOUNT",
+            b"PFDEBUG",
             b"PFMERGE",
             b"PSETEX",
             b"PTTL",

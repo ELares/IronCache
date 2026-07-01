@@ -1545,6 +1545,9 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"PFADD" => cmd_hll::cmd_pfadd(store, db, now, req),
         b"PFCOUNT" => cmd_hll::cmd_pfcount(store, db, now, req),
         b"PFMERGE" => cmd_hll::cmd_pfmerge(store, db, now, req),
+        // -- PFDEBUG GETREG/ENCODING/TODENSE (#242 part 3): HLL introspection, key at args[2]
+        // (routed like OBJECT via ObjectArg2). --
+        b"PFDEBUG" => cmd_hll::cmd_pfdebug(store, db, now, req),
         // -- Generic SORT / SORT_RO (cmd_sort). SORT sorts the elements of a list/set/zset
         // (numeric or ALPHA) with LIMIT/ASC/DESC/BY/GET/STORE; SORT_RO is the read-only form
         // (no STORE). The BY/GET/STORE keys are dereferenced on this connection's accept shard

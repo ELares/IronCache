@@ -151,6 +151,14 @@ release.
 
 ### Added
 
+- HyperLogLog PFDEBUG introspection (issue #242, part 3): `PFDEBUG GETREG|ENCODING|TODENSE key`,
+  the HLL-internals debug verbs the Redis test suite uses. GETREG returns all 16384 register
+  values as an integer array (decoded from either encoding); ENCODING returns `sparse` or
+  `dense`; TODENSE converts a sparse HLL to dense in place (one-way), preserving every logical
+  register and leaving an already-dense HLL untouched. The key is `args[2]`, routed to its owner
+  shard like `OBJECT ENCODING` (the `ObjectArg2` key spec). Categorized like Redis PFDEBUG:
+  `@write @hyperloglog @admin @slow @dangerous`, so a `-@admin`/`-@dangerous` user is denied it.
+  `PFSELFTEST` (a heavy fixed self-test) is intentionally not implemented.
 - HyperLogLog sparse encoding (issue #242, part 1): a fresh HLL is now created SPARSE (18
   bytes: the `HYLL` header + one XZERO(16384) opcode, byte-identical to a redis-server fresh
   HLL) instead of the 12304-byte dense object, so a low-cardinality HLL (the common case: a

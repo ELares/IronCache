@@ -327,7 +327,7 @@ fn type_category(cmd: &[u8]) -> Option<Category> {
         b"BITFIELD",
         b"BITFIELD_RO",
     ];
-    const HLL: &[&[u8]] = &[b"PFADD", b"PFCOUNT", b"PFMERGE"];
+    const HLL: &[&[u8]] = &[b"PFADD", b"PFCOUNT", b"PFMERGE", b"PFDEBUG"];
 
     if STRING.contains(&cmd) {
         Some(Category::String)
@@ -372,6 +372,8 @@ fn is_admin(cmd: &[u8]) -> bool {
             | b"HOTKEYS"
             // DEBUG conformance subset (#411): an operator/internals command, @admin like Redis.
             | b"DEBUG"
+            // PFDEBUG (#242 part 3): the HLL internals debug verb, @admin like Redis PFDEBUG.
+            | b"PFDEBUG"
     )
 }
 
@@ -407,6 +409,8 @@ fn is_dangerous(cmd: &[u8]) -> bool {
             | b"HOTKEYS"
             // DEBUG (#411): @dangerous in Redis (it exposes internals + can block the server).
             | b"DEBUG"
+            // PFDEBUG (#242 part 3): @dangerous in Redis (TODENSE mutates the internal encoding).
+            | b"PFDEBUG"
     )
 }
 
@@ -758,6 +762,31 @@ mod tests {
         // MEMORY / LATENCY are @admin but NOT @dangerous (Redis parity).
         assert!(!category_bits(b"MEMORY").contains(Category::Dangerous));
         assert!(!category_bits(b"LATENCY").contains(Category::Dangerous));
+    }
+
+    #[test]
+    fn pfdebug_matches_redis_categories() {
+        // PFDEBUG is @write @hyperloglog @admin @slow @dangerous in Redis, so a `-@admin` or
+        // `-@dangerous` user is denied it (a debug/internals verb that mutates the encoding),
+        // while the data PF* verbs (PFADD/PFCOUNT/PFMERGE) are NOT admin/dangerous.
+        let bits = category_bits(b"PFDEBUG");
+        for cat in [
+            Category::Write,
+            Category::Hyperloglog,
+            Category::Admin,
+            Category::Dangerous,
+            Category::Slow,
+        ] {
+            assert!(bits.contains(cat), "PFDEBUG must be @{}", cat.name());
+        }
+        assert!(
+            !bits.contains(Category::Fast),
+            "PFDEBUG is @slow, not @fast"
+        );
+        assert!(
+            !category_bits(b"PFADD").contains(Category::Admin),
+            "PFADD is not @admin"
+        );
     }
 
     #[test]
