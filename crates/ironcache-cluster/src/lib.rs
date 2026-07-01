@@ -496,6 +496,20 @@ pub struct RebalanceTarget {
     pub target_slots: u32,
 }
 
+/// One concrete slot relocation in a rebalance APPLY plan (#371, REBALANCE_APPLY.md): move `slot`
+/// from `src_node_id` to `dst_node_id`. [`SlotMap::rebalance_moves`] derives the ordered list from
+/// [`SlotMap::rebalance_plan`]'s per-node targets; the APPLY driver drives each move (committed
+/// `SETSLOT MIGRATING`/`IMPORTING` -> key drain -> `SETSLOT NODE`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotMove {
+    /// The slot to relocate (`0..=16383`).
+    pub slot: u16,
+    /// The current owner (the migration SOURCE).
+    pub src_node_id: String,
+    /// The balanced-target owner (the migration DESTINATION).
+    pub dst_node_id: String,
+}
+
 impl SlotMap {
     /// Build and validate a STATIC slot map from the resolved topology and THIS node's announce
     /// id (the slice-2 boot path, byte-for-byte unchanged in behaviour).
@@ -1279,6 +1293,82 @@ impl SlotMap {
             .collect()
     }
 
+    /// Derive the CONCRETE slot moves that realize [`rebalance_plan`](Self::rebalance_plan)'s
+    /// per-node targets (#371, REBALANCE_APPLY.md slice 1): an ordered `{slot, src, dst}` list the
+    /// APPLY driver drives one at a time. PURE + read-only over ONE consistent snapshot; the caller
+    /// (a dry-run render or the driver) decides what to do with it.
+    ///
+    /// Each DONOR (a node over its balanced target) sheds its lowest-numbered surplus slots to the
+    /// RECEIVERS (nodes under target) in node order, until every node reaches its target. Conservation
+    /// holds: the targets sum to the assigned-slot total (the first `total % nodes` nodes get one
+    /// extra), so `sum(surplus over donors) == sum(deficit over receivers)` and every surplus slot is
+    /// placed. DETERMINISTIC: donors + receivers walk node index order, a donor's slots ascend, so the
+    /// same map always yields the same moves. Returns empty for a single node (nothing to balance) and
+    /// for a map already at the plan's exact targets. It realizes [`rebalance_plan`]'s CANONICAL
+    /// (index-based) target, so a map balanced only WITHIN the rounding (its `base + 1` slots sit on
+    /// different nodes than the canonical `first extra` choice) yields a few cosmetic moves, matching
+    /// the plan's within-one deltas; the APPLY driver may skip a trivially-small plan. O(slots + nodes).
+    #[must_use]
+    pub fn rebalance_moves(&self) -> Vec<SlotMove> {
+        let nodes = self.nodes();
+        if nodes.len() < 2 {
+            return Vec::new();
+        }
+        // One snapshot: the slots each node owns, ascending. `ranges()` yields the owner index per
+        // coalesced range; an UNASSIGNED range's index is out of bounds and is skipped (unassigned
+        // slots are not owned, so a rebalance does not move them, matching `rebalance_plan`).
+        let mut owned: Vec<Vec<u16>> = vec![Vec::new(); nodes.len()];
+        for (start, end, owner_idx) in self.ranges() {
+            if let Some(v) = owned.get_mut(owner_idx) {
+                v.extend(start..=end);
+            }
+        }
+        for slots in &mut owned {
+            slots.sort_unstable(); // ascending, independent of range yield order (determinism).
+        }
+        // The balanced targets, computed the SAME way as `rebalance_plan`: base each, the first
+        // `extra` nodes get one more, so the targets sum to the assigned total.
+        let total: u32 = owned
+            .iter()
+            .map(|v| u32::try_from(v.len()).unwrap_or(u32::MAX))
+            .sum();
+        let n = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+        let base = total / n;
+        let extra = total % n;
+        // surplus[i] = current - target: a DONOR is > 0, a RECEIVER is < 0.
+        let mut surplus: Vec<i64> = (0..nodes.len())
+            .map(|i| {
+                let target = base + u32::from(u32::try_from(i).unwrap_or(u32::MAX) < extra);
+                i64::from(u32::try_from(owned[i].len()).unwrap_or(u32::MAX)) - i64::from(target)
+            })
+            .collect();
+        let mut moves = Vec::new();
+        let mut recv = 0usize; // monotonic receiver cursor (a filled receiver is never revisited).
+        for donor in 0..nodes.len() {
+            let mut slot_iter = owned[donor].iter();
+            while surplus[donor] > 0 {
+                // The next node that still NEEDS slots (surplus < 0); skip donors + filled receivers.
+                while recv < nodes.len() && surplus[recv] >= 0 {
+                    recv += 1;
+                }
+                if recv >= nodes.len() {
+                    break; // conserved maps never hit this; defensive.
+                }
+                let Some(&slot) = slot_iter.next() else {
+                    break;
+                };
+                moves.push(SlotMove {
+                    slot,
+                    src_node_id: nodes[donor].id.to_string(),
+                    dst_node_id: nodes[recv].id.to_string(),
+                });
+                surplus[donor] -= 1;
+                surplus[recv] += 1;
+            }
+        }
+        moves
+    }
+
     // ----- MUTATORS (slice 3; validate-the-whole-batch-first, then mutate; all-or-nothing) -----
 
     /// `CLUSTER ADDSLOTS / ADDSLOTSRANGE`: claim each slot for THIS node. ALL of `slots` must be
@@ -1824,6 +1914,146 @@ mod tests {
         assert!(map.owns(10922));
         assert!(!map.owns(10923));
         assert_eq!(map.me().id.as_ref(), ID1);
+    }
+
+    #[test]
+    fn rebalance_moves_realize_the_plan_targets_and_conserve_slots() {
+        // ID0 owns the whole space; ID1 + ID2 are empty. The moves must level ownership to the plan.
+        let map = SlotMap::build(
+            vec![
+                (node(ID0, "h0", 1), vec![[0, 16383]]),
+                (node(ID1, "h1", 2), vec![]),
+                (node(ID2, "h2", 3), vec![]),
+            ],
+            ID0,
+        )
+        .unwrap();
+        let plan = map.rebalance_plan();
+        let moves = map.rebalance_moves();
+        let idx = |id: &str| plan.iter().position(|t| t.node_id == id).unwrap();
+
+        // Applying the moves to the current counts yields EXACTLY the balanced targets.
+        let mut count: Vec<i64> = plan.iter().map(|t| i64::from(t.current_slots)).collect();
+        for m in &moves {
+            assert_eq!(m.src_node_id, ID0, "ID0 is the only donor");
+            assert_ne!(m.src_node_id, m.dst_node_id, "a move changes owner");
+            count[idx(&m.src_node_id)] -= 1;
+            count[idx(&m.dst_node_id)] += 1;
+        }
+        for (i, t) in plan.iter().enumerate() {
+            assert_eq!(
+                count[i],
+                i64::from(t.target_slots),
+                "node {} reaches its target",
+                t.node_id
+            );
+        }
+
+        // Every moved slot is distinct (no slot moves twice) and was one of ID0's slots.
+        let mut slots: Vec<u16> = moves.iter().map(|m| m.slot).collect();
+        let move_count = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), move_count, "no slot is moved twice");
+        // The move count equals ID0's surplus (current - target).
+        let d0 = idx(ID0);
+        assert_eq!(
+            u32::try_from(move_count).unwrap(),
+            plan[d0].current_slots - plan[d0].target_slots,
+            "moves == the donor's surplus"
+        );
+    }
+
+    #[test]
+    fn rebalance_moves_of_an_exactly_balanced_or_single_node_map_is_empty() {
+        // A map already at the CANONICAL target (base+1 on the first node, base on the rest, since
+        // 16384 % 3 == 1) needs no moves: node0 owns 5462, node1 + node2 own 5461 each.
+        let canonical = SlotMap::build(
+            vec![
+                (node(ID0, "h0", 1), vec![[0, 5461]]),
+                (node(ID1, "h1", 2), vec![[5462, 10922]]),
+                (node(ID2, "h2", 3), vec![[10923, 16383]]),
+            ],
+            ID0,
+        )
+        .unwrap();
+        assert!(
+            canonical.rebalance_moves().is_empty(),
+            "an exactly-balanced map moves nothing"
+        );
+        // A single node has nothing to balance against.
+        let solo = SlotMap::build(vec![(node(ID0, "h0", 1), vec![[0, 16383]])], ID0).unwrap();
+        assert!(solo.rebalance_moves().is_empty());
+    }
+
+    #[test]
+    fn rebalance_moves_is_deterministic() {
+        let map = SlotMap::build(
+            vec![
+                (node(ID0, "h0", 1), vec![[0, 16383]]),
+                (node(ID1, "h1", 2), vec![]),
+                (node(ID2, "h2", 3), vec![]),
+            ],
+            ID0,
+        )
+        .unwrap();
+        assert_eq!(
+            map.rebalance_moves(),
+            map.rebalance_moves(),
+            "the same map yields the same moves"
+        );
+    }
+
+    #[test]
+    fn rebalance_moves_handle_multiple_donors_and_receivers() {
+        // Two overloaded owners (8192 each) + two empty; 16384/4 = 4096 exactly (no remainder), so
+        // each donor sheds 4096 and each receiver gains 4096. Exercises the receiver cursor spanning
+        // more than one donor and more than one receiver.
+        const ID3: &str = "3333333333333333333333333333333333333333";
+        let map = SlotMap::build(
+            vec![
+                (node(ID0, "h0", 1), vec![[0, 8191]]),
+                (node(ID1, "h1", 2), vec![[8192, 16383]]),
+                (node(ID2, "h2", 3), vec![]),
+                (node(ID3, "h3", 4), vec![]),
+            ],
+            ID0,
+        )
+        .unwrap();
+        let plan = map.rebalance_plan();
+        let moves = map.rebalance_moves();
+        let idx = |id: &str| plan.iter().position(|t| t.node_id == id).unwrap();
+
+        let mut count: Vec<i64> = plan.iter().map(|t| i64::from(t.current_slots)).collect();
+        for m in &moves {
+            // Only the two loaded owners donate; only the two empties receive.
+            assert!(
+                m.src_node_id == ID0 || m.src_node_id == ID1,
+                "donor is a loaded owner"
+            );
+            assert!(
+                m.dst_node_id == ID2 || m.dst_node_id == ID3,
+                "receiver is an empty owner"
+            );
+            count[idx(&m.src_node_id)] -= 1;
+            count[idx(&m.dst_node_id)] += 1;
+        }
+        for (i, t) in plan.iter().enumerate() {
+            assert_eq!(
+                count[i],
+                i64::from(t.target_slots),
+                "node {} reaches 4096",
+                t.node_id
+            );
+            assert_eq!(t.target_slots, 4096, "an even 4-way split");
+        }
+        // No slot moved twice; the total moved is the summed surplus (4096 + 4096).
+        let mut slots: Vec<u16> = moves.iter().map(|m| m.slot).collect();
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n, "no slot moved twice");
+        assert_eq!(n, 8192, "both donors' surplus is relocated");
     }
 
     #[test]
