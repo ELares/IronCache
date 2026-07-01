@@ -52,8 +52,8 @@ use ironcache_runtime::bootstrap::ShardId;
 use ironcache_server::dispatch::ServerContext;
 use ironcache_server::{
     AggOp, Aggregate, HLL_REGISTERS, ProtoVersion, Request, ScoredMember, SetOp, Value,
-    WeightedSource, bitop_compute, bitop_validate_op, dense_from_regs, estimate_reply,
-    is_valid_dense, merge_into, owner_shard, regs_reghisto, set_combine, zset_combine,
+    WeightedSource, bitop_compute, bitop_validate_op, estimate_reply, hll_from_regs, is_valid_hll,
+    merge_into, owner_shard, regs_reghisto, set_combine, zset_combine,
 };
 
 /// GATHER one source key's set members from its OWNER shard (COORDINATOR.md #107, Stage 2b):
@@ -1029,7 +1029,7 @@ fn parse_f64_arg(b: &[u8]) -> Option<f64> {
 // RAW STRING bytes from its owner shard (route `GET key`), COMBINE with a PURE function
 // SHARED with the single-shard handler (the one source of truth so cross-shard and
 // single-shard results CANNOT drift) -- [`bitop_compute`] for BITOP, the
-// [`merge_into`]/[`dense_from_regs`]/[`regs_reghisto`]/[`estimate_reply`] register-array ops
+// [`merge_into`]/[`hll_from_regs`]/[`regs_reghisto`]/[`estimate_reply`] register-array ops
 // for the HLLs -- and for the WRITE forms WRITE the result to the dest owner. BITOP's dest
 // write reuses a plain routed `SET dest <bytes>` (SET clears the dest TTL by default, which
 // is exactly BITOP's blind-overwrite-clear-TTL); PFMERGE's dest write uses the internal
@@ -1040,8 +1040,8 @@ fn parse_f64_arg(b: &[u8]) -> Option<f64> {
 // missing source as an empty string the zero-pad covers; PFCOUNT/PFMERGE skip it); a
 // NON-STRING -> WRONGTYPE (a `GET` on a non-string replies WRONGTYPE) -> ABORT the whole
 // command BEFORE any write. For the HLLs a PRESENT string is additionally validated as a
-// dense HLL on the HOME core ([`is_valid_dense`]); an invalid one -> hll_invalid_value ->
-// abort. All sources are validated FIRST, so a write command never partially mutates.
+// valid HLL (dense OR sparse) on the HOME core (`is_valid_hll`); an invalid one ->
+// hll_invalid_value -> abort. All sources are validated FIRST, so a write never partially mutates.
 // ===========================================================================
 
 /// GATHER one key's RAW STRING bytes from its OWNER shard by routing `GET key` (the home
@@ -1185,8 +1185,8 @@ async fn store_bitop_result(
 
 /// GATHER one HLL key's registers from its OWNER shard into `max_regs` (per-register max),
 /// validating on the HOME core (COORDINATOR.md #107, Stage 2b-3). Route `GET key`: a present
-/// STRING is validated as a dense HLL via [`is_valid_dense`] (an invalid one ->
-/// hll_invalid_value abort) then unioned with the SHARED [`merge_into`]; a missing key
+/// STRING is validated as a valid HLL (dense OR sparse) via [`is_valid_hll`] (an invalid one
+/// -> hll_invalid_value abort) then unioned with the SHARED [`merge_into`]; a missing key
 /// contributes nothing; a non-string -> WRONGTYPE abort. Returns `Ok(())` on a clean gather,
 /// or `Err(error)` to abort the whole command BEFORE any write.
 async fn gather_hll_into(
@@ -1200,9 +1200,10 @@ async fn gather_hll_into(
     use ironcache_protocol::ErrorReply;
     match gather_string_bytes(inbox, ctx, home, db, key).await? {
         Some(bytes) => {
-            // Validate on the home core with the EXACT single-shard check; an invalid dense
-            // HLL aborts before any union/write (matching cmd_pfcount/cmd_pfmerge).
-            if !is_valid_dense(&bytes) {
+            // Validate on the home core with the EXACT single-shard check; an invalid HLL
+            // (dense OR sparse) aborts before any union/write (matching cmd_pfcount/
+            // cmd_pfmerge). `merge_into` then dispatches on the gathered object's encoding.
+            if !is_valid_hll(&bytes) {
                 return Err(Value::error(ErrorReply::hll_invalid_value()));
             }
             merge_into(max_regs, &bytes);
@@ -1263,11 +1264,12 @@ pub async fn fan_out_pfcount(
 /// MIRRORS the single-shard `cmd_pfmerge` EXACTLY: the dest counts as BOTH a source (its
 /// current registers join the union) and the write target, so gather the dest + every source
 /// FIRST (a non-string -> WRONGTYPE, a present-but-invalid -> hll_invalid_value -- validated
-/// before any write); UNION via the SHARED [`merge_into`]; build the merged dense object via
-/// [`dense_from_regs`]; write it to the dest owner via the internal
+/// before any write); UNION via the SHARED [`merge_into`]; build the merged object via the
+/// SHARED [`hll_from_regs`] (sparse when it fits, else dense -- the SAME encoding the
+/// single-shard handler writes); write it to the dest owner via the internal
 /// [`ironcache_server::ICSTOREHLL`] verb, which PRESERVES the dest's existing TTL (the one
 /// semantic that differs from a plain SET) and NEVER deletes (an empty merge still ensures an
-/// empty dense HLL at the dest). Reply `+OK`.
+/// empty HLL at the dest). Reply `+OK`.
 pub async fn fan_out_pfmerge(
     inbox: &Inbox,
     ctx: &ServerContext,
@@ -1295,10 +1297,11 @@ pub async fn fan_out_pfmerge(
                 break 'reply e;
             }
         }
-        // Build the merged dense object and write it TTL-PRESERVINGLY to the dest owner via
-        // the internal verb. PFMERGE never deletes on empty: an empty union still writes an
-        // (empty) dense HLL, matching the single-shard handler.
-        let merged = dense_from_regs(&max_regs);
+        // Build the merged object (sparse when it fits, else dense) and write it
+        // TTL-PRESERVINGLY to the dest owner via the internal verb. PFMERGE never deletes on
+        // empty: an empty union still writes an (empty, hence sparse) HLL, matching the
+        // single-shard handler and its encoding exactly.
+        let merged = hll_from_regs(&max_regs);
         store_hll_result(inbox, ctx, home, db, &dest, merged).await
     };
     encode_into(out, &reply, proto);

@@ -88,8 +88,8 @@ pub use cmd_bitmap::{bitop_compute, bitop_validate_op};
 // dest-write verb token (client-unreachable; only the coordinator issues it to write a
 // merged HLL to the PFMERGE dest owner with the dest TTL PRESERVED).
 pub use cmd_hll::{
-    HLL_REGISTERS, ICSTOREHLL, dense_from_regs, estimate_reply, is_valid_dense, merge_into,
-    regs_reghisto,
+    HLL_REGISTERS, ICSTOREHLL, estimate_reply, hll_from_regs, is_valid_dense, is_valid_hll,
+    merge_into, regs_reghisto,
 };
 // The #89 single-source-of-truth command registry. `CommandClass` is also re-exported via
 // `route` (its legacy path) below; `Arity` is re-exported via `cmd_txn` (its legacy path).

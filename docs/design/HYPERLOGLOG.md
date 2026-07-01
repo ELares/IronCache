@@ -94,6 +94,29 @@ three PF commands, and the round-trip contract. Out of scope: the SIMD kernels
   dense promotion produces the same logical registers and stays dense (#98).
 - OBJECT ENCODING reports a string-typed value consistent with #40.
 
+## Implementation status
+
+- DONE (dense): PFADD/PFCOUNT/PFMERGE over the real Redis dense byte layout,
+  MurmurHash64A, and the Ertl estimator (PR-11, #241).
+- DONE (sparse, #242): a fresh HLL is created SPARSE (18 bytes: header + one
+  XZERO(16384), byte-identical to a redis-server fresh HLL); PFADD keeps it sparse and
+  PROMOTES one-way to dense when a register would exceed the VAL cap of 32 or the stream
+  would exceed hll-sparse-max-bytes [redis-hll-sparse-max-bytes-3000]; PFCOUNT/PFMERGE and
+  the cross-shard coordinator read sparse sources through the same logical-register view, and
+  PFMERGE writes the smallest valid result (sparse when it fits, else dense) via the shared
+  `hll_from_regs` in both the single-shard and cross-shard paths, so the two agree exactly.
+- Two deliberate, Redis-compatible divergences from the sketch above, documented in the
+  `cmd_hll` module: (a) PFADD REBUILDS the sparse stream by a canonical re-encode of the
+  logical registers (adjacent equal-value runs merged) rather than an in-place opcode
+  rewrite; the output is a valid Redis sparse object, and the worst-case cost is the same
+  O(sparse size) bounded by the promotion cap. (b) The cached-cardinality header field is
+  ALWAYS left invalid and PFCOUNT always recomputes (avoiding a read-path write that would
+  dirty a watched key); observably identical to Redis (same count).
+- DEFERRED (#242): DUMP/RESTORE byte-interop against a pinned redis-server (needs the
+  DUMP/RESTORE command plus the differential oracle #97) and the PFDEBUG / PFSELFTEST
+  introspection verbs. The sparse bytes written here are already valid Redis sparse
+  objects, so DUMP/RESTORE round-trips them without rework.
+
 ## References
 
 - ADR-0009, ADR-0018; issues #39, #35, #40, #129, #116, #98, #97, #85.

@@ -151,6 +151,21 @@ release.
 
 ### Added
 
+- HyperLogLog sparse encoding (issue #242, part 1): a fresh HLL is now created SPARSE (18
+  bytes: the `HYLL` header + one XZERO(16384) opcode, byte-identical to a redis-server fresh
+  HLL) instead of the 12304-byte dense object, so a low-cardinality HLL (the common case: a
+  per-page unique-visitor counter) costs tens of bytes, not 12 KB. PFADD keeps the HLL
+  sparse via a canonical re-encode of the logical registers and PROMOTES it one-way to dense
+  only when a register would exceed the sparse VAL cap of 32 or the opcode stream would
+  exceed `hll-sparse-max-bytes` (~3000, the Redis default). PFCOUNT, PFMERGE, and the
+  cross-shard coordinator all read sparse sources through the same logical-register view, so
+  the estimate is identical whatever the encoding; PFMERGE also WRITES the smallest valid
+  result (sparse when the merged cardinality fits, else dense), in both the single-shard and
+  cross-shard paths, so a merge of low-cardinality HLLs stays compact. The opcode geometry (ZERO/XZERO/VAL run
+  maxima and byte widths, the value cap) is pinned to the Redis source and covered by a
+  golden-vector test plus a sparse->dense promotion model test that asserts the registers
+  are preserved across the flip. DUMP/RESTORE byte-interop and the PFDEBUG/PFSELFTEST verbs
+  remain deferred (they need the DUMP/RESTORE command and the differential oracle #97).
 - Console rebalance-APPLY rail (issue #361, over engine #371): a `POST /api/cluster/rebalance` action
   + an "Arm rebalance" button on the cluster view that issues `CLUSTER REBALANCE APPLY` to arm the
   planned migrations (the engine drives the HA-6 copy; it does not flip ownership, so it cannot lose a
