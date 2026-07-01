@@ -151,6 +151,18 @@ release.
 
 ### Added
 
+- `apply_step` + `ApplyStep` (issue #371, REBALANCE_APPLY.md): the pure decision core of the
+  rebalance-APPLY controller. Given the authoritative committed state (has the owner flipped to the
+  destination? is a migration in flight?) and the driver's caught-up verdict, it returns the next
+  committed step for one `SlotMove`: `StartMigration` (propose committed `SETSLOT MIGRATING`/
+  `IMPORTING`, then HA-6 auto-copies the slot's data + tail), `AwaitCopy` (not yet caught up, keep
+  polling), `Commit` (safely caught up, propose the `SETSLOT NODE` flip), or `Done`. The
+  data-safety judgement of WHEN the destination is safely caught up (the import in-sync on the
+  source's offset per ADR-0026, not just `COUNTKEYSINSLOT` parity) is deliberately left to the driver
+  where the live import state lives; this function is the pure state transition. Because every input
+  is read fresh from the committed map + the live import state, the controller needs no durable
+  checkpoint and RESUMES correctly after a crash. The cross-node copy itself is the existing HA-6
+  slot-import (not a new transport).
 - `SlotMap::rebalance_moves` (issue #371, REBALANCE_APPLY.md slice 1): the pure planner that turns
   `rebalance_plan`'s per-node targets into a concrete ordered `{slot, src, dst}` move list the APPLY
   driver will drive one at a time. Donors (over target) shed their lowest-numbered surplus slots to

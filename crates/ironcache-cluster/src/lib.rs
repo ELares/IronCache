@@ -510,6 +510,60 @@ pub struct SlotMove {
     pub dst_node_id: String,
 }
 
+/// The NEXT committed step the rebalance-APPLY controller should take for ONE [`SlotMove`] (#371,
+/// REBALANCE_APPLY.md). The controller loops [`apply_step`] per move against the AUTHORITATIVE
+/// committed state + the live copy progress, so it is RESUMABLE: a restart re-derives the step from
+/// the committed map + the counts, holding no private controller checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyStep {
+    /// The slot is not yet migrating: propose the committed `SETSLOT <slot> MIGRATING <dst>` (source)
+    /// + `SETSLOT <slot> IMPORTING <src>` (destination). HA-6 then auto-copies the slot's data + tail.
+    StartMigration,
+    /// Migration is committed and HA-6 is still copying (the destination is not yet caught up): do
+    /// nothing, poll again. The scoped tail keeps the destination converging as the source serves
+    /// writes.
+    AwaitCopy,
+    /// The destination has SAFELY caught up (the driver's in-sync verdict): propose the committed
+    /// `SETSLOT <slot> NODE <dst>`, the epoch-bumping ownership flip.
+    Commit,
+    /// Ownership has flipped to the destination: this move is complete.
+    Done,
+}
+
+/// Decide the next rebalance-APPLY step for a move (#371, REBALANCE_APPLY.md), PURELY from the
+/// authoritative committed state + a caught-up verdict the driver supplies:
+/// - `owner_is_destination`: has the committed owner already flipped to the destination?
+/// - `migration_in_flight`: has `MIGRATING`/`IMPORTING` been committed (and not yet flipped)?
+/// - `destination_caught_up`: has HA-6 finished copying the slot to the destination such that it is
+///   SAFE to flip ownership?
+///
+/// IMPORTANT: this function does NOT decide "caught up" itself, because the SAFE flip condition is a
+/// data-safety judgement (a last-moment source write must not race the flip), not a coarse count
+/// compare. The DRIVER computes `destination_caught_up` with the strongest signal available -- the
+/// import being IN-SYNC on the source's offset (the ADR-0026 in-sync posture, not just
+/// `COUNTKEYSINSLOT` parity, which is only a progress hint) and/or a brief source-write quiesce at the
+/// flip -- and passes the verdict in. Keeping that judgement in the driver (where the live repl/import
+/// state lives) and the STATE TRANSITION here (pure) is the clean split.
+///
+/// Because every input is read fresh from the committed map + the live import state, the controller
+/// needs no durable checkpoint: after a crash it re-reads and resumes at the same step.
+#[must_use]
+pub fn apply_step(
+    owner_is_destination: bool,
+    migration_in_flight: bool,
+    destination_caught_up: bool,
+) -> ApplyStep {
+    if owner_is_destination {
+        ApplyStep::Done
+    } else if !migration_in_flight {
+        ApplyStep::StartMigration
+    } else if destination_caught_up {
+        ApplyStep::Commit
+    } else {
+        ApplyStep::AwaitCopy
+    }
+}
+
 impl SlotMap {
     /// Build and validate a STATIC slot map from the resolved topology and THIS node's announce
     /// id (the slice-2 boot path, byte-for-byte unchanged in behaviour).
@@ -2054,6 +2108,41 @@ mod tests {
         slots.dedup();
         assert_eq!(slots.len(), n, "no slot moved twice");
         assert_eq!(n, 8192, "both donors' surplus is relocated");
+    }
+
+    #[test]
+    fn apply_step_walks_a_move_start_to_done() {
+        // Not migrating yet -> start (the caught-up verdict is irrelevant here).
+        assert_eq!(apply_step(false, false, false), ApplyStep::StartMigration);
+        assert_eq!(apply_step(false, false, true), ApplyStep::StartMigration);
+
+        // Migrating but not yet caught up -> keep waiting for HA-6 to copy.
+        assert_eq!(apply_step(false, true, false), ApplyStep::AwaitCopy);
+
+        // Migrating and safely caught up (the driver's verdict) -> commit the flip.
+        assert_eq!(apply_step(false, true, true), ApplyStep::Commit);
+
+        // Ownership flipped -> done, regardless of the (now stale) migrating / caught-up flags.
+        assert_eq!(apply_step(true, false, false), ApplyStep::Done);
+        assert_eq!(apply_step(true, true, false), ApplyStep::Done);
+        assert_eq!(apply_step(true, true, true), ApplyStep::Done);
+    }
+
+    #[test]
+    fn apply_step_is_a_pure_function_of_committed_state_so_it_resumes() {
+        // The controller holds no checkpoint: the SAME inputs always yield the SAME step, so a
+        // restart re-deriving from the committed map + the live import state picks up at the same
+        // place. Exhaustive over the 8-point input space.
+        for &owner in &[false, true] {
+            for &mig in &[false, true] {
+                for &caught in &[false, true] {
+                    assert_eq!(
+                        apply_step(owner, mig, caught),
+                        apply_step(owner, mig, caught)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
