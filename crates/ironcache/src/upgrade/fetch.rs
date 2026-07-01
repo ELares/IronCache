@@ -424,6 +424,139 @@ fn subprocess_err(tool: &str, what: &str, e: &BoundedError) -> FetchError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GitHub release resolution for `ironcache upgrade --to <version|latest>` (#394).
+//
+// Turns a `--to` spec into the `(tarball_url, sha256sums_url)` that `fetch_release` downloads. The
+// `latest` case resolves the tag via GitHub's `releases/latest` REDIRECT (curl's `--write-out
+// %{url_effective}`) rather than the JSON API, so there is no token, no JSON parse, and no new
+// dependency. release.yml names assets `ironcache-<version>-<plat>.tar.gz`; rolling releases (the
+// `latest` channel) tag == version, formal releases tag == `v<version>`.
+// ---------------------------------------------------------------------------
+
+/// The default GitHub repo the upgrade fetches from (overridable with `--repo`).
+pub const DEFAULT_UPGRADE_REPO: &str = "ELares/IronCache";
+
+/// The release-asset platform tag for THIS binary's build target, or `None` when the platform has
+/// no published release asset. `cfg!` resolves at COMPILE time to the target this binary was built
+/// for, so a musl amd64 build reports `linux-amd64-musl`; the strings mirror release.yml's
+/// `matrix.plat`. The release ships Linux musl/glibc on amd64/arm64 only (upgrade targets Linux
+/// servers), so a macOS/other build returns `None` and `--to` reports "no asset for this platform".
+#[must_use]
+pub fn target_plat() -> Option<&'static str> {
+    if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "musl"
+    )) {
+        Some("linux-amd64-musl")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "musl"
+    )) {
+        Some("linux-arm64-musl")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu"
+    )) {
+        Some("linux-amd64-glibc")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "gnu"
+    )) {
+        Some("linux-arm64-glibc")
+    } else {
+        None
+    }
+}
+
+/// The `(tarball_url, sha256sums_url)` for `version` published under `tag` in `repo`, for `plat`.
+/// Pure, so the URL shape is unit-tested. `tag` and `version` are separate because a formal release
+/// tags `vX.Y.Z` while its asset is named `...-X.Y.Z-...` (rolling releases have tag == version).
+#[must_use]
+pub fn github_release_urls(repo: &str, tag: &str, version: &str, plat: &str) -> (String, String) {
+    let base = format!("https://github.com/{repo}/releases/download/{tag}");
+    (
+        format!("{base}/ironcache-{version}-{plat}.tar.gz"),
+        format!("{base}/SHA256SUMS"),
+    )
+}
+
+/// The version implied by a release `tag`: the tag minus any leading `v` (a formal `vX.Y.Z` -> the
+/// `X.Y.Z` in the asset name; a rolling `YYYY.MMDD.N` tag is already the version).
+#[must_use]
+pub fn version_from_tag(tag: &str) -> &str {
+    tag.strip_prefix('v').unwrap_or(tag)
+}
+
+/// Resolve the LATEST release tag by following GitHub's `releases/latest` redirect to
+/// `.../releases/tag/<tag>` and reading the effective URL's last segment. A HEAD request (no body),
+/// bounded + https-only, so there is no API token, no rate-limited JSON, and no new dependency.
+///
+/// # Errors
+///
+/// Returns a [`FetchError`] on a curl failure or an unparseable effective URL.
+pub fn resolve_latest_tag(repo: &str, bounds: FetchBounds) -> Result<String, FetchError> {
+    let url = format!("https://github.com/{repo}/releases/latest");
+    let effective = curl_effective_url(&url, bounds)?;
+    url_basename(&effective).ok_or_else(|| FetchError::Io {
+        what: "resolving the latest release tag".to_owned(),
+        detail: format!("no tag segment in the resolved URL {effective}"),
+    })
+}
+
+/// HEAD-follow `url` and return the FINAL (post-redirect) URL via curl's `--write-out
+/// %{url_effective}`. Bounded + https-only (same guards as [`fetch_url`]).
+fn curl_effective_url(url: &str, bounds: FetchBounds) -> Result<String, FetchError> {
+    if bounds.https_only && !is_https(url) {
+        return Err(FetchError::NotHttps {
+            url: url.to_owned(),
+        });
+    }
+    let max_secs = bounds.timeout.as_secs().max(1).to_string();
+    let mut args: Vec<String> = vec![
+        "--fail".into(),
+        "--silent".into(),
+        "--show-error".into(),
+        "--location".into(),
+        "--head".into(),
+        "--output".into(),
+        "/dev/null".into(),
+        "--max-time".into(),
+        max_secs,
+        "--write-out".into(),
+        "%{url_effective}".into(),
+    ];
+    if bounds.https_only {
+        args.push("--proto".into());
+        args.push("=https".into());
+        args.push("--proto-redir".into());
+        args.push("=https".into());
+    }
+    args.push(url.into());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let outer = bounds.timeout + Duration::from_secs(30);
+    let out = run_bounded(Path::new("curl"), &refs, outer)
+        .map_err(|e| subprocess_err("curl", url, &e))?;
+    if !out.status.success() {
+        return Err(FetchError::Subprocess {
+            tool: "curl".to_owned(),
+            what: url.to_owned(),
+            detail: format!(
+                "exit {}: {}",
+                out.status
+                    .code()
+                    .map_or_else(|| "signal".to_owned(), |c| c.to_string()),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +714,86 @@ mod tests {
             !insecure.iter().any(|a| a == "--proto"),
             "no proto guard when not https_only"
         );
+    }
+
+    #[test]
+    fn github_release_urls_match_the_release_asset_naming() {
+        // The URL shape must match release.yml: ironcache-<version>-<plat>.tar.gz + SHA256SUMS, under
+        // releases/download/<tag>.
+        let (tarball, sums) = github_release_urls(
+            "ELares/IronCache",
+            "2026.0701.1",
+            "2026.0701.1",
+            "linux-amd64-musl",
+        );
+        assert_eq!(
+            tarball,
+            "https://github.com/ELares/IronCache/releases/download/2026.0701.1/ironcache-2026.0701.1-linux-amd64-musl.tar.gz"
+        );
+        assert_eq!(
+            sums,
+            "https://github.com/ELares/IronCache/releases/download/2026.0701.1/SHA256SUMS"
+        );
+        // A formal v-tag: the tag keeps the `v`, the asset uses the bare version.
+        let (tarball_v, _) = github_release_urls("o/r", "v1.2.3", "1.2.3", "linux-arm64-glibc");
+        assert!(tarball_v.ends_with("/download/v1.2.3/ironcache-1.2.3-linux-arm64-glibc.tar.gz"));
+    }
+
+    #[test]
+    fn version_from_tag_strips_a_leading_v() {
+        assert_eq!(version_from_tag("v1.2.3"), "1.2.3");
+        assert_eq!(version_from_tag("2026.0701.1"), "2026.0701.1"); // rolling tag == version
+        assert_eq!(version_from_tag("v2026.0701.1"), "2026.0701.1");
+    }
+
+    #[test]
+    fn target_plat_is_none_or_a_known_release_plat() {
+        // Platform-agnostic invariant (the value differs per CI target): it is either None (no
+        // published asset, e.g. macOS) or exactly one of the four release.yml plats.
+        let known = [
+            "linux-amd64-musl",
+            "linux-arm64-musl",
+            "linux-amd64-glibc",
+            "linux-arm64-glibc",
+        ];
+        match target_plat() {
+            None => {}
+            Some(p) => assert!(known.contains(&p), "unexpected plat {p}"),
+        }
+    }
+
+    #[test]
+    fn curl_effective_url_follows_redirect_to_the_release_tag() {
+        // The `--to latest` resolver follows releases/latest -> releases/tag/<tag>; assert the
+        // effective URL is the redirect TARGET and its last segment is the tag.
+        if !have_tool("curl") {
+            return;
+        }
+        let routes = vec![
+            Route {
+                path: "/o/r/releases/latest".to_owned(),
+                body: vec![],
+                redirect_to: Some("/o/r/releases/tag/2026.0701.1".to_owned()),
+            },
+            Route {
+                path: "/o/r/releases/tag/2026.0701.1".to_owned(),
+                body: vec![], // 200 Content-Length: 0, so the HEAD request is clean.
+                redirect_to: None,
+            },
+        ];
+        let (base, handle) = spawn_http(routes, 2);
+        let eff = curl_effective_url(&format!("http://{base}/o/r/releases/latest"), test_bounds())
+            .expect("resolves the effective url");
+        assert!(
+            eff.ends_with("/o/r/releases/tag/2026.0701.1"),
+            "effective url: {eff}"
+        );
+        assert_eq!(
+            url_basename(&eff).as_deref(),
+            Some("2026.0701.1"),
+            "the tag is the last segment"
+        );
+        handle.join().unwrap();
     }
 
     #[test]

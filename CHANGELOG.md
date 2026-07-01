@@ -151,6 +151,14 @@ release.
 
 ### Added
 
+- `ironcache upgrade --to <version|latest>` (issue #394, completes it): the "easy upgrade" UX over the
+  #394 fetch core. `--to 2026.0701.1` (or `--to latest`) resolves THIS host's release asset from GitHub
+  (`--repo` overrides the default `ELares/IronCache`), then downloads / verifies / extracts / installs
+  it via the same path as `--from-url`. The platform asset is chosen at compile time via `cfg!` (the
+  four `linux-{amd64,arm64}-{musl,glibc}` targets release.yml ships; a platform with no asset is a clean
+  error before any network). `latest` follows GitHub's `releases/latest` redirect (curl `--write-out
+  %{url_effective}`) to read the newest rolling tag, so there is no API token, no JSON, and still no new
+  dependency. `--binary`, `--from-url`, and `--to` are mutually exclusive (exactly one source).
 - `ironcache upgrade` HTTPS auto-fetch (issue #394): `ironcache upgrade --from-url <tarball-url>
   --sums-url <sums-url>` downloads a release tarball + its `SHA256SUMS` over HTTPS, verifies the
   tarball against the manifest, extracts the `ironcache` binary, and installs it through the SAME

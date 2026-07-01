@@ -141,6 +141,18 @@ pub struct UpgradeArgs {
     #[arg(long, value_name = "URL")]
     pub sums_url: Option<String>,
 
+    /// REMOTE source (#394): fetch a specific version (e.g. `2026.0701.1`) or `latest` from GitHub
+    /// Releases. Resolves this platform's asset URL (+ the `SHA256SUMS`), then downloads / verifies /
+    /// extracts / installs it exactly like `--from-url`, constructing the URLs for you. `latest`
+    /// follows the `releases/latest` redirect to the newest rolling build. Mutually exclusive with
+    /// `--binary` and `--from-url`.
+    #[arg(long, value_name = "VERSION|latest")]
+    pub to: Option<String>,
+
+    /// The `owner/repo` to fetch `--to` from (default `ELares/IronCache`).
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub repo: Option<String>,
+
     /// The live binary path to swap onto (the `.new`/`.old` slots live alongside it on the SAME
     /// filesystem). Defaults to the systemd unit's `ExecStart` path.
     #[arg(long, value_name = "PATH", default_value = "/usr/local/bin/ironcache")]
