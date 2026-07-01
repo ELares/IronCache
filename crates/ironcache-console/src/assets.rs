@@ -293,10 +293,12 @@ mod tests {
             "id=\"section-persistence\"",
             "id=\"persistence-save\"",
             "data-section=\"persistence\"",
-            // Cluster rebalance dry-run card (#361).
+            // Cluster rebalance dry-run card (#361) + the APPLY arm (#371, destructive: typed confirm).
             "id=\"rebalance-load\"",
             "id=\"rebalance-body\"",
             "id=\"rebalance-summary\"",
+            "id=\"rebalance-confirm\"",
+            "id=\"rebalance-apply\"",
             // Cluster failover card (#361, destructive: a typed confirmation input).
             "id=\"failover-confirm\"",
             "id=\"failover-trigger\"",

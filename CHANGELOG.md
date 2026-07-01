@@ -151,6 +151,14 @@ release.
 
 ### Added
 
+- Console rebalance-APPLY rail (issue #361, over engine #371): a `POST /api/cluster/rebalance` action
+  + an "Arm rebalance" button on the cluster view that issues `CLUSTER REBALANCE APPLY` to arm the
+  planned migrations (the engine drives the HA-6 copy; it does not flip ownership, so it cannot lose a
+  write). It is admin-tier + audit-logged like the other mutating actions, and requires a typed
+  destructive confirmation (`{"confirm":"REBALANCE"}` / typing `REBALANCE` in the UI) so a stray or
+  replayed POST cannot start moving slots. With the existing add/remove-node (#451) + failover (#450)
+  actions and the rebalance dry-run (#445), the console now lets an operator inspect a plan and then
+  trigger a rebalance/failover from the UI with confirmation + audit -- #361's acceptance.
 - `CLUSTER REBALANCE APPLY` (issue #371, REBALANCE_APPLY.md): the operator command that ARMS a planned
   rebalance. In raft mode it proposes, per planned move (`SlotMap::rebalance_moves`, up to a per-call
   cap), a committed `SETSLOT MIGRATING <dest>` on the source + `SETSLOT IMPORTING <src>` on the

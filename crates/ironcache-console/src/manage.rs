@@ -162,6 +162,17 @@ pub struct FailoverBody {
     pub confirm: String,
 }
 
+/// `POST /api/cluster/rebalance` body (#361): the typed destructive-confirmation for arming a
+/// planned rebalance. The operator must echo the literal token [`REBALANCE_APPLY_CONFIRM`]
+/// (`"REBALANCE"`) so a stray or replayed POST cannot start moving slots. No options are accepted:
+/// the console only ever issues a bare `CLUSTER REBALANCE APPLY`, and the engine caps the moves per
+/// call + refuses a non-admin.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RebalanceApplyBody {
+    /// Must equal [`REBALANCE_APPLY_CONFIRM`] or the request is a `400`.
+    pub confirm: String,
+}
+
 /// `POST /api/cluster/meet` body (#361): add a node to the cluster (`CLUSTER MEET host
 /// port`). Additive, so NO destructive-confirmation is required (the issue scopes typed
 /// confirmation to FORGET/SETSLOT/FLUSH-class actions); the engine validates the
@@ -631,6 +642,50 @@ pub async fn cluster_failover(client: &mut NodeClient, body: &FailoverBody) -> A
 /// destructive-confirmation rail is unit-tested without a node.
 fn failover_confirmed(body: &FailoverBody) -> bool {
     body.confirm.trim() == FAILOVER_CONFIRM
+}
+
+/// The destructive-confirmation token for [`cluster_rebalance_apply`].
+pub const REBALANCE_APPLY_CONFIRM: &str = "REBALANCE";
+
+/// `POST /api/cluster/rebalance` (#361, the rebalance-APPLY rail over engine #371): arm a planned
+/// rebalance by issuing a bare `CLUSTER REBALANCE APPLY` to the configured node. In raft mode the
+/// engine proposes, per planned move, a committed `SETSLOT MIGRATING`/`IMPORTING` (which drives the
+/// HA-6 auto-copy); it does NOT flip ownership, so this cannot lose a write. The operator inspects the
+/// plan first via `GET /api/cluster/rebalance-plan` (the dry-run rail, #445).
+///
+/// SAFE BY ENGINE CONSTRUCTION: `REBALANCE` is admin + dangerous-tier, the moves are capped per call,
+/// and the ownership flip stays a separate committed `SETSLOT NODE` step; a rejection (e.g. cluster
+/// support disabled, or not the leader) returns the node's verbatim `-ERR` (a `502`).
+///
+/// DESTRUCTIVE-CONFIRMATION: the body must carry `{"confirm":"REBALANCE"}`
+/// ([`REBALANCE_APPLY_CONFIRM`]) or it is a `400`, so a stray / replayed POST cannot start moving
+/// slots. Admin-tier + audit-logged by the HTTP layer.
+///
+/// # Errors
+///
+/// Returns a `400` when the confirmation token is absent/wrong, or a `502` when the node rejects the
+/// command (e.g. cluster support disabled) or is unreachable.
+pub async fn cluster_rebalance_apply(
+    client: &mut NodeClient,
+    body: &RebalanceApplyBody,
+) -> ApiResponse {
+    if !rebalance_apply_confirmed(body) {
+        return ApiResponse::bad_request(
+            "destructive action: re-send with {\"confirm\":\"REBALANCE\"} to arm a rebalance",
+        );
+    }
+    let reply = match client.command(&[b"CLUSTER", b"REBALANCE", b"APPLY"]).await {
+        Ok(r) => r,
+        Err(e) => return node_error_response(&e),
+    };
+    ok_or_node_text(&reply)
+}
+
+/// Whether a [`RebalanceApplyBody`] carries the EXACT confirmation token (trailing whitespace
+/// tolerated, otherwise exact + case-sensitive). Pure, so the destructive-confirmation rail is
+/// unit-tested without a node.
+fn rebalance_apply_confirmed(body: &RebalanceApplyBody) -> bool {
+    body.confirm.trim() == REBALANCE_APPLY_CONFIRM
 }
 
 /// `POST /api/cluster/meet` (#361): add a node via `CLUSTER MEET host port`. In raft
@@ -1593,6 +1648,23 @@ mod tests {
         assert!(!failover_confirmed(&body("FAIL")));
         assert!(!failover_confirmed(&body("FAILOVER!")));
         assert!(!failover_confirmed(&body("yes")));
+    }
+
+    #[test]
+    fn rebalance_apply_requires_the_exact_confirmation_token() {
+        let body = |c: &str| RebalanceApplyBody {
+            confirm: c.to_owned(),
+        };
+        // The exact token (with tolerated surrounding whitespace) confirms.
+        assert!(rebalance_apply_confirmed(&body("REBALANCE")));
+        assert!(rebalance_apply_confirmed(&body("  REBALANCE  ")));
+        // A near-miss does NOT: wrong case, empty, partial, or an extra char. A stray / replayed
+        // POST without the deliberate token can never start moving slots.
+        assert!(!rebalance_apply_confirmed(&body("rebalance")));
+        assert!(!rebalance_apply_confirmed(&body("")));
+        assert!(!rebalance_apply_confirmed(&body("REBAL")));
+        assert!(!rebalance_apply_confirmed(&body("REBALANCE!")));
+        assert!(!rebalance_apply_confirmed(&body("APPLY")));
     }
 
     #[test]

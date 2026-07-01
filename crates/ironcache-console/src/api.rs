@@ -1277,6 +1277,18 @@ const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/api/cluster/rebalance": {
+      "post": {
+        "summary": "Arm a planned rebalance: CLUSTER REBALANCE APPLY (ADMIN, MUTATING). Proposes committed MIGRATING/IMPORTING per planned move (drives HA-6 auto-copy); does NOT flip ownership. Requires confirm=REBALANCE. #361 over engine #371.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RebalanceApplyBody" } } } },
+        "responses": {
+          "200": { "description": "The rebalance migrations were armed (committed).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } } },
+          "400": { "description": "Missing / wrong confirmation token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Admin tier required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "502": { "description": "The node refused (e.g. cluster support disabled, not the leader) or is unreachable.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/cluster/meet": {
       "post": {
         "summary": "Add a node to the cluster: CLUSTER MEET host port (ADMIN, additive). #361.",
@@ -1649,6 +1661,11 @@ const OPENAPI_JSON: &str = r##"{
       "FailoverBody": {
         "type": "object",
         "properties": { "confirm": { "type": "string", "description": "Must equal \"FAILOVER\"." } },
+        "required": ["confirm"]
+      },
+      "RebalanceApplyBody": {
+        "type": "object",
+        "properties": { "confirm": { "type": "string", "description": "Must equal \"REBALANCE\"." } },
         "required": ["confirm"]
       },
       "MeetBody": {
@@ -2179,6 +2196,7 @@ mod tests {
             "/api/persistence",
             "/api/persistence/save",
             "/api/cluster/rebalance-plan",
+            "/api/cluster/rebalance",
             "/api/cluster/failover",
             "/api/cluster/meet",
             "/api/cluster/forget",
@@ -2191,6 +2209,10 @@ mod tests {
         assert!(
             paths["/api/cluster/failover"].get("post").is_some(),
             "failover POST"
+        );
+        assert!(
+            paths["/api/cluster/rebalance"].get("post").is_some(),
+            "rebalance POST"
         );
         assert!(
             paths["/api/cluster/meet"].get("post").is_some(),
