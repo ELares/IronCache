@@ -151,6 +151,14 @@ release.
 
 ### Added
 
+- `resharding::apply_drained_batch` (issue #371, REBALANCE_APPLY.md): the DESTINATION half of the
+  rebalance key move. It decodes each drained key's `encode_kvobj` bytes and reinserts the full object
+  (type + TTL + value) via `insert_object`, the same replay path replication + the snapshot loader
+  use. IDEMPOTENT (a re-applied key overwrites with identical bytes, so a retried batch after a
+  mid-transfer restart is safe) and fail-safe (undecodable bytes are skipped, never corrupting the
+  store). With `drain_slot_batch` this completes the source-to-destination key-move LOGIC (the
+  transport + controller are later slices): a test drains a slot on one store and applies it to
+  another, asserting every key (including a TTL'd one) arrives BYTE-IDENTICAL.
 - `resharding::drain_slot_batch` (issue #371, REBALANCE_APPLY.md): the source-side slot drain the
   rebalance-APPLY driver ships from. It composes the honest cross-shard `GETKEYSINSLOT` enumeration
   (`keys_in_slot`) + `ShardStore::get_object` + the self-consistent `ironcache_repl::encode_kvobj`
