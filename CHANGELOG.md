@@ -151,6 +151,12 @@ release.
 
 ### Added
 
+- `apply_actions` + `SetSlotAction` (issue #371, REBALANCE_APPLY.md): the pure mapping from an
+  `ApplyStep` decision to the concrete committed `CLUSTER SETSLOT` proposals the rebalance-APPLY driver
+  issues through the raft path. `StartMigration` -> both the source-side `MIGRATING <dest>` and the
+  destination-side `IMPORTING <src>` (which arms HA-6's auto-copy); `Commit` -> the `NODE <dest>`
+  ownership flip; `AwaitCopy`/`Done` -> nothing. Keeping this mapping pure (and the raft I/O in the
+  driver) makes the driver's proposal set unit-testable without a quorum.
 - `apply_step` + `ApplyStep` (issue #371, REBALANCE_APPLY.md): the pure decision core of the
   rebalance-APPLY controller. Given the authoritative committed state (has the owner flipped to the
   destination? is a migration in flight?) and the driver's caught-up verdict, it returns the next

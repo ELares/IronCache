@@ -564,6 +564,46 @@ pub fn apply_step(
     }
 }
 
+/// A single committed `CLUSTER SETSLOT` action the rebalance-APPLY driver proposes through the raft
+/// path (#371, REBALANCE_APPLY.md). The driver translates each into the corresponding
+/// `ConfigCmd::SetSlot*` proposal; keeping the MAPPING pure (here) and the raft I/O in the driver
+/// keeps the decision logic unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetSlotAction {
+    /// `SETSLOT <slot> MIGRATING <dest>` (tag the SOURCE, which still owns the slot).
+    Migrating { slot: u16, dest: String },
+    /// `SETSLOT <slot> IMPORTING <src>` (tag the DESTINATION, which HA-6 then pulls into).
+    Importing { slot: u16, src: String },
+    /// `SETSLOT <slot> NODE <owner>` (the committed, epoch-bumping ownership flip to the destination).
+    Node { slot: u16, owner: String },
+}
+
+/// The committed `SETSLOT` action(s) the driver must propose for `step` of one `mv` (#371): the
+/// concrete realization of an [`ApplyStep`]. `StartMigration` proposes BOTH the source-side
+/// `MIGRATING` and the destination-side `IMPORTING` (which arms HA-6's auto-copy); `Commit` proposes
+/// the `NODE` flip; `AwaitCopy` / `Done` propose nothing (the driver just polls / advances). Pure, so
+/// the driver's proposal set is unit-tested without a raft quorum.
+#[must_use]
+pub fn apply_actions(step: ApplyStep, mv: &SlotMove) -> Vec<SetSlotAction> {
+    match step {
+        ApplyStep::StartMigration => vec![
+            SetSlotAction::Migrating {
+                slot: mv.slot,
+                dest: mv.dst_node_id.clone(),
+            },
+            SetSlotAction::Importing {
+                slot: mv.slot,
+                src: mv.src_node_id.clone(),
+            },
+        ],
+        ApplyStep::Commit => vec![SetSlotAction::Node {
+            slot: mv.slot,
+            owner: mv.dst_node_id.clone(),
+        }],
+        ApplyStep::AwaitCopy | ApplyStep::Done => Vec::new(),
+    }
+}
+
 impl SlotMap {
     /// Build and validate a STATIC slot map from the resolved topology and THIS node's announce
     /// id (the slice-2 boot path, byte-for-byte unchanged in behaviour).
@@ -2126,6 +2166,40 @@ mod tests {
         assert_eq!(apply_step(true, false, false), ApplyStep::Done);
         assert_eq!(apply_step(true, true, false), ApplyStep::Done);
         assert_eq!(apply_step(true, true, true), ApplyStep::Done);
+    }
+
+    #[test]
+    fn apply_actions_maps_each_step_to_the_right_setslot_proposals() {
+        let mv = SlotMove {
+            slot: 42,
+            src_node_id: "src".to_owned(),
+            dst_node_id: "dst".to_owned(),
+        };
+        // StartMigration -> BOTH the source MIGRATING and the destination IMPORTING (arms HA-6).
+        assert_eq!(
+            apply_actions(ApplyStep::StartMigration, &mv),
+            vec![
+                SetSlotAction::Migrating {
+                    slot: 42,
+                    dest: "dst".to_owned()
+                },
+                SetSlotAction::Importing {
+                    slot: 42,
+                    src: "src".to_owned()
+                },
+            ]
+        );
+        // Commit -> the NODE flip to the destination.
+        assert_eq!(
+            apply_actions(ApplyStep::Commit, &mv),
+            vec![SetSlotAction::Node {
+                slot: 42,
+                owner: "dst".to_owned()
+            }]
+        );
+        // AwaitCopy / Done -> nothing to propose (poll / advance).
+        assert!(apply_actions(ApplyStep::AwaitCopy, &mv).is_empty());
+        assert!(apply_actions(ApplyStep::Done, &mv).is_empty());
     }
 
     #[test]
