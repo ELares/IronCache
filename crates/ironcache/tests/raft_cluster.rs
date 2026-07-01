@@ -205,6 +205,21 @@ async fn cmd(client: &mut TcpStream, args: &[&str]) -> String {
     read_reply(client).await
 }
 
+/// The shared CONVERGENCE deadline for every raft-cluster wait loop in this file.
+///
+/// These are multi-node cluster integration tests: each boots 3-4 real nodes (each its own tokio
+/// runtime + TCP + TLS + 250ms-cadence raft timers) and POLLS for a committed state (a leader, a
+/// staged learner, an auto-promotion, a slot migration). Locally each converges in well under a
+/// second. But under `cargo test --workspace --all-features` on a shared/oversubscribed CI runner,
+/// the heavy tests in this binary run in PARALLEL over only a few cores, so the timer-driven raft
+/// tasks get CPU-STARVED and convergence stretches by an order of magnitude (a sub-second op was
+/// observed exceeding 30s, causing an intermittent macos-latest failure of the learner auto-promote
+/// test). This is pure liveness slowness, NOT a correctness bug, so the fix is a GENEROUS shared
+/// deadline: it costs nothing on the passing path (every loop breaks early the instant the state is
+/// reached), and only a genuinely stuck cluster ever waits this long before failing. One constant so
+/// no single test is ever under-provisioned relative to the others.
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Whether `timeout` has elapsed since `start`, measured through the env clock (ADR-0003: even
 /// tests read real time only through the env seam, never `std::time::Instant`). Polling loops
 /// call this as their deadline check and `tokio::time::sleep` between tries.
@@ -233,7 +248,7 @@ fn key_in_range(lo: u16, hi: u16) -> String {
 fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
     // Generous bound: election base+jitter is 150-300ms and proposals must commit across three
     // real TCP-connected nodes, so several seconds is ample even on a loaded CI machine.
-    let timeout = Duration::from_secs(20);
+    let timeout = CONVERGENCE_TIMEOUT;
 
     let ports = [free_port(), free_port(), free_port()];
     clean_raft_logs(ports);
@@ -590,7 +605,7 @@ fn raft_mode_forms_assigns_converges_serves_moved_and_redirects() {
 #[test]
 #[allow(clippy::too_many_lines, clippy::needless_range_loop)]
 fn raft_mode_slot_migration_asks_serves_under_asking_and_flips_to_moved() {
-    let timeout = Duration::from_secs(20);
+    let timeout = CONVERGENCE_TIMEOUT;
 
     let ports = [free_port(), free_port(), free_port()];
     clean_raft_logs(ports);
@@ -894,7 +909,7 @@ fn raft_mode_slot_migration_asks_serves_under_asking_and_flips_to_moved() {
 #[test]
 #[allow(clippy::too_many_lines, clippy::needless_range_loop)]
 fn raft_mode_slot_migration_live_copies_snapshot_and_stream_to_dest() {
-    let timeout = Duration::from_secs(30);
+    let timeout = CONVERGENCE_TIMEOUT;
 
     let ports = [free_port(), free_port(), free_port()];
     clean_raft_logs(ports);
@@ -1153,7 +1168,7 @@ fn raft_mode_slot_migration_live_copies_snapshot_and_stream_to_dest() {
 fn raft_mode_replica_attaches_full_syncs_and_serves_readonly_reads() {
     // Replica attach involves: leader election, several committed proposals, a full-sync transfer,
     // and the replica control task's poll cadence. Generous bound for a loaded CI machine.
-    let timeout = Duration::from_secs(30);
+    let timeout = CONVERGENCE_TIMEOUT;
 
     let ports = [free_port(), free_port(), free_port()];
     clean_raft_logs(ports);
@@ -1318,7 +1333,7 @@ fn raft_mode_replica_attaches_full_syncs_and_serves_readonly_reads() {
 #[allow(clippy::too_many_lines, clippy::needless_range_loop)]
 fn raft_mode_min_replicas_to_write_rejects_until_a_replica_is_in_sync() {
     // Attach involves leader election + several committed proposals + a full-sync; generous bound.
-    let timeout = Duration::from_secs(30);
+    let timeout = CONVERGENCE_TIMEOUT;
 
     let ports = [free_port(), free_port(), free_port()];
     clean_raft_logs(ports);
@@ -1497,7 +1512,7 @@ fn raft_mode_replica_read_staleness_bound_moves_when_link_drops() {
     // because the test harness cannot stop a killed node's DETACHED raft thread, so a self-promotion
     // -- which commits only on the Raft leader -- cannot be made deterministic in loopback. This
     // test drives the part that IS deterministic and load-bearing live: the staleness gate.)
-    let timeout = Duration::from_secs(40);
+    let timeout = CONVERGENCE_TIMEOUT;
 
     let ports = [free_port(), free_port(), free_port()];
     clean_raft_logs(ports);
@@ -1666,7 +1681,7 @@ fn raft_mode_delslotsrange_unassigns_a_range_and_converges() {
     const RANGE_SIZE: u32 = 100;
     const REMAINING: u32 = 16_384 - RANGE_SIZE;
 
-    let timeout = Duration::from_secs(20);
+    let timeout = CONVERGENCE_TIMEOUT;
 
     let ports = [free_port(), free_port(), free_port()];
     clean_raft_logs(ports);
@@ -1898,7 +1913,7 @@ fn raft_mode_meet_stages_a_learner_auto_promotes_then_forget_removes_it() {
     use ironcache::raft_boot::node_id_from_announce;
     use ironcache::test_support::{run_raft_joining_node_with_handle, run_raft_node_with_handle};
 
-    let timeout = Duration::from_secs(30);
+    let timeout = CONVERGENCE_TIMEOUT;
 
     let ports4 = [free_port(), free_port(), free_port(), free_port()];
     let voter_ports = [ports4[0], ports4[1], ports4[2]];
