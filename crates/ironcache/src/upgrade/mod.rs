@@ -32,6 +32,7 @@
 //! via [`std::process::Command`] from THIS short-lived process (not the server), which is NOT a
 //! `fork` syscall and respects the no-fork invariant (invariant 4).
 
+pub mod fetch;
 pub mod health;
 pub mod pause;
 pub mod proc;
