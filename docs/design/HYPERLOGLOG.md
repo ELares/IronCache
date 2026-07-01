@@ -112,10 +112,14 @@ three PF commands, and the round-trip contract. Out of scope: the SIMD kernels
   O(sparse size) bounded by the promotion cap. (b) The cached-cardinality header field is
   ALWAYS left invalid and PFCOUNT always recomputes (avoiding a read-path write that would
   dirty a watched key); observably identical to Redis (same count).
+- DONE (PFDEBUG, #242 part 3): `PFDEBUG GETREG|ENCODING|TODENSE key` (the HLL-internals debug
+  verbs the Redis test suite uses). The key is args[2], routed like OBJECT (the ObjectArg2 key
+  spec); categorized like Redis PFDEBUG (`@write @hyperloglog @admin @slow @dangerous`). GETREG
+  is read-only here (Redis converts sparse->dense as a side effect; the register VALUES returned
+  are identical). PFSELFTEST (a heavy fixed self-test) is intentionally not implemented.
 - DEFERRED (#242): DUMP/RESTORE byte-interop against a pinned redis-server (needs the
-  DUMP/RESTORE command plus the differential oracle #97) and the PFDEBUG / PFSELFTEST
-  introspection verbs. The sparse bytes written here are already valid Redis sparse
-  objects, so DUMP/RESTORE round-trips them without rework.
+  DUMP/RESTORE command plus the differential oracle #97). The sparse bytes written here are
+  already valid Redis sparse objects, so DUMP/RESTORE round-trips them without rework.
 
 ## References
 

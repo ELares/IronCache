@@ -48,12 +48,18 @@
 //! avoids a readonly-write / WATCH hazard (a PFCOUNT that wrote back a freshly-computed
 //! cache would dirty a watched key on a pure read).
 //!
+//! ## PFDEBUG introspection (#242 part 3)
+//!
+//! `PFDEBUG GETREG|ENCODING|TODENSE key` exposes the HLL internals the Redis test suite uses:
+//! all 16384 register values, the encoding name, and a one-way sparse->dense conversion. See
+//! [`cmd_pfdebug`]. `PFSELFTEST` (a heavy fixed self-test) is not implemented.
+//!
 //! ## Deferred (tracked follow-up, #242)
 //!
 //! DUMP/RESTORE byte-interop (needs the DUMP/RESTORE command + the differential oracle #97)
-//! and the PFDEBUG / PFSELFTEST introspection verbs are NOT implemented here. The sparse
-//! bytes this module writes ARE valid Redis sparse objects (golden-vector-pinned), so a
-//! future DUMP/RESTORE round-trips them without rework.
+//! and PFSELFTEST are NOT implemented here. The sparse bytes this module writes ARE valid
+//! Redis sparse objects (golden-vector-pinned), so a future DUMP/RESTORE round-trips them
+//! without rework.
 
 use bytes::Bytes;
 use ironcache_protocol::{ErrorReply, Request, Value};
@@ -574,6 +580,28 @@ fn hll_reghisto(obj: &[u8]) -> [i32; 64] {
     }
 }
 
+/// Decode ALL 16384 registers of a validated HLL (dense or sparse) into a flat array (index
+/// -> value). Used by PFDEBUG GETREG and the encoding-equivalence tests. Dispatches on the
+/// encoding byte: a dense object reads its packed block; a sparse object walks its opcodes.
+fn hll_all_registers(obj: &[u8]) -> Vec<u8> {
+    if is_sparse_encoded(obj) {
+        let mut regs = vec![0u8; HLL_REGISTERS];
+        sparse_walk(obj, |start, run, value| {
+            if value > 0 {
+                for r in &mut regs[start..start + run] {
+                    *r = value;
+                }
+            }
+        });
+        regs
+    } else {
+        let p = reg_block(obj);
+        (0..HLL_REGISTERS)
+            .map(|i| dense_get_register(p, i))
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The estimator: the modern Redis (Ertl 2017) cardinality algorithm.
 // ---------------------------------------------------------------------------
@@ -872,6 +900,136 @@ pub fn cmd_pfmerge<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         action: RmwAction::Replace(NewValueOwned::Bytes(Bytes::from(merged))),
         expire: ExpireWrite::Unchanged,
         reply: Value::ok(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// PFDEBUG: the HLL introspection verbs the Redis test suite uses (#242 part 3).
+//
+// PFDEBUG <sub> <key>: GETREG (all 16384 register values), ENCODING ("sparse"/"dense"),
+// TODENSE (convert a sparse HLL to dense in place, one-way). The key is args[2], routed to
+// its owner shard by `KeySpecKind::ObjectArg2` (the SAME key position OBJECT ENCODING uses).
+// Classified is_write because TODENSE mutates; GETREG/ENCODING are implemented read-only.
+// ---------------------------------------------------------------------------
+
+/// `PFDEBUG <subcommand> <key>` (Redis `pfdebugCommand`). Dispatches to the introspection
+/// verbs the HLL test suite relies on. The key is `args[2]`. An unknown subcommand is the
+/// standard `unknown subcommand` error; a missing key or non-HLL value is the matching Redis
+/// error, per subcommand.
+pub fn cmd_pfdebug<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() < 3 {
+        return Value::error(ErrorReply::wrong_arity("pfdebug"));
+    }
+    let sub = crate::cmd_util::ascii_upper(&req.args[1]);
+    match sub.as_slice() {
+        b"GETREG" => pfdebug_getreg(store, db, now, req),
+        b"ENCODING" => pfdebug_encoding(store, db, now, req),
+        b"TODENSE" => pfdebug_todense(store, db, now, req),
+        _ => Value::error(ErrorReply::unknown_subcommand(
+            "PFDEBUG",
+            &String::from_utf8_lossy(&req.args[1]),
+        )),
+    }
+}
+
+/// The shared PFDEBUG lookup: read `key` (args[2]) and validate it is a real HLL. Returns the
+/// object bytes, or the matching error reply (`The specified key does not exist` for a missing
+/// key -- Redis wording; WRONGTYPE for a non-string; `hll_invalid_value` for a bad HLL string).
+fn pfdebug_read_hll<S: Store>(
+    store: &mut S,
+    db: u32,
+    now: UnixMillis,
+    key: &[u8],
+) -> Result<Vec<u8>, Value> {
+    match store.read(db, key, now) {
+        Some(v) if v.data_type() == DataType::String => {
+            if is_valid_hll(v.as_bytes()) {
+                Ok(v.as_bytes().to_vec())
+            } else {
+                Err(Value::error(ErrorReply::hll_invalid_value()))
+            }
+        }
+        Some(_) => Err(Value::error(ErrorReply::wrong_type())),
+        None => Err(Value::error(ErrorReply::err(
+            "The specified key does not exist",
+        ))),
+    }
+}
+
+/// `PFDEBUG GETREG key` -> a RESP array of the 16384 register values (as integers), decoded
+/// from either encoding. READ-ONLY here (Redis converts a sparse object to dense as a side
+/// effect; the register VALUES returned are identical, so this is behaviorally equivalent on
+/// the observable reply while avoiding a read-path write -- the same reasoning as leaving the
+/// cached cardinality invalid).
+fn pfdebug_getreg<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("pfdebug"));
+    }
+    match pfdebug_read_hll(store, db, now, &req.args[2]) {
+        Ok(obj) => {
+            let regs = hll_all_registers(&obj);
+            Value::Array(Some(
+                regs.into_iter()
+                    .map(|v| Value::Integer(i64::from(v)))
+                    .collect(),
+            ))
+        }
+        Err(e) => e,
+    }
+}
+
+/// `PFDEBUG ENCODING key` -> the internal encoding name as a simple string (`sparse` or
+/// `dense`), matching Redis `addReplyStatus`.
+fn pfdebug_encoding<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("pfdebug"));
+    }
+    match pfdebug_read_hll(store, db, now, &req.args[2]) {
+        Ok(obj) => {
+            if is_sparse_encoded(&obj) {
+                Value::simple("sparse")
+            } else {
+                Value::simple("dense")
+            }
+        }
+        Err(e) => e,
+    }
+}
+
+/// `PFDEBUG TODENSE key` -> convert a SPARSE HLL to dense in place (one-way), reply `+OK`. A
+/// dense HLL is left untouched (no write, so a watched key stays clean). A missing key or
+/// non-HLL is the matching error. The conversion preserves every logical register.
+fn pfdebug_todense<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
+    if req.args.len() != 3 {
+        return Value::error(ErrorReply::wrong_arity("pfdebug"));
+    }
+    store.rmw(db, &req.args[2], now, |entry| match entry {
+        RmwEntry::Vacant => keep_err(ErrorReply::err("The specified key does not exist")),
+        RmwEntry::Occupied(o) if o.data_type() != DataType::String => {
+            keep_err(ErrorReply::wrong_type())
+        }
+        RmwEntry::Occupied(o) => {
+            let bytes = o.as_bytes();
+            if !is_valid_hll(bytes) {
+                return keep_err(ErrorReply::hll_invalid_value());
+            }
+            if !is_sparse_encoded(bytes) {
+                // Already dense: no write (Keep), so a watched key is not dirtied. Reply OK.
+                return RmwStep {
+                    action: RmwAction::Keep,
+                    expire: ExpireWrite::Unchanged,
+                    reply: Value::ok(),
+                };
+            }
+            // Sparse -> dense: decode the logical registers and pack them into a dense object.
+            let dense = dense_from_nonzero(&sparse_decode_nonzero(bytes));
+            RmwStep {
+                action: RmwAction::Replace(NewValueOwned::Bytes(Bytes::from(dense))),
+                expire: ExpireWrite::Unchanged,
+                reply: Value::ok(),
+            }
+        }
+        RmwEntry::OccupiedMut(_) => unreachable!("cmd_pfdebug todense uses rmw, not rmw_mut"),
     })
 }
 
@@ -1555,25 +1713,11 @@ mod tests {
 
     // ---- Sparse encoding: golden vector, round trip, equivalence, promotion. ----
 
-    /// Decode all 16384 registers of any HLL object (sparse or dense) into a flat array, so
-    /// two encodings can be compared register-for-register.
+    /// Decode all 16384 registers of any HLL (sparse or dense) into a flat array, so two
+    /// encodings can be compared register-for-register. Delegates to the module fn that
+    /// PFDEBUG GETREG also uses.
     fn all_registers(obj: &[u8]) -> Vec<u8> {
-        if is_sparse_encoded(obj) {
-            let mut regs = vec![0u8; HLL_REGISTERS];
-            sparse_walk(obj, |start, run, value| {
-                if value > 0 {
-                    for r in &mut regs[start..start + run] {
-                        *r = value;
-                    }
-                }
-            });
-            regs
-        } else {
-            let p = reg_block(obj);
-            (0..HLL_REGISTERS)
-                .map(|i| dense_get_register(p, i))
-                .collect()
-        }
+        hll_all_registers(obj)
     }
 
     /// The reference register array a set of elements MUST produce (per-register max pattern
@@ -1846,6 +1990,215 @@ mod tests {
         assert!(
             (285..=315).contains(&mcount),
             "merged union estimated {mcount}"
+        );
+    }
+
+    // ---- PFDEBUG GETREG / ENCODING / TODENSE (#242 part 3). ----
+
+    /// Extract a RESP integer array reply into a `Vec<i64>` (for PFDEBUG GETREG).
+    fn arr_ints(v: &Value) -> Vec<i64> {
+        match v {
+            Value::Array(Some(items)) => items.iter().map(int).collect(),
+            other => panic!("expected an integer array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pfdebug_encoding_reports_sparse_then_dense_after_promotion() {
+        let mut s = test_store();
+        cmd_pfadd(&mut s, 0, NOW, &req(&[b"PFADD", b"h", b"a"]));
+        assert_eq!(
+            cmd_pfdebug(&mut s, 0, NOW, &req(&[b"PFDEBUG", b"ENCODING", b"h"])),
+            Value::simple("sparse"),
+            "a low-cardinality HLL reports sparse"
+        );
+        // Force promotion to dense by adding many distinct elements.
+        for i in 0..3000 {
+            let e = format!("p{i}").into_bytes();
+            cmd_pfadd(&mut s, 0, NOW, &req(&[b"PFADD", b"h", &e]));
+            if get_bytes(&mut s, b"h").unwrap().len() == HLL_DENSE_SIZE {
+                break;
+            }
+        }
+        assert_eq!(get_bytes(&mut s, b"h").unwrap().len(), HLL_DENSE_SIZE);
+        assert_eq!(
+            cmd_pfdebug(&mut s, 0, NOW, &req(&[b"PFDEBUG", b"ENCODING", b"h"])),
+            Value::simple("dense"),
+            "after promotion it reports dense"
+        );
+    }
+
+    #[test]
+    fn pfdebug_getreg_matches_the_logical_registers() {
+        let mut s = test_store();
+        let elems: Vec<Vec<u8>> = (0..50).map(|i| format!("e{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = elems.iter().map(Vec::as_slice).collect();
+        let mut parts: Vec<&[u8]> = vec![b"PFADD", b"h"];
+        parts.extend_from_slice(&refs);
+        cmd_pfadd(&mut s, 0, NOW, &req(&parts));
+        let got_regs = arr_ints(&cmd_pfdebug(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"PFDEBUG", b"GETREG", b"h"]),
+        ));
+        assert_eq!(
+            got_regs.len(),
+            HLL_REGISTERS,
+            "GETREG returns all 16384 registers"
+        );
+        let want = reference_registers(&refs);
+        for (i, (&got, &exp)) in got_regs.iter().zip(want.iter()).enumerate() {
+            assert_eq!(got, i64::from(exp), "register {i}");
+        }
+    }
+
+    #[test]
+    fn pfdebug_todense_converts_sparse_preserving_registers() {
+        let mut s = test_store();
+        let elems: Vec<Vec<u8>> = (0..40).map(|i| format!("t{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = elems.iter().map(Vec::as_slice).collect();
+        let mut parts: Vec<&[u8]> = vec![b"PFADD", b"h"];
+        parts.extend_from_slice(&refs);
+        cmd_pfadd(&mut s, 0, NOW, &req(&parts));
+        assert!(is_sparse_encoded(&get_bytes(&mut s, b"h").unwrap()));
+        let before = all_registers(&get_bytes(&mut s, b"h").unwrap());
+        assert_eq!(
+            cmd_pfdebug(&mut s, 0, NOW, &req(&[b"PFDEBUG", b"TODENSE", b"h"])),
+            Value::ok()
+        );
+        let obj = get_bytes(&mut s, b"h").unwrap();
+        assert_eq!(obj.len(), HLL_DENSE_SIZE, "TODENSE yields a dense object");
+        assert!(!is_sparse_encoded(&obj));
+        assert_eq!(
+            all_registers(&obj),
+            before,
+            "TODENSE preserves every register"
+        );
+        // Idempotent: TODENSE on an already-dense HLL is +OK and leaves the bytes untouched.
+        assert_eq!(
+            cmd_pfdebug(&mut s, 0, NOW, &req(&[b"PFDEBUG", b"TODENSE", b"h"])),
+            Value::ok()
+        );
+        assert_eq!(
+            get_bytes(&mut s, b"h").unwrap(),
+            obj,
+            "an already-dense TODENSE is a no-op"
+        );
+    }
+
+    #[test]
+    fn pfdebug_todense_on_dense_does_not_dirty_a_watched_key() {
+        use ironcache_storage::Watch;
+        let mut s = test_store();
+        let dense = dense_from_nonzero(&[(1, 1), (2, 2)]);
+        store_string(&mut s, b"h", &dense);
+        let snap = s.watch_snapshot(0, b"h", NOW);
+        assert!(!s.watch_is_dirty(&snap, NOW), "fresh snapshot is clean");
+        assert_eq!(
+            cmd_pfdebug(&mut s, 0, NOW, &req(&[b"PFDEBUG", b"TODENSE", b"h"])),
+            Value::ok()
+        );
+        assert!(
+            !s.watch_is_dirty(&snap, NOW),
+            "a no-op TODENSE on a dense HLL must not dirty a watched key"
+        );
+    }
+
+    #[test]
+    fn pfdebug_todense_preserves_ttl() {
+        use ironcache_storage::{ExpireWrite, NewValue};
+        let mut s = test_store();
+        // Seed a SPARSE HLL carrying an absolute deadline.
+        let sparse = sparse_encode(&[(1, 1), (5, 2), (9, 3)]);
+        assert!(is_sparse_encoded(&sparse));
+        let deadline = UnixMillis(NOW.0 + 100_000);
+        s.upsert(
+            0,
+            b"h",
+            NewValue::Bytes(&sparse),
+            ExpireWrite::Set(deadline),
+            NOW,
+        );
+        // TODENSE converts to dense but must KEEP the deadline (it edits the value in place).
+        assert_eq!(
+            cmd_pfdebug(&mut s, 0, NOW, &req(&[b"PFDEBUG", b"TODENSE", b"h"])),
+            Value::ok()
+        );
+        let v = s.read(0, b"h", NOW).unwrap();
+        assert_eq!(v.as_bytes().len(), HLL_DENSE_SIZE, "converted to dense");
+        assert_eq!(
+            v.expire_at(),
+            Some(deadline),
+            "TODENSE must preserve the TTL"
+        );
+    }
+
+    #[test]
+    fn pfdebug_errors_are_exact() {
+        let mut s = test_store();
+        // Missing key -> the Redis "does not exist" wording.
+        assert_eq!(
+            err_line(&cmd_pfdebug(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"PFDEBUG", b"ENCODING", b"nope"])
+            )),
+            "-ERR The specified key does not exist"
+        );
+        assert_eq!(
+            err_line(&cmd_pfdebug(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"PFDEBUG", b"TODENSE", b"nope"])
+            )),
+            "-ERR The specified key does not exist"
+        );
+        // Unknown subcommand.
+        cmd_pfadd(&mut s, 0, NOW, &req(&[b"PFADD", b"h", b"a"]));
+        let unk = err_line(&cmd_pfdebug(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"PFDEBUG", b"BOGUS", b"h"]),
+        ));
+        assert!(
+            unk.contains("unknown subcommand") && unk.contains("PFDEBUG HELP"),
+            "unexpected unknown-subcommand line: {unk}"
+        );
+        // Wrong arity (missing key).
+        assert_eq!(
+            err_line(&cmd_pfdebug(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"PFDEBUG", b"ENCODING"])
+            )),
+            "-ERR wrong number of arguments for 'pfdebug' command"
+        );
+        // Wrong type (a LIST, not an HLL string).
+        let _ = crate::cmd_list::cmd_lpush(&mut s, 0, NOW, &req(&[b"LPUSH", b"lst", b"x"]));
+        assert_eq!(
+            err_line(&cmd_pfdebug(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"PFDEBUG", b"GETREG", b"lst"])
+            )),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+        // A plain (non-HLL) string is the invalid-HLL error.
+        store_string(&mut s, b"str", b"not an hll");
+        assert_eq!(
+            err_line(&cmd_pfdebug(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"PFDEBUG", b"GETREG", b"str"])
+            )),
+            "-WRONGTYPE Key is not a valid HyperLogLog string value."
         );
     }
 
