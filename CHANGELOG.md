@@ -151,6 +151,16 @@ release.
 
 ### Added
 
+- `ironcache upgrade` HTTPS auto-fetch (issue #394): `ironcache upgrade --from-url <tarball-url>
+  --sums-url <sums-url>` downloads a release tarball + its `SHA256SUMS` over HTTPS, verifies the
+  tarball against the manifest, extracts the `ironcache` binary, and installs it through the SAME
+  verified / SAVE-first / write-freeze / health-gated / auto-rollback flow as the local `--binary`
+  path (which stays the default; exactly one source is required). The fetch reuses the SYSTEM `curl`
+  (TLS against the OS trust store, redirect-following, https-only, byte + time bounds) and `tar` as
+  BOUNDED subprocesses through the same `run_bounded` seam the version probe uses, so it adds NO new
+  Rust dependency (the static + musl + cargo-deny posture, ADR-0017). The authenticity-relevant check
+  is the tarball's sha256 against the published `SHA256SUMS`; that trust is forwarded to the standard
+  binary-level verify. (The minisign signature over `SHA256SUMS` will gate the fetch once #386 lands.)
 - HyperLogLog PFDEBUG introspection (issue #242, part 3): `PFDEBUG GETREG|ENCODING|TODENSE key`,
   the HLL-internals debug verbs the Redis test suite uses. GETREG returns all 16384 register
   values as an integer array (decoded from either encoding); ENCODING returns `sparse` or

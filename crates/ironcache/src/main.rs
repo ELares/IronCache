@@ -421,9 +421,14 @@ fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
     let auth = upgrade::read_auth_file(args.auth_file.as_deref())
         .context("reading the --auth-file password")?;
 
+    // Resolve the binary source: a LOCAL `--binary` + `--sha256sums`, or a REMOTE `--from-url` +
+    // `--sums-url` fetch (#394). `_fetched` owns the downloaded temp dir; it is held for the whole
+    // run so the extracted binary + derived manifest stay on disk until the swap completes.
+    let (binary, sha256sums, _fetched) = resolve_upgrade_source(args)?;
+
     let resolved = upgrade::UpgradeArgs {
-        binary: args.binary.clone(),
-        sha256sums: args.sha256sums.clone(),
+        binary,
+        sha256sums,
         target: args.target.clone(),
         unit: args.unit.clone(),
         readyz_addr: args.readyz_addr.clone(),
@@ -464,10 +469,135 @@ fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Resolve the upgrade's binary source into a `(binary, sha256sums)` pair plus the optional fetch
+/// guard. Exactly one source must be given: the LOCAL `--binary` + `--sha256sums`, or the REMOTE
+/// `--from-url` + `--sums-url` fetch (#394). The remote path downloads + verifies the tarball, extracts
+/// the binary, and returns the [`fetch::Fetched`] guard (its temp dir must outlive the run).
+fn resolve_upgrade_source(
+    args: &cli::UpgradeArgs,
+) -> anyhow::Result<(
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Option<ironcache::upgrade::fetch::Fetched>,
+)> {
+    use ironcache::upgrade::fetch;
+    match (args.from_url.as_deref(), args.binary.as_ref()) {
+        (Some(url), None) => {
+            let sums_url = args.sums_url.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--from-url requires --sums-url (the SHA256SUMS URL that vouches for the tarball)"
+                )
+            })?;
+            if args.sha256sums.is_some() {
+                anyhow::bail!(
+                    "--sha256sums is for the local --binary source; use --sums-url with --from-url"
+                );
+            }
+            println!("upgrade: fetching {url}");
+            let fetched = fetch::fetch_release(url, sums_url, fetch::FetchBounds::default())
+                .context("fetching the release over HTTPS")?;
+            println!(
+                "upgrade: fetched + verified the tarball; installing the extracted binary {}",
+                fetched.binary.display()
+            );
+            Ok((
+                fetched.binary.clone(),
+                fetched.sha256sums.clone(),
+                Some(fetched),
+            ))
+        }
+        (None, Some(binary)) => {
+            let sums = args
+                .sha256sums
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--binary requires --sha256sums"))?;
+            Ok((binary.clone(), sums, None))
+        }
+        (Some(_), Some(_)) => anyhow::bail!(
+            "--from-url and --binary are mutually exclusive; choose ONE source (remote fetch or local file)"
+        ),
+        (None, None) => anyhow::bail!(
+            "a binary source is required: either `--binary <path> --sha256sums <path>` (local) or \
+             `--from-url <url> --sums-url <url>` (remote fetch, #394)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tracing::level_filters::LevelFilter;
+
+    /// Parse an `ironcache upgrade ...` argv into its [`cli::UpgradeArgs`] (via the real clap surface).
+    fn parse_upgrade(argv: &[&str]) -> cli::UpgradeArgs {
+        use clap::Parser as _;
+        let full: Vec<&str> = std::iter::once("ironcache")
+            .chain(std::iter::once("upgrade"))
+            .chain(argv.iter().copied())
+            .collect();
+        match cli::Cli::try_parse_from(full)
+            .expect("upgrade args parse")
+            .command
+        {
+            Some(cli::Command::Upgrade(a)) => a,
+            other => panic!("expected the upgrade subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_source_local_returns_the_paths() {
+        let args = parse_upgrade(&["--binary", "/tmp/ic", "--sha256sums", "/tmp/SUMS"]);
+        let (bin, sums, fetched) = resolve_upgrade_source(&args).expect("local mode resolves");
+        assert_eq!(bin, std::path::PathBuf::from("/tmp/ic"));
+        assert_eq!(sums, std::path::PathBuf::from("/tmp/SUMS"));
+        assert!(fetched.is_none(), "local mode does not fetch");
+    }
+
+    #[test]
+    fn resolve_source_binary_without_sums_errors() {
+        let args = parse_upgrade(&["--binary", "/tmp/ic"]);
+        let err = resolve_upgrade_source(&args).expect_err("--binary needs --sha256sums");
+        assert!(
+            err.to_string().contains("--binary requires --sha256sums"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_source_from_url_without_sums_url_errors() {
+        let args = parse_upgrade(&["--from-url", "https://x/a.tar.gz"]);
+        let err = resolve_upgrade_source(&args).expect_err("--from-url needs --sums-url");
+        assert!(
+            err.to_string().contains("--from-url requires --sums-url"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_source_both_modes_is_rejected() {
+        let args = parse_upgrade(&[
+            "--binary",
+            "/tmp/ic",
+            "--sha256sums",
+            "/tmp/SUMS",
+            "--from-url",
+            "https://x/a.tar.gz",
+            "--sums-url",
+            "https://x/SHA256SUMS",
+        ]);
+        let err = resolve_upgrade_source(&args).expect_err("cannot mix local + remote");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn resolve_source_no_source_is_rejected() {
+        let args = parse_upgrade(&[]);
+        let err = resolve_upgrade_source(&args).expect_err("a source is required");
+        assert!(
+            err.to_string().contains("a binary source is required"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn parse_log_level_maps_the_vocabulary() {

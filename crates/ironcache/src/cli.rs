@@ -71,6 +71,10 @@ pub struct Cli {
 }
 
 /// The six modes (ADR-0020).
+// The `Upgrade` variant carries the (intentionally flat, many-flag) `UpgradeArgs`, so it is far larger
+// than the unit variants. This enum is parsed ONCE at process start, not stored in bulk, so the size
+// difference is immaterial and boxing it would only obscure the clap `Subcommand` derive.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run the cache server (the daemon). This is the default mode.
@@ -113,15 +117,29 @@ pub enum Command {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, clap::Args)]
 pub struct UpgradeArgs {
-    /// Path to the NEW ironcache binary to install (the local source for v1). Its sha256 must match
-    /// its entry in `--sha256sums`, and it must run + report a version.
+    /// Path to the NEW ironcache binary to install (the LOCAL source). Its sha256 must match its
+    /// entry in `--sha256sums`, and it must run + report a version. Mutually exclusive with the
+    /// remote `--from-url` fetch (#394); exactly one source must be given.
     #[arg(long, value_name = "PATH")]
-    pub binary: PathBuf,
+    pub binary: Option<PathBuf>,
 
     /// Path to the release `SHA256SUMS` to verify `--binary` against (its sha256 must equal the
-    /// entry whose file name matches `--binary`'s basename).
+    /// entry whose file name matches `--binary`'s basename). Required with `--binary`.
     #[arg(long, value_name = "PATH")]
-    pub sha256sums: PathBuf,
+    pub sha256sums: Option<PathBuf>,
+
+    /// REMOTE source (#394): fetch the release TARBALL from this HTTPS URL instead of a local
+    /// `--binary`. The tarball is downloaded (bounded), verified against the `--sums-url`
+    /// `SHA256SUMS`, and its `ironcache` binary extracted, then installed through the SAME verified /
+    /// SAVE-first / health-gated / auto-rollback flow as the local path. Requires `--sums-url`;
+    /// mutually exclusive with `--binary`.
+    #[arg(long, value_name = "URL")]
+    pub from_url: Option<String>,
+
+    /// The HTTPS URL of the release `SHA256SUMS` that vouches for the `--from-url` tarball. Required
+    /// when `--from-url` is given.
+    #[arg(long, value_name = "URL")]
+    pub sums_url: Option<String>,
 
     /// The live binary path to swap onto (the `.new`/`.old` slots live alongside it on the SAME
     /// filesystem). Defaults to the systemd unit's `ExecStart` path.

@@ -56,12 +56,15 @@ pub trait BinarySource {
 /// The v1 source: a local file the operator already placed on disk (`--binary <path>`). No network,
 /// no new dependency.
 ///
-/// TODO(#387 follow-up): `HttpsUrl { url, .. }` downloads the artifact (and its `SHA256SUMS` +, with
-/// #386, its signature) over HTTPS to a temp path, then returns a [`ResolvedBinary`] pointing at it.
-/// `GithubLatest { repo, .. }` resolves the latest release's asset for the host's target triple. Both
-/// implement [`BinarySource`] and need a fetcher (e.g. a rustls-based minimal client reusing the
-/// already-pinned `tokio-rustls`/`ring` stack, NOT reqwest/hyper, to keep the static/cargo-deny
-/// posture). The orchestrator is unchanged: it calls `resolve()` and proceeds to verify the bytes.
+/// The HTTPS AUTO-FETCH (#394) is implemented in [`super::fetch`], NOT as a `BinarySource` impl: the
+/// release ships TARBALLS with a `SHA256SUMS` over those tarballs, so the fetch must download BOTH,
+/// verify the tarball, and EXTRACT the binary -- a shape [`ResolvedBinary`] (a single pre-verified
+/// binary path) does not carry. So the CLI (`resolve_upgrade_source` in main.rs) materializes the
+/// extracted binary + a derived per-binary manifest locally, then runs the SAME [`LocalFile`] +
+/// [`super::verify::Sha256Verifier`] flow, leaving the orchestrator untouched. This seam stays for a
+/// future in-process fetcher (should the static/cargo-deny posture ever admit a public-root HTTPS
+/// client); [`super::fetch`] instead reuses the SYSTEM `curl`/`tar` as bounded subprocesses (no new
+/// dependency). With the minisign anchor (#386) the signature over `SHA256SUMS` gates the fetch too.
 pub struct LocalFile {
     path: PathBuf,
 }
