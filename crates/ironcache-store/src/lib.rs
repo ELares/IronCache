@@ -2409,25 +2409,6 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         self.put_object(db, db_idx, &key, entry);
     }
 
-    /// The live [`KvObj`] under `(db, key)`, or `None` if the key is absent or lazily expired. The
-    /// READ counterpart to [`insert_object`](Self::insert_object): the resharding drain (#371,
-    /// REBALANCE_APPLY.md) reads a key's FULL object (type + TTL + value) so it can encode + ship it
-    /// to the destination node, exactly as the snapshot walk reconstructs each key
-    /// ([`snapshot_chunk`](Self::snapshot_chunk)). Returns an OWNED clone (a transfer value, like the
-    /// snapshot's `to_kvobj`); this is the COLD resharding/export path, NOT the hot `GET` path, which
-    /// returns bytes without cloning the object. A lazily-expired key is skipped (a logically-dead key
-    /// is never shipped), matching the snapshot + `GET` liveness rule.
-    #[must_use]
-    pub fn get_object(&self, db: u32, key: &[u8], now: UnixMillis) -> Option<KvObj> {
-        let db_idx = self.db_index(db);
-        let h = self.hasher.hash_one(key);
-        let obj = self.dbs[db_idx].find(h, |e| e.key() == key)?;
-        if obj.is_expired(now) {
-            return None;
-        }
-        Some(obj.to_kvobj())
-    }
-
     /// Remove EVERY live key (across all databases) for which `pred(key)` is true, returning the
     /// count removed. A LOCAL-CLEANUP primitive (HA-6 M2): when an aborted / un-won slot import
     /// ends, the importer purges the partially-merged slot's keys (`pred = |k| key_slot(k) ==
@@ -3316,48 +3297,6 @@ mod policy_swap_tests {
             *removes.borrow(),
             1,
             "an ordinary delete still fires the observer"
-        );
-    }
-}
-
-#[cfg(test)]
-mod get_object_tests {
-    //! `get_object` (the resharding-drain read primitive, #371): presence / absence / lazy-expiry /
-    //! db-isolation. Value fidelity is inherited from `to_kvobj`, exercised by the snapshot tests.
-    use super::{KvObj, ShardStore};
-    use ironcache_storage::UnixMillis;
-
-    #[test]
-    fn get_object_returns_a_present_key_and_none_for_absent_or_wrong_db() {
-        let mut store = ShardStore::new(4);
-        store.insert_object(0, KvObj::from_bytes(b"k", b"v", None));
-        let now = UnixMillis(1_000);
-
-        let got = store.get_object(0, b"k", now).expect("present key");
-        assert_eq!(&*got.key, b"k", "the returned object is the requested key");
-
-        assert!(store.get_object(0, b"missing", now).is_none(), "absent key");
-        // The same key in a DIFFERENT db is absent (db isolation).
-        assert!(store.get_object(1, b"k", now).is_none(), "wrong db");
-    }
-
-    #[test]
-    fn get_object_skips_a_lazily_expired_key() {
-        let mut store = ShardStore::new(1);
-        // A key whose deadline is in the past: get_object must skip it (a dead key is never shipped).
-        store.insert_object(0, KvObj::from_bytes(b"dead", b"v", Some(UnixMillis(10))));
-        assert!(
-            store.get_object(0, b"dead", UnixMillis(1_000)).is_none(),
-            "an expired key is not returned"
-        );
-        // Before its deadline the same key IS returned.
-        store.insert_object(
-            0,
-            KvObj::from_bytes(b"alive", b"v", Some(UnixMillis(5_000))),
-        );
-        assert!(
-            store.get_object(0, b"alive", UnixMillis(1_000)).is_some(),
-            "a live key is returned"
         );
     }
 }

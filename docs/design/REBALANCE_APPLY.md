@@ -7,8 +7,31 @@ Issue: #371 (the last piece: `CLUSTER REBALANCE APPLY`). Decisions: ADR-0002 (sh
 CLUSTER_CONTRACT.md (the slot map + the migration state machine), CONTROL_PLANE.md
 (the raft-governed config apply path), SLOT_KEY_ENUMERATION.md (the read side, landed:
 `COUNTKEYSINSLOT` / `GETKEYSINSLOT`), `crates/ironcache-cluster/src/lib.rs`
-(`rebalance_plan`, `set_migrating`, `migration_state`), `crates/ironcache-raft-net`
-(the `RAFTMSG` cluster bus).
+(`rebalance_plan`, `set_migrating`, `migration_state`), `crates/ironcache/src/replica_attach.rs`
+(the HA-6 slot-import data-copy: `run_import_control`, `import_once`).
+
+## CORRECTION (supersedes the "cross-node key transfer" section below)
+
+This doc's first draft assumed the cross-node slot data-copy was UNBUILT and proposed a
+new push-based transport (an internal encoding + a bus verb + a source drain loop). That
+was WRONG: IronCache ALREADY has a complete, architecturally-correct PULL-based
+slot-migration data-copy in **HA-6** (`replica_attach.rs::run_import_control`, spawned per
+shard at boot). When a committed `SetSlotImporting` names this node, it auto-detects
+(`any_importing_slot`), resolves the source's repl endpoint (`migration_peer_endpoint`),
+dials it (peer-authenticated: TLS + shared secret), and pulls a SCOPED copy of the slot's
+keys (`drive_full_sync_chunked` with `slot_filter = Some(slot)`) PLUS a scoped TAIL of
+ongoing writes to that slot. The scoped tail is exactly what makes "write consistency
+during the drain" (flagged below as the controller's open question) a NON-issue: HA-6
+reuses the battle-tested replication transport, which already streams the tail.
+
+So the transport is DONE. The remaining #371 APPLY work is ONLY the CONTROLLER + the
+`CLUSTER REBALANCE APPLY` wiring: given `rebalance_moves` (landed, #470), for each move
+propose committed `SETSLOT MIGRATING` (source) + `SETSLOT IMPORTING` (dest), let HA-6
+auto-copy the slot's data + tail, wait until the destination is caught up
+(`COUNTKEYSINSLOT` parity / the import's in-sync signal), then propose the committed
+`SETSLOT NODE` flip. No new encoding, no new transport, no source drain loop. The
+"serialization-format decision", "the transport", and the manual drain-loop in the
+sections below are SUPERSEDED by this correction and kept only for the record.
 
 ## Where #371 stands
 
