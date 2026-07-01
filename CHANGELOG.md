@@ -151,6 +151,16 @@ release.
 
 ### Added
 
+- Design doc `docs/design/REBALANCE_APPLY.md` (issue #371, design-first): how to build the
+  slot-moving `CLUSTER REBALANCE APPLY` driver that #444 deferred, now that the read side
+  (`COUNTKEYSINSLOT` / `GETKEYSINSLOT`) is honest. Scopes the pure move planner (per-node deltas to
+  concrete `{slot, src, dst}` moves), and the load-bearing decision: use an INTERNAL self-consistent
+  transfer encoding for resharding (round-trip-testable on macOS, reusing the persistence `KvObj`
+  encoders) rather than blocking on the ORACLE-GATED Redis-compatible `DUMP` / `RESTORE` (#129 / #242).
+  Details the per-slot controller (committed `SETSLOT MIGRATING`/`IMPORTING` -> drain via
+  `GETKEYSINSLOT` + bus ship + idempotent restore -> `SETSLOT NODE`), its safety (no data loss: the
+  key lands on the destination before the source deletes it; no split ownership: the epoch fence), and
+  a macOS-testable staged plan (a two-node loopback cluster, no external oracle).
 - `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` are now HONEST in cluster mode (issue #371, slice 2 of
   SLOT_KEY_ENUMERATION.md): they were documented placeholders returning `0` / empty because a slot's
   keys span every internal shard (the client CRC16 slot and the FNV `owner_shard` are independent
