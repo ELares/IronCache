@@ -209,6 +209,13 @@ pub use bootstrap::{ShardConfig, ShardId, ShardSet, available_shards};
 // on every host (the dangerous parsing bugs are validated here, not on a live systemd box).
 pub mod listen_fds;
 
+// The per-shard fixed-buffer group pool bookkeeping (#284 io_uring datapath). A PURE
+// free/outstanding ledger over buffer ids + the slab-offset arithmetic + the read back-pressure
+// rule; it owns no memory and makes no syscall (the io_uring_register_buffers of the slab is the
+// thin Linux layer built on this). Cfg-free + no `unsafe`, so the aliasing / double-free / off-by-one
+// bookkeeping is validated on every host (cargo test + a HashSet oracle; miri-trivial).
+pub mod buffer_pool;
+
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
