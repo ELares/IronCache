@@ -291,6 +291,23 @@ pub fn run(args: &UpgradeArgs) -> Result<UpgradeOutcome, UpgradeError> {
     }
 }
 
+/// [`run`] with the INTEGRITY-ONLY verifier regardless of the pinned key -- for the FETCHED sources
+/// (`--from-url` / `--to`, #394), whose AUTHENTICITY was already verified AT FETCH TIME when a key is
+/// pinned ([`fetch::fetch_release`] downloads the real `SHA256SUMS.minisig` and verifies it
+/// fail-closed before extracting). The fetched flow hands the orchestrator a DERIVED per-binary
+/// manifest with no signature of its own, so the downstream check is the sha256 chain from that
+/// already-authenticated manifest; selecting [`MinisignVerifier`] here would wrongly demand a
+/// `.minisig` for the derived file. The LOCAL `--binary` flow (where the operator supplies the real
+/// `SHA256SUMS` + `.minisig` on disk) goes through [`run`], which enforces the signature when a key
+/// is pinned.
+///
+/// # Errors
+///
+/// Exactly [`run`]'s errors.
+pub fn run_integrity_only(args: &UpgradeArgs) -> Result<UpgradeOutcome, UpgradeError> {
+    run_with_verifier(args, Sha256Verifier)
+}
+
 /// Build the production dependency set with the chosen `verifier` and drive the orchestrator. The
 /// verifier is the only production dependency that varies (by the pinned minisign anchor, #386); the
 /// rest are the fixed loopback/systemd implementations.

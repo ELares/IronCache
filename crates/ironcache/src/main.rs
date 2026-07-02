@@ -422,9 +422,9 @@ fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
         .context("reading the --auth-file password")?;
 
     // Resolve the binary source: a LOCAL `--binary` + `--sha256sums`, or a REMOTE `--from-url` +
-    // `--sums-url` fetch (#394). `_fetched` owns the downloaded temp dir; it is held for the whole
+    // `--sums-url` fetch (#394). `fetched` owns the downloaded temp dir; it is held for the whole
     // run so the extracted binary + derived manifest stay on disk until the swap completes.
-    let (binary, sha256sums, _fetched) = resolve_upgrade_source(args)?;
+    let (binary, sha256sums, fetched) = resolve_upgrade_source(args)?;
 
     let resolved = upgrade::UpgradeArgs {
         binary,
@@ -441,7 +441,17 @@ fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
         no_freeze: args.no_freeze,
     };
 
-    match upgrade::run(&resolved) {
+    // FETCHED sources (--from-url / --to) hand the orchestrator a DERIVED per-binary manifest whose
+    // AUTHENTICITY was already verified at fetch time when a key is pinned (fetch_release downloads
+    // + verifies the real SHA256SUMS.minisig fail-closed), so they run integrity-only downstream.
+    // The LOCAL --binary flow runs the full pinned-key selection (minisign over the operator's real
+    // SHA256SUMS + .minisig when a key is committed).
+    let outcome = if fetched.is_some() {
+        upgrade::run_integrity_only(&resolved)
+    } else {
+        upgrade::run(&resolved)
+    };
+    match outcome {
         Ok(outcome) => {
             tracing::info!(
                 version = %outcome.installed_version,

@@ -190,20 +190,33 @@ pub fn verify(
 // ---------------------------------------------------------------------------
 
 /// Decode a standard-alphabet (RFC 4648) base64 string (with optional `=` padding, no line breaks).
-/// Returns `None` on any non-alphabet byte, so a malformed key/signature is rejected, not truncated.
+/// STRICT: any non-alphabet byte, any non-`=` byte after padding begins, or a dangling 6-bit tail
+/// (a length that cannot come from a canonical encoder) is `None` -- a malformed key/signature is
+/// rejected outright, never truncated or partially decoded.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
     let mut acc: u32 = 0;
     let mut nbits: u32 = 0;
+    let mut padding = false;
     for &b in bytes {
+        if padding {
+            // Once padding begins, ONLY further '=' is legal (no trailing garbage).
+            if b != b'=' {
+                return None;
+            }
+            continue;
+        }
         let v = match b {
             b'A'..=b'Z' => b - b'A',
             b'a'..=b'z' => b - b'a' + 26,
             b'0'..=b'9' => b - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
-            b'=' => break, // padding begins; the remainder is padding
+            b'=' => {
+                padding = true;
+                continue;
+            }
             _ => return None,
         };
         acc = (acc << 6) | u32::from(v);
@@ -212,6 +225,11 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
             nbits -= 8;
             out.push((acc >> nbits) as u8);
         }
+    }
+    // A canonical encoding leaves 0, 2, or 4 leftover bits; a lone trailing symbol leaves 6, which
+    // no encoder produces -- reject it as malformed.
+    if nbits >= 6 {
+        return None;
     }
     Some(out)
 }
@@ -364,12 +382,27 @@ mod tests {
             "786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419\
              d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce"
         );
-        // A > 128-byte input to exercise multi-block processing (144 bytes of 'a').
-        let long = vec![b'a'; 144];
+        // MULTI-BLOCK known answers (cross-checked against python hashlib.blake2b, itself
+        // RFC-7693-conformant). A real SHA256SUMS exceeds 128 bytes, so multi-block IS the
+        // production path; these pin the exact boundary cases.
+        // Exactly 128 bytes: the single full block is also the FINAL block (no non-final compress).
         assert_eq!(
-            hex(&blake2b512(&long)).len(),
-            128,
-            "512-bit digest is 64 bytes"
+            hex(&blake2b512(&[b'a'; 128])),
+            "fc6c71f688f43ea7d60817478808f3cac753e61571865c95adbc2d9122c943a7\
+             6b92c2cb1047ef3fe7bf6e436ec1d0a99a9e5b216780bf7fed9d7ca91d3a8f3b"
+        );
+        // 200 bytes: one full non-final block + a 72-byte final block.
+        assert_eq!(
+            hex(&blake2b512(&[b'a'; 200])),
+            "932355851d75f09c18646a9da87c25e055bc57f113121ad1ec63d45e7a1d62ab\
+             9133f8b7d1d7de9e0afa784eb6a8a11d78683013d0a672611f17668d9577d209"
+        );
+        // 256 bytes: one full non-final block + a FULL 128-byte final block (the len % 128 == 0
+        // boundary where a naive len/128 split would mis-count the final block).
+        assert_eq!(
+            hex(&blake2b512(&[b'a'; 256])),
+            "0eee13d0c73a2710c5015a8b4be0a16120bb88f826b662951ffe4b3b81441cfd\
+             ce1f712c58e237dba72a0dad7f9c86b9745ea0b4b3b850ff3a260fb7df9d3e81"
         );
     }
 
@@ -382,6 +415,27 @@ mod tests {
         assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
         // A non-alphabet byte is rejected (not silently truncated).
         assert!(base64_decode("Zm9v!bad").is_none());
+        // STRICTNESS: trailing garbage after padding begins is rejected (previously it silently
+        // decoded the prefix -- a review finding).
+        assert!(
+            base64_decode("Zg==Zg").is_none(),
+            "bytes after '=' are rejected"
+        );
+        assert!(
+            base64_decode("Zg=x").is_none(),
+            "non-'=' inside padding is rejected"
+        );
+        // A dangling single symbol (6 leftover bits) cannot come from any encoder.
+        assert!(
+            base64_decode("A").is_none(),
+            "a lone 6-bit tail is malformed"
+        );
+        // Canonical padded/unpadded forms still decode.
+        assert_eq!(
+            base64_decode("Zg").unwrap(),
+            b"f",
+            "unpadded canonical form ok"
+        );
     }
 
     // ---- End-to-end against a REAL rsign2 0.6.6 signature (ground truth). ----
@@ -403,6 +457,122 @@ mod tests {
         // The key id in the pubkey must equal the one in the signature (191C0F7CAF297644, LE).
         assert_eq!(pk.key_id, [0x44, 0x76, 0x29, 0xaf, 0x7c, 0x0f, 0x1c, 0x19]);
         verify(REAL_SUMS, REAL_MINISIG, &pk).expect("a genuine minisign signature verifies");
+    }
+
+    /// A real rsign2 signature over a MULTI-BLOCK (450-byte: 3 full Blake2b blocks + a 66-byte tail)
+    /// 4-entry `SHA256SUMS`, the exact shape the release publishes. This exercises the multi-block
+    /// Blake2b prehash end to end against genuine minisign output (the single-block vector above
+    /// cannot catch a block-boundary bug).
+    const MULTIBLOCK_SUMS: &[u8] =
+        b"c53b9efacbcd54477c708719357c9d3c67d36b938d636ddc47a9833a75ce6746  ironcache-2026.0701.1-linux-amd64-musl.tar.gz\n\
+          dddafb46c1104fa56b57ce92b3589fb2d39d985fa51d5a7b703afe6cc059d6d8  ironcache-2026.0701.1-linux-arm64-musl.tar.gz\n\
+          4602353f275c4ec9ac38c0c8716cdf52c04939a6771e71221cb4990277707f5b  ironcache-2026.0701.1-linux-amd64-glibc.tar.gz\n\
+          eee27b5e6f485d161eca3a17a7721b6d14d6e813e8b97c91d98edf7e7ca850e0  ironcache-2026.0701.1-linux-arm64-glibc.tar.gz\n";
+    const MULTIBLOCK_MINISIG: &str = "untrusted comment: signature from rsign secret key\n\
+        RUREdimvfA8cGSqM2b1cUI3p4EuBQRo+8FzY8oboT4fE7YhW0+5XzjTtiZZp6No8+kyCuQvPf5oTxzI6os5gMaHVLs+6lQNiEwc=\n\
+        trusted comment: multi-block release\n\
+        Gcb8oweh0XWV9sRsPIiZ0wtPY7Lr+uTgSr6kG+VkY/wpuZpEVAkpV8G2wHuOyR6e4jrNN+SkyKMDnuwt+4cGAw==\n";
+
+    #[test]
+    fn verifies_a_real_multiblock_signature() {
+        let pk = MinisignPublicKey::parse(REAL_PUBKEY).unwrap();
+        verify(MULTIBLOCK_SUMS, MULTIBLOCK_MINISIG, &pk)
+            .expect("a genuine multi-block (450-byte) minisign signature verifies");
+        // And a flipped bit in block 2 (past the first 128-byte block) is caught.
+        let mut tampered = MULTIBLOCK_SUMS.to_vec();
+        tampered[200] ^= 0x01;
+        assert_eq!(
+            verify(&tampered, MULTIBLOCK_MINISIG, &pk),
+            Err(MinisignError::BadSignature),
+            "a tamper in a later block must be rejected"
+        );
+    }
+
+    /// The LEGACY `Ed` (non-prehashed) path: no modern tool emits it (rsign2 always prehashes), so
+    /// build a cryptographically REAL legacy signature in-test with ring's Ed25519 signer -- sign the
+    /// RAW message (legacy semantics) + the global signature, assemble the 4-line minisig, and verify.
+    /// This gives the `Ed` branch genuine coverage instead of none. The keypair derives from a FIXED
+    /// seed (no OS entropy: invariant 2, determinism -- and a reproducible test is stronger anyway),
+    /// wrapped in the RFC 8410 PKCS#8 v1 constant prefix ring accepts via `from_pkcs8_maybe_unchecked`.
+    #[test]
+    fn verifies_a_legacy_ed_signature_built_with_ring() {
+        use ring::signature::{Ed25519KeyPair, KeyPair as _};
+
+        // PKCS#8 v1 for Ed25519 (RFC 8410): the 16-byte DER prefix || the 32-byte seed.
+        const PKCS8_V1_PREFIX: [u8; 16] = [
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        let seed = [7u8; 32]; // fixed, so the test is fully deterministic
+        let mut pkcs8 = Vec::with_capacity(48);
+        pkcs8.extend_from_slice(&PKCS8_V1_PREFIX);
+        pkcs8.extend_from_slice(&seed);
+        let kp = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8).expect("fixed-seed keypair");
+        let key_id = [9u8, 8, 7, 6, 5, 4, 3, 2];
+        let message = b"legacy-signed sums content\n";
+        let trusted = "legacy trusted comment";
+
+        // Legacy `Ed`: the signature is over the RAW message (no Blake2b prehash).
+        let file_sig = kp.sign(message);
+        let mut sig_blob = Vec::with_capacity(74);
+        sig_blob.extend_from_slice(b"Ed");
+        sig_blob.extend_from_slice(&key_id);
+        sig_blob.extend_from_slice(file_sig.as_ref());
+        // Global signature over signature[64] || trusted_comment.
+        let mut global_msg = Vec::new();
+        global_msg.extend_from_slice(file_sig.as_ref());
+        global_msg.extend_from_slice(trusted.as_bytes());
+        let global_sig = kp.sign(&global_msg);
+
+        let minisig = format!(
+            "untrusted comment: legacy test\n{}\ntrusted comment: {trusted}\n{}\n",
+            base64_encode(&sig_blob),
+            base64_encode(global_sig.as_ref()),
+        );
+        // Assemble the matching pubkey blob: "Ed" || key_id || public_key[32].
+        let mut pk_blob = Vec::with_capacity(42);
+        pk_blob.extend_from_slice(b"Ed");
+        pk_blob.extend_from_slice(&key_id);
+        pk_blob.extend_from_slice(kp.public_key().as_ref());
+        let pk = MinisignPublicKey::parse(&base64_encode(&pk_blob)).expect("assembled key parses");
+
+        verify(message, &minisig, &pk).expect("a real legacy Ed signature verifies");
+        // Legacy semantics confirmed strictly: the SAME signature must FAIL if treated as content
+        // tampering (flip a message bit).
+        let mut tampered = message.to_vec();
+        tampered[0] ^= 1;
+        assert_eq!(
+            verify(&tampered, &minisig, &pk),
+            Err(MinisignError::BadSignature)
+        );
+    }
+
+    /// Test-only base64 ENCODER (RFC 4648, padded) for assembling the synthetic legacy vector.
+    fn base64_encode(data: &[u8]) -> String {
+        const ALPHA: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(ALPHA[(n >> 18) as usize & 63] as char);
+            out.push(ALPHA[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHA[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHA[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
     }
 
     // ---- Tamper tests: every mutation must be REJECTED (fail-closed). ----
