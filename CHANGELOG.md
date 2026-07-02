@@ -164,6 +164,17 @@ release.
 
 ### Added
 
+- io_uring fixed-buffer group pool bookkeeping (issue #284 substrate): `ironcache-runtime`'s new
+  `buffer_pool` module is the pure per-shard free/outstanding ledger the registered-buffer fast path
+  is built on (IOURING_DATAPATH.md). `BufferPool` hands out and reclaims buffer ids over one fixed
+  slab and computes each buffer's slab offset, enforcing the invariants the ring depends on: an
+  outstanding buffer is never re-issued (no aliasing of a live kernel read), a non-outstanding buffer
+  cannot be released (no double-free), exhaustion yields `None` (never a reused live buffer), and the
+  id->offset arithmetic is exact. It also carries the read back-pressure rule (`can_rearm`): with the
+  fixed slab drained the shard defers re-arming recv rather than allocating, so a burst cannot blow
+  the memory bound. It owns no memory and makes no syscall and has no `unsafe`, so the dangerous
+  bookkeeping is validated on any host (cargo test + a HashSet oracle); the `io_uring_register_buffers`
+  of the slab is the thin Linux layer built on it.
 - Rolling-upgrade promotion gate (issue #392 guardrail): `ironcache-repl`'s new `safe_to_promote`
   composes the two safety guardrails the clustered rolling upgrade names into one pure verdict
   (`PromotionSafety`): QUORUM (the config-plane raft must have a majority to COMMIT the
