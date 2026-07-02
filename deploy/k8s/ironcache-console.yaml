@@ -28,7 +28,7 @@ metadata:
   name: ironcache-console-secret
   namespace: ironcache
   labels:
-    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/name: ironcache-console
     app.kubernetes.io/component: console
 type: Opaque
 stringData:
@@ -45,18 +45,18 @@ metadata:
   name: ironcache-console
   namespace: ironcache
   labels:
-    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/name: ironcache-console
     app.kubernetes.io/component: console
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app.kubernetes.io/name: ironcache
+      app.kubernetes.io/name: ironcache-console
       app.kubernetes.io/component: console
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: ironcache
+        app.kubernetes.io/name: ironcache-console
         app.kubernetes.io/component: console
     spec:
       terminationGracePeriodSeconds: 30
@@ -73,7 +73,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app.kubernetes.io/name: ironcache
+                    app.kubernetes.io/name: ironcache-console
                     app.kubernetes.io/component: console
                 topologyKey: kubernetes.io/hostname
       containers:
@@ -158,12 +158,12 @@ metadata:
   name: ironcache-console
   namespace: ironcache
   labels:
-    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/name: ironcache-console
     app.kubernetes.io/component: console
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/name: ironcache-console
     app.kubernetes.io/component: console
   ports:
     - name: http
@@ -176,11 +176,11 @@ metadata:
   name: ironcache-console
   namespace: ironcache
   labels:
-    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/name: ironcache-console
     app.kubernetes.io/component: console
 spec:
   maxUnavailable: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: ironcache
+      app.kubernetes.io/name: ironcache-console
       app.kubernetes.io/component: console

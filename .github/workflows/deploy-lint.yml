@@ -64,10 +64,18 @@ jobs:
           # schema; -strict rejects unknown fields in the core resources.
           for extra in "" "--set console.enabled=true --set console.replicas=2"; do
             echo "::group::helm template ${extra:-(defaults)}"
-            helm template ic deploy/helm/ironcache $extra \
+            rendered="$(helm template ic deploy/helm/ironcache $extra)"
+            printf '%s\n' "$rendered" \
               | kubeconform -strict -summary -verbose \
                   -ignore-missing-schemas \
                   -kubernetes-version "${KUBE_VERSION}"
+            if [ -n "$extra" ]; then
+              # Guard against a broken `console.enabled` gate silently rendering
+              # nothing (kubeconform is happy with zero console objects, so assert
+              # the console Deployment/Service actually appeared).
+              printf '%s\n' "$rendered" | grep -q "ic-ironcache-console" \
+                || { echo "ERROR: console.enabled=true rendered no console resources"; exit 1; }
+            fi
             echo "::endgroup::"
           done
 
