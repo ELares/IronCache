@@ -18,6 +18,21 @@
 //! rather than on a live cluster. The actual binary swap, the raft `PromoteReplica` commit, and the
 //! redirect are the clustered/Linux layer the driver performs; this module decides WHAT to do next
 //! and in what ORDER (replicas first, primary last), never HOW.
+//!
+//! ## Scope + generalizations (what this models, and what it deliberately does not)
+//!
+//! - MULTI-REPLICA ordering: the #392 body describes the minimal case ("upgrade AN in-sync replica,
+//!   then promote IT"). This generalizes it to "upgrade ALL replicas first, then promote ANY upgraded
+//!   in-sync one", which yields exactly ONE failover / one client redirect for the whole cluster (the
+//!   ElastiCache pattern) instead of one per replica. That multi-replica ordering is this module's
+//!   choice; the body is silent on it.
+//! - FORWARD PATH ONLY: this models the happy-path sequence. It has NO state for a FAILED node
+//!   upgrade, a ROLLBACK, or a mid-sequence ABORT (the single-node upgrade's auto-rollback,
+//!   UPGRADE.md, is a per-node health-probe concern the driver owns). A replica that never returns to
+//!   sync yields `AwaitInSync` indefinitely -- which FAILS CLOSED (it never promotes an unsafe
+//!   candidate or forces ahead), so the driver owns the timeout / abort / rollback policy ON TOP of
+//!   this sequencing. Adding an `Abort`/`Rollback` step is a clean future extension; it is left out
+//!   here so the safe forward sequence can be pinned + tested first.
 
 use crate::lag::PromotionSafety;
 
@@ -192,6 +207,33 @@ mod tests {
                         !matches!(step, UpgradeStep::Promote | UpgradeStep::UpgradeOldPrimary),
                         "must not touch the primary while replicas remain: {step:?}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn promote_never_fires_once_the_primary_is_demoted() {
+        // The OTHER half of the "primary last" guarantee: once the promotion has committed
+        // (primary_demoted), NO input combination can emit a SECOND `Promote` -- Phase 3 owns it, so
+        // a stale/lying replica count or Safe verdict cannot re-trigger a failover. (A committed
+        // demotion is only reachable after Phase 2 from a truthful driver; this pins the defensive
+        // behavior regardless.)
+        for &replicas in &[0usize, 1, 5] {
+            for &catching in &[false, true] {
+                for promo in [SAFE, NO_QUORUM, NOT_IN_SYNC] {
+                    for &old_up in &[false, true] {
+                        let step = upgrade_step(replicas, catching, promo, true, old_up);
+                        assert!(
+                            !matches!(step, UpgradeStep::Promote),
+                            "no second promotion once demoted: {step:?}"
+                        );
+                        // Phase 3 emits only the old-primary work or Done.
+                        assert!(
+                            matches!(step, UpgradeStep::UpgradeOldPrimary | UpgradeStep::Done),
+                            "phase 3 is old-primary-then-done: {step:?}"
+                        );
+                    }
                 }
             }
         }
