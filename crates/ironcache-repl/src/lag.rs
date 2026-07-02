@@ -695,6 +695,28 @@ mod tests {
             lag: ReplicaLag::compute(ReplOffset(10), ReplOffset(8)), // lag 2 == 2
         };
         assert_eq!(safe_to_promote(at_bound, 2, true), PromotionSafety::Safe);
+
+        // ...and JUST over the bound (lag == max_lag + 1) is refused.
+        let just_over = CandidateReplica {
+            link: LinkStatus::Up,
+            lag: ReplicaLag::compute(ReplOffset(10), ReplOffset(7)), // lag 3 > 2
+        };
+        assert_eq!(
+            safe_to_promote(just_over, 2, true),
+            PromotionSafety::CandidateNotInSync
+        );
+
+        // The adversarial inconsistent-field combo: an UP link but an UNKNOWN lag (the two
+        // CandidateReplica fields are independent) must NOT slip through -- the known-lag gate
+        // rejects it regardless of max_lag.
+        let up_but_unknown = CandidateReplica {
+            link: LinkStatus::Up,
+            lag: ReplicaLag::unknown(),
+        };
+        assert_eq!(
+            safe_to_promote(up_but_unknown, u64::MAX, true),
+            PromotionSafety::CandidateNotInSync
+        );
     }
 
     #[test]
