@@ -106,6 +106,13 @@ impl std::error::Error for ListenFdsError {}
 /// `Ok(empty)` when `LISTEN_FDS` is absent (the normal, not-socket-activated path) and when the
 /// count is zero.
 ///
+/// CALLER CONTRACT: an `Err` means "do NOT adopt an inherited fd" -- the caller must FALL BACK to
+/// binding the socket itself, NOT abort startup. Real `sd_listen_fds(3)` silently returns 0 (no
+/// error) for a missing or foreign `LISTEN_PID`, because a stray `LISTEN_PID` leaked into a normally
+/// launched process is benign; this function surfaces that as a typed `Err` instead so the reason is
+/// visible in a log, but the correct reaction is identical: self-bind and continue. Treating these
+/// errors as fatal would turn a harmless environment quirk into a spurious crash.
+///
 /// # Errors
 ///
 /// Returns a [`ListenFdsError`] for a missing/foreign `LISTEN_PID`, a malformed count, or a
@@ -338,5 +345,29 @@ mod tests {
             parse_listen_fds(Some("4242"), Some("1"), Some("resp:repl"), PID),
             Err(ListenFdsError::NameCountMismatch { fds: 1, names: 2 })
         );
+    }
+
+    #[test]
+    fn empty_name_entry_is_a_named_but_empty_fd() {
+        // systemd's split is NON-coalescing, so "resp::metrics" is THREE names (the middle one
+        // empty), one per fd -- not two. This pins that fidelity behavior.
+        let got = ok("4242", "3", Some("resp::metrics"));
+        assert_eq!(
+            got.iter().map(|f| f.name.as_deref()).collect::<Vec<_>>(),
+            vec![Some("resp"), Some(""), Some("metrics")]
+        );
+    }
+
+    #[test]
+    fn select_named_returns_the_first_match_on_duplicates() {
+        let got = ok("4242", "2", Some("dup:dup"));
+        // Documented "first match wins": fd 3, not fd 4.
+        assert_eq!(select_named(&got, "dup").map(|f| f.fd), Some(3));
+    }
+
+    #[test]
+    fn leading_zero_count_parses_as_decimal() {
+        // "007" is all-digits and parses as 7 (matching systemd's decimal read), yielding 7 fds.
+        assert_eq!(ok("4242", "007", None).len(), 7);
     }
 }
