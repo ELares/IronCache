@@ -130,7 +130,7 @@ jobs:
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
             | tar -xz actionlint
           sudo install -m 0755 actionlint /usr/local/bin/actionlint
-      - name: actionlint (all workflows; shellcheck the run: blocks)
+      - name: "actionlint (all workflows; shellcheck run blocks)"
         run: |
           set -euo pipefail
           # actionlint auto-discovers .github/workflows/*.yml, validates the action
