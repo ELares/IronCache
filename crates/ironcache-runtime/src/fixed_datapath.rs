@@ -18,6 +18,7 @@
 
 use std::io;
 
+use tokio_uring::buf::IoBufMut;
 use tokio_uring::buf::fixed::{FixedBuf, FixedBufPool};
 use tokio_uring::net::TcpStream;
 
@@ -86,9 +87,40 @@ pub async fn recv_fixed(
     Some(stream.read_fixed(buf).await)
 }
 
+/// Write `data` to `stream` from a checked-out REGISTERED buffer via `write_fixed_all`: the reply is
+/// staged into the pre-registered slab and written without a per-write pin. The contract mirrors
+/// `recv_fixed`'s fall-back shape -- `None` means "the fixed send does not apply, use the owned-buffer
+/// send" -- so the caller has one clean branch:
+/// - `None` if `data` does not fit ONE buffer (`> ring.buf_size()`, a rare large bulk reply) OR the
+///   group is drained (no buffer to stage into); either way the caller falls back to the owned send.
+/// - `Some(Ok(()))` on a fully-written fixed send; `Some(Err(e))` on a write error.
+pub async fn send_fixed(
+    stream: &TcpStream,
+    ring: &FixedRing,
+    data: &[u8],
+) -> Option<io::Result<()>> {
+    // A reply larger than one fixed buffer uses the owned send (signalled by None), not a multi-
+    // buffer fixed write -- keeps this primitive single-buffer and the size decision in the caller.
+    if data.len() > ring.buf_size() {
+        return None;
+    }
+    let mut buf = ring.checkout()?; // None = drained -> owned-send fall-back
+    // SAFETY: `data.len() <= ring.buf_size()` (guarded above) == the checked-out buffer's capacity
+    // (`FixedBufPool` grouped it by that capacity), so `stable_mut_ptr()` is valid for `data.len()`
+    // writes. `data` and `buf` are distinct allocations (non-overlapping). We write exactly
+    // `data.len()` bytes then mark exactly that many initialized, so the subsequent `write_fixed_all`
+    // reads only the bytes we just wrote (no uninitialized read).
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.stable_mut_ptr(), data.len());
+        buf.set_init(data.len());
+    }
+    let (res, _buf) = stream.write_fixed_all(buf).await;
+    Some(res)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FixedRing, recv_fixed};
+    use super::{FixedRing, recv_fixed, send_fixed};
     use crate::io_uring_rt::IoUringRuntime;
     use crate::{Runtime, tokio_rt};
     use tokio_uring::net::TcpListener;
@@ -126,6 +158,53 @@ mod tests {
                 runtime
                     .send(&mut { stream }, b"+PONG\r\n".to_vec())
                     .await
+                    .unwrap();
+            });
+
+            let client = IoUringRuntime::new();
+            let mut peer = client.connect(addr).await.unwrap();
+            let _ = client.send(&mut peer, b"PING\r\n".to_vec()).await.unwrap();
+            let res = client
+                .recv(&mut peer, Vec::with_capacity(16))
+                .await
+                .unwrap();
+            assert_eq!(&res.buf[..res.n], b"+PONG\r\n");
+            server.await.unwrap();
+        });
+    }
+
+    /// The full FIXED round-trip: the server reads the request via `recv_fixed` AND writes the reply
+    /// via `send_fixed` (both over the registered slab). Also asserts the fall-back contract: a reply
+    /// larger than one buffer yields `None` (caller uses the owned send).
+    #[test]
+    fn fixed_ring_recv_and_send_round_trip_over_the_registered_slab() {
+        tokio_uring::start(async {
+            let std_listener =
+                tokio_rt::bind_reuseport_std("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = std_listener.local_addr().unwrap();
+            let listener = TcpListener::from_std(std_listener);
+
+            let server = tokio_uring::spawn(async move {
+                let runtime = IoUringRuntime::new();
+                let (stream, _peer) = runtime.accept(&listener).await.unwrap();
+                let ring = FixedRing::register(8, 4096).unwrap();
+
+                let (res, buf) = recv_fixed(&stream, &ring).await.expect("buffer available");
+                let n = res.unwrap();
+                assert_eq!(&buf[..n], b"PING\r\n");
+                drop(buf);
+
+                // A reply that does NOT fit one buffer -> None (caller falls back to owned send).
+                let too_big = vec![b'x'; ring.buf_size() + 1];
+                assert!(
+                    send_fixed(&stream, &ring, &too_big).await.is_none(),
+                    "oversized reply must signal owned-send fall-back"
+                );
+
+                // The fitting reply is written from the registered slab.
+                send_fixed(&stream, &ring, b"+PONG\r\n")
+                    .await
+                    .expect("fits + not drained")
                     .unwrap();
             });
 

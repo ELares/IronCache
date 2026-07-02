@@ -164,6 +164,12 @@ release.
 
 ### Added
 
+- io_uring fixed-buffer SEND (issue #284): `ironcache-runtime::fixed_datapath` gains `send_fixed`,
+  the reply side over registered buffers, completing the fixed recv/send pair. It stages the reply
+  into a checked-out registered buffer and writes it via `write_fixed_all` (no per-write pin). Its
+  fall-back contract mirrors `recv_fixed`: it returns `None` (use the owned-buffer send) when the
+  reply does not fit one buffer (a rare large bulk value) OR the slab is drained, so the caller has
+  one clean branch. Functionally validated on a real ring by a full fixed recv+send round-trip.
 - io_uring OneShotFixed datapath substrate (issue #284, IOURING_DATAPATH.md "Registered fixed-buffer
   slab"): `ironcache-runtime`'s new `fixed_datapath` module adds `FixedRing` (a per-shard slab of
   buffers registered once with the ring via tokio-uring's `FixedBufPool`) + `recv_fixed`, which reads
