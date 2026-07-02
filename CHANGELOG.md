@@ -164,6 +164,16 @@ release.
 
 ### Added
 
+- systemd socket-activation protocol parser (issue #389 Phase 2a): `ironcache-runtime`'s new
+  `listen_fds` module parses the `sd_listen_fds` environment (`LISTEN_PID` / `LISTEN_FDS` /
+  `LISTEN_FDNAMES`) into a typed list of inherited listening fds, or a typed rejection. This is the
+  pure gate that decides whether to ADOPT an inherited listen socket vs self-bind, where the dangerous
+  bugs live: adopting fds meant for a DIFFERENT pid, an off-by-one on the `SD_LISTEN_FDS_START` (= 3)
+  numbering, or a name->fd mis-map that would bind the RESP listener to the replication socket. It is
+  fail-closed (a foreign/malformed environment never yields a live fd) and, by taking `self_pid` as a
+  parameter rather than calling `getpid()`, is deterministic and fully unit-tested against the
+  documented systemd protocol on any host. The raw-fd adoption itself (`TcpListener::from_raw_fd`) is
+  a thin Linux-only layer downstream, a tracked follow-up.
 - Console image publishing (issue #363): the release + image pipelines now also build and publish the
   console. On a `v*` tag, `image.yml` builds + pushes `ghcr.io/elares/ironcache-console` (multi-arch,
   provenance + SBOM) in a SEPARATE `publish-console` job so a console-image problem can never affect
