@@ -18,8 +18,8 @@
 
 use std::io;
 
-use tokio_uring::buf::IoBufMut;
 use tokio_uring::buf::fixed::{FixedBuf, FixedBufPool};
+use tokio_uring::buf::{BoundedBuf, IoBufMut};
 use tokio_uring::net::TcpStream;
 
 /// A per-shard REGISTERED fixed-buffer group for the OneShotFixed datapath: `count` buffers of
@@ -105,16 +105,20 @@ pub async fn send_fixed(
         return None;
     }
     let mut buf = ring.checkout()?; // None = drained -> owned-send fall-back
-    // SAFETY: `data.len() <= ring.buf_size()` (guarded above) == the checked-out buffer's capacity
-    // (`FixedBufPool` grouped it by that capacity), so `stable_mut_ptr()` is valid for `data.len()`
-    // writes. `data` and `buf` are distinct allocations (non-overlapping). We write exactly
-    // `data.len()` bytes then mark exactly that many initialized, so the subsequent `write_fixed_all`
-    // reads only the bytes we just wrote (no uninitialized read).
+    // SAFETY: `data.len() <= ring.buf_size() <= capacity` (the `>` guard above + `Vec::with_capacity`
+    // never under-allocates), so `stable_mut_ptr()` is valid for `data.len()` writes. `data` and
+    // `buf` are distinct allocations (non-overlapping). We write exactly `data.len()` bytes then grow
+    // the init length to cover them, so the `0..data.len()` slice below has an INITIALIZED range.
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), buf.stable_mut_ptr(), data.len());
         buf.set_init(data.len());
     }
-    let (res, _buf) = stream.write_fixed_all(buf).await;
+    // Write EXACTLY `data.len()` bytes by SLICING to `0..data.len()`: the SQE length is the slice
+    // length, NOT the buffer's `bytes_init()`. tokio-uring's `set_init` is GROW-ONLY and the pool
+    // RETAINS `init_len` across buffer reuse, so a reused buffer can carry a LARGER init_len from a
+    // prior (longer) recv/reply; writing `bytes_init()` would then append those stale, possibly
+    // cross-connection, trailing bytes after the reply. The slice pins the write to the fresh reply.
+    let (res, _buf) = stream.write_fixed_all(buf.slice(0..data.len())).await;
     Some(res)
 }
 
@@ -216,6 +220,56 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(&res.buf[..res.n], b"+PONG\r\n");
+            server.await.unwrap();
+        });
+    }
+
+    /// Regression: a SHORT reply after a LONGER recv on the SAME reused buffer must write only the
+    /// reply, never the stale trailing bytes of the prior read. tokio-uring's `set_init` is grow-only
+    /// and the pool retains `init_len` across reuse, so `write_fixed_all(buf)` would send
+    /// `bytes_init()` (= the prior 20) bytes; `send_fixed` slices to `data.len()` to prevent that
+    /// leak. A pool of ONE buffer forces `send_fixed` to reuse the exact buffer `recv_fixed` filled.
+    #[test]
+    fn fixed_send_of_a_short_reply_after_a_longer_recv_leaks_no_stale_bytes() {
+        tokio_uring::start(async {
+            let std_listener =
+                tokio_rt::bind_reuseport_std("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = std_listener.local_addr().unwrap();
+            let listener = TcpListener::from_std(std_listener);
+
+            let server = tokio_uring::spawn(async move {
+                let runtime = IoUringRuntime::new();
+                let (stream, _peer) = runtime.accept(&listener).await.unwrap();
+                // ONE buffer: send_fixed necessarily reuses the buffer recv_fixed just filled, whose
+                // retained init_len is 20 -- the exact grow-only trap.
+                let ring = FixedRing::register(1, 4096).unwrap();
+                let (res, buf) = recv_fixed(&stream, &ring).await.expect("buffer available");
+                let n = res.unwrap();
+                assert_eq!(
+                    n, 20,
+                    "the long request set the reused buffer's init_len to 20"
+                );
+                drop(buf);
+                // A 5-byte reply through that same buffer: must be exactly 5 bytes on the wire.
+                send_fixed(&stream, &ring, b"+OK\r\n")
+                    .await
+                    .expect("fits + not drained")
+                    .unwrap();
+            });
+
+            let client = IoUringRuntime::new();
+            let mut peer = client.connect(addr).await.unwrap();
+            let _ = client.send(&mut peer, vec![b'q'; 20]).await.unwrap();
+            let res = client
+                .recv(&mut peer, Vec::with_capacity(64))
+                .await
+                .unwrap();
+            // With the bug this would be 20 bytes ("+OK\r\n" + 15 stale 'q's); the slice makes it 5.
+            assert_eq!(
+                &res.buf[..res.n],
+                b"+OK\r\n",
+                "reply must be exactly the 5 fresh bytes, no stale trailing bytes leaked"
+            );
             server.await.unwrap();
         });
     }
