@@ -164,6 +164,15 @@ release.
 
 ### Added
 
+- io_uring OneShotFixed datapath substrate (issue #284, IOURING_DATAPATH.md "Registered fixed-buffer
+  slab"): `ironcache-runtime`'s new `fixed_datapath` module adds `FixedRing` (a per-shard slab of
+  buffers registered once with the ring via tokio-uring's `FixedBufPool`) + `recv_fixed`, which reads
+  into a checked-out REGISTERED buffer via `read_fixed` so the bytes land directly in the pre-
+  registered slab (no per-request pin/malloc) and the parser reads them in place. `checkout` returns
+  `None` when the fixed slab is drained -- the read back-pressure signal (never grow past the fixed
+  budget). This is the mid tier `select_datapath` picks when the kernel lacks multishot; the raw
+  multishot/provided-buffer-ring tier is a following slice. Linux + `io_uring`-feature gated,
+  functionally validated on a real ring (register + check-out + `read_fixed` round-trip).
 - io_uring startup capability probe + datapath selection (issue #284, IOURING_DATAPATH.md "chosen
   by startup probe"): `ironcache-runtime`'s new `uring_probe` module lets one Linux artifact run
   across kernel versions. `probe_uring_caps` creates a ring and, via `register_probe`, detects which

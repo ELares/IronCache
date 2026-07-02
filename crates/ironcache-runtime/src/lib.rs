@@ -223,6 +223,13 @@ pub mod buffer_pool;
 // select through, so one Linux artifact runs multishot on 6.x and falls back on older kernels.
 pub mod uring_probe;
 
+// The OneShotFixed io_uring datapath substrate (#284): recv over a per-shard REGISTERED fixed-buffer
+// slab (tokio-uring FixedBufPool + read_fixed), the mid tier `select_datapath` picks when the kernel
+// lacks multishot. Whole-module Linux + io_uring gated (it uses tokio-uring's ring types), so it
+// compiles + is functionally tested only on the io_uring path (a real ring).
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+pub mod fixed_datapath;
+
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
