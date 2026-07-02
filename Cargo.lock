@@ -563,6 +563,7 @@ dependencies = [
 name = "ironcache-runtime"
 version = "0.0.0"
 dependencies = [
+ "io-uring",
  "ironcache-env",
  "rustls-pki-types",
  "socket2 0.6.4",

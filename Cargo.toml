@@ -114,6 +114,13 @@ rustls-pki-types = { version = "1.12", features = ["std"] }
 # (RUNTIME_ABSTRACTION.md). Its license tree is MIT (cargo-deny clean: io-uring/libc/slab/socket2/
 # futures-util/tokio, all already in or compatible with the workspace allowlist).
 tokio-uring = { version = "0.5", features = ["bytes"] }
+# The raw pure-Rust io_uring syscall bindings (ALREADY pulled transitively by tokio-uring, same
+# 0.6 line). Declared DIRECTLY + optional so the io_uring backend can run the STARTUP CAPABILITY
+# PROBE (IOURING_DATAPATH.md "chosen by startup probe"): create a ring, `register_probe`, and read
+# which opcodes (multishot recv/accept, provided buffers, fixed-buffer read) the RUNNING kernel
+# supports, so one Linux artifact selects the fastest datapath the kernel offers. Linux + opt-in
+# only (same license tree as tokio-uring, already cargo-deny clean).
+io-uring = { version = "0.6", default-features = false }
 # The per-shard SwissTable for the store index (ADR-0005, HASHTABLE.md #35). Stock
 # hashbrown, unsynchronized, owned by one core; MIT OR Apache-2.0 (cargo-deny clean).
 hashbrown = "0.16"

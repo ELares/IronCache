@@ -164,6 +164,16 @@ release.
 
 ### Added
 
+- io_uring startup capability probe + datapath selection (issue #284, IOURING_DATAPATH.md "chosen
+  by startup probe"): `ironcache-runtime`'s new `uring_probe` module lets one Linux artifact run
+  across kernel versions. `probe_uring_caps` creates a ring and, via `register_probe`, detects which
+  opcodes the RUNNING kernel supports (multishot recv/accept, provided buffers, fixed-buffer read);
+  the pure `select_datapath` then picks the fastest datapath that kernel actually supports
+  (`MultishotProvided` -> `OneShotFixed` -> `OneShotOwned`), so an old kernel transparently gets the
+  slower-but-correct path instead of an `EINVAL` from an unsupported opcode. The selection decision +
+  types are cfg-free (truth-table tested on every host); the real probe is Linux + `io_uring`-feature
+  gated (validated on a real kernel by the CI io_uring datapath job). Adds `io-uring` as a direct
+  optional Linux dependency (already present transitively via `tokio-uring`).
 - Rolling-upgrade orchestration state machine (issue #392 Phase 3): `ironcache-repl`'s new
   `upgrade_plan` module adds `upgrade_step`, the pure next-step decision of the clustered RPO=0
   rolling upgrade, in the same shape as the rebalance controller's `apply_step`. It encodes the

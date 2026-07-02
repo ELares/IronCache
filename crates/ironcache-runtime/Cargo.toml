@@ -34,7 +34,7 @@ workspace = true
 default = ["tokio", "tls"]
 tokio = ["dep:tokio", "dep:socket2"]
 tls = ["tokio", "dep:tokio-rustls", "dep:rustls-pki-types"]
-io_uring = ["tokio", "dep:tokio-uring"]
+io_uring = ["tokio", "dep:tokio-uring", "dep:io-uring"]
 
 [dependencies]
 ironcache-env = { workspace = true }
@@ -65,6 +65,9 @@ rustls-pki-types = { workspace = true, optional = true }
 # to Linux so the dependency tree on macOS/Windows does not try to compile the Linux-only crate.
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = { workspace = true, optional = true }
+# Raw io_uring bindings for the startup capability probe (see the `io_uring` feature note above +
+# `uring_probe`). Linux + opt-in only; already in the tree via tokio-uring.
+io-uring = { workspace = true, optional = true }
 
 # `test-util` enables tokio's PAUSED-clock test harness (`start_paused`), used to fire the bounded
 # secret-handshake timeout near-instantly in the slow-loris test without a real 10s wall-clock wait.
