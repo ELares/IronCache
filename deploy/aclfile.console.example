@@ -1,0 +1,84 @@
+# Least-privilege reference aclfile for the IronCache console (issue #367).
+#
+# Load this on every NODE the console talks to, via IRONCACHE_ACLFILE (or the
+# `aclfile = "..."` config key). It defines the two scoped users the console
+# authenticates AS when it dials a node:
+#
+#   console_monitor  the read-only POLL loop (health + INFO + best-effort
+#                    slowlog/clients panels). Cannot mutate anything and cannot
+#                    read a single key value.
+#   console_admin    the management surface (CONFIG, CLUSTER ops, ACL admin,
+#                    key CRUD, SAVE), but NOT the destructive verbs (FLUSHALL,
+#                    FLUSHDB, SHUTDOWN, KEYS, DEBUG, MIGRATE, SWAPDB, ...).
+#
+# Point the console at one of them with:
+#   IRONCACHE_CONSOLE_NODE_USER=console_monitor        (or console_admin)
+#   IRONCACHE_CONSOLE_NODE_PASSWORD_FILE=/run/secrets/console_node_password
+#
+# THIS IS AN EXAMPLE. Before using it:
+#   1. Replace both CHANGE_ME_* passwords with real secrets (or feed hashed
+#      digests with `#<sha256hex>` instead of `>plaintext`).
+#   2. Decide what to do with the `default` user below. It is `off` here so
+#      there is NO anonymous access; add your OWN operator/admin user (or set
+#      `requirepass` on default) so YOU can still administer the node.
+#
+# The rule grammar (see docs/design/ACL.md): rules apply left to right,
+# last-match-wins. `-@all` then `+cmd` yields "only these commands". `~pattern`
+# grants key access (absent = no keys); `&pattern` grants pub/sub channels.
+
+# No anonymous access. Add your own operator user here (e.g.
+#   user ops on >YOUR_STRONG_PASSWORD ~* &* +@all
+# ) so locking down the console users does not lock YOU out.
+user default off
+
+# console_monitor: the read-only poll loop. The console's monitor path issues
+# PING, INFO, and (best-effort) SLOWLOG GET + CLIENT LIST; cluster topology is
+# fetched over HTTP, never RESP, so no CLUSTER grant is needed. +ping and +info
+# are MANDATORY: PING/INFO are not pre-auth-exempt, and a poll that gets NOPERM
+# on them marks the node unreachable. +client|list is the read-only CLIENT verb
+# for the clients panel. There is deliberately NO `~` key grant, so this user can
+# never read a key's value. SLOWLOG is intentionally omitted: it has no
+# per-subcommand ACL grant (granting it would mean the whole command, including
+# SLOWLOG RESET, which is a mutation), and its argv can name keys; the console's
+# slowlog panel is best-effort and simply stays empty for the monitor. The poll
+# loop works on +ping +info alone and tolerates NOPERM on the rest.
+user console_monitor on >CHANGE_ME_monitor resetkeys resetchannels -@all +ping +info +client|list
+
+# console_admin: scoped management. `+@all -@dangerous` grants every ordinary
+# (incl. all data) command, then removes the whole @dangerous class; the
+# re-grants add back EXACTLY the privileged verbs the console's management path
+# (src/manage.rs) issues, PER SUBCOMMAND wherever the command supports it, so a
+# whole-command grant cannot silently re-open a destructive sibling verb:
+#   +config|get +config|set    (NOT bare +config, which would also re-grant
+#                               CONFIG REWRITE / RESETSTAT)
+#   +cluster|meet|forget|failover|rebalance|setslot  (NOT bare +cluster, which
+#                               would re-grant the destructive ADDSLOTS /
+#                               DELSLOTS / FLUSHSLOTS / RESET / BUMPEPOCH /
+#                               SET-CONFIG-EPOCH slot mutators the console never
+#                               calls). CLUSTER's READ verbs (INFO / SLOTS /
+#                               SHARDS / NODES / MYID) are @slow-not-@dangerous,
+#                               so they remain allowed via `+@all -@dangerous`.
+#   +client|list               (observe clients; NOT CLIENT KILL)
+#   +slowlog                   (whole: SLOWLOG has no per-subcommand grant; GET
+#                               for the panel + RESET, neither data-destructive)
+#   +info +save +bgsave
+# What stays DENIED: FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE,
+# RESTORE, MOVE, SORT, HOTKEYS, PFDEBUG, and the destructive CLUSTER slot verbs.
+#
+# ACL is DELIBERATELY NOT granted. ACL has no per-subcommand grant, so a bare
+# `+acl` would hand console_admin ACL SETUSER, i.e. the power to rewrite ANY
+# user's rules (including its own) to `+@all` -- a self-escalation that would
+# defeat this entire least-privilege model. Managing a node's ACL users is a
+# root-level capability; keep it on a SEPARATE, dedicated credential. The
+# console's own doc treats this node ACL as "the ultimate bound" (defense in
+# depth), so console_admin intentionally cannot rewrite it. If you accept the
+# trade-off and want the console's ACL panel to manage users, add `+acl` here
+# and understand that console_admin then becomes root-equivalent.
+#
+# CAVEATS that the Redis ACL model cannot express (so treat console_admin's
+# password as a PRIVILEGED secret): `+config|set` still allows CONFIG SET of ANY
+# parameter (there is no per-parameter ACL), including `dir` / `dbfilename`
+# which, with `+save`/`+bgsave`, is a file-write primitive; and `~*` grants
+# read AND write to EVERY key. Both are inherent to the console's config + key
+# panels; narrow them only if your console does not use those panels.
+user console_admin on >CHANGE_ME_admin ~* &* +@all -@dangerous +config|get +config|set +cluster|meet +cluster|forget +cluster|failover +cluster|rebalance +cluster|setslot +info +save +bgsave +client|list +slowlog
