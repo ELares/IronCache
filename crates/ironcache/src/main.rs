@@ -470,9 +470,14 @@ fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
 }
 
 /// Resolve the upgrade's binary source into a `(binary, sha256sums)` pair plus the optional fetch
-/// guard. Exactly one source must be given: the LOCAL `--binary` + `--sha256sums`, or the REMOTE
-/// `--from-url` + `--sums-url` fetch (#394). The remote path downloads + verifies the tarball, extracts
-/// the binary, and returns the [`fetch::Fetched`] guard (its temp dir must outlive the run).
+/// guard. EXACTLY ONE source must be given (#394):
+/// - LOCAL: `--binary <path>` + `--sha256sums <path>`.
+/// - REMOTE explicit: `--from-url <url>` + `--sums-url <url>`.
+/// - REMOTE GitHub: `--to <version|latest>` (+ optional `--repo`), which resolves this platform's
+///   asset URLs itself.
+///
+/// The two remote paths download + verify the tarball, extract the binary, and return the
+/// [`fetch::Fetched`] guard (its temp dir must outlive the run).
 fn resolve_upgrade_source(
     args: &cli::UpgradeArgs,
 ) -> anyhow::Result<(
@@ -481,46 +486,92 @@ fn resolve_upgrade_source(
     Option<ironcache::upgrade::fetch::Fetched>,
 )> {
     use ironcache::upgrade::fetch;
-    match (args.from_url.as_deref(), args.binary.as_ref()) {
-        (Some(url), None) => {
-            let sums_url = args.sums_url.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--from-url requires --sums-url (the SHA256SUMS URL that vouches for the tarball)"
-                )
-            })?;
-            if args.sha256sums.is_some() {
-                anyhow::bail!(
-                    "--sha256sums is for the local --binary source; use --sums-url with --from-url"
-                );
-            }
-            println!("upgrade: fetching {url}");
-            let fetched = fetch::fetch_release(url, sums_url, fetch::FetchBounds::default())
-                .context("fetching the release over HTTPS")?;
-            println!(
-                "upgrade: fetched + verified the tarball; installing the extracted binary {}",
-                fetched.binary.display()
-            );
-            Ok((
-                fetched.binary.clone(),
-                fetched.sha256sums.clone(),
-                Some(fetched),
-            ))
-        }
-        (None, Some(binary)) => {
-            let sums = args
-                .sha256sums
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--binary requires --sha256sums"))?;
-            Ok((binary.clone(), sums, None))
-        }
-        (Some(_), Some(_)) => anyhow::bail!(
-            "--from-url and --binary are mutually exclusive; choose ONE source (remote fetch or local file)"
-        ),
-        (None, None) => anyhow::bail!(
-            "a binary source is required: either `--binary <path> --sha256sums <path>` (local) or \
-             `--from-url <url> --sums-url <url>` (remote fetch, #394)"
-        ),
+
+    // Exactly one of the three source modes must be selected.
+    let n_sources = [
+        args.binary.is_some(),
+        args.from_url.is_some(),
+        args.to.is_some(),
+    ]
+    .into_iter()
+    .filter(|&m| m)
+    .count();
+    if n_sources == 0 {
+        anyhow::bail!(
+            "a binary source is required: `--binary <path> --sha256sums <path>` (local), \
+             `--from-url <url> --sums-url <url>` (remote), or `--to <version|latest>` (GitHub, #394)"
+        );
     }
+    if n_sources > 1 {
+        anyhow::bail!(
+            "the sources --binary, --from-url, and --to are mutually exclusive; choose exactly ONE"
+        );
+    }
+
+    // REMOTE GitHub: `--to <version|latest>` -> resolve this platform's asset URLs, then fetch.
+    if let Some(spec) = args.to.as_deref() {
+        let repo = args.repo.as_deref().unwrap_or(fetch::DEFAULT_UPGRADE_REPO);
+        let plat = fetch::target_plat().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this platform has no published release asset (the release ships Linux musl/glibc on \
+                 amd64/arm64); use --from-url or --binary instead"
+            )
+        })?;
+        let bounds = fetch::FetchBounds::default();
+        let tag = if spec.eq_ignore_ascii_case("latest") {
+            println!("upgrade: resolving the latest release of {repo}");
+            fetch::resolve_latest_tag(repo, bounds).context("resolving the latest release tag")?
+        } else {
+            spec.to_owned()
+        };
+        let version = fetch::version_from_tag(&tag);
+        let (tarball_url, sums_url) = fetch::github_release_urls(repo, &tag, version, plat);
+        println!("upgrade: fetching {tarball_url}");
+        let fetched = fetch::fetch_release(&tarball_url, &sums_url, bounds)
+            .context("fetching the release from GitHub")?;
+        return Ok((
+            fetched.binary.clone(),
+            fetched.sha256sums.clone(),
+            Some(fetched),
+        ));
+    }
+
+    // REMOTE explicit: `--from-url <url>` + `--sums-url <url>`.
+    if let Some(url) = args.from_url.as_deref() {
+        let sums_url = args.sums_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--from-url requires --sums-url (the SHA256SUMS URL that vouches for the tarball)"
+            )
+        })?;
+        if args.sha256sums.is_some() {
+            anyhow::bail!(
+                "--sha256sums is for the local --binary source; use --sums-url with --from-url"
+            );
+        }
+        println!("upgrade: fetching {url}");
+        let fetched = fetch::fetch_release(url, sums_url, fetch::FetchBounds::default())
+            .context("fetching the release over HTTPS")?;
+        println!(
+            "upgrade: fetched + verified the tarball; installing the extracted binary {}",
+            fetched.binary.display()
+        );
+        return Ok((
+            fetched.binary.clone(),
+            fetched.sha256sums.clone(),
+            Some(fetched),
+        ));
+    }
+
+    // LOCAL: `--binary <path>` + `--sha256sums <path>`.
+    let binary = args
+        .binary
+        .clone()
+        .expect("exactly one source selected; binary is it");
+    let sums = args
+        .sha256sums
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--binary requires --sha256sums"))?;
+    Ok((binary, sums, None))
 }
 
 #[cfg(test)]
@@ -595,6 +646,47 @@ mod tests {
         let err = resolve_upgrade_source(&args).expect_err("a source is required");
         assert!(
             err.to_string().contains("a binary source is required"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_source_to_conflicts_with_other_sources() {
+        // --to is mutually exclusive with --binary (checked before any platform/network work).
+        let args = parse_upgrade(&[
+            "--to",
+            "latest",
+            "--binary",
+            "/tmp/ic",
+            "--sha256sums",
+            "/tmp/S",
+        ]);
+        let err = resolve_upgrade_source(&args).expect_err("--to + --binary is rejected");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+        // And with --from-url.
+        let args2 = parse_upgrade(&[
+            "--to",
+            "2026.0701.1",
+            "--from-url",
+            "https://x/a.tgz",
+            "--sums-url",
+            "https://x/S",
+        ]);
+        let err2 = resolve_upgrade_source(&args2).expect_err("--to + --from-url is rejected");
+        assert!(err2.to_string().contains("mutually exclusive"), "{err2}");
+    }
+
+    /// On a platform with no published release asset (e.g. macOS), `--to` fails at the platform check
+    /// BEFORE any network access. On Linux CI `target_plat` is `Some`, so this path would try to reach
+    /// GitHub; gate the assertion to non-Linux so it is deterministic (the happy path is covered by
+    /// the fetch unit tests).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn resolve_source_to_on_unsupported_platform_errors_before_network() {
+        let args = parse_upgrade(&["--to", "latest"]);
+        let err = resolve_upgrade_source(&args).expect_err("no asset for this platform");
+        assert!(
+            err.to_string().contains("no published release asset"),
             "{err}"
         );
     }
