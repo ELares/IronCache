@@ -325,6 +325,15 @@ fn log_boot(cfg: &ConsoleConfig) {
              is idle and /readyz stays not-ready until a seed is set"
         );
     }
+    if embedded_history_is_ha_inconsistent(cfg) {
+        tracing::warn!(
+            addr = %cfg.http_addr,
+            "console: EMBEDDED history (history_embedded_hours) on a non-loopback bind is PER-REPLICA \
+             and not shared; behind a load balancer (the #363 HA topology) each replica shows a \
+             different /api/timeseries window and a replica loss drops its window. Point every \
+             replica at a shared `prometheus_url` for HA-consistent history."
+        );
+    }
     if binds_all_interfaces(&cfg.http_addr) {
         tracing::warn!(
             addr = %cfg.http_addr,
@@ -373,6 +382,22 @@ fn log_auth_posture(cfg: &ConsoleConfig) {
 fn binds_all_interfaces(addr: &str) -> bool {
     let host = host_of(addr);
     host.is_empty() || host == "0.0.0.0" || host == "::"
+}
+
+/// Whether the console runs EMBEDDED (per-replica, in-memory) history on a non-loopback bind, the
+/// one config combination that makes horizontal scaling behind a load balancer (#363 HA) surprising:
+/// each replica keeps its OWN `/api/timeseries` trend window (fed only by its own poll loop), so
+/// behind an LB the window a client sees depends on which replica answered, and a replica loss drops
+/// its window. This is NOT a correctness bug (the cache data path is untouched and every replica is
+/// otherwise stateless: header-token auth, independently-polled topology, per-replica readiness) but
+/// an operator surprise, so `log_boot` warns and recommends a SHARED `prometheus_url` as the
+/// HA-consistent history backend. Embedded history is used only when `prometheus_url` is unset
+/// (see [`build_history`]), and a loopback (single-host / dev) bind is not an HA topology, so both are
+/// excluded here.
+fn embedded_history_is_ha_inconsistent(cfg: &ConsoleConfig) -> bool {
+    cfg.prometheus_url.is_none()
+        && cfg.history_embedded_hours.is_some()
+        && !binds_loopback(&cfg.http_addr)
 }
 
 /// Whether `addr` (a `host:port`) binds a LOOPBACK address (the IPv4 `127.0.0.0/8`
@@ -452,6 +477,47 @@ mod tests {
         }));
         assert!(!has_token(&ConsoleConfig {
             admin_token: Some("   ".to_owned()),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn embedded_history_ha_inconsistency_detection() {
+        use super::embedded_history_is_ha_inconsistent;
+        use crate::config::ConsoleConfig;
+
+        // Embedded history + a non-loopback (HA) bind = the one flagged combination.
+        assert!(embedded_history_is_ha_inconsistent(&ConsoleConfig {
+            http_addr: "0.0.0.0:9180".to_owned(),
+            prometheus_url: None,
+            history_embedded_hours: Some(24),
+            ..Default::default()
+        }));
+        assert!(embedded_history_is_ha_inconsistent(&ConsoleConfig {
+            http_addr: "10.2.0.5:9180".to_owned(),
+            prometheus_url: None,
+            history_embedded_hours: Some(6),
+            ..Default::default()
+        }));
+        // A SHARED prometheus backend is HA-consistent, embedded or not -> no warning.
+        assert!(!embedded_history_is_ha_inconsistent(&ConsoleConfig {
+            http_addr: "0.0.0.0:9180".to_owned(),
+            prometheus_url: Some("http://prom:9090".to_owned()),
+            history_embedded_hours: Some(24),
+            ..Default::default()
+        }));
+        // A loopback (single-host / dev) bind is not an HA topology -> no warning.
+        assert!(!embedded_history_is_ha_inconsistent(&ConsoleConfig {
+            http_addr: "127.0.0.1:9180".to_owned(),
+            prometheus_url: None,
+            history_embedded_hours: Some(24),
+            ..Default::default()
+        }));
+        // No history at all -> nothing to warn about.
+        assert!(!embedded_history_is_ha_inconsistent(&ConsoleConfig {
+            http_addr: "0.0.0.0:9180".to_owned(),
+            prometheus_url: None,
+            history_embedded_hours: None,
             ..Default::default()
         }));
     }

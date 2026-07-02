@@ -266,6 +266,33 @@ When `--metrics-addr` is set the server serves on that address:
 - `GET /metrics` -> Prometheus exposition (per-shard counter rollup + process and
   raft gauges). Scrape it directly, or enable the chart's `metrics.serviceMonitor`.
 
+### Console HA: stateless replicas behind a load balancer
+
+The IronCache console (issue #352) is designed to run as **N identical stateless
+replicas behind a load balancer** (issue #363), separate from the data path:
+
+- **No per-instance session state.** Auth is a `Authorization: Bearer` header
+  (never a cookie), resolved from config that is identical on every replica, so
+  any replica can serve any request; there is no sticky-session requirement.
+- **Topology is derived, not stored.** Each replica independently polls the seed
+  nodes and rebuilds its view, so replicas converge without shared state.
+- **Readiness is per-replica.** The console's own `GET /livez` / `GET /readyz`
+  (its HTTP listener) are the load balancer's health checks: `/readyz` returns
+  `503` until that replica's first successful poll, so a cold replica is held out
+  of rotation and a lost replica is transparently routed around.
+- **History must be SHARED for consistency.** Point every replica at one shared
+  Prometheus with `IRONCACHE_CONSOLE_PROMETHEUS_URL`. The alternative,
+  `IRONCACHE_CONSOLE_HISTORY_EMBEDDED_HOURS`, keeps a PER-REPLICA in-memory trend
+  window, so behind an LB each replica shows a different `/api/timeseries` window
+  and a replica loss drops its window. The console logs a boot WARNING if embedded
+  history is used on a non-loopback bind for exactly this reason.
+- **Least privilege + exposure.** Each replica dials nodes as the scoped
+  `console_monitor` user (see the aclfile above), and the console is kept behind a
+  VPN-locked, SG-restricted load balancer, not world-reachable (issue #369).
+
+The reference container image + Helm/k8s manifests for the console are tracked as
+follow-up packaging work under #363.
+
 ---
 
 ## 8. Persistence, RPO, and the PVC
