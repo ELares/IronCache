@@ -164,6 +164,14 @@ release.
 
 ### Added
 
+- Rolling-upgrade promotion gate (issue #392 guardrail): `ironcache-repl`'s new `safe_to_promote`
+  composes the two safety guardrails the clustered rolling upgrade names into one pure verdict
+  (`PromotionSafety`): QUORUM (the config-plane raft must have a majority to COMMIT the
+  `PromoteReplica` fence, checked first) and the LAG GATE (the candidate replica must be in sync via
+  the existing `replica_is_in_sync`, so the synchronous committed fence loses no acknowledged write,
+  RPO=0). It refuses to promote a lagging or down-link candidate, and defers when quorum is absent.
+  Pure + deterministic, so the guardrail is truth-table unit-tested rather than needing a live
+  cluster; the surrounding orchestration + the raft commit are the clustered layer.
 - systemd socket-activation protocol parser (issue #389 Phase 2a): `ironcache-runtime`'s new
   `listen_fds` module parses the `sd_listen_fds` environment (`LISTEN_PID` / `LISTEN_FDS` /
   `LISTEN_FDNAMES`) into a typed list of inherited listening fds, or a typed rejection. This is the

@@ -193,6 +193,61 @@ pub fn replica_is_in_sync(link: LinkStatus, lag: ReplicaLag, max_lag: u64) -> bo
     link.is_up() && lag.in_sync(max_lag)
 }
 
+/// The promotion candidate for a rolling upgrade: its replication link to the current primary and
+/// its lag. The rolling-upgrade orchestrator (#392) selects the best standby (preferring the
+/// least-lagging) and asks [`safe_to_promote`] whether promoting it is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateReplica {
+    /// The candidate's link to the primary it would take over from.
+    pub link: LinkStatus,
+    /// The candidate's lag behind that primary.
+    pub lag: ReplicaLag,
+}
+
+/// The verdict of the rolling-upgrade promotion gate ([`safe_to_promote`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionSafety {
+    /// Both guardrails hold: the candidate is in sync and the config-plane raft has quorum, so the
+    /// synchronous `PromoteReplica` fence can be committed with no acknowledged-write loss.
+    Safe,
+    /// The config-plane raft lacks a majority quorum, so the `PromoteReplica` log entry cannot be
+    /// COMMITTED; the ownership move would not be durable. Defer until quorum returns.
+    NoQuorum,
+    /// The candidate replica is not in sync (link down, or lag above the bound). Promoting it would
+    /// move ownership to a replica missing acknowledged writes, breaking the RPO=0 guarantee. Defer
+    /// until the candidate catches up (or pick a different, in-sync candidate).
+    CandidateNotInSync,
+}
+
+/// The #392 rolling-upgrade PROMOTION GATE: whether it is safe to promote `candidate` (and thus
+/// proceed to take its current primary down for upgrade). Encodes the two guardrails the issue names,
+/// composing the existing per-replica [`replica_is_in_sync`] lag gate with the cluster quorum signal:
+///
+/// 1. QUORUM: the config-plane raft must have a majority to COMMIT the `PromoteReplica` entry. The
+///    ownership fence is only durable once committed, so without quorum the promotion must not be
+///    attempted (checked first, since it is a cluster-wide precondition independent of the candidate).
+/// 2. LAG GATE (RPO=0): the candidate must be in sync (link up AND lag within `max_lag`). Because
+///    promotion is a SYNCHRONOUS committed fence, promoting an in-sync replica loses NO acknowledged
+///    write; promoting a lagging one WOULD lose the writes it has not shipped, so it is refused.
+///
+/// Pure + deterministic, so the guardrail is unit-tested to a truth table rather than on a live
+/// cluster; the orchestration around it (drive the replica upgrade, wait, trigger the commit, verify,
+/// upgrade the old primary) and the raft commit itself are the Linux/clustered layer.
+#[must_use]
+pub fn safe_to_promote(
+    candidate: CandidateReplica,
+    max_lag: u64,
+    raft_quorum_available: bool,
+) -> PromotionSafety {
+    if !raft_quorum_available {
+        return PromotionSafety::NoQuorum;
+    }
+    if !replica_is_in_sync(candidate.link, candidate.lag, max_lag) {
+        return PromotionSafety::CandidateNotInSync;
+    }
+    PromotionSafety::Safe
+}
+
 /// The SOURCE-SIDE in-sync-replica COUNT (ADR-0026, the WRITE-SIDE guardrail `min-replicas-to
 /// -write`): a single CHEAP ATOMIC the primary's per-replica serve tasks maintain, and the WRITE
 /// hot path reads with ONE relaxed load when the guardrail is enabled.
@@ -588,6 +643,58 @@ mod tests {
         ));
         // A DOWN link with a stale "known" lag is still rejected by the link gate.
         assert!(!replica_is_in_sync(LinkStatus::Down, up_ok, 100));
+    }
+
+    #[test]
+    fn safe_to_promote_requires_both_quorum_and_an_in_sync_candidate() {
+        use super::{CandidateReplica, PromotionSafety, safe_to_promote};
+        let in_sync = CandidateReplica {
+            link: LinkStatus::Up,
+            lag: ReplicaLag::compute(ReplOffset(10), ReplOffset(9)), // lag 1 <= 2
+        };
+        let lagging = CandidateReplica {
+            link: LinkStatus::Up,
+            lag: ReplicaLag::compute(ReplOffset(10), ReplOffset(5)), // lag 5 > 2
+        };
+        let down = CandidateReplica {
+            link: LinkStatus::Down,
+            lag: ReplicaLag::unknown(),
+        };
+
+        // Both guardrails hold -> Safe.
+        assert_eq!(safe_to_promote(in_sync, 2, true), PromotionSafety::Safe);
+
+        // No quorum -> NoQuorum, even with a perfectly in-sync candidate (quorum is the cluster-wide
+        // precondition, checked first, so the ownership fence can actually be committed).
+        assert_eq!(
+            safe_to_promote(in_sync, 2, false),
+            PromotionSafety::NoQuorum
+        );
+
+        // Quorum held but the candidate is not in sync -> refuse (RPO=0 guard): a lagging candidate
+        // and a down-link candidate are both rejected.
+        assert_eq!(
+            safe_to_promote(lagging, 2, true),
+            PromotionSafety::CandidateNotInSync
+        );
+        assert_eq!(
+            safe_to_promote(down, u64::MAX, true),
+            PromotionSafety::CandidateNotInSync
+        );
+
+        // Quorum is checked BEFORE the candidate, so a no-quorum + not-in-sync case reports NoQuorum
+        // (the blocking precondition), not the candidate state.
+        assert_eq!(
+            safe_to_promote(lagging, 2, false),
+            PromotionSafety::NoQuorum
+        );
+
+        // The lag bound is inclusive (matches replica_is_in_sync): lag == max_lag is still Safe.
+        let at_bound = CandidateReplica {
+            link: LinkStatus::Up,
+            lag: ReplicaLag::compute(ReplOffset(10), ReplOffset(8)), // lag 2 == 2
+        };
+        assert_eq!(safe_to_promote(at_bound, 2, true), PromotionSafety::Safe);
     }
 
     #[test]
