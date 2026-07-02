@@ -216,6 +216,13 @@ pub mod listen_fds;
 // bookkeeping is validated on every host (cargo test + a HashSet oracle; miri-trivial).
 pub mod buffer_pool;
 
+// The io_uring startup CAPABILITY PROBE + datapath selection (#284 IOURING_DATAPATH.md "chosen by
+// startup probe"). The pure `select_datapath` decision + its types are cfg-free (truth-table tested
+// on every host); the real `probe_uring_caps` (creates a ring + register_probe) is Linux+feature
+// gated, validated on a real kernel. It is the cross-kernel compatibility gate the fast datapaths
+// select through, so one Linux artifact runs multishot on 6.x and falls back on older kernels.
+pub mod uring_probe;
+
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
