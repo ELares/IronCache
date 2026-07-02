@@ -14,11 +14,16 @@
 //! grows the table, the datastore behavior), it EVICTS the coldest slot IN THAT SEGMENT and places
 //! the new key, so memory stays bounded and eviction touches O(`SEGMENT_CAP`) = O(1) slots with no
 //! table-wide scan and no per-key side state. The victim is the slot minimizing the total order
-//! `(freq, scan_hash, key)` -- the SAME freq-in-object order the store's `refill_evict_pool`
-//! `ColdEntry` uses (`freq, scan_h, key[, db]`; EVICTION.md, ADR-0003), so two shards with identical
-//! state evict identically. The 2-bit frequency lives IN the value (freq-in-object), read via the
-//! caller's `freq_of` accessor. [`Dashtable::with_directory_bits`] pre-sizes the segment array for a
-//! known working set (a cache is sized up front; growth is by eviction, not splits).
+//! `(freq, scan_hash, key)`, the SAME SHAPE the store's `refill_evict_pool` `ColdEntry` uses
+//! (`freq, scan_h, key[, db]`; EVICTION.md, ADR-0003). Both the 2-bit frequency and the `scan_hash`
+//! are supplied by the CALLER (`freq_of` reads the freq out of the value = freq-in-object; `scan_hash`
+//! is the caller's scan-order hash over the key), so when the store wires this table it passes its
+//! OWN `freq` + `scan_hash` and the victim is then byte-identical to `refill_evict_pool`'s choice by
+//! construction; two shards with identical state evict identically. Passing the scan hash in (rather
+//! than hashing the key with this crate's internal directory hash, which is a DIFFERENT function)
+//! is what makes that parity real rather than merely same-shaped. [`Dashtable::with_directory_bits`]
+//! pre-sizes the segment array for a known working set (a cache is sized up front; growth is by
+//! eviction, not splits).
 //!
 //! ## What is deliberately deferred (later stages of DASHTABLE.md)
 //!
@@ -338,15 +343,21 @@ where
     /// CACHE-mode insert: `key` -> `value`, EVICTING the coldest slot in the routed segment instead of
     /// splitting when that segment is full (the (b) lever of #285, DASHTABLE.md). An existing key is
     /// overwritten in place. `freq_of` reads the 2-bit frequency out of the value (freq-in-object,
-    /// EVICTION.md); the evicted victim is the slot minimizing the deterministic total order
-    /// `(freq, scan_hash, key)`, identical to the store's `refill_evict_pool` victim order, so the
-    /// selection is O(`SEGMENT_CAP`) = O(1) and reproducible across shards (ADR-0003).
-    pub fn insert_cache<F: Fn(&V) -> u8>(
+    /// EVICTION.md); `scan_hash_of` is the caller's scan-order hash over the key (the store passes its
+    /// own `scan_hash`, so the tie-break matches `refill_evict_pool` exactly). The evicted victim is
+    /// the slot minimizing the deterministic total order `(freq, scan_hash, key)`, so the selection is
+    /// O(`SEGMENT_CAP`) = O(1) and reproducible across shards (ADR-0003).
+    pub fn insert_cache<F, H>(
         &mut self,
         key: K,
         value: V,
         freq_of: F,
-    ) -> CacheInsert<K, V> {
+        scan_hash_of: H,
+    ) -> CacheInsert<K, V>
+    where
+        F: Fn(&V) -> u8,
+        H: Fn(&K) -> u64,
+    {
         let h = hash_key(&key);
         let fp = fingerprint(h);
         let si = self.directory[self.dir_index(h)];
@@ -362,7 +373,7 @@ where
 
         // A full segment EVICTS its coldest slot (cache mode) rather than splitting.
         if self.segments[si].slots.len() >= SEGMENT_CAP {
-            let victim = Self::evict_victim(&self.segments[si].slots, &freq_of);
+            let victim = Self::evict_victim(&self.segments[si].slots, &freq_of, &scan_hash_of);
             // swap_remove is O(1) and order-independent (a segment is an unordered pool); then place
             // the new slot. Net len unchanged.
             let evicted = self.segments[si].slots.swap_remove(victim);
@@ -388,17 +399,23 @@ where
     }
 
     /// The index of the segment's COLDEST slot by the total order `(freq, scan_hash, key)` (the
-    /// eviction victim). `scan_hash` is the deterministic key hash (the store's SCAN-order hash role);
-    /// the final `key` tie-break makes the order TOTAL so the choice is unique + reproducible. Panics
-    /// only if called on an empty segment (never, in `insert_cache`, which checks fullness first).
-    fn evict_victim<F: Fn(&V) -> u8>(slots: &[Slot<K, V>], freq_of: &F) -> usize {
+    /// eviction victim). `scan_hash_of` is the caller's scan-order hash (the store's `scan_hash` when
+    /// wired), NOT this crate's internal directory hash [`hash_key`] -- passing it in is what makes the
+    /// victim identical to the store's, since the two hash functions differ. The final `key` tie-break
+    /// makes the order TOTAL so the choice is unique + reproducible. Panics only if called on an empty
+    /// segment (never, in `insert_cache`, which checks fullness first).
+    fn evict_victim<F, H>(slots: &[Slot<K, V>], freq_of: &F, scan_hash_of: &H) -> usize
+    where
+        F: Fn(&V) -> u8,
+        H: Fn(&K) -> u64,
+    {
         slots
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
                 freq_of(&a.value)
                     .cmp(&freq_of(&b.value))
-                    .then_with(|| hash_key(&a.key).cmp(&hash_key(&b.key)))
+                    .then_with(|| scan_hash_of(&a.key).cmp(&scan_hash_of(&b.key)))
                     .then_with(|| a.key.cmp(&b.key))
             })
             .map(|(i, _)| i)
@@ -503,16 +520,44 @@ mod tests {
         v.freq
     }
 
-    /// The store's `refill_evict_pool` victim order: COLDEST by `(freq, scan_hash, key)`. Replicated
-    /// here as the independent ORACLE the dashtable's eviction must agree with (DASHTABLE.md stage 2:
-    /// "the same victim as the current freq-in-object selection").
+    /// A BYTE-EXACT port of `ironcache_store::scan_hash` (store/src/lib.rs), the store's real
+    /// SCAN-order hash. The eviction tie-break must use THIS (not the crate's internal directory hash)
+    /// for the victim to match `refill_evict_pool`; the standalone crate does not depend on the store,
+    /// so the test replicates the function and feeds it in as the `scan_hash_of` accessor, exactly as
+    /// the store would at stage-3 wiring. Kept in lockstep with the store definition.
+    fn store_scan_hash(key: &[u8]) -> u64 {
+        const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+        const SECRET: u64 = 0xA076_1D64_78BD_642F;
+        let mut h: u64 = SEED ^ SECRET;
+        for &b in key {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            h ^= h >> 33;
+        }
+        h = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        h ^ (h >> 31)
+    }
+    /// The `scan_hash_of` accessor for a `u64` key: the store's scan_hash over the key's big-endian
+    /// bytes (the byte encoding the store would key on). Takes `&u64` (not `u64`) because it is passed
+    /// as the `Fn(&K) -> u64` accessor, whose signature requires a reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn scan_hash_of(k: &u64) -> u64 {
+        store_scan_hash(&k.to_be_bytes())
+    }
+
+    /// The store's `refill_evict_pool` victim order: COLDEST by `(freq, scan_hash, key)`, using the
+    /// STORE's real `scan_hash`. This is the independent ORACLE the dashtable's eviction must agree
+    /// with (DASHTABLE.md stage 2: "the same victim as the current freq-in-object selection"), and it
+    /// now validates parity with the ACTUAL store hash, not the crate's internal one.
     fn oracle_victim(entries: &[(u64, u8)]) -> u64 {
         entries
             .iter()
             .copied()
             .min_by(|&(ka, fa), &(kb, fb)| {
                 fa.cmp(&fb)
-                    .then(hash_key(&ka).cmp(&hash_key(&kb)))
+                    .then(scan_hash_of(&ka).cmp(&scan_hash_of(&kb)))
                     .then(ka.cmp(&kb))
             })
             .map(|(k, _)| k)
@@ -535,7 +580,8 @@ mod tests {
                         freq,
                         tag: k as u32
                     },
-                    freq_of
+                    freq_of,
+                    scan_hash_of
                 ),
                 CacheInsert::Inserted
             );
@@ -543,7 +589,7 @@ mod tests {
         assert_eq!(dt.len(), SEGMENT_CAP);
 
         let expected = oracle_victim(&entries);
-        let out = dt.insert_cache(9999, Freqd { freq: 3, tag: 9999 }, freq_of);
+        let out = dt.insert_cache(9999, Freqd { freq: 3, tag: 9999 }, freq_of, scan_hash_of);
         match out {
             CacheInsert::Evicted { key, .. } => {
                 assert_eq!(key, expected, "evicted the wrong victim");
@@ -567,13 +613,13 @@ mod tests {
     fn cache_higher_freq_survives_eviction() {
         // One HOT slot (freq 3) among cold ones (freq 0) must never be the victim across many evicts.
         let mut dt: Dashtable<u64, Freqd> = Dashtable::with_directory_bits(0);
-        dt.insert_cache(u64::MAX, Freqd { freq: 3, tag: 1 }, freq_of); // the hot key
+        dt.insert_cache(u64::MAX, Freqd { freq: 3, tag: 1 }, freq_of, scan_hash_of); // the hot key
         for i in 0..(SEGMENT_CAP as u64 - 1) {
-            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of);
+            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of, scan_hash_of);
         }
         // Drive many evictions with fresh cold keys; the hot key must persist throughout.
         for i in 1000..1100u64 {
-            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of);
+            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of, scan_hash_of);
             assert_eq!(
                 dt.get(&u64::MAX),
                 Some(&Freqd { freq: 3, tag: 1 }),
@@ -597,12 +643,13 @@ mod tests {
                     tag: p as u32,
                 },
                 freq_of,
+                scan_hash_of,
             );
         }
         assert_eq!(dt.len(), 16);
         // Hammer segment 0 (prefix 0) to full + beyond, forcing local evictions there.
         for i in 1..(SEGMENT_CAP as u64 * 3) {
-            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of); // top bits 0 -> segment 0
+            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of, scan_hash_of); // top bits 0 -> segment 0
         }
         // Every OTHER segment's seeded key is intact (only segment 0 evicted).
         for p in 1..16u64 {
@@ -622,11 +669,11 @@ mod tests {
     fn cache_insert_overwrites_in_place_without_eviction() {
         let mut dt: Dashtable<u64, Freqd> = Dashtable::with_directory_bits(0);
         assert_eq!(
-            dt.insert_cache(7, Freqd { freq: 1, tag: 10 }, freq_of),
+            dt.insert_cache(7, Freqd { freq: 1, tag: 10 }, freq_of, scan_hash_of),
             CacheInsert::Inserted
         );
         assert_eq!(
-            dt.insert_cache(7, Freqd { freq: 2, tag: 20 }, freq_of),
+            dt.insert_cache(7, Freqd { freq: 2, tag: 20 }, freq_of, scan_hash_of),
             CacheInsert::Overwrote(Freqd { freq: 1, tag: 10 })
         );
         assert_eq!(dt.get(&7), Some(&Freqd { freq: 2, tag: 20 }));
