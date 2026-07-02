@@ -164,6 +164,16 @@ release.
 
 ### Added
 
+- Rolling-upgrade orchestration state machine (issue #392 Phase 3): `ironcache-repl`'s new
+  `upgrade_plan` module adds `upgrade_step`, the pure next-step decision of the clustered RPO=0
+  rolling upgrade, in the same shape as the rebalance controller's `apply_step`. It encodes the
+  #392 sequence -- upgrade the in-sync REPLICAS first (one at a time, waiting for each to re-sync),
+  then PROMOTE an upgraded in-sync replica (consuming the `safe_to_promote` guardrail), then upgrade
+  the demoted OLD PRIMARY last -- and never emits a promotion while replicas remain, so the primary
+  is always upgraded last. It is derived purely from committed state + driver verdicts (so a driver
+  restart re-derives the step and RESUMES, holding no checkpoint), which makes the sequence
+  truth-table unit-tested rather than needing a live cluster; the binary swap + the raft
+  `PromoteReplica` commit are the clustered driver's job.
 - io_uring fixed-buffer group pool bookkeeping (issue #284 substrate): `ironcache-runtime`'s new
   `buffer_pool` module is the pure per-shard free/outstanding ledger the registered-buffer fast path
   is built on (IOURING_DATAPATH.md). `BufferPool` hands out and reclaims buffer ids over one fixed

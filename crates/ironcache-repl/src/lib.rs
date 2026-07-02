@@ -83,6 +83,12 @@ pub use lag::{
     ReplStatusSnapshot, ReplicaLag, lag, replica_is_in_sync, safe_to_promote,
 };
 
+// The clustered rolling-upgrade orchestration state machine (#392 Phase 3): the PURE next-step
+// decision (replicas first -> promote -> old primary last) consuming the safe_to_promote guardrail.
+// The binary swap + the raft commit are the clustered driver's job; this decides what/when.
+pub mod upgrade_plan;
+pub use upgrade_plan::{BlockReason, UpgradeStep, upgrade_step};
+
 pub mod stream;
 pub use stream::{ApplyOutcome, ReplicaApplier, ShipOutcome, drain_and_ship};
 
