@@ -9,6 +9,19 @@ release.
 
 ### Security
 
+- `ironcache upgrade` minisign authenticity anchor (issue #386, ADR-0020): a `MinisignVerifier` that
+  verifies a detached minisign signature over the release `SHA256SUMS` (`<sums>.minisig`) against a
+  pinned Ed25519 public key, adding AUTHENTICITY (the publisher is trusted) on top of the existing
+  SHA-256 INTEGRITY check. Since `SHA256SUMS` pins every artifact's hash, one small signature against
+  one committed key authenticates the whole release offline (no PKI, no network, no transparency log).
+  The crypto reuses `ring`'s Ed25519 (already linked as the TLS provider, so no new crate) with
+  hand-rolled Blake2b-512 (the modern minisign prehash) + base64, each validated against RFC-7693 /
+  RFC-4648 known-answer vectors PLUS an end-to-end test against a real `rsign2`/minisign signature (so
+  the format is proven against genuine minisign, not just self-consistent). `run()` auto-selects the
+  minisign verifier the moment `verify::PINNED_UPGRADE_PUBLIC_KEY` is set; until the production key is
+  committed (+ the already-wired release signing secret is provisioned) it falls back to the
+  integrity-only verifier, so behavior is unchanged today. Every tamper (binary, `SHA256SUMS`,
+  signature, trusted comment, wrong key) is rejected fail-closed.
 - IronCache Console security sign-off (issue #364): a threat model + control
   inventory at `crates/ironcache-console/SECURITY.md`. It records the trust
   boundary, the assets/adversaries, the code-side controls in place (three-tier

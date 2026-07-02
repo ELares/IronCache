@@ -102,9 +102,9 @@ pub enum Command {
     /// Print the effective configuration.
     Config,
     /// Self-update: swap the on-disk binary to a new version and restart the systemd-managed
-    /// server onto it, DATA-SAFELY (SAVE-first) and SAFELY (sha256-verify + health-gate +
-    /// auto-rollback). Operator-run + privileged; NOT a RESP surface. The signature anchor (#386),
-    /// HTTPS auto-fetch, and the lossless write-freeze (#388) are explicit follow-ups (#387).
+    /// server onto it, DATA-SAFELY (SAVE-first + lossless write-freeze) and SAFELY (sha256 INTEGRITY,
+    /// minisign AUTHENTICITY once a public key is pinned #386, health-gate, auto-rollback).
+    /// Operator-run + privileged; NOT a RESP surface.
     Upgrade(UpgradeArgs),
 }
 

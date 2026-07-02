@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! The VERIFY seam for `ironcache upgrade` (#387 mechanism; #386 signature follow-up).
+//! The VERIFY seam for `ironcache upgrade` (#387 mechanism; #386 signature anchor).
 //!
-//! v1 ships ONE [`Verifier`]: [`Sha256Verifier`], which confirms the new binary's SHA-256 matches
-//! its entry in a release `SHA256SUMS`. This is INTEGRITY (the bytes are the published ones), NOT
-//! AUTHENTICITY (that the publisher is trusted). The cryptographic SIGNATURE ANCHOR is the explicit
-//! #386 follow-up: #386 finalized the anchor as MINISIGN (over cosign/sigstore; ADR-0020 amendment
-//! 2026-06-29), so a `MinisignVerifier` implementing this SAME trait drops in with NO change to the
-//! orchestrator. The trait is the only thing the orchestrator depends on.
+//! Two [`Verifier`]s behind one trait:
+//! - [`Sha256Verifier`] -- INTEGRITY: the new binary's SHA-256 matches its entry in a release
+//!   `SHA256SUMS` (the bytes are the published ones), but NOT publisher authenticity.
+//! - [`MinisignVerifier`] (#386) -- INTEGRITY *and* AUTHENTICITY: it composes `Sha256Verifier` AND
+//!   verifies a detached MINISIGN signature over `SHA256SUMS` (`<sums>.minisig`) against a pinned
+//!   Ed25519 key. #386 (ADR-0020 amendment 2026-06-29) finalized the anchor as minisign; the crypto
+//!   lives in [`super::minisign`] and is validated against real rsign2/minisign output. `run()`
+//!   SELECTS `MinisignVerifier` the instant [`PINNED_UPGRADE_PUBLIC_KEY`] is set (the release workflow
+//!   is already wired to sign `SHA256SUMS`); until then it falls back to `Sha256Verifier`.
 //!
-//! SHA-256 is computed with the workspace's hand-rolled FIPS 180-4 implementation
-//! ([`ironcache_config::sha256_hex`], already used for AUTH-at-rest) -- NO new crypto crate, keeping
-//! the musl + cargo-deny posture (ADR-0017, the same rationale that crate documents).
+//! SHA-256 is the workspace's hand-rolled FIPS 180-4 impl ([`ironcache_config::sha256_hex`]); Ed25519
+//! is `ring` (already linked as the TLS provider, so no new crate); Blake2b-512 + base64 are the small
+//! hand-rolled pieces in [`super::minisign`] (validated against RFC KATs). No new crypto crate enters
+//! the graph, keeping the musl + cargo-deny posture (ADR-0017).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::minisign::{self, MinisignError, MinisignPublicKey};
 use super::proc::run_bounded;
 
 /// The bound on `<binary> --version`: it runs the UNTRUSTED new binary, so a hung child must not
@@ -75,6 +80,19 @@ pub enum VerifyError {
         /// Why the version probe failed.
         detail: String,
     },
+    /// The detached minisign signature over `SHA256SUMS` could not be read (the `<sums>.minisig` file
+    /// is missing/unreadable), so authenticity could not be checked (#386).
+    #[error("reading the minisign signature {path}: {detail}")]
+    ReadSignature {
+        /// The `.minisig` path.
+        path: String,
+        /// The IO error.
+        detail: String,
+    },
+    /// The pinned minisign public key or the signature did not verify: the `SHA256SUMS` is not
+    /// authentic (not signed by the pinned key) (#386).
+    #[error("minisign authenticity check failed: {0}")]
+    Signature(#[from] MinisignError),
 }
 
 /// The verify seam (#386 lands minisign/sigstore behind this exact signature). An implementation
@@ -90,15 +108,9 @@ pub trait Verifier {
     fn verify(&self, binary: &Path, name: &str, sha256sums: &Path) -> Result<(), VerifyError>;
 }
 
-/// The v1 verifier: the binary's SHA-256 must equal its `SHA256SUMS` entry. Integrity only;
-/// authenticity is #386.
-///
-/// TODO(#386): #386 finalized the anchor as MINISIGN (ADR-0020 amendment 2026-06-29). A
-/// `MinisignVerifier` implementing [`Verifier`] verifies a detached minisign signature over the
-/// binary (or over `SHA256SUMS`) against an in-repo/in-docs Ed25519 public key (offline, no PKI),
-/// per docs/design/UPGRADE.md "Verify before swap". It composes with this one (verify the sums entry
-/// AND the signature); the orchestrator is unchanged because it only names the trait. The remaining
-/// blockers are operational (release-side per-binary minisign signing + a committed pubkey).
+/// The INTEGRITY verifier: the binary's SHA-256 must equal its `SHA256SUMS` entry. Integrity only
+/// (the bytes are the published ones); AUTHENTICITY (the publisher is trusted) is [`MinisignVerifier`],
+/// which COMPOSES this one -- #386 is now implemented (the crypto lives in [`super::minisign`]).
 pub struct Sha256Verifier;
 
 impl Verifier for Sha256Verifier {
@@ -119,6 +131,66 @@ impl Verifier for Sha256Verifier {
             })
         }
     }
+}
+
+/// The pinned minisign public key the upgrade authenticates releases against (#386, ADR-0020: "the
+/// public key ships in the repo"). `None` until the maintainer commits the production key here + the
+/// release workflow's `MINISIGN_SECRET_KEY` is provisioned (release.yml is already wired to sign
+/// `SHA256SUMS` when the secret exists). While `None`, [`select_verifier`] falls back to the
+/// integrity-only [`Sha256Verifier`] (the current behavior); the instant a key is pinned, upgrades
+/// require a valid minisign signature with NO other code change.
+pub const PINNED_UPGRADE_PUBLIC_KEY: Option<&str> = None;
+
+/// The AUTHENTICITY verifier (#386): the binary's SHA-256 matches `SHA256SUMS` (integrity, via the
+/// composed [`Sha256Verifier`]) AND `SHA256SUMS` carries a valid detached minisign signature
+/// (`<sums>.minisig`) made by the pinned Ed25519 key (authenticity, via [`super::minisign`]). The
+/// release signs `SHA256SUMS`, whose entries pin every artifact's sha256, so this one signature
+/// authenticates the whole release offline with a single committed key (no PKI/network).
+pub struct MinisignVerifier {
+    pubkey: MinisignPublicKey,
+}
+
+impl MinisignVerifier {
+    /// Build a verifier that authenticates against the pinned minisign public key string (the `RW...`
+    /// line committed in the repo).
+    ///
+    /// # Errors
+    ///
+    /// [`VerifyError::Signature`] if `pubkey_b64` is not a well-formed minisign Ed25519 public key.
+    pub fn new(pubkey_b64: &str) -> Result<Self, VerifyError> {
+        Ok(MinisignVerifier {
+            pubkey: MinisignPublicKey::parse(pubkey_b64)?,
+        })
+    }
+}
+
+impl Verifier for MinisignVerifier {
+    fn verify(&self, binary: &Path, name: &str, sha256sums: &Path) -> Result<(), VerifyError> {
+        // 1. INTEGRITY: the binary is the artifact `SHA256SUMS` vouches for.
+        Sha256Verifier.verify(binary, name, sha256sums)?;
+        // 2. AUTHENTICITY: `SHA256SUMS` itself is signed by the pinned key. minisign's detached
+        //    signature convention is `<file>.minisig` alongside the file.
+        let sig_path = minisig_path(sha256sums);
+        let sig_file =
+            std::fs::read_to_string(&sig_path).map_err(|e| VerifyError::ReadSignature {
+                path: sig_path.display().to_string(),
+                detail: e.to_string(),
+            })?;
+        let sums_bytes = std::fs::read(sha256sums).map_err(|source| VerifyError::ReadSums {
+            path: sha256sums.display().to_string(),
+            source,
+        })?;
+        minisign::verify(&sums_bytes, &sig_file, &self.pubkey)?;
+        Ok(())
+    }
+}
+
+/// The detached-signature path for `file`: minisign appends `.minisig` to the WHOLE file name
+/// (`SHA256SUMS` -> `SHA256SUMS.minisig`), so append rather than replace-extension.
+fn minisig_path(file: &Path) -> PathBuf {
+    let mut s = file.as_os_str().to_owned();
+    s.push(".minisig");
+    PathBuf::from(s)
 }
 
 /// Parse a `SHA256SUMS` file and return the hex digest listed for `name`, or a typed error. The
@@ -354,5 +426,89 @@ mod tests {
         let err =
             probe_binary_version(&not_exec).expect_err("a non-executable cannot report a version");
         assert!(matches!(err, VerifyError::VersionProbe { .. }), "{err:?}");
+    }
+
+    // ---- MinisignVerifier end-to-end (#386), against a REAL rsign2 0.6.6 vector. ----
+
+    /// A genuine rsign2 keypair + a real detached signature over a VALID coreutils `SHA256SUMS`
+    /// listing the sha256 of `REAL_BIN_CONTENT`. `rsign verify` accepts these bytes, so a
+    /// `MinisignVerifier` pass proves the full integrity + authenticity chain against real minisign.
+    const MV_PUBKEY: &str = "RWREdimvfA8cGa5MTkLinjCO6dktAfbzHcG7vGO4cCDAtilnBR+mUBvY";
+    const MV_BIN_CONTENT: &[u8] = b"test-binary-content-v1";
+    const MV_SUMS: &str =
+        "c6d825d6d463eeed24c9e4845d9a0ac14fa88e0f51134e18877966887d44dec0  ironcache\n";
+    const MV_MINISIG: &str = "untrusted comment: signature from rsign secret key\n\
+        RUREdimvfA8cGfjxfSkBmLo+I8PwenC65B6S5KwG4eoW7LK2wZvgGKvO1cPGXdZk65qDNQsWlEZA2Qi2k19szGZyTNqwK/XwkQ4=\n\
+        trusted comment: release 1.0.0\n\
+        GpjFwyBwM/Y2eADDfYzKnmxpMUDVnyRmi+qL07zxgI8D5miZPIdl5qfPhoQxsU0XoHHkDbLysSlfClM//FEQBQ==\n";
+
+    /// Stage `<dir>/ironcache`, `<dir>/SHA256SUMS`, `<dir>/SHA256SUMS.minisig` from the real vector.
+    fn stage_minisign_release(dir: &Path, sums: &str, minisig: &str) -> (PathBuf, PathBuf) {
+        std::fs::write(dir.join("ironcache"), MV_BIN_CONTENT).unwrap();
+        let sums_path = dir.join("SHA256SUMS");
+        std::fs::write(&sums_path, sums).unwrap();
+        std::fs::write(dir.join("SHA256SUMS.minisig"), minisig).unwrap();
+        (dir.join("ironcache"), sums_path)
+    }
+
+    #[test]
+    fn minisign_verifier_accepts_a_genuine_signed_release() {
+        let dir = temp_dir("mv-ok");
+        let (bin, sums) = stage_minisign_release(&dir, MV_SUMS, MV_MINISIG);
+        MinisignVerifier::new(MV_PUBKEY)
+            .unwrap()
+            .verify(&bin, "ironcache", &sums)
+            .expect("a genuine minisign-signed release verifies (integrity + authenticity)");
+    }
+
+    #[test]
+    fn minisign_verifier_rejects_a_tampered_binary() {
+        let dir = temp_dir("mv-badbin");
+        let (bin, sums) = stage_minisign_release(&dir, MV_SUMS, MV_MINISIG);
+        std::fs::write(&bin, b"tampered-binary").unwrap(); // sha256 no longer matches SHA256SUMS
+        let err = MinisignVerifier::new(MV_PUBKEY)
+            .unwrap()
+            .verify(&bin, "ironcache", &sums)
+            .expect_err("a tampered binary fails the integrity check");
+        assert!(matches!(err, VerifyError::Mismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn minisign_verifier_rejects_an_unsigned_alteration_to_sha256sums() {
+        // Alter the SHA256SUMS bytes in a way that keeps INTEGRITY passing (double space -> single
+        // space; `lookup_sum` still finds the same digest for `ironcache`) so the SIGNATURE layer is
+        // what rejects it -- proving authenticity is actually enforced, not just integrity.
+        let dir = temp_dir("mv-badsums");
+        std::fs::write(dir.join("ironcache"), MV_BIN_CONTENT).unwrap();
+        let sums = dir.join("SHA256SUMS");
+        std::fs::write(&sums, MV_SUMS.replacen("  ironcache", " ironcache", 1)).unwrap();
+        std::fs::write(dir.join("SHA256SUMS.minisig"), MV_MINISIG).unwrap();
+        let err = MinisignVerifier::new(MV_PUBKEY)
+            .unwrap()
+            .verify(&dir.join("ironcache"), "ironcache", &sums)
+            .expect_err("SHA256SUMS bytes that differ from what was signed must fail authenticity");
+        assert!(matches!(err, VerifyError::Signature(_)), "{err:?}");
+    }
+
+    #[test]
+    fn minisign_verifier_rejects_a_missing_signature() {
+        let dir = temp_dir("mv-nosig");
+        std::fs::write(dir.join("ironcache"), MV_BIN_CONTENT).unwrap();
+        let sums = dir.join("SHA256SUMS");
+        std::fs::write(&sums, MV_SUMS).unwrap();
+        // No SHA256SUMS.minisig written.
+        let err = MinisignVerifier::new(MV_PUBKEY)
+            .unwrap()
+            .verify(&dir.join("ironcache"), "ironcache", &sums)
+            .expect_err("a missing signature cannot be authenticated");
+        assert!(matches!(err, VerifyError::ReadSignature { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn minisign_verifier_new_rejects_a_malformed_pinned_key() {
+        assert!(matches!(
+            MinisignVerifier::new("not-a-valid-key"),
+            Err(VerifyError::Signature(_))
+        ));
     }
 }

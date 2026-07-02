@@ -34,6 +34,7 @@
 
 pub mod fetch;
 pub mod health;
+pub mod minisign;
 pub mod pause;
 pub mod proc;
 pub mod save;
@@ -51,7 +52,7 @@ use save::{LoopbackSaver, SaveError, SaveTarget, Saver};
 use service::{ServiceManager, SystemdManager};
 use source::{BinarySource, LocalFile};
 use swap::SwapError;
-use verify::{Sha256Verifier, Verifier, VerifyError};
+use verify::{MinisignVerifier, Sha256Verifier, Verifier, VerifyError};
 
 /// The default live binary path the swap targets when neither `--target` nor a unit `ExecStart`
 /// override is given (matches `packaging/ironcache.service`'s `ExecStart`).
@@ -280,9 +281,26 @@ pub struct UpgradeOutcome {
 ///
 /// Returns an [`UpgradeError`] on any stage failure; the caller maps it to a nonzero exit.
 pub fn run(args: &UpgradeArgs) -> Result<UpgradeOutcome, UpgradeError> {
+    // Select the verifier by the pinned minisign anchor (#386): if a public key is committed
+    // ([`verify::PINNED_UPGRADE_PUBLIC_KEY`]), upgrades REQUIRE a valid minisign signature over
+    // `SHA256SUMS` (authenticity); otherwise the integrity-only `Sha256Verifier` (the current default,
+    // until the key is committed + the release workflow signs). Both go through the SAME orchestrator.
+    match verify::PINNED_UPGRADE_PUBLIC_KEY {
+        Some(pubkey) => run_with_verifier(args, MinisignVerifier::new(pubkey)?),
+        None => run_with_verifier(args, Sha256Verifier),
+    }
+}
+
+/// Build the production dependency set with the chosen `verifier` and drive the orchestrator. The
+/// verifier is the only production dependency that varies (by the pinned minisign anchor, #386); the
+/// rest are the fixed loopback/systemd implementations.
+fn run_with_verifier<V: Verifier>(
+    args: &UpgradeArgs,
+    verifier: V,
+) -> Result<UpgradeOutcome, UpgradeError> {
     let deps = UpgradeDeps {
         source: LocalFile::new(args.binary.clone()),
-        verifier: Sha256Verifier,
+        verifier,
         service: SystemdManager,
         probe: LoopbackProbe,
         saver: LoopbackSaver,
