@@ -21,6 +21,16 @@
 //! decisions"): the slab is a FIXED budget, not grown on demand, so when the group is DRAINED the
 //! shard must DEFER re-arming recv rather than allocate. [`BufferPool::can_rearm`] encodes exactly
 //! that bounded-memory guarantee (never re-arm with zero free buffers).
+//!
+//! The `free -> outstanding -> free` ledger covers BOTH io_uring tiers, though the direction reads
+//! differently: for the ONE-SHOT fixed-buffer fallback (kernel 5.6+, doc "chosen by startup probe")
+//! userspace PICKS the buffer index per read, which is literally [`BufferPool::acquire`]; for the
+//! MULTISHOT provided-buffer ring (kernel 6.0+) the KERNEL picks a buffer and reports its id on the
+//! completion, so there `acquire` models "reserve the next buffer to hand the ring" and the id the
+//! kernel reports is the one that becomes outstanding until [`BufferPool::release`] replenishes it.
+//! Either way the invariant is identical -- a buffer is outstanding from the moment it is given to
+//! the kernel until it is returned, and is never given out twice meanwhile -- which is what this
+//! ledger enforces.
 
 /// A buffer's id within its group: `0..count`. Doubles as the kernel buffer-group buffer id and the
 /// index for the slab-offset arithmetic.
@@ -88,8 +98,9 @@ impl BufferPool {
         self.in_use.len() * self.buf_size
     }
 
-    /// The byte OFFSET of buffer `id` within the slab (`id * buf_size`). The buffer occupies
-    /// `offset(id) .. offset(id) + buf_size`, always within `0..slab_len()`.
+    /// The byte OFFSET of buffer `id` within the slab (`id * buf_size`). For a VALID id (every id
+    /// handed out by [`Self::acquire`] is `< count`), the buffer occupies
+    /// `offset(id) .. offset(id) + buf_size`, within `0..slab_len()`.
     #[must_use]
     pub fn offset(&self, id: BufId) -> usize {
         id.0 as usize * self.buf_size
@@ -221,12 +232,18 @@ mod tests {
     }
 
     #[test]
-    fn matches_a_hashset_oracle_over_a_deterministic_op_stream() {
-        // A deterministic LCG drives an acquire/release stream; the pool's outstanding set must match
-        // a HashSet oracle at every step, and every live id must be distinct + in range (no aliasing).
+    fn matches_an_oracle_over_a_deterministic_fill_and_drain_stream() {
+        // A deterministic LCG drives an acquire/release stream; the pool's free/outstanding state
+        // must match an independent oracle at every step, with every live id distinct + in range (no
+        // aliasing). Crucially the stream must actually FILL the pool to exhaustion and DRAIN it back
+        // to empty -- asserted at the end -- so the exhaustion + deep-free-stack paths are genuinely
+        // exercised (a naive coin flip on the LCG's low bit strictly ALTERNATES, because bit 0 of an
+        // odd-multiplier/odd-increment LCG has period 2, and would never move outstanding past 1).
         const COUNT: u16 = 16;
         let mut pool = BufferPool::new(COUNT, 1024);
-        let mut outstanding: HashSet<BufId> = HashSet::new();
+        // The oracle is an ordered list of outstanding ids (deterministic, unlike a HashSet's random
+        // iteration order), so the released id is a reproducible function of the LCG.
+        let mut outstanding: Vec<BufId> = Vec::new();
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
             state = state
@@ -234,27 +251,44 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             state
         };
+        let mut reached_full = false;
+        let mut reached_empty = false;
         for _ in 0..50_000 {
-            // Bias slightly toward acquire when there is room, else release, so both paths run.
-            let want_acquire = next() % 2 == 0;
+            // Use a HIGH bit (bit 41) for the coin flip -- a long period, so the outstanding count
+            // random-walks across the whole [0, COUNT] range rather than alternating.
+            let want_acquire = (next() >> 41) & 1 == 0;
             if want_acquire {
-                match pool.acquire() {
-                    Some(id) => {
-                        assert!(id.0 < COUNT);
-                        assert!(
-                            outstanding.insert(id),
-                            "acquired an already-outstanding id (aliasing!)"
-                        );
-                    }
-                    None => assert_eq!(outstanding.len(), COUNT as usize, "None only when full"),
+                if let Some(id) = pool.acquire() {
+                    assert!(id.0 < COUNT);
+                    assert!(
+                        !outstanding.contains(&id),
+                        "acquired an already-outstanding id (aliasing!)"
+                    );
+                    outstanding.push(id);
+                } else {
+                    reached_full = true;
+                    assert_eq!(outstanding.len(), COUNT as usize, "None only when full");
                 }
-            } else if let Some(&id) = outstanding.iter().next() {
+            } else if outstanding.is_empty() {
+                reached_empty = true;
+            } else {
+                // Release a deterministically-chosen outstanding buffer (varied order via the LCG,
+                // not just LIFO), so the free stack is exercised at many depths.
+                let idx = (next() as usize) % outstanding.len();
+                let id = outstanding.swap_remove(idx);
                 assert!(pool.release(id), "releasing an outstanding id must succeed");
-                outstanding.remove(&id);
             }
             // The pool's free count is always the complement of the oracle's outstanding set.
             assert_eq!(pool.free_count(), COUNT as usize - outstanding.len());
             assert_eq!(pool.can_rearm(), outstanding.len() < COUNT as usize);
         }
+        assert!(
+            reached_full,
+            "the stream must drive the pool to exhaustion (acquire -> None)"
+        );
+        assert!(
+            reached_empty,
+            "the stream must also fully drain the pool back to empty"
+        );
     }
 }
