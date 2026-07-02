@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The IronCache CONSOLE as TWO stateless replicas behind an nginx load balancer
+# (epic #352, issue #363). This is an OVERLAY: run it alongside a cache (the
+# single-node docker-compose.yml or the 3-node docker-compose.cluster.yml), e.g.
+#
+#   docker compose \
+#     -f docker-compose.cluster.yml \
+#     -f docker-compose.console.yml up -d
+#   curl localhost:9180/readyz          # served by whichever replica the LB picks
+#
+# The two replicas are IDENTICAL and stateless (Bearer-header auth, per-replica
+# derived topology, per-replica readiness), so the LB can route any request to
+# either and transparently drop a dead one. History is kept consistent by pointing
+# every replica at ONE shared Prometheus (IRONCACHE_CONSOLE_PROMETHEUS_URL); leave
+# it unset only for a single replica. Set IRONCACHE_CONSOLE_SEEDS to the cache
+# node(s) and IRONCACHE_CONSOLE_READ_TOKEN to gate the privileged API.
+#
+# Note: the console image is distroless (no shell/curl), so there is no per-container
+# HTTP healthcheck; the nginx LB is the HTTP health surface (it proxies /readyz).
+
+name: ironcache-console
+
+# The common console replica config (both replicas are identical).
+x-console: &console
+  image: ghcr.io/elares/ironcache-console:latest
+  command: [run]
+  environment:
+    IRONCACHE_CONSOLE_HTTP_ADDR: 0.0.0.0:9180
+    # Point at the cache node(s). Defaults to the single-node compose service name.
+    IRONCACHE_CONSOLE_SEEDS: ${IRONCACHE_CONSOLE_SEEDS:-ironcache:6379}
+    # A SHARED Prometheus keeps history consistent across the two replicas.
+    IRONCACHE_CONSOLE_PROMETHEUS_URL: ${IRONCACHE_CONSOLE_PROMETHEUS_URL:-}
+    # Dial nodes as the least-privilege user (deploy/aclfile.console.example).
+    IRONCACHE_CONSOLE_NODE_USER: ${IRONCACHE_CONSOLE_NODE_USER:-console_monitor}
+    IRONCACHE_CONSOLE_NODE_PASSWORD_FILE: ${IRONCACHE_CONSOLE_NODE_PASSWORD_FILE:-}
+    # Set a read token so the privileged API is not open behind the LB.
+    IRONCACHE_CONSOLE_READ_TOKEN: ${IRONCACHE_CONSOLE_READ_TOKEN:-}
+  restart: unless-stopped
+
+services:
+  console-1:
+    <<: *console
+  console-2:
+    <<: *console
+  console-lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "9180:9180"
+    volumes:
+      - ./config/console-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - console-1
+      - console-2
+    restart: unless-stopped

@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Raw Kubernetes manifests for the IronCache CONSOLE (epic #352, issue #363) -- the
+# Helm-free path (mirrors deploy/helm/ironcache's console templates). Apply AFTER
+# the cache (ironcache.yaml) is up:
+#
+#   kubectl -n ironcache apply -f ironcache-console.yaml
+#
+# The console is a SEPARATE, STATELESS Deployment (no PVC, no per-pod identity, no
+# headless Service): N identical replicas behind a ClusterIP Service, so any
+# replica serves any request. Front the Service with a VPN-locked Ingress/LB (#369)
+# for operator access.
+#
+# BEFORE applying in production:
+#   1. Set real console tokens + the node password in the Secret below (PLACEHOLDERS
+#      here -- replace them or create the Secret out-of-band).
+#   2. Pin the image to an immutable tag (not :latest).
+#   3. Set IRONCACHE_CONSOLE_PROMETHEUS_URL to a SHARED Prometheus so every replica
+#      shows the same history (otherwise each replica keeps its own embedded window).
+#   4. Load deploy/aclfile.console.example on the nodes so console_monitor exists.
+#
+# Port 9180 serves everything: /livez + /readyz (the LB health checks) + /metrics +
+# the UI + /api/*.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ironcache-console-secret
+  namespace: ironcache
+  labels:
+    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/component: console
+type: Opaque
+stringData:
+  # REPLACE these placeholders (or create the Secret out-of-band). console_node_password
+  # is the password for the least-privilege console_monitor ACL user (deploy/aclfile.console.example);
+  # the tokens gate the console's own /api/* RBAC (setting one enables ENFORCE mode).
+  console_node_password: "CHANGE_ME_console_node_password"
+  console_read_token: "CHANGE_ME_console_read_token"
+  console_admin_token: "CHANGE_ME_console_admin_token"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ironcache-console
+  namespace: ironcache
+  labels:
+    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/component: console
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ironcache
+      app.kubernetes.io/component: console
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ironcache
+        app.kubernetes.io/component: console
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ironcache
+                    app.kubernetes.io/component: console
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: console
+          image: ghcr.io/elares/ironcache-console:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - run
+          env:
+            - name: IRONCACHE_CONSOLE_HTTP_ADDR
+              value: "0.0.0.0:9180"
+            - name: IRONCACHE_CONSOLE_LOG_LEVEL
+              value: "info"
+            # Poll the cache client Service (adjust the namespace if not `ironcache`).
+            - name: IRONCACHE_CONSOLE_SEEDS
+              value: "ironcache.ironcache.svc.cluster.local:6379"
+            # A SHARED Prometheus keeps history consistent across replicas. Set this.
+            - name: IRONCACHE_CONSOLE_PROMETHEUS_URL
+              value: ""
+            - name: IRONCACHE_CONSOLE_NODE_USER
+              value: "console_monitor"
+            - name: IRONCACHE_CONSOLE_NODE_PASSWORD_FILE
+              value: "/run/console/node-password"
+            - name: IRONCACHE_CONSOLE_READ_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ironcache-console-secret
+                  key: console_read_token
+                  optional: true
+            - name: IRONCACHE_CONSOLE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ironcache-console-secret
+                  key: console_admin_token
+                  optional: true
+          ports:
+            - name: http
+              containerPort: 9180
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+          volumeMounts:
+            - name: node-password
+              mountPath: /run/console
+              readOnly: true
+      volumes:
+        - name: node-password
+          secret:
+            secretName: ironcache-console-secret
+            items:
+              - key: console_node_password
+                path: node-password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ironcache-console
+  namespace: ironcache
+  labels:
+    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/component: console
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/component: console
+  ports:
+    - name: http
+      port: 9180
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ironcache-console
+  namespace: ironcache
+  labels:
+    app.kubernetes.io/name: ironcache
+    app.kubernetes.io/component: console
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ironcache
+      app.kubernetes.io/component: console

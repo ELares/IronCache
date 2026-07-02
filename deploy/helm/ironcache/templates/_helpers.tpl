@@ -45,3 +45,28 @@ Usage: include "ironcache.nodeId" (dict "ctx" . "ordinal" 0)
 {{- $seed := printf "%s-%d" (include "ironcache.fullname" .ctx) (int .ordinal) -}}
 {{- substr 0 40 (sha256sum $seed) -}}
 {{- end -}}
+
+{{/* The console workload / Service base name (a distinct resource from the StatefulSet). */}}
+{{- define "ironcache.console.fullname" -}}
+{{- printf "%s-console" (include "ironcache.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+Console labels: the common labels PLUS component=console, so the console
+Deployment/Service/PDB are labelled as one unit distinct from the cache nodes.
+*/}}
+{{- define "ironcache.console.labels" -}}
+{{ include "ironcache.labels" . }}
+app.kubernetes.io/component: console
+{{- end -}}
+
+{{/*
+Console selector labels: the common selector labels PLUS component=console, so the
+console Deployment's selector matches ONLY console pods and never the StatefulSet's
+(both share the name/instance labels). Version is deliberately omitted (stable
+across upgrades), matching ironcache.selectorLabels.
+*/}}
+{{- define "ironcache.console.selectorLabels" -}}
+{{ include "ironcache.selectorLabels" . }}
+app.kubernetes.io/component: console
+{{- end -}}
