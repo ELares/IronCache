@@ -114,6 +114,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate every compose file parses + resolves
+        env:
+          # The cluster compose uses a fail-fast required var (${IRONCACHE_CLUSTER_SECRET:?});
+          # deploy-lint only checks the file STRUCTURE, not real secrets, so a
+          # placeholder lets `config` interpolate. Add more here if a compose file
+          # introduces another required var.
+          IRONCACHE_CLUSTER_SECRET: deploy-lint-placeholder
         run: |
           set -euo pipefail
           for f in deploy/compose/docker-compose*.yml; do
