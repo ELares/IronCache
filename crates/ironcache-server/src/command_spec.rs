@@ -1389,6 +1389,27 @@ pub fn spec_of(cmd_upper: &[u8]) -> Option<&'static CommandSpec> {
             control: false,
             is_write: false,
         },
+        // DUMP key (#129): serialize a value to the Redis blob. Read-only, single-key.
+        b"DUMP" => &CommandSpec {
+            name: b"DUMP",
+            arity: Exact(2),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: false,
+            control: false,
+            is_write: false,
+        },
+        // RESTORE key ttl blob [REPLACE|ABSTTL|IDLETIME n|FREQ n] (#129): recreate a value from a
+        // DUMP blob. A single-key WRITE that allocates a value (denyoom); arity Min(4).
+        b"RESTORE" => &CommandSpec {
+            name: b"RESTORE",
+            arity: Min(4),
+            class: KeyedSingle,
+            key_spec: Arg1,
+            denyoom: true,
+            control: false,
+            is_write: true,
+        },
         b"KEYS" => &CommandSpec {
             name: b"KEYS",
             arity: Exact(2),
@@ -3005,6 +3026,8 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     b"DEL",
     b"EXISTS",
     b"TYPE",
+    b"DUMP",
+    b"RESTORE",
     b"KEYS",
     b"SCAN",
     b"DBSIZE",
@@ -3445,6 +3468,7 @@ pub(crate) mod tests {
             b"DECRBY",
             b"DEL",
             b"DELIFEQ",
+            b"DUMP",
             b"EXISTS",
             b"EXPIRE",
             b"EXPIREAT",
@@ -3517,6 +3541,7 @@ pub(crate) mod tests {
             b"PTTL",
             b"RENAME",
             b"RENAMENX",
+            b"RESTORE",
             b"RPOP",
             b"RPOPLPUSH",
             b"RPUSH",

@@ -422,6 +422,8 @@ fn is_keyspace(cmd: &[u8]) -> bool {
             | b"UNLINK"
             | b"EXISTS"
             | b"TYPE"
+            | b"DUMP"
+            | b"RESTORE"
             | b"KEYS"
             | b"SCAN"
             | b"DBSIZE"

@@ -164,6 +164,17 @@ release.
 
 ### Added
 
+- `DUMP` / `RESTORE` (issue #129, KEYSPACE.md): the Redis/Valkey-compatible value serialization blob.
+  `DUMP key` emits an opaque byte string (`<type><rdb-encoded-value> || rdb_version[2] || crc64[8]`);
+  `RESTORE key ttl blob [REPLACE|ABSTTL|IDLETIME n|FREQ n]` recreates the value from one. The blob
+  INTEROPERATES with a real `redis-server` (the differential oracle, #97) both directions: a blob
+  IronCache emits, redis RESTOREs to the same value, and vice versa. The checksum is CRC-64/Jones (the
+  Redis polynomial), validated against its published check value; RESTORE decodes the raw, integer
+  (`INT8`/`INT16`/`INT32`), and LZF-compressed string encodings redis can emit, and rejects a too-new
+  version or a bad checksum fail-closed (byte-exact `BUSYKEY` / `DUMP payload ...` errors). Scope is the
+  STRING type; because a HyperLogLog is stored AS a string, this gives HLL DUMP/RESTORE byte-interop for
+  free (issue #242 part 2: an HLL DUMPed here RESTOREs + PFCOUNTs identically on redis, asserted by a new
+  cross-server round trip in the differential test). Other value types are a tracked follow-up.
 - `ironcache upgrade --to <version|latest>` (issue #394, completes it): the "easy upgrade" UX over the
   #394 fetch core. `--to 2026.0701.1` (or `--to latest`) resolves THIS host's release asset from GitHub
   (`--repo` overrides the default `ELares/IronCache`), then downloads / verifies / extracts / installs

@@ -710,6 +710,112 @@ fn corpus() -> Vec<Step> {
 }
 
 // ===========================================================================
+// DUMP / RESTORE cross-server interop (#129; #242 part 2 for the HLL case).
+// ===========================================================================
+
+/// Extract the bytes of a bulk-string reply, or `None` (a nil/error/other reply).
+fn bulk_bytes(r: &Resp) -> Option<Vec<u8>> {
+    match r {
+        Resp::Bulk(Some(b)) => Some(b.clone()),
+        _ => None,
+    }
+}
+
+/// Prove the DUMP serialization blob interoperates in BOTH directions: `SET`/`PFADD` a value on the
+/// SOURCE server, `DUMP` it, `RESTORE` the blob on the DESTINATION server, and read it back -- it must
+/// equal the source value. Runs for plain / integer-looking (redis int-encodes) / binary / long
+/// (redis LZF-compresses) strings, and for a HyperLogLog (a string type: this closes #242 part 2 --
+/// an HLL DUMPed on one server RESTOREs + PFCOUNTs identically on the other). Returns the number of
+/// comparisons made; a mismatch is pushed onto `div` (failing the test via the shared assertion).
+fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Divergence>) -> usize {
+    let mut compared = 0usize;
+
+    // ---- STRING values (GET must round-trip both directions). ----
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("plain", b"a short readable value".to_vec()),
+        ("int", b"12345".to_vec()), // redis int-encodes this on DUMP; IronCache must decode it
+        ("bin", vec![0u8, 159, 146, 150, 0, 7, 255]), // non-utf8 bytes
+        ("long", vec![b'a'; 400]),  // > 20 bytes + compressible: redis LZF-encodes; must decompress
+    ];
+    // (label, source client, dest client)
+    for (tag, val) in &cases {
+        for dir in ["r2i", "i2r"] {
+            let (src, dst): (&mut Client, &mut Client) = if dir == "r2i" {
+                (rds, iron)
+            } else {
+                (iron, rds)
+            };
+            let src_key = format!("dr:{tag}:{dir}:src").into_bytes();
+            let dst_key = format!("dr:{tag}:{dir}:dst").into_bytes();
+            src.cmd(&[b"SET", &src_key, val]);
+            let Some(blob) = bulk_bytes(&src.cmd(&[b"DUMP", &src_key])) else {
+                div.push(Divergence {
+                    cmd: format!("DUMP dr:{tag} ({dir})"),
+                    iron: Resp::Null,
+                    redis: Resp::Null,
+                    note: "DUMP did not return a bulk blob".to_owned(),
+                });
+                continue;
+            };
+            let restore = dst.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+            let got = dst.cmd(&[b"GET", &dst_key]);
+            compared += 1;
+            let want = Resp::Bulk(Some(val.clone()));
+            if got != want {
+                div.push(Divergence {
+                    cmd: format!(
+                        "DUMP/RESTORE round-trip dr:{tag} ({dir}); RESTORE said {restore:?}"
+                    ),
+                    iron: got,
+                    redis: want,
+                    note:
+                        "a blob one server emitted did not RESTORE to the same value on the other"
+                            .to_owned(),
+                });
+            }
+        }
+    }
+
+    // ---- HyperLogLog (#242 part 2): a HLL is a string type, so DUMP/RESTORE moves its bytes; the
+    // restored HLL must PFCOUNT identically to the source's. Both servers use the same MurmurHash64A
+    // + estimator, so for a fixed small element set the counts are exactly equal. ----
+    for dir in ["r2i", "i2r"] {
+        let (src, dst): (&mut Client, &mut Client) = if dir == "r2i" {
+            (rds, iron)
+        } else {
+            (iron, rds)
+        };
+        let src_key = format!("dr:hll:{dir}:src").into_bytes();
+        let dst_key = format!("dr:hll:{dir}:dst").into_bytes();
+        src.cmd(&[b"PFADD", &src_key, b"a", b"b", b"c", b"d", b"e", b"f", b"g"]);
+        let src_count = src.cmd(&[b"PFCOUNT", &src_key]);
+        let Some(blob) = bulk_bytes(&src.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP hll ({dir})"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "HLL DUMP did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        dst.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let dst_count = dst.cmd(&[b"PFCOUNT", &dst_key]);
+        compared += 1;
+        if dst_count != src_count {
+            div.push(Divergence {
+                cmd: format!("HLL DUMP/RESTORE + PFCOUNT ({dir})"),
+                iron: dst_count,
+                redis: src_count,
+                note: "a HLL DUMPed on one server did not PFCOUNT identically after RESTORE on the other (#242 part 2)"
+                    .to_owned(),
+            });
+        }
+    }
+
+    compared
+}
+
+// ===========================================================================
 // The single differential test. Boots both servers, replays the corpus, compares
 // every reply, prints the divergence report, and asserts zero policy-violating
 // divergences (so the allowlist is what keeps it green).
@@ -759,6 +865,12 @@ fn differential_corpus_against_real_redis() {
         compared += 1;
         compare(&args, &iron_reply, &redis_reply, step.cmp, &mut divergences);
     }
+
+    // DUMP/RESTORE cross-server INTEROP (#129, #242 part 2): the corpus loop can only send the SAME
+    // command to both, but the serialization blob's whole point is that a blob one server emits, the
+    // OTHER accepts. So we do explicit cross-server round trips here, feeding any divergence into the
+    // same report.
+    compared += dump_restore_interop(&mut iron, &mut rds, &mut divergences);
 
     // Always print the run summary, so a developer sees the coverage + any divergences.
     eprintln!(

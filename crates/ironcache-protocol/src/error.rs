@@ -1014,6 +1014,37 @@ impl ErrorReply {
         )
     }
 
+    /// `BUSYKEY Target key name already exists.` - the byte-exact Redis reply for a
+    /// `RESTORE` onto an existing key without `REPLACE` (src/cluster.c `restoreCommand`).
+    /// The code token is `BUSYKEY`; the trailing period is part of the canonical string.
+    #[must_use]
+    pub fn busykey_target_exists() -> Self {
+        ErrorReply::new(ErrorCode::BusyKey, "Target key name already exists.")
+    }
+
+    /// `ERR DUMP payload version or checksum are wrong` - the byte-exact Redis reply for a
+    /// `RESTORE` whose serialized payload fails the footer check (an RDB version newer than
+    /// the server supports, or a CRC64 mismatch; src/cluster.c `verifyDumpPayload`).
+    #[must_use]
+    pub fn restore_bad_payload() -> Self {
+        ErrorReply::new(ErrorCode::Err, "DUMP payload version or checksum are wrong")
+    }
+
+    /// `ERR Bad data format` - the byte-exact Redis reply for a `RESTORE` whose payload
+    /// passed the footer check but could not be deserialized (src/cluster.c
+    /// `restoreCommand` on a failed `rdbLoadObject`).
+    #[must_use]
+    pub fn restore_bad_data() -> Self {
+        ErrorReply::new(ErrorCode::Err, "Bad data format")
+    }
+
+    /// `ERR Invalid TTL value, must be >= 0` - the byte-exact Redis reply for a `RESTORE`
+    /// with a negative TTL argument.
+    #[must_use]
+    pub fn restore_invalid_ttl() -> Self {
+        ErrorReply::new(ErrorCode::Err, "Invalid TTL value, must be >= 0")
+    }
+
     /// `OOM command not allowed when used memory > 'maxmemory'.` - the byte-exact
     /// Redis reply for a `denyoom` write rejected at the memory ceiling (ADMISSION.md
     /// OOM-write contract, ADR-0007). Emitted in cache mode when eviction cannot free

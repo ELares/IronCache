@@ -226,6 +226,8 @@ pub(crate) mod tests {
             b"DEL",
             b"EXISTS",
             b"TYPE",
+            b"DUMP",
+            b"RESTORE",
             b"KEYS",
             b"SCAN",
             b"DBSIZE",
@@ -565,8 +567,9 @@ pub(crate) mod tests {
     fn dispatch_arm_list_has_the_expected_count() {
         assert_eq!(
             dispatch_arm_names().len(),
-            196,
-            "the dispatch-arm hand-list drifted from the 184 client commands (incl. PFDEBUG, \
+            198,
+            "the dispatch-arm hand-list drifted from the 186 client commands (incl. DUMP/RESTORE, \
+             #129 serialization, + PFDEBUG, \
              #242 part 3 HLL introspection, + LOLWUT, \
              #414 command-surface completeness, + the 12 hash-field-TTL commands HEXPIRE/\
              HPEXPIRE/HEXPIREAT/HPEXPIREAT/HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME/HPERSIST + the \

@@ -12,7 +12,7 @@
 use crate::admission::is_denyoom;
 use crate::conn::ConnState;
 use crate::{
-    cmd_bitmap, cmd_cluster, cmd_config, cmd_expire, cmd_hash, cmd_hll, cmd_introspect,
+    cmd_bitmap, cmd_cluster, cmd_config, cmd_dump, cmd_expire, cmd_hash, cmd_hll, cmd_introspect,
     cmd_keyspace, cmd_list, cmd_set, cmd_sort, cmd_string, cmd_txn, cmd_zset, command_spec,
 };
 use ironcache_config::{ClusterMode, Config, RuntimeConfig};
@@ -1323,6 +1323,9 @@ fn dispatch_keyed_data<E: Env, S: Store + Admit + ActiveExpiry + Keyspace>(
         b"DEL" => cmd_keyspace::cmd_del(store, db, now, req),
         b"EXISTS" => cmd_keyspace::cmd_exists(store, db, now, req),
         b"TYPE" => cmd_keyspace::cmd_type(store, db, now, req),
+        // -- DUMP / RESTORE (#129): the Redis-compatible serialization blob (string type). --
+        b"DUMP" => cmd_dump::cmd_dump(store, db, now, req),
+        b"RESTORE" => cmd_dump::cmd_restore(store, db, now, req),
         // -- TTL / EXPIRE family (PR-3b) over the frozen waist. TTL-setting commands
         // also register their new deadline in the per-shard timing wheel. --
         b"EXPIRE" => cmd_expire::cmd_expire(store, wheel, db, now, req),
