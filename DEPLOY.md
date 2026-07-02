@@ -279,7 +279,10 @@ replicas behind a load balancer** (issue #363), separate from the data path:
 - **Readiness is per-replica.** The console's own `GET /livez` / `GET /readyz`
   (its HTTP listener) are the load balancer's health checks: `/readyz` returns
   `503` until that replica's first successful poll, so a cold replica is held out
-  of rotation and a lost replica is transparently routed around.
+  of rotation, and a replica whose process is DOWN fails the probe and is routed
+  around. (Readiness latches once ready, so a still-running replica that has only
+  lost backend connectivity keeps serving a degraded view rather than ejecting
+  itself; liveness/readiness gate startup + process health, not backend reachability.)
 - **History must be SHARED for consistency.** Point every replica at one shared
   Prometheus with `IRONCACHE_CONSOLE_PROMETHEUS_URL`. The alternative,
   `IRONCACHE_CONSOLE_HISTORY_EMBEDDED_HOURS`, keeps a PER-REPLICA in-memory trend
