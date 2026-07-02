@@ -164,6 +164,13 @@ release.
 
 ### Added
 
+- Console HA readiness (issue #363): a boot WARNING when the console runs embedded (per-replica,
+  in-memory) history on a non-loopback bind, since behind a load balancer each replica would then show
+  a different `/api/timeseries` window (the fix is a shared `prometheus_url`); the console is otherwise
+  already stateless (header-token auth, independently-polled topology, per-replica `/livez` + `/readyz`
+  probes) and safe to run as N replicas behind an LB. DEPLOY.md documents the stateless-behind-a-load-
+  balancer HA topology. The reference container image + Helm/k8s manifests are tracked follow-up
+  packaging work under #363.
 - Reference least-privilege console aclfile (issue #367): `deploy/aclfile.console.example` ships two
   scoped IronCache ACL users the console authenticates as when it dials nodes: `console_monitor`
   (read-only, exactly the poll loop's PING/INFO/CLIENT LIST, no key access, no mutation) and
