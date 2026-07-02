@@ -11,9 +11,11 @@
 //! The command inventory the two users must / must not have is taken from the console's actual RESP
 //! calls (`ironcache-console` src/node.rs poll path + src/manage.rs management path): the monitor
 //! issues PING / INFO / CLIENT LIST and touches no keys (SLOWLOG is omitted from the read-only user,
-//! since it has no per-subcommand grant and the whole command includes RESET); the admin issues
-//! CONFIG, CLUSTER, ACL, INFO, SAVE, key CRUD, CLIENT LIST, and SLOWLOG, but never the destructive
-//! verbs (FLUSHALL / SHUTDOWN / KEYS / DEBUG / ...).
+//! since it has no per-subcommand grant and the whole command includes RESET); the admin issues the
+//! CONFIG GET/SET, the five CLUSTER mutators, INFO, SAVE, key CRUD, CLIENT LIST, and SLOWLOG the
+//! console uses (granted per-subcommand where possible), but never the destructive verbs (FLUSHALL /
+//! SHUTDOWN / KEYS / DEBUG / the CLUSTER slot mutators) and never ACL (which would let it
+//! self-escalate).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -83,6 +85,9 @@ fn is_noperm(reply: &str) -> bool {
     reply.starts_with("-NOPERM")
 }
 
+// One cohesive over-the-wire scenario (boot with the shipped file, then the monitor + admin + anon
+// allow/deny matrices); splitting it would reboot the server three times for no clarity gain.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn reference_console_aclfile_loads_and_enforces_least_privilege() {
     let (r, local) = rt();
@@ -148,14 +153,17 @@ fn reference_console_aclfile_loads_and_enforces_least_privilege() {
             "+OK\r\n",
             "console_admin must authenticate with the committed password"
         );
-        // The management + data surface the console uses is ALLOWED.
+        // The management + data surface the console uses is ALLOWED. (An allowed command may still
+        // error for a NON-acl reason, e.g. CLUSTER FAILOVER on a non-cluster server; we assert only
+        // that the ACL verdict is not a denial, which is exactly the boundary under test.)
         for allowed in [
             vec!["INFO"],
             vec!["CONFIG", "GET", "maxmemory"],
             vec!["CONFIG", "SET", "maxmemory", "128mb"],
             vec!["CLIENT", "LIST"],
             vec!["SLOWLOG", "GET", "8"], // admin gets whole SLOWLOG (GET for the panel)
-            vec!["ACL", "WHOAMI"],
+            vec!["CLUSTER", "INFO"],     // a CLUSTER read: allowed via +@all -@dangerous
+            vec!["CLUSTER", "FAILOVER"], // a GRANTED CLUSTER mutator (+cluster|failover)
             vec!["SET", "console:probe", "1"], // ~* keyspace grant
             vec!["GET", "console:probe"],
             vec!["DEL", "console:probe"],
@@ -166,19 +174,30 @@ fn reference_console_aclfile_loads_and_enforces_least_privilege() {
                 "console_admin must be ALLOWED on {allowed:?}, got {reply:?}"
             );
         }
-        // The destructive tail of @dangerous stays DENIED (the least-privilege boundary).
+        // The destructive verbs stay DENIED (the least-privilege boundary). This covers EVERY verb
+        // the aclfile's -@dangerous leaves out, the destructive CLUSTER slot mutators the
+        // subcommand-precise grant excludes, and ACL (deliberately not granted, so no self-escalation).
         for denied in [
             vec!["FLUSHALL"],
             vec!["FLUSHDB"],
             vec!["SHUTDOWN", "NOSAVE"],
             vec!["KEYS", "*"],
             vec!["SWAPDB", "0", "1"],
-            vec!["CLIENT", "KILL", "ID", "1"], // admin may LIST clients, not KILL them
+            vec!["DEBUG", "SLEEP", "0"],
+            vec!["MIGRATE", "127.0.0.1", "6399", "k", "0", "50"],
+            vec!["RESTORE", "k", "0", "x"],
+            vec!["MOVE", "k", "1"],
+            vec!["HOTKEYS"],
+            vec!["CLIENT", "KILL", "ID", "1"], // may LIST clients, not KILL
+            vec!["CONFIG", "REWRITE"],         // +config|get|set does not include REWRITE
+            vec!["CLUSTER", "ADDSLOTS", "1"],  // destructive slot mutator, not granted
+            vec!["CLUSTER", "RESET", "HARD"],  // hard cluster reset, not granted
+            vec!["ACL", "SETUSER", "x", "on", "+@all"], // no +acl: cannot self-escalate
         ] {
             let reply = cmd(&mut adm, &denied).await;
             assert!(
                 is_noperm(&reply),
-                "console_admin must be NOPERM on the destructive {denied:?}, got {reply:?}"
+                "console_admin must be NOPERM on {denied:?}, got {reply:?}"
             );
         }
         drop(adm);

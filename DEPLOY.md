@@ -222,9 +222,12 @@ credential. `deploy/aclfile.console.example` is a ready-to-adapt aclfile definin
 two scoped users the console authenticates as
 (`IRONCACHE_CONSOLE_NODE_USER` + `IRONCACHE_CONSOLE_NODE_PASSWORD_FILE`):
 `console_monitor` (read-only: PING/INFO/CLIENT LIST, no key access, no mutation)
-for the polling replicas, and `console_admin` (the management surface: CONFIG,
-CLUSTER ops, ACL admin, key CRUD, SAVE) that is still denied the destructive verbs
-(FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE, ...). Replace the
+for the polling replicas, and `console_admin` (the management surface: CONFIG
+GET/SET, the CLUSTER mutators, INFO, SAVE, key CRUD) that is still denied the
+destructive verbs (FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE, the
+destructive CLUSTER slot ops, ...) and, by default, ACL (so a scoped admin cannot
+rewrite the node's users to escalate itself; node-ACL management stays on a
+separate credential). Replace the
 `CHANGE_ME_*` passwords, decide how the `default` user is secured, and load it via
 `IRONCACHE_ACLFILE`. The exact enforcement is pinned by the
 `reference_console_aclfile_loads_and_enforces_least_privilege` test.

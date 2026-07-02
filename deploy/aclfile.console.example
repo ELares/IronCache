@@ -45,13 +45,40 @@ user default off
 user console_monitor on >CHANGE_ME_monitor resetkeys resetchannels -@all +ping +info +client|list
 
 # console_admin: scoped management. `+@all -@dangerous` grants every ordinary
-# (incl. all data) command and then removes the whole @dangerous class; the
-# re-grants below add back exactly the privileged families the console's
-# management surface uses. What stays DENIED is the destructive tail of
-# @dangerous: FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE,
-# RESTORE, MOVE, SORT, HOTKEYS, PFDEBUG. CLIENT is re-granted only for its READ
-# verb (`|list`), so the admin can observe clients but not CLIENT KILL. SLOWLOG
-# is re-granted whole (it has no per-subcommand grant), giving the admin SLOWLOG
-# GET for the panel plus SLOWLOG RESET, neither of which is data-destructive.
-# `~*` enables the key read/write panels; `&*` enables PUBLISH / PUBSUB.
-user console_admin on >CHANGE_ME_admin ~* &* +@all -@dangerous +config +cluster +acl +info +save +bgsave +client|list +slowlog
+# (incl. all data) command, then removes the whole @dangerous class; the
+# re-grants add back EXACTLY the privileged verbs the console's management path
+# (src/manage.rs) issues, PER SUBCOMMAND wherever the command supports it, so a
+# whole-command grant cannot silently re-open a destructive sibling verb:
+#   +config|get +config|set    (NOT bare +config, which would also re-grant
+#                               CONFIG REWRITE / RESETSTAT)
+#   +cluster|meet|forget|failover|rebalance|setslot  (NOT bare +cluster, which
+#                               would re-grant the destructive ADDSLOTS /
+#                               DELSLOTS / FLUSHSLOTS / RESET / BUMPEPOCH /
+#                               SET-CONFIG-EPOCH slot mutators the console never
+#                               calls). CLUSTER's READ verbs (INFO / SLOTS /
+#                               SHARDS / NODES / MYID) are @slow-not-@dangerous,
+#                               so they remain allowed via `+@all -@dangerous`.
+#   +client|list               (observe clients; NOT CLIENT KILL)
+#   +slowlog                   (whole: SLOWLOG has no per-subcommand grant; GET
+#                               for the panel + RESET, neither data-destructive)
+#   +info +save +bgsave
+# What stays DENIED: FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE,
+# RESTORE, MOVE, SORT, HOTKEYS, PFDEBUG, and the destructive CLUSTER slot verbs.
+#
+# ACL is DELIBERATELY NOT granted. ACL has no per-subcommand grant, so a bare
+# `+acl` would hand console_admin ACL SETUSER, i.e. the power to rewrite ANY
+# user's rules (including its own) to `+@all` -- a self-escalation that would
+# defeat this entire least-privilege model. Managing a node's ACL users is a
+# root-level capability; keep it on a SEPARATE, dedicated credential. The
+# console's own doc treats this node ACL as "the ultimate bound" (defense in
+# depth), so console_admin intentionally cannot rewrite it. If you accept the
+# trade-off and want the console's ACL panel to manage users, add `+acl` here
+# and understand that console_admin then becomes root-equivalent.
+#
+# CAVEATS that the Redis ACL model cannot express (so treat console_admin's
+# password as a PRIVILEGED secret): `+config|set` still allows CONFIG SET of ANY
+# parameter (there is no per-parameter ACL), including `dir` / `dbfilename`
+# which, with `+save`/`+bgsave`, is a file-write primitive; and `~*` grants
+# read AND write to EVERY key. Both are inherent to the console's config + key
+# panels; narrow them only if your console does not use those panels.
+user console_admin on >CHANGE_ME_admin ~* &* +@all -@dangerous +config|get +config|set +cluster|meet +cluster|forget +cluster|failover +cluster|rebalance +cluster|setslot +info +save +bgsave +client|list +slowlog

@@ -167,9 +167,12 @@ release.
 - Reference least-privilege console aclfile (issue #367): `deploy/aclfile.console.example` ships two
   scoped IronCache ACL users the console authenticates as when it dials nodes: `console_monitor`
   (read-only, exactly the poll loop's PING/INFO/CLIENT LIST, no key access, no mutation) and
-  `console_admin` (the management surface: CONFIG, CLUSTER ops, ACL admin, key CRUD, SAVE) with the
-  destructive `@dangerous` tail (FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE, ...) left
-  DENIED. The rules are grounded in the console's ACTUAL RESP command inventory, and a new
+  `console_admin` (the management surface: CONFIG GET/SET, the CLUSTER mutators, INFO, SAVE, key CRUD)
+  with the destructive `@dangerous` tail (FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE,
+  the destructive CLUSTER slot ops, ...) left DENIED, granted per-subcommand where the command supports
+  it (so a whole-command grant cannot silently re-open a destructive sibling verb), and NOT granted ACL
+  by default (a bare `+acl` would let the scoped admin `ACL SETUSER` itself to `+@all`). The rules are
+  grounded in the console's ACTUAL RESP command inventory, and a new
   integration test loads the shipped file byte-for-byte into a real server and asserts the enforcement
   over the wire (each user can do exactly what the console needs and nothing more), so the reference
   file is an EXECUTABLE acceptance, not just documentation. Only the account-specific Terraform/secret
