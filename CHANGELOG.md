@@ -164,6 +164,16 @@ release.
 
 ### Added
 
+- Dash table cache-mode segment-local eviction (issue #285 stage 2, DASHTABLE.md): `ironcache-dashtable`
+  gains `insert_cache`, which on a full segment EVICTS the coldest slot IN THAT SEGMENT (O(`SEGMENT_CAP`)
+  = O(1)) instead of splitting, so the standalone table now models the (b) lever of #285 (O(1)
+  segment-local eviction, no table-wide scan, no per-key side state). The victim is the slot minimizing
+  the deterministic total order `(freq, scan_hash, key)` -- the SAME freq-in-object order the store's
+  `refill_evict_pool` uses (EVICTION.md, ADR-0003) -- so a model test asserts the standalone table
+  evicts the exact victim the store would. `with_directory_bits` pre-sizes the segment array for a known
+  working set. Still standalone (not wired into the store, stage 3) and safe/`miri`-clean; the memory /
+  throughput WIN vs DragonflyDB is the Linux head-to-head (stage 4), but the victim QUALITY is now
+  proven on any host.
 - `DUMP` / `RESTORE` (issue #129, KEYSPACE.md): the Redis/Valkey-compatible value serialization blob.
   `DUMP key` emits an opaque byte string (`<type><rdb-encoded-value> || rdb_version[2] || crc64[8]`);
   `RESTORE key ttl blob [REPLACE|ABSTTL|IDLETIME n|FREQ n]` recreates the value from one. The blob
