@@ -203,6 +203,12 @@ pub use tls::{
 pub mod bootstrap;
 pub use bootstrap::{ShardConfig, ShardId, ShardSet, available_shards};
 
+// The systemd socket-activation (sd_listen_fds) protocol parser (#389 Phase 2a). A PURE
+// string->typed-result gate deciding whether to adopt an inherited listening fd vs self-bind; the
+// raw-fd adoption itself is a thin Linux-only layer downstream. Cfg-free so it builds + unit-tests
+// on every host (the dangerous parsing bugs are validated here, not on a live systemd box).
+pub mod listen_fds;
+
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
