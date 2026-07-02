@@ -44,6 +44,17 @@ const DUMP_RDB_VERSION: u16 = 9;
 /// is refused as [`ErrorReply::restore_bad_payload`], exactly as redis refuses a too-new payload.
 const SUPPORTED_RDB_VERSION: u16 = 11;
 
+/// The largest value RESTORE will reconstruct: the Redis 512 MiB bulk-string cap
+/// ([bulk-string-max-512mb], KEYSPACE.md). A declared length above this is a hostile/garbage payload,
+/// rejected as [`RestoreParseError::BadData`] BEFORE any allocation, so an attacker cannot make a tiny
+/// blob demand a huge buffer (the LZF `ulen` DoS the review flagged).
+const MAX_RESTORE_VALUE_BYTES: usize = 512 * 1024 * 1024;
+
+/// The ceiling on how much a decoder PRE-allocates from a still-unverified declared length: a legit
+/// value still grows past this via `push`/`extend`, but a tiny blob that lies about its size can never
+/// force more than this up front. The final exact-length check is the correctness gate.
+const DECODE_PREALLOC_CAP: usize = 64 * 1024;
+
 // ---------------------------------------------------------------------------
 // CRC-64 (Jones variant, the Redis DUMP checksum): width 64, poly 0xad93d23594c935a9, reflected in
 // and out, init 0. Validated against the published check value CRC64("123456789") = 0xe9c6d914c4b8d9ca.
@@ -202,8 +213,11 @@ fn read_rdb_string(p: &[u8], pos: &mut usize) -> Result<Vec<u8>, RestoreParseErr
         };
     }
     let len = usize::try_from(len_or_enc).map_err(|_| RestoreParseError::BadData)?;
-    let bytes = p.get(*pos..*pos + len).ok_or(RestoreParseError::BadData)?;
-    *pos += len;
+    // checked_add so a hostile length near usize::MAX is a clean BadData, never an overflow panic
+    // (which would fire under overflow-checks builds, i.e. debug + CI).
+    let end = pos.checked_add(len).ok_or(RestoreParseError::BadData)?;
+    let bytes = p.get(*pos..end).ok_or(RestoreParseError::BadData)?;
+    *pos = end;
     Ok(bytes.to_vec())
 }
 
@@ -232,8 +246,14 @@ fn read_lzf_string(p: &[u8], pos: &mut usize) -> Result<Vec<u8>, RestoreParseErr
     let (ulen, _) = read_rdb_len(p, pos)?;
     let clen = usize::try_from(clen).map_err(|_| RestoreParseError::BadData)?;
     let ulen = usize::try_from(ulen).map_err(|_| RestoreParseError::BadData)?;
-    let input = p.get(*pos..*pos + clen).ok_or(RestoreParseError::BadData)?;
-    *pos += clen;
+    // Reject an absurd declared output size BEFORE decoding: `ulen` is fully attacker-controlled (a
+    // 64-bit RDB length), so bound it to the value cap so a tiny blob cannot demand a huge buffer.
+    if ulen > MAX_RESTORE_VALUE_BYTES {
+        return Err(RestoreParseError::BadData);
+    }
+    let end = pos.checked_add(clen).ok_or(RestoreParseError::BadData)?;
+    let input = p.get(*pos..end).ok_or(RestoreParseError::BadData)?;
+    *pos = end;
     let out = lzf_decompress(input, ulen)?;
     Ok(out)
 }
@@ -241,7 +261,10 @@ fn read_lzf_string(p: &[u8], pos: &mut usize) -> Result<Vec<u8>, RestoreParseErr
 /// The LZF decompressor (Marc Lehmann's liblzf, the variant Redis vendors). `expected` is the known
 /// output length; a stream that over/under-runs it or references before the start is `BadData`.
 fn lzf_decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, RestoreParseError> {
-    let mut out: Vec<u8> = Vec::with_capacity(expected);
+    // Pre-allocate only up to a cap: a blob that lies (`expected` huge, stream tiny) grows the vec to
+    // its ACTUAL output and then fails the exact-length gate below, so it can never force a giant
+    // up-front allocation. A legit large value still grows naturally as bytes are pushed.
+    let mut out: Vec<u8> = Vec::with_capacity(expected.min(DECODE_PREALLOC_CAP));
     let mut i = 0usize;
     while i < input.len() {
         let ctrl = input[i] as usize;
@@ -350,22 +373,29 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
                 absttl = true;
                 i += 1;
             }
-            b"IDLETIME" | b"FREQ" => {
-                // A single numeric argument follows; accept + validate + ignore it.
-                if i + 1 >= req.args.len() || parse_i64(&req.args[i + 1]).is_none() {
-                    return Value::error(ErrorReply::syntax_error());
+            // IDLETIME/FREQ carry an LRU/LFU hint that does not change the value, but redis still
+            // RANGE-validates them (and errors on a non-integer as NOT-an-integer, not a syntax error).
+            b"IDLETIME" => match req.args.get(i + 1).and_then(|a| parse_i64(a)) {
+                None if req.args.len() <= i + 1 => return Value::error(ErrorReply::syntax_error()),
+                None => return Value::error(ErrorReply::not_an_integer()),
+                Some(v) if v < 0 => {
+                    return Value::error(ErrorReply::err("Invalid IDLETIME value, must be >= 0"));
                 }
-                i += 2;
-            }
+                Some(_) => i += 2,
+            },
+            b"FREQ" => match req.args.get(i + 1).and_then(|a| parse_i64(a)) {
+                None if req.args.len() <= i + 1 => return Value::error(ErrorReply::syntax_error()),
+                None => return Value::error(ErrorReply::not_an_integer()),
+                Some(v) if !(0..=255).contains(&v) => {
+                    return Value::error(ErrorReply::err(
+                        "Invalid FREQ value, must be >= 0 and <= 255",
+                    ));
+                }
+                Some(_) => i += 2,
+            },
             _ => return Value::error(ErrorReply::syntax_error()),
         }
     }
-
-    // Decode the blob BEFORE touching the store (a bad payload must not mutate anything).
-    let value = match deserialize_string(&req.args[3]) {
-        Ok(v) => v,
-        Err(e) => return Value::error(e.into_reply()),
-    };
 
     // Compute the deadline: 0 -> no expiry; ABSTTL -> the value as-is; else now + ttl.
     // ttl_ms is validated >= 0 above, so the u64 cast is lossless.
@@ -378,25 +408,54 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         ExpireWrite::Set(UnixMillis(now.0.saturating_add(ttl)))
     };
 
-    let bytes = Bytes::from(value);
-    store.rmw(db, &req.args[1], now, move |entry| match entry {
-        RmwEntry::Occupied(_) if !replace => RmwStep {
-            action: RmwAction::Keep,
-            expire: ExpireWrite::Unchanged,
-            reply: Value::error(ErrorReply::busykey_target_exists()),
-        },
-        // Vacant, or Occupied with REPLACE: write the value (Replace on a vacant entry inserts).
-        _ => RmwStep {
-            action: RmwAction::Replace(NewValueOwned::Bytes(bytes.clone())),
-            expire,
-            reply: Value::ok(),
-        },
+    // The decode happens INSIDE the rmw closure so redis's error PRECEDENCE holds: an existing key
+    // without REPLACE is BUSYKEY *before* the payload is even parsed. A bad payload on the write path
+    // returns Keep (no mutation) -- still fail-closed.
+    let blob = &req.args[3];
+    store.rmw(db, &req.args[1], now, move |entry| {
+        if matches!(entry, RmwEntry::Occupied(_)) && !replace {
+            return RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::error(ErrorReply::busykey_target_exists()),
+            };
+        }
+        match deserialize_string(blob) {
+            // Vacant, or Occupied with REPLACE: write the value (Replace on a vacant entry inserts).
+            Ok(value) => RmwStep {
+                action: RmwAction::Replace(NewValueOwned::Bytes(Bytes::from(value))),
+                expire,
+                reply: Value::ok(),
+            },
+            Err(e) => RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: Value::error(e.into_reply()),
+            },
+        }
     })
 }
 
-/// Parse a base-10 signed integer argument (RESTORE ttl / option numerics).
+/// Parse a base-10 signed integer argument (RESTORE ttl / IDLETIME / FREQ) with the STRICTNESS of
+/// redis's `string2ll`: no leading `+`, no surrounding whitespace, no leading zeros (only the
+/// standalone `0`), no `-0`. This keeps RESTORE's argument acceptance byte-for-byte with redis, so a
+/// value redis rejects (`RESTORE k +5 ...`, `RESTORE k 007 ...`) is rejected here too.
 fn parse_i64(bytes: &[u8]) -> Option<i64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
+    let s = std::str::from_utf8(bytes).ok()?;
+    let magnitude = s.strip_prefix('-').unwrap_or(s);
+    // All digits, non-empty (this also rejects a leading '+', whitespace, or any sign but '-').
+    if magnitude.is_empty() || !magnitude.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Leading zeros: only the standalone "0" is legal; "007" / "-0" are not (redis string2ll).
+    if (magnitude.len() > 1 && magnitude.starts_with('0'))
+        || (s.starts_with('-') && magnitude == "0")
+    {
+        return None;
+    }
+    // `s` now has at most a leading '-' and canonical digits, so std parse (which handles i64::MIN)
+    // agrees with redis; the '+' std would otherwise accept was already excluded above.
+    s.parse::<i64>().ok()
 }
 
 #[cfg(test)]
@@ -598,6 +657,132 @@ mod tests {
                 o => panic!("{o:?}"),
             },
             "-ERR Invalid TTL value, must be >= 0"
+        );
+    }
+
+    // ---- Review-driven hardening tests. ----
+
+    #[test]
+    fn lzf_with_a_huge_declared_ulen_is_rejected_without_allocating() {
+        // A HOSTILE blob: LZF encoding, a 1-byte compressed stream, but a declared ulen of ~1 TiB
+        // (via the 0x81 64-bit RDB length). The pre-review code fed that straight to
+        // Vec::with_capacity and aborted the process; now it must be a clean BadData with no giant
+        // allocation.
+        let mut payload = vec![RDB_TYPE_STRING, 0xC3]; // RDB_ENCVAL | LZF
+        write_rdb_len(&mut payload, 1); // clen = 1
+        payload.push(0x81); // 64-bit ulen marker
+        payload.extend_from_slice(&(1u64 << 40).to_be_bytes()); // ulen = 2^40
+        payload.push(0x00); // the 1 compressed byte
+        payload.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+        let crc = crc64(0, &payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            deserialize_string(&payload),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn a_raw_length_that_overflows_usize_is_bad_data_not_a_panic() {
+        // A raw string declaring a 64-bit length near usize::MAX must reject cleanly (the checked_add
+        // guards the range computation from an overflow panic under overflow-checks builds).
+        let mut payload = vec![RDB_TYPE_STRING, 0x81]; // 64-bit length marker
+        payload.extend_from_slice(&u64::MAX.to_be_bytes());
+        payload.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+        let crc = crc64(0, &payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            deserialize_string(&payload),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn parse_i64_matches_redis_string2ll_strictness() {
+        assert_eq!(parse_i64(b"0"), Some(0));
+        assert_eq!(parse_i64(b"12345"), Some(12345));
+        assert_eq!(parse_i64(b"-7"), Some(-7));
+        // Rejections redis's string2ll also makes:
+        assert_eq!(parse_i64(b"+5"), None, "leading + rejected");
+        assert_eq!(parse_i64(b"007"), None, "leading zeros rejected");
+        assert_eq!(parse_i64(b"-0"), None, "negative zero rejected");
+        assert_eq!(parse_i64(b" 5"), None, "whitespace rejected");
+        assert_eq!(parse_i64(b""), None, "empty rejected");
+        assert_eq!(parse_i64(b"9x"), None, "trailing junk rejected");
+    }
+
+    #[test]
+    fn restore_busykey_precedes_a_bad_payload_check() {
+        // redis error PRECEDENCE: an existing key without REPLACE is BUSYKEY even when the payload is
+        // ALSO corrupt (the existence check comes first). A garbage blob onto an existing key must
+        // therefore say BUSYKEY, not "bad payload", and must not mutate the key.
+        let mut s = test_store();
+        seed(&mut s, b"k", b"original");
+        let garbage = b"\x00\x00not a real dump blob at all!!";
+        let err = cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", garbage]));
+        assert_eq!(
+            match err {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-BUSYKEY Target key name already exists."
+        );
+        assert_eq!(
+            s.read(0, b"k", NOW)
+                .map(|v| v.as_bytes().to_vec())
+                .as_deref(),
+            Some(&b"original"[..]),
+            "the existing value must be untouched"
+        );
+    }
+
+    #[test]
+    fn restore_freq_and_idletime_are_range_validated() {
+        let mut s = test_store();
+        let blob = serialize_string(b"v");
+        let line = |v: Value| match v {
+            Value::Error(e) => e.line(),
+            o => panic!("{o:?}"),
+        };
+        // FREQ out of [0,255].
+        assert_eq!(
+            line(cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"a", b"0", &blob, b"FREQ", b"999"])
+            )),
+            "-ERR Invalid FREQ value, must be >= 0 and <= 255"
+        );
+        // IDLETIME negative.
+        assert_eq!(
+            line(cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"b", b"0", &blob, b"IDLETIME", b"-1"])
+            )),
+            "-ERR Invalid IDLETIME value, must be >= 0"
+        );
+        // A non-integer FREQ argument is NOT-an-integer, not a syntax error.
+        assert_eq!(
+            line(cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"c", b"0", &blob, b"FREQ", b"x"])
+            )),
+            "-ERR value is not an integer or out of range"
+        );
+        // A valid FREQ is accepted + ignored (value still restored).
+        assert_eq!(
+            cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"d", b"0", &blob, b"FREQ", b"5"])
+            ),
+            Value::ok()
         );
     }
 }

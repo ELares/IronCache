@@ -778,37 +778,60 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
 
     // ---- HyperLogLog (#242 part 2): a HLL is a string type, so DUMP/RESTORE moves its bytes; the
     // restored HLL must PFCOUNT identically to the source's. Both servers use the same MurmurHash64A
-    // + estimator, so for a fixed small element set the counts are exactly equal. ----
-    for dir in ["r2i", "i2r"] {
-        let (src, dst): (&mut Client, &mut Client) = if dir == "r2i" {
-            (rds, iron)
-        } else {
-            (iron, rds)
-        };
-        let src_key = format!("dr:hll:{dir}:src").into_bytes();
-        let dst_key = format!("dr:hll:{dir}:dst").into_bytes();
-        src.cmd(&[b"PFADD", &src_key, b"a", b"b", b"c", b"d", b"e", b"f", b"g"]);
-        let src_count = src.cmd(&[b"PFCOUNT", &src_key]);
-        let Some(blob) = bulk_bytes(&src.cmd(&[b"DUMP", &src_key])) else {
-            div.push(Divergence {
-                cmd: format!("DUMP hll ({dir})"),
-                iron: Resp::Null,
-                redis: Resp::Null,
-                note: "HLL DUMP did not return a bulk blob".to_owned(),
-            });
-            continue;
-        };
-        dst.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
-        let dst_count = dst.cmd(&[b"PFCOUNT", &dst_key]);
-        compared += 1;
-        if dst_count != src_count {
-            div.push(Divergence {
-                cmd: format!("HLL DUMP/RESTORE + PFCOUNT ({dir})"),
-                iron: dst_count,
-                redis: src_count,
-                note: "a HLL DUMPed on one server did not PFCOUNT identically after RESTORE on the other (#242 part 2)"
-                    .to_owned(),
-            });
+    // + estimator, so for a fixed element set the counts are exactly equal. We cover BOTH internal
+    // encodings: a SPARSE HLL (7 elements, well under the ~3000-byte sparse cap) and a DENSE HLL (a
+    // large element set that forces promotion), because the dense 6-bit-packed register layout is a
+    // different code path than sparse and must ALSO be byte-compatible with redis. ----
+    // The dense element set (one PFADD, many distinct elements) exceeds hll-sparse-max-bytes so both
+    // servers promote to the dense encoding before the DUMP.
+    let dense_elems: Vec<Vec<u8>> = (0..1500)
+        .map(|i| format!("elem-{i}").into_bytes())
+        .collect();
+    for (enc, elems) in [
+        (
+            "sparse",
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+            ],
+        ),
+        ("dense", dense_elems),
+    ] {
+        for dir in ["r2i", "i2r"] {
+            let (src, dst): (&mut Client, &mut Client) = if dir == "r2i" {
+                (rds, iron)
+            } else {
+                (iron, rds)
+            };
+            let src_key = format!("dr:hll:{enc}:{dir}:src").into_bytes();
+            let dst_key = format!("dr:hll:{enc}:{dir}:dst").into_bytes();
+            let mut pfadd: Vec<&[u8]> = vec![b"PFADD", &src_key];
+            pfadd.extend(elems.iter().map(std::vec::Vec::as_slice));
+            src.cmd(&pfadd);
+            let src_count = src.cmd(&[b"PFCOUNT", &src_key]);
+            let Some(blob) = bulk_bytes(&src.cmd(&[b"DUMP", &src_key])) else {
+                div.push(Divergence {
+                    cmd: format!("DUMP hll {enc} ({dir})"),
+                    iron: Resp::Null,
+                    redis: Resp::Null,
+                    note: "HLL DUMP did not return a bulk blob".to_owned(),
+                });
+                continue;
+            };
+            dst.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+            let dst_count = dst.cmd(&[b"PFCOUNT", &dst_key]);
+            compared += 1;
+            if dst_count != src_count {
+                div.push(Divergence {
+                    cmd: format!("HLL {enc} DUMP/RESTORE + PFCOUNT ({dir})"),
+                    iron: dst_count,
+                    redis: src_count,
+                    note: format!("a {enc} HLL DUMPed on one server did not PFCOUNT identically after RESTORE on the other (#242 part 2)"),
+                });
+            }
         }
     }
 
