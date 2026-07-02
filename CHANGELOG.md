@@ -164,6 +164,16 @@ release.
 
 ### Added
 
+- Reference least-privilege console aclfile (issue #367): `deploy/aclfile.console.example` ships two
+  scoped IronCache ACL users the console authenticates as when it dials nodes: `console_monitor`
+  (read-only, exactly the poll loop's PING/INFO/CLIENT LIST, no key access, no mutation) and
+  `console_admin` (the management surface: CONFIG, CLUSTER ops, ACL admin, key CRUD, SAVE) with the
+  destructive `@dangerous` tail (FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE, ...) left
+  DENIED. The rules are grounded in the console's ACTUAL RESP command inventory, and a new
+  integration test loads the shipped file byte-for-byte into a real server and asserts the enforcement
+  over the wire (each user can do exactly what the console needs and nothing more), so the reference
+  file is an EXECUTABLE acceptance, not just documentation. Only the account-specific Terraform/secret
+  provisioning is out of scope for the repo. DEPLOY.md documents the pattern.
 - Dash table cache-mode segment-local eviction (issue #285 stage 2, DASHTABLE.md): `ironcache-dashtable`
   gains `insert_cache`, which on a full segment EVICTS the coldest slot IN THAT SEGMENT (O(`SEGMENT_CAP`)
   = O(1)) instead of splitting, so the standalone table now models the (b) lever of #285 (O(1)
