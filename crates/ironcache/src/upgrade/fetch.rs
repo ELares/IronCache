@@ -35,8 +35,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::minisign::{self, MinisignPublicKey};
 use super::proc::{BoundedError, run_bounded};
-use super::verify::{Sha256Verifier, Verifier, VerifyError};
+use super::verify::{PINNED_UPGRADE_PUBLIC_KEY, Sha256Verifier, Verifier, VerifyError};
 
 /// The default cap on a fetched artifact: a release tarball is tens of MB; 512 MiB is generous
 /// headroom that still refuses a runaway/hostile download. Overridable in [`FetchBounds`].
@@ -212,11 +213,25 @@ pub struct Fetched {
 /// # Errors
 ///
 /// Returns a [`FetchError`] on a non-https URL (when required), a curl/tar failure, an over-cap
-/// download, a tarball sha256 mismatch, or a missing binary in the archive.
+/// download, a tarball sha256 mismatch, a missing/invalid minisign signature (when a key is
+/// pinned), or a missing binary in the archive.
 pub fn fetch_release(
     tarball_url: &str,
     sums_url: &str,
     bounds: FetchBounds,
+) -> Result<Fetched, FetchError> {
+    // The production entry point authenticates against the PINNED key (#386) when one is committed;
+    // `None` (the not-yet-activated state) skips the signature step, integrity-only.
+    fetch_release_with_key(tarball_url, sums_url, bounds, PINNED_UPGRADE_PUBLIC_KEY)
+}
+
+/// [`fetch_release`] with an explicit pinned-key parameter (separated so the pinned/authenticated
+/// path is testable while the compile-time [`PINNED_UPGRADE_PUBLIC_KEY`] is still `None`).
+fn fetch_release_with_key(
+    tarball_url: &str,
+    sums_url: &str,
+    bounds: FetchBounds,
+    pinned_pubkey: Option<&str>,
 ) -> Result<Fetched, FetchError> {
     let dir = TempDir::new("release")?;
     let asset_name = url_basename(tarball_url).ok_or_else(|| FetchError::Io {
@@ -230,9 +245,33 @@ pub fn fetch_release(
     let sums = dir.path().join("SHA256SUMS");
     fetch_url(sums_url, &sums, bounds)?;
 
+    // 1b. AUTHENTICITY (#386, when a key is pinned): download the detached minisign signature
+    //     (`<sums_url>.minisig`, the file the release publishes next to SHA256SUMS) and verify it over
+    //     the downloaded manifest bytes BEFORE trusting that manifest for the integrity comparison.
+    //     FAIL-CLOSED: with a pinned key, a missing or invalid signature aborts the fetch (an
+    //     unauthenticated release must never reach the swap).
+    if let Some(pubkey_b64) = pinned_pubkey {
+        let sig_url = format!("{sums_url}.minisig");
+        let sig_dest = dir.path().join("SHA256SUMS.minisig");
+        fetch_url(&sig_url, &sig_dest, bounds)?;
+        let sig_text = std::fs::read_to_string(&sig_dest).map_err(|e| FetchError::Io {
+            what: format!("reading the downloaded signature {}", sig_dest.display()),
+            detail: e.to_string(),
+        })?;
+        let sums_bytes = std::fs::read(&sums).map_err(|e| FetchError::Io {
+            what: format!("reading the downloaded manifest {}", sums.display()),
+            detail: e.to_string(),
+        })?;
+        let key = MinisignPublicKey::parse(pubkey_b64)
+            .map_err(|e| FetchError::Verify(VerifyError::Signature(e)))?;
+        minisign::verify(&sums_bytes, &sig_text, &key)
+            .map_err(|e| FetchError::Verify(VerifyError::Signature(e)))?;
+    }
+
     // 2. Verify the TARBALL against the published manifest -- an INTEGRITY check (the manifest lists
-    //    the tarballs; publisher authenticity is the #386 minisign signature over SHA256SUMS, not this
-    //    same-channel comparison). An `ok` here means the bytes match the published SHA256SUMS.
+    //    the tarballs). With a pinned key, step 1b just AUTHENTICATED that manifest, so an `ok` here
+    //    means the bytes match a manifest signed by the pinned key; without one (the not-yet-activated
+    //    state) it means the bytes match the same-channel published SHA256SUMS.
     Sha256Verifier.verify(&tarball, &asset_name, &sums)?;
 
     // 3. Extract the binary from the (now-verified) tarball.
@@ -1019,6 +1058,115 @@ mod tests {
         )
         .expect_err("a tarball whose sha256 does not match the manifest must be rejected");
         assert!(matches!(err, FetchError::Verify(_)), "{err:?}");
+        handle.join().unwrap();
+    }
+
+    // ---- The PINNED-KEY (authenticated) fetch path (#386): a REAL rsign2-signed release. ----
+
+    /// The rsign2 0.6.6 test public key (same as upgrade::minisign's vectors).
+    const PIN_PUBKEY: &str = "RWREdimvfA8cGa5MTkLinjCO6dktAfbzHcG7vGO4cCDAtilnBR+mUBvY";
+    /// A REAL 153-byte `.tar.gz` (containing an `ironcache` script) captured byte-for-byte, whose
+    /// sha256 is the entry in [`PIN_SUMS`]; [`PIN_MINISIG`] is a genuine rsign2 signature over
+    /// [`PIN_SUMS`]. Together they form a complete signed release the mock server serves.
+    const PIN_TARBALL_HEX: &str = "1f8b080009ae456a0003edd2c10ac2300c06e09df71471de5dd2752b3e4e2d\
+        8116ca86ad43f0e9adc204413c59bce4ebe1bf84f20712d2323beb3c37f520e2a4353cd24ce3338b2d0b4d40a352\
+        3428834480a4cd400d60c54e2f6bbed854aaf08dcf6be0186de2fc61eeea99e3977fde97824a6d7f6ebfeb4f61ee\
+        b36fd9f905bab0dd031c0fe575edbf0b0a2184a8e20e48add4a800080000";
+    const PIN_SUMS: &str = "e1f12676776622a47532d8adce6f5aef869ec67b9634dacdfc569af40b511625  ironcache-9.9.9-test.tar.gz\n";
+    const PIN_MINISIG: &str = "untrusted comment: signature from rsign secret key\n\
+        RUREdimvfA8cGUGi0WUkaHMCWQrbhI14/+lPUctVZWIPKP9lxdJbNTdBGxOu2KG6kFCoB+/C7XWyOv2pS7GhMlyu/JN2XD3NSAc=\n\
+        trusted comment: fetch e2e\n\
+        Ax7MKp23gwkpCheedEjhMeQ1W7+MY3JyRyWs+G/91d7vvIp/sGT63gzDDM1H+9qvx3eJLzznkF6kyoEMeGFnCQ==\n";
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        let clean: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        clean
+            .as_bytes()
+            .chunks(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    /// The route table for a signed release: the tarball, the manifest, and (optionally) the
+    /// detached signature.
+    fn pinned_routes(with_sig: bool, sums_body: &str) -> Vec<Route> {
+        let mut routes = vec![
+            Route {
+                path: "/ironcache-9.9.9-test.tar.gz".to_owned(),
+                body: hex_bytes(PIN_TARBALL_HEX),
+                redirect_to: None,
+            },
+            Route {
+                path: "/SHA256SUMS".to_owned(),
+                body: sums_body.as_bytes().to_vec(),
+                redirect_to: None,
+            },
+        ];
+        if with_sig {
+            routes.push(Route {
+                path: "/SHA256SUMS.minisig".to_owned(),
+                body: PIN_MINISIG.as_bytes().to_vec(),
+                redirect_to: None,
+            });
+        }
+        routes
+    }
+
+    #[test]
+    fn pinned_fetch_verifies_a_genuinely_signed_release() {
+        if !have_tool("curl") || !have_tool("tar") {
+            return;
+        }
+        let (base, handle) = spawn_http(pinned_routes(true, PIN_SUMS), 3);
+        let fetched = fetch_release_with_key(
+            &format!("http://{base}/ironcache-9.9.9-test.tar.gz"),
+            &format!("http://{base}/SHA256SUMS"),
+            test_bounds(),
+            Some(PIN_PUBKEY),
+        )
+        .expect("a genuinely signed release fetches + authenticates + extracts");
+        assert!(fetched.binary.exists(), "the binary was extracted");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pinned_fetch_rejects_a_missing_signature_fail_closed() {
+        if !have_tool("curl") || !have_tool("tar") {
+            return;
+        }
+        // The server has NO /SHA256SUMS.minisig route (404): with a pinned key the fetch must abort.
+        let (base, handle) = spawn_http(pinned_routes(false, PIN_SUMS), 3);
+        let err = fetch_release_with_key(
+            &format!("http://{base}/ironcache-9.9.9-test.tar.gz"),
+            &format!("http://{base}/SHA256SUMS"),
+            test_bounds(),
+            Some(PIN_PUBKEY),
+        )
+        .expect_err("with a pinned key, a release without a signature must be rejected");
+        assert!(matches!(err, FetchError::Subprocess { .. }), "{err:?}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pinned_fetch_rejects_an_unsigned_manifest_alteration() {
+        if !have_tool("curl") || !have_tool("tar") {
+            return;
+        }
+        // Serve a SHA256SUMS whose bytes differ from what was signed (an extra trailing comment line
+        // keeps the tarball's integrity entry intact, so the SIGNATURE layer is what rejects it).
+        let altered = format!("{PIN_SUMS}# attacker appended line\n");
+        let (base, handle) = spawn_http(pinned_routes(true, &altered), 3);
+        let err = fetch_release_with_key(
+            &format!("http://{base}/ironcache-9.9.9-test.tar.gz"),
+            &format!("http://{base}/SHA256SUMS"),
+            test_bounds(),
+            Some(PIN_PUBKEY),
+        )
+        .expect_err("manifest bytes that differ from what was signed must fail authenticity");
+        assert!(
+            matches!(err, FetchError::Verify(VerifyError::Signature(_))),
+            "{err:?}"
+        );
         handle.join().unwrap();
     }
 }

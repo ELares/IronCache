@@ -76,6 +76,14 @@ ironcache-clusterbus = { workspace = true }
 # `tls = off` (the default) the acceptor is never built and the serve path is plaintext
 # byte-unchanged.
 tokio-rustls = { workspace = true }
+# Ed25519 signature verification for the `ironcache upgrade` minisign anchor (#386). `ring` is ALREADY
+# in the graph + linked into this binary as tokio-rustls's crypto provider (the `ring` feature above),
+# so declaring it directly adds NO new crate to Cargo.lock and no binary-size / musl / cargo-deny cost
+# (respecting the verify.rs "no new crypto crate" posture); the minisign verify reuses the SAME audited
+# Ed25519 the TLS stack uses, rather than hand-rolling curve arithmetic. Blake2b-512 + base64 (which
+# `ring` does not expose) ARE hand-rolled in `upgrade::minisign`, validated against RFC-7693 /
+# RFC-4648 known-answer vectors, in the same spirit as the hand-rolled FIPS-180-4 sha256.
+ring = { version = "0.17", default-features = false }
 clap = { workspace = true }
 anyhow = { workspace = true }
 # Typed errors for the `ironcache upgrade` self-updater (#387): the Verifier/Source/Swap/Service/
