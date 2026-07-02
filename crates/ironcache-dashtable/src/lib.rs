@@ -1,11 +1,29 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! A standalone Dash-style extendible-hashing table (#285, STAGE 1: the algorithm core).
+//! A standalone Dash-style extendible-hashing table (#285, STAGES 1-2: the algorithm core + the
+//! cache-mode segment-local eviction).
 //!
 //! This crate validates the NOVEL part of the Dash design (DASHTABLE.md) in isolation, with zero
 //! blast radius on the store and zero `unsafe` (so `miri` is trivial): the extendible DIRECTORY, the
 //! per-segment LOCAL depth, the SEGMENT SPLIT on overflow, the DIRECTORY DOUBLING when a split would
 //! exceed the global depth, and the 1-byte FINGERPRINT that gates a lookup so it skips non-matching
 //! slots. It is a correctness reference, NOT yet the production index.
+//!
+//! ## Cache mode (STAGE 2, DASHTABLE.md "Segment-local O(1) eviction")
+//!
+//! [`Dashtable::insert_cache`] is the CACHE-mode insert: instead of SPLITTING a full segment (which
+//! grows the table, the datastore behavior), it EVICTS the coldest slot IN THAT SEGMENT and places
+//! the new key, so memory stays bounded and eviction touches O(`SEGMENT_CAP`) = O(1) slots with no
+//! table-wide scan and no per-key side state. The victim is the slot minimizing the total order
+//! `(freq, scan_hash, key)`, the SAME SHAPE the store's `refill_evict_pool` `ColdEntry` uses
+//! (`freq, scan_h, key[, db]`; EVICTION.md, ADR-0003). Both the 2-bit frequency and the `scan_hash`
+//! are supplied by the CALLER (`freq_of` reads the freq out of the value = freq-in-object; `scan_hash`
+//! is the caller's scan-order hash over the key), so when the store wires this table it passes its
+//! OWN `freq` + `scan_hash` and the victim is then byte-identical to `refill_evict_pool`'s choice by
+//! construction; two shards with identical state evict identically. Passing the scan hash in (rather
+//! than hashing the key with this crate's internal directory hash, which is a DIFFERENT function)
+//! is what makes that parity real rather than merely same-shaped. [`Dashtable::with_directory_bits`]
+//! pre-sizes the segment array for a known working set (a cache is sized up front; growth is by
+//! eviction, not splits).
 //!
 //! ## What is deliberately deferred (later stages of DASHTABLE.md)
 //!
@@ -18,7 +36,9 @@
 //!   cache efficiency. Here a segment is a single flat slot pool; a lookup is an O(`SEGMENT_CAP`)
 //!   fingerprint-gated scan (`SEGMENT_CAP` is a small constant), which is correct but not yet
 //!   cache-optimal.
-//! - Wiring into the store behind a feature flag, and the freq-in-object segment-local eviction.
+//! - Wiring into the store behind a feature flag (stage 3), and the pinned-Linux + DragonflyDB
+//!   head-to-heads that PROVE the memory/throughput win (stage 4). The eviction VICTIM-QUALITY is
+//!   validated here on macOS by the model test; only the perf claim needs the Linux/bench harness.
 //!
 //! Directory mechanics use the TOP `global_depth` bits of the key hash as the directory index and a
 //! disjoint hash byte as the fingerprint, exactly as DASHTABLE.md specifies.
@@ -113,6 +133,28 @@ where
                 local_depth: 0,
                 slots: Vec::new(),
             }],
+            len: 0,
+        }
+    }
+
+    /// A table PRE-SIZED to `2^dir_bits` DISTINCT segments (directory and every local depth =
+    /// `dir_bits`, each directory entry owning its own segment, no aliasing). This is the CACHE-mode
+    /// shape: the working-set size is known up front and growth is by segment-local EVICTION
+    /// ([`Self::insert_cache`]), not by splitting, so the segment array is fixed. `dir_bits` must be
+    /// `<= 63` (the top-bits directory index).
+    #[must_use]
+    pub fn with_directory_bits(dir_bits: u8) -> Self {
+        assert!(dir_bits <= 63, "dir_bits must be <= 63");
+        let n = 1usize << dir_bits;
+        Dashtable {
+            global_depth: dir_bits,
+            directory: (0..n).collect(),
+            segments: (0..n)
+                .map(|_| Segment {
+                    local_depth: dir_bits,
+                    slots: Vec::new(),
+                })
+                .collect(),
             len: 0,
         }
     }
@@ -275,6 +317,112 @@ where
     }
 }
 
+/// The outcome of a CACHE-mode [`Dashtable::insert_cache`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum CacheInsert<K, V> {
+    /// The key was new and there was room in its segment; nothing was evicted. `len` grew by one.
+    Inserted,
+    /// The key already existed; its value was overwritten in place. Carries the PREVIOUS value.
+    /// `len` is unchanged.
+    Overwrote(V),
+    /// The key was new but its segment was FULL, so the coldest slot was EVICTED to make room and the
+    /// new key placed. Carries the evicted `(key, value)` (so the caller can release its accounting).
+    /// `len` is unchanged (one out, one in).
+    Evicted {
+        /// The evicted key.
+        key: K,
+        /// The evicted value.
+        value: V,
+    },
+}
+
+impl<K, V> Dashtable<K, V>
+where
+    K: Hash + Eq + Ord,
+{
+    /// CACHE-mode insert: `key` -> `value`, EVICTING the coldest slot in the routed segment instead of
+    /// splitting when that segment is full (the (b) lever of #285, DASHTABLE.md). An existing key is
+    /// overwritten in place. `freq_of` reads the 2-bit frequency out of the value (freq-in-object,
+    /// EVICTION.md); `scan_hash_of` is the caller's scan-order hash over the key (the store passes its
+    /// own `scan_hash`, so the tie-break matches `refill_evict_pool` exactly). The evicted victim is
+    /// the slot minimizing the deterministic total order `(freq, scan_hash, key)`, so the selection is
+    /// O(`SEGMENT_CAP`) = O(1) and reproducible across shards (ADR-0003).
+    pub fn insert_cache<F, H>(
+        &mut self,
+        key: K,
+        value: V,
+        freq_of: F,
+        scan_hash_of: H,
+    ) -> CacheInsert<K, V>
+    where
+        F: Fn(&V) -> u8,
+        H: Fn(&K) -> u64,
+    {
+        let h = hash_key(&key);
+        let fp = fingerprint(h);
+        let si = self.directory[self.dir_index(h)];
+
+        // Overwrite in place if present (no eviction, len unchanged).
+        if let Some(slot) = self.segments[si]
+            .slots
+            .iter_mut()
+            .find(|s| s.fingerprint == fp && s.key == key)
+        {
+            return CacheInsert::Overwrote(std::mem::replace(&mut slot.value, value));
+        }
+
+        // A full segment EVICTS its coldest slot (cache mode) rather than splitting.
+        if self.segments[si].slots.len() >= SEGMENT_CAP {
+            let victim = Self::evict_victim(&self.segments[si].slots, &freq_of, &scan_hash_of);
+            // swap_remove is O(1) and order-independent (a segment is an unordered pool); then place
+            // the new slot. Net len unchanged.
+            let evicted = self.segments[si].slots.swap_remove(victim);
+            self.segments[si].slots.push(Slot {
+                fingerprint: fp,
+                key,
+                value,
+            });
+            return CacheInsert::Evicted {
+                key: evicted.key,
+                value: evicted.value,
+            };
+        }
+
+        // Room to spare: place and grow.
+        self.segments[si].slots.push(Slot {
+            fingerprint: fp,
+            key,
+            value,
+        });
+        self.len += 1;
+        CacheInsert::Inserted
+    }
+
+    /// The index of the segment's COLDEST slot by the total order `(freq, scan_hash, key)` (the
+    /// eviction victim). `scan_hash_of` is the caller's scan-order hash (the store's `scan_hash` when
+    /// wired), NOT this crate's internal directory hash [`hash_key`] -- passing it in is what makes the
+    /// victim identical to the store's, since the two hash functions differ. The final `key` tie-break
+    /// makes the order TOTAL so the choice is unique + reproducible. Panics only if called on an empty
+    /// segment (never, in `insert_cache`, which checks fullness first).
+    fn evict_victim<F, H>(slots: &[Slot<K, V>], freq_of: &F, scan_hash_of: &H) -> usize
+    where
+        F: Fn(&V) -> u8,
+        H: Fn(&K) -> u64,
+    {
+        slots
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                freq_of(&a.value)
+                    .cmp(&freq_of(&b.value))
+                    .then_with(|| scan_hash_of(&a.key).cmp(&scan_hash_of(&b.key)))
+                    .then_with(|| a.key.cmp(&b.key))
+            })
+            .map(|(i, _)| i)
+            .expect("evict_victim on a non-empty segment")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +506,177 @@ mod tests {
         from_dt.sort_unstable();
         from_oracle.sort_unstable();
         assert_eq!(from_dt, from_oracle);
+    }
+
+    // ---- STAGE 2: cache-mode segment-local eviction. ----
+
+    /// A value that carries its own 2-bit frequency (freq-in-object).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Freqd {
+        freq: u8,
+        tag: u32,
+    }
+    fn freq_of(v: &Freqd) -> u8 {
+        v.freq
+    }
+
+    /// A BYTE-EXACT port of `ironcache_store::scan_hash` (store/src/lib.rs), the store's real
+    /// SCAN-order hash. The eviction tie-break must use THIS (not the crate's internal directory hash)
+    /// for the victim to match `refill_evict_pool`; the standalone crate does not depend on the store,
+    /// so the test replicates the function and feeds it in as the `scan_hash_of` accessor, exactly as
+    /// the store would at stage-3 wiring. Kept in lockstep with the store definition.
+    fn store_scan_hash(key: &[u8]) -> u64 {
+        const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+        const SECRET: u64 = 0xA076_1D64_78BD_642F;
+        let mut h: u64 = SEED ^ SECRET;
+        for &b in key {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            h ^= h >> 33;
+        }
+        h = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        h ^ (h >> 31)
+    }
+    /// The `scan_hash_of` accessor for a `u64` key: the store's scan_hash over the key's big-endian
+    /// bytes (the byte encoding the store would key on). Takes `&u64` (not `u64`) because it is passed
+    /// as the `Fn(&K) -> u64` accessor, whose signature requires a reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn scan_hash_of(k: &u64) -> u64 {
+        store_scan_hash(&k.to_be_bytes())
+    }
+
+    /// The store's `refill_evict_pool` victim order: COLDEST by `(freq, scan_hash, key)`, using the
+    /// STORE's real `scan_hash`. This is the independent ORACLE the dashtable's eviction must agree
+    /// with (DASHTABLE.md stage 2: "the same victim as the current freq-in-object selection"), and it
+    /// now validates parity with the ACTUAL store hash, not the crate's internal one.
+    fn oracle_victim(entries: &[(u64, u8)]) -> u64 {
+        entries
+            .iter()
+            .copied()
+            .min_by(|&(ka, fa), &(kb, fb)| {
+                fa.cmp(&fb)
+                    .then(scan_hash_of(&ka).cmp(&scan_hash_of(&kb)))
+                    .then(ka.cmp(&kb))
+            })
+            .map(|(k, _)| k)
+            .unwrap()
+    }
+
+    #[test]
+    fn cache_evicts_the_freq_in_object_victim() {
+        // Fill ONE segment to capacity, each value carrying a deterministic 2-bit freq. The next
+        // insert must evict exactly the slot the store's freq-in-object order would pick.
+        let mut dt: Dashtable<u64, Freqd> = Dashtable::with_directory_bits(0);
+        let entries: Vec<(u64, u8)> = (0..SEGMENT_CAP as u64)
+            .map(|i| (i, (i % 4) as u8))
+            .collect();
+        for &(k, freq) in &entries {
+            assert_eq!(
+                dt.insert_cache(
+                    k,
+                    Freqd {
+                        freq,
+                        tag: k as u32
+                    },
+                    freq_of,
+                    scan_hash_of
+                ),
+                CacheInsert::Inserted
+            );
+        }
+        assert_eq!(dt.len(), SEGMENT_CAP);
+
+        let expected = oracle_victim(&entries);
+        let out = dt.insert_cache(9999, Freqd { freq: 3, tag: 9999 }, freq_of, scan_hash_of);
+        match out {
+            CacheInsert::Evicted { key, .. } => {
+                assert_eq!(key, expected, "evicted the wrong victim");
+            }
+            other => panic!("expected an eviction, got {other:?}"),
+        }
+        assert_eq!(dt.get(&expected), None, "the victim must be gone");
+        assert_eq!(
+            dt.get(&9999),
+            Some(&Freqd { freq: 3, tag: 9999 }),
+            "the new key must be present"
+        );
+        assert_eq!(
+            dt.len(),
+            SEGMENT_CAP,
+            "cache mode holds len steady across an evict-insert"
+        );
+    }
+
+    #[test]
+    fn cache_higher_freq_survives_eviction() {
+        // One HOT slot (freq 3) among cold ones (freq 0) must never be the victim across many evicts.
+        let mut dt: Dashtable<u64, Freqd> = Dashtable::with_directory_bits(0);
+        dt.insert_cache(u64::MAX, Freqd { freq: 3, tag: 1 }, freq_of, scan_hash_of); // the hot key
+        for i in 0..(SEGMENT_CAP as u64 - 1) {
+            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of, scan_hash_of);
+        }
+        // Drive many evictions with fresh cold keys; the hot key must persist throughout.
+        for i in 1000..1100u64 {
+            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of, scan_hash_of);
+            assert_eq!(
+                dt.get(&u64::MAX),
+                Some(&Freqd { freq: 3, tag: 1 }),
+                "hot key was evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_eviction_is_segment_local() {
+        // With 16 distinct segments, filling+evicting the segment one key routes to must leave EVERY
+        // other segment's contents untouched (the O(1) locality claim).
+        let mut dt: Dashtable<u64, Freqd> = Dashtable::with_directory_bits(4);
+        // Seed one key into every segment via its top-4-bit prefix (key = prefix << 60).
+        for p in 0..16u64 {
+            let key = p << 60;
+            dt.insert_cache(
+                key,
+                Freqd {
+                    freq: 2,
+                    tag: p as u32,
+                },
+                freq_of,
+                scan_hash_of,
+            );
+        }
+        assert_eq!(dt.len(), 16);
+        // Hammer segment 0 (prefix 0) to full + beyond, forcing local evictions there.
+        for i in 1..(SEGMENT_CAP as u64 * 3) {
+            dt.insert_cache(i, Freqd { freq: 0, tag: 0 }, freq_of, scan_hash_of); // top bits 0 -> segment 0
+        }
+        // Every OTHER segment's seeded key is intact (only segment 0 evicted).
+        for p in 1..16u64 {
+            let key = p << 60;
+            assert_eq!(
+                dt.get(&key),
+                Some(&Freqd {
+                    freq: 2,
+                    tag: p as u32
+                }),
+                "segment {p} was disturbed by eviction in segment 0"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_insert_overwrites_in_place_without_eviction() {
+        let mut dt: Dashtable<u64, Freqd> = Dashtable::with_directory_bits(0);
+        assert_eq!(
+            dt.insert_cache(7, Freqd { freq: 1, tag: 10 }, freq_of, scan_hash_of),
+            CacheInsert::Inserted
+        );
+        assert_eq!(
+            dt.insert_cache(7, Freqd { freq: 2, tag: 20 }, freq_of, scan_hash_of),
+            CacheInsert::Overwrote(Freqd { freq: 1, tag: 10 })
+        );
+        assert_eq!(dt.get(&7), Some(&Freqd { freq: 2, tag: 20 }));
+        assert_eq!(dt.len(), 1, "an overwrite does not change len");
     }
 }
