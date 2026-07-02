@@ -79,8 +79,8 @@ pub use disk_backlog::{DiskBacklog, SpillError};
 
 pub mod lag;
 pub use lag::{
-    InSyncReplicas, LinkStatus, ReplNodeStatus, ReplRole, ReplStatusSnapshot, ReplicaLag, lag,
-    replica_is_in_sync,
+    CandidateReplica, InSyncReplicas, LinkStatus, PromotionSafety, ReplNodeStatus, ReplRole,
+    ReplStatusSnapshot, ReplicaLag, lag, replica_is_in_sync, safe_to_promote,
 };
 
 pub mod stream;
