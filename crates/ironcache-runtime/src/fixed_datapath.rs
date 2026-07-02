@@ -40,6 +40,12 @@ impl FixedRing {
     ///
     /// Returns the `io::Error` if `io_uring_register_buffers` fails (e.g. `RLIMIT_MEMLOCK` too low).
     /// The caller falls back to the owned-buffer datapath rather than treating it as fatal.
+    ///
+    /// # Panics
+    ///
+    /// Panics ("not in a runtime context") if called OUTSIDE a `tokio_uring::start` context, since
+    /// registration binds to the current thread's ring. The per-shard bootstrap always calls this on
+    /// the shard thread inside its `tokio_uring::start`.
     pub fn register(count: u16, buf_size: usize) -> io::Result<Self> {
         let bufs = (0..count).map(|_| Vec::with_capacity(buf_size));
         let pool = FixedBufPool::new(bufs);
@@ -52,6 +58,11 @@ impl FixedRing {
     /// slab (so a read burst cannot blow the memory bound), exactly the rule
     /// [`crate::buffer_pool::BufferPool::can_rearm`] encodes for the raw tier.
     pub fn checkout(&self) -> Option<FixedBuf> {
+        // `try_next(cap)` keys on the buffer's exact `bytes_total()` (capacity). This matches because
+        // the pool was registered with `Vec::with_capacity(buf_size)` (capacity == buf_size). If a
+        // future refactor ever built the buffers via a path whose `capacity()` could EXCEED buf_size,
+        // this key would never match and `checkout` would wedge on a permanent false `None` -- so the
+        // register/check-out sizes must stay tied to the one `buf_size` field, as they are here.
         self.pool.try_next(self.buf_size)
     }
 
