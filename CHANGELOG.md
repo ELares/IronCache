@@ -164,6 +164,14 @@ release.
 
 ### Added
 
+- Console image publishing (issue #363): the release + image pipelines now also build and publish the
+  console. On a `v*` tag, `image.yml` builds + pushes `ghcr.io/elares/ironcache-console` (multi-arch,
+  provenance + SBOM) in a SEPARATE `publish-console` job so a console-image problem can never affect
+  the cache image, and `release.yml` / `rolling-release.yml` ship a `ironcache-console-<ver>-<plat>.tar.gz`
+  binary as an additive asset (the existing `ironcache-*` upload/publish/SHA256SUMS globs pick it up).
+  `deploy-lint` gains an `actionlint` job (workflow syntax + shellcheck of every `run:` block), the
+  only PR-CI validation available for these tag-triggered workflows. (The console image the Helm/k8s/
+  compose manifests reference is now produced by the pipeline.)
 - Console HA readiness (issue #363): a boot WARNING when the console runs embedded (per-replica,
   in-memory) history on a non-loopback bind, since behind a load balancer each replica would then show
   a different `/api/timeseries` window (the fix is a shared `prometheus_url`); the console is otherwise

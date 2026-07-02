@@ -22,7 +22,7 @@ on:
       - "deploy/**"
       - "Dockerfile"
       - "Dockerfile.console"
-      - ".github/workflows/deploy-lint.yml"
+      - ".github/workflows/**"
 
 permissions:
   contents: read
@@ -64,6 +64,9 @@ jobs:
           # schema; -strict rejects unknown fields in the core resources.
           for extra in "" "--set console.enabled=true --set console.replicas=2"; do
             echo "::group::helm template ${extra:-(defaults)}"
+            # $extra must WORD-SPLIT into multiple `--set` flags, so it is
+            # intentionally unquoted (SC2086 does not apply here).
+            # shellcheck disable=SC2086
             rendered="$(helm template ic deploy/helm/ironcache $extra)"
             printf '%s\n' "$rendered" \
               | kubeconform -strict -summary -verbose \
@@ -114,6 +117,30 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile.console
+
+  actionlint:
+    name: actionlint (workflow syntax + shellcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+      - name: "actionlint (all workflows; shellcheck run blocks)"
+        run: |
+          set -euo pipefail
+          # actionlint auto-discovers .github/workflows/*.yml, validates the action
+          # input schemas + expression syntax, and shellchecks every run: block
+          # (shellcheck is preinstalled on the runner). This is the only PR-CI
+          # validation available for the tag-triggered release/image workflows.
+          actionlint -color
 
   compose:
     name: docker compose config (validate)

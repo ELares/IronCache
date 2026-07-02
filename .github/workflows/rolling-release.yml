@@ -172,6 +172,11 @@ jobs:
           # of the same inputs yields a byte-identical archive.
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" -C "$tdir" -czf "$out" ironcache
+          # The console binary (#363), a SEPARATE additive asset: the
+          # `ironcache-*.tar.gz` upload + publish globs also match it.
+          outc="ironcache-console-${VERSION}-${{ matrix.plat }}.tar.gz"
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" -C "$tdir" -czf "$outc" ironcache-console
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         # A UNIQUE artifact name per platform (no shared SHA256SUMS file), so the
         # publish job's merge-multiple download cannot have two same-named files
