@@ -1,0 +1,147 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- if .Values.console.enabled }}
+{{- $httpPort := int .Values.console.httpPort -}}
+# The IronCache CONSOLE (epic #352, issue #363): a STATELESS monitoring/management
+# server, run as N identical replicas behind a load balancer (the client Service
+# below). Unlike the cache StatefulSet it holds no durable state: no PVC, no
+# per-pod identity, no headless Service. Auth is a Bearer header (no session), the
+# topology view is re-derived per replica, and readiness is per-replica, so any
+# replica serves any request. History must be a SHARED Prometheus for consistency
+# (see console.prometheusUrl), not the per-replica embedded buffer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ironcache.console.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.console.labels" . | nindent 4 }}
+spec:
+  replicas: {{ int .Values.console.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ironcache.console.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ironcache.console.labels" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        # No fsGroup: the console has no PVC and runs read-only-root.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        podAntiAffinity:
+          {{- if eq .Values.podAntiAffinity.type "hard" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "ironcache.console.selectorLabels" . | nindent 18 }}
+              topologyKey: {{ .Values.podAntiAffinity.topologyKey }}
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "ironcache.console.selectorLabels" . | nindent 20 }}
+                topologyKey: {{ .Values.podAntiAffinity.topologyKey }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: console
+          image: "{{ .Values.console.image.repository }}:{{ .Values.console.image.tag }}"
+          imagePullPolicy: {{ .Values.console.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          args:
+            - run
+          env:
+            # Bind all interfaces so the kubelet probe + Service can reach it (the
+            # binary defaults to loopback). The image already sets this; repeated
+            # here so the manifest is self-documenting and override-friendly.
+            - name: IRONCACHE_CONSOLE_HTTP_ADDR
+              value: "0.0.0.0:{{ $httpPort }}"
+            - name: IRONCACHE_CONSOLE_LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            {{- with .Values.console.seeds }}
+            - name: IRONCACHE_CONSOLE_SEEDS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.console.prometheusUrl }}
+            - name: IRONCACHE_CONSOLE_PROMETHEUS_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.console.nodeUser }}
+            - name: IRONCACHE_CONSOLE_NODE_USER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.console.nodePasswordSecret.existingSecret }}
+            - name: IRONCACHE_CONSOLE_NODE_PASSWORD_FILE
+              value: /run/console/node-password
+            {{- end }}
+            {{- if .Values.console.tokensSecret.existingSecret }}
+            - name: IRONCACHE_CONSOLE_READ_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.console.tokensSecret.existingSecret }}
+                  key: {{ .Values.console.tokensSecret.readTokenKey }}
+                  optional: true
+            - name: IRONCACHE_CONSOLE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.console.tokensSecret.existingSecret }}
+                  key: {{ .Values.console.tokensSecret.adminTokenKey }}
+                  optional: true
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $httpPort }}
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.console.resources | nindent 12 }}
+          {{- if .Values.console.nodePasswordSecret.existingSecret }}
+          volumeMounts:
+            - name: node-password
+              mountPath: /run/console
+              readOnly: true
+          {{- end }}
+      {{- if .Values.console.nodePasswordSecret.existingSecret }}
+      volumes:
+        - name: node-password
+          secret:
+            secretName: {{ .Values.console.nodePasswordSecret.existingSecret }}
+            items:
+              - key: {{ .Values.console.nodePasswordSecret.key }}
+                path: node-password
+      {{- end }}
+{{- end }}

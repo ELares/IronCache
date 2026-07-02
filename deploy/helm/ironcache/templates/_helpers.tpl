@@ -45,3 +45,31 @@ Usage: include "ironcache.nodeId" (dict "ctx" . "ordinal" 0)
 {{- $seed := printf "%s-%d" (include "ironcache.fullname" .ctx) (int .ordinal) -}}
 {{- substr 0 40 (sha256sum $seed) -}}
 {{- end -}}
+
+{{/* The console workload / Service base name (a distinct resource from the StatefulSet). */}}
+{{- define "ironcache.console.fullname" -}}
+{{- printf "%s-console" (include "ironcache.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+Console selector labels. CRITICAL: the console uses a DISTINCT
+`app.kubernetes.io/name` (`<name>-console`), not the cache's `<name>`, so the
+console pod labels are NOT a superset of the cache selector labels. If the console
+reused the cache name, the cache PDB/Services/StatefulSet selectors (which are just
+{name, instance}) would ALSO select the console pods -- a cross-controller PDB that
+can block a cache node drain. A distinct name avoids that WITHOUT touching (and
+breaking) the cache's immutable StatefulSet selector. Version is omitted (stable
+across upgrades), matching ironcache.selectorLabels.
+*/}}
+{{- define "ironcache.console.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "ironcache.name" . }}-console
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: console
+{{- end -}}
+
+{{/* Console labels: the selector labels PLUS the managed-by / chart / version metadata. */}}
+{{- define "ironcache.console.labels" -}}
+{{ include "ironcache.console.selectorLabels" . }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
+{{- end -}}

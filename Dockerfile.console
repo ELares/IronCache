@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Production container image for the IronCache CONSOLE (epic #352, issue #363).
+#
+# The console is a SEPARATE, STATELESS monitoring/management server from the
+# `ironcache` data-plane binary; it discovers a deployment, aggregates a
+# cluster-wide view, and serves a dashboard + `/api/*`, staying OUT of the client
+# data path. This image mirrors the server image (Dockerfile): it STAGES the SAME
+# fully-static musl `ironcache-console` binary the release pipeline builds (the
+# `*-unknown-linux-musl` targets, `crt-static`, no libc dependency) onto a minimal,
+# nonroot, distroless runtime. There is no Rust toolchain in either stage, so the
+# final image is tiny and cannot drift from the released, attested artifact. The
+# dashboard assets (HTML/CSS/JS/fonts) are compiled INTO the binary (include_str!/
+# include_bytes!), so nothing else needs staging. Unlike the server image there is
+# NO data VOLUME (the console holds no durable state).
+#
+# Local / manual multi-arch build (after the release tarballs are unpacked under
+# dist/, see .github/workflows/image.yml for the exact layout):
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f Dockerfile.console -t ghcr.io/elares/ironcache-console:dev --load .
+#
+# Port:
+#   9180  the single HTTP listener: /livez + /readyz + /metrics + the UI + /api/*
+#         (IRONCACHE_CONSOLE_HTTP_ADDR). It defaults to loopback, so this image
+#         sets it to 0.0.0.0:9180 below or a kubelet/LB probe could not reach it.
+
+# --- stage: take the prebuilt static musl binary for the target arch ----------
+# `alpine` is a throwaway staging filesystem to chmod the binary; it never reaches
+# the final image. TARGETARCH (amd64 | arm64) is set by buildx, so one Dockerfile
+# serves both arches.
+FROM alpine:3 AS stage
+ARG TARGETARCH
+WORKDIR /stage
+# dist/amd64/ironcache-console and dist/arm64/ironcache-console are the fully-static
+# musl binaries unpacked from the release tarballs by the image-publish CI.
+COPY dist/${TARGETARCH}/ironcache-console /stage/ironcache-console
+RUN chmod 0755 /stage/ironcache-console
+
+# --- final: distroless static, nonroot, least-privilege -----------------------
+# gcr.io/distroless/static:nonroot ships CA certs + a nonroot user (uid/gid 65532)
+# and NOTHING else (no shell, no package manager, no libc): the minimal, secure
+# runtime for a static binary.
+FROM gcr.io/distroless/static:nonroot
+
+# OCI image metadata. The version label is overwritten at build time by the CI
+# `--label org.opencontainers.image.version=<tag>`.
+LABEL org.opencontainers.image.title="ironcache-console"
+LABEL org.opencontainers.image.description="The IronCache monitoring + management console (stateless)."
+LABEL org.opencontainers.image.source="https://github.com/ELares/IronCache"
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+COPY --from=stage /stage/ironcache-console /usr/local/bin/ironcache-console
+
+# Run as the distroless nonroot user (uid 65532), never root. The console needs no
+# writable filesystem (stateless), so it pairs with readOnlyRootFilesystem: true.
+USER 65532:65532
+
+# Document the single HTTP port (EXPOSE is metadata only; it does not publish).
+EXPOSE 9180
+
+# Bind all interfaces so a kubelet probe / load balancer can reach the listener
+# (the binary defaults to loopback 127.0.0.1:9180, which is unreachable in a
+# container). Mirrors how the server image sets IRONCACHE_DATA_DIR. Override any
+# other knob via IRONCACHE_CONSOLE_* env vars or a mounted TOML.
+ENV IRONCACHE_CONSOLE_HTTP_ADDR=0.0.0.0:9180
+
+ENTRYPOINT ["/usr/local/bin/ironcache-console"]
+CMD ["run"]

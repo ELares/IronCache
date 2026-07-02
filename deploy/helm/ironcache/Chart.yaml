@@ -8,7 +8,8 @@ description: >-
   preserves Raft quorum.
 type: application
 # The chart version. Bump on chart changes (independent of the app version).
-version: 0.1.0
+# 0.2.0: adds the optional stateless console Deployment (console.enabled, #363).
+version: 0.2.0
 # The default IronCache image tag this chart targets. Override via
 # image.tag in values.yaml. Quoted so a calendar version is not parsed as a float.
 appVersion: "latest"

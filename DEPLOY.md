@@ -3,11 +3,20 @@
 
 This guide covers the production deployment artifacts that ship in this repo:
 
-- A multi-stage, non-root container image (`Dockerfile`), published to GHCR by
+- Two multi-stage, non-root container images (`Dockerfile` for the cache,
+  `Dockerfile.console` for the console), published to GHCR by
   `.github/workflows/image.yml`.
-- `deploy/compose/` -- single-node and 3-node Raft cluster docker-compose files.
-- `deploy/helm/ironcache/` -- a Helm chart deploying a StatefulSet.
-- `deploy/k8s/` -- the same StatefulSet as raw, Helm-free YAML.
+- `deploy/compose/` -- single-node and 3-node Raft cluster docker-compose files,
+  plus `docker-compose.console.yml` (two stateless console replicas behind an LB).
+- `deploy/helm/ironcache/` -- a Helm chart deploying the cache StatefulSet and an
+  optional stateless console Deployment (`console.enabled=true`).
+- `deploy/k8s/` -- the same StatefulSet as raw, Helm-free YAML, plus
+  `ironcache-console.yaml` (the console Deployment + Service).
+
+The deploy artifacts are lint-gated on every PR that touches them
+(`.github/workflows/deploy-lint.yml`: `helm lint` + `kubeconform` on the rendered
+chart and the raw manifests, `hadolint` on both Dockerfiles, `docker compose
+config` on the compose files).
 
 It maps every knob to the REAL config key, explains the ports, and is honest
 about what was validated offline versus what needs a live cluster to confirm.
@@ -203,6 +212,28 @@ kubectl create namespace ironcache
 # Edit the Secret placeholders (cluster_secret / requirepass) first!
 kubectl -n ironcache apply -f deploy/k8s/ironcache.yaml
 ```
+
+### The console (optional, stateless)
+
+The monitoring/management console (epic #352) is a SEPARATE, stateless workload,
+off by default. It is a Deployment of N identical replicas behind a Service (no
+PVC, no per-pod identity), so it scales horizontally and any replica serves any
+request; see "Console HA" under section 7 for the statelessness details.
+
+- **Helm:** enable it in the same release with `--set console.enabled=true`
+  (tune `console.replicas`, `console.seeds`, `console.prometheusUrl`, and the
+  `console.nodePasswordSecret` / `console.tokensSecret` references). It renders a
+  Deployment + Service + (at 2+ replicas) a PodDisruptionBudget.
+- **Raw manifests:** `kubectl -n ironcache apply -f deploy/k8s/ironcache-console.yaml`
+  (edit the Secret placeholders + the seeds/Prometheus env first).
+- **docker-compose:** overlay `docker-compose.console.yml` (two replicas + an nginx
+  LB) onto a cache compose file.
+
+In every form: point the console at the cache client Service/nodes
+(`IRONCACHE_CONSOLE_SEEDS`), a SHARED Prometheus for consistent history
+(`IRONCACHE_CONSOLE_PROMETHEUS_URL`), and the least-privilege node user
+(`console_monitor`, section 6); set a read token so the privileged API is not open;
+and keep the console Service behind a VPN-locked LB (#369).
 
 ---
 

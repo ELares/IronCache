@@ -169,8 +169,16 @@ release.
   a different `/api/timeseries` window (the fix is a shared `prometheus_url`); the console is otherwise
   already stateless (header-token auth, independently-polled topology, per-replica `/livez` + `/readyz`
   probes) and safe to run as N replicas behind an LB. DEPLOY.md documents the stateless-behind-a-load-
-  balancer HA topology. The reference container image + Helm/k8s manifests are tracked follow-up
-  packaging work under #363.
+  balancer HA topology.
+- Console packaging (issue #363): a container image (`Dockerfile.console`, the same static-musl,
+  distroless/nonroot recipe as the cache image) plus reference deployment artifacts for the stateless
+  console: an optional Helm Deployment + Service + PDB (`console.enabled=true`), a raw
+  `deploy/k8s/ironcache-console.yaml`, and a `deploy/compose/docker-compose.console.yml` overlay (two
+  replicas behind an nginx LB). A new `deploy-lint` CI workflow validates all of it on every PR that
+  touches it (`helm lint` + `kubeconform` on the rendered chart and raw manifests, `hadolint` on both
+  Dockerfiles, `docker compose config` on the compose files), so the manifests cannot silently rot.
+  DEPLOY.md documents deploying the console in each form. (The tag-triggered release/image-publish
+  entry that BUILDS the console image is a tracked follow-up.)
 - Reference least-privilege console aclfile (issue #367): `deploy/aclfile.console.example` ships two
   scoped IronCache ACL users the console authenticates as when it dials nodes: `console_monitor`
   (read-only, exactly the poll loop's PING/INFO/CLIENT LIST, no key access, no mutation) and

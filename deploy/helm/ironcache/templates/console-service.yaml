@@ -1,0 +1,22 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- if .Values.console.enabled }}
+# The console's load-balancer endpoint: a single stable Service in front of the N
+# stateless console replicas. It selects ONLY console pods (component=console), so
+# it never routes to the cache StatefulSet. Front this with an Ingress / external
+# LB (VPN-locked, per #369) for operator access.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ironcache.console.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.console.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.console.service.type }}
+  selector:
+    {{- include "ironcache.console.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ int .Values.console.httpPort }}
+      targetPort: http
+{{- end }}

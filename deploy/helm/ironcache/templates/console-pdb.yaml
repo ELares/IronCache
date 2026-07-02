@@ -1,0 +1,22 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- /*
+PodDisruptionBudget for the console replicas. The console has NO quorum (each
+replica is independent + stateless), so unlike the cache StatefulSet (which needs
+3+ for Raft majority) it can be protected at 2+ replicas: maxUnavailable keeps at
+least one console serving through a voluntary disruption (node drain / rolling node
+upgrade), so operator access is never fully interrupted.
+*/ -}}
+{{- if and .Values.console.enabled (ge (int .Values.console.replicas) 2) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ironcache.console.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.console.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.console.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "ironcache.console.selectorLabels" . | nindent 6 }}
+{{- end }}

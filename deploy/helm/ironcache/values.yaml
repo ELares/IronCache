@@ -192,3 +192,58 @@ initImage:
   repository: busybox
   tag: "1.36"
   pullPolicy: IfNotPresent
+
+# --- Console (epic #352, issue #363) ------------------------------------------
+# The IronCache monitoring/management console: a SEPARATE, STATELESS Deployment
+# (not part of the cache StatefulSet), disabled by default. When enabled the chart
+# renders a Deployment of N identical replicas behind a ClusterIP Service, plus a
+# PodDisruptionBudget for 2+ replicas. It shares the image/anti-affinity/resource
+# posture but holds no state: no PVC, no per-pod identity, no headless Service.
+console:
+  enabled: false
+  # N stateless replicas behind the Service below. 2+ gives HA (and a PDB).
+  replicas: 2
+  image:
+    repository: ghcr.io/elares/ironcache-console
+    # Pin to an immutable version in production, NOT "latest".
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  # The single HTTP port serving /livez + /readyz + /metrics + the UI + /api/*.
+  httpPort: 9180
+  service:
+    type: ClusterIP
+  # Seed nodes the console polls. Point at the cache client Service DNS, e.g.
+  #   - "ironcache.<namespace>.svc.cluster.local:6379"
+  # Empty leaves the poll loop idle (and /readyz never ready), so set this.
+  seeds: []
+  # A SHARED Prometheus URL is the HA-consistent history backend (every replica
+  # queries the same store). Leave empty only for a single replica; with multiple
+  # replicas an unset URL falls back to per-replica embedded history, which the
+  # console WARNS about on a non-loopback bind (each replica shows a different
+  # trend window). e.g. "http://prometheus.monitoring.svc.cluster.local:9090".
+  prometheusUrl: ""
+  # The least-privilege ACL user the console dials nodes as (deploy/aclfile.console.example).
+  nodeUser: console_monitor
+  # The node password: reference an existing Secret; the chart mounts its `key` as
+  # a file and points IRONCACHE_CONSOLE_NODE_PASSWORD_FILE at it (never inline).
+  nodePasswordSecret:
+    existingSecret: ""
+    key: console_node_password
+  # The API RBAC tokens (read + admin). Reference an existing Secret; the keys are
+  # injected as env (optional, so an absent key is fine). Configuring a token flips
+  # the console into ENFORCE mode -- set at least the read token for a non-loopback
+  # (behind-LB) deployment, or privileged routes return 401.
+  tokensSecret:
+    existingSecret: ""
+    readTokenKey: console_read_token
+    adminTokenKey: console_admin_token
+  # Per-replica resource envelope (smaller than a cache node: the console is I/O,
+  # not memory, bound).
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      memory: "256Mi"
+  pdb:
+    maxUnavailable: 1
