@@ -33,6 +33,11 @@ pub mod persist;
 // headroom (tmpfs is RAM -- a too-big snapshot would OOM), else the durable data_dir. Pure decision +
 // a Linux MemAvailable read; the OOM-prevention guard is the correctness core.
 pub mod handoff;
+// The live rolling-upgrade OBSERVERS (#392 Phase 3): translate a cluster snapshot (ClusterView) into
+// the ironcache-repl upgrade_step inputs + pick the promotion candidate. The pure observe/decision
+// layer of the live UpgradeActions impl; the wire I/O (fetch /topology + INFO, CLUSTER FAILOVER, the
+// per-node upgrade) is a following slice.
+pub mod cluster_upgrade;
 pub mod pubsub;
 pub mod raft_boot;
 /// HA-7d LIVE per-shard replica attach. Reached ONLY in raft-mode once an `AssignReplica`
