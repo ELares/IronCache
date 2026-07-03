@@ -243,7 +243,7 @@ pub use uring_bootstrap::run_shards_uring;
 mod uring_bootstrap {
     use super::{IoUringRuntime, TcpStream};
     use crate::bootstrap::{ShardConfig, ShardId, ShardSet};
-    use crate::tokio_rt::bind_reuseport_std;
+    use crate::tokio_rt::listener_for;
     use std::cell::Cell;
     use std::future::Future;
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -302,9 +302,11 @@ mod uring_bootstrap {
             inboxes.len()
         );
 
-        // Bind the ONE listening socket up front so a bind failure surfaces here, not inside
-        // a spawned thread (same as the tokio bootstrap). The acceptor thread owns it.
-        let listener = bind_reuseport_std(cfg.bind)?;
+        // Obtain the ONE listening socket up front so a bind failure surfaces here, not inside a
+        // spawned thread (same as the tokio bootstrap). `listener_for` adopts a systemd socket-
+        // activation inherited fd if one was passed (#389), else self-binds. The acceptor thread
+        // owns it.
+        let listener = listener_for(cfg.bind)?;
 
         // One connection channel per shard: the acceptor sends accepted std streams, the
         // shard receives them. Unbounded so the synchronous acceptor never blocks on a
