@@ -229,6 +229,8 @@ pub mod uring_probe;
 // compiles + is functionally tested only on the io_uring path (a real ring).
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 pub mod fixed_datapath;
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+pub use fixed_datapath::recv_batch;
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
