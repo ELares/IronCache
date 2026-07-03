@@ -16,6 +16,18 @@
 //! The DECISION ([`handoff_target`] + [`headroom_for`]) is pure + cfg-free (truth-table tested on
 //! every host); the available-RAM read ([`available_ram_bytes`], `/proc/meminfo`) is Linux, with a
 //! `None` fallback everywhere else that makes the guard take the safe `data_dir` path.
+//!
+//! ## The headroom is calibrated for the SAVE step (a load-wiring precondition)
+//!
+//! `MemAvailable` already EXCLUDES the resident live dataset, so `snapshot + headroom <= MemAvailable`
+//! correctly bounds the tmpfs snapshot's INCREMENTAL cost at save time. But that only stays safe
+//! across the LOAD if the incoming new process MMAP-REATTACHES / shares the tmpfs pages
+//! (WARM_RESTART.md: relative-offset fixup + O(n) index regen over the resident mapping, no re-read).
+//! If the deferred load path instead DESERIALIZES the tmpfs snapshot into a SECOND in-heap copy while
+//! the tmpfs file is still resident, the load-time peak is `tmpfs(x) + heap(x)` and the 25% headroom
+//! UNDER-provisions (it would need ~100%). So when the save/load wiring lands, the headroom constant
+//! MUST be validated against the actual load implementation; the guard is save-step-correct, not
+//! load-safe by assumption.
 
 use std::path::{Path, PathBuf};
 
@@ -64,7 +76,10 @@ pub fn handoff_target(
         return HandoffTarget::DataDir; // unknown RAM -> do not gamble on tmpfs
     };
     match snapshot_bytes.checked_add(headroom_bytes) {
-        // Fits with headroom -> stage on tmpfs, in a node-private subdir of the mount.
+        // Fits with headroom -> stage on tmpfs, at a FIXED well-known name: the old + new process
+        // rendezvous on it across the handoff, so it must NOT be pid-scoped. Node-LOCAL, not
+        // instance-private -- two instances on one host (or a stale dir from a crashed prior handoff)
+        // would collide; out of scope for #390's single-node handoff (the caller truncates/creates it).
         Some(need) if need <= avail => HandoffTarget::Tmpfs(tmpfs_dir.join("ironcache-handoff")),
         // Does not fit (or the addition overflowed) -> the durable disk path, which does not eat RAM.
         _ => HandoffTarget::DataDir,
