@@ -164,6 +164,18 @@ release.
 
 ### Added
 
+- Rolling-upgrade DRIVER (issue #392 Phase 3): `ironcache-repl`'s `upgrade_plan` gains
+  `run_rolling_upgrade` / `drive_upgrade_step` + the `UpgradeActions` trait, the orchestration loop
+  that turns the pure `upgrade_step` decision (#494) into an executed cluster rolling upgrade:
+  observe the committed cluster state, compute the next step, and execute its action (upgrade the next
+  replica, promote via the `safe_to_promote` guardrail, upgrade the demoted old primary last), looping
+  until done. Bounded by a tick budget so a stuck upgrade (a replica that never catches up, or a
+  promotion that stays blocked because quorum never returns) fails loud (`UpgradeReport`) rather than
+  looping forever, and an action error stops the upgrade rather than pressing on. The cluster ACTIONS
+  (the raft `PromoteReplica` commit + the per-node self-updater) sit behind the `UpgradeActions` trait
+  so the SEQUENCING is unit-tested against a simulated-cluster mock (the safety invariants -- primary
+  upgraded last, no promotion without quorum + an in-sync candidate -- are enforced by `upgrade_step`);
+  the live actions are the clustered layer.
 - Upgrade-handoff snapshot tmpfs target + RAM-headroom guard (issue #390 Phase 2b): a new
   `ironcache::handoff` module decides where to stage the `ironcache upgrade` handoff snapshot -- tmpfs
   (`/dev/shm`, no disk I/O) when it fits in available RAM with headroom, else the durable `data_dir`.

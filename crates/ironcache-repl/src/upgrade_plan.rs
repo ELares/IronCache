@@ -124,15 +124,230 @@ pub fn upgrade_step(
     }
 }
 
+/// The outcome of driving the rolling upgrade to (attempted) completion (#392).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeReport {
+    /// Every node upgraded, the primary LAST: the rolling upgrade completed.
+    Completed,
+    /// The upgrade did not finish within the tick budget -- a replica never caught up, or the
+    /// promotion stayed BLOCKED (no quorum / no in-sync candidate). Carries the last step so the
+    /// operator sees WHY it stalled. The driver fails loud here rather than looping forever.
+    StalledAfterBudget(UpgradeStep),
+}
+
+/// The CLUSTER OPERATIONS the rolling-upgrade DRIVER invokes (#392 Phase 3). The live impl drives the
+/// single-node self-updater per node, waits for re-attach/in-sync, and triggers the committed raft
+/// `PromoteReplica` fence; it is unit-tested with a simulated-cluster mock. Splitting the cluster
+/// ACTIONS behind this trait from the pure [`upgrade_step`] DECISION keeps the driver's SEQUENCING
+/// testable without a live cluster (the live actions are the clustered layer).
+pub trait UpgradeActions {
+    /// A cluster action failure (a node upgrade timed out, a raft propose was rejected, ...). The
+    /// driver surfaces it and STOPS rather than pressing on across a broken cluster.
+    type Error;
+
+    // -- observe the committed cluster state (the inputs [`upgrade_step`] decides on) --
+    /// Replica nodes NOT yet on the new version.
+    fn replicas_to_upgrade(&self) -> usize;
+    /// Is a just-upgraded replica still re-syncing (not yet back in sync)?
+    fn replica_catching_up(&self) -> bool;
+    /// The [`safe_to_promote`](crate::lag::safe_to_promote) verdict for the chosen upgraded in-sync
+    /// candidate (the lag gate + quorum).
+    fn promotion_safety(&self) -> PromotionSafety;
+    /// Has the `PromoteReplica` committed, so the old primary is now a replica?
+    fn primary_demoted(&self) -> bool;
+    /// Is the demoted old primary now on the new version?
+    fn old_primary_upgraded(&self) -> bool;
+
+    // -- execute a step's action --
+    /// Upgrade the next not-yet-upgraded replica in place (drive its self-updater; it re-attaches).
+    ///
+    /// # Errors
+    /// The cluster action's error if the replica upgrade cannot be started/completed.
+    fn upgrade_next_replica(&mut self) -> Result<(), Self::Error>;
+    /// Promote the chosen upgraded in-sync replica (the committed raft `PromoteReplica` fence).
+    ///
+    /// # Errors
+    /// The cluster action's error if the promotion cannot be committed.
+    fn promote_candidate(&mut self) -> Result<(), Self::Error>;
+    /// Upgrade the demoted old primary (now a replica) -- the LAST node.
+    ///
+    /// # Errors
+    /// The cluster action's error if the old-primary upgrade cannot be started/completed.
+    fn upgrade_old_primary(&mut self) -> Result<(), Self::Error>;
+
+    /// WAIT for the cluster to make progress before the next tick (a replica to catch up, quorum to
+    /// return). The live impl polls the cluster with a backoff; the mock advances its simulated state.
+    ///
+    /// # Errors
+    /// The cluster action's error if the wait/poll itself fails.
+    fn wait_for_progress(&mut self) -> Result<(), Self::Error>;
+}
+
+/// Drive ONE step: read the cluster state, compute [`upgrade_step`], and execute the matching action.
+/// Returns the step taken. `AwaitInSync` / `Blocked` / `Done` execute NO action (the caller waits or
+/// finishes).
+///
+/// # Errors
+///
+/// Propagates the [`UpgradeActions::Error`] from the executed action (the upgrade stops on failure
+/// rather than proceeding across a broken cluster).
+pub fn drive_upgrade_step<A: UpgradeActions>(actions: &mut A) -> Result<UpgradeStep, A::Error> {
+    let step = upgrade_step(
+        actions.replicas_to_upgrade(),
+        actions.replica_catching_up(),
+        actions.promotion_safety(),
+        actions.primary_demoted(),
+        actions.old_primary_upgraded(),
+    );
+    match step {
+        UpgradeStep::UpgradeReplica => actions.upgrade_next_replica()?,
+        UpgradeStep::Promote => actions.promote_candidate()?,
+        UpgradeStep::UpgradeOldPrimary => actions.upgrade_old_primary()?,
+        // No action: the driver is waiting (AwaitInSync/Blocked) or the upgrade is finished (Done).
+        UpgradeStep::AwaitInSync | UpgradeStep::Blocked(_) | UpgradeStep::Done => {}
+    }
+    Ok(step)
+}
+
+/// Drive the WHOLE rolling upgrade to completion (#392): loop [`drive_upgrade_step`], letting the
+/// cluster make progress between ticks, until `Done`. Bounded by `max_ticks` so a stuck upgrade (a
+/// replica that never catches up, or a promotion that stays `Blocked` because quorum never returns)
+/// fails LOUD ([`UpgradeReport::StalledAfterBudget`]) instead of looping forever.
+///
+/// The safety invariants -- the primary is upgraded LAST, and a promotion happens only when
+/// [`safe_to_promote`](crate::lag::safe_to_promote) says it is safe -- are enforced entirely by
+/// [`upgrade_step`]; this loop merely executes its decisions and never reorders them.
+///
+/// `max_ticks` MUST be `> 0` (a zero budget makes no observation and is a caller error, debug-asserted).
+///
+/// # Errors
+///
+/// Propagates the first [`UpgradeActions::Error`] from an executed action or a wait.
+pub fn run_rolling_upgrade<A: UpgradeActions>(
+    actions: &mut A,
+    max_ticks: usize,
+) -> Result<UpgradeReport, A::Error> {
+    debug_assert!(
+        max_ticks > 0,
+        "run_rolling_upgrade needs a positive tick budget"
+    );
+    // Track the last OBSERVED step (not the `Done` sentinel) so `StalledAfterBudget` reports the true
+    // blocking step. Starts `None` so a (degenerate) zero budget cannot report `StalledAfterBudget(Done)`.
+    let mut last: Option<UpgradeStep> = None;
+    for _ in 0..max_ticks {
+        let step = drive_upgrade_step(actions)?;
+        if step == UpgradeStep::Done {
+            return Ok(UpgradeReport::Completed);
+        }
+        last = Some(step);
+        // Acted, AwaitInSync, or Blocked: let the cluster make progress (a node finishes upgrading, a
+        // replica catches up, quorum returns) before re-evaluating.
+        actions.wait_for_progress()?;
+    }
+    // Budget exhausted with progress observed -> the last blocking step; or (zero budget) nothing
+    // observed -> report the stall against `AwaitInSync` (a neutral "made no progress"), never `Done`.
+    Ok(UpgradeReport::StalledAfterBudget(
+        last.unwrap_or(UpgradeStep::AwaitInSync),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BlockReason, UpgradeStep, upgrade_step};
+    use super::{
+        BlockReason, UpgradeReport, UpgradeStep, drive_upgrade_step, run_rolling_upgrade,
+        upgrade_step,
+    };
     use crate::lag::PromotionSafety;
+    use crate::upgrade_plan::UpgradeActions;
 
     // Shorthands for the promotion verdict (Phase 2 only cares about it once replicas are done).
     const SAFE: PromotionSafety = PromotionSafety::Safe;
     const NO_QUORUM: PromotionSafety = PromotionSafety::NoQuorum;
     const NOT_IN_SYNC: PromotionSafety = PromotionSafety::CandidateNotInSync;
+
+    /// A simulated cluster for driving [`run_rolling_upgrade`] without a live raft cluster. It evolves
+    /// its state as the driver executes actions + waits, recording the action ORDER so a test can
+    /// assert the driver drove the #392 sequence (replicas first -> promote -> old primary last).
+    // A cluster-state simulation: each bool is an independent, named cluster condition, so bools are
+    // the natural representation here (not the boolean-blind API `struct_excessive_bools` warns of).
+    #[allow(clippy::struct_excessive_bools)]
+    struct MockCluster {
+        replicas_left: usize,
+        catching_up: bool,
+        /// An upgraded, in-sync replica exists to promote (set once a replica catches up).
+        promotable_candidate: bool,
+        /// The config-plane raft quorum is available (else `safe_to_promote` -> NoQuorum).
+        quorum: bool,
+        demoted: bool,
+        old_primary_upgraded: bool,
+        actions_log: Vec<&'static str>,
+    }
+
+    impl MockCluster {
+        fn with_replicas(replicas: usize, quorum: bool) -> Self {
+            MockCluster {
+                replicas_left: replicas,
+                catching_up: false,
+                promotable_candidate: false,
+                quorum,
+                demoted: false,
+                old_primary_upgraded: false,
+                actions_log: Vec::new(),
+            }
+        }
+    }
+
+    impl UpgradeActions for MockCluster {
+        type Error = ();
+
+        fn replicas_to_upgrade(&self) -> usize {
+            self.replicas_left
+        }
+        fn replica_catching_up(&self) -> bool {
+            self.catching_up
+        }
+        fn promotion_safety(&self) -> PromotionSafety {
+            if !self.quorum {
+                PromotionSafety::NoQuorum
+            } else if self.promotable_candidate {
+                PromotionSafety::Safe
+            } else {
+                PromotionSafety::CandidateNotInSync
+            }
+        }
+        fn primary_demoted(&self) -> bool {
+            self.demoted
+        }
+        fn old_primary_upgraded(&self) -> bool {
+            self.old_primary_upgraded
+        }
+
+        fn upgrade_next_replica(&mut self) -> Result<(), ()> {
+            self.actions_log.push("upgrade_replica");
+            self.replicas_left -= 1;
+            self.catching_up = true; // a just-upgraded replica re-syncs before the next step
+            Ok(())
+        }
+        fn promote_candidate(&mut self) -> Result<(), ()> {
+            self.actions_log.push("promote");
+            self.demoted = true; // the PromoteReplica fence committed
+            Ok(())
+        }
+        fn upgrade_old_primary(&mut self) -> Result<(), ()> {
+            self.actions_log.push("upgrade_old_primary");
+            self.old_primary_upgraded = true;
+            Ok(())
+        }
+        fn wait_for_progress(&mut self) -> Result<(), ()> {
+            // A catching-up replica finishes re-syncing; once it is in sync it is a promotable
+            // candidate. (Quorum is fixed per-test: if it never returns, the driver stays blocked.)
+            if self.catching_up {
+                self.catching_up = false;
+                self.promotable_candidate = true;
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn phase1_upgrades_replicas_first_one_at_a_time() {
@@ -237,5 +452,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn run_rolling_upgrade_drives_replicas_first_then_promote_then_old_primary() {
+        // Two replicas + quorum: the driver must upgrade BOTH replicas, then promote, then upgrade
+        // the old primary LAST, and report Completed.
+        let mut cluster = MockCluster::with_replicas(2, true);
+        let report = run_rolling_upgrade(&mut cluster, 50).unwrap();
+        assert_eq!(report, UpgradeReport::Completed);
+        assert_eq!(
+            cluster.actions_log,
+            vec![
+                "upgrade_replica",
+                "upgrade_replica",
+                "promote",
+                "upgrade_old_primary",
+            ],
+            "the driver drove the #392 sequence: replicas first, promote, old primary last"
+        );
+    }
+
+    #[test]
+    fn run_rolling_upgrade_handles_a_single_replica_cluster() {
+        let mut cluster = MockCluster::with_replicas(1, true);
+        assert_eq!(
+            run_rolling_upgrade(&mut cluster, 50).unwrap(),
+            UpgradeReport::Completed
+        );
+        assert_eq!(
+            cluster.actions_log,
+            vec!["upgrade_replica", "promote", "upgrade_old_primary"]
+        );
+    }
+
+    #[test]
+    fn run_rolling_upgrade_stalls_loud_without_promoting_when_quorum_never_returns() {
+        // Quorum absent for the whole run: once the replicas are upgraded the driver reaches the
+        // promotion gate, which stays Blocked(NoQuorum) forever. It must NOT promote (the guardrail)
+        // and must fail LOUD after the budget, not loop.
+        let mut cluster = MockCluster::with_replicas(1, false);
+        let report = run_rolling_upgrade(&mut cluster, 20).unwrap();
+        assert_eq!(
+            report,
+            UpgradeReport::StalledAfterBudget(UpgradeStep::Blocked(BlockReason::NoQuorum))
+        );
+        // The replica was upgraded, but the promotion guardrail held: the ONLY action was the replica
+        // upgrade -- NO promote, NO old-primary upgrade (the primary is never touched without a safe
+        // promotion).
+        assert_eq!(
+            cluster.actions_log,
+            vec!["upgrade_replica"],
+            "the guardrail held: no promote / old-primary upgrade without quorum"
+        );
+    }
+
+    #[test]
+    fn drive_upgrade_step_executes_only_the_current_steps_action() {
+        // A no-action step (Blocked: replicas done, no quorum) executes NOTHING.
+        let mut blocked = MockCluster::with_replicas(0, false);
+        let step = drive_upgrade_step(&mut blocked).unwrap();
+        assert_eq!(step, UpgradeStep::Blocked(BlockReason::NoQuorum));
+        assert!(blocked.actions_log.is_empty(), "Blocked executes no action");
+
+        // An action step (UpgradeReplica) executes exactly its action.
+        let mut acting = MockCluster::with_replicas(1, true);
+        let step = drive_upgrade_step(&mut acting).unwrap();
+        assert_eq!(step, UpgradeStep::UpgradeReplica);
+        assert_eq!(acting.actions_log, vec!["upgrade_replica"]);
+    }
+
+    #[test]
+    fn drive_upgrade_step_awaits_in_sync_without_acting_while_a_replica_catches_up() {
+        // A just-upgraded replica still re-syncing: the driver must report AwaitInSync and execute NO
+        // action (the AwaitInSync no-op branch, which the full run tests do not traverse because the
+        // mock catches up in a single wait).
+        let mut cluster = MockCluster::with_replicas(1, true);
+        cluster.catching_up = true;
+        let step = drive_upgrade_step(&mut cluster).unwrap();
+        assert_eq!(step, UpgradeStep::AwaitInSync);
+        assert!(
+            cluster.actions_log.is_empty(),
+            "AwaitInSync waits, it does not act"
+        );
+    }
+
+    #[test]
+    fn run_rolling_upgrade_surfaces_an_action_error_and_stops() {
+        // A cluster whose upgrade action fails: the driver propagates the error and stops (does not
+        // press on across a broken cluster).
+        struct FailingCluster;
+        impl UpgradeActions for FailingCluster {
+            type Error = &'static str;
+            fn replicas_to_upgrade(&self) -> usize {
+                1
+            }
+            fn replica_catching_up(&self) -> bool {
+                false
+            }
+            fn promotion_safety(&self) -> PromotionSafety {
+                PromotionSafety::Safe
+            }
+            fn primary_demoted(&self) -> bool {
+                false
+            }
+            fn old_primary_upgraded(&self) -> bool {
+                false
+            }
+            fn upgrade_next_replica(&mut self) -> Result<(), &'static str> {
+                Err("node upgrade timed out")
+            }
+            fn promote_candidate(&mut self) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn upgrade_old_primary(&mut self) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn wait_for_progress(&mut self) -> Result<(), &'static str> {
+                Ok(())
+            }
+        }
+        let mut cluster = FailingCluster;
+        assert_eq!(
+            run_rolling_upgrade(&mut cluster, 50),
+            Err("node upgrade timed out")
+        );
     }
 }
