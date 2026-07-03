@@ -87,7 +87,10 @@ pub use lag::{
 // decision (replicas first -> promote -> old primary last) consuming the safe_to_promote guardrail.
 // The binary swap + the raft commit are the clustered driver's job; this decides what/when.
 pub mod upgrade_plan;
-pub use upgrade_plan::{BlockReason, UpgradeStep, upgrade_step};
+pub use upgrade_plan::{
+    BlockReason, UpgradeActions, UpgradeReport, UpgradeStep, drive_upgrade_step, run_rolling_upgrade,
+    upgrade_step,
+};
 
 pub mod stream;
 pub use stream::{ApplyOutcome, ReplicaApplier, ShipOutcome, drain_and_ship};
