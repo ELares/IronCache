@@ -279,13 +279,14 @@ mod tests {
     /// land contiguously in `read_buf`.
     #[test]
     fn recv_batch_accumulates_a_payload_larger_than_one_fixed_buffer() {
+        // > the 16 KiB fixed buffer -> the payload spans multiple fixed reads.
+        const LEN: usize = 40 * 1024;
         tokio_uring::start(async {
             let std_listener =
                 tokio_rt::bind_reuseport_std("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = std_listener.local_addr().unwrap();
             let listener = TcpListener::from_std(std_listener);
 
-            const LEN: usize = 40 * 1024; // > the 16 KiB fixed buffer -> multiple fixed reads
             let server = tokio_uring::spawn(async move {
                 let rt = IoUringRuntime::new();
                 let (mut stream, _peer) = rt.accept(&listener).await.unwrap();
