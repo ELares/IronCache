@@ -28,6 +28,11 @@ pub mod multikey;
 /// the manifest commit, LASTSAVE, load-on-boot, and the periodic save policy. Default-off (only
 /// engaged when a `data_dir` is configured); the engine half lives in `ironcache-persist`.
 pub mod persist;
+// The upgrade-handoff snapshot staging target + its RAM-headroom guard (#390): stage the handoff
+// snapshot on tmpfs (/dev/shm) to remove the disk I/O, but ONLY when it fits in available RAM with
+// headroom (tmpfs is RAM -- a too-big snapshot would OOM), else the durable data_dir. Pure decision +
+// a Linux MemAvailable read; the OOM-prevention guard is the correctness core.
+pub mod handoff;
 pub mod pubsub;
 pub mod raft_boot;
 /// HA-7d LIVE per-shard replica attach. Reached ONLY in raft-mode once an `AssignReplica`
