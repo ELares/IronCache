@@ -23,10 +23,19 @@ Description=IronCache RESP socket (socket activation)
 Documentation=https://github.com/OWNER/REPO
 
 [Socket]
-# The RESP port on all interfaces. Accept=no (the default) hands ONE long-lived
-# listening socket to a single service instance (a single acceptor), NOT one
-# service per connection -- matching IronCache's single-acceptor topology.
-ListenStream=6379
+# The RESP port on LOOPBACK by default, matching IronCache's SAFE config default
+# (bind 127.0.0.1 -- "an unconfigured boot is not exposed on all interfaces").
+#
+# IMPORTANT: when socket-activated, THIS unit's ListenStream -- NOT the server's
+# `bind` / `--bind` config -- is the authoritative listen address (the server adopts
+# whatever fd systemd opened). So to expose IronCache beyond loopback, change this
+# to `ListenStream=6379` (all interfaces) or a specific address, and keep it in sync
+# with how you would otherwise set `--bind`; the server's own bind is a no-op here.
+#
+# Accept=no (the default) hands ONE long-lived listening socket to a single service
+# instance (a single acceptor), NOT one service per connection -- matching the
+# single-acceptor topology.
+ListenStream=127.0.0.1:6379
 
 # The kernel listen backlog. systemd silently CAPS this at net.core.somaxconn, so
 # to make the deep queue that absorbs the upgrade window effective, raise the

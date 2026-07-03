@@ -165,6 +165,12 @@ pub fn adopt_listener_fd(fd: std::os::fd::RawFd) -> io::Result<std::net::TcpList
 /// all fall back to self-bind, so a non-socket-activated boot is byte-unchanged. (Operator-facing
 /// logging of which path was taken is a follow-up; the runtime crate carries no logging dep today.)
 ///
+/// ADDRESS AUTHORITY: when socket-activated, the effective listen address is whatever SYSTEMD opened
+/// the socket on (the `.socket` unit's `ListenStream=`); `addr` (the server's `bind` config) is used
+/// ONLY on the self-bind fallback. The packaged `ironcache.socket` defaults its `ListenStream` to
+/// LOOPBACK to match the config's safe default, so enabling socket activation does not silently widen
+/// exposure; an operator binding beyond loopback must set BOTH the unit and `--bind`.
+///
 /// # Errors
 ///
 /// Returns the `io::Error` only if the self-bind itself fails (e.g. the address is in use).
