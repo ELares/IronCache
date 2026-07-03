@@ -164,6 +164,17 @@ release.
 
 ### Added
 
+- systemd socket-activation fd ADOPTION (issue #389 Phase 2a): the server now adopts an inherited
+  listening socket from systemd instead of self-binding, so the listen queue survives an
+  `ironcache upgrade` restart and clients queue in the backlog instead of getting connection-refused.
+  `ironcache-runtime::tokio_rt` gains `adopt_listener_fd` (wraps the inherited fd, fail-closed on a
+  non-stream socket, sets non-blocking) and `listener_for` (adopts the `LISTEN_FDS` fd parsed by
+  `listen_fds`, else self-binds); both shard bootstraps (tokio + io_uring) now obtain their one
+  listener via `listener_for`. FAIL-OPEN: not socket-activated, a malformed `LISTEN_*` env, or an
+  unusable inherited fd all fall back to self-bind, so a non-socket-activated boot is unchanged. Ships
+  a `packaging/ironcache.socket` unit (`ListenStream=6379`, tuned `Backlog=`) wired to
+  `ironcache.service` via a fail-open `Wants=`. (The Terraform user-data update lives in the infra
+  repo.)
 - io_uring fixed-buffer datapath WIRED into the serve loop (issue #284): `ironcache-runtime` gains
   `recv_batch`, and the io_uring serve loop's hot read now calls it instead of the raw owned recv. On
   first use per shard it resolves the datapath once (the startup probe) and, for a registered-buffer

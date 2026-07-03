@@ -130,7 +130,7 @@ pub fn available_shards() -> usize {
 mod tokio_bootstrap {
     use super::{Arc, AtomicBool, DRAIN_GRACE, Duration, Ordering, ShardConfig, ShardId, ShardSet};
     use crate::TokioRuntime;
-    use crate::tokio_rt::bind_reuseport_std;
+    use crate::tokio_rt::listener_for;
     use std::cell::Cell;
     use std::future::Future;
     use std::rc::Rc;
@@ -209,13 +209,14 @@ mod tokio_bootstrap {
             inboxes.len()
         );
 
-        // Bind the ONE listening socket up front, in this synchronous call, so a
+        // Obtain the ONE listening socket up front, in this synchronous call, so a
         // bind failure (e.g. port in use) surfaces as an error here rather than
-        // inside a spawned thread. This std listener is owned by the acceptor
-        // thread; the shards never bind. `set_reuse_port` on it is harmless and
-        // kept only so a fast restart can rebind the address; it no longer does
-        // any load-balancing (that is now the acceptor's job).
-        let listener = bind_reuseport_std(cfg.bind)?;
+        // inside a spawned thread. `listener_for` ADOPTS a systemd socket-activation
+        // inherited fd when one was passed (LISTEN_FDS, #389 -- the listen queue then
+        // survives an upgrade restart with no connection-refused window), else self-
+        // binds with SO_REUSEPORT (unchanged). This std listener is owned by the
+        // acceptor thread; the shards never bind.
+        let listener = listener_for(cfg.bind)?;
 
         // One connection channel per shard: the acceptor sends accepted
         // `std::net::TcpStream`s, the shard receives them. Unbounded so the

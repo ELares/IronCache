@@ -18,6 +18,15 @@ Description=IronCache server
 Documentation=https://github.com/OWNER/REPO
 After=network-online.target
 Wants=network-online.target
+# Socket activation (#389): when ironcache.socket is enabled, systemd creates the
+# listening socket FIRST and passes its fd to this service, which ADOPTS it instead
+# of self-binding -- so the listen queue survives an upgrade restart with no
+# connection-refused window. HARMLESS when the socket unit is absent: systemd
+# ignores a Wants/After of a non-installed unit, and the server self-binds exactly
+# as before. Wants (not Requires) keeps this fail-open: if the socket unit failed,
+# the service still starts and self-binds rather than being blocked.
+Wants=ironcache.socket
+After=ironcache.socket
 
 [Service]
 Type=simple

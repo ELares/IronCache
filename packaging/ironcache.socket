@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# systemd SOCKET-ACTIVATION unit for the IronCache RESP port (#389 Phase 2a).
+# SCAFFOLD: templated and inert until the first release. See
+# docs/design/PACKAGING.md and packaging/README.md.
+#
+# Why: systemd OWNS this listening socket and keeps it open ACROSS an
+# `ironcache upgrade` service restart, so during the swap clients QUEUE in the
+# kernel backlog (a brief latency blip) instead of getting ECONNREFUSED. The
+# perceived downtime collapses to the new process's startup/reload time. This is
+# better than SO_REUSEPORT for the upgrade case: a closed SO_REUSEPORT socket
+# loses its queued connections, whereas this single listen queue is never closed.
+#
+# Install alongside ironcache.service:
+#   install to /etc/systemd/system/ironcache.socket
+#   systemctl daemon-reload && systemctl enable --now ironcache.socket
+# Then `ironcache.service` receives the socket fd via the sd_listen_fds protocol
+# (LISTEN_FDS / LISTEN_PID) and adopts it instead of self-binding. If the socket
+# unit is NOT enabled, the service self-binds exactly as before (unchanged).
+
+[Unit]
+Description=IronCache RESP socket (socket activation)
+Documentation=https://github.com/OWNER/REPO
+
+[Socket]
+# The RESP port on all interfaces. Accept=no (the default) hands ONE long-lived
+# listening socket to a single service instance (a single acceptor), NOT one
+# service per connection -- matching IronCache's single-acceptor topology.
+ListenStream=6379
+
+# The kernel listen backlog. systemd silently CAPS this at net.core.somaxconn, so
+# to make the deep queue that absorbs the upgrade window effective, raise the
+# sysctl to match (e.g. `net.core.somaxconn=1024`) or this is clamped down to it.
+Backlog=1024
+
+# One shared socket (the service round-robins accepts to shards in userspace), so
+# do NOT open a per-shard SO_REUSEPORT set here.
+ReusePort=false
+
+[Install]
+WantedBy=sockets.target

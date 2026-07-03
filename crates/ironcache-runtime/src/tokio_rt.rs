@@ -121,6 +121,72 @@ pub fn bind_reuseport_std(addr: SocketAddr) -> io::Result<std::net::TcpListener>
     Ok(socket.into())
 }
 
+/// Adopt an INHERITED listening-socket fd (systemd socket-activation, #389 Phase 2a) as a `std`
+/// `TcpListener`, instead of binding our own. `sd_listen_fds` (parsed by [`crate::listen_fds`]) hands
+/// the fd that SYSTEMD opened + kept open across the upgrade restart, so the listen queue is never
+/// closed and clients QUEUE in the backlog instead of getting `ECONNREFUSED`.
+///
+/// Fail-closed: validates the fd is a TCP STREAM socket (`SO_TYPE`) before use, and sets it
+/// non-blocking to match the single acceptor loop ([`crate::bootstrap`]). Takes SOLE ownership of the
+/// fd. (systemd with `Accept=no ListenStream=` always passes a LISTENING stream socket; the type
+/// check rejects the realistic misconfig -- a non-socket fd or a `ListenDatagram=` UDP socket.)
+///
+/// # Errors
+///
+/// Returns `InvalidInput` if the fd is not a TCP stream socket, or the underlying `io::Error` if the
+/// `SO_TYPE` query fails (e.g. a non-socket fd). The caller falls back to [`bind_reuseport_std`]
+/// rather than failing the boot.
+#[cfg(unix)]
+pub fn adopt_listener_fd(fd: std::os::fd::RawFd) -> io::Result<std::net::TcpListener> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: this is a systemd-inherited fd the boot owns EXCLUSIVELY -- the sd_listen_fds parser
+    // confirmed LISTEN_PID names our pid, and each fd is adopted at most once, so taking ownership
+    // here does not alias another owner.
+    let socket = unsafe { Socket::from_raw_fd(fd) };
+    // Fail closed if systemd handed us something that is not a TCP STREAM socket: a non-socket fd
+    // makes `type()` error (`ENOTSOCK`), and a DGRAM/other socket (a `ListenDatagram=` misconfig)
+    // returns the wrong type. systemd with `Accept=no ListenStream=` always passes a LISTENING stream
+    // socket, so this guards a misconfigured unit; the caller self-binds rather than serve on a bad fd.
+    if socket.r#type()? != Type::STREAM {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inherited socket-activation fd is not a TCP stream socket",
+        ));
+    }
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+/// Choose the RESP listener: ADOPT a systemd socket-activation inherited fd if one was passed
+/// (`LISTEN_FDS`, #389 -- the listen queue survives an upgrade restart, no `ECONNREFUSED`), else
+/// SELF-BIND `addr` with `SO_REUSEPORT`.
+///
+/// FAIL-OPEN: not socket-activated, a malformed `LISTEN_*` environment, or an unusable inherited fd
+/// all fall back to self-bind, so a non-socket-activated boot is byte-unchanged. (Operator-facing
+/// logging of which path was taken is a follow-up; the runtime crate carries no logging dep today.)
+///
+/// # Errors
+///
+/// Returns the `io::Error` only if the self-bind itself fails (e.g. the address is in use).
+#[cfg(unix)]
+pub fn listener_for(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    match crate::listen_fds::from_env() {
+        // Socket-activated: adopt the FIRST passed fd (the RESP `ListenStream`). A validation
+        // failure on the inherited fd degrades to a self-bind rather than failing the boot.
+        Ok(fds) if !fds.is_empty() => {
+            adopt_listener_fd(fds[0].fd).or_else(|_| bind_reuseport_std(addr))
+        }
+        // Not socket-activated (or a malformed/foreign LISTEN_* env): self-bind, unchanged behavior.
+        _ => bind_reuseport_std(addr),
+    }
+}
+
+/// Non-Unix fallback: socket-activation is a Unix/systemd feature, so always self-bind.
+#[cfg(not(unix))]
+pub fn listener_for(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    bind_reuseport_std(addr)
+}
+
 /// Apply `SO_KEEPALIVE` with `secs` idle time to a tokio [`TcpStream`] at ACCEPT (Redis
 /// `tcp-keepalive`). `secs == 0` DISABLES keepalive (the option is left off). This borrows the
 /// stream's fd via [`socket2::SockRef`] WITHOUT taking ownership (no fd dance / `unsafe`), so the
@@ -222,5 +288,58 @@ mod tests {
                 "keepalive should be OFF"
             );
         });
+    }
+
+    /// #389: `adopt_listener_fd` takes over a REAL inherited listening socket (the systemd
+    /// socket-activation case) -- it serves the same address and accepts connections. Uses
+    /// `try_clone().into_raw_fd()` to hand `adopt` an independent, owned fd (no libc dup needed).
+    #[cfg(unix)]
+    #[test]
+    fn adopt_listener_fd_takes_over_a_real_listening_socket() {
+        use std::os::fd::IntoRawFd;
+        let original = bind_reuseport_std("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = original.local_addr().unwrap();
+        // A dup'd fd `adopt` can own exclusively (the original stays valid + drops normally).
+        let fd = original.try_clone().unwrap().into_raw_fd();
+
+        let adopted = adopt_listener_fd(fd).expect("adopts a listening socket");
+        assert_eq!(
+            adopted.local_addr().unwrap(),
+            addr,
+            "the adopted listener serves the inherited socket's address"
+        );
+        adopted.set_nonblocking(false).unwrap();
+        let _client = std::net::TcpStream::connect(addr).unwrap();
+        let (_conn, _peer) = adopted.accept().expect("the adopted listener accepts");
+    }
+
+    /// #389 fail-closed: `adopt_listener_fd` REJECTS a fd that is not a TCP STREAM socket (a
+    /// `ListenDatagram=` misconfig hands a UDP socket), so the caller self-binds instead of serving on
+    /// a bad fd.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_listener_fd_rejects_a_non_stream_socket() {
+        use std::os::fd::IntoRawFd;
+        // A UDP (DGRAM) socket -- the wrong socket type for a RESP listener.
+        let udp = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let fd = udp.into_raw_fd();
+        assert!(
+            adopt_listener_fd(fd).is_err(),
+            "a non-stream (UDP) socket must be rejected fail-closed"
+        );
+    }
+
+    /// #389: `listener_for` self-binds when NOT socket-activated (no valid `LISTEN_PID`/`LISTEN_FDS`
+    /// in the env), so a normal (non-systemd) boot is unchanged. The test harness has no `LISTEN_PID`
+    /// naming this pid, so `from_env` returns an error and `listener_for` takes the self-bind path.
+    #[cfg(unix)]
+    #[test]
+    fn listener_for_self_binds_when_not_socket_activated() {
+        let listener = listener_for("127.0.0.1:0".parse().unwrap())
+            .expect("self-binds when not socket-activated");
+        assert!(
+            listener.local_addr().is_ok(),
+            "a working self-bound listener"
+        );
     }
 }
