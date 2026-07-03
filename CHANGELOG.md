@@ -164,6 +164,16 @@ release.
 
 ### Added
 
+- io_uring fixed-buffer datapath WIRED into the serve loop (issue #284): `ironcache-runtime` gains
+  `recv_batch`, and the io_uring serve loop's hot read now calls it instead of the raw owned recv. On
+  first use per shard it resolves the datapath once (the startup probe) and, for a registered-buffer
+  tier, registers a per-shard slab (64 x 16 KiB); each read then lands in a registered buffer (no
+  per-request page-pin) and its bytes are appended to the accumulator -- behavior-preserving for the
+  partial-frame pipelining model, with the owned recv kept as the untouched fallback (drained slab or
+  owned tier). A per-shard thread-local (a cheap `Rc`-clone held across the recv `await`) holds the
+  one registered slab. Validated on a real ring: `recv_batch` appends after a carryover + reports a
+  clean EOF, and accumulates a 40 KiB payload across multiple fixed reads. No throughput claim (the
+  registered-read-vs-owned comparison + a zero-copy parse-in-place are deferred to a pinned host).
 - io_uring fixed-buffer SEND (issue #284): `ironcache-runtime::fixed_datapath` gains `send_fixed`,
   the reply side over registered buffers, completing the fixed recv/send pair. It stages the reply
   into a checked-out registered buffer and writes it via `write_fixed_all` (no per-write pin). Its

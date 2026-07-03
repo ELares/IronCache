@@ -2085,13 +2085,15 @@ async fn serve_connection_uring(
                 break;
             }
         } else {
-            // Read the next command batch over the io_uring owned-buffer recv seam. A clean EOF
-            // (`n == 0`) or any error closes the connection.
-            let Ok(res) = rt.recv(&mut stream, std::mem::take(&mut read_buf)).await else {
+            // Read the next command batch. `recv_batch` uses this shard's REGISTERED fixed-buffer
+            // datapath when the kernel selected it (the startup probe, #495/#496), else the owned
+            // recv seam -- both APPEND into `read_buf`, preserving any partial-frame carryover, so
+            // this is behavior-preserving for the pipelining model. A clean EOF (`n == 0`) or any
+            // error closes the connection.
+            let Ok(n) = ironcache_runtime::recv_batch(&rt, &mut stream, &mut read_buf).await else {
                 break;
             };
-            read_buf = res.buf;
-            if res.n == 0 {
+            if n == 0 {
                 break; // peer closed
             }
         }

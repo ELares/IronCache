@@ -16,17 +16,27 @@
 //! Whole-module gated to `#[cfg(all(target_os = "linux", feature = "io_uring"))]` at the `pub mod`
 //! in `lib.rs`, so it compiles + is functionally tested only on the io_uring path (a real ring).
 
+use std::cell::RefCell;
 use std::io;
 
 use tokio_uring::buf::fixed::{FixedBuf, FixedBufPool};
 use tokio_uring::buf::{BoundedBuf, IoBufMut};
 use tokio_uring::net::TcpStream;
 
+use crate::Runtime;
+use crate::io_uring_rt::IoUringRuntime;
+use crate::uring_probe::{DataPath, probe_uring_caps, select_datapath};
+
 /// A per-shard REGISTERED fixed-buffer group for the OneShotFixed datapath: `count` buffers of
 /// `buf_size` bytes, registered once with the shard's ring.
 ///
 /// Created + registered INSIDE the shard's `tokio_uring::start` (registration binds to the current
 /// thread's ring). Because it is per-shard and single-threaded, it carries no synchronization.
+///
+/// `Clone` is a cheap `Rc` clone of the same underlying pool (tokio-uring's `FixedBufPool` is
+/// `Rc`-backed): a clone shares the one registered slab, so [`recv_batch`] can clone it out of the
+/// per-shard thread-local and hold it across the recv `await` without holding the thread-local borrow.
+#[derive(Clone)]
 pub struct FixedRing {
     pool: FixedBufPool<Vec<u8>>,
     buf_size: usize,
@@ -122,12 +132,188 @@ pub async fn send_fixed(
     Some(res)
 }
 
+/// The per-shard fixed-buffer group geometry: `FIXED_RING_COUNT` buffers of `FIXED_RING_BUF_SIZE`
+/// bytes. The buffer size matches the serve loop's owned read window (16 KiB) so a single fixed read
+/// covers the same batch; the count bounds the per-shard registered slab (here 64 * 16 KiB = 1 MiB
+/// per shard, a fixed budget). When the group drains, the read falls back to the owned recv for that
+/// read (never a stall), so the count trades memory for how many concurrent reads stay on the fast
+/// path before falling back.
+const FIXED_RING_COUNT: u16 = 64;
+const FIXED_RING_BUF_SIZE: usize = 16 * 1024;
+
+/// This shard's resolved datapath (the three states the lazy per-shard resolution can be in).
+enum ShardDatapath {
+    /// Not yet resolved on this shard thread (the probe + registration have not run).
+    Unresolved,
+    /// The kernel selected the owned datapath (io_uring absent/disabled, the owned tier, or a slab
+    /// registration failure): no registered slab; reads use the owned recv.
+    Owned,
+    /// The fixed datapath: this shard's registered slab.
+    Fixed(FixedRing),
+}
+
+thread_local! {
+    /// This shard's fixed datapath, resolved ONCE (lazily) on the shard thread.
+    static SHARD_FIXED_RING: RefCell<ShardDatapath> = const { RefCell::new(ShardDatapath::Unresolved) };
+}
+
+/// This shard's fixed-buffer group, resolving it on first use: probe the running kernel and, if
+/// [`select_datapath`] picks a registered-buffer tier, register the per-shard slab; otherwise the
+/// owned datapath (returns `None`). Returns a cheap `Rc`-clone so the caller can hold it across the
+/// recv `await` without keeping the thread-local borrowed. Must be called inside `tokio_uring::start`
+/// (registration binds to the current thread's ring), which the shard serve loop always is.
+fn shard_fixed_ring() -> Option<FixedRing> {
+    SHARD_FIXED_RING.with(|cell| {
+        if matches!(*cell.borrow(), ShardDatapath::Unresolved) {
+            // First use on this shard: decide the datapath + (maybe) register the slab, ONCE.
+            let resolved = match probe_uring_caps() {
+                // A registered-buffer tier (fixed or the multishot-provided tier, which also uses a
+                // registered slab): register this shard's group. A registration failure (e.g.
+                // RLIMIT_MEMLOCK) degrades to the owned path rather than failing the shard.
+                Ok(caps) if select_datapath(caps) != DataPath::OneShotOwned => {
+                    match FixedRing::register(FIXED_RING_COUNT, FIXED_RING_BUF_SIZE) {
+                        Ok(ring) => ShardDatapath::Fixed(ring),
+                        Err(_) => ShardDatapath::Owned,
+                    }
+                }
+                // io_uring absent/disabled, or the owned tier: no registered slab.
+                _ => ShardDatapath::Owned,
+            };
+            *cell.borrow_mut() = resolved;
+        }
+        // Clone the ring out (cheap Rc clone) for the fixed datapath, releasing the borrow.
+        match &*cell.borrow() {
+            ShardDatapath::Fixed(ring) => Some(ring.clone()),
+            ShardDatapath::Owned | ShardDatapath::Unresolved => None,
+        }
+    })
+}
+
+/// Read the next command batch into `read_buf`, APPENDING to any partial-frame carryover, using this
+/// shard's REGISTERED fixed buffer when the kernel selected a registered-buffer datapath, else the
+/// owned recv. Returns the bytes read (`0` = clean peer close / EOF).
+///
+/// The `read_buf` accumulator + partial-frame pipelining are IDENTICAL to the owned path: the fixed
+/// read lands in a pre-registered buffer (no per-request page-pin -- the registered-read win) and its
+/// bytes are appended to `read_buf`, exactly as the owned recv appends into `read_buf`'s spare
+/// capacity. (A zero-copy parse-IN-PLACE from the registered buffer is a further optimization; this
+/// slice keeps the accumulator model unchanged so the wiring is provably behavior-preserving.) If the
+/// group is momentarily drained, this read falls back to the owned recv rather than stalling.
+///
+/// # Errors
+///
+/// Returns the underlying `io::Error` from the recv (a dead/broken peer); the caller closes.
+pub async fn recv_batch(
+    rt: &IoUringRuntime,
+    stream: &mut TcpStream,
+    read_buf: &mut Vec<u8>,
+) -> io::Result<usize> {
+    if let Some(ring) = shard_fixed_ring() {
+        match recv_fixed(stream, &ring).await {
+            Some((Ok(n), buf)) => {
+                read_buf.extend_from_slice(&buf[..n]);
+                return Ok(n);
+            }
+            Some((Err(e), _)) => return Err(e),
+            // Drained (all buffers checked out by other in-flight reads on this shard): fall through
+            // to the owned recv for this one read rather than blocking.
+            None => {}
+        }
+    }
+    // Owned datapath (or drained fall-back): the io_uring owned-buffer recv, appending into
+    // `read_buf`'s spare capacity, then hand ownership back.
+    let res = rt.recv(stream, std::mem::take(read_buf)).await?;
+    *read_buf = res.buf;
+    Ok(res.n)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FixedRing, recv_fixed, send_fixed};
+    use super::{FixedRing, recv_batch, recv_fixed, send_fixed};
     use crate::io_uring_rt::IoUringRuntime;
     use crate::{Runtime, tokio_rt};
     use tokio_uring::net::TcpListener;
+
+    /// `recv_batch` APPENDS successive reads onto `read_buf` (preserving a partial-frame carryover)
+    /// and returns `0` at a clean peer close -- the exact accumulator + EOF contract the serve loop's
+    /// pipelining depends on. Runs the real per-shard path (probe + register, or owned) on this
+    /// kernel; either datapath must satisfy the same contract.
+    #[test]
+    fn recv_batch_appends_after_carryover_then_reports_eof() {
+        tokio_uring::start(async {
+            let std_listener =
+                tokio_rt::bind_reuseport_std("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = std_listener.local_addr().unwrap();
+            let listener = TcpListener::from_std(std_listener);
+
+            let server = tokio_uring::spawn(async move {
+                let rt = IoUringRuntime::new();
+                let (mut stream, _peer) = rt.accept(&listener).await.unwrap();
+                let mut read_buf = Vec::with_capacity(1024);
+                // Pre-seed a partial-frame carryover: recv_batch must APPEND after it, never overwrite.
+                read_buf.extend_from_slice(b"CARRY");
+                // Read until the peer closes (EOF), appending every batch.
+                loop {
+                    let n = recv_batch(&rt, &mut stream, &mut read_buf).await.unwrap();
+                    if n == 0 {
+                        break; // clean EOF
+                    }
+                }
+                assert_eq!(
+                    &read_buf, b"CARRYPING\r\n",
+                    "recv_batch appended the request after the carryover, then saw a clean EOF"
+                );
+            });
+
+            let client = IoUringRuntime::new();
+            let mut peer = client.connect(addr).await.unwrap();
+            client.send(&mut peer, b"PING\r\n".to_vec()).await.unwrap();
+            drop(peer); // close -> the server sees EOF after the 6 bytes
+            server.await.unwrap();
+        });
+    }
+
+    /// `recv_batch` accumulates a request LARGER than one fixed buffer across multiple reads -- the
+    /// riskiest edge vs the owned path, since the fixed read is capped at `FIXED_RING_BUF_SIZE`
+    /// (16 KiB) per call, so a 40 KiB payload takes several `recv_fixed`/extend cycles that must all
+    /// land contiguously in `read_buf`.
+    #[test]
+    fn recv_batch_accumulates_a_payload_larger_than_one_fixed_buffer() {
+        tokio_uring::start(async {
+            let std_listener =
+                tokio_rt::bind_reuseport_std("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = std_listener.local_addr().unwrap();
+            let listener = TcpListener::from_std(std_listener);
+
+            const LEN: usize = 40 * 1024; // > the 16 KiB fixed buffer -> multiple fixed reads
+            let server = tokio_uring::spawn(async move {
+                let rt = IoUringRuntime::new();
+                let (mut stream, _peer) = rt.accept(&listener).await.unwrap();
+                let mut read_buf = Vec::new();
+                loop {
+                    let n = recv_batch(&rt, &mut stream, &mut read_buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    read_buf.len(),
+                    LEN,
+                    "every fixed read accumulated into read_buf"
+                );
+                assert!(
+                    read_buf.iter().all(|&b| b == b'z'),
+                    "payload intact + contiguous"
+                );
+            });
+
+            let client = IoUringRuntime::new();
+            let mut peer = client.connect(addr).await.unwrap();
+            client.send(&mut peer, vec![b'z'; LEN]).await.unwrap();
+            drop(peer);
+            server.await.unwrap();
+        });
+    }
 
     /// A registered fixed-buffer group serves a real read: the server registers a `FixedRing`, reads
     /// a request via `read_fixed` (into the registered slab), asserts the bytes arrived in place,
