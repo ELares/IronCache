@@ -218,6 +218,8 @@ pub fn drive_upgrade_step<A: UpgradeActions>(actions: &mut A) -> Result<UpgradeS
 /// [`safe_to_promote`](crate::lag::safe_to_promote) says it is safe -- are enforced entirely by
 /// [`upgrade_step`]; this loop merely executes its decisions and never reorders them.
 ///
+/// `max_ticks` MUST be `> 0` (a zero budget makes no observation and is a caller error, debug-asserted).
+///
 /// # Errors
 ///
 /// Propagates the first [`UpgradeActions::Error`] from an executed action or a wait.
@@ -225,18 +227,28 @@ pub fn run_rolling_upgrade<A: UpgradeActions>(
     actions: &mut A,
     max_ticks: usize,
 ) -> Result<UpgradeReport, A::Error> {
-    let mut last = UpgradeStep::Done;
+    debug_assert!(
+        max_ticks > 0,
+        "run_rolling_upgrade needs a positive tick budget"
+    );
+    // Track the last OBSERVED step (not the `Done` sentinel) so `StalledAfterBudget` reports the true
+    // blocking step. Starts `None` so a (degenerate) zero budget cannot report `StalledAfterBudget(Done)`.
+    let mut last: Option<UpgradeStep> = None;
     for _ in 0..max_ticks {
         let step = drive_upgrade_step(actions)?;
         if step == UpgradeStep::Done {
             return Ok(UpgradeReport::Completed);
         }
-        last = step;
+        last = Some(step);
         // Acted, AwaitInSync, or Blocked: let the cluster make progress (a node finishes upgrading, a
         // replica catches up, quorum returns) before re-evaluating.
         actions.wait_for_progress()?;
     }
-    Ok(UpgradeReport::StalledAfterBudget(last))
+    // Budget exhausted with progress observed -> the last blocking step; or (zero budget) nothing
+    // observed -> report the stall against `AwaitInSync` (a neutral "made no progress"), never `Done`.
+    Ok(UpgradeReport::StalledAfterBudget(
+        last.unwrap_or(UpgradeStep::AwaitInSync),
+    ))
 }
 
 #[cfg(test)]
@@ -508,6 +520,21 @@ mod tests {
         let step = drive_upgrade_step(&mut acting).unwrap();
         assert_eq!(step, UpgradeStep::UpgradeReplica);
         assert_eq!(acting.actions_log, vec!["upgrade_replica"]);
+    }
+
+    #[test]
+    fn drive_upgrade_step_awaits_in_sync_without_acting_while_a_replica_catches_up() {
+        // A just-upgraded replica still re-syncing: the driver must report AwaitInSync and execute NO
+        // action (the AwaitInSync no-op branch, which the full run tests do not traverse because the
+        // mock catches up in a single wait).
+        let mut cluster = MockCluster::with_replicas(1, true);
+        cluster.catching_up = true;
+        let step = drive_upgrade_step(&mut cluster).unwrap();
+        assert_eq!(step, UpgradeStep::AwaitInSync);
+        assert!(
+            cluster.actions_log.is_empty(),
+            "AwaitInSync waits, it does not act"
+        );
     }
 
     #[test]
