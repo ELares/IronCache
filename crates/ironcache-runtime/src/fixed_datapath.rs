@@ -45,7 +45,9 @@ pub struct FixedRing {
 impl FixedRing {
     /// Create a group of `count` buffers of `buf_size` bytes and register it with the current
     /// thread's io_uring. The slab is a FIXED budget (IOURING_DATAPATH.md "the per-shard slab is a
-    /// fixed budget set at startup"), counted against the shard's maxmemory share, never grown.
+    /// fixed budget set at startup"), never grown. NOTE: charging this registered, `RLIMIT_MEMLOCK`
+    /// -pinned slab against the shard's maxmemory share (the doc's intent) is NOT yet wired -- today
+    /// it is a fixed budget OUTSIDE the maxmemory accounting; wiring the accounting is a follow-up.
     ///
     /// # Errors
     ///
@@ -167,9 +169,13 @@ fn shard_fixed_ring() -> Option<FixedRing> {
         if matches!(*cell.borrow(), ShardDatapath::Unresolved) {
             // First use on this shard: decide the datapath + (maybe) register the slab, ONCE.
             let resolved = match probe_uring_caps() {
-                // A registered-buffer tier (fixed or the multishot-provided tier, which also uses a
-                // registered slab): register this shard's group. A registration failure (e.g.
-                // RLIMIT_MEMLOCK) degrades to the owned path rather than failing the shard.
+                // Any registered-buffer tier -> register this shard's slab. NOTE: for now BOTH
+                // non-owned tiers (OneShotFixed and MultishotProvided) run the SAME one-shot
+                // `read_fixed` path here -- the multishot provided-buffer-ring datapath is an
+                // unimplemented following slice -- so the tier distinction is coarse today; it is
+                // safe because READ_FIXED (5.1) is available whenever any newer tier is. A
+                // registration failure (e.g. RLIMIT_MEMLOCK) degrades to the owned path rather than
+                // failing the shard.
                 Ok(caps) if select_datapath(caps) != DataPath::OneShotOwned => {
                     match FixedRing::register(FIXED_RING_COUNT, FIXED_RING_BUF_SIZE) {
                         Ok(ring) => ShardDatapath::Fixed(ring),
