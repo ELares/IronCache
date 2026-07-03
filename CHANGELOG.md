@@ -164,6 +164,16 @@ release.
 
 ### Added
 
+- Upgrade-handoff snapshot tmpfs target + RAM-headroom guard (issue #390 Phase 2b): a new
+  `ironcache::handoff` module decides where to stage the `ironcache upgrade` handoff snapshot -- tmpfs
+  (`/dev/shm`, no disk I/O) when it fits in available RAM with headroom, else the durable `data_dir`.
+  `handoff_target` is the pure OOM-prevention decision (tmpfs pages ARE RAM, so a snapshot larger than
+  free RAM would swap/OOM the box; the guard requires `max(25% of snapshot, 512 MiB)` headroom and
+  falls back to the disk path when RAM is tight or unknown), `headroom_for` the scaling policy, and
+  `available_ram_bytes` reads `/proc/meminfo` `MemAvailable` on Linux (None elsewhere -> safe
+  fallback). The decision is truth-table tested on every host; the RAM read is validated on a real
+  Linux host. (Wiring the upgrade save/load path onto this target + the pinned-host save/load-time
+  measurement are follow-ups.)
 - systemd socket-activation fd ADOPTION (issue #389 Phase 2a): the server now adopts an inherited
   listening socket from systemd instead of self-binding, so the listen queue survives an
   `ironcache upgrade` restart and clients queue in the backlog instead of getting connection-refused.
