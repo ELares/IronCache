@@ -88,8 +88,8 @@ pub use lag::{
 // The binary swap + the raft commit are the clustered driver's job; this decides what/when.
 pub mod upgrade_plan;
 pub use upgrade_plan::{
-    BlockReason, UpgradeActions, UpgradeReport, UpgradeStep, drive_upgrade_step, run_rolling_upgrade,
-    upgrade_step,
+    BlockReason, UpgradeActions, UpgradeReport, UpgradeStep, drive_upgrade_step,
+    run_rolling_upgrade, upgrade_step,
 };
 
 pub mod stream;
