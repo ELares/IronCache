@@ -63,7 +63,11 @@ impl NodeView {
 pub struct ClusterView {
     /// The nodes of the shard being rolled (one master + its replicas).
     pub nodes: Vec<NodeView>,
-    /// The version being rolled TO (explicit, not inferred -- dev builds pin `0.0.0`).
+    /// The version being rolled TO (explicit, not inferred -- dev builds pin `0.0.0`). Matched by
+    /// EXACT STRING equality (`is_upgraded`), so the I/O layer that assembles this view MUST normalize
+    /// both sides consistently (e.g. strip a `v` prefix / build metadata like `+build` / whitespace)
+    /// -- otherwise a formatting skew leaves `replicas_to_upgrade` never reaching 0 and the roll
+    /// stalls (`StalledAfterBudget`; fail-closed -- no unsafe action, but no progress).
     pub target_version: String,
     /// The min-replicas-max-lag bound (ADR-0026): a replica is in sync when its lag is `<= max_lag`.
     pub max_lag: u64,
@@ -74,6 +78,13 @@ pub struct ClusterView {
     /// (roles flip on promotion, so it must be remembered): when this node's role flips to `Replica`,
     /// the promotion has committed (`primary_demoted`), and its version reaching the target is the
     /// final step (`old_primary_upgraded`). `None` before the roll has identified the primary.
+    ///
+    /// LOAD-BEARING CONTRACT for the I/O slice: once the roll begins, this MUST be set (to the
+    /// pre-roll master's id) and that id MUST stay present in `nodes`. If it is left `None` after a
+    /// real promotion, `primary_demoted` stays false and the demoted old primary (now a `Replica` on
+    /// the old version) is re-counted by `replicas_to_upgrade` -> a spurious SECOND promotion. If the
+    /// id vanishes from `nodes` (old primary removed/crashed), the driver believes the promotion never
+    /// committed and could re-promote. The following slice guarantees set-at-start + present.
     pub old_primary_id: Option<String>,
 }
 
@@ -149,6 +160,22 @@ impl ClusterView {
             .iter()
             .filter(|n| n.is_promotable(&self.target_version, self.max_lag))
             .min_by_key(|n| n.lag.and_then(ReplicaLag::lag).unwrap_or(u64::MAX))
+    }
+
+    /// Whether the WHOLE shard -- the primary AND every replica -- is ALREADY on the target version.
+    /// The driver MUST check this BEFORE rolling a shard: `upgrade_step` does not take the current
+    /// primary's version, so with everything already upgraded it would still emit `Promote` (a
+    /// gratuitous `CLUSTER FAILOVER` + client redirect) before reaching `Done`. Skipping a shard that
+    /// is `shard_fully_upgraded()` makes the roll IDEMPOTENT (a re-run, or `target == current`, is a
+    /// no-op) rather than costing a needless failover. Empty `nodes` is NOT "fully upgraded" (nothing
+    /// observed -- do not treat an empty snapshot as done).
+    #[must_use]
+    pub fn shard_fully_upgraded(&self) -> bool {
+        !self.nodes.is_empty()
+            && self
+                .nodes
+                .iter()
+                .all(|n| n.is_upgraded(&self.target_version))
     }
 }
 
@@ -298,5 +325,36 @@ mod tests {
         );
         assert!(done.primary_demoted());
         assert!(done.old_primary_upgraded());
+    }
+
+    #[test]
+    fn shard_fully_upgraded_is_the_is_a_roll_needed_precheck() {
+        // Everything already on target -> fully upgraded (the driver skips it -> no spurious roll).
+        let all = view(
+            vec![master("p", TARGET), in_sync_replica("r1", TARGET)],
+            None,
+        );
+        assert!(all.shard_fully_upgraded());
+        // Any node still on the old version -> a roll IS needed.
+        assert!(
+            !view(vec![master("p", TARGET), in_sync_replica("r1", OLD)], None)
+                .shard_fully_upgraded()
+        );
+        assert!(
+            !view(vec![master("p", OLD), in_sync_replica("r1", TARGET)], None)
+                .shard_fully_upgraded()
+        );
+        // An empty snapshot is NOT "done" (nothing observed).
+        assert!(!view(vec![], None).shard_fully_upgraded());
+
+        // WHY the pre-check exists (review Finding 1): with the shard already fully upgraded, the raw
+        // observers would still drive a spurious Promote -- upgrade_step(replicas_to_upgrade=0,
+        // catching_up=false, promotion=Safe, primary_demoted=false, ..) == Promote, a gratuitous
+        // CLUSTER FAILOVER. `shard_fully_upgraded()` is exactly the gate the driver checks first to
+        // keep a re-run (or target == current) a no-op.
+        assert_eq!(all.replicas_to_upgrade(), 0);
+        assert!(!all.replica_catching_up());
+        assert_eq!(all.promotion_safety(), PromotionSafety::Safe);
+        assert!(!all.primary_demoted());
     }
 }
