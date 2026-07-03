@@ -164,7 +164,16 @@ release.
 
 ### Added
 
-- Rolling-upgrade DRIVER (issue #392 Phase 3): `ironcache-repl`'s `upgrade_plan` gains
+- Rolling-upgrade cluster OBSERVERS (issue #392 Phase 3): a new `ironcache::cluster_upgrade` module
+  translates a cluster snapshot (`ClusterView`: a shard's primary + replicas, the target version, the
+  lag bound, the raft-quorum flag) into the five `upgrade_step` inputs (`replicas_to_upgrade`,
+  `replica_catching_up`, `promotion_safety` via `safe_to_promote`, `primary_demoted`,
+  `old_primary_upgraded`) plus `select_promote_candidate` (the least-lagging upgraded in-sync
+  replica). This is the pure observe/decision layer of the live `UpgradeActions` impl -- unit-tested
+  against synthetic cluster states -- for a single shard being rolled; the wire I/O (fetch each
+  node's `/topology` + `INFO`, send `CLUSTER FAILOVER`, drive the per-node upgrade) is a following
+  slice. The version is each node's self-reported `ironcache_version` against an explicit
+  `target_version` (dev/lock builds pin `0.0.0`, so a live diff needs an explicit target).
   `run_rolling_upgrade` / `drive_upgrade_step` + the `UpgradeActions` trait, the orchestration loop
   that turns the pure `upgrade_step` decision (#494) into an executed cluster rolling upgrade:
   observe the committed cluster state, compute the next step, and execute its action (upgrade the next
