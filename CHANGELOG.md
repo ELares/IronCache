@@ -47,6 +47,17 @@ release.
 
 ### Changed
 
+- Pipelined-request read-buffer compaction is now O(P) instead of O(P^2) over a depth-P
+  pipeline. Both serve loops (the tokio path and the io_uring datapath) previously called
+  `read_buf.drain(..consumed)` after EACH command in a pipeline batch; each drain memmoves
+  all remaining buffered bytes to the front, so a batch of P commands did ~P^2/2 byte-moves
+  (a measurable read-buffer write-amplification at high pipeline depth, and zero cost at
+  P=1). They now advance a running `consumed_total` cursor (decoding from
+  `read_buf[cursor..]`) and drain the whole processed batch ONCE after the loop; the
+  blocking-park path drains before handing the buffer to the parker. Behavior is
+  byte-identical (verified: the RESP decode, pipelining end-to-end, and blocking/park
+  suites pass); only the per-batch memmove cost changes.
+
 - Cache-mode eviction-pool refill (`refill_evict_pool`) now selects the coldest
   candidates with a bounded max-heap of size `EVICT_POOL_CAP` instead of cloning
   every resident key into a vector and full-sorting it (the #285 "do first"
