@@ -47,6 +47,16 @@ release.
 
 ### Changed
 
+- RESP replies now encode STRAIGHT into the connection's output buffer instead of through a
+  fresh per-reply `BytesMut`. `ironcache_protocol::encode` is now generic over any
+  `bytes::BufMut` sink (it was `&mut BytesMut`; `BytesMut` still satisfies it, so external
+  callers are unchanged), and `Vec<u8>` -- the serve loop's output buffer -- is a `BufMut`
+  sink, so every reply drops one heap allocation (`BytesMut::with_capacity(64)`) and one
+  buffer-to-buffer copy that each reply previously paid. Applied at all six reply-encode
+  sites (the serve hot path plus the multikey / spanning-move / spanning-combine /
+  whole-keyspace / coordinator cross-shard reply encoders). The encoded bytes are
+  byte-identical (verified: protocol encode/decode + RESP2/RESP3 reply-shaping suites pass).
+
 - Pipelined-request read-buffer compaction is now O(P) instead of O(P^2) over a depth-P
   pipeline. Both serve loops (the tokio path and the io_uring datapath) previously called
   `read_buf.drain(..consumed)` after EACH command in a pipeline batch; each drain memmoves

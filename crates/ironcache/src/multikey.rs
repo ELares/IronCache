@@ -324,9 +324,8 @@ fn clone_subreqs(subreqs: &[(usize, Request)]) -> Vec<(usize, Request)> {
 /// loop / coordinator / whole_keyspace encode). Encoding stays on the home core with the
 /// home proto.
 fn encode_into(out: &mut Vec<u8>, value: &Value, proto: ProtoVersion) {
-    let mut bm = bytes::BytesMut::with_capacity(64);
-    ironcache_protocol::encode(&mut bm, value, proto);
-    out.extend_from_slice(&bm);
+    // Vec<u8> is a bytes::BufMut sink: encode writes straight into `out` (no temp BytesMut + copy).
+    ironcache_protocol::encode(out, value, proto);
 }
 
 #[cfg(test)]

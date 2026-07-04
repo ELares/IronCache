@@ -371,9 +371,8 @@ fn rewrite_scan_reply(reply: Value, shard_idx: usize, n_shards: usize) -> Value 
 /// Encode `value` for `proto` and append to `out` (the home-core encode; mirrors the serve
 /// loop / coordinator encode). Encoding stays on the home core with the home proto.
 fn encode_into(out: &mut Vec<u8>, value: &Value, proto: ProtoVersion) {
-    let mut bm = bytes::BytesMut::with_capacity(64);
-    ironcache_protocol::encode(&mut bm, value, proto);
-    out.extend_from_slice(&bm);
+    // Vec<u8> is a bytes::BufMut sink: encode writes straight into `out` (no temp BytesMut + copy).
+    ironcache_protocol::encode(out, value, proto);
 }
 
 /// Draw the RANDOMKEY shard-pick u64 from the home shard's Env RNG seam (ADR-0003), the

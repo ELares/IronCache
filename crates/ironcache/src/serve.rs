@@ -6235,13 +6235,11 @@ fn redact_args_for_slowlog(cmd_upper: &[u8], mut args: Vec<Vec<u8>>) -> Vec<Vec<
     args
 }
 
-/// Encode `value` and append the bytes to `out`. PR-1 encodes into a fresh
-/// `BytesMut` per reply and appends; pooling is a later optimization behind this
-/// same call site (PROTOCOL.md notes zero-copy/pooling sit behind the interface).
+/// Encode `value` and append the bytes to `out`. `Vec<u8>` is a `bytes::BufMut` sink, so
+/// `encode` writes the reply STRAIGHT into `out` -- no per-reply `BytesMut` allocation and no
+/// intermediate copy (the encoder is generic over the sink; PROTOCOL.md's zero-copy note).
 fn encode_into(out: &mut Vec<u8>, value: &ironcache_server::Value, proto: ProtoVersion) {
-    let mut bm = bytes::BytesMut::with_capacity(64);
-    ironcache_protocol::encode(&mut bm, value, proto);
-    out.extend_from_slice(&bm);
+    ironcache_protocol::encode(out, value, proto);
 }
 
 /// Whether EVERY routing key of a KEYED data command (`KeyedSingle`/`KeyedMulti`) is owned

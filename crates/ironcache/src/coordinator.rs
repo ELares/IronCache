@@ -1679,9 +1679,8 @@ fn shard_unavailable_error() -> ironcache_protocol::ErrorReply {
 /// serve loop's `encode_into`). Encoding stays on the home core and uses the home
 /// connection's negotiated proto, never the owning shard's.
 fn encode_into(out: &mut Vec<u8>, value: &Value, proto: ProtoVersion) {
-    let mut bm = bytes::BytesMut::with_capacity(64);
-    ironcache_protocol::encode(&mut bm, value, proto);
-    out.extend_from_slice(&bm);
+    // Vec<u8> is a bytes::BufMut sink: encode writes straight into `out` (no temp BytesMut + copy).
+    ironcache_protocol::encode(out, value, proto);
 }
 
 // A tiny compile-time anchor that the per-shard handle types stay reachable from this
