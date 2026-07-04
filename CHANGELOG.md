@@ -47,6 +47,21 @@ release.
 
 ### Changed
 
+- Cross-shard hops in a pipeline now OVERLAP instead of serializing (the tokio serve loop). A remote
+  single-key command previously enqueued its `ShardWork` to the owning shard and AWAITED the reply
+  inline before decoding the next command, so a pipeline of N cross-shard commands paid N sequential
+  cross-thread round-trips -- which made a 2-shard node SLOWER than 1-shard on cross-shard traffic
+  (negative scaling). The loop now DEFERS a run of consecutive remote hops (enqueue, keep decoding)
+  and drains their replies together at the next barrier / end of batch; the owning shard is a single
+  FIFO consumer, so the whole run is serviced in one pass. Any non-hop command (a synchronous /
+  control / home / fan-out command, e.g. SELECT/MULTI/PING or a blocking park) is a BARRIER: the
+  pending run is spliced into the output buffer BEFORE the barrier's own reply, preserving strict
+  FIFO reply order on the wire, and state-mutating barriers (SELECT/AUTH/MULTI/ASKING) still take
+  effect before the following command routes. `shards == 1` is byte-identical (no hops), and the
+  io_uring datapath keeps the inline-await path for now (a following change mirrors the overlap).
+  Covered by new pipelined cross-shard ordering tests (FIFO, same-owner RMW, barrier-splice, 100-key
+  no-crosstalk, error-in-order, SELECT-barrier) plus the differential-vs-real-Redis gate.
+
 - RESP replies now encode STRAIGHT into the connection's output buffer instead of through a
   fresh per-reply `BytesMut`. `ironcache_protocol::encode` is now generic over any
   `bytes::BufMut` sink (it was `&mut BytesMut`; `BytesMut` still satisfies it, so external

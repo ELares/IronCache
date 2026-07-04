@@ -1268,6 +1268,86 @@ fn shard_started_at() -> ironcache_env::Monotonic {
     STARTED_AT.with(|s| s.borrow().unwrap_or(ironcache_env::Monotonic::ZERO))
 }
 
+/// One DEFERRED cross-shard hop (#8 overlap): a remote single-key command whose `ShardWork` was
+/// enqueued but whose reply is not yet awaited, so the next command's hop can be issued while this
+/// owner is still working. The serve loop parks a RUN of these and drains them together (in order)
+/// at the next barrier / end of batch, encoding each reply into `out` and running its per-command
+/// hooks then -- because those hooks read the reply bytes (`record_command_stats`/`record_hotkeys`),
+/// they cannot run until the reply is materialized. Every field is the per-command state the hooks
+/// need, captured at defer time.
+///
+/// KNOWN BEST-EFFORT EDGE (client tracking): the drain-time hooks read the deferred command's own
+/// snapshotted `was_tracking`/`was_bcast`, but the CLIENT-TRACKING / CLIENT-CACHING hooks
+/// (`apply_client_tracking`, `consume_caching_flag`) also read LIVE `conn` tracking state. If a
+/// tracking-CONTROL command (`CLIENT CACHING`/`TRACKING`) is pipelined BETWEEN deferred remote hops
+/// in the same batch, a hop's tracking hook can observe that control command's mutation (it runs as
+/// a barrier before the drain). This only affects CLIENT-side tracking of REMOTE keys, which is
+/// ALREADY documented single-shard-only / best-effort (see `apply_client_tracking`); it never
+/// affects the data reply bytes or their wire order. Snapshotting the full tracking sub-state into
+/// this struct is a clean follow-up; deferred here to keep the overlap focused on the FIFO property.
+struct DeferredHop {
+    /// The reply receiver (`None` = the owner was gone at send; `finish_hop` encodes shard-unavailable).
+    rx: Option<coordinator::HopReceiver>,
+    /// The request, for the hooks (cheap clone: `Request` is `Vec<Bytes>`, refcounted).
+    request: Request,
+    /// The monotonic start stamp for this command's elapsed-time (slowlog + commandstats).
+    cmd_start: ironcache_env::Monotonic,
+    /// Tracking-state snapshot taken BEFORE dispatch (so the tracking hook sees an ON->OFF flip).
+    was_tracking: bool,
+    was_bcast: bool,
+    /// The slowlog threshold snapshot (negative = disabled) for this command.
+    slow_threshold: i64,
+    /// The connection's negotiated proto, to encode the reply on the home core.
+    proto: ProtoVersion,
+}
+
+/// Drain a run of [`DeferredHop`]s (in FIFO order) into `out`: for each, await + encode its reply,
+/// then run its per-command hooks (commandstats, hotkeys, client-tracking, caching, slowlog) exactly
+/// as the inline path does -- so a deferred remote command is observably identical to a
+/// non-deferred one, only its reply is assembled later (still in order). Called at every barrier and
+/// at end of batch, so `out` stays strictly append-in-command-order (FIFO on the wire).
+#[allow(clippy::too_many_arguments)]
+async fn drain_deferred_hops(
+    pending: &mut Vec<DeferredHop>,
+    out: &mut Vec<u8>,
+    ctx: &ServerContext,
+    conn: &mut ConnState,
+    env: &Rc<RefCell<SystemEnv>>,
+    state_rc: &Rc<RefCell<ShardState>>,
+    push_tx: &tokio::sync::mpsc::Sender<crate::pubsub::ServerPush>,
+    shed_flag: &std::sync::Arc<crate::pubsub::ShedSignal>,
+) {
+    for d in pending.drain(..) {
+        let out_before = out.len();
+        coordinator::finish_hop(d.rx, out, d.proto).await;
+        let cmd_elapsed_us = u64::try_from(
+            env.borrow()
+                .now()
+                .saturating_duration_since(d.cmd_start)
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
+        record_command_stats(state_rc, &d.request, out_before, out, cmd_elapsed_us);
+        if ctx.hotkeys.is_active() {
+            let reply_bytes =
+                u64::try_from(out.len().saturating_sub(out_before)).unwrap_or(u64::MAX);
+            record_hotkeys(ctx, env, &d.request, cmd_elapsed_us, reply_bytes);
+        }
+        apply_client_tracking(
+            conn,
+            push_tx,
+            shed_flag,
+            &d.request,
+            d.was_tracking,
+            d.was_bcast,
+        );
+        consume_caching_flag(conn, &d.request);
+        if d.slow_threshold >= 0 {
+            record_slow_command(ctx, env, conn, &d.request, d.cmd_start, d.slow_threshold);
+        }
+    }
+}
+
 // `too_many_lines` is allowed: this is the per-connection WIRING + read/dispatch/write loop --
 // the shard-handle lazy-inits, the per-connection push channel + shed signal (FIX D), the
 // pipelined decode/route/flush loop, the subscribe-mode idle wait, and the close-path cleanup
@@ -1440,6 +1520,10 @@ async fn serve_connection(
     };
     let mut read_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
+    // CROSS-SHARD HOP OVERLAP (#8): the run of DEFERRED remote hops awaiting assembly. Parked as they
+    // are decoded and drained (in order) at the next barrier / end of batch. Always empty between
+    // batches (drained before every flush), so it carries no state across the outer loop.
+    let mut pending: Vec<DeferredHop> = Vec::new();
 
     // The IDLE TIMEOUT (PROD-SAFETY #4): a connection that sits idle (no command) longer than
     // `timeout` seconds is CLOSED, so idle connections cannot accumulate. `0` (the Redis default)
@@ -1481,7 +1565,9 @@ async fn serve_connection(
                     let cmd_start = env.borrow().now();
                     // The offset where THIS command's reply will be appended, so the commandstats
                     // hook can tell an error reply (leading `-`) from a success without re-parsing.
-                    let out_before = out.len();
+                    // `mut`: the cross-shard-hop overlap (#8) may re-base this when a run of pending
+                    // hop replies is spliced in ahead of a barrier command's output (see below).
+                    let mut out_before = out.len();
                     // CLIENT TRACKING (#409): snapshot whether this connection was tracking / in
                     // BCAST mode BEFORE dispatch, so the hook can detect the ON->OFF / RESET and the
                     // BCAST enter/leave transitions (purge or register prefixes accordingly).
@@ -1494,6 +1580,12 @@ async fn serve_connection(
                     // command must PARK; it stays `None` for every non-blocking command (the hot
                     // path), so this is a single stack `Option` write per command.
                     let mut block_request: Option<BlockPark> = None;
+                    // CROSS-SHARD HOP OVERLAP (#8): route_and_dispatch sets this (the tokio loop opts
+                    // IN below) when the command is a single-key REMOTE hop it ENQUEUED but did not
+                    // await -- we park it in `pending` and drain the run at the next barrier / end of
+                    // batch, instead of blocking here on the cross-thread round-trip (which serialized
+                    // N pipelined hops into 2N wakeups and made 2 shards slower than 1).
+                    let mut deferred_hop = coordinator::HopOutcome::NotHop;
                     // CLIENT PAUSE (#388, write-aware): hold this command HERE while a pause that
                     // applies to it is active -- an ALL pause holds every command, a WRITE pause
                     // holds only writes (reads + admin like SAVE proceed). This is the single point
@@ -1518,8 +1610,50 @@ async fn serve_connection(
                         &request,
                         &mut out,
                         &mut block_request,
+                        // #8: opt IN to hop deferral -- this is the default tokio serve loop.
+                        true,
+                        &mut deferred_hop,
                     )
                     .await;
+                    // #8 OVERLAP: a DEFERRED remote hop -- park it and keep decoding, so the next
+                    // command's hop is issued while this owner works. `out` is UNTOUCHED (the reply is
+                    // encoded later, in order), so FIFO on the wire is preserved. A hop is never a
+                    // blocking command and never closes the connection, so we skip the hooks + park +
+                    // close handling and go straight to the next command; its hooks run at drain time.
+                    if let coordinator::HopOutcome::Deferred(rx) = deferred_hop {
+                        pending.push(DeferredHop {
+                            rx,
+                            request,
+                            cmd_start,
+                            was_tracking,
+                            was_bcast,
+                            slow_threshold,
+                            proto: conn.proto,
+                        });
+                        consumed_total += consumed;
+                        continue;
+                    }
+                    // BARRIER (any synchronous / control / home / fan-out command): if a run of hops is
+                    // pending, splice their replies into `out` BEFORE this command's already-encoded
+                    // output (FIFO), running each hop's deferred hooks in order. `split_off` lifts this
+                    // command's bytes aside; after draining the run we re-append them and re-base
+                    // `out_before` so this command's own hooks read the right reply slice.
+                    if !pending.is_empty() {
+                        let barrier_bytes = out.split_off(out_before);
+                        drain_deferred_hops(
+                            &mut pending,
+                            &mut out,
+                            &ctx,
+                            &mut conn,
+                            &env,
+                            &state_rc,
+                            &push_tx,
+                            &shed_flag,
+                        )
+                        .await;
+                        out_before = out.len();
+                        out.extend_from_slice(&barrier_bytes);
+                    }
                     // SLOWLOG record (PROD-7): only reached when the SLOWLOG was enabled at the start
                     // of this command. Measure elapsed micros through the SAME Env clock seam
                     // (ADR-0003), and if it met the threshold, push the command (args + this
@@ -1623,12 +1757,45 @@ async fn serve_connection(
                 }
                 DecodeOutcome::Incomplete => break,
                 DecodeOutcome::Error(e) => {
-                    // Protocol error: write it and close the connection (hardening).
+                    // Protocol error: write it and close the connection (hardening). #8: FIRST drain
+                    // any pending cross-shard hops so the replies for the VALID commands that preceded
+                    // the malformed frame still go out (in order) before the error + close -- otherwise
+                    // the overlap would silently drop them (the inline path flushed them).
+                    if !pending.is_empty() {
+                        drain_deferred_hops(
+                            &mut pending,
+                            &mut out,
+                            &ctx,
+                            &mut conn,
+                            &env,
+                            &state_rc,
+                            &push_tx,
+                            &shed_flag,
+                        )
+                        .await;
+                    }
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
                     let _ = stream.send(std::mem::take(&mut out)).await;
                     break 'conn;
                 }
             }
+        }
+
+        // CROSS-SHARD HOP OVERLAP (#8): the batch ended (decode Incomplete) with a run of remote hops
+        // still pending (no trailing barrier drained them). Assemble their replies into `out` NOW, in
+        // order, BEFORE the flush -- so every reply for this batch is on the wire in command order.
+        if !pending.is_empty() {
+            drain_deferred_hops(
+                &mut pending,
+                &mut out,
+                &ctx,
+                &mut conn,
+                &env,
+                &state_rc,
+                &push_tx,
+                &shed_flag,
+            )
+            .await;
         }
 
         // Drain the whole processed batch ONCE (the running-cursor deferral): a single memmove removes
@@ -1959,6 +2126,10 @@ async fn serve_connection_uring(
                     // blocking is a documented io_uring-path limitation; the reply is the same one
                     // the command would have produced on a zero timeout.
                     let mut block_request: Option<BlockPark> = None;
+                    // #8: the io_uring loop does NOT opt into hop deferral yet (a following PR mirrors
+                    // the overlap here); it passes `defer_hops = false` so route_and_dispatch awaits
+                    // each hop inline exactly as before, and this stays `NotHop` (byte-identical path).
+                    let mut deferred_hop = coordinator::HopOutcome::NotHop;
                     // CLIENT PAUSE (#388, write-aware), identical to the tokio path: hold this
                     // command while a pause that applies to it is active -- an ALL pause holds
                     // everything, a WRITE pause holds only writes (reads + admin like SAVE proceed).
@@ -1981,8 +2152,12 @@ async fn serve_connection_uring(
                         &request,
                         &mut out,
                         &mut block_request,
+                        // #8: io_uring loop does NOT defer hops (inline await, byte-identical).
+                        false,
+                        &mut deferred_hop,
                     )
                     .await;
+                    let _ = &deferred_hop; // never set (defer_hops = false); kept for the shared signature.
                     // COMMANDSTATS / ERRORSTATS (#413): record this command's elapsed micros +
                     // outcome on the serving shard (ALWAYS, the call/usec/failed tally INFO reads).
                     // The end clock read is shared with the slowlog hook (same `cmd_start`).
@@ -2992,6 +3167,14 @@ async fn route_and_dispatch(
     request: &Request,
     out: &mut Vec<u8>,
     block_request: &mut Option<BlockPark>,
+    // CROSS-SHARD HOP OVERLAP (#8): when `defer_hops` is true (the tokio serve loop opts in), a
+    // single-target remote hop ENQUEUES its ShardWork and returns the reply receiver via
+    // `deferred_hop` INSTEAD of awaiting it inline -- so a pipeline of hops runs concurrently (the
+    // owner drains the run FIFO) rather than N serialized round-trips. The caller parks the receiver
+    // and drains it in order. When `defer_hops` is false (io_uring loop, or any non-pipelined caller)
+    // the hop is awaited inline exactly as before and `deferred_hop` stays `None` -- byte-identical.
+    defer_hops: bool,
+    deferred_hop: &mut coordinator::HopOutcome,
 ) -> bool {
     let cmd_upper = ascii_upper(request.command());
     let route = route::classify(&cmd_upper);
@@ -3818,12 +4001,26 @@ async fn route_and_dispatch(
         .await;
         false
     } else if let Some(target) = target {
-        // REMOTE keyed hop: enqueue to the owning shard, await its reply, encode here. The
-        // owning shard folded the data counters; here we only attribute commands_processed.
+        // REMOTE keyed hop: enqueue to the owning shard, encode its reply here. The owning shard
+        // folded the data counters; here we only attribute commands_processed.
         // KEYSPACE NOTIFICATIONS (PROD-8): the MUTATION runs on the OWNER shard, so it records its
         // keyspace events into the OWNER shard's pending buffer; that shard's drain loop drains +
         // publishes them (see `run_remote`). The home path here records nothing for a remote write.
         state_rc.borrow_mut().counters.on_command();
+        if defer_hops {
+            // #8 OVERLAP: enqueue the hop and hand the receiver back WITHOUT awaiting, so the caller
+            // can issue the next command's hop before this owner replies. `out` is left UNTOUCHED
+            // (the reply is encoded later, in order, by the caller's drain), so `deferred_hop` being
+            // Some is the caller's signal to defer this command's hooks + reply. A None inside means
+            // the owner was already gone; the caller's `finish_hop` encodes shard-unavailable in order.
+            *deferred_hop = coordinator::HopOutcome::Deferred(
+                coordinator::dispatch_via_send(inbox, target, request, conn.db).await,
+            );
+            // No home post-processing for a deferred remote hop: the wake/keyspace-publish below run
+            // on the OWNER shard (via run_remote), and the home probes are no-ops for a remote key.
+            // Return early so we do NOT run the shared post-dispatch (wake/publish) against `out`.
+            return false;
+        }
         coordinator::dispatch_via(inbox, target, request, conn.db, out, conn.proto).await;
         false
     } else {
