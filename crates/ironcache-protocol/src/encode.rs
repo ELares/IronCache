@@ -29,14 +29,14 @@
 
 use crate::error::ErrorReply;
 use crate::value::{ProtoVersion, Value};
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 
 /// Encode `value` into `out` for protocol version `proto`.
 // One arm per RESP type, each with its RESP2/RESP3 degradation inline; splitting
 // the match into per-type fns would scatter the one authoritative shaping table
 // (ADR-0019) across the file and hurt reviewability, so the length is deliberate.
 #[allow(clippy::too_many_lines)]
-pub fn encode(out: &mut BytesMut, value: &Value, proto: ProtoVersion) {
+pub fn encode(out: &mut impl BufMut, value: &Value, proto: ProtoVersion) {
     match value {
         Value::SimpleString(s) => {
             out.put_u8(b'+');
@@ -206,15 +206,16 @@ pub fn encode(out: &mut BytesMut, value: &Value, proto: ProtoVersion) {
     }
 }
 
-/// Convenience: encode into a fresh [`BytesMut`] and return it.
+/// Convenience: encode into a fresh `Vec<u8>` and return it. `Vec<u8>` is a
+/// [`BufMut`] sink, so `encode` writes into it directly (no `BytesMut` round-trip).
 #[must_use]
 pub fn encode_to_vec(value: &Value, proto: ProtoVersion) -> Vec<u8> {
-    let mut out = BytesMut::new();
+    let mut out = Vec::new();
     encode(&mut out, value, proto);
-    out.to_vec()
+    out
 }
 
-fn encode_error_line(out: &mut BytesMut, e: &ErrorReply) {
+fn encode_error_line(out: &mut impl BufMut, e: &ErrorReply) {
     // line() is "-TOKEN message"; sanitize against embedded CR/LF which would
     // break framing (a simple error cannot contain a raw newline).
     let line = e.line();
@@ -222,22 +223,22 @@ fn encode_error_line(out: &mut BytesMut, e: &ErrorReply) {
     crlf(out);
 }
 
-fn null_bulk(out: &mut BytesMut, _proto: ProtoVersion) {
+fn null_bulk(out: &mut impl BufMut, _proto: ProtoVersion) {
     out.put_slice(b"$-1\r\n");
 }
 
-fn null_array(out: &mut BytesMut, proto: ProtoVersion) {
+fn null_array(out: &mut impl BufMut, proto: ProtoVersion) {
     match proto {
         ProtoVersion::Resp3 => out.put_slice(b"_\r\n"),
         ProtoVersion::Resp2 => out.put_slice(b"*-1\r\n"),
     }
 }
 
-fn crlf(out: &mut BytesMut) {
+fn crlf(out: &mut impl BufMut) {
     out.put_slice(b"\r\n");
 }
 
-fn put_i64(out: &mut BytesMut, n: i64) {
+fn put_i64(out: &mut impl BufMut, n: i64) {
     let mut buf = itoa_buf();
     let s = i64_to_str(n, &mut buf);
     out.put_slice(s);
@@ -254,7 +255,7 @@ fn sanitize_line(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn put_double(out: &mut BytesMut, d: f64) {
+fn put_double(out: &mut impl BufMut, d: f64) {
     out.put_slice(format_double(d).as_bytes());
 }
 

@@ -353,9 +353,8 @@ fn parse_i64(b: &[u8]) -> Option<i64> {
 /// Encode `value` for `proto` and append to `out` (the home-core encode; mirrors the serve
 /// loop / coordinator / multikey encode). Encoding stays on the home core with the home proto.
 fn encode_into(out: &mut Vec<u8>, value: &Value, proto: ProtoVersion) {
-    let mut bm = bytes::BytesMut::with_capacity(64);
-    ironcache_protocol::encode(&mut bm, value, proto);
-    out.extend_from_slice(&bm);
+    // Vec<u8> is a bytes::BufMut sink: encode writes straight into `out` (no temp BytesMut + copy).
+    ironcache_protocol::encode(out, value, proto);
 }
 
 // ===========================================================================
