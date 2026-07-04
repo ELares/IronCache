@@ -1459,10 +1459,14 @@ async fn serve_connection(
 
     'conn: loop {
         // Drain every complete request currently buffered (pipelining), building
-        // one combined output buffer, then flush once.
+        // one combined output buffer, then flush once. A running cursor (`consumed_total`) advances
+        // per command and the read buffer is drained ONCE after the batch, instead of per command:
+        // draining per command memmoves all remaining pipelined bytes to the front each time, which is
+        // O(P^2) over a depth-P pipeline. `decode` parses a `&[u8]`, so we hand it `read_buf[cursor..]`.
         out.clear();
+        let mut consumed_total = 0usize;
         loop {
-            match decode(&read_buf, &limits) {
+            match decode(&read_buf[consumed_total..], &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
                     // SLOWLOG TIMING HOOK (PROD-7). When the SLOWLOG is ENABLED (threshold >= 0) read
                     // the monotonic clock ONCE before dispatch; when DISABLED (-1, the default) this
@@ -1557,7 +1561,7 @@ async fn serve_connection(
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
-                    read_buf.drain(..consumed);
+                    consumed_total += consumed;
                     // -- BLOCKING PARK (PROD-9). The blocking-command interception in
                     // `route_and_dispatch` set `block_request`: the command's non-blocking attempt
                     // found every key empty (or WAIT's quorum not yet met), so PARK this connection
@@ -1569,6 +1573,12 @@ async fn serve_connection(
                     // `block_request == None` on the hot path (every non-blocking command), so this
                     // is a single `is_some` check then skipped.
                     if let Some(park) = block_request {
+                        // The running cursor deferred the read-buffer drain; apply it now so
+                        // `run_block_park` (which owns `read_buf` during the park + re-decodes bytes
+                        // that arrive) sees the buffer starting at the next UNprocessed byte. The
+                        // blocking command's own bytes are included in `consumed_total`.
+                        read_buf.drain(..consumed_total);
+                        consumed_total = 0;
                         // Flush the pipelined replies that preceded the blocking command, so a
                         // blocked client still receives the earlier commands' replies before it
                         // parks (FIFO, never a blocking command holding up prior replies).
@@ -1619,6 +1629,12 @@ async fn serve_connection(
                     break 'conn;
                 }
             }
+        }
+
+        // Drain the whole processed batch ONCE (the running-cursor deferral): a single memmove removes
+        // every consumed command, leaving only a partial trailing frame at the front of the buffer.
+        if consumed_total > 0 {
+            read_buf.drain(..consumed_total);
         }
 
         // OUTPUT-BUFFER hard cap (PROD-SAFETY #5): before flushing, if the pending reply buffer has
@@ -1915,8 +1931,11 @@ async fn serve_connection_uring(
 
     'conn: loop {
         out.clear();
+        // Running cursor: advance per command, drain the read buffer ONCE after the batch instead of
+        // per command (per-command drain memmoves the remaining pipelined bytes each time -> O(P^2)).
+        let mut consumed_total = 0usize;
         loop {
-            match decode(&read_buf, &limits) {
+            match decode(&read_buf[consumed_total..], &limits) {
                 DecodeOutcome::Complete { request, consumed } => {
                     let slow_threshold = ctx.slowlog.log_slower_than_micros();
                     // COMMANDSTATS timing (#413): capture the monotonic start ALWAYS (one read),
@@ -2000,7 +2019,7 @@ async fn serve_connection_uring(
                     if slow_threshold >= 0 {
                         record_slow_command(&ctx, &env, &conn, &request, cmd_start, slow_threshold);
                     }
-                    read_buf.drain(..consumed);
+                    consumed_total += consumed;
                     // FIX1: the blocking command parked (`out` is empty). Write its IMMEDIATE
                     // non-blocking reply so it returns at once rather than hanging: the BLPOP-family
                     // pops get the nil-array timeout reply; WAIT gets the CURRENT in-sync replica
@@ -2031,6 +2050,13 @@ async fn serve_connection_uring(
                     break 'conn;
                 }
             }
+        }
+
+        // Drain the whole processed batch ONCE (the running-cursor deferral): one memmove removes all
+        // consumed commands, leaving any partial trailing frame at the front. Done before the flush +
+        // the subscriber-idle / recv paths below (which own `read_buf` and append to it).
+        if consumed_total > 0 {
+            read_buf.drain(..consumed_total);
         }
 
         // OUTPUT-BUFFER hard cap (PROD-SAFETY #5), identical to the tokio path.
