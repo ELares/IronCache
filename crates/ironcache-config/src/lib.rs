@@ -245,7 +245,7 @@ pub enum ClusterMode {
     /// the same `slot_to_shard` the router uses, so the connection homes on the key's owner. Mutually
     /// exclusive with `Raft` (which governs ownership across PHYSICAL nodes). TOML
     /// `cluster_mode = "shard-owners"` / `IRONCACHE_CLUSTER_MODE=shard-owners`.
-    #[serde(rename = "shard-owners")]
+    #[serde(rename = "shard-owners", alias = "shardowners")]
     ShardOwners,
 }
 
@@ -2676,7 +2676,7 @@ mod tests {
         let o = ConfigOverlay::from_toml_str("cluster_mode = \"raft\"").unwrap();
         assert_eq!(o.cluster_mode, Some(ClusterMode::Raft));
 
-        // #517: shard-owners mode parses from both spellings (and TOML).
+        // #517: shard-owners mode parses from both spellings via `parse_cluster_mode` (env/CLI)...
         assert_eq!(
             parse_cluster_mode("shard-owners"),
             Some(ClusterMode::ShardOwners)
@@ -2685,8 +2685,14 @@ mod tests {
             parse_cluster_mode(" ShardOwners "),
             Some(ClusterMode::ShardOwners)
         );
-        let o = ConfigOverlay::from_toml_str("cluster_mode = \"shard-owners\"").unwrap();
-        assert_eq!(o.cluster_mode, Some(ClusterMode::ShardOwners));
+        // ...AND both spellings via TOML/serde (the `rename` + `alias` cover the hyphen + no-hyphen).
+        for toml in [
+            "cluster_mode = \"shard-owners\"",
+            "cluster_mode = \"shardowners\"",
+        ] {
+            let o = ConfigOverlay::from_toml_str(toml).unwrap();
+            assert_eq!(o.cluster_mode, Some(ClusterMode::ShardOwners), "{toml}");
+        }
     }
 
     #[test]

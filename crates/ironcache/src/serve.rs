@@ -307,7 +307,32 @@ pub fn run_server_observed(
     // node therefore takes the `empty_self` arm here exactly like a no-topology node, and the
     // shared governed map replaces it below.
     let build_static_topology = config.cluster_mode == ironcache_config::ClusterMode::Static;
-    let mut cluster: Option<Arc<ironcache_cluster::SlotMap>> = if config.cluster_enabled {
+    let build_shard_owners = config.cluster_mode == ironcache_config::ClusterMode::ShardOwners;
+    let mut cluster: Option<Arc<ironcache_cluster::SlotMap>> = if config.cluster_enabled
+        && build_shard_owners
+    {
+        // SHARD-OWNERS (#517): the standalone node auto-owns ALL 16384 slots as a single-node
+        // cluster, so it SERVES every key immediately (via its single endpoint + the internal
+        // cross-shard hop) -- no manual `CLUSTER ADDSLOTS` needed, unlike a bare cluster-enabled
+        // node. The per-shard distinct-port listeners + the N-shard `CLUSTER SLOTS` projection that
+        // actually ELIMINATE the hop are follow-up PRs (#517 PR3/PR4), which replace this
+        // single-node-owns-all map with N synthetic owners at per-shard ports. Until then this mode
+        // is functionally a single-node cluster (correct answers, hop not yet eliminated).
+        Some(Arc::new(
+            ironcache_cluster::SlotMap::build(
+                vec![(
+                    ironcache_cluster::NodeEntry {
+                        id: cluster_node_id.into(),
+                        host: config.bind.to_string().into_boxed_str(),
+                        port: config.port,
+                    },
+                    vec![[0, ironcache_protocol::CLUSTER_SLOTS - 1]],
+                )],
+                cluster_node_id,
+            )
+            .expect("single-node-owns-all is a valid slot map"),
+        ))
+    } else if config.cluster_enabled {
         match config.cluster_topology.as_ref() {
             Some(topo) if build_static_topology => {
                 let nodes: Vec<(ironcache_cluster::NodeEntry, Vec<[u16; 2]>)> = topo

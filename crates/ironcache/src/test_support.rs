@@ -359,6 +359,27 @@ pub fn run_cluster_node_for_test_shards(
     run_server(&config).expect("test cluster node failed to bind")
 }
 
+/// Boot a SHARD-OWNERS node (#517) on `127.0.0.1:port` with `shards` internal shards: cluster
+/// enabled, `cluster_mode = ShardOwners`, NO static topology (the node auto-owns all 16384 slots as
+/// a single-node cluster, so it serves every key immediately). Used to assert the mode boots into a
+/// SERVING state (not a zero-slot `cluster_state:fail` node).
+#[must_use]
+pub fn run_shard_owners_node_for_test(port: u16, shards: usize) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        cluster_enabled: true,
+        cluster_mode: ClusterMode::ShardOwners,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("shard-owners config must validate");
+    run_server(&config).expect("shard-owners node failed to bind")
+}
+
 /// Boot a real RAFT-GOVERNANCE node (HA-4c) on `127.0.0.1:port` (single shard): cluster mode
 /// enabled, `cluster_mode = Raft`, with the shared `topology` (which supplies the voter set + the
 /// peer cluster-bus addresses) and this node's `announce_id`. The node spawns its Raft
