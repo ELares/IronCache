@@ -220,6 +220,17 @@ release.
 
 ### Added
 
+- A new opt-in `cluster_mode = "shard-owners"` (`IRONCACHE_CLUSTER_MODE=shard-owners`), the config
+  foundation of issue #517: a SINGLE node exposes its N internal shards as N hashslot owners (each on
+  its own port) so a cluster-aware client routes each key straight to the owning shard, eliminating
+  the internal cross-shard hop. This PR wires the mode declaration + validation only (it requires
+  `cluster_enabled` and rejects a `cluster_topology`, since owners derive from the shard count; it is
+  mutually exclusive with the raft governance mode). At boot the node auto-owns ALL 16384 slots as a
+  single-node cluster, so it SERVES every key immediately (no manual `CLUSTER ADDSLOTS`) -- it is
+  functionally a single-node cluster today. The per-shard distinct-port listeners and the N-shard
+  `CLUSTER SLOTS` projection that actually ELIMINATE the internal cross-shard hop are follow-up
+  changes; until they land the mode gives correct answers with the hop NOT yet eliminated.
+
 - Benchmarks now compare against the LATEST Redis (8.x), not the distro-packaged 7.x, and the README
   gains a higher-core scaling run (16-vCPU AWS Graviton, `redis-benchmark`, Redis 8.8.0 vs IronCache
   vs Dragonfly, GET/SET). On 16 cores IronCache wins SET decisively (about 2.5x Redis 8's io-threads
