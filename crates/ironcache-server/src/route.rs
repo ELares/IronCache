@@ -323,7 +323,11 @@ mod tests {
         // Every slot in [0, 16384) maps to exactly one shard in [0, n), and the per-shard ranges
         // partition the whole slot space with no gap or overlap -- the invariant the single-node
         // CLUSTER SLOTS projection relies on.
-        for n in [1usize, 2, 3, 4, 8, 15, 16] {
+        // Real shard counts are capped at MAX_SHARDS (256), so 256 is the top production value; 16384
+        // (each shard owns exactly one slot) is included as a pure-math boundary check. The partition
+        // holds for every n up to 16384; beyond that some shards would own zero slots (never a real
+        // config).
+        for n in [1usize, 2, 3, 4, 8, 15, 16, 256, 16384] {
             // Totality + in-range.
             for slot in 0u16..ironcache_protocol::CLUSTER_SLOTS {
                 let s = slot_to_shard(slot, n);
