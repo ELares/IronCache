@@ -248,24 +248,10 @@ mod tokio_bootstrap {
             // SHARD-OWNER MODE (#517): bind ONE listener PER shard at `bind.port() + i`, each homing
             // its accepted connections on THAT shard (its own `conn_senders[i]`), so a cluster-aware
             // client that dials the owner's port lands on the key's owner shard -- no internal hop.
-            // `conn_senders` is consumed here, one sender per per-shard acceptor. All N binds happen
-            // synchronously so any port conflict fails boot loudly.
-            for (index, sender) in conn_senders.into_iter().enumerate() {
-                let offset = u16::try_from(index).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "shard index exceeds u16")
-                })?;
-                let port = cfg.bind.port().checked_add(offset).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "shard-owner port {} + shard {index} overflows u16 (lower the base port \
-                             or the shard count)",
-                            cfg.bind.port()
-                        ),
-                    )
-                })?;
-                let addr = std::net::SocketAddr::new(cfg.bind.ip(), port);
-                let listener = listener_for(addr)?;
+            // `bind_shard_owner_listeners` binds all N up front (fail fast, no half-bound state) and
+            // rejects the socket-activation combo; only once every port is bound do we spawn.
+            let listeners = bind_shard_owner_listeners(cfg.bind, total)?;
+            for (index, (listener, sender)) in listeners.into_iter().zip(conn_senders).enumerate() {
                 let shutdown = Arc::clone(&shutdown);
                 let acceptor = std::thread::Builder::new()
                     .name(format!("ironcache-acceptor-{index}"))
@@ -417,6 +403,52 @@ mod tokio_bootstrap {
         }
         // Returning drops `conn_senders`, closing every shard channel so the shard
         // serve loops observe channel-closed and move on to drain.
+    }
+
+    /// SHARD-OWNER binding (#517): bind ONE listener per shard at `bind.port() + i`, in shard order.
+    ///
+    /// Binds ALL N up front so a mid-list port conflict/overflow fails boot BEFORE any acceptor
+    /// thread is spawned -- no orphaned acceptors left running on the ports that did bind. Rejects
+    /// systemd socket activation (`LISTEN_FDS`, #389): activation hands ONE inherited fd for ONE
+    /// port, but this mode needs N DISTINCT self-bound ports; adopting the one fd N times (as
+    /// `listener_for` would, since it ignores its `addr` under activation) would alias it (a
+    /// multi-close-unsound double free on shutdown) AND leave ports `base+1..` unbound. The two are
+    /// fundamentally incompatible, so reject the combo loudly (mirroring the io_uring guard in
+    /// `Config::validate`). A malformed activation env -> `Err` -> treated as inactive, and
+    /// `listener_for` then self-binds, which is correct here.
+    fn bind_shard_owner_listeners(
+        bind: std::net::SocketAddr,
+        total: usize,
+    ) -> std::io::Result<Vec<std::net::TcpListener>> {
+        if crate::listen_fds::from_env()
+            .map(|fds| !fds.is_empty())
+            .unwrap_or(false)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "shard-owners mode is incompatible with systemd socket activation (LISTEN_FDS): it \
+                 needs N distinct self-bound ports, but activation supplies one inherited socket for \
+                 one port",
+            ));
+        }
+        let mut listeners = Vec::with_capacity(total);
+        for index in 0..total {
+            let offset = u16::try_from(index).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "shard index exceeds u16")
+            })?;
+            let port = bind.port().checked_add(offset).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "shard-owner port {} + shard {index} overflows u16 (lower the base port or \
+                         the shard count)",
+                        bind.port()
+                    ),
+                )
+            })?;
+            listeners.push(listener_for(std::net::SocketAddr::new(bind.ip(), port))?);
+        }
+        Ok(listeners)
     }
 
     /// SHARD-OWNER acceptor (#517): owns ONE per-shard listener and hands EVERY accepted connection
