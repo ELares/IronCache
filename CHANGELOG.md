@@ -164,6 +164,14 @@ release.
 
 ### Added
 
+- Benchmarks now compare against the LATEST Redis (8.x), not the distro-packaged 7.x, and the README
+  gains a higher-core scaling run (16-vCPU AWS Graviton, `redis-benchmark`, Redis 8.8.0 vs IronCache
+  vs Dragonfly, GET/SET). On 16 cores IronCache wins SET decisively (about 2.5x Redis 8's io-threads
+  config, whose io-threads accelerate reads but not the serialized write mutation) and edges GET past
+  Redis 8's best config (about 1.2x); Dragonfly leads both (measured directly, not from its
+  marketing). The prior 2-vCPU table is kept and reframed as the small-node worst case (it used Redis
+  7.4 and its Dragonfly-trails standing is a 2-core artifact that reverses at real core count).
+
 - Rolling-upgrade cluster OBSERVERS (issue #392 Phase 3): a new `ironcache::cluster_upgrade` module
   translates a cluster snapshot (`ClusterView`: a shard's primary + replicas, the target version, the
   lag bound, the raft-quorum flag) into the five `upgrade_step` inputs (`replicas_to_upgrade`,
