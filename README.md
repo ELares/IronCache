@@ -297,32 +297,44 @@ Redis is compared at **8.x**, not 7.x.
 
 **Setup.** A single **AWS Graviton c7g.4xlarge** server (16 vCPU, arm64, kernel 6.17)
 with a separate **c7g.8xlarge** load generator (32 vCPU, so the generator is never the
-cap). The tool is `redis-benchmark` against a 1,000,000-key space, pipeline 64,
-`-c 512 --threads 16`, persistence off. Each engine uses all 16 server cores: Redis 8
-`--io-threads 8` (its peak; 16 did not improve), IronCache `--shards 15` (one core left
-for the acceptor), Dragonfly `--proactor_threads 16`. Versions: **Redis 8.8.0**,
-Dragonfly latest, IronCache (this build, io_uring datapath).
+cap). The tool is `redis-benchmark` against a 1,000,000-key space, **pipeline 64**,
+`-c 512 --threads 16`, **default 3-byte values** (`redis-benchmark`'s default `-d`),
+persistence off. This is a PIPELINED PEAK-THROUGHPUT microbenchmark of GET and SET in
+isolation -- it is NOT a mixed workload and reports no latency percentiles (the 2-vCPU
+run below carries the MIX and tail-latency rows); read it as a raw scaling ceiling, not a
+production-traffic model. Each engine uses all 16 server cores: Redis 8 `--io-threads 8`
+(its peak; 16 did not improve), IronCache `--shards 15` (one core left for the acceptor),
+Dragonfly `--proactor_threads 16`. Versions: **Redis 8.8.0**, Dragonfly official image
+pulled 2026-07-03 (the `latest` tag; the exact patch was not captured on the ephemeral
+box -- the pinned baseline is v1.39.0 in [COMPETITORS.md](docs/bench/COMPETITORS.md), and
+a version-pinned Dragonfly re-run is a follow-up), IronCache (this build, io_uring
+datapath). Bold marks the fastest engine in each row.
 
 | Peak ops/sec | Redis 8 (1 thread) | Redis 8 (io-threads 8) | IronCache (shards 15) | Dragonfly (16) |
 | --- | ---: | ---: | ---: | ---: |
-| GET | 2,482,622 | 3,315,650 | **3,974,563** | 4,921,260 |
-| SET | (n/a) | 1,328,374 | **3,311,258** | 4,945,598 |
+| GET | 2,482,622 | 3,315,650 | 3,974,563 | **4,921,260** |
+| SET | (n/a) | 1,328,374 | 3,311,258 | **4,945,598** |
 
-IronCache's GET scales cleanly with shards (about 1.53M / 1.81M / 2.84M / 3.97M at 1 / 4
-/ 8 / 15 shards), overtaking single-threaded Redis 8 at ~8 cores.
+IronCache's GET scales with shards (about 1.53M / 1.33M / 1.81M / 2.84M / 3.97M at 1 / 2 /
+4 / 8 / 15 shards): it DIPS from 1 to 2 shards -- the cross-shard-hop overhead, since with
+2 shards about half of random keys land on the non-home shard -- then climbs steeply,
+overtaking single-threaded Redis 8 at ~8 cores. Erasing that 1-to-2 dip (cross-shard-hop
+batching) is exactly the tracked datapath work below.
 
 **How to read this (honestly).** On 16 cores IronCache **wins SET decisively** (3.31M vs
 Redis 8's 1.33M, about 2.5x -- Redis's io-threads accelerate reads but the single main
 thread still serializes the write mutation) and **edges GET** past Redis 8's best config
-(3.97M vs 3.32M, about 1.2x). Redis 8 is a much stronger GET baseline than 7.x was: its
-io-threads lift GET from 2.48M to 3.32M, closing most of the gap a 7.x comparison would
-have shown -- which is exactly why we no longer benchmark against 7.x. **Dragonfly leads
-both** (about 4.9M), measured directly on the same box rather than taken from its
-marketing; its widely cited "25x" is a single-instance-versus-single-threaded-Redis
-framing that does not hold against multi-threaded Redis 8. Closing the remaining gap to
-Dragonfly is tracked optimization work (cross-shard-hop batching and per-op allocation
-removal in the datapath), not an architectural ceiling -- at these throughputs the server
-CPU is not saturated.
+(3.97M vs 3.32M, about 1.2x, each engine at its own peak on the same 16-vCPU box). Redis 8
+is a much stronger GET baseline than 7.x was: its io-threads lift GET from 2.48M to 3.32M,
+closing most of the gap a 7.x comparison would have shown -- which is exactly why we no
+longer benchmark against 7.x. **Dragonfly leads both** (about 4.9M), measured directly on
+the same box rather than taken from its marketing; its widely cited "25x" is a
+single-instance-versus-single-threaded-Redis framing that does not hold against
+multi-threaded Redis 8 (here Dragonfly is about 2x single-threaded Redis 8, not 25x).
+Closing the remaining gap to Dragonfly is tracked optimization work (cross-shard-hop
+batching and per-op allocation removal in the datapath) rather than a fixed architectural
+ceiling; quantifying how much of the gap that recovers is itself follow-up measurement,
+not an assumption.
 
 ### Small-node (2-vCPU) worst case (dated 2026-06-21)
 
