@@ -99,6 +99,24 @@ pub struct ShardReply {
 /// it is an `Arc` over lock-free channel senders.
 pub type Inbox = Arc<[mpsc::Sender<ShardWork>]>;
 
+/// The receiver end of a single deferred cross-shard hop (from [`dispatch_via_send`]); the serve
+/// loop parks a run of these and drains them together via [`finish_hop`].
+pub type HopReceiver = oneshot::Receiver<ShardReply>;
+
+/// The out-param `route_and_dispatch` sets to tell the serve loop whether the command was DEFERRED
+/// as a cross-shard hop (#8 overlap): `NotHop` = a synchronous/barrier command whose reply is
+/// already in `out` (run its hooks now); `Deferred(rx)` = a remote hop that was enqueued but not
+/// awaited (park it, drain the reply in order later). `Deferred(None)` means the owner was gone at
+/// send time, so `finish_hop` will encode the shard-unavailable error in order.
+#[derive(Debug, Default)]
+pub enum HopOutcome {
+    /// The command produced its reply synchronously (or is a park/close); not a deferred hop.
+    #[default]
+    NotHop,
+    /// A remote single-key hop was enqueued; its reply receiver (`None` = owner gone at send).
+    Deferred(Option<HopReceiver>),
+}
+
 /// Build `n` bounded per-shard inbound queues, returning the shared [`Inbox`] of senders
 /// (one per shard, captured into the serve closure) and the matching receivers (one per
 /// shard, handed to that shard's [`run_drain_loop`] by the bootstrap).
@@ -606,6 +624,27 @@ pub async fn dispatch_via(
     out: &mut Vec<u8>,
     proto: ProtoVersion,
 ) {
+    // The full hop = the SEND half then the AWAIT half, back to back (the non-pipelined path).
+    let rx = dispatch_via_send(inbox, target, request, db).await;
+    finish_hop(rx, out, proto).await;
+}
+
+/// The SEND half of a cross-shard hop (COORDINATOR.md #107): build the oneshot, enqueue the
+/// [`ShardWork`] to `inbox[target]`, and return the reply receiver WITHOUT awaiting it -- so a
+/// PIPELINE of hops can be issued back-to-back (the owner is a single FIFO consumer that drains the
+/// whole run) and their replies awaited together in [`finish_hop`], collapsing N serialized
+/// round-trips into one. This is the same enqueue-all-then-await-all shape [`fan_out_all`] already
+/// uses. Returns `None` if the owning shard's receiver is gone (shutdown / shard died); the caller
+/// records that and [`finish_hop`] encodes the shard-unavailable error IN ORDER at assembly time.
+///
+/// `send().await` still applies the bounded-queue back-pressure (suspends only if the owner's queue
+/// is full), exactly as the non-pipelined path did.
+pub async fn dispatch_via_send(
+    inbox: &Inbox,
+    target: usize,
+    request: &Request,
+    db: u32,
+) -> Option<oneshot::Receiver<ShardReply>> {
     let (tx, rx) = oneshot::channel::<ShardReply>();
     let work = ShardWork {
         // Clone is cheap: Request is Vec<Bytes> (refcounted buffers).
@@ -613,24 +652,33 @@ pub async fn dispatch_via(
         db,
         reply: tx,
     };
-    // Await-on-full back-pressure. A send error means the owning shard's receiver is gone
-    // (shutdown / shard died); reply with a proto-shaped error rather than hang.
     if inbox[target].send(work).await.is_err() {
-        encode_into(out, &Value::error(shard_unavailable_error()), proto);
-        return;
+        return None;
     }
-    match rx.await {
-        Ok(reply) => {
-            // The home core deliberately does NOT re-apply `reply.deltas`: the OWNING
-            // shard already folded those data counters into its own ShardState (the data
-            // lives there), so applying them here too would double-count. They ride back
-            // only so a future observability pass could attribute cross-shard work; PASS 1
-            // discards them here. The issuing connection's commands_processed is bumped by
-            // the serve loop (matching the local fast path), not from these deltas.
-            let _ = &reply.deltas;
-            encode_into(out, &reply.value, proto);
-        }
-        Err(_) => encode_into(out, &Value::error(shard_unavailable_error()), proto),
+    Some(rx)
+}
+
+/// The AWAIT half of a cross-shard hop: await the reply from [`dispatch_via_send`] and encode it
+/// into `out` with the home connection's `proto`. A `None` receiver (owner already gone at send) or
+/// an oneshot error (owner died mid-flight) both encode the proto-shaped shard-unavailable error --
+/// byte-identical to the fused [`dispatch_via`]. The home core deliberately does NOT re-apply
+/// `reply.deltas` (the owning shard already folded those data counters into its own `ShardState`;
+/// applying them here too would double-count); the issuing connection's `commands_processed` is
+/// bumped by the serve loop, matching the local fast path.
+pub async fn finish_hop(
+    rx: Option<oneshot::Receiver<ShardReply>>,
+    out: &mut Vec<u8>,
+    proto: ProtoVersion,
+) {
+    match rx {
+        Some(rx) => match rx.await {
+            Ok(reply) => {
+                let _ = &reply.deltas;
+                encode_into(out, &reply.value, proto);
+            }
+            Err(_) => encode_into(out, &Value::error(shard_unavailable_error()), proto),
+        },
+        None => encode_into(out, &Value::error(shard_unavailable_error()), proto),
     }
 }
 
