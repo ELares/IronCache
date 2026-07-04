@@ -3,8 +3,9 @@
 # Rust workspace CI. Mirrors the guard idiom of release.yml: a leading `guard`
 # job short-circuits the whole workflow while the repo is docs-only (no root
 # Cargo.toml), so the workflow is inert until the first crate lands and active
-# thereafter. Gates: fmt, clippy (pedantic, -D warnings), test (ubuntu + macos),
-# msrv (1.85), musl static build, and the invariant lints (INVARIANTS.md).
+# thereafter. Gates: fmt, clippy (pedantic, -D warnings), test (ubuntu; Linux is
+# the only supported deployment OS), msrv (1.85), musl static build, and the
+# invariant lints (INVARIANTS.md).
 name: rust
 
 on:
@@ -78,7 +79,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Linux only: IronCache targets Linux servers (the io_uring datapath is Linux-only and the
+        # deployment images are Linux). macOS was dropped from CI -- it is not a supported deployment
+        # OS and its runners were a persistent source of slow/flaky hangs. The single-entry matrix is
+        # kept so the check name stays `test (ubuntu-latest)`. Local macOS dev still works (portable
+        # tokio path); it is just no longer a merge gate.
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
