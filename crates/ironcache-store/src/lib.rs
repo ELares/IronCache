@@ -978,12 +978,13 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // the hot path (the no-op policies do nothing with it, and the FIFO-class engine
         // reads the freq off the object at `select_victim` time via `VictimFreq`).
         let h = self.key_hash(key);
-        if let Some(obj) = self.dbs[db_idx].find_mut(h, |e| e.key() == key) {
+        // SINGLE PROBE (#511): one `find_mut` bumps the freq AND yields the view, instead of a
+        // `find_mut` (bump) followed by a second `find` (view) -- two SIMD group walks where one
+        // suffices on every GET. The `&mut Entry` reborrows immutably for `view_of` after the bump.
+        self.dbs[db_idx].find_mut(h, |e| e.key() == key).map(|obj| {
             obj.bump_freq();
-        }
-        self.dbs[db_idx]
-            .find(h, |e| e.key() == key)
-            .map(Self::view_of)
+            Self::view_of(obj)
+        })
     }
 
     // The Store-trait view of the passive-replica flag (HA-7d), so generic command handlers
