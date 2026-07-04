@@ -1016,6 +1016,19 @@ impl Config {
                     .to_owned(),
             });
         }
+        // SHARD-OWNERS binds one listener PER shard (`port + i`), which the tokio bootstrap does; the
+        // io_uring bootstrap does not yet (its per-shard listeners are a follow-up). Reject the combo
+        // loudly rather than silently bind a single port whose `CLUSTER SLOTS` projection would
+        // advertise per-shard ports no one is listening on.
+        if self.cluster_mode == ClusterMode::ShardOwners && self.runtime == RuntimeBackend::IoUring
+        {
+            return Err(ConfigError::Invalid {
+                field: "cluster-mode",
+                reason: "shard-owners mode is not yet supported with the io_uring runtime (its \
+                         per-shard listeners are a follow-up); use the tokio runtime for shard-owners"
+                    .to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -2739,6 +2752,29 @@ mod tests {
         assert!(
             with_topo.validate().is_err(),
             "shard-owners + a cluster_topology must be rejected"
+        );
+
+        // #517 PR3: shard-owners is rejected with the io_uring runtime (per-shard listeners are a
+        // tokio-only follow-up there); the tokio runtime (the default) is accepted.
+        let with_uring = Config {
+            cluster_mode: ClusterMode::ShardOwners,
+            cluster_enabled: true,
+            runtime: RuntimeBackend::IoUring,
+            ..Config::default()
+        };
+        assert!(
+            with_uring.validate().is_err(),
+            "shard-owners + io_uring must be rejected"
+        );
+        let with_tokio = Config {
+            cluster_mode: ClusterMode::ShardOwners,
+            cluster_enabled: true,
+            runtime: RuntimeBackend::Tokio,
+            ..Config::default()
+        };
+        assert!(
+            with_tokio.validate().is_ok(),
+            "shard-owners + tokio must be accepted"
         );
     }
 
