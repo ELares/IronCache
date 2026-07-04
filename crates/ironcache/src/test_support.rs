@@ -359,25 +359,70 @@ pub fn run_cluster_node_for_test_shards(
     run_server(&config).expect("test cluster node failed to bind")
 }
 
-/// Boot a SHARD-OWNERS node (#517) on `127.0.0.1:port` with `shards` internal shards: cluster
-/// enabled, `cluster_mode = ShardOwners`, NO static topology (the node auto-owns all 16384 slots as
-/// a single-node cluster, so it serves every key immediately). Used to assert the mode boots into a
-/// SERVING state (not a zero-slot `cluster_state:fail` node).
+/// Boot a SHARD-OWNERS node (#517) on `127.0.0.1` with `shards` internal shards: cluster enabled,
+/// `cluster_mode = ShardOwners`, NO static topology (the node auto-owns all 16384 slots, so it serves
+/// every key immediately). Returns the running `ShardSet` AND the base port it bound; the node's per-
+/// shard listeners are `base .. base + shards - 1`.
+///
+/// The node binds `shards` CONTIGUOUS ports, but only the base is picked from the OS ephemeral pool,
+/// so under parallel test load an adjacent port can be grabbed between probe and bind. This RETRIES
+/// the whole boot with a fresh contiguous block until every listener binds -- so the shard-owner
+/// tests are robust under the parallel `cargo test --workspace` run (a plain single-port `free_port`
+/// reserved only the base and flaked with bind panics).
 #[must_use]
-pub fn run_shard_owners_node_for_test(port: u16, shards: usize) -> ShardSet {
-    let config = Config {
-        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        port,
-        shards,
-        databases: 16,
-        cluster_enabled: true,
-        cluster_mode: ClusterMode::ShardOwners,
-        ..Config::default()
-    };
-    config
-        .validate()
-        .expect("shard-owners config must validate");
-    run_server(&config).expect("shard-owners node failed to bind")
+pub fn run_shard_owners_node_for_test(shards: usize) -> (ShardSet, u16) {
+    for _ in 0..64 {
+        let base = free_contiguous_ports(shards);
+        let config = Config {
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: base,
+            shards,
+            databases: 16,
+            cluster_enabled: true,
+            cluster_mode: ClusterMode::ShardOwners,
+            ..Config::default()
+        };
+        config
+            .validate()
+            .expect("shard-owners config must validate");
+        // A bind race (an adjacent port taken between probe and bind) returns Err -> retry a fresh
+        // block; any OTHER boot error would also retry, but only a transient bind race is plausible.
+        if let Ok(set) = run_server(&config) {
+            return (set, base);
+        }
+    }
+    panic!("could not bind {shards} contiguous shard-owner ports after 64 attempts");
+}
+
+/// Find a base port `b` such that `b .. b + n - 1` are ALL currently bindable on 127.0.0.1, by
+/// holding a listener on every one during the probe (so the block is momentarily reserved as a
+/// unit), then releasing them for the caller to bind. Retries until it finds a clean contiguous run.
+fn free_contiguous_ports(n: usize) -> u16 {
+    let span = u16::try_from(n.max(1)).expect("shard count fits u16");
+    for _ in 0..256 {
+        let Ok(l0) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
+            continue;
+        };
+        let base = l0.local_addr().expect("listener has a local addr").port();
+        if base.checked_add(span - 1).is_none() {
+            continue; // base too high for the block to fit u16; try another ephemeral port
+        }
+        let mut held = vec![l0];
+        let mut all_free = true;
+        for i in 1..span {
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", base + i)) {
+                held.push(l);
+            } else {
+                all_free = false;
+                break;
+            }
+        }
+        drop(held); // release the block so the caller can bind it
+        if all_free {
+            return base;
+        }
+    }
+    panic!("could not find {n} contiguous free ports after 256 attempts");
 }
 
 /// Boot a real RAFT-GOVERNANCE node (HA-4c) on `127.0.0.1:port` (single shard): cluster mode
