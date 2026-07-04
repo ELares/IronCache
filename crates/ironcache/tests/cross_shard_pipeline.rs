@@ -214,6 +214,33 @@ async fn pipelined_select_barrier_takes_effect_before_next_command() {
     pipeline_expect(&mut c, &frame, &expected).await;
 }
 
+/// TEST (review #1 regression): a valid deferred remote hop followed by a MALFORMED frame in the
+/// same batch. The protocol-error close path must FIRST drain the pending hop so the valid command's
+/// reply still goes out (in order) before the error + close -- the overlap must not silently drop it.
+#[tokio::test(flavor = "current_thread")]
+async fn deferred_hop_reply_survives_a_trailing_protocol_error() {
+    let (_set, port) = boot(3);
+    let mut c = connect_retry(port).await;
+    // Seed a value (its own batch), then pipeline: GET a (a deferred remote hop) + a malformed
+    // array-count frame (`*x\r\n`) which decodes to a protocol Error and closes the connection.
+    client_write(&mut c, &cmd(&["SET", "a", "hello"])).await;
+    expect_exact(&mut c, b"+OK\r\n").await;
+
+    let mut frame = cmd(&["GET", "a"]);
+    frame.push_str("*x\r\n"); // malformed: non-numeric array count -> DecodeOutcome::Error
+    client_write(&mut c, &frame).await;
+
+    // The deferred GET's reply must arrive FIRST (drained before the error), in order.
+    expect_exact(&mut c, &bulk("hello")).await;
+    // Then the protocol error line.
+    let err = read_line(&mut c).await;
+    assert!(
+        err.starts_with(b"-"),
+        "expected the protocol error after the drained hop reply, got {:?}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
 async fn client_write(client: &mut TcpStream, frame: &str) {
     client.write_all(frame.as_bytes()).await.unwrap();
 }

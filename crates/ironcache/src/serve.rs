@@ -1275,6 +1275,16 @@ fn shard_started_at() -> ironcache_env::Monotonic {
 /// hooks then -- because those hooks read the reply bytes (`record_command_stats`/`record_hotkeys`),
 /// they cannot run until the reply is materialized. Every field is the per-command state the hooks
 /// need, captured at defer time.
+///
+/// KNOWN BEST-EFFORT EDGE (client tracking): the drain-time hooks read the deferred command's own
+/// snapshotted `was_tracking`/`was_bcast`, but the CLIENT-TRACKING / CLIENT-CACHING hooks
+/// (`apply_client_tracking`, `consume_caching_flag`) also read LIVE `conn` tracking state. If a
+/// tracking-CONTROL command (`CLIENT CACHING`/`TRACKING`) is pipelined BETWEEN deferred remote hops
+/// in the same batch, a hop's tracking hook can observe that control command's mutation (it runs as
+/// a barrier before the drain). This only affects CLIENT-side tracking of REMOTE keys, which is
+/// ALREADY documented single-shard-only / best-effort (see `apply_client_tracking`); it never
+/// affects the data reply bytes or their wire order. Snapshotting the full tracking sub-state into
+/// this struct is a clean follow-up; deferred here to keep the overlap focused on the FIFO property.
 struct DeferredHop {
     /// The reply receiver (`None` = the owner was gone at send; `finish_hop` encodes shard-unavailable).
     rx: Option<coordinator::HopReceiver>,
@@ -1747,7 +1757,23 @@ async fn serve_connection(
                 }
                 DecodeOutcome::Incomplete => break,
                 DecodeOutcome::Error(e) => {
-                    // Protocol error: write it and close the connection (hardening).
+                    // Protocol error: write it and close the connection (hardening). #8: FIRST drain
+                    // any pending cross-shard hops so the replies for the VALID commands that preceded
+                    // the malformed frame still go out (in order) before the error + close -- otherwise
+                    // the overlap would silently drop them (the inline path flushed them).
+                    if !pending.is_empty() {
+                        drain_deferred_hops(
+                            &mut pending,
+                            &mut out,
+                            &ctx,
+                            &mut conn,
+                            &env,
+                            &state_rc,
+                            &push_tx,
+                            &shed_flag,
+                        )
+                        .await;
+                    }
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
                     let _ = stream.send(std::mem::take(&mut out)).await;
                     break 'conn;
