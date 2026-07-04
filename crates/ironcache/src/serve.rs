@@ -219,6 +219,9 @@ pub fn run_server_observed(
     let shard_cfg = ShardConfig {
         shards: config.shards,
         bind,
+        // SHARD-OWNER ENDPOINTS (#517): in shard-owners mode, bind one listener per shard (port + i)
+        // so a cluster-aware client routes each key to its owner's port and skips the internal hop.
+        shard_owner_ports: config.cluster_mode == ironcache_config::ClusterMode::ShardOwners,
     };
 
     // The BOOT eviction policy NAME is leaked to a 'static str so INFO/ServerInfo can

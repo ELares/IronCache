@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! #517 PR2 acceptance: a node booted with `cluster_mode = shard-owners` (multiple internal shards,
-//! no static topology) must boot into a SERVING single-node cluster -- it auto-owns all 16384 slots,
-//! so `CLUSTER INFO` is `cluster_state:ok` and keys are served immediately (no `CLUSTER ADDSLOTS`).
-//! This guards against the "cluster-enabled but zero slots -> CLUSTERDOWN" trap: enabling the perf
-//! mode must NOT turn a working cache into a non-serving node. (The per-shard endpoints + the
-//! N-shard projection that actually eliminate the internal hop are later PRs; here we only assert
-//! the mode is a correct, serving single-node cluster.)
+//! #517 shard-owners acceptance.
+//!
+//! PR2: a node booted with `cluster_mode = shard-owners` (multiple internal shards, no static
+//! topology) must boot into a SERVING single-node cluster -- it auto-owns all 16384 slots, so
+//! `CLUSTER INFO` is `cluster_state:ok` and keys are served immediately (no `CLUSTER ADDSLOTS`). This
+//! guards against the "cluster-enabled but zero slots -> CLUSTERDOWN" trap: enabling the perf mode
+//! must NOT turn a working cache into a non-serving node.
+//!
+//! PR3: the mode binds ONE listener PER shard at `port + i`, each homing its connections on shard
+//! `i`. We assert every one of the N per-shard ports is bound and serves keys (the foundation the
+//! later `CLUSTER SLOTS` projection points cluster-aware clients at, so each key lands on its owner
+//! with no internal hop).
 
 use ironcache::test_support::run_shard_owners_node_for_test;
 use std::net::TcpListener;
@@ -76,4 +81,35 @@ async fn shard_owners_mode_owns_all_slots_and_serves_keys() {
     assert_eq!(&set, b"+OK\r\n", "SET must succeed on the serving node");
     let get = send_read(&mut c, &cmd(&["GET", "k"])).await;
     assert_eq!(&get, b"$5\r\nhello\r\n", "GET must return the value");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shard_owners_binds_one_serving_listener_per_shard() {
+    // PR3: 4 shards -> the node binds 4 listeners (base_port .. base_port + 3). Pick a base with
+    // headroom so base + 3 cannot collide with an ephemeral port already in use.
+    const SHARDS: u16 = 4;
+    let base = free_port();
+    let _node = run_shard_owners_node_for_test(base, SHARDS as usize);
+
+    // EVERY per-shard port must be independently bound AND serve keys (a connection to `base + i`
+    // homes on shard `i`; the single-node-owns-all map means it serves any key, via a local hit or
+    // an internal hop). A missing listener would fail to connect; a broken one would fail the SET/GET.
+    for i in 0..SHARDS {
+        let port = base + i;
+        let mut c = connect_retry(port).await;
+        let key = format!("shard-port-{i}");
+        let val = format!("v{i}");
+        let set = send_read(&mut c, &cmd(&["SET", &key, &val])).await;
+        assert_eq!(
+            &set, b"+OK\r\n",
+            "per-shard port {port} (shard {i}) must serve SET"
+        );
+        let get = send_read(&mut c, &cmd(&["GET", &key])).await;
+        let want = format!("${}\r\n{val}\r\n", val.len());
+        assert_eq!(
+            get,
+            want.as_bytes(),
+            "per-shard port {port} (shard {i}) must return the value"
+        );
+    }
 }
