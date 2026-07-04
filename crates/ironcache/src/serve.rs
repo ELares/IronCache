@@ -314,26 +314,44 @@ pub fn run_server_observed(
     let mut cluster: Option<Arc<ironcache_cluster::SlotMap>> = if config.cluster_enabled
         && build_shard_owners
     {
-        // SHARD-OWNERS (#517): the standalone node auto-owns ALL 16384 slots as a single-node
-        // cluster, so it SERVES every key immediately (via its single endpoint + the internal
-        // cross-shard hop) -- no manual `CLUSTER ADDSLOTS` needed, unlike a bare cluster-enabled
-        // node. The per-shard distinct-port listeners + the N-shard `CLUSTER SLOTS` projection that
-        // actually ELIMINATE the hop are follow-up PRs (#517 PR3/PR4), which replace this
-        // single-node-owns-all map with N synthetic owners at per-shard ports. Until then this mode
-        // is functionally a single-node cluster (correct answers, hop not yet eliminated).
-        Some(Arc::new(
-            ironcache_cluster::SlotMap::build(
-                vec![(
+        // SHARD-OWNERS (#517 PR4): build the N-SHARD PROJECTION -- N synthetic cluster nodes, node i
+        // at `(advertised_host, base_port + i)` owning the CONTIGUOUS slot range `shard_slot_range(i,
+        // n)`, the SAME partition the internal router uses (`owner_shard = slot_to_shard(key_slot)`).
+        // A cluster-aware client reads this via CLUSTER SLOTS and dials each key's owner PORT, so the
+        // connection homes on the owning shard (PR3's per-shard listeners) and the internal cross-
+        // shard hop is ELIMINATED; a mis-routed key gets a MOVED to the owner's port (see
+        // `moved_if_unowned`). Node 0 carries `cluster_node_id` (the announce id) so it is `self` in
+        // the map and `CLUSTER MYID` is stable; nodes 1.. get deterministic synthetic ids.
+        let n = config.shards.max(1);
+        let base = config.port;
+        let host = shard_owner_announce_host(config.bind);
+        let nodes: Vec<(ironcache_cluster::NodeEntry, Vec<[u16; 2]>)> = (0..n)
+            .map(|i| {
+                let [start, end_excl] = ironcache_server::route::shard_slot_range(i, n);
+                let offset = u16::try_from(i).expect("shard index <= MAX_SHARDS fits u16");
+                let port = base.checked_add(offset).unwrap_or_else(|| {
+                    panic!("shard-owner base port {base} + shard {i} overflows u16")
+                });
+                let id: Box<str> = if i == 0 {
+                    cluster_node_id.into()
+                } else {
+                    ironcache_server::cmd_cluster::synth_node_id(&host, port).into_boxed_str()
+                };
+                (
                     ironcache_cluster::NodeEntry {
-                        id: cluster_node_id.into(),
-                        host: config.bind.to_string().into_boxed_str(),
-                        port: config.port,
+                        id,
+                        host: host.clone().into_boxed_str(),
+                        port,
                     },
-                    vec![[0, ironcache_protocol::CLUSTER_SLOTS - 1]],
-                )],
-                cluster_node_id,
-            )
-            .expect("single-node-owns-all is a valid slot map"),
+                    // `shard_slot_range` is half-open [start, end_excl); `SlotMap::build` wants an
+                    // INCLUSIVE [start, end], so the top slot is `end_excl - 1`.
+                    vec![[start, end_excl - 1]],
+                )
+            })
+            .collect();
+        Some(Arc::new(
+            ironcache_cluster::SlotMap::build(nodes, cluster_node_id)
+                .expect("the N-shard-owner projection partitions [0,16384) with self present"),
         ))
     } else if config.cluster_enabled {
         match config.cluster_topology.as_ref() {
@@ -2603,6 +2621,35 @@ struct MigrationCtx<'a> {
     key_present: &'a dyn Fn(&[u8]) -> bool,
 }
 
+/// The host a shard-owner node ADVERTISES in its `CLUSTER SLOTS` projection (and thus in every
+/// MOVED it emits). Clients must be able to DIAL it, so an unspecified bind (`0.0.0.0` / `::`) --
+/// which is not a connectable address -- falls back to loopback (shard-owners is a single-box mode;
+/// its clients/benches dial localhost). A concrete bind IP is advertised as-is. There is no
+/// `cluster-announce-ip` knob today; adding one is a follow-up for the cross-host case.
+fn shard_owner_announce_host(bind: std::net::IpAddr) -> String {
+    if bind.is_unspecified() {
+        match bind {
+            std::net::IpAddr::V6(_) => "::1",
+            std::net::IpAddr::V4(_) => "127.0.0.1",
+        }
+        .to_owned()
+    } else {
+        bind.to_string()
+    }
+}
+
+/// The home `ShardId` to hand the cluster redirect, but ONLY in shard-owners mode (`Some(home)` ->
+/// the per-shard ownership predicate in [`moved_if_unowned`]; `None` -> the default single-self-node
+/// redirect used by Static/Raft, byte-unchanged). Centralizes the mode check so every redirect call
+/// site agrees on when per-shard ownership applies.
+fn shard_owner_home(ctx: &ServerContext, home: ShardId) -> Option<ShardId> {
+    (ctx.cluster_mode() == ironcache_config::ClusterMode::ShardOwners).then_some(home)
+}
+
+// The cluster redirect predicate takes many orthogonal inputs (the map, the command's class + key
+// spec, two read-gate flags, the migration context, and the shard-owner home). Bundling them would
+// obscure more than it clarifies, so allow the extra parameter.
+#[allow(clippy::too_many_arguments)]
 fn cluster_redirect(
     map: &ironcache_cluster::SlotMap,
     route: route::CommandClass,
@@ -2611,6 +2658,7 @@ fn cluster_redirect(
     readonly: bool,
     replica_in_sync: bool,
     migration: Option<&MigrationCtx<'_>>,
+    home_owner: Option<ShardId>,
 ) -> Option<ironcache_protocol::ErrorReply> {
     // (a) keyless / admin exemption: only KEYED data commands carry slots.
     let spec = match route {
@@ -2646,12 +2694,20 @@ fn cluster_redirect(
     match spec {
         // No routable key (malformed / short): fall through, the handler errors properly.
         route::KeySpec::None => None,
-        route::KeySpec::One(k) => {
-            redirect_for_keys(map, std::iter::once(k), replica_serves, migration)
-        }
-        route::KeySpec::Many(keys) => {
-            redirect_for_keys(map, keys.iter().copied(), replica_serves, migration)
-        }
+        route::KeySpec::One(k) => redirect_for_keys(
+            map,
+            std::iter::once(k),
+            replica_serves,
+            migration,
+            home_owner,
+        ),
+        route::KeySpec::Many(keys) => redirect_for_keys(
+            map,
+            keys.iter().copied(),
+            replica_serves,
+            migration,
+            home_owner,
+        ),
     }
 }
 
@@ -2681,6 +2737,7 @@ fn redirect_for_keys<'a, I>(
     keys: I,
     replica_serves: bool,
     migration: Option<&MigrationCtx<'_>>,
+    home_owner: Option<ShardId>,
 ) -> Option<ironcache_protocol::ErrorReply>
 where
     I: IntoIterator<Item = &'a [u8]>,
@@ -2708,7 +2765,7 @@ where
     }
     // All keys co-locate on one non-migrating slot: MOVED if this node neither owns nor (read-only)
     // replicates it. `replica_serves` carries the HA-7d READONLY-read gate (see `moved_if_unowned`).
-    moved_if_unowned(map, first_slot, replica_serves)
+    moved_if_unowned(map, first_slot, replica_serves, home_owner)
 }
 
 /// THE WRITE-SIDE replication guardrail decision (ADR-0026, Redis `min-replicas-to-write`). Returns
@@ -3006,7 +3063,25 @@ fn moved_if_unowned(
     map: &ironcache_cluster::SlotMap,
     slot: u16,
     replica_serves: bool,
+    home_owner: Option<ShardId>,
 ) -> Option<ironcache_protocol::ErrorReply> {
+    // SHARD-OWNERS (#517 PR4): the projection map has N nodes (one per shard), but every shard shares
+    // ONE `ctx.cluster`, so `map.owns(slot)` (which asks the SINGLE self-node) cannot tell shard i
+    // from shard j. Instead this shard owns `slot` iff the CONTIGUOUS partition maps it here --
+    // `slot_to_shard(slot, N) == home.index` -- the SAME predicate the internal hop uses, so when a
+    // client dialed the right owner port (homed here) it serves locally with neither MOVED nor hop.
+    // A foreign slot is MOVED to its owner's advertised `host:base+owner` (resolved from the N-node
+    // map). Replica reads do not apply in shard-owners mode (no replication), so that leg is skipped.
+    if let Some(home) = home_owner {
+        if route::slot_to_shard(slot, home.total) == home.index {
+            return None;
+        }
+        let (host, port) = map.moved_target(slot)?;
+        return Some(ironcache_protocol::ErrorReply::moved(
+            slot,
+            &format!("{host}:{port}"),
+        ));
+    }
     if map.owns(slot) {
         return None;
     }
@@ -3614,6 +3689,7 @@ async fn route_and_dispatch(
                 request.args[1..].iter().map(AsRef::as_ref),
                 false,
                 None,
+                shard_owner_home(ctx, home),
             ) {
                 state_rc.borrow_mut().counters.on_command();
                 encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
@@ -3742,6 +3818,7 @@ async fn route_and_dispatch(
             conn.readonly,
             in_sync,
             Some(&mig),
+            shard_owner_home(ctx, home),
         ) {
             state_rc.borrow_mut().counters.on_command();
             encode_into(out, &ironcache_server::Value::error(reply), conn.proto);
@@ -5489,6 +5566,7 @@ fn route_in_multi(
             conn.readonly,
             in_sync,
             Some(&mig),
+            shard_owner_home(ctx, home),
         ) {
             state_rc.borrow_mut().counters.on_command();
             conn.dirty_exec = true;
@@ -7803,7 +7881,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, false, false, None),
+            cluster_redirect(&map, route, b"GET", &req, false, false, None, None),
             None,
             "an owned single-key command proceeds (no redirect)"
         );
@@ -7938,7 +8016,7 @@ mod tests {
         let slot = ironcache_protocol::key_slot(key.as_bytes());
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
-        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, None)
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, None, None)
             .expect("foreign key -> MOVED");
         // The MOVED carries the CLIENT-VISIBLE slot and node B's ADVERTISED host:port.
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
@@ -7952,7 +8030,7 @@ mod tests {
         let hi = key_in_slot_range(8192, 16383);
         let req = rreq(&[b"MGET", lo.as_bytes(), hi.as_bytes()]);
         let route = route::classify(b"MGET");
-        let reply = cluster_redirect(&map, route, b"MGET", &req, false, false, None)
+        let reply = cluster_redirect(&map, route, b"MGET", &req, false, false, None, None)
             .expect("cross-slot -> CROSSSLOT");
         assert_eq!(
             reply.line(),
@@ -7970,7 +8048,7 @@ mod tests {
             })
             .expect("a second distinct high-half slot");
         let req2 = rreq(&[b"MGET", h1.as_bytes(), h2.as_bytes()]);
-        let reply2 = cluster_redirect(&map, route, b"MGET", &req2, false, false, None)
+        let reply2 = cluster_redirect(&map, route, b"MGET", &req2, false, false, None, None)
             .expect("still CROSSSLOT");
         assert_eq!(
             reply2.line(),
@@ -8086,7 +8164,7 @@ mod tests {
         let req = rreq(&[b"MGET", k1.as_bytes(), k2.as_bytes()]);
         let route = route::classify(b"MGET");
         assert_eq!(
-            cluster_redirect(&map, route, b"MGET", &req, false, false, None),
+            cluster_redirect(&map, route, b"MGET", &req, false, false, None, None),
             None,
             "co-located + owned multi-key proceeds"
         );
@@ -8101,7 +8179,7 @@ mod tests {
             let req = rreq(&[cmd, b"*"]);
             let route = route::classify(cmd);
             assert_eq!(
-                cluster_redirect(&map, route, cmd, &req, false, false, None),
+                cluster_redirect(&map, route, cmd, &req, false, false, None, None),
                 None,
                 "{} must be exempt from cluster redirect",
                 String::from_utf8_lossy(cmd)
@@ -8117,7 +8195,7 @@ mod tests {
         let req = rreq(&[b"GET"]);
         let route = route::classify(b"GET");
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, false, false, None),
+            cluster_redirect(&map, route, b"GET", &req, false, false, None, None),
             None
         );
     }
@@ -8134,7 +8212,7 @@ mod tests {
         let map = redirect_map();
         let key = key_in_slot_range(0, 8191); // owned by self
         assert_eq!(
-            redirect_for_keys(&map, std::iter::once(key.as_bytes()), false, None),
+            redirect_for_keys(&map, std::iter::once(key.as_bytes()), false, None, None),
             None,
             "a single owned key proceeds (this is the WATCH-of-owned-key +OK case)"
         );
@@ -8145,7 +8223,7 @@ mod tests {
         let map = redirect_map();
         let key = key_in_slot_range(8192, 16383); // owned by node B
         let slot = ironcache_protocol::key_slot(key.as_bytes());
-        let reply = redirect_for_keys(&map, std::iter::once(key.as_bytes()), false, None)
+        let reply = redirect_for_keys(&map, std::iter::once(key.as_bytes()), false, None, None)
             .expect("foreign key -> MOVED (the WATCH-of-foreign-key case)");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -8156,7 +8234,7 @@ mod tests {
         let lo = key_in_slot_range(0, 8191);
         let hi = key_in_slot_range(8192, 16383);
         let keys = [lo.as_bytes(), hi.as_bytes()];
-        let reply = redirect_for_keys(&map, keys.iter().copied(), false, None)
+        let reply = redirect_for_keys(&map, keys.iter().copied(), false, None, None)
             .expect("two keys spanning slots -> CROSSSLOT (the WATCH-of-two-spanning-keys case)");
         assert_eq!(
             reply.line(),
@@ -8169,7 +8247,7 @@ mod tests {
         let map = redirect_map();
         let empty: std::iter::Empty<&[u8]> = std::iter::empty();
         assert_eq!(
-            redirect_for_keys(&map, empty, false, None),
+            redirect_for_keys(&map, empty, false, None, None),
             None,
             "no key -> None (defensive; a well-formed WATCH always has >=1 key)"
         );
@@ -8250,7 +8328,7 @@ mod tests {
         let route = route::classify(b"GET");
         // READONLY (replica_serves = true via readonly=true & GET is a read): served locally.
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, true, true, None),
+            cluster_redirect(&map, route, b"GET", &req, true, true, None, None),
             None,
             "a READONLY GET for a replicated slot is served locally (no MOVED)"
         );
@@ -8268,7 +8346,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         // READONLY but NOT in sync: the replica is too stale to serve -> MOVED to the owner (B).
-        let reply = cluster_redirect(&map, route, b"GET", &req, true, false, None)
+        let reply = cluster_redirect(&map, route, b"GET", &req, true, false, None, None)
             .expect("a READONLY read past the lag bound MOVEDs to the owner");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -8280,7 +8358,7 @@ mod tests {
         let req = rreq(&[b"SET", key.as_bytes(), b"v"]);
         let route = route::classify(b"SET");
         // SET is a write: MOVED to the OWNER (B) even on a READONLY connection.
-        let reply = cluster_redirect(&map, route, b"SET", &req, true, true, None)
+        let reply = cluster_redirect(&map, route, b"SET", &req, true, true, None, None)
             .expect("a write on a replica is MOVED to the owner even under READONLY");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -8292,7 +8370,7 @@ mod tests {
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
         // A non-READONLY (default) connection gets MOVED to the owner for the strong read.
-        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, None)
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, None, None)
             .expect("a non-READONLY read of a replicated-but-not-owned slot is MOVED to the owner");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -8305,7 +8383,7 @@ mod tests {
         let slot = ironcache_protocol::key_slot(key.as_bytes());
         let req = rreq(&[b"GET", key.as_bytes()]);
         let route = route::classify(b"GET");
-        let reply = cluster_redirect(&map, route, b"GET", &req, true, true, None)
+        let reply = cluster_redirect(&map, route, b"GET", &req, true, true, None, None)
             .expect("READONLY does not serve a slot this node neither owns nor replicates");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
     }
@@ -8331,7 +8409,7 @@ mod tests {
             asking: false,
             key_present: &key_present,
         };
-        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx))
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx), None)
             .expect("absent key on a migrating slot -> ASK");
         // ASK carries the client-visible slot and the DEST's advertised host:port (B = 10.0.0.2:7002).
         assert_eq!(reply.line(), format!("-ASK {slot} 10.0.0.2:7002"));
@@ -8352,7 +8430,7 @@ mod tests {
             key_present: &key_present,
         };
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx)),
+            cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx), None),
             None,
             "a present key on a migrating slot is served locally"
         );
@@ -8380,7 +8458,7 @@ mod tests {
             asking: false,
             key_present: &key_present,
         };
-        let reply = cluster_redirect(&map, route, b"MGET", &req, false, false, Some(&ctx))
+        let reply = cluster_redirect(&map, route, b"MGET", &req, false, false, Some(&ctx), None)
             .expect("a split multi-key on a migrating slot -> TRYAGAIN");
         assert_eq!(
             reply.line(),
@@ -8403,7 +8481,7 @@ mod tests {
             asking: false, // NO ASKING
             key_present: &key_present,
         };
-        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx))
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx), None)
             .expect("an importing slot without ASKING -> MOVED to the owner");
         // MOVED to the OWNER (B = 10.0.0.2:7002), NOT served locally.
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
@@ -8424,7 +8502,7 @@ mod tests {
             key_present: &key_present,
         };
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx)),
+            cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx), None),
             None,
             "an importing slot WITH ASKING is served locally (the ASK second leg)"
         );
@@ -8448,7 +8526,7 @@ mod tests {
             asking: false,
             key_present: &key_present,
         };
-        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx))
+        let reply = cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx), None)
             .expect("post-FLIP the old owner serves MOVED");
         assert_eq!(
             reply.line(),
@@ -8562,8 +8640,9 @@ mod tests {
         for (cmd, key) in [(b"GET".as_slice(), &owned), (b"GET".as_slice(), &foreign)] {
             let req = rreq(&[cmd, key.as_bytes()]);
             let route = route::classify(cmd);
-            let with_mig = cluster_redirect(&map, route, cmd, &req, false, false, Some(&ctx_ask));
-            let without_mig = cluster_redirect(&map, route, cmd, &req, false, false, None);
+            let with_mig =
+                cluster_redirect(&map, route, cmd, &req, false, false, Some(&ctx_ask), None);
+            let without_mig = cluster_redirect(&map, route, cmd, &req, false, false, None, None);
             assert_eq!(
                 with_mig, without_mig,
                 "no migration state -> Some(ctx) must equal None for key {key}"
@@ -8713,7 +8792,16 @@ mod tests {
             key_present: &key_present,
         };
         assert_eq!(
-            cluster_redirect(&map, route, b"GET", &req, false, false, Some(&mig_asking)),
+            cluster_redirect(
+                &map,
+                route,
+                b"GET",
+                &req,
+                false,
+                false,
+                Some(&mig_asking),
+                None
+            ),
             None,
             "an in-MULTI command on an IMPORTING slot WITH the transaction-scoped ASKING is served"
         );
@@ -8732,6 +8820,7 @@ mod tests {
             false,
             false,
             Some(&mig_no_asking),
+            None,
         )
         .expect("an in-MULTI importing command WITHOUT ASKING is MOVED (dirties the txn)");
         assert_eq!(reply.line(), format!("-MOVED {slot} 10.0.0.2:7002"));
@@ -8756,9 +8845,17 @@ mod tests {
         for key in [&owned, &foreign] {
             let req = rreq(&[b"GET", key.as_bytes()]);
             let route = route::classify(b"GET");
-            let with_mig =
-                cluster_redirect(&map, route, b"GET", &req, false, false, Some(&ctx_ask));
-            let pre_fix = cluster_redirect(&map, route, b"GET", &req, false, false, None);
+            let with_mig = cluster_redirect(
+                &map,
+                route,
+                b"GET",
+                &req,
+                false,
+                false,
+                Some(&ctx_ask),
+                None,
+            );
+            let pre_fix = cluster_redirect(&map, route, b"GET", &req, false, false, None, None);
             assert_eq!(
                 with_mig, pre_fix,
                 "no migration state -> the in-MULTI Some(ctx) must equal the pre-fix None for {key}"
