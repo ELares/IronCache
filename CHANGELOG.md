@@ -47,6 +47,19 @@ release.
 
 ### Changed
 
+- The internal key-to-shard owner is now ALIGNED to the client-visible CRC16 cluster slot
+  (`owner_shard(key) = slot_to_shard(key_slot(key), n)`, a contiguous partition), replacing the old
+  raw-key FNV-1a `hash64(key) % n`. This is the foundation of issue #517 (eliminating the cross-shard
+  hop for cluster-aware clients): once a shard owns a contiguous slot range and a cluster client
+  routes each key to the owner, the connection homes on the owning shard and the internal hop is
+  skipped. Two immediate effects even before the endpoint work lands: hash-tagged keys (`{u}.a`,
+  `{u}.b`) now CO-LOCATE on one shard (a hash-tagged multi-key command / `MULTI-EXEC` stays home-only,
+  shrinking the cross-shard fan-out), and the internal partition matches the `CLUSTER SLOTS` space.
+  Client-invisible in the default (non-cluster) mode; routing is deterministic + seedless (ADR-0003)
+  and never on the wire. `hash64` (FNV-1a) is retained as a pure hash but no longer backs
+  `owner_shard`. New unit tests cover slot-owner totality, the range partition, and hash-tag
+  co-location; all cross-shard, coordinator, persistence, and sim suites pass unchanged.
+
 - The store read path (`ShardStore::read`, every GET) now does a SINGLE hash-table probe instead of
   two. It previously called `find_mut` to bump the S3-FIFO access frequency, then a SECOND `find` to
   produce the immutable `ValueRef` view -- two SwissTable SIMD group walks per GET. It now bumps the
