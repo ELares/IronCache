@@ -9,23 +9,27 @@
 //! hopped to its owning shard (the remote path). It has no async, no I/O, and no
 //! shared state, so it is unit-testable in isolation.
 //!
-//! ## The hash is the INTERNAL shard hash, NOT the client-visible cluster hash
+//! ## The internal shard owner is ALIGNED to the client-visible cluster slot (#517)
 //!
-//! [`hash64`] is FNV-1a, a fast non-cryptographic hash used ONLY to map a key to an
-//! owning shard inside this process. It is deliberately NOT the client-visible
-//! cluster hash: CRC16/XMODEM with the `{hashtag}` rule (CLUSTER_CONTRACT.md) is
-//! RESERVED for the cluster / sharded-pubsub slot assignment a client can observe and
-//! depend on. The two MUST NOT be conflated: the internal shard hash may change with
-//! the shard count and is never exposed on the wire, whereas the cluster slot hash is
-//! a stable wire contract. Keep this hash off any client-facing slot computation.
+//! [`owner_shard`] maps a key to its owning shard via the SAME CRC16/XMODEM `{hashtag}`
+//! cluster slot a client observes (`key_slot`), partitioned CONTIGUOUSLY across shards by
+//! [`slot_to_shard`]. This alignment is deliberate (#517): a cluster-aware client that routes a
+//! key to the shard owning its slot then HOMES its connection on the owning shard, so
+//! `owner_shard(key) == home` and the internal cross-shard hop is skipped entirely (the hop
+//! remains only as the fallback for a misrouting client). It also co-locates hash-tagged keys
+//! (`{u}.a`, `{u}.b`) on one shard, shrinking the cross-shard fan-out surface.
+//!
+//! [`hash64`] (FNV-1a) is RETAINED as a pure, seedless byte hash but NO LONGER backs
+//! `owner_shard` (it predates the #517 alignment). Before #517 the internal owner was
+//! `hash64(key) % n`, deliberately independent of the cluster slot; #517 replaced that with the
+//! slot-based owner so the two coincide.
 //!
 //! ## Determinism (ADR-0003)
 //!
-//! [`hash64`] is a PURE function of the key bytes: the same key always hashes to the
-//! same value, with no random seed. This is required so a key's owning shard is stable
-//! across a seeded replay (a randomly-seeded `DefaultHasher`/SipHash would route the
-//! same key to different shards on different boots, breaking replay determinism), and
-//! so two connections on different shards agree on where a key lives.
+//! `owner_shard` is a PURE function of the key bytes: `key_slot` (CRC16 over the hash-tag) is
+//! seedless, so a key's owning shard is stable across a seeded replay and two connections on
+//! different shards agree on where a key lives. (A randomly-seeded `DefaultHasher`/SipHash would
+//! route the same key to different shards on different boots, breaking replay determinism.)
 
 use ironcache_protocol::Request;
 
@@ -50,18 +54,48 @@ pub fn hash64(key: &[u8]) -> u64 {
     hash
 }
 
-/// The shard that OWNS `key` given `n_shards` shards: `hash64(key) % n_shards`.
+/// The internal shard that owns cluster hash `slot`, given `n_shards`, as a CONTIGUOUS partition:
+/// shard `i` owns the slot range `[i*16384/n, (i+1)*16384/n)`. Contiguity is deliberate (#517): it
+/// makes a shard's owned slots coalesce into exactly ONE range, so the single-node `CLUSTER SLOTS`
+/// projection is N clean ranges (a `slot % n` interleave would fragment each shard into ~16384/n
+/// ranges). Real Redis Cluster likewise advertises contiguous ranges per node.
+#[must_use]
+pub fn slot_to_shard(slot: u16, n_shards: usize) -> usize {
+    let n = n_shards.max(1);
+    // slot in [0, 16384); (slot*n)/16384 in [0, n). Widen to avoid overflow (16383 * n).
+    (slot as usize * n) / ironcache_protocol::CLUSTER_SLOTS as usize
+}
+
+/// The half-open slot range `[start, end)` that internal shard `i` owns under `slot_to_shard`
+/// (#517), for the single-node `CLUSTER SLOTS`/`SHARDS`/`NODES` projection. Together the N ranges
+/// partition `[0, 16384)` with no gap or overlap.
+#[must_use]
+pub fn shard_slot_range(shard: usize, n_shards: usize) -> [u16; 2] {
+    let n = n_shards.max(1) as u32;
+    let slots = u32::from(ironcache_protocol::CLUSTER_SLOTS);
+    // ceil(shard*16384/n) .. ceil((shard+1)*16384/n): the inverse of the floor in slot_to_shard,
+    // so a slot maps to shard i iff it is in this range.
+    let start = (shard as u32 * slots).div_ceil(n);
+    let end = ((shard as u32 + 1) * slots).div_ceil(n);
+    [
+        u16::try_from(start).unwrap_or(0),
+        u16::try_from(end.min(slots)).unwrap_or(ironcache_protocol::CLUSTER_SLOTS),
+    ]
+}
+
+/// The shard that OWNS `key` given `n_shards`: the shard owning `key`'s cluster slot
+/// (`slot_to_shard(key_slot(key), n_shards)`).
 ///
-/// # Panics
-///
-/// Panics in debug builds if `n_shards == 0` (the precondition: a running server has
-/// at least one shard). The serve loop computes `n_shards` as `config.shards.max(1)`,
-/// so this never fires in practice.
+/// As of #517 this is derived from the CLIENT-VISIBLE CRC16 cluster slot (`key_slot`, which applies
+/// the `{tag}` hash-tag rule), NOT the old raw-key FNV-1a. Two consequences: (1) hash-tagged keys
+/// (`{u}.a`, `{u}.b`) now CO-LOCATE on one internal shard, shrinking the cross-shard fan-out surface
+/// for multi-key / spanning commands and letting a hash-tagged `MULTI/EXEC` run home-only; (2) a
+/// cluster-aware client that routes `key` to the shard owning its slot HOMES on the owning shard, so
+/// the internal cross-shard hop is skipped (the hop remains only as the misroute fallback). Still a
+/// pure, seedless function (ADR-0003): `key_slot` is deterministic; the routing is never on the wire.
 #[must_use]
 pub fn owner_shard(key: &[u8], n_shards: usize) -> usize {
-    debug_assert!(n_shards >= 1, "owner_shard requires n_shards >= 1");
-    let n = n_shards.max(1) as u64;
-    usize::try_from(hash64(key) % n).expect("modulo n_shards fits usize")
+    slot_to_shard(ironcache_protocol::key_slot(key), n_shards)
 }
 
 // How a command must be routed across shards (COORDINATOR.md #107). The enum lives in the
@@ -252,6 +286,76 @@ mod tests {
             assert!(
                 c >= lo && c <= hi,
                 "shard {shard} got {c} keys, expected within [{lo}, {hi}] (mean {mean})"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_shard_is_the_slot_owner_and_respects_hash_tags() {
+        // #517: owner_shard is now derived from the CRC16 cluster slot, so it MUST equal
+        // slot_to_shard(key_slot(key), n) for every key, and it MUST apply the {tag} hash-tag rule
+        // (a key and its hash-tag share a slot -> the same owner shard).
+        let n = 8usize;
+        for key in [
+            b"user:1".as_slice(),
+            b"session:abc",
+            b"{u1}.name",
+            b"{u1}.email",
+            b"plainkey",
+        ] {
+            assert_eq!(
+                owner_shard(key, n),
+                slot_to_shard(ironcache_protocol::key_slot(key), n),
+                "owner_shard must equal the slot owner"
+            );
+        }
+        // HASH-TAG CO-LOCATION (the #517 bonus): keys sharing a `{tag}` land on ONE internal shard,
+        // so a hash-tagged multi-key command / MULTI-EXEC stays home-only (no cross-shard fan-out).
+        assert_eq!(
+            owner_shard(b"{acct42}.balance", n),
+            owner_shard(b"{acct42}.history", n),
+            "hash-tagged keys must co-locate on one shard"
+        );
+    }
+
+    #[test]
+    fn slot_to_shard_is_total_and_shard_slot_range_partitions_the_space() {
+        // Every slot in [0, 16384) maps to exactly one shard in [0, n), and the per-shard ranges
+        // partition the whole slot space with no gap or overlap -- the invariant the single-node
+        // CLUSTER SLOTS projection relies on.
+        // Real shard counts are capped at MAX_SHARDS (256), so 256 is the top production value; 16384
+        // (each shard owns exactly one slot) is included as a pure-math boundary check. The partition
+        // holds for every n up to 16384; beyond that some shards would own zero slots (never a real
+        // config).
+        for n in [1usize, 2, 3, 4, 8, 15, 16, 256, 16384] {
+            // Totality + in-range.
+            for slot in 0u16..ironcache_protocol::CLUSTER_SLOTS {
+                let s = slot_to_shard(slot, n);
+                assert!(s < n, "slot {slot} -> shard {s} out of range for n={n}");
+            }
+            // Ranges partition [0, 16384): range[i].end == range[i+1].start, cover the whole space,
+            // and a slot maps to shard i iff it is in range i.
+            let mut prev_end = 0u16;
+            for i in 0..n {
+                let [start, end] = shard_slot_range(i, n);
+                assert_eq!(start, prev_end, "gap/overlap at shard {i} for n={n}");
+                assert!(
+                    end >= start,
+                    "empty-or-inverted range at shard {i} for n={n}"
+                );
+                for slot in start..end {
+                    assert_eq!(
+                        slot_to_shard(slot, n),
+                        i,
+                        "slot {slot} not owned by shard {i}"
+                    );
+                }
+                prev_end = end;
+            }
+            assert_eq!(
+                prev_end,
+                ironcache_protocol::CLUSTER_SLOTS,
+                "ranges must cover 16384 for n={n}"
             );
         }
     }

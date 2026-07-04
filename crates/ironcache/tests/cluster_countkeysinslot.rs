@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! #371 cross-shard `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` acceptance (SLOT_KEY_ENUMERATION.md,
-//! slice 2): a single CLUSTER-ENABLED node with MULTIPLE internal shards, with keys placed (via a
-//! shared `{hashtag}`) into ONE cluster slot but spread across the shards -- the client CRC16 slot
-//! is the same for every `{t}i` (the hashtag rule), while the internal FNV `owner_shard` differs per
-//! full key, so the slot's keys land on DIFFERENT shards. An honest count / key list must therefore
-//! aggregate across shards: a home-shard-only answer would undercount. The server is driven over real
-//! sockets, so the whole serve-loop rewrite -> whole-keyspace fan-out -> merge path is exercised.
+//! #371 `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` acceptance (SLOT_KEY_ENUMERATION.md, slice 2):
+//! a single CLUSTER-ENABLED node with MULTIPLE internal shards, with keys placed (via a shared
+//! `{hashtag}`) into ONE cluster slot. The client CRC16 slot is the same for every `{t}i` (the
+//! hashtag rule). NOTE (post-#517): the internal `owner_shard` is now derived from that SAME cluster
+//! slot (`slot_to_shard(key_slot(key), n)`), so all same-`{hashtag}` keys now CO-LOCATE on ONE
+//! internal shard -- a cluster slot lives entirely on one shard. So this test no longer STRESSES the
+//! cross-shard COUNTKEYSINSLOT/GETKEYSINSLOT aggregation (that fan-out -> merge path is now a no-op
+//! for a single slot: exactly one shard holds the keys); it verifies the count / key list is CORRECT
+//! (the aggregation over one populated shard + zero-others still returns the right total). Before
+//! #517 the internal FNV owner differed per full key, so the slot's keys landed on different shards
+//! and the aggregation was genuinely exercised. The server is driven over real sockets, so the
+//! serve-loop rewrite -> whole-keyspace fan-out -> merge path is still executed end to end.
 
 use ironcache::test_support::run_cluster_node_for_test_shards;
 use ironcache_config::{ClusterNode, ClusterTopology};
@@ -134,7 +139,9 @@ fn empty_slot(a: u16, b: u16) -> u16 {
 fn countkeysinslot_aggregates_the_count_across_internal_shards() {
     with_runtime(async {
         let port = free_port();
-        // 4 shards so a single slot's keys genuinely span shards; a home-only count would undercount.
+        // 4 shards: pre-#517 a single slot's keys spanned shards (FNV owner per full key); post-#517
+        // slot-aligned ownership co-locates them on ONE shard, so this asserts the count is still
+        // CORRECT (single populated shard) through the same fan-out/merge path, now a no-op aggregation.
         let _node: ShardSet =
             run_cluster_node_for_test_shards(port, 4, one_node_topology(port), ID);
         let mut c = connect_retry(port).await;
@@ -177,17 +184,13 @@ fn getkeysinslot_returns_the_bounded_keys_across_internal_shards() {
         .await;
         assert_eq!(array_len(&r), 12, "all of slot_a's keys, across shards");
 
-        // The count BOUNDS the union (not 4x the per-shard cap): exactly 3.
+        // The count BOUNDS the returned key list: exactly 3 of the slot's keys.
         let r = cmd(
             &mut c,
             &["CLUSTER", "GETKEYSINSLOT", &slot_a.to_string(), "3"],
         )
         .await;
-        assert_eq!(
-            array_len(&r),
-            3,
-            "the count truncates the cross-shard union"
-        );
+        assert_eq!(array_len(&r), 3, "the count truncates the slot's key list");
 
         // slot_b independently returns its 5.
         let r = cmd(

@@ -402,10 +402,14 @@ mod tests {
     /// The DATABASE count for every test store (the `ShardStore::new` arg; unrelated to shards).
     const DBS: u32 = 4;
 
-    // The EXACT router owner-shard hash (FNV-1a 64-bit, the same constants as
-    // `ironcache_server::route::owner_shard`). This crate does not depend on `ironcache-server`, so
-    // the tests reproduce the hash to verify re-shard places a key EXACTLY where the live router
-    // would. The binary passes `ironcache_server::owner_shard` itself (see `crate::persist`).
+    // A STAND-IN owner-shard hash (FNV-1a 64-bit) used ONLY to exercise this crate's GENERIC
+    // read-all-then-filter reshard algorithm (`load_shard_resharded`) with an arbitrary pure route
+    // function. NOTE: this is NOT the live router anymore -- as of #517 `ironcache_server::owner_shard`
+    // is slot-based (`slot_to_shard(key_slot(key), n)`), not this FNV. Production reload stays correct
+    // because the binary passes the REAL `ironcache_server::owner_shard` (see `crate::persist`); this
+    // crate has no dependency on `ironcache-server`, so the test just needs SOME deterministic route
+    // fn to prove the reshard mechanism, and any pure fn (FNV here) suffices. The reshard is
+    // route-fn-agnostic: whatever `owner_shard` is at load time, every key is re-homed by it.
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     fn test_hash64(key: &[u8]) -> u64 {
