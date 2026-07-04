@@ -47,6 +47,13 @@ release.
 
 ### Changed
 
+- The store read path (`ShardStore::read`, every GET) now does a SINGLE hash-table probe instead of
+  two. It previously called `find_mut` to bump the S3-FIFO access frequency, then a SECOND `find` to
+  produce the immutable `ValueRef` view -- two SwissTable SIMD group walks per GET. It now bumps the
+  freq and yields the view through one `find_mut` (the `&mut Entry` reborrows immutably for `view_of`
+  after the bump; the redundant second probe was pre-NLL over-caution). Semantically identical (same
+  lookup, same freq bump); part of issue #511 (the by-reference GET value path is the remaining half).
+
 - Cross-shard hops in a pipeline now OVERLAP instead of serializing (the tokio serve loop). A remote
   single-key command previously enqueued its `ShardWork` to the owning shard and AWAITED the reply
   inline before decoding the next command, so a pipeline of N cross-shard commands paid N sequential
