@@ -239,6 +239,14 @@ pub enum ClusterMode {
     Static,
     /// Opt-in: the Raft control plane governs slot ownership via committed proposals (HA-4c).
     Raft,
+    /// Opt-in (#517): a SINGLE node exposes its N INTERNAL shards as N hashslot owners, each on its
+    /// own port (`shard_base_port + i`), so a cluster-aware client routes each key straight to the
+    /// shard that owns it -- eliminating the internal cross-shard hop. The slot->owner partition is
+    /// the same `slot_to_shard` the router uses, so the connection homes on the key's owner. Mutually
+    /// exclusive with `Raft` (which governs ownership across PHYSICAL nodes). TOML
+    /// `cluster_mode = "shard-owners"` / `IRONCACHE_CLUSTER_MODE=shard-owners`.
+    #[serde(rename = "shard-owners")]
+    ShardOwners,
 }
 
 /// The embedded transport-TLS posture for the CLIENT listener (#105, docs/design/TLS.md).
@@ -983,8 +991,30 @@ impl Config {
                     // only the node-IDENTITY rules (40-hex ids, no duplicates, self present) are
                     // enforced here so the voter set is well-formed.
                     ClusterMode::Raft => validate_raft_topology(topo, announce)?,
+                    // SHARD-OWNERS (#517): a standalone node derives its slot owners from its OWN
+                    // shard count, so a config `cluster_topology` is meaningless here -- reject it
+                    // loudly rather than silently ignore a topology the operator declared.
+                    ClusterMode::ShardOwners => {
+                        return Err(ConfigError::Invalid {
+                            field: "cluster-mode",
+                            reason: "shard-owners mode derives slot owners from the shard count; \
+                                     it does not take a cluster_topology (remove the topology)"
+                                .to_owned(),
+                        });
+                    }
                 }
             }
+        }
+        // SHARD-OWNERS (#517) requires cluster mode enabled (it serves CLUSTER SLOTS + MOVED). It is
+        // also mutually exclusive with the raft governance axis (a ShardOwners node is standalone),
+        // which the enum already enforces (a single `cluster_mode` cannot be both).
+        if self.cluster_mode == ClusterMode::ShardOwners && !self.cluster_enabled {
+            return Err(ConfigError::Invalid {
+                field: "cluster-mode",
+                reason: "shard-owners mode requires cluster_enabled = true (it exposes the node's \
+                         shards as hashslot owners over the CLUSTER protocol)"
+                    .to_owned(),
+            });
         }
         Ok(())
     }
@@ -1621,7 +1651,7 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_MODE") {
             o.cluster_mode = Some(parse_cluster_mode(&v).ok_or_else(|| ConfigError::Invalid {
                 field: "cluster-mode",
-                reason: format!("not a cluster mode (expected static/raft): {v}"),
+                reason: format!("not a cluster mode (expected static/raft/shard-owners): {v}"),
             })?);
         }
         // HA-8 knobs (single scalars, so env-encodable for per-pod injection). Both are
@@ -1954,6 +1984,9 @@ pub fn parse_cluster_mode(s: &str) -> Option<ClusterMode> {
     match s.trim().to_ascii_lowercase().as_str() {
         "static" => Some(ClusterMode::Static),
         "raft" => Some(ClusterMode::Raft),
+        // #517: `shard-owners` / `shardowners` (friendly alias) select the standalone shard-slot-owner
+        // mode where the node's internal shards are exposed as per-port hashslot owners.
+        "shard-owners" | "shardowners" => Some(ClusterMode::ShardOwners),
         _ => None,
     }
 }
@@ -2642,6 +2675,65 @@ mod tests {
         // TOML deserializes the lowercase-renamed enum directly.
         let o = ConfigOverlay::from_toml_str("cluster_mode = \"raft\"").unwrap();
         assert_eq!(o.cluster_mode, Some(ClusterMode::Raft));
+
+        // #517: shard-owners mode parses from both spellings (and TOML).
+        assert_eq!(
+            parse_cluster_mode("shard-owners"),
+            Some(ClusterMode::ShardOwners)
+        );
+        assert_eq!(
+            parse_cluster_mode(" ShardOwners "),
+            Some(ClusterMode::ShardOwners)
+        );
+        let o = ConfigOverlay::from_toml_str("cluster_mode = \"shard-owners\"").unwrap();
+        assert_eq!(o.cluster_mode, Some(ClusterMode::ShardOwners));
+    }
+
+    #[test]
+    fn shard_owners_mode_requires_cluster_enabled_and_rejects_a_topology() {
+        // #517: ShardOwners requires cluster_enabled (it serves CLUSTER SLOTS + MOVED).
+        // `validate` (not `resolve`, which does not validate) enforces the cross-field rules.
+        let no_enable = Config {
+            cluster_mode: ClusterMode::ShardOwners,
+            cluster_enabled: false,
+            ..Config::default()
+        };
+        assert!(
+            no_enable.validate().is_err(),
+            "shard-owners without cluster_enabled must be rejected"
+        );
+
+        // With cluster_enabled and NO topology, it validates (owners derive from the shard count).
+        let ok = Config {
+            cluster_mode: ClusterMode::ShardOwners,
+            cluster_enabled: true,
+            shards: 4,
+            ..Config::default()
+        };
+        assert!(
+            ok.validate().is_ok(),
+            "shard-owners + cluster_enabled + no topology must validate"
+        );
+
+        // A cluster_topology alongside ShardOwners is a config conflict (owners derive from shards).
+        let with_topo = Config {
+            cluster_mode: ClusterMode::ShardOwners,
+            cluster_enabled: true,
+            cluster_announce_id: Some("1".repeat(40)),
+            cluster_topology: Some(ClusterTopology {
+                nodes: vec![ClusterNode {
+                    id: "1".repeat(40),
+                    host: "127.0.0.1".to_owned(),
+                    port: 6379,
+                    slots: vec![[0, 16383]],
+                }],
+            }),
+            ..Config::default()
+        };
+        assert!(
+            with_topo.validate().is_err(),
+            "shard-owners + a cluster_topology must be rejected"
+        );
     }
 
     #[test]
