@@ -57,6 +57,14 @@ pub struct ShardConfig {
     /// The single address the acceptor thread binds and accepts on; connections
     /// are then round-robined to the shards in userspace.
     pub bind: SocketAddr,
+    /// SHARD-OWNER ENDPOINTS (#517): when `true`, bind ONE listener PER shard at
+    /// `bind.port() + i` (shard `i`), each homing its accepted connections on THAT shard, instead of
+    /// one listener round-robining across shards. A cluster-aware client then routes each key to the
+    /// port of the shard that owns it (`CLUSTER SLOTS`), so the connection lands on the key's owner
+    /// and the internal cross-shard hop is skipped. `false` (the default) keeps the single-acceptor
+    /// round-robin. Uses DISTINCT PORTS (not `SO_REUSEPORT`), so it is portable and needs no kernel
+    /// accept-balancing.
+    pub shard_owner_ports: bool,
 }
 
 /// A handle to a running set of shards, used to signal graceful shutdown and join.
@@ -209,14 +217,12 @@ mod tokio_bootstrap {
             inboxes.len()
         );
 
-        // Obtain the ONE listening socket up front, in this synchronous call, so a
-        // bind failure (e.g. port in use) surfaces as an error here rather than
-        // inside a spawned thread. `listener_for` ADOPTS a systemd socket-activation
-        // inherited fd when one was passed (LISTEN_FDS, #389 -- the listen queue then
-        // survives an upgrade restart with no connection-refused window), else self-
-        // binds with SO_REUSEPORT (unchanged). This std listener is owned by the
-        // acceptor thread; the shards never bind.
-        let listener = listener_for(cfg.bind)?;
+        // Listener binding happens below (either the single round-robin listener or, in shard-owner
+        // mode, one listener per shard) -- SYNCHRONOUSLY in this call, so a bind failure (e.g. port in
+        // use) surfaces as an error here rather than inside a spawned thread. `listener_for` ADOPTS a
+        // systemd socket-activation inherited fd when one was passed (LISTEN_FDS, #389 -- the listen
+        // queue then survives an upgrade restart with no connection-refused window), else self-binds
+        // with SO_REUSEPORT. The listeners are owned by the acceptor thread(s); the shards never bind.
 
         // One connection channel per shard: the acceptor sends accepted
         // `std::net::TcpStream`s, the shard receives them. Unbounded so the
@@ -235,12 +241,40 @@ mod tokio_bootstrap {
 
         let mut handles = Vec::with_capacity(total + 1);
 
-        // The ACCEPTOR thread: owns the single listener, accepts in a loop, and
-        // round-robins each connection to the next shard's channel. It is a plain
-        // OS thread (no tokio runtime): a blocking `std` accept loop with a
-        // shutdown-aware poll. `tokio::sync::mpsc::UnboundedSender::send` does not
-        // require a runtime, so the hand-off is valid from this sync context.
-        {
+        // THE ACCEPTOR(S). A plain OS thread (no tokio runtime): a blocking `std` accept loop with a
+        // shutdown-aware poll. `tokio::sync::mpsc::UnboundedSender::send` does not require a runtime,
+        // so the hand-off is valid from this sync context.
+        if cfg.shard_owner_ports {
+            // SHARD-OWNER MODE (#517): bind ONE listener PER shard at `bind.port() + i`, each homing
+            // its accepted connections on THAT shard (its own `conn_senders[i]`), so a cluster-aware
+            // client that dials the owner's port lands on the key's owner shard -- no internal hop.
+            // `conn_senders` is consumed here, one sender per per-shard acceptor. All N binds happen
+            // synchronously so any port conflict fails boot loudly.
+            for (index, sender) in conn_senders.into_iter().enumerate() {
+                let offset = u16::try_from(index).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "shard index exceeds u16")
+                })?;
+                let port = cfg.bind.port().checked_add(offset).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "shard-owner port {} + shard {index} overflows u16 (lower the base port \
+                             or the shard count)",
+                            cfg.bind.port()
+                        ),
+                    )
+                })?;
+                let addr = std::net::SocketAddr::new(cfg.bind.ip(), port);
+                let listener = listener_for(addr)?;
+                let shutdown = Arc::clone(&shutdown);
+                let acceptor = std::thread::Builder::new()
+                    .name(format!("ironcache-acceptor-{index}"))
+                    .spawn(move || single_shard_acceptor_loop(&listener, &sender, &shutdown))?;
+                handles.push(acceptor);
+            }
+        } else {
+            // DEFAULT: one listener, round-robin each accepted connection to the next shard's channel.
+            let listener = listener_for(cfg.bind)?;
             let shutdown = Arc::clone(&shutdown);
             let acceptor = std::thread::Builder::new()
                 .name("ironcache-acceptor".to_string())
@@ -383,6 +417,40 @@ mod tokio_bootstrap {
         }
         // Returning drops `conn_senders`, closing every shard channel so the shard
         // serve loops observe channel-closed and move on to drain.
+    }
+
+    /// SHARD-OWNER acceptor (#517): owns ONE per-shard listener and hands EVERY accepted connection
+    /// to a SINGLE shard's channel (no round-robin) -- so a connection dialed to shard `i`'s port
+    /// homes on shard `i`. Otherwise identical to [`acceptor_loop`] (blocking `std` accept with a
+    /// shutdown-aware poll, Nagle off, back-off on transient errors). When `sender` is gone (the shard
+    /// thread exited) the send fails and the connection is dropped rather than crashing the acceptor.
+    fn single_shard_acceptor_loop(
+        listener: &std::net::TcpListener,
+        sender: &tokio::sync::mpsc::UnboundedSender<std::net::TcpStream>,
+        shutdown: &Arc<AtomicBool>,
+    ) {
+        if let Err(e) = listener.set_nonblocking(true) {
+            eprintln!("shard-owner acceptor: set_nonblocking failed: {e}; shutdown may be delayed");
+        }
+        let poll = Duration::from_millis(1);
+        while !shutdown.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _peer)) => {
+                    let _ = stream.set_nodelay(true);
+                    if let Err(e) = sender.send(stream) {
+                        eprintln!("shard-owner acceptor: shard channel closed: {e}");
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(poll);
+                }
+                Err(e) => {
+                    eprintln!("shard-owner acceptor: accept error: {e}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        // Returning drops `sender`, closing this shard's channel so its serve loop drains.
     }
 
     /// The shard's serve loop: instead of accepting, it AWAITS its connection
