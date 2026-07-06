@@ -107,6 +107,12 @@ pub struct RuntimeConfig {
     /// load) after each batch is rendered, so a `CONFIG SET` takes effect for subsequent batches.
     /// Seeded from the boot config.
     output_buffer_limit: AtomicU64,
+    /// The per-connection query-buffer hard cap in bytes (#528, the inbound analog of
+    /// `output_buffer_limit`). `0` disables the cap. Runtime-settable via
+    /// `CONFIG SET query-buffer-limit`; the serve loop reads it (one relaxed load) after each recv
+    /// grows the inbound buffer, so a `CONFIG SET` takes effect for subsequent reads. Seeded from
+    /// the boot config.
+    query_buffer_limit: AtomicU64,
     /// The SLOWLOG threshold in MICROSECONDS (Redis `slowlog-log-slower-than`, PROD-7). `-1`
     /// DISABLES the SLOWLOG (the per-command hook short-circuits on this single load); `0` logs
     /// every command. Signed so `-1` round-trips. Runtime-settable via
@@ -220,6 +226,10 @@ impl RuntimeConfig {
             // live (the serve loop re-reads it each connection-loop iteration).
             timeout_secs: AtomicU64::new(cfg.timeout_secs),
             output_buffer_limit: AtomicU64::new(cfg.output_buffer_limit),
+            // The per-connection query-buffer cap (#528), seeded from the boot config; a later
+            // `CONFIG SET query-buffer-limit` overrides it live (the serve loop reads it after each
+            // recv grows the inbound buffer).
+            query_buffer_limit: AtomicU64::new(cfg.query_buffer_limit),
             // The SLOWLOG knobs (PROD-7), seeded from the boot config so a node started with a
             // configured threshold/length keeps it; a later `CONFIG SET slowlog-*` overrides live.
             active_expire: AtomicBool::new(true),
@@ -435,6 +445,23 @@ impl RuntimeConfig {
     /// after each rendered batch, so the new value applies to subsequent batches (PROD-SAFETY #5).
     pub fn set_output_buffer_limit(&self, bytes: u64) {
         self.output_buffer_limit.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The current effective per-connection query-buffer hard cap in bytes (#528, the inbound
+    /// analog of [`output_buffer_limit`](Self::output_buffer_limit)); `0` disables the cap. A
+    /// single relaxed atomic load: the serve loop reads it after each recv grows the inbound
+    /// buffer (off the per-command decode/dispatch hot path).
+    #[must_use]
+    pub fn query_buffer_limit(&self) -> u64 {
+        self.query_buffer_limit.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET query-buffer-limit <bytes>`: store the new per-connection query-buffer cap
+    /// (a relaxed atomic store); `0` disables it. The serve loop reads `query_buffer_limit()`
+    /// after each recv grows the inbound buffer, so the new value applies to subsequent reads
+    /// (#528).
+    pub fn set_query_buffer_limit(&self, bytes: u64) {
+        self.query_buffer_limit.store(bytes, Ordering::Relaxed);
     }
 
     /// `CONFIG SET save "<seconds> <changes> [...]"`: REPLACE the runtime save policy (#58
@@ -672,6 +699,29 @@ mod tests {
         // The default boot config seeds `0` (Redis default: idle disconnection off).
         let rc_default = RuntimeConfig::from_config(&Config::default());
         assert_eq!(rc_default.timeout_secs(), 0);
+    }
+
+    #[test]
+    fn set_query_buffer_limit_round_trips() {
+        let cfg = Config {
+            query_buffer_limit: 4096,
+            ..Config::default()
+        };
+        let rc = RuntimeConfig::from_config(&cfg);
+        // Seeded from the boot config.
+        assert_eq!(rc.query_buffer_limit(), 4096);
+        // A setter overrides it.
+        rc.set_query_buffer_limit(8192);
+        assert_eq!(rc.query_buffer_limit(), 8192);
+        // `0` disables the cap.
+        rc.set_query_buffer_limit(0);
+        assert_eq!(rc.query_buffer_limit(), 0);
+        // The default seeds the high 1 GiB ceiling (mirrors the output cap).
+        let rc_default = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(
+            rc_default.query_buffer_limit(),
+            crate::DEFAULT_QUERY_BUFFER_LIMIT
+        );
     }
 
     #[test]

@@ -353,6 +353,16 @@ pub struct Config {
     /// ceiling ([`DEFAULT_OUTPUT_BUFFER_LIMIT`]) so a legitimate large pipeline/reply is
     /// unaffected while a pathological accumulation is bounded.
     pub output_buffer_limit: u64,
+    /// The per-connection QUERY-BUFFER hard cap in bytes (the inbound analog of
+    /// [`output_buffer_limit`](Self::output_buffer_limit); Redis `client-query-buffer-limit`,
+    /// #528). A connection whose accumulated inbound read buffer would exceed this is CLOSED
+    /// rather than allowed to grow unbounded: a client that announces a large multibulk
+    /// (`*<huge>\r\n`) and then dribbles the elements slowly forces the server to buffer every
+    /// partial byte while the frame never completes, a PRE-AUTH memory-amplification DoS. `0`
+    /// DISABLES the cap (the pre-fix unbounded behavior); the default is a high ceiling
+    /// ([`DEFAULT_QUERY_BUFFER_LIMIT`]) so a legitimate large request / deep pipeline is unaffected
+    /// while a slow-dribble accumulation is bounded.
+    pub query_buffer_limit: u64,
     /// The maximum size in bytes of a single inbound bulk string the RESP decoder accepts,
     /// AND the ceiling a string value may grow to (Redis `proto-max-bulk-len`, default
     /// [`DEFAULT_PROTO_MAX_BULK_LEN`] = 512 MB). A bulk string larger than this is a
@@ -671,6 +681,11 @@ impl Default for Config {
             // unbounded accumulation (slow consumer / pub-sub flood) is bounded so it
             // cannot OOM the host. 0 disables it (unbounded, the pre-fix behavior).
             output_buffer_limit: DEFAULT_OUTPUT_BUFFER_LIMIT,
+            // A high per-connection query-buffer ceiling by default (#528): a legitimate large
+            // request / deep pipeline is unaffected, but a slow-dribble multibulk that never
+            // completes cannot force unbounded inbound buffering (a pre-auth memory-amplification
+            // DoS). 0 disables it (unbounded, the pre-fix behavior).
+            query_buffer_limit: DEFAULT_QUERY_BUFFER_LIMIT,
             // The Redis `proto-max-bulk-len` default (512 MB): the inbound bulk-string ceiling and
             // the string-value growth ceiling. Runtime-settable; the default keeps the decoder
             // Limits + the string/bitmap ceilings byte-identical to the pre-fix compiled constant.
@@ -781,6 +796,16 @@ pub const DEFAULT_MAXCLIENTS: u64 = 10_000;
 /// unbounded accumulation is bounded; `0` disables the cap (unbounded, the pre-fix
 /// behavior).
 pub const DEFAULT_OUTPUT_BUFFER_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Default per-connection query-buffer hard cap in bytes (#528): 1 GiB. A connection whose
+/// accumulated inbound read buffer would exceed this is closed, bounding the slow-dribble
+/// multibulk memory-amplification DoS (a client announces a large `*<huge>\r\n` array and then
+/// trickles the elements, forcing the server to buffer every partial byte pre-auth while the
+/// frame never completes). The default is high enough that a legitimate large request or deep
+/// pipeline (an individual bulk string is itself capped at the 512 MB `proto-max-bulk-len`) is
+/// never affected, while a pathological accumulation is bounded; `0` disables the cap (unbounded,
+/// the pre-fix behavior). Mirrors [`DEFAULT_OUTPUT_BUFFER_LIMIT`] on the inbound side.
+pub const DEFAULT_QUERY_BUFFER_LIMIT: u64 = 1024 * 1024 * 1024;
 
 /// Default `slowlog-log-slower-than` threshold in MICROSECONDS (Redis default 10000us = 10ms,
 /// PROD-7). A command taking at least this long is recorded in the SLOWLOG. `-1` disables the
@@ -1406,6 +1431,11 @@ pub struct ConfigOverlay {
     /// (`output_buffer_limit = 1073741824`) + the `IRONCACHE_OUTPUT_BUFFER_LIMIT` env var.
     /// `None` leaves the lower layer (default [`DEFAULT_OUTPUT_BUFFER_LIMIT`]); `0` disables it.
     pub output_buffer_limit: Option<u64>,
+    /// The per-connection query-buffer hard cap in bytes (#528, the inbound analog of
+    /// `output_buffer_limit`). TOML (`query_buffer_limit = 1073741824`) + the
+    /// `IRONCACHE_QUERY_BUFFER_LIMIT` env var. `None` leaves the lower layer (default
+    /// [`DEFAULT_QUERY_BUFFER_LIMIT`]); `0` disables it.
+    pub query_buffer_limit: Option<u64>,
     /// The inbound bulk-string + string-value-growth ceiling in bytes (Redis
     /// `proto-max-bulk-len`). TOML (`proto_max_bulk_len = 536870912`) + the
     /// `IRONCACHE_PROTO_MAX_BULK_LEN` env var. `None` leaves the lower layer (default
@@ -1617,6 +1647,13 @@ impl ConfigOverlay {
         if let Ok(v) = std::env::var("IRONCACHE_OUTPUT_BUFFER_LIMIT") {
             o.output_buffer_limit = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "output_buffer_limit",
+                reason: format!("not a number of bytes: {v}"),
+            })?);
+        }
+        // The per-connection query-buffer hard cap in bytes (#528, inbound analog); 0 disables it.
+        if let Ok(v) = std::env::var("IRONCACHE_QUERY_BUFFER_LIMIT") {
+            o.query_buffer_limit = Some(v.parse().map_err(|_| ConfigError::Invalid {
+                field: "query_buffer_limit",
                 reason: format!("not a number of bytes: {v}"),
             })?);
         }
@@ -1910,6 +1947,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.output_buffer_limit {
             cfg.output_buffer_limit = v;
+        }
+        if let Some(v) = self.query_buffer_limit {
+            cfg.query_buffer_limit = v;
         }
         if let Some(v) = self.proto_max_bulk_len {
             cfg.proto_max_bulk_len = v;
@@ -2261,6 +2301,11 @@ mod tests {
         assert_eq!(c.maxclients, 10_000);
         assert_eq!(c.output_buffer_limit, DEFAULT_OUTPUT_BUFFER_LIMIT);
         assert_eq!(c.output_buffer_limit, 1024 * 1024 * 1024);
+        // The query-buffer cap (#528) mirrors the output cap: a high 1 GiB ceiling by default so a
+        // legitimate large request / deep pipeline is unaffected while a slow-dribble multibulk is
+        // bounded.
+        assert_eq!(c.query_buffer_limit, DEFAULT_QUERY_BUFFER_LIMIT);
+        assert_eq!(c.query_buffer_limit, 1024 * 1024 * 1024);
         // No data directory by default: the Raft log lands under the OS temp dir (unchanged).
         assert!(c.data_dir.is_none());
         // PERSISTENCE save policy is OFF by default (#58): no periodic save timer in the default
@@ -3462,29 +3507,33 @@ mod tests {
         );
     }
 
-    /// PROD-SAFETY #3/#4/#5: the connection-safety knobs (`maxclients`, `timeout`,
-    /// `output_buffer_limit`) parse from TOML + the overlay, override the defaults, and are
-    /// runtime-settable + readable via the CONFIG registry (`maxclients` / `output-buffer-limit`).
+    /// PROD-SAFETY #3/#4/#5 + #528: the connection-safety knobs (`maxclients`, `timeout`,
+    /// `output_buffer_limit`, `query_buffer_limit`) parse from TOML + the overlay, override the
+    /// defaults, and are runtime-settable + readable via the CONFIG registry (`maxclients` /
+    /// `output-buffer-limit` / `query-buffer-limit`).
     #[test]
     fn connection_safety_knobs_parse_and_are_runtime_settable() {
         use crate::registry::{SetOutcome, apply_set, effective_value, lookup};
         use crate::runtime::RuntimeConfig;
 
-        // TOML overlay sets all three; the resolved Config carries them (overriding the defaults).
-        let toml = "maxclients = 250\ntimeout = 45\noutput_buffer_limit = 65536\n";
+        // TOML overlay sets all four; the resolved Config carries them (overriding the defaults).
+        let toml = "maxclients = 250\ntimeout = 45\noutput_buffer_limit = 65536\nquery_buffer_limit = 32768\n";
         let overlay = ConfigOverlay::from_toml_str(toml).unwrap();
         assert_eq!(overlay.maxclients, Some(250));
         assert_eq!(overlay.timeout, Some(45));
         assert_eq!(overlay.output_buffer_limit, Some(65536));
+        assert_eq!(overlay.query_buffer_limit, Some(32768));
         let cfg = Config::resolve(&[overlay]).unwrap();
         assert_eq!(cfg.maxclients, 250);
         assert_eq!(cfg.timeout_secs, 45);
         assert_eq!(cfg.output_buffer_limit, 65536);
+        assert_eq!(cfg.query_buffer_limit, 32768);
         cfg.validate().unwrap();
 
-        // The CONFIG registry knows both runtime-settable names and reports the boot values.
+        // The CONFIG registry knows the runtime-settable names and reports the boot values.
         assert!(lookup("maxclients").is_some());
         assert!(lookup("output-buffer-limit").is_some());
+        assert!(lookup("query-buffer-limit").is_some());
         let runtime = RuntimeConfig::from_config(&cfg);
         assert_eq!(
             effective_value("maxclients", &runtime, &cfg).as_deref(),
@@ -3494,8 +3543,13 @@ mod tests {
             effective_value("output-buffer-limit", &runtime, &cfg).as_deref(),
             Some("65536")
         );
+        assert_eq!(
+            effective_value("query-buffer-limit", &runtime, &cfg).as_deref(),
+            Some("32768")
+        );
         assert_eq!(runtime.maxclients(), 250);
         assert_eq!(runtime.output_buffer_limit(), 65536);
+        assert_eq!(runtime.query_buffer_limit(), 32768);
 
         // `CONFIG SET maxclients` updates the live ceiling the accept path reads; `0` disables it.
         assert_eq!(apply_set("maxclients", "9", &runtime), SetOutcome::Applied);
@@ -3521,6 +3575,23 @@ mod tests {
         assert_eq!(runtime.output_buffer_limit(), 0);
         assert!(matches!(
             apply_set("output-buffer-limit", "1.5gb", &runtime),
+            SetOutcome::InvalidValue(_)
+        ));
+
+        // `CONFIG SET query-buffer-limit` (#528) accepts a human size; `0` disables it; garbage is
+        // rejected. Mirrors the output-buffer-limit setter on the inbound side.
+        assert_eq!(
+            apply_set("query-buffer-limit", "128mb", &runtime),
+            SetOutcome::Applied
+        );
+        assert_eq!(runtime.query_buffer_limit(), 128 * 1024 * 1024);
+        assert_eq!(
+            apply_set("query-buffer-limit", "0", &runtime),
+            SetOutcome::Applied
+        );
+        assert_eq!(runtime.query_buffer_limit(), 0);
+        assert!(matches!(
+            apply_set("query-buffer-limit", "1.5gb", &runtime),
             SetOutcome::InvalidValue(_)
         ));
     }
