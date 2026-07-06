@@ -1005,10 +1005,25 @@ impl Config {
                 }
             }
         }
-        // SHARD-OWNERS (#517) requires cluster mode enabled (it serves CLUSTER SLOTS + MOVED). It is
-        // also mutually exclusive with the raft governance axis (a ShardOwners node is standalone),
-        // which the enum already enforces (a single `cluster_mode` cannot be both).
-        if self.cluster_mode == ClusterMode::ShardOwners && !self.cluster_enabled {
+        self.validate_shard_owners()?;
+        Ok(())
+    }
+
+    /// Validate the SHARD-OWNERS (#517) mode rules. A NO-OP for every other `cluster_mode`.
+    ///
+    /// The mode requires `cluster_enabled` (it serves CLUSTER SLOTS + MOVED); it is mutually
+    /// exclusive with raft governance (the enum enforces that: one `cluster_mode`). It binds one
+    /// listener PER shard (`port + i`), which the tokio bootstrap does but the io_uring bootstrap
+    /// does not yet, so the io_uring combo is rejected loudly rather than silently binding a single
+    /// port whose `CLUSTER SLOTS` projection would advertise per-shard ports no one listens on. And
+    /// the whole port block `port .. port + shards - 1` must fit u16 (checked here so the operator
+    /// gets ONE clean config error instead of a boot panic from the projection build or a mid-bind
+    /// io::Error from the bootstrap racing to fire first).
+    fn validate_shard_owners(&self) -> Result<(), ConfigError> {
+        if self.cluster_mode != ClusterMode::ShardOwners {
+            return Ok(());
+        }
+        if !self.cluster_enabled {
             return Err(ConfigError::Invalid {
                 field: "cluster-mode",
                 reason: "shard-owners mode requires cluster_enabled = true (it exposes the node's \
@@ -1016,17 +1031,24 @@ impl Config {
                     .to_owned(),
             });
         }
-        // SHARD-OWNERS binds one listener PER shard (`port + i`), which the tokio bootstrap does; the
-        // io_uring bootstrap does not yet (its per-shard listeners are a follow-up). Reject the combo
-        // loudly rather than silently bind a single port whose `CLUSTER SLOTS` projection would
-        // advertise per-shard ports no one is listening on.
-        if self.cluster_mode == ClusterMode::ShardOwners && self.runtime == RuntimeBackend::IoUring
-        {
+        if self.runtime == RuntimeBackend::IoUring {
             return Err(ConfigError::Invalid {
                 field: "cluster-mode",
                 reason: "shard-owners mode is not yet supported with the io_uring runtime (its \
                          per-shard listeners are a follow-up); use the tokio runtime for shard-owners"
                     .to_owned(),
+            });
+        }
+        let top_offset = u16::try_from(self.shards.max(1) - 1).unwrap_or(u16::MAX);
+        if self.port.checked_add(top_offset).is_none() {
+            return Err(ConfigError::Invalid {
+                field: "port",
+                reason: format!(
+                    "shard-owners mode needs ports {}..{} (one per shard), which overflows the \
+                     maximum port 65535; lower the base port or the shard count",
+                    self.port,
+                    u32::from(self.port) + u32::from(top_offset)
+                ),
             });
         }
         Ok(())
@@ -2775,6 +2797,32 @@ mod tests {
         assert!(
             with_tokio.validate().is_ok(),
             "shard-owners + tokio must be accepted"
+        );
+
+        // #517 PR4 review: the per-shard port block `port .. port + shards - 1` must fit u16 -- a
+        // clean config error, not a boot panic. 65500 + 100 shards overflows; 65500 + 4 fits (top
+        // port 65503); the exact boundary base 65535 - (shards-1) also fits.
+        let overflow = Config {
+            cluster_mode: ClusterMode::ShardOwners,
+            cluster_enabled: true,
+            port: 65500,
+            shards: 100,
+            ..Config::default()
+        };
+        assert!(
+            overflow.validate().is_err(),
+            "shard-owners port block overflowing u16 must be rejected at validate"
+        );
+        let fits = Config {
+            cluster_mode: ClusterMode::ShardOwners,
+            cluster_enabled: true,
+            port: 65532,
+            shards: 4,
+            ..Config::default()
+        };
+        assert!(
+            fits.validate().is_ok(),
+            "shard-owners port block ending exactly at 65535 must be accepted"
         );
     }
 

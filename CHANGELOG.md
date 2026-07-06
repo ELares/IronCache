@@ -236,7 +236,14 @@ release.
   and is MOVED for the rest. NOTE: shard-owners mode currently requires the tokio runtime (the
   io_uring per-shard listeners are a follow-up) and is incompatible with systemd socket activation
   (which supplies one inherited socket, but the mode needs N distinct ports) -- both are rejected at
-  boot rather than mis-bound.
+  boot rather than mis-bound; the per-shard port block `port .. port + shards - 1` must also fit
+  within 65535, validated at config load. KNOWN DIVERGENCE (documented, follow-up tracked): the
+  whole-keyspace commands (KEYS / SCAN / DBSIZE / RANDOMKEY / FLUSHDB / FLUSHALL) are exempt from
+  cluster redirect and fan out across ALL internal shards on WHICHEVER per-shard port they arrive at.
+  A real Redis Cluster node answers those only for ITS OWN slots, so a cluster-aware tool that
+  aggregates per node (for example a per-node DBSIZE sum) will over-count by the shard factor N. The
+  data-path semantics (keyed commands, MOVED, CROSSSLOT) match Redis Cluster; only the whole-keyspace
+  aggregation scope differs.
 
 - Benchmarks now compare against the LATEST Redis (8.x), not the distro-packaged 7.x, and the README
   gains a higher-core scaling run (16-vCPU AWS Graviton, `redis-benchmark`, Redis 8.8.0 vs IronCache
