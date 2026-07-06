@@ -1,0 +1,40 @@
+# cargo-nextest configuration (#533). nextest runs each test in its OWN process, which
+# (a) isolates shared-global-state / port-contention deadlocks that hung the old in-process
+# `cargo test --workspace` under parallel load, and (b) enforces a PER-TEST timeout so a stuck
+# test is killed and reported instead of hanging the whole CI job for hours.
+[profile.default]
+# Timeout budget. Most tests are sub-second; the heaviest are the Raft DST seed sweeps, which run
+# ~15-35s each once the simulation crates are opt-level 3 (see [profile.dev.package.*] in the root
+# Cargo.toml; unoptimized they were 100-260s and starved CI, which is what looked like a hang). 90s
+# is a generous ceiling for those under CI parallel load; `terminate-after = 3` SIGKILLs a test still
+# running after 3 * 90s = 270s and fails the run with a clear "TMT" line naming it -- turning any
+# genuine unbounded hang into a fast, diagnosable failure instead of a multi-hour runner burn.
+slow-timeout = { period = "90s", terminate-after = 3 }
+# A flaky test may be retried a bounded number of times (does NOT mask a hard failure: a test that
+# fails every attempt still fails). Keeps a genuinely flaky env hiccup from red-flagging a PR while
+# a real regression still blocks.
+retries = 2
+
+[profile.ci]
+# CI inherits default timeouts; fail-fast off so one failure does not hide others.
+fail-fast = false
+slow-timeout = { period = "90s", terminate-after = 3 }
+retries = 2
+final-status-level = "flaky"
+
+# io_uring tests contend on a LIMITED kernel resource (io_uring rings + registered buffers). Running
+# them concurrently with the rest of the workspace under load is the diagnosed cause of the
+# intermittent CI hang: the `fixed_datapath` ring tests (a 6-test module, matching the observed
+# "6-test binary hangs" signature) block on a ring operation that never completes under contention.
+# Pin every io_uring test to a single-slot group so they run SERIALLY, one ring lifecycle at a time.
+# The per-test timeout above remains the backstop; this removes the contention that triggered it.
+[test-groups]
+io-uring = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(=ironcache-runtime) and (test(/io_uring/) or test(/fixed_datapath/) or test(/uring/))'
+test-group = 'io-uring'
+
+[[profile.ci.overrides]]
+filter = 'package(=ironcache-runtime) and (test(/io_uring/) or test(/fixed_datapath/) or test(/uring/))'
+test-group = 'io-uring'
