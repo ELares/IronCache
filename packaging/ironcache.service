@@ -39,6 +39,14 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 
+# --- File descriptors (#532). Give the server a high open-file ceiling so its
+#     `maxclients` (Redis default 10000) is not silently clamped down to fit a low
+#     inherited `ulimit -n` (the boot-time RLIMIT_NOFILE budget logs LOUDLY when it
+#     has to clamp). systemd applies this limit directly, which matters because the
+#     `@resources` syscall group is filtered below: the server CANNOT self-raise via
+#     setrlimit under this sandbox, so the unit must provision the budget for it.
+LimitNOFILE=65535
+
 # --- Identity: transient, allocated-per-start UID/GID, no persistent account.
 DynamicUser=yes
 

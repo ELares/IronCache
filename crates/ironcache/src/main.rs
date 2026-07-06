@@ -8,6 +8,7 @@
 //! boundary (ADR-0003) holds.
 
 mod cli;
+mod fd_budget;
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -172,7 +173,13 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
 }
 
 fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
-    let cfg = load_config(cli)?;
+    let mut cfg = load_config(cli)?;
+    // FD BUDGET (#532, Redis `adjustOpenFilesLimit` parity): before wiring any shard,
+    // raise the `RLIMIT_NOFILE` soft limit toward the hard limit where the kernel
+    // allows, else CLAMP `maxclients` down to fit the file-descriptor budget with a
+    // LOUD warning. This makes a low `ulimit -n` a clean bounded ceiling at boot
+    // rather than an `EMFILE` mid-traffic. Boot / OS-seam code, outside ADR-0003.
+    fd_budget::apply_fd_budget(&mut cfg);
     tracing::info!(
         version = cli::BUILD_VERSION,
         bind = %cfg.bind,
