@@ -3,11 +3,13 @@
 # `cargo test --workspace` under parallel load, and (b) enforces a PER-TEST timeout so a stuck
 # test is killed and reported instead of hanging the whole CI job for hours.
 [profile.default]
-# The slowest healthy integration test (a 3-node raft cluster forming over real sockets) is a few
-# seconds; 60s is a generous ceiling. `terminate-after = 2` SIGKILLs a test still running after
-# 2 * 60s = 120s and fails the run with a clear "SLOW/TIMEOUT" line naming the test -- turning an
-# unbounded hang into a fast, diagnosable failure.
-slow-timeout = { period = "60s", terminate-after = 2 }
+# Timeout budget. Most tests are sub-second; the heaviest are the Raft DST seed sweeps, which run
+# ~15-35s each once the simulation crates are opt-level 3 (see [profile.dev.package.*] in the root
+# Cargo.toml; unoptimized they were 100-260s and starved CI, which is what looked like a hang). 90s
+# is a generous ceiling for those under CI parallel load; `terminate-after = 3` SIGKILLs a test still
+# running after 3 * 90s = 270s and fails the run with a clear "TMT" line naming it -- turning any
+# genuine unbounded hang into a fast, diagnosable failure instead of a multi-hour runner burn.
+slow-timeout = { period = "90s", terminate-after = 3 }
 # A flaky test may be retried a bounded number of times (does NOT mask a hard failure: a test that
 # fails every attempt still fails). Keeps a genuinely flaky env hiccup from red-flagging a PR while
 # a real regression still blocks.
@@ -16,7 +18,7 @@ retries = 2
 [profile.ci]
 # CI inherits default timeouts; fail-fast off so one failure does not hide others.
 fail-fast = false
-slow-timeout = { period = "60s", terminate-after = 2 }
+slow-timeout = { period = "90s", terminate-after = 3 }
 retries = 2
 final-status-level = "flaky"
 

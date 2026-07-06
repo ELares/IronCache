@@ -176,3 +176,18 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# DETERMINISTIC-SIMULATION SPEED (#533). The Raft DST seed sweeps run millions of simulated ticks;
+# unoptimized (debug/test-profile) they take 100-260s EACH, which starved CI under parallel load and
+# looked like a hang. Optimize ONLY the simulation crates in dev/test builds -- opt-level 3 gives the
+# sim loop a ~10-20x speedup (seconds, not minutes) while every other crate stays debug (fast compile,
+# debug-assertions + overflow-checks preserved, so the sims still exercise the checked build). This is
+# the standard DST posture (compile the harness optimized, keep asserts on).
+[profile.dev.package.ironcache-raft]
+opt-level = 3
+[profile.dev.package.ironcache-sim]
+opt-level = 3
+[profile.dev.package.ironcache-cluster]
+opt-level = 3
+[profile.dev.package.ironcache-store]
+opt-level = 3
