@@ -68,6 +68,7 @@ all deployment artifacts here pass `--metrics-addr 0.0.0.0:9121`.
 | `data_dir` | `IRONCACHE_DATA_DIR` | durable snapshot + Raft log dir (enables persistence) |
 | `save_interval_secs` | `IRONCACHE_SAVE_INTERVAL_SECS` | periodic save cadence (0 = off) |
 | `save_min_changes` | `IRONCACHE_SAVE_MIN_CHANGES` | min writes before a periodic save fires |
+| `refuse_empty_start_on_version_mismatch` | `IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH` | fail closed (refuse to boot) on a newer-format snapshot instead of a loud empty start |
 | `cluster_enabled` | `IRONCACHE_CLUSTER_ENABLED` | turn on cluster mode (boot-only) |
 | `cluster_mode` | `IRONCACHE_CLUSTER_MODE` | `static` (default) or `raft` |
 | `cluster_announce_id` | `IRONCACHE_CLUSTER_ANNOUNCE_ID` | this node's stable 40-hex id |
@@ -351,6 +352,24 @@ Each pod gets its own PVC via the StatefulSet `volumeClaimTemplate`
 (`ReadWriteOnce`, default 10Gi); set `persistence.storageClassName` to an SSD class
 in production. PVCs are NOT deleted by `helm uninstall` / `kubectl delete sts` --
 remove them explicitly when you mean to discard data.
+
+### Dump-format compatibility policy
+
+The on-disk snapshot (`dump.manifest` + `dump-shard-<n>.icss`) carries an integer
+FORMAT VERSION, bumped only on a breaking layout change. A binary reads ONLY its own
+format version: a genuinely absent, torn, or foreign dump degrades safely to an empty
+start (the ephemeral-cache posture), but a WELL-FORMED dump written by a DIFFERENT
+version is NOT silently discarded. On boot the node classifies such a mismatch (almost
+always an older binary loading a NEWER dump -- a downgrade or a failed-upgrade rollback)
+and emits a LOUD `ERROR` log; it never boots silently empty on a version it cannot read.
+The default posture then starts with an empty keyspace (loud, not silent), which is
+recoverable ONLY if you have not yet let a save overwrite the newer dump -- so set
+`refuse_empty_start_on_version_mismatch = true`
+(`IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH=true`) to FAIL CLOSED: the node
+refuses to boot on an unreadable dump, giving you the chance to roll the correct binary
+forward again before any data is lost. Practical rule: upgrade format versions forward
+only, and when you must roll a binary back, restore a snapshot the older binary can read
+(or wipe the `data_dir`) rather than pointing it at a newer dump.
 
 ---
 

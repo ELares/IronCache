@@ -515,6 +515,9 @@ dependencies = [
  "ironcache-repl",
  "ironcache-storage",
  "ironcache-store",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

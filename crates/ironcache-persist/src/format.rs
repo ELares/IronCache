@@ -44,9 +44,35 @@ use std::path::{Path, PathBuf};
 /// Snapshot) tag, so a stray / foreign / truncated-to-zero file is rejected before any decode.
 pub const MAGIC: [u8; 4] = *b"ICSS";
 
-/// The on-disk FORMAT VERSION. Bumped only on a breaking layout change; load rejects an
-/// unknown version (treated as no-snapshot, start empty) rather than mis-parsing it.
+/// The on-disk FORMAT VERSION. Bumped only on a breaking layout change; the decode helpers reject an
+/// unknown version rather than mis-parsing it, and the boot check ([`crate::check_snapshot_loadable`])
+/// CLASSIFIES a well-formed-but-unknown version as [`SnapshotLoadError::UnknownVersion`] so a mismatch
+/// fails LOUDLY instead of silently starting empty (#530).
 pub const FORMAT_VERSION: u32 = 1;
+
+/// A committed on-disk snapshot this binary CANNOT load, CLASSIFIED so the boot path can react
+/// (surface it LOUDLY, and optionally FAIL CLOSED) instead of the pre-#530 behavior of silently
+/// starting with an EMPTY keyspace. This is DISTINCT from a genuinely MISSING / TORN / FOREIGN file,
+/// which stays the safe "start empty" degradation ([`Manifest::decode`] returns `None`); this error
+/// is reserved for a WELL-FORMED snapshot whose FORMAT VERSION this binary does not understand.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SnapshotLoadError {
+    /// The committed manifest is well-formed (magic + trailing CRC valid) but records a format
+    /// version this binary does NOT support -- almost always a NEWER dump an OLDER binary is being
+    /// asked to load (a DOWNGRADE, or a failed-upgrade ROLLBACK). Silently loading it would DISCARD
+    /// the entire on-disk keyspace, so it is surfaced as this classified error instead.
+    #[error(
+        "on-disk snapshot format version {found} is not supported by this binary (it reads version \
+         {supported}); refusing to silently start with an empty keyspace -- this is almost always \
+         an older binary loading a newer dump (a downgrade or a failed-upgrade rollback)"
+    )]
+    UnknownVersion {
+        /// The format version recorded in the committed manifest on disk.
+        found: u32,
+        /// The format version THIS binary understands ([`FORMAT_VERSION`]).
+        supported: u32,
+    },
+}
 
 /// The manifest file name within the data directory (the single COMMIT POINT, written LAST).
 pub const MANIFEST_NAME: &str = "dump.manifest";
@@ -237,6 +263,48 @@ impl Manifest {
             entries,
         })
     }
+}
+
+/// CLASSIFY a committed manifest's on-disk bytes as loadable-or-not WITHOUT a full decode (#530), so
+/// the boot path can tell a snapshot it CANNOT read (a WELL-FORMED but UNKNOWN format version) apart
+/// from a genuinely missing / torn / foreign file. Returns:
+///
+/// - `Ok(())` when `buf` is NOT a well-formed manifest (too short / wrong magic / a broken trailing
+///   CRC -- all "start empty" degradations, unchanged from [`Manifest::decode`] returning `None`), OR
+///   it IS a well-formed manifest recording the version this binary reads ([`FORMAT_VERSION`]).
+/// - `Err(`[`SnapshotLoadError::UnknownVersion`]`)` when `buf` IS a well-formed manifest (magic +
+///   trailing CRC valid) whose recorded format version differs from [`FORMAT_VERSION`]: a dump this
+///   binary must not silently discard.
+///
+/// The trailing CRC is validated FIRST so a torn manifest (whose version bytes are untrustworthy) is
+/// treated as no-snapshot, never mis-classified as a version error. TOTAL: never panics.
+pub fn classify_manifest_version(buf: &[u8]) -> Result<(), SnapshotLoadError> {
+    // A torn / truncated manifest carries no trustworthy version: treat as no-snapshot (start empty).
+    if buf.len() < 4 {
+        return Ok(());
+    }
+    let (body, crc_bytes) = buf.split_at(buf.len() - 4);
+    let Ok(crc_arr) = <[u8; 4]>::try_from(crc_bytes) else {
+        return Ok(());
+    };
+    if crc32(body) != u32::from_le_bytes(crc_arr) {
+        return Ok(()); // a torn manifest: the version bytes are not trustworthy.
+    }
+    // The magic + version are the first 8 bytes of the CRC-validated body.
+    if body.len() < 8 || body[0..4] != MAGIC {
+        return Ok(()); // foreign / too short: not our manifest, the safe start-empty path.
+    }
+    let Ok(ver_arr) = <[u8; 4]>::try_from(&body[4..8]) else {
+        return Ok(());
+    };
+    let version = u32::from_le_bytes(ver_arr);
+    if version == FORMAT_VERSION {
+        return Ok(()); // a version this binary reads; the normal decode path handles it.
+    }
+    Err(SnapshotLoadError::UnknownVersion {
+        found: version,
+        supported: FORMAT_VERSION,
+    })
 }
 
 /// The fixed header at the head of EACH per-shard snapshot file: `MAGIC`, the format version,
@@ -486,6 +554,50 @@ mod tests {
         let new_crc = crc32(&foreign[..body_len]);
         foreign[body_len..].copy_from_slice(&new_crc.to_le_bytes());
         assert!(Manifest::decode(&foreign).is_none());
+    }
+
+    #[test]
+    fn classify_manifest_version_flags_only_a_well_formed_unknown_version() {
+        // A manifest at a NEWER format version (FORMAT_VERSION + 1) is a downgrade / rollback: it is
+        // well-formed (magic + trailing CRC valid) but unreadable, so it CLASSIFIES as UnknownVersion
+        // rather than the silent no-snapshot `None` the old decode returned (#530).
+        let newer = Manifest {
+            version: FORMAT_VERSION + 1,
+            shards: 1,
+            save_id: 7,
+            save_unix_secs: 1,
+            entries: vec![ShardManifestEntry {
+                shard: 0,
+                file: shard_file_name(0),
+                keys: 3,
+                crc: 0xABCD,
+            }],
+        };
+        assert_eq!(
+            classify_manifest_version(&newer.encode()),
+            Err(SnapshotLoadError::UnknownVersion {
+                found: FORMAT_VERSION + 1,
+                supported: FORMAT_VERSION,
+            }),
+            "a well-formed newer-version manifest is a classified error, not silent empty"
+        );
+
+        // The CURRENT version is loadable -> Ok (the normal decode path handles it).
+        let current = Manifest {
+            version: FORMAT_VERSION,
+            ..newer.clone()
+        };
+        assert_eq!(classify_manifest_version(&current.encode()), Ok(()));
+
+        // A TORN manifest (its version bytes are untrustworthy) stays the safe start-empty path (Ok),
+        // NOT mis-classified as a version error: the CRC is checked before the version is read.
+        let mut torn = newer.encode();
+        torn[10] ^= 0xFF; // corrupt a body byte so the trailing CRC no longer matches.
+        assert_eq!(classify_manifest_version(&torn), Ok(()));
+
+        // Foreign / too-short / empty buffers are likewise Ok (start empty, unchanged).
+        assert_eq!(classify_manifest_version(b""), Ok(()));
+        assert_eq!(classify_manifest_version(b"IC"), Ok(()));
     }
 
     #[test]

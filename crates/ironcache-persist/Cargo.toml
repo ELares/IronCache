@@ -28,7 +28,22 @@ ironcache-storage = { workspace = true }
 # full-sync uses for a `KvObj` is reused VERBATIM as the on-disk record format, so
 # the snapshot file and the replication stream share one audited codec.
 ironcache-repl = { workspace = true }
+# The TYPED-ERROR derive: `SnapshotLoadError` classifies an on-disk snapshot this
+# binary cannot read (an unknown, almost-always NEWER format version) distinctly
+# from a genuinely missing / torn file, so the boot path can fail loudly instead of
+# silently starting empty (#530). thiserror is the workspace's standard error derive.
+thiserror = { workspace = true }
+# The logging FACADE (OBSERVABILITY.md): the boot check emits ONE loud
+# `tracing::error!` when it finds a snapshot whose format version this binary cannot
+# read (#530), co-located with detection so a downgrade / failed-upgrade rollback
+# that would otherwise SILENTLY start empty is never silent. tracing is a log facade,
+# not a clock / RNG, so it does not touch the ADR-0003 determinism seam.
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The determinism seam is not needed here (persist reads `now` as a passed-in
 # `UnixMillis`, never a clock), so the tests construct `UnixMillis` directly.
+# A CAPTURING subscriber for the unit test that asserts the load path's loud
+# version-mismatch `tracing::error!` actually FIRES (#530 acceptance), captured
+# in-process via `with_default` without installing a global logger.
+tracing-subscriber = { workspace = true }
