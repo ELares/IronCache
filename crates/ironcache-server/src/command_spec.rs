@@ -94,6 +94,16 @@ pub const ICCOUNTKEYSINSLOT: &[u8] = b"__ICCOUNTKEYSINSLOT";
 /// See [`ICCOUNTKEYSINSLOT`]; this is the `GETKEYSINSLOT` (collect up to `<count>` keys) half.
 pub const ICGETKEYSINSLOT: &[u8] = b"__ICGETKEYSINSLOT";
 
+/// The INTERNAL whole-keyspace verb the coordinator uses to gather the NODE-WIDE `# Keyspace`
+/// section for INFO (#531): `__ICINFOKEYSPACE <databases>` asks every shard for its per-db key
+/// count, and the home core SUMS the partials element-wise into the per-db node totals (the SAME
+/// scatter-gather DBSIZE uses, so INFO's `# Keyspace` matches DBSIZE on a multi-shard node). Each
+/// shard replies an Array of `<databases>` Integers, `[db_len(0), db_len(1), ...]`. NOT a client
+/// command: like [`ICCOUNTKEYSINSLOT`]/[`ICGETKEYSINSLOT`] it is DELIBERATELY ABSENT from the
+/// [`spec_of`] registry (dispatched only via the whole-keyspace fan-out, which allow-lists it in
+/// its defense check), so the registry-vs-dispatch cross-check is untouched.
+pub const ICINFOKEYSPACE: &[u8] = b"__ICINFOKEYSPACE";
+
 /// The queue-time arity rule for a known command, mirroring the `arity` field of the
 /// Redis command table (src/commands.def). Redis encodes arity as a single signed int:
 /// a POSITIVE `n` means EXACTLY `n` total arguments (command token included); a NEGATIVE

@@ -128,6 +128,7 @@ async fn serve_one(
                         &mut shard_gen,
                         rollup,
                         &|| (String::new(), String::new()),
+                        &|| None,
                         mem,
                         &mut deltas,
                         &request,

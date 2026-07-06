@@ -10,10 +10,11 @@
 //! unknown param or a rejected value is the canonical Redis error. A
 //! `CONFIG SET maxmemory-policy` bumps the runtime generation so every shard hot-swaps
 //! its policy (the swap itself happens at the top of [`crate::dispatch`], not here:
-//! this command only mutates the shared cell). `CONFIG RESETSTAT` zeroes the SERVING
-//! shard's stat counters (serving-shard-scoped, like the single-shard KEYS/SCAN scope;
-//! a cross-shard reset is a coordinator follow-up). `CONFIG REWRITE` returns the Redis
-//! no-config-file error (the server currently boots without a config-file path).
+//! this command only mutates the shared cell). `CONFIG RESETSTAT` signals the reset via
+//! `deltas.reset_stats`; the serve loop zeroes the serving shard's cell AND (since INFO's
+//! stats are now the NODE-WIDE rollup, #531) fans the reset across every shard's cell so
+//! INFO's `# Stats` actually zero. `CONFIG REWRITE` returns the Redis no-config-file
+//! error (the server currently boots without a config-file path).
 
 use crate::cmd_util::ascii_upper;
 use crate::dispatch::ServerContext;
@@ -25,7 +26,8 @@ use zeroize::Zeroizing;
 
 /// `CONFIG <subcommand> [args]` (CONFIG.md / ADMIN_COMMANDS.md). `deltas` carries the
 /// per-command counter signal the serve loop folds in; `CONFIG RESETSTAT` sets
-/// `deltas.reset_stats` so the serving shard's stat counters zero.
+/// `deltas.reset_stats` so the serve loop zeroes the serving shard's stat counters AND fans the
+/// reset across every shard's cell (#531, so the node-wide INFO rollup zeroes).
 pub fn cmd_config(ctx: &ServerContext, deltas: &mut CounterDeltas, req: &Request) -> Value {
     if req.args.len() < 2 {
         return Value::error(ErrorReply::wrong_arity("config"));
@@ -162,11 +164,11 @@ fn mirror_slowlog_param(ctx: &ServerContext, name: &str) {
     }
 }
 
-/// `CONFIG RESETSTAT` -> `+OK`. Zeroes the SERVING shard's stat counters by signalling
-/// the serve loop through `deltas.reset_stats` (CONFIG.md / Redis `resetServerStats`).
-/// Serving-shard-scoped for PR-4b (documented): the cross-shard reset generalizes
-/// through the same shared-cell pattern when the coordinator lands, like the
-/// single-shard KEYS/SCAN scope.
+/// `CONFIG RESETSTAT` -> `+OK`. Signals the reset through `deltas.reset_stats` (CONFIG.md / Redis
+/// `resetServerStats`). The serve loop honors it NODE-WIDE (#531): it zeroes the serving shard's
+/// counter cell (via `ShardCounters::apply`) AND fans the reset across every shard's cell (via the
+/// always-present metrics registry), so INFO's node-wide `# Stats` rollup actually zeroes rather
+/// than only the ~1/N the serving shard held.
 fn config_resetstat(deltas: &mut CounterDeltas, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("config|resetstat"));

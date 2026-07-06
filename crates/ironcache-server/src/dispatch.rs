@@ -378,17 +378,29 @@ impl ServerContext {
     }
 }
 
-/// A source of the rolled-up counters for INFO. The serve loop supplies the
-/// current per-shard snapshot (PR-1 reports the local shard's view; the
-/// cross-shard rollup wires in with the coordinator later).
+/// A source of the rolled-up counters for INFO's `# Stats` / `# Clients` sections. The serve loop
+/// supplies the NODE-WIDE rollup (#531): it sums EVERY shard's counter cell through the always-on
+/// metrics registry ([`ironcache_observe::MetricsRegistry::aggregate`]), so INFO reports the whole
+/// node's totals invariant to which shard homed the connection -- consistent with `DBSIZE` and
+/// `/metrics`. (The registry-absent unit-test path falls back to the serving shard's snapshot.)
 pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
+
+/// A source of the NODE-WIDE `# Keyspace` per-db lines for INFO (#531). The serve loop supplies the
+/// cross-shard sum (gathered by the SAME whole-keyspace scatter-gather `DBSIZE` uses) as
+/// `Some(lines)`, so INFO's `dbN:keys=...` counts equal `DBSIZE` on a multi-shard node. `None`
+/// tells [`cmd_info`] to fall back to the SERVING shard's local `db_len` (the single-shard node,
+/// where the serving shard IS the whole keyspace, and any path -- EXEC replay / a unit-test
+/// dispatch -- that cannot fan out); that fallback is byte-identical to the pre-#531 behavior.
+/// Invoked ONLY when INFO renders the keyspace section (zero cost on every other command).
+pub type KeyspaceFn<'a> = &'a dyn Fn() -> Option<Vec<KeyspaceDbLine>>;
 
 /// Yields the INFO `COMMANDSTATS` + `ERRORSTATS` section BODIES (#413) as
 /// `(commandstats_body, errorstats_body)`, rendered by the serve layer from the SERVING shard's
-/// `CommandStats` table (home-shard-local, the same scope [`RollupFn`] uses). `INFO` invokes it
-/// ONLY for the `commandstats` / `errorstats` / `everything` sections, so it costs nothing on the
-/// common INFO path; a caller that does not track per-command stats (tests) passes a closure
-/// yielding two empty strings.
+/// `CommandStats` table (home-shard-local; unlike the node-wide [`RollupFn`] counters, the
+/// per-command table is NOT yet cross-shard-aggregated -- a documented follow-up, out of #531's
+/// `# Stats`/`# Keyspace` scope). `INFO` invokes it ONLY for the `commandstats` / `errorstats` /
+/// `everything` sections, so it costs nothing on the common INFO path; a caller that does not track
+/// per-command stats (tests) passes a closure yielding two empty strings.
 pub type CmdStatsFn<'a> = &'a dyn Fn() -> (String, String);
 
 /// Dispatch one request to its handler, returning the reply [`Value`].
@@ -789,6 +801,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap 
     shard_generation: &mut u64,
     rollup: RollupFn<'_>,
     cmdstats: CmdStatsFn<'_>,
+    keyspace: KeyspaceFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
     req: &Request,
@@ -808,6 +821,7 @@ pub fn dispatch<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwap 
         shard_generation,
         rollup,
         cmdstats,
+        keyspace,
         mem,
         deltas,
         req,
@@ -836,6 +850,7 @@ pub fn dispatch_with_cmd<
     shard_generation: &mut u64,
     rollup: RollupFn<'_>,
     cmdstats: CmdStatsFn<'_>,
+    keyspace: KeyspaceFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
     req: &Request,
@@ -956,7 +971,7 @@ pub fn dispatch_with_cmd<
     }
 
     let reply = dispatch_inner(
-        ctx, state, env, store, wheel, now, rollup, cmdstats, mem, deltas, req, cmd,
+        ctx, state, env, store, wheel, now, rollup, cmdstats, keyspace, mem, deltas, req, cmd,
     );
 
     // KEYSPACE NOTIFICATIONS (PROD-8): map this just-executed command + its reply to the Redis
@@ -991,6 +1006,7 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
     now: UnixMillis,
     rollup: RollupFn<'_>,
     cmdstats: CmdStatsFn<'_>,
+    keyspace: KeyspaceFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
     req: &Request,
@@ -1104,7 +1120,7 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         b"WATCH" => cmd_watch(state, store, now, req),
         b"UNWATCH" => cmd_unwatch(state, store, req),
         b"EXEC" => exec_transaction(
-            ctx, state, env, store, wheel, now, rollup, cmdstats, mem, deltas, req,
+            ctx, state, env, store, wheel, now, rollup, cmdstats, keyspace, mem, deltas, req,
         ),
         b"CLIENT" => cmd_client(ctx, state, env, req),
         b"COMMAND" => cmd_command(req),
@@ -1128,12 +1144,13 @@ fn dispatch_inner<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicySwa
         // shard; SET-ACTIVE-EXPIRE toggles the node's active-expiry flag via `ctx.runtime`.
         b"DEBUG" => cmd_introspect::cmd_debug(&ctx.runtime, store, db, now, req),
         // INFO reads only the CLOCK half of the env seam (uptime); pass `env` as the
-        // `&C: Clock` it needs. `store` is passed so the `# Keyspace` section can report each
-        // database's live key count (DBSIZE) via `Keyspace::db_len` (durability/operability fix #5).
-        b"INFO" => cmd_info(ctx, env, store, rollup, cmdstats, mem, req),
-        // CONFIG GET/SET/RESETSTAT/REWRITE/HELP (PR-4b). RESETSTAT signals the serving
-        // shard's counter reset via `deltas.reset_stats` (the serve loop honors it in
-        // ShardCounters::apply); the serving-shard scope is documented in cmd_config.
+        // `&C: Clock` it needs. `store` is the SERVING shard's, used ONLY as the `# Keyspace`
+        // fallback (`Keyspace::db_len`) when `keyspace` yields `None`; on a multi-shard node the
+        // serve loop hands `keyspace` the NODE-WIDE per-db counts (#531) so INFO matches DBSIZE.
+        b"INFO" => cmd_info(ctx, env, store, rollup, cmdstats, keyspace, mem, req),
+        // CONFIG GET/SET/RESETSTAT/REWRITE/HELP (PR-4b). RESETSTAT signals the counter reset via
+        // `deltas.reset_stats`; the serve loop honors it NODE-WIDE (#531) -- it zeroes the serving
+        // shard's cell (ShardCounters::apply) AND fans the reset across every shard's cell.
         b"CONFIG" => cmd_config::cmd_config(ctx, deltas, req),
         // CLUSTER (cluster-disabled-but-introspectable, CLUSTER_CONTRACT.md #70, slice 1):
         // the read-only CLUSTER surface (KEYSLOT/MYID/INFO/SLOTS/SHARDS/NODES/...) plus the
@@ -1721,13 +1738,15 @@ pub fn dispatch_remote_whole_keyspace<E: Env, S: Store + Keyspace>(
     let cmd = ascii_upper(req.command());
 
     // Defense in depth: only WholeKeyspace commands are fanned out here. Anything else is
-    // a coordinator classification bug; refuse it rather than run it on a wrong path. The two
-    // #371 slot-scan internal verbs are allow-listed: they are NOT in `spec_of` (so `classify`
-    // returns `AlwaysHome`), but the serve loop only ever rewrites a cluster-mode CLUSTER slot-scan
-    // into them, exactly the whole-keyspace broadcast shape.
-    let is_slot_scan = cmd == crate::command_spec::ICCOUNTKEYSINSLOT
-        || cmd == crate::command_spec::ICGETKEYSINSLOT;
-    if !is_slot_scan
+    // a coordinator classification bug; refuse it rather than run it on a wrong path. The three
+    // internal verbs are allow-listed: they are NOT in `spec_of` (so `classify` returns
+    // `AlwaysHome`), but the serve loop only ever emits them in exactly the whole-keyspace
+    // broadcast shape -- the two #371 slot-scans (rewritten from a cluster-mode CLUSTER slot-scan)
+    // and the #531 `__ICINFOKEYSPACE` node-wide INFO keyspace gather.
+    let is_internal_whole_keyspace = cmd == crate::command_spec::ICCOUNTKEYSINSLOT
+        || cmd == crate::command_spec::ICGETKEYSINSLOT
+        || cmd == crate::command_spec::ICINFOKEYSPACE;
+    if !is_internal_whole_keyspace
         && !matches!(
             crate::route::classify(&cmd),
             crate::route::CommandClass::WholeKeyspace
@@ -1779,6 +1798,20 @@ pub fn dispatch_remote_whole_keyspace<E: Env, S: Store + Keyspace>(
             }
             None => Value::Array(Some(Vec::new())),
         },
+        // #531: THIS shard's per-db key counts for the node-wide INFO `# Keyspace`. `args[1]` is the
+        // `databases` count (from the issuing node's config); reply an Array of that many Integers,
+        // `[db_len(0), db_len(1), ...]`, which the home core SUMS element-wise (the SAME db_len each
+        // shard's DBSIZE partial reports, so the merged per-db totals equal DBSIZE). A missing /
+        // malformed count is defensive-zero (an empty array), never a panic; the serve loop always
+        // supplies the config's `databases`.
+        b"__ICINFOKEYSPACE" => {
+            let databases = whole_keyspace_databases_arg(req);
+            Value::Array(Some(
+                (0..databases)
+                    .map(|i| Value::Integer(store.db_len(i) as i64))
+                    .collect(),
+            ))
+        }
         // The classify gate above already excludes everything else.
         _ => Value::error(ErrorReply::err(
             "command fanned out cross-shard is not whole-keyspace",
@@ -1803,6 +1836,18 @@ fn whole_keyspace_count_arg(req: &Request) -> usize {
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|&n| n >= 0)
         .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+/// Parse the `databases` argument (`args[1]`) of an `__ICINFOKEYSPACE` internal request (#531): the
+/// number of logical DBs the issuing node is configured with, so this shard reports `db_len(0)`..
+/// `db_len(databases-1)`. Returns `0` (an empty per-db array) if absent / malformed -- the serve
+/// loop always supplies the config's `databases`, so this is purely defensive, never a panic.
+fn whole_keyspace_databases_arg(req: &Request) -> u32 {
+    req.args
+        .get(1)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0)
 }
 
@@ -1897,6 +1942,7 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
     now: UnixMillis,
     rollup: RollupFn<'_>,
     cmdstats: CmdStatsFn<'_>,
+    keyspace: KeyspaceFn<'_>,
     mem: MemoryInfo,
     deltas: &mut CounterDeltas,
     req: &Request,
@@ -1982,7 +2028,8 @@ fn exec_transaction<E: Env, S: Store + Admit + ActiveExpiry + Keyspace + PolicyS
             Value::error(deny)
         } else {
             dispatch_inner(
-                ctx, state, env, store, wheel, now, rollup, cmdstats, mem, deltas, q, &qcmd,
+                ctx, state, env, store, wheel, now, rollup, cmdstats, keyspace, mem, deltas, q,
+                &qcmd,
             )
         };
         replies.push(reply);
@@ -3657,12 +3704,19 @@ fn latency_help() -> Value {
 /// allocator snapshot (ADR-0006) the caller read once at the binary edge (the
 /// server crate has no access to the concrete store's mallctl readers, by the
 /// layering contract; the binary supplies the figure).
+///
+/// Each argument is an orthogonal INFO input the serve layer threads in (ctx / clock / store /
+/// the counter rollup / the commandstats closure / the #531 node-wide keyspace rollup / the memory
+/// snapshot / the request); bundling them into a struct would only obscure the per-section borrows,
+/// so the over-7-args lint is allowed here with that justification.
+#[allow(clippy::too_many_arguments)]
 fn cmd_info<C: Clock, S: Keyspace>(
     ctx: &ServerContext,
     clock: &C,
     store: &S,
     rollup: RollupFn<'_>,
     cmdstats: CmdStatsFn<'_>,
+    keyspace_rollup: KeyspaceFn<'_>,
     mem: MemoryInfo,
     req: &Request,
 ) -> Value {
@@ -3700,21 +3754,26 @@ fn cmd_info<C: Clock, S: Keyspace>(
         }
         None => PersistenceInfo::disabled(),
     };
-    // The `# Keyspace` section facts (operability fix #5): one line per non-empty database with its
-    // live DBSIZE. SERVING-SHARD-SCOPED (this shard's partition of each db), consistent with how
-    // INFO's counters + the single-shard KEYS/SCAN/DBSIZE scope already report on the default path;
-    // a cross-shard sum is the documented coordinator follow-up. `expires` is 0 (per-db expiry
-    // counting is an O(n) scan, a follow-up); `keys` is the load-bearing field operators monitor.
-    let keyspace: Vec<KeyspaceDbLine> = (0..ctx.databases)
-        .filter_map(|db| {
-            let keys = store.db_len(db) as u64;
-            (keys > 0).then_some(KeyspaceDbLine {
-                db,
-                keys,
-                expires: 0,
+    // The `# Keyspace` section facts (operability fix #5, now NODE-WIDE #531): one line per
+    // non-empty database with its live DBSIZE. The serve loop supplies the cross-shard sum via
+    // `keyspace_rollup` (the SAME whole-keyspace scatter-gather DBSIZE uses), so on a multi-shard
+    // node these `dbN:keys=...` counts equal DBSIZE and no longer vary by which shard homed the
+    // connection. `None` (a single-shard node -- the serving shard IS the whole keyspace -- or an
+    // EXEC-replay / unit-test path that cannot fan out) falls back to THIS shard's local `db_len`,
+    // byte-identical to the pre-#531 behavior. `expires` is 0 (per-db expiry counting is an O(n)
+    // scan, a follow-up); `keys` is the load-bearing field operators monitor.
+    let keyspace: Vec<KeyspaceDbLine> = keyspace_rollup().unwrap_or_else(|| {
+        (0..ctx.databases)
+            .filter_map(|db| {
+                let keys = store.db_len(db) as u64;
+                (keys > 0).then_some(KeyspaceDbLine {
+                    db,
+                    keys,
+                    expires: 0,
+                })
             })
-        })
-        .collect();
+            .collect()
+    });
     // The PROD-7 completeness facts for the `# Clients` / `# Stats` / `# CPU` sections: the effective
     // `maxclients` (read from the runtime overlay so a `CONFIG SET maxclients` is reflected) and the
     // rejected-connection count off the connection gate. `instantaneous_ops_per_sec` is left 0 here
@@ -3980,6 +4039,7 @@ mod tests {
             &mut shard_gen,
             &zero,
             &|| (String::new(), String::new()),
+            &|| None,
             MemoryInfo::default(),
             &mut deltas,
             &req(parts),
@@ -4039,6 +4099,7 @@ mod tests {
             &mut shard_gen,
             &zero,
             &|| (String::new(), String::new()),
+            &|| None,
             MemoryInfo::default(),
             &mut deltas,
             &req(parts),
@@ -5563,6 +5624,7 @@ mod tests {
             &mut shard_gen,
             &zero,
             &|| (String::new(), String::new()),
+            &|| None,
             MemoryInfo::default(),
             &mut deltas,
             &req(parts),
@@ -8092,6 +8154,7 @@ mod tests {
             shard_gen,
             &zero,
             &|| (String::new(), String::new()),
+            &|| None,
             MemoryInfo::default(),
             &mut deltas,
             &req(parts),

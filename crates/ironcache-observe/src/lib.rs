@@ -191,6 +191,23 @@ impl ShardCountersCell {
     pub fn set_keyspace_keys(&self, keys: u64) {
         self.keyspace_keys.store(keys, Ordering::Relaxed);
     }
+
+    /// Zero the RESETTABLE stat counters (`CONFIG RESETSTAT`, #531): the eviction / expiry /
+    /// keyspace hit-miss totals and the command / connection COUNTERS, the SAME set Redis
+    /// `resetServerStats` clears. It DELIBERATELY leaves `connected_clients` (a live gauge, not a
+    /// since-reset stat) and `keyspace_keys` (a live key-count gauge) untouched, matching
+    /// [`ShardCounters::apply`]'s per-shard reset. The registry fans this across EVERY cell so a
+    /// NODE-WIDE INFO rollup ([`MetricsRegistry::aggregate`]) actually zeroes -- see
+    /// [`MetricsRegistry::reset_stats`]; each store is `Relaxed` (independent monotonic tallies,
+    /// the same relaxation the increments use).
+    pub fn reset_stats(&self) {
+        self.evicted_keys.store(0, Ordering::Relaxed);
+        self.expired_keys.store(0, Ordering::Relaxed);
+        self.keyspace_hits.store(0, Ordering::Relaxed);
+        self.keyspace_misses.store(0, Ordering::Relaxed);
+        self.commands_processed.store(0, Ordering::Relaxed);
+        self.connections_received.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Per-shard counters. Each shard owns one of these and mutates it with no LOCK (its single
@@ -293,12 +310,10 @@ impl ShardCounters {
     /// since-reset stat), matching Redis (RESETSTAT leaves connected_clients alone).
     pub fn apply(&mut self, d: CounterDeltas) {
         if d.reset_stats {
-            self.cell.evicted_keys.store(0, Ordering::Relaxed);
-            self.cell.expired_keys.store(0, Ordering::Relaxed);
-            self.cell.keyspace_hits.store(0, Ordering::Relaxed);
-            self.cell.keyspace_misses.store(0, Ordering::Relaxed);
-            self.cell.commands_processed.store(0, Ordering::Relaxed);
-            self.cell.connections_received.store(0, Ordering::Relaxed);
+            // The SERVING shard's per-shard reset (the same resettable set Redis clears). On a
+            // multi-shard node the serve loop ALSO fans the reset across every OTHER shard's cell
+            // via [`MetricsRegistry::reset_stats`], so the node-wide INFO rollup zeroes (#531).
+            self.cell.reset_stats();
         }
         if d.evicted != 0 {
             self.cell
@@ -394,6 +409,19 @@ impl MetricsRegistry {
     #[must_use]
     pub fn per_shard_snapshots(&self) -> Vec<CounterSnapshot> {
         self.cells.iter().map(|c| c.snapshot()).collect()
+    }
+
+    /// `CONFIG RESETSTAT` NODE-WIDE (#531): zero the resettable stat counters of EVERY shard's
+    /// cell, so an INFO rollup read through [`Self::aggregate`] reports zeroed totals. Since INFO's
+    /// `# Stats`/`# Clients` counters are now the node-wide sum, a reset that touched only the
+    /// SERVING shard would leave every sibling shard's stale totals in the rollup; this fans the
+    /// reset across all cells. Lock-free (per-cell `Relaxed` stores); under concurrent traffic a
+    /// racing increment on another shard may survive, which is the inherent, acceptable fuzziness
+    /// of a stats reset on a sharded node (there is no global stop-the-world).
+    pub fn reset_stats(&self) {
+        for c in self.cells.iter() {
+            c.reset_stats();
+        }
     }
 }
 
