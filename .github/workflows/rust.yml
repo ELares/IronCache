@@ -214,9 +214,21 @@ jobs:
       # enough for a merge gate; libFuzzer exits non-zero (fails the job) on the
       # first panic/timeout/OOM. A longer nightly campaign (e.g. -max_total_time=900
       # on a schedule) is a reasonable future add; this job is the per-PR floor.
+      #
+      # `--target x86_64-unknown-linux-gnu` is EXPLICIT: libFuzzer's sanitizer
+      # instrumentation is incompatible with a statically linked libc, and cargo-fuzz
+      # otherwise picked up a musl target here ("sanitizer is incompatible with
+      # statically linked libc" / "can't find crate for std"). The gnu target is the
+      # runner host and has a dynamic libc, so the sanitizer links.
+      #
+      # The workspace sets RUSTFLAGS="-D warnings" globally; cargo-fuzz APPENDS its
+      # own sanitizer -Cllvm-args to RUSTFLAGS, and the fuzz crate's generated harness
+      # is not warning-clean under `-D warnings`, so unset it for this job only.
       - name: cargo fuzz run decode (bounded)
         working-directory: fuzz
-        run: cargo +nightly fuzz run decode -- -max_total_time=60 -rss_limit_mb=4096
+        env:
+          RUSTFLAGS: ""
+        run: cargo +nightly fuzz run decode --target x86_64-unknown-linux-gnu -- -max_total_time=60 -rss_limit_mb=4096
 
   invariant-lints:
     name: invariant lints (INVARIANTS.md)
