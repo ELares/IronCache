@@ -225,11 +225,25 @@ release.
   its own port) so a cluster-aware client routes each key straight to the owning shard, eliminating
   the internal cross-shard hop. This PR wires the mode declaration + validation only (it requires
   `cluster_enabled` and rejects a `cluster_topology`, since owners derive from the shard count; it is
-  mutually exclusive with the raft governance mode). At boot the node auto-owns ALL 16384 slots as a
-  single-node cluster, so it SERVES every key immediately (no manual `CLUSTER ADDSLOTS`) -- it is
-  functionally a single-node cluster today. The per-shard distinct-port listeners and the N-shard
-  `CLUSTER SLOTS` projection that actually ELIMINATE the internal cross-shard hop are follow-up
-  changes; until they land the mode gives correct answers with the hop NOT yet eliminated.
+  mutually exclusive with the raft governance mode). The node binds one listener PER shard at
+  `port + i` and its `CLUSTER SLOTS` / `SHARDS` / `NODES` advertise the N shards as N contiguous
+  hashslot owners at those ports (the SAME `slot_to_shard` partition the internal router uses). A
+  cluster-aware client therefore dials each key's owner port, the connection homes on the owning
+  shard, and the internal cross-shard hop is ELIMINATED; a key sent to the wrong port gets a `-MOVED`
+  to the owner's port, so the client converges to zero hops. It boots healthy (`cluster_state:ok`,
+  all 16384 slots assigned) with no manual `CLUSTER ADDSLOTS`. Like any Redis Cluster, it requires a
+  cluster-aware client: a plain client pinned to one port is served only for the keys that port owns
+  and is MOVED for the rest. NOTE: shard-owners mode currently requires the tokio runtime (the
+  io_uring per-shard listeners are a follow-up) and is incompatible with systemd socket activation
+  (which supplies one inherited socket, but the mode needs N distinct ports) -- both are rejected at
+  boot rather than mis-bound; the per-shard port block `port .. port + shards - 1` must also fit
+  within 65535, validated at config load. KNOWN DIVERGENCE (documented, follow-up tracked): the
+  whole-keyspace commands (KEYS / SCAN / DBSIZE / RANDOMKEY / FLUSHDB / FLUSHALL) are exempt from
+  cluster redirect and fan out across ALL internal shards on WHICHEVER per-shard port they arrive at.
+  A real Redis Cluster node answers those only for ITS OWN slots, so a cluster-aware tool that
+  aggregates per node (for example a per-node DBSIZE sum) will over-count by the shard factor N. The
+  data-path semantics (keyed commands, MOVED, CROSSSLOT) match Redis Cluster; only the whole-keyspace
+  aggregation scope differs.
 
 - Benchmarks now compare against the LATEST Redis (8.x), not the distro-packaged 7.x, and the README
   gains a higher-core scaling run (16-vCPU AWS Graviton, `redis-benchmark`, Redis 8.8.0 vs IronCache

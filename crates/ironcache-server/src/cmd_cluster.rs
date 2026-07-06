@@ -587,7 +587,10 @@ fn parse_slot_ranges(args: &[bytes::Bytes], cmd: &str) -> Result<Vec<u16>, Error
 /// MEET'd node is addressable by `SETSLOT` / `FORGET` before gossip learns its real id (slice 3b).
 /// DOCUMENTED DIVERGENCE: real Redis learns the peer's actual id over the cluster bus; with no bus
 /// in slice 3 we derive a stable id from `host:port` (FNV-1a over the endpoint, hex-padded to 40).
-fn synth_node_id(host: &str, port: u16) -> String {
+///
+/// Also used by the #517 shard-owner projection (serve.rs boot) to give synthetic per-shard nodes
+/// (shard 1..N at `base+i`) stable, distinct ids consistent with a future `CLUSTER MEET`.
+pub fn synth_node_id(host: &str, port: u16) -> String {
     // FNV-1a 64-bit over "host:port" (deterministic, no rand/time, ADR-0003), rendered as hex and
     // repeated to fill the 40-hex node-id width.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
