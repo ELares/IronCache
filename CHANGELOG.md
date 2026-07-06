@@ -47,6 +47,13 @@ release.
 
 ### Changed
 
+- Rewrote `CONTRIBUTING.md` for the implementation phase (#536). It no longer claims "there is no
+  implementation code yet"; it now documents the real clone-to-green-tests flow (pinned toolchain via
+  `rust-toolchain.toml`, `cargo build`/`cargo test`), the actual merge gates (`rust.yml` fmt / clippy
+  pedantic / test / MSRV 1.85 / musl / io_uring / invariant lints / cargo-deny, plus differential,
+  driver-matrix, docs ADR-index, and the non-blocking adr-governance workflows), the ADR-0003
+  determinism rule and its invariant lint, the docker Linux dev loop for the io_uring datapath, and
+  ADR + design-doc governance.
 - The internal key-to-shard owner is now ALIGNED to the client-visible CRC16 cluster slot
   (`owner_shard(key) = slot_to_shard(key_slot(key), n)`, a contiguous partition), replacing the old
   raw-key FNV-1a `hash64(key) % n`. This is the foundation of issue #517 (eliminating the cross-shard
