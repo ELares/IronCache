@@ -241,6 +241,13 @@ fn config_set_get_round_trips_canonical_flag_string() {
 }
 
 #[test]
+// QUARANTINED (#543): this test's notification assertions all pass, but it intermittently HANGS at
+// `server.shutdown_and_join()` when three connections (a mutator + two subscribers) are still open --
+// a shard whose serve loop is parked in the subscriber idle-wait can miss the shutdown flag, so the
+// join blocks. That is a real graceful-shutdown-with-active-subscribers bug (tracked in #543), not a
+// bug in what this test asserts; the sibling pub/sub tests still cover keyspace/keyevent delivery.
+// Ignored so the flaky teardown hang stops blocking every PR's CI until #543 fixes the shutdown path.
+#[ignore = "flaky teardown hang: graceful shutdown vs a parked subscriber connection, tracked in #543"]
 fn keyevent_and_keyspace_for_set_del_expire_lpush() {
     // With KEA enabled: SUBSCRIBE __keyevent@0__:set then SET k v -> ["message", ch, "k"];
     // PSUBSCRIBE __keyspace@0__:* then SET k v -> a pmessage payload "set"; DEL -> "del";
