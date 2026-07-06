@@ -70,7 +70,10 @@
 
 pub mod format;
 
-pub use format::{Manifest, ShardManifestEntry, crc32, manifest_path, shard_file_name, shard_path};
+pub use format::{
+    Manifest, ShardManifestEntry, SnapshotLoadError, crc32, manifest_path, shard_file_name,
+    shard_path,
+};
 
 use std::io;
 use std::path::Path;
@@ -225,6 +228,51 @@ pub fn write_manifest(
 pub fn read_manifest(dir: &Path) -> Option<Manifest> {
     let bytes = format::read_file(&format::manifest_path(dir))?;
     Manifest::decode(&bytes)
+}
+
+/// CHECK, ONCE at node boot, whether the committed snapshot in `dir` is one THIS binary can load,
+/// surfacing a version it CANNOT read LOUDLY (a `tracing::error!` + a classified
+/// [`SnapshotLoadError`]) instead of the pre-#530 behavior of silently starting with an EMPTY
+/// keyspace. Call this BEFORE the per-shard [`load_shard_resharded`] so the loud signal fires exactly
+/// ONCE per node (the per-shard load stays silent-on-mismatch, which is correct because this node-level
+/// gate has already reported it).
+///
+/// Returns:
+/// - `Ok(())` -- there is no committed manifest (a fresh / empty data dir), the manifest is unreadable
+///   / torn / foreign (all "start empty" degradations, unchanged), OR it is a manifest at the version
+///   this binary reads. The per-shard load then proceeds normally.
+/// - `Err(`[`SnapshotLoadError::UnknownVersion`]`)` -- the committed manifest records a format version
+///   this binary does not support (almost always a NEWER dump an OLDER binary is loading: a downgrade
+///   or a failed-upgrade rollback). The boot path decides POLICY: log-and-continue (start empty, but
+///   no longer SILENTLY) or FAIL CLOSED (refuse to boot, `refuse_empty_start_on_version_mismatch`).
+///   Either way this function has ALREADY emitted the `tracing::error!`, so the discard is never
+///   silent.
+///
+/// The loud log lives HERE (co-located with detection) rather than only at the call site, so ANY
+/// caller of the boot check inherits the never-silent guarantee STRUCTURALLY, not by remembering to
+/// log. `tracing` is a log facade, not a clock / RNG, so this does not touch the ADR-0003 seam.
+///
+/// # Errors
+///
+/// [`SnapshotLoadError::UnknownVersion`] when the committed manifest's format version is unsupported.
+pub fn check_snapshot_loadable(dir: &Path) -> Result<(), SnapshotLoadError> {
+    let Some(bytes) = format::read_file(&format::manifest_path(dir)) else {
+        return Ok(()); // no committed manifest: a genuinely empty / first boot, nothing to load.
+    };
+    match format::classify_manifest_version(&bytes) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                dir = %dir.display(),
+                "ironcache: the on-disk snapshot has an unsupported format version and will NOT be \
+                 loaded; the node would start with an EMPTY keyspace (set \
+                 refuse_empty_start_on_version_mismatch = true to fail closed and refuse to boot \
+                 instead of discarding the on-disk data)"
+            );
+            Err(err)
+        }
+    }
 }
 
 /// Read + CRC-validate one shard's committed snapshot file, returning its RECORD BODY bytes, or
@@ -703,6 +751,118 @@ mod tests {
             loaded, 0,
             "the torn (crashed) file is rejected, never corrupt-loaded"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `tracing_subscriber::fmt` WRITER that appends every formatted event to a shared buffer, so a
+    /// test can assert an expected log event actually FIRED (in-process, no global logger installed).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// THE #530 ACCEPTANCE TEST: a committed manifest at `FORMAT_VERSION + 1` (a downgrade / a
+    /// failed-upgrade rollback -- an older binary asked to load a newer dump) makes the boot check
+    /// (1) return a CLASSIFIED [`SnapshotLoadError::UnknownVersion`] rather than the old SILENT
+    /// no-snapshot, and (2) emit a LOUD `tracing::error!`, so the all-data discard is never silent.
+    #[test]
+    fn newer_version_snapshot_fails_loud_not_silent_empty() {
+        let dir = temp_dir("version-mismatch");
+        // Write a committed manifest at FORMAT_VERSION + 1, encoded exactly as a real save would (so
+        // magic + trailing CRC are VALID -- this is a well-formed dump this binary just cannot read).
+        let manifest = Manifest {
+            version: format::FORMAT_VERSION + 1,
+            shards: 1,
+            save_id: 1,
+            save_unix_secs: 1_700_000_000,
+            entries: vec![ShardManifestEntry {
+                shard: 0,
+                file: shard_file_name(0),
+                keys: 5,
+                crc: 0x1234_5678,
+            }],
+        };
+        format::write_file_atomic(&format::manifest_path(&dir), &manifest.encode())
+            .expect("write the newer-version manifest");
+
+        // Capture tracing output on THIS thread while the boot check runs (no global logger).
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buf)))
+            .finish();
+        let result =
+            tracing::subscriber::with_default(subscriber, || check_snapshot_loadable(&dir));
+
+        // (1) The load path returns a CLASSIFIED error -- NOT a silent empty start.
+        assert_eq!(
+            result,
+            Err(SnapshotLoadError::UnknownVersion {
+                found: format::FORMAT_VERSION + 1,
+                supported: format::FORMAT_VERSION,
+            }),
+            "a newer-version dump is a classified error, not silent empty"
+        );
+
+        // (2) The LOUD error log FIRED: an ERROR-level event naming the unsupported version.
+        let logged = String::from_utf8(buf.lock().expect("capture buffer lock").clone())
+            .expect("captured log is utf8");
+        assert!(
+            logged.contains("ERROR"),
+            "an ERROR-level event was emitted (never silent): {logged:?}"
+        );
+        assert!(
+            logged.contains("unsupported format version"),
+            "the version-mismatch log fired: {logged:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A clean data dir (no manifest) and a manifest at the SUPPORTED version both pass the boot check
+    /// (`Ok`): the loud path is reserved strictly for a well-formed UNKNOWN version, so a normal boot
+    /// is byte-unchanged.
+    #[test]
+    fn loadable_snapshot_and_empty_dir_pass_the_boot_check() {
+        let dir = temp_dir("version-ok");
+        // No manifest yet -> Ok (a fresh / empty data dir).
+        assert_eq!(check_snapshot_loadable(&dir), Ok(()));
+
+        // A committed manifest at the CURRENT version -> Ok (the per-shard load handles it normally).
+        let manifest = Manifest {
+            version: format::FORMAT_VERSION,
+            shards: 1,
+            save_id: 1,
+            save_unix_secs: 1,
+            entries: vec![ShardManifestEntry {
+                shard: 0,
+                file: shard_file_name(0),
+                keys: 1,
+                crc: 0,
+            }],
+        };
+        format::write_file_atomic(&format::manifest_path(&dir), &manifest.encode())
+            .expect("write a current-version manifest");
+        assert_eq!(check_snapshot_loadable(&dir), Ok(()));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

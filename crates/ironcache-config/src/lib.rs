@@ -626,6 +626,17 @@ pub struct Config {
     /// (`cluster_tls_insecure_skip_verify = true`) + the `IRONCACHE_CLUSTER_TLS_INSECURE_SKIP_VERIFY`
     /// env var.
     pub cluster_tls_insecure_skip_verify: bool,
+    /// FAIL CLOSED when the on-disk snapshot ([`Self::data_dir`]) has a format version this binary
+    /// CANNOT read (#530). By default (`false`) a version-mismatched dump -- almost always a NEWER
+    /// dump an OLDER binary is asked to load (a downgrade / a failed-upgrade rollback) -- is NOT
+    /// loaded and the node starts with an EMPTY keyspace, but the mismatch is now surfaced with a
+    /// LOUD boot-time `tracing::error!` (it is never silent). With this `true` the node REFUSES TO
+    /// BOOT on such a dump instead, so an operator who would rather halt than silently serve an empty
+    /// keyspace (and risk overwriting the newer dump on the next save) can fail closed. Inert with no
+    /// `data_dir` or when the dump is loadable / genuinely absent. TOML
+    /// (`refuse_empty_start_on_version_mismatch = true`) + the
+    /// `IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH` env var.
+    pub refuse_empty_start_on_version_mismatch: bool,
 }
 
 impl Default for Config {
@@ -747,6 +758,10 @@ impl Default for Config {
             // Peer-cert verification is ON by default when cluster TLS is on (a CA is required, so
             // the secret is never exposed to a MITM). This insecure escape hatch is opt-in only.
             cluster_tls_insecure_skip_verify: false,
+            // A format-version-mismatched snapshot is NOT loaded (start empty) but is surfaced with a
+            // LOUD boot error (#530); refusing to boot on it is the opt-in fail-closed posture, OFF by
+            // default so a mismatch degrades to a loud empty start rather than a boot failure.
+            refuse_empty_start_on_version_mismatch: false,
         }
     }
 }
@@ -1520,6 +1535,11 @@ pub struct ConfigOverlay {
     /// (`cluster_tls_insecure_skip_verify = true`) + the `IRONCACHE_CLUSTER_TLS_INSECURE_SKIP_VERIFY`
     /// env var. `None` leaves the lower layer (default `false`, peer cert is verified against the CA).
     pub cluster_tls_insecure_skip_verify: Option<bool>,
+    /// Fail closed on a format-version-mismatched on-disk snapshot (#530). TOML
+    /// (`refuse_empty_start_on_version_mismatch = true`) + the
+    /// `IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH` env var. `None` leaves the lower layer
+    /// (default `false`, log loudly + start empty rather than refusing to boot).
+    pub refuse_empty_start_on_version_mismatch: Option<bool>,
 }
 
 impl ConfigOverlay {
@@ -1810,6 +1830,15 @@ impl ConfigOverlay {
                     reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
                 })?);
         }
+        // FAIL CLOSED on a version-mismatched snapshot is a boolean (#530). An unrecognized token
+        // hard-fails boot rather than silently leaving the posture off.
+        if let Ok(v) = std::env::var("IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH") {
+            o.refuse_empty_start_on_version_mismatch =
+                Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
+                    field: "refuse-empty-start-on-version-mismatch",
+                    reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
+                })?);
+        }
         // PERSISTENCE save-policy knobs (#58, single scalars, env-encodable for per-pod injection).
         // Both are meaningful only when a data_dir is set; a malformed value hard-fails boot rather
         // than silently picking a default (mirrors the other numeric knobs above).
@@ -1991,6 +2020,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.cluster_tls_insecure_skip_verify {
             cfg.cluster_tls_insecure_skip_verify = v;
+        }
+        if let Some(v) = self.refuse_empty_start_on_version_mismatch {
+            cfg.refuse_empty_start_on_version_mismatch = v;
         }
         Ok(())
     }
@@ -2454,6 +2486,24 @@ mod tests {
             .unwrap();
         assert_eq!(o.save_interval_secs, Some(300));
         assert_eq!(o.save_min_changes, Some(10));
+    }
+
+    #[test]
+    fn refuse_empty_start_on_version_mismatch_parses_and_defaults_off() {
+        // The fail-closed snapshot-version knob (#530) folds in from an overlay; an unset overlay
+        // leaves the default `false` (log loudly + start empty, byte-unchanged boot posture).
+        let on = Config::resolve(&[ConfigOverlay {
+            refuse_empty_start_on_version_mismatch: Some(true),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert!(on.refuse_empty_start_on_version_mismatch);
+        let off = Config::resolve(&[ConfigOverlay::default()]).unwrap();
+        assert!(!off.refuse_empty_start_on_version_mismatch);
+        // TOML deserializes the boolean directly into the Option<bool> overlay field.
+        let o = ConfigOverlay::from_toml_str("refuse_empty_start_on_version_mismatch = true\n")
+            .unwrap();
+        assert_eq!(o.refuse_empty_start_on_version_mismatch, Some(true));
     }
 
     #[test]

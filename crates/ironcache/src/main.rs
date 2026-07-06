@@ -181,6 +181,26 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
         "ironcache: binding"
     );
 
+    // SNAPSHOT FORMAT-VERSION GUARD (#530): before we bind any port, check ONCE (at the node level)
+    // whether the committed on-disk snapshot is a format version THIS binary can read. A dump written
+    // by a NEWER binary (a downgrade / a failed-upgrade rollback) would otherwise be silently ignored
+    // and the node would boot with an EMPTY keyspace -- then the next save could OVERWRITE the newer
+    // dump, losing everything. `check_snapshot_loadable` emits a LOUD `tracing::error!` on such a
+    // mismatch (so it is never silent), and here we FAIL CLOSED (refuse to boot) when the operator
+    // opted in via `refuse_empty_start_on_version_mismatch`. With no `data_dir`, a genuinely absent
+    // dump, or a loadable version this is a no-op (boot is byte-unchanged).
+    if let Some(dir) = cfg.data_dir.as_deref() {
+        if let Err(e) = ironcache_persist::check_snapshot_loadable(dir) {
+            if cfg.refuse_empty_start_on_version_mismatch {
+                return Err(anyhow::Error::new(e).context(
+                    "refusing to boot: the on-disk snapshot has an unsupported format version and \
+                     refuse_empty_start_on_version_mismatch is set (fail closed rather than start \
+                     with an empty keyspace)",
+                ));
+            }
+        }
+    }
+
     // OUT-OF-BAND METRICS / HEALTH (OBSERVABILITY.md, #152). Enabled ONLY when `--metrics-addr`
     // is set: build the per-shard counter registry (sized to the shard count, adopted by each
     // shard at boot) and the liveness / readiness flags, boot the server with the registry
