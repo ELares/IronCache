@@ -46,8 +46,16 @@ protocol still permits a reply, or disconnects immediately where it does not.
 
 ## Acceptance and test hooks
 
-- cargo-fuzz targets on the RESP2/RESP3 parser cover multibulk-count overflow,
-  bulk-length overflow, dribbled incomplete frames, and deep nesting (#95).
+- A cargo-fuzz target (`fuzz/fuzz_targets/decode.rs`, #534/#95) feeds arbitrary
+  bytes to the request decoder `ironcache_protocol::decode` and asserts it never
+  panics (release is `panic = "abort"`, so a decode panic is a whole-process crash).
+  It runs both the production `Limits::default()` caps and a tightened set, so the
+  multibulk-count-overflow, bulk-length-overflow, and inline-length rejection
+  branches are reachable; dribbled incomplete frames return `Incomplete` without
+  panic. It runs BOUNDED per PR (`-max_total_time=60`) in the `fuzz` job of
+  rust.yml, Linux, seeded from `fuzz/corpus/decode/`. Deep RESP3 aggregate nesting
+  is not on the request-decode path (requests are a flat multibulk of bulk strings);
+  the nesting-depth cap in "Open questions" awaits the reply/streamed-type surface.
 - A test asserts each limit triggers its protocol-error/disconnect contract and
   bumps the metric, and that no legitimate mainstream-client request trips a
   default limit.

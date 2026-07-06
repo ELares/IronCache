@@ -387,6 +387,16 @@ fn decode_and_skip_attribute(input: &[u8], limits: &Limits) -> FrameStep {
     if pairs < 0 {
         return FrameStep::Error(ErrorReply::protocol("invalid attribute length"));
     }
+    // Bound `pairs` by the multibulk element cap (#138) BEFORE forming the element
+    // count `pairs * 2`. Without this, a header like `|7177777777777777774\r\n`
+    // (a near-i64::MAX pair count) makes `pairs * 2` overflow i64: a decode panic
+    // under overflow checks (which, on the `panic = "abort"` server, is a
+    // whole-process crash) and a silent wrap otherwise. A legitimate attribute
+    // carries a handful of pairs, so this cap never trips a real client but keeps
+    // the multiply and the skip loop finite. Found by the parser fuzz gate (#534).
+    if pairs > limits.max_multibulk {
+        return FrameStep::Error(ErrorReply::protocol("invalid attribute length"));
+    }
     // Skip 2*pairs bulk strings. Attributes are client->server rare; we only need
     // to consume them. Each element here is expected to be a bulk string.
     let mut pos = crlf + 2;
@@ -581,6 +591,19 @@ mod tests {
         let buf = b"|1\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*1\r\n$4\r\nPING\r\n";
         let (args, _) = complete(buf);
         assert_eq!(args, vec![b"PING".to_vec()]);
+    }
+
+    #[test]
+    fn huge_attribute_count_is_error_not_overflow_panic() {
+        // Regression (#534, parser fuzz gate): an attribute header whose pair count is
+        // near i64::MAX overflowed the `pairs * 2` element-count multiply, PANICKING the
+        // decoder under overflow checks (a whole-process crash on the panic=abort
+        // server). It must now be a bounded protocol error, never a panic. This exact
+        // input is the crash the libFuzzer target `fuzz/fuzz_targets/decode.rs` found.
+        match decode(b"|7177777777777777774\r\n$", &Limits::default()) {
+            DecodeOutcome::Error(e) => assert!(e.line().contains("invalid attribute length")),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     // -- Regression: no-op-frame skipping is iterative (O(1) stack), not

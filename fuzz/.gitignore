@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# cargo-fuzz build + run artifacts. The SEED corpus under corpus/decode/ IS
+# tracked (it is the checked-in starting point for the gate); only the generated
+# build tree, crash artifacts, coverage data, and the standalone lockfile are
+# ignored.
+target/
+artifacts/
+coverage/
+Cargo.lock

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# cargo-fuzz harness crate for the RESP request decoder (#534, #95, #138).
+#
+# STANDALONE by design: this crate declares its OWN empty `[workspace]` table
+# below, and the root Cargo.toml `exclude`s `fuzz/`. Together that fully detaches
+# it from the IronCache virtual workspace, so `cargo build --workspace`, the MSRV
+# (1.85) gate, the musl static build, and the cargo-deny scan over the workspace
+# Cargo.lock are ALL unaffected: `libfuzzer-sys` never enters the workspace graph
+# or lock. It is built ONLY by `cargo +nightly fuzz build` in the dedicated CI job.
+#
+# `libfuzzer-sys` is MIT OR Apache-2.0 (dual, matching the workspace posture); since
+# the crate is excluded from the workspace it does not touch the deny.toml allowlist.
+[package]
+name = "ironcache-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Zeke <ezequiel.lares@outlook.com>"]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The crate under test, by PATH (never a version): the decoder we are fuzzing.
+ironcache-protocol = { path = "../crates/ironcache-protocol" }
+
+# Empty table => this crate is its OWN workspace root, detached from the parent
+# virtual workspace. Belt-and-suspenders with the root `exclude = ["fuzz"]`.
+[workspace]
+
+# Keep light debug info in the fuzz binary so a crash gives a readable backtrace
+# without paying full -Cdebuginfo=2 build cost.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false

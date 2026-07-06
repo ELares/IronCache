@@ -36,6 +36,15 @@ members = [
     "crates/ironcache-bench",
     "crates/ironcache-console",
 ]
+# The cargo-fuzz harness crate (#534) is a STANDALONE crate, deliberately NOT a
+# workspace member: its libFuzzer dependency needs a nightly toolchain and must
+# never enter the workspace build/lock. Excluding it here (it also declares its own
+# empty `[workspace]`) keeps `cargo build --workspace`, the MSRV/musl gates, and the
+# cargo-deny scan over the workspace Cargo.lock byte-for-byte unaffected. It builds
+# only under `cargo +nightly fuzz build` in the dedicated `fuzz` CI job.
+exclude = [
+    "fuzz",
+]
 
 [workspace.package]
 edition = "2024"

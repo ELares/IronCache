@@ -68,12 +68,27 @@ in #99/#100).
 
 ### Parser fuzz gate
 
-- A cargo-fuzz/libFuzzer CI fuzz-gate runs on the RESP2/RESP3 parser, the corpus
-  seeded from captured frames. Coverage targets the adversarial edges:
-  multibulk-length overflow, inline commands, RESP3 push/attribute frames, and
-  streamed types [resp-type-prefixes][bulk-string-max-512mb]; this complements the
-  per-frame size limits in #138. Crashing inputs are archived as regression seeds.
-  AFL++ is an optional second engine for longer campaigns, not a CI gate.
+- A cargo-fuzz/libFuzzer target (`fuzz/fuzz_targets/decode.rs`, #534) feeds
+  arbitrary bytes to the request decoder `ironcache_protocol::decode` (the RESP
+  request frame parser) and asserts it NEVER panics: because the release profile is
+  `panic = "abort"`, a single missed decode panic is an uncatchable whole-process
+  crash (a remote parser DoS), so "does not panic on any input" is the property the
+  gate proves. It runs both the production `Limits::default()` hardening caps and a
+  tightened set, so the size-limit rejection branches (#138) are reachable from
+  small inputs. It exercises the decoder's real input surface: multibulk arrays and
+  their length/bulk-length edges, inline commands (quoting), and the tolerated
+  RESP3 attribute frame (`|n...`); RESP3 push and streamed aggregate types are a
+  reply/encode concern and are not on the request-decode path (a possible future
+  target, see Open decisions).
+- The corpus is a small committed seed set of valid RESP frames under
+  `fuzz/corpus/decode/`; libFuzzer mutates from there. The fuzz crate is STANDALONE
+  (excluded from the workspace, its own nightly toolchain), so it does not affect
+  `cargo build --workspace`, the MSRV/musl gates, or the cargo-deny scan.
+- The gate runs BOUNDED per PR (`cargo fuzz run decode -- -max_total_time=60`) in
+  the `fuzz` job of `.github/workflows/rust.yml` on Linux. A longer scheduled
+  campaign is a reasonable future add; a crash is reproducible and is minimized into
+  `fuzz/corpus/decode/` as a regression seed. AFL++ is an optional second engine for
+  longer offline campaigns, not a CI gate.
 
 ### Property tests and deterministic simulation (DST)
 
@@ -94,8 +109,9 @@ in #99/#100).
   encodings and shim the suite (encoding assertions either map or are
   compatibility-shimmed).
 - The pinned Valkey tag and the drift-tracking cadence as upstream evolves.
-- Fuzz coverage beyond the request decoder (inline, RESP3 push/attributes,
-  streamed types) and the milestone where the DST cost crosses over.
+- Fuzz coverage beyond the request decoder (which the #534 `decode` target now
+  gates): the reply/encode path and RESP3 push/streamed aggregate types, plus a
+  longer scheduled campaign, and the milestone where the DST cost crosses over.
 
 ## Acceptance and test hooks
 
@@ -106,9 +122,12 @@ in #99/#100).
 - A pinned Valkey tag runs as the differential oracle in CI, failing on any
   byte-level reply divergence; divergences emit reproducible seed+trace artifacts
   [valkey-resp-identical][valkey-version-landscape-2026].
-- The cargo-fuzz gate covers multibulk-length overflow, inline commands, and RESP3
-  frames [resp-type-prefixes][bulk-string-max-512mb], with archived crashing
-  inputs.
+- The cargo-fuzz target (`fuzz/fuzz_targets/decode.rs`) runs BOUNDED per PR
+  (`-max_total_time=60`, the `fuzz` job in rust.yml) over `ironcache_protocol::
+  decode`, seeded from `fuzz/corpus/decode/`, asserting no input panics the decoder;
+  it covers multibulk-length/bulk-length edges, inline commands, and the tolerated
+  RESP3 attribute frame [resp-type-prefixes][bulk-string-max-512mb], and a crash is
+  minimized into the corpus as a regression seed.
 - A seeded DST run replays byte-identically through the Env seam
   [dst-fdb-tigerbeetle-single-seed]; the build-vs-buy decision is recorded with its
   runtime-determinism implication.
