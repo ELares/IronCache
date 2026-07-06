@@ -13,21 +13,12 @@
 //! with no internal hop).
 
 use ironcache::test_support::run_shard_owners_node_for_test;
-use std::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 async fn connect_retry(port: u16) -> TcpStream {
     for _ in 0..50 {
@@ -59,8 +50,7 @@ async fn send_read(c: &mut TcpStream, frame: &str) -> Vec<u8> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn shard_owners_mode_owns_all_slots_and_serves_keys() {
-    let port = free_port();
-    let _node = run_shard_owners_node_for_test(port, 4);
+    let (_node, port) = run_shard_owners_node_for_test(4);
     let mut c = connect_retry(port).await;
 
     // CLUSTER INFO must report a HEALTHY cluster (all 16384 slots owned by this single node), NOT
@@ -85,11 +75,10 @@ async fn shard_owners_mode_owns_all_slots_and_serves_keys() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn shard_owners_binds_one_serving_listener_per_shard() {
-    // PR3: 4 shards -> the node binds 4 listeners (base_port .. base_port + 3). Pick a base with
-    // headroom so base + 3 cannot collide with an ephemeral port already in use.
+    // PR3: 4 shards -> the node binds 4 listeners (base .. base + 3). The helper reserves a
+    // CONTIGUOUS free block and retries on a bind race, so this is robust under parallel test load.
     const SHARDS: u16 = 4;
-    let base = free_port();
-    let _node = run_shard_owners_node_for_test(base, SHARDS as usize);
+    let (_node, base) = run_shard_owners_node_for_test(SHARDS as usize);
 
     // EVERY per-shard port must be independently bound AND serve keys (a connection to `base + i`
     // homes on shard `i`; the single-node-owns-all map means it serves any key, via a local hit or
