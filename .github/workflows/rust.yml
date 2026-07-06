@@ -205,8 +205,11 @@ jobs:
           # The fuzz crate has its own target/lock; cache them under a distinct key
           # so it does not collide with the stable-toolchain workspace caches.
           workspaces: "fuzz -> fuzz/target"
-      # Prebuilt cargo-fuzz binary (fast; avoids a from-source `cargo install`).
-      - uses: taiki-e/install-action@cargo-fuzz
+      # Prebuilt cargo-fuzz binary (fast; avoids a from-source `cargo install`). The explicit
+      # `tool:` form is used (the bare `@cargo-fuzz` ref does not put the binary on PATH).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       # Bounded per-PR budget: a 60s campaign seeded from fuzz/corpus/decode/. Fast
       # enough for a merge gate; libFuzzer exits non-zero (fails the job) on the
       # first panic/timeout/OOM. A longer nightly campaign (e.g. -max_total_time=900
