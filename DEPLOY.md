@@ -298,6 +298,10 @@ When `--metrics-addr` is set the server serves on that address:
 - `GET /metrics` -> Prometheus exposition (per-shard counter rollup + process and
   raft gauges). Scrape it directly, or enable the chart's `metrics.serviceMonitor`.
 
+When something is wrong at 3am, [`docs/RUNBOOK.md`](docs/RUNBOOK.md) is the
+symptom-to-action index: every operator-visible error string, log line, and probe
+state, each with what it means, what to check, and how to resolve it.
+
 ### Console HA: stateless replicas behind a load balancer
 
 The IronCache console (issue #352) is designed to run as **N identical stateless
