@@ -312,6 +312,14 @@ pub struct Config {
     pub shards: usize,
     /// Number of logical databases (`SELECT 0..databases-1`). Redis default 16.
     pub databases: u32,
+    /// The number of per-slot store tables each database is partitioned into (#570, the
+    /// bounded-resize tail-latency lever). A MEMORY vs tail-latency tradeoff: more slots
+    /// bound a `hashbrown` all-at-once resize to fewer entries (~N/slots) so the p99.9
+    /// insert stall shrinks, at a small fixed per-touched-DB `Vec` cost. Default 256 (the
+    /// store's [`DEFAULT_SLOTS_PER_DB`](../ironcache_store) safe default, which keeps the
+    /// perf-gate bytes-per-key green). Structural, so restart-required (immutable at
+    /// runtime like `databases`); the store rounds it UP to a power of two. `0` is rejected.
+    pub slots_per_db: u32,
     /// The default protocol for a new connection before `HELLO 3` (always RESP2
     /// per PROTOCOL.md; exposed for completeness/testing).
     pub default_resp3: bool,
@@ -663,6 +671,10 @@ impl Default for Config {
             // runtime crate (and thus tokio) here.
             shards: default_shards(),
             databases: 16,
+            // The store's per-slot partition default (#570): a modest count that bounds the
+            // resize unit to ~N/256 while keeping the perf-gate bytes-per-key green. Mirrors
+            // ironcache-store's DEFAULT_SLOTS_PER_DB.
+            slots_per_db: 256,
             default_resp3: false,
             maxmemory: 0,
             // ADR-0007: cache mode default is eviction-ON with a Redis-recognized
@@ -943,6 +955,12 @@ impl Config {
         if self.databases == 0 {
             return Err(ConfigError::Invalid {
                 field: "databases",
+                reason: "must be at least 1".to_owned(),
+            });
+        }
+        if self.slots_per_db == 0 {
+            return Err(ConfigError::Invalid {
+                field: "slots_per_db",
                 reason: "must be at least 1".to_owned(),
             });
         }
@@ -1436,6 +1454,8 @@ pub struct ConfigOverlay {
     pub shards: Option<usize>,
     /// Database count.
     pub databases: Option<u32>,
+    /// Per-DB store slot count (#570, `store-slots-per-db`): the bounded-resize partition.
+    pub slots_per_db: Option<u32>,
     /// Whether new connections default to RESP3.
     pub default_resp3: Option<bool>,
     /// Memory ceiling as a human size string ("512mb", "1gb", "0").
@@ -1962,6 +1982,9 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.databases {
             cfg.databases = v;
+        }
+        if let Some(v) = self.slots_per_db {
+            cfg.slots_per_db = v;
         }
         if let Some(v) = self.default_resp3 {
             cfg.default_resp3 = v;

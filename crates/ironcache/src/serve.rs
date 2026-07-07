@@ -249,6 +249,12 @@ pub fn run_server_observed(
     // RuntimeConfig cell; INFO reads it from there (PR-4b). One small leak at boot.
     let policy_name: &'static str = Box::leak(config.maxmemory_policy.clone().into_boxed_str());
 
+    // The per-DB store slot partition count (#570): publish the boot config value so EVERY
+    // shard's store is built with it. Set here (before any shard spawns) and read once per
+    // per-shard store construction in `fresh_shard_store`; the store rounds it UP to a power
+    // of two. A process-global boot fact like `policy_name`, off the command hot path.
+    STORE_SLOTS_PER_DB.store(config.slots_per_db as usize, Ordering::Relaxed);
+
     // The cluster node id (CLUSTER_CONTRACT.md #70), leaked to a 'static str at boot exactly
     // like `policy_name`. It is resolved ONCE at the run_server level (NOT per shard) so it is
     // IDENTICAL across every shard, and shared by value via the cloned ServerContext.
@@ -1283,6 +1289,16 @@ pub(crate) fn scan_reserved_bits(total_shards: usize) -> u32 {
     }
 }
 
+/// The per-DB store slot count (#570, `store-slots-per-db`) resolved from the boot config,
+/// defaulting to [`ironcache_store::DEFAULT_SLOTS_PER_DB`]. Set ONCE in `run_server_inner`
+/// before any shard spawns, then read by every per-shard store construction below. A
+/// process-global boot fact (the store-geometry sibling of the leaked `policy_name`), read
+/// once per store build OFF the hot path; the store rounds it up to a power of two. Relaxed
+/// ordering suffices: the boot store happens-before the shard spawn that reads it, and the
+/// value never changes at runtime (it is structurally restart-required, like `databases`).
+static STORE_SLOTS_PER_DB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(ironcache_store::DEFAULT_SLOTS_PER_DB);
+
 /// Build a FRESH [`ShardStoreImpl`] with this shard's configured eviction policy, accounting,
 /// and scan-band width, WITHOUT caching it in the thread-local (unlike [`shard_store`], which
 /// builds-once-and-caches the LIVE store).
@@ -1309,6 +1325,9 @@ pub(crate) fn fresh_shard_store(
     // before the coordinator layer; FIX 1).
     ShardStore::with_hooks(databases, policy, CountingAccounting::new())
         .with_scan_band_bits(reserved_bits)
+        // The per-DB slot partition (#570): the configured (or default) slot count, published
+        // by `run_server_inner` at boot. Bounds a table resize to ~one slot's entries.
+        .with_slots_per_db(STORE_SLOTS_PER_DB.load(Ordering::Relaxed))
 }
 
 pub(crate) fn shard_store(
