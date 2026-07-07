@@ -1,11 +1,21 @@
 # Changelog
 
 All notable changes to IronCache are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project will
-adopt [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it ships a
-release.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adopts
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html) as of the `0.1.0` tag
+(currently in the `0.x` prerelease series, so a minor bump may still carry
+breaking changes until `1.0.0`).
 
 ## [Unreleased]
+
+## [0.1.0]
+
+First tagged release (2026-07-07). IronCache is a Redis-wire-compatible, thread-per-core cache in Rust with
+optional Raft clustering, a deterministic engine (ADR-0003), and an optional Linux io_uring
+datapath. This `0.x` release is a pre-1.0 prerelease: it is stable enough for a trusted-network
+deployment (see PRODUCTION_READINESS.md and the M1 trust-blocker + M2 operator-experience work
+that landed under EPIC #527), but the version is not yet a stability promise. Everything below
+shipped ahead of this tag.
 
 ### Security
 
