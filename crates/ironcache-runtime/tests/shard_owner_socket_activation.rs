@@ -45,7 +45,10 @@ fn shard_owners_rejects_systemd_socket_activation() {
         bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6390),
         shard_owner_ports: true,
     };
-    let serve = |_rt: TokioRuntime, _s: tokio::net::TcpStream, _shard: ShardId| async {};
+    let serve = |_rt: TokioRuntime,
+                 _s: tokio::net::TcpStream,
+                 _shard: ShardId,
+                 _sd: Arc<AtomicBool>| async {};
     let drain = |_idx: usize, _inbox: (), _shutdown: Arc<AtomicBool>| async {};
 
     let result = run_shards(&cfg, serve, vec![(), ()], drain);

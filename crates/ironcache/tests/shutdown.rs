@@ -139,6 +139,65 @@ async fn shutdown_refusals_keep_the_server_up() {
     server.shutdown_and_join().unwrap();
 }
 
+/// #543 REGRESSION: graceful shutdown must be BOUNDED even with active pub/sub subscribers. Each
+/// SUBSCRIBE / PSUBSCRIBE connection leaves its per-connection serve loop PARKED on the subscribe-
+/// mode idle wait -- the exact state that, before the fix, had no `select!` arm a graceful stop
+/// woke, so `shutdown_and_join` blocked on the parked shard-thread join until the drain grace (an
+/// ops hang on a real SIGTERM). The idle wait now races a short poll of the shared shutdown flag,
+/// so a parked subscriber closes within one poll interval. We drive the join on a SEPARATE thread
+/// behind a HARD `recv_timeout` so a regression FAILS FAST here instead of hanging the whole suite.
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_is_bounded_with_active_subscribers() {
+    let port = free_port();
+    let server = run_server_for_test(port, 4); // multi-shard: subscribers spread across cores.
+
+    // A dozen subscriber connections (plain SUBSCRIBE + pattern PSUBSCRIBE), round-robined across
+    // the 4 shards, each parked in the subscribe-mode idle wait. Held open for the whole test so
+    // the point is proven: shutdown must NOT wait on them.
+    let mut subs = Vec::new();
+    for i in 0..6 {
+        let mut c = connect_retry(port).await;
+        let reply = cmd(&mut c, &["SUBSCRIBE", &format!("chan-{i}")]).await;
+        assert!(
+            reply.starts_with(b"*") || reply.starts_with(b">"),
+            "SUBSCRIBE confirmation: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        subs.push(c);
+    }
+    for i in 0..6 {
+        let mut c = connect_retry(port).await;
+        let reply = cmd(&mut c, &["PSUBSCRIBE", &format!("pat-{i}-*")]).await;
+        assert!(
+            reply.starts_with(b"*") || reply.starts_with(b">"),
+            "PSUBSCRIBE confirmation: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        subs.push(c);
+    }
+    // Let the subscriptions register on their home shards and the serve loops settle into the wait.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Join on a dedicated thread (`ShardSet` is `Send`) so a hang trips a bounded `recv_timeout`
+    // rather than wedging the suite. The `recv_timeout` returning `Ok` IS the assertion that
+    // `shutdown_and_join` completed within the 2s bound (no wall-clock read is needed here, keeping
+    // this test off the determinism seam / ADR-0003); a timeout means it hung on a parked subscriber.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let joiner = std::thread::spawn(move || {
+        server.shutdown_and_join().unwrap();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(2)).expect(
+        "#543: shutdown_and_join must return within 2s with active subscribers, not hang on a \
+         parked subscriber serve loop",
+    );
+    joiner.join().unwrap();
+
+    // The subscriber sockets stayed open across the whole shutdown (dropped only now): the fix
+    // closed them from the server side promptly instead of the join waiting on them.
+    drop(subs);
+}
+
 // ---------------------------------------------------------------------------
 // SUBPROCESS exit-path helpers (the binary EXITS, so the test process survives).
 // ---------------------------------------------------------------------------

@@ -172,8 +172,12 @@ mod tokio_bootstrap {
     ///      shutdown flag is set.
     ///
     /// `serve` is cloned per shard and invoked per connection with the shard's
-    /// [`TokioRuntime`], the accepted [`tokio::net::TcpStream`], and the
-    /// [`ShardId`]. It returns a `'static` future (the connection task).
+    /// [`TokioRuntime`], the accepted [`tokio::net::TcpStream`], the [`ShardId`],
+    /// AND the shared shutdown flag (#543): a per-connection serve loop that PARKS
+    /// (e.g. a pub/sub subscriber blocked on its push channel) can then race the
+    /// same flag the acceptor and drain loop watch, so a graceful stop closes it
+    /// PROMPTLY instead of blocking the shard-thread join until the drain grace.
+    /// It returns a `'static` future (the connection task).
     ///
     /// `inboxes` hands each shard ITS OWN cross-shard inbound item by index (the
     /// coordinator's per-shard MPSC receiver, COORDINATOR.md #107): shard `index`
@@ -195,7 +199,10 @@ mod tokio_bootstrap {
         drain: D,
     ) -> std::io::Result<ShardSet>
     where
-        S: Fn(TokioRuntime, tokio::net::TcpStream, ShardId) -> Fut + Clone + Send + 'static,
+        S: Fn(TokioRuntime, tokio::net::TcpStream, ShardId, Arc<AtomicBool>) -> Fut
+            + Clone
+            + Send
+            + 'static,
         Fut: Future<Output = ()> + 'static,
         I: Send + 'static,
         // The drain closure receives THIS shard's index (0-based), its inbox, AND the shared
@@ -496,7 +503,9 @@ mod tokio_bootstrap {
         shard: ShardId,
         shutdown: &Arc<AtomicBool>,
     ) where
-        S: Fn(TokioRuntime, tokio::net::TcpStream, ShardId) -> Fut + Clone + 'static,
+        S: Fn(TokioRuntime, tokio::net::TcpStream, ShardId, Arc<AtomicBool>) -> Fut
+            + Clone
+            + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         // Core-local count of in-flight connection tasks, for the bounded drain.
@@ -527,7 +536,12 @@ mod tokio_bootstrap {
                                     continue;
                                 }
                             };
-                            let fut = serve(TokioRuntime::new(), stream, shard);
+                            // Hand the per-connection serve closure a clone of the SAME shutdown
+                            // flag the acceptor + drain loop watch (#543), so a serve loop that
+                            // parks (e.g. a subscriber idle-waiting on its push channel) can race
+                            // it and close promptly on a graceful stop rather than lingering until
+                            // the drain grace elapses.
+                            let fut = serve(TokioRuntime::new(), stream, shard, Arc::clone(shutdown));
                             // Track this connection for the drain: bump the live
                             // count, and decrement via a drop guard when the task
                             // ends (including on panic).
