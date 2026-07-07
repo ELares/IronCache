@@ -311,8 +311,9 @@ mod tests {
         // key-rotation typo: the pinned key must always be a parseable minisign public key.
         let key = PINNED_UPGRADE_PUBLIC_KEY
             .expect("a production minisign public key is pinned (authenticity-verified upgrades)");
-        MinisignVerifier::new(key)
-            .expect("the pinned PINNED_UPGRADE_PUBLIC_KEY must be a well-formed minisign public key");
+        MinisignVerifier::new(key).expect(
+            "the pinned PINNED_UPGRADE_PUBLIC_KEY must be a well-formed minisign public key",
+        );
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
