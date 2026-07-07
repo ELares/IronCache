@@ -217,11 +217,17 @@ def run_single(port: int) -> None:
 
 
 # --------------------------------------------------------------------------- cluster groups
-def run_cluster(nodes: list[tuple[str, int]]) -> None:
-    mode = "cluster"
+def run_cluster(nodes: list[tuple[str, int]], mode: str = "cluster") -> None:
+    # `mode` labels the RESULT lines and picks the key prefix. The SAME cluster-client body drives
+    # the turnkey 3-node Raft cluster (`mode="cluster"`) AND the #517 single-node SHARD-OWNERS
+    # projection (`mode="shard-owners"`): both expose N slot owners on distinct endpoints that a
+    # cluster-aware client discovers via CLUSTER SLOTS and routes to by following MOVED. The
+    # shard-owners leg proves a real client routes each key to its owning SHARD's port, so the
+    # internal cross-shard hop is eliminated (the zero-hop metric is asserted by run.sh + the Rust
+    # metrics_endpoint.rs test).
     from redis.cluster import ClusterNode, RedisCluster
 
-    pfx = f"pyc:{uuid.uuid4().hex[:8]}:"
+    pfx = f"py:{mode}:{uuid.uuid4().hex[:8]}:"
     startup = [ClusterNode(h, p) for (h, p) in nodes]
 
     # Construction itself exercises DISCOVERY: redis-py issues CLUSTER SLOTS against a seed and builds
@@ -389,6 +395,8 @@ def main() -> int:
     ap.add_argument("--cluster", type=str, required=True, help="comma list of host:port seeds")
     ap.add_argument("--acl-user", type=str, default="", help="restricted (scoped-ACL) username, #405 leg")
     ap.add_argument("--acl-pass", type=str, default="", help="restricted (scoped-ACL) password, #405 leg")
+    ap.add_argument("--shard-owners", type=str, default="",
+                    help="comma list of the N shard-owner host:port endpoints (#517 leg)")
     args = ap.parse_args()
 
     print(f"# redis-py {redis.__version__}", flush=True)
@@ -396,6 +404,8 @@ def main() -> int:
     run_cluster(parse_nodes(args.cluster))
     if args.acl_user:
         run_restricted(parse_nodes(args.cluster), args.acl_user, args.acl_pass)
+    if args.shard_owners:
+        run_cluster(parse_nodes(args.shard_owners), mode="shard-owners")
     return 1 if FAILED else 0
 
 

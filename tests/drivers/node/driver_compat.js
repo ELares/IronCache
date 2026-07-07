@@ -36,13 +36,14 @@ async function check(mode, group, fn) {
 }
 
 function parseArgs() {
-  const args = { singlePort: 0, cluster: "", aclUser: "", aclPass: "" };
+  const args = { singlePort: 0, cluster: "", aclUser: "", aclPass: "", shardOwners: "" };
   const a = process.argv.slice(2);
   for (let i = 0; i < a.length; i++) {
     if (a[i] === "--single-port") args.singlePort = parseInt(a[++i], 10);
     else if (a[i] === "--cluster") args.cluster = a[++i];
     else if (a[i] === "--acl-user") args.aclUser = a[++i];
     else if (a[i] === "--acl-pass") args.aclPass = a[++i];
+    else if (a[i] === "--shard-owners") args.shardOwners = a[++i];
   }
   return args;
 }
@@ -182,9 +183,15 @@ async function runSingle(port) {
   r.disconnect();
 }
 
-async function runCluster(seeds) {
-  const mode = "cluster";
-  const pfx = `jsc:${Date.now() % 1000000}:`;
+// runCluster drives the ioredis cluster client against a set of slot-owner endpoints. The SAME body
+// serves TWO legs, picked by `mode`: the turnkey 3-node Raft cluster (mode="cluster") and the #517
+// single-node SHARD-OWNERS projection (mode="shard-owners"), which exposes the node's N internal
+// shards as N slot owners on distinct ports. In both, a cluster-aware client discovers the topology
+// via CLUSTER SLOTS and routes each key to its owner by following MOVED; for shard-owners that owner
+// is the key's home SHARD's port, so the internal cross-shard hop is eliminated (the zero-hop metric
+// is asserted by run.sh + the Rust metrics_endpoint.rs test).
+async function runCluster(seeds, mode = "cluster") {
+  const pfx = `js-${mode}:${Date.now() % 1000000}:`;
   const nodes = seeds.map((s) => {
     const [host, port] = s.split(":");
     return { host, port: parseInt(port, 10) };
@@ -345,6 +352,7 @@ async function main() {
   if (args.singlePort > 0) await runSingle(args.singlePort);
   if (args.cluster) await runCluster(args.cluster.split(","));
   if (args.cluster && args.aclUser) await runRestricted(args.cluster.split(","), args.aclUser, args.aclPass);
+  if (args.shardOwners) await runCluster(args.shardOwners.split(","), "shard-owners");
   process.exit(failed > 0 ? 1 : 0);
 }
 

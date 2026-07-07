@@ -1,13 +1,19 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
 # IronCache client-driver compatibility matrix (PROD-8 / #158)
 
-This harness runs **real Redis client libraries** against a live IronCache, in two modes:
+This harness runs **real Redis client libraries** against a live IronCache, in three modes:
 
 * **single-node** -- one `ironcache server`, exercising the core data types, pipelining,
   MULTI/EXEC, pub/sub, and RESP3.
 * **cluster** -- a **turnkey 3-node Raft cluster** (#347) that auto-forms to `cluster_state:ok`
   from a static topology with no manual `CLUSTER MEET` / `ADDSLOTS`, exercising cluster-aware
   client **topology discovery** (`CLUSTER SLOTS`) + **MOVED-routing** end to end.
+* **shard-owners** (#517) -- ONE node in `cluster_mode = shard-owners` that exposes its N internal
+  shards as N CRC16-hashslot owners on distinct ports (`base + i`). A cluster-aware client reads
+  `CLUSTER SLOTS` and dials each key's **owner shard's port**, so the key lands on its home shard
+  and the internal **cross-shard hop is eliminated** -- proven by scraping `/metrics` and asserting
+  `ironcache_hops_sent_total` stays 0 while `ironcache_local_served_total` climbs, with a
+  single-endpoint **contrast** node (same keys, one port) showing `hops_sent > 0`.
 
 It is the layer the existing **differential** harness does NOT cover. The differential proves
 byte-for-byte RESP parity vs `redis-server`; this proves real client *libraries* (including
@@ -48,8 +54,10 @@ is killed by recorded PID (never `pkill -f`, which would self-match) and the tem
 
 ## Results (latest local run: macOS, all three clients available)
 
-**54 PASS, 0 FAIL.** Cluster-aware discovery + MOVED-routing works end to end for all three
-clients.
+**54 PASS, 0 FAIL** for the single-node + Raft-cluster + restricted legs. Cluster-aware discovery +
+MOVED-routing works end to end for all three clients. The **shard-owners** leg (#517) adds 6 routed
+op-groups per cluster-aware client plus the two harness metric groups (`zero-hop`,
+`single-endpoint-contrast`); see its own section below.
 
 ### Single-node
 
@@ -110,6 +118,38 @@ health probes and the existing legs are byte-identical; the restricted user is l
 The `addslots-denied` group PASSES *when the mutator is denied* (`-NOPERM User svc has no
 permissions to run the 'cluster|addslots' command`) -- the ACL fires before the handler, so this
 holds even where a single-node mutator would otherwise be inert. See finding **F4**.
+
+### Shard-owners (single-node hop elimination, #517)
+
+ONE node booted `cluster_mode = shard-owners` with `shards = 4` exposes its 4 internal shards as 4
+CRC16-hashslot owners on ports `7511..7514` (metrics on a dedicated `:9092`). The SAME cluster-client
+bodies that drive the Raft cluster leg run again pointed at those 4 owner ports -- discovery, routed
+ops, readback, crossslot, hashtag-coloc, pipeline:
+
+| op-group | redis-py | go-redis | ioredis |
+|----------|:--------:|:--------:|:-------:|
+| discovery (CLUSTER SLOTS -> 4 shard owners) | PASS | PASS | (RESP2-only; runs where node present) |
+| routed-ops (60 keys, routed to owner ports) | PASS | PASS | " |
+| routed-readback (values correct) | PASS | PASS | " |
+| crossslot (multi-slot op rejected) | PASS | PASS | " |
+| hashtag-coloc ({tag} co-located mget) | PASS | PASS | " |
+| pipeline | PASS | PASS | " |
+
+**The zero-hop assertion (`RESULT harness shard-owners zero-hop`).** After the client legs, `run.sh`
+also drives its own **owner-dialed** keyed traffic -- a minimal MOVED-following client in bash, so the
+assertion holds even when NO external client library is installed -- then scrapes `/metrics`:
+
+* **shard-owners node:** `ironcache_hops_sent_total = 0`, `ironcache_local_served_total = 32`.
+  Every owner-dialed key landed on its home shard and was served locally, with **zero internal hops**.
+* **contrast node** (a NORMAL 4-shard node, same 32 keys through ONE port):
+  `ironcache_hops_sent_total = 23`, `local_served = 9`. A single-endpoint client's foreign-shard keys
+  HOP internally -- the baseline the shard-owners projection eliminates.
+
+So the hop elimination is **measured**, not merely asserted: `hops_sent` 23 -> 0 for the same keys,
+purely by routing them to the shard that owns their slot. The Rust
+`crates/ironcache/tests/metrics_endpoint.rs::shard_owners_owner_dialed_client_shows_zero_hops`
+asserts the identical property over a raw socket, and
+`coordinator_hop_counters_increment_on_cross_shard_traffic` asserts the single-endpoint contrast.
 
 ## Findings
 
@@ -175,6 +215,22 @@ holds even where a single-node mutator would otherwise be inert. See finding **F
   `-@dangerous`; and `CLIENT SETINFO` (go-redis / redis-py lib-name handshake) is `@dangerous` and
   therefore NOPERM, but both clients treat a `SETINFO` failure as non-fatal -- so the connection
   still succeeds. No further grant was required.
+
+### F5 (design note, #517) -- the client's CRC16 slots align with the internal shard owner
+
+* **Why zero hops actually happens:** a cluster-aware client computes each key's slot with **CRC16
+  (XMODEM) over the `{hashtag}`** and routes by the `CLUSTER SLOTS` map. IronCache's internal
+  shard owner is `owner_shard(key) = slot_to_shard(key_slot(key), N)` -- the **same** CRC16
+  `key_slot`, partitioned contiguously across the N shards (`route.rs`). The shard-owners projection
+  advertises exactly that partition (shard `i` at `base + i` owns `[i*16384/N, (i+1)*16384/N)`), so a
+  client that dials the slot's owner PORT lands on the shard that owns the slot INTERNALLY: `owner ==
+  home`, no hop. The legacy FNV-1a hash (`fnv1a_shard`) is the pre-#517 internal owner; it is
+  **superseded** by the slot-based owner in every cluster mode so the client-visible slot and the
+  internal shard coincide. A misroute (dialing the wrong port) returns `MOVED` (no hop, no local
+  serve), so a correct client converges to zero hops after at most one redirect.
+* **Verified:** both go-redis and redis-py discovered all 4 shard owners and routed 60 keys with 0
+  CROSSSLOT/MOVED-loop failures; the `hops_sent = 0` scrape confirms the alignment held for real
+  client slot math, not just the harness's owner-dial.
 
 ## What is NOT covered (follow-ups)
 

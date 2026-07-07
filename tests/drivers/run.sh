@@ -41,6 +41,19 @@ DRIVERS="${DRIVERS:-python,go,node}"
 SINGLE_PORT="${SINGLE_PORT:-7411}"
 CLUSTER_PORTS=(7421 7451 7481)
 
+# SHARD-OWNERS leg (#517): ONE node in `cluster_mode = shard-owners` exposes its N internal shards as
+# N CRC16-hashslot owners on CONTIGUOUS ports `SHARD_OWNERS_BASE .. +N-1` (no raft, so no derived
+# bus/repl ports). A cluster-aware client reads CLUSTER SLOTS and dials each key's owner PORT -> the
+# key lands on its home shard -> NO internal cross-shard hop. The CONTRAST node is a NORMAL multi-shard
+# node (one listener fronting N shards) that HOPS foreign-shard keys internally, so a single-endpoint
+# client drives `hops_sent` up -- the measurable baseline the shard-owners leg eliminates.
+SHARD_OWNERS_SHARDS="${SHARD_OWNERS_SHARDS:-4}"
+SHARD_OWNERS_BASE="${SHARD_OWNERS_BASE:-7511}"       # binds 7511..7514 for N=4
+SHARD_OWNERS_METRICS="${SHARD_OWNERS_METRICS:-9092}" # dedicated (default 9091 is off'd for the others)
+CONTRAST_PORT="${CONTRAST_PORT:-7519}"               # a normal N-shard node on ONE listener
+CONTRAST_METRICS="${CONTRAST_METRICS:-9093}"
+SHARD_OWNERS_WARMUP="${SHARD_OWNERS_WARMUP:-32}"     # keyed keys the harness drives for the metric A/B
+
 # Stable 40-hex node ids (must match the per-node topology entries below).
 NODE_IDS=(
   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -136,6 +149,91 @@ wait_for_ping() { # wait_for_ping <port> <timeout-secs>
     sleep 0.2
   done
   return 1
+}
+
+# ---------------------------------------------------------------------------- raw RESP + metrics (#517 leg)
+# Build an exact RESP2 array frame for the given args into the global RESP_FRAME. Uses `printf -v`
+# (NOT command substitution, which would strip the trailing LF and corrupt the framing), so the CR/LF
+# bytes are preserved verbatim -- these are used to drive the zero-hop metric A/B without a redis-cli.
+RESP_FRAME=""
+resp_build() { # resp_build <ARG>...  -> sets RESP_FRAME
+  local a seg
+  printf -v RESP_FRAME '*%d\r\n' "$#"
+  for a in "$@"; do
+    printf -v seg '$%d\r\n%s\r\n' "${#a}" "$a"
+    RESP_FRAME+="$seg"
+  done
+}
+
+# Send one command over a fresh /dev/tcp connection and echo the FIRST reply line (trailing CR
+# trimmed). The replies here (+OK, -MOVED ...) are single-line, so one read suffices.
+raw_resp() { # raw_resp <port> <ARG>...  -> prints reply line
+  local port="$1"; shift
+  resp_build "$@"
+  exec 3<>"/dev/tcp/127.0.0.1/$port" 2>/dev/null || return 1
+  printf '%s' "$RESP_FRAME" >&3
+  local reply=""
+  IFS= read -r -t 2 -u 3 reply || true
+  exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
+  printf '%s' "${reply%$'\r'}"
+}
+
+# A minimal CLUSTER-AWARE client in bash: SET a key on the shard-owners BASE port, and if it replies
+# `-MOVED <slot> <host>:<port>`, re-dial the owner PORT the redirect names and SET there. Once on the
+# owning shard the key is served LOCALLY (owner == home, NO hop), so this GUARANTEES `local_served`
+# climbs while `hops_sent` stays 0 -- the harness's own owner-dialing traffic for the zero-hop
+# assertion, independent of which external client libraries happen to be installed.
+owner_dial_set() { # owner_dial_set <base> <key>
+  local base="$1" key="$2" reply host_port target
+  reply="$(raw_resp "$base" SET "$key" v)"
+  case "$reply" in
+    +OK) return 0 ;;
+    -MOVED*)
+      host_port="${reply##* }"   # last whitespace-separated field: host:port
+      target="${host_port##*:}"  # the port after the final colon
+      [ "$target" = "$reply" ] && return 1
+      reply="$(raw_resp "$target" SET "$key" v)"
+      [ "$reply" = "+OK" ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Drive `count` keyed SETs over ONE connection to a SINGLE port (the single-endpoint shape). On a
+# NORMAL multi-shard node this connection homes on one shard, so every key another shard owns HOPS
+# internally -- the baseline `hops_sent >> 0` the shard-owners leg contrasts against.
+drive_single_endpoint() { # drive_single_endpoint <port> <count>
+  local port="$1" count="$2" i all=""
+  for (( i = 0; i < count; i++ )); do
+    resp_build SET "sokey:$i" v
+    all+="$RESP_FRAME"
+  done
+  exec 3<>"/dev/tcp/127.0.0.1/$port" 2>/dev/null || return 1
+  printf '%s' "$all" >&3
+  # Drain replies briefly so the server processes every SET before we scrape (a quiet socket ends it).
+  while IFS= read -r -t 1 -u 3 _; do :; done
+  exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
+  return 0
+}
+
+# Scrape the out-of-band /metrics endpoint. Prefers curl; falls back to a /dev/tcp HTTP/1.0 GET.
+metrics_scrape() { # metrics_scrape <metrics-port>  -> prints the Prometheus body
+  local port="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 5 "http://127.0.0.1:$port/metrics" 2>/dev/null
+    return $?
+  fi
+  exec 3<>"/dev/tcp/127.0.0.1/$port" 2>/dev/null || return 1
+  printf 'GET /metrics HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
+  local line
+  while IFS= read -r -t 3 -u 3 line; do printf '%s\n' "${line%$'\r'}"; done
+  exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
+}
+
+# Extract the NODE-WIDE value of an unlabeled Prometheus counter/gauge (the `name <value>` line, NOT
+# the per-shard `name{shard="i"} v` series). Prints empty if absent.
+metric_of() { # metric_of <body> <metric-name>
+  printf '%s\n' "$1" | awk -v n="$2" '$1 == n { print $2; exit }'
 }
 
 # ---------------------------------------------------------------------------- boot: single node
@@ -267,6 +365,112 @@ boot_cluster() {
   return 1
 }
 
+# ---------------------------------------------------------------------------- boot: shard-owners (#517)
+# Write the single-node shard-owners config: cluster_enabled + `cluster_mode = shard-owners` +
+# `shards = N`. The node auto-owns all 16384 slots partitioned across its N shards and binds one
+# listener per shard at `port + i` (there is NO CLI flag for cluster mode, so this goes through a
+# config file, like the raft-cluster leg). No topology (shard-owners derives owners from the shard
+# count); no data_dir (in-memory).
+write_shard_owners_config() {
+  local cfg="$WORK_DIR/shard-owners.toml"
+  {
+    echo '# generated by tests/drivers/run.sh (single-node shard-owners projection, #517)'
+    echo 'bind = "127.0.0.1"'
+    echo "port = $SHARD_OWNERS_BASE"
+    echo "shards = $SHARD_OWNERS_SHARDS"
+    echo 'cluster_enabled = true'
+    echo 'cluster_mode = "shard-owners"'
+  } > "$cfg"
+  echo "$cfg"
+}
+
+# The CSV of the N shard-owner endpoints a cluster-aware client seeds from (host:port per shard port).
+SHARD_OWNERS_CSV=""
+boot_shard_owners() {
+  local cfg i last=$(( SHARD_OWNERS_BASE + SHARD_OWNERS_SHARDS - 1 ))
+  cfg="$(write_shard_owners_config)"
+  # --metrics-addr ON (dedicated 9092): the other legs pass `off` to avoid the default-9091 collision,
+  # but the zero-hop assertion must SCRAPE /metrics, so this single node gets its own metrics port.
+  info "booting shard-owners node: base :$SHARD_OWNERS_BASE, $SHARD_OWNERS_SHARDS shards (ports $SHARD_OWNERS_BASE..$last), metrics :$SHARD_OWNERS_METRICS"
+  "$BIN" server --config "$cfg" --metrics-addr "127.0.0.1:$SHARD_OWNERS_METRICS" \
+      > "$WORK_DIR/shard-owners.log" 2>&1 &
+  PIDS+=("$!")
+  # EVERY per-shard listener (base + i) must answer PING before we drive it.
+  for (( i = 0; i < SHARD_OWNERS_SHARDS; i++ )); do
+    if ! wait_for_ping "$(( SHARD_OWNERS_BASE + i ))" 25; then
+      err "shard-owners port $(( SHARD_OWNERS_BASE + i )) never answered PING; log tail:"
+      tail -20 "$WORK_DIR/shard-owners.log" >&2; return 1
+    fi
+    SHARD_OWNERS_CSV+="${SHARD_OWNERS_CSV:+,}127.0.0.1:$(( SHARD_OWNERS_BASE + i ))"
+  done
+  info "shard-owners node up (all $SHARD_OWNERS_SHARDS per-shard listeners answer PING)"
+}
+
+# Boot the CONTRAST node: a NORMAL multi-shard node (NOT shard-owners) with ONE listener fronting
+# N shards, metrics on its own port. A single-endpoint client's foreign-shard keys HOP internally here
+# -- the `hops_sent >> 0` baseline the shard-owners projection eliminates. (`--shards N` matches the
+# shard-owners shard count so the A/B is apples-to-apples: same N, same keys, different topology.)
+boot_contrast() {
+  info "booting single-endpoint CONTRAST node (normal $SHARD_OWNERS_SHARDS-shard node) on :$CONTRAST_PORT, metrics :$CONTRAST_METRICS"
+  "$BIN" server --bind 127.0.0.1 --port "$CONTRAST_PORT" --shards "$SHARD_OWNERS_SHARDS" \
+      --metrics-addr "127.0.0.1:$CONTRAST_METRICS" > "$WORK_DIR/contrast.log" 2>&1 &
+  PIDS+=("$!")
+  if ! wait_for_ping "$CONTRAST_PORT" 25; then
+    err "contrast node never answered PING; log tail:"; tail -20 "$WORK_DIR/contrast.log" >&2; return 1
+  fi
+  info "contrast node up (PING ok)"
+}
+
+# THE #517 ZERO-HOP ASSERTION (metric proof + single-endpoint contrast). After the real cluster
+# clients have driven routed SET/GET at the shard-owner ports, the harness ALSO drives its own
+# owner-dialed keyed traffic (MOVED-following bash client) so the assertion holds even when no external
+# client lib is installed, then scrapes /metrics and asserts:
+#   * shard-owners node: ironcache_hops_sent_total == 0 AND ironcache_local_served_total > 0
+#     (owner-dialed keys served locally, ZERO internal hops -- the #517 property), and
+#   * contrast node (same keys, one port): ironcache_hops_sent_total > 0 (the internal-hop baseline).
+# This makes the hop ELIMINATION measurable, not merely asserted. (The Rust metrics_endpoint.rs test
+# `shard_owners_owner_dialed_client_shows_zero_hops` asserts the same over a raw socket.)
+shard_owners_zero_hop_check() {
+  local i served=0
+  # Harness-guaranteed owner-dialed traffic: SET a spread of keys, following MOVED to each owner port.
+  for (( i = 0; i < SHARD_OWNERS_WARMUP; i++ )); do
+    owner_dial_set "$SHARD_OWNERS_BASE" "sokey:$i" && served=$(( served + 1 ))
+  done
+  info "shard-owners: harness owner-dialed $served/$SHARD_OWNERS_WARMUP keyed SETs (MOVED-followed to owner ports)"
+
+  local so_body so_hops so_local
+  so_body="$(metrics_scrape "$SHARD_OWNERS_METRICS")"
+  if [ -z "$so_body" ]; then
+    record harness shard-owners zero-hop FAIL "could not scrape shard-owners /metrics on :$SHARD_OWNERS_METRICS"
+    return
+  fi
+  so_hops="$(metric_of "$so_body" ironcache_hops_sent_total)"
+  so_local="$(metric_of "$so_body" ironcache_local_served_total)"
+  so_hops="${so_hops:-missing}"; so_local="${so_local:-0}"
+  if [ "$so_hops" = "0" ] && [ "$so_local" -gt 0 ] 2>/dev/null; then
+    record harness shard-owners zero-hop PASS "hops_sent=$so_hops local_served=$so_local (owner-dialed keys served locally, no internal hop)"
+  else
+    record harness shard-owners zero-hop FAIL "expected hops_sent=0 and local_served>0, got hops_sent=$so_hops local_served=$so_local"
+  fi
+
+  # Single-endpoint contrast: SAME keys through ONE port of the normal N-shard node -> hops rise.
+  local c_body c_hops c_local
+  drive_single_endpoint "$CONTRAST_PORT" "$SHARD_OWNERS_WARMUP"
+  c_body="$(metrics_scrape "$CONTRAST_METRICS")"
+  if [ -z "$c_body" ]; then
+    record harness shard-owners single-endpoint-contrast SKIP "could not scrape contrast /metrics on :$CONTRAST_METRICS"
+    return
+  fi
+  c_hops="$(metric_of "$c_body" ironcache_hops_sent_total)"
+  c_local="$(metric_of "$c_body" ironcache_local_served_total)"
+  c_hops="${c_hops:-0}"; c_local="${c_local:-0}"
+  if [ "$c_hops" -gt 0 ] 2>/dev/null; then
+    record harness shard-owners single-endpoint-contrast PASS "hops_sent=$c_hops local_served=$c_local (one port to a normal $SHARD_OWNERS_SHARDS-shard node: internal hops -- the #517 baseline; shard-owners drove it to 0)"
+  else
+    record harness shard-owners single-endpoint-contrast FAIL "expected hops_sent>0 through one port, got hops_sent=$c_hops"
+  fi
+}
+
 # ---------------------------------------------------------------------------- run a client script
 want() { case ",$DRIVERS," in *,"$1",*) return 0 ;; *) return 1 ;; esac; }
 
@@ -277,7 +481,8 @@ run_client_go() {
   info "=== running client: go ==="
   ( cd "$SCRIPT_DIR/go" && GOFLAGS=-mod=mod go run . \
       -single-port "$SINGLE_PORT" -cluster "$CLUSTER_CSV" \
-      -acl-user "$SVC_USER" -acl-pass "$SVC_PASS" ) \
+      -acl-user "$SVC_USER" -acl-pass "$SVC_PASS" \
+      -shard-owners "$SHARD_OWNERS_CSV" ) \
       > "$WORK_DIR/go.out" 2> "$WORK_DIR/go.err"
   cat "$WORK_DIR/go.out"
   grep '^RESULT' "$WORK_DIR/go.out" 2>/dev/null | while IFS=' ' read -r _ c m g s d; do
@@ -363,8 +568,10 @@ print_matrix() {
 main() {
   resolve_binary
 
-  boot_single  || { err "single-node boot failed"; exit 1; }
-  boot_cluster || { err "cluster boot failed";    exit 1; }
+  boot_single        || { err "single-node boot failed";   exit 1; }
+  boot_cluster       || { err "cluster boot failed";        exit 1; }
+  boot_shard_owners  || { err "shard-owners boot failed";   exit 1; }
+  boot_contrast      || { err "contrast-node boot failed";  exit 1; }
 
   # Setup + run each requested + available client. Each driver also gets the scoped-ACL creds
   # (`--acl-user`/`--acl-pass`) so it runs the #405 RESTRICTED leg against the cluster: discovery +
@@ -373,10 +580,12 @@ main() {
     if setup_python; then
       run_client python "$PY" "$SCRIPT_DIR/python/driver_compat.py" \
         --single-port "$SINGLE_PORT" --cluster "$CLUSTER_CSV" \
-        --acl-user "$SVC_USER" --acl-pass "$SVC_PASS"
+        --acl-user "$SVC_USER" --acl-pass "$SVC_PASS" \
+        --shard-owners "$SHARD_OWNERS_CSV"
     else
       record redis-py single all SKIP "python/redis-py unavailable"
       record redis-py cluster all SKIP "python/redis-py unavailable"
+      record redis-py shard-owners all SKIP "python/redis-py unavailable"
     fi
   fi
 
@@ -386,6 +595,7 @@ main() {
     else
       record go-redis single all SKIP "go/go-redis unavailable"
       record go-redis cluster all SKIP "go/go-redis unavailable"
+      record go-redis shard-owners all SKIP "go/go-redis unavailable"
     fi
   fi
 
@@ -393,12 +603,20 @@ main() {
     if setup_node; then
       run_client node node "$SCRIPT_DIR/node/driver_compat.js" \
         --single-port "$SINGLE_PORT" --cluster "$CLUSTER_CSV" \
-        --acl-user "$SVC_USER" --acl-pass "$SVC_PASS"
+        --acl-user "$SVC_USER" --acl-pass "$SVC_PASS" \
+        --shard-owners "$SHARD_OWNERS_CSV"
     else
       record ioredis single all SKIP "node/ioredis unavailable"
       record ioredis cluster all SKIP "node/ioredis unavailable"
+      record ioredis shard-owners all SKIP "node/ioredis unavailable"
     fi
   fi
+
+  # THE #517 ZERO-HOP ASSERTION: the metric proof (owner-dialed keys -> hops_sent 0) + the
+  # single-endpoint contrast (same keys, one port -> hops_sent > 0). Runs regardless of which client
+  # libs are present (the harness drives its own owner-dialed traffic), so the driver matrix always
+  # carries the measured hop-elimination result.
+  shard_owners_zero_hop_check
 
   print_matrix
 }
