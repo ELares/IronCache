@@ -446,3 +446,99 @@ verify in CI / a live environment:**
   loader-valid, but live quorum behavior must be confirmed on a cluster.
 - The HTTP probes returning 200/503 against a running pod (the endpoints and paths
   are taken from the server source; the probe wiring is dry-run-valid).
+
+---
+
+## 11. Crash troubleshooting (panics, backtraces, core dumps)
+
+The release binary is built `panic = "abort"` (a panic terminates the process
+immediately, with no orderly unwind) and is size-stripped, but it is tuned so a
+crash is still diagnosable.
+
+### What you always get: the panic hook
+
+At boot, before any listener binds, the server installs a process-wide panic hook.
+The instant a panic fires, and BEFORE the abort, it writes ONE actionable `ERROR`
+line through the normal log sink (stderr, i.e. journald under the systemd unit):
+
+```
+ERROR ironcache::panic: ironcache PANICKED and is aborting: <message> (at
+  <file>:<line>:<col>; build <version>). Please report this crash at
+  https://github.com/ELares/IronCache/issues
+```
+
+The `file:line:col` LOCATION is baked into the binary as static string data, so it
+is present even on the stripped release artifact regardless of `strip`. That single
+line already tells you WHERE it crashed and on WHICH build, so a bug report is
+actionable even without a backtrace.
+
+### Turning on the backtrace: RUST_BACKTRACE
+
+Set `RUST_BACKTRACE=1` (or `full` for unabridged frames) in the process
+environment. The packaging systemd unit ships it on:
+
+```ini
+# packaging/ironcache.service, [Service]
+Environment=RUST_BACKTRACE=1
+```
+
+With it set, the panic hook ALSO logs a captured backtrace after the summary line.
+The release profile keeps the SYMBOL TABLE (`[profile.release] strip =
+"debuginfo"` in the root `Cargo.toml`, NOT `strip = "symbols"`), so on a
+system-linker build the backtrace frames resolve to FUNCTION NAMES.
+
+Two caveats worth knowing up front:
+
+- The published **static-musl** binary (the one the container image and the
+  release tarballs ship) is linked by `zig cc`, which strips it FULLY, so its
+  backtrace frames are raw addresses. On that artifact the panic hook's own
+  `file:line` line is your crash site; for named frames, reproduce the crash with a
+  from-source or glibc `cargo build --release` (which retains the symbol table).
+- Full `file:line` on EVERY backtrace frame needs DWARF line tables, which the
+  release build omits for size. Use the hook's `file:line` for the crash site, or a
+  debug `cargo build` when you want line numbers throughout the trace.
+
+Read it from the journal:
+
+```sh
+journalctl -u ironcache -n 100 --no-pager        # recent logs incl. the panic line
+journalctl -u ironcache -p err --no-pager         # only ERROR (the panic summary + trace)
+```
+
+You can also force a panic on a `--release` build to see exactly what an operator
+would get, using the shipped demonstration example:
+
+```sh
+RUST_BACKTRACE=1 cargo run -p ironcache --example forced_panic --release
+```
+
+### Core dumps
+
+For a post-mortem beyond the backtrace (inspecting memory, all threads), enable
+core dumps. On a `systemd-coredump`-equipped host they are captured automatically
+and read with `coredumpctl` (no writable path needed in the sandbox, because
+`systemd-coredump` collects the core out of process):
+
+```sh
+coredumpctl list ironcache            # crashes captured for the unit
+coredumpctl info ironcache            # signal, command line, and a symbolized trace
+coredumpctl gdb ironcache             # open the newest core in gdb (needs gdb installed)
+```
+
+Notes for this unit:
+
+- The core is stored under `/var/lib/systemd/coredump/` (compressed) and indexed by
+  the journal; `coredumpctl` finds it by unit name even though the service runs as a
+  transient `DynamicUser`.
+- `abort()` raises `SIGABRT`, which is a core-generating signal, so a
+  `panic = "abort"` crash DOES produce a core when core dumps are enabled.
+- If cores are disabled globally, raise the limit
+  (`ulimit -c unlimited` / `LimitCORE=infinity` in the unit) and confirm
+  `/proc/sys/kernel/core_pattern` routes to `systemd-coredump` (the distro default);
+  the unit's strict `ProtectSystem`/`PrivateTmp` sandbox does not block out-of-process
+  `systemd-coredump` collection.
+- Symbols: `coredumpctl` resolves function names from the binary's symbol table.
+  A system-linker build retains it (`strip = "debuginfo"`, as above); the shipping
+  static-musl binary is stripped, so for named frames from a core, load it against a
+  from-source / glibc build of the SAME commit. Either way, keep the exact binary
+  that produced the core on hand for the cleanest symbolization.

@@ -184,7 +184,24 @@ ironcache-server = { path = "crates/ironcache-server" }
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-strip = "symbols"
+# CRASH ERGONOMICS (#551): keep the SYMBOL TABLE, strip only the (much larger) DWARF debuginfo.
+# `strip = "symbols"` removed BOTH, so a `panic = "abort"` release crash produced a backtrace of
+# bare unsymbolizable addresses. `strip = "debuginfo"` retains the symbol table so a
+# `RUST_BACKTRACE=1` backtrace resolves to FUNCTION NAMES on a system-linker build, while the panic
+# hook's `file:line` location (baked in as static `.rodata` string data, unaffected by `strip`) is
+# ALWAYS present. This is the SMALLEST option that yields a symbolized location: it keeps just the
+# symbol table, not the multi-megabyte DWARF that full `debug` / `line-tables-only` would add for a
+# marginal file:line gain the panic hook already provides. MEASURED size deltas (aarch64):
+#   * glibc (aarch64-gnu, system ld): 5,905,696 -> 7,255,552 bytes (+1.29 MiB, +23%); .symtab
+#     retained, so the backtrace resolves to function names (proven via examples/forced_panic).
+#   * static musl (the SHIPPING artifact, linked by `zig cc` in the release pipeline): UNCHANGED at
+#     ~5,716,056 bytes. The zig release linker strips the static-musl artifact FULLY regardless of
+#     this level (no .symtab; `strip --strip-all` does not shrink it), so the change is size-NEUTRAL
+#     on musl and the ADR-0017 static-binary budget is untouched. On that stripped artifact the
+#     panic hook's `file:line` is the symbolization; function-name backtraces come from a
+#     glibc/from-source `cargo build --release`.
+# See DEPLOY.md "Crash troubleshooting" and crates/ironcache/src/panic_hook.rs.
+strip = "debuginfo"
 
 # DETERMINISTIC-SIMULATION SPEED (#533). The Raft DST seed sweeps run millions of simulated ticks;
 # unoptimized (debug/test-profile) they take 100-260s EACH, which starved CI under parallel load and

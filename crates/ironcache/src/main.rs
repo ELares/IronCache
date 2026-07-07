@@ -72,6 +72,13 @@ fn main() -> anyhow::Result<()> {
     // harness) is non-fatal: the existing subscriber stands.
     install_tracing(&cli.log_level);
 
+    // CRASH ERGONOMICS (#551): install the process-wide panic hook now, right after the tracing
+    // sink is up and BEFORE any listener binds. The release profile is `panic = "abort"`, so a
+    // panic terminates the process with no orderly unwind; this hook makes the LAST log line
+    // actionable (panic message + `file:line` location + build version + a report URL) instead of a
+    // bare abort. Boot/panic-path, outside the ADR-0003 determinism boundary (no clock/RNG).
+    ironcache::panic_hook::install_panic_hook(cli::BUILD_VERSION);
+
     let command = cli.command.as_ref();
 
     match command {
