@@ -8282,6 +8282,54 @@ mod tests {
         }
     }
 
+    /// #549: a FORCED save failure flips INFO `rdb_last_bgsave_status` to `err`. We point the data
+    /// dir under a regular FILE so `create_dir_all` fails, drive the REAL `do_save_all`, and assert
+    /// the shared persistence-stats cell (the SAME atomics INFO reads) flips to not-ok. The default
+    /// (pre-save) status is `ok`, matching Redis. The `err` rendering itself is covered by the observe
+    /// `# Persistence` render test.
+    #[test]
+    fn a_failed_save_flips_rdb_last_bgsave_status_to_err() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        // A path that cannot be created: its parent is a regular file, so `create_dir_all` fails.
+        let blocker = std::env::temp_dir().join(format!("ic-savefail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocker);
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"x").expect("write the blocking file");
+        let broken_dir = blocker.join("nested");
+        let persist = Arc::new(crate::persist::PersistState {
+            dir: broken_dir,
+            stats: Arc::new(ironcache_observe::PersistRuntime::new()),
+            save_id: AtomicU64::new(0),
+            saving: AtomicBool::new(false),
+        });
+        // Before any save the status is ok (Redis parity).
+        assert!(persist.stats.last_bgsave_ok(), "default status is ok");
+        // `ctx` is unused on the create-dir failure arm (it returns before the shard fan-out); an
+        // empty inbox drives `n_shards == 0`.
+        let ctx = guardrail_ctx(0, 0);
+        let inbox: crate::coordinator::Inbox = Arc::from(Vec::new());
+        let home = ShardId { index: 0, total: 0 };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let res = rt.block_on(crate::persist::do_save_all(
+            &persist,
+            &inbox,
+            &ctx,
+            home,
+            0,
+            1_700_000_000,
+        ));
+        assert!(res.is_err(), "the broken data dir fails the save: {res:?}");
+        assert!(
+            !persist.stats.last_bgsave_ok(),
+            "a failed save flips rdb_last_bgsave_status to err"
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
     #[test]
     fn redirect_foreign_single_key_is_moved() {
         let map = redirect_map();

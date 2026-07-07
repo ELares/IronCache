@@ -3748,6 +3748,8 @@ fn cmd_info<C: Clock, S: Keyspace>(
                 enabled: true,
                 rdb_last_save_time: stats.last_save_unix_secs(),
                 rdb_changes_since_last_save: stats.dirty(),
+                // #549: the last-save OUTCOME the persistence subsystem recorded (ok before any save).
+                last_bgsave_ok: stats.last_bgsave_ok(),
                 save_interval_secs: interval_secs,
                 save_min_changes: min_changes,
             }
@@ -3774,21 +3776,32 @@ fn cmd_info<C: Clock, S: Keyspace>(
             })
             .collect()
     });
+    // The node-wide counter rollup (summed across every shard's cell via the always-present
+    // `MetricsRegistry`, #531). Read ONCE here: it feeds both the `# Stats`/`# Clients` fields and the
+    // ops/sec sampler below (the sampler must see the SAME total the section reports).
+    let rolled = rollup();
     // The PROD-7 completeness facts for the `# Clients` / `# Stats` / `# CPU` sections: the effective
     // `maxclients` (read from the runtime overlay so a `CONFIG SET maxclients` is reflected) and the
-    // rejected-connection count off the connection gate. `instantaneous_ops_per_sec` is left 0 here
-    // (the rolling-rate sample lives in the serve layer's periodic tick; a dispatch-time figure would
-    // need cross-command state); `blocked_clients` is 0 (no blocking commands yet).
+    // rejected-connection count off the connection gate. `blocked_clients` is 0 (no blocking commands
+    // yet). `instantaneous_ops_per_sec` is a REAL recent rate now (#549): sample the node-wide command
+    // total against the Env WALL clock (`now_unix_millis`, ADR-0003 -- comparable across the shards
+    // that may each serve an INFO read into the shared ring) and read the rate over the sampling
+    // window. This is the COLD INFO read path, so the clock read + the sampler's node-level lock are
+    // off the per-command hot path. Falls back to 0 when there is no registry (a bare unit-test ctx).
+    let instantaneous_ops_per_sec = ctx.metrics_registry.as_ref().map_or(0, |reg| {
+        reg.ops_rate()
+            .observe(clock.now_unix_millis(), rolled.commands_processed)
+    });
     let runtime_stats = ironcache_observe::RuntimeStats {
         maxclients: ctx.runtime.maxclients(),
         blocked_clients: 0,
-        instantaneous_ops_per_sec: 0,
+        instantaneous_ops_per_sec,
         rejected_connections: ctx.conn_gate.rejected(),
     };
     let mut body = build_info(
         clock,
         &ctx.info,
-        rollup(),
+        rolled,
         mem,
         effective,
         &replication,
@@ -10656,5 +10669,65 @@ mod tests {
             }
             other => panic!("expected INFO bulk, got {other:?}"),
         }
+    }
+
+    /// #549: under driven load INFO reports a NONZERO `instantaneous_ops_per_sec` that tracks the
+    /// rate. With the always-present metrics registry (the binary path), the ops/sec sampler is fed
+    /// the node-wide command total against the Env WALL clock on each INFO read; two reads a second
+    /// apart across 1000 driven commands report ~1000 ops/sec (0 before the second sample lands).
+    #[test]
+    fn info_instantaneous_ops_per_sec_tracks_driven_load() {
+        let mut c = ctx(None);
+        let reg = ironcache_observe::MetricsRegistry::new(1);
+        c.metrics_registry = Some(reg.clone());
+        let store = test_store(c.databases);
+        let mut env = TestEnv::new(1);
+        let rollup = || reg.aggregate();
+        let rollup_fn: RollupFn<'_> = &rollup;
+        let cmdstats = || (String::new(), String::new());
+        let cmdstats_fn: CmdStatsFn<'_> = &cmdstats;
+        let keyspace = || None;
+        let keyspace_fn: KeyspaceFn<'_> = &keyspace;
+        let info_req = req(&[b"INFO", b"stats"]);
+        let body_of = |v: Value| match v {
+            Value::BulkString(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
+            other => panic!("expected INFO bulk, got {other:?}"),
+        };
+        // First read at t=0 with 0 commands: seeds the sampler, so the rate is still 0.
+        let first = body_of(cmd_info(
+            &c,
+            &env,
+            &store,
+            rollup_fn,
+            cmdstats_fn,
+            keyspace_fn,
+            MemoryInfo::default(),
+            &info_req,
+        ));
+        assert!(
+            first.contains("instantaneous_ops_per_sec:0\r\n"),
+            "the seeding read reports 0: {first}"
+        );
+        // Drive 1000 commands into the node-wide total and advance the Env wall clock by 1s.
+        let mut sc = ironcache_observe::ShardCounters::with_cell(reg.shard_cell(0));
+        for _ in 0..1000 {
+            sc.on_command();
+        }
+        env.advance(core::time::Duration::from_millis(1000));
+        // Second read: 1000 commands over 1s -> a NONZERO ops/sec tracking the driven rate.
+        let second = body_of(cmd_info(
+            &c,
+            &env,
+            &store,
+            rollup_fn,
+            cmdstats_fn,
+            keyspace_fn,
+            MemoryInfo::default(),
+            &info_req,
+        ));
+        assert!(
+            second.contains("instantaneous_ops_per_sec:1000\r\n"),
+            "1000 commands / 1s -> 1000 ops/sec: {second}"
+        );
     }
 }
