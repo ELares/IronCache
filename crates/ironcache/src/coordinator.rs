@@ -142,6 +142,25 @@ pub fn build_inboxes(n: usize) -> (Inbox, Vec<mpsc::Receiver<ShardWork>>) {
     (Inbox::from(senders), receivers)
 }
 
+/// Sample each shard's cross-shard inbox OCCUPANCY (#556, the coordinator back-pressure gauge):
+/// `max_capacity - capacity` per shard, i.e. the number of cross-shard work items currently queued
+/// and not yet drained. Returned in shard-index order (`[i]` is shard `i`'s inbox).
+///
+/// This is the SAMPLING side of the inbox-depth gauge: it is read ONLY at `/metrics` scrape time
+/// (the cold observability path), NEVER on the hop hot path. The tokio mpsc channel already tracks
+/// its own length, so this needs no per-enqueue/dequeue atomic and adds ZERO cost to
+/// [`dispatch_via_send`] / [`run_drain_loop`] -- the reason inbox depth is SAMPLED rather than
+/// counted (the four-series design in #556). `capacity()` counts free slots (queued items plus any
+/// outstanding reserved permits); the coordinator only ever uses plain `send().await` (no long-lived
+/// permits), so `max_capacity - capacity` equals the queued-item count in practice.
+#[must_use]
+pub fn inbox_depths(inbox: &Inbox) -> Vec<u64> {
+    inbox
+        .iter()
+        .map(|tx| (tx.max_capacity().saturating_sub(tx.capacity())) as u64)
+        .collect()
+}
+
 /// The per-shard DRAIN LOOP (COORDINATOR.md #107): consume cross-shard work for the keys
 /// THIS shard owns, run each unit against this shard's thread-locals, and reply.
 ///
@@ -553,6 +572,13 @@ fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
         if deltas != CounterDeltas::default() {
             st.counters.apply(deltas);
         }
+        // COORDINATOR HOP OBSERVABILITY (#556, the #517 zero-hop measurement harness): THIS shard
+        // just SERVED a peer's cross-shard request off its inbox (a remote keyed or whole-keyspace
+        // unit -- the pure-infra verbs `__ICPUBLISH`/`__ICEXISTS`/`__ICSAVE`/... returned earlier and
+        // are not client requests). ONE relaxed atomic on the borrow the drain path ALREADY takes, so
+        // no new alloc / clock / lock. Symmetric with the home shard's `hops_sent` bump in
+        // `route_and_dispatch`; an operator sees how much work each shard does FOR its peers.
+        st.counters.on_hop_served();
         st.last_policy_generation = shard_generation;
     }
 

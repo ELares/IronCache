@@ -54,6 +54,8 @@ pub fn run_server_with_metrics_for_test(port: u16, shards: usize, metrics_port: 
         handles.raft.clone(),
         handles.persist.clone(),
         handles.topology.clone(),
+        // The coordinator inbox, so `/metrics` samples the per-shard inbox-depth gauge (#556).
+        Some(handles.inbox.clone()),
     );
     let addr = format!("127.0.0.1:{metrics_port}");
     metrics_http::spawn_metrics_server(&addr, state).expect("metrics endpoint failed to bind");
@@ -420,6 +422,70 @@ pub fn run_shard_owners_node_for_test(shards: usize) -> (ShardSet, u16) {
         if let Ok(set) = run_server(&config) {
             return (set, base);
         }
+    }
+    panic!("could not bind {shards} contiguous shard-owner ports after 64 attempts");
+}
+
+/// Like [`run_shard_owners_node_for_test`] but ALSO stands up the out-of-band `/metrics` endpoint on
+/// `127.0.0.1:metrics_port` (#556), so a test can scrape the coordinator hop counters + inbox-depth
+/// gauge on a shard-owners node and ASSERT the #517 zero-hop property: a cluster-aware client dialing
+/// each key's OWNER port is served locally with NO hop, so `hops_sent` stays ~0. Returns the running
+/// `ShardSet` and the base RESP port (`base .. base + shards - 1`; the metrics endpoint is on the
+/// separate `metrics_port`).
+///
+/// # Panics
+///
+/// Panics if the config fails to validate, or the server / metrics listener fails to bind after the
+/// contiguous-port retries.
+#[must_use]
+pub fn run_shard_owners_node_with_metrics_for_test(
+    shards: usize,
+    metrics_port: u16,
+) -> (ShardSet, u16) {
+    use crate::metrics_http::{self, MetricsState, ReadyState};
+    use ironcache_observe::MetricsRegistry;
+    for _ in 0..64 {
+        let base = free_contiguous_ports(shards);
+        let config = Config {
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: base,
+            shards,
+            databases: 16,
+            cluster_enabled: true,
+            cluster_mode: ClusterMode::ShardOwners,
+            ..Config::default()
+        };
+        config
+            .validate()
+            .expect("shard-owners config must validate");
+        let registry = MetricsRegistry::new(shards);
+        let live = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(ReadyState::with_shards(shards));
+        // A bind race on the contiguous RESP block returns Err -> retry a fresh block (mirrors
+        // `run_shard_owners_node_for_test`). Only spawn the metrics endpoint once the RESP block bound.
+        let Ok(handles) = crate::serve::run_server_observed(
+            &config,
+            Some(registry.clone()),
+            Some(Arc::clone(&ready)),
+        ) else {
+            continue;
+        };
+        let runtime = Arc::clone(&handles.runtime);
+        let state = MetricsState::new(
+            registry,
+            Arc::clone(&live),
+            Arc::clone(&ready),
+            shards,
+            Arc::new(move || runtime.maxmemory()),
+            handles.raft.clone(),
+            handles.persist.clone(),
+            handles.topology.clone(),
+            Some(handles.inbox.clone()),
+        );
+        let addr = format!("127.0.0.1:{metrics_port}");
+        metrics_http::spawn_metrics_server(&addr, state).expect("metrics endpoint failed to bind");
+        live.store(true, std::sync::atomic::Ordering::SeqCst);
+        return (handles.set, base);
     }
     panic!("could not bind {shards} contiguous shard-owner ports after 64 attempts");
 }
