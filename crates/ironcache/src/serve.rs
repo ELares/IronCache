@@ -1594,6 +1594,15 @@ async fn serve_connection(
         // draining per command memmoves all remaining pipelined bytes to the front each time, which is
         // O(P^2) over a depth-P pipeline. `decode` parses a `&[u8]`, so we hand it `read_buf[cursor..]`.
         out.clear();
+        // OUTPUT-BUFFER hard cap (PROD-SAFETY #5 / #529): read the live cap ONCE per batch (one cold
+        // relaxed load, off the per-command hot path) and enforce it in TWO places -- after each
+        // command's reply is appended INSIDE the decode loop below (#529: bound resident output so a
+        // single pipelined batch of large-reply commands cannot OOM the host before the post-batch
+        // check), and again after the batch is assembled (the original PROD-SAFETY #5 pre-flush
+        // check). Reading once per batch matches the documented "takes effect for subsequent batches"
+        // semantics (a `CONFIG SET output-buffer-limit` applies from the next batch), so both checks
+        // use one consistent value. `0` disables the cap (the pre-fix unbounded behavior).
+        let obl = ctx.runtime.output_buffer_limit();
         let mut consumed_total = 0usize;
         loop {
             match decode(&read_buf[consumed_total..], &limits) {
@@ -1800,6 +1809,17 @@ async fn serve_connection(
                         let _ = stream.send(std::mem::take(&mut out)).await;
                         break 'conn;
                     }
+                    // OUTPUT-BUFFER intra-batch cap (#529): this command's reply is now appended to
+                    // `out`. If the accumulated reply buffer has grown past the cap MID-BATCH, stop
+                    // decoding more commands and fall through to close -- the post-batch drain + the
+                    // pre-flush check below then close the connection. This bounds resident output so
+                    // a single pipelined batch of large-reply commands cannot drive unbounded server
+                    // memory before the (post-batch) check runs. At the default cap (1 GiB) / `0`
+                    // (disabled) this is a single compare against a local that is never true on the
+                    // hot path, so the branch is predicted not-taken and the batch decodes as before.
+                    if obl > 0 && out.len() as u64 > obl {
+                        break;
+                    }
                 }
                 DecodeOutcome::Incomplete => break,
                 DecodeOutcome::Error(e) => {
@@ -1854,10 +1874,10 @@ async fn serve_connection(
         // grown past the configured `output_buffer_limit`, CLOSE the connection rather than let a
         // slow consumer / a huge reply / a pipelined flood drive unbounded server memory. `0`
         // disables the cap (the pre-fix unbounded behavior); the default is a high ceiling so a
-        // legitimate large reply / deep pipeline is never affected. Read from the runtime overlay so
-        // a `CONFIG SET output-buffer-limit` takes effect for subsequent batches. We drop the
-        // oversized buffer unsent and close (matching Redis closing a client over the limit).
-        let obl = ctx.runtime.output_buffer_limit();
+        // legitimate large reply / deep pipeline is never affected. Uses the `obl` read once at the
+        // top of this batch (the intra-batch check #529 shares it), so a `CONFIG SET
+        // output-buffer-limit` takes effect for subsequent batches. We drop the oversized buffer
+        // unsent and close (matching Redis closing a client over the limit).
         if obl > 0 && out.len() as u64 > obl {
             break;
         }
@@ -1957,6 +1977,20 @@ async fn serve_connection(
             if res.n == 0 {
                 break; // peer closed
             }
+        }
+
+        // QUERY-BUFFER hard cap (#528): every idle-wait arm above (subscriber drain / idle-timeout
+        // race / plain recv) APPENDS the newly-arrived bytes into `read_buf`, then this loop
+        // re-decodes. If the accumulated inbound query buffer has grown past the configured
+        // `query_buffer_limit`, CLOSE the connection rather than let a client that announces a large
+        // multibulk (`*<huge>\r\n`) and then DRIBBLES the elements force unbounded pre-auth inbound
+        // buffering (a memory-amplification DoS: the frame never completes, so decode keeps returning
+        // Incomplete and `read_buf` grows without bound). A single cold relaxed load on this
+        // post-batch / idle path (never per command); `0` disables the cap (Redis parity, the pre-fix
+        // unbounded behavior). The oversized buffer is dropped and the connection closed.
+        let qbl = ctx.runtime.query_buffer_limit();
+        if qbl > 0 && read_buf.len() as u64 > qbl {
+            break;
         }
     }
 
@@ -2144,6 +2178,11 @@ async fn serve_connection_uring(
 
     'conn: loop {
         out.clear();
+        // OUTPUT-BUFFER hard cap (PROD-SAFETY #5 / #529), identical to the tokio path: read the live
+        // cap ONCE per batch and enforce it both INSIDE the decode loop after each command's reply is
+        // appended (#529: bound resident output so one pipelined batch of large-reply commands cannot
+        // OOM the host) and again pre-flush after the batch is assembled. `0` disables the cap.
+        let obl = ctx.runtime.output_buffer_limit();
         // Running cursor: advance per command, drain the read buffer ONCE after the batch instead of
         // per command (per-command drain memmoves the remaining pipelined bytes each time -> O(P^2)).
         let mut consumed_total = 0usize;
@@ -2263,6 +2302,15 @@ async fn serve_connection_uring(
                         let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
                         break 'conn;
                     }
+                    // OUTPUT-BUFFER intra-batch cap (#529), identical to the tokio path: this
+                    // command's reply is now in `out`; if the accumulated reply buffer has grown past
+                    // the cap MID-BATCH, stop decoding and fall through to the post-batch drain +
+                    // pre-flush check, which close the connection. Bounds resident output so a single
+                    // pipelined batch of large-reply commands cannot OOM the host. At the default cap
+                    // / `0` (disabled) this is a single never-taken compare on the hot path.
+                    if obl > 0 && out.len() as u64 > obl {
+                        break;
+                    }
                 }
                 DecodeOutcome::Incomplete => break,
                 DecodeOutcome::Error(e) => {
@@ -2280,8 +2328,8 @@ async fn serve_connection_uring(
             read_buf.drain(..consumed_total);
         }
 
-        // OUTPUT-BUFFER hard cap (PROD-SAFETY #5), identical to the tokio path.
-        let obl = ctx.runtime.output_buffer_limit();
+        // OUTPUT-BUFFER hard cap (PROD-SAFETY #5), identical to the tokio path: the pre-flush check,
+        // using the `obl` read once at the top of this batch (shared with the intra-batch check).
         if obl > 0 && out.len() as u64 > obl {
             break;
         }
@@ -2343,6 +2391,17 @@ async fn serve_connection_uring(
             if n == 0 {
                 break; // peer closed
             }
+        }
+
+        // QUERY-BUFFER hard cap (#528), identical to the tokio path: every idle-wait arm above (the
+        // subscriber drain / the plain recv_batch) APPENDS the newly-arrived bytes into `read_buf`,
+        // then this loop re-decodes. If the accumulated inbound query buffer exceeds the configured
+        // `query_buffer_limit`, CLOSE the connection rather than let a slow-dribble multibulk force
+        // unbounded pre-auth inbound buffering. A single cold relaxed load on this post-batch / idle
+        // path; `0` disables the cap. The oversized buffer is dropped and the connection closed.
+        let qbl = ctx.runtime.query_buffer_limit();
+        if qbl > 0 && read_buf.len() as u64 > qbl {
+            break;
         }
     }
 

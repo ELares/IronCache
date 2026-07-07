@@ -142,6 +142,15 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "output-buffer-limit",
             kind: SetKind::Runtime,
         },
+        // The per-connection query-buffer hard cap in bytes (#528, the inbound analog of
+        // `output-buffer-limit`; Redis `client-query-buffer-limit`). RUNTIME-SETTABLE: `CONFIG SET
+        // query-buffer-limit <bytes>` updates the live cap the serve loop enforces after each recv;
+        // `0` disables it. Named with the simple scalar `query-buffer-limit` (IronCache uses a
+        // single hard byte cap on the accumulated inbound buffer).
+        ParamSpec {
+            name: "query-buffer-limit",
+            kind: SetKind::Runtime,
+        },
         // The inbound bulk-string + string-value-growth ceiling in bytes (Redis
         // `proto-max-bulk-len`). RUNTIME-SETTABLE: `CONFIG SET proto-max-bulk-len <bytes>` updates
         // the live ceiling the serve loop builds its decoder `Limits` from + the string/bitmap
@@ -307,6 +316,9 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // timeout` is reflected. `0` means idle disconnection is disabled.
         "timeout" => runtime.timeout_secs().to_string(),
         "output-buffer-limit" => runtime.output_buffer_limit().to_string(),
+        // The per-connection query-buffer cap (#528, inbound analog): read the overlay so a
+        // `CONFIG SET query-buffer-limit` is reflected; reported as a byte count.
+        "query-buffer-limit" => runtime.query_buffer_limit().to_string(),
         // The protocol / keepalive ceilings: read the overlay so a `CONFIG SET` is reflected.
         // `proto-max-bulk-len` is reported as a byte count (the form CONFIG SET accepts back);
         // `tcp-keepalive` is seconds (`0` = disabled).
@@ -498,6 +510,15 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
         "output-buffer-limit" => match crate::parse_human_size(value) {
             Ok(bytes) => {
                 runtime.set_output_buffer_limit(bytes);
+                SetOutcome::Applied
+            }
+            Err(e) => SetOutcome::InvalidValue(e.to_string()),
+        },
+        // The per-connection query-buffer hard cap (#528, inbound analog): a byte count accepted as
+        // a human size ("128mb") OR a plain integer; `0` disables it. A malformed value is rejected.
+        "query-buffer-limit" => match crate::parse_human_size(value) {
+            Ok(bytes) => {
+                runtime.set_query_buffer_limit(bytes);
                 SetOutcome::Applied
             }
             Err(e) => SetOutcome::InvalidValue(e.to_string()),

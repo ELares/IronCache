@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Connection / output safety-limit regression tests (PROD-SAFETY #3/#4/#5).
+//! Connection / output safety-limit regression tests (PROD-SAFETY #3/#4/#5 + #528/#529).
 //!
-//! A production-readiness audit found three connection-side DoS gaps the cache could not protect
+//! A production-readiness audit found five connection-side DoS gaps the cache could not protect
 //! itself from:
 //!
 //! - #3 NO `maxclients` cap: the accept loop NEVER rejected, so an attacker could exhaust
@@ -10,15 +10,25 @@
 //!   so idle connections accumulated.
 //! - #5 NO output-buffer-limit: a slow consumer / huge reply / pipelined flood could grow a
 //!   connection's pending output unbounded (server-memory DoS).
+//! - #528 NO query-buffer-limit: a client that announces a large multibulk (`*<huge>\r\n`) and then
+//!   DRIBBLES the elements forced unbounded PRE-AUTH inbound buffering (the frame never completes,
+//!   so the read buffer grew without bound).
+//! - #529 the output-buffer-limit fired only POST-batch: a single pipelined batch of large-reply
+//!   commands could accumulate unbounded reply bytes and OOM the host before the check ran.
 //!
 //! These tests boot the REAL server over real sockets and assert each limit is now enforced: the
 //! Nth+1 connection over the cap gets `-ERR max number of clients reached` and is closed; a
 //! connection idle past the (short, test-configured) timeout is closed while an ACTIVE one is not;
-//! and a connection whose accumulated reply exceeds the (small, test-configured) output-buffer cap
-//! is closed without unbounded growth. The defaults (no limits beyond the high ceilings) leave the
-//! behavior unchanged, covered by the byte-for-byte default-path test at the end.
+//! a connection whose accumulated reply exceeds the (small, test-configured) output-buffer cap is
+//! closed without unbounded growth (both at the single-reply boundary AND mid-pipelined-batch, #529);
+//! and a connection that dribbles a never-completing multibulk past the (small, test-configured)
+//! query-buffer cap is closed (#528). Both new caps are exercised via boot config AND a live
+//! `CONFIG SET`. The defaults (no limits beyond the high ceilings) leave the behavior unchanged,
+//! covered by the byte-for-byte default-path test at the end.
 
-use ironcache::test_support::run_server_with_limits_for_test;
+use ironcache::test_support::{
+    run_server_with_limits_for_test, run_server_with_query_buffer_limit_for_test,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -232,6 +242,182 @@ fn output_buffer_limit_closes_a_connection_over_the_cap() {
             delivered <= (cap as usize) * 4,
             "the server must not deliver an unbounded oversized reply (delivered {delivered} bytes \
              for a {cap}-byte cap); the connection should be closed"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// Dribble a never-completing multibulk into `client` and return the total inbound bytes the client
+/// managed to WRITE before the server closed the connection (a write error / a read EOF). The client
+/// first announces a large multibulk header (`*1048576\r\n`, exactly the decoder's `max_multibulk`
+/// cap so it is ACCEPTED, not a protocol error), then trickles single-char bulk elements that never
+/// complete the array -- the server must keep buffering every partial byte, so the query-buffer cap
+/// is what stops it. We keep writing in modest chunks and probe for the close after each, bounding
+/// the total we are willing to write to `max_bytes`; exceeding that means the cap was NOT enforced.
+async fn dribble_until_closed(client: &mut TcpStream, max_bytes: usize) -> Result<usize, usize> {
+    // Announce a huge (but at-cap, so accepted) multibulk that will never be completed.
+    if client.write_all(b"*1048576\r\n").await.is_err() {
+        return Ok(10);
+    }
+    // ~3 KiB of dribble per chunk (512 x the 6-byte "$1\r\nx\r\n" element).
+    let mut chunk = Vec::new();
+    for _ in 0..512 {
+        chunk.extend_from_slice(b"$1\r\nx\r\n");
+    }
+    let mut written = 10usize;
+    loop {
+        if client.write_all(&chunk).await.is_err() {
+            return Ok(written); // the server closed the socket (write failed): the cap fired.
+        }
+        written += chunk.len();
+        // Probe for a close without blocking: a short read. EOF (0) or a read error = closed; a
+        // read timeout (`Err`) or a stray byte (`Ok(Ok(n>0))`, not expected for a dribble) means the
+        // connection is still open, so keep dribbling.
+        let mut buf = [0u8; 64];
+        if let Ok(Ok(0) | Err(_)) =
+            tokio::time::timeout(Duration::from_millis(50), client.read(&mut buf)).await
+        {
+            return Ok(written); // EOF / read error: the server closed the connection.
+        }
+        if written > max_bytes {
+            return Err(written); // far past the cap and still open -> the limit was NOT enforced.
+        }
+    }
+}
+
+/// #528: with a SMALL query-buffer cap, a connection that announces a large multibulk and then
+/// DRIBBLES the elements (never completing the frame) is CLOSED once its accumulated inbound buffer
+/// crosses the cap, rather than being allowed to buffer unbounded pre-auth memory. The connection is
+/// dropped well before an unbounded amount of dribble is accepted.
+#[test]
+fn query_buffer_limit_closes_a_slow_dribble_multibulk() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        // A small 16 KiB query-buffer cap; single shard.
+        let cap: u64 = 16 * 1024;
+        let server = run_server_with_query_buffer_limit_for_test(port, 1, cap);
+
+        let mut c = connect_retry(port).await;
+        // Sanity: a normal command still works under the cap (the cap does not break legitimate use).
+        assert_eq!(cmd(&mut c, &["PING"]).await, b"+PONG\r\n");
+
+        // Dribble a never-completing multibulk: the server must close the connection at the cap. We
+        // bound the bytes we will write to 8x the cap; the server should close far sooner.
+        let bound = (cap as usize) * 8;
+        let written = dribble_until_closed(&mut c, bound)
+            .await
+            .expect("the dribbling connection must be closed at the query-buffer cap");
+        assert!(
+            written <= bound,
+            "the server must close a dribbled never-completing multibulk near the query cap \
+             (wrote {written} bytes for a {cap}-byte cap); the connection should be closed"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// #528 (CONFIG SET): the query-buffer cap is LIVE-settable. Boot with the cap OFF (the high
+/// default), then `CONFIG SET query-buffer-limit` to a small value on the SAME connection; the very
+/// next dribble is bounded and the connection is closed. Proves the cap is runtime-settable over a
+/// real socket (not only boot config).
+#[test]
+fn query_buffer_limit_is_config_settable_and_then_closes_a_dribble() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        // Boot with the query cap DISABLED (0): only a live CONFIG SET arms it.
+        let server = run_server_with_query_buffer_limit_for_test(port, 1, 0);
+
+        let mut c = connect_retry(port).await;
+        // Arm a small 16 KiB cap live; the setter accepts a human size and replies +OK.
+        assert_eq!(
+            cmd(&mut c, &["CONFIG", "SET", "query-buffer-limit", "16kb"]).await,
+            b"+OK\r\n",
+            "CONFIG SET query-buffer-limit must apply and ack"
+        );
+        // CONFIG GET reflects the live value (reported in bytes).
+        let getreply = cmd(&mut c, &["CONFIG", "GET", "query-buffer-limit"]).await;
+        assert!(
+            getreply
+                .windows(b"query-buffer-limit".len())
+                .any(|w| w == b"query-buffer-limit")
+                && getreply.windows(b"16384".len()).any(|w| w == b"16384"),
+            "CONFIG GET must report the live query-buffer-limit in bytes, got {getreply:?}"
+        );
+
+        // Now the dribble is bounded and the connection is closed at the live cap.
+        let cap = 16 * 1024usize;
+        let bound = cap * 8;
+        let written = dribble_until_closed(&mut c, bound)
+            .await
+            .expect("the dribbling connection must be closed at the live query-buffer cap");
+        assert!(
+            written <= bound,
+            "a CONFIG SET query-buffer-limit must bound a subsequent dribble (wrote {written} bytes)"
+        );
+
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// #529: with a SMALL output cap, a SINGLE pipelined batch of many large-reply commands is cut off
+/// MID-BATCH at the cap: the server stops accumulating replies and closes the connection rather than
+/// building the whole (potentially host-OOMing) batch output first. From the wire this reads as the
+/// connection being closed with far fewer than the full batch's reply bytes delivered. The prior
+/// code only checked the cap POST-batch, so it would have assembled the entire batch in memory first.
+#[test]
+fn output_buffer_limit_cuts_off_a_pipelined_batch_mid_batch() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        // A small 4 KiB output cap; maxclients/timeout off.
+        let cap: u64 = 4096;
+        let server = run_server_with_limits_for_test(port, 1, 0, 0, cap);
+
+        let mut c = connect_retry(port).await;
+
+        // Store one moderate value (~512 bytes, comfortably UNDER the cap so no single reply trips
+        // it): the batch must cross the cap only by ACCUMULATION across commands.
+        let val = "y".repeat(512);
+        assert_eq!(cmd(&mut c, &["SET", "k", &val]).await, b"+OK\r\n");
+
+        // Pipeline 200 GETs of it in ONE write: ~200 * ~520 bytes ~= 104 KiB of reply, which crosses
+        // the 4 KiB cap after ~8 commands. The intra-batch check (#529) must cut the batch off there
+        // and close the connection, so the client sees EOF with far less than the full 104 KiB.
+        let mut batch = Vec::new();
+        for _ in 0..200 {
+            batch.extend_from_slice(&encode_args(&["GET", "k"]));
+        }
+        c.write_all(&batch).await.unwrap();
+
+        // Read until EOF (or the outer timeout), bounding how much we will accept. Receiving the full
+        // oversized batch would mean the mid-batch cut did not fire.
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            let mut total = 0usize;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = c.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break; // EOF: the server closed the connection (the cap fired mid-batch).
+                }
+                total += n;
+                if total > (cap as usize) * 4 {
+                    return Err(total); // far more than the cap arrived -> not cut off mid-batch.
+                }
+            }
+            Ok(total)
+        })
+        .await
+        .expect("the over-cap pipelined batch must close the connection within the outer timeout");
+        let delivered = result
+            .expect("the server must cut the batch off mid-flight, not deliver the full batch reply");
+        assert!(
+            delivered <= (cap as usize) * 4,
+            "a pipelined batch over the output cap must be cut off mid-batch (delivered {delivered} \
+             bytes for a {cap}-byte cap); the connection should be closed"
         );
 
         server.shutdown_and_join().unwrap();
