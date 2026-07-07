@@ -1269,6 +1269,29 @@ impl Config {
         }
         Ok(())
     }
+
+    /// True when a CLUSTERED mode is configured but the inter-node bus / replication link runs
+    /// PLAINTEXT and UNAUTHENTICATED, i.e. it has NEITHER a shared `cluster_secret` NOR
+    /// `cluster_tls = on`. In that posture any party that can reach the cluster-bus port could join
+    /// consensus (forge `RAFTMSG`) or siphon the full keyspace off the replication stream, so the
+    /// binary emits a loud boot warning (see `cluster_bus::warn_if_unauthenticated`). Pure: a
+    /// posture read, no I/O, so it is unit-tested directly without a subscriber.
+    ///
+    /// "Clustered" is the broad reading the audit wants: `cluster_enabled` is set (a static
+    /// multi-node bus + replication) OR `cluster_mode` is anything other than `Static` (raft
+    /// governance or shard-owners), either of which stands up an inter-node link. The DEFAULT
+    /// standalone node (`cluster_enabled = false`, `cluster_mode = Static`) is NOT clustered, so
+    /// this returns `false` and the default boot logs nothing new.
+    ///
+    /// `cluster_tls = on` already REQUIRES a `cluster_secret` (enforced by
+    /// `validate_cluster_transport`), so a TLS bus is always authenticated; a bare `cluster_secret`
+    /// with TLS off is plaintext-but-authenticated (allowed, no warning). Only the no-secret,
+    /// no-TLS clustered case is the exposure.
+    #[must_use]
+    pub fn cluster_bus_unauthenticated(&self) -> bool {
+        let clustered = self.cluster_enabled || self.cluster_mode != ClusterMode::Static;
+        clustered && self.cluster_secret.is_none() && self.cluster_tls != TlsMode::On
+    }
 }
 
 /// Validate a [`ClusterTopology`] against `announce_id` (THIS node's id) by building a
@@ -1599,37 +1622,46 @@ impl ConfigOverlay {
     #[allow(clippy::too_many_lines)]
     pub fn from_env() -> Result<ConfigOverlay, ConfigError> {
         let mut o = ConfigOverlay::default();
-        if let Ok(v) = std::env::var("IRONCACHE_BIND") {
+        // SINGLE SOURCE OF TRUTH for the known `IRONCACHE_*` keys: `env_var` appends every key this
+        // reader probes into `known` as it reads it, so the strict "unknown key" guard at the end
+        // (below) cannot drift from the set of keys we actually honor. Adding a new `env_var(..)`
+        // read below automatically extends the known set; there is no second hand-maintained list.
+        let mut known: Vec<&'static str> = Vec::new();
+        let mut env_var = |key: &'static str| {
+            known.push(key);
+            std::env::var(key)
+        };
+        if let Ok(v) = env_var("IRONCACHE_BIND") {
             o.bind = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "bind",
                 reason: format!("not an IP address: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_PORT") {
+        if let Ok(v) = env_var("IRONCACHE_PORT") {
             o.port = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "port",
                 reason: format!("not a port: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_SHARDS") {
+        if let Ok(v) = env_var("IRONCACHE_SHARDS") {
             o.shards = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "shards",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_MAXMEMORY") {
+        if let Ok(v) = env_var("IRONCACHE_MAXMEMORY") {
             o.maxmemory = Some(v);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_MAXMEMORY_POLICY") {
+        if let Ok(v) = env_var("IRONCACHE_MAXMEMORY_POLICY") {
             o.maxmemory_policy = Some(v);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_REQUIREPASS") {
+        if let Ok(v) = env_var("IRONCACHE_REQUIREPASS") {
             o.requirepass = Some(v);
         }
         // Idle timeout (PROD-SAFETY #4): seconds a connection may sit idle before it is
         // closed; 0 disables it (Redis default). Env-readable for parity with the other
         // connection knobs (previously TOML-only).
-        if let Ok(v) = std::env::var("IRONCACHE_TIMEOUT") {
+        if let Ok(v) = env_var("IRONCACHE_TIMEOUT") {
             o.timeout = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "timeout",
                 reason: format!("not a number of seconds: {v}"),
@@ -1637,21 +1669,21 @@ impl ConfigOverlay {
         }
         // The simultaneous-connection ceiling (PROD-SAFETY #3, Redis `maxclients`); 0
         // disables the cap.
-        if let Ok(v) = std::env::var("IRONCACHE_MAXCLIENTS") {
+        if let Ok(v) = env_var("IRONCACHE_MAXCLIENTS") {
             o.maxclients = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "maxclients",
                 reason: format!("not a number: {v}"),
             })?);
         }
         // The per-connection output-buffer hard cap in bytes (PROD-SAFETY #5); 0 disables it.
-        if let Ok(v) = std::env::var("IRONCACHE_OUTPUT_BUFFER_LIMIT") {
+        if let Ok(v) = env_var("IRONCACHE_OUTPUT_BUFFER_LIMIT") {
             o.output_buffer_limit = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "output_buffer_limit",
                 reason: format!("not a number of bytes: {v}"),
             })?);
         }
         // The per-connection query-buffer hard cap in bytes (#528, inbound analog); 0 disables it.
-        if let Ok(v) = std::env::var("IRONCACHE_QUERY_BUFFER_LIMIT") {
+        if let Ok(v) = env_var("IRONCACHE_QUERY_BUFFER_LIMIT") {
             o.query_buffer_limit = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "query_buffer_limit",
                 reason: format!("not a number of bytes: {v}"),
@@ -1659,7 +1691,7 @@ impl ConfigOverlay {
         }
         // The inbound bulk-string + string-value-growth ceiling (Redis `proto-max-bulk-len`).
         // Accepts a human size ("512mb") OR a plain byte count for env parity with maxmemory.
-        if let Ok(v) = std::env::var("IRONCACHE_PROTO_MAX_BULK_LEN") {
+        if let Ok(v) = env_var("IRONCACHE_PROTO_MAX_BULK_LEN") {
             o.proto_max_bulk_len =
                 Some(parse_human_size(&v).map_err(|_| ConfigError::Invalid {
                     field: "proto_max_bulk_len",
@@ -1668,7 +1700,7 @@ impl ConfigOverlay {
         }
         // The TCP keepalive idle interval in seconds applied at accept (Redis `tcp-keepalive`); 0
         // disables keepalive.
-        if let Ok(v) = std::env::var("IRONCACHE_TCP_KEEPALIVE") {
+        if let Ok(v) = env_var("IRONCACHE_TCP_KEEPALIVE") {
             o.tcp_keepalive_secs = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "tcp_keepalive_secs",
                 reason: format!("not a number of seconds: {v}"),
@@ -1676,55 +1708,55 @@ impl ConfigOverlay {
         }
         // The 8 collection-encoding thresholds (Redis `*-max-listpack-*` / `set-max-intset-entries`).
         // Single scalars, so env-encodable; `list-max-listpack-size` is the signed Redis form.
-        if let Ok(v) = std::env::var("IRONCACHE_HASH_MAX_LISTPACK_ENTRIES") {
+        if let Ok(v) = env_var("IRONCACHE_HASH_MAX_LISTPACK_ENTRIES") {
             o.hash_max_listpack_entries = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "hash_max_listpack_entries",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_HASH_MAX_LISTPACK_VALUE") {
+        if let Ok(v) = env_var("IRONCACHE_HASH_MAX_LISTPACK_VALUE") {
             o.hash_max_listpack_value = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "hash_max_listpack_value",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_LIST_MAX_LISTPACK_SIZE") {
+        if let Ok(v) = env_var("IRONCACHE_LIST_MAX_LISTPACK_SIZE") {
             o.list_max_listpack_size = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "list_max_listpack_size",
                 reason: format!("not a signed number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_SET_MAX_INTSET_ENTRIES") {
+        if let Ok(v) = env_var("IRONCACHE_SET_MAX_INTSET_ENTRIES") {
             o.set_max_intset_entries = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "set_max_intset_entries",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_SET_MAX_LISTPACK_ENTRIES") {
+        if let Ok(v) = env_var("IRONCACHE_SET_MAX_LISTPACK_ENTRIES") {
             o.set_max_listpack_entries = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "set_max_listpack_entries",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_SET_MAX_LISTPACK_VALUE") {
+        if let Ok(v) = env_var("IRONCACHE_SET_MAX_LISTPACK_VALUE") {
             o.set_max_listpack_value = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "set_max_listpack_value",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_ZSET_MAX_LISTPACK_ENTRIES") {
+        if let Ok(v) = env_var("IRONCACHE_ZSET_MAX_LISTPACK_ENTRIES") {
             o.zset_max_listpack_entries = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "zset_max_listpack_entries",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_ZSET_MAX_LISTPACK_VALUE") {
+        if let Ok(v) = env_var("IRONCACHE_ZSET_MAX_LISTPACK_VALUE") {
             o.zset_max_listpack_value = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "zset_max_listpack_value",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_ENABLED") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_ENABLED") {
             o.cluster_enabled = Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
                 field: "cluster-enabled",
                 reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
@@ -1733,14 +1765,14 @@ impl ConfigOverlay {
         // The announce id is a single scalar, so it is env-encodable (useful for per-pod
         // identity injection in a stateful set). The structured topology is TOML-only. The id
         // is validated (40-hex + present in topology) by Config::validate via the slot map.
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_ANNOUNCE_ID") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_ANNOUNCE_ID") {
             o.cluster_announce_id = Some(v);
         }
         // The cluster-governance mode (HA-4c): `static` (default) or `raft`. A single scalar,
         // so it is env-encodable (per-pod injection alongside the announce id). Mirrors the
         // `cluster_enabled` env handling: an unrecognized token hard-fails rather than
         // silently picking a mode.
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_MODE") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_MODE") {
             o.cluster_mode = Some(parse_cluster_mode(&v).ok_or_else(|| ConfigError::Invalid {
                 field: "cluster-mode",
                 reason: format!("not a cluster mode (expected static/raft/shard-owners): {v}"),
@@ -1749,13 +1781,13 @@ impl ConfigOverlay {
         // HA-8 knobs (single scalars, so env-encodable for per-pod injection). Both are
         // meaningful only in raft-mode; a malformed value hard-fails boot rather than
         // silently picking a default.
-        if let Ok(v) = std::env::var("IRONCACHE_REPLICA_MAX_LAG") {
+        if let Ok(v) = env_var("IRONCACHE_REPLICA_MAX_LAG") {
             o.replica_max_lag = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "replica-max-lag",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_FAILOVER_TIMEOUT_SECS") {
+        if let Ok(v) = env_var("IRONCACHE_FAILOVER_TIMEOUT_SECS") {
             o.failover_timeout_secs = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "failover-timeout-secs",
                 reason: format!("not a number: {v}"),
@@ -1764,32 +1796,32 @@ impl ConfigOverlay {
         // The write-side replication guardrail knobs (single scalars, env-encodable for per-pod
         // injection). Both are meaningful only in raft-mode AND only when the guardrail is
         // enabled; a malformed value hard-fails boot rather than silently picking a default.
-        if let Ok(v) = std::env::var("IRONCACHE_MIN_REPLICAS_TO_WRITE") {
+        if let Ok(v) = env_var("IRONCACHE_MIN_REPLICAS_TO_WRITE") {
             o.min_replicas_to_write = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "min-replicas-to-write",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_MIN_REPLICAS_MAX_LAG") {
+        if let Ok(v) = env_var("IRONCACHE_MIN_REPLICAS_MAX_LAG") {
             o.min_replicas_max_lag = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "min-replicas-max-lag",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_RAFT_SNAPSHOT_THRESHOLD") {
+        if let Ok(v) = env_var("IRONCACHE_RAFT_SNAPSHOT_THRESHOLD") {
             o.raft_snapshot_threshold = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "raft-snapshot-threshold",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES") {
+        if let Ok(v) = env_var("IRONCACHE_RAFT_SNAPSHOT_CHUNK_BYTES") {
             o.raft_snapshot_chunk_bytes = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "raft-snapshot-chunk-bytes",
                 reason: format!("not a number: {v}"),
             })?);
         }
         // HA-7e disk-backed replication backlog size (bytes); a single scalar, env-encodable.
-        if let Ok(v) = std::env::var("IRONCACHE_REPL_BACKLOG_DISK_BYTES") {
+        if let Ok(v) = env_var("IRONCACHE_REPL_BACKLOG_DISK_BYTES") {
             o.repl_backlog_disk_bytes = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "repl-backlog-disk-bytes",
                 reason: format!("not a number: {v}"),
@@ -1798,12 +1830,12 @@ impl ConfigOverlay {
         // The durable data directory is a single scalar path, so it is env-encodable (useful
         // for per-pod injection in a stateful set alongside the announce id). A path is taken
         // verbatim (no parse can fail); an empty value is rejected by Config::validate.
-        if let Ok(v) = std::env::var("IRONCACHE_DATA_DIR") {
+        if let Ok(v) = env_var("IRONCACHE_DATA_DIR") {
             o.data_dir = Some(PathBuf::from(v));
         }
         // The ACL file path (#106) is a single scalar path, env-encodable for per-pod injection.
         // Taken verbatim (no parse can fail); a missing/unreadable file hard-fails at boot LOAD.
-        if let Ok(v) = std::env::var("IRONCACHE_ACLFILE") {
+        if let Ok(v) = env_var("IRONCACHE_ACLFILE") {
             o.aclfile = Some(PathBuf::from(v));
         }
         // TRANSPORT TLS knobs (#105). The mode is a single scalar token (off/on, case-insensitive),
@@ -1811,23 +1843,23 @@ impl ConfigOverlay {
         // silently picking a posture (mirrors `cluster_enabled` / `cluster_mode`). The cert/key are
         // scalar paths taken verbatim (no parse can fail); their readability is checked in
         // Config::validate when tls = on.
-        if let Ok(v) = std::env::var("IRONCACHE_TLS") {
+        if let Ok(v) = env_var("IRONCACHE_TLS") {
             o.tls = Some(parse_tls_mode(&v).ok_or_else(|| ConfigError::Invalid {
                 field: "tls",
                 reason: format!("not a TLS mode (expected off/on): {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_TLS_CERT_PATH") {
+        if let Ok(v) = env_var("IRONCACHE_TLS_CERT_PATH") {
             o.tls_cert_path = Some(PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("IRONCACHE_TLS_KEY_PATH") {
+        if let Ok(v) = env_var("IRONCACHE_TLS_KEY_PATH") {
             o.tls_key_path = Some(PathBuf::from(v));
         }
         // The per-shard RUNTIME backend (PROD-10 / #28): a single tokio/io_uring token
         // (case-insensitive), env-encodable for per-pod injection; an unrecognized token hard-fails
         // boot (mirrors the `tls` / `cluster_mode` knobs). Requesting `io_uring` on a non-Linux /
         // no-feature / TLS build is NOT an error here -- it falls back to tokio at boot.
-        if let Ok(v) = std::env::var("IRONCACHE_RUNTIME") {
+        if let Ok(v) = env_var("IRONCACHE_RUNTIME") {
             o.runtime = Some(
                 parse_runtime_backend(&v).ok_or_else(|| ConfigError::Invalid {
                     field: "runtime",
@@ -1840,27 +1872,27 @@ impl ConfigOverlay {
         // boot (mirrors the public `tls` knob). The cert/key/CA are scalar paths taken verbatim
         // (readability checked in Config::validate when cluster_tls = on); the secret is a scalar
         // token taken verbatim.
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_TLS") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_TLS") {
             o.cluster_tls = Some(parse_tls_mode(&v).ok_or_else(|| ConfigError::Invalid {
                 field: "cluster-tls",
                 reason: format!("not a TLS mode (expected off/on): {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_TLS_CERT_PATH") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_TLS_CERT_PATH") {
             o.cluster_tls_cert_path = Some(PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_TLS_KEY_PATH") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_TLS_KEY_PATH") {
             o.cluster_tls_key_path = Some(PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_CA_PATH") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_CA_PATH") {
             o.cluster_ca_path = Some(PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_SECRET") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_SECRET") {
             o.cluster_secret = Some(v);
         }
         // The insecure peer-cert-skip opt-out is a boolean (yes/no/true/false/1/0). An unrecognized
         // token hard-fails boot rather than silently leaving verification on/off.
-        if let Ok(v) = std::env::var("IRONCACHE_CLUSTER_TLS_INSECURE_SKIP_VERIFY") {
+        if let Ok(v) = env_var("IRONCACHE_CLUSTER_TLS_INSECURE_SKIP_VERIFY") {
             o.cluster_tls_insecure_skip_verify =
                 Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
                     field: "cluster-tls-insecure-skip-verify",
@@ -1869,7 +1901,7 @@ impl ConfigOverlay {
         }
         // FAIL CLOSED on a version-mismatched snapshot is a boolean (#530). An unrecognized token
         // hard-fails boot rather than silently leaving the posture off.
-        if let Ok(v) = std::env::var("IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH") {
+        if let Ok(v) = env_var("IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH") {
             o.refuse_empty_start_on_version_mismatch =
                 Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
                     field: "refuse-empty-start-on-version-mismatch",
@@ -1879,22 +1911,30 @@ impl ConfigOverlay {
         // PERSISTENCE save-policy knobs (#58, single scalars, env-encodable for per-pod injection).
         // Both are meaningful only when a data_dir is set; a malformed value hard-fails boot rather
         // than silently picking a default (mirrors the other numeric knobs above).
-        if let Ok(v) = std::env::var("IRONCACHE_SAVE_INTERVAL_SECS") {
+        if let Ok(v) = env_var("IRONCACHE_SAVE_INTERVAL_SECS") {
             o.save_interval_secs = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "save-interval-secs",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_SAVE_MIN_CHANGES") {
+        if let Ok(v) = env_var("IRONCACHE_SAVE_MIN_CHANGES") {
             o.save_min_changes = Some(v.parse().map_err(|_| ConfigError::Invalid {
                 field: "save-min-changes",
                 reason: format!("not a number: {v}"),
             })?);
         }
-        if let Ok(v) = std::env::var("IRONCACHE_NOTIFY_KEYSPACE_EVENTS") {
+        if let Ok(v) = env_var("IRONCACHE_NOTIFY_KEYSPACE_EVENTS") {
             // The flag-string validity is checked once on the resolved value in Config::validate.
             o.notify_keyspace_events = Some(v);
         }
+        // STRICT UNKNOWN-KEY GUARD (mirrors the `deny_unknown_fields` TOML posture). Every key we
+        // honor was recorded in `known` above, so ANY `IRONCACHE_*` variable present in the
+        // environment that is NOT there is a typo (e.g. `IRONCACHE_MAXCLIENT` for
+        // `IRONCACHE_MAXCLIENTS`) whose intended setting would otherwise be silently dropped, the
+        // exact opposite of the strict-TOML posture. Fail boot naming the key (with a nearest-known
+        // suggestion). `env_var` is not called past this point, so its `&mut known` borrow has
+        // ended and the guard can read `known`.
+        reject_unknown_env(std::env::vars().map(|(k, _)| k), &known)?;
         Ok(o)
     }
 
@@ -2253,6 +2293,92 @@ pub fn render_save_points(interval_secs: u64, min_changes: u64) -> String {
     } else {
         format!("{interval_secs} {min_changes}")
     }
+}
+
+/// Reject the first `IRONCACHE_*` environment variable in `present` that `from_env` does not honor
+/// (its keys are `known`), mirroring the strict `deny_unknown_fields` TOML posture: a typo'd var
+/// (e.g. `IRONCACHE_MAXCLIENT` for `IRONCACHE_MAXCLIENTS`) would otherwise be SILENTLY ignored and
+/// the operator's intended setting lost. `known` is the exact set of keys `from_env` probed (its
+/// single source of truth), so this guard can never drift from what the reader accepts.
+///
+/// Two `IRONCACHE_*` namespaces are deliberately allowed through so a legitimate boot is not
+/// rejected:
+///
+/// * `IRONCACHE_CONSOLE_*` belongs to the SEPARATE `ironcache-console` binary (with its own strict
+///   env validation); a shared deployment env may legitimately carry both, and the server should
+///   not fail boot over a sibling component's variable.
+/// * `IRONCACHE_BUILD_VERSION` is the compile-time release stamp (read via `option_env!` in
+///   `build.rs`); a build/deploy environment that exports it at runtime is harmless, so allow it.
+///
+/// This is the PURE core (it takes the environment key names, not the process env) so it is
+/// unit-tested without mutating `std::env`; `from_env` wires in `std::env::vars()`.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Invalid`] (`field = "env"`) naming the first unknown key and, when a
+/// close known key exists, a "did you mean" suggestion.
+fn reject_unknown_env<I, S>(present: I, known: &[&str]) -> Result<(), ConfigError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for key in present {
+        let key = key.as_ref();
+        if !key.starts_with("IRONCACHE_") {
+            continue;
+        }
+        if key.starts_with("IRONCACHE_CONSOLE_") || key == "IRONCACHE_BUILD_VERSION" {
+            continue;
+        }
+        if known.contains(&key) {
+            continue;
+        }
+        let hint = nearest_env_key(key, known)
+            .map(|s| format!(" (did you mean {s}?)"))
+            .unwrap_or_default();
+        return Err(ConfigError::Invalid {
+            field: "env",
+            reason: format!(
+                "unknown IRONCACHE_* environment variable {key}{hint}; unset it or fix the typo \
+                 (unknown env vars are rejected, matching the strict TOML deny_unknown_fields \
+                 posture, so a mistyped knob is never silently ignored)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The nearest key in `known` to `key` by Levenshtein edit distance, returned ONLY when it is a
+/// plausible typo (distance <= 3 AND strictly less than the key length, so an unrelated short key
+/// is not "suggested" for a long typo). Used to add a "did you mean" hint to the unknown-env error.
+/// Pure and small (the known set is tiny), so the quadratic DP cost is irrelevant at boot.
+fn nearest_env_key<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
+    let mut best: Option<(&'a str, usize)> = None;
+    for &cand in known {
+        let d = levenshtein(key, cand);
+        if best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((cand, d));
+        }
+    }
+    best.and_then(|(cand, d)| (d <= 3 && d < key.len()).then_some(cand))
+}
+
+/// Levenshtein edit distance between two byte strings (ASCII env-var names), a standard two-row
+/// dynamic program. Pure helper for [`nearest_env_key`]'s "did you mean" suggestion.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for (i, &ac) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &bc) in b.iter().enumerate() {
+            let cost = usize::from(ac != bc);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 #[cfg(test)]
@@ -3594,5 +3720,91 @@ mod tests {
             apply_set("query-buffer-limit", "1.5gb", &runtime),
             SetOutcome::InvalidValue(_)
         ));
+    }
+
+    #[test]
+    fn cluster_bus_unauthenticated_flags_only_the_exposed_posture() {
+        // The DEFAULT standalone node is NOT clustered -> no warning (byte-unchanged boot).
+        assert!(!Config::default().cluster_bus_unauthenticated());
+
+        // cluster_enabled with NEITHER a secret NOR TLS is the exposure the audit names.
+        let exposed = Config {
+            cluster_enabled: true,
+            ..Config::default()
+        };
+        assert!(exposed.cluster_bus_unauthenticated());
+
+        // A non-static cluster_mode (raft / shard-owners) is likewise clustered.
+        let raft = Config {
+            cluster_mode: ClusterMode::Raft,
+            ..Config::default()
+        };
+        assert!(raft.cluster_bus_unauthenticated());
+
+        // A shared secret (even plaintext) AUTHENTICATES the peer -> no warning.
+        let secret = Config {
+            cluster_enabled: true,
+            cluster_secret: Some("s3cret".to_owned()),
+            ..Config::default()
+        };
+        assert!(!secret.cluster_bus_unauthenticated());
+
+        // cluster_tls = on always carries a secret (validate enforces it) -> authenticated.
+        let tls = Config {
+            cluster_enabled: true,
+            cluster_tls: TlsMode::On,
+            ..Config::default()
+        };
+        assert!(!tls.cluster_bus_unauthenticated());
+    }
+
+    #[test]
+    fn reject_unknown_env_names_the_typo_and_suggests() {
+        // The exact key set from_env probes is the single source of truth; a small representative
+        // slice is enough to exercise the guard. A typo'd key is rejected, naming it + a hint.
+        let known: &[&'static str] = &["IRONCACHE_MAXCLIENTS", "IRONCACHE_PORT", "IRONCACHE_BIND"];
+        let err = reject_unknown_env(["IRONCACHE_MAXCLIENT"], known)
+            .expect_err("a typo'd IRONCACHE_* var must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("IRONCACHE_MAXCLIENT"), "names the key: {msg}");
+        assert!(
+            msg.contains("did you mean IRONCACHE_MAXCLIENTS"),
+            "suggests the nearest key: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_unknown_env_allows_known_foreign_and_non_prefixed_keys() {
+        let known: &[&'static str] = &["IRONCACHE_PORT", "IRONCACHE_BIND"];
+        // A known key, a non-IRONCACHE key, the console namespace, and the build stamp all pass.
+        reject_unknown_env(
+            [
+                "IRONCACHE_PORT",
+                "PATH",
+                "RUST_BACKTRACE",
+                "LISTEN_FDS",
+                "IRONCACHE_CONSOLE_HTTP_ADDR",
+                "IRONCACHE_BUILD_VERSION",
+            ],
+            known,
+        )
+        .expect("known + foreign-namespaced + non-prefixed vars must all be allowed");
+    }
+
+    #[test]
+    fn nearest_env_key_only_suggests_plausible_typos() {
+        let known: &[&'static str] = &["IRONCACHE_MAXCLIENTS", "IRONCACHE_TIMEOUT"];
+        // A one-char deletion is a plausible typo.
+        assert_eq!(
+            nearest_env_key("IRONCACHE_MAXCLIENT", known),
+            Some("IRONCACHE_MAXCLIENTS")
+        );
+        // A wildly different key gets no (misleading) suggestion.
+        assert_eq!(
+            nearest_env_key("IRONCACHE_TOTALLY_DIFFERENT_KNOB", known),
+            None
+        );
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("same", "same"), 0);
     }
 }
