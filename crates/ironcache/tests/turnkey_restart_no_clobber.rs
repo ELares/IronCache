@@ -143,6 +143,10 @@ fn spawn_node(config_path: &Path) -> Child {
     cmd.arg("server")
         .arg("--config")
         .arg(config_path)
+        // Metrics endpoint is default-on (127.0.0.1:9091) since #555; several nodes run at once and
+        // this test does not exercise it, so disable it to avoid a shared ops-port bind conflict.
+        .arg("--metrics-addr")
+        .arg("off")
         .env_remove("IRONCACHE_DATA_DIR")
         .env_remove("IRONCACHE_CLUSTER_MODE")
         .env_remove("IRONCACHE_CLUSTER_ENABLED")

@@ -52,7 +52,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "LEVEL", default_value = "info")]
     pub log_level: String,
 
-    /// Metrics endpoint address (reserved; /metrics lands with observability).
+    /// Metrics / health endpoint bind (serves `/metrics`, `/livez`, `/readyz`). Absent means the
+    /// DEFAULT localhost bind [`DEFAULT_METRICS_ADDR`] (`127.0.0.1:9091`), so a Prometheus scrape and
+    /// the k8s probes work out of the box WITHOUT exposing the ops port publicly (#555, the
+    /// tunability principle: env-dependent tradeoffs default SAFE, not off). Override with any
+    /// `host:port` (e.g. `0.0.0.0:9121` to expose it behind a network policy), or DISABLE the
+    /// endpoint with `off` (also `none` / `disabled` / an empty value). Resolution lives in
+    /// [`effective_metrics_addr`].
     #[arg(long, global = true, value_name = "ADDR")]
     pub metrics_addr: Option<String>,
 
@@ -207,6 +213,34 @@ pub struct UpgradeArgs {
     pub no_freeze: bool,
 }
 
+/// The DEFAULT metrics / health endpoint bind (#555). A LOCALHOST address so `/metrics`, `/livez`,
+/// and `/readyz` are scrapable out of the box WITHOUT exposing the ops port publicly, per the
+/// tunability principle (env-dependent tradeoffs default SAFE, not off). Override with any
+/// `host:port` (e.g. `0.0.0.0:9121` to expose it behind a network policy) or disable it with `off`;
+/// [`effective_metrics_addr`] applies the policy. Chosen distinct from the RESP port (6379) and from
+/// the deployment artifacts' publicly-exposed `9121` so a local default cannot collide with them.
+pub const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9091";
+
+/// Resolve the EFFECTIVE metrics bind from the (optional) `--metrics-addr` value:
+///
+///   * absent (`None`) -> the default localhost bind [`DEFAULT_METRICS_ADDR`] (endpoint ON),
+///   * a disable sentinel (`off` / `none` / `disabled` / empty, case-insensitive) -> `None` (OFF),
+///   * any other value -> that `host:port` (the operator's override).
+///
+/// This is the single place the default-on-localhost policy is applied, keeping it OVERRIDABLE and
+/// DISABLE-ABLE (the tunability principle: never a baked-in one-way choice). `None` in the return
+/// means the endpoint is disabled and no listener is bound.
+#[must_use]
+pub fn effective_metrics_addr(raw: Option<&str>) -> Option<&str> {
+    let value = raw.unwrap_or(DEFAULT_METRICS_ADDR).trim();
+    let disabled = value.is_empty()
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("disable")
+        || value.eq_ignore_ascii_case("disabled");
+    if disabled { None } else { Some(value) }
+}
+
 /// Returns true when the binary was invoked under a `redis-cli` basename, in
 /// which case dispatch forwards to `cli` (ADR-0020 alias).
 #[must_use]
@@ -269,5 +303,41 @@ mod tests {
     fn no_subcommand_is_allowed() {
         let cli = Cli::try_parse_from(["ironcache"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn metrics_addr_defaults_on_localhost() {
+        // #555, tunability principle: an ABSENT `--metrics-addr` resolves to the localhost default
+        // (endpoint ON, scrapable out of the box, not publicly exposed) -- the safe default, not off.
+        assert_eq!(effective_metrics_addr(None), Some(DEFAULT_METRICS_ADDR));
+        assert_eq!(effective_metrics_addr(None), Some("127.0.0.1:9091"));
+    }
+
+    #[test]
+    fn metrics_addr_override_is_honored() {
+        // An explicit bind overrides the default (e.g. exposing it behind a network policy).
+        assert_eq!(
+            effective_metrics_addr(Some("0.0.0.0:9121")),
+            Some("0.0.0.0:9121")
+        );
+        // Surrounding whitespace is trimmed so a config-templated value is not mis-parsed.
+        assert_eq!(
+            effective_metrics_addr(Some("  127.0.0.1:9091  ")),
+            Some("127.0.0.1:9091")
+        );
+    }
+
+    #[test]
+    fn metrics_addr_disable_sentinels_turn_it_off() {
+        // The endpoint stays DISABLE-ABLE (tunability): a sentinel value binds no listener.
+        for raw in [
+            "off", "OFF", "Off", "none", "None", "disable", "disabled", "", "   ",
+        ] {
+            assert_eq!(
+                effective_metrics_addr(Some(raw)),
+                None,
+                "'{raw}' should disable the metrics endpoint"
+            );
+        }
     }
 }

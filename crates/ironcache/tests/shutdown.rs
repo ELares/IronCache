@@ -213,6 +213,11 @@ fn spawn_binary(port: u16, data_dir: Option<&std::path::Path>, interval_secs: u6
         .arg(port.to_string())
         .arg("--shards")
         .arg("2")
+        // Metrics endpoint is default-on (127.0.0.1:9091) since #555; this test does not exercise
+        // it and several subprocesses run in parallel, so disable it explicitly to avoid a shared
+        // ops-port bind conflict (a bind failure is a hard boot error).
+        .arg("--metrics-addr")
+        .arg("off")
         // Do not read the conventional /etc config path in CI.
         .env_remove("IRONCACHE_DATA_DIR")
         .stdin(Stdio::null())

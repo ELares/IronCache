@@ -46,16 +46,17 @@ redis-cli ... SLOWLOG GET 10
 redis-cli ... CLIENT LIST
 ```
 
-`--metrics-addr` must be set for `/livez`, `/readyz`, and `/metrics` to exist; with no
-`--metrics-addr` no HTTP listener is bound (see `DEPLOY.md` section 7). The RESP
+The ops HTTP endpoint (`/livez`, `/readyz`, `/metrics`) is ON by default at
+`127.0.0.1:9091` (since #555); override the bind with `--metrics-addr <ip:port>` or
+disable it with `--metrics-addr off` (see `DEPLOY.md` section 7). The RESP
 introspection commands (`INFO`, `SLOWLOG`, `CLIENT`, ...) work regardless.
 
 ---
 
 ## Probe states
 
-The ops HTTP endpoint (bound on `--metrics-addr`) serves three fixed routes.
-Semantics are in `crates/ironcache/src/metrics_http.rs`.
+The ops HTTP endpoint (default `127.0.0.1:9091`, set by `--metrics-addr`) serves
+three fixed routes. Semantics are in `crates/ironcache/src/metrics_http.rs`.
 
 | Route | Code + body | Meaning |
 |-------|-------------|---------|

@@ -21,7 +21,8 @@ pub mod blocking;
 pub mod coordinator;
 /// The out-of-band operations HTTP endpoint (OBSERVABILITY.md, #152): a bounded, hand-rolled
 /// tokio HTTP/1.1 responder on `--metrics-addr` serving Prometheus `/metrics`, `/livez`, and
-/// `/readyz`. Spawned ONLY when `--metrics-addr` is set; default-off boot is byte-identical.
+/// `/readyz`. Enabled by DEFAULT on a localhost bind (#555, `127.0.0.1:9091`); disable it with
+/// `--metrics-addr off`.
 pub mod metrics_http;
 pub mod multikey;
 /// Boot-time PANIC HOOK for crash ergonomics (#551): a process-wide hook installed once at boot that
