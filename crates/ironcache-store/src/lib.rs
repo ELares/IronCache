@@ -10,14 +10,25 @@
 //! is held via `&mut self`, so the binary wires it as `Rc<RefCell<ShardStore>>`
 //! (the same pattern as the per-shard `Env`).
 //!
-//! ## Slot partitioning (deferred)
+//! ## Slot partitioning (#570, the bounded-resize tail-latency lever)
 //!
-//! HASHTABLE.md describes a per-SLOT table within each shard (the 16384-slot space,
-//! ADR-0011). The slot dimension is a cluster-routing concern (#35/#129/#75); PR-2a
-//! is single-node and uses one table per DB. The slot split is an internal
-//! representation change behind the same `Store` waist (a `HashMap` per (db, slot)
-//! instead of per db) and changes no command-layer or waist signature, so it is
-//! deferred without freezing anything out.
+//! Each logical DB's keyspace is PARTITIONED into [`DEFAULT_SLOTS_PER_DB`] per-slot
+//! tables (`dbs[db]` is a `Vec<HashTable<Entry>>`, one small table per slot), routing
+//! every op by [`slot_index`] (a FIXED-SEED key hash, ADR-0003). This is the intended
+//! per-slot design (HASHTABLE.md "Growth and rehash"): a `hashbrown` all-at-once resize
+//! now rehashes only ONE slot's ~N/S entries, not the DB's whole N, so the worst-case
+//! single-insert resize on the serving core is bounded to a small slot (at 1M keys and
+//! 256 slots, ~4000 entries instead of 1M, a ~250x smaller p99.9 stall). This is an
+//! INTERNAL representation change behind the frozen `Store` waist: no command-layer or
+//! waist signature moves. The store-internal slot is DISTINCT from the cluster wire slot
+//! (ironcache-cluster's CRC16 16384-space, #70): this is a memory/latency partition of
+//! one shard's own tables, not a routing concern.
+//!
+//! The slot count is a MEMORY/latency tradeoff, so it is a config knob with a safe
+//! default (the tunability tenet): more slots shrink the resize unit but add a fixed
+//! per-DB `Vec` cost. To keep that cost off unused DBs, a DB's slot tables are allocated
+//! LAZILY on its first write (an untouched DB carries an empty `Vec`, no slot tables), so
+//! a typical single-DB workload pays for one DB's slots, not all `databases` of them.
 //!
 //! ## Determinism and time (ADR-0003)
 //!
@@ -98,6 +109,34 @@ pub fn scan_hash(key: &[u8]) -> u64 {
     h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     h ^ (h >> 31)
+}
+
+/// The default number of per-slot tables each database is partitioned into (#570). A
+/// MODEST power-of-two count: the per-insert resize unit is bounded to ~N/S entries, so
+/// at 1M keys a resize rehashes ~4000 entries (~80us) instead of ~1M (~6ms), a ~250x
+/// smaller p99.9 stall, at a small fixed per-DB `Vec` cost (S empty [`HashTable`]s, each
+/// a few words with NO bucket allocation until first insert). 256 balances the tail-
+/// latency win against that fixed cost so the perf-gate bytes-per-key does not regress
+/// (BENCHMARK.md #8). Overridable per the tunability tenet via
+/// [`ShardStore::with_slots_per_db`] (a boot/config knob); the value is rounded UP to a
+/// power of two there so routing is a mask.
+pub const DEFAULT_SLOTS_PER_DB: usize = 256;
+
+/// The per-DB partition slot for `key` given `slots` (a power of two): the FIXED-SEED,
+/// key-derived [`scan_hash`] masked to the slot count. It is DELIBERATELY the fixed-seed
+/// hash, NOT `hashbrown`'s per-run table hasher, so slot routing is DETERMINISTIC run-to-
+/// run (ADR-0003: two shards with identical keyspaces partition identically, and the
+/// physical resize timing is reproducible). Because [`scan_hash`] is well-avalanched,
+/// masking its low bits spreads keys evenly across the slots, keeping every slot near
+/// the ~N/S average so no single slot's resize approaches the DB's whole N. This is the
+/// STORE-INTERNAL slot, separate from the cluster wire slot (ironcache-cluster CRC16).
+#[inline]
+#[must_use]
+fn slot_index(key: &[u8], slots: usize) -> usize {
+    // `slots` is a power of two (enforced at construction), so `& (slots - 1)` is the
+    // low-bit mask. A single slot (`slots == 1`) masks to 0 (one table, the pre-#570
+    // behavior).
+    (scan_hash(key) as usize) & (slots - 1)
 }
 
 /// The result of the pure SCAN cursor-stepping core ([`scan_plan`]): which sorted
@@ -218,13 +257,29 @@ fn scan_plan<'a>(
 /// [`NullEviction`] and [`CountingAccounting`].
 #[derive(Debug)]
 pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = CountingAccounting> {
-    /// One per-database SwissTable, each storing a single-allocation [`Entry`] per key
-    /// (memory Round 3). `dbs[db]` is the keyspace for `SELECT db`. Unlike a
-    /// `HashMap<Box<[u8]>, _>`, the low-level [`HashTable`] stores ONLY the entry and
-    /// derives the key from inside it ([`Entry::key`]), so there is no separate map key
-    /// allocation and no key duplication. Lookups hash the probe key with [`Self::hasher`]
-    /// and pass the hash + an eq closure to `find`/`find_entry`/`entry`.
-    dbs: Vec<HashTable<Entry>>,
+    /// Per-database, per-SLOT SwissTables (#570), each storing a single-allocation
+    /// [`Entry`] per key (memory Round 3). `dbs[db]` is the keyspace for `SELECT db`,
+    /// PARTITIONED into [`Self::slots`] per-slot tables so a `hashbrown` all-at-once
+    /// resize rehashes only one slot's ~N/S entries, not the DB's whole N (the bounded-
+    /// resize tail-latency lever). `dbs[db][slot_index(key, slots)]` is the table for a
+    /// key. Unlike a `HashMap<Box<[u8]>, _>`, the low-level [`HashTable`] stores ONLY the
+    /// entry and derives the key from inside it ([`Entry::key`]), so there is no separate
+    /// map key allocation and no key duplication. Lookups hash the probe key with
+    /// [`Self::hasher`] and pass the hash + an eq closure to `find`/`find_entry`/`entry`.
+    ///
+    /// LAZY per-DB: `dbs[db]` is an EMPTY `Vec` until the DB's first write, when it is
+    /// filled with `slots` empty tables ([`Self::slot_table_mut`]). An untouched DB
+    /// therefore carries no slot tables, so a single-DB workload pays for one DB's slot
+    /// `Vec`, not all `databases` of them. Empty tables allocate no bucket array, so the
+    /// per-DB fixed cost is `slots` `HashTable` structs plus the `Vec` (a few KB), not
+    /// per-key state.
+    dbs: Vec<Vec<HashTable<Entry>>>,
+    /// The per-DB slot count (a power of two, [`DEFAULT_SLOTS_PER_DB`] by default, set at
+    /// construction via [`Self::with_slots_per_db`]). Fixed for the store's life: slot
+    /// routing must be stable, so this is chosen once at boot (a restart-required config
+    /// knob) and never changes while keys are resident. A power of two so [`slot_index`]
+    /// routes with a mask.
+    slots: usize,
     /// The fixed per-store hasher used for EVERY key hash fed to the [`HashTable`]
     /// explicit-hash API (the table stores no hasher of its own). One `RandomState`
     /// instance shared across all dbs so a key hashes identically regardless of which db
@@ -384,8 +439,11 @@ pub trait WriteObserver: std::fmt::Debug {
 /// double-borrow of `self`. It mirrors `db_index`'s clamp (the command layer validates
 /// the db range upstream; the clamp is the same defensive backstop).
 struct TableVictimFreq<'a> {
-    dbs: &'a mut Vec<HashTable<Entry>>,
+    dbs: &'a mut [Vec<HashTable<Entry>>],
     hasher: &'a DefaultHashBuilder,
+    /// The per-DB slot count (a copy of [`ShardStore::slots`]) so this can route a probe
+    /// key to its slot table exactly as the store does.
+    slots: usize,
 }
 
 impl TableVictimFreq<'_> {
@@ -399,8 +457,10 @@ impl VictimFreq for TableVictimFreq<'_> {
     fn get(&self, db: u32, key: &[u8]) -> Option<u8> {
         let db_idx = self.db_index(db);
         let h = self.hasher.hash_one(key);
+        // Route to the key's slot table; an untouched DB (empty slot `Vec`) yields None.
         self.dbs
             .get(db_idx)?
+            .get(slot_index(key, self.slots))?
             .find(h, |e| e.key() == key)
             .map(Entry::freq)
     }
@@ -408,7 +468,13 @@ impl VictimFreq for TableVictimFreq<'_> {
     fn dec(&mut self, db: u32, key: &[u8]) {
         let db_idx = self.db_index(db);
         let h = self.hasher.hash_one(key);
-        if let Some(obj) = self.dbs[db_idx].find_mut(h, |e| e.key() == key) {
+        let slot = slot_index(key, self.slots);
+        if let Some(obj) = self
+            .dbs
+            .get_mut(db_idx)
+            .and_then(|d| d.get_mut(slot))
+            .and_then(|t| t.find_mut(h, |e| e.key() == key))
+        {
             obj.dec_freq();
         }
     }
@@ -474,12 +540,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// A store with explicit hooks (PR-3 supplies the real S3-FIFO/jemalloc hooks).
     pub fn with_hooks(databases: u32, eviction: E, accounting: A) -> Self {
         let n = databases.max(1) as usize;
-        let mut dbs = Vec::with_capacity(n);
-        for _ in 0..n {
-            dbs.push(HashTable::new());
-        }
+        // One EMPTY slot `Vec` per DB: the `slots` per-slot tables (#570) are filled
+        // LAZILY on the DB's first write ([`Self::slot_table_mut`]), so an unused DB
+        // carries no slot overhead. `Vec::new()` allocates nothing.
+        let dbs = (0..n).map(|_| Vec::new()).collect();
         ShardStore {
             dbs,
+            slots: DEFAULT_SLOTS_PER_DB,
             hasher: DefaultHashBuilder::default(),
             eviction,
             accounting,
@@ -530,6 +597,34 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         self
     }
 
+    /// Set the per-DB slot partition count (#570, a CONSUMING builder, the tunability-tenet
+    /// config knob). The boot path calls this with the configured `store-slots-per-db` value
+    /// (default [`DEFAULT_SLOTS_PER_DB`]); it stays at the default for every test fixture and
+    /// the memory harness. `slots` is rounded UP to a power of two (so [`slot_index`] routes
+    /// with a mask) and clamped to at least 1 (`1` == one table per DB, the pre-#570 layout).
+    ///
+    /// The slot count is a MEMORY vs tail-latency tradeoff: more slots bound the per-insert
+    /// resize to fewer entries but add a fixed per-touched-DB `Vec` cost. It is fixed for the
+    /// store's life (slot routing must be stable), so it is a boot/restart-required knob and
+    /// MUST be set before any insert.
+    ///
+    /// # Panics
+    ///
+    /// Panics (in ALL build profiles) if the store already holds keys. Changing the slot count
+    /// after a write would re-route existing keys to different slots, making them silently
+    /// unreachable; a hard fail at this cold construction-time seam is strictly safer than that
+    /// silent data loss (a `debug_assert` here would be a release-mode footgun). The builder is
+    /// called immediately after construction, so this never fires on the nominal path.
+    #[must_use]
+    pub fn with_slots_per_db(mut self, slots: usize) -> Self {
+        assert!(
+            self.is_empty() && self.dbs.iter().all(Vec::is_empty),
+            "slot count must be set before any DB is touched (routing must stay stable)"
+        );
+        self.slots = slots.max(1).next_power_of_two();
+        self
+    }
+
     /// Pre-size database `db`'s keyspace to hold at least `additional` more keys
     /// without an intermediate rehash. A bulk-load and measurement seam: the
     /// memory-model harness (BENCHMARK.md #8) reserves to the final key count so a
@@ -540,11 +635,26 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// signature and changes no observable command behavior, only the table's
     /// pre-allocated capacity.
     pub fn reserve(&mut self, db: u32, additional: usize) {
+        let slots = self.slots;
         let hasher = self.hasher.clone();
-        if let Some(table) = self.dbs.get_mut(db as usize) {
+        let Some(dbv) = self.dbs.get_mut(db as usize) else {
+            return;
+        };
+        // Materialize this DB's slot tables (lazy per-DB) so the reservation lands on real
+        // tables, then SPREAD it across the slots: a bulk fill distributes ~additional/S
+        // keys to each slot, so pre-sizing each slot to that share makes the fill resize-
+        // free. The memory model (BENCHMARK.md #8) relies on this to separate the per-entry
+        // data cost from the table slack. Because S and the reservation share the power-of-
+        // two rounding, the aggregate bucket count matches the pre-#570 single table (the
+        // per-slot slack sums back to one table's), so bytes-per-key does not regress.
+        if dbv.is_empty() {
+            dbv.resize_with(slots, HashTable::new);
+        }
+        let per_slot = additional.div_ceil(slots);
+        for table in dbv.iter_mut() {
             // The explicit-hash table's `reserve` needs a hasher closure to re-place
             // entries on a grow: hash each entry's embedded key.
-            table.reserve(additional, |e| hasher.hash_one(e.key()));
+            table.reserve(per_slot, |e| hasher.hash_one(e.key()));
         }
     }
 
@@ -553,6 +663,34 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     #[inline]
     fn key_hash(&self, key: &[u8]) -> u64 {
         self.hasher.hash_one(key)
+    }
+
+    /// The IMMUTABLE per-slot table holding `key` in `db_idx` (#570 read routing), or
+    /// `None` if `db_idx`'s slot tables are not yet allocated (an untouched DB -> the key
+    /// is absent, no allocation). `db_idx` is the already-validated/clamped Vec index.
+    #[inline]
+    fn slot_table(&self, db_idx: usize, key: &[u8]) -> Option<&HashTable<Entry>> {
+        // An untouched DB has an empty slot `Vec`, so `get(slot)` returns None (the key is
+        // absent). A touched DB has exactly `slots` tables, so the slot always resolves.
+        self.dbs.get(db_idx)?.get(slot_index(key, self.slots))
+    }
+
+    /// The MUTABLE per-slot table for `key` in `db_idx` (#570 write routing), ALLOCATING
+    /// this DB's `slots` slot tables on first touch (lazy per-DB: an unused DB carries no
+    /// slot `Vec`). Every write funnel routes through here, so an insert into a fresh DB
+    /// materializes its slot tables exactly once. `db_idx` is the validated/clamped index
+    /// (in range, so the direct `self.dbs[db_idx]` cannot panic).
+    #[inline]
+    fn slot_table_mut(&mut self, db_idx: usize, key: &[u8]) -> &mut HashTable<Entry> {
+        let slots = self.slots;
+        let slot = slot_index(key, slots);
+        let dbv = &mut self.dbs[db_idx];
+        if dbv.is_empty() {
+            // First write to this DB: fill its slot `Vec` with `slots` empty tables (no
+            // bucket array is allocated until each table's own first insert).
+            dbv.resize_with(slots, HashTable::new);
+        }
+        &mut dbv[slot]
     }
 
     /// The WATCH write-funnel NOTIFY (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Called
@@ -637,7 +775,12 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             return;
         };
         let h = self.hasher.hash_one(key);
-        if let Some(obj) = self.dbs[db_idx].find(h, |e| e.key() == key) {
+        if let Some(obj) = self
+            .dbs
+            .get(db_idx)
+            .and_then(|d| d.get(slot_index(key, self.slots)))
+            .and_then(|t| t.find(h, |e| e.key() == key))
+        {
             observer.on_put(db, key, obj);
         }
     }
@@ -679,13 +822,18 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// waist method).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.dbs.iter().map(HashTable::len).sum()
+        // Sum every slot table across every DB (#570).
+        self.dbs
+            .iter()
+            .flat_map(|db| db.iter())
+            .map(HashTable::len)
+            .sum()
     }
 
     /// Whether the store holds no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.dbs.iter().all(HashTable::is_empty)
+        self.dbs.iter().all(|db| db.iter().all(HashTable::is_empty))
     }
 
     /// The map index for the validated logical `db`. The command layer validates the
@@ -720,8 +868,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     fn expire_if_due(&mut self, db: u32, db_idx: usize, key: &[u8], now: UnixMillis) -> bool {
         let h = self.key_hash(key);
         let due = self
-            .dbs
-            .get(db_idx)
+            .slot_table(db_idx, key)
             .and_then(|t| t.find(h, |e| e.key() == key))
             .is_some_and(|o| o.is_expired(now));
         if due {
@@ -761,8 +908,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             return false;
         }
         // Present-and-live iff it exists (it did not expire above).
-        self.dbs
-            .get(db_idx)
+        self.slot_table(db_idx, key)
             .is_some_and(|t| t.find(h, |e| e.key() == key).is_some())
     }
 
@@ -792,27 +938,30 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // hooks AFTER the table borrow ends (the hooks borrow `self` mutably). The
         // explicit-hash `entry` takes the probe hash, an eq closure (compare embedded
         // keys), and a hasher closure (re-place entries on a grow).
-        let old_bytes =
-            match self.dbs[db_idx].entry(h, |e| e.key() == key, |e| hasher.hash_one(e.key())) {
-                hashbrown::hash_table::Entry::Occupied(mut e) => {
-                    let old = e.get().accounted_bytes();
-                    // freq-in-object: a reused key KEEPS its S3-FIFO promote frequency
-                    // (the policy semantic "a replaced key carries its frequency"). The
-                    // freq now lives ON the entry, so an upsert that swaps the value
-                    // would reset it to 0 unless we carry the old entry's freq onto the
-                    // new entry here. (The policy's on_remove/on_insert below only moves
-                    // the KEY between queues; the freq is the store's to preserve.)
-                    let old_freq = e.get().freq();
-                    let mut obj = obj;
-                    obj.set_freq(old_freq);
-                    *e.get_mut() = obj;
-                    Some(old)
-                }
-                hashbrown::hash_table::Entry::Vacant(e) => {
-                    e.insert(obj);
-                    None
-                }
-            };
+        let old_bytes = match self.slot_table_mut(db_idx, key).entry(
+            h,
+            |e| e.key() == key,
+            |e| hasher.hash_one(e.key()),
+        ) {
+            hashbrown::hash_table::Entry::Occupied(mut e) => {
+                let old = e.get().accounted_bytes();
+                // freq-in-object: a reused key KEEPS its S3-FIFO promote frequency
+                // (the policy semantic "a replaced key carries its frequency"). The
+                // freq now lives ON the entry, so an upsert that swaps the value
+                // would reset it to 0 unless we carry the old entry's freq onto the
+                // new entry here. (The policy's on_remove/on_insert below only moves
+                // the KEY between queues; the freq is the store's to preserve.)
+                let old_freq = e.get().freq();
+                let mut obj = obj;
+                obj.set_freq(old_freq);
+                *e.get_mut() = obj;
+                Some(old)
+            }
+            hashbrown::hash_table::Entry::Vacant(e) => {
+                e.insert(obj);
+                None
+            }
+        };
         // A value REPLACE does NOT change the key's eviction-policy membership: the key
         // stays tracked, at its current FIFO position, with its carried freq (set above).
         // S3-FIFO is insertion-ordered (a write is an access that bumps freq, never a
@@ -860,7 +1009,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // slots), since remove_object only fires for a key that was actually resident.
         self.touch_watch(db, key);
         let h = self.key_hash(key);
-        let removed = match self.dbs[db_idx].find_entry(h, |e| e.key() == key) {
+        let removed = match self
+            .slot_table_mut(db_idx, key)
+            .find_entry(h, |e| e.key() == key)
+        {
             Ok(occ) => {
                 let (obj, _) = occ.remove();
                 Some(obj.accounted_bytes())
@@ -901,7 +1053,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // modification, like any delete).
         self.touch_watch(db, key);
         let h = self.key_hash(key);
-        let existed = match self.dbs[db_idx].find_entry(h, |e| e.key() == key) {
+        let existed = match self
+            .slot_table_mut(db_idx, key)
+            .find_entry(h, |e| e.key() == key)
+        {
             Ok(occ) => {
                 occ.remove();
                 true
@@ -927,7 +1082,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// disappears); a deadline-only change patches in place. A no-op if the key is gone.
     fn set_entry_expire(&mut self, db_idx: usize, key: &[u8], deadline: Option<UnixMillis>) {
         let h = self.key_hash(key);
-        if let Some(obj) = self.dbs[db_idx].find_mut(h, |e| e.key() == key) {
+        let slot = slot_index(key, self.slots);
+        if let Some(obj) = self
+            .dbs
+            .get_mut(db_idx)
+            .and_then(|d| d.get_mut(slot))
+            .and_then(|t| t.find_mut(h, |e| e.key() == key))
+        {
             obj.set_expire_at(deadline);
         }
     }
@@ -981,10 +1142,14 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // SINGLE PROBE (#511): one `find_mut` bumps the freq AND yields the view, instead of a
         // `find_mut` (bump) followed by a second `find` (view) -- two SIMD group walks where one
         // suffices on every GET. The `&mut Entry` reborrows immutably for `view_of` after the bump.
-        self.dbs[db_idx].find_mut(h, |e| e.key() == key).map(|obj| {
-            obj.bump_freq();
-            Self::view_of(obj)
-        })
+        // `expire_if_due` above returned true, so the key's slot table exists (the DB is touched);
+        // `slot_table_mut` therefore does not allocate here (#570).
+        self.slot_table_mut(db_idx, key)
+            .find_mut(h, |e| e.key() == key)
+            .map(|obj| {
+                obj.bump_freq();
+                Self::view_of(obj)
+            })
     }
 
     // The Store-trait view of the passive-replica flag (HA-7d), so generic command handlers
@@ -1007,8 +1172,8 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         let existed = self.expire_if_due(db, db_idx, key, now);
         let old_deadline = if existed {
             let h = self.key_hash(key);
-            self.dbs[db_idx]
-                .find(h, |e| e.key() == key)
+            self.slot_table(db_idx, key)
+                .and_then(|t| t.find(h, |e| e.key() == key))
                 .and_then(Entry::expire_at)
         } else {
             None
@@ -1048,11 +1213,16 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // policy call is gone from the hot path; the policy reads the freq off the
             // object at `select_victim` time via `VictimFreq`.
             let h = self.key_hash(key);
-            if let Some(obj) = self.dbs[db_idx].find_mut(h, |e| e.key() == key) {
+            // `live` is true, so the key's slot table exists (the DB is touched, #570).
+            if let Some(obj) = self
+                .slot_table_mut(db_idx, key)
+                .find_mut(h, |e| e.key() == key)
+            {
                 obj.bump_freq();
             }
-            let obj = self.dbs[db_idx]
-                .find(h, |e| e.key() == key)
+            let obj = self
+                .slot_table(db_idx, key)
+                .and_then(|t| t.find(h, |e| e.key() == key))
                 .expect("live entry present");
             let entry = RmwEntry::Occupied(Self::occupied_of(obj));
             f(entry)
@@ -1063,8 +1233,8 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // The current (pre-write) deadline, for ExpireWrite::Keep/Unchanged.
         let old_deadline = if live {
             let h = self.key_hash(key);
-            self.dbs[db_idx]
-                .find(h, |e| e.key() == key)
+            self.slot_table(db_idx, key)
+                .and_then(|t| t.find(h, |e| e.key() == key))
                 .and_then(Entry::expire_at)
         } else {
             None
@@ -1157,8 +1327,9 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         let old_bytes = if live {
             // freq-in-object: bump the accessed entry's S3-FIFO freq INLINE (O(1), no
             // policy lookup) and read its pre-edit weight in the SAME mutable borrow.
-            // The per-access `on_access` policy call is gone from the hot path.
-            self.dbs[db_idx]
+            // The per-access `on_access` policy call is gone from the hot path. `live` is
+            // true, so the key's slot table exists (#570).
+            self.slot_table_mut(db_idx, key)
                 .find_mut(key_h, |e| e.key() == key)
                 .map_or(0, |obj| {
                     obj.bump_freq();
@@ -1174,7 +1345,8 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // at the default this is the same compiled-default values the constants held.
         let thresholds = self.encoding_thresholds;
         let step = if live {
-            let obj = self.dbs[db_idx]
+            let obj = self
+                .slot_table_mut(db_idx, key)
                 .find_mut(key_h, |e| e.key() == key)
                 .expect("live entry present");
             // Read the REAL pre-edit metadata BEFORE taking the typed mutable borrow
@@ -1222,8 +1394,8 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         };
 
         let old_deadline = if live {
-            self.dbs[db_idx]
-                .find(key_h, |e| e.key() == key)
+            self.slot_table(db_idx, key)
+                .and_then(|t| t.find(key_h, |e| e.key() == key))
                 .and_then(Entry::expire_at)
         } else {
             None
@@ -1283,8 +1455,9 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // from the post-edit repr, and applies any TTL effect.
             RmwAction::Mutated => {
                 if live {
-                    let emptied = self.dbs[db_idx]
-                        .find(key_h, |e| e.key() == key)
+                    let emptied = self
+                        .slot_table(db_idx, key)
+                        .and_then(|t| t.find(key_h, |e| e.key() == key))
                         .is_some_and(Entry::is_empty_collection);
                     if emptied {
                         // Same pre-edit-weight credit as the Delete arm: the edit
@@ -1303,8 +1476,9 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                         // same-size in-place path, so the notify must fire here. (The emptied
                         // branch above already notifies via remove_object_crediting.)
                         self.touch_watch(db, key);
-                        let new_bytes = self.dbs[db_idx]
-                            .find(key_h, |e| e.key() == key)
+                        let new_bytes = self
+                            .slot_table(db_idx, key)
+                            .and_then(|t| t.find(key_h, |e| e.key() == key))
                             .map_or(0, Entry::accounted_bytes);
                         // Re-account the signed delta and re-fire the eviction sizing
                         // so the policy's per-key byte estimate tracks the edit.
@@ -1320,7 +1494,10 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
                             ExpireWrite::Unchanged => old_deadline,
                             other => resolve_expire(other, old_deadline),
                         };
-                        if let Some(obj) = self.dbs[db_idx].find_mut(key_h, |e| e.key() == key) {
+                        if let Some(obj) = self
+                            .slot_table_mut(db_idx, key)
+                            .find_mut(key_h, |e| e.key() == key)
+                        {
                             obj.recompute_encoding();
                             if new_deadline != old_deadline {
                                 obj.set_expire_at(new_deadline);
@@ -1354,8 +1531,8 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             return None;
         }
         let h = self.key_hash(key);
-        self.dbs[db_idx]
-            .find(h, |e| e.key() == key)
+        self.slot_table(db_idx, key)
+            .and_then(|t| t.find(h, |e| e.key() == key))
             .map(Entry::data_type)
     }
 
@@ -1548,8 +1725,9 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
             // been deleted, overwritten away, persisted, expired, or WARMED UP since the
             // refill). Read only the fields we need under the immutable borrow, then drop it
             // before any mutating funnel call.
-            let Some((lost_ttl, is_expired, live_freq)) = self.dbs[db_idx]
-                .find(h, |e| e.key() == &cand.key[..])
+            let Some((lost_ttl, is_expired, live_freq)) = self
+                .slot_table(db_idx, &cand.key)
+                .and_then(|t| t.find(h, |e| e.key() == &cand.key[..]))
                 .map(|obj| (obj.expire_at().is_none(), obj.is_expired(now), obj.freq()))
             else {
                 // The key is gone since the refill: skip it (no progress; the pool shrank
@@ -1653,9 +1831,10 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
         // borrows immutably. The 2-bit freq is read straight off the object (no policy lookup).
         let mut heap: BinaryHeap<ColdEntry> = BinaryHeap::with_capacity(EVICT_POOL_CAP + 1);
         let mut expired: Vec<(u32, Box<[u8]>)> = Vec::new();
-        for (db_idx, table) in self.dbs.iter().enumerate() {
+        for (db_idx, slots) in self.dbs.iter().enumerate() {
             let db = db_idx as u32;
-            for obj in table {
+            // Every slot table of this DB (#570): an untouched DB has an empty slot `Vec`.
+            for obj in slots.iter().flat_map(HashTable::iter) {
                 if obj.is_expired(now) {
                     // Collected only to reap it for free below (NOT an eviction candidate).
                     expired.push((db, obj.key().to_vec().into_boxed_slice()));
@@ -1788,6 +1967,7 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
             let mut freq = TableVictimFreq {
                 dbs: &mut self.dbs,
                 hasher: &self.hasher,
+                slots: self.slots,
             };
             let Some((db, key)) = evict.select_victim(&mut freq) else {
                 break;
@@ -1796,11 +1976,13 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
             // Inspect the candidate (immutable borrow), extract the state, then drop
             // the borrow before any mutating call (the hooks borrow self mut).
             let kh = self.key_hash(&key);
-            let (present, is_expired, lacks_ttl) =
-                match self.dbs[db_idx].find(kh, |e| e.key() == &key[..]) {
-                    Some(obj) => (true, obj.is_expired(now), obj.expire_at().is_none()),
-                    None => (false, false, true),
-                };
+            let (present, is_expired, lacks_ttl) = match self
+                .slot_table(db_idx, &key)
+                .and_then(|t| t.find(kh, |e| e.key() == &key[..]))
+            {
+                Some(obj) => (true, obj.is_expired(now), obj.expire_at().is_none()),
+                None => (false, false, true),
+            };
             // A STALE victim (the policy offered a key the store no longer holds, e.g.
             // a Random roster entry the store did not actually delete on a prior skip):
             // prune it from the policy so it is not re-offered, then ask for the next.
@@ -1894,19 +2076,23 @@ impl<A: AccountingHook> ironcache_storage::PolicySwap for ShardStore<Policy, A> 
             .dbs
             .iter()
             .enumerate()
-            .flat_map(|(db_idx, table)| {
+            .flat_map(|(db_idx, slots)| {
                 let db = db_idx as u32;
-                table.iter().filter_map(move |obj| {
-                    if obj.is_expired(now) {
-                        None
-                    } else {
-                        Some((
-                            db,
-                            obj.key().to_vec().into_boxed_slice(),
-                            obj.accounted_bytes(),
-                        ))
-                    }
-                })
+                // Every slot table of this DB (#570).
+                slots
+                    .iter()
+                    .flat_map(HashTable::iter)
+                    .filter_map(move |obj| {
+                        if obj.is_expired(now) {
+                            None
+                        } else {
+                            Some((
+                                db,
+                                obj.key().to_vec().into_boxed_slice(),
+                                obj.accounted_bytes(),
+                            ))
+                        }
+                    })
             })
             .collect();
         // Re-seed in a DETERMINISTIC order (ADR-0003): the `hashbrown` map iteration
@@ -1946,8 +2132,7 @@ impl<E: EvictionHook, A: AccountingHook> ironcache_storage::ActiveExpiry for Sha
         let db_idx = self.db_index(db);
         let h = self.key_hash(key);
         let expired = self
-            .dbs
-            .get(db_idx)
+            .slot_table(db_idx, key)
             .and_then(|t| t.find(h, |e| e.key() == key))
             .is_some_and(|o| o.is_expired(now));
         if !expired {
@@ -1986,23 +2171,29 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         mut keep: impl FnMut(&[u8], DataType) -> bool,
     ) -> (ScanCursor, Vec<Box<[u8]>>) {
         let db_idx = self.db_index(db);
-        let Some(table) = self.dbs.get(db_idx) else {
+        let Some(slots) = self.dbs.get(db_idx) else {
             return (ScanCursor::START, Vec::new());
         };
-        if table.is_empty() {
-            // Empty db -> complete immediately (cursor 0).
-            return (ScanCursor::START, Vec::new());
-        }
 
-        // The sorted (scan_hash, key_bytes) view. `scan_hash` is recomputed from the
-        // key bytes (read out of each entry), NOT from the table's internal hasher, so
-        // the order is stable across calls and across a resize (KEYSPACE.md). Sorting by
-        // (hash, bytes) gives a total order even for equal-hash keys. Each `&[u8]`
-        // borrows the key INSIDE its entry (no separate key allocation).
-        let mut order: Vec<(u64, &[u8])> = table
+        // The sorted (scan_hash, key_bytes) view over EVERY slot table of the DB (#570).
+        // `scan_hash` is recomputed from the key bytes (read out of each entry), NOT from
+        // the table's internal hasher, so the order is stable across calls and across a
+        // resize (KEYSPACE.md). It is also SLOT-INDEPENDENT: partitioning the DB into slots
+        // does not change any key's `scan_hash`, so the MERGED order over all slots is
+        // byte-identical to the pre-#570 single table's, and the cursor stays the exact same
+        // `scan_hash` threshold. That is why the per-slot split needs NO cursor-format change:
+        // SCAN still returns every key exactly once across pages, and the wire token and the
+        // cross-shard composite cursor are unchanged. Sorting by (hash, bytes) gives a total
+        // order even for equal-hash keys. Each `&[u8]` borrows the key INSIDE its entry.
+        let mut order: Vec<(u64, &[u8])> = slots
             .iter()
+            .flat_map(HashTable::iter)
             .map(|e| (scan_hash(e.key()), e.key()))
             .collect();
+        if order.is_empty() {
+            // Empty (or untouched) db -> complete immediately (cursor 0).
+            return (ScanCursor::START, Vec::new());
+        }
         order.sort_unstable();
 
         // Walk the sorted order, choosing which keys to EXAMINE this batch and what the
@@ -2016,11 +2207,13 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         // MATCH/TYPE `keep` filter BEFORE cloning the key into the result.
         let mut kept: Vec<Box<[u8]>> = Vec::with_capacity(plan.examined.len());
         for &key in &plan.examined {
-            // Re-find the entry by its embedded key (the `order`/`plan.examined`
-            // slices borrow the keys inside the entries; `find` reaches the entry to
-            // read its metadata). `self.hasher` and `table` are disjoint fields, so
-            // both immutable borrows coexist.
-            if let Some(obj) = table.find(self.hasher.hash_one(key), |e| e.key() == key) {
+            // Re-find the entry in ITS slot table (#570); the `order`/`plan.examined` slices
+            // borrow the keys inside the entries, and `self.slot_table` / `self.hasher` are
+            // further shared borrows, so all the immutable borrows coexist.
+            if let Some(obj) = self
+                .slot_table(db_idx, key)
+                .and_then(|t| t.find(self.hasher.hash_one(key), |e| e.key() == key))
+            {
                 if obj.is_expired(now) {
                     continue;
                 }
@@ -2035,14 +2228,18 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
     fn db_len(&self, db: u32) -> usize {
         let db_idx = self.db_index(db);
         // RAW table length (Redis does not active-expire on DBSIZE): the dict size,
-        // including not-yet-reaped expired keys. No lazy backstop here.
-        self.dbs.get(db_idx).map_or(0, HashTable::len)
+        // including not-yet-reaped expired keys. No lazy backstop here. Sum across every
+        // slot table of the DB (#570).
+        self.dbs
+            .get(db_idx)
+            .map_or(0, |slots| slots.iter().map(HashTable::len).sum())
     }
 
     fn random_key(&mut self, db: u32, pick: u64, now: UnixMillis) -> Option<Box<[u8]>> {
         let db_idx = self.db_index(db);
-        let table = self.dbs.get(db_idx)?;
-        let n = table.len();
+        let slots = self.dbs.get(db_idx)?;
+        // Total count across every slot table of the DB (#570).
+        let n: usize = slots.iter().map(HashTable::len).sum();
         if n == 0 {
             return None;
         }
@@ -2050,9 +2247,13 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         // Map it to a starting index, then probe forward DETERMINISTICALLY in the
         // sorted scan order, skipping expired keys, so an expired key at the picked
         // position does not yield `None` while live keys remain. The order carries the
-        // key + its live/expired flag so no re-lookup is needed.
-        let mut order: Vec<(&[u8], bool)> =
-            table.iter().map(|e| (e.key(), e.is_expired(now))).collect();
+        // key + its live/expired flag so no re-lookup is needed. Merged over all slots so
+        // the sorted order (and thus the deterministic pick) is slot-independent.
+        let mut order: Vec<(&[u8], bool)> = slots
+            .iter()
+            .flat_map(HashTable::iter)
+            .map(|e| (e.key(), e.is_expired(now)))
+            .collect();
         order.sort_unstable_by(|a, b| scan_hash(a.0).cmp(&scan_hash(b.0)).then(a.0.cmp(b.0)));
         let start = (pick % n as u64) as usize;
         for off in 0..n {
@@ -2067,9 +2268,12 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
 
     fn flush_db(&mut self, db: u32) -> u64 {
         let db_idx = self.db_index(db);
+        // Collect the keys across every slot table of the DB (#570), releasing the table
+        // borrow before the removal funnel mutates.
         let keys: Vec<Box<[u8]>> = match self.dbs.get(db_idx) {
-            Some(table) => table
+            Some(slots) => slots
                 .iter()
+                .flat_map(HashTable::iter)
                 .map(|e| e.key().to_vec().into_boxed_slice())
                 .collect(),
             None => return 0,
@@ -2138,7 +2342,11 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         // entry `rekey` rebuilds the blob with the new embedded key; for a Coll it is a
         // field write.
         let src_h = self.key_hash(src);
-        let Some(mut obj) = self.dbs[src_idx].find(src_h, |e| e.key() == src).cloned() else {
+        let Some(mut obj) = self
+            .slot_table(src_idx, src)
+            .and_then(|t| t.find(src_h, |e| e.key() == src))
+            .cloned()
+        else {
             return MoveOutcome::NoSource;
         };
         obj.rekey(dst);
@@ -2161,9 +2369,9 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         let ai = self.db_index(a);
         let bi = self.db_index(b);
         if ai != bi {
-            // O(1) Vec element swap: the per-DB maps trade places; no entry is created
-            // or destroyed, so no hook fires and the accounting total is unchanged
-            // (the same entries are still resident, just under different db ids).
+            // O(1) Vec element swap: the two DBs' whole slot `Vec`s trade places (#570); no
+            // entry is created or destroyed, so no hook fires and the accounting total is
+            // unchanged (the same entries are still resident, just under different db ids).
             self.dbs.swap(ai, bi);
             // WATCH (PR-10b): the contents under db `a` and db `b` both changed wholesale,
             // so every key watched in EITHER db is dirtied. Redis treats SWAPDB like a
@@ -2282,8 +2490,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     pub fn contains_live(&self, db: u32, key: &[u8], now: UnixMillis) -> bool {
         let db_idx = self.db_index(db);
         let h = self.key_hash(key);
-        self.dbs
-            .get(db_idx)
+        self.slot_table(db_idx, key)
             .and_then(|t| t.find(h, |e| e.key() == key))
             .is_some_and(|o| !o.is_expired(now))
     }
@@ -2428,9 +2635,11 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     pub fn remove_keys_where<P: Fn(&[u8]) -> bool>(&mut self, pred: P) -> usize {
         let mut removed = 0usize;
         for db_idx in 0..self.dbs.len() {
-            // Phase 1: collect the matching keys (release the table borrow before mutating).
+            // Phase 1: collect the matching keys across every slot table of the DB (#570),
+            // releasing the table borrow before mutating.
             let victims: Vec<Box<[u8]>> = self.dbs[db_idx]
                 .iter()
+                .flat_map(HashTable::iter)
                 .filter(|e| pred(e.key()))
                 .map(|e| e.key().to_vec().into_boxed_slice())
                 .collect();
@@ -2440,7 +2649,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
                 let db = db_idx as u32;
                 self.touch_watch(db, &key);
                 let h = self.key_hash(&key);
-                if let Ok(occ) = self.dbs[db_idx].find_entry(h, |e| e.key() == &*key) {
+                if let Ok(occ) = self
+                    .slot_table_mut(db_idx, &key)
+                    .find_entry(h, |e| e.key() == &*key)
+                {
                     let (obj, _) = occ.remove();
                     let bytes = obj.accounted_bytes();
                     self.account_sub(bytes);
@@ -2589,7 +2801,10 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // lazy-expiry skip so a logically-dead key is never shipped as live.
             for key in examined {
                 let h = self.hasher.hash_one(&*key);
-                if let Some(obj) = self.dbs[db_idx].find(h, |e| e.key() == &*key) {
+                if let Some(obj) = self
+                    .slot_table(db_idx, &key)
+                    .and_then(|t| t.find(h, |e| e.key() == &*key))
+                {
                     if obj.is_expired(now) {
                         continue;
                     }
@@ -2626,19 +2841,22 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         cursor: ScanCursor,
         count: usize,
     ) -> (ScanCursor, Vec<Box<[u8]>>) {
-        let Some(table) = self.dbs.get(db_idx) else {
+        let Some(slots) = self.dbs.get(db_idx) else {
             return (ScanCursor::START, Vec::new());
         };
-        if table.is_empty() {
-            return (ScanCursor::START, Vec::new());
-        }
-        // The sorted (scan_hash, key) view, identical to `scan_step`: `scan_hash` is
-        // recomputed from the key bytes, so the order is stable across calls AND across a
-        // hashbrown resize between chunks (writes continue during the snapshot).
-        let mut order: Vec<(u64, &[u8])> = table
+        // The sorted (scan_hash, key) view over EVERY slot table of the DB (#570), identical
+        // in spirit to `scan_step`: `scan_hash` is recomputed from the key bytes, so the
+        // order is stable across calls AND across a hashbrown resize between chunks (writes
+        // continue during the snapshot), and it is slot-independent (the merged order equals
+        // the pre-#570 single table's), so the inner cursor is unchanged.
+        let mut order: Vec<(u64, &[u8])> = slots
             .iter()
+            .flat_map(HashTable::iter)
             .map(|e| (scan_hash(e.key()), e.key()))
             .collect();
+        if order.is_empty() {
+            return (ScanCursor::START, Vec::new());
+        }
         order.sort_unstable();
         // band_bits == 0: the snapshot is shard-local, so it wants the EXACT next-key
         // cursor (no cross-shard band rounding). The plan EXAMINES up to `count` keys.
@@ -3299,5 +3517,227 @@ mod policy_swap_tests {
             1,
             "an ordinary delete still fires the observer"
         );
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    //! The per-slot table partition (#570): multi-slot point-op round-trips, the
+    //! exactly-once full SCAN across pages over a multi-slot DB, the bounded-resize
+    //! property (the max slot holds ~N/S, not N), lazy per-DB slot allocation, and the
+    //! deterministic fixed-seed slot routing + the tunable slot count.
+
+    use super::*;
+    use ironcache_storage::{ExpireWrite, Keyspace, NewValue, ScanCursor, Store};
+    use std::collections::HashSet;
+
+    const NOW: UnixMillis = UnixMillis(0);
+
+    /// Drive a full SCAN to completion with a small `count` (so it spans many pages) and
+    /// return every key emitted, in order. Asserts the cursor terminates.
+    fn drain_scan<E: EvictionHook, A: AccountingHook>(
+        store: &mut ShardStore<E, A>,
+        db: u32,
+        count: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        let mut cursor = ScanCursor::START;
+        // A generous page bound so a cursor bug fails rather than hangs.
+        for _ in 0..(store.db_len(db) + 100) {
+            let (next, batch) = store.scan_step(db, cursor, count, NOW, |_k, _t| true);
+            seen.extend(batch.into_iter().map(|k| k.to_vec()));
+            if next.is_start() {
+                return seen;
+            }
+            cursor = next;
+        }
+        panic!("SCAN did not terminate");
+    }
+
+    #[test]
+    fn multi_slot_get_delete_exists_round_trip() {
+        // 2000 keys >> the 256-slot default, so the keyspace spans (essentially) every slot.
+        let mut store = ShardStore::new(1);
+        let n = 2000usize;
+        for i in 0..n {
+            let key = format!("key:{i}").into_bytes();
+            store.upsert(0, &key, NewValue::Int(i as i64), ExpireWrite::Clear, NOW);
+        }
+        assert_eq!(store.len(), n);
+        // The keys really span multiple slots (the whole point of the partition).
+        let occupied = store.dbs[0].iter().filter(|t| !t.is_empty()).count();
+        assert!(
+            occupied > 1,
+            "keys must span multiple slots, got {occupied}"
+        );
+
+        // Every key reads back with its value and reports present.
+        for i in 0..n {
+            let key = format!("key:{i}").into_bytes();
+            let v = store.read(0, &key, NOW).expect("present");
+            assert_eq!(v.as_bytes(), i.to_string().as_bytes());
+            assert!(store.contains(0, &key, NOW));
+        }
+        // Delete the even keys; the odd keys remain.
+        for i in (0..n).step_by(2) {
+            let key = format!("key:{i}").into_bytes();
+            assert!(store.delete(0, &key, NOW), "delete {i}");
+        }
+        for i in 0..n {
+            let key = format!("key:{i}").into_bytes();
+            assert_eq!(store.contains(0, &key, NOW), i % 2 == 1, "key {i}");
+        }
+        assert_eq!(store.len(), n / 2);
+        // Re-deleting an already-gone key (and a never-present key) is a clean false.
+        assert!(!store.delete(0, b"key:0", NOW));
+        assert!(!store.delete(0, b"never", NOW));
+    }
+
+    #[test]
+    fn full_scan_returns_every_multi_slot_key_exactly_once() {
+        // The exactly-once-across-pages guarantee over a multi-slot DB: SCAN merges every
+        // slot in the global scan_hash order, so a small COUNT (many pages) still returns
+        // every key exactly once and never misses one present for the whole scan.
+        let mut store = ShardStore::new(1);
+        let n = 1500usize;
+        let mut expected: HashSet<Vec<u8>> = HashSet::new();
+        for i in 0..n {
+            let key = format!("k{i}").into_bytes();
+            store.upsert(0, &key, NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+            expected.insert(key);
+        }
+        let seen = drain_scan(&mut store, 0, 7);
+        let seen_set: HashSet<Vec<u8>> = seen.iter().cloned().collect();
+        assert_eq!(
+            seen.len(),
+            seen_set.len(),
+            "no key returned twice across pages"
+        );
+        assert_eq!(seen_set, expected, "every key returned exactly once");
+    }
+
+    #[test]
+    fn per_slot_partition_bounds_the_resize_unit() {
+        // The bounded-resize property (#570): the LARGEST slot table holds only ~N/S
+        // entries, so the worst-case single-insert all-at-once rehash touches ~one slot's
+        // entries, NOT the DB's whole N. We measure and report the MAX slot occupancy (the
+        // p100 resize unit). 100k keys extrapolates linearly: at 1M keys / 256 slots the max
+        // slot is ~4000 entries (~80us resize) vs ~1M (~6ms) for a single table.
+        let mut store = ShardStore::new(1);
+        let n = 100_000usize;
+        for i in 0..n {
+            let key = format!("key:{i}").into_bytes();
+            store.upsert(0, &key, NewValue::Int(i as i64), ExpireWrite::Clear, NOW);
+        }
+        assert_eq!(store.len(), n);
+        let slots = store.slots;
+        let lens: Vec<usize> = store.dbs[0].iter().map(HashTable::len).collect();
+        let max = lens.iter().copied().max().expect("slots present");
+        let mean = n / slots;
+        // A well-avalanched fixed-seed slot hash keeps the max near the mean N/S (measured
+        // MAX ~439 at n=100k, ~1.13x the 390 mean). A generous 2x-mean bound absorbs hash
+        // imbalance while still proving the resize unit is ~N/S, not N.
+        assert!(
+            max <= mean * 2,
+            "MAX slot {max} exceeds 2x mean {mean} (slots={slots}, n={n})"
+        );
+        // The resize unit (max slot) is DRASTICALLY smaller than N (the pre-#570 unit).
+        assert!(
+            (max as f64) < (n as f64) / 50.0,
+            "resize unit (max slot {max}) must be << N ({n})"
+        );
+    }
+
+    #[test]
+    fn untouched_db_allocates_no_slot_tables() {
+        // Lazy per-DB: only a written DB materializes its slot tables; an untouched DB
+        // carries an empty slot Vec, and reads/scan/dbsize on it allocate nothing.
+        let mut store = ShardStore::new(4);
+        store.upsert(0, b"k", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        assert_eq!(store.dbs[0].len(), store.slots, "written db has its slots");
+        for db in 1..4 {
+            assert!(
+                store.dbs[db].is_empty(),
+                "untouched db {db} carries no slots"
+            );
+        }
+        // Read/exists/dbsize/scan on untouched DBs are correct AND non-allocating.
+        assert!(store.read(1, b"absent", NOW).is_none());
+        assert!(!store.contains(2, b"absent", NOW));
+        assert_eq!(store.db_len(3), 0);
+        let (cur, batch) = store.scan_step(1, ScanCursor::START, 10, NOW, |_, _| true);
+        assert!(cur.is_start() && batch.is_empty());
+        for db in 1..4 {
+            assert!(
+                store.dbs[db].is_empty(),
+                "read/scan must not allocate untouched db {db}"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_index_is_deterministic_and_masked() {
+        // Fixed-seed routing: a key maps to the same slot every call, always in [0, slots).
+        for slots in [1usize, 2, 16, 256, 1024] {
+            for k in [&b"alpha"[..], b"beta", b"", b"a-long-key-name-01234567890"] {
+                let s = slot_index(k, slots);
+                assert_eq!(s, slot_index(k, slots), "deterministic");
+                assert!(s < slots, "masked into [0, {slots})");
+            }
+        }
+        // slots == 1 collapses to slot 0 (the single-table pre-#570 layout).
+        assert_eq!(slot_index(b"anything", 1), 0);
+    }
+
+    #[test]
+    fn with_slots_per_db_rounds_up_to_power_of_two() {
+        assert_eq!(ShardStore::new(1).with_slots_per_db(100).slots, 128);
+        assert_eq!(ShardStore::new(1).with_slots_per_db(0).slots, 1);
+        assert_eq!(ShardStore::new(1).with_slots_per_db(256).slots, 256);
+        assert_eq!(
+            ShardStore::new(1)
+                .with_slots_per_db(DEFAULT_SLOTS_PER_DB)
+                .slots,
+            DEFAULT_SLOTS_PER_DB
+        );
+    }
+
+    #[test]
+    fn custom_slot_count_routes_and_scans() {
+        // A config-overridden slot count still round-trips point ops and full SCAN.
+        let mut store = ShardStore::new(1).with_slots_per_db(64);
+        assert_eq!(store.slots, 64);
+        let n = 500usize;
+        for i in 0..n {
+            let key = format!("z{i}").into_bytes();
+            store.upsert(0, &key, NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        }
+        assert_eq!(store.dbs[0].len(), 64, "the DB has exactly 64 slot tables");
+        assert_eq!(store.len(), n);
+        let seen: HashSet<Vec<u8>> = drain_scan(&mut store, 0, 5).into_iter().collect();
+        assert_eq!(
+            seen.len(),
+            n,
+            "full scan returns every key under a custom slot count"
+        );
+    }
+
+    #[test]
+    fn swap_db_exchanges_multi_slot_keyspaces() {
+        // SWAPDB trades the two DBs' whole slot Vecs (#570): counts and membership follow.
+        let mut store = ShardStore::new(2);
+        for i in 0..300 {
+            let k = format!("a{i}").into_bytes();
+            store.upsert(0, &k, NewValue::Int(i as i64), ExpireWrite::Clear, NOW);
+        }
+        for i in 0..100 {
+            let k = format!("b{i}").into_bytes();
+            store.upsert(1, &k, NewValue::Int(i as i64), ExpireWrite::Clear, NOW);
+        }
+        store.swap_db(0, 1);
+        assert_eq!(store.db_len(0), 100);
+        assert_eq!(store.db_len(1), 300);
+        assert!(store.contains(0, b"b50", NOW));
+        assert!(store.contains(1, b"a250", NOW));
     }
 }
