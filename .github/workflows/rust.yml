@@ -21,6 +21,7 @@ on:
       - "deny.toml"
       - "scripts/ci/check-rust-invariants.sh"
       - ".github/workflows/rust.yml"
+      - "fuzz/**"
 
 permissions:
   contents: read
@@ -177,6 +178,57 @@ jobs:
       # owned-buffer append semantics map correctly onto tokio-uring.
       - name: test --features io_uring
         run: cargo nextest run --profile ci -p ironcache-runtime --features io_uring
+
+  fuzz:
+    name: fuzz (parser, bounded)
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    # The documented parser fuzz gate (#534, #95, HARDENING.md/TESTING.md): run the
+    # cargo-fuzz/libFuzzer target `fuzz/fuzz_targets/decode.rs` over
+    # `ironcache_protocol::decode`. The decoder is the first code an unauthenticated
+    # peer reaches and release is `panic = "abort"`, so a missed decode panic is a
+    # whole-process crash (remote parser DoS); this job is the merge-blocking gate
+    # that proves no seed-reachable input panics the decoder.
+    #
+    # The fuzz crate is STANDALONE (root Cargo.toml `exclude`s it + it has its own
+    # empty `[workspace]`), so it needs NIGHTLY (libFuzzer sanitizer codegen) and
+    # never touches the workspace build/lock/deny gate.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Nightly is REQUIRED: `cargo fuzz build` compiles with the address/leak
+      # sanitizer instrumentation (`-Z` codegen), which is nightly-only.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The fuzz crate has its own target/lock; cache them under a distinct key
+          # so it does not collide with the stable-toolchain workspace caches.
+          workspaces: "fuzz -> fuzz/target"
+      # Prebuilt cargo-fuzz binary (fast; avoids a from-source `cargo install`). The explicit
+      # `tool:` form is used (the bare `@cargo-fuzz` ref does not put the binary on PATH).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Bounded per-PR budget: a 60s campaign seeded from fuzz/corpus/decode/. Fast
+      # enough for a merge gate; libFuzzer exits non-zero (fails the job) on the
+      # first panic/timeout/OOM. A longer nightly campaign (e.g. -max_total_time=900
+      # on a schedule) is a reasonable future add; this job is the per-PR floor.
+      #
+      # `--target x86_64-unknown-linux-gnu` is EXPLICIT: libFuzzer's sanitizer
+      # instrumentation is incompatible with a statically linked libc, and cargo-fuzz
+      # otherwise picked up a musl target here ("sanitizer is incompatible with
+      # statically linked libc" / "can't find crate for std"). The gnu target is the
+      # runner host and has a dynamic libc, so the sanitizer links.
+      #
+      # The workspace sets RUSTFLAGS="-D warnings" globally; cargo-fuzz APPENDS its
+      # own sanitizer -Cllvm-args to RUSTFLAGS, and the fuzz crate's generated harness
+      # is not warning-clean under `-D warnings`, so unset it for this job only.
+      - name: cargo fuzz run decode (bounded)
+        working-directory: fuzz
+        env:
+          RUSTFLAGS: ""
+        run: cargo +nightly fuzz run decode --target x86_64-unknown-linux-gnu -- -max_total_time=60 -rss_limit_mb=4096
 
   invariant-lints:
     name: invariant lints (INVARIANTS.md)
