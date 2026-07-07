@@ -375,11 +375,21 @@ indexed below with the file that emits them. Message text is verbatim.
 - ERROR `raft control plane: failed to create data directory` / `failed to open storage`
   -- the `data_dir` is not writable; fix permissions / the mount.
 
-### Socket activation (`crates/ironcache-runtime/src/bootstrap.rs`)
+### Socket activation (`crates/ironcache/src/sockact_log.rs`, `crates/ironcache-runtime/src/bootstrap.rs`)
+- INFO `socket-activation: ADOPTED <n> systemd socket-activation listening fd(s) [<name=fd>...];
+  systemd owns the listen queue, so it survives an upgrade restart with no connection-refused
+  window` (#562) -- this boot ADOPTED the fd(s) systemd passed; the upgrade handoff is in effect.
+- INFO `socket-activation: FELL BACK to self-binding its own listener: not socket-activated (no
+  LISTEN_FDS in the environment)` -- the normal, non-socket-activated boot.
+- WARN `socket-activation: FELL BACK to self-binding its own listener: the socket-activation
+  environment was REJECTED and not adopted (<reason>)` -> a `LISTEN_*` env was PRESENT but rejected
+  (a foreign/missing `LISTEN_PID`, a malformed count); the socket-activated upgrade silently
+  degraded to a self-bind. Fix the unit / re-exec so `LISTEN_PID` names this process.
 - The shard-owners listener mode returns `shard-owners mode is incompatible with systemd
   socket activation (LISTEN_FDS): it needs N distinct self-bound ports, but activation
   supplies one inherited socket for one port`. -> Do not combine systemd socket activation
-  with the shard-owners listener mode; let IronCache bind its own ports.
+  with the shard-owners listener mode; let IronCache bind its own ports. See
+  `docs/UPGRADE.md` for the full rolling-upgrade + rollback procedure.
 
 ### Runtime backend fallback (`serve.rs`)
 - WARN `runtime = io_uring requested with TLS on; the io_uring datapath does not support

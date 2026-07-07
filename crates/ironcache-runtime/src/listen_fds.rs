@@ -100,6 +100,88 @@ impl std::fmt::Display for ListenFdsError {
 
 impl std::error::Error for ListenFdsError {}
 
+/// Whether the boot ADOPTED the systemd-passed listening fds (socket activation) or FELL BACK to
+/// self-binding its own listener, plus WHY. This is the classification behind the loud
+/// operator-facing boot log (#562): without it an operator cannot tell from the logs which listener
+/// path a socket-activated upgrade took, which is exactly what is needed to debug a failed one.
+///
+/// Derived PURELY from the parsed [`from_env`] result (no clock/rand, ADR-0003, boot/OS seam), so the
+/// exact log line the binary emits is unit-testable off a live systemd host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activation {
+    /// Socket-activated: ADOPT the inherited listening fds systemd passed. The listen queue then
+    /// survives an upgrade restart (systemd keeps it open), so clients queue in the kernel backlog
+    /// instead of getting `ECONNREFUSED`.
+    Adopted(Vec<InheritedFd>),
+    /// FALL BACK to self-binding our own listener; `reason` records why.
+    SelfBound(SelfBindReason),
+}
+
+/// Why the boot self-bound its own listener instead of adopting socket-activation fds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfBindReason {
+    /// Not socket-activated: `LISTEN_FDS` was unset (the normal, non-systemd launch) or zero
+    /// (activation opened no sockets). There is nothing to adopt; self-binding is correct and the
+    /// boot is byte-unchanged.
+    NotActivated,
+    /// A `LISTEN_*` environment WAS present but was rejected (a foreign/missing `LISTEN_PID`, a
+    /// malformed count, or a `LISTEN_FDNAMES` mismatch), so the fds are not safely ours to adopt.
+    /// Carries the typed reason so the log names it.
+    Rejected(ListenFdsError),
+}
+
+/// Classify the parsed socket-activation environment into the boot's listener decision (#562): adopt
+/// the inherited fds, or self-bind (and why). Pure over [`from_env`]'s result -- the SAME result
+/// [`crate::tokio_rt::listener_for`] acts on, so the logged decision matches the one the runtime
+/// takes.
+#[must_use]
+pub fn classify(parsed: &Result<Vec<InheritedFd>, ListenFdsError>) -> Activation {
+    match parsed {
+        Ok(fds) if !fds.is_empty() => Activation::Adopted(fds.clone()),
+        Ok(_) => Activation::SelfBound(SelfBindReason::NotActivated),
+        Err(e) => Activation::SelfBound(SelfBindReason::Rejected(e.clone())),
+    }
+}
+
+impl Activation {
+    /// The loud, operator-facing one-line boot summary (#562): exactly which listener path the boot
+    /// took and why, so a failed socket-activated upgrade is diagnosable from the logs alone. Each
+    /// variant carries a distinct marker (`ADOPTED` vs `FELL BACK`) the binary emits through
+    /// `tracing`; this crate is the pure runtime seam and takes no logging dependency itself.
+    #[must_use]
+    pub fn boot_summary(&self) -> String {
+        match self {
+            Activation::Adopted(fds) => {
+                // Name each fd via LISTEN_FDNAMES when systemd supplied names (`resp=fd3`), else the
+                // bare number (`fd3`), so the operator can see which socket is which.
+                let named = fds
+                    .iter()
+                    .map(|f| match &f.name {
+                        Some(name) => format!("{name}=fd{}", f.fd),
+                        None => format!("fd{}", f.fd),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "ADOPTED {} systemd socket-activation listening fd(s) [{named}]; systemd owns \
+                     the listen queue, so it survives an upgrade restart with no connection-refused \
+                     window",
+                    fds.len()
+                )
+            }
+            Activation::SelfBound(SelfBindReason::NotActivated) => {
+                "FELL BACK to self-binding its own listener: not socket-activated (no LISTEN_FDS in \
+                 the environment)"
+                    .to_owned()
+            }
+            Activation::SelfBound(SelfBindReason::Rejected(reason)) => format!(
+                "FELL BACK to self-binding its own listener: the socket-activation environment was \
+                 REJECTED and not adopted ({reason})"
+            ),
+        }
+    }
+}
+
 /// Parse the socket-activation environment into the inherited listening fds, or a typed rejection.
 ///
 /// `self_pid` is THIS process's pid (a parameter, so the parse is pure + deterministic). Returns
@@ -217,7 +299,10 @@ pub fn from_env() -> Result<Vec<InheritedFd>, ListenFdsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InheritedFd, ListenFdsError, SD_LISTEN_FDS_START, parse_listen_fds, select_named};
+    use super::{
+        Activation, InheritedFd, ListenFdsError, SD_LISTEN_FDS_START, SelfBindReason, classify,
+        parse_listen_fds, select_named,
+    };
 
     const PID: u32 = 4242;
 
@@ -369,5 +454,102 @@ mod tests {
     fn leading_zero_count_parses_as_decimal() {
         // "007" is all-digits and parses as 7 (matching systemd's decimal read), yielding 7 fds.
         assert_eq!(ok("4242", "007", None).len(), 7);
+    }
+
+    // --- #562: the loud adopt-vs-fallback classification the boot logs. The ADOPT branch and BOTH
+    //     fall-back branches must be distinct in the enum AND carry a distinct log marker.
+
+    #[test]
+    fn classify_adopt_branch_names_the_fds() {
+        // A valid socket-activation env parses to non-empty fds -> ADOPT, carrying the fds/names.
+        let parsed = parse_listen_fds(Some("4242"), Some("3"), Some("resp:repl:metrics"), PID);
+        let activation = classify(&parsed);
+        assert_eq!(
+            activation,
+            Activation::Adopted(vec![
+                InheritedFd {
+                    fd: 3,
+                    name: Some("resp".to_owned())
+                },
+                InheritedFd {
+                    fd: 4,
+                    name: Some("repl".to_owned())
+                },
+                InheritedFd {
+                    fd: 5,
+                    name: Some("metrics".to_owned())
+                },
+            ])
+        );
+        // The log marker distinguishes this branch and names each socket (LISTEN_FDNAMES).
+        let summary = activation.boot_summary();
+        assert!(
+            summary.contains("ADOPTED 3"),
+            "adopt marker + count: {summary:?}"
+        );
+        assert!(
+            summary.contains("resp=fd3"),
+            "names the RESP fd: {summary:?}"
+        );
+        assert!(
+            summary.contains("repl=fd4"),
+            "names the repl fd: {summary:?}"
+        );
+        assert!(
+            !summary.contains("FELL BACK"),
+            "adopt must not claim a fallback: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn classify_fallback_not_activated_branch() {
+        // No LISTEN_FDS -> the normal launch -> self-bind, reason NotActivated.
+        let parsed = parse_listen_fds(None, None, None, PID);
+        let activation = classify(&parsed);
+        assert_eq!(
+            activation,
+            Activation::SelfBound(SelfBindReason::NotActivated)
+        );
+        let summary = activation.boot_summary();
+        assert!(
+            summary.contains("FELL BACK"),
+            "fallback marker: {summary:?}"
+        );
+        assert!(
+            summary.contains("no LISTEN_FDS"),
+            "states WHY (not activated): {summary:?}"
+        );
+        assert!(
+            !summary.contains("ADOPTED"),
+            "fallback must not claim an adopt: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn classify_fallback_rejected_branch_names_the_reason() {
+        // A foreign LISTEN_PID -> rejected -> self-bind, reason Rejected(PidMismatch), and the log
+        // names the mismatch so a failed socket-activated upgrade is diagnosable.
+        let parsed = parse_listen_fds(Some("9999"), Some("1"), None, PID);
+        let activation = classify(&parsed);
+        assert_eq!(
+            activation,
+            Activation::SelfBound(SelfBindReason::Rejected(ListenFdsError::PidMismatch {
+                listen_pid: 9999,
+                self_pid: PID
+            }))
+        );
+        let summary = activation.boot_summary();
+        assert!(
+            summary.contains("FELL BACK"),
+            "fallback marker: {summary:?}"
+        );
+        assert!(
+            summary.contains("REJECTED"),
+            "states it was rejected: {summary:?}"
+        );
+        assert!(
+            summary.contains("9999"),
+            "names the foreign pid from the reason: {summary:?}"
+        );
     }
 }

@@ -162,8 +162,11 @@ pub fn adopt_listener_fd(fd: std::os::fd::RawFd) -> io::Result<std::net::TcpList
 /// SELF-BIND `addr` with `SO_REUSEPORT`.
 ///
 /// FAIL-OPEN: not socket-activated, a malformed `LISTEN_*` environment, or an unusable inherited fd
-/// all fall back to self-bind, so a non-socket-activated boot is byte-unchanged. (Operator-facing
-/// logging of which path was taken is a follow-up; the runtime crate carries no logging dep today.)
+/// all fall back to self-bind, so a non-socket-activated boot is byte-unchanged. The binary emits
+/// the LOUD adopt-vs-fallback boot log (#562) from the pure [`crate::listen_fds::classify`] over the
+/// SAME env parse this function acts on; the ONE case that log cannot see -- an inherited fd that
+/// parsed fine but failed validation here (a `ListenDatagram=` UDP socket) -- is surfaced with an
+/// `eprintln!` below, matching this crate's boot-diagnostic convention (it takes no logging dep).
 ///
 /// ADDRESS AUTHORITY: when socket-activated, the effective listen address is whatever SYSTEMD opened
 /// the socket on (the `.socket` unit's `ListenStream=`); `addr` (the server's `bind` config) is used
@@ -178,10 +181,17 @@ pub fn adopt_listener_fd(fd: std::os::fd::RawFd) -> io::Result<std::net::TcpList
 pub fn listener_for(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     match crate::listen_fds::from_env() {
         // Socket-activated: adopt the FIRST passed fd (the RESP `ListenStream`). A validation
-        // failure on the inherited fd degrades to a self-bind rather than failing the boot.
-        Ok(fds) if !fds.is_empty() => {
-            adopt_listener_fd(fds[0].fd).or_else(|_| bind_reuseport_std(addr))
-        }
+        // failure on the inherited fd degrades to a self-bind rather than failing the boot, but
+        // is logged (the one adopt-vs-fallback case the binary's #562 boot log cannot see, since
+        // the env parsed cleanly and only the fd itself is unusable).
+        Ok(fds) if !fds.is_empty() => adopt_listener_fd(fds[0].fd).or_else(|e| {
+            eprintln!(
+                "socket-activation: inherited fd {} could not be adopted ({e}); FELL BACK to \
+                 self-binding {addr}",
+                fds[0].fd
+            );
+            bind_reuseport_std(addr)
+        }),
         // Not socket-activated (or a malformed/foreign LISTEN_* env): self-bind, unchanged behavior.
         _ => bind_reuseport_std(addr),
     }

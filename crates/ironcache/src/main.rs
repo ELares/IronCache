@@ -10,6 +10,7 @@
 mod cli;
 mod cluster_bus;
 mod fd_budget;
+mod sockact_log;
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -201,6 +202,12 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
         shards = cfg.shards,
         "ironcache: binding"
     );
+    // SOCKET ACTIVATION (#562, #389): state LOUDLY whether this boot ADOPTED the listening fd(s)
+    // systemd passed (the listen queue then survives an upgrade restart with no connection-refused
+    // window) or FELL BACK to self-binding, and why (e.g. no LISTEN_FDS, or a LISTEN_PID mismatch).
+    // Without this an operator cannot tell from the logs which path a socket-activated upgrade took.
+    // Boot / OS-seam, outside ADR-0003 (the classification is the pure runtime-crate `classify`).
+    sockact_log::log_boot_socket_activation();
 
     // SNAPSHOT FORMAT-VERSION GUARD (#530): before we bind any port, check ONCE (at the node level)
     // whether the committed on-disk snapshot is a format version THIS binary can read. A dump written
