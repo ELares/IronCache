@@ -136,6 +136,8 @@ full contract.
   optional `aclfile`. ACL passwords are SHA-256 at rest.
 - **TLS** on three planes: the public client port (`tls`), the **cluster bus**, and
   the **replication** link (`cluster_tls`, with peer-cert verification against a CA).
+  rustls + `ring` (pure Rust, compiled in by default, no OpenSSL). Cert generation,
+  mTLS scope, and the rotation story are in [`docs/TLS.md`](docs/TLS.md).
 - **Cluster peer auth**: a shared `cluster_secret` presented in a constant-time
   handshake on the bus and replication links.
 - **Secret hygiene**: secret arguments are redacted from SLOWLOG, MONITOR, INFO, and

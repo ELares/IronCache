@@ -268,10 +268,18 @@ separate credential). Replace the
 `IRONCACHE_ACLFILE`. The exact enforcement is pinned by the
 `reference_console_aclfile_loads_and_enforces_least_privilege` test.
 
+TLS uses rustls + the `ring` provider (pure Rust, compiled into the binary by
+default; no OpenSSL, no `--features` flag). The full guide (openssl cert generation,
+what is and is NOT covered, the client side, and the rotation story) is
+[`docs/TLS.md`](docs/TLS.md).
+
 ### Client-port TLS (public listener)
 
 `tls=on` + `tls_cert_path` + `tls_key_path`. The client port becomes TLS-only
-(plaintext clients are rejected). In Helm, `tls.enabled=true` + the cert/key.
+(plaintext clients are rejected). Server-auth only: client identity is AUTH / ACL
+inside the session, NOT a client cert (no mTLS on the client port yet). In Helm,
+`tls.enabled=true` + the cert/key. Connect with a TLS-capable Redis client
+(`redis-cli --tls --cacert ...`); the built-in `ironcache cli` is plaintext-only.
 
 ### Cluster TLS + the shared secret (bus + replication)
 
@@ -285,6 +293,15 @@ cluster CA so a dialed peer's cert is verified (this defeats an active MITM BEFO
 the secret is sent). A single self-signed cluster cert used as BOTH the cert and
 the CA verifies against itself -- the simple no-PKI-but-secure setup. Without TLS
 the secret travels in cleartext, so TLS + secret is the recommended pairing.
+
+### Rotating a certificate
+
+There is no hot reload: the cert/key are read once at boot. To rotate, replace the
+files and RESTART the node; in a cluster do a rolling restart (one node at a time,
+waiting for each to rejoin healthy). A node presenting a new cert signed by the same
+cluster CA is accepted by peers that have not yet rotated, so a rolling rotation needs
+no flag-day. Hot reload without a restart is tracked in #563. See
+[`docs/TLS.md`](docs/TLS.md) for the full procedure.
 
 ---
 
