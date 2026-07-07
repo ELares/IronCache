@@ -161,6 +161,71 @@ pub fn merge_randomkey(replies: Vec<(usize, ShardReply)>, pick: u64) -> Value {
     candidates.swap_remove(idx)
 }
 
+/// SUM the per-shard `__ICINFOKEYSPACE <databases>` partials into the NODE-WIDE per-db key counts
+/// (#531): each shard replied an Array of `databases` Integers (`[db_len(0), db_len(1), ...]`);
+/// fold them element-wise so `totals[db]` is the whole node's DBSIZE for `db` -- EXACTLY the sum
+/// the cross-shard DBSIZE merge ([`merge_dbsize`]) produces per db, since each shard reports the
+/// SAME `db_len` its DBSIZE partial does. A shard-unavailable / error reply contributes 0 (that
+/// shard's counts are unknown; 0 is the least-surprising degradation and unavailability only
+/// happens during shutdown), mirroring [`merge_dbsize`].
+#[must_use]
+pub fn merge_keyspace_counts(replies: Vec<(usize, ShardReply)>, databases: usize) -> Vec<u64> {
+    let mut totals = vec![0u64; databases];
+    for (_, r) in replies {
+        // A non-Array reply (a shard-unavailable Error, or an out-of-shape reply that cannot occur)
+        // contributes nothing; only the per-db Integer array is summed.
+        if let Value::Array(Some(items)) = r.value {
+            for (db, item) in items.into_iter().enumerate() {
+                if db >= databases {
+                    break;
+                }
+                if let Value::Integer(n) = item {
+                    totals[db] = totals[db].saturating_add(u64::try_from(n).unwrap_or(0));
+                }
+            }
+        }
+    }
+    totals
+}
+
+/// Gather the NODE-WIDE INFO `# Keyspace` lines (#531): fan `__ICINFOKEYSPACE <databases>` out to
+/// EVERY shard (the SAME scatter-gather DBSIZE uses -- the home shard's partial runs LOCALLY +
+/// synchronously via the `local` closure, the rest via their drain loops), SUM the per-db partials
+/// with [`merge_keyspace_counts`], then build one [`KeyspaceDbLine`] per NON-EMPTY db (Redis omits
+/// empty DBs). The result feeds INFO's keyspace section so its `dbN:keys=...` counts equal DBSIZE
+/// on a multi-shard node. Called ONLY for INFO on a >1-shard node whose reply includes the keyspace
+/// section (a cold, rare command), never on the data hot path; `db` is the issuing connection's
+/// selected DB (threaded to the fan-out purely as the `ShardWork.db`, ignored by the per-db gather).
+pub async fn gather_node_keyspace(
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    databases: u32,
+    db: u32,
+    home: usize,
+) -> Vec<ironcache_observe::KeyspaceDbLine> {
+    // The internal broadcast request carries the db COUNT so every shard reports db_len(0..databases).
+    let request = Request {
+        args: vec![
+            bytes::Bytes::from_static(ironcache_server::ICINFOKEYSPACE),
+            bytes::Bytes::from(databases.to_string()),
+        ],
+    };
+    let replies = coordinator::fan_out_all(inbox, &request, db, home, || {
+        coordinator::run_local_whole_keyspace(ctx, &request, db)
+    })
+    .await;
+    merge_keyspace_counts(replies, databases as usize)
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, keys)| keys > 0)
+        .map(|(db, keys)| ironcache_observe::KeyspaceDbLine {
+            db: db as u32,
+            keys,
+            expires: 0,
+        })
+        .collect()
+}
+
 /// The `<count>` limit of an `__ICGETKEYSINSLOT <slot> <count>` internal request: `args[2]` as a
 /// non-negative count. The serve loop only routes a VALIDATED command here (the slot + count already
 /// parsed by `parse_slot_scan`), so this re-read is defensive and falls back to `0` (an empty result,

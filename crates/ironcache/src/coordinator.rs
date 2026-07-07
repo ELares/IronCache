@@ -500,12 +500,14 @@ fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
     // else never reaches the drain loop (the serve loop only enqueues those two classes);
     // dispatch_remote_* refuses a mis-routed command defensively.
     let cmd_upper = crate::serve::ascii_upper(request.command());
-    // The two #371 slot-scan internal verbs are whole-keyspace partials too (they run the
-    // `cmd_keyspace` slot-scan over this shard's partition), but are NOT in `spec_of`, so
-    // `classify` returns `AlwaysHome` for them; allow-list them alongside the classified set.
+    // The internal whole-keyspace partials run `cmd_keyspace` / `db_len` reads over THIS shard's
+    // partition, but are NOT in `spec_of`, so `classify` returns `AlwaysHome` for them; allow-list
+    // them alongside the classified set: the two #371 slot-scans and the #531 `__ICINFOKEYSPACE`
+    // per-db key-count gather for the node-wide INFO `# Keyspace`.
     let is_whole_keyspace = matches!(classify(&cmd_upper), CommandClass::WholeKeyspace)
         || cmd_upper == ironcache_server::ICCOUNTKEYSINSLOT
-        || cmd_upper == ironcache_server::ICGETKEYSINSLOT;
+        || cmd_upper == ironcache_server::ICGETKEYSINSLOT
+        || cmd_upper == ironcache_server::ICINFOKEYSPACE;
 
     let mut deltas = CounterDeltas::default();
     let lazy_expired;

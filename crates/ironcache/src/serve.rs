@@ -198,9 +198,16 @@ pub struct BootHandles {
 /// HTTP task can read the cells across threads), and return the [`BootHandles`] the binary uses to
 /// stand up the `/metrics` + `/livez` + `/readyz` endpoint.
 ///
-/// `metrics_registry` is `Some` ONLY when `--metrics-addr` is set; passing `None` (every test and
-/// the no-flag default) makes the shards use a standalone counter cell and is byte-identical to
-/// the pre-observability boot.
+/// `metrics_registry` is passed as `Some` ONLY by the caller that ALSO stands up the `/metrics`
+/// HTTP endpoint (it needs the SAME handle for the scrape task). When it is `None` (every test and
+/// the no-flag default) this fn now BUILDS one anyway (#531): INFO's `# Stats`/`# Clients` rollup
+/// must be NODE-WIDE (summed across every shard's counter cell), which requires every shard to
+/// adopt a REGISTERED cell, so the registry can no longer be gated on `--metrics-addr`. ONLY the
+/// HTTP endpoint stays optional; the registry is always present. It is a pre-allocated
+/// `Arc<Vec<ShardCountersCell>>` (one cheap cell per shard) and adopting a cell is EXACTLY what
+/// already happened with metrics ON, so the metrics-disabled hot path stays allocation/perf-neutral
+/// (a shard's `ShardCounters` wrap the registered cell instead of a standalone one; the per-command
+/// increments are the same relaxed atomics either way).
 ///
 /// `ready` is the `/readyz` readiness state (`Some` only when the metrics endpoint is enabled). It
 /// is threaded into the per-shard drain closure so each shard, AFTER its `load_shard_on_boot`
@@ -215,6 +222,13 @@ pub fn run_server_observed(
     metrics_registry: Option<ironcache_observe::MetricsRegistry>,
     ready: Option<Arc<crate::metrics_http::ReadyState>>,
 ) -> anyhow::Result<BootHandles> {
+    // #531: the metrics registry is now ALWAYS present. The caller supplies `Some` only when it
+    // also runs the `/metrics` endpoint (reusing the handle); otherwise build one here so every
+    // shard adopts a REGISTERED counter cell and INFO's node-wide rollup (`aggregate()`) can sum
+    // them. Sized to the shard count, exactly like the endpoint-enabled path. Cheap: one
+    // pre-allocated cell per shard, no per-command cost (see the doc comment).
+    let metrics_registry =
+        metrics_registry.unwrap_or_else(|| ironcache_observe::MetricsRegistry::new(config.shards));
     let bind: SocketAddr = SocketAddr::new(config.bind, config.port);
     let shard_cfg = ShardConfig {
         shards: config.shards,
@@ -562,11 +576,13 @@ pub fn run_server_observed(
         // the primary resumes ONLY on an exact match -> a restart forces a full re-sync (no silent
         // divergence). `None` on the default static path (it never serves the live resume).
         repl_history_id,
-        // The per-shard metrics registry (OBSERVABILITY.md, #152), `Some` only when the `/metrics`
-        // endpoint is enabled. Moved into the template (a cheap `Arc<Vec<_>>`), then cloned per
-        // shard via `ctx_template.clone()` so each shard adopts its cell by index at boot; `None`
-        // on the default path (byte-identical). The caller keeps its own registry handle.
-        metrics_registry,
+        // The per-shard metrics registry (OBSERVABILITY.md, #152). NOW ALWAYS `Some` (#531): built
+        // above whether or not the `/metrics` endpoint is enabled, so every shard adopts its
+        // REGISTERED counter cell and INFO's node-wide rollup (`aggregate()`) sums the whole node.
+        // Moved into the template (a cheap `Arc<Vec<_>>`), then cloned per shard via
+        // `ctx_template.clone()` so each shard adopts its cell by index at boot. The endpoint-
+        // enabled caller keeps its own clone of the SAME registry handle for the scrape task.
+        metrics_registry: Some(metrics_registry),
         // The shared persistence-stats cell (last-save + dirty), `Some` only when a data_dir is
         // configured. Cloned by Arc onto every shard's context so any shard serving INFO reads the
         // same live atomics the persistence path writes (durability footgun fix #5). `None` on the
@@ -4192,8 +4208,41 @@ async fn route_and_dispatch(
         // commands, AlwaysHome, and the key-SPANNING multi-key commands (Stage 2 gap).
         // Pass the ALREADY-uppercased command (FIX 5): we computed `cmd_upper` above for
         // routing, so the home dispatch reuses it instead of re-uppercasing + re-allocating.
+        //
+        // #531: an INFO whose reply includes the `# Keyspace` section reports the NODE-WIDE per-db
+        // key counts on a multi-shard node -- consistent with DBSIZE. Gather them FIRST via the SAME
+        // whole-keyspace scatter-gather DBSIZE uses, then hand the summed lines to the sync INFO
+        // render. This runs ONLY for INFO (a cold, rare command) on a >1-shard node; a single-shard
+        // node (the serving shard IS the whole keyspace) passes `None`, so its local `db_len` render
+        // stays byte-identical. Both serve loops (tokio + io_uring) route through here, so the fix
+        // covers both. AlwaysHome, so INFO reaches this home branch; the await here is off the data
+        // hot path.
+        let node_keyspace: Option<Vec<ironcache_observe::KeyspaceDbLine>> =
+            if home.total > 1 && cmd_upper == b"INFO" && info_reply_includes_keyspace(request) {
+                Some(
+                    crate::whole_keyspace::gather_node_keyspace(
+                        inbox,
+                        ctx,
+                        ctx.databases,
+                        conn.db,
+                        home.index,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
         handle_request(
-            ctx, conn, env, store_rc, wheel_rc, state_rc, request, &cmd_upper, out,
+            ctx,
+            conn,
+            env,
+            store_rc,
+            wheel_rc,
+            state_rc,
+            request,
+            &cmd_upper,
+            node_keyspace.as_deref(),
+            out,
         )
     };
 
@@ -5672,8 +5721,14 @@ fn route_in_multi(
     // keyed command (`+QUEUED`) and runs EXEC/DISCARD/etc. specially. This is the ONLY routing
     // branch taken while in_multi (no remote hop, no fan-out), so a transaction that reaches real
     // EXEC has ALL queued keys home-owned -> home-only EXEC is correct.
+    //
+    // #531: `None` node-keyspace here -- the MULTI queue path cannot fan out (EXEC replays
+    // synchronously), so an INFO queued in a transaction falls back to the serving shard's local
+    // `db_len` keyspace (a documented edge, consistent with the rest of the serving-shard-scoped
+    // EXEC-replay data). A bare non-transaction INFO takes the async home branch above with the
+    // node-wide gather.
     handle_request(
-        ctx, conn, env, store_rc, wheel_rc, state_rc, request, cmd_upper, out,
+        ctx, conn, env, store_rc, wheel_rc, state_rc, request, cmd_upper, None, out,
     )
 }
 
@@ -6099,6 +6154,21 @@ fn block_timeout_value() -> ironcache_server::Value {
     ironcache_server::block_timeout_reply()
 }
 
+/// Whether an `INFO [section]` reply will INCLUDE the `# Keyspace` section (#531), so the router
+/// only pays the cross-shard keyspace gather when the client will actually see it. This mirrors
+/// `ironcache_observe::build_info`'s section `want` gate EXACTLY: the keyspace section renders for a
+/// bare `INFO` (no section) or a section of `default` / `all` / `everything` / `keyspace` (case-
+/// insensitive). `INFO server` / `INFO stats` / etc. do NOT include it, so they skip the fan-out.
+fn info_reply_includes_keyspace(request: &Request) -> bool {
+    match request.args.get(1) {
+        None => true,
+        Some(section) => {
+            let s = String::from_utf8_lossy(section).to_ascii_lowercase();
+            s == "default" || s == "all" || s == "everything" || s == "keyspace"
+        }
+    }
+}
+
 /// Dispatch one request and append its encoded reply to `out`. Returns whether
 /// the connection should close after flushing (QUIT).
 ///
@@ -6117,11 +6187,36 @@ fn handle_request(
     state_rc: &Rc<RefCell<ShardState>>,
     request: &Request,
     cmd_upper: &[u8],
+    // #531: the NODE-WIDE INFO `# Keyspace` lines (per-db counts summed across every shard), or
+    // `None` to fall back to THIS shard's local `db_len`. The router gathers it (via a whole-
+    // keyspace fan-out) ONLY for an INFO whose reply includes the keyspace section on a >1-shard
+    // node; every other command and the single-shard node pass `None` (byte-identical). Borrowed
+    // from the router's stack for the duration of the synchronous dispatch.
+    node_keyspace: Option<&[ironcache_observe::KeyspaceDbLine]>,
     out: &mut Vec<u8>,
 ) -> bool {
     state_rc.borrow_mut().counters.on_command();
-    let snapshot_fn = || state_rc.borrow().counters.snapshot();
+    // INFO ROLLUP (#531): the `# Stats`/`# Clients` counters are the NODE-WIDE sum, not this
+    // serving shard's ~1/N view. The metrics registry is always present now (built at boot even
+    // with `/metrics` off), and every shard's `ShardCounters` mutate their registered cell, so
+    // `aggregate()` folds EVERY shard into one snapshot -- invariant to which shard homed this
+    // connection, and consistent with DBSIZE / `/metrics`. The serving-shard snapshot is the
+    // defensive fallback for a registry-absent `ServerContext` (unit tests that build one bare); in
+    // the binary the registry is always `Some`, so the node-wide arm is always taken. The closure
+    // is invoked ONLY by INFO (inside dispatch); the aggregate arm borrows nothing of `state_rc`,
+    // and the fallback arm's `state_rc.borrow()` runs sequentially with (never aliasing) dispatch's
+    // later mutable borrow, exactly as before.
+    let snapshot_fn = || {
+        ctx.metrics_registry.as_ref().map_or_else(
+            || state_rc.borrow().counters.snapshot(),
+            ironcache_observe::MetricsRegistry::aggregate,
+        )
+    };
     let rollup: &dyn Fn() -> CounterSnapshot = &snapshot_fn;
+    // #531: the node-wide INFO keyspace source. `Some` slice -> yield the fanned-out per-db lines;
+    // `None` -> `cmd_info` falls back to this shard's local `db_len` (single-shard / non-INFO).
+    let keyspace_fn = || node_keyspace.map(<[_]>::to_vec);
+    let keyspace: ironcache_server::KeyspaceFn<'_> = &keyspace_fn;
     // COMMANDSTATS / ERRORSTATS render (#413): render the serving shard's per-command + per-error
     // tables into the INFO section bodies. Invoked ONLY when INFO asks for those sections (the
     // closure is not called otherwise), and it borrows `state_rc` immutably like `rollup` does
@@ -6188,6 +6283,7 @@ fn handle_request(
             &mut shard_generation,
             rollup,
             cmdstats,
+            keyspace,
             mem,
             &mut deltas,
             request,
@@ -6203,9 +6299,9 @@ fn handle_request(
     // Fold this command's dynamic counters into the shard's totals for INFO and write
     // back the (possibly advanced) policy generation. Each is a cheap no-op on the
     // common hot path (no deltas, no generation change).
+    let reset_stats = deltas.reset_stats;
     {
         deltas.expired += lazy_expired;
-        let reset_stats = deltas.reset_stats;
         let mut st = state_rc.borrow_mut();
         if deltas != CounterDeltas::default() {
             st.counters.apply(deltas);
@@ -6216,6 +6312,16 @@ fn handle_request(
             st.command_stats.reset();
         }
         st.last_policy_generation = shard_generation;
+    }
+    // CONFIG RESETSTAT NODE-WIDE (#531): `apply` above zeroed only THIS serving shard's cell, but
+    // INFO now reports the node-wide rollup (every shard's cell summed via `aggregate()`), so a
+    // reset must fan across EVERY shard's cell or a sibling shard's stale totals would survive in
+    // the rollup. The registry is always present in the binary; the reset is a handful of relaxed
+    // atomic stores per cell (RESETSTAT is a rare admin command, never on the data hot path).
+    if reset_stats {
+        if let Some(registry) = ctx.metrics_registry.as_ref() {
+            registry.reset_stats();
+        }
     }
     encode_into(out, &reply, conn.proto);
     conn.should_close
