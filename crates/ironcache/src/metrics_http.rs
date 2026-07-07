@@ -232,6 +232,7 @@ impl MetricsState {
                 voters: h.config().voters.len() as u64,
             }
         });
+        let (repl_link_up, repl_lag_offset) = self.replication_gauges();
         MetricsGauges {
             uptime_secs: self.clock.uptime_secs(),
             shards: self.shards,
@@ -240,7 +241,43 @@ impl MetricsState {
             maxmemory: (self.maxmemory)(),
             last_save_unix,
             rdb_changes_since_save: dirty,
+            repl_link_up,
+            repl_lag_offset,
             raft,
+        }
+    }
+
+    /// Derive the replication gauges (#549) from the node's repl-status snapshot -- the SAME cell the
+    /// INFO `# Replication` path reads (carried on the `/topology` handle). Returns
+    /// `(link_up, lag_offset)`:
+    ///
+    /// * standalone (no status cell) -> `(true, 0)`, the master default (no upstream link to lose);
+    /// * a MASTER -> link up, lag = its WORST connected replica's lag (`head - acked`), or 0;
+    /// * a REPLICA -> link up iff attached to its master, lag = `master_offset - node_offset` (0 when
+    ///   caught up or the link is down / unknown).
+    ///
+    /// The lag is in LOGICAL WRITE OFFSETS (IronCache tracks a write offset, not a time delta), the
+    /// honest unit. A cheap, lock-free-ish snapshot read on the cold scrape path.
+    fn replication_gauges(&self) -> (bool, u64) {
+        let Some(status) = self.topology.repl_status.as_ref() else {
+            return (true, 0);
+        };
+        let snap = status.snapshot();
+        match snap.role {
+            ironcache_server::ReplRole::Master => {
+                let worst = snap
+                    .replicas
+                    .iter()
+                    .map(|r| snap.slave_lag_of(r.acked).lag().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
+                (true, worst)
+            }
+            ironcache_server::ReplRole::Replica => {
+                let up = snap.master_link.is_up();
+                let lag = snap.replica_lag().lag().unwrap_or(0);
+                (up, lag)
+            }
         }
     }
 
@@ -634,6 +671,58 @@ mod tests {
         // The per-shard labeled histogram is present in the same scrape.
         assert!(
             text.contains("ironcache_shard_command_duration_seconds_bucket{shard=\"0\","),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn metrics_route_includes_replication_gauges() {
+        // #549: the replication gauges appear in a scrape. Standalone (test_state has no repl status):
+        // the master default -- link up, no lag.
+        let (state, _r, _l, _rd) = test_state();
+        let text = String::from_utf8(state.respond("GET", "/metrics")).unwrap();
+        assert!(
+            text.contains("# TYPE ironcache_replication_link_up gauge\n"),
+            "{text}"
+        );
+        assert!(text.contains("ironcache_replication_link_up 1\n"), "{text}");
+        assert!(
+            text.contains("ironcache_replication_lag_offset 0\n"),
+            "{text}"
+        );
+
+        // A REPLICA whose link is UP and lagging by 50 logical write offsets: link_up 1, lag 50.
+        let status = Arc::new(ironcache_server::ReplNodeStatus::new());
+        status.set_replica_attached("10.0.0.1", 7002, ironcache_repl::ReplOffset(100));
+        status.set_observed_master_head(ironcache_repl::ReplOffset(150));
+        let mut topo = crate::topology::TopologyHandle::standalone("replica-node", 6379, 2);
+        topo.repl_status = Some(Arc::clone(&status));
+        let state = MetricsState::new(
+            MetricsRegistry::new(2),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(ReadyState::with_shards(0)),
+            2,
+            Arc::new(|| 0),
+            None,
+            None,
+            topo,
+        );
+        let text = String::from_utf8(state.respond("GET", "/metrics")).unwrap();
+        assert!(text.contains("ironcache_replication_link_up 1\n"), "{text}");
+        assert!(
+            text.contains("ironcache_replication_lag_offset 50\n"),
+            "a lagging replica reports its offset lag: {text}"
+        );
+
+        // The link going DOWN flips link_up to 0 and the lag to unknown (0) -- the replica's alert.
+        status.set_master_link_down();
+        let text = String::from_utf8(state.respond("GET", "/metrics")).unwrap();
+        assert!(
+            text.contains("ironcache_replication_link_up 0\n"),
+            "a down link reports link_up 0: {text}"
+        );
+        assert!(
+            text.contains("ironcache_replication_lag_offset 0\n"),
             "{text}"
         );
     }

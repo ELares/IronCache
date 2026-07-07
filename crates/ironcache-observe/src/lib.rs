@@ -11,9 +11,10 @@
 //! Counters are per-shard (shared-nothing, ADR-0002) and rolled up for INFO by
 //! summing snapshots; there is no shared atomic on the hot path.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ironcache_env::Clock;
 use std::sync::Arc;
+use std::sync::Mutex; // lint-allow: shared-nothing -- the ops/sec sampler ring is node-level cold state, taken only on the rare INFO/metrics READ, never on the per-command hot path (see `OpsPerSecSampler`).
 
 /// Operator-introspection state (PROD-7): the SLOWLOG ring, the LATENCY monitor, and the
 /// live-connection registry CLIENT KILL/PAUSE act through. Kept in its own module since each is a
@@ -529,6 +530,102 @@ impl ShardCounters {
     }
 }
 
+/// The number of `(wall_millis, total_commands)` samples the ops/sec sampler retains (#549). Small:
+/// the rate is read over the ring's oldest-to-newest span, so a handful of recent samples is enough
+/// to smooth a single spiky read without diluting a sustained rate. Mirrors the spirit of Redis's
+/// fixed instantaneous-metric ring.
+const OPS_SAMPLE_RING: usize = 16;
+
+/// One `(timestamp, total_commands)` sample the [`OpsPerSecSampler`] retains. The timestamp is
+/// WALL-CLOCK milliseconds from the Env `Clock` seam (`now_unix_millis`, ADR-0003): unlike the
+/// per-shard monotonic clock (whose origin differs per shard), the wall clock is comparable across
+/// the shards that may each serve an INFO read into the SAME shared ring, and it is the same basis
+/// Redis samples its instantaneous metrics on.
+#[derive(Debug, Clone, Copy)]
+struct OpsSample {
+    /// Wall-clock milliseconds at which the sample was taken (`Clock::now_unix_millis`).
+    at_millis: u64,
+    /// The node-wide `commands_processed` total at that instant.
+    total: u64,
+}
+
+/// The node-wide `instantaneous_ops_per_sec` sampler (#549): a small ring of
+/// `(wall_millis, total_commands)` samples updated ON the (cold) INFO / metrics read, from which
+/// INFO reports the recent commands-per-second rate. Previously that field was HARDWIRED to 0, so an
+/// operator could not see load.
+///
+/// ## How the rate is computed
+///
+/// Each read appends `(now_millis, total_commands)` via [`Self::observe`] and returns the rate over
+/// the retained window: `(newest.total - oldest.total) * 1000 / (newest.at - oldest.at)`. With a
+/// single sample so far (or no elapsed time) the rate is 0. Under sustained load two reads a second
+/// apart report the driven rate; sparse reads report the honest average over their span. The ring
+/// bounds how far back "oldest" reaches ([`OPS_SAMPLE_RING`] samples).
+///
+/// ## Determinism + shared-nothing
+///
+/// Time comes ONLY from the Env `Clock` seam (ADR-0003); the sampler never reads the OS clock. It is
+/// NODE-LEVEL cold state behind ONE standard-library mutex, taken only on the rare INFO/metrics read
+/// (never the per-command hot path), so `bytes_per_key` and steady-state throughput are unaffected.
+/// The lock is the sanctioned shared-nothing carve-out (mirroring [`ops`]).
+#[derive(Debug, Default)]
+pub struct OpsPerSecSampler {
+    ring: Mutex<std::collections::VecDeque<OpsSample>>, // lint-allow: shared-nothing -- node-level cold state, taken only on the rare INFO/metrics read.
+}
+
+impl OpsPerSecSampler {
+    /// A fresh sampler with an empty ring (first read reports 0 ops/sec until a second sample lands).
+    #[must_use]
+    pub fn new() -> Self {
+        OpsPerSecSampler {
+            ring: Mutex::new(std::collections::VecDeque::with_capacity(OPS_SAMPLE_RING)),
+        }
+    }
+
+    /// Record a `(now_millis, total_commands)` sample and return the current
+    /// `instantaneous_ops_per_sec` estimate over the retained window. `now_millis` is wall-clock
+    /// milliseconds from the Env `Clock` seam (`now_unix_millis`); `total_commands` is the node-wide
+    /// `commands_processed` total (summed across shards via [`MetricsRegistry::aggregate`]).
+    ///
+    /// Robust to a wall-clock that does not advance or steps backwards (a benign no-op / coalesce for
+    /// this cold observability metric): a same-millisecond read updates the newest sample's total in
+    /// place (no zero-duration division), and the rate uses `saturating_sub` on both axes.
+    pub fn observe(&self, now_millis: u64, total_commands: u64) -> u64 {
+        let Ok(mut ring) = self.ring.lock() else {
+            // A poisoned lock (a prior panic while holding it) is not worth failing an INFO read over;
+            // report 0 rather than propagate.
+            return 0;
+        };
+        match ring.back_mut() {
+            // Coalesce a same-instant (or backwards-clock) read into the newest sample so the window
+            // never carries a zero/negative time step; keep the larger command total (monotonic).
+            Some(last) if now_millis <= last.at_millis => {
+                last.total = last.total.max(total_commands);
+            }
+            _ => {
+                ring.push_back(OpsSample {
+                    at_millis: now_millis,
+                    total: total_commands,
+                });
+                if ring.len() > OPS_SAMPLE_RING {
+                    ring.pop_front();
+                }
+            }
+        }
+        // Need two distinct-time samples to compute a rate.
+        let (Some(oldest), Some(newest)) = (ring.front(), ring.back()) else {
+            return 0;
+        };
+        let dt_ms = newest.at_millis.saturating_sub(oldest.at_millis);
+        if dt_ms == 0 {
+            return 0;
+        }
+        let dcommands = newest.total.saturating_sub(oldest.total);
+        // commands over dt_ms milliseconds -> per-second rate (integer, matching Redis's field type).
+        dcommands.saturating_mul(1000) / dt_ms
+    }
+}
+
 /// The process-wide METRICS REGISTRY (OBSERVABILITY.md, #152): one [`ShardCountersCell`] per
 /// shard, pre-allocated at boot and shared (by `Arc`) into BOTH the shard (which mutates its
 /// own cell) AND the out-of-band `/metrics` HTTP task (which reads EVERY cell across threads
@@ -545,6 +642,10 @@ impl ShardCounters {
 pub struct MetricsRegistry {
     /// One backing cell per shard, in shard-index order (`cells[i]` belongs to shard `i`).
     cells: Arc<Vec<Arc<ShardCountersCell>>>,
+    /// The node-wide `instantaneous_ops_per_sec` sampler (#549), shared by `Arc` so every clone of
+    /// the registry (one per shard's context) feeds the SAME ring on an INFO read. Node-level cold
+    /// state; touched only on the rare INFO/metrics read, never per command.
+    ops_rate: Arc<OpsPerSecSampler>,
 }
 
 impl MetricsRegistry {
@@ -558,7 +659,16 @@ impl MetricsRegistry {
             .collect();
         MetricsRegistry {
             cells: Arc::new(cells),
+            ops_rate: Arc::new(OpsPerSecSampler::new()),
         }
+    }
+
+    /// The node-wide `instantaneous_ops_per_sec` sampler (#549), for the INFO read to sample the
+    /// node-wide command total against the Env clock and report the recent rate. Shared across every
+    /// shard's registry clone, so any shard serving INFO feeds the same ring.
+    #[must_use]
+    pub fn ops_rate(&self) -> &OpsPerSecSampler {
+        &self.ops_rate
     }
 
     /// The pre-allocated backing cell for shard `index`, for the shard to adopt into its
@@ -667,6 +777,17 @@ pub struct MetricsGauges {
     pub last_save_unix: u64,
     /// The persistence DIRTY counter (changes since the last save; `0` when persistence off).
     pub rdb_changes_since_save: u64,
+    /// REPLICATION (#549): whether this node's replication link is healthy. A REPLICA reports the
+    /// link to its master (`master_link_status:up`); a MASTER / standalone reports `true` (it has no
+    /// upstream link to lose). Rendered as `ironcache_replication_link_up 1|0` so a replica losing
+    /// its master is visible on a scrape.
+    pub repl_link_up: bool,
+    /// REPLICATION (#549): the replication lag in LOGICAL WRITE OFFSETS (IronCache tracks a logical
+    /// write offset, not a time delta, so the honest unit is offsets, not seconds). A REPLICA reports
+    /// its own lag (`master_offset - node_offset`); a MASTER reports its worst connected replica's
+    /// lag; `0` when caught up, standalone, or the link is down (unknown). Rendered as
+    /// `ironcache_replication_lag_offset`.
+    pub repl_lag_offset: u64,
     /// The raft control-plane gauges, `Some` only in raft-governance mode.
     pub raft: Option<RaftGauges>,
 }
@@ -779,6 +900,20 @@ pub fn render_prometheus(counters: CounterSnapshot, gauges: MetricsGauges) -> St
         "ironcache_persistence_rdb_changes_since_save",
         "Changes since the last save (the dirty counter; 0 when persistence is off).",
         gauges.rdb_changes_since_save,
+    );
+
+    // REPLICATION gauges (#549): a replica falling behind (or losing its master) is otherwise
+    // invisible. `link_up` is 1 when this node's replication link is healthy (a replica's link to its
+    // master; a master/standalone is trivially up); `lag_offset` is the lag in logical write offsets.
+    gauge(
+        "ironcache_replication_link_up",
+        "1 when this node's replication link is up (a replica's link to its master; a master is 1).",
+        u64::from(gauges.repl_link_up),
+    );
+    gauge(
+        "ironcache_replication_lag_offset",
+        "Replication lag in logical write offsets (a replica's own lag; a master's worst replica; 0 when caught up / standalone / link down).",
+        gauges.repl_lag_offset,
     );
 
     if let Some(r) = gauges.raft {
@@ -1208,6 +1343,10 @@ pub struct PersistenceInfo {
     pub rdb_last_save_time: u64,
     /// `rdb_changes_since_last_save`: keyspace writes since the last save (the dirty counter).
     pub rdb_changes_since_last_save: u64,
+    /// `rdb_last_bgsave_status`: whether the last save COMMITTED (`true` -> `ok`, `false` -> `err`),
+    /// #549. `true` before any save has run (Redis parity) and when persistence is off, so the
+    /// canonical "last save failed" alert reads a real signal only after a genuine failure.
+    pub last_bgsave_ok: bool,
     /// The SECONDS half of the active save point (the periodic cadence). `0` = the periodic save
     /// is OFF (only an explicit SAVE/BGSAVE persists), rendered as an EMPTY `save` policy.
     pub save_interval_secs: u64,
@@ -1226,6 +1365,11 @@ pub struct PersistenceInfo {
 pub struct PersistRuntime {
     last_save_unix_secs: AtomicU64,
     dirty: AtomicU64,
+    /// Whether the most recent save COMMITTED successfully (#549). Defaults to `true` (Redis reports
+    /// `rdb_last_bgsave_status:ok` before any save has run); a FAILED save flips it to `false` and a
+    /// committed save flips it back to `true`. Read (relaxed) by the INFO `# Persistence` render so
+    /// the canonical "last save failed" alert can be written; a lock-free node-level cell.
+    last_bgsave_ok: AtomicBool,
 }
 
 impl Default for PersistRuntime {
@@ -1241,6 +1385,8 @@ impl PersistRuntime {
         PersistRuntime {
             last_save_unix_secs: AtomicU64::new(0),
             dirty: AtomicU64::new(0),
+            // Redis reports `rdb_last_bgsave_status:ok` before any save has run.
+            last_bgsave_ok: AtomicBool::new(true),
         }
     }
 
@@ -1269,6 +1415,19 @@ impl PersistRuntime {
     /// Reset the dirty counter to zero (a committed save), relaxed.
     pub fn reset_dirty(&self) {
         self.dirty.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the last save COMMITTED successfully (INFO `rdb_last_bgsave_status:ok|err`, #549),
+    /// relaxed. `true` before any save has run (Redis parity).
+    #[must_use]
+    pub fn last_bgsave_ok(&self) -> bool {
+        self.last_bgsave_ok.load(Ordering::Relaxed)
+    }
+
+    /// Record the outcome of a save (#549): `true` on a committed save, `false` on a failed one.
+    /// Relaxed; the persistence save path calls this so INFO's `rdb_last_bgsave_status` is honest.
+    pub fn set_last_bgsave_ok(&self, ok: bool) {
+        self.last_bgsave_ok.store(ok, Ordering::Relaxed);
     }
 }
 
@@ -1447,6 +1606,8 @@ impl PersistenceInfo {
             enabled: false,
             rdb_last_save_time: 0,
             rdb_changes_since_last_save: 0,
+            // Redis reports `rdb_last_bgsave_status:ok` even with persistence off / before any save.
+            last_bgsave_ok: true,
             save_interval_secs: 0,
             save_min_changes: 0,
         }
@@ -1667,6 +1828,13 @@ fn push_persistence_section(out: &mut String, p: &PersistenceInfo) {
     );
     out.push_str("rdb_bgsave_in_progress:0\r\n");
     let _ = write!(out, "rdb_last_save_time:{}\r\n", p.rdb_last_save_time);
+    // `rdb_last_bgsave_status:ok|err` (#549): the canonical "last save failed" signal, sourced from
+    // the persistence subsystem's last-save outcome. `ok` before any save (Redis parity).
+    let _ = write!(
+        out,
+        "rdb_last_bgsave_status:{}\r\n",
+        if p.last_bgsave_ok { "ok" } else { "err" }
+    );
     out.push_str("aof_enabled:0\r\n");
     let _ = write!(out, "persistence_enabled:{}\r\n", u8::from(p.enabled));
     // The active save policy as the Redis `save` directive spelling: "<secs> <changes>" when a
@@ -2075,6 +2243,7 @@ mod tests {
             enabled: true,
             rdb_last_save_time: 1_700_000_000,
             rdb_changes_since_last_save: 7,
+            last_bgsave_ok: true,
             save_interval_secs: 900,
             save_min_changes: 1,
         };
@@ -2097,6 +2266,28 @@ mod tests {
         assert!(body.contains("save:900 1\r\n"), "{body}");
         assert!(body.contains("persistence_enabled:1\r\n"), "{body}");
         assert!(body.contains("aof_enabled:0\r\n"), "{body}");
+        // #549: a committed-save posture renders rdb_last_bgsave_status:ok.
+        assert!(body.contains("rdb_last_bgsave_status:ok\r\n"), "{body}");
+        // A FAILED save renders rdb_last_bgsave_status:err (the canonical "last save failed" alert).
+        let failed = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl(),
+            &PersistenceInfo {
+                last_bgsave_ok: false,
+                ..persistence
+            },
+            &[],
+            RuntimeStats::default(),
+            Some("persistence"),
+        );
+        assert!(
+            failed.contains("rdb_last_bgsave_status:err\r\n"),
+            "{failed}"
+        );
         // DISABLED: the honest no-snapshot posture (last-save 0, empty policy).
         let off = build_info(
             &env,
@@ -2113,6 +2304,36 @@ mod tests {
         assert!(off.contains("rdb_last_save_time:0\r\n"), "{off}");
         assert!(off.contains("save:\r\n"), "{off}");
         assert!(off.contains("persistence_enabled:0\r\n"), "{off}");
+    }
+
+    /// #549: the ops/sec sampler reports 0 until a second sample lands, then tracks the driven rate
+    /// over the sampling window. Time is fed explicitly (the caller reads it from the Env clock).
+    #[test]
+    fn ops_per_sec_sampler_tracks_the_driven_rate() {
+        let s = OpsPerSecSampler::new();
+        // The first sample seeds the ring: no elapsed time yet, so the rate is 0.
+        assert_eq!(s.observe(0, 0), 0, "first sample -> no rate yet");
+        // 500 commands over the next 1000ms -> 500 ops/sec.
+        assert_eq!(s.observe(1000, 500), 500, "500 commands / 1s = 500 ops/sec");
+        // Sustained: another 1000 commands over the next 2000ms (t=3000) -> the window (t=0..3000,
+        // 1500 commands) averages 500 ops/sec.
+        assert_eq!(s.observe(3000, 1500), 500, "sustained rate over the window");
+    }
+
+    /// #549: the sampler is robust to a non-advancing / backwards wall clock (a benign no-op for this
+    /// cold metric): a same-millisecond read coalesces into the newest sample (no zero-duration
+    /// division) and never panics.
+    #[test]
+    fn ops_per_sec_sampler_is_robust_to_a_stalled_clock() {
+        let s = OpsPerSecSampler::new();
+        assert_eq!(s.observe(1000, 0), 0);
+        // Same instant, more commands: coalesced, still no elapsed time -> 0 (no panic).
+        assert_eq!(s.observe(1000, 100), 0);
+        // A backwards clock read is also coalesced rather than producing a negative window.
+        assert_eq!(s.observe(500, 200), 0);
+        // Time finally advances: the rate is computed against the coalesced newest total (200) at the
+        // retained oldest sample.
+        assert_eq!(s.observe(2000, 1200), 1000);
     }
 
     /// Operability fix #5: INFO renders a `# Keyspace` section with `dbN:keys=...` lines (Redis
@@ -2582,10 +2803,22 @@ mod tests {
             maxmemory: 0,
             last_save_unix: 0,
             rdb_changes_since_save: 0,
+            repl_link_up: true,
+            repl_lag_offset: 0,
             raft: None,
         };
         let body = render_prometheus(counters, gauges);
         assert!(body.contains("# TYPE ironcache_commands_processed_total counter\n"));
+        // #549: the replication gauges appear in the scrape (a standalone master: link up, no lag).
+        assert!(
+            body.contains("# TYPE ironcache_replication_link_up gauge\n"),
+            "{body}"
+        );
+        assert!(body.contains("ironcache_replication_link_up 1\n"), "{body}");
+        assert!(
+            body.contains("ironcache_replication_lag_offset 0\n"),
+            "{body}"
+        );
         assert!(
             body.contains("ironcache_commands_processed_total 42\n"),
             "{body}"
@@ -2613,6 +2846,8 @@ mod tests {
             maxmemory: 0,
             last_save_unix: 0,
             rdb_changes_since_save: 0,
+            repl_link_up: true,
+            repl_lag_offset: 0,
             raft: Some(RaftGauges {
                 is_leader: true,
                 current_term: 9,

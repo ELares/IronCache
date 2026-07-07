@@ -198,12 +198,23 @@ impl PersistState {
         self.saving.store(false, Ordering::Release);
     }
 
-    /// Record a COMMITTED save: stamp the last-save time, bump the save id, and reset the dirty
-    /// counter to 0 (relaxed). Called on the home core after the manifest is written.
+    /// Record a COMMITTED save: stamp the last-save time, bump the save id, reset the dirty counter
+    /// to 0, and mark the last-save outcome OK (relaxed). Called on the home core after the manifest
+    /// is written. The OK stamp clears any prior `err` so INFO `rdb_last_bgsave_status` recovers to
+    /// `ok` on the next successful save (#549).
     pub fn record_committed(&self, save_unix_secs: u64) {
         self.stats.set_last_save_unix_secs(save_unix_secs);
         self.save_id.fetch_add(1, Ordering::Relaxed);
         self.stats.reset_dirty();
+        self.stats.set_last_bgsave_ok(true);
+    }
+
+    /// Record a FAILED save (#549): mark the last-save outcome as `err` so INFO
+    /// `rdb_last_bgsave_status` reports the failure (the canonical "last save failed" alert). The
+    /// last-save TIME + dirty counter are left untouched (the prior committed snapshot stays valid).
+    /// Called by the save fan-out on any failure arm.
+    pub fn record_save_failed(&self) {
+        self.stats.set_last_bgsave_ok(false);
     }
 
     /// The next monotone save id (the value the next save will record; read for the manifest).
@@ -303,6 +314,27 @@ fn icsave_request(save_unix_secs: u64, shard: usize, dir: &std::path::Path) -> R
 /// `save_unix_secs` is the home core's wall-clock time (read from the env Clock seam by the caller,
 /// ADR-0003); it is recorded in the manifest and reported by `LASTSAVE`.
 pub async fn do_save_all(
+    persist: &Arc<PersistState>,
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    home: ShardId,
+    db: u32,
+    save_unix_secs: u64,
+) -> Result<(), String> {
+    // Record the save OUTCOME so INFO `rdb_last_bgsave_status` is honest (#549): the success path
+    // stamps OK inside `record_committed`; every FAILURE arm funnels through this ONE place, so a
+    // failed save flips the status to `err` regardless of which arm failed (dir create, a shard
+    // error, or the manifest write).
+    let outcome = save_all_attempt(persist, inbox, ctx, home, db, save_unix_secs).await;
+    if outcome.is_err() {
+        persist.record_save_failed();
+    }
+    outcome
+}
+
+/// The inner cross-shard SAVE attempt: the actual fan-out + manifest commit (records the COMMITTED
+/// save on success). [`do_save_all`] wraps it to record a FAILED save on any `Err` (#549).
+async fn save_all_attempt(
     persist: &Arc<PersistState>,
     inbox: &Inbox,
     ctx: &ServerContext,
@@ -419,9 +451,12 @@ pub async fn do_save_all_bounded(
     tokio::select! {
         biased;
         result = do_save_all(persist, inbox, ctx, home, db, save_unix_secs) => result,
-        () = rt.timer(timeout) => Err(
-            "save fan-out timed out (a shard did not answer in time)".to_owned()
-        ),
+        () = rt.timer(timeout) => {
+            // The timeout cancels the in-flight `do_save_all` (its own failure-recording never runs),
+            // so record the failed outcome here so INFO `rdb_last_bgsave_status` reports `err` (#549).
+            persist.record_save_failed();
+            Err("save fan-out timed out (a shard did not answer in time)".to_owned())
+        }
     }
 }
 
