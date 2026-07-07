@@ -282,6 +282,14 @@ impl MetricsState {
                 body.push_str(&ironcache_observe::render_prometheus_shards(
                     &self.registry.per_shard_snapshots(),
                 ));
+                // Command-latency HISTOGRAM (#546): the node-wide rollup (the p99/p99.9-graphable
+                // `ironcache_command_duration_seconds_*` series) then the additive per-shard detail.
+                body.push_str(&ironcache_observe::render_latency_histogram(
+                    &self.registry.aggregate_latency(),
+                ));
+                body.push_str(&ironcache_observe::render_latency_histogram_shards(
+                    &self.registry.per_shard_latency(),
+                ));
                 http_response(
                     200,
                     "OK",
@@ -593,6 +601,41 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ironcache_uptime_seconds"), "{text}");
+    }
+
+    #[test]
+    fn metrics_route_includes_the_latency_histogram() {
+        // #546: driving commands with measured latencies makes the histogram series appear in a
+        // `/metrics` scrape with correct semantics (cumulative buckets, +Inf == _count == commands).
+        let (state, registry, _live, _ready) = test_state();
+        let s0 = ShardCounters::with_cell(registry.shard_cell(0));
+        let s1 = ShardCounters::with_cell(registry.shard_cell(1));
+        // Six observations across two shards spanning several buckets.
+        for us in [10u64, 200, 900] {
+            s0.observe_latency(us);
+        }
+        for us in [40u64, 30_000, 20_000_000] {
+            s1.observe_latency(us);
+        }
+        let text = String::from_utf8(state.respond("GET", "/metrics")).unwrap();
+        assert!(
+            text.contains("# TYPE ironcache_command_duration_seconds histogram"),
+            "{text}"
+        );
+        // 6 observations total -> _count == 6 and the +Inf bucket == 6.
+        assert!(
+            text.contains("ironcache_command_duration_seconds_count 6\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ironcache_command_duration_seconds_bucket{le=\"+Inf\"} 6\n"),
+            "{text}"
+        );
+        // The per-shard labeled histogram is present in the same scrape.
+        assert!(
+            text.contains("ironcache_shard_command_duration_seconds_bucket{shard=\"0\","),
+            "{text}"
+        );
     }
 
     #[test]

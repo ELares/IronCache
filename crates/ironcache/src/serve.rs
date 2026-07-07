@@ -6351,6 +6351,15 @@ fn record_command_stats(
     out: &[u8],
     elapsed_us: u64,
 ) {
+    // LATENCY HISTOGRAM (#546): record this command's elapsed micros into the shard's per-shard
+    // histogram FIRST, before the `spec_of` gate below early-returns for an unknown command. The
+    // histogram is the operator-facing tail-latency view (p99/p99.9 graphable from `/metrics`), so
+    // it must count EVERY command that reached the timing site -- known or not -- to stay consistent
+    // with the commands-processed total. This is the single per-command choke point every serve path
+    // funnels through (the tokio loop, the io_uring loop, and the deferred-hop drain all call it with
+    // the SAME reused SLOWLOG/COMMANDSTATS elapsed), so recording here covers them all with no new
+    // clock read: a branchless find-bucket + one relaxed atomic increment (see `observe_latency`).
+    state_rc.borrow().counters.observe_latency(elapsed_us);
     let cmd_upper = ascii_upper(request.command());
     let Some(spec) = ironcache_server::spec_of(&cmd_upper) else {
         return;
