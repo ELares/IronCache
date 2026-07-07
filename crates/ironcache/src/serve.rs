@@ -3794,7 +3794,7 @@ async fn route_and_dispatch(
         // so the drain is a no-op; the re-attempt in the serve loop's park loop publishes its own
         // events on a successful wake. The drain short-circuits on an empty buffer, so this is a
         // single thread-local `is_empty` check when notifications are off.
-        publish_pending_keyspace_events(inbox, home.index).await;
+        publish_pending_keyspace_events(inbox, home.index);
         return close;
     }
 
@@ -4360,7 +4360,7 @@ async fn route_and_dispatch(
     // notifications disabled), so on the default deployment this is a single thread-local
     // `is_empty` check and the path is byte-identical. Events recorded on a REMOTE owner shard
     // (a cross-shard write) are drained + published by THAT shard's drain loop (`run_remote`).
-    publish_pending_keyspace_events(inbox, home.index).await;
+    publish_pending_keyspace_events(inbox, home.index);
     close
 }
 
@@ -4406,7 +4406,7 @@ pub(crate) fn wake_blocking_waiters_for_shard(db: u32, request: &Request) {
 /// (channel `__keyevent@db__:<event>`, payload = the key), per the channel selectors resolved at
 /// record time. The receiver COUNT each PUBLISH returns is ignored (a notification's value is the
 /// delivery, not a reply).
-async fn publish_pending_keyspace_events(inbox: &coordinator::Inbox, home: usize) {
+fn publish_pending_keyspace_events(inbox: &coordinator::Inbox, home: usize) {
     let events = ironcache_config::notify::drain();
     if events.is_empty() {
         return;
@@ -4422,12 +4422,11 @@ async fn publish_pending_keyspace_events(inbox: &coordinator::Inbox, home: usize
         // separate per-connection channel drained only after this batch's reply is flushed.
         if ev.keyspace {
             let channel = ev.keyspace_channel();
-            coordinator::fan_out_publish_notify(inbox, &channel, ev.event.as_bytes(), ev.db, home)
-                .await;
+            coordinator::fan_out_publish_notify(inbox, &channel, ev.event.as_bytes(), ev.db, home);
         }
         if ev.keyevent {
             let channel = ev.keyevent_channel();
-            coordinator::fan_out_publish_notify(inbox, &channel, &ev.key, ev.db, home).await;
+            coordinator::fan_out_publish_notify(inbox, &channel, &ev.key, ev.db, home);
         }
     }
 }
@@ -6094,7 +6093,7 @@ async fn run_block_park(
                 // A successful blocked pop fires the SAME lpop/rpop/zpopmin keyspace event as a
                 // non-blocking pop; publish it AFTER the reply is flushed (per-connection FIFO).
                 let closed = flush_block_reply(stream, out, conn.proto, reply).await;
-                publish_pending_keyspace_events(inbox, home.index).await;
+                publish_pending_keyspace_events(inbox, home.index);
                 return closed;
             }
         }

@@ -306,7 +306,7 @@ pub async fn run_drain_loop(
                         // THIS shard recorded its keyspace events into this shard's pending buffer;
                         // drain + publish them AFTER the reply is sent. Short-circuits on an empty
                         // buffer (the common case: a read, or notifications disabled).
-                        publish_pending_keyspace_events(&inbox, shard_index).await;
+                        publish_pending_keyspace_events(&inbox, shard_index);
                     }
                     // All senders dropped (the process is already tearing down): stop the loop. Not a
                     // flag-driven stop, so no save is attempted here.
@@ -357,7 +357,7 @@ pub async fn run_drain_loop(
                             // KEYSPACE NOTIFICATIONS (PROD-8): publish any events this cross-shard
                             // write recorded, exactly as the steady-state arm above (the
                             // post-shutdown window still services live cross-shard work).
-                            publish_pending_keyspace_events(&inbox, shard_index).await;
+                            publish_pending_keyspace_events(&inbox, shard_index);
                         }
                         None => return,
                     }
@@ -1440,17 +1440,18 @@ pub async fn fan_out_publish(
 /// ORDERING is preserved where it is observable: the `__ICPUBLISH`s a single source shard enqueues
 /// go into each target shard's inbox in event order, and the target drain loop delivers its inbox
 /// FIFO, so a subscriber sees a given source's events in order. The HOME shard's own subset is still
-/// delivered LOCALLY + SYNCHRONOUSLY (no self-channel hop). Back-pressure is intact: the enqueue
-/// still `await`s the bounded inbox `send`, so a flood cannot grow an unbounded backlog. A shard whose
-/// drain loop is gone (send error, only at shutdown / a shard panic) simply misses the notification,
-/// exactly as the awaited path already tolerated.
-pub async fn fan_out_publish_notify(
-    inbox: &Inbox,
-    channel: &[u8],
-    payload: &[u8],
-    db: u32,
-    home: usize,
-) {
+/// delivered LOCALLY + SYNCHRONOUSLY (no self-channel hop).
+///
+/// BEST-EFFORT enqueue (`try_send`, NOT `send().await`): a keyspace/pub-sub notification is delivered
+/// on a best-effort basis (Redis keyspace events are explicitly lossy under subscriber pressure), so
+/// when a target inbox is FULL we DROP this event rather than block. Blocking would re-introduce the
+/// very deadlock this function removes from the reply path: if two drain loops each `send().await`
+/// into the other's full inbox, neither is back at its own `recv` to drain it, so neither send ever
+/// gets capacity -- a send-side cross-shard cycle. `try_send` cannot block, so a drain loop always
+/// returns to servicing its inbox; back-pressure is bounded by the inbox depth (a flood is dropped,
+/// never queued unboundedly). A closed inbox (a shard tearing down) is likewise a silent miss, as the
+/// awaited path already tolerated. Because it never awaits, this is a plain synchronous function.
+pub fn fan_out_publish_notify(inbox: &Inbox, channel: &[u8], payload: &[u8], db: u32, home: usize) {
     let n_shards = inbox.len();
     let request = Request {
         args: vec![
@@ -1459,10 +1460,11 @@ pub async fn fan_out_publish_notify(
             bytes::Bytes::copy_from_slice(payload),
         ],
     };
-    // Enqueue to every NON-home shard. The reply oneshot is created (ShardWork requires one) but its
-    // receiver is DROPPED immediately: the count is ignored, so we never await it (the target's
-    // `reply.send` then fails harmlessly into a dropped receiver). The bounded `send().await` keeps
-    // back-pressure; a send error means that shard is tearing down and simply misses this delivery.
+    // Enqueue to every NON-home shard, non-blocking. The reply oneshot is created (ShardWork requires
+    // one) but its receiver is DROPPED immediately: the count is ignored, so the target's `reply.send`
+    // fails harmlessly into a dropped receiver (the drain loop already does `let _ = reply.send(..)`).
+    // A `try_send` Err (Full = best-effort drop, or Closed = shard tearing down) simply misses this
+    // delivery.
     for target in 0..n_shards {
         if target == home {
             continue;
@@ -1473,11 +1475,10 @@ pub async fn fan_out_publish_notify(
             db,
             reply: tx,
         };
-        let _ = inbox[target].send(work).await;
+        let _ = inbox[target].try_send(work);
     }
     // The HOME shard's delivery: LOCAL + SYNCHRONOUS (no self-channel hop), exactly like
-    // `fan_out_publish`. `run_local_publish` returns before any `.await`, so no subscription-table
-    // borrow is held across the enqueue awaits above.
+    // `fan_out_publish`.
     let _ = run_local_publish(&request);
 }
 
@@ -1539,7 +1540,7 @@ pub async fn fan_out_spublish(
 /// single thread-local `is_empty` check. Only an actually-recorded event builds a channel + fans
 /// out. The `__ICPUBLISH` delivery a fan-out enqueues to THIS shard later is handled BEFORE any
 /// store borrow + does NOT go through dispatch, so it records nothing -- no notification loop.
-async fn publish_pending_keyspace_events(inbox: &Inbox, home: usize) {
+fn publish_pending_keyspace_events(inbox: &Inbox, home: usize) {
     let events = ironcache_config::notify::drain();
     if events.is_empty() {
         return;
@@ -1551,11 +1552,11 @@ async fn publish_pending_keyspace_events(inbox: &Inbox, home: usize) {
         // source->target FIFO order while never blocking this drain loop's inbox recv.
         if ev.keyspace {
             let channel = ev.keyspace_channel();
-            fan_out_publish_notify(inbox, &channel, ev.event.as_bytes(), ev.db, home).await;
+            fan_out_publish_notify(inbox, &channel, ev.event.as_bytes(), ev.db, home);
         }
         if ev.keyevent {
             let channel = ev.keyevent_channel();
-            fan_out_publish_notify(inbox, &channel, &ev.key, ev.db, home).await;
+            fan_out_publish_notify(inbox, &channel, &ev.key, ev.db, home);
         }
     }
 }
