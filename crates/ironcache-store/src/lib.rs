@@ -606,10 +606,18 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// The slot count is a MEMORY vs tail-latency tradeoff: more slots bound the per-insert
     /// resize to fewer entries but add a fixed per-touched-DB `Vec` cost. It is fixed for the
     /// store's life (slot routing must be stable), so it is a boot/restart-required knob and
-    /// MUST be set before any insert; the debug assert catches a caller that sets it late.
+    /// MUST be set before any insert.
+    ///
+    /// # Panics
+    ///
+    /// Panics (in ALL build profiles) if the store already holds keys. Changing the slot count
+    /// after a write would re-route existing keys to different slots, making them silently
+    /// unreachable; a hard fail at this cold construction-time seam is strictly safer than that
+    /// silent data loss (a `debug_assert` here would be a release-mode footgun). The builder is
+    /// called immediately after construction, so this never fires on the nominal path.
     #[must_use]
     pub fn with_slots_per_db(mut self, slots: usize) -> Self {
-        debug_assert!(
+        assert!(
             self.is_empty() && self.dbs.iter().all(Vec::is_empty),
             "slot count must be set before any DB is touched (routing must stay stable)"
         );
