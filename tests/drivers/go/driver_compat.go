@@ -211,9 +211,15 @@ func runSingle(port int) {
 	})
 }
 
-func runCluster(addrs []string) {
-	mode := "cluster"
-	pfx := fmt.Sprintf("goc:%d:", time.Now().UnixNano()%1_000_000)
+// runCluster drives the go-redis cluster client against a set of slot-owner endpoints. The SAME body
+// serves TWO legs, picked by `mode`: the turnkey 3-node Raft cluster (mode="cluster") and the #517
+// single-node SHARD-OWNERS projection (mode="shard-owners"), which exposes the node's N internal
+// shards as N slot owners on distinct ports. In both, a cluster-aware client discovers the topology
+// via CLUSTER SLOTS and routes each key to its owner by following MOVED; for shard-owners that owner
+// is the key's home SHARD's port, so the internal cross-shard hop is eliminated (the zero-hop metric
+// is asserted by run.sh + the Rust metrics_endpoint.rs test).
+func runCluster(addrs []string, mode string) {
+	pfx := fmt.Sprintf("go-%s:%d:", mode, time.Now().UnixNano()%1_000_000)
 	rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs})
 	defer rdb.Close()
 
@@ -361,6 +367,7 @@ func main() {
 	clusterCSV := flag.String("cluster", "", "comma list of host:port cluster seeds")
 	aclUser := flag.String("acl-user", "", "restricted (scoped-ACL) username for the #405 leg")
 	aclPass := flag.String("acl-pass", "", "restricted (scoped-ACL) password for the #405 leg")
+	shardOwnersCSV := flag.String("shard-owners", "", "comma list of the N shard-owner host:port endpoints (#517 leg)")
 	flag.Parse()
 
 	fmt.Println("# go-redis v9")
@@ -368,10 +375,13 @@ func main() {
 		runSingle(*singlePort)
 	}
 	if *clusterCSV != "" {
-		runCluster(strings.Split(*clusterCSV, ","))
+		runCluster(strings.Split(*clusterCSV, ","), "cluster")
 		if *aclUser != "" {
 			runRestricted(strings.Split(*clusterCSV, ","), *aclUser, *aclPass)
 		}
+	}
+	if *shardOwnersCSV != "" {
+		runCluster(strings.Split(*shardOwnersCSV, ","), "shard-owners")
 	}
 	if failed > 0 {
 		os.Exit(1)
