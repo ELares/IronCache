@@ -150,7 +150,11 @@ boot_single() {
   # deterministic for the driver tests, while every other op-group is shard-count-agnostic. See
   # DRIVER_MATRIX.md "Findings" for the multi-shard transaction note.
   info "booting single-node ironcache on :$SINGLE_PORT (--shards 1 for deterministic MULTI/EXEC)"
-  "$BIN" server --bind 127.0.0.1 --port "$SINGLE_PORT" --shards 1 \
+  # --metrics-addr off: metrics default to 127.0.0.1:9091, and this harness boots several instances
+  # on ONE host (this single node, then the 3-node cluster), which would collide on that port. The
+  # driver tests do not exercise /metrics, so disable it here (a real multi-instance host configures
+  # a distinct metrics port per instance instead).
+  "$BIN" server --bind 127.0.0.1 --port "$SINGLE_PORT" --shards 1 --metrics-addr off \
       > "$WORK_DIR/single.log" 2>&1 &
   PIDS+=("$!")
   if ! wait_for_ping "$SINGLE_PORT" 25; then
@@ -240,7 +244,9 @@ boot_cluster() {
   info "booting turnkey 3-node cluster on :${CLUSTER_PORTS[0]} :${CLUSTER_PORTS[1]} :${CLUSTER_PORTS[2]}"
   for i in 0 1 2; do
     cfg="$(write_cluster_config "$i")"
-    "$BIN" server --config "$cfg" > "$WORK_DIR/node$i.log" 2>&1 &
+    # --metrics-addr off (CLI overrides the config): three nodes on one host would otherwise collide
+    # on the default 127.0.0.1:9091 metrics port. See the single-node boot above.
+    "$BIN" server --config "$cfg" --metrics-addr off > "$WORK_DIR/node$i.log" 2>&1 &
     PIDS+=("$!")
   done
   # Each node must answer PING first ...
