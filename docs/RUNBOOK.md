@@ -138,10 +138,9 @@ Per-shard latency histogram: `ironcache_shard_command_duration_seconds_bucket{sh
 histogram_quantile(0.99, sum(rate(ironcache_command_duration_seconds_bucket[5m])) by (le))
 ```
 
-Note: there is currently **no** `ironcache_repl_*` Prometheus series. Replication lag is
-observable via `INFO replication` (below); native repl metrics are the in-flight #549
-work, so do not build a dashboard panel on a repl `/metrics` series that does not exist
-yet.
+Note: replication is exported both ways. `/metrics` carries `ironcache_replication_link_up`
+(1 healthy / 0 down) and `ironcache_replication_lag_offset` (lag in logical write offsets),
+added in #549; `INFO replication` (below) carries the same signal in RESP form.
 
 ### `INFO` sections (RESP)
 
@@ -160,9 +159,9 @@ Load-bearing fields per section:
   completes, so `INFO` is only served post-load), `rdb_changes_since_last_save`,
   `rdb_bgsave_in_progress:0`, `rdb_last_save_time`, `aof_enabled:0` (snapshots only, no
   AOF), `persistence_enabled`, `save` (the active policy `"<secs> <changes>"`, empty when
-  off). NOTE: `rdb_last_bgsave_status` is NOT emitted yet (planned in #549); to judge a
-  failed save today, use the `rdb_last_save_time` staleness and the save-on-exit /
-  BGSAVE log lines below.
+  off), `rdb_last_bgsave_status:ok|err` (the explicit last-save outcome, added in #549).
+  A failed save flips it to `err`; corroborate with `rdb_last_save_time` staleness and the
+  save-on-exit / BGSAVE log lines below.
 - `# Stats`: `total_connections_received`, `total_commands_processed`,
   `instantaneous_ops_per_sec` (coarse ops/sec), `rejected_connections` (refused by the
   `maxclients` gate), `expired_keys`, `evicted_keys`, `keyspace_hits`, `keyspace_misses`.
@@ -375,11 +374,21 @@ indexed below with the file that emits them. Message text is verbatim.
 - ERROR `raft control plane: failed to create data directory` / `failed to open storage`
   -- the `data_dir` is not writable; fix permissions / the mount.
 
-### Socket activation (`crates/ironcache-runtime/src/bootstrap.rs`)
+### Socket activation (`crates/ironcache/src/sockact_log.rs`, `crates/ironcache-runtime/src/bootstrap.rs`)
+- INFO `socket-activation: ADOPTED <n> systemd socket-activation listening fd(s) [<name=fd>...];
+  systemd owns the listen queue, so it survives an upgrade restart with no connection-refused
+  window` (#562) -- this boot ADOPTED the fd(s) systemd passed; the upgrade handoff is in effect.
+- INFO `socket-activation: FELL BACK to self-binding its own listener: not socket-activated (no
+  LISTEN_FDS in the environment)` -- the normal, non-socket-activated boot.
+- WARN `socket-activation: FELL BACK to self-binding its own listener: the socket-activation
+  environment was REJECTED and not adopted (<reason>)` -> a `LISTEN_*` env was PRESENT but rejected
+  (a foreign/missing `LISTEN_PID`, a malformed count); the socket-activated upgrade silently
+  degraded to a self-bind. Fix the unit / re-exec so `LISTEN_PID` names this process.
 - The shard-owners listener mode returns `shard-owners mode is incompatible with systemd
   socket activation (LISTEN_FDS): it needs N distinct self-bound ports, but activation
   supplies one inherited socket for one port`. -> Do not combine systemd socket activation
-  with the shard-owners listener mode; let IronCache bind its own ports.
+  with the shard-owners listener mode; let IronCache bind its own ports. See
+  `docs/UPGRADE.md` for the full rolling-upgrade + rollback procedure.
 
 ### Runtime backend fallback (`serve.rs`)
 - WARN `runtime = io_uring requested with TLS on; the io_uring datapath does not support
@@ -533,9 +542,9 @@ Symptom: `SAVE`/`BGSAVE` errors, the exit save logs `save-on-exit failed`, or
 3. The PREVIOUS committed snapshot stays valid on a failed save (fail-closed), so you do not
    lose the last good dump -- but new writes are not yet durable. Free space / fix the mount,
    then `BGSAVE` and confirm `LASTSAVE` advances.
-4. `rdb_last_bgsave_status` (an explicit ok/err field) is NOT emitted yet (#549); until then,
-   the `rdb_last_save_time` staleness plus the `save-on-exit failed` / BGSAVE log lines are
-   the signal.
+4. `rdb_last_bgsave_status:ok|err` (INFO `# Persistence`, #549) is the explicit signal: it
+   flips to `err` on a failed save. Corroborate with `rdb_last_save_time` staleness and the
+   `save-on-exit failed` / BGSAVE log lines.
 
 ---
 
