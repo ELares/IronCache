@@ -680,7 +680,10 @@ pub fn run_server_observed(
         // drives data I/O through the `ClientStream` (plain or TLS), and the shard's background
         // timer task constructs its own zero-sized backend, so this connection path no longer
         // needs the handle directly (the underscore keeps the run_shards closure shape).
-        move |_rt: TokioRuntime, stream: tokio::net::TcpStream, shard: ShardId| {
+        move |_rt: TokioRuntime,
+              stream: tokio::net::TcpStream,
+              shard: ShardId,
+              shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>| {
             let ctx = ctx_template.clone();
             let inbox = inbox.clone();
             // Clone the cheap acceptor handle (Arc inside) per connection; `None` when tls = off,
@@ -697,6 +700,9 @@ pub fn run_server_observed(
                     inbox,
                     tls_acceptor,
                     persist,
+                    // The shared shutdown flag (#543): the subscribe-mode idle wait races it so a
+                    // PARKED subscriber closes promptly on a graceful stop.
+                    shutdown,
                 )
                 .await;
             }
@@ -763,13 +769,25 @@ pub fn run_server_observed(
             let persist = persist_for_uring;
             move |rt: ironcache_runtime::IoUringRuntime,
                   stream: ironcache_runtime::UringTcpStream,
-                  shard: ShardId| {
+                  shard: ShardId,
+                  shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>| {
                 let ctx = ctx_template.clone();
                 let inbox = inbox.clone();
                 let persist = persist.clone();
                 async move {
-                    serve_connection_uring(rt, stream, shard, ctx, default_proto, inbox, persist)
-                        .await;
+                    serve_connection_uring(
+                        rt,
+                        stream,
+                        shard,
+                        ctx,
+                        default_proto,
+                        inbox,
+                        persist,
+                        // The shared shutdown flag (#543): mirror the tokio path so a parked
+                        // io_uring subscriber idle-wait also closes promptly on a graceful stop.
+                        shutdown,
+                    )
+                    .await;
                 }
             }
         };
@@ -1416,7 +1434,7 @@ async fn drain_deferred_hops(
 // (subscription deregistration + WATCH deregistration + counter close). Each is a documented step
 // the connection lifecycle must run in one place; splitting it would scatter the loop's control
 // flow across helpers that all need the same locals.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve_connection(
     tcp: tokio::net::TcpStream,
     home: ShardId,
@@ -1425,6 +1443,14 @@ async fn serve_connection(
     inbox: coordinator::Inbox,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     persist: Option<Arc<crate::persist::PersistState>>,
+    // The per-shard graceful-shutdown flag (#543), the SAME `Arc<AtomicBool>` the acceptor and the
+    // drain loop watch. The subscribe-mode idle wait races a SHORT poll of it so a connection PARKED
+    // in `subscriber_idle_wait` (a pub/sub subscriber blocked on its push channel, or a CLIENT
+    // TRACKING client) observes a graceful stop within one poll interval and CLOSES -- instead of
+    // sitting on the `select!` forever and blocking the shard-thread join until the DRAIN_GRACE
+    // backstop expires. The non-subscriber hot path never reads it (it closes when the acceptor drops
+    // the connection channel on shutdown, exactly as before).
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // TLS HANDSHAKE (or plaintext passthrough), #105. When TLS is enabled the accepted TCP
     // connection is upgraded RIGHT HERE, before any RESP byte is read: a rustls handshake runs
@@ -1953,6 +1979,11 @@ async fn serve_connection(
                 &mut read_buf,
                 &mut out,
                 conn.proto,
+                // #543: race a short poll of the shard shutdown flag so a parked subscriber closes
+                // promptly on a graceful stop. `timer_rt` is the same Runtime timer seam the idle-
+                // timeout arm uses (ADR-0003: no wall-clock on the decision path).
+                &shutdown,
+                &timer_rt,
             )
             .await
             {
@@ -2090,7 +2121,7 @@ async fn serve_connection(
 /// The registered-buffer / multishot fast path (IOURING_DATAPATH.md) and a perf benchmark are
 /// deferred to a Linux soak; no throughput claim is made here.
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve_connection_uring(
     rt: ironcache_runtime::IoUringRuntime,
     mut stream: ironcache_runtime::UringTcpStream,
@@ -2099,6 +2130,10 @@ async fn serve_connection_uring(
     default_proto: ProtoVersion,
     inbox: coordinator::Inbox,
     persist: Option<Arc<crate::persist::PersistState>>,
+    // The per-shard graceful-shutdown flag (#543), mirrored from the tokio serve path: the
+    // subscribe-mode idle wait races a short poll of it so a PARKED io_uring subscriber closes
+    // promptly on a graceful stop instead of blocking the shard-thread join until the drain grace.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use ironcache_runtime::Runtime;
 
@@ -2390,6 +2425,10 @@ async fn serve_connection_uring(
                 &mut read_buf,
                 &mut out,
                 conn.proto,
+                // #543: race a short poll of the shard shutdown flag so a parked subscriber closes
+                // promptly on a graceful stop. `rt` supplies the timer seam (its `timer` is the
+                // canonical tokio time driver under `tokio_uring::start`), ADR-0003-clean.
+                &shutdown,
             )
             .await
             {
@@ -2434,6 +2473,15 @@ async fn serve_connection_uring(
     state_rc.borrow_mut().counters.on_connection_close();
 }
 
+/// How often a subscribe-mode idle wait re-checks the shared shutdown flag (#543). A subscriber
+/// parked on the `select!` of (push recv, shed, socket recv) has no arm a graceful stop wakes, so
+/// it races this SHORT timer (the Runtime timer SEAM, ADR-0003 -- NOT wall-clock) to observe the
+/// flag within one interval and close. Chosen well UNDER the shutdown-latency budget (the shard
+/// join must return in ~2s with active subscribers) yet coarse enough that a fully idle subscriber
+/// wakes only a few times a second -- a negligible cost the steady-state push hot path never pays
+/// (a ready push always wins its own arm before this timer elapses).
+const SUBSCRIBER_SHUTDOWN_POLL: core::time::Duration = core::time::Duration::from_millis(250);
+
 /// The SUBSCRIBE-mode idle wait (SERVER_PUSH.md #20, PR 91a): `select!` between draining the
 /// per-connection push channel, observing the SHED kill-signal, and reading the next command.
 /// Returns `true` when the connection should CLOSE (the push consumer was SHED for back-pressure,
@@ -2456,6 +2504,18 @@ async fn serve_connection_uring(
 /// `push_tx` clone, so `push_rx.recv()` would NOT return `None`. The signal is the disconnect
 /// trigger; `wait()` parks on the signal's `Notify` (SPIN-FREE, no busy poll), so a healthy
 /// subscriber pays nothing for this arm.
+///
+/// The SHUTDOWN arm (#543) races a SHORT periodic poll of the shared per-shard shutdown flag
+/// (`timer_rt.timer(SUBSCRIBER_SHUTDOWN_POLL)`, the SAME Runtime timer seam the idle-timeout arm
+/// uses -- ADR-0003, no wall-clock on the decision path). A non-subscriber closes on shutdown
+/// because the acceptor drops its connection channel, but a subscriber PARKED on this `select!` of
+/// (push recv, shed, socket recv) has NO arm that a graceful stop wakes, so without this it would
+/// sit here until the DRAIN_GRACE backstop expires and block the shard-thread join. The poll fires
+/// ONLY on a fully idle subscriber (a ready push always wins its own arm first, so the steady-state
+/// hot path is unaffected); on each wake it does one relaxed atomic load -- `true` -> close, `false`
+/// -> re-arm the idle wait (the same "return false, re-loop with an unchanged `read_buf`" path a
+/// delivered push already takes), so a false wake costs one cheap loop turn, never a busy spin.
+#[allow(clippy::too_many_arguments)]
 async fn subscriber_idle_wait(
     stream: &mut ironcache_runtime::ClientStream,
     push_rx: &mut tokio::sync::mpsc::Receiver<crate::pubsub::ServerPush>,
@@ -2463,10 +2523,17 @@ async fn subscriber_idle_wait(
     read_buf: &mut Vec<u8>,
     out: &mut Vec<u8>,
     proto: ProtoVersion,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    timer_rt: &TokioRuntime,
 ) -> bool {
     // Fast pre-check: if the publisher already shed this connection between iterations, close
     // now without entering the select! (the table sender is gone; nothing more will arrive).
     if shed.is_tripped() {
+        return true;
+    }
+    // Fast pre-check: if a graceful stop already began between iterations, close now (#543) without
+    // entering the select! -- symmetrical to the shed pre-check above.
+    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
     tokio::select! {
@@ -2492,6 +2559,12 @@ async fn subscriber_idle_wait(
             // The publisher SHED this slow consumer (its push channel overflowed past the
             // bound): close the connection (its subscriptions are cleaned up on the close path).
             true
+        }
+        () = timer_rt.timer(SUBSCRIBER_SHUTDOWN_POLL) => {
+            // #543: a short poll of the shared shutdown flag. On a graceful stop, close (`true`);
+            // otherwise (`false`) re-arm the idle wait -- the outer serve loop re-decodes the
+            // unchanged `read_buf` (Incomplete), flushes the empty `out`, and re-enters here.
+            shutdown.load(std::sync::atomic::Ordering::Relaxed)
         }
         res = stream.recv(Vec::new()) => {
             let Ok(res) = res else { return true; };
@@ -2533,7 +2606,14 @@ async fn subscriber_idle_wait(
 ///
 /// The SHED arm parks on the signal's `Notify` (spin-free); the fast pre-check closes promptly when
 /// the publisher already shed this connection between iterations.
+///
+/// The SHUTDOWN arm (#543) mirrors the tokio [`subscriber_idle_wait`]: it races a SHORT poll of the
+/// shared per-shard shutdown flag ([`SUBSCRIBER_SHUTDOWN_POLL`] via `rt.timer`, whose seam is the
+/// canonical tokio time driver under `tokio_uring::start`), so a subscriber parked on this `select!`
+/// observes a graceful stop within one interval and closes instead of blocking the shard-thread join
+/// until the drain grace. It fires only on a fully idle subscriber; a false wake re-arms the wait.
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[allow(clippy::too_many_arguments)]
 async fn subscriber_idle_wait_uring(
     rt: &ironcache_runtime::IoUringRuntime,
     stream: &mut ironcache_runtime::UringTcpStream,
@@ -2542,12 +2622,17 @@ async fn subscriber_idle_wait_uring(
     read_buf: &mut Vec<u8>,
     out: &mut Vec<u8>,
     proto: ProtoVersion,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> bool {
     use ironcache_runtime::Runtime;
     // Fast pre-check: if the publisher already shed this connection between iterations, close now
     // without entering the select! (the table sender is gone; nothing more will arrive). This is
     // ALSO the close-on-shed for a pure-idle flooded subscriber (FIX2 non-negotiable).
     if shed.is_tripped() {
+        return true;
+    }
+    // Fast pre-check: if a graceful stop already began between iterations, close now (#543).
+    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
     tokio::select! {
@@ -2573,6 +2658,12 @@ async fn subscriber_idle_wait_uring(
             // The publisher SHED this slow consumer (its push channel overflowed past the bound):
             // close the connection (its subscriptions are cleaned up on the close path).
             true
+        }
+        () = rt.timer(SUBSCRIBER_SHUTDOWN_POLL) => {
+            // #543: a short poll of the shared shutdown flag. On a graceful stop, close (`true`);
+            // otherwise (`false`) re-arm the idle wait (the outer serve loop re-decodes the
+            // unchanged `read_buf`, flushes the empty `out`, and re-enters here).
+            shutdown.load(std::sync::atomic::Ordering::Relaxed)
         }
         res = rt.recv(stream, Vec::new()) => {
             let Ok(res) = res else { return true; };
@@ -4321,13 +4412,22 @@ async fn publish_pending_keyspace_events(inbox: &coordinator::Inbox, home: usize
         return;
     }
     for ev in events {
+        // FIRE-AND-FORGET (#543): the delivery COUNT is ignored for a notification, so this enqueues
+        // the fan-out and returns rather than awaiting every shard's reply. This keeps notifications
+        // off the command's synchronous cross-shard path (the drain-loop analog in
+        // `coordinator::publish_pending_keyspace_events` MUST be fire-and-forget to avoid a two-shard
+        // drain-loop deadlock; the home path matches it for a consistent, deadlock-free model). FIFO
+        // to any one subscriber is preserved (per source->target inbox ordering); a self-subscribed
+        // connection still receives the push AFTER its command reply because the push rides the
+        // separate per-connection channel drained only after this batch's reply is flushed.
         if ev.keyspace {
             let channel = ev.keyspace_channel();
-            coordinator::fan_out_publish(inbox, &channel, ev.event.as_bytes(), ev.db, home).await;
+            coordinator::fan_out_publish_notify(inbox, &channel, ev.event.as_bytes(), ev.db, home)
+                .await;
         }
         if ev.keyevent {
             let channel = ev.keyevent_channel();
-            coordinator::fan_out_publish(inbox, &channel, &ev.key, ev.db, home).await;
+            coordinator::fan_out_publish_notify(inbox, &channel, &ev.key, ev.db, home).await;
         }
     }
 }

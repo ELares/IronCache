@@ -1423,6 +1423,64 @@ pub async fn fan_out_publish(
     total
 }
 
+/// FIRE-AND-FORGET fan-out for KEYSPACE NOTIFICATIONS (#543). The notification path IGNORES the
+/// delivery count (a notification's value is the delivery, not a reply), so unlike [`fan_out_publish`]
+/// this ENQUEUES the `__ICPUBLISH` to every non-home shard and RETURNS WITHOUT awaiting the per-shard
+/// reply oneshots.
+///
+/// WHY (the deadlock this removes): notification fan-out is driven from the coordinator DRAIN loop
+/// (a cross-shard keyed write that recorded events) AND the home serve loop. When it AWAITED the
+/// replies, two shards' DRAIN loops could each block inside their own fan-out awaiting the other's
+/// `__ICPUBLISH` reply -- and while a drain loop is parked in its fan-out it is NOT back at its inbox
+/// `recv`, so it cannot service the OTHER shard's `__ICPUBLISH`. That is a cross-shard request/reply
+/// CYCLE: both drain loops wait forever and the mutator's reply (assembled after the inline publish)
+/// never flushes. Enqueue-and-return breaks the cycle: no drain loop ever blocks on a sibling's
+/// reply, so every inbox keeps draining.
+///
+/// ORDERING is preserved where it is observable: the `__ICPUBLISH`s a single source shard enqueues
+/// go into each target shard's inbox in event order, and the target drain loop delivers its inbox
+/// FIFO, so a subscriber sees a given source's events in order. The HOME shard's own subset is still
+/// delivered LOCALLY + SYNCHRONOUSLY (no self-channel hop). Back-pressure is intact: the enqueue
+/// still `await`s the bounded inbox `send`, so a flood cannot grow an unbounded backlog. A shard whose
+/// drain loop is gone (send error, only at shutdown / a shard panic) simply misses the notification,
+/// exactly as the awaited path already tolerated.
+pub async fn fan_out_publish_notify(
+    inbox: &Inbox,
+    channel: &[u8],
+    payload: &[u8],
+    db: u32,
+    home: usize,
+) {
+    let n_shards = inbox.len();
+    let request = Request {
+        args: vec![
+            bytes::Bytes::from_static(ironcache_server::ICPUBLISH),
+            bytes::Bytes::copy_from_slice(channel),
+            bytes::Bytes::copy_from_slice(payload),
+        ],
+    };
+    // Enqueue to every NON-home shard. The reply oneshot is created (ShardWork requires one) but its
+    // receiver is DROPPED immediately: the count is ignored, so we never await it (the target's
+    // `reply.send` then fails harmlessly into a dropped receiver). The bounded `send().await` keeps
+    // back-pressure; a send error means that shard is tearing down and simply misses this delivery.
+    for target in 0..n_shards {
+        if target == home {
+            continue;
+        }
+        let (tx, _rx) = oneshot::channel::<ShardReply>();
+        let work = ShardWork {
+            request: request.clone(),
+            db,
+            reply: tx,
+        };
+        let _ = inbox[target].send(work).await;
+    }
+    // The HOME shard's delivery: LOCAL + SYNCHRONOUS (no self-channel hop), exactly like
+    // `fan_out_publish`. `run_local_publish` returns before any `.await`, so no subscription-table
+    // borrow is held across the enqueue awaits above.
+    let _ = run_local_publish(&request);
+}
+
 /// Fan a SHARDED publish (`SPUBLISH channel payload`) out to every shard's LOCAL shard-channel
 /// table and SUM the per-shard receiver counts (#410), the SPUBLISH analog of [`fan_out_publish`].
 /// Broadcasts the internal `__ICSPUBLISH <channel> <payload>` (whose [`run_remote`] branch calls
@@ -1487,13 +1545,17 @@ async fn publish_pending_keyspace_events(inbox: &Inbox, home: usize) {
         return;
     }
     for ev in events {
+        // FIRE-AND-FORGET (#543): a synchronous, reply-awaiting fan-out FROM the drain loop deadlocks
+        // (two drain loops each block awaiting the other's `__ICPUBLISH` reply). The delivery count is
+        // ignored for notifications, so `fan_out_publish_notify` enqueues + returns, keeping per
+        // source->target FIFO order while never blocking this drain loop's inbox recv.
         if ev.keyspace {
             let channel = ev.keyspace_channel();
-            fan_out_publish(inbox, &channel, ev.event.as_bytes(), ev.db, home).await;
+            fan_out_publish_notify(inbox, &channel, ev.event.as_bytes(), ev.db, home).await;
         }
         if ev.keyevent {
             let channel = ev.keyevent_channel();
-            fan_out_publish(inbox, &channel, &ev.key, ev.db, home).await;
+            fan_out_publish_notify(inbox, &channel, &ev.key, ev.db, home).await;
         }
     }
 }

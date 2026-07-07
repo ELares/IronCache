@@ -241,13 +241,19 @@ fn config_set_get_round_trips_canonical_flag_string() {
 }
 
 #[test]
-// QUARANTINED (#543): this test's notification assertions all pass, but it intermittently HANGS at
-// `server.shutdown_and_join()` when three connections (a mutator + two subscribers) are still open --
-// a shard whose serve loop is parked in the subscriber idle-wait can miss the shutdown flag, so the
-// join blocks. That is a real graceful-shutdown-with-active-subscribers bug (tracked in #543), not a
-// bug in what this test asserts; the sibling pub/sub tests still cover keyspace/keyevent delivery.
-// Ignored so the flaky teardown hang stops blocking every PR's CI until #543 fixes the shutdown path.
-#[ignore = "flaky teardown hang: graceful shutdown vs a parked subscriber connection, tracked in #543"]
+// #543 FIXED (un-quarantined). This test kept THREE connections open at teardown (a mutator + two
+// subscribers) and exercised the cross-shard keyspace-notification fan-out. It used to hang for TWO
+// distinct reasons, both now fixed:
+//   1. TEARDOWN: a shard whose per-connection serve loop was parked in the subscribe-mode idle wait
+//      never observed the shutdown flag, so `shutdown_and_join` blocked on that shard's join. The
+//      idle wait now races a short poll of the shared shutdown flag, so a parked subscriber closes
+//      promptly (bounded shutdown; the dedicated bound is asserted in tests/shutdown.rs).
+//   2. ASSERTIONS: the keyspace-event fan-out from the coordinator DRAIN loop was SYNCHRONOUS -- it
+//      awaited every other shard's ICPUBLISH reply. Two shards' drain loops could each block in their
+//      own fan-out awaiting the other, so neither serviced the other's ICPUBLISH -> a cross-shard
+//      request/reply deadlock that stalled the mutator's reply. Notifications ignore the delivery
+//      count, so the fan-out is now FIRE-AND-FORGET (enqueue, no reply await), which breaks the cycle
+//      while keeping per source->target FIFO order.
 fn keyevent_and_keyspace_for_set_del_expire_lpush() {
     // With KEA enabled: SUBSCRIBE __keyevent@0__:set then SET k v -> ["message", ch, "k"];
     // PSUBSCRIBE __keyspace@0__:* then SET k v -> a pmessage payload "set"; DEL -> "del";

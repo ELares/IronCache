@@ -287,7 +287,7 @@ mod uring_bootstrap {
         drain: D,
     ) -> std::io::Result<ShardSet>
     where
-        S: Fn(IoUringRuntime, TcpStream, ShardId) -> Fut + Clone + Send + 'static,
+        S: Fn(IoUringRuntime, TcpStream, ShardId, Arc<AtomicBool>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = ()> + 'static,
         I: Send + 'static,
         D: Fn(usize, I, Arc<AtomicBool>) -> DFut + Clone + Send + 'static,
@@ -428,7 +428,7 @@ mod uring_bootstrap {
         shard: ShardId,
         shutdown: &Arc<AtomicBool>,
     ) where
-        S: Fn(IoUringRuntime, TcpStream, ShardId) -> Fut + Clone + 'static,
+        S: Fn(IoUringRuntime, TcpStream, ShardId, Arc<AtomicBool>) -> Fut + Clone + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         let live: LiveTasks = Rc::new(Cell::new(0));
@@ -449,7 +449,12 @@ mod uring_bootstrap {
                             // to feed `TcpStream::from_std` transfers sole ownership to the ring.
                             let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw) };
                             let stream = TcpStream::from_std(std_stream);
-                            let fut = serve(IoUringRuntime::new(), stream, shard);
+                            // Hand the per-connection serve closure a clone of the SAME shutdown
+                            // flag the acceptor + drain loop watch (#543), mirroring the tokio
+                            // bootstrap: a parked subscriber idle-wait races it and closes promptly
+                            // on a graceful stop instead of lingering until the drain grace.
+                            let fut =
+                                serve(IoUringRuntime::new(), stream, shard, Arc::clone(shutdown));
                             live.set(live.get() + 1);
                             let guard = LiveGuard(Rc::clone(&live));
                             tokio_uring::spawn(async move {
