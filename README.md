@@ -153,6 +153,9 @@ full contract.
   clients), CLUSTER, OBJECT, SLOWLOG, MEMORY, LATENCY.
 - **DoS guards**: `maxmemory` with eviction, `maxclients`, an idle-connection
   timeout, and a per-connection output-buffer bound.
+- **On-call runbook**: [`docs/RUNBOOK.md`](docs/RUNBOOK.md) indexes every
+  operator-visible error string, log line, and probe state with a symptom-to-action
+  diagnostic sequence.
 
 ### Seamless upgrades
 
@@ -400,6 +403,8 @@ cores per engine), sweeping connections for the peak.
 - [README.md](README.md): this overview.
 - [DEPLOY.md](DEPLOY.md): the production deployment guide (container, Helm, k8s,
   compose) and every config key.
+- [docs/RUNBOOK.md](docs/RUNBOOK.md): the on-call operator runbook (symptom to action
+  for every operator-visible error string, log line, and probe state).
 - [SECURITY.md](SECURITY.md) and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md): the
   security policy and threat model.
 - [CHANGELOG.md](CHANGELOG.md): notable changes.
