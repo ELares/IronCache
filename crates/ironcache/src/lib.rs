@@ -24,6 +24,11 @@ pub mod coordinator;
 /// `/readyz`. Spawned ONLY when `--metrics-addr` is set; default-off boot is byte-identical.
 pub mod metrics_http;
 pub mod multikey;
+/// Boot-time PANIC HOOK for crash ergonomics (#551): a process-wide hook installed once at boot that
+/// logs (via `tracing`) the panic message + location + build version + a "report at <issues URL>"
+/// line before the `panic = "abort"` release build aborts, so even a crashing process leaves
+/// actionable last words. Boot/panic-path, outside the ADR-0003 determinism boundary.
+pub mod panic_hook;
 /// Durable on-disk SNAPSHOT persistence serve wiring (#58): the cross-shard SAVE/BGSAVE fan-out,
 /// the manifest commit, LASTSAVE, load-on-boot, and the periodic save policy. Default-off (only
 /// engaged when a `data_dir` is configured); the engine half lives in `ironcache-persist`.

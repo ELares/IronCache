@@ -39,6 +39,14 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 
+# --- Crash ergonomics (#551). The release build is `panic = "abort"`; the boot-installed panic
+#     hook always logs the panic message + `file:line` location + build version + a report URL, and
+#     with RUST_BACKTRACE set it ALSO logs a backtrace whose frames resolve to function names (the
+#     release profile retains the symbol table, `strip = "debuginfo"`). Ship it on so a crash in
+#     journald is immediately diagnosable; use `full` for unabridged frames. See DEPLOY.md
+#     "Crash troubleshooting".
+Environment=RUST_BACKTRACE=1
+
 # --- File descriptors (#532). Give the server a high open-file ceiling so its
 #     `maxclients` (Redis default 10000) is not silently clamped down to fit a low
 #     inherited `ulimit -n` (the boot-time RLIMIT_NOFILE budget logs LOUDLY when it
