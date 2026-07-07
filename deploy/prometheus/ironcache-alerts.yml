@@ -1,0 +1,159 @@
+# IronCache Prometheus alerting rules (issue #555).
+#
+# Load with `rule_files:` in prometheus.yml and validate with:
+#   promtool check rules deploy/prometheus/ironcache-alerts.yml
+#
+# Every ACTIVE rule references a series IronCache actually emits on /metrics
+# (cross-checked against crates/ironcache-observe/src/lib.rs) or the Prometheus
+# target-health series `up`. The thresholds are STARTING points; tune them to
+# your workload and SLOs. Signals that IronCache exposes only via INFO (not as a
+# native /metrics series) are documented in the commented block at the end, with
+# the redis_exporter series to use if you also scrape INFO.
+#
+# Scrape assumption: the IronCache job is named `ironcache` (adjust the `job=`
+# matchers below if yours differs), and /metrics is scraped from the endpoint
+# configured via --metrics-addr (default 127.0.0.1:9091; deployments override it
+# to 0.0.0.0:9121 behind a network policy).
+
+groups:
+  - name: ironcache.availability
+    rules:
+      - alert: IronCacheNodeDown
+        # `up` is injected by Prometheus per scrape target; 0 means the last
+        # scrape of the /metrics endpoint failed (process down or unreachable).
+        expr: up{job="ironcache"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "IronCache node down ({{ $labels.instance }})"
+          description: "Prometheus cannot scrape {{ $labels.instance }} (up == 0) for over 1m. The process is down or the ops endpoint is unreachable."
+
+  - name: ironcache.latency
+    rules:
+      - alert: IronCacheHighP99Latency
+        # p99 command latency from the histogram. Default trip at 25ms; IronCache
+        # commands are typically sub-millisecond, so 25ms sustained is a real
+        # regression. Tune to your SLO.
+        expr: >-
+          histogram_quantile(
+            0.99,
+            sum by (le, instance, job) (rate(ironcache_command_duration_seconds_bucket[5m]))
+          ) > 0.025
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IronCache p99 command latency high ({{ $labels.instance }})"
+          description: "p99 command latency is {{ $value | humanizeDuration }} (over 25ms) for 10m on {{ $labels.instance }}."
+
+  - name: ironcache.memory
+    rules:
+      - alert: IronCacheHighEvictionRate
+        # Sustained evictions mean the working set exceeds maxmemory. Any nonzero
+        # rate for 10m is worth surfacing; raise the threshold for churn-heavy
+        # caches that evict by design.
+        expr: sum by (instance, job) (rate(ironcache_evicted_keys_total[5m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IronCache evicting keys steadily ({{ $labels.instance }})"
+          description: "Eviction rate is {{ $value | printf \"%.1f\" }} keys/s (over 100/s) for 10m on {{ $labels.instance }}. The working set likely exceeds maxmemory."
+
+      - alert: IronCacheMemoryNearMaxmemory
+        # Used memory approaching the configured maxmemory ceiling. Skips nodes
+        # with maxmemory == 0 (unlimited).
+        expr: >-
+          (ironcache_maxmemory_bytes > 0)
+          and
+          (ironcache_used_memory_bytes / ironcache_maxmemory_bytes > 0.9)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IronCache memory near maxmemory ({{ $labels.instance }})"
+          description: "used_memory is {{ $value | humanizePercentage }} of maxmemory on {{ $labels.instance }}. Evictions are imminent or ongoing."
+
+  - name: ironcache.connections
+    rules:
+      - alert: IronCacheConnectionsNearLimit
+        # maxclients is NOT exported to /metrics (it is an INFO field), so this is
+        # an ABSOLUTE threshold: set it to about 90% of your configured maxclients.
+        # Default 9000 assumes the default maxclients of 10000.
+        expr: sum by (instance, job) (ironcache_connected_clients) > 9000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IronCache connections near the client limit ({{ $labels.instance }})"
+          description: "{{ $value }} connected clients on {{ $labels.instance }} (threshold 9000; set to ~90% of your maxclients). New connections may soon be refused."
+
+  - name: ironcache.replication
+    rules:
+      - alert: IronCacheReplicationLinkDown
+        # 0 means this node's replication link is down (a replica that lost its
+        # master). Masters and standalone nodes report 1, so they never trip this.
+        expr: ironcache_replication_link_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "IronCache replication link down ({{ $labels.instance }})"
+          description: "{{ $labels.instance }} reports its replication link down (a replica disconnected from its master) for over 1m."
+
+      - alert: IronCacheReplicationLagHigh
+        # Replication lag in LOGICAL WRITE OFFSETS (not seconds). 10000 offsets is
+        # a starting point; tune to your write rate and RPO.
+        expr: ironcache_replication_lag_offset > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IronCache replication lag high ({{ $labels.instance }})"
+          description: "Replication lag is {{ $value }} logical write offsets (over 10000) for 5m on {{ $labels.instance }}."
+
+  - name: ironcache.persistence
+    rules:
+      - alert: IronCachePersistenceSaveStale
+        # A save ran (last_save > 0) but is now old AND there are unsaved changes.
+        # Guarding on last_save > 0 avoids a false positive on a fresh node that
+        # has not saved yet; guarding on the dirty counter avoids alerting on an
+        # idle node whose last save is simply old but has nothing new to persist.
+        expr: >-
+          (ironcache_persistence_last_save_unixtime > 0)
+          and
+          (time() - ironcache_persistence_last_save_unixtime > 3600)
+          and
+          (ironcache_persistence_rdb_changes_since_save > 0)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IronCache last save is stale with unsaved changes ({{ $labels.instance }})"
+          description: "The last successful save on {{ $labels.instance }} is over 1h old and there are {{ with query \"ironcache_persistence_rdb_changes_since_save\" }}{{ . | first | value }}{{ end }} unsaved changes. Data written since the last save is at risk on a crash."
+
+# ---------------------------------------------------------------------------
+# INFO-only signals (NOT native /metrics series).
+#
+# rdb_last_bgsave_status (save success/err) and cluster_state (ok/fail) are
+# reported by IronCache via INFO / CLUSTER INFO, but are NOT exposed as native
+# ironcache_* /metrics series today, so no ACTIVE rule above references them (that
+# would reference a series that does not exist). If you ALSO scrape INFO with the
+# Redis exporter (github.com/oliver006/redis_exporter, which parses IronCache's
+# Redis-compatible INFO), enable these rules against its series:
+#
+#   - alert: IronCacheBgsaveFailed
+#     expr: redis_rdb_last_bgsave_status == 0   # exporter maps "err" -> 0, "ok" -> 1
+#     for: 1m
+#     labels: { severity: critical }
+#     annotations:
+#       summary: "IronCache last background save FAILED ({{ $labels.instance }})"
+#
+#   - alert: IronCacheClusterStateNotOk
+#     expr: redis_cluster_state != 1            # exporter maps "ok" -> 1
+#     for: 1m
+#     labels: { severity: critical }
+#     annotations:
+#       summary: "IronCache cluster_state is not ok ({{ $labels.instance }})"
+# ---------------------------------------------------------------------------

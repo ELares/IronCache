@@ -18,13 +18,16 @@
 //! crate, and keeps the dependency tree pure-Rust (ADR-0017). It is NOT a general HTTP server:
 //! anything malformed/oversized is answered with a fixed `400`/`413` and the connection is closed.
 //!
-//! ## Default-off and the hot path
+//! ## Default-on (localhost) and the hot path
 //!
-//! This listener is spawned ONLY when `--metrics-addr` is set (see [`spawn_metrics_server`]). On
-//! the DEFAULT path it never runs, no socket is bound, and the server boot is byte-identical.
-//! The `/metrics` handler READS existing atomics (the per-shard [`MetricsRegistry`] cells, the
-//! jemalloc mallctl, the persistence atomics, the raft status watch); it never touches the
-//! command hot path, takes no shard lock, and adds no per-command cost.
+//! This listener is spawned when a metrics bind is resolved (see [`spawn_metrics_server`]). By
+//! DEFAULT (#555) that is a LOCALHOST bind (`127.0.0.1:9091`), so `/metrics` and the k8s probes are
+//! scrapable out of the box WITHOUT exposing the ops port publicly; `--metrics-addr off` (or
+//! `none` / `disabled` / empty) disables the endpoint and binds no socket (byte-identical to the
+//! prior default-off boot). Whether it runs or not, the `/metrics` handler only READS existing
+//! atomics (the per-shard [`MetricsRegistry`] cells, the jemalloc mallctl, the persistence atomics,
+//! the raft status watch); it never touches the command hot path, takes no shard lock, and adds no
+//! per-command cost.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -549,8 +552,10 @@ fn resolve_metrics_addr(metrics_addr: &str) -> anyhow::Result<SocketAddr> {
 /// background thread then runs the accept loop for the process lifetime; it is detached (the
 /// process exit tears it down), matching the orchestrator-friendly posture.
 ///
-/// Default-off: this is called ONLY when `--metrics-addr` is set, so with no flag no thread is
-/// spawned and no socket is bound (byte-identical boot).
+/// Called whenever a metrics bind is resolved -- by DEFAULT the localhost bind (#555,
+/// `127.0.0.1:9091`), or an explicit `--metrics-addr`. `--metrics-addr off` resolves to NO bind (see
+/// `cli::effective_metrics_addr`), so this is not called, no thread is spawned, and no socket is
+/// bound.
 pub fn spawn_metrics_server(metrics_addr: &str, state: MetricsState) -> anyhow::Result<()> {
     let addr = resolve_metrics_addr(metrics_addr)?;
     // Bind synchronously on a throwaway runtime so a bind failure surfaces HERE (fail-fast),

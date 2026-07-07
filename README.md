@@ -145,10 +145,11 @@ full contract.
 
 ### Operability
 
-- **HTTP health and metrics** (when `--metrics-addr` is set): `/livez` (liveness),
+- **HTTP health and metrics** (on by default at `127.0.0.1:9091`; override with
+  `--metrics-addr`, disable with `--metrics-addr off`): `/livez` (liveness),
   `/readyz` (ready only when every shard has loaded and, in raft mode, a leader is
   known), and `/metrics` (Prometheus exposition: per-shard counters plus process and
-  raft gauges).
+  raft gauges). Every series is cataloged in `docs/METRICS.md`.
 - **Introspection**: INFO, CLIENT, COMMAND (a real command table for cluster-aware
   clients), CLUSTER, OBJECT, SLOWLOG, MEMORY, LATENCY.
 - **DoS guards**: `maxmemory` with eviction, `maxclients`, an idle-connection

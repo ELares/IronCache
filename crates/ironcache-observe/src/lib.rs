@@ -687,9 +687,10 @@ impl OpsPerSecSampler {
 /// shared-nothing ADR-0002), only an immutable `Vec` of `Arc<ShardCountersCell>` fixed at boot.
 /// A shard ADOPTS its pre-allocated cell at its index via [`MetricsRegistry::shard_cell`]
 /// (the registry pre-fills `shards` cells; the shard wraps cell `index` into its
-/// [`ShardCounters`]). The registry is `Some` ONLY when the metrics endpoint is enabled
-/// (`--metrics-addr` set); on the DEFAULT path it is never built and the shard's counters use a
-/// fresh standalone cell (byte-identical to the prior behavior).
+/// [`ShardCounters`]). The registry is `Some` when the metrics endpoint is enabled -- by DEFAULT the
+/// localhost bind (#555), or an explicit `--metrics-addr`; it is `None` only when the endpoint is
+/// DISABLED (`--metrics-addr off`), in which case the shard's counters use a fresh standalone cell
+/// (byte-identical to the prior default-off behavior).
 #[derive(Debug, Clone)]
 pub struct MetricsRegistry {
     /// One backing cell per shard, in shard-index order (`cells[i]` belongs to shard `i`).

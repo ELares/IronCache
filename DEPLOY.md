@@ -46,13 +46,17 @@ values without rewriting the file.
 | `6379` | client RESP listener | `port` / `IRONCACHE_PORT` / `--port` |
 | `16379` | Raft cluster-bus (`RAFTMSG`) | `port + 10000` (raft mode only) |
 | `26379` | replication data plane | `port + 20000` (raft mode only) |
-| operator-chosen (e.g. `9121`) | HTTP `/metrics` + `/livez` + `/readyz` | `--metrics-addr <ip:port>` |
+| `127.0.0.1:9091` (default) | HTTP `/metrics` + `/livez` + `/readyz` | `--metrics-addr <ip:port>` |
 
 The cluster-bus and replication ports are DERIVED from the client port in code
 (`BUS_PORT_OFFSET = 10000`, `REPL_PORT_OFFSET = 20000`); you do not configure them
 separately. They are only used in raft-governance mode. The health/metrics HTTP
-endpoint exists ONLY when `--metrics-addr` is passed (there is no env var for it);
-all deployment artifacts here pass `--metrics-addr 0.0.0.0:9121`.
+endpoint is ON by DEFAULT since #555, bound to `127.0.0.1:9091` so a scrape and the
+k8s probes work out of the box without exposing the port publicly (there is no env
+var or TOML key for it, only the `--metrics-addr` flag). To make it reachable from
+outside the pod/host, override the bind (all deployment artifacts here pass
+`--metrics-addr 0.0.0.0:9121`, behind a NetworkPolicy); to turn it off entirely,
+pass `--metrics-addr off`.
 
 ### The config keys you will actually set (REAL names)
 
@@ -286,7 +290,8 @@ the secret travels in cleartext, so TLS + secret is the recommended pairing.
 
 ## 7. Health, readiness, and metrics
 
-When `--metrics-addr` is set the server serves on that address:
+The endpoint is ON by default at `127.0.0.1:9091` (override with `--metrics-addr
+<ip:port>`, disable with `--metrics-addr off`). It serves:
 
 - `GET /livez` -> `200` once the process is up and serving (liveness). The
   Kubernetes livenessProbe uses this -- it restarts a hung pod.
@@ -297,6 +302,11 @@ When `--metrics-addr` is set the server serves on that address:
   genuinely ready.
 - `GET /metrics` -> Prometheus exposition (per-shard counter rollup + process and
   raft gauges). Scrape it directly, or enable the chart's `metrics.serviceMonitor`.
+
+Full catalog of every `ironcache_*` series and the key `INFO` fields is in
+[`docs/METRICS.md`](docs/METRICS.md); a starter Grafana dashboard and Prometheus
+alert rules ship in [`deploy/grafana/`](deploy/grafana/) and
+[`deploy/prometheus/`](deploy/prometheus/).
 
 When something is wrong at 3am, [`docs/RUNBOOK.md`](docs/RUNBOOK.md) is the
 symptom-to-action index: every operator-visible error string, log line, and probe

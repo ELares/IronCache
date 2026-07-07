@@ -215,14 +215,19 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
         }
     }
 
-    // OUT-OF-BAND METRICS / HEALTH (OBSERVABILITY.md, #152). Enabled ONLY when `--metrics-addr`
-    // is set: build the per-shard counter registry (sized to the shard count, adopted by each
-    // shard at boot) and the liveness / readiness flags, boot the server with the registry
-    // threaded through every shard's context, then spawn the HTTP endpoint. With NO `--metrics-addr`
-    // the registry is `None`, the shards use a standalone counter cell, and NO listener is spawned
-    // (byte-identical boot). The `live`/`ready` flags exist regardless (cheap atomics) but are only
-    // read by the endpoint.
-    let metrics_enabled = cli.metrics_addr.is_some();
+    // OUT-OF-BAND METRICS / HEALTH (OBSERVABILITY.md, #152; DEFAULT-ON #555). Resolve the effective
+    // ops-endpoint bind (the tunability principle): with NO `--metrics-addr` this is the LOCALHOST
+    // default (`127.0.0.1:9091`), so `/metrics` + the k8s probes are scrapable out of the box without
+    // exposing the port publicly; an explicit `host:port` overrides it, and `--metrics-addr off`
+    // disables the endpoint entirely (`metrics_addr` is then `None`). When enabled we build the
+    // per-shard counter registry (sized to the shard count, adopted by each shard at boot) and the
+    // liveness / readiness flags, boot the server with the registry threaded through every shard's
+    // context, then spawn the HTTP endpoint. When DISABLED the registry is `None`, the shards use a
+    // standalone counter cell, and NO listener is spawned (byte-identical to the prior default-off
+    // boot). The `live`/`ready` flags exist regardless (cheap atomics) but are only read by the
+    // endpoint.
+    let metrics_addr = cli::effective_metrics_addr(cli.metrics_addr.as_deref());
+    let metrics_enabled = metrics_addr.is_some();
     let registry = metrics_enabled.then(|| MetricsRegistry::new(cfg.shards));
     let live = Arc::new(AtomicBool::new(false));
     // Readiness gates on ACTUAL per-shard load-on-boot completion (OBSERVABILITY.md, #152): sized to
@@ -239,10 +244,10 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     // the runtime-config maxmemory). Spawn it AFTER the shards are up so a `/metrics` scrape sees a
     // live server. A bind failure here is a hard boot error (a misconfigured `--metrics-addr`
     // should fail fast, like the RESP listener), so propagate it before we mark the node live.
-    // `registry` and `ready` are both `Some` exactly when `--metrics-addr` is set (built together
+    // `registry` and `ready` are both `Some` exactly when the endpoint is enabled (built together
     // under `metrics_enabled`); the metrics state SHARES the SAME `ready` the shards signal into.
     if let (Some(metrics_addr), Some(registry), Some(ready)) =
-        (cli.metrics_addr.as_ref(), registry, ready.as_ref())
+        (metrics_addr, registry, ready.as_ref())
     {
         let runtime = std::sync::Arc::clone(&handles.runtime);
         let state = MetricsState::new(
