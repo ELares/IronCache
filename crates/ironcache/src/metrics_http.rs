@@ -89,6 +89,12 @@ pub struct MetricsState {
     /// The structured-topology read state (#365): membership/slots/epoch + node identity, served as
     /// JSON at `/topology` (coherent single-node answer in standalone mode). Read-only.
     topology: crate::topology::TopologyHandle,
+    /// The cross-shard coordinator inbox senders (#556), for the `ironcache_shard_inbox_depth`
+    /// back-pressure gauge. At scrape the handler SAMPLES each shard's inbox length
+    /// ([`crate::coordinator::inbox_depths`]) -- a cheap, lock-free read that costs the hop hot path
+    /// nothing (no per-enqueue/dequeue atomic). `None` only in the degenerate unit-test state with no
+    /// coordinator wired, in which case the gauge renders an all-zero slice sized to the shard count.
+    inbox: Option<crate::coordinator::Inbox>,
 }
 
 /// The boot-anchored clock for uptime. One [`SystemEnv`] whose monotonic `origin` is captured at
@@ -200,6 +206,7 @@ impl MetricsState {
         raft: Option<ironcache_server::RaftHandle>,
         persist: Option<Arc<crate::persist::PersistState>>,
         topology: crate::topology::TopologyHandle,
+        inbox: Option<crate::coordinator::Inbox>,
     ) -> Self {
         MetricsState {
             registry,
@@ -211,6 +218,7 @@ impl MetricsState {
             raft,
             persist,
             topology,
+            inbox,
         }
     }
 
@@ -327,6 +335,16 @@ impl MetricsState {
                 body.push_str(&ironcache_observe::render_latency_histogram_shards(
                     &self.registry.per_shard_latency(),
                 ));
+                // COORDINATOR inbox-depth gauge (#556): SAMPLE each shard's cross-shard inbox length
+                // at scrape (a cheap, lock-free read that costs the hop hot path nothing), then render
+                // the node-wide + per-shard `ironcache_(shard_)inbox_depth` back-pressure series. With
+                // no coordinator inbox wired (the degenerate unit-test state) render an all-zero slice
+                // sized to the shard count, so the series always appears.
+                let inbox_depths = self.inbox.as_ref().map_or_else(
+                    || vec![0u64; self.shards as usize],
+                    crate::coordinator::inbox_depths,
+                );
+                body.push_str(&ironcache_observe::render_inbox_depth(&inbox_depths));
                 http_response(
                     200,
                     "OK",
@@ -595,6 +613,7 @@ mod tests {
             None,
             None,
             crate::topology::TopologyHandle::standalone("test-node-id", 6379, 2),
+            None,
         );
         (state, registry, live, ready)
     }
@@ -706,6 +725,7 @@ mod tests {
             None,
             None,
             topo,
+            None,
         );
         let text = String::from_utf8(state.respond("GET", "/metrics")).unwrap();
         assert!(text.contains("ironcache_replication_link_up 1\n"), "{text}");

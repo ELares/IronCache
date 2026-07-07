@@ -321,6 +321,24 @@ pub struct ShardCountersCell {
     /// the `/metrics` keyspace gauge is eventually-consistent (bounded by the expiry cycle) at
     /// ZERO per-command cost. The metrics task sums it across shards for the node-wide keyspace.
     keyspace_keys: AtomicU64,
+    /// COORDINATOR HOP counters (#556) -- the #517 zero-hop MEASUREMENT harness. Same shared-nothing
+    /// `Relaxed`-atomic pattern as the counters above (one writer per counter, uncontended on this
+    /// shard's own cache line), so each is the SAME single increment a plain `u64 += 1` compiled to.
+    ///
+    /// * `hops_sent`: cross-shard requests THIS shard DISPATCHED to a peer's inbox (the hop it PAID),
+    ///   bumped on the coordinator's single-target keyed hop branch in `route_and_dispatch`.
+    /// * `hops_served`: cross-shard requests THIS shard RECEIVED + served for a peer, bumped by the
+    ///   drain loop when it runs a peer's remote keyed / whole-keyspace unit (`run_remote`).
+    /// * `local_served`: keyed requests served LOCALLY (owner == home shard, NO hop), the complement
+    ///   of `hops_sent` -- so hop-rate = `hops_sent / (hops_sent + local_served)` is derivable.
+    ///
+    /// In shard-owners mode (#517) a cluster-aware client dialing owner ports drives `hops_sent` to
+    /// ~0 (every key homes on its owner), which is now a metric an operator/test can ASSERT instead
+    /// of a claim. The inbox-DEPTH gauge is deliberately NOT stored here: it is sampled from the mpsc
+    /// channel length at scrape time (see `render_inbox_depth`), so it costs the hop path nothing.
+    hops_sent: AtomicU64,
+    hops_served: AtomicU64,
+    local_served: AtomicU64,
     /// This shard's command-latency HISTOGRAM (#546): a fixed atomic bucket array + micros sum +
     /// observation count, recorded per command by the serve loop (reusing the SLOWLOG/COMMANDSTATS
     /// elapsed micros, no new clock read) and summed across shards by the metrics task for the
@@ -346,6 +364,9 @@ impl ShardCountersCell {
             keyspace_hits: self.keyspace_hits.load(Ordering::Relaxed),
             keyspace_misses: self.keyspace_misses.load(Ordering::Relaxed),
             keyspace_keys: self.keyspace_keys.load(Ordering::Relaxed),
+            hops_sent: self.hops_sent.load(Ordering::Relaxed),
+            hops_served: self.hops_served.load(Ordering::Relaxed),
+            local_served: self.local_served.load(Ordering::Relaxed),
         }
     }
 
@@ -385,6 +406,13 @@ impl ShardCountersCell {
         self.keyspace_misses.store(0, Ordering::Relaxed);
         self.commands_processed.store(0, Ordering::Relaxed);
         self.connections_received.store(0, Ordering::Relaxed);
+        // The coordinator HOP counters (#556) are `_total` since-start stats like
+        // `commands_processed`, so `CONFIG RESETSTAT` clears them too (an operator resetting stats
+        // expects the hop-rate window to restart with them). The inbox-depth GAUGE is not a stat
+        // and is sampled live, so there is nothing to reset for it.
+        self.hops_sent.store(0, Ordering::Relaxed);
+        self.hops_served.store(0, Ordering::Relaxed);
+        self.local_served.store(0, Ordering::Relaxed);
     }
 }
 
@@ -459,6 +487,30 @@ impl ShardCounters {
     /// elapsed the SLOWLOG/COMMANDSTATS hooks measured -- no new clock read on the hot path.
     pub fn observe_latency(&self, elapsed_us: u64) {
         self.cell.observe_latency(elapsed_us);
+    }
+
+    /// Record that THIS shard DISPATCHED one single-target cross-shard keyed hop to a peer (#556):
+    /// the hop it PAID (the #517 zero-hop harness's numerator). Bumped once on the coordinator's
+    /// single-owner remote branch in `route_and_dispatch`. Takes `&self` (the cell records through a
+    /// `Relaxed` atomic, like [`Self::observe_latency`]) so the serve loop needs no `&mut` borrow;
+    /// ONE uncontended increment, no alloc, no clock -- the additive hot-path budget #556 allows.
+    pub fn on_hop_sent(&self) {
+        self.cell.hops_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that THIS shard SERVED one peer's cross-shard request off its inbox (#556): the drain
+    /// loop ran a remote keyed / whole-keyspace unit for another shard. ONE `Relaxed` increment,
+    /// reusing the drain loop's existing per-unit borrow.
+    pub fn on_hop_served(&self) {
+        self.cell.hops_served.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that THIS shard served one keyed request LOCALLY (#556): the request's owner IS the
+    /// home shard, so it took the ZERO-hop fast path. The complement of [`Self::on_hop_sent`], so an
+    /// operator/test derives hop-rate = `hops_sent / (hops_sent + local_served)`. ONE `Relaxed`
+    /// increment on the existing home-serve branch.
+    pub fn on_local_served(&self) {
+        self.cell.local_served.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record `n` keys evicted to honor the memory ceiling (PR-3a; INFO
@@ -848,6 +900,24 @@ pub fn render_prometheus(counters: CounterSnapshot, gauges: MetricsGauges) -> St
         "Read commands that found no live key.",
         counters.keyspace_misses,
     );
+    // COORDINATOR HOP counters (#556, the #517 zero-hop measurement harness): how much cross-shard
+    // hopping the node is doing, and the no-hop path it takes. hop-rate = hops_sent / (hops_sent +
+    // local_served); in shard-owners mode with an owner-dialing client `hops_sent` trends to ~0.
+    counter(
+        "ironcache_hops_sent_total",
+        "Cross-shard requests dispatched to a peer shard (the hop paid).",
+        counters.hops_sent,
+    );
+    counter(
+        "ironcache_hops_served_total",
+        "Cross-shard requests received and served for a peer shard.",
+        counters.hops_served,
+    );
+    counter(
+        "ironcache_local_served_total",
+        "Keyed requests served locally (owner is the home shard, no hop).",
+        counters.local_served,
+    );
 
     // A gauge family: HELP + TYPE gauge + one sample.
     let mut gauge = |name: &str, help: &str, value: u64| {
@@ -1019,6 +1089,32 @@ pub fn render_prometheus_shards(per_shard: &[CounterSnapshot]) -> String {
         per_shard,
         |s| s.keyspace_misses,
     );
+    // COORDINATOR HOP counters, per shard (#556): the shard-level view of the hop / no-hop split the
+    // #517 zero-hop harness reads (node-wide equivalents live in `render_prometheus`).
+    shard_family(
+        &mut o,
+        "ironcache_shard_hops_sent_total",
+        "Cross-shard requests dispatched to a peer shard (the hop paid), per shard.",
+        "counter",
+        per_shard,
+        |s| s.hops_sent,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_hops_served_total",
+        "Cross-shard requests received and served for a peer shard, per shard.",
+        "counter",
+        per_shard,
+        |s| s.hops_served,
+    );
+    shard_family(
+        &mut o,
+        "ironcache_shard_local_served_total",
+        "Keyed requests served locally (owner is the home shard, no hop), per shard.",
+        "counter",
+        per_shard,
+        |s| s.local_served,
+    );
     shard_family(
         &mut o,
         "ironcache_shard_connected_clients",
@@ -1035,6 +1131,39 @@ pub fn render_prometheus_shards(per_shard: &[CounterSnapshot]) -> String {
         per_shard,
         |s| s.keyspace_keys,
     );
+    o
+}
+
+/// Render the cross-shard INBOX-DEPTH gauge (#556): the node-wide `ironcache_inbox_depth` (the sum
+/// of every shard's queued cross-shard work) plus the per-shard `ironcache_shard_inbox_depth{shard}`
+/// occupancy, so an operator sees back-pressure BUILDING before the 1024-bounded inbox stalls a home
+/// core. `depths[i]` is shard `i`'s current inbox occupancy.
+///
+/// Unlike the hop COUNTERS (which live in the [`MetricsRegistry`] cells), the depth is SAMPLED from
+/// the mpsc channel length at scrape time (the caller reads `max_capacity - capacity` per shard, see
+/// `coordinator::inbox_depths`), NOT tracked with a per-enqueue/dequeue atomic -- so this gauge costs
+/// the cross-shard hop path NOTHING (no new atomic, no cross-core write on the send/drain branch).
+/// The metrics endpoint passes an all-zero slice sized to the shard count when no coordinator inbox
+/// is wired (a degenerate unit-test state), so the series always appears.
+#[must_use]
+pub fn render_inbox_depth(depths: &[u64]) -> String {
+    use core::fmt::Write as _;
+    let mut o = String::with_capacity(depths.len() * 48 + 128);
+    let node: u64 = depths.iter().copied().sum();
+    let _ = write!(
+        o,
+        "# HELP ironcache_inbox_depth Cross-shard inbox occupancy (queued cross-shard work items) across all shards.\n\
+         # TYPE ironcache_inbox_depth gauge\n\
+         ironcache_inbox_depth {node}\n"
+    );
+    let _ = write!(
+        o,
+        "# HELP ironcache_shard_inbox_depth Cross-shard inbox occupancy (queued cross-shard work items), per shard.\n\
+         # TYPE ironcache_shard_inbox_depth gauge\n"
+    );
+    for (i, d) in depths.iter().enumerate() {
+        let _ = writeln!(o, "ironcache_shard_inbox_depth{{shard=\"{i}\"}} {d}");
+    }
     o
 }
 
@@ -1158,6 +1287,13 @@ pub struct CounterSnapshot {
     /// the node-wide key count for the `/metrics` keyspace gauge. Published off the command hot
     /// path (the periodic expiry tick), so it is eventually-consistent.
     pub keyspace_keys: u64,
+    /// Cross-shard requests this shard DISPATCHED to a peer (the hop it paid), #556.
+    pub hops_sent: u64,
+    /// Cross-shard requests this shard RECEIVED + served for a peer (its drain loop), #556.
+    pub hops_served: u64,
+    /// Keyed requests this shard served LOCALLY (owner == home, no hop), #556 -- the complement of
+    /// `hops_sent`, so hop-rate = `hops_sent / (hops_sent + local_served)`.
+    pub local_served: u64,
 }
 
 impl CounterSnapshot {
@@ -1173,6 +1309,9 @@ impl CounterSnapshot {
             keyspace_hits: self.keyspace_hits + other.keyspace_hits,
             keyspace_misses: self.keyspace_misses + other.keyspace_misses,
             keyspace_keys: self.keyspace_keys + other.keyspace_keys,
+            hops_sent: self.hops_sent + other.hops_sent,
+            hops_served: self.hops_served + other.hops_served,
+            local_served: self.local_served + other.local_served,
         }
     }
 }
@@ -2202,6 +2341,22 @@ mod tests {
         ReplicationInfo::standalone()
     }
 
+    /// A minimal standalone [`MetricsGauges`] for the `/metrics` render tests (no raft, no repl lag).
+    fn gauges() -> MetricsGauges {
+        MetricsGauges {
+            uptime_secs: 1,
+            shards: 2,
+            used_memory: 0,
+            used_memory_rss: 0,
+            maxmemory: 0,
+            last_save_unix: 0,
+            rdb_changes_since_save: 0,
+            repl_link_up: true,
+            repl_lag_offset: 0,
+            raft: None,
+        }
+    }
+
     #[test]
     fn info_has_standard_sections_and_fields() {
         let env = TestEnv::new(1);
@@ -2730,6 +2885,109 @@ mod tests {
         assert_eq!(rolled.connections_received, 3);
         assert_eq!(rolled.commands_processed, 2);
         assert_eq!(rolled.connected_clients, 2); // a:1 + b:(2-1)
+    }
+
+    /// #556: the coordinator hop counters record per shard and SUM in the node rollup, and a
+    /// `CONFIG RESETSTAT` (`apply(reset_stats)`) zeroes them like the other `_total` stats.
+    #[test]
+    fn hop_counters_record_merge_and_reset() {
+        let mut a = ShardCounters::new();
+        // Shard a: paid 3 hops, served 1 for a peer, served 4 keyed requests locally.
+        for _ in 0..3 {
+            a.on_hop_sent();
+        }
+        a.on_hop_served();
+        for _ in 0..4 {
+            a.on_local_served();
+        }
+        let b = ShardCounters::new();
+        // Shard b: served 2 peer hops, 5 locally, sent none.
+        for _ in 0..2 {
+            b.on_hop_served();
+        }
+        for _ in 0..5 {
+            b.on_local_served();
+        }
+        let rolled = a.snapshot().merge(b.snapshot());
+        assert_eq!(rolled.hops_sent, 3, "3 + 0");
+        assert_eq!(rolled.hops_served, 3, "1 + 2");
+        assert_eq!(rolled.local_served, 9, "4 + 5");
+        // hop-rate = hops_sent / (hops_sent + local_served) = 3 / 12 = 0.25, checked as integers
+        // (denominator 12, four times the numerator) to avoid a float compare.
+        assert_eq!(rolled.hops_sent + rolled.local_served, 12);
+        assert_eq!(rolled.hops_sent + rolled.local_served, rolled.hops_sent * 4);
+        // RESETSTAT zeroes the hop `_total`s (they are since-start stats like commands_processed).
+        a.apply(CounterDeltas {
+            reset_stats: true,
+            ..CounterDeltas::default()
+        });
+        let after = a.snapshot();
+        assert_eq!(after.hops_sent, 0);
+        assert_eq!(after.hops_served, 0);
+        assert_eq!(after.local_served, 0);
+    }
+
+    /// #556: the hop counters render in BOTH the node rollup (`ironcache_*`) and the per-shard
+    /// (`ironcache_shard_*{shard}`) families, mirroring the other counter families.
+    #[test]
+    fn prometheus_render_emits_hop_counter_families() {
+        let counters = CounterSnapshot {
+            hops_sent: 7,
+            hops_served: 4,
+            local_served: 21,
+            ..CounterSnapshot::default()
+        };
+        let node = render_prometheus(counters, gauges());
+        assert!(
+            node.contains(
+                "# TYPE ironcache_hops_sent_total counter\nironcache_hops_sent_total 7\n"
+            ),
+            "{node}"
+        );
+        assert!(node.contains("ironcache_hops_served_total 4\n"), "{node}");
+        assert!(node.contains("ironcache_local_served_total 21\n"), "{node}");
+
+        let s0 = CounterSnapshot {
+            hops_sent: 7,
+            local_served: 1,
+            ..CounterSnapshot::default()
+        };
+        let s1 = CounterSnapshot {
+            hops_served: 4,
+            local_served: 20,
+            ..CounterSnapshot::default()
+        };
+        let per = render_prometheus_shards(&[s0, s1]);
+        assert!(
+            per.contains("ironcache_shard_hops_sent_total{shard=\"0\"} 7\n"),
+            "{per}"
+        );
+        assert!(
+            per.contains("ironcache_shard_hops_served_total{shard=\"1\"} 4\n"),
+            "{per}"
+        );
+        assert!(
+            per.contains("ironcache_shard_local_served_total{shard=\"1\"} 20\n"),
+            "{per}"
+        );
+    }
+
+    /// #556: the inbox-depth gauge renders a node-wide sum plus a per-shard sample.
+    #[test]
+    fn inbox_depth_renders_node_and_per_shard() {
+        let body = render_inbox_depth(&[2, 0, 5]);
+        assert!(
+            body.contains("# TYPE ironcache_inbox_depth gauge\nironcache_inbox_depth 7\n"),
+            "node-wide sum 2+0+5: {body}"
+        );
+        assert!(
+            body.contains("ironcache_shard_inbox_depth{shard=\"0\"} 2\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("ironcache_shard_inbox_depth{shard=\"2\"} 5\n"),
+            "{body}"
+        );
     }
 
     /// The registry pre-allocates one cell per shard, a shard adopts its cell by index, and

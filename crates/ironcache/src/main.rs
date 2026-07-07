@@ -254,6 +254,8 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
             handles.raft.clone(),
             handles.persist.clone(),
             handles.topology.clone(),
+            // The coordinator inbox, so `/metrics` samples the per-shard inbox-depth gauge (#556).
+            Some(handles.inbox.clone()),
         );
         metrics_http::spawn_metrics_server(metrics_addr, state)
             .context("starting the metrics endpoint")?;

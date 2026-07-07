@@ -191,6 +191,11 @@ pub struct BootHandles {
     /// The structured-topology read state (#365): node identity + the (optional) cluster slot map,
     /// for the `/topology` admin endpoint. Coherent in standalone mode (no cluster map).
     pub topology: crate::topology::TopologyHandle,
+    /// The cross-shard coordinator inbox senders (#556): the `/metrics` endpoint SAMPLES each
+    /// shard's inbox length (via [`coordinator::inbox_depths`]) for the `ironcache_shard_inbox_depth`
+    /// back-pressure gauge. Always present (an inbox is built for every boot); the metrics task only
+    /// READS its depth, never sends. A cheap `Arc<[Sender]>` clone.
+    pub inbox: coordinator::Inbox,
 }
 
 /// Boot the server like [`run_server`], but thread an optional [`MetricsRegistry`] through every
@@ -619,6 +624,11 @@ pub fn run_server_observed(
     // byte-identical to before this layer (verified by the coordinator_stage1 parity test).
     let total = config.shards.max(1);
     let (inbox, rxs) = coordinator::build_inboxes(total);
+    // A clone of the inbox senders returned in `BootHandles` so the `/metrics` endpoint can SAMPLE
+    // each shard's inbox occupancy for the `ironcache_shard_inbox_depth` gauge (#556). Taken here,
+    // before `inbox` is cloned into the serve / drain / io_uring closures below, so it is always
+    // available regardless of those moves. A cheap `Arc<[Sender]>` bump.
+    let inbox_for_handles = inbox.clone();
 
     // Clone the (immutable-after-boot) context for the drain closure BEFORE the serve
     // closure moves `ctx_template` in. Each shard's drain loop gets this clone so it has
@@ -842,6 +852,7 @@ pub fn run_server_observed(
         persist: persist_handle,
         runtime: runtime_handle,
         topology,
+        inbox: inbox_for_handles,
     })
 }
 
@@ -4278,6 +4289,13 @@ async fn route_and_dispatch(
         // keyspace events into the OWNER shard's pending buffer; that shard's drain loop drains +
         // publishes them (see `run_remote`). The home path here records nothing for a remote write.
         state_rc.borrow_mut().counters.on_command();
+        // COORDINATOR HOP OBSERVABILITY (#556, the #517 zero-hop measurement harness): THIS shard is
+        // about to DISPATCH a single-target cross-shard keyed hop to `target` -- the hop it PAYS.
+        // Count it here (covering BOTH the deferred #8-overlap enqueue and the fused `dispatch_via`),
+        // ONE relaxed atomic on this already-taken remote branch. hop-rate = hops_sent / (hops_sent +
+        // local_served); in shard-owners mode a client dialing owner ports never reaches this branch,
+        // so `hops_sent` trends to ~0 -- the #517 property, now MEASURABLE instead of merely claimed.
+        state_rc.borrow().counters.on_hop_sent();
         if defer_hops {
             // #8 OVERLAP: enqueue the hop and hand the receiver back WITHOUT awaiting, so the caller
             // can issue the next command's hop before this owner replies. `out` is left UNTOUCHED
@@ -4297,6 +4315,18 @@ async fn route_and_dispatch(
     } else {
         // HOME path: the SYNC fast path (zero await/channel). Covers the home-owned keyed
         // commands, AlwaysHome, and the key-SPANNING multi-key commands (Stage 2 gap).
+        // COORDINATOR HOP OBSERVABILITY (#556, the #517 zero-hop measurement harness): a KEYED
+        // request whose owner IS the home shard is served here with NO hop -- the ZERO-hop path, the
+        // complement of `hops_sent` (so hop-rate = hops_sent / (hops_sent + local_served)). Count it
+        // ONLY for the keyed classes (AlwaysHome control/conn commands are not keyed requests and
+        // must not dilute the ratio); a co-located KeyedMulti reaches here too (the shard-spanning
+        // forms took their fan-out branches above). ONE relaxed atomic on this existing home branch.
+        if matches!(
+            route,
+            route::CommandClass::KeyedSingle | route::CommandClass::KeyedMulti
+        ) {
+            state_rc.borrow().counters.on_local_served();
+        }
         // Pass the ALREADY-uppercased command (FIX 5): we computed `cmd_upper` above for
         // routing, so the home dispatch reuses it instead of re-uppercasing + re-allocating.
         //

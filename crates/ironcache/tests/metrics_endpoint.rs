@@ -8,7 +8,10 @@
 //! Prometheus render -> HTTP response. They also assert the DEFAULT (no metrics) boot starts NO
 //! HTTP listener.
 
-use ironcache::test_support::{run_server_for_test, run_server_with_metrics_for_test};
+use ironcache::test_support::{
+    run_server_for_test, run_server_with_metrics_for_test,
+    run_shard_owners_node_with_metrics_for_test,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -41,6 +44,42 @@ async fn ping(client: &mut TcpStream) {
     let mut buf = [0u8; 7];
     client.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"+PONG\r\n");
+}
+
+/// A RESP2 array command frame (each arg a bulk string), for the #556 hop-counter tests.
+fn cmd(args: &[&str]) -> String {
+    use std::fmt::Write as _;
+    let mut f = format!("*{}\r\n", args.len());
+    for a in args {
+        write!(f, "${}\r\n{}\r\n", a.len(), a).unwrap();
+    }
+    f
+}
+
+/// Write `frame` and read one reply's bytes (the small replies here fit one packet).
+async fn send_read(c: &mut TcpStream, frame: &str) -> Vec<u8> {
+    c.write_all(frame.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 4096];
+    let n = c.read(&mut buf).await.unwrap();
+    buf[..n].to_vec()
+}
+
+/// Parse the NODE-WIDE value of a Prometheus counter/gauge `name` (the unlabeled `name <value>`
+/// line) from a `/metrics` body. Panics if the line is absent (a clearer failure than a silent 0).
+fn metric(body: &str, name: &str) -> u64 {
+    let needle = format!("{name} ");
+    body.lines()
+        .find(|l| l.starts_with(&needle))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("metric `{name}` not found in body:\n{body}"))
+}
+
+/// The contiguous partition the shard-owners router + projection share: slot -> owning shard (the
+/// SAME mapping `shard_owners_mode.rs` uses to dial a key's owner port).
+fn owner_shard(key: &str, n: usize) -> usize {
+    let slot = ironcache_protocol::key_slot(key.as_bytes()) as usize;
+    (slot * n) / 16384
 }
 
 /// Perform one HTTP/1.1 `GET path` against the metrics endpoint and return `(status_code, body)`.
@@ -135,6 +174,123 @@ async fn metrics_endpoint_serves_prometheus_and_reflects_commands() {
         .expect("histogram +Inf bucket present");
     let inf: u64 = inf_line.rsplit(' ').next().unwrap().parse().unwrap();
     assert_eq!(inf, hcount, "+Inf bucket must equal _count; body: {body}");
+
+    set.shutdown_and_join().unwrap();
+}
+
+/// #556 (the #517 zero-hop harness): on a MULTI-SHARD node, keyed commands whose owner is not the
+/// connection's home shard take an internal cross-shard HOP, while keys the home shard owns are
+/// served locally. Driving a spread of keys must move BOTH `hops_sent` (+ `hops_served` on the owner
+/// shards) AND `local_served`, and expose the per-shard + inbox-depth series.
+#[tokio::test]
+async fn coordinator_hop_counters_increment_on_cross_shard_traffic() {
+    const N_SHARDS: usize = 4;
+    let resp_port = free_port();
+    let metrics_port = free_port();
+    let set = run_server_with_metrics_for_test(resp_port, N_SHARDS, metrics_port);
+
+    // One connection homes on ONE shard (SO_REUSEPORT). A spread of 256 distinct keys divides ~evenly
+    // across the 4 owner shards, so whatever shard this homed on, some keys are LOCAL (no hop) and
+    // most HOP to a peer -- both the hop and the no-hop path fire regardless of the home shard.
+    let mut c = connect_retry(resp_port).await;
+    for i in 0..256u32 {
+        let key = format!("hopkey:{i}");
+        let _ = send_read(&mut c, &cmd(&["SET", &key, "v"])).await;
+        let _ = send_read(&mut c, &cmd(&["GET", &key])).await;
+    }
+    drop(c);
+
+    let (code, body) = http_get(metrics_port, "/metrics").await;
+    assert_eq!(code, 200, "body: {body}");
+    // The four #556 series are present with the right TYPE headers.
+    assert!(
+        body.contains("# TYPE ironcache_hops_sent_total counter"),
+        "{body}"
+    );
+    assert!(
+        body.contains("# TYPE ironcache_hops_served_total counter"),
+        "{body}"
+    );
+    assert!(
+        body.contains("# TYPE ironcache_local_served_total counter"),
+        "{body}"
+    );
+    assert!(
+        body.contains("# TYPE ironcache_inbox_depth gauge"),
+        "{body}"
+    );
+    // Cross-shard hops happened (dispatched on home shards, served on owner shards) AND the no-hop
+    // local path was taken -- so hop-rate = hops_sent / (hops_sent + local_served) is meaningful.
+    let hops_sent_val = metric(&body, "ironcache_hops_sent_total");
+    let hops_served_val = metric(&body, "ironcache_hops_served_total");
+    let local_served_val = metric(&body, "ironcache_local_served_total");
+    assert!(
+        hops_sent_val >= 1,
+        "expected cross-shard hops_sent, got {hops_sent_val}"
+    );
+    assert!(
+        hops_served_val >= 1,
+        "expected hops_served on owner shards, got {hops_served_val}"
+    );
+    assert!(
+        local_served_val >= 1,
+        "expected local no-hop serves, got {local_served_val}"
+    );
+    // Per-shard labeled detail (the console's shard view) and the per-shard inbox-depth gauge appear.
+    assert!(
+        body.contains("ironcache_shard_hops_sent_total{shard=\"0\"}"),
+        "{body}"
+    );
+    assert!(
+        body.contains("ironcache_shard_local_served_total{shard=\"0\"}"),
+        "{body}"
+    );
+    for s in 0..N_SHARDS {
+        assert!(
+            body.contains(&format!("ironcache_shard_inbox_depth{{shard=\"{s}\"}}")),
+            "per-shard inbox-depth gauge for shard {s} missing:\n{body}"
+        );
+    }
+
+    set.shutdown_and_join().unwrap();
+}
+
+/// #556 + #517: a cluster-aware client that dials each key's OWNER port on a SHARD-OWNERS node is
+/// served LOCALLY (owner == home, no internal hop). Driven only through owner ports, `hops_sent`
+/// stays ZERO while `local_served` climbs -- the zero-hop property, now an ASSERTED metric rather
+/// than a claim.
+#[tokio::test]
+async fn shard_owners_owner_dialed_client_shows_zero_hops() {
+    const N: usize = 4;
+    let metrics_port = free_port();
+    let (set, base) = run_shard_owners_node_with_metrics_for_test(N, metrics_port);
+
+    for key in [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+    ] {
+        let owner_port = base + owner_shard(key, N) as u16;
+        let mut c = connect_retry(owner_port).await;
+        let set_r = send_read(&mut c, &cmd(&["SET", key, "v"])).await;
+        assert_eq!(
+            &set_r, b"+OK\r\n",
+            "the owner port must serve {key} locally (no MOVED)"
+        );
+        let _ = send_read(&mut c, &cmd(&["GET", key])).await;
+        drop(c);
+    }
+
+    let (code, body) = http_get(metrics_port, "/metrics").await;
+    assert_eq!(code, 200, "body: {body}");
+    let hops_sent_val = metric(&body, "ironcache_hops_sent_total");
+    let local_served_val = metric(&body, "ironcache_local_served_total");
+    assert_eq!(
+        hops_sent_val, 0,
+        "owner-dialed keys must take ZERO internal hops (the #517 property); got {hops_sent_val}\n{body}"
+    );
+    assert!(
+        local_served_val >= 1,
+        "owner-dialed keyed serves must count as local (the no-hop path); got {local_served_val}\n{body}"
+    );
 
     set.shutdown_and_join().unwrap();
 }
