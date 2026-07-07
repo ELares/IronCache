@@ -134,12 +134,15 @@ impl Verifier for Sha256Verifier {
 }
 
 /// The pinned minisign public key the upgrade authenticates releases against (#386, ADR-0020: "the
-/// public key ships in the repo"). `None` until the maintainer commits the production key here + the
-/// release workflow's `MINISIGN_SECRET_KEY` is provisioned (release.yml is already wired to sign
-/// `SHA256SUMS` when the secret exists). While `None`, [`select_verifier`] falls back to the
-/// integrity-only [`Sha256Verifier`] (the current behavior); the instant a key is pinned, upgrades
-/// require a valid minisign signature with NO other code change.
-pub const PINNED_UPGRADE_PUBLIC_KEY: Option<&str> = None;
+/// public key ships in the repo"). This is the production release key: its private half is held in
+/// the `MINISIGN_SECRET_KEY` repo secret and signs `SHA256SUMS` on every formal `v*` release
+/// (`.github/workflows/release.yml`), first used for `v0.1.0`. Because it is `Some`, `run` selects
+/// [`MinisignVerifier`], so `ironcache upgrade` now REQUIRES a valid minisign signature over
+/// `SHA256SUMS` (authenticity) on top of the SHA-256 integrity check; an unsigned or wrong-key
+/// release is rejected. Rotating the key means committing the new public half here and provisioning
+/// the matching secret. (Key id `92B942F68A9797C`.)
+pub const PINNED_UPGRADE_PUBLIC_KEY: Option<&str> =
+    Some("RWR8ealoL5QrCRPm6Pt5Oab3RqsMP7eCBL8OhLSAAPveB9JU6eYLUTOj");
 
 /// The AUTHENTICITY verifier (#386): the binary's SHA-256 matches `SHA256SUMS` (integrity, via the
 /// composed [`Sha256Verifier`]) AND `SHA256SUMS` carries a valid detached minisign signature
@@ -300,6 +303,18 @@ fn parse_version_output(stdout: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn the_pinned_upgrade_public_key_is_present_and_well_formed() {
+        // `run` does `MinisignVerifier::new(PINNED_UPGRADE_PUBLIC_KEY?)?`, so a malformed committed
+        // key would fail every `ironcache upgrade` before it could check any release. This guards a
+        // key-rotation typo: the pinned key must always be a parseable minisign public key.
+        let key = PINNED_UPGRADE_PUBLIC_KEY
+            .expect("a production minisign public key is pinned (authenticity-verified upgrades)");
+        MinisignVerifier::new(key).expect(
+            "the pinned PINNED_UPGRADE_PUBLIC_KEY must be a well-formed minisign public key",
+        );
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

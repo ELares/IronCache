@@ -1012,10 +1012,15 @@ mod tests {
             },
         ];
         let (base, handle) = spawn_http(routes, 2);
-        let fetched = fetch_release(
+        // Exercise the integrity-only fetch/extract path explicitly (key = None). The AUTHENTICITY
+        // path (with a pinned key + a real signature) is covered by the `pinned_fetch_*` tests; the
+        // public `fetch_release` now carries the production `PINNED_UPGRADE_PUBLIC_KEY`, which cannot
+        // be unit-signed here (its private half is not in the repo).
+        let fetched = fetch_release_with_key(
             &format!("http://{base}/{asset}"),
             &format!("http://{base}/SHA256SUMS"),
             test_bounds(),
+            None,
         )
         .expect("fetch + verify + extract");
         // The extracted binary is present, and the derived manifest vouches for it.
@@ -1051,10 +1056,13 @@ mod tests {
             },
         ];
         let (base, handle) = spawn_http(routes, 2);
-        let err = fetch_release(
+        // Integrity-only path (key = None): this asserts the sha256 mismatch is what rejects. The
+        // pinned-key authenticity rejections are covered by the `pinned_fetch_*` tests.
+        let err = fetch_release_with_key(
             &format!("http://{base}/{asset}"),
             &format!("http://{base}/SHA256SUMS"),
             test_bounds(),
+            None,
         )
         .expect_err("a tarball whose sha256 does not match the manifest must be rejected");
         assert!(matches!(err, FetchError::Verify(_)), "{err:?}");
