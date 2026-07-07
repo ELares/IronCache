@@ -113,6 +113,29 @@ async fn metrics_endpoint_serves_prometheus_and_reflects_commands() {
     let value: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
     assert!(value >= N as u64, "processed={value} < {N}; body: {body}");
 
+    // #546 tail-latency histogram: the command-latency histogram series appears in the SAME scrape,
+    // p99-graphable. Assert its shape (HELP/TYPE), that its `_count` reflects the driven commands,
+    // and that the cumulative `+Inf` bucket equals `_count` (the load-bearing histogram invariant).
+    assert!(
+        body.contains("# TYPE ironcache_command_duration_seconds histogram"),
+        "{body}"
+    );
+    let hcount_line = body
+        .lines()
+        .find(|l| l.starts_with("ironcache_command_duration_seconds_count "))
+        .expect("histogram _count present");
+    let hcount: u64 = hcount_line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(
+        hcount >= N as u64,
+        "hist _count={hcount} < {N}; body: {body}"
+    );
+    let inf_line = body
+        .lines()
+        .find(|l| l.starts_with("ironcache_command_duration_seconds_bucket{le=\"+Inf\"}"))
+        .expect("histogram +Inf bucket present");
+    let inf: u64 = inf_line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert_eq!(inf, hcount, "+Inf bucket must equal _count; body: {body}");
+
     set.shutdown_and_join().unwrap();
 }
 

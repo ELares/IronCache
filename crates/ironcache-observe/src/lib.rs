@@ -134,6 +134,161 @@ impl CommandStats {
     }
 }
 
+/// The number of latency histogram buckets (#546): the 18 finite log-spaced `le` upper bounds
+/// plus the terminal `+Inf` overflow bucket. Fixed at compile time so the per-shard histogram is
+/// a pre-sized atomic array (no per-command allocation, the hot-path requirement).
+pub const LATENCY_BUCKET_COUNT: usize = 19;
+
+/// The finite bucket UPPER BOUNDS in MICROSECONDS (#546), log-spaced ~25us..10s. The command
+/// serve loop measures elapsed micros already (SLOWLOG + COMMANDSTATS), so the find-bucket compares
+/// integers directly with no unit conversion on the hot path. The matching Prometheus `le` labels
+/// (in SECONDS, the base unit for a `_seconds` histogram) are [`LATENCY_BUCKET_LE`], and there are
+/// `LATENCY_BUCKET_COUNT - 1` of these (the `+Inf` bucket has no finite bound).
+const LATENCY_BUCKET_BOUNDS_US: [u64; LATENCY_BUCKET_COUNT - 1] = [
+    25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000, 5_000_000, 10_000_000,
+];
+
+/// The Prometheus `le` label strings (in SECONDS) for each bucket, parallel to
+/// [`LATENCY_BUCKET_BOUNDS_US`] with the terminal `+Inf`. Pre-formatted `&'static str`s so the
+/// render allocates nothing per bucket boundary; kept as literals (not derived from the micros
+/// bounds) so the exposition text is exact and stable.
+pub const LATENCY_BUCKET_LE: [&str; LATENCY_BUCKET_COUNT] = [
+    "0.000025", "0.00005", "0.0001", "0.00025", "0.0005", "0.001", "0.0025", "0.005", "0.01",
+    "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf",
+];
+
+/// One shard's command-latency HISTOGRAM storage (#546): a fixed array of `AtomicU64` bucket
+/// counters plus the running micros SUM and observation COUNT. Lives inside [`ShardCountersCell`]
+/// so the shared-nothing writer (the serving shard, one writer per cell) records with the SAME
+/// uncontended `Relaxed` atomics the counters use, while the out-of-band metrics task reads every
+/// shard's histogram across threads for the `/metrics` scrape.
+///
+/// ## Semantics
+///
+/// `buckets[i]` holds the NON-cumulative count of observations that fell in bucket `i` (elapsed
+/// `<=` [`LATENCY_BUCKET_BOUNDS_US`]`[i]` and above the previous bound; the LAST index is the `+Inf`
+/// overflow). The Prometheus `le` series is CUMULATIVE, so the render accumulates these (see
+/// [`LatencyHistogram::cumulative`]); storing per-bucket keeps a record to ONE atomic add.
+/// `count` is a DEDICATED observation count (not the shared command counter), so the histogram is
+/// self-consistent by construction: the sum of the buckets equals `count`, hence the `+Inf` bucket
+/// equals `_count`. `sum_micros` totals elapsed micros; the render divides by 1e6 for the `_sum` in
+/// seconds. `Relaxed` is correct for the same reason the counters use it (independent monotonic
+/// tallies read at a fuzzy scrape instant).
+#[derive(Debug)]
+struct LatencyHistogramCell {
+    /// Per-bucket (NON-cumulative) observation counts; index `LATENCY_BUCKET_COUNT - 1` is `+Inf`.
+    buckets: [AtomicU64; LATENCY_BUCKET_COUNT],
+    /// Total elapsed MICROSECONDS across every observation (rendered as `_sum` in seconds).
+    sum_micros: AtomicU64,
+    /// Total number of observations (the histogram `_count`; equals the sum of `buckets`).
+    count: AtomicU64,
+}
+
+impl Default for LatencyHistogramCell {
+    fn default() -> Self {
+        LatencyHistogramCell {
+            // `AtomicU64` is not `Copy`, so the array cannot be built with a repeat literal; build
+            // each cell explicitly. A one-time boot cost (one array per shard), never per command.
+            buckets: core::array::from_fn(|_| AtomicU64::new(0)),
+            sum_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl LatencyHistogramCell {
+    /// Record one command's `elapsed_us` (#546): a branch-predictable find-bucket, one `Relaxed`
+    /// bucket increment, one `Relaxed` sum add, and one `Relaxed` count bump. The find-bucket is a
+    /// data-independent fold (count the finite bounds strictly BELOW `elapsed_us`), which yields the
+    /// index of the smallest bucket whose `le` bound is `>=` the observation -- exactly Prometheus
+    /// `le` semantics -- and saturates at the `+Inf` index when the elapsed exceeds every bound. No
+    /// allocation, no new clock read (the caller reuses the SLOWLOG/COMMANDSTATS elapsed measurement).
+    fn observe(&self, elapsed_us: u64) {
+        let idx = LATENCY_BUCKET_BOUNDS_US
+            .iter()
+            .filter(|&&bound| elapsed_us > bound)
+            .count();
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read this shard's histogram into an immutable, summable [`LatencyHistogram`] (each load
+    /// `Relaxed`, like [`ShardCountersCell::snapshot`]).
+    fn snapshot(&self) -> LatencyHistogram {
+        let mut buckets = [0u64; LATENCY_BUCKET_COUNT];
+        for (dst, src) in buckets.iter_mut().zip(self.buckets.iter()) {
+            *dst = src.load(Ordering::Relaxed);
+        }
+        LatencyHistogram {
+            buckets,
+            sum_micros: self.sum_micros.load(Ordering::Relaxed),
+            count: self.count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// An immutable, summable snapshot of one shard's (or the node-wide) command-latency histogram
+/// (#546). Held OUTSIDE [`CounterSnapshot`] (which stays `Copy` and small) because the bucket array
+/// is comparatively large and the counter snapshot is merged/copied on many paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatencyHistogram {
+    /// Per-bucket (NON-cumulative) observation counts, parallel to [`LATENCY_BUCKET_LE`]; the last
+    /// entry is the `+Inf` overflow. [`LatencyHistogram::cumulative`] turns these into the
+    /// cumulative Prometheus `le` series.
+    pub buckets: [u64; LATENCY_BUCKET_COUNT],
+    /// Total elapsed MICROSECONDS across every observation (the render divides by 1e6 for `_sum`).
+    pub sum_micros: u64,
+    /// Total observations (the histogram `_count`; equals the sum of `buckets`, hence `+Inf`).
+    pub count: u64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        LatencyHistogram {
+            buckets: [0; LATENCY_BUCKET_COUNT],
+            sum_micros: 0,
+            count: 0,
+        }
+    }
+}
+
+impl LatencyHistogram {
+    /// Fold another histogram into this one element-wise (the cross-shard rollup, mirroring
+    /// [`CounterSnapshot::merge`]): buckets add position-wise, and the sum + count add.
+    #[must_use]
+    pub fn merge(mut self, other: &LatencyHistogram) -> LatencyHistogram {
+        for (dst, src) in self.buckets.iter_mut().zip(other.buckets.iter()) {
+            *dst += *src;
+        }
+        self.sum_micros += other.sum_micros;
+        self.count += other.count;
+        self
+    }
+
+    /// The CUMULATIVE bucket counts (Prometheus `le` semantics): entry `i` is the number of
+    /// observations `<=` bound `i`. Monotonic non-decreasing by construction, and the final entry
+    /// (the `+Inf` bucket) equals [`Self::count`].
+    #[must_use]
+    pub fn cumulative(&self) -> [u64; LATENCY_BUCKET_COUNT] {
+        let mut out = [0u64; LATENCY_BUCKET_COUNT];
+        let mut acc = 0u64;
+        for (dst, &b) in out.iter_mut().zip(self.buckets.iter()) {
+            acc += b;
+            *dst = acc;
+        }
+        out
+    }
+
+    /// The total observed latency in SECONDS (the `_sum` value), converted from the micros total.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn sum_seconds(&self) -> f64 {
+        self.sum_micros as f64 / 1_000_000.0
+    }
+}
+
 /// The per-shard counter STORAGE: a flat bag of `AtomicU64`s, one cell per counter, owned
 /// by ONE shard and shared (by `Arc`) into the process-wide [`MetricsRegistry`] so the
 /// out-of-band metrics HTTP task can READ the live values from another thread WITHOUT a lock
@@ -165,6 +320,13 @@ pub struct ShardCountersCell {
     /// the `/metrics` keyspace gauge is eventually-consistent (bounded by the expiry cycle) at
     /// ZERO per-command cost. The metrics task sums it across shards for the node-wide keyspace.
     keyspace_keys: AtomicU64,
+    /// This shard's command-latency HISTOGRAM (#546): a fixed atomic bucket array + micros sum +
+    /// observation count, recorded per command by the serve loop (reusing the SLOWLOG/COMMANDSTATS
+    /// elapsed micros, no new clock read) and summed across shards by the metrics task for the
+    /// `/metrics` histogram series. Not touched by [`Self::reset_stats`]: a Prometheus histogram is a
+    /// cumulative, counter-typed family expected to run for the process lifetime (rate/quantile math
+    /// assumes it only resets on restart), so `CONFIG RESETSTAT` leaves it intact.
+    latency: LatencyHistogramCell,
 }
 
 impl ShardCountersCell {
@@ -184,6 +346,21 @@ impl ShardCountersCell {
             keyspace_misses: self.keyspace_misses.load(Ordering::Relaxed),
             keyspace_keys: self.keyspace_keys.load(Ordering::Relaxed),
         }
+    }
+
+    /// Record one command's elapsed micros into this shard's latency HISTOGRAM (#546): a
+    /// branch-predictable find-bucket + one `Relaxed` bucket increment + a `Relaxed` sum add + a
+    /// `Relaxed` count bump (see [`LatencyHistogramCell::observe`]). Called on the command hot path
+    /// with the SAME elapsed the SLOWLOG/COMMANDSTATS hooks already computed (no new clock read).
+    pub fn observe_latency(&self, elapsed_us: u64) {
+        self.latency.observe(elapsed_us);
+    }
+
+    /// Read this shard's latency histogram into an immutable, summable [`LatencyHistogram`] (the
+    /// cross-thread read the metrics task folds across shards).
+    #[must_use]
+    pub fn latency_snapshot(&self) -> LatencyHistogram {
+        self.latency.snapshot()
     }
 
     /// Publish this shard's live key count (a GAUGE store, `Relaxed`). Called off the command
@@ -273,6 +450,14 @@ impl ShardCounters {
     /// Record a processed command.
     pub fn on_command(&mut self) {
         self.cell.commands_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one command's elapsed micros into this shard's latency HISTOGRAM (#546). Takes
+    /// `&self` (the underlying cell records through `Relaxed` atomics, no `&mut` needed), so the
+    /// serve loop can observe latency without a mutable borrow of the counters. Reuses the same
+    /// elapsed the SLOWLOG/COMMANDSTATS hooks measured -- no new clock read on the hot path.
+    pub fn observe_latency(&self, elapsed_us: u64) {
+        self.cell.observe_latency(elapsed_us);
     }
 
     /// Record `n` keys evicted to honor the memory ceiling (PR-3a; INFO
@@ -409,6 +594,26 @@ impl MetricsRegistry {
     #[must_use]
     pub fn per_shard_snapshots(&self) -> Vec<CounterSnapshot> {
         self.cells.iter().map(|c| c.snapshot()).collect()
+    }
+
+    /// Sum every shard's latency histogram into ONE node-wide [`LatencyHistogram`] (#546), the
+    /// element-wise cross-shard rollup the `/metrics` histogram series renders. Lock-free, mirroring
+    /// [`Self::aggregate`]: it snapshots each cell's histogram and folds them with
+    /// [`LatencyHistogram::merge`], so the node `+Inf`/`_count`/`_sum` are the sum of the per-shard
+    /// values (the invariant the acceptance test checks).
+    #[must_use]
+    pub fn aggregate_latency(&self) -> LatencyHistogram {
+        self.cells
+            .iter()
+            .map(|c| c.latency_snapshot())
+            .fold(LatencyHistogram::default(), |acc, h| acc.merge(&h))
+    }
+
+    /// One [`LatencyHistogram`] per shard, in shard-index order (#546), for the per-shard labeled
+    /// `/metrics` histogram series and for the test that checks the node rollup equals their sum.
+    #[must_use]
+    pub fn per_shard_latency(&self) -> Vec<LatencyHistogram> {
+        self.cells.iter().map(|c| c.latency_snapshot()).collect()
     }
 
     /// `CONFIG RESETSTAT` NODE-WIDE (#531): zero the resettable stat counters of EVERY shard's
@@ -695,6 +900,79 @@ pub fn render_prometheus_shards(per_shard: &[CounterSnapshot]) -> String {
         per_shard,
         |s| s.keyspace_keys,
     );
+    o
+}
+
+/// The stable metric-family NAME for the command-latency histogram (#546). Prometheus derives the
+/// `_bucket` / `_sum` / `_count` child series from this base, and the base unit is SECONDS (the
+/// `_seconds` suffix), matching the Prometheus base-unit convention for a latency histogram.
+const LATENCY_HISTOGRAM_NAME: &str = "ironcache_command_duration_seconds";
+
+/// Append ONE histogram family sample-set to `o` under `name` from `hist`: the CUMULATIVE
+/// `_bucket{le="..."}` series (Prometheus `le` semantics; monotonic non-decreasing, and the `+Inf`
+/// bucket equals `_count`), then `_sum` (seconds) and `_count`. `shard` is `None` for the node
+/// rollup (unlabeled samples) or `Some(i)` for the per-shard series (a `shard="i"` label), so the
+/// two callers share the exact same bucket/sum/count format. Caller emits the `# HELP`/`# TYPE`.
+fn write_histogram_family(
+    o: &mut String,
+    name: &str,
+    shard: Option<usize>,
+    hist: &LatencyHistogram,
+) {
+    use core::fmt::Write as _;
+    let cumulative = hist.cumulative();
+    // On a bucket line the shard label (when present) precedes the REQUIRED `le` label.
+    let shard_label = shard.map(|i| format!("shard=\"{i}\",")).unwrap_or_default();
+    for (le, cum) in LATENCY_BUCKET_LE.iter().zip(cumulative.iter()) {
+        let _ = writeln!(o, "{name}_bucket{{{shard_label}le=\"{le}\"}} {cum}");
+    }
+    // `_sum`/`_count` carry only the shard label (no `le`), or NO braces at all for the node rollup.
+    // `_sum` is the total observed latency in SECONDS; the micros total divides exactly by 1e6, so
+    // six decimals reproduce it losslessly (the sub-microsecond digit is always zero).
+    let sc_label = shard
+        .map(|i| format!("{{shard=\"{i}\"}}"))
+        .unwrap_or_default();
+    let _ = writeln!(o, "{name}_sum{sc_label} {:.6}", hist.sum_seconds());
+    let _ = writeln!(o, "{name}_count{sc_label} {}", hist.count);
+}
+
+/// Render the NODE-WIDE command-latency histogram (#546) as a Prometheus `histogram` family:
+/// `ironcache_command_duration_seconds_{bucket,sum,count}`. `hist` is the cross-shard rollup
+/// ([`MetricsRegistry::aggregate_latency`]); the caller appends this to the `/metrics` body. The
+/// buckets are CUMULATIVE and monotonic non-decreasing, the `+Inf` bucket equals `_count`, and
+/// `p99`/`p99.9` are derivable from the `le` series -- the operator-facing tail-latency view (#546).
+#[must_use]
+pub fn render_latency_histogram(hist: &LatencyHistogram) -> String {
+    use core::fmt::Write as _;
+    let mut o = String::with_capacity(1024);
+    let name = LATENCY_HISTOGRAM_NAME;
+    let _ = write!(
+        o,
+        "# HELP {name} Command execution latency in seconds (all commands, all shards).\n\
+         # TYPE {name} histogram\n"
+    );
+    write_histogram_family(&mut o, name, None, hist);
+    o
+}
+
+/// Render the PER-SHARD labeled command-latency histogram series (#546), mirroring
+/// [`render_prometheus_shards`]: one `ironcache_shard_command_duration_seconds` histogram family per
+/// shard, each `le`/`sum`/`count` sample carrying a `shard="i"` label. Additive to the node rollup
+/// (a DISTINCT `ironcache_shard_*` namespace, so there is no mixed-label double-count within the
+/// node family); the caller appends it to the `/metrics` body.
+#[must_use]
+pub fn render_latency_histogram_shards(per_shard: &[LatencyHistogram]) -> String {
+    use core::fmt::Write as _;
+    let mut o = String::with_capacity(per_shard.len() * 512 + 128);
+    let name = "ironcache_shard_command_duration_seconds";
+    let _ = write!(
+        o,
+        "# HELP {name} Command execution latency in seconds, per shard.\n\
+         # TYPE {name} histogram\n"
+    );
+    for (i, hist) in per_shard.iter().enumerate() {
+        write_histogram_family(&mut o, name, Some(i), hist);
+    }
     o
 }
 
@@ -1555,6 +1833,178 @@ mod tests {
         assert_eq!(reg.per_shard_snapshots().len(), 3);
         // A single-shard registry still yields exactly one snapshot (one `shard="0"` sample).
         assert_eq!(MetricsRegistry::new(1).per_shard_snapshots().len(), 1);
+    }
+
+    /// The find-bucket lands each observation in the SMALLEST `le` bucket whose bound is `>=` the
+    /// elapsed micros (Prometheus `le` semantics), and an over-range observation lands in `+Inf`.
+    #[test]
+    fn latency_histogram_buckets_by_le_semantics() {
+        let cell = ShardCountersCell::default();
+        // Exactly on a boundary (25us) -> the `le="0.000025"` bucket (index 0).
+        cell.observe_latency(25);
+        // Just above a boundary (26us, > 25 and <= 50) -> the `le="0.00005"` bucket (index 1).
+        cell.observe_latency(26);
+        // Zero elapsed -> the smallest bucket (index 0).
+        cell.observe_latency(0);
+        // Above every finite bound (11s) -> the terminal `+Inf` bucket (last index).
+        cell.observe_latency(11_000_000);
+        let h = cell.latency_snapshot();
+        assert_eq!(h.buckets[0], 2, "25us and 0us land in le=0.000025");
+        assert_eq!(h.buckets[1], 1, "26us lands in le=0.00005");
+        assert_eq!(h.buckets[LATENCY_BUCKET_COUNT - 1], 1, "11s lands in +Inf");
+        assert_eq!(h.count, 4);
+        // Sum includes the zero-elapsed observation (25 + 26 + 0 + 11s of micros).
+        assert_eq!(h.sum_micros, 25 + 26 + 11_000_000);
+    }
+
+    /// The cumulative `le` series is monotonic non-decreasing, its terminal (`+Inf`) entry equals
+    /// `_count`, and `_count` equals the number of observations recorded (#546 core invariant).
+    #[test]
+    fn latency_histogram_cumulative_is_monotonic_and_inf_equals_count() {
+        let cell = ShardCountersCell::default();
+        // A spread of latencies across several buckets.
+        for us in [
+            10u64, 40, 300, 1_500, 30_000, 700_000, 3_000_000, 20_000_000,
+        ] {
+            cell.observe_latency(us);
+        }
+        let h = cell.latency_snapshot();
+        let cum = h.cumulative();
+        // Monotonic non-decreasing.
+        for w in cum.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "cumulative buckets must not decrease: {cum:?}"
+            );
+        }
+        // The `+Inf` bucket equals `_count`, which equals the 8 observations.
+        assert_eq!(cum[LATENCY_BUCKET_COUNT - 1], h.count);
+        assert_eq!(h.count, 8);
+    }
+
+    /// The node-wide aggregate equals the element-wise SUM of the per-shard histograms, and `_count`
+    /// equals the total commands driven (K) across all shards (#546 acceptance).
+    #[test]
+    fn latency_histogram_node_aggregate_equals_sum_of_per_shard() {
+        let reg = MetricsRegistry::new(3);
+        // Drive K observations spread across the three shard cells.
+        let mut k = 0u64;
+        for (shard, &n) in [5usize, 8, 2].iter().enumerate() {
+            let cell = reg.shard_cell(shard);
+            for i in 0..n {
+                // Vary the latency so several buckets are populated per shard.
+                cell.observe_latency((i as u64 + 1) * 37);
+                k += 1;
+            }
+        }
+        let node = reg.aggregate_latency();
+        // _count == K (total commands driven).
+        assert_eq!(node.count, k);
+        // The node rollup is the element-wise sum of the per-shard histograms.
+        let per_shard = reg.per_shard_latency();
+        let mut summed = LatencyHistogram::default();
+        for h in &per_shard {
+            summed = summed.merge(h);
+        }
+        assert_eq!(
+            node, summed,
+            "node aggregate must equal the sum of per-shard"
+        );
+        // The `+Inf` cumulative bucket equals _count on the node rollup too.
+        assert_eq!(node.cumulative()[LATENCY_BUCKET_COUNT - 1], node.count);
+    }
+
+    /// The node histogram render is a valid Prometheus `histogram` family: HELP/TYPE, cumulative
+    /// `le` buckets, a `+Inf` bucket equal to `_count`, plus `_sum`/`_count`.
+    #[test]
+    fn latency_histogram_render_is_valid_prometheus() {
+        let mut h = LatencyHistogram::default();
+        // 900us (le=0.001) and 2ms (le=0.0025) and 3s (le=5): three distinct buckets.
+        h.buckets[LATENCY_BUCKET_BOUNDS_US
+            .iter()
+            .filter(|&&b| 900 > b)
+            .count()] += 1;
+        h.buckets[LATENCY_BUCKET_BOUNDS_US
+            .iter()
+            .filter(|&&b| 2_000 > b)
+            .count()] += 1;
+        h.buckets[LATENCY_BUCKET_BOUNDS_US
+            .iter()
+            .filter(|&&b| 3_000_000 > b)
+            .count()] += 1;
+        h.sum_micros = 900 + 2_000 + 3_000_000;
+        h.count = 3;
+        let out = render_latency_histogram(&h);
+        assert!(
+            out.contains("# TYPE ironcache_command_duration_seconds histogram\n"),
+            "{out}"
+        );
+        // Cumulative: le=0.001 covers the 900us observation (1), le=0.0025 also covers the 2ms (2).
+        assert!(
+            out.contains("ironcache_command_duration_seconds_bucket{le=\"0.001\"} 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ironcache_command_duration_seconds_bucket{le=\"0.0025\"} 2\n"),
+            "{out}"
+        );
+        // The `+Inf` bucket equals _count (all 3 observations).
+        assert!(
+            out.contains("ironcache_command_duration_seconds_bucket{le=\"+Inf\"} 3\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ironcache_command_duration_seconds_count 3\n"),
+            "{out}"
+        );
+        // _sum in seconds (900us + 2ms + 3s = 3.0029s).
+        assert!(
+            out.contains("ironcache_command_duration_seconds_sum 3.002900\n"),
+            "{out}"
+        );
+    }
+
+    /// The per-shard histogram render labels each shard in the distinct `ironcache_shard_*`
+    /// namespace, additive to the node rollup (#362 style).
+    #[test]
+    fn latency_histogram_per_shard_render_labels_each_shard() {
+        let per_shard = vec![
+            {
+                let mut h = LatencyHistogram::default();
+                h.buckets[0] = 4;
+                h.sum_micros = 40;
+                h.count = 4;
+                h
+            },
+            {
+                let mut h = LatencyHistogram::default();
+                h.buckets[LATENCY_BUCKET_COUNT - 1] = 1;
+                h.sum_micros = 99_000_000;
+                h.count = 1;
+                h
+            },
+        ];
+        let out = render_latency_histogram_shards(&per_shard);
+        assert!(
+            out.contains("# TYPE ironcache_shard_command_duration_seconds histogram\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "ironcache_shard_command_duration_seconds_bucket{shard=\"0\",le=\"0.000025\"} 4\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("ironcache_shard_command_duration_seconds_count{shard=\"0\"} 4\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "ironcache_shard_command_duration_seconds_bucket{shard=\"1\",le=\"+Inf\"} 1\n"
+            ),
+            "{out}"
+        );
     }
 
     fn server() -> ServerInfo {
