@@ -8,6 +8,7 @@
 //! boundary (ADR-0003) holds.
 
 mod cli;
+mod cluster_bus;
 mod fd_budget;
 
 use anyhow::Context as _;
@@ -187,6 +188,12 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
     // LOUD warning. This makes a low `ulimit -n` a clean bounded ceiling at boot
     // rather than an `EMFILE` mid-traffic. Boot / OS-seam code, outside ADR-0003.
     fd_budget::apply_fd_budget(&mut cfg);
+    // CLUSTER-BUS SECURITY (#557): if a clustered mode is configured WITHOUT a cluster_secret and
+    // with cluster_tls off, the inter-node RAFTMSG bus + replication stream run plaintext and
+    // unauthenticated, so any peer reaching the bus port could join consensus or siphon the
+    // keyspace. Emit a LOUD boot warning naming the exposure + how to secure it (a no-op for the
+    // default standalone node and for any authenticated posture). Boot / OS-seam, outside ADR-0003.
+    cluster_bus::warn_if_unauthenticated(&cfg);
     tracing::info!(
         version = cli::BUILD_VERSION,
         bind = %cfg.bind,
