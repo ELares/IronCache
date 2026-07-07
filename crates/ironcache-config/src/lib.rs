@@ -1927,14 +1927,15 @@ impl ConfigOverlay {
             // The flag-string validity is checked once on the resolved value in Config::validate.
             o.notify_keyspace_events = Some(v);
         }
-        // STRICT UNKNOWN-KEY GUARD (mirrors the `deny_unknown_fields` TOML posture). Every key we
-        // honor was recorded in `known` above, so ANY `IRONCACHE_*` variable present in the
-        // environment that is NOT there is a typo (e.g. `IRONCACHE_MAXCLIENT` for
-        // `IRONCACHE_MAXCLIENTS`) whose intended setting would otherwise be silently dropped, the
-        // exact opposite of the strict-TOML posture. Fail boot naming the key (with a nearest-known
-        // suggestion). `env_var` is not called past this point, so its `&mut known` borrow has
-        // ended and the guard can read `known`.
-        reject_unknown_env(std::env::vars().map(|(k, _)| k), &known)?;
+        // UNKNOWN-KEY GUARD. Every key we honor was recorded in `known` above, so ANY `IRONCACHE_*`
+        // variable present in the environment that is NOT there is either a typo (e.g.
+        // `IRONCACHE_MAXCLIENT` for `IRONCACHE_MAXCLIENTS`) whose intended setting would otherwise be
+        // silently dropped, or an orchestrator/tooling variable in the shared `IRONCACHE_*`
+        // namespace. WARN loudly (do not fail boot) naming the key with a nearest-known suggestion:
+        // the environment is shared, so a hard failure here is user-hostile (unlike the config FILE,
+        // which stays strict). `env_var` is not called past this point, so its `&mut known` borrow
+        // has ended and the guard can read `known`.
+        warn_unknown_env(std::env::vars().map(|(k, _)| k), &known);
         Ok(o)
     }
 
@@ -2295,33 +2296,37 @@ pub fn render_save_points(interval_secs: u64, min_changes: u64) -> String {
     }
 }
 
-/// Reject the first `IRONCACHE_*` environment variable in `present` that `from_env` does not honor
-/// (its keys are `known`), mirroring the strict `deny_unknown_fields` TOML posture: a typo'd var
-/// (e.g. `IRONCACHE_MAXCLIENT` for `IRONCACHE_MAXCLIENTS`) would otherwise be SILENTLY ignored and
-/// the operator's intended setting lost. `known` is the exact set of keys `from_env` probed (its
-/// single source of truth), so this guard can never drift from what the reader accepts.
+/// WARN (never fail boot) on every `IRONCACHE_*` environment variable in `present` that `from_env`
+/// does not honor (its keys are `known`), each with a "did you mean" suggestion when a close known
+/// key exists. Returns the warning messages (for testability) AND emits each through
+/// `tracing::warn!`. A typo'd var (e.g. `IRONCACHE_MAXCLIENT` for `IRONCACHE_MAXCLIENTS`) would
+/// otherwise be SILENTLY ignored and the operator's intended setting lost; this surfaces it loudly.
+/// `known` is the exact set of keys `from_env` probed (its single source of truth), so the guard can
+/// never drift from what the reader accepts.
 ///
-/// Two `IRONCACHE_*` namespaces are deliberately allowed through so a legitimate boot is not
-/// rejected:
+/// WHY warn, not hard-fail (unlike the config FILE's `deny_unknown_fields`): the environment is a
+/// namespace SHARED with the OS and the orchestrator, which legitimately set `IRONCACHE_*` variables
+/// that are not server config knobs (this repo's own driver-matrix harness exports `IRONCACHE_BIN`,
+/// the binary path, per tests/drivers/run.sh; a systemd unit or k8s pod may export others). Aborting
+/// boot on those is user-hostile and a real footgun. A config FILE is author-controlled, so an
+/// unknown key there IS a mistake and still hard-fails; an env var is not, so a mistyped knob is
+/// surfaced LOUDLY but never silently swallowed and never aborts an otherwise-valid boot.
+///
+/// Two `IRONCACHE_*` namespaces are additionally skipped entirely (not even warned):
 ///
 /// * `IRONCACHE_CONSOLE_*` belongs to the SEPARATE `ironcache-console` binary (with its own strict
-///   env validation); a shared deployment env may legitimately carry both, and the server should
-///   not fail boot over a sibling component's variable.
+///   env validation); a shared deployment env may legitimately carry both.
 /// * `IRONCACHE_BUILD_VERSION` is the compile-time release stamp (read via `option_env!` in
-///   `build.rs`); a build/deploy environment that exports it at runtime is harmless, so allow it.
+///   `build.rs`); a build/deploy environment that exports it at runtime is harmless.
 ///
 /// This is the PURE core (it takes the environment key names, not the process env) so it is
 /// unit-tested without mutating `std::env`; `from_env` wires in `std::env::vars()`.
-///
-/// # Errors
-///
-/// Returns [`ConfigError::Invalid`] (`field = "env"`) naming the first unknown key and, when a
-/// close known key exists, a "did you mean" suggestion.
-fn reject_unknown_env<I, S>(present: I, known: &[&str]) -> Result<(), ConfigError>
+fn warn_unknown_env<I, S>(present: I, known: &[&str]) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    let mut warnings = Vec::new();
     for key in present {
         let key = key.as_ref();
         if !key.starts_with("IRONCACHE_") {
@@ -2336,16 +2341,15 @@ where
         let hint = nearest_env_key(key, known)
             .map(|s| format!(" (did you mean {s}?)"))
             .unwrap_or_default();
-        return Err(ConfigError::Invalid {
-            field: "env",
-            reason: format!(
-                "unknown IRONCACHE_* environment variable {key}{hint}; unset it or fix the typo \
-                 (unknown env vars are rejected, matching the strict TOML deny_unknown_fields \
-                 posture, so a mistyped knob is never silently ignored)"
-            ),
-        });
+        let msg = format!(
+            "ignoring unknown IRONCACHE_* environment variable {key}{hint}; it is not a server \
+             config knob. If it is a typo, fix or unset it so your intended setting is not lost; if \
+             your tooling sets it intentionally, this warning is harmless"
+        );
+        tracing::warn!(env_var = key, "{msg}");
+        warnings.push(msg);
     }
-    Ok(())
+    warnings
 }
 
 /// The nearest key in `known` to `key` by Levenshtein edit distance, returned ONLY when it is a
@@ -3759,13 +3763,14 @@ mod tests {
     }
 
     #[test]
-    fn reject_unknown_env_names_the_typo_and_suggests() {
+    fn warn_unknown_env_names_the_typo_and_suggests() {
         // The exact key set from_env probes is the single source of truth; a small representative
-        // slice is enough to exercise the guard. A typo'd key is rejected, naming it + a hint.
+        // slice is enough to exercise the guard. A typo'd key is WARNED (not rejected), naming it +
+        // a hint, so the operator sees a mistyped knob without a hard boot failure.
         let known: &[&'static str] = &["IRONCACHE_MAXCLIENTS", "IRONCACHE_PORT", "IRONCACHE_BIND"];
-        let err = reject_unknown_env(["IRONCACHE_MAXCLIENT"], known)
-            .expect_err("a typo'd IRONCACHE_* var must be rejected");
-        let msg = err.to_string();
+        let warnings = warn_unknown_env(["IRONCACHE_MAXCLIENT"], known);
+        assert_eq!(warnings.len(), 1, "one unknown key warned: {warnings:?}");
+        let msg = &warnings[0];
         assert!(msg.contains("IRONCACHE_MAXCLIENT"), "names the key: {msg}");
         assert!(
             msg.contains("did you mean IRONCACHE_MAXCLIENTS"),
@@ -3774,10 +3779,11 @@ mod tests {
     }
 
     #[test]
-    fn reject_unknown_env_allows_known_foreign_and_non_prefixed_keys() {
+    fn warn_unknown_env_stays_silent_for_known_foreign_and_non_prefixed_keys() {
         let known: &[&'static str] = &["IRONCACHE_PORT", "IRONCACHE_BIND"];
-        // A known key, a non-IRONCACHE key, the console namespace, and the build stamp all pass.
-        reject_unknown_env(
+        // A known key, a non-IRONCACHE key, the console namespace, and the build stamp all warn
+        // nothing; only a genuinely-unknown server-namespaced var (IRONCACHE_BIN here) does.
+        let warnings = warn_unknown_env(
             [
                 "IRONCACHE_PORT",
                 "PATH",
@@ -3787,8 +3793,11 @@ mod tests {
                 "IRONCACHE_BUILD_VERSION",
             ],
             known,
-        )
-        .expect("known + foreign-namespaced + non-prefixed vars must all be allowed");
+        );
+        assert!(
+            warnings.is_empty(),
+            "known + foreign-namespaced + non-prefixed vars warn nothing: {warnings:?}"
+        );
     }
 
     #[test]
