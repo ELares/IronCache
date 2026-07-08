@@ -123,6 +123,17 @@ pub struct RuntimeConfig {
     /// ring drops the oldest past it). Runtime-settable via `CONFIG SET slowlog-max-len`. Seeded
     /// from [`crate::DEFAULT_SLOWLOG_MAX_LEN`].
     slowlog_max_len: AtomicU64,
+    /// The SAVE BACKPRESSURE percent (#577, the concurrent-snapshot p99.9 stopgap): the fraction of
+    /// the serving core a `SAVE`/`BGSAVE` is allowed to consume, in `1..=100`. `100` (the default)
+    /// means NO throttle -- the save dumps at full speed exactly as before #577, so the default
+    /// deployment is byte-identical. A value below 100 makes the per-shard save loop sleep
+    /// proportionally after each dump chunk (`sleep = chunk_time * (100 - pct) / pct`, via the
+    /// Runtime timer seam) so the save uses only about `pct`% of the core and the datapath stays
+    /// above the offered load (the open-loop queue drains instead of building). The save loop reads
+    /// this LIVE per chunk (one relaxed load, off the per-command hot path), so a `CONFIG SET
+    /// save-backpressure-percent` takes effect even during an in-flight save. Node-level cold state
+    /// seeded from [`crate::DEFAULT_SAVE_BACKPRESSURE_PERCENT`].
+    save_backpressure_percent: AtomicU64,
     /// The `notify-keyspace-events` FLAG BITS (PROD-8 keyspace notifications), stored as the
     /// compact [`crate::NotifyFlags`] bitset. `0` (the default) DISABLES notifications, and the
     /// per-command hot-path read is a single relaxed load the serve loop snapshots into the
@@ -235,6 +246,10 @@ impl RuntimeConfig {
             active_expire: AtomicBool::new(true),
             slowlog_log_slower_than: AtomicI64::new(cfg.slowlog_log_slower_than),
             slowlog_max_len: AtomicU64::new(cfg.slowlog_max_len),
+            // The save-backpressure throttle (#577) defaults to 100 = NO throttle, so a default node
+            // saves at full speed exactly as before #577 (byte-identical); an operator opts in with a
+            // `CONFIG SET save-backpressure-percent <1-100>`.
+            save_backpressure_percent: AtomicU64::new(crate::DEFAULT_SAVE_BACKPRESSURE_PERCENT),
             // The keyspace-notification flags (PROD-8), seeded from the boot config's flag string.
             // The string was validated in `Config::validate`, so the parse here cannot fail in
             // practice; an EMPTY/invalid string seeds the DISABLED (0) set so the default boot is
@@ -505,6 +520,28 @@ impl RuntimeConfig {
     /// the value into the live `SlowLog`).
     pub fn set_slowlog_max_len(&self, n: u64) {
         self.slowlog_max_len.store(n, Ordering::Relaxed);
+    }
+
+    /// The current SAVE BACKPRESSURE percent (#577); `100` = no throttle (the default, byte-identical
+    /// to pre-#577 saves), `1..=99` = the save uses only about that percent of the serving core. A
+    /// single relaxed atomic load: the per-shard save loop reads it once per dump chunk (off the
+    /// per-command hot path), so a `CONFIG SET save-backpressure-percent` is honored LIVE by an
+    /// in-flight save on its next chunk. NO generation bump: like [`Self::maxmemory`] / the save
+    /// policy, the save loop reads this atomic DIRECTLY each chunk, so it needs no hot-swap publish
+    /// barrier (bumping the generation would needlessly force every shard to rebuild its cached
+    /// encoding-threshold snapshot on its next command -- churn on the per-command hot path this
+    /// save-only knob must not touch).
+    #[must_use]
+    pub fn save_backpressure_percent(&self) -> u64 {
+        self.save_backpressure_percent.load(Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET save-backpressure-percent <1-100>`: store the new throttle percent (a relaxed
+    /// store); `100` disables the throttle. The save loop reads `save_backpressure_percent()` each
+    /// dump chunk, so the new value applies to the current + subsequent saves without a restart. The
+    /// caller (the registry's runtime setter) validated the `1..=100` domain before calling this.
+    pub fn set_save_backpressure_percent(&self, pct: u64) {
+        self.save_backpressure_percent.store(pct, Ordering::Relaxed);
     }
 
     /// The current `notify-keyspace-events` flag set (PROD-8). A single RELAXED atomic load: the
@@ -798,6 +835,28 @@ mod tests {
         assert_eq!(u.set_max_intset_entries, usize::MAX);
         // The list budget resolves to the 64 KB tier with no entry cap.
         assert_eq!(u.list_budget(), (64 * 1024, usize::MAX));
+    }
+
+    #[test]
+    fn save_backpressure_percent_defaults_to_100_and_round_trips() {
+        // #577: the throttle DEFAULTS to 100 (no throttle -- byte-identical to pre-#577 saves), and a
+        // setter overrides it live. No boot Config field backs it (like `active_expire`); the default
+        // is the single-source constant.
+        let rc = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(
+            rc.save_backpressure_percent(),
+            crate::DEFAULT_SAVE_BACKPRESSURE_PERCENT
+        );
+        assert_eq!(rc.save_backpressure_percent(), 100);
+        // A setter overrides it (the registry validates the 1..=100 domain before calling this).
+        rc.set_save_backpressure_percent(10);
+        assert_eq!(rc.save_backpressure_percent(), 10);
+        // Setting the throttle does NOT bump the generation (the save loop reads the atomic directly,
+        // like maxmemory / the save policy -- no hot-swap publish barrier, no per-command churn).
+        let g = rc.generation();
+        rc.set_save_backpressure_percent(50);
+        assert_eq!(rc.save_backpressure_percent(), 50);
+        assert_eq!(rc.generation(), g);
     }
 
     #[test]

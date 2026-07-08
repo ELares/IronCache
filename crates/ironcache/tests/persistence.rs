@@ -355,6 +355,119 @@ async fn bgsave_yields_so_concurrent_writes_are_serviced_and_snapshot_loads() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// #577 SAVE-BACKPRESSURE THROTTLE: `CONFIG SET save-backpressure-percent` is LIVE-settable + VALIDATED,
+/// and a THROTTLED (`pct < 100`) BGSAVE still commits (manifest-last crash-safety unchanged), still
+/// services concurrent writes DURING the dump, and reloads every pre-existing key on restart. The
+/// proportional-sleep MATH is proven deterministically by the `save_throttle_sleep_us` unit tests (no
+/// wall-clock race here); this asserts the knob is wired end to end and the throttle preserves
+/// correctness. Reuses the #571 `bgsave_yields` harness.
+#[tokio::test(flavor = "current_thread")]
+async fn bgsave_backpressure_percent_is_live_settable_validated_and_still_commits() {
+    let dir = temp_data_dir("throttle");
+    let port = free_port();
+
+    let preload = 4000usize;
+    {
+        // One shard so the whole keyspace + the dump live on shard 0 and the concurrent writes below
+        // are homed there too (they must interleave with the SAME shard's throttled dump).
+        let server = run_persist_server_for_test(port, 1, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+
+        // The knob DEFAULTS to 100 (no throttle -- byte-identical saves).
+        let got = cmd(&mut c, &["CONFIG", "GET", "save-backpressure-percent"]).await;
+        assert!(
+            got.windows(3).any(|w| w == b"100"),
+            "default is 100 (no throttle), got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+
+        // Invalid values are REJECTED (never a silent clamp): 0 (would sleep forever) and 101.
+        for bad in ["0", "101"] {
+            let r = cmd(&mut c, &["CONFIG", "SET", "save-backpressure-percent", bad]).await;
+            assert_eq!(
+                r.first(),
+                Some(&b'-'),
+                "CONFIG SET save-backpressure-percent {bad} should error, got {:?}",
+                String::from_utf8_lossy(&r)
+            );
+        }
+
+        // Turn the throttle ON (10% of the core) LIVE -- +OK, and GET reflects it.
+        assert_eq!(
+            cmd(
+                &mut c,
+                &["CONFIG", "SET", "save-backpressure-percent", "10"]
+            )
+            .await,
+            b"+OK\r\n"
+        );
+        let got = cmd(&mut c, &["CONFIG", "GET", "save-backpressure-percent"]).await;
+        assert!(
+            got.windows(2).any(|w| w == b"10"),
+            "GET reflects the live throttle, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+
+        // Populate a keyspace large enough that the throttled dump spans MANY chunks (>> DUMP_CHUNK).
+        for i in 0..preload {
+            set(&mut c, &format!("pre-{i}"), &format!("v-{i}")).await;
+        }
+
+        // Kick the THROTTLED background save; it sleeps proportionally between chunks on shard 0.
+        assert_eq!(
+            cmd1(&mut c, "BGSAVE").await,
+            b"+Background saving started\r\n"
+        );
+
+        // Concurrent writes are STILL serviced during the throttled dump (the proportional sleep lets
+        // the shard drain queued writes -- the whole point of the backpressure).
+        let live = 100usize;
+        for i in 0..live {
+            let (key, val) = (format!("live-{i}"), format!("lv-{i}"));
+            tokio::time::timeout(Duration::from_secs(20), set(&mut c, &key, &val))
+                .await
+                .expect("a concurrent write was serviced during the THROTTLED BGSAVE");
+        }
+
+        // The throttled save still COMMITS (manifest-last): poll LASTSAVE until it advances.
+        let mut advanced = false;
+        for _ in 0..600 {
+            if cmd1(&mut c, "LASTSAVE").await != b":0\r\n" {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            advanced,
+            "the THROTTLED BGSAVE still committed (LASTSAVE advanced)"
+        );
+
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    // The committed manifest exists, and a restart reloads EVERY pre-existing key (present for the
+    // whole throttled dump -> captured at least once, SCAN-stable) -- the throttle changed timing, not
+    // correctness or crash-safety.
+    assert!(dir.join("dump.manifest").exists(), "manifest committed");
+    {
+        let server = run_persist_server_for_test(port, 1, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+        for i in 0..preload {
+            assert_eq!(
+                get_raw(&mut c, &format!("pre-{i}")).await,
+                bulk(&format!("v-{i}")),
+                "pre-{i} reloaded from the throttled snapshot"
+            );
+        }
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// With NO data_dir, persistence is OFF: SAVE/BGSAVE are the persistence-disabled no-op success
 /// fallbacks, LASTSAVE is 0, and no files are written. This is the default byte-unchanged posture.
 #[tokio::test(flavor = "current_thread")]

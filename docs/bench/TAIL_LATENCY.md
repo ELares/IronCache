@@ -136,6 +136,31 @@ The tail is REPORTED, not a pass/fail gate: the ADR-0017 verdict stays qps-per-c
 + bytes-per-key. The p99.9 is the moat NARRATIVE the numbers back, published
 alongside the verdict.
 
+## Save-backpressure throttle: the stopgap that cuts the measured tail (#577)
+
+The `c7g` run measured a concurrent-snapshot **p99.9 of ~3.6s**: a full-speed dump steals about half
+the serving core, so once the offered load exceeds what the half-a-core datapath can drain the
+open-loop queue **builds** for the whole save window. The `save-backpressure-percent` knob is the
+cheap stopgap that cuts that tail (~3-4x) while the ms-class isolation fix is built.
+
+- **What it does.** `CONFIG SET save-backpressure-percent <1-100>` (default **100 = no throttle**,
+  byte-identical to today) makes the per-shard dump loop **sleep proportionally** after each chunk
+  (`sleep = chunk_time * (100 - pct) / pct`), so the save consumes only about `pct`% of the core and
+  the datapath stays **above** the offered load -- the queue drains instead of building. See
+  `docs/design/PERSISTENCE.md` for the mechanism (Env clock elapsed, Runtime timer sleep, ADR-0003).
+
+- **The TRADEOFF you must respect.** Throttling **stretches the save's wall-time to about `1/pct`**:
+  at `pct = 10` a ~2s dump becomes a ~20s wall-time save. That is fine at a **realistic 5-15 min save
+  cadence** (a 20s save every 10 min is ~3% background, tail protected throughout) and **wrong at the
+  bench's aggressive 3s cadence** (a 20s save never finishes before the next is due). **The rule is
+  `save-cadence >> save-duration`.** For the bench itself, this means the throttle is only meaningful
+  when `SNAPSHOT_INTERVAL_SECS` is set to a realistic operational cadence, not the stress 3-5s used to
+  *guarantee* a save lands in a short measured window.
+
+- **It is a STOPGAP, not the isolation fix.** The throttle reaches **hundreds-of-ms**, not the
+  **ms-class** isolation of a decoupled save. The durable fix is the epoch-cut copy-on-write snapshot
+  on a dedicated persist thread (#576 PR-B); the throttle buys the tail-cut cheaply until it lands.
+
 ## Reproducing on real hardware
 
 The measured claim needs a pinned Linux box (disjoint server/client cores) against

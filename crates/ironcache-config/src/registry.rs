@@ -183,6 +183,14 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "slowlog-max-len",
             kind: SetKind::Runtime,
         },
+        // The save-backpressure throttle (#577, the concurrent-snapshot p99.9 stopgap). RUNTIME-
+        // SETTABLE: `CONFIG SET save-backpressure-percent <1-100>` bounds the fraction of the serving
+        // core a `SAVE`/`BGSAVE` consumes; `100` (the default) is no throttle (byte-identical saves).
+        // A value outside `1..=100` is rejected (never a silent clamp).
+        ParamSpec {
+            name: "save-backpressure-percent",
+            kind: SetKind::Runtime,
+        },
         // Keyspace notifications (PROD-8). RUNTIME-SETTABLE: `CONFIG SET notify-keyspace-events
         // <flags>` parses the flag string (`KEA...`) into the live overlay the serve loop reads;
         // `CONFIG GET notify-keyspace-events` renders the canonical flag string. The empty string
@@ -327,6 +335,9 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         // The SLOWLOG knobs (PROD-7): read the overlay so a `CONFIG SET slowlog-*` is reflected.
         "slowlog-log-slower-than" => runtime.slowlog_log_slower_than().to_string(),
         "slowlog-max-len" => runtime.slowlog_max_len().to_string(),
+        // The save-backpressure throttle (#577): read the overlay so a `CONFIG SET` is reflected.
+        // `100` = no throttle (the default).
+        "save-backpressure-percent" => runtime.save_backpressure_percent().to_string(),
         // Keyspace notifications (PROD-8): render the live overlay flags back to the canonical Redis
         // flag string (the empty string when disabled, the default).
         "notify-keyspace-events" => runtime.notify_flags().render(),
@@ -562,6 +573,21 @@ fn apply_runtime_set(name: &str, value: &str, runtime: &RuntimeConfig) -> SetOut
             Err(_) => {
                 SetOutcome::InvalidValue("argument couldn't be parsed into an integer".to_owned())
             }
+        },
+        // The save-backpressure throttle (#577): a percent in `1..=100`. `100` = no throttle (the
+        // default). `0` is REJECTED (a zero-percent core budget would sleep forever), as is anything
+        // above 100 or non-numeric -- never a silent clamp, matching the neighboring numeric setters.
+        "save-backpressure-percent" => match value.parse::<u64>() {
+            Ok(pct) if (1..=100).contains(&pct) => {
+                runtime.set_save_backpressure_percent(pct);
+                SetOutcome::Applied
+            }
+            Ok(_) => SetOutcome::InvalidValue(format!(
+                "'{value}' is not a valid save-backpressure-percent (expected 1..=100)"
+            )),
+            Err(_) => SetOutcome::InvalidValue(format!(
+                "'{value}' is not a valid save-backpressure-percent"
+            )),
         },
         // Keyspace notifications (PROD-8): parse the flag string into the live overlay. An
         // unrecognized flag character is rejected (Redis rejects a bad `notify-keyspace-events`);
@@ -995,6 +1021,68 @@ mod tests {
             SetOutcome::InvalidValue(_)
         ));
         assert_eq!(rc.tcp_keepalive_secs(), 0);
+    }
+
+    /// #577: `save-backpressure-percent` is RUNTIME-SETTABLE. GET reports the live value (default
+    /// 100 = no throttle); SET accepts `1..=100`; `0`, above-100, negative, and garbage are all
+    /// rejected as invalid values (never a silent clamp), leaving the prior value untouched.
+    #[test]
+    fn apply_set_save_backpressure_percent_is_runtime_settable_and_validated() {
+        let cfg = boot();
+        let rc = RuntimeConfig::from_config(&cfg);
+        // GET reports the seeded default (100 = no throttle, byte-identical saves).
+        assert_eq!(
+            effective_value("save-backpressure-percent", &rc, &cfg).as_deref(),
+            Some("100")
+        );
+        // A valid percent in 1..=100 is applied and reflected by GET.
+        assert_eq!(
+            apply_set("save-backpressure-percent", "10", &rc),
+            SetOutcome::Applied
+        );
+        assert_eq!(rc.save_backpressure_percent(), 10);
+        assert_eq!(
+            effective_value("save-backpressure-percent", &rc, &cfg).as_deref(),
+            Some("10")
+        );
+        // The boundaries 1 and 100 are both accepted.
+        assert_eq!(
+            apply_set("save-backpressure-percent", "1", &rc),
+            SetOutcome::Applied
+        );
+        assert_eq!(rc.save_backpressure_percent(), 1);
+        assert_eq!(
+            apply_set("save-backpressure-percent", "100", &rc),
+            SetOutcome::Applied
+        );
+        assert_eq!(rc.save_backpressure_percent(), 100);
+        // Re-set to a throttling value so the rejected sets below have a value to leave untouched.
+        assert_eq!(
+            apply_set("save-backpressure-percent", "25", &rc),
+            SetOutcome::Applied
+        );
+        // `0` is rejected (a zero-percent core budget would sleep forever).
+        assert!(matches!(
+            apply_set("save-backpressure-percent", "0", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        // Above 100 is rejected.
+        assert!(matches!(
+            apply_set("save-backpressure-percent", "101", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        // Negative / non-numeric garbage is rejected.
+        assert!(matches!(
+            apply_set("save-backpressure-percent", "-5", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        assert!(matches!(
+            apply_set("save-backpressure-percent", "abc", &rc),
+            SetOutcome::InvalidValue(_)
+        ));
+        // Every rejected set left the last accepted value (25) untouched.
+        assert_eq!(rc.save_backpressure_percent(), 25);
+        assert!(lookup("SAVE-BACKPRESSURE-PERCENT").is_some());
     }
 
     /// Area A: the 8 collection-encoding thresholds are RUNTIME-SETTABLE (were accepted-but-ignored
