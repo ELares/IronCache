@@ -468,6 +468,112 @@ async fn bgsave_backpressure_percent_is_live_settable_validated_and_still_commit
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// #576 PR-B OFF-THREAD PERSIST: a BGSAVE encodes + fsyncs its keyspace on a DEDICATED persist thread
+/// (`ic-persist-<n>`), so the serving shard stays UNCONTENDED during the dump. #571 (yield) and #578
+/// (throttle) only REDUCED the contention because the encode was still on the serving core; #576
+/// measured a 3.6s p99.9 STALL on c7g from that on-core encode+fsync. This drives LIVE writes on the
+/// SAME shard DURING an UNTHROTTLED (pct==100, the p99.9-relevant config) BGSAVE over a populated
+/// keyspace and asserts they are serviced with LOW latency THROUGHOUT -- NOT merely "eventually" like
+/// the #571 test: every op completes well UNDER the multi-second stall the on-core encode produced (a
+/// TIGHT per-op timeout, 10x tighter than the #571 test's), AND the whole batch of writes fired during
+/// the dump completes PROMPTLY (a full-keyspace on-core encode would monopolize the shard for its whole
+/// duration). The dump still commits (manifest-last crash-safety) and every pre-existing key
+/// round-trips on restart (the copy is SCAN-stable, so a key present the whole dump is captured).
+///
+/// Latency is asserted via `tokio::time::timeout` (the determinism seam forbids ad-hoc `Instant` on
+/// any path, ADR-0003; a socket-level test has no access to the shard Env clock the bench harness times
+/// through). This is a unit-scale PROXY: a small keyspace on one box cannot reproduce the c7g
+/// multi-second stall, so the ABSOLUTE p99.9 win is re-measured on c7g via scripts/bench/tail.sh. The
+/// unit assertion guards against a gross regression and pins the off-thread path (the sole save path)
+/// end to end, with GENEROUS bounds so single-box scheduling noise does not flake it.
+#[tokio::test(flavor = "current_thread")]
+async fn bgsave_off_thread_keeps_datapath_low_latency_during_dump() {
+    let dir = temp_data_dir("offthread");
+    let port = free_port();
+
+    // One shard so the whole keyspace + the dump live on shard 0 and the ops below are homed there too
+    // (they must contend with the SAME shard's dump -- the off-thread persist is what keeps them fast).
+    // A keyspace large enough that the dump spans MANY chunks and stays in-flight while the ops run.
+    let preload = 15000usize;
+    {
+        let server = run_persist_server_for_test(port, 1, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+        for i in 0..preload {
+            set(&mut c, &format!("pre-{i}"), &format!("v-{i}")).await;
+        }
+
+        // Kick the UNTHROTTLED background save; it COPIES on shard 0 and encodes+fsyncs on the persist
+        // thread OFF the serving core. The dump is now in-flight for the ops below.
+        assert_eq!(
+            cmd1(&mut c, "BGSAVE").await,
+            b"+Background saving started\r\n"
+        );
+
+        // While the dump runs, fire LIVE writes on the SAME shard. Two nested bounds assert the datapath
+        // stays uncontended: (a) each op completes within a TIGHT per-op timeout (no multi-second stall
+        // -- #576 measured 3.6s; a full-keyspace on-core encode+fsync would blow this), and (b) the
+        // WHOLE batch completes within an aggregate timeout (the shard is not monopolized for the dump's
+        // duration). We fire immediately after BGSAVE so the ops overlap the in-flight dump.
+        let live = 300usize;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for i in 0..live {
+                let key = format!("live-{i}");
+                tokio::time::timeout(Duration::from_secs(1), set(&mut c, &key, "x"))
+                    .await
+                    .expect(
+                        "a concurrent write was serviced with NO multi-second stall during BGSAVE \
+                         (the encode + fsync run off the serving core)",
+                    );
+            }
+        })
+        .await
+        .expect(
+            "the whole batch of writes DURING the dump completed promptly -- the shard was not \
+             monopolized by the encode + fsync (they run on the persist thread)",
+        );
+
+        // A live key written during the save window is served in-memory immediately.
+        assert_eq!(get_raw(&mut c, "live-0").await, bulk("x"));
+
+        // The off-thread save still COMMITS (manifest-last): poll LASTSAVE until it advances.
+        let mut advanced = false;
+        for _ in 0..600 {
+            if cmd1(&mut c, "LASTSAVE").await != b":0\r\n" {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            advanced,
+            "the off-thread BGSAVE still committed (LASTSAVE advanced)"
+        );
+
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    // The committed manifest exists, and a restart reloads EVERY pre-existing key (present for the
+    // whole dump -> captured at least once, SCAN-stable) -- the off-thread copy changed WHERE the
+    // encode runs, not the file's correctness or crash-safety.
+    assert!(dir.join("dump.manifest").exists(), "manifest committed");
+    {
+        let server = run_persist_server_for_test(port, 1, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+        for i in 0..preload {
+            assert_eq!(
+                get_raw(&mut c, &format!("pre-{i}")).await,
+                bulk(&format!("v-{i}")),
+                "pre-{i} reloaded from the off-thread snapshot"
+            );
+        }
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// With NO data_dir, persistence is OFF: SAVE/BGSAVE are the persistence-disabled no-op success
 /// fallbacks, LASTSAVE is 0, and no files are written. This is the default byte-unchanged posture.
 #[tokio::test(flavor = "current_thread")]

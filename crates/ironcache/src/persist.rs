@@ -41,6 +41,15 @@
 //!   APPROXIMATE warm-start restore point (a deliberate choice for a cache, see the
 //!   `ironcache_persist` module consistency note). The crash-safety invariant is unaffected: the
 //!   manifest is still written LAST, so a torn/partial dump is never loaded.
+//! - OFF-THREAD persist (#576 PR-B): the shard's chunk work is now ONLY a bounded COPY of its store
+//!   into an OWNED `Send` buffer; a DEDICATED per-shard OS thread (`ic-persist-<n>`) does the
+//!   seconds-long ENCODE + FSYNC of that owned copy OFF the serving core, so the datapath stays
+//!   ms-class DURING a save (the #576 p99.9 fix, which #571/#578 could only blunt). `save_shard_local`
+//!   awaits the persist thread's file-write result on a `tokio::sync::oneshot` (a cross-thread wake,
+//!   not a blocking join), so the shard keeps serving while its own dump encodes. The detached persist
+//!   thread touches ONLY the owned copy + the filesystem, never a shard cell, so the shared-nothing
+//!   DATAPATH (ADR-0002) is unaffected; and it still writes the per-shard file before the home core
+//!   commits the manifest LAST, so crash-safety is unchanged.
 //!
 //! ## Default-off (#58)
 //!
