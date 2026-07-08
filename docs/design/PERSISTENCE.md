@@ -162,6 +162,45 @@ chunks** so a `SAVE`/`BGSAVE` does not block the shard for its whole keyspace du
   file. A CRC mismatch on a shard file is treated as no-snapshot for that file, and a foreign / newer
   format version fails closed loudly (#530) rather than silently starting empty.
 
+### Save-backpressure throttle: the concurrent-snapshot p99.9 stopgap (#577)
+
+Yielding between chunks (#571) bounds the save tail, but a full-speed dump still **steals about half
+the serving core** for the length of the dump: the `c7g` tail bench measured a concurrent-snapshot
+p99.9 of ~3.6s because, once the offered load exceeds what the half-a-core datapath can drain, the
+open-loop queue **builds** for the whole save window. The `save-backpressure-percent` knob is the
+cheap, low-risk stopgap that cuts that tail (~3-4x) while the ms-class isolation fix (below) is built.
+
+- **The knob.** `save_backpressure_percent` is a runtime config value in `1..=100`, **default 100 =
+  no throttle** (a save dumps at full speed, byte-identical to the pre-#577 behavior, so the default
+  deployment is unchanged -- this is strictly opt-in). It is live-settable with
+  `CONFIG SET save-backpressure-percent <1-100>` (validated: a value outside `1..=100` is rejected,
+  never silently clamped) and reported by `CONFIG GET save-backpressure-percent`.
+
+- **The throttle.** In the per-shard dump loop (`coordinator::save_shard_local`), after each chunk the
+  loop reads the live percent and, when it is below 100, **sleeps proportionally**:
+  `sleep = chunk_time * (100 - pct) / pct`. That shares the core `pct : (100 - pct)` between the save
+  and the datapath, so the save consumes only about `pct`% of the core and the datapath throughput
+  stays **above** the offered load -- the queue drains instead of building. The per-chunk store borrow
+  is already dropped before the sleep (the no-borrow-across-await contract), so the sleep just lets the
+  shard service its queued writes. `chunk_time` is measured on the shard's **Env monotonic clock** and
+  the sleep is armed on the **Runtime timer seam** (ADR-0003), so the save path carries no `std::time`.
+  At `pct == 100` no sleep is inserted and the loop is byte-identical to the #571 yielding dump.
+
+- **The TRADEOFF (honest cost).** Throttling **stretches the save's wall-time to about `1/pct`**: at
+  `pct = 10` a ~2s dump becomes a ~20s wall-time save (the save only gets a tenth of the core). That is
+  fine at a **realistic 5-15 min save cadence** (a 20s save every 10 min is ~3% of the background
+  window, and the tail is protected the whole time), and **wrong at an aggressive every-few-seconds
+  cadence** (a 20s save on a 3s cadence never finishes before the next one is due). **The rule is
+  `save-cadence >> save-duration`**: pick a `pct` low enough to protect the tail but high enough that a
+  throttled save still completes comfortably inside the cadence. When the cadence cannot be relaxed,
+  leave the throttle at 100 (or use a milder `pct`) and rely on the isolation fix below.
+
+- **This is a STOPGAP, not the isolation fix.** The throttle reaches **hundreds-of-ms** tail under a
+  concurrent save; it does **not** deliver the **ms-class** isolation of a truly decoupled save. That
+  is the deliberate follow-up (#576 PR-B): an **epoch-cut copy-on-write** snapshot with an owned
+  `Send` point-in-time view handed to a **dedicated persist thread**, so the serving core is not shared
+  with the dump at all. The throttle buys the tail-cut cheaply until that lands.
+
 ## Open questions
 
 - Group-commit batching window for the strict tier (latency vs syscall amortization).
@@ -186,7 +225,7 @@ chunks** so a `SAVE`/`BGSAVE` does not block the shard for its whole keyspace du
 ## References
 
 - ADR-0014, ADR-0022, ADR-0023; issues #58, #60, #62, #63, #64, #66, #65, #67,
-  #34, #28, #86, #137.
+  #34, #28, #86, #137, #571, #577, #576.
 - Claims: [dragonfly-forkless-snapshot-mechanism], [dragonfly-snapshot-constant-memory],
   [dragonfly-bgsave-memory-efficiency], [redis-cow-rss-doubling],
   [garnet-storage-tier-default-off], [garnet-aof-default-off],

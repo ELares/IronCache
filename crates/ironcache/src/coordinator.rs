@@ -1139,6 +1139,72 @@ pub fn run_local_spublish(request: &Request) -> Value {
     Value::Integer(count)
 }
 
+/// The per-chunk SAVE-BACKPRESSURE sleep (#577), in microseconds: given `elapsed_us` spent doing one
+/// dump chunk's work and the configured throttle `pct` (`1..=100`), the time the save loop should
+/// then sleep so the save consumes only about `pct`% of the serving core.
+///
+/// The core is shared `pct : (100 - pct)` between the save and the datapath, so after `elapsed_us` of
+/// save work the loop yields `elapsed_us * (100 - pct) / pct` to the datapath. At `pct == 100` (the
+/// DEFAULT, no throttle) this is `0` -- the save loop keeps its byte-identical pre-#577 `yield_now`
+/// and inserts no timer sleep at all. The multiply saturates (a pathologically long chunk cannot
+/// overflow into a wrong tiny sleep); the caller only reaches the divide with `pct` in `1..=99`
+/// (`pct >= 100` takes the no-sleep branch and the registry validates the `1..=100` domain), so the
+/// `/ pct` never divides by zero. This is a pure function of its inputs (env clock reads happen at the
+/// call site) so the proportional-throttle math is unit-tested deterministically, no wall-clock race.
+#[must_use]
+fn save_throttle_sleep_us(elapsed_us: u64, pct: u64) -> u64 {
+    if pct >= 100 {
+        return 0;
+    }
+    // pct is in 1..=99 here, so `100 - pct` is 1..=99 and the divide is by a non-zero pct.
+    elapsed_us.saturating_mul(100 - pct) / pct
+}
+
+#[cfg(test)]
+mod save_throttle_tests {
+    use super::save_throttle_sleep_us;
+
+    /// #577: the DEFAULT pct==100 inserts NO sleep (byte-identical to the pre-#577 yielding dump), and
+    /// any value at/above 100 is likewise a zero throttle -- the save loop keeps its plain `yield_now`.
+    #[test]
+    fn pct_100_is_zero_sleep_byte_identical() {
+        assert_eq!(save_throttle_sleep_us(0, 100), 0);
+        assert_eq!(save_throttle_sleep_us(1_000, 100), 0);
+        assert_eq!(save_throttle_sleep_us(5_000_000, 100), 0);
+        // Defensive: a value above 100 (the registry rejects it, but the helper must not misbehave)
+        // is also a zero throttle rather than an underflow.
+        assert_eq!(save_throttle_sleep_us(1_000, 200), 0);
+    }
+
+    /// #577: below 100 the sleep is PROPORTIONAL -- the core is shared `pct : (100 - pct)`, so after
+    /// `elapsed` of save work the loop yields `elapsed * (100 - pct) / pct` to the datapath.
+    #[test]
+    fn sub_100_sleeps_proportionally() {
+        // pct=50: a 50/50 split -> sleep == elapsed (the save gets half the core).
+        assert_eq!(save_throttle_sleep_us(1_000, 50), 1_000);
+        // pct=10: the save gets a tenth -> sleep is 9x elapsed (a ~2s dump stretches to ~20s wall).
+        assert_eq!(save_throttle_sleep_us(200, 10), 1_800);
+        assert_eq!(save_throttle_sleep_us(2_000_000, 10), 18_000_000);
+        // pct=25: sleep is 3x elapsed.
+        assert_eq!(save_throttle_sleep_us(300, 25), 900);
+        // pct=1 (the most aggressive throttle): sleep is 99x elapsed.
+        assert_eq!(save_throttle_sleep_us(1_000, 1), 99_000);
+        // A zero-elapsed chunk yields a zero sleep regardless of pct (nothing to compensate for).
+        assert_eq!(save_throttle_sleep_us(0, 10), 0);
+    }
+
+    /// The multiply SATURATES: a pathologically long chunk cannot overflow into a wrong tiny sleep --
+    /// the `* (100 - pct)` clamps at `u64::MAX` and the `/ pct` then divides that saturated value
+    /// (never a panic, always a huge sleep).
+    #[test]
+    fn saturates_instead_of_overflowing() {
+        // pct=1: `* 99` saturates to u64::MAX, `/ 1` leaves it at u64::MAX.
+        assert_eq!(save_throttle_sleep_us(u64::MAX, 1), u64::MAX);
+        // pct=50: `* 50` saturates to u64::MAX, `/ 50` divides the saturated value (still enormous).
+        assert_eq!(save_throttle_sleep_us(u64::MAX, 50), u64::MAX / 50);
+    }
+}
+
 /// Run ONE shard's `__ICSAVE <save_unix_secs> <shard_index> <dir>` against THIS shard's store
 /// (#58 persistence, #571 yielding save): DUMP this shard's whole partition to
 /// `<dir>/dump-shard-<shard_index>.icss` ATOMICALLY (the forkless, memory-neutral `snapshot_chunk`
@@ -1169,7 +1235,22 @@ pub fn run_local_spublish(request: &Request) -> Value {
 /// It reads `now` from THIS shard's Env clock (the determinism seam, ADR-0003: the lazy-expiry basis
 /// the dump skips dead keys at) via a SHORT shared borrow. Produces NO counter deltas (a save is not
 /// a keyed write).
+///
+/// ## Save-backpressure throttle (#577): the concurrent-snapshot p99.9 stopgap
+///
+/// When `ctx.runtime.save_backpressure_percent()` is below 100, the loop SLEEPS proportionally after
+/// each chunk (`chunk_time * (100 - pct) / pct`, [`save_throttle_sleep_us`]) via the Runtime timer
+/// seam, so the save uses only about `pct`% of the serving core and the datapath throughput stays
+/// above the offered load (the open-loop queue drains instead of building -- the concurrent-snapshot
+/// tail lever). At the DEFAULT pct==100 NO sleep is inserted and the loop is byte-identical to the
+/// #571 yielding dump. Elapsed is measured on the Env clock, the sleep armed on the Runtime timer, so
+/// the path carries no `std::time` (ADR-0003). This is a STOPGAP (reaches hundreds-of-ms, and stretches
+/// a save's wall-time to `~1/pct`, fine only when the save CADENCE far exceeds a save's DURATION); the
+/// ms-class isolation fix is the epoch-cut COW follow-up (#576 PR-B).
 async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
+    // The `Runtime` trait for the #577 backpressure sleep's `rt.timer(..)` (the ADR-0003 timer seam);
+    // hoisted to the function top so the `use` item precedes the statements below.
+    use ironcache_runtime::Runtime;
     // Parse `__ICSAVE <save_unix_secs> <shard_index> <dir>`.
     let (Some(secs_arg), Some(shard_arg), Some(dir_arg)) = (
         request.args.get(1),
@@ -1201,22 +1282,55 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     // The database count (a short borrow, dropped immediately) bounds the outer walk.
     let databases = store_rc.borrow().databases();
 
+    // The Runtime TIMER SEAM (ADR-0003) the #577 backpressure sleep arms under, constructed the same
+    // way the periodic-save / poll loops build theirs (`TokioRuntime::timer` is the shard executor's
+    // `tokio::time::sleep`). Only the throttle branch below uses it; at the default pct==100 it is
+    // never touched.
+    let rt = ironcache_runtime::TokioRuntime::new();
+
     // Dump this shard's keyspace CHUNK BY CHUNK, releasing the store borrow + YIELDING between chunks
-    // (#571) so the shard services queued writes DURING the dump.
+    // (#571) so the shard services queued writes DURING the dump. When a SAVE-BACKPRESSURE throttle is
+    // configured (#577, `pct < 100`), sleep proportionally AFTER each chunk so the save consumes only
+    // about `pct`% of the core (the datapath stays above the offered load and the open-loop queue
+    // drains instead of building). At the DEFAULT pct==100 the loop is BYTE-IDENTICAL to #571: a plain
+    // `yield_now`, no timer sleep inserted.
     let mut builder = ironcache_persist::ShardDumpBuilder::new();
     let mut cursor = ironcache_store::SnapshotCursor::START;
     while !cursor.is_done(databases) {
+        // Read the LIVE throttle each chunk (one relaxed load, off the hot path) so a `CONFIG SET
+        // save-backpressure-percent` is honored by an in-flight save on its next chunk.
+        let pct = ctx.runtime.save_backpressure_percent();
+        // Time the chunk on THIS shard's MONOTONIC Env clock (ADR-0003, the seam #571 / SLOWLOG use --
+        // NOT std::time). Read BEFORE the store borrow so `elapsed` covers the borrow + push_chunk
+        // work; the short env borrow is dropped at the semicolon, never held across the await.
+        let chunk_start = env.borrow().now();
         let (chunk, next) = {
             // PER-CHUNK borrow: taken + dropped inside this block, so it is NOT held across the
-            // yield below (and a concurrent write can run between chunks).
+            // yield/sleep below (and a concurrent write can run between chunks).
             let store = store_rc.borrow();
             store.snapshot_chunk(cursor, ironcache_persist::DUMP_CHUNK, now)
         };
         builder.push_chunk(&chunk);
         cursor = next;
-        // Let the shard's executor service any queued writes before the next chunk (a bounded,
-        // predictable save tail instead of a full-keyspace block).
-        tokio::task::yield_now().await;
+        if pct >= 100 {
+            // DEFAULT (no throttle): byte-identical to #571 -- let the shard's executor service any
+            // queued writes before the next chunk (a bounded, predictable save tail), no timer sleep.
+            tokio::task::yield_now().await;
+        } else {
+            // Throttle: sleep proportionally so the save consumes only about `pct`% of the core. The
+            // per-chunk store borrow is ALREADY dropped (the no-borrow-across-await contract), so the
+            // sleep just lets the shard drain its queued writes. Elapsed via the Env clock, sleep via
+            // the Runtime timer seam (ADR-0003, no std::time on the path).
+            let elapsed_us = u64::try_from(
+                env.borrow()
+                    .now()
+                    .saturating_duration_since(chunk_start)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            let sleep_us = save_throttle_sleep_us(elapsed_us, pct);
+            rt.timer(std::time::Duration::from_micros(sleep_us)).await;
+        }
     }
 
     // The store borrow is already released; write the sealed file atomically (tmp -> fsync -> rename).
