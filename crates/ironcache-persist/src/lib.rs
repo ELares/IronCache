@@ -14,11 +14,12 @@
 //!   [`ironcache_store::ShardStore::snapshot_chunk`] (HA-5b #60): a resumable, constant-memory
 //!   SCAN dump that yields each live key as an owned [`ironcache_store::KvObj`]. [`dump_shard_keyspace`]
 //!   drives it chunk by chunk, so a save never double-memories the keyspace (its transient memory is
-//!   O(`DUMP_CHUNK`), not the whole keyspace). NOTE: the per-shard dump caller currently holds the
-//!   store borrow across the WHOLE dump + fsync (see [`crate::dump_shard_keyspace`] / the
-//!   coordinator), so BGSAVE BLOCKS the dumping shard for its full keyspace dump + fsync latency
-//!   (per-shard-consistent); it does NOT yield the shard between chunks. The borrow-release the
-//!   chunked iterator MAKES POSSIBLE is not exploited by the current caller.
+//!   O(`DUMP_CHUNK`), not the whole keyspace). The serve path drives it through
+//!   [`ShardDumpBuilder`], re-acquiring the store borrow PER CHUNK and `yield`ing the shard between
+//!   chunks (#571), so `SAVE`/`BGSAVE` no longer BLOCK the dumping shard for its whole keyspace dump
+//!   -- the shard services queued writes DURING the dump, a bounded/predictable save tail. (The sync
+//!   [`crate::dump_shard_keyspace`] used by this crate's tests + [`crate::save_shard_to_dir`] still
+//!   holds the borrow across the whole walk, so it stays per-shard point-in-time.)
 //! - The KvObj WIRE CODEC ([`ironcache_repl::encode_kvobj`] / [`ironcache_repl::decode_kvobj`]):
 //!   the SAME faithful, one-way-ratchet-preserving encoding the HA-7b replication full-sync uses
 //!   is reused VERBATIM as the on-disk record value, so the snapshot file and the replication
@@ -34,14 +35,28 @@
 //! written + fsync'd LAST, so a crash mid-save leaves the PRIOR good snapshot. A torn file is
 //! caught by its CRC and treated as no-snapshot (start empty), never as corrupt-load.
 //!
-//! ## Snapshot consistency: per-shard-consistent, cross-shard FUZZY
+//! ## Snapshot consistency: FUZZY (approximate warm-start restore point), by DECISION (#571)
 //!
-//! Each shard dumps its OWN partition on its OWN thread (no global lock, no fork-COW), so a shard's
-//! file is a CONSISTENT point-in-time view of THAT shard, but DIFFERENT shards dump at slightly
-//! DIFFERENT instants. The cross-shard snapshot is therefore FUZZY (not a single global
-//! point-in-time): a write that lands on shard A after A dumped but before B dumped is in B's file
-//! and not A's. This is ACCEPTABLE for a cache (no cross-key transactional durability is promised);
-//! it is NOT a fork-COW point-in-time snapshot like Redis RDB.
+//! Each shard dumps its OWN partition on its OWN thread (no global lock, no fork-COW). The serve
+//! path drives that dump chunk-by-chunk and YIELDS the shard between chunks (#571) so queued writes
+//! run DURING the dump. Two consequences, both a DELIBERATE choice for a CACHE (not an accident):
+//!
+//! - WITHIN a shard the snapshot is NO LONGER a clean point-in-time: because writes interleave
+//!   between chunks, an early chunk may hold a key's pre-write value while a late chunk holds another
+//!   key's post-write value. The walk is `scan_hash`-cursor stable (SCAN semantics), so a key present
+//!   for the WHOLE dump is captured at least once; a key created/deleted mid-dump may or may not
+//!   appear.
+//! - ACROSS shards it is also FUZZY: different shards dump at slightly different instants, so a write
+//!   landing on shard A after A dumped but before B dumped is in B's file and not A's.
+//!
+//! We ACCEPT this: IronCache is a cache, so an APPROXIMATE warm-start restore point (bounded save
+//! tail, writes never stalled behind a dump) is worth far more than a strict global point-in-time,
+//! and no cross-key transactional durability is promised. A strict point-in-time snapshot would need
+//! versioning / copy-on-write (the forkless epoch-cut serializer in SNAPSHOT.md, a much larger
+//! change) -- deliberately OUT of scope here. The CRASH-SAFETY invariant is INDEPENDENT of this
+//! fuzziness and STILL HOLDS: the manifest is written LAST (below), so a torn/partial dump is never
+//! loaded -- a restart loads a fully-committed (if fuzzy) snapshot or the prior one, never a
+//! half-written file.
 //!
 //! ## Re-shard on load (correct across a shard-count change)
 //!
@@ -79,7 +94,7 @@ use std::io;
 use std::path::Path;
 
 use ironcache_storage::{AccountingHook, EvictionHook, UnixMillis};
-use ironcache_store::{ShardStore, SnapshotCursor};
+use ironcache_store::{ShardStore, SnapshotCursor, SnapshotEntry};
 
 /// The number of keys [`dump_shard_keyspace`] EXAMINES per
 /// [`ironcache_store::ShardStore::snapshot_chunk`] call. Bounds the per-chunk owned `Vec` (and
@@ -88,10 +103,11 @@ use ironcache_store::{ShardStore, SnapshotCursor};
 /// balance: large enough to amortize the per-chunk borrow/sort overhead, small enough to bound the
 /// transient buffer.
 ///
-/// NOTE: the chunked iterator RELEASES the store borrow between chunks (so a caller COULD yield the
-/// shard between chunks), but the current per-shard dump caller holds the store borrow across the
-/// whole walk, so BGSAVE blocks the dumping shard for its full dump + fsync. The chunking still
-/// bounds memory regardless; the borrow-release is just not currently exploited for yielding.
+/// The chunked iterator RELEASES the store borrow between chunks, and the yielding save path
+/// EXPLOITS that (#571): [`ShardDumpBuilder`] lets the coordinator re-acquire the store borrow
+/// PER CHUNK and `yield` the shard between chunks, so a `SAVE`/`BGSAVE` no longer monopolizes the
+/// serving shard for its whole keyspace dump (a bounded, predictable save tail instead of a
+/// full-keyspace block). The chunking bounds memory regardless of whether the caller yields.
 pub const DUMP_CHUNK: usize = 512;
 
 /// The result of dumping one shard's keyspace to a byte buffer ([`dump_shard_keyspace`]).
@@ -117,17 +133,21 @@ pub struct ShardDump {
 /// `now` is the lazy-expiry basis: `snapshot_chunk` SKIPS a logically-dead key (so the snapshot
 /// never persists an already-expired key), exactly as SCAN does.
 ///
-/// ## Forkless + memory-neutral (NOT yield-between-chunks as used today)
+/// ## Forkless + memory-neutral (this SYNC form is per-shard-consistent; the YIELDING form is not)
 ///
 /// The chunked pull bounds the transient memory to O([`DUMP_CHUNK`]) (the per-chunk `Vec` + its
 /// `KvObj` clones), never the whole keyspace, and `snapshot_chunk` RELEASES the store borrow
 /// between chunks. The MEMORY property holds unconditionally: a `BGSAVE` or `SAVE` never doubles the
-/// shard's memory. The borrow-release between chunks MAKES IT POSSIBLE to yield the shard between
-/// chunks, but the current per-shard dump caller (the coordinator's `save_shard_local`) holds the
-/// store borrow across the WHOLE `dump_shard_keyspace` call + the fsync, so BOTH `SAVE` AND `BGSAVE`
-/// BLOCK the dumping shard for its full keyspace dump + fsync latency (per-shard-consistent). BGSAVE
-/// differs from SAVE only in not blocking the ISSUING connection (it spawns + acks immediately); it
-/// does NOT make the dump itself non-blocking on the dumping shard.
+/// shard's memory.
+///
+/// This function holds the `&store` SHARED borrow across the WHOLE walk, so it is
+/// PER-SHARD-CONSISTENT (a single point-in-time view of the shard) but BLOCKS the shard for the
+/// full dump. It is retained for the persist crate's own round-trip tests + [`save_shard_to_dir`].
+/// The SERVE path instead drives the dump chunk-by-chunk through [`ShardDumpBuilder`], re-acquiring
+/// the store borrow per chunk and `yield`ing between chunks (#571) so the shard services queued
+/// writes DURING the dump; that yielding form is NOT per-shard point-in-time (see
+/// [`ShardDumpBuilder`] and the module-level consistency note), which is the accepted warm-start
+/// tradeoff for a cache.
 ///
 /// `&S` is a SHARED borrow: the dump never mutates the store (it does not even reap the
 /// lazily-expired keys it skips, unlike a command-path read), so it is purely an observer.
@@ -137,28 +157,82 @@ pub fn dump_shard_keyspace<E: EvictionHook, A: AccountingHook>(
     shard: u32,
     now: UnixMillis,
 ) -> ShardDump {
-    let mut body = Vec::new();
-    let mut keys: u64 = 0;
+    let mut builder = ShardDumpBuilder::new();
     let databases = store.databases();
 
     let mut cursor = SnapshotCursor::START;
     while !cursor.is_done(databases) {
         let (chunk, next) = store.snapshot_chunk(cursor, DUMP_CHUNK, now);
-        for (db, _key, kv) in &chunk {
-            let encoded = ironcache_repl::encode_kvobj(kv);
-            format::put_record(&mut body, *db, &encoded);
-            keys += 1;
-        }
+        builder.push_chunk(&chunk);
         cursor = next;
     }
+    builder.finish(shard)
+}
 
-    let crc = format::crc32(&body);
-    // Prepend the file header to the record body to form the complete file bytes.
-    let mut bytes = Vec::with_capacity(format::SHARD_HEADER_LEN + body.len());
-    format::put_shard_header(&mut bytes, shard);
-    bytes.extend_from_slice(&body);
+/// INCREMENTAL builder for a shard [`ShardDump`], so the caller can drive
+/// [`ShardStore::snapshot_chunk`](ironcache_store::ShardStore::snapshot_chunk) itself and RELEASE
+/// the store borrow (and, on the serve path, `yield` the shard) BETWEEN chunks (#571). It is the
+/// chunk-at-a-time form of [`dump_shard_keyspace`]: feed each bounded chunk to [`push_chunk`], then
+/// [`finish`] to seal the file bytes + the body CRC recorded in the manifest.
+///
+/// ## Cursor stability across a released borrow (the correctness crux)
+///
+/// Because the caller releases the store borrow between chunks, a concurrent write CAN mutate the
+/// table (insert / delete / `hashbrown` resize, and post-#570 a per-slot resize) between chunks.
+/// This is SAFE and gives SCAN semantics because `snapshot_chunk` walks the RESIZE-STABLE
+/// `scan_hash` order and its cursor is the `scan_hash` THRESHOLD of the next un-examined key (NOT a
+/// table slot index): it rebuilds the sorted order from the CURRENT contents each chunk and resumes
+/// at `scan_hash >= cursor`. So a key present for the WHOLE dump (its `scan_hash` is fixed) is
+/// emitted AT LEAST ONCE; a key inserted/deleted mid-dump MAY or may not appear (acceptable). This
+/// is the SAME iterator (and the same guarantee) the replication full-sync already relies on while
+/// it awaits shipping each chunk to a replica -- the yielding save just reuses that proven
+/// mutation-tolerant walk.
+///
+/// [`push_chunk`]: ShardDumpBuilder::push_chunk
+/// [`finish`]: ShardDumpBuilder::finish
+#[derive(Debug, Default)]
+pub struct ShardDumpBuilder {
+    /// The db-tagged kvcodec record body accumulated so far (header prepended at `finish`).
+    body: Vec<u8>,
+    /// The live keys recorded so far (across all of this shard's databases).
+    keys: u64,
+}
 
-    ShardDump { bytes, keys, crc }
+impl ShardDumpBuilder {
+    /// A fresh, empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// APPEND one bounded [`ShardStore::snapshot_chunk`](ironcache_store::ShardStore::snapshot_chunk)
+    /// batch to the running dump body, encoding each yielded [`KvObj`](ironcache_store::KvObj) with
+    /// the reused [`ironcache_repl::encode_kvobj`] codec as a db-tagged record. Byte-identical to the
+    /// per-chunk work [`dump_shard_keyspace`] does inline, so the sealed file is the same whether the
+    /// caller yielded between chunks or not.
+    pub fn push_chunk(&mut self, chunk: &[SnapshotEntry]) {
+        for (db, _key, kv) in chunk {
+            let encoded = ironcache_repl::encode_kvobj(kv);
+            format::put_record(&mut self.body, *db, &encoded);
+            self.keys += 1;
+        }
+    }
+
+    /// SEAL the accumulated body into a [`ShardDump`]: prepend the file header for `shard` and
+    /// compute the body CRC recorded in the manifest (revalidated on load to detect a torn file).
+    #[must_use]
+    pub fn finish(self, shard: u32) -> ShardDump {
+        let crc = format::crc32(&self.body);
+        // Prepend the file header to the record body to form the complete file bytes.
+        let mut bytes = Vec::with_capacity(format::SHARD_HEADER_LEN + self.body.len());
+        format::put_shard_header(&mut bytes, shard);
+        bytes.extend_from_slice(&self.body);
+        ShardDump {
+            bytes,
+            keys: self.keys,
+            crc,
+        }
+    }
 }
 
 /// SAVE one shard: dump its keyspace ([`dump_shard_keyspace`]) and write the resulting file
@@ -180,6 +254,26 @@ pub fn save_shard_to_dir<E: EvictionHook, A: AccountingHook>(
     now: UnixMillis,
 ) -> io::Result<ShardManifestEntry> {
     let dump = dump_shard_keyspace(store, shard, now);
+    write_shard_dump(&dump, shard, dir)
+}
+
+/// WRITE an already-assembled shard [`ShardDump`] ATOMICALLY to
+/// `<dir>/dump-shard-<shard>.icss` (tmp -> fsync -> rename) and return its manifest entry. This is
+/// the file-write half of a save, split out of [`save_shard_to_dir`] so the YIELDING save path
+/// (#571) can build the dump INCREMENTALLY via [`ShardDumpBuilder`] with the store borrow released
+/// between chunks, then hand the sealed bytes here for the one atomic write. The manifest (the
+/// COMMIT POINT) is still written LAST by [`write_manifest`], so a crash between this per-shard
+/// write and the manifest write leaves the PRIOR committed snapshot intact.
+///
+/// # Errors
+///
+/// Returns any underlying [`io::Error`] from the atomic file write; the caller treats it as a
+/// failed save (the prior committed snapshot stays current).
+pub fn write_shard_dump(
+    dump: &ShardDump,
+    shard: u32,
+    dir: &Path,
+) -> io::Result<ShardManifestEntry> {
     let path = format::shard_path(dir, shard);
     format::write_file_atomic(&path, &dump.bytes)?;
     Ok(ShardManifestEntry {
@@ -864,5 +958,81 @@ mod tests {
             .expect("write a current-version manifest");
         assert_eq!(check_snapshot_loadable(&dir), Ok(()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #571 CURSOR STABILITY (the correctness crux): the CHUNKED dump ([`ShardDumpBuilder`] driving
+    /// [`ShardStore::snapshot_chunk`]) stays CORRECT when the table is MUTATED BETWEEN chunks. The
+    /// yielding save releases the store borrow between chunks, so a concurrent write CAN
+    /// insert/delete/RESIZE (and, post-#570, resize a per-slot table) between chunks. This test
+    /// simulates that writer: it drives the dump chunk by chunk and, between chunks, INSERTS brand-new
+    /// keys (forcing table growth/resizes) and DELETES churn keys. Every key present for the WHOLE
+    /// dump MUST be captured at least once (SCAN semantics, `scan_hash`-threshold cursor); the walk
+    /// must not panic, lose a stable key, or corrupt the file. Keys created/deleted mid-dump may or
+    /// may not appear (acceptable). This is what makes the yielding save safe.
+    #[test]
+    fn chunked_dump_survives_mutation_between_chunks() {
+        let now = UnixMillis(1_000);
+        let mut store: TestStore = ShardStore::new(2);
+
+        // The STABLE set (db 0): present for the ENTIRE dump, so every one must survive the snapshot.
+        let stable = 600usize;
+        for i in 0..stable {
+            let k = format!("stable:{i}");
+            store.insert_object(
+                0,
+                KvObj::from_bytes(k.as_bytes(), format!("v{i}").as_bytes(), None),
+            );
+        }
+        // CHURN keys (db 1) that exist at dump-start but get DELETED mid-dump.
+        for i in 0..200usize {
+            let k = format!("churn:{i}");
+            store.insert_object(1, KvObj::from_bytes(k.as_bytes(), b"x", None));
+        }
+
+        // Drive the dump CHUNK BY CHUNK (small chunk so the walk spans MANY mutation windows),
+        // mutating the store BETWEEN chunks exactly as a concurrent writer would during a yield.
+        let databases = store.databases();
+        let mut builder = ShardDumpBuilder::new();
+        let mut cursor = SnapshotCursor::START;
+        let mut chunk_no = 0u32;
+        // A generous cap: the cursor strictly advances, so this loop terminates well within it (the
+        // cap just fails loudly instead of hanging if a regression breaks cursor progress).
+        while !cursor.is_done(databases) {
+            assert!(chunk_no < 100_000, "the chunked dump must terminate");
+            let (chunk, next) = store.snapshot_chunk(cursor, 32, now);
+            builder.push_chunk(&chunk);
+            cursor = next;
+            // MUTATE between chunks (bounded to the first 40 chunks so the walk still drains): insert
+            // NEW keys (grow + resize the db-0 slot tables) and delete churn keys from db 1.
+            if chunk_no < 40 {
+                for j in 0..16u32 {
+                    let k = format!("fresh:{chunk_no}:{j}");
+                    store.insert_object(0, KvObj::from_bytes(k.as_bytes(), b"n", None));
+                }
+                let target = format!("churn:{chunk_no}");
+                store.remove_keys_where(|key| key == target.as_bytes());
+            }
+            chunk_no += 1;
+        }
+        let dump = builder.finish(0);
+
+        // The sealed file's recorded CRC matches its body (no corruption from the interleaved writes).
+        let body = format::split_shard_header(&dump.bytes, 0).expect("valid header");
+        assert_eq!(format::crc32(body), dump.crc, "recorded crc matches body");
+
+        // LOAD the snapshot; EVERY stable key must be present with its value intact (at-least-once).
+        let mut dst: TestStore = ShardStore::new(2);
+        load_body_all(&mut dst, body, now);
+        for i in 0..stable {
+            let k = format!("stable:{i}");
+            let got = dst.read(0, k.as_bytes(), now).unwrap_or_else(|| {
+                panic!("stable key {k} missing from a dump taken under concurrent mutation")
+            });
+            assert_eq!(
+                got.as_bytes(),
+                format!("v{i}").as_bytes(),
+                "{k} value intact through a mutating dump"
+            );
+        }
     }
 }
