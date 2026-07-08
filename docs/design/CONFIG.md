@@ -89,7 +89,7 @@ should set it. An empty `data_dir` is rejected at boot (a likely operator mistak
 
 ### Transparent huge pages
 
-Issue: #512. Related: ADR-0006 (allocator), [[tunability-principle]].
+Issue: #512. Related: ADR-0006 (allocator); the tunability tenet (env-dependent tradeoffs are config knobs with a safe default).
 
 The `-r 1M` random-key benchmark (and real skewed workloads) thrash the TLB: each
 GET touches a random hashbrown store-table bucket plus a random value blob, mostly
