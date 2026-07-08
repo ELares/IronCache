@@ -7766,8 +7766,11 @@ fn reject_spanning_move(
 /// ASCII; mirrors the dispatcher's own case-insensitive token handling). The classified
 /// token is used ONLY to pick a route; dispatch re-uppercases its own copy. `pub(crate)`
 /// so the [`crate::coordinator`] drain loop classifies the same way (keyed vs whole-keyspace).
-pub(crate) fn ascii_upper(b: &[u8]) -> Vec<u8> {
-    b.iter().map(u8::to_ascii_uppercase).collect()
+///
+/// Delegates to the canonical [`ironcache_server::cmd_util::ascii_upper`], whose stack-backed
+/// `UpperToken` classifies the per-command token with NO heap allocation on this hot path.
+pub(crate) fn ascii_upper(b: &[u8]) -> ironcache_server::cmd_util::UpperToken {
+    ironcache_server::cmd_util::ascii_upper(b)
 }
 
 /// Wait for a shutdown signal (SIGINT/SIGTERM) and then stop the shard set.

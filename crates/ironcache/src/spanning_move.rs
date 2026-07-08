@@ -481,9 +481,11 @@ fn group_pairs_by_owner(pairs: &[bytes::Bytes], n_shards: usize) -> Vec<(usize, 
     subreqs
 }
 
-/// ASCII-uppercase a token (the LMOVE direction parse), mirroring the server's case-handling.
-fn ascii_upper(b: &[u8]) -> Vec<u8> {
-    b.iter().map(u8::to_ascii_uppercase).collect()
+/// ASCII-uppercase a token (the LMOVE direction parse), delegating to the canonical
+/// [`ironcache_server::cmd_util::ascii_upper`] so the direction token uppercases into a stack
+/// buffer with no per-command heap allocation.
+fn ascii_upper(b: &[u8]) -> ironcache_server::cmd_util::UpperToken {
+    ironcache_server::cmd_util::ascii_upper(b)
 }
 
 /// Encode `value` for `proto` and append to `out` (the home-core encode; mirrors the serve

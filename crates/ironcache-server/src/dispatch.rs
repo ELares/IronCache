@@ -3907,10 +3907,12 @@ fn replication_info(ctx: &ServerContext) -> ReplicationInfo {
 
 // -- helpers --
 
-/// ASCII-uppercase a byte slice into an owned `Vec<u8>` for case-insensitive
-/// command matching (the command token is ASCII per RESP).
-fn ascii_upper(b: &[u8]) -> Vec<u8> {
-    b.iter().map(u8::to_ascii_uppercase).collect()
+/// ASCII-uppercase a byte slice for case-insensitive command matching (the command token is
+/// ASCII per RESP). Delegates to the canonical [`crate::cmd_util::ascii_upper`], whose
+/// stack-backed [`UpperToken`](crate::cmd_util::UpperToken) uppercases the per-command token
+/// with NO heap allocation on this dispatch hot path.
+fn ascii_upper(b: &[u8]) -> crate::cmd_util::UpperToken {
+    crate::cmd_util::ascii_upper(b)
 }
 
 /// Parse a base-10 i64 from an argument, returning `None` on any non-digit.
