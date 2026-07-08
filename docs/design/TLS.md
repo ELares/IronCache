@@ -17,10 +17,16 @@ so a reader does not take a sketch for current truth:
   RESOLVED in favor of `ring`, pinned at the workspace level for a reproducible
   musl / aarch64 static cross-build (no cmake, no C toolchain). See
   `crates/ironcache-runtime/src/tls.rs`.
-- **Certificate rotation needs a RESTART (no hot reload).** The "cert/key reload with
-  no restart" this spec proposed did NOT ship: the acceptor is built once at boot and
-  cloned onto every shard (`crates/ironcache/src/serve.rs`). Hot reload is tracked as a
-  follow-up (issue #563). Rotate with a rolling restart (`docs/TLS.md`).
+- **Client-listener cert rotation now hot-reloads on `SIGHUP` (#563); the cluster bus
+  still needs a restart.** The "cert/key reload with no restart" this spec proposed
+  shipped for the CLIENT listener: the acceptor is held behind an `ArcSwap`
+  (`crates/ironcache-runtime/src/tls.rs`, `ReloadableAcceptor`) and a `SIGHUP` handler
+  (`crates/ironcache/src/serve.rs`, `spawn_tls_reload_on_sighup`) re-reads the configured
+  cert/key and atomically swaps it in, with in-flight connections undisturbed and a bad
+  replacement rejected (old cert kept). The intra-cluster acceptor / connector are still
+  built once at boot (`raft_boot.rs`, `build_cluster_security`), so a cluster cert rotates
+  with a rolling restart; extending the swap to the bus is the remaining #563 follow-up
+  (`docs/TLS.md` section 4).
 - **Client-port mTLS did NOT ship.** The public client listener is server-auth ONLY
   (`build_acceptor` uses `with_no_client_auth()`); client identity is established by
   AUTH / ACL inside the session. Full client-cert mTLS on the client port is a
@@ -80,9 +86,10 @@ AUTH credential model (#104, runs inside the TLS session) and the full ACL engin
 
 - The listener takes a cert chain and private key from configured paths (#85).
   This spec proposed cert/key reload (a cert rotation with no restart) as a
-  hot-swappable parameter; that did NOT ship (see "Shipped status" above): the
-  acceptor is built once at boot, so rotation needs a restart today (issue #563).
-  TLS is exposed
+  hot-swappable parameter; that SHIPPED for the client listener (#563): the acceptor is
+  held behind an `ArcSwap` and a `SIGHUP` handler re-reads the paths and atomically swaps
+  the config (see "Shipped status" above). The cluster bus acceptor is still built once at
+  boot, so a cluster cert still rotates with a restart. TLS is exposed
   by making the ONE client port TLS-only when `tls = on` (plaintext clients fail the
   handshake and are dropped), rather than by sniffing TLS vs plaintext on one port.
   (This spec originally proposed a dedicated separate `tls-port` alongside the
@@ -118,8 +125,9 @@ AUTH credential model (#104, runs inside the TLS session) and the full ACL engin
 - ~~Whether mTLS ships in the first TLS build.~~ RESOLVED: client-port mTLS did NOT
   ship (server-auth only); the cluster links use CA-verified peer certs + a shared
   secret. Client-port client-cert mTLS remains a follow-up.
-- Restart-free cert rotation (hot reload): a follow-up (issue #563); today rotation
-  needs a restart.
+- ~~Restart-free cert rotation (hot reload).~~ RESOLVED for the client listener (#563):
+  `SIGHUP` re-reads the cert/key and atomically swaps the `ArcSwap`-held config. Extending
+  the same swap to the cluster bus / repl dials is the remaining follow-up.
 - Session resumption (tickets vs IDs) and whether 0-RTT is ever enabled (replay
   risk), deferred with the threat model (#142).
 
@@ -129,8 +137,9 @@ AUTH credential model (#104, runs inside the TLS session) and the full ACL engin
   and serves RESP over it; SSLv3/TLS1.0/TLS1.1 are refused
   [rustls-pure-rust-tls12-tls13]; the dependency tree links no C TLS library
   [rustls-aws-lc-rs-default-ring-alternative] (a `cargo tree` / SBOM check, #84).
-- TLS-only mode (`tls = on`) refuses a plaintext connection at the handshake. (A cert
-  rotation currently needs a restart, NOT a live reload; hot reload is issue #563.)
+- TLS-only mode (`tls = on`) refuses a plaintext connection at the handshake. (A
+  client-listener cert rotation hot-reloads on `SIGHUP` without a restart, #563; the
+  cluster bus cert still needs a restart.)
 - Server-auth-only connections succeed; the public client port does NOT verify a
   client cert (mTLS on the client port is a follow-up). The intra-cluster dial rejects
   a peer whose cert is not signed by the configured cluster CA.

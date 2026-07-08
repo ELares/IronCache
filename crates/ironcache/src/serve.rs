@@ -196,6 +196,28 @@ pub struct BootHandles {
     /// back-pressure gauge. Always present (an inbox is built for every boot); the metrics task only
     /// READS its depth, never sends. A cheap `Arc<[Sender]>` clone.
     pub inbox: coordinator::Inbox,
+    /// The hot TLS cert-reload handle (#563), `Some` only when `tls = on`. The binary installs a
+    /// SIGHUP handler ([`spawn_tls_reload_on_sighup`]) over it so the configured cert/key can be
+    /// re-read and atomically swapped WITHOUT a restart. `None` (TLS off / every plaintext boot)
+    /// arms no handler.
+    pub tls_reload: Option<TlsReloadHandle>,
+}
+
+/// The hot TLS certificate-reload handle threaded out of the boot wiring (#563): the shared
+/// [`ironcache_runtime::ReloadableAcceptor`] (the ArcSwap-published client-listener config) plus the
+/// SAME configured cert/key paths, so the binary can re-read those paths on SIGHUP and atomically
+/// publish the fresh cert. Cloning is cheap (an `Arc` bump on the acceptor + two `String` clones).
+///
+/// Only the CLIENT listener is covered here (the cert that expires + rotates in practice); the
+/// intra-cluster bus/repl TLS reload is a documented follow-up (docs/TLS.md "Certificate rotation").
+#[derive(Clone)]
+pub struct TlsReloadHandle {
+    /// The shared, swappable client-listener acceptor every shard's serve closure reads from.
+    pub acceptor: ironcache_runtime::ReloadableAcceptor,
+    /// The configured cert-chain PEM path re-read on each reload.
+    pub cert_path: String,
+    /// The configured private-key PEM path re-read on each reload.
+    pub key_path: String,
 }
 
 /// Boot the server like [`run_server`], but thread an optional [`MetricsRegistry`] through every
@@ -665,9 +687,17 @@ pub fn run_server_observed(
     // is a hard boot error: a TLS-only listener with no usable material would reject every client,
     // so we refuse to start rather than silently serve nothing. `Config::validate` already proved
     // the paths are present + readable, so this is the PEM-parse + rustls-acceptance step.
-    let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if config.tls
-        == ironcache_config::TlsMode::On
-    {
+    // The acceptor is held behind an ArcSwap (a `ReloadableAcceptor`, #563) so a SIGHUP-triggered
+    // hot cert reload can atomically PUBLISH a freshly parsed `ServerConfig` that SUBSEQUENT
+    // handshakes pick up, while in-flight connections keep theirs (rustls config is per-handshake) --
+    // rotating a soon-to-expire cert needs no restart. The boot build runs the SAME PEM-parse +
+    // rustls-acceptance validation as before; a failure here is still a hard boot error. `tls_reload`
+    // carries the SAME shared swap cell plus the configured cert/key paths out to the binary, which
+    // installs the SIGHUP handler that re-reads those paths and swaps.
+    let (tls_acceptor, tls_reload): (
+        Option<ironcache_runtime::ReloadableAcceptor>,
+        Option<TlsReloadHandle>,
+    ) = if config.tls == ironcache_config::TlsMode::On {
         // validate() guaranteed both paths are Some + readable; expressing it as a clear error here
         // keeps the boot failure precise if a future path reaches this without validation.
         let cert = config.tls_cert_path.as_ref().ok_or_else(|| {
@@ -676,17 +706,25 @@ pub fn run_server_observed(
         let key = config.tls_key_path.as_ref().ok_or_else(|| {
             anyhow::anyhow!("tls = on requires tls_key_path (should have been caught by validate)")
         })?;
-        let acceptor =
-            ironcache_runtime::build_acceptor(&cert.to_string_lossy(), &key.to_string_lossy())
-                .map_err(|e| anyhow::anyhow!("building the TLS listener: {e}"))?;
+        let cert_path = cert.to_string_lossy().into_owned();
+        let key_path = key.to_string_lossy().into_owned();
+        let acceptor = ironcache_runtime::ReloadableAcceptor::from_paths(&cert_path, &key_path)
+            .map_err(|e| anyhow::anyhow!("building the TLS listener: {e}"))?;
         tracing::info!(
             cert = %cert.display(),
             key = %key.display(),
-            "ironcache: TLS enabled (rustls, server-auth) on the client listener"
+            "ironcache: TLS enabled (rustls, server-auth) on the client listener; SIGHUP reloads the cert"
         );
-        Some(acceptor)
+        // The reload handle shares the SAME ArcSwap (a cheap `Arc` clone), so a swap it applies is
+        // seen by every shard's serve closure.
+        let reload = TlsReloadHandle {
+            acceptor: acceptor.clone(),
+            cert_path,
+            key_path,
+        };
+        (Some(acceptor), Some(reload))
     } else {
-        None
+        (None, None)
     };
 
     let serve = {
@@ -859,6 +897,7 @@ pub fn run_server_observed(
         runtime: runtime_handle,
         topology,
         inbox: inbox_for_handles,
+        tls_reload,
     })
 }
 
@@ -1471,7 +1510,7 @@ async fn serve_connection(
     mut ctx: ServerContext,
     default_proto: ProtoVersion,
     inbox: coordinator::Inbox,
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_acceptor: Option<ironcache_runtime::ReloadableAcceptor>,
     persist: Option<Arc<crate::persist::PersistState>>,
     // The per-shard graceful-shutdown flag (#543), the SAME `Arc<AtomicBool>` the acceptor and the
     // drain loop watch. The subscribe-mode idle wait races a SHORT poll of it so a connection PARKED
@@ -1499,15 +1538,22 @@ async fn serve_connection(
     // passthrough to the identical TcpStream read/write code -- the plaintext hot path is
     // byte-unchanged. The client stream's own recv/send carry the data bytes from here on.
     let mut stream = match tls_acceptor {
-        Some(acceptor) => match ironcache_runtime::accept_tls(&acceptor, tcp).await {
-            Ok(s) => s,
-            Err(_e) => {
-                // A failed handshake (a non-TLS client, an unsupported version, a truncated
-                // ClientHello): close the connection. The bytes that arrived were never RESP and
-                // never reached the engine, so there is nothing to flush -- just return.
-                return;
+        Some(reloadable) => {
+            // Read the CURRENTLY published acceptor right before the handshake (#563): a hot cert
+            // reload that swapped in a new ServerConfig is picked up by THIS new connection, while
+            // any in-flight connection keeps the config it already handshook with. A cheap lock-free
+            // ArcSwap load.
+            let acceptor = reloadable.acceptor();
+            match ironcache_runtime::accept_tls(&acceptor, tcp).await {
+                Ok(s) => s,
+                Err(_e) => {
+                    // A failed handshake (a non-TLS client, an unsupported version, a truncated
+                    // ClientHello): close the connection. The bytes that arrived were never RESP and
+                    // never reached the engine, so there is nothing to flush -- just return.
+                    return;
+                }
             }
-        },
+        }
         None => ironcache_runtime::ClientStream::plain(tcp),
     };
     let env = shard_env();
@@ -7781,6 +7827,92 @@ pub(crate) fn ascii_upper(b: &[u8]) -> ironcache_server::cmd_util::UpperToken {
 /// support on the main thread.
 pub fn install_shutdown(set: &ShardSet) -> Arc<std::sync::atomic::AtomicBool> {
     set.shutdown_flag()
+}
+
+/// Re-read the configured cert/key PEM and, if VALID, atomically swap it into the live client
+/// listener (#563 hot TLS cert reload). The SIGHUP handler calls this; a test can call it DIRECTLY
+/// (the signal handler is a thin wrapper over it) to exercise the reload hermetically.
+///
+/// This is the FAIL-SAFE point: on a bad/missing/mismatched replacement the error is returned and
+/// the PREVIOUS good config stays live (the listener is never torn down). Only the CLIENT listener
+/// is reloaded; the intra-cluster bus/repl TLS reload is a documented follow-up.
+///
+/// # Errors
+///
+/// Returns [`ironcache_runtime::TlsConfigError`] if the new material cannot be read/parsed or rustls
+/// rejects it; in that case NO swap happens and existing TLS keeps working.
+pub fn reload_client_tls(
+    handle: &TlsReloadHandle,
+) -> Result<(), ironcache_runtime::TlsConfigError> {
+    handle
+        .acceptor
+        .reload_from_paths(&handle.cert_path, &handle.key_path)
+}
+
+/// Install the SIGHUP hot cert-reload handler (#563) over the client-listener [`TlsReloadHandle`].
+///
+/// On each SIGHUP the handler re-reads the SAME configured cert/key paths and, via
+/// [`reload_client_tls`], atomically swaps the new material in so SUBSEQUENT handshakes present the
+/// fresh cert -- with no restart and no dropped existing connections (rustls config is per-handshake,
+/// so in-flight connections keep theirs). A bad replacement is LOGGED and REJECTED, keeping the
+/// previous good cert live. SIGHUP is the conventional cert/config-reload signal (nginx/haproxy),
+/// and the handler LOOPS so repeated rotations each take effect.
+///
+/// Runs on a DEDICATED thread with its own current-thread runtime (mirroring the force-stop watcher)
+/// so it handles SIGHUP CONCURRENTLY while the main thread blocks in [`wait_for_signal`] awaiting
+/// SIGINT/SIGTERM. Signal handling lives in the binary only (CLI_BINARY.md), and the reload is a
+/// boot/ops-path file read + atomic pointer swap, outside the determinism boundary (ADR-0003).
+/// A no-op off unix (SIGHUP is a unix signal).
+pub fn spawn_tls_reload_on_sighup(handle: TlsReloadHandle) {
+    #[cfg(unix)]
+    {
+        let _ = std::thread::Builder::new()
+            .name("ironcache-tls-reload".to_string())
+            .spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async move {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+                        tracing::warn!(
+                            "ironcache: could not install the SIGHUP TLS-reload handler; \
+                             cert rotation still requires a restart"
+                        );
+                        return;
+                    };
+                    tracing::info!(
+                        cert = %handle.cert_path,
+                        key = %handle.key_path,
+                        "ironcache: SIGHUP TLS cert reload armed (send SIGHUP after replacing the cert/key)"
+                    );
+                    // Loop so repeated SIGHUPs each rotate the cert. `recv` returns `None` only when
+                    // the signal stream is torn down (process exit); stop watching then.
+                    while sighup.recv().await.is_some() {
+                        match reload_client_tls(&handle) {
+                            Ok(()) => tracing::info!(
+                                cert = %handle.cert_path,
+                                key = %handle.key_path,
+                                "ironcache: TLS certificate reloaded on SIGHUP; new handshakes present the new cert (existing connections undisturbed)"
+                            ),
+                            Err(e) => tracing::error!(
+                                error = %e,
+                                cert = %handle.cert_path,
+                                key = %handle.key_path,
+                                "ironcache: TLS cert reload FAILED on SIGHUP; keeping the previous certificate"
+                            ),
+                        }
+                    }
+                });
+            });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = handle;
+    }
 }
 
 /// Block the calling (main) thread until a termination signal (SIGINT/SIGTERM) arrives, then flip

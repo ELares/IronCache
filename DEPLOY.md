@@ -296,11 +296,19 @@ the secret travels in cleartext, so TLS + secret is the recommended pairing.
 
 ### Rotating a certificate
 
-There is no hot reload: the cert/key are read once at boot. To rotate, replace the
-files and RESTART the node; in a cluster do a rolling restart (one node at a time,
-waiting for each to rejoin healthy). A node presenting a new cert signed by the same
-cluster CA is accepted by peers that have not yet rotated, so a rolling rotation needs
-no flag-day. Hot reload without a restart is tracked in #563. See
+**Client listener: hot reload on `SIGHUP` (#563), no restart.** Replace the
+`tls_cert_path` / `tls_key_path` files in place and send the node `SIGHUP`
+(`kill -HUP <pid>`). It re-reads those paths, rebuilds + validates the config, and
+atomically swaps it in: new handshakes present the new cert, existing connections are
+undisturbed. A bad or missing replacement is logged and REJECTED, keeping the previous
+good cert live (the listener is never torn down), so re-issue a valid pair and `SIGHUP`
+again.
+
+**Cluster bus (`cluster_tls`): still restart-only.** `SIGHUP` does not reload the
+intra-cluster cert. To rotate it, replace the cluster cert/key files and RESTART the
+node; in a cluster do a rolling restart (one node at a time, waiting for each to rejoin
+healthy). A node presenting a new cert signed by the same cluster CA is accepted by peers
+that have not yet rotated, so a rolling rotation needs no flag-day. See
 [`docs/TLS.md`](docs/TLS.md) for the full procedure.
 
 ---

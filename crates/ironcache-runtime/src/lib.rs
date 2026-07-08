@@ -189,7 +189,10 @@ pub use tokio_uring::net::TcpStream as UringTcpStream;
 #[cfg(feature = "tls")]
 pub mod tls;
 #[cfg(feature = "tls")]
-pub use tls::{ClientStream, HANDSHAKE_TIMEOUT, TlsConfigError, accept_tls, build_acceptor};
+pub use tls::{
+    ClientStream, HANDSHAKE_TIMEOUT, ReloadableAcceptor, TlsConfigError, accept_tls,
+    build_acceptor, build_server_config,
+};
 // Intra-cluster transport security (PROD-3): the node-to-node secure stream + the client-side
 // handshake + the shared-secret peer auth + the forged-length frame bound, reused by the Raft
 // cluster-bus and the replication transports. Behind the same `tls` feature (default ON).

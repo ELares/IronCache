@@ -327,6 +327,42 @@ pub fn run_tls_server_for_test(
     run_server(&config).expect("test TLS server failed to bind")
 }
 
+/// Like [`run_tls_server_for_test`] but ALSO returns the hot cert-reload handle (#563), so a test
+/// can drive [`crate::serve::reload_client_tls`] directly (the SIGHUP handler is a thin wrapper over
+/// it) and observe that a NEW connection picks up a swapped cert while existing TLS keeps working.
+/// Boots through [`crate::serve::run_server_observed`] (the handle-returning boot path) with no
+/// metrics endpoint.
+///
+/// # Panics
+///
+/// Panics if the config fails to validate, the server fails to bind, or (a test bug) TLS is somehow
+/// off so no reload handle was produced.
+#[must_use]
+pub fn run_tls_server_with_reload_for_test(
+    port: u16,
+    shards: usize,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) -> (ShardSet, crate::serve::TlsReloadHandle) {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        tls: TlsMode::On,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..Config::default()
+    };
+    config.validate().expect("test TLS config must validate");
+    let handles = crate::serve::run_server_observed(&config, None, None)
+        .expect("test TLS server failed to bind");
+    let reload = handles
+        .tls_reload
+        .expect("tls = on must yield a reload handle");
+    (handles.set, reload)
+}
+
 /// Boot a real CLUSTER-mode server on `127.0.0.1:port` (single shard) with a static slot
 /// `topology` and this node's `announce_id`, returning the running [`ShardSet`]
 /// (CLUSTER_CONTRACT.md #70, slice 2). The topology is shared by every node in a cluster

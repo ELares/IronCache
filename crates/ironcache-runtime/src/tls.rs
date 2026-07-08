@@ -30,6 +30,7 @@
 //! I/O seam) for exactly this reason.
 
 use crate::{IoBuf, RecvResult};
+use arc_swap::ArcSwap;
 use rustls_pki_types::pem::PemObject;
 use std::io;
 use std::net::SocketAddr;
@@ -109,13 +110,114 @@ impl std::error::Error for TlsConfigError {
 /// Returns [`TlsConfigError`] if a file cannot be read, the cert PEM has no
 /// certificate, the key PEM has no private key, or rustls rejects the pair.
 pub fn build_acceptor(cert_path: &str, key_path: &str) -> Result<RustlsAcceptor, TlsConfigError> {
+    Ok(RustlsAcceptor::from(build_server_config(
+        cert_path, key_path,
+    )?))
+}
+
+/// Parse the cert-chain + private-key PEM at `cert_path` / `key_path` into a rustls
+/// [`ServerConfig`] (the reload-friendly CORE that both [`build_acceptor`] and
+/// [`ReloadableAcceptor`] share).
+///
+/// Factored out so the hot cert reload (#563) can re-run EXACTLY the boot-time validation -- the
+/// same PEM load, the same rustls `with_single_cert` acceptance -- and only publish the result if
+/// it succeeds. Returns an owned `Arc<ServerConfig>` so the caller can either wrap it in a
+/// [`RustlsAcceptor`] once (boot) or atomically swap it behind a [`ReloadableAcceptor`] (reload).
+///
+/// # Errors
+///
+/// Returns [`TlsConfigError`] if a file cannot be read, the cert PEM has no certificate, the key
+/// PEM has no private key, or rustls rejects the pair (a mismatched cert/key).
+pub fn build_server_config(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<Arc<ServerConfig>, TlsConfigError> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(TlsConfigError::Rustls)?;
-    Ok(RustlsAcceptor::from(Arc::new(config)))
+    Ok(Arc::new(config))
+}
+
+/// A hot-reloadable TLS acceptor for the CLIENT listener: the current rustls [`ServerConfig`] held
+/// behind a lock-free [`ArcSwap`], so a certificate rotation can be applied WITHOUT a restart
+/// (#563, docs/TLS.md "Certificate rotation").
+///
+/// The boot wiring builds ONE of these from the configured cert/key PEM and clones the cheap handle
+/// (an `Arc` bump) onto every connection's serve closure, exactly as it used to clone the bare
+/// [`RustlsAcceptor`]. Each accepted connection reads the CURRENT config via [`Self::acceptor`]
+/// right before its handshake, so:
+///
+/// * a SIGHUP-triggered [`Self::reload_from_paths`] atomically PUBLISHES a freshly parsed config
+///   (a single atomic pointer store) that every SUBSEQUENT handshake picks up, while
+/// * every in-flight connection keeps the [`ServerConfig`] it already handshook with (rustls
+///   config is per-handshake), so a reload NEVER drops or disturbs an existing connection.
+///
+/// The reload is FAIL-SAFE: [`Self::reload_from_paths`] re-runs the full boot-time validation and
+/// only swaps on success; a bad/missing/mismatched replacement returns the error and leaves the
+/// previous good config live (the caller logs and keeps serving).
+///
+/// `ArcSwap`'s read side is lock-free + wait-free, so the per-accept load never contends with a
+/// shard's hot path; the store is a single atomic swap, so the rare reload never blocks an accept.
+/// The handle is `Send + Sync + Clone`, safe to share across the shard threads (ADR-0002).
+#[derive(Clone)]
+pub struct ReloadableAcceptor {
+    /// The published config. `Arc<ArcSwap<..>>` (not a bare `ArcSwap`) so [`Clone`] shares the SAME
+    /// swap cell across every shard's serve closure: a reload on the shared cell is seen by all.
+    config: Arc<ArcSwap<ServerConfig>>,
+}
+
+impl ReloadableAcceptor {
+    /// Wrap an already-built [`ServerConfig`] (the config the boot acceptor was built from).
+    #[must_use]
+    pub fn new(config: Arc<ServerConfig>) -> Self {
+        Self {
+            config: Arc::new(ArcSwap::from(config)),
+        }
+    }
+
+    /// Build from the cert/key PEM at `cert_path` / `key_path` (the BOOT path: identical validation
+    /// to [`build_acceptor`], just held reloadably).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsConfigError`] on the same faults as [`build_server_config`].
+    pub fn from_paths(cert_path: &str, key_path: &str) -> Result<Self, TlsConfigError> {
+        Ok(Self::new(build_server_config(cert_path, key_path)?))
+    }
+
+    /// The acceptor for the NEXT handshake: loads the CURRENTLY published config and wraps it in a
+    /// [`RustlsAcceptor`]. Called once per accepted connection, right before [`accept_tls`]. Cheap:
+    /// a lock-free `ArcSwap` load plus an `Arc` bump into the acceptor.
+    #[must_use]
+    pub fn acceptor(&self) -> RustlsAcceptor {
+        RustlsAcceptor::from(self.config.load_full())
+    }
+
+    /// Atomically PUBLISH a new config (the reload commit). A single atomic pointer store; every
+    /// handshake started AFTER it returns uses `config`, every in-flight one is undisturbed.
+    pub fn store(&self, config: Arc<ServerConfig>) {
+        self.config.store(config);
+    }
+
+    /// Re-read the cert/key PEM at `cert_path` / `key_path` and, only if it parses + rustls accepts
+    /// it, atomically swap it in (#563). On ANY error the CURRENT config is retained untouched (the
+    /// listener is never torn down) and the error is returned for the caller to log -- the
+    /// fail-safe the acceptance test asserts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsConfigError`] if the new material cannot be read/parsed or rustls rejects it; in
+    /// that case NO swap happens.
+    pub fn reload_from_paths(&self, cert_path: &str, key_path: &str) -> Result<(), TlsConfigError> {
+        // Build (and validate) BEFORE the swap: if this fails we return without having touched the
+        // published config, so the previous good cert stays live.
+        let config = build_server_config(cert_path, key_path)?;
+        self.store(config);
+        Ok(())
+    }
 }
 
 /// Read and parse the PEM cert CHAIN at `path` into rustls' owned DER certificates, via
@@ -774,6 +876,62 @@ mod tests {
         assert!(matches!(err, TlsConfigError::Pem { .. }), "got {err:?}");
         let _ = std::fs::remove_file(&cert);
         let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn reloadable_acceptor_swaps_config_and_keeps_old_on_bad_reload() {
+        // #563 hot cert reload: a ReloadableAcceptor built from a valid cert/key exposes a
+        // published ServerConfig; reload_from_paths with NEW valid material atomically PUBLISHES a
+        // different config (Arc pointer changes), while a reload with BAD/missing material is
+        // REJECTED and leaves the previous good config in place (fail-safe).
+        let cert = temp_pem("cert", TEST_CERT);
+        let key = temp_pem("key", TEST_KEY);
+        let ra = ReloadableAcceptor::from_paths(&cert.to_string_lossy(), &key.to_string_lossy())
+            .expect("valid cert+key builds a reloadable acceptor");
+        // The initially published config.
+        let first = ra.config.load_full();
+
+        // Reload from the SAME (still valid) material: it parses + rustls accepts it, so a NEW
+        // Arc<ServerConfig> is published (a fresh parse, so a distinct allocation).
+        ra.reload_from_paths(&cert.to_string_lossy(), &key.to_string_lossy())
+            .expect("a valid reload succeeds");
+        let second = ra.config.load_full();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a successful reload must publish a NEW config Arc"
+        );
+
+        // Reload from a MISSING cert path: rejected, and the previously published config is kept.
+        let err = ra
+            .reload_from_paths("/nonexistent/cert.pem", &key.to_string_lossy())
+            .map_err(|e| matches!(e, TlsConfigError::Io { .. }))
+            .expect_err("a missing cert must reject the reload");
+        assert!(err, "a missing cert reload must be an Io error");
+        let after_bad = ra.config.load_full();
+        assert!(
+            Arc::ptr_eq(&second, &after_bad),
+            "a rejected reload must KEEP the previous good config (fail-safe)"
+        );
+
+        // Reload from a MALFORMED cert PEM: also rejected, config still unchanged.
+        let junk = temp_pem("junkcert", "not a pem at all\n");
+        assert!(
+            ra.reload_from_paths(&junk.to_string_lossy(), &key.to_string_lossy())
+                .is_err(),
+            "a malformed cert must reject the reload"
+        );
+        assert!(
+            Arc::ptr_eq(&second, &ra.config.load_full()),
+            "a malformed reload must KEEP the previous good config"
+        );
+
+        // The acceptor handle always builds against the CURRENT (still valid) config: no panic,
+        // proving the listener is never torn down by a bad reload.
+        let _acceptor = ra.acceptor();
+
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&junk);
     }
 
     #[test]
