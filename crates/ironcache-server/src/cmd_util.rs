@@ -3,11 +3,84 @@
 //! tier and the new string/keyspace modules). Kept in one place so the command
 //! modules do not each re-roll case-folding and integer parsing.
 
-/// ASCII-uppercase a byte slice into an owned `Vec<u8>` for case-insensitive
-/// command/option matching (command and option tokens are ASCII per RESP).
+/// Inline capacity of [`UpperToken`]'s stack buffer. Every real RESP command verb,
+/// subcommand, and option token is far shorter than this (the longest internal token,
+/// `__ICCOUNTKEYSINSLOT`, is 19 bytes), so the inline path covers every hot-path
+/// uppercase; only a pathologically long token (never a real command) spills to the heap.
+const UPPER_INLINE_CAP: usize = 32;
+
+/// A stack-backed ASCII-uppercased token, the return of [`ascii_upper`].
+///
+/// The uppercased bytes live INLINE in a fixed `[u8; 32]` for the common short-token case
+/// (every real command / subcommand / option token), so uppercasing the per-command token
+/// on the dispatch hot path does ZERO heap allocation. A token longer than
+/// [`UPPER_INLINE_CAP`] (never a real command) spills to a heap `Vec` fallback.
+///
+/// Derefs to `&[u8]` and offers [`as_slice`](UpperToken::as_slice), so callers `match` /
+/// compare exactly as they did against the previous owned-`Vec<u8>` return.
+pub enum UpperToken {
+    /// The uppercased bytes held inline on the stack (`buf[..len]`).
+    Inline {
+        /// Backing storage; only the first `len` bytes are meaningful.
+        buf: [u8; UPPER_INLINE_CAP],
+        /// Number of valid bytes in `buf`.
+        len: usize,
+    },
+    /// Heap fallback for a token longer than [`UPPER_INLINE_CAP`].
+    Heap(Vec<u8>),
+}
+
+impl UpperToken {
+    /// The uppercased bytes. Use `tok.as_slice()` to `match` against byte-string literals
+    /// exactly as against the old `Vec<u8>` return.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            UpperToken::Inline { buf, len } => &buf[..*len],
+            UpperToken::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+impl core::ops::Deref for UpperToken {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq<&[u8]> for UpperToken {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.as_slice() == *other
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for UpperToken {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+/// ASCII-uppercase a byte slice for case-insensitive command/option matching (command and
+/// option tokens are ASCII per RESP), WITHOUT a per-command heap allocation.
+///
+/// The result is a stack-backed [`UpperToken`]: for the common short token (`len <= 32`,
+/// i.e. every real command) the uppercased bytes are written into an inline `[u8; 32]` with
+/// no allocation; a longer token (never a real command) spills to a heap `Vec`. Uppercasing
+/// is byte-identical to `[u8]::to_ascii_uppercase` (ASCII `a..=z` -> `A..=Z`, bytes `>= 0x80`
+/// untouched); this is a pure function (ADR-0003: no clock, no entropy).
 #[must_use]
-pub fn ascii_upper(b: &[u8]) -> Vec<u8> {
-    b.iter().map(u8::to_ascii_uppercase).collect()
+pub fn ascii_upper(b: &[u8]) -> UpperToken {
+    if b.len() <= UPPER_INLINE_CAP {
+        let mut buf = [0u8; UPPER_INLINE_CAP];
+        for (dst, &src) in buf.iter_mut().zip(b) {
+            *dst = src.to_ascii_uppercase();
+        }
+        UpperToken::Inline { buf, len: b.len() }
+    } else {
+        // Pathologically long token (never a real command): fall back to the heap.
+        UpperToken::Heap(b.iter().map(u8::to_ascii_uppercase).collect())
+    }
 }
 
 /// ASCII-lowercase a byte slice into an owned `Vec<u8>` for case-insensitive matching
@@ -223,6 +296,60 @@ pub fn parse_lex_bound(arg: &[u8]) -> Option<ironcache_storage::LexBound> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_upper_inline_is_byte_identical_to_std() {
+        // The common short-token path (inline stack buffer, zero heap alloc) must match
+        // `[u8]::to_ascii_uppercase` byte for byte: ASCII a-z -> A-Z, everything else
+        // (digits, punctuation, bytes >= 0x80) untouched.
+        for token in [
+            &b""[..],
+            b"GET",
+            b"set",
+            b"HsEt",
+            b"WITHSCORES",
+            b"__ICCOUNTKEYSINSLOT",
+            b"Key-With_Digits123",
+            b"\x00\x80\xffAbZ",
+        ] {
+            let up = ascii_upper(token);
+            assert!(matches!(up, UpperToken::Inline { .. }));
+            assert_eq!(up.as_slice(), token.to_ascii_uppercase().as_slice());
+        }
+        // A 32-byte token is the largest that still stays inline (boundary).
+        let at_cap = vec![b'a'; UPPER_INLINE_CAP];
+        let up = ascii_upper(&at_cap);
+        assert!(matches!(up, UpperToken::Inline { .. }));
+        assert_eq!(up.as_slice(), at_cap.to_ascii_uppercase().as_slice());
+    }
+
+    #[test]
+    fn ascii_upper_long_token_uses_heap_fallback() {
+        // A token longer than the inline capacity (never a real command) spills to the heap
+        // and still uppercases byte-identically.
+        let long = vec![b'z'; UPPER_INLINE_CAP + 1];
+        let up = ascii_upper(&long);
+        assert!(matches!(up, UpperToken::Heap(_)));
+        assert_eq!(up.as_slice(), vec![b'Z'; UPPER_INLINE_CAP + 1].as_slice());
+
+        // A much longer mixed token also matches std uppercasing exactly.
+        let mixed: Vec<u8> = (0u16..300).map(|n| (n % 256) as u8).collect();
+        let up = ascii_upper(&mixed);
+        assert!(matches!(up, UpperToken::Heap(_)));
+        assert_eq!(up.as_slice(), mixed.to_ascii_uppercase().as_slice());
+    }
+
+    #[test]
+    fn upper_token_compares_like_the_old_vec() {
+        // Deref + the PartialEq impls keep the call sites' `match`/`==` working unchanged.
+        let tok = ascii_upper(b"count");
+        assert_eq!(tok.as_slice(), b"COUNT");
+        assert!(tok == b"COUNT"); // PartialEq<&[u8; N]>
+        let as_bytes: &[u8] = b"COUNT";
+        assert!(tok == as_bytes); // PartialEq<&[u8]>
+        assert!(tok.eq_ignore_ascii_case(b"count")); // via Deref to [u8]
+        assert_eq!(tok.len(), 5); // via Deref
+    }
 
     #[test]
     fn parse_i64_accepts_canonical_forms_and_full_range() {

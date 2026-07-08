@@ -335,9 +335,10 @@ fn parse_sintercard(request: &Request) -> Result<(Vec<bytes::Bytes>, usize), Val
 }
 
 /// ASCII-uppercase a token (for the SINTERCARD `LIMIT` option compare). Local to the home
-/// core; mirrors the server's own token handling.
-fn ascii_upper(token: &[u8]) -> Vec<u8> {
-    token.to_ascii_uppercase()
+/// core; delegates to the canonical [`ironcache_server::cmd_util::ascii_upper`] so the
+/// option token uppercases into a stack buffer with no per-command heap allocation.
+fn ascii_upper(token: &[u8]) -> ironcache_server::cmd_util::UpperToken {
+    ironcache_server::cmd_util::ascii_upper(token)
 }
 
 /// Parse a decimal `i64` (the SINTERCARD/ZINTERCARD numkeys + LIMIT). Delegates to the
