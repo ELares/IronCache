@@ -6345,6 +6345,24 @@ fn handle_request(
     node_keyspace: Option<&[ironcache_observe::KeyspaceDbLine]>,
     out: &mut Vec<u8>,
 ) -> bool {
+    // #511 GET-BY-REFERENCE HOME FAST PATH (Dragonfly GET-gap, root cause #2). A plain 2-arg `GET`
+    // served on its OWN (home) shard is answered by encoding the RESP bulk string DIRECTLY from the
+    // stored value bytes into `out`, DROPPING the per-GET `Bytes::copy_from_slice` + the
+    // `Value::BulkString` allocation that `cmd_get` builds (the value is written store->`out` in ONE
+    // copy, ZERO heap alloc). Everything else -- a wrong-arity `GET`, every other command, and the
+    // cross-shard HOP path (whose reply must be an OWNED, `Send` `Value` crossing the coordinator
+    // channel, so it KEEPS `cmd_get`) -- falls through to the UNCHANGED `dispatch_with_cmd` below.
+    // This is a home-path-only diversion of the reply ENCODING; the router already ran the auth /
+    // subscribe-mode gates (a GET reaching here is authenticated and is not a blocked subscriber
+    // command), so bypassing dispatch's redundant backstop gates is safe. The `!conn.in_multi`
+    // guard is REQUIRED: `route_in_multi` also funnels through `handle_request` and relies on
+    // dispatch's QUEUE GATE to stage a GET inside a transaction as `+QUEUED` (NOT execute it), so an
+    // in-MULTI GET must fall through to `dispatch_with_cmd` below; only the LIVE (non-queued) home
+    // GET takes the by-ref fast path. A queued GET is replayed by `EXEC` through `dispatch`
+    // (`cmd_get`), so its reply bytes are unchanged.
+    if cmd_upper == b"GET" && request.args.len() == 2 && !conn.in_multi {
+        return get_home_by_ref(ctx, conn, env, store_rc, state_rc, &request.args[1], out);
+    }
     state_rc.borrow_mut().counters.on_command();
     // INFO ROLLUP (#531): the `# Stats`/`# Clients` counters are the NODE-WIDE sum, not this
     // serving shard's ~1/N view. The metrics registry is always present now (built at boot even
@@ -6474,6 +6492,96 @@ fn handle_request(
         }
     }
     encode_into(out, &reply, conn.proto);
+    conn.should_close
+}
+
+/// #511 GET-BY-REFERENCE HOME FAST PATH. Answer a plain 2-arg `GET` served on its home shard by
+/// framing the RESP bulk string DIRECTLY from the stored value bytes into `out`, dropping the
+/// `Bytes::copy_from_slice` + `Value::BulkString` allocation `cmd_get` pays (root cause #2 of the
+/// Dragonfly GET gap). The value bytes are written store->`out` in a SINGLE copy with ZERO heap
+/// allocation; the cross-shard HOP path is untouched (it still returns an owned `Value` via
+/// `cmd_get`, which must be `Send` to cross the coordinator channel -- a borrow cannot hop).
+///
+/// BORROW SAFETY. `store.read` returns a `ValueRef` that BORROWS the shard store (the value bytes
+/// are a `&[u8]` into the stored buffer, the #519 single-probe read). That borrow is CONSUMED here,
+/// INSIDE the `store` borrow scope, before it is released: `encode_bulk_ref` copies the bytes into
+/// the SEPARATE `out` buffer immediately, so the value ref can NEVER outlive the store borrow. A
+/// `GET` does not mutate the value; the only write `read` performs is the in-object S3-FIFO freq
+/// bump, which happens BEFORE the bytes are handed back (single `find_mut`), so the byte slice we
+/// encode cannot alias a concurrent mutation or a freed entry.
+///
+/// PARITY WITH `dispatch`. The command counter, the `keyspace_hits`/`keyspace_misses` fold, the
+/// per-command notify-flag snapshot (so a lazy-TTL `expired` event fired by `store.read` reads the
+/// CURRENT flags), and the lazy-expiry `expired_keys` drain are all reproduced so INFO + keyspace
+/// notifications stay identical. The WRONGTYPE and NULL replies reuse the EXACT `Value`s `cmd_get`
+/// returns (byte-identical). The router's post-dispatch wake + keyspace-event publish still run on
+/// the returned `close` flag, exactly as for the general path. The active timing-wheel drain and
+/// the rare maxmemory-policy hot-swap check are deliberately NOT reproduced here: neither affects a
+/// GET's reply bytes (they reap OTHER keys / swap the eviction policy), both are still driven by
+/// every non-GET command and the background reap timer, and skipping them on a read matches Redis's
+/// access-does-not-active-expire behavior. Kept as one self-contained fn so the change is trivially
+/// reversible (delete the top-of-`handle_request` branch + this fn) and cannot drift the hot path.
+fn get_home_by_ref(
+    ctx: &ServerContext,
+    conn: &mut ConnState,
+    env: &Rc<RefCell<SystemEnv>>,
+    store_rc: &Rc<RefCell<ShardStoreImpl>>,
+    state_rc: &Rc<RefCell<ShardState>>,
+    key: &[u8],
+    out: &mut Vec<u8>,
+) -> bool {
+    // The `Store` waist trait, in scope so `read` (the by-ref accessor) resolves on the concrete
+    // `ShardStoreImpl`. Local like the other inner-scope waist-trait uses in this module.
+    use ironcache_storage::{DataType, Store};
+
+    state_rc.borrow_mut().counters.on_command();
+    let now = UnixMillis(env.borrow().now_unix_millis());
+    // Snapshot the live `notify-keyspace-events` flags into this shard's per-command emit gate,
+    // EXACTLY as `dispatch_with_cmd` does, so a keyspace `expired` event fired by the lazy TTL
+    // backstop inside `store.read` below reads the CURRENT flags (not the previous command's). One
+    // relaxed atomic load + a thread-local `Cell` write; a no-op when notifications are disabled.
+    ironcache_config::notify::set_command_flags(ctx.runtime.notify_flags());
+
+    let mut deltas = CounterDeltas::default();
+    let lazy_expired;
+    {
+        let mut store = store_rc.borrow_mut();
+        match store.read(conn.db, key, now) {
+            Some(v) if v.data_type() == DataType::String => {
+                // HAPPY PATH: frame `$<len>\r\n<bytes>\r\n` straight from the stored bytes into
+                // `out` -- no `Bytes::copy_from_slice`, no `Value::BulkString`. `out` is a distinct
+                // buffer from `store`, so `v.as_bytes()` (a borrow into the store) and `&mut out` do
+                // not alias; the borrow ends at the arm boundary, inside the store scope.
+                ironcache_protocol::encode_bulk_ref(out, v.as_bytes());
+                deltas.keyspace_hits += 1;
+            }
+            Some(_) => {
+                // A non-string key: byte-identical to `cmd_get`'s WRONGTYPE reply. Rare, off the hot
+                // path. Neither a hit nor a miss (mirrors `keyspace_counted`).
+                encode_into(
+                    out,
+                    &ironcache_server::Value::error(ironcache_protocol::ErrorReply::wrong_type()),
+                    conn.proto,
+                );
+            }
+            None => {
+                // Missing OR lazily-expired: the null reply (`$-1` RESP2 / `_` RESP3), a keyspace
+                // MISS. Byte-identical to `cmd_get`'s `Value::Null`.
+                encode_into(out, &ironcache_server::Value::Null, conn.proto);
+                deltas.keyspace_misses += 1;
+            }
+        }
+        // Drain the lazy-backstop expiry count `store.read` may have produced (a GET of an expired
+        // key reaps it), inside the store scope, exactly as `handle_request` does after dispatch.
+        lazy_expired = store.take_lazy_expired();
+    }
+
+    // Fold this command's keyspace hit/miss + lazy-expiry count into the shard's counters for INFO.
+    // A cheap no-op on the common hit path with notifications/TTLs quiescent.
+    deltas.expired += lazy_expired;
+    if deltas != CounterDeltas::default() {
+        state_rc.borrow_mut().counters.apply(deltas);
+    }
     conn.should_close
 }
 
