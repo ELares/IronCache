@@ -370,6 +370,10 @@ pub fn run_home_only(
 /// holds EXACTLY its slot range (#520), this enumerates precisely the keys THIS per-shard
 /// port owns (the per-node Redis Cluster view), never the global fan-out. `home_only == false`
 /// is the Static/Raft global walk across every shard, byte-unchanged.
+// One cohesive scatter-gather over the SCAN state (cursor/count/match/type/db) plus the
+// shard-owners `home_only` scoping bit; splitting it into a params struct would just shuffle the
+// same fields. Same allowance the cluster-redirect path uses (#517 PR4).
+#[allow(clippy::too_many_arguments)]
 pub async fn scan_cross_shard(
     inbox: &Inbox,
     ctx: &ServerContext,

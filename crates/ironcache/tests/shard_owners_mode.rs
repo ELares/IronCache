@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// The per-shard-owner loops walk `0..N` because the index IS the port offset (`base + i`) and the
+// shard id, not merely a `by_shard` subscript; `enumerate()` over the vec would lose the port math.
+#![allow(clippy::needless_range_loop)]
 //! #517 shard-owners acceptance.
 //!
 //! PR2: a node booted with `cluster_mode = shard-owners` must boot into a SERVING cluster (all 16384
