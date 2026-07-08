@@ -38,20 +38,59 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // dirty pages return to the OS faster under eviction churn. The exact decay value
 // is a config knob (#85); 5 s is a sensible sub-10 s default until that lands.
 //
+// TRANSPARENT HUGE PAGES (#512). On Linux, the default-off `hugepages` Cargo
+// feature appends `thp:always,metadata_thp:auto`, so jemalloc backs its extents
+// (the per-shard hashbrown store tables AND the value blobs, all of which flow
+// through the global allocator) and its own arena metadata with 2 MiB transparent
+// huge pages via madvise(MADV_HUGEPAGE). The `-r 1M` random-key hot path touches a
+// random table bucket plus a random value per GET, so with 4 KiB pages the TLB
+// thrashes; 2 MiB pages cut the TLB-miss rate for the same coverage. This is a
+// process-wide memory HINT, not an engine decision, so it stays clear of the
+// ADR-0003 determinism boundary (no clock/RNG). It is compiled in ONLY on Linux
+// (jemalloc builds THP support on Linux and nowhere else): on macOS and other
+// targets the string stays THP-free, so there is no jemalloc "Invalid conf pair"
+// warning and the feature is inert. See docs/design/CONFIG.md ("Transparent huge
+// pages") for the RSS/latency tradeoff, why the default is OFF, and the runtime
+// override.
+//
+// TUNABILITY ([[tunability-principle]]). THP is a behavior tradeoff, so it is a
+// knob with a safe default rather than a baked-in choice. It is DEFAULT-OFF because
+// `thp:always` can raise RSS (2 MiB allocation granularity) and, on some kernels,
+// add khugepaged compaction latency spikes; keeping it off preserves an honest RSS
+// figure for the maxmemory ceiling (ADR-0006). The build-time knob is the
+// `hugepages` feature (flips the compiled default). The RUNTIME knob, which works on
+// ANY shipped binary with no rebuild, is jemalloc's own env override
+// `_RJEM_MALLOC_CONF=thp:always` (or `thp:never`): jemalloc layers it on top of this
+// static string, overriding only the `thp` key, so `background_thread`/`dirty_decay_ms`
+// stay put.
+//
 // tikv-jemalloc-sys builds jemalloc with the `_rjem_` prefix on our targets
 // (musl/macos; macOS forces prefixing), so the symbol downstream is
 // `_rjem_malloc_conf`. Same cfg-gate as the allocator so MSVC (which has no
 // jemalloc here) is unaffected.
+
+// The Linux + `hugepages` string: background purge + decay, PLUS THP on the
+// jemalloc extents and metadata (the #512 huge-page path).
+#[cfg(all(not(target_env = "msvc"), target_os = "linux", feature = "hugepages"))]
+const MALLOC_CONF_CSTR: &core::ffi::CStr =
+    c"background_thread:true,dirty_decay_ms:5000,thp:always,metadata_thp:auto";
+
+// Every other non-MSVC target/feature combination: the THP-free default. Emitting no
+// `thp:` token keeps non-Linux jemalloc (which has no THP support compiled in)
+// warning-free, and keeps THP off by default even on Linux (opt-in per the tradeoff).
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(all(target_os = "linux", feature = "hugepages"))
+))]
+const MALLOC_CONF_CSTR: &core::ffi::CStr = c"background_thread:true,dirty_decay_ms:5000";
+
 #[cfg(not(target_env = "msvc"))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: Option<&'static libc::c_char> = Some(unsafe {
-    // background_thread:true enables the async purge thread; dirty_decay_ms:5000
-    // returns dirty pages after 5 s (sub-10 s per ADR-0006). `c"..."` is a
-    // NUL-terminated C string literal; jemalloc reads this pointer at init.
-    &*c"background_thread:true,dirty_decay_ms:5000"
-        .as_ptr()
-        .cast::<libc::c_char>()
+    // `MALLOC_CONF_CSTR` is a NUL-terminated C string literal; jemalloc reads this
+    // pointer at init. Cast to the `libc::c_char` the exported symbol type requires.
+    &*MALLOC_CONF_CSTR.as_ptr().cast::<libc::c_char>()
 });
 
 fn main() -> anyhow::Result<()> {
@@ -799,5 +838,43 @@ mod tests {
         // process is ignored). This also exercises the unknown-level branch.
         install_tracing("info");
         install_tracing("nonsense");
+    }
+
+    // The exported `malloc_conf` string (#512, ADR-0006). Asserts the compile-time
+    // string always carries the ADR-0006 background-purge + decay defaults, and that
+    // the `thp:` huge-page token appears IF AND ONLY IF this is a Linux build with the
+    // default-off `hugepages` feature on. This locks in the Linux gating (no `thp:`
+    // token on non-Linux, so no jemalloc "Invalid conf pair" warning there) and the
+    // opt-in default (no `thp:` token without the feature). Gated to non-MSVC, where
+    // the `MALLOC_CONF_CSTR` const (and jemalloc itself) exist.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn malloc_conf_carries_thp_only_on_linux_with_the_hugepages_feature() {
+        let conf = MALLOC_CONF_CSTR
+            .to_str()
+            .expect("malloc_conf is valid UTF-8");
+        // The ADR-0006 defaults are always present.
+        assert!(
+            conf.contains("background_thread:true"),
+            "malloc_conf keeps the background purge thread: {conf}"
+        );
+        assert!(
+            conf.contains("dirty_decay_ms:5000"),
+            "malloc_conf keeps the sub-10 s dirty decay: {conf}"
+        );
+        // THP is present exactly when Linux AND the hugepages feature are both on.
+        let want_thp = cfg!(target_os = "linux") && cfg!(feature = "hugepages");
+        assert_eq!(
+            conf.contains("thp:always"),
+            want_thp,
+            "thp:always present iff Linux + hugepages feature (was {conf:?})"
+        );
+        // No `thp:` token at all off that path, so non-Linux jemalloc never warns.
+        if !want_thp {
+            assert!(
+                !conf.contains("thp:"),
+                "no thp token unless Linux + hugepages: {conf}"
+            );
+        }
     }
 }

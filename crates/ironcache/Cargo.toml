@@ -111,6 +111,18 @@ tracing-subscriber = { workspace = true }
 default = []
 io_uring = ["ironcache-runtime/io_uring"]
 
+# TRANSPARENT HUGE PAGES for the store tables + value blobs (#512, ADR-0006). A
+# default-OFF, Linux-only knob: when enabled it appends `thp:always,metadata_thp:auto`
+# to the compile-time jemalloc `malloc_conf` (see main.rs), so jemalloc backs its
+# extents and metadata with 2 MiB huge pages via madvise(MADV_HUGEPAGE), cutting TLB
+# misses on the `-r 1M` random-key hot path. The string only carries the `thp:` token
+# on `target_os = "linux"` (jemalloc compiles THP support there and nowhere else), so
+# turning this on for a macOS/other build is a no-op with no jemalloc warning. It is
+# DEFAULT-OFF because `thp:always` can raise RSS and add khugepaged latency on some
+# kernels (docs/design/CONFIG.md "Transparent huge pages"); the runtime override
+# `_RJEM_MALLOC_CONF=thp:always` flips it on ANY shipped binary with no rebuild.
+hugepages = []
+
 # jemalloc is the default allocator (ADR-0006, jemalloc 5.3.x). Not available on
 # MSVC Windows; gate it so the workspace still builds there (the static release
 # targets are musl/macos, where it is available). The background-purge thread,

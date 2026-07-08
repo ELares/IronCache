@@ -87,6 +87,52 @@ unset the log lives under the OS temp directory, which is writable and ephemeral
 is NOT durable across a reboot that clears the temp dir, so a production raft node
 should set it. An empty `data_dir` is rejected at boot (a likely operator mistake).
 
+### Transparent huge pages
+
+Issue: #512. Related: ADR-0006 (allocator), [[tunability-principle]].
+
+The `-r 1M` random-key benchmark (and real skewed workloads) thrash the TLB: each
+GET touches a random hashbrown store-table bucket plus a random value blob, mostly
+TLB misses with 4 KiB pages. Backing the allocator's extents with 2 MiB transparent
+huge pages (THP) cuts the TLB-miss rate for the same coverage, an estimated 3 to 10
+percent on the random-key hot path (measured on Linux, stacked with the other cheap
+levers). Because the store tables and value blobs both flow through the global
+allocator (jemalloc, ADR-0006), the cheapest effective mechanism is jemalloc's own
+`thp:always` boot option (which madvises `MADV_HUGEPAGE` on its extents) rather than
+per-allocation `madvise`, which hashbrown's global-allocator tables do not expose.
+
+THP is a memory-layout HINT, not part of the engine decision path, so it stays clear
+of the ADR-0003 determinism boundary (no clock or entropy is added). It is
+Linux-only: jemalloc compiles THP support on Linux and nowhere else, so the option is
+never emitted into `malloc_conf` on macOS or other targets (no "Invalid conf pair"
+warning; the feature is simply inert there).
+
+Per the tunability principle THP is a knob with a safe default, NOT a baked-in
+choice, because it is a real tradeoff:
+
+- Upside: fewer TLB misses on random access, and more predictable RSS granularity.
+- Downside: `thp:always` can RAISE RSS (2 MiB allocation granularity rounds small
+  extents up) and, on some kernels, khugepaged compaction adds occasional latency
+  spikes. Because the `maxmemory` ceiling is enforced against the allocator RSS
+  figure (ADR-0006), an inflated RSS is not free.
+
+The default is therefore OFF (opt-in). Two knobs control it, both defaulting off:
+
+- Build-time: the `hugepages` Cargo feature on the `ironcache` crate. Building with
+  `--features hugepages` appends `thp:always,metadata_thp:auto` to the compile-time
+  jemalloc `malloc_conf`, baking THP into that binary's default (Linux only).
+- Runtime (no rebuild, works on ANY shipped binary): jemalloc's own environment
+  override `_RJEM_MALLOC_CONF=thp:always` (or `thp:never` to force it off). jemalloc
+  layers this on top of the compiled `malloc_conf`, overriding only the `thp` key, so
+  the ADR-0006 `background_thread`/`dirty_decay_ms` defaults are preserved.
+
+Verify it is live on Linux with `grep -c AnonHugePages /proc/<pid>/smaps` (a nonzero
+huge-page total on the process maps) or by reading jemalloc's `opt.thp` mallctl (it
+reports `always` when the option was honored). It is not a TOML `CONFIG SET` key:
+jemalloc reads `malloc_conf` once at process init, before the config file is parsed,
+so THP cannot be flipped live without a restart; the env override is the operational
+knob and requires a process restart to take effect.
+
 ## Open questions
 
 - The exact hot-swappable vs restart-required parameter partition (which knobs
