@@ -33,7 +33,7 @@ workspace = true
 # build).
 default = ["tokio", "tls"]
 tokio = ["dep:tokio", "dep:socket2"]
-tls = ["tokio", "dep:tokio-rustls", "dep:rustls-pki-types"]
+tls = ["tokio", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap"]
 io_uring = ["tokio", "dep:tokio-uring", "dep:io-uring"]
 
 [dependencies]
@@ -55,6 +55,12 @@ socket2 = { workspace = true, optional = true }
 # OPTIONAL: the plaintext build pulls neither.
 tokio-rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
+# Lock-free atomic Arc publish holding the CURRENT client-listener rustls `ServerConfig`, so a
+# SIGHUP-triggered hot cert reload (#563, `ReloadableAcceptor`) can atomically swap in a freshly
+# parsed config that the NEXT handshake reads while in-flight connections keep theirs. Behind the
+# `tls` feature (never pulled by the plaintext build); pure-Rust with no transitive deps, so the
+# static musl/aarch64 build is undisturbed.
+arc-swap = { workspace = true, optional = true }
 # The OPT-IN Linux io_uring backend (PROD-10 / #28), behind the default-OFF `io_uring`
 # feature. `tokio-uring` provides a per-thread, current-thread io_uring runtime (one ring
 # per shard thread, matching the shared-nothing thread-per-core model ADR-0002) plus an

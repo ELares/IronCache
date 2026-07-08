@@ -319,6 +319,14 @@ fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
             .context("starting the metrics endpoint")?;
     }
 
+    // HOT TLS CERT RELOAD (#563): when TLS is on, arm the SIGHUP handler over the client-listener
+    // reload handle so an operator can rotate a soon-to-expire cert by replacing the configured
+    // cert/key files and sending SIGHUP -- no restart, no dropped connections. A bad replacement is
+    // logged and rejected (the previous cert stays live). `None` on a plaintext boot (no handler).
+    if let Some(tls_reload) = handles.tls_reload {
+        serve::spawn_tls_reload_on_sighup(tls_reload);
+    }
+
     let flag = serve::install_shutdown(&set);
     // Boot is complete: the process is SERVING (liveness). Readiness is NOT flipped here: the
     // synchronous boot wiring only SPAWNS the shards, whose load-on-boot runs async afterward, so

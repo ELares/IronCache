@@ -48,8 +48,11 @@ it, and the plaintext hot path is byte-unchanged when it is off.
   dials a bare TCP socket (`crates/ironcache/src/main.rs`, `cmd_cli`) and CANNOT talk
   to a TLS-only listener. Use a Redis-compatible client with TLS (for example
   `redis-cli --tls`) against a `tls = on` server.
-- **No hot certificate reload.** Rotating a cert needs a restart. See
-  "Certificate rotation" below (tracked by #563).
+- **The CLIENT listener hot-reloads its cert on `SIGHUP` (#563); the cluster bus does
+  not yet.** Replace the configured `tls_cert_path` / `tls_key_path` files and send the
+  node `SIGHUP` to rotate the client-listener cert with no restart and no dropped
+  connections. The intra-cluster (`cluster_tls`) cert still needs a restart to rotate.
+  See "Certificate rotation" below.
 
 ## 1. Generate certificates
 
@@ -180,26 +183,46 @@ pairing. Setting neither in a clustered mode triggers the unauthenticated-bus wa
 
 ## 4. Certificate rotation
 
-**Rotation currently requires a process restart. There is no hot reload.** The rustls
-acceptor / connector are built ONCE at boot and cloned onto every shard and dial
-(`crates/ironcache/src/serve.rs`, `build_acceptor`; `crates/ironcache/src/raft_boot.rs`,
-`build_cluster_security`). There is no `SIGHUP` handler and no filesystem watch for the
-cert / key / CA paths, so replacing the files on disk has NO effect until the process
-restarts and re-reads them.
+### 4.1 Client listener: hot reload on `SIGHUP` (#563)
 
-To rotate a cert:
+**The client-listener cert rotates with NO restart.** The rustls acceptor is held behind
+an atomic `ArcSwap` (`crates/ironcache-runtime/src/tls.rs`, `ReloadableAcceptor`), and the
+binary installs a `SIGHUP` handler at boot when `tls = on`
+(`crates/ironcache/src/serve.rs`, `spawn_tls_reload_on_sighup`). To rotate:
 
-1. Write the new cert + key to the configured paths.
-2. Restart the node. In a cluster, do a ROLLING restart (one node at a time), waiting
-   for each node to rejoin and report healthy before moving on, so the cluster stays
-   available. Because the cluster peer identity rests on the `cluster_secret` (and the
-   CA), a node presenting a NEW cert signed by the SAME cluster CA is accepted by peers
-   that have not yet rotated, which lets a rolling cert rotation proceed without a
-   flag-day.
+1. Write the new cert + key to the SAME configured `tls_cert_path` / `tls_key_path`.
+2. Send the node `SIGHUP` (for example `kill -HUP <pid>`, or `nginx`/`haproxy`-style from
+   your process manager).
 
-Plan rotations before expiry (a cert past its validity fails new handshakes). Hot
-reload without a restart (a `SIGHUP` or a file watch that rebuilds and atomically swaps
-the config) is tracked as a follow-up in issue #563.
+On `SIGHUP` the node re-reads those paths, rebuilds and validates the `ServerConfig`, and
+atomically publishes it. Every handshake started AFTER the reload presents the new cert;
+every in-flight connection keeps the cert it handshook with (rustls config is
+per-handshake), so **no existing connection is dropped**. The outcome is logged (a success
+line, or the failure reason).
+
+**Fail-safe:** a bad, missing, or mismatched replacement is REJECTED. The reload logs the
+error and KEEPS the previous good cert live, so a fat-fingered rotation never tears down
+the listener or breaks existing TLS. Re-issue a valid pair and `SIGHUP` again.
+
+`SIGHUP` can be sent repeatedly, so successive rotations each take effect. The reload reads
+the SAME configured paths (it does not accept new paths at runtime); to change the paths
+themselves, restart with the new config.
+
+### 4.2 Cluster bus / replication: still restart-only
+
+The intra-cluster (`cluster_tls`) acceptor + connector are still built ONCE at boot and
+cloned onto every dial / accept (`crates/ironcache/src/raft_boot.rs`,
+`build_cluster_security`); `SIGHUP` does NOT reload them (extending the same `ArcSwap`
+mechanism to the bus + repl dials is a documented follow-up). To rotate a cluster cert:
+
+1. Write the new cert + key to the configured cluster paths.
+2. Restart the node. In a cluster, do a ROLLING restart (one node at a time), waiting for
+   each node to rejoin and report healthy before moving on, so the cluster stays available.
+   Because the cluster peer identity rests on the `cluster_secret` (and the CA), a node
+   presenting a NEW cert signed by the SAME cluster CA is accepted by peers that have not
+   yet rotated, which lets a rolling cert rotation proceed without a flag-day.
+
+Plan rotations before expiry either way (a cert past its validity fails new handshakes).
 
 ## 5. Version and cipher floor
 
@@ -220,4 +243,5 @@ the config) is tracked as a follow-up in issue #563.
   `crates/ironcache/src/raft_boot.rs` + `crates/ironcache-clusterbus/src/security.rs`
   (cluster bus + repl), `crates/ironcache/src/cluster_bus.rs` (the unauthenticated-bus
   warning), `crates/ironcache-config/src/lib.rs` (the config fields).
-- Follow-up: #563 (hot cert reload without restart).
+- Hot client-listener cert reload: #563 (`ReloadableAcceptor` + `SIGHUP`); extending the
+  same swap to the cluster bus / repl dials is the remaining follow-up.

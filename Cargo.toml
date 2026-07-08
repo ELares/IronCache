@@ -114,6 +114,19 @@ socket2 = { version = "0.6", features = ["all"] }
 # engine's clock/RNG (ADR-0003), so it does not cross the determinism boundary.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pki-types = { version = "1.12", features = ["std"] }
+# Lock-free atomic Arc publish for the hot TLS certificate reload (#563, docs/TLS.md
+# "Certificate rotation"). The client-listener rustls `ServerConfig` is held behind an
+# `ArcSwap` so a SIGHUP-triggered reload atomically PUBLISHES a fresh config the next handshake
+# picks up, while in-flight connections keep the config they handshook with (rustls config is
+# per-handshake). ArcSwap's read side (`load`) is lock-free + wait-free and its store is a single
+# atomic pointer swap, so the per-accept cert read never contends and the rare reload never blocks
+# an accept. PURE RUST with NO transitive dependencies (the musl/aarch64 static build is
+# unaffected), MIT OR Apache-2.0 (already on the deny.toml license allowlist). Behind the `tls`
+# feature in ironcache-runtime, so the plaintext default build pulls it no more than it pulls
+# rustls. It lives in ironcache-runtime (the sanctioned I/O seam, ADR-0003): the swap is a
+# boot/ops-path publish, never an engine clock/entropy source, so it stays off the determinism
+# boundary.
+arc-swap = "1.7"
 # The OPT-IN Linux io_uring backend (PROD-10 / #28, docs/design/IOURING_DATAPATH.md), behind the
 # default-OFF `io_uring` feature in ironcache-runtime and target-gated to Linux there. PURE-RUST: it
 # pulls `io-uring` (raw syscall bindings, NO liburing / C library), so it does not disturb the
