@@ -29,6 +29,17 @@
 //! through verbatim ([`ScanCursor::compose`]/[`ScanCursor::decompose`] are identities at
 //! `n_shards == 1`). So every merge is the single-shard reply unchanged and the wire SCAN
 //! token is bit-identical to before this layer.
+//!
+//! ## shard-owners: HOME-ONLY scope (#526)
+//!
+//! In `cluster_mode = shard-owners` the node advertises its N internal shards as N cluster
+//! nodes (one per port). Because each shard's store holds EXACTLY its slot range (#520), a
+//! whole-keyspace command issued to shard `i`'s port must answer for shard `i` ONLY -- the
+//! per-node Redis Cluster view -- NOT the global fan-out (which would make a per-node
+//! aggregator over-count DBSIZE by N and return N copies from SCAN). The serve loop routes
+//! those commands to [`run_home_only`] (DBSIZE / KEYS / RANDOMKEY / FLUSHDB / FLUSHALL) and
+//! [`scan_cross_shard`] with `home_only` (SCAN pinned to the home shard). Static/Raft keep
+//! the global scatter-gather above (one logical keyspace), byte-unchanged.
 
 use crate::coordinator::{self, Inbox, ShardReply};
 use ironcache_env::{Env, Rng};
@@ -291,6 +302,35 @@ pub async fn fan_out_and_merge(
     encode_into(out, &merged, proto);
 }
 
+/// Serve a broadcast whole-keyspace command (DBSIZE / KEYS / RANDOMKEY / FLUSHDB / FLUSHALL)
+/// from the HOME shard ONLY -- NO fan-out (#526, shard-owners). Since the slot-owner
+/// alignment (#520) each internal shard's store holds EXACTLY the keys in its slot range, so
+/// the connecting shard's local partial IS the per-node Redis Cluster answer:
+/// - `DBSIZE`: this shard's key count (a per-node sum over the N ports equals the true total,
+///   each port distinct -- no more over-count by N).
+/// - `KEYS pattern`: only this shard's matching keys (the union across ports is the keyspace,
+///   each key once).
+/// - `RANDOMKEY`: a key OWNED by this shard (its own Env RNG seam draws it, ADR-0003), or nil
+///   if this shard is empty.
+/// - `FLUSHDB` / `FLUSHALL`: clears ONLY this shard's slice, matching a real Redis Cluster
+///   node flushing its own slots (an operator wiping the whole dataset uses a cluster-aware
+///   tool that visits every node, exactly as with Redis Cluster).
+///
+/// This is the SAME per-shard partial [`fan_out_and_merge`] runs on every shard, but for the
+/// home shard alone and encoded directly (no scatter-gather, no merge, no RNG shard-pick).
+/// Static/Raft never reach here -- they keep the global [`fan_out_and_merge`], so their single
+/// logical keyspace stays byte-unchanged.
+pub fn run_home_only(
+    ctx: &ServerContext,
+    request: &Request,
+    db: u32,
+    out: &mut Vec<u8>,
+    proto: ProtoVersion,
+) {
+    let reply = coordinator::run_local_whole_keyspace(ctx, request, db);
+    encode_into(out, &reply.value, proto);
+}
+
 /// The cross-shard `SCAN cursor [MATCH] [COUNT] [TYPE]` (COORDINATOR.md #107). SCAN routes
 /// to ONE shard per call (the current composite-cursor shard index), NOT a broadcast, so
 /// it uses a SINGLE-TARGET hop ([`dispatch_one_value`]) for the remote case and the home
@@ -320,6 +360,20 @@ pub async fn fan_out_and_merge(
 ///
 /// A malformed cursor (non-decimal / out-of-range) surfaces the canonical invalid-cursor
 /// error WITHOUT hopping (the home shard's own SCAN handler would return the same).
+///
+/// ## `home_only` (shard-owners, #526)
+///
+/// When `home_only` is set (`cluster_mode = shard-owners`), the walk is PINNED to the
+/// connecting `home` shard: the decoded cursor's shard field is IGNORED (only its inner
+/// position is used) and the scan NEVER advances to a sibling shard -- it terminates at the
+/// composite `"0"` as soon as the home shard is exhausted. Since each internal shard's store
+/// holds EXACTLY its slot range (#520), this enumerates precisely the keys THIS per-shard
+/// port owns (the per-node Redis Cluster view), never the global fan-out. `home_only == false`
+/// is the Static/Raft global walk across every shard, byte-unchanged.
+// One cohesive scatter-gather over the SCAN state (cursor/count/match/type/db) plus the
+// shard-owners `home_only` scoping bit; splitting it into a params struct would just shuffle the
+// same fields. Same allowance the cluster-redirect path uses (#517 PR4).
+#[allow(clippy::too_many_arguments)]
 pub async fn scan_cross_shard(
     inbox: &Inbox,
     ctx: &ServerContext,
@@ -328,6 +382,7 @@ pub async fn scan_cross_shard(
     home: usize,
     out: &mut Vec<u8>,
     proto: ProtoVersion,
+    home_only: bool,
 ) {
     let n_shards = inbox.len();
 
@@ -354,9 +409,17 @@ pub async fn scan_cross_shard(
         );
         return;
     };
-    let (shard_idx, inner_resume) = composite.decompose(n_shards);
+    let (decoded_shard, inner_resume) = composite.decompose(n_shards);
+    // shard-owners (#526): PIN the walk to the home shard -- ignore the cursor's shard field
+    // and only ever scan `home`, so this per-shard port enumerates its OWN slice and stops
+    // there. The inner resume is still taken from the cursor (it is `START` for the initial
+    // "0" token and the home shard's mid-scan position otherwise). In the Static/Raft global
+    // walk the decoded shard drives the cross-shard advance, unchanged.
+    let shard_idx = if home_only { home } else { decoded_shard };
     // Defensive: a composite cursor whose decoded shard index is out of range (a corrupted
     // / hand-crafted token) is treated as the invalid-cursor error rather than indexing OOB.
+    // (In `home_only` mode `shard_idx == home` is always in range, so this never fires there;
+    // a garbage inner cursor is rounded DOWN and only re-visits keys, never skips.)
     if shard_idx >= n_shards {
         encode_into(
             out,
@@ -381,7 +444,9 @@ pub async fn scan_cross_shard(
 
     // Decode the per-shard reply `[next_inner_cursor_bulkstring, [keys...]]`, rewrite the
     // inner cursor into the COMPOSITE wire cursor advancing shard-by-shard, and re-emit.
-    let merged = rewrite_scan_reply(reply_value, shard_idx, n_shards);
+    // In `home_only` mode the rewrite stays on `home` and finishes when it is exhausted
+    // (never advancing to a sibling shard).
+    let merged = rewrite_scan_reply(reply_value, shard_idx, n_shards, home_only);
     encode_into(out, &merged, proto);
 }
 
@@ -394,10 +459,14 @@ pub async fn scan_cross_shard(
 ///   LAST shard, the global-complete sentinel `"0"`.
 /// - Else stay on this shard at `compose(shard_idx, next_inner)`.
 ///
+/// When `home_only` (shard-owners, #526) the walk is PINNED to `shard_idx` (the home shard):
+/// exhausting it returns the global-complete `"0"` DIRECTLY (never advancing to a sibling),
+/// so a per-shard port enumerates ONLY its own slice and then terminates.
+///
 /// A non-array reply (a shard-unavailable Error, or a wrong-arity Error from the per-shard
 /// handler) is passed through unchanged so the client sees a well-formed error.
 #[must_use]
-fn rewrite_scan_reply(reply: Value, shard_idx: usize, n_shards: usize) -> Value {
+fn rewrite_scan_reply(reply: Value, shard_idx: usize, n_shards: usize, home_only: bool) -> Value {
     // Decompose the per-shard reply shape; anything else (an Error) passes through.
     let Value::Array(Some(items)) = reply else {
         return reply;
@@ -416,8 +485,11 @@ fn rewrite_scan_reply(reply: Value, shard_idx: usize, n_shards: usize) -> Value 
     };
 
     let composite_next = if next_inner.is_start() {
-        // This shard is fully scanned. Advance to the next shard's START, or finish.
-        if shard_idx + 1 >= n_shards {
+        // This shard is fully scanned. In `home_only` mode the walk is pinned to the home
+        // shard, so an exhausted home shard is the WHOLE per-node scan complete -> "0"
+        // (#526), never advancing to a sibling. Otherwise advance to the next shard's START,
+        // or finish if this was the last shard (the Static/Raft global walk).
+        if home_only || shard_idx + 1 >= n_shards {
             ScanCursor::START // global complete: the wire cursor "0".
         } else {
             ScanCursor::compose(shard_idx + 1, ScanCursor::START, n_shards)
@@ -616,7 +688,7 @@ mod tests {
             Value::bulk(b"0".to_vec()), // inner complete
             Value::Array(Some(vec![bulk("a")])),
         ]));
-        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 0, 3) else {
+        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 0, 3, false) else {
             panic!("expected array reply");
         };
         let Value::BulkString(Some(tok)) = &items[0] else {
@@ -636,7 +708,7 @@ mod tests {
             Value::bulk(ScanCursor(inner_hash).to_token().into_bytes()),
             Value::Array(Some(vec![bulk("x")])),
         ]));
-        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 1, 4) else {
+        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 1, 4, false) else {
             panic!("expected array reply");
         };
         let Value::BulkString(Some(tok)) = &items[0] else {
@@ -658,13 +730,52 @@ mod tests {
             Value::bulk(b"0".to_vec()),
             Value::Array(Some(vec![])),
         ]));
-        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 2, 3) else {
+        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 2, 3, false) else {
             panic!("expected array reply");
         };
         let Value::BulkString(Some(tok)) = &items[0] else {
             panic!("expected cursor bulkstring");
         };
         assert_eq!(tok.as_ref(), b"0", "last shard complete -> global cursor 0");
+    }
+
+    #[test]
+    fn scan_rewrite_home_only_stops_at_the_home_shard() {
+        // shard-owners (#526): the home shard is NOT the last shard (index 1 of 4), but with
+        // `home_only` an exhausted home shard is the whole per-node scan complete -> "0",
+        // NEVER advancing to shard 2. This is what pins a per-shard port to its own slice.
+        let per_shard = Value::Array(Some(vec![
+            Value::bulk(b"0".to_vec()), // home shard inner complete
+            Value::Array(Some(vec![bulk("a")])),
+        ]));
+        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 1, 4, true) else {
+            panic!("expected array reply");
+        };
+        let Value::BulkString(Some(tok)) = &items[0] else {
+            panic!("expected cursor bulkstring");
+        };
+        assert_eq!(
+            tok.as_ref(),
+            b"0",
+            "home_only: exhausting the home shard finishes the scan (no sibling advance)"
+        );
+
+        // Mid-scan the home_only walk STAYS on the home shard (same as the global walk): a
+        // non-zero inner cursor re-composes onto shard 1, resuming there next call.
+        let inner_hash = 0x0BAD_F00D_0000_2222u64;
+        let per_shard = Value::Array(Some(vec![
+            Value::bulk(ScanCursor(inner_hash).to_token().into_bytes()),
+            Value::Array(Some(vec![bulk("x")])),
+        ]));
+        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 1, 4, true) else {
+            panic!("expected array reply");
+        };
+        let Value::BulkString(Some(tok)) = &items[0] else {
+            panic!("expected cursor bulkstring");
+        };
+        let (shard, inner) = ScanCursor::from_token(tok).unwrap().decompose(4);
+        assert_eq!(shard, 1, "home_only stays on the home shard mid-scan");
+        assert!(!inner.is_start(), "resume mid-shard");
     }
 
     #[test]
@@ -676,7 +787,7 @@ mod tests {
             Value::bulk(ScanCursor(inner_hash).to_token().into_bytes()),
             Value::Array(Some(vec![bulk("k")])),
         ]));
-        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 0, 1) else {
+        let Value::Array(Some(items)) = rewrite_scan_reply(per_shard, 0, 1, false) else {
             panic!("expected array reply");
         };
         let Value::BulkString(Some(tok)) = &items[0] else {
@@ -690,7 +801,7 @@ mod tests {
             Value::bulk(b"0".to_vec()),
             Value::Array(Some(vec![])),
         ]));
-        let Value::Array(Some(items)) = rewrite_scan_reply(done, 0, 1) else {
+        let Value::Array(Some(items)) = rewrite_scan_reply(done, 0, 1, false) else {
             panic!("expected array reply");
         };
         let Value::BulkString(Some(tok)) = &items[0] else {
@@ -703,6 +814,9 @@ mod tests {
     fn scan_rewrite_passes_through_error_replies() {
         // A shard-unavailable / wrong-arity Error from the per-shard step passes through.
         let err = Value::error(ErrorReply::err("cross-shard target unavailable"));
-        assert!(matches!(rewrite_scan_reply(err, 0, 4), Value::Error(_)));
+        assert!(matches!(
+            rewrite_scan_reply(err, 0, 4, false),
+            Value::Error(_)
+        ));
     }
 }

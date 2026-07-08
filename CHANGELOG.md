@@ -254,13 +254,19 @@ shipped ahead of this tag.
   io_uring per-shard listeners are a follow-up) and is incompatible with systemd socket activation
   (which supplies one inherited socket, but the mode needs N distinct ports) -- both are rejected at
   boot rather than mis-bound; the per-shard port block `port .. port + shards - 1` must also fit
-  within 65535, validated at config load. KNOWN DIVERGENCE (documented, follow-up tracked): the
-  whole-keyspace commands (KEYS / SCAN / DBSIZE / RANDOMKEY / FLUSHDB / FLUSHALL) are exempt from
-  cluster redirect and fan out across ALL internal shards on WHICHEVER per-shard port they arrive at.
-  A real Redis Cluster node answers those only for ITS OWN slots, so a cluster-aware tool that
-  aggregates per node (for example a per-node DBSIZE sum) will over-count by the shard factor N. The
-  data-path semantics (keyed commands, MOVED, CROSSSLOT) match Redis Cluster; only the whole-keyspace
-  aggregation scope differs.
+  within 65535, validated at config load. The whole-keyspace commands (KEYS / SCAN / DBSIZE /
+  RANDOMKEY / FLUSHDB / FLUSHALL) are now SCOPED to the connecting shard for Redis Cluster parity
+  (#526): a command issued to shard i's port answers for shard i's slot range ONLY -- DBSIZE returns
+  that shard's count (a per-node sum over the N ports equals the true total, each port distinct, no
+  over-count by N), KEYS / SCAN enumerate only that shard's keys (the union across ports is the whole
+  keyspace, each key once, and SCAN terminates when the connecting shard is exhausted), RANDOMKEY
+  returns a key that shard owns, and FLUSHDB / FLUSHALL clear only that shard's slice (each cluster
+  node flushes its own slots). This matches how a real Redis Cluster node answers those commands for
+  ITS OWN slots, so a cluster-aware aggregator (redis_exporter, `redis-cli --cluster`, a cluster
+  client's per-node DBSIZE sum) no longer over-counts. Static / Raft mode is byte-unchanged (the
+  keyspace is one logical whole there, so the global scatter-gather across shards is correct and
+  stays). Together with the data-path semantics (keyed commands, MOVED, CROSSSLOT) the whole-keyspace
+  scope now matches Redis Cluster as well.
 
 - Benchmarks now compare against the LATEST Redis (8.x), not the distro-packaged 7.x, and the README
   gains a higher-core scaling run (16-vCPU AWS Graviton, `redis-benchmark`, Redis 8.8.0 vs IronCache
