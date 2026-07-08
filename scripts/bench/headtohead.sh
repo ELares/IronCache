@@ -37,6 +37,12 @@
 #   SMOKE=1 scripts/bench/headtohead.sh                     # fast tiny run
 #   COMPETITOR_BIN=$(command -v valkey-server) ...          # explicit competitor
 #   SERVER_CORES=0-3 CLIENT_CORES=4-9 ...                   # explicit pinning (Linux)
+#   SNAPSHOT=1 EVICT=1 scripts/bench/headtohead.sh          # the #518 moat mix (adversarial tail)
+#
+# TAIL LATENCY (#574): the open-loop pass reports p50/p99/p99.9(p999)/p99.99(p9999) OVERALL op
+# latency for each server. SNAPSHOT=1 fires a background BGSAVE during that pass so the p99.9 tail
+# CAPTURES the concurrent durable-save cost (the #518 moat proof; see docs/bench/TAIL_LATENCY.md).
+# scripts/bench/tail.sh is a thin wrapper that presets the adversarial mix.
 
 set -euo pipefail
 
@@ -84,6 +90,20 @@ MAXMEMORY="${MAXMEMORY:-4gb}"
 # The script does NOT override MAXMEMORY itself - the caller picks the low ceiling.
 EVICT="${EVICT:-0}"
 
+# CONCURRENT-SNAPSHOT mode (default OFF = the standard latency pass with no background save).
+# When SNAPSHOT=1, a background loop fires BGSAVE on the server UNDER TEST every
+# SNAPSHOT_INTERVAL_SECS DURING the open-loop latency pass, so the measured p99.9/p99.99 CAPTURES
+# the concurrent durable-save tail (the #518 moat proof: IronCache yields between snapshot chunks
+# #571 so its per-op tail stays bounded; Redis fork-COW stalls; Dragonfly snapshot-spikes). Each
+# server boots with a FRESH, PRIVATE snapshot dir (empty on boot so nothing is loaded, removed
+# after) and the save is actually enabled (IronCache: IRONCACHE_DATA_DIR; redis/valkey/keydb:
+# --dir into that private dir with BGSAVE still honored under --save ''; dragonfly: a real
+# --dbfilename). The loop fires ONCE immediately so even a sub-second SMOKE window captures at
+# least one save, then every interval. The QPS pass runs BEFORE the loop starts, so peak QPS is
+# unchanged; only the latency tail reflects the save.
+SNAPSHOT="${SNAPSHOT:-0}"
+SNAPSHOT_INTERVAL_SECS="${SNAPSHOT_INTERVAL_SECS:-3}"   # BGSAVE cadence during the open-loop pass.
+
 # The pinned competitor version (the published bar). Used to WARN on a version mismatch.
 PINNED_VALKEY_VERSION="9.1.0"
 
@@ -110,6 +130,8 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       echo "Usage: $0 [--out-dir DIR] [--smoke]" >&2
       echo "Competitor: COMPETITOR_BIN env, else valkey-server, else redis-server (stand-in)." >&2
+      echo "Env knobs incl. EVICT=1 (eviction mix) and SNAPSHOT=1 (concurrent-BGSAVE tail, #574)." >&2
+      echo "SNAPSHOT=1 EVICT=1 $0  runs the full #518 moat mix; see docs/bench/TAIL_LATENCY.md." >&2
       echo "See scripts/bench/README.md for the full knob list (env vars)." >&2
       exit 0
       ;;
@@ -140,14 +162,28 @@ if [[ "${EVICT}" == "1" ]]; then
   echo "[h2h] bytes-per-key number is not meaningful under continuous eviction."
 fi
 
+# Announce CONCURRENT-SNAPSHOT mode.
+if [[ "${SNAPSHOT}" == "1" ]]; then
+  echo "[h2h] SNAPSHOT mode ON: a background BGSAVE fires every ${SNAPSHOT_INTERVAL_SECS}s DURING the"
+  echo "[h2h] open-loop latency pass on the server under test, so the measured p99.9/p99.99 CAPTURES"
+  echo "[h2h] the concurrent durable-save tail (IronCache yields between chunks #571; Redis forks;"
+  echo "[h2h] Dragonfly snapshot-spikes). Each server boots with a fresh private snapshot dir (removed"
+  echo "[h2h] after the pass); the loop fires once immediately so even the SMOKE window sees >=1 save."
+fi
+
 # ---------------------------------------------------------------------------
 # Build the release binaries (ironcache + the bench crate, which produces loadgen).
 # ---------------------------------------------------------------------------
 echo "[h2h] building release binaries (cargo build --release -p ironcache -p ironcache-bench)..."
 cargo build --release -p ironcache -p ironcache-bench
 
-IRONCACHE_BIN="${REPO_ROOT}/target/release/ironcache"
-LOADGEN_BIN="${REPO_ROOT}/target/release/loadgen"
+# The release binaries live under Cargo's target dir. Honor CARGO_TARGET_DIR (e.g. a shared
+# container cache volume) when set; otherwise the in-tree ${REPO_ROOT}/target. This keeps the
+# default (unset) behavior byte-identical while letting a container build that redirects the
+# target dir still find the binaries.
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+IRONCACHE_BIN="${TARGET_DIR}/release/ironcache"
+LOADGEN_BIN="${TARGET_DIR}/release/loadgen"
 for b in "${IRONCACHE_BIN}" "${LOADGEN_BIN}"; do
   [[ -x "${b}" ]] || { echo "error: expected binary missing after build: ${b}" >&2; exit 1; }
 done
@@ -348,8 +384,18 @@ fi
 # ---------------------------------------------------------------------------
 SERVER_PID=""
 SERVER_LOG=""
+# SNAPSHOT mode state: the background BGSAVE loop's pid and the current server's private
+# snapshot dir. Both are cleaned by the EXIT trap so an abort mid-pass never leaks the loop
+# or the temp dir. Empty when SNAPSHOT is off.
+SNAP_PID=""
+SNAP_DIR=""
 
 cleanup() {
+  # Kill the background BGSAVE loop FIRST (before the server) so no stray BGSAVE races the kill.
+  if [[ -n "${SNAP_PID}" ]] && kill -0 "${SNAP_PID}" 2>/dev/null; then
+    kill "${SNAP_PID}" 2>/dev/null || true
+    wait "${SNAP_PID}" 2>/dev/null || true
+  fi
   if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
     kill "${SERVER_PID}" 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -359,6 +405,8 @@ cleanup() {
     kill -9 "${SERVER_PID}" 2>/dev/null || true
     wait "${SERVER_PID}" 2>/dev/null || true
   fi
+  # Best-effort remove the current server's private snapshot dir (SNAPSHOT mode).
+  [[ -n "${SNAP_DIR}" && -d "${SNAP_DIR}" ]] && rm -rf "${SNAP_DIR}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -527,6 +575,94 @@ ratio_div() {
 }
 
 # ---------------------------------------------------------------------------
+# CONCURRENT-SNAPSHOT helpers (SNAPSHOT mode). The loop fires BGSAVE on the server under test
+# DURING the open-loop latency pass so the measured tail captures the save; verify_snapshot_fired
+# then PROVES a save actually executed (not merely that BGSAVE was accepted).
+# ---------------------------------------------------------------------------
+
+# snap_lastsave: the server's LASTSAVE as a bare integer (Unix seconds of the last completed
+# save), "0" when unavailable. Works on every RESP server (redis/valkey/keydb/dragonfly/ironcache).
+snap_lastsave() {
+  local v
+  v="$(redis-cli -h "${HOST}" -p "${PORT}" LASTSAVE 2>/dev/null | tr -dc '0-9')"
+  [[ -n "${v}" ]] || v="0"
+  echo "${v}"
+}
+
+# start_snapshot_loop NAME: launch the background BGSAVE loop against the server under test.
+# Fires ONCE immediately (so even a sub-second SMOKE window captures >=1 save) then every
+# SNAPSHOT_INTERVAL_SECS. Each fire's redis-cli reply is appended to the per-server bgsave log so
+# the caller can count fires and show a reply. Sets SNAP_PID; stop_snapshot_loop tears it down.
+SNAP_BGSAVE_LOG=""
+start_snapshot_loop() {
+  local name="$1"
+  SNAP_BGSAVE_LOG="${OUT_DIR}/${name}-bgsave.log"
+  : >"${SNAP_BGSAVE_LOG}"
+  (
+    # This is a best-effort background loop: disable errexit/pipefail INSIDE the subshell so a
+    # benign BGSAVE error (e.g. "ERR Background save already in progress" when a prior save is
+    # still running, or a connection error as the server is being stopped) is just RECORDED and
+    # never aborts the loop early. The save still proceeds; stop_snapshot_loop tears it down.
+    set +e +o pipefail
+    while true; do
+      reply="$(redis-cli -h "${HOST}" -p "${PORT}" BGSAVE 2>&1 | tr -d '\r' | tr '\n' ' ')"
+      printf '%s\t%s\n' "$(date -u +%H:%M:%S)" "${reply}" >>"${SNAP_BGSAVE_LOG}"
+      sleep "${SNAPSHOT_INTERVAL_SECS}"
+    done
+  ) &
+  SNAP_PID=$!
+}
+
+# stop_snapshot_loop: kill the background BGSAVE loop and reap it. Idempotent.
+stop_snapshot_loop() {
+  if [[ -n "${SNAP_PID}" ]] && kill -0 "${SNAP_PID}" 2>/dev/null; then
+    kill "${SNAP_PID}" 2>/dev/null || true
+    wait "${SNAP_PID}" 2>/dev/null || true
+  fi
+  SNAP_PID=""
+}
+
+# verify_snapshot_fired NAME LASTSAVE_BEFORE: PROVE at least one BGSAVE EXECUTED during the pass
+# (not just that the command was accepted). Two independent, time-robust signals:
+#   (1) LASTSAVE advanced beyond the pre-pass baseline (polled up to ~10s for the async save to
+#       land). The open pass runs many wall-seconds after boot, so a completed save lands in a
+#       strictly later Unix second and LASTSAVE advances - even in SMOKE.
+#   (2) the server log contains a save-completion line (kind-specific pattern).
+# Prints a confirmation line if EITHER holds (both are reported); prints a loud WARNING otherwise.
+# Never aborts the run (the tail is still reported), but the confirmation/WARNING is explicit so a
+# SMOKE self-test can assert the save fired.
+verify_snapshot_fired() {
+  local name="$1" before="$2" kind="$3"
+  local fires after advanced=0 loghits=0 i
+  fires="$(wc -l <"${SNAP_BGSAVE_LOG}" 2>/dev/null | tr -dc '0-9')"
+  [[ -n "${fires}" ]] || fires=0
+  # (1) Poll LASTSAVE for an advance (the last BGSAVE may still be completing after the loop dies).
+  after="${before}"
+  for i in $(seq 1 50); do
+    after="$(snap_lastsave)"
+    if [[ "${after}" -gt "${before}" ]]; then advanced=1; break; fi
+    sleep 0.2
+  done
+  # (2) Grep the server log for a save-completion line (best-effort; kind-specific patterns).
+  local pat=''
+  case "${kind}" in
+    redis|valkey|keydb) pat='[Bb]ackground saving (started|terminated)|DB saved on disk|RDB.*saved' ;;
+    dragonfly)          pat='[Ss]aving|[Ss]aved.*to|snapshot|DFS?.*save' ;;
+    ironcache)          pat='[Ss]ave|[Ss]napshot|__ICSAVE|dump' ;;
+    *)                  pat='[Ss]ave|[Ss]napshot' ;;
+  esac
+  if [[ -n "${SERVER_LOG}" && -f "${SERVER_LOG}" ]]; then
+    loghits="$(grep -Ec "${pat}" "${SERVER_LOG}" 2>/dev/null || true)"
+    [[ -n "${loghits}" ]] || loghits=0
+  fi
+  if [[ "${advanced}" -eq 1 || "${loghits}" -gt 0 ]]; then
+    echo "[h2h] ${name}: SNAPSHOT CONFIRMED FIRED: BGSAVE issued ${fires}x during the pass; LASTSAVE ${before} -> ${after} (advanced=${advanced}); server-log save lines=${loghits}."
+  else
+    echo "[h2h] WARNING: ${name}: SNAPSHOT could NOT be confirmed: BGSAVE issued ${fires}x but LASTSAVE did not advance (${before} -> ${after}) and no save line in the log. The p99.9 tail may NOT reflect a concurrent save; check that this server persists on BGSAVE."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # measure_server: boot one server (pinned, persistence off, eviction off), measure
 # bytes-per-key + peak QPS + an optional open-loop latency pass, then stop it cleanly.
 # Args:
@@ -534,15 +670,20 @@ ratio_div() {
 #   $2 = kind ("ironcache" | "valkey" | "redis" | "keydb" | "dragonfly" | "memcached" |
 #        "unknown")
 # Writes the per-metric results to the global out-vars RES_QPS / RES_QPS_PER_CORE /
-# RES_BYTES_PER_KEY / RES_P50 / RES_P99 / RES_PROTOCOL (read by the caller before the next
-# server). RES_PROTOCOL is "resp" for every RESP server and "memcached-text" for the
-# memory-only memcached path, so the JSON marks memcached as memory-only / non-RESP.
+# RES_BYTES_PER_KEY / RES_P50 / RES_P99 / RES_P999 / RES_P9999 / RES_PROTOCOL (read by the caller
+# before the next server). The p50/p99/p999/p9999 are the loadgen's OVERALL open-loop op latency
+# (microseconds): the loadgen records GET and SET into ONE hdrhistogram (crates/ironcache-bench/
+# src/open_loop.rs), so there is NO GET-vs-SET percentile split - these are whole-op-mix tails.
+# RES_PROTOCOL is "resp" for every RESP server and "memcached-text" for the memory-only memcached
+# path, so the JSON marks memcached as memory-only / non-RESP.
 # ---------------------------------------------------------------------------
 RES_QPS=""
 RES_QPS_PER_CORE=""
 RES_BYTES_PER_KEY=""
 RES_P50=""
 RES_P99=""
+RES_P999=""
+RES_P9999=""
 RES_PROTOCOL=""
 
 measure_server() {
@@ -556,6 +697,16 @@ measure_server() {
   if ! port_free; then
     echo "error: ${HOST}:${PORT} is already in use before starting ${name}. Free it or set PORT=." >&2
     exit 1
+  fi
+
+  # SNAPSHOT mode: give THIS server a fresh, private, EMPTY snapshot dir so (a) nothing stale is
+  # loaded on boot (the bytes-per-key baseline stays an empty server) and (b) the BGSAVE loop has a
+  # real place to persist. Removed after the server stops (RESP path + the EXIT trap). Not used for
+  # memcached (non-RESP, no BGSAVE). Reset to "" first so a prior server's dir is not reused.
+  SNAP_DIR=""
+  if [[ "${SNAPSHOT}" == "1" && "${kind}" != "memcached" ]]; then
+    SNAP_DIR="$(mktemp -d "${OUT_DIR}/snapdir-${name}.XXXXXX")"
+    echo "[h2h] ${name}: SNAPSHOT dir ${SNAP_DIR} (fresh, private; BGSAVE persists here)."
   fi
 
   # ---------------------------------------------------------------------------
@@ -676,6 +827,8 @@ measure_server() {
     RES_BYTES_PER_KEY="${mc_bpk}"
     RES_P50="0"
     RES_P99="0"
+    RES_P999="0"
+    RES_P9999="0"
     RES_PROTOCOL="memcached-text"
     return 0
   fi
@@ -703,7 +856,17 @@ measure_server() {
     # makes it fail startup with "invalid config value for shards: not a number". Pinning
     # it to ${ic_shards} here overrides any empty inherited env so the binary always gets a
     # valid count.
-    IRONCACHE_MAXMEMORY="${MAXMEMORY}" IRONCACHE_SHARDS="${ic_shards}" \
+    # Env for the launch, built as an array so an optional IRONCACHE_DATA_DIR can be added ONLY in
+    # SNAPSHOT mode (an EMPTY IRONCACHE_DATA_DIR would wrongly enable persistence into the cwd, so it
+    # is added conditionally, never blank). IRONCACHE_DATA_DIR is the single enable switch for #58
+    # persistence: with it set (to the fresh private SNAP_DIR) a BGSAVE performs a REAL forkless,
+    # yielding (#571) cross-shard save; without it BGSAVE is the no-op persistence-disabled fallback.
+    local ic_env=("IRONCACHE_MAXMEMORY=${MAXMEMORY}" "IRONCACHE_SHARDS=${ic_shards}")
+    if [[ "${SNAPSHOT}" == "1" && -n "${SNAP_DIR}" ]]; then
+      ic_env+=("IRONCACHE_DATA_DIR=${SNAP_DIR}")
+      echo "[h2h] ${name}: SNAPSHOT persistence ON (IRONCACHE_DATA_DIR=${SNAP_DIR}; periodic save off, only the BGSAVE loop persists)."
+    fi
+    env "${ic_env[@]}" \
       ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${IRONCACHE_BIN}" \
       --port "${PORT}" --shards "${ic_shards}" server \
       >"${SERVER_LOG}" 2>&1 &
@@ -731,10 +894,18 @@ measure_server() {
       # ABORTS Dragonfly; wait_ready then surfaces the Dragonfly log with the exact reason.
       echo "[h2h] NOTE: Dragonfly requires maxmemory >= 256MiB * ${SERVER_CORE_COUNT} threads to boot; set MAXMEMORY accordingly for an eviction h2h."
     fi
+    # Snapshot file: OFF by default (empty --dbfilename, the never-persist measurement). Under
+    # SNAPSHOT a REAL dbfilename + --dir into the fresh private dir so BGSAVE actually writes a
+    # Dragonfly snapshot (and its snapshot-spike shows in the tail). gflags need the space form here.
+    local df_snap_flag=(--dbfilename '')
+    if [[ "${SNAPSHOT}" == "1" && -n "${SNAP_DIR}" ]]; then
+      df_snap_flag=(--dbfilename dump --dir "${SNAP_DIR}")
+      echo "[h2h] ${name}: SNAPSHOT persistence ON (--dbfilename dump --dir ${SNAP_DIR}; BGSAVE writes a Dragonfly snapshot)."
+    fi
     echo "[h2h] starting ${name} on ${HOST}:${PORT} (proactor_threads=${SERVER_CORE_COUNT}, maxmemory=${MAXMEMORY}, snapshots off)..."
     ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
       --port "${PORT}" --bind "${HOST}" --proactor_threads "${SERVER_CORE_COUNT}" \
-      --maxmemory "${MAXMEMORY}" --dbfilename '' --primary_port_http_enabled=false \
+      --maxmemory "${MAXMEMORY}" "${df_snap_flag[@]}" --primary_port_http_enabled=false \
       ${df_cache_flag[@]+"${df_cache_flag[@]}"} \
       >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
@@ -752,10 +923,18 @@ measure_server() {
       kdb_mem_args=(--maxmemory "${MAXMEMORY}" --maxmemory-policy allkeys-lru)
       kdb_mem_desc="maxmemory=${MAXMEMORY} policy=allkeys-lru (EVICTION mode)"
     fi
+    # SNAPSHOT: point --dir at the fresh private dir so BGSAVE's RDB lands there (manual BGSAVE
+    # still works under --save '', which only disables the AUTOMATIC change-based snapshot). Built
+    # once and reused in the initial + fallback launch so they stay in lockstep.
+    local kdb_snap_args=()
+    if [[ "${SNAPSHOT}" == "1" && -n "${SNAP_DIR}" ]]; then
+      kdb_snap_args=(--dir "${SNAP_DIR}")
+      echo "[h2h] ${name}: SNAPSHOT persistence ON (--dir ${SNAP_DIR}; BGSAVE writes an RDB there despite --save '')."
+    fi
     echo "[h2h] starting ${name} on ${HOST}:${PORT} (server-threads=${SERVER_CORE_COUNT}, ${kdb_mem_desc}, persistence off)..."
     ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
       --port "${PORT}" --bind "${HOST}" --save '' --appendonly no \
-      "${kdb_mem_args[@]}" --daemonize no --server-threads "${SERVER_CORE_COUNT}" \
+      "${kdb_mem_args[@]}" ${kdb_snap_args[@]+"${kdb_snap_args[@]}"} --daemonize no --server-threads "${SERVER_CORE_COUNT}" \
       >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
     # Defensive fallback (mirrors redis/valkey): if KeyDB rejects --server-threads and exits
@@ -768,7 +947,7 @@ measure_server() {
       if ! port_free; then sleep 0.5; fi
       ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
         --port "${PORT}" --bind "${HOST}" --save '' --appendonly no \
-        "${kdb_mem_args[@]}" --daemonize no \
+        "${kdb_mem_args[@]}" ${kdb_snap_args[@]+"${kdb_snap_args[@]}"} --daemonize no \
         >"${SERVER_LOG}" 2>&1 &
       SERVER_PID=$!
     fi
@@ -784,10 +963,18 @@ measure_server() {
       rv_mem_args=(--maxmemory "${MAXMEMORY}" --maxmemory-policy allkeys-lru)
       rv_mem_desc="maxmemory=${MAXMEMORY} policy=allkeys-lru (EVICTION mode)"
     fi
+    # SNAPSHOT: point --dir at the fresh private dir so BGSAVE's RDB (a fork-COW save) lands there.
+    # BGSAVE still works under --save '' (that only disables the AUTOMATIC change-based snapshot).
+    # Built once and reused in the initial + fallback launch so they stay in lockstep.
+    local rv_snap_args=()
+    if [[ "${SNAPSHOT}" == "1" && -n "${SNAP_DIR}" ]]; then
+      rv_snap_args=(--dir "${SNAP_DIR}")
+      echo "[h2h] ${name}: SNAPSHOT persistence ON (--dir ${SNAP_DIR}; BGSAVE fork-COW writes an RDB there despite --save '')."
+    fi
     echo "[h2h] starting ${name} on ${HOST}:${PORT} (io-threads=${SERVER_CORE_COUNT}, ${rv_mem_desc}, persistence off)..."
     ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
       --port "${PORT}" --bind "${HOST}" --save '' --appendonly no \
-      "${rv_mem_args[@]}" --daemonize no --io-threads "${SERVER_CORE_COUNT}" \
+      "${rv_mem_args[@]}" ${rv_snap_args[@]+"${rv_snap_args[@]}"} --daemonize no --io-threads "${SERVER_CORE_COUNT}" \
       >"${SERVER_LOG}" 2>&1 &
     SERVER_PID=$!
     # Detect an immediate exit caused by an unsupported flag (e.g. --io-threads) and
@@ -800,7 +987,7 @@ measure_server() {
       if ! port_free; then sleep 0.5; fi
       ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${COMPETITOR_BIN}" \
         --port "${PORT}" --bind "${HOST}" --save '' --appendonly no \
-        "${rv_mem_args[@]}" --daemonize no \
+        "${rv_mem_args[@]}" ${rv_snap_args[@]+"${rv_snap_args[@]}"} --daemonize no \
         >"${SERVER_LOG}" 2>&1 &
       SERVER_PID=$!
     fi
@@ -851,27 +1038,50 @@ measure_server() {
   qps_per_core="$(ratio_div "${qps}" "${SERVER_CORE_COUNT}")"
   echo "[h2h] ${name}: qps=${qps} qps_per_core=${qps_per_core} (over ${SERVER_CORE_COUNT} cores)"
 
-  # (e) Optional open-loop latency pass (p50/p99).
+  # (e) Optional open-loop latency pass (p50/p99/p999/p9999). Under SNAPSHOT mode a background
+  #     BGSAVE loop runs DURING this pass so the tail captures the concurrent durable save, then
+  #     verify_snapshot_fired PROVES a save executed while the server is still up.
   local open_json="${OUT_DIR}/${name}-open.json"
   local open_hgrm="${OUT_DIR}/${name}-open.hgrm"
+  local snap_lastsave_before=0
+  if [[ "${SNAPSHOT}" == "1" ]]; then
+    snap_lastsave_before="$(snap_lastsave)"   # baseline BEFORE any save fires this pass.
+    echo "[h2h] ${name}: SNAPSHOT loop starting (BGSAVE every ${SNAPSHOT_INTERVAL_SECS}s, first fire immediate; LASTSAVE baseline=${snap_lastsave_before})."
+    start_snapshot_loop "${name}"
+  fi
   echo "[h2h] ${name}: open-loop latency @ ${RATE} ops/sec..."
   run_loadgen --mode open --read-ratio "${READ_RATIO}" --duration-secs "${DURATION_SECS}" \
     --connections "${CONNECTIONS}" --rate "${RATE}" \
     --out "${open_json}" --hist "${open_hgrm}"
-  local p50 p99
+  if [[ "${SNAPSHOT}" == "1" ]]; then
+    stop_snapshot_loop
+    verify_snapshot_fired "${name}" "${snap_lastsave_before}" "${kind}"
+  fi
+  local p50 p99 p999 p9999
   p50="$(json_field "${open_json}" p50_us)"
   p99="$(json_field "${open_json}" p99_us)"
+  p999="$(json_field "${open_json}" p999_us)"
+  p9999="$(json_field "${open_json}" p9999_us)"
   [[ -n "${p50}" ]] || p50="0"
   [[ -n "${p99}" ]] || p99="0"
+  [[ -n "${p999}" ]] || p999="0"
+  [[ -n "${p9999}" ]] || p9999="0"
 
-  # (f) Stop the server cleanly and verify the port frees.
+  # (f) Stop the server cleanly and verify the port frees, then drop this server's private
+  #     snapshot dir (SNAPSHOT mode).
   stop_server "${name}"
+  if [[ -n "${SNAP_DIR}" && -d "${SNAP_DIR}" ]]; then
+    rm -rf "${SNAP_DIR}" 2>/dev/null || true
+    SNAP_DIR=""
+  fi
 
   RES_QPS="${qps}"
   RES_QPS_PER_CORE="${qps_per_core}"
   RES_BYTES_PER_KEY="${bytes_per_key}"
   RES_P50="${p50}"
   RES_P99="${p99}"
+  RES_P999="${p999}"
+  RES_P9999="${p9999}"
 }
 
 # ---------------------------------------------------------------------------
@@ -884,6 +1094,8 @@ IC_QPS_PER_CORE="${RES_QPS_PER_CORE}"
 IC_BYTES_PER_KEY="${RES_BYTES_PER_KEY}"
 IC_P50="${RES_P50}"
 IC_P99="${RES_P99}"
+IC_P999="${RES_P999}"
+IC_P9999="${RES_P9999}"
 IC_PROTOCOL="${RES_PROTOCOL}"
 
 measure_server "${COMPETITOR_NAME}" "${COMPETITOR_KIND}"
@@ -892,6 +1104,8 @@ CO_QPS_PER_CORE="${RES_QPS_PER_CORE}"
 CO_BYTES_PER_KEY="${RES_BYTES_PER_KEY}"
 CO_P50="${RES_P50}"
 CO_P99="${RES_P99}"
+CO_P999="${RES_P999}"
+CO_P9999="${RES_P9999}"
 CO_PROTOCOL="${RES_PROTOCOL}"
 
 # ---------------------------------------------------------------------------
@@ -908,6 +1122,11 @@ if [[ "${CO_PROTOCOL}" == "memcached-text" ]]; then MEMORY_ONLY=1; fi
 
 QPS_RATIO="$(ratio_div "${IC_QPS_PER_CORE}" "${CO_QPS_PER_CORE}")"           # ic / competitor; >1 is good.
 BYTES_RATIO="$(ratio_div "${IC_BYTES_PER_KEY}" "${CO_BYTES_PER_KEY}")"       # ic / competitor; <1 is good.
+# The #518 MOAT ratio: the p99.9 (p999) tail, ic/competitor. <1 means IronCache's tail is TIGHTER
+# than the competitor's - the metric to win under the adversarial mix (mixed + skew + evict + snapshot).
+# This is REPORTED, not a pass/fail gate (the ADR-0017 verdict stays qps-per-core + bytes-per-key).
+P999_RATIO="$(ratio_div "${IC_P999}" "${CO_P999}")"
+P9999_RATIO="$(ratio_div "${IC_P9999}" "${CO_P9999}")"
 
 BYTES_VERDICT="FAIL"
 if awk -v a="${IC_BYTES_PER_KEY}" -v b="${CO_BYTES_PER_KEY}" 'BEGIN { exit !(a < b) }'; then
@@ -943,6 +1162,7 @@ if [[ "${PINNED}" -eq 1 ]]; then PINNED_BOOL="true"; else PINNED_BOOL="false"; f
 if [[ "${SMOKE}" == "1" ]]; then SMOKE_BOOL="true"; else SMOKE_BOOL="false"; fi
 if [[ "${STANDIN}" -eq 1 ]]; then STANDIN_BOOL="true"; else STANDIN_BOOL="false"; fi
 if [[ "${EVICT}" == "1" ]]; then EVICT_BOOL="true"; else EVICT_BOOL="false"; fi
+if [[ "${SNAPSHOT}" == "1" ]]; then SNAPSHOT_BOOL="true"; else SNAPSHOT_BOOL="false"; fi
 # indicative_only is the CONSERVATIVE headline flag: the verdict is non-authoritative
 # if the competitor was a stand-in / version mismatch (STANDIN), OR the run was SMOKE
 # (tiny, not publishable), OR it was UNPINNED (no disjoint server/client cores). A
@@ -993,7 +1213,9 @@ cat >"${H2H_JSON}" <<EOF
     "rate": ${RATE},
     "port": ${PORT},
     "ironcache_maxmemory": "${MAXMEMORY}",
-    "eviction": ${EVICT_BOOL}
+    "eviction": ${EVICT_BOOL},
+    "snapshot": ${SNAPSHOT_BOOL},
+    "snapshot_interval_secs": ${SNAPSHOT_INTERVAL_SECS}
   },
   "competitor_resolution": {
     "binary": "${COMPETITOR_BIN_ESC}",
@@ -1011,7 +1233,9 @@ cat >"${H2H_JSON}" <<EOF
       "qps_per_core": ${IC_QPS_PER_CORE},
       "bytes_per_key": ${IC_BYTES_PER_KEY},
       "p50_us": ${IC_P50},
-      "p99_us": ${IC_P99}
+      "p99_us": ${IC_P99},
+      "p999_us": ${IC_P999},
+      "p9999_us": ${IC_P9999}
     },
     "competitor": {
       "name": "${COMPETITOR_NAME}",
@@ -1021,12 +1245,16 @@ cat >"${H2H_JSON}" <<EOF
       "qps_per_core": ${CO_QPS_PER_CORE},
       "bytes_per_key": ${CO_BYTES_PER_KEY},
       "p50_us": ${CO_P50},
-      "p99_us": ${CO_P99}
+      "p99_us": ${CO_P99},
+      "p999_us": ${CO_P999},
+      "p9999_us": ${CO_P9999}
     }
   },
   "ratios": {
     "qps_per_core_ironcache_over_competitor": ${QPS_RATIO},
-    "bytes_per_key_ironcache_over_competitor": ${BYTES_RATIO}
+    "bytes_per_key_ironcache_over_competitor": ${BYTES_RATIO},
+    "p999_us_ironcache_over_competitor": ${P999_RATIO},
+    "p9999_us_ironcache_over_competitor": ${P9999_RATIO}
   },
   "verdict": {
     "memory_only": ${MEMORY_ONLY_BOOL},
@@ -1064,6 +1292,15 @@ if [[ "${SMOKE}" == "1" ]]; then
   echo "  mode:        SMOKE (NOT publishable)"
 fi
 echo "  knobs:       keyspace=${KEYSPACE} keycount=${KEYCOUNT} theta=${THETA} read_ratio=${READ_RATIO} value_size=${VALUE_SIZE} dur=${DURATION_SECS}s conns=${CONNECTIONS} rate=${RATE}"
+# Adversarial-mix banner: which of the moat dimensions were ON for this run.
+adv_bits=""
+[[ "${EVICT}" == "1" ]] && adv_bits="${adv_bits} eviction(maxmemory=${MAXMEMORY},allkeys-lru)"
+[[ "${SNAPSHOT}" == "1" ]] && adv_bits="${adv_bits} concurrent-snapshot(BGSAVE/${SNAPSHOT_INTERVAL_SECS}s)"
+if [[ -n "${adv_bits}" ]]; then
+  echo "  adversarial: mixed(read_ratio=${READ_RATIO}) + zipf(theta=${THETA})${adv_bits}"
+else
+  echo "  adversarial: none (mixed(read_ratio=${READ_RATIO}) + zipf(theta=${THETA}) only; set EVICT=1 and/or SNAPSHOT=1 for the moat mix)"
+fi
 echo "  ---"
 if [[ "${MEMORY_ONLY}" -eq 1 ]]; then
   echo "  mode:        MEMORY-ONLY (competitor ${COMPETITOR_NAME} is non-RESP; throughput/latency NOT measured)"
@@ -1076,14 +1313,22 @@ if [[ "${MEMORY_ONLY}" -eq 1 ]]; then
   printf '  %-16s %18s %18s %18s\n' "bytes_per_key"  "${IC_BYTES_PER_KEY}" "${CO_BYTES_PER_KEY}" "${BYTES_RATIO}"
   printf '  %-16s %18s %18s %18s\n' "p50_us"         "${IC_P50}"           "n/a"  "-"
   printf '  %-16s %18s %18s %18s\n' "p99_us"         "${IC_P99}"           "n/a"  "-"
+  printf '  %-16s %18s %18s %18s\n' "p999_us"        "${IC_P999}"          "n/a"  "-"
+  printf '  %-16s %18s %18s %18s\n' "p9999_us"       "${IC_P9999}"         "n/a"  "-"
 else
   printf '  %-16s %18s %18s %18s\n' "qps"            "${IC_QPS}"          "${CO_QPS}"          "-"
   printf '  %-16s %18s %18s %18s\n' "qps_per_core"   "${IC_QPS_PER_CORE}" "${CO_QPS_PER_CORE}" "${QPS_RATIO}"
   printf '  %-16s %18s %18s %18s\n' "bytes_per_key"  "${IC_BYTES_PER_KEY}" "${CO_BYTES_PER_KEY}" "${BYTES_RATIO}"
   printf '  %-16s %18s %18s %18s\n' "p50_us"         "${IC_P50}"          "${CO_P50}"          "-"
   printf '  %-16s %18s %18s %18s\n' "p99_us"         "${IC_P99}"          "${CO_P99}"          "-"
+  # p999/p9999 are the #518 MOAT tails; the ratio column is ic/competitor (<1 = IronCache tighter).
+  printf '  %-16s %18s %18s %18s\n' "p999_us  (moat)" "${IC_P999}"        "${CO_P999}"         "${P999_RATIO}"
+  printf '  %-16s %18s %18s %18s\n' "p9999_us"        "${IC_P9999}"       "${CO_P9999}"        "${P9999_RATIO}"
 fi
 echo "  ---"
+echo "  NOTE: p50/p99/p999/p9999 are the OVERALL open-loop op latency (us): the loadgen records GET"
+echo "        and SET into ONE histogram, so there is NO GET-vs-SET percentile split. p999 (=p99.9)"
+echo "        is the #518 MOAT metric; its ic/competitor ratio <1 means IronCache's tail is tighter."
 echo "  ADR-0017 VERDICT:"
 if [[ "${MEMORY_ONLY}" -eq 1 ]]; then
   echo "    qps_per_core EXCEEDS competitor?  N/A   (memory-only: ${COMPETITOR_NAME} is non-RESP, throughput not measured)"
@@ -1105,10 +1350,23 @@ elif [[ "${STANDIN}" -eq 1 ]]; then
     echo "    NOTE: competitor was not the pinned valkey-server ${PINNED_VALKEY_VERSION}; this verdict is INDICATIVE."
   fi
 fi
+if [[ "${SNAPSHOT}" == "1" ]]; then
+  echo "  ---"
+  echo "  #518 MOAT (p99.9 under concurrent snapshot): a background BGSAVE fired every"
+  echo "  ${SNAPSHOT_INTERVAL_SECS}s DURING the open-loop pass on each server, so the p999_us above CAPTURES"
+  echo "  the durable-save tail. IronCache yields between snapshot chunks (#571) so its per-op"
+  echo "  work stays bounded (#570); Redis fork-COW stalls; Dragonfly snapshot-spikes. The"
+  echo "  per-server ${OUT_DIR}/<name>-bgsave.log records each BGSAVE fire + reply; grep the"
+  echo "  '[h2h] ... SNAPSHOT CONFIRMED FIRED' lines above for the proof the save executed."
+fi
 echo "  ---"
 echo "  artifacts:   ${OUT_DIR}"
 echo "    headtohead.json (comparison) + per-server closed/open/hgrm/log"
+if [[ "${SNAPSHOT}" == "1" ]]; then
+  echo "    + per-server <name>-bgsave.log (SNAPSHOT mode: BGSAVE fire timestamps + replies)"
+fi
 echo "  competitor matrix: docs/bench/COMPETITORS.md"
+echo "  tail methodology:  docs/bench/TAIL_LATENCY.md"
 echo "==============================================================================="
 
 # Cleanup runs on EXIT (the trap). Both servers have already been stopped by

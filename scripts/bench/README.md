@@ -190,7 +190,31 @@ indicative, and the denominator falls back to the host CPU count.
   `loadgen --mode closed` (pinned to the client cores) runs the shared workload
   (`SEED`/`KEYSPACE`/`THETA`/`READ_RATIO`/`VALUE_SIZE`/`DURATION_SECS`/`CONNECTIONS`)
   against the server; `qps_per_core = qps / server_core_count`. An optional
-  `loadgen --mode open` pass records p50/p99 per server.
+  `loadgen --mode open` pass records the OVERALL op-latency tail
+  (p50/p99/**p99.9**/p99.99) per server. The percentiles are whole-op-mix (the loadgen
+  records GET and SET into one histogram; there is no GET-vs-SET split).
+
+### Adversarial tail: EVICT and SNAPSHOT (the #518 moat, #574)
+
+Two env knobs turn the head-to-head into the moat proof (see
+[`docs/bench/TAIL_LATENCY.md`](../../docs/bench/TAIL_LATENCY.md)):
+
+- **`EVICT=1`** boots every server in its evicting cache mode under a LOW `MAXMEMORY`
+  (below the dataset) so eviction fires continuously during the pass.
+- **`SNAPSHOT=1`** fires a background `BGSAVE` on the server under test every
+  `SNAPSHOT_INTERVAL_SECS` (default 3) DURING the open-loop latency pass, so the measured
+  p99.9/p99.99 CAPTURES the concurrent durable-save tail. Each server boots with a fresh,
+  private snapshot dir (empty on boot so nothing is loaded, removed after) and a real save
+  enabled (IronCache `IRONCACHE_DATA_DIR`; redis/valkey/keydb `--dir` with `BGSAVE` still
+  honored under `--save ''`; Dragonfly a real `--dbfilename`). The QPS pass runs BEFORE the
+  loop, so peak QPS is unchanged; only the latency tail reflects the save. The script PROVES
+  a save actually executed (LASTSAVE advanced and/or a save line in the server log) and
+  prints a `SNAPSHOT CONFIRMED FIRED` line; each fire + reply is logged to
+  `<name>-bgsave.log`.
+
+`SNAPSHOT=1 EVICT=1 scripts/bench/headtohead.sh` runs the full mix (mixed ratio + zipf
+skew + eviction + concurrent snapshot). `scripts/bench/tail.sh` is a thin wrapper that
+presets it. `SMOKE=1` shrinks every dimension and still fires at least one BGSAVE.
 
 ### The ADR-0017 bar (verdict)
 
@@ -210,11 +234,12 @@ In the output directory:
 
 | File | Contents |
 | --- | --- |
-| `headtohead.json` | The comparison: both servers' `{name, version, qps, qps_per_core, bytes_per_key, p50_us, p99_us}`, the ratios, the verdict, and a manifest of knobs / host / pinning / competitor resolution. |
+| `headtohead.json` | The comparison: both servers' `{name, version, qps, qps_per_core, bytes_per_key, p50_us, p99_us, p999_us, p9999_us}`, the ratios (incl. the p99.9 `p999` moat ratio), the verdict, and a manifest of knobs (incl. `eviction`, `snapshot`, `snapshot_interval_secs`) / host / pinning / competitor resolution. |
 | `ironcache-closed.json`, `<competitor>-closed.json` | Per-server closed-loop peak-QPS results. |
-| `ironcache-open.json`, `<competitor>-open.json` | Per-server open-loop latency results. |
+| `ironcache-open.json`, `<competitor>-open.json` | Per-server open-loop latency results (`p50/p99/p999/p9999_us`). |
 | `ironcache-open.hgrm`, `<competitor>-open.hgrm` | Per-server HdrHistogram percentile dumps. |
 | `ironcache-server.log`, `<competitor>-server.log` | Each server's stdout/stderr for the run. |
+| `<name>-bgsave.log` (SNAPSHOT mode) | Each background `BGSAVE` fire's UTC timestamp + redis-cli reply, the audit trail behind the `SNAPSHOT CONFIRMED FIRED` line. |
 
 ONE server runs at a time on the same port. A pre-launch `/dev/tcp` port-free check
 rejects a stale listener (which `SO_REUSEPORT` would otherwise hide), and each server is
