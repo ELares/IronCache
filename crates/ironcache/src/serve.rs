@@ -4180,16 +4180,35 @@ async fn route_and_dispatch(
     };
 
     let close = if matches!(route, route::CommandClass::WholeKeyspace) {
-        // WHOLE-KEYSPACE SCATTER-GATHER: cover EVERY shard's partition. SCAN walks one shard
-        // per call (composite cursor); the rest broadcast + merge on the home core. The home
-        // shard's partial runs LOCALLY + synchronously (no self-channel hop). These were
-        // never on the single-key hot path, so awaiting here is fine.
+        // WHOLE-KEYSPACE dispatch. In Static/Raft the keyspace is ONE logical whole, so a
+        // whole-keyspace command SCATTER-GATHERS across EVERY shard's partition (SCAN walks one
+        // shard per call via the composite cursor; the rest broadcast + merge on the home core).
+        //
+        // In shard-owners mode (#526) the node advertises its N internal shards as N cluster
+        // nodes (one per port) and each shard's store holds EXACTLY its slot range (#520). So a
+        // whole-keyspace command issued to shard i's port must answer for shard i ONLY -- the
+        // per-node Redis Cluster view -- NOT the global fan-out (which would make a per-node
+        // aggregator over-count DBSIZE by N and return N copies from SCAN). Serve HOME-ONLY: the
+        // connecting shard's local partial IS the whole per-node answer. Both paths run the SAME
+        // per-shard partial; they differ only in whether it is fanned out or served alone.
+        //
+        // These were never on the single-key hot path, so awaiting here is fine.
         state_rc.borrow_mut().counters.on_command();
+        let home_only = ctx.cluster_mode() == ironcache_config::ClusterMode::ShardOwners;
         if cmd_upper == b"SCAN" {
+            // SCAN pins to the home shard when `home_only` (start there, finish when it is
+            // exhausted rather than advancing to a sibling); else it walks all shards.
             crate::whole_keyspace::scan_cross_shard(
-                inbox, ctx, request, conn.db, home.index, out, conn.proto,
+                inbox, ctx, request, conn.db, home.index, out, conn.proto, home_only,
             )
             .await;
+        } else if home_only {
+            // HOME-ONLY (no fan-out, no cross-shard RNG shard-pick): DBSIZE / KEYS / RANDOMKEY /
+            // FLUSHDB / FLUSHALL served from the connecting shard's local partition alone.
+            // RANDOMKEY draws from THIS shard's own Env RNG seam inside the partial (ADR-0003);
+            // FLUSHDB / FLUSHALL clear only this shard's slice (each cluster node flushes its
+            // own slots).
+            crate::whole_keyspace::run_home_only(ctx, request, conn.db, out, conn.proto);
         } else {
             // RANDOMKEY draws its shard-pick from the home Env RNG seam ONCE (ADR-0003);
             // the other whole-keyspace merges (DBSIZE / KEYS / FLUSHDB / FLUSHALL) ignore
