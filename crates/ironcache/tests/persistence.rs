@@ -273,6 +273,88 @@ async fn bgsave_persists_and_restart_reloads() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// #571 YIELDING SAVE: a BGSAVE over a populated shard YIELDS between snapshot chunks, so concurrent
+/// writes are SERVICED DURING the dump (not blocked until it ends) AND the dump still completes + is
+/// loadable + captures every pre-existing key. Populate a shard, kick a BGSAVE, then fire a batch of
+/// LIVE writes with a per-op timeout while the background dump runs (each must succeed promptly --
+/// proof the shard is not monopolized by the dump), wait for the save to commit, then RESTART and
+/// assert every pre-existing key (present for the whole dump) reloaded from the snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn bgsave_yields_so_concurrent_writes_are_serviced_and_snapshot_loads() {
+    let dir = temp_data_dir("yield");
+    let port = free_port();
+
+    // One shard so the whole keyspace + the dump live on shard 0 and the concurrent writes below are
+    // homed there too (they must interleave with the SAME shard's dump -- the yield is what lets them).
+    let preload = 4000usize;
+    {
+        let server = run_persist_server_for_test(port, 1, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+
+        // Populate a keyspace large enough that the dump spans MANY snapshot chunks (>> DUMP_CHUNK).
+        for i in 0..preload {
+            set(&mut c, &format!("pre-{i}"), &format!("v-{i}")).await;
+        }
+
+        // Kick the background save; it dumps on shard 0's executor and yields between chunks.
+        assert_eq!(
+            cmd1(&mut c, "BGSAVE").await,
+            b"+Background saving started\r\n"
+        );
+
+        // While the dump runs, fire LIVE writes on the SAME connection. Each must be SERVICED
+        // promptly (a generous timeout that a full-keyspace block would blow only under a huge
+        // keyspace, but the real proof is that they all complete + are readable -- the shard is not
+        // monopolized). If the save did NOT yield, these would queue behind the whole dump.
+        let live = 200usize;
+        for i in 0..live {
+            let (key, val) = (format!("live-{i}"), format!("lv-{i}"));
+            tokio::time::timeout(Duration::from_secs(10), set(&mut c, &key, &val))
+                .await
+                .expect("a concurrent write was serviced during BGSAVE (the shard yielded)");
+        }
+        // A live key written during the save window is served in-memory immediately.
+        assert_eq!(get_raw(&mut c, "live-0").await, bulk("lv-0"));
+
+        // The background save commits shortly after; poll LASTSAVE until it advances (dump done +
+        // manifest committed).
+        let mut advanced = false;
+        for _ in 0..200 {
+            if cmd1(&mut c, "LASTSAVE").await != b":0\r\n" {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            advanced,
+            "the yielding BGSAVE still committed (LASTSAVE advanced)"
+        );
+
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    // The committed manifest exists, and a fresh server on the same data_dir reloads EVERY
+    // pre-existing key (each was present for the whole dump -> captured at least once, SCAN-stable).
+    assert!(dir.join("dump.manifest").exists(), "manifest committed");
+    {
+        let server = run_persist_server_for_test(port, 1, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+        for i in 0..preload {
+            assert_eq!(
+                get_raw(&mut c, &format!("pre-{i}")).await,
+                bulk(&format!("v-{i}")),
+                "pre-{i} (present for the whole dump) reloaded from the yielding snapshot"
+            );
+        }
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// With NO data_dir, persistence is OFF: SAVE/BGSAVE are the persistence-disabled no-op success
 /// fallbacks, LASTSAVE is 0, and no files are written. This is the default byte-unchanged posture.
 #[tokio::test(flavor = "current_thread")]

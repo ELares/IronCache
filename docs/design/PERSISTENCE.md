@@ -121,6 +121,47 @@ into a false sense of durability:
   the live loss window is observable rather than guessed. The zero-RPO strict tier
   (Tier 2 above) is still roadmap.
 
+### Yielding snapshot: a bounded save tail, and the fuzzy-consistency decision (#571)
+
+The shipped per-shard dump is **forkless** and **memory-neutral** (a resumable, constant-memory
+`snapshot_chunk` SCAN pull, #60), and it now also **yields the serving shard between snapshot
+chunks** so a `SAVE`/`BGSAVE` does not block the shard for its whole keyspace dump:
+
+- **Per-chunk borrow + yield.** The dump loop re-acquires the shard's store borrow **per chunk**
+  (not across the whole dump), pulls one bounded `DUMP_CHUNK` batch, releases the borrow, and
+  `yield`s. Between yields the shard's executor services queued writes (its connection serve loops,
+  and -- for a `BGSAVE`, which runs off a spawned task -- its drain loop). So a write homed on a
+  dumping shard is **serviced during the dump instead of blocked until it ends**: the save tail is
+  bounded and predictable (one `DUMP_CHUNK` of work between servicing points) rather than a
+  full-keyspace stall. This is the tail-latency moat versus Redis fork-stalls and Dragonfly
+  snapshot-spikes -- a save no longer causes a p99.9 spike whenever it aligns with writes.
+
+- **Consistency is DELIBERATELY fuzzy: an approximate warm-start restore point.** Because writes
+  interleave between chunks, the snapshot is **no longer a strict point-in-time** view even within a
+  single shard (an early chunk may hold a key's pre-write value while a later chunk holds another
+  key's post-write value), and it was already cross-shard fuzzy (each shard dumps at a slightly
+  different instant). We **accept** this: IronCache is a **cache**, so an approximate warm-start
+  restore point that never stalls the request path is worth far more than a strict global
+  point-in-time, and no cross-key transactional durability is promised. This is a conscious decision,
+  not an accident. A strict point-in-time snapshot would require versioning / copy-on-write (the
+  forkless epoch-cut serializer sketched in SNAPSHOT.md), a much larger change deliberately **out of
+  scope** here.
+
+- **The dump stays correct under concurrent mutation.** The chunk cursor is the resize-stable
+  `scan_hash` **threshold** of the next un-examined key (KEYSPACE.md cursor-stability contract), not a
+  table slot index, and the walk rebuilds its sorted order from current contents each chunk. So a key
+  present for the **whole** dump is captured **at least once** (SCAN semantics); a key created or
+  deleted mid-dump may or may not appear. This is the same iterator the replication full-sync already
+  relies on while it awaits shipping each chunk to a replica, and it is unchanged by the per-slot
+  table partition (#570). A regression test drives a dump chunk-by-chunk while inserting (forcing
+  resizes) and deleting between chunks and asserts every stable key survives.
+
+- **Crash-safety is independent of the fuzziness and still holds.** The **manifest is written LAST**
+  (tmp -> fsync -> rename, after every per-shard file is durable), so a torn or partial dump is never
+  loaded: a boot loads a fully committed (if fuzzy) snapshot or the prior one, never a half-written
+  file. A CRC mismatch on a shard file is treated as no-snapshot for that file, and a foreign / newer
+  format version fails closed loudly (#530) rather than silently starting empty.
+
 ## Open questions
 
 - Group-commit batching window for the strict tier (latency vs syscall amortization).

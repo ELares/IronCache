@@ -312,7 +312,7 @@ pub async fn run_drain_loop(
             maybe = rx.recv() => {
                 match maybe {
                     Some(work) => {
-                        let reply = run_remote(&ctx, &work.request, work.db);
+                        let reply = run_drained_unit(&ctx, &work.request, work.db).await;
                         let _ = work.reply.send(reply);
                         // BLOCKING WAKE (PROD-9): a cross-shard WRITE that ran on THIS shard and may
                         // have ADDED an element to a list/zset wakes a blocking waiter parked on
@@ -371,7 +371,7 @@ pub async fn run_drain_loop(
                     match maybe {
                         Some(work) => {
                             idle_ticks = 0;
-                            let reply = run_remote(&ctx, &work.request, work.db);
+                            let reply = run_drained_unit(&ctx, &work.request, work.db).await;
                             let _ = work.reply.send(reply);
                             // KEYSPACE NOTIFICATIONS (PROD-8): publish any events this cross-shard
                             // write recorded, exactly as the steady-state arm above (the
@@ -391,6 +391,23 @@ pub async fn run_drain_loop(
             }
         }
     }
+}
+
+/// Dispatch ONE drained cross-shard unit, routing the async YIELDING save path for `__ICSAVE`
+/// and the SYNCHRONOUS [`run_remote`] for everything else (#571).
+///
+/// This is the single drain-loop entry point. The `__ICSAVE` partial dumps the WHOLE shard
+/// partition, and the dump now YIELDS between snapshot chunks (a bounded, predictable BGSAVE tail
+/// instead of a full-keyspace block) via [`run_local_save`], so it MUST run on an async path. Every
+/// OTHER unit -- the hot cross-shard keyed commands and the whole-keyspace partials -- stays on the
+/// SYNCHRONOUS `run_remote` (which returns before any await, holding no borrow across one), so the
+/// hot path is NOT dragged onto the async state machine: the `.await` here resolves immediately for
+/// the non-save common case.
+async fn run_drained_unit(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
+    if crate::serve::ascii_upper(request.command()) == crate::persist::ICSAVE {
+        return run_local_save(ctx, request).await;
+    }
+    run_remote(ctx, request, db)
 }
 
 /// Run ONE unit of remote keyed work against THIS shard's thread-local state, returning
@@ -433,19 +450,13 @@ fn run_remote(ctx: &ServerContext, request: &Request, db: u32) -> ShardReply {
         };
     }
 
-    // INTERNAL `__ICSAVE <save_unix_secs> <shard_index> <dir>` (#58 persistence): the cross-shard
-    // SAVE fan-out. This shard DUMPS ITS OWN partition (the forkless, memory-neutral
-    // `snapshot_chunk` pull) to `<dir>/dump-shard-<shard_index>.icss` ATOMICALLY and returns its
-    // manifest entry encoded in the reply. It reads only the store (read-only SHARED borrow) + the
-    // Env clock for the lazy-expiry `now`, produces NO counter deltas (a save is not a keyed
-    // write), and is handled BEFORE any mutable store borrow. The home core (the SAVE/BGSAVE
-    // orchestrator) collects every shard's entry + commits the manifest LAST.
-    if crate::serve::ascii_upper(request.command()) == crate::persist::ICSAVE {
-        return ShardReply {
-            value: save_shard_local(ctx, request),
-            deltas: CounterDeltas::default(),
-        };
-    }
+    // NOTE (#571): `__ICSAVE` is NOT handled here. Because the per-shard dump now YIELDS between
+    // snapshot chunks (a bounded save tail, not a full-keyspace block), it is an ASYNC unit and is
+    // dispatched by [`run_drained_unit`] on the drain loop BEFORE this synchronous `run_remote` is
+    // reached (via the yielding [`run_local_save`]). Keeping `run_remote` fully SYNCHRONOUS keeps the
+    // hot cross-shard keyed / whole-keyspace path off the async state machine; only the save path is
+    // async. A stray `__ICSAVE` reaching here would fall through to the keyed dispatcher, which
+    // defensively refuses a mis-routed internal verb -- but `run_drained_unit` intercepts it first.
 
     // INTERNAL `__ICPUBSUB <subcommand> [args]` (SERVER_PUSH.md #20, PR 91b): the cross-shard
     // PUBSUB-introspection gather. Like `__ICPUBLISH` it touches ONLY the per-shard SUBSCRIPTION
@@ -931,6 +942,74 @@ pub async fn fan_out_split(
     replies
 }
 
+/// Fan an `__ICSAVE` out to EVERY shard for a full cross-shard SAVE (#58/#571), running the home
+/// shard's dump on the YIELDING save path INLINE (no self-channel hop) and every other shard off
+/// its own drain loop. Returns the `(shard_index, reply)` pairs in NO guaranteed order (the caller
+/// maps each shard's reply to its manifest entry by the index it built).
+///
+/// This mirrors [`fan_out_split`] structurally (enqueue every REMOTE sub-request first so the shards
+/// dump concurrently, then run the HOME shard's partial locally, then gather the remote replies), but
+/// the home partial is the ASYNC yielding [`run_local_save`] -- which awaits between snapshot chunks
+/// so shard 0 services its OWN queued writes during its dump too (the entire benefit for a
+/// single-shard node) -- and a synchronous `FnOnce` local closure cannot express that await. NO
+/// `RefCell` borrow is held across any await: `run_local_save` releases its per-chunk store borrow
+/// before each yield, exactly like `fan_out_split`'s no-borrow-across-await contract.
+///
+/// A dead shard (send error / cancelled oneshot, only at shutdown / a shard panic) yields a
+/// SHARD-UNAVAILABLE [`ShardReply`] for that shard rather than a hang.
+pub async fn fan_out_save(
+    ctx: &ServerContext,
+    inbox: &Inbox,
+    home: ShardId,
+    db: u32,
+    subreqs: Vec<(usize, Request)>,
+) -> Vec<(usize, ShardReply)> {
+    let mut replies: Vec<(usize, ShardReply)> = Vec::with_capacity(subreqs.len());
+    let mut pending: Vec<(usize, oneshot::Receiver<ShardReply>)> =
+        Vec::with_capacity(subreqs.len());
+    // The home shard's __ICSAVE, deferred so its inline yielding dump runs AFTER every remote
+    // sub-request is enqueued (so the shards dump concurrently), exactly as fan_out_split orders it.
+    let mut home_subreq: Option<Request> = None;
+
+    for (shard, req) in subreqs {
+        if shard == home.index {
+            home_subreq = Some(req);
+            continue;
+        }
+        let (tx, rx) = oneshot::channel::<ShardReply>();
+        let work = ShardWork {
+            request: req,
+            db,
+            reply: tx,
+        };
+        // Await-on-full back-pressure; a send error means the owning shard's receiver is gone
+        // (shutdown / shard died): record a shard-unavailable reply for it directly.
+        if inbox[shard].send(work).await.is_err() {
+            replies.push((shard, shard_unavailable_reply()));
+        } else {
+            pending.push((shard, rx));
+        }
+    }
+
+    // The HOME shard dumps its OWN partition INLINE on the YIELDING path (no self hop): it awaits
+    // between chunks with the per-chunk store borrow released, so shard 0 services its queued writes
+    // during its own dump too.
+    if let Some(req) = home_subreq {
+        replies.push((home.index, run_local_save(ctx, &req).await));
+    }
+
+    // Gather the remote replies. A cancelled oneshot (the owning shard's drain loop went away after
+    // we enqueued) maps to a shard-unavailable reply, never a hang/panic.
+    for (shard, rx) in pending {
+        match rx.await {
+            Ok(reply) => replies.push((shard, reply)),
+            Err(_) => replies.push((shard, shard_unavailable_reply())),
+        }
+    }
+
+    replies
+}
+
 /// Run ONE keyed sub-request's subset against THIS (home) shard's thread-local state,
 /// SYNCHRONOUSLY, for the multi-key DATA fan-out (COORDINATOR.md #107, Stage 2a). This is
 /// the `local` closure [`fan_out_split`] runs for the home shard: the home core does NOT
@@ -1061,23 +1140,36 @@ pub fn run_local_spublish(request: &Request) -> Value {
 }
 
 /// Run ONE shard's `__ICSAVE <save_unix_secs> <shard_index> <dir>` against THIS shard's store
-/// (#58 persistence): DUMP this shard's whole partition to `<dir>/dump-shard-<shard_index>.icss`
-/// ATOMICALLY (the forkless, memory-neutral `snapshot_chunk` pull + tmp -> fsync -> rename) and
-/// return its manifest entry encoded as `*3 [:shard :keys :crc]` (see
-/// [`crate::persist::encode_save_reply`]). On an I/O error it returns a proto error the home core
-/// surfaces as a failed SAVE.
+/// (#58 persistence, #571 yielding save): DUMP this shard's whole partition to
+/// `<dir>/dump-shard-<shard_index>.icss` ATOMICALLY (the forkless, memory-neutral `snapshot_chunk`
+/// pull + tmp -> fsync -> rename) and return its manifest entry encoded as `*3 [:shard :keys :crc]`
+/// (see [`crate::persist::encode_save_reply`]). On an I/O error it returns a proto error the home
+/// core surfaces as a failed SAVE.
 ///
-/// It reads `now` from THIS shard's Env clock (the determinism seam, ADR-0003: the lazy-expiry
-/// basis the dump skips dead keys at) via a SHORT shared borrow, and borrows the store READ-ONLY
-/// for the dump (the dump never mutates). Both borrows are taken + released inside this synchronous
-/// call (the no-borrow-across-await contract). NOTE (M4): this holds the store borrow across the
-/// ENTIRE `save_shard_to_dir` call -- the whole keyspace dump AND the file fsync -- so this shard is
-/// BLOCKED for its full dump + fsync latency (per-shard-consistent). The chunked `snapshot_chunk`
-/// bounds the dump's MEMORY to O(`DUMP_CHUNK`), but the borrow is NOT released between chunks here,
-/// so BGSAVE blocks this shard exactly as SAVE does (BGSAVE only frees the ISSUING connection).
-/// Produces NO counter deltas (a save is not a keyed write).
-#[must_use]
-fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
+/// ## Yielding dump (#571): a bounded save tail, not a full-keyspace block
+///
+/// The dump is driven CHUNK BY CHUNK through [`ironcache_persist::ShardDumpBuilder`]: each iteration
+/// takes a SHORT read-only store borrow, pulls one bounded `snapshot_chunk` batch (O(`DUMP_CHUNK`)
+/// keys), RELEASES the borrow, then `tokio::task::yield_now().await`s so the shard's executor
+/// services queued writes (its connection serve loops, and -- on the home shard whose BGSAVE runs
+/// off a spawned task -- its drain loop) BEFORE the next chunk. So a `SAVE`/`BGSAVE` no longer
+/// monopolizes the serving shard for its whole keyspace dump: a write homed here is serviced DURING
+/// the dump instead of blocked to its end (the p99.9 tail lever). Only the fsync'd file write remains
+/// after the last chunk, and the store borrow is already released for it.
+///
+/// The store borrow is taken + dropped INSIDE each chunk block, never held across the `yield` (the
+/// no-borrow-across-await contract), which is ALSO what lets a concurrent write mutate the table
+/// between chunks. The dump stays CORRECT under that mutation: `snapshot_chunk` walks the
+/// resize-stable `scan_hash` order and resumes at the `scan_hash` THRESHOLD (not a table slot), so a
+/// key present for the WHOLE dump is captured at least once and a key created/deleted mid-dump may or
+/// may not appear (SCAN semantics -- the accepted approximate warm-start point for a cache, see
+/// [`ironcache_persist`]). This is the SAME iterator the replication full-sync already relies on
+/// while it awaits shipping chunks to a replica.
+///
+/// It reads `now` from THIS shard's Env clock (the determinism seam, ADR-0003: the lazy-expiry basis
+/// the dump skips dead keys at) via a SHORT shared borrow. Produces NO counter deltas (a save is not
+/// a keyed write).
+async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     // Parse `__ICSAVE <save_unix_secs> <shard_index> <dir>`.
     let (Some(secs_arg), Some(shard_arg), Some(dir_arg)) = (
         request.args.get(1),
@@ -1104,15 +1196,31 @@ fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
         ctx.info.maxmemory_policy,
         crate::serve::scan_reserved_bits(ctx.shards),
     );
-    // `now` from THIS shard's wall clock (ADR-0003), a short borrow dropped before the store dump.
+    // `now` from THIS shard's wall clock (ADR-0003), a short borrow dropped before the dump loop.
     let now = UnixMillis(env.borrow().now_unix_millis());
-    // Read-only store borrow for the dump (the forkless snapshot pull). save_shard_to_dir runs the
-    // chunked snapshot_chunk + writes the file atomically.
-    let result = {
-        let store = store_rc.borrow();
-        ironcache_persist::save_shard_to_dir(&*store, shard_index, &dir, now)
-    };
-    match result {
+    // The database count (a short borrow, dropped immediately) bounds the outer walk.
+    let databases = store_rc.borrow().databases();
+
+    // Dump this shard's keyspace CHUNK BY CHUNK, releasing the store borrow + YIELDING between chunks
+    // (#571) so the shard services queued writes DURING the dump.
+    let mut builder = ironcache_persist::ShardDumpBuilder::new();
+    let mut cursor = ironcache_store::SnapshotCursor::START;
+    while !cursor.is_done(databases) {
+        let (chunk, next) = {
+            // PER-CHUNK borrow: taken + dropped inside this block, so it is NOT held across the
+            // yield below (and a concurrent write can run between chunks).
+            let store = store_rc.borrow();
+            store.snapshot_chunk(cursor, ironcache_persist::DUMP_CHUNK, now)
+        };
+        builder.push_chunk(&chunk);
+        cursor = next;
+        // Let the shard's executor service any queued writes before the next chunk (a bounded,
+        // predictable save tail instead of a full-keyspace block).
+        tokio::task::yield_now().await;
+    }
+
+    // The store borrow is already released; write the sealed file atomically (tmp -> fsync -> rename).
+    match ironcache_persist::write_shard_dump(&builder.finish(shard_index), shard_index, &dir) {
         Ok(entry) => crate::persist::encode_save_reply(&entry),
         Err(e) => Value::error(ironcache_protocol::ErrorReply::err(format!(
             "save failed: {e}"
@@ -1120,17 +1228,17 @@ fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     }
 }
 
-/// Run the HOME shard's `__ICSAVE` partial LOCALLY + SYNCHRONOUSLY (#58 persistence), returning the
-/// home shard's [`ShardReply`]. This is the `local` closure [`fan_out_split`] runs for the home
-/// shard: the home core does NOT round-trip its OWN save through its channel; it dumps inline via
-/// the SAME [`save_shard_local`] every remote shard runs (so the home shard's file is byte-identical
-/// to a remote shard's). A save produces no counter deltas, so the reply carries default deltas.
-/// Every per-shard borrow is taken + released inside the synchronous `save_shard_local` (the
-/// no-borrow-across-await contract; the caller awaits remote replies AFTER this returns).
-#[must_use]
-pub fn run_local_save(ctx: &ServerContext, request: &Request) -> ShardReply {
+/// Run the HOME shard's `__ICSAVE` partial LOCALLY (#58 persistence, #571 yielding), returning the
+/// home shard's [`ShardReply`]. This is the async local step [`fan_out_save`] runs for the home
+/// shard: the home core does NOT round-trip its OWN save through its channel; it dumps inline via the
+/// SAME yielding [`save_shard_local`] every remote shard runs (so the home shard's file is
+/// byte-identical to a remote shard's), AWAITING between chunks so the home shard's OWN queued writes
+/// are serviced during its dump too. A save produces no counter deltas, so the reply carries default
+/// deltas. The per-chunk store borrow is released before each yield (the no-borrow-across-await
+/// contract).
+pub async fn run_local_save(ctx: &ServerContext, request: &Request) -> ShardReply {
     ShardReply {
-        value: save_shard_local(ctx, request),
+        value: save_shard_local(ctx, request).await,
         deltas: CounterDeltas::default(),
     }
 }

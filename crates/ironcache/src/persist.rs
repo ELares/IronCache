@@ -32,10 +32,15 @@
 //!   it never double-memories the keyspace.
 //! - `BGSAVE` kicks the SAME save off the ISSUING request path (spawned on the home shard's
 //!   executor) and replies `+Background saving started` immediately, so the ISSUING connection is
-//!   not blocked. NOTE: each dumping shard STILL holds its store borrow across its full dump + fsync
-//!   (`save_shard_local` does not yield between chunks), so BGSAVE BLOCKS EACH SHARD for the
-//!   duration of ITS OWN dump (per-shard-consistent); it is not a fully non-blocking background dump
-//!   on the dumping shard. The win over SAVE is purely that the issuing client is freed immediately.
+//!   not blocked.
+//! - YIELDING dump (#571): each dumping shard now re-acquires its store borrow PER CHUNK and
+//!   `yield`s between snapshot chunks (`save_shard_local`), so a `SAVE`/`BGSAVE` no longer
+//!   monopolizes the serving shard for its whole keyspace dump -- the shard services queued writes
+//!   DURING the dump (a bounded, predictable save tail instead of a full-keyspace block). The
+//!   tradeoff is that the snapshot is no longer a strict per-shard point-in-time; it is an
+//!   APPROXIMATE warm-start restore point (a deliberate choice for a cache, see the
+//!   `ironcache_persist` module consistency note). The crash-safety invariant is unaffected: the
+//!   manifest is still written LAST, so a torn/partial dump is never loaded.
 //!
 //! ## Default-off (#58)
 //!
@@ -306,10 +311,12 @@ fn icsave_request(save_unix_secs: u64, shard: usize, dir: &std::path::Path) -> R
 /// so two saves never race on the same files + manifest. The guard releases the latch on drop
 /// (completion, panic, or cancellation), so this fn never needs to release it itself.
 ///
-/// The fan-out reuses [`coordinator::fan_out_split`] (a DIFFERENT sub-request per shard -- each
-/// carries its own shard index for its file name): the home shard's `__ICSAVE` runs LOCALLY +
-/// synchronously ([`coordinator::run_local_save`]), every other shard via its drain loop. No
-/// `RefCell` borrow is held across the awaits (the per-shard `save_shard_local` is synchronous).
+/// The fan-out uses [`coordinator::fan_out_save`] (a DIFFERENT sub-request per shard -- each carries
+/// its own shard index for its file name): the home shard's `__ICSAVE` runs INLINE on the YIELDING
+/// [`coordinator::run_local_save`], every other shard off its drain loop. Each per-shard dump yields
+/// between snapshot chunks (#571) so the shard services queued writes DURING the dump. No `RefCell`
+/// borrow is held across any await (the per-shard `save_shard_local` releases its per-chunk store
+/// borrow before each yield).
 ///
 /// `save_unix_secs` is the home core's wall-clock time (read from the env Clock seam by the caller,
 /// ADR-0003); it is recorded in the manifest and reported by `LASTSAVE`.
@@ -352,10 +359,10 @@ async fn save_all_attempt(
     let subreqs: Vec<(usize, Request)> = (0..n_shards)
         .map(|shard| (shard, icsave_request(save_unix_secs, shard, &dir)))
         .collect();
-    let replies = coordinator::fan_out_split(inbox, home, db, subreqs, |req| {
-        coordinator::run_local_save(ctx, req)
-    })
-    .await;
+    // Fan out via the SAVE-specific fan-out (#571): the home shard's own dump runs INLINE on the
+    // YIELDING `run_local_save` (awaits between snapshot chunks), which a synchronous `fan_out_split`
+    // local closure cannot express; every other shard dumps off its drain loop (also yielding).
+    let replies = coordinator::fan_out_save(ctx, inbox, home, db, subreqs).await;
 
     // Collect the per-shard manifest entries; surface the FIRST shard error as a failed save (a
     // partial set of files without a committed manifest is harmless -- the prior manifest stays

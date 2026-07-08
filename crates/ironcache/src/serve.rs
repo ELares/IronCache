@@ -3624,8 +3624,9 @@ async fn route_and_dispatch(
         // explicit and uniform with the other internal verbs.
         || cmd_upper == ironcache_server::ICEXISTS
         // `__ICSAVE` is the INTERNAL cross-shard SAVE fan-out verb (#58 persistence): the same gate
-        // -- client-unreachable; only the home core issues it (via `do_save_all`'s `fan_out_split`
-        // to each shard's drain loop, which dumps that shard's partition). Like `__ICEXISTS` it is
+        // -- client-unreachable; only the home core issues it (via `do_save_all`'s `fan_out_save`
+        // to each shard's drain loop, which dumps that shard's partition, yielding between chunks).
+        // Like `__ICEXISTS` it is
         // NOT in the `spec_of` registry (dispatched directly by the coordinator), so a client
         // sending it would already get unknown-command; rejecting it HERE keeps the contract uniform.
         || cmd_upper == crate::persist::ICSAVE
@@ -4487,10 +4488,11 @@ fn publish_pending_keyspace_events(inbox: &coordinator::Inbox, home: usize) {
 ///   parity), then replies `+OK` (or an `-ERR` on a shard / manifest failure). The fan-out is the
 ///   forkless, borrow-releasing per-shard dump, so it never double-memories the keyspace.
 /// - `BGSAVE`: SPAWNS the SAME save off the request path on the home shard's executor and replies
-///   `+Background saving started` IMMEDIATELY, so the ISSUING connection is not blocked. NOTE (M4):
-///   each dumping shard STILL holds its store borrow across its full dump + fsync (it does not yield
-///   between chunks), so BGSAVE BLOCKS EACH SHARD for ITS OWN dump duration; the win over SAVE is
-///   only that the issuing client is freed immediately.
+///   `+Background saving started` IMMEDIATELY, so the ISSUING connection is not blocked. The per-shard
+///   dump now YIELDS between snapshot chunks (#571), re-acquiring the store borrow per chunk, so a
+///   dumping shard services queued writes DURING its dump instead of being blocked for the whole
+///   keyspace dump -- a bounded, predictable save tail. (The snapshot is then an approximate
+///   warm-start point rather than a strict per-shard point-in-time; see `crate::persist`.)
 /// - `LASTSAVE`: replies `:<unix_secs>` of the last committed save (`:0` until the first save).
 ///
 /// Concurrent saves are serialized by [`crate::persist::PersistState::try_begin_save`]: a SAVE /
