@@ -57,3 +57,10 @@ shared-nothing (ADR-0002).
   choice provides.
 - The allocator-vs-mimalloc throughput and RSS comparison under a real cache
   workload is the empirical follow-up (#42's benchmark).
+- Because both the store tables and the value blobs flow through jemalloc, the
+  transparent-huge-page lever for the random-key hot path (#512) rides the same
+  `malloc_conf` seam: a default-off `thp:always` (the `hugepages` build feature, or
+  the `_RJEM_MALLOC_CONF=thp:always` runtime override) backs jemalloc's extents with
+  2 MiB pages to cut TLB misses. It is Linux-only and opt-in because `thp:always` can
+  raise the very RSS this ADR accounts against `maxmemory`; the RSS/latency tradeoff
+  and the knobs are documented in docs/design/CONFIG.md ("Transparent huge pages").
