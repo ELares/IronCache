@@ -206,6 +206,25 @@ pub fn encode(out: &mut impl BufMut, value: &Value, proto: ProtoVersion) {
     }
 }
 
+/// Frame a RESP bulk string DIRECTLY from a borrowed byte slice into `out`, with NO intermediate
+/// [`Value`] / `Bytes` allocation. This is the by-REFERENCE GET fast path (#511, root cause #2):
+/// the home GET path hands the STORED value bytes straight to this framer, so a present value is
+/// written store->socket-buffer in ONE copy with ZERO heap allocation, replacing the
+/// `Bytes::copy_from_slice` + `Value::BulkString` that `cmd_get` builds.
+///
+/// The emitted bytes are IDENTICAL to encoding a `Value::BulkString(Some(..))` of the SAME slice:
+/// this is the exact `$<len>\r\n<bytes>\r\n` framing the [`encode`] `BulkString(Some)` arm writes
+/// (asserted in the tests), so the differential reply bytes are unchanged. It is protocol-version
+/// INDEPENDENT: a PRESENT bulk string is `$<len>\r\n<bytes>\r\n` in both RESP2 and RESP3 (only the
+/// NULL bulk differs by proto, and a present value is never null), so it needs no `proto` argument.
+pub fn encode_bulk_ref(out: &mut impl BufMut, data: &[u8]) {
+    out.put_u8(b'$');
+    put_i64(out, data.len() as i64);
+    crlf(out);
+    out.put_slice(data);
+    crlf(out);
+}
+
 /// Convenience: encode into a fresh `Vec<u8>` and return it. `Vec<u8>` is a
 /// [`BufMut`] sink, so `encode` writes into it directly (no `BytesMut` round-trip).
 #[must_use]
@@ -523,6 +542,36 @@ mod tests {
         assert_eq!(enc(&Value::Null, ProtoVersion::Resp3), b"_\r\n");
         // RESP2 null degrades to the null bulk.
         assert_eq!(enc(&Value::Null, ProtoVersion::Resp2), b"$-1\r\n");
+    }
+
+    #[test]
+    fn bulk_ref_matches_bulk_string_bytes() {
+        // #511: `encode_bulk_ref` frames a borrowed slice IDENTICALLY to encoding a
+        // `Value::BulkString(Some(..))` of the same bytes -- for empty, 1-byte, large, and
+        // binary/NUL payloads. This is the guarantee the by-ref home GET fast path relies on to
+        // stay byte-identical to the copying `cmd_get` path.
+        let cases: &[&[u8]] = &[
+            b"",
+            b"x",
+            b"hello world",
+            &[0u8, 1, 2, 255, b'\r', b'\n', 0, b'a'],
+            &[b'z'; 8192],
+        ];
+        for &data in cases {
+            let mut by_ref = Vec::new();
+            encode_bulk_ref(&mut by_ref, data);
+            let via_value = enc(
+                &Value::BulkString(Some(Bytes::copy_from_slice(data))),
+                ProtoVersion::Resp2,
+            );
+            assert_eq!(by_ref, via_value, "mismatch for {data:?}");
+            // RESP3 too: a PRESENT bulk string is proto-independent.
+            let via_value3 = enc(
+                &Value::BulkString(Some(Bytes::copy_from_slice(data))),
+                ProtoVersion::Resp3,
+            );
+            assert_eq!(by_ref, via_value3, "resp3 mismatch for {data:?}");
+        }
     }
 
     #[test]
