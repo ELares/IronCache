@@ -78,6 +78,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "off|auto|LIST")]
     pub persist_cpu: Option<String>,
 
+    /// #527 config-rollback ESCAPE HATCH: boot past an UNKNOWN config-file key with a loud warning
+    /// (one line per key, naming it) instead of hard-failing. OFF by default (strict, so a typo is
+    /// caught in normal ops); turn it ON only for a DOWNGRADE, where an old binary must start past a
+    /// forward-incompatible key a newer build wrote into the config file rather than bricking the
+    /// rollback. Env `IRONCACHE_IGNORE_UNKNOWN_CONFIG_KEYS`; TOML `ignore_unknown_config_keys`. It
+    /// relaxes unknown KEYS only -- a malformed file or a bad VALUE still fails boot.
+    #[arg(long, global = true)]
+    pub ignore_unknown_config_keys: bool,
+
     /// The subcommand. Absent means `server`.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -304,6 +313,17 @@ mod tests {
         let cli = Cli::try_parse_from(["ironcache", "--port", "7000", "server"]).unwrap();
         assert_eq!(cli.port, Some(7000));
         assert!(matches!(cli.command, Some(Command::Server)));
+    }
+
+    #[test]
+    fn parses_ignore_unknown_config_keys_flag() {
+        // #527 config-rollback escape hatch: OFF by default, ON when the flag is present (a global
+        // flag, so it works before OR after the subcommand).
+        let off = Cli::try_parse_from(["ironcache", "server"]).unwrap();
+        assert!(!off.ignore_unknown_config_keys, "strict by default");
+        let on =
+            Cli::try_parse_from(["ironcache", "--ignore-unknown-config-keys", "server"]).unwrap();
+        assert!(on.ignore_unknown_config_keys, "flag flips the hatch on");
     }
 
     #[test]

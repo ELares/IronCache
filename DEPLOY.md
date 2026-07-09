@@ -493,6 +493,17 @@ forward again before any data is lost. Practical rule: upgrade format versions f
 only, and when you must roll a binary back, restore a snapshot the older binary can read
 (or wipe the `data_dir`) rather than pointing it at a newer dump.
 
+A downgrade has a second boot hazard: the config FILE. If a newer build wrote a config
+key the older binary does not recognize, the old binary hard-fails at boot (the config
+file is STRICT by default, so an unknown key is a typo-guard, not a silent drop). To keep
+a rollback from bricking on a forward-incompatible key, set the config-rollback escape
+hatch on the OLD binary: `ignore_unknown_config_keys = true`
+(`IRONCACHE_IGNORE_UNKNOWN_CONFIG_KEYS=true`, or `--ignore-unknown-config-keys`). It turns
+an unknown FILE key into a loud WARN that NAMES the ignored key and lets the node boot,
+while still applying every key the old binary DOES understand; it relaxes unknown keys
+only, so a malformed file or a bad value still fails. Leave it OFF in steady state (so a
+real typo is still caught) and set it only for the rollback (CONFIG.md, #527).
+
 ---
 
 ## 9. Raft cluster formation, quorum, and scaling
