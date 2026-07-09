@@ -8,6 +8,26 @@ breaking changes until `1.0.0`).
 
 ## [Unreleased]
 
+### Added
+
+- systemd socket-activation deployment finish-out (issue #389 Phase 2a, closing the sub-issue): a
+  DEPLOY.md "systemd socket activation" section documenting how to install/enable `ironcache.socket`
+  + `ironcache.service` and WHY a restart under it QUEUES clients in the kernel backlog instead of
+  returning `ECONNREFUSED` (the listen queue systemd owns is never closed across the swap). The RESP
+  fd adoption now DISAMBIGUATES via `LISTEN_FDNAMES`: `listener_for` adopts the fd NAMED `resp` (the
+  packaged `.socket` now sets `FileDescriptorName=resp`) when a multi-socket unit passes names, else
+  the first inherited fd (fd 3, unchanged for the single-socket default) -- a `resp_listener_fd`
+  selector guarding a future multi-socket unit from binding the RESP listener to the wrong socket.
+
+### Changed
+
+- Socket activation now follows the `sd_listen_fds(3)` `unset_environment` convention (issue #389):
+  the server captures the `LISTEN_PID` / `LISTEN_FDS` / `LISTEN_FDNAMES` environment ONCE at the very
+  top of boot and then UNSETS it, so a later-exec'd child cannot re-adopt fds meant for this pid. The
+  captured snapshot feeds every boot consumer (the adopt-vs-fallback log, the RESP adoption, the
+  shard-owner guard), so clearing the env after the first read changes no decision. The unset is a
+  no-op when not socket-activated (env absent), so a normal launch is byte-unchanged.
+
 ## [0.1.0]
 
 First tagged release (2026-07-07). IronCache is a Redis-wire-compatible, thread-per-core cache in Rust with

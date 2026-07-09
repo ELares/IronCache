@@ -37,6 +37,13 @@ Documentation=https://github.com/OWNER/REPO
 # single-acceptor topology.
 ListenStream=127.0.0.1:6379
 
+# Name this fd `resp` so the service adopts the RESP CLIENT listener unambiguously via
+# LISTEN_FDNAMES, rather than positionally. Today there is exactly one socket, so this is
+# equivalent to "adopt fd 3"; naming it future-proofs a second [Socket] (e.g. the replication /
+# cluster-bus port as FileDescriptorName=repl), whose adoption is a deliberate follow-up -- this
+# unit activates the CLIENT listener only.
+FileDescriptorName=resp
+
 # The kernel listen backlog. systemd silently CAPS this at net.core.somaxconn, so
 # to make the deep queue that absorbs the upgrade window effective, raise the
 # sysctl to match (e.g. `net.core.somaxconn=1024`) or this is clamped down to it.

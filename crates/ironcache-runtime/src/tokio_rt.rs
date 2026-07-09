@@ -180,18 +180,21 @@ pub fn adopt_listener_fd(fd: std::os::fd::RawFd) -> io::Result<std::net::TcpList
 #[cfg(unix)]
 pub fn listener_for(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     match crate::listen_fds::from_env() {
-        // Socket-activated: adopt the FIRST passed fd (the RESP `ListenStream`). A validation
-        // failure on the inherited fd degrades to a self-bind rather than failing the boot, but
-        // is logged (the one adopt-vs-fallback case the binary's #562 boot log cannot see, since
-        // the env parsed cleanly and only the fd itself is unusable).
-        Ok(fds) if !fds.is_empty() => adopt_listener_fd(fds[0].fd).or_else(|e| {
-            eprintln!(
-                "socket-activation: inherited fd {} could not be adopted ({e}); FELL BACK to \
-                 self-binding {addr}",
-                fds[0].fd
-            );
-            bind_reuseport_std(addr)
-        }),
+        // Socket-activated: adopt the RESP `ListenStream` fd -- the one NAMED `resp` when
+        // `LISTEN_FDNAMES` disambiguates a multi-socket unit, else the first passed fd (fd 3, the
+        // single-socket default). A validation failure on the inherited fd degrades to a self-bind
+        // rather than failing the boot, but is logged (the one adopt-vs-fallback case the binary's
+        // #562 boot log cannot see, since the env parsed cleanly and only the fd itself is unusable).
+        Ok(fds) if !fds.is_empty() => {
+            let fd = crate::listen_fds::resp_listener_fd(&fds).map_or(fds[0].fd, |f| f.fd);
+            adopt_listener_fd(fd).or_else(|e| {
+                eprintln!(
+                    "socket-activation: inherited fd {fd} could not be adopted ({e}); FELL BACK to \
+                     self-binding {addr}"
+                );
+                bind_reuseport_std(addr)
+            })
+        }
         // Not socket-activated (or a malformed/foreign LISTEN_* env): self-bind, unchanged behavior.
         _ => bind_reuseport_std(addr),
     }
