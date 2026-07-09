@@ -53,7 +53,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // pages") for the RSS/latency tradeoff, why the default is OFF, and the runtime
 // override.
 //
-// TUNABILITY ([[tunability-principle]]). THP is a behavior tradeoff, so it is a
+// TUNABILITY (the tunability tenet: env-dependent tradeoffs are config knobs with a
+// safe default). THP is a behavior tradeoff, so it is a
 // knob with a safe default rather than a baked-in choice. It is DEFAULT-OFF because
 // `thp:always` can raise RSS (2 MiB allocation granularity) and, on some kernels,
 // add khugepaged compaction latency spikes; keeping it off preserves an honest RSS
