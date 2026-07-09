@@ -1,11 +1,14 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
 
-# The p99.9 tail under durable load: the #518 moat metric (#574)
+# The p99.9 tail under durable load: methodology (#574, #518)
 
 This is the methodology for the tail-latency head-to-head: how IronCache's
 `scripts/bench/headtohead.sh` measures the **p99.9 (and p99.99) latency under a
-concurrent durable save**, why that specific number is IronCache's moat, and how
-to reproduce it on real hardware.
+concurrent durable save**, and how to reproduce it on real hardware. NOTE: this
+metric was originally framed as IronCache's "moat"; the harness itself REFUTED that
+(see the measured record below) -- IronCache's durable-save tail is COMPETITIVE
+(sub-second after #588), not category-leading. The doc keeps the harness; the honest
+result is stated plainly.
 
 It is the committed, reproducible HARNESS + methodology. It claims **no numbers**:
 the cross-competitor figures are produced by running this harness on a pinned
@@ -43,31 +46,36 @@ it is where the incumbents' designs leak:
 - **Redis / Valkey fork-COW stall.** `BGSAVE` `fork()`s; the child dumps the RDB
   while the parent keeps serving on copy-on-write pages. Under a write-heavy,
   skewed workload the parent faults and COW-copies hot pages during the save,
-  and large-heap forks add page-table-copy latency. The result is a
-  save-correlated tail spike the operator cannot schedule away.
+  and large-heap forks add page-table-copy latency.
 - **Dragonfly snapshot-spike.** Dragonfly avoids `fork` with a versioned,
   shard-local point-in-time snapshot, but the serialization still competes with
-  the serving fibers on the same proactor threads, so a save shows up as a
-  throughput dip / latency spike during the snapshot window.
-- **IronCache bounded per-op work + yielding snapshot.** Two shipped pieces make
-  the tail bounded by design:
-  - **#570 per-slot tables** keep the per-operation work bounded (no whole-table
-    rehash stall, no unbounded probe): a single op does a bounded amount of work
-    regardless of table growth, so the p99.9 does not inherit a resize cliff.
-  - **#571 yielding snapshot** dumps each shard's partition FORKLESS via the
-    `snapshot_chunk` pull, re-acquiring the store borrow PER CHUNK and YIELDING
-    between chunks (`ironcache-persist`, `crates/ironcache/src/persist.rs`). The
-    dumping shard SERVICES QUEUED WRITES between chunks, so a `SAVE`/`BGSAVE`
-    never monopolizes the serving shard for a whole-keyspace dump. The save tail
-    is bounded and predictable instead of a fork-COW cliff or a snapshot-window
-    spike. There is also no memory doubling (forkless), which matters precisely
-    under the low-`MAXMEMORY` eviction leg where a fork would need headroom the
-    ceiling does not allow.
+  the serving fibers, so a save shows up as a throughput dip during the window.
+- **IronCache forkless per-slot Arc-COW snapshot.** `#570` per-slot tables keep
+  per-op work bounded (no rehash cliff); `#588` per-slot Arc copy-on-write hands
+  a save a frozen point-in-time view read off-core by a dedicated persist thread,
+  with no O(N) serving-side copy and no fork memory doubling.
 
-So the claim the harness is built to PROVE is: **IronCache wins p99.9 under mixed
-+ hot-key-skew + concurrent eviction + concurrent snapshot, even where median GET
-only ties**, because its worst-case per-op work is bounded where the incumbents'
-is not.
+**What this harness actually MEASURED (honest, c7g, do not oversell):** the
+original thesis -- that IronCache WINS the durable-load tail -- was REFUTED by
+this very harness. The first measurement showed a catastrophic concurrent-snapshot
+p99.9 of ~3.5s (vs Dragonfly/Redis ~15ms), because the forkless save contended
+with the datapath. That drove a real fix: the per-slot Arc-COW (#588) cut it 11.5x
+to ~291ms. But ~291ms is still NOT parity: DURING a full-keyspace snapshot IronCache
+trails Dragonfly/Redis (~15ms) by ~16-20x. The cause is FUNDAMENTAL, not a bug: the
+persist thread reading the frozen keyspace shares MEMORY BANDWIDTH with the datapath,
+and IronCache's multi-core datapath already consumes most of that bandwidth serving,
+so a concurrent save has little headroom. Redis reaches ~15ms precisely because it
+is single-threaded (one serving core leaves headroom for a fork child). Pinning the
+persist thread and throttling the save were both MEASURED to make the tail WORSE (they
+lengthen the bandwidth-contention window).
+
+So the HONEST claim this harness supports is narrower and true: IronCache's baseline
+p99.9 TIES Dragonfly (~15ms) and beats it on qps/core and memory, its durable-save
+tail went from CATASTROPHIC (3.5s) to COMPETITIVE (sub-second, ~291ms), and it is
+deterministic and tunable. It does NOT win the during-snapshot tail; closing that to
+ms-class would require reducing the save's data footprint (incremental/compressed
+snapshots), a large deferred lever. See CONFIG.md ("Dedicated persist core") and
+issues #576/#588/#589 for the full measured record.
 
 ## The adversarial workload (the four dimensions)
 
