@@ -558,6 +558,51 @@ mod tests {
     }
 
     #[test]
+    fn bulk_len_header_over_cap_rejected_before_payload_buffered() {
+        // Reject-before-alloc (#527): a bulk-string length HEADER that declares more than
+        // `max_bulk_len` is a hard protocol error decided FROM THE HEADER ALONE. The decoder never
+        // waits for (so never buffers / allocates) the claimed payload. Here the header announces
+        // 600 MB but NO payload byte follows; against the default 512 MB ceiling the decode must
+        // return `Error` IMMEDIATELY, not `Incomplete` (which would signal the caller to keep
+        // reading toward a 600 MB buffer). The whole input is ~16 bytes yet the outcome is a
+        // protocol error: proof the huge declared size is rejected on the header, never allocated.
+        const OVER_CAP: usize = 600 * 1024 * 1024; // > the default 512 MB max_bulk_len
+        let header = format!("*1\r\n${OVER_CAP}\r\n");
+        assert!(
+            header.len() < 32,
+            "the header alone is tiny (no payload present)"
+        );
+        match decode(header.as_bytes(), &Limits::default()) {
+            DecodeOutcome::Error(e) => assert!(
+                e.line().contains("invalid bulk length"),
+                "expected an invalid-bulk-length protocol error, got {}",
+                e.line()
+            ),
+            other => panic!(
+                "an oversized bulk-length header must be an immediate Error (reject-before-alloc), \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn bulk_len_at_cap_with_no_payload_is_incomplete_not_error() {
+        // The dual of the reject-before-alloc test: a header whose declared length is WITHIN the cap
+        // is legitimate, so with no payload yet the decoder returns `Incomplete` (await the bytes),
+        // NOT an error. This confirms the cap rejects only the OVER-limit header, and that an
+        // under-limit large value is accepted once its bytes arrive (bounded separately by the total
+        // query-buffer cap in the serve loop, #528).
+        let limits = Limits {
+            max_bulk_len: 1024,
+            ..Limits::default()
+        };
+        assert_eq!(
+            decode(b"*1\r\n$1024\r\n", &limits),
+            DecodeOutcome::Incomplete
+        );
+    }
+
+    #[test]
     fn multibulk_count_over_cap_is_error() {
         let limits = Limits {
             max_multibulk: 2,

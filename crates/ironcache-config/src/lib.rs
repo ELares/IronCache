@@ -1018,6 +1018,19 @@ impl Config {
                 reason: "must be at least 1".to_owned(),
             });
         }
+        // The inbound bulk-string ceiling (Redis `proto-max-bulk-len`, #527) must be NON-ZERO at
+        // boot. A `0` ceiling makes the decoder reject EVERY bulk string (`invalid bulk length` on
+        // the first `$`-prefixed argument -- the whole RESP array form), a self-inflicted DoS from a
+        // single mistyped TOML/env value. `CONFIG SET proto-max-bulk-len 0` is already rejected at
+        // runtime (registry.rs); this makes the BOOT path agree, so the two entry points share one
+        // rule. `query_buffer_limit` deliberately has NO such guard: `0` there is the legal Redis
+        // "disabled" sentinel (the inbound query buffer stays uncapped), not a malformed value.
+        if self.proto_max_bulk_len == 0 {
+            return Err(ConfigError::Invalid {
+                field: "proto-max-bulk-len",
+                reason: "must be greater than 0".to_owned(),
+            });
+        }
         // maxmemory-policy must be one of the eight Redis names (case-insensitive),
         // EVICTION.md #50. An unknown name hard-fails boot rather than silently
         // falling back to a default (an operator typo must be visible).
@@ -2575,6 +2588,43 @@ mod tests {
         assert!(c.cluster_ca_path.is_none());
         assert!(c.cluster_secret.is_none());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn proto_max_bulk_len_zero_fails_validate_at_boot() {
+        // #527: a `0` inbound bulk-string ceiling would make the decoder reject EVERY bulk string,
+        // a self-DoS. Boot validation must reject it with a precise field error, matching the
+        // `CONFIG SET proto-max-bulk-len 0` runtime guard so the two entry points agree.
+        let bad = Config {
+            proto_max_bulk_len: 0,
+            ..Config::default()
+        };
+        assert!(matches!(
+            bad.validate().unwrap_err(),
+            ConfigError::Invalid {
+                field: "proto-max-bulk-len",
+                ..
+            }
+        ));
+        // A non-zero ceiling (here 1 byte, the smallest legal value; `CONFIG SET` likewise accepts
+        // any value > 0) passes: the guard rejects ONLY the zero footgun, not a small-but-valid cap.
+        let ok = Config {
+            proto_max_bulk_len: 1,
+            ..Config::default()
+        };
+        ok.validate().unwrap();
+        // The default ceiling is the Redis-compatible 512 MB and validates.
+        let d = Config::default();
+        assert_eq!(d.proto_max_bulk_len, DEFAULT_PROTO_MAX_BULK_LEN);
+        assert_eq!(d.proto_max_bulk_len, 512 * 1024 * 1024);
+        d.validate().unwrap();
+        // `query_buffer_limit = 0` is the LEGAL "disabled" sentinel (Redis parity), NOT a malformed
+        // value: it must still validate (the inbound query buffer is simply left uncapped).
+        let qbuf_off = Config {
+            query_buffer_limit: 0,
+            ..Config::default()
+        };
+        qbuf_off.validate().unwrap();
     }
 
     #[test]
