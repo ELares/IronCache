@@ -591,3 +591,76 @@ fn msetex_atomic_multikey_over_the_wire() {
         );
     });
 }
+
+/// Extract the `run_id:` value from an `INFO server` reply body.
+fn run_id_of(info: &str) -> &str {
+    info.lines()
+        .find_map(|l| l.strip_prefix("run_id:"))
+        .map(str::trim_end) // drop the trailing \r
+        .expect("INFO server must carry a run_id line")
+}
+
+/// #527 MONITOR honesty: MONITOR is NOT implemented, so the server replies a clear, honest
+/// `-ERR MONITOR is not supported` (not the generic unknown-command reply, and never a silent
+/// mis-behavior). The README secret-hygiene note no longer claims MONITOR either.
+#[test]
+fn monitor_is_honestly_unsupported() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let _server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+        assert_eq!(
+            cmd(&mut c, &["MONITOR"]).await,
+            "-ERR MONITOR is not supported\r\n"
+        );
+        // The connection is still usable after the reject (it was not a silent state change).
+        assert_eq!(cmd(&mut c, &["PING"]).await, "+PONG\r\n");
+    });
+}
+
+/// #527 INFO honesty: `run_id` is a REAL 40-hex per-boot value (not the old 40-zero placeholder)
+/// and `redis_mode` is `standalone` on a non-cluster node. Two SEPARATE boots produce DIFFERENT
+/// run ids (the value identifies a process incarnation, so it changes on restart -- what clients /
+/// `redis_exporter` rely on). Drawn through the ADR-0003 env seam at boot, so no raw entropy on a
+/// determinism-guarded path.
+#[test]
+fn info_reports_real_run_id_and_standalone_redis_mode() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        // Boot A.
+        let port_a = free_port();
+        let _a = run_server_for_test(port_a, 1);
+        let mut ca = connect_retry(port_a).await;
+        let info_a = cmd(&mut ca, &["INFO", "server"]).await;
+        assert!(
+            info_a.contains("redis_mode:standalone\r\n"),
+            "a non-cluster node reports standalone: {info_a:?}"
+        );
+        let run_id_a = run_id_of(&info_a).to_owned();
+        assert_eq!(
+            run_id_a.len(),
+            40,
+            "run_id must be 40 hex chars: {run_id_a:?}"
+        );
+        assert!(
+            run_id_a.bytes().all(|b| b.is_ascii_hexdigit()),
+            "run_id must be hex: {run_id_a:?}"
+        );
+        assert_ne!(
+            run_id_a, "0000000000000000000000000000000000000000",
+            "run_id must not be the old zero placeholder"
+        );
+
+        // Boot B (a fresh process incarnation) -> a DIFFERENT run id.
+        let port_b = free_port();
+        let _b = run_server_for_test(port_b, 1);
+        let mut cb = connect_retry(port_b).await;
+        let info_b = cmd(&mut cb, &["INFO", "server"]).await;
+        let run_id_b = run_id_of(&info_b).to_owned();
+        assert_ne!(
+            run_id_a, run_id_b,
+            "two boots must yield different run ids (run_id identifies an incarnation)"
+        );
+    });
+}

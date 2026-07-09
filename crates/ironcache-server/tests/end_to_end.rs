@@ -60,6 +60,7 @@ fn ctx_cfg(port: u16, pass: Option<&str>, cluster_enabled: bool) -> ServerContex
             // boot from the SystemEnv RNG); cluster mode per `cluster_enabled`
             // (CLUSTER_CONTRACT.md #70).
             cluster_node_id: "abcdef0123456789abcdef0123456789abcdef01",
+            run_id: "abcdef0123456789abcdef0123456789abcdef01",
             cluster_enabled,
         },
         cluster: None,

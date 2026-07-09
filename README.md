@@ -140,7 +140,7 @@ full contract.
   mTLS scope, and the rotation story are in [`docs/TLS.md`](docs/TLS.md).
 - **Cluster peer auth**: a shared `cluster_secret` presented in a constant-time
   handshake on the bus and replication links.
-- **Secret hygiene**: secret arguments are redacted from SLOWLOG, MONITOR, INFO, and
+- **Secret hygiene**: secret arguments are redacted from SLOWLOG, INFO, and
   logs; the long-lived `cluster_secret` and transient plaintext are held in
   `Zeroizing` and scrubbed from the heap. The scope (what is and is not protected, and
   why) is documented in `SECURITY.md` and `docs/THREAT_MODEL.md`.

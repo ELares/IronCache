@@ -197,6 +197,16 @@ ironcache-server = { path = "crates/ironcache-server" }
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+# OVERFLOW SAFETY (#527): keep the integer-overflow checks ON in release. Rust DISABLES them by
+# default in release (silent two's-complement wraparound), which for a cache doing size / offset /
+# refcount / TTL arithmetic turns a latent overflow into silent corruption rather than a loud abort.
+# `overflow-checks = true` makes an overflowing `+`/`-`/`*` PANIC (which, under `panic = "abort"`,
+# terminates the process with a symbolized location) instead of wrapping. The cost is a few extra
+# ALU instructions on arithmetic ops; for a data system the fail-fast correctness/safety guarantee
+# is worth it (the dev/test profiles already run with overflow-checks, so this keeps the SHIPPING
+# artifact honest to the same invariant). If a specific hot loop ever proves this material it can be
+# scoped down per-crate, but the default is safe.
+overflow-checks = true
 # CRASH ERGONOMICS (#551): keep the SYMBOL TABLE, strip only the (much larger) DWARF debuginfo.
 # `strip = "symbols"` removed BOTH, so a `panic = "abort"` release crash produced a backtrace of
 # bare unsymbolizable addresses. `strip = "debuginfo"` retains the symbol table so a

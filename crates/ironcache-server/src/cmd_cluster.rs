@@ -1379,6 +1379,7 @@ mod tests {
                 maxmemory_policy: "allkeys-lru",
                 mem_allocator: "jemalloc",
                 cluster_node_id: TEST_NODE_ID,
+                run_id: TEST_NODE_ID,
                 cluster_enabled: boot.cluster_enabled,
             },
             // No slot map: the single-node-owns-all fallback (slice-1 behavior). The
