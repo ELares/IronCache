@@ -68,9 +68,9 @@
 //! The save TIMESTAMP (`save_unix_secs`, what `LASTSAVE` reports) and the dump's lazy-expiry `now`
 //! are read from the shard's `ironcache-env` Clock seam, never `std::time`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ironcache_config::Config;
 use ironcache_runtime::bootstrap::ShardId;
@@ -113,7 +113,32 @@ const SHUTDOWN_SAVE_POLL: std::time::Duration = std::time::Duration::from_millis
 #[derive(Debug)]
 pub struct PersistState {
     /// The data directory: the snapshot location (`<dir>/dump-shard-<n>.icss` + `<dir>/dump.manifest`).
+    /// This is the DURABLE snapshot target (SAVE/BGSAVE/periodic + the crash-recovery source); the
+    /// upgrade handoff (#390) NEVER touches it when it stages on tmpfs, so a crash mid-upgrade always
+    /// recovers from the last durable snapshot here.
     pub dir: PathBuf,
+    /// The resolved tmpfs BASE for the upgrade HANDOFF snapshot (#390), or `None` when tmpfs staging
+    /// is unavailable (non-Linux, no `/dev/shm`, or a configured base that is not a tmpfs mount).
+    /// The handoff staging dir is `ironcache::handoff::handoff_staging_dir(base)`; `None` makes the
+    /// handoff save + boot load use the durable `data_dir`. Resolved ONCE at boot from
+    /// `config.upgrade_handoff_dir`.
+    pub handoff_base: Option<PathBuf>,
+    /// The directory THIS boot LOADS its snapshot from: the tmpfs handoff staging dir when a valid,
+    /// committed handoff manifest is present AND at least as fresh as the durable `data_dir`
+    /// snapshot (the just-completed-upgrade case), else the durable `data_dir`. Resolved ONCE at
+    /// construction (a cheap two-manifest read) so EVERY shard loads from the SAME source and the
+    /// choice cannot flap mid-boot as shards load at different instants.
+    pub boot_load_dir: PathBuf,
+    /// The tmpfs handoff staging dir to REMOVE once every shard has finished load-on-boot -- `Some`
+    /// ONLY when this boot loaded from tmpfs (`boot_load_dir` IS the staging dir). The ephemeral
+    /// handoff must not leak across upgrades; cleanup is coordinated by `shards_pending_load` so it
+    /// runs exactly once, AFTER the last shard has read the snapshot (never mid-load).
+    pub handoff_cleanup_dir: Option<PathBuf>,
+    /// Countdown of shards that have NOT yet finished load-on-boot, initialized to the shard count.
+    /// Each shard decrements it after its load ([`Self::note_shard_loaded`]); the shard that drives
+    /// it to zero removes `handoff_cleanup_dir`. This makes tmpfs cleanup safe under the
+    /// shared-nothing per-shard load (a slower shard is never raced into an empty keyspace).
+    pub shards_pending_load: AtomicUsize,
     /// The LIVE node-level persistence stats (last-save time + dirty counter), shared by `Arc` with
     /// `ServerContext` (the INFO `# Persistence` path) and the `/metrics` gauges so all three read
     /// the SAME atomics. The last-save time is SEEDED ON BOOT from the loaded snapshot's
@@ -138,8 +163,19 @@ impl PersistState {
     #[must_use]
     pub fn from_config(config: &Config) -> Option<Arc<PersistState>> {
         let dir = config.data_dir.clone()?;
+        // Resolve the tmpfs handoff base (#390): the configured `upgrade_handoff_dir`, or the
+        // built-in `/dev/shm` on Linux, but ONLY when it is a real RAM-backed tmpfs mount. `None`
+        // (non-Linux / no tmpfs / a disk dir) self-binds every handoff to the durable `data_dir`.
+        let handoff_base = crate::handoff::usable_tmpfs_base(config.upgrade_handoff_dir.as_deref());
+        // Resolve, ONCE, which snapshot THIS boot loads from (tmpfs handoff vs durable data_dir).
+        let (boot_load_dir, handoff_cleanup_dir) =
+            resolve_boot_load_dir(&dir, handoff_base.as_deref());
         Some(Arc::new(PersistState {
             dir,
+            handoff_base,
+            boot_load_dir,
+            handoff_cleanup_dir,
+            shards_pending_load: AtomicUsize::new(config.shards.max(1)),
             stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
             saving: std::sync::atomic::AtomicBool::new(false),
@@ -177,7 +213,10 @@ impl PersistState {
         if self.stats.last_save_unix_secs() != 0 {
             return;
         }
-        if let Some(manifest) = ironcache_persist::read_manifest(&self.dir) {
+        // Read the manifest of the snapshot THIS boot actually loaded (`boot_load_dir`): the tmpfs
+        // handoff when the node booted from it (#390), else the durable `data_dir`. So `LASTSAVE`
+        // reflects the loaded snapshot's save time regardless of which source won the boot.
+        if let Some(manifest) = ironcache_persist::read_manifest(&self.boot_load_dir) {
             self.stats.set_last_save_unix_secs(manifest.save_unix_secs);
         }
     }
@@ -234,6 +273,45 @@ impl PersistState {
     /// Called by the save fan-out on any failure arm.
     pub fn record_save_failed(&self) {
         self.stats.set_last_bgsave_ok(false);
+    }
+
+    /// Record a committed EPHEMERAL upgrade-handoff save on tmpfs (#390): stamp `LASTSAVE` (so the
+    /// upgrade's SAVE-first confirmation sees it ADVANCE) and bump the save id, but DO NOT reset the
+    /// durable dirty counter or the `rdb_last_bgsave_status`. The tmpfs handoff is ephemeral and does
+    /// NOT touch the durable `data_dir`, so "changes since the last DURABLE save" and the durable-save
+    /// health signal must stay honest: if the upgrade ABORTS and the process keeps running, the
+    /// periodic policy still knows a durable save is owed. (The data_dir FALLBACK path uses
+    /// [`Self::record_committed`] instead, since that write IS durable.)
+    pub fn record_handoff_committed(&self, save_unix_secs: u64) {
+        self.stats.set_last_save_unix_secs(save_unix_secs);
+        self.save_id.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Note that ONE shard has finished its load-on-boot; the shard that drives the countdown to
+    /// zero cleans up the ephemeral tmpfs handoff (#390). Cleanup runs EXACTLY ONCE, AFTER the last
+    /// shard has read the snapshot -- a per-shard load reads EVERY manifest file, so removing the
+    /// staging dir mid-load would race a slower shard into an empty keyspace. `handoff_cleanup_dir`
+    /// is `Some` only when this boot loaded FROM tmpfs, so a data_dir boot decrements harmlessly.
+    pub fn note_shard_loaded(&self) {
+        // fetch_sub returns the PRE-decrement value; `== 1` means this call took it to 0 (last shard).
+        if self.shards_pending_load.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Some(dir) = self.handoff_cleanup_dir.as_deref() {
+                match std::fs::remove_dir_all(dir) {
+                    Ok(()) => tracing::info!(
+                        dir = %dir.display(),
+                        "ironcache upgrade: cleaned up the tmpfs handoff snapshot after load-on-boot"
+                    ),
+                    // Already gone (a concurrent cleanup / never written): nothing to do.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "ironcache upgrade: could not remove the tmpfs handoff snapshot; it is \
+                         ephemeral (a reboot clears it and the next handoff save truncates it)"
+                    ),
+                }
+            }
+        }
     }
 
     /// The next monotone save id (the value the next save will record; read for the manifest).
@@ -353,8 +431,9 @@ pub async fn do_save_all(
     outcome
 }
 
-/// The inner cross-shard SAVE attempt: the actual fan-out + manifest commit (records the COMMITTED
-/// save on success). [`do_save_all`] wraps it to record a FAILED save on any `Err` (#549).
+/// The inner cross-shard SAVE attempt against the DURABLE `data_dir`: the actual fan-out + manifest
+/// commit (records the COMMITTED save on success). [`do_save_all`] wraps it to record a FAILED save
+/// on any `Err` (#549). A thin wrapper over the dir-generic [`save_all_to_dir`].
 async fn save_all_attempt(
     persist: &Arc<PersistState>,
     inbox: &Inbox,
@@ -363,15 +442,43 @@ async fn save_all_attempt(
     db: u32,
     save_unix_secs: u64,
 ) -> Result<(), String> {
-    let n_shards = inbox.len();
     let dir = persist.dir.clone();
-    // Ensure the data directory exists (idempotent; a create failure fails the save cleanly).
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return Err(format!("cannot create data dir {}: {e}", dir.display()));
+    save_all_to_dir(persist, inbox, ctx, home, db, save_unix_secs, &dir, true).await
+}
+
+/// The dir-generic cross-shard SAVE: fan an `__ICSAVE` out to EVERY shard (each dumps its OWN
+/// partition to `<dir>/dump-shard-<n>.icss` ON ITS OWN thread), collect the manifest entries, and
+/// COMMIT by writing `<dir>/dump.manifest` LAST (atomic + fsync'd). `dir` is the DURABLE `data_dir`
+/// for a normal SAVE/BGSAVE/periodic save and the TMPFS staging dir for the #390 upgrade handoff --
+/// the write mechanics (per-shard atomic file, manifest-last commit, CRC fail-closed) are IDENTICAL
+/// on both, so the tmpfs handoff inherits the same torn/foreign safety as the durable path.
+///
+/// `durable` selects the post-commit accounting: `true` records a full committed DURABLE save
+/// ([`PersistState::record_committed`] -- stamps `LASTSAVE`, resets the dirty counter, marks
+/// bgsave-ok); `false` records an EPHEMERAL handoff ([`PersistState::record_handoff_committed`] --
+/// stamps `LASTSAVE` for the upgrade confirmation but leaves the durable dirty/health accounting
+/// untouched, since the tmpfs write is not durable).
+///
+/// SERIALIZED: the caller must hold the save latch. No `RefCell` borrow is held across any await.
+#[allow(clippy::too_many_arguments)]
+async fn save_all_to_dir(
+    persist: &Arc<PersistState>,
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    home: ShardId,
+    db: u32,
+    save_unix_secs: u64,
+    dir: &Path,
+    durable: bool,
+) -> Result<(), String> {
+    let n_shards = inbox.len();
+    // Ensure the target directory exists (idempotent; a create failure fails the save cleanly).
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return Err(format!("cannot create snapshot dir {}: {e}", dir.display()));
     }
     // One `__ICSAVE` sub-request per shard, each carrying its own shard index for its file name.
     let subreqs: Vec<(usize, Request)> = (0..n_shards)
-        .map(|shard| (shard, icsave_request(save_unix_secs, shard, &dir)))
+        .map(|shard| (shard, icsave_request(save_unix_secs, shard, dir)))
         .collect();
     // Fan out via the SAVE-specific fan-out (#571): the home shard's own dump runs INLINE on the
     // YIELDING `run_local_save` (awaits between snapshot chunks), which a synchronous `fan_out_split`
@@ -395,12 +502,125 @@ async fn save_all_attempt(
 
     // COMMIT: write the manifest LAST (the atomic commit point).
     let save_id = persist.next_save_id();
-    match ironcache_persist::write_manifest(&dir, save_id, save_unix_secs, entries) {
+    match ironcache_persist::write_manifest(dir, save_id, save_unix_secs, entries) {
         Ok(_) => {
-            persist.record_committed(save_unix_secs);
+            if durable {
+                persist.record_committed(save_unix_secs);
+            } else {
+                persist.record_handoff_committed(save_unix_secs);
+            }
             Ok(())
         }
         Err(e) => Err(format!("manifest write failed: {e}")),
+    }
+}
+
+/// PERFORM the `ironcache upgrade` HANDOFF save (#390): stage the snapshot on tmpfs (`/dev/shm`,
+/// RAM-backed) to shrink the reload window by removing the disk I/O legs, guarded against OOM. Falls
+/// back to the durable `data_dir` when tmpfs staging is unavailable or the RAM/tmpfs-headroom guard
+/// declines. The durable `data_dir` snapshot is UNTOUCHED on the tmpfs path (the crash-recovery
+/// source stays intact); the new process's load-on-boot prefers this handoff when present + fresh.
+///
+/// SERIALIZED like [`do_save_all`]: the caller must hold the save latch. Records a FAILED save on any
+/// `Err` (#549). Returns `Ok(())` on a committed handoff (tmpfs OR the data_dir fallback).
+pub async fn do_handoff_save_all(
+    persist: &Arc<PersistState>,
+    inbox: &Inbox,
+    ctx: &ServerContext,
+    home: ShardId,
+    db: u32,
+    save_unix_secs: u64,
+) -> Result<(), String> {
+    match persist.resolve_handoff_target(ctx) {
+        crate::handoff::HandoffTarget::Tmpfs(dir) => {
+            tracing::info!(
+                dir = %dir.display(),
+                "ironcache upgrade: staging the handoff snapshot on tmpfs (RAM-backed, no disk I/O; \
+                 the durable data_dir snapshot is left untouched)"
+            );
+            // Truncate any stale staging dir left by a crashed prior handoff so this handoff starts
+            // from a clean tmpfs dir (a leftover file the new manifest does not reference is ignored
+            // on load, but clearing it keeps /dev/shm tidy and bounds the RAM footprint).
+            let _ = std::fs::remove_dir_all(&dir);
+            let outcome =
+                save_all_to_dir(persist, inbox, ctx, home, db, save_unix_secs, &dir, false).await;
+            if outcome.is_err() {
+                persist.record_save_failed();
+            }
+            outcome
+        }
+        crate::handoff::HandoffTarget::DataDir => {
+            tracing::info!(
+                dir = %persist.dir.display(),
+                "ironcache upgrade: staging the handoff snapshot on the durable data_dir (tmpfs \
+                 unavailable, non-Linux, or the RAM-headroom guard declined tmpfs)"
+            );
+            // The durable fallback IS a normal committed data_dir save.
+            do_save_all(persist, inbox, ctx, home, db, save_unix_secs).await
+        }
+    }
+}
+
+/// Resolve, ONCE, which snapshot dir THIS boot loads from and whether a tmpfs handoff must be cleaned
+/// up afterward (#390). Prefers the tmpfs handoff staging dir when its manifest reads CLEANLY
+/// (`read_manifest` enforces magic/version/CRC -- #530 fail-closed on a foreign/torn handoff) AND it
+/// is at least as fresh as the durable `data_dir` manifest (a stale leftover from a crashed
+/// upgrade must never shadow a newer durable save). Otherwise the durable `data_dir`, and no cleanup.
+///
+/// Returns `(load_dir, cleanup_dir)`: `cleanup_dir` is `Some(staging)` ONLY when the tmpfs handoff
+/// won, so a data_dir boot never removes a staging dir it did not load from (which could be another
+/// instance's, given the node-local well-known path).
+fn resolve_boot_load_dir(
+    data_dir: &Path,
+    handoff_base: Option<&Path>,
+) -> (PathBuf, Option<PathBuf>) {
+    let Some(base) = handoff_base else {
+        return (data_dir.to_path_buf(), None);
+    };
+    let staging = crate::handoff::handoff_staging_dir(base);
+    let handoff_time = ironcache_persist::read_manifest(&staging).map(|m| m.save_unix_secs);
+    let durable_time = ironcache_persist::read_manifest(data_dir).map(|m| m.save_unix_secs);
+    match (handoff_time, durable_time) {
+        // A valid handoff manifest at least as fresh as the durable one -> load from tmpfs + clean up
+        // (the just-completed-upgrade case, and the crashed-mid-upgrade case where tmpfs is newer).
+        (Some(h), Some(d)) if h >= d => (staging.clone(), Some(staging)),
+        // A valid handoff with no durable snapshot at all -> load from tmpfs + clean up.
+        (Some(_), None) => (staging.clone(), Some(staging)),
+        // No handoff / a stale-or-foreign handoff -> the durable data_dir, no cleanup.
+        _ => (data_dir.to_path_buf(), None),
+    }
+}
+
+impl PersistState {
+    /// Choose the upgrade-handoff SAVE target (#390): tmpfs when the RAM-headroom guard admits it,
+    /// else the durable `data_dir`. The size estimate is a CONSERVATIVE upper bound on the on-tmpfs
+    /// snapshot -- the live allocator memory (`>=` the logical dataset), falling back to `maxmemory`;
+    /// an unknown size (both zero) never gambles on tmpfs. The available budget is `MemAvailable`
+    /// (which already EXCLUDES the resident live dataset), so `snapshot + headroom <= MemAvailable`
+    /// bounds the incremental tmpfs cost against OOM. (A too-small tmpfs mount that would ENOSPC on
+    /// write is not pre-checked here -- it degrades cleanly: the tmpfs save errors and the upgrade
+    /// CLI falls back to a plain durable `SAVE`.)
+    fn resolve_handoff_target(&self, ctx: &ServerContext) -> crate::handoff::HandoffTarget {
+        use crate::handoff;
+        let Some(base) = self.handoff_base.as_deref() else {
+            return handoff::HandoffTarget::DataDir;
+        };
+        // A FRESH synchronous live-allocator read (jemalloc epoch + stats.allocated), NOT the
+        // periodically-published gauge -- so the estimate is valid even on a just-booted node before
+        // the first expiry tick. The whole-process allocation is `>=` the logical dataset (a
+        // conservative overestimate for the OOM guard); `maxmemory` is a secondary ceiling.
+        let live_mem = ironcache_store::process_memory().0;
+        let estimate = live_mem.max(ctx.maxmemory());
+        if estimate == 0 {
+            // No size signal at all -> do not gamble on tmpfs (the safe data_dir path).
+            return handoff::HandoffTarget::DataDir;
+        }
+        handoff::handoff_target(
+            estimate,
+            handoff::available_ram_bytes(),
+            handoff::headroom_for(estimate),
+            base,
+        )
     }
 }
 
@@ -513,6 +733,10 @@ mod tests {
     fn latch_state() -> Arc<PersistState> {
         Arc::new(PersistState {
             dir: PathBuf::from("/nonexistent-test-dir"),
+            handoff_base: None,
+            boot_load_dir: PathBuf::from("/nonexistent-test-dir"),
+            handoff_cleanup_dir: None,
+            shards_pending_load: AtomicUsize::new(1),
             stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
             saving: AtomicBool::new(false),
@@ -531,6 +755,10 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let p = Arc::new(PersistState {
             dir: dir.clone(),
+            handoff_base: None,
+            boot_load_dir: dir.clone(),
+            handoff_cleanup_dir: None,
+            shards_pending_load: AtomicUsize::new(1),
             stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
             saving: AtomicBool::new(false),

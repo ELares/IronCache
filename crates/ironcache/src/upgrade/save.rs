@@ -193,20 +193,20 @@ async fn save_exchange(resp_addr: &str, password: Option<&str>) -> Result<SaveOu
     // LASTSAVE before, to detect advancement.
     let before = lastsave(&mut stream).await?;
 
-    // SAVE (blocking, fsync'd). A persistence-disabled server replies an error here -- that is the
-    // honest no-persistence case, not a hard failure.
-    write_command(&mut stream, &[b"SAVE"]).await?;
-    match read_reply(&mut stream).await? {
-        Reply::Simple(s) if s.eq_ignore_ascii_case("OK") => {}
-        Reply::Error(e) => {
-            return Ok(SaveOutcome::NoPersistence { reason: e });
-        }
-        other => {
-            return Err(SaveError::Protocol {
-                context: "SAVE".to_owned(),
-                detail: other.to_string(),
-            });
-        }
+    // SAVE (blocking, fsync'd). We PREFER the #390 upgrade HANDOFF save (`SAVE HANDOFF`), which the
+    // server stages on tmpfs (RAM-backed, no disk I/O) when a RAM-headroom guard admits it -- this
+    // shrinks the reload window the new process pays on load-on-boot. It is a BEST-EFFORT
+    // optimization: a server that does not understand the `HANDOFF` argument (upgrading FROM a
+    // pre-#390 build) or that has persistence off replies an error, so we transparently fall back to
+    // a plain durable `SAVE` and interpret ITS reply definitively. Either committed save advances
+    // LASTSAVE, which is what we confirm below; a persistence-disabled server surfaces as the honest
+    // no-persistence case, not a hard failure.
+    match issue_save(&mut stream, &[b"SAVE", b"HANDOFF"]).await? {
+        SaveReply::Ok => {}
+        SaveReply::Error(_handoff_err) => match issue_save(&mut stream, &[b"SAVE"]).await? {
+            SaveReply::Ok => {}
+            SaveReply::Error(reason) => return Ok(SaveOutcome::NoPersistence { reason }),
+        },
     }
 
     // LASTSAVE after; confirm it advanced (or moved off 0).
@@ -215,6 +215,33 @@ async fn save_exchange(resp_addr: &str, password: Option<&str>) -> Result<SaveOu
         Ok(SaveOutcome::Confirmed { last_save: after })
     } else {
         Err(SaveError::NotAdvanced { before, after })
+    }
+}
+
+/// The outcome of one save command: `+OK` (committed) or an `-ERR` reply (persistence disabled, an
+/// unsupported argument on an older server, or another server-reported reason). A non-status reply
+/// is a hard protocol error surfaced by [`issue_save`].
+enum SaveReply {
+    /// `+OK`: the save committed.
+    Ok,
+    /// `-<reason>`: the server declined (persistence off / unsupported argument / other).
+    Error(String),
+}
+
+/// Write one save command (`SAVE` or `SAVE HANDOFF`, #390) and classify its reply as [`SaveReply`].
+/// An unexpected (non simple-string / non-error) reply is a hard [`SaveError::Protocol`].
+async fn issue_save(
+    stream: &mut tokio::net::TcpStream,
+    args: &[&[u8]],
+) -> Result<SaveReply, SaveError> {
+    write_command(stream, args).await?;
+    match read_reply(stream).await? {
+        Reply::Simple(s) if s.eq_ignore_ascii_case("OK") => Ok(SaveReply::Ok),
+        Reply::Error(e) => Ok(SaveReply::Error(e)),
+        other => Err(SaveError::Protocol {
+            context: "SAVE".to_owned(),
+            detail: other.to_string(),
+        }),
     }
 }
 
@@ -418,9 +445,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn no_persistence_when_save_errors() {
-        // LASTSAVE=0, then SAVE replies an error (persistence disabled).
+        // LASTSAVE=0, then `SAVE HANDOFF` errors (persistence disabled) AND the plain-SAVE fallback
+        // also errors -> the honest no-persistence outcome (#390: the handoff falls back to SAVE).
         let addr = spawn_fake(vec![
             b":0\r\n",
+            b"-ERR persistence is disabled (no data_dir)\r\n",
             b"-ERR persistence is disabled (no data_dir)\r\n",
         ])
         .await;
@@ -431,6 +460,25 @@ mod tests {
             }
             SaveOutcome::Confirmed { .. } => panic!("expected NoPersistence, got Confirmed"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_unsupported_falls_back_to_plain_save() {
+        // #390 compat: `SAVE HANDOFF` errors (an older server that does not know the argument), the
+        // plain `SAVE` fallback succeeds, and LASTSAVE advances -> Confirmed via the durable path.
+        // Script: LASTSAVE(before)=100, SAVE HANDOFF=-ERR, SAVE=+OK, LASTSAVE(after)=200.
+        let addr = spawn_fake(vec![
+            b":100\r\n",
+            b"-ERR wrong number of arguments for 'save' command\r\n",
+            b"+OK\r\n",
+            b":200\r\n",
+        ])
+        .await;
+        let out = save_exchange(&addr, None).await.expect("exchange ok");
+        assert!(
+            matches!(out, SaveOutcome::Confirmed { last_save: 200 }),
+            "the plain-SAVE fallback confirms: {out:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
