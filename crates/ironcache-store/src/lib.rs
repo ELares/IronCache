@@ -1139,15 +1139,21 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // the hot path (the no-op policies do nothing with it, and the FIFO-class engine
         // reads the freq off the object at `select_victim` time via `VictimFreq`).
         let h = self.key_hash(key);
-        // SINGLE PROBE (#511): one `find_mut` bumps the freq AND yields the view, instead of a
-        // `find_mut` (bump) followed by a second `find` (view) -- two SIMD group walks where one
-        // suffices on every GET. The `&mut Entry` reborrows immutably for `view_of` after the bump.
-        // `expire_if_due` above returned true, so the key's slot table exists (the DB is touched);
-        // `slot_table_mut` therefore does not allocate here (#570).
-        self.slot_table_mut(db_idx, key)
-            .find_mut(h, |e| e.key() == key)
+        // SHARED READ (#576 prerequisite): the GET hot path looks the entry up with the
+        // SHARED `find` (not `find_mut`) and bumps the S3-FIFO freq through the entry's
+        // INTERIOR-MUTABLE `bump_freq_shared` accessor, so a hit needs NO `&mut` on the
+        // table or the entry -- the whole read path is a shared borrow. This decouples the
+        // freq bump from `&mut` so a later per-slot Arc-COW value never triggers
+        // `Arc::get_mut`'s refcount check on a plain GET (the measured driver of the Arc
+        // regression). The bump is BYTE-IDENTICAL to the old `find_mut(..).bump_freq()`, so
+        // eviction picks the same victims. Still a SINGLE probe (#511): one `find` both
+        // bumps (via the shared accessor) and yields the view. `expire_if_due` above
+        // returned true, so the key's slot table exists (the DB is touched, #570), hence
+        // `slot_table(..)` is `Some`.
+        self.slot_table(db_idx, key)
+            .and_then(|t| t.find(h, |e| e.key() == key))
             .map(|obj| {
-                obj.bump_freq();
+                obj.bump_freq_shared();
                 Self::view_of(obj)
             })
     }
@@ -1208,22 +1214,19 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
 
         // Observe (atomically with the write that follows, on the owning core).
         let step = if live {
-            // freq-in-object: bump the just-accessed entry's S3-FIFO freq INLINE (the
-            // store holds the entry, O(1), no policy lookup). The per-access `on_access`
-            // policy call is gone from the hot path; the policy reads the freq off the
-            // object at `select_victim` time via `VictimFreq`.
+            // freq-in-object: bump the just-accessed entry's S3-FIFO freq INLINE through the
+            // SHARED interior-mutable accessor (O(1), no policy lookup, no `&mut` on the
+            // table). One `find` both bumps the freq AND yields the read-only view, instead
+            // of a `find_mut` (bump) followed by a second `find` (view). The per-access
+            // `on_access` policy call is gone from the hot path; the policy reads the freq
+            // off the object at `select_victim` time via `VictimFreq`. `live` is true, so the
+            // key's slot table exists (the DB is touched, #570), hence `slot_table` is `Some`.
             let h = self.key_hash(key);
-            // `live` is true, so the key's slot table exists (the DB is touched, #570).
-            if let Some(obj) = self
-                .slot_table_mut(db_idx, key)
-                .find_mut(h, |e| e.key() == key)
-            {
-                obj.bump_freq();
-            }
             let obj = self
                 .slot_table(db_idx, key)
                 .and_then(|t| t.find(h, |e| e.key() == key))
                 .expect("live entry present");
+            obj.bump_freq_shared();
             let entry = RmwEntry::Occupied(Self::occupied_of(obj));
             f(entry)
         } else {
