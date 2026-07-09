@@ -1139,147 +1139,66 @@ pub fn run_local_spublish(request: &Request) -> Value {
     Value::Integer(count)
 }
 
-/// The per-chunk SAVE-BACKPRESSURE sleep (#577), in microseconds: given `elapsed_us` spent doing one
-/// dump chunk's work and the configured throttle `pct` (`1..=100`), the time the save loop should
-/// then sleep so the save consumes only about `pct`% of the serving core.
-///
-/// The core is shared `pct : (100 - pct)` between the save and the datapath, so after `elapsed_us` of
-/// save work the loop yields `elapsed_us * (100 - pct) / pct` to the datapath. At `pct == 100` (the
-/// DEFAULT, no throttle) this is `0` -- the save loop keeps its byte-identical pre-#577 `yield_now`
-/// and inserts no timer sleep at all. The multiply saturates (a pathologically long chunk cannot
-/// overflow into a wrong tiny sleep); the caller only reaches the divide with `pct` in `1..=99`
-/// (`pct >= 100` takes the no-sleep branch and the registry validates the `1..=100` domain), so the
-/// `/ pct` never divides by zero. This is a pure function of its inputs (env clock reads happen at the
-/// call site) so the proportional-throttle math is unit-tested deterministically, no wall-clock race.
-#[must_use]
-fn save_throttle_sleep_us(elapsed_us: u64, pct: u64) -> u64 {
-    if pct >= 100 {
-        return 0;
-    }
-    // pct is in 1..=99 here, so `100 - pct` is 1..=99 and the divide is by a non-zero pct.
-    elapsed_us.saturating_mul(100 - pct) / pct
-}
-
-#[cfg(test)]
-mod save_throttle_tests {
-    use super::save_throttle_sleep_us;
-
-    /// #577: the DEFAULT pct==100 inserts NO sleep (byte-identical to the pre-#577 yielding dump), and
-    /// any value at/above 100 is likewise a zero throttle -- the save loop keeps its plain `yield_now`.
-    #[test]
-    fn pct_100_is_zero_sleep_byte_identical() {
-        assert_eq!(save_throttle_sleep_us(0, 100), 0);
-        assert_eq!(save_throttle_sleep_us(1_000, 100), 0);
-        assert_eq!(save_throttle_sleep_us(5_000_000, 100), 0);
-        // Defensive: a value above 100 (the registry rejects it, but the helper must not misbehave)
-        // is also a zero throttle rather than an underflow.
-        assert_eq!(save_throttle_sleep_us(1_000, 200), 0);
-    }
-
-    /// #577: below 100 the sleep is PROPORTIONAL -- the core is shared `pct : (100 - pct)`, so after
-    /// `elapsed` of save work the loop yields `elapsed * (100 - pct) / pct` to the datapath.
-    #[test]
-    fn sub_100_sleeps_proportionally() {
-        // pct=50: a 50/50 split -> sleep == elapsed (the save gets half the core).
-        assert_eq!(save_throttle_sleep_us(1_000, 50), 1_000);
-        // pct=10: the save gets a tenth -> sleep is 9x elapsed (a ~2s dump stretches to ~20s wall).
-        assert_eq!(save_throttle_sleep_us(200, 10), 1_800);
-        assert_eq!(save_throttle_sleep_us(2_000_000, 10), 18_000_000);
-        // pct=25: sleep is 3x elapsed.
-        assert_eq!(save_throttle_sleep_us(300, 25), 900);
-        // pct=1 (the most aggressive throttle): sleep is 99x elapsed.
-        assert_eq!(save_throttle_sleep_us(1_000, 1), 99_000);
-        // A zero-elapsed chunk yields a zero sleep regardless of pct (nothing to compensate for).
-        assert_eq!(save_throttle_sleep_us(0, 10), 0);
-    }
-
-    /// The multiply SATURATES: a pathologically long chunk cannot overflow into a wrong tiny sleep --
-    /// the `* (100 - pct)` clamps at `u64::MAX` and the `/ pct` then divides that saturated value
-    /// (never a panic, always a huge sleep).
-    #[test]
-    fn saturates_instead_of_overflowing() {
-        // pct=1: `* 99` saturates to u64::MAX, `/ 1` leaves it at u64::MAX.
-        assert_eq!(save_throttle_sleep_us(u64::MAX, 1), u64::MAX);
-        // pct=50: `* 50` saturates to u64::MAX, `/ 50` divides the saturated value (still enormous).
-        assert_eq!(save_throttle_sleep_us(u64::MAX, 50), u64::MAX / 50);
-    }
-}
-
-/// The bounded number of OWNED snapshot chunks the copy loop keeps IN FLIGHT to the dedicated persist
-/// thread (#576 PR-B). The shard copies one chunk, ships it, and moves straight to the next; the
-/// persist thread encodes + fsyncs those chunks OFF the serving core. A SMALL bound (a few
-/// [`ironcache_persist::DUMP_CHUNK`] batches) keeps the NEW transient memory a save costs to
-/// O(a few chunks), NOT a second full copy of the keyspace, while giving the encode thread enough
-/// runway that the shard rarely waits on the channel. The encoded dump BODY itself accumulates on the
-/// persist thread (~1x the keyspace) -- exactly the buffer that used to accumulate on the shard thread
-/// pre-PR-B: it is RELOCATED off the serving core, not new memory.
-const PERSIST_QUEUE_DEPTH: usize = 4;
-
-// #576 PR-B soundness: the shard hands OWNED snapshot records to another OS thread, so those records
-// MUST be `Send`. The store's `Entry` slot is a `!Send` tagged `NonNull<u8>` (kvobj.rs), but
-// `snapshot_chunk` does NOT ship an `Entry`: it reconstructs each key/value into an OWNED, borrow-free
-// `KvObj` (`Box<[u8]>` key + `ValueRepr`/collection values that are all `Box`/`Vec`/`HashMap`), so a
-// `SnapshotEntry` carries no raw pointer and is `Send`. This static assertion pins that: if a future
-// field made `KvObj` `!Send` the handoff below would no longer compile, catching the regression HERE
-// rather than as an `unsafe` footgun.
+// #576 FROZEN-SLOT soundness: the shard hands its FROZEN slot tables to a dedicated persist OS thread,
+// so what it ships MUST be `Send`. An `Arc<HashTable<Entry>>` is `!Send` (`Entry` is a `!Send` tagged
+// `NonNull<u8>`), so the store wraps each frozen slot in `ironcache_store::FrozenSlot`, whose
+// `unsafe impl Send` is justified by the freeze invariant (a frozen slot's entries are de-facto
+// immutable for the save -- every datapath write COWs first and the shared freq bump is gated off; see
+// the `FrozenSlot` type doc). This static assertion pins that the shipped type IS `Send`, so a
+// regression that broke the wrapper would fail HERE at compile time rather than as an `unsafe` footgun.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
-    assert_send::<ironcache_store::SnapshotEntry>();
+    assert_send::<Vec<ironcache_store::FrozenSlot>>();
 };
 
 /// Run ONE shard's `__ICSAVE <save_unix_secs> <shard_index> <dir>` against THIS shard's store
-/// (#58 persistence, #571 yielding save, #576 off-thread persist): DUMP this shard's whole partition
-/// to `<dir>/dump-shard-<shard_index>.icss` ATOMICALLY (tmp -> fsync -> rename) and return its manifest
+/// (#58 persistence, #576 per-slot Arc-COW off-thread persist): DUMP this shard's whole partition to
+/// `<dir>/dump-shard-<shard_index>.icss` ATOMICALLY (tmp -> fsync -> rename) and return its manifest
 /// entry encoded as `*3 [:shard :keys :crc]` (see [`crate::persist::encode_save_reply`]). On an I/O
 /// error it returns a proto error the home core surfaces as a failed SAVE.
 ///
-/// ## Off-thread persist (#576 PR-B): the shard is UNCONTENDED during the encode + fsync
+/// ## Per-slot Arc-COW freeze (#576): the shard does NO O(N) copy; the datapath stays uncontended
 ///
-/// The seconds-long p99.9 stalls (#576) came from the ENCODE + FSYNC of the whole keyspace running ON
-/// the serving shard's single thread: #571 (yield between chunks) and #578 (throttle) only REDUCE the
-/// contention because the encode is still on the critical serving core. PR-B removes it entirely. The
-/// shard now does ONLY a bounded, chunked COPY of its store into an OWNED `Send` buffer; a DEDICATED
-/// OS thread does the encode + fsync of that owned copy while the shard keeps serving.
+/// The seconds-long p99.9 stalls (#576) were NOT the encode+fsync (#586 already moved those off-thread)
+/// -- they were the O(N) `snapshot_chunk` COPY of the whole keyspace into owned records, which HAD to
+/// stay on the serving core (the store is `!Send`) and contended the datapath on memory bandwidth
+/// (throttling only STRETCHED that contention). This fix removes the serving-side copy entirely:
 ///
-/// Flow:
-/// - Spawn a per-shard persist thread (`std::thread`, name `ic-persist-<shard>`) that owns the encode:
-///   it `recv`s owned [`SnapshotEntry`](ironcache_store::SnapshotEntry) chunks off a bounded channel,
-///   feeds each to [`ironcache_persist::ShardDumpBuilder::push_chunk`] (the `ironcache_repl::encode_kvobj`
-///   codec + CRC), then [`ironcache_persist::write_shard_dump`]s the sealed file ATOMICALLY. It touches
-///   ONLY the owned copy + the filesystem, never a shard cell.
-/// - The shard drives the COPY loop: each iteration takes a SHORT read-only store borrow, pulls one
-///   bounded `snapshot_chunk` batch (O(`DUMP_CHUNK`) keys, already an OWNED reconstruction so this IS
-///   the copy -- no second copy), RELEASES the borrow, and STREAMS the owned chunk to the persist
-///   thread. It then `yield_now().await`s (or throttles, below) so its executor services queued writes
-///   before the next chunk. The store borrow is taken + dropped INSIDE each chunk block, never held
-///   across an await.
-/// - The shard hands off WITHOUT blocking its executor: a bounded [`std::sync::mpsc::sync_channel`]
-///   (`PERSIST_QUEUE_DEPTH`) `try_send`; on backpressure (the persist thread momentarily behind) it
-///   `yield_now().await`s and retries rather than a blocking `send` that would stall the WHOLE shard
-///   OS thread. The bound caps the in-flight owned copy at ~`PERSIST_QUEUE_DEPTH` chunks (the memory
-///   bound; the ~1x encoded body lives on the persist thread, relocated off the core, see
-///   [`PERSIST_QUEUE_DEPTH`]).
-/// - When the copy is done the shard drops the sender (closing the stream) and AWAITS the persist
-///   thread's `io::Result<ShardManifestEntry>` on a `tokio::sync::oneshot` -- a cross-thread wake that
-///   does NOT block the executor (the shard services other work meanwhile). A dropped result sender
-///   (the persist thread panicked) surfaces as a failed save, never a hang.
+/// - FREEZE: the shard calls [`ShardStore::begin_save`](ironcache_store::ShardStore::begin_save), which
+///   takes an `Arc` clone of every non-empty slot table (O(slots) atomic refcount bumps, NOT an
+///   O(N-keys) copy) and flips the store's `saving` flag. Returns a `Vec<FrozenSlot>`. A SHORT
+///   `borrow_mut`, dropped immediately.
+/// - HAND OFF: the frozen slots move to a DEDICATED persist thread (`std::thread`, `ic-persist-<n>`)
+///   which does ALL the O(N) work OFF the serving core --
+///   [`dump_frozen_slots`](ironcache_persist::dump_frozen_slots) iterates each frozen slot's entries,
+///   reconstructs + encodes each (`to_kvobj` + `encode_kvobj` + CRC), then
+///   [`write_shard_dump`](ironcache_persist::write_shard_dump)s the sealed file ATOMICALLY. It touches
+///   ONLY the frozen `Arc`s + the filesystem, never a live shard cell.
+/// - SERVE THROUGHOUT: while the persist thread runs, the shard task AWAITS the result on a
+///   `tokio::sync::oneshot` (a cross-thread wake, NOT a blocking join), so the shard keeps serving.
+///   Datapath reads share the frozen `Arc`s (a shared deref, no atomic); datapath writes COW a still
+///   frozen slot on first touch (`Arc::make_mut`, a one-time ~0.7ms deep-clone per written slot) and
+///   then mutate the fresh copy, so a write is NEVER visible in the concurrent dump and NEVER touches a
+///   pointee the persist thread reads.
+/// - END: once the result arrives (success OR error -- both mean the persist thread's closure has fully
+///   exited, so all its reads are done and its `FrozenSlot`s are dropped), the shard clears the `saving`
+///   flag via [`ShardStore::end_save`](ironcache_store::ShardStore::end_save). It is cleared ONLY here
+///   (not on task cancellation): if this task is cancelled at shutdown the flag stays set, which is the
+///   SAFE direction (the datapath keeps COWing + skips freq bumps, never racing the still-running
+///   persist thread) on an already-exiting process.
 ///
-/// So the ONLY shard-thread work is the bounded memcpy of `snapshot_chunk`; the seconds-long
-/// encode+fsync is off the serving core, which is what reaches ms-class datapath latency DURING a save
-/// (the p99.9 lever #571/#578 could only blunt). This detached persist thread does not violate the
-/// shared-nothing datapath (ADR-0002): the datapath is untouched; the thread only reads an OWNED copy
-/// and writes files.
+/// So the ONLY shard-thread cost is O(slots) refcount bumps at freeze plus a one-time COW per slot that
+/// is actually written DURING the save; the whole O(N) encode+fsync is off the serving core. That is
+/// what reaches ms-class datapath latency during a save (the p99.9 lever #571/#578/#586 could not).
 ///
-/// ## Consistency (unchanged from #571): an approximate warm-start point
+/// ## Consistency (#576): a per-shard POINT-IN-TIME as of the freeze (stronger than #571)
 ///
-/// Because the store borrow is released between chunks, a concurrent write CAN mutate the table
-/// between chunks. The dump stays CORRECT: `snapshot_chunk` walks the resize-stable `scan_hash` order
-/// and resumes at the `scan_hash` THRESHOLD (not a table slot), so a key present for the WHOLE copy is
-/// captured at least once and a key created/deleted mid-copy may or may not appear (SCAN semantics --
-/// the accepted approximate warm-start point for a cache, see [`ironcache_persist`]). Streaming the
-/// copy chunk-by-chunk to the persist thread does not change this: the encode preserves the arrival
-/// order, so the sealed file is byte-identical to feeding the same chunks to a single-thread builder.
-/// A strict point-in-time snapshot would need MVCC (out of scope).
+/// Because a write COWs a still-frozen slot before mutating it, the entries the persist thread reads are
+/// IMMUTABLE for the save, so the dump is a per-shard POINT-IN-TIME view AS OF `begin_save`: a key
+/// written mid-save keeps its PRE-freeze value in the dump (or is omitted if newly created), while the
+/// live store keeps the new value. This is STRONGER than the pre-#576 chunked walk (which could capture
+/// a mid-dump write). Cross-shard it stays FUZZY (each shard freezes at its own instant), the accepted
+/// cache warm-start tradeoff (see [`ironcache_persist`]).
 ///
 /// ## Crash-safety (unchanged, #530): the manifest is written LAST
 ///
@@ -1287,21 +1206,17 @@ const _: fn() = || {
 /// manifest -- the COMMIT POINT -- is still written LAST by the home core via
 /// [`ironcache_persist::write_manifest`] only AFTER every shard's reply (each returned only once its
 /// persist thread FINISHED its file write). So a crash between the per-shard writes and the manifest
-/// leaves the PRIOR committed snapshot intact, and a torn/un-committed `.icss` (e.g. a cancelled save)
-/// is ignored by load. `now` is read from THIS shard's Env clock (ADR-0003, the lazy-expiry basis);
-/// the save produces NO counter deltas.
+/// leaves the PRIOR committed snapshot intact, and a torn/un-committed `.icss` (a cancelled/panicked
+/// save) is ignored by load. `now` is read from THIS shard's Env clock (ADR-0003, the lazy-expiry
+/// basis); the save produces NO counter deltas.
 ///
-/// ## Save-backpressure throttle (#578): retained, now bounding the COPY
+/// ## Save-backpressure throttle (#578): now INERT for the tail (the copy it throttled is gone)
 ///
-/// When `ctx.runtime.save_backpressure_percent()` is below 100 the loop SLEEPS proportionally after
-/// each chunk (`copy_time * (100 - pct) / pct`, [`save_throttle_sleep_us`]) via the Runtime timer seam,
-/// so even the (now-cheap) COPY consumes only about `pct`% of the core. At the DEFAULT pct==100 no
-/// sleep is inserted (a plain copy + `yield_now`). Elapsed is measured on the Env clock, the sleep
-/// armed on the Runtime timer, so the path carries no `std::time` (ADR-0003).
+/// The `save-backpressure-percent` knob stays settable (CONFIG), but the freeze-based save does NO
+/// serving-side copy loop for it to throttle, so it no longer paces the datapath -- consistent with the
+/// #576 finding that throttling only STRETCHED (never bounded) the during-save tail. It is not read
+/// here.
 async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
-    // The `Runtime` trait for the #578 backpressure sleep's `rt.timer(..)` (the ADR-0003 timer seam);
-    // hoisted to the function top so the `use` item precedes the statements below.
-    use ironcache_runtime::Runtime;
     // Parse `__ICSAVE <save_unix_secs> <shard_index> <dir>`.
     let (Some(secs_arg), Some(shard_arg), Some(dir_arg)) = (
         request.args.get(1),
@@ -1328,108 +1243,57 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
         ctx.info.maxmemory_policy,
         crate::serve::scan_reserved_bits(ctx.shards),
     );
-    // `now` from THIS shard's wall clock (ADR-0003), a short borrow dropped before the copy loop.
+    // `now` from THIS shard's wall clock (ADR-0003), a short borrow dropped immediately.
     let now = UnixMillis(env.borrow().now_unix_millis());
-    // The database count (a short borrow, dropped immediately) bounds the outer walk.
-    let databases = store_rc.borrow().databases();
 
-    // The Runtime TIMER SEAM (ADR-0003) the #578 backpressure sleep arms under, constructed the same
-    // way the periodic-save / poll loops build theirs (`TokioRuntime::timer` is the shard executor's
-    // `tokio::time::sleep`). Only the throttle branch below uses it; at the default pct==100 it is
-    // never touched.
-    let rt = ironcache_runtime::TokioRuntime::new();
+    // FREEZE (#576): Arc-clone every non-empty slot table (O(slots), no O(N-keys) copy) and set the
+    // store's `saving` flag, so the datapath COWs a frozen slot on its first write and skips the shared
+    // freq bump for the save window. A SHORT `borrow_mut`, dropped at the end of this statement -- no
+    // store borrow is held across the await below.
+    let frozen: Vec<ironcache_store::FrozenSlot> = store_rc.borrow_mut().begin_save();
 
-    // #576 PR-B: spawn the DEDICATED persist thread and stream owned chunks to it. The bounded channel
-    // carries owned `SnapshotEntry` chunks (the copy); the oneshot carries the persist thread's file
-    // write result back to this shard task via a cross-thread wake (does NOT block the executor).
-    let (chunk_tx, chunk_rx) =
-        std::sync::mpsc::sync_channel::<Vec<ironcache_store::SnapshotEntry>>(PERSIST_QUEUE_DEPTH);
+    // The oneshot carries the persist thread's file-write result back to this shard task via a
+    // cross-thread wake (does NOT block the executor).
     let (done_tx, done_rx) =
         oneshot::channel::<std::io::Result<ironcache_persist::ShardManifestEntry>>();
     let dir_for_thread = dir.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("ic-persist-{shard_index}"))
         .spawn(move || {
-            // OFF the serving core: encode each owned chunk (the `encode_kvobj` codec + CRC) and write
-            // the sealed file ATOMICALLY. Touches ONLY the owned copy + the filesystem, never a shard
-            // cell (ADR-0002 datapath isolation preserved). The arrival order is the copy order, so the
-            // sealed file is byte-identical to a single-thread builder over the same chunks.
-            let mut builder = ironcache_persist::ShardDumpBuilder::new();
-            while let Ok(chunk) = chunk_rx.recv() {
-                builder.push_chunk(&chunk);
-            }
-            let result = ironcache_persist::write_shard_dump(
-                &builder.finish(shard_index),
-                shard_index,
-                &dir_for_thread,
-            );
+            // OFF the serving core: iterate the frozen slots, reconstruct + encode each entry (the
+            // `to_kvobj` deep-clone + `encode_kvobj` codec + CRC), and write the sealed file ATOMICALLY.
+            // Touches ONLY the frozen `Arc`s (de-facto immutable for the save -- the datapath COWs before
+            // any write) + the filesystem, never a live shard cell (ADR-0002 datapath isolation).
+            let dump = ironcache_persist::dump_frozen_slots(&frozen, shard_index, now);
+            let result = ironcache_persist::write_shard_dump(&dump, shard_index, &dir_for_thread);
+            // Release the frozen `Arc`s NOW (all reads + the file write are done): a slot that the
+            // datapath COW'd away is freed here (no live reader remains); a still-shared slot just
+            // decrements its atomic refcount. Done BEFORE the send so that by the time the shard clears
+            // `saving` every live slot is back to strong_count 1.
+            drop(frozen);
             // The receiver may be gone (this save task was cancelled at shutdown): the send error is
             // harmless -- the un-committed `.icss` is ignored by load (the manifest is written last).
             let _ = done_tx.send(result);
         });
     if let Err(e) = spawned {
+        // The spawn consumed + dropped `frozen` (releasing the frozen `Arc`s), but the `saving` flag is
+        // still set: clear it so the datapath resumes its fast path, then surface the failure.
+        store_rc.borrow_mut().end_save();
         return Value::error(ironcache_protocol::ErrorReply::err(format!(
             "save failed: cannot spawn persist thread: {e}"
         )));
     }
 
-    // COPY loop: drain the store into OWNED chunks and STREAM them to the persist thread, releasing the
-    // store borrow + YIELDING between chunks (#571) so the shard services queued writes DURING the
-    // copy. When a SAVE-BACKPRESSURE throttle is configured (#578, `pct < 100`), sleep proportionally
-    // AFTER each chunk so even the copy consumes only about `pct`% of the core. At pct==100 it is a
-    // plain copy + `yield_now`.
-    let mut cursor = ironcache_store::SnapshotCursor::START;
-    'copy: while !cursor.is_done(databases) {
-        // Read the LIVE throttle each chunk (one relaxed load, off the hot path) so a `CONFIG SET
-        // save-backpressure-percent` is honored by an in-flight save on its next chunk.
-        let pct = ctx.runtime.save_backpressure_percent();
-        // Time the copy on THIS shard's MONOTONIC Env clock (ADR-0003, the seam #571 / SLOWLOG use --
-        // NOT std::time). The short env borrow is dropped at the semicolon, never held across an await.
-        let chunk_start = env.borrow().now();
-        let (chunk, next) = {
-            // PER-CHUNK borrow: taken + dropped inside this block, so it is NOT held across the
-            // yield/sleep below (and a concurrent write can run between chunks). `snapshot_chunk`
-            // already reconstructs OWNED `KvObj` records, so this pull IS the Send copy (no second one).
-            let store = store_rc.borrow();
-            store.snapshot_chunk(cursor, ironcache_persist::DUMP_CHUNK, now)
-        };
-        cursor = next;
-        // Measure the copy elapsed BEFORE the handoff so a backpressure wait does not inflate the
-        // throttle sleep (the throttle bounds the COPY work, not the wait for the encode thread).
-        let copy_elapsed = env.borrow().now().saturating_duration_since(chunk_start);
-        // Ship the owned chunk to the persist thread WITHOUT blocking the executor: on backpressure
-        // (bounded queue full) yield the shard and retry; a disconnected channel means the persist
-        // thread died (its result oneshot, awaited below, surfaces the failure).
-        let mut outgoing = chunk;
-        loop {
-            match chunk_tx.try_send(outgoing) {
-                Ok(()) => break,
-                Err(std::sync::mpsc::TrySendError::Full(c)) => {
-                    outgoing = c;
-                    tokio::task::yield_now().await;
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break 'copy,
-            }
-        }
-        if pct >= 100 {
-            // DEFAULT (no throttle): let the shard's executor service any queued writes before the
-            // next copy (a bounded, predictable copy cadence), no timer sleep.
-            tokio::task::yield_now().await;
-        } else {
-            // Throttle: sleep proportionally so the copy consumes only about `pct`% of the core. The
-            // per-chunk store borrow is ALREADY dropped, so the sleep just lets the shard drain its
-            // queued writes. Elapsed via the Env clock, sleep via the Runtime timer seam (ADR-0003).
-            let elapsed_us = u64::try_from(copy_elapsed.as_micros()).unwrap_or(u64::MAX);
-            let sleep_us = save_throttle_sleep_us(elapsed_us, pct);
-            rt.timer(std::time::Duration::from_micros(sleep_us)).await;
-        }
-    }
-
-    // Close the stream and AWAIT the persist thread's atomic file write result WITHOUT blocking the
-    // executor. A `RecvError` (the result sender dropped) means the persist thread panicked before
-    // reporting -- surfaced as a failed save, not a hang.
-    drop(chunk_tx);
-    match done_rx.await {
+    // AWAIT the persist thread's atomic file-write result WITHOUT blocking the executor. The shard keeps
+    // serving throughout: reads share the frozen `Arc`s, writes COW. A `RecvError` (the result sender
+    // dropped) means the persist thread panicked -- surfaced as a failed save, not a hang.
+    let result = done_rx.await;
+    // END (#576): clear the `saving` flag. All three arms below mean the persist thread's closure has
+    // FULLY exited (it dropped `frozen` and its `done_tx` before/at return), so its reads are complete
+    // and no freq bump resuming here can race them. Cleared only on this normal-completion path (a
+    // cancelled task never reaches here -- the flag then safely stays set on an exiting process).
+    store_rc.borrow_mut().end_save();
+    match result {
         Ok(Ok(entry)) => crate::persist::encode_save_reply(&entry),
         Ok(Err(e)) => Value::error(ironcache_protocol::ErrorReply::err(format!(
             "save failed: {e}"

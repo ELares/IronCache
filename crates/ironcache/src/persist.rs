@@ -41,15 +41,20 @@
 //!   APPROXIMATE warm-start restore point (a deliberate choice for a cache, see the
 //!   `ironcache_persist` module consistency note). The crash-safety invariant is unaffected: the
 //!   manifest is still written LAST, so a torn/partial dump is never loaded.
-//! - OFF-THREAD persist (#576 PR-B): the shard's chunk work is now ONLY a bounded COPY of its store
-//!   into an OWNED `Send` buffer; a DEDICATED per-shard OS thread (`ic-persist-<n>`) does the
-//!   seconds-long ENCODE + FSYNC of that owned copy OFF the serving core, so the datapath stays
-//!   ms-class DURING a save (the #576 p99.9 fix, which #571/#578 could only blunt). `save_shard_local`
-//!   awaits the persist thread's file-write result on a `tokio::sync::oneshot` (a cross-thread wake,
-//!   not a blocking join), so the shard keeps serving while its own dump encodes. The detached persist
-//!   thread touches ONLY the owned copy + the filesystem, never a shard cell, so the shared-nothing
-//!   DATAPATH (ADR-0002) is unaffected; and it still writes the per-shard file before the home core
-//!   commits the manifest LAST, so crash-safety is unchanged.
+//! - OFF-THREAD persist via PER-SLOT ARC-COW (#576): the shard no longer COPIES its keyspace at all.
+//!   It FREEZES its store in O(slots) `Arc` refcount bumps (`ShardStore::begin_save`) and hands the
+//!   frozen slot tables to a DEDICATED per-shard OS thread (`ic-persist-<n>`) that does the whole
+//!   seconds-long ENCODE + FSYNC OFF the serving core, so the datapath stays ms-class DURING a save
+//!   (the #576 p99.9 fix, which #571/#578/#586 could only blunt -- the O(N) serving-side copy WAS the
+//!   contention). `save_shard_local` awaits the persist thread's file-write result on a
+//!   `tokio::sync::oneshot` (a cross-thread wake, not a blocking join), so the shard keeps serving:
+//!   reads share the frozen `Arc`s, and a write COW-copies its slot (a one-time deep clone) before
+//!   mutating, so the frozen view the persist thread reads is never touched (`FrozenSlot`, the
+//!   `unsafe impl Send` soundness argument). The detached persist thread touches ONLY the frozen
+//!   `Arc`s + the filesystem, never a live shard cell, so the shared-nothing DATAPATH (ADR-0002) is
+//!   unaffected; and it still writes the per-shard file before the home core commits the manifest
+//!   LAST, so crash-safety is unchanged. The dump is now a per-shard POINT-IN-TIME as of the freeze
+//!   (stronger than the #571 chunked walk); cross-shard it stays fuzzy.
 //!
 //! ## Default-off (#58)
 //!
