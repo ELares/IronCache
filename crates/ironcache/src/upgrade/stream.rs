@@ -221,6 +221,17 @@ pub enum HandoffError {
     /// The handshake was rejected (the receiver did not ack the HELLO, or acked the wrong message).
     #[error("handoff handshake rejected by the peer")]
     HelloRejected,
+    /// A caller-imposed deadline (the `tokio::time::timeout` the wiring wraps each phase in) elapsed
+    /// before the peer answered: a hung / wedged peer. Fail-closed like any other abort -- the
+    /// receiver drops its partial store, the sender keeps the OLD process serving, and the durable
+    /// snapshot remains a valid fallback. `phase` names which leg timed out (connect / accept / bulk
+    /// / cutover) for the operator log. The core flagged this as CALLER-owned, so it lives in the
+    /// wiring [`crate::upgrade::drive`], not the transport.
+    #[error("handoff timed out waiting on the peer during {phase} (a hung/wedged peer)")]
+    Timeout {
+        /// Which handoff leg exceeded the caller's deadline.
+        phase: &'static str,
+    },
 }
 
 impl HandoffError {
