@@ -1279,8 +1279,35 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
             // `to_kvobj` deep-clone + `encode_kvobj` codec + CRC), and write the sealed file ATOMICALLY.
             // Touches ONLY the frozen `Arc`s (de-facto immutable for the save -- the datapath COWs before
             // any write) + the filesystem, never a live shard cell (ADR-0002 datapath isolation).
-            let dump = ironcache_persist::dump_frozen_slots(&frozen, shard_index, now);
-            let result = ironcache_persist::write_shard_dump(&dump, shard_index, &dir_for_thread);
+            //
+            // #585: run the encode+write under `catch_unwind` so a panic here (an encode bug, a
+            // filesystem edge) is LOGGED with its cause instead of surfacing to the shard only as an
+            // opaque `RecvError`. On a panic the save fails (turned into an `io::Error`); the DURABLE
+            // prior snapshot is intact (the manifest is written last), so this is a failed save, never
+            // data loss. `AssertUnwindSafe` is sound: the caught closure only READS the frozen `Arc`s
+            // (immutable for the save) + the filesystem, so a mid-encode unwind leaves no shared state
+            // observably broken (the frozen slots are dropped below regardless).
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let dump = ironcache_persist::dump_frozen_slots(&frozen, shard_index, now);
+                ironcache_persist::write_shard_dump(&dump, shard_index, &dir_for_thread)
+            })) {
+                Ok(r) => r,
+                Err(panic) => {
+                    let cause = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    tracing::error!(
+                        shard = shard_index,
+                        cause = %cause,
+                        "ic-persist thread panicked during save; save FAILED (durable prior snapshot intact)"
+                    );
+                    Err(std::io::Error::other(format!(
+                        "persist thread panicked: {cause}"
+                    )))
+                }
+            };
             // Release the frozen `Arc`s NOW (all reads + the file write are done): a slot that the
             // datapath COW'd away is freed here (no live reader remains); a still-shared slot just
             // decrements its atomic refcount. Done BEFORE the send so that by the time the shard clears
