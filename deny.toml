@@ -52,14 +52,21 @@ allow-wildcard-paths = true
 # real time or OS entropy outside the sanctioned ironcache-env seam. The grep lint
 # in scripts/ci/check-rust-invariants.sh catches direct API use in OUR source; this
 # ban catches a TRANSITIVE pull of one of these crates into the dependency graph
-# (which the grep cannot see). None are present today, so the build stays green; if
-# a future dep pulls one in transitively and it cannot be removed, narrow this list
-# and record the residual here.
+# (which the grep cannot see). The one permitted case is `rand`, scoped to the
+# `proptest` wrapper (below); if a future dep pulls another in transitively and it
+# cannot be removed, narrow this list and record the residual here.
+#
+# `rand` via `proptest`: `proptest` is a `[dev-dependencies]`-ONLY property-testing
+# harness (ironcache-protocol, #527) and pulls `rand` for its TEST-INPUT PRNG. That
+# is test-harness randomness, NOT the engine's clock/entropy (ADR-0003 permits it,
+# and dev-deps never enter the shipped static-musl artifact). The `wrappers` scope
+# keeps the ban FULLY ACTIVE everywhere else: any RUNTIME/engine crate that pulls
+# `rand` (whose parent would NOT be proptest) still fails this gate.
 deny = [
     { name = "chrono" },
     { name = "time" },
     { name = "fastrand" },
-    { name = "rand" },
+    { name = "rand", wrappers = ["proptest"] },
     { name = "quanta" },
     { name = "coarsetime" },
     { name = "minstant" },

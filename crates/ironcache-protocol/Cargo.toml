@@ -19,3 +19,21 @@ memchr = { workspace = true }
 # Shortest round-trip f64 digit extraction. We post-process ryu's output into
 # Redis/fpconv's exact spelling (no-decimal integrals, `e+NN`/`e-N` exponents).
 ryu = { workspace = true }
+
+[dev-dependencies]
+# Property-based tests over the RESP codec (#527 production-readiness M3, TESTING.md).
+# TEST-ONLY: proptest is a `[dev-dependencies]` entry, so it compiles for this crate's
+# `cargo test` ONLY. It is NEVER linked into the `ironcache` binary or any runtime crate
+# (dev-deps are excluded from the dependencies of downstream builds), so the shipped
+# static-musl artifact (ADR-0017) is byte-for-byte unaffected.
+#
+# `default-features = false` (with `std` + `bit-set`) DROPS proptest's `fork`/`timeout`
+# features, which would pull `tempfile` -> `fastrand`; `fastrand` is BANNED in deny.toml
+# (the determinism backstop, ADR-0003). The property tests here are pure in-process codec
+# checks: they need no forked-process isolation (a `#![forbid(unsafe_code)]` codec cannot
+# SIGABRT, and a mere panic is caught by the normal test harness as a shrunk counterexample),
+# so dropping `fork`/`timeout` costs nothing. What remains pulls `rand` (proptest's own
+# test-input PRNG); that is TEST-HARNESS randomness, not engine clock/entropy, so ADR-0003
+# permits it. deny.toml scopes the `rand` ban to `wrappers = ["proptest"]` so any OTHER
+# (runtime) pull of `rand` still fails the supply-chain gate.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
