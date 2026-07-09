@@ -2291,6 +2291,10 @@ mod blob {
     pub const KEYLEN_LEN: usize = 4;
     /// The flags byte bit: a TTL deadline u64 follows the header.
     pub const FLAG_HAS_TTL: u8 = 0b0000_0001;
+    /// The byte offset of the flags byte WITHIN the blob (the third header byte, after
+    /// `data_type` and `encoding`). Named so the shared-reference freq accessor can reach
+    /// the exact byte `str_flags`/`set_freq` read/write, instead of a bare `2`.
+    pub const FLAGS_OFFSET: usize = 2;
     /// The S3-FIFO 2-bit promote frequency, packed into bits 1-2 of the flags byte
     /// (freq-in-object). Bit 0 is [`FLAG_HAS_TTL`]; bits 1-2 hold the 0..=3 frequency
     /// the eviction policy reads through the store's `VictimFreq` accessor. Packing it
@@ -3144,6 +3148,70 @@ impl Entry {
         self.set_freq(next);
     }
 
+    /// Bump the S3-FIFO 2-bit promote frequency by one (saturating at [`Self::MAX_FREQ`])
+    /// through a SHARED `&self` reference, using INTERIOR MUTABILITY on the entry's own
+    /// heap allocation. This is the GET/read-path bump.
+    ///
+    /// A cache read must not need `&mut` on the table (nor on the entry) merely to record
+    /// that a key was touched: the store's `read`/`rmw` look the entry up with the SHARED
+    /// `find` and bump the freq through this accessor, so the hot read path is a shared
+    /// borrow end to end. (The mutating [`Self::bump_freq`] above stays for the write paths
+    /// that already hold `&mut`, e.g. `rmw_mut` and eviction second-chance.)
+    ///
+    /// # Why a non-atomic interior-mutable write is SOUND here
+    ///
+    /// `Entry` is an 8-byte tagged `NonNull<u8>` that SOLELY OWNS its pointee (a Str blob
+    /// or a `Box<CollEntry>`). The freq lives INSIDE that pointee, a SEPARATE allocation
+    /// from the `Entry`'s own pointer word, so the `&self` borrow -- which covers only the
+    /// pointer word -- does not forbid mutating the pointee. We load the owned raw pointer
+    /// (raw pointers are `Copy` and carry their allocation's write provenance) and patch a
+    /// single byte through it, forming NO overlapping `&`/`&mut` view of that byte for the
+    /// write. There is no CROSS-THREAD aliasing to guard against either: a shard's `Entry`s
+    /// are owned by exactly one core and never sent across threads (ADR-0002/0005, the
+    /// store is `!Send`/`!Sync`), so a plain non-atomic write is the correct primitive (an
+    /// atomic would be pure overhead with a single writer and no reader on another thread).
+    /// The freq is a bounded 0..=3 counter, not a clock or entropy source, so this stays
+    /// deterministic (ADR-0003).
+    ///
+    /// The bump is BYTE-IDENTICAL to [`Self::bump_freq`]: it computes the same
+    /// `(freq + 1).min(MAX_FREQ)` and writes the same bits, so S3-FIFO eviction selects the
+    /// same victims whether a key was touched through the shared or the mutable path.
+    pub fn bump_freq_shared(&self) {
+        if self.is_coll() {
+            let ce = self.coll_ptr();
+            // SAFETY: this is a Coll entry, so `coll_ptr` recovered the live, aligned,
+            // non-null `Box<CollEntry>` pointer this `Entry` owns (identical recovery to
+            // `coll_ref`/`coll_mut`). We hold `&self`, no `&CollEntry`/`&mut CollEntry` view
+            // is live across this write (the read path bumps BEFORE it borrows the value for
+            // the view), and the shard is single-threaded, so read-modify-writing the
+            // `eviction_rank` field through the owned pointer is sound. The stored value is
+            // `<= MAX_FREQ`, matching `set_freq`'s Coll arm exactly.
+            unsafe {
+                let cur = (*ce).eviction_rank & blob::FREQ_MASK;
+                (*ce).eviction_rank = (cur + 1).min(Entry::MAX_FREQ);
+            }
+        } else {
+            // SAFETY: this is a Str entry (low tag bit 0), so `self.0` points to the start
+            // of the blob allocation this `Entry` owns; the flags byte at
+            // `STR_BLOB_OFFSET + blob::FLAGS_OFFSET` was initialized by `alloc_str_blob` and
+            // lies within the allocation (that offset is the same one `str_flags`/`set_freq`
+            // read/write). We read-modify-write that ONE byte through the owned raw pointer,
+            // patching only the freq bits (1-2) and leaving the TTL-present bit (0) and any
+            // high bits untouched -- byte-for-byte what `set_freq`'s Str arm does through the
+            // `&mut` blob view. No `str_blob()`/`str_blob_mut()` slice is live across this
+            // write, and the shard is single-threaded, so the write is sound.
+            unsafe {
+                let flags_ptr = self.0.as_ptr().add(STR_BLOB_OFFSET + blob::FLAGS_OFFSET);
+                let flags = flags_ptr.read();
+                let cur = (flags >> blob::FREQ_SHIFT) & blob::FREQ_MASK;
+                let next = (cur + 1).min(Entry::MAX_FREQ);
+                let patched =
+                    (flags & !(blob::FREQ_MASK << blob::FREQ_SHIFT)) | (next << blob::FREQ_SHIFT);
+                flags_ptr.write(patched);
+            }
+        }
+    }
+
     /// Decrement the S3-FIFO 2-bit promote frequency by one, saturating at 0 (the
     /// main-queue second-chance step, driven by the policy through `VictimFreq::dec`).
     pub fn dec_freq(&mut self) {
@@ -3568,6 +3636,81 @@ mod tests {
         assert_eq!(e.freq(), 3, "freq survives a rekey");
         assert_eq!(e.key(), b"newkey");
         assert_eq!(e.str_value_bytes(), b"v");
+    }
+
+    #[test]
+    fn bump_freq_shared_matches_the_mutable_bump_through_a_shared_ref() {
+        // The GET read-path bump (#576 prerequisite): bumping the freq through a SHARED
+        // `&Entry` (interior mutability) must be BYTE-IDENTICAL to the mutable `bump_freq`,
+        // so S3-FIFO eviction sees the same freq either way. Take a plain `&Entry` (NOT
+        // `&mut`) to prove the bump needs no unique borrow.
+        let e = Entry::str_from_bytes(b"k", b"value", None);
+        let shared: &Entry = &e;
+        assert_eq!(shared.freq(), 0, "fresh entry starts at freq 0");
+        shared.bump_freq_shared();
+        assert_eq!(shared.freq(), 1, "shared bump reaches 1 through &self");
+        shared.bump_freq_shared();
+        shared.bump_freq_shared();
+        assert_eq!(shared.freq(), 3);
+        shared.bump_freq_shared();
+        assert_eq!(
+            shared.freq(),
+            3,
+            "shared bump caps at MAX_FREQ (3), like bump_freq"
+        );
+        // The freq write must not disturb the rest of the entry (same invariant the
+        // mutable-bump test asserts).
+        assert_eq!(shared.key(), b"k");
+        assert_eq!(shared.str_value_bytes(), b"value");
+        assert_eq!(shared.data_type(), DataType::String);
+        assert_eq!(
+            shared.expire_at(),
+            None,
+            "no TTL: bit 0 untouched by the shared bump"
+        );
+
+        // A Str entry WITH a TTL: the shared bump patches only bits 1-2, leaving the
+        // TTL-present bit (0) and the deadline bytes intact.
+        let ttl = Entry::str_from_bytes(b"k2", b"v", Some(UnixMillis(12345)));
+        let ttl_ref: &Entry = &ttl;
+        ttl_ref.bump_freq_shared();
+        assert_eq!(ttl.freq(), 1);
+        assert_eq!(
+            ttl.expire_at(),
+            Some(UnixMillis(12345)),
+            "TTL survives the shared bump"
+        );
+        assert_eq!(ttl.str_value_bytes(), b"v");
+
+        // The Coll arm writes `eviction_rank` through the owned box pointer, again matching
+        // the mutable `bump_freq` and capping at 3.
+        let mut list = ListVal::new();
+        list.push_back(b"a", TH);
+        let coll = Entry::coll(b"mylist", CollVal::List(list), None);
+        let coll_ref: &Entry = &coll;
+        assert_eq!(coll_ref.freq(), 0);
+        coll_ref.bump_freq_shared();
+        coll_ref.bump_freq_shared();
+        assert_eq!(coll_ref.freq(), 2, "Coll shared bump tracks eviction_rank");
+        coll_ref.bump_freq_shared();
+        coll_ref.bump_freq_shared();
+        assert_eq!(coll_ref.freq(), 3, "Coll shared bump caps at 3");
+        assert_eq!(coll_ref.key(), b"mylist");
+    }
+
+    #[test]
+    fn bump_freq_shared_is_byte_identical_to_bump_freq_over_a_full_sweep() {
+        // Drive both bump variants through the same access sequence and assert the freq
+        // agrees at every step: the shared read-path bump must select the SAME S3-FIFO
+        // victims as the historical `&mut` bump.
+        let mut mutable = Entry::str_from_bytes(b"key", b"payload", None);
+        let shared = Entry::str_from_bytes(b"key", b"payload", None);
+        let shared_ref: &Entry = &shared;
+        for _ in 0..6 {
+            mutable.bump_freq();
+            shared_ref.bump_freq_shared();
+            assert_eq!(mutable.freq(), shared.freq());
+        }
     }
 
     // -- ListVal unit tests (PR-5): the abstract list-op vocabulary + the
