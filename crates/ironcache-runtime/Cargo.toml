@@ -74,6 +74,12 @@ tokio-uring = { workspace = true, optional = true }
 # Raw io_uring bindings for the startup capability probe (see the `io_uring` feature note above +
 # `uring_probe`). Linux + opt-in only; already in the tree via tokio-uring.
 io-uring = { workspace = true, optional = true }
+# The `sched_setaffinity`/`sched_getaffinity` bindings for the persist-thread CPU pin (#589,
+# `affinity`). Linux-ONLY (CPU affinity is a Linux scheduling primitive), so the dep is target-gated
+# and the module's non-Linux path is a pure no-op that never references libc. NOT optional: the
+# affinity module is always compiled (the pin is a runtime primitive, not behind a Cargo feature).
+# libc is already a workspace dep pinned at the root (MIT/Apache, cargo-deny clean, static-musl safe).
+libc = { workspace = true }
 
 # `test-util` enables tokio's PAUSED-clock test harness (`start_paused`), used to fire the bounded
 # secret-handshake timeout near-instantly in the slow-loris test without a real 10s wall-clock wait.

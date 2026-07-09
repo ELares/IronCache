@@ -71,6 +71,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "BACKEND")]
     pub runtime: Option<String>,
 
+    /// Dedicated persist core (#589): which CPU core(s) the off-datapath `ic-persist` thread pins to
+    /// during a save, so its encode stops stealing a serving core. `off` (default, no pin), `auto`
+    /// (reserve the highest core of the process cpuset), or an explicit cpu list (`8`, `6-7`,
+    /// `6-7,10`). Linux-only (a no-op elsewhere). Env `IRONCACHE_PERSIST_CPU`; TOML `persist_cpu`.
+    #[arg(long, global = true, value_name = "off|auto|LIST")]
+    pub persist_cpu: Option<String>,
+
     /// The subcommand. Absent means `server`.
     #[command(subcommand)]
     pub command: Option<Command>,

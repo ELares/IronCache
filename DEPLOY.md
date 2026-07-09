@@ -72,6 +72,7 @@ pass `--metrics-addr off`.
 | `data_dir` | `IRONCACHE_DATA_DIR` | durable snapshot + Raft log dir (enables persistence) |
 | `save_interval_secs` | `IRONCACHE_SAVE_INTERVAL_SECS` | periodic save cadence (0 = off) |
 | `save_min_changes` | `IRONCACHE_SAVE_MIN_CHANGES` | min writes before a periodic save fires |
+| `persist_cpu` | `IRONCACHE_PERSIST_CPU` | dedicate a core to the persist thread: `off` (default) / `auto` / a cpu list (`8`, `6-7`); Linux-only, see below |
 | `refuse_empty_start_on_version_mismatch` | `IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH` | fail closed (refuse to boot) on a newer-format snapshot instead of a loud empty start |
 | `cluster_enabled` | `IRONCACHE_CLUSTER_ENABLED` | turn on cluster mode (boot-only) |
 | `cluster_mode` | `IRONCACHE_CLUSTER_MODE` | `static` (default) or `raft` |
@@ -391,6 +392,41 @@ Each pod gets its own PVC via the StatefulSet `volumeClaimTemplate`
 (`ReadWriteOnce`, default 10Gi); set `persistence.storageClassName` to an SSD class
 in production. PVCs are NOT deleted by `helm uninstall` / `kubectl delete sts` --
 remove them explicitly when you mean to discard data.
+
+### Dedicated persist core (snapshot tail latency)
+
+During a save the off-datapath `ic-persist-<shard>` thread reads the frozen keyspace to
+encode + fsync it. Under the thread-per-core model that thread is an EXTRA runnable thread
+on top of the shard threads, so on a fully-pinned box (all cores serving) it lands on a
+serving core and steals serving time, stretching the request-latency tail during the save.
+`persist_cpu` (env `IRONCACHE_PERSIST_CPU`, CLI `--persist-cpu`) dedicates a core to it so
+the encode runs off the datapath cores. It is Linux-only (a no-op elsewhere) and defaults
+to `off` (no pin, unchanged behavior).
+
+The recommended deployment gives the server ONE extra core: pin the datapath (shards) to
+`0..N-1` with `taskset` and set `persist_cpu` to core `N`. `sched_setaffinity` is bounded
+by the process cpuset, not by the inherited `taskset` mask, so the persist thread escapes
+onto core `N` even though the datapath is confined to `0..N-1`:
+
+```sh
+# 8 datapath cores (0-7) + 1 dedicated persist core (8). The persist thread escapes the
+# taskset mask onto core 8; the shards stay on 0-7.
+IRONCACHE_PERSIST_CPU=8 taskset -c 0-7 ironcache --port 6379 --shards 8 server
+```
+
+On Kubernetes, request one extra CPU beyond the shard count, set the pod's CPU manager
+policy to `static` (so the datapath cores are exclusive), and set `IRONCACHE_PERSIST_CPU`
+to a reserved core id. `auto` instead reserves the HIGHEST core of the process's current
+affinity mask, which suits a deployment that has already confined the datapath to the
+lower cores via a cpuset.
+
+Trade-off (the tunability tenet: a knob with a safe default): dedicating a core costs you a
+serving (or spare) core, so it only pays off on a host with a core to spare. And it is a
+PARTIAL fix: pinning removes the persist thread's CPU steal but not its MEMORY-BANDWIDTH
+share (it still reads the frozen keyspace), so it closes part, not all, of the gap to
+millisecond-class snapshot tails. Confirm the pin is live: the server logs
+`persist thread pinned to cpu(s) [...]` once on the first save, and
+`CONFIG GET persist-cpu` reports the effective value.
 
 ### Dump-format compatibility policy
 

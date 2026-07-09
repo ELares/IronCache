@@ -206,6 +206,13 @@ pub use tls::{
 pub mod bootstrap;
 pub use bootstrap::{ShardConfig, ShardId, ShardSet, available_shards};
 
+// The dedicated-persist-thread CPU affinity primitives (#589): pin the off-core `ic-persist` thread
+// to a reserved core so its encode+fsync stops stealing a pinned datapath serving core. A Linux
+// scheduling primitive (`sched_setaffinity`); a graceful no-op on non-Linux. It lives in this runtime
+// seam (not the `#![forbid(unsafe_code)]` binary) because the syscall is a small contained `unsafe`.
+pub mod affinity;
+pub use affinity::{AFFINITY_SUPPORTED, current_thread_cpus, pin_thread_to_cpus};
+
 // The systemd socket-activation (sd_listen_fds) protocol parser (#389 Phase 2a). A PURE
 // string->typed-result gate deciding whether to adopt an inherited listening fd vs self-bind; the
 // raw-fd adoption itself is a thin Linux-only layer downstream. Cfg-free so it builds + unit-tests

@@ -1257,9 +1257,18 @@ async fn save_shard_local(ctx: &ServerContext, request: &Request) -> Value {
     let (done_tx, done_rx) =
         oneshot::channel::<std::io::Result<ironcache_persist::ShardManifestEntry>>();
     let dir_for_thread = dir.clone();
+    // The `persist-cpu` knob (#589): which core(s) to pin THIS persist thread to. Cloned into the
+    // closure so the pin is applied ON the persist thread (affinity is per-thread). Empty = the
+    // default no-pin (float, byte-unchanged); a no-op on non-Linux (see `crate::affinity`).
+    let persist_cpu_spec = ctx.boot.persist_cpu.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("ic-persist-{shard_index}"))
         .spawn(move || {
+            // #589: pin this persist thread to the configured dedicated persist core(s) BEFORE the
+            // encode, so its off-core read+encode+fsync stops competing for a pinned datapath serving
+            // core. A graceful no-op when the knob is unset (default) or on a non-Linux host; a bad
+            // core just logs once and runs unpinned. Purely a scheduling action (ADR-0003 untouched).
+            crate::affinity::apply_persist_pin(&persist_cpu_spec);
             // OFF the serving core: iterate the frozen slots, reconstruct + encode each entry (the
             // `to_kvobj` deep-clone + `encode_kvobj` codec + CRC), and write the sealed file ATOMICALLY.
             // Touches ONLY the frozen `Arc`s (de-facto immutable for the save -- the datapath COWs before

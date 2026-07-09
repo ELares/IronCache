@@ -100,6 +100,7 @@ number is measured at.
 | `PORT` | `6399` | RESP port (loopback only). |
 | `MAXMEMORY` | `1gb` | Server memory ceiling, via the `IRONCACHE_MAXMEMORY` overlay. |
 | `SERVER_CORES` / `CLIENT_CORES` | half/half | taskset core lists (Linux only). |
+| `PERSIST_CORE` | unset | headtohead/tail only: dedicate this core to IronCache's persist thread (#589, `IRONCACHE_PERSIST_CPU`); keep it OUTSIDE `SERVER_CORES`. |
 | `SMOKE` | `0` | `1` shrinks every dimension for a few-second CI run. |
 
 ### A note on concurrency vs pipeline depth

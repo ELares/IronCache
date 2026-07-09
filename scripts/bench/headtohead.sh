@@ -38,6 +38,9 @@
 #   COMPETITOR_BIN=$(command -v valkey-server) ...          # explicit competitor
 #   SERVER_CORES=0-3 CLIENT_CORES=4-9 ...                   # explicit pinning (Linux)
 #   SNAPSHOT=1 EVICT=1 scripts/bench/headtohead.sh          # the #518 moat mix (adversarial tail)
+#   SERVER_CORES=0-7 PERSIST_CORE=8 CLIENT_CORES=9-15 ...   # dedicate core 8 to IronCache's persist
+#                                                           #   thread (#589): the datapath stays on
+#                                                           #   0-7, the persist encode escapes to 8.
 #
 # TAIL LATENCY (#574): the open-loop pass reports p50/p99/p99.9(p999)/p99.99(p9999) OVERALL op
 # latency for each server. SNAPSHOT=1 fires a background BGSAVE during that pass so the p99.9 tail
@@ -865,6 +868,17 @@ measure_server() {
     if [[ "${SNAPSHOT}" == "1" && -n "${SNAP_DIR}" ]]; then
       ic_env+=("IRONCACHE_DATA_DIR=${SNAP_DIR}")
       echo "[h2h] ${name}: SNAPSHOT persistence ON (IRONCACHE_DATA_DIR=${SNAP_DIR}; periodic save off, only the BGSAVE loop persists)."
+    fi
+    # DEDICATED PERSIST CORE (#589): if PERSIST_CORE is set, pin IronCache's off-datapath persist
+    # thread to it via IRONCACHE_PERSIST_CPU so its encode stops stealing a serving core during a save.
+    # The datapath is confined to PIN_SERVER_CORES by taskset (SERVER_PREFIX); the persist thread's
+    # sched_setaffinity is bounded by the process cpuset (not the taskset mask), so it escapes onto
+    # PERSIST_CORE even though it sits OUTSIDE the datapath set. Give the box one extra core:
+    # SERVER_CORES=0-7 PERSIST_CORE=8. Only meaningful under SNAPSHOT (there is no persist thread
+    # otherwise); a blank inherited value is ignored so persistence-off runs are byte-unchanged.
+    if [[ -n "${PERSIST_CORE:-}" ]]; then
+      ic_env+=("IRONCACHE_PERSIST_CPU=${PERSIST_CORE}")
+      echo "[h2h] ${name}: dedicated persist core ON (IRONCACHE_PERSIST_CPU=${PERSIST_CORE}; persist thread escapes the datapath cores ${PIN_SERVER_CORES:-<unpinned>})."
     fi
     env "${ic_env[@]}" \
       ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "${IRONCACHE_BIN}" \

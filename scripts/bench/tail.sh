@@ -17,6 +17,8 @@
 #   SMOKE=1 scripts/bench/tail.sh                            # fast CI/local self-test (seconds)
 #   COMPETITOR_BIN=$(command -v valkey-server) scripts/bench/tail.sh
 #   MAXMEMORY=512mb SNAPSHOT_INTERVAL_SECS=2 scripts/bench/tail.sh
+#   SERVER_CORES=0-7 PERSIST_CORE=8 CLIENT_CORES=9-15 scripts/bench/tail.sh   # #589: dedicate core 8
+#                                                                             #   to the persist thread
 #
 # Overridable presets (this wrapper only sets a DEFAULT; an inherited value wins):
 #   SNAPSHOT=1    concurrent BGSAVE during the latency pass (the #571 payoff).

@@ -24,11 +24,13 @@
 #![forbid(unsafe_code)]
 
 pub mod notify;
+pub mod persist_cpu;
 pub mod registry;
 pub mod runtime;
 pub mod sha256;
 
 pub use notify::{EventClass, KeyspaceEvent, NotifyFlags};
+pub use persist_cpu::{PersistCpu, parse_persist_cpu, select_persist_cpus};
 pub use registry::{
     ParamSpec, SetKind, SetOutcome, apply_set, effective_value, lookup, param_specs,
 };
@@ -574,6 +576,16 @@ pub struct Config {
     /// Meaningful only when [`Self::save_interval_secs`] is non-zero. TOML (`save_min_changes = 1`)
     /// + the `IRONCACHE_SAVE_MIN_CHANGES` env var.
     pub save_min_changes: u64,
+    /// The DEDICATED PERSIST CORE knob (#589, the durable-snapshot tail residual lever). Selects which
+    /// CPU core(s) the off-datapath `ic-persist-<shard>` thread (#588 per-slot Arc-COW) pins to, so its
+    /// encode+fsync stops competing for a pinned datapath serving core during a save. Values (parsed
+    /// by [`crate::parse_persist_cpu`], validated at boot): `""`/`off` (the DEFAULT: no pin, today's
+    /// float behavior), `auto` (reserve the HIGHEST core of the process cpuset), or an explicit cpu
+    /// list -- a single id (`"8"`), a range (`"6-7"`), or a mix (`"6-7,10"`). SCHEDULING-ONLY: it
+    /// changes only which core a thread runs on, never a stored value or ordering, so ADR-0003
+    /// determinism is untouched. A no-op on non-Linux (CPU affinity is a Linux primitive). TOML
+    /// (`persist_cpu = "8"`) + the `IRONCACHE_PERSIST_CPU` env var + the `--persist-cpu` CLI flag.
+    pub persist_cpu: String,
     /// The SLOWLOG threshold in MICROSECONDS (Redis `slowlog-log-slower-than`, PROD-7). `-1`
     /// DISABLES the SLOWLOG (the per-command hook short-circuits on a single atomic load); `0` logs
     /// every command. Default [`DEFAULT_SLOWLOG_LOG_SLOWER_THAN`] (10ms, the Redis default).
@@ -769,6 +781,10 @@ impl Default for Config {
             // when a data_dir is set). A non-zero interval + a data_dir enables the cadence.
             save_interval_secs: 0,
             save_min_changes: 0,
+            // The dedicated persist core (#589) is OFF by default: the empty value means no CPU pin,
+            // so the `ic-persist` thread floats exactly as it does today (byte-unchanged, the safe
+            // default per the tunability tenet). An operator opts into `auto` or an explicit core.
+            persist_cpu: String::new(),
             slowlog_log_slower_than: DEFAULT_SLOWLOG_LOG_SLOWER_THAN,
             slowlog_max_len: DEFAULT_SLOWLOG_MAX_LEN,
             // Keyspace notifications are OFF by default (PROD-8, the Redis default): the empty flag
@@ -1012,6 +1028,13 @@ impl Config {
                 });
             }
         }
+        // DEDICATED PERSIST CORE (#589): parse the knob once on the resolved value so a malformed
+        // `persist_cpu` (a bad range / non-numeric id) hard-fails boot rather than silently running
+        // unpinned. The empty default parses to `Off` (no pin), so an unconfigured node is unaffected.
+        crate::parse_persist_cpu(&self.persist_cpu).map_err(|reason| ConfigError::Invalid {
+            field: "persist-cpu",
+            reason,
+        })?;
         // TRANSPORT TLS (#105, docs/design/TLS.md). A no-op when `tls = off` (the default), so the
         // plaintext path is byte-unchanged; otherwise it requires a readable cert + key. Factored
         // into a helper so `validate` stays within the line budget and the TLS pre-flight lives in
@@ -1590,6 +1613,10 @@ pub struct ConfigOverlay {
     /// (`save_min_changes = 1`) + the `IRONCACHE_SAVE_MIN_CHANGES` env var. `None` leaves the lower
     /// layer (default `0`).
     pub save_min_changes: Option<u64>,
+    /// The dedicated persist core (#589): which CPU core(s) the `ic-persist` thread pins to. TOML
+    /// (`persist_cpu = "8"`) + the `IRONCACHE_PERSIST_CPU` env var + the `--persist-cpu` CLI flag. A
+    /// string (`off`/`auto`/a cpu list); `None` leaves the lower layer (default `""` = no pin).
+    pub persist_cpu: Option<String>,
     /// The `notify-keyspace-events` flag string (PROD-8, keyspace notifications). TOML
     /// (`notify_keyspace_events = "KEA"`) + the `IRONCACHE_NOTIFY_KEYSPACE_EVENTS` env var. `None`
     /// leaves the lower layer (default `""` = DISABLED). The flag-string validity is checked in
@@ -1951,6 +1978,12 @@ impl ConfigOverlay {
                 reason: format!("not a number: {v}"),
             })?);
         }
+        // The dedicated persist core (#589): a string knob (`off`/`auto`/a cpu list). Validity is
+        // checked once on the RESOLVED value in Config::validate (like notify-keyspace-events), so an
+        // env override folds through and is validated together with any TOML/CLI layer.
+        if let Ok(v) = env_var("IRONCACHE_PERSIST_CPU") {
+            o.persist_cpu = Some(v);
+        }
         if let Ok(v) = env_var("IRONCACHE_NOTIFY_KEYSPACE_EVENTS") {
             // The flag-string validity is checked once on the resolved value in Config::validate.
             o.notify_keyspace_events = Some(v);
@@ -2109,6 +2142,10 @@ impl ConfigOverlay {
         }
         if let Some(v) = self.save_min_changes {
             cfg.save_min_changes = v;
+        }
+        if let Some(ref v) = self.persist_cpu {
+            // Raw string folds through; validity is checked in Config::validate on the resolved value.
+            cfg.persist_cpu.clone_from(v);
         }
         if let Some(ref v) = self.notify_keyspace_events {
             // Flag-string validity is checked in Config::validate (after all overlays fold), so an
