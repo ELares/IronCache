@@ -355,12 +355,12 @@ async fn bgsave_yields_so_concurrent_writes_are_serviced_and_snapshot_loads() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// #577 SAVE-BACKPRESSURE THROTTLE: `CONFIG SET save-backpressure-percent` is LIVE-settable + VALIDATED,
-/// and a THROTTLED (`pct < 100`) BGSAVE still commits (manifest-last crash-safety unchanged), still
-/// services concurrent writes DURING the dump, and reloads every pre-existing key on restart. The
-/// proportional-sleep MATH is proven deterministically by the `save_throttle_sleep_us` unit tests (no
-/// wall-clock race here); this asserts the knob is wired end to end and the throttle preserves
-/// correctness. Reuses the #571 `bgsave_yields` harness.
+/// #577 SAVE-BACKPRESSURE knob: `CONFIG SET save-backpressure-percent` is LIVE-settable + VALIDATED,
+/// and a BGSAVE with the knob set still commits (manifest-last crash-safety unchanged), still services
+/// concurrent writes DURING the dump, and reloads every pre-existing key on restart. NOTE (#576): the
+/// freeze-based off-thread save does NO serving-side copy loop for the knob to throttle, so the knob is
+/// now INERT for pacing (it stays settable for compatibility); this asserts the knob is still wired end
+/// to end (GET/SET/validation) and that a save with it set preserves correctness.
 #[tokio::test(flavor = "current_thread")]
 async fn bgsave_backpressure_percent_is_live_settable_validated_and_still_commits() {
     let dir = temp_data_dir("throttle");
@@ -502,8 +502,9 @@ async fn bgsave_off_thread_keeps_datapath_low_latency_during_dump() {
             set(&mut c, &format!("pre-{i}"), &format!("v-{i}")).await;
         }
 
-        // Kick the UNTHROTTLED background save; it COPIES on shard 0 and encodes+fsyncs on the persist
-        // thread OFF the serving core. The dump is now in-flight for the ops below.
+        // Kick the UNTHROTTLED background save; it FREEZES shard 0 (per-slot Arc-COW, #576) and
+        // encodes+fsyncs the frozen slots on the persist thread OFF the serving core. The dump is now
+        // in-flight for the ops below.
         assert_eq!(
             cmd1(&mut c, "BGSAVE").await,
             b"+Background saving started\r\n"
@@ -571,6 +572,141 @@ async fn bgsave_off_thread_keeps_datapath_low_latency_during_dump() {
         server.shutdown_and_join().unwrap();
     }
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #576 PER-SLOT ARC-COW during a BGSAVE, through the REAL command path: APPEND / INCR / DEL / SET
+/// on keys being dumped are serviced with LOW latency (the datapath is uncontended -- a write COWs
+/// a still-frozen slot then mutates the fresh copy; the O(N) encode is off the serving core), AND
+/// the reloaded snapshot is self-consistent (a key present at freeze reloads with a VALID, non-torn
+/// value -- either its pre-freeze value or, if the write landed pre-freeze, its post-write value,
+/// never garbage), AND the live in-place writes are in the live store afterward. This exercises the
+/// in-place mutation (APPEND/INCR) + free (DEL/overwrite) COW hazards end to end. Latency is bounded
+/// via `tokio::time::timeout` (the determinism seam forbids ad-hoc `Instant`, ADR-0003); GENEROUS
+/// bounds absorb single-box noise, and the absolute p99.9 win is re-measured on c7g.
+#[tokio::test(flavor = "current_thread")]
+async fn bgsave_cow_serves_inplace_writes_and_reloads_consistently() {
+    let dir = temp_data_dir("cow");
+    let port = free_port();
+
+    // One shard so the whole keyspace + the dump + the concurrent in-place writes are homed on
+    // shard 0 (they must contend with the SAME shard's dump). Large enough that the dump stays
+    // in-flight while the writes run.
+    let preload = 20000usize;
+    let ints = 2000usize;
+    {
+        let server = run_persist_server_for_test(port, 1, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+        for i in 0..preload {
+            set(&mut c, &format!("s-{i}"), &format!("v-{i}")).await;
+        }
+        for i in 0..ints {
+            set(&mut c, &format!("n-{i}"), "1000").await;
+        }
+
+        // Kick the UNTHROTTLED background save; it FREEZES shard 0 and encodes+fsyncs the frozen
+        // slots off the serving core, so the in-place writes below overlap the in-flight dump.
+        assert_eq!(
+            cmd1(&mut c, "BGSAVE").await,
+            b"+Background saving started\r\n"
+        );
+
+        // Fire in-place + free + create writes DURING the dump; each must complete PROMPTLY (a
+        // frozen-slot COW is a bounded one-time deep-clone, never a multi-second stall).
+        let live = 600usize;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for i in 0..live {
+                // APPEND to a pre-existing string (in-place mutation of a possibly-frozen pointee).
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    cmd(&mut c, &["APPEND", &format!("s-{i}"), "-x"]),
+                )
+                .await
+                .expect("APPEND serviced promptly during BGSAVE (COW, no stall)");
+                // INCR a pre-existing int (in-place mutation of a possibly-frozen pointee).
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    cmd(&mut c, &["INCR", &format!("n-{}", i % ints)]),
+                )
+                .await
+                .expect("INCR serviced promptly during BGSAVE");
+                // DELETE a pre-existing string (frees the pointee -- must not touch the frozen one).
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    cmd(&mut c, &["DEL", &format!("s-{}", preload - 1 - i)]),
+                )
+                .await
+                .expect("DEL serviced promptly during BGSAVE");
+                // A brand-new key created mid-save.
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    set(&mut c, &format!("fresh-{i}"), "new"),
+                )
+                .await
+                .expect("SET serviced promptly during BGSAVE");
+            }
+        })
+        .await
+        .expect("the whole batch of in-place writes during the dump completed promptly");
+
+        // The live store reflects the in-place writes (mutations landed on the fresh COW copies).
+        assert_eq!(
+            get_raw(&mut c, "s-0").await,
+            bulk("v-0-x"),
+            "APPEND applied to the live store"
+        );
+        assert_eq!(
+            get_raw(&mut c, "n-0").await,
+            bulk("1001"),
+            "INCR applied to the live store"
+        );
+        assert_eq!(get_raw(&mut c, "fresh-0").await, bulk("new"));
+
+        // The save commits (manifest-last).
+        let mut advanced = false;
+        for _ in 0..600 {
+            if cmd1(&mut c, "LASTSAVE").await != b":0\r\n" {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(advanced, "the COW BGSAVE committed (LASTSAVE advanced)");
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
+
+    // Restart: the reloaded snapshot is self-consistent.
+    assert!(dir.join("dump.manifest").exists(), "manifest committed");
+    {
+        let server = run_persist_server_for_test(port, 1, dir.clone(), 0, 0);
+        let mut c = connect_retry(port).await;
+        // A string never touched during the save reloads EXACTLY (present the whole dump).
+        let untouched = preload / 2; // 10000: outside the appended (0..600) + deleted (19400..) ranges.
+        assert_eq!(
+            get_raw(&mut c, &format!("s-{untouched}")).await,
+            bulk(&format!("v-{untouched}")),
+            "an untouched key reloads exactly"
+        );
+        // An APPENDed key reloads to a VALID value: its pre-freeze "v-0" (the COW isolated the
+        // dump from a post-freeze APPEND) OR "v-0-x" (the APPEND landed pre-freeze) -- never a
+        // torn/garbage value.
+        let got = get_raw(&mut c, "s-0").await;
+        assert!(
+            got == bulk("v-0") || got == bulk("v-0-x"),
+            "s-0 reloads self-consistent (pre- or post-freeze value, never torn), got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        // An INCRed key reloads to a VALID value: "1000" (pre-freeze) or "1001" (INCR pre-freeze).
+        let got_n = get_raw(&mut c, "n-0").await;
+        assert!(
+            got_n == bulk("1000") || got_n == bulk("1001"),
+            "n-0 reloads self-consistent, got {:?}",
+            String::from_utf8_lossy(&got_n)
+        );
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -72,6 +72,7 @@ use ironcache_storage::{
     RmwAction, RmwEntry, RmwStep, ScanCursor, Store, UnixMillis, ValueRef, VictimFreq, WatchEntry,
 };
 use std::hash::BuildHasher;
+use std::sync::Arc;
 
 /// The FIXED-SEED stable key hash that the SCAN cursor iterates in ascending order
 /// (KEYSPACE.md "the full hash recomputed from the embedded key"). It is a small
@@ -273,7 +274,29 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// `Vec`, not all `databases` of them. Empty tables allocate no bucket array, so the
     /// per-DB fixed cost is `slots` `HashTable` structs plus the `Vec` (a few KB), not
     /// per-key state.
-    dbs: Vec<Vec<HashTable<Entry>>>,
+    ///
+    /// ## Per-slot `Arc` copy-on-write snapshot isolation (#576)
+    ///
+    /// Each slot table is held behind an [`Arc`] so a SAVE can FREEZE the whole shard in
+    /// O(slots) atomic-refcount bumps ([`Self::begin_save`]) and hand the frozen slot
+    /// tables to a dedicated persist thread that reads them OFF the serving core, with NO
+    /// O(N) serving-side copy. The datapath stays uncontended:
+    /// - GET reads through the `Arc` as a SHARED deref ([`Self::slot_table`]) -- no
+    ///   `Arc::get_mut`, no atomic on the read path (the freq bump goes through the
+    ///   interior-mutable [`Entry::bump_freq_shared`], gated OFF while a save holds a
+    ///   frozen clone, see [`Self::saving`], so no datapath thread ever mutates a shared
+    ///   frozen pointee -- the soundness crux).
+    /// - A write takes `Arc::make_mut` ([`Self::slot_table_mut`]): the COMMON (not-saving)
+    ///   case is `strong_count == 1`, an uncontended in-place mutate; while a save holds a
+    ///   frozen clone of this slot (`strong_count > 1`) the FIRST write DEEP-CLONES the
+    ///   slot's entries into a fresh table (`HashTable<Entry>: Clone` clones each `Entry`,
+    ///   and `Entry`'s `Clone` is DEEP -- a new pointee allocation, see its impl), swaps
+    ///   the live `Arc` to the fresh copy, and leaves the frozen `Arc` owning the ORIGINAL
+    ///   entries. So a write during a save is NEVER visible in the concurrent dump and
+    ///   NEVER mutates/frees a pointee the persist thread is reading (no data race, no
+    ///   use-after-free). Later writes to the same slot see `strong_count == 1` again
+    ///   (one-time COW per written slot).
+    dbs: Vec<Vec<Arc<HashTable<Entry>>>>,
     /// The per-DB slot count (a power of two, [`DEFAULT_SLOTS_PER_DB`] by default, set at
     /// construction via [`Self::with_slots_per_db`]). Fixed for the store's life: slot
     /// routing must be stable, so this is chosen once at boot (a restart-required config
@@ -385,6 +408,21 @@ pub struct ShardStore<E: EvictionHook = NullEviction, A: AccountingHook = Counti
     /// compiled-constant behavior. Default [`EncodingThresholds::defaults`] so a store built without
     /// an explicit snapshot (every existing test fixture) behaves exactly as the compiled defaults.
     encoding_thresholds: EncodingThresholds,
+    /// SAVE-IN-PROGRESS flag (#576 per-slot Arc-COW): `true` for exactly the window a
+    /// [`Self::begin_save`] freeze is outstanding (a persist thread holds `Arc` clones of
+    /// this shard's slot tables), cleared by [`Self::end_save`] once that thread has
+    /// finished reading + dropped its frozen clones. It gates ONE thing on the datapath:
+    /// the interior-mutable S3-FIFO freq bump ([`Entry::bump_freq_shared`]) on the GET /
+    /// rmw READ path, which is the ONLY datapath write that reaches a stored pointee
+    /// through a SHARED `&Entry` (every other write funnels through `Arc::make_mut`, which
+    /// COW-copies a frozen slot first). While a save holds a frozen clone, a freq bump on
+    /// a not-yet-COW'd slot would mutate a byte the persist thread is concurrently reading
+    /// (a data race), so it is SKIPPED for the save window -- a tiny, bounded S3-FIFO
+    /// fidelity loss (the freq stays put; eviction is unaffected outside the short save)
+    /// traded for snapshot-read soundness. A plain `bool` (NOT an atomic): the shard is
+    /// single-threaded (ADR-0002/0005), set/cleared through `&mut self` on the owning core
+    /// and read through the same core's read path; the persist thread NEVER touches it.
+    saving: bool,
 }
 
 /// The data-plane WRITE OBSERVER (HA-5a): a background sink the per-shard store calls on
@@ -439,7 +477,7 @@ pub trait WriteObserver: std::fmt::Debug {
 /// double-borrow of `self`. It mirrors `db_index`'s clamp (the command layer validates
 /// the db range upstream; the clamp is the same defensive backstop).
 struct TableVictimFreq<'a> {
-    dbs: &'a mut [Vec<HashTable<Entry>>],
+    dbs: &'a mut [Vec<Arc<HashTable<Entry>>>],
     hasher: &'a DefaultHashBuilder,
     /// The per-DB slot count (a copy of [`ShardStore::slots`]) so this can route a probe
     /// key to its slot table exactly as the store does.
@@ -469,10 +507,15 @@ impl VictimFreq for TableVictimFreq<'_> {
         let db_idx = self.db_index(db);
         let h = self.hasher.hash_one(key);
         let slot = slot_index(key, self.slots);
+        // A second-chance freq decrement is a MUTATION, so it takes `Arc::make_mut` (COW):
+        // during a save this deep-clones a still-frozen slot before writing (so the persist
+        // thread's frozen view is untouched), then decrements the fresh copy; outside a save
+        // it is an uncontended in-place `&mut` (strong_count == 1).
         if let Some(obj) = self
             .dbs
             .get_mut(db_idx)
             .and_then(|d| d.get_mut(slot))
+            .map(Arc::make_mut)
             .and_then(|t| t.find_mut(h, |e| e.key() == key))
         {
             obj.dec_freq();
@@ -575,6 +618,9 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // store built without an explicit snapshot is byte-identical to the pre-runtime-threshold
             // behavior. The boot/serve path installs the live snapshot via `set_encoding_thresholds`.
             encoding_thresholds: EncodingThresholds::defaults(),
+            // No save in flight at boot (#576): the datapath bumps the S3-FIFO freq
+            // normally; only a live `begin_save` freeze flips this on for its window.
+            saving: false,
         }
     }
 
@@ -648,13 +694,21 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // two rounding, the aggregate bucket count matches the pre-#570 single table (the
         // per-slot slack sums back to one table's), so bytes-per-key does not regress.
         if dbv.is_empty() {
-            dbv.resize_with(slots, HashTable::new);
+            // `arc_with_non_send_sync` is EXPECTED and intentional here: `HashTable<Entry>` is
+            // `!Send`/`!Sync` (its `Entry` is a raw tagged pointer), but the #576 design uses `Arc`
+            // (not `Rc`) DELIBERATELY -- its ATOMIC refcount is what lets a save FREEZE a slot into a
+            // cross-thread `FrozenSlot` and COW it via `Arc::make_mut`. See the `dbs` field + the
+            // `FrozenSlot` soundness doc for why sending the frozen `Arc` is sound.
+            #[allow(clippy::arc_with_non_send_sync)]
+            dbv.resize_with(slots, || Arc::new(HashTable::new()));
         }
         let per_slot = additional.div_ceil(slots);
         for table in dbv.iter_mut() {
             // The explicit-hash table's `reserve` needs a hasher closure to re-place
-            // entries on a grow: hash each entry's embedded key.
-            table.reserve(per_slot, |e| hasher.hash_one(e.key()));
+            // entries on a grow: hash each entry's embedded key. `Arc::make_mut` yields the
+            // unique `&mut HashTable` (a bulk-load seam runs before any save, so this is the
+            // uncontended strong_count == 1 path; if a save ever raced it would COW first).
+            Arc::make_mut(table).reserve(per_slot, |e| hasher.hash_one(e.key()));
         }
     }
 
@@ -672,7 +726,13 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     fn slot_table(&self, db_idx: usize, key: &[u8]) -> Option<&HashTable<Entry>> {
         // An untouched DB has an empty slot `Vec`, so `get(slot)` returns None (the key is
         // absent). A touched DB has exactly `slots` tables, so the slot always resolves.
-        self.dbs.get(db_idx)?.get(slot_index(key, self.slots))
+        // SHARED `Arc` deref (#576): the read path derefs through the `Arc` (one pointer
+        // indirection, NO `Arc::get_mut`, NO atomic refcount touch), so a GET stays a shared
+        // borrow even while a save holds a frozen clone of this slot.
+        self.dbs
+            .get(db_idx)?
+            .get(slot_index(key, self.slots))
+            .map(|arc| &**arc)
     }
 
     /// The MUTABLE per-slot table for `key` in `db_idx` (#570 write routing), ALLOCATING
@@ -680,6 +740,18 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     /// slot `Vec`). Every write funnel routes through here, so an insert into a fresh DB
     /// materializes its slot tables exactly once. `db_idx` is the validated/clamped index
     /// (in range, so the direct `self.dbs[db_idx]` cannot panic).
+    ///
+    /// COPY-ON-WRITE (#576): the `&mut HashTable` comes from `Arc::make_mut`. In the COMMON
+    /// (no-save) case the slot `Arc` is uniquely owned (`strong_count == 1`), so `make_mut`
+    /// hands back the live table in place -- an uncontended `&mut`, no copy. While a save
+    /// holds a FROZEN clone of this slot (`strong_count > 1`), the FIRST write DEEP-CLONES
+    /// the slot's entries into a fresh table and re-points the live `Arc` at it, leaving the
+    /// frozen `Arc` sole-owning the ORIGINAL entries for the persist thread; the write then
+    /// lands on the fresh copy. `HashTable<Entry>: Clone` clones each `Entry`, and `Entry`'s
+    /// `Clone` is a DEEP clone (a new pointee allocation -- see its impl), so the frozen and
+    /// live tables share NO pointee: a datapath write can never mutate/free what the dump
+    /// reads. Subsequent writes to the same slot in the same save see `strong_count == 1`
+    /// again (one-time COW per written slot, the ~0.7ms-per-slot cost).
     #[inline]
     fn slot_table_mut(&mut self, db_idx: usize, key: &[u8]) -> &mut HashTable<Entry> {
         let slots = self.slots;
@@ -687,10 +759,12 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         let dbv = &mut self.dbs[db_idx];
         if dbv.is_empty() {
             // First write to this DB: fill its slot `Vec` with `slots` empty tables (no
-            // bucket array is allocated until each table's own first insert).
-            dbv.resize_with(slots, HashTable::new);
+            // bucket array is allocated until each table's own first insert). `Arc` (not `Rc`) is
+            // deliberate for the #576 cross-thread freeze/COW; the `!Send`/`!Sync` inner is expected.
+            #[allow(clippy::arc_with_non_send_sync)]
+            dbv.resize_with(slots, || Arc::new(HashTable::new()));
         }
-        &mut dbv[slot]
+        Arc::make_mut(&mut dbv[slot])
     }
 
     /// The WATCH write-funnel NOTIFY (TRANSACTIONS.md per-key dirty-CAS, PR-10b). Called
@@ -826,14 +900,14 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         self.dbs
             .iter()
             .flat_map(|db| db.iter())
-            .map(HashTable::len)
+            .map(|t| t.len())
             .sum()
     }
 
     /// Whether the store holds no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.dbs.iter().all(|db| db.iter().all(HashTable::is_empty))
+        self.dbs.iter().all(|db| db.iter().all(|t| t.is_empty()))
     }
 
     /// The map index for the validated logical `db`. The command layer validates the
@@ -1083,10 +1157,14 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     fn set_entry_expire(&mut self, db_idx: usize, key: &[u8], deadline: Option<UnixMillis>) {
         let h = self.key_hash(key);
         let slot = slot_index(key, self.slots);
+        // A TTL write is a MUTATION, so it takes `Arc::make_mut` (COW): during a save this
+        // deep-clones a still-frozen slot before patching the deadline (so the dump reflects
+        // the pre-freeze TTL); outside a save it is an uncontended in-place `&mut`.
         if let Some(obj) = self
             .dbs
             .get_mut(db_idx)
             .and_then(|d| d.get_mut(slot))
+            .map(Arc::make_mut)
             .and_then(|t| t.find_mut(h, |e| e.key() == key))
         {
             obj.set_expire_at(deadline);
@@ -1150,10 +1228,20 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
         // bumps (via the shared accessor) and yields the view. `expire_if_due` above
         // returned true, so the key's slot table exists (the DB is touched, #570), hence
         // `slot_table(..)` is `Some`.
+        //
+        // #576 SOUNDNESS GATE: `bump_freq_shared` is the ONLY datapath write reaching a
+        // stored pointee through a SHARED `&Entry`. While a save holds a frozen `Arc` clone
+        // of this slot the SAME pointee may be READ by the persist thread, so the bump is
+        // SKIPPED for the save window (a bounded, correctness-neutral S3-FIFO fidelity loss)
+        // to avoid a read/write data race on the freq byte. The flag is a `Copy` bool read
+        // before the shared table borrow.
+        let bump = !self.saving;
         self.slot_table(db_idx, key)
             .and_then(|t| t.find(h, |e| e.key() == key))
             .map(|obj| {
-                obj.bump_freq_shared();
+                if bump {
+                    obj.bump_freq_shared();
+                }
                 Self::view_of(obj)
             })
     }
@@ -1222,11 +1310,17 @@ impl<E: EvictionHook, A: AccountingHook> Store for ShardStore<E, A> {
             // off the object at `select_victim` time via `VictimFreq`. `live` is true, so the
             // key's slot table exists (the DB is touched, #570), hence `slot_table` is `Some`.
             let h = self.key_hash(key);
+            // #576 SOUNDNESS GATE (see `read`): skip the shared-`&Entry` freq bump while a
+            // save holds a frozen clone, so the persist thread's concurrent read of this
+            // pointee never races the bump. A `Copy` bool read before the table borrow.
+            let bump = !self.saving;
             let obj = self
                 .slot_table(db_idx, key)
                 .and_then(|t| t.find(h, |e| e.key() == key))
                 .expect("live entry present");
-            obj.bump_freq_shared();
+            if bump {
+                obj.bump_freq_shared();
+            }
             let entry = RmwEntry::Occupied(Self::occupied_of(obj));
             f(entry)
         } else {
@@ -1837,7 +1931,7 @@ impl<E: EvictionPolicy, A: AccountingHook> ShardStore<E, A> {
         for (db_idx, slots) in self.dbs.iter().enumerate() {
             let db = db_idx as u32;
             // Every slot table of this DB (#570): an untouched DB has an empty slot `Vec`.
-            for obj in slots.iter().flat_map(HashTable::iter) {
+            for obj in slots.iter().flat_map(|t| t.iter()) {
                 if obj.is_expired(now) {
                     // Collected only to reap it for free below (NOT an eviction candidate).
                     expired.push((db, obj.key().to_vec().into_boxed_slice()));
@@ -2082,20 +2176,17 @@ impl<A: AccountingHook> ironcache_storage::PolicySwap for ShardStore<Policy, A> 
             .flat_map(|(db_idx, slots)| {
                 let db = db_idx as u32;
                 // Every slot table of this DB (#570).
-                slots
-                    .iter()
-                    .flat_map(HashTable::iter)
-                    .filter_map(move |obj| {
-                        if obj.is_expired(now) {
-                            None
-                        } else {
-                            Some((
-                                db,
-                                obj.key().to_vec().into_boxed_slice(),
-                                obj.accounted_bytes(),
-                            ))
-                        }
-                    })
+                slots.iter().flat_map(|t| t.iter()).filter_map(move |obj| {
+                    if obj.is_expired(now) {
+                        None
+                    } else {
+                        Some((
+                            db,
+                            obj.key().to_vec().into_boxed_slice(),
+                            obj.accounted_bytes(),
+                        ))
+                    }
+                })
             })
             .collect();
         // Re-seed in a DETERMINISTIC order (ADR-0003): the `hashbrown` map iteration
@@ -2190,7 +2281,7 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         // order even for equal-hash keys. Each `&[u8]` borrows the key INSIDE its entry.
         let mut order: Vec<(u64, &[u8])> = slots
             .iter()
-            .flat_map(HashTable::iter)
+            .flat_map(|t| t.iter())
             .map(|e| (scan_hash(e.key()), e.key()))
             .collect();
         if order.is_empty() {
@@ -2235,14 +2326,14 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         // slot table of the DB (#570).
         self.dbs
             .get(db_idx)
-            .map_or(0, |slots| slots.iter().map(HashTable::len).sum())
+            .map_or(0, |slots| slots.iter().map(|t| t.len()).sum())
     }
 
     fn random_key(&mut self, db: u32, pick: u64, now: UnixMillis) -> Option<Box<[u8]>> {
         let db_idx = self.db_index(db);
         let slots = self.dbs.get(db_idx)?;
         // Total count across every slot table of the DB (#570).
-        let n: usize = slots.iter().map(HashTable::len).sum();
+        let n: usize = slots.iter().map(|t| t.len()).sum();
         if n == 0 {
             return None;
         }
@@ -2254,7 +2345,7 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         // the sorted order (and thus the deterministic pick) is slot-independent.
         let mut order: Vec<(&[u8], bool)> = slots
             .iter()
-            .flat_map(HashTable::iter)
+            .flat_map(|t| t.iter())
             .map(|e| (e.key(), e.is_expired(now)))
             .collect();
         order.sort_unstable_by(|a, b| scan_hash(a.0).cmp(&scan_hash(b.0)).then(a.0.cmp(b.0)));
@@ -2276,7 +2367,7 @@ impl<E: EvictionHook, A: AccountingHook> Keyspace for ShardStore<E, A> {
         let keys: Vec<Box<[u8]>> = match self.dbs.get(db_idx) {
             Some(slots) => slots
                 .iter()
-                .flat_map(HashTable::iter)
+                .flat_map(|t| t.iter())
                 .map(|e| e.key().to_vec().into_boxed_slice())
                 .collect(),
             None => return 0,
@@ -2642,7 +2733,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             // releasing the table borrow before mutating.
             let victims: Vec<Box<[u8]>> = self.dbs[db_idx]
                 .iter()
-                .flat_map(HashTable::iter)
+                .flat_map(|t| t.iter())
                 .filter(|e| pred(e.key()))
                 .map(|e| e.key().to_vec().into_boxed_slice())
                 .collect();
@@ -2854,7 +2945,7 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
         // the pre-#570 single table's), so the inner cursor is unchanged.
         let mut order: Vec<(u64, &[u8])> = slots
             .iter()
-            .flat_map(HashTable::iter)
+            .flat_map(|t| t.iter())
             .map(|e| (scan_hash(e.key()), e.key()))
             .collect();
         if order.is_empty() {
@@ -2870,6 +2961,142 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
             .map(|&k| k.to_vec().into_boxed_slice())
             .collect();
         (plan.next, examined)
+    }
+}
+
+/// A FROZEN per-slot table handed to the dedicated persist thread for an off-thread,
+/// copy-free SAVE (#576). It wraps an [`Arc`] clone of ONE of the store's slot tables,
+/// captured at [`ShardStore::begin_save`], plus the logical `db` the slot belongs to (so
+/// the persist thread can write db-tagged records). The persist thread iterates
+/// [`Self::entries`] and encodes each entry directly -- NO O(N) serving-side copy, the
+/// whole point of the fix.
+///
+/// ## Why the `unsafe impl Send` is SOUND
+///
+/// `Arc<HashTable<Entry>>` is `!Send` (an [`Entry`] is a raw `NonNull` tagged pointer with
+/// interior-mutable freq, so it is `!Send`/`!Sync`, which is CORRECT for the otherwise
+/// shard-local, single-core store, ADR-0002/0005). Sending a `FrozenSlot` to the persist
+/// thread is nonetheless sound because, for the WHOLE lifetime of the frozen clone, the
+/// slot's table and every entry pointee it holds are DE-FACTO IMMUTABLE from the datapath's
+/// side:
+///
+/// 1. Any datapath WRITE to this slot goes through `Arc::make_mut`
+///    ([`ShardStore::slot_table_mut`]): while the frozen clone is outstanding the slot's
+///    `strong_count > 1`, so `make_mut` DEEP-CLONES the entries into a FRESH table and
+///    re-points the LIVE `Arc` at it, leaving THIS frozen `Arc` sole-owning the ORIGINAL
+///    entries. So a write never forms `&mut` to, nor frees, a pointee this `FrozenSlot`
+///    reads.
+/// 2. The one datapath write that reaches a pointee through a SHARED `&Entry` -- the
+///    S3-FIFO freq bump ([`Entry::bump_freq_shared`]) -- is GATED OFF for the save window
+///    ([`ShardStore::saving`]), so no freq byte is mutated under the persist thread's read.
+///
+/// Thus the persist thread has exclusive, read-only access to immutable data: no `&mut` and
+/// no free of those pointees occurs until it DROPS the `FrozenSlot` (after all its reads and
+/// the file write). The `Arc` refcount itself is atomic, so the cross-thread clone/drop is
+/// data-race-free; and dropping a `FrozenSlot` only frees pointees when its `strong_count`
+/// reached 1 (the slot was COW'd away, so no datapath reader remains) -- never a
+/// still-shared pointee. This mirrors exactly why the store is otherwise `!Send` (mutable
+/// aliasing on the owning core), which does NOT apply to a frozen-immutable slot.
+pub struct FrozenSlot {
+    /// The logical database this slot belongs to (captured at freeze), so the persist thread
+    /// writes each record under its correct `db` tag.
+    db: u32,
+    /// An `Arc` clone of one of the store's slot tables, frozen at [`ShardStore::begin_save`].
+    /// Solely read (never `&mut`) by the persist thread until it is dropped.
+    table: Arc<HashTable<Entry>>,
+}
+
+// SAFETY: see the `FrozenSlot` type doc. A `FrozenSlot` is created ONLY for a slot that is
+// FROZEN for the duration of a save; the datapath never mutates a frozen slot's table or its
+// entries' pointees (every write COWs via `Arc::make_mut` first, and the shared freq bump is
+// gated off while `saving`), so handing the `Arc` to the persist thread grants exclusive
+// de-facto-immutable READ access. No `&mut` and no free of those pointees races the persist
+// thread's reads. The `Arc` refcount is atomic, so the cross-thread move + drop is sound.
+unsafe impl Send for FrozenSlot {}
+
+impl FrozenSlot {
+    /// The logical database this frozen slot belongs to (the record `db` tag).
+    #[must_use]
+    pub fn db(&self) -> u32 {
+        self.db
+    }
+
+    /// Iterate the frozen slot's entries by SHARED reference (the persist thread's read-only
+    /// dump source). The `impl Iterator` return keeps the underlying `hashbrown` iterator an
+    /// implementation detail. The caller (the persist crate) applies the lazy-expiry skip via
+    /// [`Entry::is_expired`] and encodes each live entry with [`Entry::to_kvobj`].
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> + '_ {
+        self.table.iter()
+    }
+}
+
+impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
+    /// BEGIN an off-thread SAVE (#576 per-slot Arc-COW): FREEZE the whole shard by taking an
+    /// `Arc` clone of every NON-EMPTY slot table (O(non-empty slots) atomic refcount bumps,
+    /// NOT an O(N-keys) copy) and return them as [`FrozenSlot`]s for a dedicated persist
+    /// thread to encode + fsync OFF the serving core. Also sets the [`Self::saving`] flag so
+    /// the datapath (a) COWs a frozen slot on its first write ([`Self::slot_table_mut`] via
+    /// `Arc::make_mut`) instead of mutating the frozen entries, and (b) skips the shared
+    /// S3-FIFO freq bump for the save window (the soundness gate).
+    ///
+    /// EMPTY slots are skipped: they hold nothing to dump, and a key INSERTED into an empty
+    /// slot during the save is a brand-new key that the snapshot may legitimately omit
+    /// (SCAN/snapshot semantics), so leaving it un-frozen (an in-place insert, no COW) is
+    /// correct and saves the clone.
+    ///
+    /// CONSISTENCY: the returned freeze is a per-shard POINT-IN-TIME view AS OF this call --
+    /// stronger than the pre-#576 chunked walk. A key written mid-save COWs, so the dump keeps
+    /// its PRE-freeze value (or omits it if newly created); the live store keeps the new value.
+    /// Cross-shard it stays FUZZY (each shard freezes at its own instant), the accepted cache
+    /// warm-start tradeoff (see `ironcache_persist`).
+    ///
+    /// MEMORY: the freeze itself is O(slots) pointers (no key copy). The transient extra memory a
+    /// save costs is bounded by the fraction of slots WRITTEN during it: each written slot is
+    /// deep-cloned ONCE (the frozen original is retained by the persist thread until the save
+    /// completes), so a save with no concurrent writes costs ~0 extra and a save racing a full
+    /// rewrite costs up to ~1x the keyspace transiently -- the same class of COW headroom a fork
+    /// snapshot needs, and freed as the persist thread finishes.
+    ///
+    /// The caller MUST pair this with [`Self::end_save`] once the persist thread has finished
+    /// reading and dropped its [`FrozenSlot`]s, so the flag does not stay set (which would
+    /// keep the datapath COWing + skipping freq bumps).
+    #[must_use]
+    pub fn begin_save(&mut self) -> Vec<FrozenSlot> {
+        self.saving = true;
+        let mut frozen = Vec::new();
+        for (db_idx, dbv) in self.dbs.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let db = db_idx as u32;
+            for slot in dbv {
+                // Skip empty slots: nothing to dump, and a mid-save insert there is a new key
+                // the snapshot may omit, so it need not be frozen (an in-place insert is fine).
+                if slot.is_empty() {
+                    continue;
+                }
+                // O(1) freeze: an atomic refcount bump. `make_mut` on a later write to this
+                // slot sees strong_count > 1 and COWs, protecting these frozen entries.
+                frozen.push(FrozenSlot {
+                    db,
+                    table: Arc::clone(slot),
+                });
+            }
+        }
+        frozen
+    }
+
+    /// END an off-thread SAVE (#576): clear the [`Self::saving`] flag. MUST be called only
+    /// AFTER the persist thread has finished reading its [`FrozenSlot`]s (i.e. once the save's
+    /// result has been received), so a datapath freq bump resuming here can never race the
+    /// persist thread's reads. Idempotent (a plain `false` store).
+    pub fn end_save(&mut self) {
+        self.saving = false;
+    }
+
+    /// Whether an off-thread save is currently frozen over this shard (#576). Introspection /
+    /// test helper; the datapath reads the private [`Self::saving`] field directly.
+    #[must_use]
+    pub fn is_saving(&self) -> bool {
+        self.saving
     }
 }
 
@@ -3634,7 +3861,7 @@ mod slot_tests {
         }
         assert_eq!(store.len(), n);
         let slots = store.slots;
-        let lens: Vec<usize> = store.dbs[0].iter().map(HashTable::len).collect();
+        let lens: Vec<usize> = store.dbs[0].iter().map(|t| t.len()).collect();
         let max = lens.iter().copied().max().expect("slots present");
         let mean = n / slots;
         // A well-avalanched fixed-seed slot hash keeps the max near the mean N/S (measured
@@ -3742,5 +3969,259 @@ mod slot_tests {
         assert_eq!(store.db_len(1), 300);
         assert!(store.contains(0, b"b50", NOW));
         assert!(store.contains(1, b"a250", NOW));
+    }
+}
+
+#[cfg(test)]
+mod arc_cow_tests {
+    //! The per-slot `Arc` copy-on-write snapshot isolation (#576): a [`ShardStore::begin_save`]
+    //! freeze is a per-shard POINT-IN-TIME view the (simulated) persist thread reads, and every
+    //! LIVE write during the save COW-copies its slot with a DEEP clone so the frozen view is
+    //! never mutated / freed under the reader. These are single-threaded, deterministic, and
+    //! Miri-friendly (the crux test simulates the persist thread's read handle by simply HOLDING
+    //! the `FrozenSlot`s across the live mutations + drop).
+
+    use super::*;
+    use ironcache_storage::{ExpireWrite, NewValue, Store};
+
+    const NOW: UnixMillis = UnixMillis(0);
+
+    /// The LIVE S3-FIFO freq of `(db, key)`, read straight off the stored entry via the
+    /// crate-internal accessors (so this works for a `NullEviction` store, which does not get the
+    /// `Admit` trait's `access_freq`).
+    fn live_freq<E: EvictionHook, A: AccountingHook>(
+        store: &ShardStore<E, A>,
+        db: u32,
+        key: &[u8],
+    ) -> Option<u8> {
+        let db_idx = store.db_index(db);
+        let h = store.key_hash(key);
+        store
+            .slot_table(db_idx, key)
+            .and_then(|t| t.find(h, |e| e.key() == key))
+            .map(Entry::freq)
+    }
+
+    /// Read the STRING value a `FrozenSlot` set holds for `(db, key)`, reconstructed from the
+    /// frozen entry (the same `to_kvobj` the persist thread encodes through). `None` if absent.
+    fn frozen_value(frozen: &[FrozenSlot], db: u32, key: &[u8]) -> Option<Vec<u8>> {
+        for slot in frozen.iter().filter(|s| s.db() == db) {
+            for e in slot.entries() {
+                if e.key() == key {
+                    return Some(match e.to_kvobj().value {
+                        crate::kvobj::ValueRepr::Int(n) => n.to_string().into_bytes(),
+                        crate::kvobj::ValueRepr::Inline(b) | crate::kvobj::ValueRepr::Raw(b) => {
+                            b.into_vec()
+                        }
+                        _ => Vec::new(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// THE COW CORRECTNESS CRUX (+ the Miri target): while a freeze is held (as the persist
+    /// thread would), OVERWRITE + DELETE the frozen keys in the LIVE store. A shallow clone that
+    /// shared the entry pointees would corrupt / free what the frozen reader still reads (a
+    /// use-after-free / double-free Miri would catch). The deep-clone-on-COW must leave the
+    /// frozen view byte-for-byte at its pre-freeze state while the live store advances.
+    #[test]
+    fn cow_deep_clone_isolates_frozen_slots_from_overwrite_and_delete() {
+        let mut store = ShardStore::new(1);
+        // Enough keys to span many slots, so the freeze covers many slot `Arc`s and the live
+        // writes COW many distinct slots.
+        let n = 500usize;
+        for i in 0..n {
+            let k = format!("k{i}").into_bytes();
+            let v = format!("orig-{i}");
+            store.upsert(
+                0,
+                &k,
+                NewValue::Bytes(v.as_bytes()),
+                ExpireWrite::Clear,
+                NOW,
+            );
+        }
+
+        // FREEZE: hold the frozen slots exactly as the persist thread would (a read handle over
+        // the pre-freeze entries). `saving` is now set.
+        let frozen = store.begin_save();
+        assert!(store.is_saving(), "begin_save sets the saving flag");
+        let frozen_keys: usize = frozen.iter().map(|s| s.entries().count()).sum();
+        assert_eq!(
+            frozen_keys, n,
+            "the freeze captures the whole pre-freeze keyspace"
+        );
+
+        // MUTATE the LIVE store while the frozen slots are held: OVERWRITE even keys (frees the
+        // old pointee + allocates a new one) and DELETE odd keys (frees the pointee). With a
+        // shallow clone BOTH would corrupt/free the frozen reader's pointee.
+        for i in 0..n {
+            let k = format!("k{i}").into_bytes();
+            if i % 2 == 0 {
+                let v = format!("NEW-{i}");
+                store.upsert(
+                    0,
+                    &k,
+                    NewValue::Bytes(v.as_bytes()),
+                    ExpireWrite::Clear,
+                    NOW,
+                );
+            } else {
+                assert!(store.delete(0, &k, NOW), "live delete of k{i}");
+            }
+        }
+
+        // The FROZEN slots STILL show the PRE-freeze value for EVERY key (overwritten AND
+        // deleted): deep-clone-on-COW isolated them. Reading here would UAF under a shallow clone.
+        for i in 0..n {
+            let k = format!("k{i}");
+            assert_eq!(
+                frozen_value(&frozen, 0, k.as_bytes()).as_deref(),
+                Some(format!("orig-{i}").as_bytes()),
+                "frozen slot must retain the pre-freeze value for {k} (COW isolation)"
+            );
+        }
+        // The frozen entry COUNT is unchanged: a live delete did not remove from the frozen view.
+        let frozen_keys_after: usize = frozen.iter().map(|s| s.entries().count()).sum();
+        assert_eq!(
+            frozen_keys_after, n,
+            "the frozen point-in-time is unperturbed"
+        );
+
+        // The LIVE store reflects the POST-write state.
+        for i in 0..n {
+            let k = format!("k{i}").into_bytes();
+            if i % 2 == 0 {
+                assert_eq!(
+                    store
+                        .read(0, &k, NOW)
+                        .expect("overwritten key live")
+                        .as_bytes(),
+                    format!("NEW-{i}").as_bytes()
+                );
+            } else {
+                assert!(
+                    store.read(0, &k, NOW).is_none(),
+                    "deleted key gone from live store"
+                );
+            }
+        }
+
+        // Drop the frozen handle (the persist thread finishing), THEN end the save. Dropping the
+        // frozen `Arc`s frees ONLY the COW'd-away originals (no live reader remains) -- no UAF /
+        // double-free (Miri validates the drop ordering).
+        drop(frozen);
+        store.end_save();
+        assert!(!store.is_saving(), "end_save clears the saving flag");
+
+        // Post-save writes take the uncontended fast path and are correct.
+        store.upsert(0, b"k0", NewValue::Bytes(b"post"), ExpireWrite::Clear, NOW);
+        assert_eq!(
+            store.read(0, b"k0", NOW).expect("k0 live").as_bytes(),
+            b"post"
+        );
+        // A key deleted during the save stays gone post-save (the fast path sees it absent).
+        assert!(
+            !store.delete(0, b"k1", NOW),
+            "k1 was deleted during the save"
+        );
+    }
+
+    /// The SOUNDNESS GATE: while a save holds a frozen clone, a GET must NOT bump the S3-FIFO
+    /// freq (a shared interior-mutable write to a frozen pointee the persist thread reads would
+    /// be a data race). The bump resumes after `end_save`.
+    #[test]
+    fn freq_bump_skipped_while_saving_then_resumes() {
+        let mut store = ShardStore::new(1);
+        store.upsert(0, b"hot", NewValue::Bytes(b"v"), ExpireWrite::Clear, NOW);
+        let f0 = live_freq(&store, 0, b"hot").expect("present");
+        store.read(0, b"hot", NOW);
+        let f1 = live_freq(&store, 0, b"hot").expect("present");
+        assert!(f1 > f0, "a read bumps the S3-FIFO freq when not saving");
+
+        // FREEZE: reads during the save leave the freq UNCHANGED (the gate).
+        let frozen = store.begin_save();
+        let before = live_freq(&store, 0, b"hot").expect("present");
+        for _ in 0..5 {
+            store.read(0, b"hot", NOW);
+        }
+        let during = live_freq(&store, 0, b"hot").expect("present");
+        assert_eq!(
+            during, before,
+            "the freq bump is SKIPPED while a save holds a frozen clone (soundness gate)"
+        );
+        drop(frozen);
+        store.end_save();
+
+        // After the save the bump resumes.
+        let resume0 = live_freq(&store, 0, b"hot").expect("present");
+        store.read(0, b"hot", NOW);
+        let resume1 = live_freq(&store, 0, b"hot").expect("present");
+        assert!(resume1 > resume0, "the freq bump resumes after end_save");
+    }
+
+    /// At SCALE (200k keys): a freeze is a stable per-shard point-in-time even as a large
+    /// fraction of the keyspace is overwritten + deleted on the LIVE store. Every COW is
+    /// one-time-per-slot; the frozen view keeps its full pre-freeze contents.
+    #[test]
+    fn point_in_time_holds_under_mass_writes_at_scale() {
+        let mut store = ShardStore::new(1);
+        let n = 200_000usize;
+        for i in 0..n {
+            let k = format!("key:{i}").into_bytes();
+            store.upsert(0, &k, NewValue::Int(i as i64), ExpireWrite::Clear, NOW);
+        }
+        let frozen = store.begin_save();
+        let frozen_count: usize = frozen.iter().map(|s| s.entries().count()).sum();
+        assert_eq!(
+            frozen_count, n,
+            "the freeze captures the whole pre-freeze keyspace"
+        );
+
+        // Mass mutation on the LIVE store: overwrite a third, delete a third, leave a third.
+        for i in 0..n {
+            let k = format!("key:{i}").into_bytes();
+            match i % 3 {
+                0 => {
+                    store.upsert(
+                        0,
+                        &k,
+                        NewValue::Int(i as i64 + 1_000_000),
+                        ExpireWrite::Clear,
+                        NOW,
+                    );
+                }
+                1 => {
+                    store.delete(0, &k, NOW);
+                }
+                _ => {}
+            }
+        }
+        // The frozen view is UNCHANGED -- a true per-shard point-in-time isolated from every
+        // live write by COW.
+        let frozen_count_after: usize = frozen.iter().map(|s| s.entries().count()).sum();
+        assert_eq!(
+            frozen_count_after, n,
+            "the frozen point-in-time is unperturbed by live writes"
+        );
+        for i in (0..n).step_by(9973) {
+            assert_eq!(
+                frozen_value(&frozen, 0, format!("key:{i}").as_bytes()),
+                Some(i.to_string().into_bytes()),
+                "frozen value for key:{i} is the pre-freeze int"
+            );
+        }
+        drop(frozen);
+        store.end_save();
+
+        // The live store reflects the post-write state.
+        let deleted = (0..n).filter(|i| i % 3 == 1).count();
+        assert_eq!(
+            store.len(),
+            n - deleted,
+            "a third of the keys were deleted from the live store"
+        );
     }
 }

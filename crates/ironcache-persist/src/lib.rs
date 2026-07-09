@@ -94,7 +94,7 @@ use std::io;
 use std::path::Path;
 
 use ironcache_storage::{AccountingHook, EvictionHook, UnixMillis};
-use ironcache_store::{ShardStore, SnapshotCursor, SnapshotEntry};
+use ironcache_store::{Entry, FrozenSlot, ShardStore, SnapshotCursor, SnapshotEntry};
 
 /// The number of keys [`dump_shard_keyspace`] EXAMINES per
 /// [`ironcache_store::ShardStore::snapshot_chunk`] call. Bounds the per-chunk owned `Vec` (and
@@ -169,6 +169,38 @@ pub fn dump_shard_keyspace<E: EvictionHook, A: AccountingHook>(
     builder.finish(shard)
 }
 
+/// DUMP a shard's FROZEN slot tables to an in-memory snapshot file buffer, the #576
+/// per-slot Arc-COW off-thread SAVE path. The shard called
+/// [`ironcache_store::ShardStore::begin_save`] to FREEZE its keyspace into `frozen`
+/// ([`FrozenSlot`]s, `Arc` clones of its non-empty slot tables) in O(slots) with NO O(N)
+/// serving-side copy; this runs ENTIRELY on the dedicated persist thread, iterating each
+/// frozen slot's entries directly and encoding them ([`ShardDumpBuilder::push_entry`] ->
+/// the `encode_kvobj` codec + CRC). The returned [`ShardDump`] carries the file bytes, the
+/// live key count, and the body CRC for the manifest.
+///
+/// The dump reflects the store AS OF the freeze: because a datapath write COW-copies a still
+/// frozen slot before mutating it (`ShardStore::slot_table_mut`), the entries `frozen` holds
+/// are IMMUTABLE for this call, so the dump is a per-shard POINT-IN-TIME view (stronger than
+/// the pre-#576 chunked walk) with NO risk of reading a torn / concurrently-mutated pointee.
+///
+/// `now` is the lazy-expiry basis (the shard's clock, ADR-0003): a logically-dead entry is
+/// SKIPPED, exactly as `snapshot_chunk` / SCAN do, so the snapshot never persists an
+/// already-expired key.
+#[must_use]
+pub fn dump_frozen_slots(frozen: &[FrozenSlot], shard: u32, now: UnixMillis) -> ShardDump {
+    let mut builder = ShardDumpBuilder::new();
+    for slot in frozen {
+        let db = slot.db();
+        for entry in slot.entries() {
+            if entry.is_expired(now) {
+                continue; // never persist a logically-dead key (matches snapshot_chunk / SCAN).
+            }
+            builder.push_entry(db, entry);
+        }
+    }
+    builder.finish(shard)
+}
+
 /// INCREMENTAL builder for a shard [`ShardDump`], so the caller can drive
 /// [`ShardStore::snapshot_chunk`](ironcache_store::ShardStore::snapshot_chunk) itself and RELEASE
 /// the store borrow (and, on the serve path, `yield` the shard) BETWEEN chunks (#571). It is the
@@ -216,6 +248,21 @@ impl ShardDumpBuilder {
             format::put_record(&mut self.body, *db, &encoded);
             self.keys += 1;
         }
+    }
+
+    /// APPEND one stored [`Entry`] (read directly from a [`FrozenSlot`]) as a db-tagged
+    /// record, the #576 off-thread FREEZE path's analogue of [`Self::push_chunk`]. It
+    /// reconstructs the owned [`ironcache_store::KvObj`] from the entry with
+    /// [`Entry::to_kvobj`] (the deep-clone the persist thread does OFF the serving core, so
+    /// the shard pays NO O(N) copy) and encodes it with the same reused
+    /// [`ironcache_repl::encode_kvobj`] codec, yielding a record byte-identical to the one
+    /// `push_chunk` would produce for the same key. The caller applies the lazy-expiry skip
+    /// (a logically-dead entry is not pushed).
+    pub fn push_entry(&mut self, db: u32, entry: &Entry) {
+        let kv = entry.to_kvobj();
+        let encoded = ironcache_repl::encode_kvobj(&kv);
+        format::put_record(&mut self.body, db, &encoded);
+        self.keys += 1;
     }
 
     /// SEAL the accumulated body into a [`ShardDump`]: prepend the file header for `shard` and
@@ -1033,6 +1080,101 @@ mod tests {
                 format!("v{i}").as_bytes(),
                 "{k} value intact through a mutating dump"
             );
+        }
+    }
+
+    /// #576 COW CORRECTNESS through a real DUMP + RELOAD: a [`dump_frozen_slots`] over a
+    /// `begin_save` freeze is a per-shard POINT-IN-TIME. Overwriting + deleting keys on the LIVE
+    /// store AFTER the freeze must NOT change the dumped file (deep-clone-on-COW isolated it), so
+    /// the RELOAD holds every key's PRE-freeze value; the LIVE store holds the POST-write values.
+    /// A shallow clone would have let a post-freeze overwrite/delete corrupt/free the dumped
+    /// entry's pointee (torn value / crash).
+    #[test]
+    fn dump_frozen_slots_is_point_in_time_across_later_writes() {
+        let now = UnixMillis(1_000);
+        let mut store: TestStore = ShardStore::new(2);
+        let n = 400usize;
+        for i in 0..n {
+            store.insert_object(
+                0,
+                KvObj::from_bytes(format!("k{i}").as_bytes(), format!("v{i}").as_bytes(), None),
+            );
+        }
+
+        // FREEZE, then DUMP the frozen slots to file bytes exactly as the persist thread does.
+        let frozen = store.begin_save();
+        let dump = dump_frozen_slots(&frozen, 0, now);
+        assert_eq!(
+            dump.keys, n as u64,
+            "the dump records the whole pre-freeze keyspace"
+        );
+
+        // MUTATE the LIVE store AFTER the freeze: overwrite the even keys, delete a quarter.
+        for i in 0..n {
+            let k = format!("k{i}");
+            if i % 2 == 0 {
+                store.insert_object(
+                    0,
+                    KvObj::from_bytes(k.as_bytes(), format!("NEW{i}").as_bytes(), None),
+                );
+            } else if i % 4 == 3 {
+                store.delete(0, k.as_bytes(), now);
+            }
+        }
+        drop(frozen);
+        store.end_save();
+
+        // The DUMP is the frozen point-in-time: reload it and assert EVERY key has its PRE-freeze
+        // value and the file is not corrupt (CRC matches).
+        let body = format::split_shard_header(&dump.bytes, 0).expect("valid header");
+        assert_eq!(
+            format::crc32(body),
+            dump.crc,
+            "recorded crc matches the body (no corruption)"
+        );
+        let mut reloaded: TestStore = ShardStore::new(2);
+        let loaded = load_body_all(&mut reloaded, body, now);
+        assert_eq!(
+            loaded, n as u64,
+            "the dump holds the whole pre-freeze keyspace"
+        );
+        for i in 0..n {
+            let k = format!("k{i}");
+            let got = reloaded
+                .read(0, k.as_bytes(), now)
+                .expect("pre-freeze key present in the dump");
+            assert_eq!(
+                got.as_bytes(),
+                format!("v{i}").as_bytes(),
+                "the dump has the PRE-freeze value for {k} (COW isolation)"
+            );
+        }
+
+        // The LIVE store reflects the POST-write state (writes landed on the fresh COW copies).
+        for i in 0..n {
+            let k = format!("k{i}");
+            if i % 2 == 0 {
+                assert_eq!(
+                    store
+                        .read(0, k.as_bytes(), now)
+                        .expect("overwritten key live")
+                        .as_bytes(),
+                    format!("NEW{i}").as_bytes()
+                );
+            } else if i % 4 == 3 {
+                assert!(
+                    store.read(0, k.as_bytes(), now).is_none(),
+                    "deleted key gone from the live store"
+                );
+            } else {
+                assert_eq!(
+                    store
+                        .read(0, k.as_bytes(), now)
+                        .expect("untouched key live")
+                        .as_bytes(),
+                    format!("v{i}").as_bytes()
+                );
+            }
         }
     }
 }
