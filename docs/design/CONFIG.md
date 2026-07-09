@@ -97,9 +97,19 @@ thread pins to during a save. The per-slot Arc-COW snapshot (#588) moved a save'
 encode+fsync off the serving core onto that dedicated thread, but the thread still runs
 somewhere: under the thread-per-core model (ADR-0002) the datapath threads are confined
 to a pinned cpuset, and at 16 shards on 8 pinned cores the persist thread is a 17th
-runnable thread the scheduler places on one of those same serving cores, where its encode
-steals serving time and stretches the during-save tail. Pinning it to a reserved core off
-the datapath set removes that steal.
+runnable thread the scheduler otherwise places on one of those same serving cores.
+
+WARNING (measured on c7g, 2026-07-09): pinning the persist thread to a single dedicated
+core makes the concurrent-snapshot tail WORSE, not better. A/B at 1M keys: snapshot p99.9
+was 291ms with the DEFAULT float behavior and 1,125ms (3.9x WORSE) pinned to one reserved
+core. A single dedicated core encodes SLOWER than the thread floating opportunistically
+across the datapath cores' spare cycles, so the save takes LONGER, and because the real
+bottleneck is the persist thread SHARING MEMORY BANDWIDTH with the (memory-bound) datapath
+while it reads the frozen keyspace, a longer save means a LONGER contention window and thus
+a worse tail. The bandwidth contention is at the shared memory controller and cannot be
+scheduled away by moving the thread. The DEFAULT (float) is best for the tail; this knob is
+retained only for operators who want to isolate persist CPU from the datapath for OTHER
+reasons (e.g. bounding datapath CPU jitter during a save) and accept the tail cost.
 
 Accepted values:
 
@@ -133,11 +143,16 @@ It is restart-required: the persist thread's affinity is set as the thread spawn
 boot value, so `CONFIG GET persist-cpu` reports the effective value but `CONFIG SET
 persist-cpu` returns restart-required (like `bind`/`port`/`shards`).
 
-Honest residual: pinning removes the persist thread's CPU steal, but the thread still
-READS the frozen keyspace to encode it, so it still shares MEMORY BANDWIDTH with the
-(memory-bound) datapath during a save. Pinning is expected to close part, not all, of the
-remaining gap to millisecond-class snapshot tails; bounding the reader's bandwidth share
-is a separate follow-up lever tracked in #589.
+Why the snapshot tail is what it is: the per-slot Arc-COW (#588) cut the concurrent-snapshot
+p99.9 from a catastrophic 3.5s to ~291ms (11.5x) by eliminating the O(N) serving-side copy.
+The residual gap to millisecond-class snapshot tails (Redis/Dragonfly ~15ms) is a FUNDAMENTAL
+memory-bandwidth-headroom tradeoff, not a scheduling bug: IronCache's multi-core datapath
+already consumes most of the memory bandwidth serving, so a concurrent save's reads push
+toward saturation. Redis reaches ~15ms because it is single-threaded (one serving core leaves
+ample bandwidth for a fork() child to dump). Neither pinning (measured worse, above) nor
+throttling the save (also measured worse: it stretches the contention window) helps; only
+REDUCING the save's data footprint (incremental or compressed snapshots) could, which is a
+large lever with diminishing returns against the shipped 11.5x and is deferred (#589 context).
 
 ### Transparent huge pages
 

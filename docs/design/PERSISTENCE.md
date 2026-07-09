@@ -164,11 +164,17 @@ chunks** so a `SAVE`/`BGSAVE` does not block the shard for its whole keyspace du
 
 ### Save-backpressure throttle: the concurrent-snapshot p99.9 stopgap (#577)
 
-Yielding between chunks (#571) bounds the save tail, but a full-speed dump still **steals about half
-the serving core** for the length of the dump: the `c7g` tail bench measured a concurrent-snapshot
-p99.9 of ~3.6s because, once the offered load exceeds what the half-a-core datapath can drain, the
-open-loop queue **builds** for the whole save window. The `save-backpressure-percent` knob is the
-cheap, low-risk stopgap that cuts that tail (~3-4x) while the ms-class isolation fix (below) is built.
+Yielding between chunks (#571) does NOT bound the save tail: the `c7g` tail bench measured a
+catastrophic concurrent-snapshot p99.9 of ~3.5s, because a full-speed dump contends with the datapath
+for the whole save window. `save_backpressure_percent` was introduced on the HYPOTHESIS that throttling
+the save would cut that tail.
+
+WARNING (measured on c7g, the hypothesis was WRONG): **the throttle makes the tail WORSE, not better.**
+A/B: snapshot p99.9 was 3.5s at `pct=100` (off), 6.8s at `pct=25`, 16.75s at `pct=10`. Throttling
+STRETCHES the save's wall-time, and because the real bottleneck is the save SHARING MEMORY BANDWIDTH
+with the datapath (not CPU duty), a longer save is a LONGER contention window and thus a WORSE tail.
+The knob is retained ONLY for bounding background save CPU when the during-save tail is not a concern;
+it must NOT be used to protect the tail. The actual fix is the per-slot Arc-COW (#588, below).
 
 - **The knob.** `save_backpressure_percent` is a runtime config value in `1..=100`, **default 100 =
   no throttle** (a save dumps at full speed, byte-identical to the pre-#577 behavior, so the default
@@ -178,9 +184,9 @@ cheap, low-risk stopgap that cuts that tail (~3-4x) while the ms-class isolation
 
 - **The throttle.** In the per-shard dump loop (`coordinator::save_shard_local`), after each chunk the
   loop reads the live percent and, when it is below 100, **sleeps proportionally**:
-  `sleep = chunk_time * (100 - pct) / pct`. That shares the core `pct : (100 - pct)` between the save
-  and the datapath, so the save consumes only about `pct`% of the core and the datapath throughput
-  stays **above** the offered load -- the queue drains instead of building. The per-chunk store borrow
+  `sleep = chunk_time * (100 - pct) / pct`. The original intent was to share the core `pct : (100 - pct)`
+  so the datapath throughput stays above the offered load. MEASUREMENT DISPROVED this: the bottleneck is
+  not CPU duty but memory bandwidth, so throttling only lengthens the save (and the tail). The per-chunk store borrow
   is already dropped before the sleep (the no-borrow-across-await contract), so the sleep just lets the
   shard service its queued writes. `chunk_time` is measured on the shard's **Env monotonic clock** and
   the sleep is armed on the **Runtime timer seam** (ADR-0003), so the save path carries no `std::time`.
@@ -195,11 +201,16 @@ cheap, low-risk stopgap that cuts that tail (~3-4x) while the ms-class isolation
   throttled save still completes comfortably inside the cadence. When the cadence cannot be relaxed,
   leave the throttle at 100 (or use a milder `pct`) and rely on the isolation fix below.
 
-- **This is a STOPGAP, not the isolation fix.** The throttle reaches **hundreds-of-ms** tail under a
-  concurrent save; it does **not** deliver the **ms-class** isolation of a truly decoupled save. That
-  is the deliberate follow-up (#576 PR-B): an **epoch-cut copy-on-write** snapshot with an owned
-  `Send` point-in-time view handed to a **dedicated persist thread**, so the serving core is not shared
-  with the dump at all. The throttle buys the tail-cut cheaply until that lands.
+- **The actual fix that landed: per-slot Arc-COW (#588).** The throttle failed (above); an earlier
+  off-thread-encode attempt (#576 PR-B, #586) ALSO measured no improvement (~3.9s) because it still
+  copied the keyspace on the serving core. What worked is the per-slot Arc copy-on-write (#588): each
+  slot table is an `Arc<HashTable>`; a save `Arc`-clones each slot into a frozen `Send` view read IN
+  PLACE off-core by a dedicated persist thread, with NO O(N) serving-side copy (a write to a frozen
+  slot copies just that slot). Measured on c7g: concurrent-snapshot p99.9 dropped from 3.5s to ~291ms
+  (11.5x). The residual gap to ms-class (Redis/Dragonfly ~15ms) is a FUNDAMENTAL memory-bandwidth-
+  headroom tradeoff of the high-throughput multi-core datapath (see CONFIG.md "Dedicated persist core"
+  and #589), reachable only by reducing the save's data footprint (incremental/compressed snapshots),
+  which is deferred. The durable-save tail is COMPETITIVE (sub-second), not category-leading.
 
 ## Open questions
 
