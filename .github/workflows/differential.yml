@@ -14,9 +14,25 @@
 # wiring bug, not a pass. Keeping it separate means a redis-install or redis-version hiccup cannot
 # flake the main test gate.
 #
-# It installs `redis-server` from the Ubuntu archive (the binary the test spawns on an ephemeral
-# port), guarded by the same `has_cargo` idiom rust.yml/perf-gate.yml use so a docs-only repo state
-# is a no-op, and runs only when Rust sources / the test / the workflow change.
+# It builds a PINNED `redis-server` FROM SOURCE (an exact Redis tag, the binary the test spawns on
+# an ephemeral port), guarded by the same `has_cargo` idiom rust.yml/perf-gate.yml use so a docs-only
+# repo state is a no-op, and runs only when Rust sources / the test / the workflow change.
+#
+# WHY A PINNED ORACLE (not `apt-get install redis-server`): the gate asserts IronCache's RESP2
+# replies match a REAL redis-server, so redis IS the correctness oracle. A bare apt install pulls
+# whatever the runner image happens to ship (~7.x today, a different build tomorrow), so the oracle
+# would DRIFT with the runner and a differential pass/fail would stop being reproducible; a Redis
+# behavior change could then silently move the gate. Building one EXACT tag from source pins the
+# oracle to a single reproducible version, independent of the runner image and the apt archive.
+#
+# WHY REDIS 7.2 SPECIFICALLY (not 7.4 / 8.0): the corpus includes cross-server DUMP/RESTORE round
+# trips, and IronCache's RESTORE accepts an RDB footer version only up to SUPPORTED_RDB_VERSION = 11
+# (see crates/ironcache-server/src/cmd_dump.rs; that is the Redis 7.2 RDB version). Redis 7.4 and 8.0
+# bumped the RDB version to 12, so a payload DUMPed by a 7.4/8.0 server fails IronCache's RESTORE with
+# "DUMP payload version or checksum are wrong" -- verified empirically (7.4.5 and 8.0.0 each produce
+# 6 DUMP/RESTORE divergences; 7.2.7 is green). So the oracle is pinned to the newest 7.2 patch: the
+# highest Redis whose DUMP surface round-trips with this build. Raise it in lockstep with
+# SUPPORTED_RDB_VERSION when IronCache learns to RESTORE a newer RDB version.
 name: differential
 
 on:
@@ -38,6 +54,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUSTFLAGS: "-D warnings"
+  # The PINNED differential oracle: an EXACT Redis tag built from source (see the header for why).
+  # 7.2.7 is the newest Redis 7.2 patch; 7.2 is the highest Redis whose DUMP/RESTORE RDB version (11)
+  # this build accepts (SUPPORTED_RDB_VERSION in cmd_dump.rs). 7.4/8.0 use RDB v12 and break the
+  # cross-server DUMP round-trip. Bump this in lockstep with SUPPORTED_RDB_VERSION (and re-verify the
+  # corpus) when IronCache's RESTORE learns a newer RDB version.
+  REDIS_ORACLE_VERSION: "7.2.7"
 
 jobs:
   guard:
@@ -68,15 +90,25 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2
-      - name: Install redis-server (the binary the test spawns)
+      - name: Build + install the PINNED redis-server oracle from source
         run: |
-          sudo apt-get update
-          sudo apt-get install -y redis-server
-          # The Ubuntu package autostarts a system redis; the test spawns its OWN instance on an
-          # ephemeral port, so stop the autostarted one to avoid any port/resource surprise. It is
-          # only the redis-server BINARY on PATH that the test needs.
-          sudo systemctl stop redis-server || true
+          set -euo pipefail
+          # Build ONE exact Redis tag from source and put it on PATH as the differential oracle. This
+          # pins the oracle to a single reproducible version (no apt-archive/runner-image drift). The
+          # test spawns `redis-server` from PATH on its own ephemeral port (it never uses a system
+          # service), so a source build is all it needs; nothing is autostarted, so there is nothing
+          # to stop. BUILD_TLS=no keeps the build minimal (the corpus is plaintext RESP2) and uses
+          # Redis's own bundled deps (jemalloc/lua/hiredis), so no apt redis-server is ever involved.
+          curl -fsSL "https://github.com/redis/redis/archive/refs/tags/${REDIS_ORACLE_VERSION}.tar.gz" \
+            -o "${RUNNER_TEMP}/redis-src.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/redis-src"
+          tar -xzf "${RUNNER_TEMP}/redis-src.tar.gz" -C "${RUNNER_TEMP}/redis-src" --strip-components=1
+          make -C "${RUNNER_TEMP}/redis-src" -j"$(nproc)" BUILD_TLS=no redis-server
+          sudo install -m 0755 "${RUNNER_TEMP}/redis-src/src/redis-server" /usr/local/bin/redis-server
+          # Fail LOUDLY if the binary on PATH is not the pinned version (a silent oracle swap would
+          # defeat the whole point of pinning).
           redis-server --version
+          redis-server --version | grep -q "v=${REDIS_ORACLE_VERSION}"
       - name: Run the differential corpus
         # Explicitly target the one test; `--nocapture` surfaces the run summary + any divergence
         # report in the job log. With redis installed the test RUNS (it does not skip).
