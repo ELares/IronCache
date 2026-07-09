@@ -28,6 +28,48 @@ set by `CONFIG SET` wins until it is explicitly overwritten or cleared (a later
 precedence is documented so an operator can reason about the effective value,
 surfaced by `CONFIG GET`.
 
+### Unknown keys and the config-rollback escape hatch
+
+Each layer has a distinct unknown-key posture, chosen for who authors it:
+
+- The config FILE is STRICT by default: an unknown top-level key is a hard boot
+  failure (serde `deny_unknown_fields`). A config file is author-controlled, so an
+  unrecognized key is almost always a typo, and catching it at boot beats silently
+  dropping the operator's intended setting.
+- The ENVIRONMENT is lenient: an unknown `IRONCACHE_*` variable is a loud one-line
+  WARN (with a nearest-key "did you mean" hint), never a boot failure (#557). The
+  environment is a namespace SHARED with the OS and the orchestrator, which
+  legitimately set `IRONCACHE_*` vars that are not server knobs, so aborting boot on
+  those would be user-hostile.
+- CLI flags are STRICT: clap rejects an unrecognized flag immediately. A bad flag is
+  interactive and fixed on the spot, not a rollback hazard.
+
+The strict FILE posture creates one sharp edge: a DOWNGRADE. If you roll a binary
+back (or hand-edit the file) and the config now carries a key the OLDER binary does
+not recognize (a forward-incompatible key a newer build wrote), the old binary would
+HARD-FAIL at boot and the node would not start -- an outage during a rollback,
+exactly when you need the node to come up.
+
+The escape hatch is `ignore_unknown_config_keys` (TOML key
+`ignore_unknown_config_keys = true`, env `IRONCACHE_IGNORE_UNKNOWN_CONFIG_KEYS=true`,
+CLI `--ignore-unknown-config-keys`). When set, an unknown config-FILE key becomes a
+loud WARN (one line per key, NAMING each ignored key) instead of a hard failure,
+bringing the FILE to the same leniency the environment already has. It is a BOOTSTRAP
+knob: it is consumed when the FILE is parsed, not applied to the live config. The
+switch works set at any layer -- the env/CLI flag governs the file parse, and a file
+that sets `ignore_unknown_config_keys = true` in itself also enables it, so a rollback
+runbook can either pass the flag or bake it into the shipped config.
+
+Design constraints (deliberate):
+
+- The default is STRICT. The hatch only RELAXES when explicitly set, so a typo is
+  still caught in normal operation; leniency is opt-in for a rollback.
+- The hatch relaxes unknown KEYS only. A malformed TOML document, or an invalid
+  VALUE on a known key, still hard-fails boot even when the hatch is on -- leniency
+  never masks a real misconfiguration.
+- Every ignored key is NAMED in the warning, so an operator sees exactly what was
+  skipped and can reconcile the config after the rollback settles.
+
 ### Wire parity: CONFIG GET / SET / REWRITE
 
 - `CONFIG GET <pattern>` returns the effective values with Redis-recognized

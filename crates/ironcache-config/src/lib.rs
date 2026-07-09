@@ -1700,19 +1700,183 @@ pub struct ConfigOverlay {
     /// `IRONCACHE_REFUSE_EMPTY_START_ON_VERSION_MISMATCH` env var. `None` leaves the lower layer
     /// (default `false`, log loudly + start empty rather than refusing to boot).
     pub refuse_empty_start_on_version_mismatch: Option<bool>,
+    /// The #527 config-rollback ESCAPE HATCH. When set, an UNKNOWN config-FILE key is a loud WARN
+    /// (one line per key, naming it) instead of a hard boot failure. TOML
+    /// (`ignore_unknown_config_keys = true`) + the `IRONCACHE_IGNORE_UNKNOWN_CONFIG_KEYS` env var +
+    /// the `--ignore-unknown-config-keys` CLI flag. `None`/`false` (the default) keeps the STRICT
+    /// posture: an unknown FILE key still hard-fails boot so a typo is caught in normal ops. This is
+    /// a BOOTSTRAP-only option (it governs how the FILE is PARSED, so it is consumed at parse time and
+    /// never applied onto the live [`Config`]); the env layer ALREADY warns rather than fails on an
+    /// unknown `IRONCACHE_*` var (a shared namespace, see [`warn_unknown_env`]), so this switch exists
+    /// to bring the config FILE to that same leniency for a DOWNGRADE: an old binary must boot past a
+    /// forward-incompatible key a newer binary wrote, rather than bricking the rollback. See CONFIG.md
+    /// / DEPLOY.md (a downgrade should set it).
+    pub ignore_unknown_config_keys: Option<bool>,
+}
+
+/// The exact set of top-level TOML keys [`ConfigOverlay`] accepts (one per field). The strict parse
+/// is still enforced by serde's `deny_unknown_fields` on the struct; this list is used ONLY by the
+/// #527 lenient escape hatch to name + strip an unknown FILE key when `ignore_unknown_config_keys` is
+/// set. A drift-guard test (`known_toml_keys_matches_overlay_fields`) extracts the field list serde
+/// reports for an unknown key and asserts it equals this array, so the two can never silently diverge.
+const KNOWN_TOML_KEYS: &[&str] = &[
+    "bind",
+    "port",
+    "shards",
+    "databases",
+    "slots_per_db",
+    "default_resp3",
+    "maxmemory",
+    "maxmemory_policy",
+    "requirepass",
+    "timeout",
+    "maxclients",
+    "output_buffer_limit",
+    "query_buffer_limit",
+    "proto_max_bulk_len",
+    "tcp_keepalive_secs",
+    "hash_max_listpack_entries",
+    "hash_max_listpack_value",
+    "list_max_listpack_size",
+    "set_max_intset_entries",
+    "set_max_listpack_entries",
+    "set_max_listpack_value",
+    "zset_max_listpack_entries",
+    "zset_max_listpack_value",
+    "cluster_enabled",
+    "cluster_topology",
+    "cluster_announce_id",
+    "cluster_mode",
+    "replica_max_lag",
+    "failover_timeout_secs",
+    "min_replicas_to_write",
+    "min_replicas_max_lag",
+    "raft_snapshot_threshold",
+    "raft_snapshot_chunk_bytes",
+    "repl_backlog_disk_bytes",
+    "data_dir",
+    "upgrade_handoff_dir",
+    "handoff_socket",
+    "aclfile",
+    "tls",
+    "tls_cert_path",
+    "tls_key_path",
+    "runtime",
+    "save_interval_secs",
+    "save_min_changes",
+    "persist_cpu",
+    "notify_keyspace_events",
+    "cluster_tls",
+    "cluster_tls_cert_path",
+    "cluster_tls_key_path",
+    "cluster_ca_path",
+    "cluster_secret",
+    "cluster_tls_insecure_skip_verify",
+    "refuse_empty_start_on_version_mismatch",
+    "ignore_unknown_config_keys",
+];
+
+/// The unknown TOP-LEVEL keys present in a parsed TOML document (present keys minus [`KNOWN_TOML_KEYS`]),
+/// sorted for a DETERMINISTIC order (ADR-0003; config parse is on the boot path). Pure core so the
+/// unknown-key detection is unit-tested without touching the tracing subscriber, mirroring
+/// [`warn_unknown_env`]. Only TOP-LEVEL keys are considered, matching the historical strict surface:
+/// nested tables (`[cluster_topology]`) carry no `deny_unknown_fields`, so a nested unknown key was
+/// already tolerated and stays that way.
+fn unknown_toml_keys(present: &toml::Table) -> Vec<String> {
+    let mut unknown: Vec<String> = present
+        .keys()
+        .filter(|k| !KNOWN_TOML_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
 }
 
 impl ConfigOverlay {
-    /// Parse a TOML document into an overlay.
+    /// Parse a TOML document into an overlay, STRICT: an unknown top-level key hard-fails boot
+    /// (`deny_unknown_fields`). This is the default posture so a config typo is caught in normal ops.
     pub fn from_toml_str(s: &str) -> Result<ConfigOverlay, ConfigError> {
-        Ok(toml::from_str(s)?)
+        ConfigOverlay::from_toml_str_lenient(s, false)
     }
 
-    /// Load an overlay from a TOML file path. A missing file yields an empty
+    /// Parse a TOML document into an overlay, with the #527 config-rollback escape hatch.
+    ///
+    /// STRICT (the default, `ignore_unknown = false` AND the file does not set
+    /// `ignore_unknown_config_keys = true`): behaves byte-identically to the historical strict parse
+    /// -- serde's `deny_unknown_fields` makes an unknown top-level key a hard boot failure, and an
+    /// invalid VALUE for a known key is likewise a hard failure.
+    ///
+    /// LENIENT (`ignore_unknown` passed in from the env/CLI bootstrap layer, OR the file itself sets
+    /// `ignore_unknown_config_keys = true`): an unknown top-level key becomes a loud `WARN` (one line
+    /// per key, NAMING it) and is skipped, while every KNOWN key still applies. This is the rollback
+    /// escape hatch: an old binary boots past a forward-incompatible key a newer binary wrote. The
+    /// hatch relaxes UNKNOWN KEYS ONLY -- a malformed TOML document or an invalid VALUE on a known key
+    /// still hard-fails, even when lenient, so leniency never masks a real misconfiguration.
+    pub fn from_toml_str_lenient(
+        s: &str,
+        ignore_unknown: bool,
+    ) -> Result<ConfigOverlay, ConfigError> {
+        // Strict/fast path: byte-identical to the historical parse. `deny_unknown_fields` turns an
+        // unknown key into an error and a bad value into a type error; a clean document returns here.
+        let strict_err = match toml::from_str::<ConfigOverlay>(s) {
+            Ok(overlay) => return Ok(overlay),
+            Err(e) => e,
+        };
+        // We only get here on a parse error. Re-parse permissively to see the raw keys actually written
+        // (this never rejects unknown keys). A genuine TOML SYNTAX error fails both parses; surface the
+        // original strict error in that case.
+        let present: toml::Table = match toml::from_str(s) {
+            Ok(t) => t,
+            Err(_) => return Err(ConfigError::from(strict_err)),
+        };
+        // Resolve leniency: the env/CLI bootstrap flag OR the file's OWN `ignore_unknown_config_keys`.
+        // Either one, set at any layer, makes THIS file parse lenient -- one switch for a rollback.
+        let file_ignore = present
+            .get("ignore_unknown_config_keys")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        if !(ignore_unknown || file_ignore) {
+            // DEFAULT STRICT: hard-fail exactly as before the escape hatch existed.
+            return Err(ConfigError::from(strict_err));
+        }
+        let unknown = unknown_toml_keys(&present);
+        if unknown.is_empty() {
+            // No unknown key, yet the strict parse failed: the error was a bad VALUE on a known key (or
+            // a nested error). The hatch covers unknown KEYS only, so this still hard-fails.
+            return Err(ConfigError::from(strict_err));
+        }
+        // Lenient: WARN each unknown key by name, then strip them and re-parse with `deny_unknown_fields`
+        // STILL in force, so an invalid value on a known key (or an unknown NESTED key) still hard-fails.
+        let mut cleaned = present;
+        for key in &unknown {
+            cleaned.remove(key);
+            tracing::warn!(
+                config_key = %key,
+                "ignoring unknown config-file key '{key}' (ignore_unknown_config_keys is set); it is \
+                 not a recognized server config knob. If it is a typo, fix or remove it; if it is a \
+                 forward-compatible key written by a newer build, this is expected during a rollback"
+            );
+        }
+        toml::Value::Table(cleaned)
+            .try_into()
+            .map_err(ConfigError::from)
+    }
+
+    /// Load an overlay from a TOML file path, STRICT (the default). A missing file yields an empty
     /// overlay (an absent config file is allowed, CONFIG.md / Redis parity).
     pub fn from_toml_file(path: &std::path::Path) -> Result<ConfigOverlay, ConfigError> {
+        ConfigOverlay::from_toml_file_lenient(path, false)
+    }
+
+    /// Load an overlay from a TOML file path with the #527 escape hatch (`ignore_unknown` comes from
+    /// the env/CLI bootstrap layer; the file's own `ignore_unknown_config_keys = true` also enables
+    /// it). A missing file yields an empty overlay. See [`Self::from_toml_str_lenient`].
+    pub fn from_toml_file_lenient(
+        path: &std::path::Path,
+        ignore_unknown: bool,
+    ) -> Result<ConfigOverlay, ConfigError> {
         match std::fs::read_to_string(path) {
-            Ok(s) => ConfigOverlay::from_toml_str(&s),
+            Ok(s) => ConfigOverlay::from_toml_str_lenient(&s, ignore_unknown),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConfigOverlay::default()),
             Err(e) => Err(ConfigError::Io(e.to_string())),
         }
@@ -2052,6 +2216,18 @@ impl ConfigOverlay {
             // The flag-string validity is checked once on the resolved value in Config::validate.
             o.notify_keyspace_events = Some(v);
         }
+        // The #527 config-rollback escape hatch is a boolean bootstrap knob. Reading it here both sets
+        // the overlay field (so the binary can consult it before parsing the config FILE) AND records
+        // `IRONCACHE_IGNORE_UNKNOWN_CONFIG_KEYS` as a KNOWN key, so the guard below never warns on the
+        // hatch's own env var. An unrecognized token hard-fails boot rather than silently leaving the
+        // hatch off (a bad value here would otherwise brick the very rollback it exists to unblock).
+        if let Ok(v) = env_var("IRONCACHE_IGNORE_UNKNOWN_CONFIG_KEYS") {
+            o.ignore_unknown_config_keys =
+                Some(parse_bool(&v).ok_or_else(|| ConfigError::Invalid {
+                    field: "ignore-unknown-config-keys",
+                    reason: format!("not a boolean (expected yes/no/true/false/1/0): {v}"),
+                })?);
+        }
         // UNKNOWN-KEY GUARD. Every key we honor was recorded in `known` above, so ANY `IRONCACHE_*`
         // variable present in the environment that is NOT there is either a typo (e.g.
         // `IRONCACHE_MAXCLIENT` for `IRONCACHE_MAXCLIENTS`) whose intended setting would otherwise be
@@ -2243,6 +2419,9 @@ impl ConfigOverlay {
         if let Some(v) = self.refuse_empty_start_on_version_mismatch {
             cfg.refuse_empty_start_on_version_mismatch = v;
         }
+        // `ignore_unknown_config_keys` is a BOOTSTRAP-only knob: it governs how the config FILE is
+        // PARSED (consumed by from_toml_str_lenient), not a runtime setting, so it is deliberately NOT
+        // folded onto `Config` here. There is no `Config` field for it.
         Ok(())
     }
 }
@@ -3516,6 +3695,113 @@ mod tests {
     fn toml_rejects_unknown_field() {
         let res = ConfigOverlay::from_toml_str("nonsense = 1");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn known_toml_keys_matches_overlay_fields() {
+        // DRIFT GUARD for the #527 escape hatch. serde's `deny_unknown_fields` lists EVERY accepted
+        // field in the error it raises for an unknown key ("unknown field `X`, expected one of `a`,
+        // `b`, ..."). Parse that expected-field list out and assert it EQUALS `KNOWN_TOML_KEYS`, so the
+        // hand-listed set the lenient path strips against can never silently drift from the struct: add
+        // a field without listing it here and this test fails.
+        let err = toml::from_str::<ConfigOverlay>("__unknown_probe__ = 1").unwrap_err();
+        let msg = err.to_string();
+        // Backtick-delimited tokens: the first is the unknown key itself, the rest are the field names.
+        let reported: std::collections::BTreeSet<String> = msg
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| *t != "__unknown_probe__")
+            .map(str::to_owned)
+            .collect();
+        let listed: std::collections::BTreeSet<String> =
+            KNOWN_TOML_KEYS.iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(
+            listed, reported,
+            "KNOWN_TOML_KEYS is out of sync with the ConfigOverlay fields serde accepts"
+        );
+    }
+
+    #[test]
+    fn toml_unknown_key_strict_by_default_fails() {
+        // Regression: with the escape hatch OFF (the default), an unknown FILE key still hard-fails.
+        assert!(ConfigOverlay::from_toml_str("port = 7000\nfrobnicate = true\n").is_err());
+        assert!(
+            ConfigOverlay::from_toml_str_lenient("port = 7000\nfrobnicate = true\n", false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn toml_unknown_key_lenient_boots_and_keeps_known_keys() {
+        // With the hatch ON (passed from the env/CLI bootstrap layer), the SAME config boots: the
+        // unknown key is skipped and every known key still applies.
+        let o = ConfigOverlay::from_toml_str_lenient(
+            "port = 7000\nmaxclients = 42\nfrobnicate = true\n",
+            true,
+        )
+        .expect("unknown key must be tolerated when ignore_unknown is set");
+        assert_eq!(o.port, Some(7000), "known key `port` still applied");
+        assert_eq!(
+            o.maxclients,
+            Some(42),
+            "known key `maxclients` still applied"
+        );
+    }
+
+    #[test]
+    fn toml_unknown_key_lenient_names_each_unknown_key() {
+        // The WARN must NAME every unknown key. `unknown_toml_keys` is the pure core the lenient path
+        // warns over (mirroring `warn_unknown_env`), so it is asserted directly, sorted + deterministic.
+        let present: toml::Table =
+            toml::from_str("port = 7000\nfrobnicate = true\nwidgets = 3\n").unwrap();
+        assert_eq!(
+            unknown_toml_keys(&present),
+            vec!["frobnicate".to_owned(), "widgets".to_owned()],
+            "both unknown keys are named, sorted; the known `port` is not"
+        );
+    }
+
+    #[test]
+    fn toml_file_own_hatch_enables_leniency() {
+        // The file may flip the hatch ITSELF: `ignore_unknown_config_keys = true` in the file makes THAT
+        // file lenient even with the external (env/CLI) flag off, so a rollback runbook can bake the
+        // switch into the config it ships.
+        let o = ConfigOverlay::from_toml_str_lenient(
+            "ignore_unknown_config_keys = true\nport = 7000\nfrobnicate = true\n",
+            false,
+        )
+        .expect("the file's own ignore_unknown_config_keys must enable leniency");
+        assert_eq!(o.port, Some(7000));
+        assert_eq!(o.ignore_unknown_config_keys, Some(true));
+    }
+
+    #[test]
+    fn ignore_unknown_config_keys_parses_from_toml() {
+        // The option itself is a first-class TOML key.
+        let on = ConfigOverlay::from_toml_str("ignore_unknown_config_keys = true").unwrap();
+        assert_eq!(on.ignore_unknown_config_keys, Some(true));
+        let off = ConfigOverlay::from_toml_str("ignore_unknown_config_keys = false").unwrap();
+        assert_eq!(off.ignore_unknown_config_keys, Some(false));
+        let unset = ConfigOverlay::from_toml_str("port = 7000").unwrap();
+        assert_eq!(unset.ignore_unknown_config_keys, None);
+    }
+
+    #[test]
+    fn toml_lenient_still_rejects_bad_value_on_known_key() {
+        // The hatch relaxes unknown KEYS only; an invalid VALUE on a known key still hard-fails, even
+        // when lenient, so leniency never masks a real misconfiguration.
+        assert!(ConfigOverlay::from_toml_str_lenient("port = \"not-a-port\"\n", true).is_err());
+    }
+
+    #[test]
+    fn toml_lenient_with_no_unknown_key_is_a_clean_parse() {
+        // Leniency is a no-op when there is nothing unknown to forgive: a clean document parses the same
+        // whether or not the hatch is set.
+        let strict = ConfigOverlay::from_toml_str("port = 7000\nmaxclients = 9\n").unwrap();
+        let lenient =
+            ConfigOverlay::from_toml_str_lenient("port = 7000\nmaxclients = 9\n", true).unwrap();
+        assert_eq!(strict, lenient);
     }
 
     #[test]

@@ -185,15 +185,23 @@ fn parse_log_level(log_level: &str) -> (tracing::level_filters::LevelFilter, boo
 /// Resolve the effective config from the layered sources (CONFIG.md): defaults ->
 /// TOML file -> env vars -> CLI flags.
 fn load_config(cli: &Cli) -> anyhow::Result<Config> {
+    // Read the env layer FIRST: it carries the #527 config-rollback escape hatch
+    // (`IRONCACHE_IGNORE_UNKNOWN_CONFIG_KEYS`) that, together with the `--ignore-unknown-config-keys`
+    // CLI flag, must be resolved BEFORE the config FILE is parsed -- the hatch decides whether an
+    // unknown FILE key is a loud WARN (a rollback past a forward-incompatible key) or a hard boot
+    // failure (the strict default). The file's OWN `ignore_unknown_config_keys = true` also enables
+    // it; from_toml_file_lenient ORs the two, so the switch works set at ANY layer.
+    let env_overlay = ConfigOverlay::from_env().context("reading IRONCACHE_* env vars")?;
+    let bootstrap_ignore_unknown =
+        cli.ignore_unknown_config_keys || env_overlay.ignore_unknown_config_keys == Some(true);
     let file_overlay = if let Some(path) = &cli.config {
-        ConfigOverlay::from_toml_file(path)
+        ConfigOverlay::from_toml_file_lenient(path, bootstrap_ignore_unknown)
             .with_context(|| format!("loading config file {}", path.display()))?
     } else {
         // A conventional default path is checked but optional.
         let default_path = Path::new("/etc/ironcache/ironcache.toml");
-        ConfigOverlay::from_toml_file(default_path)?
+        ConfigOverlay::from_toml_file_lenient(default_path, bootstrap_ignore_unknown)?
     };
-    let env_overlay = ConfigOverlay::from_env().context("reading IRONCACHE_* env vars")?;
 
     // CLI flags overlay (highest of the startup layers).
     // The `--runtime` flag (PROD-10 / #28): parse the token to a `RuntimeBackend` here so a typo
@@ -213,6 +221,10 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
         // The dedicated persist core (#589): the raw string folds through; it is parsed + validated
         // on the resolved value in `Config::validate`, so a bad `--persist-cpu` fails boot here.
         persist_cpu: cli.persist_cpu.clone(),
+        // The #527 escape hatch also flows through as an overlay field for completeness (CONFIG GET
+        // parity + a single precedence story); it was ALREADY consumed above to parse the FILE, and
+        // it is a bootstrap-only knob so apply_to never folds it onto the live Config.
+        ignore_unknown_config_keys: cli.ignore_unknown_config_keys.then_some(true),
         ..Default::default()
     };
 
