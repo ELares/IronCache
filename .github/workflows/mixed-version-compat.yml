@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# MIXED-VERSION compatibility gate (#527; the rolling-upgrade + #391/#392 upgrade epic).
+#
+# No other gate verifies that a NEW build interoperates with the PREVIOUS release. The load-bearing
+# direction for a rolling upgrade is FORWARD-LOAD: a vN binary (HEAD) must load a snapshot a vN-1
+# binary (the latest published release) wrote. If the on-disk snapshot format silently drifts, a
+# rolling upgrade would bring the new node up EMPTY (or refuse to boot); the snapshot format is
+# versioned (ironcache-persist FORMAT_VERSION) precisely so a mismatch fails LOUDLY, and this gate
+# proves the compatible path stays compatible.
+#
+# It fetches the latest RELEASE binary (vN-1, a static musl asset from the rolling/`v*` channels),
+# builds the HEAD binary (vN), and runs scripts/ci/mixed-version-compat.sh: OLD seeds a
+# representative multi-type dataset + SAVE, then NEW boots on the SAME data_dir and must load every
+# key back, plus a small RESP wire smoke against both. It is DELIBERATELY BOUNDED (a smoke, a handful
+# of commands + one snapshot round-trip), not the full suite.
+#
+# SCOPED / DEFERRED: the deep cross-version RESP surface (every command, RESP2 vs RESP3, a vN client
+# against a vN-1 server for the whole command table) is left to a follow-up. The differential gate
+# already pins an exact Redis and asserts the RESP surface per version, so the highest-value
+# cross-VERSION check here is the snapshot forward-load that nothing else covers.
+#
+# When there is NO prior release yet (a fresh repo), the job is a clean no-op with a notice: there is
+# simply no vN-1 to test against until the first release ships.
+name: mixed-version-compat
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/ci/mixed-version-compat.sh"
+      - ".github/workflows/mixed-version-compat.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  guard:
+    name: guard (skip until a Cargo project exists)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_cargo: ${{ steps.check.outputs.has_cargo }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] && [ -f Cargo.lock ]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::repo is docs-only (no Cargo.toml/Cargo.lock); mixed-version-compat is a no-op"
+          fi
+
+  snapshot-compat:
+    name: snapshot forward-load (vN loads a vN-1 snapshot) + RESP smoke
+    needs: guard
+    if: needs.guard.outputs.has_cargo == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2
+      - name: Fetch the latest release binary (vN-1, the previous version)
+        id: prev
+        run: |
+          set -euo pipefail
+          mkdir -p old
+          # Is there a published "latest" release at all? The releases/latest API 404s when the repo
+          # has no non-draft, non-prerelease release yet; in that case there is simply no vN-1 to test
+          # against, so no-op cleanly with a notice (both the rolling and `v*` channels publish NORMAL
+          # releases, so `gh release download` with no tag then resolves to that same newest release).
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name >/dev/null 2>&1; then
+            echo "::notice::no published release yet; skipping mixed-version compat (no vN-1 to test)"
+            echo "have_prev=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Both the server tarball (ironcache-<ver>-linux-amd64-musl.tar.gz) and the console tarball
+          # (ironcache-console-<ver>-...) match the glob, so extract the one carrying the `ironcache`
+          # server binary specifically (its archive lists a member named exactly `ironcache`).
+          gh release download --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'ironcache-*-linux-amd64-musl.tar.gz' --dir old
+          found=""
+          for f in old/*.tar.gz; do
+            if tar -tzf "$f" | grep -qx ironcache; then
+              tar -xzf "$f" -C old ironcache
+              found="$f"
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "::warning::a release exists but no linux-amd64-musl ironcache server asset was found; skipping"
+            echo "have_prev=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          chmod +x old/ironcache
+          echo "OLD_IRONCACHE_BIN=${GITHUB_WORKSPACE}/old/ironcache" >> "$GITHUB_ENV"
+          echo "have_prev=true" >> "$GITHUB_OUTPUT"
+          ./old/ironcache --version || true
+      - name: Build the HEAD binary (vN)
+        if: steps.prev.outputs.have_prev == 'true'
+        run: |
+          set -euo pipefail
+          cargo build --locked -p ironcache --bin ironcache
+          echo "NEW_IRONCACHE_BIN=${GITHUB_WORKSPACE}/target/debug/ironcache" >> "$GITHUB_ENV"
+      - name: Run the mixed-version compatibility smoke
+        if: steps.prev.outputs.have_prev == 'true'
+        run: |
+          set -euo pipefail
+          bash scripts/ci/mixed-version-compat.sh
