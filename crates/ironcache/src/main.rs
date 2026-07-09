@@ -224,6 +224,15 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
 }
 
 fn cmd_server(cli: &Cli) -> anyhow::Result<()> {
+    // SOCKET ACTIVATION (#389): capture the systemd `LISTEN_*` environment ONCE, then UNSET it (the
+    // `sd_listen_fds` convention). This is the FIRST action of the server boot, before any config
+    // load or thread spawn, so the unset is sound (no other thread reads the environment yet) and the
+    // captured snapshot feeds every later consumer -- the loud adopt-vs-fallback log below and the
+    // RESP listener adoption in `run_shards`. Clearing the vars stops a later-exec'd child from
+    // re-adopting fds meant for THIS pid. A no-op when not socket-activated (env absent). Boot/OS
+    // seam, outside the ADR-0003 determinism boundary.
+    ironcache_runtime::listen_fds::prime_from_env_and_unset();
+
     let mut cfg = load_config(cli)?;
     // FD BUDGET (#532, Redis `adjustOpenFilesLimit` parity): before wiring any shard,
     // raise the `RLIMIT_NOFILE` soft limit toward the hard limit where the kernel

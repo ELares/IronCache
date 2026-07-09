@@ -24,6 +24,7 @@
 //! listener to the replication socket all live entirely in this string->typed-result logic.
 
 use std::os::fd::RawFd;
+use std::sync::OnceLock;
 
 /// The first inherited file descriptor systemd uses (`SD_LISTEN_FDS_START`). Inherited fds are
 /// numbered consecutively upward from here (stdin/stdout/stderr are 0/1/2).
@@ -276,15 +277,28 @@ pub fn select_named<'a>(fds: &'a [InheritedFd], name: &str) -> Option<&'a Inheri
     fds.iter().find(|f| f.name.as_deref() == Some(name))
 }
 
-/// Read the socket-activation environment from THIS process and parse it. A thin wrapper over
-/// [`parse_listen_fds`] that supplies the real `LISTEN_*` env vars + this process's pid; all of the
-/// parsing logic (and its tests) live in the pure function. Returns `Ok(empty)` when not
-/// socket-activated (so a normal, non-systemd launch takes the self-bind path).
-///
-/// # Errors
-///
-/// Propagates [`parse_listen_fds`]'s errors.
-pub fn from_env() -> Result<Vec<InheritedFd>, ListenFdsError> {
+/// The inherited fd to adopt as the RESP CLIENT listener (#389): the fd NAMED `resp` (from a unit's
+/// `FileDescriptorName=resp`) when `LISTEN_FDNAMES` disambiguates a MULTI-socket activation, else the
+/// FIRST inherited fd (`SD_LISTEN_FDS_START` = 3, the single-socket default). Returns `None` only for
+/// an empty list (not socket-activated). Using the NAME rather than blindly taking fd 3 is what keeps
+/// a future multi-socket unit from binding the RESP listener to the wrong socket (the replication /
+/// cluster-bus fd): that second socket would be a distinct fd named e.g. `repl`, and ADOPTING it is a
+/// deliberate follow-up -- this PR scopes socket activation to the CLIENT listener.
+#[must_use]
+pub fn resp_listener_fd(fds: &[InheritedFd]) -> Option<&InheritedFd> {
+    select_named(fds, "resp").or_else(|| fds.first())
+}
+
+/// The socket-activation environment captured ONCE by [`prime_from_env_and_unset`] at boot, BEFORE
+/// the `LISTEN_*` vars were removed. When set, [`from_env`] returns THIS snapshot instead of
+/// re-reading the (now-cleared) environment, so every boot consumer -- the loud adopt-vs-fallback log
+/// (#562), the RESP listener adoption ([`crate::tokio_rt::listener_for`]), and the shard-owner guard
+/// -- sees the SAME activation decision even though the env was cleared after the first read.
+static PRIMED: OnceLock<Result<Vec<InheritedFd>, ListenFdsError>> = OnceLock::new();
+
+/// Parse THIS process's live `LISTEN_*` environment. The raw read behind both [`from_env`] (its
+/// not-yet-primed path) and [`prime_from_env_and_unset`] (the one-shot capture).
+fn read_env() -> Result<Vec<InheritedFd>, ListenFdsError> {
     let self_pid = std::process::id();
     let listen_pid = std::env::var("LISTEN_PID").ok();
     let listen_fds = std::env::var("LISTEN_FDS").ok();
@@ -297,11 +311,57 @@ pub fn from_env() -> Result<Vec<InheritedFd>, ListenFdsError> {
     )
 }
 
+/// The socket-activation environment for THIS process, parsed. Returns the [`prime_from_env_and_unset`]
+/// snapshot once the binary has primed it (the boot path, so every consumer agrees AND a later read
+/// survives the env being unset); otherwise reads the live `LISTEN_*` vars directly (the un-primed
+/// path -- unit/integration tests, which set the env themselves and never prime). Returns `Ok(empty)`
+/// when not socket-activated (so a normal, non-systemd launch takes the self-bind path).
+///
+/// # Errors
+///
+/// Propagates [`parse_listen_fds`]'s errors.
+pub fn from_env() -> Result<Vec<InheritedFd>, ListenFdsError> {
+    if let Some(primed) = PRIMED.get() {
+        return primed.clone();
+    }
+    read_env()
+}
+
+/// Capture the socket-activation environment ONCE, then UNSET `LISTEN_PID` / `LISTEN_FDS` /
+/// `LISTEN_FDNAMES` -- the `sd_listen_fds(3)` `unset_environment` convention (#389). Clearing the vars
+/// after the single authoritative read means a later `exec`'d child or a subprocess does NOT inherit
+/// this process's activation state and try to RE-ADOPT fds meant for THIS pid. (The `LISTEN_PID` check
+/// in [`parse_listen_fds`] already fail-closes a foreign pid, so this is belt-and-suspenders; it also
+/// keeps a leaked `LISTEN_FDS` from confusing a child that happens to share our pid namespace.) The
+/// snapshot is stored FIRST, so every later [`from_env`] caller still sees the activation decision.
+///
+/// CALL EXACTLY ONCE at the very top of the server boot, before any listener binds. Idempotent: a
+/// second call is a no-op (the snapshot is already set).
+///
+/// # Safety / threading
+///
+/// This mutates the process environment, which is only sound with no concurrent environ access. The
+/// binary calls this as the FIRST action of `cmd_server`, before ANY IronCache thread (the acceptor,
+/// the shards, the metrics server) is spawned; the sole other live thread is jemalloc's background
+/// purge thread, which never reads or writes the process environment. So there is no reader to race
+/// this unset.
+pub fn prime_from_env_and_unset() {
+    let _ = PRIMED.set(read_env());
+    // SAFETY: see the "Safety / threading" note above -- called once at the top of `cmd_server`
+    // before any IronCache thread exists, and jemalloc's purge thread does not touch the environment,
+    // so no other thread reads or writes `environ` concurrently with this removal.
+    unsafe {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+        std::env::remove_var("LISTEN_FDNAMES");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Activation, InheritedFd, ListenFdsError, SD_LISTEN_FDS_START, SelfBindReason, classify,
-        parse_listen_fds, select_named,
+        parse_listen_fds, resp_listener_fd, select_named,
     };
 
     const PID: u32 = 4242;
@@ -441,6 +501,31 @@ mod tests {
             got.iter().map(|f| f.name.as_deref()).collect::<Vec<_>>(),
             vec![Some("resp"), Some(""), Some("metrics")]
         );
+    }
+
+    #[test]
+    fn resp_listener_fd_prefers_the_named_resp_fd_else_the_first() {
+        // Unnamed single-socket activation (the packaged default, no LISTEN_FDNAMES): the FIRST fd
+        // (fd 3, SD_LISTEN_FDS_START) is the RESP client listener -- byte-identical to blindly taking
+        // fds[0].
+        assert_eq!(
+            resp_listener_fd(&ok("4242", "1", None)).map(|f| f.fd),
+            Some(3)
+        );
+        // Named MULTI-socket: pick the fd NAMED `resp` even when it is NOT first. This is the mis-map
+        // guard -- without it, a `repl:resp` unit would bind the RESP listener to fd 3 (the repl
+        // socket) instead of fd 4.
+        assert_eq!(
+            resp_listener_fd(&ok("4242", "2", Some("repl:resp"))).map(|f| f.fd),
+            Some(4)
+        );
+        // Names present but none is `resp`: fall back to the first fd.
+        assert_eq!(
+            resp_listener_fd(&ok("4242", "2", Some("a:b"))).map(|f| f.fd),
+            Some(3)
+        );
+        // Not socket-activated: nothing to adopt.
+        assert_eq!(resp_listener_fd(&[]), None);
     }
 
     #[test]

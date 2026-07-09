@@ -147,6 +147,53 @@ docker run -d --name ironcache \
   server --bind 0.0.0.0 --metrics-addr 0.0.0.0:9121
 ```
 
+### systemd socket activation (restart without a connection-refused window)
+
+For a bare-metal / VM single node managed by systemd, run IronCache under socket
+activation so an `ironcache upgrade` (or any `systemctl restart`) does NOT drop a
+connection. The packaging ships both units:
+
+- `packaging/ironcache.socket` opens the RESP listening socket and holds the listen
+  queue.
+- `packaging/ironcache.service` (`Wants=`/`After=ironcache.socket`) receives that
+  socket's fd via the `sd_listen_fds` protocol (`LISTEN_FDS` / `LISTEN_PID`) and
+  ADOPTS it instead of binding its own.
+
+Install and enable both:
+
+```sh
+install -m0644 packaging/ironcache.socket   /etc/systemd/system/ironcache.socket
+install -m0644 packaging/ironcache.service  /etc/systemd/system/ironcache.service
+systemctl daemon-reload
+systemctl enable --now ironcache.socket   # opens the listen socket
+systemctl enable ironcache.service        # started on the first connection / boot
+```
+
+Why this removes the refused window: because SYSTEMD owns the listening socket, it
+stays open ACROSS the service restart. While the old process exits and the new one
+starts, incoming clients QUEUE in the kernel backlog (a brief added latency) instead
+of getting `ECONNREFUSED`. Perceived downtime collapses to the new process's startup
+time. This is stronger than `SO_REUSEPORT` for the restart case: a closed
+`SO_REUSEPORT` socket loses its queued connections, whereas this single listen queue
+is never closed.
+
+Notes:
+
+- The listen ADDRESS is authoritative from the `.socket` unit's `ListenStream=`, NOT
+  from `--bind` / `IRONCACHE_BIND`, when socket-activated. The packaged default is
+  `ListenStream=127.0.0.1:6379` (loopback, matching IronCache's safe bind default);
+  to expose beyond loopback edit that line (e.g. `ListenStream=6379`), not `--bind`.
+- Deepen the backlog that absorbs the restart with `Backlog=` in the socket unit;
+  systemd caps it at `net.core.somaxconn`, so raise that sysctl to match.
+- Not enabling `ironcache.socket` is fully supported: the service then self-binds
+  exactly as before (byte-unchanged), so socket activation is strictly opt-in.
+- The boot logs state which path was taken: `socket-activation: ADOPTED ...` when it
+  adopted the passed fd, or `... FELL BACK to self-binding ...` (with the reason)
+  otherwise, so a mis-set unit is diagnosable from `journalctl -u ironcache`.
+- Scope: activation covers the RESP CLIENT listener. The Raft cluster-bus and
+  replication listeners still self-bind (a follow-up), so this is aimed at the
+  single-node upgrade path.
+
 ---
 
 ## 4. docker-compose 3-node Raft cluster
