@@ -4601,14 +4601,23 @@ async fn handle_persist_command(
             encode_into(out, &Value::Integer(secs), conn.proto);
         }
         b"SAVE" => {
-            if request.args.len() != 1 {
-                encode_into(
-                    out,
-                    &Value::error(ironcache_protocol::ErrorReply::wrong_arity("save")),
-                    conn.proto,
-                );
-                return;
-            }
+            // `SAVE` -> the normal DURABLE data_dir save (Redis parity). `SAVE HANDOFF` -> the #390
+            // upgrade-handoff save, staged on tmpfs when the RAM-headroom guard admits it (else the
+            // durable data_dir); it is issued by `ironcache upgrade` to shrink the reload window and
+            // is client-reachable only over the auth-gated loopback the upgrade CLI uses. Any other
+            // argument shape is a syntax error.
+            let handoff = match request.args.len() {
+                1 => false,
+                2 if request.args[1].eq_ignore_ascii_case(b"HANDOFF") => true,
+                _ => {
+                    encode_into(
+                        out,
+                        &Value::error(ironcache_protocol::ErrorReply::wrong_arity("save")),
+                        conn.proto,
+                    );
+                    return;
+                }
+            };
             // The save timestamp from the home shard's Env clock (ADR-0003), in unix seconds.
             let now_secs = shard_env().borrow().now_unix_millis() / 1_000;
             // Serialize against a concurrent save. If one is already running, wait for the latch by
@@ -4620,8 +4629,12 @@ async fn handle_persist_command(
                 encode_into(out, &Value::ok(), conn.proto);
                 return;
             };
-            let result =
-                crate::persist::do_save_all(persist, inbox, ctx, home, conn.db, now_secs).await;
+            let result = if handoff {
+                crate::persist::do_handoff_save_all(persist, inbox, ctx, home, conn.db, now_secs)
+                    .await
+            } else {
+                crate::persist::do_save_all(persist, inbox, ctx, home, conn.db, now_secs).await
+            };
             match result {
                 Ok(()) => encode_into(out, &Value::ok(), conn.proto),
                 Err(msg) => encode_into(
@@ -8611,7 +8624,11 @@ mod tests {
         std::fs::write(&blocker, b"x").expect("write the blocking file");
         let broken_dir = blocker.join("nested");
         let persist = Arc::new(crate::persist::PersistState {
-            dir: broken_dir,
+            dir: broken_dir.clone(),
+            handoff_base: None,
+            boot_load_dir: broken_dir,
+            handoff_cleanup_dir: None,
+            shards_pending_load: std::sync::atomic::AtomicUsize::new(1),
             stats: Arc::new(ironcache_observe::PersistRuntime::new()),
             save_id: AtomicU64::new(0),
             saving: AtomicBool::new(false),

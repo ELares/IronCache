@@ -241,6 +241,12 @@ pub async fn run_drain_loop(
         if shard_index == 0 {
             spawn_periodic_save(ctx.clone(), inbox.clone(), Arc::clone(persist));
         }
+        // TMPFS HANDOFF CLEANUP (#390): mark this shard's load-on-boot done. The shard that drives
+        // the node-wide countdown to zero removes the ephemeral tmpfs handoff staging dir (a no-op
+        // unless THIS boot loaded from tmpfs). Placed AFTER the shard-0 seed above, so the durable
+        // LASTSAVE seed reads the staging manifest BEFORE cleanup can remove it (shard 0's decrement
+        // is required for the count to reach zero, so the seed always precedes any cleanup).
+        persist.note_shard_loaded();
     }
     // READINESS SIGNAL (OBSERVABILITY.md, #152): this shard has now finished its load-on-boot --
     // either `load_shard_on_boot` restored its snapshot above (persistence on), or there was nothing
@@ -1353,11 +1359,15 @@ fn load_shard_on_boot(
     // The CURRENT shard count: the router computes owner_shard(key, shard_count), so re-shard with
     // the SAME count + hash the live serve loop routes with.
     let shard_count = ctx.shards.max(1);
+    // Load from the dir THIS boot resolved (#390): the tmpfs upgrade-handoff staging dir when a
+    // valid, fresher-or-equal handoff is present, else the durable `data_dir`. Resolved ONCE at
+    // `PersistState::from_config`, so every shard loads from the SAME source (no mid-boot flap).
+    let load_dir = &persist.boot_load_dir;
     let (loaded, evicted, over_budget) = {
         let mut store = store_rc.borrow_mut();
         let loaded = ironcache_persist::load_shard_resharded(
             &mut store,
-            &persist.dir,
+            load_dir,
             shard_index,
             shard_count,
             now,
@@ -1387,7 +1397,7 @@ fn load_shard_on_boot(
             shard = shard_index,
             loaded,
             evicted,
-            dir = %persist.dir.display(),
+            dir = %load_dir.display(),
             "ironcache: shard loaded keys from snapshot"
         );
     }

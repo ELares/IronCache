@@ -534,6 +534,20 @@ pub struct Config {
     /// byte-unchanged. (It is read by the PERSISTENCE path regardless of cluster mode; the Raft
     /// log use of it is the separate raft-governance concern above.)
     pub data_dir: Option<PathBuf>,
+    /// The tmpfs BASE directory the `ironcache upgrade` HANDOFF snapshot is staged under (#390,
+    /// Phase 2b). During an upgrade the reload window is dominated by the snapshot save+load
+    /// against the durable [`Self::data_dir`] (EBS on prod); staging the EPHEMERAL handoff snapshot
+    /// on a RAM-backed tmpfs mount removes the disk I/O legs. The staging dir is
+    /// `<upgrade_handoff_dir>/ironcache-handoff`; the durable periodic snapshot in `data_dir` is
+    /// UNCHANGED and remains the crash-recovery source.
+    ///
+    /// `None` (the default) resolves to the built-in `/dev/shm` on Linux (a tmpfs on essentially
+    /// every distro); an explicit path overrides the base. Staging is used ONLY when a RAM-headroom
+    /// guard confirms the snapshot fits in available RAM (tmpfs pages ARE RAM), the base is a real
+    /// tmpfs mount, and the OS is Linux -- otherwise the handoff CLEANLY falls back to `data_dir`
+    /// (a warning, not a failure). TOML (`upgrade_handoff_dir = "/dev/shm"`) + the
+    /// `IRONCACHE_UPGRADE_HANDOFF_DIR` env var. Inert with no `data_dir` (persistence off).
+    pub upgrade_handoff_dir: Option<PathBuf>,
     /// The ACL FILE path (#106, Redis `aclfile`). When set, the server LOADS the `user <name>
     /// <rules>...` lines from it at boot (so ACL users survive a restart) and `ACL SAVE`
     /// writes the live registry back to it. `None` (the default) means NO aclfile: the ACL
@@ -762,6 +776,10 @@ impl Default for Config {
             // (byte-unchanged pre-existing behavior). Setting it makes the log durable
             // across a reboot that clears /tmp. Meaningful only in raft-governance mode.
             data_dir: None,
+            // No explicit upgrade-handoff dir by default (#390): the resolver picks the built-in
+            // `/dev/shm` on Linux (guarded), else falls back to data_dir. A byte-unchanged default
+            // (the handoff staging only ever runs during an `ironcache upgrade`).
+            upgrade_handoff_dir: None,
             // No aclfile by default (#106): the ACL registry is the single all-permissive
             // `default` user (plus any requirepass), so the default deployment is byte-identical.
             // Setting it loads users at boot and makes ACL SAVE persistent.
@@ -1586,6 +1604,10 @@ pub struct ConfigOverlay {
     /// (`data_dir = "/var/lib/ironcache"`, a string path) + the `IRONCACHE_DATA_DIR` env var.
     /// `None` leaves the lower layer (default `None` = the OS temp dir, byte-unchanged).
     pub data_dir: Option<PathBuf>,
+    /// The tmpfs base dir the upgrade HANDOFF snapshot is staged under (#390). TOML
+    /// (`upgrade_handoff_dir = "/dev/shm"`, a string path) + the `IRONCACHE_UPGRADE_HANDOFF_DIR`
+    /// env var. `None` leaves the lower layer (default `None` = the built-in `/dev/shm`, guarded).
+    pub upgrade_handoff_dir: Option<PathBuf>,
     /// The ACL file path (#106). TOML (`aclfile = "..."`, a string path) + the
     /// `IRONCACHE_ACLFILE` env var. `None` leaves the lower layer (default `None` = no aclfile).
     pub aclfile: Option<PathBuf>,
@@ -1888,6 +1910,12 @@ impl ConfigOverlay {
         if let Ok(v) = env_var("IRONCACHE_DATA_DIR") {
             o.data_dir = Some(PathBuf::from(v));
         }
+        // The upgrade-handoff tmpfs base (#390) is a single scalar path, env-encodable for per-pod
+        // injection. Taken verbatim (no parse can fail); an absent/non-tmpfs dir falls back to
+        // data_dir at handoff time, so a bad value degrades cleanly rather than failing boot.
+        if let Ok(v) = env_var("IRONCACHE_UPGRADE_HANDOFF_DIR") {
+            o.upgrade_handoff_dir = Some(PathBuf::from(v));
+        }
         // The ACL file path (#106) is a single scalar path, env-encodable for per-pod injection.
         // Taken verbatim (no parse can fail); a missing/unreadable file hard-fails at boot LOAD.
         if let Ok(v) = env_var("IRONCACHE_ACLFILE") {
@@ -2121,6 +2149,9 @@ impl ConfigOverlay {
         }
         if let Some(ref v) = self.data_dir {
             cfg.data_dir = Some(v.clone());
+        }
+        if let Some(ref v) = self.upgrade_handoff_dir {
+            cfg.upgrade_handoff_dir = Some(v.clone());
         }
         if let Some(ref v) = self.aclfile {
             cfg.aclfile = Some(v.clone());

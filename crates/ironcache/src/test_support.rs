@@ -266,6 +266,37 @@ pub fn run_persist_server_for_test(
     run_server(&config).expect("test persist server failed to bind")
 }
 
+/// Boot a real persistence-enabled server (#58) with an explicit upgrade-handoff tmpfs base (#390),
+/// so a test can drive `SAVE HANDOFF` and assert the handoff is staged on tmpfs (or falls back to
+/// `data_dir`) and reloaded on the next boot. `upgrade_handoff_dir` is the base staged under
+/// (`<base>/ironcache-handoff`); `None` uses the built-in `/dev/shm` default. The periodic save
+/// policy is OFF (only explicit SAVE / SAVE HANDOFF persist).
+///
+/// # Panics
+///
+/// Panics if the config fails to validate or the server fails to bind.
+#[must_use]
+pub fn run_persist_server_with_handoff_for_test(
+    port: u16,
+    shards: usize,
+    data_dir: PathBuf,
+    upgrade_handoff_dir: Option<PathBuf>,
+) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        data_dir: Some(data_dir),
+        upgrade_handoff_dir,
+        ..Config::default()
+    };
+    config
+        .validate()
+        .expect("test persist+handoff config must validate");
+    run_server(&config).expect("test persist+handoff server failed to bind")
+}
+
 /// Boot a real server with PERSISTENCE ENABLED and a `requirepass` (#58 + #65), so a test can prove
 /// the persistence command interception is AUTH-GATED (H2): an UNAUTHENTICATED client must get
 /// `-NOAUTH` for SAVE / BGSAVE / LASTSAVE and write no snapshot. `password` is the PLAINTEXT a client
