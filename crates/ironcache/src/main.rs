@@ -209,6 +209,9 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
         port: cli.port,
         shards: cli.shards,
         runtime: cli_runtime,
+        // The dedicated persist core (#589): the raw string folds through; it is parsed + validated
+        // on the resolved value in `Config::validate`, so a bad `--persist-cpu` fails boot here.
+        persist_cpu: cli.persist_cpu.clone(),
         ..Default::default()
     };
 
@@ -422,6 +425,15 @@ fn cmd_check(cli: &Cli) -> anyhow::Result<()> {
         }
     );
     println!("  databases   = {}", cfg.databases);
+    // The dedicated persist core (#589): report the effective knob (empty = off / no pin).
+    println!(
+        "  persist-cpu = {}",
+        if cfg.persist_cpu.is_empty() {
+            "off (no pin)"
+        } else {
+            cfg.persist_cpu.as_str()
+        }
+    );
     println!(
         "  maxmemory   = {} bytes{}",
         cfg.maxmemory,

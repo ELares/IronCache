@@ -87,6 +87,58 @@ unset the log lives under the OS temp directory, which is writable and ephemeral
 is NOT durable across a reboot that clears the temp dir, so a production raft node
 should set it. An empty `data_dir` is rejected at boot (a likely operator mistake).
 
+### Dedicated persist core
+
+Issue: #589. Related: #588 (per-slot Arc-COW snapshot), ADR-0002 (thread-per-core), ADR-0003 (determinism), the tunability tenet.
+
+`persist_cpu` (TOML key `persist_cpu`, env `IRONCACHE_PERSIST_CPU`, CLI `--persist-cpu`,
+defaulting to unset) selects which CPU core(s) the off-datapath `ic-persist-<shard>`
+thread pins to during a save. The per-slot Arc-COW snapshot (#588) moved a save's O(N)
+encode+fsync off the serving core onto that dedicated thread, but the thread still runs
+somewhere: under the thread-per-core model (ADR-0002) the datapath threads are confined
+to a pinned cpuset, and at 16 shards on 8 pinned cores the persist thread is a 17th
+runnable thread the scheduler places on one of those same serving cores, where its encode
+steals serving time and stretches the during-save tail. Pinning it to a reserved core off
+the datapath set removes that steal.
+
+Accepted values:
+
+- `off` (or an empty value / `none` / `disabled`): the DEFAULT. No pin; the persist
+  thread floats exactly as it does today (byte-unchanged behavior).
+- `auto`: reserve the HIGHEST core of the process's current affinity mask for
+  persistence. Most useful when the datapath is confined (via `taskset`/cpuset) to the
+  lower cores so the top core is genuinely free; otherwise it still parks the persist
+  thread on one deterministic core instead of letting it float across every serving core.
+- an explicit cpu list: a single id (`8`), a range (`6-7`), or a mix (`6-7,10`). The
+  recommended deployment reserves a core OUTSIDE the datapath's `taskset` mask (see
+  DEPLOY.md): pinning to that reserved id makes the persist thread escape onto it, which
+  the kernel allows because `sched_setaffinity` is bounded by the process cpuset, not by
+  the inherited `taskset` mask.
+
+An explicit list is used as given (it is deliberately allowed to name a core outside the
+current mask); a core the kernel ultimately rejects is logged once and the thread runs
+unpinned rather than failing the save. A malformed value (a non-numeric id, an inverted
+range) is rejected at boot.
+
+Affinity is a SCHEDULING concern off the engine decision path: it changes only which core
+a thread runs on, never a stored value, an ordering, or any output, so it stays clear of
+the ADR-0003 determinism boundary (no clock or entropy is added). It is Linux-only
+(`sched_setaffinity` is a Linux primitive); on macOS or any other target the knob is a
+graceful no-op (a set value logs one warning and the thread runs unpinned). Per the
+tunability tenet it is a knob with a SAFE default (the current float behavior), not a
+baked-in choice, because dedicating a core trades a serving core (or spare core) for
+persistence, which only pays off on hosts with a core to spare.
+
+It is restart-required: the persist thread's affinity is set as the thread spawns from the
+boot value, so `CONFIG GET persist-cpu` reports the effective value but `CONFIG SET
+persist-cpu` returns restart-required (like `bind`/`port`/`shards`).
+
+Honest residual: pinning removes the persist thread's CPU steal, but the thread still
+READS the frozen keyspace to encode it, so it still shares MEMORY BANDWIDTH with the
+(memory-bound) datapath during a save. Pinning is expected to close part, not all, of the
+remaining gap to millisecond-class snapshot tails; bounding the reader's bandwidth share
+is a separate follow-up lever tracked in #589.
+
 ### Transparent huge pages
 
 Issue: #512. Related: ADR-0006 (allocator); the tunability tenet (env-dependent tradeoffs are config knobs with a safe default).

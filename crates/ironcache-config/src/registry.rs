@@ -280,6 +280,13 @@ pub fn param_specs() -> &'static [ParamSpec] {
             name: "shards",
             kind: SetKind::RestartRequired,
         },
+        // The dedicated persist core (#589): a deployment/scheduling knob resolved at boot (the
+        // persist thread's affinity is set as it spawns), so it is restart-required like the topology
+        // knobs above. CONFIG GET reports the effective boot value; CONFIG SET says restart-required.
+        ParamSpec {
+            name: "persist-cpu",
+            kind: SetKind::RestartRequired,
+        },
     ]
 }
 
@@ -394,6 +401,8 @@ pub fn effective_value(name: &str, runtime: &RuntimeConfig, boot: &Config) -> Op
         "port" => boot.port.to_string(),
         "databases" => boot.databases.to_string(),
         "io-threads" | "shards" => boot.shards.to_string(),
+        // The dedicated persist core (#589): report the effective boot value (`""` when unset).
+        "persist-cpu" => boot.persist_cpu.clone(),
         _ => return None,
     };
     Some(value)

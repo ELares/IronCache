@@ -11,6 +11,12 @@
 
 #![forbid(unsafe_code)]
 
+/// Persist-thread CPU pinning glue (#589): apply the `persist-cpu` knob to the current thread so a
+/// save's off-core encode runs on a DEDICATED persist core instead of stealing a pinned datapath
+/// serving core. The safe orchestration only (parse the knob + select cpus + call the runtime pin);
+/// the `sched_setaffinity` `unsafe` lives in the `ironcache-runtime` seam, keeping this binary
+/// `#![forbid(unsafe_code)]`. A graceful no-op when unset (default), on non-Linux, or on a bad core.
+pub mod affinity;
 /// BLOCKING-command parking (PROD-9): the per-shard FIFO WAITER REGISTRY a connection parks on
 /// when a blocking list/zset pop (BLPOP/BRPOP/BLMOVE/BLMPOP/BZPOPMIN/BZPOPMAX/BZMPOP) finds every
 /// key empty. A push to a waited key WAKES the longest-waiting waiter (Redis fairness); the woken
