@@ -548,6 +548,15 @@ pub struct Config {
     /// (a warning, not a failure). TOML (`upgrade_handoff_dir = "/dev/shm"`) + the
     /// `IRONCACHE_UPGRADE_HANDOFF_DIR` env var. Inert with no `data_dir` (persistence off).
     pub upgrade_handoff_dir: Option<PathBuf>,
+    /// The unix-socket path the STREAMED upgrade handoff (#391 Phase 2c) rendezvouses on: the old
+    /// process (sender) and the new sibling (receiver) meet here to stream the live keyspace
+    /// old->new with no disk round-trip, so the sibling serves before the old drains. `None` (the
+    /// default) disables the streamed path -- an `ironcache upgrade` uses the SAVE-first / tmpfs
+    /// (#390) reload instead, and the streamed core never runs. TOML
+    /// (`handoff_socket = "/run/ironcache/handoff.sock"`) + the `IRONCACHE_HANDOFF_SOCKET` env var.
+    /// The durable `data_dir` snapshot always remains a valid fallback, so a bad/absent socket
+    /// degrades cleanly to the durable path (never data loss).
+    pub handoff_socket: Option<PathBuf>,
     /// The ACL FILE path (#106, Redis `aclfile`). When set, the server LOADS the `user <name>
     /// <rules>...` lines from it at boot (so ACL users survive a restart) and `ACL SAVE`
     /// writes the live registry back to it. `None` (the default) means NO aclfile: the ACL
@@ -780,6 +789,9 @@ impl Default for Config {
             // `/dev/shm` on Linux (guarded), else falls back to data_dir. A byte-unchanged default
             // (the handoff staging only ever runs during an `ironcache upgrade`).
             upgrade_handoff_dir: None,
+            // No streamed-handoff socket by default (#391): the streamed old->new transfer is opt-in;
+            // with it unset an upgrade uses the SAVE-first / tmpfs reload path, byte-unchanged.
+            handoff_socket: None,
             // No aclfile by default (#106): the ACL registry is the single all-permissive
             // `default` user (plus any requirepass), so the default deployment is byte-identical.
             // Setting it loads users at boot and makes ACL SAVE persistent.
@@ -1608,6 +1620,11 @@ pub struct ConfigOverlay {
     /// (`upgrade_handoff_dir = "/dev/shm"`, a string path) + the `IRONCACHE_UPGRADE_HANDOFF_DIR`
     /// env var. `None` leaves the lower layer (default `None` = the built-in `/dev/shm`, guarded).
     pub upgrade_handoff_dir: Option<PathBuf>,
+    /// The streamed-handoff rendezvous socket path (#391). TOML
+    /// (`handoff_socket = "/run/ironcache/handoff.sock"`, a string path) + the
+    /// `IRONCACHE_HANDOFF_SOCKET` env var. `None` leaves the lower layer (default `None` = the
+    /// streamed path disabled).
+    pub handoff_socket: Option<PathBuf>,
     /// The ACL file path (#106). TOML (`aclfile = "..."`, a string path) + the
     /// `IRONCACHE_ACLFILE` env var. `None` leaves the lower layer (default `None` = no aclfile).
     pub aclfile: Option<PathBuf>,
@@ -1916,6 +1933,12 @@ impl ConfigOverlay {
         if let Ok(v) = env_var("IRONCACHE_UPGRADE_HANDOFF_DIR") {
             o.upgrade_handoff_dir = Some(PathBuf::from(v));
         }
+        // The streamed-handoff rendezvous socket (#391) is a single scalar path, env-encodable for
+        // per-pod injection. Taken verbatim (no parse can fail); an absent/unbindable socket falls
+        // back to the durable path at upgrade time, so a bad value degrades cleanly, never data loss.
+        if let Ok(v) = env_var("IRONCACHE_HANDOFF_SOCKET") {
+            o.handoff_socket = Some(PathBuf::from(v));
+        }
         // The ACL file path (#106) is a single scalar path, env-encodable for per-pod injection.
         // Taken verbatim (no parse can fail); a missing/unreadable file hard-fails at boot LOAD.
         if let Ok(v) = env_var("IRONCACHE_ACLFILE") {
@@ -2152,6 +2175,9 @@ impl ConfigOverlay {
         }
         if let Some(ref v) = self.upgrade_handoff_dir {
             cfg.upgrade_handoff_dir = Some(v.clone());
+        }
+        if let Some(ref v) = self.handoff_socket {
+            cfg.handoff_socket = Some(v.clone());
         }
         if let Some(ref v) = self.aclfile {
             cfg.aclfile = Some(v.clone());

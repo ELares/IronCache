@@ -40,6 +40,7 @@ pub mod proc;
 pub mod save;
 pub mod service;
 pub mod source;
+pub mod stream;
 pub mod swap;
 pub mod verify;
 
