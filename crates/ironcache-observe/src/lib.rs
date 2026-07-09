@@ -1348,10 +1348,19 @@ pub struct ServerInfo {
     /// Redis assigns a 40-hex node id whether or not cluster mode is on, and so does
     /// IronCache.
     pub cluster_node_id: &'static str,
+    /// The 40-lowercase-hex process RUN ID (INFO `run_id`), generated ONCE at boot through the
+    /// determinism seam (ADR-0003: drawn from the binary's `SystemEnv` RNG in `serve::run_server`,
+    /// then leaked to `'static`), identical across shards. UNLIKE `cluster_node_id` (a stable
+    /// identity that in cluster mode is the configured announce id), the run id is ALWAYS a fresh
+    /// per-boot random value: it identifies THIS process incarnation, so it changes on every restart
+    /// (Redis parity -- clients + `redis_exporter` read `run_id` to detect a restart / distinguish
+    /// incarnations). It is NOT the placeholder zero string it used to be.
+    pub run_id: &'static str,
     /// Whether the server booted in cluster mode (Redis `cluster-enabled`,
     /// CLUSTER_CONTRACT.md #70). Reported by the INFO `# Cluster` section
     /// (`cluster_enabled:0/1`) and `CLUSTER INFO`. Slice 1 is cluster-disabled, so this is
-    /// `false` in practice; the field is sourced from config so a later slice can flip it.
+    /// `false` in practice; the field is sourced from config so a later slice can flip it. It ALSO
+    /// drives the INFO `# Server` `redis_mode` field (`cluster` when set, else `standalone`).
     pub cluster_enabled: bool,
 }
 
@@ -1825,11 +1834,25 @@ pub fn build_info<C: Clock>(
         out.push_str("# Server\r\n");
         out.push_str("redis_version:7.4.0\r\n"); // compatibility version tag for clients/exporters
         let _ = write!(out, "ironcache_version:{SERVER_VERSION}\r\n");
-        out.push_str("redis_mode:standalone\r\n");
+        // `redis_mode` honesty (#527): report `cluster` when this node booted in a clustered mode
+        // (raft governance / a static shard-owner topology -- both set `cluster_enabled`), else
+        // `standalone`. Matches Redis's field semantics (a node started with `cluster-enabled yes`
+        // reports `redis_mode:cluster`), which `redis_exporter` reads to label the instance.
+        let _ = write!(
+            out,
+            "redis_mode:{}\r\n",
+            if server.cluster_enabled {
+                "cluster"
+            } else {
+                "standalone"
+            }
+        );
         let _ = write!(out, "os:{}\r\n", std::env::consts::OS);
         let _ = write!(out, "arch_bits:{}\r\n", usize::BITS);
         let _ = write!(out, "process_id:{}\r\n", server.pid);
-        let _ = write!(out, "run_id:{}\r\n", run_id_placeholder());
+        // `run_id` (#527): the REAL 40-hex per-boot run id generated at boot through the determinism
+        // seam (ADR-0003), carried in `ServerInfo`. No longer the 40-zero placeholder.
+        let _ = write!(out, "run_id:{}\r\n", server.run_id);
         let _ = write!(out, "tcp_port:{}\r\n", server.tcp_port);
         let _ = write!(out, "uptime_in_seconds:{uptime_secs}\r\n");
         let _ = write!(out, "uptime_in_days:{}\r\n", uptime_secs / 86_400);
@@ -2065,13 +2088,6 @@ fn push_replication_section(out: &mut String, replication: &ReplicationInfo) {
         replication.master_repl_offset
     );
     out.push_str("\r\n");
-}
-
-/// A stable-per-process placeholder run id. The real 40-hex run id ships with the
-/// observability registry (#152); a fixed placeholder is fine for PR-1 and keeps
-/// the seam off the Env (no rand here).
-fn run_id_placeholder() -> &'static str {
-    "0000000000000000000000000000000000000000"
 }
 
 /// Render a byte count the way Redis's `bytesToHuman` does for `used_memory_human`:
@@ -2325,6 +2341,9 @@ mod tests {
             maxmemory_policy: "allkeys-lru",
             mem_allocator: "jemalloc",
             cluster_node_id: "0000000000000000000000000000000000000000",
+            // A fixed, non-zero 40-hex run id for the render tests (the real one is drawn at boot
+            // from the env seam; here we only assert the field renders through).
+            run_id: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
             cluster_enabled: false,
         }
     }
@@ -2386,6 +2405,69 @@ mod tests {
         assert!(body.contains("connected_clients:0\r\n"));
         assert!(body.contains("mem_allocator:jemalloc\r\n"));
         assert!(body.contains(&format!("ironcache_version:{SERVER_VERSION}\r\n")));
+        // #527: a non-cluster node reports `redis_mode:standalone`.
+        assert!(body.contains("redis_mode:standalone\r\n"), "{body}");
+        // #527: the `run_id` renders the real per-boot id from `ServerInfo`, NOT the old 40-zero
+        // placeholder. It is a 40-char lowercase-hex string.
+        let run_id = body
+            .lines()
+            .find_map(|l| l.strip_prefix("run_id:"))
+            .expect("INFO must carry a run_id line");
+        assert_eq!(run_id.len(), 40, "run_id must be 40 hex chars: {run_id:?}");
+        assert!(
+            run_id.bytes().all(|c| c.is_ascii_hexdigit()),
+            "run_id must be hex: {run_id:?}"
+        );
+        assert_ne!(
+            run_id, "0000000000000000000000000000000000000000",
+            "run_id must not be the old zero placeholder"
+        );
+    }
+
+    /// #527: `redis_mode` is HONEST -- a node booted in a clustered mode reports `cluster`, a
+    /// standalone node reports `standalone`. Matches Redis's field semantics (`redis_exporter`
+    /// reads it to label the instance).
+    #[test]
+    fn info_redis_mode_reflects_cluster_enabled() {
+        let env = TestEnv::new(1);
+        let mut clustered = server();
+        clustered.cluster_enabled = true;
+        let body = build_info(
+            &env,
+            &clustered,
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl(),
+            &PersistenceInfo::default(),
+            &[],
+            RuntimeStats::default(),
+            Some("server"),
+        );
+        assert!(body.contains("redis_mode:cluster\r\n"), "{body}");
+        assert!(!body.contains("redis_mode:standalone\r\n"), "{body}");
+
+        // The standalone default reports `standalone` (and never `cluster`).
+        let standalone = build_info(
+            &env,
+            &server(),
+            CounterSnapshot::default(),
+            MemoryInfo::default(),
+            eff(),
+            &repl(),
+            &PersistenceInfo::default(),
+            &[],
+            RuntimeStats::default(),
+            Some("server"),
+        );
+        assert!(
+            standalone.contains("redis_mode:standalone\r\n"),
+            "{standalone}"
+        );
+        assert!(
+            !standalone.contains("redis_mode:cluster\r\n"),
+            "{standalone}"
+        );
     }
 
     /// Durability footgun fix #5: INFO renders a `# Persistence` section with the Redis `rdb_*`

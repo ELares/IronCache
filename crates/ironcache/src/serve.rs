@@ -300,6 +300,17 @@ pub fn run_server_observed(
             _ => Box::leak(node_id_hex(boot_env.rng()).into_boxed_str()),
         };
 
+    // The process RUN ID (INFO `run_id`, #527): a fresh 40-lowercase-hex value drawn ONCE here from
+    // the SAME boot RNG seam as `cluster_node_id` (ADR-0003: the only entropy is the binary's
+    // `SystemEnv`, no `rand` outside ironcache-env), then leaked to `'static` and shared by value
+    // into every shard's context -- so it is IDENTICAL across shards for one process. It reuses
+    // `node_id_hex` because the SHAPE is the same (40 hex from 3 seam draws, Redis `getRandomHexChars`
+    // parity), but it is a DISTINCT draw from `cluster_node_id`: unlike the node id (a stable identity,
+    // in cluster mode the configured announce id), the run id is ALWAYS random-per-boot and identifies
+    // THIS incarnation, so it CHANGES on every restart (clients + `redis_exporter` read it to detect a
+    // restart). One small leak at boot, like the node id / policy name.
+    let run_id: &'static str = Box::leak(node_id_hex(boot_env.rng()).into_boxed_str());
+
     // The process-wide runtime-config overlay (PR-4b, the highest-precedence layer):
     // ONE Arc shared (cloned) into every shard's context, exactly like the shutdown
     // AtomicBool precedent. A `CONFIG SET` mutates it; the per-command reads are cheap
@@ -583,6 +594,9 @@ pub fn run_server_observed(
             // cluster-mode flag (CLUSTER_CONTRACT.md #70). Slice 1 is cluster-disabled, so
             // `cluster_enabled` is `false` in practice, but it is sourced from config.
             cluster_node_id,
+            // The boot-generated per-boot 40-hex run id (#527), identical across shards, NEW every
+            // process boot (drawn above from the same env seam as `cluster_node_id`).
+            run_id,
             cluster_enabled: config.cluster_enabled,
         },
         // The boot-resolved static slot map (None unless cluster mode + a topology). Shared
@@ -3692,6 +3706,29 @@ async fn route_and_dispatch(
         if conn.in_multi {
             conn.dirty_exec = true;
         }
+        return false;
+    }
+
+    // -- MONITOR HONESTY INTERCEPTION (#527). MONITOR (stream every executed command to the
+    // subscribed client) is NOT implemented: a correct implementation needs a fan-out from the
+    // command choke point to a set of monitor connections, which this build does not have. Rather
+    // than let it fall through to the generic `unknown command` reply (which would suggest it is
+    // merely unrecognized) OR silently mis-behave, reply a CLEAR, honest `-ERR MONITOR is not
+    // supported`. It is intentionally NOT registered in the command spec, so `COMMAND` does not
+    // advertise it (we do not claim a capability we lack -- the same honesty that removed the
+    // MONITOR mention from the README secret-hygiene note). Gated `!conn.in_multi` like the other
+    // serve-layer rejects: inside a MULTI it is an unregistered token, so the queue gate rejects it
+    // with the standard unknown-command error and dirties the transaction. A non-MONITOR command
+    // never enters this block (one byte-compare), so the hot path is byte-unchanged.
+    if !conn.in_multi && cmd_upper == b"MONITOR" {
+        state_rc.borrow_mut().counters.on_command();
+        encode_into(
+            out,
+            &ironcache_server::Value::error(ironcache_protocol::ErrorReply::err(
+                "MONITOR is not supported",
+            )),
+            conn.proto,
+        );
         return false;
     }
 
@@ -8323,6 +8360,39 @@ mod tests {
         );
     }
 
+    /// #527: the process RUN ID (INFO `run_id`) is a DISTINCT per-boot draw from the SAME env seam
+    /// as `cluster_node_id` (ADR-0003), mirroring how the real boot draws it (a second `node_id_hex`
+    /// off `boot_env` right after the node id). Two properties matter: within ONE boot the run id
+    /// differs from the node id (an independent draw off the stream, not the same value), and a
+    /// DIFFERENT boot seed yields a DIFFERENT run id -- the mechanism that makes `run_id` change on
+    /// every restart while staying entirely on the sanctioned seam (no raw entropy). The 40-hex
+    /// shape + non-zero-ness are covered by `node_id_hex_is_deterministic_for_a_seed` (same helper).
+    #[test]
+    fn run_id_is_a_distinct_per_boot_draw_from_the_same_seam() {
+        // One boot: node id is the first draw, run id the second -> they differ.
+        let mut boot = ironcache_env::TestEnv::new(0x5EED_1234_5678_9ABC);
+        let node_id = node_id_hex(boot.rng());
+        let run_id = node_id_hex(boot.rng());
+        assert_eq!(run_id.len(), 40, "run id must be 40 hex chars: {run_id:?}");
+        assert_ne!(
+            node_id, run_id,
+            "the run id must be a distinct draw from the node id, not a copy"
+        );
+        assert_ne!(
+            run_id, "0000000000000000000000000000000000000000",
+            "the run id must not be the old zero placeholder"
+        );
+        // A DIFFERENT boot (a different seed, as SystemEnv is wall-clock-seeded per boot) yields a
+        // DIFFERENT run id -> the run id changes on restart.
+        let mut other = ironcache_env::TestEnv::new(0x5EED_1234_5678_9ABD);
+        let _ = node_id_hex(other.rng()); // consume the node-id draw so we compare the RUN-id draw
+        let run_id_other = node_id_hex(other.rng());
+        assert_ne!(
+            run_id, run_id_other,
+            "a different boot must yield a different run id"
+        );
+    }
+
     // ----- cluster_redirect / moved_if_unowned (CLUSTER_CONTRACT.md #70, slice 2) -----
     //
     // `cluster_redirect` is PURE over (map, route, cmd, request), so it is tested directly
@@ -8589,6 +8659,7 @@ mod tests {
                 maxmemory_policy: "allkeys-lru",
                 mem_allocator: "test",
                 cluster_node_id: RID_A,
+                run_id: RID_A,
                 cluster_enabled: true,
             },
             cluster: Some(std::sync::Arc::new(redirect_map())),

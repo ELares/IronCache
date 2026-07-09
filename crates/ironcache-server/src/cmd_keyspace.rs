@@ -630,6 +630,7 @@ mod tests {
                 maxmemory_policy: "allkeys-lru",
                 mem_allocator: "system",
                 cluster_node_id: "0000000000000000000000000000000000000000",
+                run_id: "0000000000000000000000000000000000000000",
                 cluster_enabled: false,
             },
             cluster: None,
