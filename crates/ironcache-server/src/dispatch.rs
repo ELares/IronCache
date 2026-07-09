@@ -395,12 +395,17 @@ pub type RollupFn<'a> = &'a dyn Fn() -> CounterSnapshot;
 pub type KeyspaceFn<'a> = &'a dyn Fn() -> Option<Vec<KeyspaceDbLine>>;
 
 /// Yields the INFO `COMMANDSTATS` + `ERRORSTATS` section BODIES (#413) as
-/// `(commandstats_body, errorstats_body)`, rendered by the serve layer from the SERVING shard's
-/// `CommandStats` table (home-shard-local; unlike the node-wide [`RollupFn`] counters, the
-/// per-command table is NOT yet cross-shard-aggregated -- a documented follow-up, out of #531's
-/// `# Stats`/`# Keyspace` scope). `INFO` invokes it ONLY for the `commandstats` / `errorstats` /
-/// `everything` sections, so it costs nothing on the common INFO path; a caller that does not track
-/// per-command stats (tests) passes a closure yielding two empty strings.
+/// `(commandstats_body, errorstats_body)`, rendered by the serve layer. The `COMMANDSTATS` body is
+/// now NODE-WIDE (#527): the serve loop records each command's calls/usec/failed into its shard's
+/// per-command atomic slot in the metrics registry, and this closure sums EVERY shard's table via
+/// [`ironcache_observe::MetricsRegistry::aggregate_command_stats`] -- the per-command analog of the
+/// node-wide `# Stats` rollup ([`RollupFn`], #545), invariant to which shard homed the connection.
+/// The `ERRORSTATS` body remains the SERVING shard's local `errorstat_*` table (home-shard-local,
+/// the same scope the pre-#527 per-command table used); cross-shard error aggregation is the
+/// remaining smaller follow-up (the acceptance surface is per-command `calls`, not error codes).
+/// `INFO` invokes it ONLY for the `commandstats` / `errorstats` / `everything` sections, so it costs
+/// nothing on the common INFO path; a caller with no metrics registry + no per-shard error table
+/// (bare unit-test contexts) passes a closure yielding two empty strings.
 pub type CmdStatsFn<'a> = &'a dyn Fn() -> (String, String);
 
 /// Dispatch one request to its handler, returning the reply [`Value`].

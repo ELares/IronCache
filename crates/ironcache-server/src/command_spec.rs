@@ -3191,6 +3191,67 @@ pub const CLIENT_COMMAND_NAMES: &[&[u8]] = &[
     b"OBJECT",
 ];
 
+/// The STABLE ordinal of a client command in [`CLIENT_COMMAND_NAMES`] (#527), for indexing a shard's
+/// per-command COMMANDSTATS atomic slot ([`ironcache_observe::ShardCounters::on_command_stat`]) so
+/// the node-wide INFO COMMANDSTATS rollup sums each command across shards -- the per-command analog
+/// of what #545 did for the top-level `# Stats`.
+///
+/// Backed by a once-built name->ordinal map so the serve loop's per-command lookup is ONE hash (the
+/// SAME cost the prior per-shard `CommandStats` HashMap tally paid), with no allocation. `None` for a
+/// token not in the client table -- the internal `__IC*` verbs, which `spec_of` rejects and the serve
+/// loop never records. The ordinals are dense over `[0, CLIENT_COMMAND_NAMES.len())`, which
+/// `command_stat_slots_fit_the_registry` asserts fits [`ironcache_observe::COMMAND_STAT_SLOTS`].
+#[must_use]
+pub fn command_stat_index(name: &[u8]) -> Option<usize> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static INDEX: OnceLock<HashMap<&'static [u8], usize>> = OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            CLIENT_COMMAND_NAMES
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, i))
+                .collect()
+        })
+        .get(name)
+        .copied()
+}
+
+/// Render the node-wide INFO `# Commandstats` BODY (no header) from the cross-shard per-command
+/// rollup (#527: [`ironcache_observe::MetricsRegistry::aggregate_command_stats`]). One
+/// `cmdstat_<lowercased name>:calls=..,usec=..,usec_per_call=..,rejected_calls=..,failed_calls=..`
+/// line per command with a non-zero call count, mapping each [`CLIENT_COMMAND_NAMES`] ordinal back to
+/// its name (`agg[ordinal]`). SORTED by name so the body is deterministic (ADR-0003), and carrying
+/// the exact Redis field shape go-redis / redis-py parse -- the SAME shape the prior serving-shard
+/// `CommandStats::render_commandstats` produced, now node-wide.
+pub fn render_commandstats_agg(out: &mut String, agg: &[ironcache_observe::CmdStat]) {
+    use core::fmt::Write;
+    let mut rows: Vec<(&'static [u8], ironcache_observe::CmdStat)> = CLIENT_COMMAND_NAMES
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &name)| {
+            let s = *agg.get(i)?;
+            (s.calls > 0).then_some((name, s))
+        })
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (name, s) in rows {
+        let lname = String::from_utf8_lossy(name).to_ascii_lowercase();
+        #[allow(clippy::cast_precision_loss)]
+        let per_call = if s.calls == 0 {
+            0.0
+        } else {
+            s.usec as f64 / s.calls as f64
+        };
+        let _ = write!(
+            out,
+            "cmdstat_{lname}:calls={},usec={},usec_per_call={per_call:.2},rejected_calls={},failed_calls={}\r\n",
+            s.calls, s.usec, s.rejected_calls, s.failed_calls
+        );
+    }
+}
+
 /// The Redis `COMMAND` key-position triple `(first_key, last_key, step)` plus a `movable` flag for
 /// a command's [`KeySpecKind`] (#158). These are the positions a cluster client reads to find a
 /// command's keys WITHOUT a server round-trip (the `begin_search index` / `find_keys range` spec).
@@ -3315,6 +3376,70 @@ pub(crate) mod tests {
             "command table looks truncated: {} entries",
             CLIENT_COMMAND_NAMES.len()
         );
+    }
+
+    /// COMMANDSTATS ordinal coherence (#527): every client command has a DENSE ordinal that fits the
+    /// per-shard atomic COMMANDSTATS table capacity ([`ironcache_observe::COMMAND_STAT_SLOTS`]), the
+    /// ordinal round-trips (name -> index -> name), and an internal verb has none. If the command
+    /// surface ever outgrows the slot cap, this fails so the cap is bumped (never a silently-dropped
+    /// command in INFO COMMANDSTATS).
+    #[test]
+    fn command_stat_slots_fit_the_registry() {
+        assert!(
+            CLIENT_COMMAND_NAMES.len() <= ironcache_observe::COMMAND_STAT_SLOTS,
+            "COMMAND_STAT_SLOTS ({}) must cover every client command ({})",
+            ironcache_observe::COMMAND_STAT_SLOTS,
+            CLIENT_COMMAND_NAMES.len()
+        );
+        for (i, &name) in CLIENT_COMMAND_NAMES.iter().enumerate() {
+            assert_eq!(
+                command_stat_index(name),
+                Some(i),
+                "ordinal must round-trip for {:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        // An internal cross-shard verb is never a client command, so it has no stat ordinal.
+        assert_eq!(command_stat_index(ICINFOKEYSPACE), None);
+    }
+
+    /// COMMANDSTATS render (#527): the node-wide aggregate renders one `cmdstat_<name>` line per
+    /// command with a non-zero call count, in the Redis field shape, sorted for determinism, and
+    /// OMITS zero-call commands.
+    #[test]
+    fn render_commandstats_agg_shapes_and_skips_zero() {
+        let mut agg =
+            vec![ironcache_observe::CmdStat::default(); ironcache_observe::COMMAND_STAT_SLOTS];
+        let get = command_stat_index(b"GET").unwrap();
+        let set = command_stat_index(b"SET").unwrap();
+        agg[get] = ironcache_observe::CmdStat {
+            calls: 3,
+            usec: 30,
+            rejected_calls: 0,
+            failed_calls: 1,
+        };
+        agg[set] = ironcache_observe::CmdStat {
+            calls: 2,
+            usec: 10,
+            rejected_calls: 0,
+            failed_calls: 0,
+        };
+        let mut out = String::new();
+        render_commandstats_agg(&mut out, &agg);
+        assert!(
+            out.contains("cmdstat_get:calls=3,usec=30,usec_per_call=10.00,rejected_calls=0,failed_calls=1\r\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "cmdstat_set:calls=2,usec=10,usec_per_call=5.00,rejected_calls=0,failed_calls=0\r\n"
+            ),
+            "{out}"
+        );
+        // A command with no calls must not appear.
+        assert!(!out.contains("cmdstat_ping"), "{out}");
+        // Deterministic order: GET sorts before SET.
+        assert!(out.find("cmdstat_get").unwrap() < out.find("cmdstat_set").unwrap());
     }
 
     /// COMMAND key-position projection (#158): the `(first, last, step, movable)` a cluster client
