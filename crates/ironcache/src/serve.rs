@@ -1904,8 +1904,13 @@ async fn serve_connection(
                         // blocked client still receives the earlier commands' replies before it
                         // parks (FIFO, never a blocking command holding up prior replies).
                         if !out.is_empty() {
+                            let sent = out.len();
                             match stream.send(std::mem::take(&mut out)).await {
-                                Ok(returned) => out = returned,
+                                Ok(returned) => {
+                                    out = returned;
+                                    // #527: net output for the pre-park pipelined flush.
+                                    state_rc.borrow().counters.on_net_output(sent as u64);
+                                }
                                 Err(_) => break 'conn,
                             }
                         }
@@ -1938,7 +1943,11 @@ async fn serve_connection(
                         // returned buffer is dropped rather than reclaimed. Sent over the
                         // CLIENT stream (plain or TLS); the plain arm is byte-identical to the
                         // prior `rt.send` (it calls the same TcpStream write_all), #105.
-                        let _ = stream.send(std::mem::take(&mut out)).await;
+                        let sent = out.len();
+                        if stream.send(std::mem::take(&mut out)).await.is_ok() {
+                            // #527: net output for the QUIT reply.
+                            state_rc.borrow().counters.on_net_output(sent as u64);
+                        }
                         break 'conn;
                     }
                     // OUTPUT-BUFFER intra-batch cap (#529): this command's reply is now appended to
@@ -1973,7 +1982,11 @@ async fn serve_connection(
                         .await;
                     }
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
-                    let _ = stream.send(std::mem::take(&mut out)).await;
+                    let sent = out.len();
+                    if stream.send(std::mem::take(&mut out)).await.is_ok() {
+                        // #527: net output for the protocol-error reply before close.
+                        state_rc.borrow().counters.on_net_output(sent as u64);
+                    }
                     break 'conn;
                 }
             }
@@ -2018,8 +2031,14 @@ async fn serve_connection(
             // Owned-buffer send: hand `out` over and take the returned buffer back. Over the
             // client stream (plain or TLS); the plain arm is the same TcpStream write the prior
             // `rt.send` did (#105).
+            let sent = out.len();
             match stream.send(std::mem::take(&mut out)).await {
-                Ok(returned) => out = returned,
+                Ok(returned) => {
+                    out = returned;
+                    // #527: count the reply bytes written to the client socket (net output). ONE
+                    // relaxed atomic add through this shard's counters, summed node-wide for INFO.
+                    state_rc.borrow().counters.on_net_output(sent as u64);
+                }
                 Err(_) => break,
             }
         }
@@ -2095,6 +2114,8 @@ async fn serve_connection(
                         break; // peer closed
                     }
                     read_buf.extend_from_slice(&res.buf[..res.n]);
+                    // #527: count the command bytes read off the client socket (net input).
+                    state_rc.borrow().counters.on_net_input(res.n as u64);
                 }
                 () = timer_rt.timer(timeout) => {
                     // Idle past the timeout with no new command bytes: close the connection
@@ -2114,6 +2135,8 @@ async fn serve_connection(
             if res.n == 0 {
                 break; // peer closed
             }
+            // #527: count the command bytes read off the client socket (net input).
+            state_rc.borrow().counters.on_net_input(res.n as u64);
         }
 
         // QUERY-BUFFER hard cap (#528): every idle-wait arm above (subscriber drain / idle-timeout
@@ -2440,7 +2463,11 @@ async fn serve_connection_uring(
                         encode_into(&mut out, &reply, conn.proto);
                     }
                     if close {
-                        let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
+                        let sent = out.len();
+                        if rt.send(&mut stream, std::mem::take(&mut out)).await.is_ok() {
+                            // #527: net output for the io_uring QUIT reply.
+                            state_rc.borrow().counters.on_net_output(sent as u64);
+                        }
                         break 'conn;
                     }
                     // OUTPUT-BUFFER intra-batch cap (#529), identical to the tokio path: this
@@ -2456,7 +2483,11 @@ async fn serve_connection_uring(
                 DecodeOutcome::Incomplete => break,
                 DecodeOutcome::Error(e) => {
                     encode_into(&mut out, &ironcache_server::Value::Error(e), conn.proto);
-                    let _ = rt.send(&mut stream, std::mem::take(&mut out)).await;
+                    let sent = out.len();
+                    if rt.send(&mut stream, std::mem::take(&mut out)).await.is_ok() {
+                        // #527: net output for the io_uring protocol-error reply before close.
+                        state_rc.borrow().counters.on_net_output(sent as u64);
+                    }
                     break 'conn;
                 }
             }
@@ -2476,8 +2507,13 @@ async fn serve_connection_uring(
         }
 
         if !out.is_empty() {
+            let sent = out.len();
             match rt.send(&mut stream, std::mem::take(&mut out)).await {
-                Ok(returned) => out = returned,
+                Ok(returned) => {
+                    out = returned;
+                    // #527: net output for the io_uring batch flush (one relaxed atomic add).
+                    state_rc.borrow().counters.on_net_output(sent as u64);
+                }
                 Err(_) => break,
             }
         }
@@ -2536,6 +2572,8 @@ async fn serve_connection_uring(
             if n == 0 {
                 break; // peer closed
             }
+            // #527: count the command bytes read off the client socket (net input), io_uring path.
+            state_rc.borrow().counters.on_net_input(n as u64);
         }
 
         // QUERY-BUFFER hard cap (#528), identical to the tokio path: every idle-wait arm above (the
@@ -2640,8 +2678,12 @@ async fn subscriber_idle_wait(
             while let Ok(next) = push_rx.try_recv() {
                 encode_into(out, &next.render(proto), proto);
             }
+            let sent = out.len();
             stream.send(std::mem::take(out)).await.map_or(true, |returned| {
                 *out = returned;
+                // #527: net output for a coalesced pub/sub push write (cold path -- reach the
+                // serving shard's counters through the thread-local, no `state_rc` in scope here).
+                shard_state().borrow().counters.on_net_output(sent as u64);
                 false
             })
         }
@@ -2662,6 +2704,8 @@ async fn subscriber_idle_wait(
                 return true; // peer closed
             }
             read_buf.extend_from_slice(&res.buf);
+            // #527: net input for a command read while in the subscriber idle wait.
+            shard_state().borrow().counters.on_net_input(res.n as u64);
             false
         }
     }
@@ -2739,8 +2783,11 @@ async fn subscriber_idle_wait_uring(
             while let Ok(next) = push_rx.try_recv() {
                 encode_into(out, &next.render(proto), proto);
             }
+            let sent = out.len();
             rt.send(stream, std::mem::take(out)).await.map_or(true, |returned| {
                 *out = returned;
+                // #527: net output for a coalesced pub/sub push write (io_uring cold path).
+                shard_state().borrow().counters.on_net_output(sent as u64);
                 false
             })
         }
@@ -2761,6 +2808,8 @@ async fn subscriber_idle_wait_uring(
                 return true; // peer closed
             }
             read_buf.extend_from_slice(&res.buf[..res.n]);
+            // #527: net input for a command read while in the io_uring subscriber idle wait.
+            shard_state().borrow().counters.on_net_input(res.n as u64);
             false
         }
     }
@@ -6300,7 +6349,12 @@ async fn run_block_park(
             () = timer_rt.timer(timer_dur) => WakeOutcome::Timer,
             res = stream.recv(Vec::new()) => match res {
                 Ok(r) if r.n == 0 => return true, // peer closed while parked
-                Ok(r) => { read_buf.extend_from_slice(&r.buf[..r.n]); WakeOutcome::Bytes }
+                Ok(r) => {
+                    read_buf.extend_from_slice(&r.buf[..r.n]);
+                    // #527: net input for pipelined bytes read while parked on a blocking command.
+                    shard_state().borrow().counters.on_net_input(r.n as u64);
+                    WakeOutcome::Bytes
+                }
                 Err(_) => return true,
             },
         };
@@ -6385,8 +6439,9 @@ async fn wait_park(
                     Ok(r) if r.n == 0 => return true, // peer closed
                     // Bytes while parked in WAIT: Redis would not process a new command until WAIT
                     // returns; we drop them (a rare edge -- a client pipelining behind WAIT). The
-                    // poll loop continues. (Buffering them safely is a documented follow-up.)
-                    Ok(_) => {}
+                    // poll loop continues. (Buffering them safely is a documented follow-up.) They
+                    // WERE read off the socket, so #527 still counts them as net input.
+                    Ok(r) => shard_state().borrow().counters.on_net_input(r.n as u64),
                     Err(_) => return true,
                 }
             }
@@ -6405,9 +6460,12 @@ async fn flush_block_reply(
 ) -> bool {
     out.clear();
     encode_into(out, &reply, proto);
+    let sent = out.len();
     match stream.send(std::mem::take(out)).await {
         Ok(returned) => {
             *out = returned;
+            // #527: net output for a blocking command's reply (BLPOP/WAIT/... timeout or result).
+            shard_state().borrow().counters.on_net_output(sent as u64);
             false
         }
         Err(_) => true,
@@ -6505,10 +6563,19 @@ fn handle_request(
     // closure is not called otherwise), and it borrows `state_rc` immutably like `rollup` does
     // (sequentially, never aliasing dispatch's later mutable borrow).
     let cmdstats_fn = || {
-        let st = state_rc.borrow();
         let (mut cs, mut es) = (String::new(), String::new());
-        st.command_stats.render_commandstats(&mut cs);
-        st.command_stats.render_errorstats(&mut es);
+        // COMMANDSTATS node-wide (#527): sum EVERY shard's per-command atomic table via the registry
+        // (the SAME cross-shard rollup #545 uses for `# Stats`) and render node-wide `cmdstat_<cmd>`
+        // lines -- invariant to which shard homed this connection. The registry is always present in
+        // the binary; a bare unit-test context without one renders an empty body (it records no
+        // per-command stats either), byte-identical to the pre-#527 empty-closure fallback.
+        if let Some(reg) = ctx.metrics_registry.as_ref() {
+            ironcache_server::render_commandstats_agg(&mut cs, &reg.aggregate_command_stats());
+        }
+        // ERRORSTATS stays serving-shard-scoped (#527 follow-up): render THIS shard's local error
+        // table (single-shard nodes see the whole node; multi-shard error aggregation is the
+        // remaining smaller follow-up).
+        state_rc.borrow().command_stats.render_errorstats(&mut es);
         (cs, es)
     };
     let cmdstats: ironcache_server::CmdStatsFn<'_> = &cmdstats_fn;
@@ -6740,17 +6807,32 @@ fn record_command_stats(
     // The reply for THIS command begins at `out_before`; a leading `-` is an error reply (the
     // command ran but failed). A push/array/status/integer/bulk lead byte is a success.
     let failed = out.get(out_before) == Some(&b'-');
-    let mut st = state_rc.borrow_mut();
-    st.command_stats.record(spec.name, elapsed_us, failed);
+    // COMMANDSTATS node-wide (#527): record this command's calls/usec/failed into THIS shard's
+    // per-command atomic slot in the metrics registry (indexed by the command's STABLE ordinal), so
+    // INFO COMMANDSTATS sums it across shards via `aggregate_command_stats` -- the per-command analog
+    // of the #545 `# Stats` rollup. ONE relaxed atomic add, no lock, no allocation (the slot is
+    // pre-allocated). Only registry commands reach here (the `spec_of` gate above), so the ordinal is
+    // always present; a defensive miss is a no-op.
+    if let Some(index) = ironcache_server::command_stat_index(spec.name) {
+        state_rc
+            .borrow()
+            .counters
+            .on_command_stat(index, elapsed_us, failed);
+    }
     if failed {
-        // The error CODE: the first whitespace/CR-delimited token after the `-`.
+        // The error CODE: the first whitespace/CR-delimited token after the `-`. ERRORSTATS stays
+        // serving-shard-scoped (#527 follow-up): record it into THIS shard's local error table for
+        // the `errorstat_*` section (cross-shard error aggregation is the remaining smaller follow-up).
         let code_start = out_before + 1;
         let rest = &out[code_start..];
         let code_len = rest
             .iter()
             .position(|&b| b == b' ' || b == b'\r')
             .unwrap_or(rest.len());
-        st.command_stats.record_error(&rest[..code_len]);
+        state_rc
+            .borrow_mut()
+            .command_stats
+            .record_error(&rest[..code_len]);
     }
 }
 

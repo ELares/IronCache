@@ -96,7 +96,8 @@ pub use cmd_hll::{
 // `route` (its legacy path) below; `Arity` is re-exported via `cmd_txn` (its legacy path).
 pub use command_spec::{
     Arity, CommandSpec, ICCOUNTKEYSINSLOT, ICEXISTS, ICGETKEYSINSLOT, ICINFOKEYSPACE, ICPUBLISH,
-    ICPUBSUB, ICSPUBLISH, KeySpecKind, is_write, request_is_write_for_pause, spec_of,
+    ICPUBSUB, ICSPUBLISH, KeySpecKind, command_stat_index, is_write, render_commandstats_agg,
+    request_is_write_for_pause, spec_of,
 };
 pub use conn::ConnState;
 pub use dispatch::{

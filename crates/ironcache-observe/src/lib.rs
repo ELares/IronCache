@@ -290,6 +290,59 @@ impl LatencyHistogram {
     }
 }
 
+/// The capacity of a shard's per-command COMMANDSTATS table (#527): one atomic [`CmdStatCell`]
+/// SLOT per client command, indexed by the server's STABLE command ordinal (its position in the
+/// server's client-command list). Sized with headroom over the ~200 client commands; the server
+/// asserts its command count fits (`command_stat_slots_fit_the_registry`). Slots the server never
+/// indexes stay zero, so the node-wide rollup + render simply skip them. This crate does not know
+/// the command NAMES (it is below the server in the dep graph), only the opaque ordinal.
+pub const COMMAND_STAT_SLOTS: usize = 256;
+
+/// One command's cross-shard-readable execution tally (#527): the atomic backing of a [`CmdStat`],
+/// one per command SLOT in a [`ShardCountersCell`]. Written ONLY by the owning shard's serve loop
+/// (uncontended `Relaxed` adds -- the SAME single-increment the counters use, no lock and no
+/// allocation) and READ across threads by the node-wide INFO COMMANDSTATS rollup
+/// ([`MetricsRegistry::aggregate_command_stats`]). `rejected_calls` is not yet split out at this
+/// layer (a documented approximation, matching [`CmdStat`]), so only `calls`/`usec`/`failed_calls`
+/// are ever bumped; the reset zeroes all four.
+#[derive(Debug, Default)]
+struct CmdStatCell {
+    calls: AtomicU64,
+    usec: AtomicU64,
+    rejected_calls: AtomicU64,
+    failed_calls: AtomicU64,
+}
+
+impl CmdStatCell {
+    /// Record one executed command into this slot: one `Relaxed` calls-increment + a usec add, plus
+    /// a failed-increment when the reply was an error. No lock, no allocation (the slot exists).
+    fn record(&self, usec: u64, failed: bool) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.usec.fetch_add(usec, Ordering::Relaxed);
+        if failed {
+            self.failed_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Read this slot into an immutable, summable [`CmdStat`] (each load `Relaxed`).
+    fn snapshot(&self) -> CmdStat {
+        CmdStat {
+            calls: self.calls.load(Ordering::Relaxed),
+            usec: self.usec.load(Ordering::Relaxed),
+            rejected_calls: self.rejected_calls.load(Ordering::Relaxed),
+            failed_calls: self.failed_calls.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zero this slot (`CONFIG RESETSTAT`), each store `Relaxed`.
+    fn reset(&self) {
+        self.calls.store(0, Ordering::Relaxed);
+        self.usec.store(0, Ordering::Relaxed);
+        self.rejected_calls.store(0, Ordering::Relaxed);
+        self.failed_calls.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The per-shard counter STORAGE: a flat bag of `AtomicU64`s, one cell per counter, owned
 /// by ONE shard and shared (by `Arc`) into the process-wide [`MetricsRegistry`] so the
 /// out-of-band metrics HTTP task can READ the live values from another thread WITHOUT a lock
@@ -307,11 +360,20 @@ impl LatencyHistogram {
 /// different instants (a metrics scrape is inherently a fuzzy snapshot). `connected_clients`
 /// is a GAUGE (a `fetch_sub` on close), so it uses `saturating`-style guards via a CAS-free
 /// `fetch_sub` that never underflows in practice (open precedes close on the same shard).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ShardCountersCell {
     connections_received: AtomicU64,
     commands_processed: AtomicU64,
     connected_clients: AtomicU64,
+    /// Cumulative bytes READ off this shard's client sockets (INFO `total_net_input_bytes`, #527):
+    /// bumped once per serve RECV on both datapaths (tokio + io_uring). `redis_exporter` reads
+    /// `redis_net_input_bytes_total` from this INFO field. A since-start stat (`CONFIG RESETSTAT`
+    /// clears it, matching Redis's `resetServerStats`).
+    total_net_input_bytes: AtomicU64,
+    /// Cumulative bytes WRITTEN to this shard's client sockets (INFO `total_net_output_bytes`,
+    /// #527): bumped once per serve SEND on both datapaths. `redis_exporter` reads
+    /// `redis_net_output_bytes_total` from this INFO field. Resettable like the input total.
+    total_net_output_bytes: AtomicU64,
     evicted_keys: AtomicU64,
     expired_keys: AtomicU64,
     keyspace_hits: AtomicU64,
@@ -346,6 +408,41 @@ pub struct ShardCountersCell {
     /// cumulative, counter-typed family expected to run for the process lifetime (rate/quantile math
     /// assumes it only resets on restart), so `CONFIG RESETSTAT` leaves it intact.
     latency: LatencyHistogramCell,
+    /// This shard's per-command COMMANDSTATS table (#527): [`COMMAND_STAT_SLOTS`] atomic
+    /// [`CmdStatCell`]s indexed by the server's stable command ordinal, so the node-wide INFO
+    /// COMMANDSTATS rollup ([`MetricsRegistry::aggregate_command_stats`]) sums each command's
+    /// calls/usec/failed across shards -- the per-command analog of the top-level `# Stats` rollup
+    /// (#545). Written on the command hot path by the SERVING shard through `Relaxed` adds (no lock,
+    /// no allocation -- the slot is pre-allocated), read cross-thread by the rollup. `CONFIG
+    /// RESETSTAT` clears it (a since-start stat, like the counters).
+    cmd_stats: Box<[CmdStatCell]>,
+}
+
+impl Default for ShardCountersCell {
+    fn default() -> Self {
+        // Manual (not derived): the `cmd_stats` slice must be SIZED to [`COMMAND_STAT_SLOTS`] (a
+        // derived `Box<[_]>::default()` is empty), and `AtomicU64`/`CmdStatCell` are not `Copy` so
+        // the slots are built explicitly. A one-time boot cost per shard, never per command.
+        ShardCountersCell {
+            connections_received: AtomicU64::new(0),
+            commands_processed: AtomicU64::new(0),
+            connected_clients: AtomicU64::new(0),
+            total_net_input_bytes: AtomicU64::new(0),
+            total_net_output_bytes: AtomicU64::new(0),
+            evicted_keys: AtomicU64::new(0),
+            expired_keys: AtomicU64::new(0),
+            keyspace_hits: AtomicU64::new(0),
+            keyspace_misses: AtomicU64::new(0),
+            keyspace_keys: AtomicU64::new(0),
+            hops_sent: AtomicU64::new(0),
+            hops_served: AtomicU64::new(0),
+            local_served: AtomicU64::new(0),
+            latency: LatencyHistogramCell::default(),
+            cmd_stats: (0..COMMAND_STAT_SLOTS)
+                .map(|_| CmdStatCell::default())
+                .collect(),
+        }
+    }
 }
 
 impl ShardCountersCell {
@@ -359,6 +456,8 @@ impl ShardCountersCell {
             connections_received: self.connections_received.load(Ordering::Relaxed),
             commands_processed: self.commands_processed.load(Ordering::Relaxed),
             connected_clients: self.connected_clients.load(Ordering::Relaxed),
+            total_net_input_bytes: self.total_net_input_bytes.load(Ordering::Relaxed),
+            total_net_output_bytes: self.total_net_output_bytes.load(Ordering::Relaxed),
             evicted_keys: self.evicted_keys.load(Ordering::Relaxed),
             expired_keys: self.expired_keys.load(Ordering::Relaxed),
             keyspace_hits: self.keyspace_hits.load(Ordering::Relaxed),
@@ -385,6 +484,14 @@ impl ShardCountersCell {
         self.latency.snapshot()
     }
 
+    /// Read this shard's per-command COMMANDSTATS table into a summable per-slot vector (#527), the
+    /// cross-thread read the node-wide rollup folds. `out[ordinal]` is this shard's tally for the
+    /// command at that ordinal; each load is `Relaxed` (see the type docs).
+    #[must_use]
+    pub fn command_stats_snapshot(&self) -> Vec<CmdStat> {
+        self.cmd_stats.iter().map(CmdStatCell::snapshot).collect()
+    }
+
     /// Publish this shard's live key count (a GAUGE store, `Relaxed`). Called off the command
     /// hot path (the periodic expiry tick + connection close), so it adds no per-command cost.
     pub fn set_keyspace_keys(&self, keys: u64) {
@@ -406,6 +513,17 @@ impl ShardCountersCell {
         self.keyspace_misses.store(0, Ordering::Relaxed);
         self.commands_processed.store(0, Ordering::Relaxed);
         self.connections_received.store(0, Ordering::Relaxed);
+        // The net-io byte totals (#527) are since-start `total_*` stats like `commands_processed`,
+        // so RESETSTAT clears them too (Redis `resetServerStats` zeroes `stat_net_input_bytes` /
+        // `stat_net_output_bytes`).
+        self.total_net_input_bytes.store(0, Ordering::Relaxed);
+        self.total_net_output_bytes.store(0, Ordering::Relaxed);
+        // The per-command COMMANDSTATS table (#527) is the `cmdstat_*` since-start tally Redis
+        // `resetServerStats` also clears; the registry fans this across every shard's cell so the
+        // node-wide COMMANDSTATS rollup zeroes (#531 parity with the `# Stats` reset).
+        for slot in &self.cmd_stats {
+            slot.reset();
+        }
         // The coordinator HOP counters (#556) are `_total` since-start stats like
         // `commands_processed`, so `CONFIG RESETSTAT` clears them too (an operator resetting stats
         // expects the hop-rate window to restart with them). The inbox-depth GAUGE is not a stat
@@ -487,6 +605,37 @@ impl ShardCounters {
     /// elapsed the SLOWLOG/COMMANDSTATS hooks measured -- no new clock read on the hot path.
     pub fn observe_latency(&self, elapsed_us: u64) {
         self.cell.observe_latency(elapsed_us);
+    }
+
+    /// Record `n` bytes READ off a client socket into this shard's `total_net_input_bytes` (#527):
+    /// ONE uncontended `Relaxed` add, reached from every serve RECV site on BOTH datapaths (tokio +
+    /// io_uring). Takes `&self` (the cell records through a `Relaxed` atomic, like
+    /// [`Self::observe_latency`]) so the serve loop needs no `&mut` borrow; no lock, no allocation --
+    /// the same single-increment the command counters compile to.
+    pub fn on_net_input(&self, n: u64) {
+        self.cell
+            .total_net_input_bytes
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record `n` bytes WRITTEN to a client socket into this shard's `total_net_output_bytes`
+    /// (#527): the SEND-path complement of [`Self::on_net_input`], one `Relaxed` add reached from
+    /// every serve SEND site on both datapaths.
+    pub fn on_net_output(&self, n: u64) {
+        self.cell
+            .total_net_output_bytes
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record one executed command into this shard's per-command COMMANDSTATS slot (#527): ONE
+    /// `Relaxed` calls-increment + a usec add (+ a failed-increment on an error reply), the
+    /// per-command analog of [`Self::observe_latency`]. `index` is the server's STABLE command
+    /// ordinal; an out-of-range index (never produced by the server's ordinal map) is a defensive
+    /// no-op. No lock, no allocation on the hot path -- the slot is pre-allocated.
+    pub fn on_command_stat(&self, index: usize, usec: u64, failed: bool) {
+        if let Some(slot) = self.cell.cmd_stats.get(index) {
+            slot.record(usec, failed);
+        }
     }
 
     /// Record that THIS shard DISPATCHED one single-target cross-shard keyed hop to a peer (#556):
@@ -749,6 +898,27 @@ impl MetricsRegistry {
             .iter()
             .map(|c| c.snapshot())
             .fold(CounterSnapshot::default(), CounterSnapshot::merge)
+    }
+
+    /// Sum every shard's per-command COMMANDSTATS table into ONE node-wide per-slot vector (#527),
+    /// the per-command analog of [`Self::aggregate`]: element-wise across shards so `out[ordinal]`
+    /// is the whole node's calls/usec/failed for the command at that ordinal. Lock-free (each cell's
+    /// slots are loaded independently). The SERVER maps the slot ordinals back to command names when
+    /// it renders `cmdstat_<name>` for INFO COMMANDSTATS, so this crate stays name-agnostic. The
+    /// result length is always [`COMMAND_STAT_SLOTS`]; unused ordinals stay zero.
+    #[must_use]
+    pub fn aggregate_command_stats(&self) -> Vec<CmdStat> {
+        let mut out = vec![CmdStat::default(); COMMAND_STAT_SLOTS];
+        for cell in self.cells.iter() {
+            for (dst, src) in out.iter_mut().zip(cell.cmd_stats.iter()) {
+                let s = src.snapshot();
+                dst.calls = dst.calls.saturating_add(s.calls);
+                dst.usec = dst.usec.saturating_add(s.usec);
+                dst.rejected_calls = dst.rejected_calls.saturating_add(s.rejected_calls);
+                dst.failed_calls = dst.failed_calls.saturating_add(s.failed_calls);
+            }
+        }
+        out
     }
 
     /// One [`CounterSnapshot`] per shard, in shard-index order (`[i]` is shard `i`), for the
@@ -1273,6 +1443,13 @@ pub struct CounterSnapshot {
     pub commands_processed: u64,
     /// Currently-open connections on this shard.
     pub connected_clients: u64,
+    /// Total bytes READ off this shard's client sockets since start (INFO `total_net_input_bytes`,
+    /// #527); summed across shards for the node-wide figure `redis_exporter` reads as
+    /// `redis_net_input_bytes_total`.
+    pub total_net_input_bytes: u64,
+    /// Total bytes WRITTEN to this shard's client sockets since start (INFO
+    /// `total_net_output_bytes`, #527); the node-wide `redis_net_output_bytes_total` source.
+    pub total_net_output_bytes: u64,
     /// Total keys evicted by this shard to honor the memory ceiling (INFO
     /// `evicted_keys`, PR-3a).
     pub evicted_keys: u64,
@@ -1305,6 +1482,8 @@ impl CounterSnapshot {
             connections_received: self.connections_received + other.connections_received,
             commands_processed: self.commands_processed + other.commands_processed,
             connected_clients: self.connected_clients + other.connected_clients,
+            total_net_input_bytes: self.total_net_input_bytes + other.total_net_input_bytes,
+            total_net_output_bytes: self.total_net_output_bytes + other.total_net_output_bytes,
             evicted_keys: self.evicted_keys + other.evicted_keys,
             expired_keys: self.expired_keys + other.expired_keys,
             keyspace_hits: self.keyspace_hits + other.keyspace_hits,
@@ -1916,6 +2095,20 @@ pub fn build_info<C: Clock>(
             out,
             "total_commands_processed:{}\r\n",
             rolled.commands_processed
+        );
+        // #527: the cumulative bytes READ off / WRITTEN to client sockets, summed across shards by
+        // the SAME `aggregate()` rollup the counters above use (invariant to which shard homed the
+        // connection). `redis_exporter` reads `redis_net_input_bytes_total` /
+        // `redis_net_output_bytes_total` from exactly these two INFO fields.
+        let _ = write!(
+            out,
+            "total_net_input_bytes:{}\r\n",
+            rolled.total_net_input_bytes
+        );
+        let _ = write!(
+            out,
+            "total_net_output_bytes:{}\r\n",
+            rolled.total_net_output_bytes
         );
         // PROD-7: a coarse commands-per-second estimate (the caller's rolling delta off the
         // per-shard `commands_processed`) and the count of connections refused by the `maxclients`
