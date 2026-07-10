@@ -70,6 +70,24 @@ cert, mount it, and set `IRONCACHE_CLUSTER_TLS=on` plus the cert/key/CA paths on
 every service. See the commented block at the bottom of
 `docker-compose.cluster.yml`.
 
+## Console overlay (optional, HA)
+
+`docker-compose.console.yml` adds the monitoring/management console as TWO stateless
+replicas behind an nginx load balancer (`console-lb`), overlaid on either cache file.
+The console stays OUT of the client data path -- it only polls the nodes -- so a
+replica loss is transparent:
+
+```sh
+cd deploy/compose
+docker compose -f docker-compose.cluster.yml -f docker-compose.console.yml up -d
+curl localhost:9180/readyz    # served by whichever replica the LB picks
+```
+
+Point it at the cache node(s) (`IRONCACHE_CONSOLE_SEEDS`), a SHARED metrics backend
+(`IRONCACHE_CONSOLE_PROMETHEUS_URL`), and set `IRONCACHE_CONSOLE_READ_TOKEN` so the
+privileged API is not open. Full HA + security walkthrough:
+[`../CONSOLE_DEPLOY.md`](../CONSOLE_DEPLOY.md).
+
 ## Ports reference
 
 | Port | Purpose | Derivation |
@@ -78,5 +96,7 @@ every service. See the commented block at the bottom of
 | 16379 | Raft cluster-bus (RAFTMSG) | `port + 10000` |
 | 26379 | replication data plane | `port + 20000` |
 | 9121 | `/metrics` + `/livez` + `/readyz` | `--metrics-addr` |
+| 9180 | console UI + `/api/*` + `/livez` + `/readyz` (console overlay) | `IRONCACHE_CONSOLE_HTTP_ADDR` |
 
-See `../../DEPLOY.md` for the full config-knob reference and the Kubernetes paths.
+See `../../DEPLOY.md` for the full config-knob reference and the Kubernetes paths,
+and `../CONSOLE_DEPLOY.md` for the console HA + security deployment guide.

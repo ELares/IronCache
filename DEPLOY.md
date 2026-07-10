@@ -286,7 +286,9 @@ In every form: point the console at the cache client Service/nodes
 (`IRONCACHE_CONSOLE_SEEDS`), a SHARED Prometheus for consistent history
 (`IRONCACHE_CONSOLE_PROMETHEUS_URL`), and the least-privilege node user
 (`console_monitor`, section 6); set a read token so the privileged API is not open;
-and keep the console Service behind a VPN-locked LB (#369).
+and keep the console Service behind a VPN-locked LB (#369). The dedicated runbook
+(HA model, data-path isolation, security posture, 2-replica walkthroughs) is
+[`deploy/CONSOLE_DEPLOY.md`](deploy/CONSOLE_DEPLOY.md).
 
 ---
 
@@ -434,8 +436,12 @@ replicas behind a load balancer** (issue #363), separate from the data path:
   `console_monitor` user (see the aclfile above), and the console is kept behind a
   VPN-locked, SG-restricted load balancer, not world-reachable (issue #369).
 
-The reference container image + Helm/k8s manifests for the console are tracked as
-follow-up packaging work under #363.
+The reference container image (`Dockerfile.console`), the Helm values
+(`console.*`), and the raw manifests (`deploy/k8s/ironcache-console.yaml`, including
+an egress-restricting NetworkPolicy) ship the HA packaging (#363). The full
+deployment runbook -- the HA model, the data-path-isolation guarantee, the security
+posture, and the two-replicas-behind-an-LB walkthroughs for compose and k8s/Helm --
+is [`deploy/CONSOLE_DEPLOY.md`](deploy/CONSOLE_DEPLOY.md).
 
 ---
 
