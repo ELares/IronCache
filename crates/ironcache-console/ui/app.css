@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: MIT OR Apache-2.0
  * IronCache Console dashboard styling (issue #359), re-skinned to the bespoke
- * Butlr design system. Self-hosted fonts (no CDN): the @font-face decls live in
+ * brand design system. Self-hosted fonts (no CDN): the @font-face decls live in
  * fonts.css, imported here at the TOP (an @import must precede every other rule)
  * so the strict CSP (default-src 'self') needs no external fetch. All styling is
  * by CLASS (no inline styles); dynamic values (memory-bar widths, the live dot,
@@ -10,11 +10,11 @@
  */
 @import url('/assets/fonts.css');
 
-/* --- Design tokens (Butlr) ------------------------------------------------ */
+/* --- Design tokens (brand) ------------------------------------------------ */
 :root {
   /* Brand */
-  --butlr-black: #191919;
-  --butlr-red: #ff3d00;
+  --brand-black: #191919;
+  --brand-red: #ff3d00;
   --accent-lime: #d3ff8c;
   --accent-lime-ink: #2c4d00;
 
@@ -210,7 +210,7 @@ body {
 }
 
 .nav-item.active {
-  background: var(--butlr-black);
+  background: var(--brand-black);
   color: #ffffff;
 }
 
@@ -365,7 +365,7 @@ body {
   width: 13px;
   height: 13px;
   border-radius: 50%;
-  background: var(--butlr-black);
+  background: var(--brand-black);
   transition: left 0.12s ease;
 }
 
@@ -564,7 +564,7 @@ body {
 
 .spark-line {
   fill: none;
-  stroke: var(--butlr-black);
+  stroke: var(--brand-black);
   stroke-width: 2;
   stroke-linejoin: round;
   stroke-linecap: round;
@@ -658,7 +658,7 @@ body {
   position: absolute;
   inset: 0;
   width: calc(var(--mem-frac, 0) * 100%);
-  background: var(--butlr-black);
+  background: var(--brand-black);
   border-radius: var(--radius-pill);
 }
 
@@ -869,7 +869,7 @@ td.err {
 /* --- Sign-in panel (UI auth, follow-up to #360) --------------------------- */
 .login-panel {
   margin-bottom: 16px;
-  border-color: var(--butlr-red);
+  border-color: var(--brand-red);
 }
 
 .login-note {
@@ -909,7 +909,7 @@ td.err {
 
 .login-input:focus {
   outline: none;
-  border-color: var(--butlr-black);
+  border-color: var(--brand-black);
 }
 
 .login-actions {
@@ -934,13 +934,13 @@ td.err {
 }
 
 .btn-primary {
-  background: var(--butlr-black);
-  border-color: var(--butlr-black);
+  background: var(--brand-black);
+  border-color: var(--brand-black);
   color: #ffffff;
 }
 
 .btn-primary:hover {
-  border-color: var(--butlr-black);
+  border-color: var(--brand-black);
   filter: brightness(1.12);
 }
 
@@ -1150,7 +1150,7 @@ td.err {
 .value-block {
   margin: 0;
   padding: 12px 14px;
-  background: var(--butlr-black);
+  background: var(--brand-black);
   color: #e8e8e8;
   border-radius: var(--radius-md);
   font-size: 12.5px;
@@ -1203,7 +1203,7 @@ td.err {
 .console-scrollback {
   margin: 0 0 12px;
   padding: 14px 16px;
-  background: var(--butlr-black);
+  background: var(--brand-black);
   color: #e8e8e8;
   border-radius: var(--radius-md);
   font-size: 12.5px;

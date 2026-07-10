@@ -271,7 +271,7 @@ boot_single() {
 # `-NOAUTH` and break turnkey-convergence detection AND all current scenarios. So we keep `default`
 # all-permissive (byte-identical for the existing legs + the harness probes) and LAYER the scoped
 # `svc` user on top -- the restricted leg AUTHs as `svc`, which proves the locked-down per-subcommand
-# ACL end-to-end regardless of `default`'s posture. `butlr_admin` is the all-powers identity (the
+# ACL end-to-end regardless of `default`'s posture. `superuser` is the all-powers identity (the
 # turnkey cluster issues no CLUSTER mutators itself, so it is unused here, present for parity with
 # prod where an operator runs mutators as the admin user, never as `svc`).
 #
@@ -285,7 +285,7 @@ boot_single() {
 write_cluster_aclfile() {
   cat > "$CLUSTER_ACLFILE" <<EOF
 user default on nopass ~* &* +@all
-user butlr_admin on >adminpw ~* &* +@all
+user superuser on >adminpw ~* &* +@all
 user $SVC_USER on >$SVC_PASS ~* resetchannels +@read +@write +@connection +@transaction -@dangerous +cluster|slots +cluster|shards +cluster|nodes +cluster|info
 EOF
   info "wrote cluster aclfile: $CLUSTER_ACLFILE (default all-permissive; scoped svc user added)"
