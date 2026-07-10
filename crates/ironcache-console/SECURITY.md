@@ -106,7 +106,7 @@ and up/down counts, no identifying string.
 | Gate | Status |
 | --- | --- |
 | No PII in the OPEN tier | MET (`/api/cluster` aggregate-only, #360) |
-| No `+@all` node user | PENDING: requires the least-privilege `console_monitor` ACL user (#367, infra). Until it lands the console must use a scoped user, NOT `butlr_admin`. |
+| No `+@all` node user | PENDING: requires the least-privilege `console_monitor` ACL user (#367, infra). Until it lands the console must use a scoped user, NOT `superuser`. |
 | Step-up auth for ADMIN actions | N/A today (no ADMIN action exists; gating lands with #371) |
 | SSRF allowlisting | MET (#356 metric allowlist + #369 no-redirect + metadata-IP block) |
 | Console not internet-reachable | MET by default (loopback bind). Exposure requires the deployment gate below. |
@@ -121,9 +121,9 @@ and up/down counts, no identifying string.
 2. HTTPS to Prometheus is deferred (HTTP only, in-VPC); the console MUST reach
    Prometheus over a trusted network only.
 3. LEAST-PRIVILEGE NODE USER (#367): provision and use the read-only
-   `console_monitor` ACL user; do NOT wire `butlr_admin` into the console.
+   `console_monitor` ACL user; do NOT wire `superuser` into the console.
 4. EXPOSURE (#369 deployment): the console must run behind a VPN-locked,
-   SG-restricted load balancer (the existing Thanos pattern), reachable by
+   SG-restricted load balancer, reachable by
    operators only, never the public internet or the data-client network. When
    exposed, a token MUST be configured (the non-loopback no-token posture serves
    OPEN only, but a real deployment configures the read/admin tokens).

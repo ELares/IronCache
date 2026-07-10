@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // IronCache Console dashboard logic (issue #359), re-skinned to the bespoke
-// Butlr design system. Vanilla JS, no framework, no build step, no external
+// brand design system. Vanilla JS, no framework, no build step, no external
 // fetch (a strict CSP default-src 'self' must run this with no 'unsafe-inline'
 // and no CDN).
 //

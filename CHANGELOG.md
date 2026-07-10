@@ -242,11 +242,11 @@ shipped ahead of this tag.
   `CONFIG SET tcp-keepalive` applies to newly-accepted connections; an established
   connection keeps the option it was accepted with, matching Redis. Configurable at
   boot via TOML (`tcp_keepalive_secs`) and the `IRONCACHE_TCP_KEEPALIVE` env var.
-- IronCache Console dashboard re-skin to the bespoke Butlr design system (issue
+- IronCache Console dashboard re-skin to the bespoke brand design system (issue
   #359). The generic dark dashboard is replaced with the real design language: a
   full-height sidebar (brand chip plus grouped nav) and topbar (page title, a
   cluster-state pill, a node selector, a Live toggle, refresh and theme-toggle
-  icon buttons, an avatar), light and dark themes built from Butlr color tokens
+  icon buttons, an avatar), light and dark themes built from brand color tokens
   (the page/card surfaces, the ink primary text, the sparingly used red CTA, the
   lime accent), 16px rounded cards with a soft shadow, and a tabbed single-page
   layout. The real-data views are fully wired from the `/api/*` JSON: an Overview
@@ -1097,7 +1097,7 @@ shipped ahead of this tag.
   per-arg cap, and a total-bytes cap); the SCAN browser caps the page size and the
   pattern length and uses SCAN, never KEYS; the Bearer-header auth is CSRF-safe (no
   cookie). The dashboard Config, Keyspace, Console, Pub/Sub, ACL, and a new
-  Persistence page are now FUNCTIONAL (read plus write) in the bespoke Butlr design
+  Persistence page are now FUNCTIONAL (read plus write) in the bespoke brand design
   language, replacing their gated empty-states; a mutation without an admin token
   surfaces "admin required" and reveals the sign-in rather than a raw error. The
   strict CSP (`default-src 'self'`, no inline style/script/handlers) and the
