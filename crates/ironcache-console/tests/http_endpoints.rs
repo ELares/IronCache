@@ -232,18 +232,36 @@ async fn api_responses_carry_security_headers_over_tcp() {
         accept_loop(listener, serving).await;
     });
 
-    // An /api/* response (health, no poll needed) carries nosniff + no-store.
+    // An /api/* response (health, no poll needed) carries the full set (#369):
+    // a deny-all CSP, nosniff, frame denial, no-referrer, and no-store.
     let health = http_get(addr, "/api/health").await;
     assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
     assert!(
         health.contains("Content-Type: application/json"),
         "{health}"
     );
-    assert!(
-        health.contains("X-Content-Type-Options: nosniff"),
-        "{health}"
-    );
-    assert!(health.contains("Cache-Control: no-store"), "{health}");
+    for h in [
+        "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'",
+        "X-Content-Type-Options: nosniff",
+        "X-Frame-Options: DENY",
+        "Referrer-Policy: no-referrer",
+        "Cache-Control: no-store",
+    ] {
+        assert!(health.contains(h), "missing {h}: {health}");
+    }
+
+    // The dashboard shell (`/`) carries the strict UI set: a same-origin CSP
+    // (the embedded app.css/app.js must load) plus the same browser hardening.
+    let index = http_get(addr, "/").await;
+    assert!(index.starts_with("HTTP/1.1 200 OK"), "{index}");
+    for h in [
+        "Content-Security-Policy: default-src 'self'",
+        "X-Content-Type-Options: nosniff",
+        "X-Frame-Options: DENY",
+        "Referrer-Policy: no-referrer",
+    ] {
+        assert!(index.contains(h), "missing {h} on /: {index}");
+    }
 
     // The probes/metrics do NOT carry Cache-Control (scoped to /api/* only).
     for path in ["/livez", "/readyz", "/metrics"] {
@@ -253,6 +271,112 @@ async fn api_responses_carry_security_headers_over_tcp() {
             "{path} must not carry Cache-Control: {resp}"
         );
     }
+}
+
+/// Send a request with ARBITRARY extra header lines (each `Name: value\r\n`), for
+/// the same-origin (CSRF) gate tests.
+async fn http_send_with_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    extra_headers: &str,
+    body: &str,
+) -> String {
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: x\r\n{extra_headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    c.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    c.read_to_end(&mut raw).await.unwrap();
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// CSRF (#369) end to end: a browser-marked cross-site mutation is 403 (never
+/// reaches the node), while the SAME mutation with a matching Origin passes the
+/// gate and completes against the stub node.
+#[tokio::test]
+async fn cross_site_mutation_rejected_same_origin_accepted_over_tcp() {
+    // A stub node that would answer the SET with +OK (only the allowed request
+    // may ever reach it).
+    let node = spawn_stub_node(vec![b"+OK\r\n"]).await;
+    let state = state_with_node(
+        ironcache_console::auth::AuthPolicy::resolve(None, Some("admin-tok"), true),
+        &node,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = state.clone();
+    tokio::spawn(async move {
+        accept_loop(listener, serving).await;
+    });
+
+    let auth = "Authorization: Bearer admin-tok\r\n";
+    // Cross-site Origin -> 403, even with a valid admin token.
+    let resp = http_send_with_headers(
+        addr,
+        "POST",
+        "/api/keys/k1",
+        &format!("{auth}Origin: http://evil.example\r\n"),
+        "{\"value\":\"v\"}",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+
+    // Sec-Fetch-Site: cross-site -> 403 too.
+    let resp = http_send_with_headers(
+        addr,
+        "POST",
+        "/api/keys/k1",
+        &format!("{auth}Sec-Fetch-Site: cross-site\r\n"),
+        "{\"value\":\"v\"}",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+
+    // A matching Origin (the helper sends `Host: x`) passes the gate, reaches
+    // the stub node, and completes.
+    let resp = http_send_with_headers(
+        addr,
+        "POST",
+        "/api/keys/k1",
+        &format!("{auth}Origin: http://x\r\n"),
+        "{\"value\":\"v\"}",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+}
+
+/// Failed-auth rate limit (#369) end to end: once the fixed window holds the
+/// failure budget of INVALID Bearer tokens, token-bearing requests answer 429.
+#[tokio::test]
+async fn failed_auth_rate_limit_answers_429_over_tcp() {
+    let state = ConsoleHttpState::with_topology_and_auth(
+        Arc::new(ConsoleMetrics::new()),
+        ironcache_console::poll::new_topology_holder(),
+        ironcache_console::auth::AuthPolicy::resolve(Some("read-tok"), None, true),
+    );
+    state.set_live(true);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = state.clone();
+    tokio::spawn(async move {
+        accept_loop(listener, serving).await;
+    });
+
+    for i in 0..ironcache_console::http::MAX_AUTH_FAILURES_PER_WINDOW {
+        let resp = http_send(addr, "GET", "/api/nodes", Some("WRONG"), "").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "attempt {i} must be 401: {resp}"
+        );
+    }
+    let resp = http_send(addr, "GET", "/api/nodes", Some("WRONG"), "").await;
+    assert!(resp.starts_with("HTTP/1.1 429"), "{resp}");
+    // Token-free requests (the Open tier) are unaffected by the trip.
+    let open = http_get(addr, "/api/health").await;
+    assert!(open.starts_with("HTTP/1.1 200 OK"), "{open}");
 }
 
 /// A stub history source for the integration test: returns a canned series for any

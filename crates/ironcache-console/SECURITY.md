@@ -40,8 +40,10 @@ addresses, version, memory/keyspace figures).
   OPEN allow-list and FAILS CLOSED: only `/api/health`, `/api/cluster` (aggregate
   totals + up/down counts only), and `/api/openapi.json` are OPEN; every other
   `/api/*` (nodes, nodes/{addr}, slowlog, clients, keyspace) and any
-  unknown/trailing-slash path defaults to PRIVILEGED_READ. ADMIN is reserved for
-  phase-2 management (#371); no route grants it today.
+  unknown/trailing-slash path defaults to PRIVILEGED_READ. ADMIN gates every
+  management WRITE plus the sensitive management reads (`/api/acl`, the
+  rebalance plan): any non-GET/HEAD verb maps to ADMIN regardless of path
+  (#361/#371), so a mutation can never inherit a read route's lower tier.
 - Bearer-token auth: `read_token` grants OPEN+PRIVILEGED_READ, `admin_token`
   grants all. Tokens are compared in CONSTANT time (`ironcache_runtime::
   constant_time_eq`), held in `Zeroizing`, redacted in `Debug`, and never logged.
@@ -99,7 +101,54 @@ and up/down counts, no identifying string.
 - The UI responses carry a strict CSP (`default-src 'self'; base-uri 'none';
   frame-ancestors 'none'; object-src 'none'`), plus `X-Content-Type-Options:
   nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. The `/api/*`
-  responses carry `nosniff` + `Cache-Control: no-store`.
+  responses carry a DENY-ALL CSP (`default-src 'none'; frame-ancestors 'none'`),
+  `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and
+  `Cache-Control: no-store` on every outcome (success and error alike).
+
+### Web-surface hardening (#369)
+
+The console is the classic credential-holding monitoring UI (it proxies a
+metrics backend and reaches internal cache nodes), the pattern behind real
+monitoring-dashboard SSRF and account-takeover CVEs, so the web surface carries
+the controls that history demands.
+
+- Same-origin mutation gate (CSRF, `src/http.rs`): every state-changing
+  `/api/*` request that a BROWSER marks as cross-site is refused with `403`
+  BEFORE the auth gate and in EVERY posture, including the loopback dev mode
+  (the one posture that serves mutations with no token, and therefore the one
+  place a hostile page in an operator's browser could otherwise drive the
+  console, e.g. via DNS rebinding or a cross-site form POST).
+  `Sec-Fetch-Site: same-origin`/`none` passes; any other value is refused;
+  without it, the `Origin` authority must equal the request `Host`
+  (`Origin: null`, a non-web scheme, or a mismatch is refused). Requests with
+  no browser-provenance headers (curl, in-house tooling) are unaffected.
+  Reads are not origin-gated: no CORS header is ever emitted, so a cross-site
+  reader cannot read a response.
+- Failed-auth rate limit (`src/auth.rs`, `src/http.rs`): presented-but-INVALID
+  Bearer tokens are counted in a fixed window (10 failures / 60 s); once
+  tripped, token-bearing requests answer `429` until the window rolls, so a
+  brute force learns nothing. The compare stays constant-time; token-free
+  requests (the Open tier, the probes) are never throttled.
+- Session model: there is NO cookie and NO server-side session. Every request
+  re-presents the Bearer token (the UI keeps it in tab-scoped
+  `sessionStorage`), so `HttpOnly`/`Secure`/`SameSite` have nothing to protect
+  and no ambient credential exists to ride; the CSRF answer is the
+  header-credential plus the same-origin gate above. Admin actions re-present
+  the admin token on every call, and the destructive ones additionally require
+  a typed confirmation in the body (the step-up model as built).
+- Egress allowlist: the console dials ONLY operator-configured targets: the
+  seed node addresses (RESP), the node admin HTTP URL, and the metrics-backend
+  base URL. No request input can name an outbound target, and
+  discovery-derived endpoints are displayed, never dialed. The outbound URLs
+  and every seed `host:port` are validated at BOOT (`config::validate`) as
+  well as at request time; the outbound client refuses redirects, non-http
+  schemes, and link-local/metadata addresses, and caps time and response size.
+- Deployment posture (general): run the console on a private network behind a
+  VPN-restricted ingress (the operator's monitoring load balancer), never on
+  the public internet or the data-client network; terminate TLS at that edge
+  (or in front of the console); configure the read/admin tokens whenever the
+  bind is not loopback; and give the console a least-privilege, read-only
+  monitor ACL user on the nodes, never a full-privilege user.
 
 ## Sign-off gates
 

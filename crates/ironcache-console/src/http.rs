@@ -45,6 +45,15 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// than queueing unbounded tasks.
 const MAX_CONCURRENT_CONNS: usize = 128;
 
+/// Failed-authentication budget per fixed window (#369): after this many
+/// presented-but-INVALID Bearer tokens inside one window, token-bearing requests
+/// answer `429` until the window rolls (the brute-force brake). Public so the
+/// integration tests and operators can reference the shipped budget.
+pub const MAX_AUTH_FAILURES_PER_WINDOW: u32 = 10;
+
+/// The fixed window (seconds) for the failed-auth limiter (#369).
+pub const AUTH_FAILURE_WINDOW_SECS: u64 = 60;
+
 /// The shared state the HTTP handler reads at request time. Cheap, lock-free
 /// reads; cloned (`Arc` inside) into each connection task.
 #[derive(Clone)]
@@ -71,6 +80,10 @@ pub struct ConsoleHttpState {
     /// then drop). `None` when no seed is configured, in which case the management
     /// endpoints answer `503`. Carries the zeroized node password (never logged).
     node_access: Option<Arc<NodeAccess>>,
+    /// The failed-auth fixed-window rate limiter (#369): presented-but-invalid
+    /// Bearer tokens are counted, and past the budget token-bearing requests are
+    /// answered `429` (the brute-force brake). Shared (`Arc`) across connections.
+    auth_limiter: Arc<auth::FailedAuthLimiter>,
 }
 
 impl ConsoleHttpState {
@@ -110,6 +123,10 @@ impl ConsoleHttpState {
             auth: Arc::new(auth),
             history: None,
             node_access: None,
+            auth_limiter: Arc::new(auth::FailedAuthLimiter::new(
+                AUTH_FAILURE_WINDOW_SECS,
+                MAX_AUTH_FAILURES_PER_WINDOW,
+            )),
         }
     }
 
@@ -176,11 +193,32 @@ impl ConsoleHttpState {
     /// the connection handler read after the header block, capped by
     /// [`MAX_REQUEST_BYTES`]; an oversized body never reaches here (the read phase
     /// answers `413` first). GET/HEAD ignore the body.
+    ///
+    /// Carries ONLY the `Authorization` header (no browser-provenance headers), so
+    /// it behaves like a non-browser client at the same-origin gate; the connection
+    /// handler goes through [`Self::respond_async_request`] with the full
+    /// [`RequestHead`].
     pub async fn respond_async_with_body(
         &self,
         method: &str,
         path: &str,
         auth_header: Option<&str>,
+        body: &[u8],
+    ) -> Vec<u8> {
+        self.respond_async_request(method, path, &RequestHead::bearer(auth_header), body)
+            .await
+    }
+
+    /// The full request-aware responder (#369): [`Self::respond_async_with_body`]
+    /// plus the parsed [`RequestHead`], so the same-origin (CSRF) gate can consult
+    /// the browser-provenance headers (`Origin`, `Sec-Fetch-Site`, `Host`) and the
+    /// failed-auth limiter can throttle a brute force. The connection handler
+    /// calls this; the narrower forms above delegate here.
+    pub async fn respond_async_request(
+        &self,
+        method: &str,
+        path: &str,
+        req: &RequestHead,
         body: &[u8],
     ) -> Vec<u8> {
         let head = method == "HEAD";
@@ -198,33 +236,14 @@ impl ConsoleHttpState {
             return api_response(405, status_reason(405), b"", head);
         }
 
-        // AUTH/RBAC GATE (#360, #361): every `/api/*` route maps to a tier from the
-        // METHOD + path; the policy decides allow / 401 / 403 from the (bind, token)
-        // posture and the presented Bearer token. This runs BEFORE any handler, so
-        // privileged data is never produced and NO mutation runs for a request that
-        // is not authorized. A write verb maps to `Admin` regardless of path (fail
-        // closed), so a trailing slash / casing / method trick cannot drop a
-        // mutation below the admin bar.
-        let required = auth::route_tier_for_method(method, bare);
-        match auth::authorize(&self.auth, required, auth_header) {
-            Decision::Allow => {}
-            Decision::Unauthorized(reason) => {
-                return api_response(
-                    401,
-                    status_reason(401),
-                    api::error_json(reason).as_bytes(),
-                    head,
-                );
-            }
-            Decision::Forbidden(reason) => {
-                return api_response(
-                    403,
-                    status_reason(403),
-                    api::error_json(reason).as_bytes(),
-                    head,
-                );
-            }
-        }
+        // The pre-handler security gates (#360, #361, #369): same-origin (CSRF)
+        // for writes, then the failed-auth rate limit, then the tier/RBAC
+        // decision. On rejection the ready-to-write response comes back; on
+        // allow, the required tier does (the management dispatch audit-logs it).
+        let required = match self.security_gate(method, bare, req, is_write, head) {
+            Ok(tier) => tier,
+            Err(response) => return response,
+        };
 
         // Write verbs go to the management dispatch (#361). The tier gate above has
         // already enforced Admin, so by here the caller is authorized to mutate.
@@ -284,6 +303,96 @@ impl ConsoleHttpState {
             resp.body.as_bytes(),
             head,
         )
+    }
+
+    /// Run the pre-handler security gates for one `/api/*` request (#360, #361,
+    /// #369), in order:
+    ///
+    ///   1. SAME-ORIGIN (CSRF): a state-changing request that a BROWSER marks as
+    ///      cross-site is refused `403` BEFORE the auth gate and in EVERY auth
+    ///      posture, including the loopback dev mode (which serves mutations with
+    ///      no token, the one place a cross-site browser request could otherwise
+    ///      ride: a hostile page driving a token-less loopback console via DNS
+    ///      rebinding or a cross-site form POST). The auth model is a Bearer
+    ///      HEADER (no cookie), so there is no ambient credential to steal;
+    ///      non-browser clients send neither provenance header and are
+    ///      unaffected. Reads are not gated: no CORS header is ever emitted, so
+    ///      a cross-site reader cannot read a response anyway.
+    ///   2. FAILED-AUTH RATE LIMIT: once the fixed window holds the failure
+    ///      budget, every TOKEN-BEARING request answers `429` BEFORE the compare
+    ///      (a brute force stops learning anything); token-free requests are
+    ///      never throttled, so the probes and Open routes are unaffected. Time
+    ///      comes from the metrics' env clock seam (ADR-0003).
+    ///   3. AUTH/RBAC: every `/api/*` route maps to a tier from the METHOD +
+    ///      path; the policy decides allow / 401 / 403 from the (bind, token)
+    ///      posture and the presented Bearer token. This runs BEFORE any
+    ///      handler, so privileged data is never produced and NO mutation runs
+    ///      for an unauthorized request; a write verb maps to `Admin` regardless
+    ///      of path (fail closed). A PRESENTED token that did not authenticate
+    ///      feeds the limiter; a merely MISSING token does not (the dashboard's
+    ///      first unauthenticated load must not lock the login out).
+    ///
+    /// Returns the required tier on allow, or the ready-to-write rejection
+    /// response bytes.
+    fn security_gate(
+        &self,
+        method: &str,
+        bare: &str,
+        req: &RequestHead,
+        is_write: bool,
+        head: bool,
+    ) -> Result<Tier, Vec<u8>> {
+        if is_write {
+            if let Some(reason) = cross_site_rejection(req) {
+                return Err(api_response(
+                    403,
+                    status_reason(403),
+                    api::error_json(reason).as_bytes(),
+                    head,
+                ));
+            }
+        }
+
+        let auth_header = req.authorization.as_deref();
+        let token_presented = auth_header.and_then(auth::parse_bearer).is_some();
+        if token_presented
+            && self
+                .auth_limiter
+                .is_limited(self.metrics.now_unix_seconds())
+        {
+            return Err(api_response(
+                429,
+                status_reason(429),
+                api::error_json(
+                    "too many failed authentication attempts; retry after the rate-limit window",
+                )
+                .as_bytes(),
+                head,
+            ));
+        }
+
+        let required = auth::route_tier_for_method(method, bare);
+        match auth::authorize(&self.auth, required, auth_header) {
+            Decision::Allow => Ok(required),
+            Decision::Unauthorized(reason) => {
+                if token_presented {
+                    self.auth_limiter
+                        .record_failure(self.metrics.now_unix_seconds());
+                }
+                Err(api_response(
+                    401,
+                    status_reason(401),
+                    api::error_json(reason).as_bytes(),
+                    head,
+                ))
+            }
+            Decision::Forbidden(reason) => Err(api_response(
+                403,
+                status_reason(403),
+                api::error_json(reason).as_bytes(),
+                head,
+            )),
+        }
     }
 
     /// Dispatch a MANAGEMENT request (#361) to the node. Opens a short-lived
@@ -657,6 +766,7 @@ fn status_reason(code: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -680,15 +790,27 @@ const UI_SECURITY_HEADERS: &str = concat!(
 
 /// The extra response headers carried by EVERY `/api/*` JSON response (#369). The
 /// API data is sensitive (node addresses, slowlog argv = key names, client IPs)
-/// and must NOT be content-sniffed or cached: `X-Content-Type-Options: nosniff`
-/// stops a browser from re-typing the `application/json` body, and `Cache-Control:
-/// no-store` keeps the privileged data out of any shared/disk cache. These are
-/// applied ONLY to `/api/*` (success, 401, 403, 405); the probe routes
-/// (`/livez`/`/readyz`/`/metrics`), the UI assets, and their byte-for-byte tests
-/// are untouched. Each line is `Name: value\r\n`; the builder inserts the block
-/// before the blank-line terminator.
+/// and must NOT be content-sniffed, cached, rendered, or framed:
+///
+///   * a DENY-ALL `Content-Security-Policy` (`default-src 'none'; frame-ancestors
+///     'none'`) so a JSON body coaxed into rendering as a document can load or
+///     run nothing (the class of pivot behind real monitoring-UI CVEs),
+///   * `X-Content-Type-Options: nosniff` so a browser never re-types the
+///     `application/json` body,
+///   * `X-Frame-Options: DENY` (the legacy twin of `frame-ancestors 'none'`),
+///   * `Referrer-Policy: no-referrer` so an API URL never leaks in a referrer,
+///   * `Cache-Control: no-store` so the privileged data stays out of any
+///     shared/disk cache.
+///
+/// These are applied ONLY to `/api/*` (success, 401, 403, 405, 429); the probe
+/// routes (`/livez`/`/readyz`/`/metrics`) and the UI assets carry their own sets.
+/// Each line is `Name: value\r\n`; the builder inserts the block before the
+/// blank-line terminator.
 const API_SECURITY_HEADERS: &str = concat!(
+    "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n",
     "X-Content-Type-Options: nosniff\r\n",
+    "X-Frame-Options: DENY\r\n",
+    "Referrer-Policy: no-referrer\r\n",
     "Cache-Control: no-store\r\n",
 );
 
@@ -801,12 +923,13 @@ fn content_length(buf: &[u8]) -> Option<usize> {
         .and_then(|(_, value)| value.trim().parse::<usize>().ok())
 }
 
-/// Extract the FIRST `Authorization` header value from the request head, or
-/// `None`. The field name is case-insensitive (RFC 9110); the value is the text
-/// after the first colon, trimmed. Parsing is tolerant and never panics: a header
-/// line without a colon is skipped, and a non-UTF-8 byte sequence is lossily
-/// decoded. Only the header block (up to the first blank line) is scanned.
-fn authorization_header(buf: &[u8]) -> Option<String> {
+/// Extract the FIRST `name` header value from the request head, or `None`. The
+/// field name is case-insensitive (RFC 9110); the value is the text after the
+/// first colon, trimmed. Parsing is tolerant and never panics: a header line
+/// without a colon is skipped, and a non-UTF-8 byte sequence is lossily decoded.
+/// Only the header block (up to the first blank line) is scanned, so a
+/// header-looking line in the BODY is never picked up.
+fn header_value(buf: &[u8], name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(buf);
     // Stop at the blank line that ends the header block (ignore any body).
     let head = text.split_once("\r\n\r\n").map_or_else(
@@ -817,8 +940,95 @@ fn authorization_header(buf: &[u8]) -> Option<String> {
     head.split('\n')
         .skip(1)
         .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+        .find(|(n, _)| n.trim().eq_ignore_ascii_case(name))
         .map(|(_, value)| value.trim().to_owned())
+}
+
+/// The request headers the responder consults (#369), parsed once from the
+/// bounded request head: the `Authorization` credential plus the
+/// browser-provenance headers (`Origin`, `Sec-Fetch-Site`) and `Host` that drive
+/// the same-origin gate on mutations. The connection handler builds it with
+/// [`RequestHead::parse`]; tests construct it directly.
+#[derive(Debug, Clone, Default)]
+pub struct RequestHead {
+    /// The `Authorization` header value, if present.
+    pub authorization: Option<String>,
+    /// The `Origin` header value, if present. Browsers send it on every
+    /// cross-origin request and on same-origin non-GET requests; non-browser
+    /// clients normally omit it.
+    pub origin: Option<String>,
+    /// The `Sec-Fetch-Site` header value, if present (a forbidden header name:
+    /// only the browser itself can set it).
+    pub sec_fetch_site: Option<String>,
+    /// The `Host` header value (the authority the client addressed), if present.
+    pub host: Option<String>,
+}
+
+impl RequestHead {
+    /// Parse the four consulted headers out of a raw (already bounded) request
+    /// head. Tolerant and panic-free (see [`header_value`]).
+    #[must_use]
+    pub fn parse(buf: &[u8]) -> Self {
+        RequestHead {
+            authorization: header_value(buf, "authorization"),
+            origin: header_value(buf, "origin"),
+            sec_fetch_site: header_value(buf, "sec-fetch-site"),
+            host: header_value(buf, "host"),
+        }
+    }
+
+    /// A head carrying ONLY an `Authorization` value (the shape the narrower
+    /// `respond_async*` forms use): no browser-provenance headers, so it passes
+    /// the same-origin gate like any non-browser client.
+    #[must_use]
+    pub fn bearer(auth_header: Option<&str>) -> Self {
+        RequestHead {
+            authorization: auth_header.map(ToOwned::to_owned),
+            ..RequestHead::default()
+        }
+    }
+}
+
+/// Decide whether a MUTATION request is a cross-site BROWSER request that must be
+/// refused (#369, the CSRF gate). Returns the rejection reason, or `None` to
+/// proceed.
+///
+/// The rules, in order:
+///   * `Sec-Fetch-Site: same-origin` or `none` (a direct user action) passes;
+///     ANY other value (`cross-site`, and the deliberately-strict `same-site`)
+///     is refused. The header is browser-controlled (a forbidden header name),
+///     so it cannot be spoofed by page script.
+///   * Otherwise an `Origin`, when present, must be an http/https origin whose
+///     authority equals the request `Host` (case-insensitive). `Origin: null`
+///     (an opaque/sandboxed context), a non-web scheme, a mismatch, or a missing
+///     `Host` is refused (fail closed once a browser signal is present).
+///   * NEITHER header present: allow. That is a non-browser client (curl, an
+///     in-house tool); browsers always mark cross-site mutations with at least
+///     one of the two.
+///
+/// Comparing authorities (not schemes) keeps a TLS-terminating edge in front of
+/// the console working: the browser's `Origin: https://host` and the forwarded
+/// `Host: host` still match.
+fn cross_site_rejection(req: &RequestHead) -> Option<&'static str> {
+    if let Some(site) = req.sec_fetch_site.as_deref() {
+        let site = site.trim();
+        if site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        return Some("cross-site request refused: mutations must be same-origin");
+    }
+    let Some(origin) = req.origin.as_deref().map(str::trim) else {
+        return None; // No browser-provenance signal: a non-browser client.
+    };
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    match (authority, req.host.as_deref().map(str::trim)) {
+        (Some(a), Some(h)) if !a.is_empty() && a.eq_ignore_ascii_case(h) => None,
+        // `Origin: null`, a non-web scheme, an authority/Host mismatch, or a
+        // missing Host header: refuse (fail closed once a browser signal exists).
+        _ => Some("cross-site request refused: the Origin does not match the console host"),
+    }
 }
 
 /// Serve ONE connection with the production whole-request deadline.
@@ -863,7 +1073,7 @@ async fn serve_conn_with_deadline(
                     // not found via the fixed responder (never panic).
                     return Some(state.respond("GET", "/"));
                 };
-                let auth = authorization_header(&buf);
+                let req_head = RequestHead::parse(&buf);
                 let header_end = header_block_end(&buf);
                 let want_body = content_length(&buf).unwrap_or(0);
                 // If a body is declared but not fully read yet, keep reading until
@@ -893,11 +1103,15 @@ async fn serve_conn_with_deadline(
                     let body = buf[body_start..body_end].to_vec();
                     return Some(
                         state
-                            .respond_async_with_body(&method, &path, auth.as_deref(), &body)
+                            .respond_async_request(&method, &path, &req_head, &body)
                             .await,
                     );
                 }
-                return Some(state.respond_async(&method, &path, auth.as_deref()).await);
+                return Some(
+                    state
+                        .respond_async_request(&method, &path, &req_head, &[])
+                        .await,
+                );
             }
         }
     })
@@ -1571,19 +1785,29 @@ mod tests {
     }
 
     #[test]
-    fn authorization_header_is_extracted_case_insensitively() {
+    fn request_head_headers_are_extracted_case_insensitively() {
         let req = b"GET /api/nodes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n";
-        assert_eq!(authorization_header(req).as_deref(), Some("Bearer tok"));
-        // Case-insensitive field name; value trimmed.
-        let req = b"GET /api/nodes HTTP/1.1\r\nauthorization:   Bearer tok2  \r\n\r\n";
-        assert_eq!(authorization_header(req).as_deref(), Some("Bearer tok2"));
+        let parsed = RequestHead::parse(req);
+        assert_eq!(parsed.authorization.as_deref(), Some("Bearer tok"));
+        assert_eq!(parsed.host.as_deref(), Some("x"));
+        assert_eq!(parsed.origin, None);
+        assert_eq!(parsed.sec_fetch_site, None);
+        // Case-insensitive field names; values trimmed.
+        let req = b"POST /x HTTP/1.1\r\nauthorization:   Bearer tok2  \r\nORIGIN: http://a:1\r\nsec-fetch-site: cross-site\r\n\r\n";
+        let parsed = RequestHead::parse(req);
+        assert_eq!(parsed.authorization.as_deref(), Some("Bearer tok2"));
+        assert_eq!(parsed.origin.as_deref(), Some("http://a:1"));
+        assert_eq!(parsed.sec_fetch_site.as_deref(), Some("cross-site"));
         // Absent header.
         let req = b"GET /api/nodes HTTP/1.1\r\nHost: x\r\n\r\n";
-        assert_eq!(authorization_header(req), None);
+        assert_eq!(RequestHead::parse(req).authorization, None);
         // A header-looking line in the BODY is not picked up (only the head is
-        // scanned).
-        let req = b"GET /api/nodes HTTP/1.1\r\nHost: x\r\n\r\nAuthorization: Bearer body\r\n";
-        assert_eq!(authorization_header(req), None);
+        // scanned), so a body cannot smuggle an Origin/Authorization.
+        let req =
+            b"GET /api/nodes HTTP/1.1\r\nHost: x\r\n\r\nAuthorization: Bearer body\r\nOrigin: http://evil\r\n";
+        let parsed = RequestHead::parse(req);
+        assert_eq!(parsed.authorization, None);
+        assert_eq!(parsed.origin, None);
     }
 
     #[test]
@@ -2002,5 +2226,243 @@ mod tests {
         c.read_to_end(&mut raw).await.unwrap();
         let resp = String::from_utf8_lossy(&raw);
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    }
+
+    // ---- same-origin (CSRF) gate + failed-auth rate limit + headers (#369) ----
+
+    /// The full API security header set is present on `/api/*` responses: the
+    /// deny-all CSP, nosniff, frame denial, no-referrer, and no-store.
+    #[tokio::test]
+    async fn api_responses_carry_the_full_security_header_set() {
+        let state = test_state();
+        state.set_live(true);
+        let resp =
+            String::from_utf8(state.respond_async("GET", "/api/health", None).await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        for h in [
+            "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'",
+            "X-Content-Type-Options: nosniff",
+            "X-Frame-Options: DENY",
+            "Referrer-Policy: no-referrer",
+            "Cache-Control: no-store",
+        ] {
+            assert!(resp.contains(h), "missing {h}: {resp}");
+        }
+    }
+
+    /// The pure cross-site decision table: Sec-Fetch-Site outranks Origin; an
+    /// Origin must be a same-authority web origin; no browser signal passes.
+    #[test]
+    fn cross_site_rejection_rules() {
+        let head = |origin: Option<&str>, sfs: Option<&str>, host: Option<&str>| RequestHead {
+            authorization: None,
+            origin: origin.map(ToOwned::to_owned),
+            sec_fetch_site: sfs.map(ToOwned::to_owned),
+            host: host.map(ToOwned::to_owned),
+        };
+        // No browser-provenance headers at all (curl and kin): allowed.
+        assert!(cross_site_rejection(&RequestHead::default()).is_none());
+        // Sec-Fetch-Site: same-origin / none pass (case-insensitively)...
+        assert!(cross_site_rejection(&head(None, Some("same-origin"), None)).is_none());
+        assert!(cross_site_rejection(&head(None, Some("SAME-ORIGIN"), None)).is_none());
+        assert!(cross_site_rejection(&head(None, Some("none"), None)).is_none());
+        // ...and any other value is refused, EVEN with a matching Origin.
+        assert!(cross_site_rejection(&head(None, Some("cross-site"), None)).is_some());
+        assert!(cross_site_rejection(&head(None, Some("same-site"), None)).is_some());
+        assert!(
+            cross_site_rejection(&head(Some("http://a:1"), Some("cross-site"), Some("a:1")))
+                .is_some()
+        );
+        // Origin fallback: a same-authority web origin passes (either scheme, so a
+        // TLS-terminating edge still works), case-insensitively.
+        assert!(cross_site_rejection(&head(Some("http://a:1"), None, Some("a:1"))).is_none());
+        assert!(cross_site_rejection(&head(Some("https://A:1"), None, Some("a:1"))).is_none());
+        // A mismatched authority, `null`, a non-web scheme, or a missing Host is
+        // refused (fail closed once a browser signal exists).
+        assert!(cross_site_rejection(&head(Some("http://evil:1"), None, Some("a:1"))).is_some());
+        assert!(cross_site_rejection(&head(Some("null"), None, Some("a:1"))).is_some());
+        assert!(
+            cross_site_rejection(&head(Some("chrome-extension://x"), None, Some("a:1"))).is_some()
+        );
+        assert!(cross_site_rejection(&head(Some("http://a:1"), None, None)).is_some());
+        assert!(cross_site_rejection(&head(Some("http://"), None, Some(""))).is_some());
+    }
+
+    /// A browser-marked cross-site MUTATION is 403 in EVERY posture, including
+    /// the loopback dev mode (no token), where the auth gate alone would serve it.
+    #[tokio::test]
+    async fn cross_site_mutation_is_refused_even_in_dev_mode() {
+        // Dev posture: loopback bind, no token (mutations otherwise allowed).
+        let state = state_with_auth(AuthPolicy::resolve(None, None, true));
+        let req = RequestHead {
+            origin: Some("http://evil.example".to_owned()),
+            host: Some("127.0.0.1:9070".to_owned()),
+            ..RequestHead::default()
+        };
+        let resp = String::from_utf8(
+            state
+                .respond_async_request("POST", "/api/keys/foo", &req, b"{\"value\":\"v\"}")
+                .await,
+        )
+        .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+        // Sec-Fetch-Site: cross-site is refused too, regardless of Origin.
+        let req = RequestHead {
+            sec_fetch_site: Some("cross-site".to_owned()),
+            ..RequestHead::default()
+        };
+        let resp = String::from_utf8(
+            state
+                .respond_async_request("POST", "/api/command", &req, b"{\"args\":[\"PING\"]}")
+                .await,
+        )
+        .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    }
+
+    /// Same-origin and non-browser mutations PASS the gate: with no node access
+    /// configured they surface as 503 (management unavailable), never 403.
+    #[tokio::test]
+    async fn same_origin_and_non_browser_mutations_pass_the_csrf_gate() {
+        let state = state_with_auth(AuthPolicy::resolve(None, None, true));
+        let cases = [
+            // A same-origin browser request (Origin matches Host).
+            RequestHead {
+                origin: Some("http://127.0.0.1:9070".to_owned()),
+                host: Some("127.0.0.1:9070".to_owned()),
+                ..RequestHead::default()
+            },
+            // A modern browser's own same-origin marking.
+            RequestHead {
+                sec_fetch_site: Some("same-origin".to_owned()),
+                ..RequestHead::default()
+            },
+            // A non-browser client (no provenance headers at all).
+            RequestHead::default(),
+        ];
+        for req in cases {
+            let resp = String::from_utf8(
+                state
+                    .respond_async_request("POST", "/api/keys/foo", &req, b"{\"value\":\"v\"}")
+                    .await,
+            )
+            .unwrap();
+            assert!(
+                resp.starts_with("HTTP/1.1 503"),
+                "must pass the CSRF gate and reach the (unconfigured) management \
+                 dispatch: {resp}"
+            );
+        }
+    }
+
+    /// READS are not origin-gated: no CORS headers are ever emitted, so a
+    /// cross-site reader cannot read a response anyway; blocking would only
+    /// break dashboards behind rewriting proxies.
+    #[tokio::test]
+    async fn cross_site_reads_are_not_blocked() {
+        let state = state_with_auth(AuthPolicy::resolve(None, None, true));
+        publish_empty_topology(&state).await;
+        let req = RequestHead {
+            origin: Some("http://elsewhere.example".to_owned()),
+            host: Some("127.0.0.1:9070".to_owned()),
+            ..RequestHead::default()
+        };
+        let resp = String::from_utf8(
+            state
+                .respond_async_request("GET", "/api/cluster", &req, &[])
+                .await,
+        )
+        .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    }
+
+    /// Repeated INVALID tokens trip the fixed-window limiter: 401 up to the
+    /// budget, then 429 for every token-bearing request (even the correct token,
+    /// bounded by the window), while token-free requests stay unaffected.
+    #[tokio::test]
+    async fn repeated_failed_tokens_trip_the_429_rate_limit() {
+        let state = state_with_auth(AuthPolicy::resolve(Some("read-tok"), None, true));
+        publish_empty_topology(&state).await;
+        for i in 0..MAX_AUTH_FAILURES_PER_WINDOW {
+            let resp = String::from_utf8(
+                state
+                    .respond_async("GET", "/api/nodes", Some("Bearer WRONG"))
+                    .await,
+            )
+            .unwrap();
+            assert!(
+                resp.starts_with("HTTP/1.1 401"),
+                "attempt {i} must be 401: {resp}"
+            );
+        }
+        // The budget is spent: the next wrong token is throttled...
+        let resp = String::from_utf8(
+            state
+                .respond_async("GET", "/api/nodes", Some("Bearer WRONG"))
+                .await,
+        )
+        .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 429"), "{resp}");
+        // ...and while tripped even the RIGHT token answers 429 (the lockout is
+        // bounded by the window; a brute force learns nothing meanwhile).
+        let resp = String::from_utf8(
+            state
+                .respond_async("GET", "/api/nodes", Some("Bearer read-tok"))
+                .await,
+        )
+        .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 429"), "{resp}");
+        // Token-FREE requests are never throttled: the Open tier still serves.
+        let resp =
+            String::from_utf8(state.respond_async("GET", "/api/health", None).await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    }
+
+    /// MISSING tokens never feed the limiter: any number of unauthenticated
+    /// privileged probes stays 401 (the dashboard's first load must not lock the
+    /// login out), and a subsequent wrong token is still 401, not 429.
+    #[tokio::test]
+    async fn missing_tokens_do_not_feed_the_rate_limit() {
+        let state = state_with_auth(AuthPolicy::resolve(Some("read-tok"), None, true));
+        publish_empty_topology(&state).await;
+        for _ in 0..(MAX_AUTH_FAILURES_PER_WINDOW * 2) {
+            let resp =
+                String::from_utf8(state.respond_async("GET", "/api/nodes", None).await).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
+        }
+        let resp = String::from_utf8(
+            state
+                .respond_async("GET", "/api/nodes", Some("Bearer WRONG"))
+                .await,
+        )
+        .unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "the limiter must not have tripped: {resp}"
+        );
+    }
+
+    /// The connection handler parses the browser-provenance headers, so the gate
+    /// holds over a REAL socket: a cross-site POST is 403 end to end.
+    #[tokio::test]
+    async fn cross_site_mutation_is_403_over_tcp() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = state_with_auth(AuthPolicy::resolve(None, None, true));
+        let serving = state.clone();
+        tokio::spawn(async move {
+            accept_loop(listener, serving).await;
+        });
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = "{\"value\":\"v\"}";
+        let req = format!(
+            "POST /api/keys/foo HTTP/1.1\r\nHost: x\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        c.read_to_end(&mut raw).await.unwrap();
+        let resp = String::from_utf8_lossy(&raw);
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
     }
 }

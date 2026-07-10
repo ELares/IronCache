@@ -211,6 +211,21 @@ fn parse_url(url: &str) -> Result<ParsedUrl, HttpError> {
     Ok(ParsedUrl { host, port, target })
 }
 
+/// Validate a SERVER-CONFIGURED outbound base URL at BOOT (#369): the same
+/// parse the client applies per request (`http://` scheme only, a non-empty
+/// host, a well-formed port), surfaced so `config::validate` can fail fast on a
+/// bad scheme/host instead of erroring on the first query. No I/O and no
+/// resolution here; the per-dial screens (redirect refusal, link-local block)
+/// still apply at request time.
+///
+/// # Errors
+///
+/// Returns [`HttpError::InvalidUrl`] exactly when a request-time [`get`] of this
+/// URL would.
+pub fn validate_url(url: &str) -> Result<(), HttpError> {
+    parse_url(url).map(|_| ())
+}
+
 /// Parse the port that may follow an IPv6 `]`: `Some(":9090")`-stripped digits, or
 /// the default `80` when no `:port` follows. `remainder` is included only for the
 /// error message when a non-`:` trailer is present.
