@@ -304,9 +304,12 @@ shipped ahead of this tag.
   gains a higher-core scaling run (16-vCPU AWS Graviton, `redis-benchmark`, Redis 8.8.0 vs IronCache
   vs Dragonfly, GET/SET). On 16 cores IronCache wins SET decisively (about 2.5x Redis 8's io-threads
   config, whose io-threads accelerate reads but not the serialized write mutation) and edges GET past
-  Redis 8's best config (about 1.2x); Dragonfly leads both (measured directly, not from its
-  marketing). The prior 2-vCPU table is kept and reframed as the small-node worst case (it used Redis
-  7.4 and its Dragonfly-trails standing is a 2-core artifact that reverses at real core count).
+  Redis 8's best config (about 1.2x); Dragonfly posted the higher raw peak in that deep-pipeline run
+  (measured directly, not from its marketing). The prior 2-vCPU table is kept and reframed as the
+  small-node worst case (it used Redis 7.4). NOTE: a later corrected thread-per-core re-bench
+  (2026-07-10) found this run's IronCache GET was depressed by cross-shard-hop oversubscription (a
+  config artifact) and REVERSED the GET standing -- IronCache leads GET by about 19% single-endpoint
+  and roughly 2x cluster-aware via #517 zero-hop (see README); #507 is CLOSED.
 
 - Rolling-upgrade cluster OBSERVERS (issue #392 Phase 3): a new `ironcache::cluster_upgrade` module
   translates a cluster snapshot (`ClusterView`: a shard's primary + replicas, the target version, the

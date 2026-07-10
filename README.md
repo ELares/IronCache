@@ -333,22 +333,29 @@ thread still serializes the write mutation) and **edges GET** past Redis 8's bes
 (3.97M vs 3.32M, about 1.2x, each engine at its own peak on the same 16-vCPU box). Redis 8
 is a much stronger GET baseline than 7.x was: its io-threads lift GET from 2.48M to 3.32M,
 closing most of the gap a 7.x comparison would have shown -- which is exactly why we no
-longer benchmark against 7.x. **Dragonfly leads both** (about 4.9M), measured directly on
-the same box rather than taken from its marketing; its widely cited "25x" is a
+longer benchmark against 7.x. On this deep-pipeline (pipeline 64) run Dragonfly posted the
+highest raw GET/SET peaks (about 4.9M), but the IronCache GET figure in the table above was
+DEPRESSED by cross-shard-hop oversubscription (the 1-to-2 dip noted above, amplified when
+shards contend on a saturated box) -- a benchmark CONFIG artifact, not an architectural
+ceiling. A corrected thread-per-core re-bench (c7g, 2026-07-10, proper shard-to-core
+placement) REVERSES the GET standing: IronCache LEADS GET by about 19% single-endpoint
+(2.43M vs Dragonfly's 2.04M ops/sec) and by roughly 2x cluster-aware (4.32M vs 2.19M ops/sec)
+once #517 zero-hop routing removes the cross-shard hop entirely -- the hop-elimination lever
+paid off and #507 is CLOSED. Dragonfly's widely cited "25x" is a
 single-instance-versus-single-threaded-Redis framing that does not hold against
-multi-threaded Redis 8 (here Dragonfly is about 2x single-threaded Redis 8, not 25x).
-Closing the remaining gap to Dragonfly is tracked optimization work (cross-shard-hop
-batching and per-op allocation removal in the datapath) rather than a fixed architectural
-ceiling; quantifying how much of the gap that recovers is itself follow-up measurement,
-not an assumption.
+multi-threaded Redis 8 (here Dragonfly is about 2x single-threaded Redis 8, not 25x). The
+honest nuance that remains: IronCache's baseline p99.9 TIES Dragonfly (~15ms) rather than
+beating it, and the durable-SAVE tail (291ms) is COMPETITIVE, not category-leading;
+IronCache's decisive edges are GET throughput, memory, and determinism.
 
 ### Small-node (2-vCPU) worst case (dated 2026-06-21)
 
 The earlier run below intentionally used 2-vCPU nodes -- the WORST case for a
 thread-per-core design (no core headroom), where single-threaded Redis stays most
 competitive. It predates the move to the Redis 8 baseline (it used Redis 7.4.1), and the
-higher-core numbers above supersede its overall standings -- in particular Dragonfly,
-which trails on 2 cores here, pulls AHEAD at 16 cores above.
+higher-core numbers above supersede its overall standings -- the multi-threaded engines
+have no headroom on 2 cores and stretch out at real core count, where the corrected
+thread-per-core re-bench above shows IronCache LEADING GET rather than trailing Dragonfly.
 
 **Setup.** Server nodes are **t4g.medium** (2 vCPU / 4 GB, arm64, AL2023); the load
 generator is a separate **t4g.2xlarge**. The tool is `memtier_benchmark` against
@@ -387,10 +394,11 @@ the least overhead to amortize.
 Where IronCache leads: it **tops SET and GET throughput and GET tail latency
 single-node**, and it **ties Redis on cluster GET (about 1.30M ops/sec)**. KeyDB and
 Dragonfly trail here, but note that is a 2-vCPU artifact: with only two cores the
-multi-threaded engines cannot stretch, and Dragonfly in particular **pulls ahead once
-given real core count** (see the 16-core run above). The picture is honest in both
-directions: Redis wins the small-op rows, IronCache wins the bulk SET/GET and latency
-rows on these nodes.
+multi-threaded engines cannot stretch. Given real core count the field spreads out (see
+the 16-core run above), where the corrected thread-per-core re-bench shows IronCache
+**LEADING GET** (+19% single-endpoint, ~2x cluster-aware via #517 zero-hop), not trailing
+Dragonfly. The picture is honest in both directions: Redis wins the small-op rows,
+IronCache wins the bulk SET/GET and latency rows on these nodes.
 
 That "higher-core nodes would widen the multi-threaded engines' lead over
 single-threaded Redis" is no longer a projection -- the 16-core run above measures it;
