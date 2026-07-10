@@ -40,9 +40,18 @@ const RDB_TYPE_STRING: u8 = 0;
 /// while the type-0 string encoding is version-independent.
 const DUMP_RDB_VERSION: u16 = 9;
 
-/// The highest RDB footer version RESTORE accepts (matching a modern redis, 7.2-era). A newer version
+/// The highest RDB footer version RESTORE accepts (matching Redis 8.x `RDB_VERSION`). A newer version
 /// is refused as [`ErrorReply::restore_bad_payload`], exactly as redis refuses a too-new payload.
-const SUPPORTED_RDB_VERSION: u16 = 11;
+///
+/// Accepting up through 14 (rather than the older 11) lets a plain-string DUMP produced by a modern
+/// Redis/Valkey (which stamp a higher footer as new AGGREGATE encodings ship) RESTORE cleanly here.
+/// This is SOUND because our decoder only reconstructs the type-0 STRING encoding, which is
+/// version-independent (raw / INT8-16-32 / LZF, unchanged for many releases), and rejects any unknown
+/// TYPE byte or string encoding as [`RestoreParseError::BadData`] REGARDLESS of the footer version.
+/// So a v14 non-string blob is still refused on its type byte, not silently mis-decoded; only the
+/// version-stable string case is newly accepted. Our own DUMP still stamps the conservative
+/// `DUMP_RDB_VERSION` for maximum backward RESTORE-ability elsewhere (dump-low, accept-high).
+const SUPPORTED_RDB_VERSION: u16 = 14;
 
 /// The largest value RESTORE will reconstruct: the Redis 512 MiB bulk-string cap
 /// ([bulk-string-max-512mb], KEYSPACE.md). A declared length above this is a hostile/garbage payload,
@@ -573,6 +582,53 @@ mod tests {
         assert!(matches!(
             deserialize_string(&blob),
             Err(RestoreParseError::BadPayload)
+        ));
+    }
+
+    /// Rewrite a DUMP blob's footer version to `ver` and recompute the CRC so ONLY the version
+    /// distinguishes acceptance from rejection (the CRC always matches).
+    fn with_footer_version(mut blob: Vec<u8>, ver: u16) -> Vec<u8> {
+        let footer = blob.len() - 10;
+        blob[footer..footer + 2].copy_from_slice(&ver.to_le_bytes());
+        let crc = crc64(0, &blob[..blob.len() - 8]);
+        let bl = blob.len();
+        blob[bl - 8..].copy_from_slice(&crc.to_le_bytes());
+        blob
+    }
+
+    #[test]
+    fn restore_accepts_a_modern_redis_string_footer_version() {
+        // A plain-string DUMP produced by Redis 7.4 / 8.x stamps footer version 12/13/14. The string
+        // type-0 encoding is version-independent, so RESTORE must accept it (was rejected when the
+        // cap was 11, silently breaking migration of a string value FROM a modern redis).
+        for ver in [11u16, 12, 13, 14] {
+            let blob = with_footer_version(serialize_string(b"hello-from-modern-redis"), ver);
+            assert_eq!(
+                deserialize_string(&blob).unwrap(),
+                b"hello-from-modern-redis",
+                "a version-{ver} string DUMP must RESTORE"
+            );
+        }
+        // One past the cap is still refused (we never blindly trust an unbounded future version).
+        let too_new = with_footer_version(serialize_string(b"hello"), SUPPORTED_RDB_VERSION + 1);
+        assert!(matches!(
+            deserialize_string(&too_new),
+            Err(RestoreParseError::BadPayload)
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_a_nonstring_type_even_at_a_modern_version() {
+        // Raising the accepted version must NOT let a non-string type through: a type byte we do not
+        // decode is refused as BadData regardless of the (now-accepted) footer version.
+        let mut payload = vec![16u8]; // RDB_TYPE_HASH-ish: any type != RDB_TYPE_STRING
+        payload.extend_from_slice(b"\x00"); // a byte of body
+        payload.extend_from_slice(&14u16.to_le_bytes()); // modern, now-accepted version
+        let crc = crc64(0, &payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            deserialize_string(&payload),
+            Err(RestoreParseError::BadData)
         ));
     }
 
