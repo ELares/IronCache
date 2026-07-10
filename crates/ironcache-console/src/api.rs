@@ -2425,6 +2425,57 @@ mod tests {
         assert!(src.calls.lock().unwrap().is_empty());
     }
 
+    /// SSRF (#369): a request-supplied URL / host / path smuggled through the
+    /// `metric` param can never become an outbound target: anything that is not
+    /// a bare allowlisted name is a 400 BEFORE the source is consulted.
+    #[tokio::test]
+    async fn timeseries_rejects_a_request_supplied_url_or_host() {
+        let src = StubSource::ok(Vec::new());
+        for smuggled in [
+            // A full URL (encoded and raw-ish forms).
+            "metric=http%3A%2F%2F10.9.9.9%3A9090%2Fapi",
+            "metric=http://internal-host/secrets",
+            // A bare host:port target.
+            "metric=10.9.9.9%3A9090",
+            // A path-traversal-shaped name on top of a valid prefix.
+            "metric=ironcache_x%2F..%2Fadmin",
+        ] {
+            let resp = handle_async(
+                &format!("/api/timeseries?{smuggled}"),
+                None,
+                Some(&src),
+                &ctx(),
+            )
+            .await;
+            assert_eq!(resp.status, 400, "{smuggled} must be rejected");
+            assert!(
+                src.calls.lock().unwrap().is_empty(),
+                "{smuggled} must never reach the source"
+            );
+        }
+    }
+
+    /// SSRF (#369): extra `url=` / `query=` / `target=` params are NOT read by
+    /// the handler (only `metric`, `range`, `step` exist), so they cannot steer
+    /// the upstream request; the allowlisted metric is passed through verbatim.
+    #[tokio::test]
+    async fn timeseries_ignores_url_query_and_target_params() {
+        let src = StubSource::ok(sample_series());
+        let resp = handle_async(
+            "/api/timeseries?metric=ironcache_used_memory_bytes&url=http://10.9.9.9/&query=up&target=10.9.9.9:9090",
+            None,
+            Some(&src),
+            &ctx(),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let calls = src.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // Only the allowlisted bare metric reached the source; nothing derived
+        // from the extra params did.
+        assert_eq!(calls[0].0, "ironcache_used_memory_bytes");
+    }
+
     #[tokio::test]
     async fn timeseries_400_on_bad_numeric_param() {
         let src = StubSource::ok(Vec::new());

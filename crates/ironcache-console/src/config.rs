@@ -324,6 +324,37 @@ impl ConsoleConfig {
                 reason: "must be at least 1 (every node read must be bounded)".to_owned(),
             });
         }
+        // SSRF boundary, boot-time half (#369): every OUTBOUND target the console
+        // will ever dial comes from THIS config (never from request input), so
+        // each is validated here and a bad scheme/host fails the boot instead of
+        // the first query. The outbound HTTP URLs must pass the exact parse the
+        // client applies per request (`http://` only, a non-empty host).
+        if let Some(url) = &self.prometheus_url {
+            if let Err(e) = crate::httpclient::validate_url(url) {
+                return Err(ConsoleConfigError::Invalid {
+                    field: "prometheus_url",
+                    reason: e.to_string(),
+                });
+            }
+        }
+        if let Some(url) = &self.node_http_url {
+            if let Err(e) = crate::httpclient::validate_url(url) {
+                return Err(ConsoleConfigError::Invalid {
+                    field: "node_http_url",
+                    reason: e.to_string(),
+                });
+            }
+        }
+        // Each seed must be a well-formed `host:port` (a bracketed IPv6 literal is
+        // fine) so a malformed target is refused before any dial.
+        for seed in &self.seeds {
+            if let Err(reason) = validate_host_port(seed) {
+                return Err(ConsoleConfigError::Invalid {
+                    field: "seeds",
+                    reason: format!("seed '{seed}': {reason}"),
+                });
+            }
+        }
         // TLS must AUTHENTICATE the peer by default: with TLS on and no CA, refuse
         // to boot unless the operator EXPLICITLY opted into accept-any-cert. This
         // closes the silent accept-any path (a MITM could otherwise impersonate a
@@ -429,6 +460,34 @@ impl ConsoleConfig {
             token_state(&self.admin_token),
         )
     }
+}
+
+/// Validate that a configured dial target is a well-formed `host:port` (#369):
+/// a non-empty host (a bracketed IPv6 literal is accepted) and a parseable u16
+/// port. Boot-time only; the dial itself still carries its own timeouts. Returns
+/// the human-readable reason on failure.
+fn validate_host_port(addr: &str) -> Result<(), String> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err("must be a non-empty host:port".to_owned());
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err(format!("expected host:port, got '{addr}'"));
+    };
+    // A bracketed IPv6 literal keeps its inner colons: `[::1]:6379` splits to
+    // host `[::1]`. An UNbracketed IPv6 (`::1:6379`) is ambiguous and refused.
+    if host.is_empty() {
+        return Err(format!("missing host in '{addr}'"));
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err(format!(
+            "an IPv6 host must be bracketed ([addr]:port), got '{addr}'"
+        ));
+    }
+    if port.parse::<u16>().is_err() {
+        return Err(format!("invalid port '{port}' in '{addr}'"));
+    }
+    Ok(())
 }
 
 /// Split a comma-separated seed list, trimming whitespace and dropping empties.
@@ -585,6 +644,59 @@ mod tests {
             vec!["a:1", "b:2", "c:3"]
         );
         assert!(parse_seed_list("").is_empty());
+    }
+
+    /// Boot-time SSRF boundary (#369): the outbound URLs must be well-formed
+    /// `http://` URLs and every seed a well-formed `host:port`, so a bad target
+    /// fails the boot rather than the first query/dial.
+    #[test]
+    fn validate_rejects_bad_outbound_urls_and_seed_shapes() {
+        // https is deferred (the client refuses it); the boot must too.
+        let cfg = ConsoleConfig {
+            prometheus_url: Some("https://prom:9090".to_owned()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConsoleConfigError::Invalid {
+                field: "prometheus_url",
+                ..
+            })
+        ));
+        // A scheme-less / non-http URL is refused.
+        let cfg = ConsoleConfig {
+            node_http_url: Some("prom:9090".to_owned()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConsoleConfigError::Invalid {
+                field: "node_http_url",
+                ..
+            })
+        ));
+        // Seeds: a missing port, a non-numeric port, and an unbracketed IPv6 are
+        // refused; well-formed shapes pass.
+        for bad in ["localhost", "host:notaport", "::1:6379", ":6379"] {
+            let cfg = ConsoleConfig {
+                seeds: vec![bad.to_owned()],
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    cfg.validate(),
+                    Err(ConsoleConfigError::Invalid { field: "seeds", .. })
+                ),
+                "seed '{bad}' must be refused"
+            );
+        }
+        let cfg = ConsoleConfig {
+            seeds: vec!["10.0.0.1:6379".to_owned(), "[::1]:6379".to_owned()],
+            prometheus_url: Some("http://prom:9090".to_owned()),
+            node_http_url: Some("http://10.0.0.1:9100".to_owned()),
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
     }
 
     #[test]

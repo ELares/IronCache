@@ -222,6 +222,55 @@ mod tests {
     }
 
     #[test]
+    fn ui_loads_no_external_resources() {
+        // Supply chain (#369): the UI is fully EMBEDDED. Nothing the browser
+        // renders may LOAD from the network: no external script/style/font/image
+        // reference in the markup, no absolute-URL fetch in the script, no
+        // external url() in the stylesheets. (The one absolute URL in app.js is
+        // the SVG NAMESPACE identifier passed to createElementNS, which is never
+        // fetched.)
+        for needle in [
+            "src=\"http",
+            "src='http",
+            "href=\"http",
+            "href='http",
+            "src=\"//",
+            "href=\"//",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(needle),
+                "index.html must not load an external resource via `{needle}`"
+            );
+        }
+        for css in [APP_CSS, FONTS_CSS] {
+            for needle in [
+                "url(http",
+                "url('http",
+                "url(\"http",
+                "url(//",
+                "@import url('http",
+            ] {
+                assert!(
+                    !css.contains(needle),
+                    "stylesheets must not reference an external url via `{needle}`"
+                );
+            }
+        }
+        for needle in [
+            "fetch(\"http",
+            "fetch('http",
+            "fetch(`http",
+            "new WebSocket",
+            "importScripts",
+        ] {
+            assert!(
+                !APP_JS.contains(needle),
+                "app.js must not reach an external host via `{needle}`"
+            );
+        }
+    }
+
+    #[test]
     fn index_has_no_inline_handlers() {
         // CSP forbids inline event handlers: index.html must wire NOTHING via
         // onclick/onsubmit/etc.; app.js attaches the handlers via addEventListener.

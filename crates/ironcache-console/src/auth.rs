@@ -344,6 +344,91 @@ fn token_matches(configured: &str, presented: &str) -> bool {
     constant_time_eq(configured.as_bytes(), presented.as_bytes())
 }
 
+/// A tiny FIXED-WINDOW rate limiter for FAILED authentication attempts (#369),
+/// the brute-force brake on the Bearer gate: every presented-but-invalid token is
+/// recorded, and once the window holds `max_failures` of them, token-bearing
+/// requests are answered `429` until the window rolls.
+///
+/// Deliberately small and global (one shared window, not per-peer): the console
+/// is an operator tool with a handful of legitimate clients, so a single counter
+/// throttles a brute force without any per-connection state plumbing. The
+/// tradeoff is documented: while tripped, even a CORRECT token answers `429`,
+/// bounded by the window length. Requests that present NO token (the Open tier,
+/// the dev posture) are never throttled, so the limiter cannot deny the probes
+/// or the unauthenticated dashboard shell.
+///
+/// Time is passed IN as unix seconds (the caller reads the env clock seam,
+/// ADR-0003): no clock is read here. `std::sync::Mutex` guards the two-word
+/// window state; the critical section is a few loads/stores, safe in async code.
+pub struct FailedAuthLimiter {
+    /// The fixed window length, seconds (floored to 1).
+    window_secs: u64,
+    /// Failures allowed per window before the limiter trips (floored to 1).
+    max_failures: u32,
+    /// The current window: its start stamp and the failures recorded in it.
+    state: std::sync::Mutex<FailureWindow>,
+}
+
+/// The mutable window state of a [`FailedAuthLimiter`].
+#[derive(Clone, Copy)]
+struct FailureWindow {
+    /// Unix-seconds stamp of the window start (0 = no window yet).
+    start_unix: u64,
+    /// Failures recorded in the current window.
+    failures: u32,
+}
+
+impl FailedAuthLimiter {
+    /// Construct with the window length (seconds) and the per-window failure
+    /// budget. Zero inputs are floored to 1 so the limiter can never divide the
+    /// window away or trip on the first attempt with a zero budget.
+    #[must_use]
+    pub fn new(window_secs: u64, max_failures: u32) -> Self {
+        FailedAuthLimiter {
+            window_secs: window_secs.max(1),
+            max_failures: max_failures.max(1),
+            state: std::sync::Mutex::new(FailureWindow {
+                start_unix: 0,
+                failures: 0,
+            }),
+        }
+    }
+
+    /// Whether token-bearing requests are currently throttled: the current
+    /// window already holds the full failure budget. Rolls the window first, so
+    /// a stale window never throttles.
+    #[must_use]
+    pub fn is_limited(&self, now_unix: u64) -> bool {
+        let mut w = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::roll(&mut w, now_unix, self.window_secs);
+        w.failures >= self.max_failures
+    }
+
+    /// Record one FAILED authentication attempt (a presented token that matched
+    /// no configured token) at `now_unix`.
+    pub fn record_failure(&self, now_unix: u64) {
+        let mut w = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::roll(&mut w, now_unix, self.window_secs);
+        w.failures = w.failures.saturating_add(1);
+    }
+
+    /// Roll to a fresh window when `now_unix` is past the current one. A clock
+    /// that moved BACKWARDS also resets (never wedge the limiter on a stale
+    /// future stamp).
+    fn roll(w: &mut FailureWindow, now_unix: u64, window_secs: u64) {
+        if now_unix < w.start_unix || now_unix - w.start_unix >= window_secs {
+            w.start_unix = now_unix;
+            w.failures = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,6 +687,36 @@ mod tests {
             authorize(&p, Tier::PrivilegedRead, Some("Bearer read-tok")),
             Decision::Unauthorized(_)
         ));
+    }
+
+    #[test]
+    fn failed_auth_limiter_trips_at_the_budget_and_resets_on_roll() {
+        let l = FailedAuthLimiter::new(60, 3);
+        // Fresh: not limited.
+        assert!(!l.is_limited(100));
+        l.record_failure(100);
+        l.record_failure(110);
+        assert!(!l.is_limited(110), "under budget must not throttle");
+        l.record_failure(120);
+        assert!(l.is_limited(120), "at budget must throttle");
+        // Still inside the window started at 100: throttled.
+        assert!(l.is_limited(159));
+        // The next fixed window clears the count.
+        assert!(!l.is_limited(160), "a rolled window must not throttle");
+        // A clock that moved BACKWARDS resets rather than wedging.
+        l.record_failure(50);
+        assert!(!l.is_limited(50));
+    }
+
+    #[test]
+    fn failed_auth_limiter_floors_zero_inputs() {
+        // A zero window / zero budget must not panic or trip instantly on zero.
+        let l = FailedAuthLimiter::new(0, 0);
+        assert!(!l.is_limited(10));
+        l.record_failure(10);
+        assert!(l.is_limited(10), "budget 1: one failure trips it");
+        // The 1s window rolls a second later.
+        assert!(!l.is_limited(11));
     }
 
     #[test]
