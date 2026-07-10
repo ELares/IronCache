@@ -10,6 +10,18 @@ breaking changes until `1.0.0`).
 
 ### Added
 
+- Per-subcommand ACL for SLOWLOG (issue #367, extending the Redis 7 `+cmd|sub` surface that already
+  covers CLUSTER / CONFIG / CLIENT): `+slowlog|get` / `+slowlog|len` grant ONLY the read half while
+  `SLOWLOG RESET` (the log wipe) stays denied, matching Redis's `COMMAND INFO slowlog|<sub>` flags
+  (GET / LEN / RESET are `@admin @slow @dangerous`, HELP is `@slow`). This closes the last gap in
+  the least-privilege monitoring credential: a read-only user can now be granted the FULL
+  introspection surface the bundled console's poll loop issues (PING / INFO / SLOWLOG GET / CLIENT
+  LIST) without holding a single mutating verb. Live `ACL SETUSER`, the aclfile save/load
+  round-trip, and `ACL GETUSER` / `ACL LIST` rendering all cover the new rules. DEPLOY.md now
+  documents the generic per-subcommand monitor shape, and the reference console aclfile grants
+  `console_monitor` `+slowlog|get` (the slowlog panel works read-only) and narrows `console_admin`
+  from the whole `+slowlog` to `+slowlog|get`.
+
 - systemd socket-activation deployment finish-out (issue #389 Phase 2a, closing the sub-issue): a
   DEPLOY.md "systemd socket activation" section documenting how to install/enable `ironcache.socket`
   + `ironcache.service` and WHY a restart under it QUEUES clients in the kernel backlog instead of

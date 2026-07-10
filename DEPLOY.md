@@ -299,19 +299,41 @@ rest (SHA-256); the plaintext never persists past config load. In Helm,
 `auth.enabled=true` + `auth.password=...` (or `auth.existingSecret`). Richer ACL
 users are loaded from an `aclfile` (`IRONCACHE_ACLFILE`) if you provide one.
 
-### Least-privilege console users (aclfile)
+### Least-privilege monitoring users (per-subcommand ACL)
 
-The IronCache console (issue #352) should NOT dial nodes with a full-access
-credential. `deploy/aclfile.console.example` is a ready-to-adapt aclfile defining
-two scoped users the console authenticates as
+A long-running monitoring service (the bundled console, a metrics poller, a
+dashboard) should NOT hold a full-access credential: a single leaked monitoring
+password must not be able to mutate or destroy anything. IronCache supports the
+Redis 7 per-subcommand ACL rule `+command|subcommand` for exactly this:
+`+slowlog|get` grants ONLY `SLOWLOG GET` (never `SLOWLOG RESET`), `+client|list`
+grants ONLY `CLIENT LIST` (never `CLIENT KILL`), `+config|get` only `CONFIG GET`
+(never `CONFIG SET`), and `+cluster|info` / `+cluster|slots` / `+cluster|shards`
+/ `+cluster|nodes` / `+cluster|myid` grant the topology reads without the
+`MEET` / `SETSLOT` / `FORGET` mutators a bare `+cluster` would include. The
+rules compose Redis-style: `+cmd|sub` is additive on top of other rules, a later
+`-cmd` removes the whole command including prior subcommand grants, a bare
+`+cmd` grants every subcommand, and a `|sub` rule is rejected for a command that
+has no subcommands. The containers with a per-subcommand surface today are
+CLUSTER, CONFIG, CLIENT, and SLOWLOG. The generic read-only monitor shape is:
+
+```
+user monitor on >CHANGE_ME resetkeys resetchannels -@all +ping +info +slowlog|get +client|list
+```
+
+(no key access, no writes, no CONFIG, no KEYS/SCAN, no flush, no bare
+`+client`/`+cluster`). Management actions belong on a SEPARATE scoped credential
+supplied only at action time, never held by the long-running poller.
+
+`deploy/aclfile.console.example` is a ready-to-adapt aclfile applying this model
+to the bundled console, defining the two scoped users it authenticates as
 (`IRONCACHE_CONSOLE_NODE_USER` + `IRONCACHE_CONSOLE_NODE_PASSWORD_FILE`):
-`console_monitor` (read-only: PING/INFO/CLIENT LIST, no key access, no mutation)
-for the polling replicas, and `console_admin` (the management surface: CONFIG
-GET/SET, the CLUSTER mutators, INFO, SAVE, key CRUD) that is still denied the
-destructive verbs (FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE, the
-destructive CLUSTER slot ops, ...) and, by default, ACL (so a scoped admin cannot
-rewrite the node's users to escalate itself; node-ACL management stays on a
-separate credential). Replace the
+`console_monitor` (read-only: PING/INFO/SLOWLOG GET/CLIENT LIST, no key access,
+no mutation) for the polling replicas, and `console_admin` (the management
+surface: CONFIG GET/SET, the CLUSTER mutators, INFO, SAVE, key CRUD) that is
+still denied the destructive verbs (FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB,
+DEBUG, MIGRATE, SLOWLOG RESET, the destructive CLUSTER slot ops, ...) and, by
+default, ACL (so a scoped admin cannot rewrite the node's users to escalate
+itself; node-ACL management stays on a separate credential). Replace the
 `CHANGE_ME_*` passwords, decide how the `default` user is secured, and load it via
 `IRONCACHE_ACLFILE`. The exact enforcement is pinned by the
 `reference_console_aclfile_loads_and_enforces_least_privilege` test.

@@ -433,6 +433,30 @@ mod tests {
     }
 
     #[test]
+    fn slowlog_subcommand_rules_grant_get_only_and_minus_wipes() {
+        // The least-privilege monitoring shape: `+slowlog|get` grants ONLY SLOWLOG GET; the log
+        // wipe (RESET) and even LEN stay denied, and the bare container is not granted.
+        let u = build_user("mon", &[b"on", b"+ping", b"+slowlog|get"]).expect("valid rules");
+        assert!(u.can_run_command(b"PING"));
+        assert!(u.can_run_command_sub(b"SLOWLOG", Some(b"GET")));
+        assert!(!u.can_run_command_sub(b"SLOWLOG", Some(b"RESET")));
+        assert!(!u.can_run_command_sub(b"SLOWLOG", Some(b"LEN")));
+        assert!(!u.can_run_command(b"SLOWLOG"));
+        // An unknown SLOWLOG subcommand is the Redis-style ACL error.
+        assert!(build_user("mon", &[b"+slowlog|bogus"]).is_err());
+        // A LATER `-slowlog` wipes the subcommand grant too (last-match-wins, Redis parity:
+        // `-cmd` removes the whole command INCLUDING prior `+cmd|sub` grants)...
+        let mut u2 = build_user("mon", &[b"on", b"+slowlog|get"]).expect("ok");
+        apply_rules_to(&mut u2, &[b"-slowlog"]).expect("ok");
+        assert!(!u2.can_run_command_sub(b"SLOWLOG", Some(b"GET")));
+        // ...and a bare `+slowlog` grants EVERY subcommand (a whole-command grant is not
+        // narrowed by the subcommand table).
+        apply_rules_to(&mut u2, &[b"+slowlog"]).expect("ok");
+        assert!(u2.can_run_command_sub(b"SLOWLOG", Some(b"GET")));
+        assert!(u2.can_run_command_sub(b"SLOWLOG", Some(b"RESET")));
+    }
+
+    #[test]
     fn subcommand_rule_round_trips_through_describe_and_reparse() {
         // describe() emits `+cluster|slots`; re-parsing that line reproduces the same enforcement.
         let u = build_user("svc", &[b"on", b"~*", b"+cluster|slots"]).expect("ok");

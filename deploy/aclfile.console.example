@@ -32,17 +32,22 @@
 user default off
 
 # console_monitor: the read-only poll loop. The console's monitor path issues
-# PING, INFO, and (best-effort) SLOWLOG GET + CLIENT LIST; cluster topology is
-# fetched over HTTP, never RESP, so no CLUSTER grant is needed. +ping and +info
-# are MANDATORY: PING/INFO are not pre-auth-exempt, and a poll that gets NOPERM
-# on them marks the node unreachable. +client|list is the read-only CLIENT verb
-# for the clients panel. There is deliberately NO `~` key grant, so this user can
-# never read a key's value. SLOWLOG is intentionally omitted: it has no
-# per-subcommand ACL grant (granting it would mean the whole command, including
-# SLOWLOG RESET, which is a mutation), and its argv can name keys; the console's
-# slowlog panel is best-effort and simply stays empty for the monitor. The poll
-# loop works on +ping +info alone and tolerates NOPERM on the rest.
-user console_monitor on >CHANGE_ME_monitor resetkeys resetchannels -@all +ping +info +client|list
+# EXACTLY these RESP commands (src/node.rs): PING, INFO, SLOWLOG GET, CLIENT
+# LIST; cluster topology is fetched over HTTP, never RESP, so no CLUSTER grant
+# is needed (were a poller to read topology over RESP instead, the same pattern
+# applies: grant the read verbs per subcommand, e.g. +cluster|info
+# +cluster|slots +cluster|shards +cluster|nodes +cluster|myid, never bare
+# +cluster, which would include MEET / SETSLOT / FORGET). +ping and +info are
+# MANDATORY: PING/INFO are not pre-auth-exempt, and a poll that gets NOPERM on
+# them marks the node unreachable. +slowlog|get and +client|list are the
+# per-subcommand read verbs for the slowlog + clients panels: the grants cover
+# ONLY those subcommands, so SLOWLOG RESET (the log wipe) and CLIENT KILL stay
+# NOPERM even if this credential leaks. There is deliberately NO `~` key grant,
+# so this user can never read a key's VALUE. Caveat (informed opt-in): SLOWLOG
+# GET's argv can carry key NAMES; drop +slowlog|get if even key-name recon is
+# unacceptable -- the poll loop works on +ping +info alone and tolerates NOPERM
+# on the rest (the panel just stays empty).
+user console_monitor on >CHANGE_ME_monitor resetkeys resetchannels -@all +ping +info +slowlog|get +client|list
 
 # console_admin: scoped management. `+@all -@dangerous` grants every ordinary
 # (incl. all data) command, then removes the whole @dangerous class; the
@@ -59,11 +64,13 @@ user console_monitor on >CHANGE_ME_monitor resetkeys resetchannels -@all +ping +
 #                               SHARDS / NODES / MYID) are @slow-not-@dangerous,
 #                               so they remain allowed via `+@all -@dangerous`.
 #   +client|list               (observe clients; NOT CLIENT KILL)
-#   +slowlog                   (whole: SLOWLOG has no per-subcommand grant; GET
-#                               for the panel + RESET, neither data-destructive)
+#   +slowlog|get               (the panel read; NOT bare +slowlog, which would
+#                               also re-grant SLOWLOG RESET -- the console only
+#                               ever issues SLOWLOG GET)
 #   +info +save +bgsave
 # What stays DENIED: FLUSHALL, FLUSHDB, SHUTDOWN, KEYS, SWAPDB, DEBUG, MIGRATE,
-# RESTORE, MOVE, SORT, HOTKEYS, PFDEBUG, and the destructive CLUSTER slot verbs.
+# RESTORE, MOVE, SORT, HOTKEYS, PFDEBUG, SLOWLOG RESET, and the destructive
+# CLUSTER slot verbs.
 #
 # ACL is DELIBERATELY NOT granted. ACL has no per-subcommand grant, so a bare
 # `+acl` would hand console_admin ACL SETUSER, i.e. the power to rewrite ANY
@@ -81,4 +88,4 @@ user console_monitor on >CHANGE_ME_monitor resetkeys resetchannels -@all +ping +
 # which, with `+save`/`+bgsave`, is a file-write primitive; and `~*` grants
 # read AND write to EVERY key. Both are inherent to the console's config + key
 # panels; narrow them only if your console does not use those panels.
-user console_admin on >CHANGE_ME_admin ~* &* +@all -@dangerous +config|get +config|set +cluster|meet +cluster|forget +cluster|failover +cluster|rebalance +cluster|setslot +info +save +bgsave +client|list +slowlog
+user console_admin on >CHANGE_ME_admin ~* &* +@all -@dangerous +config|get +config|set +cluster|meet +cluster|forget +cluster|failover +cluster|rebalance +cluster|setslot +info +save +bgsave +client|list +slowlog|get

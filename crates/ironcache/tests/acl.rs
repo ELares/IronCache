@@ -1296,6 +1296,156 @@ fn config_client_subcommand_aclfile_round_trip() {
     });
 }
 
+/// (22) PER-SUBCOMMAND ACL for SLOWLOG (#367, the least-privilege monitoring shape): a user
+/// granted `-@all +ping +slowlog|get +client|list` LIVE via `ACL SETUSER` can run SLOWLOG GET and
+/// CLIENT LIST (the introspection reads a metrics poller needs) but is `-NOPERM` on SLOWLOG RESET
+/// (the log wipe), SLOWLOG LEN (not granted), and CLIENT KILL -- each NOPERM naming the
+/// `cmd|<sub>` pair. `ACL GETUSER` / `ACL LIST` render the subcommand rule Redis-compatibly
+/// (the `+slowlog|get` token appears verbatim, so tooling round-trips it).
+#[test]
+fn slowlog_subcommand_acl_allows_get_denies_reset() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let port = free_port();
+        let server = run_server_for_test(port, 1);
+        let mut c = connect_retry(port).await;
+
+        // mon: the read-only monitoring user, granted live (no reboot, no aclfile).
+        assert_eq!(
+            cmd(
+                &mut c,
+                &[
+                    "ACL",
+                    "SETUSER",
+                    "mon",
+                    "on",
+                    "nopass",
+                    "resetkeys",
+                    "resetchannels",
+                    "-@all",
+                    "+ping",
+                    "+slowlog|get",
+                    "+client|list",
+                ]
+            )
+            .await,
+            "+OK\r\n"
+        );
+
+        // GETUSER + LIST render the subcommand rule (Redis pipe form, lowercased).
+        let getuser = cmd(&mut c, &["ACL", "GETUSER", "mon"]).await;
+        assert!(
+            getuser.contains("+slowlog|get"),
+            "GETUSER must render the subcommand rule, got {getuser:?}"
+        );
+        let list = cmd(&mut c, &["ACL", "LIST"]).await;
+        assert!(
+            list.contains("+slowlog|get") && list.contains("+client|list"),
+            "ACL LIST must render the subcommand rules, got {list:?}"
+        );
+
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "mon", "x"]).await, "+OK\r\n");
+
+        // The granted reads pass the ACL (never NOPERM). Case-insensitive on both halves.
+        for read in [
+            vec!["SLOWLOG", "GET"],
+            vec!["SLOWLOG", "GET", "8"],
+            vec!["slowlog", "get"],
+            vec!["CLIENT", "LIST"],
+        ] {
+            let reply = cmd(&mut a, &read).await;
+            assert!(
+                !reply.starts_with("-NOPERM"),
+                "{read:?} must be allowed by ACL (not NOPERM), got {reply:?}"
+            );
+        }
+
+        // The destructive / ungranted siblings are NOPERM, naming the `cmd|sub` pair.
+        for (denied, token) in [
+            (vec!["SLOWLOG", "RESET"], "slowlog|reset"),
+            (vec!["SLOWLOG", "LEN"], "slowlog|len"),
+            (vec!["CLIENT", "KILL", "ID", "1"], "client|kill"),
+        ] {
+            let reply = cmd(&mut a, &denied).await;
+            assert!(
+                reply.starts_with("-NOPERM") && reply.contains(token),
+                "{denied:?} must be NOPERM naming {token:?}, got {reply:?}"
+            );
+        }
+
+        drop(a);
+        drop(c);
+        server.shutdown_and_join().unwrap();
+    });
+}
+
+/// (23) ACLFILE round trip with a `+slowlog|get` rule: boot with an aclfile granting the
+/// subcommand, prove it is enforced (SLOWLOG GET allowed, SLOWLOG RESET NOPERM), `ACL SAVE`,
+/// REBOOT on the same file, and prove the rule survived with identical enforcement.
+#[test]
+fn slowlog_subcommand_aclfile_round_trip() {
+    let (r, local) = rt();
+    local.block_on(&r, async {
+        let dir = std::env::temp_dir().join(format!("ironcache-aclslow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aclfile = dir.join("users.acl");
+        std::fs::write(
+            &aclfile,
+            "user default on nopass ~* &* +@all\n\
+             user mon on nopass resetchannels -@all +ping +slowlog|get\n",
+        )
+        .unwrap();
+
+        let port = free_port();
+        let server = run_server_with_aclfile_for_test(port, 1, aclfile.clone());
+        let mut c = connect_retry(port).await;
+        let mut a = connect_retry(port).await;
+        assert_eq!(cmd(&mut a, &["AUTH", "mon", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut a, &["SLOWLOG", "GET"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        let denied = cmd(&mut a, &["SLOWLOG", "RESET"]).await;
+        assert!(
+            denied.starts_with("-NOPERM") && denied.contains("slowlog|reset"),
+            "loaded mon must be NOPERM on SLOWLOG RESET, got {denied:?}"
+        );
+        drop(a);
+
+        // SAVE, reboot on the same file.
+        assert_eq!(cmd(&mut c, &["ACL", "SAVE"]).await, "+OK\r\n");
+        drop(c);
+        server.shutdown_and_join().unwrap();
+
+        let saved = std::fs::read_to_string(&aclfile).unwrap();
+        assert!(
+            saved.contains("+slowlog|get"),
+            "SAVE must persist the subcommand rule, got {saved:?}"
+        );
+
+        let port2 = free_port();
+        let server2 = run_server_with_aclfile_for_test(port2, 1, aclfile.clone());
+        let mut a2 = connect_retry(port2).await;
+        assert_eq!(cmd(&mut a2, &["AUTH", "mon", "x"]).await, "+OK\r\n");
+        assert!(
+            !cmd(&mut a2, &["SLOWLOG", "GET"])
+                .await
+                .starts_with("-NOPERM")
+        );
+        let denied2 = cmd(&mut a2, &["SLOWLOG", "RESET"]).await;
+        assert!(
+            denied2.starts_with("-NOPERM") && denied2.contains("slowlog|reset"),
+            "reloaded mon must still be NOPERM on SLOWLOG RESET, got {denied2:?}"
+        );
+
+        drop(a2);
+        server2.shutdown_and_join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 /// (21) MSETEX gates EVERY key through the key-pattern check, not just the first (#412; the
 /// Redis 8.6 MSETEX ACL-bypass fix). A user `+msetex ~k:*` can MSETEX when ALL the strided
 /// keys (args[2], args[4], ...) match `~k:*`, but is `-NOPERM ... access a key` when ANY key
