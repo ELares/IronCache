@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronCache single-node configuration template.
+#
+# Every key below is a REAL top-level TOML key accepted by the config loader
+# (crates/ironcache-config, the `ConfigOverlay` fields). Unknown keys are rejected at
+# boot, so a typo fails fast rather than being silently ignored. Config is layered,
+# highest precedence first:
+#
+#   runtime CONFIG SET  >  CLI flags  >  IRONCACHE_* env vars  >  this TOML  >  defaults
+#
+# Point the server at this file with:  ironcache server --config /etc/ironcache/ironcache.toml
+# Validate it without starting the server:  ironcache check --config /etc/ironcache/ironcache.toml
+# The full key list (with env-var names) is in DEPLOY.md.
+
+# --- Network -----------------------------------------------------------------------
+# Address the RESP client listener binds to. Use "0.0.0.0" inside a container so the
+# port is reachable from outside; keep "127.0.0.1" for a local-only server.
+bind = "127.0.0.1"
+
+# TCP port for the RESP client listener (the Redis-compatible port).
+port = 6379
+
+# Maximum simultaneous client connections. 0 disables the cap.
+maxclients = 10000
+
+# --- Sharding ----------------------------------------------------------------------
+# Number of shards (per-core runtimes); one shard is owned by one pinned core. Omit
+# this key to default to the machine's available parallelism; set it to cap the count.
+shards = 4
+
+# --- Memory and eviction -----------------------------------------------------------
+# Memory ceiling as a human size string ("512mb", "1gb", ...). "0" means unlimited.
+maxmemory = "512mb"
+
+# Eviction policy applied when maxmemory is reached. One of:
+#   noeviction, allkeys-lru, allkeys-lfu, allkeys-random,
+#   volatile-lru, volatile-lfu, volatile-random, volatile-ttl
+# The default is allkeys-lru (cache mode), NOT Redis's noeviction default.
+maxmemory_policy = "allkeys-lru"
+
+# --- Persistence -------------------------------------------------------------------
+# Durable state directory. Setting data_dir is the single switch that enables the
+# on-disk snapshot (dump-shard-<n>.icss + the manifest); leave it unset for a pure
+# in-memory cache. In a container, mount a volume here.
+data_dir = "/var/lib/ironcache"
+
+# Periodic background-save cadence: save if at least `save_min_changes` writes happened
+# in the last `save_interval_secs` seconds. Set save_interval_secs = 0 to disable
+# periodic saves (a final save on graceful shutdown still runs when data_dir is set).
+save_interval_secs = 900
+save_min_changes = 1
+
+# --- Keyspace notifications --------------------------------------------------------
+# Redis `notify-keyspace-events` flags (e.g. "KEA" for all key + event classes).
+# Empty disables notifications and the write hot path pays nothing. Off by default.
+notify_keyspace_events = ""
+
+# --- Authentication ----------------------------------------------------------------
+# Client AUTH password. The plaintext here is hashed (SHA-256) once at config load; the
+# running process holds only the digest. Leave commented for no authentication.
+# requirepass = "change-me"
+
+# Path to an ACL user file loaded at boot (per-user command / key / channel rules).
+# aclfile = "/etc/ironcache/aclfile.conf"
+
+# --- TLS on the client port (commented out; plaintext by default) ------------------
+# Set tls = "on" to make the client port TLS-only (every connection is rustls-
+# terminated before the RESP loop). Requires both a certificate chain and its key.
+# tls = "on"
+# tls_cert_path = "/etc/ironcache/tls/server.crt"
+# tls_key_path  = "/etc/ironcache/tls/server.key"
+
+# --- Metrics / health endpoint -----------------------------------------------------
+# NOTE: the metrics + health endpoint (/metrics, /livez, /readyz) is NOT a TOML key.
+# It is configured with the `--metrics-addr` CLI flag. It defaults to 127.0.0.1:9091
+# (on, localhost-only); pass `--metrics-addr 0.0.0.0:9121` to expose it, or
+# `--metrics-addr off` to disable it. Example:
+#   ironcache server --config /etc/ironcache/ironcache.toml --metrics-addr 0.0.0.0:9121

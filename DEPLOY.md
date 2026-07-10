@@ -91,6 +91,9 @@ pass `--metrics-addr off`.
 | `tls_cert_path` | `IRONCACHE_TLS_CERT_PATH` | client TLS cert (PEM chain) |
 | `tls_key_path` | `IRONCACHE_TLS_KEY_PATH` | client TLS private key |
 
+A documented single-node template with one comment per field is at
+[`deploy/ironcache.example.toml`](deploy/ironcache.example.toml); copy it and edit the values.
+
 Self-check any config without starting the server:
 
 ```sh
