@@ -33,6 +33,15 @@ storage are AUTH.md (#104); the transport is TLS (#105, separate spec).
   single identity can hold distinct command/key bundles (the Redis selector form).
   This is an IronCache ACL-parity design target, not asserted from a pinned claim;
   it is the superset form the M1 default user degenerates out of.
+- Per-subcommand grants: a command may be granted or revoked at subcommand
+  granularity with the Redis 7 `+cmd|sub` / `-cmd|sub` form. The least-privilege
+  monitor user relies on `+slowlog|get`, which grants read-only `SLOWLOG GET`
+  WITHOUT `SLOWLOG RESET` (so the monitor can read the slow log but cannot wipe it,
+  keeping the audit trail intact). Per-subcommand carve-outs ARE supported here; the
+  CLUSTER_CONTRACT.md "no per-subcommand carve-out" note is narrowly about the
+  CLUSTER command when clustering is disabled and does not imply the feature is
+  globally unsupported. This is an IronCache ACL-parity design target, not asserted
+  from a pinned claim.
 
 ### Command surface
 

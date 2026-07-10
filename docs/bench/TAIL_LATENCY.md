@@ -31,11 +31,13 @@ The p99.9 UNDER A CONCURRENT SNAPSHOT is the metric to win.
 
 ## Why the p99.9 under durable load (and not median GET)
 
-On a plain uncontended GET, IronCache roughly TIES a tuned Redis/Valkey and can
-trail a thread-per-core Dragonfly by a constant factor (see
-`docs/research/dragonfly.md`; the gap is per-command constant-factor work, not
-Big-O). Competing on median GET is competing on the axis where the incumbents are
-already good.
+On a plain uncontended GET, IronCache roughly TIES a tuned Redis/Valkey and, under a
+proper thread-per-core config, now LEADS a thread-per-core Dragonfly (the corrected c7g
+re-bench, 2026-07-10: about +19% single-endpoint and roughly 2x cluster-aware via #517
+zero-hop; the earlier apparent GET deficit was a benchmark CONFIG artifact, shards
+oversubscribed relative to cores -- see README.md and `docs/research/dragonfly.md`). Even
+so, median GET is the axis where the incumbents are already strong, so it is not the most
+architecturally differentiating one to lead on.
 
 The axis where the ARCHITECTURE diverges is the **tail under real production
 pressure**: a hot-key-skewed mixed workload, memory pressure forcing continuous
