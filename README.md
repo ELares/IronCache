@@ -219,9 +219,38 @@ silently wrong: a single-node MULTI/EXEC (and a cross-shard multi-key move) requ
 the keys to share a shard, mirroring the cluster contract that a transaction's keys
 must share a slot (co-locate them with a `{hash tag}`).
 
+- **Connecting a client**: copy-paste connect + SET/GET/PING snippets for redis-py, go-redis,
+  and ioredis are in [docs/CLIENT_LIBRARIES.md](docs/CLIENT_LIBRARIES.md).
+- **Command coverage**: the supported commands by category are in
+  [docs/COMMAND_COVERAGE.md](docs/COMMAND_COVERAGE.md) (the command registry is the source of
+  truth; a live server reports its set via `COMMAND LIST` / `COMMAND COUNT`).
+
 ---
 
 ## Quick start
+
+### Run it in one command (Docker)
+
+The fastest way to a running, Redis-compatible server. This maps the client port and starts
+the server in the foreground:
+
+```sh
+docker run --rm -p 6379:6379 ghcr.io/elares/ironcache:latest server --bind 0.0.0.0
+```
+
+In another terminal, point any Redis client at it (here `redis-cli`):
+
+```sh
+redis-cli -p 6379 PING             # -> PONG
+redis-cli -p 6379 SET hello world  # -> OK
+redis-cli -p 6379 GET hello        # -> "world"
+```
+
+That is a full Redis-compatible server: `redis-cli`, redis-py, go-redis, ioredis, and any
+other RESP client work against it unchanged (see
+[docs/CLIENT_LIBRARIES.md](docs/CLIENT_LIBRARIES.md)). For a persistent, metrics-exposed
+container (a named data volume plus the `/metrics` + `/readyz` endpoints), see
+[Run the container](#run-the-container) below.
 
 ### Build and run from source
 
@@ -244,6 +273,25 @@ cargo run -p ironcache -- config
 cargo run -p ironcache -- check
 cargo run -p ironcache -- upgrade --binary ./ironcache --sha256sums ./SHA256SUMS
 ```
+
+### Runnable examples
+
+Small, self-contained programs that connect to a running IronCache over RESP and demonstrate
+common use. Start a server first (`cargo run -p ironcache -- server`, listening on
+`127.0.0.1:6379`), then in another terminal run any of:
+
+```sh
+cargo run -p ironcache --example hello_world   # PING + SET / GET / DEL
+cargo run -p ironcache --example expiry        # SET with EX, TTL, wait, then GONE
+cargo run -p ironcache --example pipeline      # a pipelined batch of commands
+cargo run -p ironcache --example pubsub        # SUBSCRIBE + PUBLISH across two connections
+cargo run -p ironcache --example transactions  # MULTI / EXEC atomic block
+```
+
+Each prints what it does and asserts the result. They share a tiny standard-library-only RESP
+helper (`crates/ironcache/examples/common/resp.rs`) so they add no dependencies; for real
+applications use a real client library (see [docs/CLIENT_LIBRARIES.md](docs/CLIENT_LIBRARIES.md)).
+Point `IRONCACHE_ADDR` at a different `host:port` to run them against another server.
 
 ### Run the container
 
@@ -284,6 +332,10 @@ The most common knobs (every key, with its env var, is in
 | `cluster_enabled` / `cluster_mode` | `IRONCACHE_CLUSTER_*` | turn on clustering; `static` or `raft` |
 | `cluster_secret` / `cluster_tls` | `IRONCACHE_CLUSTER_SECRET` / `_TLS` | peer auth + bus/repl encryption |
 | `min_replicas_to_write` | `IRONCACHE_MIN_REPLICAS_TO_WRITE` | write-side durability guardrail |
+
+A documented single-node config template you can copy and edit is at
+[`deploy/ironcache.example.toml`](deploy/ironcache.example.toml) (run it with
+`ironcache server --config <file>`; validate it with `ironcache check --config <file>`).
 
 In raft mode the cluster-bus port is `port + 10000` and the replication port is
 `port + 20000`, both derived automatically.
