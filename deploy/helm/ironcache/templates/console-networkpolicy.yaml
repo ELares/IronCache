@@ -1,0 +1,66 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- if and .Values.console.enabled .Values.console.networkPolicy.enabled }}
+{{- $httpPort := int .Values.console.httpPort -}}
+# Egress allowlist for the console replicas (the SSRF-containment control, #369).
+# The console proxies a metrics backend and dials internal nodes, so a compromised
+# or tricked replica must NOT be able to reach anything else on the network. This
+# NetworkPolicy pins the console's reachable set to EXACTLY: DNS (to resolve the
+# cache Service + backend), the cache pods on the RESP + metrics ports, and the
+# operator-supplied history backend (prometheusEgress) -- nothing else. Ingress is
+# limited to the single HTTP port (the VPN-locked Ingress / LB in front does the
+# who-can-reach-it restriction; this just closes every other port). Enforcement
+# needs a NetworkPolicy-aware CNI; on a CNI that ignores it the manifest is inert
+# (fails open), so treat it as defense-in-depth, not the only egress control.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ironcache.console.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ironcache.console.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ironcache.console.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Operator UI + API + the LB health probes, on the single HTTP port only.
+    - ports:
+        - protocol: TCP
+          port: {{ $httpPort }}
+      {{- with .Values.console.networkPolicy.ingressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  egress:
+    {{- if .Values.console.networkPolicy.allowDNS }}
+    # DNS: resolve the cache Service DNS + the backend host.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    # The cache pods only, on the client RESP port + the node metrics/admin port
+    # (RESP INFO/ACL poll + the structured /topology read). Selects the cache
+    # StatefulSet pods (NOT the console: their app name is `<name>-console`).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ironcache.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ int .Values.service.clientPort }}
+        - protocol: TCP
+          port: {{ int .Values.metrics.port }}
+    {{- with .Values.console.networkPolicy.prometheusEgress }}
+    # The shared history backend (usually another namespace, so operator-supplied).
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.console.networkPolicy.extraEgress }}
+    # Any extra allowed egress peers (verbatim).
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

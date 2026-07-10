@@ -184,3 +184,62 @@ spec:
     matchLabels:
       app.kubernetes.io/name: ironcache-console
       app.kubernetes.io/component: console
+---
+# Egress allowlist for the console (the SSRF-containment control, #369). The
+# console proxies a metrics backend and dials internal nodes, so a compromised or
+# tricked replica must not be able to reach anything else on the network. This
+# NetworkPolicy pins the console's reachable set to EXACTLY: DNS, the cache pods on
+# the RESP + metrics ports, and (once you fill in the commented block below) the
+# shared history backend -- nothing else. Ingress is limited to the single HTTP
+# port; the VPN-locked Ingress / LB in front does the who-can-reach-it restriction.
+# Enforcement needs a NetworkPolicy-aware CNI; on a CNI that ignores it this is
+# inert (fails open), so treat it as defense-in-depth, not the only egress control.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ironcache-console
+  namespace: ironcache
+  labels:
+    app.kubernetes.io/name: ironcache-console
+    app.kubernetes.io/component: console
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ironcache-console
+      app.kubernetes.io/component: console
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Operator UI + API + the LB health probes, on the single HTTP port only.
+    - ports:
+        - protocol: TCP
+          port: 9180
+  egress:
+    # DNS: resolve the cache Service DNS + the backend host.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The cache pods only (ironcache.yaml's StatefulSet), on the client RESP port
+    # + the node metrics/admin port (RESP INFO/ACL poll + the /topology read).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ironcache
+      ports:
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 9121
+    # The shared history backend usually lives in another namespace, so its
+    # selector is deployment-specific. UNCOMMENT + edit to match your Prometheus
+    # (IRONCACHE_CONSOLE_PROMETHEUS_URL); left out, history queries fail closed.
+    # - to:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: monitoring
+    #   ports:
+    #     - protocol: TCP
+    #       port: 9090

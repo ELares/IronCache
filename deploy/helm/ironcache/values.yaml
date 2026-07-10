@@ -247,3 +247,33 @@ console:
       memory: "256Mi"
   pdb:
     maxUnavailable: 1
+  # Egress allowlist (the SSRF-containment control, #369). When enabled the chart
+  # renders a NetworkPolicy that lets the console reach ONLY DNS, the cache pods
+  # (RESP + metrics ports), and the history backend you list in prometheusEgress;
+  # every other destination is denied. Ingress is limited to the HTTP port. Needs
+  # a NetworkPolicy-aware CNI to take effect (inert / fails-open otherwise).
+  networkPolicy:
+    enabled: true
+    # DNS egress (UDP/TCP 53). Keep on: the console resolves the cache Service DNS
+    # and the history-backend host by name.
+    allowDNS: true
+    # Restrict who may reach the console HTTP port. Empty = allow from any source
+    # ON THAT PORT (the VPN-locked Ingress / LB in front enforces who; this only
+    # closes the other ports). Tighten by listing NetworkPolicyPeer entries, e.g.
+    #   ingressFrom:
+    #     - namespaceSelector:
+    #         matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+    ingressFrom: []
+    # The shared history backend (Prometheus) usually lives in another namespace,
+    # so its selector is deployment-specific: supply the egress peer(s) here to
+    # match your console.prometheusUrl, e.g.
+    #   prometheusEgress:
+    #     - to:
+    #         - namespaceSelector:
+    #             matchLabels: { kubernetes.io/metadata.name: monitoring }
+    #       ports:
+    #         - { protocol: TCP, port: 9090 }
+    # Left empty, the history queries are blocked by the policy (fail closed).
+    prometheusEgress: []
+    # Any extra egress rules appended verbatim (e.g. an external alertmanager).
+    extraEgress: []
