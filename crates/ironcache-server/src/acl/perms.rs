@@ -773,6 +773,34 @@ mod tests {
     }
 
     #[test]
+    fn monitor_shape_grants_slowlog_get_and_client_list_reads_only() {
+        // The least-privilege monitoring shape (#367): `-@all +ping +info +slowlog|get
+        // +client|list`. The two granted introspection subcommands pass; the destructive
+        // siblings (SLOWLOG RESET, CLIENT KILL) and everything else stay denied.
+        let mut p = CommandPerms::nocommands();
+        p.allow_command(b"PING");
+        p.allow_command(b"INFO");
+        p.allow_subcommand(b"SLOWLOG", b"GET");
+        p.allow_subcommand(b"CLIENT", b"LIST");
+
+        assert!(p.allows(b"PING"));
+        assert!(p.allows(b"INFO"));
+        assert!(p.allows_sub(b"SLOWLOG", Some(b"GET")));
+        assert!(p.allows_sub(b"CLIENT", Some(b"LIST")));
+        // The destructive siblings of the granted subcommands are NOPERM.
+        assert!(!p.allows_sub(b"SLOWLOG", Some(b"RESET")));
+        assert!(!p.allows_sub(b"SLOWLOG", Some(b"LEN")));
+        assert!(!p.allows_sub(b"CLIENT", Some(b"KILL")));
+        // No leak to the bare containers, to CONFIG, or to the data plane.
+        assert!(!p.allows(b"SLOWLOG"));
+        assert!(!p.allows(b"CLIENT"));
+        assert!(!p.allows_sub(b"CONFIG", Some(b"GET")));
+        assert!(!p.allows(b"GET"));
+        assert!(!p.allows(b"SET"));
+        assert!(!p.allows(b"FLUSHALL"));
+    }
+
+    #[test]
     fn describe_round_trips_subcommand_rule() {
         // A subcommand rule renders as `+cluster|slots` (lowercased pipe form) with the implicit
         // `-@all` baseline, so an aclfile SAVE -> LOAD reproduces it.

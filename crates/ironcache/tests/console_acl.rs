@@ -10,12 +10,12 @@
 //!
 //! The command inventory the two users must / must not have is taken from the console's actual RESP
 //! calls (`ironcache-console` src/node.rs poll path + src/manage.rs management path): the monitor
-//! issues PING / INFO / CLIENT LIST and touches no keys (SLOWLOG is omitted from the read-only user,
-//! since it has no per-subcommand grant and the whole command includes RESET); the admin issues the
-//! CONFIG GET/SET, the five CLUSTER mutators, INFO, SAVE, key CRUD, CLIENT LIST, and SLOWLOG the
+//! issues PING / INFO / SLOWLOG GET / CLIENT LIST and touches no keys (each container verb granted
+//! PER SUBCOMMAND, so SLOWLOG RESET and CLIENT KILL stay denied); the admin issues the CONFIG
+//! GET/SET, the five CLUSTER mutators, INFO, SAVE, key CRUD, CLIENT LIST, and SLOWLOG GET the
 //! console uses (granted per-subcommand where possible), but never the destructive verbs (FLUSHALL /
-//! SHUTDOWN / KEYS / DEBUG / the CLUSTER slot mutators) and never ACL (which would let it
-//! self-escalate).
+//! SHUTDOWN / KEYS / DEBUG / SLOWLOG RESET / the CLUSTER slot mutators) and never ACL (which would
+//! let it self-escalate).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -125,14 +125,19 @@ fn reference_console_aclfile_loads_and_enforces_least_privilege() {
             !is_noperm(&cmd(&mut mon, &["CLIENT", "LIST"]).await),
             "monitor needs CLIENT LIST (clients panel)"
         );
-        // Everything mutating or key-reading is DENIED. SLOWLOG is intentionally NOT granted to the
-        // read-only monitor (no per-subcommand grant exists, and the whole command includes RESET).
+        assert!(
+            !is_noperm(&cmd(&mut mon, &["SLOWLOG", "GET", "8"]).await),
+            "monitor needs SLOWLOG GET (slowlog panel; +slowlog|get grants ONLY the read)"
+        );
+        // Everything mutating or key-reading is DENIED, including the destructive SIBLINGS of the
+        // granted subcommand reads (SLOWLOG RESET / CLIENT KILL) and the ungranted SLOWLOG LEN.
         for denied in [
             vec!["SET", "k", "v"],
             vec!["GET", "k"], // command denied AND no keyspace grant
             vec!["DEL", "k"],
             vec!["CONFIG", "SET", "maxmemory", "100mb"],
-            vec!["SLOWLOG", "GET", "8"], // read-only monitor does not get SLOWLOG
+            vec!["SLOWLOG", "RESET"], // +slowlog|get must NOT include the log wipe
+            vec!["SLOWLOG", "LEN"],   // not granted (the poll path never issues it)
             vec!["FLUSHALL"],
             vec!["SHUTDOWN", "NOSAVE"],
             vec!["CLIENT", "KILL", "ID", "1"],
@@ -161,7 +166,7 @@ fn reference_console_aclfile_loads_and_enforces_least_privilege() {
             vec!["CONFIG", "GET", "maxmemory"],
             vec!["CONFIG", "SET", "maxmemory", "128mb"],
             vec!["CLIENT", "LIST"],
-            vec!["SLOWLOG", "GET", "8"], // admin gets whole SLOWLOG (GET for the panel)
+            vec!["SLOWLOG", "GET", "8"], // admin gets +slowlog|get (the panel read only)
             vec!["CLUSTER", "INFO"],     // a CLUSTER read: allowed via +@all -@dangerous
             vec!["CLUSTER", "FAILOVER"], // a GRANTED CLUSTER mutator (+cluster|failover)
             vec!["SET", "console:probe", "1"], // ~* keyspace grant
@@ -189,6 +194,7 @@ fn reference_console_aclfile_loads_and_enforces_least_privilege() {
             vec!["MOVE", "k", "1"],
             vec!["HOTKEYS"],
             vec!["CLIENT", "KILL", "ID", "1"], // may LIST clients, not KILL
+            vec!["SLOWLOG", "RESET"],          // +slowlog|get does not include the log wipe
             vec!["CONFIG", "REWRITE"],         // +config|get|set does not include REWRITE
             vec!["CLUSTER", "ADDSLOTS", "1"],  // destructive slot mutator, not granted
             vec!["CLUSTER", "RESET", "HARD"],  // hard cluster reset, not granted

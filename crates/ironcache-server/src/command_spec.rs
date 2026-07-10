@@ -290,8 +290,8 @@ pub fn request_is_write_for_pause(cmd_upper: &[u8], in_multi: bool, queued: &[Re
     is_write(cmd_upper)
 }
 
-/// One SUBCOMMAND record of a CONTAINER command (CLUSTER today; CONFIG / CLIENT / ACL /
-/// COMMAND can be added later) for PER-SUBCOMMAND ACL (Redis 7 `+cluster|slots`). It carries
+/// One SUBCOMMAND record of a CONTAINER command (CLUSTER / CONFIG / CLIENT / SLOWLOG today;
+/// ACL / COMMAND can be added later) for PER-SUBCOMMAND ACL (Redis 7 `+cluster|slots`). It carries
 /// only the attributes the ACL layer needs to grant a subcommand independently of its
 /// container: the @write flag (whether the subcommand mutates the keyspace) and the
 /// @admin / @dangerous flags. The category derivation that reads these lives in
@@ -651,16 +651,68 @@ const CLIENT_SUBCOMMANDS: &[SubcommandSpec] = &[
     },
 ];
 
+/// The SLOWLOG subcommand table, TRANSCRIBED from the authoritative dispatch arms in
+/// [`crate::dispatch`]'s `cmd_slowlog` (dispatch.rs).
+///
+/// ============================ CO-EDIT CONTRACT (READ THIS) ============================
+/// THREE artifacts encode the SAME SLOWLOG subcommand set and MUST be edited together:
+/// (A) the `match sub` arms in `cmd_slowlog` (dispatch.rs), which decide which subcommands EXIST;
+/// (B) THIS table, the ACL view that carries each entry's `admin` / `dangerous` flags; (C) the
+/// `non_dangerous` / `dangerous` hand-lists in the `slowlog_subcommand_table_matches_dispatch_arms`
+/// pin test. The pin test asserts (B) == (C); it CANNOT parse the dispatch arms (A) at runtime, so
+/// keeping (A) in sync with (B) and (C) is a HUMAN obligation enforced by this contract, not by
+/// the compiler.
+///
+/// SECURITY BOUNDARY: in Redis 7 the three operative SLOWLOG subcommands GET / LEN / RESET are ALL
+/// `@admin @slow @dangerous` (verified against `redis-server` `COMMAND INFO slowlog|<sub>`);
+/// SLOWLOG HELP alone is `@slow`. So, exactly as with CONFIG, the per-subcommand VALUE is
+/// GRANULARITY, not a category split: `-@dangerous` denies every operative SLOWLOG subcommand, and
+/// `+slowlog|get` (or `+slowlog|len`) then re-allows ONLY the read half while `SLOWLOG RESET` (the
+/// log wipe) stays denied. This is what lets a least-privilege monitoring credential read the slow
+/// log without being able to destroy the evidence. NOTE the reads still leak recon (a slowlog
+/// entry's argv can carry key NAMES), which is WHY Redis tags them @dangerous; granting
+/// `+slowlog|get` to a monitor is an informed opt-in, not a free pass. `is_write` is `false` for
+/// all (SLOWLOG touches no key).
+const SLOWLOG_SUBCOMMANDS: &[SubcommandSpec] = &[
+    // GET / LEN / RESET: @admin @slow @dangerous (operative; all denied by -@dangerous).
+    SubcommandSpec {
+        name: b"GET",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"LEN",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    SubcommandSpec {
+        name: b"RESET",
+        is_write: false,
+        admin: true,
+        dangerous: true,
+    },
+    // HELP: @slow only (NOT @admin/@dangerous), so it survives a -@dangerous carve-out.
+    SubcommandSpec {
+        name: b"HELP",
+        is_write: false,
+        admin: false,
+        dangerous: false,
+    },
+];
+
 /// The per-subcommand table for a CONTAINER command `cmd_upper` (UPPERCASE), or `None` for a
-/// command that has no per-subcommand ACL surface. CLUSTER / CONFIG / CLIENT have one today; ACL /
-/// COMMAND would each add an arm here (and a `const` table above) when their subcommands are split.
-/// PURE function of the bytes.
+/// command that has no per-subcommand ACL surface. CLUSTER / CONFIG / CLIENT / SLOWLOG have one
+/// today; ACL / COMMAND would each add an arm here (and a `const` table above) when their
+/// subcommands are split. PURE function of the bytes.
 #[must_use]
 pub fn subcommands_of(cmd_upper: &[u8]) -> Option<&'static [SubcommandSpec]> {
     match cmd_upper {
         b"CLUSTER" => Some(CLUSTER_SUBCOMMANDS),
         b"CONFIG" => Some(CONFIG_SUBCOMMANDS),
         b"CLIENT" => Some(CLIENT_SUBCOMMANDS),
+        b"SLOWLOG" => Some(SLOWLOG_SUBCOMMANDS),
         _ => None,
     }
 }
@@ -3985,6 +4037,39 @@ pub(crate) mod tests {
         );
         // CLIENT has NO `HELP` dispatch arm, so it must NOT be in the table (don't invent one).
         assert!(subcommand_spec(b"CLIENT", b"HELP").is_none());
+    }
+
+    /// SLOWLOG SUBCOMMAND-TABLE PIN (per-subcommand ACL). Same contract as the CLUSTER pin: it
+    /// asserts [`SLOWLOG_SUBCOMMANDS`] equals the hand-lists transcribed from the `cmd_slowlog`
+    /// dispatch arms (dispatch.rs) and that each carries the right Redis-7 flags (`COMMAND INFO
+    /// slowlog|<sub>`: GET / LEN / RESET are `@admin @slow @dangerous`, HELP is `@slow`). The
+    /// dispatch arms, the table, and these hand-lists are the THREE artifacts the CO-EDIT
+    /// CONTRACT binds together.
+    #[test]
+    fn slowlog_subcommand_table_matches_dispatch_arms() {
+        // @slow only (non-dangerous): HELP. @admin+@slow+@dangerous (operative): GET / LEN / RESET.
+        let non_dangerous: &[&[u8]] = &[b"HELP"];
+        let dangerous: &[&[u8]] = &[b"GET", b"LEN", b"RESET"];
+        assert_subcommand_table_pin(b"SLOWLOG", non_dangerous, dangerous);
+
+        // The granularity boundary directly: GET is dangerous (so -@dangerous denies it until
+        // `+slowlog|get` re-allows it, while RESET stays denied); an unknown subcommand is None.
+        assert!(
+            subcommand_spec(b"SLOWLOG", b"GET")
+                .expect("slowlog|get")
+                .dangerous
+        );
+        assert!(
+            subcommand_spec(b"SLOWLOG", b"RESET")
+                .expect("slowlog|reset")
+                .dangerous
+        );
+        assert!(
+            !subcommand_spec(b"SLOWLOG", b"HELP")
+                .expect("slowlog|help")
+                .dangerous
+        );
+        assert!(subcommand_spec(b"SLOWLOG", b"BOGUS").is_none());
     }
 
     /// `extract_keys` is byte-identical to the legacy `command_keys` per-pattern logic. A
