@@ -11,10 +11,16 @@
 //!
 //! ## Scope
 //!
-//! The STRING type (`RDB_TYPE_STRING = 0`). Because a HyperLogLog is stored AS a string
-//! (`cmd_hll`), this gives HLL DUMP/RESTORE byte-interop for free (#242 part 2: an HLL DUMPed here
-//! RESTOREs + PFCOUNTs identically on redis). Other value types (list/set/hash/zset) are a tracked
-//! follow-up; DUMP of one is a typed "unsupported" error rather than a wrong blob.
+//! DUMP (encode) emits the STRING type (`RDB_TYPE_STRING = 0`) only. Because a HyperLogLog is stored
+//! AS a string (`cmd_hll`), this gives HLL DUMP/RESTORE byte-interop for free (#242 part 2: an HLL
+//! DUMPed here RESTOREs + PFCOUNTs identically on redis). DUMP of a non-string value is still a typed
+//! "unsupported" error rather than a wrong blob.
+//!
+//! RESTORE (decode) additionally accepts the SET type in all three RDB encodings -- the plain
+//! `RDB_TYPE_SET`, the `RDB_TYPE_SET_INTSET`, and the `RDB_TYPE_SET_LISTPACK` -- so a set DUMPed by a
+//! real redis RESTOREs here with identical members (#612 phase; DUMP of a set stays deferred). The
+//! remaining aggregate types (list/hash/zset) RESTORE is the tracked follow-up; a type we do not yet
+//! decode is refused as bad data, never mis-decoded.
 //!
 //! The reusable RDB codec substrate (the CRC-64 footer, the RDB length + string encodings, and the
 //! container element iterators the aggregate types build on) lives in [`crate::rdb`]; this slice is
@@ -37,8 +43,9 @@ use ironcache_storage::{
 };
 
 use crate::rdb::{
-    DUMP_RDB_VERSION, RDB_TYPE_STRING, RestoreParseError, crc64, read_rdb_string, verify_footer,
-    write_rdb_len,
+    DECODE_PREALLOC_CAP, DUMP_RDB_VERSION, LpElem, RDB_TYPE_SET, RDB_TYPE_SET_INTSET,
+    RDB_TYPE_SET_LISTPACK, RDB_TYPE_STRING, RestoreParseError, crc64, intset_iter, listpack_iter,
+    read_rdb_len, read_rdb_string, verify_footer, write_rdb_len,
 };
 
 /// Serialize `value` (its raw bytes) as a full DUMP blob: `type || raw-string || version || crc64`.
@@ -71,6 +78,87 @@ fn deserialize_string(blob: &[u8]) -> Result<Vec<u8>, RestoreParseError> {
         return Err(RestoreParseError::BadData); // trailing bytes: malformed
     }
     Ok(value)
+}
+
+/// Parse a DUMP blob (footer-verified) into the SET members, ready for [`NewValueOwned::Set`] (which
+/// dedups + applies the intset/listpack/hashtable ladder). Handles the three RDB set encodings:
+///
+/// * `RDB_TYPE_SET` (2): an RDB length = member count, then that many RDB strings. The member count
+///   is bounded against the remaining payload bytes BEFORE any pre-allocation (a member is at least
+///   one byte, so a count past the remaining bytes is a hostile/garbage header), and each member
+///   goes through [`read_rdb_string`] (inheriting its LZF + length-gating + bounded-alloc discipline).
+/// * `RDB_TYPE_SET_INTSET` (11): the intset blob, itself stored AS an RDB string (so redis may LZF- or
+///   raw-encode it), decoded by [`intset_iter`]; each integer materializes as its DECIMAL ASCII text
+///   (redis renders a materialized intset member with `ll2string`, e.g. `-5` -> `"-5"`).
+/// * `RDB_TYPE_SET_LISTPACK` (20): the listpack blob, likewise stored AS an RDB string, decoded by
+///   [`listpack_iter`]; an [`LpElem::Int`] renders as decimal ASCII and an [`LpElem::Str`] is the raw
+///   bytes.
+///
+/// Every declared length is bounds-checked before a slice or allocation (the shared `rdb` discipline),
+/// so a hostile blob is a clean [`RestoreParseError::BadData`], never a panic or an over-allocation.
+fn deserialize_set(blob: &[u8]) -> Result<Vec<Vec<u8>>, RestoreParseError> {
+    let payload = verify_footer(blob)?;
+    let mut pos = 0usize;
+    let ty = *payload.get(pos).ok_or(RestoreParseError::BadData)?;
+    pos += 1;
+    match ty {
+        RDB_TYPE_SET => {
+            let (count, is_encoded) = read_rdb_len(payload, &mut pos)?;
+            if is_encoded {
+                // A member count is never one of the RDB_ENCVAL special encodings.
+                return Err(RestoreParseError::BadData);
+            }
+            let count = usize::try_from(count).map_err(|_| RestoreParseError::BadData)?;
+            // Bound the declared count against the bytes still available: the smallest member is a
+            // single length byte (a zero-length string), so a count larger than the remaining bytes
+            // is a lie -> BadData BEFORE the pre-allocation. `read_rdb_string` re-validates each
+            // member's own declared length.
+            if count > payload.len().saturating_sub(pos) {
+                return Err(RestoreParseError::BadData);
+            }
+            let mut members = Vec::with_capacity(count.min(DECODE_PREALLOC_CAP));
+            for _ in 0..count {
+                members.push(read_rdb_string(payload, &mut pos)?);
+            }
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes: malformed
+            }
+            Ok(members)
+        }
+        RDB_TYPE_SET_INTSET => {
+            // The intset blob is stored AS an RDB string (redis `rdbSaveRawString`), so decode the
+            // string first (LZF handled for free), then the intset, then render each integer as its
+            // decimal text so a RESTOREd intset yields string members "1", "2", ... .
+            let body = read_rdb_string(payload, &mut pos)?;
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes after the intset string
+            }
+            let ints = intset_iter(&body)?;
+            Ok(ints
+                .into_iter()
+                .map(|n| n.to_string().into_bytes())
+                .collect())
+        }
+        RDB_TYPE_SET_LISTPACK => {
+            // Likewise stored AS an RDB string; each listpack element is a member (an int renders as
+            // decimal ASCII, a string is the raw bytes).
+            let body = read_rdb_string(payload, &mut pos)?;
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes after the listpack string
+            }
+            let elems = listpack_iter(&body)?;
+            Ok(elems
+                .into_iter()
+                .map(|e| match e {
+                    LpElem::Int(n) => n.to_string().into_bytes(),
+                    LpElem::Str(b) => b.into_vec(),
+                })
+                .collect())
+        }
+        // A non-set type reaching here is a routing bug; caller dispatches STRING elsewhere and any
+        // other type is a tracked follow-up, refused as BadData (the value cannot be reconstructed).
+        _ => Err(RestoreParseError::BadData),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,10 +258,22 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
                 reply: Value::error(ErrorReply::busykey_target_exists()),
             };
         }
-        match deserialize_string(blob) {
+        // Route on the RDB type byte, which is `blob[0]` (the first payload byte, before the footer)
+        // and is CRC-covered, so `verify_footer` inside the chosen decoder still authenticates it: a
+        // SET type reconstructs a `NewValueOwned::Set` (the store dedups + applies the encoding
+        // ladder), everything else falls to the STRING decoder (which rejects a non-STRING type as
+        // BadData). Both paths install through the same `RmwAction::Replace` used by the string RESTORE
+        // -- only the value construction differs, so REPLACE / ttl / ABSTTL / IDLETIME / FREQ all hold.
+        let decoded = match blob.first() {
+            Some(&RDB_TYPE_SET | &RDB_TYPE_SET_INTSET | &RDB_TYPE_SET_LISTPACK) => {
+                deserialize_set(blob).map(NewValueOwned::Set)
+            }
+            _ => deserialize_string(blob).map(|v| NewValueOwned::Bytes(Bytes::from(v))),
+        };
+        match decoded {
             // Vacant, or Occupied with REPLACE: write the value (Replace on a vacant entry inserts).
             Ok(value) => RmwStep {
-                action: RmwAction::Replace(NewValueOwned::Bytes(Bytes::from(value))),
+                action: RmwAction::Replace(value),
                 expire,
                 reply: Value::ok(),
             },
@@ -561,5 +661,306 @@ mod tests {
             ),
             Value::ok()
         );
+    }
+
+    // ---- SET RESTORE (#612 phase 2): the three RDB set encodings. ----
+
+    use std::collections::BTreeSet;
+
+    /// Wrap a value payload (`type || body`) as a full DUMP blob: append the version + CRC-64 footer
+    /// so `verify_footer` accepts it. Mirrors `serialize_string`'s footer so a test can hand-build a
+    /// golden SET blob for any of the three encodings.
+    fn set_blob(type_byte: u8, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![type_byte];
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+        let crc = crc64(0, &payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        payload
+    }
+
+    /// Append an RDB raw string (length-prefix + bytes) to `out`. This is how redis wraps an intset /
+    /// listpack blob (and each plain-set member) inside a DUMP payload.
+    fn push_rdb_string(out: &mut Vec<u8>, s: &[u8]) {
+        write_rdb_len(out, s.len() as u64);
+        out.extend_from_slice(s);
+    }
+
+    /// Build an intset blob (`encoding[u32 LE] length[u32 LE]` then the LE integers) at the given
+    /// width (2/4/8). The header `length` is `values.len()`; ordering is the caller's to control (a
+    /// valid intset is strictly ascending, but a reject test wants a descending one).
+    fn build_intset(encoding: u32, values: &[i64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&encoding.to_le_bytes());
+        out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+        for &v in values {
+            match encoding {
+                2 => out.extend_from_slice(&(v as i16).to_le_bytes()),
+                4 => out.extend_from_slice(&(v as i32).to_le_bytes()),
+                8 => out.extend_from_slice(&v.to_le_bytes()),
+                _ => unreachable!("test intset encoding is 2/4/8"),
+            }
+        }
+        out
+    }
+
+    /// Encode a listpack 6-bit string entry (`10xxxxxx` len + bytes), len 0..=63.
+    fn lp_str6(s: &[u8]) -> Vec<u8> {
+        assert!(s.len() <= 63);
+        let mut o = vec![0x80 | s.len() as u8];
+        o.extend_from_slice(s);
+        o
+    }
+
+    /// Encode a listpack int16 entry (`0xF1` + 2 LE payload bytes).
+    fn lp_int16(v: i16) -> Vec<u8> {
+        let mut o = vec![0xF1];
+        o.extend_from_slice(&v.to_le_bytes());
+        o
+    }
+
+    /// Assemble a listpack from pre-encoded `encoding + payload` entries: the 6-byte header, each
+    /// entry followed by its 1-byte reverse-encoded backlen (every test entry is < 128 bytes so the
+    /// backlen is a single byte equal to the entry length), then the 0xFF EOF, with `total_bytes`
+    /// fixed to the real length. Mirrors the builder proven in `rdb`'s own tests.
+    fn build_listpack(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for e in entries {
+            assert!(
+                e.len() <= 127,
+                "test listpack entries use the 1-byte backlen"
+            );
+            body.extend_from_slice(e);
+            body.push(e.len() as u8);
+        }
+        let total = 6 + body.len() + 1; // header + entries + EOF
+        let mut lp = Vec::with_capacity(total);
+        lp.extend_from_slice(&(total as u32).to_le_bytes());
+        lp.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        lp.extend_from_slice(&body);
+        lp.push(0xFF);
+        lp
+    }
+
+    /// The SMEMBERS snapshot of `key` as a set of member byte-vectors (empty if absent / not a set),
+    /// read through the typed `SetValue` view for order-independent assertions.
+    fn set_members(store: &mut TestStore, key: &[u8]) -> BTreeSet<Vec<u8>> {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let members = match entry {
+                RmwEntry::OccupiedMut(mut o) => {
+                    o.as_set_mut().map(|s| s.members()).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: members.into_iter().collect(),
+            }
+        })
+    }
+
+    /// SISMEMBER through the typed `SetValue` view.
+    fn set_contains(store: &mut TestStore, key: &[u8], member: &[u8]) -> bool {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let hit = match entry {
+                RmwEntry::OccupiedMut(mut o) => o.as_set_mut().is_some_and(|s| s.contains(member)),
+                _ => false,
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: hit,
+            }
+        })
+    }
+
+    #[test]
+    fn restore_intset_set_yields_decimal_string_members() {
+        // A real-redis intset-encoded set: RESTORE must materialize each integer as its DECIMAL ASCII
+        // text (redis `ll2string`), so SMEMBERS yields "-5","1","2","300".
+        let mut s = test_store();
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &build_intset(2, &[-5, 1, 2, 300]));
+        let blob = set_blob(RDB_TYPE_SET_INTSET, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"iset", b"0", &blob])),
+            Value::ok()
+        );
+        let want: BTreeSet<Vec<u8>> = [&b"-5"[..], b"1", b"2", b"300"]
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(set_members(&mut s, b"iset"), want);
+        assert_eq!(set_members(&mut s, b"iset").len(), 4); // SCARD
+        assert!(set_contains(&mut s, b"iset", b"300")); // SISMEMBER hit
+        assert!(!set_contains(&mut s, b"iset", b"301")); // SISMEMBER miss
+    }
+
+    #[test]
+    fn restore_listpack_set_yields_string_and_int_members() {
+        // A listpack-encoded set with mixed string + int elements: the ints render as decimal ASCII,
+        // the strings are the raw bytes.
+        let mut s = test_store();
+        let lp = build_listpack(&[
+            lp_str6(b"hello"),
+            lp_int16(-5),
+            lp_str6(b"world"),
+            lp_int16(42),
+        ]);
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_SET_LISTPACK, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"lset", b"0", &blob])),
+            Value::ok()
+        );
+        let want: BTreeSet<Vec<u8>> = [&b"hello"[..], b"-5", b"world", b"42"]
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(set_members(&mut s, b"lset"), want);
+        assert!(set_contains(&mut s, b"lset", b"hello"));
+        assert!(set_contains(&mut s, b"lset", b"-5"));
+    }
+
+    #[test]
+    fn restore_plain_set_yields_string_members() {
+        // A plain RDB_TYPE_SET (redis's hashtable encoding on DUMP): a member count then that many
+        // RDB strings.
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 3);
+        push_rdb_string(&mut body, b"alpha");
+        push_rdb_string(&mut body, b"beta");
+        push_rdb_string(&mut body, b"gamma");
+        let blob = set_blob(RDB_TYPE_SET, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"pset", b"0", &blob])),
+            Value::ok()
+        );
+        let want: BTreeSet<Vec<u8>> = [&b"alpha"[..], b"beta", b"gamma"]
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(set_members(&mut s, b"pset"), want);
+    }
+
+    #[test]
+    fn restore_plain_set_dedups_repeated_members() {
+        // NewValueOwned::Set dedups (via SetVal::from_members), so a hand-built blob with a repeat
+        // still yields the unique members. Real redis never dumps a duplicate, but the decoder must
+        // not trust the input to be unique.
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 3);
+        push_rdb_string(&mut body, b"dup");
+        push_rdb_string(&mut body, b"dup");
+        push_rdb_string(&mut body, b"unique");
+        let blob = set_blob(RDB_TYPE_SET, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"d", b"0", &blob])),
+            Value::ok()
+        );
+        let got = set_members(&mut s, b"d");
+        assert_eq!(got.len(), 2, "the duplicate must collapse");
+        assert!(got.contains(&b"dup"[..]) && got.contains(&b"unique"[..]));
+    }
+
+    #[test]
+    fn restore_set_honors_replace_and_ttl() {
+        let mut s = test_store();
+        // Restore a plain set with no ttl.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 2);
+        push_rdb_string(&mut body, b"x");
+        push_rdb_string(&mut body, b"y");
+        let blob = set_blob(RDB_TYPE_SET, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])),
+            Value::ok()
+        );
+        // Restoring onto the existing key without REPLACE is BUSYKEY (value untouched).
+        assert_eq!(
+            match cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])) {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-BUSYKEY Target key name already exists."
+        );
+        // REPLACE + a relative ttl: an intset overwrites the set and the deadline is now + ttl.
+        let mut ibody = Vec::new();
+        push_rdb_string(&mut ibody, &build_intset(2, &[7, 8, 9]));
+        let iblob = set_blob(RDB_TYPE_SET_INTSET, &ibody);
+        assert_eq!(
+            cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"k", b"25000", &iblob, b"REPLACE"])
+            ),
+            Value::ok()
+        );
+        let want: BTreeSet<Vec<u8>> = [&b"7"[..], b"8", b"9"]
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(set_members(&mut s, b"k"), want);
+        assert_eq!(
+            s.read(0, b"k", NOW).and_then(|v| v.expire_at()),
+            Some(UnixMillis(NOW.0 + 25_000))
+        );
+    }
+
+    #[test]
+    fn deserialize_set_rejects_a_huge_declared_count_without_allocating() {
+        // A plain RDB_TYPE_SET whose declared member count (~4 billion) dwarfs the tiny body: the
+        // count-vs-remaining bound rejects BEFORE the pre-allocation, no over-alloc, no panic.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 0xffff_ffff);
+        push_rdb_string(&mut body, b"only-one");
+        let blob = set_blob(RDB_TYPE_SET, &body);
+        assert_eq!(deserialize_set(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_set_rejects_a_listpack_length_past_the_end() {
+        // A listpack whose header total_bytes lies far past the real slice must be BadData with no
+        // over-read (the listpack decoder's exact-length gate).
+        let mut lp = build_listpack(&[lp_str6(b"a")]);
+        lp[0..4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_SET_LISTPACK, &body);
+        assert_eq!(deserialize_set(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_set_rejects_a_non_ascending_intset() {
+        // A descending intset is not a valid (sorted, unique) intset.
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &build_intset(2, &[5, 3, 1]));
+        let blob = set_blob(RDB_TYPE_SET_INTSET, &body);
+        assert_eq!(deserialize_set(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn restore_a_hostile_set_blob_errors_and_creates_no_key() {
+        // End-to-end: a hostile SET blob returns the bad-data error and leaves NO key behind (no
+        // panic, no partial write).
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 0xffff_ffff);
+        push_rdb_string(&mut body, b"x");
+        let blob = set_blob(RDB_TYPE_SET, &body);
+        let err = cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"h", b"0", &blob]));
+        assert_eq!(
+            match err {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-ERR Bad data format"
+        );
+        assert!(s.read(0, b"h", NOW).is_none(), "no key must be created");
     }
 }

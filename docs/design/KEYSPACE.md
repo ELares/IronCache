@@ -76,11 +76,14 @@ is specified here as the canonical serializer so #39/#40 (intset/HLL/OBJECT
 ENCODING) have one blob format to target, validated against the oracle
 [valkey-resp-identical]. The 512 MB value bound [bulk-string-max-512mb] applies.
 
-> **LOUD NOTE (current reality): DUMP/RESTORE is STRING-only.** As implemented today,
-> `DUMP`/`RESTORE` round-trips the **STRING type ONLY** (a HyperLogLog counts, since an HLL is
-> stored as a string). A `DUMP` of a list, hash, set, or zset returns an error and cannot be
-> `RESTORE`d, so full multi-type `MIGRATE` compatibility does NOT hold yet. The remaining
-> per-type codecs (and thus full multi-type `MIGRATE`) are tracked in #612.
+> **LOUD NOTE (current reality): DUMP is STRING-only; RESTORE also accepts the SET type.** As
+> implemented today, `DUMP` (encode) emits the **STRING type ONLY** (a HyperLogLog counts, since an
+> HLL is stored as a string); a `DUMP` of a list, hash, set, or zset returns an error. `RESTORE`
+> (decode) accepts the **STRING type AND the SET type in all three RDB encodings** (intset, listpack,
+> and the plain length-prefixed set), so a set `DUMP`ed by a real Redis `RESTORE`s with identical
+> members. `RESTORE` of a list, hash, or zset is still refused, so full multi-type `MIGRATE`
+> compatibility does NOT hold yet. The remaining per-type codecs (and `DUMP` of the aggregate types)
+> are tracked in #612.
 
 ## Open questions
 
