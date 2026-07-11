@@ -25,14 +25,16 @@
 # behavior change could then silently move the gate. Building one EXACT tag from source pins the
 # oracle to a single reproducible version, independent of the runner image and the apt archive.
 #
-# WHY REDIS 7.2 SPECIFICALLY (not 7.4 / 8.0): the corpus includes cross-server DUMP/RESTORE round
-# trips, and IronCache's RESTORE accepts an RDB footer version only up to SUPPORTED_RDB_VERSION = 11
-# (see crates/ironcache-server/src/cmd_dump.rs; that is the Redis 7.2 RDB version). Redis 7.4 and 8.0
-# bumped the RDB version to 12, so a payload DUMPed by a 7.4/8.0 server fails IronCache's RESTORE with
-# "DUMP payload version or checksum are wrong" -- verified empirically (7.4.5 and 8.0.0 each produce
-# 6 DUMP/RESTORE divergences; 7.2.7 is green). So the oracle is pinned to the newest 7.2 patch: the
-# highest Redis whose DUMP surface round-trips with this build. Raise it in lockstep with
-# SUPPORTED_RDB_VERSION when IronCache learns to RESTORE a newer RDB version.
+# WHY REDIS 7.4 SPECIFICALLY (not 7.2 / 8.0): the corpus includes cross-server DUMP/RESTORE round
+# trips, so the oracle can only be a Redis whose DUMP RDB footer version IronCache's RESTORE accepts,
+# up to SUPPORTED_RDB_VERSION (see crates/ironcache-server/src/rdb.rs). That ceiling is now 14, which
+# covers Redis 7.4's RDB version 12, so a payload DUMPed by 7.4 round-trips (verified empirically: the
+# full corpus is 0 divergences on 7.4.9). 7.4 is chosen over 7.2 because it adds hash field TTLs
+# (HEXPIRE), which lets the corpus exercise IronCache's field-TTL hash RESTORE decode (the
+# RDB_TYPE_HASH_METADATA / _LISTPACK_EX encodings) against a real server; that section self-gates to a
+# no-op on an older oracle that lacks HEXPIRE. 8.0 is a candidate for a later bump (its RDB version 14
+# is exactly the ceiling), left for a separate re-verification of the full corpus. Raise this in
+# lockstep with SUPPORTED_RDB_VERSION and re-verify the corpus when IronCache learns a newer RDB version.
 name: differential
 
 on:
@@ -55,11 +57,11 @@ env:
   CARGO_INCREMENTAL: "0"
   RUSTFLAGS: "-D warnings"
   # The PINNED differential oracle: an EXACT Redis tag built from source (see the header for why).
-  # 7.2.7 is the newest Redis 7.2 patch; 7.2 is the highest Redis whose DUMP/RESTORE RDB version (11)
-  # this build accepts (SUPPORTED_RDB_VERSION in cmd_dump.rs). 7.4/8.0 use RDB v12 and break the
-  # cross-server DUMP round-trip. Bump this in lockstep with SUPPORTED_RDB_VERSION (and re-verify the
-  # corpus) when IronCache's RESTORE learns a newer RDB version.
-  REDIS_ORACLE_VERSION: "7.2.7"
+  # 7.4.9 is the newest Redis 7.4 patch. Its DUMP/RESTORE RDB version (12) is within the ceiling this
+  # build accepts (SUPPORTED_RDB_VERSION = 14 in rdb.rs), and 7.4 adds HEXPIRE so the corpus can
+  # exercise the field-TTL hash RESTORE decode. Bump this in lockstep with SUPPORTED_RDB_VERSION (and
+  # re-verify the full corpus is 0 divergences) when IronCache's RESTORE learns a newer RDB version.
+  REDIS_ORACLE_VERSION: "7.4.9"
 
 jobs:
   guard:
