@@ -884,6 +884,7 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
     // (redis DUMP -> IronCache RESTORE and IronCache DUMP -> redis RESTORE).
     compared += set_dump_restore_interop(iron, rds, div);
     compared += hash_dump_restore_interop(iron, rds, div);
+    compared += hash_field_ttl_dump_restore_interop(iron, rds, div);
     compared += zset_dump_restore_interop(iron, rds, div);
     compared += list_dump_restore_interop(iron, rds, div);
 
@@ -1110,6 +1111,135 @@ fn hash_dump_restore_interop(
             });
         }
     }
+    compared
+}
+
+/// Does the connected redis support hash-field TTLs (`HEXPIRE`, Redis >= 7.4)? Probe once so the
+/// field-TTL DUMP/RESTORE section runs ONLY against an oracle new enough to produce the `listpack_ex` /
+/// `metadata` encodings. On an older redis (e.g. the pinned 7.2 CI oracle, which lacks `HEXPIRE`) the
+/// section is a NO-OP, so the gate stays green there while a 7.4+ oracle exercises the field-TTL wire.
+fn redis_supports_field_ttl(rds: &mut Client) -> bool {
+    rds.cmd(&[b"DEL", b"dr:hx:probe"]);
+    rds.cmd(&[b"HSET", b"dr:hx:probe", b"f", b"v"]);
+    // On >= 7.4 HEXPIRE replies an ARRAY of per-field codes; on an older redis it is an unknown-command
+    // ERROR. The array/error split cleanly detects support without parsing a version string.
+    let supported = matches!(
+        rds.cmd(&[b"HEXPIRE", b"dr:hx:probe", b"100000", b"FIELDS", b"1", b"f"]),
+        Resp::Array(_)
+    );
+    rds.cmd(&[b"DEL", b"dr:hx:probe"]);
+    supported
+}
+
+/// The HASH FIELD-TTL half of the DUMP/RESTORE parity check (#612 final): a hash carrying per-field
+/// TTLs, which Redis 7.4+ DUMPs as `RDB_TYPE_HASH_LISTPACK_EX` (25, the compact default) or
+/// `RDB_TYPE_HASH_METADATA` (24, the hashtable form, forced by dropping `hash-max-listpack-entries` to
+/// 0). r2i ONLY (real-Redis DUMP -> IronCache RESTORE): IronCache's own DUMP emits the plain
+/// `RDB_TYPE_HASH` with no field TTLs, so an i2r direction would not exercise the field-TTL wire form.
+/// For each encoding we `HSET` six fields, `HEXPIRE` a SUBSET with a far-future TTL (leaving the rest
+/// with none), DUMP on redis, RESTORE on IronCache, and assert: (a) the leading DUMP type byte IS the
+/// expected encoding (proving both branches run), (b) `HGETALL` + `HLEN` match, and (c) `HPEXPIRETIME`
+/// matches for EVERY field -- the ABSOLUTE ms deadline for the TTL'd fields and the -1 "no expiry"
+/// sentinel for the rest. `HTTL` is deliberately NOT asserted: it is remaining-seconds and racy across
+/// two engines, whereas the absolute expire time is deterministic. Runs only when the oracle supports
+/// `HEXPIRE` (>= 7.4); a no-op otherwise. Returns the number of comparisons made.
+fn hash_field_ttl_dump_restore_interop(
+    iron: &mut Client,
+    rds: &mut Client,
+    div: &mut Vec<Divergence>,
+) -> usize {
+    if !redis_supports_field_ttl(rds) {
+        return 0;
+    }
+    let mut compared = 0usize;
+    // Six fields; the subset at indices 0, 2, 4 carries a far-future TTL, the rest none.
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..6)
+        .map(|i| (format!("f{i}").into_bytes(), format!("v{i}").into_bytes()))
+        .collect();
+    let ttl_idx = [0usize, 2, 4];
+    // (tag, hash-max-listpack-entries, expected leading DUMP type byte). 25 = RDB_TYPE_HASH_LISTPACK_EX,
+    // 24 = RDB_TYPE_HASH_METADATA (literals: the test crate cannot see ironcache-server's pub(crate) rdb
+    // constants, and these RDB type bytes are a stable on-disk contract).
+    let cases: [(&str, &[u8], u8); 2] = [("listpack_ex", b"128", 25), ("metadata", b"0", 24)];
+    for (tag, max_entries, want_type) in cases {
+        // Force the target encoding on the redis side BEFORE building the hash.
+        rds.cmd(&[b"CONFIG", b"SET", b"hash-max-listpack-entries", max_entries]);
+        let src_key = format!("dr:hx:{tag}:src").into_bytes();
+        let dst_key = format!("dr:hx:{tag}:dst").into_bytes();
+        rds.cmd(&[b"DEL", &src_key]);
+        let mut hset: Vec<&[u8]> = vec![b"HSET", &src_key];
+        for (f, v) in &pairs {
+            hset.push(f.as_slice());
+            hset.push(v.as_slice());
+        }
+        rds.cmd(&hset);
+        // HEXPIRE the subset with a big future TTL (100000 s), so the absolute deadline is well beyond
+        // any test runtime and deterministic across both engines.
+        let mut hexpire: Vec<&[u8]> = vec![b"HEXPIRE", &src_key, b"100000", b"FIELDS", b"3"];
+        for &i in &ttl_idx {
+            hexpire.push(pairs[i].0.as_slice());
+        }
+        rds.cmd(&hexpire);
+        let Some(blob) = bulk_bytes(&rds.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP hash-field-ttl {tag}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "redis DUMP of a field-TTL hash did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        // (a) Prove we actually exercised the intended wire encoding (the leading RDB type byte).
+        compared += 1;
+        if blob.first().copied() != Some(want_type) {
+            div.push(Divergence {
+                cmd: format!("hash-field-ttl {tag} DUMP type byte"),
+                iron: Resp::Integer(i64::from(blob.first().copied().unwrap_or(0))),
+                redis: Resp::Integer(i64::from(want_type)),
+                note: "redis DUMP did not use the expected field-TTL hash encoding (tune hash-max-listpack-entries)".to_owned(),
+            });
+            continue;
+        }
+        let restore = iron.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        // (b) HGETALL + HLEN parity.
+        let iron_get = iron.cmd(&[b"HGETALL", &dst_key]);
+        let redis_get = rds.cmd(&[b"HGETALL", &src_key]);
+        let iron_len = iron.cmd(&[b"HLEN", &dst_key]);
+        let redis_len = rds.cmd(&[b"HLEN", &src_key]);
+        compared += 1;
+        if sorted_pairs(&iron_get).is_none()
+            || sorted_pairs(&iron_get) != sorted_pairs(&redis_get)
+            || iron_len != redis_len
+        {
+            div.push(Divergence {
+                cmd: format!("hash-field-ttl {tag} HGETALL/HLEN; RESTORE said {restore:?}"),
+                iron: iron_get,
+                redis: redis_get,
+                note: "a field-TTL hash DUMPed by redis did not RESTORE to the same fields on IronCache (#612 field-TTL)".to_owned(),
+            });
+        }
+        // (c) HPEXPIRETIME parity for EVERY field: the absolute ms deadline for the TTL'd fields, -1 for
+        // the rest. Query both with the SAME FIELDS order so the reply arrays line up for exact compare.
+        let mut hpe_r: Vec<&[u8]> = vec![b"HPEXPIRETIME", &src_key, b"FIELDS", b"6"];
+        let mut hpe_i: Vec<&[u8]> = vec![b"HPEXPIRETIME", &dst_key, b"FIELDS", b"6"];
+        for (f, _) in &pairs {
+            hpe_r.push(f.as_slice());
+            hpe_i.push(f.as_slice());
+        }
+        let redis_hpe = rds.cmd(&hpe_r);
+        let iron_hpe = iron.cmd(&hpe_i);
+        compared += 1;
+        if iron_hpe != redis_hpe {
+            div.push(Divergence {
+                cmd: format!("hash-field-ttl {tag} HPEXPIRETIME"),
+                iron: iron_hpe,
+                redis: redis_hpe,
+                note: "a field-TTL hash RESTOREd on IronCache did not preserve the per-field absolute deadlines (#612 field-TTL)".to_owned(),
+            });
+        }
+    }
+    // Restore the redis default so this section's config change does not leak into later steps.
+    rds.cmd(&[b"CONFIG", b"SET", b"hash-max-listpack-entries", b"128"]);
     compared
 }
 
