@@ -878,12 +878,13 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
         }
     }
 
-    // SET, HASH, and ZSET values are SEPARATE helpers (below): DUMP of an aggregate is not yet
+    // SET, HASH, ZSET, and LIST values are SEPARATE helpers (below): DUMP of an aggregate is not yet
     // implemented on IronCache, so each parity check is one-directional (redis DUMP -> IronCache
     // RESTORE) and does not fit the bidirectional loop above.
     compared += set_dump_restore_interop(iron, rds, div);
     compared += hash_dump_restore_interop(iron, rds, div);
     compared += zset_dump_restore_interop(iron, rds, div);
+    compared += list_dump_restore_interop(iron, rds, div);
 
     compared
 }
@@ -1121,6 +1122,93 @@ fn zset_dump_restore_interop(
                 iron: iron_reply,
                 redis: redis_reply,
                 note: "a zset DUMPed by redis did not RESTORE to the same members/scores on IronCache (#612 ZSET)".to_owned(),
+            });
+        }
+    }
+    compared
+}
+
+/// The LIST half of the DUMP/RESTORE parity check (#612 LIST RESTORE). ONE-DIRECTIONAL (r2i only):
+/// DUMP of a list is not yet implemented on IronCache (still a typed "unsupported" error), so we
+/// exercise the real-Redis DUMP -> IronCache RESTORE direction, exactly the migration path that
+/// matters. We force BOTH a SMALL list (a single quicklist-2 PACKED node) AND a LARGE list (>
+/// `list-max-listpack-size` = 128 elements, which forces redis's quicklist encoding with MULTIPLE
+/// listpack nodes, plus one oversized element redis stores as a PLAIN node), covering short strings, a
+/// long (> 64 byte) string, pure integers, and an EMPTY-string element. A list preserves INSERTION
+/// ORDER, so the comparison is EXACT (unlike the unordered set/hash checks): we assert `LLEN`, the
+/// full ordered `LRANGE 0 -1`, and head/tail/middle `LINDEX` probes all match. When DUMP(list) lands
+/// the i2r direction can be added here too. Returns the number of comparisons made; a mismatch is
+/// pushed onto `div`.
+fn list_dump_restore_interop(
+    iron: &mut Client,
+    rds: &mut Client,
+    div: &mut Vec<Divergence>,
+) -> usize {
+    let mut compared = 0usize;
+    // The large case: > list-max-listpack-size (128) elements forces redis's quicklist encoding with
+    // MULTIPLE listpack nodes; one element larger than the 8 KiB node safety limit is stored as a
+    // PLAIN node, so the decode exercises BOTH the packed multi-node path and the plain-node path.
+    let mut large: Vec<Vec<u8>> = (0..300).map(|i| format!("e{i:04}").into_bytes()).collect();
+    large.push(vec![b'P'; 9000]); // > 8 KiB -> a PLAIN quicklist node
+    large.push(b"12345".to_vec()); // a pure integer (an int-encoded listpack element)
+
+    // Type left to inference: the fully-written nested type trips clippy's `type_complexity` lint.
+    let list_cases = vec![
+        // Small -> a single quicklist-2 PACKED node: short strings, a pure integer, a long (> 64 byte)
+        // string, and an EMPTY-string element (a legal list value redis packs as a zero-length entry).
+        (
+            "packed",
+            vec![
+                b"head".to_vec(),
+                b"7".to_vec(),
+                vec![b'x'; 100],
+                b"".to_vec(),
+                b"tail".to_vec(),
+            ],
+        ),
+        ("quicklist", large),
+    ];
+    for (enc, elems) in &list_cases {
+        let src_key = format!("dr:list:{enc}:src").into_bytes();
+        let dst_key = format!("dr:list:{enc}:dst").into_bytes();
+        let mut rpush: Vec<&[u8]> = vec![b"RPUSH", &src_key];
+        rpush.extend(elems.iter().map(std::vec::Vec::as_slice));
+        rds.cmd(&rpush);
+        let Some(blob) = bulk_bytes(&rds.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP list {enc}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "redis DUMP of a list did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        let restore = iron.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let iron_range = iron.cmd(&[b"LRANGE", &dst_key, b"0", b"-1"]);
+        let redis_range = rds.cmd(&[b"LRANGE", &src_key, b"0", b"-1"]);
+        let iron_len = iron.cmd(&[b"LLEN", &dst_key]);
+        let redis_len = rds.cmd(&[b"LLEN", &src_key]);
+        // LINDEX probes: head, tail, and a middle index that lands in a later node for the large case
+        // (so cross-node ordering is checked end to end); an out-of-range middle index on the small
+        // case is nil on both, which still compares equal.
+        let iron_head = iron.cmd(&[b"LINDEX", &dst_key, b"0"]);
+        let redis_head = rds.cmd(&[b"LINDEX", &src_key, b"0"]);
+        let iron_tail = iron.cmd(&[b"LINDEX", &dst_key, b"-1"]);
+        let redis_tail = rds.cmd(&[b"LINDEX", &src_key, b"-1"]);
+        let iron_mid = iron.cmd(&[b"LINDEX", &dst_key, b"200"]);
+        let redis_mid = rds.cmd(&[b"LINDEX", &src_key, b"200"]);
+        compared += 1;
+        if iron_range != redis_range
+            || iron_len != redis_len
+            || iron_head != redis_head
+            || iron_tail != redis_tail
+            || iron_mid != redis_mid
+        {
+            div.push(Divergence {
+                cmd: format!("LIST DUMP(redis)->RESTORE(iron) {enc}; RESTORE said {restore:?}"),
+                iron: iron_range,
+                redis: redis_range,
+                note: "a list DUMPed by redis did not RESTORE to the same ordered elements on IronCache (#612 LIST)".to_owned(),
             });
         }
     }
