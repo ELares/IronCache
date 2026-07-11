@@ -17,14 +17,19 @@
 //! "unsupported" error rather than a wrong blob.
 //!
 //! RESTORE (decode) additionally accepts the SET type in all three RDB encodings -- the plain
-//! `RDB_TYPE_SET`, the `RDB_TYPE_SET_INTSET`, and the `RDB_TYPE_SET_LISTPACK` -- and the HASH type in
+//! `RDB_TYPE_SET`, the `RDB_TYPE_SET_INTSET`, and the `RDB_TYPE_SET_LISTPACK` -- the HASH type in
 //! its two non-field-TTL RDB encodings -- the plain `RDB_TYPE_HASH` and the `RDB_TYPE_HASH_LISTPACK`
-//! -- so a set OR a (non-field-TTL) hash DUMPed by a real redis RESTOREs here with identical
-//! members/fields (#612 phase; DUMP of an aggregate stays deferred). The field-TTL hash encodings
-//! (`RDB_TYPE_HASH_LISTPACK_EX`, `RDB_TYPE_HASH_METADATA`, and their pre-GA forms) are a tracked
-//! follow-up (#612 PR4) and are refused as bad data for now rather than half-decoded (a field TTL is
-//! never silently dropped). The remaining aggregate types (list/zset) RESTORE is the tracked
-//! follow-up; a type we do not yet decode is refused as bad data, never mis-decoded.
+//! -- and the ZSET type in all three RDB encodings -- `RDB_TYPE_ZSET_2` (8-byte little-endian
+//! binary-double scores), the legacy `RDB_TYPE_ZSET` (length-prefixed ASCII scores with the
+//! -inf/+inf/NaN sentinels), and `RDB_TYPE_ZSET_LISTPACK` -- so a set, a (non-field-TTL) hash, OR a
+//! sorted set DUMPed by a real redis RESTOREs here with identical members/fields/scores (#612 phase;
+//! DUMP of an aggregate stays deferred). A NaN score is refused as bad data in every zset encoding
+//! (parity with our ZADD guard + Redis's post-load isnan check); a +inf/-inf score is a legitimate
+//! value and is preserved. The field-TTL hash encodings (`RDB_TYPE_HASH_LISTPACK_EX`,
+//! `RDB_TYPE_HASH_METADATA`, and their pre-GA forms) are a tracked follow-up (#612 PR4) and are
+//! refused as bad data for now rather than half-decoded (a field TTL is never silently dropped). The
+//! remaining aggregate type (list) RESTORE is the tracked follow-up; a type we do not yet decode is
+//! refused as bad data, never mis-decoded.
 //!
 //! The reusable RDB codec substrate (the CRC-64 footer, the RDB length + string encodings, and the
 //! container element iterators the aggregate types build on) lives in [`crate::rdb`]; this slice is
@@ -50,14 +55,20 @@ use crate::rdb::{
     DECODE_PREALLOC_CAP, DUMP_RDB_VERSION, LpElem, RDB_TYPE_HASH, RDB_TYPE_HASH_LISTPACK,
     RDB_TYPE_HASH_LISTPACK_EX, RDB_TYPE_HASH_LISTPACK_EX_PRE_GA, RDB_TYPE_HASH_METADATA,
     RDB_TYPE_HASH_METADATA_PRE_GA, RDB_TYPE_SET, RDB_TYPE_SET_INTSET, RDB_TYPE_SET_LISTPACK,
-    RDB_TYPE_STRING, RestoreParseError, crc64, intset_iter, listpack_iter, read_rdb_len,
-    read_rdb_string, verify_footer, write_rdb_len,
+    RDB_TYPE_STRING, RDB_TYPE_ZSET, RDB_TYPE_ZSET_2, RDB_TYPE_ZSET_LISTPACK, RestoreParseError,
+    crc64, intset_iter, listpack_iter, parse_ascii_double, read_rdb_ascii_double,
+    read_rdb_binary_double, read_rdb_len, read_rdb_string, verify_footer, write_rdb_len,
 };
 
 /// A decoded hash's `(field, value)` pairs in stream order (a repeated field is resolved last-wins by
 /// [`NewValueOwned::Hash`]). Aliased to keep the [`deserialize_hash`] signature under the
 /// `type_complexity` lint, mirroring `cmd_hash`'s `FieldValue`.
 type HashPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// A decoded zset's `(member, score)` pairs in stream order (a repeated member is resolved
+/// last-score-wins by [`NewValueOwned::ZSet`] / `ZSetVal::from_pairs`). Aliased to keep the
+/// [`deserialize_zset`] signature under the `type_complexity` lint, mirroring [`HashPairs`].
+type ZSetPairs = Vec<(Vec<u8>, f64)>;
 
 /// Serialize `value` (its raw bytes) as a full DUMP blob: `type || raw-string || version || crc64`.
 #[must_use]
@@ -270,6 +281,123 @@ fn deserialize_hash(blob: &[u8]) -> Result<HashPairs, RestoreParseError> {
     }
 }
 
+/// Parse a DUMP blob (footer-verified) into the ZSET `(member, score)` pairs, ready for
+/// [`NewValueOwned::ZSet`] (which applies the listpack/skiplist ladder + the (score, member) ordering
+/// and, via `ZSetVal::from_pairs`, keeps the LAST score for a repeated member -- Redis's last-wins
+/// semantics -- so the decoder need not pre-dedup). A NaN score is rejected as
+/// [`RestoreParseError::BadData`] in ONE place after each score is read, exactly as Redis rejects a
+/// NaN-scored zset element on load (`rdbReportCorruptRDB("Zset with NAN score detected")`) and our own
+/// ZADD refuses a NaN; a +inf/-inf score is a LEGITIMATE value and is preserved. Handles the three RDB
+/// sorted-set encodings:
+///
+/// * `RDB_TYPE_ZSET_2` (5): an RDB length = the member count, then `count` x (an [`read_rdb_string`]
+///   member + an 8-byte little-endian IEEE754 `binary64` score, [`read_rdb_binary_double`]). The count
+///   is bounded against the remaining bytes BEFORE any pre-allocation: each element is at least a
+///   1-byte member length + 8 score bytes = 9 bytes, so a `count * 9` larger than the remaining bytes
+///   is a hostile/garbage header (`checked_mul` guards the product).
+/// * `RDB_TYPE_ZSET` (3, legacy ASCII scores): an RDB length = the member count, then `count` x (a
+///   member + a length-prefixed ASCII score with the `255`/`254`/`253` = -inf/+inf/NaN sentinels,
+///   [`read_rdb_ascii_double`]). Each element is at least a 1-byte member length + a 1-byte score
+///   length = 2 bytes, bounding the count as above.
+/// * `RDB_TYPE_ZSET_LISTPACK` (17): the listpack blob, itself stored AS an RDB string (so redis may
+///   LZF- or raw-encode it, EXACTLY like the SET_LISTPACK / HASH_LISTPACK cases), decoded by
+///   [`listpack_iter`]; its elements are the FLATTENED `[member, score, member, score, ...]`, so the
+///   count MUST be EVEN (an odd count is a corrupt/hostile blob -> BadData). An [`LpElem::Int`] member
+///   renders as its DECIMAL ASCII text (`ll2string`, as for a set/hash) and an [`LpElem::Str`] is the
+///   raw bytes; a score that is an [`LpElem::Int`] is that integer as an `f64`, a score that is an
+///   [`LpElem::Str`] is the ASCII float text parsed by [`parse_ascii_double`].
+///
+/// Every declared length is bounds-checked before a slice or allocation (the shared `rdb` discipline),
+/// so a hostile blob is a clean [`RestoreParseError::BadData`], never a panic or an over-allocation.
+fn deserialize_zset(blob: &[u8]) -> Result<ZSetPairs, RestoreParseError> {
+    let payload = verify_footer(blob)?;
+    let mut pos = 0usize;
+    let ty = *payload.get(pos).ok_or(RestoreParseError::BadData)?;
+    pos += 1;
+    match ty {
+        RDB_TYPE_ZSET_2 | RDB_TYPE_ZSET => {
+            let (count, is_encoded) = read_rdb_len(payload, &mut pos)?;
+            if is_encoded {
+                // A member count is never one of the RDB_ENCVAL special encodings.
+                return Err(RestoreParseError::BadData);
+            }
+            let count = usize::try_from(count).map_err(|_| RestoreParseError::BadData)?;
+            // Bound the declared count against the bytes still available BEFORE the pre-allocation: an
+            // element is a member (>= 1 length byte) plus a score (8 bytes for ZSET_2's binary double,
+            // >= 1 byte for ZSET's length-prefixed ASCII score / sentinel). A count implying more
+            // minimum-size elements than remaining bytes is a lie -> BadData. `checked_mul` guards the
+            // product, and `read_rdb_string` / the double readers re-validate each element's own bytes.
+            let per_elem = if ty == RDB_TYPE_ZSET_2 { 9 } else { 2 };
+            let min_bytes = count
+                .checked_mul(per_elem)
+                .ok_or(RestoreParseError::BadData)?;
+            if min_bytes > payload.len().saturating_sub(pos) {
+                return Err(RestoreParseError::BadData);
+            }
+            let mut pairs = Vec::with_capacity(count.min(DECODE_PREALLOC_CAP));
+            for _ in 0..count {
+                let member = read_rdb_string(payload, &mut pos)?;
+                let score = if ty == RDB_TYPE_ZSET_2 {
+                    read_rdb_binary_double(payload, &mut pos)?
+                } else {
+                    read_rdb_ascii_double(payload, &mut pos)?
+                };
+                // A NaN score (a NaN bit pattern in the binary form, the 253 sentinel or "nan" text in
+                // the ASCII form) is corrupt: reject it, matching Redis's post-load isnan guard and our
+                // ZADD. A +inf/-inf is finite-enough to keep.
+                if score.is_nan() {
+                    return Err(RestoreParseError::BadData);
+                }
+                pairs.push((member, score));
+            }
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes: malformed
+            }
+            Ok(pairs)
+        }
+        RDB_TYPE_ZSET_LISTPACK => {
+            // Stored AS an RDB string (redis `rdbSaveRawString`); decode the string first (LZF handled
+            // for free), then the listpack, whose elements are the flattened member/score pairs.
+            let body = read_rdb_string(payload, &mut pos)?;
+            if pos != payload.len() {
+                return Err(RestoreParseError::BadData); // trailing bytes after the listpack string
+            }
+            let elems = listpack_iter(&body)?;
+            // A zset listpack is member/score PAIRS, so the element count must be EVEN; an odd count is
+            // a corrupt/hostile blob (redis never writes one).
+            if elems.len() % 2 != 0 {
+                return Err(RestoreParseError::BadData);
+            }
+            let mut pairs: ZSetPairs = Vec::with_capacity(elems.len() / 2);
+            let mut it = elems.into_iter();
+            // The even-count check above guarantees `it` yields pairs; the `while let` stops cleanly at
+            // exhaustion. A member int renders as decimal ASCII, a member string is the raw bytes
+            // (matching SET_LISTPACK / HASH_LISTPACK); a score int IS that integer as an f64, a score
+            // string is its ASCII float text.
+            while let (Some(m), Some(sc)) = (it.next(), it.next()) {
+                let member = match m {
+                    LpElem::Int(n) => n.to_string().into_bytes(),
+                    LpElem::Str(b) => b.into_vec(),
+                };
+                let score = match sc {
+                    // A listpack int score is that integer as an f64 (the workspace allows the
+                    // cast_precision_loss: a real score is a whole number well within f64's exact range).
+                    LpElem::Int(n) => n as f64,
+                    LpElem::Str(b) => parse_ascii_double(&b)?,
+                };
+                if score.is_nan() {
+                    return Err(RestoreParseError::BadData);
+                }
+                pairs.push((member, score));
+            }
+            Ok(pairs)
+        }
+        // A non-zset type reaching here is a routing bug; the caller dispatches the decodable types
+        // elsewhere and any other type is refused as BadData (the value cannot be reconstructed).
+        _ => Err(RestoreParseError::BadData),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The commands.
 // ---------------------------------------------------------------------------
@@ -369,12 +497,13 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         }
         // Route on the RDB type byte, which is `blob[0]` (the first payload byte, before the footer)
         // and is CRC-covered, so `verify_footer` inside the chosen decoder still authenticates it: a
-        // SET type reconstructs a `NewValueOwned::Set` and a HASH type a `NewValueOwned::Hash` (the
-        // store dedups + applies the encoding ladder), everything else falls to the STRING decoder
-        // (which rejects a non-STRING type as BadData). The four field-TTL hash type bytes route to
-        // `deserialize_hash` too, which cleanly refuses them as BadData (PR4), so no key is created.
-        // All paths install through the same `RmwAction::Replace` used by the string RESTORE -- only
-        // the value construction differs, so REPLACE / ttl / ABSTTL / IDLETIME / FREQ all hold.
+        // SET type reconstructs a `NewValueOwned::Set`, a HASH type a `NewValueOwned::Hash`, and a ZSET
+        // type a `NewValueOwned::ZSet` (the store dedups + applies the encoding ladder), everything
+        // else falls to the STRING decoder (which rejects a non-STRING type as BadData). The four
+        // field-TTL hash type bytes route to `deserialize_hash` too, which cleanly refuses them as
+        // BadData (PR4), so no key is created. All paths install through the same `RmwAction::Replace`
+        // used by the string RESTORE -- only the value construction differs, so REPLACE / ttl / ABSTTL
+        // / IDLETIME / FREQ all hold.
         let decoded = match blob.first() {
             Some(&RDB_TYPE_SET | &RDB_TYPE_SET_INTSET | &RDB_TYPE_SET_LISTPACK) => {
                 deserialize_set(blob).map(NewValueOwned::Set)
@@ -387,6 +516,9 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
                 | &RDB_TYPE_HASH_METADATA_PRE_GA
                 | &RDB_TYPE_HASH_LISTPACK_EX_PRE_GA,
             ) => deserialize_hash(blob).map(NewValueOwned::Hash),
+            Some(&RDB_TYPE_ZSET_2 | &RDB_TYPE_ZSET | &RDB_TYPE_ZSET_LISTPACK) => {
+                deserialize_zset(blob).map(NewValueOwned::ZSet)
+            }
             _ => deserialize_string(blob).map(|v| NewValueOwned::Bytes(Bytes::from(v))),
         };
         match decoded {
@@ -1293,6 +1425,324 @@ mod tests {
         assert_eq!(
             s.read(0, b"k", NOW).and_then(|v| v.expire_at()),
             Some(UnixMillis(NOW.0 + 30_000))
+        );
+    }
+
+    // ---- ZSET RESTORE (#612 phase 5): the three RDB sorted-set encodings. ----
+
+    /// Append a legacy ASCII score (redis `rdbSaveDoubleValue` for a finite value): a 1-byte length
+    /// then the ASCII float text (the +inf/-inf/NaN sentinels are pushed as a bare 254/255/253 byte).
+    fn push_ascii_score(out: &mut Vec<u8>, text: &[u8]) {
+        assert!(
+            text.len() < 253,
+            "ascii score text uses a plain length byte"
+        );
+        out.push(text.len() as u8);
+        out.extend_from_slice(text);
+    }
+
+    /// Append an 8-byte little-endian binary-double score (redis `rdbSaveBinaryDoubleValue`).
+    fn push_binary_score(out: &mut Vec<u8>, score: f64) {
+        out.extend_from_slice(&score.to_le_bytes());
+    }
+
+    /// The ordered `(member, score)` pairs of `key` (ZRANGE 0 -1 WITHSCORES), read through the typed
+    /// `ZSetValue` view for a deterministic (score, member)-ordered assertion; empty if absent / not a
+    /// zset. `.len()` on the result is ZCARD.
+    fn zset_ordered(store: &mut TestStore, key: &[u8]) -> Vec<(Vec<u8>, f64)> {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let pairs = match entry {
+                RmwEntry::OccupiedMut(mut o) => o
+                    .as_zset_mut()
+                    .map(|z| z.range_by_rank(0, -1, false))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: pairs,
+            }
+        })
+    }
+
+    /// ZSCORE through the typed `ZSetValue` view.
+    fn zset_score(store: &mut TestStore, key: &[u8], member: &[u8]) -> Option<f64> {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let sc = match entry {
+                RmwEntry::OccupiedMut(mut o) => o.as_zset_mut().and_then(|z| z.score(member)),
+                _ => None,
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: sc,
+            }
+        })
+    }
+
+    #[test]
+    fn restore_zset2_binary_double_scores() {
+        // RDB_TYPE_ZSET_2: an RDB length = member count, then (member, 8-byte LE binary double). Covers
+        // a NEGATIVE score, a FRACTIONAL score, and +inf; ZRANGE WITHSCORES comes back in
+        // (score, member) order and each ZSCORE matches.
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 3);
+        push_rdb_string(&mut body, b"neg");
+        push_binary_score(&mut body, -3.5);
+        push_rdb_string(&mut body, b"frac");
+        push_binary_score(&mut body, 1.5);
+        push_rdb_string(&mut body, b"top");
+        push_binary_score(&mut body, f64::INFINITY);
+        let blob = set_blob(RDB_TYPE_ZSET_2, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"z2", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(
+            zset_ordered(&mut s, b"z2"),
+            vec![
+                (b"neg".to_vec(), -3.5),
+                (b"frac".to_vec(), 1.5),
+                (b"top".to_vec(), f64::INFINITY),
+            ]
+        );
+        assert_eq!(zset_score(&mut s, b"z2", b"frac"), Some(1.5)); // ZSCORE
+        assert_eq!(zset_ordered(&mut s, b"z2").len(), 3); // ZCARD
+    }
+
+    #[test]
+    fn restore_legacy_zset_ascii_scores_with_neg_inf_sentinel() {
+        // RDB_TYPE_ZSET (legacy): a member count then (member, ASCII score). The -inf sentinel (a bare
+        // length byte 255) and a normal "2" score both decode; -inf sorts first.
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 2);
+        push_rdb_string(&mut body, b"bottom");
+        body.push(255); // -inf sentinel (rdbSaveDoubleValue)
+        push_rdb_string(&mut body, b"mid");
+        push_ascii_score(&mut body, b"2");
+        let blob = set_blob(RDB_TYPE_ZSET, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"zl", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(
+            zset_ordered(&mut s, b"zl"),
+            vec![
+                (b"bottom".to_vec(), f64::NEG_INFINITY),
+                (b"mid".to_vec(), 2.0),
+            ]
+        );
+        assert_eq!(
+            zset_score(&mut s, b"zl", b"bottom"),
+            Some(f64::NEG_INFINITY)
+        );
+    }
+
+    #[test]
+    fn restore_zset_listpack_int_and_fractional_scores() {
+        // RDB_TYPE_ZSET_LISTPACK: flattened [member, score, ...]. A member-as-int renders decimal
+        // ("7"); an int score is that integer as f64 (5.0); a string score is parsed ("2.5").
+        let mut s = test_store();
+        let lp = build_listpack(&[
+            lp_str6(b"a"),
+            lp_int16(5),     // int score -> 5.0
+            lp_int16(7),     // int MEMBER -> "7"
+            lp_str6(b"2.5"), // string score -> 2.5
+        ]);
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_ZSET_LISTPACK, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"zlp", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(
+            zset_ordered(&mut s, b"zlp"),
+            vec![(b"7".to_vec(), 2.5), (b"a".to_vec(), 5.0)]
+        );
+        assert_eq!(zset_score(&mut s, b"zlp", b"7"), Some(2.5));
+        assert_eq!(zset_score(&mut s, b"zlp", b"a"), Some(5.0));
+    }
+
+    #[test]
+    fn restore_zset_repeated_member_keeps_last_score() {
+        // A hand-built ZSET_2 with the SAME member twice: NewValueOwned::ZSet builds via
+        // ZSetVal::from_pairs (last score wins), matching Redis. Real redis never dumps a duplicate,
+        // but the decoder must not trust the input to be unique.
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 3);
+        push_rdb_string(&mut body, b"a");
+        push_binary_score(&mut body, 1.0);
+        push_rdb_string(&mut body, b"b");
+        push_binary_score(&mut body, 2.0);
+        push_rdb_string(&mut body, b"a");
+        push_binary_score(&mut body, 9.0);
+        let blob = set_blob(RDB_TYPE_ZSET_2, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dup", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(zset_ordered(&mut s, b"dup").len(), 2, "duplicate collapses");
+        assert_eq!(
+            zset_score(&mut s, b"dup", b"a"),
+            Some(9.0),
+            "last score wins"
+        );
+    }
+
+    #[test]
+    fn deserialize_zset_rejects_nan_in_every_encoding() {
+        // A NaN score is corrupt in ALL three encodings (parity with our ZADD guard + Redis's post-load
+        // isnan check): the binary bit pattern, the legacy 253 sentinel, and a listpack "nan" text.
+        let mut b2 = Vec::new();
+        write_rdb_len(&mut b2, 1);
+        push_rdb_string(&mut b2, b"m");
+        push_binary_score(&mut b2, f64::NAN);
+        assert_eq!(
+            deserialize_zset(&set_blob(RDB_TYPE_ZSET_2, &b2)),
+            Err(RestoreParseError::BadData)
+        );
+
+        let mut bl = Vec::new();
+        write_rdb_len(&mut bl, 1);
+        push_rdb_string(&mut bl, b"m");
+        bl.push(253); // NaN sentinel
+        assert_eq!(
+            deserialize_zset(&set_blob(RDB_TYPE_ZSET, &bl)),
+            Err(RestoreParseError::BadData)
+        );
+
+        let lp = build_listpack(&[lp_str6(b"m"), lp_str6(b"nan")]);
+        let mut blp = Vec::new();
+        push_rdb_string(&mut blp, &lp);
+        assert_eq!(
+            deserialize_zset(&set_blob(RDB_TYPE_ZSET_LISTPACK, &blp)),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn deserialize_zset_rejects_an_odd_listpack() {
+        // A zset listpack must hold an EVEN number of elements (member/score pairs); an odd count is a
+        // corrupt/hostile blob (no partial pair kept).
+        let lp = build_listpack(&[lp_str6(b"a"), lp_int16(1), lp_str6(b"b")]);
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        assert_eq!(
+            deserialize_zset(&set_blob(RDB_TYPE_ZSET_LISTPACK, &body)),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn deserialize_zset_rejects_a_huge_declared_count_without_allocating() {
+        // A ZSET_2 whose declared count (~4 billion) dwarfs the tiny body: the count*9-vs-remaining
+        // bound rejects BEFORE the pre-allocation, no over-alloc, no panic.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 0xffff_ffff);
+        push_rdb_string(&mut body, b"m");
+        push_binary_score(&mut body, 1.0);
+        assert_eq!(
+            deserialize_zset(&set_blob(RDB_TYPE_ZSET_2, &body)),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn deserialize_zset_rejects_a_truncated_binary_double() {
+        // A ZSET_2 element with a member long enough to pass the count bound, but only 3 of the 8 score
+        // bytes: the binary-double reader rejects the short tail as BadData, no over-read.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 1);
+        push_rdb_string(&mut body, b"member"); // 7 bytes encoded, so count*9 <= remaining
+        body.extend_from_slice(&[0u8; 3]); // only 3 of 8 score bytes
+        assert_eq!(
+            deserialize_zset(&set_blob(RDB_TYPE_ZSET_2, &body)),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn deserialize_zset_rejects_a_listpack_length_past_the_end() {
+        // A zset listpack whose header total_bytes lies far past the real slice must be BadData with no
+        // over-read (the listpack decoder's exact-length gate).
+        let mut lp = build_listpack(&[lp_str6(b"a"), lp_int16(1)]);
+        lp[0..4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp);
+        assert_eq!(
+            deserialize_zset(&set_blob(RDB_TYPE_ZSET_LISTPACK, &body)),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn restore_a_hostile_zset_blob_errors_and_creates_no_key() {
+        // End-to-end: a hostile ZSET blob returns the bad-data error and leaves NO key behind (no
+        // panic, no partial write).
+        let mut s = test_store();
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 0xffff_ffff);
+        push_rdb_string(&mut body, b"x");
+        push_binary_score(&mut body, 1.0);
+        let blob = set_blob(RDB_TYPE_ZSET_2, &body);
+        let err = cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"h", b"0", &blob]));
+        assert_eq!(
+            match err {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-ERR Bad data format"
+        );
+        assert!(s.read(0, b"h", NOW).is_none(), "no key must be created");
+    }
+
+    #[test]
+    fn restore_zset_honors_replace_and_ttl() {
+        let mut s = test_store();
+        // Restore a legacy ASCII zset with no ttl.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 2);
+        push_rdb_string(&mut body, b"a");
+        push_ascii_score(&mut body, b"1");
+        push_rdb_string(&mut body, b"b");
+        push_ascii_score(&mut body, b"2");
+        let blob = set_blob(RDB_TYPE_ZSET, &body);
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])),
+            Value::ok()
+        );
+        // Without REPLACE -> BUSYKEY (value untouched).
+        assert_eq!(
+            match cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])) {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-BUSYKEY Target key name already exists."
+        );
+        // REPLACE + a relative ttl: a ZSET_2 blob overwrites the value and the deadline is now + ttl.
+        let mut body2 = Vec::new();
+        write_rdb_len(&mut body2, 1);
+        push_rdb_string(&mut body2, b"x");
+        push_binary_score(&mut body2, 3.5);
+        let blob2 = set_blob(RDB_TYPE_ZSET_2, &body2);
+        assert_eq!(
+            cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"k", b"40000", &blob2, b"REPLACE"])
+            ),
+            Value::ok()
+        );
+        assert_eq!(zset_ordered(&mut s, b"k"), vec![(b"x".to_vec(), 3.5)]);
+        assert_eq!(
+            s.read(0, b"k", NOW).and_then(|v| v.expire_at()),
+            Some(UnixMillis(NOW.0 + 40_000))
         );
     }
 }
