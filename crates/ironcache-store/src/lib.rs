@@ -3100,6 +3100,105 @@ impl<E: EvictionHook, A: AccountingHook> ShardStore<E, A> {
     }
 }
 
+/// A RESUMABLE cursor over a FROZEN slot view (the #588 [`ShardStore::begin_save`] output),
+/// the frozen-scan analogue of [`SnapshotCursor`]. It is a plain slot index into the
+/// `&[FrozenSlot]` vector: [`frozen_snapshot_chunk`] emits WHOLE slots per chunk and returns
+/// the next slot to resume at.
+///
+/// The frozen scan is TEAR-FREE by construction, which is the whole reason the streamed
+/// handoff (#391) drives it instead of the live [`ShardStore::snapshot_chunk`]: each frozen
+/// slot table is an `Arc` clone captured at the freeze and IMMUTABLE for the save's lifetime
+/// (a concurrent write to that slot COW-copies a fresh table via `Arc::make_mut`, leaving THIS
+/// frozen `Arc` untouched, see [`FrozenSlot`]). So iterating it visits EXACTLY the keys present
+/// at the freeze, in a stable order, and a concurrent rehash of the LIVE store can never skip a
+/// pre-existing key from this walk -- unlike a live chunked scan whose resize-stable cursor can
+/// (a torn scan) drop a pre-existing key that rehashes into an already-visited position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrozenCursor {
+    /// The next frozen-slot index to emit (0-based into the `&[FrozenSlot]` vector).
+    slot: usize,
+}
+
+impl FrozenCursor {
+    /// The start-of-iteration cursor: the first frozen slot.
+    pub const START: FrozenCursor = FrozenCursor { slot: 0 };
+
+    /// Whether the walk over a `total`-slot frozen view is COMPLETE (every slot emitted). The
+    /// caller loops `while !cursor.is_done(frozen.len())`.
+    #[must_use]
+    pub fn is_done(self, total: usize) -> bool {
+        self.slot >= total
+    }
+
+    /// The frozen-slot index this cursor is positioned at (introspection / tests).
+    #[must_use]
+    pub fn slot(self) -> usize {
+        self.slot
+    }
+}
+
+/// Pull ONE bounded chunk of a FROZEN slot view (`frozen`, from [`ShardStore::begin_save`]),
+/// resuming at `cursor`. Returns the chunk (each live entry as an owned `(db, key, KvObj)`
+/// [`SnapshotEntry`], the same borrow-free transfer triple [`ShardStore::snapshot_chunk`]
+/// yields, replayed by [`ShardStore::insert_object`]) and the NEXT [`FrozenCursor`]. The walk
+/// is COMPLETE once the returned cursor [`FrozenCursor::is_done`] is true.
+///
+/// This is the frozen-view counterpart of [`ShardStore::snapshot_chunk`] and is DATA-SAFE for
+/// the streamed handoff (#391): because each [`FrozenSlot`] is an immutable point-in-time `Arc`
+/// clone, this walk NEVER tears under a concurrent write (which COWs a fresh live copy and
+/// leaves the frozen `Arc` untouched), so a pre-existing key can never be skipped mid-scan. A
+/// live chunked scan CAN drop such a key when a concurrent rehash moves it behind the cursor;
+/// that torn-scan window is exactly what driving the handoff off the frozen view closes.
+///
+/// It ADDS a read-only accessor over the existing [`FrozenSlot`] surface (same shape the
+/// persist crate's `dump_frozen_slots` consumes); it does NOT touch the frozen-save primitives
+/// ([`ShardStore::begin_save`] / [`ShardStore::end_save`] / the `Arc::make_mut` COW write path),
+/// so their soundness argument is unchanged.
+///
+/// CONSTANT MEMORY: the chunk is built from WHOLE slots up to a `max`-entry budget (`max == 0`
+/// is treated as 1 so progress is always made) and stops at a slot boundary, so peak is bounded
+/// by `max` plus at most one frozen slot (~keyspace/slots by default). The returned `Vec` is
+/// owned, so the caller holds no borrow of `frozen` across an `.await`.
+///
+/// `now` is the caller's clock (ADR-0003: the store reads no clock): a lazily-expired entry is
+/// SKIPPED (never shipped as a live key, matching [`ShardStore::snapshot_chunk`]); the entry's
+/// ABSOLUTE deadline is preserved verbatim by [`Entry::to_kvobj`] (never rebased to `now`).
+#[must_use]
+pub fn frozen_snapshot_chunk(
+    frozen: &[FrozenSlot],
+    cursor: FrozenCursor,
+    max: usize,
+    now: UnixMillis,
+) -> (Vec<SnapshotEntry>, FrozenCursor) {
+    let budget = max.max(1);
+    let mut out: Vec<SnapshotEntry> = Vec::new();
+    let mut slot = cursor.slot;
+    // Walk WHOLE frozen slots, filling the chunk until the budget is reached at a slot boundary.
+    // Never splitting a slot keeps the cursor a plain index (no O(within) re-skip of a hashbrown
+    // iterator) while bounding peak memory by budget + one slot.
+    while slot < frozen.len() {
+        let fs = &frozen[slot];
+        let db = fs.db();
+        for entry in fs.entries() {
+            // Skip a logically-dead key (lazy expiry), exactly as the live snapshot does; the
+            // absolute deadline of a live key is carried verbatim in `to_kvobj`.
+            if entry.is_expired(now) {
+                continue;
+            }
+            out.push((
+                db,
+                entry.key().to_vec().into_boxed_slice(),
+                entry.to_kvobj(),
+            ));
+        }
+        slot += 1;
+        if out.len() >= budget {
+            break;
+        }
+    }
+    (out, FrozenCursor { slot })
+}
+
 /// Resolve an [`ExpireWrite`] against the entry's current deadline into the new
 /// absolute deadline. `Keep`/`Unchanged` preserve the old deadline; `Set` sets it;
 /// `Clear` removes it.

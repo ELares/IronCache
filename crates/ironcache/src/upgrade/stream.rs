@@ -110,7 +110,9 @@ use ironcache_repl::{
     encode_kvobj,
 };
 use ironcache_storage::{AccountingHook, EvictionHook, UnixMillis};
-use ironcache_store::{ShardStore, SnapshotCursor};
+use ironcache_store::{
+    FrozenCursor, FrozenSlot, ShardStore, SnapshotCursor, frozen_snapshot_chunk,
+};
 
 /// The magic at the head of EVERY handoff envelope: ASCII `ICHO` (IronCache HandOff), so a stray
 /// or foreign byte stream is rejected before any decode (mirrors the on-disk `ICSS` magic).
@@ -467,6 +469,13 @@ async fn abort_with<W: AsyncWrite + Unpin>(w: &mut W, err: HandoffError) -> Hand
 /// then are the frames awaited out -- no store borrow is ever held across an `.await`, peak memory
 /// is one chunk.
 ///
+/// CONCURRENCY: this scans the LIVE store, so it is only tear-free when NO write races the scan (a
+/// concurrent rehash could move a pre-existing key behind the resize-stable cursor and drop it from
+/// the dump). The live near-zero-downtime handoff (#391), where the old shard keeps serving WRITES
+/// during the bulk, MUST instead use [`send_bulk_from_frozen`] over a [`freeze_cut`] point-in-time
+/// view, which is tear-free by construction. This live variant is retained for the no-concurrent
+/// -write case (tests, a read-mostly transfer).
+///
 /// # Errors
 /// Any [`HandoffError`] on a socket failure, a rejected handshake, or a peer abort. The old store
 /// is untouched, so the caller keeps the OLD process serving.
@@ -652,6 +661,179 @@ where
 {
     let end_offset = send_bulk(stream, store, ring, shard, replid, now, chunk_max).await?;
     send_cutover(stream, ring, end_offset, chunk_max).await
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE ATOMIC CUT (#391 PR-1): freeze a point-in-time view + latch the delta floor in ONE step,
+// so the bulk scan is tear-free and the old shard keeps serving reads AND writes during it.
+// ---------------------------------------------------------------------------------------------
+
+/// Capture the ATOMIC CUT for a streamed handoff (#391): FREEZE the shard's #588/#576 Arc-COW
+/// slot view AND latch the delta FLOOR `F = ring.head()` in ONE uninterrupted, non-`await`
+/// critical section on the shard's own thread. Returns `(frozen slots, F)`. The caller ships the
+/// frozen slots with [`send_bulk_from_frozen`] (passing `F`), then -- after quiescing writes --
+/// drains the delta `(F, E]` with [`send_cutover`], and finally [`ironcache_store::ShardStore::end_save`]s
+/// once the frozen reads are done (drop the returned `Vec` first).
+///
+/// ## Why this is the load-bearing invariant (the "atomic cut")
+///
+/// The replication observer ring is ALWAYS-ON (installed before ANY write), so every mutator
+/// assigns its offset and appends to the ring in the SAME non-`await` critical section it applies
+/// to the store (free on a single-threaded shard). Given that keystone, this function's TWO reads
+/// -- `begin_save` (the freeze) and `ring.head()` (F) -- run back-to-back with NO `.await` and NO
+/// lock-drop between them, so they observe the SAME instant. Therefore:
+///
+/// - every mutation with offset `<= F` was applied BEFORE the freeze, so it is in the frozen view;
+/// - every mutation with offset `> F` happens AFTER the freeze, so it COW-copies a fresh live slot
+///   (`Arc::make_mut`), leaves the frozen `Arc` untouched, and lands in the ring at offset `> F`.
+///
+/// Hence `bulk(frozen @ F)` UNION `delta(F, E]` equals EXACTLY the mutations with offset `<= E`,
+/// with zero gaps and zero doubles. If ANY `.await` or lock-drop were introduced between the two
+/// reads, a write could apply+append in the gap and be MISSED by both the frozen view and the
+/// delta floor -- the torn cut this ordering forecloses. The precondition (the ring is always-on,
+/// installed before the first write) is the caller's to uphold; a write made before the observer
+/// was installed would be unobserved and thus outside both bulk and delta.
+///
+/// This does NOT change the frozen-save primitives: `begin_save` is called exactly as the durable
+/// persist path calls it, and the freeze/COW/`end_save` mechanism is untouched.
+#[must_use]
+pub fn freeze_cut<E, A>(
+    store: &mut ShardStore<E, A>,
+    ring: &Rc<RefCell<ReplRing>>,
+) -> (Vec<FrozenSlot>, ReplOffset)
+where
+    E: EvictionHook,
+    A: AccountingHook,
+{
+    // --- BEGIN ATOMIC CUT: NO `.await`, NO lock-drop between these two reads. ---
+    // FREEZE: O(slots) Arc-COW refcount bumps; the returned slots == the store state at this
+    // instant (a per-shard point-in-time). Sets the `saving` flag so a racing write COWs.
+    let frozen = store.begin_save();
+    // CUT: F = the highest offset assigned as of the freeze. Because no mutation can interleave
+    // between the freeze and this read (single thread, no await), F is exactly the floor the
+    // frozen view corresponds to: everything `<= F` is frozen, everything `> F` rides the delta.
+    let cut = ring.borrow().head();
+    // --- END ATOMIC CUT. ---
+    (frozen, cut)
+}
+
+/// SENDER, phase 1 (BULK) over a FROZEN view (#391 PR-1): handshake, then stream the shard's
+/// point-in-time keyspace old->new from the [`freeze_cut`] frozen slots, so the old shard keeps
+/// serving reads AND writes throughout.
+///
+/// Unlike [`send_bulk`] this does NOT scan the live store; it iterates the immutable frozen slot
+/// tables ([`ironcache_store::frozen_snapshot_chunk`]), so the scan is TEAR-FREE by construction:
+/// a concurrent write COW-copies a fresh LIVE slot and cannot perturb this frozen `Arc`, so no
+/// pre-existing key is ever skipped by a mid-scan rehash (the data-loss window driving the handoff
+/// off the frozen view closes). `cut` is the floor `F` from [`freeze_cut`], transmitted in the
+/// `FullSync` frame so the receiver's delta applies everything at offset `> F` (last-write-wins).
+///
+/// CONSTANT MEMORY: each chunk is pulled from whole frozen slots up to `chunk_max`, materialized as
+/// OWNED frames, and only then awaited out -- no borrow of `frozen` crosses an `.await`, peak is
+/// bounded by `chunk_max` plus one frozen slot.
+///
+/// The sender is READ-ONLY on the frozen view (and never touches the live store here); on ANY error
+/// the store is intact and the caller keeps the OLD process serving. `databases` is the sender's
+/// database count (`store.databases()`), advertised in the HELLO for `insert_object` routing.
+///
+/// # Errors
+/// Any [`HandoffError`] on a socket failure, a rejected handshake, or a peer abort.
+#[allow(clippy::too_many_arguments)] // the per-shard frozen-bulk transfer inputs; mirrors send_bulk.
+pub async fn send_bulk_from_frozen<S>(
+    stream: &mut S,
+    frozen: &[FrozenSlot],
+    shard: u32,
+    databases: u32,
+    replid: ReplId,
+    cut: ReplOffset,
+    now: UnixMillis,
+    chunk_max: usize,
+) -> Result<ReplOffset, HandoffError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_msg(stream, &HandoffMsg::Hello { shard, databases }).await?;
+    match read_msg(stream).await? {
+        HandoffMsg::HelloAck => {}
+        HandoffMsg::Abort => return Err(HandoffError::Aborted),
+        _ => return Err(HandoffError::HelloRejected),
+    }
+
+    // The cut `F` was latched ATOMICALLY with the freeze (freeze_cut) BEFORE this async send, so
+    // FullSync ships the exact floor the frozen view corresponds to. Any write after `F` COWs away
+    // from the frozen view and rides the delta ring at offset > F (applied last-write-wins).
+    let end_offset = cut;
+    write_msg(
+        stream,
+        &HandoffMsg::Frame(Frame::FullSync { replid, end_offset }),
+    )
+    .await?;
+
+    let mut cursor = FrozenCursor::START;
+    while !cursor.is_done(frozen.len()) {
+        // --- Pull ONE bounded chunk of the frozen view, encode it to OWNED frames. No borrow of
+        // `frozen` is held past this block, so nothing crosses the awaits below. ---
+        let frames: Vec<Frame> = {
+            let (chunk, next) = frozen_snapshot_chunk(frozen, cursor, chunk_max, now);
+            cursor = next;
+            chunk
+                .into_iter()
+                .map(|(db, key, kv)| Frame::SyncKv {
+                    db,
+                    key: key.into_vec(),
+                    kvobj_bytes: encode_kvobj(&kv),
+                })
+                .collect()
+        };
+        for frame in frames {
+            if let Err(e) = write_msg(stream, &HandoffMsg::Frame(frame)).await {
+                return Err(abort_with(stream, e).await);
+            }
+        }
+    }
+
+    write_msg(stream, &HandoffMsg::Frame(Frame::SyncEnd { end_offset })).await?;
+    Ok(end_offset)
+}
+
+/// SENDER convenience for the FROZEN path (the mirror of [`send_shard`]): [`freeze_cut`], then
+/// [`send_bulk_from_frozen`], then [`send_cutover`] with NO quiesce between, ending the save
+/// unconditionally so the freeze flag is cleared even on a mid-transfer abort. This is the simple
+/// no-concurrent-write case (tests, a read-mostly handoff); the live near-zero-downtime path drives
+/// [`freeze_cut`] / [`send_bulk_from_frozen`] / [`send_cutover`] explicitly and quiesces writes
+/// before the cutover so the delta tail is final.
+///
+/// # Errors
+/// Any [`HandoffError`] from either phase. The store is intact on failure and the save is ended.
+pub async fn send_shard_from_frozen<E, A, S>(
+    stream: &mut S,
+    store: &mut ShardStore<E, A>,
+    ring: &Rc<RefCell<ReplRing>>,
+    shard: u32,
+    replid: ReplId,
+    now: UnixMillis,
+    chunk_max: usize,
+) -> Result<ReplOffset, HandoffError>
+where
+    E: EvictionHook,
+    A: AccountingHook,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let databases = u32::try_from(store.databases()).unwrap_or(u32::MAX);
+    let (frozen, cut) = freeze_cut(store, ring);
+    // Ship the frozen bulk then drain the delta tail; on ANY error the store stays intact. The
+    // save is ended (frozen dropped first) in ALL cases so the `saving` flag never leaks.
+    let result = async {
+        send_bulk_from_frozen(
+            stream, &frozen, shard, databases, replid, cut, now, chunk_max,
+        )
+        .await?;
+        send_cutover(stream, ring, cut, chunk_max).await
+    }
+    .await;
+    drop(frozen);
+    store.end_save();
+    result
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1335,5 +1517,479 @@ mod socket_tests {
             b"c-v0",
             "old process still serves after the peer crashed"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #391 PR-1: the FROZEN atomic-cut bulk path (freeze_cut + send_bulk_from_frozen).
+    // -----------------------------------------------------------------------------------------
+
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    /// A far-future absolute TTL deadline, chosen so no key is lazily expired at [`NOW`] (the
+    /// snapshot/compare clock), letting the tests assert the deadline round-trips VERBATIM.
+    const TTL_AT: UnixMillis = UnixMillis(NOW.0 + 10_000_000);
+
+    /// Dump a LIVE store's whole keyspace as a `(db, key) -> encoded-KvObj` map. The encoded bytes
+    /// carry value + type + encoding + ABSOLUTE TTL, so map equality proves full-fidelity
+    /// convergence (value AND TTL), zero missing keys, and zero extra keys in ONE assertion.
+    fn live_dump_map<E: EvictionHook, A: AccountingHook>(
+        store: &ShardStore<E, A>,
+        now: UnixMillis,
+    ) -> HashMap<(u32, Vec<u8>), Vec<u8>> {
+        let mut m = HashMap::new();
+        let dbs = store.databases();
+        let mut c = SnapshotCursor::START;
+        while !c.is_done(dbs) {
+            let (chunk, next) = store.snapshot_chunk(c, 256, now);
+            c = next;
+            for (db, key, kv) in chunk {
+                m.insert((db, key.into_vec()), encode_kvobj(&kv));
+            }
+        }
+        m
+    }
+
+    /// Dump a LIVE store's whole keyspace as a `(db, key) -> KvObj` map (for reading back an
+    /// absolute-TTL deadline explicitly, on top of the encoded-bytes equality check).
+    fn live_kv_map<E: EvictionHook, A: AccountingHook>(
+        store: &ShardStore<E, A>,
+        now: UnixMillis,
+    ) -> HashMap<(u32, Vec<u8>), ironcache_store::KvObj> {
+        let mut m = HashMap::new();
+        let dbs = store.databases();
+        let mut c = SnapshotCursor::START;
+        while !c.is_done(dbs) {
+            let (chunk, next) = store.snapshot_chunk(c, 256, now);
+            c = next;
+            for (db, key, kv) in chunk {
+                m.insert((db, key.into_vec()), kv);
+            }
+        }
+        m
+    }
+
+    /// Dump a FROZEN view (`&[FrozenSlot]`) as a `(db, key) -> encoded-KvObj` map, via the new
+    /// [`frozen_snapshot_chunk`] accessor.
+    fn frozen_dump_map(frozen: &[FrozenSlot], now: UnixMillis) -> HashMap<(u32, Vec<u8>), Vec<u8>> {
+        let mut m = HashMap::new();
+        let mut c = FrozenCursor::START;
+        while !c.is_done(frozen.len()) {
+            let (chunk, next) = frozen_snapshot_chunk(frozen, c, 128, now);
+            c = next;
+            for (db, key, kv) in chunk {
+                m.insert((db, key.into_vec()), encode_kvobj(&kv));
+            }
+        }
+        m
+    }
+
+    /// ATOMIC-CUT UNIT (the invariant [`freeze_cut`] enforces): after the freeze returns, NO write
+    /// can be assigned an offset `<= F` unless it is already in the frozen view. Concretely: `F`
+    /// equals the ring head at the freeze; every subsequent write gets a STRICTLY GREATER,
+    /// contiguous offset; and the frozen point-in-time is UNPERTURBED by those live writes (COW
+    /// isolation), so nothing `> F` leaks into the bulk and nothing `<= F` is missing from it.
+    #[test]
+    fn freeze_cut_latches_f_atomically_and_no_later_write_is_at_or_below_f() {
+        let ring = ReplRing::new(65_536, ReplOffset::ZERO);
+        let mut s = ShardStore::new(DBS);
+        s.set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+
+        // N observed pre-freeze writes -> the always-on ring advances one offset per write.
+        let n = 64u32;
+        for i in 0..n {
+            s.upsert(
+                i % DBS,
+                format!("pre-{i}").as_bytes(),
+                NewValue::Bytes(format!("v-{i}").as_bytes()),
+                ExpireWrite::Clear,
+                NOW,
+            );
+        }
+        let head_before = ring.borrow().head();
+        assert_eq!(
+            head_before.0, n as u64,
+            "the always-on ring assigned one contiguous offset per pre-freeze write"
+        );
+
+        // THE ATOMIC CUT: freeze + F-latch in one non-await step.
+        let (frozen, f) = freeze_cut(&mut s, &ring);
+        assert_eq!(
+            f, head_before,
+            "F is exactly the ring head at the freeze instant"
+        );
+        assert!(
+            s.is_saving(),
+            "freeze_cut began the save so live writes COW away from the frozen view"
+        );
+
+        // The frozen view holds EXACTLY the pre-freeze keys.
+        let frozen_before = frozen_dump_map(&frozen, NOW);
+        assert_eq!(
+            frozen_before.len(),
+            n as usize,
+            "the frozen view is the pre-freeze point-in-time"
+        );
+
+        // Every post-freeze write (a churny overwrite / create / delete mix) is assigned an offset
+        // STRICTLY GREATER than F, contiguous and monotone: nothing can slip in at offset <= F.
+        let mut prev = f;
+        for j in 0..48u32 {
+            match j % 3 {
+                0 => {
+                    // overwrite an existing pre-freeze key (crosses to an int encoding)
+                    s.upsert(
+                        j % DBS,
+                        format!("pre-{j}").as_bytes(),
+                        NewValue::Int(i64::from(j)),
+                        ExpireWrite::Clear,
+                        NOW,
+                    );
+                }
+                1 => {
+                    // create a brand-new post-freeze key
+                    s.upsert(
+                        j % DBS,
+                        format!("post-{j}").as_bytes(),
+                        NewValue::Bytes(b"fresh"),
+                        ExpireWrite::Clear,
+                        NOW,
+                    );
+                }
+                _ => {
+                    // delete an existing pre-freeze key
+                    s.delete(j % DBS, format!("pre-{j}").as_bytes(), NOW);
+                }
+            }
+            let h = ring.borrow().head();
+            assert!(
+                h.0 > f.0,
+                "a post-freeze write was assigned offset {} which is not > F {}",
+                h.0,
+                f.0
+            );
+            assert_eq!(
+                h.0,
+                prev.0 + 1,
+                "offsets stay contiguous and strictly increasing after the freeze"
+            );
+            prev = h;
+        }
+
+        // The frozen point-in-time did NOT move under the live writes (COW isolation): the bulk the
+        // handoff ships is still exactly state@F -- no offset>F write leaked in, no offset<=F lost.
+        let frozen_after = frozen_dump_map(&frozen, NOW);
+        assert_eq!(
+            frozen_after, frozen_before,
+            "the frozen view is immutable under concurrent live writes"
+        );
+        // ... while the LIVE store genuinely advanced (pre-0 was overwritten to the int 0).
+        assert_eq!(
+            s.read(0, b"pre-0", NOW).unwrap().as_bytes(),
+            b"0",
+            "the live store moved even though the frozen view did not"
+        );
+        // A post-freeze new key is ABSENT from the frozen view (it rides the delta at offset > F).
+        assert!(
+            !frozen_before.contains_key(&(1u32, b"post-1".to_vec())),
+            "a post-freeze key must not appear in the frozen bulk"
+        );
+
+        drop(frozen);
+        s.end_save();
+    }
+
+    /// THE HERO TEST (#391 PR-1): a background writer HAMMERS the shard with a churny mix (create,
+    /// overwrite crossing encodings, delete, some absolute TTLs) THROUGHOUT the frozen bulk scan,
+    /// under REAL concurrent load on one thread (the writer is a joined future that yields between
+    /// ops, so it interleaves with every bulk frame). It reconstructs the receiver's post-cutover
+    /// store and asserts `bulk(frozen@F)` UNION `delta(F, E]` equals EXACTLY the sender's live
+    /// keyspace as of the cut `E`: every key present with its last-written value, ZERO pre-existing
+    /// keys lost to a mid-scan rehash, ZERO gaps, ZERO doubles, absolute TTLs preserved.
+    ///
+    /// This is the test that would CATCH the torn-scan bug the frozen view fixes: it seeds enough
+    /// keys across enough slots and drives thousands of concurrent inserts during the multi-thousand
+    /// -frame scan, so the LIVE store demonstrably rehashes while the scan runs -- a live chunked
+    /// scan (the old [`send_bulk`]) could drop a pre-existing key rehashed behind its cursor, which
+    /// the map-equality assertion below would surface as a missing key.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::too_many_lines)] // one churny-writer scenario end to end; splitting hides the flow.
+    #[allow(clippy::many_single_char_names)] // a/b sockets, f/e offsets: the file's test conventions.
+    async fn hero_frozen_bulk_under_write_load_is_the_exact_acked_set() {
+        // Enough keys spread across the default 256 slots/db that concurrent inserts force live-slot
+        // rehashes during the scan; the first RESERVED pre keys are never touched by the writer, so
+        // they must survive the whole handoff untouched (the "no pre-existing key lost" spine).
+        const PRE: u32 = 3_000;
+        const RESERVED: u32 = 24;
+        // A generous delta ring so the (F, E] tail never overflows under the write storm.
+        let ring = ReplRing::new(500_000, ReplOffset::ZERO);
+        let store = Rc::new(RefCell::new(ShardStore::new(DBS)));
+        store
+            .borrow_mut()
+            .set_write_observer(ReplObserver::boxed(Rc::clone(&ring)));
+
+        // Seed the pre-existing keyspace (installed AFTER the observer, so every key is on the ring).
+        // A mix of int and raw encodings; the reserved-index keys carry an absolute TTL to prove the
+        // deadline survives the bulk verbatim.
+        {
+            let mut s = store.borrow_mut();
+            for i in 0..PRE {
+                let db = i % DBS;
+                let key = format!("pre-{i}");
+                if i % 2 == 0 {
+                    s.upsert(
+                        db,
+                        key.as_bytes(),
+                        NewValue::Int(i64::from(i)),
+                        if i < RESERVED {
+                            ExpireWrite::Set(TTL_AT)
+                        } else {
+                            ExpireWrite::Clear
+                        },
+                        NOW,
+                    );
+                } else {
+                    s.upsert(
+                        db,
+                        key.as_bytes(),
+                        NewValue::Bytes(format!("raw-value-for-{i}").as_bytes()),
+                        if i < RESERVED {
+                            ExpireWrite::Set(TTL_AT)
+                        } else {
+                            ExpireWrite::Clear
+                        },
+                        NOW,
+                    );
+                }
+            }
+        }
+        let seeded = live_dump_map(&store.borrow(), NOW);
+        assert_eq!(
+            seeded.len(),
+            PRE as usize,
+            "the seed populated every pre key"
+        );
+
+        // ---- THE ATOMIC CUT (freeze + F), on the "shard thread" (a synchronous borrow). ----
+        let (frozen, f) = {
+            let mut s = store.borrow_mut();
+            freeze_cut(&mut s, &ring)
+        };
+        let frozen_bulk = frozen_dump_map(&frozen, NOW);
+        assert_eq!(
+            frozen_bulk.len(),
+            PRE as usize,
+            "the frozen bulk == the pre-cut keyspace (state@F)"
+        );
+
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+        let stop = Rc::new(Cell::new(false));
+
+        // ---- PHASE 1: frozen BULK shipped while the writer HAMMERS the live store. ----
+        let writer = {
+            let store = Rc::clone(&store);
+            let stop = Rc::clone(&stop);
+            async move {
+                // A batch of live writes per scheduling: the sender yields on socket backpressure a
+                // bounded number of times during the bulk, so batching each interleave point drives
+                // thousands of live mutations across those concurrent segments -- enough to grow +
+                // REHASH the live slots WHILE the scan runs (a live scan would tear here). The writer
+                // is NOT serialized: it runs interleaved with the scan, then stops when the bulk ends.
+                const BATCH: u64 = 64;
+                let mut n: u64 = 0;
+                while !stop.get() && n < 200_000 {
+                    {
+                        let mut s = store.borrow_mut();
+                        for _ in 0..BATCH {
+                            // A resize-stable spread so writes hit many different slots.
+                            let t = n.wrapping_mul(2_654_435_761) ^ (n >> 3);
+                            match n % 5 {
+                                // create/overwrite a NEW key (raw)
+                                0 => {
+                                    let idx = t % 20_000;
+                                    s.upsert(
+                                        (idx as u32) % DBS,
+                                        format!("nw-{idx}").as_bytes(),
+                                        NewValue::Bytes(format!("hot-{n}").as_bytes()),
+                                        ExpireWrite::Clear,
+                                        NOW,
+                                    );
+                                }
+                                // create a NEW key with an int encoding + an absolute TTL
+                                1 => {
+                                    let idx = t % 20_000;
+                                    s.upsert(
+                                        (idx as u32) % DBS,
+                                        format!("nw-{idx}").as_bytes(),
+                                        NewValue::Int(n as i64),
+                                        ExpireWrite::Set(TTL_AT),
+                                        NOW,
+                                    );
+                                }
+                                // overwrite an existing (non-reserved) PRE key, crossing encodings
+                                2 => {
+                                    let idx = RESERVED + (t as u32 % (PRE - RESERVED));
+                                    s.upsert(
+                                        idx % DBS,
+                                        format!("pre-{idx}").as_bytes(),
+                                        NewValue::Bytes(format!("rewritten-{n}").as_bytes()),
+                                        ExpireWrite::Clear,
+                                        NOW,
+                                    );
+                                }
+                                // delete a NEW key (idempotent whether or not it exists)
+                                3 => {
+                                    let idx = t % 20_000;
+                                    s.delete(
+                                        (idx as u32) % DBS,
+                                        format!("nw-{idx}").as_bytes(),
+                                        NOW,
+                                    );
+                                }
+                                // delete an existing (non-reserved) PRE key
+                                _ => {
+                                    let idx = RESERVED + (t as u32 % (PRE - RESERVED));
+                                    s.delete(idx % DBS, format!("pre-{idx}").as_bytes(), NOW);
+                                }
+                            }
+                            n += 1;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                n
+            }
+        };
+
+        let sender = {
+            let stop = Rc::clone(&stop);
+            let frozen = &frozen;
+            async move {
+                // Small chunks so the scan spans many frames (many interleavings with the writer),
+                // maximizing the rehash-vs-scan race.
+                let r = send_bulk_from_frozen(&mut a, frozen, 0, DBS, replid(), f, NOW, 4).await;
+                stop.set(true); // the bulk is done: release the writer.
+                (r, a)
+            }
+        };
+        let receiver = recv_bulk(&mut b, || ShardStore::new(DBS), DBS, NOW);
+
+        let (writer_ops, (send_res, mut a), recv_res) = tokio::join!(writer, sender, receiver);
+        let bulk_end = send_res.expect("frozen bulk send completes");
+        let (recv_store, _shard, recv_floor) = recv_res.expect("bulk recv completes");
+        assert_eq!(bulk_end, f, "the bulk ships the atomic-cut floor F");
+        assert_eq!(
+            recv_floor, f,
+            "sender and receiver agree on the delta floor F"
+        );
+        // A large writer-op count PROVES genuine interleaving: each writer batch requires a sender
+        // yield (socket backpressure) DURING the bulk, so thousands of ops means the scan was cut
+        // into many concurrent segments with heavy live churn (and rehashes) between them -- if the
+        // sender had run the whole bulk in one poll, the writer would have done ~0 ops before stop.
+        assert!(
+            writer_ops > 2_500,
+            "the writer must genuinely hammer THROUGHOUT the bulk (did {writer_ops} ops)"
+        );
+
+        // The frozen view has been fully read; end the save (drop the freeze) before the delta.
+        drop(frozen);
+        store.borrow_mut().end_save();
+
+        // The live store demonstrably GREW during the scan (thousands of concurrent inserts across
+        // 256 slots/db => live-slot rehashes raced the scan); a torn LIVE scan could have dropped a
+        // pre key here, which the map-equality assertion below would catch.
+        assert!(
+            !ring.borrow().needs_resync(),
+            "the delta ring must not overflow (it would abort the cutover)"
+        );
+
+        // ---- PHASE 2: QUIESCE (writer is joined/stopped) + final DELTA + CUTOVER. ----
+        // With the writer stopped, E is the final ring head; the delta (F, E] is a stable tail.
+        let e = ring.borrow().head();
+        assert!(e.0 > f.0, "writes during the bulk advanced the ring past F");
+        let send = send_cutover(&mut a, &ring, f, 256);
+        let recv = recv_cutover(&mut b, recv_store, 0, f, NOW);
+        let (sres, rres) = tokio::join!(send, recv);
+        let final_off = sres.expect("cutover send completes");
+        let loaded = rres.expect("cutover recv completes");
+        assert_eq!(final_off, e, "the cutover drained the whole tail up to E");
+        assert_eq!(loaded.final_offset, e, "receiver applied exactly through E");
+        let recv_store = loaded.store;
+
+        // ---- THE ASSERTION: bulk UNION delta == EXACTLY the acked writes as of the cut E. ----
+        // The sender's live store now reflects state@E (the writer has stopped). The receiver's
+        // reconstructed store must be byte-for-byte identical across the WHOLE keyspace: every key
+        // present with its last-written value+encoding+ABSOLUTE-TTL, zero pre keys lost to a
+        // mid-scan rehash, zero extras (no double or ghost), zero gaps.
+        let want = live_dump_map(&store.borrow(), NOW);
+        let got = live_dump_map(&recv_store, NOW);
+        assert_eq!(
+            got, want,
+            "reconstructed store (bulk UNION delta) must equal the sender's exact acked keyspace@E"
+        );
+
+        // Spot checks on top of the whole-keyspace equality:
+        // 1. Every RESERVED, never-touched pre key survives with its ORIGINAL value AND its absolute
+        //    TTL deadline (the frozen bulk carried it; nothing in the delta touched it).
+        let recv_kv = live_kv_map(&recv_store, NOW);
+        for i in 0..RESERVED {
+            let db = i % DBS;
+            let key = format!("pre-{i}");
+            let entry = recv_kv
+                .get(&(db, key.as_bytes().to_vec()))
+                .unwrap_or_else(|| panic!("reserved pre key {key} was LOST across the handoff"));
+            assert_eq!(
+                entry.expire_at,
+                Some(TTL_AT),
+                "reserved pre key {key} kept its ABSOLUTE TTL deadline (no rebase)"
+            );
+            assert_eq!(
+                got.get(&(db, key.as_bytes().to_vec())),
+                seeded.get(&(db, key.as_bytes().to_vec())),
+                "reserved pre key {key} kept its original seeded value"
+            );
+        }
+        // 2. The reconstructed keyspace is substantial (the writer added many new keys), proving the
+        //    delta really did carry a large post-F tail (not a trivially-empty handoff).
+        assert!(
+            got.len() > PRE as usize,
+            "the reconstructed keyspace ({}) must exceed the {PRE} pre keys (delta carried new keys)",
+            got.len()
+        );
+    }
+
+    /// The FROZEN convenience [`send_shard_from_frozen`] (the no-concurrent-write case): it streams
+    /// every key old->new AND ends the save (clears the freeze flag) on the success path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_shard_from_frozen_streams_every_key_and_ends_the_save() {
+        let (mut src, ring) = populated(40, "fz");
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+
+        let send = send_shard_from_frozen(&mut a, &mut src, &ring, 0, replid(), NOW, 4);
+        let recv = recv_shard(&mut b, || ShardStore::new(DBS), DBS, NOW);
+        let (sres, rres) = tokio::join!(send, recv);
+
+        let final_off = sres.expect("frozen send_shard completes");
+        let loaded = rres.expect("recv completes");
+        assert_eq!(
+            loaded.final_offset, final_off,
+            "sender and receiver agree on the cut"
+        );
+        assert!(
+            !src.is_saving(),
+            "the convenience ended the save (the freeze flag never leaks)"
+        );
+
+        // Every key is served by the adopted store.
+        let mut store = loaded.store;
+        for i in 0..40u32 {
+            let key = format!("fz-k{i}");
+            let want = format!("fz-v{i}");
+            assert_eq!(
+                store.read(i % DBS, key.as_bytes(), NOW).unwrap().as_bytes(),
+                want.as_bytes(),
+                "adopted store serves {key}"
+            );
+        }
     }
 }
