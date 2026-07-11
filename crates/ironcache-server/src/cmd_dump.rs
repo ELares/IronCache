@@ -11,9 +11,10 @@
 //!
 //! ## Scope
 //!
-//! DUMP (encode) emits the STRING type (`RDB_TYPE_STRING = 0`), and the SET, HASH, and ZSET aggregate
-//! types in their PLAIN RDB forms -- `RDB_TYPE_SET` (2), `RDB_TYPE_HASH` (4), and `RDB_TYPE_ZSET_2` (5,
-//! 8-byte little-endian binary-double scores). Because a HyperLogLog is stored AS a string (`cmd_hll`),
+//! DUMP (encode) emits the STRING type (`RDB_TYPE_STRING = 0`), and the SET, HASH, ZSET, and LIST
+//! aggregate types in their PLAIN RDB forms -- `RDB_TYPE_SET` (2), `RDB_TYPE_HASH` (4), `RDB_TYPE_ZSET_2`
+//! (5, 8-byte little-endian binary-double scores), and `RDB_TYPE_LIST` (1, the element count then each
+//! element as a raw RDB string in head-to-tail order). Because a HyperLogLog is stored AS a string (`cmd_hll`),
 //! the string path also gives HLL DUMP/RESTORE byte-interop for free (#242 part 2: an HLL DUMPed here
 //! RESTOREs + PFCOUNTs identically on redis).
 //!
@@ -23,9 +24,11 @@
 //! ALWAYS valid and always redis-loadable, regardless of the value's internal encoding on our side. Our
 //! footer stamps the conservative [`DUMP_RDB_VERSION`] and RESTORE compatibility is dump-low/accept-high
 //! (a modern redis is a higher RDB version >= 9), so a real redis accepts our blobs. (A future PR could
-//! emit the compact forms as a size optimization; out of scope here.) DUMP of a LIST is still a typed
-//! "unsupported" error rather than a wrong blob: the plain list form needs a listpack WRITER, which is
-//! a tracked follow-up (#612); DUMP of the STREAM type is likewise not yet emitted.
+//! emit the compact forms as a size optimization; out of scope here.) DUMP of a LIST likewise emits its
+//! PLAIN `RDB_TYPE_LIST` form, and this needs NO listpack writer: redis's RESTORE fully loads the plain
+//! list (reading the length as an element count, pushing each RDB string to the tail, then
+//! auto-converting the encoding), so the plain form is always redis-loadable. DUMP of the STREAM type
+//! is not yet emitted.
 //!
 //! RESTORE (decode) additionally accepts the SET type in all three RDB encodings -- the plain
 //! `RDB_TYPE_SET`, the `RDB_TYPE_SET_INTSET`, and the `RDB_TYPE_SET_LISTPACK` -- the HASH type in
@@ -163,6 +166,29 @@ pub fn serialize_zset(members: &[(Vec<u8>, f64)]) -> Vec<u8> {
         );
         write_rdb_string(&mut payload, member);
         payload.extend_from_slice(&score.to_le_bytes());
+    }
+    push_dump_footer(&mut payload);
+    payload
+}
+
+/// Serialize a LIST as a full DUMP blob in the PLAIN `RDB_TYPE_LIST` form (1): the type byte, the
+/// element COUNT (an RDB length), then each element as a raw RDB string ([`write_rdb_string`]) in
+/// HEAD-TO-TAIL order (index 0 first), then the version + CRC-64 footer. UNLIKE a set/hash/zset, a
+/// list preserves INSERTION ORDER, so the element order in the blob is the list order.
+///
+/// The plain form needs NO listpack WRITER: redis's RESTORE fully loads `RDB_TYPE_LIST` -- it reads
+/// the length as an element count, then that many RDB strings, pushing each to the list TAIL, and then
+/// auto-converts to its listpack/quicklist encoding -- so a plain-form blob is ALWAYS redis-loadable
+/// regardless of our internal list encoding (see the module-level "Scope" note, and exactly parallel to
+/// [`serialize_set`]); the compact quicklist-2 form is a deferred size optimization. `elements` is the
+/// [`ironcache_storage::ListValue::range`]`(0, -1)` head-to-tail snapshot, taken as a borrowed slice so
+/// there is no needless clone.
+#[must_use]
+pub fn serialize_list(elements: &[Vec<u8>]) -> Vec<u8> {
+    let mut payload = vec![RDB_TYPE_LIST];
+    write_rdb_len(&mut payload, elements.len() as u64);
+    for element in elements {
+        write_rdb_string(&mut payload, element);
     }
     push_dump_footer(&mut payload);
     payload
@@ -605,13 +631,12 @@ fn deserialize_list(blob: &[u8]) -> Result<Vec<Vec<u8>>, RestoreParseError> {
 // ---------------------------------------------------------------------------
 
 /// `DUMP key` -> the serialized value as a bulk string, or the null bulk string for a missing key.
-/// Serializes the STRING type (an HLL is a string, so it works too) and the SET / HASH / ZSET
-/// aggregate types in their plain RDB forms; DUMP of a LIST (or a STREAM) is still a typed
-/// "unsupported" error rather than a wrong blob (LIST DUMP needs a listpack writer, a tracked
-/// follow-up). DUMP has no WRONGTYPE (it serializes whatever type is present). READ-ONLY: a
-/// STRING serializes straight from the read view, and a collection is read through the typed
-/// mutable view with [`RmwAction::Keep`] (the established read-via-`rmw_mut` pattern), so no
-/// write / dirty / replication happens.
+/// Serializes the STRING type (an HLL is a string, so it works too) and the SET / HASH / ZSET / LIST
+/// aggregate types in their plain RDB forms; DUMP of a STREAM is still a typed "unsupported" error
+/// rather than a wrong blob (a tracked follow-up). DUMP has no WRONGTYPE (it serializes whatever type
+/// is present). READ-ONLY: a STRING serializes straight from the read view, and a collection is read
+/// through the typed mutable view with [`RmwAction::Keep`] (the established read-via-`rmw_mut`
+/// pattern), so no write / dirty / replication happens.
 pub fn cmd_dump<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request) -> Value {
     if req.args.len() != 2 {
         return Value::error(ErrorReply::wrong_arity("dump"));
@@ -646,11 +671,16 @@ pub fn cmd_dump<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Request
                 DataType::ZSet => o.as_zset_mut().map_or(Value::Null, |z| {
                     Value::BulkString(Some(Bytes::from(serialize_zset(&z.members_with_scores()))))
                 }),
-                // LIST DUMP needs a listpack writer and is a tracked follow-up (#612); STREAM DUMP is
-                // likewise not emitted yet. A STRING here would be the impossible race noted above.
-                DataType::List | DataType::Stream | DataType::String => Value::error(
-                    ErrorReply::err("DUMP of this value type is not yet supported"),
-                ),
+                // A LIST reads its elements head-to-tail via `range(0, -1)` (the same whole-list read
+                // `cmd_lrange` uses) and encodes the plain `RDB_TYPE_LIST` form, which preserves that
+                // insertion order.
+                DataType::List => o.as_list_mut().map_or(Value::Null, |l| {
+                    Value::BulkString(Some(Bytes::from(serialize_list(&l.range(0, -1)))))
+                }),
+                // STREAM DUMP is not emitted yet. A STRING here would be the impossible race noted above.
+                DataType::Stream | DataType::String => Value::error(ErrorReply::err(
+                    "DUMP of this value type is not yet supported",
+                )),
             },
             RmwEntry::Occupied(_) => unreachable!("rmw_mut never yields Occupied"),
         };
@@ -2553,7 +2583,12 @@ mod tests {
             b"zset",
             NewValueOwned::ZSet(vec![(b"m".to_vec(), 2.5)]),
         );
-        for key in [&b"set"[..], b"hash", b"zset"] {
+        seed_value(
+            &mut s,
+            b"list",
+            NewValueOwned::List(vec![b"a".to_vec(), b"b".to_vec()]),
+        );
+        for key in [&b"set"[..], b"hash", b"zset", b"list"] {
             let clean = dump_blob(&mut s, key);
             assert!(verify_footer(&clean).is_ok(), "{key:?} footer must verify");
             let mut bad = clean.to_vec();
@@ -2573,23 +2608,121 @@ mod tests {
         }
     }
 
+    // ---- LIST DUMP (#612 phase 8): the plain RDB_TYPE_LIST encode side, completing bidirectional
+    // DUMP+RESTORE for all four core aggregate types. ----
+    //
+    // These prove `serialize_list` emits a valid, RESTORE-able blob that preserves head-to-tail
+    // INSERTION ORDER (unlike the unordered set/hash checks). As with the other aggregates, the PRIMARY
+    // check is a round trip THROUGH THE STORE: seed a list in its natural internal encoding, `cmd_dump`
+    // it, `cmd_restore` the blob into a fresh key, and assert the reconstructed list equals the original
+    // EXACTLY (LRANGE 0 -1). A golden byte-layout test then pins the exact encoder output. (An empty
+    // list is never observed: the store deletes the key the moment its list becomes empty.)
+
     #[test]
-    fn dump_of_a_list_is_still_unsupported() {
-        // LIST DUMP needs a listpack writer (a tracked #612 follow-up), so it stays a typed error,
-        // never a wrong blob. RESTORE of a real list already works (see the LIST RESTORE tests).
+    fn dump_list_round_trips_small_single_node() {
+        // A small list fits a single listpack node on our side; DUMP emits the plain RDB_TYPE_LIST and
+        // RESTORE rebuilds the EXACT head-to-tail order.
+        let mut s = test_store();
+        let elements = vec![b"head".to_vec(), b"middle".to_vec(), b"tail".to_vec()];
+        seed_value(&mut s, b"src", NewValueOwned::List(elements.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(list_all(&mut s, b"dst"), elements); // exact order (LRANGE 0 -1)
+        assert_eq!(list_all(&mut s, b"dst"), list_all(&mut s, b"src"));
+        assert_eq!(list_len(&mut s, b"dst"), 3); // LLEN
+        assert_eq!(list_index(&mut s, b"dst", 0), Some(b"head".to_vec())); // LINDEX head
+        assert_eq!(list_index(&mut s, b"dst", -1), Some(b"tail".to_vec())); // LINDEX tail
+    }
+
+    #[test]
+    fn dump_list_round_trips_large_quicklist_encoding() {
+        // Enough elements to force the quicklist encoding on our side (> 200): the encoder must read
+        // EVERY element in order through `range(0, -1)`, independent of the source internal encoding.
+        let mut s = test_store();
+        let elements: Vec<Vec<u8>> = (0..500).map(|i| format!("e{i:04}").into_bytes()).collect();
+        seed_value(&mut s, b"src", NewValueOwned::List(elements.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(list_len(&mut s, b"dst"), 500); // LLEN
+        assert_eq!(list_all(&mut s, b"dst"), elements); // exact order preserved end to end
+        assert_eq!(list_index(&mut s, b"dst", 0), Some(b"e0000".to_vec())); // head
+        assert_eq!(list_index(&mut s, b"dst", -1), Some(b"e0499".to_vec())); // tail
+        assert_eq!(list_index(&mut s, b"dst", 250), Some(b"e0250".to_vec())); // middle
+    }
+
+    #[test]
+    fn dump_list_round_trips_edge_element_bytes_in_order() {
+        // Edge elements: an empty string, binary bytes (a NUL + high bytes), a > 64-byte element, and
+        // integer-looking elements -- each must survive DUMP -> RESTORE verbatim, and the head-to-tail
+        // ORDER must be preserved EXACTLY (a list is ordered, unlike a set/hash). The known appended
+        // sequence is asserted back index for index.
+        let mut s = test_store();
+        let elements = vec![
+            b"".to_vec(),
+            vec![0u8, 1, 255, 200, b'x'],
+            vec![b'q'; 80],
+            b"12345".to_vec(),
+            b"67890".to_vec(),
+            b"plain".to_vec(),
+        ];
+        seed_value(&mut s, b"src", NewValueOwned::List(elements.clone()));
+        let blob = dump_blob(&mut s, b"src");
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"dst", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(list_all(&mut s, b"dst"), elements); // exact sequence, order-sensitive
+        assert_eq!(list_index(&mut s, b"dst", 0), Some(b"".to_vec())); // empty-string head
+        assert_eq!(list_index(&mut s, b"dst", -1), Some(b"plain".to_vec())); // tail
+    }
+
+    #[test]
+    fn serialize_list_golden_byte_layout() {
+        // A three-element list ["a","bc",""]: type(1, RDB_TYPE_LIST), element count(3), then each
+        // element as a raw RDB string (len-prefix + bytes) in head-to-tail order, then the version +
+        // CRC-64 footer. Pin the exact body; the CRC itself is validated by rdb's known-answer test, so
+        // recomputing it here only checks that the encoder feeds the right bytes into the footer.
+        let blob = serialize_list(&[b"a".to_vec(), b"bc".to_vec(), b"".to_vec()]);
+        let mut expect = vec![RDB_TYPE_LIST, 3, 1, b'a', 2, b'b', b'c', 0];
+        let body_len = expect.len();
+        expect.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
+        expect.extend_from_slice(&crc64(0, &expect).to_le_bytes());
+        assert_eq!(blob, expect);
+        // The footer verifies and recovers exactly `type || body`.
+        assert_eq!(verify_footer(&blob).unwrap(), &expect[..body_len]);
+    }
+
+    #[test]
+    fn dump_list_blob_footer_verifies_and_a_flipped_byte_is_rejected() {
+        // A LIST DUMP blob carries the same version + CRC-64 footer as the other types: it verifies
+        // clean, and flipping a CRC byte makes RESTORE reject it (checksum mismatch), creating NO key.
         let mut s = test_store();
         seed_value(
             &mut s,
-            b"l",
-            NewValueOwned::List(vec![b"a".to_vec(), b"b".to_vec()]),
+            b"list",
+            NewValueOwned::List(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]),
         );
-        let err = cmd_dump(&mut s, 0, NOW, &req(&[b"DUMP", b"l"]));
-        assert_eq!(
-            match err {
-                Value::Error(e) => e.line(),
-                o => panic!("{o:?}"),
-            },
-            "-ERR DUMP of this value type is not yet supported"
+        let clean = dump_blob(&mut s, b"list");
+        assert!(verify_footer(&clean).is_ok(), "list footer must verify");
+        let mut bad = clean.to_vec();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff; // flip a CRC byte
+        assert!(
+            matches!(
+                cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"corrupt", b"0", &bad])),
+                Value::Error(_)
+            ),
+            "a corrupted list blob must be rejected"
+        );
+        assert!(
+            s.read(0, b"corrupt", NOW).is_none(),
+            "no key from a corrupted list blob"
         );
     }
 }

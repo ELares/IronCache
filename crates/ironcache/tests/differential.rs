@@ -879,10 +879,9 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
     }
 
     // SET, HASH, ZSET, and LIST values are SEPARATE helpers (below): they do not fit the simple
-    // SET/GET bidirectional loop above (each needs its own build + read-back commands). SET/HASH/ZSET
-    // DUMP is now implemented on IronCache, so those three check BOTH directions (redis DUMP ->
-    // IronCache RESTORE and IronCache DUMP -> redis RESTORE); LIST DUMP is still a tracked follow-up, so
-    // the list check stays one-directional (redis DUMP -> IronCache RESTORE).
+    // SET/GET bidirectional loop above (each needs its own build + read-back commands). All four
+    // aggregate DUMP encoders are now implemented on IronCache, so each check runs BOTH directions
+    // (redis DUMP -> IronCache RESTORE and IronCache DUMP -> redis RESTORE).
     compared += set_dump_restore_interop(iron, rds, div);
     compared += hash_dump_restore_interop(iron, rds, div);
     compared += zset_dump_restore_interop(iron, rds, div);
@@ -1235,17 +1234,18 @@ fn zset_dump_restore_interop(
     compared
 }
 
-/// The LIST half of the DUMP/RESTORE parity check (#612 LIST RESTORE). ONE-DIRECTIONAL (r2i only):
-/// DUMP of a list is not yet implemented on IronCache (still a typed "unsupported" error), so we
-/// exercise the real-Redis DUMP -> IronCache RESTORE direction, exactly the migration path that
-/// matters. We force BOTH a SMALL list (a single quicklist-2 PACKED node) AND a LARGE list (>
-/// `list-max-listpack-size` = 128 elements, which forces redis's quicklist encoding with MULTIPLE
-/// listpack nodes, plus one oversized element redis stores as a PLAIN node), covering short strings, a
-/// long (> 64 byte) string, pure integers, and an EMPTY-string element. A list preserves INSERTION
-/// ORDER, so the comparison is EXACT (unlike the unordered set/hash checks): we assert `LLEN`, the
-/// full ordered `LRANGE 0 -1`, and head/tail/middle `LINDEX` probes all match. When DUMP(list) lands
-/// the i2r direction can be added here too. Returns the number of comparisons made; a mismatch is
-/// pushed onto `div`.
+/// The LIST half of the DUMP/RESTORE parity check (#612 LIST). BIDIRECTIONAL now that DUMP(list) is
+/// implemented. r2i (real-Redis DUMP -> IronCache RESTORE) forces BOTH a SMALL list (a single
+/// quicklist-2 PACKED node) AND a LARGE list (> `list-max-listpack-size` = 128 elements, which forces
+/// redis's quicklist encoding with MULTIPLE listpack nodes, plus one oversized element redis stores as
+/// a PLAIN node), covering short strings, a long (> 64 byte) string, pure integers, and an EMPTY-string
+/// element -- exactly the migration path that matters. i2r (IronCache DUMP -> redis RESTORE) builds each
+/// case on IronCache (its internal encoding is irrelevant, since DUMP always emits the plain
+/// `RDB_TYPE_LIST`), DUMPs it here, RESTOREs into redis, and asserts redis reads back the same list --
+/// proving a REAL redis loads a blob WE emit. A list preserves INSERTION ORDER, so the comparison is
+/// EXACT (unlike the unordered set/hash checks): both directions assert `LLEN`, the full ordered
+/// `LRANGE 0 -1`, and head/tail/middle `LINDEX` probes all match. Returns the number of comparisons
+/// made; a mismatch is pushed onto `div`.
 fn list_dump_restore_interop(
     iron: &mut Client,
     rds: &mut Client,
@@ -1316,6 +1316,49 @@ fn list_dump_restore_interop(
                 iron: iron_range,
                 redis: redis_range,
                 note: "a list DUMPed by redis did not RESTORE to the same ordered elements on IronCache (#612 LIST)".to_owned(),
+            });
+        }
+    }
+    // i2r: IronCache DUMP -> redis RESTORE. Build on IronCache, DUMP here, RESTORE into redis, compare
+    // the ordered LRANGE + LLEN + head/tail/middle LINDEX (a list is ordered, so the compare is EXACT).
+    for (enc, elems) in &list_cases {
+        let src_key = format!("dr:list:{enc}:i2r:src").into_bytes();
+        let dst_key = format!("dr:list:{enc}:i2r:dst").into_bytes();
+        let mut rpush: Vec<&[u8]> = vec![b"RPUSH", &src_key];
+        rpush.extend(elems.iter().map(std::vec::Vec::as_slice));
+        iron.cmd(&rpush);
+        let Some(blob) = bulk_bytes(&iron.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP(iron) list {enc}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "IronCache DUMP of a list did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        let restore = rds.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let redis_range = rds.cmd(&[b"LRANGE", &dst_key, b"0", b"-1"]);
+        let iron_range = iron.cmd(&[b"LRANGE", &src_key, b"0", b"-1"]);
+        let redis_len = rds.cmd(&[b"LLEN", &dst_key]);
+        let iron_len = iron.cmd(&[b"LLEN", &src_key]);
+        let redis_head = rds.cmd(&[b"LINDEX", &dst_key, b"0"]);
+        let iron_head = iron.cmd(&[b"LINDEX", &src_key, b"0"]);
+        let redis_tail = rds.cmd(&[b"LINDEX", &dst_key, b"-1"]);
+        let iron_tail = iron.cmd(&[b"LINDEX", &src_key, b"-1"]);
+        let redis_mid = rds.cmd(&[b"LINDEX", &dst_key, b"200"]);
+        let iron_mid = iron.cmd(&[b"LINDEX", &src_key, b"200"]);
+        compared += 1;
+        if redis_range != iron_range
+            || redis_len != iron_len
+            || redis_head != iron_head
+            || redis_tail != iron_tail
+            || redis_mid != iron_mid
+        {
+            div.push(Divergence {
+                cmd: format!("LIST DUMP(iron)->RESTORE(redis) {enc}; RESTORE said {restore:?}"),
+                iron: iron_range,
+                redis: redis_range,
+                note: "a list DUMPed by IronCache did not RESTORE to the same ordered elements on redis (#612 LIST DUMP)".to_owned(),
             });
         }
     }
