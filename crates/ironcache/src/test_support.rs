@@ -85,6 +85,36 @@ pub fn run_server_for_test(port: u16, shards: usize) -> ShardSet {
     run_server(&config).expect("test server failed to bind")
 }
 
+/// Boot a real server on `127.0.0.1:port` across `shards` shards on the LINUX io_uring DATAPATH
+/// (PROD-10 / #28, [`RuntimeBackend::IoUring`](ironcache_config::RuntimeBackend::IoUring)) and return
+/// the running [`ShardSet`]. Identical to [`run_server_for_test`] except `runtime = io_uring`, so an
+/// integration test can drive the io_uring serve loop ([`crate::serve::serve_connection_uring`]) over
+/// real sockets and assert its reply ordering (#514, the cross-shard hop overlap).
+///
+/// Cfg-gated to a Linux build with the `io_uring` feature and NO TLS -- the ONLY case in which the
+/// io_uring backend is honored (in every other case [`crate::serve::run_server`] silently falls back
+/// to the tokio backend). Under this exact cfg the boot uses the io_uring datapath, so a test built
+/// here never silently exercises tokio instead. The CLIENT side is unchanged (plaintext RESP); only
+/// the server's per-connection datapath differs from [`run_server_for_test`].
+///
+/// # Panics
+///
+/// Panics if the server fails to bind (e.g. the port is already in use), which a test wants to
+/// surface immediately.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[must_use]
+pub fn run_server_io_uring_for_test(port: u16, shards: usize) -> ShardSet {
+    let config = Config {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        shards,
+        databases: 16,
+        runtime: ironcache_config::RuntimeBackend::IoUring,
+        ..Config::default()
+    };
+    run_server(&config).expect("test io_uring server failed to bind")
+}
+
 /// Boot a real server on `127.0.0.1:port` across `shards` shards with the CONNECTION-SAFETY limits
 /// set (PROD-SAFETY #3/#4/#5): `maxclients` (the simultaneous-connection ceiling; `0` disables),
 /// `timeout_secs` (the idle timeout; `0` disables), and `output_buffer_limit` (the per-connection
