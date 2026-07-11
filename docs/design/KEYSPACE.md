@@ -76,12 +76,17 @@ is specified here as the canonical serializer so #39/#40 (intset/HLL/OBJECT
 ENCODING) have one blob format to target, validated against the oracle
 [valkey-resp-identical]. The 512 MB value bound [bulk-string-max-512mb] applies.
 
-> **LOUD NOTE (current reality): DUMP is STRING-only; RESTORE also accepts SET, HASH, ZSET, and
-> LIST.** As implemented today, `DUMP` (encode) emits the **STRING type ONLY** (a HyperLogLog counts,
-> since an HLL is stored as a string); a `DUMP` of a list, hash, set, or zset returns an error.
-> `RESTORE` (decode) accepts the **STRING type, the SET type in all three RDB encodings** (intset,
-> listpack, and the plain length-prefixed set), **the HASH type in its two non-field-TTL encodings**
-> (listpack and the plain length-prefixed hash), **the ZSET type in all three encodings**
+> **LOUD NOTE (current reality): DUMP emits STRING + SET + HASH + ZSET; RESTORE also accepts LIST.**
+> As implemented today, `DUMP` (encode) emits the **STRING type** (a HyperLogLog counts, since an HLL
+> is stored as a string) and the **SET, HASH, and ZSET types in their plain RDB forms**
+> (`RDB_TYPE_SET`, `RDB_TYPE_HASH`, and `RDB_TYPE_ZSET_2` 8-byte binary-double scores). The plain forms
+> are always valid and Redis-loadable at any cardinality (the compact intset/listpack/skiplist
+> encodings are a size optimization, not a correctness requirement), so a set, hash, or zset `DUMP`ed
+> here `RESTORE`s on a real Redis with identical members/fields/scores (+inf/-inf preserved). A `DUMP`
+> of a **list** still returns an error (the plain list form needs a listpack writer, a tracked
+> follow-up). `RESTORE` (decode) accepts the **STRING type, the SET type in all three RDB encodings**
+> (intset, listpack, and the plain length-prefixed set), **the HASH type in its two non-field-TTL
+> encodings** (listpack and the plain length-prefixed hash), **the ZSET type in all three encodings**
 > (`RDB_TYPE_ZSET_2` binary-double scores, the legacy `RDB_TYPE_ZSET` ASCII scores, and listpack),
 > **and the LIST type in the modern `RDB_TYPE_LIST_QUICKLIST_2` encoding** (the quicklist of listpack
 > + plain nodes that Redis 7.x DUMPs, insertion order preserved across nodes) **plus the trivial
@@ -90,8 +95,8 @@ ENCODING) have one blob format to target, validated against the oracle
 > `ZADD`; +inf/-inf are preserved). A HASH carrying per-field TTLs (Redis 7.4+ `listpack_ex` /
 > `metadata` encodings) and the legacy ziplist-based list encodings (`RDB_TYPE_LIST_QUICKLIST` /
 > `RDB_TYPE_LIST_ZIPLIST`, which modern Redis never DUMPs) are still refused, so full multi-type
-> `MIGRATE` compatibility does NOT hold yet. The remaining per-type codecs (hash field-TTLs, the
-> ziplist-based list forms) and `DUMP` of the aggregate types are tracked in #612.
+> `MIGRATE` compatibility does NOT hold yet. The remaining follow-ups (LIST `DUMP`, hash field-TTL
+> `RESTORE`, and the ziplist-based list `RESTORE` forms) are tracked in #612.
 
 ## Open questions
 

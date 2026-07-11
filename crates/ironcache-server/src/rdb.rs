@@ -199,6 +199,18 @@ pub(crate) fn write_rdb_len(out: &mut Vec<u8>, len: u64) {
     }
 }
 
+/// Append an RDB RAW string (a length prefix via [`write_rdb_len`] then the bytes verbatim) to `out`.
+/// This is the un-compressed, un-int-encoded string form the DUMP encode side uses for every member /
+/// field / value: it is ALWAYS a valid redis payload (RESTORE accepts it), just not byte-identical to
+/// what redis's own DUMP might emit for a compressible or integer-looking value (redis may LZF- or
+/// int-encode). The LZF / INT special encodings are DECODE-only here; raw is always sufficient on
+/// encode. Mirrors `serialize_string`'s raw-string body, factored out so the aggregate `serialize_*`
+/// encoders share it.
+pub(crate) fn write_rdb_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_rdb_len(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
 /// Verify a DUMP blob's footer (version <= supported, CRC-64 matches) and return the value-payload
 /// slice (everything before the 10-byte footer).
 pub(crate) fn verify_footer(blob: &[u8]) -> Result<&[u8], RestoreParseError> {
