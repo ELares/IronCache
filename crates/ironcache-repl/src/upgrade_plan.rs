@@ -80,19 +80,26 @@ pub enum UpgradeStep {
 ///   replica (Phase 2's lag gate + quorum), computed by the driver from the live repl/raft state.
 /// - `primary_demoted`: has the promotion committed, so the OLD primary is now a replica (Phase 3)?
 /// - `old_primary_upgraded`: is that demoted old primary now on the new version?
+/// - `master_on_target`: is the CURRENT shard master already on the new version (the #392 slice-6
+///   belt-and-suspenders guard against a driver-restart double-failover)?
 ///
 /// The ORDER encodes the #392 sequence: finish the old-primary (Phase 3) once demoted; otherwise
 /// upgrade replicas first (Phase 1), waiting for each to re-sync; and only when all replicas are
 /// upgraded + in sync, promote (Phase 2), deferring safely if quorum or an in-sync candidate is
 /// missing. It never emits `Promote` while replicas remain to upgrade, so the primary is always
 /// upgraded LAST.
+// Each bool is an INDEPENDENT, named committed-state verdict (the same rationale as the test
+// MockCluster's `struct_excessive_bools` allow); bundling them into a struct would obscure the
+// truth-table call sites the unit tests pin, so the >3-bool signature is deliberate here.
 #[must_use]
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn upgrade_step(
     replicas_to_upgrade: usize,
     replica_catching_up: bool,
     promotion: PromotionSafety,
     primary_demoted: bool,
     old_primary_upgraded: bool,
+    master_on_target: bool,
 ) -> UpgradeStep {
     // Phase 3: the promotion has committed (the old primary is demoted). Upgrade it last, then done.
     // Checked first because it is only reachable AFTER Phases 1+2; during them `primary_demoted` is
@@ -113,6 +120,21 @@ pub fn upgrade_step(
     }
     if replicas_to_upgrade > 0 {
         return UpgradeStep::UpgradeReplica;
+    }
+
+    // Belt-and-suspenders guard (#392 slice 6): NEVER emit Promote when the CURRENT shard master is
+    // ALREADY on the target version. A rolling upgrade only ever promotes AWAY from an OLD-version
+    // master (the primary is upgraded LAST), so a master already on target -- with every replica
+    // also upgraded, which is exactly the state Phase 2 is reached in -- means the whole shard is
+    // rolled and there is nothing to promote away from: the step is Done. Without this guard a driver
+    // that RESTARTED right after a promotion (losing its in-memory `old_primary_id`) would re-capture
+    // the freshly promoted, on-target replica as "the master", count the demoted old primary as an
+    // old-version replica, upgrade it, then drive a SPURIOUS SECOND failover. The guard makes that
+    // resume an idempotent no-op with no external checkpoint. It only bites in Phase 2 (all replicas
+    // already upgraded); during a NORMAL roll the master here is still the old version, so
+    // `master_on_target` is false and promotion proceeds unchanged.
+    if master_on_target {
+        return UpgradeStep::Done;
     }
 
     // Phase 2: all replicas upgraded + in sync. Promote an upgraded in-sync replica so the old
@@ -157,6 +179,10 @@ pub trait UpgradeActions {
     fn primary_demoted(&self) -> bool;
     /// Is the demoted old primary now on the new version?
     fn old_primary_upgraded(&self) -> bool;
+    /// Is the CURRENT shard master already on the new version? The #392 slice-6 belt-and-suspenders
+    /// guard that keeps [`upgrade_step`] from emitting a SECOND `Promote` after a driver restart (a
+    /// roll only ever promotes AWAY from an old-version master), making a resume an idempotent no-op.
+    fn master_on_target(&self) -> bool;
 
     // -- execute a step's action --
     /// Upgrade the next not-yet-upgraded replica in place (drive its self-updater; it re-attaches).
@@ -198,6 +224,7 @@ pub fn drive_upgrade_step<A: UpgradeActions>(actions: &mut A) -> Result<UpgradeS
         actions.promotion_safety(),
         actions.primary_demoted(),
         actions.old_primary_upgraded(),
+        actions.master_on_target(),
     );
     match step {
         UpgradeStep::UpgradeReplica => actions.upgrade_next_replica()?,
@@ -321,6 +348,12 @@ mod tests {
         fn old_primary_upgraded(&self) -> bool {
             self.old_primary_upgraded
         }
+        fn master_on_target(&self) -> bool {
+            // The mock models the OLD primary staying on the old version until it is upgraded LAST
+            // (Phase 3), so the master is never "on target" during the roll; the slice-6 guard only
+            // matters to the live driver's restart-resume, exercised in the driver's own tests.
+            false
+        }
 
         fn upgrade_next_replica(&mut self) -> Result<(), ()> {
             self.actions_log.push("upgrade_replica");
@@ -354,59 +387,85 @@ mod tests {
         // Replicas remain + none catching up -> upgrade the next replica. Promotion verdict is
         // IRRELEVANT here (the primary is upgraded last), so even a Safe verdict does not promote.
         assert_eq!(
-            upgrade_step(3, false, SAFE, false, false),
+            upgrade_step(3, false, SAFE, false, false, false),
             UpgradeStep::UpgradeReplica
         );
         // A just-upgraded replica is re-syncing -> wait; do NOT start the next replica or promote.
         assert_eq!(
-            upgrade_step(2, true, SAFE, false, false),
+            upgrade_step(2, true, SAFE, false, false, false),
             UpgradeStep::AwaitInSync
         );
         // The catching-up gate wins even with zero replicas left to START (the in-flight one).
         assert_eq!(
-            upgrade_step(0, true, SAFE, false, false),
+            upgrade_step(0, true, SAFE, false, false, false),
             UpgradeStep::AwaitInSync
         );
     }
 
     #[test]
     fn phase2_promotes_only_after_all_replicas_upgraded_and_when_safe() {
-        // All replicas upgraded + in sync + safe -> promote.
+        // All replicas upgraded + in sync + safe + the master still on the OLD version -> promote.
         assert_eq!(
-            upgrade_step(0, false, SAFE, false, false),
+            upgrade_step(0, false, SAFE, false, false, false),
             UpgradeStep::Promote
         );
         // Safe promotion is NOT attempted while a replica still needs upgrading (primary last).
         assert_eq!(
-            upgrade_step(1, false, SAFE, false, false),
+            upgrade_step(1, false, SAFE, false, false, false),
             UpgradeStep::UpgradeReplica
         );
         // Guardrail defers: no quorum / no in-sync candidate -> Blocked with the matching reason.
         assert_eq!(
-            upgrade_step(0, false, NO_QUORUM, false, false),
+            upgrade_step(0, false, NO_QUORUM, false, false, false),
             UpgradeStep::Blocked(BlockReason::NoQuorum)
         );
         assert_eq!(
-            upgrade_step(0, false, NOT_IN_SYNC, false, false),
+            upgrade_step(0, false, NOT_IN_SYNC, false, false, false),
             UpgradeStep::Blocked(BlockReason::NoInSyncCandidate)
         );
     }
 
     #[test]
     fn phase3_upgrades_the_demoted_old_primary_last_then_done() {
-        // Promotion committed (primary demoted), old primary not yet upgraded -> upgrade it.
+        // Promotion committed (primary demoted), old primary not yet upgraded -> upgrade it. The new
+        // master (the promoted replica) IS on target, but Phase 3 is checked first, so the guard is
+        // moot here.
         assert_eq!(
-            upgrade_step(0, false, SAFE, true, false),
+            upgrade_step(0, false, SAFE, true, false, true),
             UpgradeStep::UpgradeOldPrimary
         );
         // Old primary upgraded -> Done.
-        assert_eq!(upgrade_step(0, false, SAFE, true, true), UpgradeStep::Done);
+        assert_eq!(
+            upgrade_step(0, false, SAFE, true, true, true),
+            UpgradeStep::Done
+        );
         // Phase 3 takes precedence: once demoted, the old-primary work runs regardless of the
         // (now-moot) replica/promotion inputs, so a stale Safe/replica count cannot re-trigger a
         // second promotion.
         assert_eq!(
-            upgrade_step(5, true, NO_QUORUM, true, false),
+            upgrade_step(5, true, NO_QUORUM, true, false, true),
             UpgradeStep::UpgradeOldPrimary
+        );
+    }
+
+    #[test]
+    fn slice6_guard_never_promotes_when_the_master_is_already_on_target() {
+        // #392 slice 6: in Phase 2 (all replicas upgraded, none catching up, not yet demoted) a
+        // master ALREADY on the target version means the shard is fully rolled -> Done, NEVER a
+        // (spurious, second) Promote. Holds regardless of the promotion verdict, since there is
+        // nothing to promote away from.
+        for promo in [SAFE, NO_QUORUM, NOT_IN_SYNC] {
+            assert_eq!(
+                upgrade_step(0, false, promo, false, false, true),
+                UpgradeStep::Done,
+                "master already on target -> Done, not a second promotion ({promo:?})"
+            );
+        }
+        // Contrast: the SAME inputs with the master still on the OLD version DO promote (the guard
+        // is the only difference), so it does not suppress a legitimate first failover.
+        assert_eq!(
+            upgrade_step(0, false, SAFE, false, false, false),
+            UpgradeStep::Promote
         );
     }
 
@@ -417,11 +476,14 @@ mod tests {
         for &replicas in &[1usize, 2, 5] {
             for &catching in &[false, true] {
                 for promo in [SAFE, NO_QUORUM, NOT_IN_SYNC] {
-                    let step = upgrade_step(replicas, catching, promo, false, false);
-                    assert!(
-                        !matches!(step, UpgradeStep::Promote | UpgradeStep::UpgradeOldPrimary),
-                        "must not touch the primary while replicas remain: {step:?}"
-                    );
+                    for &master_on_target in &[false, true] {
+                        let step =
+                            upgrade_step(replicas, catching, promo, false, false, master_on_target);
+                        assert!(
+                            !matches!(step, UpgradeStep::Promote | UpgradeStep::UpgradeOldPrimary),
+                            "must not touch the primary while replicas remain: {step:?}"
+                        );
+                    }
                 }
             }
         }
@@ -438,16 +500,25 @@ mod tests {
             for &catching in &[false, true] {
                 for promo in [SAFE, NO_QUORUM, NOT_IN_SYNC] {
                     for &old_up in &[false, true] {
-                        let step = upgrade_step(replicas, catching, promo, true, old_up);
-                        assert!(
-                            !matches!(step, UpgradeStep::Promote),
-                            "no second promotion once demoted: {step:?}"
-                        );
-                        // Phase 3 emits only the old-primary work or Done.
-                        assert!(
-                            matches!(step, UpgradeStep::UpgradeOldPrimary | UpgradeStep::Done),
-                            "phase 3 is old-primary-then-done: {step:?}"
-                        );
+                        for &master_on_target in &[false, true] {
+                            let step = upgrade_step(
+                                replicas,
+                                catching,
+                                promo,
+                                true,
+                                old_up,
+                                master_on_target,
+                            );
+                            assert!(
+                                !matches!(step, UpgradeStep::Promote),
+                                "no second promotion once demoted: {step:?}"
+                            );
+                            // Phase 3 emits only the old-primary work or Done.
+                            assert!(
+                                matches!(step, UpgradeStep::UpgradeOldPrimary | UpgradeStep::Done),
+                                "phase 3 is old-primary-then-done: {step:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -557,6 +628,9 @@ mod tests {
                 false
             }
             fn old_primary_upgraded(&self) -> bool {
+                false
+            }
+            fn master_on_target(&self) -> bool {
                 false
             }
             fn upgrade_next_replica(&mut self) -> Result<(), &'static str> {
