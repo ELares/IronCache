@@ -50,6 +50,14 @@ pub mod handoff;
 // layer of the live UpgradeActions impl; the wire I/O (fetch /topology + INFO, CLUSTER FAILOVER, the
 // per-node upgrade) is a following slice.
 pub mod cluster_upgrade;
+// The LIVE clustered rolling-upgrade DRIVER (#392 Phase 3): the `impl UpgradeActions` (LiveCluster)
+// that assembles a per-tick ClusterView from the authenticated RESP surface (INFO / CLUSTER SHARDS /
+// CLUSTER INFO), drives the three act methods over the wire, and implements the failover-freeze fence
+// (CLIENT PAUSE WRITE on the old primary -> drain the candidate to lag 0 -> CLUSTER FAILOVER, fail
+// closed on a drain timeout) as the load-bearing RPO=0 mechanism. The per-node binary swap is behind
+// the NodeUpgrader trait (prod: SSH-invoke the single-node `ironcache upgrade`); the CLI wiring + the
+// live 3-node acceptance test are following slices.
+pub mod cluster_upgrade_driver;
 pub mod pubsub;
 pub mod raft_boot;
 /// HA-7d LIVE per-shard replica attach. Reached ONLY in raft-mode once an `AssignReplica`

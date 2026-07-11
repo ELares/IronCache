@@ -152,6 +152,19 @@ impl ClusterView {
         })
     }
 
+    /// Is the CURRENT shard master already on the target version? `upgrade_step`'s `master_on_target`
+    /// (the #392 slice-6 belt-and-suspenders guard against a driver-restart double-failover): a roll
+    /// only ever promotes AWAY from an old-version master, so a master already on target -- with the
+    /// replicas also upgraded (the state Phase 2 is reached in) -- means the shard is fully rolled and
+    /// no (second) promotion is needed. With no observed master (a transient snapshot) this is false,
+    /// leaving the promotion gate to defer safely.
+    #[must_use]
+    pub fn master_on_target(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.role == NodeRole::Master && n.is_upgraded(&self.target_version))
+    }
+
     /// Pick the promotion candidate: an upgraded, in-sync replica, preferring the LEAST-lagging (the
     /// most-caught-up), so the synchronous fence loses the least. `None` if none is promotable.
     #[must_use]
@@ -325,6 +338,35 @@ mod tests {
         );
         assert!(done.primary_demoted());
         assert!(done.old_primary_upgraded());
+    }
+
+    #[test]
+    fn master_on_target_reflects_the_current_masters_version() {
+        // Master on the OLD version (the normal pre-promotion posture) -> false, so the promotion
+        // gate is free to fire.
+        let old = view(
+            vec![master("p", OLD), in_sync_replica("r1", TARGET)],
+            Some("p"),
+        );
+        assert!(!old.master_on_target());
+
+        // Master already on target (e.g. the driver restarted after promoting r1) -> true, the guard
+        // input that keeps upgrade_step from driving a second failover.
+        let promoted = view(
+            vec![
+                master("r1", TARGET),
+                NodeView {
+                    role: NodeRole::Replica,
+                    ..master("p", OLD) // old primary demoted, still old version
+                },
+            ],
+            None,
+        );
+        assert!(promoted.master_on_target());
+
+        // No master observed (a transient snapshot) -> false (defer, do not assume rolled).
+        let headless = view(vec![in_sync_replica("r1", TARGET)], None);
+        assert!(!headless.master_on_target());
     }
 
     #[test]
