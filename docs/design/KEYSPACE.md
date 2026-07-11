@@ -76,16 +76,18 @@ is specified here as the canonical serializer so #39/#40 (intset/HLL/OBJECT
 ENCODING) have one blob format to target, validated against the oracle
 [valkey-resp-identical]. The 512 MB value bound [bulk-string-max-512mb] applies.
 
-> **LOUD NOTE (current reality): DUMP is STRING-only; RESTORE also accepts SET and HASH.** As
+> **LOUD NOTE (current reality): DUMP is STRING-only; RESTORE also accepts SET, HASH, and ZSET.** As
 > implemented today, `DUMP` (encode) emits the **STRING type ONLY** (a HyperLogLog counts, since an
 > HLL is stored as a string); a `DUMP` of a list, hash, set, or zset returns an error. `RESTORE`
 > (decode) accepts the **STRING type, the SET type in all three RDB encodings** (intset, listpack,
-> and the plain length-prefixed set), **and the HASH type in its two non-field-TTL encodings**
-> (listpack and the plain length-prefixed hash), so a set OR a (non-field-TTL) hash `DUMP`ed by a real
-> Redis `RESTORE`s with identical members/fields. A HASH carrying per-field TTLs (Redis 7.4+
-> `listpack_ex` / `metadata` encodings) and `RESTORE` of a list or zset are still refused, so full
-> multi-type `MIGRATE` compatibility does NOT hold yet. The remaining per-type codecs (hash
-> field-TTLs, zset, list) and `DUMP` of the aggregate types are tracked in #612.
+> and the plain length-prefixed set), **the HASH type in its two non-field-TTL encodings** (listpack
+> and the plain length-prefixed hash), **and the ZSET type in all three encodings** (`RDB_TYPE_ZSET_2`
+> binary-double scores, the legacy `RDB_TYPE_ZSET` ASCII scores, and listpack), so a set, a
+> (non-field-TTL) hash, OR a sorted set `DUMP`ed by a real Redis `RESTORE`s with identical
+> members/fields/scores (a NaN score is refused, matching `ZADD`; +inf/-inf are preserved). A HASH
+> carrying per-field TTLs (Redis 7.4+ `listpack_ex` / `metadata` encodings) and `RESTORE` of a list
+> are still refused, so full multi-type `MIGRATE` compatibility does NOT hold yet. The remaining
+> per-type codecs (hash field-TTLs, list) and `DUMP` of the aggregate types are tracked in #612.
 
 ## Open questions
 

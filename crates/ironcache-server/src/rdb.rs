@@ -279,6 +279,60 @@ pub(crate) fn read_int_string(
     Ok(v.to_string().into_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// RDB double (zset score) encodings. A sorted set stores each score either as a raw 8-byte
+// little-endian IEEE754 binary64 (`RDB_TYPE_ZSET_2`, Redis `rdbLoadBinaryDoubleValue`) or, in the
+// legacy `RDB_TYPE_ZSET`, as a length-prefixed ASCII string with three sentinel lengths for the
+// non-finite values (`rdbLoadDoubleValue`). Both readers return the RAW `f64` -- a +inf/-inf is a
+// legitimate score and is preserved -- and leave a NaN for the caller to reject, matching Redis's
+// post-load `isnan` guard (`rdbReportCorruptRDB("Zset with NAN score detected")`) and our own ZADD.
+// ---------------------------------------------------------------------------
+
+/// Read an 8-byte little-endian IEEE754 `binary64` score (`RDB_TYPE_ZSET_2`, Redis
+/// `rdbLoadBinaryDoubleValue`, which stores the double little-endian byte-for-byte -- `memrev64ifbe`
+/// is a no-op on the little-endian wire form). Returns the raw value: a +inf/-inf is legitimate and a
+/// NaN bit pattern is returned as-is for the caller's `is_nan` gate to reject. A truncated 8-byte
+/// tail is a clean [`RestoreParseError::BadData`], never an over-read.
+pub(crate) fn read_rdb_binary_double(p: &[u8], pos: &mut usize) -> Result<f64, RestoreParseError> {
+    let b = p.get(*pos..*pos + 8).ok_or(RestoreParseError::BadData)?;
+    *pos += 8;
+    Ok(f64::from_le_bytes(b.try_into().expect("8 bytes")))
+}
+
+/// Read a legacy ASCII score (`RDB_TYPE_ZSET`, Redis `rdbLoadDoubleValue`): one length byte `L`, then
+/// the three sentinel lengths `255` -> -inf, `254` -> +inf, `253` -> NaN (returned as NaN for the
+/// caller to reject), else read `L` bytes and parse them as an ASCII float. Returns the raw value; a
+/// truncated body or a non-float text is a clean [`RestoreParseError::BadData`].
+pub(crate) fn read_rdb_ascii_double(p: &[u8], pos: &mut usize) -> Result<f64, RestoreParseError> {
+    let len = *p.get(*pos).ok_or(RestoreParseError::BadData)?;
+    *pos += 1;
+    match len {
+        255 => Ok(f64::NEG_INFINITY),
+        254 => Ok(f64::INFINITY),
+        // The NaN sentinel: returned as NaN so the caller's single `is_nan` gate turns it into
+        // BadData, exactly as Redis's post-load isnan check rejects a NaN-scored zset element.
+        253 => Ok(f64::NAN),
+        n => {
+            let n = usize::from(n);
+            let end = pos.checked_add(n).ok_or(RestoreParseError::BadData)?;
+            let bytes = p.get(*pos..end).ok_or(RestoreParseError::BadData)?;
+            *pos = end;
+            parse_ascii_double(bytes)
+        }
+    }
+}
+
+/// Parse a raw ASCII float (the digits Redis writes with `ll2string` / `fpconv_dtoa`, or an `inf` /
+/// `-inf` spelling some producers emit) into an `f64`. Redis loads these with `sscanf(%lg)`; Rust's
+/// float parser accepts the same finite decimal / scientific forms plus the `inf`/`infinity`
+/// spellings. A byte string that is not a valid float is [`RestoreParseError::BadData`]; a `nan` text
+/// parses to NaN and is left for the caller's `is_nan` gate to reject. Also used for a listpack
+/// zset's string-encoded score element.
+pub(crate) fn parse_ascii_double(bytes: &[u8]) -> Result<f64, RestoreParseError> {
+    let s = std::str::from_utf8(bytes).map_err(|_| RestoreParseError::BadData)?;
+    s.parse::<f64>().map_err(|_| RestoreParseError::BadData)
+}
+
 /// Decompress an LZF-compressed RDB string: `clen` (compressed len) `ulen` (uncompressed len) then
 /// the LZF stream. LZF is a byte stream of (a) literal runs `0LLLLLLL` + L+1 literal bytes, and (b)
 /// back-references `LLLNNNNN [NNNNNNNN]` copying `len` bytes from `distance` back. Only DECOMPRESSION
@@ -914,5 +968,82 @@ mod tests {
         blob.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
         blob.extend_from_slice(&[0u8; 8]); // one token value's worth of bytes
         assert_eq!(intset_iter(&blob), Err(RestoreParseError::BadData));
+    }
+
+    // ---- RDB double (zset score) encodings. ----
+
+    #[test]
+    fn binary_double_reads_little_endian_and_the_non_finites() {
+        // A finite value, its NEGATIVE, a fraction, and +inf/-inf all round-trip byte-for-byte through
+        // the little-endian 8-byte reader; the reader returns the raw f64 (NaN gate is the caller's).
+        for v in [3.5_f64, -2.0, 0.1, f64::INFINITY, f64::NEG_INFINITY] {
+            let bytes = v.to_le_bytes();
+            let mut pos = 0usize;
+            let got = read_rdb_binary_double(&bytes, &mut pos).unwrap();
+            assert_eq!(pos, 8);
+            assert_eq!(got.to_bits(), v.to_bits(), "round trip for {v}");
+        }
+        // A NaN bit pattern is returned as-is (the caller rejects it).
+        let mut pos = 0usize;
+        assert!(
+            read_rdb_binary_double(&f64::NAN.to_le_bytes(), &mut pos)
+                .unwrap()
+                .is_nan()
+        );
+        // A truncated tail (<8 bytes) is BadData, never an over-read.
+        let mut pos = 0usize;
+        assert_eq!(
+            read_rdb_binary_double(&[0u8; 7], &mut pos),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn ascii_double_reads_sentinels_and_text() {
+        // Sentinel lengths: 255 -> -inf, 254 -> +inf, 253 -> NaN.
+        let mut pos = 0usize;
+        assert_eq!(
+            read_rdb_ascii_double(&[255], &mut pos),
+            Ok(f64::NEG_INFINITY)
+        );
+        let mut pos = 0usize;
+        assert_eq!(read_rdb_ascii_double(&[254], &mut pos), Ok(f64::INFINITY));
+        let mut pos = 0usize;
+        assert!(read_rdb_ascii_double(&[253], &mut pos).unwrap().is_nan());
+        // A normal length-prefixed ASCII float: L then L bytes.
+        let mut blob = vec![4u8];
+        blob.extend_from_slice(b"3.25");
+        let mut pos = 0usize;
+        assert_eq!(read_rdb_ascii_double(&blob, &mut pos), Ok(3.25));
+        assert_eq!(pos, 5);
+        // A negative integer-valued score renders exactly.
+        let mut blob = vec![2u8];
+        blob.extend_from_slice(b"-7");
+        let mut pos = 0usize;
+        assert_eq!(read_rdb_ascii_double(&blob, &mut pos), Ok(-7.0));
+        // A length that runs past the end is BadData, no over-read.
+        let mut pos = 0usize;
+        assert_eq!(
+            read_rdb_ascii_double(&[9u8, b'1'], &mut pos),
+            Err(RestoreParseError::BadData)
+        );
+        // Non-float text is BadData.
+        let mut blob = vec![3u8];
+        blob.extend_from_slice(b"1x2");
+        let mut pos = 0usize;
+        assert_eq!(
+            read_rdb_ascii_double(&blob, &mut pos),
+            Err(RestoreParseError::BadData)
+        );
+    }
+
+    #[test]
+    fn parse_ascii_double_accepts_inf_rejects_junk() {
+        assert_eq!(parse_ascii_double(b"inf"), Ok(f64::INFINITY));
+        assert_eq!(parse_ascii_double(b"-inf"), Ok(f64::NEG_INFINITY));
+        assert_eq!(parse_ascii_double(b"1e10"), Ok(1e10));
+        assert!(parse_ascii_double(b"nan").unwrap().is_nan());
+        assert_eq!(parse_ascii_double(b""), Err(RestoreParseError::BadData));
+        assert_eq!(parse_ascii_double(b"abc"), Err(RestoreParseError::BadData));
     }
 }

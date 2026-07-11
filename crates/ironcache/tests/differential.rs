@@ -878,11 +878,12 @@ fn dump_restore_interop(iron: &mut Client, rds: &mut Client, div: &mut Vec<Diver
         }
     }
 
-    // SET and HASH values are SEPARATE helpers (below): DUMP of an aggregate is not yet implemented on
-    // IronCache, so each parity check is one-directional (redis DUMP -> IronCache RESTORE) and does not
-    // fit the bidirectional loop above.
+    // SET, HASH, and ZSET values are SEPARATE helpers (below): DUMP of an aggregate is not yet
+    // implemented on IronCache, so each parity check is one-directional (redis DUMP -> IronCache
+    // RESTORE) and does not fit the bidirectional loop above.
     compared += set_dump_restore_interop(iron, rds, div);
     compared += hash_dump_restore_interop(iron, rds, div);
+    compared += zset_dump_restore_interop(iron, rds, div);
 
     compared
 }
@@ -1035,6 +1036,91 @@ fn hash_dump_restore_interop(
                 iron: iron_reply,
                 redis: redis_reply,
                 note: "a hash DUMPed by redis did not RESTORE to the same fields on IronCache (#612 HASH)".to_owned(),
+            });
+        }
+    }
+    compared
+}
+
+/// The ZSET half of the DUMP/RESTORE parity check (#612 ZSET RESTORE). ONE-DIRECTIONAL (r2i only):
+/// DUMP of a zset is not yet implemented on IronCache (still a typed "unsupported" error), so we
+/// exercise the real-Redis DUMP -> IronCache RESTORE direction, exactly the migration path that
+/// matters. We force BOTH of redis's sorted-set encodings -- `listpack` for a small zset and the
+/// `skiplist` (which DUMPs as `RDB_TYPE_ZSET_2`, 8-byte binary-double scores) for a large one -- with
+/// a FRACTIONAL score, a LARGE score, a NEGATIVE score, and +inf/-inf, and assert `ZRANGE 0 -1
+/// WITHSCORES` (deterministic (score, member) order, all scores distinct) AND `ZCARD` match. When
+/// DUMP(zset) lands the i2r direction can be added here too. Returns the number of comparisons made; a
+/// mismatch is pushed onto `div`.
+fn zset_dump_restore_interop(
+    iron: &mut Client,
+    rds: &mut Client,
+    div: &mut Vec<Divergence>,
+) -> usize {
+    let mut compared = 0usize;
+    // The large case: > `zset-max-listpack-entries` (128) members forces redis's skiplist encoding,
+    // which DUMPs as RDB_TYPE_ZSET_2 (binary-double scores). Distinct fractional scores plus a large /
+    // negative / +inf / -inf score exercise the binary-double decode path end to end.
+    let mut skiplist: Vec<(Vec<u8>, Vec<u8>)> = (0..200)
+        .map(|i| {
+            (
+                format!("m{i:03}").into_bytes(),
+                format!("{}", f64::from(i) + 0.5).into_bytes(),
+            )
+        })
+        .collect();
+    skiplist.push((b"big".to_vec(), b"1000000".to_vec()));
+    skiplist.push((b"neg".to_vec(), b"-42.25".to_vec()));
+    skiplist.push((b"pinf".to_vec(), b"+inf".to_vec()));
+    skiplist.push((b"ninf".to_vec(), b"-inf".to_vec()));
+
+    // Type left to inference: the fully-written nested type trips clippy's `type_complexity` lint.
+    let zset_cases = vec![
+        // Small -> redis `listpack` encoding: an integer score (int-encoded listpack element), a
+        // FRACTIONAL score (string element), an integer MEMBER, and +inf/-inf (string elements the
+        // decoder parses back to non-finite scores).
+        (
+            "listpack",
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2.5".to_vec()),
+                (b"7".to_vec(), b"-3".to_vec()),
+                (b"hi".to_vec(), b"+inf".to_vec()),
+                (b"lo".to_vec(), b"-inf".to_vec()),
+            ],
+        ),
+        ("skiplist", skiplist),
+    ];
+    for (enc, pairs) in &zset_cases {
+        let src_key = format!("dr:zset:{enc}:src").into_bytes();
+        let dst_key = format!("dr:zset:{enc}:dst").into_bytes();
+        let mut zadd: Vec<&[u8]> = vec![b"ZADD", &src_key];
+        for (m, sc) in pairs {
+            // ZADD takes score BEFORE member.
+            zadd.push(sc.as_slice());
+            zadd.push(m.as_slice());
+        }
+        rds.cmd(&zadd);
+        let Some(blob) = bulk_bytes(&rds.cmd(&[b"DUMP", &src_key])) else {
+            div.push(Divergence {
+                cmd: format!("DUMP zset {enc}"),
+                iron: Resp::Null,
+                redis: Resp::Null,
+                note: "redis DUMP of a zset did not return a bulk blob".to_owned(),
+            });
+            continue;
+        };
+        let restore = iron.cmd(&[b"RESTORE", &dst_key, b"0", &blob, b"REPLACE"]);
+        let iron_reply = iron.cmd(&[b"ZRANGE", &dst_key, b"0", b"-1", b"WITHSCORES"]);
+        let redis_reply = rds.cmd(&[b"ZRANGE", &src_key, b"0", b"-1", b"WITHSCORES"]);
+        let iron_card = iron.cmd(&[b"ZCARD", &dst_key]);
+        let redis_card = rds.cmd(&[b"ZCARD", &src_key]);
+        compared += 1;
+        if iron_reply != redis_reply || iron_card != redis_card {
+            div.push(Divergence {
+                cmd: format!("ZSET DUMP(redis)->RESTORE(iron) {enc}; RESTORE said {restore:?}"),
+                iron: iron_reply,
+                redis: redis_reply,
+                note: "a zset DUMPed by redis did not RESTORE to the same members/scores on IronCache (#612 ZSET)".to_owned(),
             });
         }
     }
