@@ -70,18 +70,20 @@ standard Redis 7.4+ commands.
   optimization, not a correctness requirement), so a set, hash, zset, or list `DUMP`ed here `RESTORE`s
   on a real Redis with identical members/fields/scores/order (+inf/-inf preserved). `RESTORE` (decode)
   accepts the **STRING type, the SET type in all three RDB encodings** (`intset`, `listpack`, and the
-  plain length-prefixed set), **the HASH type in its two non-field-TTL encodings** (`listpack` and the
-  plain length-prefixed hash), **the ZSET type in all three encodings** (`RDB_TYPE_ZSET_2`
-  binary-double scores, the legacy `RDB_TYPE_ZSET` ASCII scores, and `listpack`), **and the LIST type in
-  the modern `RDB_TYPE_LIST_QUICKLIST_2` encoding** (the quicklist of listpack + plain nodes that Redis
-  7.x DUMPs, insertion order preserved across nodes) **plus the trivial legacy `RDB_TYPE_LIST`**, so a
-  set, a (non-field-TTL) hash, a sorted set, OR a list `DUMP`ed by a real Redis `RESTORE`s here with
-  identical members/fields/scores/order (a NaN score is refused, matching `ZADD`; +inf/-inf are
-  preserved). All four aggregate types therefore round-trip BIDIRECTIONALLY with real Redis. A HASH
-  with per-field TTLs (Redis 7.4+ `listpack_ex` / `metadata` encodings) and the legacy ziplist-based
-  list encodings (`RDB_TYPE_LIST_QUICKLIST` / `RDB_TYPE_LIST_ZIPLIST`, which modern Redis never DUMPs)
-  are still refused as bad data on `RESTORE`. The only remaining #612 follow-up is hash field-TTL
-  `RESTORE` (needs a Redis >= 7.4 oracle).
+  plain length-prefixed set), **the HASH type in ALL of its encodings** (the non-field-TTL `listpack`
+  and plain length-prefixed hash, AND the four Redis 7.4+ field-TTL forms `RDB_TYPE_HASH_METADATA` /
+  `RDB_TYPE_HASH_LISTPACK_EX` plus their pre-GA variants, decoded WITH each field's per-field expiry),
+  **the ZSET type in all three encodings** (`RDB_TYPE_ZSET_2` binary-double scores, the legacy
+  `RDB_TYPE_ZSET` ASCII scores, and `listpack`), **and the LIST type in the modern
+  `RDB_TYPE_LIST_QUICKLIST_2` encoding** (the quicklist of listpack plus plain nodes that Redis 7.x
+  DUMPs, insertion order preserved across nodes) **plus the trivial legacy `RDB_TYPE_LIST`**, so a set,
+  a hash (with OR without field TTLs, per-field deadlines preserved), a sorted set, OR a list `DUMP`ed
+  by a real Redis `RESTORE`s here with identical members/fields/scores/order (a NaN score is refused,
+  matching `ZADD`; +inf/-inf are preserved). All four aggregate types therefore round-trip
+  BIDIRECTIONALLY with real Redis, and `RESTORE` now accepts EVERY hash form a Redis 7.4+ can `DUMP`
+  (#612 hash decode complete). The only `RESTORE` gap left is the legacy ziplist-based list encodings
+  (`RDB_TYPE_LIST_QUICKLIST` / `RDB_TYPE_LIST_ZIPLIST`, which modern Redis never DUMPs), still refused
+  as bad data.
 
 For the full type-by-type feature list see the [README](../README.md); for the byte-for-byte
 parity story see [docs/design/DIFFERENTIAL_TESTING.md](design/DIFFERENTIAL_TESTING.md).

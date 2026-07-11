@@ -32,22 +32,26 @@
 //!
 //! RESTORE (decode) additionally accepts the SET type in all three RDB encodings -- the plain
 //! `RDB_TYPE_SET`, the `RDB_TYPE_SET_INTSET`, and the `RDB_TYPE_SET_LISTPACK` -- the HASH type in
-//! its two non-field-TTL RDB encodings -- the plain `RDB_TYPE_HASH` and the `RDB_TYPE_HASH_LISTPACK`
-//! -- and the ZSET type in all three RDB encodings -- `RDB_TYPE_ZSET_2` (8-byte little-endian
+//! ALL of its RDB encodings, both the two non-field-TTL forms (the plain `RDB_TYPE_HASH` and the
+//! `RDB_TYPE_HASH_LISTPACK`) AND the four field-TTL forms that Redis 7.4+ DUMPs (`RDB_TYPE_HASH_METADATA`
+//! and `RDB_TYPE_HASH_LISTPACK_EX`, plus their 7.4 pre-GA variants), preserving each field's per-field
+//! expiry -- and the ZSET type in all three RDB encodings -- `RDB_TYPE_ZSET_2` (8-byte little-endian
 //! binary-double scores), the legacy `RDB_TYPE_ZSET` (length-prefixed ASCII scores with the
-//! -inf/+inf/NaN sentinels), and `RDB_TYPE_ZSET_LISTPACK` -- so a set, a (non-field-TTL) hash, OR a
-//! sorted set DUMPed by a real redis RESTOREs here with identical members/fields/scores (#612 phase;
-//! DUMP of an aggregate stays deferred). A NaN score is refused as bad data in every zset encoding
-//! (parity with our ZADD guard + Redis's post-load isnan check); a +inf/-inf score is a legitimate
-//! value and is preserved. RESTORE also accepts the LIST type in the modern `RDB_TYPE_LIST_QUICKLIST_2`
-//! encoding (the quicklist of listpack + plain nodes that Redis 7.x DUMPs) and the trivial legacy
-//! `RDB_TYPE_LIST`, preserving element INSERTION ORDER across nodes, so a list DUMPed by a real redis
-//! RESTOREs here with identical order. The field-TTL hash encodings (`RDB_TYPE_HASH_LISTPACK_EX`,
-//! `RDB_TYPE_HASH_METADATA`, and their pre-GA forms) are a tracked follow-up (#612 PR4) and are
-//! refused as bad data for now rather than half-decoded (a field TTL is never silently dropped). The
-//! ziplist-based list encodings (`RDB_TYPE_LIST_QUICKLIST` / `RDB_TYPE_LIST_ZIPLIST`, which modern
-//! redis never DUMPs) are likewise a tracked follow-up, refused as bad data rather than mis-decoded;
-//! a type we do not yet decode is refused as bad data, never mis-decoded.
+//! -inf/+inf/NaN sentinels), and `RDB_TYPE_ZSET_LISTPACK` -- so a set, a hash (WITH or without field
+//! TTLs), OR a sorted set DUMPed by a real redis RESTOREs here with identical members/fields/scores
+//! (and, for a hash, identical per-field deadlines) (#612 phase; DUMP of an aggregate stays deferred).
+//! A NaN score is refused as bad data in every zset encoding (parity with our ZADD guard + Redis's
+//! post-load isnan check); a +inf/-inf score is a legitimate value and is preserved. RESTORE also
+//! accepts the LIST type in the modern `RDB_TYPE_LIST_QUICKLIST_2` encoding (the quicklist of listpack
+//! plus plain nodes that Redis 7.x DUMPs) and the trivial legacy `RDB_TYPE_LIST`, preserving element
+//! INSERTION ORDER across nodes, so a list DUMPed by a real redis RESTOREs here with identical order.
+//! The field-TTL hash encodings (`RDB_TYPE_HASH_METADATA` = 24 and `RDB_TYPE_HASH_LISTPACK_EX` = 25,
+//! plus the 7.4 pre-GA forms 22 / 23) are DECODED into a hash carrying each field's absolute-ms expiry
+//! deadline (a field TTL is never silently dropped): the GA metadata form's ttl is delta-encoded against
+//! a `minExpire` header on save and is undone here, while the listpack_ex form stores the deadline
+//! absolute. The ziplist-based list encodings (`RDB_TYPE_LIST_QUICKLIST` / `RDB_TYPE_LIST_ZIPLIST`,
+//! which modern redis never DUMPs) are a tracked follow-up, refused as bad data rather than
+//! mis-decoded; a type we do not yet decode is refused as bad data, never mis-decoded.
 //!
 //! The reusable RDB codec substrate (the CRC-64 footer, the RDB length + string encodings, and the
 //! container element iterators the aggregate types build on) lives in [`crate::rdb`]; this slice is
@@ -85,6 +89,16 @@ use crate::rdb::{
 /// [`NewValueOwned::Hash`]). Aliased to keep the [`deserialize_hash`] signature under the
 /// `type_complexity` lint, mirroring `cmd_hash`'s `FieldValue`.
 type HashPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// A decoded hash's per-field TTLs: `(field, absolute-unix-ms deadline)` for each field that carries
+/// an expiry (a field with no TTL is simply omitted). Empty for the two non-field-TTL hash encodings.
+type HashFieldTtls = Vec<(Vec<u8>, UnixMillis)>;
+
+/// The full result of decoding a hash DUMP blob: its `(field, value)` pairs plus the per-field expiry
+/// deadlines. Aliased (with [`HashPairs`] / [`HashFieldTtls`]) to keep the [`deserialize_hash`] return
+/// type under the `type_complexity` lint. When the second element is empty the value is a plain hash
+/// ([`NewValueOwned::Hash`]); otherwise it is a hash with field TTLs ([`NewValueOwned::HashEx`]).
+type HashDecoded = (HashPairs, HashFieldTtls);
 
 /// A decoded zset's `(member, score)` pairs in stream order (a repeated member is resolved
 /// last-score-wins by [`NewValueOwned::ZSet`] / `ZSetVal::from_pairs`). Aliased to keep the
@@ -294,10 +308,13 @@ fn deserialize_set(blob: &[u8]) -> Result<Vec<Vec<u8>>, RestoreParseError> {
     }
 }
 
-/// Parse a DUMP blob (footer-verified) into the HASH `(field, value)` pairs, ready for
-/// [`NewValueOwned::Hash`] (which applies the listpack/hashtable ladder and, via `HashVal::set`, keeps
-/// the LAST value for a repeated field -- Redis's last-wins semantics -- so the decoder need not
-/// pre-dedup). Handles the two NON-field-TTL RDB hash encodings:
+/// Parse a DUMP blob (footer-verified) into the HASH `(field, value)` pairs plus each field's
+/// absolute-ms expiry deadline, ready for [`NewValueOwned::Hash`] / [`NewValueOwned::HashEx`] (which
+/// apply the listpack/hashtable ladder and, via `HashVal::set`, keep the LAST value for a repeated
+/// field -- Redis's last-wins semantics -- so the decoder need not pre-dedup). The returned
+/// [`HashFieldTtls`] is EMPTY for the two non-field-TTL encodings, so the caller builds a plain hash;
+/// a non-empty list means a field carries an expiry, so the caller builds a `HashEx`. Handles all six
+/// RDB hash encodings:
 ///
 /// * `RDB_TYPE_HASH` (4): an RDB length = the field/value PAIR count, then `2*count` RDB strings read
 ///   alternately field, value, field, value. The implied `2*count` string count is bounded against the
@@ -311,85 +328,277 @@ fn deserialize_set(blob: &[u8]) -> Result<Vec<Vec<u8>>, RestoreParseError> {
 ///   an odd count is a corrupt/hostile blob and is [`RestoreParseError::BadData`]. An [`LpElem::Int`]
 ///   field OR value renders as its DECIMAL ASCII text (`ll2string`, as for a set) and an [`LpElem::Str`]
 ///   is the raw bytes.
-///
-/// The field-TTL hash encodings -- `RDB_TYPE_HASH_LISTPACK_EX` (25), `RDB_TYPE_HASH_METADATA` (24), and
-/// their 7.4 pre-GA forms (23 / 22) -- are a tracked follow-up (#612 PR4). We do NOT half-decode a field
-/// TTL, so they are refused as [`RestoreParseError::BadData`] here, never mis-decoded (a field TTL is
-/// never silently dropped).
+/// * `RDB_TYPE_HASH_METADATA` (24) and its pre-GA form (22): an optional `minExpire` header (redis's
+///   fixed 8-byte LE ms-time, present ONLY in the GA form 24), then a field COUNT, then for each field
+///   IN ORDER a `ttl` RDB length, the field RDB string, and the value RDB string. `ttl == 0` means the
+///   field has no expiry; otherwise the GA form delta-encodes the deadline on SAVE as
+///   `deadline - minExpire + 1`, so we undo it here as `ttl + minExpire - 1`, while the pre-GA form
+///   stores the absolute deadline directly. See [`deserialize_hash_metadata`].
+/// * `RDB_TYPE_HASH_LISTPACK_EX` (25) and its pre-GA form (23): an optional `minExpire` header (the same
+///   8-byte LE ms-time, present ONLY in the GA form 25 and REDUNDANT metadata here), then a listpack
+///   (stored AS an RDB string) whose elements are TRIPLETS `[field, value, ttl, ...]`, so the count MUST
+///   be a multiple of 3. The `ttl` element is an [`LpElem::Int`] that is the ABSOLUTE unix-ms deadline
+///   (the listpack_ex form is NOT delta-encoded, even for GA); `ttl == 0` means no expiry. See
+///   [`deserialize_hash_listpack_ex`].
 ///
 /// Every declared length is bounds-checked before a slice or allocation (the shared `rdb` discipline),
-/// so a hostile blob is a clean [`RestoreParseError::BadData`], never a panic or an over-allocation.
-fn deserialize_hash(blob: &[u8]) -> Result<HashPairs, RestoreParseError> {
+/// and a deadline that could not be a valid unix-ms (negative, or an overflow of the delta arithmetic)
+/// is refused, so a hostile blob is a clean [`RestoreParseError::BadData`], never a panic or an
+/// over-allocation.
+fn deserialize_hash(blob: &[u8]) -> Result<HashDecoded, RestoreParseError> {
     let payload = verify_footer(blob)?;
     let mut pos = 0usize;
     let ty = *payload.get(pos).ok_or(RestoreParseError::BadData)?;
     pos += 1;
+    // Each arm consumes the whole remaining payload; the non-TTL forms return an empty TTL list and the
+    // field-TTL forms decode each field's absolute-ms deadline. The GA / pre-GA distinction (the
+    // presence of the 8-byte `minExpire` header and the ttl arithmetic) is handled inside each decoder.
     match ty {
-        RDB_TYPE_HASH => {
-            let (count, is_encoded) = read_rdb_len(payload, &mut pos)?;
-            if is_encoded {
-                // A field/value pair count is never one of the RDB_ENCVAL special encodings.
-                return Err(RestoreParseError::BadData);
-            }
-            let count = usize::try_from(count).map_err(|_| RestoreParseError::BadData)?;
-            // Each pair is TWO RDB strings, so the stream must hold `2*count` strings; the smallest
-            // string is a single length byte, so `2*count` larger than the remaining bytes is a lie ->
-            // BadData BEFORE the pre-allocation. `checked_mul` guards the doubling from overflow, and
-            // `read_rdb_string` re-validates each string's own declared length.
-            let strings = count.checked_mul(2).ok_or(RestoreParseError::BadData)?;
-            if strings > payload.len().saturating_sub(pos) {
-                return Err(RestoreParseError::BadData);
-            }
-            let mut pairs = Vec::with_capacity(count.min(DECODE_PREALLOC_CAP));
-            for _ in 0..count {
-                let field = read_rdb_string(payload, &mut pos)?;
-                let value = read_rdb_string(payload, &mut pos)?;
-                pairs.push((field, value));
-            }
-            if pos != payload.len() {
-                return Err(RestoreParseError::BadData); // trailing bytes: malformed
-            }
-            Ok(pairs)
+        RDB_TYPE_HASH => deserialize_hash_plain(payload, &mut pos),
+        RDB_TYPE_HASH_LISTPACK => deserialize_hash_listpack(payload, &mut pos),
+        RDB_TYPE_HASH_METADATA | RDB_TYPE_HASH_METADATA_PRE_GA => {
+            deserialize_hash_metadata(payload, &mut pos, ty == RDB_TYPE_HASH_METADATA)
         }
-        RDB_TYPE_HASH_LISTPACK => {
-            // Stored AS an RDB string (redis `rdbSaveRawString`); decode the string first (LZF handled
-            // for free), then the listpack, whose elements are the flattened field/value pairs.
-            let body = read_rdb_string(payload, &mut pos)?;
-            if pos != payload.len() {
-                return Err(RestoreParseError::BadData); // trailing bytes after the listpack string
-            }
-            let elems = listpack_iter(&body)?;
-            // A hash listpack is field/value PAIRS, so the element count must be EVEN; an odd count is
-            // a corrupt/hostile blob (redis never writes one).
-            if elems.len() % 2 != 0 {
-                return Err(RestoreParseError::BadData);
-            }
-            let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(elems.len() / 2);
-            let mut it = elems.into_iter();
-            // The even-count check above guarantees `it` yields pairs; the `while let` pattern stops
-            // cleanly at exhaustion regardless. An int element renders as decimal ASCII, a string is
-            // the raw bytes (matching the SET_LISTPACK rendering).
-            while let (Some(f), Some(v)) = (it.next(), it.next()) {
-                let field = match f {
-                    LpElem::Int(n) => n.to_string().into_bytes(),
-                    LpElem::Str(b) => b.into_vec(),
-                };
-                let value = match v {
-                    LpElem::Int(n) => n.to_string().into_bytes(),
-                    LpElem::Str(b) => b.into_vec(),
-                };
-                pairs.push((field, value));
-            }
-            Ok(pairs)
+        RDB_TYPE_HASH_LISTPACK_EX | RDB_TYPE_HASH_LISTPACK_EX_PRE_GA => {
+            deserialize_hash_listpack_ex(payload, &mut pos, ty == RDB_TYPE_HASH_LISTPACK_EX)
         }
-        // The field-TTL hash encodings (`RDB_TYPE_HASH_LISTPACK_EX` / `_METADATA` and their 7.4 pre-GA
-        // forms 23 / 22) are a tracked follow-up (#612 PR4): we do NOT decode a field TTL, so they are
-        // refused as BadData rather than mis-decoded (a field TTL is never silently dropped). Any OTHER
-        // type reaching here is a routing bug (the caller dispatches the decodable types elsewhere);
-        // it is likewise BadData, since the value cannot be reconstructed. The two cases share a body,
-        // so they collapse into one wildcard arm.
+        // Any OTHER type reaching here is a routing bug (the caller dispatches the decodable types
+        // elsewhere); it is BadData, since the value cannot be reconstructed.
         _ => Err(RestoreParseError::BadData),
     }
+}
+
+/// Turn a decoded hash into the store's create value: a plain [`NewValueOwned::Hash`] when no field
+/// carried an expiry, or a [`NewValueOwned::HashEx`] (pairs + per-field deadlines, which the store
+/// applies after building the pairs) when at least one field has a TTL.
+fn hash_new_value((pairs, ttls): HashDecoded) -> NewValueOwned {
+    if ttls.is_empty() {
+        NewValueOwned::Hash(pairs)
+    } else {
+        NewValueOwned::HashEx(pairs, ttls)
+    }
+}
+
+/// Decode the plain `RDB_TYPE_HASH` (4) form: an RDB length = the field/value PAIR count, then
+/// `2*count` RDB strings read alternately field, value, field, value. The implied `2*count` string
+/// count is bounded against the remaining payload bytes BEFORE any pre-allocation (a string is at least
+/// one length byte, so a pair count implying more strings than remaining bytes is a hostile/garbage
+/// header; `checked_mul` guards the doubling), and each string goes through [`read_rdb_string`]. A plain
+/// hash carries no field TTLs, so the returned TTL list is empty.
+fn deserialize_hash_plain(
+    payload: &[u8],
+    pos: &mut usize,
+) -> Result<HashDecoded, RestoreParseError> {
+    let (count, is_encoded) = read_rdb_len(payload, pos)?;
+    if is_encoded {
+        // A field/value pair count is never one of the RDB_ENCVAL special encodings.
+        return Err(RestoreParseError::BadData);
+    }
+    let count = usize::try_from(count).map_err(|_| RestoreParseError::BadData)?;
+    // Each pair is TWO RDB strings, so the stream must hold `2*count` strings; the smallest string is a
+    // single length byte, so `2*count` larger than the remaining bytes is a lie -> BadData BEFORE the
+    // pre-allocation. `read_rdb_string` re-validates each string's own declared length.
+    let strings = count.checked_mul(2).ok_or(RestoreParseError::BadData)?;
+    if strings > payload.len().saturating_sub(*pos) {
+        return Err(RestoreParseError::BadData);
+    }
+    let mut pairs = Vec::with_capacity(count.min(DECODE_PREALLOC_CAP));
+    for _ in 0..count {
+        let field = read_rdb_string(payload, pos)?;
+        let value = read_rdb_string(payload, pos)?;
+        pairs.push((field, value));
+    }
+    if *pos != payload.len() {
+        return Err(RestoreParseError::BadData); // trailing bytes: malformed
+    }
+    Ok((pairs, Vec::new()))
+}
+
+/// Decode the `RDB_TYPE_HASH_LISTPACK` (16) form: the listpack blob, itself stored AS an RDB string (so
+/// redis may LZF- or raw-encode it), whose elements are the FLATTENED pairs `[field, value, ...]`, so
+/// the element count MUST be EVEN (an odd count is a corrupt/hostile blob). An [`LpElem::Int`] field OR
+/// value renders as its DECIMAL ASCII text (`ll2string`), an [`LpElem::Str`] is the raw bytes. A plain
+/// listpack hash carries no field TTLs, so the returned TTL list is empty.
+fn deserialize_hash_listpack(
+    payload: &[u8],
+    pos: &mut usize,
+) -> Result<HashDecoded, RestoreParseError> {
+    let body = read_rdb_string(payload, pos)?;
+    if *pos != payload.len() {
+        return Err(RestoreParseError::BadData); // trailing bytes after the listpack string
+    }
+    let elems = listpack_iter(&body)?;
+    if elems.len() % 2 != 0 {
+        return Err(RestoreParseError::BadData);
+    }
+    let mut pairs: HashPairs = Vec::with_capacity(elems.len() / 2);
+    let mut it = elems.into_iter();
+    // The even-count check above guarantees `it` yields pairs; the `while let` stops cleanly at
+    // exhaustion regardless. An int element renders as decimal ASCII, a string is the raw bytes.
+    while let (Some(f), Some(v)) = (it.next(), it.next()) {
+        let field = match f {
+            LpElem::Int(n) => n.to_string().into_bytes(),
+            LpElem::Str(b) => b.into_vec(),
+        };
+        let value = match v {
+            LpElem::Int(n) => n.to_string().into_bytes(),
+            LpElem::Str(b) => b.into_vec(),
+        };
+        pairs.push((field, value));
+    }
+    Ok((pairs, Vec::new()))
+}
+
+/// The largest absolute-ms deadline we accept: a hash-field expiry is a `long long` millisecond
+/// timestamp in redis, so a value past [`i64::MAX`] (which our [`UnixMillis`] reader would surface as a
+/// negative `i64` to HPEXPIRETIME) can never be a legitimate deadline and is a corrupt/hostile blob.
+const MAX_FIELD_DEADLINE_MS: u64 = i64::MAX as u64;
+
+/// Read redis's fixed 8-byte LITTLE-endian millisecond timestamp (`rdbSaveMillisecondTime`), the wire
+/// form of the `minExpire` header that leads the GA field-TTL hash encodings. Bounds-checked against
+/// the remaining payload so a truncated header is a clean [`RestoreParseError::BadData`], never an
+/// over-read. Returned as a `u64` (a real `minExpire` is a positive ms timestamp; the deadline
+/// arithmetic + the [`MAX_FIELD_DEADLINE_MS`] gate reject any value that could not be one).
+fn read_rdb_ms_time(payload: &[u8], pos: &mut usize) -> Result<u64, RestoreParseError> {
+    let end = pos.checked_add(8).ok_or(RestoreParseError::BadData)?;
+    let b = payload.get(*pos..end).ok_or(RestoreParseError::BadData)?;
+    let v = u64::from_le_bytes(b.try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+/// Decode the metadata (hashtable) field-TTL hash forms: `RDB_TYPE_HASH_METADATA` (24, GA) and
+/// `RDB_TYPE_HASH_METADATA_PRE_GA` (22). `pos` is positioned just after the type byte; `ga` is true for
+/// the GA form (which prepends an 8-byte LE `minExpire` header and delta-encodes each ttl against it).
+///
+/// Layout: `[minExpire]?` `field_count` then `field_count` x (`ttl`, `field`, `value`) -- `minExpire` an
+/// 8-byte LE ms-time, `ttl` an RDB length, `field`/`value` RDB strings. `ttl == 0` -> the field has no
+/// expiry (omitted from the TTL list). For the GA form redis saves `stored = deadline - minExpire + 1`,
+/// so the absolute deadline is `stored + minExpire - 1` (undone with `checked_*` so a hostile header
+/// cannot overflow); the pre-GA form stores the absolute deadline directly. A deadline past
+/// [`MAX_FIELD_DEADLINE_MS`] is refused.
+fn deserialize_hash_metadata(
+    payload: &[u8],
+    pos: &mut usize,
+    ga: bool,
+) -> Result<HashDecoded, RestoreParseError> {
+    // The GA form leads with a `minExpire` header (the delta base), stored as redis's fixed 8-byte LE
+    // millisecond timestamp; the pre-GA form has none, so the base is 0 and each stored ttl is already
+    // absolute.
+    let min_expire = if ga {
+        read_rdb_ms_time(payload, pos)?
+    } else {
+        0
+    };
+    let (count, is_encoded) = read_rdb_len(payload, pos)?;
+    if is_encoded {
+        // A field count is never one of the RDB_ENCVAL special encodings.
+        return Err(RestoreParseError::BadData);
+    }
+    let count = usize::try_from(count).map_err(|_| RestoreParseError::BadData)?;
+    // Each field contributes at least three bytes: a 1-byte ttl length, a 1-byte field length, and a
+    // 1-byte value length. A `3*count` larger than the remaining bytes is a lie -> BadData BEFORE the
+    // pre-allocation; `checked_mul` guards the product and `read_rdb_*` re-validate each element.
+    let min_bytes = count.checked_mul(3).ok_or(RestoreParseError::BadData)?;
+    if min_bytes > payload.len().saturating_sub(*pos) {
+        return Err(RestoreParseError::BadData);
+    }
+    let mut pairs: HashPairs = Vec::with_capacity(count.min(DECODE_PREALLOC_CAP));
+    let mut ttls: HashFieldTtls = Vec::new();
+    for _ in 0..count {
+        let (ttl, is_encoded) = read_rdb_len(payload, pos)?;
+        if is_encoded {
+            // A ttl is a plain RDB length, never an RDB_ENCVAL special encoding.
+            return Err(RestoreParseError::BadData);
+        }
+        let field = read_rdb_string(payload, pos)?;
+        let value = read_rdb_string(payload, pos)?;
+        if ttl != 0 {
+            // ttl == 0 is "no expiry". Otherwise recover the absolute deadline: the GA form
+            // delta-encodes `deadline - minExpire + 1`, so undo it as `ttl + minExpire - 1`; the
+            // pre-GA form (min_expire == 0 and no delta) uses the ttl as-is. `checked_*` turn a
+            // hostile header into BadData instead of an overflow panic.
+            let deadline = if ga {
+                ttl.checked_add(min_expire)
+                    .and_then(|s| s.checked_sub(1))
+                    .ok_or(RestoreParseError::BadData)?
+            } else {
+                ttl
+            };
+            if deadline > MAX_FIELD_DEADLINE_MS {
+                return Err(RestoreParseError::BadData);
+            }
+            ttls.push((field.clone(), UnixMillis(deadline)));
+        }
+        pairs.push((field, value));
+    }
+    if *pos != payload.len() {
+        return Err(RestoreParseError::BadData); // trailing bytes: malformed
+    }
+    Ok((pairs, ttls))
+}
+
+/// Decode the listpack field-TTL hash forms: `RDB_TYPE_HASH_LISTPACK_EX` (25, GA) and
+/// `RDB_TYPE_HASH_LISTPACK_EX_PRE_GA` (23). `pos` is positioned just after the type byte; `ga` is true
+/// for the GA form (which prepends an 8-byte LE `minExpire` header -- REDUNDANT here, since the listpack
+/// stores each ttl ABSOLUTE rather than delta-encoded -- that we read and discard).
+///
+/// The listpack (stored AS an RDB string) holds TRIPLETS `[field, value, ttl, ...]`, so its element
+/// count MUST be a multiple of 3. field / value render as for the non-TTL listpack hash (an
+/// [`LpElem::Int`] as decimal ASCII, an [`LpElem::Str`] as raw bytes). The ttl element MUST be an
+/// [`LpElem::Int`] (a non-int is a corrupt blob); `ttl == 0` -> no expiry, a NEGATIVE ttl can never be
+/// a valid unix-ms deadline and is refused, and a positive ttl is the absolute deadline.
+fn deserialize_hash_listpack_ex(
+    payload: &[u8],
+    pos: &mut usize,
+    ga: bool,
+) -> Result<HashDecoded, RestoreParseError> {
+    // The GA form leads with a `minExpire` header (redis's fixed 8-byte LE millisecond timestamp); it
+    // is redundant here (the listpack ttls are stored absolute), so read past it. The pre-GA form has
+    // none.
+    if ga {
+        let _min_expire = read_rdb_ms_time(payload, pos)?;
+    }
+    // The listpack is itself stored AS an RDB string (LZF handled for free by `read_rdb_string`).
+    let body = read_rdb_string(payload, pos)?;
+    if *pos != payload.len() {
+        return Err(RestoreParseError::BadData); // trailing bytes after the listpack string
+    }
+    let elems = listpack_iter(&body)?;
+    // A listpack_ex hash is (field, value, ttl) TRIPLETS, so the element count must be a multiple of
+    // three; anything else is a corrupt/hostile blob (redis never writes one).
+    if elems.len() % 3 != 0 {
+        return Err(RestoreParseError::BadData);
+    }
+    let mut pairs: HashPairs = Vec::with_capacity(elems.len() / 3);
+    let mut ttls: HashFieldTtls = Vec::new();
+    let mut it = elems.into_iter();
+    // The multiple-of-3 check guarantees `it` yields whole triplets; the `while let` stops cleanly at
+    // exhaustion regardless.
+    while let (Some(f), Some(v), Some(t)) = (it.next(), it.next(), it.next()) {
+        let field = match f {
+            LpElem::Int(n) => n.to_string().into_bytes(),
+            LpElem::Str(b) => b.into_vec(),
+        };
+        let value = match v {
+            LpElem::Int(n) => n.to_string().into_bytes(),
+            LpElem::Str(b) => b.into_vec(),
+        };
+        // The ttl element is the ABSOLUTE unix-ms deadline as a listpack integer; a string ttl is a
+        // corrupt blob.
+        let ttl = match t {
+            LpElem::Int(n) => n,
+            LpElem::Str(_) => return Err(RestoreParseError::BadData),
+        };
+        if ttl != 0 {
+            // A negative ttl can never be a valid unix-ms deadline; `try_from` rejects it as BadData
+            // rather than wrapping. A positive `i64` is always within `MAX_FIELD_DEADLINE_MS`.
+            let deadline = u64::try_from(ttl).map_err(|_| RestoreParseError::BadData)?;
+            ttls.push((field.clone(), UnixMillis(deadline)));
+        }
+        pairs.push((field, value));
+    }
+    Ok((pairs, ttls))
 }
 
 /// Parse a DUMP blob (footer-verified) into the ZSET `(member, score)` pairs, ready for
@@ -769,14 +978,16 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
         }
         // Route on the RDB type byte, which is `blob[0]` (the first payload byte, before the footer)
         // and is CRC-covered, so `verify_footer` inside the chosen decoder still authenticates it: a
-        // SET type reconstructs a `NewValueOwned::Set`, a HASH type a `NewValueOwned::Hash`, a ZSET
+        // SET type reconstructs a `NewValueOwned::Set`, a HASH type a `NewValueOwned::Hash` (or a
+        // `NewValueOwned::HashEx` when the field-TTL encodings carry per-field deadlines), a ZSET
         // type a `NewValueOwned::ZSet`, and a LIST type a `NewValueOwned::List` (the store dedups
         // where applicable + applies the encoding ladder), everything else falls to the STRING decoder
         // (which rejects a non-STRING type as BadData). The four field-TTL hash type bytes route to
-        // `deserialize_hash` too, and the two ziplist-based list type bytes to `deserialize_list`,
-        // both of which cleanly refuse them as BadData (a tracked follow-up), so no key is created.
-        // All paths install through the same `RmwAction::Replace` used by the string RESTORE -- only
-        // the value construction differs, so REPLACE / ttl / ABSTTL / IDLETIME / FREQ all hold.
+        // `deserialize_hash` too (decoded WITH their per-field TTLs), while the two ziplist-based list
+        // type bytes route to `deserialize_list`, which cleanly refuses them as BadData (a tracked
+        // follow-up), so no key is created. All paths install through the same `RmwAction::Replace`
+        // used by the string RESTORE -- only the value construction differs, so REPLACE / ttl / ABSTTL
+        // / IDLETIME / FREQ all hold.
         let decoded = match blob.first() {
             Some(&RDB_TYPE_SET | &RDB_TYPE_SET_INTSET | &RDB_TYPE_SET_LISTPACK) => {
                 deserialize_set(blob).map(NewValueOwned::Set)
@@ -788,7 +999,7 @@ pub fn cmd_restore<S: Store>(store: &mut S, db: u32, now: UnixMillis, req: &Requ
                 | &RDB_TYPE_HASH_METADATA
                 | &RDB_TYPE_HASH_METADATA_PRE_GA
                 | &RDB_TYPE_HASH_LISTPACK_EX_PRE_GA,
-            ) => deserialize_hash(blob).map(NewValueOwned::Hash),
+            ) => deserialize_hash(blob).map(hash_new_value),
             Some(&RDB_TYPE_ZSET_2 | &RDB_TYPE_ZSET | &RDB_TYPE_ZSET_LISTPACK) => {
                 deserialize_zset(blob).map(NewValueOwned::ZSet)
             }
@@ -1216,6 +1427,12 @@ mod tests {
         out.extend_from_slice(s);
     }
 
+    /// Append redis's fixed 8-byte little-endian millisecond timestamp (`rdbSaveMillisecondTime`). This
+    /// is how the GA field-TTL hash encodings wrap the `minExpire` header inside a DUMP payload.
+    fn push_ms_time(out: &mut Vec<u8>, v: u64) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
     /// Build an intset blob (`encoding[u32 LE] length[u32 LE]` then the LE integers) at the given
     /// width (2/4/8). The header `length` is `values.len()`; ordering is the caller's to control (a
     /// valid intset is strictly ascending, but a reject test wants a descending one).
@@ -1245,6 +1462,14 @@ mod tests {
     /// Encode a listpack int16 entry (`0xF1` + 2 LE payload bytes).
     fn lp_int16(v: i16) -> Vec<u8> {
         let mut o = vec![0xF1];
+        o.extend_from_slice(&v.to_le_bytes());
+        o
+    }
+
+    /// Encode a listpack int64 entry (`0xF4` + 8 LE payload bytes). Used for a field-TTL listpack_ex
+    /// hash, whose ttl element is an absolute unix-ms deadline (a 64-bit value).
+    fn lp_int64(v: i64) -> Vec<u8> {
+        let mut o = vec![0xF4];
         o.extend_from_slice(&v.to_le_bytes());
         o
     }
@@ -1517,6 +1742,23 @@ mod tests {
         })
     }
 
+    /// A field's absolute-ms expiry deadline (HPEXPIRETIME's underlying value), or `None` when the
+    /// field has no TTL / does not exist. Read through the typed `HashValue::field_ttl` view so the
+    /// field-TTL RESTORE tests can assert the exact decoded deadline.
+    fn hash_field_deadline(store: &mut TestStore, key: &[u8], field: &[u8]) -> Option<UnixMillis> {
+        store.rmw_mut(0, key, NOW, |entry| {
+            let ttl = match entry {
+                RmwEntry::OccupiedMut(mut o) => o.as_hash_mut().and_then(|h| h.field_ttl(field)),
+                _ => None,
+            };
+            RmwStep {
+                action: RmwAction::Keep,
+                expire: ExpireWrite::Unchanged,
+                reply: ttl,
+            }
+        })
+    }
+
     #[test]
     fn restore_plain_hash_yields_string_pairs() {
         // A plain RDB_TYPE_HASH (redis's hashtable encoding on DUMP): a PAIR count then that many
@@ -1608,33 +1850,299 @@ mod tests {
         assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
     }
 
+    // ---- HASH field-TTL RESTORE (#612 final): the four field-TTL RDB hash encodings. ----
+
+    // A realistic absolute unix-ms deadline base (well after NOW), so a restored deadline is in the
+    // future and its high bit is clear (a valid i64 timestamp for HPEXPIRETIME).
+    const BASE_DEADLINE_MS: u64 = 2_000_000_000_000;
+
     #[test]
-    fn restore_hash_field_ttl_type_is_unsupported_and_creates_no_key() {
-        // The field-TTL hash encodings (HASH_LISTPACK_EX=25, HASH_METADATA=24, and the pre-GA 23/22)
-        // are DEFERRED to PR4: each must be a clean bad-data error with NO key created (never a
-        // half-decoded / TTL-dropped hash).
-        for &ty in &[
-            RDB_TYPE_HASH_LISTPACK_EX,
-            RDB_TYPE_HASH_METADATA,
-            RDB_TYPE_HASH_LISTPACK_EX_PRE_GA,
-            RDB_TYPE_HASH_METADATA_PRE_GA,
-        ] {
-            let mut s = test_store();
-            let blob = set_blob(ty, &[0x00]); // any body; the type byte is refused before decode
-            let err = cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"ex", b"0", &blob]));
-            assert_eq!(
-                match err {
-                    Value::Error(e) => e.line(),
-                    o => panic!("type {ty}: {o:?}"),
-                },
-                "-ERR Bad data format",
-                "field-TTL type {ty} must be a clean bad-data error"
-            );
-            assert!(
-                s.read(0, b"ex", NOW).is_none(),
-                "type {ty}: no key must be created"
-            );
-        }
+    fn restore_metadata_ga_hash_decodes_delta_ttls() {
+        // The GA metadata form (RDB_TYPE_HASH_METADATA = 24): a `minExpire` header, a field count,
+        // then per field (ttl, field, value). redis delta-encodes each ttl on SAVE as
+        // `deadline - minExpire + 1`, so the decoder must undo it as `ttl + minExpire - 1`. This
+        // hash MIXES fields with a TTL (f1, f2) and one without (f3, stored ttl 0).
+        let min_expire = BASE_DEADLINE_MS;
+        let mut body = Vec::new();
+        push_ms_time(&mut body, min_expire); // minExpire header (GA only): 8-byte LE ms-time
+        write_rdb_len(&mut body, 3); // field count
+        // f1 is the minimum-deadline field: stored ttl 1 -> absolute == minExpire.
+        write_rdb_len(&mut body, 1);
+        push_rdb_string(&mut body, b"f1");
+        push_rdb_string(&mut body, b"v1");
+        // f2: stored ttl 11 -> absolute == minExpire + 10.
+        write_rdb_len(&mut body, 11);
+        push_rdb_string(&mut body, b"f2");
+        push_rdb_string(&mut body, b"v2");
+        // f3: stored ttl 0 -> NO expiry.
+        write_rdb_len(&mut body, 0);
+        push_rdb_string(&mut body, b"f3");
+        push_rdb_string(&mut body, b"v3");
+        let blob = set_blob(RDB_TYPE_HASH_METADATA, &body);
+
+        let mut s = test_store();
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"h", b"0", &blob])),
+            Value::ok()
+        );
+        let got = hash_pairs(&mut s, b"h");
+        assert_eq!(got.len(), 3); // HLEN
+        assert_eq!(got.get(&b"f1"[..]).map(Vec::as_slice), Some(&b"v1"[..]));
+        assert_eq!(got.get(&b"f2"[..]).map(Vec::as_slice), Some(&b"v2"[..]));
+        assert_eq!(got.get(&b"f3"[..]).map(Vec::as_slice), Some(&b"v3"[..]));
+        // The delta arithmetic: f1 -> minExpire, f2 -> minExpire + 10, f3 -> no TTL.
+        assert_eq!(
+            hash_field_deadline(&mut s, b"h", b"f1"),
+            Some(UnixMillis(min_expire))
+        );
+        assert_eq!(
+            hash_field_deadline(&mut s, b"h", b"f2"),
+            Some(UnixMillis(min_expire + 10))
+        );
+        assert_eq!(hash_field_deadline(&mut s, b"h", b"f3"), None);
+    }
+
+    #[test]
+    fn restore_metadata_pre_ga_hash_decodes_absolute_ttls() {
+        // The pre-GA metadata form (RDB_TYPE_HASH_METADATA_PRE_GA = 22): NO minExpire header, and each
+        // stored ttl is the ABSOLUTE deadline (not delta-encoded). A field with stored ttl 0 has no
+        // expiry.
+        let mut body = Vec::new();
+        write_rdb_len(&mut body, 2); // field count (no minExpire header)
+        write_rdb_len(&mut body, BASE_DEADLINE_MS + 5); // absolute deadline
+        push_rdb_string(&mut body, b"a");
+        push_rdb_string(&mut body, b"1");
+        write_rdb_len(&mut body, 0); // no expiry
+        push_rdb_string(&mut body, b"b");
+        push_rdb_string(&mut body, b"2");
+        let blob = set_blob(RDB_TYPE_HASH_METADATA_PRE_GA, &body);
+
+        let mut s = test_store();
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"h", b"0", &blob])),
+            Value::ok()
+        );
+        let got = hash_pairs(&mut s, b"h");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.get(&b"a"[..]).map(Vec::as_slice), Some(&b"1"[..]));
+        assert_eq!(got.get(&b"b"[..]).map(Vec::as_slice), Some(&b"2"[..]));
+        assert_eq!(
+            hash_field_deadline(&mut s, b"h", b"a"),
+            Some(UnixMillis(BASE_DEADLINE_MS + 5)),
+            "pre-GA stores the absolute deadline directly"
+        );
+        assert_eq!(hash_field_deadline(&mut s, b"h", b"b"), None);
+    }
+
+    #[test]
+    fn restore_listpack_ex_ga_hash_decodes_triplet_ttls() {
+        // The GA listpack_ex form (RDB_TYPE_HASH_LISTPACK_EX = 25): a `minExpire` header (redundant,
+        // read and discarded) then a listpack of (field, value, ttl) TRIPLETS. The ttl is the ABSOLUTE
+        // unix-ms deadline (NOT delta-encoded), 0 meaning no expiry. Mixed: "name" has a TTL, "age"
+        // (int field) has none, and "7" (int field) has a TTL.
+        let lp = build_listpack(&[
+            lp_str6(b"name"),
+            lp_str6(b"bob"),
+            lp_int64(BASE_DEADLINE_MS as i64), // name -> absolute deadline
+            lp_str6(b"age"),
+            lp_int16(42), // an int value -> "42"
+            lp_int16(0),  // ttl 0 -> no expiry
+            lp_int16(7),  // an int field -> "7"
+            lp_str6(b"lucky"),
+            lp_int64(BASE_DEADLINE_MS as i64 + 25), // "7" -> absolute deadline
+        ]);
+        let mut body = Vec::new();
+        push_ms_time(&mut body, BASE_DEADLINE_MS); // minExpire header (GA only, redundant): 8-byte LE
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_HASH_LISTPACK_EX, &body);
+
+        let mut s = test_store();
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"h", b"0", &blob])),
+            Value::ok()
+        );
+        let got = hash_pairs(&mut s, b"h");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.get(&b"name"[..]).map(Vec::as_slice), Some(&b"bob"[..]));
+        assert_eq!(got.get(&b"age"[..]).map(Vec::as_slice), Some(&b"42"[..]));
+        assert_eq!(got.get(&b"7"[..]).map(Vec::as_slice), Some(&b"lucky"[..]));
+        assert_eq!(
+            hash_field_deadline(&mut s, b"h", b"name"),
+            Some(UnixMillis(BASE_DEADLINE_MS)),
+            "listpack_ex stores the ttl absolute"
+        );
+        assert_eq!(hash_field_deadline(&mut s, b"h", b"age"), None);
+        assert_eq!(
+            hash_field_deadline(&mut s, b"h", b"7"),
+            Some(UnixMillis(BASE_DEADLINE_MS + 25))
+        );
+    }
+
+    #[test]
+    fn restore_listpack_ex_pre_ga_hash_has_no_min_expire_header() {
+        // The pre-GA listpack_ex form (RDB_TYPE_HASH_LISTPACK_EX_PRE_GA = 23): identical to the GA form
+        // but with NO minExpire header before the listpack. The ttl is still absolute.
+        let lp = build_listpack(&[
+            lp_str6(b"k"),
+            lp_str6(b"val"),
+            lp_int64(BASE_DEADLINE_MS as i64 + 7),
+        ]);
+        let mut body = Vec::new();
+        push_rdb_string(&mut body, &lp); // no minExpire header
+        let blob = set_blob(RDB_TYPE_HASH_LISTPACK_EX_PRE_GA, &body);
+
+        let mut s = test_store();
+        assert_eq!(
+            cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"h", b"0", &blob])),
+            Value::ok()
+        );
+        assert_eq!(
+            hash_pairs(&mut s, b"h").get(&b"k"[..]).map(Vec::as_slice),
+            Some(&b"val"[..])
+        );
+        assert_eq!(
+            hash_field_deadline(&mut s, b"h", b"k"),
+            Some(UnixMillis(BASE_DEADLINE_MS + 7))
+        );
+    }
+
+    #[test]
+    fn restore_field_ttl_hash_honors_replace_and_key_ttl() {
+        // A field-TTL RESTORE installs through the same path as a plain hash, so REPLACE and the
+        // KEY-level ttl still apply ON TOP of the per-field deadlines.
+        let mut s = test_store();
+        seed(&mut s, b"k", b"existing");
+        let mut body = Vec::new();
+        push_ms_time(&mut body, BASE_DEADLINE_MS); // minExpire: 8-byte LE ms-time
+        write_rdb_len(&mut body, 1); // one field
+        write_rdb_len(&mut body, 1); // stored ttl 1 -> absolute minExpire
+        push_rdb_string(&mut body, b"f");
+        push_rdb_string(&mut body, b"v");
+        let blob = set_blob(RDB_TYPE_HASH_METADATA, &body);
+        // Without REPLACE: BUSYKEY, value untouched.
+        assert_eq!(
+            match cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"k", b"0", &blob])) {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-BUSYKEY Target key name already exists."
+        );
+        // REPLACE + a KEY-level relative ttl of 40s: the hash overwrites the string, the field carries
+        // its own deadline, and the KEY expiry is now + 40000.
+        assert_eq!(
+            cmd_restore(
+                &mut s,
+                0,
+                NOW,
+                &req(&[b"RESTORE", b"k", b"40000", &blob, b"REPLACE"])
+            ),
+            Value::ok()
+        );
+        assert_eq!(
+            hash_pairs(&mut s, b"k").get(&b"f"[..]).map(Vec::as_slice),
+            Some(&b"v"[..])
+        );
+        assert_eq!(
+            hash_field_deadline(&mut s, b"k", b"f"),
+            Some(UnixMillis(BASE_DEADLINE_MS))
+        );
+        assert_eq!(
+            s.read(0, b"k", NOW).and_then(|v| v.expire_at()),
+            Some(UnixMillis(NOW.0 + 40_000))
+        );
+    }
+
+    #[test]
+    fn deserialize_hash_rejects_a_non_multiple_of_three_listpack_ex() {
+        // A listpack_ex is (field, value, ttl) TRIPLETS, so the element count must be a multiple of 3;
+        // anything else (here 4 elements) is a corrupt/hostile blob and is BadData (no partial keep).
+        let lp = build_listpack(&[
+            lp_str6(b"f"),
+            lp_str6(b"v"),
+            lp_int16(5),
+            lp_str6(b"orphan"),
+        ]);
+        let mut body = Vec::new();
+        push_ms_time(&mut body, 0); // minExpire header: 8-byte LE ms-time
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_HASH_LISTPACK_EX, &body);
+        assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_hash_rejects_a_non_int_listpack_ex_ttl() {
+        // The ttl element of a triplet MUST be an integer; a string ttl is a corrupt blob.
+        let lp = build_listpack(&[lp_str6(b"f"), lp_str6(b"v"), lp_str6(b"not-an-int")]);
+        let mut body = Vec::new();
+        push_ms_time(&mut body, 0); // minExpire header: 8-byte LE ms-time
+        push_rdb_string(&mut body, &lp);
+        let blob = set_blob(RDB_TYPE_HASH_LISTPACK_EX, &body);
+        assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_hash_rejects_a_truncated_metadata_count() {
+        // A metadata hash whose declared field count (~4 billion) dwarfs the tiny body: the
+        // 3*count-vs-remaining bound rejects BEFORE the pre-allocation, no over-alloc, no panic.
+        let mut body = Vec::new();
+        push_ms_time(&mut body, 0); // minExpire: 8-byte LE ms-time
+        write_rdb_len(&mut body, 0xffff_ffff); // absurd field count
+        write_rdb_len(&mut body, 1); // one stored ttl
+        push_rdb_string(&mut body, b"only-field");
+        push_rdb_string(&mut body, b"only-value");
+        let blob = set_blob(RDB_TYPE_HASH_METADATA, &body);
+        assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_hash_rejects_a_metadata_ttl_overflow() {
+        // A GA metadata ttl whose `ttl + minExpire - 1` overflows u64 must be BadData, NOT an overflow
+        // panic (which would fire under overflow-checks builds). minExpire = u64::MAX and a stored ttl
+        // of 2 overflows the add.
+        let mut body = Vec::new();
+        push_ms_time(&mut body, u64::MAX); // minExpire: 8-byte LE ms-time
+        write_rdb_len(&mut body, 1); // one field
+        write_rdb_len(&mut body, 2); // ttl 2 -> 2 + u64::MAX - 1 overflows
+        push_rdb_string(&mut body, b"f");
+        push_rdb_string(&mut body, b"v");
+        let blob = set_blob(RDB_TYPE_HASH_METADATA, &body);
+        assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn deserialize_hash_rejects_a_metadata_deadline_past_i64_max() {
+        // A decoded absolute deadline past i64::MAX can never be a valid unix-ms timestamp (it would
+        // surface as a NEGATIVE i64 to HPEXPIRETIME), so it is refused rather than stored.
+        let mut body = Vec::new();
+        push_ms_time(&mut body, 0); // minExpire 0, so GA arithmetic is `stored ttl - 1`
+        write_rdb_len(&mut body, 1); // one field
+        // Decoded deadline = ttl + 0 - 1 = (i64::MAX + 2) - 1 = i64::MAX + 1, one past the cap.
+        write_rdb_len(&mut body, (i64::MAX as u64) + 2);
+        push_rdb_string(&mut body, b"f");
+        push_rdb_string(&mut body, b"v");
+        let blob = set_blob(RDB_TYPE_HASH_METADATA, &body);
+        assert_eq!(deserialize_hash(&blob), Err(RestoreParseError::BadData));
+    }
+
+    #[test]
+    fn restore_a_hostile_field_ttl_hash_creates_no_key() {
+        // End-to-end: a hostile field-TTL blob returns the bad-data error and leaves NO key behind (no
+        // panic, no partial write, no TTL-dropped hash).
+        let mut s = test_store();
+        let mut body = Vec::new();
+        push_ms_time(&mut body, 0); // minExpire: 8-byte LE ms-time
+        write_rdb_len(&mut body, 0xffff_ffff); // absurd field count
+        push_rdb_string(&mut body, b"x");
+        let blob = set_blob(RDB_TYPE_HASH_METADATA, &body);
+        let err = cmd_restore(&mut s, 0, NOW, &req(&[b"RESTORE", b"h", b"0", &blob]));
+        assert_eq!(
+            match err {
+                Value::Error(e) => e.line(),
+                o => panic!("{o:?}"),
+            },
+            "-ERR Bad data format"
+        );
+        assert!(s.read(0, b"h", NOW).is_none(), "no key must be created");
     }
 
     #[test]
