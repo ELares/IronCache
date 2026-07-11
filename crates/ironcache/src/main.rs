@@ -553,6 +553,12 @@ fn cmd_config(cli: &Cli) -> anyhow::Result<()> {
 fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
     use ironcache::upgrade;
 
+    // CLUSTER MODE (#392): a completely separate orchestrator path. Branch FIRST so the single-node
+    // flow below is byte-unchanged when `--cluster` is absent.
+    if args.cluster {
+        return cmd_upgrade_cluster(args);
+    }
+
     // Read the optional auth password from its file (keeps the secret out of argv/logs).
     let auth = upgrade::read_auth_file(args.auth_file.as_deref())
         .context("reading the --auth-file password")?;
@@ -612,6 +618,123 @@ fn cmd_upgrade(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
             // Propagate as a nonzero exit; anyhow prints the full error chain.
             Err(anyhow::Error::new(e).context("ironcache upgrade failed"))
         }
+    }
+}
+
+/// `ironcache upgrade --cluster` (#392): the LIVE clustered rolling-upgrade orchestrator. Loads the
+/// static actuation-map inventory, assembles a [`LiveCluster`] over the prod seams (authenticated RESP
+/// observe + `CLUSTER FAILOVER`, the SSH per-node binary swap, the loopback write-freeze pauser), and
+/// either PREVIEWS the plan (`--dry-run`, a single observe + print, NO action) or drives the roll to
+/// completion (upgrade the replicas first, promote an upgraded in-sync replica behind the
+/// failover-freeze fence, upgrade the old primary last). Fails loud + nonzero on a stall or an action
+/// error, naming the blocking step.
+fn cmd_upgrade_cluster(args: &cli::UpgradeArgs) -> anyhow::Result<()> {
+    use ironcache::cluster_upgrade_driver::{
+        DriverConfig, FreezeCfg, LiveCluster, PollCfg, RespClusterClient, SshUpgrader,
+        ThreadSleeper, run_cluster_upgrade,
+    };
+    use ironcache::cluster_upgrade_inventory::{derive_plan, load_inventory};
+    use ironcache::upgrade::pause::LoopbackPauser;
+    use ironcache_repl::UpgradeReport;
+    use std::time::Duration;
+
+    // REQUIRED cluster inputs (clear error if missing): the inventory path + the explicit target.
+    let (inventory_path, target) = args
+        .require_cluster_inputs()
+        .map_err(|msg| anyhow::anyhow!(msg))?;
+
+    // Load + validate the static actuation map (fail closed on a malformed / invalid inventory).
+    let inventory = load_inventory(inventory_path)
+        .with_context(|| format!("loading the cluster inventory {}", inventory_path.display()))?;
+    let node_count = inventory.len();
+
+    // Assemble the driver config from the flags. The freeze drains the candidate to lag 0, so the
+    // drain budget is `--drain-timeout` seconds at the driver's 100ms poll cadence.
+    let drain_poll_delay = Duration::from_millis(100);
+    let max_drain_polls = u32::try_from(args.drain_timeout.saturating_mul(10))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let config = DriverConfig {
+        inventory,
+        target_version: target.to_owned(),
+        max_lag: args.max_lag,
+        poll: PollCfg::default(),
+        freeze: FreezeCfg {
+            pause_window_ms: args.pause_ms,
+            max_drain_polls,
+            drain_poll_delay,
+        },
+    };
+
+    // The prod seams: authenticated RESP client (bounded per-exchange), SSH per-node swap, the shipped
+    // loopback write-freeze pauser (pointed at the old primary during a promotion), a real sleeper.
+    let client = RespClusterClient::new(Duration::from_secs(args.per_node_timeout))
+        .context("building the RESP cluster client")?;
+    let mut live = LiveCluster::new(
+        client,
+        SshUpgrader::new(),
+        Box::new(LoopbackPauser),
+        Box::new(ThreadSleeper),
+        config,
+    );
+
+    // DRY-RUN: OBSERVE once, print the derived plan, take NO action.
+    if args.dry_run {
+        live.refresh()
+            .context("observing the cluster for the dry-run plan")?;
+        let plan = derive_plan(live.view());
+        print!("{plan}");
+        println!(
+            "dry-run only: NO action taken. Re-run without --dry-run to execute the roll of {node_count} node(s)."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "cluster rolling upgrade: {node_count} node(s) -> target {target} (replicas first, primary upgraded last, RPO=0 failover-freeze)"
+    );
+    match run_cluster_upgrade(&mut live, args.max_ticks) {
+        Ok(UpgradeReport::Completed) => {
+            tracing::info!(target = %target, nodes = node_count, "ironcache upgrade --cluster: SUCCESS");
+            println!(
+                "cluster upgrade succeeded: every node is on {target} (primary upgraded last)"
+            );
+            Ok(())
+        }
+        Ok(UpgradeReport::StalledAfterBudget(step)) => {
+            let why = describe_stall(step);
+            tracing::error!(target = %target, ?step, "ironcache upgrade --cluster: STALLED");
+            Err(anyhow::anyhow!(
+                "cluster upgrade did not finish within --max-ticks {}: stalled at {why}",
+                args.max_ticks
+            ))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "ironcache upgrade --cluster: FAILED");
+            Err(anyhow::Error::new(e).context("ironcache upgrade --cluster failed"))
+        }
+    }
+}
+
+/// Describe the step a stalled cluster upgrade got stuck on, for the operator-facing error (#392).
+fn describe_stall(step: ironcache_repl::UpgradeStep) -> String {
+    use ironcache_repl::{BlockReason, UpgradeStep};
+    match step {
+        UpgradeStep::UpgradeReplica => "upgrading a replica (a node upgrade did not complete)".to_owned(),
+        UpgradeStep::AwaitInSync => {
+            "awaiting a just-upgraded replica to catch back up (it never re-synced)".to_owned()
+        }
+        UpgradeStep::Promote => "promoting an upgraded in-sync replica".to_owned(),
+        UpgradeStep::UpgradeOldPrimary => "upgrading the demoted old primary (last node)".to_owned(),
+        UpgradeStep::Blocked(BlockReason::NoQuorum) => {
+            "BLOCKED: the config-plane raft has no quorum, so the promotion fence cannot commit"
+                .to_owned()
+        }
+        UpgradeStep::Blocked(BlockReason::NoInSyncCandidate) => {
+            "BLOCKED: no upgraded replica is in sync enough to promote without losing acknowledged writes"
+                .to_owned()
+        }
+        UpgradeStep::Done => "completed".to_owned(),
     }
 }
 

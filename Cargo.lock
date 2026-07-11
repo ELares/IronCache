@@ -443,11 +443,13 @@ dependencies = [
  "ironcache-store",
  "libc",
  "ring",
+ "serde",
  "thiserror",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

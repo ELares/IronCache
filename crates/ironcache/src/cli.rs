@@ -227,6 +227,79 @@ pub struct UpgradeArgs {
     /// or rebuildable cache where availability matters more than that window.
     #[arg(long)]
     pub no_freeze: bool,
+
+    /// CLUSTER MODE (#392): run the live rolling upgrade of a raft-governance CLUSTER (upgrade the
+    /// replicas first, promote an upgraded in-sync replica, upgrade the old primary LAST) instead of
+    /// the single-node self-upgrade. Requires `--inventory` (the static actuation map) and `--to`
+    /// (the explicit target version). The per-node local flags (`--target`, `--unit`, `--resp-addr`,
+    /// `--readyz-addr`, `--auth-file`) do not apply on the orchestrator; each node's reach + actuation
+    /// comes from the inventory. Off by default (the single-node path is unchanged).
+    #[arg(long)]
+    pub cluster: bool,
+
+    /// The TOML actuation-map inventory for `--cluster`: each `[[node]]` supplies `id`, `resp_addr`,
+    /// optional `auth`, `ssh_target`, `upgrade_source`, plus the observe `seeds`. REQUIRED with
+    /// `--cluster`. The dynamic topology (roles / versions / lag / membership) is discovered live.
+    #[arg(long, value_name = "FILE")]
+    pub inventory: Option<PathBuf>,
+
+    /// CLUSTER MODE in-sync bound (#392): a replica is a promotion candidate when its master-side lag
+    /// is `<= --max-lag`. Defaults to the server's own `replica_max_lag`, which the server re-checks
+    /// on `CLUSTER FAILOVER`; the failover-freeze drains the candidate to lag 0 regardless, so this is
+    /// a pre-filter, not the safety boundary.
+    #[arg(long, value_name = "N", default_value_t = ironcache_config::DEFAULT_REPLICA_MAX_LAG)]
+    pub max_lag: u64,
+
+    /// CLUSTER MODE failover-freeze drain bound (#392): how long (seconds) to poll the chosen
+    /// candidate's master-side lag down to EXACTLY 0 before FAILING CLOSED (unpause, no promotion).
+    /// Polled every 100ms, so the default 60s matches the driver's own 600-poll budget.
+    #[arg(long, value_name = "SECS", default_value_t = 60)]
+    pub drain_timeout: u64,
+
+    /// CLUSTER MODE freeze window (#392): the `CLIENT PAUSE <MS> WRITE` window applied to the old
+    /// primary during a promotion (it self-cancels once the old primary is demoted). Must comfortably
+    /// cover the drain + the commit + a margin. Matches the driver's default freeze window.
+    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    pub pause_ms: u64,
+
+    /// CLUSTER MODE per-node RESP timeout (#392): the bound on each authenticated RESP exchange
+    /// (`INFO` / `CLUSTER` / `CLUSTER FAILOVER`) to a node, in seconds. A slow / unreachable node
+    /// fails the exchange rather than hanging the roll.
+    #[arg(long, value_name = "SECS", default_value_t = 30)]
+    pub per_node_timeout: u64,
+
+    /// CLUSTER MODE tick budget (#392): the maximum number of rolling-upgrade ticks before the driver
+    /// fails LOUD (`StalledAfterBudget`) instead of looping forever -- a replica that never catches up
+    /// or a promotion that stays blocked (no quorum / no in-sync candidate) stops here, fail-closed.
+    #[arg(long, value_name = "N", default_value_t = 300)]
+    pub max_ticks: usize,
+
+    /// CLUSTER MODE preview (#392): OBSERVE the cluster once and print the derived plan (the current
+    /// versions, the replica roll order, the promotion candidate, the primary upgraded LAST) then EXIT
+    /// -- taking NO action (no upgrade, no failover). Use it to confirm primary-last before committing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl UpgradeArgs {
+    /// The `--cluster` inputs that are REQUIRED in cluster mode: the inventory path and the explicit
+    /// `--to` target (dev / lock builds pin a constant version, so an explicit target is mandatory).
+    /// Returns a clear error message when `--cluster` is set without one of them. The single-node
+    /// path never calls this, so its behavior is unchanged.
+    ///
+    /// # Errors
+    /// A message naming the missing required flag.
+    pub fn require_cluster_inputs(&self) -> Result<(&std::path::Path, &str), String> {
+        let inventory = self.inventory.as_deref().ok_or_else(|| {
+            "`--cluster` requires `--inventory <FILE>` (the TOML actuation map)".to_owned()
+        })?;
+        let target = self.to.as_deref().ok_or_else(|| {
+            "`--cluster` requires `--to <TAG>` (the explicit target version; dev/lock builds pin a \
+             constant version, so it cannot be inferred)"
+                .to_owned()
+        })?;
+        Ok((inventory, target))
+    }
 }
 
 /// The DEFAULT metrics / health endpoint bind (#555). A LOCALHOST address so `/metrics`, `/livez`,
@@ -351,6 +424,113 @@ mod tests {
         assert_eq!(
             effective_metrics_addr(Some("  127.0.0.1:9091  ")),
             Some("127.0.0.1:9091")
+        );
+    }
+
+    /// Parse an `ironcache upgrade ...` argv into its [`UpgradeArgs`] (via the real clap surface).
+    fn parse_upgrade(argv: &[&str]) -> UpgradeArgs {
+        let full: Vec<&str> = ["ironcache", "upgrade"]
+            .into_iter()
+            .chain(argv.iter().copied())
+            .collect();
+        match Cli::try_parse_from(full)
+            .expect("upgrade args parse")
+            .command
+        {
+            Some(Command::Upgrade(a)) => a,
+            other => panic!("expected the upgrade subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cluster_flags_parse_into_the_expected_values() {
+        let args = parse_upgrade(&[
+            "--cluster",
+            "--inventory",
+            "/etc/ironcache/cluster.toml",
+            "--to",
+            "v1.2.3",
+            "--max-lag",
+            "8",
+            "--drain-timeout",
+            "15",
+            "--pause-ms",
+            "45000",
+            "--per-node-timeout",
+            "20",
+            "--max-ticks",
+            "500",
+            "--dry-run",
+        ]);
+        assert!(args.cluster);
+        assert!(args.dry_run);
+        assert_eq!(
+            args.inventory.as_deref(),
+            Some(std::path::Path::new("/etc/ironcache/cluster.toml"))
+        );
+        assert_eq!(args.to.as_deref(), Some("v1.2.3"));
+        assert_eq!(args.max_lag, 8);
+        assert_eq!(args.drain_timeout, 15);
+        assert_eq!(args.pause_ms, 45_000);
+        assert_eq!(args.per_node_timeout, 20);
+        assert_eq!(args.max_ticks, 500);
+    }
+
+    #[test]
+    fn cluster_tuning_flags_have_sensible_defaults() {
+        // The driver-tuning knobs default to match the driver / server defaults so an operator can
+        // run `--cluster --inventory ... --to ...` with no tuning.
+        let args = parse_upgrade(&["--cluster", "--inventory", "/tmp/inv.toml", "--to", "v1"]);
+        assert_eq!(args.max_lag, ironcache_config::DEFAULT_REPLICA_MAX_LAG);
+        assert_eq!(args.drain_timeout, 60);
+        assert_eq!(args.pause_ms, 30_000);
+        assert_eq!(args.per_node_timeout, 30);
+        assert_eq!(args.max_ticks, 300);
+        assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn cluster_without_inventory_is_a_clear_error() {
+        let args = parse_upgrade(&["--cluster", "--to", "v1.2.3"]);
+        let err = args
+            .require_cluster_inputs()
+            .expect_err("cluster needs --inventory");
+        assert!(err.contains("--inventory"), "{err}");
+    }
+
+    #[test]
+    fn cluster_without_to_is_a_clear_error() {
+        let args = parse_upgrade(&["--cluster", "--inventory", "/tmp/inv.toml"]);
+        let err = args
+            .require_cluster_inputs()
+            .expect_err("cluster needs --to");
+        assert!(err.contains("--to"), "{err}");
+    }
+
+    #[test]
+    fn cluster_inputs_resolve_when_both_present() {
+        let args = parse_upgrade(&[
+            "--cluster",
+            "--inventory",
+            "/tmp/inv.toml",
+            "--to",
+            "v1.2.3",
+        ]);
+        let (inv, target) = args.require_cluster_inputs().expect("both present");
+        assert_eq!(inv, std::path::Path::new("/tmp/inv.toml"));
+        assert_eq!(target, "v1.2.3");
+    }
+
+    #[test]
+    fn single_node_upgrade_still_parses_unchanged() {
+        // The single-node path is untouched: no --cluster, the source flags still parse, and cluster
+        // mode is off with the tuning knobs at their defaults.
+        let args = parse_upgrade(&["--binary", "/tmp/ic", "--sha256sums", "/tmp/SUMS"]);
+        assert!(!args.cluster, "single-node is not cluster mode");
+        assert!(args.inventory.is_none());
+        assert_eq!(
+            args.binary.as_deref(),
+            Some(std::path::Path::new("/tmp/ic"))
         );
     }
 
