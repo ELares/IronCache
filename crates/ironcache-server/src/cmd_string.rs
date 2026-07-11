@@ -1192,7 +1192,34 @@ pub fn cmd_append<S: Store>(
 
 #[cfg(test)]
 mod tests {
-    use super::{PROTO_MAX_BULK_LEN, append_would_exceed_max};
+    use super::*;
+    use ironcache_storage::CountingAccounting;
+    use ironcache_store::ShardStore;
+
+    type TestStore = ShardStore<ironcache_eviction::Policy, CountingAccounting>;
+
+    fn test_store() -> TestStore {
+        ShardStore::with_hooks(
+            1,
+            ironcache_eviction::Policy::cache_default(),
+            CountingAccounting::new(),
+        )
+    }
+
+    fn req(parts: &[&[u8]]) -> Request {
+        Request {
+            args: parts.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        }
+    }
+
+    const NOW: UnixMillis = UnixMillis(0);
+
+    fn err_line(v: &Value) -> String {
+        match v {
+            Value::Error(e) => e.line(),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn append_ceiling_matches_proto_max_bulk_len() {
@@ -1227,5 +1254,88 @@ mod tests {
         // an append that fit under 512 MB now fails under a 16-byte ceiling.
         assert!(!append_would_exceed_max(8, 8, 16));
         assert!(append_would_exceed_max(8, 9, 16));
+    }
+
+    // ---- Competitor-regression lock-in: SET condition mutual-exclusivity. ----
+
+    #[test]
+    fn set_write_conditions_are_mutually_exclusive() {
+        // Class of bug: a competitor's SET parser accepted invalid syntax that MIXED the
+        // compare-and-set conditions (IFEQ/IFNE) with the presence conditions (NX/XX), which
+        // are mutually exclusive. Our defense: `parse_set_options` gates every one of
+        // NX/XX/IFEQ/IFNE behind `has_condition()`, so a second write condition is a syntax
+        // error. (IFEQ/IFNE consume their comparison value POSITIONALLY, so `IFEQ hello`
+        // reads `hello` as the value and a trailing `NX` is the illegal second condition.)
+        let mut store = test_store();
+        let mut wheel = TimingWheel::new();
+
+        // Each of these combines two write conditions and must be `-ERR syntax error`.
+        let bad_ifeq_then_nx = cmd_set(
+            &mut store,
+            &mut wheel,
+            0,
+            NOW,
+            &req(&[b"SET", b"k", b"v", b"IFEQ", b"hello", b"NX"]),
+        );
+        assert_eq!(err_line(&bad_ifeq_then_nx), "-ERR syntax error");
+        let bad_nx_xx = cmd_set(
+            &mut store,
+            &mut wheel,
+            0,
+            NOW,
+            &req(&[b"SET", b"k", b"v", b"NX", b"XX"]),
+        );
+        assert_eq!(err_line(&bad_nx_xx), "-ERR syntax error");
+        let bad_ifeq_ifne = cmd_set(
+            &mut store,
+            &mut wheel,
+            0,
+            NOW,
+            &req(&[b"SET", b"k", b"v", b"IFEQ", b"a", b"IFNE", b"b"]),
+        );
+        assert_eq!(err_line(&bad_ifeq_ifne), "-ERR syntax error");
+        // No write leaked through from any rejected form.
+        assert_eq!(
+            cmd_get(&mut store, 0, NOW, &req(&[b"GET", b"k"])),
+            Value::Null
+        );
+
+        // A SINGLE condition still parses and applies. NX on an absent key writes.
+        assert_eq!(
+            cmd_set(
+                &mut store,
+                &mut wheel,
+                0,
+                NOW,
+                &req(&[b"SET", b"a", b"1", b"NX"])
+            ),
+            Value::ok()
+        );
+        assert_eq!(
+            cmd_get(&mut store, 0, NOW, &req(&[b"GET", b"a"])),
+            Value::BulkString(Some(Bytes::from_static(b"1")))
+        );
+        // IFEQ against the real current value applies (compare-and-set).
+        cmd_set(
+            &mut store,
+            &mut wheel,
+            0,
+            NOW,
+            &req(&[b"SET", b"b", b"old"]),
+        );
+        assert_eq!(
+            cmd_set(
+                &mut store,
+                &mut wheel,
+                0,
+                NOW,
+                &req(&[b"SET", b"b", b"new", b"IFEQ", b"old"])
+            ),
+            Value::ok()
+        );
+        assert_eq!(
+            cmd_get(&mut store, 0, NOW, &req(&[b"GET", b"b"])),
+            Value::BulkString(Some(Bytes::from_static(b"new")))
+        );
     }
 }

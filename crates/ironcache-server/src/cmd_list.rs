@@ -1245,4 +1245,50 @@ mod tests {
             "-ERR value is not an integer or out of range"
         );
     }
+
+    // ---- Competitor-regression lock-in: LSET 64-bit index safety. ----
+
+    #[test]
+    fn lset_i64_extreme_index_is_out_of_range_and_does_not_corrupt() {
+        // Class of bug: a competitor TRUNCATED a 64-bit LSET index to 32 bits BEFORE the
+        // bounds check, so a huge index wrapped into range and silently overwrote the WRONG
+        // element (data corruption). Our defense: the index is parsed as a full i64
+        // (`parse_i64_strict`) and `ListVal::resolve_index` bounds-checks in i64 with NO
+        // narrowing and no overflow (a positive index is never added to the length; a negative
+        // index only moves TOWARD zero), so a 64-bit-extreme index is rejected with
+        // `-ERR index out of range` and NOTHING is written.
+        let mut store = test_store();
+        cmd_rpush(
+            &mut store,
+            0,
+            NOW,
+            &req(&[b"RPUSH", b"k", b"a", b"b", b"c"]),
+        );
+        // i64::MAX and i64::MIN both PARSE as valid i64 (so this is not a not-an-integer error)
+        // yet are far out of range; each is rejected and leaves the list untouched.
+        for idx in [
+            b"9223372036854775807".as_slice(),  // i64::MAX
+            b"-9223372036854775808".as_slice(), // i64::MIN
+        ] {
+            let reply = cmd_lset(&mut store, 0, NOW, &req(&[b"LSET", b"k", idx, b"z"]));
+            assert_eq!(
+                err_line(&reply),
+                "-ERR index out of range",
+                "a 64-bit-extreme LSET index is out of range, not a wrapped overwrite"
+            );
+        }
+        // The list is byte-for-byte unchanged: no element was silently corrupted.
+        assert_eq!(
+            contents(&mut store, b"k"),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "no element was overwritten by an out-of-range 64-bit index"
+        );
+        // A normal negative index still resolves (-1 = last), proving the bounds math works.
+        let ok = cmd_lset(&mut store, 0, NOW, &req(&[b"LSET", b"k", b"-1", b"Z"]));
+        assert_eq!(ok, Value::ok());
+        assert_eq!(
+            contents(&mut store, b"k"),
+            vec![b"a".to_vec(), b"b".to_vec(), b"Z".to_vec()]
+        );
+    }
 }

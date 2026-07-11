@@ -3038,4 +3038,58 @@ mod tests {
             "hashtable"
         );
     }
+
+    // ---- Competitor-regression lock-in: HRANDFIELD terminates when live fields < count. ----
+
+    #[test]
+    fn hrandfield_terminates_when_live_fields_fewer_than_count() {
+        // Class of bug: a competitor INFINITE-LOOPED on HRANDFIELD when the number of
+        // NON-EXPIRED fields was smaller than the requested DISTINCT count (it kept drawing
+        // for distinct fields that no longer existed). Our defense: HRANDFIELD reaps expired
+        // fields FIRST, then clamps `want = min(count, live_len)` and runs a BOUNDED partial
+        // Fisher-Yates, so it always terminates and returns exactly the available distinct
+        // fields (<= count). A negative (with-repetition) count is a bounded `|count|` draws.
+        let mut s = test_store();
+        cmd_hset(
+            &mut s,
+            0,
+            NOW,
+            &req(&[
+                b"HSET", b"h", b"a", b"1", b"b", b"2", b"c", b"3", b"d", b"4", b"e", b"5",
+            ]),
+        );
+        // Give three of the five fields a 1s TTL (deadline 1000ms from NOW=0).
+        cmd_hexpire(
+            &mut s,
+            0,
+            NOW,
+            &req(&[b"HEXPIRE", b"h", b"1", b"FIELDS", b"3", b"a", b"b", b"c"]),
+        );
+        // Read at a time PAST the deadline: a,b,c are reaped first, leaving only d,e live.
+        let later = UnixMillis(2000);
+
+        // Positive count 10 (DISTINCT) with only 2 live fields: returns exactly 2, no hang.
+        let distinct = cmd_hrandfield(&mut s, 0, SEED, later, &req(&[b"HRANDFIELD", b"h", b"10"]));
+        let fields = match distinct {
+            Value::Array(Some(items)) => items,
+            other => panic!("expected an array, got {other:?}"),
+        };
+        assert_eq!(
+            fields.len(),
+            2,
+            "distinct HRANDFIELD is capped at the live field count, and terminates"
+        );
+
+        // A large NEGATIVE count (WITH repetition) also terminates, returning exactly |count|.
+        let with_rep = cmd_hrandfield(&mut s, 0, SEED, later, &req(&[b"HRANDFIELD", b"h", b"-10"]));
+        let rep = match with_rep {
+            Value::Array(Some(items)) => items,
+            other => panic!("expected an array, got {other:?}"),
+        };
+        assert_eq!(
+            rep.len(),
+            10,
+            "with-repetition HRANDFIELD returns exactly |count| fields and terminates"
+        );
+    }
 }

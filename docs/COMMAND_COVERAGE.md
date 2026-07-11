@@ -61,6 +61,11 @@ standard Redis 7.4+ commands.
   rejected with `CROSSSLOT`.
 - **Keyspace notifications.** `notify-keyspace-events` drives keyspace / keyevent Pub/Sub messages
   (including `expired` / `evicted`); disabled by default so the write hot path pays nothing.
+- **DUMP / RESTORE is STRING-only today.** `DUMP` and `RESTORE` currently round-trip the **STRING
+  type ONLY** (a HyperLogLog counts, since an HLL is stored as a string). A `DUMP` of a list, hash,
+  set, or zset returns an error and cannot be `RESTORE`d, so do NOT assume full-fidelity `MIGRATE`
+  across all types yet. The remaining per-type codecs, and thus full multi-type `MIGRATE`
+  compatibility, are tracked in #612.
 
 For the full type-by-type feature list see the [README](../README.md); for the byte-for-byte
 parity story see [docs/design/DIFFERENTIAL_TESTING.md](design/DIFFERENTIAL_TESTING.md).
